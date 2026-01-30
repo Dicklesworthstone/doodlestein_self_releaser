@@ -179,12 +179,12 @@ act_run_workflow() {
     local duration=$((end_time - start_time))
 
     # Output results as JSON (to stdout)
-    local artifact_count
+    local artifact_count status
     artifact_count=$(find "$artifact_dir" -type f 2>/dev/null | wc -l)
 
     if [[ "$exit_code" -eq 0 ]]; then
         _log_ok "Workflow completed successfully in ${duration}s"
-        local status="success"
+        status="success"
     elif [[ "$exit_code" -eq 124 ]]; then
         _log_error "Workflow timed out after ${ACT_TIMEOUT}s"
         status="timeout"
@@ -695,7 +695,7 @@ EOF
     _log_info "Build cmd: $build_cmd"
     _log_info "Log file: $log_file"
 
-    local start_time exit_code
+    local start_time
     start_time=$(date +%s)
 
     # Construct the remote command
