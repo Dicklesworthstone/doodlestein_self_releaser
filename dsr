@@ -4294,12 +4294,19 @@ main() {
             ;;
         release)
             # Check for subcommand
-            if [[ "${1:-}" == "verify" ]]; then
-                shift
-                cmd_release_verify "$@"
-            else
-                cmd_release "$@"
-            fi
+            case "${1:-}" in
+                verify)
+                    shift
+                    cmd_release_verify "$@"
+                    ;;
+                formulas)
+                    shift
+                    cmd_release_formulas "$@"
+                    ;;
+                *)
+                    cmd_release "$@"
+                    ;;
+            esac
             ;;
         fallback)
             cmd_fallback "$@"
