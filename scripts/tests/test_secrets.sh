@@ -194,9 +194,21 @@ test_gh_source_detection() {
     fi
 
     # Restore env
-    [[ -n "$save_dsr" ]] && export DSR_GH_TOKEN="$save_dsr" || unset DSR_GH_TOKEN
-    [[ -n "$save_github" ]] && export GITHUB_TOKEN="$save_github" || unset GITHUB_TOKEN
-    [[ -n "$save_gh" ]] && export GH_TOKEN="$save_gh" || unset GH_TOKEN
+    if [[ -n "$save_dsr" ]]; then
+        export DSR_GH_TOKEN="$save_dsr"
+    else
+        unset DSR_GH_TOKEN
+    fi
+    if [[ -n "$save_github" ]]; then
+        export GITHUB_TOKEN="$save_github"
+    else
+        unset GITHUB_TOKEN
+    fi
+    if [[ -n "$save_gh" ]]; then
+        export GH_TOKEN="$save_gh"
+    else
+        unset GH_TOKEN
+    fi
 }
 
 # ============================================================================
@@ -227,7 +239,11 @@ test_slack_webhook_validation() {
     fi
 
     # Restore
-    [[ -n "$save_webhook" ]] && export DSR_SLACK_WEBHOOK="$save_webhook" || unset DSR_SLACK_WEBHOOK
+    if [[ -n "$save_webhook" ]]; then
+        export DSR_SLACK_WEBHOOK="$save_webhook"
+    else
+        unset DSR_SLACK_WEBHOOK
+    fi
 }
 
 # ============================================================================

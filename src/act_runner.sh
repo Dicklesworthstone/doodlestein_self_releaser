@@ -278,14 +278,23 @@ act_analyze_workflow() {
         esac
     done < <(act_list_jobs "$workflow")
 
+    # Helper to convert array to JSON array (handles empty arrays correctly)
+    _array_to_json() {
+        if [[ $# -eq 0 ]]; then
+            echo "[]"
+        else
+            printf '%s\n' "$@" | jq -R . | jq -s .
+        fi
+    }
+
     # Output JSON analysis
     cat <<EOF
 {
   "workflow": "$workflow",
-  "linux_jobs": $(printf '%s\n' "${linux_jobs[@]}" | jq -R . | jq -s .),
-  "macos_jobs": $(printf '%s\n' "${macos_jobs[@]}" | jq -R . | jq -s .),
-  "windows_jobs": $(printf '%s\n' "${windows_jobs[@]}" | jq -R . | jq -s .),
-  "other_jobs": $(printf '%s\n' "${other_jobs[@]}" | jq -R . | jq -s .),
+  "linux_jobs": $(_array_to_json "${linux_jobs[@]+"${linux_jobs[@]}"}"),
+  "macos_jobs": $(_array_to_json "${macos_jobs[@]+"${macos_jobs[@]}"}"),
+  "windows_jobs": $(_array_to_json "${windows_jobs[@]+"${windows_jobs[@]}"}"),
+  "other_jobs": $(_array_to_json "${other_jobs[@]+"${other_jobs[@]}"}"),
   "act_compatible": ${#linux_jobs[@]},
   "native_required": $((${#macos_jobs[@]} + ${#windows_jobs[@]}))
 }
@@ -517,11 +526,20 @@ act_list_tools() {
         return 1
     fi
 
+    # Use nullglob to handle empty directory gracefully
+    local old_nullglob
+    old_nullglob=$(shopt -p nullglob || true)
+    shopt -s nullglob
+
     for config in "$ACT_REPOS_DIR"/*.yaml; do
-        if [[ -f "$config" && ! "$(basename "$config")" =~ ^_ ]]; then
+        # Skip template files (start with _)
+        if [[ ! "$(basename "$config")" =~ ^_ ]]; then
             basename "$config" .yaml
         fi
     done
+
+    # Restore previous nullglob setting
+    eval "$old_nullglob" 2>/dev/null || shopt -u nullglob
 }
 
 # Generate full build matrix for a tool
@@ -539,7 +557,431 @@ act_build_matrix() {
         strategies+=("$strategy")
     done
 
-    printf '%s\n' "${strategies[@]}" | jq -s '.'
+    if [[ ${#strategies[@]} -eq 0 ]]; then
+        echo "[]"
+    else
+        printf '%s\n' "${strategies[@]}" | jq -s '.'
+    fi
+}
+
+# ============================================================================
+# Hybrid Build Orchestration (act + SSH)
+# ============================================================================
+
+# SSH settings for native builds
+_ACT_SSH_TIMEOUT="${DSR_SSH_TIMEOUT:-30}"
+_ACT_BUILD_TIMEOUT="${DSR_BUILD_TIMEOUT:-3600}"
+
+# Get build command from config
+# Usage: act_get_build_cmd <tool_name>
+act_get_build_cmd() {
+    local tool_name="$1"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        return 4
+    fi
+
+    yq -r '.build_cmd // ""' "$config_file" 2>/dev/null
+}
+
+# Get environment variables for a build target
+# Usage: act_get_build_env <tool_name> <platform>
+# Returns: Space-separated KEY=VALUE pairs
+act_get_build_env() {
+    local tool_name="$1"
+    local platform="$2"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo ""
+        return 4
+    fi
+
+    local result=""
+
+    # Get global env vars
+    local global_env
+    global_env=$(yq -r '.env // {} | to_entries | map(.key + "=" + .value) | .[]' "$config_file" 2>/dev/null)
+    [[ -n "$global_env" ]] && result="$global_env"
+
+    # Get platform-specific cross_compile env vars
+    local platform_env
+    platform_env=$(yq -r ".cross_compile.\"$platform\".env // {} | to_entries | map(.key + \"=\" + .value) | .[]" "$config_file" 2>/dev/null)
+    [[ -n "$platform_env" ]] && result="$result $platform_env"
+
+    echo "$result"
+}
+
+# Get local path for a tool
+# Usage: act_get_local_path <tool_name>
+act_get_local_path() {
+    local tool_name="$1"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        return 4
+    fi
+
+    yq -r '.local_path // ""' "$config_file" 2>/dev/null
+}
+
+# Execute command on remote host via SSH
+# Usage: _act_ssh_exec <host> <command> [timeout]
+# Returns: Exit code from remote command
+_act_ssh_exec() {
+    local host="$1"
+    local cmd="$2"
+    local timeout_sec="${3:-$_ACT_BUILD_TIMEOUT}"
+
+    timeout "$timeout_sec" ssh \
+        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new \
+        "$host" "$cmd"
+}
+
+# Run native build on remote host via SSH
+# Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
+# Returns: JSON result with status, exit_code, artifact info
+act_run_native_build() {
+    local tool_name="$1"
+    local platform="$2"
+    local version="$3"
+    local run_id="${4:-}"
+
+    local host
+    host=$(act_get_native_host "$platform")
+    if [[ -z "$host" ]]; then
+        _log_error "No native host configured for platform: $platform"
+        cat << EOF
+{"status": "error", "exit_code": 4, "error": "No native host for $platform"}
+EOF
+        return 4
+    fi
+
+    # Get build configuration
+    local local_path build_cmd build_env binary_name
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        _log_error "Config not found: $config_file"
+        cat << EOF
+{"status": "error", "exit_code": 4, "error": "Config not found: $config_file"}
+EOF
+        return 4
+    fi
+
+    local_path=$(act_get_local_path "$tool_name")
+    build_cmd=$(act_get_build_cmd "$tool_name")
+    build_env=$(act_get_build_env "$tool_name" "$platform")
+    binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
+
+    if [[ -z "$local_path" || -z "$build_cmd" ]]; then
+        _log_error "Missing local_path or build_cmd in config"
+        cat << EOF
+{"status": "error", "exit_code": 4, "error": "Missing required config fields"}
+EOF
+        return 4
+    fi
+
+    # Prepare log file
+    local log_dir log_file
+    log_dir="$ACT_LOGS_DIR"
+    mkdir -p "$log_dir"
+    log_file="$log_dir/${tool_name}-${platform//\//-}-${run_id:-$$}.log"
+
+    _log_info "Building $tool_name for $platform on $host"
+    _log_info "Local path: $local_path"
+    _log_info "Build cmd: $build_cmd"
+    _log_info "Log file: $log_file"
+
+    local start_time exit_code
+    start_time=$(date +%s)
+
+    # Construct the remote command
+    # For SSH, we need to cd to repo, set env vars, and run build
+    local env_exports=""
+    for env_pair in $build_env; do
+        env_exports+="export $env_pair; "
+    done
+
+    local remote_cmd="cd '$local_path' && $env_exports$build_cmd"
+
+    # Execute on remote host
+    if _act_ssh_exec "$host" "$remote_cmd" 2>&1 | tee "$log_file"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    local end_time duration
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    # Determine result
+    local status artifact_path
+    if [[ $exit_code -eq 0 ]]; then
+        _log_ok "Build completed on $host in ${duration}s"
+        status="success"
+
+        # Artifact path depends on language
+        local language
+        language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+        case "$language" in
+            rust)
+                artifact_path="$local_path/target/release/$binary_name"
+                ;;
+            go)
+                artifact_path="$local_path/$binary_name"
+                ;;
+            *)
+                artifact_path="$local_path/$binary_name"
+                ;;
+        esac
+
+        # Add .exe extension for Windows
+        [[ "$platform" == windows/* ]] && artifact_path+=".exe"
+    elif [[ $exit_code -eq 124 ]]; then
+        _log_error "Build timed out on $host after ${_ACT_BUILD_TIMEOUT}s"
+        status="timeout"
+        exit_code=5
+    else
+        _log_error "Build failed on $host with exit code $exit_code"
+        status="failed"
+        exit_code=6
+    fi
+
+    # Return JSON result
+    cat << EOF
+{
+  "tool": "$tool_name",
+  "platform": "$platform",
+  "host": "$host",
+  "method": "native",
+  "status": "$status",
+  "exit_code": $exit_code,
+  "duration_seconds": $duration,
+  "artifact_path": "${artifact_path:-}",
+  "log_file": "$log_file"
+}
+EOF
+
+    return "$exit_code"
+}
+
+# Main orchestration function: coordinate act + SSH builds
+# Usage: act_orchestrate_build <tool_name> <version> [targets...]
+# Returns: JSON with aggregated results
+act_orchestrate_build() {
+    local tool_name="$1"
+    local version="$2"
+    shift 2
+    local targets_arg=("$@")
+
+    # Load config
+    if ! act_load_repo_config "$tool_name"; then
+        _log_error "Failed to load config for $tool_name"
+        return 4
+    fi
+
+    # Get targets (from args or config)
+    local targets
+    if [[ ${#targets_arg[@]} -gt 0 ]]; then
+        targets="${targets_arg[*]}"
+    else
+        targets=$(act_get_targets "$tool_name")
+    fi
+
+    if [[ -z "$targets" ]]; then
+        _log_error "No targets configured for $tool_name"
+        return 4
+    fi
+
+    _log_info "Orchestrating build for $tool_name $version"
+    _log_info "Targets: $targets"
+
+    # Initialize build state (if build_state.sh is sourced)
+    local run_id
+    if command -v build_state_create &>/dev/null; then
+        if ! build_lock_acquire "$tool_name" "$version"; then
+            _log_error "Build already in progress (lock held)"
+            return 2
+        fi
+        run_id=$(build_state_create "$tool_name" "$version" "${targets// /,}")
+        build_state_update_status "$tool_name" "$version" "running" "$run_id"
+    else
+        run_id="run-$(date +%s)-$$"
+    fi
+
+    _log_info "Run ID: $run_id"
+
+    # Track results
+    local results=()
+    local success_count=0
+    local fail_count=0
+    local start_time
+    start_time=$(date +%s)
+
+    # Process each target
+    for target in $targets; do
+        _log_info "--- Building target: $target ---"
+
+        # Update host status
+        local host
+        host=$(act_get_native_host "$target")
+        if command -v build_state_update_host &>/dev/null; then
+            build_state_update_host "$tool_name" "$version" "$host" "running" '{"target":"'"$target"'"}' "$run_id"
+        fi
+
+        # Determine build method
+        local result exit_code=0
+        if act_platform_uses_act "$tool_name" "$target"; then
+            # Run via act
+            local job workflow local_path extra_flags
+            job=$(act_get_job_for_target "$tool_name" "$target")
+            workflow="$ACT_REPO_WORKFLOW"
+            local_path="$ACT_REPO_LOCAL_PATH"
+            extra_flags=$(act_get_flags "$tool_name" "$target")
+
+            _log_info "Method: act (job=$job)"
+
+            # Collect extra args
+            local act_args=()
+            [[ -n "$extra_flags" ]] && read -ra act_args <<< "$extra_flags"
+
+            # Run act workflow
+            result=$(act_run_workflow "$local_path" "$workflow" "$job" "push" "${act_args[@]}" 2>&1) || exit_code=$?
+
+            # Wrap in consistent format
+            result=$(echo "$result" | jq --arg target "$target" --arg method "act" \
+                '. + {platform: $target, method: $method}' 2>/dev/null || echo "$result")
+        else
+            # Run via SSH (native build)
+            _log_info "Method: native (host=$host)"
+            result=$(act_run_native_build "$tool_name" "$target" "$version" "$run_id") || exit_code=$?
+        fi
+
+        # Update result tracking
+        results+=("$result")
+
+        local status
+        status=$(echo "$result" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+        if [[ "$status" == "success" ]]; then
+            ((success_count++))
+            if command -v build_state_update_host &>/dev/null; then
+                build_state_update_host "$tool_name" "$version" "$host" "completed" \
+                    "$(echo "$result" | jq -c '{artifact_path, duration_seconds}' 2>/dev/null || echo '{}')" "$run_id"
+            fi
+        else
+            ((fail_count++))
+            if command -v build_state_update_host &>/dev/null; then
+                build_state_update_host "$tool_name" "$version" "$host" "failed" \
+                    "$(echo "$result" | jq -c '{exit_code, error: .error // .status}' 2>/dev/null || echo '{}')" "$run_id"
+            fi
+        fi
+
+        _log_info "Result: $status (exit_code=$exit_code)"
+    done
+
+    local end_time total_duration
+    end_time=$(date +%s)
+    total_duration=$((end_time - start_time))
+
+    # Determine overall status
+    local overall_status overall_exit_code
+    if [[ $fail_count -eq 0 ]]; then
+        overall_status="success"
+        overall_exit_code=0
+    elif [[ $success_count -gt 0 ]]; then
+        overall_status="partial"
+        overall_exit_code=1
+    else
+        overall_status="failed"
+        overall_exit_code=6
+    fi
+
+    # Update build state
+    if command -v build_state_update_status &>/dev/null; then
+        build_state_update_status "$tool_name" "$version" "$overall_status" "$run_id"
+        build_lock_release "$tool_name" "$version"
+    fi
+
+    _log_info "=== Build orchestration complete ==="
+    _log_info "Status: $overall_status (success=$success_count, failed=$fail_count)"
+    _log_info "Duration: ${total_duration}s"
+
+    # Return aggregated JSON result
+    local results_json
+    if [[ ${#results[@]} -eq 0 ]]; then
+        results_json="[]"
+    else
+        results_json=$(printf '%s\n' "${results[@]}" | jq -s '.' 2>/dev/null || echo '[]')
+    fi
+
+    cat << EOF
+{
+  "tool": "$tool_name",
+  "version": "$version",
+  "run_id": "$run_id",
+  "status": "$overall_status",
+  "exit_code": $overall_exit_code,
+  "duration_seconds": $total_duration,
+  "summary": {
+    "total": $((success_count + fail_count)),
+    "success": $success_count,
+    "failed": $fail_count
+  },
+  "targets": $results_json
+}
+EOF
+
+    return "$overall_exit_code"
+}
+
+# Generate build manifest from orchestration results
+# Usage: act_generate_manifest <orchestration_result_json> <output_file>
+act_generate_manifest() {
+    local result_json="$1"
+    local output_file="$2"
+
+    local tool version run_id status
+    tool=$(echo "$result_json" | jq -r '.tool')
+    version=$(echo "$result_json" | jq -r '.version')
+    run_id=$(echo "$result_json" | jq -r '.run_id')
+    status=$(echo "$result_json" | jq -r '.status')
+
+    local manifest
+    manifest=$(jq -nc \
+        --arg tool "$tool" \
+        --arg version "$version" \
+        --arg run_id "$run_id" \
+        --arg status "$status" \
+        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        --argjson targets "$(echo "$result_json" | jq '.targets // []')" \
+        '{
+            schema_version: "1.0.0",
+            tool: $tool,
+            version: $version,
+            run_id: $run_id,
+            status: $status,
+            generated_at: $generated_at,
+            artifacts: ($targets | map(select(.status == "success") | {
+                platform: .platform,
+                host: .host,
+                method: .method,
+                path: .artifact_path,
+                duration_seconds: .duration_seconds
+            }))
+        }')
+
+    if [[ -n "$output_file" ]]; then
+        echo "$manifest" > "$output_file"
+        _log_info "Manifest written to: $output_file"
+    else
+        echo "$manifest"
+    fi
 }
 
 # Export functions for use by other scripts
@@ -548,3 +990,5 @@ export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanu
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
 export -f act_list_tools act_build_matrix
+export -f act_get_build_cmd act_get_build_env act_get_local_path
+export -f act_run_native_build act_orchestrate_build act_generate_manifest
