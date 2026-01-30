@@ -60,25 +60,35 @@ DSR_CURRENT_HOST="${DSR_CURRENT_HOST:-}"
 # Creates log directory, sets up log file, handles rotation
 log_init() {
   local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
-  local log_dir="$state_dir/logs"
+  local log_root="$state_dir/logs"
+  local log_date
+  log_date="$(date +%Y-%m-%d)"
+  local day_dir="$log_root/$log_date"
+  local builds_dir="$day_dir/builds"
 
-  # Create log directory if needed
-  if ! mkdir -p "$log_dir" 2>/dev/null; then
-    echo "[logging] Warning: Cannot create log directory $log_dir" >&2
+  # Create date-based log directories if needed
+  if ! mkdir -p "$builds_dir" 2>/dev/null; then
+    echo "[logging] Warning: Cannot create log directory $builds_dir" >&2
     return 0  # Non-fatal, continue without file logging
   fi
 
   # Set log file if not specified
   if [[ -z "$LOG_FILE" ]]; then
-    LOG_FILE="$log_dir/dsr-$(date +%Y%m%d).log"
+    LOG_FILE="$day_dir/run.log"
+  fi
+
+  # Update logs/latest symlink atomically
+  local tmp_link="$log_root/.latest.$$"
+  if ln -sfn "$log_date" "$tmp_link" 2>/dev/null; then
+    mv -f "$tmp_link" "$log_root/latest" 2>/dev/null || true
   fi
 
   # Rotate logs: compress logs older than 7 days
-  find "$log_dir" -name 'dsr-*.log' -mtime +7 ! -name '*.gz' \
+  find "$log_root" -type f -name '*.log' -mtime +7 ! -name '*.gz' \
     -exec gzip -q {} \; 2>/dev/null || true
 
   # Delete logs older than 30 days
-  find "$log_dir" -name 'dsr-*.log*' -mtime +30 -delete 2>/dev/null || true
+  find "$log_root" -type f -name '*.log*' -mtime +30 -delete 2>/dev/null || true
 
   # Log session start
   _log info "Session started" "\"pid\":$$"

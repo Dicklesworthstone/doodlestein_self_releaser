@@ -13,8 +13,11 @@
 #   release   Upload artifacts to GitHub
 #   fallback  Full pipeline: check -> build -> release
 #   repos     Manage repository registry
+#   health    Check health of build hosts
+#   prune     Clean up old artifacts and cache
 #   config    View/modify configuration
 #   doctor    System diagnostics
+#   signing   Manage minisign keys and signing
 #
 # Global Options:
 #   --json, -j          Machine-readable JSON output
@@ -70,9 +73,11 @@ COMMANDS:
     fallback    Full pipeline: check -> build -> release
     repos       Manage repository registry
     health      Check health of build hosts
+    prune       Clean up old artifacts and cache
     config      View/modify configuration
     doctor      System diagnostics
     signing     Manage minisign keys and signing
+    status      System and last run summary
 
 GLOBAL OPTIONS:
     -j, --json          Machine-readable JSON output
@@ -1838,6 +1843,8 @@ cmd_repos_discover() {
 
     # Validate search path
     source "$SCRIPT_DIR/src/guardrails.sh"
+    # shellcheck disable=SC2034 # Used by guardrails is_non_interactive
+    [[ "$NON_INTERACTIVE" == "true" ]] && DSR_NON_INTERACTIVE=true
     search_path=$(resolve_path "$search_path" --must-exist 2>&1) || {
         log_error "Invalid search path: $search_path"
         return 4
@@ -2117,6 +2124,520 @@ cmd_health_clear_cache() {
 }
 
 # ============================================================================
+# PRUNE SUBCOMMAND
+# ============================================================================
+
+_prune_size_bytes() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null || echo 0
+        return 0
+    fi
+    if [[ -d "$path" ]]; then
+        local kb
+        kb=$(du -sk "$path" 2>/dev/null | awk '{print $1}' || echo 0)
+        echo $((kb * 1024))
+        return 0
+    fi
+    echo 0
+}
+
+_prune_mtime_epoch() {
+    local path="$1"
+    stat -c%Y "$path" 2>/dev/null || stat -f%m "$path" 2>/dev/null || echo 0
+}
+
+_prune_epoch_to_iso() {
+    local epoch="$1"
+    if date -u -d "@$epoch" +"%Y-%m-%dT%H:%M:%SZ" >/dev/null 2>&1; then
+        date -u -d "@$epoch" +"%Y-%m-%dT%H:%M:%SZ"
+        return 0
+    fi
+    date -u -r "$epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo ""
+}
+
+_prune_log_file() {
+    local msg="$1"
+    local path="$2"
+    local size_bytes="$3"
+    local log_file="${LOG_FILE:-}"
+
+    [[ -z "$log_file" ]] && return 0
+
+    local ts escaped_msg escaped_path
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    escaped_msg=$(_json_escape "$msg")
+    escaped_path=$(_json_escape "$path")
+
+    cat >> "$log_file" << EOF
+{"ts":"$ts","run_id":"$DSR_RUN_ID","level":"info","cmd":"prune","msg":"$escaped_msg","event":"prune","path":"$escaped_path","size_bytes":$size_bytes}
+EOF
+}
+
+cmd_prune() {
+    local dry_run=false
+    local max_age_days=30
+    local keep_last=5
+    local force=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n)
+                dry_run=true
+                shift
+                ;;
+            --max-age|--cutoff-days)
+                max_age_days="${2:-}"
+                shift 2
+                ;;
+            --keep-last)
+                keep_last="${2:-}"
+                shift 2
+                ;;
+            --force|--yes|-y)
+                force=true
+                shift
+                ;;
+            --help|-h)
+                cat << 'EOF'
+dsr prune - Clean up old artifacts, logs, and cache
+
+USAGE:
+    dsr prune [options]
+
+OPTIONS:
+    -n, --dry-run       Show what would be removed without deleting
+        --max-age DAYS  Remove items older than DAYS (default: 30)
+        --keep-last N   Keep the most recent N build runs per tool/version (default: 5)
+        --force         Skip confirmation prompt
+
+EXAMPLES:
+    dsr prune --dry-run
+    dsr prune --max-age 14 --keep-last 3
+EOF
+                return 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                log_info "Run 'dsr prune --help' for usage"
+                return 4
+                ;;
+        esac
+    done
+
+    if [[ -z "$max_age_days" || ! "$max_age_days" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid --max-age: $max_age_days"
+        return 4
+    fi
+    if [[ -z "$keep_last" || ! "$keep_last" =~ ^[0-9]+$ ]]; then
+        log_error "Invalid --keep-last: $keep_last"
+        return 4
+    fi
+
+    source "$SCRIPT_DIR/src/guardrails.sh"
+
+    local state_dir cache_dir
+    state_dir=$(resolve_path "$DSR_STATE_DIR" 2>/dev/null || echo "$DSR_STATE_DIR")
+    cache_dir=$(resolve_path "$DSR_CACHE_DIR" 2>/dev/null || echo "$DSR_CACHE_DIR")
+
+    if [[ ! -d "$state_dir" ]]; then
+        log_error "State directory not found: $state_dir"
+        if $JSON_MODE; then
+            json_envelope "prune" "error" 4 "{\"state_dir\": \"$state_dir\", \"dry_run\": $dry_run, \"pruned_count\": 0, \"bytes_freed\": 0}"
+        fi
+        return 4
+    fi
+
+    if [[ ! -d "$cache_dir" ]]; then
+        if ! $JSON_MODE; then
+            log_warn "Cache directory not found: $cache_dir (skipping cache cleanup)"
+        fi
+    fi
+
+    if ! $dry_run && ! $force; then
+        if ! confirm "Prune old artifacts and cache in $state_dir and $cache_dir?" "n"; then
+            if $JSON_MODE; then
+                json_envelope "prune" "error" 5 "{\"state_dir\": \"$state_dir\", \"dry_run\": $dry_run, \"pruned_count\": 0, \"bytes_freed\": 0}"
+            fi
+            return 5
+        fi
+    fi
+
+    local now_epoch cutoff_epoch
+    now_epoch=$(date +%s)
+    cutoff_epoch=$((now_epoch - max_age_days * 86400))
+
+    local pruned_count=0
+    local bytes_freed=0
+    local pruned_items=()
+    local errors=()
+
+    _prune_record() {
+        local path="$1"
+        local size_bytes="$2"
+        local mtime_iso="$3"
+        pruned_items+=("{\"path\":\"$(_json_escape "$path")\",\"size_bytes\":$size_bytes,\"mtime\":\"$mtime_iso\"}")
+        pruned_count=$((pruned_count + 1))
+        bytes_freed=$((bytes_freed + size_bytes))
+        if ! $JSON_MODE; then
+            echo "$path"
+        fi
+    }
+
+    _prune_error() {
+        local code="$1"
+        local message="$2"
+        local path="$3"
+        errors+=("{\"code\":\"$code\",\"message\":\"$(_json_escape "$message")\",\"path\":\"$(_json_escape "$path")\"}")
+        if ! $JSON_MODE; then
+            log_warn "$message: $path"
+        fi
+    }
+
+    _prune_consider() {
+        local path="$1"
+        [[ -z "$path" ]] && return 0
+
+        local size_bytes mtime_epoch mtime_iso
+        size_bytes=$(_prune_size_bytes "$path")
+        mtime_epoch=$(_prune_mtime_epoch "$path")
+        mtime_iso=$(_prune_epoch_to_iso "$mtime_epoch")
+
+        if $dry_run; then
+            _prune_record "$path" "$size_bytes" "$mtime_iso"
+            return 0
+        fi
+
+        if safe_rm "$path" --force; then
+            _prune_record "$path" "$size_bytes" "$mtime_iso"
+            _prune_log_file "Pruned path" "$path" "$size_bytes"
+            if ! $JSON_MODE; then
+                log_info "Pruned: $path"
+            fi
+            return 0
+        fi
+
+        _prune_error "E051" "Failed to delete" "$path"
+        return 1
+    }
+
+    if ! $JSON_MODE; then
+        $dry_run && log_info "Dry run: scanning for items older than $max_age_days days..."
+        $dry_run || log_info "Pruning items older than $max_age_days days..."
+    fi
+
+    # Prune old logs
+    if [[ -d "$state_dir/logs" ]]; then
+        while IFS= read -r path; do
+            _prune_consider "$path"
+        done < <(find "$state_dir/logs" -mindepth 1 -maxdepth 1 -type d -mtime +"$max_age_days" 2>/dev/null)
+
+        while IFS= read -r path; do
+            _prune_consider "$path"
+        done < <(find "$state_dir/logs" -type f -mtime +"$max_age_days" 2>/dev/null)
+    fi
+
+    # Prune old manifests
+    if [[ -d "$state_dir/manifests" ]]; then
+        while IFS= read -r path; do
+            _prune_consider "$path"
+        done < <(find "$state_dir/manifests" -type f -mtime +"$max_age_days" 2>/dev/null)
+    fi
+
+    # Prune old artifacts (by version directories)
+    if [[ -d "$state_dir/artifacts" ]]; then
+        while IFS= read -r path; do
+            _prune_consider "$path"
+        done < <(find "$state_dir/artifacts" -mindepth 2 -maxdepth 2 -type d -mtime +"$max_age_days" 2>/dev/null)
+    fi
+
+    # Prune old build runs beyond keep_last
+    if [[ -d "$state_dir/builds" ]]; then
+        local tool_dir version_dir
+        for tool_dir in "$state_dir/builds"/*; do
+            [[ -d "$tool_dir" ]] || continue
+            for version_dir in "$tool_dir"/*; do
+                [[ -d "$version_dir" ]] || continue
+
+                local run_dirs=()
+                while IFS= read -r line; do
+                    run_dirs+=("$line")
+                done < <(
+                    find "$version_dir" -maxdepth 1 -type d -name 'run-*' 2>/dev/null | while read -r dir; do
+                        local mtime
+                        mtime=$(_prune_mtime_epoch "$dir")
+                        echo "$mtime $dir"
+                    done | sort -rn | awk '{print $2}'
+                )
+
+                local idx=0
+                for run_dir in "${run_dirs[@]}"; do
+                    idx=$((idx + 1))
+                    if [[ $idx -le $keep_last ]]; then
+                        continue
+                    fi
+                    local run_mtime
+                    run_mtime=$(_prune_mtime_epoch "$run_dir")
+                    if [[ "$run_mtime" -le "$cutoff_epoch" ]]; then
+                        _prune_consider "$run_dir"
+                    fi
+                done
+            done
+        done
+    fi
+
+    # Prune cache entries
+    if [[ -d "$cache_dir" ]]; then
+        while IFS= read -r path; do
+            _prune_consider "$path"
+        done < <(find "$cache_dir" -mindepth 1 -maxdepth 1 -mtime +"$max_age_days" 2>/dev/null)
+    fi
+
+    local pruned_json errors_json details_json
+    pruned_json=$(printf '%s\n' "${pruned_items[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
+    errors_json=$(printf '%s\n' "${errors[@]}" | jq -sc '.' 2>/dev/null || echo "[]")
+
+    local status="success"
+    local exit_code=0
+    if [[ "${#errors[@]}" -gt 0 ]]; then
+        status="partial"
+        exit_code=1
+    fi
+
+    if $JSON_MODE; then
+        details_json=$(jq -nc \
+            --arg state_dir "$state_dir" \
+            --argjson dry_run "$dry_run" \
+            --argjson cutoff_days "$max_age_days" \
+            --argjson keep_last "$keep_last" \
+            --argjson pruned_count "$pruned_count" \
+            --argjson bytes_freed "$bytes_freed" \
+            --argjson pruned_paths "$pruned_json" \
+            --argjson errors "$errors_json" \
+            '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last, pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths, errors: $errors}')
+        json_envelope "prune" "$status" "$exit_code" "$details_json"
+    else
+        if $dry_run; then
+            log_info "Dry run complete: $pruned_count item(s) would be removed, ${bytes_freed} bytes freed"
+        else
+            log_info "Prune complete: $pruned_count item(s) removed, ${bytes_freed} bytes freed"
+        fi
+    fi
+
+    return $exit_code
+}
+
+# ============================================================================
+# STATUS SUBCOMMAND
+# ============================================================================
+
+# Get last run info from log directory
+_status_get_last_run() {
+    local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    local log_dir="$state_dir/logs"
+    local latest_link="$log_dir/latest"
+
+    if [[ ! -L "$latest_link" ]]; then
+        echo '{"run_id": null, "timestamp": null, "log_file": null}'
+        return
+    fi
+
+    local latest_date
+    latest_date=$(readlink "$latest_link" 2>/dev/null)
+    local run_log="$log_dir/$latest_date/run.log"
+
+    if [[ ! -f "$run_log" ]]; then
+        echo '{"run_id": null, "timestamp": null, "log_file": null}'
+        return
+    fi
+
+    # Extract run_id and timestamp from last session start
+    local last_entry
+    last_entry=$(grep '"msg":"Session started"' "$run_log" 2>/dev/null | tail -1)
+
+    if [[ -n "$last_entry" ]]; then
+        local run_id ts
+        run_id=$(echo "$last_entry" | jq -r '.run_id // empty')
+        ts=$(echo "$last_entry" | jq -r '.ts // empty')
+        jq -nc --arg run_id "$run_id" --arg ts "$ts" --arg log "$run_log" \
+            '{run_id: $run_id, timestamp: $ts, log_file: $log}'
+    else
+        echo '{"run_id": null, "timestamp": null, "log_file": null}'
+    fi
+}
+
+# Get config summary
+_status_get_config() {
+    local config_file="${DSR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsr}/config.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo '{"valid": false, "path": null}'
+        return
+    fi
+
+    echo "{\"valid\": true, \"path\": \"$config_file\"}"
+}
+
+# Get signing status
+_status_get_signing() {
+    local private_key="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/secrets/minisign.key"
+    local public_key="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/minisign.pub"
+
+    local configured=false
+    if [[ -f "$private_key" && -f "$public_key" ]]; then
+        configured=true
+    fi
+
+    echo "{\"configured\": $configured}"
+}
+
+# Status command
+cmd_status() {
+    local refresh=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --refresh|-r)
+                refresh=true
+                shift
+                ;;
+            --help|-h)
+                cat << 'EOF'
+dsr status - System and last run summary
+
+USAGE:
+    dsr status [options]
+
+OPTIONS:
+    --refresh, -r    Refresh host health (makes network calls)
+    --json           JSON output (global flag)
+
+DESCRIPTION:
+    Shows a quick summary of:
+    - Last run information (run_id, timestamp)
+    - Configuration status
+    - Host health (from cache by default)
+    - Signing configuration
+
+    By default, status is read from local state only (<1s).
+    Use --refresh to update host health checks.
+
+EXAMPLES:
+    dsr status                Show cached status
+    dsr status --refresh      Refresh host health
+    dsr status --json         Machine-readable output
+EOF
+                return 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                return 4
+                ;;
+        esac
+    done
+
+    # Collect status information
+    local last_run config_status signing_status hosts_status
+
+    last_run=$(_status_get_last_run)
+    config_status=$(_status_get_config)
+    signing_status=$(_status_get_signing)
+
+    # Get host health (refresh if requested)
+    if $refresh; then
+        log_info "Refreshing host health..."
+        hosts_status=$(host_health_check_all 2>/dev/null | jq -c '.')
+    else
+        # Try to get from cache, fallback to empty
+        local cache_dir="${DSR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dsr}/health"
+        if [[ -d "$cache_dir" ]] && ls "$cache_dir"/*.json &>/dev/null; then
+            hosts_status=$(cat "$cache_dir"/*.json 2>/dev/null | jq -s 'map({(.hostname): .}) | add' 2>/dev/null) || hosts_status='{}'
+        else
+            hosts_status='{}'
+        fi
+    fi
+
+    # Ensure hosts_status is valid JSON
+    if [[ -z "$hosts_status" ]] || ! echo "$hosts_status" | jq -e . &>/dev/null; then
+        hosts_status='{}'
+    fi
+
+    # Build JSON output
+    local json_output
+    json_output=$(jq -nc \
+        --argjson last_run "$last_run" \
+        --argjson config "$config_status" \
+        --argjson signing "$signing_status" \
+        --argjson hosts "$hosts_status" \
+        '{
+            last_run: $last_run,
+            config: $config,
+            signing: $signing,
+            hosts: $hosts
+        }' 2>/dev/null) || json_output='{}'
+
+    if $JSON_MODE; then
+        json_envelope "status" "success" 0 "$json_output"
+    else
+        # Human-readable output
+        echo ""
+        log_info "=== DSR Status ==="
+        echo ""
+
+        # Last run
+        local run_id ts
+        run_id=$(echo "$last_run" | jq -r '.run_id // "none"')
+        ts=$(echo "$last_run" | jq -r '.timestamp // "never"')
+
+        if [[ "$run_id" != "null" && "$run_id" != "none" ]]; then
+            log_info "Last Run:"
+            log_info "  Run ID:    $run_id"
+            log_info "  Timestamp: $ts"
+        else
+            log_info "Last Run: no runs recorded"
+        fi
+        echo ""
+
+        # Config
+        local config_valid config_path
+        config_valid=$(echo "$config_status" | jq -r '.valid')
+        config_path=$(echo "$config_status" | jq -r '.path // "not found"')
+
+        log_info "Configuration:"
+        if [[ "$config_valid" == "true" ]]; then
+            log_ok "  Config: valid ($config_path)"
+        else
+            log_warn "  Config: not found (run 'dsr config init')"
+        fi
+        echo ""
+
+        # Signing
+        local signing_configured
+        signing_configured=$(echo "$signing_status" | jq -r '.configured')
+
+        log_info "Signing:"
+        if [[ "$signing_configured" == "true" ]]; then
+            log_ok "  Keypair: configured"
+        else
+            log_warn "  Keypair: not configured (run 'dsr signing init')"
+        fi
+        echo ""
+
+        # Hosts (if any cached)
+        if [[ -n "$hosts_status" && "$hosts_status" != "{}" && "$hosts_status" != "null" ]]; then
+            log_info "Build Hosts (cached):"
+            echo "$hosts_status" | jq -r 'to_entries[] | "  \(.key): \(.value.status // "unknown")"' 2>/dev/null || true
+        else
+            log_info "Build Hosts: no cached status (use --refresh)"
+        fi
+        echo ""
+    fi
+
+    return 0
+}
+
+# ============================================================================
 # SIGNING SUBCOMMAND
 # ============================================================================
 
@@ -2273,8 +2794,14 @@ main() {
         health)
             cmd_health "$@"
             ;;
+        prune)
+            cmd_prune "$@"
+            ;;
         signing)
             cmd_signing "$@"
+            ;;
+        status)
+            cmd_status "$@"
             ;;
         help)
             show_help

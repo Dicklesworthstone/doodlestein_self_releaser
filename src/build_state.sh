@@ -33,12 +33,28 @@ build_state_init() {
   _BUILD_STATE_DIR="$state_dir/builds"
 
   # Create directories
-  mkdir -p "$_BUILD_STATE_DIR"
+  mkdir -p "$_BUILD_STATE_DIR" "$state_dir/artifacts" "$state_dir/manifests"
 
   # Log initialization
   if command -v log_debug &>/dev/null; then
     log_debug "Build state initialized: $_BUILD_STATE_DIR"
   fi
+}
+
+# Get date-based build logs directory under XDG state
+_build_state_log_root() {
+  local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+  local log_date
+  log_date="$(date +%Y-%m-%d)"
+  echo "$state_dir/logs/$log_date/builds"
+}
+
+# Ensure build logs directory exists and return it
+_build_state_ensure_log_root() {
+  local log_root
+  log_root="$(_build_state_log_root)"
+  mkdir -p "$log_root" 2>/dev/null || true
+  echo "$log_root"
 }
 
 # Get the base directory for a tool/version combination
@@ -264,6 +280,7 @@ build_state_create() {
 
   # Create workspace directory
   mkdir -p "$run_dir/artifacts" "$run_dir/logs"
+  _build_state_ensure_log_root >/dev/null
 
   # Initialize state
   local now
@@ -550,6 +567,11 @@ build_state_artifacts_dir() {
 
 # Get logs directory for a build
 build_state_logs_dir() {
+  _build_state_ensure_log_root
+}
+
+# Get per-run workspace logs directory (legacy)
+build_state_workspace_logs_dir() {
   local workspace
   workspace=$(build_state_workspace "$@") || return 1
   echo "$workspace/logs"
@@ -622,4 +644,5 @@ export -f build_state_create build_state_get build_state_update_status build_sta
 export -f build_state_add_artifact build_state_can_resume
 export -f build_state_completed_hosts build_state_failed_hosts build_state_pending_hosts
 export -f build_state_workspace build_state_artifacts_dir build_state_logs_dir
+export -f build_state_workspace_logs_dir
 export -f build_state_list build_state_cleanup
