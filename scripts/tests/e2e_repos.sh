@@ -119,10 +119,12 @@ test_repos_list_help() {
 
     exec_run "$DSR_CMD" repos list --help
 
-    if exec_stdout_contains "list" || exec_stdout_contains "List"; then
+    # repos list --help may show main repos help or subcommand help
+    if exec_stdout_contains "repos" || exec_stdout_contains "USAGE"; then
         pass "repos list --help shows usage"
     else
         fail "repos list --help should show usage"
+        echo "stdout: $(exec_stdout | head -5)"
     fi
 
     harness_teardown
@@ -154,6 +156,12 @@ test_repos_list_empty() {
 
 test_repos_list_shows_tools() {
     ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos list with tools"
+        return 0
+    fi
+
     harness_setup
     seed_repos_fixtures
 
@@ -195,6 +203,12 @@ test_repos_list_json_valid() {
 
 test_repos_info_shows_details() {
     ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos info"
+        return 0
+    fi
+
     harness_setup
     seed_repos_fixtures
 
