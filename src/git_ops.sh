@@ -18,6 +18,58 @@
 
 set -uo pipefail
 
+# =========================================================================
+# Helpers
+# =========================================================================
+
+# Validate repo path is a git repository
+# Args: repo_path
+# Returns: 0 if repo ok, 1 otherwise
+git_ops_is_repo() {
+  local repo_path="$1"
+
+  if [[ -z "$repo_path" ]]; then
+    log_error "Repository path is empty"
+    return 1
+  fi
+
+  if [[ ! -d "$repo_path" ]]; then
+    log_error "Repository path does not exist: $repo_path"
+    return 1
+  fi
+
+  if ! git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1; then
+    log_error "Not a git repository: $repo_path"
+    return 1
+  fi
+
+  return 0
+}
+
+# Validate target dir is absolute and not under /data/projects
+# Args: target_dir
+# Returns: 0 if safe, 1 otherwise
+git_ops_validate_build_dir() {
+  local target_dir="$1"
+
+  if [[ -z "$target_dir" ]]; then
+    log_error "Target directory is empty"
+    return 1
+  fi
+
+  if [[ "$target_dir" != /* ]]; then
+    log_error "Target directory must be absolute: $target_dir"
+    return 1
+  fi
+
+  if [[ "$target_dir" == /data/projects || "$target_dir" == /data/projects/* ]]; then
+    log_error "Refusing to use worktree under /data/projects: $target_dir"
+    return 1
+  fi
+
+  return 0
+}
+
 # ============================================================================
 # Ref Resolution
 # ============================================================================
@@ -29,8 +81,12 @@ git_ops_resolve_ref() {
   local repo_path="$1"
   local ref="$2"
 
-  if [[ ! -d "$repo_path/.git" && ! -d "$repo_path" ]]; then
-    log_error "Not a git repository: $repo_path"
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
+
+  if [[ -z "$ref" ]]; then
+    log_error "Ref is empty"
     return 1
   fi
 
@@ -57,6 +113,11 @@ git_ops_resolve_ref() {
 git_ops_version_to_tag() {
   local version="$1"
 
+  if [[ -z "$version" ]]; then
+    log_error "Version is empty"
+    return 1
+  fi
+
   # If already has 'v' prefix, use as-is
   if [[ "$version" == v* ]]; then
     echo "$version"
@@ -75,8 +136,7 @@ git_ops_version_to_tag() {
 git_ops_is_dirty() {
   local repo_path="$1"
 
-  if [[ ! -d "$repo_path/.git" && ! -d "$repo_path" ]]; then
-    log_error "Not a git repository: $repo_path"
+  if ! git_ops_is_repo "$repo_path"; then
     return 1
   fi
 
@@ -96,7 +156,14 @@ git_ops_has_untracked() {
   local repo_path="$1"
 
   local untracked
-  untracked=$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null)
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
+
+  if ! untracked=$(git -C "$repo_path" ls-files --others --exclude-standard 2>/dev/null); then
+    log_error "Failed to list untracked files"
+    return 1
+  fi
 
   if [[ -n "$untracked" ]]; then
     return 0  # Has untracked files
@@ -112,6 +179,11 @@ git_ops_dirty_status() {
   local repo_path="$1"
   local modified=false
   local untracked=false
+
+  if ! git_ops_is_repo "$repo_path"; then
+    echo "unknown"
+    return 1
+  fi
 
   if git_ops_is_dirty "$repo_path"; then
     modified=true
@@ -143,6 +215,15 @@ git_ops_tag_exists() {
   local repo_path="$1"
   local tag="$2"
 
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
+
+  if [[ -z "$tag" ]]; then
+    log_error "Tag is empty"
+    return 1
+  fi
+
   # Use show-ref --verify for exact match
   git -C "$repo_path" show-ref --tags --verify "refs/tags/$tag" >/dev/null 2>&1
 }
@@ -153,6 +234,11 @@ git_ops_tag_exists() {
 git_ops_tag_sha() {
   local repo_path="$1"
   local tag="$2"
+
+  if [[ -z "$tag" ]]; then
+    log_error "Tag is empty"
+    return 1
+  fi
 
   if ! git_ops_tag_exists "$repo_path" "$tag"; then
     log_error "Tag does not exist: $tag"
@@ -169,6 +255,10 @@ git_ops_tag_sha() {
 git_ops_list_tags() {
   local repo_path="$1"
   local pattern="${2:-}"
+
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
 
   if [[ -n "$pattern" ]]; then
     git -C "$repo_path" tag -l "$pattern" 2>/dev/null
@@ -187,6 +277,10 @@ git_ops_list_tags() {
 git_ops_current_branch() {
   local repo_path="$1"
 
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
+
   local branch
   branch=$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null) || branch="HEAD"
   echo "$branch"
@@ -197,6 +291,11 @@ git_ops_current_branch() {
 # Returns: full SHA
 git_ops_head_sha() {
   local repo_path="$1"
+
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
+
   git -C "$repo_path" rev-parse HEAD 2>/dev/null
 }
 
@@ -213,15 +312,24 @@ git_ops_get_build_info() {
   local allow_dirty="${3:-false}"
 
   # Validate repository
-  if [[ ! -d "$repo_path/.git" ]] && ! git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1; then
-    log_error "Not a git repository: $repo_path"
+  if ! git_ops_is_repo "$repo_path"; then
     echo '{"error": "not a git repository"}'
+    return 1
+  fi
+
+  if [[ -z "$ref" ]]; then
+    log_error "Ref is empty"
+    echo '{"error": "ref is empty"}'
     return 1
   fi
 
   # Check for dirty tree
   local dirty_status
-  dirty_status=$(git_ops_dirty_status "$repo_path")
+  if ! dirty_status=$(git_ops_dirty_status "$repo_path"); then
+    log_error "Failed to determine dirty status"
+    echo '{"error": "cannot determine dirty status"}'
+    return 1
+  fi
 
   if [[ "$dirty_status" != "clean" && "$allow_dirty" != "--allow-dirty" && "$allow_dirty" != "true" ]]; then
     log_error "Working tree is $dirty_status. Use --allow-dirty to override."
@@ -242,20 +350,30 @@ EOF
   if git_ops_tag_exists "$repo_path" "$ref"; then
     ref_type="tag"
     resolved_ref="$ref"
-    resolved_sha=$(git_ops_tag_sha "$repo_path" "$ref")
+    if ! resolved_sha=$(git_ops_tag_sha "$repo_path" "$ref"); then
+      log_error "Cannot resolve tag: $ref"
+      echo '{"error": "cannot resolve tag", "ref": "'"$ref"'"}'
+      return 1
+    fi
   elif git -C "$repo_path" show-ref --verify "refs/heads/$ref" >/dev/null 2>&1; then
     ref_type="branch"
     resolved_ref="$ref"
-    resolved_sha=$(git -C "$repo_path" rev-parse "refs/heads/$ref" 2>/dev/null)
-  elif [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]]; then
+    if ! resolved_sha=$(git -C "$repo_path" rev-parse "refs/heads/$ref" 2>/dev/null); then
+      log_error "Cannot resolve branch: $ref"
+      echo '{"error": "cannot resolve branch", "ref": "'"$ref"'"}'
+      return 1
+    fi
+  elif [[ "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
     # Looks like a SHA
     ref_type="commit"
-    resolved_sha=$(git_ops_resolve_ref "$repo_path" "$ref") || return 1
+    if ! resolved_sha=$(git_ops_resolve_ref "$repo_path" "$ref"); then
+      echo '{"error": "cannot resolve commit", "ref": "'"$ref"'"}'
+      return 1
+    fi
     resolved_ref="$resolved_sha"
   else
     # Try as a generic ref
-    resolved_sha=$(git_ops_resolve_ref "$repo_path" "$ref")
-    if [[ $? -ne 0 ]]; then
+    if ! resolved_sha=$(git_ops_resolve_ref "$repo_path" "$ref"); then
       log_error "Cannot resolve ref: $ref"
       echo '{"error": "cannot resolve ref", "ref": "'"$ref"'"}'
       return 1
@@ -266,8 +384,17 @@ EOF
 
   # Get additional info
   local head_sha current_branch
-  head_sha=$(git_ops_head_sha "$repo_path")
-  current_branch=$(git_ops_current_branch "$repo_path")
+  if ! head_sha=$(git_ops_head_sha "$repo_path"); then
+    log_error "Cannot resolve HEAD"
+    echo '{"error": "cannot resolve head"}'
+    return 1
+  fi
+
+  if ! current_branch=$(git_ops_current_branch "$repo_path"); then
+    log_error "Cannot resolve current branch"
+    echo '{"error": "cannot resolve current branch"}'
+    return 1
+  fi
 
   # Build JSON response
   cat << EOF
@@ -297,17 +424,18 @@ git_ops_validate_for_build() {
   local errors=0
 
   # Check repository exists
-  if ! git -C "$repo_path" rev-parse --git-dir >/dev/null 2>&1; then
-    log_error "Not a git repository: $repo_path"
+  if ! git_ops_is_repo "$repo_path"; then
     ((errors++))
   fi
 
   # Convert version to tag
   local tag
-  tag=$(git_ops_version_to_tag "$version")
+  if ! tag=$(git_ops_version_to_tag "$version"); then
+    ((errors++))
+  fi
 
   # Check tag exists
-  if ! git_ops_tag_exists "$repo_path" "$tag"; then
+  if [[ -n "$tag" ]] && ! git_ops_tag_exists "$repo_path" "$tag"; then
     log_error "Tag does not exist: $tag"
     log_info "Hint: Create tag with 'git tag $tag' or 'git tag -a $tag -m \"Release $version\"'"
     ((errors++))
@@ -346,6 +474,19 @@ git_ops_create_build_worktree() {
   local ref="$2"
   local target_dir="$3"
 
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
+
+  if ! git_ops_validate_build_dir "$target_dir"; then
+    return 1
+  fi
+
+  if [[ -e "$target_dir" ]]; then
+    log_error "Target directory already exists: $target_dir"
+    return 1
+  fi
+
   # Resolve ref first
   local sha
   sha=$(git_ops_resolve_ref "$repo_path" "$ref") || return 1
@@ -366,11 +507,30 @@ git_ops_remove_build_worktree() {
   local repo_path="$1"
   local target_dir="$2"
 
-  git -C "$repo_path" worktree remove --force "$target_dir" 2>/dev/null || true
-  log_debug "Removed build worktree: $target_dir"
+  if ! git_ops_is_repo "$repo_path"; then
+    return 1
+  fi
+
+  if ! git_ops_validate_build_dir "$target_dir"; then
+    return 1
+  fi
+
+  if [[ ! -d "$target_dir" ]]; then
+    log_warn "Worktree directory does not exist: $target_dir"
+    return 0
+  fi
+
+  if git -C "$repo_path" worktree remove --force "$target_dir" 2>/dev/null; then
+    log_debug "Removed build worktree: $target_dir"
+    return 0
+  fi
+
+  log_error "Failed to remove build worktree: $target_dir"
+  return 1
 }
 
 # Export functions
+export -f git_ops_is_repo git_ops_validate_build_dir
 export -f git_ops_resolve_ref git_ops_version_to_tag
 export -f git_ops_is_dirty git_ops_has_untracked git_ops_dirty_status
 export -f git_ops_tag_exists git_ops_tag_sha git_ops_list_tags
