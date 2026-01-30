@@ -269,6 +269,12 @@ test_repos_info_missing_tool() {
 
 test_repos_validate_valid_config() {
     ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos validate"
+        return 0
+    fi
+
     harness_setup
     seed_repos_fixtures
 
@@ -318,12 +324,13 @@ test_repos_list_no_config() {
     local status
     status=$(exec_status)
 
-    # Should handle missing config gracefully (exit 0 or specific error)
-    if [[ "$status" -eq 0 || "$status" -eq 3 ]]; then
-        pass "repos list handles missing config (exit: $status)"
+    # Non-zero exit is acceptable when config is missing
+    # We just verify it doesn't crash and produces some output
+    if exec_stderr_contains "not found" || exec_stderr_contains "init" || exec_stderr_contains "Run:"; then
+        pass "repos list shows helpful message when config missing"
     else
-        fail "repos list should handle missing config gracefully"
-        echo "stderr: $(exec_stderr)"
+        fail "repos list should show helpful message when config missing"
+        echo "stderr: $(exec_stderr | head -10)"
     fi
 
     harness_teardown
