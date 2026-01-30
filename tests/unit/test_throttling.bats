@@ -624,9 +624,12 @@ teardown() {
     # The key is that it doesn't crash with a bash error
     run _watch_is_triggered "any-id"
 
-    # jq returns exit code 1 on parse error, which is treated as "not triggered"
-    # This is the expected behavior - corrupted file = assume not triggered
-    assert_equal "1" "$status" "Corrupted JSON should be treated as 'not triggered'"
+    # jq returns various exit codes (1 or 5) for parse errors
+    # This is treated as "not triggered" - corrupted file = assume not triggered
+    [[ "$status" -ne 0 ]] || {
+        echo "Corrupted JSON should return non-zero (got status=$status)" >&2
+        return 1
+    }
 }
 
 @test "edge: jitter with zero percent would return base" {
