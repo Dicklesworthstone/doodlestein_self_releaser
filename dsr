@@ -43,6 +43,8 @@ source "$SCRIPT_DIR/src/signing.sh"
 source "$SCRIPT_DIR/src/github.sh"
 source "$SCRIPT_DIR/src/host_health.sh"
 source "$SCRIPT_DIR/src/quality_gates.sh"
+source "$SCRIPT_DIR/src/build_state.sh"
+source "$SCRIPT_DIR/src/git_ops.sh"
 
 # Global flags
 JSON_MODE=false

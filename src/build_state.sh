@@ -460,6 +460,65 @@ build_state_add_artifact() {
   log_debug "Artifact added: $artifact_name"
 }
 
+# Set git info for a build (for reproducibility tracking)
+# Args: tool version git_sha git_ref [run_id]
+build_state_set_git_info() {
+  local tool="$1"
+  local version="$2"
+  local git_sha="$3"
+  local git_ref="$4"
+  local run_id="${5:-latest}"
+
+  local tool_dir
+  tool_dir=$(_build_get_tool_dir "$tool" "$version")
+
+  if [[ "$run_id" == "latest" ]]; then
+    run_id=$(readlink "$tool_dir/latest" 2>/dev/null || true)
+    [[ -z "$run_id" ]] && return 1
+  fi
+
+  local state_file="$tool_dir/$run_id/state.json"
+  [[ ! -f "$state_file" ]] && return 1
+
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # Update git info
+  local tmp_file="$state_file.tmp"
+  jq --arg sha "$git_sha" --arg ref "$git_ref" --arg now "$now" \
+    '.git_sha = $sha | .git_ref = $ref | .updated_at = $now' \
+    "$state_file" > "$tmp_file" \
+    && mv "$tmp_file" "$state_file"
+
+  log_debug "Git info set: $git_ref ($git_sha)"
+}
+
+# Get git SHA from build state
+# Args: tool version [run_id]
+# Returns: SHA on stdout, or empty
+build_state_get_git_sha() {
+  local tool="$1"
+  local version="$2"
+  local run_id="${3:-latest}"
+
+  local state
+  state=$(build_state_get "$tool" "$version" "$run_id" 2>/dev/null) || return 1
+  echo "$state" | jq -r '.git_sha // empty'
+}
+
+# Get git ref from build state
+# Args: tool version [run_id]
+# Returns: ref on stdout, or empty
+build_state_get_git_ref() {
+  local tool="$1"
+  local version="$2"
+  local run_id="${3:-latest}"
+
+  local state
+  state=$(build_state_get "$tool" "$version" "$run_id" 2>/dev/null) || return 1
+  echo "$state" | jq -r '.git_ref // empty'
+}
+
 # ============================================================================
 # Resume Support
 # ============================================================================
@@ -642,6 +701,7 @@ build_state_cleanup() {
 export -f build_state_init build_lock_acquire build_lock_release build_lock_check build_lock_info
 export -f build_state_create build_state_get build_state_update_status build_state_update_host
 export -f build_state_add_artifact build_state_can_resume
+export -f build_state_set_git_info build_state_get_git_sha build_state_get_git_ref
 export -f build_state_completed_hosts build_state_failed_hosts build_state_pending_hosts
 export -f build_state_workspace build_state_artifacts_dir build_state_logs_dir
 export -f build_state_workspace_logs_dir
