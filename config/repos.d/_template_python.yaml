@@ -1,0 +1,73 @@
+# Template for Python CLI tools
+# Copy this file and customize for each Python tool
+#
+# Usage:
+#   cp _template_python.yaml mcp_agent_mail.yaml
+#   Edit the values for your specific tool
+
+tool_name: example-python-tool
+
+# GitHub repository
+repo: Dicklesworthstone/example-python-tool
+local_path: /data/projects/example-python-tool
+
+# Build configuration
+language: python
+binary_name: example-tool
+# Python typically uses pip/pipx install
+build_cmd: pip install -e .
+main_module: example_tool
+
+# Target platforms (Python wheels are typically platform-independent)
+targets:
+  - linux/amd64
+  - linux/arm64
+  - darwin/arm64
+  - darwin/amd64
+  - windows/amd64
+
+# GitHub Actions workflow
+workflow: .github/workflows/release.yml
+
+# act job mapping
+# Python wheels are cross-platform, so we only need to build once
+act_job_map:
+  linux/amd64: build-wheel
+  linux/arm64: build-wheel       # Same wheel works on ARM
+  darwin/arm64: null             # Use the same wheel
+  darwin/amd64: null             # Use the same wheel
+  windows/amd64: null            # Use the same wheel
+
+# Pre-build checks
+checks:
+  - pip install -e ".[dev]"
+  - pytest
+  - ruff check .
+  - mypy .
+
+# Artifact naming pattern
+# Python uses wheel naming convention: {distribution}-{version}-{python}-{abi}-{platform}.whl
+artifact_naming: "${name}-${version}-py3-none-any.whl"
+
+# Archive format (Python wheels are zip files)
+archive_format:
+  linux: whl
+  darwin: whl
+  windows: whl
+
+# Additional files to include
+include_files:
+  - README.md
+  - LICENSE
+  - pyproject.toml
+
+# Environment variables for builds
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+# Python-specific settings
+python:
+  min_version: "3.10"
+  package_manager: pip           # or uv, poetry, pdm
+  publish_to: pypi               # or test-pypi, none
