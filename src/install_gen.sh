@@ -484,6 +484,12 @@ main() {
         fi
 
         _download_and_verify "$download_url" "$archive_file" "$checksums_url" || return $?
+
+        # Verify minisign signature if available
+        if $_VERIFY || $_REQUIRE_SIGNATURES; then
+            local sig_url="${download_url}.minisig"
+            _verify_minisign "$archive_file" "$sig_url" || return $?
+        fi
     fi
 
     # Extract
@@ -620,6 +626,17 @@ install_gen_create() {
     artifact_naming="${artifact_naming#\"}"
     artifact_naming="${artifact_naming%\"}"
 
+    # Get minisign public key (from tool config or global dsr config)
+    local minisign_pubkey=""
+    minisign_pubkey=$(_install_gen_yaml_get "$config_file" "minisign_pubkey" "")
+    if [[ -z "$minisign_pubkey" ]]; then
+        # Try global config
+        local global_config="$_IG_CONFIG_DIR/config.yaml"
+        if [[ -f "$global_config" ]]; then
+            minisign_pubkey=$(_install_gen_yaml_get "$global_config" "signing.minisign_pubkey" "")
+        fi
+    fi
+
     if [[ -z "$repo" ]]; then
         log_error "No repo defined in config"
         return 4
@@ -655,6 +672,7 @@ install_gen_create() {
     template="${template//__ARCHIVE_FORMAT_DARWIN__/$archive_darwin}"
     template="${template//__ARCHIVE_FORMAT_WINDOWS__/$archive_windows}"
     template="${template//__ARTIFACT_NAMING__/$artifact_naming}"
+    template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
 
     echo "$template" > "$output_file"
     chmod +x "$output_file"

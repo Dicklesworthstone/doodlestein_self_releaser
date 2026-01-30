@@ -190,8 +190,21 @@ test_watch_creates_state_dir() {
 # Tests: Full Watch (requires real GH auth - run outside harness isolation)
 # ============================================================================
 
+# Save original XDG_CONFIG_HOME before any tests modify it
+_ORIGINAL_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-}"
+
+_restore_real_xdg() {
+    # Restore original XDG_CONFIG_HOME so gh auth works
+    if [[ -n "$_ORIGINAL_XDG_CONFIG_HOME" ]]; then
+        export XDG_CONFIG_HOME="$_ORIGINAL_XDG_CONFIG_HOME"
+    else
+        unset XDG_CONFIG_HOME
+    fi
+}
+
 test_watch_with_real_auth() {
     ((TESTS_RUN++))
+    _restore_real_xdg
 
     # Skip if gh auth not available in real environment
     if ! gh auth status &>/dev/null; then
@@ -199,7 +212,7 @@ test_watch_with_real_auth() {
         return 0
     fi
 
-    # Run WITHOUT harness_setup to use real GH auth
+    # Run with real GH auth (no harness isolation)
     local output status
     output=$(timeout 30 "$DSR_CMD" --json watch --once --dry-run 2>/dev/null)
     status=$?
@@ -214,6 +227,7 @@ test_watch_with_real_auth() {
 
 test_watch_real_auth_json_has_details() {
     ((TESTS_RUN++))
+    _restore_real_xdg
 
     if ! gh auth status &>/dev/null; then
         skip "gh auth not available for JSON details test"
@@ -232,6 +246,7 @@ test_watch_real_auth_json_has_details() {
 
 test_watch_real_auth_json_has_triggered_state() {
     ((TESTS_RUN++))
+    _restore_real_xdg
 
     if ! gh auth status &>/dev/null; then
         skip "gh auth not available for triggered state test"
