@@ -33,7 +33,8 @@ DSR_VERSION="0.1.0"
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source modules
+# Source modules (logging first, others may depend on it)
+source "$SCRIPT_DIR/src/logging.sh"
 source "$SCRIPT_DIR/src/config.sh"
 source "$SCRIPT_DIR/src/signing.sh"
 source "$SCRIPT_DIR/src/github.sh"
@@ -45,22 +46,8 @@ VERBOSE=false
 QUIET=false
 NON_INTERACTIVE=false
 
-# Colors (unless disabled)
-if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
-    RED=$'\033[0;31m'
-    GREEN=$'\033[0;32m'
-    YELLOW=$'\033[0;33m'
-    BLUE=$'\033[0;34m'
-    NC=$'\033[0m'
-else
-    RED='' GREEN='' YELLOW='' BLUE='' NC=''
-fi
-
-log_info()  { $QUIET || echo "${BLUE}[dsr]${NC} $*" >&2; }
-log_ok()    { $QUIET || echo "${GREEN}[dsr]${NC} $*" >&2; }
-log_warn()  { echo "${YELLOW}[dsr]${NC} $*" >&2; }
-log_error() { echo "${RED}[dsr]${NC} $*" >&2; }
-log_debug() { $VERBOSE && echo "${BLUE}[debug]${NC} $*" >&2 || true; }
+# Note: Colors and log functions are now provided by src/logging.sh
+# The logging module provides: log_error, log_warn, log_info, log_debug, log_ok, log_timed
 
 # Show help
 show_help() {
@@ -118,14 +105,11 @@ json_envelope() {
     local cmd="$1"
     local vstatus="$2"  # renamed to avoid potential conflict
     local exit_code="$3"
-    local details="${4:-{}}"
+    local details="${4:-"{}"}"
     local run_id
     run_id=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown")
     local started_at
     started_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-    # DEBUG
-    echo "DEBUG in json_envelope: details braces: $(echo "$details" | tr -cd '{' | wc -c) { $(echo "$details" | tr -cd '}' | wc -c) }" >&2
 
     cat << EOF
 {
@@ -420,11 +404,7 @@ cmd_doctor() {
         # Build details as proper JSON object using jq for correctness
         details_json=$(jq -nc --argjson errors "$errors" --argjson warnings "$warnings" --argjson checks "$checks_json" \
             '{errors: $errors, warnings: $warnings, checks: $checks}')
-        # DEBUG
-        echo "DEBUG checks_json braces: $(echo "$checks_json" | tr -cd '{' | wc -c) { $(echo "$checks_json" | tr -cd '}' | wc -c) }" >&2
-        echo "DEBUG details_json braces: $(echo "$details_json" | tr -cd '{' | wc -c) { $(echo "$details_json" | tr -cd '}' | wc -c) }" >&2
-        echo "DEBUG details_json last 30: ${details_json: -30}" >&2
-        json_envelope "doctor" "$([ $errors -eq 0 ] && echo success || echo error)" $exit_code "$details_json"
+        json_envelope "doctor" "$([ $errors -eq 0 ] && echo success || echo error)" "$exit_code" "$details_json"
     fi
 
     return $exit_code
@@ -581,6 +561,10 @@ main() {
         esac
     done
 
+    # Initialize logging with appropriate level
+    log_set_level_from_flags "$VERBOSE" "$QUIET"
+    log_init
+
     # Get command
     local command="${1:-}"
     shift 2>/dev/null || true
@@ -589,6 +573,9 @@ main() {
         show_help
         exit 0
     fi
+
+    # Set command context for logging
+    log_set_command "$command"
 
     # Dispatch to command handler
     case "$command" in
