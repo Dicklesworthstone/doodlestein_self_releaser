@@ -56,6 +56,7 @@ source "$SCRIPT_DIR/src/build_state.sh"
 source "$SCRIPT_DIR/src/git_ops.sh"
 source "$SCRIPT_DIR/src/version.sh"
 source "$SCRIPT_DIR/src/act_runner.sh"
+source "$SCRIPT_DIR/src/release_formulas.sh"
 
 # Global flags
 JSON_MODE=false
@@ -1925,6 +1926,10 @@ EOF
                 return 4
             fi
             log_info "Tag $tag verified locally"
+        elif $verify_tag; then
+            # User explicitly requested verification but no local path available
+            log_warn "Cannot verify tag: local_path not configured for $tool_name"
+            log_info "Tag verification skipped (GitHub will validate on release)"
         fi
     fi
 
@@ -1988,7 +1993,7 @@ EOF
 
     if [[ $create_status -ne 0 ]]; then
         # Check if release already exists
-        release_json=$(gh api "repos/$repo/releases/tags/$tag" 2>/dev/null)
+        release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
         if [[ -n "$release_json" ]] && echo "$release_json" | jq -e '.id' &>/dev/null; then
             log_info "Release $tag already exists, using existing release"
         else
@@ -2107,6 +2112,7 @@ EOF
         while IFS= read -r expected_file; do
             [[ -z "$expected_file" ]] && continue
             local found=false
+            # Check uploaded assets
             for asset in "${uploaded_assets[@]}"; do
                 local asset_name
                 asset_name=$(echo "$asset" | jq -r '.name')
@@ -2115,6 +2121,15 @@ EOF
                     break
                 fi
             done
+            # Also check skipped assets (from resume mode - already uploaded previously)
+            if ! $found; then
+                for skipped in "${skipped_assets[@]}"; do
+                    if [[ "$skipped" == "$expected_file" ]]; then
+                        found=true
+                        break
+                    fi
+                done
+            fi
             if ! $found; then
                 missing_assets+=("$expected_file")
                 verification_status="incomplete"
@@ -2463,9 +2478,9 @@ EOF
                         break
                     fi
 
-                    # Get expected checksum from file
+                    # Get expected checksum from file (use awk for literal filename matching)
                     local expected_sum
-                    expected_sum=$(grep -E "^[a-f0-9]+[[:space:]]+\*?$name$" "$checksums_file" 2>/dev/null | awk '{print $1}')
+                    expected_sum=$(awk -v fname="$name" '$2 == fname || $2 == "*" fname {print $1; exit}' "$checksums_file" 2>/dev/null)
 
                     if [[ -n "$expected_sum" ]]; then
                         log_info "  Verifying: $name"
@@ -2477,7 +2492,12 @@ EOF
 
                         if curl -sL "$asset_url" -o "$asset_file" 2>/dev/null; then
                             local actual_sum
-                            actual_sum=$(sha256sum "$asset_file" | awk '{print $1}')
+                            # Use sha256sum on Linux, shasum -a 256 on macOS
+                            if command -v sha256sum &>/dev/null; then
+                                actual_sum=$(sha256sum "$asset_file" | awk '{print $1}')
+                            else
+                                actual_sum=$(shasum -a 256 "$asset_file" | awk '{print $1}')
+                            fi
 
                             if [[ "$expected_sum" == "$actual_sum" ]]; then
                                 log_ok "    Checksum OK"

@@ -481,13 +481,29 @@ gh_upload_asset() {
         return 3
     fi
 
-    curl -sS -f \
+    # Use -w to capture HTTP status, don't use -f so we can capture error response body
+    local http_code response
+    response=$(curl -sS \
         -X POST \
         -H "Accept: application/vnd.github+json" \
         -H "Authorization: Bearer $token" \
         -H "Content-Type: $content_type" \
         --data-binary "@$file_path" \
-        "$upload_url"
+        -w "\n__HTTP_CODE__%{http_code}" \
+        "$upload_url" 2>&1)
+
+    http_code="${response##*__HTTP_CODE__}"
+    response="${response%__HTTP_CODE__*}"
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        echo "$response"
+        return 0
+    else
+        _gh_log_error "Upload failed with HTTP $http_code"
+        # Output response for debugging (may contain GitHub error message)
+        echo "$response" >&2
+        return 7
+    fi
 }
 
 # Compare two commits/tags
