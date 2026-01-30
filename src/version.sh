@@ -46,7 +46,8 @@ version_detect() {
     if [[ -n "$language" ]]; then
         version=$(_version_detect_by_language "$repo_path" "$language")
         echo "$version"
-        return $([[ -n "$version" ]] && echo 0 || echo 1)
+        [[ -n "$version" ]]
+        return $?
     fi
 
     # Auto-detect: try each language in order of prevalence
