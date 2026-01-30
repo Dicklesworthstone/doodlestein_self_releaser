@@ -612,6 +612,19 @@ act_get_build_env() {
     echo "$result"
 }
 
+# Get GitHub repo for a tool
+# Usage: act_get_repo <tool_name>
+act_get_repo() {
+    local tool_name="$1"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        return 4
+    fi
+
+    yq -r '.repo // ""' "$config_file" 2>/dev/null
+}
+
 # Get local path for a tool
 # Usage: act_get_local_path <tool_name>
 act_get_local_path() {
@@ -969,6 +982,7 @@ act_generate_manifest() {
                 host: .host,
                 method: .method,
                 path: .artifact_path,
+                filename: (.artifact_path | split("/") | last),
                 duration_seconds: .duration_seconds
             }))
         }')
@@ -987,5 +1001,5 @@ export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanu
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
 export -f act_list_tools act_build_matrix
-export -f act_get_build_cmd act_get_build_env act_get_local_path
+export -f act_get_build_cmd act_get_build_env act_get_repo act_get_local_path
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
