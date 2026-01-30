@@ -135,16 +135,42 @@ selector_acquire_slot() {
     local lock_dir="$_SELECTOR_LOCKS_DIR/$hostname"
     mkdir -p "$lock_dir"
 
-    local lock_file="$lock_dir/${run_id}.lock"
-
-    # Check capacity
-    if ! selector_has_capacity "$hostname"; then
-        if $wait_mode; then
-            _sel_log_info "Host $hostname at capacity, waiting..."
-            while ! selector_has_capacity "$hostname"; do
-                sleep 5
-            done
+    local slot_file="$lock_dir/${run_id}.lock"
+    local global_lock_file="$_SELECTOR_STATE_DIR/selector.lock"
+    
+    # Helper to run in critical section
+    _with_lock() {
+        if command -v flock &>/dev/null; then
+            (
+                flock -x 200
+                "$@"
+            ) 200>"$global_lock_file"
         else
+            "$@"
+        fi
+    }
+
+    # Helper to attempt acquisition
+    _try_acquire() {
+        if selector_has_capacity "$hostname"; then
+            echo "$run_id" > "$slot_file"
+            touch "$slot_file"
+            return 0
+        else
+            return 1
+        fi
+    }
+
+    if $wait_mode; then
+        _sel_log_info "Host $hostname at capacity, waiting..."
+        while true; do
+            if _with_lock _try_acquire; then
+                break
+            fi
+            sleep 5
+        done
+    else
+        if ! _with_lock _try_acquire; then
             local limit usage
             limit=$(selector_get_limit "$hostname")
             usage=$(selector_get_usage "$hostname")
@@ -152,10 +178,6 @@ selector_acquire_slot() {
             return 2
         fi
     fi
-
-    # Create lock file
-    echo "$run_id" > "$lock_file"
-    touch "$lock_file"
 
     local usage
     usage=$(selector_get_usage "$hostname")
@@ -197,7 +219,7 @@ selector_get_candidates() {
         esac
     done
 
-    local os
+    local os=""
     if [[ -n "$target" ]]; then
         os="${target%/*}"
     fi

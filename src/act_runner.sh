@@ -77,9 +77,9 @@ act_get_runner() {
     else
         # Fallback: grep-based extraction (handles simple cases)
         awk -v job="$job_id:" '
-            $0 ~ job { in_job=1 }
+            $0 ~ "^[[:space:]]*" job { in_job=1 }
             in_job && /runs-on:/ { gsub(/.*runs-on:[ ]*/, ""); gsub(/["\047]/, ""); print; exit }
-            in_job && /^[a-z]/ && $0 !~ job { exit }
+            in_job && /^[[:space:]]*[a-zA-Z]/ && $0 !~ job { exit }
         ' "$workflow"
     fi
 }
@@ -718,7 +718,7 @@ EOF
         env_exports+="export $env_pair; "
     done
 
-    local remote_cmd="cd '$local_path' && $env_exports$build_cmd"
+    local remote_cmd="cd '${local_path//\'/\'\\\'\'}' && $env_exports$build_cmd"
 
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
