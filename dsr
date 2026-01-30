@@ -36,6 +36,12 @@ DSR_VERSION="0.1.0"
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Source guardrails first for Bash version check
+source "$SCRIPT_DIR/src/guardrails.sh"
+
+# Enforce Bash 4.0+ requirement
+require_bash_4 || exit $?
+
 # Source modules (logging first, others may depend on it)
 source "$SCRIPT_DIR/src/logging.sh"
 source "$SCRIPT_DIR/src/config.sh"
