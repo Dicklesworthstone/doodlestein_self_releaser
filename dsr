@@ -41,9 +41,11 @@ source "$SCRIPT_DIR/src/github.sh"
 
 # Global flags
 JSON_MODE=false
+# shellcheck disable=SC2034  # Reserved for future use
 DRY_RUN=false
 VERBOSE=false
 QUIET=false
+# shellcheck disable=SC2034  # Reserved for future use
 NON_INTERACTIVE=false
 
 # Note: Colors and log functions are now provided by src/logging.sh
@@ -414,10 +416,265 @@ cmd_doctor() {
 # STUB COMMANDS (to be implemented)
 # ============================================================================
 
+# ============================================================================
+# CHECK SUBCOMMAND
+# ============================================================================
+
 cmd_check() {
-    log_warn "check command not yet implemented"
-    log_info "See bead bd-1jt.1.1 for implementation plan"
-    return 4
+    local repos=()
+    local threshold=600  # 10 minutes in seconds
+    local check_all=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repos|-r)
+                IFS=',' read -ra repos <<< "$2"
+                shift 2
+                ;;
+            --threshold|-t)
+                threshold="$2"
+                shift 2
+                ;;
+            --all|-a)
+                check_all=true
+                shift
+                ;;
+            --help|-h)
+                cat << 'EOF'
+dsr check - Detect throttled GitHub Actions runs
+
+USAGE:
+    dsr check <repo>
+    dsr check --repos repo1,repo2
+    dsr check --all
+
+OPTIONS:
+    -r, --repos <list>      Comma-separated repos (e.g., ntm,bv)
+    -t, --threshold <sec>   Queue time threshold in seconds (default: 600)
+    -a, --all               Check all configured repos
+    --json                  JSON output (global flag)
+
+EXAMPLES:
+    dsr check Dicklesworthstone/ntm
+    dsr check --repos ntm,bv --threshold 300
+    dsr check --all --json
+
+EXIT CODES:
+    0  - No throttling detected
+    1  - Throttling detected
+    3  - Dependency error (gh not authenticated)
+    4  - Invalid arguments
+    8  - Network/API error
+EOF
+                return 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                log_info "Run 'dsr check --help' for usage"
+                return 4
+                ;;
+            *)
+                # Positional argument - repo
+                repos+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Load config for --all option
+    if $check_all; then
+        config_load 2>/dev/null || true
+        # Get repos from config (parse repos.yaml)
+        local repos_file="$DSR_CONFIG_DIR/repos.yaml"
+        if [[ -f "$repos_file" ]]; then
+            while IFS= read -r repo; do
+                [[ -n "$repo" ]] && repos+=("$repo")
+            done < <(grep -E '^\s+repo:' "$repos_file" 2>/dev/null | sed 's/.*repo:\s*//' | tr -d '"' || true)
+        fi
+    fi
+
+    # Validate we have repos to check
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        log_error "No repos specified. Use: dsr check <repo> or --all"
+        return 4
+    fi
+
+    # Check dependencies
+    if ! gh_check 2>/dev/null; then
+        if ! gh_check_token 2>/dev/null; then
+            if $JSON_MODE; then
+                json_envelope "check" "error" 3 '{"error": "GitHub authentication required"}'
+            fi
+            return 3
+        fi
+    fi
+
+    # Process each repo
+    local any_throttled=false
+    local results=()
+    local now
+    now=$(date +%s)
+
+    for repo in "${repos[@]}"; do
+        local result
+        result=$(_check_repo "$repo" "$threshold" "$now")
+        local status=$?
+
+        if [[ $status -eq 1 ]]; then
+            any_throttled=true
+        fi
+
+        results+=("$result")
+
+        if ! $JSON_MODE; then
+            _check_print_result "$result"
+        fi
+    done
+
+    # JSON output
+    if $JSON_MODE; then
+        local results_json
+        results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')
+        local summary_status="ok"
+        $any_throttled && summary_status="throttled"
+        json_envelope "check" "$summary_status" "$($any_throttled && echo 1 || echo 0)" \
+            "$(jq -nc --argjson repos "$results_json" --argjson threshold "$threshold" \
+                '{threshold_seconds: $threshold, repos: $repos}')"
+    fi
+
+    $any_throttled && return 1 || return 0
+}
+
+# Check a single repo for throttling
+# Returns JSON result, exit code 1 if throttled
+_check_repo() {
+    local repo="$1"
+    local threshold="$2"
+    local now="$3"
+
+    # Resolve short repo name to owner/repo
+    if [[ ! "$repo" =~ / ]]; then
+        # Assume Dicklesworthstone if no owner specified
+        repo="Dicklesworthstone/$repo"
+    fi
+
+    # Fetch workflow runs
+    local runs_json
+    runs_json=$(gh_workflow_runs "$repo" --limit 20 2>/dev/null)
+    local fetch_status=$?
+
+    if [[ $fetch_status -ne 0 ]] || [[ -z "$runs_json" ]]; then
+        echo '{"repo": "'"$repo"'", "status": "error", "error": "failed to fetch runs"}'
+        return 8
+    fi
+
+    # Extract and analyze runs
+    local queued_runs stuck_runs
+    queued_runs=$(echo "$runs_json" | jq -c --argjson now "$now" --argjson threshold "$threshold" '
+        .workflow_runs // [] |
+        map(select(.status == "queued")) |
+        map(. as $run |
+            ($now - ($run.created_at | fromdateiso8601 // $now)) as $age |
+            select($age > $threshold) |
+            {
+                id: .id,
+                status: .status,
+                created_at: .created_at,
+                workflow_id: .workflow_id,
+                workflow_name: .name,
+                event: .event,
+                html_url: .html_url,
+                age_seconds: $age
+            }
+        )' 2>/dev/null || echo '[]')
+
+    stuck_runs=$(echo "$runs_json" | jq -c --argjson now "$now" --argjson threshold "$threshold" '
+        .workflow_runs // [] |
+        map(select(.status == "in_progress")) |
+        map(. as $run |
+            ($run.run_started_at // $run.created_at) as $start_time |
+            ($now - ($start_time | fromdateiso8601 // $now)) as $age |
+            select($age > $threshold) |
+            {
+                id: .id,
+                status: .status,
+                created_at: .created_at,
+                run_started_at: .run_started_at,
+                workflow_id: .workflow_id,
+                workflow_name: .name,
+                event: .event,
+                html_url: .html_url,
+                age_seconds: $age
+            }
+        )' 2>/dev/null || echo '[]')
+
+    # Count issues
+    local queued_count stuck_count
+    queued_count=$(echo "$queued_runs" | jq 'length')
+    stuck_count=$(echo "$stuck_runs" | jq 'length')
+
+    # Determine oldest queued time
+    local oldest_queued_sec=0
+    if [[ "$queued_count" -gt 0 ]]; then
+        oldest_queued_sec=$(echo "$queued_runs" | jq '[.[].age_seconds] | max // 0')
+    fi
+
+    # Build result
+    local status="ok"
+    if [[ "$queued_count" -gt 0 ]] || [[ "$stuck_count" -gt 0 ]]; then
+        status="throttled"
+    fi
+
+    jq -nc \
+        --arg repo "$repo" \
+        --arg status "$status" \
+        --argjson threshold "$threshold" \
+        --argjson queued_count "$queued_count" \
+        --argjson stuck_count "$stuck_count" \
+        --argjson oldest_queued_sec "$oldest_queued_sec" \
+        --argjson queued_runs "$queued_runs" \
+        --argjson stuck_runs "$stuck_runs" \
+        '{
+            repo: $repo,
+            status: $status,
+            threshold_seconds: $threshold,
+            queued_count: $queued_count,
+            stuck_in_progress_count: $stuck_count,
+            oldest_queued_seconds: $oldest_queued_sec,
+            oldest_queued_minutes: (($oldest_queued_sec / 60) | floor),
+            queued_runs: $queued_runs,
+            stuck_runs: $stuck_runs
+        }'
+
+    [[ "$status" == "throttled" ]] && return 1 || return 0
+}
+
+# Print human-readable check result
+_check_print_result() {
+    local result="$1"
+
+    local repo status queued stuck oldest_min
+    repo=$(echo "$result" | jq -r '.repo')
+    status=$(echo "$result" | jq -r '.status')
+    queued=$(echo "$result" | jq -r '.queued_count')
+    stuck=$(echo "$result" | jq -r '.stuck_in_progress_count')
+    oldest_min=$(echo "$result" | jq -r '.oldest_queued_minutes')
+
+    if [[ "$status" == "error" ]]; then
+        log_error "$repo: $(echo "$result" | jq -r '.error // "unknown error"')"
+    elif [[ "$status" == "throttled" ]]; then
+        log_warn "$repo: THROTTLED"
+        [[ "$queued" -gt 0 ]] && log_warn "  - $queued runs queued (oldest: ${oldest_min}m)"
+        [[ "$stuck" -gt 0 ]] && log_warn "  - $stuck runs stuck in_progress"
+
+        # Show URLs for queued runs
+        echo "$result" | jq -r '.queued_runs[:3][] | "    → \(.html_url)"' 2>/dev/null | while read -r url; do
+            log_info "$url"
+        done
+    else
+        log_ok "$repo: OK (no throttling detected)"
+    fi
 }
 
 cmd_watch() {
@@ -519,6 +776,7 @@ EOF
 # ============================================================================
 
 main() {
+    # shellcheck disable=SC2034  # DRY_RUN/NON_INTERACTIVE reserved for future use
     # Parse global options
     while [[ $# -gt 0 ]]; do
         case "$1" in
