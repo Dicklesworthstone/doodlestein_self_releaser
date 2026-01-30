@@ -104,9 +104,9 @@ secrets_redact_json() {
     fi
 }
 
-# Mask a token for display (show first 4 chars only)
+# Mask a token for display (show first 8 chars)
 # Usage: secrets_mask <token>
-# Returns: "ghp_xxxx***" or "***" if too short
+# Returns: "ghp_abcd***" or "***" if too short
 secrets_mask() {
     local token="$1"
 

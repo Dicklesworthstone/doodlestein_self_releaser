@@ -168,12 +168,11 @@ act_run_workflow() {
     start_time=$(date +%s)
 
     # Run act with timeout
-    local exit_code=0
-    if ! timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
+    # Use PIPESTATUS to capture the actual command exit code, not tee's
+    timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
         --directory "$repo_path" \
-        2>&1 | tee "$log_file"; then
-        exit_code=$?
-    fi
+        2>&1 | tee "$log_file"
+    local exit_code=${PIPESTATUS[0]}
 
     local end_time
     end_time=$(date +%s)
@@ -709,11 +708,9 @@ EOF
     local remote_cmd="cd '$local_path' && $env_exports$build_cmd"
 
     # Execute on remote host
-    if _act_ssh_exec "$host" "$remote_cmd" 2>&1 | tee "$log_file"; then
-        exit_code=0
-    else
-        exit_code=$?
-    fi
+    # Use PIPESTATUS to capture the actual command exit code, not tee's
+    _act_ssh_exec "$host" "$remote_cmd" 2>&1 | tee "$log_file"
+    local exit_code=${PIPESTATUS[0]}
 
     local end_time duration
     end_time=$(date +%s)
