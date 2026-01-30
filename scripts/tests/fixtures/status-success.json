@@ -1,0 +1,46 @@
+{
+  "command": "status",
+  "status": "success",
+  "exit_code": 0,
+  "run_id": "550e8400-e29b-41d4-a716-446655440010",
+  "started_at": "2026-01-30T15:00:00Z",
+  "completed_at": "2026-01-30T15:00:02Z",
+  "duration_ms": 2000,
+  "tool": "dsr",
+  "version": "1.0.0",
+  "schema_version": "1.0.0",
+  "artifacts": [],
+  "warnings": [],
+  "errors": [],
+  "details": {
+    "generated_at": "2026-01-30T15:00:02Z",
+    "overall_status": "ok",
+    "config": {
+      "valid": true,
+      "path": "~/.config/dsr/config.yaml",
+      "schema_version": "1.0.0"
+    },
+    "hosts": [
+      {
+        "host": "trj",
+        "status": "ok",
+        "platform": "linux/amd64",
+        "last_checked_at": "2026-01-30T14:59:30Z",
+        "latency_ms": 120
+      }
+    ],
+    "queue": {
+      "throttled_count": 0,
+      "threshold_seconds": 600
+    },
+    "last_run": {
+      "command": "check",
+      "status": "success",
+      "exit_code": 0,
+      "run_id": "550e8400-e29b-41d4-a716-446655440011",
+      "started_at": "2026-01-30T14:59:00Z",
+      "completed_at": "2026-01-30T14:59:01Z",
+      "duration_ms": 1000
+    }
+  }
+}
