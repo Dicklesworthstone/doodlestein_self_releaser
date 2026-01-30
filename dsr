@@ -1804,7 +1804,10 @@ USAGE:
     dsr release <tool> <version>
     dsr release <tool> <version> --artifacts <dir>
     dsr release <tool> <version> --draft
-    dsr release <tool> <version> --generate-notes
+    dsr release verify <tool> <version>   (verify existing release)
+
+SUBCOMMANDS:
+    verify    Verify release assets against build manifest
 
 OPTIONS:
     -t, --tool <name>        Tool to release (or first positional arg)
@@ -1830,6 +1833,7 @@ EXAMPLES:
     dsr release ntm 1.2.3                   Create release v1.2.3
     dsr release ntm 1.2.3 --draft           Create as draft
     dsr release ntm 1.2.3 --resume          Resume interrupted upload
+    dsr release verify ntm 1.2.3            Verify release assets
     dsr release --tool bv --version 2.0.0   Full flag syntax
 
 EXIT CODES:
