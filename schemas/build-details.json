@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/build-details.json",
+  "title": "DSR Build Details",
+  "description": "Details payload for 'dsr build' command",
+  "type": "object",
+  "required": ["repo", "version", "targets"],
+  "properties": {
+    "repo": {
+      "type": "string",
+      "description": "Repository that was built"
+    },
+    "version": {
+      "type": "string",
+      "description": "Version/tag that was built"
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$",
+      "description": "Git commit SHA"
+    },
+    "workflow_used": {
+      "type": "string",
+      "description": "GitHub Actions workflow file used"
+    },
+    "targets": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/build_target" },
+      "description": "Per-target build results"
+    },
+    "manifest_path": {
+      "type": "string",
+      "description": "Path to build manifest JSON"
+    },
+    "total_build_time_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total build time across all targets"
+    },
+    "parallel_builds": {
+      "type": "boolean",
+      "description": "Whether builds ran in parallel"
+    }
+  },
+  "$defs": {
+    "build_target": {
+      "type": "object",
+      "required": ["platform", "host", "method", "status"],
+      "properties": {
+        "platform": {
+          "type": "string",
+          "pattern": "^(linux|darwin|windows)/(amd64|arm64)$",
+          "description": "Target platform (os/arch)"
+        },
+        "host": {
+          "type": "string",
+          "description": "Build host (css, mmini, wlap)"
+        },
+        "method": {
+          "type": "string",
+          "enum": ["act", "native", "docker", "cross"],
+          "description": "Build method used"
+        },
+        "workflow": {
+          "type": "string",
+          "description": "Workflow file used"
+        },
+        "job": {
+          "type": "string",
+          "description": "Job name within workflow"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "failed", "skipped", "timeout"],
+          "description": "Build status"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Build duration"
+        },
+        "artifact_path": {
+          "type": "string",
+          "description": "Path to built artifact"
+        },
+        "log_path": {
+          "type": "string",
+          "description": "Path to build log"
+        },
+        "error": {
+          "type": "string",
+          "description": "Error message if failed"
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of retries attempted"
+        }
+      }
+    }
+  }
+}

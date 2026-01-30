@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/release-details.json",
+  "title": "DSR Release Details",
+  "description": "Details payload for 'dsr release' command",
+  "type": "object",
+  "required": ["repo", "version", "tag"],
+  "properties": {
+    "repo": {
+      "type": "string",
+      "description": "Repository name"
+    },
+    "version": {
+      "type": "string",
+      "description": "Release version"
+    },
+    "tag": {
+      "type": "string",
+      "description": "Git tag name"
+    },
+    "release_id": {
+      "type": "integer",
+      "description": "GitHub release ID"
+    },
+    "release_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL to the GitHub release"
+    },
+    "upload_url": {
+      "type": "string",
+      "description": "GitHub upload URL for assets"
+    },
+    "draft": {
+      "type": "boolean",
+      "description": "Whether release is a draft"
+    },
+    "prerelease": {
+      "type": "boolean",
+      "description": "Whether release is a prerelease"
+    },
+    "assets_uploaded": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/uploaded_asset" },
+      "description": "List of uploaded assets"
+    },
+    "checksums": {
+      "type": "object",
+      "properties": {
+        "published": { "type": "boolean" },
+        "filename": { "type": "string" },
+        "algorithm": { "type": "string", "enum": ["sha256", "sha512"] }
+      },
+      "description": "Checksum file details"
+    },
+    "signatures": {
+      "type": "object",
+      "properties": {
+        "published": { "type": "boolean" },
+        "method": { "type": "string", "enum": ["minisign", "cosign", "gpg"] },
+        "key_id": { "type": "string" }
+      },
+      "description": "Signature details"
+    },
+    "sbom": {
+      "type": "object",
+      "properties": {
+        "published": { "type": "boolean" },
+        "format": { "type": "string", "enum": ["spdx", "cyclonedx"] },
+        "filename": { "type": "string" }
+      },
+      "description": "SBOM details"
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "published": { "type": "boolean" },
+        "slsa_level": { "type": "integer", "minimum": 0, "maximum": 4 }
+      },
+      "description": "SLSA provenance attestation"
+    },
+    "release_notes": {
+      "type": "string",
+      "description": "Generated release notes"
+    }
+  },
+  "$defs": {
+    "uploaded_asset": {
+      "type": "object",
+      "required": ["name", "size_bytes", "download_url"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Asset filename"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Asset size"
+        },
+        "content_type": {
+          "type": "string",
+          "description": "MIME type"
+        },
+        "download_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Direct download URL"
+        },
+        "download_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Download count (if available)"
+        }
+      }
+    }
+  }
+}

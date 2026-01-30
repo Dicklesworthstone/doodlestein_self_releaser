@@ -1,0 +1,20 @@
+{
+  "command": "check",
+  "status": "success",
+  "exit_code": 0,
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "started_at": "2026-01-30T15:00:00Z",
+  "completed_at": "2026-01-30T15:00:05Z",
+  "duration_ms": 5000,
+  "tool": "dsr",
+  "version": "1.0.0",
+  "artifacts": [],
+  "warnings": [],
+  "errors": [],
+  "details": {
+    "repos_checked": ["ntm", "bv", "cass"],
+    "threshold_seconds": 600,
+    "throttled": [],
+    "healthy": ["ntm", "bv", "cass"]
+  }
+}

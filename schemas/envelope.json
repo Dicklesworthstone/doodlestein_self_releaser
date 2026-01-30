@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/envelope.json",
+  "title": "DSR Response Envelope",
+  "description": "Base envelope for all dsr --json responses",
+  "type": "object",
+  "required": ["command", "status", "exit_code", "run_id", "started_at", "duration_ms", "tool", "version"],
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "Subcommand that was executed",
+      "enum": ["check", "watch", "build", "release", "fallback", "repos", "config", "doctor"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "partial", "error"],
+      "description": "Overall operation status"
+    },
+    "exit_code": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255,
+      "description": "Process exit code"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this run"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 timestamp when command started"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 timestamp when command completed"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total duration in milliseconds"
+    },
+    "tool": {
+      "type": "string",
+      "const": "dsr",
+      "description": "Tool identifier"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+",
+      "description": "Tool version (semver)"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" },
+      "description": "Built/released artifacts"
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/warning" },
+      "description": "Non-fatal warnings"
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/error" },
+      "description": "Errors encountered"
+    },
+    "details": {
+      "type": "object",
+      "description": "Command-specific payload"
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["name", "target", "sha256", "size_bytes"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Artifact filename"
+        },
+        "path": {
+          "type": "string",
+          "description": "Local filesystem path"
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^(linux|darwin|windows)/(amd64|arm64)$",
+          "description": "Target platform"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA256 checksum"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "File size in bytes"
+        },
+        "signed": {
+          "type": "boolean",
+          "description": "Whether artifact is signed"
+        },
+        "signature_path": {
+          "type": "string",
+          "description": "Path to signature file"
+        }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^W\\d{3}$",
+          "description": "Warning code"
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable warning"
+        },
+        "context": {
+          "type": "object",
+          "description": "Additional context"
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^E\\d{3}$",
+          "description": "Error code"
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable error"
+        },
+        "target": {
+          "type": "string",
+          "description": "Target that failed (if applicable)"
+        },
+        "recoverable": {
+          "type": "boolean",
+          "description": "Whether error is recoverable"
+        },
+        "suggestion": {
+          "type": "string",
+          "description": "Suggested fix"
+        }
+      }
+    }
+  }
+}

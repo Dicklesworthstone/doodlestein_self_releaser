@@ -1,0 +1,89 @@
+{
+  "command": "build",
+  "status": "success",
+  "exit_code": 0,
+  "run_id": "550e8400-e29b-41d4-a716-446655440002",
+  "started_at": "2026-01-30T15:00:00Z",
+  "completed_at": "2026-01-30T15:05:30Z",
+  "duration_ms": 330000,
+  "tool": "dsr",
+  "version": "1.0.0",
+  "artifacts": [
+    {
+      "name": "ntm-linux-amd64",
+      "path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-linux-amd64",
+      "target": "linux/amd64",
+      "sha256": "a1b2c3d4e5f6789012345678901234567890123456789012345678901234abcd",
+      "size_bytes": 8540000,
+      "signed": true,
+      "signature_path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-linux-amd64.minisig"
+    },
+    {
+      "name": "ntm-darwin-arm64",
+      "path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-darwin-arm64",
+      "target": "darwin/arm64",
+      "sha256": "b2c3d4e5f678901234567890123456789012345678901234567890123456bcde",
+      "size_bytes": 7890000,
+      "signed": true,
+      "signature_path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-darwin-arm64.minisig"
+    },
+    {
+      "name": "ntm-windows-amd64.exe",
+      "path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-windows-amd64.exe",
+      "target": "windows/amd64",
+      "sha256": "c3d4e5f67890123456789012345678901234567890123456789012345678cdef",
+      "size_bytes": 9120000,
+      "signed": true,
+      "signature_path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-windows-amd64.exe.minisig"
+    }
+  ],
+  "warnings": [],
+  "errors": [],
+  "details": {
+    "repo": "ntm",
+    "version": "v1.2.3",
+    "commit_sha": "abc123def456789012345678901234567890abcd",
+    "workflow_used": ".github/workflows/release.yml",
+    "targets": [
+      {
+        "platform": "linux/amd64",
+        "host": "css",
+        "method": "act",
+        "workflow": ".github/workflows/release.yml",
+        "job": "build-linux",
+        "status": "success",
+        "duration_ms": 120000,
+        "artifact_path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-linux-amd64",
+        "log_path": "/tmp/dsr/logs/ntm-v1.2.3/linux-amd64.log",
+        "retry_count": 0
+      },
+      {
+        "platform": "darwin/arm64",
+        "host": "mmini",
+        "method": "native",
+        "workflow": ".github/workflows/release.yml",
+        "job": "build-macos",
+        "status": "success",
+        "duration_ms": 90000,
+        "artifact_path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-darwin-arm64",
+        "log_path": "/tmp/dsr/logs/ntm-v1.2.3/darwin-arm64.log",
+        "retry_count": 0
+      },
+      {
+        "platform": "windows/amd64",
+        "host": "wlap",
+        "method": "native",
+        "workflow": ".github/workflows/release.yml",
+        "job": "build-windows",
+        "status": "success",
+        "duration_ms": 110000,
+        "artifact_path": "/tmp/dsr/artifacts/ntm-v1.2.3/ntm-windows-amd64.exe",
+        "log_path": "/tmp/dsr/logs/ntm-v1.2.3/windows-amd64.log",
+        "retry_count": 0
+      }
+    ],
+    "manifest_path": "/tmp/dsr/manifests/ntm-v1.2.3.json",
+    "total_build_time_ms": 320000,
+    "parallel_builds": true
+  }
+}

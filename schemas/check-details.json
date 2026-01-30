@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/check-details.json",
+  "title": "DSR Check Details",
+  "description": "Details payload for 'dsr check' command",
+  "type": "object",
+  "required": ["repos_checked", "throttled", "healthy", "threshold_seconds"],
+  "properties": {
+    "repos_checked": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of repositories that were checked"
+    },
+    "threshold_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Queue time threshold used for detection"
+    },
+    "throttled": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/throttled_repo" },
+      "description": "Repositories with throttled workflows"
+    },
+    "healthy": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Repositories with healthy queue times"
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "repo": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      },
+      "description": "Repositories that were skipped"
+    }
+  },
+  "$defs": {
+    "throttled_repo": {
+      "type": "object",
+      "required": ["repo", "workflow", "run_id", "queue_time_seconds"],
+      "properties": {
+        "repo": {
+          "type": "string",
+          "description": "Repository name (owner/repo or short name)"
+        },
+        "workflow": {
+          "type": "string",
+          "description": "Workflow file name"
+        },
+        "run_id": {
+          "type": "integer",
+          "description": "GitHub Actions run ID"
+        },
+        "queue_time_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Time spent in queue"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "in_progress", "completed"],
+          "description": "Current workflow status"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the run was created"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the run started (if started)"
+        },
+        "html_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "URL to the workflow run"
+        }
+      }
+    }
+  }
+}

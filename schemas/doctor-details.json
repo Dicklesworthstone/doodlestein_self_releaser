@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/doctor-details.json",
+  "title": "DSR Doctor Details",
+  "description": "Details payload for 'dsr doctor' command",
+  "type": "object",
+  "required": ["checks", "overall_status"],
+  "properties": {
+    "overall_status": {
+      "type": "string",
+      "enum": ["healthy", "degraded", "unhealthy"],
+      "description": "Overall system status"
+    },
+    "checks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/health_check" },
+      "description": "Individual health checks"
+    },
+    "recommendations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Recommended actions"
+    },
+    "system_info": {
+      "type": "object",
+      "properties": {
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "hostname": { "type": "string" },
+        "dsr_version": { "type": "string" }
+      },
+      "description": "System information"
+    }
+  },
+  "$defs": {
+    "health_check": {
+      "type": "object",
+      "required": ["name", "status"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Check name"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["auth", "tool", "network", "config"],
+          "description": "Check category"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "warn", "fail", "skip"],
+          "description": "Check result"
+        },
+        "message": {
+          "type": "string",
+          "description": "Status message"
+        },
+        "details": {
+          "type": "object",
+          "description": "Additional check details"
+        },
+        "fix_command": {
+          "type": "string",
+          "description": "Command to fix the issue"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Check duration"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+# ~/.actrc - nektos/act configuration for dsr
+# Copy this to ~/.actrc on the build host (css)
+
+# Runner image mappings (pin for reproducibility)
+# Using catthehacker images which include common build tools
+-P ubuntu-latest=catthehacker/ubuntu:full-22.04
+-P ubuntu-22.04=catthehacker/ubuntu:full-22.04
+-P ubuntu-20.04=catthehacker/ubuntu:full-20.04
+
+# Force x86_64 architecture (important for ARM hosts)
+--container-architecture linux/amd64
+
+# Artifact collection path (dsr reads artifacts from here)
+--artifact-server-path /tmp/dsr-act-artifacts
+
+# Bind host Docker socket for Docker-in-Docker workflows
+--bind
+
+# Don't auto-remove containers (helps debugging)
+# --rm=false
+
+# Environment variables to inject
+# --env CI=true
+# --env GITHUB_ACTIONS=true

@@ -1,0 +1,106 @@
+{
+  "command": "doctor",
+  "status": "success",
+  "exit_code": 0,
+  "run_id": "550e8400-e29b-41d4-a716-446655440003",
+  "started_at": "2026-01-30T15:00:00Z",
+  "completed_at": "2026-01-30T15:00:12Z",
+  "duration_ms": 12000,
+  "tool": "dsr",
+  "version": "1.0.0",
+  "artifacts": [],
+  "warnings": [],
+  "errors": [],
+  "details": {
+    "overall_status": "healthy",
+    "checks": [
+      {
+        "name": "gh_cli",
+        "category": "tool",
+        "status": "pass",
+        "message": "gh 2.62.0 installed",
+        "details": { "version": "2.62.0" },
+        "duration_ms": 150
+      },
+      {
+        "name": "gh_auth",
+        "category": "auth",
+        "status": "pass",
+        "message": "Authenticated as Dicklesworthstone",
+        "details": { "user": "Dicklesworthstone", "scopes": ["repo", "workflow"] },
+        "duration_ms": 800
+      },
+      {
+        "name": "docker",
+        "category": "tool",
+        "status": "pass",
+        "message": "Docker 24.0.7 running",
+        "details": { "version": "24.0.7", "running": true },
+        "duration_ms": 200
+      },
+      {
+        "name": "act",
+        "category": "tool",
+        "status": "pass",
+        "message": "act 0.2.57 installed",
+        "details": { "version": "0.2.57" },
+        "duration_ms": 100
+      },
+      {
+        "name": "ssh_css",
+        "category": "network",
+        "status": "pass",
+        "message": "SSH to css (Contabo) reachable",
+        "details": { "host": "css", "latency_ms": 45 },
+        "duration_ms": 2000
+      },
+      {
+        "name": "ssh_mmini",
+        "category": "network",
+        "status": "pass",
+        "message": "SSH to mmini (Mac Mini) reachable",
+        "details": { "host": "mmini", "latency_ms": 12 },
+        "duration_ms": 1500
+      },
+      {
+        "name": "ssh_wlap",
+        "category": "network",
+        "status": "pass",
+        "message": "SSH to wlap (Windows laptop) reachable",
+        "details": { "host": "wlap", "latency_ms": 8 },
+        "duration_ms": 1200
+      },
+      {
+        "name": "minisign_key",
+        "category": "config",
+        "status": "pass",
+        "message": "Minisign private key found",
+        "details": { "key_path": "~/.minisign/minisign.key" },
+        "duration_ms": 50
+      },
+      {
+        "name": "syft",
+        "category": "tool",
+        "status": "pass",
+        "message": "syft 1.4.1 installed (SBOM generation)",
+        "details": { "version": "1.4.1" },
+        "duration_ms": 100
+      },
+      {
+        "name": "config_file",
+        "category": "config",
+        "status": "pass",
+        "message": "Config file valid",
+        "details": { "path": "~/.config/dsr/config.yaml", "repos_count": 15 },
+        "duration_ms": 50
+      }
+    ],
+    "recommendations": [],
+    "system_info": {
+      "os": "linux",
+      "arch": "amd64",
+      "hostname": "threadripper",
+      "dsr_version": "1.0.0"
+    }
+  }
+}
