@@ -1,0 +1,66 @@
+# ntm - Named Tmux Manager
+# Go CLI tool for managing named tmux sessions
+
+tool_name: ntm
+
+# GitHub repository
+repo: Dicklesworthstone/ntm
+local_path: /data/projects/ntm
+
+# Build configuration
+language: go
+binary_name: ntm
+build_cmd: go build -ldflags="-s -w -X main.version=${VERSION}" -o ntm ./cmd/ntm
+main_package: ./cmd/ntm
+
+# Target platforms
+targets:
+  - linux/amd64
+  - linux/arm64
+  - darwin/arm64
+  - darwin/amd64
+  # Windows not supported (tmux is Unix-only)
+
+# GitHub Actions workflow
+workflow: .github/workflows/release.yml
+
+# act job mapping
+act_job_map:
+  linux/amd64: build-linux
+  linux/arm64: build-linux-arm
+  darwin/arm64: null              # native on mmini
+  darwin/amd64: null              # native on mmini
+
+# Cross-compilation
+cross_compile:
+  linux/arm64:
+    method: native
+    env:
+      GOOS: linux
+      GOARCH: arm64
+      CGO_ENABLED: "0"
+
+# Pre-build checks
+checks:
+  - go mod verify
+  - go vet ./...
+  - go test -race ./...
+
+# Artifact naming pattern
+artifact_naming: "${name}-${version}-${os}-${arch}"
+
+# Archive format
+archive_format:
+  linux: tar.gz
+  darwin: tar.gz
+
+# Additional files
+include_files:
+  - README.md
+  - LICENSE
+  - docs/usage.md
+
+# Build environment
+env:
+  CGO_ENABLED: "0"
+  GO111MODULE: "on"

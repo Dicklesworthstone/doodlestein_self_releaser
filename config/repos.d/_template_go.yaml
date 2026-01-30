@@ -1,0 +1,86 @@
+# Template for Go CLI tools
+# Copy this file and customize for each Go tool
+#
+# Usage:
+#   cp _template_go.yaml ntm.yaml
+#   Edit the values for your specific tool
+
+tool_name: example-go-tool
+
+# GitHub repository
+repo: Dicklesworthstone/example-go-tool
+local_path: /data/projects/example-go-tool
+
+# Build configuration
+language: go
+binary_name: example-tool
+build_cmd: go build -ldflags="-s -w" -o ${binary_name} ./cmd/${binary_name}
+main_package: ./cmd/example-tool
+
+# Target platforms
+targets:
+  - linux/amd64
+  - linux/arm64
+  - darwin/arm64
+  - darwin/amd64
+  - windows/amd64
+
+# GitHub Actions workflow
+workflow: .github/workflows/release.yml
+
+# act job mapping (null = requires native build)
+act_job_map:
+  linux/amd64: build-linux
+  linux/arm64: build-linux-arm    # via GOOS/GOARCH cross-compile
+  darwin/arm64: null              # native on mmini (or cross-compile)
+  darwin/amd64: null              # native on mmini (or cross-compile)
+  windows/amd64: null             # native on wlap (or cross-compile)
+
+# Cross-compilation (Go makes this easy)
+cross_compile:
+  linux/arm64:
+    method: native
+    env:
+      GOOS: linux
+      GOARCH: arm64
+  darwin/arm64:
+    method: native
+    env:
+      GOOS: darwin
+      GOARCH: arm64
+  darwin/amd64:
+    method: native
+    env:
+      GOOS: darwin
+      GOARCH: amd64
+  windows/amd64:
+    method: native
+    env:
+      GOOS: windows
+      GOARCH: amd64
+
+# Pre-build checks
+checks:
+  - go mod verify
+  - go vet ./...
+  - go test ./...
+  - golangci-lint run
+
+# Artifact naming pattern
+artifact_naming: "${name}-${version}-${os}-${arch}"
+
+# Archive format per platform
+archive_format:
+  linux: tar.gz
+  darwin: tar.gz
+  windows: zip
+
+# Additional files to include in archive
+include_files:
+  - README.md
+  - LICENSE
+
+# Environment variables for builds
+env:
+  CGO_ENABLED: "0"
+  GO111MODULE: "on"

@@ -9,6 +9,9 @@ cache/
 # User-specific configuration (may contain IPs, hosts, credentials)
 config/hosts.yaml
 config/config.yaml
+config/repos.d/*.yaml
+!config/repos.d/_template_*.yaml
+!config/repos.d/*.yaml.example
 secrets/
 
 # Act (nektos/act) artifacts

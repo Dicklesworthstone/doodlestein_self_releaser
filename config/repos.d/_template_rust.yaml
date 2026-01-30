@@ -1,0 +1,72 @@
+# Template for Rust CLI tools
+# Copy this file and customize for each Rust tool
+#
+# Usage:
+#   cp _template_rust.yaml cass.yaml
+#   Edit the values for your specific tool
+
+tool_name: example-rust-tool
+
+# GitHub repository
+repo: Dicklesworthstone/example-rust-tool
+local_path: /data/projects/example-rust-tool
+
+# Build configuration
+language: rust
+binary_name: example-tool
+build_cmd: cargo build --release
+build_profile: release
+
+# Target platforms
+targets:
+  - linux/amd64
+  - linux/arm64
+  - darwin/arm64
+  - darwin/amd64
+  - windows/amd64
+
+# GitHub Actions workflow
+workflow: .github/workflows/release.yml
+
+# act job mapping (null = requires native build)
+act_job_map:
+  linux/amd64: build-linux
+  linux/arm64: build-linux-arm    # via cargo-zigbuild or QEMU
+  darwin/arm64: null              # native on mmini
+  darwin/amd64: null              # native on mmini (Rosetta)
+  windows/amd64: null             # native on wlap (or cross-compile)
+
+# Cross-compilation strategy
+cross_compile:
+  linux/arm64:
+    method: cargo-zigbuild
+    target: aarch64-unknown-linux-gnu
+  windows/amd64:
+    method: cargo-zigbuild
+    target: x86_64-pc-windows-gnu
+
+# Pre-build checks
+checks:
+  - cargo check
+  - cargo test --release
+  - cargo clippy -- -D warnings
+
+# Artifact naming pattern
+# Variables: ${name}, ${version}, ${os}, ${arch}, ${ext}
+artifact_naming: "${name}-${version}-${os}-${arch}"
+
+# Archive format per platform
+archive_format:
+  linux: tar.gz
+  darwin: tar.gz
+  windows: zip
+
+# Additional files to include in archive
+include_files:
+  - README.md
+  - LICENSE
+
+# Environment variables for builds
+env:
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-C target-feature=+crt-static"
