@@ -1097,7 +1097,7 @@ _watch_iteration() {
 
     # Run dsr check
     local check_output check_exit
-    if check_output=$(./dsr --json check --all 2>/dev/null); then
+    if check_output=$("$0" --json check --all 2>/dev/null); then
         check_exit=0
         _WATCH_CURRENT_BACKOFF=0  # Reset backoff on success
     else
@@ -2669,9 +2669,375 @@ EOF
 }
 
 cmd_fallback() {
-    log_warn "fallback command not yet implemented"
-    log_info "See bead bd-1jt.1.4 for implementation plan"
-    return 4
+    local tool_name=""
+    local version=""
+    local build_only=false
+    local skip_checks=false
+    local resume=false
+    local output_dir=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tool|-t)
+                tool_name="$2"
+                shift 2
+                ;;
+            --version|-V)
+                version="$2"
+                shift 2
+                ;;
+            --build-only)
+                build_only=true
+                shift
+                ;;
+            --skip-checks)
+                skip_checks=true
+                shift
+                ;;
+            --resume|-r)
+                resume=true
+                shift
+                ;;
+            --output-dir|-o)
+                output_dir="$2"
+                shift 2
+                ;;
+            --help|-h)
+                cat << 'EOF'
+dsr fallback - Orchestrated build + release pipeline
+
+USAGE:
+    dsr fallback <tool>
+    dsr fallback <tool> --version v1.2.3
+    dsr fallback <tool> --build-only
+    dsr fallback <tool> --skip-checks
+
+OPTIONS:
+    -t, --tool <name>      Tool to build/release
+    -V, --version <ver>    Version to release (default: detect from version files)
+    --build-only           Build artifacts but don't create release
+    --skip-checks          Skip pre-release quality checks
+    -r, --resume           Resume interrupted build
+    -o, --output-dir <dir> Output directory for artifacts
+
+DESCRIPTION:
+    End-to-end fallback pipeline when GitHub Actions is throttled:
+    1. Pre-release quality checks (unless --skip-checks)
+    2. Build all targets using act + native hosts
+    3. Generate manifest, checksums, signatures
+    4. Verify artifacts match manifest
+    5. Create GitHub release and upload assets
+
+EXAMPLES:
+    dsr fallback ntm                        Full pipeline
+    dsr fallback ntm --version 1.2.3        Specific version
+    dsr fallback ntm --build-only           Build without releasing
+    dsr fallback ntm --skip-checks          Skip quality gates
+    dsr --dry-run fallback ntm              Show plan without executing
+
+EXIT CODES:
+    0  - Pipeline completed successfully
+    1  - Partial failure (some targets failed)
+    2  - Lock conflict (build already in progress)
+    4  - Invalid arguments
+    6  - Build failed
+    7  - Release failed
+EOF
+                return 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                log_info "Run 'dsr fallback --help' for usage"
+                return 4
+                ;;
+            *)
+                # First positional arg is tool name
+                if [[ -z "$tool_name" ]]; then
+                    tool_name="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate tool name
+    if [[ -z "$tool_name" ]]; then
+        log_error "Tool name required"
+        log_info "Run 'dsr fallback --help' for usage"
+        return 4
+    fi
+
+    # Record start time
+    local start_time run_id
+    start_time=$(date +%s)
+    run_id="${DSR_RUN_ID:-run-$start_time-$$}"
+    export DSR_RUN_ID="$run_id"
+
+    log_info "Starting fallback pipeline for $tool_name (run_id: $run_id)"
+    log_set_tool "$tool_name"
+
+    # Set output directory default
+    local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    [[ -z "$output_dir" ]] && output_dir="$state_dir/artifacts"
+    mkdir -p "$output_dir"
+
+    # Load tool config
+    if ! act_load_repo_config "$tool_name" 2>/dev/null; then
+        log_error "Tool '$tool_name' not found in repos.d"
+        if $JSON_MODE; then
+            json_envelope "fallback" "error" 4 "$(jq -nc --arg tool "$tool_name" '{error: "Tool not found", tool: $tool}')"
+        fi
+        return 4
+    fi
+
+    # Get local path
+    local local_path
+    local_path=$(act_get_local_path "$tool_name")
+    if [[ -z "$local_path" || ! -d "$local_path" ]]; then
+        log_error "Local path not found for $tool_name: $local_path"
+        return 4
+    fi
+
+    # Get GitHub repo
+    local repo
+    repo=$(act_get_repo "$tool_name")
+    if [[ -z "$repo" ]]; then
+        log_error "No GitHub repo configured for $tool_name"
+        return 4
+    fi
+    [[ ! "$repo" =~ / ]] && repo="Dicklesworthstone/$repo"
+
+    # Detect version if not specified
+    if [[ -z "$version" ]]; then
+        log_info "Detecting version from version files..."
+        if version=$(version_detect "$local_path" 2>/dev/null); then
+            log_info "Detected version: $version"
+        else
+            log_error "Cannot detect version. Specify with --version"
+            return 4
+        fi
+    fi
+
+    # Normalize version tag
+    local tag
+    tag=$(git_ops_version_to_tag "$version")
+    local version_num="${tag#v}"
+
+    if $DRY_RUN; then
+        log_info "[dry-run] Would execute fallback pipeline:"
+        log_info "  Tool:      $tool_name"
+        log_info "  Version:   $tag"
+        log_info "  Repo:      $repo"
+        log_info "  Local:     $local_path"
+        log_info "  Output:    $output_dir"
+        log_info "  Skip checks: $skip_checks"
+        log_info "  Build only: $build_only"
+        if $JSON_MODE; then
+            json_envelope "fallback" "dry_run" 0 "$(jq -nc \
+                --arg tool "$tool_name" \
+                --arg version "$tag" \
+                --arg repo "$repo" \
+                --argjson skip_checks "$skip_checks" \
+                --argjson build_only "$build_only" \
+                '{tool: $tool, version: $version, repo: $repo, skip_checks: $skip_checks, build_only: $build_only, mode: "dry_run"}')"
+        fi
+        return 0
+    fi
+
+    # Track status for summary
+    local checks_status="skipped"
+    local build_status="pending"
+    local release_status="pending"
+    local artifacts_count=0
+    local exit_code=0
+
+    # === Step 1: Pre-release checks ===
+    if ! $skip_checks; then
+        log_info "=== Step 1/4: Pre-release Checks ==="
+        if quality_run_checks "$tool_name" --work-dir "$local_path" 2>/dev/null; then
+            checks_status="passed"
+            log_ok "Quality checks passed"
+        else
+            checks_status="failed"
+            log_error "Quality checks failed"
+            notify_event "fallback.checks_failed" "error" "Checks Failed" "$tool_name pre-release checks failed" "$run_id"
+            if $JSON_MODE; then
+                json_envelope "fallback" "error" 6 "$(jq -nc --arg tool "$tool_name" '{error: "Quality checks failed", tool: $tool, phase: "checks"}')"
+            fi
+            return 6
+        fi
+    else
+        log_info "=== Step 1/4: Pre-release Checks (skipped) ==="
+    fi
+
+    # === Step 2: Acquire lock and build ===
+    log_info "=== Step 2/4: Build Artifacts ==="
+
+    # Initialize build state
+    build_state_init
+
+    # Acquire lock
+    if ! build_lock_acquire "$tool_name" "$tag"; then
+        log_error "Build already in progress for $tool_name $tag"
+        if $JSON_MODE; then
+            json_envelope "fallback" "error" 2 "$(jq -nc --arg tool "$tool_name" --arg version "$tag" '{error: "Lock conflict", tool: $tool, version: $version}')"
+        fi
+        return 2
+    fi
+
+    # Trap to release lock on exit
+    trap 'build_lock_release "$tool_name" "$tag" 2>/dev/null' EXIT
+
+    # Run build
+    if cmd_build "$tool_name" --version "$version" --output-dir "$output_dir"; then
+        build_status="success"
+        log_ok "Build completed successfully"
+    else
+        local build_exit=$?
+        if [[ $build_exit -eq 1 ]]; then
+            build_status="partial"
+            log_warn "Build partially succeeded"
+        else
+            build_status="failed"
+            log_error "Build failed"
+            notify_event "fallback.build_failed" "error" "Build Failed" "$tool_name build failed" "$run_id"
+            exit_code=6
+        fi
+    fi
+
+    # Count artifacts
+    artifacts_count=$(find "$output_dir" -name "${tool_name}*" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+    if [[ "$build_status" == "failed" ]] || [[ "$artifacts_count" -eq 0 ]]; then
+        build_lock_release "$tool_name" "$tag"
+        trap - EXIT
+        if $JSON_MODE; then
+            json_envelope "fallback" "error" 6 "$(jq -nc --arg tool "$tool_name" '{error: "Build failed", tool: $tool, artifacts: 0}')"
+        fi
+        return 6
+    fi
+
+    # === Step 3: Verify artifacts ===
+    log_info "=== Step 3/4: Verify Artifacts ==="
+    log_info "Found $artifacts_count artifact(s) in $output_dir"
+
+    # Generate checksums
+    local checksums_file="$output_dir/${tool_name}-${version_num}-SHA256SUMS.txt"
+    if command -v sha256sum &>/dev/null; then
+        find "$output_dir" -maxdepth 1 -name "${tool_name}*" -type f ! -name "*SHA256*" ! -name "*manifest*" -exec sha256sum {} \; > "$checksums_file" 2>/dev/null || true
+        log_ok "Generated checksums: $checksums_file"
+    fi
+
+    # Sign if enabled
+    if signing_is_enabled 2>/dev/null; then
+        log_info "Signing artifacts..."
+        signing_sign_files "$output_dir" "${tool_name}*" 2>/dev/null || log_warn "Signing failed"
+    fi
+
+    # === Step 4: Release (unless --build-only) ===
+    if $build_only; then
+        log_info "=== Step 4/4: Release (skipped - build-only mode) ==="
+        release_status="skipped"
+    else
+        log_info "=== Step 4/4: Create Release and Upload ==="
+
+        # Create release
+        if cmd_release "$tool_name" "$version" --artifacts "$output_dir"; then
+            release_status="success"
+            log_ok "Release created successfully"
+            notify_event "fallback.success" "success" "Release Complete" "$tool_name $tag released successfully" "$run_id"
+        else
+            local release_exit=$?
+            if [[ $release_exit -eq 1 ]]; then
+                release_status="partial"
+                log_warn "Release partially succeeded"
+                exit_code=1
+            else
+                release_status="failed"
+                log_error "Release failed"
+                notify_event "fallback.release_failed" "error" "Release Failed" "$tool_name release upload failed" "$run_id"
+                exit_code=7
+            fi
+        fi
+    fi
+
+    # Release lock
+    build_lock_release "$tool_name" "$tag"
+    trap - EXIT
+
+    # Calculate duration
+    local end_time duration
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    # Determine overall status
+    local overall_status="success"
+    if [[ $exit_code -ne 0 ]]; then
+        if [[ "$build_status" == "partial" ]] || [[ "$release_status" == "partial" ]]; then
+            overall_status="partial"
+        else
+            overall_status="failed"
+        fi
+    fi
+
+    # Output summary
+    if $JSON_MODE; then
+        json_envelope "fallback" "$overall_status" "$exit_code" "$(jq -nc \
+            --arg tool "$tool_name" \
+            --arg version "$tag" \
+            --arg repo "$repo" \
+            --arg run_id "$run_id" \
+            --arg checks "$checks_status" \
+            --arg build "$build_status" \
+            --arg release "$release_status" \
+            --argjson artifacts "$artifacts_count" \
+            --argjson duration "$duration" \
+            --arg output_dir "$output_dir" \
+            '{
+                tool: $tool,
+                version: $version,
+                repo: $repo,
+                run_id: $run_id,
+                phases: {
+                    checks: $checks,
+                    build: $build,
+                    release: $release
+                },
+                artifacts_count: $artifacts,
+                duration_seconds: $duration,
+                output_dir: $output_dir
+            }')"
+    else
+        echo ""
+        log_info "=== Fallback Pipeline Summary ==="
+        log_info "Tool:       $tool_name"
+        log_info "Version:    $tag"
+        log_info "Run ID:     $run_id"
+        log_info "Duration:   ${duration}s"
+        echo ""
+        log_info "Phases:"
+        case "$checks_status" in
+            passed) log_ok "  Checks:   passed" ;;
+            skipped) log_info "  Checks:   skipped" ;;
+            *) log_error "  Checks:   $checks_status" ;;
+        esac
+        case "$build_status" in
+            success) log_ok "  Build:    success ($artifacts_count artifacts)" ;;
+            partial) log_warn "  Build:    partial ($artifacts_count artifacts)" ;;
+            *) log_error "  Build:    $build_status" ;;
+        esac
+        case "$release_status" in
+            success) log_ok "  Release:  success" ;;
+            skipped) log_info "  Release:  skipped (build-only)" ;;
+            partial) log_warn "  Release:  partial" ;;
+            *) log_error "  Release:  $release_status" ;;
+        esac
+        echo ""
+        log_info "Artifacts: $output_dir"
+    fi
+
+    return $exit_code
 }
 
 cmd_repos() {
@@ -3044,6 +3410,257 @@ cmd_repos_info() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# GoReleaser compatibility validation helpers
+# ---------------------------------------------------------------------------
+
+_goreleaser_find_config() {
+    local repo_path="$1"
+    local candidates=(
+        ".goreleaser.yaml"
+        ".goreleaser.yml"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [[ -f "$repo_path/$candidate" ]]; then
+            echo "$repo_path/$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_goreleaser_extract_targets() {
+    local gr_json="$1"
+    printf '%s\n' "$gr_json" | jq -r '
+        (.builds // []) as $builds
+        | if ($builds | length) == 0 then empty else
+            [ $builds[]
+              | (.goos // []) as $os
+              | (.goarch // []) as $arch
+              | if ($os | length) == 0 or ($arch | length) == 0 then empty
+                else $os[] as $o | $arch[] as $a | "\($o)/\($a)"
+                end
+            ] | unique | .[]
+          end
+    ' 2>/dev/null
+}
+
+_goreleaser_render_template() {
+    local template="$1"
+    local project_name="$2"
+    local version="$3"
+    local os="$4"
+    local arch="$5"
+    local ext="$6"
+    local binary="$7"
+
+    local rendered="$template"
+    rendered=$(echo "$rendered" | sed -E \
+        -e "s/{{[^}]*\\.ProjectName[^}]*}}/$project_name/g" \
+        -e "s/{{[^}]*\\.Binary[^}]*}}/$binary/g" \
+        -e "s/{{[^}]*\\.Version[^}]*}}/$version/g" \
+        -e "s/{{[^}]*\\.Os[^}]*}}/$os/g" \
+        -e "s/{{[^}]*\\.Arch[^}]*}}/$arch/g" \
+        -e "s/{{[^}]*\\.Arm[^}]*}}//g" \
+        -e "s/{{[^}]*\\.Ext[^}]*}}/$ext/g")
+
+    echo "$rendered"
+}
+
+_dsr_render_artifact_name() {
+    local pattern="$1"
+    local name="$2"
+    local version="$3"
+    local os="$4"
+    local arch="$5"
+    local binary="$6"
+    local ext="$7"
+
+    local rendered="$pattern"
+    rendered="${rendered//\$\{name\}/$name}"
+    rendered="${rendered//\$\{binary\}/$binary}"
+    rendered="${rendered//\$\{version\}/$version}"
+    rendered="${rendered//\$\{os\}/$os}"
+    rendered="${rendered//\$\{arch\}/$arch}"
+    rendered="${rendered//\$\{ext\}/$ext}"
+
+    echo "$rendered"
+}
+
+goreleaser_validate_tool() {
+    local tool_name="$1"
+    local tool_json="$2"
+    local repo_path="$3"
+
+    local messages=()
+    local status="ok"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        echo "skip|"
+        return 0
+    fi
+
+    local gr_config
+    if ! gr_config=$(_goreleaser_find_config "$repo_path"); then
+        echo "skip|"
+        return 0
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        echo "warn|jq required for goreleaser validation"
+        return 0
+    fi
+
+    local gr_json
+    if ! gr_json=$(yq -o=json '.' "$gr_config" 2>/dev/null); then
+        echo "warn|Unable to parse goreleaser config: $gr_config"
+        return 0
+    fi
+
+    # Merge repos.yaml config with repos.d config if present (repos.d takes precedence)
+    local merged_json="$tool_json"
+    local dsr_config_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/${tool_name}.yaml"
+    if [[ -f "$dsr_config_file" ]]; then
+        local dsr_json
+        if dsr_json=$(yq -o=json '.' "$dsr_config_file" 2>/dev/null); then
+            merged_json=$(jq -s '.[0] * .[1]' \
+                <(printf '%s\n' "$tool_json") \
+                <(printf '%s\n' "$dsr_json") 2>/dev/null) || merged_json="$tool_json"
+        fi
+    fi
+
+    # Extract dsr targets
+    local dsr_targets=()
+    mapfile -t dsr_targets < <(printf '%s\n' "$merged_json" | jq -r '.targets[]?' 2>/dev/null)
+
+    # Extract goreleaser targets
+    local gr_targets=()
+    mapfile -t gr_targets < <(_goreleaser_extract_targets "$gr_json")
+
+    if [[ ${#dsr_targets[@]} -eq 0 ]]; then
+        status="warn"
+        messages+=("No dsr targets defined; cannot validate goreleaser targets")
+    elif [[ ${#gr_targets[@]} -eq 0 ]]; then
+        status="warn"
+        messages+=("No goreleaser targets found in config")
+    else
+        local missing_in_dsr missing_in_gr
+        missing_in_dsr=$(comm -23 \
+            <(printf '%s\n' "${gr_targets[@]}" | sort -u) \
+            <(printf '%s\n' "${dsr_targets[@]}" | sort -u) 2>/dev/null)
+        missing_in_gr=$(comm -23 \
+            <(printf '%s\n' "${dsr_targets[@]}" | sort -u) \
+            <(printf '%s\n' "${gr_targets[@]}" | sort -u) 2>/dev/null)
+        if [[ -n "$missing_in_dsr" ]]; then
+            status="warn"
+            messages+=("Targets missing in dsr config: $(echo "$missing_in_dsr" | paste -sd ',' -)")
+        fi
+        if [[ -n "$missing_in_gr" ]]; then
+            status="warn"
+            messages+=("Targets missing in goreleaser config: $(echo "$missing_in_gr" | paste -sd ',' -)")
+        fi
+    fi
+
+    # Archive format comparison
+    local gr_archive
+    gr_archive=$(printf '%s\n' "$gr_json" | jq -c '.archives[0] // {}' 2>/dev/null)
+    local gr_format_default
+    gr_format_default=$(printf '%s\n' "$gr_archive" | jq -r '
+        if .format then .format
+        elif (.formats | type) == "array" and (.formats | length) > 0 then .formats[0]
+        else "" end
+    ' 2>/dev/null)
+
+    if [[ -z "$gr_format_default" ]]; then
+        status="warn"
+        messages+=("No default archive format in goreleaser config")
+    fi
+
+    local target
+    for target in "${dsr_targets[@]}"; do
+        local os arch
+        os="${target%%/*}"
+        arch="${target##*/}"
+
+        local dsr_format
+        dsr_format=$(printf '%s\n' "$merged_json" | jq -r --arg os "$os" '
+            if .archive_format == null then ""
+            elif (.archive_format | type) == "string" then .archive_format
+            elif (.archive_format | type) == "object" then .archive_format[$os] // ""
+            else "" end
+        ' 2>/dev/null)
+
+        local gr_format
+        gr_format=$(printf '%s\n' "$gr_archive" | jq -r --arg os "$os" '
+            (.format_overrides // []) as $o
+            | ($o[]? | select(.goos == $os) | .format) // empty
+        ' 2>/dev/null | head -n1)
+        [[ -z "$gr_format" ]] && gr_format="$gr_format_default"
+
+        if [[ -n "$dsr_format" && -n "$gr_format" && "$dsr_format" != "$gr_format" ]]; then
+            status="warn"
+            messages+=("Archive format mismatch for $os/$arch: dsr=$dsr_format goreleaser=$gr_format")
+        elif [[ -z "$dsr_format" ]]; then
+            status="warn"
+            messages+=("Archive format missing in dsr config for $os/$arch")
+        fi
+    done
+
+    # Artifact naming template comparison (best-effort)
+    local dsr_pattern
+    dsr_pattern=$(printf '%s\n' "$merged_json" | jq -r '.artifact_naming // empty' 2>/dev/null)
+    local gr_name_template
+    gr_name_template=$(printf '%s\n' "$gr_archive" | jq -r '.name_template // empty' 2>/dev/null)
+
+    local dsr_binary
+    dsr_binary=$(printf '%s\n' "$merged_json" | jq -r '.binary_name // empty' 2>/dev/null)
+    local gr_project_name
+    gr_project_name=$(printf '%s\n' "$gr_json" | jq -r '.project_name // empty' 2>/dev/null)
+    [[ -z "$gr_project_name" ]] && gr_project_name="$tool_name"
+
+    if [[ -n "$dsr_pattern" && -n "$gr_name_template" ]]; then
+        local sample_version="1.2.3"
+        local name_mismatch=false
+        for target in "${dsr_targets[@]}"; do
+            local os arch dsr_format gr_format
+            os="${target%%/*}"
+            arch="${target##*/}"
+
+            dsr_format=$(printf '%s\n' "$merged_json" | jq -r --arg os "$os" '
+                if .archive_format == null then ""
+                elif (.archive_format | type) == "string" then .archive_format
+                elif (.archive_format | type) == "object" then .archive_format[$os] // ""
+                else "" end
+            ' 2>/dev/null)
+            gr_format=$(printf '%s\n' "$gr_archive" | jq -r --arg os "$os" '
+                (.format_overrides // []) as $o
+                | ($o[]? | select(.goos == $os) | .format) // empty
+            ' 2>/dev/null | head -n1)
+            [[ -z "$gr_format" ]] && gr_format="$gr_format_default"
+
+            local dsr_name gr_name
+            dsr_name=$(_dsr_render_artifact_name "$dsr_pattern" "$tool_name" "$sample_version" "$os" "$arch" "$dsr_binary" "$dsr_format")
+            gr_name=$(_goreleaser_render_template "$gr_name_template" "$gr_project_name" "$sample_version" "$os" "$arch" "$gr_format" "$dsr_binary")
+            if [[ "$dsr_name" != "$gr_name" ]]; then
+                name_mismatch=true
+                messages+=("Artifact name mismatch for $os/$arch: dsr='$dsr_name' goreleaser='$gr_name'")
+                break
+            fi
+        done
+        if $name_mismatch; then
+            status="warn"
+        fi
+    else
+        status="warn"
+        messages+=("Missing artifact_naming or goreleaser name_template")
+    fi
+
+    local msg_str=""
+    [[ ${#messages[@]} -gt 0 ]] && msg_str=$(IFS='; '; echo "${messages[*]}")
+    echo "$status|$msg_str"
+}
+
 # Validate repository configurations
 cmd_repos_validate() {
     local repo_filter="${1:-}"
@@ -3086,10 +3703,10 @@ cmd_repos_validate() {
             ((errors++))
         fi
 
+        local resolved_path=""
         # Check local_path exists
         if [[ -n "$local_path" ]]; then
             source "$SCRIPT_DIR/src/guardrails.sh"
-            local resolved_path
             resolved_path=$(resolve_path "$local_path" 2>/dev/null) || {
                 status="error"
                 messages+=("Invalid local_path: $local_path")
@@ -3116,6 +3733,23 @@ cmd_repos_validate() {
                 messages+=("Workflow file not found: $workflow")
                 ((warnings++))
             fi
+        fi
+
+        # GoReleaser compatibility validation (best-effort)
+        local gr_result gr_status gr_message
+        gr_result=$(goreleaser_validate_tool "$name" "$tool_json" "$resolved_path")
+        gr_status="${gr_result%%|*}"
+        gr_message="${gr_result#*|}"
+        if [[ "$gr_status" == "warn" && -n "$gr_message" ]]; then
+            if [[ "$status" != "error" ]]; then
+                status="warn"
+            fi
+            messages+=("$gr_message")
+            ((warnings++))
+        elif [[ "$gr_status" == "error" && -n "$gr_message" ]]; then
+            status="error"
+            messages+=("$gr_message")
+            ((errors++))
         fi
 
         local msg_str=""
