@@ -52,7 +52,25 @@ _tc_log_ok()    { echo "${_TC_GREEN}[toolchain]${_TC_NC} $*" >&2; }
 _tc_log_warn()  { echo "${_TC_YELLOW}[toolchain]${_TC_NC} $*" >&2; }
 _tc_log_error() { echo "${_TC_RED}[toolchain]${_TC_NC} $*" >&2; }
 
-# Compare semver versions
+# Check for required dependencies
+_tc_require_jq() {
+    if ! command -v jq &>/dev/null; then
+        _tc_log_error "jq is required but not installed"
+        _tc_log_info "Install: apt install jq (Debian/Ubuntu) or brew install jq (macOS)"
+        return 3
+    fi
+    return 0
+}
+
+_tc_require_curl() {
+    if ! command -v curl &>/dev/null; then
+        _tc_log_error "curl is required but not installed"
+        return 3
+    fi
+    return 0
+}
+
+# Compare semver versions (pure bash - works on macOS/Linux/BSD)
 # Returns: 0 if v1 >= v2, 1 if v1 < v2
 _tc_version_ge() {
     local v1="$1"
@@ -66,12 +84,22 @@ _tc_version_ge() {
     [[ -z "$v1" ]] && return 1
     [[ -z "$v2" ]] && return 0
 
-    # Use sort -V for version comparison
-    if [[ "$(printf '%s\n%s' "$v2" "$v1" | sort -V | head -1)" == "$v2" ]]; then
-        return 0
-    else
-        return 1
-    fi
+    # Pure bash version comparison (portable - works without sort -V)
+    local v1_parts v2_parts
+    IFS='.' read -ra v1_parts <<< "$v1"
+    IFS='.' read -ra v2_parts <<< "$v2"
+
+    local i
+    for ((i=0; i<3; i++)); do
+        local n1="${v1_parts[i]:-0}"
+        local n2="${v2_parts[i]:-0}"
+        if ((n1 > n2)); then
+            return 0
+        elif ((n1 < n2)); then
+            return 1
+        fi
+    done
+    return 0  # Equal versions
 }
 
 # Detect OS and architecture
@@ -183,6 +211,7 @@ EOF
 _tc_install_rust() {
     local nightly="${1:-false}"
 
+    _tc_require_curl || return $?
     _tc_log_info "Installing Rust via rustup..."
 
     # Check if already installed
@@ -255,6 +284,7 @@ EOF
 _tc_install_go() {
     local go_version="${1:-1.23.0}"
 
+    _tc_require_curl || return $?
     _tc_log_info "Installing Go $go_version..."
 
     if command -v go &>/dev/null; then
@@ -336,6 +366,7 @@ EOF
 
 # Install Bun
 _tc_install_bun() {
+    _tc_require_curl || return $?
     _tc_log_info "Installing Bun..."
 
     if command -v bun &>/dev/null; then
@@ -459,6 +490,8 @@ toolchain_ensure() {
     local auto_install=false
     [[ "${2:-}" == "--install" ]] && auto_install=true
 
+    _tc_require_jq || return $?
+
     local result
     result=$(toolchain_detect "$toolchain")
 
@@ -497,6 +530,9 @@ toolchain_install() {
     local toolchain="${1:-}"
     local auto_yes=false
     [[ "${2:-}" == "--yes" ]] && auto_yes=true
+
+    _tc_require_jq || return $?
+    _tc_require_curl || return $?
 
     # Check if already installed
     local result
@@ -547,6 +583,8 @@ toolchain_install() {
 
 # Print human-readable status for all toolchains
 toolchain_status() {
+    _tc_require_jq || return $?
+
     local platform
     platform=$(_tc_detect_platform)
 
