@@ -1393,11 +1393,13 @@ cmd_build() {
                 shift 2
                 ;;
             --parallel|-p)
-                parallel=true  # shellcheck disable=SC2034
+                # shellcheck disable=SC2034
+                parallel=true
                 shift
                 ;;
             --resume|-r)
-                resume=true  # shellcheck disable=SC2034
+                # shellcheck disable=SC2034
+                resume=true
                 shift
                 ;;
             --allow-dirty)
