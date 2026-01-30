@@ -63,6 +63,70 @@ act_job_map:
 - **Non-null values**: Job ID to run via act
 - **null values**: Requires native build host (SSH)
 
+## Per-Host Overrides
+
+Different target platforms require different build strategies:
+
+### linux/amd64 (trj - primary host)
+
+Default act configuration. All Linux jobs run here via Docker.
+
+```yaml
+act_overrides:
+  platform_image: catthehacker/ubuntu:act-latest
+```
+
+### linux/arm64 (trj via cross-compile or QEMU)
+
+Two strategies for ARM64 Linux:
+
+1. **Cross-compile** (preferred for Go/Rust):
+   ```yaml
+   cross_compile:
+     linux/arm64:
+       method: native  # Go
+       env:
+         GOOS: linux
+         GOARCH: arm64
+   ```
+
+2. **QEMU emulation** (slower, full compatibility):
+   ```yaml
+   act_overrides:
+     linux_arm64_flags:
+       - "--container-architecture linux/arm64"
+   ```
+
+### darwin/arm64 (mmini)
+
+Native builds via SSH. Required for macOS code signing.
+
+```yaml
+act_job_map:
+  darwin/arm64: null  # Native build required
+
+native_build:
+  darwin/arm64:
+    host: mmini
+    connection: ssh
+```
+
+### windows/amd64 (wlap)
+
+Native builds via SSH. Required for Windows code signing.
+
+```yaml
+act_job_map:
+  windows/amd64: null  # Native build required
+
+native_build:
+  windows/amd64:
+    host: wlap
+    connection: ssh
+```
+
+---
+
 ## Common act Flags
 
 | Flag | Purpose | Example |
@@ -127,6 +191,53 @@ jobs:
     name: ${{ matrix.binary_name }}-${{ matrix.target }}
     path: target/release/${{ matrix.binary_name }}
 ```
+
+## Using the Compatibility Matrix
+
+The `act_runner.sh` module provides functions to query the compatibility matrix:
+
+```bash
+source src/act_runner.sh
+
+# Load a tool's configuration
+act_load_repo_config ntm
+# → [act] Loaded config for ntm: Dicklesworthstone/ntm
+
+# Get the job to run for a platform
+act_get_job_for_target ntm linux/amd64
+# → build
+
+act_get_job_for_target ntm darwin/arm64
+# → (empty - native build required)
+
+# Check if a platform uses act or native
+act_platform_uses_act ntm linux/amd64 && echo "act" || echo "native"
+# → act
+
+act_platform_uses_act ntm darwin/arm64 && echo "act" || echo "native"
+# → native
+
+# Get the build strategy for a platform
+act_get_build_strategy ntm linux/amd64
+# → {"tool":"ntm","platform":"linux/amd64","method":"act","host":"trj","job":"build"}
+
+act_get_build_strategy cass darwin/arm64
+# → {"tool":"cass","platform":"darwin/arm64","method":"native","host":"mmini","job":""}
+
+# Get all targets for a tool
+act_get_targets ntm
+# → linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64
+
+# List all configured tools
+act_list_tools
+# → br bv cass ntm
+
+# Generate full build matrix
+act_build_matrix ntm | jq .
+# → [{"tool":"ntm","platform":"linux/amd64","method":"act",...}, ...]
+```
+
+---
 
 ## Testing act Compatibility
 

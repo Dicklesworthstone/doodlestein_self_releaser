@@ -11,8 +11,8 @@
 set -uo pipefail
 
 # Configuration (can be overridden)
-ACT_ARTIFACTS_DIR="${ACT_ARTIFACTS_DIR:-/tmp/dsr-act-artifacts}"
-ACT_LOGS_DIR="${ACT_LOGS_DIR:-/tmp/dsr-act-logs}"
+ACT_ARTIFACTS_DIR="${ACT_ARTIFACTS_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/artifacts}"
+ACT_LOGS_DIR="${ACT_LOGS_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/logs/$(date +%Y-%m-%d)/builds}"
 ACT_TIMEOUT="${ACT_TIMEOUT:-3600}"  # 1 hour default
 
 # Colors for output (if not disabled)
@@ -59,7 +59,7 @@ act_list_jobs() {
 
     # Parse workflow YAML to extract job info
     # act -l outputs: Stage  Job ID  Job name  Workflow name  Workflow file  Events
-    act -l -W "$workflow" 2>/dev/null | tail -n +2 | while IFS=$'\t' read -r stage job_id job_name workflow_name workflow_file events; do
+    act -l -W "$workflow" 2>/dev/null | tail -n +2 | while IFS=$'\t' read -r _ job_id _ _ _ _; do
         echo "$job_id"
     done
 }
@@ -91,10 +91,10 @@ act_can_run() {
     local runs_on="$1"
 
     case "$runs_on" in
-        ubuntu-*|ubuntu-latest)
+        ubuntu-*)
             return 0
             ;;
-        macos-*|macos-latest|windows-*|windows-latest)
+        macos-*|windows-*)
             return 1
             ;;
         self-hosted*)
@@ -305,6 +305,246 @@ act_cleanup() {
     _log_ok "Cleanup complete"
 }
 
+# ============================================================================
+# Compatibility Matrix Functions
+# ============================================================================
+
+# Configuration directories
+ACT_CONFIG_DIR="${DSR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsr}"
+ACT_REPOS_DIR="${ACT_CONFIG_DIR}/repos.d"
+
+# Load repo configuration
+# Usage: act_load_repo_config <tool_name>
+# Returns: Sets global ACT_REPO_* variables
+act_load_repo_config() {
+    local tool_name="$1"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        _log_error "Repo config not found: $config_file"
+        return 4
+    fi
+
+    # Check for yq
+    if ! command -v yq &>/dev/null; then
+        _log_error "yq required for config parsing. Install: brew install yq"
+        return 3
+    fi
+
+    # Load config into variables
+    ACT_REPO_NAME=$(yq -r '.tool_name // empty' "$config_file")
+    ACT_REPO_GITHUB=$(yq -r '.repo // empty' "$config_file")
+    ACT_REPO_LOCAL_PATH=$(yq -r '.local_path // empty' "$config_file")
+    ACT_REPO_LANGUAGE=$(yq -r '.language // empty' "$config_file")
+    ACT_REPO_WORKFLOW=$(yq -r '.workflow // ".github/workflows/release.yml"' "$config_file")
+
+    export ACT_REPO_NAME ACT_REPO_GITHUB ACT_REPO_LOCAL_PATH ACT_REPO_LANGUAGE ACT_REPO_WORKFLOW
+
+    _log_info "Loaded config for $tool_name: $ACT_REPO_GITHUB"
+    return 0
+}
+
+# Get act job for a target platform
+# Usage: act_get_job_for_target <tool_name> <platform>
+# Returns: Job name or empty if native build required
+act_get_job_for_target() {
+    local tool_name="$1"
+    local platform="$2"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        _log_error "Repo config not found: $config_file"
+        return 4
+    fi
+
+    # Use yq to extract the job mapping
+    # Format in YAML: act_job_map.linux/amd64: build-linux
+    local job
+    job=$(yq -r ".act_job_map.\"$platform\" // empty" "$config_file" 2>/dev/null)
+
+    # Handle null values (native build required)
+    if [[ "$job" == "null" || -z "$job" ]]; then
+        echo ""
+        return 1  # Native build required
+    fi
+
+    echo "$job"
+    return 0
+}
+
+# Check if a platform can be built via act
+# Usage: act_platform_uses_act <tool_name> <platform>
+# Returns: 0 if act, 1 if native
+act_platform_uses_act() {
+    local tool_name="$1"
+    local platform="$2"
+
+    local job
+    job=$(act_get_job_for_target "$tool_name" "$platform")
+
+    if [[ -n "$job" ]]; then
+        return 0  # Uses act
+    else
+        return 1  # Native build
+    fi
+}
+
+# Get act flags for a tool/platform combination
+# Usage: act_get_flags <tool_name> <platform>
+# Returns: Array of act flags as space-separated string
+act_get_flags() {
+    local tool_name="$1"
+    local platform="$2"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo ""
+        return 4
+    fi
+
+    local flags=()
+
+    # Get platform-specific image override
+    local image
+    image=$(yq -r ".act_overrides.platform_image // empty" "$config_file" 2>/dev/null)
+    if [[ -n "$image" ]]; then
+        flags+=("-P ubuntu-latest=$image")
+    fi
+
+    # Get secrets file if specified
+    local secrets_file
+    secrets_file=$(yq -r ".act_overrides.secrets_file // empty" "$config_file" 2>/dev/null)
+    if [[ -n "$secrets_file" ]]; then
+        flags+=("--secret-file $secrets_file")
+    fi
+
+    # Get env file if specified
+    local env_file
+    env_file=$(yq -r ".act_overrides.env_file // empty" "$config_file" 2>/dev/null)
+    if [[ -n "$env_file" ]]; then
+        flags+=("--env-file $env_file")
+    fi
+
+    # Platform-specific flags
+    if [[ "$platform" == "linux/arm64" ]]; then
+        # Check for ARM64 specific overrides
+        local arm64_flags
+        arm64_flags=$(yq -r '.act_overrides.linux_arm64_flags[]? // empty' "$config_file" 2>/dev/null)
+        if [[ -n "$arm64_flags" ]]; then
+            while IFS= read -r flag; do
+                flags+=("$flag")
+            done <<< "$arm64_flags"
+        fi
+    fi
+
+    echo "${flags[*]}"
+}
+
+# Get all targets for a tool
+# Usage: act_get_targets <tool_name>
+# Returns: Space-separated list of platforms
+act_get_targets() {
+    local tool_name="$1"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo ""
+        return 4
+    fi
+
+    yq -r '.targets[]' "$config_file" 2>/dev/null | tr '\n' ' '
+}
+
+# Get native host for a platform
+# Usage: act_get_native_host <platform>
+# Returns: Host name (trj, mmini, wlap) or empty
+act_get_native_host() {
+    local platform="$1"
+
+    case "$platform" in
+        linux/amd64|linux/arm64)
+            echo "trj"
+            ;;
+        darwin/arm64|darwin/amd64)
+            echo "mmini"
+            ;;
+        windows/amd64)
+            echo "wlap"
+            ;;
+        *)
+            echo ""
+            return 1
+            ;;
+    esac
+}
+
+# Get build strategy for a tool/platform
+# Usage: act_get_build_strategy <tool_name> <platform>
+# Returns: JSON with method, host, job info
+act_get_build_strategy() {
+    local tool_name="$1"
+    local platform="$2"
+
+    local job host method
+
+    if act_platform_uses_act "$tool_name" "$platform"; then
+        job=$(act_get_job_for_target "$tool_name" "$platform")
+        host="trj"
+        method="act"
+    else
+        job=""
+        host=$(act_get_native_host "$platform")
+        method="native"
+    fi
+
+    cat <<EOF
+{
+  "tool": "$tool_name",
+  "platform": "$platform",
+  "method": "$method",
+  "host": "$host",
+  "job": "$job"
+}
+EOF
+}
+
+# List all configured tools
+# Usage: act_list_tools
+# Returns: List of tool names
+act_list_tools() {
+    if [[ ! -d "$ACT_REPOS_DIR" ]]; then
+        _log_warn "Repos directory not found: $ACT_REPOS_DIR"
+        return 1
+    fi
+
+    for config in "$ACT_REPOS_DIR"/*.yaml; do
+        if [[ -f "$config" && ! "$(basename "$config")" =~ ^_ ]]; then
+            basename "$config" .yaml
+        fi
+    done
+}
+
+# Generate full build matrix for a tool
+# Usage: act_build_matrix <tool_name>
+# Returns: JSON array of build strategies
+act_build_matrix() {
+    local tool_name="$1"
+    local targets strategies=()
+
+    targets=$(act_get_targets "$tool_name")
+
+    for target in $targets; do
+        local strategy
+        strategy=$(act_get_build_strategy "$tool_name" "$target")
+        strategies+=("$strategy")
+    done
+
+    printf '%s\n' "${strategies[@]}" | jq -s '.'
+}
+
 # Export functions for use by other scripts
 export -f act_check act_list_jobs act_get_runner act_can_run
 export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanup
+export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
+export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
+export -f act_list_tools act_build_matrix
