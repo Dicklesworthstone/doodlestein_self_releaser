@@ -1407,6 +1407,7 @@ cmd_build() {
             --resume|-r)
                 # shellcheck disable=SC2034
                 resume=true
+                log_warn "--resume is not yet implemented; proceeding with fresh build"
                 shift
                 ;;
             --allow-dirty)
@@ -1794,7 +1795,9 @@ cmd_release() {
                 shift
                 ;;
             --resume|-r)
+                # shellcheck disable=SC2034
                 resume=true
+                log_warn "--resume is not yet implemented; proceeding with fresh upload"
                 shift
                 ;;
             --help|-h)
@@ -2697,6 +2700,7 @@ cmd_fallback() {
                 ;;
             --resume|-r)
                 resume=true
+                log_warn "--resume is not yet implemented; proceeding with fresh build"
                 shift
                 ;;
             --output-dir|-o)
