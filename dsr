@@ -702,9 +702,672 @@ cmd_fallback() {
 }
 
 cmd_repos() {
-    log_warn "repos command not yet implemented"
-    log_info "See bead bd-1jt.1.3 for implementation plan"
-    return 4
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)
+            cmd_repos_list "$@"
+            ;;
+        add)
+            cmd_repos_add "$@"
+            ;;
+        remove)
+            cmd_repos_remove "$@"
+            ;;
+        info)
+            cmd_repos_info "$@"
+            ;;
+        validate)
+            cmd_repos_validate "$@"
+            ;;
+        discover)
+            cmd_repos_discover "$@"
+            ;;
+        sync)
+            cmd_repos_sync "$@"
+            ;;
+        --help|-h|help)
+            cat << 'EOF'
+dsr repos - Manage repository registry
+
+USAGE:
+    dsr repos <subcommand> [options]
+
+SUBCOMMANDS:
+    list        List all registered repositories
+    add         Add a repository to the registry
+    remove      Remove a repository from the registry
+    info        Show detailed info for a repository
+    validate    Validate repository configurations
+    discover    Discover repos that could benefit from dsr
+    sync        Sync repository metadata from GitHub
+
+OPTIONS:
+    --json      Output in JSON format (global)
+
+EXAMPLES:
+    dsr repos list                          List all repos
+    dsr repos add ntm --local-path /data/projects/ntm
+    dsr repos add dicklesworthstone/bv
+    dsr repos remove ntm
+    dsr repos info ntm --json
+    dsr repos validate
+    dsr repos discover --path /data/projects
+
+For more information, see docs/CLI_CONTRACT.md
+EOF
+            ;;
+        *)
+            log_error "Unknown repos subcommand: $subcmd"
+            log_info "Run 'dsr repos --help' for usage"
+            return 4
+            ;;
+    esac
+}
+
+# List all registered repositories
+cmd_repos_list() {
+    local format="table"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --format|-f)
+                format="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Load repos config
+    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+        log_error "Repos file not found: $DSR_REPOS_FILE"
+        log_info "Run: dsr config init"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 4 '{"action": "list", "repos": [], "errors": [{"code": "E052", "message": "repos file not found"}]}'
+        fi
+        return 4
+    fi
+
+    local repos_json="[]"
+    if command -v yq &>/dev/null; then
+        repos_json=$(yq -o=json '.tools // {}' "$DSR_REPOS_FILE" 2>/dev/null | jq -c '
+            to_entries | map({
+                name: .key,
+                repo: (.value.repo // ""),
+                local_path: (.value.local_path // ""),
+                language: (.value.language // ""),
+                targets: (.value.targets // []),
+                workflow: (.value.workflow // ""),
+                enabled: (.value.enabled // true)
+            })
+        ' 2>/dev/null || echo "[]")
+    else
+        # Fallback: simple parsing without yq
+        repos_json="[]"
+        log_warn "yq not found. Install yq for full repos functionality."
+    fi
+
+    if $JSON_MODE; then
+        json_envelope "repos" "success" 0 "$(jq -nc --argjson repos "$repos_json" '{action: "list", repos: $repos}')"
+    else
+        local count
+        count=$(echo "$repos_json" | jq 'length')
+
+        if [[ "$count" -eq 0 ]]; then
+            log_info "No repositories registered."
+            log_info "Run: dsr repos add <owner/repo> --local-path <path>"
+            return 0
+        fi
+
+        log_info "Registered repositories ($count):"
+        echo ""
+
+        if [[ "$format" == "table" ]]; then
+            printf "%-12s %-30s %-10s %s\n" "NAME" "REPO" "LANGUAGE" "TARGETS"
+            printf "%s\n" "$(printf '%.0s-' {1..80})"
+            echo "$repos_json" | jq -r '.[] | [.name, .repo, .language, (.targets | join(","))] | @tsv' | \
+                while IFS=$'\t' read -r name repo lang targets; do
+                    printf "%-12s %-30s %-10s %s\n" "$name" "$repo" "${lang:-?}" "${targets:-all}"
+                done
+        else
+            echo "$repos_json" | jq -r '.[] | "\(.name): \(.repo)"'
+        fi
+    fi
+}
+
+# Add a repository to the registry
+cmd_repos_add() {
+    local repo_input=""
+    local local_path=""
+    local language=""
+    local name=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --local-path|-p)
+                local_path="$2"
+                shift 2
+                ;;
+            --language|-l)
+                language="$2"
+                shift 2
+                ;;
+            --name|-n)
+                name="$2"
+                shift 2
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                return 4
+                ;;
+            *)
+                repo_input="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$repo_input" ]]; then
+        log_error "Usage: dsr repos add <owner/repo|name> [--local-path <path>] [--language <lang>]"
+        return 4
+    fi
+
+    # Parse repo input - could be "owner/repo" or just "name"
+    local repo
+    if [[ "$repo_input" =~ / ]]; then
+        repo="$repo_input"
+        [[ -z "$name" ]] && name="${repo_input#*/}"
+    else
+        name="$repo_input"
+        repo=""
+    fi
+
+    # Validate local_path if provided
+    if [[ -n "$local_path" ]]; then
+        # Source guardrails for path resolution
+        source "$SCRIPT_DIR/src/guardrails.sh"
+        local_path=$(resolve_path "$local_path" 2>&1) || {
+            log_error "Invalid local path: $local_path"
+            if $JSON_MODE; then
+                json_envelope "repos" "error" 4 "$(jq -nc --arg name "$name" '{action: "add", repo: $name, errors: [{code: "E052", message: "invalid local path"}]}')"
+            fi
+            return 4
+        }
+
+        # Auto-detect language if not specified
+        if [[ -z "$language" && -d "$local_path" ]]; then
+            if [[ -f "$local_path/Cargo.toml" ]]; then
+                language="rust"
+            elif [[ -f "$local_path/go.mod" ]]; then
+                language="go"
+            elif [[ -f "$local_path/package.json" ]]; then
+                if [[ -f "$local_path/bun.lockb" ]]; then
+                    language="bun"
+                else
+                    language="node"
+                fi
+            elif [[ -f "$local_path/pyproject.toml" || -f "$local_path/setup.py" ]]; then
+                language="python"
+            fi
+        fi
+
+        # Auto-detect repo from git remote if not specified
+        if [[ -z "$repo" && -d "$local_path/.git" ]]; then
+            local remote_url
+            remote_url=$(git -C "$local_path" remote get-url origin 2>/dev/null || true)
+            if [[ -n "$remote_url" ]]; then
+                # Parse owner/repo from git URL
+                repo=$(echo "$remote_url" | sed -E 's#.*(github\.com[:/])([^/]+/[^/]+)(\.git)?$#\2#')
+                repo="${repo%.git}"
+            fi
+        fi
+    fi
+
+    # Check if yq is available for writing
+    if ! command -v yq &>/dev/null; then
+        log_error "yq is required to add repositories"
+        log_info "Install: brew install yq  OR  apt install yq"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 3 '{"action": "add", "errors": [{"code": "E041", "message": "yq required"}]}'
+        fi
+        return 3
+    fi
+
+    # Ensure repos file exists
+    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+        log_warn "Repos file not found, running config init..."
+        config_init >/dev/null 2>&1
+    fi
+
+    # Check if already exists
+    local existing
+    existing=$(yq ".tools.$name" "$DSR_REPOS_FILE" 2>/dev/null)
+    if [[ "$existing" != "null" && -n "$existing" ]]; then
+        log_error "Repository '$name' already exists"
+        log_info "Use 'dsr repos remove $name' first, or choose a different name"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 4 "$(jq -nc --arg name "$name" '{action: "add", repo: $name, errors: [{code: "E052", message: "repo already exists"}]}')"
+        fi
+        return 4
+    fi
+
+    # Build the tool entry
+    local tool_yaml=""
+    tool_yaml+="repo: \"${repo:-}\""
+    [[ -n "$local_path" ]] && tool_yaml+="\n    local_path: \"$local_path\""
+    [[ -n "$language" ]] && tool_yaml+="\n    language: \"$language\""
+    tool_yaml+="\n    targets:\n      - linux/amd64\n      - darwin/arm64\n      - windows/amd64"
+
+    # Add to repos.yaml using yq
+    yq -i ".tools.$name = {}" "$DSR_REPOS_FILE"
+    [[ -n "$repo" ]] && yq -i ".tools.$name.repo = \"$repo\"" "$DSR_REPOS_FILE"
+    [[ -n "$local_path" ]] && yq -i ".tools.$name.local_path = \"$local_path\"" "$DSR_REPOS_FILE"
+    [[ -n "$language" ]] && yq -i ".tools.$name.language = \"$language\"" "$DSR_REPOS_FILE"
+    yq -i ".tools.$name.targets = [\"linux/amd64\", \"darwin/arm64\", \"windows/amd64\"]" "$DSR_REPOS_FILE"
+
+    if $JSON_MODE; then
+        local added_json
+        added_json=$(jq -nc \
+            --arg name "$name" \
+            --arg repo "${repo:-}" \
+            --arg local_path "${local_path:-}" \
+            --arg language "${language:-}" \
+            '{name: $name, repo: $repo, local_path: $local_path, language: $language, targets: ["linux/amd64", "darwin/arm64", "windows/amd64"]}')
+        json_envelope "repos" "success" 0 "$(jq -nc --argjson added "[$added_json]" '{action: "add", added: $added}')"
+    else
+        log_ok "Added repository: $name"
+        [[ -n "$repo" ]] && log_info "  repo: $repo"
+        [[ -n "$local_path" ]] && log_info "  local_path: $local_path"
+        [[ -n "$language" ]] && log_info "  language: $language"
+    fi
+}
+
+# Remove a repository from the registry
+cmd_repos_remove() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        log_error "Usage: dsr repos remove <name>"
+        return 4
+    fi
+
+    if ! command -v yq &>/dev/null; then
+        log_error "yq is required to remove repositories"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 3 '{"action": "remove", "errors": [{"code": "E041", "message": "yq required"}]}'
+        fi
+        return 3
+    fi
+
+    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+        log_error "Repos file not found"
+        return 4
+    fi
+
+    # Check if exists
+    local existing
+    existing=$(yq ".tools.$name" "$DSR_REPOS_FILE" 2>/dev/null)
+    if [[ "$existing" == "null" || -z "$existing" ]]; then
+        log_error "Repository '$name' not found"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 4 "$(jq -nc --arg name "$name" '{action: "remove", repo: $name, errors: [{code: "E052", message: "repo not found"}]}')"
+        fi
+        return 4
+    fi
+
+    # Remove from repos.yaml
+    yq -i "del(.tools.$name)" "$DSR_REPOS_FILE"
+
+    if $JSON_MODE; then
+        json_envelope "repos" "success" 0 "$(jq -nc --arg name "$name" '{action: "remove", removed: [{name: $name}]}')"
+    else
+        log_ok "Removed repository: $name"
+    fi
+}
+
+# Show detailed info for a repository
+cmd_repos_info() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        log_error "Usage: dsr repos info <name>"
+        return 4
+    fi
+
+    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+        log_error "Repos file not found"
+        return 4
+    fi
+
+    local tool_yaml
+    if command -v yq &>/dev/null; then
+        tool_yaml=$(yq ".tools.$name" "$DSR_REPOS_FILE" 2>/dev/null)
+    else
+        log_error "yq required for repos info"
+        return 3
+    fi
+
+    if [[ "$tool_yaml" == "null" || -z "$tool_yaml" ]]; then
+        log_error "Repository '$name' not found"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 4 "$(jq -nc --arg name "$name" '{action: "info", repo: $name, errors: [{code: "E052", message: "repo not found"}]}')"
+        fi
+        return 4
+    fi
+
+    local tool_json
+    tool_json=$(yq -o=json ".tools.$name" "$DSR_REPOS_FILE" 2>/dev/null | jq -c --arg name "$name" '. + {name: $name}')
+
+    if $JSON_MODE; then
+        json_envelope "repos" "success" 0 "$(jq -nc --argjson repos "[$tool_json]" --arg name "$name" '{action: "info", repo: $name, repos: $repos}')"
+    else
+        log_info "Repository: $name"
+        echo ""
+        echo "$tool_json" | jq -r 'to_entries[] | "  \(.key): \(.value)"'
+    fi
+}
+
+# Validate repository configurations
+cmd_repos_validate() {
+    local repo_filter="${1:-}"
+
+    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+        log_error "Repos file not found"
+        return 4
+    fi
+
+    if ! command -v yq &>/dev/null; then
+        log_error "yq required for validation"
+        return 3
+    fi
+
+    local tools_json
+    tools_json=$(yq -o=json '.tools // {}' "$DSR_REPOS_FILE" 2>/dev/null)
+
+    local results=()
+    local errors=0
+    local warnings=0
+
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        [[ -n "$repo_filter" && "$name" != "$repo_filter" ]] && continue
+
+        local tool_json
+        tool_json=$(echo "$tools_json" | jq -c --arg name "$name" '.[$name]')
+
+        local status="ok"
+        local messages=()
+
+        # Check required fields
+        local repo local_path
+        repo=$(echo "$tool_json" | jq -r '.repo // ""')
+        local_path=$(echo "$tool_json" | jq -r '.local_path // ""')
+
+        if [[ -z "$repo" && -z "$local_path" ]]; then
+            status="error"
+            messages+=("Missing both 'repo' and 'local_path' - need at least one")
+            ((errors++))
+        fi
+
+        # Check local_path exists
+        if [[ -n "$local_path" ]]; then
+            source "$SCRIPT_DIR/src/guardrails.sh"
+            local resolved_path
+            resolved_path=$(resolve_path "$local_path" 2>/dev/null) || {
+                status="error"
+                messages+=("Invalid local_path: $local_path")
+                ((errors++))
+            }
+            if [[ -n "$resolved_path" && ! -d "$resolved_path" ]]; then
+                status="warn"
+                messages+=("local_path does not exist: $resolved_path")
+                ((warnings++))
+            fi
+        fi
+
+        # Check workflow file exists
+        local workflow
+        workflow=$(echo "$tool_json" | jq -r '.workflow // ""')
+        if [[ -n "$workflow" && -n "$local_path" ]]; then
+            source "$SCRIPT_DIR/src/guardrails.sh"
+            local resolved_path
+            resolved_path=$(resolve_path "$local_path" 2>/dev/null) || true
+            if [[ -n "$resolved_path" && ! -f "$resolved_path/$workflow" ]]; then
+                if [[ "$status" != "error" ]]; then
+                    status="warn"
+                fi
+                messages+=("Workflow file not found: $workflow")
+                ((warnings++))
+            fi
+        fi
+
+        local msg_str=""
+        [[ ${#messages[@]} -gt 0 ]] && msg_str=$(IFS='; '; echo "${messages[*]}")
+
+        results+=("$(jq -nc --arg repo "$name" --arg status "$status" --arg message "$msg_str" \
+            '{repo: $repo, status: $status, message: $message}')")
+
+        if ! $JSON_MODE; then
+            if [[ "$status" == "ok" ]]; then
+                log_ok "$name: OK"
+            elif [[ "$status" == "warn" ]]; then
+                log_warn "$name: $msg_str"
+            else
+                log_error "$name: $msg_str"
+            fi
+        fi
+
+    done < <(echo "$tools_json" | jq -r 'keys[]')
+
+    local results_json
+    results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')
+
+    if $JSON_MODE; then
+        local status="success"
+        local exit_code=0
+        if [[ $errors -gt 0 ]]; then
+            status="error"
+            exit_code=1
+        elif [[ $warnings -gt 0 ]]; then
+            status="partial"
+        fi
+        json_envelope "repos" "$status" "$exit_code" "$(jq -nc --argjson validated "$results_json" '{action: "validate", validated: $validated}')"
+    else
+        echo ""
+        if [[ $errors -gt 0 ]]; then
+            log_error "Validation found $errors error(s), $warnings warning(s)"
+            return 1
+        elif [[ $warnings -gt 0 ]]; then
+            log_warn "Validation found $warnings warning(s)"
+        else
+            log_ok "All repositories validated successfully"
+        fi
+    fi
+}
+
+# Discover repositories that could benefit from dsr
+cmd_repos_discover() {
+    local search_path="/data/projects"
+    local apply=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --path|-p)
+                search_path="$2"
+                shift 2
+                ;;
+            --apply)
+                apply=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Validate search path
+    source "$SCRIPT_DIR/src/guardrails.sh"
+    search_path=$(resolve_path "$search_path" --must-exist 2>&1) || {
+        log_error "Invalid search path: $search_path"
+        return 4
+    }
+
+    log_info "Scanning $search_path for buildable projects..."
+
+    local discovered=()
+
+    # Find directories with build files
+    while IFS= read -r dir; do
+        local name
+        name=$(basename "$dir")
+        local language=""
+        local repo=""
+
+        # Detect language
+        if [[ -f "$dir/Cargo.toml" ]]; then
+            language="rust"
+        elif [[ -f "$dir/go.mod" ]]; then
+            language="go"
+        elif [[ -f "$dir/package.json" ]]; then
+            language="node"
+        else
+            continue
+        fi
+
+        # Get repo from git remote
+        if [[ -d "$dir/.git" ]]; then
+            local remote_url
+            remote_url=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
+            if [[ -n "$remote_url" ]]; then
+                repo=$(echo "$remote_url" | sed -E 's#.*(github\.com[:/])([^/]+/[^/]+)(\.git)?$#\2#')
+                repo="${repo%.git}"
+            fi
+        fi
+
+        # Check if has release workflow
+        local has_workflow=false
+        if [[ -d "$dir/.github/workflows" ]]; then
+            if grep -l -E 'release|build' "$dir/.github/workflows/"*.yml "$dir/.github/workflows/"*.yaml 2>/dev/null | head -1 >/dev/null; then
+                has_workflow=true
+            fi
+        fi
+
+        local entry
+        entry=$(jq -nc \
+            --arg name "$name" \
+            --arg repo "${repo:-}" \
+            --arg local_path "$dir" \
+            --arg language "$language" \
+            --argjson has_workflow "$has_workflow" \
+            '{name: $name, repo: $repo, local_path: $local_path, language: $language, has_workflow: $has_workflow}')
+
+        discovered+=("$entry")
+
+        if ! $JSON_MODE; then
+            local workflow_indicator="  "
+            $has_workflow && workflow_indicator="✓ "
+            log_info "$workflow_indicator$name ($language) - $dir"
+        fi
+
+    done < <(find "$search_path" -maxdepth 2 -type f \( -name "Cargo.toml" -o -name "go.mod" -o -name "package.json" \) -print0 2>/dev/null | xargs -0 -I{} dirname {} | sort -u)
+
+    local discovered_json
+    discovered_json=$(printf '%s\n' "${discovered[@]}" | jq -sc '.')
+
+    if $JSON_MODE; then
+        json_envelope "repos" "success" 0 "$(jq -nc --argjson discovered "$discovered_json" '{action: "discover", discovered: $discovered}')"
+    else
+        echo ""
+        local count
+        count=$(echo "$discovered_json" | jq 'length')
+        log_info "Discovered $count potential repositories"
+        if [[ $count -gt 0 ]] && ! $apply; then
+            log_info "Run with --apply to add them to the registry"
+        fi
+    fi
+
+    # Apply if requested
+    if $apply && [[ ${#discovered[@]} -gt 0 ]]; then
+        log_info "Adding discovered repositories..."
+        for entry in "${discovered[@]}"; do
+            local name repo local_path language
+            name=$(echo "$entry" | jq -r '.name')
+            repo=$(echo "$entry" | jq -r '.repo // ""')
+            local_path=$(echo "$entry" | jq -r '.local_path')
+            language=$(echo "$entry" | jq -r '.language')
+
+            cmd_repos_add "$name" --local-path "$local_path" --language "$language" 2>/dev/null || true
+        done
+    fi
+}
+
+# Sync repository metadata from GitHub
+cmd_repos_sync() {
+    log_info "Syncing repository metadata from GitHub..."
+
+    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+        log_error "Repos file not found"
+        return 4
+    fi
+
+    if ! command -v yq &>/dev/null; then
+        log_error "yq required for sync"
+        return 3
+    fi
+
+    local tools_json
+    tools_json=$(yq -o=json '.tools // {}' "$DSR_REPOS_FILE" 2>/dev/null)
+
+    local synced=0
+    local failed=0
+
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+
+        local repo
+        repo=$(echo "$tools_json" | jq -r --arg name "$name" '.[$name].repo // ""')
+
+        if [[ -z "$repo" ]]; then
+            log_warn "$name: no repo configured, skipping"
+            continue
+        fi
+
+        log_info "Syncing $name ($repo)..."
+
+        # Fetch repo info from GitHub
+        if gh_check 2>/dev/null || gh_check_token 2>/dev/null; then
+            local repo_info
+            repo_info=$(gh_repo "$repo" 2>/dev/null) || {
+                log_warn "$name: failed to fetch repo info"
+                ((failed++))
+                continue
+            }
+
+            local default_branch
+            default_branch=$(echo "$repo_info" | jq -r '.default_branch // "main"')
+
+            # Update the entry with synced data
+            yq -i ".tools.$name.default_branch = \"$default_branch\"" "$DSR_REPOS_FILE"
+            ((synced++))
+            log_ok "$name: synced (default_branch: $default_branch)"
+        else
+            log_warn "$name: GitHub auth not available"
+            ((failed++))
+        fi
+
+    done < <(echo "$tools_json" | jq -r 'keys[]')
+
+    if $JSON_MODE; then
+        json_envelope "repos" "success" 0 "$(jq -nc --argjson synced "$synced" --argjson failed "$failed" '{action: "sync", synced: $synced, failed: $failed}')"
+    else
+        echo ""
+        log_info "Sync complete: $synced synced, $failed failed"
+    fi
 }
 
 # ============================================================================
