@@ -2,170 +2,66 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/config-details.json",
   "title": "DSR Config Details",
-  "description": "Details payload for 'dsr config' command and subcommands (show, init, get, set, validate, migrate, edit)",
+  "description": "Details payload for 'dsr config' command",
   "type": "object",
-  "required": ["subcommand"],
+  "required": ["action"],
   "properties": {
-    "subcommand": {
+    "action": {
       "type": "string",
-      "enum": ["show", "init", "get", "set", "validate", "migrate", "edit"],
-      "description": "Config subcommand that was executed"
-    },
-    "config_dir": {
-      "type": "string",
-      "description": "Configuration directory path"
+      "enum": ["show", "get", "set", "init", "validate", "migrate", "edit"],
+      "description": "Config subcommand"
     },
     "config_file": {
       "type": "string",
-      "description": "Main configuration file path"
+      "description": "Path to config file"
     },
-    "values": {
-      "type": "object",
-      "additionalProperties": true,
-      "description": "Current configuration values (for show)"
+    "schema_version": {
+      "type": "string",
+      "description": "Config schema version"
     },
     "key": {
       "type": "string",
-      "description": "Configuration key (for get/set)"
+      "description": "Config key"
     },
     "value": {
-      "description": "Configuration value (for get/set)"
+      "type": "string",
+      "description": "Config value"
     },
-    "previous_value": {
-      "description": "Previous value before set (for set)"
-    },
-    "persisted": {
+    "valid": {
       "type": "boolean",
-      "description": "Whether change was persisted to disk"
+      "description": "Validation result"
     },
-    "initialized": {
-      "type": "boolean",
-      "description": "Whether config was initialized (for init)"
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/config_error" },
+      "description": "Validation or migration errors"
     },
-    "files_created": {
+    "from_version": {
+      "type": "string",
+      "description": "Source schema version"
+    },
+    "to_version": {
+      "type": "string",
+      "description": "Target schema version"
+    },
+    "backup_path": {
+      "type": "string",
+      "description": "Backup file path created during migration"
+    },
+    "changed_keys": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Files created during initialization"
-    },
-    "validation": {
-      "$ref": "#/$defs/validation_result",
-      "description": "Validation results (for validate)"
-    },
-    "migration": {
-      "$ref": "#/$defs/migration_result",
-      "description": "Migration results (for migrate)"
-    },
-    "available_keys": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/config_key" },
-      "description": "Available configuration keys"
+      "description": "Keys changed during migration"
     }
   },
   "$defs": {
-    "config_key": {
+    "config_error": {
       "type": "object",
-      "required": ["key", "type"],
+      "required": ["code", "message"],
       "properties": {
-        "key": {
-          "type": "string",
-          "description": "Configuration key name"
-        },
-        "type": {
-          "type": "string",
-          "enum": ["string", "integer", "boolean", "array", "object"],
-          "description": "Value type"
-        },
-        "default": {
-          "description": "Default value"
-        },
-        "description": {
-          "type": "string",
-          "description": "Key description"
-        },
-        "env_var": {
-          "type": "string",
-          "description": "Corresponding environment variable"
-        },
-        "required": {
-          "type": "boolean",
-          "description": "Whether key is required"
-        }
-      }
-    },
-    "validation_result": {
-      "type": "object",
-      "required": ["valid"],
-      "properties": {
-        "valid": {
-          "type": "boolean",
-          "description": "Whether configuration is valid"
-        },
-        "errors": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "key": { "type": "string" },
-              "message": { "type": "string" },
-              "expected": { "type": "string" },
-              "actual": { "type": "string" }
-            }
-          },
-          "description": "Validation errors"
-        },
-        "warnings": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "key": { "type": "string" },
-              "message": { "type": "string" }
-            }
-          },
-          "description": "Validation warnings"
-        },
-        "schema_version": {
-          "type": "string",
-          "description": "Config schema version"
-        }
-      }
-    },
-    "migration_result": {
-      "type": "object",
-      "required": ["migrated"],
-      "properties": {
-        "migrated": {
-          "type": "boolean",
-          "description": "Whether migration was performed"
-        },
-        "from_version": {
-          "type": "string",
-          "description": "Source schema version"
-        },
-        "to_version": {
-          "type": "string",
-          "description": "Target schema version"
-        },
-        "changes": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "action": {
-                "type": "string",
-                "enum": ["add", "remove", "rename", "convert"]
-              },
-              "key": { "type": "string" },
-              "old_key": { "type": "string" },
-              "description": { "type": "string" }
-            }
-          },
-          "description": "Changes applied during migration"
-        },
-        "backup_path": {
-          "type": "string",
-          "description": "Path to backup of original config"
-        }
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "key": { "type": "string" }
       }
     }
   }

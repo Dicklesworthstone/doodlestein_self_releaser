@@ -228,25 +228,44 @@ _config_load_yaml() {
     local file="$1"
 
     if ! command -v yq &>/dev/null; then
-        # Fallback: simple key: value parsing
-        while IFS=': ' read -r key value; do
-            # Skip comments and empty lines
-            [[ -z "$key" || "$key" =~ ^# ]] && continue
-            # Skip nested keys (indented)
-            [[ "$key" =~ ^[[:space:]] ]] && continue
-            # Remove quotes from value
-            value="${value#\"}"
-            value="${value%\"}"
-            value="${value#\'}"
-            value="${value%\'}"
-            # Store
-            [[ -n "$value" ]] && DSR_CONFIG["$key"]="$value"
+        # Fallback: simple key: value parsing (top-level only)
+        # NOTE: This does NOT handle nested structures, lists, or multi-line values
+        local line key value
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip empty lines
+            [[ -z "$line" ]] && continue
+            # Skip comments
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            # Skip indented lines (nested keys, list items)
+            [[ "$line" =~ ^[[:space:]] ]] && continue
+            # Skip list items at root level (shouldn't happen in well-formed YAML)
+            [[ "$line" =~ ^- ]] && continue
+            # Match "key: value" pattern - must have colon followed by space or end
+            if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*):\ *(.*)$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                value="${BASH_REMATCH[2]}"
+                # Remove quotes from value
+                value="${value#\"}"
+                value="${value%\"}"
+                value="${value#\'}"
+                value="${value%\'}"
+                # Skip if value is empty or starts nested block
+                [[ -z "$value" || "$value" == "{" || "$value" == "[" ]] && continue
+                # Store the value
+                DSR_CONFIG["$key"]="$value"
+            fi
         done < "$file"
     else
         # Use yq for proper YAML parsing
-        local key value
-        while IFS='=' read -r key value; do
-            [[ -n "$key" && -n "$value" ]] && DSR_CONFIG["$key"]="$value"
+        local line key value
+        while IFS= read -r line; do
+            # yq props format: key = value (with spaces around =)
+            # Handle keys with dots by taking everything before last " = "
+            if [[ "$line" =~ ^(.+)\ =\ (.*)$ ]]; then
+                key="${BASH_REMATCH[1]}"
+                value="${BASH_REMATCH[2]}"
+                [[ -n "$key" && -n "$value" ]] && DSR_CONFIG["$key"]="$value"
+            fi
         done < <(yq -o=props "$file" 2>/dev/null | grep -v '^#')
     fi
 }
@@ -333,12 +352,19 @@ config_validate() {
 }
 
 # Show configuration (human-readable or JSON)
-# Usage: config_show [key] [--json]
+# Usage: config_show [--json] [key] OR config_show [key] [--json]
 config_show() {
-    local key="${1:-}"
+    local key=""
     local json_mode=false
-    [[ "${2:-}" == "--json" || "${1:-}" == "--json" ]] && json_mode=true
-    [[ "$key" == "--json" ]] && key=""
+
+    # Parse arguments - handle --json in any position
+    for arg in "$@"; do
+        if [[ "$arg" == "--json" ]]; then
+            json_mode=true
+        elif [[ -z "$key" ]]; then
+            key="$arg"
+        fi
+    done
 
     config_load
 
