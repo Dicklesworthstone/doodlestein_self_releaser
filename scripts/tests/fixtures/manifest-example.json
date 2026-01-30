@@ -1,0 +1,75 @@
+{
+  "schema_version": "1.0.0",
+  "tool": "ntm",
+  "version": "v1.2.3",
+  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "git_sha": "abc123def456789012345678901234567890abcd",
+  "git_ref": "v1.2.3",
+  "built_at": "2026-01-30T15:00:00Z",
+  "duration_ms": 180000,
+  "builder": {
+    "tool": "dsr",
+    "version": "0.1.0",
+    "trigger": "throttle-fallback"
+  },
+  "artifacts": [
+    {
+      "name": "ntm-v1.2.3-linux-amd64.tar.gz",
+      "target": "linux/amd64",
+      "sha256": "abc123def456789012345678901234567890abcdef1234567890abcdef12345678",
+      "size_bytes": 5242880,
+      "archive_format": "tar.gz",
+      "signed": true,
+      "signature_file": "ntm-v1.2.3-linux-amd64.tar.gz.minisig"
+    },
+    {
+      "name": "ntm-v1.2.3-darwin-arm64.tar.gz",
+      "target": "darwin/arm64",
+      "sha256": "def456abc789012345678901234567890abcdef1234567890abcdef1234567890",
+      "size_bytes": 5120000,
+      "archive_format": "tar.gz",
+      "signed": true,
+      "signature_file": "ntm-v1.2.3-darwin-arm64.tar.gz.minisig"
+    },
+    {
+      "name": "ntm-v1.2.3-windows-amd64.zip",
+      "target": "windows/amd64",
+      "sha256": "789abc123def456789012345678901234567890abcdef1234567890abcdef1234",
+      "size_bytes": 5500000,
+      "archive_format": "zip",
+      "signed": true,
+      "signature_file": "ntm-v1.2.3-windows-amd64.zip.minisig"
+    }
+  ],
+  "hosts": [
+    {
+      "host": "trj",
+      "platform": "linux/amd64",
+      "status": "success",
+      "method": "act",
+      "duration_ms": 60000,
+      "logs_path": "/tmp/dsr-act-logs/20260130-150000-12345.log",
+      "workflow": ".github/workflows/release.yml",
+      "job": "build-linux"
+    },
+    {
+      "host": "mmini",
+      "platform": "darwin/arm64",
+      "status": "success",
+      "method": "native-ssh",
+      "duration_ms": 45000,
+      "logs_path": "/tmp/dsr-logs/mmini-20260130-150000.log"
+    },
+    {
+      "host": "wlap",
+      "platform": "windows/amd64",
+      "status": "success",
+      "method": "native-ssh",
+      "duration_ms": 75000,
+      "logs_path": "/tmp/dsr-logs/wlap-20260130-150000.log"
+    }
+  ],
+  "checksums_file": "ntm-v1.2.3-checksums.sha256",
+  "signature_file": "ntm-v1.2.3-checksums.sha256.minisig",
+  "sbom_file": "ntm-v1.2.3-sbom.json"
+}

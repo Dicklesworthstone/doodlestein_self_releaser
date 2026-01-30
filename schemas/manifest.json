@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dicklesworthstone/doodlestein_self_releaser/schemas/manifest.json",
+  "title": "DSR Build Manifest",
+  "description": "Schema for dsr build manifests - the source of truth for artifact metadata",
+  "type": "object",
+  "required": ["schema_version", "tool", "version", "run_id", "git_sha", "built_at", "artifacts"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Manifest schema version"
+    },
+    "tool": {
+      "type": "string",
+      "description": "Tool/project name (e.g., 'ntm', 'bv', 'cass')",
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "version": {
+      "type": "string",
+      "description": "Semantic version with 'v' prefix (e.g., 'v1.2.3')",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9.]+)?$"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this build run"
+    },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full git commit SHA that was built"
+    },
+    "git_ref": {
+      "type": "string",
+      "description": "Git ref (branch or tag name)"
+    },
+    "built_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO8601 timestamp when build completed"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total build duration in milliseconds"
+    },
+    "builder": {
+      "type": "object",
+      "description": "Information about the build system",
+      "properties": {
+        "tool": {
+          "type": "string",
+          "const": "dsr"
+        },
+        "version": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string",
+          "enum": ["manual", "throttle-fallback", "ci-failure", "scheduled"],
+          "description": "What triggered this build"
+        }
+      },
+      "required": ["tool", "version"]
+    },
+    "artifacts": {
+      "type": "array",
+      "description": "List of built artifacts",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "minItems": 1
+    },
+    "hosts": {
+      "type": "array",
+      "description": "Build host status for each platform",
+      "items": {
+        "$ref": "#/$defs/host_status"
+      }
+    },
+    "checksums_file": {
+      "type": "string",
+      "description": "Path/name of the SHA256SUMS file"
+    },
+    "signature_file": {
+      "type": "string",
+      "description": "Path/name of the minisign signature file"
+    },
+    "sbom_file": {
+      "type": "string",
+      "description": "Path/name of the SBOM file"
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "required": ["name", "target", "sha256", "size_bytes"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Artifact filename following naming convention",
+          "pattern": "^[a-z][a-z0-9_-]+-v[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9.]+)?-(linux|darwin|windows)-(amd64|arm64|386)(\\.exe)?(\\.tar\\.gz|\\.zip)?$"
+        },
+        "target": {
+          "type": "string",
+          "description": "Target platform in os/arch format",
+          "pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA256 checksum of the artifact"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "File size in bytes"
+        },
+        "archive_format": {
+          "type": "string",
+          "enum": ["tar.gz", "zip", "none"],
+          "description": "Archive format (tar.gz for Unix, zip for Windows)"
+        },
+        "signed": {
+          "type": "boolean",
+          "description": "Whether artifact has minisign signature"
+        },
+        "signature_file": {
+          "type": "string",
+          "description": "Name of the .minisig file for this artifact"
+        }
+      }
+    },
+    "host_status": {
+      "type": "object",
+      "required": ["host", "platform", "status"],
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host identifier (trj, mmini, wlap)"
+        },
+        "platform": {
+          "type": "string",
+          "description": "Target platform built on this host"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "failed", "skipped", "timeout"],
+          "description": "Build status on this host"
+        },
+        "method": {
+          "type": "string",
+          "enum": ["act", "native-ssh", "local"],
+          "description": "Build method used"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Build duration on this host"
+        },
+        "logs_path": {
+          "type": "string",
+          "description": "Path to build logs"
+        },
+        "error": {
+          "type": "string",
+          "description": "Error message if status is failed"
+        },
+        "workflow": {
+          "type": "string",
+          "description": "GitHub Actions workflow file used (for act builds)"
+        },
+        "job": {
+          "type": "string",
+          "description": "Specific job name run (for act builds)"
+        }
+      }
+    }
+  }
+}
