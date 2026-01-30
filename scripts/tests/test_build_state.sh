@@ -24,7 +24,8 @@ fail() { ((TESTS_FAILED++)); echo "${RED}FAIL${NC}: $1"; }
 # Setup test environment
 TEMP_DIR=$(mktemp -d)
 export DSR_STATE_DIR="$TEMP_DIR/state"
-export DSR_RUN_ID="test-run-$(date +%s)-$$"
+DSR_RUN_ID="test-run-$(date +%s)-$$"
+export DSR_RUN_ID
 
 # Stub logging functions
 log_info() { :; }
