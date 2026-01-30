@@ -12,7 +12,7 @@ This document defines the authoritative contract for the `dsr` (Doodlestein Self
 `dsr` is a fallback release infrastructure for when GitHub Actions is throttled (>10 min queue time). It:
 - Detects GH Actions throttling via queue time monitoring
 - Triggers local builds using `nektos/act` (reusing exact GH Actions YAML)
-- Distributes builds across Linux (css), macOS (mmini), Windows (wlap)
+- Distributes builds across Linux (trj), macOS (mmini), Windows (wlap)
 - Generates smart curl-bash installers with staleness detection
 - Signs artifacts with minisign and generates SBOMs
 
@@ -186,7 +186,7 @@ The `details` field contains command-specific data:
     "targets": [
       {
         "platform": "linux/amd64",
-        "host": "css",
+        "host": "trj",
         "method": "act",
         "workflow": ".github/workflows/release.yml",
         "job": "build-linux",

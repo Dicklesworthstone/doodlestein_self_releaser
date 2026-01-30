@@ -1,4 +1,4 @@
-# AGENTS.md — repo_updater (ru) Project
+# AGENTS.md — dsr (Doodlestein Self-Releaser) Project
 
 ## RULE 1 – ABSOLUTE (DO NOT EVER VIOLATE THIS)
 
@@ -37,9 +37,9 @@ If that audit trail is missing, then you must act as if the operation never happ
 
 ## Shell / Bash Discipline
 
-- This is a **pure Bash project**. The main script `ru` and `install.sh` are shell scripts.
+- This is a **pure Bash project**. The main script `dsr` and supporting modules are shell scripts.
 - Target **Bash 4.0+** compatibility. Use `#!/usr/bin/env bash` shebang.
-- Do NOT use `set -e` globally — handle errors explicitly to ensure processing continues after individual repo failures.
+- Do NOT use `set -e` globally — handle errors explicitly to ensure processing continues after individual failures.
 - Use `set -uo pipefail` instead.
 - Use ShellCheck to lint all scripts. Address all warnings at severity `warning` or higher.
 
@@ -54,13 +54,13 @@ If that audit trail is missing, then you must act as if the operation never happ
 
 ## Development Workspace Hygiene
 
-**CRITICAL**: Do NOT create git worktrees, clones, or any other directories in `/data/projects/` (or the user's projects directory). This directory is managed by `ru` and should only contain repositories that are configured in `ru`.
+**CRITICAL**: Do NOT create git worktrees, clones, or any other directories in `/data/projects/` (or the user's projects directory). This directory is managed and should only contain configured repositories.
 
 ### Forbidden Actions
 
-- `git worktree add /data/projects/repo_updater_*` — creates clutter that confuses users
+- `git worktree add /data/projects/doodlestein_self_releaser_*` — creates clutter that confuses users
 - Cloning repos to `/data/projects/` for "testing" or "exploration"
-- Creating any subdirectories in the projects folder that aren't managed by `ru`
+- Creating any subdirectories in the projects folder that aren't managed
 
 ### Correct Approaches
 
@@ -70,10 +70,10 @@ For development/testing that requires separate working directories:
 2. **Use the existing repo** — work in the current checkout, create branches if needed
 3. **Clean up after yourself** — if you must create temporary files/dirs, remove them when done
 
-The E2E tests demonstrate the correct pattern:
+The tests demonstrate the correct pattern:
 ```bash
 TEMP_DIR=$(mktemp -d)
-export RU_PROJECTS_DIR="$TEMP_DIR/projects"
+export DSR_STATE_DIR="$TEMP_DIR/state"
 # ... run tests ...
 rm -rf "$TEMP_DIR"  # cleanup
 ```
@@ -82,96 +82,112 @@ rm -rf "$TEMP_DIR"  # cleanup
 
 ## Project Architecture
 
-**ru** (repo_updater) is a robust, automation-friendly CLI tool that synchronizes a collection of GitHub repositories to a local projects directory.
+**dsr** (Doodlestein Self-Releaser) is a fallback release infrastructure for when GitHub Actions is throttled (>10 min queue time). It:
 
-### Key Features
+- Detects GH Actions throttling via queue time monitoring
+- Triggers local builds using `nektos/act` (reusing exact GH Actions YAML)
+- Distributes builds across Linux (trj), macOS (mmini), Windows (wlap)
+- Generates smart curl-bash installers with staleness detection
+- Signs artifacts with minisign and generates SBOMs
 
-- **One-liner curl-bash installation** with checksum verification by default
-- **XDG-compliant configuration** with `ru init` for first-run setup
-- **Automatic `gh` CLI detection** with prompted (not automatic) installation
-- **Beautiful gum-powered terminal UI** with intelligent ANSI fallbacks
-- **Intelligent clone/pull logic** using git plumbing (not string parsing)
-- **Automation-grade design**: meaningful exit codes, non-interactive mode, JSON output
-- **Subcommand architecture**: `sync`, `status`, `init`, `add`, `list`, `doctor`, `self-update`, `config`
+### Build Machines
+
+| Machine | Platform | Connection | Purpose |
+|---------|----------|------------|---------|
+| trj | Linux x64 | local | Primary build host, act runner |
+| mmini | macOS arm64 | SSH via Tailscale | Native macOS builds |
+| wlap | Windows x64 | SSH via Tailscale | Native Windows builds |
+
+### Build Strategy
+
+- **Linux**: nektos/act reuses GH Actions YAML in Docker containers
+- **macOS**: SSH to mmini, run native compilation
+- **Windows**: SSH to wlap, run native compilation
 
 ### Subcommands
 
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
-| `sync` | Clone/pull repositories | `--clone-only`, `--pull-only`, `--autostash`, `--rebase`, `--dry-run` |
-| `status` | Show repo status (read-only) | `--fetch` (default), `--no-fetch` |
-| `init` | Create config directory & files | `--example` (include example repos) |
-| `add` | Add repo to list | `--private`, `--from-cwd` |
-| `list` | Show configured repos | `--public`, `--private`, `--paths` |
-| `doctor` | System diagnostics | (none) |
-| `self-update` | Update ru | `--check` (check only, don't update) |
-| `config` | Show/set configuration | `--print`, `--set KEY=VALUE` |
+| `check` | Detect throttled GH Actions runs | `--repos`, `--threshold`, `--all` |
+| `watch` | Continuous monitoring daemon | `--interval`, `--auto-fallback`, `--notify` |
+| `build` | Build artifacts locally | `--repo`, `--targets`, `--version`, `--workflow` |
+| `release` | Upload artifacts to GitHub | `--repo`, `--version`, `--draft`, `--prerelease` |
+| `fallback` | Full pipeline: check → build → release | `--repo`, `--version` |
+| `repos` | Manage repository registry | `list`, `add`, `remove`, `sync` |
+| `config` | View/modify configuration | `show`, `set`, `get`, `init` |
+| `doctor` | System diagnostics | `--fix` |
 
 ---
 
 ## Repo Layout
 
 ```
-repo_updater/
-├── ru                                    # Main script (~800-1000 LOC)
-├── install.sh                            # Curl-bash installer (~250 LOC)
-├── README.md                             # Comprehensive documentation
-├── VERSION                               # Semver version file (e.g., "1.0.0")
-├── LICENSE                               # MIT License
-├── AGENTS.md                             # This file
-├── PLAN_TO_CREATE_UPDATE_REPO_TOOL.md    # Detailed implementation plan
-├── .gitignore                            # Ignore runtime artifacts
-├── .github/
-│   └── workflows/
-│       ├── ci.yml                        # ShellCheck, syntax, behavioral tests
-│       └── release.yml                   # GitHub releases with checksums
+doodlestein_self_releaser/
+├── dsr                               # Main CLI script (planned)
+├── src/
+│   └── act_runner.sh                 # nektos/act integration module
 ├── scripts/
-│   ├── test_local_git.sh                 # Integration tests with local git repos
-│   ├── test_parsing.sh                   # URL parsing tests
-│   └── test_json_output.sh               # JSON schema validation
-└── examples/
-    ├── public.txt                        # Example public repos list
-    └── private.template.txt              # Empty template for private repos
+│   ├── toolchain_check.sh            # Cross-machine toolchain harmonization
+│   └── tests/
+│       ├── test_act_runner.sh        # act_runner unit tests
+│       ├── test_json_schemas.sh      # JSON schema validation tests
+│       └── fixtures/                 # Test fixtures (JSON)
+├── schemas/
+│   ├── envelope.json                 # Base JSON response schema
+│   ├── check-details.json            # dsr check command schema
+│   ├── build-details.json            # dsr build command schema
+│   ├── release-details.json          # dsr release command schema
+│   └── doctor-details.json           # dsr doctor command schema
+├── config/
+│   └── actrc.example                 # Sample ~/.actrc configuration
+├── docs/
+│   ├── CLI_CONTRACT.md               # Authoritative CLI specification
+│   └── ACT_SETUP.md                  # nektos/act installation guide
+├── README.md                         # User documentation
+├── AGENTS.md                         # This file
+└── .beads/                           # Issue tracking (br)
 ```
-
-**Critical:** No `je_*.txt` files in repo. Those are examples only. User's actual lists live in XDG config (`~/.config/ru/repos.d/`).
 
 ---
 
 ## XDG Configuration Layout
 
 ```
-~/.config/ru/
-├── config                    # Key-value configuration
+~/.config/dsr/
+├── config.yaml               # Main configuration
 └── repos.d/
-    ├── public.txt            # User's public repos
-    └── private.txt           # User's private repos (optional)
+    └── *.yaml                # Per-repo build configurations
 
-~/.cache/ru/
-└── (runtime cache)
+~/.cache/dsr/
+├── act/                      # act Docker layer cache
+└── builds/                   # Cached build artifacts
 
-~/.local/state/ru/
+~/.local/state/dsr/
 ├── logs/
 │   ├── YYYY-MM-DD/
 │   │   ├── run.log           # Main run log
-│   │   └── repos/
-│   │       └── *.log         # Per-repo logs
+│   │   └── builds/
+│   │       └── *.log         # Per-build logs
 │   └── latest -> YYYY-MM-DD  # Symlink to latest run
-└── archived/                 # Orphan repos moved here by `ru prune`
+├── artifacts/                # Build artifacts
+└── manifests/                # Build manifests
 ```
 
 ---
 
 ## Exit Codes
 
-| Code | Meaning | When |
-|------|---------|------|
-| `0` | Success | All repos synced or already current |
-| `1` | Partial failure | Some repos failed (network/auth) |
-| `2` | Conflicts exist | Some repos have conflicts needing resolution |
-| `3` | Dependency/system error | gh missing, auth failed, doctor issues |
-| `4` | Invalid arguments | Bad CLI options, missing files |
-| `5` | Interrupted sync | Use `--resume` or `--restart` to continue |
+| Code | Name | Meaning |
+|------|------|---------|
+| `0` | SUCCESS | Operation completed successfully |
+| `1` | PARTIAL_FAILURE | Some targets/repos failed |
+| `2` | CONFLICT | Blocked by pending run/lock |
+| `3` | DEPENDENCY_ERROR | Missing gh auth, docker, ssh, etc. |
+| `4` | INVALID_ARGS | Bad CLI options or config |
+| `5` | INTERRUPTED | User abort (Ctrl+C) or timeout |
+| `6` | BUILD_FAILED | Build/compilation error |
+| `7` | RELEASE_FAILED | Upload/signing failed |
+| `8` | NETWORK_ERROR | Network connectivity issue |
 
 ---
 
@@ -207,7 +223,7 @@ We optimize for a clean architecture now, not backwards compatibility.
 
 ## Console Output Design
 
-This project has installer scripts (`install.sh`) and a CLI tool (`ru`).
+This project has a CLI tool (`dsr`) and supporting modules.
 
 Output stream rules:
 - **stderr**: All human-readable output (progress, errors, summary, help)
@@ -238,7 +254,7 @@ This section is a **developer toolbelt** reference.
 - **ast-grep** (`sg`) — Structural search/replace
 - **lazygit** — Git TUI
 - **bat** — Better cat
-- **gum** — Glamorous shell scripts (used by ru for UI)
+- **gum** — Glamorous shell scripts (used by dsr for UI)
 - **ShellCheck** — Shell script linter
 
 ### Coding Agents
@@ -246,11 +262,15 @@ This section is a **developer toolbelt** reference.
 - **Codex CLI** — OpenAI's coding agent
 - **Gemini CLI** — Google's coding agent
 
-### Dependencies for ru
+### Dependencies for dsr
 - **git** — Version control
-- **gh** — GitHub CLI (for cloning private repos, auth)
-- **curl** — For installer and self-update
-- **jq** — JSON parsing (optional, for advanced scripting)
+- **gh** — GitHub CLI (for API access, releases)
+- **docker** — For nektos/act containers
+- **act** — nektos/act for running GH Actions locally
+- **ssh** — For remote builds on mmini/wlap
+- **minisign** — For artifact signing
+- **syft** — For SBOM generation
+- **jq** — JSON parsing
 
 ### Dicklesworthstone Stack (all 8 tools)
 1. **ntm** — Named Tmux Manager (agent cockpit)
@@ -287,7 +307,7 @@ Core patterns:
    - Register identity:
      - `ensure_project` then `register_agent` with the repo's absolute path as `project_key`.
    - Reserve files before editing:
-     - `file_reservation_paths(project_key, agent_name, ["ru", "install.sh"], ttl_seconds=3600, exclusive=true)`.
+     - `file_reservation_paths(project_key, agent_name, ["src/act_runner.sh", "scripts/toolchain_check.sh"], ttl_seconds=3600, exclusive=true)`.
    - Communicate:
      - `send_message(..., thread_id="FEAT-123")`.
      - `fetch_inbox`, then `acknowledge_message`.
@@ -475,8 +495,8 @@ Example:
 
 ```
 mcp__morph-mcp__warp_grep(
-  repoPath: "/data/projects/repo_updater",
-  query: "How does URL parsing handle git@ SSH URLs?"
+  repoPath: "/data/projects/doodlestein_self_releaser",
+  query: "How does act_runner determine if a job can run locally vs needs SSH?"
 )
 ```
 
@@ -496,8 +516,8 @@ Comparison:
 
 | Scenario | Tool |
 | ---------------------------------- | ---------- |
-| "How does gh auth check work?" | warp_grep |
-| "Where is `parse_repo_url` defined?" | `rg` |
+| "How does act workflow analysis work?" | warp_grep |
+| "Where is `act_can_run` defined?" | `rg` |
 | "Replace `var` with `let`" | `ast-grep` |
 
 ---
@@ -585,11 +605,11 @@ UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Fl
 
 **For Shell Scripts:**
 ```bash
-ubs ru install.sh                         # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)      # Staged files — before commit
-ubs --only=bash scripts/                  # Language filter
-ubs --ci --fail-on-warning .              # CI mode — before PR
-ubs .                                     # Whole project
+ubs src/act_runner.sh scripts/toolchain_check.sh  # Specific files (< 1s) — USE THIS
+ubs $(git diff --name-only --cached)              # Staged files — before commit
+ubs --only=bash scripts/                          # Language filter
+ubs --ci --fail-on-warning .                      # CI mode — before PR
+ubs .                                             # Whole project
 ```
 
 **Output Format:**
@@ -609,7 +629,7 @@ Parse: `file:line:col` -> location | Suggested fix -> how to fix | Exit 0/1 -> p
 5. Re-run `ubs <file>` -> exit 0
 6. Commit
 
-**Speed Critical:** Scope to changed files. `ubs ru` (< 1s) vs `ubs .` (30s). Never full scan for small edits.
+**Speed Critical:** Scope to changed files. `ubs src/act_runner.sh` (< 1s) vs `ubs .` (30s). Never full scan for small edits.
 
 **Anti-Patterns:**
 - Do not ignore findings -> Investigate each
