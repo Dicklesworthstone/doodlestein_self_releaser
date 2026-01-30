@@ -62,7 +62,9 @@ harness_setup() {
 
   # Generate deterministic run ID
   mock_random_seed 42
-  export DSR_RUN_ID="$(mock_run_id)"
+  local _run_id
+  _run_id=$(mock_run_id)
+  export DSR_RUN_ID="$_run_id"
 
   # Initialize log capture
   log_capture_init "$_HARNESS_TMPDIR/test.log"
@@ -192,7 +194,9 @@ harness_run_dsr() {
 # Args: module_name (e.g., "config", "signing")
 harness_source_module() {
   local module="$1"
-  source "$PROJECT_ROOT/src/${module}.sh"
+  local module_path="$PROJECT_ROOT/src/${module}.sh"
+  # shellcheck source=/dev/null
+  source "$module_path"
 }
 
 # Assert helper functions for simple test frameworks
