@@ -221,127 +221,6 @@ The `details` field contains command-specific data:
 }
 ```
 
-#### `dsr status` details
-```json
-{
-  "details": {
-    "system_status": "healthy",
-    "repos_summary": {
-      "total": 15,
-      "healthy": 14,
-      "throttled": 1,
-      "unknown": 0
-    },
-    "last_run": {
-      "run_id": "550e8400-e29b-41d4-a716-446655440009",
-      "command": "build",
-      "status": "success",
-      "repo": "ntm",
-      "started_at": "2026-01-30T14:30:00Z",
-      "duration_ms": 180000,
-      "trigger": "throttle-fallback"
-    },
-    "disk_usage": {
-      "artifacts_bytes": 524288000,
-      "logs_bytes": 10485760,
-      "cache_bytes": 2147483648,
-      "total_bytes": 2682257408
-    },
-    "hosts_status": [
-      {"host": "trj", "platform": "linux/amd64", "status": "online"},
-      {"host": "mmini", "platform": "darwin/arm64", "status": "online"},
-      {"host": "wlap", "platform": "windows/amd64", "status": "online"}
-    ],
-    "watch_active": true
-  }
-}
-```
-
-#### `dsr prune` details
-```json
-{
-  "details": {
-    "items_scanned": 250,
-    "items_pruned": 42,
-    "items_kept": 208,
-    "bytes_freed": 1073741824,
-    "bytes_remaining": 1608515584,
-    "dry_run": false,
-    "categories": [
-      {"name": "artifacts", "pruned": 20, "bytes_freed": 536870912},
-      {"name": "logs", "pruned": 15, "bytes_freed": 5242880},
-      {"name": "cache", "pruned": 7, "bytes_freed": 531628032}
-    ],
-    "retention_policy": {
-      "max_age_days": 30,
-      "keep_last_n": 5,
-      "keep_releases": true
-    }
-  }
-}
-```
-
-#### `dsr fallback` details
-```json
-{
-  "details": {
-    "repo": "ntm",
-    "version": "v1.5.3",
-    "trigger": "throttle-detected",
-    "stages": [
-      {"name": "check", "status": "success", "duration_ms": 5000},
-      {"name": "build", "status": "success", "duration_ms": 240000},
-      {"name": "sign", "status": "success", "duration_ms": 5000},
-      {"name": "release", "status": "success", "duration_ms": 80000}
-    ],
-    "check_result": {"throttled": true, "queue_time_seconds": 720},
-    "build_result": {"targets_succeeded": 3, "targets_failed": 0},
-    "release_result": {
-      "release_url": "https://github.com/owner/ntm/releases/tag/v1.5.3",
-      "assets_uploaded": 6
-    },
-    "total_duration_ms": 330000
-  }
-}
-```
-
-#### `dsr repos` details
-```json
-{
-  "details": {
-    "subcommand": "list",
-    "total_repos": 3,
-    "repos": [
-      {
-        "name": "ntm",
-        "owner": "Dicklesworthstone",
-        "language": "go",
-        "build_targets": ["linux/amd64", "darwin/arm64", "windows/amd64"],
-        "enabled": true,
-        "last_release": "v1.5.2"
-      }
-    ]
-  }
-}
-```
-
-#### `dsr config` details
-```json
-{
-  "details": {
-    "subcommand": "show",
-    "config_dir": "~/.config/dsr",
-    "config_file": "~/.config/dsr/config.yaml",
-    "values": {
-      "threshold_seconds": 600,
-      "log_level": "info",
-      "auto_fallback": false,
-      "hosts": {"linux": "trj", "darwin": "mmini", "windows": "wlap"}
-    }
-  }
-}
-```
-
 #### `dsr fallback` details
 Success:
 ```json
@@ -427,7 +306,7 @@ Error:
   "details": {
     "generated_at": "2026-01-30T15:00:00Z",
     "summary": {"runs_last_24h": 0, "failures_last_24h": 0, "throttled_repos": 0},
-    "alerts": [{"code": "R001", "message": "report data unavailable"}]
+    "alerts": [{"code": "E060", "message": "report data unavailable"}]
   }
 }
 ```
@@ -458,7 +337,7 @@ Error:
     "cutoff_days": 30,
     "pruned_count": 0,
     "bytes_freed": 0,
-    "errors": [{"code": "P001", "message": "state directory not found"}]
+    "errors": [{"code": "E050", "message": "state directory not found"}]
   }
 }
 ```
@@ -482,7 +361,7 @@ Error:
   "details": {
     "action": "add",
     "repo": "dicklesworthstone/ntm",
-    "errors": [{"code": "R001", "message": "repo already exists"}]
+    "errors": [{"code": "E052", "message": "repo already exists"}]
   }
 }
 ```
@@ -508,7 +387,7 @@ Error:
     "action": "validate",
     "config_file": "~/.config/dsr/config.yaml",
     "valid": false,
-    "errors": [{"code": "C001", "message": "missing schema_version"}]
+    "errors": [{"code": "E031", "message": "missing schema_version"}]
   }
 }
 ```
@@ -709,6 +588,26 @@ dsr status [--watch] [--compact]
 
 ---
 
+### `dsr report`
+
+Generate a detailed status report.
+
+```bash
+dsr report [--since <duration>] [--limit <n>] [--repo <name>]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--since` | 24h | Lookback window |
+| `--limit` | 20 | Max recent runs in report |
+| `--repo` | all | Scope report to a repo |
+
+**Exit codes:**
+- `0`: Report generated
+- `3`: Report failed (missing data or dependencies)
+
+---
+
 ### `dsr prune`
 
 Clean up old artifacts, logs, and cache to free disk space.
@@ -752,6 +651,10 @@ Structured error codes for programmatic handling:
 | E031 | CONFIG | Missing required config |
 | E040 | SYSTEM | Docker not running |
 | E041 | SYSTEM | Required tool missing |
+| E050 | PRUNE | State directory not found |
+| E051 | PRUNE | Prune failed or permissions blocked |
+| E052 | REPOS | Repository registry error |
+| E060 | REPORT | Report generation failed |
 
 ---
 

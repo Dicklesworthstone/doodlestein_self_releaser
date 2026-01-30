@@ -2,188 +2,83 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/repos-details.json",
   "title": "DSR Repos Details",
-  "description": "Details payload for 'dsr repos' command and subcommands (list, add, remove, validate, discover, sync)",
+  "description": "Details payload for 'dsr repos' command",
   "type": "object",
-  "required": ["subcommand"],
+  "required": ["action"],
   "properties": {
-    "subcommand": {
+    "action": {
       "type": "string",
       "enum": ["list", "add", "remove", "validate", "discover", "sync"],
-      "description": "Repos subcommand that was executed"
+      "description": "Repos subcommand"
+    },
+    "repo": {
+      "type": "string",
+      "description": "Repo name (owner/repo or short name)"
     },
     "repos": {
       "type": "array",
       "items": { "$ref": "#/$defs/repo_entry" },
-      "description": "List of repositories (for list/discover)"
+      "description": "Repository entries"
     },
-    "repo_added": {
-      "$ref": "#/$defs/repo_entry",
-      "description": "Repository that was added (for add)"
+    "added": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repo_entry" },
+      "description": "Repositories added"
     },
-    "repo_removed": {
-      "type": "string",
-      "description": "Repository that was removed (for remove)"
+    "removed": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repo_entry" },
+      "description": "Repositories removed"
     },
-    "validation_results": {
+    "validated": {
       "type": "array",
       "items": { "$ref": "#/$defs/validation_result" },
-      "description": "Validation results (for validate)"
+      "description": "Validation results"
     },
     "discovered": {
       "type": "array",
-      "items": { "$ref": "#/$defs/discovered_repo" },
-      "description": "Discovered repositories (for discover)"
+      "items": { "$ref": "#/$defs/repo_entry" },
+      "description": "Discovered repositories"
     },
-    "sync_results": {
-      "type": "object",
-      "properties": {
-        "checked": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Number of repos checked"
-        },
-        "updated": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Number of repos with updates"
-        },
-        "failed": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Number of sync failures"
-        }
-      },
-      "description": "Sync results (for sync)"
-    },
-    "total_repos": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Total number of registered repos"
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/repos_error" },
+      "description": "Errors encountered"
     }
   },
   "$defs": {
     "repo_entry": {
       "type": "object",
-      "required": ["name", "owner"],
+      "required": ["name", "repo"],
       "properties": {
-        "name": {
-          "type": "string",
-          "description": "Repository name"
-        },
-        "owner": {
-          "type": "string",
-          "description": "Repository owner (GitHub username or org)"
-        },
-        "full_name": {
-          "type": "string",
-          "pattern": "^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$",
-          "description": "Full name (owner/repo)"
-        },
-        "local_path": {
-          "type": "string",
-          "description": "Local filesystem path to repository"
-        },
-        "language": {
-          "type": "string",
-          "description": "Primary programming language"
-        },
-        "workflow_file": {
-          "type": "string",
-          "description": "Release workflow file path"
-        },
-        "build_targets": {
+        "name": { "type": "string" },
+        "repo": { "type": "string" },
+        "local_path": { "type": "string" },
+        "language": { "type": "string" },
+        "workflow": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "targets": {
           "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "^(linux|darwin|windows)/(amd64|arm64)$"
-          },
-          "description": "Supported build targets"
-        },
-        "enabled": {
-          "type": "boolean",
-          "description": "Whether repo is enabled for fallback builds"
-        },
-        "last_build": {
-          "type": "string",
-          "format": "date-time",
-          "description": "Timestamp of last successful build"
-        },
-        "last_release": {
-          "type": "string",
-          "description": "Last released version"
-        },
-        "config_path": {
-          "type": "string",
-          "description": "Path to repo-specific config file"
+          "items": { "type": "string" }
         }
       }
     },
     "validation_result": {
       "type": "object",
-      "required": ["repo", "valid"],
+      "required": ["repo", "status"],
       "properties": {
-        "repo": {
-          "type": "string",
-          "description": "Repository name"
-        },
-        "valid": {
-          "type": "boolean",
-          "description": "Whether configuration is valid"
-        },
-        "issues": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "severity": {
-                "type": "string",
-                "enum": ["error", "warning", "info"]
-              },
-              "message": { "type": "string" },
-              "field": { "type": "string" }
-            }
-          },
-          "description": "Validation issues found"
-        },
-        "workflow_exists": {
-          "type": "boolean",
-          "description": "Whether release workflow file exists"
-        },
-        "local_path_exists": {
-          "type": "boolean",
-          "description": "Whether local path is accessible"
-        }
+        "repo": { "type": "string" },
+        "status": { "type": "string", "enum": ["ok", "warn", "error"] },
+        "message": { "type": "string" }
       }
     },
-    "discovered_repo": {
+    "repos_error": {
       "type": "object",
-      "required": ["full_name", "language"],
+      "required": ["code", "message"],
       "properties": {
-        "full_name": {
-          "type": "string",
-          "description": "Full repository name (owner/repo)"
-        },
-        "language": {
-          "type": "string",
-          "description": "Primary language"
-        },
-        "has_releases": {
-          "type": "boolean",
-          "description": "Whether repo has GitHub releases"
-        },
-        "has_workflow": {
-          "type": "boolean",
-          "description": "Whether repo has release workflow"
-        },
-        "suggested_targets": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Suggested build targets based on language"
-        },
-        "already_registered": {
-          "type": "boolean",
-          "description": "Whether repo is already in registry"
-        }
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "repo": { "type": "string" }
       }
     }
   }

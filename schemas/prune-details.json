@@ -2,137 +2,66 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/prune-details.json",
   "title": "DSR Prune Details",
-  "description": "Details payload for 'dsr prune' command - artifact retention and disk cleanup",
+  "description": "Details payload for 'dsr prune' command",
   "type": "object",
-  "required": ["items_scanned", "items_pruned", "bytes_freed"],
+  "required": ["state_dir", "dry_run", "pruned_count", "bytes_freed"],
   "properties": {
-    "items_scanned": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Total number of items scanned"
+    "state_dir": {
+      "type": "string",
+      "description": "State directory being pruned"
     },
-    "items_pruned": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Number of items deleted"
+    "dry_run": {
+      "type": "boolean",
+      "description": "Whether this was a dry run"
     },
-    "items_kept": {
+    "cutoff_days": {
       "type": "integer",
       "minimum": 0,
-      "description": "Number of items retained"
+      "description": "Age threshold for pruning"
+    },
+    "keep_last": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of recent items to keep"
+    },
+    "pruned_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of items pruned"
     },
     "bytes_freed": {
       "type": "integer",
       "minimum": 0,
-      "description": "Total bytes freed by pruning"
+      "description": "Total bytes freed"
     },
-    "bytes_remaining": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Total bytes remaining after prune"
-    },
-    "dry_run": {
-      "type": "boolean",
-      "description": "Whether this was a dry run (no actual deletions)"
-    },
-    "categories": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/prune_category" },
-      "description": "Breakdown by category (artifacts, logs, cache)"
-    },
-    "retention_policy": {
-      "type": "object",
-      "properties": {
-        "max_age_days": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Maximum age in days before pruning"
-        },
-        "max_size_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Maximum total size before triggering prune"
-        },
-        "keep_last_n": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Always keep the N most recent items"
-        },
-        "keep_releases": {
-          "type": "boolean",
-          "description": "Whether to preserve released artifacts"
-        }
-      },
-      "description": "Retention policy that was applied"
-    },
-    "pruned_items": {
+    "pruned_paths": {
       "type": "array",
       "items": { "$ref": "#/$defs/pruned_item" },
-      "description": "List of pruned items (in verbose mode)"
+      "description": "List of pruned files"
+    },
+    "errors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/prune_error" },
+      "description": "Errors encountered during pruning"
     }
   },
   "$defs": {
-    "prune_category": {
-      "type": "object",
-      "required": ["name", "scanned", "pruned", "bytes_freed"],
-      "properties": {
-        "name": {
-          "type": "string",
-          "enum": ["artifacts", "logs", "cache", "manifests", "temp"],
-          "description": "Category name"
-        },
-        "scanned": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Items scanned in this category"
-        },
-        "pruned": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Items pruned in this category"
-        },
-        "kept": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Items kept in this category"
-        },
-        "bytes_freed": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Bytes freed from this category"
-        },
-        "path": {
-          "type": "string",
-          "description": "Base path for this category"
-        }
-      }
-    },
     "pruned_item": {
       "type": "object",
-      "required": ["path", "size_bytes", "age_days"],
+      "required": ["path", "size_bytes"],
       "properties": {
-        "path": {
-          "type": "string",
-          "description": "Path to pruned item"
-        },
-        "size_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Size of pruned item"
-        },
-        "age_days": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Age of item in days"
-        },
-        "category": {
-          "type": "string",
-          "description": "Category of pruned item"
-        },
-        "reason": {
-          "type": "string",
-          "description": "Reason for pruning"
-        }
+        "path": { "type": "string" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "mtime": { "type": "string", "format": "date-time" }
+      }
+    },
+    "prune_error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "path": { "type": "string" }
       }
     }
   }

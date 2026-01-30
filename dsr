@@ -35,6 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Source modules
 source "$SCRIPT_DIR/src/config.sh"
+source "$SCRIPT_DIR/src/signing.sh"
 
 # Global flags
 JSON_MODE=false
@@ -58,7 +59,7 @@ log_info()  { $QUIET || echo "${BLUE}[dsr]${NC} $*" >&2; }
 log_ok()    { $QUIET || echo "${GREEN}[dsr]${NC} $*" >&2; }
 log_warn()  { echo "${YELLOW}[dsr]${NC} $*" >&2; }
 log_error() { echo "${RED}[dsr]${NC} $*" >&2; }
-log_debug() { $VERBOSE && echo "${BLUE}[debug]${NC} $*" >&2; }
+log_debug() { $VERBOSE && echo "${BLUE}[debug]${NC} $*" >&2 || true; }
 
 # Show help
 show_help() {
@@ -79,6 +80,7 @@ COMMANDS:
     repos       Manage repository registry
     config      View/modify configuration
     doctor      System diagnostics
+    signing     Manage minisign keys and signing
 
 GLOBAL OPTIONS:
     -j, --json          Machine-readable JSON output
@@ -203,8 +205,14 @@ cmd_config_init() {
     [[ "${1:-}" == "--force" ]] && force=true
 
     if $JSON_MODE; then
-        config_init ${force:+--force} >/dev/null 2>&1
-        local status=$?
+        local status
+        if $force; then
+            config_init --force >/dev/null 2>&1
+            status=$?
+        else
+            config_init >/dev/null 2>&1
+            status=$?
+        fi
         if [[ $status -eq 0 ]]; then
             json_envelope "config init" "success" 0 "{\"config_dir\": \"$DSR_CONFIG_DIR\", \"initialized\": true}"
         else
@@ -304,10 +312,17 @@ cmd_doctor() {
     local warnings=0
     local checks=()
 
+    # Helper to escape JSON strings
+    _json_escape() {
+        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\n/\\n/g'
+    }
+
     # Check git
     if command -v git &>/dev/null; then
-        checks+=("{\"name\": \"git\", \"status\": \"ok\", \"version\": \"$(git --version | cut -d' ' -f3)\"}")
-        log_ok "git: $(git --version | cut -d' ' -f3)"
+        local git_ver
+        git_ver=$(git --version | cut -d' ' -f3)
+        checks+=("{\"name\": \"git\", \"status\": \"ok\", \"version\": \"$(_json_escape "$git_ver")\"}")
+        log_ok "git: $git_ver"
     else
         checks+=("{\"name\": \"git\", \"status\": \"error\", \"message\": \"not found\"}")
         log_error "git: not found"
@@ -348,8 +363,10 @@ cmd_doctor() {
 
     # Check act
     if command -v act &>/dev/null; then
-        checks+=("{\"name\": \"act\", \"status\": \"ok\", \"version\": \"$(act --version 2>/dev/null | head -1)\"}")
-        log_ok "act: $(act --version 2>/dev/null | head -1)"
+        local act_ver
+        act_ver=$(act --version 2>/dev/null | head -1)
+        checks+=("{\"name\": \"act\", \"status\": \"ok\", \"version\": \"$(_json_escape "$act_ver")\"}")
+        log_ok "act: $act_ver"
     else
         checks+=("{\"name\": \"act\", \"status\": \"warning\", \"message\": \"not found\"}")
         log_warn "act: not found (needed for local builds)"
@@ -369,6 +386,7 @@ cmd_doctor() {
     done
 
     # Check config
+    config_load 2>/dev/null || true
     if config_validate &>/dev/null 2>&1; then
         checks+=("{\"name\": \"config\", \"status\": \"ok\"}")
         log_ok "config: valid"
@@ -392,10 +410,13 @@ cmd_doctor() {
     fi
 
     if $JSON_MODE; then
-        local checks_json
-        checks_json=$(printf '%s\n' "${checks[@]}" | jq -s '.')
-        json_envelope "doctor" "$([ $errors -eq 0 ] && echo success || echo error)" $exit_code \
-            "{\"errors\": $errors, \"warnings\": $warnings, \"checks\": $checks_json}"
+        local checks_json details_json
+        # Use compact output (-c) to avoid multiline issues in string interpolation
+        checks_json=$(printf '%s\n' "${checks[@]}" | jq -sc '.')
+        # Build details as proper JSON object using jq for correctness
+        details_json=$(jq -nc --argjson errors "$errors" --argjson warnings "$warnings" --argjson checks "$checks_json" \
+            '{errors: $errors, warnings: $warnings, checks: $checks}')
+        json_envelope "doctor" "$([ $errors -eq 0 ] && echo success || echo error)" $exit_code "$details_json"
     fi
 
     return $exit_code
@@ -439,6 +460,70 @@ cmd_repos() {
     log_warn "repos command not yet implemented"
     log_info "See bead bd-1jt.1.3 for implementation plan"
     return 4
+}
+
+# ============================================================================
+# SIGNING SUBCOMMAND
+# ============================================================================
+
+cmd_signing() {
+    local subcmd="${1:-check}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        init)
+            signing_init "$@"
+            ;;
+        check)
+            if $JSON_MODE; then
+                signing_check --json
+            else
+                signing_check
+            fi
+            ;;
+        sign)
+            signing_sign "$@"
+            ;;
+        verify)
+            signing_verify "$@"
+            ;;
+        fix)
+            signing_fix_permissions
+            ;;
+        pubkey|public-key)
+            signing_get_public_key "$@"
+            ;;
+        --help|-h|help)
+            cat << 'EOF'
+dsr signing - Manage minisign keys and artifact signing
+
+USAGE:
+    dsr signing <subcommand> [options]
+
+SUBCOMMANDS:
+    init        Generate new keypair (interactive)
+    check       Verify keypair is configured
+    sign        Sign a file
+    verify      Verify a file signature
+    fix         Fix private key permissions
+    pubkey      Display public key
+
+EXAMPLES:
+    dsr signing init              Generate new keypair
+    dsr signing check             Check if keys are configured
+    dsr signing sign artifact.tar.gz
+    dsr signing verify artifact.tar.gz
+    dsr signing pubkey --oneline  Get public key for embedding
+
+For more information, see docs/CLI_CONTRACT.md
+EOF
+            ;;
+        *)
+            log_error "Unknown signing subcommand: $subcmd"
+            log_info "Run 'dsr signing --help' for usage"
+            return 4
+            ;;
+    esac
 }
 
 # ============================================================================
@@ -522,6 +607,9 @@ main() {
             ;;
         repos)
             cmd_repos "$@"
+            ;;
+        signing)
+            cmd_signing "$@"
             ;;
         help)
             show_help

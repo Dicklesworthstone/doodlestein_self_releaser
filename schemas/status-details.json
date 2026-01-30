@@ -2,158 +2,131 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/status-details.json",
   "title": "DSR Status Details",
-  "description": "Details payload for 'dsr status' and 'dsr report' commands",
+  "description": "Details payload for 'dsr status' command",
   "type": "object",
-  "required": ["system_status", "repos_summary"],
+  "required": ["generated_at", "overall_status"],
   "properties": {
-    "system_status": {
+    "generated_at": {
       "type": "string",
-      "enum": ["healthy", "degraded", "unhealthy"],
-      "description": "Overall system health status"
+      "format": "date-time",
+      "description": "Time the status was generated"
     },
-    "repos_summary": {
-      "type": "object",
-      "required": ["total", "healthy", "throttled", "unknown"],
-      "properties": {
-        "total": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Total registered repositories"
-        },
-        "healthy": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Repositories with healthy CI queue times"
-        },
-        "throttled": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Repositories experiencing throttling"
-        },
-        "unknown": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Repositories with unknown status"
-        }
-      }
+    "overall_status": {
+      "type": "string",
+      "enum": ["ok", "degraded", "error"],
+      "description": "Overall system health"
     },
-    "last_run": {
-      "$ref": "#/$defs/run_summary",
-      "description": "Summary of the most recent dsr operation"
-    },
-    "recent_runs": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/run_summary" },
-      "description": "List of recent dsr operations"
-    },
-    "disk_usage": {
+    "config": {
       "type": "object",
       "properties": {
-        "artifacts_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Total bytes used by cached artifacts"
-        },
-        "logs_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Total bytes used by logs"
-        },
-        "cache_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Total bytes used by act cache"
-        },
-        "total_bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Total disk usage"
-        }
+        "valid": { "type": "boolean" },
+        "path": { "type": "string" },
+        "schema_version": { "type": "string" }
       },
-      "description": "Disk usage statistics"
+      "description": "Configuration summary"
     },
-    "hosts_status": {
+    "hosts": {
       "type": "array",
       "items": { "$ref": "#/$defs/host_status" },
-      "description": "Status of build hosts"
+      "description": "Per-host health summary"
     },
-    "uptime_seconds": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Seconds since dsr watch daemon started (if running)"
+    "repos": {
+      "type": "object",
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "enabled": { "type": "integer", "minimum": 0 },
+        "disabled": { "type": "integer", "minimum": 0 }
+      },
+      "description": "Repository registry summary"
     },
-    "watch_active": {
-      "type": "boolean",
-      "description": "Whether dsr watch is currently running"
+    "queue": {
+      "type": "object",
+      "properties": {
+        "throttled_count": { "type": "integer", "minimum": 0 },
+        "threshold_seconds": { "type": "integer", "minimum": 0 }
+      },
+      "description": "Queue/throttling summary"
+    },
+    "last_run": {
+      "$ref": "#/$defs/run_summary"
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Non-fatal status warnings"
     }
   },
   "$defs": {
+    "host_status": {
+      "type": "object",
+      "required": ["host", "status"],
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host identifier"
+        },
+        "platform": {
+          "type": "string",
+          "description": "Platform for the host"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ok", "warn", "error", "unknown"],
+          "description": "Host status"
+        },
+        "last_checked_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of last check"
+        },
+        "latency_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Health check latency"
+        },
+        "message": {
+          "type": "string",
+          "description": "Additional context"
+        }
+      }
+    },
     "run_summary": {
       "type": "object",
-      "required": ["run_id", "command", "status", "started_at"],
+      "required": ["command", "status", "exit_code"],
       "properties": {
-        "run_id": {
-          "type": "string",
-          "format": "uuid",
-          "description": "Unique run identifier"
-        },
         "command": {
           "type": "string",
-          "description": "Command that was executed"
+          "description": "Command name"
         },
         "status": {
           "type": "string",
           "enum": ["success", "partial", "error"],
           "description": "Run status"
         },
-        "repo": {
+        "exit_code": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Process exit code"
+        },
+        "run_id": {
           "type": "string",
-          "description": "Repository affected (if applicable)"
+          "format": "uuid",
+          "description": "Run identifier"
         },
         "started_at": {
           "type": "string",
           "format": "date-time",
-          "description": "When the run started"
+          "description": "Run start time"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Run completion time"
         },
         "duration_ms": {
           "type": "integer",
           "minimum": 0,
           "description": "Run duration"
-        },
-        "trigger": {
-          "type": "string",
-          "enum": ["manual", "throttle-fallback", "ci-failure", "scheduled"],
-          "description": "What triggered this run"
-        }
-      }
-    },
-    "host_status": {
-      "type": "object",
-      "required": ["host", "platform", "status"],
-      "properties": {
-        "host": {
-          "type": "string",
-          "description": "Host identifier (trj, mmini, wlap)"
-        },
-        "platform": {
-          "type": "string",
-          "pattern": "^(linux|darwin|windows)/(amd64|arm64)$",
-          "description": "Platform this host builds"
-        },
-        "status": {
-          "type": "string",
-          "enum": ["online", "offline", "degraded"],
-          "description": "Host availability status"
-        },
-        "last_seen": {
-          "type": "string",
-          "format": "date-time",
-          "description": "Last successful health check"
-        },
-        "latency_ms": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Network latency to host"
         }
       }
     }

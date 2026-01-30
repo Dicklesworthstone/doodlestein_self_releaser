@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/schemas/report-details.json",
+  "title": "DSR Report Details",
+  "description": "Details payload for 'dsr report' command",
+  "type": "object",
+  "required": ["generated_at", "summary"],
+  "properties": {
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Time the report was generated"
+    },
+    "repo": {
+      "type": "string",
+      "description": "Optional repo scope for the report"
+    },
+    "summary": {
+      "type": "object",
+      "required": ["runs_last_24h", "failures_last_24h", "throttled_repos"],
+      "properties": {
+        "runs_last_24h": { "type": "integer", "minimum": 0 },
+        "failures_last_24h": { "type": "integer", "minimum": 0 },
+        "throttled_repos": { "type": "integer", "minimum": 0 }
+      },
+      "description": "High-level activity summary"
+    },
+    "recent_runs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/run_report" },
+      "description": "Recent run summaries"
+    },
+    "alerts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/alert" },
+      "description": "Report alerts or warnings"
+    }
+  },
+  "$defs": {
+    "run_report": {
+      "type": "object",
+      "required": ["repo", "command", "status", "exit_code"],
+      "properties": {
+        "repo": { "type": "string" },
+        "command": { "type": "string" },
+        "status": { "type": "string", "enum": ["success", "partial", "error"] },
+        "exit_code": { "type": "integer", "minimum": 0 },
+        "run_id": { "type": "string", "format": "uuid" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "duration_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "alert": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "severity": { "type": "string", "enum": ["info", "warn", "error"] }
+      }
+    }
+  }
+}

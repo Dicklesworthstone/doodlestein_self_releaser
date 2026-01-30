@@ -9,7 +9,7 @@
     "command": {
       "type": "string",
       "description": "Subcommand that was executed",
-      "enum": ["check", "watch", "build", "release", "fallback", "repos", "config", "doctor", "status", "prune"]
+      "enum": ["check", "watch", "status", "report", "build", "release", "fallback", "repos", "prune", "config", "doctor", "signing"]
     },
     "schema_version": {
       "type": "string",
