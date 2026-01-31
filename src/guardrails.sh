@@ -17,14 +17,18 @@
 
 set -uo pipefail
 
-# Exit codes (from AGENTS.md)
-readonly EXIT_SUCCESS=0
-readonly EXIT_DEPENDENCY_ERROR=3
-readonly EXIT_INVALID_ARGS=4
+# Exit codes (from AGENTS.md) - only declare if not already set
+if [[ -z "${EXIT_SUCCESS:-}" ]]; then
+    readonly EXIT_SUCCESS=0
+    readonly EXIT_DEPENDENCY_ERROR=3
+    readonly EXIT_INVALID_ARGS=4
+fi
 
-# Minimum required Bash version
-readonly MIN_BASH_MAJOR=4
-readonly MIN_BASH_MINOR=0
+# Minimum required Bash version - only declare if not already set
+if [[ -z "${MIN_BASH_MAJOR:-}" ]]; then
+    readonly MIN_BASH_MAJOR=4
+    readonly MIN_BASH_MINOR=0
+fi
 
 # Safe deletion allowlist (directories under which deletion is permitted)
 _SAFE_DELETE_ROOTS=()

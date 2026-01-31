@@ -286,6 +286,7 @@ test_gh_check_returns_when_missing() {
   # Save PATH
   local old_path="$PATH"
   # Remove gh from PATH
+  # shellcheck disable=SC2123  # Intentional PATH override for testing
   PATH="/nonexistent"
   local result=0
   gh_check 2>/dev/null || result=$?
@@ -386,6 +387,14 @@ test_exports_gh_clear_cache() {
   declare -f gh_clear_cache >/dev/null
 }
 
+test_exports_gh_resolve_tag_sha() {
+  declare -f gh_resolve_tag_sha >/dev/null
+}
+
+test_exports_gh_repository_dispatch() {
+  declare -f gh_repository_dispatch >/dev/null
+}
+
 # ============================================================================
 # Tests: High-Level Helpers (Argument Validation)
 # ============================================================================
@@ -429,6 +438,103 @@ test_tags_rejects_empty_repo() {
 
 test_repo_rejects_empty_repo() {
   ! gh_repo "" 2>/dev/null
+}
+
+# ============================================================================
+# Tests: Dispatch Helpers
+# ============================================================================
+
+test_resolve_tag_sha_rejects_missing_args() {
+  ! gh_resolve_tag_sha "" "v1.2.3" 2>/dev/null
+  ! gh_resolve_tag_sha "owner/repo" "" 2>/dev/null
+}
+
+test_resolve_tag_sha_commit() {
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+
+  gh_api() {
+    if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.3" ]]; then
+      echo '{"object":{"sha":"abc123","type":"commit"}}'
+      return 0
+    fi
+    echo '{}'
+    return 0
+  }
+
+  local sha status
+  sha=$(gh_resolve_tag_sha "owner/repo" "v1.2.3")
+  status=$?
+
+  eval "$gh_api_def"
+
+  [[ $status -eq 0 && "$sha" == "abc123" ]]
+}
+
+test_resolve_tag_sha_annotated() {
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+
+  gh_api() {
+    if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.4" ]]; then
+      echo '{"object":{"sha":"tagsha123","type":"tag"}}'
+      return 0
+    fi
+    if [[ "$1" == "repos/owner/repo/git/tags/tagsha123" ]]; then
+      echo '{"object":{"sha":"commitsha456","type":"commit"}}'
+      return 0
+    fi
+    echo '{}'
+    return 0
+  }
+
+  local sha status
+  sha=$(gh_resolve_tag_sha "owner/repo" "v1.2.4")
+  status=$?
+
+  eval "$gh_api_def"
+
+  [[ $status -eq 0 && "$sha" == "commitsha456" ]]
+}
+
+test_dispatch_rejects_missing_args() {
+  ! gh_repository_dispatch "" "event" 2>/dev/null
+  ! gh_repository_dispatch "owner/repo" "" 2>/dev/null
+}
+
+test_dispatch_accepts_valid_payload() {
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+
+  gh_api() {
+    # Stub success for dispatch
+    return 0
+  }
+
+  local result status
+  result=$(gh_repository_dispatch "owner/repo" "dsr_release" '{"tool":"ntm"}' 2>/dev/null)
+  status=$?
+
+  eval "$gh_api_def"
+
+  [[ $status -eq 0 ]]
+}
+
+test_dispatch_fails_on_error_response() {
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+
+  gh_api() {
+    echo '{"message":"Not Found"}'
+    return 0
+  }
+
+  local status=0
+  gh_repository_dispatch "owner/repo" "dsr_release" '{"tool":"ntm"}' 2>/dev/null || status=$?
+
+  eval "$gh_api_def"
+
+  [[ $status -ne 0 ]]
 }
 
 # ============================================================================
@@ -504,6 +610,8 @@ main() {
   run_test "exports_gh_releases" test_exports_gh_releases
   run_test "exports_gh_create_release" test_exports_gh_create_release
   run_test "exports_gh_clear_cache" test_exports_gh_clear_cache
+  run_test "exports_gh_resolve_tag_sha" test_exports_gh_resolve_tag_sha
+  run_test "exports_gh_repository_dispatch" test_exports_gh_repository_dispatch
 
   echo ""
   echo "Argument Validation:"
@@ -517,6 +625,15 @@ main() {
   run_test "compare_rejects_missing_args" test_compare_rejects_missing_args
   run_test "tags_rejects_empty_repo" test_tags_rejects_empty_repo
   run_test "repo_rejects_empty_repo" test_repo_rejects_empty_repo
+
+  echo ""
+  echo "Dispatch Helpers:"
+  run_test "resolve_tag_sha_rejects_missing_args" test_resolve_tag_sha_rejects_missing_args
+  run_test "resolve_tag_sha_commit" test_resolve_tag_sha_commit
+  run_test "resolve_tag_sha_annotated" test_resolve_tag_sha_annotated
+  run_test "dispatch_rejects_missing_args" test_dispatch_rejects_missing_args
+  run_test "dispatch_accepts_valid_payload" test_dispatch_accepts_valid_payload
+  run_test "dispatch_fails_on_error_response" test_dispatch_fails_on_error_response
 
   echo ""
   echo "=== Results ==="

@@ -244,6 +244,7 @@ Upload artifacts to GitHub Release.
 ```bash
 dsr release --repo ntm --version v1.2.3         # Upload to release
 dsr release --repo ntm --version v1.2.3 --draft # Create draft release
+dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
 ```
 
 ### `dsr fallback`

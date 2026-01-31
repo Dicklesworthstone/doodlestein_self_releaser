@@ -251,6 +251,55 @@ test_workflow_validation() {
     fi
 }
 
+test_act_run_workflow_injects_tag_env() {
+    log_test "act_run_workflow injects tag env"
+
+    export ACT_ARTIFACTS_DIR="$TEMP_DIR/artifacts"
+    export ACT_LOGS_DIR="$TEMP_DIR/logs"
+    mkdir -p "$ACT_ARTIFACTS_DIR" "$ACT_LOGS_DIR"
+
+    local bin_dir="$TEMP_DIR/bin"
+    local args_file="$TEMP_DIR/act_args.txt"
+    mkdir -p "$bin_dir"
+
+    export ACT_TEST_ARGS_FILE="$args_file"
+
+    cat > "$bin_dir/act" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$ACT_TEST_ARGS_FILE"
+exit 0
+EOF
+    chmod +x "$bin_dir/act"
+
+    local original_path="$PATH"
+    PATH="$bin_dir:$PATH"
+
+    local original_act_check=""
+    original_act_check="$(declare -f act_check)"
+
+    act_check() { return 0; }
+    timeout() { shift; "$@"; }
+
+    act_run_workflow "$TEMP_DIR" ".github/workflows/release.yml" "" "push" "1.2.3" >/dev/null 2>&1
+
+    if [[ -f "$args_file" ]] && \
+        grep -q "GITHUB_REF=refs/tags/v1.2.3" "$args_file" && \
+        grep -q "GITHUB_REF_NAME=v1.2.3" "$args_file" && \
+        grep -q "GITHUB_REF_TYPE=tag" "$args_file"; then
+        log_pass "Tag context envs are passed to act"
+    else
+        log_fail "Tag context envs missing from act args"
+    fi
+
+    PATH="$original_path"
+    unset -f timeout 2>/dev/null || true
+    if [[ -n "$original_act_check" ]]; then
+        eval "$original_act_check"
+    else
+        unset -f act_check 2>/dev/null || true
+    fi
+}
+
 # Main
 main() {
     echo "═══════════════════════════════════════════════════════════════"
@@ -266,6 +315,7 @@ main() {
     test_artifact_dirs
     test_act_cleanup
     test_workflow_validation
+    test_act_run_workflow_injects_tag_env
     test_act_analyze_workflow
 
     echo ""

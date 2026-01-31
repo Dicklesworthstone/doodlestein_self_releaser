@@ -548,6 +548,115 @@ gh_repo() {
     gh_api "repos/$repo"
 }
 
+# Resolve a tag to a commit SHA via GitHub API
+# Usage: gh_resolve_tag_sha <owner/repo> <tag>
+# Returns: commit SHA on stdout
+gh_resolve_tag_sha() {
+    local repo="$1"
+    local tag="$2"
+
+    if [[ -z "$repo" || -z "$tag" ]]; then
+        _gh_log_error "Usage: gh_resolve_tag_sha <owner/repo> <tag>"
+        return 4
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        _gh_log_error "jq required for tag resolution"
+        return 3
+    fi
+
+    local ref_json
+    ref_json=$(gh_api "repos/$repo/git/ref/tags/$tag" --no-cache 2>/dev/null) || {
+        _gh_log_error "Failed to fetch tag ref: $tag"
+        return 4
+    }
+
+    local obj_sha obj_type
+    obj_sha=$(echo "$ref_json" | jq -r '.object.sha // empty' 2>/dev/null)
+    obj_type=$(echo "$ref_json" | jq -r '.object.type // empty' 2>/dev/null)
+
+    if [[ -z "$obj_sha" ]]; then
+        _gh_log_error "Tag not found: $tag"
+        return 4
+    fi
+
+    if [[ "$obj_type" == "commit" ]]; then
+        echo "$obj_sha"
+        return 0
+    fi
+
+    if [[ "$obj_type" == "tag" ]]; then
+        local tag_json
+        tag_json=$(gh_api "repos/$repo/git/tags/$obj_sha" --no-cache 2>/dev/null) || {
+            _gh_log_error "Failed to dereference annotated tag: $tag"
+            return 4
+        }
+
+        local commit_sha
+        commit_sha=$(echo "$tag_json" | jq -r '.object.sha // empty' 2>/dev/null)
+        if [[ -n "$commit_sha" ]]; then
+            echo "$commit_sha"
+            return 0
+        fi
+    fi
+
+    _gh_log_warn "Unknown tag type for $tag (type=$obj_type)"
+    echo "$obj_sha"
+    return 0
+}
+
+# Trigger repository dispatch event
+# Usage: gh_repository_dispatch <owner/repo> <event_type> [payload_json]
+# Returns: 0 on success, 4 on invalid args, 3 on missing deps
+gh_repository_dispatch() {
+    local repo="$1"
+    local event_type="$2"
+    local payload_json="${3:-"{}"}"
+
+    if [[ -z "$repo" || -z "$event_type" ]]; then
+        _gh_log_error "Usage: gh_repository_dispatch <owner/repo> <event_type> [payload_json]"
+        return 4
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        _gh_log_error "jq required for dispatch payload"
+        return 3
+    fi
+
+    if ! echo "$payload_json" | jq -e '.' >/dev/null 2>&1; then
+        _gh_log_error "Invalid payload JSON for dispatch"
+        return 4
+    fi
+
+    local data
+    data=$(jq -nc \
+        --arg event "$event_type" \
+        --argjson payload "$payload_json" \
+        '{event_type: $event, client_payload: $payload}')
+
+    local response=""
+    local status=0
+    response=$(gh_api "repos/$repo/dispatches" --post "$data" --no-cache 2>/dev/null) || status=$?
+
+    if [[ $status -ne 0 ]]; then
+        return $status
+    fi
+
+    # GitHub returns 204 No Content on success; any body likely indicates error.
+    if [[ -n "$response" ]]; then
+        local msg=""
+        msg=$(echo "$response" | jq -r '.message // empty' 2>/dev/null)
+        if [[ -n "$msg" ]]; then
+            _gh_log_error "Dispatch failed: $msg"
+        else
+            _gh_log_error "Dispatch failed: unexpected response"
+        fi
+        return 7
+    fi
+
+    return 0
+}
+
 # Clear cache
 # Usage: gh_clear_cache [<endpoint>]
 gh_clear_cache() {
@@ -568,4 +677,5 @@ gh_clear_cache() {
 export -f gh_init_cache gh_check gh_check_token gh_api
 export -f gh_workflow_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_compare gh_tags gh_repo
+export -f gh_resolve_tag_sha gh_repository_dispatch
 export -f gh_clear_cache

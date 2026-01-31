@@ -456,7 +456,7 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 Upload artifacts to GitHub Release.
 
 ```bash
-dsr release --repo <name> --version <tag> [--draft] [--prerelease]
+dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 ```
 
 | Flag | Default | Description |
@@ -466,6 +466,10 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease]
 | `--draft` | false | Create as draft release |
 | `--prerelease` | false | Mark as prerelease |
 | `--artifacts` | auto | Artifact directory |
+| `--dispatch` | false | Trigger repository dispatch hooks after release |
+| `--no-dispatch` | false | Disable repository dispatch for this run |
+| `--dispatch-event` | `dsr_release` | Override dispatch event type |
+| `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
 
 ---
 
