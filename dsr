@@ -1766,6 +1766,7 @@ cmd_release() {
     local generate_notes=false
     local verify_tag=false
     local resume=false
+    local verify_upgrade=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -1804,6 +1805,10 @@ cmd_release() {
                 log_warn "--resume is not yet implemented; proceeding with fresh upload"
                 shift
                 ;;
+            --verify-upgrade)
+                verify_upgrade=true
+                shift
+                ;;
             --help|-h)
                 cat << 'EOF'
 dsr release - Upload artifacts to GitHub
@@ -1825,6 +1830,7 @@ OPTIONS:
     --prerelease             Mark as prerelease
     --generate-notes         Auto-generate release notes
     --verify-tag             Verify tag exists before release
+    --verify-upgrade         Run upgrade verification after successful release
     -r, --resume             Resume interrupted upload
 
 DESCRIPTION:
@@ -1840,6 +1846,7 @@ REQUIRED INPUTS:
 EXAMPLES:
     dsr release ntm 1.2.3                   Create release v1.2.3
     dsr release ntm 1.2.3 --draft           Create as draft
+    dsr release ntm 1.2.3 --verify-upgrade  Release + verify upgrade works
     dsr release ntm 1.2.3 --resume          Resume interrupted upload
     dsr release verify ntm 1.2.3            Verify release assets
     dsr release --tool bv --version 2.0.0   Full flag syntax
@@ -2212,6 +2219,19 @@ EOF
 
         if [[ ${#missing_assets[@]} -gt 0 ]]; then
             log_warn "Missing from manifest: ${missing_assets[*]}"
+        fi
+    fi
+
+    # Run upgrade verification if requested and release succeeded
+    if $verify_upgrade && [[ $exit_code -eq 0 ]]; then
+        echo ""
+        log_info "Running post-release upgrade verification..."
+        if upgrade_verify_tool "$tool_name"; then
+            log_ok "Upgrade verification passed for $tool_name"
+        else
+            log_warn "Upgrade verification failed for $tool_name"
+            log_info "Run 'dsr verify upgrade $tool_name' to debug"
+            # Don't fail the release, just warn
         fi
     fi
 
