@@ -16,6 +16,12 @@
 # Bind host Docker socket for Docker-in-Docker workflows
 --bind
 
+# CRITICAL: Run container as host user to prevent UID mismatch!
+# catthehacker images run as UID 1001 (runner). Without this line,
+# any files written by act will be owned by UID 1001, not your user.
+# Replace 1000:1000 with your actual UID:GID (run `id` to check)
+--container-options --user=1000:1000
+
 # Don't auto-remove containers (helps debugging)
 # --rm=false
 
