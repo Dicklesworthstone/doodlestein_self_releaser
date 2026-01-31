@@ -57,6 +57,7 @@ source "$SCRIPT_DIR/src/git_ops.sh"
 source "$SCRIPT_DIR/src/version.sh"
 source "$SCRIPT_DIR/src/act_runner.sh"
 source "$SCRIPT_DIR/src/release_formulas.sh"
+source "$SCRIPT_DIR/src/canary.sh"
 
 # Global flags
 JSON_MODE=false
@@ -95,6 +96,7 @@ COMMANDS:
     signing     Manage minisign keys and signing
     status      System and last run summary
     version     Detect and tag versions from version files
+    canary      Test installers in Docker containers
 
 GLOBAL OPTIONS:
     -j, --json          Machine-readable JSON output
@@ -4850,6 +4852,293 @@ EOF
 }
 
 # ============================================================================
+# CANARY SUBCOMMAND - Installer Testing in Docker
+# ============================================================================
+
+cmd_canary() {
+    local subcmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        run)
+            _canary_run "$@"
+            ;;
+        matrix)
+            _canary_matrix "$@"
+            ;;
+        schedule)
+            _canary_schedule "$@"
+            ;;
+        results)
+            _canary_results "$@"
+            ;;
+        --help|-h|help|"")
+            cat << 'EOF'
+dsr canary - Test installers in Docker containers
+
+USAGE:
+    dsr canary run <tool> [--os <image>] [--mode <vibe|safe>]
+    dsr canary run --all [--os <image>]
+    dsr canary matrix [--tools <list>]
+    dsr canary schedule [--cron <expr>]
+    dsr canary results
+
+SUBCOMMANDS:
+    run         Run canary test for one or all tools
+    matrix      Run full test matrix (all images/modes)
+    schedule    Setup daily canary cron job
+    results     Show latest canary results
+
+OPTIONS:
+    --os <image>    Docker image to test (default: ubuntu:24.04)
+    --mode <mode>   Installation mode: vibe or safe (default: vibe)
+    --all           Test all tools with installers
+    --tools <list>  Comma-separated list of tools
+    --cron <expr>   Cron schedule (default: "0 6 * * *")
+
+EXAMPLES:
+    dsr canary run ntm                      Test ntm on ubuntu:24.04
+    dsr canary run ntm --os debian:12       Test on specific image
+    dsr canary run --all                    Test all tools
+    dsr canary matrix                       Full test matrix
+    dsr canary schedule                     Setup daily cron
+    dsr canary results                      Show latest results
+
+EXIT CODES:
+    0  - All tests passed
+    1  - Some tests failed
+    3  - Docker not available
+    4  - Invalid arguments
+EOF
+            return 0
+            ;;
+        *)
+            log_error "Unknown canary subcommand: $subcmd"
+            log_info "Run 'dsr canary --help' for usage"
+            return 4
+            ;;
+    esac
+}
+
+_canary_run() {
+    local tool=""
+    local image="ubuntu:24.04"
+    local mode="vibe"
+    local all_tools=false
+    local verbose=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --os|--image)
+                image="$2"
+                shift 2
+                ;;
+            --mode)
+                mode="$2"
+                shift 2
+                ;;
+            --all)
+                all_tools=true
+                shift
+                ;;
+            --verbose|-v)
+                verbose=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                return 4
+                ;;
+            *)
+                tool="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # Check Docker
+    if ! canary_check_docker; then
+        if $JSON_MODE; then
+            json_envelope "canary" "error" 3 '{"error": "Docker not available"}'
+        fi
+        return 3
+    fi
+
+    local start_time results
+    start_time=$(date +%s)
+
+    if $all_tools; then
+        log_info "Running canary tests for all tools on $image ($mode mode)..."
+        results=$(canary_run_image "$image" --mode "$mode" 2>&1)
+        local status=$?
+
+        if $JSON_MODE; then
+            local duration=$(($(date +%s) - start_time))
+            json_envelope "canary" "$([[ $status -eq 0 ]] && echo "ok" || echo "failed")" "$status" \
+                "$(echo "$results" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
+        else
+            echo "$results" | jq -r '
+                "Results for \(.image) (\(.mode) mode):",
+                "  Passed: \(.passed)",
+                "  Failed: \(.failed)",
+                "",
+                (.results[] | "  \(.tool): \(.status)")
+            '
+        fi
+
+        # Save results
+        canary_save_results "$results" 2>/dev/null || true
+
+        return $status
+    fi
+
+    if [[ -z "$tool" ]]; then
+        log_error "Tool name required (or use --all)"
+        return 4
+    fi
+
+    log_info "Running canary test for $tool on $image ($mode mode)..."
+
+    if canary_run_test "$tool" "$image" "$mode" "$verbose"; then
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "canary" "ok" 0 "$(jq -nc \
+                --arg tool "$tool" \
+                --arg image "$image" \
+                --arg mode "$mode" \
+                --argjson duration "$duration" \
+                '{tool: $tool, image: $image, mode: $mode, status: "passed", duration_seconds: $duration}')"
+        else
+            log_ok "Canary test passed for $tool on $image"
+        fi
+        return 0
+    else
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "canary" "failed" 1 "$(jq -nc \
+                --arg tool "$tool" \
+                --arg image "$image" \
+                --arg mode "$mode" \
+                --argjson duration "$duration" \
+                '{tool: $tool, image: $image, mode: $mode, status: "failed", duration_seconds: $duration}')"
+        else
+            log_error "Canary test failed for $tool on $image"
+        fi
+        return 1
+    fi
+}
+
+_canary_matrix() {
+    local tools_arg=""
+    local modes_arg=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tools)
+                tools_arg="--tools $2"
+                shift 2
+                ;;
+            --modes)
+                modes_arg="--modes $2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Check Docker
+    if ! canary_check_docker; then
+        if $JSON_MODE; then
+            json_envelope "canary-matrix" "error" 3 '{"error": "Docker not available"}'
+        fi
+        return 3
+    fi
+
+    log_info "Running full canary matrix..."
+
+    local start_time
+    start_time=$(date +%s)
+
+    # shellcheck disable=SC2086  # Intentional word splitting
+    if canary_run_matrix $tools_arg $modes_arg; then
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "canary-matrix" "ok" 0 "{\"duration_seconds\": $duration}"
+        else
+            log_ok "Matrix tests completed successfully"
+        fi
+        return 0
+    else
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "canary-matrix" "failed" 1 "{\"duration_seconds\": $duration}"
+        else
+            log_error "Some matrix tests failed"
+        fi
+        return 1
+    fi
+}
+
+_canary_schedule() {
+    local cron_expr=""
+    local unschedule=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cron)
+                cron_expr="$2"
+                shift 2
+                ;;
+            --remove|--unschedule)
+                unschedule=true
+                shift
+                ;;
+            --show)
+                canary_show_schedule
+                return 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    if $unschedule; then
+        canary_unschedule
+    elif [[ -n "$cron_expr" ]]; then
+        canary_schedule "$cron_expr"
+    else
+        canary_schedule
+    fi
+}
+
+_canary_results() {
+    local results
+    results=$(canary_get_latest)
+
+    if $JSON_MODE; then
+        echo "$results"
+    else
+        echo "$results" | jq -r '
+            if .error then
+                "No canary results found"
+            else
+                "Latest canary results (\(.timestamp // "unknown")):",
+                "  Image: \(.image // "unknown")",
+                "  Mode: \(.mode // "unknown")",
+                "  Passed: \(.passed // 0)",
+                "  Failed: \(.failed // 0)",
+                "",
+                "Results:",
+                (.results // [] | .[] | "  \(.tool): \(.status)")
+            end
+        '
+    fi
+}
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -4969,6 +5258,9 @@ main() {
             ;;
         version)
             cmd_version "$@"
+            ;;
+        canary)
+            cmd_canary "$@"
             ;;
         help)
             show_help
