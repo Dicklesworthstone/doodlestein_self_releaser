@@ -386,7 +386,7 @@ _tl_update_summary() {
             --argjson pass "$total_pass" \
             --argjson fail "$total_fail" \
             --argjson skip "$total_skip" \
-            '.total_pass = $pass | .total_fail = $fail | .total_skip = $skip | .updated_at = now | strftime("%Y-%m-%dT%H:%M:%SZ")' \
+            '.total_pass = $pass | .total_fail = $fail | .total_skip = $skip | .updated_at = (now | strftime("%Y-%m-%dT%H:%M:%SZ"))' \
             > "$_TL_SUMMARY_FILE"
     else
         # Create new summary

@@ -275,17 +275,24 @@ function Install-Tool {
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     $destFile = Join-Path $installDir "$BinaryName.exe"
 
-    if (Test-Path $destFile -and -not $nonInteractive) {
-        $resp = Read-Host "Overwrite existing $destFile? (y/N)"
-        if ($resp -ne "y" -and $resp -ne "Y") {
-            Write-Log "INFO" "Installation cancelled"
-            Write-JsonResult -Status "cancelled" -Message "user cancelled" -OutVersion $Version
-            exit 0
+    if (Test-Path $destFile) {
+        if ($Yes) {
+            # -Yes explicitly passed: overwrite silently
+            Write-Log "INFO" "Overwriting existing $destFile"
+        } elseif ($env:CI -eq "1") {
+            # CI environment without -Yes: error to be safe
+            Write-Log "ERROR" "Existing file at $destFile (use -Yes to overwrite in CI)"
+            Write-JsonResult -Status "error" -Message "destination exists" -OutVersion $Version
+            exit 1
+        } else {
+            # Interactive: prompt user
+            $resp = Read-Host "Overwrite existing $destFile? (y/N)"
+            if ($resp -ne "y" -and $resp -ne "Y") {
+                Write-Log "INFO" "Installation cancelled"
+                Write-JsonResult -Status "cancelled" -Message "user cancelled" -OutVersion $Version
+                exit 0
+            }
         }
-    } elseif (Test-Path $destFile -and $nonInteractive) {
-        Write-Log "ERROR" "Existing file at $destFile (use -Yes to overwrite)"
-        Write-JsonResult -Status "error" -Message "destination exists" -OutVersion $Version
-        exit 1
     }
 
     Copy-Item -Force -Path $binaryFile.FullName -Destination $destFile

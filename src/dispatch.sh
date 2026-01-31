@@ -35,7 +35,7 @@ _dp_log_info()  { echo "${_DP_BLUE}[dispatch]${_DP_NC} $*" >&2; }
 _dp_log_ok()    { echo "${_DP_GREEN}[dispatch]${_DP_NC} $*" >&2; }
 _dp_log_warn()  { echo "${_DP_YELLOW}[dispatch]${_DP_NC} $*" >&2; }
 _dp_log_error() { echo "${_DP_RED}[dispatch]${_DP_NC} $*" >&2; }
-_dp_log_debug() { [[ "${DISPATCH_DEBUG:-}" == "1" ]] && echo "${_DP_BLUE}[dispatch:debug]${_DP_NC} $*" >&2; }
+_dp_log_debug() { [[ "${DISPATCH_DEBUG:-}" == "1" ]] && echo "${_DP_BLUE}[dispatch:debug]${_DP_NC} $*" >&2 || true; }
 
 # ============================================================================
 # Authentication
@@ -45,7 +45,7 @@ _dp_log_debug() { [[ "${DISPATCH_DEBUG:-}" == "1" ]] && echo "${_DP_BLUE}[dispat
 # Returns: 0 if authenticated, 3 if not
 dispatch_check_auth() {
     # Try gh CLI first
-    if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
         return 0
     fi
 
@@ -62,7 +62,7 @@ dispatch_check_auth() {
 
 # Get GitHub token for API calls
 _dp_get_token() {
-    if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
         gh auth token 2>/dev/null
     elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
         echo "$GITHUB_TOKEN"
@@ -174,7 +174,7 @@ _dp_send_dispatch() {
     local request_body="$2"
 
     # Try gh CLI first
-    if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
         if echo "$request_body" | gh api "repos/$repo/dispatches" --input - -X POST &>/dev/null; then
             return 0
         fi

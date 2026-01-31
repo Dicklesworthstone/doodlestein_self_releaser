@@ -34,7 +34,7 @@ _cs_log_info()  { echo "${_CS_BLUE}[checksum-sync]${_CS_NC} $*" >&2; }
 _cs_log_ok()    { echo "${_CS_GREEN}[checksum-sync]${_CS_NC} $*" >&2; }
 _cs_log_warn()  { echo "${_CS_YELLOW}[checksum-sync]${_CS_NC} $*" >&2; }
 _cs_log_error() { echo "${_CS_RED}[checksum-sync]${_CS_NC} $*" >&2; }
-_cs_log_debug() { [[ "${CS_DEBUG:-}" == "1" ]] && echo "${_CS_BLUE}[checksum-sync:debug]${_CS_NC} $*" >&2; }
+_cs_log_debug() { [[ "${CS_DEBUG:-}" == "1" ]] && echo "${_CS_BLUE}[checksum-sync:debug]${_CS_NC} $*" >&2 || true; }
 
 # ============================================================================
 # Safety Checks
@@ -49,7 +49,8 @@ _cs_is_safe_path() {
     abs_path=$(realpath -m "$path" 2>/dev/null || echo "$path")
 
     for protected in "${CHECKSUM_SYNC_PROTECTED_PATHS[@]}"; do
-        if [[ "$abs_path" == "$protected"* ]]; then
+        # Check for exact match OR path is inside protected directory
+        if [[ "$abs_path" == "$protected" || "$abs_path" == "$protected/"* ]]; then
             _cs_log_error "Refusing to modify protected path: $abs_path"
             _cs_log_error "Protected prefix: $protected"
             return 1
@@ -520,21 +521,22 @@ Please review and verify these checksums before merging.
 
 /cc @maintainer"
 
-            if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+            if command -v gh &>/dev/null && gh auth status &>/dev/null; then
                 if gh issue create --repo "$target_repo" --title "$issue_title" --body "$issue_body" >/dev/null 2>&1; then
                     _cs_log_ok "Security review issue opened in $target_repo"
                     ((issues_opened++))
+                    results+=("{\"repo\": \"$target_repo\", \"action\": \"issue_opened\", \"status\": \"success\"}")
                 else
                     _cs_log_error "Failed to open issue in $target_repo"
                     ((failed++))
+                    results+=("{\"repo\": \"$target_repo\", \"action\": \"issue_opened\", \"status\": \"error\"}")
                 fi
             else
                 _cs_log_warn "gh CLI not available, cannot open issue"
                 _cs_log_info "Manual review required for: $target_repo"
                 ((failed++))
+                results+=("{\"repo\": \"$target_repo\", \"action\": \"issue_opened\", \"status\": \"error\", \"reason\": \"gh_unavailable\"}")
             fi
-
-            results+=("{\"repo\": \"$target_repo\", \"action\": \"issue_opened\", \"status\": \"success\"}")
             continue
         fi
 
