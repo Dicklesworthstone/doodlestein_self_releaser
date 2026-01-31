@@ -534,56 +534,50 @@ _decode_skill_content() {
 }
 
 # Install skill for Claude Code
+# Returns 0 if skill was installed, 1 if skipped
 _install_claude_skill() {
     local skill_dir="${HOME}/.claude/skills/${TOOL_NAME}"
 
     # Check if Claude Code is installed
     if [[ ! -d "${HOME}/.claude" ]] && ! command -v claude &>/dev/null; then
-        return 0  # Claude Code not installed, skip silently
+        return 1  # Claude Code not installed, skip silently
     fi
-
-    _log_info "Installing Claude Code skill..."
-
-    # Create skill directory
-    mkdir -p "$skill_dir"
 
     # Write skill file from decoded base64 content
     local skill_content
     skill_content=$(_decode_skill_content)
     if [[ -n "$skill_content" ]]; then
+        _log_info "Installing Claude Code skill..."
+        mkdir -p "$skill_dir"
         printf '%s\n' "$skill_content" > "$skill_dir/SKILL.md"
         _log_ok "Claude Code skill installed: $skill_dir/SKILL.md"
         return 0
     else
-        _log_warn "Skill content not embedded, skipping Claude Code skill"
-        return 0
+        return 1  # No skill content, skip
     fi
 }
 
 # Install skill for Codex CLI
+# Returns 0 if skill was installed, 1 if skipped
 _install_codex_skill() {
     local skill_dir="${HOME}/.codex/skills/${TOOL_NAME}"
 
     # Check if Codex CLI is installed
     if [[ ! -d "${HOME}/.codex" ]] && ! command -v codex &>/dev/null; then
-        return 0  # Codex CLI not installed, skip silently
+        return 1  # Codex CLI not installed, skip silently
     fi
-
-    _log_info "Installing Codex CLI skill..."
-
-    # Create skill directory
-    mkdir -p "$skill_dir"
 
     # Write skill file from decoded base64 content
     local skill_content
     skill_content=$(_decode_skill_content)
     if [[ -n "$skill_content" ]]; then
+        _log_info "Installing Codex CLI skill..."
+        mkdir -p "$skill_dir"
         printf '%s\n' "$skill_content" > "$skill_dir/SKILL.md"
         _log_ok "Codex CLI skill installed: $skill_dir/SKILL.md"
         return 0
     else
-        _log_warn "Skill content not embedded, skipping Codex CLI skill"
-        return 0
+        return 1  # No skill content, skip
     fi
 }
 
