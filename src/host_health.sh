@@ -120,9 +120,21 @@ _hh_parse_host_fallback() {
     # If we found the host, return JSON
     if [[ -n "$platform" || -n "$connection" ]]; then
         capabilities="${capabilities% }"  # trim trailing space
-        cat << EOF
-{"platform": "$platform", "connection": "${connection:-ssh}", "ssh_host": "${ssh_host:-$hostname}", "description": "$description", "concurrency": $concurrency, "capabilities": "$capabilities"}
-EOF
+        jq -nc \
+            --arg platform "$platform" \
+            --arg connection "${connection:-ssh}" \
+            --arg ssh_host "${ssh_host:-$hostname}" \
+            --arg description "$description" \
+            --argjson concurrency "$concurrency" \
+            --arg capabilities "$capabilities" \
+            '{
+                platform: $platform,
+                connection: $connection,
+                ssh_host: $ssh_host,
+                description: $description,
+                concurrency: $concurrency,
+                capabilities: $capabilities
+            }'
         return 0
     fi
 

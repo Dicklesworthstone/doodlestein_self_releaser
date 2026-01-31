@@ -78,20 +78,25 @@ signing_check() {
     fi
 
     if $json_mode; then
-        cat << EOF
-{
-  "valid": $valid,
-  "private_key": {
-    "path": "$SIGNING_PRIVATE_KEY",
-    "exists": $private_exists,
-    "permissions": "$private_perms"
-  },
-  "public_key": {
-    "path": "$SIGNING_PUBLIC_KEY",
-    "exists": $public_exists
-  }
-}
-EOF
+        jq -nc \
+            --argjson valid "$valid" \
+            --arg private_path "$SIGNING_PRIVATE_KEY" \
+            --argjson private_exists "$private_exists" \
+            --arg private_perms "$private_perms" \
+            --arg public_path "$SIGNING_PUBLIC_KEY" \
+            --argjson public_exists "$public_exists" \
+            '{
+                valid: $valid,
+                private_key: {
+                    path: $private_path,
+                    exists: $private_exists,
+                    permissions: $private_perms
+                },
+                public_key: {
+                    path: $public_path,
+                    exists: $public_exists
+                }
+            }'
     else
         _sign_log_info "Private key: $SIGNING_PRIVATE_KEY"
         if $private_exists; then

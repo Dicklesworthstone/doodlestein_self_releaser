@@ -209,19 +209,27 @@ act_run_workflow() {
     fi
 
     # Return JSON result
-    cat <<EOF
-{
-  "run_id": "$run_id",
-  "workflow": "$workflow",
-  "job": "${job:-all}",
-  "status": "$status",
-  "exit_code": $exit_code,
-  "duration_seconds": $duration,
-  "artifact_dir": "$artifact_dir",
-  "artifact_count": $artifact_count,
-  "log_file": "$log_file"
-}
-EOF
+    jq -nc \
+        --arg run_id "$run_id" \
+        --arg workflow "$workflow" \
+        --arg job "${job:-all}" \
+        --arg status "$status" \
+        --argjson exit_code "$exit_code" \
+        --argjson duration_seconds "$duration" \
+        --arg artifact_dir "$artifact_dir" \
+        --argjson artifact_count "$artifact_count" \
+        --arg log_file "$log_file" \
+        '{
+            run_id: $run_id,
+            workflow: $workflow,
+            job: $job,
+            status: $status,
+            exit_code: $exit_code,
+            duration_seconds: $duration_seconds,
+            artifact_dir: $artifact_dir,
+            artifact_count: $artifact_count,
+            log_file: $log_file
+        }'
 
     return "$exit_code"
 }
@@ -300,17 +308,23 @@ act_analyze_workflow() {
     }
 
     # Output JSON analysis
-    cat <<EOF
-{
-  "workflow": "$workflow",
-  "linux_jobs": $(_array_to_json "${linux_jobs[@]+"${linux_jobs[@]}"}"),
-  "macos_jobs": $(_array_to_json "${macos_jobs[@]+"${macos_jobs[@]}"}"),
-  "windows_jobs": $(_array_to_json "${windows_jobs[@]+"${windows_jobs[@]}"}"),
-  "other_jobs": $(_array_to_json "${other_jobs[@]+"${other_jobs[@]}"}"),
-  "act_compatible": ${#linux_jobs[@]},
-  "native_required": $((${#macos_jobs[@]} + ${#windows_jobs[@]}))
-}
-EOF
+    jq -nc \
+        --arg workflow "$workflow" \
+        --argjson linux_jobs "$(_array_to_json "${linux_jobs[@]+"${linux_jobs[@]}"}")" \
+        --argjson macos_jobs "$(_array_to_json "${macos_jobs[@]+"${macos_jobs[@]}"}")" \
+        --argjson windows_jobs "$(_array_to_json "${windows_jobs[@]+"${windows_jobs[@]}"}")" \
+        --argjson other_jobs "$(_array_to_json "${other_jobs[@]+"${other_jobs[@]}"}")" \
+        --argjson act_compatible "${#linux_jobs[@]}" \
+        --argjson native_required "$((${#macos_jobs[@]} + ${#windows_jobs[@]}))" \
+        '{
+            workflow: $workflow,
+            linux_jobs: $linux_jobs,
+            macos_jobs: $macos_jobs,
+            windows_jobs: $windows_jobs,
+            other_jobs: $other_jobs,
+            act_compatible: $act_compatible,
+            native_required: $native_required
+        }'
 }
 
 # Clean up old act artifacts
@@ -518,15 +532,19 @@ act_get_build_strategy() {
         method="native"
     fi
 
-    cat <<EOF
-{
-  "tool": "$tool_name",
-  "platform": "$platform",
-  "method": "$method",
-  "host": "$host",
-  "job": "$job"
-}
-EOF
+    jq -nc \
+        --arg tool "$tool_name" \
+        --arg platform "$platform" \
+        --arg method "$method" \
+        --arg host "$host" \
+        --arg job "$job" \
+        '{
+            tool: $tool,
+            platform: $platform,
+            method: $method,
+            host: $host,
+            job: $job
+        }'
 }
 
 # List all configured tools
@@ -679,9 +697,8 @@ act_run_native_build() {
     host=$(act_get_native_host "$platform")
     if [[ -z "$host" ]]; then
         _log_error "No native host configured for platform: $platform"
-        cat << EOF
-{"status": "error", "exit_code": 4, "error": "No native host for $platform"}
-EOF
+        jq -nc --arg platform "$platform" \
+            '{status: "error", exit_code: 4, error: ("No native host for " + $platform)}'
         return 4
     fi
 
@@ -691,9 +708,8 @@ EOF
 
     if [[ ! -f "$config_file" ]]; then
         _log_error "Config not found: $config_file"
-        cat << EOF
-{"status": "error", "exit_code": 4, "error": "Config not found: $config_file"}
-EOF
+        jq -nc --arg config_file "$config_file" \
+            '{status: "error", exit_code: 4, error: ("Config not found: " + $config_file)}'
         return 4
     fi
 
@@ -704,9 +720,7 @@ EOF
 
     if [[ -z "$local_path" || -z "$build_cmd" ]]; then
         _log_error "Missing local_path or build_cmd in config"
-        cat << EOF
-{"status": "error", "exit_code": 4, "error": "Missing required config fields"}
-EOF
+        jq -nc '{status: "error", exit_code: 4, error: "Missing required config fields"}'
         return 4
     fi
 
@@ -805,19 +819,26 @@ EOF
     fi
 
     # Return JSON result (pointing to LOCAL artifact path)
-    cat << EOF
-{
-  "tool": "$tool_name",
-  "platform": "$platform",
-  "host": "$host",
-  "method": "native",
-  "status": "$status",
-  "exit_code": $exit_code,
-  "duration_seconds": $duration,
-  "artifact_path": "${local_artifact_path:-}",
-  "log_file": "$log_file"
-}
-EOF
+    jq -nc \
+        --arg tool "$tool_name" \
+        --arg platform "$platform" \
+        --arg host "$host" \
+        --arg status "$status" \
+        --argjson exit_code "$exit_code" \
+        --argjson duration "$duration" \
+        --arg artifact_path "${local_artifact_path:-}" \
+        --arg log_file "$log_file" \
+        '{
+            tool: $tool,
+            platform: $platform,
+            host: $host,
+            method: "native",
+            status: $status,
+            exit_code: $exit_code,
+            duration_seconds: $duration,
+            artifact_path: $artifact_path,
+            log_file: $log_file
+        }'
 
     return "$exit_code"
 }
@@ -918,13 +939,10 @@ act_orchestrate_build() {
             # Fallback if no JSON found
             if [[ -z "$result" ]] || ! echo "$result" | jq -e '.' &>/dev/null; then
                 _log_warn "Could not parse JSON from act output, creating status from exit code"
-                result=$(cat <<EOFJ
-{
-  "status": "$([ "$exit_code" -eq 0 ] && echo "success" || echo "failed")",
-  "exit_code": $exit_code
-}
-EOFJ
-)
+                local fallback_status="failed"
+                [[ "$exit_code" -eq 0 ]] && fallback_status="success"
+                result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
+                    '{status: $status, exit_code: $exit_code}')
             fi
 
             # Wrap in consistent format
@@ -994,22 +1012,31 @@ EOFJ
         results_json=$(printf '%s\n' "${results[@]}" | jq -s '.' 2>/dev/null || echo '[]')
     fi
 
-    cat << EOF
-{
-  "tool": "$tool_name",
-  "version": "$version",
-  "run_id": "$run_id",
-  "status": "$overall_status",
-  "exit_code": $overall_exit_code,
-  "duration_seconds": $total_duration,
-  "summary": {
-    "total": $((success_count + fail_count)),
-    "success": $success_count,
-    "failed": $fail_count
-  },
-  "targets": $results_json
-}
-EOF
+    jq -nc \
+        --arg tool "$tool_name" \
+        --arg version "$version" \
+        --arg run_id "$run_id" \
+        --arg status "$overall_status" \
+        --argjson exit_code "$overall_exit_code" \
+        --argjson duration "$total_duration" \
+        --argjson total "$((success_count + fail_count))" \
+        --argjson success "$success_count" \
+        --argjson failed "$fail_count" \
+        --argjson targets "$results_json" \
+        '{
+            tool: $tool,
+            version: $version,
+            run_id: $run_id,
+            status: $status,
+            exit_code: $exit_code,
+            duration_seconds: $duration,
+            summary: {
+                total: $total,
+                success: $success,
+                failed: $failed
+            },
+            targets: $targets
+        }'
 
     return "$overall_exit_code"
 }
