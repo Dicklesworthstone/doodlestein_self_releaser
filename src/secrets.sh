@@ -262,13 +262,12 @@ secrets_check_gh_auth() {
         fi
     fi
 
-    cat <<EOF
-{
-  "status": "$status",
-  "details": "$details",
-  "user": "$user"
-}
-EOF
+    # Use jq for safe JSON construction
+    jq -nc \
+        --arg status "$status" \
+        --arg details "$details" \
+        --arg user "$user" \
+        '{status: $status, details: $details, user: $user}'
 }
 
 # ============================================================================
@@ -395,38 +394,43 @@ secrets_validate_for() {
 # Usage: secrets_doctor_summary
 # Returns: JSON with credential status (secrets redacted)
 secrets_doctor_summary() {
-    local gh_status slack_status discord_status
+    local gh_available=false gh_user="" gh_source=""
+    local slack_configured=false
+    local discord_configured=false
 
     # GitHub
     if secrets_has_gh_token; then
-        local user
-        user=$(gh api user -q '.login' 2>/dev/null || echo "unknown")
-        gh_status="{\"available\": true, \"user\": \"$user\", \"source\": \"$(secrets_get_gh_source)\"}"
-    else
-        gh_status='{"available": false, "user": null, "source": null}'
+        gh_available=true
+        gh_user=$(gh api user -q '.login' 2>/dev/null || echo "unknown")
+        gh_source=$(secrets_get_gh_source)
     fi
 
     # Slack
     if secrets_has_slack_webhook; then
-        slack_status='{"configured": true}'
-    else
-        slack_status='{"configured": false}'
+        slack_configured=true
     fi
 
     # Discord
     if [[ -n "${DSR_DISCORD_WEBHOOK:-}" ]]; then
-        discord_status='{"configured": true}'
-    else
-        discord_status='{"configured": false}'
+        discord_configured=true
     fi
 
-    cat <<EOF
-{
-  "github": $gh_status,
-  "slack": $slack_status,
-  "discord": $discord_status
-}
-EOF
+    # Use jq for safe JSON construction
+    jq -nc \
+        --argjson gh_available "$gh_available" \
+        --arg gh_user "$gh_user" \
+        --arg gh_source "$gh_source" \
+        --argjson slack_configured "$slack_configured" \
+        --argjson discord_configured "$discord_configured" \
+        '{
+            github: {
+                available: $gh_available,
+                user: (if $gh_user == "" then null else $gh_user end),
+                source: (if $gh_source == "" then null else $gh_source end)
+            },
+            slack: {configured: $slack_configured},
+            discord: {configured: $discord_configured}
+        }'
 }
 
 # Get the source of the GitHub token (for diagnostics)

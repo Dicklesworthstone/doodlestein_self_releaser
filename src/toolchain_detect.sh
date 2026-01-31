@@ -163,7 +163,6 @@ _tc_prompt() {
 # Detect Rust installation
 # Returns: JSON object with detection results
 toolchain_detect_rust() {
-    local result
     local installed=false
     local version=""
     local path=""
@@ -192,17 +191,23 @@ toolchain_detect_rust() {
         fi
     fi
 
-    cat << EOF
-{
-  "toolchain": "rust",
-  "installed": $installed,
-  "version": "$version",
-  "path": "$path",
-  "minimum_version": "$TOOLCHAIN_RUST_MIN_VERSION",
-  "meets_minimum": $meets_minimum,
-  "install_method": "$install_method"
-}
-EOF
+    # Use jq for safe JSON construction
+    jq -nc \
+        --argjson installed "$installed" \
+        --arg version "$version" \
+        --arg path "$path" \
+        --arg minimum_version "$TOOLCHAIN_RUST_MIN_VERSION" \
+        --argjson meets_minimum "$meets_minimum" \
+        --arg install_method "$install_method" \
+        '{
+            toolchain: "rust",
+            installed: $installed,
+            version: $version,
+            path: $path,
+            minimum_version: $minimum_version,
+            meets_minimum: $meets_minimum,
+            install_method: $install_method
+        }'
 }
 
 # Install Rust via rustup
@@ -266,17 +271,23 @@ toolchain_detect_go() {
         fi
     fi
 
-    cat << EOF
-{
-  "toolchain": "go",
-  "installed": $installed,
-  "version": "$version",
-  "path": "$path",
-  "goroot": "$goroot",
-  "minimum_version": "$TOOLCHAIN_GO_MIN_VERSION",
-  "meets_minimum": $meets_minimum
-}
-EOF
+    # Use jq for safe JSON construction
+    jq -nc \
+        --argjson installed "$installed" \
+        --arg version "$version" \
+        --arg path "$path" \
+        --arg goroot "$goroot" \
+        --arg minimum_version "$TOOLCHAIN_GO_MIN_VERSION" \
+        --argjson meets_minimum "$meets_minimum" \
+        '{
+            toolchain: "go",
+            installed: $installed,
+            version: $version,
+            path: $path,
+            goroot: $goroot,
+            minimum_version: $minimum_version,
+            meets_minimum: $meets_minimum
+        }'
 }
 
 # Install Go
@@ -352,16 +363,21 @@ toolchain_detect_bun() {
         fi
     fi
 
-    cat << EOF
-{
-  "toolchain": "bun",
-  "installed": $installed,
-  "version": "$version",
-  "path": "$path",
-  "minimum_version": "$TOOLCHAIN_BUN_MIN_VERSION",
-  "meets_minimum": $meets_minimum
-}
-EOF
+    # Use jq for safe JSON construction
+    jq -nc \
+        --argjson installed "$installed" \
+        --arg version "$version" \
+        --arg path "$path" \
+        --arg minimum_version "$TOOLCHAIN_BUN_MIN_VERSION" \
+        --argjson meets_minimum "$meets_minimum" \
+        '{
+            toolchain: "bun",
+            installed: $installed,
+            version: $version,
+            path: $path,
+            minimum_version: $minimum_version,
+            meets_minimum: $meets_minimum
+        }'
 }
 
 # Install Bun
@@ -416,17 +432,23 @@ toolchain_detect_node() {
         fi
     fi
 
-    cat << EOF
-{
-  "toolchain": "node",
-  "installed": $installed,
-  "version": "$version",
-  "path": "$path",
-  "npm_version": "$npm_version",
-  "minimum_version": "$TOOLCHAIN_NODE_MIN_VERSION",
-  "meets_minimum": $meets_minimum
-}
-EOF
+    # Use jq for safe JSON construction
+    jq -nc \
+        --argjson installed "$installed" \
+        --arg version "$version" \
+        --arg path "$path" \
+        --arg npm_version "$npm_version" \
+        --arg minimum_version "$TOOLCHAIN_NODE_MIN_VERSION" \
+        --argjson meets_minimum "$meets_minimum" \
+        '{
+            toolchain: "node",
+            installed: $installed,
+            version: $version,
+            path: $path,
+            npm_version: $npm_version,
+            minimum_version: $minimum_version,
+            meets_minimum: $meets_minimum
+        }'
 }
 
 # ============================================================================
@@ -463,23 +485,24 @@ toolchain_detect() {
 # Detect all toolchains
 # Returns: JSON array of all detection results
 toolchain_detect_all() {
-    local rust go bun node
-    rust=$(toolchain_detect_rust)
-    go=$(toolchain_detect_go)
-    bun=$(toolchain_detect_bun)
-    node=$(toolchain_detect_node)
+    local rust_json go_json bun_json node_json platform
+    rust_json=$(toolchain_detect_rust)
+    go_json=$(toolchain_detect_go)
+    bun_json=$(toolchain_detect_bun)
+    node_json=$(toolchain_detect_node)
+    platform=$(_tc_detect_platform)
 
-    cat << EOF
-{
-  "platform": "$(_tc_detect_platform)",
-  "toolchains": [
-    $rust,
-    $go,
-    $bun,
-    $node
-  ]
-}
-EOF
+    # Use jq to safely combine JSON objects
+    jq -nc \
+        --arg platform "$platform" \
+        --argjson rust "$rust_json" \
+        --argjson go "$go_json" \
+        --argjson bun "$bun_json" \
+        --argjson node "$node_json" \
+        '{
+            platform: $platform,
+            toolchains: [$rust, $go, $bun, $node]
+        }'
 }
 
 # Ensure a toolchain is available (detect + optionally install)

@@ -525,17 +525,17 @@ Please review and verify these checksums before merging.
                 if gh issue create --repo "$target_repo" --title "$issue_title" --body "$issue_body" >/dev/null 2>&1; then
                     _cs_log_ok "Security review issue opened in $target_repo"
                     ((issues_opened++))
-                    results+=("{\"repo\": \"$target_repo\", \"action\": \"issue_opened\", \"status\": \"success\"}")
+                    results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "issue_opened", status: "success"}')")
                 else
                     _cs_log_error "Failed to open issue in $target_repo"
                     ((failed++))
-                    results+=("{\"repo\": \"$target_repo\", \"action\": \"issue_opened\", \"status\": \"error\"}")
+                    results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "issue_opened", status: "error"}')")
                 fi
             else
                 _cs_log_warn "gh CLI not available, cannot open issue"
                 _cs_log_info "Manual review required for: $target_repo"
                 ((failed++))
-                results+=("{\"repo\": \"$target_repo\", \"action\": \"issue_opened\", \"status\": \"error\", \"reason\": \"gh_unavailable\"}")
+                results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "issue_opened", status: "error", reason: "gh_unavailable"}')")
             fi
             continue
         fi
@@ -546,7 +546,7 @@ Please review and verify these checksums before merging.
         if [[ -z "$repo_path" ]]; then
             _cs_log_error "Failed to clone $target_repo"
             ((failed++))
-            results+=("{\"repo\": \"$target_repo\", \"action\": \"clone\", \"status\": \"error\"}")
+            results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "clone", status: "error"}')")
             continue
         fi
 
@@ -557,10 +557,10 @@ Please review and verify these checksums before merging.
 
         if _cs_update_repo_checksums "$repo_path" "$checksums_content" "${update_args[@]}"; then
             ((synced++))
-            results+=("{\"repo\": \"$target_repo\", \"action\": \"updated\", \"status\": \"success\", \"pushed\": $push_changes}")
+            results+=("$(jq -nc --arg repo "$target_repo" --argjson pushed "$push_changes" '{repo: $repo, action: "updated", status: "success", pushed: $pushed}')")
         else
             ((failed++))
-            results+=("{\"repo\": \"$target_repo\", \"action\": \"update\", \"status\": \"error\"}")
+            results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "update", status: "error"}')")
         fi
 
         # Cleanup

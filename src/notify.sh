@@ -102,7 +102,9 @@ notify_mark_sent() {
 
   local ts
   ts=$(_notify_now)
-  printf '{"run_id":"%s","event":"%s","ts":"%s"}\n' "$run_id" "$event" "$ts" >> "$_NOTIFY_SENT_FILE"
+  # Use jq for safe JSON construction to prevent injection
+  jq -nc --arg run_id "$run_id" --arg event "$event" --arg ts "$ts" \
+      '{run_id: $run_id, event: $event, ts: $ts}' >> "$_NOTIFY_SENT_FILE"
 }
 
 _notify_terminal() {

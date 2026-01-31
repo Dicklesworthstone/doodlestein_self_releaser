@@ -357,16 +357,22 @@ version_info_json() {
         fi
     fi
 
-    cat << EOF
-{
-  "repo_path": "$repo_path",
-  "version": "$version",
-  "tag": "$tag",
-  "tag_exists": $tag_exists,
-  "needs_tag": $needs_tag,
-  "language": "$language"
-}
-EOF
+    # Use jq for safe JSON construction
+    jq -nc \
+        --arg repo_path "$repo_path" \
+        --arg version "$version" \
+        --arg tag "$tag" \
+        --argjson tag_exists "$tag_exists" \
+        --argjson needs_tag "$needs_tag" \
+        --arg language "$language" \
+        '{
+            repo_path: $repo_path,
+            version: $version,
+            tag: $tag,
+            tag_exists: $tag_exists,
+            needs_tag: $needs_tag,
+            language: $language
+        }'
 }
 
 # ============================================================================
@@ -436,10 +442,10 @@ version_tag_all() {
         # shellcheck disable=SC2086
         if version_create_tag "$local_path" $tag_args; then
             ((tagged++))
-            results+=("{\"tool\": \"$tool_name\", \"status\": \"tagged\"}")
+            results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "tagged"}')")
         else
             ((failed++))
-            results+=("{\"tool\": \"$tool_name\", \"status\": \"failed\"}")
+            results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "failed"}')")
         fi
     done
 
