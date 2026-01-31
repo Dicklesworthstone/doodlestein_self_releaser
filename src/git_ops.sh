@@ -333,13 +333,13 @@ git_ops_get_build_info() {
 
   if [[ "$dirty_status" != "clean" && "$allow_dirty" != "--allow-dirty" && "$allow_dirty" != "true" ]]; then
     log_error "Working tree is $dirty_status. Use --allow-dirty to override."
-    cat << EOF
-{
-  "error": "dirty working tree",
-  "dirty_status": "$dirty_status",
-  "hint": "Commit or stash changes, or use --allow-dirty flag"
-}
-EOF
+    jq -nc \
+        --arg dirty_status "$dirty_status" \
+        '{
+            error: "dirty working tree",
+            dirty_status: $dirty_status,
+            hint: "Commit or stash changes, or use --allow-dirty flag"
+        }'
     return 1
   fi
 
@@ -352,7 +352,7 @@ EOF
     resolved_ref="$ref"
     if ! resolved_sha=$(git_ops_tag_sha "$repo_path" "$ref"); then
       log_error "Cannot resolve tag: $ref"
-      echo '{"error": "cannot resolve tag", "ref": "'"$ref"'"}'
+      jq -nc --arg ref "$ref" '{error: "cannot resolve tag", ref: $ref}'
       return 1
     fi
   elif git -C "$repo_path" show-ref --verify "refs/heads/$ref" >/dev/null 2>&1; then
@@ -360,14 +360,14 @@ EOF
     resolved_ref="$ref"
     if ! resolved_sha=$(git -C "$repo_path" rev-parse "refs/heads/$ref" 2>/dev/null); then
       log_error "Cannot resolve branch: $ref"
-      echo '{"error": "cannot resolve branch", "ref": "'"$ref"'"}'
+      jq -nc --arg ref "$ref" '{error: "cannot resolve branch", ref: $ref}'
       return 1
     fi
   elif [[ "$ref" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
     # Looks like a SHA
     ref_type="commit"
     if ! resolved_sha=$(git_ops_resolve_ref "$repo_path" "$ref"); then
-      echo '{"error": "cannot resolve commit", "ref": "'"$ref"'"}'
+      jq -nc --arg ref "$ref" '{error: "cannot resolve commit", ref: $ref}'
       return 1
     fi
     resolved_ref="$resolved_sha"
@@ -375,7 +375,7 @@ EOF
     # Try as a generic ref
     if ! resolved_sha=$(git_ops_resolve_ref "$repo_path" "$ref"); then
       log_error "Cannot resolve ref: $ref"
-      echo '{"error": "cannot resolve ref", "ref": "'"$ref"'"}'
+      jq -nc --arg ref "$ref" '{error: "cannot resolve ref", ref: $ref}'
       return 1
     fi
     ref_type="ref"
@@ -397,20 +397,32 @@ EOF
   fi
 
   # Build JSON response
-  cat << EOF
-{
-  "repo_path": "$repo_path",
-  "requested_ref": "$ref",
-  "resolved_ref": "$resolved_ref",
-  "ref_type": "$ref_type",
-  "git_sha": "$resolved_sha",
-  "head_sha": "$head_sha",
-  "current_branch": "$current_branch",
-  "dirty_status": "$dirty_status",
-  "at_head": $([ "$resolved_sha" = "$head_sha" ] && echo "true" || echo "false"),
-  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-}
-EOF
+  local at_head=false
+  [[ "$resolved_sha" = "$head_sha" ]] && at_head=true
+
+  jq -nc \
+      --arg repo_path "$repo_path" \
+      --arg requested_ref "$ref" \
+      --arg resolved_ref "$resolved_ref" \
+      --arg ref_type "$ref_type" \
+      --arg git_sha "$resolved_sha" \
+      --arg head_sha "$head_sha" \
+      --arg current_branch "$current_branch" \
+      --arg dirty_status "$dirty_status" \
+      --argjson at_head "$at_head" \
+      --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+      '{
+          repo_path: $repo_path,
+          requested_ref: $requested_ref,
+          resolved_ref: $resolved_ref,
+          ref_type: $ref_type,
+          git_sha: $git_sha,
+          head_sha: $head_sha,
+          current_branch: $current_branch,
+          dirty_status: $dirty_status,
+          at_head: $at_head,
+          timestamp: $timestamp
+      }'
 }
 
 # Validate that a repo is ready for release build

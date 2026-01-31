@@ -243,18 +243,25 @@ build_lock_info() {
     local age=$((now - lock_ts))
     local alive=false
     kill -0 "$lock_pid" 2>/dev/null && alive=true
+    local stale=false
+    [[ "$age" -gt "$BUILD_LOCK_STALE_THRESHOLD" ]] && stale=true
 
-    cat << EOF
-{
-  "locked": true,
-  "pid": $lock_pid,
-  "timestamp": $lock_ts,
-  "age_seconds": $age,
-  "run_id": "$lock_run_id",
-  "process_alive": $alive,
-  "stale": $([ "$age" -gt "$BUILD_LOCK_STALE_THRESHOLD" ] && echo true || echo false)
-}
-EOF
+    jq -nc \
+        --argjson pid "$lock_pid" \
+        --argjson timestamp "$lock_ts" \
+        --argjson age_seconds "$age" \
+        --arg run_id "$lock_run_id" \
+        --argjson process_alive "$alive" \
+        --argjson stale "$stale" \
+        '{
+            locked: true,
+            pid: $pid,
+            timestamp: $timestamp,
+            age_seconds: $age_seconds,
+            run_id: $run_id,
+            process_alive: $process_alive,
+            stale: $stale
+        }'
   else
     echo '{"locked": false, "error": "invalid lock file"}'
   fi
@@ -292,18 +299,23 @@ build_state_create() {
     targets_json=$(echo "$targets" | jq -R 'split(",")' 2>/dev/null || echo '[]')
   fi
 
-  cat > "$run_dir/state.json" << EOF
-{
-  "tool": "$tool",
-  "version": "$version",
-  "run_id": "$run_id",
-  "status": "created",
-  "created_at": "$now",
-  "updated_at": "$now",
-  "targets": $targets_json,
-  "hosts": {}
-}
-EOF
+  jq -nc \
+      --arg tool "$tool" \
+      --arg version "$version" \
+      --arg run_id "$run_id" \
+      --arg created_at "$now" \
+      --arg updated_at "$now" \
+      --argjson targets "$targets_json" \
+      '{
+          tool: $tool,
+          version: $version,
+          run_id: $run_id,
+          status: "created",
+          created_at: $created_at,
+          updated_at: $updated_at,
+          targets: $targets,
+          hosts: {}
+      }' > "$run_dir/state.json"
 
   # Create symlink to latest
   ln -sfn "$run_id" "$tool_dir/latest"
