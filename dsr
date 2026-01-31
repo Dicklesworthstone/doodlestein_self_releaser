@@ -58,6 +58,7 @@ source "$SCRIPT_DIR/src/version.sh"
 source "$SCRIPT_DIR/src/act_runner.sh"
 source "$SCRIPT_DIR/src/release_formulas.sh"
 source "$SCRIPT_DIR/src/canary.sh"
+source "$SCRIPT_DIR/src/upgrade_verify.sh"
 
 # Global flags
 JSON_MODE=false
@@ -97,6 +98,7 @@ COMMANDS:
     status      System and last run summary
     version     Detect and tag versions from version files
     canary      Test installers in Docker containers
+    verify      Verification commands (upgrade checks)
 
 GLOBAL OPTIONS:
     -j, --json          Machine-readable JSON output
@@ -4852,6 +4854,149 @@ EOF
 }
 
 # ============================================================================
+# VERIFY SUBCOMMAND - Verification Commands
+# ============================================================================
+
+cmd_verify() {
+    local subcmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        upgrade)
+            _verify_upgrade "$@"
+            ;;
+        --help|-h|help|"")
+            cat << 'EOF'
+dsr verify - Verification commands
+
+USAGE:
+    dsr verify upgrade <tool> [options]
+    dsr verify upgrade --all
+
+SUBCOMMANDS:
+    upgrade     Verify tool upgrade commands work correctly after release
+
+OPTIONS:
+    --build-from-source   Build tool from source before testing
+    --dry-run             Show what would be tested
+    --all                 Verify all tools
+
+DESCRIPTION:
+    After releasing binaries, verify that each tool's `upgrade --check`
+    command correctly finds and downloads the new release assets.
+    Catches asset naming mismatches between code and build configs.
+
+EXAMPLES:
+    dsr verify upgrade ntm                    Verify ntm's upgrade command
+    dsr verify upgrade --all                  Verify all tools
+    dsr verify upgrade ntm --build-from-source  Build and verify
+
+EXIT CODES:
+    0  - All verifications passed
+    1  - Some verifications failed
+    4  - Invalid arguments
+EOF
+            return 0
+            ;;
+        *)
+            log_error "Unknown verify subcommand: $subcmd"
+            log_info "Run 'dsr verify --help' for usage"
+            return 4
+            ;;
+    esac
+}
+
+_verify_upgrade() {
+    local tool_name=""
+    local all_tools=false
+    local build_from_source=false
+    local dry_run_flag=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                all_tools=true
+                shift
+                ;;
+            --build-from-source)
+                build_from_source=true
+                shift
+                ;;
+            --dry-run)
+                dry_run_flag=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                return 4
+                ;;
+            *)
+                tool_name="$1"
+                shift
+                ;;
+        esac
+    done
+
+    local start_time
+    start_time=$(date +%s)
+
+    local args=""
+    $build_from_source && args+=" --build-from-source"
+    $dry_run_flag && args+=" --dry-run"
+
+    if $all_tools; then
+        log_info "Verifying upgrade command for all tools..."
+
+        # shellcheck disable=SC2086
+        if upgrade_verify_all $args; then
+            local duration=$(($(date +%s) - start_time))
+            if $JSON_MODE; then
+                json_envelope "verify-upgrade" "ok" 0 "{\"mode\": \"all\", \"duration_seconds\": $duration}"
+            else
+                log_ok "All upgrade verifications passed"
+            fi
+            return 0
+        else
+            local duration=$(($(date +%s) - start_time))
+            if $JSON_MODE; then
+                json_envelope "verify-upgrade" "failed" 1 "{\"mode\": \"all\", \"duration_seconds\": $duration}"
+            else
+                log_error "Some upgrade verifications failed"
+            fi
+            return 1
+        fi
+    fi
+
+    if [[ -z "$tool_name" ]]; then
+        log_error "Tool name required (or use --all)"
+        return 4
+    fi
+
+    # shellcheck disable=SC2086
+    if upgrade_verify_tool "$tool_name" $args; then
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            local result
+            result=$(upgrade_verify_json "$tool_name" 2>/dev/null || echo '{}')
+            json_envelope "verify-upgrade" "ok" 0 "$(echo "$result" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
+        else
+            log_ok "Upgrade verification passed for $tool_name"
+        fi
+        return 0
+    else
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            local result
+            result=$(upgrade_verify_json "$tool_name" 2>/dev/null || echo '{}')
+            json_envelope "verify-upgrade" "failed" 1 "$(echo "$result" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
+        else
+            log_error "Upgrade verification failed for $tool_name"
+        fi
+        return 1
+    fi
+}
+
+# ============================================================================
 # CANARY SUBCOMMAND - Installer Testing in Docker
 # ============================================================================
 
@@ -5261,6 +5406,9 @@ main() {
             ;;
         canary)
             cmd_canary "$@"
+            ;;
+        verify)
+            cmd_verify "$@"
             ;;
         help)
             show_help
