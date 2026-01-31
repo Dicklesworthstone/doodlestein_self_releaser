@@ -60,6 +60,7 @@ source "$SCRIPT_DIR/src/release_formulas.sh"
 source "$SCRIPT_DIR/src/canary.sh"
 source "$SCRIPT_DIR/src/upgrade_verify.sh"
 source "$SCRIPT_DIR/src/sbom.sh"
+source "$SCRIPT_DIR/src/slsa.sh"
 
 # Global flags
 JSON_MODE=false
@@ -100,6 +101,7 @@ COMMANDS:
     version     Detect and tag versions from version files
     canary      Test installers in Docker containers
     sbom        Generate Software Bill of Materials
+    slsa        Generate SLSA provenance attestation
     verify      Verification commands (upgrade checks)
 
 GLOBAL OPTIONS:
@@ -5439,6 +5441,153 @@ _sbom_verify() {
 }
 
 # ============================================================================
+# SLSA SUBCOMMAND - Supply Chain Provenance
+# ============================================================================
+
+cmd_slsa() {
+    local subcmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        generate)
+            _slsa_generate "$@"
+            ;;
+        verify)
+            _slsa_verify "$@"
+            ;;
+        --help|-h|help|"")
+            cat << 'EOF'
+dsr slsa - SLSA provenance attestation
+
+USAGE:
+    dsr slsa generate <artifact> [options]
+    dsr slsa verify <artifact> [provenance]
+
+SUBCOMMANDS:
+    generate    Generate SLSA v1 provenance for an artifact
+    verify      Verify SLSA provenance matches artifact digest
+
+OPTIONS:
+    --builder, -b <id>  Builder identity URL
+    --output, -o <file> Output file (default: <artifact>.intoto.jsonl)
+
+DESCRIPTION:
+    Generates SLSA v1 provenance (in-toto Statement) for release artifacts.
+    Provides verifiable build provenance for supply chain security.
+
+    The provenance includes:
+    - Artifact name and SHA256 digest
+    - Builder identity
+    - Build timestamps
+    - Git source info (if available)
+
+EXAMPLES:
+    dsr slsa generate ./build/ntm-linux-amd64
+    dsr slsa generate ./build/ntm-darwin-arm64 --builder "https://github.com/Dicklesworthstone/dsr"
+    dsr slsa verify ./build/ntm-linux-amd64
+
+EXIT CODES:
+    0  - Success
+    1  - Verification failed / digest mismatch
+    4  - Invalid arguments
+EOF
+            return 0
+            ;;
+        *)
+            log_error "Unknown slsa subcommand: $subcmd"
+            log_info "Run 'dsr slsa --help' for usage"
+            return 4
+            ;;
+    esac
+}
+
+_slsa_generate() {
+    local artifact=""
+    local builder_id="$SLSA_BUILDER_ID"
+    local output=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --builder|-b) builder_id="$2"; shift 2 ;;
+            --output|-o) output="$2"; shift 2 ;;
+            -*) log_error "Unknown option: $1"; return 4 ;;
+            *) artifact="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$artifact" ]]; then
+        log_error "Artifact path required"
+        return 4
+    fi
+
+    local start_time
+    start_time=$(date +%s)
+
+    local args=""
+    [[ -n "$output" ]] && args+=" --output $output"
+
+    # shellcheck disable=SC2086
+    if result=$(slsa_generate "$artifact" --builder "$builder_id" $args 2>&1); then
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "slsa-generate" "ok" 0 "$(jq -nc \
+                --arg artifact "$artifact" \
+                --arg builder "$builder_id" \
+                --arg output "$result" \
+                --argjson duration "$duration" \
+                '{artifact: $artifact, builder: $builder, output: $output, duration_seconds: $duration}')"
+        else
+            log_ok "SLSA provenance generated: $result"
+        fi
+        return 0
+    else
+        local exit_code=$?
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "slsa-generate" "error" "$exit_code" "$(jq -nc \
+                --arg error "$result" \
+                --argjson duration "$duration" \
+                '{error: $error, duration_seconds: $duration}')"
+        fi
+        return $exit_code
+    fi
+}
+
+_slsa_verify() {
+    local artifact="${1:-}"
+    local provenance="${2:-}"
+
+    if [[ -z "$artifact" ]]; then
+        log_error "Artifact path required"
+        return 4
+    fi
+
+    local start_time
+    start_time=$(date +%s)
+
+    if slsa_verify "$artifact" "$provenance"; then
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "slsa-verify" "ok" 0 "$(jq -nc \
+                --arg artifact "$artifact" \
+                --argjson duration "$duration" \
+                '{artifact: $artifact, valid: true, duration_seconds: $duration}')"
+        fi
+        return 0
+    else
+        local exit_code=$?
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "slsa-verify" "error" "$exit_code" "$(jq -nc \
+                --arg artifact "$artifact" \
+                --argjson duration "$duration" \
+                '{artifact: $artifact, valid: false, duration_seconds: $duration}')"
+        fi
+        return $exit_code
+    fi
+}
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -5564,6 +5713,9 @@ main() {
             ;;
         sbom)
             cmd_sbom "$@"
+            ;;
+        slsa)
+            cmd_slsa "$@"
             ;;
         verify)
             cmd_verify "$@"
