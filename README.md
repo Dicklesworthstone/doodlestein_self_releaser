@@ -1,11 +1,24 @@
 # dsr — Doodlestein Self-Releaser
 
 <div align="center">
+  <img src="dsr_illustration.webp" alt="dsr - Fallback release infrastructure for when GitHub Actions is throttled">
+</div>
+
+<div align="center">
 
 **Fallback release infrastructure for when GitHub Actions is throttled.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash 4.0+](https://img.shields.io/badge/Bash-4.0%2B-green.svg)](https://www.gnu.org/software/bash/)
+
+</div>
+
+<div align="center">
+<h3>Quick Install</h3>
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/doodlestein_self_releaser/main/install.sh?$(date +%s)" | bash
+```
 
 </div>
 
