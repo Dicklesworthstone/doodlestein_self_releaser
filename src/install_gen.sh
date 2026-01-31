@@ -69,7 +69,13 @@ _install_gen_template() {
 #   --cache-dir DIR          Cache directory (default: ~/.cache/dsr/installers)
 #   --offline                Use cached archives only (fail if not cached)
 #   --prefer-gh              Prefer gh release download for private repos
+#   --no-skills              Skip AI coding agent skill installation
 #   --help                   Show this help
+#
+# AI Coding Agent Skills:
+#   The installer automatically installs skills for Claude Code and Codex CLI.
+#   Skills teach AI agents about the tool's commands, workflows, and best practices.
+#   Use --no-skills to skip skill installation.
 #
 # Safety:
 #   - Never overwrites without asking (unless --yes)
@@ -105,6 +111,7 @@ _OFFLINE_ARCHIVE=""
 _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dsr/installers"
 _OFFLINE_MODE=false
 _PREFER_GH=false
+_SKIP_SKILLS=false
 
 # Colors (disable if NO_COLOR set or not a terminal)
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
@@ -506,6 +513,119 @@ _install_binary() {
     return 0
 }
 
+# ============================================================================
+# SKILL INSTALLATION
+# ============================================================================
+
+# Skill content is embedded at generation time (base64 encoded to avoid escaping issues)
+# If this placeholder was not replaced, skill installation is skipped
+_SKILL_CONTENT_B64='__SKILL_CONTENT_B64__'
+
+# Decode skill content at runtime
+_decode_skill_content() {
+    # Skip if placeholder wasn't replaced (check for literal __ prefix)
+    if [[ "$_SKILL_CONTENT_B64" == _* ]]; then
+        return 1
+    fi
+    if [[ -n "$_SKILL_CONTENT_B64" ]] && command -v base64 &>/dev/null; then
+        # macOS uses -D, Linux uses -d
+        base64 -d 2>/dev/null <<< "$_SKILL_CONTENT_B64" || base64 -D 2>/dev/null <<< "$_SKILL_CONTENT_B64"
+    fi
+}
+
+# Install skill for Claude Code
+_install_claude_skill() {
+    local skill_dir="${HOME}/.claude/skills/${TOOL_NAME}"
+
+    # Check if Claude Code is installed
+    if [[ ! -d "${HOME}/.claude" ]] && ! command -v claude &>/dev/null; then
+        return 0  # Claude Code not installed, skip silently
+    fi
+
+    _log_info "Installing Claude Code skill..."
+
+    # Create skill directory
+    mkdir -p "$skill_dir"
+
+    # Write skill file from decoded base64 content
+    local skill_content
+    skill_content=$(_decode_skill_content)
+    if [[ -n "$skill_content" ]]; then
+        printf '%s\n' "$skill_content" > "$skill_dir/SKILL.md"
+        _log_ok "Claude Code skill installed: $skill_dir/SKILL.md"
+        return 0
+    else
+        _log_warn "Skill content not embedded, skipping Claude Code skill"
+        return 0
+    fi
+}
+
+# Install skill for Codex CLI
+_install_codex_skill() {
+    local skill_dir="${HOME}/.codex/skills/${TOOL_NAME}"
+
+    # Check if Codex CLI is installed
+    if [[ ! -d "${HOME}/.codex" ]] && ! command -v codex &>/dev/null; then
+        return 0  # Codex CLI not installed, skip silently
+    fi
+
+    _log_info "Installing Codex CLI skill..."
+
+    # Create skill directory
+    mkdir -p "$skill_dir"
+
+    # Write skill file from decoded base64 content
+    local skill_content
+    skill_content=$(_decode_skill_content)
+    if [[ -n "$skill_content" ]]; then
+        printf '%s\n' "$skill_content" > "$skill_dir/SKILL.md"
+        _log_ok "Codex CLI skill installed: $skill_dir/SKILL.md"
+        return 0
+    else
+        _log_warn "Skill content not embedded, skipping Codex CLI skill"
+        return 0
+    fi
+}
+
+# Install skills for all detected AI coding agents
+_install_skills() {
+    if $_SKIP_SKILLS; then
+        _log_info "Skipping skill installation (--no-skills)"
+        return 0
+    fi
+
+    local installed_any=false
+
+    echo "" >&2
+    _log_info "Installing AI coding agent skills..."
+    _log_info ""
+    _log_info "Skills teach AI agents (Claude Code, Codex CLI) about ${TOOL_NAME}'s"
+    _log_info "commands, workflows, and best practices. When you invoke /${TOOL_NAME} in"
+    _log_info "a conversation, the agent gains specialized knowledge about the tool."
+    _log_info ""
+
+    # Try Claude Code
+    if _install_claude_skill; then
+        installed_any=true
+    fi
+
+    # Try Codex CLI
+    if _install_codex_skill; then
+        installed_any=true
+    fi
+
+    if $installed_any; then
+        echo "" >&2
+        _log_info "How to use the ${TOOL_NAME} skill:"
+        _log_info "  1. Start a conversation with Claude Code or Codex CLI"
+        _log_info "  2. Type /${TOOL_NAME} to invoke the skill"
+        _log_info "  3. The agent will have full knowledge of ${TOOL_NAME} commands"
+        echo "" >&2
+    fi
+
+    return 0
+}
+
 # Main installation function
 main() {
     # Parse arguments
@@ -557,6 +677,10 @@ main() {
                 ;;
             --prefer-gh)
                 _PREFER_GH=true
+                shift
+                ;;
+            --no-skills)
+                _SKIP_SKILLS=true
                 shift
                 ;;
             --help|-h)
@@ -684,6 +808,9 @@ main() {
     # Install
     _install_binary "$binary_path" "$_INSTALL_DIR" || return $?
 
+    # Install AI coding agent skills
+    _install_skills
+
     # Verify installation
     local installed_path="$_INSTALL_DIR/$BINARY_NAME"
     if [[ -f "$installed_path" ]]; then
@@ -809,6 +936,28 @@ install_gen_create() {
         fi
     fi
 
+    # Get skill content (look in multiple locations)
+    local skill_content=""
+    local skill_paths=(
+        "./SKILL.md"
+        "./config/skills/${tool_name}/SKILL.md"
+    )
+    local local_path
+    local_path=$(_install_gen_yaml_get "$config_file" "local_path" "")
+    if [[ -n "$local_path" && -f "$local_path/SKILL.md" ]]; then
+        skill_paths=("$local_path/SKILL.md" "${skill_paths[@]}")
+    fi
+    for skill_path in "${skill_paths[@]}"; do
+        if [[ -f "$skill_path" ]]; then
+            skill_content=$(cat "$skill_path")
+            log_info "  Skill: $skill_path"
+            break
+        fi
+    done
+    if [[ -z "$skill_content" ]]; then
+        log_info "  Skill: (none found, skills will be skipped)"
+    fi
+
     if [[ -z "$repo" ]]; then
         log_error "No repo defined in config"
         return 4
@@ -845,6 +994,14 @@ install_gen_create() {
     template="${template//__ARCHIVE_FORMAT_WINDOWS__/$archive_windows}"
     template="${template//__ARTIFACT_NAMING__/$artifact_naming}"
     template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
+
+    # Handle skill content - use base64 encoding to avoid escaping issues
+    if [[ -n "$skill_content" ]]; then
+        local skill_b64
+        # Encode skill content as base64 (works on both Linux and macOS)
+        skill_b64=$(printf '%s' "$skill_content" | base64 | tr -d '\n')
+        template="${template//__SKILL_CONTENT_B64__/$skill_b64}"
+    fi
 
     echo "$template" > "$output_file"
     chmod +x "$output_file"
