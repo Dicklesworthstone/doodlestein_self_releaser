@@ -59,6 +59,7 @@ source "$SCRIPT_DIR/src/act_runner.sh"
 source "$SCRIPT_DIR/src/release_formulas.sh"
 source "$SCRIPT_DIR/src/canary.sh"
 source "$SCRIPT_DIR/src/upgrade_verify.sh"
+source "$SCRIPT_DIR/src/sbom.sh"
 
 # Global flags
 JSON_MODE=false
@@ -98,6 +99,7 @@ COMMANDS:
     status      System and last run summary
     version     Detect and tag versions from version files
     canary      Test installers in Docker containers
+    sbom        Generate Software Bill of Materials
     verify      Verification commands (upgrade checks)
 
 GLOBAL OPTIONS:
@@ -5304,6 +5306,139 @@ _canary_results() {
 }
 
 # ============================================================================
+# SBOM SUBCOMMAND - Software Bill of Materials
+# ============================================================================
+
+cmd_sbom() {
+    local subcmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        generate)
+            _sbom_generate "$@"
+            ;;
+        verify)
+            _sbom_verify "$@"
+            ;;
+        --help|-h|help|"")
+            cat << 'EOF'
+dsr sbom - Software Bill of Materials (SBOM) generation
+
+USAGE:
+    dsr sbom generate <path> [options]
+    dsr sbom verify <sbom-file>
+
+SUBCOMMANDS:
+    generate    Generate SBOM for a project or artifact
+    verify      Verify an SBOM file is valid
+
+OPTIONS:
+    --format, -f <fmt>  Output format: spdx (default) or cyclonedx
+    --output, -o <file> Output file (default: auto-generated)
+
+DESCRIPTION:
+    Generates Software Bill of Materials using syft for supply chain
+    transparency. SBOMs can be attached to releases for compliance.
+
+REQUIREMENTS:
+    - syft must be installed: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s
+
+EXAMPLES:
+    dsr sbom generate /path/to/project          # Generate SPDX SBOM
+    dsr sbom generate /path/to/binary --format cyclonedx
+    dsr sbom verify sbom.spdx.json              # Verify SBOM format
+
+EXIT CODES:
+    0  - Success
+    1  - Error generating/verifying SBOM
+    3  - syft not installed
+    4  - Invalid arguments
+EOF
+            return 0
+            ;;
+        *)
+            log_error "Unknown sbom subcommand: $subcmd"
+            log_info "Run 'dsr sbom --help' for usage"
+            return 4
+            ;;
+    esac
+}
+
+_sbom_generate() {
+    local target=""
+    local format="spdx"
+    local output=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --format|-f) format="$2"; shift 2 ;;
+            --output|-o) output="$2"; shift 2 ;;
+            -*) log_error "Unknown option: $1"; return 4 ;;
+            *) target="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$target" ]]; then
+        log_error "Target path required"
+        return 4
+    fi
+
+    local start_time
+    start_time=$(date +%s)
+
+    local args=""
+    [[ -n "$output" ]] && args+=" --output $output"
+
+    # shellcheck disable=SC2086
+    if result=$(sbom_generate "$target" --format "$format" $args 2>&1); then
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "sbom-generate" "ok" 0 "$(jq -nc \
+                --arg target "$target" \
+                --arg format "$format" \
+                --arg output "$result" \
+                --argjson duration "$duration" \
+                '{target: $target, format: $format, output: $output, duration_seconds: $duration}')"
+        else
+            log_ok "SBOM generated: $result"
+        fi
+        return 0
+    else
+        local exit_code=$?
+        local duration=$(($(date +%s) - start_time))
+        if $JSON_MODE; then
+            json_envelope "sbom-generate" "error" "$exit_code" "$(jq -nc \
+                --arg error "$result" \
+                --argjson duration "$duration" \
+                '{error: $error, duration_seconds: $duration}')"
+        fi
+        return $exit_code
+    fi
+}
+
+_sbom_verify() {
+    local sbom_file="${1:-}"
+
+    if [[ -z "$sbom_file" ]]; then
+        log_error "SBOM file required"
+        return 4
+    fi
+
+    if sbom_verify "$sbom_file"; then
+        if $JSON_MODE; then
+            json_envelope "sbom-verify" "ok" 0 "$(jq -nc --arg file "$sbom_file" '{file: $file, valid: true}')"
+        fi
+        return 0
+    else
+        local exit_code=$?
+        if $JSON_MODE; then
+            json_envelope "sbom-verify" "error" "$exit_code" "$(jq -nc --arg file "$sbom_file" '{file: $file, valid: false}')"
+        fi
+        return $exit_code
+    fi
+}
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -5426,6 +5561,9 @@ main() {
             ;;
         canary)
             cmd_canary "$@"
+            ;;
+        sbom)
+            cmd_sbom "$@"
             ;;
         verify)
             cmd_verify "$@"
