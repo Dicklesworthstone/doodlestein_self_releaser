@@ -43,12 +43,12 @@ fi
 # ============================================================================
 
 seed_health_fixtures() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
-    mkdir -p "$XDG_STATE_HOME/dsr"
-    mkdir -p "$XDG_CACHE_HOME/dsr"
+    mkdir -p "$DSR_CONFIG_DIR"
+    mkdir -p "$DSR_STATE_DIR"
+    mkdir -p "$DSR_CACHE_DIR"
 
     # Create hosts.yaml with local host definition
-    cat > "$XDG_CONFIG_HOME/dsr/hosts.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/hosts.yaml" << 'YAML'
 schema_version: "1.0.0"
 
 hosts:
@@ -63,7 +63,7 @@ hosts:
 YAML
 
     # Create minimal config.yaml
-    cat > "$XDG_CONFIG_HOME/dsr/config.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/config.yaml" << 'YAML'
 schema_version: "1.0.0"
 threshold_seconds: 600
 log_level: info
@@ -71,12 +71,12 @@ YAML
 }
 
 seed_multi_host_fixtures() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
-    mkdir -p "$XDG_STATE_HOME/dsr"
-    mkdir -p "$XDG_CACHE_HOME/dsr"
+    mkdir -p "$DSR_CONFIG_DIR"
+    mkdir -p "$DSR_STATE_DIR"
+    mkdir -p "$DSR_CACHE_DIR"
 
     # Create hosts.yaml with multiple hosts (local + fake SSH)
-    cat > "$XDG_CONFIG_HOME/dsr/hosts.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/hosts.yaml" << 'YAML'
 schema_version: "1.0.0"
 
 hosts:
@@ -100,7 +100,7 @@ hosts:
     description: "Fake SSH host for testing failures"
 YAML
 
-    cat > "$XDG_CONFIG_HOME/dsr/config.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/config.yaml" << 'YAML'
 schema_version: "1.0.0"
 threshold_seconds: 600
 log_level: info
@@ -419,7 +419,7 @@ test_health_check_cache_created() {
     exec_run "$DSR_CMD" health check local-test
 
     # Check if cache file was created
-    if [[ -d "$XDG_CACHE_HOME/dsr/health" ]] || [[ -d "$XDG_STATE_HOME/dsr/health" ]]; then
+    if [[ -d "$DSR_CACHE_DIR/health" ]] || [[ -d "$DSR_STATE_DIR/health" ]]; then
         pass "health check creates cache"
     else
         # Cache might be stored differently - just pass if the check succeeded

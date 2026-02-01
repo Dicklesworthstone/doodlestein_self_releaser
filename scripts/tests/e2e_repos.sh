@@ -43,10 +43,10 @@ fi
 # ============================================================================
 
 seed_repos_fixtures() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
+    mkdir -p "$DSR_CONFIG_DIR"
 
     # Create repos.yaml with test tools
-    cat > "$XDG_CONFIG_HOME/dsr/repos.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'YAML'
 schema_version: "1.0.0"
 
 tools:
@@ -73,16 +73,16 @@ YAML
 }
 
 seed_empty_repos() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
-    cat > "$XDG_CONFIG_HOME/dsr/repos.yaml" << 'YAML'
+    mkdir -p "$DSR_CONFIG_DIR"
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'YAML'
 schema_version: "1.0.0"
 tools: {}
 YAML
 }
 
 seed_malformed_repos() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
-    cat > "$XDG_CONFIG_HOME/dsr/repos.yaml" << 'YAML'
+    mkdir -p "$DSR_CONFIG_DIR"
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'YAML'
 schema_version: "1.0.0"
 tools:
   bad-tool:

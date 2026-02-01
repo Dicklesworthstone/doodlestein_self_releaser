@@ -106,8 +106,8 @@ test_signing_init_creates_private_key() {
 
     exec_run "$DSR_CMD" signing init --no-password
 
-    # dsr uses XDG_CONFIG_HOME/dsr for config, not DSR_CONFIG_DIR directly
-    local priv_key="$XDG_CONFIG_HOME/dsr/secrets/minisign.key"
+    # dsr uses DSR_CONFIG_DIR (which defaults to XDG_CONFIG_HOME/dsr when not set)
+    local priv_key="$DSR_CONFIG_DIR/secrets/minisign.key"
     if [[ -f "$priv_key" ]]; then
         pass "signing init creates private key"
     else
@@ -124,8 +124,8 @@ test_signing_init_creates_public_key() {
 
     exec_run "$DSR_CMD" signing init --no-password
 
-    # dsr uses XDG_CONFIG_HOME/dsr for config
-    local pub_key="$XDG_CONFIG_HOME/dsr/minisign.pub"
+    # dsr uses DSR_CONFIG_DIR (which defaults to XDG_CONFIG_HOME/dsr when not set)
+    local pub_key="$DSR_CONFIG_DIR/minisign.pub"
     if [[ -f "$pub_key" ]]; then
         pass "signing init creates public key"
     else
@@ -141,8 +141,8 @@ test_signing_init_private_key_permissions() {
 
     exec_run "$DSR_CMD" signing init --no-password
 
-    # dsr uses XDG_CONFIG_HOME/dsr for config
-    local priv_key="$XDG_CONFIG_HOME/dsr/secrets/minisign.key"
+    # dsr uses DSR_CONFIG_DIR (which defaults to XDG_CONFIG_HOME/dsr when not set)
+    local priv_key="$DSR_CONFIG_DIR/secrets/minisign.key"
     local perms
     perms=$(stat -c '%a' "$priv_key" 2>/dev/null || stat -f '%Lp' "$priv_key" 2>/dev/null || echo "")
 
@@ -360,8 +360,8 @@ test_signing_fix_restores_permissions() {
 
     "$DSR_CMD" signing init --no-password >/dev/null 2>&1
 
-    # dsr uses XDG_CONFIG_HOME/dsr for config
-    local priv_key="$XDG_CONFIG_HOME/dsr/secrets/minisign.key"
+    # dsr uses DSR_CONFIG_DIR (which defaults to XDG_CONFIG_HOME/dsr when not set)
+    local priv_key="$DSR_CONFIG_DIR/secrets/minisign.key"
     # Mess up permissions
     chmod 644 "$priv_key"
 

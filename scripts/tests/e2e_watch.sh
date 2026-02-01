@@ -177,7 +177,7 @@ test_watch_creates_state_dir() {
     exec_run timeout 30 "$DSR_CMD" watch --once --dry-run
 
     # State directory should be created even on preflight failure
-    if [[ -d "$XDG_STATE_HOME/dsr" ]]; then
+    if [[ -d "$DSR_STATE_DIR" ]]; then
         pass "watch creates state directory"
     else
         fail "watch should create state directory"

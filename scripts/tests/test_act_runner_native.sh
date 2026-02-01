@@ -446,8 +446,8 @@ test_scp_windows_exe_extension() {
     fi
 }
 
-test_scp_windows_backslash_path() {
-    log_test "SCP Windows: backslash paths"
+test_scp_windows_forward_slash_path() {
+    log_test "SCP Windows: forward slashes (OpenSSH SCP convention)"
     reset_state
     MOCK_LANGUAGE="go"
     MOCK_BINARY_NAME="mytool"
@@ -458,11 +458,11 @@ test_scp_windows_backslash_path() {
     local scp_args
     scp_args=$(get_scp_args)
 
-    # Windows SCP path should have backslashes
-    if [[ "$scp_args" == *'\'* ]]; then
-        log_pass "Windows SCP path has backslashes"
+    # OpenSSH SCP uses forward slashes even on Windows (see act_runner.sh line 1144)
+    if [[ "$scp_args" == *"/c/Users/jeffr/projects/mytool/mytool.exe"* ]]; then
+        log_pass "Windows SCP path uses forward slashes (OpenSSH convention)"
     else
-        log_fail "Expected backslashes in Windows path: $scp_args"
+        log_fail "Expected forward-slash path in SCP args: $scp_args"
     fi
 }
 
@@ -767,7 +767,7 @@ main() {
     test_scp_unix_artifact_path
     test_scp_rust_artifact_path
     test_scp_windows_exe_extension
-    test_scp_windows_backslash_path
+    test_scp_windows_forward_slash_path
 
     # Host detection
     test_host_detection_darwin

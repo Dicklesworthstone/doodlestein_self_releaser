@@ -50,9 +50,9 @@ fi
 # ============================================================================
 
 seed_repos_config() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
+    mkdir -p "$DSR_CONFIG_DIR"
 
-    cat > "$XDG_CONFIG_HOME/dsr/config.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/config.yaml" << 'YAML'
 schema_version: "1.0.0"
 threshold_seconds: 600
 log_level: info
@@ -61,7 +61,7 @@ signing:
 YAML
 
     # Create repos.yaml with test tool
-    cat > "$XDG_CONFIG_HOME/dsr/repos.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'YAML'
 schema_version: "1.0.0"
 
 tools:
@@ -80,7 +80,7 @@ YAML
 seed_artifacts() {
     local tool="${1:-test-tool}"
     local version="${2:-v1.0.0}"
-    local state_dir="$XDG_STATE_HOME/dsr"
+    local state_dir="$DSR_STATE_DIR"
     local artifacts_dir="$state_dir/artifacts/$tool/$version"
 
     mkdir -p "$artifacts_dir"
@@ -324,15 +324,13 @@ test_release_missing_artifacts_dir() {
     local status
     status=$(exec_status)
 
-    # Should fail with missing artifacts (exit 4) or tool not found
-    if [[ "$status" -eq 4 ]]; then
-        if exec_stderr_contains "Artifacts" || exec_stderr_contains "not found"; then
-            pass "release fails with missing artifacts dir (exit: 4)"
-        else
-            pass "release fails at validation stage (exit: 4)"
-        fi
+    # Should fail - either exit 3 (gh auth missing) or exit 4 (missing artifacts/tool)
+    # The gh auth check happens before artifact validation, so exit 3 is expected
+    # when gh isn't authenticated in the test environment
+    if [[ "$status" -eq 3 || "$status" -eq 4 ]]; then
+        pass "release fails before upload (exit: $status)"
     else
-        fail "release should fail with exit 4 for missing artifacts (got: $status)"
+        fail "release should fail with exit 3 or 4 (got: $status)"
         echo "stderr: $(exec_stderr | head -5)"
     fi
 

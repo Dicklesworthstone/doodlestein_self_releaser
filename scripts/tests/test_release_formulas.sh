@@ -49,10 +49,10 @@ fi
 # ============================================================================
 
 seed_formulas_config() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
-    mkdir -p "$XDG_CONFIG_HOME/dsr/repos.d"
+    mkdir -p "$DSR_CONFIG_DIR"
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
 
-    cat > "$XDG_CONFIG_HOME/dsr/config.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/config.yaml" << 'YAML'
 schema_version: "1.0.0"
 threshold_seconds: 600
 log_level: info
@@ -64,7 +64,7 @@ signing:
 YAML
 
     # Create a test tool config
-    cat > "$XDG_CONFIG_HOME/dsr/repos.d/test-tool.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" << 'YAML'
 name: test-tool
 repo: testuser/test-tool
 language: go

@@ -261,7 +261,7 @@ test_status_empty_state_no_error() {
     harness_setup
 
     # Clear state directory completely
-    rm -rf "$XDG_STATE_HOME/dsr"/* 2>/dev/null || true
+    rm -rf "${DSR_STATE_DIR:?}"/* 2>/dev/null || true
 
     exec_run "$DSR_CMD" status
     local status
@@ -281,7 +281,7 @@ test_status_empty_state_json_valid() {
     ((TESTS_RUN++))
     harness_setup
 
-    rm -rf "$XDG_STATE_HOME/dsr"/* 2>/dev/null || true
+    rm -rf "${DSR_STATE_DIR:?}"/* 2>/dev/null || true
 
     exec_run "$DSR_CMD" --json status
     local output

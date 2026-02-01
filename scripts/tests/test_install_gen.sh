@@ -30,8 +30,10 @@ setup() {
     TEMP_DIR=$(mktemp -d)
     export XDG_CONFIG_HOME="$TEMP_DIR/config"
     export XDG_CACHE_HOME="$TEMP_DIR/cache"
-    mkdir -p "$XDG_CONFIG_HOME/dsr/repos.d"
-    mkdir -p "$XDG_CACHE_HOME/dsr/installers"
+    export DSR_CONFIG_DIR="$TEMP_DIR/config/dsr"
+    export DSR_CACHE_DIR="$TEMP_DIR/cache/dsr"
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    mkdir -p "$DSR_CACHE_DIR/installers"
 }
 
 teardown() {

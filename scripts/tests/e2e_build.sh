@@ -54,10 +54,10 @@ fi
 # ============================================================================
 
 seed_build_fixtures() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr/repos.d"
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
 
     # Create per-tool config file (required by dsr build)
-    cat > "$XDG_CONFIG_HOME/dsr/repos.d/test-build-tool.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/repos.d/test-build-tool.yaml" << 'YAML'
 tool_name: test-build-tool
 repo: testuser/test-build-tool
 local_path: /tmp/test-build-tool
@@ -70,7 +70,7 @@ workflow: .github/workflows/release.yml
 YAML
 
     # Also create repos.yaml for other commands that use it
-    cat > "$XDG_CONFIG_HOME/dsr/repos.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'YAML'
 schema_version: "1.0.0"
 
 tools:
@@ -101,6 +101,9 @@ jobs:
       - name: Build
         run: echo "test build"
 WORKFLOW
+
+    # Create a version file so dsr can auto-detect version
+    echo "0.1.0" > /tmp/test-build-tool/VERSION
 
     # Create a minimal go.mod and main.go
     mkdir -p /tmp/test-build-tool/cmd/test-build-tool

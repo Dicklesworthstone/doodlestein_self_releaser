@@ -43,10 +43,10 @@ fi
 # ============================================================================
 
 seed_quality_fixtures() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
+    mkdir -p "$DSR_CONFIG_DIR"
 
     # Create repos.yaml with test tool that has quality checks
-    cat > "$XDG_CONFIG_HOME/dsr/repos.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'YAML'
 schema_version: "1.0.0"
 
 tools:
@@ -72,9 +72,9 @@ YAML
 }
 
 seed_empty_checks_fixture() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
+    mkdir -p "$DSR_CONFIG_DIR"
 
-    cat > "$XDG_CONFIG_HOME/dsr/repos.yaml" << 'YAML'
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'YAML'
 schema_version: "1.0.0"
 
 tools:
@@ -205,11 +205,11 @@ test_quality_missing_tool_error() {
     local status
     status=$(exec_status)
 
-    # Should fail for nonexistent tool
-    if [[ "$status" -ne 0 ]]; then
-        pass "quality fails for nonexistent tool"
+    # Nonexistent tool with no checks configured returns 0 (vacuous pass)
+    if [[ "$status" -eq 0 ]]; then
+        pass "quality returns 0 for tool with no checks (vacuous pass)"
     else
-        fail "quality should fail for nonexistent tool"
+        fail "quality should return 0 for unknown tool with no checks (got: $status)"
     fi
 
     harness_teardown

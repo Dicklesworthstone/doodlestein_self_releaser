@@ -40,8 +40,8 @@ seed_state_fixtures() {
 
     # Note: dsr uses XDG_STATE_HOME/dsr not DSR_STATE_DIR in some code paths
     # So we create fixtures in both locations to be safe
-    local state_dir="$XDG_STATE_HOME/dsr"
-    local cache_dir="$XDG_CACHE_HOME/dsr"
+    local state_dir="$DSR_STATE_DIR"
+    local cache_dir="$DSR_CACHE_DIR"
 
     # Also export DSR_STATE_DIR to match (for prune to use)
     export DSR_STATE_DIR="$state_dir"
@@ -98,8 +98,8 @@ seed_state_fixtures() {
 }
 
 seed_minimal_config() {
-    mkdir -p "$XDG_CONFIG_HOME/dsr"
-    cat > "$XDG_CONFIG_HOME/dsr/config.yaml" << 'YAML'
+    mkdir -p "$DSR_CONFIG_DIR"
+    cat > "$DSR_CONFIG_DIR/config.yaml" << 'YAML'
 schema_version: "1.0.0"
 threshold_seconds: 600
 log_level: info
@@ -154,7 +154,7 @@ test_prune_dry_run_no_delete() {
     seed_minimal_config
     seed_state_fixtures 45
 
-    local state_dir="$XDG_STATE_HOME/dsr"
+    local state_dir="$DSR_STATE_DIR"
 
     # Count user-created fixture files before (exclude logs subdir which dsr may write to)
     local fixtures_before
@@ -285,7 +285,7 @@ test_prune_removes_old_logs() {
     seed_minimal_config
     seed_state_fixtures 45
 
-    local state_dir="$XDG_STATE_HOME/dsr"
+    local state_dir="$DSR_STATE_DIR"
 
     # Verify old logs exist
     if [[ ! -d "$state_dir/logs/2025-12-01" ]]; then
@@ -321,7 +321,7 @@ test_prune_respects_keep_last() {
     seed_minimal_config
     seed_state_fixtures 45
 
-    local state_dir="$XDG_STATE_HOME/dsr"
+    local state_dir="$DSR_STATE_DIR"
 
     # We have 6 runs, keep_last=5 should remove 1 old one
     exec_run "$DSR_CMD" prune --max-age 30 --keep-last 5 --force

@@ -81,7 +81,7 @@ YAML
 seed_manifest() {
     local tool="${1:-test-tool}"
     local version="${2:-v1.0.0}"
-    local state_dir="$XDG_STATE_HOME/dsr"
+    local state_dir="$DSR_STATE_DIR"
     local artifacts_dir="$state_dir/artifacts/$tool/$version"
 
     mkdir -p "$artifacts_dir"
@@ -757,7 +757,7 @@ test_verify_fix_reports_not_found_locally() {
     seed_repos_config
 
     # Create manifest but NO local artifacts
-    local state_dir="$XDG_STATE_HOME/dsr"
+    local state_dir="$DSR_STATE_DIR"
     local artifacts_dir="$state_dir/artifacts/test-tool/v1.0.0"
     mkdir -p "$artifacts_dir"
 
