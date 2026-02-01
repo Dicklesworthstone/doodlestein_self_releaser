@@ -50,7 +50,8 @@ act_check() {
     if [[ -f "$actrc_file" ]]; then
         local has_bind=false has_user=false
         # Use 'command grep' to bypass any aliases (e.g., rg aliased as grep)
-        if command grep -qE '^--bind$|^--bind[[:space:]]' "$actrc_file" 2>/dev/null; then
+        # Pattern handles optional leading whitespace: "  --bind" or "--bind"
+        if command grep -qE '^[[:space:]]*--bind([[:space:]]|$)' "$actrc_file" 2>/dev/null; then
             has_bind=true
         fi
         if command grep -qE -- '--container-options.*--user|--container-options=.*--user' "$actrc_file" 2>/dev/null; then
