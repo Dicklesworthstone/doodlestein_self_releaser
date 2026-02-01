@@ -595,8 +595,8 @@ EOF
             log_error "  actrc: CRITICAL - --bind without --user flag"
             log_error "         Files created by act will have wrong ownership (UID 1001)"
             log_error "         This WILL break file access for other processes!"
-            fixes+=("Fix actrc: Add to ~/.actrc: --container-options --user=\$(id -u):\$(id -g)")
-            fixes+=("Or run: echo '--container-options --user=$(id -u):$(id -g)' >> ~/.actrc")
+            fixes+=("Fix actrc: Run 'id' to get your UID:GID, then add to ~/.actrc: --container-options --user=UID:GID")
+            fixes+=("Quick fix: echo '--container-options --user=$(id -u):$(id -g)' >> ~/.actrc")
             ((errors++))
         elif $has_bind && $has_user; then
             _add_check "actrc" "ok" ", \"file\": \"$actrc_file\", \"bind\": true, \"user_mapping\": true"

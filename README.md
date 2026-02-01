@@ -146,9 +146,9 @@ For local builds:
 > cp config/actrc.example ~/.actrc
 > ```
 >
-> Or ensure your `~/.actrc` includes:
+> Or add this line to your `~/.actrc` (replace 1000:1000 with your UID:GID from `id`):
 > ```
-> --container-options --user=$(id -u):$(id -g)
+> --container-options --user=1000:1000
 > ```
 >
 > Run `dsr doctor` to verify your configuration.
