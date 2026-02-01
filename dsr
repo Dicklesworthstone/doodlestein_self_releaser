@@ -1465,6 +1465,8 @@ cmd_build() {
     # shellcheck disable=SC2034  # resume reserved for future resume support
     local resume=false
     local allow_dirty=false
+    local no_sync=false
+    local sync_only=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -1505,6 +1507,14 @@ cmd_build() {
                 allow_dirty=true
                 shift
                 ;;
+            --no-sync)
+                no_sync=true
+                shift
+                ;;
+            --sync-only)
+                sync_only=true
+                shift
+                ;;
             --help|-h)
                 cat << 'EOF'
 dsr build - Build artifacts locally
@@ -1522,10 +1532,16 @@ OPTIONS:
     -p, --parallel         Build targets in parallel
     -r, --resume           Resume interrupted build
     --allow-dirty          Allow building with uncommitted changes
+    --no-sync              Skip source sync to remote hosts
+    --sync-only            Sync source to remote hosts without building
 
 DESCRIPTION:
     Builds a tool for all configured targets using act (Linux) and
     SSH to remote hosts (macOS/Windows).
+
+    Before building on remote hosts (macOS/Windows), source code is
+    automatically synced via rsync. Use --no-sync to skip this step
+    if you manage sync separately, or --sync-only to sync without building.
 
 TARGETS:
     Configured per tool in ~/.config/dsr/repos.d/<tool>.yaml
@@ -1537,6 +1553,8 @@ EXAMPLES:
     dsr build ntm --version 1.2.3           Build specific version
     dsr build ntm --parallel                Build all targets in parallel
     dsr build --tool bv --resume            Resume interrupted bv build
+    dsr build ntm --sync-only               Sync source without building
+    dsr build ntm --no-sync                 Build without syncing source
 
 EXIT CODES:
     0  - All builds succeeded
@@ -1647,6 +1665,42 @@ EOF
 
     log_info "Targets: $target_list"
 
+    # Sync source to remote hosts (unless --no-sync)
+    if ! $no_sync; then
+        log_info "Syncing source to remote build hosts..."
+        local sync_output sync_status
+        # shellcheck disable=SC2086
+        sync_output=$(act_sync_sources "$tool_name" $target_list 2>&1)
+        sync_status=$(echo "$sync_output" | grep '^{' | tail -1 | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+        if [[ "$sync_status" == "success" || "$sync_status" == "skipped" ]]; then
+            local synced
+            synced=$(echo "$sync_output" | grep '^{' | tail -1 | jq -r '.synced // 0' 2>/dev/null || echo 0)
+            if [[ "$synced" -gt 0 ]]; then
+                log_ok "Source synced to $synced host(s)"
+            fi
+        elif [[ "$sync_status" == "partial" ]]; then
+            log_warn "Some hosts failed to sync - builds may fail"
+        else
+            log_error "Source sync failed"
+            if $JSON_MODE; then
+                json_envelope "build" "failed" 1 '{"error":"Source sync failed"}'
+            fi
+            return 1
+        fi
+
+        # If --sync-only, we're done
+        if $sync_only; then
+            log_ok "Sync completed (--sync-only mode)"
+            if $JSON_MODE; then
+                local sync_json
+                sync_json=$(echo "$sync_output" | grep '^{' | tail -1)
+                json_envelope "build" "success" 0 "$sync_json"
+            fi
+            return 0
+        fi
+    fi
+
     # Record start time
     local start_time
     start_time=$(date +%s)
@@ -1657,15 +1711,33 @@ EOF
     full_output=$(act_orchestrate_build "$tool_name" "$version" $target_list 2>&1)
 
     # Extract JSON from mixed output (orchestrator logs + JSON at end)
-    # The orchestrator outputs compact JSON on a single line starting with {
-    # Find the last line that starts with { and is valid JSON
-    local result
+    # The orchestrator outputs JSON containing a summary object
+    # We look for lines containing "summary" that are valid JSON
+    local result=""
+
+    # Try multiple patterns to find the JSON output
+    # First: lines starting with { (standard jq output)
     result=$(echo "$full_output" | grep '^{' | tail -1)
 
-    # Validate it's actually JSON
-    if ! echo "$result" | jq -e '.' &>/dev/null; then
-        log_warn "Could not parse orchestrator JSON output"
-        result='{}'
+    # Validate it's actually JSON with expected structure
+    if ! echo "$result" | jq -e '.summary' &>/dev/null 2>&1; then
+        # Second: try finding any JSON object with summary field
+        result=$(echo "$full_output" | grep -o '{[^}]*"summary"[^}]*}' | tail -1)
+
+        if ! echo "$result" | jq -e '.summary' &>/dev/null 2>&1; then
+            # Third: look for multiline JSON (lines between { and })
+            result=$(echo "$full_output" | awk '/^{$/,/^}$/' | tr -d '\n')
+
+            if ! echo "$result" | jq -e '.summary' &>/dev/null 2>&1; then
+                log_warn "Could not parse orchestrator JSON output"
+                # In verbose mode, show what we got
+                if $VERBOSE; then
+                    log_debug "Full output was:"
+                    echo "$full_output" | head -50 >&2
+                fi
+                result='{}'
+            fi
+        fi
     fi
 
     # Parse result
@@ -1683,6 +1755,11 @@ EOF
     [[ -z "$total" || "$total" == "null" ]] && total=0
     [[ -z "$success" || "$success" == "null" ]] && success=0
     [[ -z "$failed" || "$failed" == "null" ]] && failed=0
+
+    # Log parsing results in verbose mode
+    if $VERBOSE; then
+        log_debug "Parsed counts: total=$total success=$success failed=$failed"
+    fi
 
     # Generate manifest
     local manifest_file="$output_dir/${tool_name}-${version}-manifest.json"
