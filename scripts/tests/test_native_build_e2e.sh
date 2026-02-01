@@ -728,6 +728,12 @@ test_live_build_darwin_native() {
         return
     fi
 
+    # Check Go toolchain on mmini
+    if ! timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=3 mmini 'command -v go' &>/dev/null; then
+        log_skip "Skipped (Go not available on mmini)"
+        return
+    fi
+
     setup_test_environment
 
     local tool_dir
@@ -762,6 +768,18 @@ test_live_build_windows_native() {
         log_skip "Skipped (SSH to wlap unavailable)"
         return
     fi
+
+    # Verify SCP works to wlap (source sync must succeed for build)
+    local _scp_test
+    _scp_test=$(mktemp)
+    echo "test" > "$_scp_test"
+    if ! timeout 10 scp -o BatchMode=yes -o ConnectTimeout=3 "$_scp_test" wlap:/tmp/dsr_scp_test &>/dev/null; then
+        rm -f "$_scp_test"
+        log_skip "Skipped (SCP to wlap unavailable)"
+        return
+    fi
+    rm -f "$_scp_test"
+    ssh -o BatchMode=yes -o ConnectTimeout=3 wlap 'del C:\tmp\dsr_scp_test 2>nul' &>/dev/null || true
 
     setup_test_environment
 
