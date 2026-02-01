@@ -30,6 +30,7 @@ dsr build br --only-native --no-sync
 3. Targets with a job mapping → act targets
 4. Targets without a job mapping → native targets
 5. If filtering results in empty target list, returns error with helpful message
+6. The flags are mutually exclusive (cannot specify both --only-act and --only-native)
 
 ### Files Modified
 
@@ -40,10 +41,11 @@ dsr build br --only-native --no-sync
 
 - `test_only_act_flag()`: Verifies --only-act filters to act-compatible targets
 - `test_only_native_flag()`: Verifies --only-native filters to native targets
+- `test_only_act_and_native_mutual_exclusion()`: Verifies both flags cannot be specified together
 
 ### Test Results
 
 All tests pass:
 - test_act_runner.sh: 14/0
 - test_act_runner_native.sh: 30/0
-- test_native_build_e2e.sh: 22/0 (3 skipped live tests)
+- test_native_build_e2e.sh: 23/0 (3 skipped live tests)

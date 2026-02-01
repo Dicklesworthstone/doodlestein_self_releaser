@@ -1604,6 +1604,12 @@ EOF
         return 4
     fi
 
+    # Validate matrix filter flags are mutually exclusive
+    if $only_act && $only_native; then
+        log_error "Cannot specify both --only-act and --only-native"
+        return 4
+    fi
+
     # Set output directory default
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     [[ -z "$output_dir" ]] && output_dir="$state_dir/artifacts"

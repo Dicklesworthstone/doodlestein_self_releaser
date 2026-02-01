@@ -748,12 +748,22 @@ _act_sync_source() {
         done
 
         # Create remote directory and extract
+        # Windows (wlap) needs different mkdir syntax - use cmd /c with backslashes
+        local mkdir_cmd
+        if [[ "$host" == "wlap" ]]; then
+            # Windows: convert forward slashes to backslashes, use cmd /c
+            local win_path="${remote_path//\//\\}"
+            mkdir_cmd="cmd /c \"if not exist $win_path mkdir $win_path\" && cd /d \"$remote_path\""
+        else
+            mkdir_cmd="mkdir -p \"$remote_path\" && cd \"$remote_path\""
+        fi
+
         if timeout "$_ACT_SYNC_TIMEOUT" bash -c "
             cd '$local_path' && \
             tar czf - ${tar_excludes[*]} . | \
             ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT \
                 -o StrictHostKeyChecking=accept-new \
-                '$host' 'mkdir -p \"$remote_path\" && cd \"$remote_path\" && tar xzf -'
+                '$host' '$mkdir_cmd && tar xzf -'
         " 2>&1; then
             local duration=$(($(date +%s) - start_time))
             _log_ok "Sync completed in ${duration}s (tar)"

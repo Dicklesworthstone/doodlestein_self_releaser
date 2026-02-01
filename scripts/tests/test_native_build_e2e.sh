@@ -499,6 +499,28 @@ test_only_native_flag() {
     cleanup_test_environment
 }
 
+test_only_act_and_native_mutual_exclusion() {
+    ((TESTS_RUN++))
+    log_test "Matrix filter: --only-act and --only-native are mutually exclusive"
+    setup_test_environment
+
+    local tool_dir
+    tool_dir=$(setup_mock_rust_tool)
+    create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
+
+    local output exit_code=0
+    output=$(timeout 30 "$DSR_CMD" build mock_rust_tool --only-act --only-native 2>&1) || exit_code=$?
+
+    # Should fail with exit 4 and error about mutual exclusion
+    if [[ "$exit_code" -eq 4 ]] && [[ "$output" == *"Cannot specify both"* ]]; then
+        log_pass "--only-act and --only-native correctly rejected (exit: $exit_code)"
+    else
+        log_fail "Expected mutual exclusion error (exit: $exit_code, output: $output)"
+    fi
+
+    cleanup_test_environment
+}
+
 # ============================================================================
 # Test Cases: Error Scenarios
 # ============================================================================
@@ -788,6 +810,7 @@ main() {
     # Matrix filtering tests
     test_only_act_flag
     test_only_native_flag
+    test_only_act_and_native_mutual_exclusion
 
     # Live tests (optional, require SSH/Docker)
     test_live_build_linux_via_act
