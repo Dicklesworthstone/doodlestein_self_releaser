@@ -1264,7 +1264,18 @@ act_orchestrate_build() {
         else
             # Run via SSH (native build)
             _log_info "Method: native (host=$host)"
-            result=$(act_run_native_build "$tool_name" "$target" "$version" "$run_id") || exit_code=$?
+            local full_native_output
+            full_native_output=$(act_run_native_build "$tool_name" "$target" "$version" "$run_id") || exit_code=$?
+            # Extract JSON from output (native build includes build output + JSON at end)
+            result=$(echo "$full_native_output" | grep '^{' | tail -1)
+            if [[ -z "$result" ]] || ! echo "$result" | jq -e '.' &>/dev/null; then
+                _log_warn "Could not parse JSON from native build output"
+                local fallback_status="failed"
+                [[ "$exit_code" -eq 0 ]] && fallback_status="success"
+                result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
+                    --arg platform "$target" --arg method "native" \
+                    '{status: $status, exit_code: $exit_code, platform: $platform, method: $method}')
+            fi
         fi
 
         # Update result tracking
