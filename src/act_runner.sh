@@ -1108,9 +1108,7 @@ act_run_native_build() {
 
         # Handle Windows specifics
         if [[ "$platform" == windows/* ]]; then
-            # Convert forward slashes to backslashes for Windows
-            remote_artifact_path="${remote_artifact_path//\//\\}"
-            # Add .exe extension
+            # Add .exe extension (keep forward slashes - SCP via OpenSSH uses them)
             remote_artifact_path+=".exe"
         fi
 

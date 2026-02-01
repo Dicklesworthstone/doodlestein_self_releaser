@@ -19,6 +19,7 @@ secrets/
 *.actrc
 
 # Build artifacts
+a.out
 artifacts/
 manifests/
 *.minisig
