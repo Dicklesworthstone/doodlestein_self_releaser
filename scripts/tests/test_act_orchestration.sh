@@ -188,7 +188,26 @@ echo ""
 echo "== act_generate_manifest =="
 
 # Test manifest generation
-test_result='{"tool":"testool","version":"v1.0.0","run_id":"test-run","status":"success","targets":[{"platform":"linux/amd64","host":"trj","method":"act","status":"success","artifact_path":"/tmp/testool","duration_seconds":10}]}'
+artifact_path="$TEMP_DIR/artifacts/testool-linux-amd64.tar.gz"
+mkdir -p "$(dirname "$artifact_path")"
+echo "dummy artifact" > "$artifact_path"
+
+test_result=$(jq -nc --arg path "$artifact_path" '{
+  tool: "testool",
+  version: "v1.0.0",
+  run_id: "test-run",
+  status: "success",
+  targets: [
+    {
+      platform: "linux/amd64",
+      host: "trj",
+      method: "act",
+      status: "success",
+      artifact_path: $path,
+      duration_seconds: 10
+    }
+  ]
+}')
 manifest=$(act_generate_manifest "$test_result" "")
 schema_ver=$(echo "$manifest" | jq -r '.schema_version')
 artifacts_count=$(echo "$manifest" | jq '.artifacts | length')

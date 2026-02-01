@@ -31,6 +31,39 @@ _log_ok()    { echo "${_GREEN}[act]${_NC} $*" >&2; }
 _log_warn()  { echo "${_YELLOW}[act]${_NC} $*" >&2; }
 _log_error() { echo "${_RED}[act]${_NC} $*" >&2; }
 
+# Compute SHA256 for a file (portable: sha256sum or shasum -a 256)
+_act_sha256() {
+    local file="$1"
+
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+        return $?
+    fi
+
+    if command -v shasum &>/dev/null; then
+        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+        return $?
+    fi
+
+    return 3
+}
+
+# Get file size in bytes (portable)
+_act_file_size() {
+    local file="$1"
+    stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo 0
+}
+
+# Infer archive format from filename
+_act_archive_format() {
+    local name="$1"
+    case "$name" in
+        *.tar.gz|*.tgz) echo "tar.gz" ;;
+        *.zip) echo "zip" ;;
+        *) echo "none" ;;
+    esac
+}
+
 # Check if act is available and properly configured
 act_check() {
     if ! command -v act &>/dev/null; then
@@ -1215,6 +1248,18 @@ act_orchestrate_build() {
     _log_info "Orchestrating build for $tool_name $version"
     _log_info "Targets: $targets"
 
+    # Resolve git metadata for manifest (best-effort)
+    local git_sha="" git_ref=""
+    if command -v git &>/dev/null && [[ -n "${ACT_REPO_LOCAL_PATH:-}" && -d "$ACT_REPO_LOCAL_PATH/.git" ]]; then
+        git_sha=$(git -C "$ACT_REPO_LOCAL_PATH" rev-parse HEAD 2>/dev/null || true)
+        git_ref=$(git -C "$ACT_REPO_LOCAL_PATH" symbolic-ref -q --short HEAD 2>/dev/null || true)
+        if [[ -z "$git_ref" || "$git_ref" == "HEAD" ]]; then
+            git_ref=$(git -C "$ACT_REPO_LOCAL_PATH" describe --tags --exact-match 2>/dev/null || true)
+        fi
+    fi
+    [[ -z "$git_ref" ]] && git_ref="v${version#v}"
+    [[ -z "$git_sha" ]] && git_sha="0000000000000000000000000000000000000000"
+
     # Initialize build state (if build_state.sh is sourced)
     local run_id
     if command -v build_state_create &>/dev/null; then
@@ -1368,6 +1413,8 @@ act_orchestrate_build() {
         --arg tool "$tool_name" \
         --arg version "$version" \
         --arg run_id "$run_id" \
+        --arg git_sha "$git_sha" \
+        --arg git_ref "$git_ref" \
         --arg status "$overall_status" \
         --argjson exit_code "$overall_exit_code" \
         --argjson duration "$total_duration" \
@@ -1379,6 +1426,8 @@ act_orchestrate_build() {
             tool: $tool,
             version: $version,
             run_id: $run_id,
+            git_sha: $git_sha,
+            git_ref: $git_ref,
             status: $status,
             exit_code: $exit_code,
             duration_seconds: $duration,
@@ -1405,30 +1454,152 @@ act_generate_manifest() {
     run_id=$(echo "$result_json" | jq -r '.run_id')
     status=$(echo "$result_json" | jq -r '.status')
 
+    local manifest_version
+    manifest_version="v${version#v}"
+
+    local git_sha git_ref
+    git_sha=$(echo "$result_json" | jq -r '.git_sha // empty' 2>/dev/null)
+    git_ref=$(echo "$result_json" | jq -r '.git_ref // empty' 2>/dev/null)
+
+    if [[ -z "$git_sha" || "$git_sha" == "null" ]]; then
+        if command -v git &>/dev/null && [[ -n "${ACT_REPO_LOCAL_PATH:-}" && -d "$ACT_REPO_LOCAL_PATH/.git" ]]; then
+            git_sha=$(git -C "$ACT_REPO_LOCAL_PATH" rev-parse HEAD 2>/dev/null || true)
+        fi
+    fi
+    [[ -z "$git_sha" || "$git_sha" == "null" ]] && git_sha="0000000000000000000000000000000000000000"
+
+    if [[ -z "$git_ref" || "$git_ref" == "null" ]]; then
+        if command -v git &>/dev/null && [[ -n "${ACT_REPO_LOCAL_PATH:-}" && -d "$ACT_REPO_LOCAL_PATH/.git" ]]; then
+            git_ref=$(git -C "$ACT_REPO_LOCAL_PATH" symbolic-ref -q --short HEAD 2>/dev/null || true)
+            if [[ -z "$git_ref" || "$git_ref" == "HEAD" ]]; then
+                git_ref=$(git -C "$ACT_REPO_LOCAL_PATH" describe --tags --exact-match 2>/dev/null || true)
+            fi
+        fi
+    fi
+    [[ -z "$git_ref" || "$git_ref" == "null" ]] && git_ref="$manifest_version"
+
+    local built_at
+    built_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    local duration_seconds duration_ms
+    duration_seconds=$(echo "$result_json" | jq -r '.duration_seconds // 0' 2>/dev/null || echo 0)
+    [[ "$duration_seconds" =~ ^[0-9]+$ ]] || duration_seconds=0
+    duration_ms=$((duration_seconds * 1000))
+
+    local artifacts=()
+    local seen_paths=()
+
+    _act_manifest_add_file() {
+        local file="$1"
+        local target="$2"
+
+        [[ -z "$file" || ! -f "$file" ]] && return 0
+        [[ -z "$target" ]] && return 0
+
+        local name
+        name=$(basename "$file")
+
+        case "$name" in
+            *.minisig|*.sig|*.sha256|*.sha512|SHA256SUMS*|*.sbom.*|*.intoto.jsonl)
+                return 0
+                ;;
+        esac
+
+        for seen in "${seen_paths[@]}"; do
+            [[ "$seen" == "$file" ]] && return 0
+        done
+
+        local sha size format
+        sha=$(_act_sha256 "$file" 2>/dev/null || echo "")
+        size=$(_act_file_size "$file")
+        format=$(_act_archive_format "$name")
+
+        if [[ -z "$sha" ]]; then
+            _log_warn "Unable to compute SHA256 for artifact: $file"
+            return 0
+        fi
+        if [[ -z "$size" || "$size" -le 0 ]]; then
+            _log_warn "Unable to determine size for artifact: $file"
+            return 0
+        fi
+
+        local sig_file=""
+        local signed=false
+        if [[ -f "${file}.minisig" ]]; then
+            signed=true
+            sig_file=$(basename "${file}.minisig")
+        fi
+
+        local artifact_json
+        artifact_json=$(jq -nc \
+            --arg name "$name" \
+            --arg target "$target" \
+            --arg sha "$sha" \
+            --argjson size "$size" \
+            --arg format "$format" \
+            --argjson signed "$signed" \
+            --arg sig "$sig_file" \
+            '{
+                name: $name,
+                target: $target,
+                sha256: $sha,
+                size_bytes: $size,
+                archive_format: $format,
+                signed: $signed,
+                signature_file: $sig
+            }')
+
+        artifacts+=("$artifact_json")
+        seen_paths+=("$file")
+    }
+
+    while IFS= read -r target_json; do
+        [[ -z "$target_json" ]] && continue
+        local target
+        target=$(echo "$target_json" | jq -r '.platform // .target // empty' 2>/dev/null)
+        local artifact_path
+        artifact_path=$(echo "$target_json" | jq -r '.artifact_path // empty' 2>/dev/null)
+        local artifact_dir
+        artifact_dir=$(echo "$target_json" | jq -r '.artifact_dir // empty' 2>/dev/null)
+
+        if [[ -n "$artifact_path" && -f "$artifact_path" ]]; then
+            _act_manifest_add_file "$artifact_path" "$target"
+        fi
+
+        if [[ -n "$artifact_dir" && -d "$artifact_dir" ]]; then
+            while IFS= read -r -d '' file; do
+                _act_manifest_add_file "$file" "$target"
+            done < <(find "$artifact_dir" -type f -print0 2>/dev/null)
+        fi
+    done < <(echo "$result_json" | jq -c '.targets[]?' 2>/dev/null || true)
+
+    local artifacts_json="[]"
+    if [[ ${#artifacts[@]} -gt 0 ]]; then
+        artifacts_json=$(printf '%s\n' "${artifacts[@]}" | jq -s '.')
+    fi
+
     local manifest
     manifest=$(jq -nc \
         --arg tool "$tool" \
-        --arg version "$version" \
+        --arg version "$manifest_version" \
         --arg run_id "$run_id" \
+        --arg git_sha "$git_sha" \
+        --arg git_ref "$git_ref" \
+        --arg built_at "$built_at" \
         --arg status "$status" \
-        --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-        --argjson targets "$(echo "$result_json" | jq '.targets // []')" \
+        --argjson duration_ms "$duration_ms" \
+        --argjson artifacts "$artifacts_json" \
         '{
             schema_version: "1.0.0",
             tool: $tool,
             version: $version,
             run_id: $run_id,
+            git_sha: $git_sha,
+            git_ref: $git_ref,
+            built_at: $built_at,
+            duration_ms: $duration_ms,
             status: $status,
-            generated_at: $generated_at,
-            artifacts: ($targets | map(select(.status == "success") | {
-                platform: .platform,
-                host: (.host // "local"),
-                method: .method,
-                path: (.artifact_path // .artifact_dir // null),
-                artifact_dir: .artifact_dir,
-                artifact_count: .artifact_count,
-                duration_seconds: .duration_seconds
-            }))
+            artifacts: $artifacts
         }')
 
     if [[ -n "$output_file" ]]; then

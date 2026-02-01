@@ -2569,7 +2569,7 @@ EOF
                 missing_assets+=("$expected_file")
                 verification_status="incomplete"
             fi
-        done < <(jq -r '.artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
+        done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
     fi
 
     # Build result
@@ -2877,7 +2877,7 @@ EOF
         log_info "Using manifest: $manifest_file"
         while IFS= read -r name; do
             [[ -n "$name" ]] && expected_assets+=("$name")
-        done < <(jq -r '.artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
+        done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
     else
         log_warn "No manifest found - cannot verify completeness"
     fi

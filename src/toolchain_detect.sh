@@ -52,6 +52,14 @@ _tc_log_ok()    { echo "${_TC_GREEN}[toolchain]${_TC_NC} $*" >&2; }
 _tc_log_warn()  { echo "${_TC_YELLOW}[toolchain]${_TC_NC} $*" >&2; }
 _tc_log_error() { echo "${_TC_RED}[toolchain]${_TC_NC} $*" >&2; }
 
+# Determine non-interactive mode (supports installers + dsr globals)
+_tc_is_non_interactive() {
+    [[ "${_TC_NON_INTERACTIVE:-false}" == "true" ]] || \
+    [[ "${NON_INTERACTIVE:-}" == "true" ]] || \
+    [[ "${_NON_INTERACTIVE:-}" == "true" ]] || \
+    [[ "${DSR_NON_INTERACTIVE:-}" == "true" ]]
+}
+
 # Check for required dependencies
 _tc_require_jq() {
     if ! command -v jq &>/dev/null; then
@@ -133,7 +141,7 @@ _tc_prompt() {
     local question="$1"
     local default="${2:-n}"
 
-    if [[ "$_TC_NON_INTERACTIVE" == "true" ]]; then
+    if _tc_is_non_interactive; then
         _tc_log_error "Cannot prompt in non-interactive mode"
         _tc_log_info "Run interactively or use --yes to auto-approve"
         return 1
