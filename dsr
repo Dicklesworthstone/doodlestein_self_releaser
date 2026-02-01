@@ -1244,14 +1244,16 @@ _watch_iteration() {
             # Mark as triggered before attempting (to prevent repeated attempts on failure)
             _watch_mark_triggered "$run_id"
 
-            # TODO: Actually trigger fallback when build/release commands are implemented
-            # For now, just log that we would trigger it
-            log_info "Fallback queued for $repo (run $run_id)"
-            # ./dsr fallback --repo "$repo" &
+            # Trigger fallback as a background subprocess
+            local fallback_log="$_WATCH_STATE_DIR/fallback-${run_id}.log"
+            log_info "Starting fallback for $repo (run $run_id)..."
+            "$0" fallback "$repo" --non-interactive >> "$fallback_log" 2>&1 &
+            local fallback_pid=$!
+            log_info "Fallback started (PID: $fallback_pid, log: $fallback_log)"
             if [[ "${DSR_NOTIFY_ENABLED:-false}" == "true" ]]; then
-                notify_event "watch.fallback_queued" "info" \
-                    "Fallback queued" \
-                    "Repo $repo run $run_id queued for fallback" \
+                notify_event "watch.fallback_started" "info" \
+                    "Fallback started" \
+                    "Repo $repo run $run_id fallback started (PID: $fallback_pid)" \
                     "$run_id" || true
             fi
         fi
