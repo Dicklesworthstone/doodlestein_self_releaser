@@ -1089,31 +1089,68 @@ _watch_cleanup() {
 }
 
 # Acquire lock to prevent multiple watcher instances
+# Uses atomic mv -n to prevent race conditions (TOCTOU)
 _watch_acquire_lock() {
     if ! mkdir -p "$_WATCH_STATE_DIR"; then
         log_error "Failed to create watch state directory: $_WATCH_STATE_DIR"
         return 1
     fi
 
-    # Check for existing lock
-    if [[ -f "$_WATCH_LOCK_FILE" ]]; then
-        local lock_pid
-        lock_pid=$(cat "$_WATCH_LOCK_FILE" 2>/dev/null)
+    local temp_lock="${_WATCH_LOCK_FILE}.$$"
+    local max_attempts=3
+    local attempt=0
 
-        # Check if process is still running
-        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-            log_error "Another watcher is running (PID $lock_pid)"
-            return 2
+    while [[ $attempt -lt $max_attempts ]]; do
+        ((attempt++))
+
+        # Check for existing lock
+        if [[ -f "$_WATCH_LOCK_FILE" ]]; then
+            local lock_pid
+            # Read PID (format: "PID:TIMESTAMP" - timestamp for future stale detection)
+            # shellcheck disable=SC2034  # lock_ts reserved for future stale lock timeout
+            local lock_ts
+            IFS=':' read -r lock_pid lock_ts < "$_WATCH_LOCK_FILE" 2>/dev/null || true
+
+            # Validate PID is numeric
+            if [[ ! "$lock_pid" =~ ^[0-9]+$ ]]; then
+                log_warn "Corrupted lock file, removing"
+                rm -f "$_WATCH_LOCK_FILE"
+            elif kill -0 "$lock_pid" 2>/dev/null; then
+                log_error "Another watcher is running (PID $lock_pid)"
+                return 2
+            else
+                # Stale lock - remove it
+                log_warn "Removing stale lock file (PID $lock_pid no longer running)"
+                rm -f "$_WATCH_LOCK_FILE"
+            fi
         fi
 
-        # Stale lock - remove it
-        log_warn "Removing stale lock file"
-        rm -f "$_WATCH_LOCK_FILE"
-    fi
+        # Create temp lock with PID:TIMESTAMP
+        echo "$$:$(date +%s)" > "$temp_lock" || {
+            log_error "Failed to create temp lock file"
+            return 1
+        }
 
-    # Create lock
-    echo "$$" > "$_WATCH_LOCK_FILE"
-    return 0
+        # Atomic rename - mv -n fails if target exists (race-safe)
+        # Note: mv -n is POSIX and atomic on same filesystem
+        if mv -n "$temp_lock" "$_WATCH_LOCK_FILE" 2>/dev/null; then
+            # Verify we own the lock (another process might have won)
+            local final_pid
+            IFS=':' read -r final_pid _ < "$_WATCH_LOCK_FILE" 2>/dev/null || true
+            if [[ "$final_pid" == "$$" ]]; then
+                return 0
+            fi
+            # Lost race, loop and retry
+            log_debug "Lost lock race, retrying..."
+        fi
+
+        # Clean up temp file if mv failed
+        rm -f "$temp_lock" 2>/dev/null
+        sleep 0.1
+    done
+
+    log_error "Failed to acquire lock after $max_attempts attempts"
+    return 2
 }
 
 _watch_release_lock() {

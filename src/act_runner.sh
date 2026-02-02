@@ -658,8 +658,9 @@ act_list_tools() {
     fi
 
     # Use nullglob to handle empty directory gracefully
-    local old_nullglob
-    old_nullglob=$(shopt -p nullglob || true)
+    # Save state without eval - shopt -q returns 0 if set, 1 if unset
+    local had_nullglob=false
+    shopt -q nullglob && had_nullglob=true
     shopt -s nullglob
 
     for config in "$ACT_REPOS_DIR"/*.yaml; do
@@ -669,8 +670,12 @@ act_list_tools() {
         fi
     done
 
-    # Restore previous nullglob setting
-    eval "$old_nullglob" 2>/dev/null || shopt -u nullglob
+    # Restore previous nullglob setting without eval
+    if $had_nullglob; then
+        shopt -s nullglob
+    else
+        shopt -u nullglob
+    fi
 }
 
 # Generate full build matrix for a tool

@@ -36,6 +36,13 @@ _hh_parse_host_fallback() {
     local hostname="$1"
     local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
 
+    # Validate hostname contains only safe characters (prevents regex injection)
+    # Hostnames must be alphanumeric with underscores/hyphens only
+    if [[ ! "$hostname" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
+        echo "Invalid hostname format: $hostname" >&2
+        return 4
+    fi
+
     if [[ ! -f "$hosts_file" ]]; then
         return 1
     fi

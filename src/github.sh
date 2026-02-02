@@ -400,8 +400,34 @@ gh_workflow_runs() {
         return 4
     fi
 
+    # Validate status parameter (GitHub API enum)
+    if [[ -n "$status" ]]; then
+        case "$status" in
+            queued|in_progress|completed|waiting|requested|pending|action_required|cancelled|failure|neutral|skipped|stale|success|timed_out)
+                ;;
+            *)
+                _gh_log_error "Invalid status: $status"
+                return 4
+                ;;
+        esac
+    fi
+
+    # Validate limit is numeric
+    if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
+        _gh_log_error "Invalid limit: $limit (must be numeric)"
+        return 4
+    fi
+
     local endpoint="repos/$repo/actions/runs?per_page=$limit"
-    [[ -n "$workflow" ]] && endpoint+="&workflow_file=$workflow"
+    # URL-encode workflow to prevent injection (only allow safe chars)
+    if [[ -n "$workflow" ]]; then
+        # Validate workflow contains only safe filename characters
+        if [[ ! "$workflow" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+            _gh_log_error "Invalid workflow name: $workflow"
+            return 4
+        fi
+        endpoint+="&workflow_file=$workflow"
+    fi
     [[ -n "$status" ]] && endpoint+="&status=$status"
 
     gh_api "$endpoint"
@@ -525,6 +551,13 @@ gh_upload_asset() {
 
     local filename
     filename=$(basename "$file_path")
+
+    # Validate filename contains only safe characters for URL
+    # Release assets should only have alphanumeric, dash, underscore, dot
+    if [[ ! "$filename" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        _gh_log_error "Invalid filename for upload: $filename (contains unsafe characters)"
+        return 4
+    fi
 
     # Remove template part from upload_url
     upload_url="${upload_url%\{*}"
