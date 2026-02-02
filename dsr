@@ -2746,6 +2746,35 @@ EOF
         return 0
     }
 
+    _release_arch_aliases() {
+        local name="$1"
+        local arch="$2"
+        local -a aliases=()
+
+        case "$arch" in
+            amd64)
+                if [[ "$name" == *"amd64"* ]]; then
+                    local alias
+                    alias="${name//-amd64/-x86_64}"
+                    alias="${alias//_amd64/_x86_64}"
+                    [[ "$alias" != "$name" ]] && aliases+=("$alias")
+                fi
+                ;;
+            arm64)
+                if [[ "$name" == *"arm64"* ]]; then
+                    local alias
+                    alias="${name//-arm64/-aarch64}"
+                    alias="${alias//_arm64/_aarch64}"
+                    [[ "$alias" != "$name" ]] && aliases+=("$alias")
+                fi
+                ;;
+        esac
+
+        if [[ ${#aliases[@]} -gt 0 ]]; then
+            printf '%s\n' "${aliases[@]}"
+        fi
+    }
+
     # Map manifest artifact names to targets and formats (for dual-name uploads)
     local -A manifest_targets=()
     local -A manifest_formats=()
@@ -2842,6 +2871,22 @@ EOF
                     fi
                     if [[ -n "$compat_name" && "$compat_name" != "$filename" && "$compat_name" != "$versioned_name" ]]; then
                         upload_names+=("$compat_name")
+                    fi
+                    if [[ -n "$compat_name" ]]; then
+                        while IFS= read -r alias_name; do
+                            [[ -z "$alias_name" ]] && continue
+                            local seen_alias=false
+                            local existing
+                            for existing in "${upload_names[@]}"; do
+                                if [[ "$existing" == "$alias_name" ]]; then
+                                    seen_alias=true
+                                    break
+                                fi
+                            done
+                            if ! $seen_alias; then
+                                upload_names+=("$alias_name")
+                            fi
+                        done < <(_release_arch_aliases "$compat_name" "$arch")
                     fi
 
                     log_info "[$idx/$total_files] Uploading asset variants for: $filename"

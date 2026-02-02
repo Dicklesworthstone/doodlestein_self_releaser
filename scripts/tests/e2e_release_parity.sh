@@ -100,7 +100,9 @@ _json_escape() {
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
   s=${s//$'\n'/\\n}
-  echo "$s"
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
 }
 
 log_line() {

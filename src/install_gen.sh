@@ -146,11 +146,25 @@ _json_result() {
                 --arg path "$path" \
                 '{tool: $tool, status: $status, message: $message, version: $version, path: $path}'
         else
-            # Fallback for systems without jq - escape quotes manually
-            local esc_msg="${message//\"/\\\"}"
-            local esc_path="${path//\"/\\\"}"
+            # Fallback for systems without jq - escape JSON special characters
+            # Order matters: escape backslashes first, then quotes, then control chars
+            _json_escape_str() {
+                local s="$1"
+                s="${s//\\/\\\\}"      # \ -> \\
+                s="${s//\"/\\\"}"      # " -> \"
+                s="${s//$'\n'/\\n}"    # newline -> \n
+                s="${s//$'\t'/\\t}"    # tab -> \t
+                s="${s//$'\r'/\\r}"    # carriage return -> \r
+                printf '%s' "$s"
+            }
+            local esc_tool esc_status esc_msg esc_ver esc_path
+            esc_tool=$(_json_escape_str "$TOOL_NAME")
+            esc_status=$(_json_escape_str "$status")
+            esc_msg=$(_json_escape_str "$message")
+            esc_ver=$(_json_escape_str "$version")
+            esc_path=$(_json_escape_str "$path")
             printf '{"tool":"%s","status":"%s","message":"%s","version":"%s","path":"%s"}\n' \
-                "$TOOL_NAME" "$status" "$esc_msg" "$version" "$esc_path"
+                "$esc_tool" "$esc_status" "$esc_msg" "$esc_ver" "$esc_path"
         fi
     fi
 }

@@ -38,7 +38,10 @@ _json_escape() {
   local s="$1"
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
-  echo "$s"
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
 }
 
 log() {
