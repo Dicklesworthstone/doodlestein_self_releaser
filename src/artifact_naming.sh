@@ -470,3 +470,97 @@ artifact_naming_substitute() {
 
     echo "$result"
 }
+
+# Get the compat pattern for a tool using precedence:
+# 1. Explicit install_script_compat from config (highest priority)
+# 2. Auto-detect from install_script_path if set
+# 3. Derive from artifact_naming by stripping version (fallback)
+#
+# Args: tool_name local_repo_path
+# Output: Compat pattern (stdout) or empty
+# Exit: 0 on success
+artifact_naming_get_compat_pattern() {
+    local tool="$1"
+    local repo_path="${2:-}"
+
+    _an_log_debug "Getting compat pattern for: $tool"
+
+    # Source config.sh if not already loaded
+    if ! declare -F config_get_install_script_compat &>/dev/null; then
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        # shellcheck source=./config.sh
+        source "$script_dir/config.sh" 2>/dev/null || true
+    fi
+
+    # Priority 1: Explicit install_script_compat
+    local explicit_compat
+    explicit_compat=$(config_get_install_script_compat "$tool" 2>/dev/null || echo "")
+    if [[ -n "$explicit_compat" ]]; then
+        _an_log_info "Using explicit install_script_compat: $explicit_compat"
+        echo "$explicit_compat"
+        return 0
+    fi
+
+    # Priority 2: Auto-detect from install_script_path
+    local install_path
+    install_path=$(config_get_install_script_path "$tool" 2>/dev/null || echo "")
+    if [[ -n "$install_path" && -n "$repo_path" ]]; then
+        local full_path="$repo_path/$install_path"
+        if [[ -f "$full_path" ]]; then
+            local detected_pattern
+            detected_pattern=$(artifact_naming_parse_install_script "$full_path")
+            if [[ -n "$detected_pattern" ]]; then
+                _an_log_info "Auto-detected pattern from install.sh: $detected_pattern"
+                echo "$detected_pattern"
+                return 0
+            fi
+        else
+            _an_log_debug "Install script not found at: $full_path"
+        fi
+    fi
+
+    # Priority 3: Derive from artifact_naming by stripping version
+    local artifact_naming
+    artifact_naming=$(config_get_artifact_naming "$tool" 2>/dev/null || echo "")
+    if [[ -n "$artifact_naming" ]]; then
+        local derived
+        derived=$(_an_derive_compat_from_versioned "$artifact_naming")
+        _an_log_info "Derived compat pattern from artifact_naming: $derived"
+        echo "$derived"
+        return 0
+    fi
+
+    # No pattern found - caller should use default
+    _an_log_debug "No compat pattern found for $tool, using default"
+    echo ""
+    return 0
+}
+
+# Generate dual names for a tool using config-aware precedence
+# This is the main entry point for the release workflow
+#
+# Args: tool_name version os arch ext repo_path
+# Output: JSON object with versioned and compat names
+# Exit: 0 on success
+artifact_naming_generate_dual_for_tool() {
+    local tool="$1"
+    local version="$2"
+    local os="$3"
+    local arch="$4"
+    local ext="${5:-tar.gz}"
+    local repo_path="${6:-}"
+
+    # Get compat pattern using precedence logic
+    local compat_pattern
+    compat_pattern=$(artifact_naming_get_compat_pattern "$tool" "$repo_path")
+
+    # Generate dual names
+    artifact_naming_generate_dual "$tool" "$version" "$os" "$arch" "$ext" "$compat_pattern"
+}
+
+# Export functions
+export -f artifact_naming_parse_install_script artifact_naming_parse_workflow
+export -f artifact_naming_generate_dual artifact_naming_validate
+export -f artifact_naming_substitute
+export -f artifact_naming_get_compat_pattern artifact_naming_generate_dual_for_tool

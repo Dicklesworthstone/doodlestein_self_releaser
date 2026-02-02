@@ -453,6 +453,65 @@ config_get_tool() {
     fi
 }
 
+# Get a specific field from tool configuration
+# Usage: config_get_tool_field <toolname> <field> [default]
+# Returns: Field value or default (or empty if not found)
+config_get_tool_field() {
+    local toolname="$1"
+    local field="$2"
+    local default="${3:-}"
+
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml"
+
+    if [[ -f "$tool_config" ]] && command -v yq &>/dev/null; then
+        local value
+        value=$(yq -r ".$field" "$tool_config" 2>/dev/null)
+        if [[ -n "$value" && "$value" != "null" ]]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    # Fallback to repos.yaml
+    if [[ -f "$DSR_REPOS_FILE" ]] && command -v yq &>/dev/null; then
+        local value
+        value=$(yq -r ".tools.$toolname.$field" "$DSR_REPOS_FILE" 2>/dev/null)
+        if [[ -n "$value" && "$value" != "null" ]]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    echo "$default"
+}
+
+# Get install_script_compat pattern for a tool
+# This is the naming pattern expected by install.sh scripts
+# Usage: config_get_install_script_compat <toolname>
+# Returns: Compat pattern (e.g., "${name}-${os}-${arch}") or empty
+config_get_install_script_compat() {
+    local toolname="$1"
+    config_get_tool_field "$toolname" "install_script_compat" ""
+}
+
+# Get install_script_path for a tool
+# When set, dsr parses this script to auto-detect the expected naming pattern
+# Usage: config_get_install_script_path <toolname>
+# Returns: Path to install.sh (relative to repo root) or empty
+config_get_install_script_path() {
+    local toolname="$1"
+    config_get_tool_field "$toolname" "install_script_path" ""
+}
+
+# Get artifact naming pattern for a tool
+# Usage: config_get_artifact_naming <toolname>
+# Returns: Naming pattern (e.g., "${name}-${version}-${os}-${arch}") or empty
+config_get_artifact_naming() {
+    local toolname="$1"
+    config_get_tool_field "$toolname" "artifact_naming" ""
+}
+
 # List configured hosts
 # Usage: config_list_hosts [--json]
 config_list_hosts() {
@@ -527,3 +586,5 @@ config_get_host_for_platform() {
 export -f config_init config_load config_get config_set config_validate config_show
 export -f config_get_host config_get_tool config_list_hosts config_list_tools
 export -f config_get_host_for_platform
+export -f config_get_tool_field config_get_install_script_compat config_get_install_script_path
+export -f config_get_artifact_naming

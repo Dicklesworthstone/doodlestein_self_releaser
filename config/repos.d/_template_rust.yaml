@@ -61,6 +61,18 @@ checks:
 # Variables: ${name}, ${version}, ${os}, ${arch}, ${ext}
 artifact_naming: "${name}-${version}-${os}-${arch}"
 
+# Install.sh compatibility (optional)
+# When install.sh expects a different naming pattern than artifact_naming,
+# use one of these fields to ensure dsr uploads artifacts with BOTH names.
+#
+# Option 1: Explicit pattern (takes precedence)
+# install_script_compat: "${name}-${os}-${arch}"
+#
+# Option 2: Auto-detect from install.sh
+# install_script_path: install.sh
+#
+# Precedence: install_script_compat > install_script_path > fallback (strip version)
+
 # Archive format per platform
 archive_format:
   linux: tar.gz
