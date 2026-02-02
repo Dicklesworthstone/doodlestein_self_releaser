@@ -275,7 +275,20 @@ upgrade_verify_json() {
             return 1
         fi
 
-        output=$(timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" upgrade --check 2>&1) || exit_code=$?
+        local timeout_cmd=""
+        if command -v timeout &>/dev/null; then
+            timeout_cmd="timeout"
+        elif command -v gtimeout &>/dev/null; then
+            timeout_cmd="gtimeout"
+        else
+            log_warn "timeout command not available; running upgrade check without timeout"
+        fi
+
+        if [[ -n "$timeout_cmd" ]]; then
+            output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" upgrade --check 2>&1) || exit_code=$?
+        else
+            output=$("$bin_path" upgrade --check 2>&1) || exit_code=$?
+        fi
 
         local found_asset=false
         if echo "$output" | grep -qi "up.to.date\|no update\|already.*latest\|current version\|found.*asset\|download.*available\|update.*available"; then
