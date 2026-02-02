@@ -1,0 +1,41 @@
+name: Multiple Upload Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: go build -o multitool-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multitool-linux-amd64
+          path: multitool-linux-amd64
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: go build -o multitool-darwin-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multitool-darwin-arm64
+          path: multitool-darwin-arm64
+
+  release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            multitool-linux-amd64.tar.gz
+            multitool-darwin-arm64.tar.gz
+            checksums.txt
