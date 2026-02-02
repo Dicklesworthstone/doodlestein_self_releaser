@@ -218,7 +218,11 @@ _DSR_MS_TIMESTAMP_METHOD=""
 _get_ms_timestamp() {
   # Cache the detection result to avoid repeated checks
   if [[ -z "$_DSR_MS_TIMESTAMP_METHOD" ]]; then
-    if date +%s%3N &>/dev/null; then
+    # Check if GNU date supports %N (nanoseconds) - BSD date outputs literal "%3N"
+    # We verify by checking that the output is purely numeric (no literal % chars)
+    local test_output
+    test_output=$(date +%s%3N 2>/dev/null)
+    if [[ "$test_output" =~ ^[0-9]+$ ]]; then
       _DSR_MS_TIMESTAMP_METHOD="date_ms"
     elif command -v python3 &>/dev/null; then
       _DSR_MS_TIMESTAMP_METHOD="python"
