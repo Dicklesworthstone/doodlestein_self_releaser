@@ -1543,7 +1543,7 @@ cmd_build() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --tool|-t)
+            --tool|-t|--repo)
                 tool_name="$2"
                 shift 2
                 ;;
@@ -1605,6 +1605,7 @@ USAGE:
 
 OPTIONS:
     -t, --tool <name>      Tool to build (required, or as first positional arg)
+        --repo <name>      Alias for --tool
     --target <target>      Specific target (e.g., linux/amd64); can repeat
     --targets <list>       Comma-separated target list
     -V, --version <ver>    Version to build (default: detect from version files)
@@ -1977,7 +1978,7 @@ cmd_quality() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --tool|-t)
+            --tool|-t|--repo)
                 tool_name="$2"
                 shift 2
                 ;;
@@ -2313,6 +2314,7 @@ SUBCOMMANDS:
 
 OPTIONS:
     -t, --tool <name>        Tool to release (or first positional arg)
+        --repo <name>        Alias for --tool
     -V, --version <ver>      Version to release (or second positional arg)
     -a, --artifacts <dir>    Directory containing build artifacts
     --draft                  Create as draft release
