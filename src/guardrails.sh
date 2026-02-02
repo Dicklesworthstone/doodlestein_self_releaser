@@ -151,11 +151,30 @@ resolve_path() {
   elif [[ "$input" == "~/"* ]]; then
     resolved="$HOME/${input:2}"
   elif [[ "$input" == "~"* ]]; then
-    # ~username expansion (let shell handle it)
-    resolved=$(eval echo "$input" 2>/dev/null) || {
+    # ~username expansion (sanitized to avoid eval injection)
+    if [[ "$input" =~ ^~([a-zA-Z0-9._-]+)(/.*)?$ ]]; then
+      local user="${BASH_REMATCH[1]}"
+      local rest="${BASH_REMATCH[2]}"
+      local user_home=""
+
+      if command -v getent &>/dev/null; then
+        user_home=$(getent passwd "$user" | awk -F: '{print $6}' | head -1)
+      fi
+
+      if [[ -z "$user_home" ]]; then
+        user_home=$(eval echo "~$user" 2>/dev/null || true)
+      fi
+
+      if [[ -z "$user_home" || "$user_home" == "~"* ]]; then
+        echo "Error: Cannot expand path: $input" >&2
+        return $EXIT_INVALID_ARGS
+      fi
+
+      resolved="$user_home${rest:-}"
+    else
       echo "Error: Cannot expand path: $input" >&2
       return $EXIT_INVALID_ARGS
-    }
+    fi
   elif [[ "$input" == /* ]]; then
     # Already absolute
     resolved="$input"

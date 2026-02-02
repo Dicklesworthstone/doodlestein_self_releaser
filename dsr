@@ -628,15 +628,36 @@ EOF
     echo ""
     log_info "Build hosts:"
 
+    local timeout_cmd=""
+    if command -v timeout &>/dev/null; then
+        timeout_cmd="timeout"
+    elif command -v gtimeout &>/dev/null; then
+        timeout_cmd="gtimeout"
+    else
+        log_warn "timeout command not available; SSH checks will run without timeout"
+    fi
+
     for host in mmini wlap; do
-        if timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null 2>&1; then
-            _add_check "ssh-$host" "ok" ""
-            log_ok "  $host: reachable"
+        if [[ -n "$timeout_cmd" ]]; then
+            if "$timeout_cmd" 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null 2>&1; then
+                _add_check "ssh-$host" "ok" ""
+                log_ok "  $host: reachable"
+            else
+                _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\""
+                log_warn "  $host: unreachable"
+                fixes+=("Check SSH config for $host: ssh $host")
+                ((warnings++))
+            fi
         else
-            _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\""
-            log_warn "  $host: unreachable"
-            fixes+=("Check SSH config for $host: ssh $host")
-            ((warnings++))
+            if ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null 2>&1; then
+                _add_check "ssh-$host" "ok" ""
+                log_ok "  $host: reachable"
+            else
+                _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\""
+                log_warn "  $host: unreachable"
+                fixes+=("Check SSH config for $host: ssh $host")
+                ((warnings++))
+            fi
         fi
     done
 

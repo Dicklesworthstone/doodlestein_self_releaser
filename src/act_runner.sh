@@ -64,6 +64,37 @@ _act_archive_format() {
     esac
 }
 
+# Timeout helper (supports GNU timeout and coreutils gtimeout)
+_ACT_TIMEOUT_CMD=""
+_act_timeout_cmd() {
+    if [[ -n "$_ACT_TIMEOUT_CMD" ]]; then
+        echo "$_ACT_TIMEOUT_CMD"
+        return 0
+    fi
+
+    if command -v timeout &>/dev/null; then
+        _ACT_TIMEOUT_CMD="timeout"
+    elif command -v gtimeout &>/dev/null; then
+        _ACT_TIMEOUT_CMD="gtimeout"
+    else
+        _ACT_TIMEOUT_CMD=""
+    fi
+
+    echo "$_ACT_TIMEOUT_CMD"
+}
+
+_act_run_with_timeout() {
+    local seconds="$1"
+    shift
+    local cmd
+    cmd=$(_act_timeout_cmd)
+    if [[ -n "$cmd" ]]; then
+        "$cmd" "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Check if act is available and properly configured
 act_check() {
     if ! command -v act &>/dev/null; then
@@ -250,20 +281,14 @@ act_run_workflow() {
 
     # Run act with timeout
     # Use PIPESTATUS to capture the actual command exit code, not tee's
-    local timeout_cmd=""
-    if command -v timeout &>/dev/null; then
-        timeout_cmd="timeout"
-    elif command -v gtimeout &>/dev/null; then
-        timeout_cmd="gtimeout"
-    else
-        _log_warn "timeout command not available; running act without timeout"
-    fi
-
+    local timeout_cmd
+    timeout_cmd=$(_act_timeout_cmd)
     if [[ -n "$timeout_cmd" ]]; then
         "$timeout_cmd" "$ACT_TIMEOUT" "${act_cmd[@]}" \
             --directory "$repo_path" \
             2>&1 | tee "$log_file"
     else
+        _log_warn "timeout command not available; running act without timeout"
         "${act_cmd[@]}" \
             --directory "$repo_path" \
             2>&1 | tee "$log_file"
@@ -747,7 +772,7 @@ _ACT_SYNC_DEFAULT_EXCLUDES=(
 # Returns: 0 if rsync available, 1 otherwise
 _act_has_rsync() {
     local host="$1"
-    timeout 10 ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+    _act_run_with_timeout 10 ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
         "$host" 'command -v rsync >/dev/null 2>&1' 2>/dev/null
@@ -790,7 +815,7 @@ _act_sync_source() {
     # Check for rsync on remote
     if _act_has_rsync "$host"; then
         # Use rsync for efficient sync
-        if timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+        if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
             "${exclude_args[@]}" \
             -e "ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new" \
             "$local_path/" "$host:$remote_path/" 2>&1; then
@@ -825,7 +850,7 @@ _act_sync_source() {
             mkdir_cmd="mkdir -p \"$remote_path\" && cd \"$remote_path\""
         fi
 
-        if timeout "$_ACT_SYNC_TIMEOUT" bash -c "
+        if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" bash -c "
             cd '$local_path' && \
             tar czf - ${tar_excludes[*]} . | \
             ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT \
@@ -1256,7 +1281,7 @@ _act_ssh_exec() {
     local cmd="$2"
     local timeout_sec="${3:-$_ACT_BUILD_TIMEOUT}"
 
-    timeout "$timeout_sec" ssh \
+    _act_run_with_timeout "$timeout_sec" ssh \
         -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \

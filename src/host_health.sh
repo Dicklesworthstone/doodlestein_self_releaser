@@ -224,6 +224,37 @@ _HH_CLOCK_DRIFT_WARN=30      # Warn if clock drift > 30 seconds
 _HH_SSH_TIMEOUT=10           # SSH connect timeout (seconds)
 _HH_CMD_TIMEOUT=30           # Command execution timeout (seconds)
 
+# Timeout helper (supports GNU timeout and coreutils gtimeout)
+_HH_TIMEOUT_CMD=""
+_hh_timeout_cmd() {
+    if [[ -n "$_HH_TIMEOUT_CMD" ]]; then
+        echo "$_HH_TIMEOUT_CMD"
+        return 0
+    fi
+
+    if command -v timeout &>/dev/null; then
+        _HH_TIMEOUT_CMD="timeout"
+    elif command -v gtimeout &>/dev/null; then
+        _HH_TIMEOUT_CMD="gtimeout"
+    else
+        _HH_TIMEOUT_CMD=""
+    fi
+
+    echo "$_HH_TIMEOUT_CMD"
+}
+
+_hh_run_with_timeout() {
+    local seconds="$1"
+    shift
+    local cmd
+    cmd=$(_hh_timeout_cmd)
+    if [[ -n "$cmd" ]]; then
+        "$cmd" "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Colors for output (if not disabled)
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
     _HH_RED=$'\033[0;31m'
@@ -310,9 +341,9 @@ _hh_exec_on_host() {
     local cmd="$4"
 
     if [[ "$connection" == "local" ]]; then
-        timeout "$_HH_CMD_TIMEOUT" bash -c "$cmd" 2>/dev/null
+        _hh_run_with_timeout "$_HH_CMD_TIMEOUT" bash -c "$cmd" 2>/dev/null
     else
-        timeout "$_HH_CMD_TIMEOUT" ssh \
+        _hh_run_with_timeout "$_HH_CMD_TIMEOUT" ssh \
             -o ConnectTimeout="$_HH_SSH_TIMEOUT" \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new \
@@ -336,7 +367,7 @@ _hh_check_connectivity() {
     local start_ms end_ms latency_ms
     start_ms=$(date +%s%3N 2>/dev/null || echo "0")
 
-    if timeout "$_HH_SSH_TIMEOUT" ssh \
+    if _hh_run_with_timeout "$_HH_SSH_TIMEOUT" ssh \
         -o ConnectTimeout="$_HH_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \

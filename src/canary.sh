@@ -39,6 +39,42 @@ CANARY_STATE_DIR="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/ca
 # Timeout for each test (seconds)
 CANARY_TIMEOUT=300
 
+# Timeout helper (supports GNU timeout and coreutils gtimeout)
+_CANARY_TIMEOUT_CMD=""
+_canary_timeout_cmd() {
+    if [[ -n "$_CANARY_TIMEOUT_CMD" ]]; then
+        echo "$_CANARY_TIMEOUT_CMD"
+        return 0
+    fi
+
+    if command -v timeout &>/dev/null; then
+        _CANARY_TIMEOUT_CMD="timeout"
+    elif command -v gtimeout &>/dev/null; then
+        _CANARY_TIMEOUT_CMD="gtimeout"
+    else
+        _CANARY_TIMEOUT_CMD=""
+    fi
+
+    echo "$_CANARY_TIMEOUT_CMD"
+}
+
+_canary_run_with_timeout() {
+    local seconds="$1"
+    shift
+    local cmd
+    cmd=$(_canary_timeout_cmd)
+    if [[ -n "$cmd" ]]; then
+        "$cmd" "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Shell-escape a string for safe remote execution (single-quote strategy)
+_canary_shell_escape() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\"'\"'/g")"
+}
+
 # ============================================================================
 # Docker Helpers
 # ============================================================================
@@ -73,7 +109,7 @@ _canary_get_install_cmd() {
             echo "apk add --no-cache curl ca-certificates bash"
             ;;
         *)
-            echo "echo 'Unknown package manager for $image'"
+            echo "echo 'Unknown package manager for $image' >&2; exit 1"
             ;;
     esac
 }
@@ -143,12 +179,18 @@ canary_run_test() {
     # Create the test script
     cat > "$tmpdir/test.sh" << TESTSCRIPT
 #!/usr/bin/env $shell
-set -e
+set -u
+if set -o pipefail 2>/dev/null; then
+    set -o pipefail
+fi
 
 echo "=== Canary test: $tool on $image (mode: $mode) ==="
 
 # Install dependencies
-$install_deps
+if ! sh -c "$install_deps"; then
+    echo "Dependency installation failed" >&2
+    exit 1
+fi
 
 # Run installer
 echo "Installing $tool..."
@@ -233,7 +275,7 @@ DOCKERFILE
 
     log_info "Running canary test..."
 
-    output=$(timeout "$CANARY_TIMEOUT" docker run --rm "$tag" 2>&1) || status=$?
+    output=$(_canary_run_with_timeout "$CANARY_TIMEOUT" docker run --rm "$tag" 2>&1) || status=$?
 
     # Cleanup image
     docker rmi "$tag" &>/dev/null || true
@@ -390,7 +432,7 @@ canary_run_macos() {
     log_info "Running canary test for $tool on macOS ($host)..."
 
     # Check SSH connectivity
-    if ! timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null; then
+    if ! _canary_run_with_timeout 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null; then
         log_error "Cannot connect to $host"
         return 1
     fi
@@ -400,7 +442,14 @@ canary_run_macos() {
 
     local output
     local status=0
-    output=$(ssh "$host" "curl -sSL '$installer_url' | bash -s -- --mode $mode && $tool --version" 2>&1) || status=$?
+    local installer_url_esc mode_esc tool_esc
+    installer_url_esc=$(_canary_shell_escape "$installer_url")
+    mode_esc=$(_canary_shell_escape "$mode")
+    tool_esc=$(_canary_shell_escape "$tool")
+    local remote_cmd
+    remote_cmd="curl -sSL $installer_url_esc | bash -s -- --mode $mode_esc --non-interactive && $tool_esc --version"
+
+    output=$(ssh "$host" "$remote_cmd" 2>&1) || status=$?
 
     if [[ $status -eq 0 ]]; then
         log_ok "$tool installed and working on $host"

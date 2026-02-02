@@ -403,7 +403,7 @@ gh_workflow_runs() {
     # Validate status parameter (GitHub API enum)
     if [[ -n "$status" ]]; then
         case "$status" in
-            queued|in_progress|completed|waiting|requested|pending|action_required|cancelled|failure|neutral|skipped|stale|success|timed_out)
+            queued|in_progress|completed)
                 ;;
             *)
                 _gh_log_error "Invalid status: $status"
@@ -418,15 +418,16 @@ gh_workflow_runs() {
         return 4
     fi
 
-    local endpoint="repos/$repo/actions/runs?per_page=$limit"
-    # URL-encode workflow to prevent injection (only allow safe chars)
+    local endpoint=""
     if [[ -n "$workflow" ]]; then
         # Validate workflow contains only safe filename characters
         if [[ ! "$workflow" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
             _gh_log_error "Invalid workflow name: $workflow"
             return 4
         fi
-        endpoint+="&workflow_file=$workflow"
+        endpoint="repos/$repo/actions/workflows/$workflow/runs?per_page=$limit"
+    else
+        endpoint="repos/$repo/actions/runs?per_page=$limit"
     fi
     [[ -n "$status" ]] && endpoint+="&status=$status"
 
