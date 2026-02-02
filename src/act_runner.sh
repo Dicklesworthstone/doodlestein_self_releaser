@@ -250,9 +250,24 @@ act_run_workflow() {
 
     # Run act with timeout
     # Use PIPESTATUS to capture the actual command exit code, not tee's
-    timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
-        --directory "$repo_path" \
-        2>&1 | tee "$log_file"
+    local timeout_cmd=""
+    if command -v timeout &>/dev/null; then
+        timeout_cmd="timeout"
+    elif command -v gtimeout &>/dev/null; then
+        timeout_cmd="gtimeout"
+    else
+        _log_warn "timeout command not available; running act without timeout"
+    fi
+
+    if [[ -n "$timeout_cmd" ]]; then
+        "$timeout_cmd" "$ACT_TIMEOUT" "${act_cmd[@]}" \
+            --directory "$repo_path" \
+            2>&1 | tee "$log_file"
+    else
+        "${act_cmd[@]}" \
+            --directory "$repo_path" \
+            2>&1 | tee "$log_file"
+    fi
     local exit_code=${PIPESTATUS[0]}
 
     local end_time

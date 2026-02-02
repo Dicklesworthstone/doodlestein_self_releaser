@@ -1107,9 +1107,7 @@ _watch_acquire_lock() {
         if [[ -f "$_WATCH_LOCK_FILE" ]]; then
             local lock_pid
             # Read PID (format: "PID:TIMESTAMP" - timestamp for future stale detection)
-            # shellcheck disable=SC2034  # lock_ts reserved for future stale lock timeout
-            local lock_ts
-            IFS=':' read -r lock_pid lock_ts < "$_WATCH_LOCK_FILE" 2>/dev/null || true
+            IFS=':' read -r lock_pid _ < "$_WATCH_LOCK_FILE" 2>/dev/null || true
 
             # Validate PID is numeric
             if [[ ! "$lock_pid" =~ ^[0-9]+$ ]]; then
@@ -4473,7 +4471,6 @@ _validate_artifact_naming() {
     local status="ok"
     local messages=()
     local sources="{}"
-    local mismatches=()
     local recommendations=()
 
     # Get config pattern

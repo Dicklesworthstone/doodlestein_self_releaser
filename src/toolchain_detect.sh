@@ -334,14 +334,24 @@ _tc_install_go() {
     fi
 
     # Check if we can write to /usr/local
+    local extract_ok=false
     if [[ -w /usr/local ]]; then
-        tar -C /usr/local -xzf "$temp_file"
+        if tar -C /usr/local -xzf "$temp_file"; then
+            extract_ok=true
+        fi
     else
         _tc_log_info "Need sudo to install to /usr/local/go"
-        sudo tar -C /usr/local -xzf "$temp_file"
+        if sudo tar -C /usr/local -xzf "$temp_file"; then
+            extract_ok=true
+        fi
     fi
 
     rm -f "$temp_file"
+
+    if [[ "$extract_ok" != "true" ]]; then
+        _tc_log_error "Failed to extract Go archive"
+        return 1
+    fi
 
     # Add to PATH hint
     _tc_log_ok "Go installed to /usr/local/go"

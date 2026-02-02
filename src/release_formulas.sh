@@ -205,7 +205,11 @@ EOF
         if [[ -n "$name" ]]; then
             url=$(echo "$assets_json" | jq -r --arg n "$name" '.[] | select(.name == $n) | .browser_download_url')
             if [[ -n "$checksums_content" ]]; then
-                sha=$(echo "$checksums_content" | grep -E "$name" | awk '{print $1}')
+                sha=$(printf '%s\n' "$checksums_content" | awk -v n="$name" '
+                    $2==n {print $1; exit}
+                    $2=="*"n {print $1; exit}
+                    $1==n {print $2; exit}
+                ')
             fi
             echo "$url|$sha"
         fi

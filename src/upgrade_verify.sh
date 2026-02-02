@@ -103,7 +103,20 @@ upgrade_verify_tool() {
         return 0
     fi
 
-    output=$(timeout "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" upgrade --check 2>&1) || exit_code=$?
+    local timeout_cmd=""
+    if command -v timeout &>/dev/null; then
+        timeout_cmd="timeout"
+    elif command -v gtimeout &>/dev/null; then
+        timeout_cmd="gtimeout"
+    else
+        log_warn "timeout command not available; running upgrade check without timeout"
+    fi
+
+    if [[ -n "$timeout_cmd" ]]; then
+        output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" upgrade --check 2>&1) || exit_code=$?
+    else
+        output=$("$bin_path" upgrade --check 2>&1) || exit_code=$?
+    fi
 
     # Parse output
     local found_asset=false

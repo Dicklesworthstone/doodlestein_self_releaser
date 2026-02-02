@@ -241,7 +241,8 @@ sbom_generate_artifacts() {
         local output_ext
         case "$format" in
             spdx|spdx-json)   output_ext="spdx.json" ;;
-            cyclonedx|cdx|*)  output_ext="cdx.json" ;;
+            cyclonedx|cdx|cyclonedx-json)  output_ext="cdx.json" ;;
+            *)  output_ext="spdx.json" ;;  # Fallback to default; sbom_generate will validate
         esac
         local sbom_file="${artifact%.*}.sbom.$output_ext"
         if [[ -f "$sbom_file" ]]; then

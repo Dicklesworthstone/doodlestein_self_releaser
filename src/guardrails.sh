@@ -83,6 +83,51 @@ EOF
 # Path Resolution
 # ============================================================================
 
+# Normalize a path without relying on realpath (resolves ., .., and //)
+# Usage: _normalize_path <path>
+_normalize_path() {
+  local path="$1"
+  local is_abs=false
+  [[ "$path" == /* ]] && is_abs=true
+
+  local IFS='/'
+  local -a parts=()
+  read -r -a parts <<< "$path"
+
+  local -a stack=()
+  local part
+  for part in "${parts[@]}"; do
+    case "$part" in
+      ""|".")
+        continue
+        ;;
+      "..")
+        if [[ ${#stack[@]} -gt 0 ]]; then
+          unset 'stack[${#stack[@]}-1]'
+        elif ! $is_abs; then
+          stack+=("..")
+        fi
+        ;;
+      *)
+        stack+=("$part")
+        ;;
+    esac
+  done
+
+  local normalized=""
+  if $is_abs; then
+    normalized="/"
+  fi
+  if [[ ${#stack[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=/; printf '%s' "${stack[*]}")
+    normalized+="$joined"
+  fi
+
+  [[ -z "$normalized" ]] && normalized="/"
+  printf '%s' "$normalized"
+}
+
 # Resolve a path to absolute, expanding ~ and validating
 # Usage: resolve_path <path> [--must-exist]
 # Returns: Absolute path on stdout
@@ -134,9 +179,7 @@ resolve_path() {
     fi
   else
     # Manual normalization for systems without realpath
-    # Remove trailing slashes and double slashes
-    resolved="${resolved%/}"
-    resolved=$(echo "$resolved" | sed 's#//*#/#g')
+    resolved=$(_normalize_path "$resolved")
 
     if $must_exist && [[ ! -e "$resolved" ]]; then
       echo "Error: Path does not exist: $resolved" >&2

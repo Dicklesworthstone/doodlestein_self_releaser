@@ -307,12 +307,14 @@ artifact_naming_generate_dual() {
     local compat
     if [[ -n "$compat_pattern" ]]; then
         # Use explicit pattern if provided
-        compat="$compat_pattern"
-        # Substitute variables
-        compat="${compat//\$\{name\}/$tool}"
-        compat="${compat//\$\{os\}/$os}"
-        compat="${compat//\$\{arch\}/$arch}"
-        compat="${compat}.${ext}"
+        compat=$(artifact_naming_substitute "$compat_pattern" "$tool" "$version" "$os" "$arch" "$ext")
+        if [[ "$compat" == *".${ext}" ]]; then
+            : # Extension already present
+        elif [[ "$compat" =~ \.(tar\.gz|tgz|zip|exe)$ ]]; then
+            : # Extension already present (different from ext)
+        else
+            compat="${compat}.${ext}"
+        fi
     else
         # Default compat: no version
         compat="${tool}-${os}-${arch}.${ext}"
@@ -463,11 +465,28 @@ artifact_naming_substitute() {
     local version_stripped="${version#v}"
 
     result="${result//\$\{name\}/$tool}"
+    result="${result//\$\{NAME\}/$tool}"
+    result="${result//\$\{tool\}/$tool}"
+    result="${result//\$\{TOOL\}/$tool}"
+    result="${result//\$\{app\}/$tool}"
+    result="${result//\$\{APP\}/$tool}"
+
     result="${result//\$\{version\}/$version_stripped}"
+    result="${result//\$\{VERSION\}/$version_stripped}"
+
     result="${result//\$\{os\}/$os}"
+    result="${result//\$\{OS\}/$os}"
     result="${result//\$\{arch\}/$arch}"
-    result="${result//\$\{ext\}/.$ext}"
+    result="${result//\$\{ARCH\}/$arch}"
+
     result="${result//\$\{target\}/${os}-${arch}}"
+    result="${result//\$\{TARGET\}/${os}-${arch}}"
+
+    # Replace extension placeholders; handle ".${ext}" before bare "${ext}"
+    result="${result//\.\$\{ext\}/.${ext}}"
+    result="${result//\.\$\{EXT\}/.${ext}}"
+    result="${result//\$\{ext\}/$ext}"
+    result="${result//\$\{EXT\}/$ext}"
 
     echo "$result"
 }

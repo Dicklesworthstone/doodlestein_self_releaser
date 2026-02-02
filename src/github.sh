@@ -692,6 +692,11 @@ gh_upload_asset_dual() {
         return 4
     fi
 
+    if ! command -v jq &>/dev/null; then
+        _gh_log_error "jq required for dual-name upload"
+        return 3
+    fi
+
     # Generate dual names using artifact_naming module
     local names_json
     if command -v artifact_naming_generate_dual_for_tool &>/dev/null; then
@@ -761,8 +766,13 @@ gh_upload_asset_dual() {
             same_names: $same
         }'
 
-    [[ "$versioned_result" == "uploaded" ]] && return 0
-    return 7
+    if [[ "$versioned_result" != "uploaded" ]]; then
+        return 7
+    fi
+    if [[ "$compat_result" == "failed" ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # Compare two commits/tags
