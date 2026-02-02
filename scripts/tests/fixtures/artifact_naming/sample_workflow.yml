@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o mytool
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mytool-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: mytool
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Package
+        run: |
+          for dir in mytool-*; do
+            tar -czvf "${dir}.tar.gz" -C "$dir" .
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mytool-linux-amd64.tar.gz
+            mytool-darwin-arm64.tar.gz
