@@ -1028,6 +1028,211 @@ act_get_local_path() {
     yq -r '.local_path // ""' "$config_file" 2>/dev/null
 }
 
+# Ensure remote repo is in a valid git state for builds (bd-1tv.9)
+# Handles: missing repos, broken .git, dirty working tree
+#
+# Usage: act_ensure_remote_repo_ready <host> <remote_path> <repo_url> <version>
+# Returns: 0 on success, 1 on failure
+act_ensure_remote_repo_ready() {
+    local host="$1"
+    local remote_path="$2"
+    local repo_url="$3"
+    local version="$4"
+
+    _log_info "Ensuring repo at $host:$remote_path is ready..."
+
+    # Determine if this is a Windows host
+    local is_windows=false
+    [[ "$host" == "wlap" ]] && is_windows=true
+
+    # Build commands for git operations
+    local test_dir_cmd test_git_cmd clone_cmd pull_cmd checkout_cmd stash_cmd rm_cmd
+
+    if $is_windows; then
+        # Windows: use PowerShell for reliable path handling
+        local win_path="${remote_path//\//\\}"
+        test_dir_cmd="if exist \"$win_path\" (exit 0) else (exit 1)"
+        test_git_cmd="if exist \"$win_path\\.git\" (exit 0) else (exit 1)"
+        clone_cmd="git clone \"$repo_url\" \"$win_path\""
+        pull_cmd="cd /d \"$win_path\" && git fetch --all && git reset --hard origin/HEAD"
+        checkout_cmd="cd /d \"$win_path\" && git checkout \"$version\""
+        stash_cmd="cd /d \"$win_path\" && git stash --include-untracked"
+        rm_cmd="rmdir /s /q \"$win_path\""
+    else
+        # Unix
+        test_dir_cmd="test -d '$remote_path'"
+        test_git_cmd="test -d '$remote_path/.git'"
+        clone_cmd="git clone '$repo_url' '$remote_path'"
+        pull_cmd="cd '$remote_path' && git fetch --all && git reset --hard origin/HEAD"
+        checkout_cmd="cd '$remote_path' && git checkout '$version'"
+        stash_cmd="cd '$remote_path' && git stash --include-untracked"
+        rm_cmd="rm -rf '$remote_path'"
+    fi
+
+    # Step 1: Check if path exists
+    if ! _act_ssh_exec "$host" "$test_dir_cmd" 30 &>/dev/null; then
+        _log_info "Directory doesn't exist on $host, cloning..."
+        if ! _act_ssh_exec "$host" "$clone_cmd" 300; then
+            _log_error "Failed to clone repo on $host"
+            return 1
+        fi
+        _log_ok "Cloned repo on $host"
+    else
+        # Step 2: Check if .git exists
+        if ! _act_ssh_exec "$host" "$test_git_cmd" 30 &>/dev/null; then
+            _log_warn "Missing .git on $host, re-cloning..."
+
+            # Remove existing directory and clone fresh
+            if ! _act_ssh_exec "$host" "$rm_cmd && $clone_cmd" 300; then
+                _log_error "Failed to re-clone repo on $host"
+                return 1
+            fi
+            _log_ok "Re-cloned repo on $host"
+        else
+            # Step 3: Try to update (stash if needed)
+            _log_info "Updating repo on $host..."
+
+            # First try a clean pull with reset (handles most dirty tree issues)
+            if ! _act_ssh_exec "$host" "$pull_cmd" 120 2>/dev/null; then
+                _log_warn "Pull failed on $host, trying stash and pull..."
+
+                # Stash any local changes and try again
+                if _act_ssh_exec "$host" "$stash_cmd" 60 2>/dev/null; then
+                    if ! _act_ssh_exec "$host" "$pull_cmd" 120; then
+                        _log_error "Pull still failed after stash on $host"
+                        return 1
+                    fi
+                else
+                    _log_warn "Stash failed, trying hard reset..."
+                    # Last resort: hard reset to remote
+                    if ! _act_ssh_exec "$host" "$pull_cmd" 120; then
+                        _log_error "Hard reset failed on $host"
+                        return 1
+                    fi
+                fi
+            fi
+            _log_ok "Updated repo on $host"
+        fi
+    fi
+
+    # Step 4: Checkout the target version
+    _log_info "Checking out $version on $host..."
+    if ! _act_ssh_exec "$host" "$checkout_cmd" 60; then
+        _log_error "Failed to checkout $version on $host"
+        return 1
+    fi
+
+    _log_ok "Repo ready at $host:$remote_path (version: $version)"
+    return 0
+}
+
+# Ensure repos are ready on all native build hosts for a tool
+# Usage: act_ensure_repos_ready <tool_name> <version> [targets...]
+# Returns: JSON with readiness results
+act_ensure_repos_ready() {
+    local tool_name="$1"
+    local version="$2"
+    shift 2
+    local targets_arg=("$@")
+
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+    if [[ ! -f "$config_file" ]]; then
+        _log_error "Config not found: $config_file"
+        echo '{"status":"error","error":"Config not found"}'
+        return 4
+    fi
+
+    local repo_url
+    repo_url=$(act_get_repo "$tool_name")
+    if [[ -z "$repo_url" ]]; then
+        _log_error "No repo URL in config"
+        echo '{"status":"error","error":"No repo URL in config"}'
+        return 4
+    fi
+
+    # Convert repo shorthand to full URL
+    if [[ "$repo_url" != https://* && "$repo_url" != git@* ]]; then
+        repo_url="https://github.com/${repo_url}.git"
+    fi
+
+    # Determine targets
+    local targets
+    if [[ ${#targets_arg[@]} -gt 0 ]]; then
+        targets="${targets_arg[*]}"
+    else
+        targets=$(act_get_targets "$tool_name")
+    fi
+
+    # Find unique native hosts that need repo setup
+    local -A hosts_checked=()
+    local results=()
+    local ready=0 failed=0
+
+    for target in $targets; do
+        # Skip targets that use act (no remote repo needed)
+        if act_platform_uses_act "$tool_name" "$target"; then
+            continue
+        fi
+
+        local host
+        host=$(act_get_native_host "$target")
+        [[ -z "$host" ]] && continue
+
+        # Skip if already checked this host
+        [[ -n "${hosts_checked[$host]:-}" ]] && continue
+        hosts_checked[$host]=1
+
+        # Get remote path for this host
+        local remote_path
+        remote_path=$(yq -r '.host_paths.'"$host"' // ""' "$config_file" 2>/dev/null)
+        if [[ -z "$remote_path" ]]; then
+            remote_path=$(act_get_local_path "$tool_name")
+        fi
+
+        _log_info "Checking $host:$remote_path..."
+
+        if act_ensure_remote_repo_ready "$host" "$remote_path" "$repo_url" "$version"; then
+            results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"ready\"}")
+            ((ready++))
+        else
+            results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"failed\"}")
+            ((failed++))
+        fi
+    done
+
+    # Build results JSON
+    local status
+    if [[ $failed -eq 0 ]]; then
+        status="success"
+    elif [[ $ready -gt 0 ]]; then
+        status="partial"
+    else
+        status="failed"
+    fi
+
+    local results_json
+    if [[ ${#results[@]} -eq 0 ]]; then
+        results_json="[]"
+    else
+        results_json=$(printf '%s\n' "${results[@]}" | jq -s '.')
+    fi
+
+    jq -nc \
+        --arg status "$status" \
+        --argjson ready "$ready" \
+        --argjson failed "$failed" \
+        --argjson hosts "$results_json" \
+        '{
+            status: $status,
+            ready: $ready,
+            failed: $failed,
+            hosts: $hosts
+        }'
+
+    [[ $failed -gt 0 ]] && return 1
+    return 0
+}
+
 # Execute command on remote host via SSH
 # Usage: _act_ssh_exec <host> <command> [timeout]
 # Returns: Exit code from remote command
