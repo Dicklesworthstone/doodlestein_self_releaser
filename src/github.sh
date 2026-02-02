@@ -603,6 +603,165 @@ gh_upload_asset() {
     fi
 }
 
+# Upload release asset with a specific name
+# Usage: gh_upload_asset_named <upload_url> <file_path> <upload_name> [content_type]
+# This allows uploading the same file with a different name
+gh_upload_asset_named() {
+    local upload_url="$1"
+    local file_path="$2"
+    local upload_name="$3"
+    local content_type="${4:-application/octet-stream}"
+
+    if [[ -z "$upload_url" ]] || [[ -z "$file_path" ]] || [[ -z "$upload_name" ]]; then
+        _gh_log_error "Usage: gh_upload_asset_named <upload_url> <file_path> <upload_name>"
+        return 4
+    fi
+
+    if [[ ! -f "$file_path" ]]; then
+        _gh_log_error "File not found: $file_path"
+        return 4
+    fi
+
+    # Validate filename contains only safe characters for URL
+    if [[ ! "$upload_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        _gh_log_error "Invalid upload name: $upload_name (contains unsafe characters)"
+        return 4
+    fi
+
+    # Remove template part from upload_url
+    upload_url="${upload_url%\{*}"
+    upload_url+="?name=$upload_name"
+
+    local token=""
+    if command -v secrets_get_gh_token &>/dev/null; then
+        token=$(secrets_get_gh_token 2>/dev/null || true)
+    fi
+    if [[ -z "$token" ]] && gh_check 2>/dev/null; then
+        token=$(gh auth token 2>/dev/null || true)
+    fi
+    [[ -z "$token" ]] && token="${GITHUB_TOKEN:-}"
+
+    if [[ -z "$token" ]]; then
+        _gh_log_error "No GitHub token available for asset upload"
+        return 3
+    fi
+
+    local http_code response
+    response=$(curl -sS \
+        -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: $content_type" \
+        --data-binary "@$file_path" \
+        -w "\n__HTTP_CODE__%{http_code}" \
+        "$upload_url" 2>&1)
+
+    http_code="${response##*__HTTP_CODE__}"
+    response="${response%__HTTP_CODE__*}"
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+        echo "$response"
+        return 0
+    else
+        _gh_log_error "Upload failed with HTTP $http_code for $upload_name"
+        echo "$response" >&2
+        return 7
+    fi
+}
+
+# Upload release asset with dual naming for install.sh compatibility (bd-1tv.3)
+# Usage: gh_upload_asset_dual <upload_url> <file_path> <tool> <version> <os> <arch> <ext> [repo_path]
+# Returns: JSON with upload results for both names
+gh_upload_asset_dual() {
+    local upload_url="$1"
+    local file_path="$2"
+    local tool="$3"
+    local version="$4"
+    local os="$5"
+    local arch="$6"
+    local ext="${7:-tar.gz}"
+    local repo_path="${8:-}"
+
+    if [[ -z "$upload_url" ]] || [[ -z "$file_path" ]]; then
+        _gh_log_error "Usage: gh_upload_asset_dual <upload_url> <file_path> <tool> <version> <os> <arch>"
+        return 4
+    fi
+
+    if [[ ! -f "$file_path" ]]; then
+        _gh_log_error "File not found: $file_path"
+        return 4
+    fi
+
+    # Generate dual names using artifact_naming module
+    local names_json
+    if command -v artifact_naming_generate_dual_for_tool &>/dev/null; then
+        names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" "$ext" "$repo_path")
+    else
+        # Fallback: generate default names
+        local version_stripped="${version#v}"
+        names_json=$(jq -nc \
+            --arg versioned "${tool}-${version_stripped}-${os}-${arch}.${ext}" \
+            --arg compat "${tool}-${os}-${arch}.${ext}" \
+            '{versioned: $versioned, compat: $compat, same: ($versioned == $compat)}')
+    fi
+
+    local versioned_name compat_name same_names
+    versioned_name=$(echo "$names_json" | jq -r '.versioned')
+    compat_name=$(echo "$names_json" | jq -r '.compat')
+    same_names=$(echo "$names_json" | jq -r '.same')
+
+    local content_type="application/octet-stream"
+    case "$ext" in
+        tar.gz|tgz) content_type="application/gzip" ;;
+        zip) content_type="application/zip" ;;
+    esac
+
+    local versioned_result="failed" compat_result="skipped"
+    local versioned_error="" compat_error=""
+
+    # Upload with versioned name
+    _gh_log_info "Uploading: $versioned_name"
+    if gh_upload_asset_named "$upload_url" "$file_path" "$versioned_name" "$content_type" 2>/dev/null; then
+        versioned_result="uploaded"
+        _gh_log_ok "  Uploaded: $versioned_name"
+    else
+        versioned_error="Upload failed for $versioned_name"
+        _gh_log_error "  $versioned_error"
+    fi
+
+    # Upload with compat name (if different)
+    if [[ "$same_names" != "true" && "$versioned_result" == "uploaded" ]]; then
+        _gh_log_info "Uploading compat name: $compat_name"
+        if gh_upload_asset_named "$upload_url" "$file_path" "$compat_name" "$content_type" 2>/dev/null; then
+            compat_result="uploaded"
+            _gh_log_ok "  Uploaded: $compat_name"
+        else
+            compat_error="Upload failed for $compat_name"
+            _gh_log_error "  $compat_error"
+        fi
+    elif [[ "$same_names" == "true" ]]; then
+        compat_result="same_as_versioned"
+    fi
+
+    # Build result JSON
+    jq -nc \
+        --arg versioned_name "$versioned_name" \
+        --arg versioned_result "$versioned_result" \
+        --arg versioned_error "$versioned_error" \
+        --arg compat_name "$compat_name" \
+        --arg compat_result "$compat_result" \
+        --arg compat_error "$compat_error" \
+        --argjson same "$same_names" \
+        '{
+            versioned: {name: $versioned_name, status: $versioned_result, error: $versioned_error},
+            compat: {name: $compat_name, status: $compat_result, error: $compat_error},
+            same_names: $same
+        }'
+
+    [[ "$versioned_result" == "uploaded" ]] && return 0
+    return 7
+}
+
 # Compare two commits/tags
 # Usage: gh_compare <owner/repo> <base> <head>
 gh_compare() {
