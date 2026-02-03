@@ -1409,9 +1409,20 @@ act_run_native_build() {
                 [[ -n "$bin" ]] && binaries_to_download+=("$bin")
             done <<< "$workspace_binaries"
             _log_info "Workspace mode: downloading ${#binaries_to_download[@]} binaries"
-        else
+        elif [[ -n "$binary_name" ]]; then
             # Single binary mode
             binaries_to_download=("$binary_name")
+        else
+            _log_error "No binary_name or workspace_binaries configured"
+            jq -nc '{status: "error", exit_code: 4, error: "No binaries configured"}'
+            return 4
+        fi
+
+        # Sanity check: ensure we have binaries to download
+        if [[ ${#binaries_to_download[@]} -eq 0 ]]; then
+            _log_error "No binaries to download (workspace_binaries may be empty)"
+            jq -nc '{status: "error", exit_code: 4, error: "No binaries to download"}'
+            return 4
         fi
 
         # Remote artifact path depends on language
@@ -1480,9 +1491,8 @@ act_run_native_build() {
         if [[ -n "$workspace_binaries" && ${#local_artifact_paths[@]} -gt 0 && "$status" != "failed" ]]; then
             _log_info "Packaging ${#local_artifact_paths[@]} workspace binaries into release tarball..."
 
-            # Determine archive format and name
+            # Determine archive format
             local archive_ext="tar.gz"
-            local archive_cmd="tar czf"
             if [[ "$platform" == windows/* ]]; then
                 archive_ext="zip"
             fi
@@ -1491,6 +1501,13 @@ act_run_native_build() {
             local plat_name="${platform//\//-}"
             # Use version parameter (strip leading 'v' if present)
             local version_stripped="${version#v}"
+
+            # Validate version is not empty
+            if [[ -z "$version_stripped" ]]; then
+                _log_warn "Version is empty, using 'unknown' for archive name"
+                version_stripped="unknown"
+            fi
+
             local archive_name="${tool_name}-${version_stripped}-${plat_name}.${archive_ext}"
             local archive_path="$artifact_dir/$archive_name"
 
@@ -1501,10 +1518,11 @@ act_run_native_build() {
             done
 
             # Create the archive
+            local archive_output
             if [[ "$archive_ext" == "zip" ]]; then
                 # Windows: use zip
                 if command -v zip &>/dev/null; then
-                    (cd "$artifact_dir" && zip "$archive_name" "${archive_files[@]}" 2>&1)
+                    archive_output=$(cd "$artifact_dir" && zip "$archive_name" "${archive_files[@]}" 2>&1)
                     if [[ -f "$archive_path" ]]; then
                         _log_ok "Created archive: $archive_path"
                         # Update artifact path to point to the archive
@@ -1512,13 +1530,19 @@ act_run_native_build() {
                         local_artifact_paths=("$archive_path")
                     else
                         _log_warn "Failed to create zip archive"
+                        _log_warn "zip output: $archive_output"
+                        echo "Archive creation failed: $archive_output" >> "$log_file"
+                        # Fall back to comma-separated paths
+                        local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
                     fi
                 else
                     _log_warn "zip not available, skipping archive creation"
+                    # Fall back to comma-separated paths
+                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
                 fi
             else
                 # Unix: use tar
-                (cd "$artifact_dir" && tar czf "$archive_name" "${archive_files[@]}" 2>&1)
+                archive_output=$(cd "$artifact_dir" && tar czf "$archive_name" "${archive_files[@]}" 2>&1)
                 if [[ -f "$archive_path" ]]; then
                     _log_ok "Created archive: $archive_path"
                     # Update artifact path to point to the archive
@@ -1526,6 +1550,10 @@ act_run_native_build() {
                     local_artifact_paths=("$archive_path")
                 else
                     _log_warn "Failed to create tar archive"
+                    _log_warn "tar output: $archive_output"
+                    echo "Archive creation failed: $archive_output" >> "$log_file"
+                    # Fall back to comma-separated paths
+                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
                 fi
             fi
         else
