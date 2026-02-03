@@ -1906,14 +1906,47 @@ EOF
     local collected_count=0
     local collision_count=0
     local -A collected_names=()
+    local -a artifact_rename_pairs=()
+
+    _build_target_suffix_name() {
+        local name="$1"
+        local target="$2"
+        local os arch base ext
+
+        [[ -z "$name" || -z "$target" ]] && printf '%s\n' "$name" && return 0
+
+        os="${target%/*}"
+        arch="${target#*/}"
+        if [[ -z "$os" || -z "$arch" || "$os" == "$target" ]]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+
+        base="$name"
+        ext=""
+        if [[ "$name" == *.* ]]; then
+            ext=".${name##*.}"
+            base="${name%.*}"
+        fi
+
+        if [[ "$base" == *"_${os}_${arch}" ]]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+
+        printf '%s_%s_%s%s\n' "$base" "$os" "$arch" "$ext"
+    }
 
     _build_collect_artifact_file() {
         local src="$1"
+        local target="${2:-}"
         local name dest
+        local orig_name=""
 
         [[ -z "$src" || ! -f "$src" ]] && return 0
 
         name=$(basename "$src")
+        orig_name="$name"
         dest="$output_dir/$name"
 
         if [[ -n "${collected_names[$name]:-}" ]]; then
@@ -1922,12 +1955,43 @@ EOF
                 log_info "Duplicate artifact (same content): $name"
                 return 0
             fi
-            log_error "Artifact name collision: $name"
-            log_error "  $prior"
-            log_error "  $src"
-            collision_count=$((collision_count + 1))
-            collect_failed=true
-            return 1
+            if [[ -n "$target" ]]; then
+                local renamed
+                renamed=$(_build_target_suffix_name "$name" "$target")
+                if [[ -z "$renamed" || "$renamed" == "$name" ]]; then
+                    log_error "Artifact name collision: $name"
+                    log_error "  $prior"
+                    log_error "  $src"
+                    collision_count=$((collision_count + 1))
+                    collect_failed=true
+                    return 1
+                fi
+                log_warn "Artifact name collision: $name (target=$target); saving as $renamed"
+                name="$renamed"
+                dest="$output_dir/$name"
+                artifact_rename_pairs+=("${target}||${orig_name}\t${name}")
+
+                if [[ -f "$dest" ]]; then
+                    if cmp -s "$dest" "$src" 2>/dev/null; then
+                        log_info "Artifact already present: $name"
+                        collected_names["$name"]="$src"
+                        return 0
+                    fi
+                    log_error "Artifact name collision after suffix: $name"
+                    log_error "  $dest"
+                    log_error "  $src"
+                    collision_count=$((collision_count + 1))
+                    collect_failed=true
+                    return 1
+                fi
+            else
+                log_error "Artifact name collision: $name"
+                log_error "  $prior"
+                log_error "  $src"
+                collision_count=$((collision_count + 1))
+                collect_failed=true
+                return 1
+            fi
         fi
 
         if [[ -f "$dest" ]]; then
@@ -2316,6 +2380,7 @@ EOF
         local output_dir="$4"
         local repo_path="$5"
         local binary_name="$6"
+        local binary_override="${7:-}"
 
         local os arch
         os="${target%/*}"
@@ -2366,8 +2431,12 @@ EOF
 
         local archive_path="$output_dir/$versioned_name"
 
-        local binary_path
-        binary_path=$(_build_find_binary "$output_dir" "$binary_name" "$os" 2>/dev/null || echo "")
+        local binary_path=""
+        if [[ -n "$binary_override" && -f "$binary_override" ]]; then
+            binary_path="$binary_override"
+        else
+            binary_path=$(_build_find_binary "$output_dir" "$binary_name" "$os" 2>/dev/null || echo "")
+        fi
         if [[ -z "$binary_path" || ! -f "$binary_path" ]]; then
             log_warn "Binary not found for $tool $target; skipping archive packaging"
             return 0
@@ -2401,7 +2470,9 @@ EOF
                 log_warn "Overwriting existing archive: $archive_path"
             fi
             local -a tar_args=()
-            tar_args=(-czf "$archive_path" -C "$output_dir" "$(basename "$binary_path")")
+            local binary_dir
+            binary_dir=$(dirname "$binary_path")
+            tar_args=(-czf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
             if [[ -n "$repo_path" ]]; then
                 for include in "${include_files[@]}"; do
                     if [[ -f "$repo_path/$include" ]]; then
@@ -2431,7 +2502,9 @@ EOF
                 log_warn "Overwriting existing archive: $archive_path"
             fi
             local -a tar_args=()
-            tar_args=(-cJf "$archive_path" -C "$output_dir" "$(basename "$binary_path")")
+            local binary_dir
+            binary_dir=$(dirname "$binary_path")
+            tar_args=(-cJf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
             if [[ -n "$repo_path" ]]; then
                 for include in "${include_files[@]}"; do
                     if [[ -f "$repo_path/$include" ]]; then
@@ -2507,12 +2580,12 @@ EOF
         local -a targets=()
         while IFS= read -r target; do
             [[ -n "$target" ]] && targets+=("$target")
-        done < <(echo "$result_json" | jq -r '.targets[]? | select(.status == "success" or .status == "ok" or .status == "passed") | .target // empty' 2>/dev/null)
+        done < <(echo "$result_json" | jq -r '.targets[]? | select(.status == "success" or .status == "ok" or .status == "passed") | .platform // empty' 2>/dev/null)
 
         if [[ ${#targets[@]} -eq 0 ]]; then
             while IFS= read -r target; do
                 [[ -n "$target" ]] && targets+=("$target")
-            done < <(echo "$result_json" | jq -r '.targets[]? | .target // empty' 2>/dev/null)
+            done < <(echo "$result_json" | jq -r '.targets[]? | .platform // empty' 2>/dev/null)
         fi
 
         if [[ ${#targets[@]} -eq 0 ]]; then
@@ -2543,7 +2616,7 @@ EOF
                     *.tar.xz) existing_archive_formats["$target"]="tar.xz" ;;
                     *.zip) existing_archive_formats["$target"]="zip" ;;
                 esac
-            done < <(echo "$result_json" | jq -r '.targets[]? | [.target, (.artifact_path // .artifact // "")] | @tsv' 2>/dev/null)
+            done < <(echo "$result_json" | jq -r '.targets[]? | [.platform, (.artifact_path // .artifact // "")] | @tsv' 2>/dev/null)
         fi
 
         for target in "${targets[@]}"; do
@@ -2613,27 +2686,39 @@ EOF
                 continue
             fi
 
-            _build_package_archive_for_target "$tool" "$version" "$target" "$output_dir" "$repo_path" "$binary_name"
+            local binary_override=""
+            binary_override=$(echo "$result_json" | jq -r --arg t "$target" '.targets[]? | select(.platform == $t) | .artifact_path // empty' 2>/dev/null | head -1)
+            if [[ -n "$binary_override" && "$binary_override" == *","* ]]; then
+                binary_override="${binary_override%%,*}"
+            fi
+            if [[ -z "$binary_override" || ! -f "$binary_override" ]]; then
+                binary_override=""
+            fi
+            _build_package_archive_for_target "$tool" "$version" "$target" "$output_dir" "$repo_path" "$binary_name" "$binary_override"
         done
     }
 
     if [[ $success -gt 0 ]]; then
         log_info "Collecting build artifacts into $output_dir..."
-        while IFS= read -r file; do
+        while IFS=$'\t' read -r target file; do
             [[ -z "$file" ]] && continue
-            _build_collect_artifact_file "$file"
-        done < <(echo "$result" | jq -r '.targets[]? | .artifact_path // empty' 2>/dev/null)
+            IFS=',' read -r -a paths <<< "$file"
+            for path in "${paths[@]}"; do
+                [[ -z "$path" ]] && continue
+                _build_collect_artifact_file "$path" "$target"
+            done
+        done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.artifact_path // "")] | @tsv' 2>/dev/null)
 
-        while IFS= read -r dir; do
+        while IFS=$'\t' read -r target dir; do
             [[ -z "$dir" || ! -d "$dir" ]] && continue
             while IFS= read -r -d '' file; do
                 if [[ "$file" == *.zip ]]; then
                     _build_collect_artifact_zip "$file" "$tag"
                 else
-                    _build_collect_artifact_file "$file"
+                    _build_collect_artifact_file "$file" "$target"
                 fi
             done < <(find "$dir" -type f -print0 2>/dev/null)
-        done < <(echo "$result" | jq -r '.targets[]? | .artifact_dir // empty' 2>/dev/null)
+        done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.artifact_dir // "")] | @tsv' 2>/dev/null)
 
         if $collect_failed; then
             log_error "Artifact collection encountered errors"
@@ -2647,6 +2732,32 @@ EOF
     if [[ $success -gt 0 ]]; then
         # Generate manifest from orchestration result JSON
         act_generate_manifest "$result" "$manifest_file" 2>/dev/null || true
+    fi
+
+    if [[ -f "$manifest_file" && ${#artifact_rename_pairs[@]} -gt 0 ]]; then
+        local renames_json updated_manifest
+        renames_json=$(printf '%s\n' "${artifact_rename_pairs[@]}" | jq -Rn '
+            reduce inputs as $line ({}; 
+                if ($line | length) == 0 then . else
+                    ($line | split("\t") | { (.[0]): .[1] }) as $pair
+                    | . + $pair
+                end
+            )
+        ')
+        updated_manifest=$(jq --argjson renames "$renames_json" '
+            .artifacts = (.artifacts // []) |
+            .artifacts |= map(
+                . as $a |
+                ($renames[($a.target // "") + "||" + ($a.name // "")] // "") as $new |
+                if $new != "" then .name = $new else . end
+            )
+        ' "$manifest_file" 2>/dev/null)
+        if [[ -n "$updated_manifest" ]]; then
+            printf '%s\n' "$updated_manifest" > "$manifest_file"
+            log_info "Updated manifest for ${#artifact_rename_pairs[@]} renamed artifact(s)"
+        else
+            log_warn "Failed to update manifest for renamed artifacts"
+        fi
     fi
 
     if [[ $success -gt 0 ]]; then

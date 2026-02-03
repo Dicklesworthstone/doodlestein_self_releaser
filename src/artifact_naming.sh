@@ -440,6 +440,7 @@ artifact_naming_generate_dual() {
     local ext="${5:-tar.gz}"
     local compat_pattern="${6:-}"  # Optional explicit compat pattern
     local versioned_pattern="${7:-}"  # Optional explicit versioned pattern
+    local config_tool="${8:-$tool}"  # Config tool name for arch alias / target triple lookups
 
     _an_log_debug "Generating dual names: tool=$tool version=$version os=$os arch=$arch ext=$ext"
 
@@ -450,7 +451,7 @@ artifact_naming_generate_dual() {
     local versioned=""
     if [[ -n "$versioned_pattern" ]]; then
         local rendered
-        rendered=$(artifact_naming_substitute "$versioned_pattern" "$tool" "$version" "$os" "$arch" "$ext_value")
+        rendered=$(artifact_naming_substitute "$versioned_pattern" "$tool" "$version" "$os" "$arch" "$ext_value" "$config_tool")
         # If pattern did not include ${ext}, append extension if missing
         if [[ "$versioned_pattern" == *'${ext}'* || "$versioned_pattern" == *'${EXT}'* ]]; then
             versioned="$rendered"
@@ -470,7 +471,7 @@ artifact_naming_generate_dual() {
     local compat
     if [[ -n "$compat_pattern" ]]; then
         # Use explicit pattern if provided
-        compat=$(artifact_naming_substitute "$compat_pattern" "$tool" "$version" "$os" "$arch" "$ext_value")
+        compat=$(artifact_naming_substitute "$compat_pattern" "$tool" "$version" "$os" "$arch" "$ext_value" "$config_tool")
         if [[ "$compat_pattern" == *'${ext}'* || "$compat_pattern" == *'${EXT}'* ]]; then
             : # Extension explicitly controlled by pattern
         else
@@ -744,6 +745,7 @@ artifact_naming_substitute() {
     local os="$4"
     local arch="$5"
     local ext="${6:-tar.gz}"
+    local config_tool="${7:-$tool}"  # Config tool name for arch alias / target triple lookups
 
     local result="$pattern"
     local version_stripped="${version#v}"
@@ -759,13 +761,13 @@ artifact_naming_substitute() {
     local arch_resolved="$arch"
     if declare -F config_get_arch_alias &>/dev/null; then
         local arch_alias
-        arch_alias=$(config_get_arch_alias "$tool" "$arch" 2>/dev/null || echo "")
+        arch_alias=$(config_get_arch_alias "$config_tool" "$arch" 2>/dev/null || echo "")
         [[ -n "$arch_alias" ]] && arch_resolved="$arch_alias"
     fi
 
     local target_triple=""
     if declare -F config_get_target_triple &>/dev/null; then
-        target_triple=$(config_get_target_triple "$tool" "${os}/${arch}" 2>/dev/null || echo "")
+        target_triple=$(config_get_target_triple "$config_tool" "${os}/${arch}" 2>/dev/null || echo "")
     fi
     [[ -z "$target_triple" ]] && target_triple=$(_an_default_target_triple "$os" "$arch")
 
@@ -916,8 +918,8 @@ artifact_naming_generate_dual_for_tool() {
     local versioned_pattern
     versioned_pattern=$(artifact_naming_get_versioned_pattern "$tool" "$repo_path")
 
-    # Generate dual names
-    artifact_naming_generate_dual "$naming_name" "$version" "$os" "$arch" "$ext" "$compat_pattern" "$versioned_pattern"
+    # Generate dual names; pass config tool name ($tool) for config lookups
+    artifact_naming_generate_dual "$naming_name" "$version" "$os" "$arch" "$ext" "$compat_pattern" "$versioned_pattern" "$tool"
 }
 
 # Export functions
