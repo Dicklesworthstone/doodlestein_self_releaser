@@ -1969,7 +1969,7 @@ EOF
                 log_warn "Artifact name collision: $name (target=$target); saving as $renamed"
                 name="$renamed"
                 dest="$output_dir/$name"
-                artifact_rename_pairs+=("${target}||${orig_name}\t${name}")
+                artifact_rename_pairs+=("${target}||${orig_name}"$'\t'"${name}")
 
                 if [[ -f "$dest" ]]; then
                     if cmp -s "$dest" "$src" 2>/dev/null; then

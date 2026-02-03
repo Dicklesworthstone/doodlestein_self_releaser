@@ -1395,8 +1395,8 @@ act_run_native_build() {
         _log_ok "Build completed on $host in ${duration}s"
         status="success"
 
-        # Use run_id if available to group artifacts
-        local artifact_dir="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name-$(date +%s)}"
+        # Use run_id if available to group artifacts; isolate per-target to avoid name collisions
+        local artifact_dir="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name-$(date +%s)}/${platform//\//-}"
         mkdir -p "$artifact_dir"
 
         # Small delay to ensure files are fully flushed on remote
