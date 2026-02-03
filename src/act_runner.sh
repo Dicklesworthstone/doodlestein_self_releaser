@@ -1322,6 +1322,10 @@ act_run_native_build() {
     build_env=$(act_get_build_env "$tool_name" "$platform")
     binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
 
+    # Check for workspace_binaries (multi-binary Rust workspaces)
+    local workspace_binaries
+    workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null)
+
     if [[ -z "$local_path" || -z "$build_cmd" ]]; then
         _log_error "Missing local_path or build_cmd in config"
         jq -nc '{status: "error", exit_code: 4, error: "Missing required config fields"}'
@@ -1385,67 +1389,148 @@ act_run_native_build() {
     duration=$((end_time - start_time))
 
     # Determine result
-    local status remote_artifact_path local_artifact_path=""
+    local status local_artifact_path="" local_artifact_paths=()
     if [[ $exit_code -eq 0 ]]; then
         _log_ok "Build completed on $host in ${duration}s"
         status="success"
 
-        # Remote artifact path depends on language
-        local language
-        language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
-        case "$language" in
-            rust)
-                remote_artifact_path="$remote_path/target/release/$binary_name"
-                ;;
-            go)
-                remote_artifact_path="$remote_path/$binary_name"
-                ;;
-            *)
-                remote_artifact_path="$remote_path/$binary_name"
-                ;;
-        esac
-
-        # Handle Windows specifics
-        if [[ "$platform" == windows/* ]]; then
-            # Add .exe extension (keep forward slashes - SCP via OpenSSH uses them)
-            remote_artifact_path+=".exe"
-        fi
-
-        # SCP artifact back to local machine
         # Use run_id if available to group artifacts
         local artifact_dir="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name-$(date +%s)}"
         mkdir -p "$artifact_dir"
-        local artifact_filename
-        artifact_filename=$(basename "$remote_artifact_path")
-        local_artifact_path="$artifact_dir/$artifact_filename"
 
-        # Small delay to ensure file is fully flushed on remote
+        # Small delay to ensure files are fully flushed on remote
         sleep 1
 
-        # Build SCP source - don't embed quotes in the path; let shell handle quoting
-        # scp interprets embedded quotes literally in the remote path
-        local scp_source="${host}:${remote_artifact_path}"
+        # Determine which binaries to download
+        local binaries_to_download=()
+        if [[ -n "$workspace_binaries" ]]; then
+            # Multi-binary workspace: download each binary
+            while IFS= read -r bin; do
+                [[ -n "$bin" ]] && binaries_to_download+=("$bin")
+            done <<< "$workspace_binaries"
+            _log_info "Workspace mode: downloading ${#binaries_to_download[@]} binaries"
+        else
+            # Single binary mode
+            binaries_to_download=("$binary_name")
+        fi
 
-        _log_info "Downloading artifact: $scp_source"
-        local scp_output
-        # Use separate arguments to avoid quote interpretation issues
-        if scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
-               -o StrictHostKeyChecking=accept-new \
-               "${host}:${remote_artifact_path}" "$local_artifact_path" 2>&1); then
-            _log_ok "Artifact downloaded: $local_artifact_path"
-            # Log file size for verification
-            if [[ -f "$local_artifact_path" ]]; then
-                local file_size
-                file_size=$(stat -f%z "$local_artifact_path" 2>/dev/null || stat -c%s "$local_artifact_path" 2>/dev/null || echo "unknown")
-                _log_info "Artifact size: $file_size bytes"
+        # Remote artifact path depends on language
+        local language
+        language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+
+        local download_failed=false
+        for bin in "${binaries_to_download[@]}"; do
+            local remote_artifact_path
+            case "$language" in
+                rust)
+                    remote_artifact_path="$remote_path/target/release/$bin"
+                    ;;
+                go)
+                    remote_artifact_path="$remote_path/$bin"
+                    ;;
+                *)
+                    remote_artifact_path="$remote_path/$bin"
+                    ;;
+            esac
+
+            # Handle Windows specifics
+            if [[ "$platform" == windows/* ]]; then
+                # Add .exe extension (keep forward slashes - SCP via OpenSSH uses them)
+                remote_artifact_path+=".exe"
+            fi
+
+            local artifact_filename
+            artifact_filename=$(basename "$remote_artifact_path")
+            local this_artifact_path="$artifact_dir/$artifact_filename"
+
+            _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
+            local scp_output
+            if scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                   -o StrictHostKeyChecking=accept-new \
+                   "${host}:${remote_artifact_path}" "$this_artifact_path" 2>&1); then
+                _log_ok "Artifact downloaded: $this_artifact_path"
+                # Log file size for verification
+                if [[ -f "$this_artifact_path" ]]; then
+                    local file_size
+                    file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
+                    _log_info "Artifact size: $file_size bytes"
+                fi
+                local_artifact_paths+=("$this_artifact_path")
+            else
+                _log_error "Failed to download artifact $bin from $host"
+                _log_error "SCP error: $scp_output"
+                echo "SCP failed for $bin: $scp_output" >> "$log_file"
+                download_failed=true
+            fi
+        done
+
+        # Set final status and artifact path(s)
+        if [[ "$download_failed" == true ]]; then
+            if [[ ${#local_artifact_paths[@]} -eq 0 ]]; then
+                status="failed"
+                exit_code=7
+            else
+                # Partial success - some artifacts downloaded
+                status="partial"
+                _log_warn "Some artifacts failed to download"
+            fi
+        fi
+
+        # Package workspace binaries into a single tarball
+        if [[ -n "$workspace_binaries" && ${#local_artifact_paths[@]} -gt 0 && "$status" != "failed" ]]; then
+            _log_info "Packaging ${#local_artifact_paths[@]} workspace binaries into release tarball..."
+
+            # Determine archive format and name
+            local archive_ext="tar.gz"
+            local archive_cmd="tar czf"
+            if [[ "$platform" == windows/* ]]; then
+                archive_ext="zip"
+            fi
+
+            # Parse platform for naming: linux/amd64 -> linux-amd64
+            local plat_name="${platform//\//-}"
+            # Use version parameter (strip leading 'v' if present)
+            local version_stripped="${version#v}"
+            local archive_name="${tool_name}-${version_stripped}-${plat_name}.${archive_ext}"
+            local archive_path="$artifact_dir/$archive_name"
+
+            # Get just the filenames for archive creation
+            local archive_files=()
+            for p in "${local_artifact_paths[@]}"; do
+                archive_files+=("$(basename "$p")")
+            done
+
+            # Create the archive
+            if [[ "$archive_ext" == "zip" ]]; then
+                # Windows: use zip
+                if command -v zip &>/dev/null; then
+                    (cd "$artifact_dir" && zip "$archive_name" "${archive_files[@]}" 2>&1)
+                    if [[ -f "$archive_path" ]]; then
+                        _log_ok "Created archive: $archive_path"
+                        # Update artifact path to point to the archive
+                        local_artifact_path="$archive_path"
+                        local_artifact_paths=("$archive_path")
+                    else
+                        _log_warn "Failed to create zip archive"
+                    fi
+                else
+                    _log_warn "zip not available, skipping archive creation"
+                fi
+            else
+                # Unix: use tar
+                (cd "$artifact_dir" && tar czf "$archive_name" "${archive_files[@]}" 2>&1)
+                if [[ -f "$archive_path" ]]; then
+                    _log_ok "Created archive: $archive_path"
+                    # Update artifact path to point to the archive
+                    local_artifact_path="$archive_path"
+                    local_artifact_paths=("$archive_path")
+                else
+                    _log_warn "Failed to create tar archive"
+                fi
             fi
         else
-            _log_error "Failed to download artifact from $host"
-            _log_error "SCP error: $scp_output"
-            echo "SCP failed: $scp_output" >> "$log_file"
-            status="failed"
-            exit_code=7
-            local_artifact_path=""
+            # Join paths with comma for JSON output (single binary or no packaging needed)
+            local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
         fi
 
     elif [[ $exit_code -eq 124 ]]; then
@@ -1459,6 +1544,12 @@ act_run_native_build() {
     fi
 
     # Return JSON result (pointing to LOCAL artifact path)
+    # Build artifact_paths array from comma-separated string
+    local artifact_paths_json="[]"
+    if [[ -n "${local_artifact_path:-}" ]]; then
+        artifact_paths_json=$(echo "$local_artifact_path" | tr ',' '\n' | jq -R . | jq -sc .)
+    fi
+
     jq -nc \
         --arg tool "$tool_name" \
         --arg platform "$platform" \
@@ -1467,6 +1558,7 @@ act_run_native_build() {
         --argjson exit_code "$exit_code" \
         --argjson duration "$duration" \
         --arg artifact_path "${local_artifact_path:-}" \
+        --argjson artifact_paths "$artifact_paths_json" \
         --arg log_file "$log_file" \
         '{
             tool: $tool,
@@ -1477,6 +1569,7 @@ act_run_native_build() {
             exit_code: $exit_code,
             duration_seconds: $duration,
             artifact_path: $artifact_path,
+            artifact_paths: $artifact_paths,
             log_file: $log_file
         }'
 
