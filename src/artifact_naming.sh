@@ -345,20 +345,9 @@ artifact_naming_parse_workflow() {
         return 0
     fi
 
-    # Build JSON array
-    local json_array="["
-    local first=true
-    while IFS= read -r p; do
-        if [[ -n "$p" ]]; then
-            if [[ "$first" == "true" ]]; then
-                first=false
-            else
-                json_array+=","
-            fi
-            json_array+="\"$p\""
-        fi
-    done <<< "$unique_patterns"
-    json_array+="]"
+    # Build JSON array using jq for proper escaping of special characters
+    local json_array
+    json_array=$(printf '%s\n' "$unique_patterns" | jq -R -s 'split("\n") | map(select(length > 0))')
 
     _an_log_info "Extracted $(echo "$unique_patterns" | wc -l | xargs) patterns from workflow"
     echo "$json_array"

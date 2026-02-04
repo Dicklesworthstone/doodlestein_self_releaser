@@ -3687,8 +3687,8 @@ EOF
                             skipped_assets+=("$upload_name")
                             continue
                         fi
-                        local name_pattern=" $upload_name "
-                        if [[ " ${already_uploaded[*]} " =~ $name_pattern ]]; then
+                        # Use literal string match (not regex) to avoid metacharacters like . being interpreted
+                        if printf '%s\n' "${already_uploaded[@]}" | grep -Fxq "$upload_name"; then
                             log_info "  Skipping (already uploaded): $upload_name"
                             skipped_assets+=("$upload_name")
                             uploaded_name_set["$upload_name"]=1
@@ -3719,8 +3719,8 @@ EOF
             skipped_assets+=("$filename")
             continue
         fi
-        local filename_pattern=" $filename "
-        if [[ " ${already_uploaded[*]} " =~ $filename_pattern ]]; then
+        # Use literal string match (not regex) to avoid metacharacters like . being interpreted
+        if printf '%s\n' "${already_uploaded[@]}" | grep -Fxq "$filename"; then
             log_info "[$idx/$total_files] Skipping (already uploaded): $filename"
             skipped_assets+=("$filename")
             uploaded_name_set["$filename"]=1

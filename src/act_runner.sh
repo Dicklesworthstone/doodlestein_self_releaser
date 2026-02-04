@@ -1026,7 +1026,7 @@ act_get_build_cmd() {
 
 # Get environment variables for a build target
 # Usage: act_get_build_env <tool_name> <platform>
-# Returns: Space-separated KEY=VALUE pairs
+# Returns: Newline-separated KEY=VALUE pairs (preserves values with spaces)
 act_get_build_env() {
     local tool_name="$1"
     local platform="$2"
@@ -1044,10 +1044,16 @@ act_get_build_env() {
     global_env=$(yq -r '.env // {} | to_entries | map(.key + "=" + .value) | .[]' "$config_file" 2>/dev/null)
     [[ -n "$global_env" ]] && result="$global_env"
 
-    # Get platform-specific cross_compile env vars
+    # Get platform-specific cross_compile env vars (join with newline to preserve spaces in values)
     local platform_env
     platform_env=$(yq -r ".cross_compile.\"$platform\".env // {} | to_entries | map(.key + \"=\" + .value) | .[]" "$config_file" 2>/dev/null)
-    [[ -n "$platform_env" ]] && result="$result $platform_env"
+    if [[ -n "$platform_env" ]]; then
+        if [[ -n "$result" ]]; then
+            result="$result"$'\n'"$platform_env"
+        else
+            result="$platform_env"
+        fi
+    fi
 
     echo "$result"
 }
@@ -1374,18 +1380,22 @@ act_run_native_build() {
         # Note: In cmd.exe, 'set VAR=value && ...' includes trailing space in value.
         # Using 'set "VAR=value"' protects the value from the space before &&.
         local env_exports=""
-        for env_pair in $build_env; do
+        # build_env is newline-delimited to preserve values with spaces
+        while IFS= read -r env_pair; do
+            [[ -z "$env_pair" ]] && continue
             env_exports+="set \"$env_pair\" && "
-        done
+        done <<< "$build_env"
         # Convert forward slashes to backslashes for Windows paths
         local win_path="${remote_path//\//\\}"
         remote_cmd="cd /d \"${win_path}\" && ${env_exports}${build_cmd}"
     else
         # Unix: use bash/zsh compatible syntax
         local env_exports=""
-        for env_pair in $build_env; do
+        # build_env is newline-delimited to preserve values with spaces
+        while IFS= read -r env_pair; do
+            [[ -z "$env_pair" ]] && continue
             env_exports+="export $env_pair; "
-        done
+        done <<< "$build_env"
         remote_cmd="cd '${remote_path//\'/\'\\\'\'}' && $env_exports$build_cmd"
     fi
 
