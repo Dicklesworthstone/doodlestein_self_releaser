@@ -3469,6 +3469,87 @@ EOF
         fi
     }
 
+    # === Generate SHA256SUMS for installer verification ===
+    # Creates a standard SHA256SUMS file with entries for every name an artifact
+    # will be uploaded as (primary, versioned, compat, and arch aliases).
+    # The find command below picks it up automatically for upload.
+    if $manifest_exists && [[ -f "$manifest_file" ]]; then
+        local sha256sums_file="$artifacts_dir/SHA256SUMS"
+        log_info "Generating SHA256SUMS for installer verification..."
+        : > "$sha256sums_file"
+
+        while IFS=$'\t' read -r a_name a_sha256 a_target a_format; do
+            [[ -z "$a_name" || -z "$a_sha256" ]] && continue
+
+            # Primary name from manifest
+            echo "${a_sha256}  ${a_name}" >> "$sha256sums_file"
+
+            # Compute alias names this artifact will also be uploaded as
+            local a_os="${a_target%/*}" a_arch="${a_target#*/}"
+            local a_ext="$a_format"
+            [[ "$a_ext" == "none" ]] && a_ext=""
+            if [[ -z "$a_ext" ]]; then
+                case "$a_name" in
+                    *.tar.xz) a_ext="tar.xz" ;; *.tar.gz) a_ext="tar.gz" ;;
+                    *.tgz)    a_ext="tgz" ;;     *.zip)    a_ext="zip" ;;
+                    *.exe)    a_ext="exe" ;;      *)       a_ext="" ;;
+                esac
+            fi
+
+            if [[ -n "$a_ext" && -n "$a_os" && -n "$a_arch" ]]; then
+                local dual_json=""
+                dual_json=$(artifact_naming_generate_dual_for_tool "$tool_name" "$version" "$a_os" "$a_arch" "$a_ext" "$local_path" 2>/dev/null || echo "")
+                if [[ -n "$dual_json" ]]; then
+                    local versioned="" compat=""
+                    versioned=$(echo "$dual_json" | jq -r '.versioned // empty')
+                    compat=$(echo "$dual_json" | jq -r '.compat // empty')
+
+                    # Track names we've already emitted to avoid duplicates
+                    local -A sha_seen=()
+                    sha_seen["$a_name"]=1
+
+                    # Add versioned and compat names
+                    local alias_name=""
+                    for alias_name in "$versioned" "$compat"; do
+                        [[ -z "$alias_name" || -n "${sha_seen[$alias_name]:-}" ]] && continue
+                        echo "${a_sha256}  ${alias_name}" >> "$sha256sums_file"
+                        sha_seen["$alias_name"]=1
+                    done
+
+                    # Add arch aliases (amd64↔x86_64, arm64↔aarch64) for compat name
+                    # only — matches the upload loop which calls _release_arch_aliases
+                    # solely on compat_name (not versioned_name).
+                    if [[ -n "$compat" ]]; then
+                        local arch_alias=""
+                        case "$a_arch" in
+                            amd64)
+                                arch_alias="${compat//-amd64/-x86_64}"
+                                arch_alias="${arch_alias//_amd64/_x86_64}"
+                                ;;
+                            arm64)
+                                arch_alias="${compat//-arm64/-aarch64}"
+                                arch_alias="${arch_alias//_arm64/_aarch64}"
+                                ;;
+                        esac
+                        if [[ -n "$arch_alias" && "$arch_alias" != "$compat" && -z "${sha_seen[$arch_alias]:-}" ]]; then
+                            echo "${a_sha256}  ${arch_alias}" >> "$sha256sums_file"
+                            sha_seen["$arch_alias"]=1
+                        fi
+                    fi
+                fi
+            fi
+        done < <(jq -r '.artifacts[]? | [.name // "", .sha256 // "", .target // "", .archive_format // ""] | @tsv' "$manifest_file" 2>/dev/null)
+
+        if [[ -s "$sha256sums_file" ]]; then
+            local line_count
+            line_count=$(wc -l < "$sha256sums_file")
+            log_ok "Generated SHA256SUMS with $line_count entries"
+        else
+            rm -f "$sha256sums_file"
+            log_warn "No checksum data available; SHA256SUMS not generated"
+        fi
+    fi
+
     # Build upload list from manifest when available to avoid stale artifacts
     if $manifest_exists && [[ -f "$manifest_file" ]]; then
         while IFS= read -r name; do

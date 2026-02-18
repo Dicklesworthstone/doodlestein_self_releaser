@@ -877,6 +877,71 @@ _act_sync_source() {
     fi
 }
 
+# Sync sibling crates and patch Cargo.toml for remote builds
+# Usage: _act_sync_sibling_crates <host> <remote_project_path> <config_file> <sibling_count>
+# When a Rust project uses [patch.crates-io] with absolute local paths (e.g.,
+# path = "/dp/asupersync"), those paths don't exist on remote build hosts.
+# This function: (1) syncs each sibling crate to the correct relative location
+# on the remote host, (2) rewrites absolute paths in the remote Cargo.toml to
+# relative paths (e.g., "../asupersync").
+_act_sync_sibling_crates() {
+    local host="$1"
+    local remote_path="$2"
+    local config_file="$3"
+    local sibling_count="$4"
+
+    local remote_parent
+    # Compute the parent directory of the remote project path
+    if [[ "$host" == "wlap" ]]; then
+        # Windows path: C:/Users/jeffr/projects/foo → C:/Users/jeffr/projects
+        remote_parent="${remote_path%/*}"
+    else
+        remote_parent="$(dirname "$remote_path")"
+    fi
+
+    local idx
+    for idx in $(seq 0 $((sibling_count - 1))); do
+        local sib_local sib_relative
+        sib_local=$(yq -r ".sibling_crates[$idx].local_path" "$config_file" 2>/dev/null)
+        sib_relative=$(yq -r ".sibling_crates[$idx].relative_path // empty" "$config_file" 2>/dev/null)
+        [[ -z "$sib_relative" ]] && sib_relative=$(basename "$sib_local")
+
+        if [[ ! -d "$sib_local" ]]; then
+            _log_warn "Sibling crate not found locally: $sib_local"
+            continue
+        fi
+
+        # Sync sibling crate to <parent>/<relative_path> on remote host
+        local sib_remote_path="${remote_parent}/${sib_relative}"
+        _log_info "Syncing sibling crate to $host:$sib_remote_path"
+        if ! _act_sync_source "$host" "$sib_local" "$sib_remote_path"; then
+            _log_warn "Failed to sync sibling crate: $sib_relative"
+            continue
+        fi
+
+        # Rewrite absolute path to relative in remote Cargo.toml
+        # e.g., path = "/dp/asupersync" → path = "../asupersync"
+        local relative_ref="../${sib_relative}"
+        if [[ "$host" == "wlap" ]]; then
+            # Windows: use .NET File API to avoid Set-Content's UTF-16LE default
+            # encoding on PowerShell 5.x (which would corrupt Cargo.toml).
+            # Avoids PowerShell variables ($p, $t) entirely — eliminates all
+            # cross-shell escaping issues (bash → SSH → cmd.exe → PowerShell).
+            local win_path="${remote_path//\//\\}"
+            local toml_path="${win_path}\\Cargo.toml"
+            _act_ssh_exec "$host" "powershell -Command \"[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_local}','${relative_ref}'))\"" 30 2>/dev/null \
+                && _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref" \
+                || _log_warn "Failed to patch Cargo.toml on $host"
+        else
+            # macOS sed requires '' after -i; Linux sed requires no arg after -i
+            # Use perl for portable in-place replacement
+            _act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_local}\\E|${relative_ref}|g' Cargo.toml" 30 2>/dev/null \
+                && _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref" \
+                || _log_warn "Failed to patch Cargo.toml on $host"
+        fi
+    done
+}
+
 # Sync source to all native build hosts for a tool
 # Usage: act_sync_sources <tool_name> [targets...]
 # Returns: JSON with sync results
@@ -958,6 +1023,12 @@ act_sync_sources() {
     local start_time
     start_time=$(date +%s)
 
+    # Check for sibling crates that need syncing alongside the main project
+    local sibling_count=0
+    if command -v yq &>/dev/null; then
+        sibling_count=$(yq -r '.sibling_crates | length // 0' "$config_file" 2>/dev/null || echo 0)
+    fi
+
     for i in "${!hosts_to_sync[@]}"; do
         local host="${hosts_to_sync[$i]}"
         local remote_path="${host_paths[$i]}"
@@ -965,6 +1036,13 @@ act_sync_sources() {
         if _act_sync_source "$host" "$local_path" "$remote_path"; then
             ((synced++))
             results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"success\"}")
+
+            # Sync sibling crates and patch Cargo.toml paths on REMOTE hosts.
+            # Skip when remote_path == local_path (i.e., the build host already
+            # has the sibling crates at their absolute paths — no sync/patch needed).
+            if [[ "$sibling_count" -gt 0 && "$remote_path" != "$local_path" ]]; then
+                _act_sync_sibling_crates "$host" "$remote_path" "$config_file" "$sibling_count"
+            fi
         else
             ((failed++))
             results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"failed\"}")
