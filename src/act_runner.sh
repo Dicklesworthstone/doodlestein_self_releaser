@@ -208,6 +208,68 @@ act_can_run() {
     esac
 }
 
+# Detect workflows that reference sibling paths outside the repository root,
+# such as `git clone ... ../frankensqlite`. act exposes the parent directory as
+# root-owned, so these workflows need special handling.
+_act_workflow_needs_writable_parent() {
+    local workflow_path="$1"
+
+    [[ -f "$workflow_path" ]] || return 1
+    command grep -Eq '\.\./[[:alnum:]_.-]+' "$workflow_path" 2>/dev/null
+}
+
+# Prepare an isolated act config that removes bind/user overrides from the
+# user's persistent config, then runs the job container as root so workflows
+# can create sibling directories outside the repo root.
+_act_prepare_isolated_home() {
+    local real_home="${HOME:-$PWD}"
+    local cache_root="${DSR_CACHE_DIR:-${XDG_CACHE_HOME:-$real_home/.cache}/dsr}/act-homes"
+    local run_id
+    run_id="$(date +%Y%m%d-%H%M%S)-$$"
+
+    local isolated_home="$cache_root/$run_id"
+    local config_dir="$isolated_home/.config/act"
+    local actrc="$config_dir/actrc"
+
+    if ! mkdir -p "$config_dir" "$isolated_home/.cache"; then
+        _log_error "Failed to prepare isolated act home: $isolated_home"
+        return 1
+    fi
+
+    local found_platform=false
+    local source_file line
+    for source_file in "$real_home/.actrc" "$real_home/.config/act/actrc"; do
+        [[ -f "$source_file" ]] || continue
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*--bind([[:space:]]|$) ]]; then
+                continue
+            fi
+            if [[ "$line" =~ ^[[:space:]]*--artifact-server-path([[:space:]=]|$) ]]; then
+                continue
+            fi
+            if [[ "$line" =~ --container-options ]] && [[ "$line" =~ --user ]]; then
+                continue
+            fi
+            if [[ "$line" =~ ^[[:space:]]*(-P|--platform)[[:space:]]+ubuntu- ]]; then
+                found_platform=true
+            fi
+            printf '%s\n' "$line" >> "$actrc"
+        done < "$source_file"
+    done
+
+    if ! $found_platform; then
+        cat >> "$actrc" <<'EOF'
+-P ubuntu-latest=catthehacker/ubuntu:full-22.04
+-P ubuntu-22.04=catthehacker/ubuntu:full-22.04
+-P ubuntu-20.04=catthehacker/ubuntu:full-20.04
+EOF
+    fi
+
+    printf '%s\n' '--container-options --user 0:0' >> "$actrc"
+    echo "$isolated_home"
+}
+
 # Run a workflow via act
 # Usage: act_run_workflow <repo_path> <workflow> [job] [event] [version] [extra_args...]
 # Returns: exit code (0=success, 1=partial, 6=build failed, 3=dependency error)
@@ -282,6 +344,13 @@ act_run_workflow() {
         act_cmd+=("${extra_args[@]}")
     fi
 
+    local isolated_home=""
+    if _act_workflow_needs_writable_parent "$workflow_path"; then
+        isolated_home=$(_act_prepare_isolated_home) || return 1
+        _log_warn "Workflow writes outside repo root; using isolated act config without --bind"
+        _log_info "Isolated act home: $isolated_home"
+    fi
+
     _log_info "Running: ${act_cmd[*]}"
     _log_info "Artifacts: $artifact_dir"
     _log_info "Log: $log_file"
@@ -294,14 +363,32 @@ act_run_workflow() {
     local timeout_cmd
     timeout_cmd=$(_act_timeout_cmd)
     if [[ -n "$timeout_cmd" ]]; then
-        "$timeout_cmd" "$ACT_TIMEOUT" "${act_cmd[@]}" \
-            --directory "$repo_path" \
-            2>&1 | tee "$log_file"
+        if [[ -n "$isolated_home" ]]; then
+            HOME="$isolated_home" \
+            XDG_CONFIG_HOME="$isolated_home/.config" \
+            XDG_CACHE_HOME="$isolated_home/.cache" \
+            "$timeout_cmd" "$ACT_TIMEOUT" "${act_cmd[@]}" \
+                --directory "$repo_path" \
+                2>&1 | tee "$log_file"
+        else
+            "$timeout_cmd" "$ACT_TIMEOUT" "${act_cmd[@]}" \
+                --directory "$repo_path" \
+                2>&1 | tee "$log_file"
+        fi
     else
         _log_warn "timeout command not available; running act without timeout"
-        "${act_cmd[@]}" \
-            --directory "$repo_path" \
-            2>&1 | tee "$log_file"
+        if [[ -n "$isolated_home" ]]; then
+            HOME="$isolated_home" \
+            XDG_CONFIG_HOME="$isolated_home/.config" \
+            XDG_CACHE_HOME="$isolated_home/.cache" \
+            "${act_cmd[@]}" \
+                --directory "$repo_path" \
+                2>&1 | tee "$log_file"
+        else
+            "${act_cmd[@]}" \
+                --directory "$repo_path" \
+                2>&1 | tee "$log_file"
+        fi
     fi
     local exit_code=${PIPESTATUS[0]}
 
@@ -1766,10 +1853,19 @@ act_orchestrate_build() {
 
     # Initialize build state (if build_state.sh is sourced)
     local run_id
+    local lock_acquired_here=false
+    local caller_holds_lock=false
+    [[ "${DSR_BUILD_LOCK_HELD_BY_CALLER:-0}" == "1" ]] && caller_holds_lock=true
+
     if command -v build_state_create &>/dev/null; then
-        if ! build_lock_acquire "$tool_name" "$version"; then
-            _log_error "Build already in progress (lock held)"
-            return 2
+        if $caller_holds_lock; then
+            _log_info "Using caller-owned build lock for $tool_name $version"
+        else
+            if ! build_lock_acquire "$tool_name" "$version"; then
+                _log_error "Build already in progress (lock held)"
+                return 2
+            fi
+            lock_acquired_here=true
         fi
         run_id=$(build_state_create "$tool_name" "$version" "${targets// /,}")
         build_state_update_status "$tool_name" "$version" "running" "$run_id"
@@ -1893,7 +1989,9 @@ act_orchestrate_build() {
     # Update build state
     if command -v build_state_update_status &>/dev/null; then
         build_state_update_status "$tool_name" "$version" "$overall_status" "$run_id"
-        build_lock_release "$tool_name" "$version"
+        if $lock_acquired_here; then
+            build_lock_release "$tool_name" "$version"
+        fi
     fi
 
     _log_info "=== Build orchestration complete ==="

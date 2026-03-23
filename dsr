@@ -4678,7 +4678,9 @@ EOF
     # Trap to release lock on exit
     trap 'build_lock_release "$tool_name" "$tag" 2>/dev/null' EXIT
 
-    # Run build
+    # Run build using the lock we already hold for the full fallback pipeline.
+    local prior_lock_flag="${DSR_BUILD_LOCK_HELD_BY_CALLER:-}"
+    export DSR_BUILD_LOCK_HELD_BY_CALLER=1
     if cmd_build "$tool_name" --version "$version" --output-dir "$output_dir"; then
         build_status="success"
         log_ok "Build completed successfully"
@@ -4693,6 +4695,11 @@ EOF
             notify_event "fallback.build_failed" "error" "Build Failed" "$tool_name build failed" "$run_id"
             exit_code=6
         fi
+    fi
+    if [[ -n "$prior_lock_flag" ]]; then
+        export DSR_BUILD_LOCK_HELD_BY_CALLER="$prior_lock_flag"
+    else
+        unset DSR_BUILD_LOCK_HELD_BY_CALLER
     fi
 
     # Count artifacts

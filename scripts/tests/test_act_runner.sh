@@ -300,6 +300,95 @@ EOF
     fi
 }
 
+test_act_run_workflow_isolates_parent_write_workflows() {
+    log_test "act_run_workflow isolates parent-write workflows"
+
+    export ACT_ARTIFACTS_DIR="$TEMP_DIR/artifacts"
+    export ACT_LOGS_DIR="$TEMP_DIR/logs"
+    mkdir -p "$ACT_ARTIFACTS_DIR" "$ACT_LOGS_DIR"
+
+    cat > "$WORKFLOW_DIR/parent-write.yml" << 'EOF'
+name: Parent Write
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p ../sibling
+          echo ok > ../sibling/ok.txt
+EOF
+
+    local bin_dir="$TEMP_DIR/bin-parent"
+    local args_file="$TEMP_DIR/act_parent_args.txt"
+    local home_file="$TEMP_DIR/act_parent_home.txt"
+    local actrc_file="$TEMP_DIR/act_parent_actrc.txt"
+    mkdir -p "$bin_dir"
+
+    export ACT_TEST_ARGS_FILE="$args_file"
+    export ACT_TEST_HOME_FILE="$home_file"
+    export ACT_TEST_ACTRC_FILE="$actrc_file"
+
+    cat > "$bin_dir/act" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$ACT_TEST_ARGS_FILE"
+printf '%s\n' "$HOME" > "$ACT_TEST_HOME_FILE"
+if [[ -f "$HOME/.config/act/actrc" ]]; then
+    cp "$HOME/.config/act/actrc" "$ACT_TEST_ACTRC_FILE"
+fi
+exit 0
+EOF
+    chmod +x "$bin_dir/act"
+
+    local real_home="$TEMP_DIR/real-home"
+    mkdir -p "$real_home"
+    cat > "$real_home/.actrc" << 'EOF'
+-P ubuntu-latest=catthehacker/ubuntu:full-22.04
+--bind
+--artifact-server-path /tmp/from-user-config
+--container-options --user=1000:1000
+EOF
+
+    local original_home="$HOME"
+    local original_path="$PATH"
+    local original_act_check=""
+    original_act_check="$(declare -f act_check)"
+
+    PATH="$bin_dir:$PATH"
+    HOME="$real_home"
+
+    act_check() { return 0; }
+    timeout() { shift; "$@"; }
+
+    act_run_workflow "$TEMP_DIR" ".github/workflows/parent-write.yml" "" "push" >/dev/null 2>&1
+
+    if [[ -f "$home_file" ]] && [[ "$(cat "$home_file")" != "$real_home" ]]; then
+        log_pass "Parent-write workflow uses isolated HOME for act"
+    else
+        log_fail "Expected act to run with isolated HOME"
+    fi
+
+    if [[ -f "$actrc_file" ]] && \
+        grep -q '^--container-options --user 0:0$' "$actrc_file" && \
+        grep -q 'ubuntu-latest=catthehacker/ubuntu:full-22.04' "$actrc_file" && \
+        ! grep -q '^--bind' "$actrc_file" && \
+        ! grep -q 'artifact-server-path' "$actrc_file" && \
+        ! grep -q 'user=1000:1000' "$actrc_file"; then
+        log_pass "Isolated act config strips bind/user overrides and forces root user"
+    else
+        log_fail "Isolated act config did not contain the expected filtered settings"
+    fi
+
+    HOME="$original_home"
+    PATH="$original_path"
+    unset -f timeout 2>/dev/null || true
+    if [[ -n "$original_act_check" ]]; then
+        eval "$original_act_check"
+    else
+        unset -f act_check 2>/dev/null || true
+    fi
+}
+
 # Main
 main() {
     echo "═══════════════════════════════════════════════════════════════"
@@ -316,6 +405,7 @@ main() {
     test_act_cleanup
     test_workflow_validation
     test_act_run_workflow_injects_tag_env
+    test_act_run_workflow_isolates_parent_write_workflows
     test_act_analyze_workflow
 
     echo ""

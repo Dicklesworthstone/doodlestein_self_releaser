@@ -496,6 +496,92 @@ test_fallback_pipeline_mocked() {
     harness_teardown
 }
 
+test_fallback_build_only_mocked() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    if ! command -v yq &>/dev/null; then
+        skip "yq not installed - skipping mocked build-only test"
+        harness_teardown
+        return 0
+    fi
+    if ! command -v jq &>/dev/null; then
+        skip "jq not installed - skipping mocked build-only test"
+        harness_teardown
+        return 0
+    fi
+    if ! command -v git &>/dev/null; then
+        skip "git not available - skipping mocked build-only test"
+        harness_teardown
+        return 0
+    fi
+    if ! command -v timeout &>/dev/null; then
+        skip "timeout not available - skipping mocked build-only test"
+        harness_teardown
+        return 0
+    fi
+
+    local repo_dir
+    repo_dir="$(harness_tmpdir)/repo-build-only"
+    seed_fallback_repo "$repo_dir"
+    seed_fallback_config "$repo_dir"
+
+    export MOCK_TOOL_NAME="test-tool"
+    export GITHUB_TOKEN="test-token"
+
+    local output_dir="$DSR_STATE_DIR/artifacts/fallback-build-only"
+    export ACT_ARTIFACTS_DIR="$output_dir"
+
+    setup_fallback_mocks
+
+    exec_run "$DSR_CMD" --json fallback test-tool --version 1.2.3 --skip-checks --build-only --output-dir "$output_dir"
+
+    local status
+    status=$(exec_status)
+
+    if [[ "$status" -eq 0 ]]; then
+        pass "fallback --build-only exits successfully with mocks"
+    else
+        fail "fallback --build-only should succeed with mocks (exit: $status)"
+        echo "stderr: $(exec_stderr | head -20)"
+    fi
+
+    local output
+    output=$(exec_stdout)
+
+    if echo "$output" | jq -e '.details.phases.build == "success" and .details.phases.release == "skipped"' >/dev/null 2>&1; then
+        pass "fallback --build-only reports build success and skipped release"
+    else
+        fail "fallback --build-only should report build success and skipped release"
+        echo "stdout: ${output:0:300}"
+    fi
+
+    local act_calls gh_calls curl_calls
+    act_calls=$(mock_call_count "act")
+    gh_calls=$(mock_call_count "gh")
+    curl_calls=$(mock_call_count "curl")
+
+    if [[ "$act_calls" -gt 0 ]]; then
+        pass "act invoked during fallback --build-only"
+    else
+        fail "act should be invoked during fallback --build-only"
+    fi
+
+    if [[ "$gh_calls" -eq 0 ]]; then
+        pass "fallback --build-only skips GitHub release calls"
+    else
+        fail "fallback --build-only should not invoke gh release calls"
+    fi
+
+    if [[ "$curl_calls" -eq 0 ]]; then
+        pass "fallback --build-only skips asset uploads"
+    else
+        fail "fallback --build-only should not upload assets"
+    fi
+
+    harness_teardown
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -540,6 +626,7 @@ test_fallback_dry_run_json_valid
 echo ""
 echo "Full Pipeline (mocked act + release):"
 test_fallback_pipeline_mocked
+test_fallback_build_only_mocked
 
 echo ""
 echo "=========================================="
