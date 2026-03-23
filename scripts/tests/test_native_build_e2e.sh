@@ -475,6 +475,89 @@ test_only_act_flag() {
     cleanup_test_environment
 }
 
+test_only_act_parent_write_workflow_skips_real_home_bind_check() {
+    ((TESTS_RUN++))
+    log_test "Matrix filter: parent-write act workflow ignores bad real-home actrc"
+    setup_test_environment
+
+    local tool_dir
+    tool_dir=$(setup_mock_rust_tool)
+
+    mkdir -p "$tool_dir/.github/workflows"
+    cat > "$tool_dir/.github/workflows/parent-write.yml" << 'EOF'
+name: Parent Write
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          mkdir -p ../sibling
+          echo ok > ../sibling/out.txt
+EOF
+
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    cat > "$DSR_CONFIG_DIR/repos.d/mock_rust_tool.yaml" << YAML
+tool_name: mock_rust_tool
+repo: test/mock_rust_tool
+local_path: $tool_dir
+language: rust
+binary_name: mock_rust_tool
+build_cmd: cargo build --release
+targets:
+  - linux/amd64
+workflow: .github/workflows/parent-write.yml
+act_job_map:
+  linux/amd64: build
+host_paths:
+  mmini: ~/projects/mock_rust_tool
+  wlap: C:/Users/test/projects/mock_rust_tool
+YAML
+
+    local bin_dir="$TEST_TMPDIR/bin"
+    local fake_home="$TEST_TMPDIR/bad-home"
+    mkdir -p "$bin_dir" "$fake_home"
+
+    cat > "$bin_dir/act" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$bin_dir/act"
+
+    cat > "$bin_dir/docker" << 'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "info" ]]; then
+    exit 0
+fi
+exit 0
+EOF
+    chmod +x "$bin_dir/docker"
+
+    cat > "$fake_home/.actrc" << 'EOF'
+--bind
+EOF
+
+    local original_home="${HOME:-}"
+    local original_path="$PATH"
+    HOME="$fake_home"
+    PATH="$bin_dir:$PATH"
+
+    local output exit_code=0
+    output=$(timeout 30 "$DSR_CMD" build mock_rust_tool --only-act --no-sync --allow-dirty --version 0.0.1 2>&1) || exit_code=$?
+
+    if [[ "$output" == *"Selected act workflow uses isolated act config"* ]] && \
+       [[ "$output" != *"has --bind but missing --user"* ]] && \
+       [[ "$exit_code" -ne 3 ]]; then
+        log_pass "Parent-write workflows bypass bad real-home act config (exit: $exit_code)"
+    else
+        log_fail "Expected isolated-act workflow path without real-home bind failure (exit: $exit_code, output: $output)"
+    fi
+
+    HOME="$original_home"
+    PATH="$original_path"
+    cleanup_test_environment
+}
+
 test_only_native_flag() {
     ((TESTS_RUN++))
     log_test "Matrix filter: --only-native flag filters to native targets"
@@ -849,6 +932,7 @@ main() {
 
     # Matrix filtering tests
     test_only_act_flag
+    test_only_act_parent_write_workflow_skips_real_home_bind_check
     test_only_native_flag
     test_only_act_and_native_mutual_exclusion
     test_no_sync_and_sync_only_mutual_exclusion

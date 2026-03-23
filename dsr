@@ -1791,7 +1791,14 @@ EOF
     done
 
     if $need_act; then
-        if ! act_check; then
+        local workflow_path="$local_path/$ACT_REPO_WORKFLOW"
+        if _act_workflow_needs_writable_parent "$workflow_path"; then
+            if ! act_check_prereqs; then
+                log_error "act not available - cannot build act targets"
+                return 3
+            fi
+            log_info "Selected act workflow uses isolated act config; deferring bind/user validation to workflow runner"
+        elif ! act_check; then
             log_error "act not available - cannot build act targets"
             return 3
         fi

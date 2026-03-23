@@ -191,6 +191,44 @@ test_act_check() {
     fi
 }
 
+test_act_check_reads_config_dir_actrc() {
+    log_test "act_check reads ~/.config/act/actrc"
+
+    local bin_dir="$TEMP_DIR/bin-act-check"
+    local fake_home="$TEMP_DIR/home-act-check"
+    mkdir -p "$bin_dir" "$fake_home/.config/act"
+
+    cat > "$bin_dir/act" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$bin_dir/act"
+
+    cat > "$bin_dir/docker" << 'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "info" ]]; then
+    exit 0
+fi
+exit 0
+EOF
+    chmod +x "$bin_dir/docker"
+
+    cat > "$fake_home/.config/act/actrc" << 'EOF'
+--bind
+EOF
+
+    local original_path="$PATH"
+    PATH="$bin_dir:$PATH"
+
+    if ! act_check "$fake_home" 2>/dev/null; then
+        log_pass "act_check rejects bad ~/.config/act/actrc"
+    else
+        log_fail "Expected act_check to reject ~/.config/act/actrc without --user"
+    fi
+
+    PATH="$original_path"
+}
+
 # Test artifact directory creation
 test_artifact_dirs() {
     log_test "artifact directories"
@@ -401,6 +439,7 @@ main() {
     test_act_can_run
     test_act_get_runner
     test_act_check
+    test_act_check_reads_config_dir_actrc
     test_artifact_dirs
     test_act_cleanup
     test_workflow_validation

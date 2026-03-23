@@ -96,8 +96,35 @@ _act_run_with_timeout() {
     fi
 }
 
-# Check if act is available and properly configured
-act_check() {
+# Return the first act config file in a home directory that has --bind without
+# a matching --user container option.
+_act_find_bind_without_user_config() {
+    local check_home="${1:-$HOME}"
+    local actrc_file
+
+    for actrc_file in "$check_home/.actrc" "$check_home/.config/act/actrc"; do
+        [[ -f "$actrc_file" ]] || continue
+
+        local has_bind=false
+        local has_user=false
+        if command grep -qE '^[[:space:]]*--bind([[:space:]]|$)' "$actrc_file" 2>/dev/null; then
+            has_bind=true
+        fi
+        if command grep -qE -- '--container-options.*--user|--container-options=.*--user' "$actrc_file" 2>/dev/null; then
+            has_user=true
+        fi
+
+        if $has_bind && ! $has_user; then
+            printf '%s\n' "$actrc_file"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Check if act and Docker are available.
+act_check_prereqs() {
     if ! command -v act &>/dev/null; then
         _log_error "act not found. Install: brew install act (macOS) or go install github.com/nektos/act@latest"
         return 3
@@ -108,36 +135,34 @@ act_check() {
         return 3
     fi
 
+    return 0
+}
+
+# Check if act is available and properly configured
+act_check() {
+    local check_home="${1:-$HOME}"
+
+    if ! act_check_prereqs; then
+        return 3
+    fi
+
     # CRITICAL: Check for UID mismatch configuration
     # catthehacker images run as UID 1001. Without --user flag,
     # files created by act will have wrong ownership!
-    local actrc_file="$HOME/.actrc"
-    if [[ -f "$actrc_file" ]]; then
-        local has_bind=false has_user=false
-        # Use 'command grep' to bypass any aliases (e.g., rg aliased as grep)
-        # Pattern handles optional leading whitespace: "  --bind" or "--bind"
-        if command grep -qE '^[[:space:]]*--bind([[:space:]]|$)' "$actrc_file" 2>/dev/null; then
-            has_bind=true
-        fi
-        if command grep -qE -- '--container-options.*--user|--container-options=.*--user' "$actrc_file" 2>/dev/null; then
-            has_user=true
-        fi
-
-        if $has_bind && ! $has_user; then
-            _log_error "═══════════════════════════════════════════════════════════════════"
-            _log_error "CRITICAL: ~/.actrc has --bind but missing --user flag!"
-            _log_error ""
-            _log_error "Files created by act will have WRONG OWNERSHIP (UID 1001 instead of $(id -u))"
-            _log_error "This WILL corrupt your repository with inaccessible files!"
-            _log_error ""
-            _log_error "FIX: Add this line to ~/.actrc:"
-            _log_error "    --container-options --user=$(id -u):$(id -g)"
-            _log_error ""
-            _log_error "Or run: echo '--container-options --user=$(id -u):$(id -g)' >> ~/.actrc"
-            _log_error "Or run: dsr doctor --fix"
-            _log_error "═══════════════════════════════════════════════════════════════════"
-            return 3
-        fi
+    local bad_actrc=""
+    if bad_actrc=$(_act_find_bind_without_user_config "$check_home"); then
+        _log_error "═══════════════════════════════════════════════════════════════════"
+        _log_error "CRITICAL: $bad_actrc has --bind but missing --user flag!"
+        _log_error ""
+        _log_error "Files created by act will have WRONG OWNERSHIP (UID 1001 instead of $(id -u))"
+        _log_error "This WILL corrupt your repository with inaccessible files!"
+        _log_error ""
+        _log_error "FIX: Add this line to the affected act config:"
+        _log_error "    --container-options --user=$(id -u):$(id -g)"
+        _log_error ""
+        _log_error "Or run: dsr doctor --fix"
+        _log_error "═══════════════════════════════════════════════════════════════════"
+        return 3
     fi
 
     return 0
@@ -266,6 +291,16 @@ _act_prepare_isolated_home() {
 EOF
     fi
 
+    if [[ -f "$real_home/.gitconfig" ]]; then
+        ln -s "$real_home/.gitconfig" "$isolated_home/.gitconfig" 2>/dev/null || true
+    fi
+    if [[ -f "$real_home/.git-credentials" ]]; then
+        ln -s "$real_home/.git-credentials" "$isolated_home/.git-credentials" 2>/dev/null || true
+    fi
+    if [[ -d "$real_home/.config/gh" ]]; then
+        ln -s "$real_home/.config/gh" "$isolated_home/.config/gh" 2>/dev/null || true
+    fi
+
     printf '%s\n' '--container-options --user 0:0' >> "$actrc"
     echo "$isolated_home"
 }
@@ -283,10 +318,6 @@ act_run_workflow() {
     local version="${5:-}"
     shift 5 2>/dev/null || true
     local extra_args=("$@")
-
-    if ! act_check; then
-        return 3
-    fi
 
     local workflow_path="$repo_path/$workflow"
     if [[ ! -f "$workflow_path" ]]; then
@@ -349,6 +380,12 @@ act_run_workflow() {
         isolated_home=$(_act_prepare_isolated_home) || return 1
         _log_warn "Workflow writes outside repo root; using isolated act config without --bind"
         _log_info "Isolated act home: $isolated_home"
+    fi
+
+    local check_home="${HOME:-}"
+    [[ -n "$isolated_home" ]] && check_home="$isolated_home"
+    if ! act_check "$check_home"; then
+        return 3
     fi
 
     _log_info "Running: ${act_cmd[*]}"
@@ -2324,7 +2361,7 @@ act_generate_manifest() {
 }
 
 # Export functions for use by other scripts
-export -f act_check act_list_jobs act_get_runner act_can_run
+export -f act_check_prereqs act_check act_list_jobs act_get_runner act_can_run
 export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanup
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
