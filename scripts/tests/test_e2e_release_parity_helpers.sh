@@ -50,9 +50,9 @@ test_parse_scenarios() {
 test_ext_from_pattern() {
   ((TESTS_RUN++))
   local ext1 ext2 ext3
-  ext1=$(_ext_from_pattern "tool-${version}-linux-amd64.tar.xz")
-  ext2=$(_ext_from_pattern "tool-${version}-windows-amd64.zip")
-  ext3=$(_ext_from_pattern "tool-${version}-linux-amd64")
+  ext1=$(_ext_from_pattern 'tool-${version}-linux-amd64.tar.xz')
+  ext2=$(_ext_from_pattern 'tool-${version}-windows-amd64.zip')
+  ext3=$(_ext_from_pattern 'tool-${version}-linux-amd64')
   if [[ "$ext1" == "tar.xz" && "$ext2" == "zip" && -z "$ext3" ]]; then
     pass "_ext_from_pattern handles tar.xz and zip"
   else
@@ -92,6 +92,7 @@ YAML
 
 test_expected_assets_for_version() {
   ((TESTS_RUN++))
+  # shellcheck disable=SC2034 # Used indirectly by sourced e2e_release_parity helpers.
   TOOL_NAME="mock_release_tool"
   LOCAL_PATH="$PROJECT_ROOT/scripts/tests/fixtures/mock_release_tool"
   TARGETS="linux/amd64"

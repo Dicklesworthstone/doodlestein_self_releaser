@@ -226,10 +226,10 @@ test_unix_env_export_syntax() {
     local cmd
     cmd=$(get_ssh_cmd)
 
-    if [[ "$cmd" == *"export CARGO_TERM_COLOR=always"* ]]; then
+    if [[ "$cmd" == *'export "CARGO_TERM_COLOR=always"'* ]] || [[ "$cmd" == *"export CARGO_TERM_COLOR=always"* ]]; then
         log_pass "Uses export for env vars"
     else
-        log_fail "Expected 'export CARGO_TERM_COLOR=always' in: $cmd"
+        log_fail "Expected export syntax for CARGO_TERM_COLOR in: $cmd"
     fi
 }
 
@@ -424,6 +424,66 @@ test_scp_rust_artifact_path() {
         log_pass "Rust artifact path correct: target/release/mytool"
     else
         log_fail "Expected Rust artifact path in: $scp_args"
+    fi
+}
+
+test_scp_rust_artifact_path_with_absolute_cargo_target_dir() {
+    log_test "SCP Unix: Rust honors absolute CARGO_TARGET_DIR"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_LOCAL_PATH="/local/path/mytool"
+    MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local scp_args
+    scp_args=$(get_scp_args)
+
+    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/release/mytool "* ]]; then
+        log_pass "Rust artifact path honors absolute CARGO_TARGET_DIR"
+    else
+        log_fail "Expected absolute CARGO_TARGET_DIR artifact path in: $scp_args"
+    fi
+}
+
+test_scp_rust_artifact_path_with_relative_cargo_target_dir() {
+    log_test "SCP Unix: Rust honors relative CARGO_TARGET_DIR"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_LOCAL_PATH="/local/path/mytool"
+    MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=custom-target"
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local scp_args
+    scp_args=$(get_scp_args)
+
+    if [[ "$scp_args" == *"mmini:/local/path/mytool/custom-target/release/mytool "* ]]; then
+        log_pass "Rust artifact path honors relative CARGO_TARGET_DIR"
+    else
+        log_fail "Expected relative CARGO_TARGET_DIR artifact path in: $scp_args"
+    fi
+}
+
+test_scp_rust_artifact_path_with_cargo_build_target() {
+    log_test "SCP Unix: Rust honors CARGO_BUILD_TARGET subdirectory"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_LOCAL_PATH="/local/path/mytool"
+    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr\nCARGO_BUILD_TARGET=x86_64-apple-darwin'
+
+    act_run_native_build "tool" "darwin/amd64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local scp_args
+    scp_args=$(get_scp_args)
+
+    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/x86_64-apple-darwin/release/mytool "* ]]; then
+        log_pass "Rust artifact path honors CARGO_BUILD_TARGET subdirectory"
+    else
+        log_fail "Expected CARGO_BUILD_TARGET artifact path in: $scp_args"
     fi
 }
 
@@ -766,6 +826,9 @@ main() {
     # SCP commands
     test_scp_unix_artifact_path
     test_scp_rust_artifact_path
+    test_scp_rust_artifact_path_with_absolute_cargo_target_dir
+    test_scp_rust_artifact_path_with_relative_cargo_target_dir
+    test_scp_rust_artifact_path_with_cargo_build_target
     test_scp_windows_exe_extension
     test_scp_windows_forward_slash_path
 

@@ -119,14 +119,14 @@ test_parse_install_simple() {
     log_test "Parse simple install.sh with TAR variable"
     local result
     result=$(artifact_naming_parse_install_script "$FIXTURE_DIR/simple_install.sh")
-    assert_eq 'mytool-${os}-${arch}' "$result" "Simple TAR pattern extraction"
+    assert_eq 'mytool-${target}' "$result" "Simple TAR pattern extraction"
 }
 
 test_parse_install_cass_style() {
     log_test "Parse CASS-style install.sh"
     local result
     result=$(artifact_naming_parse_install_script "$FIXTURE_DIR/cass_style_install.sh")
-    assert_eq 'cass-${os}-${arch}' "$result" "CASS-style pattern extraction"
+    assert_eq 'cass-${target}' "$result" "CASS-style pattern extraction"
 }
 
 test_parse_install_versioned() {
@@ -228,7 +228,7 @@ test_normalize_target() {
     log_test "Normalize TARGET variable"
     local result
     result=$(_an_normalize_pattern '${TARGET}')
-    assert_eq '${os}-${arch}' "$result" "TARGET normalizes to os-arch"
+    assert_eq '${target}' "$result" "TARGET normalizes to target"
 }
 
 test_normalize_goos_goarch() {

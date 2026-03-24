@@ -82,7 +82,7 @@ seed_manifest() {
     local tool="${1:-test-tool}"
     local version="${2:-v1.0.0}"
     local state_dir="$DSR_STATE_DIR"
-    local artifacts_dir="$state_dir/artifacts/$tool/$version"
+    local artifacts_dir="$state_dir/artifacts/${tool}-${version}"
 
     mkdir -p "$artifacts_dir"
 
