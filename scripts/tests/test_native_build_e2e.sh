@@ -70,6 +70,22 @@ setup_mock_go_tool() {
     mkdir -p "$target_dir"
     cp -r "$FIXTURES_DIR/mock_go_tool/." "$target_dir/"
 
+    mkdir -p "$target_dir/.github/workflows"
+    cat > "$target_dir/.github/workflows/release.yml" << 'YAML'
+name: release
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go build -o mock_go_tool .
+YAML
+
     # Initialize git
     (cd "$target_dir" && git init -q && git add . && git commit -q -m "Initial") 2>/dev/null || true
 
@@ -109,8 +125,8 @@ workflow: .github/workflows/release.yml
 act_job_map:
   linux/amd64: build
 host_paths:
-  mmini: ~/projects/$tool_name
-  wlap: C:/Users/test/projects/$tool_name
+  mmini: /tmp/$tool_name
+  wlap: C:/Users/Public/$tool_name
 YAML
 }
 
@@ -869,6 +885,15 @@ test_live_build_windows_native() {
     local tool_dir
     tool_dir=$(setup_mock_go_tool)
     create_tool_config "mock_go_tool" "$tool_dir" "go" "mock_go_tool"
+
+    local sync_preflight_exit=0
+    local sync_preflight_output
+    sync_preflight_output=$(timeout 60 "$DSR_CMD" build mock_go_tool --target windows/amd64 --sync-only 2>&1) || sync_preflight_exit=$?
+    if [[ "$sync_preflight_exit" -ne 0 ]] || [[ "$sync_preflight_output" == *"Source sync failed"* ]]; then
+        cleanup_test_environment
+        log_skip "Skipped (source sync to wlap unavailable)"
+        return
+    fi
 
     local exit_code=0
     local timeout_secs="${DSR_E2E_TIMEOUT:-300}"
