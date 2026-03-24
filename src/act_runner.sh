@@ -1260,6 +1260,77 @@ act_get_build_env() {
     echo "$result"
 }
 
+# Get a single environment variable value from newline-delimited KEY=VALUE pairs.
+# Usage: act_get_build_env_value <build_env> <key>
+act_get_build_env_value() {
+    local build_env="$1"
+    local key="$2"
+    local env_pair
+
+    while IFS= read -r env_pair; do
+        [[ -z "$env_pair" ]] && continue
+        if [[ "$env_pair" == "$key="* ]]; then
+            printf '%s\n' "${env_pair#*=}"
+            return 0
+        fi
+    done <<< "$build_env"
+
+    return 1
+}
+
+# Resolve the remote path to a built binary for SCP retrieval.
+# Usage: act_get_remote_artifact_path <language> <remote_path> <build_env> <binary_name> <platform>
+act_get_remote_artifact_path() {
+    local language="$1"
+    local remote_path="${2%/}"
+    local build_env="$3"
+    local binary_name="$4"
+    local platform="$5"
+    local artifact_base=""
+
+    case "$language" in
+        rust)
+            local cargo_target_dir=""
+            local cargo_build_target=""
+            cargo_target_dir=$(act_get_build_env_value "$build_env" "CARGO_TARGET_DIR" 2>/dev/null || true)
+            cargo_build_target=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" 2>/dev/null || true)
+            cargo_target_dir="${cargo_target_dir%/}"
+            cargo_target_dir="${cargo_target_dir%\\}"
+
+            if [[ -n "$cargo_target_dir" ]]; then
+                case "$cargo_target_dir" in
+                    /*|[A-Za-z]:/*|[A-Za-z]:\\*)
+                        artifact_base="$cargo_target_dir/release"
+                        ;;
+                    *)
+                        artifact_base="$remote_path/$cargo_target_dir/release"
+                        ;;
+                esac
+            else
+                artifact_base="$remote_path/target/release"
+            fi
+
+            if [[ -n "$cargo_build_target" ]]; then
+                artifact_base="${artifact_base%/release}/$cargo_build_target/release"
+            fi
+            ;;
+        go)
+            artifact_base="$remote_path"
+            ;;
+        *)
+            artifact_base="$remote_path"
+            ;;
+    esac
+
+    local remote_artifact_path="$artifact_base/$binary_name"
+    if [[ "$platform" == windows/* ]]; then
+        remote_artifact_path="${remote_artifact_path//\\//}"
+        remote_artifact_path+=".exe"
+    fi
+
+    printf '%s\n' "$remote_artifact_path"
+}
+
 # Get GitHub repo for a tool
 # Usage: act_get_repo <tool_name>
 act_get_repo() {
@@ -1655,23 +1726,7 @@ act_run_native_build() {
         local download_failed=false
         for bin in "${binaries_to_download[@]}"; do
             local remote_artifact_path
-            case "$language" in
-                rust)
-                    remote_artifact_path="$remote_path/target/release/$bin"
-                    ;;
-                go)
-                    remote_artifact_path="$remote_path/$bin"
-                    ;;
-                *)
-                    remote_artifact_path="$remote_path/$bin"
-                    ;;
-            esac
-
-            # Handle Windows specifics
-            if [[ "$platform" == windows/* ]]; then
-                # Add .exe extension (keep forward slashes - SCP via OpenSSH uses them)
-                remote_artifact_path+=".exe"
-            fi
+            remote_artifact_path=$(act_get_remote_artifact_path "$language" "$remote_path" "$build_env" "$bin" "$platform")
 
             local artifact_filename
             artifact_filename=$(basename "$remote_artifact_path")
@@ -2367,5 +2422,6 @@ export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
 export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_get_build_env act_get_repo act_get_local_path
+export -f act_get_build_env_value act_get_remote_artifact_path
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f act_sync_sources

@@ -139,12 +139,11 @@ sbom_generate() {
         esac
     fi
 
-    local syft_output
-    if syft_output=$(syft "${syft_args[@]}" 2>&1); then
-        echo "$syft_output" > "$output"
+    local syft_stderr=""
+    if syft_stderr=$(syft "${syft_args[@]}" 2>&1 > "$output"); then
         $quiet || log_ok "SBOM generated: $output"
     else
-        log_error "SBOM generation failed: $syft_output"
+        log_error "SBOM generation failed: $syft_stderr"
         return 1
     fi
 
