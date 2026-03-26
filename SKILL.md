@@ -1,6 +1,9 @@
 ---
 name: dsr
-description: "Doodlestein Self-Releaser - Fallback release infrastructure for building and releasing tools locally when GitHub Actions is throttled. Cross-platform builds via SSH, supply chain security (SLSA/SBOM/signing), quality gates, and offline capability."
+description: >-
+  Doodlestein Self-Releaser - fallback release infrastructure for when GitHub
+  Actions is throttled. Local builds, cross-platform releases, supply chain
+  security. Use when: GH Actions slow, local release, build hosts, dsr command.
 ---
 
 # dsr - Doodlestein Self-Releaser

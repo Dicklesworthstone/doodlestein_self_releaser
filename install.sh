@@ -748,13 +748,33 @@ print_detected_agents() {
 install_skill() {
   local dest_dir="$1"
   local agent_name="$2"
+  local local_skill_path=""
+  local skill_md_url="${GITHUB_RAW}/main/SKILL.md"
+  local script_dir
+
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
   mkdir -p "$dest_dir" 2>/dev/null || {
     warn "Cannot create skill directory: $dest_dir"
     return 1
   }
 
-  # Primary: download skill tarball from releases (requires TMP dir)
+  if [[ -f "${script_dir}/SKILL.md" ]]; then
+    local_skill_path="${script_dir}/SKILL.md"
+  fi
+
+  if [[ -n "$local_skill_path" ]] && cp "$local_skill_path" "$dest_dir/SKILL.md"; then
+    ok "Installed dsr skill for $agent_name (from local repository source)"
+    return 0
+  fi
+
+  # Secondary: download SKILL.md directly from repo
+  if curl -fsSL "${PROXY_ARGS[@]}" "$skill_md_url" -o "$dest_dir/SKILL.md" 2>/dev/null; then
+    ok "Installed dsr skill for $agent_name (from repo)"
+    return 0
+  fi
+
+  # Tertiary: download skill tarball from releases (requires TMP dir)
   local skill_url="https://github.com/${OWNER}/${REPO}/releases/latest/download/skill.tar.gz"
   if [[ -n "$TMP" ]] && curl -fsSL "${PROXY_ARGS[@]}" "$skill_url" -o "$TMP/skill.tar.gz" 2>/dev/null; then
     if tar -xzf "$TMP/skill.tar.gz" -C "$dest_dir" 2>/dev/null; then
@@ -763,19 +783,15 @@ install_skill() {
     fi
   fi
 
-  # Secondary: download SKILL.md directly from repo
-  local skill_md_url="${GITHUB_RAW}/main/SKILL.md"
-  if curl -fsSL "${PROXY_ARGS[@]}" "$skill_md_url" -o "$dest_dir/SKILL.md" 2>/dev/null; then
-    ok "Installed dsr skill for $agent_name (from repo)"
-    return 0
-  fi
-
-  # Tertiary: inline fallback
+  # Final fallback: inline skill
   info "Creating minimal skill for $agent_name (network download failed)..."
   cat >"$dest_dir/SKILL.md" <<'SKILL_EOF'
 ---
 name: dsr
-description: "Doodlestein Self-Releaser - Fallback release infrastructure for building and releasing tools locally when GitHub Actions is throttled."
+description: >-
+  Doodlestein Self-Releaser - fallback release infrastructure for when GitHub
+  Actions is throttled. Local builds, cross-platform releases, supply chain
+  security. Use when: GH Actions slow, local release, build hosts, dsr command.
 ---
 
 # dsr - Doodlestein Self-Releaser
