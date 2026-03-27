@@ -904,12 +904,48 @@ _ACT_SYNC_DEFAULT_EXCLUDES=(
 # Check if rsync is available on remote host
 # Usage: _act_has_rsync <host>
 # Returns: 0 if rsync available, 1 otherwise
+_act_is_windows_host() {
+    local host="${1:-}"
+    [[ "$host" == "wlap" ]]
+}
+
+_act_windows_cmd_path() {
+    local path="${1:-}"
+    path="${path//\//\\}"
+    printf '%s\n' "$path"
+}
+
+_act_windows_rsync_path() {
+    local path="${1:-}"
+    path="${path//\\//}"
+
+    if [[ "$path" =~ ^([A-Za-z]):/(.*)$ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        local rest="${BASH_REMATCH[2]}"
+        printf '/cygdrive/%s/%s\n' "$drive" "$rest"
+        return 0
+    fi
+
+    if [[ "$path" =~ ^([A-Za-z]):$ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        printf '/cygdrive/%s\n' "$drive"
+        return 0
+    fi
+
+    printf '%s\n' "$path"
+}
+
 _act_has_rsync() {
     local host="$1"
+    local probe_cmd='command -v rsync >/dev/null 2>&1'
+    if _act_is_windows_host "$host"; then
+        probe_cmd='where rsync >NUL 2>&1'
+    fi
+
     _act_run_with_timeout 10 ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
-        "$host" 'command -v rsync >/dev/null 2>&1' 2>/dev/null
+        "$host" "$probe_cmd" 2>/dev/null
 }
 
 # Sync source code to remote host via rsync
@@ -920,7 +956,20 @@ _act_sync_source() {
     local local_path="$2"
     local remote_path="$3"
     shift 3
-    local extra_excludes=("$@")
+    local respect_gitignore_excludes=true
+    local extra_excludes=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-gitignore-excludes)
+                respect_gitignore_excludes=false
+                ;;
+            *)
+                extra_excludes+=("$1")
+                ;;
+        esac
+        shift
+    done
 
     if [[ ! -d "$local_path" ]]; then
         _log_error "Local path not found: $local_path"
@@ -936,8 +985,9 @@ _act_sync_source() {
         exclude_args+=("--exclude=$pattern")
     done
 
-    # Add .gitignore patterns if available
-    if [[ -f "$local_path/.gitignore" ]]; then
+    # Respect .gitignore by default for faster remote sync, but allow callers
+    # to disable that behavior when ignored files are still required inputs.
+    if $respect_gitignore_excludes && [[ -f "$local_path/.gitignore" ]]; then
         exclude_args+=("--exclude-from=$local_path/.gitignore")
     fi
 
@@ -948,11 +998,16 @@ _act_sync_source() {
 
     # Check for rsync on remote
     if _act_has_rsync "$host"; then
+        local rsync_remote_path="$remote_path"
+        if _act_is_windows_host "$host"; then
+            rsync_remote_path=$(_act_windows_rsync_path "$remote_path")
+        fi
+
         # Use rsync for efficient sync
         if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
             "${exclude_args[@]}" \
             -e "ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new" \
-            "$local_path/" "$host:$remote_path/" 2>&1; then
+            "$local_path/" "$host:$rsync_remote_path/" 2>&1; then
             local duration=$(($(date +%s) - start_time))
             _log_ok "Sync completed in ${duration}s (rsync)"
             return 0
@@ -976,20 +1031,25 @@ _act_sync_source() {
         # Create remote directory and extract
         # Windows (wlap) needs different mkdir syntax - use cmd /c with backslashes
         local mkdir_cmd
-        if [[ "$host" == "wlap" ]]; then
+        if _act_is_windows_host "$host"; then
             # Windows: convert forward slashes to backslashes, use cmd /c
-            local win_path="${remote_path//\//\\}"
+            local win_path
+            win_path=$(_act_windows_cmd_path "$remote_path")
             mkdir_cmd="cmd /c \"if not exist \\\"$win_path\\\" mkdir \\\"$win_path\\\"\" && cd /d \"$win_path\""
         else
             mkdir_cmd="mkdir -p \"$remote_path\" && cd \"$remote_path\""
         fi
+
+        local remote_extract_cmd="$mkdir_cmd && tar xzf -"
+        local escaped_remote_extract_cmd
+        printf -v escaped_remote_extract_cmd '%q' "$remote_extract_cmd"
 
         if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" bash -c "
             cd '$local_path' && \
             tar czf - ${tar_excludes[*]} . | \
             ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT \
                 -o StrictHostKeyChecking=accept-new \
-                '$host' '$mkdir_cmd && tar xzf -'
+                '$host' $escaped_remote_extract_cmd
         " 2>&1; then
             local duration=$(($(date +%s) - start_time))
             _log_ok "Sync completed in ${duration}s (tar)"
@@ -1013,6 +1073,7 @@ _act_sync_sibling_crates() {
     local remote_path="$2"
     local config_file="$3"
     local sibling_count="$4"
+    local sync_failed=false
 
     local remote_parent
     # Compute the parent directory of the remote project path
@@ -1038,8 +1099,28 @@ _act_sync_sibling_crates() {
         # Sync sibling crate to <parent>/<relative_path> on remote host
         local sib_remote_path="${remote_parent}/${sib_relative}"
         _log_info "Syncing sibling crate to $host:$sib_remote_path"
-        if ! _act_sync_source "$host" "$sib_local" "$sib_remote_path"; then
-            _log_warn "Failed to sync sibling crate: $sib_relative"
+        local respect_gitignore has_respect_gitignore
+        has_respect_gitignore=$(yq -r ".sibling_crates[$idx] | has(\"respect_gitignore\")" "$config_file" 2>/dev/null || echo false)
+        if [[ "$has_respect_gitignore" == "true" ]]; then
+            respect_gitignore=$(yq -r ".sibling_crates[$idx].respect_gitignore" "$config_file" 2>/dev/null || echo true)
+        else
+            respect_gitignore=true
+        fi
+
+        local sync_args=()
+        if [[ "$respect_gitignore" != "true" ]]; then
+            sync_args+=(--no-gitignore-excludes)
+        fi
+
+        local extra_exclude
+        while IFS= read -r extra_exclude; do
+            [[ -z "$extra_exclude" ]] && continue
+            sync_args+=("$extra_exclude")
+        done < <(yq -r ".sibling_crates[$idx].extra_excludes // [] | .[]" "$config_file" 2>/dev/null || true)
+
+        if ! _act_sync_source "$host" "$sib_local" "$sib_remote_path" "${sync_args[@]}"; then
+            _log_error "Failed to sync sibling crate: $sib_relative"
+            sync_failed=true
             continue
         fi
 
@@ -1053,17 +1134,29 @@ _act_sync_sibling_crates() {
             # cross-shell escaping issues (bash → SSH → cmd.exe → PowerShell).
             local win_path="${remote_path//\//\\}"
             local toml_path="${win_path}\\Cargo.toml"
-            _act_ssh_exec "$host" "powershell -Command \"[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_local}','${relative_ref}'))\"" 30 2>/dev/null \
-                && _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref" \
-                || _log_warn "Failed to patch Cargo.toml on $host"
+            if _act_ssh_exec "$host" "powershell -Command \"[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_local}','${relative_ref}'))\"" 30 2>/dev/null; then
+                _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref"
+            else
+                _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
+                sync_failed=true
+            fi
         else
             # macOS sed requires '' after -i; Linux sed requires no arg after -i
             # Use perl for portable in-place replacement
-            _act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_local}\\E|${relative_ref}|g' Cargo.toml" 30 2>/dev/null \
-                && _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref" \
-                || _log_warn "Failed to patch Cargo.toml on $host"
+            if _act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_local}\\E|${relative_ref}|g' Cargo.toml" 30 2>/dev/null; then
+                _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref"
+            else
+                _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
+                sync_failed=true
+            fi
         fi
     done
+
+    if $sync_failed; then
+        return 1
+    fi
+
+    return 0
 }
 
 # Sync source to all native build hosts for a tool
@@ -1158,14 +1251,23 @@ act_sync_sources() {
         local remote_path="${host_paths[$i]}"
 
         if _act_sync_source "$host" "$local_path" "$remote_path"; then
-            ((synced++))
-            results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"success\"}")
+            local sync_ok=true
 
             # Sync sibling crates and patch Cargo.toml paths on REMOTE hosts.
             # Skip when remote_path == local_path (i.e., the build host already
             # has the sibling crates at their absolute paths — no sync/patch needed).
             if [[ "$sibling_count" -gt 0 && "$remote_path" != "$local_path" ]]; then
-                _act_sync_sibling_crates "$host" "$remote_path" "$config_file" "$sibling_count"
+                if ! _act_sync_sibling_crates "$host" "$remote_path" "$config_file" "$sibling_count"; then
+                    sync_ok=false
+                fi
+            fi
+
+            if $sync_ok; then
+                ((synced++))
+                results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"success\"}")
+            else
+                ((failed++))
+                results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"failed\"}")
             fi
         else
             ((failed++))

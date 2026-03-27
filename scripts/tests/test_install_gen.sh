@@ -23,6 +23,14 @@ NC=$'\033[0m'
 pass() { ((TESTS_PASSED++)); echo "${GREEN}PASS${NC}: $1"; }
 fail() { ((TESTS_FAILED++)); echo "${RED}FAIL${NC}: $1"; }
 
+decode_b64() {
+    if base64 -d >/dev/null 2>&1 <<< ""; then
+        base64 -d
+    else
+        base64 -D
+    fi
+}
+
 # Temp directory for test isolation
 TEMP_DIR=""
 
@@ -32,6 +40,7 @@ setup() {
     export XDG_CACHE_HOME="$TEMP_DIR/cache"
     export DSR_CONFIG_DIR="$TEMP_DIR/config/dsr"
     export DSR_CACHE_DIR="$TEMP_DIR/cache/dsr"
+    export DSR_INSTALLER_DIR="$TEMP_DIR/generated-installers"
     mkdir -p "$DSR_CONFIG_DIR/repos.d"
     mkdir -p "$DSR_CACHE_DIR/installers"
 }
@@ -219,6 +228,85 @@ test_template_has_cache_get_function() {
     teardown
 }
 
+test_template_has_skill_archive_support() {
+    ((TESTS_RUN++))
+    setup
+
+    source "$PROJECT_ROOT/src/install_gen.sh"
+
+    local template
+    template=$(_install_gen_template 2>/dev/null)
+
+    if grep -q "_SKILL_ARCHIVE_B64" <<< "$template" && \
+       grep -q "_install_skill_archive_to_dir" <<< "$template"; then
+        pass "template includes skill archive support"
+    else
+        fail "template missing skill archive support"
+    fi
+
+    teardown
+}
+
+test_generated_installer_embeds_full_skill_tree() {
+    ((TESTS_RUN++))
+    setup
+
+    local tool_root="$TEMP_DIR/demo-tool"
+    mkdir -p "$tool_root/.claude/skills/demo-tool/references"
+
+    cat > "$tool_root/.claude/skills/demo-tool/SKILL.md" <<'EOF'
+---
+name: demo-tool
+description: Demo skill
+---
+
+# Demo Tool
+EOF
+
+    cat > "$tool_root/.claude/skills/demo-tool/references/EXTRA.md" <<'EOF'
+# Extra Reference
+EOF
+
+    cat > "$DSR_CONFIG_DIR/repos.d/demo-tool.yaml" <<EOF
+tool_name: demo-tool
+repo: example/demo-tool
+local_path: $tool_root
+language: go
+binary_name: demo-tool
+artifact_naming: "\${name}_\${version}_\${os}_\${arch}"
+archive_format:
+  linux: tar.gz
+  darwin: tar.gz
+  windows: zip
+EOF
+
+    source "$PROJECT_ROOT/src/install_gen.sh"
+
+    local generated_installer
+    generated_installer="$(install_gen_create demo-tool)"
+
+    local archive_b64
+    archive_b64="$(sed -n "s/^_SKILL_ARCHIVE_B64='\\(.*\\)'/\\1/p" "$generated_installer")"
+
+    if [[ -z "$archive_b64" ]]; then
+        fail "generated installer missing embedded skill archive"
+        teardown
+        return
+    fi
+
+    local archive_listing
+    archive_listing="$(printf '%s' "$archive_b64" | decode_b64 | tar -tzf -)"
+
+    if grep -qx './SKILL.md' <<< "$archive_listing" && \
+       grep -qx './references/EXTRA.md' <<< "$archive_listing"; then
+        pass "generated installer embeds full skill tree"
+    else
+        fail "generated installer did not embed full skill tree"
+    fi
+
+    teardown
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -248,6 +336,8 @@ test_template_has_offline_flag
 test_template_has_prefer_gh_flag
 test_template_has_gh_download_function
 test_template_has_cache_get_function
+test_template_has_skill_archive_support
+test_generated_installer_embeds_full_skill_tree
 
 echo ""
 echo "=========================================="

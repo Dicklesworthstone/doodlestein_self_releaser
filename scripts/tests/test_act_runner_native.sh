@@ -41,12 +41,18 @@ SSH_ARGS_FILE="$MOCK_DIR/ssh_args.txt"
 SCP_ARGS_FILE="$MOCK_DIR/scp_args.txt"
 SSH_EXIT_CODE_FILE="$MOCK_DIR/ssh_exit_code.txt"
 SCP_EXIT_CODE_FILE="$MOCK_DIR/scp_exit_code.txt"
+RAW_SSH_ARGS_FILE="$MOCK_DIR/raw_ssh_args.txt"
+RSYNC_ARGS_FILE="$MOCK_DIR/rsync_args.txt"
+RAW_SSH_EXIT_CODE_FILE="$MOCK_DIR/raw_ssh_exit_code.txt"
+RSYNC_EXIT_CODE_FILE="$MOCK_DIR/rsync_exit_code.txt"
 
 mkdir -p "$ACT_LOGS_DIR" "$ACT_ARTIFACTS_DIR" "$ACT_REPOS_DIR"
 
 # Default exit codes (can be overridden per test)
 echo "0" > "$SSH_EXIT_CODE_FILE"
 echo "0" > "$SCP_EXIT_CODE_FILE"
+echo "0" > "$RAW_SSH_EXIT_CODE_FILE"
+echo "0" > "$RSYNC_EXIT_CODE_FILE"
 
 # Source the module under test
 source "$SRC_DIR/act_runner.sh"
@@ -60,6 +66,13 @@ _log_info()  { :; }  # Silent for tests
 _log_error() { :; }
 _log_ok()    { :; }
 _log_warn()  { :; }
+
+# Run commands directly so shell-function mocks for ssh/rsync are honored.
+_act_run_with_timeout() {
+    local _seconds="$1"
+    shift
+    "$@"
+}
 
 # Mock _act_ssh_exec - captures args to file
 _act_ssh_exec() {
@@ -83,6 +96,20 @@ scp() {
         mkdir -p "$(dirname "$target")" 2>/dev/null || true
         touch "$target" 2>/dev/null || true
     fi
+    return "$exit_code"
+}
+
+ssh() {
+    printf '%s\n' "$@" > "$RAW_SSH_ARGS_FILE"
+    local exit_code
+    exit_code=$(cat "$RAW_SSH_EXIT_CODE_FILE")
+    return "$exit_code"
+}
+
+rsync() {
+    printf '%s\n' "$@" > "$RSYNC_ARGS_FILE"
+    local exit_code
+    exit_code=$(cat "$RSYNC_EXIT_CODE_FILE")
     return "$exit_code"
 }
 
@@ -147,9 +174,11 @@ yq() {
 
 # Reset test state
 reset_state() {
-    rm -f "$SSH_ARGS_FILE" "$SCP_ARGS_FILE"
+    rm -f "$SSH_ARGS_FILE" "$SCP_ARGS_FILE" "$RAW_SSH_ARGS_FILE" "$RSYNC_ARGS_FILE"
     echo "0" > "$SSH_EXIT_CODE_FILE"
     echo "0" > "$SCP_EXIT_CODE_FILE"
+    echo "0" > "$RAW_SSH_EXIT_CODE_FILE"
+    echo "0" > "$RSYNC_EXIT_CODE_FILE"
 
     # Reset mock config values
     unset MOCK_TOOL_NAME MOCK_REPO MOCK_LOCAL_PATH MOCK_LANGUAGE
@@ -189,6 +218,22 @@ get_ssh_host() {
 get_scp_args() {
     if [[ -f "$SCP_ARGS_FILE" ]]; then
         tr '\n' ' ' < "$SCP_ARGS_FILE"
+    else
+        echo ""
+    fi
+}
+
+get_raw_ssh_args() {
+    if [[ -f "$RAW_SSH_ARGS_FILE" ]]; then
+        tr '\n' ' ' < "$RAW_SSH_ARGS_FILE"
+    else
+        echo ""
+    fi
+}
+
+get_rsync_args() {
+    if [[ -f "$RSYNC_ARGS_FILE" ]]; then
+        tr '\n' ' ' < "$RSYNC_ARGS_FILE"
     else
         echo ""
     fi
@@ -338,6 +383,98 @@ test_windows_slash_conversion() {
         log_pass "Forward slashes converted to backslashes"
     else
         log_fail "Expected backslash path in: $cmd"
+    fi
+}
+
+test_windows_rsync_path_conversion() {
+    log_test "Windows: rsync path uses /cygdrive form"
+    reset_state
+
+    local path
+    path=$(_act_windows_rsync_path "C:/Users/jeffr/release-work/tool")
+
+    if [[ "$path" == "/cygdrive/c/Users/jeffr/release-work/tool" ]]; then
+        log_pass "Windows rsync path converted to /cygdrive form"
+    else
+        log_fail "Expected /cygdrive path but got: $path"
+    fi
+}
+
+test_windows_rsync_probe_uses_where() {
+    log_test "Windows: rsync probe uses where, not command -v"
+    reset_state
+
+    _act_has_rsync "wlap" >/dev/null 2>&1 || true
+
+    local ssh_args
+    ssh_args=$(get_raw_ssh_args)
+
+    if [[ "$ssh_args" == *"where rsync >NUL 2>&1"* ]]; then
+        log_pass "Windows rsync probe uses where"
+    else
+        log_fail "Expected Windows rsync probe to use where in: $ssh_args"
+    fi
+}
+
+test_windows_sync_uses_cygdrive_remote_path() {
+    log_test "Windows: rsync sync uses cygdrive remote path"
+    reset_state
+
+    local local_src="$MOCK_DIR/local-src"
+    mkdir -p "$local_src"
+    printf 'hello\n' > "$local_src/hello.txt"
+
+    _act_sync_source "wlap" "$local_src" "C:/Users/jeffr/release-work/tool" >/dev/null 2>&1
+
+    local rsync_args
+    rsync_args=$(get_rsync_args)
+
+    if [[ "$rsync_args" == *"wlap:/cygdrive/c/Users/jeffr/release-work/tool/"* ]]; then
+        log_pass "Windows rsync sync uses /cygdrive remote path"
+    else
+        log_fail "Expected /cygdrive rsync target in: $rsync_args"
+    fi
+}
+
+test_sync_uses_gitignore_exclude_file_by_default() {
+    log_test "Sync: uses .gitignore as rsync exclude file by default"
+    reset_state
+
+    local local_src="$MOCK_DIR/local-src-gitignore"
+    mkdir -p "$local_src"
+    printf 'src/test_*.rs\n' > "$local_src/.gitignore"
+    printf 'hello\n' > "$local_src/hello.txt"
+
+    _act_sync_source "wlap" "$local_src" "C:/Users/jeffr/release-work/tool" >/dev/null 2>&1
+
+    local rsync_args
+    rsync_args=$(get_rsync_args)
+
+    if [[ "$rsync_args" == *"--exclude-from=$local_src/.gitignore"* ]]; then
+        log_pass ".gitignore is injected into rsync excludes by default"
+    else
+        log_fail "Expected --exclude-from=.gitignore in: $rsync_args"
+    fi
+}
+
+test_sync_can_disable_gitignore_exclude_file() {
+    log_test "Sync: can disable .gitignore rsync excludes"
+    reset_state
+
+    local local_src="$MOCK_DIR/local-src-gitignore-disabled"
+    mkdir -p "$local_src"
+    printf 'src/test_*.rs\n' > "$local_src/.gitignore"
+    printf 'hello\n' > "$local_src/hello.txt"
+
+    _act_sync_source "wlap" "$local_src" "C:/Users/jeffr/release-work/tool" --no-gitignore-excludes >/dev/null 2>&1
+
+    local rsync_args
+    rsync_args=$(get_rsync_args)
+
+    if [[ "$rsync_args" == *"--exclude-from="* ]]; then
+        log_fail "Did not expect --exclude-from=.gitignore in: $rsync_args"
+    else
+        log_pass ".gitignore excludes can be disabled per sync"
     fi
 }
 
@@ -818,6 +955,11 @@ main() {
     test_windows_cd_command
     test_windows_env_set_syntax
     test_windows_slash_conversion
+    test_windows_rsync_path_conversion
+    test_windows_rsync_probe_uses_where
+    test_windows_sync_uses_cygdrive_remote_path
+    test_sync_uses_gitignore_exclude_file_by_default
+    test_sync_can_disable_gitignore_exclude_file
 
     # Path handling
     test_path_with_spaces_unix

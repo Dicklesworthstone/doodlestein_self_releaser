@@ -608,20 +608,54 @@ _install_binary() {
 # SKILL INSTALLATION
 # ============================================================================
 
-# Skill content is embedded at generation time (base64 encoded to avoid escaping issues)
-# If this placeholder was not replaced, skill installation is skipped
-_SKILL_CONTENT_B64='__SKILL_CONTENT_B64__'
+# Skill archive is embedded at generation time as a gzip-compressed tarball
+# encoded in base64 so multi-file skill trees can be restored on install.
+# If this placeholder was not replaced, skill installation is skipped.
+_SKILL_ARCHIVE_B64='__SKILL_ARCHIVE_B64__'
 
-# Decode skill content at runtime
-_decode_skill_content() {
+# Decode skill archive at runtime
+_decode_skill_archive() {
     # Skip if placeholder wasn't replaced (check for literal __ prefix)
-    if [[ "$_SKILL_CONTENT_B64" == _* ]]; then
+    if [[ "$_SKILL_ARCHIVE_B64" == _* ]]; then
         return 1
     fi
-    if [[ -n "$_SKILL_CONTENT_B64" ]] && command -v base64 &>/dev/null; then
+    if [[ -n "$_SKILL_ARCHIVE_B64" ]] && command -v base64 &>/dev/null; then
         # macOS uses -D, Linux uses -d
-        base64 -d 2>/dev/null <<< "$_SKILL_CONTENT_B64" || base64 -D 2>/dev/null <<< "$_SKILL_CONTENT_B64"
+        base64 -d 2>/dev/null <<< "$_SKILL_ARCHIVE_B64" || base64 -D 2>/dev/null <<< "$_SKILL_ARCHIVE_B64"
     fi
+}
+
+_install_skill_archive_to_dir() {
+    local skill_dir="$1"
+    local stage_dir=""
+
+    stage_dir="$(mktemp -d 2>/dev/null || true)"
+    if [[ -z "$stage_dir" || ! -d "$stage_dir" ]]; then
+        _log_warn "Failed to create temporary directory for skill installation"
+        return 1
+    fi
+
+    if ! _decode_skill_archive | tar -xzf - -C "$stage_dir" >/dev/null 2>&1; then
+        rm -rf "$stage_dir" 2>/dev/null || true
+        _log_warn "Failed to extract embedded skill archive"
+        return 1
+    fi
+
+    if [[ ! -f "$stage_dir/SKILL.md" ]]; then
+        rm -rf "$stage_dir" 2>/dev/null || true
+        _log_warn "Embedded skill archive is missing SKILL.md"
+        return 1
+    fi
+
+    mkdir -p "$skill_dir"
+    if ! cp -R "$stage_dir/." "$skill_dir/" 2>/dev/null; then
+        rm -rf "$stage_dir" 2>/dev/null || true
+        _log_warn "Failed to install skill archive into $skill_dir"
+        return 1
+    fi
+
+    rm -rf "$stage_dir" 2>/dev/null || true
+    return 0
 }
 
 # Install skill for Claude Code
@@ -634,18 +668,15 @@ _install_claude_skill() {
         return 1  # Claude Code not installed, skip silently
     fi
 
-    # Write skill file from decoded base64 content
-    local skill_content
-    skill_content=$(_decode_skill_content)
-    if [[ -n "$skill_content" ]]; then
+    if [[ "$_SKILL_ARCHIVE_B64" != _* ]] && [[ -n "$_SKILL_ARCHIVE_B64" ]]; then
         _log_info "Installing Claude Code skill..."
-        mkdir -p "$skill_dir"
-        printf '%s\n' "$skill_content" > "$skill_dir/SKILL.md"
-        _log_ok "Claude Code skill installed: $skill_dir/SKILL.md"
-        return 0
-    else
-        return 1  # No skill content, skip
+        if _install_skill_archive_to_dir "$skill_dir"; then
+            _log_ok "Claude Code skill installed: $skill_dir/SKILL.md"
+            return 0
+        fi
     fi
+
+    return 1  # No skill archive, skip
 }
 
 # Install skill for Codex CLI
@@ -658,18 +689,15 @@ _install_codex_skill() {
         return 1  # Codex CLI not installed, skip silently
     fi
 
-    # Write skill file from decoded base64 content
-    local skill_content
-    skill_content=$(_decode_skill_content)
-    if [[ -n "$skill_content" ]]; then
+    if [[ "$_SKILL_ARCHIVE_B64" != _* ]] && [[ -n "$_SKILL_ARCHIVE_B64" ]]; then
         _log_info "Installing Codex CLI skill..."
-        mkdir -p "$skill_dir"
-        printf '%s\n' "$skill_content" > "$skill_dir/SKILL.md"
-        _log_ok "Codex CLI skill installed: $skill_dir/SKILL.md"
-        return 0
-    else
-        return 1  # No skill content, skip
+        if _install_skill_archive_to_dir "$skill_dir"; then
+            _log_ok "Codex CLI skill installed: $skill_dir/SKILL.md"
+            return 0
+        fi
     fi
+
+    return 1  # No skill archive, skip
 }
 
 # Install skills for all detected AI coding agents
@@ -679,11 +707,9 @@ _install_skills() {
         return 0
     fi
 
-    # Check if skill content is available before announcing anything
-    local skill_content
-    skill_content=$(_decode_skill_content)
-    if [[ -z "$skill_content" ]]; then
-        return 0  # No skill content embedded, skip silently
+    # Check if skill archive is available before announcing anything
+    if [[ "$_SKILL_ARCHIVE_B64" == _* ]] || [[ -z "$_SKILL_ARCHIVE_B64" ]]; then
+        return 0  # No skill archive embedded, skip silently
     fi
 
     local installed_any=false
@@ -1079,23 +1105,46 @@ install_gen_create() {
         fi
     fi
 
-    # Get skill content (look in multiple locations)
-    local skill_content=""
-    local skill_paths=(
+    # Get skill content (prefer full skill directory, then fall back to SKILL.md only)
+    local skill_root=""
+    local skill_file=""
+    local skill_dir_candidates=(
+        "./.claude/skills/${tool_name}"
+        "./config/skills/${tool_name}"
+    )
+    local skill_file_candidates=(
         "./SKILL.md"
         "./config/skills/${tool_name}/SKILL.md"
     )
-    if [[ -n "$local_path" && -f "$local_path/SKILL.md" ]]; then
-        skill_paths=("$local_path/SKILL.md" "${skill_paths[@]}")
+    if [[ -n "$local_path" ]]; then
+        skill_dir_candidates=(
+            "$local_path/.claude/skills/${tool_name}"
+            "${skill_dir_candidates[@]}"
+        )
+        skill_file_candidates=(
+            "$local_path/SKILL.md"
+            "${skill_file_candidates[@]}"
+        )
     fi
-    for skill_path in "${skill_paths[@]}"; do
-        if [[ -f "$skill_path" ]]; then
-            skill_content=$(cat "$skill_path")
-            log_info "  Skill: $skill_path"
+
+    local skill_candidate=""
+    for skill_candidate in "${skill_dir_candidates[@]}"; do
+        if [[ -f "$skill_candidate/SKILL.md" ]]; then
+            skill_root="$skill_candidate"
+            log_info "  Skill: $skill_candidate"
             break
         fi
     done
-    if [[ -z "$skill_content" ]]; then
+    if [[ -z "$skill_root" ]]; then
+        for skill_candidate in "${skill_file_candidates[@]}"; do
+            if [[ -f "$skill_candidate" ]]; then
+                skill_file="$skill_candidate"
+                log_info "  Skill: $skill_candidate"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$skill_root" && -z "$skill_file" ]]; then
         log_info "  Skill: (none found, skills will be skipped)"
     fi
 
@@ -1138,12 +1187,31 @@ install_gen_create() {
     template="${template//__TARGET_TRIPLE_CASES__/$target_triple_cases}"
     template="${template//__ARCH_ALIAS_CASES__/$arch_alias_cases}"
 
-    # Handle skill content - use base64 encoding to avoid escaping issues
-    if [[ -n "$skill_content" ]]; then
-        local skill_b64
-        # Encode skill content as base64 (works on both Linux and macOS)
-        skill_b64=$(printf '%s' "$skill_content" | base64 | tr -d '\n')
-        template="${template//__SKILL_CONTENT_B64__/$skill_b64}"
+    # Handle skill content - archive the full skill tree when available
+    if [[ -n "$skill_root" || -n "$skill_file" ]]; then
+        local skill_archive_b64=""
+        local skill_stage=""
+        local archive_root=""
+
+        if [[ -n "$skill_root" ]]; then
+            archive_root="$skill_root"
+        else
+            skill_stage="$(mktemp -d 2>/dev/null || true)"
+            if [[ -n "$skill_stage" && -d "$skill_stage" ]]; then
+                cp "$skill_file" "$skill_stage/SKILL.md"
+                archive_root="$skill_stage"
+            fi
+        fi
+
+        if [[ -n "$archive_root" ]]; then
+            skill_archive_b64="$(tar -czf - -C "$archive_root" . | base64 | tr -d '\n')"
+        fi
+        if [[ -n "$skill_stage" && -d "$skill_stage" ]]; then
+            rm -rf "$skill_stage" 2>/dev/null || true
+        fi
+        if [[ -n "$skill_archive_b64" ]]; then
+            template="${template//__SKILL_ARCHIVE_B64__/$skill_archive_b64}"
+        fi
     fi
 
     echo "$template" > "$output_file"
