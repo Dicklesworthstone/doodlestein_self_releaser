@@ -2014,6 +2014,8 @@ act_orchestrate_build() {
     # Load config
     if ! act_load_repo_config "$tool_name"; then
         _log_error "Failed to load config for $tool_name"
+        jq -nc --arg tool "$tool_name" --arg error "Failed to load config" \
+            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
         return 4
     fi
 
@@ -2027,6 +2029,8 @@ act_orchestrate_build() {
 
     if [[ -z "$targets" ]]; then
         _log_error "No targets configured for $tool_name"
+        jq -nc --arg tool "$tool_name" --arg error "No targets configured" \
+            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
         return 4
     fi
 
@@ -2057,6 +2061,8 @@ act_orchestrate_build() {
         else
             if ! build_lock_acquire "$tool_name" "$version"; then
                 _log_error "Build already in progress (lock held)"
+                jq -nc --arg tool "$tool_name" --arg error "Build already in progress (lock held)" \
+                    '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
                 return 2
             fi
             lock_acquired_here=true

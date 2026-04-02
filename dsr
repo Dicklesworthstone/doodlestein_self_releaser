@@ -1853,9 +1853,15 @@ EOF
     start_time=$(date +%s)
 
     # Run orchestrated build
-    local full_output
+    local full_output orchestrator_exit=0
     # shellcheck disable=SC2086
-    full_output=$(act_orchestrate_build "$tool_name" "$version" $target_list 2>&1)
+    full_output=$(act_orchestrate_build "$tool_name" "$version" $target_list 2>&1) || orchestrator_exit=$?
+
+    # Debug: show orchestrator exit and last few lines of output
+    log_debug "Orchestrator exit=$orchestrator_exit, output lines=$(echo "$full_output" | wc -l)"
+    if [[ $orchestrator_exit -ne 0 ]] || [[ "$(echo "$full_output" | wc -l)" -lt 3 ]]; then
+        echo "$full_output" | tail -10 >&2
+    fi
 
     # Extract JSON from mixed output (orchestrator logs + JSON at end)
     # The orchestrator outputs JSON containing a summary object
@@ -1877,6 +1883,11 @@ EOF
 
             if ! echo "$result" | jq -e '.summary' &>/dev/null 2>&1; then
                 log_warn "Could not parse orchestrator JSON output"
+                if [[ $orchestrator_exit -ne 0 ]]; then
+                    log_error "Orchestrator exited with code $orchestrator_exit"
+                    # Show last few lines of output for diagnosis
+                    echo "$full_output" | tail -20 >&2
+                fi
                 # In verbose mode, show what we got
                 if $VERBOSE; then
                     log_debug "Full output was:"
