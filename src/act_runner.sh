@@ -766,10 +766,32 @@ act_get_targets() {
 }
 
 # Get native host for a platform
-# Usage: act_get_native_host <platform>
+# Usage: act_get_native_host <platform> [tool_name]
 # Returns: Host name (trj, mmini, wlap) or empty
 act_get_native_host() {
     local platform="$1"
+    local tool_name="${2:-}"
+
+    if [[ -n "$tool_name" ]]; then
+        local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+        if [[ -f "$config_file" ]]; then
+            local override_host
+            override_host=$(yq -r ".cross_compile.\"$platform\".host // \"\"" "$config_file" 2>/dev/null || true)
+            if [[ -n "$override_host" && "$override_host" != "null" ]]; then
+                printf '%s\n' "$override_host"
+                return 0
+            fi
+        fi
+    fi
+
+    if declare -F config_get_host_for_platform &>/dev/null; then
+        local configured_host
+        configured_host=$(config_get_host_for_platform "$platform" 2>/dev/null | tr -d '"' || true)
+        if [[ -n "$configured_host" && "$configured_host" != "null" ]]; then
+            printf '%s\n' "$configured_host"
+            return 0
+        fi
+    fi
 
     case "$platform" in
         linux/amd64|linux/arm64)
@@ -803,7 +825,7 @@ act_get_build_strategy() {
         method="act"
     else
         job=""
-        host=$(act_get_native_host "$platform")
+        host=$(act_get_native_host "$platform" "$tool_name")
         method="native"
     fi
 
@@ -904,9 +926,63 @@ _ACT_SYNC_DEFAULT_EXCLUDES=(
 # Check if rsync is available on remote host
 # Usage: _act_has_rsync <host>
 # Returns: 0 if rsync available, 1 otherwise
+_act_get_host_field() {
+    local host="${1:-}"
+    local field="${2:-}"
+
+    if [[ -z "$host" || -z "$field" || -z "${DSR_HOSTS_FILE:-}" || ! -f "$DSR_HOSTS_FILE" ]]; then
+        return 1
+    fi
+
+    local value
+    value=$(yq -r ".hosts.$host.$field // \"\"" "$DSR_HOSTS_FILE" 2>/dev/null || true)
+    if [[ -z "$value" || "$value" == "null" ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$value"
+}
+
+_act_get_host_platform() {
+    local host="${1:-}"
+    local platform
+    platform=$(_act_get_host_field "$host" "platform" || true)
+    if [[ -n "$platform" ]]; then
+        printf '%s\n' "$platform"
+        return 0
+    fi
+
+    case "$host" in
+        trj) echo "linux/amd64" ;;
+        mmini) echo "darwin/arm64" ;;
+        wlap) echo "windows/amd64" ;;
+        *) echo "" ;;
+    esac
+}
+
+_act_get_host_connection() {
+    local host="${1:-}"
+    local connection
+    connection=$(_act_get_host_field "$host" "connection" || true)
+    if [[ -n "$connection" ]]; then
+        printf '%s\n' "$connection"
+        return 0
+    fi
+
+    case "$host" in
+        trj) echo "local" ;;
+        *) echo "ssh" ;;
+    esac
+}
+
+_act_is_local_host() {
+    local host="${1:-}"
+    [[ "$(_act_get_host_connection "$host")" == "local" ]]
+}
+
 _act_is_windows_host() {
     local host="${1:-}"
-    [[ "$host" == "wlap" ]]
+    [[ "$(_act_get_host_platform "$host")" == windows/* ]]
 }
 
 _act_windows_cmd_path() {
@@ -942,10 +1018,14 @@ _act_has_rsync() {
         probe_cmd='where rsync >NUL 2>&1'
     fi
 
-    _act_run_with_timeout 10 ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
-        -o BatchMode=yes \
-        -o StrictHostKeyChecking=accept-new \
-        "$host" "$probe_cmd" 2>/dev/null
+    if _act_is_local_host "$host"; then
+        _act_run_with_timeout 10 bash -lc "$probe_cmd" 2>/dev/null
+    else
+        _act_run_with_timeout 10 ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new \
+            "$host" "$probe_cmd" 2>/dev/null
+    fi
 }
 
 # Sync source code to remote host via rsync
@@ -995,6 +1075,25 @@ _act_sync_source() {
 
     local start_time
     start_time=$(date +%s)
+
+    if _act_is_local_host "$host"; then
+        if [[ "$remote_path" == "$local_path" ]]; then
+            _log_info "Local build host already uses source tree at $local_path; skipping sync"
+            return 0
+        fi
+
+        mkdir -p "$remote_path"
+        if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+            "${exclude_args[@]}" \
+            "$local_path/" "$remote_path/" 2>&1; then
+            local duration=$(($(date +%s) - start_time))
+            _log_ok "Sync completed in ${duration}s (local rsync)"
+            return 0
+        fi
+
+        _log_error "local rsync failed"
+        return 1
+    fi
 
     # Check for rsync on remote
     if _act_has_rsync "$host"; then
@@ -1077,7 +1176,7 @@ _act_sync_sibling_crates() {
 
     local remote_parent
     # Compute the parent directory of the remote project path
-    if [[ "$host" == "wlap" ]]; then
+    if _act_is_windows_host "$host"; then
         # Windows path: C:/Users/jeffr/projects/foo → C:/Users/jeffr/projects
         remote_parent="${remote_path%/*}"
     else
@@ -1200,7 +1299,7 @@ act_sync_sources() {
         fi
 
         local host
-        host=$(act_get_native_host "$target")
+        host=$(act_get_native_host "$target" "$tool_name")
         if [[ -z "$host" ]]; then
             continue
         fi
@@ -1606,7 +1705,7 @@ act_ensure_repos_ready() {
         fi
 
         local host
-        host=$(act_get_native_host "$target")
+        host=$(act_get_native_host "$target" "$tool_name")
         [[ -z "$host" ]] && continue
 
         # Skip if already checked this host
@@ -1672,11 +1771,15 @@ _act_ssh_exec() {
     local cmd="$2"
     local timeout_sec="${3:-$_ACT_BUILD_TIMEOUT}"
 
-    _act_run_with_timeout "$timeout_sec" ssh \
-        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
-        -o BatchMode=yes \
-        -o StrictHostKeyChecking=accept-new \
-        "$host" "$cmd"
+    if _act_is_local_host "$host"; then
+        _act_run_with_timeout "$timeout_sec" bash -lc "$cmd"
+    else
+        _act_run_with_timeout "$timeout_sec" ssh \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new \
+            "$host" "$cmd"
+    fi
 }
 
 # Run native build on remote host via SSH
@@ -1689,7 +1792,7 @@ act_run_native_build() {
     local run_id="${4:-}"
 
     local host
-    host=$(act_get_native_host "$platform")
+    host=$(act_get_native_host "$platform" "$tool_name")
     if [[ -z "$host" ]]; then
         _log_error "No native host configured for platform: $platform"
         jq -nc --arg platform "$platform" \
@@ -1745,9 +1848,9 @@ act_run_native_build() {
     start_time=$(date +%s)
 
     # Construct the remote command
-    # For SSH, we need to cd to repo, set env vars, and run build
+    # Shell syntax depends on the build host OS, not only the target platform.
     local remote_cmd
-    if [[ "$platform" == windows/* ]]; then
+    if _act_is_windows_host "$host"; then
         # Windows: use cmd.exe compatible syntax
         # - Use double quotes for paths
         # - Use 'set' instead of 'export' for env vars
@@ -1836,7 +1939,14 @@ act_run_native_build() {
 
             _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
             local scp_output
-            if scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            if _act_is_local_host "$host"; then
+                if cp "$remote_artifact_path" "$this_artifact_path" 2>/dev/null; then
+                    scp_output=""
+                else
+                    scp_output="failed to copy local artifact from $remote_artifact_path"
+                    false
+                fi
+            elif scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
                    -o StrictHostKeyChecking=accept-new \
                    "${host}:${remote_artifact_path}" "$this_artifact_path" 2>&1); then
                 _log_ok "Artifact downloaded: $this_artifact_path"
@@ -2088,7 +2198,7 @@ act_orchestrate_build() {
 
         # Update host status
         local host
-        host=$(act_get_native_host "$target")
+        host=$(act_get_native_host "$target" "$tool_name")
         if command -v build_state_update_host &>/dev/null; then
             build_state_update_host "$tool_name" "$version" "$host" "running" '{"target":"'"$target"'"}' "$run_id"
         fi

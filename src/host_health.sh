@@ -52,6 +52,7 @@ _hh_parse_host_fallback() {
     local in_target=false
     local in_capabilities=false
     local platform="" connection="" ssh_host="" description="" concurrency="1"
+    local enabled="true"
     local capabilities=""
     local line
 
@@ -174,7 +175,12 @@ _hh_list_hosts_fallback() {
 
         # Host name at 2-space indent
         if [[ "$line" =~ ^[[:space:]][[:space:]]([a-zA-Z_][a-zA-Z0-9_]*): ]]; then
-            echo "${BASH_REMATCH[1]}"
+            local host_name="${BASH_REMATCH[1]}"
+            local host_json
+            host_json=$(_hh_parse_host_fallback "$host_name" 2>/dev/null || true)
+            if [[ -n "$host_json" ]] && echo "$host_json" | jq -e '(.enabled // true) == true' >/dev/null 2>&1; then
+                echo "$host_name"
+            fi
         fi
     done < "$hosts_file"
 }
@@ -497,7 +503,7 @@ _hh_check_docker_status() {
 
     local docker_info
     docker_info=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
-        "docker info --format '{{.ServerVersion}}' 2>/dev/null")
+        "docker version --format '{{.Server.Version}}' 2>/dev/null || docker info --format '{{.ServerVersion}}' 2>/dev/null")
 
     if [[ -n "$docker_info" ]]; then
         echo "{\"running\": true, \"version\": \"$docker_info\"}"
@@ -609,7 +615,7 @@ host_health_check() {
     fi
 
     # Extract host properties (works with both yq YAML output and fallback JSON)
-    local connection ssh_host capabilities platform description
+    local connection ssh_host capabilities platform description enabled
     # Try jq first (for fallback JSON), then yq (for YAML output)
     if echo "$host_config" | jq -e '.' &>/dev/null 2>&1; then
         # JSON format from fallback parser
@@ -618,6 +624,7 @@ host_health_check() {
         capabilities=$(echo "$host_config" | jq -r '.capabilities // ""')
         platform=$(echo "$host_config" | jq -r '.platform // "unknown"')
         description=$(echo "$host_config" | jq -r '.description // ""')
+        enabled=$(echo "$host_config" | jq -r '.enabled // true')
     elif command -v yq &>/dev/null; then
         # YAML format from yq
         connection=$(echo "$host_config" | yq -r '.connection // "ssh"' 2>/dev/null || echo "ssh")
@@ -625,6 +632,8 @@ host_health_check() {
         capabilities=$(echo "$host_config" | yq -r '.capabilities // [] | .[]' 2>/dev/null | tr '\n' ' ')
         platform=$(echo "$host_config" | yq -r '.platform // "unknown"' 2>/dev/null || echo "unknown")
         description=$(echo "$host_config" | yq -r '.description // ""' 2>/dev/null || echo "")
+        enabled=$(echo "$host_config" | yq -r '.enabled' 2>/dev/null || echo null)
+        [[ "$enabled" == "null" ]] && enabled=true
     else
         # Last resort: default values
         connection="ssh"
@@ -632,6 +641,31 @@ host_health_check() {
         capabilities=""
         platform="unknown"
         description=""
+        enabled=true
+    fi
+
+    if [[ "$enabled" != "true" ]]; then
+        local checked_at
+        checked_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        local disabled_result
+        disabled_result=$(jq -nc             --arg hostname "$hostname"             --arg platform "$platform"             --arg description "$description"             --arg connection "$connection"             --arg checked_at "$checked_at"             '{
+                hostname: $hostname,
+                platform: $platform,
+                description: $description,
+                connection: $connection,
+                status: "disabled",
+                healthy: false,
+                errors: 0,
+                warnings: 0,
+                checks: {},
+                checked_at: $checked_at
+            }')
+        if $json_mode; then
+            echo "$disabled_result"
+        else
+            _hh_log_info "$hostname ($platform): disabled"
+        fi
+        return 0
     fi
 
     # Use hostname as ssh_host if not specified

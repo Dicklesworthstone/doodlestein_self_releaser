@@ -594,10 +594,24 @@ config_list_hosts() {
     fi
 
     if command -v yq &>/dev/null; then
+        local -a hosts=()
+        while IFS= read -r host; do
+            [[ -z "$host" || "$host" == "null" ]] && continue
+            local enabled
+            enabled=$(HOST="$host" yq -r '.hosts[env(HOST)].enabled' "$DSR_HOSTS_FILE" 2>/dev/null || echo null)
+            [[ "$enabled" == "null" ]] && enabled=true
+            [[ "$enabled" == "true" ]] && hosts+=("$host")
+        done < <(yq -r '.hosts | keys | .[]' "$DSR_HOSTS_FILE")
+
         if $json_mode; then
-            yq '.hosts | keys' "$DSR_HOSTS_FILE"
+            for host in "${hosts[@]}"; do
+                echo "$host"
+            done | jq -R -s 'split("
+") | map(select(length > 0))'
         else
-            yq '.hosts | keys | .[]' "$DSR_HOSTS_FILE"
+            for host in "${hosts[@]}"; do
+                echo "$host"
+            done
         fi
     else
         _cfg_log_error "yq required for host listing"
@@ -640,7 +654,21 @@ config_get_host_for_platform() {
     fi
 
     if command -v yq &>/dev/null; then
-        yq ".platform_mapping.\"$platform\" // \"\"" "$DSR_HOSTS_FILE"
+        local host
+        host=$(PLATFORM="$platform" yq -r '.platform_mapping[env(PLATFORM)] // ""' "$DSR_HOSTS_FILE" 2>/dev/null || echo "")
+        if [[ -z "$host" || "$host" == "null" ]]; then
+            echo ""
+            return 0
+        fi
+
+        local enabled
+        enabled=$(HOST="$host" yq -r '.hosts[env(HOST)].enabled' "$DSR_HOSTS_FILE" 2>/dev/null || echo null)
+        [[ "$enabled" == "null" ]] && enabled=true
+        if [[ "$enabled" == "true" ]]; then
+            echo "$host"
+        else
+            echo ""
+        fi
     else
         # Fallback to hardcoded defaults
         case "$platform" in

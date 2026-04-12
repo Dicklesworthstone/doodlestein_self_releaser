@@ -6704,12 +6704,18 @@ EOF
     # Get host health (refresh if requested)
     if $refresh; then
         log_info "Refreshing host health..."
-        hosts_status=$(host_health_check_all 2>/dev/null | jq -c '.')
+        hosts_status=$(host_health_check_all --json 2>/dev/null | jq -c '.hosts | map({(.hostname): .}) | add // {}' 2>/dev/null) || hosts_status='{}'
     else
-        # Try to get from cache, fallback to empty
+        # Try to get from cache for enabled hosts only, fallback to empty
         local cache_dir="${DSR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dsr}/health"
-        if [[ -d "$cache_dir" ]] && ls "$cache_dir"/*.json &>/dev/null; then
-            hosts_status=$(cat "$cache_dir"/*.json 2>/dev/null | jq -s 'map({(.hostname): .}) | add' 2>/dev/null) || hosts_status='{}'
+        local enabled_hosts
+        enabled_hosts=$(config_list_hosts 2>/dev/null || true)
+        if [[ -d "$cache_dir" && -n "$enabled_hosts" ]]; then
+            hosts_status=$(while IFS= read -r host; do
+                [[ -z "$host" ]] && continue
+                local cache_file="$cache_dir/${host}.json"
+                [[ -f "$cache_file" ]] && cat "$cache_file"
+            done <<< "$enabled_hosts" | jq -s 'map({(.hostname): .}) | add // {}' 2>/dev/null) || hosts_status='{}'
         else
             hosts_status='{}'
         fi
