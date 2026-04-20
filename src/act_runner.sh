@@ -2395,6 +2395,28 @@ act_generate_manifest() {
 
     local artifacts=()
     local seen_paths=()
+    local -A seen_names=()
+
+    # Map a filename's embedded platform suffix to a canonical "<os>/<arch>"
+    # target. Returns empty if no recognizable suffix is present. Used to
+    # override the orchestration-step target when matrix workflows produce
+    # cross-platform artifacts under a single act job (e.g. release.yml that
+    # builds linux/darwin/windows from the "build-release" job).
+    _act_infer_target_from_name() {
+        local nm="$1"
+        local os="" arch=""
+        case "$nm" in
+            *darwin*) os="darwin" ;;
+            *linux*musl*|*musl*linux*) os="linux" ;;
+            *linux*)  os="linux" ;;
+            *windows*|*.exe) os="windows" ;;
+        esac
+        case "$nm" in
+            *_aarch64*|*-aarch64*|*_arm64*|*-arm64*) arch="arm64" ;;
+            *_x86_64*|*-x86_64*|*_amd64*|*-amd64*)   arch="amd64" ;;
+        esac
+        [[ -n "$os" && -n "$arch" ]] && printf '%s/%s\n' "$os" "$arch"
+    }
 
     _act_manifest_add_file() {
         local file="$1"
@@ -2412,9 +2434,18 @@ act_generate_manifest() {
                 ;;
         esac
 
+        # Skip exact-path duplicates AND name-collision duplicates. Without
+        # the name dedup the manifest gets one entry per orchestration target
+        # iteration when multiple targets share an artifact_dir or when a
+        # matrix workflow emits a full set of cross-platform tarballs under
+        # one act job — producing duplicate `name` entries with conflicting
+        # `target` and `sha256`, which cascades into a corrupt SHA256SUMS.
         for seen in "${seen_paths[@]}"; do
             [[ "$seen" == "$file" ]] && return 0
         done
+        if [[ -n "${seen_names[$name]:-}" ]]; then
+            return 0
+        fi
 
         local sha size format
         sha=$(_act_sha256 "$file" 2>/dev/null || echo "")
@@ -2428,6 +2459,16 @@ act_generate_manifest() {
         if [[ -z "$size" || "$size" -le 0 ]]; then
             _log_warn "Unable to determine size for artifact: $file"
             return 0
+        fi
+
+        # If the filename embeds a recognizable platform suffix, trust it
+        # over the orchestration-step target — the latter is unreliable when
+        # matrix workflows produce cross-platform artifacts under a single
+        # act job.
+        local inferred_target
+        inferred_target=$(_act_infer_target_from_name "$name")
+        if [[ -n "$inferred_target" ]]; then
+            target="$inferred_target"
         fi
 
         local sig_file=""
@@ -2458,6 +2499,7 @@ act_generate_manifest() {
 
         artifacts+=("$artifact_json")
         seen_paths+=("$file")
+        seen_names["$name"]=1
     }
 
     _act_sha256_zip_entry() {
@@ -2535,6 +2577,12 @@ act_generate_manifest() {
             for seen in "${seen_paths[@]}"; do
                 [[ "$seen" == "$seen_key" ]] && continue 2
             done
+            # Same name-collision dedup as the on-disk path. Without it a
+            # matrix workflow whose zip artifact bundles every platform
+            # would emit one manifest entry per orchestration target.
+            if [[ -n "${seen_names[$name]:-}" ]]; then
+                continue
+            fi
 
             local sha size format
             sha=$(_act_sha256_zip_entry "$zip_file" "$entry" 2>/dev/null || echo "")
@@ -2550,10 +2598,19 @@ act_generate_manifest() {
                 continue
             fi
 
+            # Filename-derived target overrides the orchestration target
+            # (matrix workflow under one act job ⇒ unreliable per-target).
+            local entry_target="$target"
+            local inferred_target
+            inferred_target=$(_act_infer_target_from_name "$name")
+            if [[ -n "$inferred_target" ]]; then
+                entry_target="$inferred_target"
+            fi
+
             local artifact_json
             artifact_json=$(jq -nc \
                 --arg name "$name" \
-                --arg target "$target" \
+                --arg target "$entry_target" \
                 --arg sha "$sha" \
                 --argjson size "$size" \
                 --arg format "$format" \
@@ -2569,6 +2626,7 @@ act_generate_manifest() {
 
             artifacts+=("$artifact_json")
             seen_paths+=("$seen_key")
+            seen_names["$name"]=1
         done
     }
 

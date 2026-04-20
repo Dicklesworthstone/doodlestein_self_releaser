@@ -218,6 +218,60 @@ else
     fail "act_generate_manifest returned invalid manifest"
 fi
 
+# Regression: a matrix workflow under one act job emits the same set of
+# cross-platform artifacts under multiple orchestration targets. The manifest
+# must dedupe by basename and infer the real target from the filename so each
+# artifact appears exactly once with the correct target. Pre-fix, this test
+# produced 4 entries with conflicting targets and SHA256 values.
+mkdir -p "$TEMP_DIR/dup-artifacts"
+# All-tarball corpus to exercise the regular file path (the zip path extracts
+# inner entries, which is a separate semantic). The bug we're guarding
+# against is shared artifact_dir across orchestration targets producing
+# duplicate manifest entries with conflicting target labels.
+echo "linux-amd64-binary"   > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-linux_amd64.tar.gz"
+echo "linux-arm64-binary"   > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-linux_arm64.tar.gz"
+echo "darwin-arm64-binary"  > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-darwin_arm64.tar.gz"
+echo "windows-amd64-binary" > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-windows_amd64.tar.gz"
+
+dup_result=$(jq -nc --arg dir "$TEMP_DIR/dup-artifacts" '{
+  tool: "testool",
+  version: "v1.0.0",
+  run_id: "dup-test",
+  status: "success",
+  targets: [
+    { platform: "linux/amd64",  host: "trj",   method: "act", status: "success", artifact_dir: $dir },
+    { platform: "linux/arm64",  host: "trj",   method: "act", status: "success", artifact_dir: $dir },
+    { platform: "windows/amd64",host: "wlap",  method: "ssh", status: "success", artifact_dir: $dir },
+    { platform: "darwin/arm64", host: "mmini", method: "ssh", status: "success", artifact_dir: $dir }
+  ]
+}')
+dup_manifest=$(act_generate_manifest "$dup_result" "")
+dup_total=$(echo "$dup_manifest" | jq '.artifacts | length')
+dup_unique=$(echo "$dup_manifest" | jq '.artifacts | map(.name) | unique | length')
+
+if [[ "$dup_total" -eq 4 ]] && [[ "$dup_unique" -eq 4 ]]; then
+    pass "act_generate_manifest dedupes shared artifact_dir entries by basename"
+else
+    fail "act_generate_manifest emitted $dup_total entries with $dup_unique unique names (expected 4/4)"
+fi
+
+# Critically: target labels must match the filename, not the orchestration-
+# step target. Pre-fix, every artifact was labeled "linux/amd64" because the
+# first iteration won the seen_paths race.
+linux_amd_target=$(echo "$dup_manifest" | jq -r '.artifacts[] | select(.name == "testool-v1.0.0-linux_amd64.tar.gz")   | .target')
+linux_arm_target=$(echo "$dup_manifest" | jq -r '.artifacts[] | select(.name == "testool-v1.0.0-linux_arm64.tar.gz")   | .target')
+windows_target=$(echo "$dup_manifest"   | jq -r '.artifacts[] | select(.name == "testool-v1.0.0-windows_amd64.tar.gz") | .target')
+darwin_target=$(echo "$dup_manifest"    | jq -r '.artifacts[] | select(.name == "testool-v1.0.0-darwin_arm64.tar.gz")  | .target')
+
+if [[ "$linux_amd_target" == "linux/amd64" ]] && \
+   [[ "$linux_arm_target" == "linux/arm64" ]] && \
+   [[ "$windows_target"   == "windows/amd64" ]] && \
+   [[ "$darwin_target"    == "darwin/arm64" ]]; then
+    pass "act_generate_manifest infers target from filename when matrix-shared"
+else
+    fail "act_generate_manifest mislabeled targets: linux_amd=$linux_amd_target linux_arm=$linux_arm_target windows=$windows_target darwin=$darwin_target"
+fi
+
 # Cleanup
 rm -rf "$TEMP_DIR"
 
