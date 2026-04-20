@@ -218,31 +218,49 @@ else
     fail "act_generate_manifest returned invalid manifest"
 fi
 
-# Regression: a matrix workflow under one act job emits the same set of
-# cross-platform artifacts under multiple orchestration targets. The manifest
-# must dedupe by basename and infer the real target from the filename so each
-# artifact appears exactly once with the correct target. Pre-fix, this test
-# produced 4 entries with conflicting targets and SHA256 values.
-mkdir -p "$TEMP_DIR/dup-artifacts"
-# All-tarball corpus to exercise the regular file path (the zip path extracts
-# inner entries, which is a separate semantic). The bug we're guarding
-# against is shared artifact_dir across orchestration targets producing
-# duplicate manifest entries with conflicting target labels.
-echo "linux-amd64-binary"   > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-linux_amd64.tar.gz"
-echo "linux-arm64-binary"   > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-linux_arm64.tar.gz"
-echo "darwin-arm64-binary"  > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-darwin_arm64.tar.gz"
-echo "windows-amd64-binary" > "$TEMP_DIR/dup-artifacts/testool-v1.0.0-windows_amd64.tar.gz"
+# Regression: a matrix workflow under one act job emits the SAME set of
+# cross-platform artifacts under multiple orchestration targets, and each
+# matrix run lands them in its own per-target artifact_dir. So the manifest
+# sees the same basename in multiple distinct paths, often with different
+# content (each matrix run rebuilds, so SHAs drift slightly).
+#
+# Pre-fix, the path-based seen_paths dedup missed those (paths differ) and
+# four orchestration iterations × four files each → 16 manifest entries with
+# duplicate names + conflicting targets + conflicting SHAs. That cascaded
+# into a SHA256SUMS that failed `sha256sum --check` on every collided name
+# and into incorrect "target" labels in the manifest itself.
+#
+# Post-fix the basename-based dedup collapses the 16 to 4, and filename-
+# inference labels each with the right canonical target.
+mkdir -p "$TEMP_DIR/dup-artifacts/per-target/linux-amd64"
+mkdir -p "$TEMP_DIR/dup-artifacts/per-target/linux-arm64"
+mkdir -p "$TEMP_DIR/dup-artifacts/per-target/windows-amd64"
+mkdir -p "$TEMP_DIR/dup-artifacts/per-target/darwin-arm64"
 
-dup_result=$(jq -nc --arg dir "$TEMP_DIR/dup-artifacts" '{
+# Each per-target dir contains a full matrix output. Content varies per dir
+# so SHAs differ — this is what defeats the path-based seen_paths dedup.
+for d in linux-amd64 linux-arm64 windows-amd64 darwin-arm64; do
+    base="$TEMP_DIR/dup-artifacts/per-target/$d"
+    echo "linux-amd64-binary-from-$d"   > "$base/testool-v1.0.0-linux_amd64.tar.gz"
+    echo "linux-arm64-binary-from-$d"   > "$base/testool-v1.0.0-linux_arm64.tar.gz"
+    echo "darwin-arm64-binary-from-$d"  > "$base/testool-v1.0.0-darwin_arm64.tar.gz"
+    echo "windows-amd64-binary-from-$d" > "$base/testool-v1.0.0-windows_amd64.tar.gz"
+done
+
+dup_result=$(jq -nc \
+  --arg d_la "$TEMP_DIR/dup-artifacts/per-target/linux-amd64" \
+  --arg d_lr "$TEMP_DIR/dup-artifacts/per-target/linux-arm64" \
+  --arg d_w  "$TEMP_DIR/dup-artifacts/per-target/windows-amd64" \
+  --arg d_d  "$TEMP_DIR/dup-artifacts/per-target/darwin-arm64" '{
   tool: "testool",
   version: "v1.0.0",
   run_id: "dup-test",
   status: "success",
   targets: [
-    { platform: "linux/amd64",  host: "trj",   method: "act", status: "success", artifact_dir: $dir },
-    { platform: "linux/arm64",  host: "trj",   method: "act", status: "success", artifact_dir: $dir },
-    { platform: "windows/amd64",host: "wlap",  method: "ssh", status: "success", artifact_dir: $dir },
-    { platform: "darwin/arm64", host: "mmini", method: "ssh", status: "success", artifact_dir: $dir }
+    { platform: "linux/amd64",  host: "trj",   method: "act", status: "success", artifact_dir: $d_la },
+    { platform: "linux/arm64",  host: "trj",   method: "act", status: "success", artifact_dir: $d_lr },
+    { platform: "windows/amd64",host: "wlap",  method: "ssh", status: "success", artifact_dir: $d_w  },
+    { platform: "darwin/arm64", host: "mmini", method: "ssh", status: "success", artifact_dir: $d_d  }
   ]
 }')
 dup_manifest=$(act_generate_manifest "$dup_result" "")
@@ -250,14 +268,14 @@ dup_total=$(echo "$dup_manifest" | jq '.artifacts | length')
 dup_unique=$(echo "$dup_manifest" | jq '.artifacts | map(.name) | unique | length')
 
 if [[ "$dup_total" -eq 4 ]] && [[ "$dup_unique" -eq 4 ]]; then
-    pass "act_generate_manifest dedupes shared artifact_dir entries by basename"
+    pass "act_generate_manifest dedupes same-basename across distinct dirs (broken-v0.1.45 scenario)"
 else
     fail "act_generate_manifest emitted $dup_total entries with $dup_unique unique names (expected 4/4)"
 fi
 
 # Critically: target labels must match the filename, not the orchestration-
-# step target. Pre-fix, every artifact was labeled "linux/amd64" because the
-# first iteration won the seen_paths race.
+# step target. Pre-fix, every artifact got the orchestration-step target
+# attached (first iteration's "linux/amd64" for all four files).
 linux_amd_target=$(echo "$dup_manifest" | jq -r '.artifacts[] | select(.name == "testool-v1.0.0-linux_amd64.tar.gz")   | .target')
 linux_arm_target=$(echo "$dup_manifest" | jq -r '.artifacts[] | select(.name == "testool-v1.0.0-linux_arm64.tar.gz")   | .target')
 windows_target=$(echo "$dup_manifest"   | jq -r '.artifacts[] | select(.name == "testool-v1.0.0-windows_amd64.tar.gz") | .target')
@@ -270,6 +288,22 @@ if [[ "$linux_amd_target" == "linux/amd64" ]] && \
     pass "act_generate_manifest infers target from filename when matrix-shared"
 else
     fail "act_generate_manifest mislabeled targets: linux_amd=$linux_amd_target linux_arm=$linux_arm_target windows=$windows_target darwin=$darwin_target"
+fi
+
+# Spot-check the musl filename pattern — it must collapse to "linux/<arch>"
+# (libc choice is a filename detail, not a separate dsr target).
+mkdir -p "$TEMP_DIR/musl"
+echo "musl-amd64-binary" > "$TEMP_DIR/musl/testool-v1.0.0-linux_musl_amd64.tar.gz"
+musl_result=$(jq -nc --arg dir "$TEMP_DIR/musl" '{
+  tool: "testool", version: "v1.0.0", run_id: "musl-test", status: "success",
+  targets: [{ platform: "linux/amd64", host: "trj", method: "act", status: "success", artifact_dir: $dir }]
+}')
+musl_target=$(act_generate_manifest "$musl_result" "" | jq -r '.artifacts[0].target')
+
+if [[ "$musl_target" == "linux/amd64" ]]; then
+    pass "act_generate_manifest maps linux_musl_amd64 → linux/amd64"
+else
+    fail "act_generate_manifest mapped musl variant to '$musl_target' (expected linux/amd64)"
 fi
 
 # Cleanup

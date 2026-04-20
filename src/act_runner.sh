@@ -2402,13 +2402,15 @@ act_generate_manifest() {
     # override the orchestration-step target when matrix workflows produce
     # cross-platform artifacts under a single act job (e.g. release.yml that
     # builds linux/darwin/windows from the "build-release" job).
+    #
+    # musl variants are mapped to plain "linux/<arch>" — the libc choice is a
+    # filename detail (e.g. linux_musl_amd64), not a separate dsr target.
     _act_infer_target_from_name() {
         local nm="$1"
         local os="" arch=""
         case "$nm" in
-            *darwin*) os="darwin" ;;
-            *linux*musl*|*musl*linux*) os="linux" ;;
-            *linux*)  os="linux" ;;
+            *darwin*)        os="darwin" ;;
+            *linux*)         os="linux" ;;
             *windows*|*.exe) os="windows" ;;
         esac
         case "$nm" in
