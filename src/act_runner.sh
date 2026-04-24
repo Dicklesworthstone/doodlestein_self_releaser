@@ -1986,10 +1986,41 @@ act_run_native_build() {
                 fi
                 local_artifact_paths+=("$this_artifact_path")
             else
-                _log_error "Failed to download artifact $bin from $host"
-                _log_error "SCP error: $scp_output"
-                echo "SCP failed for $bin: $scp_output" >> "$log_file"
-                download_failed=true
+                # Windows cross-compile fallback (symmetric with the local-host
+                # branch above): `go build -o <name> ./cmd/x` does NOT append
+                # `.exe` on any GOOS, so when act_get_remote_artifact_path
+                # appends .exe unconditionally for windows/* and scp 404s on
+                # the .exe form, retry once against the bare name. The local
+                # dest keeps its .exe suffix so downstream packaging still
+                # produces a conventional Windows bv.exe.
+                local fallback_ok=false
+                if [[ "$remote_artifact_path" == *.exe ]]; then
+                    local alt_remote_artifact_path="${remote_artifact_path%.exe}"
+                    local alt_scp_output
+                    if alt_scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                           -o StrictHostKeyChecking=accept-new \
+                           "${host}:${alt_remote_artifact_path}" "$this_artifact_path" 2>&1); then
+                        _log_ok "Artifact downloaded (fallback, no .exe): $this_artifact_path"
+                        if [[ -f "$this_artifact_path" ]]; then
+                            local file_size
+                            file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
+                            _log_info "Artifact size: $file_size bytes"
+                        fi
+                        local_artifact_paths+=("$this_artifact_path")
+                        fallback_ok=true
+                    else
+                        # Annotate the log with the fallback attempt for
+                        # triageability; the primary error still wins the
+                        # top-level "SCP error:" line.
+                        echo "SCP fallback (no .exe) also failed for $bin: $alt_scp_output" >> "$log_file"
+                    fi
+                fi
+                if ! $fallback_ok; then
+                    _log_error "Failed to download artifact $bin from $host"
+                    _log_error "SCP error: $scp_output"
+                    echo "SCP failed for $bin: $scp_output" >> "$log_file"
+                    download_failed=true
+                fi
             fi
         done
 

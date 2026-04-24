@@ -56,9 +56,21 @@ _is_local() {
     [[ "$_HOST" == "local" ]]
 }
 
+# Stubbed scp: we can't spin up a real ssh target in a unit test, so the
+# fake `scp` behaves like cp against paths on the local filesystem. That
+# keeps the contract under test — fallback-when-.exe-missing — honest
+# without requiring a live remote.
+_fake_scp() {
+    # Usage mirrors the real call shape: _fake_scp <src> <dest>
+    cp "$1" "$2" 2>/dev/null
+}
+
 # Reimplementation of the fixed branch. If this diverges from the real
 # act_run_native_build snippet, the test will fail against the
-# acceptance criteria rather than the literal source.
+# acceptance criteria rather than the literal source. The scp arm here
+# is exercised whenever _HOST != "local" and mirrors the production
+# flow: try the exact path, and on failure, if the path ends in .exe,
+# retry once without the suffix.
 _download_branch() {
     local remote_artifact_path="$1"
     local this_artifact_path="$2"
@@ -79,6 +91,26 @@ _download_branch() {
         else
             echo "Local cp failed for $bin: $copy_src" >> "$_LOG_FILE"
             download_failed=true
+        fi
+    else
+        # Remote (scp) branch with the same .exe fallback.
+        if _fake_scp "$remote_artifact_path" "$this_artifact_path"; then
+            local_artifact_paths+=("$this_artifact_path")
+        else
+            local fallback_ok=false
+            if [[ "$remote_artifact_path" == *.exe ]]; then
+                local alt_remote="${remote_artifact_path%.exe}"
+                if _fake_scp "$alt_remote" "$this_artifact_path"; then
+                    local_artifact_paths+=("$this_artifact_path")
+                    fallback_ok=true
+                else
+                    echo "SCP fallback (no .exe) also failed for $bin" >> "$_LOG_FILE"
+                fi
+            fi
+            if ! $fallback_ok; then
+                echo "SCP failed for $bin: $remote_artifact_path" >> "$_LOG_FILE"
+                download_failed=true
+            fi
         fi
     fi
 }
@@ -177,4 +209,89 @@ _download_branch() {
     [[ "$download_failed" == "false" ]]
     [[ "$(cat "$dest")" == "exe-output" ]]
     [[ "${#local_artifact_paths[@]}" -eq 1 ]]
+}
+
+# ============================================================================
+# Remote (scp) branch — symmetric contract
+# ============================================================================
+
+@test "scp success populates local_artifact_paths" {
+    _reset_branch_state
+    _HOST="wlap"  # anything other than 'local'
+    local remote="$_HARNESS_TMPDIR/repo/bv"
+    local dest="$_HARNESS_TMPDIR/artifacts/windows-amd64/bv.exe"
+    mkdir -p "$(dirname "$remote")" "$(dirname "$dest")"
+    printf 'fake-win-pe' > "$remote"
+
+    _download_branch "$remote" "$dest" "bv"
+
+    [[ "$download_failed" == "false" ]]
+    [[ "${#local_artifact_paths[@]}" -eq 1 ]]
+    [[ "${local_artifact_paths[0]}" == "$dest" ]]
+}
+
+@test "scp failure sets download_failed and logs" {
+    _reset_branch_state
+    _HOST="wlap"
+    local missing="$_HARNESS_TMPDIR/repo/nope"
+    local dest="$_HARNESS_TMPDIR/artifacts/linux-amd64/bv"
+    mkdir -p "$(dirname "$missing")" "$(dirname "$dest")"
+
+    _download_branch "$missing" "$dest" "bv"
+
+    [[ "$download_failed" == "true" ]]
+    [[ "${#local_artifact_paths[@]}" -eq 0 ]]
+    grep -q "SCP failed for bv:" "$_LOG_FILE"
+}
+
+@test "scp windows fallback: .exe missing but bare name present -> retry succeeds" {
+    _reset_branch_state
+    _HOST="wlap"
+    local bare="$_HARNESS_TMPDIR/repo/bv"
+    local exe="$bare.exe"
+    local dest="$_HARNESS_TMPDIR/artifacts/windows-amd64/bv.exe"
+    mkdir -p "$(dirname "$bare")" "$(dirname "$dest")"
+    # Simulates native-Windows Go build with `go build -o bv ./cmd/bv`
+    # which produces `bv` even on Windows hosts (Go only auto-appends
+    # .exe when -o is omitted).
+    printf 'fake-win-bare' > "$bare"
+    [[ ! -f "$exe" ]]
+
+    _download_branch "$exe" "$dest" "bv"
+
+    [[ "$download_failed" == "false" ]]
+    [[ "$(cat "$dest")" == "fake-win-bare" ]]
+    [[ "${#local_artifact_paths[@]}" -eq 1 ]]
+}
+
+@test "scp windows fallback: both .exe and bare name missing -> failure" {
+    _reset_branch_state
+    _HOST="wlap"
+    local exe="$_HARNESS_TMPDIR/repo/bv.exe"
+    local dest="$_HARNESS_TMPDIR/artifacts/windows-amd64/bv.exe"
+    mkdir -p "$(dirname "$exe")" "$(dirname "$dest")"
+
+    _download_branch "$exe" "$dest" "bv"
+
+    [[ "$download_failed" == "true" ]]
+    [[ "${#local_artifact_paths[@]}" -eq 0 ]]
+    grep -q "SCP fallback (no .exe) also failed for bv" "$_LOG_FILE"
+    grep -q "SCP failed for bv:" "$_LOG_FILE"
+}
+
+@test "scp non-windows failure does not attempt fallback" {
+    _reset_branch_state
+    _HOST="mmini"
+    local missing="$_HARNESS_TMPDIR/repo/nope"
+    local dest="$_HARNESS_TMPDIR/artifacts/darwin-arm64/bv"
+    mkdir -p "$(dirname "$missing")" "$(dirname "$dest")"
+
+    _download_branch "$missing" "$dest" "bv"
+
+    [[ "$download_failed" == "true" ]]
+    [[ "${#local_artifact_paths[@]}" -eq 0 ]]
+    grep -q "SCP failed for bv:" "$_LOG_FILE"
+    # The fallback is gated on path ending in .exe; darwin path must not
+    # log a fallback attempt.
+    ! grep -q "SCP fallback" "$_LOG_FILE"
 }
