@@ -146,22 +146,52 @@ selector_acquire_slot() {
                 "$@"
             ) 200>"$global_lock_file"
         else
-            # Fallback: mkdir-based locking (atomic on POSIX systems)
-            local lock_dir="$global_lock_file.d"
+            # Fallback: mkdir-based locking (atomic on POSIX systems).
+            # Using a DIFFERENT local name (_mkdir_lock) to avoid
+            # shadowing the outer selector_acquire_slot's $lock_dir —
+            # if a future edit to _try_acquire ever references $lock_dir
+            # it will now see the correct per-host path rather than the
+            # global lock.
+            local _mkdir_lock="$global_lock_file.d"
             local max_wait=30
             local waited=0
-            while ! mkdir "$lock_dir" 2>/dev/null; do
+            # Treat the lock as stale if it's been held longer than
+            # max_wait * 2 — matches flock's implicit release on process
+            # death and prevents permanent wedging if a previous holder
+            # was SIGKILL'd before reaching the rmdir cleanup below.
+            local stale_ceiling=$((max_wait * 2))
+            while ! mkdir "$_mkdir_lock" 2>/dev/null; do
+                local lock_age=0
+                if [[ -d "$_mkdir_lock" ]]; then
+                    local lock_mtime
+                    lock_mtime=$(stat -c %Y "$_mkdir_lock" 2>/dev/null || stat -f %m "$_mkdir_lock" 2>/dev/null || echo 0)
+                    local now
+                    now=$(date +%s)
+                    lock_age=$((now - lock_mtime))
+                fi
+                if [[ $lock_age -ge $stale_ceiling ]]; then
+                    _sel_log_warn "Clearing stale mkdir lock (age=${lock_age}s): $_mkdir_lock"
+                    rmdir "$_mkdir_lock" 2>/dev/null || true
+                    continue
+                fi
                 if [[ $waited -ge $max_wait ]]; then
                     _sel_log_warn "Lock acquisition timeout (flock unavailable, using mkdir fallback)"
                     return 2
                 fi
                 sleep 1
-                ((waited++))
+                waited=$((waited + 1))
             done
-            # Run command and cleanup
+            # Ensure the lock is released even if the command SIGTERMs,
+            # returns non-zero, or triggers an ERR trap. The trap is
+            # RETURN-scoped so it fires when _with_lock returns, which
+            # includes the normal path below AND any early return from
+            # within the wrapped command via `exit` in the caller.
+            # shellcheck disable=SC2064  # expand _mkdir_lock now
+            trap "rmdir '$_mkdir_lock' 2>/dev/null; trap - RETURN" RETURN
             "$@"
             local ret=$?
-            rmdir "$lock_dir" 2>/dev/null
+            rmdir "$_mkdir_lock" 2>/dev/null
+            trap - RETURN
             return $ret
         fi
     }

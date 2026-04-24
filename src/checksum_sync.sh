@@ -232,9 +232,19 @@ checksum_verify() {
         [[ -z "$line" ]] && continue
         [[ "$line" =~ ^# ]] && continue
 
+        # Parse sha256sum format: "<hash>  <filename>" or "<hash> *<filename>"
+        # (the second field starts after exactly two characters past the
+        # hash — a space+space or space+asterisk separator). Using awk
+        # '{print $2}' only captured the first word of filenames that
+        # contained spaces; future dsr artifact-naming experiments that
+        # permit spaces (or releases signed by upstream tools that do)
+        # would silently report "file not found" for every such entry.
         local expected_sha filename
-        expected_sha=$(echo "$line" | awk '{print $1}')
-        filename=$(echo "$line" | awk '{print $2}')
+        expected_sha="${line%%[[:space:]]*}"
+        local rest="${line#$expected_sha}"
+        # Strip the 2-char separator: either "  " or " *"
+        rest="${rest#??}"
+        filename="$rest"
 
         local file_path="$dir/$filename"
         if [[ ! -f "$file_path" ]]; then

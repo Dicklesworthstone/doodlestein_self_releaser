@@ -63,12 +63,41 @@ gh_check() {
     return 0
 }
 
-# Check if GITHUB_TOKEN is available for curl fallback
+# Resolve a GitHub token using the canonical cascade:
+#   1. DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN (via secrets_get_gh_token
+#      if that helper is sourced — it centralises the precedence so the
+#      gh_upload_asset and gh_upload_asset_named callers below use the
+#      same order)
+#   2. `gh auth token` if gh CLI is authenticated
+#   3. Bare $GITHUB_TOKEN env var
+# Emits the resolved token on stdout. Returns 0 with a non-empty token on
+# success, 3 on failure.
+_gh_resolve_token() {
+    local token=""
+    if command -v secrets_get_gh_token &>/dev/null; then
+        token=$(secrets_get_gh_token 2>/dev/null || true)
+    fi
+    if [[ -z "$token" ]] && gh_check 2>/dev/null; then
+        token=$(gh auth token 2>/dev/null || true)
+    fi
+    [[ -z "$token" ]] && token="${GITHUB_TOKEN:-}"
+    if [[ -z "$token" ]]; then
+        return 3
+    fi
+    printf '%s' "$token"
+    return 0
+}
+
+# Check if a GitHub token can be resolved from any supported source.
+# Previously this only inspected $GITHUB_TOKEN directly, so setups that
+# provided the token via DSR_GH_TOKEN or `gh auth login` (as documented
+# in secrets.sh) were rejected even though the upload path could have
+# used them.
 gh_check_token() {
-    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-        _gh_log_error "GITHUB_TOKEN not set and gh CLI not authenticated"
+    if ! _gh_resolve_token >/dev/null; then
+        _gh_log_error "No GitHub token available (DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN unset and gh CLI not authenticated)"
         _gh_log_info "Either run: gh auth login"
-        _gh_log_info "Or set: export GITHUB_TOKEN=<your-token>"
+        _gh_log_info "Or set: export DSR_GH_TOKEN=<your-token>"
         return 3
     fi
     return 0
@@ -296,12 +325,23 @@ _gh_api_with_curl() {
     local data="$3"
 
     local url="https://api.github.com/$endpoint"
+    # Resolve via the shared cascade so DSR_GH_TOKEN and `gh auth token`
+    # work on this path too, not just bare $GITHUB_TOKEN. The callers
+    # have already been gated through gh_check_token, so an empty result
+    # here means the token was revoked mid-run — bail out instead of
+    # sending "Authorization: Bearer " (which 401s with a confusing body).
+    local gh_token
+    if ! gh_token=$(_gh_resolve_token); then
+        _GH_LAST_HTTP_CODE=""
+        _GH_LAST_ETAG=""
+        return 3
+    fi
     local curl_args=(
         -s
         -S
         -X "$method"
         -H "Accept: application/vnd.github+json"
-        -H "Authorization: Bearer $GITHUB_TOKEN"
+        -H "Authorization: Bearer $gh_token"
         -H "X-GitHub-Api-Version: 2022-11-28"
     )
 
@@ -945,7 +985,7 @@ gh_clear_cache() {
 }
 
 # Export functions
-export -f gh_init_cache gh_check gh_check_token gh_api
+export -f gh_init_cache gh_check gh_check_token _gh_resolve_token gh_api
 export -f gh_workflow_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch

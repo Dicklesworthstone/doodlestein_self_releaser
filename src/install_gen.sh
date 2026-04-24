@@ -112,6 +112,17 @@ _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dsr/installers"
 _OFFLINE_MODE=false
 _PREFER_GH=false
 _SKIP_SKILLS=false
+# Working directory created by main(). Declared at script scope so the
+# EXIT trap (which fires AFTER main returns and its locals have been
+# popped) can still see it and clean up. Leaving this as `local temp_dir`
+# inside main() made the trap fire with an empty expansion and leak the
+# tmpdir under /tmp on every install.
+_TEMP_DIR=""
+_cleanup_temp_dir() {
+    if [[ -n "${_TEMP_DIR:-}" && -d "$_TEMP_DIR" ]]; then
+        rm -rf "$_TEMP_DIR"
+    fi
+}
 
 # Colors (disable if NO_COLOR set or not a terminal)
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
@@ -820,10 +831,12 @@ main() {
     local format
     format=$(_get_archive_format "$platform")
 
-    # Create temp directory
-    local temp_dir
-    temp_dir=$(mktemp -d)
-    trap 'rm -rf "$temp_dir"' EXIT
+    # Create temp directory. _TEMP_DIR is a script-scope global so the
+    # EXIT trap can still see it after main() returns and locals are
+    # popped.
+    _TEMP_DIR=$(mktemp -d)
+    trap _cleanup_temp_dir EXIT
+    local temp_dir="$_TEMP_DIR"
 
     local archive_file="$temp_dir/${TOOL_NAME}.${format}"
     local extract_dir="$temp_dir/extracted"
