@@ -1970,7 +1970,6 @@ act_run_native_build() {
                     fi
                     local_artifact_paths+=("$this_artifact_path")
                 else
-                    scp_output="failed to copy local artifact from $copy_src"
                     _log_error "Failed to copy artifact $bin from local host ($copy_src)"
                     echo "Local cp failed for $bin: $copy_src" >> "$log_file"
                     download_failed=true
