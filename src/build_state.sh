@@ -482,11 +482,18 @@ build_state_update_host() {
     extra_json='{}'
   fi
 
-  # Update host status using safe helper
-  _build_state_jq_update "$state_file" \
-    --arg host "$host" --arg status "$host_status" --arg now "$now" \
-    --argjson extra "$extra_json" \
-    '.hosts[$host] = ((.hosts[$host] // {}) + $extra + {status: $status, updated_at: $now}) | .updated_at = $now'
+  # Update host status using safe helper. Propagate failure so callers
+  # don't see "log_debug" succeeding while the underlying jq update
+  # silently dropped the change — the previous code returned 0 even
+  # when _build_state_jq_update returned 1, which left the state file
+  # stale while the orchestrator believed it had recorded the host
+  # transition.
+  if ! _build_state_jq_update "$state_file" \
+      --arg host "$host" --arg status "$host_status" --arg now "$now" \
+      --argjson extra "$extra_json" \
+      '.hosts[$host] = ((.hosts[$host] // {}) + $extra + {status: $status, updated_at: $now}) | .updated_at = $now'; then
+    return 1
+  fi
 
   log_debug "Host status updated: $host -> $host_status"
 }
@@ -524,11 +531,16 @@ build_state_add_artifact() {
     size=$(stat -c%s "$artifact_path" 2>/dev/null || stat -f%z "$artifact_path" 2>/dev/null || echo 0)
   fi
 
-  # Add artifact to state using safe helper
-  _build_state_jq_update "$state_file" \
-    --arg name "$artifact_name" --arg path "$artifact_path" \
-    --arg sha256 "$sha256" --argjson size "$size" --arg now "$now" \
-    '.artifacts = (.artifacts // []) + [{name: $name, path: $path, sha256: $sha256, size_bytes: $size, added_at: $now}] | .updated_at = $now'
+  # Add artifact to state using safe helper. Propagate failure (see the
+  # comment in build_state_update_host) — silently swallowing a jq
+  # failure here means the manifest the orchestrator hands to the
+  # release step would be missing entries.
+  if ! _build_state_jq_update "$state_file" \
+      --arg name "$artifact_name" --arg path "$artifact_path" \
+      --arg sha256 "$sha256" --argjson size "$size" --arg now "$now" \
+      '.artifacts = (.artifacts // []) + [{name: $name, path: $path, sha256: $sha256, size_bytes: $size, added_at: $now}] | .updated_at = $now'; then
+    return 1
+  fi
 
   log_debug "Artifact added: $artifact_name"
 }
@@ -556,10 +568,15 @@ build_state_set_git_info() {
   local now
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-  # Update git info using safe helper
-  _build_state_jq_update "$state_file" \
-    --arg sha "$git_sha" --arg ref "$git_ref" --arg now "$now" \
-    '.git_sha = $sha | .git_ref = $ref | .updated_at = $now'
+  # Update git info using safe helper. Propagate failure so a corrupt
+  # state file doesn't silently get re-read with the wrong SHA later
+  # (build_state_get_git_sha would return the prior value as if this
+  # update had succeeded).
+  if ! _build_state_jq_update "$state_file" \
+      --arg sha "$git_sha" --arg ref "$git_ref" --arg now "$now" \
+      '.git_sha = $sha | .git_ref = $ref | .updated_at = $now'; then
+    return 1
+  fi
 
   log_debug "Git info set: $git_ref ($git_sha)"
 }

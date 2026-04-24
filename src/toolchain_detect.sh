@@ -99,8 +99,15 @@ _tc_version_ge() {
 
     local i
     for ((i=0; i<3; i++)); do
-        local n1="${v1_parts[i]:-0}"
-        local n2="${v2_parts[i]:-0}"
+        # Prefix segments with 10# so bash arithmetic uses base-10
+        # explicitly. Without it, a version segment with a leading zero
+        # (e.g. the "08" in a hypothetical 1.08.0 tag, or "09" in a
+        # zero-padded build identifier) is parsed as octal and the
+        # comparison aborts with "value too great for base" the moment
+        # the digit is 8 or 9. The 10# prefix is safe for any pure-digit
+        # string and standard practice for set -u shells.
+        local n1=$((10#${v1_parts[i]:-0}))
+        local n2=$((10#${v2_parts[i]:-0}))
         if ((n1 > n2)); then
             return 0
         elif ((n1 < n2)); then

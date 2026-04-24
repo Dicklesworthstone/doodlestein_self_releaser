@@ -233,9 +233,17 @@ EOF
     local homebrew_error=""
     local scoop_error=""
 
-    # Create temp directory for work
+    # Create temp directory for work. Register a RETURN trap so the
+    # tap/bucket clones get cleaned up even if a downstream `return`,
+    # SIGINT, or panic interrupts the function before reaching the
+    # explicit `rm -rf "$temp_dir"` at the bottom. Without this, a
+    # network error during git-clone (return 0 but git_clone_failed)
+    # left ~50MB of cloned brew tap under /tmp on every retry.
     local temp_dir
     temp_dir=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand $temp_dir at trap-set time so
+    # the cleanup still works after the local goes out of scope.
+    trap "rm -rf '$temp_dir' 2>/dev/null; trap - RETURN" RETURN
 
     # Update Homebrew formula
     if ! $skip_homebrew && [[ -n "$darwin_arm64_url" || -n "$linux_amd64_url" ]]; then
@@ -353,8 +361,10 @@ EOF
         log_warn "Skipping Scoop: no Windows assets found"
     fi
 
-    # Cleanup temp directory
+    # Cleanup temp directory (the RETURN trap above is the safety net;
+    # this is the explicit happy-path cleanup so the trap is a no-op).
     rm -rf "$temp_dir"
+    trap - RETURN
 
     # Calculate duration
     local end_time duration
