@@ -295,9 +295,25 @@ config_set() {
     DSR_CONFIG["$key"]="$value"
 
     if $persist && command -v yq &>/dev/null; then
-        # Use --arg to safely escape the value
-        yq -i --arg v "$value" ".$key = \$v" "$DSR_CONFIG_FILE"
-        _cfg_log_ok "Set $key = $value (persisted)"
+        # Only accept dotted-path keys built from identifier characters —
+        # anything else could inject yq expression syntax (e.g. quotes or
+        # arithmetic) through the unquoted interpolation below.
+        if [[ ! "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$ ]]; then
+            _cfg_log_error "Refusing to persist key with unsafe characters: $key"
+            return 4
+        fi
+
+        # yq (Mike Farah Go version) does NOT accept jq-style --arg flags;
+        # pass the value through the environment and read it back with
+        # strenv() inside the expression so the YAML string escaping is
+        # handled by yq itself. Check the exit code so we surface errors
+        # instead of claiming success when persistence actually failed.
+        if DSR_SET_VALUE="$value" yq -i ".$key = strenv(DSR_SET_VALUE)" "$DSR_CONFIG_FILE" 2>/dev/null; then
+            _cfg_log_ok "Set $key = $value (persisted)"
+        else
+            _cfg_log_error "Failed to persist $key to $DSR_CONFIG_FILE"
+            return 1
+        fi
     else
         _cfg_log_info "Set $key = $value (in memory)"
     fi
