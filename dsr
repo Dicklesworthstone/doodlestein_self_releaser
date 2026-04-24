@@ -4669,7 +4669,16 @@ EOF
     # === Step 1: Pre-release checks ===
     if ! $skip_checks; then
         log_info "=== Step 1/4: Pre-release Checks ==="
-        if quality_run_checks "$tool_name" --work-dir "$local_path" 2>/dev/null; then
+        # Bug: this previously called `quality_run_checks` — a name that
+        # only exists in the original bd-36r design doc, never in any
+        # shipped module. The real function is `qg_run_checks` (defined
+        # in src/quality_gates.sh). The 2>/dev/null on the call hid the
+        # `command not found` message, so the if branch always fell to
+        # the else: every `dsr fallback` run that didn't pass
+        # --skip-checks aborted at "Quality checks failed" with no
+        # diagnostic path forward. Calling the correct function makes
+        # the pipeline actually executable.
+        if qg_run_checks "$tool_name" --work-dir "$local_path"; then
             checks_status="passed"
             log_ok "Quality checks passed"
         else

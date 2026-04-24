@@ -456,7 +456,21 @@ _download_and_verify() {
             local expected_sha
             local filename
             filename=$(basename "$dest")
-            expected_sha=$(echo "$checksums" | grep "$filename" | awk '{print $1}')
+            # Match the EXACT filename. Earlier this used
+            #   grep "$filename" | awk '{print $1}'
+            # which (a) treated $filename as a regex — so the dot in
+            # `bv.tar.gz` matched any single char and would happily
+            # accept a hash for `bvXtarYgz`, and (b) used substring
+            # matching, so `bv.tar.gz` also matched `prebv.tar.gz` or
+            # `bv.tar.gz.minisig`. Either path could feed the wrong
+            # hash into the verifier — silently downgrading the
+            # integrity check or outright accepting a tampered asset.
+            # Use awk with literal field equality on the second column,
+            # accepting both the `<hash>  <name>` (text) and
+            # `<hash> *<name>` (binary) sha256sum conventions.
+            expected_sha=$(printf '%s\n' "$checksums" | awk -v fname="$filename" '
+                $2 == fname || $2 == "*" fname {print $1; exit}
+            ')
 
             if [[ -n "$expected_sha" ]]; then
                 local actual_sha

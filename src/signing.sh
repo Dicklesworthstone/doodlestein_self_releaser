@@ -463,6 +463,74 @@ signing_sign_batch() {
     return 0
 }
 
+# Predicate used by orchestrators to decide whether to call into the
+# signing pipeline. Honors:
+#   - DSR_NO_SIGN=1 / DSR_SIGNING_ENABLED=false to disable explicitly
+#   - signing.enabled in DSR_CONFIG (loaded by config.sh) when present
+#   - the presence of a usable keypair (signing_check) as the final gate
+# Returns 0 if signing should run, 1 otherwise.
+# Usage: signing_is_enabled
+signing_is_enabled() {
+    # Explicit env opt-out wins.
+    if [[ "${DSR_NO_SIGN:-}" == "1" ]] || [[ "${DSR_NO_SIGN:-}" == "true" ]]; then
+        return 1
+    fi
+    if [[ "${DSR_SIGNING_ENABLED:-}" == "false" ]] || [[ "${DSR_SIGNING_ENABLED:-}" == "0" ]]; then
+        return 1
+    fi
+    # config.sh loaded? Honor signing_enabled in the in-memory config.
+    if declare -p DSR_CONFIG &>/dev/null; then
+        local cfg_value="${DSR_CONFIG[signing_enabled]:-true}"
+        case "$cfg_value" in
+            false|0|no|off) return 1 ;;
+        esac
+    fi
+    # Final gate: only enabled if the keypair actually exists and is
+    # usable. signing_check writes diagnostic logs to stderr; suppress
+    # those here because callers use this as a "should I bother?" check.
+    signing_check >/dev/null 2>&1
+}
+
+# Sign every file in a directory matching a glob pattern. Convenience
+# wrapper that expands the pattern (skipping already-signed sigs and
+# obvious non-artifacts like checksums and SBOMs) and forwards to
+# signing_sign_batch.
+# Usage: signing_sign_files <dir> <glob_pattern>
+signing_sign_files() {
+    local dir="${1:-}"
+    local pattern="${2:-*}"
+
+    if [[ -z "$dir" || ! -d "$dir" ]]; then
+        _sign_log_error "signing_sign_files: directory not found: $dir"
+        return 4
+    fi
+
+    # Build the list of candidates with explicit globbing so the caller
+    # doesn't have to. Skip files that wouldn't make sense to sign:
+    # checksums, SBOMs, provenance, existing signatures.
+    local -a files=()
+    local f
+    shopt -s nullglob
+    for f in "$dir"/$pattern; do
+        [[ -f "$f" ]] || continue
+        case "$(basename "$f")" in
+            *.minisig|*.sig|*.asc) continue ;;
+            *SHA256*|*sha256*|*checksums*) continue ;;
+            *.sbom.*|*.intoto.jsonl) continue ;;
+        esac
+        files+=("$f")
+    done
+    shopt -u nullglob
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        _sign_log_warn "signing_sign_files: no files match $dir/$pattern"
+        return 0
+    fi
+
+    signing_sign_batch "${files[@]}"
+}
+
 # Export functions for use by other scripts
 export -f signing_require_minisign signing_check signing_init signing_fix_permissions
 export -f signing_sign signing_verify signing_get_public_key signing_sign_batch
+export -f signing_is_enabled signing_sign_files

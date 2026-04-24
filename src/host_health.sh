@@ -554,6 +554,23 @@ _hh_check_clock_drift() {
         return 1
     fi
 
+    # Validate the remote time is a positive integer before doing
+    # arithmetic on it. The earlier code went straight into
+    # `$((remote_time - local_time))`, which under `set -uo pipefail`
+    # aborts the function with a "syntax error" the moment the SSH/
+    # PowerShell call returns something non-numeric (a PowerShell warn
+    # banner, a partial line, an SSH MOTD that leaked through, etc.) —
+    # the caller would then see the function exit with no JSON on
+    # stdout and treat the host as silently broken. Use jq to safely
+    # encode the (possibly multi-line / quote-containing) error value.
+    if [[ ! "$remote_time" =~ ^[0-9]+$ ]]; then
+        local _hh_truncated="${remote_time:0:200}"
+        local _hh_err
+        _hh_err=$(jq -nc --arg msg "Non-numeric remote time: $_hh_truncated" '{drift_seconds: null, status: "error", error: $msg}')
+        echo "$_hh_err"
+        return 1
+    fi
+
     drift_seconds=$((remote_time - local_time))
     [[ $drift_seconds -lt 0 ]] && drift_seconds=$((-drift_seconds))
 
