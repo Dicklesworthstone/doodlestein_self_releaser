@@ -1940,11 +1940,40 @@ act_run_native_build() {
             _log_info "Downloading artifact: ${host}:${remote_artifact_path}"
             local scp_output
             if _act_is_local_host "$host"; then
-                if cp "$remote_artifact_path" "$this_artifact_path" 2>/dev/null; then
-                    scp_output=""
+                # Local host: no SCP, just cp from the remote_path (which IS
+                # the build path locally). Go cross-compiled to a windows
+                # target with an explicit `-o <name>` does NOT append .exe,
+                # so if the .exe form is missing, fall back to the bare
+                # name before declaring failure. Previously this branch
+                # neither populated local_artifact_paths on success nor set
+                # download_failed on failure, so a successful local cp was
+                # silently dropped from the result JSON — every downstream
+                # per-target artifact_path lookup came back empty, collection
+                # only saw one artifact, and packaging fell through to the
+                # generic `_build_find_binary "$output_dir"` path which
+                # returned the same (first-collected) binary for every
+                # target.
+                local copy_src="$remote_artifact_path"
+                if [[ ! -f "$copy_src" ]] && [[ "$copy_src" == *.exe ]]; then
+                    local alt_src="${copy_src%.exe}"
+                    if [[ -f "$alt_src" ]]; then
+                        copy_src="$alt_src"
+                        _log_info "Windows artifact lacks .exe suffix (Go -o output); using $alt_src"
+                    fi
+                fi
+                if cp "$copy_src" "$this_artifact_path" 2>/dev/null; then
+                    _log_ok "Artifact copied (local): $this_artifact_path"
+                    if [[ -f "$this_artifact_path" ]]; then
+                        local file_size
+                        file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
+                        _log_info "Artifact size: $file_size bytes"
+                    fi
+                    local_artifact_paths+=("$this_artifact_path")
                 else
-                    scp_output="failed to copy local artifact from $remote_artifact_path"
-                    false
+                    scp_output="failed to copy local artifact from $copy_src"
+                    _log_error "Failed to copy artifact $bin from local host ($copy_src)"
+                    echo "Local cp failed for $bin: $copy_src" >> "$log_file"
+                    download_failed=true
                 fi
             elif scp_output=$(scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
                    -o StrictHostKeyChecking=accept-new \
