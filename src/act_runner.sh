@@ -1225,8 +1225,12 @@ _act_sync_sibling_crates() {
 
         # Rewrite absolute path to relative in remote Cargo.toml
         # e.g., path = "/dp/asupersync" → path = "../asupersync"
+        # Was previously hardcoded to the literal hostname "wlap" —
+        # any other Windows host (winbox, ci-windows, …) silently
+        # took the Unix branch and ran perl, which doesn't exist on
+        # vanilla Windows.  Use the platform-aware helper instead.
         local relative_ref="../${sib_relative}"
-        if [[ "$host" == "wlap" ]]; then
+        if _act_is_windows_host "$host"; then
             # Windows: use .NET File API to avoid Set-Content's UTF-16LE default
             # encoding on PowerShell 5.x (which would corrupt Cargo.toml).
             # Avoids PowerShell variables ($p, $t) entirely — eliminates all
@@ -1571,9 +1575,14 @@ act_ensure_remote_repo_ready() {
 
     _log_info "Ensuring repo at $host:$remote_path is ready..."
 
-    # Determine if this is a Windows host
+    # Determine if this is a Windows host.  Was previously hardcoded
+    # to the literal hostname "wlap"; that broke any other Windows
+    # host added later (winbox, ci-windows, etc.) — _act_is_windows_host
+    # consults the host's configured platform instead.
     local is_windows=false
-    [[ "$host" == "wlap" ]] && is_windows=true
+    if _act_is_windows_host "$host"; then
+        is_windows=true
+    fi
 
     # Build commands for git operations
     local test_dir_cmd test_git_cmd clone_cmd pull_cmd checkout_cmd stash_cmd rm_cmd
