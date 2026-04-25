@@ -1940,12 +1940,19 @@ EOF
             return 0
         fi
 
-        base="$name"
-        ext=""
-        if [[ "$name" == *.* ]]; then
-            ext=".${name##*.}"
-            base="${name%.*}"
-        fi
+        # Split off compound extensions FIRST so e.g. `binary.tar.gz`
+        # becomes (base="binary", ext=".tar.gz") and the os/arch suffix
+        # is inserted before the full extension instead of between
+        # `.tar` and `.gz` (which silently broke `.tar.gz` recognition
+        # in downstream tar/checksum logic).
+        case "$name" in
+            *.tar.gz)  ext=".tar.gz";  base="${name%.tar.gz}"  ;;
+            *.tar.xz)  ext=".tar.xz";  base="${name%.tar.xz}"  ;;
+            *.tar.bz2) ext=".tar.bz2"; base="${name%.tar.bz2}" ;;
+            *.tar.zst) ext=".tar.zst"; base="${name%.tar.zst}" ;;
+            *.*)       ext=".${name##*.}"; base="${name%.*}"   ;;
+            *)         ext=""; base="$name"                    ;;
+        esac
 
         if [[ "$base" == *"_${os}_${arch}" ]]; then
             printf '%s\n' "$name"
