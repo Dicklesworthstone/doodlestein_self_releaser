@@ -388,20 +388,37 @@ _upgrade_build_tool() {
     local bin_path="$tmpdir/$tool_name"
 
     if [[ -f "$repo_dir/go.mod" ]]; then
-        # Go project
+        # Go project.  cd into the module so module-mode resolves
+        # correctly regardless of the caller's PWD; the subshell
+        # contains the cd so the rest of the script is unaffected.
         log_debug "Building Go project..."
         if [[ -d "$repo_dir/cmd/$tool_name" ]]; then
-            go build -o "$bin_path" "$repo_dir/cmd/$tool_name" 2>/dev/null
+            ( cd "$repo_dir" && go build -o "$bin_path" "./cmd/$tool_name" ) 2>/dev/null
         elif [[ -f "$repo_dir/main.go" ]]; then
-            go build -o "$bin_path" "$repo_dir" 2>/dev/null
+            ( cd "$repo_dir" && go build -o "$bin_path" . ) 2>/dev/null
         fi
     elif [[ -f "$repo_dir/Cargo.toml" ]]; then
-        # Rust project
+        # Rust project.  Use --bin so we get the right binary in
+        # multi-binary crates, then ask cargo where target_directory
+        # actually is so this works under CARGO_TARGET_DIR overrides
+        # (e.g. /data/tmp/cargo-target on this VPS).  Previously we
+        # hardcoded $repo_dir/target/release/$tool_name, which
+        # silently failed whenever CARGO_TARGET_DIR was set.
         log_debug "Building Rust project..."
-        cargo build --release --manifest-path "$repo_dir/Cargo.toml" 2>/dev/null
-        local target_path="$repo_dir/target/release/$tool_name"
-        if [[ -f "$target_path" ]]; then
-            cp "$target_path" "$bin_path"
+        if cargo build --release \
+                --manifest-path "$repo_dir/Cargo.toml" \
+                --bin "$tool_name" 2>/dev/null; then
+            local target_dir target_path
+            if command -v jq &>/dev/null; then
+                target_dir=$(cargo metadata --no-deps --format-version=1 \
+                                --manifest-path "$repo_dir/Cargo.toml" 2>/dev/null \
+                                | jq -r '.target_directory // empty' 2>/dev/null)
+            fi
+            [[ -z "$target_dir" ]] && target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
+            target_path="$target_dir/release/$tool_name"
+            if [[ -f "$target_path" ]]; then
+                cp "$target_path" "$bin_path"
+            fi
         fi
     fi
 

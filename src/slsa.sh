@@ -58,6 +58,7 @@ slsa_generate() {
     local output=""
     local build_type="dsr-local"
     local invocation_id=""
+    local repo_path=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -65,6 +66,7 @@ slsa_generate() {
             --output|-o) output="$2"; shift 2 ;;
             --build-type) build_type="$2"; shift 2 ;;
             --invocation-id) invocation_id="$2"; shift 2 ;;
+            --repo-path) repo_path="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -109,12 +111,35 @@ slsa_generate() {
         invocation_id="$(hostname)-$(date +%Y%m%d%H%M%S)-$$"
     fi
 
-    # Get git info if available
+    # Get git info if available.
+    # Resolution order for source-of-truth repo:
+    #   1) explicit --repo-path argument
+    #   2) directory containing the artifact (for build-output workflows)
+    #   3) current working directory (legacy behaviour)
+    # Each candidate is probed with `git rev-parse --git-dir` so we
+    # only use a directory that's actually inside a git repo, and we
+    # warn loudly when no repo can be located — provenance with empty
+    # source info is misleading.
     local git_repo="" git_commit="" git_ref=""
     if command -v git &>/dev/null; then
-        git_repo=$(git config --get remote.origin.url 2>/dev/null || echo "")
-        git_commit=$(git rev-parse HEAD 2>/dev/null || echo "")
-        git_ref=$(git symbolic-ref -q HEAD 2>/dev/null || echo "")
+        local git_search_dirs=()
+        [[ -n "$repo_path" ]] && git_search_dirs+=("$repo_path")
+        git_search_dirs+=("$(dirname "$artifact")" "$PWD")
+        local git_dir=""
+        for candidate in "${git_search_dirs[@]}"; do
+            [[ -z "$candidate" || ! -d "$candidate" ]] && continue
+            if git -C "$candidate" rev-parse --git-dir &>/dev/null; then
+                git_dir="$candidate"
+                break
+            fi
+        done
+        if [[ -n "$git_dir" ]]; then
+            git_repo=$(git -C "$git_dir" config --get remote.origin.url 2>/dev/null || echo "")
+            git_commit=$(git -C "$git_dir" rev-parse HEAD 2>/dev/null || echo "")
+            git_ref=$(git -C "$git_dir" symbolic-ref -q HEAD 2>/dev/null || echo "")
+        else
+            log_warn "No git repository found for $artifact (tried --repo-path, artifact dir, PWD); provenance source info will be empty"
+        fi
     fi
 
     # Build the in-toto statement with SLSA v1 provenance predicate

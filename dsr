@@ -7634,8 +7634,10 @@ SUBCOMMANDS:
     verify      Verify SLSA provenance matches artifact digest
 
 OPTIONS:
-    --builder, -b <id>  Builder identity URL
-    --output, -o <file> Output file (default: <artifact>.intoto.jsonl)
+    --builder, -b <id>   Builder identity URL
+    --output, -o <file>  Output file (default: <artifact>.intoto.jsonl)
+    --repo-path <dir>    Source repo to read git provenance from
+                         (default: artifact's directory, then PWD)
 
 DESCRIPTION:
     Generates SLSA v1 provenance (in-toto Statement) for release artifacts.
@@ -7645,11 +7647,12 @@ DESCRIPTION:
     - Artifact name and SHA256 digest
     - Builder identity
     - Build timestamps
-    - Git source info (if available)
+    - Git source info (resolved via --repo-path / artifact dir / PWD)
 
 EXAMPLES:
     dsr slsa generate ./build/ntm-linux-amd64
     dsr slsa generate ./build/ntm-darwin-arm64 --builder "https://github.com/Dicklesworthstone/dsr"
+    dsr slsa generate /tmp/out/ntm-linux-amd64 --repo-path /data/projects/ntm
     dsr slsa verify ./build/ntm-linux-amd64
 
 EXIT CODES:
@@ -7671,11 +7674,13 @@ _slsa_generate() {
     local artifact=""
     local builder_id="$SLSA_BUILDER_ID"
     local output=""
+    local repo_path=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --builder|-b) builder_id="$2"; shift 2 ;;
             --output|-o) output="$2"; shift 2 ;;
+            --repo-path) repo_path="$2"; shift 2 ;;
             -*) log_error "Unknown option: $1"; return 4 ;;
             *) artifact="$1"; shift ;;
         esac
@@ -7691,6 +7696,7 @@ _slsa_generate() {
 
     local -a args=()
     [[ -n "$output" ]] && args+=("--output" "$output")
+    [[ -n "$repo_path" ]] && args+=("--repo-path" "$repo_path")
 
     if result=$(slsa_generate "$artifact" --builder "$builder_id" "${args[@]}" 2>&1); then
         local duration=$(($(date +%s) - start_time))
