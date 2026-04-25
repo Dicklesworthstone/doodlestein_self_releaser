@@ -41,34 +41,41 @@ _dp_log_debug() { [[ "${DISPATCH_DEBUG:-}" == "1" ]] && echo "${_DP_BLUE}[dispat
 # Authentication
 # ============================================================================
 
+# Resolve a GitHub token using the canonical cascade:
+#   DSR_GH_TOKEN > GITHUB_TOKEN > GH_TOKEN > `gh auth token`
+# Mirrors github.sh / docker.sh / secrets.sh. Previously this module
+# only inspected GITHUB_TOKEN + `gh auth`, so users who set
+# DSR_GH_TOKEN (the documented primary) or GH_TOKEN were rejected.
+# Emits the token on stdout, returns 0 with non-empty token, 1 otherwise.
+_dp_get_token() {
+    local token=""
+    if command -v secrets_get_gh_token &>/dev/null; then
+        token=$(secrets_get_gh_token 2>/dev/null || true)
+    fi
+    [[ -z "$token" ]] && token="${DSR_GH_TOKEN:-}"
+    [[ -z "$token" ]] && token="${GITHUB_TOKEN:-}"
+    [[ -z "$token" ]] && token="${GH_TOKEN:-}"
+    if [[ -z "$token" ]] && command -v gh &>/dev/null; then
+        token=$(gh auth token 2>/dev/null || true)
+    fi
+    if [[ -z "$token" ]]; then
+        return 1
+    fi
+    printf '%s' "$token"
+    return 0
+}
+
 # Check if GitHub authentication is available
 # Returns: 0 if authenticated, 3 if not
 dispatch_check_auth() {
-    # Try gh CLI first
-    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-        return 0
-    fi
-
-    # Fall back to GITHUB_TOKEN
-    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    if _dp_get_token >/dev/null; then
         return 0
     fi
 
     _dp_log_error "GitHub authentication required"
     _dp_log_info "Either run: gh auth login"
-    _dp_log_info "Or set: export GITHUB_TOKEN=<your-token>"
+    _dp_log_info "Or set: export DSR_GH_TOKEN=<your-token> (or GITHUB_TOKEN / GH_TOKEN)"
     return 3
-}
-
-# Get GitHub token for API calls
-_dp_get_token() {
-    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-        gh auth token 2>/dev/null
-    elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        echo "$GITHUB_TOKEN"
-    else
-        return 1
-    fi
 }
 
 # ============================================================================
@@ -153,7 +160,7 @@ dispatch_event() {
             return 0
         else
             exit_code=$?
-            ((retry++))
+            retry=$((retry + 1))
 
             if [[ $retry -lt $DISPATCH_MAX_RETRIES ]]; then
                 local wait_time=$((DISPATCH_RETRY_DELAY * retry))
@@ -368,10 +375,10 @@ EOF
         $dry_run && dispatch_args+=(--dry-run)
 
         if dispatch_event "${dispatch_args[@]}"; then
-            ((dispatched++))
+            dispatched=$((dispatched + 1))
             results+=("$(jq -nc --arg repo "$repo" '{repo: $repo, status: "success"}')")
         else
-            ((failed++))
+            failed=$((failed + 1))
             results+=("$(jq -nc --arg repo "$repo" '{repo: $repo, status: "error"}')")
         fi
     done
@@ -448,14 +455,35 @@ dispatch_batch() {
     local dispatched=0
     local failed=0
 
-    if $parallel && command -v parallel &>/dev/null; then
-        # Use GNU parallel if available
-        _dp_log_info "Using parallel dispatch..."
-        local dispatch_cmd="dispatch_event {} $event_type --payload '$payload'"
-        $dry_run && dispatch_cmd+=" --dry-run"
-
-        printf '%s\n' "${target_repos[@]}" | parallel --jobs 4 "$dispatch_cmd"
-        return $?
+    if $parallel; then
+        # Bash-native parallel dispatch.
+        # The previous GNU-parallel path failed at runtime: parallel
+        # spawned a subshell that didn't have dispatch_event, the
+        # _dp_* helpers, or the colour vars defined, and returned
+        # immediately without updating dispatched/failed counters.
+        # `&` + `wait <pid>` keeps every helper in scope, captures
+        # each job's exit code, and removes the GNU-parallel dep.
+        # Each dispatch is a single HTTP POST so launching all repos
+        # concurrently is fine in practice (typical: 1-10 repos).
+        _dp_log_info "Using parallel dispatch (${#target_repos[@]} concurrent)..."
+        local pids=() pid_to_repo=()
+        for repo in "${target_repos[@]}"; do
+            local dispatch_args=("$repo" "$event_type" --payload "$payload")
+            $dry_run && dispatch_args+=(--dry-run)
+            ( dispatch_event "${dispatch_args[@]}" ) &
+            pids+=("$!")
+            pid_to_repo+=("$repo")
+        done
+        # Wait for each job and tally results by PID
+        local idx
+        for idx in "${!pids[@]}"; do
+            if wait "${pids[$idx]}" 2>/dev/null; then
+                dispatched=$((dispatched + 1))
+            else
+                failed=$((failed + 1))
+                _dp_log_warn "Failed: ${pid_to_repo[$idx]}"
+            fi
+        done
     else
         # Sequential dispatch
         for repo in "${target_repos[@]}"; do
@@ -463,9 +491,9 @@ dispatch_batch() {
             $dry_run && dispatch_args+=(--dry-run)
 
             if dispatch_event "${dispatch_args[@]}"; then
-                ((dispatched++))
+                dispatched=$((dispatched + 1))
             else
-                ((failed++))
+                failed=$((failed + 1))
             fi
         done
     fi
