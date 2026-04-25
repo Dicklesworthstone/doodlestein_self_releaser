@@ -243,7 +243,9 @@ EOF
     temp_dir=$(mktemp -d)
     # shellcheck disable=SC2064  # expand $temp_dir at trap-set time so
     # the cleanup still works after the local goes out of scope.
-    trap "rm -rf '$temp_dir' 2>/dev/null; trap - RETURN" RETURN
+    # RETURN handles normal exit; INT/TERM cover the common case where
+    # the user Ctrl-C's during the (slow) git clone of the tap/bucket.
+    trap "rm -rf '$temp_dir' 2>/dev/null; trap - RETURN INT TERM" RETURN INT TERM
 
     # Update Homebrew formula
     if ! $skip_homebrew && [[ -n "$darwin_arm64_url" || -n "$linux_amd64_url" ]]; then

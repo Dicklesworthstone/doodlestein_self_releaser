@@ -154,11 +154,16 @@ canary_run_test() {
         installer_path=""
     fi
 
-    # Prepare test directory
+    # Prepare test directory.
+    # RETURN handles normal exit; INT/TERM cover the common case where
+    # the user Ctrl-C's during `docker build` or `docker run` (the
+    # most time-consuming steps below).  We expand $tmpdir at trap
+    # set time so the cleanup still works even after `local` scope
+    # would otherwise hide it.
     local tmpdir
     tmpdir=$(mktemp -d)
     # shellcheck disable=SC2064  # We want $tmpdir expanded now, at trap definition time
-    trap "rm -rf '$tmpdir'" RETURN
+    trap "rm -rf '$tmpdir' 2>/dev/null; trap - RETURN INT TERM" RETURN INT TERM
 
     # Create test script
     local install_deps
