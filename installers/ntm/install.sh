@@ -194,8 +194,16 @@ _cache_put() {
     cache_dir=$(dirname "$cache_file")
 
     mkdir -p "$cache_dir"
-    cp "$src_file" "$cache_file"
-    _log_info "Cached archive: $cache_file"
+    # Atomic write: copy to .tmp then rename.  Otherwise a Ctrl-C
+    # mid-cp leaves a truncated file in the cache, and the next run
+    # silently uses it (the cache check is just `[[ -f ]]`).
+    local tmp_file="${cache_file}.tmp.$$"
+    if cp "$src_file" "$tmp_file" && mv -f "$tmp_file" "$cache_file"; then
+        _log_info "Cached archive: $cache_file"
+    else
+        rm -f "$tmp_file" 2>/dev/null || true
+        _log_warn "Failed to cache archive: $cache_file"
+    fi
 }
 
 # ============================================================================
@@ -391,7 +399,16 @@ _download_and_verify() {
             local expected_sha
             local filename
             filename=$(basename "$dest")
-            expected_sha=$(echo "$checksums" | grep "$filename" | awk '{print $1}')
+            # Match the EXACT filename — earlier this used a regex
+            # substring grep that could match `prebv.tar.gz` or
+            # `ntm.tar.gz.minisig` for filename `ntm.tar.gz`,
+            # silently picking up the wrong hash. Use awk with
+            # literal field equality on column 2; accept both the
+            # `<hash>  <name>` (text) and `<hash> *<name>` (binary)
+            # sha256sum conventions.
+            expected_sha=$(printf '%s\n' "$checksums" | awk -v fname="$filename" '
+                $2 == fname || $2 == "*" fname {print $1; exit}
+            ')
 
             if [[ -n "$expected_sha" ]]; then
                 local actual_sha

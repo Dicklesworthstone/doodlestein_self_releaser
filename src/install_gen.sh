@@ -259,8 +259,19 @@ _cache_put() {
     cache_dir=$(dirname "$cache_file")
 
     mkdir -p "$cache_dir"
-    cp "$src_file" "$cache_file"
-    _log_info "Cached archive: $cache_file"
+    # Atomic write: copy to a sibling .tmp then rename.  Without this,
+    # a Ctrl-C between cp's open() and final fsync leaves a truncated
+    # file in the cache, and the next invocation happily uses it
+    # (the cache check is just `[[ -f ]]`), causing a corrupt-archive
+    # extraction failure with no obvious cause.  rename(2) is atomic
+    # within a filesystem.
+    local tmp_file="${cache_file}.tmp.$$"
+    if cp "$src_file" "$tmp_file" && mv -f "$tmp_file" "$cache_file"; then
+        _log_info "Cached archive: $cache_file"
+    else
+        rm -f "$tmp_file" 2>/dev/null || true
+        _log_warn "Failed to cache archive: $cache_file"
+    fi
 }
 
 # ============================================================================
@@ -660,9 +671,44 @@ _install_skill_archive_to_dir() {
         return 1
     fi
 
-    if ! _decode_skill_archive | tar -xzf - -C "$stage_dir" >/dev/null 2>&1; then
+    # Pre-validate the archive listing before extracting.  Skill
+    # content is publisher-controlled, but a compromised release
+    # tarball could contain absolute paths, ".." traversal entries,
+    # or symlinks that escape $stage_dir during extraction (or worse,
+    # during the subsequent `cp -R "$stage_dir/." "$skill_dir/"`
+    # which faithfully recreates symlinks under ~/.claude/).  Reject
+    # any entry whose name starts with `/`, contains `../`, or whose
+    # type-flag indicates a symlink/hardlink.  Then extract with the
+    # safest tar flags available on both GNU and BSD tar.
+    local listing=""
+    listing=$(_decode_skill_archive | tar -tzf - 2>/dev/null) || {
         rm -rf "$stage_dir" 2>/dev/null || true
-        _log_warn "Failed to extract embedded skill archive"
+        _log_warn "Failed to read embedded skill archive"
+        return 1
+    }
+    if printf '%s\n' "$listing" | grep -E '^/|(^|/)\.\.(/|$)' >/dev/null 2>&1; then
+        rm -rf "$stage_dir" 2>/dev/null || true
+        _log_warn "Skill archive contains unsafe path entries; refusing to extract"
+        return 1
+    fi
+
+    if ! _decode_skill_archive | tar -xzf - \
+            --no-same-owner \
+            --no-same-permissions \
+            -C "$stage_dir" >/dev/null 2>&1; then
+        # Retry without the GNU-only flags for BSD tar (macOS).
+        if ! _decode_skill_archive | tar -xzf - -C "$stage_dir" >/dev/null 2>&1; then
+            rm -rf "$stage_dir" 2>/dev/null || true
+            _log_warn "Failed to extract embedded skill archive"
+            return 1
+        fi
+    fi
+
+    # Belt-and-suspenders: walk the staged tree and reject any
+    # symlinks before we copy.  Catches whatever tar didn't filter.
+    if find "$stage_dir" -type l 2>/dev/null | grep -q .; then
+        rm -rf "$stage_dir" 2>/dev/null || true
+        _log_warn "Skill archive contains symbolic links; refusing to install"
         return 1
     fi
 

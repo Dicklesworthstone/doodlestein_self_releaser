@@ -103,12 +103,16 @@ test_template_cache_put_logic() {
     local template
     template=$(_install_gen_template 2>/dev/null)
 
-    # Verify cache put creates directories and copies file
+    # Verify cache put creates directories and writes the cache file
+    # atomically (cp to a tmp sibling then mv).  The previous
+    # `cp "$src_file" "$cache_file"` form left truncated files in
+    # the cache after a Ctrl-C; the test now requires the safer form.
     if grep -q 'mkdir -p "\$cache_dir"' <<< "$template" && \
-       grep -q 'cp "\$src_file" "\$cache_file"' <<< "$template"; then
-        pass "template has cache put logic"
+       grep -q 'cp "\$src_file" "\$tmp_file"' <<< "$template" && \
+       grep -q 'mv -f "\$tmp_file" "\$cache_file"' <<< "$template"; then
+        pass "template has cache put logic (atomic write)"
     else
-        fail "template missing cache put logic"
+        fail "template missing atomic cache put logic"
     fi
 
     teardown
