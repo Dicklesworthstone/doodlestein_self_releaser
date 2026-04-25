@@ -61,8 +61,13 @@ selector_get_limit() {
         return 0
     fi
 
+    # Use strenv() to bind $hostname into the yq path safely; spliced
+    # interpolation would let a hostname containing a yq metachar
+    # (`.`, `[`, `(`, …) silently match the wrong key or evaluate an
+    # unintended expression.  Same defense-in-depth class as the
+    # round-4 config.sh fix.
     local limit
-    limit=$(yq -r ".hosts.${hostname}.concurrency // $_SELECTOR_DEFAULT_MAX_PARALLEL" "$hosts_file" 2>/dev/null)
+    limit=$(DSR_HOST="$hostname" yq -r ".hosts[strenv(DSR_HOST)].concurrency // $_SELECTOR_DEFAULT_MAX_PARALLEL" "$hosts_file" 2>/dev/null)
     echo "${limit:-$_SELECTOR_DEFAULT_MAX_PARALLEL}"
 }
 
@@ -291,11 +296,13 @@ selector_get_candidates() {
     while IFS= read -r hostname; do
         [[ -z "$hostname" ]] && continue
 
-        # Get host info
+        # Get host info.  See selector_get_limit above — we bind
+        # $hostname through strenv() so a yq-metachar in the
+        # hostname (`.`, `[`, …) can't reshape the path expression.
         local platform="" connection=""
         if [[ -f "$hosts_file" ]] && command -v yq &>/dev/null; then
-            platform=$(yq -r ".hosts.${hostname}.platform // \"\"" "$hosts_file" 2>/dev/null)
-            connection=$(yq -r ".hosts.${hostname}.connection // \"ssh\"" "$hosts_file" 2>/dev/null)
+            platform=$(DSR_HOST="$hostname" yq -r '.hosts[strenv(DSR_HOST)].platform // ""' "$hosts_file" 2>/dev/null)
+            connection=$(DSR_HOST="$hostname" yq -r '.hosts[strenv(DSR_HOST)].connection // "ssh"' "$hosts_file" 2>/dev/null)
         fi
 
         # Filter by target platform if specified

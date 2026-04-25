@@ -54,8 +54,14 @@ qg_get_checks() {
         return 0
     fi
 
+    # Use strenv() to bind $tool_name into the yq path safely.
+    # $tool_name comes from `dsr quality --tool <name>` (CLI arg) so
+    # could in theory carry yq metachars (`.`, `[`, `(`, …); spliced
+    # interpolation would silently match the wrong key or evaluate
+    # an unintended expression.  Same defense-in-depth class as the
+    # round-4 config.sh fix.
     local checks
-    checks=$(yq -o=json ".tools.${tool_name}.checks // []" "$repos_file" 2>/dev/null) || checks='[]'
+    checks=$(DSR_TOOL="$tool_name" yq -o=json '.tools[strenv(DSR_TOOL)].checks // []' "$repos_file" 2>/dev/null) || checks='[]'
     echo "$checks"
 }
 

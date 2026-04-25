@@ -2269,15 +2269,21 @@ EOF
         local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
         local tool_config="$config_dir/repos.d/${tool}.yaml"
 
+        # NOTE: $tool and $os are interpolated via env vars + strenv()
+        # rather than spliced directly into the yq path expression.
+        # Same defense-in-depth class as the round-4 config.sh fix:
+        # if either ever contains a yq metachar (`.`, `[`, `(`, …)
+        # the directly-spliced form silently returns the wrong value
+        # or evaluates an unintended expression.
         if command -v yq &>/dev/null; then
             if [[ -f "$tool_config" ]]; then
-                format=$(yq -r ".archive_format.${os} // \"\"" "$tool_config" 2>/dev/null)
+                format=$(DSR_OS="$os" yq -r '.archive_format[strenv(DSR_OS)] // ""' "$tool_config" 2>/dev/null)
                 [[ "$format" == "null" ]] && format=""
                 if [[ -n "$format" ]]; then
                     echo "$format"
                     return 0
                 fi
-                format=$(yq -r ".archive_format // \"\"" "$tool_config" 2>/dev/null)
+                format=$(yq -r '.archive_format // ""' "$tool_config" 2>/dev/null)
                 if [[ "$format" != "null" && "$format" != "" && "$format" != "{"* ]]; then
                     echo "$format"
                     return 0
@@ -2285,13 +2291,13 @@ EOF
             fi
 
             if [[ -f "$DSR_REPOS_FILE" ]]; then
-                format=$(yq -r ".tools.${tool}.archive_format.${os} // \"\"" "$DSR_REPOS_FILE" 2>/dev/null)
+                format=$(DSR_TOOL="$tool" DSR_OS="$os" yq -r '.tools[strenv(DSR_TOOL)].archive_format[strenv(DSR_OS)] // ""' "$DSR_REPOS_FILE" 2>/dev/null)
                 [[ "$format" == "null" ]] && format=""
                 if [[ -n "$format" ]]; then
                     echo "$format"
                     return 0
                 fi
-                format=$(yq -r ".tools.${tool}.archive_format // \"\"" "$DSR_REPOS_FILE" 2>/dev/null)
+                format=$(DSR_TOOL="$tool" yq -r '.tools[strenv(DSR_TOOL)].archive_format // ""' "$DSR_REPOS_FILE" 2>/dev/null)
                 if [[ "$format" != "null" && "$format" != "" && "$format" != "{"* ]]; then
                     echo "$format"
                     return 0
@@ -2316,7 +2322,10 @@ EOF
                 return 0
             fi
             if [[ -f "$DSR_REPOS_FILE" ]]; then
-                yq -r ".tools.${tool}.include_files[]? // empty" "$DSR_REPOS_FILE" 2>/dev/null
+                # See _build_get_archive_format above — same strenv()
+                # rationale: $tool came from a CLI flag and may be
+                # unsanitised at the boundary.
+                DSR_TOOL="$tool" yq -r '.tools[strenv(DSR_TOOL)].include_files[]? // empty' "$DSR_REPOS_FILE" 2>/dev/null
                 return 0
             fi
         fi
