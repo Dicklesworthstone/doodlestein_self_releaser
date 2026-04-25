@@ -152,6 +152,31 @@ docker_setup_buildx() {
 # GHCR Authentication
 # ============================================================================
 
+# Resolve a GitHub token using the same cascade as github.sh /
+# secrets.sh: DSR_GH_TOKEN > GITHUB_TOKEN > GH_TOKEN > `gh auth token`.
+# Falls back to bare $GITHUB_TOKEN if secrets.sh isn't sourced. Emits
+# the token on stdout, returns 0 with a non-empty token, 1 otherwise.
+# Centralised so docker_check_ghcr_auth and docker_login_ghcr stay in
+# sync — previously each only inspected $GITHUB_TOKEN, so a user with
+# only DSR_GH_TOKEN set was rejected here even though `gh api` and
+# `dsr release` accepted it.
+_dk_resolve_gh_token() {
+    local token=""
+    if command -v secrets_get_gh_token &>/dev/null; then
+        token=$(secrets_get_gh_token 2>/dev/null || true)
+    fi
+    if [[ -z "$token" ]] && command -v gh &>/dev/null && gh auth status &>/dev/null; then
+        token=$(gh auth token 2>/dev/null || true)
+    fi
+    [[ -z "$token" ]] && token="${GITHUB_TOKEN:-}"
+    [[ -z "$token" ]] && token="${GH_TOKEN:-}"
+    if [[ -z "$token" ]]; then
+        return 1
+    fi
+    printf '%s' "$token"
+    return 0
+}
+
 # Check if authenticated to GHCR
 # Returns: 0 if authenticated, 3 if not
 docker_check_ghcr_auth() {
@@ -160,33 +185,22 @@ docker_check_ghcr_auth() {
         return 0
     fi
 
-    # Check if GITHUB_TOKEN is available
-    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        return 0
-    fi
-
-    # Check if gh can provide token
-    if command -v gh &>/dev/null && gh auth status &>/dev/null; then
+    # Resolve any token via the canonical cascade
+    if _dk_resolve_gh_token >/dev/null; then
         return 0
     fi
 
     _dk_log_error "GHCR authentication required"
-    _dk_log_info "Run: echo \$GITHUB_TOKEN | docker login ghcr.io -u \$USER --password-stdin"
+    _dk_log_info "Run: echo \$DSR_GH_TOKEN | docker login ghcr.io -u \$USER --password-stdin"
     _dk_log_info "Or: gh auth token | docker login ghcr.io -u \$USER --password-stdin"
     return 3
 }
 
 # Login to GHCR
 docker_login_ghcr() {
-    local token=""
-
-    # Try GITHUB_TOKEN first
-    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        token="$GITHUB_TOKEN"
-    elif command -v gh &>/dev/null && gh auth status &>/dev/null; then
-        token=$(gh auth token 2>/dev/null)
-    else
-        _dk_log_error "No GitHub token available"
+    local token
+    if ! token=$(_dk_resolve_gh_token); then
+        _dk_log_error "No GitHub token available (set DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN, or run \`gh auth login\`)"
         return 3
     fi
 
