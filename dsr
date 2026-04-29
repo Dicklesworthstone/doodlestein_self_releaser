@@ -648,29 +648,68 @@ EOF
         log_warn "timeout command not available; SSH checks will run without timeout"
     fi
 
-    for host in mmini wlap; do
-        if [[ -n "$timeout_cmd" ]]; then
-            if "$timeout_cmd" 5 ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null 2>&1; then
-                _add_check "ssh-$host" "ok" ""
-                log_ok "  $host: reachable"
-            else
-                _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\""
-                log_warn "  $host: unreachable"
-                fixes+=("Check SSH config for $host: ssh $host")
-                ((warnings++))
-            fi
-        else
-            if ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "echo ok" &>/dev/null 2>&1; then
-                _add_check "ssh-$host" "ok" ""
-                log_ok "  $host: reachable"
-            else
-                _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\""
-                log_warn "  $host: unreachable"
-                fixes+=("Check SSH config for $host: ssh $host")
-                ((warnings++))
-            fi
+    local enabled_hosts=""
+    enabled_hosts=$(config_list_hosts 2>/dev/null || true)
+    if [[ -z "$enabled_hosts" ]]; then
+        log_warn "  no enabled hosts configured"
+    fi
+
+    local host
+    while IFS= read -r host; do
+        [[ -n "$host" ]] || continue
+
+        local connection ssh_host ssh_timeout check_timeout
+        connection="ssh"
+        ssh_host="$host"
+        ssh_timeout="3"
+
+        if command -v yq &>/dev/null && [[ -f "${DSR_HOSTS_FILE:-}" ]]; then
+            connection=$(HOST="$host" yq -r '.hosts[env(HOST)].connection // "ssh"' "$DSR_HOSTS_FILE" 2>/dev/null || echo "ssh")
+            ssh_host=$(HOST="$host" yq -r '.hosts[env(HOST)].ssh_host // env(HOST)' "$DSR_HOSTS_FILE" 2>/dev/null || echo "$host")
+            ssh_timeout=$(HOST="$host" yq -r '.hosts[env(HOST)].ssh_timeout // 3' "$DSR_HOSTS_FILE" 2>/dev/null || echo "3")
         fi
-    done
+
+        [[ -n "$connection" && "$connection" != "null" ]] || connection="ssh"
+        [[ -n "$ssh_host" && "$ssh_host" != "null" ]] || ssh_host="$host"
+        [[ "$ssh_timeout" =~ ^[0-9]+$ ]] || ssh_timeout="3"
+        ((ssh_timeout > 0)) || ssh_timeout="3"
+        check_timeout=$((ssh_timeout + 2))
+
+        case "$connection" in
+            local)
+                _add_check "host-$host" "ok" ", \"connection\": \"local\""
+                log_ok "  $host: local"
+                ;;
+            ssh)
+                if [[ -n "$timeout_cmd" ]]; then
+                    if "$timeout_cmd" "$check_timeout" ssh -o ConnectTimeout="$ssh_timeout" -o BatchMode=yes "$ssh_host" "echo ok" &>/dev/null 2>&1; then
+                        _add_check "ssh-$host" "ok" ", \"ssh_host\": \"$(_json_escape "$ssh_host")\""
+                        log_ok "  $host: reachable ($ssh_host)"
+                    else
+                        _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\", \"ssh_host\": \"$(_json_escape "$ssh_host")\""
+                        log_warn "  $host: unreachable ($ssh_host)"
+                        fixes+=("Check SSH config for $host: ssh $ssh_host")
+                        ((warnings++))
+                    fi
+                else
+                    if ssh -o ConnectTimeout="$ssh_timeout" -o BatchMode=yes "$ssh_host" "echo ok" &>/dev/null 2>&1; then
+                        _add_check "ssh-$host" "ok" ", \"ssh_host\": \"$(_json_escape "$ssh_host")\""
+                        log_ok "  $host: reachable ($ssh_host)"
+                    else
+                        _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\", \"ssh_host\": \"$(_json_escape "$ssh_host")\""
+                        log_warn "  $host: unreachable ($ssh_host)"
+                        fixes+=("Check SSH config for $host: ssh $ssh_host")
+                        ((warnings++))
+                    fi
+                fi
+                ;;
+            *)
+                _add_check "host-$host" "warning" ", \"message\": \"unsupported connection\", \"connection\": \"$(_json_escape "$connection")\""
+                log_warn "  $host: unsupported connection '$connection'"
+                ((warnings++))
+                ;;
+        esac
+    done <<< "$enabled_hosts"
 
     # ========== SIGNING TOOLS ==========
     echo ""

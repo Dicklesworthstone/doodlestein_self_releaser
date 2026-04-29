@@ -211,6 +211,58 @@ test_doctor_quick_skips_build_tools() {
     fi
 }
 
+test_doctor_respects_enabled_hosts_config() {
+    ((TESTS_RUN++))
+
+    cat > "$DSR_CONFIG_DIR/hosts.yaml" <<'YAML'
+schema_version: "1.0.0"
+hosts:
+  trj:
+    platform: linux/amd64
+    connection: local
+  mmini:
+    platform: darwin/arm64
+    connection: ssh
+    ssh_host: reachable-mac
+    ssh_timeout: 1
+  wlap:
+    enabled: false
+    platform: windows/amd64
+    connection: ssh
+    ssh_host: unreachable-windows
+    ssh_timeout: 1
+platform_mapping:
+  linux/amd64: trj
+  darwin/arm64: mmini
+  windows/amd64: trj
+YAML
+
+    local bin_dir="$TEMP_DIR/bin"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${DSR_TEST_SSH_LOG:?}"
+case " $* " in
+  *" reachable-mac "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+SH
+    chmod +x "$bin_dir/ssh"
+
+    local output
+    output=$(DSR_TEST_SSH_LOG="$TEMP_DIR/ssh.calls" PATH="$bin_dir:$PATH" "$DSR_CMD" --json doctor 2>/dev/null)
+
+    if echo "$output" | jq -e '
+      (.details.checks[] | select(.name == "host-trj" and .status == "ok")) and
+      (.details.checks[] | select(.name == "ssh-mmini" and .status == "ok" and .ssh_host == "reachable-mac")) and
+      ([.details.checks[] | select(.name == "ssh-wlap")] | length == 0)
+    ' >/dev/null 2>&1; then
+        pass "doctor checks enabled configured hosts and skips disabled hosts"
+    else
+        fail "doctor should skip disabled hosts and use configured ssh_host"
+    fi
+}
+
 # ============================================================================
 # Tests: Exit Codes
 # ============================================================================
@@ -319,6 +371,7 @@ test_doctor_detects_jq
 echo ""
 echo "Quick Mode:"
 test_doctor_quick_skips_build_tools
+test_doctor_respects_enabled_hosts_config
 
 echo ""
 echo "Exit Codes:"
