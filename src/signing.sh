@@ -50,6 +50,7 @@ signing_require_minisign() {
 # Check if signing is properly configured
 # Usage: signing_check [--json]
 # Returns: 0 if valid keypair exists, 3 if not
+# shellcheck disable=SC2120  # CLI dispatcher passes optional --json from dsr.
 signing_check() {
     local json_mode=false
     [[ "${1:-}" == "--json" ]] && json_mode=true

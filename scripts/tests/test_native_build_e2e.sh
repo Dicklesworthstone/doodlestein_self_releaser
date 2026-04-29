@@ -536,6 +536,10 @@ YAML
 
     cat > "$bin_dir/act" << 'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+    echo "act version 0.2.87"
+    exit 0
+fi
 exit 0
 EOF
     chmod +x "$bin_dir/act"

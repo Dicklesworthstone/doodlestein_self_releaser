@@ -127,6 +127,28 @@ test_act_can_run() {
     fi
 }
 
+test_act_version_support() {
+    log_test "act version support"
+
+    if act_version_is_supported "0.2.86"; then
+        log_pass "minimum supported act version is accepted"
+    else
+        log_fail "minimum supported act version should be accepted"
+    fi
+
+    if act_version_is_supported "0.2.87"; then
+        log_pass "newer act version is accepted"
+    else
+        log_fail "newer act version should be accepted"
+    fi
+
+    if ! act_version_is_supported "0.2.84"; then
+        log_pass "vulnerable act version is rejected"
+    else
+        log_fail "vulnerable act version should be rejected"
+    fi
+}
+
 # Test act_get_runner function
 test_act_get_runner() {
     log_test "act_get_runner"
@@ -200,6 +222,10 @@ test_act_check_reads_config_dir_actrc() {
 
     cat > "$bin_dir/act" << 'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+    echo "act version 0.2.87"
+    exit 0
+fi
 exit 0
 EOF
     chmod +x "$bin_dir/act"
@@ -437,6 +463,7 @@ main() {
     trap cleanup_fixtures EXIT
 
     test_act_can_run
+    test_act_version_support
     test_act_get_runner
     test_act_check
     test_act_check_reads_config_dir_actrc

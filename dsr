@@ -565,10 +565,21 @@ EOF
 
     # Check act
     if command -v act &>/dev/null; then
-        local act_ver
+        _dsr_require act_runner
+        local act_ver act_version
         act_ver=$(act --version 2>/dev/null | head -1)
-        _add_check "act" "ok" ", \"version\": \"$(_json_escape "$act_ver")\""
-        log_ok "  act: $act_ver"
+        act_version="$(_act_installed_version)"
+        local act_min_json
+        act_min_json="$(_json_escape "$ACT_MIN_VERSION")"
+        if act_version_is_supported "$act_version"; then
+            _add_check "act" "ok" ", \"version\": \"$(_json_escape "$act_ver")\", \"minimum_version\": \"$act_min_json\""
+            log_ok "  act: $act_ver"
+        else
+            _add_check "act" "warning" ", \"version\": \"$(_json_escape "$act_ver")\", \"minimum_version\": \"$act_min_json\", \"message\": \"unsupported or vulnerable act version\""
+            log_warn "  act: $act_ver (upgrade required; minimum supported is v$ACT_MIN_VERSION)"
+            fixes+=("Install act v$ACT_MIN_VERSION or newer: https://github.com/nektos/act/releases")
+            ((warnings++))
+        fi
     else
         _add_check "act" "warning" ", \"message\": \"not found\""
         log_warn "  act: not found (needed for local builds)"

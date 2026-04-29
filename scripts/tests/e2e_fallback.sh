@@ -338,6 +338,10 @@ setup_fallback_mocks() {
     export MOCK_LOG_DIR="$_MOCK_BIN_DIR"
 
     mock_command_script "act" "$(cat <<'EOF'
+if [[ "${1:-}" == "--version" ]]; then
+  echo "act version 0.2.87"
+  exit 0
+fi
 echo "$@" >> "$MOCK_LOG_DIR/act.calls"
 artifact_dir=""
 prev=""

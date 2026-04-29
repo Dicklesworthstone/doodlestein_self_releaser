@@ -14,6 +14,7 @@ set -uo pipefail
 ACT_ARTIFACTS_DIR="${ACT_ARTIFACTS_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/artifacts}"
 ACT_LOGS_DIR="${ACT_LOGS_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/logs/$(date +%Y-%m-%d)/builds}"
 ACT_TIMEOUT="${ACT_TIMEOUT:-3600}"  # 1 hour default
+ACT_MIN_VERSION="${ACT_MIN_VERSION:-0.2.86}"
 
 # Colors for output (if not disabled)
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
@@ -123,10 +124,62 @@ _act_find_bind_without_user_config() {
     return 1
 }
 
+_act_installed_version() {
+    act --version 2>/dev/null | sed -n 's/^act version v\?\([0-9][0-9.]*\).*/\1/p' | head -1
+}
+
+_act_version_ge() {
+    local actual="${1#v}"
+    local minimum="${2#v}"
+    local actual_major actual_minor actual_patch minimum_major minimum_minor minimum_patch
+
+    actual="${actual%%[-+]*}"
+    minimum="${minimum%%[-+]*}"
+
+    IFS=. read -r actual_major actual_minor actual_patch _ <<< "$actual"
+    IFS=. read -r minimum_major minimum_minor minimum_patch _ <<< "$minimum"
+
+    actual_major="${actual_major:-0}"
+    actual_minor="${actual_minor:-0}"
+    actual_patch="${actual_patch:-0}"
+    minimum_major="${minimum_major:-0}"
+    minimum_minor="${minimum_minor:-0}"
+    minimum_patch="${minimum_patch:-0}"
+
+    [[ "$actual_major$actual_minor$actual_patch$minimum_major$minimum_minor$minimum_patch" =~ ^[0-9]+$ ]] || return 1
+
+    if ((10#$actual_major != 10#$minimum_major)); then
+        ((10#$actual_major > 10#$minimum_major))
+        return $?
+    fi
+    if ((10#$actual_minor != 10#$minimum_minor)); then
+        ((10#$actual_minor > 10#$minimum_minor))
+        return $?
+    fi
+    ((10#$actual_patch >= 10#$minimum_patch))
+}
+
+act_version_is_supported() {
+    local version="${1:-}"
+
+    if [[ -z "$version" ]]; then
+        version="$(_act_installed_version)"
+    fi
+
+    [[ -n "$version" ]] && _act_version_ge "$version" "$ACT_MIN_VERSION"
+}
+
 # Check if act and Docker are available.
 act_check_prereqs() {
     if ! command -v act &>/dev/null; then
         _log_error "act not found. Install: brew install act (macOS) or go install github.com/nektos/act@latest"
+        return 3
+    fi
+
+    local act_version
+    act_version="$(_act_installed_version)"
+    if ! act_version_is_supported "$act_version"; then
+        _log_error "act ${act_version:-unknown} is unsupported; install act v${ACT_MIN_VERSION}+ before running local release builds"
         return 3
     fi
 
@@ -2781,7 +2834,7 @@ act_generate_manifest() {
 }
 
 # Export functions for use by other scripts
-export -f act_check_prereqs act_check act_list_jobs act_get_runner act_can_run
+export -f act_check_prereqs act_check act_version_is_supported act_list_jobs act_get_runner act_can_run
 export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanup
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy

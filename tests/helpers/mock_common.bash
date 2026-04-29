@@ -217,6 +217,11 @@ mock_act() {
   local exit_code="${2:-0}"
 
   mock_command_script "act" "
+if [[ \"\${1:-}\" == \"--version\" ]]; then
+  echo 'act version 0.2.87'
+  exit 0
+fi
+
 # Log the call
 echo \"\$@\" >> \"$_MOCK_BIN_DIR/act.calls\"
 
