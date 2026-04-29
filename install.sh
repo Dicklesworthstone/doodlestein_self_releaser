@@ -938,8 +938,8 @@ configure_agents() {
         fi
         ;;
       gemini-cli)
-        GEMINI_STATUS="skipped"
-        info "Gemini CLI: skill installation not yet supported"
+        GEMINI_STATUS="manual"
+        info "Gemini CLI: detected; no automatic skill setup"
         ;;
     esac
   done
@@ -1039,7 +1039,7 @@ show_summary() {
   fi
   if [ -n "$GEMINI_STATUS" ]; then
     case "$GEMINI_STATUS" in
-      skipped) summary_lines+=("Gemini CLI:  Skill not yet supported") ;;
+      manual) summary_lines+=("Gemini CLI:  Detected; no automatic skill setup") ;;
     esac
   fi
 
