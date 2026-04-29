@@ -278,6 +278,43 @@ test_unix_env_export_syntax() {
     fi
 }
 
+test_unix_rust_unsets_ambient_cargo_path_env() {
+    log_test "Unix Rust: ambient Cargo path env is cleared unless configured"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_cmd)
+
+    if [[ "$cmd" == *"unset CARGO_TARGET_DIR; unset CARGO_BUILD_TARGET;"*"cargo build --release"* ]]; then
+        log_pass "Unsets ambient Cargo path env before Rust build"
+    else
+        log_fail "Expected Cargo path env unsets in: $cmd"
+    fi
+}
+
+test_unix_rust_keeps_configured_cargo_path_env() {
+    log_test "Unix Rust: configured Cargo path env is exported, not unset"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_cmd)
+
+    if [[ "$cmd" == *'export "CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"'* ]] && [[ "$cmd" != *"unset CARGO_TARGET_DIR"* ]]; then
+        log_pass "Configured CARGO_TARGET_DIR is preserved"
+    else
+        log_fail "Expected configured CARGO_TARGET_DIR export without unset in: $cmd"
+    fi
+}
+
 test_unix_chained_with_and() {
     log_test "Unix: commands chained with &&"
     reset_state
@@ -947,6 +984,8 @@ main() {
     # Unix command construction
     test_unix_cd_command
     test_unix_env_export_syntax
+    test_unix_rust_unsets_ambient_cargo_path_env
+    test_unix_rust_keeps_configured_cargo_path_env
     test_unix_chained_with_and
     test_unix_host_path_override
     test_unix_fallback_to_local_path

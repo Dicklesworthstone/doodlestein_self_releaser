@@ -1825,6 +1825,9 @@ act_run_native_build() {
     build_env=$(act_get_build_env "$tool_name" "$platform")
     binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
 
+    local language
+    language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+
     # Check for workspace_binaries (multi-binary Rust workspaces)
     local workspace_binaries
     workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null)
@@ -1856,6 +1859,18 @@ act_run_native_build() {
     local start_time
     start_time=$(date +%s)
 
+    # Release builds must be reproducible from the DSR repo config, not from
+    # whichever Cargo env vars happened to be exported in the operator shell.
+    local cargo_env_to_unset=()
+    if [[ "$language" == "rust" ]]; then
+        if ! act_get_build_env_value "$build_env" "CARGO_TARGET_DIR" >/dev/null 2>&1; then
+            cargo_env_to_unset+=("CARGO_TARGET_DIR")
+        fi
+        if ! act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" >/dev/null 2>&1; then
+            cargo_env_to_unset+=("CARGO_BUILD_TARGET")
+        fi
+    fi
+
     # Construct the remote command
     # Shell syntax depends on the build host OS, not only the target platform.
     local remote_cmd
@@ -1867,6 +1882,10 @@ act_run_native_build() {
         # Note: In cmd.exe, 'set VAR=value && ...' includes trailing space in value.
         # Using 'set "VAR=value"' protects the value from the space before &&.
         local env_exports=""
+        local env_name
+        for env_name in "${cargo_env_to_unset[@]}"; do
+            env_exports+="set \"$env_name=\" && "
+        done
         # build_env is newline-delimited to preserve values with spaces
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" ]] && continue
@@ -1878,6 +1897,10 @@ act_run_native_build() {
     else
         # Unix: use bash/zsh compatible syntax
         local env_exports=""
+        local env_name
+        for env_name in "${cargo_env_to_unset[@]}"; do
+            env_exports+="unset $env_name; "
+        done
         # build_env is newline-delimited to preserve values with spaces
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" ]] && continue
@@ -1932,10 +1955,6 @@ act_run_native_build() {
             jq -nc '{status: "error", exit_code: 4, error: "No binaries to download"}'
             return 4
         fi
-
-        # Remote artifact path depends on language
-        local language
-        language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
 
         local download_failed=false
         for bin in "${binaries_to_download[@]}"; do
