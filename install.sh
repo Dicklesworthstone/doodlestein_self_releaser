@@ -44,6 +44,7 @@ GITHUB_RAW="https://raw.githubusercontent.com/${OWNER}/${REPO}"
 
 DEST="${DSR_DEST:-$HOME/.local/bin}"
 VERSION=""
+VERSION_EXPLICIT=0
 QUIET=0
 NO_GUM=0
 NO_CONFIGURE=0
@@ -110,7 +111,7 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version)       VERSION="$2"; shift 2 ;;
+    --version)       VERSION="$2"; VERSION_EXPLICIT=1; shift 2 ;;
     --dest)          DEST="$2"; shift 2 ;;
     --system)        SYSTEM=1; DEST="/usr/local/bin"; shift ;;
     --easy-mode)     EASY=1; shift ;;
@@ -367,7 +368,7 @@ check_existing_install() {
   if command -v dsr >/dev/null 2>&1; then
     local current
     current=$(dsr --version 2>/dev/null | head -1 || echo "unknown")
-    if [ "$FORCE_INSTALL" -eq 0 ] && [[ "$current" == *"$VERSION"* ]] && [[ -n "$VERSION" ]]; then
+    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 1 ] && [[ "$current" == *"$VERSION"* ]] && [[ -n "$VERSION" ]]; then
       ok "dsr $VERSION is already installed"
       info "Use --force to reinstall"
       # Still run agent configuration (idempotent)
@@ -376,6 +377,9 @@ check_existing_install() {
       fi
       show_summary
       exit 0
+    fi
+    if [ "$FORCE_INSTALL" -eq 0 ] && [ "$VERSION_EXPLICIT" -eq 0 ] && [[ "$current" == *"$VERSION"* ]] && [[ -n "$VERSION" ]]; then
+      info "Existing dsr version matches; checking the main-branch source clone for updates"
     fi
     info "Existing dsr found: $current"
   fi
@@ -480,11 +484,17 @@ clone_or_update_repo() {
       ok "Updated dsr to latest"
       return 0
     fi
-    # Pull failed (dirty state, etc.) — re-clone
-    warn "git pull failed; performing fresh clone..."
+    # Pull failed (dirty state, etc.) — preserve the old clone, then re-clone.
+    warn "git pull failed; preserving existing clone and performing fresh clone..."
     local backup
     backup="${REPO_DIR}.bak.$(date +%Y%m%d%H%M%S)"
-    mv "$REPO_DIR" "$backup" 2>/dev/null || rm -rf "$REPO_DIR"
+    if mv "$REPO_DIR" "$backup" 2>/dev/null; then
+      warn "Existing clone moved to $backup"
+    else
+      err "Could not move existing clone to backup path: $backup"
+      err "Resolve the dirty install clone manually, then rerun with --force if needed."
+      exit 1
+    fi
   fi
 
   # Fresh clone
