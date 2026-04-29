@@ -228,6 +228,16 @@ draw_box() {
   printf "\033[%sm╚%s╝\033[0m\n" "$color" "$border"
 }
 
+status_path() {
+  local path="$1"
+  if [[ -n "${HOME:-}" && "$path" == "$HOME"/* ]]; then
+    # shellcheck disable=SC2088 # This is display text, not an executable shell path.
+    printf '~/%s\n' "${path#"$HOME"/}"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 # ============================================================
 # Header Banner
 # ============================================================
@@ -1007,8 +1017,9 @@ show_summary() {
     installed_version="${VERSION:-unknown}"
   fi
   summary_lines+=("Version:  $installed_version")
-  summary_lines+=("Binary:   $DEST/$BINARY_NAME")
-  summary_lines+=("Repo:     $REPO_DIR")
+  summary_lines+=("Managed paths:")
+  summary_lines+=("  Binary: $(status_path "$DEST/$BINARY_NAME")")
+  summary_lines+=("  Repo:   $(status_path "$REPO_DIR")")
   summary_lines+=("")
 
   # Agent status
@@ -1056,15 +1067,6 @@ show_summary() {
       "${summary_lines[@]}"
   fi
 
-  # Uninstall instructions
-  echo ""
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 245 --italic "To uninstall: bash install.sh --uninstall"
-    gum style --foreground 245 --italic "              or: rm $DEST/$BINARY_NAME"
-  else
-    echo -e "\033[0;90mTo uninstall: bash install.sh --uninstall\033[0m"
-    echo -e "\033[0;90m              or: rm $DEST/$BINARY_NAME\033[0m"
-  fi
 }
 
 # ============================================================
