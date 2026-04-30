@@ -155,6 +155,44 @@ EOF
     harness_teardown
 }
 
+test_verify_uses_configured_binary_name() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+
+    mkdir -p "$TEST_TMPDIR/bin" "$TEST_TMPDIR/beads-rust"
+    cat > "$TEST_TMPDIR/repos.d/beads_rust.yaml" << EOF
+tool_name: br
+binary_name: br
+local_path: $TEST_TMPDIR/beads-rust
+repo: test/beads_rust
+EOF
+    cat > "$TEST_TMPDIR/bin/br" << 'EOF'
+#!/bin/bash
+if [[ "$1" == "--help" ]]; then
+    echo "Commands: upgrade"
+    exit 0
+fi
+if [[ "$1" == "upgrade" && "$2" == "--check" ]]; then
+    echo "Current version: 0.1.45"
+    echo "Latest version: 0.2.5"
+    echo "Update available"
+    exit 0
+fi
+exit 1
+EOF
+    chmod +x "$TEST_TMPDIR/bin/br"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+
+    if upgrade_verify_tool beads_rust 2>/dev/null; then
+        pass "verify_tool uses configured binary_name when tool key differs"
+    else
+        fail "verify_tool should use configured binary_name for beads_rust -> br"
+    fi
+
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: Upgrade Check Parsing
 # ============================================================================
@@ -436,6 +474,7 @@ echo "Tool Verification Tests:"
 test_verify_missing_tool_fails
 test_verify_requires_tool_name
 test_verify_dry_run
+test_verify_uses_configured_binary_name
 
 echo ""
 echo "Upgrade Check Parsing Tests:"

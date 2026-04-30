@@ -54,11 +54,17 @@ upgrade_verify_tool() {
 
     log_info "Verifying upgrade command for $tool_name..."
 
+    local binary_name
+    binary_name=$(_upgrade_tool_binary_name "$tool_name")
+
     # Find the tool binary
     local bin_path=""
 
     # Check if installed in PATH
-    if command -v "$tool_name" &>/dev/null; then
+    if command -v "$binary_name" &>/dev/null; then
+        bin_path=$(command -v "$binary_name")
+        log_debug "Found $binary_name at: $bin_path"
+    elif [[ "$binary_name" != "$tool_name" ]] && command -v "$tool_name" &>/dev/null; then
         bin_path=$(command -v "$tool_name")
         log_debug "Found $tool_name at: $bin_path"
     fi
@@ -76,11 +82,11 @@ upgrade_verify_tool() {
             return 1
         fi
 
-        log_info "Building $tool_name from source..."
-        bin_path=$(_upgrade_build_tool "$tool_name" "$repo_dir")
+        log_info "Building $binary_name from source for $tool_name..."
+        bin_path=$(_upgrade_build_tool "$tool_name" "$repo_dir" "$binary_name")
 
         if [[ -z "$bin_path" || ! -x "$bin_path" ]]; then
-            log_error "Failed to build $tool_name"
+            log_error "Failed to build $binary_name for $tool_name"
             return 1
         fi
 
@@ -89,7 +95,7 @@ upgrade_verify_tool() {
     fi
 
     if [[ -z "$bin_path" ]]; then
-        log_error "$tool_name not found in PATH and --build-from-source not specified"
+        log_error "$binary_name not found in PATH and --build-from-source not specified"
         return 1
     fi
 
@@ -124,12 +130,12 @@ upgrade_verify_tool() {
     local latest_version=""
 
     # Check for common success patterns
-    if echo "$output" | grep -qi "up.to.date\|no update\|already.*latest\|current version"; then
-        found_asset=true
-        log_ok "$tool_name upgrade --check: Up to date"
-    elif echo "$output" | grep -qi "found.*asset\|download.*available\|update.*available"; then
+    if echo "$output" | grep -qi "found.*asset\|download.*available\|update.*available"; then
         found_asset=true
         log_ok "$tool_name upgrade --check: Found update"
+    elif echo "$output" | grep -qi "up.to.date\|no update\|already.*latest"; then
+        found_asset=true
+        log_ok "$tool_name upgrade --check: Up to date"
     elif echo "$output" | grep -qi "no suitable release asset\|asset not found\|failed to find"; then
         found_asset=false
         log_error "$tool_name upgrade --check: Asset naming mismatch"
@@ -211,8 +217,10 @@ upgrade_verify_all() {
 
         # Check if tool has upgrade capability
         local has_upgrade=false
-        if command -v "$tool_name" &>/dev/null; then
-            if "$tool_name" --help 2>&1 | grep -q "upgrade"; then
+        local binary_name
+        binary_name=$(_upgrade_tool_binary_name "$tool_name")
+        if command -v "$binary_name" &>/dev/null; then
+            if "$binary_name" --help 2>&1 | grep -q "upgrade"; then
                 has_upgrade=true
             fi
         fi
@@ -264,14 +272,21 @@ upgrade_verify_json() {
 
     if [[ -n "$tool_name" ]]; then
         # Single tool
+        local binary_name
+        binary_name=$(_upgrade_tool_binary_name "$tool_name")
+
         local bin_path
-        bin_path=$(command -v "$tool_name" 2>/dev/null || echo "")
+        bin_path=$(command -v "$binary_name" 2>/dev/null || echo "")
+        if [[ -z "$bin_path" && "$binary_name" != "$tool_name" ]]; then
+            bin_path=$(command -v "$tool_name" 2>/dev/null || echo "")
+        fi
 
         if [[ -z "$bin_path" ]]; then
             jq -nc \
                 --arg tool "$tool_name" \
+                --arg binary "$binary_name" \
                 --arg platform "$platform" \
-                '{tool: $tool, status: "error", error: "Tool not found in PATH", platform: $platform}'
+                '{tool: $tool, binary: $binary, status: "error", error: "Tool not found in PATH", platform: $platform}'
             return 1
         fi
 
@@ -345,6 +360,30 @@ upgrade_verify_json() {
 # Internal Helpers
 # ============================================================================
 
+# Resolve the executable/Cargo binary name for a DSR config key. Config files
+# are often keyed by repo name while the distributed executable is shorter
+# (for example, beads_rust -> br).
+_upgrade_tool_binary_name() {
+    local tool_name="$1"
+    local binary_name=""
+
+    if ! declare -F config_get_tool_field &>/dev/null; then
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        # shellcheck source=./config.sh
+        source "$script_dir/config.sh" 2>/dev/null || true
+    fi
+
+    if declare -F config_get_tool_field &>/dev/null; then
+        binary_name=$(config_get_tool_field "$tool_name" "binary_name" "" 2>/dev/null || echo "")
+        if [[ -z "$binary_name" ]]; then
+            binary_name=$(config_get_tool_field "$tool_name" "tool_name" "" 2>/dev/null || echo "")
+        fi
+    fi
+
+    echo "${binary_name:-$tool_name}"
+}
+
 # Find repository directory for a tool
 _upgrade_find_repo_dir() {
     local tool_name="$1"
@@ -382,18 +421,19 @@ _upgrade_find_repo_dir() {
 _upgrade_build_tool() {
     local tool_name="$1"
     local repo_dir="$2"
+    local binary_name="${3:-$tool_name}"
     local tmpdir
     tmpdir=$(mktemp -d)
 
-    local bin_path="$tmpdir/$tool_name"
+    local bin_path="$tmpdir/$binary_name"
 
     if [[ -f "$repo_dir/go.mod" ]]; then
         # Go project.  cd into the module so module-mode resolves
         # correctly regardless of the caller's PWD; the subshell
         # contains the cd so the rest of the script is unaffected.
         log_debug "Building Go project..."
-        if [[ -d "$repo_dir/cmd/$tool_name" ]]; then
-            ( cd "$repo_dir" && go build -o "$bin_path" "./cmd/$tool_name" ) 2>/dev/null
+        if [[ -d "$repo_dir/cmd/$binary_name" ]]; then
+            ( cd "$repo_dir" && go build -o "$bin_path" "./cmd/$binary_name" ) 2>/dev/null
         elif [[ -f "$repo_dir/main.go" ]]; then
             ( cd "$repo_dir" && go build -o "$bin_path" . ) 2>/dev/null
         fi
@@ -407,7 +447,7 @@ _upgrade_build_tool() {
         log_debug "Building Rust project..."
         if cargo build --release \
                 --manifest-path "$repo_dir/Cargo.toml" \
-                --bin "$tool_name" 2>/dev/null; then
+                --bin "$binary_name" 2>/dev/null; then
             local target_dir target_path
             if command -v jq &>/dev/null; then
                 target_dir=$(cargo metadata --no-deps --format-version=1 \
@@ -415,7 +455,7 @@ _upgrade_build_tool() {
                                 | jq -r '.target_directory // empty' 2>/dev/null)
             fi
             [[ -z "$target_dir" ]] && target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
-            target_path="$target_dir/release/$tool_name"
+            target_path="$target_dir/release/$binary_name"
             if [[ -f "$target_path" ]]; then
                 cp "$target_path" "$bin_path"
             fi
@@ -433,4 +473,4 @@ _upgrade_build_tool() {
 
 # Export functions
 export -f upgrade_verify_tool upgrade_verify_all upgrade_verify_json
-export -f _upgrade_find_repo_dir _upgrade_build_tool
+export -f _upgrade_tool_binary_name _upgrade_find_repo_dir _upgrade_build_tool
