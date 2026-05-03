@@ -3553,14 +3553,35 @@ EOF
         fi
     }
 
-    # === Generate SHA256SUMS for installer verification ===
+    # === Generate SHA256SUMS + per-asset .sha256 for installer verification ===
     # Creates a standard SHA256SUMS file with entries for every name an artifact
-    # will be uploaded as (primary, versioned, compat, and arch aliases).
-    # The find command below picks it up automatically for upload.
+    # will be uploaded as (primary, versioned, compat, and arch aliases) AND a
+    # per-asset `<name>.sha256` sidecar containing the same single line.
+    #
+    # Both shapes matter:
+    #   - SHA256SUMS              — `sha256sum --check`-style multi-line manifest
+    #   - <artifact>.sha256       — per-asset one-liner that curl-pipe-bash
+    #                               installers fetch as `${URL}.sha256`
+    #
+    # GH Actions `dist.yml`-style workflows emit both. dsr previously emitted
+    # only the combined file, which silently broke any installer fetching the
+    # per-asset URL when GH Actions was throttled and dsr took over.
+    #
+    # The find command below picks both shapes up automatically for upload.
     if $manifest_exists && [[ -f "$manifest_file" ]]; then
         local sha256sums_file="$artifacts_dir/SHA256SUMS"
-        log_info "Generating SHA256SUMS for installer verification..."
+        log_info "Generating SHA256SUMS + per-asset .sha256 sidecars for installer verification..."
         : > "$sha256sums_file"
+
+        # Emit one `<sha>  <name>` line into SHA256SUMS AND a single-line
+        # `<name>.sha256` sidecar with the same content. Keep the two shapes
+        # in lock-step so a future installer that prefers one over the other
+        # can never disagree with the other.
+        _emit_sha_entry() {
+            local sha="$1" name="$2"
+            printf '%s  %s\n' "$sha" "$name" >> "$sha256sums_file"
+            printf '%s  %s\n' "$sha" "$name" > "$artifacts_dir/${name}.sha256"
+        }
 
         # Cross-artifact dedup: each filename is emitted at most once. Hoisted
         # outside the per-artifact loop because previously the dedup table was
@@ -3575,7 +3596,7 @@ EOF
 
             # Primary name from manifest (skip if a prior row already wrote it).
             if [[ -z "${sha_seen[$a_name]:-}" ]]; then
-                echo "${a_sha256}  ${a_name}" >> "$sha256sums_file"
+                _emit_sha_entry "$a_sha256" "$a_name"
                 sha_seen["$a_name"]=1
             fi
 
@@ -3603,7 +3624,7 @@ EOF
                     local alias_name=""
                     for alias_name in "$versioned" "$compat"; do
                         [[ -z "$alias_name" || -n "${sha_seen[$alias_name]:-}" ]] && continue
-                        echo "${a_sha256}  ${alias_name}" >> "$sha256sums_file"
+                        _emit_sha_entry "$a_sha256" "$alias_name"
                         sha_seen["$alias_name"]=1
                     done
 
@@ -3623,7 +3644,7 @@ EOF
                                 ;;
                         esac
                         if [[ -n "$arch_alias" && "$arch_alias" != "$compat" && -z "${sha_seen[$arch_alias]:-}" ]]; then
-                            echo "${a_sha256}  ${arch_alias}" >> "$sha256sums_file"
+                            _emit_sha_entry "$a_sha256" "$arch_alias"
                             sha_seen["$arch_alias"]=1
                         fi
                     fi
@@ -3634,7 +3655,7 @@ EOF
         if [[ -s "$sha256sums_file" ]]; then
             local line_count
             line_count=$(wc -l < "$sha256sums_file")
-            log_ok "Generated SHA256SUMS with $line_count entries"
+            log_ok "Generated SHA256SUMS with $line_count entries (+ matching per-asset .sha256 sidecars)"
         else
             rm -f "$sha256sums_file"
             log_warn "No checksum data available; SHA256SUMS not generated"
@@ -3653,12 +3674,14 @@ EOF
             fi
         done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
 
-        # Include manifest and common sidecar files (checksums, signatures, SBOM, provenance)
+        # Include manifest and common sidecar files (checksums, per-asset .sha256
+        # one-liners that curl-pipe-bash installers fetch as `${URL}.sha256`,
+        # signatures, SBOM, provenance).
         _release_add_file "$manifest_file"
         while IFS= read -r extra_file; do
             _release_add_file "$extra_file"
         done < <(find "$artifacts_dir" -maxdepth 1 -type f \
-            \( -name 'SHA256SUMS*' -o -name '*.minisig' -o -name '*.sbom.*' -o -name '*.intoto.jsonl' \) \
+            \( -name 'SHA256SUMS*' -o -name '*.sha256' -o -name '*.minisig' -o -name '*.sbom.*' -o -name '*.intoto.jsonl' \) \
             2>/dev/null)
     else
         # Fallback: upload all files in artifacts directory
