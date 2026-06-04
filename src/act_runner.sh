@@ -125,7 +125,7 @@ _act_find_bind_without_user_config() {
 }
 
 _act_installed_version() {
-    act --version 2>/dev/null | sed -n 's/^act version v\?\([0-9][0-9.]*\).*/\1/p' | head -1
+    act --version 2>/dev/null | sed -nE 's/^act version v?([0-9][0-9.]*).*/\1/p' | head -1
 }
 
 _act_version_ge() {
