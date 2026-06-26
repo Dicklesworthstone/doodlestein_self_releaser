@@ -1484,6 +1484,23 @@ act_get_build_cmd() {
     yq -r '.build_cmd // ""' "$config_file" 2>/dev/null
 }
 
+# _act_token_is_safe <value> <kind>
+# Returns 0 if the build-token value is safe to splice into a shell command,
+# 1 otherwise. <kind> is "version" (allows the extra "+" of semver build
+# metadata) or anything else (name/os/arch). An empty value is injection-safe
+# and accepted. The allowlists permit only characters that real release tags,
+# tool names and Go/Rust os/arch values use — every shell metacharacter
+# ($ ( ) ` ; | & < > newline space ' " { } * ? [ ] ~ # ! = / \) is excluded.
+_act_token_is_safe() {
+    local value="$1"
+    local kind="$2"
+    [[ -z "$value" ]] && return 0
+    case "$kind" in
+        version) [[ "$value" =~ ^[A-Za-z0-9._+-]+$ ]] ;;
+        *)       [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] ;;
+    esac
+}
+
 # Pre-substitute DSR's documented build tokens into a build_cmd.
 # Usage: act_substitute_build_cmd_tokens <build_cmd> <name> <version> <os> <arch>
 #
@@ -1510,6 +1527,30 @@ act_substitute_build_cmd_tokens() {
     local version="$3"
     local os="$4"
     local arch="$5"
+
+    # Defense in depth: the substituted command is later executed by a shell
+    # (local bash and/or a remote login shell). version/name/os/arch are
+    # operator-controlled (release tags + repo config), but a value containing
+    # shell metacharacters ($(...), backticks, ; | & < > newline, quotes, ...)
+    # would be interpreted by that shell. Refuse such values and abort the build
+    # rather than silently injecting them.
+    if ! _act_token_is_safe "$version" version; then
+        _log_error "act_substitute_build_cmd_tokens: refusing unsafe version token '$version' (allowed: A-Za-z0-9 . _ + -)"
+        return 1
+    fi
+    if ! _act_token_is_safe "$name" name; then
+        _log_error "act_substitute_build_cmd_tokens: refusing unsafe name token '$name' (allowed: A-Za-z0-9 . _ -)"
+        return 1
+    fi
+    if ! _act_token_is_safe "$os" os; then
+        _log_error "act_substitute_build_cmd_tokens: refusing unsafe os token '$os' (allowed: A-Za-z0-9 . _ -)"
+        return 1
+    fi
+    if ! _act_token_is_safe "$arch" arch; then
+        _log_error "act_substitute_build_cmd_tokens: refusing unsafe arch token '$arch' (allowed: A-Za-z0-9 . _ -)"
+        return 1
+    fi
+
     local version_stripped="${version#v}"
 
     cmd="${cmd//\$\{name\}/$name}"
@@ -1947,7 +1988,12 @@ act_run_native_build() {
     # name falls back to the tool name when binary_name is unset.
     local _act_build_os="${platform%%/*}"
     local _act_build_arch="${platform##*/}"
-    build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool_name}" "$version" "$_act_build_os" "$_act_build_arch")
+    if ! build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool_name}" "$version" "$_act_build_os" "$_act_build_arch"); then
+        _log_error "Refusing to build $tool_name: build_cmd token substitution rejected an unsafe value (version=$version platform=$platform)"
+        jq -nc --arg tool "$tool_name" --arg version "$version" --arg platform "$platform" \
+            '{status: "error", exit_code: 4, error: ("unsafe build_cmd token value for " + $tool + " " + $version + " " + $platform)}'
+        return 4
+    fi
 
     # Determine remote path (check host_paths.<host> first, fallback to local_path)
     local remote_path
