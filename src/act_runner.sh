@@ -1484,6 +1484,55 @@ act_get_build_cmd() {
     yq -r '.build_cmd // ""' "$config_file" 2>/dev/null
 }
 
+# Pre-substitute DSR's documented build tokens into a build_cmd.
+# Usage: act_substitute_build_cmd_tokens <build_cmd> <name> <version> <os> <arch>
+#
+# DSR substitutes ${version}/${name}/${os}/${arch} (and their aliases) into
+# artifact_naming and install_script_compat, but historically NOT into
+# build_cmd — there it relied on the *remote build shell* to expand the tokens.
+# That works on POSIX build hosts (bash expands ${version} from an exported env
+# var) but FAILS on Windows native build hosts: cmd.exe does not POSIX-expand
+# ${version}, so the literal string "${version}" was baked into the ldflag. That
+# is exactly how beads_viewer v0.17.0 shipped `version.version=${version}`,
+# producing `bv v${version}` and a permanent false "update available" banner
+# (beads_viewer#174).
+#
+# Resolving the tokens here — before the command is embedded into any remote
+# shell — makes version injection correct on every host. Only DSR's documented,
+# brace-delimited tokens are replaced (matching artifact_naming's token set, and
+# stripping a leading "v" from the version exactly as artifact_naming does); any
+# other shell construct ($HOME, $PATH, unbraced $VAR, ...) is left untouched for
+# the shell, so the behavior of every existing repo whose build_cmd has no DSR
+# token is byte-for-byte unchanged.
+act_substitute_build_cmd_tokens() {
+    local cmd="$1"
+    local name="$2"
+    local version="$3"
+    local os="$4"
+    local arch="$5"
+    local version_stripped="${version#v}"
+
+    cmd="${cmd//\$\{name\}/$name}"
+    cmd="${cmd//\$\{NAME\}/$name}"
+    cmd="${cmd//\$\{tool\}/$name}"
+    cmd="${cmd//\$\{TOOL\}/$name}"
+
+    cmd="${cmd//\$\{version\}/$version_stripped}"
+    cmd="${cmd//\$\{VERSION\}/$version_stripped}"
+
+    cmd="${cmd//\$\{os\}/$os}"
+    cmd="${cmd//\$\{OS\}/$os}"
+    cmd="${cmd//\$\{goos\}/$os}"
+    cmd="${cmd//\$\{GOOS\}/$os}"
+
+    cmd="${cmd//\$\{arch\}/$arch}"
+    cmd="${cmd//\$\{ARCH\}/$arch}"
+    cmd="${cmd//\$\{goarch\}/$arch}"
+    cmd="${cmd//\$\{GOARCH\}/$arch}"
+
+    printf '%s' "$cmd"
+}
+
 # Get environment variables for a build target
 # Usage: act_get_build_env <tool_name> <platform>
 # Returns: Newline-separated KEY=VALUE pairs (preserves values with spaces)
@@ -1890,6 +1939,15 @@ act_run_native_build() {
         jq -nc '{status: "error", exit_code: 4, error: "Missing required config fields"}'
         return 4
     fi
+
+    # Resolve DSR build tokens (${version} etc.) in build_cmd now, before it is
+    # embedded into the (possibly Windows/cmd.exe) remote shell below — cmd.exe
+    # does not POSIX-expand ${version}, which is how a literal "${version}" once
+    # reached an ldflag (beads_viewer#174). os/arch come from the platform; the
+    # name falls back to the tool name when binary_name is unset.
+    local _act_build_os="${platform%%/*}"
+    local _act_build_arch="${platform##*/}"
+    build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool_name}" "$version" "$_act_build_os" "$_act_build_arch")
 
     # Determine remote path (check host_paths.<host> first, fallback to local_path)
     local remote_path
@@ -2839,7 +2897,7 @@ export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanu
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
 export -f act_list_tools act_build_matrix
-export -f act_get_build_cmd act_get_build_env act_get_repo act_get_local_path
+export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f act_get_build_env_value act_get_remote_artifact_path
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f act_sync_sources
