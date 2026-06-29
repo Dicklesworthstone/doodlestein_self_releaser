@@ -604,6 +604,67 @@ test_installer_help_shows_offline_option() {
 }
 
 # ============================================================================
+# Tests: Root dsr Installer
+# ============================================================================
+
+test_root_installer_uses_nested_repo_dir_default() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    local installer="$PROJECT_ROOT/install.sh"
+    local content
+    content=$(<"$installer")
+
+    if grep -qF 'DSR_DATA_DIR="${DSR_DATA_DIR:-$DATA_HOME/dsr}"' <<< "$content" && \
+       grep -qF 'REPO_DIR="${REPO_DIR:-${DSR_REPO_DIR:-$DSR_DATA_DIR/repo}}"' <<< "$content" && \
+       grep -qF -- '--repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr/repo)' <<< "$content"; then
+        pass "root installer keeps source checkout under data-dir/repo"
+    else
+        fail "root installer should not clone into the dsr data root"
+    fi
+
+    harness_teardown
+}
+
+test_root_installer_rejects_occupied_non_git_repo_dir() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    local installer="$PROJECT_ROOT/install.sh"
+    local content
+    content=$(<"$installer")
+
+    if grep -qF 'ensure_repo_dir_available' <<< "$content" && \
+       grep -qF 'Install source path exists but is not a git clone' <<< "$content" && \
+       grep -qF 'Use --repo-dir with an empty directory' <<< "$content"; then
+        pass "root installer reports occupied non-git repo dirs clearly"
+    else
+        fail "root installer should reject occupied non-git repo dirs before clone"
+    fi
+
+    harness_teardown
+}
+
+test_root_installer_uses_main_unless_version_explicit() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    local installer="$PROJECT_ROOT/install.sh"
+    local content
+    content=$(<"$installer")
+
+    if grep -qF 'if [ "$VERSION_EXPLICIT" -eq 1 ]' <<< "$content" && \
+       grep -qF 'CLONE_REFS+=("v${VERSION}" "$VERSION")' <<< "$content" && \
+       grep -qF 'CLONE_REFS+=("main")' <<< "$content"; then
+        pass "root installer clones main unless --version is explicit"
+    else
+        fail "root installer should only use version tags for explicit --version installs"
+    fi
+
+    harness_teardown
+}
+
+# ============================================================================
 # Tests: Platform Detection
 # ============================================================================
 
@@ -705,6 +766,12 @@ echo ""
 echo "Installer Help (real installer):"
 test_installer_help_shows_signature_options
 test_installer_help_shows_offline_option
+
+echo ""
+echo "Root dsr Installer:"
+test_root_installer_uses_nested_repo_dir_default
+test_root_installer_rejects_occupied_non_git_repo_dir
+test_root_installer_uses_main_unless_version_explicit
 
 echo ""
 echo "Platform Detection:"

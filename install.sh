@@ -22,7 +22,7 @@
 #   --no-configure     Skip AI agent skill installation
 #   --no-verify        Reserved for future checksum verification
 #   --offline TARBALL  Install from pre-downloaded repo tarball
-#   --repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr)
+#   --repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr/repo)
 #   --force            Reinstall even if same version exists
 #   --uninstall        Remove dsr and associated files
 #   -h, --help         Show this help
@@ -68,6 +68,7 @@ DETECTED_AGENTS=()
 LOCK_DIR=""
 LOCKED=0
 TMP=""
+CLONE_REFS=()
 
 # ============================================================
 # Usage
@@ -92,14 +93,15 @@ Options:
   --no-configure     Skip AI agent skill installation
   --no-verify        Reserved for future checksum verification
   --offline FILE     Install from pre-downloaded repo tarball
-  --repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr)
+  --repo-dir DIR     Clone repo to DIR (default: ~/.local/share/dsr/repo)
   --force            Reinstall even if same version exists
   --uninstall        Remove dsr and associated files
   -h, --help         Show this help
 
 Environment:
   DSR_DEST           Override install directory (default: ~/.local/bin)
-  DSR_REPO_DIR       Override repo clone directory (default: ~/.local/share/dsr)
+  DSR_DATA_DIR       Override data directory (default: ~/.local/share/dsr)
+  DSR_REPO_DIR       Override repo clone directory (default: $DSR_DATA_DIR/repo)
   HTTPS_PROXY        Proxy for HTTPS connections
   HTTP_PROXY         Proxy for HTTP connections
 EOF
@@ -175,7 +177,7 @@ err() {
 run_with_spinner() {
   local title="$1"
   shift
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ] && ! declare -F "$1" >/dev/null; then
     gum spin --spinner dot --title "$title" -- "$@"
   else
     info "$title"
@@ -470,7 +472,68 @@ acquire_lock() {
 # dsr is a modular bash project (dsr + src/*.sh modules).
 # It must be cloned as a full repo, then symlinked into PATH.
 
-REPO_DIR="${REPO_DIR:-${DSR_REPO_DIR:-$HOME/.local/share/dsr}}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+DSR_DATA_DIR="${DSR_DATA_DIR:-$DATA_HOME/dsr}"
+REPO_DIR="${REPO_DIR:-${DSR_REPO_DIR:-$DSR_DATA_DIR/repo}}"
+
+repo_dir_has_entries() {
+  local first_entry
+  first_entry=$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
+  [[ -n "$first_entry" ]]
+}
+
+ensure_repo_dir_available() {
+  if [ ! -e "$REPO_DIR" ] || [ -d "$REPO_DIR/.git" ]; then
+    return 0
+  fi
+
+  if [ ! -d "$REPO_DIR" ]; then
+    err "Install source path exists but is not a directory: $REPO_DIR"
+    err "Choose a different --repo-dir or set DSR_REPO_DIR to a dedicated source directory."
+    exit 1
+  fi
+
+  if repo_dir_has_entries "$REPO_DIR"; then
+    err "Install source path exists but is not a git clone: $REPO_DIR"
+    err "dsr stores runtime data under $(status_path "$DSR_DATA_DIR"); the source checkout must be a dedicated directory."
+    err "Use --repo-dir with an empty directory, or set DSR_REPO_DIR to a dedicated source directory."
+    exit 1
+  fi
+}
+
+build_clone_refs() {
+  CLONE_REFS=()
+
+  if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ -n "$VERSION" ]]; then
+    if [[ "$VERSION" == v* ]]; then
+      CLONE_REFS+=("$VERSION")
+      [[ "${VERSION#v}" != "$VERSION" ]] && CLONE_REFS+=("${VERSION#v}")
+    else
+      CLONE_REFS+=("v${VERSION}" "$VERSION")
+    fi
+  else
+    CLONE_REFS+=("main")
+  fi
+}
+
+clone_repo_ref() {
+  local clone_ref="$1"
+  local error_file="$2"
+
+  git clone --quiet --depth 1 --branch "$clone_ref" \
+    "https://github.com/${OWNER}/${REPO}.git" "$REPO_DIR" 2>"$error_file"
+}
+
+print_clone_error() {
+  local error_file="$1"
+
+  [ -s "$error_file" ] || return 0
+
+  err "Git clone details:"
+  while IFS= read -r line; do
+    [ -n "$line" ] && err "  $line"
+  done < <(sed -n '1,8p' "$error_file")
+}
 
 clone_or_update_repo() {
   if [[ -n "$OFFLINE_TARBALL" ]]; then
@@ -479,6 +542,7 @@ clone_or_update_repo() {
       err "Offline file not found: $OFFLINE_TARBALL"
       exit 1
     fi
+    ensure_repo_dir_available
     mkdir -p "$REPO_DIR"
     tar -xf "$OFFLINE_TARBALL" -C "$REPO_DIR" --strip-components=1 2>/dev/null \
       || tar -xzf "$OFFLINE_TARBALL" -C "$REPO_DIR" --strip-components=1 2>/dev/null \
@@ -490,7 +554,7 @@ clone_or_update_repo() {
   if [ -d "$REPO_DIR/.git" ]; then
     # Existing clone: pull latest
     info "Updating existing dsr installation..."
-    if (cd "$REPO_DIR" && git pull --ff-only 2>/dev/null); then
+    if git -C "$REPO_DIR" pull --ff-only 2>/dev/null; then
       ok "Updated dsr to latest"
       return 0
     fi
@@ -508,31 +572,36 @@ clone_or_update_repo() {
   fi
 
   # Fresh clone
+  ensure_repo_dir_available
   mkdir -p "$(dirname "$REPO_DIR")"
   info "Cloning dsr from ${OWNER}/${REPO}..."
 
-  local clone_ref="main"
-  if [[ -n "$VERSION" ]] && [[ "$VERSION" != "$INSTALLER_VERSION" ]]; then
-    clone_ref="v${VERSION}"
-  fi
+  build_clone_refs
 
-  if run_with_spinner "Cloning repository..." \
-    git clone --depth 1 --branch "$clone_ref" \
-      "https://github.com/${OWNER}/${REPO}.git" "$REPO_DIR" 2>/dev/null; then
-    ok "Cloned dsr ($clone_ref) to $REPO_DIR"
-    return 0
-  fi
+  local clone_ref
+  local clone_error
+  local last_clone_error=""
+  for clone_ref in "${CLONE_REFS[@]}"; do
+    clone_error="$TMP/git-clone-${clone_ref//[^A-Za-z0-9_.-]/_}.err"
+    last_clone_error="$clone_error"
 
-  # Fallback: clone main if tag didn't exist
-  if [[ "$clone_ref" != "main" ]]; then
-    if run_with_spinner "Cloning repository (main)..." \
-      git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$REPO_DIR" 2>/dev/null; then
-      ok "Cloned dsr (main) to $REPO_DIR"
+    if run_with_spinner "Cloning repository ($clone_ref)..." \
+      clone_repo_ref "$clone_ref" "$clone_error"; then
+      ok "Cloned dsr ($clone_ref) to $REPO_DIR"
       return 0
     fi
-  fi
 
-  err "Failed to clone dsr from GitHub"
+    if [ "$VERSION_EXPLICIT" -eq 0 ]; then
+      break
+    fi
+  done
+
+  if [ "$VERSION_EXPLICIT" -eq 1 ]; then
+    err "Failed to clone dsr at requested version: $VERSION"
+  else
+    err "Failed to clone dsr from GitHub"
+  fi
+  print_clone_error "$last_clone_error"
   exit 1
 }
 
@@ -620,7 +689,7 @@ do_uninstall() {
   done
 
   # Remove repo clone
-  local repo_dir="${DSR_REPO_DIR:-$HOME/.local/share/dsr}"
+  local repo_dir="${DSR_REPO_DIR:-$DSR_DATA_DIR/repo}"
   if [ -d "$repo_dir" ]; then
     rm -rf "$repo_dir"
     ok "Removed repo: $repo_dir"
@@ -645,6 +714,7 @@ do_uninstall() {
     info "  ~/.config/dsr/"
     info "  ~/.local/state/dsr/"
     info "  ~/.cache/dsr/"
+    info "  $(status_path "$DSR_DATA_DIR")/"
   fi
 
   exit 0
