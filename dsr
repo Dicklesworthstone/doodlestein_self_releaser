@@ -3254,9 +3254,19 @@ EOF
     local result exit_code=0
     result=$(qg_run_checks "${qg_args[@]}") || exit_code=$?
 
-    # Output
+    # Output — the rc contract distinguishes planned and config-error
+    # states from real failures (bead oxmp): a dry run is never a pass
+    # AND never a spurious failure; a missing/zero-check config is a
+    # configuration failure, fail-closed.
     if $JSON_MODE; then
-        json_envelope "quality" "$([ $exit_code -eq 0 ] && echo success || echo failure)" "$exit_code" "$result"
+        local status
+        case "$exit_code" in
+            0) status="success" ;;
+            2) status="planned" ;;
+            4) status="config-error" ;;
+            *) status="failure" ;;
+        esac
+        json_envelope "quality" "$status" "$exit_code" "$result"
     fi
 
     return $exit_code
