@@ -103,6 +103,15 @@ assert_false() {
   return 0
 }
 
+write_contract_tool_config() {
+  mkdir -p "$DSR_CONFIG_DIR/repos.d"
+  cat > "$DSR_CONFIG_DIR/repos.d/contract-tool.yaml"
+}
+
+release_contract_test_deps_available() {
+  command -v yq &>/dev/null && command -v jq &>/dev/null
+}
+
 run_test() {
   local test_name="$1"
   local test_func="$2"
@@ -464,6 +473,359 @@ test_get_host_returns_config() {
 }
 
 # ============================================================================
+# Tests: Release Contract
+# ============================================================================
+
+test_release_contract_absent_is_legacy_compatible() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets:
+  - linux/amd64
+YAML
+
+  [[ "$(config_get_release_contract_json contract-tool)" == "null" ]] &&
+    config_validate_release_contract contract-tool
+}
+
+test_release_contract_null_is_legacy_compatible() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets:
+  - linux/amd64
+release_contract: null
+YAML
+
+  [[ "$(config_get_release_contract_json contract-tool)" == "null" ]] &&
+    config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_non_object() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets:
+  - linux/amd64
+release_contract: sha256
+YAML
+
+  ! config_get_release_contract_json contract-tool >/dev/null &&
+    ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_valid_is_canonical_json() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets:
+  - linux/amd64
+  - darwin/arm64
+release_contract:
+  exact_primary_assets:
+    linux/amd64: contract-tool-x86_64-unknown-linux-gnu
+    darwin/arm64: contract-tool-aarch64-apple-darwin
+  checksum_sidecar: sha256
+YAML
+
+  local expected
+  expected='{"checksum_sidecar":"sha256","exact_primary_assets":{"darwin/arm64":"contract-tool-aarch64-apple-darwin","linux/amd64":"contract-tool-x86_64-unknown-linux-gnu"}}'
+  [[ "$(config_get_release_contract_json contract-tool)" == "$expected" ]] &&
+    config_validate_release_contract contract-tool
+}
+
+test_release_contract_registry_fallback() {
+  release_contract_test_deps_available || return 0
+  mkdir -p "$DSR_CONFIG_DIR"
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools:
+  contract-tool:
+    targets:
+      - linux/amd64
+    release_contract:
+      checksum_sidecar: sha256
+      exact_primary_assets:
+        linux/amd64: contract-tool-x86_64-unknown-linux-gnu
+YAML
+
+  [[ "$(config_get_release_contract_json contract-tool)" != "null" ]] &&
+    config_validate_release_contract contract-tool
+}
+
+test_release_contract_registry_false_is_rejected() {
+  mkdir -p "$DSR_CONFIG_DIR"
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools:
+  contract-tool:
+    targets: [linux/amd64]
+    release_contract: false
+YAML
+
+  ! config_get_release_contract_json contract-tool >/dev/null &&
+    ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_multiple_yaml_documents() {
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+---
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+
+  ! config_get_release_contract_json contract-tool >/dev/null &&
+    ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_non_mapping_yaml_roots() {
+  write_contract_tool_config << 'YAML'
+contract-tool
+YAML
+  ! config_get_release_contract_json contract-tool >/dev/null || return 1
+
+  write_contract_tool_config << 'YAML'
+- contract-tool
+- linux/amd64
+YAML
+  ! config_get_release_contract_json contract-tool >/dev/null
+}
+
+test_release_contract_rejects_duplicate_yaml_keys() {
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract: null
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+  ! config_get_release_contract_json contract-tool >/dev/null || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  checksum_sidecar: sha512
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+  ! config_get_release_contract_json contract-tool >/dev/null
+}
+
+test_config_validate_rejects_invalid_repo_release_contract() {
+  config_init
+  config_load
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract: false
+YAML
+
+  ! config_validate
+}
+
+test_config_validate_rejects_invalid_registry_release_contract() {
+  config_init
+  config_load
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools:
+  contract-tool:
+    targets: [linux/amd64]
+    release_contract: false
+YAML
+
+  ! config_validate
+}
+
+test_config_validate_rejects_non_mapping_registry_tools() {
+  config_init
+  config_load
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools: []
+YAML
+
+  ! config_validate
+}
+
+test_release_contract_rejects_non_mapping_registry_tool() {
+  mkdir -p "$DSR_CONFIG_DIR"
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools:
+  contract-tool: false
+YAML
+
+  ! config_get_release_contract_json contract-tool >/dev/null &&
+    ! config_validate_release_contract contract-tool
+}
+
+test_config_validate_rejects_shadowed_non_mapping_registry_tool() {
+  config_init
+  config_load
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools:
+  contract-tool: false
+YAML
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract: null
+YAML
+
+  ! config_validate
+}
+
+test_release_contract_rejects_non_sha256_sidecar() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha512
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_missing_target() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64, darwin/arm64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_extra_target() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+    windows/amd64: contract-tool-windows-amd64.exe
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_duplicate_primary_names() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64, darwin/arm64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+    darwin/arm64: contract-tool
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_empty_primary_name() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: ""
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_unsafe_primary_name() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: "contract-tool;touch"
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_primary_path() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: dir/contract-tool
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_dotdot_primary() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool..exe
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_checksum_as_primary() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool.sha256
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_unsupported_mode() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  mode: exact
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_duplicate_configured_target() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64, linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+# ============================================================================
 # Tests: Edge Cases
 # ============================================================================
 
@@ -520,6 +882,11 @@ EOF
 main() {
   echo "=== config.sh Tests ==="
   echo ""
+
+  if ! release_contract_test_deps_available; then
+    echo "ERROR: release-contract tests require both yq and jq"
+    return 1
+  fi
 
   echo "Initialization Tests:"
   run_test "init_creates_config_dir" test_init_creates_config_dir
@@ -581,6 +948,34 @@ main() {
   run_test "get_host_for_platform_windows" test_get_host_for_platform_windows
   run_test "list_hosts_returns_hosts" test_list_hosts_returns_hosts
   run_test "get_host_returns_config" test_get_host_returns_config
+
+  echo ""
+  echo "Release Contract Tests:"
+  run_test "release_contract_absent_is_legacy_compatible" test_release_contract_absent_is_legacy_compatible
+  run_test "release_contract_null_is_legacy_compatible" test_release_contract_null_is_legacy_compatible
+  run_test "release_contract_rejects_non_object" test_release_contract_rejects_non_object
+  run_test "release_contract_valid_is_canonical_json" test_release_contract_valid_is_canonical_json
+  run_test "release_contract_registry_fallback" test_release_contract_registry_fallback
+  run_test "release_contract_registry_false_is_rejected" test_release_contract_registry_false_is_rejected
+  run_test "release_contract_rejects_multiple_yaml_documents" test_release_contract_rejects_multiple_yaml_documents
+  run_test "release_contract_rejects_non_mapping_yaml_roots" test_release_contract_rejects_non_mapping_yaml_roots
+  run_test "release_contract_rejects_duplicate_yaml_keys" test_release_contract_rejects_duplicate_yaml_keys
+  run_test "config_validate_rejects_invalid_repo_release_contract" test_config_validate_rejects_invalid_repo_release_contract
+  run_test "config_validate_rejects_invalid_registry_release_contract" test_config_validate_rejects_invalid_registry_release_contract
+  run_test "config_validate_rejects_non_mapping_registry_tools" test_config_validate_rejects_non_mapping_registry_tools
+  run_test "release_contract_rejects_non_mapping_registry_tool" test_release_contract_rejects_non_mapping_registry_tool
+  run_test "config_validate_rejects_shadowed_non_mapping_registry_tool" test_config_validate_rejects_shadowed_non_mapping_registry_tool
+  run_test "release_contract_rejects_non_sha256_sidecar" test_release_contract_rejects_non_sha256_sidecar
+  run_test "release_contract_rejects_missing_target" test_release_contract_rejects_missing_target
+  run_test "release_contract_rejects_extra_target" test_release_contract_rejects_extra_target
+  run_test "release_contract_rejects_duplicate_primary_names" test_release_contract_rejects_duplicate_primary_names
+  run_test "release_contract_rejects_empty_primary_name" test_release_contract_rejects_empty_primary_name
+  run_test "release_contract_rejects_unsafe_primary_name" test_release_contract_rejects_unsafe_primary_name
+  run_test "release_contract_rejects_primary_path" test_release_contract_rejects_primary_path
+  run_test "release_contract_rejects_dotdot_primary" test_release_contract_rejects_dotdot_primary
+  run_test "release_contract_rejects_checksum_as_primary" test_release_contract_rejects_checksum_as_primary
+  run_test "release_contract_rejects_unsupported_mode" test_release_contract_rejects_unsupported_mode
+  run_test "release_contract_rejects_duplicate_configured_target" test_release_contract_rejects_duplicate_configured_target
 
   echo ""
   echo "Edge Case Tests:"

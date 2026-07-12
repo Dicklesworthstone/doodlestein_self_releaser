@@ -350,14 +350,56 @@ config_validate() {
         fi
     fi
 
-    # Check repos.yaml if exists
+    # Parse repos.yaml with the same single-document and duplicate-key rules
+    # used for release decisions, then retain it for registry contract checks.
+    local registry_json=""
     if [[ -f "$DSR_REPOS_FILE" ]]; then
-        if command -v yq &>/dev/null; then
-            if ! yq '.' "$DSR_REPOS_FILE" &>/dev/null; then
-                _cfg_log_error "Invalid YAML in repos.yaml"
+        if ! command -v yq &>/dev/null || ! command -v jq &>/dev/null; then
+            _cfg_log_error "yq and jq are required to validate repos.yaml"
+            ((errors++))
+        elif ! registry_json=$(_config_read_single_mapping_json "$DSR_REPOS_FILE"); then
+            _cfg_log_error "Invalid YAML in repos.yaml"
+            ((errors++))
+        elif ! printf '%s\n' "$registry_json" | jq -e '
+            ((.tools | type) == "object") and all(.tools[]; type == "object")
+        ' >/dev/null; then
+            _cfg_log_error "repos.yaml must contain a tools mapping of tool mappings"
+            registry_json=""
+            ((errors++))
+        fi
+    fi
+
+    # Validate every opt-in per-repository release contract through the same
+    # fail-closed parser used by build and release. A green `config validate`
+    # must not disagree with the command that will publish assets.
+    local repos_dir="$DSR_CONFIG_DIR/repos.d"
+    if [[ -d "$repos_dir" ]]; then
+        local had_nullglob=false
+        shopt -q nullglob && had_nullglob=true
+        shopt -s nullglob
+        local repo_configs=("$repos_dir"/*.yaml)
+        $had_nullglob || shopt -u nullglob
+
+        local repo_config toolname
+        for repo_config in "${repo_configs[@]}"; do
+            toolname=$(basename "$repo_config" .yaml)
+            if ! config_validate_release_contract "$toolname"; then
+                _cfg_log_error "Invalid repository configuration: $repo_config"
                 ((errors++))
             fi
-        fi
+        done
+    fi
+
+    # Registry-only tools have no repos.d file to drive the loop above.
+    if [[ -n "$registry_json" ]]; then
+        while IFS= read -r toolname; do
+            [[ -n "$toolname" ]] || continue
+            if ! config_validate_release_contract "$toolname"; then
+                _cfg_log_error "Invalid registry configuration for tool: $toolname"
+                ((errors++))
+            fi
+        done < <(printf '%s\n' "$registry_json" | jq -r \
+            'if (.tools | type) == "object" then .tools | keys[] else empty end')
     fi
 
     if [[ $errors -eq 0 ]]; then
@@ -508,6 +550,202 @@ config_get_tool_field() {
     fi
 
     echo "$default"
+}
+
+# Parse exactly one YAML mapping document and reject duplicate mapping keys at
+# every depth before jq can collapse them with last-key-wins semantics.
+_config_read_single_mapping_json() {
+    local config_file="$1"
+    local docs_json canonical
+
+    if [[ ! -f "$config_file" ]]; then
+        _cfg_log_error "Configuration file not found: $config_file"
+        return 4
+    fi
+
+    if ! yq -e \
+        '[.. | select(tag == "!!map") | ((keys | length) == (keys | unique | length))] | all' \
+        "$config_file" >/dev/null 2>&1; then
+        _cfg_log_error "Duplicate YAML mapping key in: $config_file"
+        return 4
+    fi
+
+    if ! docs_json=$(yq ea -o=json -I=0 '[.]' "$config_file" 2>/dev/null); then
+        _cfg_log_error "Invalid YAML in: $config_file"
+        return 4
+    fi
+    if ! canonical=$(printf '%s\n' "$docs_json" | jq -ce \
+        'if length == 1 and (.[0] | type == "object") then .[0]
+         else error("configuration must contain exactly one mapping document") end' \
+        2>/dev/null); then
+        _cfg_log_error "Configuration must contain exactly one YAML mapping document: $config_file"
+        return 4
+    fi
+
+    printf '%s\n' "$canonical"
+}
+
+# Canonicalize a parsed release contract. A present contract must be an object;
+# null is the opt-out used by legacy tool configurations.
+_config_canonicalize_release_contract_json() {
+    local raw_json="$1"
+
+    if [[ "$raw_json" == "null" ]]; then
+        printf 'null\n'
+        return 0
+    fi
+
+    local canonical
+    if ! canonical=$(printf '%s\n' "$raw_json" | jq -ceS \
+        'if type == "object" then . else error("release_contract must be an object or null") end' 2>/dev/null); then
+        _cfg_log_error "release_contract must be a YAML mapping or null"
+        return 4
+    fi
+
+    printf '%s\n' "$canonical"
+}
+
+# Get the opt-in release contract for a tool as compact, canonical JSON.
+# Per-tool repos.d configuration takes precedence over the registry file.
+# Usage: config_get_release_contract_json <toolname>
+# Returns: Canonical JSON object, or literal null when no contract is configured.
+config_get_release_contract_json() {
+    local toolname="${1:-}"
+
+    if [[ -z "$toolname" ]]; then
+        _cfg_log_error "Tool name required for release contract lookup"
+        return 4
+    fi
+    if ! command -v yq &>/dev/null || ! command -v jq &>/dev/null; then
+        _cfg_log_error "yq and jq are required for release contract parsing"
+        return 3
+    fi
+
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml"
+    local tool_json has_contract raw_json
+
+    if [[ -f "$tool_config" ]]; then
+        tool_json=$(_config_read_single_mapping_json "$tool_config") || return $?
+        has_contract=$(printf '%s\n' "$tool_json" | jq -r 'has("release_contract")') || return 4
+        if [[ "$has_contract" == "true" ]]; then
+            if ! raw_json=$(printf '%s\n' "$tool_json" | jq -c '.release_contract'); then
+                _cfg_log_error "Could not parse release_contract for $toolname"
+                return 4
+            fi
+            _config_canonicalize_release_contract_json "$raw_json"
+            return $?
+        fi
+    fi
+
+    if [[ -f "$DSR_REPOS_FILE" ]]; then
+        local registry_json
+        registry_json=$(_config_read_single_mapping_json "$DSR_REPOS_FILE") || return $?
+        if ! raw_json=$(printf '%s\n' "$registry_json" | jq -c --arg tool "$toolname" '
+            if (.tools | type) != "object" then
+                error("tools must be an object")
+            elif (.tools | has($tool)) and ((.tools[$tool] | type) != "object") then
+                error("tool entry must be an object")
+            elif (.tools | has($tool)) and (.tools[$tool] | has("release_contract")) then
+                .tools[$tool].release_contract
+            else
+                null
+            end' 2>/dev/null); then
+            _cfg_log_error "Could not parse release_contract for $toolname"
+            return 4
+        fi
+    else
+        raw_json="null"
+    fi
+
+    _config_canonicalize_release_contract_json "$raw_json"
+}
+
+# Internal: get configured targets using the same per-tool precedence as the
+# release contract lookup. The raw array shape is validated by the caller.
+_config_get_tool_targets_json() {
+    local toolname="$1"
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml"
+    local tool_json has_targets raw_json
+
+    if [[ -f "$tool_config" ]]; then
+        tool_json=$(_config_read_single_mapping_json "$tool_config") || return $?
+        has_targets=$(printf '%s\n' "$tool_json" | jq -r 'has("targets")') || return 4
+        if [[ "$has_targets" == "true" ]]; then
+            raw_json=$(printf '%s\n' "$tool_json" | jq -c '.targets') || return 4
+            printf '%s\n' "$raw_json" | jq -c . 2>/dev/null
+            return $?
+        fi
+    fi
+
+    if [[ -f "$DSR_REPOS_FILE" ]]; then
+        local registry_json
+        registry_json=$(_config_read_single_mapping_json "$DSR_REPOS_FILE") || return $?
+        raw_json=$(printf '%s\n' "$registry_json" | jq -c --arg tool "$toolname" '
+            if (.tools | type) != "object" then
+                error("tools must be an object")
+            elif (.tools | has($tool)) and ((.tools[$tool] | type) != "object") then
+                error("tool entry must be an object")
+            elif (.tools | has($tool)) and (.tools[$tool] | has("targets")) then
+                .tools[$tool].targets
+            else
+                null
+            end' 2>/dev/null) || return 4
+    else
+        raw_json="null"
+    fi
+    printf '%s\n' "$raw_json" | jq -c . 2>/dev/null
+}
+
+# Validate an opt-in exact release asset contract.
+# Usage: config_validate_release_contract <toolname>
+# Returns: 0 for a valid contract or no contract, 4 for an invalid contract.
+config_validate_release_contract() {
+    local toolname="${1:-}"
+    local contract_json targets_json
+
+    contract_json=$(config_get_release_contract_json "$toolname") || return $?
+    [[ "$contract_json" == "null" ]] && return 0
+
+    if ! targets_json=$(_config_get_tool_targets_json "$toolname"); then
+        _cfg_log_error "Could not parse configured targets for $toolname"
+        return 4
+    fi
+
+    if jq -en \
+        --argjson contract "$contract_json" \
+        --argjson targets "$targets_json" '
+        def safe_asset:
+            if type != "string" then false
+            else
+                length > 0 and
+                test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+                (contains("/") | not) and
+                (contains("..") | not) and
+                (ascii_downcase | endswith(".sha256") | not)
+            end;
+
+        if ($contract | type) != "object" then false
+        elif ($targets | type) != "array" then false
+        elif (($contract | keys | sort) != ["checksum_sidecar", "exact_primary_assets"]) then false
+        elif $contract.checksum_sidecar != "sha256" then false
+        elif ($contract.exact_primary_assets | type) != "object" then false
+        elif ($targets | length) == 0 then false
+        elif ([$targets[] | if type == "string" then length > 0 else false end] | all | not) then false
+        elif (($targets | unique | length) != ($targets | length)) then false
+        else
+            (($contract.exact_primary_assets | keys | sort) == ($targets | sort)) and
+            ([$contract.exact_primary_assets[] | safe_asset] | all) and
+            (($contract.exact_primary_assets | [.[]] | unique | length) ==
+             ($contract.exact_primary_assets | length))
+        end
+    ' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    _cfg_log_error "Invalid release_contract for $toolname"
+    return 4
 }
 
 # Get install_script_compat pattern for a tool
@@ -702,3 +940,4 @@ export -f config_get_host config_get_tool config_list_hosts config_list_tools
 export -f config_get_host_for_platform
 export -f config_get_tool_field config_get_install_script_compat config_get_install_script_path
 export -f config_get_artifact_naming config_get_target_triple config_get_arch_alias
+export -f config_get_release_contract_json config_validate_release_contract

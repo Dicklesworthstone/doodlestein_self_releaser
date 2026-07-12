@@ -61,6 +61,19 @@ checks:
 # Variables: ${name}, ${version}, ${os}, ${arch}, ${target}, ${target_triple}, ${ext}
 artifact_naming: "${name}-${version}-${os}-${arch}"
 
+# Optional: fail-closed release asset contract. When enabled, every configured
+# target must map to one unique primary release asset basename, and each primary
+# must have a sibling `<basename>.sha256` checksum asset.
+# release_contract:
+#   checksum_sidecar: sha256
+#   exact_primary_assets:
+#     linux/amd64: example-tool-x86_64-unknown-linux-gnu
+#     linux/arm64: example-tool-aarch64-unknown-linux-gnu
+#     darwin/arm64: example-tool-aarch64-apple-darwin
+#     darwin/amd64: example-tool-x86_64-apple-darwin
+#     windows/amd64: example-tool-x86_64-pc-windows-msvc.exe
+#     windows/arm64: example-tool-aarch64-pc-windows-msvc.exe
+
 # Install.sh compatibility (optional)
 # When install.sh expects a different naming pattern than artifact_naming,
 # use one of these fields to ensure dsr uploads artifacts with BOTH names.
