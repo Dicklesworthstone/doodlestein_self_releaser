@@ -325,11 +325,79 @@ test_build_dry_run_json_valid() {
     local output
     output=$(exec_stdout)
 
-    if echo "$output" | jq . >/dev/null 2>&1; then
-        pass "build --dry-run --json produces valid JSON"
+    if echo "$output" | jq -e '
+        .command == "build" and
+        .status == "success" and
+        .exit_code == 0 and
+        .details.mode == "dry_run" and
+        (.details.targets | type == "array" and length > 0) and
+        (.details.targets | all(
+            (.platform | type == "string") and
+            (.host | type == "string") and
+            (.method == "act" or .method == "native") and
+            .status == "skipped"
+        ))
+    ' >/dev/null 2>&1; then
+        pass "build --dry-run --json produces a schema-shaped success envelope"
     else
-        fail "build --dry-run --json should produce valid JSON"
+        fail "build --dry-run --json should produce a schema-shaped success envelope"
         echo "output: $output"
+    fi
+
+    cleanup_build_fixtures
+    harness_teardown
+}
+
+test_build_dry_run_has_no_build_side_effects() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for dry-run side-effect test"
+        return 0
+    fi
+
+    harness_setup
+    seed_build_fixtures
+
+    local output_dir="$TEST_TMPDIR/dry-run-artifacts"
+    local sentinel_dir="$TEST_TMPDIR/dry-run-command-sentinels"
+    local command_name
+    mkdir -p "$sentinel_dir"
+
+    for command_name in rsync ssh scp act docker cargo; do
+        mock_command_script "$command_name" "
+printf '%s\\n' \"\$*\" >> \"$sentinel_dir/$command_name.calls\"
+exit 97
+"
+    done
+
+    exec_run "$DSR_CMD" build test-build-tool \
+        --dry-run \
+        --version 0.1.0 \
+        --output-dir "$output_dir" \
+        --allow-dirty
+    local status
+    status=$(exec_status)
+
+    local invoked=()
+    for command_name in rsync ssh scp act docker cargo; do
+        [[ -e "$sentinel_dir/$command_name.calls" ]] && invoked+=("$command_name")
+    done
+
+    if [[ "$status" -eq 0 ]] &&
+       [[ ! -e "$output_dir" ]] &&
+       [[ ! -e "$DSR_STATE_DIR/artifacts" ]] &&
+       [[ ! -e "$DSR_STATE_DIR/logs" ]] &&
+       [[ ${#invoked[@]} -eq 0 ]]; then
+        pass "build --dry-run invokes no build commands and creates no state paths"
+    else
+        fail "build --dry-run must be side-effect-free"
+        echo "exit: $status"
+        echo "invoked commands: ${invoked[*]:-(none)}"
+        echo "output exists: $([[ -e "$output_dir" ]] && echo yes || echo no)"
+        echo "state artifacts exist: $([[ -e "$DSR_STATE_DIR/artifacts" ]] && echo yes || echo no)"
+        echo "state logs exist: $([[ -e "$DSR_STATE_DIR/logs" ]] && echo yes || echo no)"
+        echo "stderr: $(exec_stderr | head -10)"
     fi
 
     cleanup_build_fixtures
@@ -360,6 +428,31 @@ test_build_specific_target_dry_run() {
         pass "build --target linux/amd64 completes"
     else
         fail "build --target linux/amd64 unexpected exit (exit: $status)"
+        echo "stderr: $(exec_stderr | head -10)"
+    fi
+
+    cleanup_build_fixtures
+    harness_teardown
+}
+
+test_build_rejects_unconfigured_target() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for target validation test"
+        return 0
+    fi
+
+    harness_setup
+    seed_build_fixtures
+
+    exec_run "$DSR_CMD" --dry-run build test-build-tool --target darwin/arm64
+
+    if [[ "$(exec_status)" -eq 4 ]] && exec_stderr_contains "not configured"; then
+        pass "build rejects targets outside the configured matrix"
+    else
+        fail "build should reject an unconfigured target"
+        echo "exit: $(exec_status)"
         echo "stderr: $(exec_stderr | head -10)"
     fi
 
@@ -491,10 +584,12 @@ echo "Dry-Run Mode:"
 test_build_dry_run
 test_build_dry_run_shows_plan
 test_build_dry_run_json_valid
+test_build_dry_run_has_no_build_side_effects
 
 echo ""
 echo "Specific Target:"
 test_build_specific_target_dry_run
+test_build_rejects_unconfigured_target
 
 echo ""
 echo "Real Build (when deps available):"

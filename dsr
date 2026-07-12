@@ -1580,6 +1580,7 @@ cmd_build() {
     local targets=()
     local version=""
     local output_dir=""
+    local dry_run="$DRY_RUN"
     # shellcheck disable=SC2034  # parallel reserved for future parallel build support
     local parallel=false
     # shellcheck disable=SC2034  # resume reserved for future resume support
@@ -1645,6 +1646,10 @@ cmd_build() {
                 only_native=true
                 shift
                 ;;
+            --dry-run|-n)
+                dry_run=true
+                shift
+                ;;
             --help|-h)
                 cat << 'EOF'
 dsr build - Build artifacts locally
@@ -1667,6 +1672,7 @@ OPTIONS:
     --sync-only            Sync source to remote hosts without building
     --only-act             Only build targets that use act (Linux, no SSH)
     --only-native          Only build targets that require native SSH builds
+    -n, --dry-run          Show the validated build plan without executing it
 
 DESCRIPTION:
     Builds a tool for all configured targets using act (Linux) and
@@ -1731,6 +1737,11 @@ EOF
         return 4
     fi
 
+    if $no_sync && $sync_only; then
+        log_error "--no-sync and --sync-only are mutually exclusive"
+        return 4
+    fi
+
     # Load tool config
     if ! act_load_repo_config "$tool_name"; then
         log_error "Tool '$tool_name' not found in repos.d"
@@ -1780,13 +1791,6 @@ EOF
     # Set output directory default (tool-version)
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     [[ -z "$output_dir" ]] && output_dir="$state_dir/artifacts/${tool_name}-${tag}"
-    if ! mkdir -p "$output_dir"; then
-        log_error "Failed to create output directory: $output_dir"
-        return 1
-    fi
-
-    log_info "Building $tool_name $version"
-    log_set_tool "$tool_name"
 
     # Get targets from args or config
     local target_list
@@ -1800,6 +1804,18 @@ EOF
         log_error "No targets configured for $tool_name"
         return 4
     fi
+
+    local configured_target_list target
+    configured_target_list=$(act_get_targets "$tool_name")
+    for target in $target_list; do
+        case " $configured_target_list " in
+            *" $target "*) ;;
+            *)
+                log_error "Target '$target' is not configured for $tool_name"
+                return 4
+                ;;
+        esac
+    done
 
     # Apply matrix filtering (--only-act / --only-native)
     if $only_act || $only_native; then
@@ -1829,6 +1845,63 @@ EOF
         fi
     fi
 
+    if $dry_run; then
+        local planned_targets='[]'
+        local planned_host planned_method
+        for target in $target_list; do
+            if act_platform_uses_act "$tool_name" "$target"; then
+                planned_host="local"
+                planned_method="act"
+            else
+                planned_host=$(act_get_native_host "$target" "$tool_name" 2>/dev/null || true)
+                if [[ -z "$planned_host" ]]; then
+                    log_error "No native build host is configured for target '$target'"
+                    return 4
+                fi
+                planned_method="native"
+            fi
+            planned_targets=$(jq -nc \
+                --argjson targets "$planned_targets" \
+                --arg platform "$target" \
+                --arg host "$planned_host" \
+                --arg method "$planned_method" \
+                '$targets + [{platform: $platform, host: $host, method: $method, status: "skipped"}]')
+        done
+
+        log_info "[dry-run] Would execute build:"
+        log_info "  Tool:       $tool_name"
+        log_info "  Version:    $tag"
+        log_info "  Targets:    $target_list"
+        log_info "  Output:     $output_dir"
+        if $sync_only; then
+            log_info "  Source sync: planned (sync only; no build)"
+        elif $no_sync; then
+            log_info "  Source sync: skipped"
+        else
+            log_info "  Source sync: planned"
+        fi
+
+        if $JSON_MODE; then
+            json_envelope "build" "success" 0 "$(jq -nc \
+                --arg repo "$ACT_REPO_GITHUB" \
+                --arg tool "$tool_name" \
+                --arg version "$tag" \
+                --argjson targets "$planned_targets" \
+                --arg output_dir "$output_dir" \
+                --argjson no_sync "$no_sync" \
+                --argjson sync_only "$sync_only" \
+                '{repo: $repo, tool: $tool, version: $version, targets: $targets, output_dir: $output_dir, no_sync: $no_sync, sync_only: $sync_only, mode: "dry_run"}')"
+        fi
+        return 0
+    fi
+
+    if ! mkdir -p "$output_dir"; then
+        log_error "Failed to create output directory: $output_dir"
+        return 1
+    fi
+
+    log_info "Building $tool_name $version"
+    log_set_tool "$tool_name"
     log_info "Targets: $target_list"
 
     # Check if act is required for selected targets
@@ -1854,12 +1927,6 @@ EOF
         fi
     else
         log_info "No act targets selected; skipping act dependency check"
-    fi
-
-    # Check for mutually exclusive sync flags
-    if $no_sync && $sync_only; then
-        log_error "--no-sync and --sync-only are mutually exclusive"
-        return 4
     fi
 
     # Sync source to remote hosts (unless --no-sync)
@@ -8157,9 +8224,9 @@ main() {
         esac
     done
 
-    # Initialize logging with appropriate level
+    # Resolve the command before initializing file logging. A dry-run must not
+    # create, rotate, compress, or delete log files merely to print a plan.
     log_set_level_from_flags "$VERBOSE" "$QUIET"
-    log_init
 
     # Get command
     local command="${1:-}"
@@ -8172,6 +8239,20 @@ main() {
 
     # Set command context for logging
     log_set_command "$command"
+
+    local dry_run_requested="$DRY_RUN"
+    local command_arg
+    for command_arg in "$@"; do
+        case "$command_arg" in
+            --dry-run|-n)
+                dry_run_requested=true
+                break
+                ;;
+        esac
+    done
+    if ! $dry_run_requested; then
+        log_init
+    fi
 
     # Load modules needed for command execution
     # Simple commands (config, doctor, help) need fewer modules
