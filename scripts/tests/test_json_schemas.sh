@@ -45,12 +45,42 @@ fi
 validate_with_ajv() {
     local fixture="$1"
     local schema="$2"
+    local ajv_entry ajv_root module_path
 
-    if ajv validate -s "$schema" -d "$fixture" --strict=false 2>/dev/null; then
-        return 0
-    else
-        return 1
+    ajv_entry=$(command -v ajv) || return 1
+    if command -v realpath >/dev/null 2>&1; then
+        ajv_entry=$(realpath "$ajv_entry") || return 1
     fi
+    ajv_root=$(cd "$(dirname "$ajv_entry")/.." && pwd -P) || return 1
+    module_path="$ajv_root/node_modules:$(dirname "$ajv_root")"
+
+    NODE_DISABLE_COMPILE_CACHE=1 \
+    NODE_PATH="$module_path${NODE_PATH:+:$NODE_PATH}" \
+        node - "$schema" "$fixture" <<'NODE'
+const fs = require("fs");
+const Ajv2020 = require("ajv/dist/2020").default;
+
+const schema = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const data = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+const formats = {
+    uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    "date-time": /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/,
+    uri: value => {
+        try {
+            return Boolean(new URL(value).protocol);
+        } catch (_) {
+            return false;
+        }
+    },
+};
+const ajv = new Ajv2020({ allErrors: true, strict: false, formats });
+const validate = ajv.compile(schema);
+
+if (!validate(data)) {
+    console.error(ajv.errorsText(validate.errors, { separator: "\n" }));
+    process.exit(1);
+}
+NODE
 }
 
 validate_with_jq() {
@@ -110,7 +140,7 @@ validate_manifest_with_jq() {
     local errors=()
 
     # Required manifest fields
-    local required_fields=("schema_version" "tool" "version" "run_id" "git_sha" "built_at" "artifacts")
+    local required_fields=("schema_version" "tool" "version" "run_id" "source" "built_at" "status" "summary" "artifacts")
     for field in "${required_fields[@]}"; do
         if ! jq -e ".$field" "$fixture" &>/dev/null; then
             errors+=("Missing required field: $field")
@@ -124,10 +154,44 @@ validate_manifest_with_jq() {
         errors+=("schema_version must be 1.0.0 (got: $schema_version)")
     fi
 
+    if ! jq -e '
+        (.source | type == "object") and
+        (.source.git_sha | type == "string" and test("^(?!0{40}$)[0-9a-f]{40}$")) and
+        (.source.git_ref | type == "string" and length > 0) and
+        (.source.dependencies | type == "array") and
+        all(.source.dependencies[];
+            (keys | sort) == ["git_sha", "relative_path"] and
+            (.relative_path | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not)) and
+            (.git_sha | type == "string" and test("^(?!0{40}$)[0-9a-f]{40}$"))
+        )
+    ' "$fixture" &>/dev/null; then
+        errors+=("source must contain exact git identity and canonical pinned dependencies")
+    fi
+
+    if ! jq -e '.status | type == "string" and test("^(success|partial|failed)$")' "$fixture" &>/dev/null; then
+        errors+=("status must be success, partial, or failed")
+    fi
+
+    if ! jq -e '
+        (.summary | type == "object") and
+        ([.summary.total, .summary.success, .summary.failed] | all(type == "number" and floor == . and . >= 0)) and
+        .summary.total == (.summary.success + .summary.failed)
+    ' "$fixture" &>/dev/null; then
+        errors+=("summary must contain coherent non-negative integer counts")
+    fi
+
     # Validate artifacts structure
     if jq -e '.artifacts | length > 0' "$fixture" &>/dev/null; then
-        if ! jq -e '.artifacts[0].name and .artifacts[0].target and .artifacts[0].sha256 and .artifacts[0].size_bytes' "$fixture" &>/dev/null; then
-            errors+=("Artifacts missing required fields (name, target, sha256, size_bytes)")
+        if ! jq -e '
+            all(.artifacts[];
+                (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$") and (contains("..") | not) and (ascii_downcase | endswith(".sha256") | not)) and
+                (.target | type == "string" and test("^(linux|darwin|windows)/(amd64|arm64|386)$")) and
+                (.sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
+                (.size_bytes | type == "number" and floor == . and . > 0) and
+                (.archive_format | IN("tar.gz", "tar.xz", "zip", "binary", "none"))
+            )
+        ' "$fixture" &>/dev/null; then
+            errors+=("Artifacts violate required basename, target, checksum, size, or archive-format rules")
         fi
     else
         errors+=("artifacts must be a non-empty array")
@@ -140,6 +204,26 @@ validate_manifest_with_jq() {
         return 1
     fi
     return 0
+}
+
+test_manifest_schema_release_contract_fields() {
+    echo ""
+    log_info "Testing manifest release-contract schema fields..."
+
+    if jq -e '
+        (.required | index("source")) and
+        (.required | index("status")) and
+        (.required | index("summary")) and
+        (."$defs".source.required | index("dependencies")) and
+        (."$defs".source_dependency.required | index("relative_path")) and
+        (."$defs".source_dependency.required | index("git_sha")) and
+        (."$defs".artifact.required | index("archive_format")) and
+        (."$defs".artifact.properties.archive_format.enum | index("binary"))
+    ' "$SCHEMAS_DIR/manifest.json" &>/dev/null; then
+        log_pass "Manifest schema requires source pins/status/summary and supports strict binary assets"
+    else
+        log_fail "Manifest schema is missing strict release-contract requirements"
+    fi
 }
 
 validate_fixture() {
@@ -374,6 +458,7 @@ main() {
     test_timestamp_format
     test_uuid_format
     test_sha256_format
+    test_manifest_schema_release_contract_fields
 
     # Summary
     echo ""

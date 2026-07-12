@@ -123,6 +123,48 @@ test_validate_ok_with_matching_goreleaser() {
   return 1
 }
 
+test_validate_windows_arm64_target_triple() {
+  if ! require_command yq "yq" "Install yq: brew install yq" 2>/dev/null; then
+    return 2
+  fi
+  if ! require_command jq "jq" "Install jq: brew install jq" 2>/dev/null; then
+    return 2
+  fi
+
+  local tool_name="testtool"
+  local repo_dir
+  repo_dir="$(harness_tmpdir)/repo"
+
+  write_goreleaser_config "$repo_dir" "{{ .ProjectName }}_{{ .Version }}_aarch64-pc-windows-msvc" "zip" "windows" "arm64"
+
+  mkdir -p "$DSR_CONFIG_DIR"
+  cat > "$DSR_CONFIG_DIR/repos.yaml" <<EOF_REPOS
+tools:
+  $tool_name:
+    repo: example/$tool_name
+    local_path: $repo_dir
+    language: go
+    binary_name: testtool
+    targets:
+      - windows/arm64
+    artifact_naming: "\${name}_\${version}_\${target_triple}"
+    archive_format:
+      windows: zip
+EOF_REPOS
+
+  run_validate "$tool_name"
+
+  local status
+  status=$(json_status)
+  if [[ "$status" == "ok" ]]; then
+    return 0
+  fi
+
+  echo "Unexpected status: $status" >&2
+  echo "Message: $(json_message)" >&2
+  return 1
+}
+
 test_validate_target_mismatch_warns() {
   if ! require_command yq "yq" "Install yq: brew install yq" 2>/dev/null; then
     return 2
@@ -277,6 +319,7 @@ run_test() {
 
 main() {
   run_test "validate_ok_with_matching_goreleaser" test_validate_ok_with_matching_goreleaser
+  run_test "validate_windows_arm64_target_triple" test_validate_windows_arm64_target_triple
   run_test "validate_target_mismatch_warns" test_validate_target_mismatch_warns
   run_test "validate_archive_format_mismatch_warns" test_validate_archive_format_mismatch_warns
   run_test "validate_name_template_mismatch_warns" test_validate_name_template_mismatch_warns

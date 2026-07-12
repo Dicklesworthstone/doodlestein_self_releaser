@@ -102,8 +102,8 @@ _version_from_cargo_toml() {
     # Look for version = "X.Y.Z" in [package] section
     # This handles most common Cargo.toml formats
     local version
-    version=$(grep -m1 '^version\s*=\s*"' "$cargo_file" 2>/dev/null | \
-              sed 's/.*version\s*=\s*"\([^"]*\)".*/\1/')
+    version=$(grep -E -m1 '^[[:space:]]*version[[:space:]]*=[[:space:]]*"' "$cargo_file" 2>/dev/null | \
+              sed -E 's/.*version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
 
     if [[ -n "$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         echo "$version"
@@ -133,8 +133,8 @@ _version_from_go() {
     for go_version_file in "$repo_path/version.go" "$repo_path/internal/version/version.go" \
                            "$repo_path/pkg/version/version.go" "$repo_path/cmd/version.go"; do
         if [[ -f "$go_version_file" ]]; then
-            version=$(grep -E '^\s*(const\s+)?Version\s*=\s*"' "$go_version_file" 2>/dev/null | \
-                     sed 's/.*=\s*"\([^"]*\)".*/\1/')
+            version=$(grep -E '^[[:space:]]*(const[[:space:]]+)?Version[[:space:]]*=[[:space:]]*"' "$go_version_file" 2>/dev/null | \
+                     sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
             if [[ -n "$version" && "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
                 echo "${version#v}"
                 return 0
@@ -144,8 +144,8 @@ _version_from_go() {
 
     # 3. Check main.go for version const/var
     if [[ -f "$repo_path/main.go" ]]; then
-        version=$(grep -E '^\s*(const|var)\s+[Vv]ersion\s*=\s*"' "$repo_path/main.go" 2>/dev/null | \
-                 head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/')
+        version=$(grep -E '^[[:space:]]*(const|var)[[:space:]]+[Vv]ersion[[:space:]]*=[[:space:]]*"' "$repo_path/main.go" 2>/dev/null | \
+                 head -1 | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
         if [[ -n "$version" && "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             echo "${version#v}"
             return 0
@@ -172,7 +172,7 @@ _version_from_package_json() {
     else
         # Fallback: grep + sed (less reliable for edge cases)
         version=$(grep -m1 '"version"' "$pkg_file" 2>/dev/null | \
-                 sed 's/.*"version"\s*:\s*"\([^"]*\)".*/\1/')
+                 sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
     fi
 
     if [[ -n "$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
@@ -194,8 +194,8 @@ _version_from_pyproject() {
 
     local version
     # Simple grep for version line (handles most cases)
-    version=$(grep -m1 '^version\s*=\s*"' "$pyproject_file" 2>/dev/null | \
-             sed 's/.*version\s*=\s*"\([^"]*\)".*/\1/')
+    version=$(grep -E -m1 '^[[:space:]]*version[[:space:]]*=[[:space:]]*"' "$pyproject_file" 2>/dev/null | \
+             sed -E 's/.*version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
 
     if [[ -n "$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         echo "$version"

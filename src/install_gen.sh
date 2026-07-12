@@ -310,6 +310,7 @@ __TARGET_TRIPLE_CASES__
         darwin/amd64) echo "x86_64-apple-darwin" ;;
         darwin/arm64) echo "aarch64-apple-darwin" ;;
         windows/amd64) echo "x86_64-pc-windows-msvc" ;;
+        windows/arm64) echo "aarch64-pc-windows-msvc" ;;
         *) echo "${os}-${arch}" ;;
     esac
 }

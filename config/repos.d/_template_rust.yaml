@@ -24,6 +24,7 @@ targets:
   - darwin/arm64
   - darwin/amd64
   - windows/amd64
+  - windows/arm64
 
 # GitHub Actions workflow
 workflow: .github/workflows/release.yml
@@ -35,6 +36,7 @@ act_job_map:
   darwin/arm64: null              # native on mmini
   darwin/amd64: null              # native on mmini (Rosetta)
   windows/amd64: null             # native on wlap (or cross-compile)
+  windows/arm64: null             # native on wlap (or cross-compile)
 
 # Optional: matrix filters for act when a job uses a build matrix
 act_matrix:

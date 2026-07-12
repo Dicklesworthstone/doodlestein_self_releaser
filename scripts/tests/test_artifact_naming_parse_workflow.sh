@@ -46,7 +46,7 @@ TEST_COUNT=0
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
-START_TIME=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+START_TIME=$(($(date +%s) * 1000))
 
 # Results storage for JSON output
 declare -a PHASE_RESULTS=()
@@ -210,7 +210,7 @@ PHASE_START_TIME=0
 
 start_phase() {
     CURRENT_PHASE="$1"
-    PHASE_START_TIME=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+    PHASE_START_TIME=$(($(date +%s) * 1000))
     if [[ $JSON_OUTPUT -eq 0 ]]; then
         echo "" >&2
         echo "[$(log_timestamp)] === Phase: $CURRENT_PHASE ===" >&2
@@ -221,7 +221,7 @@ end_phase() {
     local status="$1"
     local tests_in_phase="${2:-0}"
     local end_time
-    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+    end_time=$(($(date +%s) * 1000))
     local duration=$((end_time - PHASE_START_TIME))
 
     PHASE_RESULTS+=("{\"name\":\"$CURRENT_PHASE\",\"status\":\"$status\",\"tests\":$tests_in_phase,\"duration_ms\":$duration}")
@@ -405,7 +405,7 @@ test_nonexistent_workflow() {
 test_empty_workflow() {
     log_test "Empty workflow file"
     local tmpfile
-    tmpfile=$(mktemp --suffix=.yml)
+    tmpfile=$(mktemp "${TMPDIR:-/tmp}/dsr-workflow.XXXXXX")
     : > "$tmpfile"  # Create empty file
 
     log_info "Input: $tmpfile (empty)"
@@ -422,7 +422,7 @@ test_empty_workflow() {
 test_invalid_yaml() {
     log_test "Invalid YAML file"
     local tmpfile
-    tmpfile=$(mktemp --suffix=.yml)
+    tmpfile=$(mktemp "${TMPDIR:-/tmp}/dsr-workflow.XXXXXX")
     echo "this: is: not: valid: yaml:" > "$tmpfile"
 
     log_info "Input: $tmpfile (invalid YAML)"
@@ -441,17 +441,9 @@ test_yq_not_available() {
     log_test "Graceful handling when yq is not available"
     log_info "Simulating missing yq"
 
-    # Save original PATH
-    local original_path="$PATH"
-    # Temporarily remove yq from PATH
-    export PATH="/nonexistent"
-
     local result
-    result=$(artifact_naming_parse_workflow "$FIXTURE_DIR/sample_workflow.yml")
+    result=$(PATH="/nonexistent" artifact_naming_parse_workflow "$FIXTURE_DIR/sample_workflow.yml")
     log_debug "Result: $result"
-
-    # Restore PATH
-    export PATH="$original_path"
 
     # Should return empty array when yq is not available
     assert_eq "[]" "$result" "Missing yq returns empty array"
@@ -517,7 +509,7 @@ test_deduplicated_results() {
 
 print_summary() {
     local end_time
-    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+    end_time=$(($(date +%s) * 1000))
     local total_duration=$((end_time - START_TIME))
 
     if [[ $JSON_OUTPUT -eq 1 ]]; then

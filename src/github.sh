@@ -258,11 +258,11 @@ gh_api() {
 
     while [[ $retries -lt $GH_MAX_RETRIES ]]; do
         if gh_check 2>/dev/null; then
-            response=$(_gh_api_with_gh "$endpoint" "$method" "$data")
+            response=$(_gh_api_with_gh "$endpoint" "$method" "$data" "$no_cache")
             exit_code=$?
         else
             gh_check_token || return 3
-            response=$(_gh_api_with_curl "$endpoint" "$method" "$data")
+            response=$(_gh_api_with_curl "$endpoint" "$method" "$data" "$no_cache")
             exit_code=$?
         fi
 
@@ -307,8 +307,15 @@ _gh_api_with_gh() {
     local endpoint="$1"
     local method="$2"
     local data="$3"
+    local no_cache="${4:-false}"
 
     local gh_args=(api "$endpoint" -X "$method")
+    if $no_cache; then
+        gh_args+=(
+            -H "Cache-Control: no-cache, no-store, max-age=0"
+            -H "Pragma: no-cache"
+        )
+    fi
 
     if [[ -n "$data" ]]; then
         gh_args+=(--input -)
@@ -323,6 +330,7 @@ _gh_api_with_curl() {
     local endpoint="$1"
     local method="$2"
     local data="$3"
+    local no_cache="${4:-false}"
 
     local url="https://api.github.com/$endpoint"
     # Resolve via the shared cascade so DSR_GH_TOKEN and `gh auth token`
@@ -344,12 +352,20 @@ _gh_api_with_curl() {
         -H "Authorization: Bearer $gh_token"
         -H "X-GitHub-Api-Version: 2022-11-28"
     )
+    if $no_cache; then
+        curl_args+=(
+            -H "Cache-Control: no-cache, no-store, max-age=0"
+            -H "Pragma: no-cache"
+        )
+    fi
 
     # Add ETag if available
-    local etag
-    etag=$(_gh_get_etag "$endpoint")
-    if [[ -n "$etag" ]]; then
-        curl_args+=(-H "If-None-Match: $etag")
+    local etag=""
+    if ! $no_cache; then
+        etag=$(_gh_get_etag "$endpoint")
+        if [[ -n "$etag" ]]; then
+            curl_args+=(-H "If-None-Match: $etag")
+        fi
     fi
 
     if [[ -n "$data" ]]; then
@@ -524,6 +540,7 @@ gh_create_release() {
     local body=""
     local draft=false
     local prerelease=false
+    local target_commitish=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -542,6 +559,10 @@ gh_create_release() {
             --prerelease)
                 prerelease=true
                 shift
+                ;;
+            --target-commitish)
+                target_commitish="$2"
+                shift 2
                 ;;
             *)
                 if [[ -z "$repo" ]]; then
@@ -568,7 +589,9 @@ gh_create_release() {
         --arg body "$body" \
         --argjson draft "$draft" \
         --argjson prerelease "$prerelease" \
-        '{tag_name: $tag, name: $name, body: $body, draft: $draft, prerelease: $prerelease}')
+        --arg target_commitish "$target_commitish" \
+        '{tag_name: $tag, name: $name, body: $body, draft: $draft, prerelease: $prerelease}
+         + if $target_commitish == "" then {} else {target_commitish: $target_commitish} end')
 
     gh_api "repos/$repo/releases" --post "$data"
 }
@@ -594,15 +617,16 @@ gh_upload_asset() {
     filename=$(basename "$file_path")
 
     # Validate filename contains only safe characters for URL
-    # Release assets should only have alphanumeric, dash, underscore, dot
-    if [[ ! "$filename" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    # Release assets should only have alphanumeric, dash, underscore, dot, plus
+    if [[ ! "$filename" =~ ^[a-zA-Z0-9._+-]+$ ]]; then
         _gh_log_error "Invalid filename for upload: $filename (contains unsafe characters)"
         return 4
     fi
 
     # Remove template part from upload_url
     upload_url="${upload_url%\{*}"
-    upload_url+="?name=$filename"
+    local encoded_filename="${filename//+/%2B}"
+    upload_url+="?name=$encoded_filename"
 
     local token=""
     if command -v secrets_get_gh_token &>/dev/null; then
@@ -664,14 +688,15 @@ gh_upload_asset_named() {
     fi
 
     # Validate filename contains only safe characters for URL
-    if [[ ! "$upload_name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    if [[ ! "$upload_name" =~ ^[a-zA-Z0-9._+-]+$ ]]; then
         _gh_log_error "Invalid upload name: $upload_name (contains unsafe characters)"
         return 4
     fi
 
     # Remove template part from upload_url
     upload_url="${upload_url%\{*}"
-    upload_url+="?name=$upload_name"
+    local encoded_upload_name="${upload_name//+/%2B}"
+    upload_url+="?name=$encoded_upload_name"
 
     local token=""
     if command -v secrets_get_gh_token &>/dev/null; then
@@ -886,34 +911,41 @@ gh_resolve_tag_sha() {
     obj_sha=$(echo "$ref_json" | jq -r '.object.sha // empty' 2>/dev/null)
     obj_type=$(echo "$ref_json" | jq -r '.object.type // empty' 2>/dev/null)
 
-    if [[ -z "$obj_sha" ]]; then
+    if [[ ! "$obj_sha" =~ ^[0-9a-f]{40}$ ]]; then
         _gh_log_error "Tag not found: $tag"
         return 4
     fi
 
-    if [[ "$obj_type" == "commit" ]]; then
-        echo "$obj_sha"
-        return 0
-    fi
+    local depth=0
+    while [[ $depth -lt 8 ]]; do
+        case "$obj_type" in
+            commit)
+                printf '%s\n' "$obj_sha"
+                return 0
+                ;;
+            tag)
+                local tag_json
+                tag_json=$(gh_api "repos/$repo/git/tags/$obj_sha" --no-cache 2>/dev/null) || {
+                    _gh_log_error "Failed to dereference annotated tag: $tag"
+                    return 4
+                }
+                obj_sha=$(echo "$tag_json" | jq -r '.object.sha // empty' 2>/dev/null)
+                obj_type=$(echo "$tag_json" | jq -r '.object.type // empty' 2>/dev/null)
+                if [[ ! "$obj_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                    _gh_log_error "Annotated tag $tag does not reference a 40-hex object"
+                    return 4
+                fi
+                ;;
+            *)
+                _gh_log_error "Tag $tag resolved to unsupported object type: $obj_type"
+                return 4
+                ;;
+        esac
+        depth=$((depth + 1))
+    done
 
-    if [[ "$obj_type" == "tag" ]]; then
-        local tag_json
-        tag_json=$(gh_api "repos/$repo/git/tags/$obj_sha" --no-cache 2>/dev/null) || {
-            _gh_log_error "Failed to dereference annotated tag: $tag"
-            return 4
-        }
-
-        local commit_sha
-        commit_sha=$(echo "$tag_json" | jq -r '.object.sha // empty' 2>/dev/null)
-        if [[ -n "$commit_sha" ]]; then
-            echo "$commit_sha"
-            return 0
-        fi
-    fi
-
-    _gh_log_warn "Unknown tag type for $tag (type=$obj_type)"
-    echo "$obj_sha"
-    return 0
+    _gh_log_error "Annotated tag chain is too deep for $tag"
+    return 4
 }
 
 # Trigger repository dispatch event

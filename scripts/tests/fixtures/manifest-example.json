@@ -1,12 +1,30 @@
 {
   "schema_version": "1.0.0",
-  "tool": "ntm",
-  "version": "v1.2.3",
+  "tool": "focr",
+  "version": "v0.7.2",
   "run_id": "550e8400-e29b-41d4-a716-446655440000",
-  "git_sha": "abc123def456789012345678901234567890abcd",
-  "git_ref": "v1.2.3",
+  "source": {
+    "git_sha": "abc123def456789012345678901234567890abcd",
+    "git_ref": "v0.7.2",
+    "dependencies": [
+      {
+        "relative_path": "asupersync",
+        "git_sha": "1111111111111111111111111111111111111111"
+      },
+      {
+        "relative_path": "frankentorch",
+        "git_sha": "2222222222222222222222222222222222222222"
+      }
+    ]
+  },
   "built_at": "2026-01-30T15:00:00Z",
   "duration_ms": 180000,
+  "status": "success",
+  "summary": {
+    "total": 3,
+    "success": 3,
+    "failed": 0
+  },
   "builder": {
     "tool": "dsr",
     "version": "0.1.0",
@@ -14,31 +32,31 @@
   },
   "artifacts": [
     {
-      "name": "ntm-v1.2.3-linux-amd64.tar.gz",
+      "name": "focr-x86_64-unknown-linux-gnu",
       "target": "linux/amd64",
       "sha256": "2d03090ebc334efc07bedaeb18e083b58b133076fe40e4f4da59c9f47f35fd1e",
       "size_bytes": 5242880,
-      "archive_format": "tar.gz",
-      "signed": true,
-      "signature_file": "ntm-v1.2.3-linux-amd64.tar.gz.minisig"
+      "archive_format": "binary",
+      "signed": false,
+      "signature_file": ""
     },
     {
-      "name": "ntm-v1.2.3-darwin-arm64.tar.gz",
+      "name": "focr-aarch64-apple-darwin-neon-sdot-i8mm",
       "target": "darwin/arm64",
       "sha256": "15864e5fe90e1b96532857b4ef5a9cccef14307d22def8575507c0ff66eb060b",
       "size_bytes": 5120000,
-      "archive_format": "tar.gz",
-      "signed": true,
-      "signature_file": "ntm-v1.2.3-darwin-arm64.tar.gz.minisig"
+      "archive_format": "binary",
+      "signed": false,
+      "signature_file": ""
     },
     {
-      "name": "ntm-v1.2.3-windows-amd64.zip",
+      "name": "focr-x86_64-pc-windows-msvc.exe",
       "target": "windows/amd64",
       "sha256": "a38ee4abb8356321afafb9c6dd612dc83bce04c1542ea54541b35ccd09d49e0f",
       "size_bytes": 5500000,
-      "archive_format": "zip",
-      "signed": true,
-      "signature_file": "ntm-v1.2.3-windows-amd64.zip.minisig"
+      "archive_format": "binary",
+      "signed": false,
+      "signature_file": ""
     }
   ],
   "hosts": [
@@ -69,7 +87,7 @@
       "logs_path": "/tmp/dsr-logs/wlap-20260130-150000.log"
     }
   ],
-  "checksums_file": "ntm-v1.2.3-checksums.sha256",
-  "signature_file": "ntm-v1.2.3-checksums.sha256.minisig",
-  "sbom_file": "ntm-v1.2.3-sbom.json"
+  "checksums_file": "focr-v0.7.2-checksums.sha256",
+  "signature_file": "",
+  "sbom_file": ""
 }

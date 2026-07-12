@@ -35,6 +35,23 @@ _qg_log_ok()    { echo "${_QG_GREEN}[quality]${_QG_NC} $*" >&2; }
 _qg_log_warn()  { echo "${_QG_YELLOW}[quality]${_QG_NC} $*" >&2; }
 _qg_log_error() { echo "${_QG_RED}[quality]${_QG_NC} $*" >&2; }
 
+_qg_ms_timestamp() {
+    if declare -f _get_ms_timestamp &>/dev/null; then
+        _get_ms_timestamp
+        return $?
+    fi
+
+    local timestamp=""
+    timestamp=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$timestamp" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$timestamp"
+    elif command -v python3 &>/dev/null; then
+        python3 -c 'import time; print(int(time.time() * 1000))'
+    else
+        printf '%s\n' "$(($(date +%s) * 1000))"
+    fi
+}
+
 # Get configured checks for a tool
 # Usage: qg_get_checks <tool_name>
 # Returns: JSON array of check commands
@@ -75,13 +92,7 @@ _qg_run_single_check() {
 
     local start_ms end_ms duration_ms exit_code=0 output=""
 
-    # Get start time (use logging module helper if available)
-    if declare -f _get_ms_timestamp &>/dev/null; then
-        start_ms=$(_get_ms_timestamp)
-    else
-        # Fallback: prefer date +%s%3N if supported
-        start_ms=$(date +%s%3N 2>/dev/null || echo "$(($(date +%s) * 1000))")
-    fi
+    start_ms=$(_qg_ms_timestamp)
 
     if [[ "$dry_run" == "true" ]]; then
         _qg_log_info "(dry-run) Would run: $cmd"
@@ -98,13 +109,7 @@ _qg_run_single_check() {
         fi
     fi
 
-    # Get end time (use logging module helper if available)
-    if declare -f _get_ms_timestamp &>/dev/null; then
-        end_ms=$(_get_ms_timestamp)
-    else
-        # Fallback: prefer date +%s%3N if supported
-        end_ms=$(date +%s%3N 2>/dev/null || echo "$(($(date +%s) * 1000))")
-    fi
+    end_ms=$(_qg_ms_timestamp)
 
     duration_ms=$((end_ms - start_ms))
 
@@ -241,11 +246,7 @@ EOF
     local total_start_ms total_end_ms
     local passed=0 failed=0
 
-    if declare -f _get_ms_timestamp &>/dev/null; then
-        total_start_ms=$(_get_ms_timestamp)
-    else
-        total_start_ms=$(date +%s%3N 2>/dev/null || echo "$(($(date +%s) * 1000))")
-    fi
+    total_start_ms=$(_qg_ms_timestamp)
 
     while IFS= read -r cmd; do
         [[ -z "$cmd" ]] && continue
@@ -263,11 +264,7 @@ EOF
         fi
     done < <(echo "$checks" | jq -r '.[]')
 
-    if declare -f _get_ms_timestamp &>/dev/null; then
-        total_end_ms=$(_get_ms_timestamp)
-    else
-        total_end_ms=$(date +%s%3N 2>/dev/null || echo "$(($(date +%s) * 1000))")
-    fi
+    total_end_ms=$(_qg_ms_timestamp)
 
     local total_duration_ms=$((total_end_ms - total_start_ms))
 

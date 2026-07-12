@@ -103,6 +103,9 @@ ssh() {
     printf '%s\n' "$@" > "$RAW_SSH_ARGS_FILE"
     local exit_code
     exit_code=$(cat "$RAW_SSH_EXIT_CODE_FILE")
+    if [[ "$exit_code" -eq 0 && -n "${MOCK_SSH_STREAM_FILE:-}" ]]; then
+        cat "$MOCK_SSH_STREAM_FILE"
+    fi
     return "$exit_code"
 }
 
@@ -185,6 +188,7 @@ reset_state() {
     unset MOCK_BINARY_NAME MOCK_BUILD_CMD
     unset MOCK_HOST_PATH_MMINI MOCK_HOST_PATH_WLAP MOCK_HOST_PATH_TRJ
     unset MOCK_GLOBAL_ENV MOCK_PLATFORM_ENV
+    unset MOCK_SSH_STREAM_FILE
 
     # Defaults
     MOCK_LOCAL_PATH="/local/path/tool"
@@ -315,8 +319,257 @@ test_unix_rust_keeps_configured_cargo_path_env() {
     fi
 }
 
+test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
+    log_test "Unix Rust strict build: Cargo output stays outside source snapshot"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_BINARY_NAME="tool"
+    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=in-tree-target\nCARGO_HOME=/ambient/cargo-home\nRUSTFLAGS=-C target-cpu=apple-m4'
+    export RUSTC_WRAPPER="/ambient/evil-wrapper"
+    export RUSTFLAGS="-C link-arg=ambient-evil"
+    export CARGO_PROFILE_RELEASE_OPT_LEVEL="0"
+    export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="/ambient/evil-linker"
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-unix-artifact"
+    printf 'strict unix artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
+
+    local result
+    result=$(act_run_native_build \
+        "tool" "darwin/arm64" "v1.0.0" "run1" \
+        "/remote/.dsr-release-snapshots/tool-run/source" 2>/dev/null)
+
+    local cmd scp_args raw_ssh_args expected_target expected_home
+    cmd=$(get_ssh_cmd)
+    scp_args=$(get_scp_args)
+    raw_ssh_args=$(get_raw_ssh_args)
+    expected_target="/remote/.dsr-release-snapshots/tool-run/.cargo-target-darwin-arm64"
+    expected_home="/remote/.dsr-release-snapshots/tool-run/.cargo-home"
+    if [[ "$cmd" == *"export \"CARGO_TARGET_DIR=$expected_target\""* && \
+          "$cmd" == *"export \"CARGO_HOME=$expected_home\""* && \
+          "$cmd" == *"unset RUSTC_WRAPPER;"* && "$cmd" == *"unset RUSTFLAGS;"* && \
+          "$cmd" == *'case "$variable" in CARGO_*|RUST*'* && \
+          "$cmd" == *'export "RUSTFLAGS=-C target-cpu=apple-m4"'* && \
+          "$cmd" != *"/ambient/evil-wrapper"* && "$cmd" != *"ambient-evil"* && \
+          "$cmd" != *"/ambient/evil-linker"* && \
+          "$cmd" != *"CARGO_TARGET_DIR=in-tree-target"* && \
+          "$cmd" != *"CARGO_HOME=/ambient/cargo-home"* && \
+          -z "$scp_args" && "$raw_ssh_args" == *"cat --"* ]] && \
+       echo "$result" | jq -e \
+            --arg home "$expected_home" \
+            '.build_influence_env.CARGO_HOME == $home and
+             .build_influence_env.RUSTFLAGS == "-C target-cpu=apple-m4" and
+             (.build_influence_env | has("RUSTC_WRAPPER") | not) and
+             .status == "success" and
+             (.collected_sha256 | test("^[0-9a-f]{64}$")) and
+             .collected_size_bytes > 0 and
+             (.collected_identity | test("^(gnu:|bsd:)"))' >/dev/null; then
+        log_pass "Strict Unix build isolates Cargo config and compiler influence env"
+    else
+        log_fail "Strict Unix Cargo/env isolation was not enforced: cmd=$cmd scp=$scp_args result=$result"
+    fi
+    unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
+    unset CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER
+}
+
+test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
+    log_test "Windows Rust strict build: Cargo output stays outside source snapshot"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_BINARY_NAME="tool"
+    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=in-tree-target\nCARGO_HOME=C:/ambient/cargo-home\nRUSTFLAGS=-C target-feature=+crt-static'
+    export RUSTC_WRAPPER="C:/ambient/evil-wrapper.exe"
+    export RUSTFLAGS="-C link-arg=ambient-evil"
+    export CARGO_PROFILE_RELEASE_OPT_LEVEL="0"
+    export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="C:/ambient/evil-linker.exe"
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-windows-artifact"
+    printf 'strict windows artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
+
+    local result
+    result=$(act_run_native_build \
+        "tool" "windows/amd64" "v1.0.0" "run1" \
+        "C:/build/.dsr-release-snapshots/tool-run/source" 2>/dev/null)
+
+    local cmd scp_args raw_ssh_args expected_target expected_home expected_home_win
+    cmd=$(get_ssh_cmd)
+    scp_args=$(get_scp_args)
+    raw_ssh_args=$(get_raw_ssh_args)
+    expected_target="C:/build/.dsr-release-snapshots/tool-run/.cargo-target-windows-amd64"
+    expected_home="C:/build/.dsr-release-snapshots/tool-run/.cargo-home"
+    expected_home_win="C:\\build\\.dsr-release-snapshots\\tool-run\\.cargo-home"
+    if [[ "$cmd" == *"$expected_home_win"* && \
+          "$cmd" == *"System.Diagnostics.ProcessStartInfo"* && \
+          "$cmd" == *"^(CARGO_|RUST)"* && \
+          "$cmd" == *"EnvironmentVariables.Remove"* && \
+          "$cmd" == *"FromBase64String"* && \
+          "$cmd" != *"C:/ambient/evil-wrapper.exe"* && "$cmd" != *"ambient-evil"* && \
+          "$cmd" != *"C:/ambient/evil-linker.exe"* && \
+          "$cmd" != *"CARGO_TARGET_DIR=in-tree-target"* && \
+          "$cmd" != *"CARGO_HOME=C:/ambient/cargo-home"* && \
+          -z "$scp_args" && "$raw_ssh_args" == *"File]::OpenRead"* && \
+          "$raw_ssh_args" == *"CopyTo"* ]] && \
+       echo "$result" | jq -e \
+            --arg home "$expected_home" \
+            '.build_influence_env.CARGO_HOME == $home and
+             .build_influence_env.RUSTFLAGS == "-C target-feature=+crt-static" and
+             (.build_influence_env | has("RUSTC_WRAPPER") | not) and
+             .status == "success" and
+             (.collected_sha256 | test("^[0-9a-f]{64}$")) and
+             .collected_size_bytes > 0 and
+             (.collected_identity | test("^(gnu:|bsd:)"))' >/dev/null; then
+        log_pass "Strict Windows build isolates Cargo config and compiler influence env"
+    else
+        log_fail "Strict Windows Cargo/env isolation was not enforced: cmd=$cmd scp=$scp_args result=$result"
+    fi
+    unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
+    unset CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+}
+
+test_unix_strict_validation_failure_stops_build() {
+    log_test "Unix Rust strict build: isolation failure stops build command"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    local strict_root="$MOCK_DIR/unix-fail-fast/run"
+    local sentinel="$MOCK_DIR/unix-fail-fast-build-ran"
+    mkdir -p "$strict_root/source" "$strict_root/.cargo-home"
+    printf '[net]\noffline = false\n' > "$strict_root/.cargo-home/config.toml"
+    MOCK_BUILD_CMD="printf reached > '$sentinel'"
+
+    local status=0
+    (
+        _act_ssh_exec() { /opt/homebrew/bin/bash -c "$2"; }
+        act_run_native_build \
+            "tool" "darwin/arm64" "v1.0.0" "run1" \
+            "$strict_root/source" >/dev/null 2>&1
+    ) || status=$?
+
+    if [[ $status -ne 0 && ! -e "$sentinel" ]]; then
+        log_pass "Unix strict validation failure prevented the build sentinel"
+    else
+        log_fail "Unix strict validation failure reached the build command"
+    fi
+}
+
+test_windows_strict_validation_failure_stops_build() {
+    log_test "Windows Rust strict build: validation guards process launch"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="echo reached"
+    local sentinel="$MOCK_DIR/windows-fail-fast-build-ran"
+    local status=0
+    (
+        _act_ssh_exec() {
+            local command_text="$2"
+            if [[ "$command_text" == powershell* && \
+                  "$command_text" == *"throw 'Strict CARGO_HOME"* && \
+                  "$command_text" == *'$process=[Diagnostics.Process]::Start'* ]]; then
+                return 1
+            fi
+            printf 'reached\n' > "$sentinel"
+            return 1
+        }
+        act_run_native_build \
+            "tool" "windows/amd64" "v1.0.0" "run1" \
+            "C:/build/.dsr-release-snapshots/tool-run/source" >/dev/null 2>&1
+    ) || status=$?
+
+    if [[ $status -ne 0 && ! -e "$sentinel" ]]; then
+        log_pass "Windows strict validation failure prevented process launch"
+    else
+        log_fail "Windows strict validation failure reached process launch"
+    fi
+}
+
+test_strict_collector_keeps_symlink_victim_unchanged() {
+    log_test "Strict collection: held descriptor defeats destination replacement"
+    reset_state
+
+    local destination="$MOCK_DIR/strict-race/artifact"
+    local victim="$MOCK_DIR/strict-race/victim"
+    mkdir -p "$(dirname "$destination")"
+    printf 'victim must remain unchanged\n' > "$victim"
+
+    local status=0
+    (
+        replace_destination_then_stream() {
+            mv "$destination" "${destination}.opened" || return 1
+            ln -s "$victim" "$destination" || return 1
+            printf 'artifact bytes\n'
+        }
+        _act_collect_stream_exclusive \
+            "$destination" 700 replace_destination_then_stream
+    ) >/dev/null 2>&1 || status=$?
+
+    if [[ $status -eq 4 && "$(cat "$victim")" == "victim must remain unchanged" ]]; then
+        log_pass "Strict collector rejected replacement without touching symlink victim"
+    else
+        log_fail "Strict collector accepted destination replacement or changed victim"
+    fi
+}
+
+test_strict_collector_rejects_partial_producer_failure() {
+    log_test "Strict collection: partial producer failure has no receipt"
+    reset_state
+
+    local destination="$MOCK_DIR/strict-partial/artifact"
+    mkdir -p "$(dirname "$destination")"
+    local receipt status=0
+    receipt=$(
+        partial_producer() {
+            printf 'partial bytes\n'
+            return 23
+        }
+        _act_collect_stream_exclusive "$destination" 700 partial_producer
+    ) || status=$?
+
+    if [[ $status -eq 7 && -z "$receipt" && -s "$destination" ]]; then
+        log_pass "Strict collector retained partial evidence but emitted no receipt"
+    else
+        log_fail "Partial producer failure was accepted: status=$status receipt=$receipt"
+    fi
+}
+
+test_strict_windows_bare_name_retry_uses_fresh_destination() {
+    log_test "Strict collection: Windows bare-name retry gets a fresh destination"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_BINARY_NAME="tool"
+
+    local attempts_file="$MOCK_DIR/strict-windows-retry-attempts"
+    local result
+    result=$(
+        ssh() {
+            local remote_command="${!#}"
+            printf '%s\n' "$remote_command" >> "$attempts_file"
+            if [[ "$remote_command" == *"tool.exe"* ]]; then
+                printf 'partial exe attempt\n'
+                return 1
+            fi
+            printf 'complete bare-name artifact\n'
+        }
+        act_run_native_build \
+            "tool" "windows/amd64" "v1.0.0" "strict-fallback" \
+            "C:/build/.dsr-release-snapshots/tool-run/source" 2>/dev/null
+    )
+
+    local collected_path attempt_count retained_count
+    collected_path=$(jq -r '.artifact_path // empty' <<< "$result")
+    attempt_count=$(wc -l < "$attempts_file" | tr -d ' ')
+    retained_count=$(find "$ACT_ARTIFACTS_DIR" -path '*strict-fallback*' \
+        -type f -name 'tool.exe' | wc -l | tr -d ' ')
+    if [[ "$attempt_count" -eq 2 && "$retained_count" -eq 2 && \
+          "$collected_path" == */retry.*/tool.exe && -z "$(get_scp_args)" ]] && \
+       jq -e '.status == "success" and (.collected_sha256 | test("^[0-9a-f]{64}$"))' \
+           <<< "$result" >/dev/null; then
+        log_pass "Strict Windows retry retained partial evidence and streamed the bare name without scp"
+    else
+        log_fail "Strict Windows retry did not isolate attempts: result=$result attempts=$attempt_count files=$retained_count"
+    fi
+}
+
 test_unix_chained_with_and() {
-    log_test "Unix: commands chained with &&"
+    log_test "Unix: commands run under fail-fast shell mode"
     reset_state
 
     act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
@@ -324,10 +577,10 @@ test_unix_chained_with_and() {
     local cmd
     cmd=$(get_ssh_cmd)
 
-    if [[ "$cmd" == *" && "* ]]; then
-        log_pass "Commands chained with &&"
+    if [[ "$cmd" == "set -e; cd "* ]]; then
+        log_pass "Commands run with set -e before cd and build"
     else
-        log_fail "Expected && chaining in: $cmd"
+        log_fail "Expected fail-fast command construction in: $cmd"
     fi
 }
 
@@ -722,13 +975,14 @@ test_host_detection_windows() {
     log_test "Host detection: windows/* -> wlap"
     reset_state
 
-    local host
-    host=$(act_get_native_host "windows/amd64")
+    local amd64_host arm64_host
+    amd64_host=$(act_get_native_host "windows/amd64")
+    arm64_host=$(act_get_native_host "windows/arm64")
 
-    if [[ "$host" == "wlap" ]]; then
-        log_pass "windows/amd64 -> wlap"
+    if [[ "$amd64_host" == "wlap" && "$arm64_host" == "wlap" ]]; then
+        log_pass "windows/amd64 and windows/arm64 -> wlap"
     else
-        log_fail "Expected wlap but got: $host"
+        log_fail "Expected wlap but got: amd64=$amd64_host arm64=$arm64_host"
     fi
 }
 
@@ -972,6 +1226,35 @@ test_result_json_success_has_artifact() {
     fi
 }
 
+test_windows_strict_cargo_metadata_command() {
+    log_test "Strict Cargo metadata: Windows command is locked and offline"
+    reset_state
+
+    local command_file="$MOCK_DIR/windows_metadata_command.txt"
+    local status=0
+    (
+        _act_is_windows_host() { return 0; }
+        _act_ssh_exec() {
+            printf '%s\n' "$2" > "$command_file"
+            printf '%s\n' 'C:\build\source'
+            printf '%s\n' '{"workspace_root":"C:\\\\build\\\\source","packages":[{"manifest_path":"C:\\\\build\\\\source\\\\Cargo.toml","source":null}]}'
+        }
+        _act_validate_strict_cargo_source_closure \
+            "wlap" "C:/build/source" '[]' >/dev/null
+    ) 2>/dev/null || status=$?
+
+    if [[ $status -eq 0 ]] && \
+       grep -Fq "Strict CARGO_HOME already exists" "$command_file" && \
+       grep -Fq "contains ambient configuration" "$command_file" && \
+       grep -Fq "\$env:CARGO_HOME=\$strict" "$command_file" && \
+       grep -Fq "cargo metadata --locked --offline --all-features --format-version 1 --manifest-path 'C:\build\source\Cargo.toml'" \
+            "$command_file"; then
+        log_pass "Windows strict metadata command is locked and offline"
+    else
+        log_fail "Windows strict metadata command was not constructed safely"
+    fi
+}
+
 # ============================================================================
 # Run All Tests
 # ============================================================================
@@ -986,6 +1269,13 @@ main() {
     test_unix_env_export_syntax
     test_unix_rust_unsets_ambient_cargo_path_env
     test_unix_rust_keeps_configured_cargo_path_env
+    test_unix_strict_rust_forces_out_of_snapshot_target_dir
+    test_windows_strict_rust_forces_out_of_snapshot_target_dir
+    test_unix_strict_validation_failure_stops_build
+    test_windows_strict_validation_failure_stops_build
+    test_strict_collector_keeps_symlink_victim_unchanged
+    test_strict_collector_rejects_partial_producer_failure
+    test_strict_windows_bare_name_retry_uses_fresh_destination
     test_unix_chained_with_and
     test_unix_host_path_override
     test_unix_fallback_to_local_path
@@ -1034,6 +1324,7 @@ main() {
     test_result_json_correct_platform
     test_result_json_method_native
     test_result_json_success_has_artifact
+    test_windows_strict_cargo_metadata_command
 
     # Summary
     echo ""

@@ -40,7 +40,7 @@ source "$PROJECT_ROOT/src/artifact_naming.sh"
 TEST_COUNT=0
 PASS_COUNT=0
 FAIL_COUNT=0
-START_TIME=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+START_TIME=$(($(date +%s) * 1000))
 
 # Results storage for JSON output
 declare -a PHASE_RESULTS=()
@@ -158,7 +158,7 @@ PHASE_START_TIME=0
 
 start_phase() {
     CURRENT_PHASE="$1"
-    PHASE_START_TIME=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+    PHASE_START_TIME=$(($(date +%s) * 1000))
     if [[ $JSON_OUTPUT -eq 0 ]]; then
         echo "" >&2
         echo "[$(log_timestamp)] === Phase: $CURRENT_PHASE ===" >&2
@@ -169,7 +169,7 @@ end_phase() {
     local status="$1"
     local tests_in_phase="${2:-0}"
     local end_time
-    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+    end_time=$(($(date +%s) * 1000))
     local duration=$((end_time - PHASE_START_TIME))
 
     PHASE_RESULTS+=("{\"name\":\"$CURRENT_PHASE\",\"status\":\"$status\",\"tests\":$tests_in_phase,\"duration_ms\":$duration}")
@@ -403,6 +403,24 @@ test_platform_windows_arm64() {
     assert_json_field "$result" "versioned" "app-2.0.0-windows-arm64.zip" "Windows ARM64"
 }
 
+test_platform_windows_arm64_target_triple() {
+    log_test "Platform: windows/arm64 target triple"
+
+    local result
+    result=$(artifact_naming_substitute '${name}-${target_triple}.${ext}' \
+        "app" "v2.0.0" "windows" "arm64" "exe" "missing-tool")
+    log_debug "Result: $result"
+
+    ((TEST_COUNT++))
+    if [[ "$result" == "app-aarch64-pc-windows-msvc.exe" ]]; then
+        ((PASS_COUNT++))
+        log_pass "Windows ARM64 target triple"
+    else
+        ((FAIL_COUNT++))
+        log_fail "Expected app-aarch64-pc-windows-msvc.exe, got: $result"
+    fi
+}
+
 # =============================================================================
 # TEST: EDGE CASES
 # =============================================================================
@@ -487,7 +505,7 @@ test_json_format_has_all_fields() {
 
 print_summary() {
     local end_time
-    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+    end_time=$(($(date +%s) * 1000))
     local total_duration=$((end_time - START_TIME))
 
     if [[ $JSON_OUTPUT -eq 1 ]]; then
@@ -582,6 +600,7 @@ main() {
     test_platform_linux_arm64
     test_platform_darwin_amd64
     test_platform_windows_arm64
+    test_platform_windows_arm64_target_triple
     end_phase "pass" $((TEST_COUNT - phase_tests))
 
     # Phase 7: Edge Cases

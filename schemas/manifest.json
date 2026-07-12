@@ -4,7 +4,7 @@
   "title": "DSR Build Manifest",
   "description": "Schema for dsr build manifests - the source of truth for artifact metadata",
   "type": "object",
-  "required": ["schema_version", "tool", "version", "run_id", "git_sha", "built_at", "artifacts"],
+  "required": ["schema_version", "tool", "version", "run_id", "source", "built_at", "status", "summary", "artifacts"],
   "properties": {
     "schema_version": {
       "type": "string",
@@ -26,14 +26,9 @@
       "format": "uuid",
       "description": "Unique identifier for this build run"
     },
-    "git_sha": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{40}$",
-      "description": "Full git commit SHA that was built"
-    },
-    "git_ref": {
-      "type": "string",
-      "description": "Git ref (branch or tag name)"
+    "source": {
+      "$ref": "#/$defs/source",
+      "description": "Exact source identity used for the build"
     },
     "built_at": {
       "type": "string",
@@ -44,6 +39,15 @@
       "type": "integer",
       "minimum": 0,
       "description": "Total build duration in milliseconds"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "partial", "failed"],
+      "description": "Overall orchestration status"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary",
+      "description": "Orchestration target counts retained from the build result"
     },
     "builder": {
       "type": "object",
@@ -93,14 +97,96 @@
     }
   },
   "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["git_sha", "git_ref", "dependencies"],
+      "additionalProperties": false,
+      "properties": {
+        "git_sha": {
+          "type": "string",
+          "pattern": "^(?!0{40}$)[0-9a-f]{40}$",
+          "description": "Nonzero full commit SHA built by every target"
+        },
+        "git_ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact branch or version tag bound to git_sha"
+        },
+        "dependencies": {
+          "type": "array",
+          "description": "Canonical pinned sibling/path dependency revisions used by the build",
+          "items": {
+            "$ref": "#/$defs/source_dependency"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "source_dependency": {
+      "type": "object",
+      "required": ["relative_path", "git_sha"],
+      "additionalProperties": false,
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "allOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._+\\-]*$"
+            },
+            {
+              "not": {
+                "pattern": "\\.\\."
+              }
+            }
+          ]
+        },
+        "git_sha": {
+          "type": "string",
+          "pattern": "^(?!0{40}$)[0-9a-f]{40}$"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["total", "success", "failed"],
+      "additionalProperties": false,
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "success": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
     "artifact": {
       "type": "object",
-      "required": ["name", "target", "sha256", "size_bytes"],
+      "required": ["name", "target", "sha256", "size_bytes", "archive_format"],
       "properties": {
         "name": {
           "type": "string",
-          "description": "Artifact filename following naming convention",
-          "pattern": "^[a-z][a-z0-9_-]+-v[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9.]+)?-(linux|darwin|windows)-(amd64|arm64|386)(\\.exe)?(\\.tar\\.gz|\\.zip)?$"
+          "description": "Safe artifact basename with no path traversal or checksum-sidecar suffix",
+          "allOf": [
+            {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._+\\-]*$"
+            },
+            {
+              "not": {
+                "pattern": "\\.\\."
+              }
+            },
+            {
+              "not": {
+                "pattern": "\\.[sS][hH][aA]256$"
+              }
+            }
+          ]
         },
         "target": {
           "type": "string",
@@ -119,8 +205,8 @@
         },
         "archive_format": {
           "type": "string",
-          "enum": ["tar.gz", "zip", "none"],
-          "description": "Archive format (tar.gz for Unix, zip for Windows)"
+          "enum": ["tar.gz", "tar.xz", "zip", "binary", "none"],
+          "description": "Artifact packaging; binary is an unarchived strict-contract primary"
         },
         "signed": {
           "type": "boolean",

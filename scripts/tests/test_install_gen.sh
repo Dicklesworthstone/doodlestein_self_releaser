@@ -251,6 +251,24 @@ test_template_has_skill_archive_support() {
     teardown
 }
 
+test_template_maps_windows_arm64_target_triple() {
+    ((TESTS_RUN++))
+    setup
+
+    source "$PROJECT_ROOT/src/install_gen.sh"
+
+    local template
+    template=$(_install_gen_template 2>/dev/null)
+
+    if grep -Fq 'windows/arm64) echo "aarch64-pc-windows-msvc"' <<< "$template"; then
+        pass "generated installer maps windows/arm64 target triple"
+    else
+        fail "generated installer has incorrect windows/arm64 target triple"
+    fi
+
+    teardown
+}
+
 test_generated_installer_embeds_full_skill_tree() {
     ((TESTS_RUN++))
     setup
@@ -341,6 +359,7 @@ test_template_has_prefer_gh_flag
 test_template_has_gh_download_function
 test_template_has_cache_get_function
 test_template_has_skill_archive_support
+test_template_maps_windows_arm64_target_triple
 test_generated_installer_embeds_full_skill_tree
 
 echo ""

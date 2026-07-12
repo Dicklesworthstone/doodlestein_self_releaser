@@ -471,6 +471,27 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--dispatch-event` | `dsr_release` | Override dispatch event type |
 | `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
 
+When a repository opts into `release_contract`, DSR creates a new empty draft,
+uploads only the contracted primaries and checksum sidecars, and publishes only
+after exact no-cache asset, metadata, and tag-SHA verification. `--draft` keeps
+that verified draft unpublished and suppresses dispatch and upgrade hooks.
+
+Strict native builds trust the configured build host and its installed
+compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and
+records the explicit build-influence environment, but it does not yet attest
+the executable paths or hashes of the host toolchain. The tracked
+`rust-toolchain.toml`, source revisions, and final artifact hashes remain part
+of the release evidence; resistance to a compromised host toolchain is outside
+the current contract.
+
+GitHub does not document a conditional compare-and-swap operation that covers a
+release, its assets, and its tag in one transaction. A same-credential actor can
+therefore mutate one of those resources between the final read and publish
+PATCH. DSR bounds this residual with an exact post-PATCH observation and up to
+three observe-after-write re-draft attempts, but a brief exposure or failed
+rollback remains possible during a GitHub outage, immutable-release policy, or
+concurrent privileged mutation.
+
 ---
 
 ### `dsr fallback`

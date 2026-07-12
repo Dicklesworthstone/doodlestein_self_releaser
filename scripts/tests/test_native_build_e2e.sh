@@ -304,9 +304,8 @@ test_tool_config_has_targets() {
 
 # ============================================================================
 # Test Cases: Platform Target Tests
-# Note: These verify the build command accepts platform targets and runs the
-# build pipeline. Exit codes 0, 1 (partial), or 6 (build failed) are all
-# acceptable since we're testing config/flag parsing, not build success.
+# Note: These verify the build command accepts platform targets and produces a
+# validated plan. Dry-run keeps config/flag parsing tests from contacting hosts.
 # ============================================================================
 
 test_build_target_linux() {
@@ -319,11 +318,9 @@ test_build_target_linux() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --target linux/amd64 2>&1 || exit_code=$?
+    timeout 30 "$DSR_CMD" build mock_rust_tool --target linux/amd64 --dry-run 2>&1 || exit_code=$?
 
-    # Accept 0 (success), 1 (partial), 6 (build failed), 124 (timeout)
-    # Exit 4 means config not found - that's a real failure
-    if [[ "$exit_code" -ne 4 ]]; then
+    if [[ "$exit_code" -eq 0 ]]; then
         log_pass "Linux target config accepted (exit: $exit_code)"
     else
         log_fail "Linux target config failed (exit: $exit_code)"
@@ -342,9 +339,9 @@ test_build_target_darwin() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --target darwin/arm64 2>&1 || exit_code=$?
+    timeout 30 "$DSR_CMD" build mock_rust_tool --target darwin/arm64 --dry-run 2>&1 || exit_code=$?
 
-    if [[ "$exit_code" -ne 4 ]]; then
+    if [[ "$exit_code" -eq 0 ]]; then
         log_pass "Darwin target config accepted (exit: $exit_code)"
     else
         log_fail "Darwin target config failed (exit: $exit_code)"
@@ -363,9 +360,9 @@ test_build_target_windows() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --target windows/amd64 2>&1 || exit_code=$?
+    timeout 30 "$DSR_CMD" build mock_rust_tool --target windows/amd64 --dry-run 2>&1 || exit_code=$?
 
-    if [[ "$exit_code" -ne 4 ]]; then
+    if [[ "$exit_code" -eq 0 ]]; then
         log_pass "Windows target config accepted (exit: $exit_code)"
     else
         log_fail "Windows target config failed (exit: $exit_code)"
@@ -388,10 +385,9 @@ test_sync_only_flag() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --sync-only 2>&1 || exit_code=$?
+    timeout 30 "$DSR_CMD" build mock_rust_tool --sync-only --dry-run 2>&1 || exit_code=$?
 
-    # Exit 4 = config not found, that's a real failure
-    if [[ "$exit_code" -ne 4 ]]; then
+    if [[ "$exit_code" -eq 0 ]]; then
         log_pass "--sync-only flag accepted (exit: $exit_code)"
     else
         log_fail "--sync-only flag failed (exit: $exit_code)"
@@ -410,9 +406,9 @@ test_no_sync_flag() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --no-sync --target linux/amd64 2>&1 || exit_code=$?
+    timeout 30 "$DSR_CMD" build mock_rust_tool --no-sync --target linux/amd64 --dry-run 2>&1 || exit_code=$?
 
-    if [[ "$exit_code" -ne 4 ]]; then
+    if [[ "$exit_code" -eq 0 ]]; then
         log_pass "--no-sync flag accepted (exit: $exit_code)"
     else
         log_fail "--no-sync flag failed (exit: $exit_code)"
@@ -435,9 +431,9 @@ test_targets_flag_filters() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --targets linux/amd64,darwin/arm64 2>&1 || exit_code=$?
+    timeout 30 "$DSR_CMD" build mock_rust_tool --targets linux/amd64,darwin/arm64 --dry-run 2>&1 || exit_code=$?
 
-    if [[ "$exit_code" -ne 4 ]]; then
+    if [[ "$exit_code" -eq 0 ]]; then
         log_pass "--targets flag accepted (exit: $exit_code)"
     else
         log_fail "--targets flag failed (exit: $exit_code)"
@@ -456,9 +452,9 @@ test_parallel_flag() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --parallel --targets linux/amd64 2>&1 || exit_code=$?
+    timeout 30 "$DSR_CMD" build mock_rust_tool --parallel --targets linux/amd64 --dry-run 2>&1 || exit_code=$?
 
-    if [[ "$exit_code" -ne 4 ]]; then
+    if [[ "$exit_code" -eq 0 ]]; then
         log_pass "--parallel flag accepted (exit: $exit_code)"
     else
         log_fail "--parallel flag failed (exit: $exit_code)"
@@ -477,15 +473,15 @@ test_only_act_flag() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local output exit_code=0
-    output=$(timeout 30 "$DSR_CMD" build mock_rust_tool --only-act 2>&1) || exit_code=$?
+    output=$(timeout 30 "$DSR_CMD" build mock_rust_tool --only-act --dry-run 2>&1) || exit_code=$?
 
     # Should only have linux targets, not darwin/windows
-    if [[ "$output" == *"Filtered to act targets"* ]] && [[ "$output" != *"darwin"* || "$output" == *"Filtered"* ]]; then
+    if [[ "$exit_code" -eq 0 ]] && \
+       [[ "$output" == *"Filtered to act targets"* ]] && \
+       [[ "$output" == *"[dry-run] Would execute build"* ]]; then
         log_pass "--only-act filters to act targets (exit: $exit_code)"
-    elif [[ "$exit_code" -ne 4 ]]; then
-        log_pass "--only-act flag accepted (exit: $exit_code)"
     else
-        log_fail "--only-act flag failed (exit: $exit_code)"
+        log_fail "--only-act dry-run plan failed (exit: $exit_code, output: $output)"
     fi
 
     cleanup_test_environment
@@ -534,24 +530,8 @@ YAML
     local fake_home="$TEST_TMPDIR/bad-home"
     mkdir -p "$bin_dir" "$fake_home"
 
-    cat > "$bin_dir/act" << 'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "--version" ]]; then
-    echo "act version 0.2.87"
-    exit 0
-fi
-exit 0
-EOF
-    chmod +x "$bin_dir/act"
-
-    cat > "$bin_dir/docker" << 'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "info" ]]; then
-    exit 0
-fi
-exit 0
-EOF
-    chmod +x "$bin_dir/docker"
+    ln -s "$(command -v act)" "$bin_dir/act"
+    ln -s /usr/bin/true "$bin_dir/docker"
 
     cat > "$fake_home/.actrc" << 'EOF'
 --bind
@@ -588,15 +568,15 @@ test_only_native_flag() {
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
     local output exit_code=0
-    output=$(timeout 30 "$DSR_CMD" build mock_rust_tool --only-native 2>&1) || exit_code=$?
+    output=$(timeout 30 "$DSR_CMD" build mock_rust_tool --only-native --dry-run 2>&1) || exit_code=$?
 
     # Should only have native targets (darwin/windows), not linux
-    if [[ "$output" == *"Filtered to native targets"* ]]; then
+    if [[ "$exit_code" -eq 0 ]] && \
+       [[ "$output" == *"Filtered to native targets"* ]] && \
+       [[ "$output" == *"[dry-run] Would execute build"* ]]; then
         log_pass "--only-native filters to native targets (exit: $exit_code)"
-    elif [[ "$exit_code" -ne 4 ]]; then
-        log_pass "--only-native flag accepted (exit: $exit_code)"
     else
-        log_fail "--only-native flag failed (exit: $exit_code)"
+        log_fail "--only-native dry-run plan failed (exit: $exit_code, output: $output)"
     fi
 
     cleanup_test_environment
@@ -680,6 +660,46 @@ test_missing_tool_error_message() {
         log_pass "Missing tool shows clear error message"
     else
         log_fail "Expected 'not found' in error: $output"
+    fi
+
+    cleanup_test_environment
+}
+
+test_strict_build_rejects_existing_output_symlink() {
+    ((TESTS_RUN++))
+    log_test "Strict output: symlink is rejected before orchestration"
+    setup_test_environment
+
+    local tool_dir config_file output_target output_link sentinel output exit_code=0
+    tool_dir=$(setup_mock_rust_tool)
+    git -C "$tool_dir" tag v0.1.0
+    create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
+    config_file="$DSR_CONFIG_DIR/repos.d/mock_rust_tool.yaml"
+    cat >> "$config_file" << 'YAML'
+release_contract:
+  exact_primary_assets:
+    linux/amd64: mock_rust_tool-linux-amd64
+    darwin/arm64: mock_rust_tool-darwin-arm64
+    windows/amd64: mock_rust_tool-windows-amd64.exe
+  checksum_sidecar: sha256
+YAML
+
+    output_target="$TEST_TMPDIR/strict-output-target"
+    output_link="$TEST_TMPDIR/strict-output-link"
+    sentinel="$output_target/sentinel"
+    mkdir -p "$output_target"
+    printf 'sentinel must survive\n' > "$sentinel"
+    ln -s "$output_target" "$output_link"
+
+    output=$(timeout 30 "$DSR_CMD" build mock_rust_tool \
+        --output-dir "$output_link" 2>&1) || exit_code=$?
+
+    if [[ "$exit_code" -eq 4 && -L "$output_link" && \
+          "$(cat "$sentinel")" == "sentinel must survive" && \
+          "$output" == *"requires a fresh output directory"* ]]; then
+        log_pass "Strict build rejected symlink output without changing its target"
+    else
+        log_fail "Strict build did not reject output symlink safely (exit: $exit_code, output: $output)"
     fi
 
     cleanup_test_environment
@@ -939,6 +959,7 @@ main() {
     # Error handling tests
     test_missing_tool_config_error
     test_missing_tool_error_message
+    test_strict_build_rejects_existing_output_symlink
 
     # Multi-language config tests
     test_go_tool_config_has_language

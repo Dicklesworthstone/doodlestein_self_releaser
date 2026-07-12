@@ -13,7 +13,7 @@
   "warnings": [],
   "errors": [],
   "details": {
-    "subcommand": "show",
+    "action": "show",
     "config_dir": "~/.config/dsr",
     "config_file": "~/.config/dsr/config.yaml",
     "values": {

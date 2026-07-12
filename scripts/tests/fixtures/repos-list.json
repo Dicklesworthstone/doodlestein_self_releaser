@@ -13,11 +13,12 @@
   "warnings": [],
   "errors": [],
   "details": {
-    "subcommand": "list",
+    "action": "list",
     "total_repos": 3,
     "repos": [
       {
-        "name": "ntm",
+      "name": "ntm",
+      "repo": "Dicklesworthstone/ntm",
         "owner": "Dicklesworthstone",
         "full_name": "Dicklesworthstone/ntm",
         "local_path": "/data/projects/ntm",
@@ -29,7 +30,8 @@
         "last_release": "v1.5.2"
       },
       {
-        "name": "bv",
+      "name": "bv",
+      "repo": "Dicklesworthstone/beads_viewer",
         "owner": "Dicklesworthstone",
         "full_name": "Dicklesworthstone/beads_viewer",
         "local_path": "/data/projects/beads_viewer",
@@ -41,7 +43,8 @@
         "last_release": "v2.1.0"
       },
       {
-        "name": "cass",
+      "name": "cass",
+      "repo": "Dicklesworthstone/coding_agent_session_search",
         "owner": "Dicklesworthstone",
         "full_name": "Dicklesworthstone/coding_agent_session_search",
         "local_path": "/data/projects/coding_agent_session_search",

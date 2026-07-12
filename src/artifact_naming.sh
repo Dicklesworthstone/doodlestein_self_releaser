@@ -26,14 +26,24 @@ else
 fi
 
 # Logging with timestamps for debugging
+_an_timestamp() {
+    local timestamp
+    if command -v date >/dev/null 2>&1 && \
+       timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null); then
+        printf '%s\n' "$timestamp"
+    else
+        printf '%s\n' "unknown-time"
+    fi
+}
+
 _an_log_debug() {
     [[ "${ARTIFACT_NAMING_DEBUG:-0}" == "1" ]] && \
-        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${_AN_BLUE}[artifact_naming]${_AN_NC} DEBUG: $*" >&2
+        echo "[$(_an_timestamp)] ${_AN_BLUE}[artifact_naming]${_AN_NC} DEBUG: $*" >&2
 }
-_an_log_info()  { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${_AN_BLUE}[artifact_naming]${_AN_NC} $*" >&2; }
-_an_log_ok()    { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${_AN_GREEN}[artifact_naming]${_AN_NC} $*" >&2; }
-_an_log_warn()  { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${_AN_YELLOW}[artifact_naming]${_AN_NC} $*" >&2; }
-_an_log_error() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${_AN_RED}[artifact_naming]${_AN_NC} $*" >&2; }
+_an_log_info()  { echo "[$(_an_timestamp)] ${_AN_BLUE}[artifact_naming]${_AN_NC} $*" >&2; }
+_an_log_ok()    { echo "[$(_an_timestamp)] ${_AN_GREEN}[artifact_naming]${_AN_NC} $*" >&2; }
+_an_log_warn()  { echo "[$(_an_timestamp)] ${_AN_YELLOW}[artifact_naming]${_AN_NC} $*" >&2; }
+_an_log_error() { echo "[$(_an_timestamp)] ${_AN_RED}[artifact_naming]${_AN_NC} $*" >&2; }
 
 # Known archive extensions
 _an_has_known_ext() {
@@ -74,6 +84,7 @@ _an_default_target_triple() {
         darwin/amd64) echo "x86_64-apple-darwin" ;;
         darwin/arm64) echo "aarch64-apple-darwin" ;;
         windows/amd64) echo "x86_64-pc-windows-msvc" ;;
+        windows/arm64) echo "aarch64-pc-windows-msvc" ;;
         *) echo "${os}-${arch}" ;;
     esac
 }
@@ -120,13 +131,13 @@ _an_normalize_pattern() {
 
     # Handle GitHub Actions matrix syntax
     # ${{ matrix.goos }} -> ${os}
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{\s*matrix\.(goos|os)\s*\}\}/${os}/g')
+    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*matrix\.(goos|os)[[:space:]]*\}\}/${os}/g')
     # ${{ matrix.goarch }} -> ${arch}
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{\s*matrix\.(goarch|arch)\s*\}\}/${arch}/g')
+    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*matrix\.(goarch|arch)[[:space:]]*\}\}/${arch}/g')
     # ${{ matrix.target }} -> ${target_triple}
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{\s*matrix\.target\s*\}\}/${target_triple}/g')
+    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*matrix\.target[[:space:]]*\}\}/${target_triple}/g')
     # Strip version from pattern for compat comparison
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{\s*(github\.ref_name|env\.VERSION)\s*\}\}/${version}/g')
+    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*(github\.ref_name|env\.VERSION)[[:space:]]*\}\}/${version}/g')
 
     _an_log_debug "Normalized to: $result"
     printf '%s' "$result"

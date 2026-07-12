@@ -194,7 +194,14 @@ resolve_path() {
         return $EXIT_INVALID_ARGS
       }
     else
-      resolved=$(realpath -m "$resolved" 2>/dev/null) || resolved="$resolved"
+      local original_resolved="$resolved"
+      local normalized_resolved=""
+      if normalized_resolved=$(realpath -m "$original_resolved" 2>/dev/null) && \
+         [[ -n "$normalized_resolved" ]]; then
+        resolved="$normalized_resolved"
+      else
+        resolved=$(_normalize_path "$original_resolved")
+      fi
     fi
   else
     # Manual normalization for systems without realpath

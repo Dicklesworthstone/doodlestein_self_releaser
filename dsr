@@ -1781,8 +1781,54 @@ EOF
     local tag
     tag=$(git_ops_version_to_tag "$version")
 
-    # Check if tag exists
-    if ! git_ops_tag_exists "$local_path" "$tag"; then
+    local build_release_contract_json="null"
+    local build_release_contract_enabled=false
+    local build_source_sha=""
+    local build_source_ref=""
+    local build_run_id=""
+    local build_source_roots_json="{}"
+    local -a build_source_args=()
+    local -a build_sync_args=()
+    if declare -F config_get_release_contract_json &>/dev/null; then
+        if ! config_validate_release_contract "$tool_name"; then
+            log_error "Release contract validation failed for $tool_name"
+            return 4
+        fi
+        build_release_contract_json=$(config_get_release_contract_json "$tool_name") || return $?
+        [[ "$build_release_contract_json" != "null" ]] && build_release_contract_enabled=true
+    fi
+
+    if $build_release_contract_enabled && $no_sync; then
+        log_error "Strict release contract requires source synchronization; --no-sync is forbidden"
+        return 4
+    fi
+
+    # Contract builds are release-identity builds: the requested tag must exist
+    # and peel to the exact commit currently checked out.
+    if $build_release_contract_enabled; then
+        if ! git_ops_tag_exists "$local_path" "$tag"; then
+            log_error "Strict release contract requires local tag $tag"
+            return 4
+        fi
+        local strict_source_status
+        strict_source_status=$(git -C "$local_path" status --porcelain --untracked-files=all 2>/dev/null) || {
+            log_error "Could not inspect strict release source tree"
+            return 4
+        }
+        if [[ -n "$strict_source_status" ]]; then
+            log_error "Strict release contract requires a clean source tree (tracked and untracked files)"
+            return 4
+        fi
+        build_source_sha=$(git -C "$local_path" rev-parse --verify HEAD 2>/dev/null) || return 4
+        local build_tag_sha
+        build_tag_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null) || return 4
+        if [[ ! "$build_source_sha" =~ ^[0-9a-f]{40}$ || "$build_source_sha" != "$build_tag_sha" ]]; then
+            log_error "Strict release contract requires HEAD to equal the peeled local tag $tag"
+            return 4
+        fi
+        build_source_ref="$tag"
+        build_source_args=(--git-sha "$build_source_sha" --git-ref "$build_source_ref")
+    elif ! git_ops_tag_exists "$local_path" "$tag"; then
         log_warn "Tag $tag does not exist in $local_path"
         log_info "Creating tag with: dsr version tag $tool_name"
         # For now, proceed anyway - the version might be in version files but not tagged
@@ -1845,6 +1891,17 @@ EOF
         fi
     fi
 
+    if $build_release_contract_enabled; then
+        local requested_targets_json contract_targets_json
+        # shellcheck disable=SC2086  # target_list is intentionally word-split into one target per line.
+        requested_targets_json=$(printf '%s\n' $target_list | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
+        contract_targets_json=$(jq -c '.exact_primary_assets | keys | sort' <<< "$build_release_contract_json")
+        if [[ "$requested_targets_json" != "$contract_targets_json" ]]; then
+            log_error "Strict release contract requires the complete configured target set"
+            return 4
+        fi
+    fi
+
     if $dry_run; then
         local planned_targets='[]'
         local planned_host planned_method
@@ -1895,7 +1952,20 @@ EOF
         return 0
     fi
 
-    if ! mkdir -p "$output_dir"; then
+    if $build_release_contract_enabled; then
+        local output_parent
+        output_dir="${output_dir%/}"
+        output_parent=$(dirname "$output_dir")
+        if [[ -z "$output_dir" || -e "$output_dir" || -L "$output_dir" ]]; then
+            log_error "Strict release build requires a fresh output directory: $output_dir"
+            return 4
+        fi
+        if ! mkdir -p "$output_parent" || [[ ! -d "$output_parent" || -L "$output_parent" ]] || \
+           ! (umask 077; mkdir "$output_dir") || [[ ! -d "$output_dir" || -L "$output_dir" ]]; then
+            log_error "Failed to create private strict output directory: $output_dir"
+            return 4
+        fi
+    elif ! mkdir -p "$output_dir"; then
         log_error "Failed to create output directory: $output_dir"
         return 1
     fi
@@ -1931,19 +2001,39 @@ EOF
 
     # Sync source to remote hosts (unless --no-sync)
     if ! $no_sync; then
+        if $build_release_contract_enabled; then
+            if ! build_run_id=$(_act_generate_uuid) || ! _act_is_uuid "$build_run_id"; then
+                log_error "Could not generate a strict release build run ID"
+                return 4
+            fi
+            build_sync_args=(
+                --strict-release
+                --run-id "$build_run_id"
+                --git-sha "$build_source_sha"
+                --
+            )
+        fi
+
         log_info "Syncing source to remote build hosts..."
-        local sync_output sync_status
+        local sync_output sync_json sync_status
         # shellcheck disable=SC2086
-        sync_output=$(act_sync_sources "$tool_name" $target_list 2>&1)
-        sync_status=$(echo "$sync_output" | grep '^{' | tail -1 | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+        sync_output=$(act_sync_sources "$tool_name" "${build_sync_args[@]}" $target_list 2>&1)
+        sync_json=$(printf '%s\n' "$sync_output" | grep '^{' | tail -1)
+        if ! sync_status=$(jq -er '.status | strings' <<< "$sync_json" 2>/dev/null); then
+            sync_status="unknown"
+        fi
 
         if [[ "$sync_status" == "success" || "$sync_status" == "skipped" ]]; then
             local synced
-            synced=$(echo "$sync_output" | grep '^{' | tail -1 | jq -r '.synced // 0' 2>/dev/null || echo 0)
+            synced=$(jq -r '.synced // 0' <<< "$sync_json" 2>/dev/null || echo 0)
             if [[ "$synced" -gt 0 ]]; then
                 log_ok "Source synced to $synced host(s)"
             fi
         elif [[ "$sync_status" == "partial" ]]; then
+            if $build_release_contract_enabled; then
+                log_error "Strict source sync was incomplete"
+                return 1
+            fi
             log_warn "Some hosts failed to sync - builds may fail"
         else
             log_error "Source sync failed"
@@ -1953,12 +2043,30 @@ EOF
             return 1
         fi
 
+        if $build_release_contract_enabled; then
+            if ! build_source_roots_json=$(jq -ce '
+                .source_roots |
+                if type == "object" and all(.[]; type == "string" and length > 0)
+                then .
+                else error("invalid strict source roots")
+                end
+            ' <<< "$sync_json" 2>/dev/null); then
+                log_error "Strict source sync did not return valid source roots"
+                return 1
+            fi
+            build_source_args=(
+                --git-sha "$build_source_sha"
+                --git-ref "$build_source_ref"
+                --run-id "$build_run_id"
+                --source-roots-json "$build_source_roots_json"
+                --
+            )
+        fi
+
         # If --sync-only, we're done
         if $sync_only; then
             log_ok "Sync completed (--sync-only mode)"
             if $JSON_MODE; then
-                local sync_json
-                sync_json=$(echo "$sync_output" | grep '^{' | tail -1)
                 json_envelope "build" "success" 0 "$sync_json"
             fi
             return 0
@@ -1972,7 +2080,7 @@ EOF
     # Run orchestrated build
     local full_output orchestrator_exit=0
     # shellcheck disable=SC2086
-    full_output=$(act_orchestrate_build "$tool_name" "$version" $target_list 2>&1) || orchestrator_exit=$?
+    full_output=$(act_orchestrate_build "$tool_name" "$version" "${build_source_args[@]}" $target_list 2>&1) || orchestrator_exit=$?
 
     # Debug: show orchestrator exit and last few lines of output
     log_debug "Orchestrator exit=$orchestrator_exit, output lines=$(echo "$full_output" | wc -l)"
@@ -2113,7 +2221,11 @@ EOF
                 dest="$output_dir/$name"
                 artifact_rename_pairs+=("${target}||${orig_name}"$'\t'"${name}")
 
-                if [[ -f "$dest" ]]; then
+                if $build_release_contract_enabled && [[ -e "$dest" || -L "$dest" ]]; then
+                    log_error "Strict release artifact destination already exists: $name"
+                    collect_failed=true
+                    return 1
+                elif [[ -f "$dest" ]]; then
                     if cmp -s "$dest" "$src" 2>/dev/null; then
                         log_info "Artifact already present: $name"
                         collected_names["$name"]="$src"
@@ -2134,6 +2246,23 @@ EOF
                 collect_failed=true
                 return 1
             fi
+        fi
+
+        if $build_release_contract_enabled; then
+            if [[ -e "$dest" || -L "$dest" ]]; then
+                log_error "Strict release artifact destination already exists: $name"
+                collect_failed=true
+                return 1
+            fi
+            if cp -n "$src" "$dest" && [[ -f "$dest" && ! -L "$dest" ]] && \
+               cmp -s "$src" "$dest"; then
+                collected_names["$name"]="$src"
+                collected_count=$((collected_count + 1))
+                return 0
+            fi
+            log_error "Failed to create strict release artifact without clobbering: $name"
+            collect_failed=true
+            return 1
         fi
 
         if [[ -f "$dest" ]]; then
@@ -2873,6 +3002,9 @@ EOF
 
         if $collect_failed; then
             log_error "Artifact collection encountered errors"
+            if $build_release_contract_enabled; then
+                return 6
+            fi
         else
             log_info "Collected $collected_count artifact(s) into $output_dir"
         fi
@@ -2882,10 +3014,40 @@ EOF
     local manifest_file="$output_dir/${tool_name}-${tag}-manifest.json"
     if [[ $success -gt 0 ]]; then
         # Generate manifest from orchestration result JSON
-        act_generate_manifest "$result" "$manifest_file" 2>/dev/null || true
+        if $build_release_contract_enabled; then
+            local post_build_source_status
+            post_build_source_status=$(git -C "$local_path" status --porcelain --untracked-files=all 2>/dev/null) || {
+                log_error "Could not re-inspect strict release source tree after build"
+                return 6
+            }
+            if [[ -n "$post_build_source_status" ]]; then
+                log_error "Strict release build changed tracked or untracked source; refusing tag-bound manifest"
+                return 6
+            fi
+            if ! act_generate_manifest "$result" "$manifest_file"; then
+                log_error "Strict release manifest generation failed"
+                return 6
+            fi
+            while IFS=$'\t' read -r manifest_name manifest_sha manifest_size; do
+                local collected_path="$output_dir/$manifest_name"
+                local collected_sha collected_size
+                if [[ ! -f "$collected_path" || -L "$collected_path" ]]; then
+                    log_error "Strict manifest primary was not collected: $manifest_name"
+                    return 6
+                fi
+                collected_sha=$(_build_sha256 "$collected_path" 2>/dev/null || true)
+                collected_size=$(_build_file_size "$collected_path")
+                if [[ "$collected_sha" != "$manifest_sha" || "$collected_size" != "$manifest_size" ]]; then
+                    log_error "Collected primary does not match strict manifest: $manifest_name"
+                    return 6
+                fi
+            done < <(jq -r '.artifacts[] | [.name, .sha256, (.size_bytes | tostring)] | @tsv' "$manifest_file")
+        else
+            act_generate_manifest "$result" "$manifest_file" 2>/dev/null || true
+        fi
     fi
 
-    if [[ -f "$manifest_file" && ${#artifact_rename_pairs[@]} -gt 0 ]]; then
+    if ! $build_release_contract_enabled && [[ -f "$manifest_file" && ${#artifact_rename_pairs[@]} -gt 0 ]]; then
         local renames_json updated_manifest
         renames_json=$(printf '%s\n' "${artifact_rename_pairs[@]}" | jq -Rn '
             reduce inputs as $line ({}; 
@@ -2911,11 +3073,11 @@ EOF
         fi
     fi
 
-    if [[ $success -gt 0 ]]; then
+    if [[ $success -gt 0 ]] && ! $build_release_contract_enabled; then
         _build_package_archives "$tool_name" "$version" "$output_dir" "$result" "$target_list" "$manifest_file"
     fi
 
-    if [[ -f "$manifest_file" && ${#extra_manifest_entries[@]} -gt 0 ]]; then
+    if ! $build_release_contract_enabled && [[ -f "$manifest_file" && ${#extra_manifest_entries[@]} -gt 0 ]]; then
         local -A manifest_names=()
         local entry entry_name
         while IFS= read -r entry_name; do
@@ -3259,11 +3421,647 @@ _dispatch_send_all() {
     return 0
 }
 
+_release_file_size() {
+    local file="$1"
+    local size=""
+
+    size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null) || return 1
+    [[ "$size" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$size"
+}
+
+_release_sha256() {
+    local file="$1"
+    local sha=""
+
+    if command -v sha256sum &>/dev/null; then
+        sha=$(sha256sum "$file" 2>/dev/null | awk '{print $1}') || return 1
+    elif command -v shasum &>/dev/null; then
+        sha=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}') || return 1
+    else
+        log_error "No SHA256 implementation available (need sha256sum or shasum)"
+        return 3
+    fi
+
+    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$sha"
+}
+
+_release_sha256_line() {
+    local line="$1"
+    local sha=""
+
+    if command -v sha256sum &>/dev/null; then
+        sha=$(printf '%s\n' "$line" | sha256sum 2>/dev/null | awk '{print $1}') || return 1
+    elif command -v shasum &>/dev/null; then
+        sha=$(printf '%s\n' "$line" | shasum -a 256 2>/dev/null | awk '{print $1}') || return 1
+    else
+        log_error "No SHA256 implementation available (need sha256sum or shasum)"
+        return 3
+    fi
+
+    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$sha"
+}
+
+# Revalidate a frozen strict-release asset immediately before mutation. The
+# preflight proves the same facts earlier, but upload repair must not trust a
+# path whose type or bytes may have changed since that snapshot.
+_release_contract_verify_local_asset() {
+    local file_path="$1"
+    local expected_name="$2"
+    local expected_size="$3"
+    local expected_sha="$4"
+    local actual_size actual_sha
+
+    if [[ -z "$file_path" || ! -f "$file_path" || -L "$file_path" ]]; then
+        log_error "Strict repair asset must be a regular non-symlink file: $file_path"
+        return 1
+    fi
+    if [[ "$(basename "$file_path")" != "$expected_name" ]]; then
+        log_error "Strict repair asset path no longer matches its contracted name: $expected_name"
+        return 1
+    fi
+
+    actual_size=$(_release_file_size "$file_path") || {
+        log_error "Could not determine strict repair asset size: $file_path"
+        return 1
+    }
+    if [[ "$actual_size" != "$expected_size" ]]; then
+        log_error "Strict repair asset size changed after preflight: $expected_name"
+        return 1
+    fi
+
+    actual_sha=$(_release_sha256 "$file_path") || {
+        log_error "Could not hash strict repair asset: $file_path"
+        return 1
+    }
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        log_error "Strict repair asset digest changed after preflight: $expected_name"
+        return 1
+    fi
+    return 0
+}
+
+# Validate an opt-in release contract and return the closed upload plan as JSON.
+# No GitHub mutation is allowed before this succeeds. When generate_sidecars is
+# sidecar_mode is create, verify, or plan. Creation uses noclobber; an existing
+# sidecar is always validated and never overwritten.
+_release_contract_preflight() {
+    local tool_name="$1"
+    local tag="$2"
+    local repo="$3"
+    local local_path="$4"
+    local artifacts_dir="$5"
+    local manifest_file="$6"
+    local contract_json="$7"
+    local sidecar_mode="${8:-verify}"
+
+    case "$sidecar_mode" in
+        create|verify|plan) ;;
+        *)
+            log_error "Invalid strict checksum sidecar mode: $sidecar_mode"
+            return 4
+            ;;
+    esac
+
+    if ! jq -e '
+        type == "object" and
+        .checksum_sidecar == "sha256" and
+        (.exact_primary_assets | type == "object") and
+        (.exact_primary_assets | length > 0)
+    ' <<< "$contract_json" >/dev/null 2>&1; then
+        log_error "Invalid release contract for $tool_name"
+        return 4
+    fi
+
+    if [[ -z "$local_path" || ! -d "$local_path" ]] || ! git -C "$local_path" rev-parse --git-dir >/dev/null 2>&1; then
+        log_error "Strict release contract requires a local git repository for $tool_name"
+        return 4
+    fi
+    if [[ ! -f "$manifest_file" || -L "$manifest_file" ]]; then
+        log_error "Strict release contract requires a regular non-symlink manifest: $manifest_file"
+        return 4
+    fi
+    if ! jq -e . "$manifest_file" >/dev/null 2>&1; then
+        log_error "Build manifest is not valid JSON: $manifest_file"
+        return 4
+    fi
+    local manifest_sha_before manifest_sha_after
+    manifest_sha_before=$(_release_sha256 "$manifest_file") || {
+        log_error "Could not hash strict build manifest: $manifest_file"
+        return 4
+    }
+
+    local expected_count
+    expected_count=$(jq -r '.exact_primary_assets | length' <<< "$contract_json")
+    local expected_dependencies_json='[]'
+    if ! declare -F config_get_release_source_dependencies_json &>/dev/null; then
+        log_error "Strict release dependency-pin helper is unavailable"
+        return 4
+    fi
+    expected_dependencies_json=$(config_get_release_source_dependencies_json "$tool_name") || {
+        log_error "Could not resolve strict release source dependency pins"
+        return 4
+    }
+    if ! jq -e \
+        --arg tool "$tool_name" \
+        --arg tag "$tag" \
+        --argjson expected_count "$expected_count" \
+        --argjson expected_dependencies "$expected_dependencies_json" \
+        --argjson contract "$contract_json" '
+        .tool == $tool and
+        .version == $tag and
+        (.source | type == "object") and
+        .source.git_ref == $tag and
+        (.source.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+        .source.dependencies == $expected_dependencies and
+        .status == "success" and
+        (.summary | type == "object") and
+        .summary.total == $expected_count and
+        .summary.success == $expected_count and
+        .summary.failed == 0 and
+        (.artifacts | type == "array") and
+        (.artifacts | length == $expected_count) and
+        ([.artifacts[].target] | unique | length) == $expected_count and
+        ([.artifacts[].name] | unique | length) == $expected_count and
+        ([.artifacts[] | {key: .target, value: .name}] | from_entries) == $contract.exact_primary_assets and
+        all(.artifacts[];
+            (.target | type == "string") and
+            (.name | type == "string") and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            (.size_bytes | type == "number" and floor == . and . > 0)
+        )
+    ' "$manifest_file" >/dev/null 2>&1; then
+        log_error "Build manifest does not satisfy the exact release contract"
+        return 4
+    fi
+
+    local -a primary_targets=()
+    local -a primary_names=()
+    local -a primary_paths=()
+    local -a primary_shas=()
+    local -a primary_sizes=()
+    local target name manifest_sha manifest_size file_path actual_sha actual_size
+
+    while IFS=$'\t' read -r target name; do
+        [[ -n "$target" && -n "$name" ]] || {
+            log_error "Release contract contains an empty target or primary asset"
+            return 4
+        }
+
+        file_path="$artifacts_dir/$name"
+        if [[ ! -f "$file_path" || -L "$file_path" ]]; then
+            log_error "Primary release asset must be a regular non-symlink file: $file_path"
+            return 4
+        fi
+
+        manifest_sha=$(jq -r --arg target "$target" --arg name "$name" \
+            '.artifacts[] | select(.target == $target and .name == $name) | .sha256' "$manifest_file")
+        manifest_size=$(jq -r --arg target "$target" --arg name "$name" \
+            '.artifacts[] | select(.target == $target and .name == $name) | .size_bytes' "$manifest_file")
+        actual_sha=$(_release_sha256 "$file_path") || {
+            log_error "Could not compute SHA256 for primary asset: $file_path"
+            return 4
+        }
+        actual_size=$(_release_file_size "$file_path") || {
+            log_error "Could not determine size for primary asset: $file_path"
+            return 4
+        }
+
+        if [[ "$actual_sha" != "$manifest_sha" || "$actual_size" != "$manifest_size" ]]; then
+            log_error "Primary asset does not match manifest hash/size: $name"
+            return 4
+        fi
+
+        primary_targets+=("$target")
+        primary_names+=("$name")
+        primary_paths+=("$file_path")
+        primary_shas+=("$actual_sha")
+        primary_sizes+=("$actual_size")
+    done < <(jq -r '.exact_primary_assets | to_entries | sort_by(.key)[] | [.key, .value] | @tsv' <<< "$contract_json")
+
+    if [[ ${#primary_names[@]} -ne $expected_count ]]; then
+        log_error "Release contract target count changed during preflight"
+        return 4
+    fi
+
+    if ! git_ops_tag_exists "$local_path" "$tag"; then
+        log_error "Tag $tag does not exist in $local_path"
+        return 4
+    fi
+
+    local head_sha local_tag_sha remote_tag_sha manifest_git_sha
+    head_sha=$(git -C "$local_path" rev-parse --verify HEAD 2>/dev/null) || {
+        log_error "Could not resolve HEAD in $local_path"
+        return 4
+    }
+    local_tag_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null) || {
+        log_error "Could not dereference local tag $tag"
+        return 4
+    }
+    remote_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null) || {
+        log_error "Could not dereference GitHub tag $tag in $repo"
+        return 4
+    }
+    manifest_git_sha=$(jq -r '.source.git_sha' "$manifest_file")
+
+    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$local_tag_sha" =~ ^[0-9a-f]{40}$ || ! "$remote_tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        log_error "Release tag identity must resolve to 40-hex commit SHAs"
+        return 4
+    fi
+    if [[ "$head_sha" != "$local_tag_sha" ]] || [[ "$head_sha" != "$remote_tag_sha" ]] || \
+        [[ "$head_sha" != "$manifest_git_sha" ]]; then
+        log_error "Release identity mismatch: HEAD, local tag, GitHub tag, and manifest git_sha must match"
+        return 4
+    fi
+
+    local idx sidecar sidecar_line sidecar_sha sidecar_size
+    local expected_sidecar_sha expected_sidecar_size actual_sidecar_sha actual_sidecar_size
+    local -a planned_assets=()
+    for ((idx = 0; idx < ${#primary_names[@]}; idx++)); do
+        name="${primary_names[$idx]}"
+        target="${primary_targets[$idx]}"
+        file_path="${primary_paths[$idx]}"
+        actual_sha="${primary_shas[$idx]}"
+        actual_size="${primary_sizes[$idx]}"
+        sidecar="${file_path}.sha256"
+        sidecar_line="$actual_sha  $name"
+        expected_sidecar_size=$(printf '%s\n' "$sidecar_line" | wc -c | tr -d '[:space:]')
+        expected_sidecar_sha=$(_release_sha256_line "$sidecar_line") || return 4
+
+        if [[ "$sidecar_mode" == "create" && ! -e "$sidecar" && ! -L "$sidecar" ]]; then
+            if ! (set -o noclobber; printf '%s\n' "$sidecar_line" > "$sidecar"); then
+                log_error "Could not create checksum sidecar without clobbering: $sidecar"
+                return 4
+            fi
+        fi
+
+        if [[ "$sidecar_mode" != "plan" || -e "$sidecar" || -L "$sidecar" ]]; then
+            if [[ ! -f "$sidecar" || -L "$sidecar" ]]; then
+                log_error "Checksum sidecar must be a regular non-symlink file: $sidecar"
+                return 4
+            fi
+            actual_sidecar_size=$(_release_file_size "$sidecar") || return 4
+            actual_sidecar_sha=$(_release_sha256 "$sidecar") || return 4
+            if [[ "$actual_sidecar_size" != "$expected_sidecar_size" || \
+                  "$actual_sidecar_sha" != "$expected_sidecar_sha" ]]; then
+                log_error "Checksum sidecar verification failed: $sidecar"
+                return 4
+            fi
+        fi
+        sidecar_size="$expected_sidecar_size"
+        sidecar_sha="$expected_sidecar_sha"
+
+        planned_assets+=("$(jq -nc \
+            --arg target "$target" \
+            --arg name "$name" \
+            --arg path "$file_path" \
+            --arg sha256 "$actual_sha" \
+            --argjson size_bytes "$actual_size" \
+            '{target: $target, name: $name, path: $path, sha256: $sha256, size_bytes: $size_bytes, kind: "primary"}')")
+        planned_assets+=("$(jq -nc \
+            --arg target "$target" \
+            --arg name "${name}.sha256" \
+            --arg path "$sidecar" \
+            --arg sha256 "$sidecar_sha" \
+            --arg source_sha256 "$actual_sha" \
+            --argjson size_bytes "$sidecar_size" \
+            '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, size_bytes: $size_bytes, kind: "checksum"}')")
+    done
+
+    manifest_sha_after=$(_release_sha256 "$manifest_file") || return 4
+    if [[ "$manifest_sha_before" != "$manifest_sha_after" ]]; then
+        log_error "Strict build manifest changed during preflight"
+        return 4
+    fi
+
+    local assets_json
+    assets_json=$(printf '%s\n' "${planned_assets[@]}" | jq -sc '.') || return 4
+    jq -nc \
+        --arg tool "$tool_name" \
+        --arg tag "$tag" \
+        --arg repo "$repo" \
+        --arg manifest_file "$manifest_file" \
+        --arg manifest_sha256 "$manifest_sha_after" \
+        --arg git_sha "$head_sha" \
+        --argjson dependencies "$expected_dependencies_json" \
+        --argjson contract "$contract_json" \
+        --argjson assets "$assets_json" \
+        '{
+            tool: $tool,
+            tag: $tag,
+            repo: $repo,
+            manifest_file: $manifest_file,
+            manifest_sha256: $manifest_sha256,
+            git_sha: $git_sha,
+            dependencies: $dependencies,
+            contract: $contract,
+            assets: $assets
+        }'
+}
+
+# Resolve the remote tag without cache and require it to retain the frozen
+# release-plan commit identity.
+_release_contract_verify_remote_tag_identity() {
+    local repo="$1"
+    local tag="$2"
+    local expected_git_sha="$3"
+    local remote_git_sha=""
+
+    if [[ ! "$expected_git_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        log_error "Strict release plan contains an invalid git SHA"
+        return 1
+    fi
+    remote_git_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null) || {
+        log_error "Could not resolve remote release tag immediately before publication"
+        return 1
+    }
+    if [[ "$remote_git_sha" != "$expected_git_sha" ]]; then
+        log_error "Remote release tag moved after strict preflight"
+        return 1
+    fi
+}
+
+# Fetch a release and require its remote asset names and byte sizes to match the
+# preflight plan exactly. expected_draft is true, false, or any.
+_release_contract_verify_remote_assets() {
+    local repo="$1"
+    local release_id="$2"
+    local expected_assets_json="$3"
+    local expected_draft="${4:-any}"
+    local expected_tag="${5:-}"
+    local expected_metadata_json="${6:-null}"
+    local release_json=""
+
+    if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "GitHub release ID is invalid: $release_id"
+        return 1
+    fi
+    if [[ -z "$expected_tag" ]]; then
+        log_error "Expected release tag is required for strict remote verification"
+        return 1
+    fi
+    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || {
+        log_error "Could not fetch draft release for remote verification"
+        return 1
+    }
+    if ! jq -e \
+        --argjson release_id "$release_id" \
+        --arg expected_tag "$expected_tag" '
+            .id == $release_id and
+            .tag_name == $expected_tag and
+            (.assets | type == "array")
+        ' \
+        <<< "$release_json" >/dev/null 2>&1; then
+        log_error "GitHub returned an invalid or wrong-tag release during remote verification"
+        return 1
+    fi
+
+    case "$expected_draft" in
+        true|false)
+            if ! jq -e --argjson expected "$expected_draft" '.draft == $expected' \
+                <<< "$release_json" >/dev/null 2>&1; then
+                log_error "GitHub release draft state changed before verification"
+                return 1
+            fi
+            ;;
+        any) ;;
+        *)
+            log_error "Invalid expected draft state: $expected_draft"
+            return 1
+            ;;
+    esac
+
+    if [[ "$expected_metadata_json" != "null" ]] && ! jq -e \
+        --argjson expected "$expected_metadata_json" '
+            .name == $expected.name and
+            .body == $expected.body and
+            .prerelease == $expected.prerelease
+        ' <<< "$release_json" >/dev/null 2>&1; then
+        log_error "GitHub release metadata changed during strict verification"
+        return 1
+    fi
+
+    if ! jq -e '
+        all(.assets[];
+            (.id | type == "number" and floor == . and . > 0) and
+            (.state == "uploaded") and
+            (.name | type == "string" and length > 0) and
+            (.size | type == "number" and floor == . and . >= 0) and
+            (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+        ) and
+        (([.assets[].id] | unique | length) == (.assets | length)) and
+        (([.assets[].name] | unique | length) == (.assets | length))
+    ' <<< "$release_json" >/dev/null 2>&1; then
+        log_error "GitHub release contains incomplete or duplicate asset records"
+        return 1
+    fi
+
+    if ! jq -en \
+        --argjson expected "$expected_assets_json" \
+        --argjson actual "$(jq -c '.assets' <<< "$release_json")" '
+        def normalized_expected:
+            map({name: .name, size_bytes: .size_bytes, digest: ("sha256:" + .sha256)}) |
+            sort_by(.name, .size_bytes, .digest);
+        def normalized_actual:
+            map({name: .name, size_bytes: .size, digest: .digest}) |
+            sort_by(.name, .size_bytes, .digest);
+        ($expected | normalized_expected) == ($actual | normalized_actual)
+    ' >/dev/null 2>&1; then
+        local comparison
+        comparison=$(jq -nc \
+            --argjson expected "$expected_assets_json" \
+            --argjson actual "$(jq -c '.assets' <<< "$release_json")" '
+            {
+                expected: ($expected | map({name, size_bytes}) | sort_by(.name)),
+                actual: ($actual | map({name, size_bytes: .size}) | sort_by(.name))
+            }')
+        log_error "Remote release assets do not match the exact contract: $comparison"
+        return 1
+    fi
+
+    printf '%s\n' "$release_json"
+}
+
+_release_contract_observe_draft_state() {
+    local repo="$1"
+    local release_id="$2"
+    local release_json=""
+
+    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || return 1
+    jq -er \
+        --argjson release_id "$release_id" '
+            if .id == $release_id and (.draft | type == "boolean")
+            then .draft
+            else error("invalid release state")
+            end
+        ' <<< "$release_json" 2>/dev/null
+}
+
+_release_contract_restore_draft() {
+    local repo="$1"
+    local release_id="$2"
+    local expected_tag="$3"
+    local attempt observed_state=""
+    local max_attempts=3
+    local retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
+
+    [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        # A transport error is ambiguous: the PATCH may have committed. Always
+        # observe the release state before deciding whether another attempt is needed.
+        gh_api "repos/$repo/releases/$release_id" \
+            --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || true
+        observed_state=$(_release_contract_observe_draft_state \
+            "$repo" "$release_id" 2>/dev/null || true)
+        if [[ "$observed_state" == "true" ]]; then
+            log_warn "Restored strict release $expected_tag to draft after failed publication verification"
+            return 0
+        fi
+        if ((attempt < max_attempts && retry_delay > 0)); then
+            sleep "$retry_delay"
+        fi
+    done
+
+    log_error "Strict release could not be confirmed as draft after $max_attempts rollback attempts"
+    return 1
+}
+
+_release_contract_confirm_or_restore_draft() {
+    local repo="$1"
+    local release_id="$2"
+    local expected_tag="$3"
+    local observed_state=""
+
+    observed_state=$(_release_contract_observe_draft_state \
+        "$repo" "$release_id" 2>/dev/null || true)
+    if [[ "$observed_state" == "true" ]]; then
+        return 0
+    fi
+    _release_contract_restore_draft "$repo" "$release_id" "$expected_tag"
+}
+
+# Authenticated release lists include drafts, unlike the tag-specific release
+# endpoint. Scan every page without cache and return a closed zero-or-one match
+# result; duplicate exact tags or malformed pagination fail closed.
+_release_contract_scan_release_by_tag() {
+    local repo="$1"
+    local expected_tag="$2"
+    local page=1 page_json="" page_count=0
+    local max_pages=1000
+    local matches='[]'
+
+    while ((page <= max_pages)); do
+        page_json=$(gh_api "repos/$repo/releases?per_page=100&page=$page" \
+            --no-cache 2>/dev/null) || {
+            log_error "Could not scan GitHub releases for strict tag $expected_tag"
+            return 1
+        }
+        if ! jq -e 'type == "array" and length <= 100' \
+            <<< "$page_json" >/dev/null 2>&1; then
+            log_error "GitHub returned an invalid strict release-list page"
+            return 1
+        fi
+        matches=$(jq -nc \
+            --arg expected_tag "$expected_tag" \
+            --argjson prior "$matches" \
+            --argjson page "$page_json" \
+            '$prior + [$page[] | select(.tag_name == $expected_tag)]') || return 1
+        if [[ $(jq 'length' <<< "$matches") -gt 1 ]]; then
+            log_error "Multiple GitHub releases use strict tag $expected_tag"
+            return 1
+        fi
+        page_count=$(jq 'length' <<< "$page_json")
+        ((page_count < 100)) && break
+        page=$((page + 1))
+    done
+
+    if ((page > max_pages)); then
+        log_error "Strict release-list scan exceeded $max_pages pages"
+        return 1
+    fi
+    jq -nc --argjson matches "$matches" '{count: ($matches | length), release: ($matches[0] // null)}'
+}
+
+_release_contract_observe_bound_draft() {
+    local repo="$1"
+    local release_id="$2"
+    local expected_tag="$3"
+    local release_json=""
+
+    [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || return 1
+    if ! jq -e \
+        --argjson release_id "$release_id" \
+        --arg expected_tag "$expected_tag" '
+        .id == $release_id and
+        .tag_name == $expected_tag and
+        .draft == true and
+        (.upload_url | type == "string" and length > 0) and
+        (.assets | type == "array")
+    ' <<< "$release_json" >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s\n' "$release_json"
+}
+
+_release_contract_confirm_or_restore_bound_draft() {
+    local repo="$1"
+    local release_id="$2"
+    local expected_tag="$3"
+    local release_json="" attempt
+    local max_attempts=3
+    local retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
+
+    [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
+    [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    release_json=$(gh_api "repos/$repo/releases/$release_id" --no-cache 2>/dev/null) || return 1
+    if ! jq -e \
+        --argjson release_id "$release_id" \
+        --arg expected_tag "$expected_tag" '
+        .id == $release_id and
+        .tag_name == $expected_tag and
+        (.draft | type == "boolean")
+    ' <<< "$release_json" >/dev/null 2>&1; then
+        log_error "Strict draft reconciliation refused a wrong-ID or wrong-tag release"
+        return 1
+    fi
+    if jq -e '.draft == true' <<< "$release_json" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        gh_api "repos/$repo/releases/$release_id" \
+            --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || true
+        if _release_contract_observe_bound_draft \
+            "$repo" "$release_id" "$expected_tag" >/dev/null 2>&1; then
+            log_warn "Restored strict release $expected_tag to its ID-bound draft"
+            return 0
+        fi
+        if ((attempt < max_attempts && retry_delay > 0)); then
+            sleep "$retry_delay"
+        fi
+    done
+
+    log_error "Strict release could not be restored to an ID/tag-bound draft"
+    return 1
+}
+
+_release_contract_create_nonce() {
+    local nonce=""
+
+    nonce=$(od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d '[:space:]') || return 1
+    [[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$nonce"
+}
+
 cmd_release() {
     local tool_name=""
     local version=""
     local artifacts_dir=""
     local draft=false
+    local requested_draft=false
     local prerelease=false
     local generate_notes=false
     local verify_tag=false
@@ -3403,6 +4201,7 @@ EOF
                 ;;
         esac
     done
+    requested_draft=$draft
 
     # Validate required arguments
     if [[ -z "$tool_name" ]]; then
@@ -3456,6 +4255,19 @@ EOF
     local tag
     tag=$(git_ops_version_to_tag "$version")
 
+    local release_contract_json="null"
+    local release_contract_enabled=false
+    if declare -F config_get_release_contract_json &>/dev/null; then
+        if ! config_validate_release_contract "$tool_name"; then
+            log_error "Release contract validation failed for $tool_name"
+            return 4
+        fi
+        release_contract_json=$(config_get_release_contract_json "$tool_name") || return $?
+        if [[ "$release_contract_json" != "null" ]]; then
+            release_contract_enabled=true
+        fi
+    fi
+
     log_info "Releasing $tool_name $version to $repo"
     log_set_tool "$tool_name"
 
@@ -3498,8 +4310,68 @@ EOF
     if [[ -f "$manifest_file" ]]; then
         manifest_exists=true
         log_info "Using manifest: $manifest_file"
+    elif $release_contract_enabled; then
+        log_error "Strict release contract requires manifest: $manifest_file"
+        return 4
     else
         log_warn "No manifest found, will upload all files in artifacts directory"
+    fi
+
+    # Freeze user-visible release metadata before the strict upload plan is
+    # computed. The same object is required at creation and every remote check.
+    local release_body="Release $version"
+    if $generate_notes && [[ -n "$local_path" && -d "$local_path" ]]; then
+        local prev_tag
+        prev_tag=$(git -C "$local_path" describe --tags --abbrev=0 "$tag^" 2>/dev/null || echo "")
+        if [[ -n "$prev_tag" ]]; then
+            local commit_log
+            commit_log=$(git -C "$local_path" log --oneline "$prev_tag..$tag" 2>/dev/null | head -20)
+            if [[ -n "$commit_log" ]]; then
+                release_body="## Changes since $prev_tag"$'\n\n'"$commit_log"
+            fi
+        fi
+    fi
+
+    if $release_contract_enabled; then
+        local release_create_nonce=""
+        release_create_nonce=$(_release_contract_create_nonce) || {
+            log_error "Could not generate a cryptographic strict-release create nonce"
+            return 4
+        }
+        release_body+=$'\n\n'"<!-- dsr-create-nonce:$release_create_nonce -->"
+    fi
+
+    local release_contract_plan='{}'
+    local release_contract_metadata_json='null'
+    local release_contract_git_sha=""
+    if $release_contract_enabled; then
+        local contract_sidecar_mode="create"
+        $DRY_RUN && contract_sidecar_mode="plan"
+        if ! release_contract_plan=$(_release_contract_preflight \
+            "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
+            "$manifest_file" "$release_contract_json" "$contract_sidecar_mode"); then
+            return 4
+        fi
+        release_contract_git_sha=$(jq -r '.git_sha' <<< "$release_contract_plan")
+        release_contract_metadata_json=$(jq -nc \
+            --arg tag_name "$tag" \
+            --arg name "$tag" \
+            --arg body "$release_body" \
+            --arg target_commitish "$release_contract_git_sha" \
+            --argjson prerelease "$prerelease" \
+            --argjson requested_draft "$requested_draft" '
+            {
+                tag_name: $tag_name,
+                name: $name,
+                body: $body,
+                target_commitish: $target_commitish,
+                prerelease: $prerelease,
+                requested_draft: $requested_draft
+            }') || return 4
+        release_contract_plan=$(jq -c \
+            --argjson release "$release_contract_metadata_json" \
+            '. + {release: $release}' <<< "$release_contract_plan") || return 4
+        log_ok "Strict release contract preflight passed"
     fi
 
     # Dry-run mode: show planned actions and exit
@@ -3510,12 +4382,26 @@ EOF
         log_info "  Repo:        $repo"
         log_info "  Artifacts:   $artifacts_dir"
         log_info "  Manifest:    $($manifest_exists && echo "$manifest_file" || echo "(none)")"
-        log_info "  Draft:       $draft"
+        if $release_contract_enabled; then
+            if $requested_draft; then
+                log_info "  Draft:       retained after exact remote verification"
+            else
+                log_info "  Draft:       staging draft, published only after exact remote verification"
+            fi
+        else
+            log_info "  Draft:       $draft"
+        fi
         log_info "  Prerelease:  $prerelease"
 
         # List files that would be uploaded
         local file_count=0
-        if $manifest_exists && [[ -f "$manifest_file" ]]; then
+        if $release_contract_enabled; then
+            while IFS= read -r name; do
+                [[ -z "$name" ]] && continue
+                log_info "  Would upload: $name"
+                file_count=$((file_count + 1))
+            done < <(jq -r '.assets[].name' <<< "$release_contract_plan")
+        elif $manifest_exists && [[ -f "$manifest_file" ]]; then
             while IFS= read -r name; do
                 [[ -z "$name" ]] && continue
                 if [[ -f "$artifacts_dir/$name" ]]; then
@@ -3537,7 +4423,7 @@ EOF
                 --arg version "$tag" \
                 --arg repo "$repo" \
                 --arg artifacts_dir "$artifacts_dir" \
-                --argjson draft "$draft" \
+                --argjson draft "$requested_draft" \
                 --argjson prerelease "$prerelease" \
                 --argjson file_count "$file_count" \
                 '{tool: $tool, version: $version, repo: $repo, artifacts_dir: $artifacts_dir, draft: $draft, prerelease: $prerelease, file_count: $file_count, mode: "dry_run"}')"
@@ -3551,24 +4437,97 @@ EOF
 
     # Create or get release
     local release_json release_id upload_url release_url
+
+    _release_contract_require_tag_release_absent() {
+        local check_repo="$1"
+        local check_tag="$2"
+        local scan_json="" match_count=""
+
+        scan_json=$(_release_contract_scan_release_by_tag \
+            "$check_repo" "$check_tag") || return 1
+        match_count=$(jq -r '.count' <<< "$scan_json")
+        if [[ "$match_count" != "0" ]]; then
+            log_error "Strict release refused an existing release for tag $check_tag"
+            return 1
+        fi
+        return 0
+    }
+
+    _release_contract_observe_owned_release() {
+        local observe_repo="$1"
+        local observe_release_id="$2"
+        local expected_metadata_json="$3"
+        local observed_json=""
+
+        [[ "$observe_release_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        observed_json=$(gh_api "repos/$observe_repo/releases/$observe_release_id" \
+            --no-cache 2>/dev/null) || return 1
+        if ! jq -e \
+            --argjson release_id "$observe_release_id" \
+            --argjson expected "$expected_metadata_json" '
+            .id == $release_id and
+            .tag_name == $expected.tag_name and
+            .name == $expected.name and
+            .body == $expected.body and
+            .prerelease == $expected.prerelease and
+            (.target_commitish | type == "string" and length > 0) and
+            (.draft | type == "boolean") and
+            (.upload_url | type == "string" and length > 0) and
+            (.html_url | type == "string" and length > 0) and
+            (.assets | type == "array")
+        ' <<< "$observed_json" >/dev/null 2>&1; then
+            return 1
+        fi
+        printf '%s\n' "$observed_json"
+    }
+
+    _release_contract_confirm_or_restore_owned_draft() {
+        local restore_repo="$1"
+        local restore_release_id="$2"
+        local expected_metadata_json="$3"
+        local observed_json="" attempt
+        local max_attempts=3
+        local retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
+
+        [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
+        for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            # Every PATCH is preceded by a fresh ownership proof. An ID/tag
+            # match alone must never authorize mutation after ambiguous create.
+            observed_json=$(_release_contract_observe_owned_release \
+                "$restore_repo" "$restore_release_id" "$expected_metadata_json" \
+                2>/dev/null || true)
+            [[ -n "$observed_json" ]] || return 1
+            if jq -e '.draft == true' <<< "$observed_json" >/dev/null 2>&1; then
+                return 0
+            fi
+
+            gh_api "repos/$restore_repo/releases/$restore_release_id" \
+                --method PATCH --data '{"draft":true}' --no-cache >/dev/null 2>&1 || true
+            observed_json=$(_release_contract_observe_owned_release \
+                "$restore_repo" "$restore_release_id" "$expected_metadata_json" \
+                2>/dev/null || true)
+            if [[ -n "$observed_json" ]] && \
+               jq -e '.draft == true' <<< "$observed_json" >/dev/null 2>&1; then
+                return 0
+            fi
+            if ((attempt < max_attempts && retry_delay > 0)); then
+                sleep "$retry_delay"
+            fi
+        done
+        return 1
+    }
+
     log_info "Creating GitHub release for $tag..."
 
     local release_args=""
-    $draft && release_args+=" --draft"
+    if $release_contract_enabled || $requested_draft; then
+        release_args+=" --draft"
+    fi
     $prerelease && release_args+=" --prerelease"
-
-    # Build release body
-    local release_body="Release $version"
-    if $generate_notes && [[ -n "$local_path" && -d "$local_path" ]]; then
-        # Try to get previous tag for comparison
-        local prev_tag
-        prev_tag=$(git -C "$local_path" describe --tags --abbrev=0 "$tag^" 2>/dev/null || echo "")
-        if [[ -n "$prev_tag" ]]; then
-            local commit_log
-            commit_log=$(git -C "$local_path" log --oneline "$prev_tag..$tag" 2>/dev/null | head -20)
-            if [[ -n "$commit_log" ]]; then
-                release_body="## Changes since $prev_tag"$'\n\n'"$commit_log"
-            fi
+    if $release_contract_enabled; then
+        release_args+=" --target-commitish $release_contract_git_sha"
+        if ! _release_contract_require_tag_release_absent "$repo" "$tag"; then
+            return 7
         fi
     fi
 
@@ -3577,16 +4536,49 @@ EOF
     local create_status=$?
 
     if [[ $create_status -ne 0 ]]; then
-        # Check if release already exists
-        release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
-        if [[ -n "$release_json" ]] && echo "$release_json" | jq -e '.id' &>/dev/null; then
-            log_info "Release $tag already exists, using existing release"
-        else
-            log_error "Failed to create release: $release_json"
-            if $JSON_MODE; then
-                json_envelope "release" "error" 7 "$(jq -nc --arg error "$release_json" '{error: $error}')"
+        if $release_contract_enabled; then
+            local create_error="$release_json"
+            local observed_release_scan="" observed_release_id=""
+            local observed_owned_release_json=""
+            observed_release_scan=$(_release_contract_scan_release_by_tag \
+                "$repo" "$tag" 2>/dev/null || true)
+            observed_release_id=$(jq -r \
+                'if .count == 1 then .release.id // empty else empty end' \
+                <<< "$observed_release_scan" 2>/dev/null)
+            observed_owned_release_json=$(_release_contract_observe_owned_release \
+                "$repo" "$observed_release_id" "$release_contract_metadata_json" \
+                2>/dev/null || true)
+            if [[ -n "$observed_owned_release_json" ]] && \
+               jq -e '.draft == true and (.assets | length == 0)' \
+                <<< "$observed_owned_release_json" >/dev/null 2>&1 && \
+               _release_contract_verify_remote_tag_identity \
+                "$repo" "$tag" "$release_contract_git_sha"; then
+                release_json="$observed_owned_release_json"
+                log_warn "Create response failed, but no-cache observation confirmed the exact new empty draft"
+            else
+                log_error "Failed to create an exact staging draft: $create_error"
+                # The ID/tag pair is not an ownership proof. Only a fresh
+                # ID-bound observation carrying this invocation's nonce and
+                # frozen metadata may be mutated after an ambiguous create.
+                if [[ -n "$observed_owned_release_json" ]]; then
+                    _release_contract_confirm_or_restore_owned_draft \
+                        "$repo" "$observed_release_id" \
+                        "$release_contract_metadata_json" >/dev/null 2>&1 || true
+                fi
+                return 7
             fi
-            return 7
+        else
+            # Check if release already exists
+            release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
+            if [[ -n "$release_json" ]] && echo "$release_json" | jq -e '.id' &>/dev/null; then
+                log_info "Release $tag already exists, using existing release"
+            else
+                log_error "Failed to create release: $release_json"
+                if $JSON_MODE; then
+                    json_envelope "release" "error" 7 "$(jq -nc --arg error "$release_json" '{error: $error}')"
+                fi
+                return 7
+            fi
         fi
     fi
 
@@ -3594,7 +4586,39 @@ EOF
     upload_url=$(echo "$release_json" | jq -r '.upload_url')
     release_url=$(echo "$release_json" | jq -r '.html_url')
 
-    log_ok "Release created: $release_url"
+    if $release_contract_enabled; then
+        if ! jq -e \
+            --argjson expected "$release_contract_metadata_json" '
+            (.id | type == "number" and floor == . and . > 0) and
+            (.upload_url | type == "string" and length > 0) and
+            (.html_url | type == "string" and length > 0) and
+            .tag_name == $expected.tag_name and
+            .name == $expected.name and
+            .body == $expected.body and
+            .prerelease == $expected.prerelease and
+            .draft == true and
+            (.assets | type == "array" and length == 0)
+        ' <<< "$release_json" >/dev/null 2>&1; then
+            log_error "GitHub did not create a new empty draft release for strict upload"
+            local observed_owned_release_json=""
+            observed_owned_release_json=$(_release_contract_observe_owned_release \
+                "$repo" "$release_id" "$release_contract_metadata_json" \
+                2>/dev/null || true)
+            if [[ -n "$observed_owned_release_json" ]]; then
+                _release_contract_confirm_or_restore_owned_draft \
+                    "$repo" "$release_id" \
+                    "$release_contract_metadata_json" >/dev/null 2>&1 || true
+            fi
+            return 7
+        fi
+        draft=true
+    fi
+
+    if $release_contract_enabled; then
+        log_ok "Staging draft created: $release_url"
+    else
+        log_ok "Release created: $release_url"
+    fi
 
     # Cache existing release assets to avoid duplicate upload failures
     local -A release_asset_ids=()
@@ -3610,6 +4634,8 @@ EOF
     local uploaded_assets=()
     local failed_assets=()
     local skipped_assets=()
+    local strict_upload_response_failures=()
+    local -A strict_upload_response_failure_names=()
 
     _release_add_file() {
         local file="$1"
@@ -3620,6 +4646,14 @@ EOF
         fi
     }
 
+    if $release_contract_enabled; then
+        # The strict plan is closed: primaries plus exactly one checksum sidecar
+        # per primary. Do not discover manifests, evidence, SBOMs, signatures,
+        # aliases, or any other directory contents here.
+        while IFS= read -r file_path; do
+            [[ -n "$file_path" ]] && _release_add_file "$file_path"
+        done < <(jq -r '.assets[].path' <<< "$release_contract_plan")
+    else
     # === Generate SHA256SUMS + per-asset .sha256 for installer verification ===
     # Creates a standard SHA256SUMS file with entries for every name an artifact
     # will be uploaded as (primary, versioned, compat, and arch aliases) AND a
@@ -3756,14 +4790,29 @@ EOF
             _release_add_file "$file"
         done < <(find "$artifacts_dir" -maxdepth 1 -type f 2>/dev/null)
     fi
+    fi
 
     local total_files=${#files_to_upload[@]}
+    if $release_contract_enabled; then
+        local expected_upload_count
+        expected_upload_count=$(jq -r '.assets | length' <<< "$release_contract_plan")
+        if [[ $total_files -ne $expected_upload_count ]]; then
+            log_error "Strict upload plan is incomplete before upload"
+            _release_contract_confirm_or_restore_bound_draft \
+                "$repo" "$release_id" "$tag" >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
     log_info "Uploading $total_files file(s)..."
 
     # Upload state for resume
     local upload_state_file="$state_dir/releases/${tool_name}-${tag}-upload.json"
     if ! mkdir -p "$(dirname "$upload_state_file")"; then
         log_error "Failed to create releases directory"
+        if $release_contract_enabled; then
+            _release_contract_confirm_or_restore_bound_draft \
+                "$repo" "$release_id" "$tag" >/dev/null 2>&1 || true
+        fi
         return 1
     fi
 
@@ -3881,8 +4930,63 @@ EOF
             *.zip) content_type="application/zip" ;;
             *.json) content_type="application/json" ;;
             *.txt) content_type="text/plain" ;;
+            *.sha256) content_type="text/plain" ;;
             *.minisig) content_type="text/plain" ;;
         esac
+
+        if $release_contract_enabled; then
+            local planned_asset planned_kind planned_size planned_sha current_sha
+            planned_asset=$(jq -c --arg name "$filename" '.assets[] | select(.name == $name)' \
+                <<< "$release_contract_plan")
+            planned_kind=$(jq -r '.kind' <<< "$planned_asset")
+            planned_size=$(jq -r '.size_bytes' <<< "$planned_asset")
+
+            if [[ -z "$planned_asset" || ! -f "$file" || -L "$file" || "$size_bytes" != "$planned_size" ]]; then
+                log_error "[$idx/$total_files] Strict asset changed after preflight: $filename"
+                _release_record_failed "$filename" "Asset changed after strict preflight"
+                continue
+            fi
+
+            if [[ "$planned_kind" == "primary" ]]; then
+                planned_sha=$(jq -r '.sha256' <<< "$planned_asset")
+                current_sha=$(_release_sha256 "$file" 2>/dev/null || true)
+                if [[ "$current_sha" != "$planned_sha" ]]; then
+                    log_error "[$idx/$total_files] Primary checksum changed after preflight: $filename"
+                    _release_record_failed "$filename" "Primary checksum changed after strict preflight"
+                    continue
+                fi
+            elif [[ "$planned_kind" == "checksum" ]]; then
+                planned_sha=$(jq -r '.sha256' <<< "$planned_asset")
+                current_sha=$(_release_sha256 "$file" 2>/dev/null || true)
+                if [[ "$current_sha" != "$planned_sha" ]]; then
+                    log_error "[$idx/$total_files] Checksum sidecar changed after preflight: $filename"
+                    _release_record_failed "$filename" "Checksum sidecar changed after strict preflight"
+                    continue
+                fi
+            else
+                log_error "[$idx/$total_files] Unknown strict asset kind: $filename"
+                _release_record_failed "$filename" "Unknown strict asset kind"
+                continue
+            fi
+
+            log_info "[$idx/$total_files] Uploading exact contract asset: $filename"
+            local strict_upload_result=""
+            if strict_upload_result=$(gh_upload_asset "$upload_url" "$file" "$content_type" 2>&1); then
+                log_ok "  Uploaded: $filename ($size_bytes bytes)"
+                _release_record_uploaded "$filename" "uploaded" "$size_bytes" "$content_type"
+                uploaded_name_set["$filename"]=1
+            else
+                log_error "  Failed to upload: $filename"
+                _release_record_failed "$filename" "$strict_upload_result"
+                strict_upload_response_failures+=("$(jq -nc \
+                    --arg name "$filename" \
+                    --argjson size_bytes "$size_bytes" \
+                    --arg content_type "$content_type" \
+                    '{name: $name, size_bytes: $size_bytes, content_type: $content_type}')")
+                strict_upload_response_failure_names["$filename"]=1
+            fi
+            continue
+        fi
 
         # Dual-name upload for manifest artifacts (versioned + compat)
         local manifest_target="${manifest_targets[$filename]:-}"
@@ -4008,15 +5112,183 @@ EOF
         fi
     done
 
-    # Calculate duration
-    local end_time duration
-    end_time=$(date +%s)
-    duration=$((end_time - start_time))
-
-    # Verify uploaded assets match manifest (if manifest exists)
+    # Verify uploaded assets match the selected release contract.
     local verification_status="skipped"
     local missing_assets=()
-    if $manifest_exists && [[ -f "$manifest_file" ]]; then
+    if $release_contract_enabled; then
+        local expected_assets_json
+        local upload_failures=${#failed_assets[@]}
+        local remote_verified=false
+        expected_assets_json=$(jq -c '.assets' <<< "$release_contract_plan")
+
+        if _release_contract_verify_remote_assets \
+            "$repo" "$release_id" "$expected_assets_json" true "$tag" \
+            "$release_contract_metadata_json" >/dev/null; then
+            remote_verified=true
+            verification_status="exact"
+            log_ok "Remote draft contains the exact contracted asset set and sizes"
+        else
+            verification_status="incomplete"
+            _release_record_failed "remote-verification" "Remote asset set or size mismatch"
+        fi
+
+        if $remote_verified && [[ ${#strict_upload_response_failures[@]} -gt 0 ]]; then
+            if _release_contract_verify_remote_tag_identity \
+                "$repo" "$tag" "$release_contract_git_sha"; then
+                local -a remaining_failed_assets=()
+                local failed_record failed_name reconciled_record
+                for failed_record in "${failed_assets[@]}"; do
+                    failed_name=$(jq -r '.name // empty' <<< "$failed_record")
+                    if [[ -n "${strict_upload_response_failure_names[$failed_name]:-}" ]]; then
+                        continue
+                    fi
+                    remaining_failed_assets+=("$failed_record")
+                done
+                failed_assets=("${remaining_failed_assets[@]}")
+
+                for reconciled_record in "${strict_upload_response_failures[@]}"; do
+                    local reconciled_name reconciled_size reconciled_content_type
+                    reconciled_name=$(jq -r '.name' <<< "$reconciled_record")
+                    reconciled_size=$(jq -r '.size_bytes' <<< "$reconciled_record")
+                    reconciled_content_type=$(jq -r '.content_type' <<< "$reconciled_record")
+                    _release_record_uploaded "$reconciled_name" "reconciled" \
+                        "$reconciled_size" "$reconciled_content_type"
+                    uploaded_name_set["$reconciled_name"]=1
+                done
+                upload_failures=${#failed_assets[@]}
+                log_warn "Upload response failure(s) reconciled by exact no-cache draft verification"
+            else
+                verification_status="incomplete"
+                _release_record_failed "upload-reconciliation" \
+                    "Remote tag identity changed after ambiguous upload response"
+                upload_failures=${#failed_assets[@]}
+            fi
+        fi
+
+        local publish_preflight_valid=false
+        local current_release_contract_plan=""
+        if [[ $upload_failures -eq 0 ]] && $remote_verified; then
+            if current_release_contract_plan=$(_release_contract_preflight \
+                "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
+                "$manifest_file" "$release_contract_json" verify); then
+                current_release_contract_plan=$(jq -c \
+                    --argjson release "$release_contract_metadata_json" \
+                    '. + {release: $release}' <<< "$current_release_contract_plan") || \
+                    current_release_contract_plan=""
+                if jq -en \
+                    --argjson frozen "$release_contract_plan" \
+                    --argjson current "$current_release_contract_plan" \
+                    '$frozen == $current' >/dev/null 2>&1; then
+                    publish_preflight_valid=true
+                else
+                    _release_record_failed "publish-preflight" \
+                        "Strict release plan changed after upload"
+                    log_error "Strict release plan changed after upload; leaving the staging draft unpublished"
+                fi
+            else
+                _release_record_failed "publish-preflight" \
+                    "Source, artifact, or tag identity changed before publication"
+                log_error "Strict release preflight no longer holds; leaving the staging draft unpublished"
+            fi
+        fi
+
+        if [[ $upload_failures -eq 0 ]] && $remote_verified && $publish_preflight_valid; then
+            local expected_git_sha
+            expected_git_sha=$(jq -r '.git_sha' <<< "$release_contract_plan")
+            if $requested_draft; then
+                if _release_contract_verify_remote_assets \
+                    "$repo" "$release_id" "$expected_assets_json" true "$tag" \
+                    "$release_contract_metadata_json" >/dev/null && \
+                   _release_contract_verify_remote_tag_identity \
+                    "$repo" "$tag" "$expected_git_sha"; then
+                    log_ok "Strict release retained as an exact verified draft by request"
+                else
+                    verification_status="incomplete"
+                    _release_record_failed "draft-verification" \
+                        "Remote draft or tag changed before final verification"
+                    log_error "Strict draft changed before final verification"
+                fi
+            else
+                local publish_release_payload
+                publish_release_payload=$(jq -c '
+                    .release |
+                    {
+                        tag_name,
+                        target_commitish,
+                        name,
+                        body,
+                        prerelease,
+                        draft: false
+                    }
+                ' <<< "$release_contract_plan") || {
+                    _release_contract_confirm_or_restore_bound_draft \
+                        "$repo" "$release_id" "$tag" >/dev/null 2>&1 || true
+                    return 4
+                }
+                if ! _release_contract_verify_remote_assets \
+                    "$repo" "$release_id" "$expected_assets_json" true "$tag" \
+                    "$release_contract_metadata_json" >/dev/null || \
+                   ! _release_contract_verify_remote_tag_identity \
+                    "$repo" "$tag" "$expected_git_sha"; then
+                    verification_status="incomplete"
+                    _release_record_failed "publish" \
+                        "Remote draft or tag changed immediately before publication"
+                    log_error "Remote draft or tag changed immediately before publication"
+                else
+                    local publish_patch_status=0
+                    gh_api "repos/$repo/releases/$release_id" \
+                        --method PATCH --data "$publish_release_payload" \
+                        --no-cache >/dev/null 2>&1 || publish_patch_status=$?
+
+                    local published_release_json=""
+                    local postpublish_assets_valid=false
+                    local postpublish_tag_valid=false
+                    if published_release_json=$(_release_contract_verify_remote_assets \
+                        "$repo" "$release_id" "$expected_assets_json" false "$tag" \
+                        "$release_contract_metadata_json"); then
+                        postpublish_assets_valid=true
+                    fi
+                    if _release_contract_verify_remote_tag_identity \
+                        "$repo" "$tag" "$expected_git_sha"; then
+                        postpublish_tag_valid=true
+                    fi
+
+                    if $postpublish_assets_valid && $postpublish_tag_valid; then
+                        draft=false
+                        local published_url
+                        published_url=$(jq -r '.html_url // empty' <<< "$published_release_json")
+                        [[ -n "$published_url" ]] && release_url="$published_url"
+                        if [[ $publish_patch_status -ne 0 ]]; then
+                            log_warn "Publish response failed, but no-cache observation confirmed the exact public release"
+                        fi
+                        log_ok "Published release after exact remote verification: $release_url"
+                    else
+                        verification_status="incomplete"
+                        local observed_draft_state=""
+                        observed_draft_state=$(_release_contract_observe_draft_state \
+                            "$repo" "$release_id" 2>/dev/null || true)
+                        if [[ "$observed_draft_state" == "true" ]]; then
+                            draft=true
+                            _release_record_failed "publish" \
+                                "Publish attempt left the verified release as a draft"
+                            log_error "Publish attempt did not produce an exact public release"
+                        else
+                            # false means observed public; empty means unreadable. Both
+                            # require a bounded best-effort re-draft before returning.
+                            draft=false
+                            _release_record_failed "publish" \
+                                "Publication state failed exact no-cache verification"
+                            log_error "Publication state failed exact no-cache verification"
+                            if _release_contract_confirm_or_restore_bound_draft \
+                                "$repo" "$release_id" "$tag"; then
+                                draft=true
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    elif $manifest_exists && [[ -f "$manifest_file" ]]; then
         verification_status="ok"
         while IFS= read -r expected_file; do
             [[ -z "$expected_file" ]] && continue
@@ -4046,6 +5318,11 @@ EOF
         done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
     fi
 
+    # Calculate duration after contract verification and publication.
+    local end_time duration
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
     # Build result
     local success_count=${#uploaded_assets[@]}
     local failed_count=${#failed_assets[@]}
@@ -4056,6 +5333,16 @@ EOF
     if [[ $failed_count -gt 0 ]]; then
         status="partial"
         exit_code=1
+    fi
+
+    if $release_contract_enabled && [[ $exit_code -ne 0 ]]; then
+        if _release_contract_confirm_or_restore_bound_draft \
+            "$repo" "$release_id" "$tag"; then
+            draft=true
+        else
+            draft=false
+            log_error "Strict release failure could not confirm a bound draft state"
+        fi
     fi
 
     # Repository dispatch (post-release hook)
@@ -4071,7 +5358,8 @@ EOF
     [[ -n "$dispatch_event_override" ]] && dispatch_event="$dispatch_event_override"
     [[ -n "$dispatch_repos_override" ]] && dispatch_repos="$dispatch_repos_override"
 
-    if _dispatch_is_true "$dispatch_enabled" && [[ -n "$dispatch_repos" ]] && [[ $exit_code -eq 0 ]]; then
+    if _dispatch_is_true "$dispatch_enabled" && [[ -n "$dispatch_repos" ]] && \
+       [[ $exit_code -eq 0 ]] && ! $draft; then
         local git_sha=""
         if [[ -n "$local_path" && -d "$local_path" ]]; then
             git_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null || true)
@@ -4088,6 +5376,8 @@ EOF
             2) dispatch_status="skipped" ;;
             *) dispatch_status="failed" ;;
         esac
+    elif _dispatch_is_true "$dispatch_enabled" && $draft; then
+        log_info "Repository dispatch skipped while release remains a draft"
     elif _dispatch_is_true "$dispatch_enabled" && [[ -z "$dispatch_repos" ]]; then
         log_warn "Dispatch enabled but no target repos configured"
     fi
@@ -4162,7 +5452,7 @@ EOF
     fi
 
     # Run upgrade verification if requested and release succeeded
-    if $verify_upgrade && [[ $exit_code -eq 0 ]]; then
+    if $verify_upgrade && [[ $exit_code -eq 0 ]] && ! $draft; then
         echo ""
         log_info "Running post-release upgrade verification..."
         if upgrade_verify_tool "$tool_name"; then
@@ -4172,6 +5462,8 @@ EOF
             log_info "Run 'dsr verify upgrade $tool_name' to debug"
             # Don't fail the release, just warn
         fi
+    elif $verify_upgrade && $draft; then
+        log_info "Upgrade verification skipped while release remains a draft"
     fi
 
     return $exit_code
@@ -4218,7 +5510,7 @@ OPTIONS:
     -t, --tool <name>       Tool to verify (or first positional arg)
     -V, --version <ver>     Version to verify (or second positional arg)
     -c, --verify-checksums  Download assets and verify SHA256 checksums
-    --fix                   Re-upload missing assets (requires artifacts dir)
+    --fix                   Re-upload missing assets (strict contracts require a draft)
 
 DESCRIPTION:
     Compares a GitHub release against the build manifest to verify all
@@ -4290,8 +5582,9 @@ EOF
     fi
 
     # Get repository info
-    local repo
+    local repo local_path
     repo=$(act_get_repo "$tool_name")
+    local_path=$(act_get_local_path "$tool_name")
     if [[ -z "$repo" ]]; then
         log_error "No GitHub repo configured for $tool_name"
         return 4
@@ -4306,6 +5599,17 @@ EOF
     local tag
     tag=$(git_ops_version_to_tag "$version")
 
+    local release_contract_json="null"
+    local release_contract_enabled=false
+    if declare -F config_get_release_contract_json &>/dev/null; then
+        if ! config_validate_release_contract "$tool_name"; then
+            log_error "Release contract validation failed for $tool_name"
+            return 4
+        fi
+        release_contract_json=$(config_get_release_contract_json "$tool_name") || return $?
+        [[ "$release_contract_json" != "null" ]] && release_contract_enabled=true
+    fi
+
     log_info "Verifying release $tool_name $tag from $repo"
 
     # Record start time
@@ -4314,7 +5618,21 @@ EOF
 
     # Fetch release info from GitHub
     local release_json
-    release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
+    if $release_contract_enabled; then
+        local release_scan="" scanned_release_id=""
+        release_scan=$(_release_contract_scan_release_by_tag "$repo" "$tag" 2>/dev/null || true)
+        scanned_release_id=$(jq -r \
+            'if .count == 1 then .release.id // empty else empty end' \
+            <<< "$release_scan" 2>/dev/null)
+        if [[ "$scanned_release_id" =~ ^[1-9][0-9]*$ ]]; then
+            release_json=$(gh_api "repos/$repo/releases/$scanned_release_id" \
+                --no-cache 2>/dev/null || true)
+        else
+            release_json=""
+        fi
+    else
+        release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
+    fi
     if [[ -z "$release_json" ]] || ! echo "$release_json" | jq -e '.id' &>/dev/null; then
         log_error "Release $tag not found in $repo"
         if $JSON_MODE; then
@@ -4326,6 +5644,22 @@ EOF
     local release_id release_url
     release_id=$(echo "$release_json" | jq -r '.id')
     release_url=$(echo "$release_json" | jq -r '.html_url')
+
+    # Strict repair may create checksum sidecars and clobber remote assets. Do
+    # not allow either mutation unless a fresh, correctly bound release record
+    # proves the release is still a draft.
+    if $release_contract_enabled && $fix_missing; then
+        if ! jq -e \
+            --argjson release_id "$release_id" \
+            --arg expected_tag "$tag" '
+                .id == $release_id and
+                .tag_name == $expected_tag and
+                .draft == true
+            ' <<< "$release_json" >/dev/null 2>&1; then
+            log_error "Strict release repair is allowed only for a verified draft release"
+            return 1
+        fi
+    fi
 
     log_info "Found release: $release_url"
 
@@ -4346,7 +5680,57 @@ EOF
 
     local manifest_exists=false
     local expected_assets=()
-    if [[ -f "$manifest_file" ]]; then
+    local release_contract_plan='{}'
+    local -A expected_asset_sizes=()
+    local -A expected_asset_paths=()
+    local -A expected_asset_shas=()
+    local -A expected_asset_kinds=()
+    local -A expected_asset_source_shas=()
+    local strict_remote_records_valid=true
+    if $release_contract_enabled; then
+        if [[ ! -f "$manifest_file" ]]; then
+            log_error "Strict release contract requires manifest: $manifest_file"
+            return 4
+        fi
+        local artifacts_dir="${manifest_file%/*}"
+        # Repair creates a missing sidecar only at its per-upload mutation
+        # boundary, after re-confirming the remote release is still a draft.
+        local contract_sidecar_mode="plan"
+        if ! release_contract_plan=$(_release_contract_preflight \
+            "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
+            "$manifest_file" "$release_contract_json" "$contract_sidecar_mode"); then
+            return 4
+        fi
+        manifest_exists=true
+        log_info "Using strict manifest: $manifest_file"
+        while IFS=$'\t' read -r name size path sha kind source_sha; do
+            [[ -n "$name" ]] || continue
+            expected_assets+=("$name")
+            expected_asset_sizes["$name"]="$size"
+            expected_asset_paths["$name"]="$path"
+            expected_asset_shas["$name"]="$sha"
+            expected_asset_kinds["$name"]="$kind"
+            expected_asset_source_shas["$name"]="$source_sha"
+        done < <(jq -r '
+            .assets[] |
+            [.name, (.size_bytes | tostring), .path, .sha256, .kind, (.source_sha256 // "")] |
+            @tsv
+        ' <<< "$release_contract_plan")
+        local strict_expected_assets_json
+        strict_expected_assets_json=$(jq -c '.assets' <<< "$release_contract_plan")
+        local strict_expected_draft="any"
+        $fix_missing && strict_expected_draft="true"
+        local strict_release_json=""
+        if strict_release_json=$(_release_contract_verify_remote_assets \
+            "$repo" "$release_id" "$strict_expected_assets_json" "$strict_expected_draft" "$tag"); then
+            release_json="$strict_release_json"
+            release_url=$(jq -r '.html_url // empty' <<< "$release_json")
+            assets_json=$(jq -c '.assets' <<< "$release_json")
+            asset_count=$(jq 'length' <<< "$assets_json")
+        else
+            strict_remote_records_valid=false
+        fi
+    elif [[ -f "$manifest_file" ]]; then
         manifest_exists=true
         log_info "Using manifest: $manifest_file"
         while IFS= read -r name; do
@@ -4360,6 +5744,8 @@ EOF
     local missing_assets=()
     local present_assets=()
     local extra_assets=()
+    local size_mismatches=()
+    local digest_mismatches=()
     local checksum_errors=()
     local verified_checksums=()
 
@@ -4376,7 +5762,22 @@ EOF
             for actual in "${actual_assets[@]}"; do
                 if [[ "$expected" == "$actual" ]]; then
                     found=true
-                    present_assets+=("$expected")
+                    if $release_contract_enabled; then
+                        local remote_size="" remote_digest=""
+                        remote_size=$(jq -r --arg name "$actual" '.[] | select(.name == $name) | .size // empty' \
+                            <<< "$assets_json")
+                        remote_digest=$(jq -r --arg name "$actual" '.[] | select(.name == $name) | .digest // empty' \
+                            <<< "$assets_json")
+                        if [[ "$remote_size" != "${expected_asset_sizes[$expected]}" ]]; then
+                            size_mismatches+=("$expected")
+                        elif [[ "$remote_digest" != "sha256:${expected_asset_shas[$expected]}" ]]; then
+                            digest_mismatches+=("$expected")
+                        else
+                            present_assets+=("$expected")
+                        fi
+                    else
+                        present_assets+=("$expected")
+                    fi
                     break
                 fi
             done
@@ -4490,41 +5891,224 @@ EOF
         fi
     fi
 
-    # Fix missing assets if requested
-    if $fix_missing && [[ ${#missing_assets[@]} -gt 0 ]]; then
-        log_info "Attempting to re-upload ${#missing_assets[@]} missing asset(s)..."
+    # Repair missing assets if requested. Existing wrong bytes are never
+    # deleted or clobbered by strict repair.
+    local assets_to_fix=("${missing_assets[@]}" "${size_mismatches[@]}" "${digest_mismatches[@]}")
+    if $fix_missing && { $release_contract_enabled || [[ ${#assets_to_fix[@]} -gt 0 ]]; }; then
+        if [[ ${#assets_to_fix[@]} -gt 0 ]]; then
+            if $release_contract_enabled; then
+                log_info "Strict repair found ${#missing_assets[@]} missing asset(s)"
+            else
+                log_info "Attempting to re-upload ${#assets_to_fix[@]} missing or mismatched asset(s)..."
+            fi
+        fi
         local artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
 
-        for missing in "${missing_assets[@]}"; do
-            local file_path="$artifacts_dir/$missing"
-            if [[ -f "$file_path" ]]; then
-                log_info "  Uploading: $missing"
-                if gh release upload "$tag" "$file_path" --repo "$repo" --clobber 2>/dev/null; then
-                    log_ok "    Uploaded"
-                    # Move from missing to present
-                    present_assets+=("$missing")
-                else
-                    log_error "    Upload failed"
-                fi
-            else
-                log_warn "  Not found locally: $missing"
-            fi
-        done
+        if $release_contract_enabled; then
+            local expected_assets_json strict_fix_failed=false
+            local upload_result=""
+            expected_assets_json=$(jq -c '.assets' <<< "$release_contract_plan")
 
-        # Re-check missing assets
-        missing_assets=()
-        for expected in "${expected_assets[@]}"; do
-            local found=false
-            for present in "${present_assets[@]}"; do
-                if [[ "$expected" == "$present" ]]; then
-                    found=true
-                    break
+            # Additive repair is safe only for a structurally coherent draft.
+            # Extra, duplicate, incomplete, or byte-mismatched existing records
+            # require manual inspection and are never deleted or clobbered.
+            if [[ ${#extra_assets[@]} -gt 0 ]] || ! jq -e '
+                all(.[];
+                    (.id | type == "number" and floor == . and . > 0) and
+                    (.name | type == "string" and length > 0) and
+                    (.size | type == "number" and floor == . and . >= 0) and
+                    .state == "uploaded" and
+                    (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+                ) and
+                (([.[].id] | unique | length) == length) and
+                (([.[].name] | unique | length) == length)
+            ' <<< "$assets_json" >/dev/null 2>&1; then
+                log_error "Strict release repair refused incomplete, duplicate, or extra remote asset records"
+                strict_fix_failed=true
+            fi
+            if [[ ${#size_mismatches[@]} -gt 0 || ${#digest_mismatches[@]} -gt 0 ]]; then
+                log_error "Strict release repair refuses existing assets with wrong size or digest"
+                strict_fix_failed=true
+            fi
+
+            if ! $strict_fix_failed; then
+                for missing in "${missing_assets[@]}"; do
+                    local file_path="${expected_asset_paths[$missing]:-}"
+                    local bound_draft_json="" bound_upload_url=""
+                    local target_asset_count=0
+                    local upload_content_type="application/octet-stream"
+
+                    bound_draft_json=$(_release_contract_observe_bound_draft \
+                        "$repo" "$release_id" "$tag" 2>/dev/null || true)
+                    if [[ -z "$bound_draft_json" ]] || ! jq -e '
+                        all(.assets[];
+                            (.id | type == "number" and floor == . and . > 0) and
+                            (.name | type == "string" and length > 0) and
+                            .state == "uploaded" and
+                            (.size | type == "number" and floor == . and . >= 0) and
+                            (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+                        ) and
+                        (([.assets[].id] | unique | length) == (.assets | length)) and
+                        (([.assets[].name] | unique | length) == (.assets | length))
+                    ' <<< "$bound_draft_json" >/dev/null 2>&1; then
+                        log_error "Strict release left draft state before repair upload: $missing"
+                        strict_fix_failed=true
+                        break
+                    fi
+
+                    if [[ "${expected_asset_kinds[$missing]:-}" == "checksum" && \
+                          ! -e "$file_path" && ! -L "$file_path" ]]; then
+                        local source_sha="${expected_asset_source_shas[$missing]:-}"
+                        local source_name="${missing%.sha256}"
+                        if [[ "$source_name" == "$missing" || \
+                              ! "$source_sha" =~ ^[0-9a-f]{64}$ ]] || \
+                            ! (set -o noclobber; printf '%s  %s\n' \
+                                "$source_sha" "$source_name" > "$file_path"); then
+                            log_error "Could not create strict repair sidecar without clobbering: $file_path"
+                            strict_fix_failed=true
+                            break
+                        fi
+                    fi
+
+                    if ! _release_contract_verify_local_asset \
+                        "$file_path" "$missing" \
+                        "${expected_asset_sizes[$missing]:-}" \
+                        "${expected_asset_shas[$missing]:-}"; then
+                        strict_fix_failed=true
+                        break
+                    fi
+
+                    target_asset_count=$(jq -r --arg name "$missing" \
+                        '[.assets[] | select(.name == $name)] | length' <<< "$bound_draft_json")
+                    if [[ "$target_asset_count" -ne 0 ]]; then
+                        log_error "Strict repair target is no longer absent: $missing"
+                        strict_fix_failed=true
+                        break
+                    fi
+
+                    bound_upload_url=$(jq -r '.upload_url // empty' <<< "$bound_draft_json")
+                    [[ "$missing" == *.sha256 ]] && upload_content_type="text/plain"
+                    log_info "  Uploading by release ID to draft: $missing"
+                    if upload_result=$(gh_upload_asset "$bound_upload_url" "$file_path" \
+                        "$upload_content_type" 2>&1); then
+                        log_ok "    Uploaded to ID-bound draft"
+                    else
+                        log_error "Strict ID-bound repair upload returned an ambiguous failure for $missing"
+                        [[ -n "$upload_result" ]] && log_error "  Error: $upload_result"
+                        strict_fix_failed=true
+                        break
+                    fi
+                done
+            fi
+
+            # `preflight verify` requires the entire frozen local plan to be
+            # materialized, including sidecars that were already correct
+            # remotely and therefore were not selected for upload repair.
+            if ! $strict_fix_failed; then
+                local planned_name planned_path planned_source_sha planned_source_name
+                local bound_sidecar_draft_json=""
+                for planned_name in "${expected_assets[@]}"; do
+                    [[ "${expected_asset_kinds[$planned_name]:-}" == "checksum" ]] || continue
+                    planned_path="${expected_asset_paths[$planned_name]:-}"
+                    if [[ ! -e "$planned_path" && ! -L "$planned_path" ]]; then
+                        bound_sidecar_draft_json=$(_release_contract_observe_bound_draft \
+                            "$repo" "$release_id" "$tag" 2>/dev/null || true)
+                        if [[ -z "$bound_sidecar_draft_json" ]]; then
+                            log_error "Strict release left draft state before sidecar materialization"
+                            strict_fix_failed=true
+                            break
+                        fi
+                        planned_source_sha="${expected_asset_source_shas[$planned_name]:-}"
+                        planned_source_name="${planned_name%.sha256}"
+                        if [[ "$planned_source_name" == "$planned_name" || \
+                              ! "$planned_source_sha" =~ ^[0-9a-f]{64}$ ]] || \
+                            ! (set -o noclobber; printf '%s  %s\n' \
+                                "$planned_source_sha" "$planned_source_name" > "$planned_path"); then
+                            log_error "Could not materialize frozen strict sidecar: $planned_path"
+                            strict_fix_failed=true
+                            break
+                        fi
+                    fi
+                    if ! _release_contract_verify_local_asset \
+                        "$planned_path" "$planned_name" \
+                        "${expected_asset_sizes[$planned_name]:-}" \
+                        "${expected_asset_shas[$planned_name]:-}"; then
+                        strict_fix_failed=true
+                        break
+                    fi
+                done
+            fi
+
+            local repaired_contract_plan="" repaired_plan_valid=false
+            if ! $strict_fix_failed && _release_contract_verify_remote_assets \
+                "$repo" "$release_id" "$expected_assets_json" true "$tag" >/dev/null && \
+               repaired_contract_plan=$(_release_contract_preflight \
+                "$tool_name" "$tag" "$repo" "$local_path" "$artifacts_dir" \
+                "$manifest_file" "$release_contract_json" verify) && \
+               jq -en \
+                --argjson frozen "$release_contract_plan" \
+                --argjson current "$repaired_contract_plan" \
+                '$frozen == $current' >/dev/null 2>&1 && \
+               _release_contract_verify_remote_tag_identity \
+                "$repo" "$tag" "$(jq -r '.git_sha' <<< "$release_contract_plan")" && \
+               _release_contract_verify_remote_assets \
+                "$repo" "$release_id" "$expected_assets_json" true "$tag" >/dev/null; then
+                repaired_plan_valid=true
+            fi
+
+            if $repaired_plan_valid; then
+                present_assets=("${expected_assets[@]}")
+                missing_assets=()
+                extra_assets=()
+                size_mismatches=()
+                digest_mismatches=()
+                strict_remote_records_valid=true
+                log_ok "Strict draft repair matches the frozen release plan and tag"
+            else
+                log_error "Strict draft repair failed frozen-plan or tag revalidation"
+                strict_fix_failed=true
+                strict_remote_records_valid=false
+            fi
+
+            if $strict_fix_failed; then
+                if ! _release_contract_confirm_or_restore_bound_draft \
+                    "$repo" "$release_id" "$tag"; then
+                    log_error "Strict repair failed and the release could not be left as a verified draft"
+                else
+                    log_warn "Strict repair failed; release remains a draft"
+                fi
+            fi
+        else
+            for missing in "${assets_to_fix[@]}"; do
+                local file_path="$artifacts_dir/$missing"
+                if [[ -f "$file_path" ]]; then
+                    log_info "  Uploading: $missing"
+                    if gh release upload "$tag" "$file_path" --repo "$repo" --clobber 2>/dev/null; then
+                        log_ok "    Uploaded"
+                        present_assets+=("$missing")
+                    else
+                        log_error "    Upload failed"
+                    fi
+                else
+                    log_warn "  Not found locally: $missing"
                 fi
             done
-            if ! $found; then
-                missing_assets+=("$expected")
-            fi
-        done
+
+            # Re-check missing assets using the successful local upload results.
+            missing_assets=()
+            for expected in "${expected_assets[@]}"; do
+                local found=false
+                for present in "${present_assets[@]}"; do
+                    if [[ "$expected" == "$present" ]]; then
+                        found=true
+                        break
+                    fi
+                done
+                if ! $found; then
+                    missing_assets+=("$expected")
+                fi
+            done
+        fi
     fi
 
     # Calculate duration
@@ -4535,7 +6119,10 @@ EOF
     # Determine status
     local status="success"
     local exit_code=0
-    if [[ ${#missing_assets[@]} -gt 0 ]] || [[ ${#checksum_errors[@]} -gt 0 ]]; then
+    if [[ ${#missing_assets[@]} -gt 0 ]] || [[ ${#size_mismatches[@]} -gt 0 ]] || \
+        [[ ${#digest_mismatches[@]} -gt 0 ]] || \
+        [[ ${#checksum_errors[@]} -gt 0 ]] || \
+        { $release_contract_enabled && { [[ ${#extra_assets[@]} -gt 0 ]] || ! $strict_remote_records_valid; }; }; then
         status="incomplete"
         exit_code=1
     fi
@@ -4554,6 +6141,9 @@ EOF
             --argjson present "$(printf '%s\n' "${present_assets[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson missing "$(printf '%s\n' "${missing_assets[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson extra "$(printf '%s\n' "${extra_assets[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --argjson size_mismatches "$(printf '%s\n' "${size_mismatches[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --argjson digest_mismatches "$(printf '%s\n' "${digest_mismatches[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --argjson remote_records_valid "$strict_remote_records_valid" \
             --argjson checksum_verified "$(printf '%s\n' "${verified_checksums[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson checksum_errors "$(printf '%s\n' "${checksum_errors[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson duration "$duration" \
@@ -4568,12 +6158,17 @@ EOF
                     expected: $expected_count,
                     present: ($present | length),
                     missing: ($missing | length),
-                    extra: ($extra | length)
+                    extra: ($extra | length),
+                    size_mismatches: ($size_mismatches | length),
+                    digest_mismatches: ($digest_mismatches | length),
+                    remote_records_valid: $remote_records_valid
                 },
                 assets: {
                     present: $present,
                     missing: $missing,
-                    extra: $extra
+                    extra: $extra,
+                    size_mismatches: $size_mismatches,
+                    digest_mismatches: $digest_mismatches
                 },
                 checksums: {
                     verified: $checksum_verified,
@@ -4603,9 +6198,27 @@ EOF
         fi
 
         if [[ ${#extra_assets[@]} -gt 0 ]]; then
-            log_warn "Extra:    ${#extra_assets[@]} asset(s) (not in manifest)"
+            if $release_contract_enabled; then
+                log_error "Extra:    ${#extra_assets[@]} asset(s) (forbidden by strict contract)"
+            else
+                log_warn "Extra:    ${#extra_assets[@]} asset(s) (not in manifest)"
+            fi
             for asset in "${extra_assets[@]}"; do
                 log_warn "  + $asset"
+            done
+        fi
+
+        if [[ ${#size_mismatches[@]} -gt 0 ]]; then
+            log_error "Wrong size: ${#size_mismatches[@]} asset(s)"
+            for asset in "${size_mismatches[@]}"; do
+                log_error "  ! $asset"
+            done
+        fi
+
+        if [[ ${#digest_mismatches[@]} -gt 0 ]]; then
+            log_error "Wrong digest: ${#digest_mismatches[@]} asset(s)"
+            for asset in "${digest_mismatches[@]}"; do
+                log_error "  ! $asset"
             done
         fi
 
@@ -5483,6 +7096,7 @@ _dsr_render_artifact_name() {
             darwin/amd64) target_triple="x86_64-apple-darwin" ;;
             darwin/arm64) target_triple="aarch64-apple-darwin" ;;
             windows/amd64) target_triple="x86_64-pc-windows-msvc" ;;
+            windows/arm64) target_triple="aarch64-pc-windows-msvc" ;;
             *) target_triple="${os}-${arch}" ;;
         esac
     fi
@@ -6019,7 +7633,9 @@ _validate_artifact_naming() {
         local config_has_version=false
         local install_has_version=false
 
+        # shellcheck disable=SC2016  # Match the literal template placeholder.
         [[ "$config_pattern" == *'${version}'* || "$config_pattern" == *'-v'* ]] && config_has_version=true
+        # shellcheck disable=SC2016  # Match the literal template placeholder.
         [[ "$install_pattern" == *'${version}'* || "$install_pattern" == *'-v'* ]] && install_has_version=true
 
         if [[ "$config_has_version" == "true" && "$install_has_version" == "false" ]]; then

@@ -235,11 +235,14 @@ test_detect_rust_json_valid() {
 test_detect_rust_has_required_fields() {
   local result
   result=$(toolchain_detect_rust)
-  # Check for all required fields
-  echo "$result" | jq -e '.toolchain' >/dev/null
-  echo "$result" | jq -e '.installed' >/dev/null
-  echo "$result" | jq -e '.minimum_version' >/dev/null
-  echo "$result" | jq -e '.meets_minimum' >/dev/null
+  # Presence is the contract. `installed` and `meets_minimum` may legitimately
+  # be false on a host where Rust is absent or below the supported minimum.
+  echo "$result" | jq -e '
+    has("toolchain") and
+    has("installed") and
+    has("minimum_version") and
+    has("meets_minimum")
+  ' >/dev/null
 }
 
 test_detect_rust_toolchain_field() {

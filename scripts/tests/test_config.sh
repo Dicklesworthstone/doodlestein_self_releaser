@@ -447,9 +447,11 @@ test_get_host_for_platform_darwin() {
 
 test_get_host_for_platform_windows() {
   config_init
-  local host
-  host=$(config_get_host_for_platform "windows/amd64")
-  [[ "$host" == "wlap" || "$host" == "\"wlap\"" ]]
+  local amd64_host arm64_host
+  amd64_host=$(config_get_host_for_platform "windows/amd64")
+  arm64_host=$(config_get_host_for_platform "windows/arm64")
+  [[ "$amd64_host" == "wlap" || "$amd64_host" == "\"wlap\"" ]] &&
+    [[ "$arm64_host" == "wlap" || "$arm64_host" == "\"wlap\"" ]]
 }
 
 test_list_hosts_returns_hosts() {

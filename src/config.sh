@@ -151,6 +151,7 @@ platform_mapping:
   darwin/arm64: mmini
   darwin/amd64: mmini  # Rosetta
   windows/amd64: wlap
+  windows/arm64: wlap
 EOF
         _cfg_log_ok "Created $DSR_HOSTS_FILE"
     fi

@@ -260,21 +260,29 @@ test_rate_limit_not_detected_unrelated() {
 
 test_check_token_fails_when_unset() {
   unset GITHUB_TOKEN
-  ! gh_check_token
+  gh() { return 1; }
+  local status=0
+  gh_check_token >/dev/null 2>&1 || status=$?
+  unset -f gh
+  [[ $status -ne 0 ]]
 }
 
 test_check_token_passes_when_set() {
   export GITHUB_TOKEN="test_token_value"
+  gh() { return 1; }
   gh_check_token
   local result=$?
+  unset -f gh
   unset GITHUB_TOKEN
   [[ $result -eq 0 ]]
 }
 
 test_check_token_returns_code_3() {
   unset GITHUB_TOKEN
-  gh_check_token 2>/dev/null
-  local result=$?
+  gh() { return 1; }
+  local result=0
+  gh_check_token >/dev/null 2>&1 || result=$?
+  unset -f gh
   [[ $result -eq 3 ]]
 }
 
@@ -304,6 +312,55 @@ test_api_rejects_empty_endpoint() {
 
 test_api_rejects_unknown_option() {
   ! gh_api "test" --invalid-option 2>/dev/null
+}
+
+test_api_no_cache_omits_stale_etag_on_curl_fallback() {
+  local endpoint="repos/owner/repo/releases/123"
+  local curl_log="$TEMP_DIR/no-cache-curl.log"
+  echo '{"cached":true}' | _gh_set_cache "$endpoint" 'W/"stale-etag"'
+  export GITHUB_TOKEN="test-token"
+
+  gh() {
+    return 1
+  }
+  curl() {
+    printf '%s\n' "$*" > "$curl_log"
+    printf 'HTTP/1.1 200 OK\r\nETag: W/"fresh-etag"\r\n\r\n{"fresh":true}'
+  }
+
+  local result status=0 cached
+  result=$(gh_api "$endpoint" --no-cache) || status=$?
+  cached=$(_gh_get_cache_raw "$endpoint")
+
+  unset -f gh curl
+  unset GITHUB_TOKEN
+
+  [[ $status -eq 0 && "$result" == '{"fresh":true}' && "$cached" == '{"cached":true}' ]] &&
+    grep -Fq 'Cache-Control: no-cache, no-store, max-age=0' "$curl_log" &&
+    grep -Fq 'Pragma: no-cache' "$curl_log" &&
+    ! grep -Fq 'If-None-Match' "$curl_log"
+}
+
+test_api_no_cache_sends_headers_on_gh_cli() {
+  local endpoint="repos/owner/repo/releases/123"
+  local gh_log="$TEMP_DIR/no-cache-gh.log"
+
+  gh() {
+    if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
+      return 0
+    fi
+    printf '%s\n' "$*" > "$gh_log"
+    printf '{"fresh":true}\n'
+  }
+
+  local result status=0
+  result=$(gh_api "$endpoint" --no-cache) || status=$?
+
+  unset -f gh
+
+  [[ $status -eq 0 && "$result" == '{"fresh":true}' ]] &&
+    grep -Fq 'Cache-Control: no-cache, no-store, max-age=0' "$gh_log" &&
+    grep -Fq 'Pragma: no-cache' "$gh_log"
 }
 
 # ============================================================================
@@ -427,6 +484,25 @@ test_upload_asset_rejects_nonexistent_file() {
   ! gh_upload_asset "http://example.com" "/nonexistent/file.txt" 2>/dev/null
 }
 
+test_upload_asset_encodes_plus_in_filename() {
+  local asset="$TEMP_DIR/tool+build"
+  local curl_log="$TEMP_DIR/curl.log"
+  printf 'asset\n' > "$asset"
+  export GITHUB_TOKEN="test-token"
+
+  curl() {
+    printf '%s\n' "$*" > "$curl_log"
+    printf '{}\n__HTTP_CODE__201'
+  }
+
+  local status=0
+  gh_upload_asset 'https://uploads.example.invalid/assets{?name,label}' "$asset" >/dev/null || status=$?
+
+  unset -f curl
+  unset GITHUB_TOKEN
+  [[ $status -eq 0 ]] && grep -Fq '?name=tool%2Bbuild' "$curl_log"
+}
+
 test_compare_rejects_missing_args() {
   ! gh_compare "owner/repo" "" "head" 2>/dev/null
   ! gh_compare "owner/repo" "base" "" 2>/dev/null
@@ -455,7 +531,7 @@ test_resolve_tag_sha_commit() {
 
   gh_api() {
     if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.3" ]]; then
-      echo '{"object":{"sha":"abc123","type":"commit"}}'
+      echo '{"object":{"sha":"0123456789abcdef0123456789abcdef01234567","type":"commit"}}'
       return 0
     fi
     echo '{}'
@@ -468,7 +544,7 @@ test_resolve_tag_sha_commit() {
 
   eval "$gh_api_def"
 
-  [[ $status -eq 0 && "$sha" == "abc123" ]]
+  [[ $status -eq 0 && "$sha" == "0123456789abcdef0123456789abcdef01234567" ]]
 }
 
 test_resolve_tag_sha_annotated() {
@@ -477,11 +553,11 @@ test_resolve_tag_sha_annotated() {
 
   gh_api() {
     if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.4" ]]; then
-      echo '{"object":{"sha":"tagsha123","type":"tag"}}'
+      echo '{"object":{"sha":"1111111111111111111111111111111111111111","type":"tag"}}'
       return 0
     fi
-    if [[ "$1" == "repos/owner/repo/git/tags/tagsha123" ]]; then
-      echo '{"object":{"sha":"commitsha456","type":"commit"}}'
+    if [[ "$1" == "repos/owner/repo/git/tags/1111111111111111111111111111111111111111" ]]; then
+      echo '{"object":{"sha":"2222222222222222222222222222222222222222","type":"commit"}}'
       return 0
     fi
     echo '{}'
@@ -494,7 +570,69 @@ test_resolve_tag_sha_annotated() {
 
   eval "$gh_api_def"
 
-  [[ $status -eq 0 && "$sha" == "commitsha456" ]]
+  [[ $status -eq 0 && "$sha" == "2222222222222222222222222222222222222222" ]]
+}
+
+test_resolve_tag_sha_nested_annotated() {
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+
+  gh_api() {
+    case "$1" in
+      repos/owner/repo/git/ref/tags/v1.2.5)
+        echo '{"object":{"sha":"1111111111111111111111111111111111111111","type":"tag"}}'
+        ;;
+      repos/owner/repo/git/tags/1111111111111111111111111111111111111111)
+        echo '{"object":{"sha":"2222222222222222222222222222222222222222","type":"tag"}}'
+        ;;
+      repos/owner/repo/git/tags/2222222222222222222222222222222222222222)
+        echo '{"object":{"sha":"3333333333333333333333333333333333333333","type":"commit"}}'
+        ;;
+      *) echo '{}' ;;
+    esac
+  }
+
+  local sha status
+  sha=$(gh_resolve_tag_sha "owner/repo" "v1.2.5")
+  status=$?
+
+  eval "$gh_api_def"
+
+  [[ $status -eq 0 && "$sha" == "3333333333333333333333333333333333333333" ]]
+}
+
+test_resolve_tag_sha_rejects_short_sha() {
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+
+  gh_api() {
+    echo '{"object":{"sha":"abc123","type":"commit"}}'
+  }
+
+  ! gh_resolve_tag_sha "owner/repo" "v1.2.6" >/dev/null
+  local status=$?
+
+  eval "$gh_api_def"
+  [[ $status -eq 0 ]]
+}
+
+test_resolve_tag_sha_rejects_non_commit_target() {
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+
+  gh_api() {
+    if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.7" ]]; then
+      echo '{"object":{"sha":"1111111111111111111111111111111111111111","type":"tag"}}'
+    else
+      echo '{"object":{"sha":"2222222222222222222222222222222222222222","type":"blob"}}'
+    fi
+  }
+
+  ! gh_resolve_tag_sha "owner/repo" "v1.2.7" >/dev/null
+  local status=$?
+
+  eval "$gh_api_def"
+  [[ $status -eq 0 ]]
 }
 
 test_dispatch_rejects_missing_args() {
@@ -588,6 +726,8 @@ main() {
   echo "API Argument Parsing:"
   run_test "api_rejects_empty_endpoint" test_api_rejects_empty_endpoint
   run_test "api_rejects_unknown_option" test_api_rejects_unknown_option
+  run_test "api_no_cache_omits_stale_etag_on_curl_fallback" test_api_no_cache_omits_stale_etag_on_curl_fallback
+  run_test "api_no_cache_sends_headers_on_gh_cli" test_api_no_cache_sends_headers_on_gh_cli
 
   echo ""
   echo "Clear Cache:"
@@ -622,6 +762,7 @@ main() {
   run_test "upload_asset_rejects_missing_url" test_upload_asset_rejects_missing_url
   run_test "upload_asset_rejects_missing_file" test_upload_asset_rejects_missing_file
   run_test "upload_asset_rejects_nonexistent_file" test_upload_asset_rejects_nonexistent_file
+  run_test "upload_asset_encodes_plus_in_filename" test_upload_asset_encodes_plus_in_filename
   run_test "compare_rejects_missing_args" test_compare_rejects_missing_args
   run_test "tags_rejects_empty_repo" test_tags_rejects_empty_repo
   run_test "repo_rejects_empty_repo" test_repo_rejects_empty_repo
@@ -631,6 +772,9 @@ main() {
   run_test "resolve_tag_sha_rejects_missing_args" test_resolve_tag_sha_rejects_missing_args
   run_test "resolve_tag_sha_commit" test_resolve_tag_sha_commit
   run_test "resolve_tag_sha_annotated" test_resolve_tag_sha_annotated
+  run_test "resolve_tag_sha_nested_annotated" test_resolve_tag_sha_nested_annotated
+  run_test "resolve_tag_sha_rejects_short_sha" test_resolve_tag_sha_rejects_short_sha
+  run_test "resolve_tag_sha_rejects_non_commit_target" test_resolve_tag_sha_rejects_non_commit_target
   run_test "dispatch_rejects_missing_args" test_dispatch_rejects_missing_args
   run_test "dispatch_accepts_valid_payload" test_dispatch_accepts_valid_payload
   run_test "dispatch_fails_on_error_response" test_dispatch_fails_on_error_response

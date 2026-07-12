@@ -13,6 +13,8 @@
   "warnings": [],
   "errors": [],
   "details": {
+    "generated_at": "2026-01-30T16:00:00Z",
+    "overall_status": "ok",
     "system_status": "healthy",
     "repos_summary": {
       "total": 15,
@@ -24,6 +26,7 @@
       "run_id": "550e8400-e29b-41d4-a716-446655440009",
       "command": "build",
       "status": "success",
+      "exit_code": 0,
       "repo": "ntm",
       "started_at": "2026-01-30T14:30:00Z",
       "duration_ms": 180000,
