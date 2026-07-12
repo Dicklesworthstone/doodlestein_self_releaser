@@ -69,6 +69,9 @@ EOF
 export DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
 export DSR_CONFIG_FILE="$DSR_CONFIG_DIR/config.yaml"
 
+# Source logging for the numeric-safe timestamp helper, then stub log output.
+source "$PROJECT_ROOT/src/logging.sh"
+
 # Stub logging functions
 log_info() { :; }
 log_warn() { :; }
@@ -83,6 +86,35 @@ source "$PROJECT_ROOT/src/host_health.sh"
 # ============================================================================
 # Cache Tests
 # ============================================================================
+
+_test_health_result_json() {
+    local hostname="$1"
+    local status="$2"
+    local healthy="$3"
+
+    jq -nc \
+        --arg hostname "$hostname" \
+        --arg status "$status" \
+        --argjson healthy "$healthy" \
+        '{
+            hostname: $hostname,
+            platform: "linux/amd64",
+            description: "test fixture",
+            connection: "local",
+            status: $status,
+            healthy: $healthy,
+            errors: (if $healthy then 0 else 1 end),
+            warnings: 0,
+            checks: {
+                connectivity: {reachable: $healthy},
+                disk_space: {status: $status, usage_percent: null},
+                toolchains: {},
+                docker: {},
+                clock_drift: {}
+            },
+            checked_at: "2026-07-12T00:00:00Z"
+        }'
+}
 
 test_cache_init() {
     ((TESTS_RUN++))
@@ -117,12 +149,55 @@ test_cache_validity() {
     ((TESTS_RUN++))
 
     _hh_init_cache
-    _hh_cache_write "freshhost" '{"test": true}'
+    _hh_cache_write "freshhost" "$(_test_health_result_json "freshhost" "ok" "true")"
 
     if _hh_cache_valid "freshhost"; then
         pass "Fresh cache is valid"
     else
         fail "Fresh cache should be valid"
+    fi
+}
+
+test_cache_rejects_wrong_shape_or_hostname() {
+    ((TESTS_RUN++))
+
+    _hh_init_cache
+    _hh_cache_write "wrongshape" '{"hostname": "wrongshape", "healthy": true}'
+    _hh_cache_write "expectedhost" "$(_test_health_result_json "otherhost" "ok" "true")"
+
+    if ! _hh_cache_valid "wrongshape" && ! _hh_cache_valid "expectedhost"; then
+        pass "Cache requires the expected health-result shape and hostname"
+    else
+        fail "Cache should reject incomplete or mismatched health results"
+    fi
+}
+
+test_cached_unhealthy_result_returns_nonzero() {
+    ((TESTS_RUN++))
+
+    _hh_init_cache
+    _hh_cache_write "cachedunhealthy" "$(_test_health_result_json "cachedunhealthy" "error" "false")"
+
+    local result status=0
+    result=$(host_health_check "cachedunhealthy" --json 2>/dev/null) || status=$?
+
+    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.healthy == false and .status == "error"' &>/dev/null; then
+        pass "Cached unhealthy result preserves nonzero status"
+    else
+        fail "Cached unhealthy result should return nonzero, got status=$status result=$result"
+    fi
+}
+
+test_cache_rejects_invalid_json() {
+    ((TESTS_RUN++))
+
+    _hh_init_cache
+    printf 'x' > "$(_hh_cache_file "invalidhost")"
+
+    if ! _hh_cache_valid "invalidhost"; then
+        pass "Fresh cache rejects one-byte invalid JSON"
+    else
+        fail "Fresh cache should reject one-byte invalid JSON"
     fi
 }
 
@@ -161,6 +236,25 @@ test_cache_clear_all() {
 # Local Host Check Tests
 # ============================================================================
 
+test_standalone_source_ignores_caller_script_dir() {
+    ((TESTS_RUN++))
+
+    local result status=0
+    result=$(
+        SCRIPT_DIR="$TEMP_DIR/unrelated-caller" \
+        DSR_CONFIG_DIR="$DSR_CONFIG_DIR" \
+        DSR_CACHE_DIR="$DSR_CACHE_DIR" \
+        DSR_STATE_DIR="$DSR_STATE_DIR" \
+        bash -c 'source "$1/src/host_health.sh"; _get_ms_timestamp' _ "$PROJECT_ROOT" 2>&1
+    ) || status=$?
+
+    if [[ $status -eq 0 && "$result" =~ ^[0-9]+$ ]]; then
+        pass "Standalone source resolves dependencies independently of caller SCRIPT_DIR"
+    else
+        fail "Standalone source should ignore caller SCRIPT_DIR, got status=$status result=$result"
+    fi
+}
+
 test_local_connectivity() {
     ((TESTS_RUN++))
 
@@ -171,6 +265,33 @@ test_local_connectivity() {
         pass "Local connectivity check returns reachable"
     else
         fail "Local connectivity should always be reachable, got: $result"
+    fi
+}
+
+test_remote_connectivity_handles_bsd_date_literal_nanoseconds() {
+    ((TESTS_RUN++))
+
+    local result
+    result=$(
+        (
+            date() {
+                case "${1:-}" in
+                    +%s%3N) printf '1700000000%%3N\n' ;;
+                    +%s) printf '1700000000\n' ;;
+                    *) command date "$@" ;;
+                esac
+            }
+            python3() { printf '1700000000123\n'; }
+            _hh_run_with_timeout() { return 0; }
+            _DSR_MS_TIMESTAMP_METHOD=""
+            _hh_check_connectivity "testremote" "ssh" "example.invalid"
+        )
+    )
+
+    if echo "$result" | jq -e '.reachable == true and (.latency_ms | type == "number")' &>/dev/null; then
+        pass "Connectivity timing handles BSD date literal nanoseconds"
+    else
+        fail "Connectivity timing should remain numeric with BSD date, got: $result"
     fi
 }
 
@@ -199,6 +320,89 @@ test_local_disk_space_has_status() {
         pass "Disk space has valid status: $status"
     else
         fail "Disk space invalid status: $status"
+    fi
+}
+
+test_disk_space_forces_kilobytes_with_512_byte_default() {
+    ((TESTS_RUN++))
+
+    local result
+    result=$(
+        (
+            _hh_exec_on_host() {
+                if [[ "$4" == *"df -Pk /"* ]]; then
+                    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+                    printf '/dev/test 8388608 4194304 2097152 50%% /\n'
+                else
+                    printf 'Filesystem 512-blocks Used Available Capacity Mounted on\n'
+                    printf '/dev/test 16777216 8388608 4194304 50%% /\n'
+                fi
+            }
+            _hh_check_disk_space "testlocal" "local" ""
+        )
+    )
+
+    if echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2' &>/dev/null; then
+        pass "Disk space forces 1K blocks under a 512-byte default"
+    else
+        fail "Disk space should report 2 GiB from df -Pk output, got: $result"
+    fi
+}
+
+test_disk_space_rejects_non_numeric_fields() {
+    ((TESTS_RUN++))
+
+    local result status=0
+    result=$(
+        (
+            _hh_exec_on_host() {
+                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+                printf '/dev/test 8388608 4194304 invalid 50%% /\n'
+            }
+            _hh_check_disk_space "testlocal" "local" ""
+        )
+    ) || status=$?
+
+    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .available_gb == null' &>/dev/null; then
+        pass "Disk space rejects non-numeric fields"
+    else
+        fail "Disk space should reject non-numeric fields, got status=$status result=$result"
+    fi
+}
+
+test_disk_space_rejects_numeric_output_from_failed_command() {
+    ((TESTS_RUN++))
+
+    local result status=0
+    result=$(
+        (
+            _hh_exec_on_host() {
+                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+                printf '/dev/test 4194304 2097152 1048576 50%% /\n'
+                return 23
+            }
+            _hh_check_disk_space "testlocal" "local" ""
+        )
+    ) || status=$?
+
+    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .error == "Failed to get disk info"' &>/dev/null; then
+        pass "Disk space preserves command failure despite numeric stdout"
+    else
+        fail "Disk space should fail when command returns nonzero, got status=$status result=$result"
+    fi
+}
+
+test_human_disk_error_reports_probe_failure() {
+    ((TESTS_RUN++))
+
+    local result output
+    result='{"hostname":"testlocal","platform":"linux/amd64","status":"error","healthy":false,"checks":{"connectivity":{"reachable":true},"disk_space":{"status":"error","usage_percent":null,"error":"Disk probe timed out"},"toolchains":{}}}'
+    output=$(_hh_print_result "testlocal" "$result" 2>&1)
+
+    if [[ "$output" == *"Disk probe timed out"* && "$output" != *"Disk usage >"* ]]; then
+        pass "Human disk error reports the recorded probe failure"
+    else
+        fail "Human disk error should report recorded failure, got: $output"
     fi
 }
 
@@ -690,13 +894,22 @@ echo ""
 test_cache_init
 test_cache_write_and_read
 test_cache_validity
+test_cache_rejects_invalid_json
+test_cache_rejects_wrong_shape_or_hostname
+test_cached_unhealthy_result_returns_nonzero
 test_cache_clear
 test_cache_clear_all
 
 # Local check tests
+test_standalone_source_ignores_caller_script_dir
 test_local_connectivity
+test_remote_connectivity_handles_bsd_date_literal_nanoseconds
 test_local_disk_space
 test_local_disk_space_has_status
+test_disk_space_forces_kilobytes_with_512_byte_default
+test_disk_space_rejects_non_numeric_fields
+test_disk_space_rejects_numeric_output_from_failed_command
+test_human_disk_error_reports_probe_failure
 test_local_toolchains_check
 test_local_clock_drift
 

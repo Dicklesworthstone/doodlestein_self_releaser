@@ -21,12 +21,18 @@
 
 set -uo pipefail
 
-# Dependencies check
-[[ -n "${SCRIPT_DIR:-}" ]] || SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve dependencies relative to this module, independent of caller globals.
+_HH_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Source config if not already loaded
 if ! declare -p DSR_CONFIG &>/dev/null 2>&1; then
-    source "$SCRIPT_DIR/src/config.sh"
+    source "$_HH_PROJECT_ROOT/src/config.sh"
+fi
+
+# Reuse the numeric-safe millisecond clock used by structured logging. The main
+# dsr entrypoint loads logging first; source it here as well for standalone use.
+if ! declare -F _get_ms_timestamp &>/dev/null; then
+    source "$_HH_PROJECT_ROOT/src/logging.sh"
 fi
 
 # Fallback host parsing when yq is unavailable
@@ -288,13 +294,34 @@ _hh_cache_file() {
     echo "$_HH_CACHE_DIR/${hostname}.json"
 }
 
-# Check if cache is valid (exists and not expired)
+# Check if cache is valid (expected health-result shape and not expired)
 _hh_cache_valid() {
     local hostname="$1"
     local cache_file
     cache_file=$(_hh_cache_file "$hostname")
 
     if [[ ! -f "$cache_file" ]]; then
+        return 1
+    fi
+
+    if ! jq -e --arg hostname "$hostname" '
+        type == "object" and
+        .hostname == $hostname and
+        (.platform | type == "string") and
+        (.description | type == "string") and
+        (.connection | type == "string") and
+        ((.status == "ok" or .status == "warning") and .healthy == true or
+         .status == "error" and .healthy == false) and
+        (.errors | type == "number") and
+        (.warnings | type == "number") and
+        (.checks | type == "object") and
+        (.checks.connectivity | type == "object") and
+        (.checks.disk_space | type == "object") and
+        (.checks.toolchains | type == "object") and
+        (.checks.docker | type == "object") and
+        (.checks.clock_drift | type == "object") and
+        (.checked_at | type == "string")
+    ' "$cache_file" >/dev/null 2>&1; then
         return 1
     fi
 
@@ -371,7 +398,7 @@ _hh_check_connectivity() {
 
     # SSH connectivity test with timing
     local start_ms end_ms latency_ms
-    start_ms=$(date +%s%3N 2>/dev/null || echo "0")
+    start_ms=$(_get_ms_timestamp)
 
     if _hh_run_with_timeout "$_HH_SSH_TIMEOUT" ssh \
         -o ConnectTimeout="$_HH_SSH_TIMEOUT" \
@@ -379,7 +406,7 @@ _hh_check_connectivity() {
         -o StrictHostKeyChecking=accept-new \
         "$ssh_host" "echo ok" &>/dev/null; then
 
-        end_ms=$(date +%s%3N 2>/dev/null || echo "0")
+        end_ms=$(_get_ms_timestamp)
         latency_ms=$((end_ms - start_ms))
         [[ $latency_ms -lt 0 ]] && latency_ms=0
 
@@ -399,26 +426,44 @@ _hh_check_disk_space() {
     local ssh_host="$3"
     local platform="${4:-}"
 
-    local df_output
+    local df_output df_status=0
     if [[ "$platform" == windows/* ]]; then
         # Use PowerShell for Windows: get C: drive usage percentage and free space in KB
         df_output=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
-            "powershell -NoProfile -Command \"\$d=Get-WmiObject Win32_LogicalDisk -Filter \\\"DeviceID='C:'\\\"; [math]::Round(100-(\$d.FreeSpace/\$d.Size*100)); [math]::Round(\$d.FreeSpace/1KB)\"")
-        # Strip Windows CRLF
-        df_output=$(echo "$df_output" | tr -d '\r' | tr '\n' ' ')
+            "powershell -NoProfile -Command \"\$d=Get-WmiObject Win32_LogicalDisk -Filter \\\"DeviceID='C:'\\\"; [math]::Round(100-(\$d.FreeSpace/\$d.Size*100)); [math]::Round(\$d.FreeSpace/1KB)\"") || df_status=$?
     else
         df_output=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
-            "df -P / | tail -1 | awk '{print \$5, \$4}'")
+            "LC_ALL=C df -Pk /") || df_status=$?
     fi
 
-    if [[ -z "$df_output" ]]; then
+    if [[ $df_status -ne 0 || -z "$df_output" ]]; then
         echo '{"path": "/", "usage_percent": null, "available_gb": null, "status": "error", "error": "Failed to get disk info"}'
         return 1
     fi
 
-    local usage_percent available_kb available_gb status
-    usage_percent=$(echo "$df_output" | awk '{print $1}' | tr -d '%')
-    available_kb=$(echo "$df_output" | awk '{print $2}')
+    if [[ "$platform" == windows/* ]]; then
+        # Strip Windows CRLF and flatten the two PowerShell output lines.
+        df_output=$(printf '%s\n' "$df_output" | tr -d '\r' | tr '\n' ' ')
+    else
+        # Parse locally so the remote command status above belongs to df itself.
+        df_output=$(printf '%s\n' "$df_output" | awk 'END {print $5, $4}')
+    fi
+
+    local usage_token usage_percent available_kb extra available_gb status
+    read -r usage_token available_kb extra <<< "$df_output"
+    usage_percent="${usage_token%\%}"
+
+    if [[ -n "${extra:-}" || ! "$usage_percent" =~ ^[0-9]{1,3}$ || ! "$available_kb" =~ ^[0-9]+$ ]]; then
+        echo '{"path": "/", "usage_percent": null, "available_gb": null, "status": "error", "error": "Invalid disk info"}'
+        return 1
+    fi
+
+    usage_percent=$((10#$usage_percent))
+    if [[ $usage_percent -gt 100 ]]; then
+        echo '{"path": "/", "usage_percent": null, "available_gb": null, "status": "error", "error": "Invalid disk info"}'
+        return 1
+    fi
+
     # Use awk for division (more portable than bc which may not be installed)
     available_gb=$(awk -v kb="$available_kb" 'BEGIN {printf "%.2f", kb / 1048576}')
 
@@ -605,14 +650,15 @@ host_health_check() {
 
     # Check cache first
     if $use_cache && _hh_cache_valid "$hostname"; then
-        local cached
+        local cached cached_healthy
         cached=$(_hh_cache_read "$hostname")
+        cached_healthy=$(echo "$cached" | jq -r '.healthy')
         if $json_mode; then
             echo "$cached"
         else
             _hh_print_result "$hostname" "$cached"
         fi
-        return 0
+        [[ "$cached_healthy" == "true" ]] && return 0 || return 1
     fi
 
     # Get host configuration (uses yq with fallback parser)
@@ -823,14 +869,21 @@ _hh_print_result() {
             ;;
         error)
             _hh_log_error "$hostname ($platform): unhealthy"
-            local reachable disk_status
+            local reachable disk_status disk_usage disk_error
             reachable=$(echo "$result" | jq -r '.checks.connectivity.reachable')
             disk_status=$(echo "$result" | jq -r '.checks.disk_space.status')
+            disk_usage=$(echo "$result" | jq -r '.checks.disk_space.usage_percent')
 
             [[ "$reachable" == "false" ]] && \
                 _hh_log_error "  - Host unreachable"
-            [[ "$disk_status" == "error" ]] && \
-                _hh_log_error "  - Disk usage > ${_HH_DISK_ERROR_THRESHOLD}%"
+            if [[ "$disk_status" == "error" ]]; then
+                if [[ "$disk_usage" == "null" ]]; then
+                    disk_error=$(echo "$result" | jq -r '.checks.disk_space.error // "Disk check failed"')
+                    _hh_log_error "  - $disk_error"
+                else
+                    _hh_log_error "  - Disk usage > ${_HH_DISK_ERROR_THRESHOLD}%"
+                fi
+            fi
             ;;
     esac
 
