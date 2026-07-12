@@ -552,6 +552,188 @@ YAML
     config_validate_release_contract contract-tool
 }
 
+test_release_source_dependencies_absent_or_null_are_empty() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+YAML
+  [[ "$(config_get_release_source_dependencies_json contract-tool)" == "[]" ]] || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates: null
+YAML
+  [[ "$(config_get_release_source_dependencies_json contract-tool)" == "[]" ]]
+}
+
+test_release_source_dependencies_are_canonical_and_sorted() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/zeta
+    relative_path: zeta
+    revision: "ffffffffffffffffffffffffffffffffffffffff"
+    respect_gitignore: true
+  - local_path: /src/alpha
+    relative_path: alpha-core
+    revision: "1111111111111111111111111111111111111111"
+YAML
+
+  local expected
+  expected='[{"git_sha":"1111111111111111111111111111111111111111","relative_path":"alpha-core"},{"git_sha":"ffffffffffffffffffffffffffffffffffffffff","relative_path":"zeta"}]'
+  [[ "$(config_get_release_source_dependencies_json contract-tool)" == "$expected" ]] || return 1
+
+  expected='[{"git_sha":"1111111111111111111111111111111111111111","local_path":"/src/alpha","relative_path":"alpha-core"},{"git_sha":"ffffffffffffffffffffffffffffffffffffffff","local_path":"/src/zeta","relative_path":"zeta"}]'
+  [[ "$(_config_get_release_source_dependency_checkouts_json contract-tool)" == "$expected" ]]
+}
+
+test_release_source_dependencies_registry_fallback_and_repo_precedence() {
+  release_contract_test_deps_available || return 0
+  mkdir -p "$DSR_CONFIG_DIR"
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools:
+  contract-tool:
+    targets: [linux/amd64]
+    sibling_crates:
+      - local_path: /src/registry
+        relative_path: registry
+        revision: "3333333333333333333333333333333333333333"
+YAML
+
+  local expected
+  expected='[{"git_sha":"3333333333333333333333333333333333333333","relative_path":"registry"}]'
+  [[ "$(config_get_release_source_dependencies_json contract-tool)" == "$expected" ]] || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates: null
+YAML
+  [[ "$(config_get_release_source_dependencies_json contract-tool)" == "[]" ]]
+}
+
+test_release_source_dependencies_reject_missing_revision() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/alpha
+    relative_path: alpha
+YAML
+
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null
+}
+
+test_release_source_dependencies_require_absolute_nonroot_local_path() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: relative/alpha
+    relative_path: alpha
+    revision: "1111111111111111111111111111111111111111"
+YAML
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /
+    relative_path: alpha
+    revision: "1111111111111111111111111111111111111111"
+YAML
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null
+}
+
+test_release_source_dependencies_reject_unsafe_or_duplicate_paths() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/alpha
+    relative_path: ../alpha
+    revision: "1111111111111111111111111111111111111111"
+YAML
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/alpha
+    relative_path: shared
+    revision: "1111111111111111111111111111111111111111"
+  - local_path: /src/beta
+    relative_path: shared
+    revision: "2222222222222222222222222222222222222222"
+YAML
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null
+}
+
+test_release_source_dependencies_reject_nonportable_path_aliases() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/alpha-upper
+    relative_path: Alpha
+    revision: "1111111111111111111111111111111111111111"
+  - local_path: /src/alpha-lower
+    relative_path: alpha
+    revision: "2222222222222222222222222222222222222222"
+YAML
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/trailing-dot
+    relative_path: alias.
+    revision: "1111111111111111111111111111111111111111"
+YAML
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/device
+    relative_path: CON.txt
+    revision: "1111111111111111111111111111111111111111"
+YAML
+  ! config_get_release_source_dependencies_json contract-tool >/dev/null
+}
+
+test_config_validate_rejects_invalid_strict_release_dependency() {
+  release_contract_test_deps_available || return 0
+  config_init
+  config_load
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+sibling_crates:
+  - local_path: /src/alpha
+    relative_path: alpha
+    revision: ABCDEF1111111111111111111111111111111111
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+YAML
+
+  ! config_validate
+}
+
 test_release_contract_registry_false_is_rejected() {
   mkdir -p "$DSR_CONFIG_DIR"
   cat > "$DSR_REPOS_FILE" << 'YAML'
@@ -956,6 +1138,14 @@ main() {
   run_test "release_contract_rejects_non_object" test_release_contract_rejects_non_object
   run_test "release_contract_valid_is_canonical_json" test_release_contract_valid_is_canonical_json
   run_test "release_contract_registry_fallback" test_release_contract_registry_fallback
+  run_test "release_source_dependencies_absent_or_null_are_empty" test_release_source_dependencies_absent_or_null_are_empty
+  run_test "release_source_dependencies_are_canonical_and_sorted" test_release_source_dependencies_are_canonical_and_sorted
+  run_test "release_source_dependencies_registry_fallback_and_repo_precedence" test_release_source_dependencies_registry_fallback_and_repo_precedence
+  run_test "release_source_dependencies_reject_missing_revision" test_release_source_dependencies_reject_missing_revision
+  run_test "release_source_dependencies_require_absolute_nonroot_local_path" test_release_source_dependencies_require_absolute_nonroot_local_path
+  run_test "release_source_dependencies_reject_unsafe_or_duplicate_paths" test_release_source_dependencies_reject_unsafe_or_duplicate_paths
+  run_test "release_source_dependencies_reject_nonportable_path_aliases" test_release_source_dependencies_reject_nonportable_path_aliases
+  run_test "config_validate_rejects_invalid_strict_release_dependency" test_config_validate_rejects_invalid_strict_release_dependency
   run_test "release_contract_registry_false_is_rejected" test_release_contract_registry_false_is_rejected
   run_test "release_contract_rejects_multiple_yaml_documents" test_release_contract_rejects_multiple_yaml_documents
   run_test "release_contract_rejects_non_mapping_yaml_roots" test_release_contract_rejects_non_mapping_yaml_roots

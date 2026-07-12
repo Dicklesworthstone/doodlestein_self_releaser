@@ -74,6 +74,13 @@ artifact_naming: "${name}-${version}-${os}-${arch}"
 #     windows/amd64: example-tool-x86_64-pc-windows-msvc.exe
 #     windows/arm64: example-tool-aarch64-pc-windows-msvc.exe
 
+# Optional for strict releases with local path dependencies: pin each sibling
+# crate to the exact clean commit incorporated into the build manifest.
+# sibling_crates:
+#   - local_path: /absolute/path/to/example-core
+#     relative_path: example-core
+#     revision: "0123456789abcdef0123456789abcdef01234567"
+
 # Install.sh compatibility (optional)
 # When install.sh expects a different naming pattern than artifact_naming,
 # use one of these fields to ensure dsr uploads artifacts with BOTH names.

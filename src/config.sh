@@ -661,6 +661,113 @@ config_get_release_contract_json() {
     _config_canonicalize_release_contract_json "$raw_json"
 }
 
+# Canonicalize pinned sibling-crate checkouts for build-host validation. The
+# public manifest projection below deliberately omits machine-local paths.
+_config_canonicalize_release_source_dependency_checkouts_json() {
+    local raw_json="$1"
+
+    [[ "$raw_json" == "null" ]] && raw_json="[]"
+
+    local canonical
+    if ! canonical=$(printf '%s\n' "$raw_json" | jq -ceS '
+        def safe_relative_path:
+            type == "string" and
+            length > 0 and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            (contains("..") | not) and
+            (endswith(".") | not) and
+            ((ascii_downcase | test("^(con|prn|aux|nul|com[1-9]|lpt[1-9])($|\\.)")) | not);
+        def exact_git_sha:
+            type == "string" and
+            test("^[0-9a-f]{40}$") and
+            . != "0000000000000000000000000000000000000000";
+
+        if type != "array" then
+            error("sibling_crates must be an array or null")
+        elif ([.[] |
+            type == "object" and
+            has("local_path") and (.local_path | type == "string" and startswith("/") and length > 1) and
+            has("relative_path") and (.relative_path | safe_relative_path) and
+            has("revision") and (.revision | exact_git_sha)
+        ] | all | not) then
+            error("each sibling_crates entry requires local_path, safe relative_path, and exact revision")
+        elif ([.[].relative_path | ascii_downcase] | unique | length) != length then
+            error("sibling_crates relative_path values must be portable and case-insensitively unique")
+        else
+            map({relative_path, local_path, git_sha: .revision}) | sort_by(.relative_path)
+        end
+    ' 2>/dev/null); then
+        _cfg_log_error "Invalid pinned sibling_crates configuration"
+        return 4
+    fi
+
+    printf '%s\n' "$canonical"
+}
+
+# Internal: get machine-local pinned checkout descriptions. Per-tool repos.d
+# configuration takes precedence over repos.yaml.
+_config_get_release_source_dependency_checkouts_json() {
+    local toolname="${1:-}"
+
+    if [[ -z "$toolname" ]]; then
+        _cfg_log_error "Tool name required for release source dependency lookup"
+        return 4
+    fi
+    if ! command -v yq &>/dev/null || ! command -v jq &>/dev/null; then
+        _cfg_log_error "yq and jq are required for release source dependency parsing"
+        return 3
+    fi
+
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml"
+    local tool_json has_siblings raw_json
+
+    if [[ -f "$tool_config" ]]; then
+        tool_json=$(_config_read_single_mapping_json "$tool_config") || return $?
+        has_siblings=$(printf '%s\n' "$tool_json" | jq -r 'has("sibling_crates")') || return 4
+        if [[ "$has_siblings" == "true" ]]; then
+            raw_json=$(printf '%s\n' "$tool_json" | jq -c '.sibling_crates') || return 4
+            _config_canonicalize_release_source_dependency_checkouts_json "$raw_json"
+            return $?
+        fi
+    fi
+
+    if [[ -f "$DSR_REPOS_FILE" ]]; then
+        local registry_json
+        registry_json=$(_config_read_single_mapping_json "$DSR_REPOS_FILE") || return $?
+        if ! raw_json=$(printf '%s\n' "$registry_json" | jq -c --arg tool "$toolname" '
+            if (.tools | type) != "object" then
+                error("tools must be an object")
+            elif (.tools | has($tool)) and ((.tools[$tool] | type) != "object") then
+                error("tool entry must be an object")
+            elif (.tools | has($tool)) and (.tools[$tool] | has("sibling_crates")) then
+                .tools[$tool].sibling_crates
+            else
+                null
+            end' 2>/dev/null); then
+            _cfg_log_error "Could not parse sibling_crates for $toolname"
+            return 4
+        fi
+    else
+        raw_json="null"
+    fi
+
+    _config_canonicalize_release_source_dependency_checkouts_json "$raw_json"
+}
+
+# Get the exact source-dependency identities that a strict release manifest
+# must record, excluding host-local checkout paths.
+# Usage: config_get_release_source_dependencies_json <toolname>
+# Returns: Compact canonical JSON array sorted by relative_path.
+config_get_release_source_dependencies_json() {
+    local toolname="${1:-}"
+    local checkouts_json
+
+    checkouts_json=$(_config_get_release_source_dependency_checkouts_json "$toolname") || return $?
+    printf '%s\n' "$checkouts_json" | jq -ceS \
+        'map({relative_path, git_sha}) | sort_by(.relative_path)' 2>/dev/null
+}
+
 # Internal: get configured targets using the same per-tool precedence as the
 # release contract lookup. The raw array shape is validated by the caller.
 _config_get_tool_targets_json() {
@@ -741,6 +848,10 @@ config_validate_release_contract() {
              ($contract.exact_primary_assets | length))
         end
     ' >/dev/null 2>&1; then
+        if ! config_get_release_source_dependencies_json "$toolname" >/dev/null; then
+            _cfg_log_error "Invalid release source dependencies for $toolname"
+            return 4
+        fi
         return 0
     fi
 
@@ -941,3 +1052,4 @@ export -f config_get_host_for_platform
 export -f config_get_tool_field config_get_install_script_compat config_get_install_script_path
 export -f config_get_artifact_naming config_get_target_triple config_get_arch_alias
 export -f config_get_release_contract_json config_validate_release_contract
+export -f config_get_release_source_dependencies_json
