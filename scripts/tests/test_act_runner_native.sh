@@ -1247,6 +1247,9 @@ test_windows_strict_cargo_metadata_command() {
        grep -Fq "Strict CARGO_HOME already exists" "$command_file" && \
        grep -Fq "contains ambient configuration" "$command_file" && \
        grep -Fq "\$env:CARGO_HOME=\$strict" "$command_file" && \
+       grep -Fq "Set-Location -LiteralPath 'C:\build\source'; Write-Output ((Get-Location).Path)" \
+            "$command_file" && \
+       ! grep -Fq 'physical_source_root=' "$command_file" && \
        grep -Fq "cargo metadata --locked --offline --all-features --format-version 1 --manifest-path 'C:\build\source\Cargo.toml'" \
             "$command_file"; then
         log_pass "Windows strict metadata command is locked and offline"

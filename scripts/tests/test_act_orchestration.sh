@@ -1260,13 +1260,56 @@ closure_metadata_command_status=0
         "stub-host" "$closure_source_root" '[]'
 ) >/dev/null 2>&1 || closure_metadata_command_status=$?
 if [[ $closure_metadata_command_status -eq 0 ]] && \
-   grep -Fq "ancestor='$closure_snapshot_parent'" "$closure_metadata_command_file" && \
+   grep -Fq 'ancestor=${physical_source_root%/*}' "$closure_metadata_command_file" && \
    grep -Fq "cd '$closure_source_root'" "$closure_metadata_command_file" && \
    grep -Fq "CARGO_HOME=\"\$strict_home\" cargo metadata --locked --offline --all-features --format-version 1" \
         "$closure_metadata_command_file"; then
     pass "strict Cargo metadata uses the build cwd while isolating ancestor config"
 else
     fail "strict Cargo metadata cwd/config isolation was not constructed"
+fi
+
+closure_alias_logical_root="/tmp/dsr-closure-snapshot/source"
+closure_alias_physical_root="/private$closure_alias_logical_root"
+closure_alias_physical_metadata=$(jq -nc --arg root "$closure_alias_physical_root" '{
+    workspace_root: $root,
+    packages: [{manifest_path: ($root + "/Cargo.toml"), source: null}]
+}')
+closure_alias_command_file="$TEMP_DIR/strict-cargo-physical-command"
+closure_alias_command_status=0
+(
+    _act_is_windows_host() { return 1; }
+    _act_ssh_exec() {
+        printf '%s\n' "$2" > "$closure_alias_command_file"
+        printf '%s\n%s\n' "$closure_alias_physical_root" "$closure_alias_physical_metadata"
+    }
+    _act_validate_strict_cargo_source_closure \
+        "stub-host" "$closure_alias_logical_root" '[]'
+) >/dev/null 2>&1 || closure_alias_command_status=$?
+if [[ $closure_alias_command_status -eq 0 ]] && \
+   grep -Fq "physical_source_root=\$(cd '$closure_alias_logical_root' && pwd -P)" \
+        "$closure_alias_command_file" && \
+   grep -Fq 'strict_home="${physical_source_root%/*}/.cargo-home"' \
+        "$closure_alias_command_file" && \
+   grep -Fq 'ancestor=${physical_source_root%/*}' "$closure_alias_command_file" && \
+   grep -Fq 'cd "$physical_source_root"' "$closure_alias_command_file" && \
+   grep -Fq 'manifest-path "$physical_source_root/Cargo.toml"' \
+        "$closure_alias_command_file"; then
+    pass "strict Cargo metadata normalizes the macOS /tmp alias at the producer"
+else
+    fail "strict Cargo metadata mixed logical and physical source roots"
+fi
+
+closure_alias_lexical_metadata=$(jq -nc --arg root "$closure_alias_logical_root" '{
+    workspace_root: $root,
+    packages: [{manifest_path: ($root + "/Cargo.toml"), source: null}]
+}')
+if ! _act_validate_cargo_metadata_source_closure \
+        "$closure_alias_physical_root" '[]' "$closure_alias_lexical_metadata" \
+        >/dev/null 2>&1; then
+    pass "strict Cargo closure rejects a direct lexical alias mismatch"
+else
+    fail "strict Cargo closure accepted mixed /tmp and /private/tmp roots"
 fi
 
 closure_large_metadata=$(jq -nc --arg root "$closure_source_root" '{
