@@ -104,6 +104,8 @@ act_job_map:
   linux/amd64: build
   darwin/arm64: null
   windows/amd64: null
+act_overrides:
+  platform_image: catthehacker/ubuntu:full-22.04
 act_matrix:
   "linux/amd64":
     os: ubuntu-latest
@@ -195,10 +197,12 @@ echo ""
 echo "== act_get_flags (matrix) =="
 
 matrix_flags=$(act_get_flags "testool" "linux/amd64")
-if [[ "$matrix_flags" == *"--matrix os:ubuntu-latest"* ]] && [[ "$matrix_flags" == *"--matrix target:linux/amd64"* ]]; then
-    pass "act_get_flags includes matrix filters"
+if [[ "$matrix_flags" == *"-P ubuntu-latest=catthehacker/ubuntu:full-22.04"* ]] && \
+   [[ "$matrix_flags" == *"--matrix os:ubuntu-latest"* ]] && \
+   [[ "$matrix_flags" == *"--matrix target:linux/amd64"* ]]; then
+    pass "act_get_flags includes platform image and matrix filters"
 else
-    fail "act_get_flags missing matrix filters: $matrix_flags"
+    fail "act_get_flags missing platform image or matrix filters: $matrix_flags"
 fi
 
 echo ""

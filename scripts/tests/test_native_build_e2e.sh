@@ -124,6 +124,8 @@ targets:
 workflow: .github/workflows/release.yml
 act_job_map:
   linux/amd64: build
+act_overrides:
+  platform_image: catthehacker/ubuntu:full-22.04
 host_paths:
   mmini: /tmp/$tool_name
   wlap: C:/Users/Public/$tool_name
