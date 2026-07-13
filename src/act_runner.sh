@@ -1676,6 +1676,33 @@ _act_windows_rsync_path() {
     printf '%s\n' "$path"
 }
 
+# Ensure a remote directory (and all of its parent components) exists before we
+# write into it. rsync does NOT create intermediate parent directories of the
+# destination, so syncing to e.g. `release-work/<tool>-<version>/<repo>` fails
+# outright when the `<tool>-<version>` parent has not been created yet. The
+# local-host and tar-fallback sync paths already `mkdir -p`; this gives the
+# remote-rsync path the same guarantee.
+# Usage: _act_remote_mkdir <host> <remote_path>
+# Returns: 0 on success, 1 on failure
+_act_remote_mkdir() {
+    local host="$1"
+    local remote_path="$2"
+    local ssh_destination
+    ssh_destination=$(_act_get_ssh_destination "$host") || return 1
+    local ssh_opts=(-o "ConnectTimeout=$_ACT_SSH_TIMEOUT" -o StrictHostKeyChecking=accept-new)
+
+    if _act_is_windows_host "$host"; then
+        # cmd.exe: `mkdir` creates intermediate dirs; guard with `if not exist`.
+        local win_path
+        win_path=$(_act_windows_cmd_path "$remote_path")
+        ssh "${ssh_opts[@]}" "$ssh_destination" \
+            "cmd /c \"if not exist \"$win_path\" mkdir \"$win_path\"\"" >/dev/null 2>&1
+    else
+        ssh "${ssh_opts[@]}" "$ssh_destination" \
+            "mkdir -p '${remote_path//\'/\'\\\'\'}'" >/dev/null 2>&1
+    fi
+}
+
 _act_has_rsync() {
     local host="$1"
     local ssh_destination=""
@@ -1767,6 +1794,15 @@ _act_sync_source() {
 
     # Check for rsync on remote
     if _act_has_rsync "$host"; then
+        # rsync does not create the destination's parent directories, so make
+        # sure the full remote path exists first (mirrors the local-host and
+        # tar-fallback branches). Without this, a missing per-version parent dir
+        # makes the whole sync fail with "No such file or directory".
+        if ! _act_remote_mkdir "$host" "$remote_path"; then
+            _log_error "failed to create remote directory $remote_path on $host"
+            return 1
+        fi
+
         local rsync_remote_path="$remote_path"
         if _act_is_windows_host "$host"; then
             rsync_remote_path=$(_act_windows_rsync_path "$remote_path")
@@ -3620,6 +3656,28 @@ act_run_native_build() {
         fi
     fi
 
+    # Non-strict Rust builds still inherit the operator's *global* Cargo config,
+    # so a development `[patch.crates-io]` (e.g. a local frankensqlite dev
+    # checkout wired into ~/.cargo/config.toml) can leak into a published binary
+    # or, worse, break a `--locked` release when the patched version differs
+    # from Cargo.lock. `--strict-release` isolates fully; for the ordinary build
+    # path, isolate cheaply when it is safe to do so: a clean CARGO_HOME (defeats
+    # the $CARGO_HOME/config.toml source), plus building from a copy outside the
+    # operator's $HOME (defeats Cargo's ancestor-directory config walk, which
+    # reaches ~/.cargo/config.toml whenever the source lives under $HOME). The
+    # out-of-$HOME copy is only safe when CARGO_TARGET_DIR is an ABSOLUTE path
+    # (a relative one resolves against the build cwd, so moving the cwd would
+    # move the artifact away from where collection looks for it).
+    local nonstrict_rust_isolate=false
+    if [[ "$language" == "rust" ]] && ! $strict_rust_build; then
+        local _ctd_val
+        if _ctd_val=$(act_get_build_env_value "$build_env" "CARGO_TARGET_DIR" 2>/dev/null); then
+            case "$_ctd_val" in
+                /*) nonstrict_rust_isolate=true ;;
+            esac
+        fi
+    fi
+
     # Construct the remote command
     # Shell syntax depends on the build host OS, not only the target platform.
     local remote_cmd
@@ -3682,7 +3740,22 @@ act_run_native_build() {
             # Quote the env_pair to handle values with spaces (e.g., FOO="bar baz")
             env_exports+="export \"$env_pair\"; "
         done <<< "$build_env"
-        remote_cmd="set -e; cd '${remote_path//\'/\'\\\'\'}'; $env_exports$build_cmd"
+
+        # Default path: build in place under remote_path.
+        local rp_q="${remote_path//\'/\'\\\'\'}"
+        local cargo_home_prefix="" cd_cmd="cd '$rp_q'"
+        if $nonstrict_rust_isolate; then
+            # (a) clean CARGO_HOME that only reuses the download caches; and
+            # (b) when the source lives under $HOME, build from a copy under a
+            #     temp dir outside $HOME so Cargo's ancestor walk can't reach
+            #     ~/.cargo. CARGO_TARGET_DIR (absolute) is unchanged, so the
+            #     artifact still lands where collection expects it. All vars
+            #     below are expanded on the REMOTE host.
+            cargo_home_prefix="_dsr_ch=\"\${TMPDIR:-/tmp}/dsr-cargo-home\"; mkdir -p \"\$_dsr_ch\"; ln -sfn \"\$HOME/.cargo/registry\" \"\$_dsr_ch/registry\" 2>/dev/null || true; ln -sfn \"\$HOME/.cargo/git\" \"\$_dsr_ch/git\" 2>/dev/null || true; rm -f \"\$_dsr_ch/config\" \"\$_dsr_ch/config.toml\"; export CARGO_HOME=\"\$_dsr_ch\"; "
+            local iso_bd="\${TMPDIR:-/tmp}/dsr-build/${tool_name}-${platform//\//-}"
+            cd_cmd="_dsr_src='$rp_q'; if case \"\$_dsr_src/\" in \"\$HOME\"/*) true;; *) false;; esac; then _dsr_bd=\"$iso_bd\"; rm -rf \"\$_dsr_bd\" && mkdir -p \"\$_dsr_bd\" && cp -R \"\$_dsr_src/.\" \"\$_dsr_bd/\" && cd \"\$_dsr_bd\"; else cd \"\$_dsr_src\"; fi"
+        fi
+        remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
     fi
 
     # Execute on remote host
