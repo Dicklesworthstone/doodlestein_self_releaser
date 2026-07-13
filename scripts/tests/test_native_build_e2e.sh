@@ -921,7 +921,9 @@ test_live_build_windows_native() {
 
     local sync_preflight_exit=0
     local sync_preflight_output
-    sync_preflight_output=$(timeout 60 "$DSR_CMD" build mock_go_tool --target windows/amd64 --sync-only 2>&1) || sync_preflight_exit=$?
+    sync_preflight_output=$(DSR_RUN_ID="${DSR_RUN_ID}-windows-sync-preflight" \
+        timeout 60 "$DSR_CMD" build mock_go_tool --target windows/amd64 --sync-only 2>&1) || \
+        sync_preflight_exit=$?
     if [[ "$sync_preflight_exit" -ne 0 ]] || [[ "$sync_preflight_output" == *"Source sync failed"* ]]; then
         cleanup_test_environment
         log_skip "Skipped (source sync to wlap unavailable)"
@@ -931,7 +933,9 @@ test_live_build_windows_native() {
     local exit_code=0
     local timeout_secs="${DSR_E2E_TIMEOUT:-300}"
 
-    timeout "$timeout_secs" "$DSR_CMD" build mock_go_tool --target windows/amd64 2>&1 || exit_code=$?
+    DSR_RUN_ID="${DSR_RUN_ID}-windows-build" \
+        timeout "$timeout_secs" "$DSR_CMD" build mock_go_tool --target windows/amd64 2>&1 || \
+        exit_code=$?
 
     if [[ "$exit_code" -eq 0 ]]; then
         log_pass "Windows build via SSH succeeded"
