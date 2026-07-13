@@ -532,7 +532,14 @@ YAML
     local fake_home="$TEST_TMPDIR/bad-home"
     mkdir -p "$bin_dir" "$fake_home"
 
-    ln -s "$(command -v act)" "$bin_dir/act"
+    cat > "$bin_dir/act" << 'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+    printf 'act version 0.2.87\n'
+fi
+exit 0
+EOF
+    chmod +x "$bin_dir/act"
     ln -s /usr/bin/true "$bin_dir/docker"
 
     cat > "$fake_home/.actrc" << 'EOF'
