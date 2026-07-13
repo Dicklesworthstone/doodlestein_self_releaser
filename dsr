@@ -3963,11 +3963,23 @@ _release_contract_scan_release_by_tag() {
             log_error "GitHub returned an invalid strict release-list page"
             return 1
         fi
-        matches=$(jq -nc \
-            --arg expected_tag "$expected_tag" \
-            --argjson prior "$matches" \
-            --argjson page "$page_json" \
-            '$prior + [$page[] | select(.tag_name == $expected_tag)]') || return 1
+        if ! matches=$(
+            printf '%s\n%s\n' "$matches" "$page_json" |
+                jq -c -s -e \
+                    --arg expected_tag "$expected_tag" '
+                    if length == 2 and
+                       (.[0] | type == "array") and
+                       (.[1] | type == "array" and length <= 100)
+                    then
+                        .[0] + [.[1][] | select(.tag_name == $expected_tag)]
+                    else
+                        error("invalid strict release scan input")
+                    end
+                '
+        ); then
+            log_error "GitHub returned an invalid strict release-list page"
+            return 1
+        fi
         if [[ $(jq 'length' <<< "$matches") -gt 1 ]]; then
             log_error "Multiple GitHub releases use strict tag $expected_tag"
             return 1
@@ -3981,7 +3993,11 @@ _release_contract_scan_release_by_tag() {
         log_error "Strict release-list scan exceeded $max_pages pages"
         return 1
     fi
-    jq -nc --argjson matches "$matches" '{count: ($matches | length), release: ($matches[0] // null)}'
+    jq -c -e \
+        'if type == "array" and length <= 1
+         then {count: length, release: (.[0] // null)}
+         else error("invalid strict release scan result")
+         end' <<< "$matches"
 }
 
 _release_contract_observe_bound_draft() {
@@ -4445,7 +4461,17 @@ EOF
 
         scan_json=$(_release_contract_scan_release_by_tag \
             "$check_repo" "$check_tag") || return 1
-        match_count=$(jq -r '.count' <<< "$scan_json")
+        match_count=$(jq -er '
+            if type == "object" and
+               ((.count == 0 and .release == null) or
+                (.count == 1 and (.release | type == "object")))
+            then .count
+            else error("invalid strict release scan result")
+            end
+        ' <<< "$scan_json") || {
+            log_error "Strict release received an invalid release-list scan result"
+            return 1
+        }
         if [[ "$match_count" != "0" ]]; then
             log_error "Strict release refused an existing release for tag $check_tag"
             return 1

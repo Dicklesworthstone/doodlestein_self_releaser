@@ -166,6 +166,8 @@ seed_strict_verify_fixture() {
     unset STRICT_FIX_MUTATE_LOCAL_TAG_AFTER_UPLOAD
     unset STRICT_FIX_FLIP_AFTER_FIRST_POST_UPLOAD_GET
     unset STRICT_FIX_TAG_REBIND_ON_RELEASE_ID_GET
+    unset STRICT_VERIFY_RELEASE_PAGE_ONE_FILE STRICT_VERIFY_RELEASE_PAGE_TWO_FILE
+    unset STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
     STRICT_VERIFY_REPO="$TEST_TMPDIR/strict-repo"
     local artifacts_dir="$DSR_STATE_DIR/artifacts/${tool}-${tag}"
     mkdir -p "$STRICT_VERIFY_REPO" "$DSR_CONFIG_DIR/repos.d" "$artifacts_dir"
@@ -262,6 +264,27 @@ create_strict_verify_mock_gh() {
                 local method="GET"
                 [[ "$*" == *"-X PATCH"* ]] && method="PATCH"
                 [[ "$*" == *"-X DELETE"* ]] && method="DELETE"
+                case "$endpoint" in
+                    repos/testuser/test-tool/releases\?per_page=100\&page=*)
+                        if [[ -n "${STRICT_VERIFY_RELEASE_LIST_LOG:-}" ]]; then
+                            printf '%s\n' "$endpoint" >> "$STRICT_VERIFY_RELEASE_LIST_LOG"
+                        fi
+                        case "$endpoint" in
+                            *"page=1")
+                                if [[ -n "${STRICT_VERIFY_RELEASE_PAGE_ONE_FILE:-}" ]]; then
+                                    cat "$STRICT_VERIFY_RELEASE_PAGE_ONE_FILE"
+                                    return 0
+                                fi
+                                ;;
+                            *"page=2")
+                                if [[ -n "${STRICT_VERIFY_RELEASE_PAGE_TWO_FILE:-}" ]]; then
+                                    cat "$STRICT_VERIFY_RELEASE_PAGE_TWO_FILE"
+                                    return 0
+                                fi
+                                ;;
+                        esac
+                        ;;
+                esac
                 if [[ "$endpoint" == "repos/testuser/test-tool/releases?per_page=100&page=1" ]]; then
                     jq -nc \
                         --argjson assets "$STRICT_VERIFY_ASSETS" '
@@ -275,6 +298,9 @@ create_strict_verify_mock_gh() {
                         return 0
                         ;;
                     repos/testuser/test-tool/releases/123)
+                        if [[ -n "${STRICT_VERIFY_RELEASE_ID_LOG:-}" ]]; then
+                            printf '%s\n' "$endpoint" >> "$STRICT_VERIFY_RELEASE_ID_LOG"
+                        fi
                         jq -nc \
                             --arg tag_name "${STRICT_VERIFY_RELEASE_TAG:-v1.0.0}" \
                             --argjson assets "$STRICT_VERIFY_ASSETS" \
@@ -294,6 +320,63 @@ create_strict_verify_mock_gh() {
 
 remove_strict_verify_mock_gh() {
     unset -f gh curl
+    unset STRICT_VERIFY_RELEASE_PAGE_ONE_FILE STRICT_VERIFY_RELEASE_PAGE_TWO_FILE
+    unset STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
+}
+
+create_strict_verify_oversized_release_pages() {
+    local arg_max minimum_size body_size i
+    arg_max=$(getconf ARG_MAX 2>/dev/null || printf '2097152\n')
+    [[ "$arg_max" =~ ^[1-9][0-9]*$ ]] || arg_max=2097152
+    minimum_size=$((8 * 1024 * 1024 + 64 * 1024))
+    body_size=$((arg_max + 64 * 1024))
+    ((body_size < minimum_size)) && body_size=$minimum_size
+
+    STRICT_VERIFY_RELEASE_PAGE_ONE_FILE="$TEST_TMPDIR/strict-release-page-1.json"
+    STRICT_VERIFY_RELEASE_PAGE_TWO_FILE="$TEST_TMPDIR/strict-release-page-2.json"
+    STRICT_VERIFY_RELEASE_LIST_LOG="$TEST_TMPDIR/strict-release-list.log"
+    STRICT_VERIFY_RELEASE_ID_LOG="$TEST_TMPDIR/strict-release-id.log"
+    STRICT_VERIFY_ARG_MAX="$arg_max"
+
+    {
+        printf '[{"id":123,"tag_name":"v1.0.0","body":"'
+        head -c "$body_size" /dev/zero | tr '\0' 'x'
+        printf '","draft":false,"html_url":"https://example.invalid/v1.0.0","assets":%s}' \
+            "$STRICT_VERIFY_ASSETS"
+        for ((i = 1; i < 100; i++)); do
+            printf ',{"id":%d,"tag_name":"v9.%d.0"}' "$((1000 + i))" "$i"
+        done
+        printf ']\n'
+    } > "$STRICT_VERIFY_RELEASE_PAGE_ONE_FILE"
+    printf '[]\n' > "$STRICT_VERIFY_RELEASE_PAGE_TWO_FILE"
+    : > "$STRICT_VERIFY_RELEASE_LIST_LOG"
+    : > "$STRICT_VERIFY_RELEASE_ID_LOG"
+
+    export STRICT_VERIFY_RELEASE_PAGE_ONE_FILE STRICT_VERIFY_RELEASE_PAGE_TWO_FILE
+    export STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
+    export STRICT_VERIFY_ARG_MAX
+}
+
+create_strict_verify_duplicate_release_pages() {
+    STRICT_VERIFY_RELEASE_PAGE_ONE_FILE="$TEST_TMPDIR/strict-release-page-1.json"
+    STRICT_VERIFY_RELEASE_PAGE_TWO_FILE="$TEST_TMPDIR/strict-release-page-2.json"
+    STRICT_VERIFY_RELEASE_LIST_LOG="$TEST_TMPDIR/strict-release-list.log"
+    STRICT_VERIFY_RELEASE_ID_LOG="$TEST_TMPDIR/strict-release-id.log"
+
+    jq -nc '
+        [range(0; 100) as $index |
+            if $index == 0
+            then {id: 123, tag_name: "v1.0.0"}
+            else {id: (1000 + $index), tag_name: ("v9." + ($index | tostring) + ".0")}
+            end]
+    ' > "$STRICT_VERIFY_RELEASE_PAGE_ONE_FILE"
+    printf '[{"id":456,"tag_name":"v1.0.0"}]\n' \
+        > "$STRICT_VERIFY_RELEASE_PAGE_TWO_FILE"
+    : > "$STRICT_VERIFY_RELEASE_LIST_LOG"
+    : > "$STRICT_VERIFY_RELEASE_ID_LOG"
+
+    export STRICT_VERIFY_RELEASE_PAGE_ONE_FILE STRICT_VERIFY_RELEASE_PAGE_TWO_FILE
+    export STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
 }
 
 create_strict_verify_fix_mock_gh() {
@@ -920,6 +1003,84 @@ test_strict_verify_rejects_wrong_release_tag() {
         fail "strict release verify must bind the release ID to the requested tag"
         echo "status: $status"
         echo "output: $output"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_verify_mock_gh
+    harness_teardown
+}
+
+test_strict_verify_scans_release_page_larger_than_arg_max() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict release contract parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    create_strict_verify_oversized_release_pages
+    create_strict_verify_mock_gh
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0
+    local status output page_size release_list_calls release_id_calls
+    status=$(exec_status)
+    output=$(exec_stdout)
+    page_size=$(wc -c < "$STRICT_VERIFY_RELEASE_PAGE_ONE_FILE" | tr -d '[:space:]')
+    release_list_calls=$(cat "$STRICT_VERIFY_RELEASE_LIST_LOG")
+    release_id_calls=$(cat "$STRICT_VERIFY_RELEASE_ID_LOG")
+
+    if [[ $status -eq 0 && $page_size -gt $STRICT_VERIFY_ARG_MAX ]] &&
+       jq -e --argjson arg_max "$STRICT_VERIFY_ARG_MAX" '
+           length == 100 and
+           ([.[] | select(.tag_name == "v1.0.0")] | length == 1) and
+           ([.[] | select(.tag_name == "v1.0.0")][0].body | length > $arg_max)
+       ' "$STRICT_VERIFY_RELEASE_PAGE_ONE_FILE" >/dev/null 2>&1 &&
+       [[ "$release_list_calls" == $'repos/testuser/test-tool/releases?per_page=100&page=1\nrepos/testuser/test-tool/releases?per_page=100&page=2' ]] &&
+       [[ "$release_id_calls" == $'repos/testuser/test-tool/releases/123\nrepos/testuser/test-tool/releases/123' ]] &&
+       jq -e '.details.verification.missing == 0 and .details.verification.extra == 0' \
+           <<< "$output" >/dev/null 2>&1; then
+        pass "strict release verify streams oversized release pages and retained matches"
+    else
+        fail "strict release verify must not pass release-list JSON through argv"
+        echo "status: $status; page size: $page_size; ARG_MAX: $STRICT_VERIFY_ARG_MAX"
+        echo "release-list calls: $release_list_calls"
+        echo "release-id calls: $release_id_calls"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_verify_mock_gh
+    harness_teardown
+}
+
+test_strict_verify_rejects_duplicate_tag_across_pages() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict release contract parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    create_strict_verify_duplicate_release_pages
+    create_strict_verify_mock_gh
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0
+    local status release_list_calls
+    status=$(exec_status)
+    release_list_calls=$(cat "$STRICT_VERIFY_RELEASE_LIST_LOG")
+
+    if [[ $status -eq 7 ]] &&
+       [[ "$release_list_calls" == $'repos/testuser/test-tool/releases?per_page=100&page=1\nrepos/testuser/test-tool/releases?per_page=100&page=2' ]] &&
+       [[ ! -s "$STRICT_VERIFY_RELEASE_ID_LOG" ]]; then
+        pass "strict release verify rejects duplicate exact tags across pages before ID lookup"
+    else
+        fail "strict release verify must fail closed on duplicate exact tags"
+        echo "status: $status"
+        echo "release-list calls: $release_list_calls"
+        echo "release-id calls: $(cat "$STRICT_VERIFY_RELEASE_ID_LOG")"
         echo "stderr: $(exec_stderr | tail -20)"
     fi
 
@@ -1656,6 +1817,8 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_verify_rejects_extra_or_incomplete_remote_assets
     test_strict_verify_rejects_remote_digest_mismatch
     test_strict_verify_rejects_wrong_release_tag
+    test_strict_verify_scans_release_page_larger_than_arg_max
+    test_strict_verify_rejects_duplicate_tag_across_pages
     test_strict_fix_refuses_public_release_without_mutation
     test_strict_fix_rejects_local_asset_mutation_before_upload
     test_strict_fix_failed_clobber_restores_draft
@@ -1699,6 +1862,8 @@ test_strict_verify_requires_exact_names_sizes_and_sidecars
 test_strict_verify_rejects_extra_or_incomplete_remote_assets
 test_strict_verify_rejects_remote_digest_mismatch
 test_strict_verify_rejects_wrong_release_tag
+test_strict_verify_scans_release_page_larger_than_arg_max
+test_strict_verify_rejects_duplicate_tag_across_pages
 test_verify_handles_no_manifest
 
 echo ""

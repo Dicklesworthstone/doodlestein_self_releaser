@@ -147,6 +147,7 @@ seed_strict_release_fixture() {
     unset STRICT_UPLOAD_COMMIT_ERROR_ON_NAME
     unset STRICT_FLIP_PUBLIC_DURING_UPLOAD STRICT_FLIP_PUBLIC_ON_RELEASE_GET
     unset STRICT_CREATE_COMPETITOR_DRAFT
+    unset STRICT_RELEASE_LIST_SCENARIO
     export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
     STRICT_REPO_DIR="$TEST_TMPDIR/repo"
     STRICT_ARTIFACTS_DIR="$TEST_TMPDIR/artifacts"
@@ -327,6 +328,33 @@ create_strict_github_mocks() {
                             tag_release_get_count=0
                         tag_release_get_count=$((tag_release_get_count + 1))
                         printf '%s\n' "$tag_release_get_count" > "$STRICT_RELEASE_LIST_GET_COUNT_FILE"
+                        case "${STRICT_RELEASE_LIST_SCENARIO:-}" in
+                            failure)
+                                return 1
+                                ;;
+                            duplicate)
+                                jq -nc '
+                                    [range(0; 100) as $index |
+                                        if $index == 0
+                                        then {id: 123, tag_name: "v1.0.0"}
+                                        else {
+                                            id: (1000 + $index),
+                                            tag_name: ("v9." + ($index | tostring) + ".0")
+                                        }
+                                        end]
+                                '
+                                return 0
+                                ;;
+                            malformed)
+                                jq -nc '
+                                    [range(0; 100) as $index | {
+                                        id: (1000 + $index),
+                                        tag_name: ("v9." + ($index | tostring) + ".0")
+                                    }]
+                                '
+                                return 0
+                                ;;
+                        esac
                         if [[ "$release_exists" != "true" ]]; then
                             printf '[]\n'
                             return 0
@@ -354,6 +382,18 @@ create_strict_github_mocks() {
                                 assets: $assets
                             }]
                         '
+                        ;;
+                    repos/testuser/test-tool/releases\?per_page=100\&page=2:GET)
+                        local tag_release_get_count=0
+                        read -r tag_release_get_count < "$STRICT_RELEASE_LIST_GET_COUNT_FILE" || \
+                            tag_release_get_count=0
+                        tag_release_get_count=$((tag_release_get_count + 1))
+                        printf '%s\n' "$tag_release_get_count" > "$STRICT_RELEASE_LIST_GET_COUNT_FILE"
+                        case "${STRICT_RELEASE_LIST_SCENARIO:-}" in
+                            duplicate) printf '[{"id":456,"tag_name":"v1.0.0"}]\n' ;;
+                            malformed) printf '{"invalid":"release-list-page"}\n' ;;
+                            *) return 1 ;;
+                        esac
                         ;;
                     repos/testuser/test-tool/releases/tags/v1.0.0:GET)
                         printf 'gh: Not Found (HTTP 404)\n' >&2
@@ -578,6 +618,7 @@ create_strict_github_mocks() {
 
 remove_strict_github_mocks() {
     unset -f gh curl
+    unset STRICT_RELEASE_LIST_SCENARIO
 }
 
 # ============================================================================
@@ -1429,6 +1470,87 @@ test_strict_release_preflight_failure_has_no_github_mutation() {
     harness_teardown
 }
 
+test_strict_release_rejects_duplicate_tag_across_pages_before_mutation() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    export STRICT_RELEASE_LIST_SCENARIO=duplicate
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status release_list_reads
+    status=$(exec_status)
+    release_list_reads=$(cat "$STRICT_RELEASE_LIST_GET_COUNT_FILE")
+
+    if [[ $status -eq 7 && $release_list_reads -eq 2 && ! -s "$STRICT_MUTATION_LOG" ]] &&
+       exec_stderr_contains "Multiple GitHub releases use strict tag v1.0.0"; then
+        pass "strict release rejects duplicate paginated tags before GitHub mutation"
+    else
+        fail "duplicate paginated tags must stop strict release before mutation"
+        echo "status: $status; release-list reads: $release_list_reads"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_malformed_second_page_before_mutation() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    export STRICT_RELEASE_LIST_SCENARIO=malformed
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status release_list_reads
+    status=$(exec_status)
+    release_list_reads=$(cat "$STRICT_RELEASE_LIST_GET_COUNT_FILE")
+
+    if [[ $status -eq 7 && $release_list_reads -eq 2 && ! -s "$STRICT_MUTATION_LOG" ]] &&
+       exec_stderr_contains "GitHub returned an invalid strict release-list page"; then
+        pass "strict release rejects malformed pagination before GitHub mutation"
+    else
+        fail "malformed pagination must stop strict release before mutation"
+        echo "status: $status; release-list reads: $release_list_reads"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_release_list_failure_before_mutation() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    export STRICT_RELEASE_LIST_SCENARIO=failure
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status release_list_reads
+    status=$(exec_status)
+    release_list_reads=$(cat "$STRICT_RELEASE_LIST_GET_COUNT_FILE")
+
+    if [[ $status -eq 7 && $release_list_reads -eq 1 && ! -s "$STRICT_MUTATION_LOG" ]] &&
+       exec_stderr_contains "Could not scan GitHub releases for strict tag v1.0.0"; then
+        pass "strict release rejects a release-list failure before GitHub mutation"
+    else
+        fail "release-list failure must stop strict release before mutation"
+        echo "status: $status; release-list reads: $release_list_reads"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
 test_strict_release_rejects_dependency_pin_mismatch_before_mutation() {
     ((TESTS_RUN++))
     harness_setup
@@ -1842,6 +1964,9 @@ if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_publish_error_without_commit_stays_draft
     test_strict_redraft_commit_then_error_is_observed
     test_strict_release_preflight_failure_has_no_github_mutation
+    test_strict_release_rejects_duplicate_tag_across_pages_before_mutation
+    test_strict_release_rejects_malformed_second_page_before_mutation
+    test_strict_release_rejects_release_list_failure_before_mutation
     test_strict_release_rejects_dependency_pin_mismatch_before_mutation
     test_strict_release_extra_remote_asset_stays_draft
     test_strict_release_remote_digest_mismatch_stays_draft
@@ -1900,6 +2025,9 @@ test_strict_publish_commit_then_error_is_observed
 test_strict_publish_error_without_commit_stays_draft
 test_strict_redraft_commit_then_error_is_observed
 test_strict_release_preflight_failure_has_no_github_mutation
+test_strict_release_rejects_duplicate_tag_across_pages_before_mutation
+test_strict_release_rejects_malformed_second_page_before_mutation
+test_strict_release_rejects_release_list_failure_before_mutation
 test_strict_release_rejects_dependency_pin_mismatch_before_mutation
 test_strict_release_extra_remote_asset_stays_draft
 test_strict_release_remote_digest_mismatch_stays_draft
