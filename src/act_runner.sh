@@ -1903,11 +1903,13 @@ _act_write_tracked_manifest() {
         while IFS=$'\t' read -r metadata path; do
             [[ -n "$metadata" && -n "$path" ]] || continue
             read -r mode object_type object_id <<< "$metadata"
-            if [[ "$object_type" != "blob" || \
-                  ( "$mode" != "100644" && "$mode" != "100755" ) || \
+            if [[ ! ( ( "$object_type" == "blob" && \
+                        ( "$mode" == "100644" || "$mode" == "100755" ) ) || \
+                      ( "$object_type" == "commit" && "$mode" == "160000" ) ) || \
                   ! "$object_id" =~ ^[0-9a-f]{40}$ || \
                   ! "$path" =~ ^[A-Za-z0-9_./+@-]+$ || "$path" == *..* || \
-                  ! -f "$repo_path/$path" || -L "$repo_path/$path" ]]; then
+                  ( "$mode" != "160000" && \
+                    ( ! -f "$repo_path/$path" || -L "$repo_path/$path" ) ) ]]; then
                 _log_error "Strict release tracked path cannot be represented safely: $path"
                 exit 4
             fi
@@ -1929,10 +1931,14 @@ _act_tracked_manifest_object_count() {
     [[ -f "$manifest_file" && ! -L "$manifest_file" ]] || return 4
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
-           ( "$mode" == "100644" || "$mode" == "100755" ) && \
+           ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
            "$relative_path" =~ ^[A-Za-z0-9_./+@-]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
-        expected_objects["f:$relative_path"]=1
+        if [[ "$mode" == "160000" ]]; then
+            expected_objects["d:$relative_path"]=1
+        else
+            expected_objects["f:$relative_path"]=1
+        fi
         parent="$relative_path"
         while [[ "$parent" == */* ]]; do
             parent="${parent%/*}"
@@ -1948,7 +1954,7 @@ _act_tracked_manifest_object_count() {
 _act_verify_tracked_manifest_local() {
     local root_path="$1"
     local manifest_file="$2"
-    local object_id mode relative_path actual_id parent expected_count actual_count
+    local object_id mode relative_path actual_id parent expected_count actual_count gitlink_contents
 
     if [[ ! -d "$root_path" || -L "$root_path" ]] || \
        ! expected_count=$(_act_tracked_manifest_object_count "$manifest_file"); then
@@ -1957,15 +1963,23 @@ _act_verify_tracked_manifest_local() {
 
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
-           ( "$mode" == "100644" || "$mode" == "100755" ) && \
+           ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
            "$relative_path" =~ ^[A-Za-z0-9_./+@-]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
-        if [[ ! -f "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
-           ! actual_id=$(git hash-object -- "$root_path/$relative_path" 2>/dev/null) || \
-           [[ "$actual_id" != "$object_id" ]] || \
-           { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
-           { [[ "$mode" == "100644" ]] && [[ -x "$root_path/$relative_path" ]]; }; then
-            return 4
+        if [[ "$mode" == "160000" ]]; then
+            if [[ ! -d "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
+               ! gitlink_contents=$(find "$root_path/$relative_path" -mindepth 1 -print -quit 2>/dev/null) || \
+               [[ -n "$gitlink_contents" ]]; then
+                return 4
+            fi
+        else
+            if [[ ! -f "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
+               ! actual_id=$(git hash-object -- "$root_path/$relative_path" 2>/dev/null) || \
+               [[ "$actual_id" != "$object_id" ]] || \
+               { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
+               { [[ "$mode" == "100644" ]] && [[ -x "$root_path/$relative_path" ]]; }; then
+                return 4
+            fi
         fi
         parent="$relative_path"
         while [[ "$parent" == */* ]]; do
@@ -2370,6 +2384,58 @@ _act_sync_strict_checkout() {
     fi
 }
 
+_act_unix_strict_snapshot_verify_script() {
+    local remote_path="$1"
+    local remote_archive="$2"
+    local remote_manifest="$3"
+    local expected_manifest_digest="$4"
+    local expected_object_count="$5"
+
+    cat << EOF
+set -e
+test -d '$remote_path'; test ! -L '$remote_path'
+test -f '$remote_archive'; test ! -L '$remote_archive'
+test -f '$remote_manifest'; test ! -L '$remote_manifest'
+if command -v sha256sum >/dev/null 2>&1; then
+    archive_digest=\$(sha256sum '$remote_archive' | awk '{print \$1}')
+    manifest_digest=\$(sha256sum '$remote_manifest' | awk '{print \$1}')
+else
+    archive_digest=\$(shasum -a 256 '$remote_archive' | awk '{print \$1}')
+    manifest_digest=\$(shasum -a 256 '$remote_manifest' | awk '{print \$1}')
+fi
+test "\$manifest_digest" = '$expected_manifest_digest'
+tab=\$(printf '\\t')
+while IFS="\$tab" read -r object_id mode relative_path; do
+    test -n "\$relative_path"
+    printf '%s\\n' "\$object_id" | grep -Eq '^[0-9a-f]{40}\$'
+    case "\$mode" in 100644|100755|160000) :;; *) exit 21;; esac
+    case "\$relative_path" in /*|*..*|*[!A-Za-z0-9_./+@-]*) exit 21;; esac
+    node='$remote_path'/\$relative_path
+    parent=\$relative_path
+    while test "\${parent#*/}" != "\$parent"; do
+        parent=\${parent%/*}
+        test -d '$remote_path'/\$parent
+        test ! -L '$remote_path'/\$parent
+    done
+    if test "\$mode" = 160000; then
+        test -d "\$node"
+        test ! -L "\$node"
+        gitlink_contents=\$(find "\$node" -mindepth 1 -print -quit)
+        test -z "\$gitlink_contents"
+    else
+        test -f "\$node"
+        test ! -L "\$node"
+        actual=\$(git hash-object -- "\$node")
+        test "\$actual" = "\$object_id"
+        if test "\$mode" = 100755; then test -x "\$node"; else test ! -x "\$node"; fi
+    fi
+done < '$remote_manifest'
+actual_count=\$(find '$remote_path' -mindepth 1 -print | wc -l | tr -d '[:space:]')
+test "\$actual_count" = '$expected_object_count'
+printf '%s %s\\n' "\$archive_digest" "\$manifest_digest"
+EOF
+}
+
 _act_verify_strict_checkout_snapshot() {
     local host="$1"
     local local_path="$2"
@@ -2423,14 +2489,14 @@ _act_verify_strict_checkout_snapshot() {
         win_remote_archive=$(_act_windows_cmd_path "$remote_archive")
         win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
         reparse_guard=$(_act_windows_reparse_guard_script)
-        ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$file=Join-Path '${win_remote_path}' \$parts[2]; try { Assert-PlainFile \$file; \$actual=(git hash-object -- \$file).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)\""
+        ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$node=Join-Path '${win_remote_path}' \$parts[2]; try { if (\$parts[1] -eq '160000') { Assert-PlainDirectory \$node; if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { \$ok=\$false } } else { Assert-PlainFile \$node; \$actual=(git hash-object -- \$node).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)\""
         verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$ps_command") || return 4
         read -r actual_digest actual_manifest_digest <<< "$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1)"
     else
         local remote_cmd verify_output
-        remote_cmd="set -e; test -d '$remote_path'; test ! -L '$remote_path'; test -f '$remote_archive'; test ! -L '$remote_archive'; test -f '$remote_manifest'; test ! -L '$remote_manifest'; if command -v sha256sum >/dev/null 2>&1; then archive_digest=\$(sha256sum '$remote_archive' | awk '{print \$1}'); manifest_digest=\$(sha256sum '$remote_manifest' | awk '{print \$1}'); else archive_digest=\$(shasum -a 256 '$remote_archive' | awk '{print \$1}'); manifest_digest=\$(shasum -a 256 '$remote_manifest' | awk '{print \$1}'); fi; test \"\$manifest_digest\" = '$expected_manifest_digest'; tab=\$(printf '\\t'); while IFS=\"\$tab\" read -r object_id mode relative_path; do test -n \"\$relative_path\"; case \"\$object_id:\$mode:\$relative_path\" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]:100644:*|[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]:100755:*) :;; *) exit 21;; esac; case \"\$relative_path\" in /*|*..*|*[!A-Za-z0-9_./+@-]*) exit 21;; esac; file='$remote_path'/\$relative_path; test -f \"\$file\"; test ! -L \"\$file\"; parent=\$relative_path; while test \"\${parent#*/}\" != \"\$parent\"; do parent=\${parent%/*}; test -d '$remote_path'/\$parent; test ! -L '$remote_path'/\$parent; done; actual=\$(git hash-object -- \"\$file\"); test \"\$actual\" = \"\$object_id\"; if test \"\$mode\" = 100755; then test -x \"\$file\"; else test ! -x \"\$file\"; fi; done < '$remote_manifest'; actual_count=\$(find '$remote_path' -mindepth 1 -print | wc -l | tr -d '[:space:]'); test \"\$actual_count\" = '$expected_object_count'; printf '%s %s\\n' \"\$archive_digest\" \"\$manifest_digest\""
+        remote_cmd=$(_act_unix_strict_snapshot_verify_script "$remote_path" "$remote_archive" "$remote_manifest" "$expected_manifest_digest" "$expected_object_count") || return 4
         verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_cmd") || return 4

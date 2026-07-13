@@ -1285,12 +1285,23 @@ echo "== strict fresh source sync =="
 strict_sync_repo="$TEMP_DIR/strict-sync-repo"
 strict_sync_base="$TEMP_DIR/strict-sync-remote/project"
 strict_sync_run_id="550e8400-e29b-41d4-a716-446655440040"
+strict_gitlink_repo="$TEMP_DIR/strict-gitlink-repo"
+mkdir -p "$strict_gitlink_repo"
+printf 'pinned submodule commit\n' > "$strict_gitlink_repo/README.md"
+git -C "$strict_gitlink_repo" init -q
+git -C "$strict_gitlink_repo" add README.md
+git -C "$strict_gitlink_repo" -c user.name=DSR-Test -c user.email=dsr-test@example.invalid \
+    commit -qm 'gitlink fixture'
+strict_gitlink_sha=$(git -C "$strict_gitlink_repo" rev-parse HEAD)
 mkdir -p "$strict_sync_repo"
 printf 'tracked release bytes\n' > "$strict_sync_repo/tracked.txt"
 printf 'ignored.cache\n' > "$strict_sync_repo/.gitignore"
 printf 'must never reach a strict builder\n' > "$strict_sync_repo/ignored.cache"
 git -C "$strict_sync_repo" init -q
 git -C "$strict_sync_repo" add tracked.txt .gitignore
+git -C "$strict_sync_repo" update-index --add \
+    --cacheinfo "160000,$strict_gitlink_sha,vendor/submodule"
+mkdir -p "$strict_sync_repo/vendor/submodule"
 git -C "$strict_sync_repo" -c user.name=DSR-Test -c user.email=dsr-test@example.invalid \
     commit -qm 'strict sync fixture'
 strict_sync_sha=$(git -C "$strict_sync_repo" rev-parse HEAD)
@@ -1386,12 +1397,18 @@ strict_sync_output=$(
     ) 2>/dev/null
 ) || strict_sync_status=$?
 strict_sync_root=$(echo "$strict_sync_output" | jq -r '.source_roots.trj // empty')
+strict_sync_manifest="${strict_sync_root%/source}/.source.manifest"
+strict_sync_object_count=$(_act_tracked_manifest_object_count "$strict_sync_manifest" 2>/dev/null || true)
 if [[ $strict_sync_status -eq 0 && -n "$strict_sync_root" && \
       -f "$strict_sync_root/tracked.txt" && ! -e "$strict_sync_root/.git" && \
-      ! -e "$strict_sync_root/ignored.cache" ]] && \
+      ! -e "$strict_sync_root/ignored.cache" && \
+      -d "$strict_sync_root/vendor/submodule" && \
+      -z "$(find "$strict_sync_root/vendor/submodule" -mindepth 1 -print -quit)" && \
+      "$strict_sync_object_count" == "4" ]] && \
+   grep -Fq "$strict_gitlink_sha"$'\t160000\tvendor/submodule' "$strict_sync_manifest" && \
    echo "$strict_sync_output" | jq -e \
         '.status == "success" and (.source_roots | keys) == ["trj"]' &>/dev/null; then
-    pass "strict sync uses a canonical fresh source root containing tracked bytes only"
+    pass "strict sync authenticates gitlinks as empty directory placeholders"
 else
     fail "strict fresh source sync failed: status=$strict_sync_status output=$strict_sync_output"
 fi
@@ -1403,6 +1420,21 @@ if _act_verify_strict_source_roots \
     pass "strict source-root verification accepts an unchanged transferred snapshot"
 else
     fail "strict source-root verification rejected an unchanged transferred snapshot"
+fi
+
+strict_gitlink_tamper_root="$TEMP_DIR/strict-gitlink-tamper/run/source"
+if _act_sync_strict_checkout \
+        "trj" "$strict_sync_repo" "$strict_sync_sha" "$strict_gitlink_tamper_root" \
+        "source.tar" "gitlink-tamper" >/dev/null 2>&1; then
+    printf 'must not enter a gitlink placeholder\n' > \
+        "$strict_gitlink_tamper_root/vendor/submodule/injected.txt"
+fi
+if ! _act_verify_strict_checkout_snapshot \
+        "trj" "$strict_sync_repo" "$strict_sync_sha" "$strict_gitlink_tamper_root" \
+        "source.tar" "gitlink-tamper" >/dev/null 2>&1; then
+    pass "strict source verification rejects content beneath a gitlink placeholder"
+else
+    fail "strict source verification accepted content beneath a gitlink placeholder"
 fi
 
 strict_extra_file_root="$TEMP_DIR/strict-extra-file/run/source"
@@ -1472,6 +1504,30 @@ else
     fail "strict mocked Unix SSH verification accepted an extra file"
 fi
 
+strict_unix_gitlink_root="$TEMP_DIR/strict-unix-gitlink/run/source"
+_act_sync_strict_checkout \
+    "trj" "$strict_sync_repo" "$strict_sync_sha" "$strict_unix_gitlink_root" \
+    "source.tar" "unix-gitlink" >/dev/null 2>&1
+strict_unix_gitlink_status=0
+(
+    _act_is_local_host() { return 1; }
+    _act_is_windows_host() { return 1; }
+    _act_get_ssh_destination() { printf 'mock-unix\n'; }
+    _act_run_with_timeout() { shift; "$@"; }
+    ssh() {
+        local remote_command="${!#}"
+        "$BASH" -c "$remote_command"
+    }
+    _act_verify_strict_checkout_snapshot \
+        "mmini" "$strict_sync_repo" "$strict_sync_sha" "$strict_unix_gitlink_root" \
+        "source.tar" "unix-gitlink"
+) >/dev/null 2>&1 || strict_unix_gitlink_status=$?
+if [[ $strict_unix_gitlink_status -eq 0 ]]; then
+    pass "strict mocked Unix SSH verification accepts an empty gitlink placeholder"
+else
+    fail "strict mocked Unix SSH verification rejected an empty gitlink placeholder"
+fi
+
 strict_unix_symlink_root="$TEMP_DIR/strict-unix-symlink/run/source"
 _act_sync_strict_checkout \
     "trj" "$strict_sync_repo" "$strict_sync_sha" "$strict_unix_symlink_root" \
@@ -1498,6 +1554,32 @@ else
 fi
 
 strict_windows_archive_digest=$(_act_git_archive_sha256 "$strict_sync_repo" "$strict_sync_sha")
+strict_windows_gitlink_command_file="$TEMP_DIR/strict-windows-gitlink-command"
+strict_windows_gitlink_status=0
+(
+    _act_is_local_host() { return 1; }
+    _act_is_windows_host() { return 0; }
+    _act_get_ssh_destination() { printf 'mock-windows\n'; }
+    _act_run_with_timeout() { shift; "$@"; }
+    ssh() {
+        local remote_command="${!#}" manifest_digest
+        printf '%s\n' "$remote_command" > "$strict_windows_gitlink_command_file"
+        manifest_digest=$(printf '%s\n' "$remote_command" | grep -Eo '[0-9a-f]{64}' | head -1)
+        printf '%s %s\n' "$strict_windows_archive_digest" "$manifest_digest"
+    }
+    _act_verify_strict_checkout_snapshot \
+        "wlap" "$strict_sync_repo" "$strict_sync_sha" \
+        "C:/build/.dsr-release-snapshots/windows-gitlink/run/source" \
+        "source.tar" "windows-gitlink"
+) >/dev/null 2>&1 || strict_windows_gitlink_status=$?
+if [[ $strict_windows_gitlink_status -eq 0 ]] && \
+   grep -Fq "parts[1] -eq '160000'" "$strict_windows_gitlink_command_file" && \
+   grep -Fq 'Get-ChildItem -LiteralPath $node -Force' "$strict_windows_gitlink_command_file"; then
+    pass "strict Windows verification requires gitlinks to be empty plain directories"
+else
+    fail "strict Windows verification omitted the gitlink placeholder contract"
+fi
+
 strict_windows_verify_status=0
 (
     _act_is_local_host() { return 1; }
