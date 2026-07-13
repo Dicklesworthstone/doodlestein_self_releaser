@@ -2491,6 +2491,7 @@ _act_verify_strict_checkout_snapshot() {
         reparse_guard=$(_act_windows_reparse_guard_script)
         ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$node=Join-Path '${win_remote_path}' \$parts[2]; try { if (\$parts[1] -eq '160000') { Assert-PlainDirectory \$node; if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { \$ok=\$false } } else { Assert-PlainFile \$node; \$actual=(git hash-object -- \$node).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)\""
         verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+            -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$ps_command") || return 4
         read -r actual_digest actual_manifest_digest <<< "$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1)"
@@ -2498,6 +2499,7 @@ _act_verify_strict_checkout_snapshot() {
         local remote_cmd verify_output
         remote_cmd=$(_act_unix_strict_snapshot_verify_script "$remote_path" "$remote_archive" "$remote_manifest" "$expected_manifest_digest" "$expected_object_count") || return 4
         verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+            -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_cmd") || return 4
         read -r actual_digest actual_manifest_digest <<< "$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1)"
@@ -3411,6 +3413,7 @@ _act_ssh_exec() {
         local ssh_destination
         ssh_destination=$(_act_get_ssh_destination "$host") || return 4
         _act_run_with_timeout "$timeout_sec" ssh \
+            -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new \

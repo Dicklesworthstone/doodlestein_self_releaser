@@ -1732,6 +1732,128 @@ else
     fail "strict mocked Windows sync accepted a reparse-point parent or component"
 fi
 
+cat > "$ACT_REPOS_DIR/stdinlooptest.yaml" << EOF
+tool_name: stdinlooptest
+repo: Test/stdinlooptest
+local_path: $strict_sync_repo
+language: rust
+binary_name: focr
+build_cmd: cargo build --release
+targets:
+  - darwin/arm64
+  - linux/amd64
+act_job_map:
+  darwin/arm64: null
+  linux/amd64: null
+sibling_crates:
+  - local_path: $strict_sync_repo
+    relative_path: dependency-a
+    revision: "$strict_sync_sha"
+  - local_path: $strict_sync_repo
+    relative_path: dependency-b
+    revision: "$strict_sync_sha"
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    darwin/arm64: focr-aarch64-apple-darwin
+    linux/amd64: focr-x86_64-unknown-linux-gnu
+EOF
+
+stdin_loop_remote_source="$TEMP_DIR/stdin-loop-remote/run/source"
+stdin_loop_local_source="$TEMP_DIR/stdin-loop-local/run/source"
+stdin_loop_fixture_status=0
+for stdin_loop_source in "$stdin_loop_remote_source" "$stdin_loop_local_source"; do
+    _act_sync_strict_checkout \
+        "trj" "$strict_sync_repo" "$strict_sync_sha" "$stdin_loop_source" \
+        "source.tar" "stdin-loop-source" >/dev/null 2>&1 || stdin_loop_fixture_status=$?
+    for stdin_loop_dependency in dependency-a dependency-b; do
+        _act_sync_strict_checkout \
+            "trj" "$strict_sync_repo" "$strict_sync_sha" \
+            "${stdin_loop_source%/source}/$stdin_loop_dependency" \
+            "dependency-${stdin_loop_dependency}.tar" "$stdin_loop_dependency" \
+            >/dev/null 2>&1 || stdin_loop_fixture_status=$?
+    done
+done
+
+stdin_loop_source_roots=$(jq -nc \
+    --arg remote "$stdin_loop_remote_source" \
+    --arg local "$stdin_loop_local_source" \
+    '{mmini: $remote, trj: $local}')
+stdin_loop_host_log="$TEMP_DIR/stdin-loop-hosts.log"
+stdin_loop_ssh_log="$TEMP_DIR/stdin-loop-ssh.log"
+stdin_loop_first_status=0
+stdin_loop_second_status=0
+(
+    _act_run_with_timeout() { shift; "$@"; }
+    ssh() {
+        local detached=false argument remote_command="${!#}"
+        for argument in "$@"; do
+            [[ "$argument" == "-n" ]] && detached=true
+        done
+        if $detached; then
+            command cat </dev/null >/dev/null
+        else
+            command cat >/dev/null
+            printf 'missing-detach\n' >> "$stdin_loop_ssh_log"
+        fi
+        if [[ "$remote_command" == *"archive_digest="* ]]; then
+            printf 'verify\n' >> "$stdin_loop_ssh_log"
+        else
+            printf 'exec\n' >> "$stdin_loop_ssh_log"
+        fi
+        "$BASH" -c "$remote_command"
+    }
+
+    while IFS= read -r stdin_loop_host; do
+        printf '%s\n' "$stdin_loop_host" >> "$stdin_loop_host_log"
+        if [[ "$stdin_loop_host" == "mmini" ]]; then
+            _act_ssh_exec "$stdin_loop_host" true 30 >/dev/null
+        fi
+    done < <(printf 'mmini\ntrj\n')
+
+    _act_verify_strict_source_roots \
+        "stdinlooptest" "$strict_sync_sha" "$stdin_loop_source_roots"
+) >/dev/null 2>&1 || stdin_loop_first_status=$?
+stdin_loop_first_verify_count=$(grep -c '^verify$' "$stdin_loop_ssh_log" 2>/dev/null || true)
+stdin_loop_first_missing_detach=$(grep -c '^missing-detach$' "$stdin_loop_ssh_log" 2>/dev/null || true)
+
+printf 'post-build dependency mutation\n' >> \
+    "${stdin_loop_local_source%/source}/dependency-b/tracked.txt"
+: > "$stdin_loop_ssh_log"
+(
+    _act_run_with_timeout() { shift; "$@"; }
+    ssh() {
+        local detached=false argument remote_command="${!#}"
+        for argument in "$@"; do
+            [[ "$argument" == "-n" ]] && detached=true
+        done
+        if $detached; then
+            command cat </dev/null >/dev/null
+        else
+            command cat >/dev/null
+            printf 'missing-detach\n' >> "$stdin_loop_ssh_log"
+        fi
+        printf 'verify\n' >> "$stdin_loop_ssh_log"
+        "$BASH" -c "$remote_command"
+    }
+    _act_verify_strict_source_roots \
+        "stdinlooptest" "$strict_sync_sha" "$stdin_loop_source_roots"
+) >/dev/null 2>&1 || stdin_loop_second_status=$?
+stdin_loop_second_verify_count=$(grep -c '^verify$' "$stdin_loop_ssh_log" 2>/dev/null || true)
+stdin_loop_second_missing_detach=$(grep -c '^missing-detach$' "$stdin_loop_ssh_log" 2>/dev/null || true)
+
+if [[ $stdin_loop_fixture_status -eq 0 && $stdin_loop_first_status -eq 0 && \
+      "$(cat "$stdin_loop_host_log")" == $'mmini\ntrj' && \
+      "$stdin_loop_first_verify_count" == "3" && \
+      "$stdin_loop_first_missing_detach" == "0" && \
+      $stdin_loop_second_status -eq 4 && \
+      "$stdin_loop_second_verify_count" == "3" && \
+      "$stdin_loop_second_missing_detach" == "0" ]]; then
+    pass "strict SSH validation preserves host and dependency loop input"
+else
+    fail "strict SSH validation skipped stdin-fed work: fixture=$stdin_loop_fixture_status first=$stdin_loop_first_status first_verify=$stdin_loop_first_verify_count first_detach=$stdin_loop_first_missing_detach second=$stdin_loop_second_status second_verify=$stdin_loop_second_verify_count second_detach=$stdin_loop_second_missing_detach hosts=$(tr '\n' ',' < "$stdin_loop_host_log")"
+fi
+
 printf 'post-build mutation\n' >> "$strict_sync_root/tracked.txt"
 if ! _act_verify_strict_source_roots \
     "synctest" "$strict_sync_sha" "$(echo "$strict_sync_output" | jq -c '.source_roots')" \
