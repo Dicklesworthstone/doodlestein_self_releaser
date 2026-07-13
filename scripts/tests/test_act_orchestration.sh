@@ -1269,6 +1269,33 @@ else
     fail "strict Cargo metadata cwd/config isolation was not constructed"
 fi
 
+closure_large_metadata=$(jq -nc --arg root "$closure_source_root" '{
+    workspace_root: $root,
+    packages: [{manifest_path: ($root + "/Cargo.toml"), source: null}],
+    padding: ("x" * (3 * 1024 * 1024))
+}')
+closure_large_metadata_status=0
+(
+    _act_is_windows_host() { return 1; }
+    jq() {
+        local argument
+        for argument in "$@"; do
+            [[ ${#argument} -le 65536 ]] || return 126
+        done
+        command jq "$@"
+    }
+    _act_ssh_exec() {
+        printf '%s\n%s\n' "$closure_source_root" "$closure_large_metadata"
+    }
+    _act_validate_strict_cargo_source_closure \
+        "stub-host" "$closure_source_root" '[]'
+) >/dev/null 2>&1 || closure_large_metadata_status=$?
+if [[ $closure_large_metadata_status -eq 0 ]]; then
+    pass "strict Cargo metadata streams multi-megabyte output without argv overflow"
+else
+    fail "strict Cargo metadata exceeded the local process argv limit"
+fi
+
 linux_identity_command="$(declare -f _act_file_identity); exec 9< /etc/os-release; path_identity=\$(_act_file_identity /etc/os-release); fd_identity=\$(_act_file_identity /dev/fd/9); exec 9<&-; printf '%s %s\\n' \"\$path_identity\" \"\$fd_identity\"; test \"\$path_identity\" = \"\$fd_identity\""
 linux_identity_status=0
 linux_identity_output=$(command ssh \

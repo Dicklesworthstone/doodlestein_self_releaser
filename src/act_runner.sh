@@ -2219,8 +2219,8 @@ _act_strict_cargo_metadata_json() {
         _log_error "Locked offline Cargo metadata failed for strict source root on $host"
         return 4
     fi
-    jq -nc --arg source_root "$canonical_source_root" --argjson metadata "$metadata_json" \
-        '{source_root: $source_root, metadata: $metadata}'
+    jq -c --arg source_root "$canonical_source_root" \
+        '{source_root: $source_root, metadata: .}' <<< "$metadata_json"
 }
 
 _act_validate_strict_cargo_source_closure() {
