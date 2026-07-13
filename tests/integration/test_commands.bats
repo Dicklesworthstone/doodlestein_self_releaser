@@ -118,8 +118,8 @@ elif [[ "$*" == *".tools | keys"* ]]; then
     echo "- ntm"
     echo "- bv"
 else
-    # Pass through for other queries
-    cat
+    echo "unsupported yq mock invocation: $*" >&2
+    exit 1
 fi
 '
 }

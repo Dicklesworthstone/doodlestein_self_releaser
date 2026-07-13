@@ -175,7 +175,7 @@ _run_shell_test() {
 
     start_time=$(date +%s.%N)
 
-    if timeout "$_TIMEOUT" bash "$test_file" > "$log_file" 2>&1; then
+    if timeout "$_TIMEOUT" bash "$test_file" </dev/null > "$log_file" 2>&1; then
         exit_code=0
     else
         exit_code=$?
@@ -220,7 +220,7 @@ _run_bats_test() {
 
     start_time=$(date +%s.%N)
 
-    if timeout "$_TIMEOUT" bats "$test_file" > "$log_file" 2>&1; then
+    if timeout "$_TIMEOUT" bats "$test_file" </dev/null > "$log_file" 2>&1; then
         exit_code=0
     else
         exit_code=$?

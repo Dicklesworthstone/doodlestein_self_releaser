@@ -245,3 +245,46 @@ teardown() {
   assert_equal "a" "a"
   assert_contains "hello world" "world"
 }
+
+@test "unified runner detaches shell and BATS children from operator stdin" {
+  local runner_root="$TEST_TMPDIR/runner-project"
+  local fake_bin="$runner_root/fake-bin"
+  local runner="$runner_root/scripts/run-all-tests.sh"
+
+  mkdir -p "$runner_root/scripts/tests" "$runner_root/tests" "$fake_bin"
+  cp "$DSR_PROJECT_ROOT/scripts/run-all-tests.sh" "$runner"
+
+  cat > "$runner_root/scripts/tests/test_stdin_probe.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$runner_root/scripts/tests/test_stdin_probe.sh"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bats' \
+    '' \
+    '@test "stdin probe" {' \
+    '  true' \
+    '}' > "$runner_root/tests/test_stdin_probe.bats"
+
+  cat > "$fake_bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+if IFS= read -r leaked_input; then
+  printf 'unexpected operator stdin: %s\n' "$leaked_input" >&2
+  exit 99
+fi
+shift
+exec "$@"
+EOF
+  chmod +x "$fake_bin/timeout"
+
+  run bash -c \
+    'printf "shell-operator-input\n" | PATH="$1:$PATH" bash "$2" --shell-only --filter test_stdin_probe.sh --timeout 5' \
+    runner-stdin-probe "$fake_bin" "$runner"
+  assert_equal "0" "$status" "Shell runner child should receive EOF on stdin"
+
+  run bash -c \
+    'printf "bats-operator-input\n" | PATH="$1:$PATH" bash "$2" --bats-only --filter test_stdin_probe.bats --timeout 5' \
+    runner-stdin-probe "$fake_bin" "$runner"
+  assert_equal "0" "$status" "BATS runner child should receive EOF on stdin"
+}
