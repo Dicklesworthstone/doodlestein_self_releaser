@@ -3096,8 +3096,9 @@ _act_default_rust_target_triple() {
 }
 
 _act_is_rust_build_influence_name() {
-    case "$1" in
-        CARGO_*|RUST*|CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
+    local normalized_name="${1^^}"
+    case "$normalized_name" in
+        CARGO_*|RUST*|XWIN_*|CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
         CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|\
         SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|\
         INCLUDE|LIB|LIBPATH|CC_*|CXX_*|AR_*|CFLAGS_*|CXXFLAGS_*|\
@@ -3532,20 +3533,34 @@ act_run_native_build() {
         strict_build_env+=$'\n'"CARGO_HOME=$strict_cargo_home"
         build_env="$strict_build_env"
 
-        local influence_entries=() influence_name influence_value
+        local windows_build_receipt=false
+        if _act_is_windows_host "$host"; then
+            windows_build_receipt=true
+        fi
+        local influence_entries=() influence_name influence_value receipt_influence_name
         while IFS= read -r env_pair; do
             [[ -n "$env_pair" && "$env_pair" == *=* ]] || continue
             influence_name="${env_pair%%=*}"
             influence_value="${env_pair#*=}"
             if _act_is_rust_build_influence_name "$influence_name"; then
+                receipt_influence_name="$influence_name"
+                if $windows_build_receipt; then
+                    receipt_influence_name="${receipt_influence_name^^}"
+                fi
                 influence_entries+=("$(jq -nc \
-                    --arg key "$influence_name" --arg value "$influence_value" \
+                    --arg key "$receipt_influence_name" --arg value "$influence_value" \
                     '{key: $key, value: $value}')")
             fi
         done <<< "$build_env"
         if [[ ${#influence_entries[@]} -gt 0 ]]; then
-            build_influence_env_json=$(printf '%s\n' "${influence_entries[@]}" | \
-                jq -cs 'sort_by(.key) | from_entries') || return 4
+            if $windows_build_receipt; then
+                build_influence_env_json=$(printf '%s\n' "${influence_entries[@]}" | \
+                    jq -cs 'reduce .[] as $entry ({}; .[$entry.key] = $entry.value)
+                        | to_entries | sort_by(.key) | from_entries') || return 4
+            else
+                build_influence_env_json=$(printf '%s\n' "${influence_entries[@]}" | \
+                    jq -cs 'sort_by(.key) | from_entries') || return 4
+            fi
         fi
     fi
 
@@ -3649,14 +3664,14 @@ act_run_native_build() {
                 env_value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
                 ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
             done <<< "$build_env"
-            remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$home=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$home.PSIsContainer -or ((\$home.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$home.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
+            remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$home=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$home.PSIsContainer -or ((\$home.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$home.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
         fi
     else
         # Unix: use bash/zsh compatible syntax
         local env_exports=""
         local env_name
         if $strict_rust_build; then
-            env_exports+="test -d '$strict_cargo_home'; test ! -L '$strict_cargo_home'; for name in config config.toml credentials credentials.toml; do test ! -e '$strict_cargo_home'/\$name; test ! -L '$strict_cargo_home'/\$name; done; ancestor='${remote_path%/*}'; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; "
+            env_exports+="test -d '$strict_cargo_home'; test ! -L '$strict_cargo_home'; for name in config config.toml credentials credentials.toml; do test ! -e '$strict_cargo_home'/\$name; test ! -L '$strict_cargo_home'/\$name; done; ancestor='${remote_path%/*}'; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|XWIN_*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; "
         fi
         for env_name in "${cargo_env_to_unset[@]}"; do
             env_exports+="unset $env_name; "

@@ -319,17 +319,50 @@ test_unix_rust_keeps_configured_cargo_path_env() {
     fi
 }
 
+test_rust_build_influence_name_xwin_boundaries() {
+    log_test "Rust build influence names: XWIN matching is case-insensitive and bounded"
+
+    local name expected actual
+    local failures=""
+    while IFS='|' read -r name expected; do
+        if _act_is_rust_build_influence_name "$name"; then
+            actual="match"
+        else
+            actual="miss"
+        fi
+        if [[ "$actual" != "$expected" ]]; then
+            failures+=" $name:$actual"
+        fi
+    done <<'CASES'
+XWIN_FUTURE_TOOLCHAIN_SWITCH|match
+xwin_cache_dir|match
+XwIn_MsVc_SySrOoT_Download_Url|match
+XWIN|miss
+XWINNER_CACHE_DIR|miss
+NOT_XWIN_CACHE_DIR|miss
+XWIN-CACHE-DIR|miss
+CASES
+
+    if [[ -z "$failures" ]]; then
+        log_pass "XWIN build influence matching accepts case variants without prefix near-misses"
+    else
+        log_fail "Unexpected XWIN influence classifications:$failures"
+    fi
+}
+
 test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     log_test "Unix Rust strict build: Cargo output stays outside source snapshot"
     reset_state
     MOCK_LANGUAGE="rust"
     MOCK_BUILD_CMD="cargo build --release"
     MOCK_BINARY_NAME="tool"
-    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=in-tree-target\nCARGO_HOME=/ambient/cargo-home\nRUSTFLAGS=-C target-cpu=apple-m4'
+    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=in-tree-target\nCARGO_HOME=/ambient/cargo-home\nRUSTFLAGS=-C target-cpu=apple-m4\nXWIN_CACHE_DIR=/pinned/xwin-cache\nXWIN_MSVC_SYSROOT_DOWNLOAD_URL=https://example.invalid/pinned-sysroot.tar.xz'
     export RUSTC_WRAPPER="/ambient/evil-wrapper"
     export RUSTFLAGS="-C link-arg=ambient-evil"
     export CARGO_PROFILE_RELEASE_OPT_LEVEL="0"
     export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="/ambient/evil-linker"
+    export XWIN_CACHE_DIR="/ambient/evil-xwin-cache"
+    export XWIN_CROSS_COMPILER="ambient-evil-compiler"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-unix-artifact"
     printf 'strict unix artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
 
@@ -347,8 +380,10 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     if [[ "$cmd" == *"export \"CARGO_TARGET_DIR=$expected_target\""* && \
           "$cmd" == *"export \"CARGO_HOME=$expected_home\""* && \
           "$cmd" == *"unset RUSTC_WRAPPER;"* && "$cmd" == *"unset RUSTFLAGS;"* && \
-          "$cmd" == *'case "$variable" in CARGO_*|RUST*'* && \
+          "$cmd" == *'case "$variable" in CARGO_*|RUST*|XWIN_*'* && \
           "$cmd" == *'export "RUSTFLAGS=-C target-cpu=apple-m4"'* && \
+          "$cmd" == *'export "XWIN_CACHE_DIR=/pinned/xwin-cache"'* && \
+          "$cmd" == *'export "XWIN_MSVC_SYSROOT_DOWNLOAD_URL=https://example.invalid/pinned-sysroot.tar.xz"'* && \
           "$cmd" != *"/ambient/evil-wrapper"* && "$cmd" != *"ambient-evil"* && \
           "$cmd" != *"/ambient/evil-linker"* && \
           "$cmd" != *"CARGO_TARGET_DIR=in-tree-target"* && \
@@ -358,6 +393,8 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
             --arg home "$expected_home" \
             '.build_influence_env.CARGO_HOME == $home and
              .build_influence_env.RUSTFLAGS == "-C target-cpu=apple-m4" and
+             .build_influence_env.XWIN_CACHE_DIR == "/pinned/xwin-cache" and
+             .build_influence_env.XWIN_MSVC_SYSROOT_DOWNLOAD_URL == "https://example.invalid/pinned-sysroot.tar.xz" and
              (.build_influence_env | has("RUSTC_WRAPPER") | not) and
              .status == "success" and
              (.collected_sha256 | test("^[0-9a-f]{64}$")) and
@@ -368,7 +405,53 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
         log_fail "Strict Unix Cargo/env isolation was not enforced: cmd=$cmd scp=$scp_args result=$result"
     fi
     unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
+    unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER
     unset CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER
+}
+
+test_unix_strict_rust_executes_xwin_sanitizer_before_exports() {
+    log_test "Unix Rust strict build: XWIN sanitizer runs before configured exports"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="tool"
+    MOCK_PLATFORM_ENV="XWIN_CACHE_DIR=/configured/xwin-cache"
+
+    local strict_root="$MOCK_DIR/unix-xwin-order/run"
+    local observed_env="$MOCK_DIR/unix-xwin-order/observed-env"
+    mkdir -p "$strict_root/source" "$strict_root/.cargo-home"
+    MOCK_BUILD_CMD="printf '%s\\n' \"\${XWIN_CACHE_DIR-<unset>}\" \"\${XWIN_CROSS_COMPILER-<unset>}\" > '$observed_env'"
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/unix-xwin-order/artifact"
+    printf 'strict unix xwin artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
+    export XWIN_CACHE_DIR="/ambient/evil-xwin-cache"
+    export XWIN_CROSS_COMPILER="ambient-evil-compiler"
+
+    local result status=0
+    result=$(
+        _act_ssh_exec() {
+            printf '%s\n' "HOST:$1" "CMD:$2" > "$SSH_ARGS_FILE"
+            "$BASH" -c "$2"
+        }
+        act_run_native_build \
+            "tool" "darwin/arm64" "v1.0.0" "run1" \
+            "$strict_root/source" 2>/dev/null
+    ) || status=$?
+
+    local -a observed_values=()
+    if [[ -f "$observed_env" ]]; then
+        mapfile -t observed_values < "$observed_env"
+    fi
+    if [[ $status -eq 0 && ${#observed_values[@]} -eq 2 && \
+          "${observed_values[0]}" == "/configured/xwin-cache" && \
+          "${observed_values[1]}" == "<unset>" ]] && \
+       echo "$result" | jq -e \
+            '.status == "success" and
+             .build_influence_env.XWIN_CACHE_DIR == "/configured/xwin-cache" and
+             (.build_influence_env | has("XWIN_CROSS_COMPILER") | not)' >/dev/null; then
+        log_pass "Ambient XWIN values are removed before configured XWIN values are exported"
+    else
+        log_fail "Executed XWIN sanitizer ordering was incorrect: status=$status values=${observed_values[*]-} result=$result"
+    fi
+    unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER
 }
 
 test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
@@ -377,11 +460,13 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     MOCK_LANGUAGE="rust"
     MOCK_BUILD_CMD="cargo build --release"
     MOCK_BINARY_NAME="tool"
-    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=in-tree-target\nCARGO_HOME=C:/ambient/cargo-home\nRUSTFLAGS=-C target-feature=+crt-static'
+    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=in-tree-target\nCARGO_HOME=C:/ambient/cargo-home\nRUSTFLAGS=-C target-feature=+crt-static\nXwIn_CaChE_DiR=C:/pinned/xwin-cache-first\nxwin_cache_dir=C:/pinned/xwin-cache-last\nXWIN_MSVC_SYSROOT_DOWNLOAD_URL=https://example.invalid/pinned-sysroot.tar.xz'
     export RUSTC_WRAPPER="C:/ambient/evil-wrapper.exe"
     export RUSTFLAGS="-C link-arg=ambient-evil"
     export CARGO_PROFILE_RELEASE_OPT_LEVEL="0"
     export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="C:/ambient/evil-linker.exe"
+    export XWIN_CACHE_DIR="C:/ambient/evil-xwin-cache"
+    export XWIN_CROSS_COMPILER="ambient-evil-compiler"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-windows-artifact"
     printf 'strict windows artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
 
@@ -391,17 +476,25 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
         "C:/build/.dsr-release-snapshots/tool-run/source" 2>/dev/null)
 
     local cmd scp_args raw_ssh_args expected_target expected_home expected_home_win
+    local first_xwin_value_b64 last_xwin_value_b64 first_xwin_prefix last_xwin_prefix
     cmd=$(get_ssh_cmd)
     scp_args=$(get_scp_args)
     raw_ssh_args=$(get_raw_ssh_args)
+    first_xwin_value_b64=$(printf '%s' 'C:/pinned/xwin-cache-first' | base64 | tr -d '\r\n')
+    last_xwin_value_b64=$(printf '%s' 'C:/pinned/xwin-cache-last' | base64 | tr -d '\r\n')
+    first_xwin_prefix="${cmd%%"$first_xwin_value_b64"*}"
+    last_xwin_prefix="${cmd%%"$last_xwin_value_b64"*}"
     expected_target="C:/build/.dsr-release-snapshots/tool-run/.cargo-target-windows-amd64"
     expected_home="C:/build/.dsr-release-snapshots/tool-run/.cargo-home"
     expected_home_win="C:\\build\\.dsr-release-snapshots\\tool-run\\.cargo-home"
     if [[ "$cmd" == *"$expected_home_win"* && \
           "$cmd" == *"System.Diagnostics.ProcessStartInfo"* && \
-          "$cmd" == *"^(CARGO_|RUST)"* && \
+          "$cmd" == *"^(CARGO_|RUST|XWIN_)"* && \
           "$cmd" == *"EnvironmentVariables.Remove"* && \
           "$cmd" == *"FromBase64String"* && \
+          "$cmd" == *"$first_xwin_value_b64"* && \
+          "$cmd" == *"$last_xwin_value_b64"* && \
+          ${#first_xwin_prefix} -lt ${#last_xwin_prefix} && \
           "$cmd" != *"C:/ambient/evil-wrapper.exe"* && "$cmd" != *"ambient-evil"* && \
           "$cmd" != *"C:/ambient/evil-linker.exe"* && \
           "$cmd" != *"CARGO_TARGET_DIR=in-tree-target"* && \
@@ -412,6 +505,9 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
             --arg home "$expected_home" \
             '.build_influence_env.CARGO_HOME == $home and
              .build_influence_env.RUSTFLAGS == "-C target-feature=+crt-static" and
+             .build_influence_env.XWIN_CACHE_DIR == "C:/pinned/xwin-cache-last" and
+             ([.build_influence_env | keys[] | select(ascii_upcase == "XWIN_CACHE_DIR")] | length) == 1 and
+             .build_influence_env.XWIN_MSVC_SYSROOT_DOWNLOAD_URL == "https://example.invalid/pinned-sysroot.tar.xz" and
              (.build_influence_env | has("RUSTC_WRAPPER") | not) and
              .status == "success" and
              (.collected_sha256 | test("^[0-9a-f]{64}$")) and
@@ -422,6 +518,7 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
         log_fail "Strict Windows Cargo/env isolation was not enforced: cmd=$cmd scp=$scp_args result=$result"
     fi
     unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
+    unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER
     unset CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
 }
 
@@ -1272,7 +1369,9 @@ main() {
     test_unix_env_export_syntax
     test_unix_rust_unsets_ambient_cargo_path_env
     test_unix_rust_keeps_configured_cargo_path_env
+    test_rust_build_influence_name_xwin_boundaries
     test_unix_strict_rust_forces_out_of_snapshot_target_dir
+    test_unix_strict_rust_executes_xwin_sanitizer_before_exports
     test_windows_strict_rust_forces_out_of_snapshot_target_dir
     test_unix_strict_validation_failure_stops_build
     test_windows_strict_validation_failure_stops_build
