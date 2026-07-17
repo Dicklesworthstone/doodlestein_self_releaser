@@ -1769,7 +1769,11 @@ EOF
     # Detect version if not specified
     if [[ -z "$version" ]]; then
         log_info "Detecting version from version files..."
-        if version=$(version_detect "$local_path" 2>/dev/null); then
+        local configured_language="" configured_main_package=""
+        configured_language=$(config_get_tool_field "$tool_name" "language" "" 2>/dev/null || true)
+        configured_main_package=$(config_get_tool_field "$tool_name" "main_package" "" 2>/dev/null || true)
+        if version=$(version_detect \
+            "$local_path" "$configured_language" "$configured_main_package" 2>/dev/null); then
             log_info "Detected version: $version"
         else
             log_error "Cannot detect version. Specify with --version"
@@ -6422,7 +6426,11 @@ EOF
     # Detect version if not specified
     if [[ -z "$version" ]]; then
         log_info "Detecting version from version files..."
-        if version=$(version_detect "$local_path" 2>/dev/null); then
+        local configured_language="" configured_main_package=""
+        configured_language=$(config_get_tool_field "$tool_name" "language" "" 2>/dev/null || true)
+        configured_main_package=$(config_get_tool_field "$tool_name" "main_package" "" 2>/dev/null || true)
+        if version=$(version_detect \
+            "$local_path" "$configured_language" "$configured_main_package" 2>/dev/null); then
             log_info "Detected version: $version"
         else
             log_error "Cannot detect version. Specify with --version"
@@ -8637,6 +8645,8 @@ cmd_version() {
             # dsr version detect <tool|path>
             local target="${1:-}"
             local repo_path=""
+            local language=""
+            local main_package=""
 
             if [[ -z "$target" ]]; then
                 log_error "Usage: dsr version detect <tool|path>"
@@ -8651,6 +8661,8 @@ cmd_version() {
                 local config_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/${target}.yaml"
                 if [[ -f "$config_file" ]] && command -v yq &>/dev/null; then
                     repo_path=$(yq -r '.local_path // ""' "$config_file" 2>/dev/null)
+                    language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+                    main_package=$(yq -r '.main_package // ""' "$config_file" 2>/dev/null)
                 fi
             fi
 
@@ -8661,13 +8673,17 @@ cmd_version() {
 
             if $JSON_MODE; then
                 local json_result
-                json_result=$(version_info_json "$repo_path")
+                if ! json_result=$(version_info_json "$repo_path" "$language" "$main_package"); then
+                    json_envelope "version detect" "error" 1 \
+                        "$(jq -nc --arg repo_path "$repo_path" '{repo_path: $repo_path, error: "No unambiguous version source"}')"
+                    return 1
+                fi
                 json_envelope "version detect" "success" 0 "$json_result"
             else
                 local version
-                if version=$(version_detect "$repo_path"); then
+                if version=$(version_detect "$repo_path" "$language" "$main_package"); then
                     log_ok "Version: $version (v$version)"
-                    if version_needs_tag "$repo_path"; then
+                    if version_needs_tag "$repo_path" "$language" "$main_package"; then
                         log_info "Tag v$version does not exist (create with: dsr version tag $target)"
                     else
                         log_info "Tag v$version already exists"
@@ -8684,6 +8700,8 @@ cmd_version() {
             local target="${1:-}"
             local push=false
             local tag_all=false
+            local language=""
+            local main_package=""
 
             # Parse options
             while [[ $# -gt 0 ]]; do
@@ -8725,6 +8743,8 @@ cmd_version() {
                 local config_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/${target}.yaml"
                 if [[ -f "$config_file" ]] && command -v yq &>/dev/null; then
                     repo_path=$(yq -r '.local_path // ""' "$config_file" 2>/dev/null)
+                    language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+                    main_package=$(yq -r '.main_package // ""' "$config_file" 2>/dev/null)
                 fi
             fi
 
@@ -8736,11 +8756,13 @@ cmd_version() {
             local -a tag_args=()
             $push && tag_args+=("--push")
             $DRY_RUN && tag_args+=("--dry-run")
+            [[ -n "$language" ]] && tag_args+=("--language" "$language")
+            [[ -n "$main_package" ]] && tag_args+=("--main-package" "$main_package")
 
             if version_create_tag "$repo_path" "${tag_args[@]}"; then
                 if $JSON_MODE; then
                     local json_result
-                    json_result=$(version_info_json "$repo_path")
+                    json_result=$(version_info_json "$repo_path" "$language" "$main_package")
                     json_envelope "version tag" "success" 0 "$json_result"
                 fi
                 return 0

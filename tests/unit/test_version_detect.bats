@@ -53,6 +53,30 @@ teardown() {
     harness_teardown
 }
 
+add_workspace_member() {
+    local name="$1"
+    local version="$2"
+    local publish_line=""
+    [[ "${3:-}" == "false" ]] && publish_line="publish = false"
+    local member_dir="$MOCK_REPO/crates/$name"
+    mkdir -p "$member_dir/src"
+    cat > "$member_dir/Cargo.toml" << EOF
+[package]
+name = "$name"
+version = "$version"
+edition = "2021"
+$publish_line
+
+[lib]
+path = "src/lib.rs"
+EOF
+    printf 'pub fn marker() {}\n' > "$member_dir/src/lib.rs"
+}
+
+lock_workspace() {
+    cargo generate-lockfile --offline --manifest-path "$MOCK_REPO/Cargo.toml" >/dev/null
+}
+
 # ============================================================================
 # Rust (Cargo.toml) Tests
 # ============================================================================
@@ -109,21 +133,143 @@ EOF
     assert_equal "1.0.0+build.123" "$version"
 }
 
-@test "rust: ignore workspace version" {
-    # Workspace Cargo.toml may have version in [workspace.package]
+@test "rust: detect an inherited workspace package version" {
     cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
 [workspace]
-members = ["crates/*"]
+members = ["crates/tool"]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 EOF
+    mkdir -p "$MOCK_REPO/crates/tool/src"
+    cat > "$MOCK_REPO/crates/tool/Cargo.toml" << 'EOF'
+[package]
+name = "tool"
+version.workspace = true
+edition = "2021"
 
-    # Should still detect this as the first version= line
+[lib]
+path = "src/lib.rs"
+EOF
+    printf 'pub fn marker() {}\n' > "$MOCK_REPO/crates/tool/src/lib.rs"
+    lock_workspace
+
     local version
     version=$(version_detect "$MOCK_REPO")
 
     assert_equal "0.1.0" "$version"
+}
+
+@test "rust: virtual workspace cannot fall through to unrelated package.json" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[workspace]
+members = ["crates/core", "crates/cli"]
+resolver = "2"
+EOF
+    add_workspace_member core 0.1.17
+    add_workspace_member cli 0.1.17
+    cat > "$MOCK_REPO/package.json" << 'EOF'
+{
+  "name": "website-tooling",
+  "version": "1.0.0"
+}
+EOF
+    lock_workspace
+
+    run version_detect "$MOCK_REPO"
+
+    assert_equal "0" "$status"
+    assert_equal "0.1.17" "$output"
+}
+
+@test "rust: virtual workspace with no package version source fails closed" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[workspace]
+members = []
+resolver = "2"
+EOF
+    cat > "$MOCK_REPO/package.json" << 'EOF'
+{
+  "name": "unrelated-website",
+  "version": "1.0.0"
+}
+EOF
+    lock_workspace
+
+    run version_detect "$MOCK_REPO"
+
+    [[ "$status" -ne 0 ]]
+    assert_contains "$output" "No Rust workspace package version source"
+    [[ "$output" != *"1.0.0"* ]]
+}
+
+@test "rust: configured main package resolves a divergent virtual workspace" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[workspace]
+members = ["crates/core", "crates/cli"]
+resolver = "2"
+EOF
+    add_workspace_member core 0.4.0
+    add_workspace_member cli 0.5.0
+    lock_workspace
+
+    run version_detect "$MOCK_REPO" rust cli
+
+    assert_equal "0" "$status"
+    assert_equal "0.5.0" "$output"
+}
+
+@test "rust: divergent publishable workspace fails closed without main package" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[workspace]
+members = ["crates/core", "crates/cli"]
+resolver = "2"
+EOF
+    add_workspace_member core 0.4.0
+    add_workspace_member cli 0.5.0
+    cat > "$MOCK_REPO/package.json" << 'EOF'
+{"name":"unrelated","version":"9.9.9"}
+EOF
+    lock_workspace
+
+    run version_detect "$MOCK_REPO"
+
+    [[ "$status" -ne 0 ]]
+    assert_contains "$output" "Ambiguous Rust workspace versions"
+    [[ "$output" != *"9.9.9"* ]]
+}
+
+@test "rust: unpublished member version does not make release version ambiguous" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[workspace]
+members = ["crates/core", "crates/internal"]
+resolver = "2"
+EOF
+    add_workspace_member core 0.4.0
+    add_workspace_member internal 9.9.9 false
+    lock_workspace
+
+    run version_detect "$MOCK_REPO"
+
+    assert_equal "0" "$status"
+    assert_equal "0.4.0" "$output"
+}
+
+@test "rust: tag creation refuses an ambiguous workspace" {
+    cat > "$MOCK_REPO/Cargo.toml" << 'EOF'
+[workspace]
+members = ["crates/core", "crates/cli"]
+resolver = "2"
+EOF
+    add_workspace_member core 0.4.0
+    add_workspace_member cli 0.5.0
+    lock_workspace
+
+    run version_create_tag "$MOCK_REPO" --dry-run
+
+    [[ "$status" -ne 0 ]]
+    [[ "$output" != *"Would create tag"* ]]
 }
 
 # ============================================================================

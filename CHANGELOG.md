@@ -8,6 +8,19 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ---
 
+## 2026-07-17 -- Fail-Closed Rust Workspace Version Detection
+
+- Virtual Cargo workspaces now resolve versions through read-only Cargo metadata.
+  A configured `main_package` selects that exact package; otherwise every
+  publishable workspace member must agree on one version.
+- A present but ambiguous or unreadable `Cargo.toml` no longer falls through to
+  an unrelated root `package.json` or `VERSION` file. Version detection and tag
+  creation fail closed instead of suggesting a fictitious release tag.
+- Human, JSON, build, fallback, single-tool tag, and batch-tag paths share the
+  same configured language/package authority and ambiguity checks.
+
+---
+
 ## 2026-03-12 -- Curl|Bash Self-Installer for dsr Itself
 
 Added a standalone `install.sh` so users can install dsr with a single `curl | bash` command and SHA256 checksum verification.

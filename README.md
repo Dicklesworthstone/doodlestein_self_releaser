@@ -337,6 +337,23 @@ dsr status --refresh                            # Refresh host health checks
 dsr status --json                               # JSON output
 ```
 
+### `dsr version`
+
+Detect a repository's authoritative version and create an annotated release
+tag. For Rust virtual workspaces, set `main_package` in the tool's
+`repos.d/<tool>.yaml`; without it, all publishable workspace members must have
+one common version. Ambiguous or unreadable workspaces fail closed and never
+fall through to an unrelated ecosystem manifest. Workspace resolution is
+read-only (`cargo metadata --locked --offline`), so it requires `cargo`, `jq`,
+and a current `Cargo.lock`.
+
+```bash
+dsr version detect frankensqlite                 # Inspect version and tag state
+dsr --json version detect /path/to/repo           # Machine-readable inspection
+dsr --dry-run version tag frankensqlite           # Preview the exact tag
+dsr version tag frankensqlite --push              # Create and push annotated tag
+```
+
 ---
 
 ## Exit Codes

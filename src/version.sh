@@ -30,11 +30,12 @@ set -uo pipefail
 # ============================================================================
 
 # Detect version from repo based on language-specific files
-# Args: repo_path [language]
+# Args: repo_path [language] [main_package]
 # Returns: version string (without 'v' prefix) or empty
 version_detect() {
     local repo_path="$1"
     local language="${2:-}"
+    local main_package="${3:-}"
     local version=""
 
     if [[ ! -d "$repo_path" ]]; then
@@ -44,15 +45,24 @@ version_detect() {
 
     # If language specified, only check that language's files
     if [[ -n "$language" ]]; then
-        version=$(_version_detect_by_language "$repo_path" "$language")
+        version=$(_version_detect_by_language "$repo_path" "$language" "$main_package")
         echo "$version"
         [[ -n "$version" ]]
         return $?
     fi
 
+    # A root Cargo.toml is authoritative evidence that this is a Rust project.
+    # If its workspace version is missing or ambiguous, fail closed instead of
+    # falling through to an unrelated package.json/VERSION file and inventing a
+    # release tag from a secondary ecosystem manifest.
+    if [[ -f "$repo_path/Cargo.toml" ]]; then
+        _version_from_cargo_toml "$repo_path" "$main_package"
+        return $?
+    fi
+
     # Auto-detect: try each language in order of prevalence
-    for lang in rust go node python; do
-        version=$(_version_detect_by_language "$repo_path" "$lang")
+    for lang in go node python; do
+        version=$(_version_detect_by_language "$repo_path" "$lang" "$main_package")
         if [[ -n "$version" ]]; then
             echo "$version"
             return 0
@@ -64,14 +74,15 @@ version_detect() {
 }
 
 # Internal: Detect version for a specific language
-# Args: repo_path language
+# Args: repo_path language [main_package]
 _version_detect_by_language() {
     local repo_path="$1"
     local language="$2"
+    local main_package="${3:-}"
 
     case "$language" in
         rust)
-            _version_from_cargo_toml "$repo_path"
+            _version_from_cargo_toml "$repo_path" "$main_package"
             ;;
         go)
             _version_from_go "$repo_path"
@@ -88,27 +99,157 @@ _version_detect_by_language() {
     esac
 }
 
-# Extract version from Cargo.toml
-# Pattern: version = "X.Y.Z" (at package level)
+# Extract one scalar TOML key from an exact table. This fallback is deliberately
+# section-aware: a dependency/profile version must never be mistaken for the
+# package version.
+_version_from_toml_table() {
+    local toml_file="$1"
+    local table="$2"
+    local key="$3"
+    local line=""
+
+    line=$(awk -v wanted="[$table]" -v wanted_key="$key" '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/ {
+            current = $0
+            sub(/[[:space:]]*#.*/, "", current)
+            gsub(/[[:space:]]/, "", current)
+            next
+        }
+        current == wanted && $0 ~ "^[[:space:]]*" wanted_key "[[:space:]]*=" {
+            print
+            exit
+        }
+    ' "$toml_file")
+
+    [[ -n "$line" ]] || return 1
+    printf '%s\n' "$line" | sed -E 's/^[^=]*=[[:space:]]*"([^"]*)".*/\1/'
+}
+
+# Extract a Rust package/workspace version without guessing.
+#
+# A normal root package is read directly from its exact [package] table. A
+# virtual workspace is resolved through read-only Cargo metadata so inherited
+# versions, publish=false members, and configured package names are handled by
+# Cargo's own TOML semantics. Ambiguous workspaces fail closed.
 _version_from_cargo_toml() {
     local repo_path="$1"
+    local main_package="${2:-}"
     local cargo_file="$repo_path/Cargo.toml"
 
     if [[ ! -f "$cargo_file" ]]; then
         return 1
     fi
 
-    # Use grep + sed for simple extraction (no toml parser needed)
-    # Look for version = "X.Y.Z" in [package] section
-    # This handles most common Cargo.toml formats
-    local version
-    version=$(grep -E -m1 '^[[:space:]]*version[[:space:]]*=[[:space:]]*"' "$cargo_file" 2>/dev/null | \
-              sed -E 's/.*version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+    local root_version=""
+    root_version=$(_version_from_toml_table "$cargo_file" package version 2>/dev/null || true)
+    if [[ -z "$main_package" && -n "$root_version" ]]; then
+        if [[ "$root_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "$root_version"
+            return 0
+        fi
+        log_error "Invalid Rust package version in $cargo_file: $root_version"
+        return 1
+    fi
 
-    if [[ -n "$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-        echo "$version"
+    if ! command -v cargo &>/dev/null || ! command -v jq &>/dev/null; then
+        log_error "Cannot resolve virtual Rust workspace version in $repo_path: cargo and jq are required"
+        return 1
+    fi
+
+    local metadata=""
+    if ! metadata=$(cargo metadata \
+        --format-version 1 \
+        --no-deps \
+        --locked \
+        --offline \
+        --manifest-path "$cargo_file" 2>/dev/null); then
+        log_error "Cannot resolve Rust workspace version in $repo_path: 'cargo metadata --locked --offline' failed; ensure Cargo.lock is current"
+        return 1
+    fi
+
+    local members_json=""
+    if ! members_json=$(printf '%s\n' "$metadata" | jq -ce '
+        [.workspace_members[] as $member_id
+         | .packages[]
+         | select(.id == $member_id)]
+        | unique_by(.id)
+    ' 2>/dev/null); then
+        log_error "Cannot resolve Rust workspace version in $repo_path: Cargo metadata was malformed"
+        return 1
+    fi
+
+    if [[ -n "$main_package" ]]; then
+        local main_manifest=""
+        local main_candidate="$repo_path/$main_package"
+        if [[ "$main_package" == "." ]]; then
+            main_candidate="$repo_path"
+        fi
+        if [[ -d "$main_candidate" ]]; then
+            main_candidate="$main_candidate/Cargo.toml"
+        fi
+        if [[ -f "$main_candidate" ]]; then
+            if declare -f resolve_path &>/dev/null; then
+                main_manifest=$(resolve_path "$main_candidate" --must-exist 2>/dev/null || true)
+            elif command -v realpath &>/dev/null; then
+                main_manifest=$(realpath "$main_candidate" 2>/dev/null || true)
+            else
+                # macOS does not provide GNU `readlink -f`. Resolve the parent
+                # in a subshell so the caller's working directory never moves.
+                main_manifest=$(
+                    builtin cd "$(dirname "$main_candidate")" 2>/dev/null \
+                        && printf '%s/%s\n' "$(pwd -P)" "$(basename "$main_candidate")"
+                ) || main_manifest=""
+            fi
+        fi
+
+        local matches_json="" match_count=0
+        matches_json=$(printf '%s\n' "$members_json" | jq -ce \
+            --arg package "$main_package" \
+            --arg manifest "$main_manifest" '
+                [.[]
+                 | select(
+                     .name == $package
+                     or ($manifest != "" and .manifest_path == $manifest)
+                     or any(.targets[]?; .name == $package)
+                 )]
+            ') || return 1
+        match_count=$(printf '%s\n' "$matches_json" | jq -r 'length')
+        if [[ "$match_count" -ne 1 ]]; then
+            log_error "Configured Rust main_package '$main_package' matched $match_count workspace packages in $repo_path; refusing ambiguous version detection"
+            return 1
+        fi
+        printf '%s\n' "$matches_json" | jq -r '.[0].version'
         return 0
     fi
+
+    local versions_json="" version_count=0
+    local used_all_members=false
+    versions_json=$(printf '%s\n' "$members_json" | jq -ce \
+        '[.[] | select(.publish != []) | .version] | unique') || return 1
+    if [[ "$(printf '%s\n' "$versions_json" | jq -r 'length')" -eq 0 ]]; then
+        used_all_members=true
+        versions_json=$(printf '%s\n' "$members_json" | jq -ce \
+            '[.[].version] | unique') || return 1
+    fi
+    version_count=$(printf '%s\n' "$versions_json" | jq -r 'length')
+    if [[ "$version_count" -eq 0 ]]; then
+        log_error "No Rust workspace package version source found in $repo_path"
+        return 1
+    fi
+    if [[ "$version_count" -eq 1 ]]; then
+        printf '%s\n' "$versions_json" | jq -r '.[0]'
+        return 0
+    fi
+
+    local version_inventory=""
+    if $used_all_members; then
+        version_inventory=$(printf '%s\n' "$members_json" | jq -r \
+            '[.[] | "\(.name)=\(.version)"] | join(", ")')
+    else
+        version_inventory=$(printf '%s\n' "$members_json" | jq -r \
+            '[.[] | select(.publish != []) | "\(.name)=\(.version)"] | join(", ")')
+    fi
+    log_error "Ambiguous Rust workspace versions in $repo_path: $version_inventory; configure main_package explicitly"
     return 1
 }
 
@@ -209,13 +350,15 @@ _version_from_pyproject() {
 # ============================================================================
 
 # Check if a tag is needed for the detected version
-# Args: repo_path
+# Args: repo_path [language] [main_package]
 # Returns: 0 if tag needed, 1 if already tagged or no version
 version_needs_tag() {
     local repo_path="$1"
+    local language="${2:-}"
+    local main_package="${3:-}"
 
     local version
-    if ! version=$(version_detect "$repo_path"); then
+    if ! version=$(version_detect "$repo_path" "$language" "$main_package"); then
         log_debug "No version detected in $repo_path"
         return 1
     fi
@@ -242,6 +385,7 @@ version_needs_tag() {
 
 # Create and optionally push a tag for the detected version
 # Args: repo_path [--push] [--dry-run] [--message "msg"]
+#                 [--language language] [--main-package package]
 # Returns: 0 on success
 version_create_tag() {
     local repo_path="$1"
@@ -250,19 +394,23 @@ version_create_tag() {
     local push=false
     local dry_run=false
     local message=""
+    local language=""
+    local main_package=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --push) push=true; shift ;;
             --dry-run|-n) dry_run=true; shift ;;
             --message|-m) message="$2"; shift 2 ;;
+            --language) language="${2:-}"; shift 2 ;;
+            --main-package) main_package="${2:-}"; shift 2 ;;
             *) shift ;;
         esac
     done
 
     # Detect version
     local version
-    if ! version=$(version_detect "$repo_path"); then
+    if ! version=$(version_detect "$repo_path" "$language" "$main_package"); then
         log_error "Cannot detect version in $repo_path"
         return 1
     fi
@@ -329,32 +477,38 @@ version_create_tag() {
 # ============================================================================
 
 # Get version info as JSON
-# Args: repo_path
+# Args: repo_path [language] [main_package]
 version_info_json() {
     local repo_path="$1"
+    local configured_language="${2:-}"
+    local main_package="${3:-}"
     local version="" tag="" tag_exists=false needs_tag=false language=""
 
-    # Detect version
-    if version=$(version_detect "$repo_path"); then
-        tag="v$version"
+    # An empty/ambiguous version is an error, not a successful JSON record with
+    # blank fields. Callers must not be able to turn that record into a tag.
+    if ! version=$(version_detect "$repo_path" "$configured_language" "$main_package"); then
+        return 1
+    fi
+    tag="v$version"
 
-        # Check tag status
-        if git -C "$repo_path" show-ref --tags --verify "refs/tags/$tag" &>/dev/null; then
-            tag_exists=true
-        else
-            needs_tag=true
-        fi
+    # Check tag status
+    if git -C "$repo_path" show-ref --tags --verify "refs/tags/$tag" &>/dev/null; then
+        tag_exists=true
+    else
+        needs_tag=true
+    fi
 
-        # Detect language
-        if [[ -f "$repo_path/Cargo.toml" ]]; then
-            language="rust"
-        elif [[ -f "$repo_path/go.mod" ]] || [[ -f "$repo_path/go.sum" ]]; then
-            language="go"
-        elif [[ -f "$repo_path/package.json" ]]; then
-            language="node"
-        elif [[ -f "$repo_path/pyproject.toml" ]]; then
-            language="python"
-        fi
+    # Detect language
+    if [[ -n "$configured_language" ]]; then
+        language="$configured_language"
+    elif [[ -f "$repo_path/Cargo.toml" ]]; then
+        language="rust"
+    elif [[ -f "$repo_path/go.mod" ]] || [[ -f "$repo_path/go.sum" ]]; then
+        language="go"
+    elif [[ -f "$repo_path/package.json" ]]; then
+        language="node"
+    elif [[ -f "$repo_path/pyproject.toml" ]]; then
+        language="python"
     fi
 
     # Use jq for safe JSON construction
@@ -427,20 +581,32 @@ version_tag_all() {
             continue
         fi
 
+        local language="" main_package=""
+        if command -v yq &>/dev/null; then
+            language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+            main_package=$(yq -r '.main_package // ""' "$config_file" 2>/dev/null)
+        else
+            language=$(grep '^language:' "$config_file" 2>/dev/null | head -1 | \
+                sed 's/language:[[:space:]]*//' | tr -d '"' | tr -d "'")
+            main_package=$(grep '^main_package:' "$config_file" 2>/dev/null | head -1 | \
+                sed 's/main_package:[[:space:]]*//' | tr -d '"' | tr -d "'")
+        fi
+
         # Check if tag needed
-        if ! version_needs_tag "$local_path"; then
+        if ! version_needs_tag "$local_path" "$language" "$main_package"; then
             log_debug "Skipping $tool_name: already tagged or no version"
             ((skipped++))
             continue
         fi
 
         # Create tag
-        local tag_args=""
-        $push && tag_args+=" --push"
-        $dry_run && tag_args+=" --dry-run"
+        local -a tag_args=()
+        $push && tag_args+=("--push")
+        $dry_run && tag_args+=("--dry-run")
+        [[ -n "$language" ]] && tag_args+=("--language" "$language")
+        [[ -n "$main_package" ]] && tag_args+=("--main-package" "$main_package")
 
-        # shellcheck disable=SC2086
-        if version_create_tag "$local_path" $tag_args; then
+        if version_create_tag "$local_path" "${tag_args[@]}"; then
             ((tagged++))
             results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "tagged"}')")
         else
@@ -471,4 +637,4 @@ version_tag_all() {
 # Export functions
 export -f version_detect version_needs_tag version_create_tag version_info_json version_tag_all
 export -f _version_detect_by_language _version_from_cargo_toml _version_from_go
-export -f _version_from_package_json _version_from_pyproject
+export -f _version_from_package_json _version_from_pyproject _version_from_toml_table
