@@ -49,6 +49,13 @@
       "$ref": "#/$defs/summary",
       "description": "Orchestration target counts retained from the build result"
     },
+    "build_environments": {
+      "type": "array",
+      "description": "Effective per-target build environment and isolation receipts",
+      "items": {
+        "$ref": "#/$defs/build_environment"
+      }
+    },
     "builder": {
       "type": "object",
       "description": "Information about the build system",
@@ -162,6 +169,95 @@
         "failed": {
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "build_environment": {
+      "type": "object",
+      "required": ["target", "host", "method", "build_influence_env", "cargo_isolation"],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string",
+          "pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"
+        },
+        "host": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string",
+          "enum": ["act", "native"]
+        },
+        "build_influence_env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "cargo_isolation": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/cargo_isolation"
+            }
+          ]
+        }
+      }
+    },
+    "cargo_isolation": {
+      "type": "object",
+      "required": ["mode", "source_boundary", "cargo_home", "target_dir", "ancestor_config_policy", "cache_reuse"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_boundary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cargo_home": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ancestor_config_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cache_reuse": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "sibling_roots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["relative_path", "original_source_root", "source_root"],
+            "additionalProperties": false,
+            "properties": {
+              "relative_path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._+\\-]*$"
+              },
+              "original_source_root": {
+                "type": "string",
+                "minLength": 1
+              },
+              "source_root": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
         }
       }
     },

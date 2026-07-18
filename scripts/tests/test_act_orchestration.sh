@@ -288,6 +288,15 @@ test_result=$(jq -nc --arg path "$artifact_path" '{
       method: "act",
       status: "success",
       artifact_path: $path,
+      build_influence_env: {CARGO_TARGET_DIR: "/tmp/dsr-target"},
+      cargo_isolation: {
+        mode: "ephemeral-staged-source",
+        source_boundary: "system-temporary-root-outside-user-home",
+        cargo_home: "/tmp/dsr-build/cargo-home",
+        target_dir: "/tmp/dsr-target",
+        ancestor_config_policy: "detect-original-and-reject-staging",
+        cache_reuse: ["registry", "git"]
+      },
       duration_seconds: 10
     }
   ]
@@ -296,8 +305,24 @@ manifest=$(act_generate_manifest "$test_result" "")
 schema_ver=$(echo "$manifest" | jq -r '.schema_version')
 artifacts_count=$(echo "$manifest" | jq '.artifacts | length')
 
-if [[ "$schema_ver" == "1.0.0" ]] && [[ "$artifacts_count" -eq 1 ]]; then
-    pass "act_generate_manifest generates valid manifest"
+if [[ "$schema_ver" == "1.0.0" ]] && [[ "$artifacts_count" -eq 1 ]] && \
+   jq -e '
+       .build_environments == [{
+         target: "linux/amd64",
+         host: "trj",
+         method: "act",
+         build_influence_env: {CARGO_TARGET_DIR: "/tmp/dsr-target"},
+         cargo_isolation: {
+           mode: "ephemeral-staged-source",
+           source_boundary: "system-temporary-root-outside-user-home",
+           cargo_home: "/tmp/dsr-build/cargo-home",
+           target_dir: "/tmp/dsr-target",
+           ancestor_config_policy: "detect-original-and-reject-staging",
+           cache_reuse: ["registry", "git"]
+         }
+       }]' \
+      <<< "$manifest" >/dev/null; then
+    pass "act_generate_manifest records the effective build isolation boundary"
 else
     fail "act_generate_manifest returned invalid manifest"
 fi

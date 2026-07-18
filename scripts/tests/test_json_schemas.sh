@@ -217,10 +217,13 @@ test_manifest_schema_release_contract_fields() {
         (."$defs".source.required | index("dependencies")) and
         (."$defs".source_dependency.required | index("relative_path")) and
         (."$defs".source_dependency.required | index("git_sha")) and
+        (.properties.build_environments.items."$ref" == "#/$defs/build_environment") and
+        (."$defs".build_environment.required | index("cargo_isolation")) and
+        (."$defs".cargo_isolation.required | index("ancestor_config_policy")) and
         (."$defs".artifact.required | index("archive_format")) and
         (."$defs".artifact.properties.archive_format.enum | index("binary"))
     ' "$SCHEMAS_DIR/manifest.json" &>/dev/null; then
-        log_pass "Manifest schema requires source pins/status/summary and supports strict binary assets"
+        log_pass "Manifest schema covers source pins, isolation receipts, and strict binary assets"
     else
         log_fail "Manifest schema is missing strict release-contract requirements"
     fi

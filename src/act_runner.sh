@@ -3541,6 +3541,10 @@ act_run_native_build() {
     [[ -n "$remote_path_override" ]] && strict_native_build=true
     local strict_rust_build=false
     local build_influence_env_json='{}'
+    local cargo_isolation_json='null'
+    local nonstrict_stage_root="" nonstrict_source_root="" nonstrict_cargo_home=""
+    local nonstrict_sibling_roots_json='[]'
+    local nonstrict_sibling_relatives=()
     if [[ "$language" == "rust" && -n "$remote_path_override" ]]; then
         strict_rust_build=true
         local strict_cargo_target_dir="${remote_path%/*}/.cargo-target-${platform//\//-}"
@@ -3598,6 +3602,168 @@ act_run_native_build() {
                     jq -cs 'sort_by(.key) | from_entries') || return 4
             fi
         fi
+        cargo_isolation_json=$(jq -nc \
+            --arg cargo_home "$strict_cargo_home" \
+            --arg target_dir "$strict_cargo_target_dir" '
+                {
+                    mode: "strict-release-snapshot",
+                    source_boundary: "canonical-fresh-source-root",
+                    cargo_home: $cargo_home,
+                    target_dir: $target_dir,
+                    ancestor_config_policy: "reject",
+                    cache_reuse: ["registry", "git"]
+                }
+            ') || return 4
+    elif [[ "$language" == "rust" ]]; then
+        # Ordinary Rust builds must be just as independent of operator Cargo
+        # configuration as strict release builds.  Remove any configured
+        # CARGO_HOME (it can contain aliases, patches, source replacement, and
+        # target/linker settings) and ensure the target directory is absolute
+        # before the source is staged outside the operator's home directory.
+        # An absolute target keeps artifact collection deterministic after the
+        # working directory moves to the isolated source copy.
+        local nonstrict_env="" nonstrict_pair nonstrict_target_dir=""
+        local isolation_uuid isolation_suffix isolation_root
+        if [[ ! "$tool_name" =~ ^[A-Za-z0-9_.-]+$ || \
+              ! "${platform//\//-}" =~ ^[A-Za-z0-9_.-]+$ ]] || \
+           ! isolation_uuid=$(_act_generate_uuid); then
+            _log_error "Unable to derive a unique Rust isolation path"
+            jq -nc '{status: "error", exit_code: 4, error: "Invalid Rust isolation identity"}'
+            return 4
+        fi
+        isolation_suffix="${isolation_uuid//-/}"
+        while IFS= read -r nonstrict_pair; do
+            [[ -z "$nonstrict_pair" ]] && continue
+            case "$nonstrict_pair" in
+                CARGO_HOME=*) continue ;;
+                CARGO_TARGET_DIR=*)
+                    nonstrict_target_dir="${nonstrict_pair#*=}"
+                    continue
+                    ;;
+            esac
+            [[ -n "$nonstrict_env" ]] && nonstrict_env+=$'\n'
+            nonstrict_env+="$nonstrict_pair"
+        done <<< "$build_env"
+
+        if _act_is_windows_host "$host"; then
+            case "$nonstrict_target_dir" in
+                [A-Za-z]:[\\/]*) ;;
+                *) nonstrict_target_dir="${remote_path%/*}/.dsr-cargo-target-${tool_name}-${platform//\//-}" ;;
+            esac
+            case "$remote_path" in
+                [A-Za-z]:[\\/]*) isolation_root="${remote_path:0:1}:/Users/Public/dsr-builds" ;;
+                /[A-Za-z]/*) isolation_root="${remote_path:1:1}:/Users/Public/dsr-builds" ;;
+                *)
+                    _log_error "Windows Rust source path has no drive-qualified isolation root"
+                    jq -nc '{status: "error", exit_code: 4, error: "Invalid Windows Rust source path"}'
+                    return 4
+                    ;;
+            esac
+        else
+            case "$nonstrict_target_dir" in
+                /*) ;;
+                *) nonstrict_target_dir="${remote_path%/*}/.dsr-cargo-target-${tool_name}-${platform//\//-}" ;;
+            esac
+            case "$platform" in
+                darwin/*) isolation_root="/private/tmp" ;;
+                *) isolation_root="/tmp" ;;
+            esac
+        fi
+        if [[ -z "$nonstrict_target_dir" || "$nonstrict_target_dir" == *$'\n'* || \
+              "$nonstrict_target_dir" == *$'\r'* ]]; then
+            _log_error "Unable to derive an isolated Cargo target directory"
+            jq -nc '{status: "error", exit_code: 4, error: "Invalid Cargo isolation target directory"}'
+            return 4
+        fi
+        [[ -n "$nonstrict_env" ]] && nonstrict_env+=$'\n'
+        nonstrict_env+="CARGO_TARGET_DIR=$nonstrict_target_dir"
+
+        nonstrict_stage_root="${isolation_root%/}/dsr-build-${tool_name}-${platform//\//-}-${isolation_suffix}"
+        nonstrict_source_root="$nonstrict_stage_root/source"
+        nonstrict_cargo_home="$nonstrict_stage_root/cargo-home"
+        nonstrict_env+=$'\n'"CARGO_HOME=$nonstrict_cargo_home"
+        build_env="$nonstrict_env"
+
+        # `act_sync_sources` places every declared sibling crate beside the
+        # primary workspace and rewrites absolute Cargo paths to `../name`.
+        # Preserve that layout inside the isolated parent or hermetic staging
+        # would break legitimate path dependencies (Agent Mail, beads_rust,
+        # and other multi-repo Rust releases rely on this contract).
+        local sibling_count sibling_index sibling_relative sibling_local
+        local sibling_remote sibling_staged
+        local sibling_entries=() sibling_seen=" "
+        sibling_count=$(yq -r '.sibling_crates // [] | length' "$config_file" 2>/dev/null || echo 0)
+        [[ "$sibling_count" =~ ^[0-9]+$ ]] || sibling_count=0
+        for ((sibling_index = 0; sibling_index < sibling_count; sibling_index++)); do
+            sibling_relative=$(yq -r ".sibling_crates[$sibling_index].relative_path // empty" \
+                "$config_file" 2>/dev/null || true)
+            if [[ -z "$sibling_relative" ]]; then
+                sibling_local=$(yq -r ".sibling_crates[$sibling_index].local_path // empty" \
+                    "$config_file" 2>/dev/null || true)
+                sibling_relative="${sibling_local##*/}"
+            fi
+            if [[ ! "$sibling_relative" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ || \
+                  "$sibling_relative" == *..* || \
+                  "$sibling_relative" == "source" || \
+                  "$sibling_relative" == "cargo-home" || \
+                  "$sibling_seen" == *" $sibling_relative "* ]]; then
+                _log_error "Invalid or duplicate isolated sibling crate name: $sibling_relative"
+                jq -nc '{status: "error", exit_code: 4, error: "Invalid Rust sibling isolation layout"}'
+                return 4
+            fi
+            sibling_seen+="$sibling_relative "
+            sibling_remote="${remote_path%/*}/$sibling_relative"
+            sibling_staged="$nonstrict_stage_root/$sibling_relative"
+            nonstrict_sibling_relatives+=("$sibling_relative")
+            sibling_entries+=("$(jq -nc \
+                --arg relative_path "$sibling_relative" \
+                --arg original_source_root "$sibling_remote" \
+                --arg source_root "$sibling_staged" \
+                '{relative_path: $relative_path,
+                  original_source_root: $original_source_root,
+                  source_root: $source_root}')")
+        done
+        if [[ ${#sibling_entries[@]} -gt 0 ]]; then
+            nonstrict_sibling_roots_json=$(printf '%s\n' "${sibling_entries[@]}" | jq -cs '.') || return 4
+        fi
+
+        local nonstrict_entries=() nonstrict_name nonstrict_value
+        while IFS= read -r nonstrict_pair; do
+            [[ -n "$nonstrict_pair" && "$nonstrict_pair" == *=* ]] || continue
+            nonstrict_name="${nonstrict_pair%%=*}"
+            nonstrict_value="${nonstrict_pair#*=}"
+            if _act_is_rust_build_influence_name "$nonstrict_name"; then
+                nonstrict_entries+=("$(jq -nc \
+                    --arg key "$nonstrict_name" --arg value "$nonstrict_value" \
+                    '{key: $key, value: $value}')")
+            fi
+        done <<< "$build_env"
+        if [[ ${#nonstrict_entries[@]} -gt 0 ]]; then
+            build_influence_env_json=$(printf '%s\n' "${nonstrict_entries[@]}" | \
+                jq -cs 'sort_by(.key) | from_entries') || return 4
+        fi
+        cargo_isolation_json=$(jq -nc \
+            --arg original_source_root "$remote_path" \
+            --arg stage_root "$nonstrict_stage_root" \
+            --arg source_root "$nonstrict_source_root" \
+            --arg cargo_home "$nonstrict_cargo_home" \
+            --arg target_dir "$nonstrict_target_dir" \
+            --argjson sibling_roots "$nonstrict_sibling_roots_json" '
+            {
+                mode: "ephemeral-staged-source",
+                original_source_root: $original_source_root,
+                stage_root: $stage_root,
+                source_root: $source_root,
+                source_boundary: "system-temporary-root-outside-user-home",
+                cargo_home: $cargo_home,
+                cargo_home_policy: "fresh-config-and-credentials-free",
+                target_dir: $target_dir,
+                sibling_roots: $sibling_roots,
+                ancestor_config_policy: "detect-original-and-reject-staging",
+                excluded_cargo_home_entries: ["config", "config.toml", "credentials", "credentials.toml"],
+                cache_reuse: ["registry", "git"]
+            }
+        ') || return 4
     fi
 
     # Prepare log file
@@ -3618,65 +3784,45 @@ act_run_native_build() {
     # whichever Cargo env vars happened to be exported in the operator shell.
     local cargo_env_to_unset=()
     if [[ "$language" == "rust" ]]; then
-        if $strict_rust_build; then
-            cargo_env_to_unset=(
-                CARGO_HOME CARGO_TARGET_DIR CARGO_BUILD_TARGET CARGO_BUILD_JOBS
-                CARGO_INCREMENTAL CARGO_ENCODED_RUSTFLAGS
-                RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
-                RUSTDOC RUSTDOCFLAGS RUSTUP_HOME RUSTUP_TOOLCHAIN
-                CC CXX CPP AR RANLIB LD NM OBJCOPY STRIP
-                CFLAGS CXXFLAGS CPPFLAGS LDFLAGS BINDGEN_EXTRA_CLANG_ARGS
-                SDKROOT MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET
-                INCLUDE LIB LIBPATH
-            )
-            local rust_target_triple rust_target_upper rust_target_lower influence_prefix
-            rust_target_triple=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" 2>/dev/null || true)
-            [[ -n "$rust_target_triple" ]] || rust_target_triple=$(_act_default_rust_target_triple "$platform")
-            rust_target_upper=$(printf '%s' "$rust_target_triple" | tr '[:lower:]-.' '[:upper:]__')
-            rust_target_lower=$(printf '%s' "$rust_target_triple" | tr '.-' '__')
+        cargo_env_to_unset=(
+            CARGO_HOME CARGO_TARGET_DIR CARGO_BUILD_TARGET CARGO_BUILD_JOBS
+            CARGO_INCREMENTAL CARGO_ENCODED_RUSTFLAGS
+            RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
+            RUSTDOC RUSTDOCFLAGS RUSTUP_HOME RUSTUP_TOOLCHAIN
+            CC CXX CPP AR RANLIB LD NM OBJCOPY STRIP
+            CFLAGS CXXFLAGS CPPFLAGS LDFLAGS BINDGEN_EXTRA_CLANG_ARGS
+            SDKROOT MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET
+            INCLUDE LIB LIBPATH
+        )
+        local rust_target_triple rust_target_upper rust_target_lower influence_prefix
+        rust_target_triple=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" 2>/dev/null || true)
+        [[ -n "$rust_target_triple" ]] || rust_target_triple=$(_act_default_rust_target_triple "$platform")
+        rust_target_upper=$(printf '%s' "$rust_target_triple" | tr '[:lower:]-.' '[:upper:]__')
+        rust_target_lower=$(printf '%s' "$rust_target_triple" | tr '.-' '__')
+        cargo_env_to_unset+=(
+            "CARGO_TARGET_${rust_target_upper}_LINKER"
+            "CARGO_TARGET_${rust_target_upper}_RUSTFLAGS"
+            "CARGO_TARGET_${rust_target_upper}_RUNNER"
+        )
+        for influence_prefix in CC CXX AR RANLIB CFLAGS CXXFLAGS LDFLAGS; do
             cargo_env_to_unset+=(
-                "CARGO_TARGET_${rust_target_upper}_LINKER"
-                "CARGO_TARGET_${rust_target_upper}_RUSTFLAGS"
-                "CARGO_TARGET_${rust_target_upper}_RUNNER"
+                "${influence_prefix}_${rust_target_lower}"
+                "${influence_prefix}_${rust_target_upper}"
+                "${rust_target_lower}_${influence_prefix}"
+                "${rust_target_upper}_${influence_prefix}"
             )
-            for influence_prefix in CC CXX AR RANLIB CFLAGS CXXFLAGS LDFLAGS; do
-                cargo_env_to_unset+=(
-                    "${influence_prefix}_${rust_target_lower}"
-                    "${influence_prefix}_${rust_target_upper}"
-                    "${rust_target_lower}_${influence_prefix}"
-                    "${rust_target_upper}_${influence_prefix}"
-                )
-            done
-        elif ! act_get_build_env_value "$build_env" "CARGO_TARGET_DIR" >/dev/null 2>&1; then
-            cargo_env_to_unset+=("CARGO_TARGET_DIR")
-        fi
-        if ! $strict_rust_build && \
-           ! act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" >/dev/null 2>&1; then
-            cargo_env_to_unset+=("CARGO_BUILD_TARGET")
-        fi
+        done
     fi
 
-    # Non-strict Rust builds still inherit the operator's *global* Cargo config,
-    # so a development `[patch.crates-io]` (e.g. a local frankensqlite dev
-    # checkout wired into ~/.cargo/config.toml) can leak into a published binary
-    # or, worse, break a `--locked` release when the patched version differs
-    # from Cargo.lock. `--strict-release` isolates fully; for the ordinary build
-    # path, isolate cheaply when it is safe to do so: a clean CARGO_HOME (defeats
-    # the $CARGO_HOME/config.toml source), plus building from a copy outside the
-    # operator's $HOME (defeats Cargo's ancestor-directory config walk, which
-    # reaches ~/.cargo/config.toml whenever the source lives under $HOME). The
-    # out-of-$HOME copy is only safe when CARGO_TARGET_DIR is an ABSOLUTE path
-    # (a relative one resolves against the build cwd, so moving the cwd would
-    # move the artifact away from where collection looks for it).
+    # Ordinary Rust builds must not inherit the operator's *global* Cargo
+    # configuration. A development `[patch.crates-io]`, alias, source
+    # replacement, or target/linker override can otherwise leak into a
+    # published binary or break a locked release. Every ordinary Rust build is
+    # therefore staged outside the user's home with a fresh CARGO_HOME and an
+    # absolute CARGO_TARGET_DIR; configured relative target paths are replaced.
     local nonstrict_rust_isolate=false
-    if [[ "$language" == "rust" ]] && ! $strict_rust_build; then
-        local _ctd_val
-        if _ctd_val=$(act_get_build_env_value "$build_env" "CARGO_TARGET_DIR" 2>/dev/null); then
-            case "$_ctd_val" in
-                /*) nonstrict_rust_isolate=true ;;
-            esac
-        fi
-    fi
+    [[ "$language" == "rust" && "$strict_rust_build" == false ]] && \
+        nonstrict_rust_isolate=true
 
     # Construct the remote command
     # Shell syntax depends on the build host OS, not only the target platform.
@@ -3723,6 +3869,35 @@ act_run_native_build() {
                 ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
             done <<< "$build_env"
             remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$home=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$home.PSIsContainer -or ((\$home.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$home.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
+        elif $nonstrict_rust_isolate; then
+            local win_stage_root win_source_root win_cargo_home
+            win_stage_root=$(_act_windows_cmd_path "$nonstrict_stage_root") || return 4
+            win_source_root=$(_act_windows_cmd_path "$nonstrict_source_root") || return 4
+            win_cargo_home=$(_act_windows_cmd_path "$nonstrict_cargo_home") || return 4
+            local ps_build_b64 ps_env_assignments="" env_name env_value env_name_b64 env_value_b64
+            local ps_sibling_copies="" sibling_win_remote sibling_win_staged
+            if ! command -v base64 >/dev/null 2>&1; then
+                _log_error "base64 is required to construct an isolated Windows Rust build"
+                return 3
+            fi
+            ps_build_b64=$(printf '%s' "$build_cmd" | base64 | tr -d '\r\n') || return 4
+            while IFS= read -r env_pair; do
+                [[ -n "$env_pair" && "$env_pair" == *=* ]] || continue
+                env_name="${env_pair%%=*}"
+                env_value="${env_pair#*=}"
+                [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
+                env_name_b64=$(printf '%s' "$env_name" | base64 | tr -d '\r\n') || return 4
+                env_value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
+                ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
+            done <<< "$build_env"
+            for sibling_relative in "${nonstrict_sibling_relatives[@]}"; do
+                sibling_win_remote=$(_act_windows_cmd_path \
+                    "${remote_path%/*}/$sibling_relative") || return 4
+                sibling_win_staged=$(_act_windows_cmd_path \
+                    "$nonstrict_stage_root/$sibling_relative") || return 4
+                ps_sibling_copies+="\$sibling=Get-Item -LiteralPath '${sibling_win_remote}' -Force; if (-not \$sibling.PSIsContainer -or ((\$sibling.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust sibling source root must be a plain directory' }; New-Item -ItemType Directory -Path '${sibling_win_staged}' | Out-Null; Get-ChildItem -LiteralPath \$sibling.FullName -Force | Copy-Item -Destination '${sibling_win_staged}' -Recurse -Force; "
+            done
+            remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$source=Get-Item -LiteralPath '${win_path}' -Force; if (-not \$source.PSIsContainer -or ((\$source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust source root must be a plain directory' }; \$ancestor=\$source.Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { \$candidate=Join-Path \$cargoDir \$name; if (Test-Path -LiteralPath \$candidate) { [Console]::Error.WriteLine('[dsr] excluding inherited Cargo config: ' + \$candidate) } }; \$ancestor=\$ancestor.Parent }; \$root=Split-Path -Parent '${win_stage_root}'; New-Item -ItemType Directory -Path \$root -Force | Out-Null; if (Test-Path -LiteralPath '${win_stage_root}') { throw 'Rust isolation path already exists' }; New-Item -ItemType Directory -Path '${win_stage_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_source_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_cargo_home}' | Out-Null; Get-ChildItem -LiteralPath \$source.FullName -Force | Copy-Item -Destination '${win_source_root}' -Recurse -Force; ${ps_sibling_copies}foreach (\$name in @('registry','git')) { \$cache=Join-Path (Join-Path \$env:USERPROFILE '.cargo') \$name; \$link=Join-Path '${win_cargo_home}' \$name; if (Test-Path -LiteralPath \$cache -PathType Container) { New-Item -ItemType Junction -Path \$link -Target \$cache | Out-Null; if (((Get-Item -LiteralPath \$link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'Cargo cache link is not isolated' } } }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path '${win_cargo_home}' \$name)) { throw 'Ephemeral CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}' -Force).Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Staging root inherits Cargo configuration' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.EnvironmentVariables['CARGO_HOME']='${win_cargo_home}'; \$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_source_root}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
         fi
     else
         # Unix: use bash/zsh compatible syntax
@@ -3745,15 +3920,23 @@ act_run_native_build() {
         local rp_q="${remote_path//\'/\'\\\'\'}"
         local cargo_home_prefix="" cd_cmd="cd '$rp_q'"
         if $nonstrict_rust_isolate; then
-            # (a) clean CARGO_HOME that only reuses the download caches; and
-            # (b) when the source lives under $HOME, build from a copy under a
-            #     temp dir outside $HOME so Cargo's ancestor walk can't reach
-            #     ~/.cargo. CARGO_TARGET_DIR (absolute) is unchanged, so the
-            #     artifact still lands where collection expects it. All vars
-            #     below are expanded on the REMOTE host.
-            cargo_home_prefix="_dsr_ch=\"\${TMPDIR:-/tmp}/dsr-cargo-home\"; mkdir -p \"\$_dsr_ch\"; ln -sfn \"\$HOME/.cargo/registry\" \"\$_dsr_ch/registry\" 2>/dev/null || true; ln -sfn \"\$HOME/.cargo/git\" \"\$_dsr_ch/git\" 2>/dev/null || true; rm -f \"\$_dsr_ch/config\" \"\$_dsr_ch/config.toml\"; export CARGO_HOME=\"\$_dsr_ch\"; "
-            local iso_bd="\${TMPDIR:-/tmp}/dsr-build/${tool_name}-${platform//\//-}"
-            cd_cmd="_dsr_src='$rp_q'; if case \"\$_dsr_src/\" in \"\$HOME\"/*) true;; *) false;; esac; then _dsr_bd=\"$iso_bd\"; rm -rf \"\$_dsr_bd\" && mkdir -p \"\$_dsr_bd\" && cp -R \"\$_dsr_src/.\" \"\$_dsr_bd/\" && cd \"\$_dsr_bd\"; else cd \"\$_dsr_src\"; fi"
+            local sibling_copy_prefix="" sibling_remote_q
+            for sibling_relative in "${nonstrict_sibling_relatives[@]}"; do
+                sibling_remote="${remote_path%/*}/$sibling_relative"
+                sibling_remote_q="${sibling_remote//\'/\'\\\'\'}"
+                sibling_copy_prefix+="test -d '$sibling_remote_q'; test ! -L '$sibling_remote_q'; mkdir '${nonstrict_stage_root}/$sibling_relative'; cp -R '$sibling_remote_q/.' '${nonstrict_stage_root}/$sibling_relative/'; "
+            done
+            # Always build ordinary Rust sources from a unique system-temp
+            # directory.  Cargo searches .cargo/config* in every ancestor of
+            # the working directory, so merely changing CARGO_HOME is not an
+            # isolation boundary.  /private/tmp (macOS) and /tmp (other Unix)
+            # are outside the user's home; their own ancestor chain is checked
+            # before use.  A fresh CARGO_HOME reuses only immutable download
+            # caches and cannot contain aliases, patches, source replacement,
+            # credentials, or compiler settings.  Unique directories avoid
+            # cross-target races and require no destructive pre-build cleanup.
+            cargo_home_prefix="_dsr_src='$rp_q'; _dsr_ancestor=\${_dsr_src%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do if test -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\" || test -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; then printf '[dsr] excluding inherited Cargo config: %s\\n' \"\$_dsr_ancestor/.cargo/\$_dsr_name\" >&2; fi; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; _dsr_ancestor='${nonstrict_stage_root%/*}'; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do test ! -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; test ! -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; test ! -e '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_stage_root}'; test -d '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_source_root}' '${nonstrict_cargo_home}'; ${sibling_copy_prefix}for _dsr_name in registry git; do if test -d \"\$HOME/.cargo/\$_dsr_name\"; then ln -s \"\$HOME/.cargo/\$_dsr_name\" '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; fi; done; for _dsr_name in config config.toml credentials credentials.toml; do test ! -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; done; cp -R \"\$_dsr_src/.\" '${nonstrict_source_root}/'; export CARGO_HOME='${nonstrict_cargo_home}'; "
+            cd_cmd="cd '${nonstrict_source_root}'"
         fi
         remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
     fi
@@ -4151,6 +4334,7 @@ act_run_native_build() {
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
         --argjson build_influence_env "$build_influence_env_json" \
+        --argjson cargo_isolation "$cargo_isolation_json" \
         --arg log_file "$log_file" \
         '{
             tool: $tool,
@@ -4166,6 +4350,7 @@ act_run_native_build() {
             collected_size_bytes: (if $collected_size_bytes == 0 then null else $collected_size_bytes end),
             collected_identity: (if $collected_identity == "" then null else $collected_identity end),
             build_influence_env: $build_influence_env,
+            cargo_isolation: $cargo_isolation,
             log_file: $log_file
         }'
 
@@ -4612,6 +4797,31 @@ act_orchestrate_build() {
     return "$overall_exit_code"
 }
 
+_act_build_environments_json() {
+    local result_json="$1"
+
+    jq -ce '
+        [
+            .targets[]? |
+            select((.method // "") | test("^(act|native)$")) |
+            {
+                target: (.platform // .target // ""),
+                host: (.host // ""),
+                method: (.method // ""),
+                build_influence_env: (.build_influence_env // {}),
+                cargo_isolation: (.cargo_isolation // null)
+            }
+        ] | sort_by(.target)
+        | if all(.[];
+            (.target | type == "string" and length > 0) and
+            (.host | type == "string") and
+            (.method | type == "string" and test("^(act|native)$")) and
+            (.build_influence_env | type == "object" and all(.[]; type == "string")) and
+            (.cargo_isolation == null or (.cargo_isolation | type == "object"))
+          ) then . else error("invalid build environment receipt") end
+    ' <<< "$result_json"
+}
+
 _act_generate_contract_manifest() {
     local result_json="$1"
     local output_file="$2"
@@ -4829,9 +5039,14 @@ _act_generate_contract_manifest() {
         return 4
     fi
 
-    local artifacts_json summary_json manifest_version built_at duration_seconds duration_ms manifest
+    local artifacts_json summary_json build_environments_json
+    local manifest_version built_at duration_seconds duration_ms manifest
     artifacts_json=$(printf '%s\n' "${artifacts[@]}" | jq -s '.') || return 4
     summary_json=$(jq -c '.summary' <<< "$result_json") || return 4
+    build_environments_json=$(_act_build_environments_json "$result_json") || {
+        _log_error "Failed to serialize build environment receipts"
+        return 4
+    }
     manifest_version="v${version#v}"
     built_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     duration_seconds=$(jq -r '.duration_seconds // 0' <<< "$result_json")
@@ -4849,6 +5064,7 @@ _act_generate_contract_manifest() {
         --argjson duration_ms "$duration_ms" \
         --arg status "$status" \
         --argjson summary "$summary_json" \
+        --argjson build_environments "$build_environments_json" \
         --argjson artifacts "$artifacts_json" \
         '{
             schema_version: "1.0.0",
@@ -4860,6 +5076,7 @@ _act_generate_contract_manifest() {
             duration_ms: $duration_ms,
             status: $status,
             summary: $summary,
+            build_environments: $build_environments,
             artifacts: $artifacts
         }'); then
         _log_error "Failed to serialize release manifest"
@@ -5240,6 +5457,12 @@ act_generate_manifest() {
         fi
     fi
 
+    local build_environments_json
+    build_environments_json=$(_act_build_environments_json "$result_json") || {
+        _log_error "Failed to serialize build environment receipts"
+        return 4
+    }
+
     local manifest
     manifest=$(jq -nc \
         --arg tool "$tool" \
@@ -5251,6 +5474,7 @@ act_generate_manifest() {
         --arg status "$status" \
         --argjson duration_ms "$duration_ms" \
         --argjson summary "$summary_json" \
+        --argjson build_environments "$build_environments_json" \
         --argjson artifacts "$artifacts_json" \
         '{
             schema_version: "1.0.0",
@@ -5262,6 +5486,7 @@ act_generate_manifest() {
             duration_ms: $duration_ms,
             status: $status,
             summary: $summary,
+            build_environments: $build_environments,
             artifacts: $artifacts
         }') || {
             _log_error "Failed to serialize manifest"

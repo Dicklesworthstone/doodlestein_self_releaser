@@ -169,6 +169,15 @@ yq() {
         *'.cross_compile.'*'.env'*)
             echo "${MOCK_PLATFORM_ENV:-}"
             ;;
+        '.sibling_crates // [] | length')
+            if [[ -n "${MOCK_SIBLING_RELATIVE:-}" ]]; then echo 1; else echo 0; fi
+            ;;
+        '.sibling_crates[0].relative_path // empty')
+            echo "${MOCK_SIBLING_RELATIVE:-}"
+            ;;
+        '.sibling_crates[0].local_path // empty')
+            echo "${MOCK_SIBLING_LOCAL_PATH:-}"
+            ;;
         *)
             echo ""
             ;;
@@ -189,6 +198,7 @@ reset_state() {
     unset MOCK_HOST_PATH_MMINI MOCK_HOST_PATH_WLAP MOCK_HOST_PATH_TRJ
     unset MOCK_GLOBAL_ENV MOCK_PLATFORM_ENV
     unset MOCK_SSH_STREAM_FILE
+    unset MOCK_SIBLING_RELATIVE MOCK_SIBLING_LOCAL_PATH
 
     # Defaults
     MOCK_LOCAL_PATH="/local/path/tool"
@@ -301,21 +311,149 @@ test_unix_rust_unsets_ambient_cargo_path_env() {
 }
 
 test_unix_rust_keeps_configured_cargo_path_env() {
-    log_test "Unix Rust: configured Cargo path env is exported, not unset"
+    log_test "Unix Rust: configured absolute target is restored after sanitization"
     reset_state
     MOCK_LANGUAGE="rust"
     MOCK_BUILD_CMD="cargo build --release"
-    MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"
+    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr\nCARGO_HOME=/Users/jemanuel/.cargo-operator'
 
-    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+    local result
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null)
 
     local cmd
     cmd=$(get_ssh_cmd)
 
-    if [[ "$cmd" == *'export "CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"'* ]] && [[ "$cmd" != *"unset CARGO_TARGET_DIR"* ]]; then
-        log_pass "Configured CARGO_TARGET_DIR is preserved"
+    if [[ "$cmd" == *"unset CARGO_HOME; unset CARGO_TARGET_DIR;"* ]] && \
+       [[ "$cmd" == *'export "CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"'* ]] && \
+       [[ "$cmd" == *'export "CARGO_HOME=/private/tmp/dsr-build-tool-darwin-arm64-'* ]] && \
+       [[ "$cmd" != *'/Users/jemanuel/.cargo-operator'* ]] && \
+       jq -e \
+          '.cargo_isolation.target_dir == "/Users/jemanuel/tmp/rch-target-dsr" and
+           .cargo_isolation.cargo_home == .build_influence_env.CARGO_HOME and
+           (.cargo_isolation.source_root | startswith("/private/tmp/dsr-build-tool-darwin-arm64-"))' \
+          <<< "$result" >/dev/null; then
+        log_pass "Configured target survives while operator CARGO_HOME is replaced"
     else
-        log_fail "Expected configured CARGO_TARGET_DIR export without unset in: $cmd"
+        log_fail "Expected sanitize-then-restore Cargo isolation command: $cmd result=$result"
+    fi
+}
+
+test_unix_rust_isolation_executes_outside_operator_config() {
+    log_test "Unix Rust: real Cargo invocation excludes every operator config category"
+    reset_state
+
+    local source_root="$MOCK_DIR/remote-rust-source"
+    local sibling_root="$MOCK_DIR/operator-dep"
+    local operator_home="$MOCK_DIR/operator-home"
+    local probe_output="$MOCK_DIR/isolation-probe.txt"
+    local expected_target="$MOCK_DIR/.dsr-cargo-target-tool-linux-amd64"
+    mkdir -p "$source_root/src" "$sibling_root/src" "$operator_home/.cargo"
+    printf '[package]\nname = "isolation_probe"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\noperator_dep = { path = "../operator-dep" }\n' \
+        > "$source_root/Cargo.toml"
+    printf 'pub fn probe() -> bool { operator_dep::probe() }\n' > "$source_root/src/lib.rs"
+    printf '[package]\nname = "operator_dep"\nversion = "0.1.0"\nedition = "2021"\n' \
+        > "$sibling_root/Cargo.toml"
+    printf 'pub fn probe() -> bool { true }\n' > "$sibling_root/src/lib.rs"
+    printf '%s\n' \
+        '[alias]' \
+        'operator-alias = "metadata --format-version 1 --no-deps"' \
+        '[build]' \
+        'rustc-wrapper = "/definitely/not/a/rustc-wrapper"' \
+        'target-dir = "/definitely/operator-target"' \
+        '[target.x86_64-unknown-linux-gnu]' \
+        'linker = "/definitely/not/a/linker"' \
+        '[source.crates-io]' \
+        'replace-with = "operator-source"' \
+        '[source.operator-source]' \
+        'registry = "sparse+https://example.invalid/index/"' \
+        '[patch.crates-io]' \
+        'serde = { path = "/definitely/not/a/serde-checkout" }' \
+        > "$operator_home/.cargo/config.toml"
+
+    MOCK_LOCAL_PATH="$source_root"
+    MOCK_LANGUAGE="rust"
+    MOCK_SIBLING_RELATIVE="operator-dep"
+    MOCK_SIBLING_LOCAL_PATH="$sibling_root"
+    MOCK_BUILD_CMD='cargo check --offline --quiet && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/release" && printf "isolated binary\n" > "$CARGO_TARGET_DIR/release/tool"'
+    MOCK_PLATFORM_ENV="CARGO_HOME=$operator_home/.cargo
+CARGO_TARGET_DIR=relative-operator-target
+DSR_PROBE_OUTPUT=$probe_output"
+
+    local result status=0
+    result=$(
+        _act_ssh_exec() { bash -c "$2"; }
+        CARGO_HOME="$operator_home/.cargo" \
+        RUSTC_WRAPPER="/definitely/ambient-wrapper" \
+            act_run_native_build "tool" "linux/amd64" "v1.0.0" "isolation-run"
+    ) 2>/dev/null || status=$?
+
+    local observed_source="" observed_home=""
+    if [[ -f "$probe_output" ]]; then
+        observed_source=$(sed -n '1p' "$probe_output")
+        observed_home=$(sed -n '2p' "$probe_output")
+    fi
+    if [[ $status -eq 0 && -n "$observed_source" && -n "$observed_home" ]] && \
+       jq -e \
+          --arg original "$source_root" \
+          --arg source "$observed_source" \
+          --arg home "$observed_home" \
+          --arg target "$expected_target" \
+          --arg sibling "${observed_source%/source}/operator-dep" '
+            .status == "success" and
+            .cargo_isolation.original_source_root == $original and
+            .cargo_isolation.source_root == $source and
+            .cargo_isolation.cargo_home == $home and
+            .cargo_isolation.target_dir == $target and
+            .cargo_isolation.sibling_roots == [{
+              relative_path: "operator-dep",
+              original_source_root: ($original | sub("/remote-rust-source$"; "/operator-dep")),
+              source_root: $sibling
+            }] and
+            .build_influence_env.CARGO_HOME == $home and
+            .build_influence_env.CARGO_TARGET_DIR == $target and
+            (.cargo_isolation.excluded_cargo_home_entries | sort) ==
+              (["config", "config.toml", "credentials", "credentials.toml"] | sort)' \
+          <<< "$result" >/dev/null && \
+       [[ "$observed_source" == /tmp/dsr-build-tool-linux-amd64-*/source ]] && \
+       [[ "$observed_source" != "$source_root" ]] && \
+       [[ "$observed_home" != "$operator_home/.cargo" ]] && \
+       [[ ! -e "$observed_home/config.toml" ]]; then
+        log_pass "Cargo ran from the receipt-recorded source with a config-free home"
+    else
+        log_fail "Operator Cargo config leaked or isolation receipt disagreed: status=$status result=$result"
+    fi
+}
+
+test_windows_rust_isolation_receipt_matches_command() {
+    log_test "Windows Rust: receipt paths exactly match the sanitized process command"
+    reset_state
+    MOCK_LOCAL_PATH="C:/Users/jeffr/projects/tool"
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release --locked"
+    MOCK_PLATFORM_ENV=$'CARGO_HOME=C:/Users/jeffr/.cargo-operator\nCARGO_TARGET_DIR=relative-target'
+
+    local result cmd source home target
+    result=$(act_run_native_build "tool" "windows/amd64" "v1.0.0" "windows-isolation" 2>/dev/null)
+    cmd=$(get_ssh_cmd)
+    source=$(jq -r '.cargo_isolation.source_root' <<< "$result")
+    home=$(jq -r '.cargo_isolation.cargo_home' <<< "$result")
+    target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
+
+    local win_source="${source//\//\\}"
+    local win_home="${home//\//\\}"
+    if jq -e \
+         '.status == "success" and
+          (.cargo_isolation.stage_root | startswith("C:/Users/Public/dsr-builds/")) and
+          .cargo_isolation.cargo_home == .build_influence_env.CARGO_HOME and
+          .cargo_isolation.target_dir == .build_influence_env.CARGO_TARGET_DIR' \
+         <<< "$result" >/dev/null && \
+       [[ "$target" == "C:/Users/jeffr/projects/.dsr-cargo-target-tool-windows-amd64" ]] && \
+       [[ "$cmd" == *"WorkingDirectory='$win_source'"* ]] && \
+       [[ "$cmd" == *"EnvironmentVariables['CARGO_HOME']='$win_home'"* ]] && \
+       [[ "$cmd" != *'C:\Users\jeffr\.cargo-operator'* ]]; then
+        log_pass "Windows process and receipt share one unique public isolation root"
+    else
+        log_fail "Windows command diverged from its isolation receipt: cmd=$cmd result=$result"
     fi
 }
 
@@ -931,7 +1069,7 @@ test_scp_unix_artifact_path() {
 }
 
 test_scp_rust_artifact_path() {
-    log_test "SCP Unix: correct artifact path for Rust"
+    log_test "SCP Unix: Rust default target is derived outside staged source"
     reset_state
     MOCK_LANGUAGE="rust"
     MOCK_BINARY_NAME="mytool"
@@ -942,10 +1080,8 @@ test_scp_rust_artifact_path() {
     local scp_args
     scp_args=$(get_scp_args)
 
-    # Rust binary should be in target/release
-    # Note: scp now uses separate shell arguments, so path is not embedded-quoted
-    if [[ "$scp_args" == *"mmini:/local/path/mytool/target/release/mytool "* ]]; then
-        log_pass "Rust artifact path correct: target/release/mytool"
+    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/release/mytool "* ]]; then
+        log_pass "Rust artifact path is stable outside the ephemeral source copy"
     else
         log_fail "Expected Rust artifact path in: $scp_args"
     fi
@@ -972,7 +1108,7 @@ test_scp_rust_artifact_path_with_absolute_cargo_target_dir() {
 }
 
 test_scp_rust_artifact_path_with_relative_cargo_target_dir() {
-    log_test "SCP Unix: Rust honors relative CARGO_TARGET_DIR"
+    log_test "SCP Unix: Rust replaces unsafe relative CARGO_TARGET_DIR"
     reset_state
     MOCK_LANGUAGE="rust"
     MOCK_BINARY_NAME="mytool"
@@ -984,10 +1120,10 @@ test_scp_rust_artifact_path_with_relative_cargo_target_dir() {
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/local/path/mytool/custom-target/release/mytool "* ]]; then
-        log_pass "Rust artifact path honors relative CARGO_TARGET_DIR"
+    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/release/mytool "* ]]; then
+        log_pass "Relative CARGO_TARGET_DIR cannot follow the ephemeral source cwd"
     else
-        log_fail "Expected relative CARGO_TARGET_DIR artifact path in: $scp_args"
+        log_fail "Expected derived absolute CARGO_TARGET_DIR artifact path in: $scp_args"
     fi
 }
 
@@ -1369,6 +1505,8 @@ main() {
     test_unix_env_export_syntax
     test_unix_rust_unsets_ambient_cargo_path_env
     test_unix_rust_keeps_configured_cargo_path_env
+    test_unix_rust_isolation_executes_outside_operator_config
+    test_windows_rust_isolation_receipt_matches_command
     test_rust_build_influence_name_xwin_boundaries
     test_unix_strict_rust_forces_out_of_snapshot_target_dir
     test_unix_strict_rust_executes_xwin_sanitizer_before_exports
