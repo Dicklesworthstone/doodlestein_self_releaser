@@ -55,6 +55,10 @@ create_repos_yaml() {
     echo "$content" > "$DSR_REPOS_FILE"
 }
 
+run_single_check() {
+    _qg_run_single_check "$1" "$2" "$3" "$TEST_TMPDIR/check.log"
+}
+
 # ============================================================================
 # Tests: qg_get_checks
 # ============================================================================
@@ -149,15 +153,13 @@ test_get_checks_unknown_tool() {
     checks:
       - "echo test"
 '
-    local checks
-    checks=$(qg_get_checks "unknown-tool" 2>/dev/null)
-    local count
-    count=$(echo "$checks" | jq 'length')
+    local checks exit_code=0
+    checks=$(qg_get_checks "unknown-tool" 2>/dev/null) || exit_code=$?
 
-    if [[ "$count" -eq 0 ]]; then
-        pass "qg_get_checks returns empty array for unknown tool"
+    if [[ "$exit_code" -eq 4 && -z "$checks" ]]; then
+        pass "qg_get_checks fails closed for an unknown tool"
     else
-        fail "qg_get_checks: expected 0 checks for unknown tool, got $count"
+        fail "qg_get_checks: expected rc=4 and no receipt, got rc=$exit_code checks=$checks"
     fi
     teardown_test_env
 }
@@ -173,15 +175,13 @@ test_get_checks_missing_file() {
     # Don't create the file
     rm -f "$DSR_REPOS_FILE"
 
-    local checks
-    checks=$(qg_get_checks "test-tool" 2>/dev/null)
-    local count
-    count=$(echo "$checks" | jq 'length')
+    local checks exit_code=0
+    checks=$(qg_get_checks "test-tool" 2>/dev/null) || exit_code=$?
 
-    if [[ "$count" -eq 0 ]]; then
-        pass "qg_get_checks returns empty array when repos file missing"
+    if [[ "$exit_code" -eq 4 && -z "$checks" ]]; then
+        pass "qg_get_checks fails closed when the repos file is missing"
     else
-        fail "qg_get_checks: expected 0 checks for missing file, got $count"
+        fail "qg_get_checks: expected rc=4 and no receipt, got rc=$exit_code checks=$checks"
     fi
     teardown_test_env
 }
@@ -224,7 +224,7 @@ test_run_single_check_success() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "echo hello" "" "false" 2>/dev/null)
+    result=$(run_single_check "echo hello" "" "false" 2>/dev/null)
 
     local passed exit_code
     passed=$(echo "$result" | jq -r '.passed')
@@ -243,7 +243,7 @@ test_run_single_check_failure() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "false" "" "false" 2>/dev/null)
+    result=$(run_single_check "false" "" "false" 2>/dev/null)
 
     local passed exit_code
     passed=$(echo "$result" | jq -r '.passed')
@@ -262,10 +262,10 @@ test_run_single_check_output_captured() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "echo test_output_123" "" "false" 2>/dev/null)
+    result=$(run_single_check "echo test_output_123" "" "false" 2>/dev/null)
 
     local output
-    output=$(echo "$result" | jq -r '.output')
+    output=$(echo "$result" | jq -r '.output_preview')
 
     if [[ "$output" == *"test_output_123"* ]]; then
         pass "_qg_run_single_check captures command output"
@@ -280,7 +280,7 @@ test_run_single_check_duration() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "sleep 0.1" "" "false" 2>/dev/null)
+    result=$(run_single_check "sleep 0.1" "" "false" 2>/dev/null)
 
     local duration_ms
     duration_ms=$(echo "$result" | jq -r '.duration_ms')
@@ -298,14 +298,17 @@ test_run_single_check_dry_run() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "false" "" "true" 2>/dev/null)
+    result=$(run_single_check "false" "" "true" 2>/dev/null)
 
-    local passed output
+    local passed executed status output
     passed=$(echo "$result" | jq -r '.passed')
-    output=$(echo "$result" | jq -r '.output')
+    executed=$(echo "$result" | jq -r '.executed')
+    status=$(echo "$result" | jq -r '.status')
+    output=$(echo "$result" | jq -r '.output_preview')
 
-    if [[ "$passed" == "true" && "$output" == *"dry-run"* ]]; then
-        pass "_qg_run_single_check dry-run skips execution"
+    if [[ "$passed" == "false" && "$executed" == "false" && \
+          "$status" == "planned" && "$output" == *"dry-run"* ]]; then
+        pass "_qg_run_single_check records dry-run as planned and not executed"
     else
         fail "_qg_run_single_check dry-run: passed=$passed, output=$output"
     fi
@@ -320,10 +323,10 @@ test_run_single_check_work_dir() {
     mkdir -p "$work_dir"
 
     local result
-    result=$(_qg_run_single_check "pwd" "$work_dir" "false" 2>/dev/null)
+    result=$(run_single_check "pwd" "$work_dir" "false" 2>/dev/null)
 
     local output
-    output=$(echo "$result" | jq -r '.output')
+    output=$(echo "$result" | jq -r '.output_preview')
 
     if [[ "$output" == *"$work_dir"* ]]; then
         pass "_qg_run_single_check runs in work directory"
@@ -338,21 +341,43 @@ test_run_single_check_json_structure() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "echo test" "" "false" 2>/dev/null)
+    result=$(run_single_check "echo test" "" "false" 2>/dev/null)
 
-    local has_command has_exit_code has_duration has_passed has_output
+    local has_command has_exit_code has_duration has_passed has_output has_log has_sha
+    local log_path expected_sha actual_sha
     has_command=$(echo "$result" | jq 'has("command")')
     has_exit_code=$(echo "$result" | jq 'has("exit_code")')
     has_duration=$(echo "$result" | jq 'has("duration_ms")')
     has_passed=$(echo "$result" | jq 'has("passed")')
-    has_output=$(echo "$result" | jq 'has("output")')
+    has_output=$(echo "$result" | jq 'has("output_preview")')
+    has_log=$(echo "$result" | jq 'has("log_path")')
+    has_sha=$(echo "$result" | jq 'has("log_sha256")')
+    log_path=$(echo "$result" | jq -r '.log_path')
+    expected_sha=$(echo "$result" | jq -r '.log_sha256')
+    actual_sha=$(_qg_sha256 "$log_path")
 
     if [[ "$has_command" == "true" && "$has_exit_code" == "true" && \
           "$has_duration" == "true" && "$has_passed" == "true" && \
-          "$has_output" == "true" ]]; then
-        pass "_qg_run_single_check returns complete JSON structure"
+          "$has_output" == "true" && "$has_log" == "true" && "$has_sha" == "true" && \
+          -f "$log_path" && "$actual_sha" == "$expected_sha" ]]; then
+        pass "_qg_run_single_check returns a complete hash-bound log receipt"
     else
         fail "_qg_run_single_check JSON: missing fields"
+    fi
+    teardown_test_env
+}
+
+test_run_single_check_requires_log_path() {
+    ((TESTS_RUN++))
+    setup_test_env
+
+    local result exit_code=0
+    result=$(_qg_run_single_check "true" "" "false" 2>/dev/null) || exit_code=$?
+
+    if [[ "$exit_code" -eq 4 && -z "$result" ]]; then
+        pass "_qg_run_single_check rejects execution without a durable log path"
+    else
+        fail "_qg_run_single_check accepted a missing log path: exit=$exit_code result=$result"
     fi
     teardown_test_env
 }
@@ -362,7 +387,7 @@ test_run_single_check_nonzero_exit() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "exit 42" "" "false" 2>/dev/null)
+    result=$(run_single_check "exit 42" "" "false" 2>/dev/null)
 
     local exit_code
     exit_code=$(echo "$result" | jq -r '.exit_code')
@@ -458,17 +483,21 @@ test_run_checks_dry_run() {
     checks:
       - "false"
 '
-    local result
-    result=$(qg_run_checks test-tool --dry-run 2>/dev/null)
+    local result exit_code=0
+    result=$(qg_run_checks test-tool --dry-run 2>/dev/null) || exit_code=$?
 
-    local dry_run passed
+    local dry_run status passed planned executed
     dry_run=$(echo "$result" | jq -r '.dry_run')
+    status=$(echo "$result" | jq -r '.status')
     passed=$(echo "$result" | jq -r '.passed')
+    planned=$(echo "$result" | jq -r '.planned')
+    executed=$(echo "$result" | jq -r '.checks[0].executed')
 
-    if [[ "$dry_run" == "true" && "$passed" == "1" ]]; then
-        pass "qg_run_checks --dry-run skips actual execution"
+    if [[ "$exit_code" -eq 2 && "$dry_run" == "true" && "$status" == "planned" && \
+          "$passed" == "0" && "$planned" == "1" && "$executed" == "false" ]]; then
+        pass "qg_run_checks --dry-run is planned-only and cannot pass the gate"
     else
-        fail "qg_run_checks --dry-run: dry_run=$dry_run, passed=$passed"
+        fail "qg_run_checks --dry-run: exit=$exit_code status=$status dry_run=$dry_run passed=$passed planned=$planned executed=$executed"
     fi
     teardown_test_env
 }
@@ -485,16 +514,17 @@ test_run_checks_no_checks_configured() {
   test-tool:
     repo: foo/bar
 '
-    local result
-    result=$(qg_run_checks test-tool 2>/dev/null)
+    local result exit_code=0
+    result=$(qg_run_checks test-tool 2>/dev/null) || exit_code=$?
 
-    local total
+    local status total
+    status=$(echo "$result" | jq -r '.status')
     total=$(echo "$result" | jq -r '.total')
 
-    if [[ "$total" == "0" ]]; then
-        pass "qg_run_checks handles no configured checks"
+    if [[ "$exit_code" -eq 4 && "$status" == "config-error" && "$total" == "0" ]]; then
+        pass "qg_run_checks rejects a vacuous zero-check gate"
     else
-        fail "qg_run_checks: expected 0 checks, got $total"
+        fail "qg_run_checks: expected config error for zero checks, got exit=$exit_code status=$status total=$total"
     fi
     teardown_test_env
 }
@@ -644,7 +674,7 @@ test_run_checks_work_dir() {
     result=$(qg_run_checks test-tool --work-dir "$work_dir" 2>/dev/null)
 
     local output
-    output=$(echo "$result" | jq -r '.checks[0].output')
+    output=$(echo "$result" | jq -r '.checks[0].output_preview')
 
     if [[ "$output" == *"marker_file_123"* ]]; then
         pass "qg_run_checks --work-dir runs checks in specified directory"
@@ -879,7 +909,7 @@ test_check_with_special_chars() {
     result=$(qg_run_checks test-tool 2>/dev/null)
 
     local output
-    output=$(echo "$result" | jq -r '.checks[0].output')
+    output=$(echo "$result" | jq -r '.checks[0].output_preview')
 
     if [[ "$output" == *"quoted string"* ]]; then
         pass "qg_run_checks handles special characters in check"
@@ -933,7 +963,7 @@ test_check_with_and() {
     result=$(qg_run_checks test-tool 2>/dev/null)
 
     local output
-    output=$(echo "$result" | jq -r '.checks[0].output')
+    output=$(echo "$result" | jq -r '.checks[0].output_preview')
 
     if [[ "$output" == *"success"* ]]; then
         pass "qg_run_checks handles && in commands"
@@ -949,10 +979,10 @@ test_check_long_output_truncated() {
 
     # Generate long output (more than 1000 chars)
     local result
-    result=$(_qg_run_single_check "yes | head -500" "" "false" 2>/dev/null)
+    result=$(run_single_check "yes | head -500" "" "false" 2>/dev/null)
 
     local output_len
-    output_len=$(echo "$result" | jq -r '.output | length')
+    output_len=$(echo "$result" | jq -r '.output_preview | length')
 
     # Output should be truncated to ~1000 chars
     if [[ "$output_len" -le 1100 ]]; then
@@ -968,10 +998,10 @@ test_check_stderr_captured() {
     setup_test_env
 
     local result
-    result=$(_qg_run_single_check "echo stderr_test >&2" "" "false" 2>/dev/null)
+    result=$(run_single_check "echo stderr_test >&2" "" "false" 2>/dev/null)
 
     local output
-    output=$(echo "$result" | jq -r '.output')
+    output=$(echo "$result" | jq -r '.output_preview')
 
     if [[ "$output" == *"stderr_test"* ]]; then
         pass "_qg_run_single_check captures stderr"
@@ -1000,8 +1030,8 @@ test_get_checks_yq_missing() {
 
         export PATH="$old_path"
 
-        if [[ "$exit_code" -eq 3 && "$checks" == "[]" ]]; then
-            pass "qg_get_checks handles missing yq"
+        if [[ "$exit_code" -eq 3 && -z "$checks" ]]; then
+            pass "qg_get_checks fails closed when yq is missing"
         else
             fail "qg_get_checks yq missing: exit=$exit_code, checks=$checks"
         fi
@@ -1012,8 +1042,8 @@ test_get_checks_yq_missing() {
         local checks exit_code=0
         checks=$(qg_get_checks "test-tool" 2>/dev/null) || exit_code=$?
 
-        if [[ "$exit_code" -eq 3 && "$checks" == "[]" ]]; then
-            pass "qg_get_checks handles missing yq"
+        if [[ "$exit_code" -eq 3 && -z "$checks" ]]; then
+            pass "qg_get_checks fails closed when yq is missing"
         else
             fail "qg_get_checks yq missing: exit=$exit_code, checks=$checks"
         fi
@@ -1046,6 +1076,7 @@ main() {
     test_run_single_check_dry_run
     test_run_single_check_work_dir
     test_run_single_check_json_structure
+    test_run_single_check_requires_log_path
     test_run_single_check_nonzero_exit
 
     echo ""

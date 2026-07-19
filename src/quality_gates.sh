@@ -149,6 +149,11 @@ qg_get_checks() {
 # Returns: JSON object with result. Dry-run entries carry
 # status="planned", executed=false and MUST NOT be counted as passed.
 _qg_run_single_check() {
+    if [[ $# -ne 4 || -z "${4:-}" ]]; then
+        _qg_log_error "A durable per-check log path is required"
+        return 4
+    fi
+
     local cmd="$1"
     local work_dir="$2"
     local dry_run="$3"
@@ -352,7 +357,8 @@ EOF
     fi
 
     local repos_file="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
-    local run_dir="${DSR_QUALITY_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr/quality-logs}/${tool_name}/$(date +%Y%m%dT%H%M%S)-$$"
+    local run_dir
+    run_dir="${DSR_QUALITY_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr/quality-logs}/${tool_name}/$(date +%Y%m%dT%H%M%S)-$$"
     mkdir -p "$run_dir"
 
     local snapshot_before

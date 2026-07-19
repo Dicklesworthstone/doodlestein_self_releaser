@@ -98,15 +98,12 @@ teardown() {
     assert_equal "$count" "0"
 }
 
-@test "qg_get_checks returns empty array for unknown tool" {
+@test "qg_get_checks fails closed for an unknown tool" {
     skip_unless_command yq "yq required for config parsing"
 
     run qg_get_checks "nonexistent-tool"
-    [[ "$status" -eq 0 ]]
-
-    local count
-    count=$(echo "$output" | jq 'length')
-    assert_equal "$count" "0"
+    [[ "$status" -eq 4 ]]
+    assert_contains "$output" "not configured"
 }
 
 @test "qg_get_checks warns when yq unavailable" {
@@ -123,11 +120,8 @@ teardown() {
     # Should return exit code 3 when yq is unavailable
     [ "$status" -eq 3 ]
 
-    # Output should contain empty JSON array (filter out log messages)
-    # Note: log messages start with [quality] so we match exactly []
-    local json_output
-    json_output=$(echo "$output" | grep -E '^\[\]$' | head -1)
-    [[ "$json_output" == "[]" ]]
+    assert_contains "$output" "yq required"
+    ! echo "$output" | grep -Eq '^\[\]$'
 }
 
 # ============================================================================
@@ -182,7 +176,7 @@ teardown() {
 
     # Check first result has output
     local first_output
-    first_output=$(echo "$json_output" | jq -r '.checks[0].output')
+    first_output=$(echo "$json_output" | jq -r '.checks[0].output_preview')
     assert_contains "$first_output" "check 1 passed"
 }
 
@@ -228,19 +222,21 @@ teardown() {
     assert_equal "$total" "0"
 }
 
-@test "qg_run_checks with no configured checks succeeds" {
+@test "qg_run_checks with no configured checks fails closed" {
     skip_unless_command yq "yq required for config parsing"
 
     run qg_run_checks "no-checks-tool"
-    [[ "$status" -eq 0 ]]
+    [[ "$status" -eq 4 ]]
 
     # Extract JSON from output (may have log messages mixed in)
     local json_output
     json_output=$(echo "$output" | grep -E '^\{' | head -1)
 
-    local total
+    local total receipt_status
     total=$(echo "$json_output" | jq '.total')
+    receipt_status=$(echo "$json_output" | jq -r '.status')
     assert_equal "$total" "0"
+    assert_equal "$receipt_status" "config-error"
 }
 
 # ============================================================================
@@ -251,23 +247,29 @@ teardown() {
     skip_unless_command yq "yq required for config parsing"
 
     run qg_run_checks "failing-tool" --dry-run
-    [[ "$status" -eq 0 ]]
+    [[ "$status" -eq 2 ]]
 
     # Extract JSON from output (may have log messages mixed in)
     local json_output
     json_output=$(echo "$output" | grep -E '^\{' | head -1)
 
-    # All checks should "pass" in dry-run
-    local passed
+    # Every check is planned and explicitly not executed; none passes.
+    local passed planned executed receipt_status
     passed=$(echo "$json_output" | jq '.passed')
-    assert_equal "$passed" "3"
+    planned=$(echo "$json_output" | jq '.planned')
+    executed=$(echo "$json_output" | jq '[.checks[].executed] | any')
+    receipt_status=$(echo "$json_output" | jq -r '.status')
+    assert_equal "$passed" "0"
+    assert_equal "$planned" "3"
+    assert_equal "$executed" "false"
+    assert_equal "$receipt_status" "planned"
 }
 
 @test "qg_run_checks --dry-run sets dry_run flag" {
     skip_unless_command yq "yq required for config parsing"
 
     run qg_run_checks "test-tool" --dry-run
-    [[ "$status" -eq 0 ]]
+    [[ "$status" -eq 2 ]]
 
     # Extract JSON from output (may have log messages mixed in)
     local json_output
@@ -282,7 +284,7 @@ teardown() {
     skip_unless_command yq "yq required for config parsing"
 
     run qg_run_checks "test-tool" --dry-run
-    [[ "$status" -eq 0 ]]
+    [[ "$status" -eq 2 ]]
 
     # Extract JSON from output (may have log messages mixed in)
     local json_output
@@ -319,7 +321,7 @@ EOF
     json_output=$(echo "$output" | grep -E '^\{' | head -1)
 
     local output_content
-    output_content=$(echo "$json_output" | jq -r '.checks[0].output')
+    output_content=$(echo "$json_output" | jq -r '.checks[0].output_preview')
     assert_contains "$output_content" "$test_dir"
 }
 
@@ -367,14 +369,23 @@ EOF
     json_output=$(echo "$output" | grep -E '^\{' | head -1)
 
     # Check first result structure
-    local has_command has_exit_code has_passed
+    local has_command has_exit_code has_passed has_log_path has_log_sha log_path expected_sha actual_sha
     has_command=$(echo "$json_output" | jq '.checks[0] | has("command")')
     has_exit_code=$(echo "$json_output" | jq '.checks[0] | has("exit_code")')
     has_passed=$(echo "$json_output" | jq '.checks[0] | has("passed")')
+    has_log_path=$(echo "$json_output" | jq '.checks[0] | has("log_path")')
+    has_log_sha=$(echo "$json_output" | jq '.checks[0] | has("log_sha256")')
+    log_path=$(echo "$json_output" | jq -r '.checks[0].log_path')
+    expected_sha=$(echo "$json_output" | jq -r '.checks[0].log_sha256')
+    actual_sha=$(_qg_sha256 "$log_path")
 
     assert_equal "$has_command" "true"
     assert_equal "$has_exit_code" "true"
     assert_equal "$has_passed" "true"
+    assert_equal "$has_log_path" "true"
+    assert_equal "$has_log_sha" "true"
+    [[ -f "$log_path" ]]
+    assert_equal "$actual_sha" "$expected_sha"
 }
 
 # ============================================================================
@@ -421,7 +432,7 @@ EOF
     assert_equal "$failed" "0"
 }
 
-@test "qg_run_checks stops on first failure but reports all" {
+@test "qg_run_checks continues after failure and reports all" {
     skip_unless_command yq "yq required for config parsing"
 
     run qg_run_checks "failing-tool"
@@ -440,4 +451,39 @@ EOF
     local failed
     failed=$(echo "$json_output" | jq '.failed')
     assert_equal "$failed" "1"
+}
+
+@test "qg_run_checks invalidates a receipt when source moves" {
+    skip_unless_command yq "yq required for config parsing"
+    skip_unless_command git "git required for source snapshots"
+
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'EOF'
+tools:
+  moving-tool:
+    checks:
+      - "printf changed >> tracked.txt"
+EOF
+
+    local work_dir="$TEST_TMPDIR/moving-source"
+    mkdir -p "$work_dir"
+    git -C "$work_dir" init -q
+    git -C "$work_dir" config user.name "DSR Test"
+    git -C "$work_dir" config user.email "dsr-test@example.invalid"
+    printf 'before\n' > "$work_dir/tracked.txt"
+    git -C "$work_dir" add tracked.txt
+    git -C "$work_dir" commit -qm baseline
+
+    run qg_run_checks "moving-tool" --work-dir "$work_dir"
+    [[ "$status" -eq 1 ]]
+
+    local json_output receipt_status before after passed
+    json_output=$(echo "$output" | grep -E '^\{' | head -1)
+    receipt_status=$(echo "$json_output" | jq -r '.status')
+    before=$(echo "$json_output" | jq -r '.source_before')
+    after=$(echo "$json_output" | jq -r '.source_after')
+    passed=$(echo "$json_output" | jq '.passed')
+
+    assert_equal "$receipt_status" "invalidated-moving-source"
+    [[ "$before" != "$after" ]]
+    assert_equal "$passed" "1"
 }
