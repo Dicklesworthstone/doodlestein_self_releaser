@@ -265,8 +265,15 @@ Build artifacts locally.
 dsr build --repo ntm                            # Build all targets
 dsr build --repo ntm --targets linux/amd64      # Specific target
 dsr build --repo ntm --version v1.2.3           # Specific version
-dsr build --repo ntm --no-sign                  # Skip signing
+dsr build --repo ntm --parallel                  # Bounded concurrency (2 targets)
+dsr build --repo ntm --parallel=4                # Explicit concurrency bound
+dsr build --repo ntm --resume                    # Resume latest interrupted run
+dsr build --repo ntm --resume=<run-id>           # Resume a specific run
 ```
+
+Parallel builds keep attempt-scoped logs and results per target. A partial run
+preserves verified completed artifacts; resume retries only incomplete targets.
+The authoritative manifest is withheld until every requested target succeeds.
 
 ### `dsr release`
 

@@ -1580,11 +1580,10 @@ cmd_build() {
     local targets=()
     local version=""
     local output_dir=""
+    local output_dir_explicit=false
     local dry_run="$DRY_RUN"
-    # shellcheck disable=SC2034  # parallel reserved for future parallel build support
-    local parallel=false
-    # shellcheck disable=SC2034  # resume reserved for future resume support
-    local resume=false
+    local parallel_jobs=1
+    local resume=false resume_selector="latest"
     local allow_dirty=false
     local no_sync=false
     local sync_only=false
@@ -1613,17 +1612,29 @@ cmd_build() {
                 ;;
             --output-dir|-o)
                 output_dir="$2"
+                output_dir_explicit=true
                 shift 2
                 ;;
             --parallel|-p)
-                # shellcheck disable=SC2034
-                parallel=true
+                parallel_jobs="${DSR_BUILD_PARALLELISM:-2}"
                 shift
                 ;;
+            --parallel=*)
+                parallel_jobs="${1#*=}"
+                shift
+                ;;
+            --jobs)
+                [[ $# -ge 2 ]] || { log_error "--jobs requires a value"; return 4; }
+                parallel_jobs="$2"
+                shift 2
+                ;;
             --resume|-r)
-                # shellcheck disable=SC2034
                 resume=true
-                log_warn "--resume is not yet implemented; proceeding with fresh build"
+                shift
+                ;;
+            --resume=*)
+                resume=true
+                resume_selector="${1#*=}"
                 shift
                 ;;
             --allow-dirty)
@@ -1665,8 +1676,9 @@ OPTIONS:
     --targets <list>       Comma-separated target list
     -V, --version <ver>    Version to build (default: detect from version files)
     -o, --output-dir <dir> Output directory for artifacts
-    -p, --parallel         Build targets in parallel
-    -r, --resume           Resume interrupted build
+    -p, --parallel[=N]     Build targets concurrently (default bound: 2)
+        --jobs <N>         Explicit target concurrency bound (1-32)
+    -r, --resume[=RUN_ID]  Resume latest or selected interrupted build
     --allow-dirty          Allow building with uncommitted changes
     --no-sync              Skip source sync to remote hosts
     --sync-only            Sync source to remote hosts without building
@@ -1690,7 +1702,8 @@ EXAMPLES:
     dsr build ntm                           Build ntm for all targets
     dsr build ntm --target linux/amd64      Build only for Linux x64
     dsr build ntm --version 1.2.3           Build specific version
-    dsr build ntm --parallel                Build all targets in parallel
+    dsr build ntm --parallel                Build up to 2 targets concurrently
+    dsr build ntm --parallel=4              Build up to 4 targets concurrently
     dsr build --tool bv --resume            Resume interrupted bv build
     dsr build ntm --sync-only               Sync source without building
     dsr build ntm --no-sync                 Build without syncing source
@@ -1731,6 +1744,15 @@ EOF
         return 4
     fi
 
+    if [[ ! "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || [[ "$parallel_jobs" -gt 32 ]]; then
+        log_error "Parallel job count must be an integer from 1 through 32"
+        return 4
+    fi
+    if $resume && [[ "$resume_selector" != "latest" ]] && ! _act_is_uuid "$resume_selector"; then
+        log_error "--resume run ID must be a schema-valid UUID"
+        return 4
+    fi
+
     # Validate matrix filter flags are mutually exclusive
     if $only_act && $only_native; then
         log_error "Cannot specify both --only-act and --only-native"
@@ -1739,6 +1761,10 @@ EOF
 
     if $no_sync && $sync_only; then
         log_error "--no-sync and --sync-only are mutually exclusive"
+        return 4
+    fi
+    if $resume && $sync_only; then
+        log_error "--resume and --sync-only are mutually exclusive"
         return 4
     fi
 
@@ -1841,6 +1867,7 @@ EOF
     # Set output directory default (tool-version)
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     [[ -z "$output_dir" ]] && output_dir="$state_dir/artifacts/${tool_name}-${tag}"
+    [[ "$output_dir" != "/" ]] && output_dir="${output_dir%/}"
 
     # Get targets from args or config
     local target_list
@@ -1906,6 +1933,59 @@ EOF
         fi
     fi
 
+    local resume_run_id="" resume_state=""
+    if $resume; then
+        if ! build_state_init; then
+            log_error "Build state initialization failed"
+            return 4
+        fi
+        if ! resume_state=$(build_state_get "$tool_name" "$version" "$resume_selector" 2>/dev/null); then
+            log_error "No resumable build state found for $tool_name $version ($resume_selector)"
+            return 4
+        fi
+        resume_run_id=$(jq -r '.run_id // empty' <<< "$resume_state")
+        if ! _act_is_uuid "$resume_run_id" || \
+           [[ "$(jq -r '.status // empty' <<< "$resume_state")" == "completed" ]] || \
+           [[ "$(jq -r '.status // empty' <<< "$resume_state")" == "cancelled" ]]; then
+            log_error "Selected build state is not resumable"
+            return 4
+        fi
+
+        local resume_targets_json requested_resume_targets_json
+        resume_targets_json=$(jq -c '.targets // []' <<< "$resume_state")
+        # shellcheck disable=SC2086  # one configured target per word
+        requested_resume_targets_json=$(printf '%s\n' $target_list | \
+            jq -Rsc 'split("\n") | map(select(length > 0))')
+        if [[ "$resume_targets_json" != "$requested_resume_targets_json" ]]; then
+            log_error "Resume target set differs from the interrupted run"
+            return 4
+        fi
+
+        local resume_sha resume_ref resume_output current_sha
+        resume_sha=$(jq -r '.git_sha // empty' <<< "$resume_state")
+        resume_ref=$(jq -r '.git_ref // empty' <<< "$resume_state")
+        resume_output=$(jq -r '.context.output_dir // empty' <<< "$resume_state")
+        current_sha=$(git -C "$local_path" rev-parse --verify HEAD 2>/dev/null || true)
+        if ! $output_dir_explicit && [[ -n "$resume_output" ]]; then
+            output_dir="$resume_output"
+        fi
+        if [[ ! "$resume_sha" =~ ^[0-9a-f]{40}$ || "$current_sha" != "$resume_sha" || \
+              -z "$resume_output" || "$resume_output" != "$output_dir" ]]; then
+            log_error "Resume state source commit or output directory does not match this build"
+            return 4
+        fi
+        build_source_sha="$resume_sha"
+        build_source_ref="$resume_ref"
+        build_source_roots_json=$(jq -cS '.context.source_roots // {}' <<< "$resume_state")
+        if $build_release_contract_enabled && \
+           ! jq -e 'type == "object" and length > 0 and all(.[]; type == "string" and length > 0)' \
+                <<< "$build_source_roots_json" &>/dev/null; then
+            log_error "Strict resume state has no valid source-root snapshot"
+            return 4
+        fi
+        log_info "Resuming build run $resume_run_id"
+    fi
+
     if $dry_run; then
         local planned_targets='[]'
         local planned_host planned_method
@@ -1934,6 +2014,8 @@ EOF
         log_info "  Version:    $tag"
         log_info "  Targets:    $target_list"
         log_info "  Output:     $output_dir"
+        log_info "  Concurrency: $parallel_jobs"
+        $resume && log_info "  Resume run: $resume_run_id"
         if $sync_only; then
             log_info "  Source sync: planned (sync only; no build)"
         elif $no_sync; then
@@ -1949,9 +2031,14 @@ EOF
                 --arg version "$tag" \
                 --argjson targets "$planned_targets" \
                 --arg output_dir "$output_dir" \
+                --argjson parallel_jobs "$parallel_jobs" \
+                --arg resume_run_id "$resume_run_id" \
                 --argjson no_sync "$no_sync" \
                 --argjson sync_only "$sync_only" \
-                '{repo: $repo, tool: $tool, version: $version, targets: $targets, output_dir: $output_dir, no_sync: $no_sync, sync_only: $sync_only, mode: "dry_run"}')"
+                '{repo: $repo, tool: $tool, version: $version, targets: $targets,
+                  output_dir: $output_dir, parallel_jobs: $parallel_jobs,
+                  resume_run_id: $resume_run_id, no_sync: $no_sync,
+                  sync_only: $sync_only, mode: "dry_run"}')"
         fi
         return 0
     fi
@@ -1960,18 +2047,36 @@ EOF
         local output_parent
         output_dir="${output_dir%/}"
         output_parent=$(dirname "$output_dir")
-        if [[ -z "$output_dir" || -e "$output_dir" || -L "$output_dir" ]]; then
-            log_error "Strict release build requires a fresh output directory: $output_dir"
-            return 4
-        fi
-        if ! mkdir -p "$output_parent" || [[ ! -d "$output_parent" || -L "$output_parent" ]] || \
-           ! (umask 077; mkdir "$output_dir") || [[ ! -d "$output_dir" || -L "$output_dir" ]]; then
-            log_error "Failed to create private strict output directory: $output_dir"
-            return 4
+        if $resume; then
+            if [[ -z "$output_dir" || ! -d "$output_dir" || -L "$output_dir" ]]; then
+                log_error "Strict resume requires its existing private output directory: $output_dir"
+                return 4
+            fi
+        else
+            if [[ -z "$output_dir" || -e "$output_dir" || -L "$output_dir" ]]; then
+                log_error "Strict release build requires a fresh output directory: $output_dir"
+                return 4
+            fi
+            if ! mkdir -p "$output_parent" || [[ ! -d "$output_parent" || -L "$output_parent" ]] || \
+               ! (umask 077; mkdir "$output_dir") || [[ ! -d "$output_dir" || -L "$output_dir" ]]; then
+                log_error "Failed to create private strict output directory: $output_dir"
+                return 4
+            fi
         fi
     elif ! mkdir -p "$output_dir"; then
         log_error "Failed to create output directory: $output_dir"
         return 1
+    fi
+
+    # The orchestrator is captured through command substitution below, so any
+    # shell-local initialization it performs cannot propagate back into this
+    # coordinator. Initialize the parent before source sync or build work so
+    # the final targets-complete -> completed transition addresses the same
+    # state root and fails before remote side effects if persistence is
+    # unavailable.
+    if ! command -v build_state_init &>/dev/null || ! build_state_init; then
+        log_error "Build state initialization failed"
+        return 4
     fi
 
     log_info "Building $tool_name $version"
@@ -2003,8 +2108,19 @@ EOF
         log_info "No act targets selected; skipping act dependency check"
     fi
 
+    # Strict resume reuses the immutable, SHA-verified source roots recorded by
+    # the interrupted run. Creating a second strict snapshot would change the
+    # run identity and defeat resume. Ordinary builds may safely resync HEAD.
+    if $resume && $build_release_contract_enabled; then
+        build_run_id="$resume_run_id"
+        build_source_args=(
+            --git-sha "$build_source_sha"
+            --git-ref "$build_source_ref"
+            --source-roots-json "$build_source_roots_json"
+        )
+        log_info "Reusing strict source snapshot for resumed run $resume_run_id"
     # Sync source to remote hosts (unless --no-sync)
-    if ! $no_sync; then
+    elif ! $no_sync; then
         if $build_release_contract_enabled; then
             if ! build_run_id=$(_act_generate_uuid) || ! _act_is_uuid "$build_run_id"; then
                 log_error "Could not generate a strict release build run ID"
@@ -2063,7 +2179,6 @@ EOF
                 --git-ref "$build_source_ref"
                 --run-id "$build_run_id"
                 --source-roots-json "$build_source_roots_json"
-                --
             )
         fi
 
@@ -2077,14 +2192,24 @@ EOF
         fi
     fi
 
+    if $resume && ! $build_release_contract_enabled; then
+        build_source_args=(--git-sha "$build_source_sha" --git-ref "$build_source_ref")
+    fi
+
     # Record start time
     local start_time
     start_time=$(date +%s)
 
-    # Run orchestrated build
+    # Run orchestrated build. Options precede an explicit delimiter so target
+    # names can never be reinterpreted as scheduler flags.
     local full_output orchestrator_exit=0
+    local -a orchestration_resume_args=()
+    $resume && orchestration_resume_args=(--resume-run-id "$resume_run_id")
     # shellcheck disable=SC2086
-    full_output=$(act_orchestrate_build "$tool_name" "$version" "${build_source_args[@]}" $target_list 2>&1) || orchestrator_exit=$?
+    full_output=$(act_orchestrate_build "$tool_name" "$version" \
+        "${build_source_args[@]}" "${orchestration_resume_args[@]}" \
+        --parallel-jobs "$parallel_jobs" --output-dir "$output_dir" -- \
+        $target_list 2>&1) || orchestrator_exit=$?
 
     # Debug: show orchestrator exit and last few lines of output
     log_debug "Orchestrator exit=$orchestrator_exit, output lines=$(echo "$full_output" | wc -l)"
@@ -2133,10 +2258,11 @@ EOF
     duration=$((end_time - start_time))
 
     # Extract summary from JSON result
-    local total success failed
+    local total success failed result_run_id
     total=$(echo "$result" | jq -r '.summary.total // 0' 2>/dev/null || echo 0)
     success=$(echo "$result" | jq -r '.summary.success // 0' 2>/dev/null || echo 0)
     failed=$(echo "$result" | jq -r '.summary.failed // 0' 2>/dev/null || echo 0)
+    result_run_id=$(echo "$result" | jq -r '.run_id // empty' 2>/dev/null || true)
 
     # Default values if parsing failed
     [[ -z "$total" || "$total" == "null" ]] && total=0
@@ -2254,7 +2380,12 @@ EOF
 
         if $build_release_contract_enabled; then
             if [[ -e "$dest" || -L "$dest" ]]; then
-                log_error "Strict release artifact destination already exists: $name"
+                if $resume && [[ -f "$dest" && ! -L "$dest" ]] && cmp -s "$src" "$dest"; then
+                    log_info "Resume verified existing strict artifact: $name"
+                    collected_names["$name"]="$src"
+                    return 0
+                fi
+                log_error "Strict release artifact destination already exists with unverified content: $name"
                 collect_failed=true
                 return 1
             fi
@@ -3016,7 +3147,14 @@ EOF
 
     # Generate manifest
     local manifest_file="$output_dir/${tool_name}-${tag}-manifest.json"
-    if [[ $success -gt 0 ]]; then
+    local manifest_failed=false orchestration_status
+    local all_targets_succeeded=false
+    orchestration_status=$(jq -r '.status // "unknown"' <<< "$result" 2>/dev/null || true)
+    if [[ $orchestrator_exit -eq 0 && "$orchestration_status" == "success" &&
+          $total -gt 0 && $failed -eq 0 && $success -eq $total ]]; then
+        all_targets_succeeded=true
+    fi
+    if $all_targets_succeeded; then
         # Generate manifest from orchestration result JSON
         if $build_release_contract_enabled; then
             local post_build_source_status
@@ -3047,11 +3185,15 @@ EOF
                 fi
             done < <(jq -r '.artifacts[] | [.name, .sha256, (.size_bytes | tostring)] | @tsv' "$manifest_file")
         else
-            act_generate_manifest "$result" "$manifest_file" 2>/dev/null || true
+            if ! act_generate_manifest "$result" "$manifest_file"; then
+                log_error "Build manifest generation failed"
+                manifest_failed=true
+            fi
         fi
     fi
 
-    if ! $build_release_contract_enabled && [[ -f "$manifest_file" && ${#artifact_rename_pairs[@]} -gt 0 ]]; then
+    if $all_targets_succeeded && ! $build_release_contract_enabled && \
+       [[ -f "$manifest_file" && ${#artifact_rename_pairs[@]} -gt 0 ]]; then
         local renames_json updated_manifest
         renames_json=$(printf '%s\n' "${artifact_rename_pairs[@]}" | jq -Rn '
             reduce inputs as $line ({}; 
@@ -3077,11 +3219,12 @@ EOF
         fi
     fi
 
-    if [[ $success -gt 0 ]] && ! $build_release_contract_enabled; then
+    if $all_targets_succeeded && ! $build_release_contract_enabled; then
         _build_package_archives "$tool_name" "$version" "$output_dir" "$result" "$target_list" "$manifest_file"
     fi
 
-    if ! $build_release_contract_enabled && [[ -f "$manifest_file" && ${#extra_manifest_entries[@]} -gt 0 ]]; then
+    if $all_targets_succeeded && ! $build_release_contract_enabled && \
+       [[ -f "$manifest_file" && ${#extra_manifest_entries[@]} -gt 0 ]]; then
         local -A manifest_names=()
         local entry entry_name
         while IFS= read -r entry_name; do
@@ -3105,9 +3248,37 @@ EOF
         fi
     fi
 
+    # Resolve the final command status before emitting either JSON or human
+    # output. In particular, a failed completion-state write must never be
+    # followed by a success envelope, and signal cancellation must retain 130.
+    local final_exit=6 final_status="failed"
+    if [[ $orchestrator_exit -eq 130 ]]; then
+        final_exit=130
+    elif [[ $orchestrator_exit -ne 0 && $orchestrator_exit -ne 1 ]]; then
+        final_exit="$orchestrator_exit"
+    elif [[ $failed -eq 0 && $success -gt 0 && $collect_failed == false &&
+            $manifest_failed == false && -f "$manifest_file" ]]; then
+        if ! _act_is_uuid "$result_run_id" ||
+           ! command -v build_state_update_status &>/dev/null ||
+           ! build_state_update_status "$tool_name" "$version" "completed" "$result_run_id"; then
+            log_error "Could not persist completed build state"
+            final_exit=4
+        else
+            final_exit=0
+            final_status="success"
+        fi
+    elif [[ $success -gt 0 ]]; then
+        final_exit=1
+        final_status="partial"
+    elif [[ $orchestrator_exit =~ ^[1-9][0-9]*$ ]]; then
+        final_exit="$orchestrator_exit"
+    fi
+
     # Output
     if $JSON_MODE; then
-        local build_details
+        local build_details authoritative_manifest=""
+        $all_targets_succeeded && [[ $manifest_failed == false && -f "$manifest_file" ]] && \
+            authoritative_manifest="$manifest_file"
         build_details=$(cat << EOF
 {
   "tool": "$tool_name",
@@ -3118,17 +3289,11 @@ EOF
   "failed": $failed,
   "duration_seconds": $duration,
   "output_dir": "$output_dir",
-  "manifest": "$manifest_file"
+  "manifest": "$authoritative_manifest"
 }
 EOF
 )
-        if [[ $failed -eq 0 && $success -gt 0 ]]; then
-            json_envelope "build" "success" 0 "$build_details"
-        elif [[ $success -gt 0 ]]; then
-            json_envelope "build" "partial" 1 "$build_details"
-        else
-            json_envelope "build" "failed" 6 "$build_details"
-        fi
+        json_envelope "build" "$final_status" "$final_exit" "$build_details"
     else
         echo ""
         log_info "=== Build Summary ==="
@@ -3149,20 +3314,15 @@ EOF
             log_info "  Failed:   $failed"
         fi
         echo ""
-        if [[ -f "$manifest_file" ]]; then
+        if $all_targets_succeeded && [[ $manifest_failed == false && -f "$manifest_file" ]]; then
             log_ok "Manifest: $manifest_file"
+        elif [[ $success -gt 0 ]]; then
+            log_warn "Manifest withheld until every requested target succeeds"
         fi
         log_info "Artifacts: $output_dir"
     fi
 
-    # Return appropriate exit code
-    if [[ $failed -eq 0 && $success -gt 0 && $collect_failed == false ]]; then
-        return 0
-    elif [[ $success -gt 0 ]]; then
-        return 1  # Partial success
-    else
-        return 6  # All failed
-    fi
+    return "$final_exit"
 }
 
 # Quality gates command - run pre-release checks

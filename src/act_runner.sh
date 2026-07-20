@@ -4357,8 +4357,298 @@ act_run_native_build() {
     return "$exit_code"
 }
 
+# Freeze every regular artifact represented by a target result. Receipts cover
+# explicit artifact paths and every file below artifact_dir, so a resumed run
+# can distinguish verified reusable output from missing, replaced, or mutated
+# bytes. A successful target with no artifact bytes is not resumable.
+_act_result_artifact_receipts() {
+    local result_json="$1"
+    local -A seen_paths=()
+    local -a artifact_paths=() receipts=()
+    local path artifact_dir legacy_paths array_count
+
+    # The array form is authoritative and preserves commas/newlines in valid
+    # Unix paths. The scalar form is a legacy comma-separated compatibility
+    # surface and is parsed only after the exact array entries.
+    array_count=$(jq -er '
+        (.artifact_paths // []) |
+        if type == "array" then length else error("artifact_paths must be an array") end
+    ' <<< "$result_json" 2>/dev/null) || return 4
+    while IFS= read -r -d '' path; do
+        [[ -n "$path" && -z "${seen_paths[$path]:-}" ]] || continue
+        seen_paths["$path"]=1
+        artifact_paths+=("$path")
+    done < <(jq -j '
+        (.artifact_paths // [])[]? |
+        select(type == "string" and length > 0) | ., "\u0000"
+    ' <<< "$result_json" 2>/dev/null)
+    if [[ "$array_count" -eq 0 ]]; then
+        legacy_paths=$(jq -r '.artifact_path // empty' <<< "$result_json" 2>/dev/null)
+        while IFS= read -r path; do
+            [[ -n "$path" && -z "${seen_paths[$path]:-}" ]] || continue
+            seen_paths["$path"]=1
+            artifact_paths+=("$path")
+        done < <(printf '%s\n' "$legacy_paths" | tr ',' '\n')
+    fi
+
+    artifact_dir=$(jq -r '.artifact_dir // empty' <<< "$result_json" 2>/dev/null)
+    if [[ -n "$artifact_dir" ]]; then
+        [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 4
+        # Process substitution cannot propagate find's exit status. Preflight
+        # traversal explicitly so an unreadable subtree cannot yield a
+        # deceptively partial receipt set.
+        find "$artifact_dir" -type f ! -type l -print0 >/dev/null 2>&1 || return 4
+        while IFS= read -r -d '' path; do
+            [[ -z "${seen_paths[$path]:-}" ]] || continue
+            seen_paths["$path"]=1
+            artifact_paths+=("$path")
+        done < <(find "$artifact_dir" -type f ! -type l -print0 2>/dev/null)
+    fi
+
+    [[ ${#artifact_paths[@]} -gt 0 ]] || return 4
+    for path in "${artifact_paths[@]}"; do
+        local sha size identity receipt
+        [[ -f "$path" && ! -L "$path" ]] || return 4
+        sha=$(_act_sha256 "$path") || return 4
+        size=$(_act_file_size "$path") || return 4
+        identity=$(_act_file_identity "$path") || return 4
+        [[ "$sha" =~ ^[a-fA-F0-9]{64}$ && "$size" =~ ^[0-9]+$ &&
+           "$identity" =~ ^(gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)$ ]] || return 4
+        receipt=$(jq -nc --arg path "$path" --arg sha256 "${sha,,}" \
+            --argjson size_bytes "$size" --arg identity "$identity" \
+            '{path: $path, sha256: $sha256, size_bytes: $size_bytes, identity: $identity}') || return 4
+        receipts+=("$receipt")
+    done
+
+    printf '%s\n' "${receipts[@]}" | jq -sc 'sort_by(.path)'
+}
+
+# Return success only when a persisted result still points at the exact frozen
+# artifacts recorded at target completion.
+_act_target_result_available() {
+    local result_json="$1"
+    jq -e '(.status == "success" or .status == "ok" or .status == "passed")' \
+        <<< "$result_json" &>/dev/null || return 1
+    local expected actual
+    expected=$(jq -ce '
+        .resume_artifacts |
+        if type == "array" and length > 0 then sort_by(.path)
+        else error("missing artifact receipts") end
+    ' <<< "$result_json" 2>/dev/null) || return 1
+    actual=$(_act_result_artifact_receipts "$result_json" 2>/dev/null) || return 1
+    [[ "$actual" == "$expected" ]]
+}
+
+# Execute exactly one target and emit one compact JSON result as the final
+# stdout line. Diagnostic/build output is retained on stderr by the worker.
+_act_build_orchestration_target() {
+    local tool_name="$1"
+    local version="$2"
+    local run_id="$3"
+    local target="$4"
+    local strict_release_contract="$5"
+    local release_contract_json="$6"
+    local source_roots_json="$7"
+
+    local host="act-local"
+    if [[ "$strict_release_contract" != "true" ]] && \
+       ! act_platform_uses_act "$tool_name" "$target"; then
+        host=$(act_get_native_host "$target" "$tool_name")
+    elif [[ "$strict_release_contract" == "true" ]]; then
+        host=$(act_get_native_host "$target" "$tool_name")
+    fi
+
+    _log_info "--- Building target: $target ---"
+
+    local result exit_code=0 full_output=""
+    if act_platform_uses_act "$tool_name" "$target"; then
+        local job workflow local_path extra_flags
+        job=$(act_get_job_for_target "$tool_name" "$target")
+        workflow="$ACT_REPO_WORKFLOW"
+        local_path="$ACT_REPO_LOCAL_PATH"
+        if [[ "$strict_release_contract" == "true" ]]; then
+            local_path=$(jq -r '.act // empty' <<< "$source_roots_json")
+        fi
+        extra_flags=$(act_get_flags "$tool_name" "$target")
+        _log_info "Method: act (job=$job)"
+
+        local act_args=()
+        [[ -n "$extra_flags" ]] && read -ra act_args <<< "$extra_flags"
+        full_output=$(act_run_workflow \
+            "$local_path" "$workflow" "$job" "push" "$version" \
+            "${act_args[@]}" 2>&1) || exit_code=$?
+        [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
+        result=$(printf '%s\n' "$full_output" | grep '^{.*}$' | tail -1)
+        if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
+            local fallback_status="failed"
+            [[ "$exit_code" -eq 0 ]] && fallback_status="success"
+            result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
+                '{status: $status, exit_code: $exit_code}')
+        fi
+        result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
+            '. + {platform: $target, method: $method, host: $host}' <<< "$result")
+    else
+        host=$(act_get_native_host "$target" "$tool_name")
+        _log_info "Method: native (host=$host)"
+        local remote_path_override=""
+        if [[ "$strict_release_contract" == "true" ]]; then
+            remote_path_override=$(jq -r --arg host "$host" '.[$host] // empty' <<< "$source_roots_json")
+        fi
+        full_output=$(act_run_native_build \
+            "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" 2>&1) || exit_code=$?
+        [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
+        result=$(printf '%s\n' "$full_output" | grep '^{' | tail -1)
+        if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
+            local fallback_status="failed"
+            [[ "$exit_code" -eq 0 ]] && fallback_status="success"
+            result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
+                --arg platform "$target" --arg method "native" --arg host "$host" \
+                '{status: $status, exit_code: $exit_code, platform: $platform,
+                  method: $method, host: $host}')
+        fi
+    fi
+
+    local result_status
+    result_status=$(jq -r '.status // "unknown"' <<< "$result")
+    if [[ "$exit_code" -ne 0 ]] &&
+       [[ "$result_status" == "success" || "$result_status" == "ok" ||
+          "$result_status" == "passed" ]]; then
+        result=$(jq -c --argjson exit_code "$exit_code" '
+            .status = "failed" | .exit_code = $exit_code |
+            .error = (.error // "Build command exited nonzero despite reporting success")
+        ' <<< "$result")
+        result_status="failed"
+    fi
+
+    if [[ "$strict_release_contract" == "true" ]]; then
+        local staged_result
+        if [[ "$result_status" == "success" ]]; then
+            if staged_result=$(_act_stage_contract_primary \
+                "$tool_name" "$version" "$run_id" "$target" \
+                "$result" "$release_contract_json"); then
+                result="$staged_result"
+            else
+                exit_code=4
+                result=$(jq -c \
+                    '.status = "failed" | .exit_code = 4 |
+                     .error = "Release primary staging failed"' <<< "$result")
+            fi
+        fi
+    fi
+
+    if ! result=$(jq -c --argjson worker_exit "$exit_code" \
+        '.exit_code = (.exit_code // $worker_exit)' <<< "$result"); then
+        return 4
+    fi
+    printf '%s\n' "$result"
+    return "$exit_code"
+}
+
+# Worker wrapper: reserve host capacity and write immutable attempt receipts.
+_act_run_target_worker() {
+    local tool_name="$1" version="$2" run_id="$3" target="$4"
+    local attempt="$5" log_path="$6" result_path="$7"
+    local strict_release_contract="$8" release_contract_json="$9"
+    local source_roots_json="${10}"
+
+    local host="act-local"
+    if ! act_platform_uses_act "$tool_name" "$target"; then
+        host=$(act_get_native_host "$target" "$tool_name")
+    fi
+    local slot_id="${run_id}-${target//\//-}-attempt-${attempt}"
+    local slot_acquired=false
+
+    _act_write_worker_result() {
+        local body="$1"
+        (
+            umask 077
+            set -o noclobber
+            printf '%s\n' "$body" > "$result_path"
+        )
+    }
+
+    if declare -F selector_acquire_slot &>/dev/null; then
+        if ! selector_acquire_slot "$host" "$slot_id" --wait; then
+            local slot_failure
+            slot_failure=$(jq -nc --arg target "$target" --arg host "$host" \
+                '{platform: $target, host: $host, status: "failed", exit_code: 2,
+                  error: "Host capacity acquisition failed"}')
+            _act_write_worker_result "$slot_failure" || return 4
+            return 2
+        fi
+        slot_acquired=true
+    fi
+
+    _act_worker_release_slot() {
+        if $slot_acquired && declare -F selector_release_slot &>/dev/null; then
+            selector_release_slot "$host" "$slot_id" >/dev/null 2>&1 || true
+            slot_acquired=false
+        fi
+    }
+
+    local worker_pid=""
+    _act_worker_cancel() {
+        # Ignore repeated signals while the first cancellation drains the
+        # dedicated build process group and releases the host slot.
+        trap '' INT TERM
+        if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$worker_pid" 2>/dev/null; then
+            # Job control gives the target and all of its descendants a
+            # dedicated process group, so cancellation does not orphan ssh,
+            # compilers, or user build commands.
+            kill -TERM -- "-$worker_pid" 2>/dev/null || kill -TERM "$worker_pid" 2>/dev/null || true
+            wait "$worker_pid" 2>/dev/null || true
+        fi
+        exit 130
+    }
+    trap _act_worker_release_slot EXIT
+    trap _act_worker_cancel INT TERM
+
+    local worker_status=0 result receipts result_status
+    set -m
+    _act_build_orchestration_target \
+        "$tool_name" "$version" "$run_id" "$target" \
+        "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
+        >> "$log_path" 2>&1 &
+    worker_pid=$!
+    # The process group remains distinct after monitor mode is disabled; this
+    # avoids interactive-style job-completion notices in coordinator logs.
+    set +m
+    wait "$worker_pid" || worker_status=$?
+    worker_pid=""
+
+    result=$(grep '^{.*}$' "$log_path" | tail -1)
+    if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
+        result=$(jq -nc --arg target "$target" --arg host "$host" \
+            --argjson exit_code "$worker_status" \
+            '{platform: $target, host: $host, status: "failed",
+              exit_code: $exit_code, error: "Worker produced no valid result"}')
+    fi
+    result_status=$(jq -r '.status // "unknown"' <<< "$result")
+    if [[ "$result_status" == "success" || "$result_status" == "ok" ||
+          "$result_status" == "passed" ]]; then
+        if receipts=$(_act_result_artifact_receipts "$result"); then
+            result=$(jq -c --argjson receipts "$receipts" \
+                '.resume_artifacts = $receipts' <<< "$result")
+        else
+            worker_status=4
+            result=$(jq -c '
+                .status = "failed" | .exit_code = 4 |
+                .error = "Successful worker output could not be frozen for resume"
+            ' <<< "$result")
+        fi
+    fi
+    if ! _act_write_worker_result "$result"; then
+        return 4
+    fi
+    _act_worker_release_slot
+    trap - EXIT INT TERM
+    return "$worker_status"
+}
+
 # Main orchestration function: coordinate act + SSH builds
-# Usage: act_orchestrate_build <tool_name> <version> [--git-sha SHA --git-ref TAG] [targets...]
+# Usage: act_orchestrate_build <tool_name> <version>
+#        [--git-sha SHA --git-ref TAG --parallel-jobs N --resume-run-id UUID]
+#        [targets...]
 # Returns: JSON with aggregated results
 act_orchestrate_build() {
     local tool_name="$1"
@@ -4367,6 +4657,7 @@ act_orchestrate_build() {
     local targets_arg=()
     local supplied_git_sha="" supplied_git_ref=""
     local supplied_run_id="" source_roots_json="{}"
+    local parallel_jobs=1 resume_run=false supplied_output_dir=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -4390,6 +4681,22 @@ act_orchestrate_build() {
                 source_roots_json="$2"
                 shift 2
                 ;;
+            --parallel-jobs)
+                [[ $# -ge 2 ]] || { _log_error "--parallel-jobs requires a value"; return 4; }
+                parallel_jobs="$2"
+                shift 2
+                ;;
+            --resume-run-id)
+                [[ $# -ge 2 ]] || { _log_error "--resume-run-id requires a value"; return 4; }
+                supplied_run_id="$2"
+                resume_run=true
+                shift 2
+                ;;
+            --output-dir)
+                [[ $# -ge 2 ]] || { _log_error "--output-dir requires a value"; return 4; }
+                supplied_output_dir="$2"
+                shift 2
+                ;;
             --)
                 shift
                 targets_arg+=("$@")
@@ -4405,6 +4712,16 @@ act_orchestrate_build() {
                 ;;
         esac
     done
+
+    if [[ ! "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || \
+       [[ "$parallel_jobs" -gt 32 ]]; then
+        _log_error "Parallel job count must be an integer from 1 through 32"
+        return 4
+    fi
+    if $resume_run && ! _act_is_uuid "$supplied_run_id"; then
+        _log_error "--resume-run-id requires a schema-valid UUID"
+        return 4
+    fi
 
     # Load config
     if ! act_load_repo_config "$tool_name"; then
@@ -4439,10 +4756,18 @@ act_orchestrate_build() {
         return 4
     fi
 
+    local requested_targets_json
+    requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
+        jq -Rsc 'split("\n") | map(select(length > 0))')
+    if ! jq -en --argjson requested "$requested_targets_json" \
+        '($requested | length) == ($requested | unique | length)' >/dev/null 2>&1; then
+        _log_error "Duplicate build targets are not allowed"
+        jq -nc --arg tool "$tool_name" --arg error "Duplicate build targets are not allowed" \
+            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+        return 4
+    fi
+
     if $strict_release_contract; then
-        local requested_targets_json requested_target
-        requested_targets_json=$(for requested_target in $targets; do printf '%s\n' "$requested_target"; done | \
-            jq -Rsc 'split("\n") | map(select(length > 0))')
         if ! jq -en \
             --argjson contract "$release_contract_json" \
             --argjson requested "$requested_targets_json" '
@@ -4550,164 +4875,338 @@ act_orchestrate_build() {
         [[ -z "$git_ref" ]] && git_ref="v${version#v}"
     fi
 
-    # Initialize build state (if build_state.sh is sourced)
+    # Initialize or reopen build state. Shared JSON is written only by this
+    # parent process; workers communicate through immutable result sidecars.
     local run_id requested_run_id="${supplied_run_id:-${DSR_RUN_ID:-}}"
-    local lock_acquired_here=false
-    local caller_holds_lock=false
+    local lock_acquired_here=false caller_holds_lock=false state_available=false
     [[ "${DSR_BUILD_LOCK_HELD_BY_CALLER:-0}" == "1" ]] && caller_holds_lock=true
 
+    _act_release_orchestration_lock() {
+        if $lock_acquired_here; then
+            build_lock_release "$tool_name" "$version" >/dev/null 2>&1 || true
+            lock_acquired_here=false
+        fi
+    }
+
     if ! _act_is_uuid "$requested_run_id"; then
-        if ! requested_run_id=$(_act_generate_uuid); then
-            _log_error "Unable to generate a schema-valid build run UUID"
-            jq -nc --arg tool "$tool_name" --arg error "Unable to generate build run UUID" \
+        if $resume_run || ! requested_run_id=$(_act_generate_uuid); then
+            _log_error "Unable to obtain a schema-valid build run UUID"
+            jq -nc --arg tool "$tool_name" --arg error "Invalid build run UUID" \
                 '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
             return 4
         fi
     fi
 
     if command -v build_state_create &>/dev/null; then
-        if $caller_holds_lock; then
-            _log_info "Using caller-owned build lock for $tool_name $version"
-        else
-            if ! DSR_RUN_ID="$requested_run_id" build_lock_acquire "$tool_name" "$version"; then
-                _log_error "Build already in progress (lock held)"
-                jq -nc --arg tool "$tool_name" --arg error "Build already in progress (lock held)" \
-                    '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
-                return 2
-            fi
-            lock_acquired_here=true
-        fi
-        if ! run_id=$(DSR_RUN_ID="$requested_run_id" \
-            build_state_create "$tool_name" "$version" "${targets// /,}") || \
-           [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id"; then
-            _log_error "Build state did not retain the schema-valid run UUID"
-            $lock_acquired_here && build_lock_release "$tool_name" "$version"
-            jq -nc --arg tool "$tool_name" --arg error "Invalid build state run UUID" \
-                '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+        # build_state_create is captured below, so any initialization it did
+        # inside that command-substitution subshell would not persist here.
+        # Initialize explicitly in the coordinator before resolving paths or
+        # attempting state transitions.
+        if ! build_state_init; then
+            _log_error "Build state initialization failed"
             return 4
         fi
-        build_state_update_status "$tool_name" "$version" "running" "$run_id"
+        state_available=true
+        if $caller_holds_lock; then
+            _log_info "Using caller-owned build lock for $tool_name $version"
+        elif ! DSR_RUN_ID="$requested_run_id" build_lock_acquire "$tool_name" "$version"; then
+            _log_error "Build already in progress (lock held)"
+            jq -nc --arg tool "$tool_name" --arg error "Build already in progress (lock held)" \
+                '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+            return 2
+        else
+            lock_acquired_here=true
+        fi
+
+        if $resume_run; then
+            local resume_state resume_requested_targets_json
+            if ! resume_state=$(build_state_get "$tool_name" "$version" "$requested_run_id" 2>/dev/null); then
+                _log_error "Resume state not found for run $requested_run_id"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            resume_requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
+                jq -Rsc 'split("\n") | map(select(length > 0))')
+            if ! jq -en --argjson state "$resume_state" --arg run_id "$requested_run_id" \
+                --argjson requested "$resume_requested_targets_json" \
+                '$state.run_id == $run_id and $state.targets == $requested and
+                 ($state.status != "completed" and $state.status != "cancelled")' >/dev/null 2>&1; then
+                _log_error "Resume state target set or status does not match this request"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            if [[ -n "$git_sha" && "$(jq -r '.git_sha // empty' <<< "$resume_state")" != "$git_sha" ]] || \
+               [[ -n "$git_ref" && "$(jq -r '.git_ref // empty' <<< "$resume_state")" != "$git_ref" ]] || \
+               { [[ -n "$supplied_output_dir" ]] && \
+                 [[ "$(jq -r '.context.output_dir // empty' <<< "$resume_state")" != "$supplied_output_dir" ]]; }; then
+                _log_error "Resume state is bound to different source or output inputs"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            if $strict_release_contract && \
+               [[ "$(jq -cS '.context.source_roots // {}' <<< "$resume_state")" != \
+                  "$(jq -c -S '.' <<< "$source_roots_json")" ]]; then
+                _log_error "Resume state source roots do not match the strict snapshot"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            run_id="$requested_run_id"
+        else
+            if ! run_id=$(DSR_RUN_ID="$requested_run_id" \
+                build_state_create "$tool_name" "$version" "${targets// /,}") || \
+               [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id" || \
+               ! build_state_set_context "$tool_name" "$version" "$run_id" \
+                    "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs"; then
+                _log_error "Build state could not retain the run context"
+                _act_release_orchestration_lock
+                return 4
+            fi
+        fi
+        if ! build_state_update_status "$tool_name" "$version" "running" "$run_id"; then
+            _act_release_orchestration_lock
+            return 4
+        fi
+    elif $resume_run; then
+        _log_error "Resume requires the build state module"
+        return 4
     else
         run_id="$requested_run_id"
     fi
 
     _log_info "Run ID: $run_id"
+    _log_info "Target concurrency: $parallel_jobs"
 
-    # Track results
-    local results=()
-    local success_count=0
-    local fail_count=0
-    local start_time
+    local workspace
+    if $state_available; then
+        if ! workspace=$(build_state_workspace "$tool_name" "$version" "$run_id"); then
+            _act_release_orchestration_lock
+            return 4
+        fi
+    else
+        workspace="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/builds/$tool_name/$version/$run_id"
+        mkdir -p "$workspace/logs" "$workspace/results"
+    fi
+    if [[ ! -d "$workspace/logs" || -L "$workspace/logs" || \
+          ! -d "$workspace/results" || -L "$workspace/results" ]]; then
+        _log_error "Build receipt directories are missing or unsafe"
+        _act_release_orchestration_lock
+        return 4
+    fi
+
+    local results=() success_count=0 fail_count=0 interrupted=false
+    local start_time target_index=0
     start_time=$(date +%s)
+    local -a worker_pids=() worker_targets=() worker_results=() worker_logs=() worker_hosts=() worker_attempts=()
+    local active_workers=0
+    declare -A final_results=() worker_reaped=()
 
-    # Process each target
-    for target in $targets; do
-        _log_info "--- Building target: $target ---"
-
-        # Update host status
-        local host
-        host=$(act_get_native_host "$target" "$tool_name")
-        if command -v build_state_update_host &>/dev/null; then
-            build_state_update_host "$tool_name" "$version" "$host" "running" '{"target":"'"$target"'"}' "$run_id"
-        fi
-
-        # Determine build method
-        local result exit_code=0
-        if act_platform_uses_act "$tool_name" "$target"; then
-            # Run via act
-            local job workflow local_path extra_flags
-            job=$(act_get_job_for_target "$tool_name" "$target")
-            workflow="$ACT_REPO_WORKFLOW"
-            local_path="$ACT_REPO_LOCAL_PATH"
-            if $strict_release_contract; then
-                local_path=$(jq -r '.act // empty' <<< "$source_roots_json")
-            fi
-            extra_flags=$(act_get_flags "$tool_name" "$target")
-
-            _log_info "Method: act (job=$job)"
-
-            # Collect extra args
-            local act_args=()
-            [[ -n "$extra_flags" ]] && read -ra act_args <<< "$extra_flags"
-
-            # Run act workflow with version for tag context injection
-            local full_output
-            full_output=$(act_run_workflow "$local_path" "$workflow" "$job" "push" "$version" "${act_args[@]}" 2>&1) || exit_code=$?
-
-            # Extract JSON from mixed output (act logs + JSON at end)
-            # jq -nc outputs single-line compact JSON, so match lines that start with { and end with }
-            result=$(echo "$full_output" | grep '^{.*}$' | tail -1)
-
-            # Fallback if no JSON found
-            if [[ -z "$result" ]] || ! echo "$result" | jq -e '.' &>/dev/null; then
-                _log_warn "Could not parse JSON from act output, creating status from exit code"
-                local fallback_status="failed"
-                [[ "$exit_code" -eq 0 ]] && fallback_status="success"
-                result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
-                    '{status: $status, exit_code: $exit_code}')
-            fi
-
-            # Wrap in consistent format
-            result=$(echo "$result" | jq --arg target "$target" --arg method "act" \
-                '. + {platform: $target, method: $method}' 2>/dev/null || echo "$result")
+    _act_record_worker_result() {
+        local index="$1" worker_status="$2"
+        local finished_target="${worker_targets[$index]}"
+        local result_path="${worker_results[$index]}" log_path="${worker_logs[$index]}"
+        local host="${worker_hosts[$index]}" attempt="${worker_attempts[$index]}"
+        local finished_result status extra
+        if [[ -s "$result_path" ]] && finished_result=$(jq -ce '.' "$result_path" 2>/dev/null); then
+            :
         else
-            # Run via SSH (native build)
-            _log_info "Method: native (host=$host)"
-            local full_native_output remote_path_override=""
-            if $strict_release_contract; then
-                remote_path_override=$(jq -r --arg host "$host" '.[$host] // empty' <<< "$source_roots_json")
-            fi
-            full_native_output=$(act_run_native_build \
-                "$tool_name" "$target" "$version" "$run_id" "$remote_path_override") || exit_code=$?
-            # Extract JSON from output (native build includes build output + JSON at end)
-            result=$(echo "$full_native_output" | grep '^{' | tail -1)
-            if [[ -z "$result" ]] || ! echo "$result" | jq -e '.' &>/dev/null; then
-                _log_warn "Could not parse JSON from native build output"
-                local fallback_status="failed"
-                [[ "$exit_code" -eq 0 ]] && fallback_status="success"
-                result=$(jq -nc --arg status "$fallback_status" --argjson exit_code "$exit_code" \
-                    --arg platform "$target" --arg method "native" \
-                    '{status: $status, exit_code: $exit_code, platform: $platform, method: $method}')
-            fi
+            finished_result=$(jq -nc --arg target "$finished_target" --arg host "$host" \
+                --argjson exit_code "$worker_status" \
+                '{platform: $target, host: $host, status: "failed", exit_code: $exit_code,
+                  error: "Worker result receipt missing or invalid"}')
         fi
+        finished_result=$(jq -c --arg log_path "$log_path" --arg result_path "$result_path" \
+            --argjson attempt "$attempt" \
+            '. + {log_path: $log_path, result_path: $result_path, attempt: $attempt}' \
+            <<< "$finished_result")
+        final_results["$finished_target"]="$finished_result"
+        status=$(jq -r '.status // "unknown"' <<< "$finished_result")
 
-        if $strict_release_contract; then
-            local result_status staged_result
-            result_status=$(jq -r '.status // "unknown"' <<< "$result")
-            if [[ "$result_status" == "success" ]]; then
-                if staged_result=$(_act_stage_contract_primary \
-                    "$tool_name" "$version" "$run_id" "$target" "$result" "$release_contract_json"); then
-                    result="$staged_result"
-                else
-                    exit_code=4
-                    result=$(jq -c \
-                        '.status = "failed" | .exit_code = 4 | .error = "Release primary staging failed"' \
-                        <<< "$result")
-                fi
-            fi
-        fi
-
-        # Update result tracking
-        results+=("$result")
-
-        local status
-        status=$(echo "$result" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
-
-        if [[ "$status" == "success" ]]; then
-            ((success_count++))
-            if command -v build_state_update_host &>/dev/null; then
+        if $state_available; then
+            extra=$(jq -nc --argjson result "$finished_result" --arg host "$host" \
+                --arg log_path "$log_path" --arg result_path "$result_path" \
+                --argjson attempts "$attempt" \
+                '{result: $result, host: $host, log_path: $log_path,
+                  result_path: $result_path, attempts: $attempts}')
+            if [[ "$status" == "success" ]]; then
+                build_state_update_target "$tool_name" "$version" "$finished_target" \
+                    "completed" "$extra" "$run_id" || return 4
                 build_state_update_host "$tool_name" "$version" "$host" "completed" \
-                    "$(echo "$result" | jq -c '{artifact_path, duration_seconds}' 2>/dev/null || echo '{}')" "$run_id"
-            fi
-        else
-            ((fail_count++))
-            if command -v build_state_update_host &>/dev/null; then
+                    "$(jq -c --arg target "$finished_target" '{target: $target, artifact_path, duration_seconds}' \
+                        <<< "$finished_result")" "$run_id" || return 4
+            else
+                build_state_update_target "$tool_name" "$version" "$finished_target" \
+                    "failed" "$extra" "$run_id" || return 4
                 build_state_update_host "$tool_name" "$version" "$host" "failed" \
-                    "$(echo "$result" | jq -c '{exit_code, error: .error // .status}' 2>/dev/null || echo '{}')" "$run_id"
+                    "$(jq -c --arg target "$finished_target" \
+                        '{target: $target, exit_code, error: (.error // .status)}' <<< "$finished_result")" \
+                    "$run_id" || return 4
+            fi
+        fi
+        _log_info "Result: $finished_target -> $status (log: $log_path)"
+        if [[ "$status" != "success" ]]; then
+            tail -20 "$log_path" >&2 || true
+        fi
+    }
+
+    _act_cancel_parallel_workers() {
+        # A second Ctrl-C must not interrupt cleanup after workers have been
+        # told to terminate; keep the coordinator alive until they are reaped.
+        trap '' INT TERM
+        interrupted=true
+        local cancel_index cancel_pid
+        for ((cancel_index = 0; cancel_index < ${#worker_pids[@]}; cancel_index++)); do
+            [[ -z "${worker_reaped[$cancel_index]:-}" ]] || continue
+            cancel_pid="${worker_pids[$cancel_index]}"
+            kill -TERM "$cancel_pid" 2>/dev/null || true
+        done
+    }
+
+    # Bash 4.0 lacks wait -n. Poll only the bounded worker set and reap the
+    # first completed process, keeping the scheduler work-conserving without
+    # sacrificing the project's Bash 4.0 compatibility.
+    _act_reap_one_worker() {
+        local reap_index reap_pid worker_status
+        while (( active_workers > 0 )); do
+            for ((reap_index = 0; reap_index < ${#worker_pids[@]}; reap_index++)); do
+                [[ -z "${worker_reaped[$reap_index]:-}" ]] || continue
+                reap_pid="${worker_pids[$reap_index]}"
+                if ! kill -0 "$reap_pid" 2>/dev/null; then
+                    worker_status=0
+                    wait "$reap_pid" || worker_status=$?
+                    worker_reaped["$reap_index"]=1
+                    active_workers=$((active_workers - 1))
+                    _act_record_worker_result "$reap_index" "$worker_status" || interrupted=true
+                    return 0
+                fi
+            done
+            sleep 0.05
+        done
+        return 1
+    }
+    trap _act_cancel_parallel_workers INT TERM
+
+    for target in $targets; do
+        $interrupted && break
+        target_index=$((target_index + 1))
+        local persisted_entry='{}' persisted_result="" persisted_result_path=""
+        local prior_attempts=0
+        if $state_available; then
+            persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                jq -c --arg target "$target" '.target_statuses[$target] // {}')
+            prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
+            persisted_result=$(jq -c '.result // empty' <<< "$persisted_entry")
+            persisted_result_path=$(jq -r '.result_path // empty' <<< "$persisted_entry")
+        fi
+
+        if $resume_run; then
+            if [[ -n "$persisted_result" ]] && _act_target_result_available "$persisted_result"; then
+                final_results["$target"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                _log_info "Resume: reusing completed target $target"
+                continue
+            fi
+            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
+               persisted_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null) && \
+               _act_target_result_available "$persisted_result"; then
+                final_results["$target"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                if $state_available; then
+                    if ! build_state_update_target "$tool_name" "$version" "$target" "completed" \
+                        "$(jq -nc --argjson result "${final_results[$target]}" \
+                            --argjson attempts "$prior_attempts" \
+                            '{result: $result, attempts: $attempts, reconciled_from_sidecar: true}')" \
+                        "$run_id"; then
+                        interrupted=true
+                        break
+                    fi
+                fi
+                _log_info "Resume: reconciled completed sidecar for $target"
+                continue
+            fi
+            if [[ "$(jq -r '.status // "pending"' <<< "$persisted_entry")" == "failed" && \
+                  "$prior_attempts" -ge "${BUILD_RETRY_MAX:-3}" ]]; then
+                final_results["$target"]=$(jq -c \
+                    '.result // {platform: "'"$target"'", status: "failed", exit_code: 6,
+                     error: "Target retry limit exceeded"}' <<< "$persisted_entry")
+                _log_warn "Resume: retry limit exceeded for $target"
+                continue
             fi
         fi
 
-        _log_info "Result: $status (exit_code=$exit_code)"
+        local attempt=$((prior_attempts + 1)) target_slug index_prefix log_path result_path host
+        target_slug="${target//\//-}"
+        printf -v index_prefix '%03d' "$target_index"
+        log_path="$workspace/logs/${index_prefix}-${target_slug}.attempt-${attempt}.log"
+        result_path="$workspace/results/${index_prefix}-${target_slug}.attempt-${attempt}.json"
+        if [[ -e "$log_path" || -L "$log_path" || -e "$result_path" || -L "$result_path" ]]; then
+            _log_error "Refusing to overwrite an existing target attempt receipt"
+            interrupted=true
+            break
+        fi
+        if ! (umask 077; set -o noclobber; : > "$log_path"); then
+            _log_error "Could not create immutable target log receipt: $log_path"
+            interrupted=true
+            break
+        fi
+        host="act-local"
+        if ! act_platform_uses_act "$tool_name" "$target"; then
+            host=$(act_get_native_host "$target" "$tool_name")
+        fi
+
+        if $state_available; then
+            if ! build_state_update_target "$tool_name" "$version" "$target" "running" \
+                "$(jq -nc --arg host "$host" --arg log_path "$log_path" \
+                    --arg result_path "$result_path" --argjson attempts "$attempt" \
+                    '{host: $host, log_path: $log_path, result_path: $result_path,
+                      attempts: $attempts, result: null}')" "$run_id" || \
+               ! build_state_update_host "$tool_name" "$version" "$host" "running" \
+                    "$(jq -nc --arg target "$target" '{target: $target}')" "$run_id"; then
+                _log_error "Could not persist running state for target $target"
+                interrupted=true
+                break
+            fi
+        fi
+
+        _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
+            "$log_path" "$result_path" "$strict_release_contract" \
+            "$release_contract_json" "$source_roots_json" &
+        worker_pids+=("$!")
+        worker_targets+=("$target")
+        worker_results+=("$result_path")
+        worker_logs+=("$log_path")
+        worker_hosts+=("$host")
+        worker_attempts+=("$attempt")
+        active_workers=$((active_workers + 1))
+
+        if (( active_workers >= parallel_jobs )); then
+            _act_reap_one_worker || interrupted=true
+            $interrupted && break
+        fi
+    done
+
+    while (( active_workers > 0 )); do
+        _act_reap_one_worker || interrupted=true
+    done
+    trap - INT TERM
+
+    # Deterministic aggregation follows configured target order, never worker
+    # completion order.
+    for target in $targets; do
+        local ordered_result="${final_results[$target]:-}"
+        if [[ -z "$ordered_result" && $state_available == true ]]; then
+            ordered_result=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                jq -c --arg target "$target" \
+                    '.target_statuses[$target].result // {platform: $target, status: "failed",
+                     exit_code: 6, error: "No target result"}')
+        fi
+        if [[ -z "$ordered_result" ]]; then
+            ordered_result=$(jq -nc --arg target "$target" \
+                '{platform: $target, status: "failed", exit_code: 6, error: "No target result"}')
+        fi
+        results+=("$ordered_result")
+        if [[ "$(jq -r '.status // "unknown"' <<< "$ordered_result")" == "success" ]]; then
+            success_count=$((success_count + 1))
+        else
+            fail_count=$((fail_count + 1))
+        fi
     done
 
     local end_time total_duration
@@ -4728,7 +5227,10 @@ act_orchestrate_build() {
 
     # Determine overall status
     local overall_status overall_exit_code
-    if $source_validation_failed; then
+    if $interrupted; then
+        overall_status="failed"
+        overall_exit_code=130
+    elif $source_validation_failed; then
         overall_status="failed"
         overall_exit_code=4
     elif [[ $fail_count -eq 0 ]]; then
@@ -4744,11 +5246,14 @@ act_orchestrate_build() {
 
     # Update build state
     if command -v build_state_update_status &>/dev/null; then
-        build_state_update_status "$tool_name" "$version" "$overall_status" "$run_id"
-        if $lock_acquired_here; then
-            build_lock_release "$tool_name" "$version"
+        local persisted_status="$overall_status"
+        [[ "$overall_status" == "success" ]] && persisted_status="targets-complete"
+        if ! build_state_update_status "$tool_name" "$version" "$persisted_status" "$run_id"; then
+            overall_status="failed"
+            overall_exit_code=4
         fi
     fi
+    _act_release_orchestration_lock
 
     _log_info "=== Build orchestration complete ==="
     _log_info "Status: $overall_status (success=$success_count, failed=$fail_count)"
@@ -5293,6 +5798,7 @@ act_generate_manifest() {
             }')
 
         artifacts+=("$artifact_json")
+        # shellcheck disable=SC2190 # Indexed array; separate functions use an associative array with this name.
         seen_paths+=("$file")
         seen_names["$name"]=1
     }
@@ -5420,6 +5926,7 @@ act_generate_manifest() {
                 }')
 
             artifacts+=("$artifact_json")
+            # shellcheck disable=SC2190 # Indexed array; separate functions use an associative array with this name.
             seen_paths+=("$seen_key")
             seen_names["$name"]=1
         done
@@ -5513,4 +6020,6 @@ export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f act_get_build_env_value act_get_remote_artifact_path
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
+export -f _act_result_artifact_receipts _act_target_result_available
+export -f _act_build_orchestration_target _act_run_target_worker
 export -f act_sync_sources

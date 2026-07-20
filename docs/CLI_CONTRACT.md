@@ -439,6 +439,7 @@ Build artifacts locally using act or native compilation.
 
 ```bash
 dsr build --repo <name> [--targets <list>] [--version <tag>]
+          [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]]
 ```
 
 | Flag | Default | Description |
@@ -446,8 +447,16 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--repo` | (required) | Repository to build |
 | `--targets` | all | Platforms: linux/amd64,darwin/arm64,windows/amd64 |
 | `--version` | HEAD | Version/tag to build |
-| `--workflow` | auto | Workflow file to use |
-| `--sign` | true | Sign artifacts with minisign |
+| `--parallel[=N]` | off (bound 2 when enabled) | Run independent targets concurrently |
+| `--jobs` | 1 | Explicit concurrency bound from 1 through 32 |
+| `--resume[=RUN_ID]` | off | Reuse verified completed targets and retry incomplete targets |
+| `--output-dir` | state directory | Artifact collection directory, bound into resume state |
+| `--no-sync` | false | Skip ordinary source sync (forbidden by strict release contracts) |
+
+Target logs and result receipts are isolated by target and attempt. Aggregation
+is deterministic in requested-target order. Partial artifacts remain available
+for resume, but no authoritative manifest is emitted until the full target set
+succeeds.
 
 ---
 

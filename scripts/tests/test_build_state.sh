@@ -134,6 +134,23 @@ test_build_state_create() {
   fi
 }
 
+test_build_state_rejects_run_collision() {
+  ((TESTS_RUN++))
+  build_state_init
+
+  local first_state second_status=0
+  build_state_create "collision-tool" "v1.0.0" "linux/amd64" >/dev/null
+  first_state=$(build_state_get "collision-tool" "v1.0.0" "$DSR_RUN_ID")
+  build_state_create "collision-tool" "v1.0.0" "darwin/arm64" >/dev/null 2>&1 || second_status=$?
+
+  if [[ "$second_status" -ne 0 ]] &&
+     [[ "$(build_state_get "collision-tool" "v1.0.0" "$DSR_RUN_ID")" == "$first_state" ]]; then
+    pass "build_state_create preserves an existing immutable run namespace"
+  else
+    fail "build_state_create should reject a run ID collision without changing state"
+  fi
+}
+
 test_build_state_get() {
   ((TESTS_RUN++))
   build_state_init
@@ -163,6 +180,27 @@ test_build_state_update_status() {
     pass "build_state_update_status updates status"
   else
     fail "build_state_update_status should update status"
+  fi
+}
+
+test_build_state_update_preserves_private_mode() {
+  ((TESTS_RUN++))
+  build_state_init
+
+  local run_id workspace state_file old_umask mode
+  run_id=$(build_state_create "private-mode-tool" "v1.0.0" "linux/amd64")
+  workspace=$(build_state_workspace "private-mode-tool" "v1.0.0" "$run_id")
+  state_file="$workspace/state.json"
+  old_umask=$(umask)
+  umask 000
+  build_state_update_status "private-mode-tool" "v1.0.0" "running" "$run_id"
+  umask "$old_umask"
+  mode=$(stat -c '%a' "$state_file" 2>/dev/null || stat -f '%Lp' "$state_file" 2>/dev/null)
+
+  if [[ "$mode" == "600" ]]; then
+    pass "atomic state updates retain mode 0600 under a permissive caller umask"
+  else
+    fail "atomic state update mode should be 600, got: $mode"
   fi
 }
 
@@ -511,8 +549,10 @@ test_build_lock_info
 
 # State tests
 test_build_state_create
+test_build_state_rejects_run_collision
 test_build_state_get
 test_build_state_update_status
+test_build_state_update_preserves_private_mode
 test_build_state_update_host
 test_build_state_add_artifact
 

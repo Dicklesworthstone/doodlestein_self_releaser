@@ -3,7 +3,7 @@
 #
 # Provides:
 #   - Lock acquisition/release per tool+version
-#   - Build state persistence (JSON with per-host status)
+#   - Build state persistence (JSON with authoritative per-target status)
 #   - Workspace isolation (unique run_id directories)
 #   - Resume from partial builds
 #   - Stale lock detection and cleanup
@@ -58,8 +58,14 @@ _build_state_jq_update() {
 
   local tmp_file="${state_file}.tmp.$$"
 
-  # Run jq and capture exit code
-  if ! jq "$@" "$state_file" > "$tmp_file" 2>/dev/null; then
+  # Run jq into a private, exclusive temporary file. The original state is
+  # mode 0600; creating an update under the caller's ambient umask would make
+  # the replacement world-readable after mv.
+  if [[ -e "$tmp_file" || -L "$tmp_file" ]] || ! (
+      umask 077
+      set -o noclobber
+      jq "$@" "$state_file" > "$tmp_file" 2>/dev/null
+  ); then
     log_error "Failed to update state: jq parse/filter error"
     rm -f "$tmp_file"
     return 1
@@ -95,7 +101,10 @@ build_state_init() {
   _BUILD_STATE_DIR="$state_dir/builds"
 
   # Create directories
-  mkdir -p "$_BUILD_STATE_DIR" "$state_dir/artifacts" "$state_dir/manifests"
+  if ! mkdir -p "$_BUILD_STATE_DIR" "$state_dir/artifacts" "$state_dir/manifests"; then
+    command -v log_error &>/dev/null && log_error "Build state directory initialization failed: $state_dir"
+    return 1
+  fi
 
   # Log initialization
   if command -v log_debug &>/dev/null; then
@@ -349,12 +358,25 @@ build_state_create() {
   [[ -z "$_BUILD_STATE_DIR" ]] && build_state_init
 
   local run_id="${DSR_RUN_ID:-run-$(date +%s)-$$}"
+  if [[ ! "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ||
+        "$run_id" == "." || "$run_id" == ".." ]]; then
+    log_error "Invalid build run identifier: $run_id"
+    return 1
+  fi
   local tool_dir
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
   local run_dir="$tool_dir/$run_id"
 
-  # Create workspace directory
-  mkdir -p "$run_dir/artifacts" "$run_dir/logs"
+  # A run ID is an immutable namespace. Refusing a pre-existing path prevents
+  # an accidental retry from replacing state or attempt receipts belonging to
+  # an earlier invocation. The run itself is private even when the caller's
+  # ambient umask is permissive.
+  if ! mkdir -p "$tool_dir" || [[ -e "$run_dir" || -L "$run_dir" ]] ||
+     ! (umask 077; mkdir "$run_dir") ||
+     ! (umask 077; mkdir "$run_dir/artifacts" "$run_dir/logs" "$run_dir/results"); then
+    log_error "Build run workspace already exists or could not be created: $run_dir"
+    return 1
+  fi
   _build_state_ensure_log_root >/dev/null
 
   # Initialize state
@@ -364,26 +386,35 @@ build_state_create() {
   local targets_json="[]"
   if [[ -n "$targets" ]]; then
     # Convert comma-separated to JSON array
-    targets_json=$(echo "$targets" | jq -R 'split(",")' 2>/dev/null || echo '[]')
+    targets_json=$(echo "$targets" | jq -R 'split(",") | map(select(length > 0))' 2>/dev/null || echo '[]')
   fi
 
-  jq -nc \
-      --arg tool "$tool" \
-      --arg version "$version" \
-      --arg run_id "$run_id" \
-      --arg created_at "$now" \
-      --arg updated_at "$now" \
-      --argjson targets "$targets_json" \
-      '{
-          tool: $tool,
-          version: $version,
-          run_id: $run_id,
-          status: "created",
-          created_at: $created_at,
-          updated_at: $updated_at,
-          targets: $targets,
-          hosts: {}
-      }' > "$run_dir/state.json"
+  if ! (
+      umask 077
+      set -o noclobber
+      jq -nc \
+          --arg tool "$tool" \
+          --arg version "$version" \
+          --arg run_id "$run_id" \
+          --arg created_at "$now" \
+          --arg updated_at "$now" \
+          --argjson targets "$targets_json" \
+          '{
+              tool: $tool,
+              version: $version,
+              run_id: $run_id,
+              status: "created",
+              created_at: $created_at,
+              updated_at: $updated_at,
+              targets: $targets,
+              target_statuses: (reduce $targets[] as $target ({};
+                  .[$target] = {status: "pending", attempts: 0})),
+              hosts: {}
+          }' > "$run_dir/state.json"
+  ); then
+    log_error "Failed to create build state: $run_dir/state.json"
+    return 1
+  fi
 
   # Create symlink to latest
   ln -sfn "$run_id" "$tool_dir/latest"
@@ -496,6 +527,89 @@ build_state_update_host() {
   fi
 
   log_debug "Host status updated: $host -> $host_status"
+}
+
+# Update authoritative target status within build state.
+# Args: tool version target status [extra_json] [run_id]
+#
+# Host status is retained for compatibility and fleet telemetry, but it cannot
+# represent two targets assigned to the same host. Scheduling and resume logic
+# therefore use this target-keyed map exclusively.
+build_state_update_target() {
+  local tool="$1"
+  local version="$2"
+  local target="$3"
+  local target_status="$4"  # pending, running, completed, failed, cancelled
+  local extra_json="${5:-}"
+  [[ -n "$extra_json" ]] || extra_json='{}'
+  local run_id="${6:-latest}"
+
+  local tool_dir
+  tool_dir=$(_build_get_tool_dir "$tool" "$version")
+
+  if [[ "$run_id" == "latest" ]]; then
+    run_id=$(readlink "$tool_dir/latest" 2>/dev/null || true)
+    [[ -z "$run_id" ]] && return 1
+  fi
+
+  local state_file="$tool_dir/$run_id/state.json"
+  [[ ! -f "$state_file" ]] && return 1
+
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  if [[ -z "$extra_json" ]] || ! jq -e 'type == "object"' <<< "$extra_json" &>/dev/null; then
+    extra_json='{}'
+  fi
+
+  if ! _build_state_jq_update "$state_file" \
+      --arg target "$target" --arg status "$target_status" --arg now "$now" \
+      --argjson extra "$extra_json" '
+        .target_statuses = (.target_statuses // {}) |
+        .target_statuses[$target] =
+          ((.target_statuses[$target] // {attempts: 0}) + $extra +
+           {status: $status, updated_at: $now}) |
+        .updated_at = $now'; then
+    return 1
+  fi
+
+  log_debug "Target status updated: $target -> $target_status"
+}
+
+# Bind a run to the inputs required for an honest resume.
+# Args: tool version run_id git_sha git_ref source_roots_json output_dir parallel_jobs
+build_state_set_context() {
+  local tool="$1"
+  local version="$2"
+  local run_id="$3"
+  local git_sha="$4"
+  local git_ref="$5"
+  local source_roots_json="${6:-}"
+  [[ -n "$source_roots_json" ]] || source_roots_json='{}'
+  local output_dir="${7:-}"
+  local parallel_jobs="${8:-1}"
+
+  local tool_dir state_file now
+  tool_dir=$(_build_get_tool_dir "$tool" "$version")
+  state_file="$tool_dir/$run_id/state.json"
+  [[ -f "$state_file" ]] || return 1
+  jq -e 'type == "object"' <<< "$source_roots_json" &>/dev/null || return 1
+  [[ "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || return 1
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  _build_state_jq_update "$state_file" \
+    --arg sha "$git_sha" --arg ref "$git_ref" \
+    --argjson source_roots "$source_roots_json" \
+    --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
+    --arg now "$now" '
+      .git_sha = $sha |
+      .git_ref = $ref |
+      .context = {
+        source_roots: $source_roots,
+        output_dir: $output_dir,
+        parallel_jobs: $parallel_jobs
+      } |
+      .updated_at = $now'
 }
 
 # Add artifact to build state
@@ -682,6 +796,35 @@ build_state_pending_hosts() {
       echo "$target"
     fi
   done
+}
+
+# Target-keyed status queries used by the orchestrator and resume planner.
+build_state_completed_targets() {
+  local state
+  state=$(build_state_get "$1" "$2" "${3:-latest}" 2>/dev/null) || return 1
+  jq -r '
+    .target_statuses // {} | to_entries[] |
+    select(.value.status == "completed" and (.value.result | type) == "object") |
+    .key
+  ' <<< "$state"
+}
+
+build_state_failed_targets() {
+  local state
+  state=$(build_state_get "$1" "$2" "${3:-latest}" 2>/dev/null) || return 1
+  jq -r '.target_statuses // {} | to_entries[] | select(.value.status == "failed") | .key' <<< "$state"
+}
+
+build_state_pending_targets() {
+  local state
+  state=$(build_state_get "$1" "$2" "${3:-latest}" 2>/dev/null) || return 1
+  jq -r '
+    . as $state |
+    $state.targets[]? as $target |
+    ($state.target_statuses[$target] // {status: "pending"}) as $entry |
+    select($entry.status != "completed" or ($entry.result | type) != "object") |
+    $target
+  ' <<< "$state"
 }
 
 # ============================================================================
@@ -973,7 +1116,9 @@ build_state_resume() {
     return 1
   fi
 
-  # Get completed and failed hosts
+  # Keep legacy host fields for callers that display fleet telemetry. The
+  # authoritative resume plan is target-keyed because multiple targets may
+  # share one host.
   local completed_hosts failed_hosts pending_hosts
   completed_hosts=$(build_state_completed_hosts "$tool" "$version" "$run_id" | jq -R -s 'split("\n") | map(select(. != ""))')
   failed_hosts=$(build_state_failed_hosts "$tool" "$version" "$run_id" | jq -R -s 'split("\n") | map(select(. != ""))')
@@ -1007,6 +1152,22 @@ build_state_resume() {
     exceeded_json="[]"
   fi
 
+  local target_plan
+  target_plan=$(jq -c --argjson retry_max "$BUILD_RETRY_MAX" '
+    . as $state |
+    reduce $state.targets[]? as $target (
+      {completed: [], retryable: [], exceeded: []};
+      ($state.target_statuses[$target] // {status: "pending", attempts: 0}) as $entry |
+      if ($entry.status == "completed" and ($entry.result | type) == "object") then
+        .completed += [$target]
+      elif (($entry.attempts // 0) >= $retry_max and $entry.status == "failed") then
+        .exceeded += [$target]
+      else
+        .retryable += [$target]
+      end
+    )
+  ' <<< "$state") || return 1
+
   jq -nc \
     --arg tool "$tool" \
     --arg version "$version" \
@@ -1017,6 +1178,8 @@ build_state_resume() {
     --argjson pending "$pending_hosts" \
     --argjson retryable "$retryable_json" \
     --argjson exceeded "$exceeded_json" \
+    --argjson target_plan "$target_plan" \
+    --argjson context "$(jq -c '.context // {}' <<< "$state")" \
     '{
       can_resume: true,
       tool: $tool,
@@ -1028,7 +1191,11 @@ build_state_resume() {
       pending_hosts: $pending,
       retryable_hosts: $retryable,
       exceeded_retry_limit: $exceeded,
-      hosts_to_process: (($pending + $retryable) | unique)
+      hosts_to_process: (($pending + $retryable) | unique),
+      completed_targets: $target_plan.completed,
+      targets_to_process: $target_plan.retryable,
+      exceeded_target_retry_limit: $target_plan.exceeded,
+      context: $context
     }'
 }
 
@@ -1086,6 +1253,7 @@ build_state_exec_with_retry() {
 # Export functions
 export -f build_state_init build_lock_acquire build_lock_release build_lock_check build_lock_info
 export -f build_state_create build_state_get build_state_update_status build_state_update_host
+export -f build_state_update_target build_state_set_context
 export -f build_state_add_artifact build_state_can_resume
 export -f build_state_set_git_info build_state_get_git_sha build_state_get_git_ref
 export -f build_state_completed_hosts build_state_failed_hosts build_state_pending_hosts
@@ -1094,4 +1262,5 @@ export -f build_state_workspace_logs_dir
 export -f build_state_list build_state_cleanup
 export -f build_retry_with_backoff build_state_record_retry build_state_get_retry_count
 export -f build_state_reset_retries build_state_can_retry build_state_resume
+export -f build_state_completed_targets build_state_failed_targets build_state_pending_targets
 export -f build_state_exec_with_retry

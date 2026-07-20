@@ -446,20 +446,21 @@ test_targets_flag_filters() {
 
 test_parallel_flag() {
     ((TESTS_RUN++))
-    log_test "Parallel: --parallel flag accepted"
+    log_test "Parallel: explicit bound reaches the validated build plan"
     setup_test_environment
 
     local tool_dir
     tool_dir=$(setup_mock_rust_tool)
     create_tool_config "mock_rust_tool" "$tool_dir" "rust" "mock_rust_tool"
 
-    local exit_code=0
-    timeout 30 "$DSR_CMD" build mock_rust_tool --parallel --targets linux/amd64 --dry-run 2>&1 || exit_code=$?
+    local exit_code=0 output
+    output=$(timeout 30 "$DSR_CMD" --json build mock_rust_tool \
+        --parallel=3 --targets linux/amd64 --dry-run 2>&1) || exit_code=$?
 
-    if [[ "$exit_code" -eq 0 ]]; then
-        log_pass "--parallel flag accepted (exit: $exit_code)"
+    if [[ "$exit_code" -eq 0 && "$output" == *'"parallel_jobs":3'* ]]; then
+        log_pass "--parallel=3 is recorded in the build plan"
     else
-        log_fail "--parallel flag failed (exit: $exit_code)"
+        log_fail "--parallel bound missing from plan (exit: $exit_code output: $output)"
     fi
 
     cleanup_test_environment

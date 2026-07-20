@@ -66,6 +66,7 @@ ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d"
 # Note: LOG_LEVEL is used by logging.sh
 export LOG_LEVEL=0
 log_init >/dev/null 2>&1
+build_state_init
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Hybrid Build Orchestration Tests"
@@ -418,6 +419,335 @@ if [[ "$musl_target" == "linux/amd64" ]]; then
     pass "act_generate_manifest maps linux_musl_amd64 → linux/amd64"
 else
     fail "act_generate_manifest mapped musl variant to '$musl_target' (expected linux/amd64)"
+fi
+
+echo ""
+echo "== bounded parallel orchestration and resume =="
+
+comma_artifact="$TEMP_DIR/resume,artifact"
+printf 'comma-safe artifact\n' > "$comma_artifact"
+comma_result=$(jq -nc --arg path "$comma_artifact" '
+    {status: "success", artifact_path: $path, artifact_paths: [$path]}
+')
+comma_receipts=$(_act_result_artifact_receipts "$comma_result")
+comma_frozen_result=$(jq -c --argjson receipts "$comma_receipts" \
+    '.resume_artifacts = $receipts' <<< "$comma_result")
+if [[ "$(jq -r 'length' <<< "$comma_receipts")" -eq 1 ]] &&
+   [[ "$(jq -r '.[0].path' <<< "$comma_receipts")" == "$comma_artifact" ]] &&
+   _act_target_result_available "$comma_frozen_result"; then
+    pass "resume receipts preserve comma-containing paths from the authoritative array"
+else
+    fail "resume receipt parsing split an authoritative comma-containing path"
+fi
+
+duplicate_status=0
+duplicate_result=$(
+    (
+        build_lock_acquire() { return 0; }
+        build_lock_release() { return 0; }
+        act_run_native_build() { return 99; }
+        act_orchestrate_build "testool" "v-duplicate" -- \
+            linux/amd64 linux/amd64
+    ) 2>/dev/null
+) || duplicate_status=$?
+if [[ "$duplicate_status" -eq 4 ]] &&
+   jq -e '.status == "error" and (.error | contains("Duplicate"))' \
+      <<< "$duplicate_result" &>/dev/null; then
+    pass "orchestration rejects duplicate targets before launching workers"
+else
+    fail "orchestration accepted duplicate targets: status=$duplicate_status result=$duplicate_result"
+fi
+
+parallel_root="$TEMP_DIR/parallel-orchestration"
+parallel_output="$parallel_root/output"
+parallel_timeline="$parallel_root/timeline"
+parallel_log="$parallel_root/orchestration.log"
+mkdir -p "$parallel_output" "$parallel_timeline"
+
+parallel_status=0
+parallel_result=$(
+    (
+        build_lock_acquire() { return 0; }
+        build_lock_release() { return 0; }
+        unset -f selector_acquire_slot selector_release_slot
+        act_platform_uses_act() { return 1; }
+        act_get_native_host() { printf 'host-%s\n' "${1//\//-}"; }
+        act_run_native_build() {
+            local target="$2" slug="${2//\//-}"
+            local artifact="$parallel_output/$slug"
+            printf '%s\n' "$(date +%s%N)" > "$parallel_timeline/$slug.start"
+            printf 'call\n' >> "$parallel_timeline/$slug.calls"
+            case "$target" in
+                linux/amd64)
+                    local deadline=$((SECONDS + 30)) observed_third=false
+                    while (( SECONDS < deadline )); do
+                        if [[ -f "$parallel_timeline/windows-amd64.start" ]]; then
+                            observed_third=true
+                            break
+                        fi
+                        sleep 0.05
+                    done
+                    printf '%s\n' "$observed_third" > "$parallel_timeline/linux-amd64.observed-third"
+                    ;;
+                darwin/arm64) sleep 0.25 ;;
+                *)            sleep 0.15 ;;
+            esac
+            printf 'artifact %s\n' "$target" > "$artifact"
+            printf '%s\n' "$(date +%s%N)" > "$parallel_timeline/$slug.end"
+            jq -nc --arg platform "$target" --arg path "$artifact" '
+                {platform: $platform, status: "success", exit_code: 0,
+                 artifact_path: $path, artifact_paths: [$path]}'
+        }
+        act_orchestrate_build "testool" "v-parallel" \
+            --parallel-jobs 2 --output-dir "$parallel_output" -- \
+            linux/amd64 darwin/arm64 windows/amd64
+    ) 2> "$parallel_log"
+) || parallel_status=$?
+
+parallel_max=0
+third_start=""
+earliest_finish=""
+long_first_finish=""
+long_first_observed_third=""
+if [[ -f "$parallel_timeline/linux-amd64.start" &&
+      -f "$parallel_timeline/darwin-arm64.start" &&
+      -f "$parallel_timeline/windows-amd64.start" &&
+      -f "$parallel_timeline/linux-amd64.end" &&
+      -f "$parallel_timeline/darwin-arm64.end" &&
+      -f "$parallel_timeline/windows-amd64.end" ]]; then
+    parallel_max=$(awk '
+        FILENAME ~ /[.]start$/ {events[++n]=$1 " +1"}
+        FILENAME ~ /[.]end$/   {events[++n]=$1 " -1"}
+        END {
+          for (i=1; i<=n; i++) for (j=i+1; j<=n; j++)
+            if ((events[i]+0) > (events[j]+0)) {t=events[i]; events[i]=events[j]; events[j]=t}
+          active=0; max=0
+          for (i=1; i<=n; i++) {split(events[i], p, " "); active += p[2]; if (active>max) max=active}
+          print max
+        }
+    ' "$parallel_timeline"/*.start "$parallel_timeline"/*.end)
+    third_start=$(< "$parallel_timeline/windows-amd64.start")
+    first_finish=$(< "$parallel_timeline/linux-amd64.end")
+    second_finish=$(< "$parallel_timeline/darwin-arm64.end")
+    long_first_finish="$first_finish"
+    if [[ -f "$parallel_timeline/linux-amd64.observed-third" ]]; then
+        long_first_observed_third=$(< "$parallel_timeline/linux-amd64.observed-third")
+    fi
+    earliest_finish="$first_finish"
+    [[ "$second_finish" -lt "$earliest_finish" ]] && earliest_finish="$second_finish"
+fi
+parallel_run_id=$(jq -r '.run_id // empty' <<< "$parallel_result")
+parallel_state_status=""
+if [[ -n "$parallel_run_id" ]]; then
+    parallel_state_status=$(build_state_get "testool" "v-parallel" "$parallel_run_id" 2>/dev/null |
+        jq -r '.status // empty')
+fi
+
+if [[ $parallel_status -eq 0 && "$parallel_max" -eq 2 &&
+      "$third_start" =~ ^[0-9]+$ && "$earliest_finish" =~ ^[0-9]+$ &&
+      "$third_start" -ge "$earliest_finish" &&
+      "$long_first_finish" =~ ^[0-9]+$ && "$third_start" -lt "$long_first_finish" &&
+      "$long_first_observed_third" == true &&
+      "$parallel_state_status" == "targets-complete" ]] &&
+   jq -e '
+      .status == "success" and .summary == {total: 3, success: 3, failed: 0} and
+      [.targets[].platform] == ["linux/amd64", "darwin/arm64", "windows/amd64"] and
+      ([.targets[].log_path] | length == 3 and length == (unique | length))
+   ' <<< "$parallel_result" &>/dev/null; then
+    pass "parallel orchestration is work-conserving, respects bound=2, and aggregates in target order"
+else
+    fail "parallel orchestration bound/order mismatch: status=$parallel_status max=$parallel_max state=$parallel_state_status result=$parallel_result"
+    tail -20 "$parallel_log" >&2 || true
+fi
+
+contradictory_root="$TEMP_DIR/contradictory-orchestration"
+contradictory_output="$contradictory_root/output"
+contradictory_log="$contradictory_root/orchestration.log"
+mkdir -p "$contradictory_output"
+contradictory_status=0
+contradictory_result=$(
+    (
+        build_lock_acquire() { return 0; }
+        build_lock_release() { return 0; }
+        unset -f selector_acquire_slot selector_release_slot
+        act_platform_uses_act() { return 1; }
+        act_get_native_host() { printf 'host-%s\n' "${1//\//-}"; }
+        act_run_native_build() {
+            local target="$2" artifact="$contradictory_output/claimed-success"
+            printf 'untrusted output\n' > "$artifact"
+            jq -nc --arg platform "$target" --arg path "$artifact" '
+                {platform: $platform, status: "success", exit_code: 0,
+                 artifact_path: $path, artifact_paths: [$path]}'
+            return 9
+        }
+        act_orchestrate_build "testool" "v-contradictory" \
+            --parallel-jobs 1 --output-dir "$contradictory_output" -- linux/amd64
+    ) 2> "$contradictory_log"
+) || contradictory_status=$?
+if [[ "$contradictory_status" -eq 6 ]] &&
+   jq -e '
+      .status == "failed" and .summary == {total: 1, success: 0, failed: 1} and
+      .targets[0].status == "failed" and .targets[0].exit_code == 9 and
+      (.targets[0].error | contains("nonzero"))
+   ' <<< "$contradictory_result" &>/dev/null; then
+    pass "nonzero worker exit overrides contradictory success JSON"
+else
+    fail "orchestration trusted contradictory success JSON: status=$contradictory_status result=$contradictory_result"
+    tail -20 "$contradictory_log" >&2 || true
+fi
+
+resume_root="$TEMP_DIR/resume-orchestration"
+resume_output="$resume_root/output"
+resume_calls="$resume_root/calls"
+resume_first_log="$resume_root/first.log"
+resume_second_log="$resume_root/second.log"
+mkdir -p "$resume_output" "$resume_calls"
+resume_first_status=0
+resume_first=$(
+    (
+        build_lock_acquire() { return 0; }
+        build_lock_release() { return 0; }
+        unset -f selector_acquire_slot selector_release_slot
+        act_platform_uses_act() { return 1; }
+        act_get_native_host() { printf 'host-%s\n' "${1//\//-}"; }
+        act_run_native_build() {
+            local target="$2" slug="${2//\//-}"
+            printf 'call\n' >> "$resume_calls/$slug"
+            if [[ "$target" == "darwin/arm64" ]]; then
+                jq -nc --arg platform "$target" \
+                    '{platform: $platform, status: "failed", exit_code: 9, error: "fixture failure"}'
+                return 9
+            fi
+            local artifact="$resume_output/$slug"
+            printf 'artifact %s\n' "$target" > "$artifact"
+            jq -nc --arg platform "$target" --arg path "$artifact" '
+                {platform: $platform, status: "success", exit_code: 0,
+                 artifact_path: $path, artifact_paths: [$path]}'
+        }
+        act_orchestrate_build "testool" "v-resume" \
+            --parallel-jobs 3 --output-dir "$resume_output" -- \
+            linux/amd64 darwin/arm64 windows/amd64
+    ) 2> "$resume_first_log"
+) || resume_first_status=$?
+resume_run_id=$(jq -r '.run_id // empty' <<< "$resume_first")
+
+# A completed target is reusable only while its artifact bytes and filesystem
+# identity still match the immutable receipt. Mutate one successful artifact so
+# resume must rebuild it alongside the originally failed target.
+printf 'mutated after receipt\n' > "$resume_output/linux-amd64"
+
+resume_second_status=0
+resume_second=$(
+    (
+        build_lock_acquire() { return 0; }
+        build_lock_release() { return 0; }
+        unset -f selector_acquire_slot selector_release_slot
+        act_platform_uses_act() { return 1; }
+        act_get_native_host() { printf 'host-%s\n' "${1//\//-}"; }
+        act_run_native_build() {
+            local target="$2" slug="${2//\//-}"
+            printf 'call\n' >> "$resume_calls/$slug"
+            local artifact="$resume_output/$slug"
+            printf 'artifact %s\n' "$target" > "$artifact"
+            jq -nc --arg platform "$target" --arg path "$artifact" '
+                {platform: $platform, status: "success", exit_code: 0,
+                 artifact_path: $path, artifact_paths: [$path]}'
+        }
+        act_orchestrate_build "testool" "v-resume" \
+            --resume-run-id "$resume_run_id" --parallel-jobs 2 \
+            --output-dir "$resume_output" -- \
+            linux/amd64 darwin/arm64 windows/amd64
+    ) 2> "$resume_second_log"
+) || resume_second_status=$?
+
+linux_calls=0
+darwin_calls=0
+windows_calls=0
+[[ -f "$resume_calls/linux-amd64" ]] && linux_calls=$(wc -l < "$resume_calls/linux-amd64")
+[[ -f "$resume_calls/darwin-arm64" ]] && darwin_calls=$(wc -l < "$resume_calls/darwin-arm64")
+[[ -f "$resume_calls/windows-amd64" ]] && windows_calls=$(wc -l < "$resume_calls/windows-amd64")
+resume_state_status=""
+if [[ -n "$resume_run_id" ]]; then
+    resume_state_status=$(build_state_get "testool" "v-resume" "$resume_run_id" 2>/dev/null |
+        jq -r '.status // empty')
+fi
+if [[ $resume_first_status -eq 1 && $resume_second_status -eq 0 && \
+      "$linux_calls" -eq 2 && "$darwin_calls" -eq 2 && "$windows_calls" -eq 1 &&
+      "$resume_state_status" == "targets-complete" ]] &&
+   jq -e --arg run_id "$resume_run_id" '
+      .run_id == $run_id and .status == "success" and
+      .summary == {total: 3, success: 3, failed: 0} and
+      [.targets[].platform] == ["linux/amd64", "darwin/arm64", "windows/amd64"] and
+      (.targets[0].resume_reused != true) and (.targets[1].resume_reused != true) and
+      (.targets[2].resume_reused == true)
+   ' <<< "$resume_second" &>/dev/null; then
+    pass "resume reuses exact receipts and rebuilds failed or mutated targets"
+else
+    fail "resume replay mismatch: first=$resume_first_status second=$resume_second_status calls=$linux_calls/$darwin_calls/$windows_calls state=$resume_state_status result=$resume_second"
+    tail -20 "$resume_first_log" >&2 || true
+    tail -20 "$resume_second_log" >&2 || true
+fi
+
+cancel_root="$TEMP_DIR/cancel-orchestration"
+cancel_output="$cancel_root/output"
+cancel_markers="$cancel_root/markers"
+cancel_result_file="$cancel_root/result.json"
+cancel_log="$cancel_root/orchestration.log"
+mkdir -p "$cancel_output" "$cancel_markers"
+
+(
+    build_lock_acquire() { return 0; }
+    build_lock_release() { return 0; }
+    unset -f selector_acquire_slot selector_release_slot
+    act_platform_uses_act() { return 1; }
+    act_get_native_host() { printf 'host-%s\n' "${1//\//-}"; }
+    act_run_native_build() {
+        local target="$2" slug="${2//\//-}" child_pid
+        sleep 300 &
+        child_pid=$!
+        printf '%s\n' "$child_pid" > "$cancel_markers/$slug.pid"
+        wait "$child_pid"
+    }
+    act_orchestrate_build "testool" "v-cancel" \
+        --parallel-jobs 2 --output-dir "$cancel_output" -- \
+        linux/amd64 darwin/arm64
+) > "$cancel_result_file" 2> "$cancel_log" &
+cancel_coordinator_pid=$!
+
+for _ in {1..100}; do
+    marker_count=$(find "$cancel_markers" -type f -name '*.pid' 2>/dev/null | wc -l)
+    [[ "$marker_count" -eq 2 ]] && break
+    sleep 0.05
+done
+
+kill -TERM "$cancel_coordinator_pid" 2>/dev/null || true
+cancel_status=0
+wait "$cancel_coordinator_pid" || cancel_status=$?
+cancel_result=$(grep '^{.*}$' "$cancel_result_file" | tail -1)
+cancel_run_id=$(jq -r '.run_id // empty' <<< "$cancel_result" 2>/dev/null || true)
+cancel_state_status=""
+if [[ -n "$cancel_run_id" ]]; then
+    cancel_state_status=$(build_state_get "testool" "v-cancel" "$cancel_run_id" 2>/dev/null |
+        jq -r '.status // empty')
+fi
+cancel_children_stopped=true
+while IFS= read -r marker; do
+    child_pid=$(< "$marker")
+    if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$child_pid" 2>/dev/null; then
+        cancel_children_stopped=false
+    fi
+done < <(find "$cancel_markers" -type f -name '*.pid' 2>/dev/null)
+
+if [[ "$marker_count" -eq 2 && "$cancel_status" -eq 130 &&
+      "$cancel_state_status" == "failed" && "$cancel_children_stopped" == true ]] &&
+   jq -e '
+      .status == "failed" and .exit_code == 130 and
+      .summary == {total: 2, success: 0, failed: 2}
+   ' <<< "$cancel_result" &>/dev/null; then
+    pass "cancellation returns 130, persists failure, and terminates descendant builds"
+else
+    fail "cancellation mismatch: markers=$marker_count status=$cancel_status state=$cancel_state_status children_stopped=$cancel_children_stopped result=$cancel_result"
+    tail -30 "$cancel_log" >&2 || true
 fi
 
 echo ""
@@ -1512,6 +1842,8 @@ else
     fail "strict fresh source sync failed: status=$strict_sync_status output=$strict_sync_output"
 fi
 
+# Used indirectly by the sourced strict-source verifier.
+# shellcheck disable=SC2034
 ACT_REPO_LOCAL_PATH="$strict_sync_repo"
 if _act_verify_strict_source_roots \
     "synctest" "$strict_sync_sha" "$(echo "$strict_sync_output" | jq -c '.source_roots')" \

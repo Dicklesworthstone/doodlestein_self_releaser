@@ -29,11 +29,6 @@ setup() {
     TEST_PROJECTS="$TEST_TMPDIR/projects"
     mkdir -p "$TEST_PROJECTS"
 
-    # Track original syft availability
-    ORIG_SYFT_AVAILABLE=""
-    if command -v syft &>/dev/null; then
-        ORIG_SYFT_AVAILABLE="yes"
-    fi
 }
 
 # Helper to skip if command not available
@@ -144,9 +139,10 @@ teardown() {
     echo "ELF binary content" > "$artifact"
 
     run sbom_generate "$artifact" --format spdx
-    # May succeed or fail depending on syft version, but should not error
-    # The important thing is it handles files
-    [ "$status" -eq 0 ] || assert_contains "$output" "error"
+    # Syft versions differ on whether an unrecognized standalone file is a
+    # scannable source. Either result is valid, but rejection must remain an
+    # explicit, structured DSR error rather than a silent or malformed failure.
+    [ "$status" -eq 0 ] || assert_contains "$output" "[ERROR]"
 }
 
 @test "sbom_generate fails for nonexistent target" {

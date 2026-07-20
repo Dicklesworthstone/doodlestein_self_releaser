@@ -480,15 +480,25 @@ test_build_real_with_docker() {
     harness_setup
     seed_build_fixtures
 
-    # Use a timeout since real builds can hang
-    timeout 30 "$DSR_CMD" build test-build-tool --target linux/amd64 2>&1 || true
-    local status=$?
+    # Bound the live remote build without making normal fleet contention look
+    # like a product failure. Fresh remote toolchains can legitimately need
+    # more than 30 seconds even for this tiny fixture.
+    local status=0
+    timeout 120 "$DSR_CMD" build test-build-tool --target linux/amd64 2>&1 || status=$?
 
-    # We just verify it doesn't crash completely (timeout is 124)
-    if [[ "$status" -ne 124 ]]; then
-        pass "real build attempt completed (exit: $status)"
-    else
+    local state_file="$DSR_STATE_DIR/builds/test-build-tool/0.1.0/latest/state.json"
+    local manifest_file="$DSR_STATE_DIR/artifacts/test-build-tool-v0.1.0/test-build-tool-v0.1.0-manifest.json"
+
+    if [[ "$status" -eq 124 ]]; then
         skip "real build timed out (expected for full workflow)"
+    elif [[ "$status" -eq 0 ]] &&
+         jq -e '.status == "completed"' "$state_file" >/dev/null 2>&1 &&
+         [[ -f "$manifest_file" ]]; then
+        pass "real build completed with durable state and manifest"
+    else
+        fail "real build must finish successfully with durable completion evidence (exit: $status)"
+        echo "state: $(jq -c . "$state_file" 2>/dev/null || echo missing)"
+        echo "manifest exists: $([[ -f "$manifest_file" ]] && echo yes || echo no)"
     fi
 
     cleanup_build_fixtures
