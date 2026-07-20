@@ -31,7 +31,7 @@
 set -uo pipefail
 
 # Version
-DSR_VERSION="0.1.0"
+DSR_VERSION="0.1.1"
 
 # Script directory (optimized: avoid dirname subshell where possible)
 _dsr_source="${BASH_SOURCE[0]}"

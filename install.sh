@@ -39,7 +39,7 @@ umask 022
 OWNER="Dicklesworthstone"
 REPO="doodlestein_self_releaser"
 BINARY_NAME="dsr"
-INSTALLER_VERSION="0.1.0"
+INSTALLER_VERSION="0.1.1"
 GITHUB_RAW="https://raw.githubusercontent.com/${OWNER}/${REPO}"
 
 DEST="${DSR_DEST:-$HOME/.local/bin}"

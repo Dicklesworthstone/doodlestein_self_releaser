@@ -2,11 +2,48 @@
 
 All notable changes to **dsr** (Doodlestein Self-Releaser) are documented here.
 
-This project does not use semantic versioning tags or GitHub Releases. It ships as a single `dsr` Bash script (8 100+ lines) with 26 source modules under `src/`. Development history is recorded entirely through commits on the `main` branch.
+Beginning with v0.1.1, releases use annotated semantic-version tags and manually
+published GitHub Releases. The platform-neutral distribution consists of the
+`dsr` Bash entry point, its source modules, the installer, and the agent skill.
 
 Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_releaser/commit/<hash>`
 
 ---
+
+## v0.1.1 -- 2026-07-20
+
+First formally tagged release of Doodlestein Self-Releaser.
+
+### Bounded, Resumable Build Orchestration
+
+- `dsr build --parallel[=N]` and `--jobs N` now run independent targets with a
+  bounded, work-conserving scheduler instead of silently building serially.
+- Target logs and result receipts are isolated by target and attempt, while
+  final aggregation remains deterministic in requested-target order.
+- Interrupted and partial runs preserve useful artifacts. Resume reuses only
+  artifacts whose exact path, digest, size, and filesystem identity still
+  match; failed, incomplete, or mutated targets rebuild.
+- Cancellation drains descendant process groups and preserves exit 130. A
+  partial run cannot publish an authoritative manifest or enter signing.
+- Successful live builds now persist the parent coordinator state as
+  `completed` before reporting success.
+
+### Release and Quality-Gate Hardening
+
+- Rust builds run with isolated Cargo configuration, target, and home state on
+  native build hosts.
+- Rust workspace version detection fails closed on ambiguous package versions.
+- Quality-gate receipts require complete evidence and cannot turn missing or
+  malformed result records into a false green.
+- Strict source, artifact, manifest, and release-verification paths retain the
+  existing fail-closed race and identity checks across Linux, macOS, and
+  Windows build targets.
+
+### Verification
+
+- 85 orchestration assertions, 52 native-runner assertions, 28 SBOM tests, and
+  the 16-case live build E2E pass, including durable completion-state and
+  manifest verification.
 
 ## 2026-07-17 -- Fail-Closed Rust Workspace Version Detection
 
