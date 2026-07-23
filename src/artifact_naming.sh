@@ -384,10 +384,13 @@ artifact_naming_parse_goreleaser() {
     fi
 
     local template
+    # yq v4 has neither jq's `empty` keyword nor its `index` builtin — both
+    # fail at the lexer and the 2>/dev/null makes that silent. Use yq-native
+    # `contains`/`select` instead.
     template=$(yq -r '
         .archives[]? |
-        select((.formats // []) | index("binary") | not) |
-        .name_template // empty
+        select((.formats // []) | contains(["binary"]) | not) |
+        .name_template | select(. != null)
     ' "$goreleaser_path" 2>/dev/null | head -1)
 
     if [[ -z "$template" || "$template" == "null" ]]; then
