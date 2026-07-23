@@ -83,6 +83,14 @@ artifact_naming: "${name}-${version}-${os}-${arch}"
 #     relative_path: example-core
 #     revision: "0123456789abcdef0123456789abcdef01234567"
 
+# Optional: extra rsync exclude patterns for the MAIN project sync, applied on
+# top of the built-in defaults and the gitignore-derived excludes. Use for
+# large untracked directories that gitignore semantics don't reliably cover
+# (local build caches, audit output, fixture archives).
+# sync_excludes:
+#   - .codex-target
+#   - big_local_cache_dir
+
 # Install.sh compatibility (optional)
 # When install.sh expects a different naming pattern than artifact_naming,
 # use one of these fields to ensure dsr uploads artifacts with BOTH names.

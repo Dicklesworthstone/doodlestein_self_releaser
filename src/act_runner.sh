@@ -1554,7 +1554,11 @@ act_build_matrix() {
 # SSH settings for native builds
 _ACT_SSH_TIMEOUT="${DSR_SSH_TIMEOUT:-30}"
 _ACT_BUILD_TIMEOUT="${DSR_BUILD_TIMEOUT:-3600}"
-_ACT_SYNC_TIMEOUT="${DSR_SYNC_TIMEOUT:-300}"  # 5 minutes for sync
+# 30 minutes: first-time syncs of repos with multi-GB tracked trees (test
+# fixtures etc.) legitimately exceed 5 minutes over WAN links. A too-short
+# ceiling kills healthy transfers mid-flight; rsync reports real failures
+# (auth, connectivity, disk) far faster than this on its own.
+_ACT_SYNC_TIMEOUT="${DSR_SYNC_TIMEOUT:-1800}"
 
 # ============================================================================
 # Source Code Sync for Remote Native Builds
@@ -1795,8 +1799,26 @@ _act_sync_source() {
 
     # Respect .gitignore by default for faster remote sync, but allow callers
     # to disable that behavior when ignored files are still required inputs.
-    if $respect_gitignore_excludes && [[ -f "$local_path/.gitignore" ]]; then
-        exclude_args+=("--exclude-from=$local_path/.gitignore")
+    # The global git excludes file participates in ignore decisions exactly
+    # like the repo .gitignore, so honor it too — machine-wide build dirs
+    # (e.g. .codex-target) are often ignored only there, and missing them
+    # means shipping tens of GB of build artifacts to every host.
+    if $respect_gitignore_excludes; then
+        if [[ -f "$local_path/.gitignore" ]]; then
+            exclude_args+=("--exclude-from=$local_path/.gitignore")
+        fi
+        local global_excludes_file
+        global_excludes_file=$(git config --path --get core.excludesFile 2>/dev/null || true)
+        if [[ -z "$global_excludes_file" ]]; then
+            global_excludes_file="${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore"
+        fi
+        # gitignore negations don't translate to rsync excludes (a bare "!"
+        # even resets rsync's rule list), so skip the global file entirely if
+        # it uses them rather than mis-applying its patterns.
+        if [[ -f "$global_excludes_file" ]] && \
+           ! grep -q '^!' "$global_excludes_file" 2>/dev/null; then
+            exclude_args+=("--exclude-from=$global_excludes_file")
+        fi
     fi
 
     _log_info "Syncing source to $host:$remote_path"
@@ -2909,6 +2931,16 @@ act_sync_sources() {
         sibling_count=$(yq -r '.sibling_crates | length // 0' "$config_file" 2>/dev/null || echo 0)
     fi
 
+    # Per-repo exclude patterns for the MAIN project sync (siblings already
+    # support extra_excludes). Applied on top of the defaults and the
+    # gitignore-derived excludes.
+    local main_sync_excludes=()
+    local main_sync_exclude
+    while IFS= read -r main_sync_exclude; do
+        [[ -z "$main_sync_exclude" ]] && continue
+        main_sync_excludes+=("$main_sync_exclude")
+    done < <(yq -r '.sync_excludes // [] | .[]' "$config_file" 2>/dev/null || true)
+
     for i in "${!hosts_to_sync[@]}"; do
         local host="${hosts_to_sync[$i]}"
         local remote_path="${host_paths[$i]}"
@@ -2924,7 +2956,8 @@ act_sync_sources() {
                 "$remote_path" "source.tar" "$tool_name" 2>&1); then
                 source_synced=true
             fi
-        elif host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" 2>&1); then
+        elif host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" \
+            "${main_sync_excludes[@]}" 2>&1); then
             source_synced=true
         fi
         [[ -n "$host_sync_output" ]] && printf '%s\n' "$host_sync_output" >&2
