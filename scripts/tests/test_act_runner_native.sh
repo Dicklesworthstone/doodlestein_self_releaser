@@ -172,10 +172,10 @@ yq() {
         '.sibling_crates // [] | length')
             if [[ -n "${MOCK_SIBLING_RELATIVE:-}" ]]; then echo 1; else echo 0; fi
             ;;
-        '.sibling_crates[0].relative_path // empty')
+        '.sibling_crates[0].relative_path // ""')
             echo "${MOCK_SIBLING_RELATIVE:-}"
             ;;
-        '.sibling_crates[0].local_path // empty')
+        '.sibling_crates[0].local_path // ""')
             echo "${MOCK_SIBLING_LOCAL_PATH:-}"
             ;;
         *)
