@@ -2719,14 +2719,14 @@ EOF
 
         if command -v yq &>/dev/null; then
             if [[ -f "$tool_config" ]]; then
-                yq -r '.include_files[]? // empty' "$tool_config" 2>/dev/null
+                yq -r '.include_files[]?' "$tool_config" 2>/dev/null
                 return 0
             fi
             if [[ -f "$DSR_REPOS_FILE" ]]; then
                 # See _build_get_archive_format above — same strenv()
                 # rationale: $tool came from a CLI flag and may be
                 # unsanitised at the boundary.
-                DSR_TOOL="$tool" yq -r '.tools[strenv(DSR_TOOL)].include_files[]? // empty' "$DSR_REPOS_FILE" 2>/dev/null
+                DSR_TOOL="$tool" yq -r '.tools[strenv(DSR_TOOL)].include_files[]?' "$DSR_REPOS_FILE" 2>/dev/null
                 return 0
             fi
         fi
@@ -3485,9 +3485,9 @@ _dispatch_load_config() {
         local cfg_enabled cfg_event cfg_repos
 
         if [[ -f "$tool_config" ]]; then
-            cfg_enabled=$(yq -r '.dispatch.enabled // empty' "$tool_config" 2>/dev/null || echo "")
-            cfg_event=$(yq -r '.dispatch.event_type // empty' "$tool_config" 2>/dev/null || echo "")
-            cfg_repos=$(_dispatch_join_lines "$(yq -r '.dispatch.repos[]? // empty' "$tool_config" 2>/dev/null || true)")
+            cfg_enabled=$(yq -r '.dispatch.enabled // ""' "$tool_config" 2>/dev/null || echo "")
+            cfg_event=$(yq -r '.dispatch.event_type // ""' "$tool_config" 2>/dev/null || echo "")
+            cfg_repos=$(_dispatch_join_lines "$(yq -r '.dispatch.repos[]?' "$tool_config" 2>/dev/null || true)")
 
             [[ -z "$enabled" && -n "$cfg_enabled" ]] && enabled="$cfg_enabled"
             [[ -z "$event_type" && -n "$cfg_event" ]] && event_type="$cfg_event"
@@ -3495,9 +3495,9 @@ _dispatch_load_config() {
         fi
 
         if [[ -f "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" ]]; then
-            cfg_enabled=$(yq -r '.dispatch.enabled // empty' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || echo "")
-            cfg_event=$(yq -r '.dispatch.event_type // empty' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || echo "")
-            cfg_repos=$(_dispatch_join_lines "$(yq -r '.dispatch.repos[]? // empty' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || true)")
+            cfg_enabled=$(yq -r '.dispatch.enabled // ""' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || echo "")
+            cfg_event=$(yq -r '.dispatch.event_type // ""' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || echo "")
+            cfg_repos=$(_dispatch_join_lines "$(yq -r '.dispatch.repos[]?' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || true)")
 
             [[ -z "$enabled" && -n "$cfg_enabled" ]] && enabled="$cfg_enabled"
             [[ -z "$event_type" && -n "$cfg_event" ]] && event_type="$cfg_event"

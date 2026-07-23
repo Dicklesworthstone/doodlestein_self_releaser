@@ -391,7 +391,7 @@ artifact_naming_parse_goreleaser() {
     ' "$goreleaser_path" 2>/dev/null | head -1)
 
     if [[ -z "$template" || "$template" == "null" ]]; then
-        template=$(yq -r '.archives[]?.name_template // empty' "$goreleaser_path" 2>/dev/null | head -1)
+        template=$(yq -r '.archives[]?.name_template | select(. != null)' "$goreleaser_path" 2>/dev/null | head -1)
     fi
 
     if [[ -z "$template" || "$template" == "null" ]]; then

@@ -2673,7 +2673,7 @@ _act_sync_sibling_crates() {
     for idx in $(seq 0 $((sibling_count - 1))); do
         local sib_local sib_relative
         sib_local=$(yq -r ".sibling_crates[$idx].local_path" "$config_file" 2>/dev/null)
-        sib_relative=$(yq -r ".sibling_crates[$idx].relative_path // empty" "$config_file" 2>/dev/null)
+        sib_relative=$(yq -r ".sibling_crates[$idx].relative_path // \"\"" "$config_file" 2>/dev/null)
         [[ -z "$sib_relative" ]] && sib_relative=$(basename "$sib_local")
 
         if [[ ! -d "$sib_local" ]]; then
@@ -3795,10 +3795,10 @@ act_run_native_build() {
         sibling_count=$(yq -r '.sibling_crates // [] | length' "$config_file" 2>/dev/null || echo 0)
         [[ "$sibling_count" =~ ^[0-9]+$ ]] || sibling_count=0
         for ((sibling_index = 0; sibling_index < sibling_count; sibling_index++)); do
-            sibling_relative=$(yq -r ".sibling_crates[$sibling_index].relative_path // empty" \
+            sibling_relative=$(yq -r ".sibling_crates[$sibling_index].relative_path // \"\"" \
                 "$config_file" 2>/dev/null || true)
             if [[ -z "$sibling_relative" ]]; then
-                sibling_local=$(yq -r ".sibling_crates[$sibling_index].local_path // empty" \
+                sibling_local=$(yq -r ".sibling_crates[$sibling_index].local_path // \"\"" \
                     "$config_file" 2>/dev/null || true)
                 sibling_relative="${sibling_local##*/}"
             fi
