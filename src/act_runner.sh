@@ -3766,7 +3766,10 @@ act_run_native_build() {
             esac
             case "$platform" in
                 darwin/*) isolation_root="/private/tmp" ;;
-                *) isolation_root="/tmp" ;;
+                # /var/tmp, not /tmp: Linux /tmp is commonly a RAM-backed
+                # tmpfs, and the staged source copy (workspace + every
+                # sibling crate) can run to tens of GB per target.
+                *) isolation_root="/var/tmp" ;;
             esac
         fi
         if [[ -z "$nonstrict_target_dir" || "$nonstrict_target_dir" == *$'\n'* || \
@@ -4016,6 +4019,13 @@ act_run_native_build() {
             env_exports+="export \"$env_pair\"; "
         done <<< "$build_env"
 
+        # A configured TMPDIR that does not exist on the build host breaks
+        # compilers in opaque ways (clang: "unable to make temporary file"),
+        # so create it before the build runs.
+        if [[ "$build_env" == TMPDIR=* || "$build_env" == *$'\n'TMPDIR=* ]]; then
+            env_exports+='mkdir -p "$TMPDIR"; '
+        fi
+
         # Default path: build in place under remote_path.
         local rp_q="${remote_path//\'/\'\\\'\'}"
         local cargo_home_prefix="" cd_cmd="cd '$rp_q'"
@@ -4029,9 +4039,9 @@ act_run_native_build() {
             # Always build ordinary Rust sources from a unique system-temp
             # directory.  Cargo searches .cargo/config* in every ancestor of
             # the working directory, so merely changing CARGO_HOME is not an
-            # isolation boundary.  /private/tmp (macOS) and /tmp (other Unix)
-            # are outside the user's home; their own ancestor chain is checked
-            # before use.  A fresh CARGO_HOME reuses only immutable download
+            # isolation boundary.  /private/tmp (macOS) and /var/tmp (other
+            # Unix) are outside the user's home; their own ancestor chain is
+            # checked before use.  A fresh CARGO_HOME reuses only immutable download
             # caches and cannot contain aliases, patches, source replacement,
             # credentials, or compiler settings.  Unique directories avoid
             # cross-target races and require no destructive pre-build cleanup.
@@ -4045,6 +4055,31 @@ act_run_native_build() {
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     _act_ssh_exec "$host" "$remote_cmd" 2>&1 | tee "$log_file"
     local exit_code=${PIPESTATUS[0]}
+
+    # The ephemeral stage root (isolated source copy + fresh cargo-home) is
+    # never needed once the build command has exited: artifacts are collected
+    # from CARGO_TARGET_DIR, which always lives outside it. Remove it on every
+    # outcome — success, failure, and especially a timeout kill, which never
+    # reaches any in-command cleanup — or multi-GB staging copies accumulate
+    # until the temp filesystem fills and later targets die with ENOSPC.
+    # rm -rf / rmdir do not follow the cargo cache symlinks/junctions inside.
+    if [[ -n "$nonstrict_stage_root" && "$nonstrict_stage_root" == */dsr-build-* ]]; then
+        local cleanup_ok=true
+        if _act_is_windows_host "$host"; then
+            local win_cleanup_path
+            win_cleanup_path=$(_act_windows_cmd_path "$nonstrict_stage_root")
+            _act_ssh_exec "$host" \
+                "cmd /c \"if exist \"$win_cleanup_path\" rmdir /s /q \"$win_cleanup_path\"\"" \
+                120 >/dev/null 2>&1 || cleanup_ok=false
+        else
+            _act_ssh_exec "$host" \
+                "rm -rf '${nonstrict_stage_root//\'/\'\\\'\'}'" \
+                120 >/dev/null 2>&1 || cleanup_ok=false
+        fi
+        if ! $cleanup_ok; then
+            _log_warn "Could not remove build stage root $nonstrict_stage_root on $host"
+        fi
+    fi
 
     local end_time duration
     end_time=$(date +%s)

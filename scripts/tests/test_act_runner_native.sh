@@ -78,8 +78,9 @@ _act_run_with_timeout() {
 _act_ssh_exec() {
     local host="$1"
     local cmd="$2"
-    # Write to file for subshell-safe capture
-    printf '%s\n' "HOST:$host" "CMD:$cmd" > "$SSH_ARGS_FILE"
+    # Append for subshell-safe capture: a build now issues follow-up exec
+    # calls (stage-root cleanup) and the build command must stay recorded.
+    printf '%s\n' "HOST:$host" "CMD:$cmd" >> "$SSH_ARGS_FILE"
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
     return "$exit_code"
@@ -414,7 +415,7 @@ DSR_PROBE_OUTPUT=$probe_output"
             (.cargo_isolation.excluded_cargo_home_entries | sort) ==
               (["config", "config.toml", "credentials", "credentials.toml"] | sort)' \
           <<< "$result" >/dev/null && \
-       [[ "$observed_source" == /tmp/dsr-build-tool-linux-amd64-*/source ]] && \
+       [[ "$observed_source" == /var/tmp/dsr-build-tool-linux-amd64-*/source ]] && \
        [[ "$observed_source" != "$source_root" ]] && \
        [[ "$observed_home" != "$operator_home/.cargo" ]] && \
        [[ ! -e "$observed_home/config.toml" ]]; then
