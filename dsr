@@ -2135,10 +2135,14 @@ EOF
         fi
 
         log_info "Syncing source to remote build hosts..."
-        local sync_output sync_json sync_status
+        local sync_output sync_json sync_status sync_detail
         # shellcheck disable=SC2086
         sync_output=$(act_sync_sources "$tool_name" "${build_sync_args[@]}" $target_list 2>&1)
         sync_json=$(printf '%s\n' "$sync_output" | grep '^{' | tail -1)
+        # Everything that is not the structured summary is the sync transcript
+        # (module logs plus the underlying rsync/ssh/tar diagnostics). It must
+        # be shown on failure or the real error is silently discarded.
+        sync_detail=$(printf '%s\n' "$sync_output" | grep -v '^{' | grep -v '^[[:space:]]*$' || true)
         if ! sync_status=$(jq -er '.status | strings' <<< "$sync_json" 2>/dev/null); then
             sync_status="unknown"
         fi
@@ -2150,15 +2154,24 @@ EOF
                 log_ok "Source synced to $synced host(s)"
             fi
         elif [[ "$sync_status" == "partial" ]]; then
+            [[ -n "$sync_detail" ]] && printf '%s\n' "$sync_detail" >&2
             if $build_release_contract_enabled; then
                 log_error "Strict source sync was incomplete"
                 return 1
             fi
             log_warn "Some hosts failed to sync - builds may fail"
         else
+            [[ -n "$sync_detail" ]] && printf '%s\n' "$sync_detail" >&2
             log_error "Source sync failed"
             if $JSON_MODE; then
-                json_envelope "build" "failed" 1 '{"error":"Source sync failed"}'
+                local sync_error_json
+                if ! sync_error_json=$(jq -nc \
+                    --arg error "Source sync failed" \
+                    --argjson sync "${sync_json:-null}" \
+                    '{error: $error, sync: $sync}' 2>/dev/null); then
+                    sync_error_json='{"error":"Source sync failed"}'
+                fi
+                json_envelope "build" "failed" 1 "$sync_error_json"
             fi
             return 1
         fi

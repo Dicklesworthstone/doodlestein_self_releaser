@@ -1722,6 +1722,40 @@ _act_has_rsync() {
     fi
 }
 
+# Report a failed sync command with its real diagnostics instead of a generic
+# one-liner. Distinguishes the timeout wrapper's exit 124 from tool errors and
+# forwards the command's captured stdout+stderr to our stderr log stream so
+# callers (and the top-level build command) can show the underlying cause.
+# Usage: _act_log_sync_failure <label> <exit_code> <output>
+_act_log_sync_failure() {
+    local label="$1"
+    local exit_code="$2"
+    local output="$3"
+
+    if [[ "$exit_code" -eq 124 ]]; then
+        _log_error "$label timed out after ${_ACT_SYNC_TIMEOUT}s"
+    else
+        _log_error "$label failed (exit $exit_code)"
+    fi
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$output" >&2
+    fi
+}
+
+# Reduce a captured sync transcript to a short single-line error summary
+# suitable for embedding in the per-host JSON results (last non-empty lines,
+# ANSI color codes stripped).
+# Usage: _act_sync_error_summary <output>
+_act_sync_error_summary() {
+    local output="$1"
+    local esc=$'\x1b'
+    printf '%s\n' "$output" \
+        | sed -e "s/${esc}\[[0-9;]*m//g" \
+        | grep -v '^[[:space:]]*$' \
+        | tail -n 5 \
+        | paste -sd' ' -
+}
+
 # Sync source code to remote host via rsync
 # Usage: _act_sync_source <host> <local_path> <remote_path> [extra_excludes...]
 # Returns: 0 on success, non-zero on failure
@@ -1777,15 +1811,18 @@ _act_sync_source() {
         fi
 
         mkdir -p "$remote_path"
-        if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+        local sync_cmd_output sync_cmd_status
+        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
             "${exclude_args[@]}" \
-            "$local_path/" "$remote_path/" 2>&1; then
+            "$local_path/" "$remote_path/" 2>&1)
+        sync_cmd_status=$?
+        if [[ "$sync_cmd_status" -eq 0 ]]; then
             local duration=$(($(date +%s) - start_time))
             _log_ok "Sync completed in ${duration}s (local rsync)"
             return 0
         fi
 
-        _log_error "local rsync failed"
+        _act_log_sync_failure "local rsync" "$sync_cmd_status" "$sync_cmd_output"
         return 1
     fi
 
@@ -1809,15 +1846,18 @@ _act_sync_source() {
         fi
 
         # Use rsync for efficient sync
-        if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+        local sync_cmd_output sync_cmd_status
+        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
             "${exclude_args[@]}" \
             -e "ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new" \
-            "$local_path/" "$ssh_destination:$rsync_remote_path/" 2>&1; then
+            "$local_path/" "$ssh_destination:$rsync_remote_path/" 2>&1)
+        sync_cmd_status=$?
+        if [[ "$sync_cmd_status" -eq 0 ]]; then
             local duration=$(($(date +%s) - start_time))
             _log_ok "Sync completed in ${duration}s (rsync)"
             return 0
         else
-            _log_error "rsync failed"
+            _act_log_sync_failure "rsync to $host" "$sync_cmd_status" "$sync_cmd_output"
             return 1
         fi
     else
@@ -1849,18 +1889,21 @@ _act_sync_source() {
         local escaped_remote_extract_cmd
         printf -v escaped_remote_extract_cmd '%q' "$remote_extract_cmd"
 
-        if _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" bash -c "
+        local sync_cmd_output sync_cmd_status
+        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" bash -c "
             cd '$local_path' && \
             tar czf - ${tar_excludes[*]} . | \
             ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT \
                 -o StrictHostKeyChecking=accept-new \
                 '$ssh_destination' $escaped_remote_extract_cmd
-        " 2>&1; then
+        " 2>&1)
+        sync_cmd_status=$?
+        if [[ "$sync_cmd_status" -eq 0 ]]; then
             local duration=$(($(date +%s) - start_time))
             _log_ok "Sync completed in ${duration}s (tar)"
             return 0
         else
-            _log_error "tar fallback sync failed"
+            _act_log_sync_failure "tar fallback sync to $host" "$sync_cmd_status" "$sync_cmd_output"
             return 1
         fi
     fi
@@ -2658,19 +2701,23 @@ _act_sync_sibling_crates() {
             # cross-shell escaping issues (bash → SSH → cmd.exe → PowerShell).
             local win_path="${remote_path//\//\\}"
             local toml_path="${win_path}\\Cargo.toml"
-            if _act_ssh_exec "$host" "powershell -Command \"[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_local}','${relative_ref}'))\"" 30 2>/dev/null; then
+            local patch_output
+            if patch_output=$(_act_ssh_exec "$host" "powershell -Command \"[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_local}','${relative_ref}'))\"" 30 2>&1); then
                 _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref"
             else
                 _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
+                [[ -n "$patch_output" ]] && printf '%s\n' "$patch_output" >&2
                 sync_failed=true
             fi
         else
             # macOS sed requires '' after -i; Linux sed requires no arg after -i
             # Use perl for portable in-place replacement
-            if _act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_local}\\E|${relative_ref}|g' Cargo.toml" 30 2>/dev/null; then
+            local patch_output
+            if patch_output=$(_act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_local}\\E|${relative_ref}|g' Cargo.toml" 30 2>&1); then
                 _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref"
             else
                 _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
+                [[ -n "$patch_output" ]] && printf '%s\n' "$patch_output" >&2
                 sync_failed=true
             fi
         fi
@@ -2866,15 +2913,21 @@ act_sync_sources() {
         local host="${hosts_to_sync[$i]}"
         local remote_path="${host_paths[$i]}"
 
+        # Capture each host's full sync transcript so failures can report the
+        # underlying cause (in the log and in the per-host JSON) instead of a
+        # bare "failed" status. The transcript is re-emitted on stderr either
+        # way so progress detail is never lost.
         local source_synced=false
+        local host_sync_output=""
         if $strict_release; then
-            if _act_sync_strict_checkout "$host" "$local_path" "$strict_git_sha" \
-                "$remote_path" "source.tar" "$tool_name"; then
+            if host_sync_output=$(_act_sync_strict_checkout "$host" "$local_path" "$strict_git_sha" \
+                "$remote_path" "source.tar" "$tool_name" 2>&1); then
                 source_synced=true
             fi
-        elif _act_sync_source "$host" "$local_path" "$remote_path"; then
+        elif host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" 2>&1); then
             source_synced=true
         fi
+        [[ -n "$host_sync_output" ]] && printf '%s\n' "$host_sync_output" >&2
 
         if $source_synced; then
             local sync_ok=true
@@ -2884,20 +2937,30 @@ act_sync_sources() {
             # has the sibling crates at their absolute paths — no sync/patch needed).
             if $strict_release; then
                 local dependency relative_path dependency_local dependency_sha
+                local dependency_sync_output dependency_sync_status
                 while IFS= read -r dependency; do
                     [[ -n "$dependency" ]] || continue
                     relative_path=$(jq -r '.relative_path' <<< "$dependency")
                     dependency_local=$(jq -r '.local_path' <<< "$dependency")
                     dependency_sha=$(jq -r '.git_sha' <<< "$dependency")
-                    if ! _act_sync_strict_checkout "$host" "$dependency_local" "$dependency_sha" \
+                    dependency_sync_output=$(_act_sync_strict_checkout "$host" "$dependency_local" "$dependency_sha" \
                         "${remote_path%/source}/$relative_path" \
-                        "dependency-${relative_path}.tar" "$relative_path"; then
+                        "dependency-${relative_path}.tar" "$relative_path" 2>&1)
+                    dependency_sync_status=$?
+                    [[ -n "$dependency_sync_output" ]] && printf '%s\n' "$dependency_sync_output" >&2
+                    if [[ "$dependency_sync_status" -ne 0 ]]; then
+                        host_sync_output="$dependency_sync_output"
                         sync_ok=false
                         break
                     fi
                 done < <(jq -c '.[]' <<< "$strict_dependency_checkouts")
             elif [[ "$sibling_count" -gt 0 && "$remote_path" != "$local_path" ]]; then
-                if ! _act_sync_sibling_crates "$host" "$remote_path" "$config_file" "$sibling_count"; then
+                local sibling_sync_output sibling_sync_status
+                sibling_sync_output=$(_act_sync_sibling_crates "$host" "$remote_path" "$config_file" "$sibling_count" 2>&1)
+                sibling_sync_status=$?
+                [[ -n "$sibling_sync_output" ]] && printf '%s\n' "$sibling_sync_output" >&2
+                if [[ "$sibling_sync_status" -ne 0 ]]; then
+                    host_sync_output="$sibling_sync_output"
                     sync_ok=false
                 fi
             fi
@@ -2909,11 +2972,15 @@ act_sync_sources() {
                     '{key: $host, value: $path}')")
             else
                 ((failed++))
-                results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"failed\"}")
+                results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
+                    --arg error "$(_act_sync_error_summary "$host_sync_output")" \
+                    '{host: $host, path: $path, status: "failed", error: $error}')")
             fi
         else
             ((failed++))
-            results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"failed\"}")
+            results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
+                --arg error "$(_act_sync_error_summary "$host_sync_output")" \
+                '{host: $host, path: $path, status: "failed", error: $error}')")
         fi
     done
 
