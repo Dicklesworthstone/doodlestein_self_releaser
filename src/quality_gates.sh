@@ -69,6 +69,12 @@ _qg_now_ms() {
     ms=$(date +%s%3N 2>/dev/null)
     if [[ "$ms" =~ ^[0-9]+$ ]]; then
         echo "$ms"
+    elif command -v python3 &>/dev/null; then
+        # Mirrors logging.sh::_get_ms_timestamp. Without this the last resort
+        # below quantizes to whole seconds, so every check that finishes inside
+        # one second is recorded as 0ms — which is what the duration assertions
+        # in test_quality_gates.sh were catching on macOS.
+        python3 -c 'import time; print(int(time.time() * 1000))'
     else
         echo "$(($(date +%s) * 1000))"
     fi
