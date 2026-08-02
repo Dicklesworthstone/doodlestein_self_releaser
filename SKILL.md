@@ -80,8 +80,33 @@ dsr release verify <tool> <v> # Verify release assets
 | Host | Platform | Connection | Purpose |
 |------|----------|------------|---------|
 | trj | Linux x64 | local | Primary build host, act runner |
+| ts1 | Linux x64 | SSH via Tailscale | 64-core, lightly loaded — preferred linux builder |
 | mmini | macOS arm64 | SSH via Tailscale | Native macOS builds |
-| wlap | Windows x64 | SSH via Tailscale | Native Windows builds |
+| wlap | Windows x64 | SSH via Tailscale (`surfacebookje`) | Native Windows builds. Surface Book 2, 8 cores — **disk runs tight (~40 GB free)** |
+| wsurf | Windows x64 | SSH via Tailscale (`oldsurface`) | Second Windows builder, Surface Book 3 |
+
+**`hosts.yaml` exists in two places** — `~/.config/dsr/hosts.yaml` on
+**mac-mini-max** and on **trj**. They are independent files. A host added to one
+is invisible to the other, so edit both.
+
+### Host selection
+
+`act_get_native_host` resolves a platform to a host in this order:
+
+1. Per-repo override: `cross_compile."<platform>".host` in `repos.d/<tool>.yaml`
+2. **Health/capacity selector** — considers every host whose `platform` OS
+   matches, drops those that are disabled or failing health checks (5-min cache),
+   scores the rest by free build slots, and prefers the host named in
+   `platform_mapping`
+3. Static `platform_mapping["<platform>"]`
+4. Compiled-in default
+
+So a second same-platform host absorbs overflow and covers the first being
+asleep, while `platform_mapping` still decides who goes first. Set
+`DSR_DISABLE_HOST_SELECTOR=1` to bypass step 2 and use the static mapping only.
+
+The first call after a cold health cache costs ~10-15s while hosts are probed;
+subsequent calls are instant for 5 minutes.
 
 ## Common Workflows
 
@@ -179,6 +204,21 @@ ssh -o ConnectTimeout=5 mmini "echo ok"
 dsr health clear-cache
 dsr health check mmini
 ```
+
+### Builds land on the wrong host (or an unexpected one)
+
+The selector can legitimately pick a host other than the one in
+`platform_mapping` — that is the failover working. To see why:
+
+```bash
+dsr health all --json | jq '.hosts[] | {hostname, status, healthy}'
+DSR_DISABLE_HOST_SELECTOR=1 dsr build <tool>   # force the static mapping
+```
+
+A host is dropped from consideration when it is `enabled: false`, unhealthy
+(disk >95% used is an *error*; >90% is only a warning), or has no free slots.
+Remember there are two `hosts.yaml` files (mac-mini-max and trj) — confirm you
+edited the one belonging to the machine you are running `dsr` on.
 
 ### Build Fails
 
