@@ -1249,6 +1249,107 @@ test_host_detection_unknown() {
 }
 
 # ============================================================================
+# Test Cases: Host Selection (health/capacity-aware)
+# ============================================================================
+
+# The selector and the static mapping are both optional collaborators that
+# act_get_native_host discovers with `declare -F`. Define them locally so these
+# tests exercise the real resolution order without a live health cache.
+_stub_host_resolution() {
+    local mapped="$1"
+    local selected="$2"
+
+    # Same reason as the SSH/SCP capture files above: act_get_native_host is
+    # usually called through $( ), so a stub recording to a variable would lose
+    # it with the subshell. Lives under MOCK_DIR so suite teardown reaps it.
+    _STUB_SELECTOR_ARGS_FILE="$MOCK_DIR/selector_args.txt"
+    : > "$_STUB_SELECTOR_ARGS_FILE"
+
+    eval "config_get_host_for_platform() { printf '%s\n' '$mapped'; }"
+    if [[ -n "$selected" ]]; then
+        eval "selector_choose_host() { printf '%s' \"\$*\" > '$_STUB_SELECTOR_ARGS_FILE'; printf '%s\n' '$selected'; }"
+    else
+        eval "selector_choose_host() { printf '%s' \"\$*\" > '$_STUB_SELECTOR_ARGS_FILE'; return 1; }"
+    fi
+}
+
+_unstub_host_resolution() {
+    unset -f config_get_host_for_platform selector_choose_host 2>/dev/null || true
+    unset DSR_DISABLE_HOST_SELECTOR
+    unset _STUB_SELECTOR_ARGS_FILE
+    # Unconditional success: a bare `[[ ]] && ...` tail would return non-zero
+    # whenever the guard is false, and callers here run under `set -o pipefail`.
+    return 0
+}
+
+test_host_selection_selector_wins() {
+    log_test "Host selection: healthy selector result overrides platform_mapping"
+    reset_state
+    _stub_host_resolution "wlap" "wsurf"
+
+    local host
+    host=$(act_get_native_host "windows/amd64")
+
+    if [[ "$host" == "wsurf" ]]; then
+        log_pass "selector choice used instead of mapped host"
+    else
+        log_fail "Expected wsurf but got: $host"
+    fi
+    _unstub_host_resolution
+}
+
+test_host_selection_prefers_mapped_host() {
+    log_test "Host selection: platform_mapping host is passed as --prefer"
+    reset_state
+    _stub_host_resolution "wlap" "wlap"
+
+    act_get_native_host "windows/amd64" >/dev/null
+
+    local selector_args
+    selector_args=$(cat "$_STUB_SELECTOR_ARGS_FILE" 2>/dev/null || true)
+
+    if [[ "$selector_args" == *"--prefer wlap"* ]]; then
+        log_pass "mapped host forwarded as --prefer"
+    else
+        log_fail "Expected --prefer wlap in selector args: $selector_args"
+    fi
+    _unstub_host_resolution
+}
+
+test_host_selection_falls_back_to_mapping() {
+    log_test "Host selection: selector failure falls back to platform_mapping"
+    reset_state
+    _stub_host_resolution "wlap" ""
+
+    local host
+    host=$(act_get_native_host "windows/amd64")
+
+    if [[ "$host" == "wlap" ]]; then
+        log_pass "fell back to mapped host when selector found nothing"
+    else
+        log_fail "Expected wlap but got: $host"
+    fi
+    _unstub_host_resolution
+}
+
+test_host_selection_can_be_disabled() {
+    log_test "Host selection: DSR_DISABLE_HOST_SELECTOR=1 bypasses selector"
+    reset_state
+    _stub_host_resolution "wlap" "wsurf"
+    export DSR_DISABLE_HOST_SELECTOR=1
+
+    local host
+    host=$(act_get_native_host "windows/amd64")
+
+    if [[ "$host" == "wlap" ]]; then
+        log_pass "selector bypassed, mapped host used"
+    else
+        log_fail "Expected wlap but got: $host"
+    fi
+    _unstub_host_resolution
+}
+
+# ============================================================================
 # Test Cases: Error Handling
 # ============================================================================
 
@@ -1549,6 +1650,12 @@ main() {
     test_host_detection_windows
     test_host_detection_linux
     test_host_detection_unknown
+
+    # Host selection (health/capacity-aware)
+    test_host_selection_selector_wins
+    test_host_selection_prefers_mapped_host
+    test_host_selection_falls_back_to_mapping
+    test_host_selection_can_be_disabled
 
     # Error handling
     test_ssh_failure_propagates

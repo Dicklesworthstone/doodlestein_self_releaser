@@ -1435,30 +1435,70 @@ act_get_native_host() {
         fi
     fi
 
+    local configured_host=""
     if declare -F config_get_host_for_platform &>/dev/null; then
-        local configured_host
         configured_host=$(config_get_host_for_platform "$platform" 2>/dev/null | tr -d '"' || true)
-        if [[ -n "$configured_host" && "$configured_host" != "null" ]]; then
-            printf '%s\n' "$configured_host"
+        # A plain `[[ ... ]] && x=` would leave the whole `if` block returning
+        # non-zero on the common path, which bites the moment anything sources
+        # this under `set -e`.
+        if [[ "$configured_host" == "null" ]]; then
+            configured_host=""
+        fi
+    fi
+
+    # Spread across every host that can build this platform, preferring the one
+    # named in platform_mapping. The selector drops hosts that are disabled or
+    # failing health checks (5-minute cache) and scores the rest by free build
+    # slots, so a second same-platform box absorbs overflow and covers the first
+    # one being asleep. Any failure here falls through to the static mapping —
+    # a stale health cache must never be able to block a build.
+    if [[ "${DSR_DISABLE_HOST_SELECTOR:-0}" != "1" ]] && declare -F selector_choose_host &>/dev/null; then
+        local selector_args=(--target "$platform")
+        [[ -n "$configured_host" ]] && selector_args+=(--prefer "$configured_host")
+
+        local selected_host
+        selected_host=$(selector_choose_host "${selector_args[@]}" 2>/dev/null || true)
+        if [[ -n "$selected_host" && "$selected_host" != "null" ]]; then
+            printf '%s\n' "$selected_host"
             return 0
         fi
     fi
 
+    if [[ -n "$configured_host" ]]; then
+        printf '%s\n' "$configured_host"
+        return 0
+    fi
+
+    # Last resort. config_get_host_for_platform also returns empty when the
+    # mapped host is explicitly `enabled: false`, so re-check before handing
+    # back a default the operator deliberately turned off.
+    local default_host=""
     case "$platform" in
         linux/amd64|linux/arm64)
-            echo "trj"
+            default_host="trj"
             ;;
         darwin/arm64|darwin/amd64)
-            echo "mmini"
+            default_host="mmini"
             ;;
         windows/amd64|windows/arm64)
-            echo "wlap"
+            default_host="wlap"
             ;;
         *)
             echo ""
             return 1
             ;;
     esac
+
+    if [[ -f "${DSR_HOSTS_FILE:-}" ]] && command -v yq &>/dev/null; then
+        local default_enabled
+        default_enabled=$(DSR_HOST="$default_host" yq -r '.hosts[strenv(DSR_HOST)].enabled' "$DSR_HOSTS_FILE" 2>/dev/null || echo null)
+        if [[ "$default_enabled" == "false" ]]; then
+            echo ""
+            return 1
+        fi
+    fi
+
+    echo "$default_host"
 }
 
 # Get build strategy for a tool/platform
