@@ -77,17 +77,23 @@ dsr release verify <tool> <v> # Verify release assets
 
 ## Build Hosts
 
+Hosts are whatever you define in `hosts.yaml`; the ids below are the
+conventional ones used throughout these docs.
+
 | Host | Platform | Connection | Purpose |
 |------|----------|------------|---------|
 | trj | Linux x64 | local | Primary build host, act runner |
-| ts1 | Linux x64 | SSH via Tailscale | 64-core, lightly loaded — preferred linux builder |
-| mmini | macOS arm64 | SSH via Tailscale | Native macOS builds |
-| wlap | Windows x64 | SSH via Tailscale (`surfacebookje`) | Native Windows builds. Surface Book 2, 8 cores — **disk runs tight (~40 GB free)** |
-| wsurf | Windows x64 | SSH via Tailscale (`oldsurface`) | Second Windows builder, Surface Book 3 |
+| ts1 | Linux x64 | SSH | Secondary Linux builder |
+| mmini | macOS arm64 | SSH | Native macOS builds |
+| wlap | Windows x64 | SSH | Native Windows builds |
 
-**`hosts.yaml` exists in two places** — `~/.config/dsr/hosts.yaml` on
-**mac-mini-max** and on **trj**. They are independent files. A host added to one
-is invisible to the other, so edit both.
+More than one host may share a platform — a second `windows/amd64` or
+`linux/amd64` entry is picked up automatically by the selector below, giving
+overflow capacity and failover when one host is unhealthy or asleep.
+
+**`hosts.yaml` is per-machine.** Each machine that runs `dsr` reads its own
+`~/.config/dsr/hosts.yaml`. If you drive releases from more than one
+orchestrator, a host added on one is invisible to the other — edit both.
 
 ### Host selection
 
@@ -217,8 +223,8 @@ DSR_DISABLE_HOST_SELECTOR=1 dsr build <tool>   # force the static mapping
 
 A host is dropped from consideration when it is `enabled: false`, unhealthy
 (disk >95% used is an *error*; >90% is only a warning), or has no free slots.
-Remember there are two `hosts.yaml` files (mac-mini-max and trj) — confirm you
-edited the one belonging to the machine you are running `dsr` on.
+`hosts.yaml` is per-machine — confirm you edited the one belonging to the
+machine you are running `dsr` on.
 
 ### Build Fails
 
