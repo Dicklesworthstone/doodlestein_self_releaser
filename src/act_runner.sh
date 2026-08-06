@@ -241,25 +241,26 @@ _act_read_hex_bytes() {
     printf '%s\n' "$hex"
 }
 
-_act_validate_target_binary() {
-    local file="$1"
+_act_validate_target_binary_reader() {
+    local label="$1"
     local target="$2"
-    local size header machine pe_offset_hex pe_offset optional_magic
+    local size="$3"
+    local executable="$4"
+    local reader="$5"
+    shift 5
+    local reader_args=("$@")
+    local header machine pe_offset_hex pe_offset optional_magic
 
-    if [[ ! -f "$file" || -L "$file" ]]; then
-        _log_error "Target primary is not a regular non-symlink file: $file"
-        return 4
-    fi
-    size=$(_act_file_size "$file")
     if [[ ! "$size" =~ ^[1-9][0-9]*$ ]]; then
-        _log_error "Target primary has no readable bytes: $file"
+        _log_error "Target primary has no readable bytes: $label"
         return 4
     fi
 
     case "$target" in
         linux/amd64|linux/arm64)
-            if ((size < 64)) || ! header=$(_act_read_hex_bytes "$file" 0 20); then
-                _log_error "Target primary is not a complete ELF64 header: $file"
+            if ((size < 64)) || \
+               ! header=$("$reader" "${reader_args[@]}" 0 20); then
+                _log_error "Target primary is not a complete ELF64 header: $label"
                 return 4
             fi
             machine="${header:36:4}"
@@ -267,46 +268,48 @@ _act_validate_target_binary() {
                   "${header:10:2}" != "01" ]] || \
                { [[ "$target" == "linux/amd64" ]] && [[ "$machine" != "3e00" ]]; } || \
                { [[ "$target" == "linux/arm64" ]] && [[ "$machine" != "b700" ]]; }; then
-                _log_error "Target primary ELF format/architecture does not match $target: $file"
+                _log_error "Target primary ELF format/architecture does not match $target: $label"
                 return 4
             fi
-            if [[ ! -x "$file" ]]; then
-                _log_error "Unix target primary is not executable: $file"
+            if [[ "$executable" != "true" ]]; then
+                _log_error "Unix target primary is not executable: $label"
                 return 4
             fi
             ;;
         darwin/amd64|darwin/arm64)
-            if ((size < 32)) || ! header=$(_act_read_hex_bytes "$file" 0 8); then
-                _log_error "Target primary is not a complete Mach-O 64 header: $file"
+            if ((size < 32)) || \
+               ! header=$("$reader" "${reader_args[@]}" 0 8); then
+                _log_error "Target primary is not a complete Mach-O 64 header: $label"
                 return 4
             fi
             machine="${header:8:8}"
             if [[ "${header:0:8}" != "cffaedfe" ]] || \
                { [[ "$target" == "darwin/amd64" ]] && [[ "$machine" != "07000001" ]]; } || \
                { [[ "$target" == "darwin/arm64" ]] && [[ "$machine" != "0c000001" ]]; }; then
-                _log_error "Target primary Mach-O format/architecture does not match $target: $file"
+                _log_error "Target primary Mach-O format/architecture does not match $target: $label"
                 return 4
             fi
-            if [[ ! -x "$file" ]]; then
-                _log_error "Unix target primary is not executable: $file"
+            if [[ "$executable" != "true" ]]; then
+                _log_error "Unix target primary is not executable: $label"
                 return 4
             fi
             ;;
         windows/amd64|windows/arm64)
-            if ((size < 90)) || [[ "$(_act_read_hex_bytes "$file" 0 2 2>/dev/null || true)" != "4d5a" ]] || \
-               ! pe_offset_hex=$(_act_read_hex_bytes "$file" 60 4); then
-                _log_error "Target primary is not a complete PE32+ executable: $file"
+            if ((size < 90)) || \
+               [[ "$("$reader" "${reader_args[@]}" 0 2 2>/dev/null || true)" != "4d5a" ]] || \
+               ! pe_offset_hex=$("$reader" "${reader_args[@]}" 60 4); then
+                _log_error "Target primary is not a complete PE32+ executable: $label"
                 return 4
             fi
             pe_offset=$((0x${pe_offset_hex:6:2}${pe_offset_hex:4:2}${pe_offset_hex:2:2}${pe_offset_hex:0:2}))
             if ((pe_offset < 64 || pe_offset + 26 > size)) || \
-               [[ "$(_act_read_hex_bytes "$file" "$pe_offset" 4 2>/dev/null || true)" != "50450000" ]] || \
-               ! machine=$(_act_read_hex_bytes "$file" "$((pe_offset + 4))" 2) || \
-               ! optional_magic=$(_act_read_hex_bytes "$file" "$((pe_offset + 24))" 2) || \
+               [[ "$("$reader" "${reader_args[@]}" "$pe_offset" 4 2>/dev/null || true)" != "50450000" ]] || \
+               ! machine=$("$reader" "${reader_args[@]}" "$((pe_offset + 4))" 2) || \
+               ! optional_magic=$("$reader" "${reader_args[@]}" "$((pe_offset + 24))" 2) || \
                [[ "$optional_magic" != "0b02" ]] || \
                { [[ "$target" == "windows/amd64" ]] && [[ "$machine" != "6486" ]]; } || \
                { [[ "$target" == "windows/arm64" ]] && [[ "$machine" != "64aa" ]]; }; then
-                _log_error "Target primary PE format/architecture does not match $target: $file"
+                _log_error "Target primary PE format/architecture does not match $target: $label"
                 return 4
             fi
             ;;
@@ -315,6 +318,105 @@ _act_validate_target_binary() {
             return 4
             ;;
     esac
+}
+
+_act_validate_target_binary() {
+    local file="$1"
+    local target="$2"
+
+    if [[ ! -f "$file" || -L "$file" ]]; then
+        _log_error "Target primary is not a regular non-symlink file: $file"
+        return 4
+    fi
+
+    local size executable=false
+    size=$(_act_file_size "$file")
+    [[ -x "$file" ]] && executable=true
+    _act_validate_target_binary_reader \
+        "$file" "$target" "$size" "$executable" _act_read_hex_bytes "$file"
+}
+
+_act_archive_entry_stream() {
+    local archive="$1"
+    local format="$2"
+    local entry="$3"
+
+    case "$format" in
+        tar.gz) tar -xOzf "$archive" "$entry" ;;
+        tar.xz) tar -xOJf "$archive" "$entry" ;;
+        zip) unzip -p "$archive" "$entry" ;;
+        *) return 4 ;;
+    esac
+}
+
+_act_read_archive_hex_bytes() {
+    local archive="$1"
+    local format="$2"
+    local entry="$3"
+    local offset="$4"
+    local count="$5"
+    local hex
+
+    if [[ ! "$offset" =~ ^[0-9]+$ || ! "$count" =~ ^[1-9][0-9]*$ ]]; then
+        return 4
+    fi
+    # od stops after COUNT bytes, which may make the archive reader observe a
+    # harmless SIGPIPE. Validate the exact byte count below; a separate full
+    # stream pass establishes the payload size before this helper is called.
+    if ! hex=$(
+        set +o pipefail
+        _act_archive_entry_stream "$archive" "$format" "$entry" 2>/dev/null | \
+            LC_ALL=C od -An -v -j "$offset" -N "$count" -tx1 2>/dev/null | \
+            tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'
+    ); then
+        return 4
+    fi
+    if [[ ${#hex} -ne $((count * 2)) || ! "$hex" =~ ^[0-9a-f]+$ ]]; then
+        return 4
+    fi
+    printf '%s\n' "$hex"
+}
+
+_act_validate_target_archive() {
+    local archive="$1"
+    local format="$2"
+    local expected_entry="$3"
+    local target="$4"
+    local entries size mode executable=false
+
+    case "$format" in
+        tar.gz)
+            command -v tar &>/dev/null || return 4
+            entries=$(tar -tzf "$archive" 2>/dev/null) || return 4
+            mode=$(tar -tvzf "$archive" 2>/dev/null | awk 'NR == 1 { print $1 }') || return 4
+            ;;
+        tar.xz)
+            command -v tar &>/dev/null || return 4
+            entries=$(tar -tJf "$archive" 2>/dev/null) || return 4
+            mode=$(tar -tvJf "$archive" 2>/dev/null | awk 'NR == 1 { print $1 }') || return 4
+            ;;
+        zip)
+            command -v unzip &>/dev/null || return 4
+            entries=$(unzip -Z1 "$archive" 2>/dev/null) || return 4
+            mode=$(unzip -Z -l "$archive" 2>/dev/null | \
+                awk '$1 ~ /^-/ { print $1; exit }') || return 4
+            ;;
+        *)
+            _log_error "Unsupported strict release archive format: $format"
+            return 4
+            ;;
+    esac
+
+    if [[ "$entries" != "$expected_entry" ]]; then
+        _log_error "Strict release archive must contain exactly $expected_entry: $archive"
+        return 4
+    fi
+    size=$(_act_archive_entry_stream "$archive" "$format" "$expected_entry" 2>/dev/null | \
+        wc -c | tr -d '[:space:]') || return 4
+    [[ "$mode" == *x* ]] && executable=true
+    _act_validate_target_binary_reader \
+        "$archive::$expected_entry" "$target" "$size" "$executable" \
+        _act_read_archive_hex_bytes "$archive" "$format" "$expected_entry"
 }
 
 _act_stage_contract_primary() {
@@ -435,6 +537,8 @@ _act_stage_contract_primary() {
         return 4
     fi
     local staged_path="$stage_dir/$expected_name"
+    local staged_format
+    staged_format=$(_act_archive_format "$expected_name")
     if [[ -e "$staged_path" || -L "$staged_path" ]]; then
         _log_error "Refusing existing release contract staging destination: $staged_path"
         return 4
@@ -446,12 +550,35 @@ _act_stage_contract_primary() {
         set -C
         umask 077
         exec 9> "$staged_path" || exit 4
-        cat -- "$source_path" >&9 || exit 4
-        if [[ -x "$source_path" ]]; then
-            chmod 700 /dev/fd/9 || exit 4
-        else
-            chmod 600 /dev/fd/9 || exit 4
-        fi
+        case "$staged_format" in
+            none)
+                cat -- "$source_path" >&9 || exit 4
+                if [[ -x "$source_path" ]]; then
+                    chmod 700 /dev/fd/9 || exit 4
+                else
+                    chmod 600 /dev/fd/9 || exit 4
+                fi
+                ;;
+            tar.gz)
+                command -v tar &>/dev/null || exit 4
+                tar -czf - -C "$(dirname "$source_path")" \
+                    "$(basename "$source_path")" >&9 || exit 4
+                chmod 600 /dev/fd/9 || exit 4
+                ;;
+            tar.xz)
+                command -v tar &>/dev/null || exit 4
+                tar -cJf - -C "$(dirname "$source_path")" \
+                    "$(basename "$source_path")" >&9 || exit 4
+                chmod 600 /dev/fd/9 || exit 4
+                ;;
+            zip)
+                command -v zip &>/dev/null || exit 4
+                (cd "$(dirname "$source_path")" && \
+                    zip -q - "$(basename "$source_path")") >&9 || exit 4
+                chmod 600 /dev/fd/9 || exit 4
+                ;;
+            *) exit 4 ;;
+        esac
         exec 9>&-
     ); then
         _log_error "Unable to stage release primary for $target"
@@ -461,8 +588,21 @@ _act_stage_contract_primary() {
         _log_error "Staged release primary is not a regular file: $staged_path"
         return 4
     fi
-    if ! _act_validate_target_binary "$staged_path" "$target"; then
-        return 4
+    if [[ "$staged_format" == "none" ]]; then
+        if ! _act_validate_target_binary "$staged_path" "$target"; then
+            return 4
+        fi
+    else
+        if ! _act_validate_target_archive \
+            "$staged_path" "$staged_format" "$expected_input_name" "$target"; then
+            return 4
+        fi
+        if ! _act_archive_entry_stream \
+            "$staged_path" "$staged_format" "$expected_input_name" | \
+            cmp -s -- "$source_path" -; then
+            _log_error "Staged release archive payload does not match its collected binary: $staged_path"
+            return 4
+        fi
     fi
 
     local source_sha_after source_size_after source_identity_after
@@ -486,10 +626,14 @@ _act_stage_contract_primary() {
     fi
 
     if ! [[ "$source_sha_before" == "$source_sha_after" &&
-            "$source_size_before" == "$source_size_after" &&
-            "$source_sha_before" == "$staged_sha" &&
-            "$source_size_before" == "$staged_size" ]]; then
+            "$source_size_before" == "$source_size_after" ]]; then
         _log_error "Release primary changed while staging for $target"
+        return 4
+    fi
+    if [[ "$staged_format" == "none" ]] && \
+       ! [[ "$source_sha_before" == "$staged_sha" &&
+             "$source_size_before" == "$staged_size" ]]; then
+        _log_error "Raw staged release primary does not match its collected binary for $target"
         return 4
     fi
 
@@ -5520,6 +5664,15 @@ _act_generate_contract_manifest() {
     git_ref=$(jq -r '.git_ref // empty' <<< "$result_json")
     status=$(jq -r '.status // empty' <<< "$result_json")
 
+    local config_file="$ACT_REPOS_DIR/${tool}.yaml"
+    local binary_name
+    if [[ ! -f "$config_file" ]] || \
+       ! binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null) || \
+       ! _act_is_safe_basename "$binary_name"; then
+        _log_error "Strict release manifest requires a safe configured binary_name"
+        return 4
+    fi
+
     local source_dependencies_json
     if ! _act_is_uuid "$run_id"; then
         _log_error "Strict release manifest requires a schema-valid run UUID"
@@ -5575,7 +5728,8 @@ _act_generate_contract_manifest() {
     fi
 
     local artifacts=()
-    local target expected_name target_json artifact_path artifact_dir
+    local target expected_name expected_input_name format
+    local target_json artifact_path artifact_dir
     local frozen_sha frozen_size frozen_identity
     while IFS= read -r target; do
         [[ -n "$target" ]] || continue
@@ -5584,6 +5738,9 @@ _act_generate_contract_manifest() {
             _log_error "Unsafe release asset basename for $target: $expected_name"
             return 4
         fi
+        expected_input_name="$binary_name"
+        [[ "$target" == windows/* ]] && expected_input_name="${binary_name%.exe}.exe"
+        format=$(_act_archive_format "$expected_name")
 
         target_json=$(jq -c --arg target "$target" '.targets[] | select(.platform == $target)' <<< "$result_json")
         artifact_path=$(jq -r '.artifact_path // empty' <<< "$target_json")
@@ -5667,12 +5824,19 @@ _act_generate_contract_manifest() {
 
         local identity_before identity_after
         if ! identity_before=$(_act_file_identity "$primary_path") || \
-           [[ "$identity_before" != "$frozen_identity" ]] || \
-           ! _act_validate_target_binary "$primary_path" "$target"; then
+           [[ "$identity_before" != "$frozen_identity" ]]; then
+            return 4
+        fi
+        if [[ "$format" == "none" ]]; then
+            if ! _act_validate_target_binary "$primary_path" "$target"; then
+                return 4
+            fi
+        elif ! _act_validate_target_archive \
+            "$primary_path" "$format" "$expected_input_name" "$target"; then
             return 4
         fi
 
-        local sha size format artifact_json
+        local sha size artifact_json
         if ! sha=$(_act_sha256 "$primary_path") || [[ ! "$sha" =~ ^[a-f0-9]{64}$ ]]; then
             _log_error "Unable to compute SHA256 for release artifact: $primary_path"
             return 4
@@ -5690,7 +5854,6 @@ _act_generate_contract_manifest() {
             _log_error "Release artifact changed after strict staging: $primary_path"
             return 4
         fi
-        format=$(_act_archive_format "$expected_name")
         [[ "$format" == "none" ]] && format="binary"
 
         if ! artifact_json=$(jq -nc \

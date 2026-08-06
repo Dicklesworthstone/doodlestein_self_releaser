@@ -148,6 +148,23 @@ release_contract:
     windows/arm64: focr-aarch64-pc-windows-msvc.exe
 EOF
 
+cat > "$ACT_REPOS_DIR/focrarchive.yaml" << EOF
+tool_name: focrarchive
+repo: Test/focrarchive
+local_path: $TEMP_DIR/source-repo
+language: rust
+binary_name: focr
+build_cmd: cargo build --release
+targets:
+  - linux/amd64
+  - windows/amd64
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: focr-1.0.0-linux_amd64.tar.gz
+    windows/amd64: focr-1.0.0-windows_amd64.zip
+EOF
+
 echo "== act_get_build_cmd =="
 
 # Test get_build_cmd
@@ -991,6 +1008,157 @@ if $staged_valid; then
     pass "strict orchestration stages raw native binaries under exact configured basenames"
 else
     fail "strict orchestration did not stage every configured primary"
+fi
+
+archive_contract=$(config_get_release_contract_json "focrarchive")
+archive_linux_source="$TEMP_DIR/archive-linux-source/focr"
+archive_windows_source="$TEMP_DIR/archive-windows-source/focr.exe"
+mkdir -p "$(dirname "$archive_linux_source")" "$(dirname "$archive_windows_source")"
+write_minimal_target_binary "$archive_linux_source" "linux/amd64"
+write_minimal_target_binary "$archive_windows_source" "windows/amd64"
+
+archive_linux_result=$(with_collection_receipt \
+    "$(jq -nc --arg path "$archive_linux_source" '{
+        platform: "linux/amd64", status: "success", artifact_path: $path, artifact_paths: [$path]
+    }')" "$archive_linux_source")
+archive_windows_result=$(with_collection_receipt \
+    "$(jq -nc --arg path "$archive_windows_source" '{
+        platform: "windows/amd64", status: "success", artifact_path: $path, artifact_paths: [$path]
+    }')" "$archive_windows_source")
+
+archive_linux_staged=$(_act_stage_contract_primary \
+    "focrarchive" "v1.0.0" "550e8400-e29b-41d4-a716-446655440040" \
+    "linux/amd64" "$archive_linux_result" "$archive_contract")
+archive_windows_staged=$(_act_stage_contract_primary \
+    "focrarchive" "v1.0.0" "550e8400-e29b-41d4-a716-446655440040" \
+    "windows/amd64" "$archive_windows_result" "$archive_contract")
+archive_linux_path=$(jq -r '.artifact_path' <<< "$archive_linux_staged")
+archive_windows_path=$(jq -r '.artifact_path' <<< "$archive_windows_staged")
+
+if [[ "$(basename "$archive_linux_path")" == "focr-1.0.0-linux_amd64.tar.gz" ]] && \
+   [[ "$(tar -tzf "$archive_linux_path")" == "focr" ]] && \
+   tar -xOzf "$archive_linux_path" focr | cmp -s -- "$archive_linux_source" -; then
+    pass "strict staging packages a Linux binary as the contracted one-file tar.gz"
+else
+    fail "strict staging did not produce the contracted one-file Linux tar.gz"
+fi
+
+if [[ "$(basename "$archive_windows_path")" == "focr-1.0.0-windows_amd64.zip" ]] && \
+   [[ "$(unzip -Z1 "$archive_windows_path")" == "focr.exe" ]] && \
+   unzip -p "$archive_windows_path" focr.exe | cmp -s -- "$archive_windows_source" -; then
+    pass "strict staging packages a Windows binary as the contracted one-file zip"
+else
+    fail "strict staging did not produce the contracted one-file Windows zip"
+fi
+
+raw_archive_impostor="$TEMP_DIR/raw-archive-impostor.tar.gz"
+cp "$archive_linux_source" "$raw_archive_impostor"
+if ! _act_validate_target_archive \
+    "$raw_archive_impostor" "tar.gz" "focr" "linux/amd64" 2>/dev/null; then
+    pass "strict archive validation rejects raw executable bytes under an archive name"
+else
+    fail "strict archive validation accepted raw executable bytes as tar.gz"
+fi
+
+multi_member_dir="$TEMP_DIR/multi-member-archive"
+mkdir -p "$multi_member_dir"
+cp "$archive_linux_source" "$multi_member_dir/focr"
+printf 'unexpected member\n' > "$multi_member_dir/extra.txt"
+tar -czf "$TEMP_DIR/multi-member.tar.gz" -C "$multi_member_dir" focr extra.txt
+if ! _act_validate_target_archive \
+    "$TEMP_DIR/multi-member.tar.gz" "tar.gz" "focr" "linux/amd64" 2>/dev/null; then
+    pass "strict archive validation rejects additional archive members"
+else
+    fail "strict archive validation accepted a multi-member primary archive"
+fi
+
+wrong_arch_archive_dir="$TEMP_DIR/wrong-arch-archive"
+mkdir -p "$wrong_arch_archive_dir"
+write_minimal_target_binary "$wrong_arch_archive_dir/focr" "linux/arm64"
+tar -czf "$TEMP_DIR/wrong-arch.tar.gz" -C "$wrong_arch_archive_dir" focr
+if ! _act_validate_target_archive \
+    "$TEMP_DIR/wrong-arch.tar.gz" "tar.gz" "focr" "linux/amd64" 2>/dev/null; then
+    pass "strict archive validation rejects a wrong-architecture member"
+else
+    fail "strict archive validation accepted a wrong-architecture member"
+fi
+
+nonexec_archive_dir="$TEMP_DIR/nonexec-archive"
+mkdir -p "$nonexec_archive_dir"
+cp "$archive_linux_source" "$nonexec_archive_dir/focr"
+chmod 644 "$nonexec_archive_dir/focr"
+tar -czf "$TEMP_DIR/nonexec.tar.gz" -C "$nonexec_archive_dir" focr
+if ! _act_validate_target_archive \
+    "$TEMP_DIR/nonexec.tar.gz" "tar.gz" "focr" "linux/amd64" 2>/dev/null; then
+    pass "strict archive validation rejects a non-executable Unix member"
+else
+    fail "strict archive validation accepted a non-executable Unix member"
+fi
+
+tar -cJf "$TEMP_DIR/valid.tar.xz" -C "$(dirname "$archive_linux_source")" focr
+if _act_validate_target_archive \
+    "$TEMP_DIR/valid.tar.xz" "tar.xz" "focr" "linux/amd64" 2>/dev/null; then
+    pass "strict archive validation accepts a valid one-file tar.xz"
+else
+    fail "strict archive validation rejected a valid one-file tar.xz"
+fi
+
+payload_mismatch_status=0
+(
+    cmp() { return 1; }
+    _act_stage_contract_primary \
+        "focrarchive" "v1.0.0" "550e8400-e29b-41d4-a716-446655440041" \
+        "linux/amd64" "$archive_linux_result" "$archive_contract"
+) >/dev/null 2>&1 || payload_mismatch_status=$?
+if [[ $payload_mismatch_status -eq 4 ]]; then
+    pass "strict staging rejects an archive payload that fails source-byte comparison"
+else
+    fail "strict staging accepted an archive payload mismatch"
+fi
+
+archive_manifest_input=$(jq -nc \
+    --arg sha "$contract_sha" \
+    --arg ref "$contract_ref" \
+    --argjson linux "$archive_linux_staged" \
+    --argjson windows "$archive_windows_staged" '
+    {
+        tool: "focrarchive",
+        version: "v1.0.0",
+        run_id: "550e8400-e29b-41d4-a716-446655440040",
+        git_sha: $sha,
+        git_ref: $ref,
+        source_dependencies: [],
+        status: "success",
+        summary: {total: 2, success: 2, failed: 0},
+        targets: [$linux, $windows]
+    }
+')
+archive_manifest=$(
+    (
+        ACT_REPO_LOCAL_PATH="$TEMP_DIR/source-repo"
+        git() {
+            case "$*" in
+                *"rev-parse --verify HEAD^{commit}"*|*"rev-parse --verify refs/tags/v1.0.0^{commit}"*)
+                    printf '%s\n' "$contract_sha"
+                    ;;
+                *"status --porcelain --untracked-files=all"*) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        act_generate_manifest "$archive_manifest_input" ""
+    ) 2>/dev/null
+)
+if jq -e '
+    .status == "success" and
+    .summary == {total: 2, success: 2, failed: 0} and
+    ([.artifacts[] | {target, archive_format}] | sort_by(.target)) == [
+        {target: "linux/amd64", archive_format: "tar.gz"},
+        {target: "windows/amd64", archive_format: "zip"}
+    ]
+' <<< "$archive_manifest" &>/dev/null; then
+    pass "strict manifest validates and records contracted archive formats"
+else
+    fail "strict manifest rejected valid contracted archives: $archive_manifest"
 fi
 
 changing_source="$TEMP_DIR/changing-source/focr"
