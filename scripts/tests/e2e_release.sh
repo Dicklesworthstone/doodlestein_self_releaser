@@ -146,6 +146,7 @@ seed_strict_release_fixture() {
     unset STRICT_CREATE_POST_COMMIT_ERROR STRICT_CREATE_OBSERVED_NONEXACT
     unset STRICT_UPLOAD_COMMIT_ERROR_ON_NAME
     unset STRICT_FLIP_PUBLIC_DURING_UPLOAD STRICT_FLIP_PUBLIC_ON_RELEASE_GET
+    unset STRICT_MUTATE_ADDITIONAL_AFTER_FIRST_UPLOAD
     unset STRICT_CREATE_COMPETITOR_DRAFT
     unset STRICT_RELEASE_LIST_SCENARIO
     export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
@@ -181,6 +182,8 @@ release_contract:
   exact_primary_assets:
     linux/amd64: ${tool}-linux-amd64
     darwin/arm64: ${tool}-darwin-arm64
+  exact_additional_assets:
+    - ${tool}.sbom.json
 YAML
 
     printf 'linux release binary\n' > "$STRICT_ARTIFACTS_DIR/${tool}-linux-amd64"
@@ -188,11 +191,13 @@ YAML
     printf 'must not upload\n' > "$STRICT_ARTIFACTS_DIR/${tool}-alias"
     printf '{"bomFormat":"CycloneDX"}\n' > "$STRICT_ARTIFACTS_DIR/${tool}.sbom.json"
 
-    local linux_sha darwin_sha linux_size darwin_size
+    local linux_sha darwin_sha additional_sha linux_size darwin_size additional_size
     linux_sha=$(test_sha256 "$STRICT_ARTIFACTS_DIR/${tool}-linux-amd64")
     darwin_sha=$(test_sha256 "$STRICT_ARTIFACTS_DIR/${tool}-darwin-arm64")
+    additional_sha=$(test_sha256 "$STRICT_ARTIFACTS_DIR/${tool}.sbom.json")
     linux_size=$(test_file_size "$STRICT_ARTIFACTS_DIR/${tool}-linux-amd64")
     darwin_size=$(test_file_size "$STRICT_ARTIFACTS_DIR/${tool}-darwin-arm64")
+    additional_size=$(test_file_size "$STRICT_ARTIFACTS_DIR/${tool}.sbom.json")
 
     jq -nc \
         --arg tool "$tool" \
@@ -229,21 +234,27 @@ YAML
     STRICT_REMOTE_ASSETS=$(jq -nc \
         --arg linux_sha "$linux_sha" \
         --arg darwin_sha "$darwin_sha" \
+        --arg additional_sha "$additional_sha" \
         --arg linux_sidecar_sha "$linux_sidecar_sha" \
         --arg darwin_sidecar_sha "$darwin_sidecar_sha" \
         --argjson linux_size "$linux_size" \
         --argjson darwin_size "$darwin_size" \
+        --argjson additional_size "$additional_size" \
         --argjson linux_sidecar_size "$linux_sidecar_size" \
         --argjson darwin_sidecar_size "$darwin_sidecar_size" '
         [
             {id: 1, name: "test-tool-linux-amd64", size: $linux_size, state: "uploaded", digest: ("sha256:" + $linux_sha)},
             {id: 2, name: "test-tool-linux-amd64.sha256", size: $linux_sidecar_size, state: "uploaded", digest: ("sha256:" + $linux_sidecar_sha)},
             {id: 3, name: "test-tool-darwin-arm64", size: $darwin_size, state: "uploaded", digest: ("sha256:" + $darwin_sha)},
-            {id: 4, name: "test-tool-darwin-arm64.sha256", size: $darwin_sidecar_size, state: "uploaded", digest: ("sha256:" + $darwin_sidecar_sha)}
+            {id: 4, name: "test-tool-darwin-arm64.sha256", size: $darwin_sidecar_size, state: "uploaded", digest: ("sha256:" + $darwin_sidecar_sha)},
+            {id: 5, name: "test-tool.sbom.json", size: $additional_size, state: "uploaded", digest: ("sha256:" + $additional_sha)}
         ]
     ')
     STRICT_EXPECTED_UPLOAD_ASSETS="$STRICT_REMOTE_ASSETS"
+    STRICT_ADDITIONAL_ASSET_PATH="$STRICT_ARTIFACTS_DIR/${tool}.sbom.json"
+    STRICT_ADDITIONAL_MUTATED_MARKER="$TEST_TMPDIR/strict-additional-mutated"
     export STRICT_REMOTE_ASSETS STRICT_EXPECTED_UPLOAD_ASSETS
+    export STRICT_ADDITIONAL_ASSET_PATH STRICT_ADDITIONAL_MUTATED_MARKER
 }
 
 create_strict_github_mocks() {
@@ -596,6 +607,11 @@ create_strict_github_mocks() {
             return 0
         fi
         : > "$STRICT_UPLOAD_STARTED_FILE"
+        if [[ "${STRICT_MUTATE_ADDITIONAL_AFTER_FIRST_UPLOAD:-0}" == "1" && \
+              ! -e "$STRICT_ADDITIONAL_MUTATED_MARKER" ]]; then
+            printf '{"bomFormat":"CycloneDY"}\n' > "$STRICT_ADDITIONAL_ASSET_PATH"
+            : > "$STRICT_ADDITIONAL_MUTATED_MARKER"
+        fi
         if [[ "${STRICT_FLIP_PUBLIC_DURING_UPLOAD:-0}" == "1" && \
               ! -e "$STRICT_PUBLIC_FLIP_MARKER" ]]; then
             printf 'false\n' > "$STRICT_RELEASE_DRAFT_STATE"
@@ -867,7 +883,8 @@ test_strict_release_uploads_exact_set_then_publishes() {
         test-tool-darwin-arm64 \
         test-tool-darwin-arm64.sha256 \
         test-tool-linux-amd64 \
-        test-tool-linux-amd64.sha256 | sort)
+        test-tool-linux-amd64.sha256 \
+        test-tool.sbom.json | sort)
     reads=$(cat "$STRICT_READ_LOG" 2>/dev/null || true)
 
     if [[ $status -eq 0 && "$uploads" == "$expected_uploads" ]] && \
@@ -877,12 +894,83 @@ test_strict_release_uploads_exact_set_then_publishes() {
         [[ "$reads" == $'release-get:true\nrelease-get:true\nrelease-get:false' ]] && \
         [[ -f "$STRICT_ARTIFACTS_DIR/test-tool-linux-amd64.sha256" ]] && \
         [[ -f "$STRICT_ARTIFACTS_DIR/test-tool-darwin-arm64.sha256" ]]; then
-        pass "strict release uploads only primaries+sidecars, verifies draft, publishes, and re-verifies"
+        pass "strict release uploads only primaries, sidecars, and declared additions before publishing"
     else
         fail "strict release should stage and publish only the exact contracted asset set"
         echo "status: $status"
         echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
         echo "reads: $reads"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_additional_asset_mutated_after_preflight() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    export STRICT_MUTATE_ADDITIONAL_AFTER_FIRST_UPLOAD=1
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -ne 0 && -e "$STRICT_ADDITIONAL_MUTATED_MARKER" ]] && \
+        ! grep -q '^upload:test-tool.sbom.json$' "$STRICT_MUTATION_LOG" 2>/dev/null && \
+        ! grep -q '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null && \
+        exec_stderr_contains "Strict asset checksum changed after preflight"; then
+        pass "strict release rejects a declared additional asset changed after preflight"
+    else
+        fail "strict release must reject a post-preflight additional-asset mutation"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_missing_additional_asset_before_mutation() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    cat > "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" << YAML
+tool_name: test-tool
+repo: testuser/test-tool
+local_path: $STRICT_REPO_DIR
+language: go
+build_cmd: go build ./...
+binary_name: test-tool
+targets:
+  - linux/amd64
+  - darwin/arm64
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: test-tool-linux-amd64
+    darwin/arm64: test-tool-darwin-arm64
+  exact_additional_assets:
+    - test-tool.missing.sbom.json
+YAML
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -ne 0 && ! -s "$STRICT_MUTATION_LOG" ]] && \
+        exec_stderr_contains "Additional release asset must be a regular non-symlink file"; then
+        pass "strict release rejects a missing declared addition before GitHub mutation"
+    else
+        fail "strict release must fail closed on a missing additional asset"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
         echo "stderr: $(exec_stderr | tail -20)"
     fi
 
@@ -944,7 +1032,7 @@ test_strict_upload_commit_then_error_reconciles_exact_draft() {
        exec_stdout | jq -e '
            .details.draft == false and
            .details.failed == 0 and
-           .details.success == 4 and
+           .details.success == 5 and
            any(.details.assets_uploaded[];
                .name == "test-tool-linux-amd64" and .status == "reconciled")
        ' >/dev/null 2>&1; then
@@ -1945,6 +2033,8 @@ echo ""
 if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     echo "Strict Release Contract Tests (mocked GitHub):"
     test_strict_release_uploads_exact_set_then_publishes
+    test_strict_release_rejects_additional_asset_mutated_after_preflight
+    test_strict_release_rejects_missing_additional_asset_before_mutation
     test_strict_create_commit_then_error_adopts_exact_empty_draft
     test_strict_upload_commit_then_error_reconciles_exact_draft
     test_strict_create_error_rejects_nonexact_observed_draft
@@ -2006,6 +2096,8 @@ test_release_missing_artifacts_dir
 echo ""
 echo "Strict Release Contract Tests (mocked GitHub):"
 test_strict_release_uploads_exact_set_then_publishes
+test_strict_release_rejects_additional_asset_mutated_after_preflight
+test_strict_release_rejects_missing_additional_asset_before_mutation
 test_strict_create_commit_then_error_adopts_exact_empty_draft
 test_strict_upload_commit_then_error_reconciles_exact_draft
 test_strict_create_error_rejects_nonexact_observed_draft

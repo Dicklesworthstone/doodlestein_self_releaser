@@ -65,7 +65,9 @@ artifact_naming: "${name}-${version}-${os}-${arch}"
 
 # Optional: fail-closed release asset contract. When enabled, every configured
 # target must map to one unique primary release asset basename, and each primary
-# must have a sibling `<basename>.sha256` checksum asset.
+# must have a sibling `<basename>.sha256` checksum asset. Additional frozen
+# assets are optional; DSR verifies each named regular file by exact name, size,
+# and SHA-256 without discovering unlisted directory contents.
 # release_contract:
 #   checksum_sidecar: sha256
 #   exact_primary_assets:
@@ -75,6 +77,10 @@ artifact_naming: "${name}-${version}-${os}-${arch}"
 #     darwin/amd64: example-tool-x86_64-apple-darwin
 #     windows/amd64: example-tool-x86_64-pc-windows-msvc.exe
 #     windows/arm64: example-tool-aarch64-pc-windows-msvc.exe
+#   exact_additional_assets:
+#     - example-tool.sbom.spdx.json
+#     - SHA256SUMS.txt
+#     - SHA256SUMS.txt.minisig
 
 # Optional for strict releases with local path dependencies: pin each sibling
 # crate to the exact clean commit incorporated into the build manifest.

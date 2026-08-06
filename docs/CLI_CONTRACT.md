@@ -481,9 +481,13 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
 
 When a repository opts into `release_contract`, DSR creates a new empty draft,
-uploads only the contracted primaries and checksum sidecars, and publishes only
-after exact no-cache asset, metadata, and tag-SHA verification. `--draft` keeps
-that verified draft unpublished and suppresses dispatch and upgrade hooks.
+uploads only the contracted primaries, their checksum sidecars, and the regular
+files explicitly listed by the optional `exact_additional_assets` array. Every
+planned file is bound by exact basename, byte size, and SHA-256 before upload;
+unsafe names, case-fold collisions, symlinks, missing files, and unlisted remote
+assets fail closed. Publication occurs only after exact no-cache asset,
+metadata, and tag-SHA verification. `--draft` keeps that verified draft
+unpublished and suppresses dispatch and upgrade hooks.
 
 Strict native builds trust the configured build host and its installed
 compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and

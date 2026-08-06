@@ -527,11 +527,14 @@ release_contract:
   exact_primary_assets:
     linux/amd64: contract-tool-x86_64-unknown-linux-gnu
     darwin/arm64: contract-tool-aarch64-apple-darwin
+  exact_additional_assets:
+    - contract-tool.sbom.spdx.json
+    - SHA256SUMS.txt.minisig
   checksum_sidecar: sha256
 YAML
 
   local expected
-  expected='{"checksum_sidecar":"sha256","exact_primary_assets":{"darwin/arm64":"contract-tool-aarch64-apple-darwin","linux/amd64":"contract-tool-x86_64-unknown-linux-gnu"}}'
+  expected='{"checksum_sidecar":"sha256","exact_additional_assets":["contract-tool.sbom.spdx.json","SHA256SUMS.txt.minisig"],"exact_primary_assets":{"darwin/arm64":"contract-tool-aarch64-apple-darwin","linux/amd64":"contract-tool-x86_64-unknown-linux-gnu"}}'
   [[ "$(config_get_release_contract_json contract-tool)" == "$expected" ]] &&
     config_validate_release_contract contract-tool
 }
@@ -982,6 +985,90 @@ YAML
   ! config_validate_release_contract contract-tool
 }
 
+test_release_contract_rejects_non_array_additional_assets() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+  exact_additional_assets: contract-tool.sbom.json
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_null_additional_assets() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+  exact_additional_assets: null
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_false_additional_assets() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+  exact_additional_assets: false
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_unsafe_additional_asset() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+  exact_additional_assets: [../contract-tool.sbom.json]
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_additional_primary_sidecar_collision() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+  exact_additional_assets: [CONTRACT-TOOL.SHA256]
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_casefold_duplicate_additional_assets() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+  exact_additional_assets: [SBOM.json, sbom.JSON]
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
 test_release_contract_rejects_unsupported_mode() {
   release_contract_test_deps_available || return 0
   write_contract_tool_config << 'YAML'
@@ -1166,6 +1253,12 @@ main() {
   run_test "release_contract_rejects_primary_path" test_release_contract_rejects_primary_path
   run_test "release_contract_rejects_dotdot_primary" test_release_contract_rejects_dotdot_primary
   run_test "release_contract_rejects_checksum_as_primary" test_release_contract_rejects_checksum_as_primary
+  run_test "release_contract_rejects_non_array_additional_assets" test_release_contract_rejects_non_array_additional_assets
+  run_test "release_contract_rejects_null_additional_assets" test_release_contract_rejects_null_additional_assets
+  run_test "release_contract_rejects_false_additional_assets" test_release_contract_rejects_false_additional_assets
+  run_test "release_contract_rejects_unsafe_additional_asset" test_release_contract_rejects_unsafe_additional_asset
+  run_test "release_contract_rejects_additional_primary_sidecar_collision" test_release_contract_rejects_additional_primary_sidecar_collision
+  run_test "release_contract_rejects_casefold_duplicate_additional_assets" test_release_contract_rejects_casefold_duplicate_additional_assets
   run_test "release_contract_rejects_unsupported_mode" test_release_contract_rejects_unsupported_mode
   run_test "release_contract_rejects_duplicate_configured_target" test_release_contract_rejects_duplicate_configured_target
 

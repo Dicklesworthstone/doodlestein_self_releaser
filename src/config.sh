@@ -824,29 +824,41 @@ config_validate_release_contract() {
     if jq -en \
         --argjson contract "$contract_json" \
         --argjson targets "$targets_json" '
-        def safe_asset:
+        def safe_name:
             if type != "string" then false
             else
                 length > 0 and
                 test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
                 (contains("/") | not) and
-                (contains("..") | not) and
-                (ascii_downcase | endswith(".sha256") | not)
+                (contains("..") | not)
             end;
+        def safe_primary:
+            safe_name and (ascii_downcase | endswith(".sha256") | not);
 
         if ($contract | type) != "object" then false
         elif ($targets | type) != "array" then false
-        elif (($contract | keys | sort) != ["checksum_sidecar", "exact_primary_assets"]) then false
+        elif (($contract | keys | sort) != ["checksum_sidecar", "exact_primary_assets"] and
+              ($contract | keys | sort) != ["checksum_sidecar", "exact_additional_assets", "exact_primary_assets"]) then false
         elif $contract.checksum_sidecar != "sha256" then false
         elif ($contract.exact_primary_assets | type) != "object" then false
+        elif (($contract.exact_additional_assets // []) | type) != "array" then false
         elif ($targets | length) == 0 then false
         elif ([$targets[] | if type == "string" then length > 0 else false end] | all | not) then false
         elif (($targets | unique | length) != ($targets | length)) then false
         else
+            ($contract.exact_primary_assets | [.[]]) as $primaries |
+            ($contract |
+                if has("exact_additional_assets")
+                then .exact_additional_assets
+                else []
+                end) as $additional |
+            ($primaries + ($primaries | map(. + ".sha256")) + $additional) as $all_assets |
             (($contract.exact_primary_assets | keys | sort) == ($targets | sort)) and
-            ([$contract.exact_primary_assets[] | safe_asset] | all) and
+            ([$contract.exact_primary_assets[] | safe_primary] | all) and
+            ([$additional[] | safe_name] | all) and
             (($contract.exact_primary_assets | [.[]] | unique | length) ==
-             ($contract.exact_primary_assets | length))
+             ($contract.exact_primary_assets | length)) and
+            (($all_assets | map(ascii_downcase) | unique | length) == ($all_assets | length))
         end
     ' >/dev/null 2>&1; then
         if ! config_get_release_source_dependencies_json "$toolname" >/dev/null; then

@@ -3713,10 +3713,25 @@ _release_contract_preflight() {
     esac
 
     if ! jq -e '
+        def safe_name:
+            type == "string" and
+            length > 0 and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            (contains("/") | not) and
+            (contains("..") | not);
+        (.exact_primary_assets | [.[]]) as $primaries |
+        (if has("exact_additional_assets")
+         then .exact_additional_assets
+         else []
+         end) as $additional |
+        ($primaries + ($primaries | map(. + ".sha256")) + $additional) as $all_assets |
         type == "object" and
         .checksum_sidecar == "sha256" and
         (.exact_primary_assets | type == "object") and
-        (.exact_primary_assets | length > 0)
+        (.exact_primary_assets | length > 0) and
+        ($additional | type == "array") and
+        ([$additional[] | safe_name] | all) and
+        (($all_assets | map(ascii_downcase) | unique | length) == ($all_assets | length))
     ' <<< "$contract_json" >/dev/null 2>&1; then
         log_error "Invalid release contract for $tool_name"
         return 4
@@ -3916,6 +3931,39 @@ _release_contract_preflight() {
             --argjson size_bytes "$sidecar_size" \
             '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, size_bytes: $size_bytes, kind: "checksum"}')")
     done
+
+    local additional_name additional_path additional_sha additional_size
+    while IFS= read -r additional_name; do
+        [[ -n "$additional_name" ]] || {
+            log_error "Release contract contains an empty additional asset name"
+            return 4
+        }
+        additional_path="$artifacts_dir/$additional_name"
+        if [[ ! -f "$additional_path" || -L "$additional_path" || \
+              "$(basename "$additional_path")" != "$additional_name" ]]; then
+            log_error "Additional release asset must be a regular non-symlink file: $additional_path"
+            return 4
+        fi
+        additional_sha=$(_release_sha256 "$additional_path") || {
+            log_error "Could not compute SHA256 for additional asset: $additional_path"
+            return 4
+        }
+        additional_size=$(_release_file_size "$additional_path") || {
+            log_error "Could not determine size for additional asset: $additional_path"
+            return 4
+        }
+        planned_assets+=("$(jq -nc \
+            --arg name "$additional_name" \
+            --arg path "$additional_path" \
+            --arg sha256 "$additional_sha" \
+            --argjson size_bytes "$additional_size" \
+            '{target: "additional", name: $name, path: $path, sha256: $sha256, size_bytes: $size_bytes, kind: "additional"}')")
+    done < <(jq -r '
+        (if has("exact_additional_assets")
+         then .exact_additional_assets
+         else []
+         end) | sort[]
+    ' <<< "$contract_json")
 
     manifest_sha_after=$(_release_sha256 "$manifest_file") || return 4
     if [[ "$manifest_sha_before" != "$manifest_sha_after" ]]; then
@@ -4860,9 +4908,10 @@ EOF
     }
 
     if $release_contract_enabled; then
-        # The strict plan is closed: primaries plus exactly one checksum sidecar
-        # per primary. Do not discover manifests, evidence, SBOMs, signatures,
-        # aliases, or any other directory contents here.
+        # The strict plan is closed: primaries, exactly one checksum sidecar per
+        # primary, and any explicitly named additional assets. Do not discover
+        # manifests, evidence, SBOMs, signatures, aliases, or other directory
+        # contents here.
         while IFS= read -r file_path; do
             [[ -n "$file_path" ]] && _release_add_file "$file_path"
         done < <(jq -r '.assets[].path' <<< "$release_contract_plan")
@@ -5160,20 +5209,13 @@ EOF
                 continue
             fi
 
-            if [[ "$planned_kind" == "primary" ]]; then
+            if [[ "$planned_kind" == "primary" || "$planned_kind" == "checksum" || \
+                  "$planned_kind" == "additional" ]]; then
                 planned_sha=$(jq -r '.sha256' <<< "$planned_asset")
                 current_sha=$(_release_sha256 "$file" 2>/dev/null || true)
                 if [[ "$current_sha" != "$planned_sha" ]]; then
-                    log_error "[$idx/$total_files] Primary checksum changed after preflight: $filename"
-                    _release_record_failed "$filename" "Primary checksum changed after strict preflight"
-                    continue
-                fi
-            elif [[ "$planned_kind" == "checksum" ]]; then
-                planned_sha=$(jq -r '.sha256' <<< "$planned_asset")
-                current_sha=$(_release_sha256 "$file" 2>/dev/null || true)
-                if [[ "$current_sha" != "$planned_sha" ]]; then
-                    log_error "[$idx/$total_files] Checksum sidecar changed after preflight: $filename"
-                    _release_record_failed "$filename" "Checksum sidecar changed after strict preflight"
+                    log_error "[$idx/$total_files] Strict asset checksum changed after preflight: $filename"
+                    _release_record_failed "$filename" "Asset checksum changed after strict preflight"
                     continue
                 fi
             else
@@ -5886,6 +5928,7 @@ EOF
 
     # Load build manifest if available
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    local artifacts_dir=""
     local manifest_file="$state_dir/artifacts/${tool_name}-${tag}/${tool_name}-${tag}-manifest.json"
     if [[ ! -f "$manifest_file" ]]; then
         manifest_file="$state_dir/artifacts/${tool_name}-${tag}-manifest.json"
@@ -5905,7 +5948,7 @@ EOF
             log_error "Strict release contract requires manifest: $manifest_file"
             return 4
         fi
-        local artifacts_dir="${manifest_file%/*}"
+        artifacts_dir="${manifest_file%/*}"
         # Repair creates a missing sidecar only at its per-upload mutation
         # boundary, after re-confirming the remote release is still a draft.
         local contract_sidecar_mode="plan"
@@ -6115,7 +6158,9 @@ EOF
                 log_info "Attempting to re-upload ${#assets_to_fix[@]} missing or mismatched asset(s)..."
             fi
         fi
-        local artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
+        if ! $release_contract_enabled; then
+            artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
+        fi
 
         if $release_contract_enabled; then
             local expected_assets_json strict_fix_failed=false

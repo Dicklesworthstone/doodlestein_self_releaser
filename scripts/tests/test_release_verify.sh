@@ -195,20 +195,27 @@ release_contract:
   checksum_sidecar: sha256
   exact_primary_assets:
     linux/amd64: ${tool}-linux-amd64
+  exact_additional_assets:
+    - ${tool}.sbom.spdx.json
 YAML
 
     printf 'strict verify binary\n' > "$artifacts_dir/${tool}-linux-amd64"
-    local sha sidecar_sha size sidecar_size
+    printf '{"spdxVersion":"SPDX-2.3"}\n' > "$artifacts_dir/${tool}.sbom.spdx.json"
+    local sha sidecar_sha additional_sha size sidecar_size additional_size
     if command -v sha256sum &>/dev/null; then
         sha=$(sha256sum "$artifacts_dir/${tool}-linux-amd64" | awk '{print $1}')
         sidecar_sha=$(printf '%s  %s\n' "$sha" "${tool}-linux-amd64" | sha256sum | awk '{print $1}')
+        additional_sha=$(sha256sum "$artifacts_dir/${tool}.sbom.spdx.json" | awk '{print $1}')
     else
         sha=$(shasum -a 256 "$artifacts_dir/${tool}-linux-amd64" | awk '{print $1}')
         sidecar_sha=$(printf '%s  %s\n' "$sha" "${tool}-linux-amd64" | shasum -a 256 | awk '{print $1}')
+        additional_sha=$(shasum -a 256 "$artifacts_dir/${tool}.sbom.spdx.json" | awk '{print $1}')
     fi
     size=$(stat -c %s "$artifacts_dir/${tool}-linux-amd64" 2>/dev/null || \
         stat -f %z "$artifacts_dir/${tool}-linux-amd64")
     sidecar_size=$(printf '%s  %s\n' "$sha" "${tool}-linux-amd64" | wc -c | tr -d '[:space:]')
+    additional_size=$(stat -c %s "$artifacts_dir/${tool}.sbom.spdx.json" 2>/dev/null || \
+        stat -f %z "$artifacts_dir/${tool}.sbom.spdx.json")
 
     jq -nc \
         --arg tool "$tool" \
@@ -235,11 +242,14 @@ YAML
     STRICT_VERIFY_ASSETS=$(jq -nc \
         --arg sha "$sha" \
         --arg sidecar_sha "$sidecar_sha" \
+        --arg additional_sha "$additional_sha" \
         --argjson size "$size" \
-        --argjson sidecar_size "$sidecar_size" '
+        --argjson sidecar_size "$sidecar_size" \
+        --argjson additional_size "$additional_size" '
         [
             {id: 1, name: "test-tool-linux-amd64", size: $size, state: "uploaded", digest: ("sha256:" + $sha), browser_download_url: "https://example.invalid/a"},
-            {id: 2, name: "test-tool-linux-amd64.sha256", size: $sidecar_size, state: "uploaded", digest: ("sha256:" + $sidecar_sha), browser_download_url: "https://example.invalid/b"}
+            {id: 2, name: "test-tool-linux-amd64.sha256", size: $sidecar_size, state: "uploaded", digest: ("sha256:" + $sidecar_sha), browser_download_url: "https://example.invalid/b"},
+            {id: 3, name: "test-tool.sbom.spdx.json", size: $additional_size, state: "uploaded", digest: ("sha256:" + $additional_sha), browser_download_url: "https://example.invalid/c"}
         ]
     ')
     STRICT_VERIFY_EXPECTED_ASSETS="$STRICT_VERIFY_ASSETS"
@@ -888,14 +898,14 @@ test_strict_verify_requires_exact_names_sizes_and_sidecars() {
     output=$(exec_stdout)
 
     if [[ $status -eq 0 ]] && echo "$output" | jq -e '
-        .details.verification.expected == 2 and
-        .details.verification.present == 2 and
+        .details.verification.expected == 3 and
+        .details.verification.present == 3 and
         .details.verification.missing == 0 and
         .details.verification.extra == 0 and
         .details.verification.size_mismatches == 0 and
         .details.verification.remote_records_valid == true
     ' >/dev/null 2>&1; then
-        pass "strict release verify requires exactly primary+sidecar names and sizes"
+        pass "strict release verify requires primary, sidecar, and additional names and sizes"
     else
         fail "strict release verify should accept the exact complete remote asset set"
         echo "status: $status"
@@ -1433,6 +1443,51 @@ test_strict_fix_repairs_missing_asset_in_draft() {
     harness_setup
     seed_strict_verify_fixture
     STRICT_VERIFY_ASSETS=$(jq -c \
+        'map(select(.name != "test-tool.sbom.spdx.json"))' \
+        <<< "$STRICT_VERIFY_ASSETS")
+    export STRICT_VERIFY_ASSETS
+    unset STRICT_FIX_UPLOAD_MODE STRICT_FIX_MUTATE_LOCAL_ON_RELEASE_ID
+    create_strict_verify_fix_mock_gh true
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+    local status output draft_state
+    status=$(exec_status)
+    output=$(exec_stdout)
+    draft_state=$(cat "$STRICT_FIX_DRAFT_FILE")
+
+    if [[ $status -eq 0 && "$draft_state" == "true" && -s "$STRICT_FIX_UPLOAD_LOG" && \
+          -s "$STRICT_FIX_LIST_LOG" && ! -s "$STRICT_FIX_TAG_ENDPOINT_LOG" ]] && \
+        grep -q '^id-bound-upload:test-tool.sbom.spdx.json$' "$STRICT_FIX_UPLOAD_LOG" && \
+        ! grep -q '^delete:' "$STRICT_FIX_UPLOAD_LOG" && \
+        ! grep -q '^tag-bound-upload:' "$STRICT_FIX_UPLOAD_LOG" && \
+        jq -e '
+            .details.verification.missing == 0 and
+            .details.verification.remote_records_valid == true
+        ' <<< "$output" >/dev/null 2>&1; then
+        pass "strict --fix repairs an absent additional asset through the authenticated release list"
+    else
+        fail "strict --fix should upload an absent asset only to the verified draft ID"
+        echo "status: $status, draft: $draft_state"
+        echo "output: $output"
+        echo "stderr: $(exec_stderr | tail -30)"
+    fi
+
+    remove_strict_verify_mock_gh
+    unset -f _strict_fix_release_json
+    harness_teardown
+}
+
+test_strict_fix_repairs_missing_primary_in_draft() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict release contract parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    STRICT_VERIFY_ASSETS=$(jq -c \
         'map(select(.name != "test-tool-linux-amd64"))' \
         <<< "$STRICT_VERIFY_ASSETS")
     export STRICT_VERIFY_ASSETS
@@ -1454,9 +1509,60 @@ test_strict_fix_repairs_missing_asset_in_draft() {
             .details.verification.missing == 0 and
             .details.verification.remote_records_valid == true
         ' <<< "$output" >/dev/null 2>&1; then
-        pass "strict --fix repairs an absent draft asset through the authenticated release list"
+        pass "strict --fix repairs an absent primary through the authenticated release list"
     else
-        fail "strict --fix should upload an absent asset only to the verified draft ID"
+        fail "strict --fix should upload an absent primary only to the verified draft ID"
+        echo "status: $status, draft: $draft_state"
+        echo "output: $output"
+        echo "stderr: $(exec_stderr | tail -30)"
+    fi
+
+    remove_strict_verify_mock_gh
+    unset -f _strict_fix_release_json
+    harness_teardown
+}
+
+test_strict_fix_repairs_missing_addition_from_fallback_manifest_directory() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict release contract parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    local original_dir fallback_dir
+    original_dir="${STRICT_VERIFY_MANIFEST_PATH%/*}"
+    fallback_dir="${original_dir%/*}"
+    mv "$STRICT_VERIFY_PRIMARY_PATH" "$fallback_dir/test-tool-linux-amd64"
+    mv "$original_dir/test-tool.sbom.spdx.json" "$fallback_dir/test-tool.sbom.spdx.json"
+    mv "$STRICT_VERIFY_MANIFEST_PATH" "$fallback_dir/test-tool-v1.0.0-manifest.json"
+    STRICT_VERIFY_PRIMARY_PATH="$fallback_dir/test-tool-linux-amd64"
+    STRICT_VERIFY_MANIFEST_PATH="$fallback_dir/test-tool-v1.0.0-manifest.json"
+    export STRICT_VERIFY_PRIMARY_PATH STRICT_VERIFY_MANIFEST_PATH
+    STRICT_VERIFY_ASSETS=$(jq -c \
+        'map(select(.name != "test-tool.sbom.spdx.json"))' \
+        <<< "$STRICT_VERIFY_ASSETS")
+    export STRICT_VERIFY_ASSETS
+    unset STRICT_FIX_UPLOAD_MODE STRICT_FIX_MUTATE_LOCAL_ON_RELEASE_ID
+    create_strict_verify_fix_mock_gh true
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+    local status output draft_state
+    status=$(exec_status)
+    output=$(exec_stdout)
+    draft_state=$(cat "$STRICT_FIX_DRAFT_FILE")
+
+    if [[ $status -eq 0 && "$draft_state" == "true" ]] && \
+        grep -q '^id-bound-upload:test-tool.sbom.spdx.json$' "$STRICT_FIX_UPLOAD_LOG" && \
+        jq -e '
+            .details.verification.missing == 0 and
+            .details.verification.remote_records_valid == true
+        ' <<< "$output" >/dev/null 2>&1; then
+        pass "strict --fix preserves the fallback manifest directory through repair revalidation"
+    else
+        fail "strict --fix must revalidate a repaired fallback-layout plan in its original directory"
         echo "status: $status, draft: $draft_state"
         echo "output: $output"
         echo "stderr: $(exec_stderr | tail -30)"
@@ -1823,6 +1929,8 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_fix_rejects_local_asset_mutation_before_upload
     test_strict_fix_failed_clobber_restores_draft
     test_strict_fix_repairs_missing_asset_in_draft
+    test_strict_fix_repairs_missing_primary_in_draft
+    test_strict_fix_repairs_missing_addition_from_fallback_manifest_directory
     test_strict_fix_rejects_existing_digest_mismatch_without_mutation
     test_strict_fix_rejects_remote_tag_move_after_upload
     test_strict_fix_rejects_manifest_mutation_after_upload
@@ -1885,6 +1993,8 @@ test_strict_fix_refuses_public_release_without_mutation
 test_strict_fix_rejects_local_asset_mutation_before_upload
 test_strict_fix_failed_clobber_restores_draft
 test_strict_fix_repairs_missing_asset_in_draft
+test_strict_fix_repairs_missing_primary_in_draft
+test_strict_fix_repairs_missing_addition_from_fallback_manifest_directory
 test_strict_fix_rejects_existing_digest_mismatch_without_mutation
 test_strict_fix_rejects_remote_tag_move_after_upload
 test_strict_fix_rejects_manifest_mutation_after_upload
