@@ -275,6 +275,12 @@ Parallel builds keep attempt-scoped logs and results per target. A partial run
 preserves verified completed artifacts; resume retries only incomplete targets.
 The authoritative manifest is withheld until every requested target succeeds.
 
+For Rust workspaces that ship more than one executable, list each name under
+`workspace_binaries`. DSR packages them together and also includes every
+regular, non-symlink companion file named by `include_files`. Unsafe paths,
+missing files, and collisions with a binary fail the target instead of
+silently producing an incomplete release archive.
+
 ### `dsr release`
 
 Upload artifacts to GitHub Release.

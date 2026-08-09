@@ -277,6 +277,63 @@ test_artifact_dirs() {
     fi
 }
 
+test_workspace_include_staging() {
+    log_test "workspace companion-file staging"
+
+    if ! command -v yq &>/dev/null; then
+        log_skip "yq not available for workspace include staging"
+        return
+    fi
+
+    local source_root="$TEMP_DIR/workspace-include-source"
+    local artifact_dir="$TEMP_DIR/workspace-include-artifacts"
+    local config_file="$TEMP_DIR/workspace-include.yaml"
+    mkdir -p "$source_root/notices" "$artifact_dir"
+    printf 'binary\n' > "$artifact_dir/fw"
+    printf 'readme\n' > "$source_root/README.md"
+    printf 'notice\n' > "$source_root/notices/THIRD_PARTY.txt"
+    cat > "$config_file" << 'EOF'
+include_files:
+  - README.md
+  - notices/THIRD_PARTY.txt
+EOF
+
+    local staged
+    if staged=$(_act_stage_workspace_include_files "$config_file" "$source_root" "$artifact_dir") &&
+       [[ "$staged" == $'README.md\nnotices/THIRD_PARTY.txt' ]] &&
+       [[ "$(cat "$artifact_dir/README.md")" == "readme" ]] &&
+       [[ "$(cat "$artifact_dir/notices/THIRD_PARTY.txt")" == "notice" ]] &&
+       [[ "$(cat "$artifact_dir/fw")" == "binary" ]]; then
+        log_pass "Configured companion files are staged in order without changing binaries"
+    else
+        log_fail "Configured companion files were not staged exactly"
+    fi
+
+    local bad_config="$TEMP_DIR/workspace-include-bad.yaml"
+    cat > "$bad_config" << 'EOF'
+include_files:
+  - ../outside.txt
+EOF
+    if ! _act_stage_workspace_include_files "$bad_config" "$source_root" "$artifact_dir" >/dev/null 2>&1; then
+        log_pass "Traversal in a workspace include fails closed"
+    else
+        log_fail "Traversal in a workspace include should fail"
+    fi
+
+    local collision_config="$TEMP_DIR/workspace-include-collision.yaml"
+    printf 'replacement\n' > "$source_root/fw"
+    cat > "$collision_config" << 'EOF'
+include_files:
+  - fw
+EOF
+    if ! _act_stage_workspace_include_files "$collision_config" "$source_root" "$artifact_dir" >/dev/null 2>&1 &&
+       [[ "$(cat "$artifact_dir/fw")" == "binary" ]]; then
+        log_pass "A companion-file collision cannot overwrite a binary"
+    else
+        log_fail "A companion-file collision must fail without overwriting"
+    fi
+}
+
 # Test act_cleanup function
 test_act_cleanup() {
     log_test "act_cleanup"
@@ -468,6 +525,7 @@ main() {
     test_act_check
     test_act_check_reads_config_dir_actrc
     test_artifact_dirs
+    test_workspace_include_staging
     test_act_cleanup
     test_workflow_validation
     test_act_run_workflow_injects_tag_env

@@ -10,6 +10,13 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ---
 
+## Unreleased
+
+- Multi-binary native archives now honor configured `include_files`, including
+  README, license, and notice files. Companion paths are validated and staged
+  without allowing a missing file, symlink, traversal, or binary-name collision
+  to produce an incomplete archive.
+
 ## v0.1.1 -- 2026-07-20
 
 First formally tagged release of Doodlestein Self-Releaser.

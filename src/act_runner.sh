@@ -178,6 +178,61 @@ _act_stream_workspace_zip() {
     (cd "$artifact_dir" && zip -q - "$@")
 }
 
+_act_is_safe_workspace_include_path() {
+    local path="$1"
+    [[ "$path" =~ ^[A-Za-z0-9][A-Za-z0-9._+/-]*$ ]] || return 1
+    [[ "$path" != /* && "$path" != */ ]] || return 1
+    case "/$path/" in
+        *"//"*|*"/./"*|*"/../"*) return 1 ;;
+    esac
+}
+
+# Stage configured companion files beside downloaded workspace binaries so the
+# strict archive stream can package one closed directory. Paths are deliberately
+# narrow, source symlinks are rejected, and an include may never overwrite a
+# downloaded binary or another include.
+_act_stage_workspace_include_files() {
+    local config_file="$1"
+    local source_root="$2"
+    local artifact_dir="$3"
+    local configured=""
+
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 7
+    [[ -d "$source_root" && ! -L "$source_root" ]] || return 7
+    [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 7
+    command -v yq &>/dev/null || return 7
+    configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 7
+
+    local include source_path destination parent
+    while IFS= read -r include; do
+        [[ -n "$include" ]] || continue
+        if ! _act_is_safe_workspace_include_path "$include"; then
+            _log_error "Unsafe workspace include path: $include"
+            return 7
+        fi
+        source_path="$source_root/$include"
+        destination="$artifact_dir/$include"
+        parent=$(dirname "$destination")
+        if [[ ! -f "$source_path" || -L "$source_path" ]]; then
+            _log_error "Workspace include is missing or not a regular non-symlink file: $include"
+            return 7
+        fi
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            _log_error "Workspace include collides with an existing archive member: $include"
+            return 7
+        fi
+        if ! mkdir -p "$parent" || [[ ! -d "$parent" || -L "$parent" ]]; then
+            _log_error "Unable to create workspace include parent: $include"
+            return 7
+        fi
+        if ! cp -p "$source_path" "$destination"; then
+            _log_error "Unable to stage workspace include: $include"
+            return 7
+        fi
+        printf '%s\n' "$include"
+    done <<< "$configured"
+}
+
 # Infer archive format from filename
 _act_archive_format() {
     local name="$1"
@@ -4566,6 +4621,21 @@ act_run_native_build() {
             for p in "${local_artifact_paths[@]}"; do
                 archive_files+=("$(basename "$p")")
             done
+
+            local staged_workspace_includes=""
+            if ! staged_workspace_includes=$(
+                _act_stage_workspace_include_files "$config_file" "$local_path" "$artifact_dir"
+            ); then
+                _log_error "Failed to stage configured workspace companion files for $platform"
+                jq -nc --arg platform "$platform" \
+                    '{status: "failed", exit_code: 7, error: ("Workspace companion-file staging failed for " + $platform)}'
+                return 7
+            fi
+            local staged_include
+            while IFS= read -r staged_include; do
+                [[ -n "$staged_include" ]] && archive_files+=("$staged_include")
+            done <<< "$staged_workspace_includes"
+            _log_info "Workspace archive members: ${archive_files[*]}"
 
             # Create the archive
             local archive_output

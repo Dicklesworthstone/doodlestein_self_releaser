@@ -124,7 +124,8 @@ archive_format:
   darwin: tar.gz
   windows: zip
 
-# Additional files to include in archive
+# Additional regular, non-symlink files to include in both single-binary and
+# workspace/multi-binary archives. Missing, unsafe, or colliding paths fail.
 include_files:
   - README.md
   - LICENSE
