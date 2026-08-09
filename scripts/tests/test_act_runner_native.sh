@@ -304,8 +304,10 @@ test_unix_rust_unsets_ambient_cargo_path_env() {
     local cmd
     cmd=$(get_ssh_cmd)
 
-    if [[ "$cmd" == *"unset CARGO_TARGET_DIR; unset CARGO_BUILD_TARGET;"*"cargo build --release"* ]]; then
-        log_pass "Unsets ambient Cargo path env before Rust build"
+    if [[ "$cmd" == *"unset CARGO_TARGET_DIR; unset CARGO_BUILD_TARGET;"* && \
+          "$cmd" == *"export RCH_DISABLED=1; export RCH_CARGO_WRAPPER_BYPASS=1;"* && \
+          "$cmd" == *"cargo build --release"* ]]; then
+        log_pass "Unsets ambient Cargo paths and keeps native Rust compilation local"
     else
         log_fail "Expected Cargo path env unsets in: $cmd"
     fi
@@ -627,6 +629,8 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     expected_home="C:/build/.dsr-release-snapshots/tool-run/.cargo-home"
     expected_home_win="C:\\build\\.dsr-release-snapshots\\tool-run\\.cargo-home"
     if [[ "$cmd" == *"$expected_home_win"* && \
+          "$cmd" == *'$cargoHome=Get-Item'* && \
+          "$cmd" != *'$home=Get-Item'* && \
           "$cmd" == *"System.Diagnostics.ProcessStartInfo"* && \
           "$cmd" == *"^(CARGO_|RUST|XWIN_)"* && \
           "$cmd" == *"EnvironmentVariables.Remove"* && \

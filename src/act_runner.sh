@@ -2486,7 +2486,7 @@ _act_strict_cargo_metadata_json() {
         win_source_root=$(_act_windows_cmd_path "$source_root")
         win_cargo_home=$(_act_windows_cmd_path "$strict_cargo_home")
         win_manifest_path="${win_source_root}\\Cargo.toml"
-        metadata_command="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$strict='${win_cargo_home}'; \$ambient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }; if (Test-Path -LiteralPath \$strict) { throw 'Strict CARGO_HOME already exists' }; New-Item -ItemType Directory -Path \$strict | Out-Null; \$strictItem=Get-Item -LiteralPath \$strict -Force; if (-not \$strictItem.PSIsContainer -or ((\$strictItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not a plain directory' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$strict \$name)) { throw 'Strict CARGO_HOME contains ambient configuration' } }; foreach (\$name in @('registry','git')) { \$source=Join-Path \$ambient \$name; \$dest=Join-Path \$strict \$name; if (Test-Path -LiteralPath \$source -PathType Container) { New-Item -ItemType Junction -Path \$dest -Target \$source | Out-Null; \$destItem=Get-Item -LiteralPath \$dest -Force; if ((\$destItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'Strict Cargo cache is not an isolated junction' } } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; Get-ChildItem Env: | Where-Object { \$_.Name -match '^(CARGO_|RUST)' -or \$_.Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS)$' } | ForEach-Object { Remove-Item -LiteralPath (\"Env:\" + \$_.Name) }; \$env:CARGO_HOME=\$strict; Set-Location -LiteralPath '${win_source_root}'; Write-Output ((Get-Location).Path); & cargo metadata --locked --offline --all-features --format-version 1 --manifest-path '${win_manifest_path}'; exit \$LASTEXITCODE\""
+        metadata_command="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$strict='${win_cargo_home}'; \$ambient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }; if (Test-Path -LiteralPath \$strict) { throw 'Strict CARGO_HOME already exists' }; New-Item -ItemType Directory -Path \$strict | Out-Null; \$strictItem=Get-Item -LiteralPath \$strict -Force; if (-not \$strictItem.PSIsContainer -or ((\$strictItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not a plain directory' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$strict \$name)) { throw 'Strict CARGO_HOME contains ambient configuration' } }; foreach (\$name in @('registry','git')) { \$source=Join-Path \$ambient \$name; \$dest=Join-Path \$strict \$name; if (Test-Path -LiteralPath \$source -PathType Container) { New-Item -ItemType Junction -Path \$dest -Target \$source | Out-Null; \$destItem=Get-Item -LiteralPath \$dest -Force; if ((\$destItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'Strict Cargo cache is not an isolated junction' } } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; Get-ChildItem Env: | Where-Object { \$_.Name -match '^(CARGO_|RUST)' -or \$_.Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS)$' } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + \$_.Name) }; \$env:CARGO_HOME=\$strict; Set-Location -LiteralPath '${win_source_root}'; Write-Output ((Get-Location).Path); & cargo metadata --locked --offline --all-features --format-version 1 --manifest-path '${win_manifest_path}'; exit \$LASTEXITCODE\""
     else
         metadata_command="set -e; umask 077; physical_source_root=\$(cd '$source_root' && pwd -P); strict_home=\"\${physical_source_root%/*}/.cargo-home\"; ambient_home=\${CARGO_HOME:-\$HOME/.cargo}; test ! -e \"\$strict_home\"; test ! -L \"\$strict_home\"; mkdir \"\$strict_home\"; test -d \"\$strict_home\"; test ! -L \"\$strict_home\"; for name in config config.toml credentials credentials.toml; do test ! -e \"\$strict_home/\$name\"; test ! -L \"\$strict_home/\$name\"; done; for name in registry git; do if test -d \"\$ambient_home/\$name\"; then ln -s \"\$ambient_home/\$name\" \"\$strict_home/\$name\"; test -L \"\$strict_home/\$name\"; test \"\$(cd \"\$strict_home/\$name\" && pwd -P)\" = \"\$(cd \"\$ambient_home/\$name\" && pwd -P)\"; fi; done; ancestor=\${physical_source_root%/*}; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; cd \"\$physical_source_root\"; printf '%s\\n' \"\$physical_source_root\"; CARGO_HOME=\"\$strict_home\" cargo metadata --locked --offline --all-features --format-version 1 --manifest-path \"\$physical_source_root/Cargo.toml\""
     fi
@@ -2599,22 +2599,30 @@ _act_sync_strict_checkout() {
             return 4
         fi
     elif _act_is_windows_host "$host"; then
-        local win_remote_path win_snapshot_parent win_remote_archive ps_command reparse_guard
+        local win_remote_path win_snapshot_parent win_remote_archive reparse_guard
         win_remote_path=$(_act_windows_cmd_path "$remote_path")
         win_snapshot_parent=$(_act_windows_cmd_path "$snapshot_parent")
         win_remote_archive=$(_act_windows_cmd_path "$remote_archive")
         reparse_guard=$(_act_windows_reparse_guard_script)
-        local win_snapshot_grandparent parent_setup
+        local win_snapshot_grandparent parent_setup setup_command verify_command
         win_snapshot_grandparent=$(_act_windows_cmd_path "$snapshot_grandparent")
         if $creates_snapshot_parent; then
             parent_setup="if (Test-Path -LiteralPath '${win_snapshot_parent}') { exit 16 }; New-Item -ItemType Directory -Force -Path '${win_snapshot_grandparent}' | Out-Null; Assert-PlainDirectory '${win_snapshot_grandparent}'; New-Item -ItemType Directory -Path '${win_snapshot_parent}' | Out-Null; Assert-PlainDirectory '${win_snapshot_parent}'"
         else
             parent_setup="Assert-PlainDirectory '${win_snapshot_parent}'"
         fi
-        ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} ${parent_setup}; if ((Test-Path -LiteralPath '${win_remote_path}') -or (Test-Path -LiteralPath '${win_remote_archive}')) { exit 17 }; New-Item -ItemType Directory -Path '${win_remote_path}' | Out-Null; Assert-PlainDirectory '${win_remote_path}'; \$inputStream=[Console]::OpenStandardInput(); \$archive=[IO.File]::Open('${win_remote_archive}',[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); \$inputStream.CopyTo(\$archive); \$archive.Close(); Assert-PlainFile '${win_remote_archive}'; tar.exe -xf '${win_remote_archive}' -C '${win_remote_path}'; if (\$LASTEXITCODE -ne 0) { exit 18 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 19 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant()\""
-        if ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+        setup_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} ${parent_setup}; if ((Test-Path -LiteralPath '${win_remote_path}') -or (Test-Path -LiteralPath '${win_remote_archive}')) { exit 17 }; New-Item -ItemType Directory -Path '${win_remote_path}' | Out-Null; Assert-PlainDirectory '${win_remote_path}'\""
+        verify_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; tar.exe -xf '${win_remote_archive}' -C '${win_remote_path}'; if (\$LASTEXITCODE -ne 0) { exit 18 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 19 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant()\""
+        if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$ps_command" < "$archive_path"); then
+            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$setup_command" || \
+           ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new "$archive_path" \
+            "${ssh_destination}:${remote_archive}" || \
+           ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$verify_command"); then
             _log_error "Strict fresh Windows source sync failed for $label"
             return 4
         fi
@@ -2648,13 +2656,23 @@ _act_sync_strict_checkout() {
             return 4
         fi
     elif _act_is_windows_host "$host"; then
-        local win_remote_manifest manifest_ps_command reparse_guard
+        local win_remote_manifest manifest_preflight_command manifest_verify_command reparse_guard
         win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
         reparse_guard=$(_act_windows_reparse_guard_script)
-        manifest_ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; if (Test-Path -LiteralPath '${win_remote_manifest}') { exit 20 }; \$inputStream=[Console]::OpenStandardInput(); \$manifest=[IO.File]::Open('${win_remote_manifest}',[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); \$inputStream.CopyTo(\$manifest); \$manifest.Close(); Assert-PlainFile '${win_remote_manifest}'; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant()\""
+        manifest_preflight_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; if (Test-Path -LiteralPath '${win_remote_manifest}') { exit 20 }\""
+        manifest_verify_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant()\""
+        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new "$ssh_destination" \
+            "$manifest_preflight_command" || return 4
+        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new "$manifest_path" \
+            "${ssh_destination}:${remote_manifest}" || return 4
         remote_manifest_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$manifest_ps_command" < "$manifest_path") || return 4
+            -o StrictHostKeyChecking=accept-new "$ssh_destination" \
+            "$manifest_verify_command") || return 4
     else
         local manifest_remote_cmd
         manifest_remote_cmd="set -e; set -C; umask 077; test ! -e '$remote_manifest'; test ! -L '$remote_manifest'; cat > '$remote_manifest'; if command -v sha256sum >/dev/null 2>&1; then sha256sum '$remote_manifest' | awk '{print \$1}'; else shasum -a 256 '$remote_manifest' | awk '{print \$1}'; fi"
@@ -4127,7 +4145,7 @@ act_run_native_build() {
         if $strict_rust_build; then
             local win_strict_cargo_home
             win_strict_cargo_home=$(_act_windows_cmd_path "$strict_cargo_home")
-            env_exports+="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$home=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$home.PSIsContainer -or ((\$home.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$home.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }\" && for /f \"tokens=1 delims==\" %V in ('set CARGO_ 2^>nul') do @set \"%V=\" & for /f \"tokens=1 delims==\" %V in ('set RUST 2^>nul') do @set \"%V=\" & "
+            env_exports+="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$cargoHome=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$cargoHome.PSIsContainer -or ((\$cargoHome.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoHome.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }\" && for /f \"tokens=1 delims==\" %V in ('set CARGO_ 2^>nul') do @set \"%V=\" & for /f \"tokens=1 delims==\" %V in ('set RUST 2^>nul') do @set \"%V=\" & "
         fi
         for env_name in "${cargo_env_to_unset[@]}"; do
             env_exports+="set \"$env_name=\" && "
@@ -4155,7 +4173,7 @@ act_run_native_build() {
                 env_value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
                 ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
             done <<< "$build_env"
-            remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$home=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$home.PSIsContainer -or ((\$home.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$home.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
+            remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$cargoHome=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$cargoHome.PSIsContainer -or ((\$cargoHome.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoHome.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
         elif $nonstrict_rust_isolate; then
             local win_stage_root win_source_root win_cargo_home
             win_stage_root=$(_act_windows_cmd_path "$nonstrict_stage_root") || return 4
@@ -4202,6 +4220,12 @@ act_run_native_build() {
             # Quote the env_pair to handle values with spaces (e.g., FOO="bar baz")
             env_exports+="export \"$env_pair\"; "
         done <<< "$build_env"
+        if [[ "$language" == "rust" ]]; then
+            # A native target host must compile locally.  Explicitly bypass an
+            # installed RCH Cargo hook so it cannot re-offload a snapshot whose
+            # path is intentionally outside the canonical project root.
+            env_exports+="export RCH_DISABLED=1; export RCH_CARGO_WRAPPER_BYPASS=1; "
+        fi
 
         # A configured TMPDIR that does not exist on the build host breaks
         # compilers in opaque ways (clang: "unable to make temporary file"),

@@ -1792,6 +1792,26 @@ else
     fail "strict Cargo metadata cwd/config isolation was not constructed"
 fi
 
+closure_windows_metadata_command_file="$TEMP_DIR/strict-cargo-windows-metadata-command"
+closure_windows_metadata_command_status=0
+(
+    _act_is_windows_host() { return 0; }
+    _act_ssh_exec() {
+        printf '%s\n' "$2" > "$closure_windows_metadata_command_file"
+        printf '%s\n{}\n' 'C:/build/source'
+    }
+    _act_validate_cargo_metadata_source_closure() { return 0; }
+    _act_validate_strict_cargo_source_closure \
+        "wlap" "C:/build/source" '[]'
+) >/dev/null 2>&1 || closure_windows_metadata_command_status=$?
+if [[ $closure_windows_metadata_command_status -eq 0 ]] && \
+   grep -Fq "('Env:' + \$_.Name)" "$closure_windows_metadata_command_file" && \
+   ! grep -Fq '("Env:" + $_.Name)' "$closure_windows_metadata_command_file"; then
+    pass "strict Windows Cargo metadata preserves the Env provider path literal"
+else
+    fail "strict Windows Cargo metadata emitted a command-shell-broken Env path"
+fi
+
 closure_alias_logical_root="/tmp/dsr-closure-snapshot/source"
 closure_alias_physical_root="/private$closure_alias_logical_root"
 closure_alias_physical_metadata=$(jq -nc --arg root "$closure_alias_physical_root" '{
@@ -2255,6 +2275,53 @@ if [[ $strict_windows_sync_status -eq 4 ]]; then
     pass "strict mocked Windows sync rejects a reparse-point parent or component"
 else
     fail "strict mocked Windows sync accepted a reparse-point parent or component"
+fi
+
+strict_windows_scp_log="$TEMP_DIR/strict-windows-scp.log"
+strict_windows_ssh_log="$TEMP_DIR/strict-windows-ssh.log"
+strict_windows_archive_digest_file="$TEMP_DIR/strict-windows-archive.digest"
+strict_windows_manifest_digest_file="$TEMP_DIR/strict-windows-manifest.digest"
+strict_windows_scp_status=0
+(
+    _act_is_local_host() { return 1; }
+    _act_is_windows_host() { return 0; }
+    _act_get_ssh_destination() { printf 'mock-windows\n'; }
+    _act_run_with_timeout() { shift; "$@"; }
+    scp() {
+        local source_index=$(( $# - 1 )) source_path destination
+        source_path="${!source_index}"
+        destination="${!#}"
+        printf '%s -> %s\n' "$source_path" "$destination" >> "$strict_windows_scp_log"
+        if [[ "$destination" == *'.source.tar' ]]; then
+            sha256sum "$source_path" | awk '{print $1}' > "$strict_windows_archive_digest_file"
+        elif [[ "$destination" == *'.source.manifest' ]]; then
+            sha256sum "$source_path" | awk '{print $1}' > "$strict_windows_manifest_digest_file"
+        else
+            return 23
+        fi
+    }
+    ssh() {
+        local remote_command="${!#}"
+        printf '%s\n' "$remote_command" >> "$strict_windows_ssh_log"
+        if [[ "$remote_command" == *'Get-FileHash'*'.source.manifest'* ]]; then
+            cat "$strict_windows_manifest_digest_file"
+        elif [[ "$remote_command" == *'Get-FileHash'*'.source.tar'* ]]; then
+            cat "$strict_windows_archive_digest_file"
+        fi
+    }
+    _act_sync_strict_checkout \
+        "wlap" "$strict_sync_repo" "$strict_sync_sha" \
+        "C:/build/.dsr-release-snapshots/windows-scp/run/source" \
+        "source.tar" "windows-scp-sync"
+) >/dev/null 2>&1 || strict_windows_scp_status=$?
+if [[ $strict_windows_scp_status -eq 0 ]] && \
+   [[ $(wc -l < "$strict_windows_scp_log") -eq 2 ]] && \
+   grep -Fq '.source.tar' "$strict_windows_scp_log" && \
+   grep -Fq '.source.manifest' "$strict_windows_scp_log" && \
+   ! grep -Fq 'OpenStandardInput' "$strict_windows_ssh_log"; then
+    pass "strict mocked Windows sync uploads with SCP before independent verification"
+else
+    fail "strict mocked Windows sync did not preserve the SCP and verification contract"
 fi
 
 cat > "$ACT_REPOS_DIR/stdinlooptest.yaml" << EOF
