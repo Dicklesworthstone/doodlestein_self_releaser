@@ -277,9 +277,9 @@ The authoritative manifest is withheld until every requested target succeeds.
 
 For Rust workspaces that ship more than one executable, list each name under
 `workspace_binaries`. DSR packages them together and also includes every
-regular, non-symlink companion file named by `include_files`. Unsafe paths,
-missing files, and collisions with a binary fail the target instead of
-silently producing an incomplete release archive.
+regular companion file named by `include_files`; every path component must be
+free of symlinks. Unsafe paths, missing files, and collisions with a binary fail
+the target instead of silently producing an incomplete release archive.
 
 ### `dsr release`
 

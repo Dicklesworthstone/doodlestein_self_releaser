@@ -187,6 +187,22 @@ _act_is_safe_workspace_include_path() {
     esac
 }
 
+_act_workspace_include_path_is_symlink_free() {
+    local root="$1"
+    local relative_path="$2"
+    local cursor="$root"
+    local remainder="$relative_path"
+    local component
+
+    while [[ "$remainder" == */* ]]; do
+        component="${remainder%%/*}"
+        remainder="${remainder#*/}"
+        cursor="$cursor/$component"
+        [[ ! -L "$cursor" ]] || return 1
+    done
+    [[ ! -L "$cursor/$remainder" ]]
+}
+
 # Stage configured companion files beside downloaded workspace binaries so the
 # strict archive stream can package one closed directory. Paths are deliberately
 # narrow, source symlinks are rejected, and an include may never overwrite a
@@ -213,7 +229,8 @@ _act_stage_workspace_include_files() {
         source_path="$source_root/$include"
         destination="$artifact_dir/$include"
         parent=$(dirname "$destination")
-        if [[ ! -f "$source_path" || -L "$source_path" ]]; then
+        if [[ ! -f "$source_path" ]] ||
+           ! _act_workspace_include_path_is_symlink_free "$source_root" "$include"; then
             _log_error "Workspace include is missing or not a regular non-symlink file: $include"
             return 7
         fi

@@ -320,6 +320,21 @@ EOF
         log_fail "Traversal in a workspace include should fail"
     fi
 
+    local outside_dir="$TEMP_DIR/workspace-include-outside"
+    local symlink_config="$TEMP_DIR/workspace-include-symlink.yaml"
+    mkdir -p "$outside_dir"
+    printf 'outside\n' > "$outside_dir/OUTSIDE.txt"
+    ln -s "$outside_dir" "$source_root/linked"
+    cat > "$symlink_config" << 'EOF'
+include_files:
+  - linked/OUTSIDE.txt
+EOF
+    if ! _act_stage_workspace_include_files "$symlink_config" "$source_root" "$artifact_dir" >/dev/null 2>&1; then
+        log_pass "A symlinked parent in a workspace include fails closed"
+    else
+        log_fail "A symlinked workspace include parent should fail"
+    fi
+
     local collision_config="$TEMP_DIR/workspace-include-collision.yaml"
     printf 'replacement\n' > "$source_root/fw"
     cat > "$collision_config" << 'EOF'
