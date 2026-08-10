@@ -40,3 +40,16 @@ Thumbs.db
 *.tmp
 *.bak
 .beads/.br_history/
+
+# === multi-repo ephemeral patterns 2026-08-10 ===
+# br fsqlite-ns VFS sidecars — per-machine runtime state, like -wal/-shm
+.beads/beads.db-fsqlite-ns-*
+.beads/.write.lock.stale-*
+# Agent runtime scratch
+.ee/
+.ntm/
+.wrangler/
+.claude/
+.repo_janitor_workspace/
+.skill-loop-progress.md
+.skill-loop-progress-*.md
