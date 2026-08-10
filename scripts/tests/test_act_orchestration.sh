@@ -1232,6 +1232,55 @@ else
     fail "strict manifest rejected valid contracted archives: $archive_manifest"
 fi
 
+workspace_manifest_input=$(jq -nc \
+    --arg sha "$contract_sha" \
+    --arg ref "$contract_ref" \
+    --argjson linux "$workspace_archive_staged" '
+    {
+        tool: "focrworkspace",
+        version: "v1.0.0",
+        run_id: "550e8400-e29b-41d4-a716-446655440042",
+        git_sha: $sha,
+        git_ref: $ref,
+        source_dependencies: [],
+        status: "success",
+        summary: {total: 1, success: 1, failed: 0},
+        targets: [$linux]
+    }
+')
+workspace_manifest=$(
+    (
+        ACT_REPO_LOCAL_PATH="$TEMP_DIR/source-repo"
+        git() {
+            case "$*" in
+                *"rev-parse --verify HEAD^{commit}"*|*"rev-parse --verify refs/tags/v1.0.0^{commit}"*)
+                    printf '%s\n' "$contract_sha"
+                    ;;
+                *"status --porcelain --untracked-files=all"*) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        act_generate_manifest "$workspace_manifest_input" ""
+    ) 2>/dev/null
+)
+if jq -e --arg sha "$(_act_sha256 "$workspace_archive_source")" '
+    .status == "success" and
+    .summary == {total: 1, success: 1, failed: 0} and
+    .artifacts == [{
+        name: "focrworkspace-1.0.0-linux_amd64.tar.gz",
+        target: "linux/amd64",
+        sha256: $sha,
+        size_bytes: .artifacts[0].size_bytes,
+        archive_format: "tar.gz",
+        signed: false,
+        signature_file: ""
+    }]
+' <<< "$workspace_manifest" &>/dev/null; then
+    pass "strict manifest accepts a validated prepackaged multi-binary workspace archive"
+else
+    fail "strict manifest rejected the validated workspace archive: $workspace_manifest"
+fi
+
 changing_source="$TEMP_DIR/changing-source/focr"
 mkdir -p "$(dirname "$changing_source")"
 write_minimal_target_binary "$changing_source" "linux/amd64"

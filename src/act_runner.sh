@@ -5917,13 +5917,14 @@ _act_generate_contract_manifest() {
     status=$(jq -r '.status // empty' <<< "$result_json")
 
     local config_file="$ACT_REPOS_DIR/${tool}.yaml"
-    local binary_name
+    local binary_name workspace_binaries
     if [[ ! -f "$config_file" ]] || \
        ! binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null) || \
        ! _act_is_safe_basename "$binary_name"; then
         _log_error "Strict release manifest requires a safe configured binary_name"
         return 4
     fi
+    workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
 
     local source_dependencies_json
     if ! _act_is_uuid "$run_id"; then
@@ -6083,8 +6084,11 @@ _act_generate_contract_manifest() {
             if ! _act_validate_target_binary "$primary_path" "$target"; then
                 return 4
             fi
+        elif [[ -n "$workspace_binaries" ]]; then
+            _act_validate_workspace_archive \
+                "$primary_path" "$format" "$target" "$config_file" || return 4
         elif ! _act_validate_target_archive \
-            "$primary_path" "$format" "$expected_input_name" "$target"; then
+                 "$primary_path" "$format" "$expected_input_name" "$target"; then
             return 4
         fi
 
