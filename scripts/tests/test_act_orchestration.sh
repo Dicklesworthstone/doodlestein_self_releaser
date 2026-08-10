@@ -165,6 +165,27 @@ release_contract:
     windows/amd64: focr-1.0.0-windows_amd64.zip
 EOF
 
+cat > "$ACT_REPOS_DIR/focrworkspace.yaml" << EOF
+tool_name: focrworkspace
+repo: Test/focrworkspace
+local_path: $TEMP_DIR/source-repo
+language: rust
+binary_name: focr
+build_cmd: cargo build --release --bins
+targets:
+  - linux/amd64
+workspace_binaries:
+  - focr
+  - fw
+include_files:
+  - README.md
+  - docs/NOTICE.txt
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: focrworkspace-1.0.0-linux_amd64.tar.gz
+EOF
+
 echo "== act_get_build_cmd =="
 
 # Test get_build_cmd
@@ -1049,6 +1070,56 @@ if [[ "$(basename "$archive_windows_path")" == "focr-1.0.0-windows_amd64.zip" ]]
     pass "strict staging packages a Windows binary as the contracted one-file zip"
 else
     fail "strict staging did not produce the contracted one-file Windows zip"
+fi
+
+workspace_bundle_dir="$TEMP_DIR/prepackaged-workspace"
+workspace_archive_source="$TEMP_DIR/focrworkspace-1.0.0-linux_amd64.tar.gz"
+mkdir -p "$workspace_bundle_dir/docs"
+write_minimal_target_binary "$workspace_bundle_dir/focr" "linux/amd64"
+write_minimal_target_binary "$workspace_bundle_dir/fw" "linux/amd64"
+printf 'workspace readme\n' > "$workspace_bundle_dir/README.md"
+printf 'workspace notice\n' > "$workspace_bundle_dir/docs/NOTICE.txt"
+tar -czf "$workspace_archive_source" -C "$workspace_bundle_dir" \
+    focr fw README.md docs/NOTICE.txt
+workspace_archive_result=$(with_collection_receipt \
+    "$(jq -nc --arg path "$workspace_archive_source" '{
+        platform: "linux/amd64", status: "success", artifact_path: $path, artifact_paths: [$path]
+    }')" "$workspace_archive_source")
+workspace_archive_staged=$(_act_stage_contract_primary \
+    "focrworkspace" "v1.0.0" "550e8400-e29b-41d4-a716-446655440042" \
+    "linux/amd64" "$workspace_archive_result" \
+    "$(config_get_release_contract_json "focrworkspace")")
+workspace_archive_path=$(jq -r '.artifact_path' <<< "$workspace_archive_staged")
+
+if [[ "$(basename "$workspace_archive_path")" == \
+      "focrworkspace-1.0.0-linux_amd64.tar.gz" ]] && \
+   cmp -s -- "$workspace_archive_source" "$workspace_archive_path" && \
+   [[ "$(tar -tzf "$workspace_archive_path" | LC_ALL=C sort)" == \
+      $'README.md\ndocs/NOTICE.txt\nfocr\nfw' ]]; then
+    pass "strict staging preserves an already packaged multi-binary workspace archive"
+else
+    fail "strict staging rejected or rewrote a valid multi-binary workspace archive"
+fi
+
+workspace_extra_archive="$TEMP_DIR/prepackaged-workspace-extra/focrworkspace-1.0.0-linux_amd64.tar.gz"
+mkdir -p "$(dirname "$workspace_extra_archive")"
+printf 'unexpected\n' > "$workspace_bundle_dir/extra.txt"
+tar -czf "$workspace_extra_archive" -C "$workspace_bundle_dir" \
+    focr fw README.md docs/NOTICE.txt extra.txt
+workspace_extra_result=$(with_collection_receipt \
+    "$(jq -nc --arg path "$workspace_extra_archive" '{
+        platform: "linux/amd64", status: "success", artifact_path: $path, artifact_paths: [$path]
+    }')" "$workspace_extra_archive")
+workspace_extra_status=0
+_act_stage_contract_primary \
+    "focrworkspace" "v1.0.0" "550e8400-e29b-41d4-a716-446655440043" \
+    "linux/amd64" "$workspace_extra_result" \
+    "$(config_get_release_contract_json "focrworkspace")" \
+    >/dev/null 2>&1 || workspace_extra_status=$?
+if [[ $workspace_extra_status -eq 4 ]]; then
+    pass "strict staging rejects extra members in a prepackaged workspace archive"
+else
+    fail "strict staging accepted an unconfigured workspace archive member"
 fi
 
 raw_archive_impostor="$TEMP_DIR/raw-archive-impostor.tar.gz"

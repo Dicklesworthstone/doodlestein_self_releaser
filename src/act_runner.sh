@@ -491,6 +491,112 @@ _act_validate_target_archive() {
         _act_read_archive_hex_bytes "$archive" "$format" "$expected_entry"
 }
 
+# Validate a release archive that was already assembled by the strict native
+# workspace collector. Unlike the single-binary archive path above, this form
+# must retain every configured workspace binary and companion notice while
+# still proving that each executable has the requested target architecture.
+_act_validate_workspace_archive() {
+    local archive="$1"
+    local format="$2"
+    local target="$3"
+    local config_file="$4"
+    local entries="" expected_entries="" configured=""
+
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    command -v yq &>/dev/null || return 4
+
+    case "$format" in
+        tar.gz)
+            command -v tar &>/dev/null || return 4
+            entries=$(tar -tzf "$archive" 2>/dev/null) || return 4
+            ;;
+        tar.xz)
+            command -v tar &>/dev/null || return 4
+            entries=$(tar -tJf "$archive" 2>/dev/null) || return 4
+            ;;
+        zip)
+            command -v unzip &>/dev/null || return 4
+            entries=$(unzip -Z1 "$archive" 2>/dev/null) || return 4
+            ;;
+        *) return 4 ;;
+    esac
+
+    local -a binary_members=() expected_members=()
+    local -A seen_members=()
+    local binary member include
+    configured=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
+    while IFS= read -r binary; do
+        [[ -n "$binary" ]] || continue
+        _act_is_safe_basename "$binary" || return 4
+        member="$binary"
+        [[ "$target" == windows/* ]] && member="${binary%.exe}.exe"
+        [[ -z "${seen_members[$member]:-}" ]] || return 4
+        seen_members["$member"]=1
+        binary_members+=("$member")
+        expected_members+=("$member")
+    done <<< "$configured"
+    [[ ${#binary_members[@]} -gt 0 ]] || return 4
+
+    configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 4
+    while IFS= read -r include; do
+        [[ -n "$include" ]] || continue
+        _act_is_safe_workspace_include_path "$include" || return 4
+        [[ -z "${seen_members[$include]:-}" ]] || return 4
+        seen_members["$include"]=1
+        expected_members+=("$include")
+    done <<< "$configured"
+
+    expected_entries=$(printf '%s\n' "${expected_members[@]}" | LC_ALL=C sort)
+    entries=$(printf '%s\n' "$entries" | LC_ALL=C sort)
+    if [[ "$entries" != "$expected_entries" ]]; then
+        _log_error "Strict workspace archive members do not match configured closure: $archive"
+        return 4
+    fi
+
+    local mode size executable=false
+    for member in "${expected_members[@]}"; do
+        case "$format" in
+            tar.gz)
+                mode=$(tar -tvzf "$archive" 2>/dev/null | \
+                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                ;;
+            tar.xz)
+                mode=$(tar -tvJf "$archive" 2>/dev/null | \
+                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                ;;
+            zip)
+                mode=$(unzip -Z -l "$archive" 2>/dev/null | \
+                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                ;;
+        esac
+        [[ "$mode" == -* ]] || return 4
+    done
+
+    for member in "${binary_members[@]}"; do
+        size=$(_act_archive_entry_stream "$archive" "$format" "$member" 2>/dev/null | \
+            wc -c | tr -d '[:space:]') || return 4
+        executable=false
+        case "$format" in
+            tar.gz)
+                mode=$(tar -tvzf "$archive" 2>/dev/null | \
+                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                ;;
+            tar.xz)
+                mode=$(tar -tvJf "$archive" 2>/dev/null | \
+                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                ;;
+            zip)
+                mode=$(unzip -Z -l "$archive" 2>/dev/null | \
+                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                ;;
+        esac
+        [[ "$mode" == *x* ]] && executable=true
+        _act_validate_target_binary_reader \
+            "$archive::$member" "$target" "$size" "$executable" \
+            _act_read_archive_hex_bytes "$archive" "$format" "$member" || return 4
+    done
+}
+
 _act_stage_contract_primary() {
     local tool_name="$1"
     local version="$2"
@@ -555,17 +661,32 @@ _act_stage_contract_primary() {
         _log_error "Release primary must be a regular non-symlink file: $source_path"
         return 4
     fi
-    if [[ "$(basename "$source_path")" != "$expected_input_name" ]]; then
-        _log_error "Release primary input for $target must be named $expected_input_name"
+    local source_basename source_is_contract_asset=false source_format
+    source_basename=$(basename "$source_path")
+    if [[ "$source_basename" == "$expected_name" ]]; then
+        source_is_contract_asset=true
+    elif [[ "$source_basename" != "$expected_input_name" ]]; then
+        _log_error "Release primary input for $target must be named $expected_input_name or $expected_name"
         return 4
     fi
-    case "$(basename "$source_path")" in
+    case "$source_basename" in
         *.sha256|*.sha512|*.minisig|*.sig|*.sbom.*|*.intoto.jsonl)
             _log_error "Release primary candidate is metadata, not a binary/archive: $source_path"
             return 4
             ;;
     esac
-    if ! _act_validate_target_binary "$source_path" "$target"; then
+    source_format=$(_act_archive_format "$source_basename")
+    if $source_is_contract_asset && [[ "$source_format" != "none" ]]; then
+        local workspace_binaries
+        workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
+        if [[ -n "$workspace_binaries" ]]; then
+            _act_validate_workspace_archive \
+                "$source_path" "$source_format" "$target" "$config_file" || return 4
+        else
+            _act_validate_target_archive \
+                "$source_path" "$source_format" "$expected_input_name" "$target" || return 4
+        fi
+    elif ! _act_validate_target_binary "$source_path" "$target"; then
         return 4
     fi
 
@@ -622,7 +743,14 @@ _act_stage_contract_primary() {
         set -C
         umask 077
         exec 9> "$staged_path" || exit 4
-        case "$staged_format" in
+        if $source_is_contract_asset; then
+            cat -- "$source_path" >&9 || exit 4
+            if [[ -x "$source_path" && "$staged_format" == "none" ]]; then
+                chmod 700 /dev/fd/9 || exit 4
+            else
+                chmod 600 /dev/fd/9 || exit 4
+            fi
+        else case "$staged_format" in
             none)
                 cat -- "$source_path" >&9 || exit 4
                 if [[ -x "$source_path" ]]; then
@@ -651,6 +779,7 @@ _act_stage_contract_primary() {
                 ;;
             *) exit 4 ;;
         esac
+        fi
         exec 9>&-
     ); then
         _log_error "Unable to stage release primary for $target"
@@ -660,7 +789,19 @@ _act_stage_contract_primary() {
         _log_error "Staged release primary is not a regular file: $staged_path"
         return 4
     fi
-    if [[ "$staged_format" == "none" ]]; then
+    if $source_is_contract_asset && [[ "$staged_format" != "none" ]]; then
+        if [[ -n "${workspace_binaries:-}" ]]; then
+            _act_validate_workspace_archive \
+                "$staged_path" "$staged_format" "$target" "$config_file" || return 4
+        else
+            _act_validate_target_archive \
+                "$staged_path" "$staged_format" "$expected_input_name" "$target" || return 4
+        fi
+        if ! cmp -s -- "$source_path" "$staged_path"; then
+            _log_error "Staged release archive does not match its collected archive: $staged_path"
+            return 4
+        fi
+    elif [[ "$staged_format" == "none" ]]; then
         if ! _act_validate_target_binary "$staged_path" "$target"; then
             return 4
         fi
@@ -702,7 +843,7 @@ _act_stage_contract_primary() {
         _log_error "Release primary changed while staging for $target"
         return 4
     fi
-    if [[ "$staged_format" == "none" ]] && \
+    if { $source_is_contract_asset || [[ "$staged_format" == "none" ]]; } && \
        ! [[ "$source_sha_before" == "$staged_sha" &&
              "$source_size_before" == "$staged_size" ]]; then
         _log_error "Raw staged release primary does not match its collected binary for $target"
