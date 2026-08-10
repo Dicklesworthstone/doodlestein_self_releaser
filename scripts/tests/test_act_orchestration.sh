@@ -1912,6 +1912,41 @@ else
     fail "strict Cargo metadata cwd/config isolation was not constructed"
 fi
 
+closure_resume_source="$TEMP_DIR/closure-resume-snapshot/source"
+closure_resume_ambient="$TEMP_DIR/closure-resume-ambient"
+mkdir -p "$closure_resume_source/src" "$closure_resume_ambient"
+printf '%s\n' \
+    '[package]' \
+    'name = "closure-resume"' \
+    'version = "0.1.0"' \
+    'edition = "2021"' \
+    > "$closure_resume_source/Cargo.toml"
+printf '%s\n' 'pub fn proof() {}' > "$closure_resume_source/src/lib.rs"
+closure_resume_status=0
+if ! CARGO_HOME="$closure_resume_ambient" cargo generate-lockfile --offline \
+        --manifest-path "$closure_resume_source/Cargo.toml" >/dev/null 2>&1; then
+    closure_resume_status=1
+fi
+(
+    export CARGO_HOME="$closure_resume_ambient"
+    _act_is_windows_host() { return 1; }
+    _act_is_local_host() { return 0; }
+    [[ $closure_resume_status -eq 0 ]]
+    _act_validate_strict_cargo_source_closure \
+        "stub-host" "$closure_resume_source" '[]' >/dev/null
+    _act_validate_strict_cargo_source_closure \
+        "stub-host" "$closure_resume_source" '[]' >/dev/null
+) 2>/dev/null || closure_resume_status=$?
+if [[ $closure_resume_status -eq 0 && \
+      -d "$TEMP_DIR/closure-resume-snapshot/.cargo-home" && \
+      ! -L "$TEMP_DIR/closure-resume-snapshot/.cargo-home" && \
+      ! -e "$TEMP_DIR/closure-resume-snapshot/.cargo-home/config" && \
+      ! -e "$TEMP_DIR/closure-resume-snapshot/.cargo-home/config.toml" ]]; then
+    pass "strict Cargo closure validation safely reuses its isolated home on resume"
+else
+    fail "strict Cargo closure validation was not honestly resumable"
+fi
+
 closure_windows_metadata_command_file="$TEMP_DIR/strict-cargo-windows-metadata-command"
 closure_windows_metadata_command_status=0
 (

@@ -1583,7 +1583,8 @@ test_windows_strict_cargo_metadata_command() {
     ) 2>/dev/null || status=$?
 
     if [[ $status -eq 0 ]] && \
-       grep -Fq "Strict CARGO_HOME already exists" "$command_file" && \
+       grep -Fq "if (-not (Test-Path -LiteralPath \$strict))" "$command_file" && \
+       grep -Fq "if (-not (Test-Path -LiteralPath \$dest))" "$command_file" && \
        grep -Fq "contains ambient configuration" "$command_file" && \
        grep -Fq "\$env:CARGO_HOME=\$strict" "$command_file" && \
        grep -Fq "Set-Location -LiteralPath 'C:\build\source'; Write-Output ((Get-Location).Path)" \
