@@ -2067,10 +2067,13 @@ git -C "$strict_gitlink_repo" -c user.name=DSR-Test -c user.email=dsr-test@examp
 strict_gitlink_sha=$(git -C "$strict_gitlink_repo" rev-parse HEAD)
 mkdir -p "$strict_sync_repo"
 printf 'tracked release bytes\n' > "$strict_sync_repo/tracked.txt"
+mkdir -p "$strict_sync_repo/site/functions/model"
+printf 'export async function onRequest() {}\n' > \
+    "$strict_sync_repo/site/functions/model/[[path]].js"
 printf 'ignored.cache\n' > "$strict_sync_repo/.gitignore"
 printf 'must never reach a strict builder\n' > "$strict_sync_repo/ignored.cache"
 git -C "$strict_sync_repo" init -q
-git -C "$strict_sync_repo" add tracked.txt .gitignore
+git -C "$strict_sync_repo" add tracked.txt .gitignore 'site/functions/model/[[path]].js'
 git -C "$strict_sync_repo" update-index --add \
     --cacheinfo "160000,$strict_gitlink_sha,vendor/submodule"
 mkdir -p "$strict_sync_repo/vendor/submodule"
@@ -2176,8 +2179,10 @@ if [[ $strict_sync_status -eq 0 && -n "$strict_sync_root" && \
       ! -e "$strict_sync_root/ignored.cache" && \
       -d "$strict_sync_root/vendor/submodule" && \
       -z "$(find "$strict_sync_root/vendor/submodule" -mindepth 1 -print -quit)" && \
-      "$strict_sync_object_count" == "4" ]] && \
+      -f "$strict_sync_root/site/functions/model/[[path]].js" && \
+      "$strict_sync_object_count" == "8" ]] && \
    grep -Fq "$strict_gitlink_sha"$'\t160000\tvendor/submodule' "$strict_sync_manifest" && \
+   grep -Fq $'\t100644\tsite/functions/model/[[path]].js' "$strict_sync_manifest" && \
    echo "$strict_sync_output" | jq -e \
         '.status == "success" and (.source_roots | keys) == ["trj"]' &>/dev/null; then
     pass "strict sync authenticates gitlinks as empty directory placeholders"

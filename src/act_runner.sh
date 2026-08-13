@@ -2405,7 +2405,7 @@ _act_write_tracked_manifest() {
                         ( "$mode" == "100644" || "$mode" == "100755" ) ) || \
                       ( "$object_type" == "commit" && "$mode" == "160000" ) ) || \
                   ! "$object_id" =~ ^[0-9a-f]{40}$ || \
-                  ! "$path" =~ ^[A-Za-z0-9_./+@-]+$ || "$path" == *..* || \
+                  ! "$path" =~ ^[][A-Za-z0-9_./+@-]+$ || "$path" == *..* || \
                   ( "$mode" != "160000" && \
                     ( ! -f "$repo_path/$path" || -L "$repo_path/$path" ) ) ]]; then
                 _log_error "Strict release tracked path cannot be represented safely: $path"
@@ -2430,7 +2430,7 @@ _act_tracked_manifest_object_count() {
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
            ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
-           "$relative_path" =~ ^[A-Za-z0-9_./+@-]+$ && \
+           "$relative_path" =~ ^[][A-Za-z0-9_./+@-]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
         if [[ "$mode" == "160000" ]]; then
             expected_objects["d:$relative_path"]=1
@@ -2462,7 +2462,7 @@ _act_verify_tracked_manifest_local() {
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
            ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
-           "$relative_path" =~ ^[A-Za-z0-9_./+@-]+$ && \
+           "$relative_path" =~ ^[][A-Za-z0-9_./+@-]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
         if [[ "$mode" == "160000" ]]; then
             if [[ ! -d "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
@@ -2925,7 +2925,8 @@ while IFS="\$tab" read -r object_id mode relative_path; do
     test -n "\$relative_path"
     printf '%s\\n' "\$object_id" | grep -Eq '^[0-9a-f]{40}\$'
     case "\$mode" in 100644|100755|160000) :;; *) exit 21;; esac
-    case "\$relative_path" in /*|*..*|*[!A-Za-z0-9_./+@-]*) exit 21;; esac
+    case "\$relative_path" in /*|*..*) exit 21;; esac
+    printf '%s\\n' "\$relative_path" | grep -Eq '^[][A-Za-z0-9_./+@-]+\$'
     node='$remote_path'/\$relative_path
     parent=\$relative_path
     while test "\${parent#*/}" != "\$parent"; do
@@ -3005,7 +3006,7 @@ _act_verify_strict_checkout_snapshot() {
         win_remote_archive=$(_act_windows_cmd_path "$remote_archive")
         win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
         reparse_guard=$(_act_windows_reparse_guard_script)
-        ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$node=Join-Path '${win_remote_path}' \$parts[2]; try { if (\$parts[1] -eq '160000') { Assert-PlainDirectory \$node; if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { \$ok=\$false } } else { Assert-PlainFile \$node; \$actual=(git hash-object -- \$node).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)\""
+        ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@\[\]-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$node=Join-Path '${win_remote_path}' \$parts[2]; try { if (\$parts[1] -eq '160000') { Assert-PlainDirectory \$node; if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { \$ok=\$false } } else { Assert-PlainFile \$node; \$actual=(git hash-object -- \$node).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)\""
         verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
