@@ -5637,12 +5637,16 @@ act_orchestrate_build() {
     # first completed process, keeping the scheduler work-conserving without
     # sacrificing the project's Bash 4.0 compatibility.
     _act_reap_one_worker() {
-        local reap_index reap_pid worker_status
+        local reap_index reap_pid worker_status running_worker_pids
         while (( active_workers > 0 )); do
+            # The shell job table is authoritative here.  kill -0 is not: a
+            # completed, unreaped child (or an unrelated process that reused
+            # its PID) can still answer kill -0 and strand this loop forever.
+            running_worker_pids=$(jobs -pr)
             for ((reap_index = 0; reap_index < ${#worker_pids[@]}; reap_index++)); do
                 [[ -z "${worker_reaped[$reap_index]:-}" ]] || continue
                 reap_pid="${worker_pids[$reap_index]}"
-                if ! kill -0 "$reap_pid" 2>/dev/null; then
+                if ! grep -Fqx "$reap_pid" <<< "$running_worker_pids"; then
                     worker_status=0
                     wait "$reap_pid" || worker_status=$?
                     worker_reaped["$reap_index"]=1

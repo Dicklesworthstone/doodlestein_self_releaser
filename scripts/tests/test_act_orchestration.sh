@@ -462,6 +462,14 @@ fi
 echo ""
 echo "== bounded parallel orchestration and resume =="
 
+if rg 'running_worker_pids=\$\(jobs -pr\)' "$SCRIPT_DIR/src/act_runner.sh" >/dev/null &&
+   rg 'grep -Fqx "\$reap_pid"' "$SCRIPT_DIR/src/act_runner.sh" >/dev/null &&
+   ! rg 'kill -0 "\$reap_pid"' "$SCRIPT_DIR/src/act_runner.sh" >/dev/null; then
+    pass "worker reaping uses the shell job table instead of PID liveness"
+else
+    fail "worker reaping can hang on an exited child or a reused PID"
+fi
+
 comma_artifact="$TEMP_DIR/resume,artifact"
 printf 'comma-safe artifact\n' > "$comma_artifact"
 comma_result=$(jq -nc --arg path "$comma_artifact" '
