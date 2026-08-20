@@ -3481,16 +3481,21 @@ act_sync_sources() {
 }
 
 # Get build command from config
-# Usage: act_get_build_cmd <tool_name>
+# Usage: act_get_build_cmd <tool_name> [platform]
 act_get_build_cmd() {
     local tool_name="$1"
+    local platform="${2:-}"
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
 
     if [[ ! -f "$config_file" ]]; then
         return 4
     fi
 
-    yq -r '.build_cmd // ""' "$config_file" 2>/dev/null
+    if [[ -n "$platform" ]]; then
+        yq -r ".cross_compile.\"$platform\".build_cmd // .build_cmd // \"\"" "$config_file" 2>/dev/null
+    else
+        yq -r '.build_cmd // ""' "$config_file" 2>/dev/null
+    fi
 }
 
 # _act_token_is_safe <value> <kind>
@@ -4009,7 +4014,7 @@ act_run_native_build() {
     fi
 
     local_path=$(act_get_local_path "$tool_name")
-    build_cmd=$(act_get_build_cmd "$tool_name")
+    build_cmd=$(act_get_build_cmd "$tool_name" "$platform")
     build_env=$(act_get_build_env "$tool_name" "$platform")
     binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
 
