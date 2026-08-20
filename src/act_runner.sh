@@ -2292,30 +2292,35 @@ _act_sync_source() {
             tar_excludes+=("--exclude=$pattern")
         done
 
-        # Create remote directory and extract
-        # Windows (wlap) needs different mkdir syntax - use cmd /c with backslashes
-        local mkdir_cmd
+        # Create remote directory and extract. Windows OpenSSH hands the remote
+        # command to cmd.exe, so POSIX `%q` escaping is invalid there. Pass one
+        # validated cmd command as a single ssh argument instead.
+        local mkdir_cmd remote_extract_cmd
         if _act_is_windows_host "$host"; then
-            # Windows: convert forward slashes to backslashes, use cmd /c
             local win_path
             win_path=$(_act_windows_cmd_path "$remote_path")
-            mkdir_cmd="cmd /c \"if not exist \\\"$win_path\\\" mkdir \\\"$win_path\\\"\" && cd /d \"$win_path\""
+            if [[ ! "$win_path" =~ ^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$ ]]; then
+                _log_error "tar fallback requires a metacharacter-free Windows path: $remote_path"
+                return 4
+            fi
+            remote_extract_cmd="cmd /d /s /c \"if not exist $win_path mkdir $win_path && cd /d $win_path && tar xzf -\""
         else
             mkdir_cmd="mkdir -p \"$remote_path\" && cd \"$remote_path\""
+            remote_extract_cmd="$mkdir_cmd && tar xzf -"
         fi
 
-        local remote_extract_cmd="$mkdir_cmd && tar xzf -"
-        local escaped_remote_extract_cmd
-        printf -v escaped_remote_extract_cmd '%q' "$remote_extract_cmd"
-
         local sync_cmd_output sync_cmd_status
-        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" bash -c "
-            cd '$local_path' && \
-            tar czf - ${tar_excludes[*]} . | \
-            ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT \
-                -o StrictHostKeyChecking=accept-new \
-                '$ssh_destination' $escaped_remote_extract_cmd
-        " 2>&1)
+        sync_cmd_output=$(
+            set -o pipefail
+            {
+                cd "$local_path" &&
+                tar czf - "${tar_excludes[@]}" . |
+                    _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+                        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                        -o StrictHostKeyChecking=accept-new \
+                        "$ssh_destination" "$remote_extract_cmd"
+            } 2>&1
+        )
         sync_cmd_status=$?
         if [[ "$sync_cmd_status" -eq 0 ]]; then
             local duration=$(($(date +%s) - start_time))
