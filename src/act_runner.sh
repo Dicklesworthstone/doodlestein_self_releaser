@@ -3690,13 +3690,14 @@ _act_is_rust_build_influence_name() {
 }
 
 # Resolve the remote path to a built binary for SCP retrieval.
-# Usage: act_get_remote_artifact_path <language> <remote_path> <build_env> <binary_name> <platform>
+# Usage: act_get_remote_artifact_path <language> <remote_path> <build_env> <binary_name> <platform> [build_profile]
 act_get_remote_artifact_path() {
     local language="$1"
     local remote_path="${2%/}"
     local build_env="$3"
     local binary_name="$4"
     local platform="$5"
+    local build_profile="${6:-release}"
     local artifact_base=""
 
     case "$language" in
@@ -3711,18 +3712,18 @@ act_get_remote_artifact_path() {
             if [[ -n "$cargo_target_dir" ]]; then
                 case "$cargo_target_dir" in
                     /*|[A-Za-z]:/*|[A-Za-z]:\\*)
-                        artifact_base="$cargo_target_dir/release"
+                        artifact_base="$cargo_target_dir/$build_profile"
                         ;;
                     *)
-                        artifact_base="$remote_path/$cargo_target_dir/release"
+                        artifact_base="$remote_path/$cargo_target_dir/$build_profile"
                         ;;
                 esac
             else
-                artifact_base="$remote_path/target/release"
+                artifact_base="$remote_path/target/$build_profile"
             fi
 
             if [[ -n "$cargo_build_target" ]]; then
-                artifact_base="${artifact_base%/release}/$cargo_build_target/release"
+                artifact_base="${artifact_base%/$build_profile}/$cargo_build_target/$build_profile"
             fi
             ;;
         go)
@@ -4024,7 +4025,7 @@ act_run_native_build() {
     fi
 
     # Get build configuration
-    local local_path build_cmd build_env binary_name
+    local local_path build_cmd build_env binary_name build_profile
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
 
     if [[ ! -f "$config_file" ]]; then
@@ -4038,6 +4039,7 @@ act_run_native_build() {
     build_cmd=$(act_get_build_cmd "$tool_name" "$platform")
     build_env=$(act_get_build_env "$tool_name" "$platform")
     binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
+    build_profile=$(yq -r '.build_profile // "release"' "$config_file" 2>/dev/null)
 
     local language
     language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
@@ -4602,7 +4604,7 @@ act_run_native_build() {
         local download_failed=false
         for bin in "${binaries_to_download[@]}"; do
             local remote_artifact_path
-            remote_artifact_path=$(act_get_remote_artifact_path "$language" "$remote_path" "$build_env" "$bin" "$platform")
+            remote_artifact_path=$(act_get_remote_artifact_path "$language" "$remote_path" "$build_env" "$bin" "$platform" "$build_profile")
 
             local artifact_filename
             artifact_filename=$(basename "$remote_artifact_path")

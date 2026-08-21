@@ -150,6 +150,12 @@ yq() {
         '.build_cmd // ""')
             echo "${MOCK_BUILD_CMD:-go build}"
             ;;
+        *'.build_cmd // .build_cmd // ""')
+            echo "${MOCK_BUILD_CMD:-go build}"
+            ;;
+        '.build_profile // "release"')
+            echo "${MOCK_BUILD_PROFILE:-release}"
+            ;;
         '.workflow // ".github/workflows/release.yml"')
             echo ".github/workflows/release.yml"
             ;;
@@ -195,7 +201,7 @@ reset_state() {
 
     # Reset mock config values
     unset MOCK_TOOL_NAME MOCK_REPO MOCK_LOCAL_PATH MOCK_LANGUAGE
-    unset MOCK_BINARY_NAME MOCK_BUILD_CMD
+    unset MOCK_BINARY_NAME MOCK_BUILD_CMD MOCK_BUILD_PROFILE
     unset MOCK_HOST_PATH_MMINI MOCK_HOST_PATH_WLAP MOCK_HOST_PATH_TRJ
     unset MOCK_GLOBAL_ENV MOCK_PLATFORM_ENV
     unset MOCK_SSH_STREAM_FILE
@@ -1152,6 +1158,27 @@ test_scp_rust_artifact_path_with_cargo_build_target() {
     fi
 }
 
+test_scp_rust_artifact_path_with_custom_profile() {
+    log_test "SCP Unix: Rust honors configured Cargo profile directory"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_LOCAL_PATH="/local/path/mytool"
+    MOCK_BUILD_PROFILE="release-interactive"
+    MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr\nCARGO_BUILD_TARGET=aarch64-apple-darwin'
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local scp_args
+    scp_args=$(get_scp_args)
+
+    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/aarch64-apple-darwin/release-interactive/mytool "* ]]; then
+        log_pass "Rust artifact path honors configured Cargo profile directory"
+    else
+        log_fail "Expected custom-profile artifact path in: $scp_args"
+    fi
+}
+
 test_scp_windows_exe_extension() {
     log_test "SCP Windows: .exe extension added"
     reset_state
@@ -1647,6 +1674,7 @@ main() {
     test_scp_rust_artifact_path_with_absolute_cargo_target_dir
     test_scp_rust_artifact_path_with_relative_cargo_target_dir
     test_scp_rust_artifact_path_with_cargo_build_target
+    test_scp_rust_artifact_path_with_custom_profile
     test_scp_windows_exe_extension
     test_scp_windows_forward_slash_path
 
