@@ -363,6 +363,11 @@ test_unix_rust_isolation_executes_outside_operator_config() {
     printf '[package]\nname = "operator_dep"\nversion = "0.1.0"\nedition = "2021"\n' \
         > "$sibling_root/Cargo.toml"
     printf 'pub fn probe() -> bool { true }\n' > "$sibling_root/src/lib.rs"
+    git -C "$source_root" init -q
+    git -C "$source_root" config user.name "DSR Test"
+    git -C "$source_root" config user.email "dsr-test@example.invalid"
+    git -C "$source_root" add Cargo.toml src/lib.rs
+    git -C "$source_root" commit -qm "initial fixture"
     printf '%s\n' \
         '[alias]' \
         'operator-alias = "metadata --format-version 1 --no-deps"' \
@@ -384,7 +389,7 @@ test_unix_rust_isolation_executes_outside_operator_config() {
     MOCK_LANGUAGE="rust"
     MOCK_SIBLING_RELATIVE="operator-dep"
     MOCK_SIBLING_LOCAL_PATH="$sibling_root"
-    MOCK_BUILD_CMD='cargo check --offline --quiet && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/release" && printf "isolated binary\n" > "$CARGO_TARGET_DIR/release/tool"'
+    MOCK_BUILD_CMD='git diff-index --quiet HEAD -- && cargo check --offline --quiet && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/release" && printf "isolated binary\n" > "$CARGO_TARGET_DIR/release/tool"'
     MOCK_PLATFORM_ENV="CARGO_HOME=$operator_home/.cargo
 CARGO_TARGET_DIR=relative-operator-target
 DSR_PROBE_OUTPUT=$probe_output"
@@ -454,7 +459,7 @@ test_windows_rust_isolation_receipt_matches_command() {
     local win_home="${home//\//\\}"
     if jq -e \
          '.status == "success" and
-          (.cargo_isolation.stage_root | startswith("C:/Users/Public/dsr-builds/")) and
+          (.cargo_isolation.stage_root | startswith("C:/d/dsr-build-")) and
           .cargo_isolation.cargo_home == .build_influence_env.CARGO_HOME and
           .cargo_isolation.target_dir == .build_influence_env.CARGO_TARGET_DIR' \
          <<< "$result" >/dev/null && \
