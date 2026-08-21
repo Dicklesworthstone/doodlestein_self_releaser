@@ -378,6 +378,7 @@ test_unix_rust_isolation_executes_outside_operator_config() {
         '[patch.crates-io]' \
         'serde = { path = "/definitely/not/a/serde-checkout" }' \
         > "$operator_home/.cargo/config.toml"
+    mkdir -p "$operator_home/.cargo/git/checkouts/shared-mutable-checkout"
 
     MOCK_LOCAL_PATH="$source_root"
     MOCK_LANGUAGE="rust"
@@ -426,8 +427,9 @@ DSR_PROBE_OUTPUT=$probe_output"
        [[ "$observed_source" == /var/tmp/dsr-build-tool-linux-amd64-*/source ]] && \
        [[ "$observed_source" != "$source_root" ]] && \
        [[ "$observed_home" != "$operator_home/.cargo" ]] && \
+       [[ ! -e "$observed_home/git" ]] && \
        [[ ! -e "$observed_home/config.toml" ]]; then
-        log_pass "Cargo ran from the receipt-recorded source with a config-free home"
+        log_pass "Cargo ran with isolated mutable Git state and a config-free home"
     else
         log_fail "Operator Cargo config leaked or isolation receipt disagreed: status=$status result=$result"
     fi
