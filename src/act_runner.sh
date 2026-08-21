@@ -2303,7 +2303,14 @@ _act_sync_source() {
                 _log_error "tar fallback requires a metacharacter-free Windows path: $remote_path"
                 return 4
             fi
-            remote_extract_cmd="cmd /d /s /c \"if not exist $win_path mkdir $win_path && cd /d $win_path && tar xzf -\""
+            if ! _act_remote_mkdir "$host" "$remote_path"; then
+                _log_error "failed to create remote directory $remote_path on $host"
+                return 1
+            fi
+            # Invoke bsdtar directly. Wrapping this in `cmd /c` can detach the
+            # extractor from OpenSSH's stdin when the destination already
+            # exists, making the sender fail with a misleading Write error.
+            remote_extract_cmd="tar xzf - -C $remote_path"
         else
             mkdir_cmd="mkdir -p \"$remote_path\" && cd \"$remote_path\""
             remote_extract_cmd="$mkdir_cmd && tar xzf -"
@@ -2313,8 +2320,17 @@ _act_sync_source() {
         sync_cmd_output=$(
             set -o pipefail
             {
-                cd "$local_path" &&
-                tar czf - "${tar_excludes[@]}" . |
+                {
+                    if $respect_gitignore_excludes &&
+                       git -C "$local_path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+                        git -C "$local_path" ls-files --cached --others --exclude-standard -z |
+                            COPYFILE_DISABLE=1 tar -czf - -C "$local_path" \
+                                "${tar_excludes[@]}" --null -T -
+                    else
+                        cd "$local_path" &&
+                            COPYFILE_DISABLE=1 tar czf - "${tar_excludes[@]}" .
+                    fi
+                } |
                     _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
                         -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
                         -o StrictHostKeyChecking=accept-new \
@@ -4177,8 +4193,12 @@ act_run_native_build() {
                 *) nonstrict_target_dir="${remote_path%/*}/.dsr-cargo-target-${tool_name}-${platform//\//-}" ;;
             esac
             case "$remote_path" in
-                [A-Za-z]:[\\/]*) isolation_root="${remote_path:0:1}:/Users/Public/dsr-builds" ;;
-                /[A-Za-z]/*) isolation_root="${remote_path:1:1}:/Users/Public/dsr-builds" ;;
+                # Keep the Windows staging prefix deliberately short. Vendored
+                # test fixtures can already approach MAX_PATH before DSR adds
+                # its isolation directory, and PowerShell Copy-Item then fails
+                # before the compiler starts.
+                [A-Za-z]:[\\/]*) isolation_root="${remote_path:0:1}:/d" ;;
+                /[A-Za-z]/*) isolation_root="${remote_path:1:1}:/d" ;;
                 *)
                     _log_error "Windows Rust source path has no drive-qualified isolation root"
                     jq -nc '{status: "error", exit_code: 4, error: "Invalid Windows Rust source path"}'
@@ -4207,9 +4227,18 @@ act_run_native_build() {
         [[ -n "$nonstrict_env" ]] && nonstrict_env+=$'\n'
         nonstrict_env+="CARGO_TARGET_DIR=$nonstrict_target_dir"
 
-        nonstrict_stage_root="${isolation_root%/}/dsr-build-${tool_name}-${platform//\//-}-${isolation_suffix}"
-        nonstrict_source_root="$nonstrict_stage_root/source"
-        nonstrict_cargo_home="$nonstrict_stage_root/cargo-home"
+        if _act_is_windows_host "$host"; then
+            # Leave almost the entire MAX_PATH budget to vendored source file
+            # names. The directory is still unique and retains the guarded
+            # dsr-build-* shape used by cleanup.
+            nonstrict_stage_root="${isolation_root%/}/dsr-build-${isolation_suffix:0:12}"
+            nonstrict_source_root="$nonstrict_stage_root/s"
+            nonstrict_cargo_home="$nonstrict_stage_root/c"
+        else
+            nonstrict_stage_root="${isolation_root%/}/dsr-build-${tool_name}-${platform//\//-}-${isolation_suffix}"
+            nonstrict_source_root="$nonstrict_stage_root/source"
+            nonstrict_cargo_home="$nonstrict_stage_root/cargo-home"
+        fi
         nonstrict_env+=$'\n'"CARGO_HOME=$nonstrict_cargo_home"
         build_env="$nonstrict_env"
 
