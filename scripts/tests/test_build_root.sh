@@ -120,8 +120,7 @@ if command -v yq >/dev/null 2>&1; then
         log_fail "Unexpected root for unconfigured host: $actual"
     fi
 
-    DSR_STRICT_BUILD_ROOT="/opt/strict-override" \
-        actual=$(DSR_STRICT_BUILD_ROOT="/opt/strict-override" _act_strict_source_root_path "/remote/repo" "tool" "$RUN_ID" "h1")
+    actual=$(DSR_STRICT_BUILD_ROOT="/opt/strict-override" _act_strict_source_root_path "/remote/repo" "tool" "$RUN_ID" "h1")
     if [[ "$actual" == "/opt/strict-override/tool-$RUN_ID/source" ]]; then
         log_pass "DSR_STRICT_BUILD_ROOT still overrides hosts.yaml build_root"
     else
@@ -157,7 +156,7 @@ else
 fi
 
 status=0
-out=$(PATH="$TEMP_DIR/bin-none" sh -c "set -e; ${guard}echo survived" 2>/dev/null) || status=$?
+out=$(PATH="$TEMP_DIR/bin-none:/usr/bin:/bin" sh -c "set -e; ${guard}echo survived" 2>/dev/null) || status=$?
 if [[ $status -eq 0 && "$out" == "survived" ]]; then
     log_pass "Guard is a no-op when neither findmnt nor GNU stat is usable"
 else
