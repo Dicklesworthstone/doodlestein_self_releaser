@@ -198,6 +198,26 @@ test_generate_dual_same_names() {
 }
 
 # =============================================================================
+# TEST: _an_derive_compat_from_versioned
+# =============================================================================
+
+test_derive_compat_strips_version_and_v_prefix() {
+    log_test "Derive compat pattern - version and any glued v prefix are removed"
+    assert_eq '${name}-${target_triple}' "$(_an_derive_compat_from_versioned '${name}-v${version}-${target_triple}')" \
+        "v-prefixed middle version (sbh regression) leaves no stray v"
+    assert_eq '${name}-${os}-${arch}' "$(_an_derive_compat_from_versioned '${name}-${version}-${os}-${arch}')" \
+        "plain middle version"
+    assert_eq '${name}_${os}' "$(_an_derive_compat_from_versioned '${name}_v${version}_${os}')" \
+        "underscore separators"
+    assert_eq '${name}' "$(_an_derive_compat_from_versioned '${name}-v${version}')" \
+        "trailing v-prefixed version"
+    assert_eq '${name}' "$(_an_derive_compat_from_versioned 'v${version}-${name}')" \
+        "leading v-prefixed version"
+    assert_eq '${name}-${os}' "$(_an_derive_compat_from_versioned '${name}-${os}')" \
+        "pattern without version is unchanged"
+}
+
+# =============================================================================
 # TEST: artifact_naming_validate
 # =============================================================================
 
@@ -317,6 +337,7 @@ main() {
     test_generate_dual_with_pattern
     test_generate_dual_windows
     test_generate_dual_same_names
+    test_derive_compat_strips_version_and_v_prefix
 
     # Validation tests
     test_validate_consistent

@@ -610,15 +610,19 @@ _an_derive_compat_from_versioned() {
     local versioned="$1"
     local compat="$versioned"
 
-    # Remove version component variations
-    compat="${compat//\$\{version\}-/}"
-    compat="${compat//-\$\{version\}/}"
-    compat="${compat//v\$\{version\}-/}"
-    compat="${compat//-v\$\{version\}/}"
-    compat="${compat//\$\{version\}/}"
+    # Remove the version component together with ONE adjacent separator and
+    # any literal v/V glued to it, longest forms first. The old ordering
+    # stripped "${version}-" before "v${version}-", which turned
+    # ${name}-v${version}-${target_triple} into ${name}-v${target_triple}
+    # (the sbh-vx86_64-unknown-linux-gnu.tar.xz release asset).
+    compat=$(printf '%s' "$compat" | sed -E \
+        -e 's/([-_.])[vV]?\$\{version\}([-_.])/\1/g' \
+        -e 's/^[vV]?\$\{version\}[-_.]//' \
+        -e 's/[-_.][vV]?\$\{version\}$//' \
+        -e 's/[vV]?\$\{version\}//g')
 
-    # Clean up any double-hyphens or underscores
-    compat=$(echo "$compat" | sed 's/--/-/g' | sed 's/__/_/g')
+    # Clean up any double separators left behind
+    compat=$(printf '%s' "$compat" | sed -E 's/--+/-/g; s/__+/_/g')
 
     echo "$compat"
 }
