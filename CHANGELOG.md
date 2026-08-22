@@ -12,6 +12,19 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- Strict release snapshots now default to `/var/tmp/.dsr-release-snapshots`
+  instead of `/tmp`, matching the isolated Rust build root. On hosts where
+  `/tmp` is a RAM-backed tmpfs a release wave could stage multi-GB source
+  trees into memory and wedge the host (#6).
+- `hosts.yaml` gains an optional per-host `build_root` that roots both strict
+  snapshots and isolated Rust builds; unsafe values (relative, `..`, or under
+  `$HOME` on the local host) fail closed. `DSR_STRICT_BUILD_ROOT` still wins.
+- Remote and local staging now probe the root's filesystem (`findmnt` / GNU
+  `stat`) and refuse to stage onto tmpfs/ramfs with an actionable error.
+- Compat (unversioned) asset names derived from an `artifact_naming` pattern
+  no longer keep a literal `v` when the pattern uses `v${version}`; previously
+  `sbh-v${version}-${target_triple}` produced `sbh-vx86_64-unknown-linux-gnu`.
+
 - Multi-binary native archives now honor configured `include_files`, including
   README, license, and notice files. Companion paths are validated and staged
   without allowing a missing file, symlinked path component, traversal, or

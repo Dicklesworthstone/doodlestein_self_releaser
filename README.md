@@ -199,6 +199,11 @@ hosts:
     platform: darwin/arm64
     connection: ssh
     ssh_host: mmini
+  ts1:
+    platform: linux/amd64
+    connection: ssh
+    ssh_host: ts1
+    build_root: /var/tmp/dsr-builds   # optional: disk-backed staging root
   wlap:
     platform: windows/amd64
     connection: ssh
@@ -206,6 +211,13 @@ hosts:
 ```
 
 Ensure hosts have required toolchains for your repos (rust/go/bun) and that `trj` has Docker + act for Linux builds.
+
+Release snapshots and isolated Rust builds are staged under `/var/tmp` on Linux hosts and
+`/private/tmp` on macOS — never `/tmp`, which is frequently a RAM-backed tmpfs that a multi-GB
+source tree plus Cargo target will exhaust. Set `build_root` on a host to stage somewhere else
+(a bigger disk, or a host whose `/var/tmp` is also RAM-backed); `DSR_STRICT_BUILD_ROOT` still
+overrides it for strict release snapshots. Either way dsr refuses to stage onto a tmpfs/ramfs
+root and tells you to set `build_root`.
 
 ### 4. Set Up Signing (Recommended)
 

@@ -95,6 +95,13 @@ overflow capacity and failover when one host is unhealthy or asleep.
 `~/.config/dsr/hosts.yaml`. If you drive releases from more than one
 orchestrator, a host added on one is invisible to the other — edit both.
 
+**Where builds are staged.** Strict release snapshots and isolated Rust builds
+go under `/var/tmp` (Linux) or `/private/tmp` (macOS), never `/tmp`: on many
+Linux boxes `/tmp` is a RAM-backed tmpfs, and a staged workspace plus its
+Cargo target can wedge the host. A host can override the root with
+`build_root: /path/on/disk` in `hosts.yaml`; `DSR_STRICT_BUILD_ROOT` beats it
+for strict snapshots. dsr refuses to stage onto tmpfs/ramfs in either mode.
+
 ### Host selection
 
 `act_get_native_host` resolves a platform to a host in this order:
