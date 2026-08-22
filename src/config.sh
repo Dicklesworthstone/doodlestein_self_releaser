@@ -117,6 +117,9 @@ hosts:
       - act
     concurrency: 4
     description: "Threadripper workstation (local)"
+    # Optional: disk-backed root for release snapshots and isolated Rust
+    # builds (default /var/tmp on Linux, /private/tmp on macOS; never /tmp).
+    # build_root: /var/tmp/dsr-builds
 
   mmini:
     platform: darwin/arm64

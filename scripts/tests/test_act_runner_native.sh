@@ -173,6 +173,9 @@ yq() {
         '.env // {} | to_entries | map(.key + "=" + .value) | .[]')
             echo "${MOCK_GLOBAL_ENV:-}"
             ;;
+        '.hosts.'*'.build_root // ""')
+            echo "${MOCK_HOST_BUILD_ROOT:-}"
+            ;;
         *'.cross_compile.'*'.env'*)
             echo "${MOCK_PLATFORM_ENV:-}"
             ;;
@@ -316,6 +319,76 @@ test_unix_rust_unsets_ambient_cargo_path_env() {
         log_pass "Unsets ambient Cargo paths and keeps native Rust compilation local"
     else
         log_fail "Expected Cargo path env unsets in: $cmd"
+    fi
+}
+
+test_unix_rust_isolation_guards_ram_backed_root() {
+    log_test "Unix Rust: staging creates the isolation root and refuses tmpfs/ramfs"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_cmd)
+
+    if [[ "$cmd" == *"mkdir -p '/private/tmp'; _dsr_fstype=\$( (findmnt -no FSTYPE -T '/private/tmp'"* && \
+          "$cmd" == *"tmpfs|ramfs) echo \"[dsr] refusing to stage the build under RAM-backed /private/tmp"* && \
+          "$cmd" == *"mkdir '/private/tmp/dsr-build-tool-darwin-arm64-"* ]]; then
+        log_pass "Isolation root is created and guarded against RAM-backed filesystems"
+    else
+        log_fail "Expected isolation root mkdir + RAM-backed guard in: $cmd"
+    fi
+}
+
+test_unix_rust_isolation_honors_host_build_root() {
+    log_test "Unix Rust: hosts.yaml build_root replaces the default isolation root"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_HOST_BUILD_ROOT="/srv/dsr-builds"
+    export DSR_HOSTS_FILE="$MOCK_DIR/hosts.yaml"
+    touch "$DSR_HOSTS_FILE"
+
+    local result
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null)
+
+    local cmd
+    cmd=$(get_ssh_cmd)
+    unset DSR_HOSTS_FILE MOCK_HOST_BUILD_ROOT
+
+    if [[ "$cmd" == *"mkdir -p '/srv/dsr-builds'; _dsr_fstype="* && \
+          "$cmd" == *"mkdir '/srv/dsr-builds/dsr-build-tool-darwin-arm64-"* && \
+          "$cmd" != *"/private/tmp/dsr-build-"* ]] && \
+       jq -e '.cargo_isolation.source_root | startswith("/srv/dsr-builds/dsr-build-tool-darwin-arm64-")' \
+          <<< "$result" >/dev/null; then
+        log_pass "hosts.yaml build_root is used for the Rust isolation root"
+    else
+        log_fail "Expected /srv/dsr-builds isolation root in: $cmd result=$result"
+    fi
+}
+
+test_unix_rust_isolation_rejects_invalid_host_build_root() {
+    log_test "Unix Rust: an unsafe hosts.yaml build_root fails closed"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_HOST_BUILD_ROOT="/srv/../etc"
+    export DSR_HOSTS_FILE="$MOCK_DIR/hosts.yaml"
+    touch "$DSR_HOSTS_FILE"
+
+    local result status=0
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null) || status=$?
+    local cmd
+    cmd=$(get_ssh_cmd)
+    unset DSR_HOSTS_FILE MOCK_HOST_BUILD_ROOT
+
+    if [[ $status -eq 4 && -z "$cmd" ]] && \
+       jq -e '.status == "error" and .error == "Invalid hosts.yaml build_root"' <<< "$result" >/dev/null; then
+        log_pass "Invalid build_root aborts before any remote command runs"
+    else
+        log_fail "Expected exit 4 and no remote command for invalid build_root: status=$status cmd=$cmd result=$result"
     fi
 }
 
@@ -1645,6 +1718,9 @@ main() {
     test_unix_cd_command
     test_unix_env_export_syntax
     test_unix_rust_unsets_ambient_cargo_path_env
+    test_unix_rust_isolation_guards_ram_backed_root
+    test_unix_rust_isolation_honors_host_build_root
+    test_unix_rust_isolation_rejects_invalid_host_build_root
     test_unix_rust_keeps_configured_cargo_path_env
     test_unix_rust_isolation_executes_outside_operator_config
     test_windows_rust_isolation_receipt_matches_command

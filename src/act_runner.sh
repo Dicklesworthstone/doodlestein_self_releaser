@@ -2012,6 +2012,51 @@ _act_get_host_platform() {
     esac
 }
 
+# Per-host staging root for build snapshots (hosts.yaml `build_root`).
+# Used for strict release snapshots and for ordinary Rust isolation roots, so
+# a host whose /tmp or /var/tmp is RAM-backed or too small can point builds at
+# a disk-backed directory. Prints the root and returns 0 when configured,
+# returns 1 when unset, and returns 4 (after logging) when the configured
+# value is unsafe: relative, containing `..`, outside the conservative path
+# alphabet, or (for the local host) inside $HOME where Cargo would inherit the
+# operator's configuration.
+_act_get_host_build_root() {
+    local host="${1:-}"
+    local build_root
+    build_root=$(_act_get_host_field "$host" "build_root" || true)
+    [[ -n "$build_root" ]] || return 1
+    build_root="${build_root%/}"
+    if [[ ! "$build_root" =~ ^([A-Za-z]:)?/[A-Za-z0-9_./:+-]+$ || "$build_root" == *..* ]]; then
+        _log_error "hosts.yaml build_root for $host must be an absolute path without '..' (got: $build_root)"
+        return 4
+    fi
+    if [[ -n "${HOME:-}" && "$build_root" == "$HOME"/* ]] && _act_is_local_host "$host"; then
+        _log_error "hosts.yaml build_root for local host $host must not be inside \$HOME ($HOME): $build_root"
+        return 4
+    fi
+    printf '%s\n' "$build_root"
+}
+
+# True when the filesystem holding <dir> is RAM-backed (tmpfs/ramfs). Only
+# meaningful where findmnt or GNU stat exist; elsewhere (macOS) it is false.
+_act_dir_is_ram_backed() {
+    local dir="${1:-}"
+    local fstype
+    [[ -n "$dir" ]] || return 1
+    fstype=$( (findmnt -no FSTYPE -T "$dir" 2>/dev/null || stat -f -c %T "$dir" 2>/dev/null) | head -n 1)
+    [[ "$fstype" == tmpfs || "$fstype" == ramfs ]]
+}
+
+# POSIX sh snippet (with trailing "; ") that aborts with exit 4 when <dir> is
+# on a RAM-backed filesystem. Embedded in remote staging commands so a build
+# host never stages a multi-GB source tree into RAM (issue #6: a release wave
+# staged under a tmpfs /tmp and wedged the host).
+_act_ram_backed_guard_sh() {
+    local dir="${1:-}"
+    local dir_q="${dir//\'/\'\\\'\'}"
+    printf '%s' "_dsr_fstype=\$( (findmnt -no FSTYPE -T '$dir_q' 2>/dev/null || stat -f -c %T '$dir_q' 2>/dev/null) | head -n 1); case \"\$_dsr_fstype\" in tmpfs|ramfs) echo \"[dsr] refusing to stage the build under RAM-backed $dir_q (\$_dsr_fstype); set build_root for this host in hosts.yaml\" >&2; exit 4;; esac; "
+}
+
 _act_get_host_connection() {
     local host="${1:-}"
     local connection
@@ -2349,15 +2394,25 @@ _act_sync_source() {
     fi
 }
 
+# Fresh source root for a strict release snapshot. Precedence for the root:
+# DSR_STRICT_BUILD_ROOT (operator/CI override) > hosts.yaml build_root for the
+# host > /var/tmp (POSIX) or <drive>:/Users/Public (Windows). Never /tmp: on
+# many Linux hosts it is a RAM-backed tmpfs, and a snapshot plus its Cargo
+# target can run to tens of GB.
 _act_strict_source_root_path() {
     local configured_path="$1"
     local tool_name="$2"
     local run_id="$3"
-    local strict_root
+    local host="${4:-}"
+    local strict_root host_build_root="" host_build_root_rc=0
 
     if [[ ! "$configured_path" =~ ^[A-Za-z0-9_./:+-]+$ || "$configured_path" == *..* ]] || \
        ! _act_is_safe_basename "$tool_name" || ! _act_is_uuid "$run_id"; then
         return 4
+    fi
+    if [[ -n "$host" ]]; then
+        host_build_root=$(_act_get_host_build_root "$host") || host_build_root_rc=$?
+        [[ "$host_build_root_rc" -ne 4 ]] || return 4
     fi
     if [[ -n "${DSR_STRICT_BUILD_ROOT:-}" ]]; then
         strict_root="${DSR_STRICT_BUILD_ROOT%/}"
@@ -2366,10 +2421,12 @@ _act_strict_source_root_path() {
               ( -n "${HOME:-}" && "$strict_root" == "$HOME"/* ) ]]; then
             return 4
         fi
+    elif [[ -n "$host_build_root" ]]; then
+        strict_root="$host_build_root/.dsr-release-snapshots"
     elif [[ "$configured_path" =~ ^[A-Za-z]:/ ]]; then
         strict_root="${configured_path:0:2}/Users/Public/.dsr-release-snapshots"
     elif [[ "$configured_path" == /* ]]; then
-        strict_root="/tmp/.dsr-release-snapshots"
+        strict_root="/var/tmp/.dsr-release-snapshots"
     else
         return 4
     fi
@@ -2813,7 +2870,15 @@ _act_sync_strict_checkout() {
     if _act_is_local_host "$host"; then
         if $creates_snapshot_parent; then
             if [[ -e "$snapshot_parent" || -L "$snapshot_parent" ]] || \
-               ! mkdir -p "$snapshot_grandparent" || ! mkdir -m 700 "$snapshot_parent"; then
+               ! mkdir -p "$snapshot_grandparent"; then
+                _log_error "Strict release snapshot parent already exists for $label"
+                return 4
+            fi
+            if _act_dir_is_ram_backed "$snapshot_grandparent"; then
+                _log_error "Refusing to stage $label under RAM-backed $snapshot_grandparent; set build_root for this host in hosts.yaml"
+                return 4
+            fi
+            if ! mkdir -m 700 "$snapshot_parent"; then
                 _log_error "Strict release snapshot parent already exists for $label"
                 return 4
             fi
@@ -2863,7 +2928,7 @@ _act_sync_strict_checkout() {
     else
         local remote_cmd parent_setup
         if $creates_snapshot_parent; then
-            parent_setup="mkdir -p '$snapshot_grandparent'; test ! -e '$snapshot_parent'; test ! -L '$snapshot_parent'; mkdir '$snapshot_parent'"
+            parent_setup="mkdir -p '$snapshot_grandparent'; $(_act_ram_backed_guard_sh "$snapshot_grandparent")test ! -e '$snapshot_parent'; test ! -L '$snapshot_parent'; mkdir '$snapshot_parent'"
         else
             parent_setup="test -d '$snapshot_parent'; test ! -L '$snapshot_parent'"
         fi
@@ -3336,7 +3401,7 @@ act_sync_sources() {
 
         if $strict_release; then
             if ! remote_path=$(_act_strict_source_root_path \
-                "$remote_path" "$tool_name" "$strict_run_id"); then
+                "$remote_path" "$tool_name" "$strict_run_id" "$host"); then
                 _log_error "Could not derive a safe fresh source root for $host"
                 echo '{"status":"error","error":"Invalid strict release source root"}'
                 return 4
@@ -4219,6 +4284,15 @@ act_run_native_build() {
                 # sibling crate) can run to tens of GB per target.
                 *) isolation_root="/var/tmp" ;;
             esac
+            local host_build_root="" host_build_root_rc=0
+            host_build_root=$(_act_get_host_build_root "$host") || host_build_root_rc=$?
+            if [[ "$host_build_root_rc" -eq 4 ]]; then
+                jq -nc '{status: "error", exit_code: 4, error: "Invalid hosts.yaml build_root"}'
+                return 4
+            fi
+            if [[ -n "$host_build_root" ]]; then
+                isolation_root="$host_build_root"
+            fi
         fi
         if [[ -z "$nonstrict_target_dir" || "$nonstrict_target_dir" == *$'\n'* || \
               "$nonstrict_target_dir" == *$'\r'* ]]; then
@@ -4508,7 +4582,10 @@ act_run_native_build() {
             # caches and cannot contain aliases, patches, source replacement,
             # credentials, or compiler settings.  Unique directories avoid
             # cross-target races and require no destructive pre-build cleanup.
-            cargo_home_prefix="_dsr_src='$rp_q'; _dsr_ancestor=\${_dsr_src%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do if test -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\" || test -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; then printf '[dsr] excluding inherited Cargo config: %s\\n' \"\$_dsr_ancestor/.cargo/\$_dsr_name\" >&2; fi; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; _dsr_ancestor='${nonstrict_stage_root%/*}'; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do test ! -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; test ! -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; test ! -e '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_stage_root}'; test -d '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_source_root}' '${nonstrict_cargo_home}'; ${sibling_copy_prefix}for _dsr_name in registry; do if test -d \"\$HOME/.cargo/\$_dsr_name\"; then ln -s \"\$HOME/.cargo/\$_dsr_name\" '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; fi; done; for _dsr_name in config config.toml credentials credentials.toml; do test ! -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; done; cp -R \"\$_dsr_src/.\" '${nonstrict_source_root}/'; if test -e '${nonstrict_source_root}/.git' || test -L '${nonstrict_source_root}/.git'; then git -C '${nonstrict_source_root}' status --porcelain --untracked-files=no >/dev/null; fi; export CARGO_HOME='${nonstrict_cargo_home}'; "
+            local isolation_root_q="${isolation_root//\'/\'\\\'\'}"
+            local isolation_root_guard
+            isolation_root_guard="mkdir -p '${isolation_root_q}'; $(_act_ram_backed_guard_sh "$isolation_root")"
+            cargo_home_prefix="${isolation_root_guard}_dsr_src='$rp_q'; _dsr_ancestor=\${_dsr_src%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do if test -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\" || test -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; then printf '[dsr] excluding inherited Cargo config: %s\\n' \"\$_dsr_ancestor/.cargo/\$_dsr_name\" >&2; fi; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; _dsr_ancestor='${nonstrict_stage_root%/*}'; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do test ! -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; test ! -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; test ! -e '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_stage_root}'; test -d '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_source_root}' '${nonstrict_cargo_home}'; ${sibling_copy_prefix}for _dsr_name in registry; do if test -d \"\$HOME/.cargo/\$_dsr_name\"; then ln -s \"\$HOME/.cargo/\$_dsr_name\" '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; fi; done; for _dsr_name in config config.toml credentials credentials.toml; do test ! -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; done; cp -R \"\$_dsr_src/.\" '${nonstrict_source_root}/'; if test -e '${nonstrict_source_root}/.git' || test -L '${nonstrict_source_root}/.git'; then git -C '${nonstrict_source_root}' status --porcelain --untracked-files=no >/dev/null; fi; export CARGO_HOME='${nonstrict_cargo_home}'; "
             cd_cmd="cd '${nonstrict_source_root}'"
         fi
         remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
@@ -5452,7 +5529,7 @@ act_orchestrate_build() {
             fi
             [[ -n "$configured_host_path" ]] || configured_host_path="$ACT_REPO_LOCAL_PATH"
             if ! expected_source_root=$(_act_strict_source_root_path \
-                "$configured_host_path" "$tool_name" "$supplied_run_id"); then
+                "$configured_host_path" "$tool_name" "$supplied_run_id" "$source_host"); then
                 jq -nc --arg tool "$tool_name" --arg error "Invalid canonical strict source root" \
                     '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
                 return 4
