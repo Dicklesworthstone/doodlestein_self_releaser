@@ -2081,11 +2081,15 @@ printf 'export async function onRequest() {}\n' > \
 mkdir -p "$strict_sync_repo/vendor/git.sr.ht/~sbinet/gg"
 printf 'tilde namespace license\n' > \
     "$strict_sync_repo/vendor/git.sr.ht/~sbinet/gg/LICENSE.md"
+mkdir -p "$strict_sync_repo/vendor/github.com/alecthomas/chroma/v2/lexers/embedded"
+printf 'sharp lexer fixture\n' > \
+    "$strict_sync_repo/vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml"
 printf 'ignored.cache\n' > "$strict_sync_repo/.gitignore"
 printf 'must never reach a strict builder\n' > "$strict_sync_repo/ignored.cache"
 git -C "$strict_sync_repo" init -q
 git -C "$strict_sync_repo" add tracked.txt .gitignore 'site/functions/model/[[path]].js' \
-    'vendor/git.sr.ht/~sbinet/gg/LICENSE.md'
+    'vendor/git.sr.ht/~sbinet/gg/LICENSE.md' \
+    'vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml'
 git -C "$strict_sync_repo" update-index --add \
     --cacheinfo "160000,$strict_gitlink_sha,vendor/submodule"
 mkdir -p "$strict_sync_repo/vendor/submodule"
@@ -2193,10 +2197,12 @@ if [[ $strict_sync_status -eq 0 && -n "$strict_sync_root" && \
       -z "$(find "$strict_sync_root/vendor/submodule" -mindepth 1 -print -quit)" && \
       -f "$strict_sync_root/site/functions/model/[[path]].js" && \
       -f "$strict_sync_root/vendor/git.sr.ht/~sbinet/gg/LICENSE.md" && \
-      "$strict_sync_object_count" == "12" ]] && \
+      -f "$strict_sync_root/vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml" && \
+      "$strict_sync_object_count" == "19" ]] && \
    grep -Fq "$strict_gitlink_sha"$'\t160000\tvendor/submodule' "$strict_sync_manifest" && \
    grep -Fq $'\t100644\tsite/functions/model/[[path]].js' "$strict_sync_manifest" && \
    grep -Fq $'\t100644\tvendor/git.sr.ht/~sbinet/gg/LICENSE.md' "$strict_sync_manifest" && \
+   grep -Fq $'\t100644\tvendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml' "$strict_sync_manifest" && \
    echo "$strict_sync_output" | jq -e \
         '.status == "success" and (.source_roots | keys) == ["trj"]' &>/dev/null; then
     pass "strict sync authenticates gitlinks as empty directory placeholders"
@@ -2367,11 +2373,11 @@ strict_windows_gitlink_status=0
 ) >/dev/null 2>&1 || strict_windows_gitlink_status=$?
 if [[ $strict_windows_gitlink_status -eq 0 ]] && \
    grep -Fq "parts[1] -eq '160000'" "$strict_windows_gitlink_command_file" && \
-   grep -Fq '^[A-Za-z0-9_./+@~\[\]-]+$' "$strict_windows_gitlink_command_file" && \
+   grep -Fq '^[A-Za-z0-9_./+@~#\[\]-]+$' "$strict_windows_gitlink_command_file" && \
    grep -Fq 'Get-ChildItem -LiteralPath $node -Force' "$strict_windows_gitlink_command_file"; then
-    pass "strict Windows verification accepts safe tilde paths and requires empty gitlinks"
+    pass "strict Windows verification accepts safe namespace paths and requires empty gitlinks"
 else
-    fail "strict Windows verification omitted the tilde-path or gitlink contract"
+    fail "strict Windows verification omitted the safe-path or gitlink contract"
 fi
 
 strict_windows_verify_status=0
