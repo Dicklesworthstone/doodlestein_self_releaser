@@ -1159,6 +1159,25 @@ test_scp_unix_artifact_path() {
     fi
 }
 
+test_go_artifact_path_honors_gobin() {
+    log_test "Go artifact path honors absolute GOBIN outside the source root"
+
+    local unix_path windows_path
+    unix_path=$(act_get_remote_artifact_path \
+        "go" "/snapshot/source" $'GOBIN=/snapshot/go-bin-linux-amd64' \
+        "mytool" "linux/amd64")
+    windows_path=$(act_get_remote_artifact_path \
+        "go" "/snapshot/source" $'GOBIN=/snapshot/go-bin-windows-amd64' \
+        "mytool" "windows/amd64")
+
+    if [[ "$unix_path" == "/snapshot/go-bin-linux-amd64/mytool" && \
+          "$windows_path" == "/snapshot/go-bin-windows-amd64/mytool.exe" ]]; then
+        log_pass "Go artifact paths resolve from GOBIN for Unix and Windows targets"
+    else
+        log_fail "Unexpected GOBIN artifact paths: unix=$unix_path windows=$windows_path"
+    fi
+}
+
 test_scp_rust_artifact_path() {
     log_test "SCP Unix: Rust default target is derived outside staged source"
     reset_state
@@ -1753,6 +1772,7 @@ main() {
 
     # SCP commands
     test_scp_unix_artifact_path
+    test_go_artifact_path_honors_gobin
     test_scp_rust_artifact_path
     test_scp_rust_artifact_path_with_absolute_cargo_target_dir
     test_scp_rust_artifact_path_with_relative_cargo_target_dir

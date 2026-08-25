@@ -3792,7 +3792,22 @@ act_get_remote_artifact_path() {
             fi
             ;;
         go)
-            artifact_base="$remote_path"
+            local go_bin=""
+            go_bin=$(act_get_build_env_value "$build_env" "GOBIN" 2>/dev/null || true)
+            go_bin="${go_bin%/}"
+            go_bin="${go_bin%\\}"
+            if [[ -n "$go_bin" ]]; then
+                case "$go_bin" in
+                    /*|[A-Za-z]:/*|[A-Za-z]:\\*)
+                        artifact_base="$go_bin"
+                        ;;
+                    *)
+                        artifact_base="$remote_path/$go_bin"
+                        ;;
+                esac
+            else
+                artifact_base="$remote_path"
+            fi
             ;;
         *)
             artifact_base="$remote_path"
