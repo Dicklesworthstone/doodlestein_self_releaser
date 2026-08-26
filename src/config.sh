@@ -609,6 +609,135 @@ _config_canonicalize_release_contract_json() {
     printf '%s\n' "$canonical"
 }
 
+# Compare a tool's registry entry (repos.yaml) with its per-tool build config
+# (repos.d/<tool>.yaml). The two files historically drifted apart silently:
+# repos.yaml drives `dsr repos list/info/check` and the quality gates while
+# the build runner reads only repos.d — so on divergence the tool you inspect
+# is not the tool you build, which has produced wrong-target releases
+# (issues #12/#13).
+#
+# Precedence contract (documented in README "Config precedence"):
+#   - repos.d/<tool>.yaml is the build authority: build/release read it
+#     exclusively for build-affecting keys.
+#   - repos.yaml is the registry: list/info/check/quality read it.
+#   - Any key present in both files must be identical.
+#
+# Usage: config_registry_divergence_json <toolname>
+# stdout: compact JSON:
+#   {registry: bool,                 # tool present in repos.yaml
+#    repo_config: bool,              # repos.d/<tool>.yaml exists
+#    tool_name: string|null,         # tool_name declared inside repos.d file
+#    mismatched_keys: [key, ...],    # present in both files, values differ
+#    registry_only_build_keys: [..]} # build-affecting keys only in repos.yaml
+# rc: 0 with JSON on stdout; 3 when yq/jq missing; 4 on parse failure.
+config_registry_divergence_json() {
+    local toolname="${1:-}"
+    if [[ -z "$toolname" ]]; then
+        _cfg_log_error "Tool name required for registry divergence check"
+        return 4
+    fi
+    if ! command -v yq &>/dev/null || ! command -v jq &>/dev/null; then
+        _cfg_log_error "yq and jq are required for registry divergence checks"
+        return 3
+    fi
+
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml"
+    local registry_json="null" repo_json="null"
+
+    if [[ -f "$DSR_REPOS_FILE" ]]; then
+        registry_json=$(_config_read_single_mapping_json "$DSR_REPOS_FILE" | \
+            jq -c --arg tool "$toolname" '.tools[$tool] // null' 2>/dev/null) || return 4
+        [[ -n "$registry_json" ]] || return 4
+    fi
+    if [[ -f "$tool_config" ]]; then
+        repo_json=$(_config_read_single_mapping_json "$tool_config") || return 4
+    fi
+
+    jq -nc --argjson registry "$registry_json" --argjson repo "$repo_json" '
+        def build_keys: ["repo", "local_path", "language", "binary_name",
+            "main_package", "workspace_binaries", "build_cmd", "build_profile",
+            "targets", "target_triples", "cross_compile", "host_paths", "env",
+            "artifact_naming", "install_script_compat", "install_script_path",
+            "archive_format", "include_files", "sibling_crates",
+            "release_contract", "act_job_map", "workflow", "linux_glibc_floor",
+            "derive_cargo_build_target"];
+        {
+            registry: ($registry != null),
+            repo_config: ($repo != null),
+            tool_name: (if $repo == null then null else ($repo.tool_name // null) end),
+            mismatched_keys: (
+                if $registry == null or $repo == null then []
+                else [ ($registry | keys[]) as $k
+                       | select(($repo | has($k)) and ($registry[$k] != $repo[$k]))
+                       | $k ]
+                     | sort
+                end),
+            registry_only_build_keys: (
+                if $registry == null or $repo == null then []
+                else [ build_keys[] as $k
+                       | select(($registry | has($k)) and (($repo | has($k)) | not))
+                       | $k ]
+                end)
+        }'
+}
+
+# Report Windows-host source-root problems for a tool (issue #8): every
+# native windows/* target must resolve to a Windows host with a
+# drive-qualified host_paths entry (C:/... or /c/...). A POSIX root can never
+# work there — rsync targets the wrong location and the build-step validator
+# rejects the path mid-build. One problem per line on stdout; empty when OK.
+config_windows_host_path_problems() {
+    local toolname="${1:-}"
+    [[ -n "$toolname" ]] || return 0
+    command -v yq &>/dev/null || return 0
+
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml"
+    [[ -f "$tool_config" ]] || return 0
+
+    local target host host_platform host_path act_job
+    while IFS= read -r target; do
+        [[ -n "$target" ]] || continue
+        act_job=$(TARGET="$target" yq -r '.act_job_map[env(TARGET)] // ""' "$tool_config" 2>/dev/null)
+        [[ "$act_job" == "null" ]] && act_job=""
+        [[ -z "$act_job" ]] || continue
+
+        host=$(TARGET="$target" yq -r '.cross_compile[env(TARGET)].host // ""' "$tool_config" 2>/dev/null)
+        [[ "$host" == "null" ]] && host=""
+        if [[ -z "$host" && -f "${DSR_HOSTS_FILE:-}" ]]; then
+            host=$(TARGET="$target" yq -r '.platform_mapping[env(TARGET)] // ""' "$DSR_HOSTS_FILE" 2>/dev/null)
+            [[ "$host" == "null" ]] && host=""
+        fi
+        [[ -n "$host" ]] || continue
+
+        host_platform=""
+        if [[ -f "${DSR_HOSTS_FILE:-}" ]]; then
+            host_platform=$(HOST="$host" yq -r '.hosts[env(HOST)].platform // ""' "$DSR_HOSTS_FILE" 2>/dev/null)
+            [[ "$host_platform" == "null" ]] && host_platform=""
+        fi
+        case "$host_platform" in
+            windows/*) ;;
+            "") [[ "$target" == windows/* ]] || continue ;;
+            *) continue ;;
+        esac
+
+        host_path=$(HOST="$host" yq -r '.host_paths[env(HOST)] // ""' "$tool_config" 2>/dev/null)
+        [[ "$host_path" == "null" ]] && host_path=""
+        case "$host_path" in
+            [A-Za-z]:[\\/]*|/[A-Za-z]/*) ;;
+            "")
+                printf 'target %s builds on Windows host %s but repos.d/%s.yaml has no host_paths.%s (needs a drive-qualified path, e.g. C:/Users/<user>/%s)\n' \
+                    "$target" "$host" "$toolname" "$host" "$toolname"
+                ;;
+            *)
+                printf 'target %s: host_paths.%s is not drive-qualified for Windows host %s (got %s; use C:/... or /c/...)\n' \
+                    "$target" "$host" "$host" "$host_path"
+                ;;
+        esac
+    done < <(yq -r '.targets[]?' "$tool_config" 2>/dev/null)
+}
+
 # Get the opt-in release contract for a tool as compact, canonical JSON.
 # Per-tool repos.d configuration takes precedence over the registry file.
 # Usage: config_get_release_contract_json <toolname>

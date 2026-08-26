@@ -86,16 +86,53 @@ _act_ssh_exec() {
     return "$exit_code"
 }
 
+# Write a minimal but format-valid executable for the collection gate
+# (_act_accept_collected_binary validates real ELF/Mach-O/PE headers, so an
+# empty `touch`ed file no longer passes). Kind is MOCK_ARTIFACT_KIND, or
+# inferred: .exe -> PE32+ x64, otherwise Mach-O arm64 (most tests build
+# darwin/arm64).
+write_mock_artifact() {
+    local dest="$1"
+    local kind="${MOCK_ARTIFACT_KIND:-auto}"
+    if [[ "$kind" == "auto" ]]; then
+        case "$dest" in
+            *.exe) kind="pe-amd64" ;;
+            *) kind="macho-arm64" ;;
+        esac
+    fi
+    case "$kind" in
+        macho-arm64)
+            { printf '\317\372\355\376\014\000\000\001'; head -c 24 /dev/zero; } > "$dest"
+            ;;
+        macho-amd64)
+            { printf '\317\372\355\376\007\000\000\001'; head -c 24 /dev/zero; } > "$dest"
+            ;;
+        elf-amd64)
+            { printf '\177ELF\002\001'; head -c 12 /dev/zero; printf '\076\000'; head -c 44 /dev/zero; } > "$dest"
+            ;;
+        elf-arm64)
+            { printf '\177ELF\002\001'; head -c 12 /dev/zero; printf '\267\000'; head -c 44 /dev/zero; } > "$dest"
+            ;;
+        pe-amd64)
+            { printf 'MZ'; head -c 58 /dev/zero; printf '\100\000\000\000PE\000\000\144\206'; head -c 18 /dev/zero; printf '\013\002'; head -c 6 /dev/zero; } > "$dest"
+            ;;
+        *)
+            : > "$dest"
+            ;;
+    esac
+    chmod 755 "$dest" 2>/dev/null || true
+}
+
 # Mock scp - captures args to file
 scp() {
     printf '%s\n' "$@" > "$SCP_ARGS_FILE"
     local exit_code
     exit_code=$(cat "$SCP_EXIT_CODE_FILE")
     if [[ "$exit_code" -eq 0 ]]; then
-        # Touch the target file (last arg) to simulate successful download
+        # Materialize the target file (last arg) to simulate a download
         local target="${!#}"
         mkdir -p "$(dirname "$target")" 2>/dev/null || true
-        touch "$target" 2>/dev/null || true
+        write_mock_artifact "$target" 2>/dev/null || true
     fi
     return "$exit_code"
 }
@@ -188,6 +225,12 @@ yq() {
         '.sibling_crates[0].local_path // ""')
             echo "${MOCK_SIBLING_LOCAL_PATH:-}"
             ;;
+        *'.linux_glibc_floor'*)
+            echo "${MOCK_GLIBC_FLOOR:-}"
+            ;;
+        '.derive_cargo_build_target // ""')
+            echo "${MOCK_DERIVE_OPT:-}"
+            ;;
         *)
             echo ""
             ;;
@@ -209,6 +252,7 @@ reset_state() {
     unset MOCK_GLOBAL_ENV MOCK_PLATFORM_ENV
     unset MOCK_SSH_STREAM_FILE
     unset MOCK_SIBLING_RELATIVE MOCK_SIBLING_LOCAL_PATH
+    unset MOCK_ARTIFACT_KIND MOCK_GLIBC_FLOOR MOCK_DERIVE_OPT
 
     # Defaults
     MOCK_LOCAL_PATH="/local/path/tool"
@@ -224,6 +268,17 @@ reset_state() {
 get_ssh_cmd() {
     if [[ -f "$SSH_ARGS_FILE" ]]; then
         grep "^CMD:" "$SSH_ARGS_FILE" | sed 's/^CMD://'
+    else
+        echo ""
+    fi
+}
+
+# Full captured SSH exchange, including every line of multi-line commands
+# (get_ssh_cmd keeps only lines that start with CMD:, which drops the tail of
+# a command containing embedded newlines, e.g. the staged glibc-floor shim).
+get_ssh_capture() {
+    if [[ -f "$SSH_ARGS_FILE" ]]; then
+        cat "$SSH_ARGS_FILE"
     else
         echo ""
     fi
@@ -460,9 +515,10 @@ test_unix_rust_isolation_executes_outside_operator_config() {
 
     MOCK_LOCAL_PATH="$source_root"
     MOCK_LANGUAGE="rust"
+    MOCK_ARTIFACT_KIND="elf-amd64"
     MOCK_SIBLING_RELATIVE="operator-dep"
     MOCK_SIBLING_LOCAL_PATH="$sibling_root"
-    MOCK_BUILD_CMD='git diff-index --quiet HEAD -- && cargo check --offline --quiet && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/release" && printf "isolated binary\n" > "$CARGO_TARGET_DIR/release/tool"'
+    MOCK_BUILD_CMD='git diff-index --quiet HEAD -- && cargo check --offline --quiet && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release" && { printf "\177ELF\002\001"; head -c 12 /dev/zero; printf "\076\000"; head -c 44 /dev/zero; } > "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool" && chmod 755 "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool"'
     MOCK_PLATFORM_ENV="CARGO_HOME=$operator_home/.cargo
 CARGO_TARGET_DIR=relative-operator-target
 DSR_PROBE_OUTPUT=$probe_output"
@@ -970,6 +1026,7 @@ test_windows_cd_command() {
 test_windows_env_set_syntax() {
     log_test "Windows: env vars use set syntax"
     reset_state
+    MOCK_LOCAL_PATH="/c/Users/jeffr/projects/tool"
     MOCK_GLOBAL_ENV="CARGO_TERM_COLOR=always"
 
     act_run_native_build "tool" "windows/amd64" "v1.0.0" "run1" >/dev/null 2>&1
@@ -1190,7 +1247,7 @@ test_scp_rust_artifact_path() {
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/release/mytool "* ]]; then
+    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/aarch64-apple-darwin/release/mytool "* ]]; then
         log_pass "Rust artifact path is stable outside the ephemeral source copy"
     else
         log_fail "Expected Rust artifact path in: $scp_args"
@@ -1210,7 +1267,7 @@ test_scp_rust_artifact_path_with_absolute_cargo_target_dir() {
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/release/mytool "* ]]; then
+    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/aarch64-apple-darwin/release/mytool "* ]]; then
         log_pass "Rust artifact path honors absolute CARGO_TARGET_DIR"
     else
         log_fail "Expected absolute CARGO_TARGET_DIR artifact path in: $scp_args"
@@ -1230,7 +1287,7 @@ test_scp_rust_artifact_path_with_relative_cargo_target_dir() {
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/release/mytool "* ]]; then
+    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/aarch64-apple-darwin/release/mytool "* ]]; then
         log_pass "Relative CARGO_TARGET_DIR cannot follow the ephemeral source cwd"
     else
         log_fail "Expected derived absolute CARGO_TARGET_DIR artifact path in: $scp_args"
@@ -1691,6 +1748,190 @@ test_result_json_success_has_artifact() {
     fi
 }
 
+test_rust_derives_build_target_and_dsr_env() {
+    log_test "Rust: CARGO_BUILD_TARGET and DSR_TARGET_* derived from the platform"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo build --release"
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_capture)
+
+    if [[ "$cmd" == *'export "CARGO_BUILD_TARGET=aarch64-apple-darwin"'* && \
+          "$cmd" == *'export "DSR_TARGET_PLATFORM=darwin/arm64"'* && \
+          "$cmd" == *'export "DSR_TARGET_OS=darwin"'* && \
+          "$cmd" == *'export "DSR_TARGET_ARCH=arm64"'* ]]; then
+        log_pass "Derived CARGO_BUILD_TARGET and DSR_TARGET_* are exported"
+    else
+        log_fail "Expected derived target env in: $cmd"
+    fi
+}
+
+test_rust_derive_build_target_opt_out() {
+    log_test "Rust: derive_cargo_build_target: false suppresses the derived triple"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_DERIVE_OPT="false"
+
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_capture)
+
+    if [[ "$cmd" != *'export "CARGO_BUILD_TARGET='* && \
+          "$cmd" == *'export "DSR_TARGET_PLATFORM=darwin/arm64"'* ]]; then
+        log_pass "Opt-out keeps the build untargeted while DSR_TARGET_* remain"
+    else
+        log_fail "Expected no derived CARGO_BUILD_TARGET in: $cmd"
+    fi
+}
+
+test_windows_rejects_posix_source_root() {
+    log_test "Windows: POSIX source root is rejected before any remote work"
+    reset_state
+    MOCK_LOCAL_PATH="/dp/tool"
+
+    local result status=0
+    result=$(act_run_native_build "tool" "windows/amd64" "v1.0.0" "run1" 2>/dev/null) || status=$?
+
+    if [[ $status -eq 4 && "$result" == *"drive-qualified"* && ! -f "$SSH_ARGS_FILE" ]]; then
+        log_pass "POSIX root on a Windows host fails fast with an actionable error"
+    else
+        log_fail "Expected exit 4 with drive-qualified error, got status=$status result=$result"
+    fi
+}
+
+test_rust_linux_glibc_floor_shim_injected() {
+    log_test "Rust linux: glibc floor shim staged and env exported by default"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_ARTIFACT_KIND="elf-amd64"
+
+    act_run_native_build "tool" "linux/amd64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_capture)
+
+    if [[ "$cmd" == *"DSR_ZIG_SHIM_EOF"* && \
+          "$cmd" == *'export "DSR_ZIG_TARGET=x86_64-unknown-linux-gnu.2.28"'* && \
+          "$cmd" == *"/.dsr-bin':\"\$PATH\""* ]]; then
+        log_pass "Default 2.28 floor stages the cargo shim and PATH override"
+    else
+        log_fail "Expected glibc floor shim in: $cmd"
+    fi
+}
+
+test_rust_linux_glibc_floor_native_opt_out() {
+    log_test "Rust linux: linux_glibc_floor: native disables the shim"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_GLIBC_FLOOR="native"
+    MOCK_ARTIFACT_KIND="elf-amd64"
+
+    act_run_native_build "tool" "linux/amd64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_capture)
+
+    if [[ "$cmd" != *"DSR_ZIG_SHIM_EOF"* && "$cmd" != *"DSR_ZIG_TARGET"* ]]; then
+        log_pass "native opt-out builds against the host glibc"
+    else
+        log_fail "Expected no glibc floor shim in: $cmd"
+    fi
+}
+
+test_rust_linux_glibc_floor_skips_musl() {
+    log_test "Rust linux: musl targets get no glibc floor"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_PLATFORM_ENV="CARGO_BUILD_TARGET=x86_64-unknown-linux-musl"
+    MOCK_ARTIFACT_KIND="elf-amd64"
+
+    act_run_native_build "tool" "linux/amd64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_capture)
+
+    if [[ "$cmd" != *"DSR_ZIG_TARGET"* ]]; then
+        log_pass "musl target is already portable; no floor applied"
+    else
+        log_fail "Expected no glibc floor for musl in: $cmd"
+    fi
+}
+
+test_rust_linux_glibc_floor_skips_operator_linker() {
+    log_test "Rust linux: an operator cross toolchain suppresses the floor"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_PLATFORM_ENV=$'CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu\nCARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc'
+    MOCK_ARTIFACT_KIND="elf-arm64"
+
+    act_run_native_build "tool" "linux/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+
+    local cmd
+    cmd=$(get_ssh_capture)
+
+    if [[ "$cmd" != *"DSR_ZIG_TARGET"* && "$cmd" == *'export "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"'* ]]; then
+        log_pass "Configured cross linker owns the libc baseline; floor skipped"
+    else
+        log_fail "Expected operator toolchain to suppress floor in: $cmd"
+    fi
+}
+
+test_collection_rejects_wrong_arch() {
+    log_test "Collection: wrong-architecture artifact is refused"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo build --release"
+    MOCK_ARTIFACT_KIND="elf-amd64"
+
+    local result status=0
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null) || status=$?
+
+    local json_status
+    json_status=$(jq -r '.status' <<< "$result" 2>/dev/null)
+
+    if [[ "$json_status" == "failed" && $status -eq 7 ]]; then
+        log_pass "An x86-64 ELF cannot ship under a darwin/arm64 name"
+    else
+        log_fail "Expected failed/7 for wrong-arch artifact, got status=$status json=$result"
+    fi
+}
+
+test_glibc_version_helpers() {
+    log_test "glibc helpers: max version extraction and comparison"
+    local probe="$MOCK_DIR/glibc-probe.bin"
+    printf 'junkGLIBC_9.9junk\0GLIBC_2.17\0GLIBC_2.2.5\0GLIBC_2.34\0GLIBC_PRIVATE\0GLIBC_ABI_DT_RELR\0' > "$probe"
+
+    local max_version
+    max_version=$(_act_max_glibc_version "$probe")
+
+    if [[ "$max_version" == "2.34" ]] && \
+       _act_glibc_version_le "2.34" "2.34" && \
+       _act_glibc_version_le "2.28" "2.34" && \
+       ! _act_glibc_version_le "2.34" "2.28" && \
+       ! _act_glibc_version_le "2.2.5" "2.2" && \
+       _act_glibc_version_le "2.2.5" "2.3"; then
+        log_pass "NUL-token scan finds 2.34 and ordering is numeric"
+    else
+        log_fail "glibc helpers misbehaved: max=$max_version"
+    fi
+}
+
 test_windows_strict_cargo_metadata_command() {
     log_test "Strict Cargo metadata: Windows command is locked and offline"
     reset_state
@@ -1809,6 +2050,17 @@ main() {
     test_result_json_method_native
     test_result_json_success_has_artifact
     test_windows_strict_cargo_metadata_command
+
+    # Derived build identity, Windows path guard, glibc floor (issues #7/#8/#9)
+    test_rust_derives_build_target_and_dsr_env
+    test_rust_derive_build_target_opt_out
+    test_windows_rejects_posix_source_root
+    test_rust_linux_glibc_floor_shim_injected
+    test_rust_linux_glibc_floor_native_opt_out
+    test_rust_linux_glibc_floor_skips_musl
+    test_rust_linux_glibc_floor_skips_operator_linker
+    test_collection_rejects_wrong_arch
+    test_glibc_version_helpers
 
     # Summary
     echo ""

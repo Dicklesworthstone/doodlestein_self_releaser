@@ -2063,9 +2063,35 @@ EOF
                 return 4
             fi
         fi
-    elif ! mkdir -p "$output_dir"; then
-        log_error "Failed to create output directory: $output_dir"
-        return 1
+    else
+        # Never inherit artifacts from a previous build (issue #11): a stale
+        # binary with the right name, right architecture, and a valid checksum
+        # survives every cheap verification and ships the previous version's
+        # code. Quarantine any existing output to a sibling directory and
+        # start empty. Resumed runs keep their partial output (its bytes are
+        # verified against frozen receipts), and the strict path above already
+        # requires a fresh directory.
+        if ! $resume && [[ -d "$output_dir" && ! -L "$output_dir" ]] && \
+           [[ -n "$(find "$output_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+            if [[ "$(basename "$output_dir")" == "${tool_name}-${tag}" ]]; then
+                local stale_output_dir
+                stale_output_dir="${output_dir}.stale-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+                if [[ -e "$stale_output_dir" ]] || ! mv "$output_dir" "$stale_output_dir"; then
+                    log_error "Output directory $output_dir holds artifacts from a previous build and could not be quarantined"
+                    return 1
+                fi
+                log_warn "Quarantined stale artifacts from a previous $tool_name $tag build to $stale_output_dir"
+                log_info "Previous outputs are never reused; delete the quarantine directory once the new build is verified"
+            else
+                log_error "Output directory is not empty: $output_dir"
+                log_error "Refusing to build into it — leftover artifacts from an earlier build can be republished as if freshly built (issue #11). Use a fresh --output-dir."
+                return 1
+            fi
+        fi
+        if ! mkdir -p "$output_dir"; then
+            log_error "Failed to create output directory: $output_dir"
+            return 1
+        fi
     fi
 
     # The orchestrator is captured through command substitution below, so any
@@ -7188,6 +7214,15 @@ cmd_repos_add() {
         [[ -n "$local_path" ]] && log_info "  local_path: $local_path"
         [[ -n "$language" ]] && log_info "  language: $language"
     fi
+
+    # `repos add` writes the registry, but the build runner reads only
+    # repos.d/<name>.yaml — without that file this tool looks registered and
+    # still cannot build (issue #12 instance 1). Say so at add time.
+    local added_repos_d_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/${name}.yaml"
+    if [[ ! -f "$added_repos_d_file" ]]; then
+        log_warn "No repos.d/${name}.yaml yet — dsr build/release read ONLY that file, so '$name' is not buildable until it exists"
+        log_info "Create it from a template (config/repos.d/_template_*.yaml) and keep it in agreement with repos.yaml; 'dsr repos validate' checks the two for divergence"
+    fi
 }
 
 # Remove a repository from the registry
@@ -7756,6 +7791,60 @@ EOF
             naming_info="$naming_json"
         fi
 
+        # Registry vs build-config agreement (issues #12/#13). repos.yaml is
+        # what list/info/check/quality read; repos.d/<tool>.yaml is what the
+        # build runner reads. Divergence means the tool you inspect is not the
+        # tool you build, and it has shipped wrong platform matrices — so a
+        # green validate must guarantee the two agree.
+        if [[ "$naming_only" != "true" ]]; then
+            local div_json="" div_rc=0
+            div_json=$(config_registry_divergence_json "$name" 2>/dev/null) || div_rc=$?
+            if [[ $div_rc -ne 0 || -z "$div_json" ]]; then
+                status="error"
+                messages+=("Could not compare repos.yaml with repos.d/${name}.yaml (unparseable config)")
+                ((errors++))
+            else
+                local div_repo_config div_tool_name div_mismatched div_registry_only
+                div_repo_config=$(jq -r '.repo_config' <<< "$div_json")
+                div_tool_name=$(jq -r '.tool_name // ""' <<< "$div_json")
+                div_mismatched=$(jq -r '.mismatched_keys | join(", ")' <<< "$div_json")
+                div_registry_only=$(jq -r '.registry_only_build_keys | join(", ")' <<< "$div_json")
+                if [[ "$div_repo_config" != "true" ]]; then
+                    if [[ "$status" != "error" ]]; then
+                        status="warn"
+                    fi
+                    messages+=("No repos.d/${name}.yaml — dsr build/release read only repos.d, so this tool is registry-only and cannot build")
+                    ((warnings++))
+                else
+                    if [[ -n "$div_tool_name" && "$div_tool_name" != "$name" ]]; then
+                        status="error"
+                        messages+=("repos.d/${name}.yaml declares tool_name '${div_tool_name}' — the build runner loads repos.d/<tool_name>.yaml by filename, so this file can never be loaded as '${div_tool_name}'; rename the file or fix tool_name")
+                        ((errors++))
+                    fi
+                    if [[ -n "$div_mismatched" ]]; then
+                        status="error"
+                        messages+=("repos.yaml and repos.d/${name}.yaml disagree on: ${div_mismatched} (repos.d wins for builds; align the two files)")
+                        ((errors++))
+                    fi
+                    if [[ -n "$div_registry_only" ]]; then
+                        status="error"
+                        messages+=("build keys set only in repos.yaml are ignored by the build runner: ${div_registry_only} (copy them into repos.d/${name}.yaml)")
+                        ((errors++))
+                    fi
+                fi
+            fi
+
+            # Windows targets need drive-qualified host_paths (issue #8);
+            # a POSIX root fails the sync and the build-step path validator.
+            local windows_path_problem
+            while IFS= read -r windows_path_problem; do
+                [[ -n "$windows_path_problem" ]] || continue
+                status="error"
+                messages+=("$windows_path_problem")
+                ((errors++))
+            done < <(config_windows_host_path_problems "$name" 2>/dev/null)
+        fi
+
         local msg_str=""
         [[ ${#messages[@]} -gt 0 ]] && msg_str=$(IFS='; '; echo "${messages[*]}")
 
@@ -7773,6 +7862,38 @@ EOF
         fi
 
     done < <(echo "$tools_json" | jq -r 'keys[]')
+
+    # Sweep repos.d for build configs the registry does not know about
+    # (issue #13 instance 1): a fully-formed repos.d/<tool>.yaml that was
+    # never adopted into repos.yaml is invisible to `dsr repos list/info`,
+    # and a file named differently from its own tool_name can never be
+    # loaded by the build runner. Both used to pass validate silently.
+    if [[ "$naming_only" != "true" ]]; then
+        local repos_d_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d"
+        if [[ -d "$repos_d_dir" ]]; then
+            local orphan_file orphan_name orphan_tool_name
+            for orphan_file in "$repos_d_dir"/*.yaml; do
+                [[ -f "$orphan_file" ]] || continue
+                orphan_name=$(basename "$orphan_file" .yaml)
+                [[ -n "$repo_filter" && "$orphan_name" != "$repo_filter" ]] && continue
+                if echo "$tools_json" | jq -e --arg name "$orphan_name" 'has($name)' >/dev/null 2>&1; then
+                    continue
+                fi
+                orphan_tool_name=$(yq -r '.tool_name // ""' "$orphan_file" 2>/dev/null)
+                [[ "$orphan_tool_name" == "null" ]] && orphan_tool_name=""
+                local orphan_msg="repos.d/${orphan_name}.yaml is not registered in repos.yaml — dsr repos list/info/check cannot see this tool; add it to repos.yaml"
+                if [[ -n "$orphan_tool_name" && "$orphan_tool_name" != "$orphan_name" ]]; then
+                    orphan_msg+="; it also declares tool_name '${orphan_tool_name}', and the build runner loads repos.d/<tool_name>.yaml by filename, so this file can never be loaded"
+                fi
+                results+=("$(jq -nc --arg repo "$orphan_name" --arg message "$orphan_msg" \
+                    '{repo: $repo, status: "error", message: $message, naming: {}}')")
+                ((errors++))
+                if ! $JSON_MODE; then
+                    log_error "$orphan_name: $orphan_msg"
+                fi
+            done
+        fi
+    fi
 
     local results_json
     results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')

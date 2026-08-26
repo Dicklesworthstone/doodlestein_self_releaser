@@ -448,6 +448,52 @@ hosts:
   windows/amd64: wlap
 ```
 
+### Config precedence: `repos.yaml` vs `repos.d/`
+
+Tool configuration lives in two places with distinct roles:
+
+- **`repos.d/<tool>.yaml` is the build authority.** `dsr build` and
+  `dsr release` read it exclusively for build-affecting keys (`local_path`,
+  `targets`, `build_cmd`, `target_triples`, `cross_compile`, `host_paths`,
+  `artifact_naming`, `archive_format`, `release_contract`, ...). The file must
+  be named after its own `tool_name` — the runner loads
+  `repos.d/<tool_name>.yaml` by filename.
+- **`repos.yaml` is the registry.** `dsr repos list/info/check` and the
+  quality gates (`checks:`) read it.
+- **Any key present in both files must be identical.** `dsr repos validate`
+  fails on divergence: mismatched values, build keys present only in
+  `repos.yaml` (the runner would ignore them), `repos.d` files missing from
+  the registry, and `repos.d` files whose name does not match their
+  `tool_name`. A tool with no `repos.d` file validates with a warning — it is
+  registry-only and cannot build.
+
+### Build target derivation and the Linux glibc floor
+
+For Rust tools the runner derives `CARGO_BUILD_TARGET` from
+`target_triples.<platform>` (or the standard triple for the platform) whenever
+the platform's `cross_compile` env does not set one, so every build is
+explicit about its target and the artifact collector always looks where cargo
+wrote. Collected binaries are validated against the requested platform's
+executable format (ELF/Mach-O/PE + machine type) before packaging — a
+wrong-architecture artifact fails the build instead of shipping. Build
+commands can branch on `DSR_TARGET_OS` / `DSR_TARGET_ARCH` /
+`DSR_TARGET_PLATFORM` / `DSR_TARGET_TRIPLE` without parsing paths. Opt out of
+the derivation with `derive_cargo_build_target: false`.
+
+Ordinary (non-strict) Linux Rust builds targeting `*-linux-gnu` default to a
+**portable glibc floor of 2.28**: a `cargo` shim staged with the isolated
+source routes `cargo build` through `cargo zigbuild --target <triple>.<floor>`
+(cargo-zigbuild >= 0.23.0 and zig must be on the build host), and the
+collected binary's versioned glibc symbols are asserted against the floor.
+Without this, natively built amd64 binaries inherit the build host's glibc
+and stop starting on Debian 12 / Ubuntu 22.04 / RHEL 9-class systems the
+moment the build fleet upgrades. Configure per tool with
+`linux_glibc_floor: "2.28"` (or another `MAJOR.MINOR`), opt out with
+`linux_glibc_floor: native`; the floor is skipped automatically for musl
+triples, for platforms whose env carries an operator cross toolchain
+(`CARGO_TARGET_<T>_LINKER` / `CC_<t>`), and for build commands that already
+invoke `zigbuild`, `xwin`, or `cross`.
+
 ---
 
 ## Logging and State

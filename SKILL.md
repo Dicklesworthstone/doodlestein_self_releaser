@@ -102,6 +102,27 @@ Cargo target can wedge the host. A host can override the root with
 `build_root: /path/on/disk` in `hosts.yaml`; `DSR_STRICT_BUILD_ROOT` beats it
 for strict snapshots. dsr refuses to stage onto tmpfs/ramfs in either mode.
 
+**Two config files, one contract.** `repos.d/<tool>.yaml` is the build
+authority (build/release read only it, and load it by its `tool_name`-matching
+filename); `repos.yaml` is the registry (`repos list/info/check`, quality
+gates). Any key present in both must be identical — `dsr repos validate`
+fails on divergence and flags repos.d files the registry does not know about.
+Keep both files updated together.
+
+**Portable Linux Rust binaries by default.** Ordinary (non-strict) builds for
+`*-linux-gnu` targets route `cargo build` through
+`cargo zigbuild --target <triple>.2.28` via a staged cargo shim, and the
+collected binary's glibc symbol versions are asserted against the floor, so
+artifacts do not inherit the build host's glibc. Needs cargo-zigbuild >=
+0.23.0 and zig on the build host. Tune with `linux_glibc_floor: "X.Y"` or
+disable with `linux_glibc_floor: native` in `repos.d/<tool>.yaml`; platforms
+with an operator cross toolchain or a zigbuild/xwin/cross build_cmd are left
+alone. Rust builds also always get an explicit `CARGO_BUILD_TARGET` (derived
+from `target_triples` or the platform), collected artifacts are validated
+against the requested platform's executable format, and build commands can
+branch on `DSR_TARGET_OS/ARCH/PLATFORM/TRIPLE`. Windows hosts require a
+drive-qualified `host_paths.<host>` (`C:/...` or `/c/...`).
+
 ### Host selection
 
 `act_get_native_host` resolves a platform to a host in this order:

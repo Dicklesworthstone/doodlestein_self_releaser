@@ -12,6 +12,41 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- `dsr repos validate` now cross-checks `repos.yaml` against
+  `repos.d/<tool>.yaml` and fails on divergence: mismatched keys, build keys
+  present only in the registry (the build runner ignores them), `repos.d`
+  files not registered in `repos.yaml`, and `repos.d` files whose name does
+  not match their declared `tool_name`. Registry-only tools (no `repos.d`
+  file) validate with a warning, and `dsr repos add` now warns that the tool
+  is not buildable until a `repos.d` file exists. Precedence is documented in
+  the README: repos.d is the build authority, repos.yaml the registry (#12,
+  #13).
+- Rust builds derive `CARGO_BUILD_TARGET` from `target_triples.<platform>`
+  (or the platform's standard triple) when the platform env does not set one,
+  and every collected native artifact is validated against the requested
+  platform's executable format before packaging — a native-classified build
+  can no longer publish a wrong-architecture binary or lose a successful
+  compile to a `target/release` vs `target/<triple>/release` path mismatch.
+  Build commands receive `DSR_TARGET_OS/ARCH/PLATFORM/TRIPLE`; opt out with
+  `derive_cargo_build_target: false` (#7).
+- Ordinary Linux Rust builds targeting `*-linux-gnu` default to a portable
+  glibc floor of 2.28: a staged cargo shim routes `cargo build` through
+  `cargo zigbuild --target <triple>.<floor>` and the collected binary's
+  versioned glibc symbols are asserted against the floor, so released amd64
+  binaries no longer inherit the build host's glibc. Configure or disable
+  with `linux_glibc_floor` (#9). The shim refuses cargo-zigbuild older than
+  0.23.0, whose zig wrapper mishandles rustc's aarch64
+  `--fix-cortex-a53-843419` erratum flag (#10).
+- `dsr build` refuses to reuse a non-empty output directory: pre-existing
+  artifacts are quarantined to a `.stale-<timestamp>` sibling (default
+  tool-version directories) or the build aborts (custom `--output-dir`), so a
+  rebuild for the same version can never republish a previous build's
+  binaries under fresh names and checksums (#11).
+- Windows build hosts fail fast — at sync, at build, and in
+  `dsr repos validate` — when the resolved source root is not drive-qualified
+  (`C:/...` or `/c/...`), instead of rsyncing to the wrong location and dying
+  mid-build with an unexplained path validator error (#8).
+
 - Strict release snapshots now default to `/var/tmp/.dsr-release-snapshots`
   instead of `/tmp`, matching the isolated Rust build root. On hosts where
   `/tmp` is a RAM-backed tmpfs a release wave could stage multi-GB source

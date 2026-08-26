@@ -2057,6 +2057,237 @@ _act_ram_backed_guard_sh() {
     printf '%s' "_dsr_fstype=\$( (findmnt -no FSTYPE -T '$dir_q' 2>/dev/null || stat -f -c %T '$dir_q' 2>/dev/null) | head -n 1); case \"\$_dsr_fstype\" in tmpfs|ramfs) echo \"[dsr] refusing to stage the build under RAM-backed $dir_q (\$_dsr_fstype); set build_root for this host in hosts.yaml\" >&2; exit 4;; esac; "
 }
 
+# Decide whether a Linux Rust target gets the portable glibc floor (issue #9).
+# Natively-built linux artifacts inherit the build host's glibc, and the whole
+# fleet's glibc rises with OS upgrades, so a "healthy" release can silently
+# stop starting on Debian/RHEL/Amazon baselines. Default: route `cargo build`
+# through cargo-zigbuild with a versioned glibc target (floor 2.28 ~ RHEL 8),
+# matching what linux/arm64 cross-builds already do.
+#
+# Inactive (rc 1) when:
+#   - the platform is not linux/* or the resolved triple is not *-linux-gnu
+#     (musl is already portable);
+#   - the repo opts out (`linux_glibc_floor: native`, top-level or per
+#     platform under cross_compile.<platform>);
+#   - the build env carries its own cross toolchain for the triple
+#     (CARGO_TARGET_<T>_LINKER or CC_<t>), which owns its own libc baseline;
+#   - the build_cmd already drives zigbuild/xwin/cross itself.
+# rc 4: invalid floor value. Otherwise prints the floor (e.g. "2.28").
+# DSR_LINUX_GLIBC_FLOOR overrides the configured floor.
+_act_linux_glibc_floor() {
+    local tool_name="$1"
+    local platform="$2"
+    local config_file="$3"
+    local build_env="$4"
+    local build_cmd="$5"
+
+    case "$platform" in linux/*) ;; *) return 1 ;; esac
+    local triple
+    triple=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" 2>/dev/null || true)
+    case "$triple" in *-linux-gnu) ;; *) return 1 ;; esac
+
+    local floor="${DSR_LINUX_GLIBC_FLOOR:-}"
+    if [[ -z "$floor" ]]; then
+        floor=$(yq -r ".cross_compile.\"$platform\".linux_glibc_floor // .linux_glibc_floor // \"\"" \
+            "$config_file" 2>/dev/null)
+        [[ "$floor" == "null" ]] && floor=""
+    fi
+    [[ -n "$floor" ]] || floor="2.28"
+    [[ "$floor" == "native" ]] && return 1
+    if [[ ! "$floor" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        _log_error "Invalid linux_glibc_floor for $tool_name: '$floor' (use MAJOR.MINOR, e.g. \"2.28\", or \"native\")"
+        return 4
+    fi
+
+    local triple_upper triple_lower
+    triple_upper=$(printf '%s' "$triple" | tr '[:lower:]-.' '[:upper:]__')
+    triple_lower="${triple//-/_}"
+    if act_get_build_env_value "$build_env" "CARGO_TARGET_${triple_upper}_LINKER" &>/dev/null || \
+       act_get_build_env_value "$build_env" "CC_${triple_lower}" &>/dev/null; then
+        return 1
+    fi
+    case "$build_cmd" in
+        *zigbuild*|*xwin*|*"cross build"*) return 1 ;;
+    esac
+
+    printf '%s\n' "$floor"
+}
+
+# The cargo shim placed first on PATH by ordinary (non-strict) Linux Rust
+# builds when the glibc floor is active. `cargo build` becomes `cargo
+# zigbuild --target <triple>.<floor>`; every other cargo invocation passes
+# through untouched. Requires cargo-zigbuild >= 0.23.0 on the build host —
+# older releases hand rustc's aarch64 `--fix-cortex-a53-843419` erratum flag
+# to zig unfiltered and the link fails (issue #10).
+# Pure POSIX sh; reads DSR_RUST_TARGET / DSR_ZIG_TARGET / DSR_LINUX_GLIBC_FLOOR
+# from the environment dsr exports for the build.
+_act_zig_cargo_shim_sh() {
+    cat <<'DSR_ZIG_SHIM_SCRIPT'
+#!/bin/sh
+# dsr cargo shim: portable glibc floor for Linux Rust release builds.
+set -e
+_dsr_shim_dir=${0%/*}
+_dsr_clean_path=
+_dsr_old_ifs=$IFS
+IFS=:
+for _dsr_dir in $PATH; do
+  case "$_dsr_dir" in
+    "$_dsr_shim_dir") ;;
+    *) _dsr_clean_path="${_dsr_clean_path:+$_dsr_clean_path:}$_dsr_dir" ;;
+  esac
+done
+IFS=$_dsr_old_ifs
+PATH=$_dsr_clean_path
+export PATH
+_dsr_toolchain=
+case "${1:-}" in
+  +*) _dsr_toolchain=$1; shift ;;
+esac
+if [ "${1:-}" != build ] || [ -z "${DSR_ZIG_TARGET:-}" ] || [ -z "${DSR_RUST_TARGET:-}" ]; then
+  if [ -n "$_dsr_toolchain" ]; then
+    exec cargo "$_dsr_toolchain" "$@"
+  fi
+  exec cargo "$@"
+fi
+shift
+if ! command -v cargo-zigbuild >/dev/null 2>&1 || ! command -v zig >/dev/null 2>&1; then
+  echo "[dsr] portable glibc floor ${DSR_LINUX_GLIBC_FLOOR:-} needs cargo-zigbuild and zig on this build host (cargo install cargo-zigbuild); set linux_glibc_floor: native in the repo config to build against the host glibc instead" >&2
+  exit 4
+fi
+_dsr_zb_version=$(cargo-zigbuild --version 2>/dev/null | awk "{print \$2}")
+_dsr_zb_major=${_dsr_zb_version%%.*}
+_dsr_zb_rest=${_dsr_zb_version#*.}
+_dsr_zb_minor=${_dsr_zb_rest%%.*}
+case "${_dsr_zb_major}${_dsr_zb_minor}" in
+  *[!0-9]*|"") _dsr_zb_major=0; _dsr_zb_minor=0 ;;
+esac
+if [ "$_dsr_zb_major" -eq 0 ] && [ "$_dsr_zb_minor" -lt 23 ]; then
+  echo "[dsr] cargo-zigbuild ${_dsr_zb_version:-unknown} is too old for reliable cross-linking (aarch64 --fix-cortex-a53-843419 filtering needs >= 0.23.0); run: cargo install cargo-zigbuild" >&2
+  exit 4
+fi
+_dsr_expect_target=0
+_dsr_have_target=0
+_dsr_count=$#
+_dsr_index=0
+while [ "$_dsr_index" -lt "$_dsr_count" ]; do
+  _dsr_arg=$1
+  shift
+  _dsr_index=$((_dsr_index + 1))
+  if [ "$_dsr_expect_target" -eq 1 ]; then
+    _dsr_expect_target=0
+    if [ "$_dsr_arg" = "$DSR_RUST_TARGET" ]; then
+      _dsr_arg=$DSR_ZIG_TARGET
+    fi
+    set -- "$@" "$_dsr_arg"
+    continue
+  fi
+  case "$_dsr_arg" in
+    --target)
+      _dsr_have_target=1
+      _dsr_expect_target=1
+      set -- "$@" "$_dsr_arg"
+      ;;
+    --target=*)
+      _dsr_have_target=1
+      _dsr_value=${_dsr_arg#--target=}
+      if [ "$_dsr_value" = "$DSR_RUST_TARGET" ]; then
+        _dsr_value=$DSR_ZIG_TARGET
+      fi
+      set -- "$@" "--target=$_dsr_value"
+      ;;
+    *)
+      set -- "$@" "$_dsr_arg"
+      ;;
+  esac
+done
+if [ "$_dsr_have_target" -ne 1 ]; then
+  set -- --target "$DSR_ZIG_TARGET" "$@"
+fi
+if [ -n "$_dsr_toolchain" ]; then
+  exec cargo "$_dsr_toolchain" zigbuild "$@"
+fi
+exec cargo zigbuild "$@"
+DSR_ZIG_SHIM_SCRIPT
+}
+
+# Remote snippet (with trailing "; ") that materializes the cargo shim in
+# <shim_dir> on the build host. Embedded into the staged-build prefix; the
+# quoted heredoc delimiter keeps the script byte-exact through ssh/bash -c.
+_act_zig_shim_prefix_sh() {
+    local shim_dir="${1:-}"
+    local shim_dir_q="${shim_dir//\'/\'\\\'\'}"
+    printf '%s\n' "mkdir -p '$shim_dir_q'; cat > '$shim_dir_q/cargo' <<'DSR_ZIG_SHIM_EOF'"
+    _act_zig_cargo_shim_sh
+    printf '%s' "DSR_ZIG_SHIM_EOF
+chmod 755 '$shim_dir_q/cargo'; "
+}
+
+# Highest NUL-delimited GLIBC_x.y[.z] version-string token in <file>. Version
+# needs in an ELF live in .dynstr as exact NUL-terminated tokens, so a NUL to
+# newline conversion plus a whole-line match reads them portably (no objdump
+# on macOS dispatchers) without matching prose that merely mentions a
+# version. Prints nothing for static (musl) or non-glibc binaries.
+_act_max_glibc_version() {
+    local file="${1:-}"
+    [[ -f "$file" ]] || return 1
+    LC_ALL=C tr '\0' '\n' < "$file" 2>/dev/null | \
+        LC_ALL=C grep -E '^GLIBC_[0-9]+(\.[0-9]+){1,2}$' | \
+        sed 's/^GLIBC_//' | \
+        awk -F. '{ printf "%d %d %d %s\n", $1, $2, ($3 == "" ? 0 : $3), $0 }' | \
+        sort -k1,1n -k2,2n -k3,3n | tail -1 | awk '{ print $4 }'
+}
+
+# _act_glibc_version_le <a> <b>: numeric dotted-version comparison, a <= b.
+_act_glibc_version_le() {
+    local a="${1:-}" b="${2:-}"
+    awk -v a="$a" -v b="$b" 'BEGIN {
+        n = split(a, x, "."); m = split(b, y, ".")
+        len = (n > m) ? n : m
+        for (i = 1; i <= len; i++) {
+            xv = (i <= n) ? x[i] + 0 : 0
+            yv = (i <= m) ? y[i] + 0 : 0
+            if (xv < yv) exit 0
+            if (xv > yv) exit 1
+        }
+        exit 0
+    }'
+}
+
+# Post-collection gate for ordinary native builds: the artifact must actually
+# be an executable of the requested platform (issue #7 — the strict release
+# path already validates this via _act_stage_contract_primary), and when the
+# glibc floor was active it must not need a newer glibc than the floor
+# (issue #9 — a floor that silently rises with the build host is exactly the
+# defect the floor exists to stop). Only compiled languages are checked.
+_act_accept_collected_binary() {
+    local path="$1"
+    local platform="$2"
+    local language="$3"
+    local glibc_floor="${4:-}"
+
+    case "$language" in rust|go) ;; *) return 0 ;; esac
+    case "$platform" in
+        linux/amd64|linux/arm64|darwin/amd64|darwin/arm64|windows/amd64|windows/arm64) ;;
+        *) return 0 ;;
+    esac
+
+    if ! _act_validate_target_binary "$path" "$platform"; then
+        _log_error "Collected artifact is not a $platform executable: $path (the build host produced the wrong architecture; refusing to package it)"
+        return 1
+    fi
+
+    if [[ -n "$glibc_floor" ]]; then
+        local max_glibc
+        max_glibc=$(_act_max_glibc_version "$path" || true)
+        if [[ -n "$max_glibc" ]] && ! _act_glibc_version_le "$max_glibc" "$glibc_floor"; then
+            _log_error "Collected artifact needs GLIBC_$max_glibc, above the configured floor $glibc_floor: $path (the portable-build path was bypassed; see linux_glibc_floor in the repo config)"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 _act_get_host_connection() {
     local host="${1:-}"
     local connection
@@ -3387,6 +3618,21 @@ act_sync_sources() {
             continue
         fi
 
+        # Refuse a POSIX source root on a Windows host before any host is
+        # synced (issue #8): rsync would create or target the wrong location
+        # and the build step rejects the path anyway. This is a config error,
+        # not a per-host sync failure.
+        if [[ "$host" != "act" ]] && _act_is_windows_host "$host"; then
+            case "$remote_path" in
+                [A-Za-z]:[\\/]*|/[A-Za-z]/*) ;;
+                *)
+                    _log_error "Windows host $host needs a drive-qualified source root for $tool_name (set host_paths.$host in repos.d/${tool_name}.yaml, e.g. C:/Users/<user>/$tool_name); got: $remote_path"
+                    echo '{"status":"error","error":"Windows host requires a drive-qualified host_paths entry"}'
+                    return 4
+                    ;;
+            esac
+        fi
+
         # Skip duplicates
         local already_added=false
         for h in "${hosts_to_sync[@]}"; do
@@ -3702,6 +3948,48 @@ act_get_build_env() {
             result="$result"$'\n'"$platform_env"
         else
             result="$platform_env"
+        fi
+    fi
+
+    # Derived build identity (issue #7). Historically the requested platform
+    # reached the build only through artifact naming: a platform without an
+    # explicit cross_compile env compiled untargeted, wrote to target/release,
+    # and on a mismatched host produced the HOST architecture under the
+    # requested platform's name — a wrong-arch binary that survives tag,
+    # asset, and checksum verification. Deriving CARGO_BUILD_TARGET from
+    # target_triples (or the standard triple for the platform) makes every
+    # Rust build explicit about its target so cargo's output path and the
+    # artifact collector always agree, and DSR_TARGET_* lets build commands
+    # branch on the requested platform without parsing CARGO_TARGET_DIR.
+    # Opt out per tool with `derive_cargo_build_target: false`.
+    if [[ -n "$platform" && "$platform" == */* ]]; then
+        local derived_pairs
+        derived_pairs="DSR_TARGET_OS=${platform%%/*}"
+        derived_pairs+=$'\n'"DSR_TARGET_ARCH=${platform##*/}"
+        derived_pairs+=$'\n'"DSR_TARGET_PLATFORM=$platform"
+        local env_language derive_opt
+        env_language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+        derive_opt=$(yq -r '.derive_cargo_build_target // ""' "$config_file" 2>/dev/null)
+        if [[ "$env_language" == "rust" && "$derive_opt" != "false" ]]; then
+            local derived_triple
+            derived_triple=$(act_get_build_env_value "$result" "CARGO_BUILD_TARGET" 2>/dev/null || true)
+            if [[ -z "$derived_triple" ]]; then
+                derived_triple=$(yq -r ".target_triples.\"$platform\" // \"\"" "$config_file" 2>/dev/null)
+                [[ "$derived_triple" == "null" ]] && derived_triple=""
+                [[ -n "$derived_triple" ]] || \
+                    derived_triple=$(_act_default_rust_target_triple "$platform" 2>/dev/null || true)
+                if [[ -n "$derived_triple" ]]; then
+                    derived_pairs+=$'\n'"CARGO_BUILD_TARGET=$derived_triple"
+                fi
+            fi
+            if [[ -n "$derived_triple" ]]; then
+                derived_pairs+=$'\n'"DSR_TARGET_TRIPLE=$derived_triple"
+            fi
+        fi
+        if [[ -n "$result" ]]; then
+            result="$result"$'\n'"$derived_pairs"
+        else
+            result="$derived_pairs"
         fi
     fi
 
@@ -4124,6 +4412,42 @@ act_run_native_build() {
     local language
     language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
 
+    # A target whose platform differs from the host's is a cross build even
+    # when the scheduler labels it "native for this host" (issue #7). The
+    # derived CARGO_BUILD_TARGET plus post-collection architecture validation
+    # make a silent wrong-arch artifact impossible; this line makes the
+    # situation visible in the build log.
+    local build_host_platform
+    build_host_platform=$(_act_get_host_platform "$host" 2>/dev/null || true)
+    if [[ -n "$build_host_platform" && "$build_host_platform" != "$platform" ]]; then
+        _log_info "Target $platform is cross for host $host ($build_host_platform); requiring explicit target output"
+    fi
+
+    # Portable glibc floor for ordinary Linux Rust builds (issue #9). Decided
+    # here, applied on the build host through a cargo shim staged with the
+    # isolated source copy, and asserted after artifact collection. Strict
+    # release-contract builds are exempt (their build_cmds own their target
+    # handling and their pipeline is receipt-verified end to end).
+    local rust_glibc_floor="" rust_zig_target="" rust_floor_triple=""
+    if [[ "$language" == "rust" && "$platform" == linux/* && -z "$remote_path_override" ]] && \
+       ! _act_is_windows_host "$host"; then
+        local floor_rc=0
+        rust_glibc_floor=$(_act_linux_glibc_floor "$tool_name" "$platform" "$config_file" \
+            "$build_env" "$build_cmd") || floor_rc=$?
+        if [[ "$floor_rc" -eq 4 ]]; then
+            jq -nc '{status: "error", exit_code: 4, error: "Invalid linux_glibc_floor configuration"}'
+            return 4
+        fi
+        if [[ -n "$rust_glibc_floor" ]]; then
+            rust_floor_triple=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET")
+            rust_zig_target="${rust_floor_triple}.${rust_glibc_floor}"
+            build_env+=$'\n'"DSR_RUST_TARGET=$rust_floor_triple"
+            build_env+=$'\n'"DSR_ZIG_TARGET=$rust_zig_target"
+            build_env+=$'\n'"DSR_LINUX_GLIBC_FLOOR=$rust_glibc_floor"
+            _log_info "Linux glibc floor $rust_glibc_floor active for $platform (cargo build -> cargo zigbuild --target $rust_zig_target)"
+        fi
+    fi
+
     # Check for workspace_binaries (multi-binary Rust workspaces)
     local workspace_binaries
     workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null)
@@ -4156,6 +4480,22 @@ act_run_native_build() {
         if [[ -z "$remote_path" ]]; then
             remote_path="$local_path"
         fi
+    fi
+
+    # A Windows build host can never use a POSIX source root (issue #8): the
+    # sync layer would target the wrong location and the Rust isolation
+    # validator rejects the path mid-build with a config-shaped error nothing
+    # upstream explains. Fail before any remote work, naming the fix.
+    if _act_is_windows_host "$host"; then
+        case "$remote_path" in
+            [A-Za-z]:[\\/]*|/[A-Za-z]/*) ;;
+            *)
+                _log_error "Windows host $host needs a drive-qualified source root for $tool_name (set host_paths.$host in repos.d/${tool_name}.yaml, e.g. C:/Users/<user>/$tool_name); got: $remote_path"
+                jq -nc --arg host "$host" --arg path "$remote_path" \
+                    '{status: "error", exit_code: 4, error: ("Windows host " + $host + " requires a drive-qualified host_paths entry; got: " + $path)}'
+                return 4
+                ;;
+        esac
     fi
 
     # A strict source root must remain byte-for-byte equal to its tracked
@@ -4603,6 +4943,15 @@ act_run_native_build() {
             cargo_home_prefix="${isolation_root_guard}_dsr_src='$rp_q'; _dsr_ancestor=\${_dsr_src%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do if test -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\" || test -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; then printf '[dsr] excluding inherited Cargo config: %s\\n' \"\$_dsr_ancestor/.cargo/\$_dsr_name\" >&2; fi; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; _dsr_ancestor='${nonstrict_stage_root%/*}'; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do test ! -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; test ! -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; test ! -e '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_stage_root}'; test -d '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_source_root}' '${nonstrict_cargo_home}'; ${sibling_copy_prefix}for _dsr_name in registry; do if test -d \"\$HOME/.cargo/\$_dsr_name\"; then ln -s \"\$HOME/.cargo/\$_dsr_name\" '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; fi; done; for _dsr_name in config config.toml credentials credentials.toml; do test ! -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; done; cp -R \"\$_dsr_src/.\" '${nonstrict_source_root}/'; if test -e '${nonstrict_source_root}/.git' || test -L '${nonstrict_source_root}/.git'; then git -C '${nonstrict_source_root}' status --porcelain --untracked-files=no >/dev/null; fi; export CARGO_HOME='${nonstrict_cargo_home}'; "
             cd_cmd="cd '${nonstrict_source_root}'"
         fi
+        # Stage the glibc-floor cargo shim beside the isolated source copy and
+        # put it first on PATH, so a plain `cargo build` in the repo's
+        # build_cmd is routed through cargo-zigbuild with the versioned
+        # target (issue #9). `.dsr-bin` cannot collide with a sibling crate:
+        # sibling names may not start with a dot.
+        if [[ -n "$rust_zig_target" ]] && $nonstrict_rust_isolate; then
+            cargo_home_prefix+=$(_act_zig_shim_prefix_sh "${nonstrict_stage_root}/.dsr-bin")
+            env_exports+="export PATH='${nonstrict_stage_root}/.dsr-bin':\"\$PATH\"; "
+        fi
         remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
     fi
 
@@ -4798,7 +5147,12 @@ act_run_native_build() {
                         file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
                         _log_info "Artifact size: $file_size bytes"
                     fi
-                    local_artifact_paths+=("$this_artifact_path")
+                    if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor"; then
+                        local_artifact_paths+=("$this_artifact_path")
+                    else
+                        echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
+                        download_failed=true
+                    fi
                 else
                     _log_error "Failed to copy artifact $bin from local host ($copy_src)"
                     echo "Local cp failed for $bin: $copy_src" >> "$log_file"
@@ -4814,7 +5168,12 @@ act_run_native_build() {
                     file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
                     _log_info "Artifact size: $file_size bytes"
                 fi
-                local_artifact_paths+=("$this_artifact_path")
+                if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor"; then
+                    local_artifact_paths+=("$this_artifact_path")
+                else
+                    echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
+                    download_failed=true
+                fi
             else
                 # Windows cross-compile fallback (symmetric with the local-host
                 # branch above): `go build -o <name> ./cmd/x` does NOT append
@@ -4836,7 +5195,12 @@ act_run_native_build() {
                             file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
                             _log_info "Artifact size: $file_size bytes"
                         fi
-                        local_artifact_paths+=("$this_artifact_path")
+                        if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor"; then
+                            local_artifact_paths+=("$this_artifact_path")
+                        else
+                            echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
+                            download_failed=true
+                        fi
                         fallback_ok=true
                     else
                         # Annotate the log with the fallback attempt for
