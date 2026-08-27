@@ -174,6 +174,7 @@ seed_strict_verify_fixture() {
     local tool="test-tool"
     local tag="v1.0.0"
     unset STRICT_VERIFY_RELEASE_TAG STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME
+    unset STRICT_VERIFY_TAG_MOVE_ON_CALL
     unset STRICT_FIX_REMOTE_TAG_MOVE_ON_CALL STRICT_FIX_MUTATE_MANIFEST_AFTER_UPLOAD
     unset STRICT_FIX_MUTATE_LOCAL_TAG_AFTER_UPLOAD
     unset STRICT_FIX_FLIP_AFTER_FIRST_POST_UPLOAD_GET
@@ -181,8 +182,10 @@ seed_strict_verify_fixture() {
     unset STRICT_VERIFY_RELEASE_PAGE_ONE_FILE STRICT_VERIFY_RELEASE_PAGE_TWO_FILE
     unset STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
     STRICT_VERIFY_REPO="$TEST_TMPDIR/strict-repo"
+    STRICT_VERIFY_TAG_GET_COUNT_FILE="$TEST_TMPDIR/strict-tag-get-count"
     local artifacts_dir="$DSR_STATE_DIR/artifacts/${tool}-${tag}"
     mkdir -p "$STRICT_VERIFY_REPO" "$DSR_CONFIG_DIR/repos.d" "$artifacts_dir"
+    printf '0\n' > "$STRICT_VERIFY_TAG_GET_COUNT_FILE"
 
     git -C "$STRICT_VERIFY_REPO" init -q
     git -C "$STRICT_VERIFY_REPO" config user.name "DSR Test"
@@ -192,7 +195,7 @@ seed_strict_verify_fixture() {
     git -C "$STRICT_VERIFY_REPO" commit -qm "strict verify source"
     git -C "$STRICT_VERIFY_REPO" tag -a "$tag" -m "$tag"
     STRICT_VERIFY_SHA=$(git -C "$STRICT_VERIFY_REPO" rev-parse HEAD)
-    export STRICT_VERIFY_REPO STRICT_VERIFY_SHA
+    export STRICT_VERIFY_REPO STRICT_VERIFY_SHA STRICT_VERIFY_TAG_GET_COUNT_FILE
 
     cat > "$DSR_CONFIG_DIR/repos.d/${tool}.yaml" << YAML
 tool_name: $tool
@@ -376,7 +379,15 @@ create_strict_verify_mock_gh() {
                 fi
                 case "$endpoint" in
                     repos/testuser/test-tool/git/ref/tags/v1.0.0)
-                        jq -nc --arg sha "$STRICT_VERIFY_SHA" '{object:{sha:$sha,type:"commit"}}'
+                        local tag_get_count=0 tag_sha="$STRICT_VERIFY_SHA"
+                        read -r tag_get_count < "$STRICT_VERIFY_TAG_GET_COUNT_FILE" || tag_get_count=0
+                        tag_get_count=$((tag_get_count + 1))
+                        printf '%s\n' "$tag_get_count" > "$STRICT_VERIFY_TAG_GET_COUNT_FILE"
+                        if [[ "${STRICT_VERIFY_TAG_MOVE_ON_CALL:-0}" =~ ^[1-9][0-9]*$ && \
+                              $tag_get_count -ge ${STRICT_VERIFY_TAG_MOVE_ON_CALL} ]]; then
+                            tag_sha="4444444444444444444444444444444444444444"
+                        fi
+                        jq -nc --arg sha "$tag_sha" '{object:{sha:$sha,type:"commit"}}'
                         return 0
                         ;;
                     repos/testuser/test-tool/releases/123)
@@ -487,6 +498,7 @@ create_strict_verify_fix_mock_gh() {
     STRICT_FIX_EXPECTED_ASSETS_FILE="$mock_dir/expected-assets.json"
     STRICT_FIX_DRAFT_FILE="$mock_dir/draft"
     STRICT_FIX_UPLOAD_LOG="$mock_dir/uploads.log"
+    STRICT_FIX_CONTENT_TYPE_LOG="$mock_dir/content-types.log"
     STRICT_FIX_PATCH_LOG="$mock_dir/patches.log"
     STRICT_FIX_LIST_LOG="$mock_dir/release-list.log"
     STRICT_FIX_TAG_ENDPOINT_LOG="$mock_dir/tag-endpoint.log"
@@ -506,6 +518,7 @@ create_strict_verify_fix_mock_gh() {
     printf 'v1.0.0\n' > "$STRICT_FIX_TAG_NAME_FILE"
     export STRICT_FIX_ASSETS_FILE STRICT_FIX_EXPECTED_ASSETS_FILE
     export STRICT_FIX_DRAFT_FILE STRICT_FIX_UPLOAD_LOG STRICT_FIX_PATCH_LOG
+    export STRICT_FIX_CONTENT_TYPE_LOG
     export STRICT_FIX_LIST_LOG STRICT_FIX_TAG_ENDPOINT_LOG
     export STRICT_FIX_MUTATION_MARKER
     export STRICT_FIX_RELEASE_ID_GET_COUNT_FILE
@@ -602,10 +615,27 @@ create_strict_verify_fix_mock_gh() {
                         return 0
                         ;;
                     repos/testuser/test-tool/releases/assets/*)
-                        if [[ "$method" != "DELETE" ]]; then
+                        local asset_id="${endpoint##*/}"
+                        if [[ "$method" == "GET" ]]; then
+                            [[ "$*" == *"Accept: application/octet-stream"* ]] || return 1
+                            local asset_name="" asset_path=""
+                            asset_name=$(jq -er --argjson id "$asset_id" \
+                                '[.[] | select(.id == $id)] |
+                                 if length == 1 then .[0].name else error("unknown asset") end' \
+                                "$STRICT_FIX_ASSETS_FILE") || return 1
+                            asset_path="$STRICT_VERIFY_ARTIFACTS_DIR/$asset_name"
+                            if [[ "${STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME:-}" == "$asset_name" ]]; then
+                                printf 'corrupted served bytes for %s\n' "$asset_name"
+                            elif [[ -f "$asset_path" && ! -L "$asset_path" ]]; then
+                                cat "$asset_path"
+                            else
+                                return 1
+                            fi
+                            return 0
+                        elif [[ "$method" != "DELETE" ]]; then
                             return 1
                         fi
-                        local delete_asset_id="${endpoint##*/}"
+                        local delete_asset_id="$asset_id"
                         printf 'delete:%s\n' "$delete_asset_id" >> "$STRICT_FIX_UPLOAD_LOG"
                         jq -c --argjson id "$delete_asset_id" 'map(select(.id != $id))' \
                             "$STRICT_FIX_ASSETS_FILE" > "$STRICT_FIX_ASSETS_FILE.next"
@@ -625,12 +655,17 @@ create_strict_verify_fix_mock_gh() {
     }
 
     curl() {
-        local url="${!#}" data_arg="" arg
+        local url="${!#}" data_arg="" content_type="" arg
         while [[ $# -gt 0 ]]; do
             arg="$1"
             shift
             if [[ "$arg" == "--data-binary" && $# -gt 0 ]]; then
                 data_arg="$1"
+                shift
+            elif [[ "$arg" == "-H" && $# -gt 0 ]]; then
+                case "$1" in
+                    Content-Type:*) content_type="${1#Content-Type: }" ;;
+                esac
                 shift
             fi
         done
@@ -639,6 +674,7 @@ create_strict_verify_fix_mock_gh() {
         local expected
         asset_name="${asset_name//%2B/+}"
         printf 'id-bound-upload:%s\n' "$asset_name" >> "$STRICT_FIX_UPLOAD_LOG"
+        printf '%s:%s\n' "$asset_name" "$content_type" >> "$STRICT_FIX_CONTENT_TYPE_LOG"
 
         if [[ "${STRICT_FIX_UPLOAD_MODE:-success}" != "fail_without_commit" ]]; then
             expected=$(jq -c --arg name "$asset_name" '.[] | select(.name == $name)' \
@@ -1159,6 +1195,51 @@ test_strict_verify_rejects_corrupt_download_with_matching_metadata() {
         pass "strict release verify rejects corrupt served bytes despite matching metadata"
     else
         fail "strict release verify must not trust metadata for signed assets"
+        echo "status: $status"
+        echo "output: $output"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_verify_mock_gh
+    harness_teardown
+}
+
+test_strict_verify_rejects_tag_move_after_signed_byte_check() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict Minisign verification"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    local enable_rc=0
+    enable_strict_verify_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict Minisign verification requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict Minisign verification fixture setup failed"
+        harness_teardown
+        return
+    fi
+    export STRICT_VERIFY_TAG_MOVE_ON_CALL=2
+    create_strict_verify_mock_gh
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release verify test-tool v1.0.0
+    local status output
+    status=$(exec_status)
+    output=$(exec_stdout)
+
+    if [[ $status -eq 1 ]] && echo "$output" | jq -e \
+        '.details.verification.remote_records_valid == false' >/dev/null 2>&1 && \
+       exec_stderr_contains "Remote release tag moved after strict preflight"; then
+        pass "strict release verify rejects a tag move after signed byte verification"
+    else
+        fail "strict release verify must re-bind signed bytes to the remote tag"
         echo "status: $status"
         echo "output: $output"
         echo "stderr: $(exec_stderr | tail -20)"
@@ -2104,6 +2185,7 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_verify_rejects_remote_digest_mismatch
     test_strict_verify_accepts_downloaded_minisign_pair
     test_strict_verify_rejects_corrupt_download_with_matching_metadata
+    test_strict_verify_rejects_tag_move_after_signed_byte_check
     test_strict_verify_rejects_wrong_release_tag
     test_strict_verify_scans_release_page_larger_than_arg_max
     test_strict_verify_rejects_duplicate_tag_across_pages
@@ -2153,6 +2235,7 @@ test_strict_verify_rejects_extra_or_incomplete_remote_assets
 test_strict_verify_rejects_remote_digest_mismatch
 test_strict_verify_accepts_downloaded_minisign_pair
 test_strict_verify_rejects_corrupt_download_with_matching_metadata
+test_strict_verify_rejects_tag_move_after_signed_byte_check
 test_strict_verify_rejects_wrong_release_tag
 test_strict_verify_scans_release_page_larger_than_arg_max
 test_strict_verify_rejects_duplicate_tag_across_pages

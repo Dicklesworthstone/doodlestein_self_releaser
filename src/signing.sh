@@ -444,6 +444,17 @@ signing_verify_exact() {
         -m "$file" -x "$signature" >/dev/null 2>&1
 }
 
+_signing_sha256() {
+    local file="$1"
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    else
+        return 3
+    fi
+}
+
 # Create one exact detached signature without ever overwriting an existing
 # sidecar. The candidate signature is staged beside its destination, verified
 # with the pinned public key, and only then published with shell noclobber.
@@ -453,7 +464,9 @@ signing_sign_exact() {
     local private_key="$3"
     local public_key_token="$4"
     local trusted_comment="$5"
+    local expected_file_sha256="${6:-}"
     local signature_parent signature_name staging_dir staged_signature
+    local file_sha256_before="" file_sha256_after=""
     local status=0
 
     signing_require_minisign || return 3
@@ -474,6 +487,16 @@ signing_sign_exact() {
         _sign_log_error "Trusted comment must be one non-empty line"
         return 4
     fi
+    file_sha256_before=$(_signing_sha256 "$file") || {
+        _sign_log_error "Could not hash input before signing: $file"
+        return 4
+    }
+    if [[ ! "$file_sha256_before" =~ ^[0-9a-f]{64}$ || \
+          ( -n "$expected_file_sha256" && \
+            "$file_sha256_before" != "$expected_file_sha256" ) ]]; then
+        _sign_log_error "Input digest does not match the frozen signing plan: $file"
+        return 4
+    fi
 
     signature_parent="${signature%/*}"
     [[ "$signature_parent" == "$signature" ]] && signature_parent="."
@@ -492,11 +515,20 @@ signing_sign_exact() {
     elif ! signing_verify_exact "$file" "$staged_signature" "$public_key_token"; then
         _sign_log_error "Private key does not match the pinned public key"
         status=4
-    elif ! (set -o noclobber; cat "$staged_signature" > "$signature"); then
-        _sign_log_error "Could not publish signature without clobbering: $signature"
+    elif ! file_sha256_after=$(_signing_sha256 "$file") || \
+         [[ "$file_sha256_after" != "$file_sha256_before" ]]; then
+        _sign_log_error "Input changed while its detached signature was staged: $file"
+        status=4
+    elif ! ln "$staged_signature" "$signature"; then
+        _sign_log_error "Could not atomically publish signature without clobbering: $signature"
         status=4
     elif ! signing_verify_exact "$file" "$signature" "$public_key_token"; then
         _sign_log_error "Published signature failed exact verification: $signature"
+        rm -f -- "$signature"
+        status=4
+    elif ! file_sha256_after=$(_signing_sha256 "$file") || \
+         [[ "$file_sha256_after" != "$file_sha256_before" ]]; then
+        _sign_log_error "Input changed while its detached signature was published: $file"
         rm -f -- "$signature"
         status=4
     fi

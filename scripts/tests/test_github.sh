@@ -363,6 +363,90 @@ test_api_no_cache_sends_headers_on_gh_cli() {
     grep -Fq 'Pragma: no-cache' "$gh_log"
 }
 
+test_download_release_asset_uses_authenticated_gh() {
+  local destination="$TEMP_DIR/gh-asset.bin"
+  local gh_log="$TEMP_DIR/gh-download.log"
+
+  gh() {
+    if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
+      return 0
+    fi
+    printf '%s\n' "$*" > "$gh_log"
+    printf 'gh-binary-bytes\001'
+  }
+
+  local status=0
+  gh_download_release_asset "owner/repo" 42 "$destination" || status=$?
+  unset -f gh
+
+  [[ $status -eq 0 && -f "$destination" ]] &&
+    [[ "$(cat "$destination")" == $'gh-binary-bytes\001' ]] &&
+    grep -Fq 'repos/owner/repo/releases/assets/42' "$gh_log" &&
+    grep -Fq 'Accept: application/octet-stream' "$gh_log" &&
+    grep -Fq 'Cache-Control: no-cache, no-store, max-age=0' "$gh_log"
+}
+
+test_download_release_asset_uses_token_curl_fallback() {
+  local destination="$TEMP_DIR/curl-asset.bin"
+  local curl_log="$TEMP_DIR/curl-download.log"
+  export GITHUB_TOKEN="download-test-token"
+
+  gh() { return 1; }
+  curl() {
+    local output="" arg
+    printf '%s\n' "$*" > "$curl_log"
+    while [[ $# -gt 0 ]]; do
+      arg="$1"
+      shift
+      if [[ "$arg" == "-o" && $# -gt 0 ]]; then
+        output="$1"
+        shift
+      fi
+    done
+    [[ -n "$output" ]] || return 4
+    printf 'curl-binary-bytes\002' > "$output"
+  }
+
+  local status=0
+  gh_download_release_asset "owner/repo" 43 "$destination" || status=$?
+  unset -f gh curl
+  unset GITHUB_TOKEN
+
+  [[ $status -eq 0 && -f "$destination" ]] &&
+    [[ "$(cat "$destination")" == $'curl-binary-bytes\002' ]] &&
+    grep -Fq 'Accept: application/octet-stream' "$curl_log" &&
+    grep -Fq 'Authorization: Bearer download-test-token' "$curl_log" &&
+    grep -Fq 'https://api.github.com/repos/owner/repo/releases/assets/43' "$curl_log"
+}
+
+test_download_release_asset_failure_leaves_no_destination() {
+  local destination="$TEMP_DIR/failed-asset.bin"
+  export GITHUB_TOKEN="download-test-token"
+
+  gh() { return 1; }
+  curl() {
+    local output="" arg
+    while [[ $# -gt 0 ]]; do
+      arg="$1"
+      shift
+      if [[ "$arg" == "-o" && $# -gt 0 ]]; then
+        output="$1"
+        shift
+      fi
+    done
+    [[ -n "$output" ]] && printf 'partial bytes' > "$output"
+    return 22
+  }
+
+  local status=0
+  gh_download_release_asset "owner/repo" 44 "$destination" || status=$?
+  unset -f gh curl
+  unset GITHUB_TOKEN
+
+  [[ $status -ne 0 && ! -e "$destination" ]] &&
+    [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]]
+}
+
 # ============================================================================
 # Tests: Clear Cache
 # ============================================================================
@@ -426,6 +510,10 @@ test_exports_gh_check() {
 
 test_exports_gh_check_token() {
   declare -f gh_check_token >/dev/null
+}
+
+test_exports_gh_download_release_asset() {
+  declare -f gh_download_release_asset >/dev/null
 }
 
 test_exports_gh_workflow_runs() {
@@ -728,6 +816,9 @@ main() {
   run_test "api_rejects_unknown_option" test_api_rejects_unknown_option
   run_test "api_no_cache_omits_stale_etag_on_curl_fallback" test_api_no_cache_omits_stale_etag_on_curl_fallback
   run_test "api_no_cache_sends_headers_on_gh_cli" test_api_no_cache_sends_headers_on_gh_cli
+  run_test "download_release_asset_uses_authenticated_gh" test_download_release_asset_uses_authenticated_gh
+  run_test "download_release_asset_uses_token_curl_fallback" test_download_release_asset_uses_token_curl_fallback
+  run_test "download_release_asset_failure_leaves_no_destination" test_download_release_asset_failure_leaves_no_destination
 
   echo ""
   echo "Clear Cache:"
@@ -746,6 +837,7 @@ main() {
   run_test "exports_gh_api" test_exports_gh_api
   run_test "exports_gh_check" test_exports_gh_check
   run_test "exports_gh_check_token" test_exports_gh_check_token
+  run_test "exports_gh_download_release_asset" test_exports_gh_download_release_asset
   run_test "exports_gh_workflow_runs" test_exports_gh_workflow_runs
   run_test "exports_gh_releases" test_exports_gh_releases
   run_test "exports_gh_create_release" test_exports_gh_create_release

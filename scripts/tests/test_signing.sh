@@ -198,6 +198,22 @@ test_signing_exact_wrong_key_leaves_no_signature() {
     test ! -e "$signature"
 }
 
+test_signing_exact_publish_failure_leaves_no_signature() {
+  local artifact="$TEMP_DIR/publish-failure.bin"
+  local signature="${artifact}.minisig"
+  local token
+  echo "publish failure data" > "$artifact"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+
+  ln() { return 1; }
+  run_expect_fail "signing_sign_exact fails closed when atomic publication fails" \
+    signing_sign_exact "$artifact" "$signature" "$SIGNING_PRIVATE_KEY" \
+      "$token" "publication failure test"
+  unset -f ln
+  run_cmd "failed exact publication leaves no final signature" \
+    test ! -e "$signature"
+}
+
 test_signing_exact_rejects_legacy_signature() {
   local artifact="$TEMP_DIR/legacy-exact.bin"
   local signature="${artifact}.minisig"
@@ -269,6 +285,7 @@ test_signing_verify_failure
 test_signing_sign_batch
 test_signing_exact_creates_verified_signature_without_clobbering
 test_signing_exact_wrong_key_leaves_no_signature
+test_signing_exact_publish_failure_leaves_no_signature
 test_signing_exact_rejects_legacy_signature
 test_signing_exact_rejects_symlink_private_key
 test_signing_sign_missing_key

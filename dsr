@@ -4077,7 +4077,8 @@ _release_contract_preflight() {
                 signing_private_key="${SIGNING_PRIVATE_KEY:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/secrets/minisign.key}"
                 if ! signing_sign_exact "$file_path" "$signature" \
                     "$signing_private_key" "$minisign_public_key_token" \
-                    "dsr strict release $tool_name $tag $target $actual_sha"; then
+                    "dsr strict release $tool_name $tag $target $actual_sha" \
+                    "$actual_sha"; then
                     log_error "Could not create required Minisign signature: $signature"
                     return 4
                 fi
@@ -4395,10 +4396,8 @@ _release_contract_verify_remote_signed_bytes() {
         primary_download="$download_dir/$pair_index.primary"
         signature_download="$download_dir/$pair_index.minisig"
 
-        if ! gh api "repos/$repo/releases/assets/$primary_id" \
-            -H "Accept: application/octet-stream" > "$primary_download" 2>/dev/null || \
-           ! gh api "repos/$repo/releases/assets/$signature_id" \
-            -H "Accept: application/octet-stream" > "$signature_download" 2>/dev/null; then
+        if ! gh_download_release_asset "$repo" "$primary_id" "$primary_download" || \
+           ! gh_download_release_asset "$repo" "$signature_id" "$signature_download"; then
             log_error "Could not download signed release pair: $primary_name"
             status=1
             break
@@ -6309,7 +6308,9 @@ EOF
         $fix_missing && strict_expected_draft="true"
         local strict_release_json=""
         if strict_release_json=$(_release_contract_verify_remote_assets \
-            "$repo" "$release_id" "$strict_expected_assets_json" "$strict_expected_draft" "$tag"); then
+            "$repo" "$release_id" "$strict_expected_assets_json" "$strict_expected_draft" "$tag") && \
+           _release_contract_verify_remote_tag_identity \
+            "$repo" "$tag" "$(jq -r '.git_sha' <<< "$release_contract_plan")"; then
             release_json="$strict_release_json"
             release_url=$(jq -r '.html_url // empty' <<< "$release_json")
             assets_json=$(jq -c '.assets' <<< "$release_json")

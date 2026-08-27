@@ -149,6 +149,7 @@ seed_strict_release_fixture() {
     unset STRICT_MUTATE_ADDITIONAL_AFTER_FIRST_UPLOAD
     unset STRICT_CREATE_COMPETITOR_DRAFT
     unset STRICT_RELEASE_LIST_SCENARIO
+    unset STRICT_MUTATE_REMOTE_AFTER_SIGNED_DOWNLOAD
     unset DSR_MINISIGN_KEY STRICT_MINISIGN_PUBLIC_KEY STRICT_MINISIGN_SECRET_KEY
     export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
     STRICT_REPO_DIR="$TEST_TMPDIR/repo"
@@ -340,6 +341,7 @@ create_strict_github_mocks() {
     STRICT_TAG_GET_COUNT_FILE="$TEST_TMPDIR/strict-tag-get-count"
     STRICT_UPLOAD_STARTED_FILE="$TEST_TMPDIR/strict-upload-started"
     STRICT_PUBLIC_FLIP_MARKER="$TEST_TMPDIR/strict-public-flipped"
+    STRICT_SIGNED_DOWNLOAD_MARKER="$TEST_TMPDIR/strict-signed-download-complete"
     STRICT_RELEASE_BODY_STATE="$TEST_TMPDIR/strict-release-body.state"
     printf 'true\n' > "$STRICT_RELEASE_DRAFT_STATE"
     printf 'false\n' > "$STRICT_RELEASE_EXISTS_STATE"
@@ -351,6 +353,7 @@ create_strict_github_mocks() {
     export STRICT_RELEASE_GET_COUNT_FILE STRICT_RELEASE_LIST_GET_COUNT_FILE
     export STRICT_TAG_GET_COUNT_FILE STRICT_UPLOAD_STARTED_FILE
     export STRICT_PUBLIC_FLIP_MARKER
+    export STRICT_SIGNED_DOWNLOAD_MARKER
     export STRICT_RELEASE_BODY_STATE
 
     gh() {
@@ -651,12 +654,17 @@ create_strict_github_mocks() {
                              if length == 1 then .[0].name else error("unknown asset") end' \
                             <<< "$STRICT_REMOTE_ASSETS") || return 1
                         asset_path="$STRICT_ARTIFACTS_DIR/$asset_name"
+                        printf 'download:%s\n' "$asset_name" >> "$STRICT_READ_LOG"
                         if [[ "${STRICT_CORRUPT_REMOTE_ASSET_NAME:-}" == "$asset_name" ]]; then
                             printf 'corrupted served bytes for %s\n' "$asset_name"
                         elif [[ -f "$asset_path" && ! -L "$asset_path" ]]; then
                             cat "$asset_path"
                         else
                             return 1
+                        fi
+                        if [[ "${STRICT_MUTATE_REMOTE_AFTER_SIGNED_DOWNLOAD:-0}" == "1" && \
+                              "$asset_name" == "test-tool-linux-amd64.minisig" ]]; then
+                            : > "$STRICT_SIGNED_DOWNLOAD_MARKER"
                         fi
                         ;;
                     *) return 1 ;;
