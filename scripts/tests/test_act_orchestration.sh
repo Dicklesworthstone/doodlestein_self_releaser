@@ -2084,6 +2084,7 @@ git -C "$strict_gitlink_repo" -c user.name=DSR-Test -c user.email=dsr-test@examp
 strict_gitlink_sha=$(git -C "$strict_gitlink_repo" rev-parse HEAD)
 mkdir -p "$strict_sync_repo"
 printf 'tracked release bytes\n' > "$strict_sync_repo/tracked.txt"
+printf 'tracked crlf bytes\r\nsecond line\r\n' > "$strict_sync_repo/crlf.txt"
 mkdir -p "$strict_sync_repo/site/functions/model"
 printf 'export async function onRequest() {}\n' > \
     "$strict_sync_repo/site/functions/model/[[path]].js"
@@ -2096,7 +2097,7 @@ printf 'sharp lexer fixture\n' > \
 printf 'ignored.cache\n' > "$strict_sync_repo/.gitignore"
 printf 'must never reach a strict builder\n' > "$strict_sync_repo/ignored.cache"
 git -C "$strict_sync_repo" init -q
-git -C "$strict_sync_repo" add tracked.txt .gitignore 'site/functions/model/[[path]].js' \
+git -C "$strict_sync_repo" add tracked.txt crlf.txt .gitignore 'site/functions/model/[[path]].js' \
     'vendor/git.sr.ht/~sbinet/gg/LICENSE.md' \
     'vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml'
 git -C "$strict_sync_repo" update-index --add \
@@ -2207,7 +2208,8 @@ if [[ $strict_sync_status -eq 0 && -n "$strict_sync_root" && \
       -f "$strict_sync_root/site/functions/model/[[path]].js" && \
       -f "$strict_sync_root/vendor/git.sr.ht/~sbinet/gg/LICENSE.md" && \
       -f "$strict_sync_root/vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml" && \
-      "$strict_sync_object_count" == "19" ]] && \
+      -f "$strict_sync_root/crlf.txt" && \
+      "$strict_sync_object_count" == "20" ]] && \
    grep -Fq "$strict_gitlink_sha"$'\t160000\tvendor/submodule' "$strict_sync_manifest" && \
    grep -Fq $'\t100644\tsite/functions/model/[[path]].js' "$strict_sync_manifest" && \
    grep -Fq $'\t100644\tvendor/git.sr.ht/~sbinet/gg/LICENSE.md' "$strict_sync_manifest" && \
@@ -2228,6 +2230,19 @@ if _act_verify_strict_source_roots \
     pass "strict source-root verification accepts an unchanged transferred snapshot"
 else
     fail "strict source-root verification rejected an unchanged transferred snapshot"
+fi
+
+strict_crlf_status=0
+(
+    export GIT_CONFIG_COUNT=1
+    export GIT_CONFIG_KEY_0=core.autocrlf
+    export GIT_CONFIG_VALUE_0=true
+    _act_verify_tracked_manifest_local "$strict_sync_root" "$strict_sync_manifest"
+) >/dev/null 2>&1 || strict_crlf_status=$?
+if [[ $strict_crlf_status -eq 0 ]]; then
+    pass "strict byte verification ignores operator Git line-ending filters"
+else
+    fail "strict byte verification applied operator Git line-ending filters"
 fi
 
 strict_gitlink_tamper_root="$TEMP_DIR/strict-gitlink-tamper/run/source"
@@ -2324,7 +2339,8 @@ strict_unix_gitlink_status=0
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
         local remote_command="${!#}"
-        "$BASH" -c "$remote_command"
+        env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.autocrlf \
+            GIT_CONFIG_VALUE_0=true "$BASH" -c "$remote_command"
     }
     _act_verify_strict_checkout_snapshot \
         "mmini" "$strict_sync_repo" "$strict_sync_sha" "$strict_unix_gitlink_root" \
@@ -2383,6 +2399,7 @@ strict_windows_gitlink_status=0
 if [[ $strict_windows_gitlink_status -eq 0 ]] && \
    grep -Fq "parts[1] -eq '160000'" "$strict_windows_gitlink_command_file" && \
    grep -Fq '^[A-Za-z0-9_./+@~#\[\]-]+$' "$strict_windows_gitlink_command_file" && \
+   grep -Fq 'git hash-object --no-filters -- $node' "$strict_windows_gitlink_command_file" && \
    grep -Fq 'Get-ChildItem -LiteralPath $node -Force' "$strict_windows_gitlink_command_file"; then
     pass "strict Windows verification accepts safe namespace paths and requires empty gitlinks"
 else

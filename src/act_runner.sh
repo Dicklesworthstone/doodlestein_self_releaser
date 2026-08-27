@@ -2794,7 +2794,7 @@ _act_verify_tracked_manifest_local() {
             fi
         else
             if [[ ! -f "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
-               ! actual_id=$(git hash-object -- "$root_path/$relative_path" 2>/dev/null) || \
+               ! actual_id=$(git hash-object --no-filters -- "$root_path/$relative_path" 2>/dev/null) || \
                [[ "$actual_id" != "$object_id" ]] || \
                { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
                { [[ "$mode" == "100644" ]] && [[ -x "$root_path/$relative_path" ]]; }; then
@@ -3272,7 +3272,7 @@ while IFS="\$tab" read -r object_id mode relative_path; do
     else
         test -f "\$node"
         test ! -L "\$node"
-        actual=\$(git hash-object -- "\$node")
+        actual=\$(git hash-object --no-filters -- "\$node")
         test "\$actual" = "\$object_id"
         if test "\$mode" = 100755; then test -x "\$node"; else test ! -x "\$node"; fi
     fi
@@ -3336,7 +3336,7 @@ _act_verify_strict_checkout_snapshot() {
         win_remote_archive=$(_act_windows_cmd_path "$remote_archive")
         win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
         reparse_guard=$(_act_windows_reparse_guard_script)
-        ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@~#\[\]-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$node=Join-Path '${win_remote_path}' \$parts[2]; try { if (\$parts[1] -eq '160000') { Assert-PlainDirectory \$node; if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { \$ok=\$false } } else { Assert-PlainFile \$node; \$actual=(git hash-object -- \$node).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)\""
+        ps_command="powershell -NoProfile -NonInteractive -Command \"${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@~#\[\]-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$node=Join-Path '${win_remote_path}' \$parts[2]; try { if (\$parts[1] -eq '160000') { Assert-PlainDirectory \$node; if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { \$ok=\$false } } else { Assert-PlainFile \$node; \$actual=(git hash-object --no-filters -- \$node).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)\""
         verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
