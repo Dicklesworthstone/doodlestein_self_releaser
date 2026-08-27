@@ -67,9 +67,13 @@ artifact_naming: "${name}-${version}-${os}-${arch}"
 # target must map to one unique primary release asset basename, and each primary
 # must have a sibling `<basename>.sha256` checksum asset. Additional frozen
 # assets are optional; DSR verifies each named regular file by exact name, size,
-# and SHA-256 without discovering unlisted directory contents.
+# and SHA-256 without discovering unlisted directory contents. Set
+# minisign_public_key_file to a safe repository-relative public-key file to
+# require one modern `<basename>.minisig` asset for every primary. The key must
+# be a regular tracked file whose bytes match the exact release tag.
 # release_contract:
 #   checksum_sidecar: sha256
+#   minisign_public_key_file: release/keys/example-tool.pub
 #   exact_primary_assets:
 #     linux/amd64: example-tool-x86_64-unknown-linux-gnu
 #     linux/arm64: example-tool-aarch64-unknown-linux-gnu
@@ -80,7 +84,6 @@ artifact_naming: "${name}-${version}-${os}-${arch}"
 #   exact_additional_assets:
 #     - example-tool.sbom.spdx.json
 #     - SHA256SUMS.txt
-#     - SHA256SUMS.txt.minisig
 
 # Optional for strict releases with local path dependencies: pin each sibling
 # crate to the exact clean commit incorporated into the build manifest.

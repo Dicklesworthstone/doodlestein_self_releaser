@@ -161,6 +161,72 @@ test_signing_sign_batch() {
   run_cmd "batch signature b exists" assert_file_exists "${b}.minisig"
 }
 
+test_signing_exact_creates_verified_signature_without_clobbering() {
+  local artifact="$TEMP_DIR/exact.bin"
+  local signature="${artifact}.strict.minisig"
+  local token expected_signature="$TEMP_DIR/exact.expected.minisig"
+  echo "exact data" > "$artifact"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+
+  run_cmd "signing_sign_exact creates a verified signature" \
+    signing_sign_exact "$artifact" "$signature" "$SIGNING_PRIVATE_KEY" \
+      "$token" "exact signing test"
+  run_cmd "signing_verify_exact accepts the generated signature" \
+    signing_verify_exact "$artifact" "$signature" "$token"
+  cp "$signature" "$expected_signature"
+  run_expect_fail "signing_sign_exact refuses to clobber an existing signature" \
+    signing_sign_exact "$artifact" "$signature" "$SIGNING_PRIVATE_KEY" \
+      "$token" "replacement signing test"
+  run_cmd "existing exact signature remains byte-identical" \
+    cmp -s "$expected_signature" "$signature"
+}
+
+test_signing_exact_wrong_key_leaves_no_signature() {
+  local artifact="$TEMP_DIR/wrong-exact.bin"
+  local signature="${artifact}.minisig"
+  local wrong_public="$TEMP_DIR/wrong-exact.pub"
+  local wrong_private="$TEMP_DIR/wrong-exact.key"
+  local token
+  echo "wrong signer data" > "$artifact"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+  minisign -G -W -p "$wrong_public" -s "$wrong_private" >/dev/null 2>&1
+
+  run_expect_fail "signing_sign_exact rejects a wrong private key" \
+    signing_sign_exact "$artifact" "$signature" "$wrong_private" \
+      "$token" "wrong exact signing test"
+  run_cmd "wrong-key exact signing leaves no final signature" \
+    test ! -e "$signature"
+}
+
+test_signing_exact_rejects_legacy_signature() {
+  local artifact="$TEMP_DIR/legacy-exact.bin"
+  local signature="${artifact}.minisig"
+  local token
+  echo "legacy signature data" > "$artifact"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+  minisign -S -l -s "$SIGNING_PRIVATE_KEY" -m "$artifact" \
+    -x "$signature" -t "legacy signature test" >/dev/null 2>&1
+
+  run_expect_fail "signing_verify_exact rejects legacy signatures" \
+    signing_verify_exact "$artifact" "$signature" "$token"
+}
+
+test_signing_exact_rejects_symlink_private_key() {
+  local artifact="$TEMP_DIR/symlink-key.bin"
+  local signature="${artifact}.minisig"
+  local private_link="$TEMP_DIR/private-link.key"
+  local token
+  echo "symlink private key data" > "$artifact"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+  ln -s "$SIGNING_PRIVATE_KEY" "$private_link"
+
+  run_expect_fail "signing_sign_exact rejects a symlink private key" \
+    signing_sign_exact "$artifact" "$signature" "$private_link" \
+      "$token" "symlink key test"
+  run_cmd "symlink-key rejection leaves no final signature" \
+    test ! -e "$signature"
+}
+
 test_signing_sign_missing_key() {
   rm -f "$SIGNING_PRIVATE_KEY"
   run_expect_fail "signing_sign fails without private key" signing_sign "$TEMP_DIR/ghost.bin" >/dev/null
@@ -201,6 +267,10 @@ test_signing_fix_permissions
 test_signing_sign_and_verify
 test_signing_verify_failure
 test_signing_sign_batch
+test_signing_exact_creates_verified_signature_without_clobbering
+test_signing_exact_wrong_key_leaves_no_signature
+test_signing_exact_rejects_legacy_signature
+test_signing_exact_rejects_symlink_private_key
 test_signing_sign_missing_key
 test_signing_sign_multiple_files_error
 test_signing_verify_multiple_files_error

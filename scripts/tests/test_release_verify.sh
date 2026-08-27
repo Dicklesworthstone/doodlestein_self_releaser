@@ -33,6 +33,18 @@ pass() { ((TESTS_PASSED++)); echo "${GREEN}PASS${NC}: $1"; }
 fail() { ((TESTS_FAILED++)); echo "${RED}FAIL${NC}: $1"; }
 skip() { ((TESTS_SKIPPED++)); echo "${YELLOW}SKIP${NC}: $1"; }
 
+test_sha256() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+test_file_size() {
+    stat -c %s "$1" 2>/dev/null || stat -f %z "$1"
+}
+
 # ============================================================================
 # Dependency Check
 # ============================================================================
@@ -161,7 +173,7 @@ create_mock_gh() {
 seed_strict_verify_fixture() {
     local tool="test-tool"
     local tag="v1.0.0"
-    unset STRICT_VERIFY_RELEASE_TAG
+    unset STRICT_VERIFY_RELEASE_TAG STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME
     unset STRICT_FIX_REMOTE_TAG_MOVE_ON_CALL STRICT_FIX_MUTATE_MANIFEST_AFTER_UPLOAD
     unset STRICT_FIX_MUTATE_LOCAL_TAG_AFTER_UPLOAD
     unset STRICT_FIX_FLIP_AFTER_FIRST_POST_UPLOAD_GET
@@ -254,12 +266,72 @@ YAML
     ')
     STRICT_VERIFY_EXPECTED_ASSETS="$STRICT_VERIFY_ASSETS"
     STRICT_VERIFY_PRIMARY_PATH="$artifacts_dir/${tool}-linux-amd64"
+    STRICT_VERIFY_ARTIFACTS_DIR="$artifacts_dir"
     STRICT_VERIFY_MANIFEST_PATH="$artifacts_dir/${tool}-${tag}-manifest.json"
     STRICT_VERIFY_PRIMARY_SHA="$sha"
     STRICT_VERIFY_PRIMARY_SIZE="$size"
     export STRICT_VERIFY_ASSETS STRICT_VERIFY_EXPECTED_ASSETS STRICT_VERIFY_PRIMARY_PATH
+    export STRICT_VERIFY_ARTIFACTS_DIR
     export STRICT_VERIFY_MANIFEST_PATH
     export STRICT_VERIFY_PRIMARY_SHA STRICT_VERIFY_PRIMARY_SIZE
+}
+
+enable_strict_verify_minisign_contract() {
+    command -v minisign >/dev/null 2>&1 || return 77
+
+    local tool="test-tool" tag="v1.0.0"
+    local public_key="$STRICT_VERIFY_REPO/release/keys/${tool}.pub"
+    local private_key="$TEST_TMPDIR/${tool}-verify.key"
+    local signature="${STRICT_VERIFY_PRIMARY_PATH}.minisig"
+    mkdir -p "$(dirname "$public_key")"
+    minisign -G -W -p "$public_key" -s "$private_key" >/dev/null 2>&1 || return 1
+    git -C "$STRICT_VERIFY_REPO" add "release/keys/${tool}.pub"
+    git -C "$STRICT_VERIFY_REPO" commit -qm "pin strict verify signing key"
+    git -C "$STRICT_VERIFY_REPO" tag -fa "$tag" -m "$tag" >/dev/null
+    STRICT_VERIFY_SHA=$(git -C "$STRICT_VERIFY_REPO" rev-parse HEAD)
+    jq --arg git_sha "$STRICT_VERIFY_SHA" '.source.git_sha = $git_sha' \
+        "$STRICT_VERIFY_MANIFEST_PATH" > "${STRICT_VERIFY_MANIFEST_PATH}.signed"
+    mv "${STRICT_VERIFY_MANIFEST_PATH}.signed" "$STRICT_VERIFY_MANIFEST_PATH"
+
+    cat > "$DSR_CONFIG_DIR/repos.d/${tool}.yaml" << YAML
+tool_name: $tool
+repo: testuser/test-tool
+local_path: $STRICT_VERIFY_REPO
+language: go
+build_cmd: go build ./...
+binary_name: $tool
+targets:
+  - linux/amd64
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: ${tool}-linux-amd64
+  exact_additional_assets:
+    - ${tool}.sbom.spdx.json
+  minisign_public_key_file: release/keys/${tool}.pub
+YAML
+
+    minisign -S -s "$private_key" -m "$STRICT_VERIFY_PRIMARY_PATH" \
+        -x "$signature" -t \
+        "dsr strict release $tool $tag linux/amd64 $STRICT_VERIFY_PRIMARY_SHA" \
+        >/dev/null 2>&1 || return 1
+    local signature_sha signature_size
+    signature_sha=$(test_sha256 "$signature")
+    signature_size=$(test_file_size "$signature")
+    STRICT_VERIFY_ASSETS=$(jq -c \
+        --arg signature_sha "$signature_sha" \
+        --argjson signature_size "$signature_size" '
+        . + [{
+            id: 4,
+            name: "test-tool-linux-amd64.minisig",
+            size: $signature_size,
+            state: "uploaded",
+            digest: ("sha256:" + $signature_sha),
+            browser_download_url: "https://example.invalid/signature"
+        }]
+    ' <<< "$STRICT_VERIFY_ASSETS")
+    STRICT_VERIFY_EXPECTED_ASSETS="$STRICT_VERIFY_ASSETS"
+    export STRICT_VERIFY_SHA STRICT_VERIFY_ASSETS STRICT_VERIFY_EXPECTED_ASSETS
 }
 
 create_strict_verify_mock_gh() {
@@ -319,6 +391,23 @@ create_strict_verify_mock_gh() {
                         ;;
                     repos/testuser/test-tool/releases/tags/v1.0.0)
                         return 1
+                        ;;
+                    repos/testuser/test-tool/releases/assets/*)
+                        [[ "$*" == *"Accept: application/octet-stream"* ]] || return 1
+                        local asset_id="${endpoint##*/}" asset_name="" asset_path=""
+                        asset_name=$(jq -er --argjson id "$asset_id" \
+                            '[.[] | select(.id == $id)] |
+                             if length == 1 then .[0].name else error("unknown asset") end' \
+                            <<< "$STRICT_VERIFY_ASSETS") || return 1
+                        asset_path="$STRICT_VERIFY_ARTIFACTS_DIR/$asset_name"
+                        if [[ "${STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME:-}" == "$asset_name" ]]; then
+                            printf 'corrupted served bytes for %s\n' "$asset_name"
+                        elif [[ -f "$asset_path" && ! -L "$asset_path" ]]; then
+                            cat "$asset_path"
+                        else
+                            return 1
+                        fi
+                        return 0
                         ;;
                 esac
                 ;;
@@ -979,6 +1068,97 @@ test_strict_verify_rejects_remote_digest_mismatch() {
         pass "strict release verify rejects a same-size remote digest mismatch"
     else
         fail "strict release verify must fail when GitHub reports different asset bytes"
+        echo "status: $status"
+        echo "output: $output"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_verify_mock_gh
+    harness_teardown
+}
+
+test_strict_verify_accepts_downloaded_minisign_pair() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict Minisign verification"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    local enable_rc=0
+    enable_strict_verify_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict Minisign verification requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict Minisign verification fixture setup failed"
+        harness_teardown
+        return
+    fi
+    create_strict_verify_mock_gh
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release verify test-tool v1.0.0
+    local status output
+    status=$(exec_status)
+    output=$(exec_stdout)
+
+    if [[ $status -eq 0 ]] && echo "$output" | jq -e '
+        .details.verification.expected == 4 and
+        .details.verification.present == 4 and
+        .details.verification.remote_records_valid == true
+    ' >/dev/null 2>&1; then
+        pass "strict release verify downloads and verifies the Minisign pair"
+    else
+        fail "strict release verify must accept exact downloaded signed bytes"
+        echo "status: $status"
+        echo "output: $output"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_verify_mock_gh
+    harness_teardown
+}
+
+test_strict_verify_rejects_corrupt_download_with_matching_metadata() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict Minisign verification"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    local enable_rc=0
+    enable_strict_verify_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict Minisign verification requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict Minisign verification fixture setup failed"
+        harness_teardown
+        return
+    fi
+    export STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME="test-tool-linux-amd64.minisig"
+    create_strict_verify_mock_gh
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release verify test-tool v1.0.0
+    local status output
+    status=$(exec_status)
+    output=$(exec_stdout)
+
+    if [[ $status -eq 1 ]] && echo "$output" | jq -e \
+        '.details.verification.remote_records_valid == false' >/dev/null 2>&1 && \
+       exec_stderr_contains "Downloaded signature bytes differ from the frozen plan"; then
+        pass "strict release verify rejects corrupt served bytes despite matching metadata"
+    else
+        fail "strict release verify must not trust metadata for signed assets"
         echo "status: $status"
         echo "output: $output"
         echo "stderr: $(exec_stderr | tail -20)"
@@ -1922,6 +2102,8 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_verify_requires_exact_names_sizes_and_sidecars
     test_strict_verify_rejects_extra_or_incomplete_remote_assets
     test_strict_verify_rejects_remote_digest_mismatch
+    test_strict_verify_accepts_downloaded_minisign_pair
+    test_strict_verify_rejects_corrupt_download_with_matching_metadata
     test_strict_verify_rejects_wrong_release_tag
     test_strict_verify_scans_release_page_larger_than_arg_max
     test_strict_verify_rejects_duplicate_tag_across_pages
@@ -1969,6 +2151,8 @@ test_verify_detects_extra_assets
 test_strict_verify_requires_exact_names_sizes_and_sidecars
 test_strict_verify_rejects_extra_or_incomplete_remote_assets
 test_strict_verify_rejects_remote_digest_mismatch
+test_strict_verify_accepts_downloaded_minisign_pair
+test_strict_verify_rejects_corrupt_download_with_matching_metadata
 test_strict_verify_rejects_wrong_release_tag
 test_strict_verify_scans_release_page_larger_than_arg_max
 test_strict_verify_rejects_duplicate_tag_across_pages

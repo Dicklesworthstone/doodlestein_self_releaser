@@ -398,6 +398,114 @@ EOF
     return 0
 }
 
+# Read the inline Minisign public-key token from a regular public-key file.
+# The token is safe to freeze into a release plan and pass to `minisign -P`,
+# avoiding any later dependence on mutable worktree key bytes.
+signing_public_key_token() {
+    local public_key_file="$1"
+    local public_key_token=""
+
+    if [[ ! -f "$public_key_file" || -L "$public_key_file" ]]; then
+        _sign_log_error "Public key must be a regular non-symlink file: $public_key_file"
+        return 4
+    fi
+
+    public_key_token=$(sed -n '2{s/\r$//;p;}' "$public_key_file") || return 4
+    if [[ ! "$public_key_token" =~ ^[A-Za-z0-9+/]{40,}={0,2}$ ]]; then
+        _sign_log_error "Public key file does not contain a valid Minisign token: $public_key_file"
+        return 4
+    fi
+
+    printf '%s\n' "$public_key_token"
+}
+
+# Verify an explicit detached signature with an inline, already-pinned public
+# key. `-H` rejects the legacy non-prehashed signature format.
+signing_verify_exact() {
+    local file="$1"
+    local signature="$2"
+    local public_key_token="$3"
+
+    signing_require_minisign || return 3
+    if [[ ! -f "$file" || -L "$file" ]]; then
+        _sign_log_error "Signed input must be a regular non-symlink file: $file"
+        return 4
+    fi
+    if [[ ! -f "$signature" || -L "$signature" ]]; then
+        _sign_log_error "Signature must be a regular non-symlink file: $signature"
+        return 4
+    fi
+    if [[ ! "$public_key_token" =~ ^[A-Za-z0-9+/]{40,}={0,2}$ ]]; then
+        _sign_log_error "Invalid inline Minisign public key"
+        return 4
+    fi
+
+    minisign -V -H -q -P "$public_key_token" \
+        -m "$file" -x "$signature" >/dev/null 2>&1
+}
+
+# Create one exact detached signature without ever overwriting an existing
+# sidecar. The candidate signature is staged beside its destination, verified
+# with the pinned public key, and only then published with shell noclobber.
+signing_sign_exact() {
+    local file="$1"
+    local signature="$2"
+    local private_key="$3"
+    local public_key_token="$4"
+    local trusted_comment="$5"
+    local signature_parent signature_name staging_dir staged_signature
+    local status=0
+
+    signing_require_minisign || return 3
+    if [[ ! -f "$file" || -L "$file" ]]; then
+        _sign_log_error "Signed input must be a regular non-symlink file: $file"
+        return 4
+    fi
+    if [[ ! -f "$private_key" || -L "$private_key" ]]; then
+        _sign_log_error "Private key must be a regular non-symlink file: $private_key"
+        return 3
+    fi
+    if [[ -e "$signature" || -L "$signature" ]]; then
+        _sign_log_error "Refusing to overwrite existing signature: $signature"
+        return 4
+    fi
+    if [[ -z "$trusted_comment" || "$trusted_comment" == *$'\r'* || \
+          "$trusted_comment" == *$'\n'* ]]; then
+        _sign_log_error "Trusted comment must be one non-empty line"
+        return 4
+    fi
+
+    signature_parent="${signature%/*}"
+    [[ "$signature_parent" == "$signature" ]] && signature_parent="."
+    signature_name="${signature##*/}"
+    staging_dir=$(mktemp -d \
+        "$signature_parent/.${signature_name}.dsr-signing.XXXXXX") || {
+        _sign_log_error "Could not create an isolated signature staging directory"
+        return 4
+    }
+    staged_signature="$staging_dir/$signature_name"
+
+    if ! minisign -S -s "$private_key" -m "$file" -x "$staged_signature" \
+        -t "$trusted_comment" >/dev/null 2>&1; then
+        _sign_log_error "Could not create detached signature: $signature"
+        status=4
+    elif ! signing_verify_exact "$file" "$staged_signature" "$public_key_token"; then
+        _sign_log_error "Private key does not match the pinned public key"
+        status=4
+    elif ! (set -o noclobber; cat "$staged_signature" > "$signature"); then
+        _sign_log_error "Could not publish signature without clobbering: $signature"
+        status=4
+    elif ! signing_verify_exact "$file" "$signature" "$public_key_token"; then
+        _sign_log_error "Published signature failed exact verification: $signature"
+        rm -f -- "$signature"
+        status=4
+    fi
+
+    rm -f -- "$staged_signature"
+    rmdir -- "$staging_dir" 2>/dev/null || true
+    return "$status"
+}
+
 # Get the public key content for embedding
 # Usage: signing_get_public_key [--oneline]
 signing_get_public_key() {
@@ -534,4 +642,5 @@ signing_sign_files() {
 # Export functions for use by other scripts
 export -f signing_require_minisign signing_check signing_init signing_fix_permissions
 export -f signing_sign signing_verify signing_get_public_key signing_sign_batch
+export -f signing_public_key_token signing_verify_exact signing_sign_exact
 export -f signing_is_enabled signing_sign_files

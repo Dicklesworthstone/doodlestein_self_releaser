@@ -539,6 +539,68 @@ YAML
     config_validate_release_contract contract-tool
 }
 
+test_release_contract_accepts_pinned_minisign_key_file() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets:
+  - linux/amd64
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+  minisign_public_key_file: release/keys/contract-tool.pub
+YAML
+
+  local expected
+  expected='{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"contract-tool-linux-amd64"},"minisign_public_key_file":"release/keys/contract-tool.pub"}'
+  [[ "$(config_get_release_contract_json contract-tool)" == "$expected" ]] &&
+    config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_unsafe_minisign_key_paths() {
+  release_contract_test_deps_available || return 0
+  local unsafe_path
+  for unsafe_path in "/release.pub" "../release.pub" "release//key.pub" 'release\key.pub'; do
+    write_contract_tool_config << YAML
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+  minisign_public_key_file: $unsafe_path
+YAML
+    ! config_validate_release_contract contract-tool || return 1
+  done
+}
+
+test_release_contract_rejects_minisign_asset_collisions() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool
+  minisign_public_key_file: release.pub
+  exact_additional_assets: [CONTRACT-TOOL.MINISIG]
+YAML
+  ! config_validate_release_contract contract-tool || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool.minisig
+  minisign_public_key_file: release.pub
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
 test_release_contract_registry_fallback() {
   release_contract_test_deps_available || return 0
   mkdir -p "$DSR_CONFIG_DIR"
@@ -1226,6 +1288,9 @@ main() {
   run_test "release_contract_null_is_legacy_compatible" test_release_contract_null_is_legacy_compatible
   run_test "release_contract_rejects_non_object" test_release_contract_rejects_non_object
   run_test "release_contract_valid_is_canonical_json" test_release_contract_valid_is_canonical_json
+  run_test "release_contract_accepts_pinned_minisign_key_file" test_release_contract_accepts_pinned_minisign_key_file
+  run_test "release_contract_rejects_unsafe_minisign_key_paths" test_release_contract_rejects_unsafe_minisign_key_paths
+  run_test "release_contract_rejects_minisign_asset_collisions" test_release_contract_rejects_minisign_asset_collisions
   run_test "release_contract_registry_fallback" test_release_contract_registry_fallback
   run_test "release_source_dependencies_absent_or_null_are_empty" test_release_source_dependencies_absent_or_null_are_empty
   run_test "release_source_dependencies_are_canonical_and_sorted" test_release_source_dependencies_are_canonical_and_sorted

@@ -149,6 +149,7 @@ seed_strict_release_fixture() {
     unset STRICT_MUTATE_ADDITIONAL_AFTER_FIRST_UPLOAD
     unset STRICT_CREATE_COMPETITOR_DRAFT
     unset STRICT_RELEASE_LIST_SCENARIO
+    unset DSR_MINISIGN_KEY STRICT_MINISIGN_PUBLIC_KEY STRICT_MINISIGN_SECRET_KEY
     export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
     STRICT_REPO_DIR="$TEST_TMPDIR/repo"
     STRICT_ARTIFACTS_DIR="$TEST_TMPDIR/artifacts"
@@ -257,6 +258,80 @@ YAML
     export STRICT_ADDITIONAL_ASSET_PATH STRICT_ADDITIONAL_MUTATED_MARKER
 }
 
+enable_strict_minisign_contract() {
+    command -v minisign >/dev/null 2>&1 || return 77
+
+    local tool="test-tool" tag="v1.0.0"
+    STRICT_MINISIGN_PUBLIC_KEY="$STRICT_REPO_DIR/release/keys/${tool}.pub"
+    STRICT_MINISIGN_SECRET_KEY="$TEST_TMPDIR/${tool}.key"
+    mkdir -p "$(dirname "$STRICT_MINISIGN_PUBLIC_KEY")"
+    minisign -G -W -p "$STRICT_MINISIGN_PUBLIC_KEY" \
+        -s "$STRICT_MINISIGN_SECRET_KEY" >/dev/null 2>&1 || return 1
+
+    git -C "$STRICT_REPO_DIR" add "release/keys/${tool}.pub"
+    git -C "$STRICT_REPO_DIR" commit -qm "pin release signing key"
+    git -C "$STRICT_REPO_DIR" tag -fa "$tag" -m "$tag" >/dev/null
+    STRICT_GIT_SHA=$(git -C "$STRICT_REPO_DIR" rev-parse HEAD)
+    export STRICT_GIT_SHA STRICT_MINISIGN_PUBLIC_KEY STRICT_MINISIGN_SECRET_KEY
+    export DSR_MINISIGN_KEY="$STRICT_MINISIGN_SECRET_KEY"
+
+    jq --arg git_sha "$STRICT_GIT_SHA" '.source.git_sha = $git_sha' \
+        "$STRICT_MANIFEST_PATH" > "${STRICT_MANIFEST_PATH}.signed"
+    mv "${STRICT_MANIFEST_PATH}.signed" "$STRICT_MANIFEST_PATH"
+
+    cat > "$DSR_CONFIG_DIR/repos.d/${tool}.yaml" << YAML
+tool_name: $tool
+repo: testuser/test-tool
+local_path: $STRICT_REPO_DIR
+language: go
+build_cmd: go build ./...
+binary_name: $tool
+targets:
+  - linux/amd64
+  - darwin/arm64
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: ${tool}-linux-amd64
+    darwin/arm64: ${tool}-darwin-arm64
+  exact_additional_assets:
+    - ${tool}.sbom.json
+  minisign_public_key_file: release/keys/${tool}.pub
+YAML
+
+    local target name primary sha signature
+    for target in linux/amd64 darwin/arm64; do
+        case "$target" in
+            linux/amd64) name="${tool}-linux-amd64" ;;
+            darwin/arm64) name="${tool}-darwin-arm64" ;;
+        esac
+        primary="$STRICT_ARTIFACTS_DIR/$name"
+        signature="${primary}.minisig"
+        sha=$(test_sha256 "$primary")
+        minisign -S -s "$STRICT_MINISIGN_SECRET_KEY" -m "$primary" \
+            -x "$signature" -t \
+            "dsr strict release $tool $tag $target $sha" >/dev/null 2>&1 || return 1
+    done
+
+    local linux_sig_sha darwin_sig_sha linux_sig_size darwin_sig_size
+    linux_sig_sha=$(test_sha256 "$STRICT_ARTIFACTS_DIR/${tool}-linux-amd64.minisig")
+    darwin_sig_sha=$(test_sha256 "$STRICT_ARTIFACTS_DIR/${tool}-darwin-arm64.minisig")
+    linux_sig_size=$(test_file_size "$STRICT_ARTIFACTS_DIR/${tool}-linux-amd64.minisig")
+    darwin_sig_size=$(test_file_size "$STRICT_ARTIFACTS_DIR/${tool}-darwin-arm64.minisig")
+    STRICT_REMOTE_ASSETS=$(jq -c \
+        --arg linux_sig_sha "$linux_sig_sha" \
+        --arg darwin_sig_sha "$darwin_sig_sha" \
+        --argjson linux_sig_size "$linux_sig_size" \
+        --argjson darwin_sig_size "$darwin_sig_size" '
+        . + [
+            {id: 6, name: "test-tool-linux-amd64.minisig", size: $linux_sig_size, state: "uploaded", digest: ("sha256:" + $linux_sig_sha)},
+            {id: 7, name: "test-tool-darwin-arm64.minisig", size: $darwin_sig_size, state: "uploaded", digest: ("sha256:" + $darwin_sig_sha)}
+        ]
+    ' <<< "$STRICT_REMOTE_ASSETS")
+    STRICT_EXPECTED_UPLOAD_ASSETS="$STRICT_REMOTE_ASSETS"
+    export STRICT_REMOTE_ASSETS STRICT_EXPECTED_UPLOAD_ASSETS
+}
+
 create_strict_github_mocks() {
     STRICT_RELEASE_DRAFT_STATE="$TEST_TMPDIR/strict-release-draft.state"
     STRICT_RELEASE_EXISTS_STATE="$TEST_TMPDIR/strict-release-exists.state"
@@ -293,6 +368,7 @@ create_strict_github_mocks() {
                 local input_json=""
                 local saw_cache_control=false
                 local saw_pragma=false
+                local saw_octet_stream=false
                 shift 2
                 while [[ $# -gt 0 ]]; do
                     case "$1" in
@@ -301,6 +377,7 @@ create_strict_github_mocks() {
                         -H)
                             [[ "$2" == "Cache-Control: no-cache, no-store, max-age=0" ]] && saw_cache_control=true
                             [[ "$2" == "Pragma: no-cache" ]] && saw_pragma=true
+                            [[ "$2" == "Accept: application/octet-stream" ]] && saw_octet_stream=true
                             shift 2
                             ;;
                         *) shift ;;
@@ -561,7 +638,26 @@ create_strict_github_mocks() {
                                 prerelease: false,
                                 html_url: "https://example.invalid/v1.0.0",
                                 draft: $draft
-                            }'
+                        }'
+                        ;;
+                    repos/testuser/test-tool/releases/assets/*:GET)
+                        if ! $saw_octet_stream; then
+                            printf 'download-header-invalid:%s\n' "$endpoint" >> "$STRICT_MUTATION_LOG"
+                            return 1
+                        fi
+                        local asset_id="${endpoint##*/}" asset_name="" asset_path=""
+                        asset_name=$(jq -er --argjson id "$asset_id" \
+                            '[.[] | select(.id == $id)] |
+                             if length == 1 then .[0].name else error("unknown asset") end' \
+                            <<< "$STRICT_REMOTE_ASSETS") || return 1
+                        asset_path="$STRICT_ARTIFACTS_DIR/$asset_name"
+                        if [[ "${STRICT_CORRUPT_REMOTE_ASSET_NAME:-}" == "$asset_name" ]]; then
+                            printf 'corrupted served bytes for %s\n' "$asset_name"
+                        elif [[ -f "$asset_path" && ! -L "$asset_path" ]]; then
+                            cat "$asset_path"
+                        else
+                            return 1
+                        fi
                         ;;
                     *) return 1 ;;
                 esac
@@ -635,6 +731,7 @@ create_strict_github_mocks() {
 remove_strict_github_mocks() {
     unset -f gh curl
     unset STRICT_RELEASE_LIST_SCENARIO
+    unset STRICT_CORRUPT_REMOTE_ASSET_NAME
 }
 
 # ============================================================================
@@ -901,6 +998,176 @@ test_strict_release_uploads_exact_set_then_publishes() {
         echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
         echo "reads: $reads"
         echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_uploads_exact_verified_minisign_set() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    local enable_rc=0
+    enable_strict_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict minisign release test requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict minisign fixture setup failed"
+        harness_teardown
+        return
+    fi
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status uploads expected_uploads
+    status=$(exec_status)
+    uploads=$(sed -n 's/^upload://p' "$STRICT_MUTATION_LOG" 2>/dev/null | sort)
+    expected_uploads=$(printf '%s\n' \
+        test-tool-darwin-arm64 \
+        test-tool-darwin-arm64.minisig \
+        test-tool-darwin-arm64.sha256 \
+        test-tool-linux-amd64 \
+        test-tool-linux-amd64.minisig \
+        test-tool-linux-amd64.sha256 \
+        test-tool.sbom.json | sort)
+
+    if [[ $status -eq 0 && "$uploads" == "$expected_uploads" ]] && \
+       [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]]; then
+        pass "strict release uploads and publishes the exact verified minisign set"
+    else
+        fail "strict release must publish every and only contracted minisign asset"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_creates_missing_minisign_sidecars() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    local enable_rc=0
+    enable_strict_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict minisign creation test requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict minisign fixture setup failed"
+        harness_teardown
+        return
+    fi
+    mv "$STRICT_ARTIFACTS_DIR/test-tool-linux-amd64.minisig" \
+        "$TEST_TMPDIR/expected-linux.minisig"
+    mv "$STRICT_ARTIFACTS_DIR/test-tool-darwin-arm64.minisig" \
+        "$TEST_TMPDIR/expected-darwin.minisig"
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -eq 0 ]] && \
+       cmp -s "$TEST_TMPDIR/expected-linux.minisig" \
+        "$STRICT_ARTIFACTS_DIR/test-tool-linux-amd64.minisig" && \
+       cmp -s "$TEST_TMPDIR/expected-darwin.minisig" \
+        "$STRICT_ARTIFACTS_DIR/test-tool-darwin-arm64.minisig" && \
+       [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]]; then
+        pass "strict release creates deterministic verified minisign sidecars before mutation"
+    else
+        fail "strict release must materialize the exact missing minisign sidecars"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_wrong_key_signature_before_mutation() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    local enable_rc=0
+    enable_strict_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict wrong-key test requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict minisign fixture setup failed"
+        harness_teardown
+        return
+    fi
+
+    local wrong_public="$TEST_TMPDIR/wrong.pub" wrong_secret="$TEST_TMPDIR/wrong.key"
+    local primary="$STRICT_ARTIFACTS_DIR/test-tool-linux-amd64"
+    mv "${primary}.minisig" "$TEST_TMPDIR/correct-linux.minisig"
+    minisign -G -W -p "$wrong_public" -s "$wrong_secret" >/dev/null 2>&1
+    minisign -S -s "$wrong_secret" -m "$primary" -x "${primary}.minisig" \
+        -t "wrong signer" >/dev/null 2>&1
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -ne 0 && ! -s "$STRICT_MUTATION_LOG" ]] && \
+       exec_stderr_contains "Minisign verification failed for strict primary asset"; then
+        pass "strict release rejects a wrong-key signature before GitHub mutation"
+    else
+        fail "strict release must fail closed on a wrong-key signature"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_corrupt_served_signature_before_publish() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    local enable_rc=0
+    enable_strict_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict remote signature test requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict minisign fixture setup failed"
+        harness_teardown
+        return
+    fi
+    export STRICT_CORRUPT_REMOTE_ASSET_NAME="test-tool-darwin-arm64.minisig"
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -ne 0 ]] && \
+       [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null || true)" -eq 0 ]] && \
+       exec_stderr_contains "Downloaded signature bytes differ from the frozen plan"; then
+        pass "strict release verifies every served signature before publication"
+    else
+        fail "strict release must not publish when served signature bytes are corrupt"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
     fi
 
     remove_strict_github_mocks
@@ -2033,6 +2300,10 @@ echo ""
 if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     echo "Strict Release Contract Tests (mocked GitHub):"
     test_strict_release_uploads_exact_set_then_publishes
+    test_strict_release_uploads_exact_verified_minisign_set
+    test_strict_release_creates_missing_minisign_sidecars
+    test_strict_release_rejects_wrong_key_signature_before_mutation
+    test_strict_release_rejects_corrupt_served_signature_before_publish
     test_strict_release_rejects_additional_asset_mutated_after_preflight
     test_strict_release_rejects_missing_additional_asset_before_mutation
     test_strict_create_commit_then_error_adopts_exact_empty_draft
@@ -2096,6 +2367,10 @@ test_release_missing_artifacts_dir
 echo ""
 echo "Strict Release Contract Tests (mocked GitHub):"
 test_strict_release_uploads_exact_set_then_publishes
+test_strict_release_uploads_exact_verified_minisign_set
+test_strict_release_creates_missing_minisign_sidecars
+test_strict_release_rejects_wrong_key_signature_before_mutation
+test_strict_release_rejects_corrupt_served_signature_before_publish
 test_strict_release_rejects_additional_asset_mutated_after_preflight
 test_strict_release_rejects_missing_additional_asset_before_mutation
 test_strict_create_commit_then_error_adopts_exact_empty_draft

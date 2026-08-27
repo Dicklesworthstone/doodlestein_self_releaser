@@ -3721,9 +3721,9 @@ _release_contract_verify_local_asset() {
 }
 
 # Validate an opt-in release contract and return the closed upload plan as JSON.
-# No GitHub mutation is allowed before this succeeds. When generate_sidecars is
-# sidecar_mode is create, verify, or plan. Creation uses noclobber; an existing
-# sidecar is always validated and never overwritten.
+# No GitHub mutation is allowed before this succeeds. sidecar_mode is create,
+# verify, or plan. Creation uses noclobber; an existing sidecar is always
+# validated and never overwritten.
 _release_contract_preflight() {
     local tool_name="$1"
     local tag="$2"
@@ -3749,18 +3749,44 @@ _release_contract_preflight() {
             test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
             (contains("/") | not) and
             (contains("..") | not);
+        def safe_path_component:
+            type == "string" and
+            length > 0 and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            . != "." and
+            . != "..";
+        def safe_project_path:
+            type == "string" and
+            length > 0 and
+            (startswith("/") | not) and
+            (contains("\\") | not) and
+            (split("/") | all(.[]; safe_path_component));
         (.exact_primary_assets | [.[]]) as $primaries |
         (if has("exact_additional_assets")
          then .exact_additional_assets
          else []
          end) as $additional |
-        ($primaries + ($primaries | map(. + ".sha256")) + $additional) as $all_assets |
+        (if has("minisign_public_key_file")
+         then ($primaries | map(. + ".minisig"))
+         else []
+         end) as $signatures |
+        ($primaries + ($primaries | map(. + ".sha256")) + $signatures + $additional) as $all_assets |
         type == "object" and
+        has("checksum_sidecar") and
+        has("exact_primary_assets") and
+        (((keys) - [
+            "checksum_sidecar",
+            "exact_additional_assets",
+            "exact_primary_assets",
+            "minisign_public_key_file"
+        ]) | length == 0) and
         .checksum_sidecar == "sha256" and
         (.exact_primary_assets | type == "object") and
         (.exact_primary_assets | length > 0) and
         ($additional | type == "array") and
         ([$additional[] | safe_name] | all) and
+        ((has("minisign_public_key_file") | not) or
+         (.minisign_public_key_file | safe_project_path)) and
         (($all_assets | map(ascii_downcase) | unique | length) == ($all_assets | length))
     ' <<< "$contract_json" >/dev/null 2>&1; then
         log_error "Invalid release contract for $tool_name"
@@ -3908,8 +3934,92 @@ _release_contract_preflight() {
         return 4
     fi
 
+    local minisign_public_key_relative=""
+    local minisign_public_key_file=""
+    local minisign_public_key_sha256=""
+    local minisign_public_key_worktree_sha256=""
+    local minisign_public_key_token=""
+    local minisign_public_key_json="null"
+    if jq -e 'has("minisign_public_key_file")' \
+        <<< "$contract_json" >/dev/null 2>&1; then
+        minisign_public_key_relative=$(jq -r '.minisign_public_key_file' \
+            <<< "$contract_json") || return 4
+        minisign_public_key_file="$local_path/$minisign_public_key_relative"
+
+        local key_tree_entry="" key_mode="" key_type="" key_oid="" key_path=""
+        key_tree_entry=$(git -C "$local_path" ls-tree "$head_sha" -- \
+            "$minisign_public_key_relative" 2>/dev/null) || {
+            log_error "Could not inspect the pinned minisign public key at release HEAD"
+            return 4
+        }
+        read -r key_mode key_type key_oid key_path <<< "$key_tree_entry"
+        if [[ "$key_mode" != "100644" || "$key_type" != "blob" || \
+              ! "$key_oid" =~ ^[0-9a-f]{40,64}$ || \
+              "$key_path" != "$minisign_public_key_relative" ]]; then
+            log_error "Pinned minisign public key must be one regular tracked file at release HEAD"
+            return 4
+        fi
+        if [[ ! -f "$minisign_public_key_file" || -L "$minisign_public_key_file" ]]; then
+            log_error "Pinned minisign public key must be a regular non-symlink worktree file"
+            return 4
+        fi
+        local key_component="" key_component_path="$local_path"
+        local -a key_components=()
+        IFS='/' read -r -a key_components <<< "$minisign_public_key_relative"
+        for key_component in "${key_components[@]}"; do
+            key_component_path="$key_component_path/$key_component"
+            if [[ -L "$key_component_path" ]]; then
+                log_error "Pinned minisign public key path traverses a symlink"
+                return 4
+            fi
+        done
+        if ! git -C "$local_path" cat-file blob "$key_oid" 2>/dev/null | \
+            cmp -s - "$minisign_public_key_file"; then
+            log_error "Pinned minisign public key bytes differ from release HEAD"
+            return 4
+        fi
+        if ! command -v minisign >/dev/null 2>&1; then
+            log_error "minisign is required by the strict release contract"
+            return 3
+        fi
+        if command -v sha256sum &>/dev/null; then
+            minisign_public_key_sha256=$(git -C "$local_path" cat-file blob \
+                "$key_oid" 2>/dev/null | sha256sum | awk '{print $1}') || return 4
+        elif command -v shasum &>/dev/null; then
+            minisign_public_key_sha256=$(git -C "$local_path" cat-file blob \
+                "$key_oid" 2>/dev/null | shasum -a 256 | awk '{print $1}') || return 4
+        else
+            log_error "No SHA256 implementation available for the pinned public key"
+            return 3
+        fi
+        if [[ ! "$minisign_public_key_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            log_error "Could not hash the tag-pinned Minisign public key blob"
+            return 4
+        fi
+        minisign_public_key_token=$(git -C "$local_path" cat-file blob \
+            "$key_oid" 2>/dev/null | sed -n '2{s/\r$//;p;}') || return 4
+        if [[ ! "$minisign_public_key_token" =~ ^[A-Za-z0-9+/]{40,}={0,2}$ ]]; then
+            log_error "Tag-pinned file does not contain a valid Minisign public key token"
+            return 4
+        fi
+        minisign_public_key_worktree_sha256=$(_release_sha256 \
+            "$minisign_public_key_file") || return 4
+        if [[ "$minisign_public_key_worktree_sha256" != \
+              "$minisign_public_key_sha256" ]]; then
+            log_error "Pinned Minisign public key changed during strict preflight"
+            return 4
+        fi
+        minisign_public_key_json=$(jq -nc \
+            --arg path "$minisign_public_key_relative" \
+            --arg sha256 "$minisign_public_key_sha256" \
+            --arg token "$minisign_public_key_token" \
+            '{path: $path, sha256: $sha256, token: $token}') || return 4
+    fi
+
     local idx sidecar sidecar_line sidecar_sha sidecar_size
     local expected_sidecar_sha expected_sidecar_size actual_sidecar_sha actual_sidecar_size
+    local signature signature_sha signature_size signing_private_key
+    local current_primary_sha current_primary_size
     local -a planned_assets=()
     for ((idx = 0; idx < ${#primary_names[@]}; idx++)); do
         name="${primary_names[$idx]}"
@@ -3960,6 +4070,48 @@ _release_contract_preflight() {
             --arg source_sha256 "$actual_sha" \
             --argjson size_bytes "$sidecar_size" \
             '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, size_bytes: $size_bytes, kind: "checksum"}')")
+
+        if [[ -n "$minisign_public_key_file" ]]; then
+            signature="${file_path}.minisig"
+            if [[ "$sidecar_mode" == "create" && ! -e "$signature" && ! -L "$signature" ]]; then
+                signing_private_key="${SIGNING_PRIVATE_KEY:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/secrets/minisign.key}"
+                if ! signing_sign_exact "$file_path" "$signature" \
+                    "$signing_private_key" "$minisign_public_key_token" \
+                    "dsr strict release $tool_name $tag $target $actual_sha"; then
+                    log_error "Could not create required Minisign signature: $signature"
+                    return 4
+                fi
+            fi
+
+            if [[ ! -f "$signature" || -L "$signature" ]]; then
+                log_error "Minisign sidecar must be a regular non-symlink file: $signature"
+                return 4
+            fi
+            if ! signing_verify_exact "$file_path" "$signature" \
+                "$minisign_public_key_token"; then
+                log_error "Minisign verification failed for strict primary asset: $name"
+                return 4
+            fi
+            current_primary_sha=$(_release_sha256 "$file_path") || return 4
+            current_primary_size=$(_release_file_size "$file_path") || return 4
+            if [[ "$current_primary_sha" != "$actual_sha" || \
+                  "$current_primary_size" != "$actual_size" ]]; then
+                log_error "Primary asset changed while its signature was prepared: $name"
+                return 4
+            fi
+            signature_sha=$(_release_sha256 "$signature") || return 4
+            signature_size=$(_release_file_size "$signature") || return 4
+            planned_assets+=("$(jq -nc \
+                --arg target "$target" \
+                --arg name "${name}.minisig" \
+                --arg path "$signature" \
+                --arg sha256 "$signature_sha" \
+                --arg source_sha256 "$actual_sha" \
+                --arg public_key_sha256 "$minisign_public_key_sha256" \
+                --arg public_key_token "$minisign_public_key_token" \
+                --argjson size_bytes "$signature_size" \
+                '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, public_key_sha256: $public_key_sha256, public_key_token: $public_key_token, size_bytes: $size_bytes, kind: "minisign"}')")
+        fi
     done
 
     local additional_name additional_path additional_sha additional_size
@@ -4012,6 +4164,7 @@ _release_contract_preflight() {
         --arg git_sha "$head_sha" \
         --argjson dependencies "$expected_dependencies_json" \
         --argjson contract "$contract_json" \
+        --argjson minisign_public_key "$minisign_public_key_json" \
         --argjson assets "$assets_json" \
         '{
             tool: $tool,
@@ -4022,6 +4175,7 @@ _release_contract_preflight() {
             git_sha: $git_sha,
             dependencies: $dependencies,
             contract: $contract,
+            minisign_public_key: $minisign_public_key,
             assets: $assets
         }'
 }
@@ -4146,7 +4300,153 @@ _release_contract_verify_remote_assets() {
         return 1
     fi
 
+    if jq -e 'any(.[]; .kind == "minisign")' \
+        <<< "$expected_assets_json" >/dev/null 2>&1; then
+        if ! _release_contract_verify_remote_signed_bytes \
+            "$repo" "$release_json" "$expected_assets_json"; then
+            return 1
+        fi
+
+        local release_json_after=""
+        release_json_after=$(gh_api "repos/$repo/releases/$release_id" \
+            --no-cache 2>/dev/null) || {
+            log_error "Could not re-fetch release after remote signature verification"
+            return 1
+        }
+        if ! jq -en \
+            --argjson before "$release_json" \
+            --argjson after "$release_json_after" '
+            def identity:
+                {
+                    id,
+                    tag_name,
+                    draft,
+                    name,
+                    body,
+                    prerelease,
+                    assets: ([.assets[] | {id, name, size, state, digest}] | sort_by(.id))
+                };
+            ($before | identity) == ($after | identity)
+        ' >/dev/null 2>&1; then
+            log_error "GitHub release changed during remote signature verification"
+            return 1
+        fi
+        release_json="$release_json_after"
+    fi
+
     printf '%s\n' "$release_json"
+}
+
+# For signed strict contracts, metadata is insufficient proof: download every
+# primary/signature pair by immutable asset ID, bind the bytes to the frozen
+# plan, and verify each detached signature with the tag-pinned inline key.
+_release_contract_verify_remote_signed_bytes() {
+    local repo="$1"
+    local release_json="$2"
+    local expected_assets_json="$3"
+    local public_key_token=""
+    local download_dir=""
+    local status=0
+    local pair_index=0
+
+    if ! jq -e '
+        ([.[] | select(.kind == "primary")]) as $primaries |
+        ([.[] | select(.kind == "minisign")]) as $signatures |
+        ($primaries | length) > 0 and
+        ($primaries | length) == ($signatures | length) and
+        all($primaries[] as $primary;
+            ([$signatures[] |
+                select(.target == $primary.target and
+                       .source_sha256 == $primary.sha256)] | length) == 1
+        ) and
+        ([ $signatures[].public_key_token ] | unique | length) == 1 and
+        all($signatures[];
+            (.public_key_token | type == "string" and
+             test("^[A-Za-z0-9+/]{40,}={0,2}$"))
+        )
+    ' <<< "$expected_assets_json" >/dev/null 2>&1; then
+        log_error "Signed strict release plan does not contain exact primary/signature pairs"
+        return 1
+    fi
+    public_key_token=$(jq -er \
+        '[.[] | select(.kind == "minisign") | .public_key_token] | unique | .[0]' \
+        <<< "$expected_assets_json") || return 1
+
+    download_dir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-bytes.XXXXXX") || {
+        log_error "Could not create a private remote-verification directory"
+        return 1
+    }
+    chmod 700 "$download_dir" || status=1
+
+    local primary_name primary_sha primary_size signature_name signature_sha signature_size
+    local primary_id signature_id primary_download signature_download actual_sha actual_size
+    while IFS=$'\t' read -r primary_name primary_sha primary_size \
+        signature_name signature_sha signature_size; do
+        [[ $status -eq 0 ]] || break
+        pair_index=$((pair_index + 1))
+        primary_id=$(jq -er --arg name "$primary_name" '
+            [.assets[] | select(.name == $name)] |
+            if length == 1 then .[0].id else error("missing primary asset ID") end
+        ' <<< "$release_json") || { status=1; break; }
+        signature_id=$(jq -er --arg name "$signature_name" '
+            [.assets[] | select(.name == $name)] |
+            if length == 1 then .[0].id else error("missing signature asset ID") end
+        ' <<< "$release_json") || { status=1; break; }
+        primary_download="$download_dir/$pair_index.primary"
+        signature_download="$download_dir/$pair_index.minisig"
+
+        if ! gh api "repos/$repo/releases/assets/$primary_id" \
+            -H "Accept: application/octet-stream" > "$primary_download" 2>/dev/null || \
+           ! gh api "repos/$repo/releases/assets/$signature_id" \
+            -H "Accept: application/octet-stream" > "$signature_download" 2>/dev/null; then
+            log_error "Could not download signed release pair: $primary_name"
+            status=1
+            break
+        fi
+
+        actual_size=$(_release_file_size "$primary_download") || { status=1; break; }
+        actual_sha=$(_release_sha256 "$primary_download") || { status=1; break; }
+        if [[ "$actual_size" != "$primary_size" || "$actual_sha" != "$primary_sha" ]]; then
+            log_error "Downloaded primary bytes differ from the frozen plan: $primary_name"
+            status=1
+            break
+        fi
+        actual_size=$(_release_file_size "$signature_download") || { status=1; break; }
+        actual_sha=$(_release_sha256 "$signature_download") || { status=1; break; }
+        if [[ "$actual_size" != "$signature_size" || "$actual_sha" != "$signature_sha" ]]; then
+            log_error "Downloaded signature bytes differ from the frozen plan: $signature_name"
+            status=1
+            break
+        fi
+        if ! signing_verify_exact "$primary_download" "$signature_download" \
+            "$public_key_token"; then
+            log_error "Downloaded Minisign pair failed cryptographic verification: $primary_name"
+            status=1
+            break
+        fi
+    done < <(jq -r '
+        [.[] | select(.kind == "minisign")] as $signatures |
+        [.[] | select(.kind == "primary")] | sort_by(.target)[] as $primary |
+        ($signatures[] |
+            select(.target == $primary.target and
+                   .source_sha256 == $primary.sha256)) as $signature |
+        [
+            $primary.name,
+            $primary.sha256,
+            ($primary.size_bytes | tostring),
+            $signature.name,
+            $signature.sha256,
+            ($signature.size_bytes | tostring)
+        ] | @tsv
+    ' <<< "$expected_assets_json")
+
+    rm -f -- "$download_dir"/* 2>/dev/null || true
+    rmdir -- "$download_dir" 2>/dev/null || true
+    if [[ $status -ne 0 ]]; then
+        log_error "Remote signed release byte verification failed"
+        return 1
+    fi
+    return 0
 }
 
 _release_contract_observe_draft_state() {
@@ -4515,6 +4815,7 @@ EOF
         log_info "Available tools: $(act_list_tools 2>/dev/null | tr '\n' ' ')"
         return 4
     fi
+
     _dsr_require artifact_naming
 
     # Get repository info
@@ -5240,7 +5541,7 @@ EOF
             fi
 
             if [[ "$planned_kind" == "primary" || "$planned_kind" == "checksum" || \
-                  "$planned_kind" == "additional" ]]; then
+                  "$planned_kind" == "minisign" || "$planned_kind" == "additional" ]]; then
                 planned_sha=$(jq -r '.sha256' <<< "$planned_asset")
                 current_sha=$(_release_sha256 "$file" 2>/dev/null || true)
                 if [[ "$current_sha" != "$planned_sha" ]]; then
@@ -6275,7 +6576,9 @@ EOF
                     fi
 
                     bound_upload_url=$(jq -r '.upload_url // empty' <<< "$bound_draft_json")
-                    [[ "$missing" == *.sha256 ]] && upload_content_type="text/plain"
+                    if [[ "$missing" == *.sha256 || "$missing" == *.minisig ]]; then
+                        upload_content_type="text/plain"
+                    fi
                     log_info "  Uploading by release ID to draft: $missing"
                     if upload_result=$(gh_upload_asset "$bound_upload_url" "$file_path" \
                         "$upload_content_type" 2>&1); then
@@ -6654,6 +6957,17 @@ EOF
         return 4
     fi
 
+    local fallback_release_contract_json="null"
+    local strict_contract_owns_signing=false
+    if declare -F config_get_release_contract_json &>/dev/null; then
+        fallback_release_contract_json=$(config_get_release_contract_json \
+            "$tool_name") || return $?
+        if jq -e 'type == "object" and has("minisign_public_key_file")' \
+            <<< "$fallback_release_contract_json" >/dev/null 2>&1; then
+            strict_contract_owns_signing=true
+        fi
+    fi
+
     # Get local path
     local local_path
     local_path=$(act_get_local_path "$tool_name")
@@ -6821,7 +7135,9 @@ EOF
     fi
 
     # Sign if enabled
-    if signing_is_enabled 2>/dev/null; then
+    if $strict_contract_owns_signing; then
+        log_info "Strict release contract owns Minisign sidecar creation"
+    elif signing_is_enabled 2>/dev/null; then
         log_info "Signing artifacts..."
         signing_sign_files "$output_dir" "${tool_name}*" 2>/dev/null || log_warn "Signing failed"
     fi

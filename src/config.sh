@@ -964,16 +964,38 @@ config_validate_release_contract() {
                 (contains("/") | not) and
                 (contains("..") | not)
             end;
+        def safe_path_component:
+            type == "string" and
+            length > 0 and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            . != "." and
+            . != "..";
+        def safe_project_path:
+            type == "string" and
+            length > 0 and
+            (startswith("/") | not) and
+            (contains("\\") | not) and
+            (split("/") | all(.[]; safe_path_component));
         def safe_primary:
-            safe_name and (ascii_downcase | endswith(".sha256") | not);
+            safe_name and
+            (ascii_downcase | endswith(".sha256") | not) and
+            (ascii_downcase | endswith(".minisig") | not);
 
         if ($contract | type) != "object" then false
         elif ($targets | type) != "array" then false
-        elif (($contract | keys | sort) != ["checksum_sidecar", "exact_primary_assets"] and
-              ($contract | keys | sort) != ["checksum_sidecar", "exact_additional_assets", "exact_primary_assets"]) then false
+        elif (($contract | has("checksum_sidecar")) | not) then false
+        elif (($contract | has("exact_primary_assets")) | not) then false
+        elif (($contract | keys) - [
+            "checksum_sidecar",
+            "exact_additional_assets",
+            "exact_primary_assets",
+            "minisign_public_key_file"
+        ] | length) != 0 then false
         elif $contract.checksum_sidecar != "sha256" then false
         elif ($contract.exact_primary_assets | type) != "object" then false
         elif (($contract.exact_additional_assets // []) | type) != "array" then false
+        elif ($contract | has("minisign_public_key_file")) and
+             (($contract.minisign_public_key_file | safe_project_path) | not) then false
         elif ($targets | length) == 0 then false
         elif ([$targets[] | if type == "string" then length > 0 else false end] | all | not) then false
         elif (($targets | unique | length) != ($targets | length)) then false
@@ -984,7 +1006,12 @@ config_validate_release_contract() {
                 then .exact_additional_assets
                 else []
                 end) as $additional |
-            ($primaries + ($primaries | map(. + ".sha256")) + $additional) as $all_assets |
+            ($contract |
+                if has("minisign_public_key_file")
+                then ($primaries | map(. + ".minisig"))
+                else []
+                end) as $signatures |
+            ($primaries + ($primaries | map(. + ".sha256")) + $signatures + $additional) as $all_assets |
             (($contract.exact_primary_assets | keys | sort) == ($targets | sort)) and
             ([$contract.exact_primary_assets[] | safe_primary] | all) and
             ([$additional[] | safe_name] | all) and
