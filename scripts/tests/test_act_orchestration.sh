@@ -1191,6 +1191,26 @@ else
     fail "strict archive validation rejected a valid one-file tar.xz"
 fi
 
+if command -v xattr &>/dev/null && command -v gtar &>/dev/null; then
+    xattr_archive_dir="$TEMP_DIR/xattr-archive"
+    mkdir -p "$xattr_archive_dir"
+    cp "$archive_linux_source" "$xattr_archive_dir/focr"
+    xattr -w com.apple.provenance proof "$xattr_archive_dir/focr"
+    tar -cJf "$TEMP_DIR/xattr-member.tar.xz" -C "$xattr_archive_dir" focr
+    if gtar -tf "$TEMP_DIR/xattr-member.tar.xz" 2>/dev/null | grep -qx '._focr'; then
+        if ! _act_validate_target_archive \
+            "$TEMP_DIR/xattr-member.tar.xz" "tar.xz" "focr" "linux/amd64" 2>/dev/null; then
+            pass "strict archive validation rejects macOS metadata members visible to GNU tar"
+        else
+            fail "strict archive validation accepted a hidden AppleDouble member"
+        fi
+    else
+        skip "local tar did not encode the xattr as an AppleDouble member"
+    fi
+else
+    skip "xattr and gtar required for AppleDouble portability regression"
+fi
+
 payload_mismatch_status=0
 (
     cmp() { return 1; }

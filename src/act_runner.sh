@@ -455,17 +455,19 @@ _act_validate_target_archive() {
     local expected_entry="$3"
     local target="$4"
     local entries size mode executable=false
+    local tar_reader="tar"
+    command -v gtar &>/dev/null && tar_reader="gtar"
 
     case "$format" in
         tar.gz)
             command -v tar &>/dev/null || return 4
-            entries=$(tar -tzf "$archive" 2>/dev/null) || return 4
-            mode=$(tar -tvzf "$archive" 2>/dev/null | awk 'NR == 1 { print $1 }') || return 4
+            entries=$("$tar_reader" -tzf "$archive" 2>/dev/null) || return 4
+            mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | awk 'NR == 1 { print $1 }') || return 4
             ;;
         tar.xz)
             command -v tar &>/dev/null || return 4
-            entries=$(tar -tJf "$archive" 2>/dev/null) || return 4
-            mode=$(tar -tvJf "$archive" 2>/dev/null | awk 'NR == 1 { print $1 }') || return 4
+            entries=$("$tar_reader" -tJf "$archive" 2>/dev/null) || return 4
+            mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | awk 'NR == 1 { print $1 }') || return 4
             ;;
         zip)
             command -v unzip &>/dev/null || return 4
@@ -501,6 +503,8 @@ _act_validate_workspace_archive() {
     local target="$3"
     local config_file="$4"
     local entries="" expected_entries="" configured=""
+    local tar_reader="tar"
+    command -v gtar &>/dev/null && tar_reader="gtar"
 
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     command -v yq &>/dev/null || return 4
@@ -508,11 +512,11 @@ _act_validate_workspace_archive() {
     case "$format" in
         tar.gz)
             command -v tar &>/dev/null || return 4
-            entries=$(tar -tzf "$archive" 2>/dev/null) || return 4
+            entries=$("$tar_reader" -tzf "$archive" 2>/dev/null) || return 4
             ;;
         tar.xz)
             command -v tar &>/dev/null || return 4
-            entries=$(tar -tJf "$archive" 2>/dev/null) || return 4
+            entries=$("$tar_reader" -tJf "$archive" 2>/dev/null) || return 4
             ;;
         zip)
             command -v unzip &>/dev/null || return 4
@@ -557,11 +561,11 @@ _act_validate_workspace_archive() {
     for member in "${expected_members[@]}"; do
         case "$format" in
             tar.gz)
-                mode=$(tar -tvzf "$archive" 2>/dev/null | \
+                mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
                     awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
                 ;;
             tar.xz)
-                mode=$(tar -tvJf "$archive" 2>/dev/null | \
+                mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
                     awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
                 ;;
             zip)
@@ -578,11 +582,11 @@ _act_validate_workspace_archive() {
         executable=false
         case "$format" in
             tar.gz)
-                mode=$(tar -tvzf "$archive" 2>/dev/null | \
+                mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
                     awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
                 ;;
             tar.xz)
-                mode=$(tar -tvJf "$archive" 2>/dev/null | \
+                mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
                     awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
                 ;;
             zip)
@@ -761,13 +765,13 @@ _act_stage_contract_primary() {
                 ;;
             tar.gz)
                 command -v tar &>/dev/null || exit 4
-                tar -czf - -C "$(dirname "$source_path")" \
+                COPYFILE_DISABLE=1 tar --no-xattrs -czf - -C "$(dirname "$source_path")" \
                     "$(basename "$source_path")" >&9 || exit 4
                 chmod 600 /dev/fd/9 || exit 4
                 ;;
             tar.xz)
                 command -v tar &>/dev/null || exit 4
-                tar -cJf - -C "$(dirname "$source_path")" \
+                COPYFILE_DISABLE=1 tar --no-xattrs -cJf - -C "$(dirname "$source_path")" \
                     "$(basename "$source_path")" >&9 || exit 4
                 chmod 600 /dev/fd/9 || exit 4
                 ;;
