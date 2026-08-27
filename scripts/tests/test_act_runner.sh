@@ -277,6 +277,19 @@ test_artifact_dirs() {
     fi
 }
 
+test_artifact_zip_wrapper_classification() {
+    log_test "artifact zip wrapper classification"
+
+    if act_artifact_zip_is_wrapper "act" "/tmp/workflow-artifact.zip" &&
+       ! act_artifact_zip_is_wrapper "native" "/tmp/dcg-x86_64-pc-windows-msvc.zip" &&
+       ! act_artifact_zip_is_wrapper "ssh" "/tmp/dcg-aarch64-pc-windows-msvc.zip" &&
+       ! act_artifact_zip_is_wrapper "act" "/tmp/dcg-x86_64-unknown-linux-musl.tar.xz"; then
+        log_pass "Only act-produced zip wrappers are unpacked"
+    else
+        log_fail "Native release archives must remain opaque during collection"
+    fi
+}
+
 test_workspace_include_staging() {
     log_test "workspace companion-file staging"
 
@@ -540,6 +553,7 @@ main() {
     test_act_check
     test_act_check_reads_config_dir_actrc
     test_artifact_dirs
+    test_artifact_zip_wrapper_classification
     test_workspace_include_staging
     test_act_cleanup
     test_workflow_validation

@@ -3167,16 +3167,16 @@ EOF
             done
         done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.artifact_path // "")] | @tsv' 2>/dev/null)
 
-        while IFS=$'\t' read -r target dir; do
+        while IFS=$'\t' read -r target method dir; do
             [[ -z "$dir" || ! -d "$dir" ]] && continue
             while IFS= read -r -d '' file; do
-                if [[ "$file" == *.zip ]]; then
+                if act_artifact_zip_is_wrapper "$method" "$file"; then
                     _build_collect_artifact_zip "$file" "$tag"
                 else
                     _build_collect_artifact_file "$file" "$target"
                 fi
             done < <(find "$dir" -type f -print0 2>/dev/null)
-        done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.artifact_dir // "")] | @tsv' 2>/dev/null)
+        done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.method // ""), (.artifact_dir // "")] | @tsv' 2>/dev/null)
 
         if $collect_failed; then
             log_error "Artifact collection encountered errors"

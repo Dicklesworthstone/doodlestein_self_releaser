@@ -1484,6 +1484,19 @@ act_run_workflow() {
     return "$exit_code"
 }
 
+# Act's artifact server wraps uploaded files in zip containers. Native builders,
+# by contrast, may publish a zip as the final release archive. Only the former
+# should be opened during top-level collection; unpacking a native Windows
+# archive leaks its internal `*.exe` into the release directory and makes two
+# architectures collide on the shared binary name.
+# Usage: act_artifact_zip_is_wrapper <method> <path>
+act_artifact_zip_is_wrapper() {
+    local method="${1:-}"
+    local path="${2:-}"
+
+    [[ "$method" == "act" && "$path" == *.zip ]]
+}
+
 # Collect artifacts from act run
 # Usage: act_collect_artifacts <artifact_dir> <output_dir>
 act_collect_artifacts() {
