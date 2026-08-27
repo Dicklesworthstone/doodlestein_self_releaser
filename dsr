@@ -2926,7 +2926,7 @@ EOF
             local -a tar_args=()
             local binary_dir
             binary_dir=$(dirname "$binary_path")
-            tar_args=(-czf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
+            tar_args=(--no-xattrs -czf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
             if [[ -n "$repo_path" ]]; then
                 for include in "${include_files[@]}"; do
                     if [[ -f "$repo_path/$include" ]]; then
@@ -2936,9 +2936,10 @@ EOF
                     fi
                 done
             fi
-            # COPYFILE_DISABLE keeps macOS bsdtar from adding AppleDouble ._*
-            # sidecar entries that break strict installer member allowlists
-            # (franken_whisper v0.7.2 incident).
+            # COPYFILE_DISABLE suppresses macOS copyfile metadata while
+            # --no-xattrs prevents bsdtar from encoding source-file xattrs as
+            # AppleDouble ._* members that GNU tar exposes on Linux. Both are
+            # required for cross-platform strict installer member allowlists.
             if COPYFILE_DISABLE=1 tar "${tar_args[@]}"; then
                 _build_manifest_add_entry "$archive_path" "$target" "$format"
                 if [[ -n "$compat_name" ]]; then
@@ -2961,7 +2962,7 @@ EOF
             local -a tar_args=()
             local binary_dir
             binary_dir=$(dirname "$binary_path")
-            tar_args=(-cJf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
+            tar_args=(--no-xattrs -cJf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
             # COPYFILE_DISABLE: see tar.gz branch above (AppleDouble sidecars).
             if [[ -n "$repo_path" ]]; then
                 for include in "${include_files[@]}"; do
