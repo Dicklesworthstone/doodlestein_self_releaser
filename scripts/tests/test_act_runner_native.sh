@@ -795,7 +795,8 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
           "$cmd" != *"CARGO_TARGET_DIR=in-tree-target"* && \
           "$cmd" != *"CARGO_HOME=C:/ambient/cargo-home"* && \
           -z "$scp_args" && "$raw_ssh_args" == *"File]::OpenRead"* && \
-          "$raw_ssh_args" == *"CopyTo"* ]] && \
+          "$raw_ssh_args" == *"CopyTo"* && \
+          "$raw_ssh_args" == *'$output.Dispose()'* ]] && \
        echo "$result" | jq -e \
             --arg home "$expected_home" \
             '.build_influence_env.CARGO_HOME == $home and

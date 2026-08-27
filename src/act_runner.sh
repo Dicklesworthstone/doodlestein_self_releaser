@@ -158,7 +158,7 @@ _act_stream_remote_windows_file() {
     local source_path="$2"
     local ps_path="${source_path//\'/\'\'}"
     local ps_command
-    ps_command="\$ErrorActionPreference='Stop'; \$input=[IO.File]::OpenRead('${ps_path}'); try { \$output=[Console]::OpenStandardOutput(); \$input.CopyTo(\$output); \$output.Flush() } finally { \$input.Dispose() }"
+    ps_command="\$ErrorActionPreference='Stop'; \$input=[IO.File]::OpenRead('${ps_path}'); \$output=\$null; try { \$output=[Console]::OpenStandardOutput(); \$input.CopyTo(\$output); \$output.Flush() } finally { if (\$null -ne \$output) { \$output.Dispose() }; \$input.Dispose() }"
     ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
