@@ -976,6 +976,8 @@ contract_result=$(
         act_run_native_build() {
             local target="$2"
             local remote_override="$5"
+            local release_git_sha="$6"
+            local release_git_ref="$7"
             local target_slug="${target//\//-}"
             local raw_name="focr"
             [[ "$target" == windows/* ]] && raw_name="focr.exe"
@@ -986,6 +988,8 @@ contract_result=$(
                 --arg path "$raw_path" \
                 --arg dir "$contract_raw_root/shared-evidence" \
                 --arg remote_override "$remote_override" \
+                --arg release_git_sha "$release_git_sha" \
+                --arg release_git_ref "$release_git_ref" \
                 '{
                     platform: $platform,
                     host: "stub-host",
@@ -996,7 +1000,9 @@ contract_result=$(
                     artifact_path: $path,
                     artifact_paths: [$path],
                     artifact_dir: $dir,
-                    observed_remote_path: $remote_override
+                    observed_remote_path: $remote_override,
+                    observed_release_git_sha: $release_git_sha,
+                    observed_release_git_ref: $release_git_ref
                 }')
             with_collection_receipt "$native_result" "$raw_path"
         }
@@ -1017,9 +1023,12 @@ if echo "$contract_result" | jq -e \
         .source_dependencies == [] and
         .summary == {total: 6, success: 6, failed: 0} and
         (.targets | length) == 6 and
-        all(.targets[]; .observed_remote_path == $source_root)
+        all(.targets[];
+            .observed_remote_path == $source_root and
+            .observed_release_git_sha == $sha and
+            .observed_release_git_ref == $ref)
     ' &>/dev/null; then
-    pass "strict orchestration retains supplied source and reports 6/6 success"
+    pass "strict orchestration passes supplied source identity to all 6 native builds"
 else
     fail "strict orchestration source/summary mismatch: $contract_result"
 fi

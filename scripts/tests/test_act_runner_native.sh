@@ -620,10 +620,13 @@ test_rust_build_influence_name_xwin_boundaries() {
 XWIN_FUTURE_TOOLCHAIN_SWITCH|match
 xwin_cache_dir|match
 XwIn_MsVc_SySrOoT_Download_Url|match
+DSR_RELEASE_GIT_SHA|match
+dsr_release_git_ref|match
 XWIN|miss
 XWINNER_CACHE_DIR|miss
 NOT_XWIN_CACHE_DIR|miss
 XWIN-CACHE-DIR|miss
+DSR_RELEASE_GIT_SHA_EXTRA|miss
 CASES
 
     if [[ -z "$failures" ]]; then
@@ -646,13 +649,16 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="/ambient/evil-linker"
     export XWIN_CACHE_DIR="/ambient/evil-xwin-cache"
     export XWIN_CROSS_COMPILER="ambient-evil-compiler"
+    export DSR_RELEASE_GIT_SHA="ambient-evil-sha"
+    export DSR_RELEASE_GIT_REF="ambient-evil-ref"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-unix-artifact"
     printf 'strict unix artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
 
     local result
     result=$(act_run_native_build \
         "tool" "darwin/arm64" "v1.0.0" "run1" \
-        "/remote/.dsr-release-snapshots/tool-run/source" 2>/dev/null)
+        "/remote/.dsr-release-snapshots/tool-run/source" \
+        "1111111111111111111111111111111111111111" "v1.0.0" 2>/dev/null)
 
     local cmd scp_args raw_ssh_args expected_target expected_home
     cmd=$(get_ssh_cmd)
@@ -667,6 +673,8 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
           "$cmd" == *'export "RUSTFLAGS=-C target-cpu=apple-m4"'* && \
           "$cmd" == *'export "XWIN_CACHE_DIR=/pinned/xwin-cache"'* && \
           "$cmd" == *'export "XWIN_MSVC_SYSROOT_DOWNLOAD_URL=https://example.invalid/pinned-sysroot.tar.xz"'* && \
+          "$cmd" == *'export "DSR_RELEASE_GIT_SHA=1111111111111111111111111111111111111111"'* && \
+          "$cmd" == *'export "DSR_RELEASE_GIT_REF=v1.0.0"'* && \
           "$cmd" != *"/ambient/evil-wrapper"* && "$cmd" != *"ambient-evil"* && \
           "$cmd" != *"/ambient/evil-linker"* && \
           "$cmd" != *"CARGO_TARGET_DIR=in-tree-target"* && \
@@ -678,6 +686,8 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
              .build_influence_env.RUSTFLAGS == "-C target-cpu=apple-m4" and
              .build_influence_env.XWIN_CACHE_DIR == "/pinned/xwin-cache" and
              .build_influence_env.XWIN_MSVC_SYSROOT_DOWNLOAD_URL == "https://example.invalid/pinned-sysroot.tar.xz" and
+             .build_influence_env.DSR_RELEASE_GIT_SHA == "1111111111111111111111111111111111111111" and
+             .build_influence_env.DSR_RELEASE_GIT_REF == "v1.0.0" and
              (.build_influence_env | has("RUSTC_WRAPPER") | not) and
              .status == "success" and
              (.collected_sha256 | test("^[0-9a-f]{64}$")) and
@@ -688,7 +698,7 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
         log_fail "Strict Unix Cargo/env isolation was not enforced: cmd=$cmd scp=$scp_args result=$result"
     fi
     unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
-    unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER
+    unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER DSR_RELEASE_GIT_SHA DSR_RELEASE_GIT_REF
     unset CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER
 }
 

@@ -4042,7 +4042,8 @@ _act_default_rust_target_triple() {
 _act_is_rust_build_influence_name() {
     local normalized_name="${1^^}"
     case "$normalized_name" in
-        CARGO_*|RUST*|XWIN_*|CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
+        CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
+        CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
         CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|\
         SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|\
         INCLUDE|LIB|LIBPATH|CC_*|CXX_*|AR_*|CFLAGS_*|CXXFLAGS_*|\
@@ -4383,7 +4384,8 @@ _act_ssh_exec() {
 }
 
 # Run native build on remote host via SSH
-# Usage: act_run_native_build <tool_name> <platform> <version> [run_id] [remote_path_override]
+# Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
+#        [remote_path_override] [release_git_sha] [release_git_ref]
 # Returns: JSON result with status, exit_code, artifact info
 act_run_native_build() {
     local tool_name="$1"
@@ -4391,6 +4393,8 @@ act_run_native_build() {
     local version="$3"
     local run_id="${4:-}"
     local remote_path_override="${5:-}"
+    local release_git_sha="${6:-}"
+    local release_git_ref="${7:-}"
 
     local host
     host=$(act_get_native_host "$platform" "$tool_name")
@@ -4524,6 +4528,15 @@ act_run_native_build() {
     local nonstrict_sibling_relatives=()
     if [[ "$language" == "rust" && -n "$remote_path_override" ]]; then
         strict_rust_build=true
+        if [[ -n "$release_git_sha" || -n "$release_git_ref" ]]; then
+            if [[ ! "$release_git_sha" =~ ^[0-9a-f]{40}$ || \
+                  "$release_git_sha" =~ ^0{40}$ || \
+                  "$release_git_ref" != "v${version#v}" ]]; then
+                _log_error "Invalid strict release identity for native Rust build"
+                jq -nc '{status: "error", exit_code: 4, error: "Invalid strict Rust release identity"}'
+                return 4
+            fi
+        fi
         local strict_cargo_target_dir="${remote_path%/*}/.cargo-target-${platform//\//-}"
         local strict_cargo_home="${remote_path%/*}/.cargo-home"
         local strict_build_env="" env_pair
@@ -4537,7 +4550,9 @@ act_run_native_build() {
         fi
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" || "$env_pair" == CARGO_TARGET_DIR=* || \
-               "$env_pair" == CARGO_HOME=* ]] && continue
+               "$env_pair" == CARGO_HOME=* || \
+               "$env_pair" == DSR_RELEASE_GIT_SHA=* || \
+               "$env_pair" == DSR_RELEASE_GIT_REF=* ]] && continue
             if [[ -n "$strict_build_env" ]]; then
                 strict_build_env+=$'\n'
             fi
@@ -4548,6 +4563,10 @@ act_run_native_build() {
         fi
         strict_build_env+="CARGO_TARGET_DIR=$strict_cargo_target_dir"
         strict_build_env+=$'\n'"CARGO_HOME=$strict_cargo_home"
+        if [[ -n "$release_git_sha" ]]; then
+            strict_build_env+=$'\n'"DSR_RELEASE_GIT_SHA=$release_git_sha"
+            strict_build_env+=$'\n'"DSR_RELEASE_GIT_REF=$release_git_ref"
+        fi
         build_env="$strict_build_env"
 
         local windows_build_receipt=false
@@ -4870,7 +4889,7 @@ act_run_native_build() {
                 env_value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
                 ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
             done <<< "$build_env"
-            remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$cargoHome=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$cargoHome.PSIsContainer -or ((\$cargoHome.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoHome.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
+            remote_cmd="powershell -NoProfile -NonInteractive -Command \"\$ErrorActionPreference='Stop'; \$cargoHome=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$cargoHome.PSIsContainer -or ((\$cargoHome.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoHome.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^DSR_RELEASE_GIT_(SHA|REF)$') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode\""
         elif $nonstrict_rust_isolate; then
             local win_stage_root win_source_root win_cargo_home
             win_stage_root=$(_act_windows_cmd_path "$nonstrict_stage_root") || return 4
@@ -4906,7 +4925,7 @@ act_run_native_build() {
         local env_exports=""
         local env_name
         if $strict_rust_build; then
-            env_exports+="test -d '$strict_cargo_home'; test ! -L '$strict_cargo_home'; for name in config config.toml credentials credentials.toml; do test ! -e '$strict_cargo_home'/\$name; test ! -L '$strict_cargo_home'/\$name; done; ancestor='${remote_path%/*}'; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|XWIN_*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; "
+            env_exports+="test -d '$strict_cargo_home'; test ! -L '$strict_cargo_home'; for name in config config.toml credentials credentials.toml; do test ! -e '$strict_cargo_home'/\$name; test ! -L '$strict_cargo_home'/\$name; done; ancestor='${remote_path%/*}'; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; "
         fi
         for env_name in "${cargo_env_to_unset[@]}"; do
             env_exports+="unset $env_name; "
@@ -5531,6 +5550,8 @@ _act_build_orchestration_target() {
     local strict_release_contract="$5"
     local release_contract_json="$6"
     local source_roots_json="$7"
+    local release_git_sha="${8:-}"
+    local release_git_ref="${9:-}"
 
     local host="act-local"
     if [[ "$strict_release_contract" != "true" ]] && \
@@ -5577,7 +5598,8 @@ _act_build_orchestration_target() {
             remote_path_override=$(jq -r --arg host "$host" '.[$host] // empty' <<< "$source_roots_json")
         fi
         full_output=$(act_run_native_build \
-            "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" 2>&1) || exit_code=$?
+            "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" \
+            "$release_git_sha" "$release_git_ref" 2>&1) || exit_code=$?
         [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
         result=$(printf '%s\n' "$full_output" | grep '^{' | tail -1)
         if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
@@ -5632,6 +5654,8 @@ _act_run_target_worker() {
     local attempt="$5" log_path="$6" result_path="$7"
     local strict_release_contract="$8" release_contract_json="$9"
     local source_roots_json="${10}"
+    local release_git_sha="${11:-}"
+    local release_git_ref="${12:-}"
 
     local host="act-local"
     if ! act_platform_uses_act "$tool_name" "$target"; then
@@ -5690,6 +5714,7 @@ _act_run_target_worker() {
     _act_build_orchestration_target \
         "$tool_name" "$version" "$run_id" "$target" \
         "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
+        "$release_git_sha" "$release_git_ref" \
         >> "$log_path" 2>&1 &
     worker_pid=$!
     # The process group remains distinct after monitor mode is disabled; this
@@ -6253,7 +6278,7 @@ act_orchestrate_build() {
 
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
-            "$release_contract_json" "$source_roots_json" &
+            "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" &
         worker_pids+=("$!")
         worker_targets+=("$target")
         worker_results+=("$result_path")
