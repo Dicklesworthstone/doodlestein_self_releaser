@@ -989,6 +989,7 @@ config_validate_release_contract() {
             "checksum_sidecar",
             "exact_additional_assets",
             "exact_primary_assets",
+            "github_tag_ruleset",
             "minisign_public_key_file"
         ] | length) != 0 then false
         elif $contract.checksum_sidecar != "sha256" then false
@@ -996,6 +997,19 @@ config_validate_release_contract() {
         elif (($contract.exact_additional_assets // []) | type) != "array" then false
         elif ($contract | has("minisign_public_key_file")) and
              (($contract.minisign_public_key_file | safe_project_path) | not) then false
+        elif ($contract | has("github_tag_ruleset")) and
+             (($contract.github_tag_ruleset | type) != "object" or
+              (($contract.github_tag_ruleset | keys) -
+               ["repository_id", "ruleset_id"] | length) != 0 or
+              (($contract.github_tag_ruleset | keys | length) != 2) or
+              ($contract.github_tag_ruleset.repository_id | type) != "number" or
+              ($contract.github_tag_ruleset.repository_id | floor) !=
+                $contract.github_tag_ruleset.repository_id or
+              $contract.github_tag_ruleset.repository_id <= 0 or
+              ($contract.github_tag_ruleset.ruleset_id | type) != "number" or
+              ($contract.github_tag_ruleset.ruleset_id | floor) !=
+                $contract.github_tag_ruleset.ruleset_id or
+              $contract.github_tag_ruleset.ruleset_id <= 0) then false
         elif ($targets | length) == 0 then false
         elif ([$targets[] | if type == "string" then length > 0 else false end] | all | not) then false
         elif (($targets | unique | length) != ($targets | length)) then false

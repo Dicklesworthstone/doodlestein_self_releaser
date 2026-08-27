@@ -558,6 +558,74 @@ YAML
     config_validate_release_contract contract-tool
 }
 
+test_release_contract_accepts_pinned_github_tag_ruleset() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets:
+  - linux/amd64
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-linux-amd64
+  github_tag_ruleset:
+    repository_id: 1148330949
+    ruleset_id: 20418963
+YAML
+
+  local expected
+  expected='{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"contract-tool-linux-amd64"},"github_tag_ruleset":{"repository_id":1148330949,"ruleset_id":20418963}}'
+  [[ "$(config_get_release_contract_json contract-tool)" == "$expected" ]] &&
+    config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_invalid_github_tag_ruleset() {
+  release_contract_test_deps_available || return 0
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: contract-tool-linux-amd64}
+  github_tag_ruleset: {ruleset_id: 20418963}
+YAML
+  ! config_validate_release_contract contract-tool || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: contract-tool-linux-amd64}
+  github_tag_ruleset: {repository_id: "1148330949", ruleset_id: 20418963}
+YAML
+  ! config_validate_release_contract contract-tool || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: contract-tool-linux-amd64}
+  github_tag_ruleset: {repository_id: 1148330949, ruleset_id: 0}
+YAML
+  ! config_validate_release_contract contract-tool || return 1
+
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: contract-tool-linux-amd64}
+  github_tag_ruleset:
+    repository_id: 1148330949
+    ruleset_id: 20418963
+    ref_include: refs/tags/v*
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
 test_release_contract_rejects_unsafe_minisign_key_paths() {
   release_contract_test_deps_available || return 0
   local unsafe_path
@@ -1289,6 +1357,8 @@ main() {
   run_test "release_contract_rejects_non_object" test_release_contract_rejects_non_object
   run_test "release_contract_valid_is_canonical_json" test_release_contract_valid_is_canonical_json
   run_test "release_contract_accepts_pinned_minisign_key_file" test_release_contract_accepts_pinned_minisign_key_file
+  run_test "release_contract_accepts_pinned_github_tag_ruleset" test_release_contract_accepts_pinned_github_tag_ruleset
+  run_test "release_contract_rejects_invalid_github_tag_ruleset" test_release_contract_rejects_invalid_github_tag_ruleset
   run_test "release_contract_rejects_unsafe_minisign_key_paths" test_release_contract_rejects_unsafe_minisign_key_paths
   run_test "release_contract_rejects_minisign_asset_collisions" test_release_contract_rejects_minisign_asset_collisions
   run_test "release_contract_registry_fallback" test_release_contract_registry_fallback

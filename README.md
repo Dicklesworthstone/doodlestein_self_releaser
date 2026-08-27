@@ -234,6 +234,16 @@ one `<primary>.minisig` per contracted primary, and verifies downloaded release
 bytes before publication and during `dsr release verify`. The private key stays
 outside the repository and may be selected with `DSR_MINISIGN_KEY`.
 
+Repositories that protect release tags can also pin
+`release_contract.github_tag_ruleset.repository_id` and `ruleset_id`. DSR then
+fails closed unless authenticated, no-cache GitHub reads prove that the exact
+repository owns an active `refs/tags/v*` ruleset with both update and deletion
+protection, no bypass actors, and an unambiguous current history version. It
+freezes that source-bound receipt during strict preflight, refreshes it before
+draft admission and immediately before publication, and reports the revalidated
+receipt from `dsr release verify`. Missing or redacted policy fields are not
+treated as evidence.
+
 ### 5. Check System Health
 
 ```bash
@@ -637,6 +647,11 @@ contracts opt into fail-closed signatures with a tag-tracked
 `release_contract.minisign_public_key_file`; DSR then derives the exact
 `.minisig` inventory and cryptographically verifies the served primary and
 signature bytes, rather than relying only on GitHub asset metadata.
+When `release_contract.github_tag_ruleset` pins numeric repository and ruleset
+IDs, strict release and verification also require a live source-bound GitHub
+receipt for immutable `refs/tags/v*` governance. A changed history version,
+weakened rule, bypass actor, repository mismatch, or redacted field invalidates
+the frozen receipt and blocks publication or verification.
 
 ---
 

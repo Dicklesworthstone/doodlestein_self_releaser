@@ -3778,6 +3778,7 @@ _release_contract_preflight() {
             "checksum_sidecar",
             "exact_additional_assets",
             "exact_primary_assets",
+            "github_tag_ruleset",
             "minisign_public_key_file"
         ]) | length == 0) and
         .checksum_sidecar == "sha256" and
@@ -3787,6 +3788,17 @@ _release_contract_preflight() {
         ([$additional[] | safe_name] | all) and
         ((has("minisign_public_key_file") | not) or
          (.minisign_public_key_file | safe_project_path)) and
+        ((has("github_tag_ruleset") | not) or
+         ((.github_tag_ruleset | type) == "object" and
+          (.github_tag_ruleset | keys) == ["repository_id", "ruleset_id"] and
+          (.github_tag_ruleset.repository_id | type) == "number" and
+          (.github_tag_ruleset.repository_id | floor) ==
+            .github_tag_ruleset.repository_id and
+          .github_tag_ruleset.repository_id > 0 and
+          (.github_tag_ruleset.ruleset_id | type) == "number" and
+          (.github_tag_ruleset.ruleset_id | floor) ==
+            .github_tag_ruleset.ruleset_id and
+          .github_tag_ruleset.ruleset_id > 0)) and
         (($all_assets | map(ascii_downcase) | unique | length) == ($all_assets | length))
     ' <<< "$contract_json" >/dev/null 2>&1; then
         log_error "Invalid release contract for $tool_name"
@@ -3932,6 +3944,31 @@ _release_contract_preflight() {
         [[ "$head_sha" != "$manifest_git_sha" ]]; then
         log_error "Release identity mismatch: HEAD, local tag, GitHub tag, and manifest git_sha must match"
         return 4
+    fi
+
+    local tag_ruleset_receipt_json="null"
+    if jq -e 'has("github_tag_ruleset")' <<< "$contract_json" >/dev/null 2>&1; then
+        local tag_ruleset_repository_id tag_ruleset_id
+        local tag_ruleset_policy_json tag_ruleset_policy_sha256
+        tag_ruleset_repository_id=$(jq -r \
+            '.github_tag_ruleset.repository_id' <<< "$contract_json") || return 4
+        tag_ruleset_id=$(jq -r \
+            '.github_tag_ruleset.ruleset_id' <<< "$contract_json") || return 4
+        tag_ruleset_policy_json=$(gh_get_immutable_tag_ruleset_receipt \
+            "$repo" "$tag_ruleset_repository_id" "$tag_ruleset_id" "$tag") || {
+            log_error "Live GitHub tag-ruleset verification failed for $repo"
+            return 4
+        }
+        tag_ruleset_policy_sha256=$(_release_sha256_line \
+            "$tag_ruleset_policy_json") || return 4
+        tag_ruleset_receipt_json=$(jq -cS \
+            --arg git_sha "$head_sha" \
+            --arg policy_sha256 "$tag_ruleset_policy_sha256" '
+            . + {
+                git_sha: $git_sha,
+                policy_sha256: $policy_sha256
+            }
+        ' <<< "$tag_ruleset_policy_json") || return 4
     fi
 
     local minisign_public_key_relative=""
@@ -4166,6 +4203,7 @@ _release_contract_preflight() {
         --argjson dependencies "$expected_dependencies_json" \
         --argjson contract "$contract_json" \
         --argjson minisign_public_key "$minisign_public_key_json" \
+        --argjson tag_ruleset_receipt "$tag_ruleset_receipt_json" \
         --argjson assets "$assets_json" \
         '{
             tool: $tool,
@@ -4177,8 +4215,63 @@ _release_contract_preflight() {
             dependencies: $dependencies,
             contract: $contract,
             minisign_public_key: $minisign_public_key,
+            tag_ruleset_receipt: $tag_ruleset_receipt,
             assets: $assets
         }'
+}
+
+# Re-fetch the repository-owned immutable-tag policy and require byte-for-byte
+# equality with the normalized receipt frozen by strict preflight. The current
+# history version is part of that receipt, so an edit-and-revert cannot silently
+# reuse stale evidence even when the visible rules return to their earlier values.
+_release_contract_verify_tag_ruleset_receipt() {
+    local frozen_receipt="${1:-null}"
+    local repo repository_id ruleset_id tag git_sha
+    local policy_json policy_sha256 current_receipt
+
+    [[ "$frozen_receipt" == "null" ]] && return 0
+    if ! jq -e '
+        .schema == "dsr.github_tag_ruleset_receipt.v1" and
+        (.repository.full_name | type == "string" and length > 0) and
+        (.repository.id | type == "number" and floor == . and . > 0) and
+        (.ruleset.policy.id | type == "number" and floor == . and . > 0) and
+        (.ruleset.history.version_id | type == "number" and floor == . and . > 0) and
+        (.tag | type == "string" and test("^v[A-Za-z0-9._+-]+$")) and
+        (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+        (.policy_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+    ' <<< "$frozen_receipt" >/dev/null 2>&1; then
+        log_error "Strict release plan contains an invalid tag-ruleset receipt"
+        return 1
+    fi
+
+    repo=$(jq -r '.repository.full_name' <<< "$frozen_receipt") || return 1
+    repository_id=$(jq -r '.repository.id' <<< "$frozen_receipt") || return 1
+    ruleset_id=$(jq -r '.ruleset.policy.id' <<< "$frozen_receipt") || return 1
+    tag=$(jq -r '.tag' <<< "$frozen_receipt") || return 1
+    git_sha=$(jq -r '.git_sha' <<< "$frozen_receipt") || return 1
+    policy_json=$(gh_get_immutable_tag_ruleset_receipt \
+        "$repo" "$repository_id" "$ruleset_id" "$tag") || {
+        log_error "Could not refresh the frozen immutable-tag ruleset receipt"
+        return 1
+    }
+    policy_sha256=$(_release_sha256_line "$policy_json") || return 1
+    current_receipt=$(jq -cS \
+        --arg git_sha "$git_sha" \
+        --arg policy_sha256 "$policy_sha256" '
+        . + {
+            git_sha: $git_sha,
+            policy_sha256: $policy_sha256
+        }
+    ' <<< "$policy_json") || return 1
+
+    if ! jq -en \
+        --argjson frozen "$frozen_receipt" \
+        --argjson current "$current_receipt" \
+        '$frozen == $current' >/dev/null 2>&1; then
+        log_error "GitHub immutable-tag ruleset changed after its strict receipt was frozen"
+        return 1
+    fi
+    return 0
 }
 
 # Resolve the remote tag without cache and require it to retain the frozen
@@ -4934,6 +5027,7 @@ EOF
     local release_contract_plan='{}'
     local release_contract_metadata_json='null'
     local release_contract_git_sha=""
+    local release_contract_tag_ruleset_receipt='null'
     if $release_contract_enabled; then
         local contract_sidecar_mode="create"
         $DRY_RUN && contract_sidecar_mode="plan"
@@ -4943,6 +5037,8 @@ EOF
             return 4
         fi
         release_contract_git_sha=$(jq -r '.git_sha' <<< "$release_contract_plan")
+        release_contract_tag_ruleset_receipt=$(jq -c \
+            '.tag_ruleset_receipt' <<< "$release_contract_plan") || return 4
         release_contract_metadata_json=$(jq -nc \
             --arg tag_name "$tag" \
             --arg name "$tag" \
@@ -5128,6 +5224,11 @@ EOF
         release_args+=" --target-commitish $release_contract_git_sha"
         if ! _release_contract_require_tag_release_absent "$repo" "$tag"; then
             return 7
+        fi
+        if ! _release_contract_verify_tag_ruleset_receipt \
+            "$release_contract_tag_ruleset_receipt"; then
+            log_error "Immutable-tag governance changed before strict draft admission"
+            return 1
         fi
     fi
 
@@ -5794,7 +5895,9 @@ EOF
                     "$repo" "$release_id" "$expected_assets_json" true "$tag" \
                     "$release_contract_metadata_json" >/dev/null && \
                    _release_contract_verify_remote_tag_identity \
-                    "$repo" "$tag" "$expected_git_sha"; then
+                    "$repo" "$tag" "$expected_git_sha" && \
+                   _release_contract_verify_tag_ruleset_receipt \
+                    "$release_contract_tag_ruleset_receipt"; then
                     log_ok "Strict release retained as an exact verified draft by request"
                 else
                     verification_status="incomplete"
@@ -5823,7 +5926,9 @@ EOF
                     "$repo" "$release_id" "$expected_assets_json" true "$tag" \
                     "$release_contract_metadata_json" >/dev/null || \
                    ! _release_contract_verify_remote_tag_identity \
-                    "$repo" "$tag" "$expected_git_sha"; then
+                    "$repo" "$tag" "$expected_git_sha" || \
+                   ! _release_contract_verify_tag_ruleset_receipt \
+                    "$release_contract_tag_ruleset_receipt"; then
                     verification_status="incomplete"
                     _release_record_failed "publish" \
                         "Remote draft or tag changed immediately before publication"
@@ -5837,6 +5942,7 @@ EOF
                     local published_release_json=""
                     local postpublish_assets_valid=false
                     local postpublish_tag_valid=false
+                    local postpublish_ruleset_valid=false
                     if published_release_json=$(_release_contract_verify_remote_assets \
                         "$repo" "$release_id" "$expected_assets_json" false "$tag" \
                         "$release_contract_metadata_json"); then
@@ -5846,8 +5952,13 @@ EOF
                         "$repo" "$tag" "$expected_git_sha"; then
                         postpublish_tag_valid=true
                     fi
+                    if _release_contract_verify_tag_ruleset_receipt \
+                        "$release_contract_tag_ruleset_receipt"; then
+                        postpublish_ruleset_valid=true
+                    fi
 
-                    if $postpublish_assets_valid && $postpublish_tag_valid; then
+                    if $postpublish_assets_valid && $postpublish_tag_valid && \
+                       $postpublish_ruleset_valid; then
                         draft=false
                         local published_url
                         published_url=$(jq -r '.html_url // empty' <<< "$published_release_json")
@@ -5996,6 +6107,7 @@ EOF
             --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
             --argjson failed "$(printf '%s\n' "${failed_assets[@]}" | jq -sc '.')" \
             --arg verification "$verification_status" \
+            --argjson tag_ruleset_receipt "$release_contract_tag_ruleset_receipt" \
             --argjson total "$total_files" \
             --argjson success "$success_count" \
             --argjson failed_count "$failed_count" \
@@ -6017,6 +6129,7 @@ EOF
                 assets_uploaded: $uploaded,
                 assets_failed: $failed,
                 verification: $verification,
+                tag_ruleset_receipt: $tag_ruleset_receipt,
                 total: $total,
                 success: $success,
                 failed: $failed_count,
@@ -6276,6 +6389,7 @@ EOF
     local manifest_exists=false
     local expected_assets=()
     local release_contract_plan='{}'
+    local strict_tag_ruleset_receipt='null'
     local -A expected_asset_sizes=()
     local -A expected_asset_paths=()
     local -A expected_asset_shas=()
@@ -6296,6 +6410,8 @@ EOF
             "$manifest_file" "$release_contract_json" "$contract_sidecar_mode"); then
             return 4
         fi
+        strict_tag_ruleset_receipt=$(jq -c \
+            '.tag_ruleset_receipt' <<< "$release_contract_plan") || return 4
         manifest_exists=true
         log_info "Using strict manifest: $manifest_file"
         while IFS=$'\t' read -r name size path sha kind source_sha; do
@@ -6319,7 +6435,9 @@ EOF
         if strict_release_json=$(_release_contract_verify_remote_assets \
             "$repo" "$release_id" "$strict_expected_assets_json" "$strict_expected_draft" "$tag") && \
            _release_contract_verify_remote_tag_identity \
-            "$repo" "$tag" "$(jq -r '.git_sha' <<< "$release_contract_plan")"; then
+            "$repo" "$tag" "$(jq -r '.git_sha' <<< "$release_contract_plan")" && \
+           _release_contract_verify_tag_ruleset_receipt \
+            "$strict_tag_ruleset_receipt"; then
             release_json="$strict_release_json"
             release_url=$(jq -r '.html_url // empty' <<< "$release_json")
             assets_json=$(jq -c '.assets' <<< "$release_json")
@@ -6590,7 +6708,12 @@ EOF
                         upload_content_type="text/plain"
                     fi
                     log_info "  Uploading by release ID to draft: $missing"
-                    if upload_result=$(gh_upload_asset "$bound_upload_url" "$file_path" \
+                    if ! _release_contract_verify_tag_ruleset_receipt \
+                        "$strict_tag_ruleset_receipt"; then
+                        log_error "Immutable-tag governance changed before strict repair upload"
+                        strict_fix_failed=true
+                        break
+                    elif upload_result=$(gh_upload_asset "$bound_upload_url" "$file_path" \
                         "$upload_content_type" 2>&1); then
                         log_ok "    Uploaded to ID-bound draft"
                     else
@@ -6653,7 +6776,9 @@ EOF
                _release_contract_verify_remote_tag_identity \
                 "$repo" "$tag" "$(jq -r '.git_sha' <<< "$release_contract_plan")" && \
                _release_contract_verify_remote_assets \
-                "$repo" "$release_id" "$expected_assets_json" true "$tag" >/dev/null; then
+                "$repo" "$release_id" "$expected_assets_json" true "$tag" >/dev/null && \
+               _release_contract_verify_tag_ruleset_receipt \
+                "$strict_tag_ruleset_receipt"; then
                 repaired_plan_valid=true
             fi
 
@@ -6745,6 +6870,7 @@ EOF
             --argjson size_mismatches "$(printf '%s\n' "${size_mismatches[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson digest_mismatches "$(printf '%s\n' "${digest_mismatches[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson remote_records_valid "$strict_remote_records_valid" \
+            --argjson tag_ruleset_receipt "$strict_tag_ruleset_receipt" \
             --argjson checksum_verified "$(printf '%s\n' "${verified_checksums[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson checksum_errors "$(printf '%s\n' "${checksum_errors[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson duration "$duration" \
@@ -6762,7 +6888,8 @@ EOF
                     extra: ($extra | length),
                     size_mismatches: ($size_mismatches | length),
                     digest_mismatches: ($digest_mismatches | length),
-                    remote_records_valid: $remote_records_valid
+                    remote_records_valid: $remote_records_valid,
+                    tag_ruleset_receipt: $tag_ruleset_receipt
                 },
                 assets: {
                     present: $present,

@@ -560,6 +560,10 @@ test_exports_gh_download_release_asset() {
   declare -f gh_download_release_asset >/dev/null
 }
 
+test_exports_gh_get_immutable_tag_ruleset_receipt() {
+  declare -f gh_get_immutable_tag_ruleset_receipt >/dev/null
+}
+
 test_exports_gh_workflow_runs() {
   declare -f gh_workflow_runs >/dev/null
 }
@@ -646,6 +650,177 @@ test_tags_rejects_empty_repo() {
 
 test_repo_rejects_empty_repo() {
   ! gh_repo "" 2>/dev/null
+}
+
+# ============================================================================
+# Tests: Immutable Tag Ruleset Receipts
+# ============================================================================
+
+run_immutable_tag_ruleset_scenario() {
+  IMMUTABLE_RULESET_SCENARIO="$1"
+  IMMUTABLE_RULESET_CALL_LOG="$TEMP_DIR/immutable-ruleset-${1}.calls"
+  IMMUTABLE_RULESET_GET_COUNT_FILE="$TEMP_DIR/immutable-ruleset-${1}.count"
+  : > "$IMMUTABLE_RULESET_CALL_LOG"
+  printf '0\n' > "$IMMUTABLE_RULESET_GET_COUNT_FILE"
+  export IMMUTABLE_RULESET_SCENARIO IMMUTABLE_RULESET_CALL_LOG
+  export IMMUTABLE_RULESET_GET_COUNT_FILE
+
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+  gh_api() {
+    local endpoint="${1:-}" live_json history_state get_count=0
+    printf '%s\n' "$*" >> "$IMMUTABLE_RULESET_CALL_LOG"
+    live_json='{
+      "id":42,
+      "name":"Immutable release tags",
+      "target":"tag",
+      "source_type":"Repository",
+      "source":"owner/repo",
+      "enforcement":"active",
+      "bypass_actors":[],
+      "current_user_can_bypass":"never",
+      "conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},
+      "rules":[{"type":"update"},{"type":"deletion"}],
+      "node_id":"RRS_test",
+      "created_at":"2026-08-01T00:00:00Z",
+      "updated_at":"2026-08-02T00:00:00Z",
+      "_links":{"self":{"href":"https://api.github.com/repos/owner/repo/rulesets/42"}}
+    }'
+    case "$IMMUTABLE_RULESET_SCENARIO" in
+      bypass)
+        live_json=$(jq -c '.bypass_actors = [{actor_id: 7, actor_type: "User", bypass_mode: "always"}]' \
+          <<< "$live_json")
+        ;;
+      redacted)
+        live_json=$(jq -c 'del(.bypass_actors)' <<< "$live_json")
+        ;;
+      caller-bypass)
+        live_json=$(jq -c '.current_user_can_bypass = "always"' <<< "$live_json")
+        ;;
+      caller-bypass-redacted)
+        live_json=$(jq -c 'del(.current_user_can_bypass)' <<< "$live_json")
+        ;;
+      missing-update)
+        live_json=$(jq -c '.rules = [.rules[] | select(.type != "update")]' \
+          <<< "$live_json")
+        ;;
+      missing-deletion)
+        live_json=$(jq -c '.rules = [.rules[] | select(.type != "deletion")]' \
+          <<< "$live_json")
+        ;;
+      inactive)
+        live_json=$(jq -c '.enforcement = "evaluate"' <<< "$live_json")
+        ;;
+      wrong-target)
+        live_json=$(jq -c '.target = "branch"' <<< "$live_json")
+        ;;
+      wrong-source)
+        live_json=$(jq -c '.source = "owner/other"' <<< "$live_json")
+        ;;
+      wrong-include)
+        live_json=$(jq -c '.conditions.ref_name.include = ["refs/tags/release-*"]' \
+          <<< "$live_json")
+        ;;
+      nonempty-exclude)
+        live_json=$(jq -c '.conditions.ref_name.exclude = ["refs/tags/v0.*"]' \
+          <<< "$live_json")
+        ;;
+    esac
+    history_state=$(jq -c \
+      'del(.node_id, .created_at, ._links, .current_user_can_bypass) |
+       .updated_at = null' <<< "$live_json")
+    if [[ "$IMMUTABLE_RULESET_SCENARIO" == "history-mismatch" ]]; then
+      history_state=$(jq -c '.rules += [{"type":"creation"}]' <<< "$history_state")
+    fi
+
+    case "$endpoint" in
+      repos/owner/repo)
+        printf '{"id":99,"node_id":"R_repo","full_name":"owner/repo"}\n'
+        ;;
+      repos/owner/repo/rulesets/42\?includes_parents=false)
+        read -r get_count < "$IMMUTABLE_RULESET_GET_COUNT_FILE" || get_count=0
+        get_count=$((get_count + 1))
+        printf '%s\n' "$get_count" > "$IMMUTABLE_RULESET_GET_COUNT_FILE"
+        if [[ "$IMMUTABLE_RULESET_SCENARIO" == "drift" && $get_count -eq 2 ]]; then
+          jq -c '.updated_at = "2026-08-03T00:00:00Z"' <<< "$live_json"
+        else
+          printf '%s\n' "$live_json"
+        fi
+        ;;
+      repos/owner/repo/rulesets/42/history\?per_page=100\&page=1)
+        printf '[{"version_id":123,"updated_at":"2026-08-02T00:00:01Z"}]\n'
+        ;;
+      repos/owner/repo/rulesets/42/history/123)
+        jq -nc --argjson state "$history_state" \
+          '{version_id:123,updated_at:"2026-08-02T00:00:01Z",state:$state}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  IMMUTABLE_RULESET_OUTPUT=""
+  IMMUTABLE_RULESET_STATUS=0
+  IMMUTABLE_RULESET_OUTPUT=$(gh_get_immutable_tag_ruleset_receipt \
+    owner/repo 99 42 v1.2.3 2>/dev/null) || IMMUTABLE_RULESET_STATUS=$?
+  eval "$gh_api_def"
+}
+
+test_immutable_tag_ruleset_receipt_binds_live_history() {
+  run_immutable_tag_ruleset_scenario valid
+
+  [[ $IMMUTABLE_RULESET_STATUS -eq 0 ]] && \
+    jq -e '
+      .schema == "dsr.github_tag_ruleset_receipt.v1" and
+      .repository == {id:99,node_id:"R_repo",full_name:"owner/repo"} and
+      .ruleset.history.version_id == 123 and
+      .ruleset.policy.conditions.ref_name.include == ["refs/tags/v*"] and
+      .ruleset.policy.bypass_actors == [] and
+      ([.ruleset.policy.rules[].type] | sort) == ["deletion","update"]
+    ' <<< "$IMMUTABLE_RULESET_OUTPUT" >/dev/null 2>&1 && \
+    [[ $(wc -l < "$IMMUTABLE_RULESET_CALL_LOG" | tr -d '[:space:]') -eq 5 ]] && \
+    ! grep -v -- '--no-cache' "$IMMUTABLE_RULESET_CALL_LOG" | grep -q .
+}
+
+test_immutable_tag_ruleset_receipt_rejects_bypass_or_redaction() {
+  local scenario
+  for scenario in bypass redacted caller-bypass caller-bypass-redacted; do
+    run_immutable_tag_ruleset_scenario "$scenario"
+    [[ $IMMUTABLE_RULESET_STATUS -ne 0 ]] || return 1
+  done
+}
+
+test_immutable_tag_ruleset_receipt_rejects_missing_rule_or_drift() {
+  local scenario
+  for scenario in missing-update missing-deletion inactive wrong-target wrong-source \
+    wrong-include nonempty-exclude history-mismatch; do
+    run_immutable_tag_ruleset_scenario "$scenario"
+    [[ $IMMUTABLE_RULESET_STATUS -ne 0 ]] || return 1
+  done
+  run_immutable_tag_ruleset_scenario drift
+  [[ $IMMUTABLE_RULESET_STATUS -ne 0 ]]
+}
+
+test_immutable_tag_ruleset_receipt_rejects_uncovered_tag() {
+  local status=0
+  gh_get_immutable_tag_ruleset_receipt owner/repo 99 42 v1/foo \
+    >/dev/null 2>&1 || status=$?
+  [[ $status -eq 4 ]]
+}
+
+test_immutable_tag_ruleset_receipt_rejects_identity_mismatch() {
+  run_immutable_tag_ruleset_scenario valid
+  [[ $IMMUTABLE_RULESET_STATUS -eq 0 ]] || return 1
+
+  local gh_api_def
+  gh_api_def=$(declare -f gh_api)
+  gh_api() {
+    printf '{"id":100,"node_id":"R_other","full_name":"owner/repo"}\n'
+  }
+  local status=0
+  gh_get_immutable_tag_ruleset_receipt owner/repo 99 42 v1.2.3 \
+    >/dev/null 2>&1 || status=$?
+  eval "$gh_api_def"
+  [[ $status -ne 0 ]]
 }
 
 # ============================================================================
@@ -883,6 +1058,8 @@ main() {
   run_test "exports_gh_check" test_exports_gh_check
   run_test "exports_gh_check_token" test_exports_gh_check_token
   run_test "exports_gh_download_release_asset" test_exports_gh_download_release_asset
+  run_test "exports_gh_get_immutable_tag_ruleset_receipt" \
+    test_exports_gh_get_immutable_tag_ruleset_receipt
   run_test "exports_gh_workflow_runs" test_exports_gh_workflow_runs
   run_test "exports_gh_releases" test_exports_gh_releases
   run_test "exports_gh_create_release" test_exports_gh_create_release
@@ -903,6 +1080,19 @@ main() {
   run_test "compare_rejects_missing_args" test_compare_rejects_missing_args
   run_test "tags_rejects_empty_repo" test_tags_rejects_empty_repo
   run_test "repo_rejects_empty_repo" test_repo_rejects_empty_repo
+
+  echo ""
+  echo "Immutable Tag Ruleset Receipts:"
+  run_test "immutable_tag_ruleset_receipt_binds_live_history" \
+    test_immutable_tag_ruleset_receipt_binds_live_history
+  run_test "immutable_tag_ruleset_receipt_rejects_bypass_or_redaction" \
+    test_immutable_tag_ruleset_receipt_rejects_bypass_or_redaction
+  run_test "immutable_tag_ruleset_receipt_rejects_missing_rule_or_drift" \
+    test_immutable_tag_ruleset_receipt_rejects_missing_rule_or_drift
+  run_test "immutable_tag_ruleset_receipt_rejects_uncovered_tag" \
+    test_immutable_tag_ruleset_receipt_rejects_uncovered_tag
+  run_test "immutable_tag_ruleset_receipt_rejects_identity_mismatch" \
+    test_immutable_tag_ruleset_receipt_rejects_identity_mismatch
 
   echo ""
   echo "Dispatch Helpers:"

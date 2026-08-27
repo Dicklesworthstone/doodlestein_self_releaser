@@ -179,6 +179,7 @@ seed_strict_verify_fixture() {
     unset STRICT_FIX_MUTATE_LOCAL_TAG_AFTER_UPLOAD
     unset STRICT_FIX_FLIP_AFTER_FIRST_POST_UPLOAD_GET
     unset STRICT_FIX_TAG_REBIND_ON_RELEASE_ID_GET
+    unset STRICT_FIX_RULESET_CHANGE_ON_ROUND
     unset STRICT_VERIFY_RELEASE_PAGE_ONE_FILE STRICT_VERIFY_RELEASE_PAGE_TWO_FILE
     unset STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
     STRICT_VERIFY_REPO="$TEST_TMPDIR/strict-repo"
@@ -337,6 +338,36 @@ YAML
     export STRICT_VERIFY_SHA STRICT_VERIFY_ASSETS STRICT_VERIFY_EXPECTED_ASSETS
 }
 
+enable_strict_verify_tag_ruleset_contract() {
+    cat >> "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" << 'YAML'
+  github_tag_ruleset:
+    repository_id: 99
+    ruleset_id: 42
+YAML
+    STRICT_VERIFY_RULESET_GET_COUNT_FILE="$TEST_TMPDIR/strict-verify-ruleset-count"
+    printf '0\n' > "$STRICT_VERIFY_RULESET_GET_COUNT_FILE"
+    export STRICT_VERIFY_RULESET_GET_COUNT_FILE
+}
+
+strict_verify_mock_ruleset_json() {
+    printf '%s\n' '{
+      "id":42,
+      "name":"Immutable release tags",
+      "target":"tag",
+      "source_type":"Repository",
+      "source":"testuser/test-tool",
+      "enforcement":"active",
+      "bypass_actors":[],
+      "current_user_can_bypass":"never",
+      "conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},
+      "rules":[{"type":"update"},{"type":"deletion"}],
+      "node_id":"RRS_strict_verify",
+      "created_at":"2026-08-01T00:00:00Z",
+      "updated_at":"2026-08-02T00:00:00Z",
+      "_links":{"self":{"href":"https://api.github.com/repos/testuser/test-tool/rulesets/42"}}
+    }'
+}
+
 create_strict_verify_mock_gh() {
     gh() {
         case "${1:-}" in
@@ -378,6 +409,34 @@ create_strict_verify_mock_gh() {
                     return 0
                 fi
                 case "$endpoint" in
+                    repos/testuser/test-tool)
+                        printf '{"id":99,"node_id":"R_strict_verify","full_name":"testuser/test-tool"}\n'
+                        return 0
+                        ;;
+                    repos/testuser/test-tool/rulesets/42\?includes_parents=false)
+                        local ruleset_get_count=0
+                        read -r ruleset_get_count < "$STRICT_VERIFY_RULESET_GET_COUNT_FILE" || \
+                            ruleset_get_count=0
+                        ruleset_get_count=$((ruleset_get_count + 1))
+                        printf '%s\n' "$ruleset_get_count" > "$STRICT_VERIFY_RULESET_GET_COUNT_FILE"
+                        strict_verify_mock_ruleset_json
+                        return 0
+                        ;;
+                    repos/testuser/test-tool/rulesets/42/history\?per_page=100\&page=1)
+                        printf '[{"version_id":123,"updated_at":"2026-08-02T00:00:01Z"}]\n'
+                        return 0
+                        ;;
+                    repos/testuser/test-tool/rulesets/42/history/123)
+                        local ruleset_json history_state
+                        ruleset_json=$(strict_verify_mock_ruleset_json)
+                        history_state=$(jq -c \
+                            'del(.node_id, .created_at, ._links,
+                                 .current_user_can_bypass) | .updated_at = null' \
+                            <<< "$ruleset_json")
+                        jq -nc --argjson state "$history_state" \
+                            '{version_id:123,updated_at:"2026-08-02T00:00:01Z",state:$state}'
+                        return 0
+                        ;;
                     repos/testuser/test-tool/git/ref/tags/v1.0.0)
                         local tag_get_count=0 tag_sha="$STRICT_VERIFY_SHA"
                         read -r tag_get_count < "$STRICT_VERIFY_TAG_GET_COUNT_FILE" || tag_get_count=0
@@ -425,7 +484,7 @@ create_strict_verify_mock_gh() {
         esac
         return 1
     }
-    export -f gh
+    export -f gh strict_verify_mock_ruleset_json
 }
 
 remove_strict_verify_mock_gh() {
@@ -509,6 +568,7 @@ create_strict_verify_fix_mock_gh() {
     STRICT_FIX_POST_UPLOAD_MUTATION_MARKER="$mock_dir/post-upload-mutated"
     STRICT_FIX_UPLOAD_OCCURRED_FILE="$mock_dir/upload-occurred"
     STRICT_FIX_POST_UPLOAD_GET_COUNT_FILE="$mock_dir/post-upload-get-count"
+    STRICT_FIX_RULESET_GET_COUNT_FILE="$mock_dir/ruleset-get-count"
     STRICT_FIX_TAG_NAME_FILE="$mock_dir/tag-name"
     mkdir -p "$STRICT_FIX_UPLOADED_ASSETS_DIR"
     printf '%s\n' "$STRICT_VERIFY_ASSETS" > "$STRICT_FIX_ASSETS_FILE"
@@ -517,6 +577,7 @@ create_strict_verify_fix_mock_gh() {
     printf '0\n' > "$STRICT_FIX_RELEASE_ID_GET_COUNT_FILE"
     printf '0\n' > "$STRICT_FIX_TAG_GET_COUNT_FILE"
     printf '0\n' > "$STRICT_FIX_POST_UPLOAD_GET_COUNT_FILE"
+    printf '0\n' > "$STRICT_FIX_RULESET_GET_COUNT_FILE"
     printf 'v1.0.0\n' > "$STRICT_FIX_TAG_NAME_FILE"
     : > "$STRICT_FIX_UPLOAD_LOG"
     : > "$STRICT_FIX_CONTENT_TYPE_LOG"
@@ -532,6 +593,7 @@ create_strict_verify_fix_mock_gh() {
     export STRICT_FIX_RELEASE_ID_GET_COUNT_FILE
     export STRICT_FIX_TAG_GET_COUNT_FILE STRICT_FIX_POST_UPLOAD_MUTATION_MARKER
     export STRICT_FIX_UPLOAD_OCCURRED_FILE STRICT_FIX_POST_UPLOAD_GET_COUNT_FILE
+    export STRICT_FIX_RULESET_GET_COUNT_FILE
     export STRICT_FIX_TAG_NAME_FILE
 
     _strict_fix_release_json() {
@@ -585,6 +647,53 @@ create_strict_verify_fix_mock_gh() {
                     return 0
                 fi
                 case "$endpoint" in
+                    repos/testuser/test-tool)
+                        printf '{"id":99,"node_id":"R_strict_fix","full_name":"testuser/test-tool"}\n'
+                        return 0
+                        ;;
+                    repos/testuser/test-tool/rulesets/42\?includes_parents=false)
+                        local ruleset_get_count=0
+                        read -r ruleset_get_count < "$STRICT_FIX_RULESET_GET_COUNT_FILE" || \
+                            ruleset_get_count=0
+                        ruleset_get_count=$((ruleset_get_count + 1))
+                        printf '%s\n' "$ruleset_get_count" > "$STRICT_FIX_RULESET_GET_COUNT_FILE"
+                        strict_verify_mock_ruleset_json
+                        return 0
+                        ;;
+                    repos/testuser/test-tool/rulesets/42/history\?per_page=100\&page=1)
+                        local ruleset_get_count=0 ruleset_round=1 version_id=123
+                        read -r ruleset_get_count < "$STRICT_FIX_RULESET_GET_COUNT_FILE" || \
+                            ruleset_get_count=0
+                        ruleset_round=$(((ruleset_get_count + 1) / 2))
+                        if [[ "${STRICT_FIX_RULESET_CHANGE_ON_ROUND:-0}" =~ ^[1-9][0-9]*$ ]] &&
+                           ((ruleset_round >= STRICT_FIX_RULESET_CHANGE_ON_ROUND)); then
+                            version_id=124
+                        fi
+                        jq -nc --argjson version_id "$version_id" \
+                            '[{version_id:$version_id,updated_at:"2026-08-02T00:00:01Z"}]'
+                        return 0
+                        ;;
+                    repos/testuser/test-tool/rulesets/42/history/*)
+                        local ruleset_get_count=0 ruleset_round=1 version_id=123
+                        local ruleset_json history_state
+                        read -r ruleset_get_count < "$STRICT_FIX_RULESET_GET_COUNT_FILE" || \
+                            ruleset_get_count=0
+                        ruleset_round=$(((ruleset_get_count + 1) / 2))
+                        if [[ "${STRICT_FIX_RULESET_CHANGE_ON_ROUND:-0}" =~ ^[1-9][0-9]*$ ]] &&
+                           ((ruleset_round >= STRICT_FIX_RULESET_CHANGE_ON_ROUND)); then
+                            version_id=124
+                        fi
+                        [[ "${endpoint##*/}" == "$version_id" ]] || return 1
+                        ruleset_json=$(strict_verify_mock_ruleset_json)
+                        history_state=$(jq -c \
+                            'del(.node_id, .created_at, ._links,
+                                 .current_user_can_bypass) | .updated_at = null' \
+                            <<< "$ruleset_json")
+                        jq -nc --argjson version_id "$version_id" \
+                            --argjson state "$history_state" \
+                            '{version_id:$version_id,updated_at:"2026-08-02T00:00:01Z",state:$state}'
+                        return 0
+                        ;;
                     repos/testuser/test-tool/git/ref/tags/v1.0.0)
                         local tag_get_count=0 tag_sha="$STRICT_VERIFY_SHA"
                         read -r tag_get_count < "$STRICT_FIX_TAG_GET_COUNT_FILE" || tag_get_count=0
@@ -754,7 +863,7 @@ create_strict_verify_fix_mock_gh() {
         fi
         return 0
     }
-    export -f _strict_fix_release_json gh curl
+    export -f _strict_fix_release_json gh curl strict_verify_mock_ruleset_json
 }
 
 # ============================================================================
@@ -1191,6 +1300,48 @@ test_strict_verify_accepts_downloaded_minisign_pair() {
         echo "status: $status"
         echo "output: $output"
         echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_verify_mock_gh
+    harness_teardown
+}
+
+test_strict_verify_reports_live_tag_ruleset_receipt() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict tag-ruleset verification"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    enable_strict_verify_tag_ruleset_contract
+    create_strict_verify_mock_gh
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release verify test-tool v1.0.0
+    local status output ruleset_get_count=0
+    status=$(exec_status)
+    output=$(exec_stdout)
+    read -r ruleset_get_count < "$STRICT_VERIFY_RULESET_GET_COUNT_FILE" || \
+        ruleset_get_count=0
+
+    if [[ $status -eq 0 && $ruleset_get_count -eq 4 ]] && \
+       jq -e '
+        .details.verification.remote_records_valid == true and
+        .details.verification.tag_ruleset_receipt.schema ==
+          "dsr.github_tag_ruleset_receipt.v1" and
+        .details.verification.tag_ruleset_receipt.repository.id == 99 and
+        .details.verification.tag_ruleset_receipt.ruleset.history.version_id == 123 and
+        .details.verification.tag_ruleset_receipt.tag == "v1.0.0"
+       ' <<< "$output" >/dev/null 2>&1; then
+        pass "strict release verify reports a freshly revalidated tag-ruleset receipt"
+    else
+        fail "strict release verification must include current immutable-tag governance"
+        echo "status: $status ruleset_gets: $ruleset_get_count"
+        echo "output: $output"
+        echo "stderr: $(exec_stderr | tail -25)"
     fi
 
     remove_strict_verify_mock_gh
@@ -1685,6 +1836,49 @@ test_strict_fix_rejects_local_asset_mutation_before_upload() {
     fi
 
     unset STRICT_FIX_MUTATE_LOCAL_ON_RELEASE_ID
+    remove_strict_verify_mock_gh
+    unset -f _strict_fix_release_json
+    harness_teardown
+}
+
+test_strict_fix_rejects_stale_ruleset_before_upload() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict release contract parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    enable_strict_verify_tag_ruleset_contract
+    STRICT_VERIFY_ASSETS=$(jq -c \
+        'map(select(.name != "test-tool.sbom.spdx.json"))' \
+        <<< "$STRICT_VERIFY_ASSETS")
+    export STRICT_VERIFY_ASSETS
+    export STRICT_FIX_RULESET_CHANGE_ON_ROUND=2
+    create_strict_verify_fix_mock_gh true
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release verify test-tool v1.0.0 --fix
+    local status draft_state ruleset_get_count=0
+    status=$(exec_status)
+    draft_state=$(cat "$STRICT_FIX_DRAFT_FILE")
+    read -r ruleset_get_count < "$STRICT_FIX_RULESET_GET_COUNT_FILE" || \
+        ruleset_get_count=0
+
+    if [[ $status -eq 1 && "$draft_state" == "true" && \
+          $ruleset_get_count -eq 4 && ! -s "$STRICT_FIX_UPLOAD_LOG" ]] && \
+       exec_stderr_contains "governance changed before strict repair upload"; then
+        pass "strict --fix blocks its first upload when the frozen ruleset history changes"
+    else
+        fail "strict --fix must revalidate immutable-tag governance before asset mutation"
+        echo "status: $status, draft: $draft_state, ruleset_gets: $ruleset_get_count"
+        echo "uploads: $(cat "$STRICT_FIX_UPLOAD_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -30)"
+    fi
+
+    unset STRICT_FIX_RULESET_CHANGE_ON_ROUND
     remove_strict_verify_mock_gh
     unset -f _strict_fix_release_json
     harness_teardown
@@ -2334,6 +2528,7 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_verify_rejects_extra_or_incomplete_remote_assets
     test_strict_verify_rejects_remote_digest_mismatch
     test_strict_verify_accepts_downloaded_minisign_pair
+    test_strict_verify_reports_live_tag_ruleset_receipt
     test_strict_verify_rejects_corrupt_download_with_matching_metadata
     test_strict_verify_rejects_tag_move_after_signed_byte_check
     test_strict_verify_rejects_wrong_release_tag
@@ -2341,6 +2536,7 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_verify_rejects_duplicate_tag_across_pages
     test_strict_fix_refuses_public_release_without_mutation
     test_strict_fix_rejects_local_asset_mutation_before_upload
+    test_strict_fix_rejects_stale_ruleset_before_upload
     test_strict_fix_failed_clobber_restores_draft
     test_strict_fix_repairs_missing_asset_in_draft
     test_strict_fix_repairs_missing_primary_in_draft
@@ -2386,6 +2582,7 @@ test_strict_verify_requires_exact_names_sizes_and_sidecars
 test_strict_verify_rejects_extra_or_incomplete_remote_assets
 test_strict_verify_rejects_remote_digest_mismatch
 test_strict_verify_accepts_downloaded_minisign_pair
+test_strict_verify_reports_live_tag_ruleset_receipt
 test_strict_verify_rejects_corrupt_download_with_matching_metadata
 test_strict_verify_rejects_tag_move_after_signed_byte_check
 test_strict_verify_rejects_wrong_release_tag
@@ -2410,6 +2607,7 @@ echo ""
 echo "Retry/Fix Logic Tests:"
 test_strict_fix_refuses_public_release_without_mutation
 test_strict_fix_rejects_local_asset_mutation_before_upload
+test_strict_fix_rejects_stale_ruleset_before_upload
 test_strict_fix_failed_clobber_restores_draft
 test_strict_fix_repairs_missing_asset_in_draft
 test_strict_fix_repairs_missing_primary_in_draft

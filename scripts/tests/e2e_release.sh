@@ -150,6 +150,7 @@ seed_strict_release_fixture() {
     unset STRICT_CREATE_COMPETITOR_DRAFT
     unset STRICT_RELEASE_LIST_SCENARIO
     unset STRICT_MUTATE_REMOTE_AFTER_SIGNED_DOWNLOAD
+    unset STRICT_RULESET_POLICY_SCENARIO STRICT_RULESET_CHANGE_ON_ROUND
     unset DSR_MINISIGN_KEY STRICT_MINISIGN_PUBLIC_KEY STRICT_MINISIGN_SECRET_KEY
     export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
     STRICT_REPO_DIR="$TEST_TMPDIR/repo"
@@ -259,6 +260,50 @@ YAML
     export STRICT_ADDITIONAL_ASSET_PATH STRICT_ADDITIONAL_MUTATED_MARKER
 }
 
+enable_strict_tag_ruleset_contract() {
+    cat >> "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" << 'YAML'
+  github_tag_ruleset:
+    repository_id: 99
+    ruleset_id: 42
+YAML
+}
+
+strict_mock_ruleset_json() {
+    local ruleset_json
+    ruleset_json='{
+      "id":42,
+      "name":"Immutable release tags",
+      "target":"tag",
+      "source_type":"Repository",
+      "source":"testuser/test-tool",
+      "enforcement":"active",
+      "bypass_actors":[],
+      "current_user_can_bypass":"never",
+      "conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},
+      "rules":[{"type":"update"},{"type":"deletion"}],
+      "node_id":"RRS_strict_test",
+      "created_at":"2026-08-01T00:00:00Z",
+      "updated_at":"2026-08-02T00:00:00Z",
+      "_links":{"self":{"href":"https://api.github.com/repos/testuser/test-tool/rulesets/42"}}
+    }'
+    case "${STRICT_RULESET_POLICY_SCENARIO:-}" in
+        bypass)
+            ruleset_json=$(jq -c \
+                '.bypass_actors = [{actor_id:7,actor_type:"User",bypass_mode:"always"}]' \
+                <<< "$ruleset_json")
+            ;;
+        redacted)
+            ruleset_json=$(jq -c 'del(.bypass_actors)' <<< "$ruleset_json")
+            ;;
+        missing-update)
+            ruleset_json=$(jq -c \
+                '.rules = [.rules[] | select(.type != "update")]' \
+                <<< "$ruleset_json")
+            ;;
+    esac
+    printf '%s\n' "$ruleset_json"
+}
+
 enable_strict_minisign_contract() {
     command -v minisign >/dev/null 2>&1 || return 77
 
@@ -339,6 +384,7 @@ create_strict_github_mocks() {
     STRICT_RELEASE_GET_COUNT_FILE="$TEST_TMPDIR/strict-release-get-count"
     STRICT_RELEASE_LIST_GET_COUNT_FILE="$TEST_TMPDIR/strict-release-list-get-count"
     STRICT_TAG_GET_COUNT_FILE="$TEST_TMPDIR/strict-tag-get-count"
+    STRICT_RULESET_GET_COUNT_FILE="$TEST_TMPDIR/strict-ruleset-get-count"
     STRICT_UPLOAD_STARTED_FILE="$TEST_TMPDIR/strict-upload-started"
     STRICT_PUBLIC_FLIP_MARKER="$TEST_TMPDIR/strict-public-flipped"
     STRICT_SIGNED_DOWNLOAD_MARKER="$TEST_TMPDIR/strict-signed-download-complete"
@@ -348,10 +394,12 @@ create_strict_github_mocks() {
     printf '0\n' > "$STRICT_RELEASE_GET_COUNT_FILE"
     printf '0\n' > "$STRICT_RELEASE_LIST_GET_COUNT_FILE"
     printf '0\n' > "$STRICT_TAG_GET_COUNT_FILE"
+    printf '0\n' > "$STRICT_RULESET_GET_COUNT_FILE"
     printf 'Release v1.0.0\n' > "$STRICT_RELEASE_BODY_STATE"
     export STRICT_RELEASE_DRAFT_STATE STRICT_RELEASE_EXISTS_STATE
     export STRICT_RELEASE_GET_COUNT_FILE STRICT_RELEASE_LIST_GET_COUNT_FILE
     export STRICT_TAG_GET_COUNT_FILE STRICT_UPLOAD_STARTED_FILE
+    export STRICT_RULESET_GET_COUNT_FILE
     export STRICT_PUBLIC_FLIP_MARKER
     export STRICT_SIGNED_DOWNLOAD_MARKER
     export STRICT_RELEASE_BODY_STATE
@@ -389,6 +437,10 @@ create_strict_github_mocks() {
                 $has_input && input_json=$(cat)
                 case "$endpoint:$method" in
                     repos/testuser/test-tool/git/ref/tags/v1.0.0:GET|\
+                    repos/testuser/test-tool:GET|\
+                    repos/testuser/test-tool/rulesets/42\?includes_parents=false:GET|\
+                    repos/testuser/test-tool/rulesets/42/history\?per_page=100\&page=1:GET|\
+                    repos/testuser/test-tool/rulesets/42/history/*:GET|\
                     repos/testuser/test-tool/releases\?per_page=100\&page=*:GET|\
                     repos/testuser/test-tool/releases/123:GET|\
                     repos/testuser/test-tool/releases/123:PATCH)
@@ -399,6 +451,50 @@ create_strict_github_mocks() {
                         ;;
                 esac
                 case "$endpoint:$method" in
+                    repos/testuser/test-tool:GET)
+                        printf '{"id":99,"node_id":"R_strict_repo","full_name":"testuser/test-tool"}\n'
+                        ;;
+                    repos/testuser/test-tool/rulesets/42\?includes_parents=false:GET)
+                        local ruleset_get_count=0 ruleset_round=1
+                        read -r ruleset_get_count < "$STRICT_RULESET_GET_COUNT_FILE" || \
+                            ruleset_get_count=0
+                        ruleset_get_count=$((ruleset_get_count + 1))
+                        printf '%s\n' "$ruleset_get_count" > "$STRICT_RULESET_GET_COUNT_FILE"
+                        ruleset_round=$(((ruleset_get_count + 1) / 2))
+                        strict_mock_ruleset_json
+                        ;;
+                    repos/testuser/test-tool/rulesets/42/history\?per_page=100\&page=1:GET)
+                        local ruleset_get_count=0 ruleset_round=1 version_id=123
+                        read -r ruleset_get_count < "$STRICT_RULESET_GET_COUNT_FILE" || \
+                            ruleset_get_count=0
+                        ruleset_round=$(((ruleset_get_count + 1) / 2))
+                        if [[ "${STRICT_RULESET_CHANGE_ON_ROUND:-0}" =~ ^[1-9][0-9]*$ ]] &&
+                           ((ruleset_round >= STRICT_RULESET_CHANGE_ON_ROUND)); then
+                            version_id=124
+                        fi
+                        jq -nc --argjson version_id "$version_id" \
+                            '[{version_id:$version_id,updated_at:"2026-08-02T00:00:01Z"}]'
+                        ;;
+                    repos/testuser/test-tool/rulesets/42/history/*:GET)
+                        local ruleset_get_count=0 ruleset_round=1 version_id=123
+                        local ruleset_json history_state
+                        read -r ruleset_get_count < "$STRICT_RULESET_GET_COUNT_FILE" || \
+                            ruleset_get_count=0
+                        ruleset_round=$(((ruleset_get_count + 1) / 2))
+                        if [[ "${STRICT_RULESET_CHANGE_ON_ROUND:-0}" =~ ^[1-9][0-9]*$ ]] &&
+                           ((ruleset_round >= STRICT_RULESET_CHANGE_ON_ROUND)); then
+                            version_id=124
+                        fi
+                        [[ "${endpoint##*/}" == "$version_id" ]] || return 1
+                        ruleset_json=$(strict_mock_ruleset_json)
+                        history_state=$(jq -c \
+                            'del(.node_id, .created_at, ._links,
+                                 .current_user_can_bypass) | .updated_at = null' \
+                            <<< "$ruleset_json")
+                        jq -nc --argjson version_id "$version_id" \
+                            --argjson state "$history_state" \
+                            '{version_id:$version_id,updated_at:"2026-08-02T00:00:01Z",state:$state}'
+                        ;;
                     repos/testuser/test-tool/git/ref/tags/v1.0.0:GET)
                         local tag_get_count=0 tag_sha="$STRICT_GIT_SHA"
                         read -r tag_get_count < "$STRICT_TAG_GET_COUNT_FILE" || tag_get_count=0
@@ -740,7 +836,7 @@ create_strict_github_mocks() {
         printf '__HTTP_CODE__201'
     }
 
-    export -f gh curl
+    export -f gh curl strict_mock_ruleset_json
 }
 
 remove_strict_github_mocks() {
@@ -1013,6 +1109,109 @@ test_strict_release_uploads_exact_set_then_publishes() {
         echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
         echo "reads: $reads"
         echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_records_live_tag_ruleset_receipt() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    enable_strict_tag_ruleset_contract
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release test-tool v1.0.0 --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status ruleset_get_count=0
+    status=$(exec_status)
+    read -r ruleset_get_count < "$STRICT_RULESET_GET_COUNT_FILE" || \
+        ruleset_get_count=0
+
+    if [[ $status -eq 0 && $ruleset_get_count -eq 10 ]] && \
+       exec_stdout | jq -e '
+        .details.draft == false and
+        .details.tag_ruleset_receipt.schema ==
+          "dsr.github_tag_ruleset_receipt.v1" and
+        .details.tag_ruleset_receipt.repository == {
+          id:99,node_id:"R_strict_repo",full_name:"testuser/test-tool"
+        } and
+        .details.tag_ruleset_receipt.ruleset.history.version_id == 123 and
+        .details.tag_ruleset_receipt.tag == "v1.0.0" and
+        (.details.tag_ruleset_receipt.git_sha | test("^[0-9a-f]{40}$")) and
+        (.details.tag_ruleset_receipt.policy_sha256 | test("^[0-9a-f]{64}$"))
+       ' >/dev/null 2>&1 && \
+       [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]]; then
+        pass "strict release records independently refreshed admission and publication ruleset proof"
+    else
+        fail "strict release must bind success to the live immutable-tag ruleset receipt"
+        echo "status: $status ruleset_gets: $ruleset_get_count"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "output: $(exec_stdout)"
+        echo "stderr: $(exec_stderr | tail -30)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_invalid_tag_ruleset_before_mutation() {
+    ((TESTS_RUN++))
+    local scenario status failed=false
+    for scenario in bypass missing-update; do
+        harness_setup
+        seed_strict_release_fixture
+        enable_strict_tag_ruleset_contract
+        export STRICT_RULESET_POLICY_SCENARIO="$scenario"
+        create_strict_github_mocks
+
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+            release test-tool v1.0.0 --artifacts "$STRICT_ARTIFACTS_DIR"
+        status=$(exec_status)
+        if [[ $status -eq 0 || -s "$STRICT_MUTATION_LOG" ]]; then
+            failed=true
+            echo "scenario: $scenario status: $status"
+            echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+            echo "stderr: $(exec_stderr | tail -25)"
+        fi
+
+        remove_strict_github_mocks
+        harness_teardown
+    done
+
+    if ! $failed; then
+        pass "strict release rejects bypass actors and missing update protection before mutation"
+    else
+        fail "invalid live tag governance must fail before draft, asset, or publish mutation"
+    fi
+}
+
+test_strict_release_rejects_stale_ruleset_receipt_before_publish() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    enable_strict_tag_ruleset_contract
+    export STRICT_RULESET_CHANGE_ON_ROUND=3
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release test-tool v1.0.0 --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -eq 1 ]] && \
+       [[ "$(grep -c '^create$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]] && \
+       [[ "$(grep -c '^upload:' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 5 ]] && \
+       [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null || true)" -eq 0 ]] && \
+       exec_stdout | jq -e '.details.draft == true' >/dev/null 2>&1; then
+        pass "strict release leaves the draft unpublished when its ruleset receipt becomes stale"
+    else
+        fail "stale immutable-tag evidence must block publication after upload"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "output: $(exec_stdout)"
+        echo "stderr: $(exec_stderr | tail -30)"
     fi
 
     remove_strict_github_mocks
@@ -2447,6 +2646,9 @@ echo ""
 if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     echo "Strict Release Contract Tests (mocked GitHub):"
     test_strict_release_uploads_exact_set_then_publishes
+    test_strict_release_records_live_tag_ruleset_receipt
+    test_strict_release_rejects_invalid_tag_ruleset_before_mutation
+    test_strict_release_rejects_stale_ruleset_receipt_before_publish
     test_strict_release_uploads_exact_verified_minisign_set
     test_strict_release_creates_missing_minisign_sidecars
     test_strict_release_rejects_wrong_key_signature_before_mutation
@@ -2517,6 +2719,9 @@ test_release_missing_artifacts_dir
 echo ""
 echo "Strict Release Contract Tests (mocked GitHub):"
 test_strict_release_uploads_exact_set_then_publishes
+test_strict_release_records_live_tag_ruleset_receipt
+test_strict_release_rejects_invalid_tag_ruleset_before_mutation
+test_strict_release_rejects_stale_ruleset_receipt_before_publish
 test_strict_release_uploads_exact_verified_minisign_set
 test_strict_release_creates_missing_minisign_sidecars
 test_strict_release_rejects_wrong_key_signature_before_mutation

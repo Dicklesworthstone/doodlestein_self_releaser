@@ -70,10 +70,17 @@ artifact_naming: "${name}-${version}-${os}-${arch}"
 # and SHA-256 without discovering unlisted directory contents. Set
 # minisign_public_key_file to a safe repository-relative public-key file to
 # require one modern `<basename>.minisig` asset for every primary. The key must
-# be a regular tracked file whose bytes match the exact release tag.
+# be a regular tracked file whose bytes match the exact release tag. For a
+# repository with protected release tags, pin its numeric repository and
+# ruleset IDs under github_tag_ruleset. DSR then makes authenticated, no-cache
+# checks for one active repository-owned `refs/tags/v*` ruleset with update and
+# deletion protection and no bypass actors before admission and publication.
 # release_contract:
 #   checksum_sidecar: sha256
 #   minisign_public_key_file: release/keys/example-tool.pub
+#   github_tag_ruleset:
+#     repository_id: 123456789
+#     ruleset_id: 987654321
 #   exact_primary_assets:
 #     linux/amd64: example-tool-x86_64-unknown-linux-gnu
 #     linux/arm64: example-tool-aarch64-unknown-linux-gnu

@@ -386,6 +386,185 @@ gh_download_release_asset() {
     return "$status"
 }
 
+# Fetch and normalize one repository-owned immutable-tag ruleset. Repository
+# and ruleset numeric IDs prevent redirects or transfers from being accepted.
+# The current history version prevents an edit-and-revert from satisfying an
+# older frozen receipt. Missing bypass fields are redaction, not evidence that
+# bypass is impossible.
+# Usage: gh_get_immutable_tag_ruleset_receipt <owner/repo> <repository-id> <ruleset-id> <tag>
+gh_get_immutable_tag_ruleset_receipt() {
+    local repo="${1:-}"
+    local repository_id="${2:-}"
+    local ruleset_id="${3:-}"
+    local tag="${4:-}"
+    local ruleset_endpoint history_endpoint expected_self
+    local repository_json ruleset_before history_list history_version_id
+    local history_version ruleset_after receipt
+
+    if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || \
+          ! "$repository_id" =~ ^[1-9][0-9]*$ || \
+          ! "$ruleset_id" =~ ^[1-9][0-9]*$ || \
+          ! "$tag" =~ ^v[A-Za-z0-9._+-]+$ ]]; then
+        _gh_log_error "Invalid immutable tag-ruleset arguments"
+        return 4
+    fi
+    if ! command -v jq &>/dev/null; then
+        _gh_log_error "jq is required for immutable tag-ruleset verification"
+        return 3
+    fi
+
+    ruleset_endpoint="repos/$repo/rulesets/$ruleset_id?includes_parents=false"
+    history_endpoint="repos/$repo/rulesets/$ruleset_id/history"
+    expected_self="https://api.github.com/repos/$repo/rulesets/$ruleset_id"
+    repository_json=$(gh_api "repos/$repo" --no-cache 2>/dev/null) || {
+        _gh_log_error "Could not bind GitHub repository identity for $repo"
+        return 1
+    }
+    ruleset_before=$(gh_api "$ruleset_endpoint" --no-cache 2>/dev/null) || {
+        _gh_log_error "Could not fetch immutable tag ruleset $ruleset_id for $repo"
+        return 1
+    }
+    history_list=$(gh_api "$history_endpoint?per_page=100&page=1" \
+        --no-cache 2>/dev/null) || {
+        _gh_log_error "Could not fetch immutable tag-ruleset history"
+        return 1
+    }
+    history_version_id=$(jq -er '
+        if type == "array" and length > 0 and
+           (.[0].version_id | type == "number" and floor == . and . > 0)
+        then .[0].version_id
+        else error("missing current ruleset history version")
+        end
+    ' <<< "$history_list" 2>/dev/null) || {
+        _gh_log_error "GitHub returned no unambiguous current tag-ruleset history version"
+        return 1
+    }
+    history_version=$(gh_api "$history_endpoint/$history_version_id" \
+        --no-cache 2>/dev/null) || {
+        _gh_log_error "Could not fetch current immutable tag-ruleset history state"
+        return 1
+    }
+    ruleset_after=$(gh_api "$ruleset_endpoint" --no-cache 2>/dev/null) || {
+        _gh_log_error "Could not re-fetch immutable tag ruleset $ruleset_id for $repo"
+        return 1
+    }
+
+    if ! receipt=$(jq -nceS \
+        --arg repo "$repo" \
+        --arg tag "$tag" \
+        --argjson repository_id "$repository_id" \
+        --argjson ruleset_id "$ruleset_id" \
+        --argjson history_version_id "$history_version_id" \
+        --arg expected_self "$expected_self" \
+        --argjson repository "$repository_json" \
+        --argjson before "$ruleset_before" \
+        --argjson history_list "$history_list" \
+        --argjson history "$history_version" \
+        --argjson after "$ruleset_after" '
+        def timestamp:
+            type == "string" and
+            test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$");
+        def nonempty_string:
+            type == "string" and length > 0;
+        def policy:
+            {
+                id,
+                name,
+                source,
+                source_type,
+                target,
+                enforcement,
+                bypass_actors,
+                conditions: {
+                    ref_name: {
+                        include: (.conditions.ref_name.include | sort),
+                        exclude: (.conditions.ref_name.exclude | sort)
+                    }
+                },
+                rules: (.rules | sort_by(.type))
+            };
+        def live_policy:
+            policy + {current_user_can_bypass};
+        def valid_policy:
+            type == "object" and
+            .id == $ruleset_id and
+            .source == $repo and
+            .source_type == "Repository" and
+            .target == "tag" and
+            .enforcement == "active" and
+            .bypass_actors == [] and
+            (.conditions | type) == "object" and
+            (.conditions.ref_name | type) == "object" and
+            (.conditions.ref_name.include | type) == "array" and
+            ((.conditions.ref_name.include | sort) == ["refs/tags/v*"]) and
+            .conditions.ref_name.exclude == [] and
+            (.rules | type) == "array" and
+            all(.rules[]; type == "object" and (.type | type == "string")) and
+            (([.rules[].type] | unique | length) == (.rules | length)) and
+            (([.rules[] | select(.type == "update")] | length) == 1) and
+            (([.rules[] | select(.type == "deletion")] | length) == 1);
+        def valid_live_policy:
+            valid_policy and .current_user_can_bypass == "never";
+        def direct_identity:
+            {
+                node_id,
+                created_at,
+                updated_at,
+                self: ._links.self.href,
+                policy: live_policy
+            };
+
+        if ($repository | type) != "object" or
+           $repository.id != $repository_id or
+           $repository.full_name != $repo or
+           (($repository.node_id | nonempty_string) | not) or
+           (($before | valid_live_policy) | not) or
+           (($after | valid_live_policy) | not) or
+           (($before.node_id | nonempty_string) | not) or
+           (($before.created_at | timestamp) | not) or
+           (($before.updated_at | timestamp) | not) or
+           $before._links.self.href != $expected_self or
+           (($before | direct_identity) != ($after | direct_identity)) or
+           ($history_list | type) != "array" or
+           ($history_list | length) == 0 or
+           (($history_list | map(.version_id) | unique | length) != ($history_list | length)) or
+           $history_list[0].version_id != $history_version_id or
+           (($history_list[0].updated_at | timestamp) | not) or
+           ($history | type) != "object" or
+           $history.version_id != $history_version_id or
+           $history.updated_at != $history_list[0].updated_at or
+           (($history.state | valid_policy) | not) or
+           (($history.state | policy) != ($before | policy))
+        then error("ruleset does not prove immutable release tags")
+        else {
+            schema: "dsr.github_tag_ruleset_receipt.v1",
+            tag: $tag,
+            repository: {
+                id: $repository.id,
+                node_id: $repository.node_id,
+                full_name: $repository.full_name
+            },
+            ruleset: {
+                node_id: $before.node_id,
+                created_at: $before.created_at,
+                updated_at: $before.updated_at,
+                self: $before._links.self.href,
+                history: {
+                    version_id: $history.version_id,
+                    updated_at: $history.updated_at
+                },
+                policy: ($before | live_policy)
+            }
+        }
+        end
+    ' 2>/dev/null); then
+        _gh_log_error "GitHub ruleset $ruleset_id does not prove immutable refs/tags/v* for $repo"
+        return 1
+    fi
+
+    printf '%s\n' "$receipt"
+}
+
 # Make API request using gh CLI
 _gh_api_with_gh() {
     local endpoint="$1"
@@ -1103,6 +1282,7 @@ gh_clear_cache() {
 # Export functions
 export -f gh_init_cache gh_check gh_check_token _gh_resolve_token gh_api
 export -f gh_download_release_asset
+export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch
