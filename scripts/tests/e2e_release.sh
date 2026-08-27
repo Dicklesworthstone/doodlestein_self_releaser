@@ -558,6 +558,13 @@ create_strict_github_mocks() {
                         if [[ "${STRICT_POSTPUBLISH_DIGEST_FAULT:-0}" == "1" && "$draft" == "false" ]]; then
                             remote_assets=$(jq -c '.[0].digest = ("sha256:" + ("0" * 64))' <<< "$remote_assets")
                         fi
+                        if [[ "${STRICT_MUTATE_REMOTE_AFTER_SIGNED_DOWNLOAD:-0}" == "1" && \
+                              -e "$STRICT_SIGNED_DOWNLOAD_MARKER" ]]; then
+                            remote_assets=$(jq -c \
+                                'map(if .name == "test-tool-linux-amd64.minisig"
+                                     then .digest = ("sha256:" + ("8" * 64))
+                                     else . end)' <<< "$remote_assets")
+                        fi
                         if [[ "${STRICT_MUTATE_METADATA_ON_RELEASE_GET:-0}" =~ ^[1-9][0-9]*$ ]] &&
                            [[ $release_get_count -eq ${STRICT_MUTATE_METADATA_ON_RELEASE_GET} ]]; then
                             release_body="unexpected remote body"
@@ -1043,7 +1050,15 @@ test_strict_release_uploads_exact_verified_minisign_set() {
         test-tool-linux-amd64.sha256 \
         test-tool.sbom.json | sort)
 
-    if [[ $status -eq 0 && "$uploads" == "$expected_uploads" ]] && \
+    local downloaded_signed_assets expected_downloaded_signed_assets
+    downloaded_signed_assets=$(sed -n 's/^download://p' "$STRICT_READ_LOG" | sort -u)
+    expected_downloaded_signed_assets=$(printf '%s\n' \
+        test-tool-darwin-arm64 \
+        test-tool-darwin-arm64.minisig \
+        test-tool-linux-amd64 \
+        test-tool-linux-amd64.minisig | sort)
+    if [[ $status -eq 0 && "$uploads" == "$expected_uploads" && \
+          "$downloaded_signed_assets" == "$expected_downloaded_signed_assets" ]] && \
        [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]]; then
         pass "strict release uploads and publishes the exact verified minisign set"
     else
@@ -1159,7 +1174,7 @@ test_strict_release_rejects_corrupt_served_signature_before_publish() {
         harness_teardown
         return
     fi
-    export STRICT_CORRUPT_REMOTE_ASSET_NAME="test-tool-darwin-arm64.minisig"
+    export STRICT_CORRUPT_REMOTE_ASSET_NAME="test-tool-linux-amd64.minisig"
     create_strict_github_mocks
 
     PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release test-tool v1.0.0 \
@@ -1173,6 +1188,44 @@ test_strict_release_rejects_corrupt_served_signature_before_publish() {
         pass "strict release verifies every served signature before publication"
     else
         fail "strict release must not publish when served signature bytes are corrupt"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_replacement_after_signed_download() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    local enable_rc=0
+    enable_strict_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict remote replacement test requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict minisign fixture setup failed"
+        harness_teardown
+        return
+    fi
+    export STRICT_MUTATE_REMOTE_AFTER_SIGNED_DOWNLOAD=1
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -ne 0 ]] && \
+       [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null || true)" -eq 0 ]] && \
+       exec_stderr_contains "GitHub release changed during remote signature verification"; then
+        pass "strict release rejects asset replacement after signed-byte download"
+    else
+        fail "strict release must re-fetch metadata after signed-byte download"
         echo "status: $status"
         echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
         echo "stderr: $(exec_stderr | tail -25)"
@@ -2312,6 +2365,7 @@ if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_release_creates_missing_minisign_sidecars
     test_strict_release_rejects_wrong_key_signature_before_mutation
     test_strict_release_rejects_corrupt_served_signature_before_publish
+    test_strict_release_rejects_replacement_after_signed_download
     test_strict_release_rejects_additional_asset_mutated_after_preflight
     test_strict_release_rejects_missing_additional_asset_before_mutation
     test_strict_create_commit_then_error_adopts_exact_empty_draft
@@ -2379,6 +2433,7 @@ test_strict_release_uploads_exact_verified_minisign_set
 test_strict_release_creates_missing_minisign_sidecars
 test_strict_release_rejects_wrong_key_signature_before_mutation
 test_strict_release_rejects_corrupt_served_signature_before_publish
+test_strict_release_rejects_replacement_after_signed_download
 test_strict_release_rejects_additional_asset_mutated_after_preflight
 test_strict_release_rejects_missing_additional_asset_before_mutation
 test_strict_create_commit_then_error_adopts_exact_empty_draft
