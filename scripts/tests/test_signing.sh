@@ -239,9 +239,11 @@ test_signing_exact_preserves_competing_publish_replacement() {
 
 test_signing_exact_fails_closed_on_post_publish_input_mutation() {
   local artifact="$TEMP_DIR/post-publish-mutation.bin"
+  local frozen_artifact="$TEMP_DIR/post-publish-mutation.frozen.bin"
   local signature="${artifact}.minisig"
   local token
   echo "original post-publish data" > "$artifact"
+  cp "$artifact" "$frozen_artifact"
   token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
 
   ln() {
@@ -256,6 +258,8 @@ test_signing_exact_fails_closed_on_post_publish_input_mutation() {
     test -f "$signature"
   run_expect_fail "retained signature cannot verify mutated input" \
     signing_verify_exact "$artifact" "$signature" "$token"
+  run_cmd "retained signature remains bound to the frozen input bytes" \
+    signing_verify_exact "$frozen_artifact" "$signature" "$token"
   run_cmd "post-publication failure removes private staging directories" \
     test -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.*.dsr-signing.*' -print -quit)"
 }

@@ -1950,9 +1950,8 @@ test_strict_fix_repairs_missing_asset_in_draft() {
 
     if [[ $status -eq 0 && "$draft_state" == "true" && -s "$STRICT_FIX_UPLOAD_LOG" && \
           -s "$STRICT_FIX_LIST_LOG" && ! -s "$STRICT_FIX_TAG_ENDPOINT_LOG" ]] && \
-        grep -q '^id-bound-upload:test-tool.sbom.spdx.json$' "$STRICT_FIX_UPLOAD_LOG" && \
-        ! grep -q '^delete:' "$STRICT_FIX_UPLOAD_LOG" && \
-        ! grep -q '^tag-bound-upload:' "$STRICT_FIX_UPLOAD_LOG" && \
+        [[ "$(cat "$STRICT_FIX_UPLOAD_LOG")" == \
+          "id-bound-upload:test-tool.sbom.spdx.json" ]] && \
         jq -e '
             .details.verification.missing == 0 and
             .details.verification.remote_records_valid == true
@@ -1995,9 +1994,8 @@ test_strict_fix_repairs_missing_primary_in_draft() {
 
     if [[ $status -eq 0 && "$draft_state" == "true" && -s "$STRICT_FIX_UPLOAD_LOG" && \
           -s "$STRICT_FIX_LIST_LOG" && ! -s "$STRICT_FIX_TAG_ENDPOINT_LOG" ]] && \
-        grep -q '^id-bound-upload:test-tool-linux-amd64$' "$STRICT_FIX_UPLOAD_LOG" && \
-        ! grep -q '^delete:' "$STRICT_FIX_UPLOAD_LOG" && \
-        ! grep -q '^tag-bound-upload:' "$STRICT_FIX_UPLOAD_LOG" && \
+        [[ "$(cat "$STRICT_FIX_UPLOAD_LOG")" == \
+          "id-bound-upload:test-tool-linux-amd64" ]] && \
         jq -e '
             .details.verification.missing == 0 and
             .details.verification.remote_records_valid == true
