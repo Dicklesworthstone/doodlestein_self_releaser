@@ -4355,10 +4355,19 @@ _release_contract_verify_remote_signed_bytes() {
         ([.[] | select(.kind == "minisign")]) as $signatures |
         ($primaries | length) > 0 and
         ($primaries | length) == ($signatures | length) and
-        all($primaries[] as $primary;
+        all($primaries[];
+            . as $primary |
             ([$signatures[] |
                 select(.target == $primary.target and
-                       .source_sha256 == $primary.sha256)] | length) == 1
+                       .source_sha256 == $primary.sha256 and
+                       .name == ($primary.name + ".minisig"))] | length) == 1
+        ) and
+        all($signatures[];
+            . as $signature |
+            ([$primaries[] |
+                select(.target == $signature.target and
+                       .sha256 == $signature.source_sha256 and
+                       ($signature.name == (.name + ".minisig")))] | length) == 1
         ) and
         ([ $signatures[].public_key_token ] | unique | length) == 1 and
         all($signatures[];

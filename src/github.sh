@@ -312,7 +312,9 @@ gh_download_release_asset() {
     local asset_id="$2"
     local destination="$3"
     local destination_parent staging_dir staged_file token=""
-    local status=0
+    local status=0 attempt=0
+    local max_attempts="$GH_MAX_RETRIES"
+    local retry_delay="$GH_RETRY_DELAY"
 
     if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ || \
           ! "$asset_id" =~ ^[1-9][0-9]*$ || -z "$destination" ]]; then
@@ -327,43 +329,61 @@ gh_download_release_asset() {
         return 4
     fi
 
-    staging_dir=$(mktemp -d \
-        "$destination_parent/.dsr-asset-download.XXXXXX") || return 4
-    staged_file="$staging_dir/asset"
+    [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || max_attempts=1
+    [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=0
 
-    if gh_check 2>/dev/null; then
-        gh api "repos/$repo/releases/assets/$asset_id" \
-            -H "Accept: application/octet-stream" \
-            -H "Cache-Control: no-cache, no-store, max-age=0" \
-            -H "Pragma: no-cache" > "$staged_file" 2>/dev/null || status=$?
-    else
-        token=$(_gh_resolve_token) || status=$?
-        if [[ $status -eq 0 ]]; then
-            curl -fLsS \
+    while ((attempt < max_attempts)); do
+        attempt=$((attempt + 1))
+        status=0
+        staging_dir=$(mktemp -d \
+            "$destination_parent/.dsr-asset-download.XXXXXX") || return 4
+        staged_file="$staging_dir/asset"
+
+        if gh_check 2>/dev/null; then
+            gh api "repos/$repo/releases/assets/$asset_id" \
                 -H "Accept: application/octet-stream" \
-                -H "Authorization: Bearer $token" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
                 -H "Cache-Control: no-cache, no-store, max-age=0" \
-                -H "Pragma: no-cache" \
-                -o "$staged_file" \
-                "https://api.github.com/repos/$repo/releases/assets/$asset_id" || status=$?
+                -H "Pragma: no-cache" > "$staged_file" 2>/dev/null || status=$?
+        else
+            token=$(_gh_resolve_token) || status=$?
+            if [[ $status -eq 0 ]]; then
+                curl -fLsS \
+                    -H "Accept: application/octet-stream" \
+                    -H "Authorization: Bearer $token" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" \
+                    -H "Cache-Control: no-cache, no-store, max-age=0" \
+                    -H "Pragma: no-cache" \
+                    -o "$staged_file" \
+                    "https://api.github.com/repos/$repo/releases/assets/$asset_id" || status=$?
+            fi
         fi
-    fi
 
-    if [[ $status -eq 0 && ( ! -f "$staged_file" || -L "$staged_file" ) ]]; then
-        status=1
-    fi
+        if [[ $status -eq 0 && ( ! -f "$staged_file" || -L "$staged_file" ) ]]; then
+            status=1
+        fi
+        if [[ $status -eq 0 ]]; then
+            break
+        fi
+
+        rm -f -- "$staged_file"
+        rmdir -- "$staging_dir" 2>/dev/null || true
+        if ((attempt < max_attempts && retry_delay > 0)); then
+            sleep "$retry_delay"
+        fi
+    done
+
     if [[ $status -eq 0 ]] && ! ln "$staged_file" "$destination"; then
         status=1
     fi
 
     rm -f -- "$staged_file"
     rmdir -- "$staging_dir" 2>/dev/null || true
-    if [[ $status -ne 0 ]]; then
-        _gh_log_error "Failed to download GitHub release asset ID $asset_id"
-        return "$status"
+    if [[ $status -eq 0 ]]; then
+        return 0
     fi
-    return 0
+
+    _gh_log_error "Failed to download GitHub release asset ID $asset_id after $attempt attempt(s)"
+    return "$status"
 }
 
 # Make API request using gh CLI

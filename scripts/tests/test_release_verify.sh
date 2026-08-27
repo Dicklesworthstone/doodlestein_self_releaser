@@ -496,6 +496,7 @@ create_strict_verify_fix_mock_gh() {
 
     STRICT_FIX_ASSETS_FILE="$mock_dir/assets.json"
     STRICT_FIX_EXPECTED_ASSETS_FILE="$mock_dir/expected-assets.json"
+    STRICT_FIX_UPLOADED_ASSETS_DIR="$mock_dir/uploaded-assets"
     STRICT_FIX_DRAFT_FILE="$mock_dir/draft"
     STRICT_FIX_UPLOAD_LOG="$mock_dir/uploads.log"
     STRICT_FIX_CONTENT_TYPE_LOG="$mock_dir/content-types.log"
@@ -509,6 +510,7 @@ create_strict_verify_fix_mock_gh() {
     STRICT_FIX_UPLOAD_OCCURRED_FILE="$mock_dir/upload-occurred"
     STRICT_FIX_POST_UPLOAD_GET_COUNT_FILE="$mock_dir/post-upload-get-count"
     STRICT_FIX_TAG_NAME_FILE="$mock_dir/tag-name"
+    mkdir -p "$STRICT_FIX_UPLOADED_ASSETS_DIR"
     printf '%s\n' "$STRICT_VERIFY_ASSETS" > "$STRICT_FIX_ASSETS_FILE"
     printf '%s\n' "$STRICT_VERIFY_EXPECTED_ASSETS" > "$STRICT_FIX_EXPECTED_ASSETS_FILE"
     printf '%s\n' "$draft_state" > "$STRICT_FIX_DRAFT_FILE"
@@ -516,7 +518,13 @@ create_strict_verify_fix_mock_gh() {
     printf '0\n' > "$STRICT_FIX_TAG_GET_COUNT_FILE"
     printf '0\n' > "$STRICT_FIX_POST_UPLOAD_GET_COUNT_FILE"
     printf 'v1.0.0\n' > "$STRICT_FIX_TAG_NAME_FILE"
+    : > "$STRICT_FIX_UPLOAD_LOG"
+    : > "$STRICT_FIX_CONTENT_TYPE_LOG"
+    : > "$STRICT_FIX_PATCH_LOG"
+    : > "$STRICT_FIX_LIST_LOG"
+    : > "$STRICT_FIX_TAG_ENDPOINT_LOG"
     export STRICT_FIX_ASSETS_FILE STRICT_FIX_EXPECTED_ASSETS_FILE
+    export STRICT_FIX_UPLOADED_ASSETS_DIR
     export STRICT_FIX_DRAFT_FILE STRICT_FIX_UPLOAD_LOG STRICT_FIX_PATCH_LOG
     export STRICT_FIX_CONTENT_TYPE_LOG
     export STRICT_FIX_LIST_LOG STRICT_FIX_TAG_ENDPOINT_LOG
@@ -550,6 +558,27 @@ create_strict_verify_fix_mock_gh() {
                 ;;
             api)
                 local endpoint="${2:-}"
+                local method="GET" api_arg accept_octet_stream=false
+                shift 2
+                while [[ $# -gt 0 ]]; do
+                    api_arg="$1"
+                    shift
+                    case "$api_arg" in
+                        -X|--method)
+                            [[ $# -gt 0 ]] || return 1
+                            method="$1"
+                            shift
+                            ;;
+                        -H)
+                            [[ $# -gt 0 ]] || return 1
+                            if [[ "$1" == "Accept: application/octet-stream" ]]; then
+                                accept_octet_stream=true
+                            fi
+                            shift
+                            ;;
+                        --input) ;;
+                    esac
+                done
                 if [[ "$endpoint" == "repos/testuser/test-tool/releases?per_page=100&page=1" ]]; then
                     printf 'list\n' >> "$STRICT_FIX_LIST_LOG"
                     _strict_fix_release_json | jq -c '[.]'
@@ -580,6 +609,8 @@ create_strict_verify_fix_mock_gh() {
                             printf '%s\n' "$request" >> "$STRICT_FIX_PATCH_LOG"
                             if jq -e '.draft == true' <<< "$request" >/dev/null 2>&1; then
                                 printf 'true\n' > "$STRICT_FIX_DRAFT_FILE"
+                            elif jq -e '.draft == false' <<< "$request" >/dev/null 2>&1; then
+                                printf 'false\n' > "$STRICT_FIX_DRAFT_FILE"
                             fi
                         else
                             read -r release_id_get_count < "$STRICT_FIX_RELEASE_ID_GET_COUNT_FILE" || \
@@ -617,15 +648,18 @@ create_strict_verify_fix_mock_gh() {
                     repos/testuser/test-tool/releases/assets/*)
                         local asset_id="${endpoint##*/}"
                         if [[ "$method" == "GET" ]]; then
-                            [[ "$*" == *"Accept: application/octet-stream"* ]] || return 1
-                            local asset_name="" asset_path=""
+                            [[ "$accept_octet_stream" == "true" ]] || return 1
+                            local asset_name="" asset_path="" uploaded_asset_path=""
                             asset_name=$(jq -er --argjson id "$asset_id" \
                                 '[.[] | select(.id == $id)] |
                                  if length == 1 then .[0].name else error("unknown asset") end' \
                                 "$STRICT_FIX_ASSETS_FILE") || return 1
                             asset_path="$STRICT_VERIFY_ARTIFACTS_DIR/$asset_name"
+                            uploaded_asset_path="$STRICT_FIX_UPLOADED_ASSETS_DIR/$asset_name"
                             if [[ "${STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME:-}" == "$asset_name" ]]; then
                                 printf 'corrupted served bytes for %s\n' "$asset_name"
+                            elif [[ -f "$uploaded_asset_path" && ! -L "$uploaded_asset_path" ]]; then
+                                cat "$uploaded_asset_path"
                             elif [[ -f "$asset_path" && ! -L "$asset_path" ]]; then
                                 cat "$asset_path"
                             else
@@ -683,6 +717,10 @@ create_strict_verify_fix_mock_gh() {
                 printf '{}\n__HTTP_CODE__422'
                 return 0
             fi
+            cp "$file_path" "$STRICT_FIX_UPLOADED_ASSETS_DIR/$asset_name" || {
+                printf '{}\n__HTTP_CODE__500'
+                return 0
+            }
             jq -c --arg name "$asset_name" --argjson expected "$expected" '
                 map(select(.name != $name)) + [$expected]
             ' "$STRICT_FIX_ASSETS_FILE" > "$STRICT_FIX_ASSETS_FILE.next"
@@ -1834,6 +1872,118 @@ test_strict_fix_repairs_missing_addition_from_fallback_manifest_directory() {
     harness_teardown
 }
 
+test_strict_fix_repairs_missing_minisign_and_verifies_served_bytes() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict Minisign repair"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    local enable_rc=0
+    enable_strict_verify_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict Minisign repair requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict Minisign repair fixture setup failed"
+        harness_teardown
+        return
+    fi
+    STRICT_VERIFY_ASSETS=$(jq -c \
+        'map(select(.name != "test-tool-linux-amd64.minisig"))' \
+        <<< "$STRICT_VERIFY_ASSETS")
+    export STRICT_VERIFY_ASSETS
+    create_strict_verify_fix_mock_gh true
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release verify test-tool v1.0.0 --fix
+    local status output draft_state
+    status=$(exec_status)
+    output=$(exec_stdout)
+    draft_state=$(cat "$STRICT_FIX_DRAFT_FILE")
+
+    if [[ $status -eq 0 && "$draft_state" == "true" ]] && echo "$output" | jq -e \
+        '.details.verification.remote_records_valid == true' >/dev/null 2>&1 && \
+       [[ "$(cat "$STRICT_FIX_UPLOAD_LOG")" == \
+        'id-bound-upload:test-tool-linux-amd64.minisig' ]] && \
+       [[ "$(cat "$STRICT_FIX_CONTENT_TYPE_LOG")" == \
+        'test-tool-linux-amd64.minisig:text/plain' ]] && \
+       ! grep -q '^delete:' "$STRICT_FIX_UPLOAD_LOG" && \
+       ! grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' \
+        "$STRICT_FIX_PATCH_LOG"; then
+        pass "strict --fix additively repairs and verifies the missing Minisign asset"
+    else
+        fail "strict --fix must verify served bytes after repairing a signature"
+        echo "status: $status draft: $draft_state"
+        echo "output: $output"
+        echo "uploads: $(cat "$STRICT_FIX_UPLOAD_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_verify_mock_gh
+    unset -f _strict_fix_release_json
+    harness_teardown
+}
+
+test_strict_fix_rejects_corrupt_served_repaired_minisign() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict Minisign repair"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    local enable_rc=0
+    enable_strict_verify_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict Minisign repair requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict Minisign repair fixture setup failed"
+        harness_teardown
+        return
+    fi
+    STRICT_VERIFY_ASSETS=$(jq -c \
+        'map(select(.name != "test-tool-linux-amd64.minisig"))' \
+        <<< "$STRICT_VERIFY_ASSETS")
+    export STRICT_VERIFY_ASSETS
+    export STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME="test-tool-linux-amd64.minisig"
+    create_strict_verify_fix_mock_gh true
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+        release verify test-tool v1.0.0 --fix
+    local status output draft_state
+    status=$(exec_status)
+    output=$(exec_stdout)
+    draft_state=$(cat "$STRICT_FIX_DRAFT_FILE")
+
+    if [[ $status -eq 1 && "$draft_state" == "true" ]] && \
+       echo "$output" | jq -e \
+        '.details.verification.remote_records_valid == false' >/dev/null 2>&1 && \
+       grep -Fxq 'id-bound-upload:test-tool-linux-amd64.minisig' \
+        "$STRICT_FIX_UPLOAD_LOG" && \
+       exec_stderr_contains "Downloaded signature bytes differ from the frozen plan"; then
+        pass "strict --fix keeps the release draft when repaired signature bytes are corrupt"
+    else
+        fail "strict --fix must fail closed on corrupt served repaired signatures"
+        echo "status: $status draft: $draft_state"
+        echo "output: $output"
+        echo "uploads: $(cat "$STRICT_FIX_UPLOAD_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_verify_mock_gh
+    unset -f _strict_fix_release_json
+    harness_teardown
+}
+
 test_strict_fix_rejects_existing_digest_mismatch_without_mutation() {
     ((TESTS_RUN++))
 
@@ -2195,6 +2345,8 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_fix_repairs_missing_asset_in_draft
     test_strict_fix_repairs_missing_primary_in_draft
     test_strict_fix_repairs_missing_addition_from_fallback_manifest_directory
+    test_strict_fix_repairs_missing_minisign_and_verifies_served_bytes
+    test_strict_fix_rejects_corrupt_served_repaired_minisign
     test_strict_fix_rejects_existing_digest_mismatch_without_mutation
     test_strict_fix_rejects_remote_tag_move_after_upload
     test_strict_fix_rejects_manifest_mutation_after_upload
@@ -2262,6 +2414,8 @@ test_strict_fix_failed_clobber_restores_draft
 test_strict_fix_repairs_missing_asset_in_draft
 test_strict_fix_repairs_missing_primary_in_draft
 test_strict_fix_repairs_missing_addition_from_fallback_manifest_directory
+test_strict_fix_repairs_missing_minisign_and_verifies_served_bytes
+test_strict_fix_rejects_corrupt_served_repaired_minisign
 test_strict_fix_rejects_existing_digest_mismatch_without_mutation
 test_strict_fix_rejects_remote_tag_move_after_upload
 test_strict_fix_rejects_manifest_mutation_after_upload

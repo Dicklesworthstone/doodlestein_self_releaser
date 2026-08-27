@@ -214,6 +214,79 @@ test_signing_exact_publish_failure_leaves_no_signature() {
     test ! -e "$signature"
 }
 
+test_signing_exact_preserves_competing_publish_replacement() {
+  local artifact="$TEMP_DIR/publish-replaced.bin"
+  local signature="${artifact}.minisig"
+  local token
+  echo "publish replacement data" > "$artifact"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+
+  ln() {
+    local destination="${!#}"
+    command ln "$@" || return $?
+    printf 'competing signature bytes\n' > "${destination}.replacement"
+    command mv "${destination}.replacement" "$destination"
+  }
+  run_expect_fail "signing_sign_exact rejects a replaced published path" \
+    signing_sign_exact "$artifact" "$signature" "$SIGNING_PRIVATE_KEY" \
+      "$token" "publication replacement test"
+  unset -f ln
+  run_cmd "signing failure preserves the competing replacement" \
+    test "$(cat "$signature")" = "competing signature bytes"
+  run_cmd "competing replacement failure removes private staging directories" \
+    test -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.*.dsr-signing.*' -print -quit)"
+}
+
+test_signing_exact_fails_closed_on_post_publish_input_mutation() {
+  local artifact="$TEMP_DIR/post-publish-mutation.bin"
+  local signature="${artifact}.minisig"
+  local token
+  echo "original post-publish data" > "$artifact"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+
+  ln() {
+    command ln "$@" || return $?
+    printf 'mutated after publication\n' > "$artifact"
+  }
+  run_expect_fail "signing_sign_exact detects post-publication input mutation" \
+    signing_sign_exact "$artifact" "$signature" "$SIGNING_PRIVATE_KEY" \
+      "$token" "post-publication mutation test"
+  unset -f ln
+  run_cmd "post-publication failure leaves the published pathname untouched" \
+    test -f "$signature"
+  run_expect_fail "retained signature cannot verify mutated input" \
+    signing_verify_exact "$artifact" "$signature" "$token"
+  run_cmd "post-publication failure removes private staging directories" \
+    test -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.*.dsr-signing.*' -print -quit)"
+}
+
+test_signing_exact_preserves_competing_symlink_replacement() {
+  local artifact="$TEMP_DIR/publish-symlink-replaced.bin"
+  local signature="${artifact}.minisig"
+  local competitor="$TEMP_DIR/competing-signature-target"
+  local token
+  echo "publish symlink replacement data" > "$artifact"
+  echo "competing symlink bytes" > "$competitor"
+  token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY")
+
+  ln() {
+    local destination="${!#}"
+    command ln "$@" || return $?
+    command mv "$destination" "${destination}.original"
+    command ln -s "$competitor" "$destination"
+  }
+  run_expect_fail "signing_sign_exact rejects a symlink-replaced published path" \
+    signing_sign_exact "$artifact" "$signature" "$SIGNING_PRIVATE_KEY" \
+      "$token" "publication symlink replacement test"
+  unset -f ln
+  run_cmd "signing failure preserves the competing symlink" \
+    test -L "$signature"
+  run_cmd "preserved symlink still resolves to competing bytes" \
+    test "$(cat "$signature")" = "competing symlink bytes"
+  run_cmd "symlink replacement failure removes private staging directories" \
+    test -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.*.dsr-signing.*' -print -quit)"
+}
+
 test_signing_exact_rejects_legacy_signature() {
   local artifact="$TEMP_DIR/legacy-exact.bin"
   local signature="${artifact}.minisig"
@@ -286,6 +359,9 @@ test_signing_sign_batch
 test_signing_exact_creates_verified_signature_without_clobbering
 test_signing_exact_wrong_key_leaves_no_signature
 test_signing_exact_publish_failure_leaves_no_signature
+test_signing_exact_preserves_competing_publish_replacement
+test_signing_exact_fails_closed_on_post_publish_input_mutation
+test_signing_exact_preserves_competing_symlink_replacement
 test_signing_exact_rejects_legacy_signature
 test_signing_exact_rejects_symlink_private_key
 test_signing_sign_missing_key

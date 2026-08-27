@@ -1159,6 +1159,92 @@ test_strict_release_rejects_wrong_key_signature_before_mutation() {
     harness_teardown
 }
 
+test_strict_release_rejects_divergent_pinned_key_before_mutation() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    local enable_rc=0
+    enable_strict_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict pinned-key divergence test requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict minisign fixture setup failed"
+        harness_teardown
+        return
+    fi
+
+    printf '\nworktree-only key mutation\n' >> "$STRICT_MINISIGN_PUBLIC_KEY"
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -eq 4 && ! -s "$STRICT_MUTATION_LOG" ]] && \
+       exec_stderr_contains "Pinned minisign public key bytes differ from release HEAD"; then
+        pass "strict release binds the worktree key to the tagged Git blob before mutation"
+    else
+        fail "strict release must reject a worktree key that differs from the tagged blob"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_rejects_malformed_tagged_key_before_mutation() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    local enable_rc=0
+    enable_strict_minisign_contract || enable_rc=$?
+    if [[ $enable_rc -eq 77 ]]; then
+        skip "strict malformed pinned-key test requires minisign"
+        harness_teardown
+        return
+    elif [[ $enable_rc -ne 0 ]]; then
+        fail "strict minisign fixture setup failed"
+        harness_teardown
+        return
+    fi
+
+    printf '%s\n%s\n' \
+        'untrusted comment: malformed Minisign public key' \
+        'not-a-valid-minisign-token' > "$STRICT_MINISIGN_PUBLIC_KEY"
+    git -C "$STRICT_REPO_DIR" add "release/keys/test-tool.pub"
+    git -C "$STRICT_REPO_DIR" commit -qm "pin malformed release signing key"
+    git -C "$STRICT_REPO_DIR" tag -fa v1.0.0 -m v1.0.0 >/dev/null
+    STRICT_GIT_SHA=$(git -C "$STRICT_REPO_DIR" rev-parse HEAD)
+    export STRICT_GIT_SHA
+    jq --arg git_sha "$STRICT_GIT_SHA" '.source.git_sha = $git_sha' \
+        "$STRICT_MANIFEST_PATH" > "${STRICT_MANIFEST_PATH}.malformed-key"
+    mv "${STRICT_MANIFEST_PATH}.malformed-key" "$STRICT_MANIFEST_PATH"
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -eq 4 && ! -s "$STRICT_MUTATION_LOG" ]] && \
+       exec_stderr_contains "Tag-pinned file does not contain a valid Minisign public key token"; then
+        pass "strict release rejects a malformed token in the tag-pinned key before mutation"
+    else
+        fail "strict release must reject a malformed tag-pinned Minisign key"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -25)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
 test_strict_release_rejects_corrupt_served_signature_before_publish() {
     ((TESTS_RUN++))
     harness_setup
@@ -2364,6 +2450,8 @@ if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_release_uploads_exact_verified_minisign_set
     test_strict_release_creates_missing_minisign_sidecars
     test_strict_release_rejects_wrong_key_signature_before_mutation
+    test_strict_release_rejects_divergent_pinned_key_before_mutation
+    test_strict_release_rejects_malformed_tagged_key_before_mutation
     test_strict_release_rejects_corrupt_served_signature_before_publish
     test_strict_release_rejects_replacement_after_signed_download
     test_strict_release_rejects_additional_asset_mutated_after_preflight
@@ -2432,6 +2520,8 @@ test_strict_release_uploads_exact_set_then_publishes
 test_strict_release_uploads_exact_verified_minisign_set
 test_strict_release_creates_missing_minisign_sidecars
 test_strict_release_rejects_wrong_key_signature_before_mutation
+test_strict_release_rejects_divergent_pinned_key_before_mutation
+test_strict_release_rejects_malformed_tagged_key_before_mutation
 test_strict_release_rejects_corrupt_served_signature_before_publish
 test_strict_release_rejects_replacement_after_signed_download
 test_strict_release_rejects_additional_asset_mutated_after_preflight

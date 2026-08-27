@@ -421,6 +421,7 @@ test_download_release_asset_uses_token_curl_fallback() {
 
 test_download_release_asset_failure_leaves_no_destination() {
   local destination="$TEMP_DIR/failed-asset.bin"
+  local GH_MAX_RETRIES=1
   export GITHUB_TOKEN="download-test-token"
 
   gh() { return 1; }
@@ -444,6 +445,49 @@ test_download_release_asset_failure_leaves_no_destination() {
   unset GITHUB_TOKEN
 
   [[ $status -ne 0 && ! -e "$destination" ]] &&
+    [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]]
+}
+
+test_download_release_asset_retries_with_fresh_staging_bytes() {
+  local destination="$TEMP_DIR/retried-asset.bin"
+  local attempts_file="$TEMP_DIR/download-attempts"
+  local staging_paths_file="$TEMP_DIR/download-staging-paths"
+  local GH_MAX_RETRIES=2 GH_RETRY_DELAY=0
+  export GITHUB_TOKEN="download-test-token"
+  printf '0\n' > "$attempts_file"
+  : > "$staging_paths_file"
+
+  gh() { return 1; }
+  curl() {
+    local output="" arg attempts=0
+    while [[ $# -gt 0 ]]; do
+      arg="$1"
+      shift
+      if [[ "$arg" == "-o" && $# -gt 0 ]]; then
+        output="$1"
+        shift
+      fi
+    done
+    [[ -n "$output" ]] || return 4
+    printf '%s\n' "$output" >> "$staging_paths_file"
+    read -r attempts < "$attempts_file"
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" > "$attempts_file"
+    if [[ $attempts -eq 1 ]]; then
+      printf 'partial first response' > "$output"
+      return 22
+    fi
+    printf 'complete second response\003' > "$output"
+  }
+
+  local status=0
+  gh_download_release_asset "owner/repo" 45 "$destination" || status=$?
+  unset -f gh curl
+  unset GITHUB_TOKEN
+
+  [[ $status -eq 0 && "$(cat "$attempts_file")" -eq 2 ]] &&
+    [[ "$(sort -u "$staging_paths_file" | wc -l | tr -d '[:space:]')" -eq 2 ]] &&
+    [[ "$(cat "$destination")" == $'complete second response\003' ]] &&
     [[ -z "$(find "$TEMP_DIR" -maxdepth 1 -name '.dsr-asset-download.*' -print -quit)" ]]
 }
 
@@ -819,6 +863,7 @@ main() {
   run_test "download_release_asset_uses_authenticated_gh" test_download_release_asset_uses_authenticated_gh
   run_test "download_release_asset_uses_token_curl_fallback" test_download_release_asset_uses_token_curl_fallback
   run_test "download_release_asset_failure_leaves_no_destination" test_download_release_asset_failure_leaves_no_destination
+  run_test "download_release_asset_retries_with_fresh_staging_bytes" test_download_release_asset_retries_with_fresh_staging_bytes
 
   echo ""
   echo "Clear Cache:"

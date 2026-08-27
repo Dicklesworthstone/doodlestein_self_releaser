@@ -457,7 +457,9 @@ _signing_sha256() {
 
 # Create one exact detached signature without ever overwriting an existing
 # sidecar. The candidate signature is staged beside its destination, verified
-# with the pinned public key, and only then published with shell noclobber.
+# with the pinned public key, and only then published with an atomic hard link.
+# Once published, a late failure never unlinks the shared destination pathname;
+# Bash cannot atomically prove inode ownership and unlink it without a race.
 signing_sign_exact() {
     local file="$1"
     local signature="$2"
@@ -522,14 +524,20 @@ signing_sign_exact() {
     elif ! ln "$staged_signature" "$signature"; then
         _sign_log_error "Could not atomically publish signature without clobbering: $signature"
         status=4
+    elif [[ -L "$signature" || ! "$signature" -ef "$staged_signature" ]]; then
+        _sign_log_error "Published signature path changed before verification: $signature"
+        status=4
     elif ! signing_verify_exact "$file" "$signature" "$public_key_token"; then
         _sign_log_error "Published signature failed exact verification: $signature"
-        rm -f -- "$signature"
+        _sign_log_error "Leaving the published path untouched because safe conditional unlink is not atomic"
         status=4
     elif ! file_sha256_after=$(_signing_sha256 "$file") || \
          [[ "$file_sha256_after" != "$file_sha256_before" ]]; then
         _sign_log_error "Input changed while its detached signature was published: $file"
-        rm -f -- "$signature"
+        _sign_log_error "Leaving the published path untouched because safe conditional unlink is not atomic"
+        status=4
+    elif [[ -L "$signature" || ! "$signature" -ef "$staged_signature" ]]; then
+        _sign_log_error "Published signature path changed during verification: $signature"
         status=4
     fi
 
