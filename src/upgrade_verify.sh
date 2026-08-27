@@ -3,8 +3,10 @@
 #
 # bd-1jt.5.6: Implement upgrade command verification after release
 #
-# After releasing binaries, verify that each tool's `upgrade --check`
-# command correctly finds and downloads the new release assets.
+# After releasing binaries, verify that each tool's configured update-check
+# command correctly finds the new release assets. The default command is
+# `upgrade --check`; repositories with a different CLI contract can set an
+# `upgrade_check_args` string array in repos.d/<tool>.yaml.
 #
 # Usage:
 #   source "$SCRIPT_DIR/src/upgrade_verify.sh"
@@ -33,11 +35,10 @@ upgrade_verify_tool() {
     local tool_name="${1:-}"
     shift 1 2>/dev/null || true
 
-    local version=""  # Reserved for future use (assigned but not yet read)
+    local version=""
     local build_from_source=false
     local dry_run=false
 
-    # shellcheck disable=SC2034  # version is reserved for future use
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --version|-V) version="$2"; shift 2 ;;
@@ -99,12 +100,26 @@ upgrade_verify_tool() {
         return 1
     fi
 
+    local check_args_output
+    if ! check_args_output=$(_upgrade_check_args "$tool_name"); then
+        log_error "Invalid upgrade_check_args configuration for $tool_name"
+        [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
+        return 4
+    fi
+
+    local -a check_args=()
+    mapfile -t check_args <<< "$check_args_output"
+
+    local check_command
+    printf -v check_command '%q ' "$bin_path" "${check_args[@]}"
+    check_command=${check_command% }
+
     # Run upgrade check
     log_info "Running upgrade check..."
     local output exit_code=0
 
     if $dry_run; then
-        log_info "[DRY RUN] Would run: $bin_path upgrade --check"
+        log_info "[DRY RUN] Would run: $check_command"
         [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
         return 0
     fi
@@ -119,9 +134,9 @@ upgrade_verify_tool() {
     fi
 
     if [[ -n "$timeout_cmd" ]]; then
-        output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" upgrade --check 2>&1) || exit_code=$?
+        output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
     else
-        output=$("$bin_path" upgrade --check 2>&1) || exit_code=$?
+        output=$("$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
     fi
 
     # Parse output
@@ -132,31 +147,43 @@ upgrade_verify_tool() {
     # Check for common success patterns
     if echo "$output" | grep -qi "found.*asset\|download.*available\|update.*available"; then
         found_asset=true
-        log_ok "$tool_name upgrade --check: Found update"
+        log_ok "$tool_name update check: Found update"
     elif echo "$output" | grep -qi "up.to.date\|no update\|already.*latest"; then
         found_asset=true
-        log_ok "$tool_name upgrade --check: Up to date"
+        log_ok "$tool_name update check: Up to date"
     elif echo "$output" | grep -qi "no suitable release asset\|asset not found\|failed to find"; then
         found_asset=false
-        log_error "$tool_name upgrade --check: Asset naming mismatch"
+        log_error "$tool_name update check: Asset naming mismatch"
         log_error "Output: $output"
         [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
         return 1
     elif [[ $exit_code -eq 0 ]]; then
         # Exit 0 usually means success
         found_asset=true
-        log_ok "$tool_name upgrade --check: Completed successfully"
+        log_ok "$tool_name update check: Completed successfully"
     fi
 
     # Extract versions if present (using portable grep -oE)
     current_version=$(echo "$output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-    latest_version=$(echo "$output" | grep -i 'latest' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+    latest_version=$(_upgrade_extract_latest_version "$output")
 
     if [[ -n "$current_version" ]]; then
         log_debug "Current version: $current_version"
     fi
     if [[ -n "$latest_version" ]]; then
         log_debug "Latest version: $latest_version"
+    fi
+
+    if [[ -n "$version" ]]; then
+        local expected_version="${version#v}"
+        if [[ "$latest_version" != "$expected_version" ]]; then
+            log_error "$tool_name update check did not resolve the released version"
+            log_error "Expected latest version: $expected_version"
+            log_error "Observed latest version: ${latest_version:-<none>}"
+            [[ -n "$built_tmpdir" ]] && rm -rf "$built_tmpdir"
+            return 1
+        fi
+        log_ok "$tool_name update check resolved exact version $expected_version"
     fi
 
     # Build result
@@ -220,15 +247,16 @@ upgrade_verify_all() {
         local binary_name
         binary_name=$(_upgrade_tool_binary_name "$tool_name")
         if command -v "$binary_name" &>/dev/null; then
-            if "$binary_name" --help 2>&1 | grep -q "upgrade"; then
+            if _upgrade_has_explicit_check_args "$tool_name" ||
+                    "$binary_name" --help 2>&1 | grep -q "upgrade"; then
                 has_upgrade=true
             fi
         fi
 
         if ! $has_upgrade; then
-            log_debug "Skipping $tool_name: no upgrade command"
+            log_debug "Skipping $tool_name: no update-check command"
             ((skipped++))
-            results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "skipped", reason: "no upgrade command"}')")
+            results+=("$(jq -nc --arg tool "$tool_name" '{tool: $tool, status: "skipped", reason: "no update-check command"}')")
             continue
         fi
 
@@ -256,11 +284,13 @@ upgrade_verify_all() {
 upgrade_verify_json() {
     local tool_name="${1:-}"
     local build_from_source=false
+    local version=""
 
     shift || true
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --build-from-source) build_from_source=true; shift ;;
+            --version|-V) version="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -290,6 +320,18 @@ upgrade_verify_json() {
             return 1
         fi
 
+        local check_args_output
+        if ! check_args_output=$(_upgrade_check_args "$tool_name"); then
+            jq -nc \
+                --arg tool "$tool_name" \
+                --arg platform "$platform" \
+                '{tool: $tool, status: "error", error: "Invalid upgrade_check_args configuration", platform: $platform}'
+            return 4
+        fi
+
+        local -a check_args=()
+        mapfile -t check_args <<< "$check_args_output"
+
         local timeout_cmd=""
         if command -v timeout &>/dev/null; then
             timeout_cmd="timeout"
@@ -300,12 +342,14 @@ upgrade_verify_json() {
         fi
 
         if [[ -n "$timeout_cmd" ]]; then
-            output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" upgrade --check 2>&1) || exit_code=$?
+            output=$("$timeout_cmd" "$UPGRADE_VERIFY_TIMEOUT" "$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
         else
-            output=$("$bin_path" upgrade --check 2>&1) || exit_code=$?
+            output=$("$bin_path" "${check_args[@]}" 2>&1) || exit_code=$?
         fi
 
         local found_asset=false
+        local latest_version
+        latest_version=$(_upgrade_extract_latest_version "$output")
         if echo "$output" | grep -qi "up.to.date\|no update\|already.*latest\|current version\|found.*asset\|download.*available\|update.*available"; then
             found_asset=true
             status=0
@@ -313,6 +357,12 @@ upgrade_verify_json() {
             found_asset=true
             status=0
         else
+            found_asset=false
+            status=1
+        fi
+
+        local expected_version="${version#v}"
+        if [[ -n "$version" && "$latest_version" != "$expected_version" ]]; then
             found_asset=false
             status=1
         fi
@@ -325,6 +375,8 @@ upgrade_verify_json() {
             --arg platform "$platform" \
             --argjson found_asset "$found_asset" \
             --argjson exit_code "${exit_code:-0}" \
+            --arg expected_version "$expected_version" \
+            --arg latest_version "$latest_version" \
             --arg output "$output" \
             '{
                 tool: $tool,
@@ -332,6 +384,8 @@ upgrade_verify_json() {
                 platform: $platform,
                 found_asset: $found_asset,
                 exit_code: $exit_code,
+                expected_version: (if $expected_version == "" then null else $expected_version end),
+                latest_version: (if $latest_version == "" then null else $latest_version end),
                 output: $output
             }'
         return $status
@@ -359,6 +413,74 @@ upgrade_verify_json() {
 # ============================================================================
 # Internal Helpers
 # ============================================================================
+
+# Extract the version identified as latest (or update-available) from tool
+# output. Prefer a line containing "latest" so a preceding current-version
+# line cannot satisfy an exact release check.
+_upgrade_extract_latest_version() {
+    local output="$1"
+    local version=""
+
+    version=$(printf '%s\n' "$output" | grep -i 'latest' |
+        grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' |
+        tail -1 || true)
+    if [[ -z "$version" ]]; then
+        version=$(printf '%s\n' "$output" | grep -iE 'update.*available|available.*update' |
+            grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' |
+            tail -1 || true)
+    fi
+
+    printf '%s\n' "${version#v}"
+}
+
+# Print the update-check argv, one argument per line. Arguments are read as a
+# YAML string array and passed directly to the binary; they are never evaluated
+# as shell source. Repositories without an override retain the established
+# `upgrade --check` default.
+_upgrade_check_args() {
+    local tool_name="$1"
+    local repos_dir="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}"
+    local config_file="$repos_dir/$tool_name.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        printf '%s\n' upgrade --check
+        return 0
+    fi
+
+    if ! command -v yq &>/dev/null || ! command -v jq &>/dev/null; then
+        log_error "yq and jq are required to read upgrade_check_args"
+        return 3
+    fi
+
+    local args_json
+    if ! args_json=$(yq -o=json -I=0 \
+            '.upgrade_check_args // ["upgrade", "--check"]' \
+            "$config_file" 2>/dev/null); then
+        return 4
+    fi
+
+    jq -er '
+        if type == "array" and length > 0 and
+           all(.[]; type == "string" and length > 0 and
+                    (contains("\n") | not) and (contains("\r") | not))
+        then .[]
+        else error("upgrade_check_args must be a non-empty array of non-empty single-line strings")
+        end
+    ' <<< "$args_json"
+}
+
+# Return success when the repository explicitly declares its update-check
+# command. This lets `upgrade verify --all` discover nonstandard verbs such as
+# `update --check` without guessing from help text.
+_upgrade_has_explicit_check_args() {
+    local tool_name="$1"
+    local repos_dir="${ACT_REPOS_DIR:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d}"
+    local config_file="$repos_dir/$tool_name.yaml"
+
+    [[ -f "$config_file" ]] || return 1
+    command -v yq &>/dev/null || return 1
+    yq -e 'has("upgrade_check_args")' "$config_file" >/dev/null 2>&1
+}
 
 # Resolve the executable/Cargo binary name for a DSR config key. Config files
 # are often keyed by repo name while the distributed executable is shorter
@@ -473,4 +595,5 @@ _upgrade_build_tool() {
 
 # Export functions
 export -f upgrade_verify_tool upgrade_verify_all upgrade_verify_json
+export -f _upgrade_extract_latest_version _upgrade_check_args _upgrade_has_explicit_check_args
 export -f _upgrade_tool_binary_name _upgrade_find_repo_dir _upgrade_build_tool

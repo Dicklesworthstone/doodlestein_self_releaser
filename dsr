@@ -6162,7 +6162,7 @@ EOF
     if $verify_upgrade && [[ $exit_code -eq 0 ]] && ! $draft; then
         echo ""
         log_info "Running post-release upgrade verification..."
-        if upgrade_verify_tool "$tool_name"; then
+        if upgrade_verify_tool "$tool_name" --version "$version"; then
             log_ok "Upgrade verification passed for $tool_name"
         else
             log_warn "Upgrade verification failed for $tool_name"
@@ -9696,13 +9696,15 @@ SUBCOMMANDS:
     upgrade     Verify tool upgrade commands work correctly after release
 
 OPTIONS:
+    --version <ver>        Require the update check to resolve this exact version
     --build-from-source   Build tool from source before testing
     --dry-run             Show what would be tested
     --all                 Verify all tools
 
 DESCRIPTION:
-    After releasing binaries, verify that each tool's `upgrade --check`
-    command correctly finds and downloads the new release assets.
+    After releasing binaries, verify that each tool's configured update-check
+    command finds the new release assets. The default is `upgrade --check`;
+    set `upgrade_check_args` in repos.d/<tool>.yaml for a different CLI.
     Catches asset naming mismatches between code and build configs.
 
 EXAMPLES:
@@ -9730,6 +9732,7 @@ _verify_upgrade() {
     local all_tools=false
     local build_from_source=false
     local dry_run_flag=false
+    local version=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -9740,6 +9743,10 @@ _verify_upgrade() {
             --build-from-source)
                 build_from_source=true
                 shift
+                ;;
+            --version|-V)
+                version="$2"
+                shift 2
                 ;;
             --dry-run)
                 dry_run_flag=true
@@ -9762,6 +9769,7 @@ _verify_upgrade() {
     local -a args=()
     $build_from_source && args+=("--build-from-source")
     $dry_run_flag && args+=("--dry-run")
+    [[ -n "$version" ]] && args+=("--version" "$version")
 
     if $all_tools; then
         log_info "Verifying upgrade command for all tools..."
@@ -9794,7 +9802,7 @@ _verify_upgrade() {
         local duration=$(($(date +%s) - start_time))
         if $JSON_MODE; then
             local result
-            result=$(upgrade_verify_json "$tool_name" 2>/dev/null || echo '{}')
+            result=$(upgrade_verify_json "$tool_name" "${args[@]}" 2>/dev/null || echo '{}')
             json_envelope "verify-upgrade" "ok" 0 "$(echo "$result" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
         else
             log_ok "Upgrade verification passed for $tool_name"
@@ -9804,7 +9812,7 @@ _verify_upgrade() {
         local duration=$(($(date +%s) - start_time))
         if $JSON_MODE; then
             local result
-            result=$(upgrade_verify_json "$tool_name" 2>/dev/null || echo '{}')
+            result=$(upgrade_verify_json "$tool_name" "${args[@]}" 2>/dev/null || echo '{}')
             json_envelope "verify-upgrade" "failed" 1 "$(echo "$result" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
         else
             log_error "Upgrade verification failed for $tool_name"

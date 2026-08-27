@@ -193,6 +193,169 @@ EOF
     harness_teardown
 }
 
+test_verify_uses_configured_check_args() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+
+    cat > "$TEST_TMPDIR/repos.d/dcg-style.yaml" << EOF
+tool_name: dcg-style
+binary_name: dcg-style
+local_path: $TEST_TMPDIR/dcg-style
+repo: test/dcg-style
+upgrade_check_args:
+  - update
+  - --check
+EOF
+    cat > "$TEST_TMPDIR/bin/dcg-style" << 'EOF'
+#!/bin/bash
+if [[ "$1" == "update" && "$2" == "--check" && $# -eq 2 ]]; then
+    echo "Already running the latest version"
+    exit 0
+fi
+echo "unexpected argv: $*" >&2
+exit 64
+EOF
+    chmod +x "$TEST_TMPDIR/bin/dcg-style"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+
+    if upgrade_verify_tool dcg-style 2>/dev/null; then
+        pass "verify_tool uses configured upgrade_check_args"
+    else
+        fail "verify_tool should use update --check for configured tools"
+    fi
+
+    harness_teardown
+}
+
+test_json_uses_configured_check_args() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+
+    cat > "$TEST_TMPDIR/repos.d/json-update.yaml" << EOF
+tool_name: json-update
+binary_name: json-update
+local_path: $TEST_TMPDIR/json-update
+repo: test/json-update
+upgrade_check_args: [update, --check]
+EOF
+    cat > "$TEST_TMPDIR/bin/json-update" << 'EOF'
+#!/bin/bash
+if [[ "$1" == "update" && "$2" == "--check" && $# -eq 2 ]]; then
+    echo "up to date"
+    exit 0
+fi
+exit 64
+EOF
+    chmod +x "$TEST_TMPDIR/bin/json-update"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+
+    local output
+    output=$(upgrade_verify_json json-update 2>/dev/null)
+    if jq -e '.status == "passed" and .exit_code == 0' <<< "$output" &>/dev/null; then
+        pass "verify_json uses configured upgrade_check_args"
+    else
+        fail "verify_json should use configured update-check argv"
+        echo "Output: $output"
+    fi
+
+    harness_teardown
+}
+
+test_rejects_invalid_configured_check_args() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+
+    cat > "$TEST_TMPDIR/repos.d/invalid-args.yaml" << EOF
+tool_name: invalid-args
+binary_name: invalid-args
+local_path: $TEST_TMPDIR/invalid-args
+repo: test/invalid-args
+upgrade_check_args: update --check
+EOF
+    cat > "$TEST_TMPDIR/bin/invalid-args" << 'EOF'
+#!/bin/bash
+exit 0
+EOF
+    chmod +x "$TEST_TMPDIR/bin/invalid-args"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+
+    local exit_code=0
+    upgrade_verify_tool invalid-args 2>/dev/null || exit_code=$?
+    if [[ $exit_code -eq 4 ]]; then
+        pass "verify_tool rejects non-array upgrade_check_args"
+    else
+        fail "verify_tool should reject invalid upgrade_check_args with exit 4"
+    fi
+
+    harness_teardown
+}
+
+test_exact_version_must_match_latest() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+
+    cat > "$TEST_TMPDIR/bin/exact-tool" << 'EOF'
+#!/bin/bash
+if [[ "$1" == "upgrade" && "$2" == "--check" ]]; then
+    echo "Current version: 1.9.0"
+    echo "Latest version: 2.0.0"
+    echo "Update available"
+    exit 0
+fi
+exit 64
+EOF
+    chmod +x "$TEST_TMPDIR/bin/exact-tool"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+
+    if upgrade_verify_tool exact-tool --version v2.0.0 2>/dev/null; then
+        pass "verify_tool accepts the exact released version"
+    else
+        fail "verify_tool should accept the exact latest version"
+    fi
+
+    local exit_code=0
+    upgrade_verify_tool exact-tool --version 2.0.1 2>/dev/null || exit_code=$?
+    if [[ $exit_code -eq 1 ]]; then
+        pass "verify_tool rejects a stale latest version"
+    else
+        fail "verify_tool should reject output that omits the released version"
+    fi
+
+    harness_teardown
+}
+
+test_json_reports_exact_version_mismatch() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+
+    cat > "$TEST_TMPDIR/bin/json-exact" << 'EOF'
+#!/bin/bash
+echo "Latest version: 3.1.4"
+echo "Update available"
+exit 0
+EOF
+    chmod +x "$TEST_TMPDIR/bin/json-exact"
+    export PATH="$TEST_TMPDIR/bin:$PATH"
+
+    local output exit_code=0
+    output=$(upgrade_verify_json json-exact --version 3.1.5 2>/dev/null) || exit_code=$?
+    if [[ $exit_code -eq 1 ]] && jq -e \
+            '.status == "failed" and .expected_version == "3.1.5" and .latest_version == "3.1.4"' \
+            <<< "$output" &>/dev/null; then
+        pass "verify_json reports exact-version mismatch"
+    else
+        fail "verify_json should expose expected and observed latest versions"
+        echo "Output: $output"
+    fi
+
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: Upgrade Check Parsing
 # ============================================================================
@@ -475,6 +638,9 @@ test_verify_missing_tool_fails
 test_verify_requires_tool_name
 test_verify_dry_run
 test_verify_uses_configured_binary_name
+test_verify_uses_configured_check_args
+test_rejects_invalid_configured_check_args
+test_exact_version_must_match_latest
 
 echo ""
 echo "Upgrade Check Parsing Tests:"
@@ -487,6 +653,8 @@ echo "JSON Output Tests:"
 test_json_output_valid
 test_json_has_required_fields
 test_json_error_for_missing_tool
+test_json_uses_configured_check_args
+test_json_reports_exact_version_mismatch
 
 echo ""
 echo "Repository Finding Tests:"
