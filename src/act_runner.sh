@@ -32,6 +32,10 @@ _log_ok()    { echo "${_GREEN}[act]${_NC} $*" >&2; }
 _log_warn()  { echo "${_YELLOW}[act]${_NC} $*" >&2; }
 _log_error() { echo "${_RED}[act]${_NC} $*" >&2; }
 
+_act_strict_git() {
+    GIT_NO_REPLACE_OBJECTS=1 git "$@"
+}
+
 # Compute SHA256 for a file (portable: sha256sum or shasum -a 256)
 _act_sha256() {
     local file="$1"
@@ -203,14 +207,66 @@ _act_workspace_include_path_is_symlink_free() {
     [[ ! -L "$cursor/$remainder" ]]
 }
 
+_act_release_tree_file_metadata() {
+    local repo_path="$1"
+    local revision="$2"
+    local include="$3"
+    local tree_entry tree_metadata tree_mode tree_type tree_object tree_path
+
+    tree_entry=$(_act_strict_git -C "$repo_path" ls-tree -r --full-tree "$revision" -- "$include" 2>/dev/null) || return 7
+    [[ -n "$tree_entry" && "$tree_entry" != *$'\n'* ]] || return 7
+    IFS=$'\t' read -r tree_metadata tree_path <<< "$tree_entry"
+    read -r tree_mode tree_type tree_object <<< "$tree_metadata"
+    [[ "$tree_path" == "$include" && "$tree_type" == "blob" &&
+       "$tree_object" =~ ^[0-9a-f]{40}$ &&
+       ( "$tree_mode" == "100644" || "$tree_mode" == "100755" ) ]] || return 7
+    printf '%s\t%s\n' "$tree_mode" "$tree_object"
+}
+
+_act_stage_git_blob_exclusive() {
+    local repo_path="$1"
+    local object_id="$2"
+    local destination="$3"
+    local mode="$4"
+
+    (
+        local descriptor_identity path_identity staged_object_id
+        set -C
+        umask 077
+        exec 9> "$destination" || exit 4
+        descriptor_identity=$(_act_file_identity /dev/fd/9) || exit 4
+        path_identity=$(_act_file_identity "$destination") || exit 4
+        [[ "$descriptor_identity" == "$path_identity" ]] || exit 4
+
+        _act_strict_git -C "$repo_path" cat-file blob "$object_id" >&9 2>/dev/null || exit 7
+        chmod "$mode" /dev/fd/9 || exit 4
+        path_identity=$(_act_file_identity "$destination") || exit 4
+        [[ "$descriptor_identity" == "$path_identity" ]] || exit 4
+        staged_object_id=$(_act_strict_git -C "$repo_path" hash-object --no-filters "$destination" 2>/dev/null) || exit 4
+        [[ "$staged_object_id" == "$object_id" ]] || exit 4
+        path_identity=$(_act_file_identity "$destination") || exit 4
+        [[ "$descriptor_identity" == "$path_identity" ]] || exit 4
+        exec 9>&-
+
+        [[ -f "$destination" && ! -L "$destination" ]] || exit 4
+        path_identity=$(_act_file_identity "$destination") || exit 4
+        [[ "$descriptor_identity" == "$path_identity" ]] || exit 4
+        staged_object_id=$(_act_strict_git -C "$repo_path" hash-object --no-filters "$destination" 2>/dev/null) || exit 4
+        [[ "$staged_object_id" == "$object_id" ]] || exit 4
+    )
+}
+
 # Stage configured companion files beside downloaded workspace binaries so the
-# strict archive stream can package one closed directory. Paths are deliberately
-# narrow, source symlinks are rejected, and an include may never overwrite a
-# downloaded binary or another include.
+# archive stream can package one closed directory. Strict releases read the
+# exact blob and mode from their authenticated release commit instead of the
+# ambient worktree, whose clean/smudge filters need not preserve committed
+# bytes. Paths are deliberately narrow, source symlinks are rejected, and an
+# include may never overwrite a downloaded binary or another include.
 _act_stage_workspace_include_files() {
     local config_file="$1"
     local source_root="$2"
     local artifact_dir="$3"
+    local revision="${4:-}"
     local configured=""
 
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 7
@@ -218,8 +274,18 @@ _act_stage_workspace_include_files() {
     [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 7
     command -v yq &>/dev/null || return 7
     configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 7
+    if [[ -n "$revision" ]]; then
+        local resolved_revision
+        if [[ ! "$revision" =~ ^[0-9a-f]{40}$ || "$revision" =~ ^0{40}$ ]] || \
+           ! resolved_revision=$(_act_strict_git -C "$source_root" rev-parse --verify "${revision}^{commit}" 2>/dev/null) || \
+           [[ "$resolved_revision" != "$revision" ]]; then
+            _log_error "Workspace include revision is missing or not an exact commit"
+            return 7
+        fi
+    fi
 
     local include source_path destination parent
+    local tree_metadata tree_mode tree_object file_mode
     while IFS= read -r include; do
         [[ -n "$include" ]] || continue
         if ! _act_is_safe_workspace_include_path "$include"; then
@@ -229,20 +295,38 @@ _act_stage_workspace_include_files() {
         source_path="$source_root/$include"
         destination="$artifact_dir/$include"
         parent=$(dirname "$destination")
-        if [[ ! -f "$source_path" ]] ||
-           ! _act_workspace_include_path_is_symlink_free "$source_root" "$include"; then
-            _log_error "Workspace include is missing or not a regular non-symlink file: $include"
-            return 7
+        if [[ -z "$revision" ]]; then
+            if [[ ! -f "$source_path" ]] ||
+               ! _act_workspace_include_path_is_symlink_free "$source_root" "$include"; then
+                _log_error "Workspace include is missing or not a regular non-symlink file: $include"
+                return 7
+            fi
+        else
+            if ! tree_metadata=$(_act_release_tree_file_metadata \
+                "$source_root" "$revision" "$include"); then
+                _log_error "Workspace include is not a regular file in release tree: $include"
+                return 7
+            fi
+            IFS=$'\t' read -r tree_mode tree_object <<< "$tree_metadata"
+            file_mode=644
+            [[ "$tree_mode" == "100755" ]] && file_mode=755
         fi
         if [[ -e "$destination" || -L "$destination" ]]; then
             _log_error "Workspace include collides with an existing archive member: $include"
             return 7
         fi
-        if ! mkdir -p "$parent" || [[ ! -d "$parent" || -L "$parent" ]]; then
+        if ! mkdir -p "$parent" || [[ ! -d "$parent" || -L "$parent" ]] || \
+           ! _act_workspace_include_path_is_symlink_free "$artifact_dir" "$include"; then
             _log_error "Unable to create workspace include parent: $include"
             return 7
         fi
-        if ! cp -p "$source_path" "$destination"; then
+        if [[ -n "$revision" ]]; then
+            if ! _act_stage_git_blob_exclusive \
+                "$source_root" "$tree_object" "$destination" "$file_mode"; then
+                _log_error "Unable to stage exact release-tree workspace include: $include"
+                return 7
+            fi
+        elif ! cp -p "$source_path" "$destination"; then
             _log_error "Unable to stage workspace include: $include"
             return 7
         fi
@@ -419,6 +503,121 @@ _act_archive_entry_stream() {
         zip) unzip -p "$archive" "$entry" ;;
         *) return 4 ;;
     esac
+}
+
+_act_validate_workspace_archive_release_tree_includes() {
+    local archive="$1"
+    local format="$2"
+    local config_file="$3"
+    local repo_path="$4"
+    local revision="$5"
+    local resolved_revision configured=""
+
+    [[ -f "$archive" && ! -L "$archive" ]] || return 4
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    [[ -d "$repo_path" && ! -L "$repo_path" ]] || return 4
+    command -v yq &>/dev/null || return 4
+    if [[ ! "$revision" =~ ^[0-9a-f]{40}$ || "$revision" =~ ^0{40}$ ]] || \
+       ! resolved_revision=$(_act_strict_git -C "$repo_path" rev-parse --verify "${revision}^{commit}" 2>/dev/null) || \
+       [[ "$resolved_revision" != "$revision" ]]; then
+        return 4
+    fi
+    configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 4
+
+    local include tree_metadata tree_mode tree_object archived_object mode
+    local tar_reader="tar"
+    command -v gtar &>/dev/null && tar_reader="gtar"
+    while IFS= read -r include; do
+        [[ -n "$include" ]] || continue
+        _act_is_safe_workspace_include_path "$include" || return 4
+        tree_metadata=$(_act_release_tree_file_metadata \
+            "$repo_path" "$revision" "$include") || return 4
+        IFS=$'\t' read -r tree_mode tree_object <<< "$tree_metadata"
+        archived_object=$(
+            _act_archive_entry_stream "$archive" "$format" "$include" |
+                _act_strict_git -C "$repo_path" hash-object --stdin 2>/dev/null
+        ) || return 4
+        [[ "$archived_object" == "$tree_object" ]] || return 4
+
+        case "$format" in
+            tar.gz)
+                mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
+                    awk -v entry="$include" '$NF == entry { print $1; exit }') || return 4
+                ;;
+            tar.xz)
+                mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
+                    awk -v entry="$include" '$NF == entry { print $1; exit }') || return 4
+                ;;
+            zip)
+                mode=$(unzip -Z -l "$archive" 2>/dev/null | \
+                    awk -v entry="$include" '$NF == entry { print $1; exit }') || return 4
+                ;;
+            *) return 4 ;;
+        esac
+        [[ "$mode" == -* ]] || return 4
+        if [[ "$tree_mode" == "100755" ]]; then
+            [[ "$mode" == *x* ]] || return 4
+        else
+            [[ "$mode" != *x* ]] || return 4
+        fi
+    done <<< "$configured"
+}
+
+_act_validate_workspace_archive_collection_receipts() {
+    local archive="$1"
+    local format="$2"
+    local target="$3"
+    local config_file="$4"
+    shift 4
+
+    [[ -f "$archive" && ! -L "$archive" && $# -gt 0 ]] || return 4
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    command -v yq &>/dev/null || return 4
+    local -A receipt_expected_members=() receipt_seen_members=()
+    local configured="" binary expected_member expected_count=0
+    configured=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
+    while IFS= read -r binary; do
+        [[ -n "$binary" ]] || continue
+        _act_is_safe_basename "$binary" || return 4
+        expected_member="$binary"
+        [[ "$target" == windows/* ]] && expected_member="${binary%.exe}.exe"
+        [[ -z "${receipt_expected_members[$expected_member]:-}" ]] || return 4
+        receipt_expected_members["$expected_member"]=1
+        ((expected_count++))
+    done <<< "$configured"
+    [[ $expected_count -gt 0 && $# -eq $expected_count ]] || return 4
+
+    local receipt path member expected_sha expected_size identity actual_sha actual_size
+    for receipt in "$@"; do
+        if ! path=$(jq -er '.path | select(type == "string" and length > 0)' <<< "$receipt" 2>/dev/null) || \
+           ! expected_sha=$(jq -er '.sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))' <<< "$receipt" 2>/dev/null) || \
+           ! expected_size=$(jq -er '.size_bytes | select(type == "number" and . > 0 and floor == .)' <<< "$receipt" 2>/dev/null) || \
+           ! identity=$(jq -er '.identity | select(type == "string" and test("^(gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)$"))' <<< "$receipt" 2>/dev/null); then
+            return 4
+        fi
+        member=$(basename "$path")
+        [[ -n "${receipt_expected_members[$member]:-}" ]] || return 4
+        [[ -z "${receipt_seen_members[$member]:-}" ]] || return 4
+        receipt_seen_members["$member"]=1
+
+        if command -v sha256sum &>/dev/null; then
+            actual_sha=$(
+                _act_archive_entry_stream "$archive" "$format" "$member" |
+                    sha256sum | awk '{print $1}'
+            ) || return 4
+        elif command -v shasum &>/dev/null; then
+            actual_sha=$(
+                _act_archive_entry_stream "$archive" "$format" "$member" |
+                    shasum -a 256 | awk '{print $1}'
+            ) || return 4
+        else
+            return 3
+        fi
+        actual_size=$(_act_archive_entry_stream "$archive" "$format" "$member" | \
+            wc -c | tr -d '[:space:]') || return 4
+        [[ "$actual_sha" == "$expected_sha" && "$actual_size" == "$expected_size" ]] || return 4
+    done
+    [[ ${#receipt_seen_members[@]} -eq $expected_count ]]
 }
 
 _act_read_archive_hex_bytes() {
@@ -971,12 +1170,12 @@ _act_validate_contract_source_identity() {
     fi
 
     local head_sha tag_sha source_status
-    if ! head_sha=$(git -C "$repo_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || \
+    if ! head_sha=$(_act_strict_git -C "$repo_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || \
        [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
         _log_error "Unable to resolve local HEAD for release contract"
         return 4
     fi
-    if ! tag_sha=$(git -C "$repo_path" rev-parse --verify "refs/tags/${git_ref}^{commit}" 2>/dev/null) || \
+    if ! tag_sha=$(_act_strict_git -C "$repo_path" rev-parse --verify "refs/tags/${git_ref}^{commit}" 2>/dev/null) || \
        [[ ! "$tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
         _log_error "Unable to resolve release tag $git_ref"
         return 4
@@ -985,7 +1184,7 @@ _act_validate_contract_source_identity() {
         _log_error "Release source mismatch: supplied SHA, HEAD, and $git_ref must match"
         return 4
     fi
-    if ! source_status=$(git -C "$repo_path" status --porcelain --untracked-files=all 2>/dev/null); then
+    if ! source_status=$(_act_strict_git -C "$repo_path" status --porcelain --untracked-files=all 2>/dev/null); then
         _log_error "Unable to inspect release source tree cleanliness"
         return 4
     fi
@@ -1006,13 +1205,13 @@ _act_validate_contract_source_identity() {
             _log_error "Pinned release source dependency is missing: $dependency_path"
             return 4
         fi
-        if ! dependency_head=$(git -C "$dependency_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || \
-           ! dependency_revision=$(git -C "$dependency_path" rev-parse --verify "${dependency_sha}^{commit}" 2>/dev/null) || \
+        if ! dependency_head=$(_act_strict_git -C "$dependency_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || \
+           ! dependency_revision=$(_act_strict_git -C "$dependency_path" rev-parse --verify "${dependency_sha}^{commit}" 2>/dev/null) || \
            [[ "$dependency_head" != "$dependency_sha" || "$dependency_revision" != "$dependency_sha" ]]; then
             _log_error "Pinned release source dependency is not checked out at $dependency_sha: $dependency_path"
             return 4
         fi
-        if ! dependency_status=$(git -C "$dependency_path" status --porcelain --untracked-files=all 2>/dev/null); then
+        if ! dependency_status=$(_act_strict_git -C "$dependency_path" status --porcelain --untracked-files=all 2>/dev/null); then
             _log_error "Unable to inspect release source dependency: $dependency_path"
             return 4
         fi
@@ -2686,9 +2885,9 @@ _act_git_archive_sha256() {
     local revision="$2"
 
     if command -v sha256sum &>/dev/null; then
-        git -C "$repo_path" archive --format=tar "$revision" 2>/dev/null | sha256sum | awk '{print $1}'
+        _act_strict_git -C "$repo_path" archive --format=tar "$revision" 2>/dev/null | sha256sum | awk '{print $1}'
     elif command -v shasum &>/dev/null; then
-        git -C "$repo_path" archive --format=tar "$revision" 2>/dev/null | shasum -a 256 | awk '{print $1}'
+        _act_strict_git -C "$repo_path" archive --format=tar "$revision" 2>/dev/null | shasum -a 256 | awk '{print $1}'
     else
         return 3
     fi
@@ -2705,7 +2904,7 @@ _act_write_git_archive_evidence() {
         umask 077
         exec 9> "$output_file" || exit 4
         descriptor_inode=$(_act_file_identity /dev/fd/9) || exit 4
-        git -C "$repo_path" archive --format=tar "$revision" >&9 2>/dev/null || exit 4
+        _act_strict_git -C "$repo_path" archive --format=tar "$revision" >&9 2>/dev/null || exit 4
         chmod 600 /dev/fd/9 || exit 4
         path_inode=$(_act_file_identity "$output_file") || exit 4
         [[ -s /dev/fd/9 && -f "$output_file" && ! -L "$output_file" && \
@@ -2738,7 +2937,7 @@ _act_write_tracked_manifest() {
                 exit 4
             fi
             printf '%s\t%s\t%s\n' "$object_id" "$mode" "$path" >&9 || exit 4
-        done < <(git -C "$repo_path" ls-tree -r --full-tree "$revision" 2>/dev/null)
+        done < <(_act_strict_git -C "$repo_path" ls-tree -r --full-tree "$revision" 2>/dev/null)
         chmod 600 /dev/fd/9 || exit 4
         path_inode=$(_act_file_identity "$output_file") || exit 4
         [[ -s /dev/fd/9 && -f "$output_file" && ! -L "$output_file" && \
@@ -2828,13 +3027,13 @@ _act_validate_strict_checkout_at_revision() {
         _log_error "Strict release checkout is missing or unpinned: $label"
         return 4
     fi
-    if ! head=$(git -C "$repo_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || \
-       ! resolved=$(git -C "$repo_path" rev-parse --verify "${revision}^{commit}" 2>/dev/null) || \
+    if ! head=$(_act_strict_git -C "$repo_path" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || \
+       ! resolved=$(_act_strict_git -C "$repo_path" rev-parse --verify "${revision}^{commit}" 2>/dev/null) || \
        [[ "$head" != "$revision" || "$resolved" != "$revision" ]]; then
         _log_error "Strict release checkout is not at its pinned revision: $label"
         return 4
     fi
-    if ! status=$(git -C "$repo_path" status --porcelain --untracked-files=all 2>/dev/null) || \
+    if ! status=$(_act_strict_git -C "$repo_path" status --porcelain --untracked-files=all 2>/dev/null) || \
        [[ -n "$status" ]]; then
         _log_error "Strict release checkout is dirty: $label"
         return 4
@@ -5315,8 +5514,19 @@ act_run_native_build() {
             done
 
             local staged_workspace_includes=""
+            local workspace_include_revision=""
+            if $strict_native_build; then
+                if [[ ! "$release_git_sha" =~ ^[0-9a-f]{40}$ || "$release_git_sha" =~ ^0{40}$ ]]; then
+                    _log_error "Strict workspace companion-file staging requires an exact release commit"
+                    jq -nc --arg platform "$platform" \
+                        '{status: "failed", exit_code: 7, error: ("Release commit is missing for workspace companion-file staging on " + $platform)}'
+                    return 7
+                fi
+                workspace_include_revision="$release_git_sha"
+            fi
             if ! staged_workspace_includes=$(
-                _act_stage_workspace_include_files "$config_file" "$local_path" "$artifact_dir"
+                _act_stage_workspace_include_files \
+                    "$config_file" "$local_path" "$artifact_dir" "$workspace_include_revision"
             ); then
                 _log_error "Failed to stage configured workspace companion files for $platform"
                 jq -nc --arg platform "$platform" \
@@ -5346,6 +5556,20 @@ act_run_native_build() {
                         "$archive_path" "$archive_mode" \
                         _act_stream_workspace_tar "$artifact_dir" \
                         "${archive_files[@]}") || archive_receipt=""
+                fi
+                if [[ -n "$archive_receipt" ]] && \
+                   ! _act_validate_workspace_archive_release_tree_includes \
+                       "$archive_path" "$archive_ext" "$config_file" \
+                       "$local_path" "$release_git_sha"; then
+                    _log_error "Strict workspace archive includes do not match release tree for $platform"
+                    archive_receipt=""
+                fi
+                if [[ -n "$archive_receipt" ]] && \
+                   ! _act_validate_workspace_archive_collection_receipts \
+                       "$archive_path" "$archive_ext" "$platform" "$config_file" \
+                       "${strict_collection_receipts[@]}"; then
+                    _log_error "Strict workspace archive binaries do not match collection receipts for $platform"
+                    archive_receipt=""
                 fi
                 if [[ -n "$archive_receipt" ]]; then
                     _log_ok "Created archive through held descriptor: $archive_path"

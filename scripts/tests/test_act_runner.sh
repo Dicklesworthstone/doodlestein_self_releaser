@@ -360,6 +360,248 @@ EOF
     else
         log_fail "A companion-file collision must fail without overwriting"
     fi
+
+    local exact_repo="$TEMP_DIR/workspace-include-git"
+    local exact_artifact_dir="$TEMP_DIR/workspace-include-exact-artifacts"
+    local exact_config="$TEMP_DIR/workspace-include-exact.yaml"
+    mkdir -p "$exact_repo" "$exact_artifact_dir"
+    git -C "$exact_repo" init -q
+    git -C "$exact_repo" config user.name "DSR Test"
+    git -C "$exact_repo" config user.email "dsr-test.invalid"
+    git -C "$exact_repo" config filter.dsr-include-test.clean "sed 's/^worktree-smudged$/release-tree/'"
+    git -C "$exact_repo" config filter.dsr-include-test.smudge "sed 's/^release-tree$/worktree-smudged/'"
+    git -C "$exact_repo" config filter.dsr-include-test.required true
+    mkdir -p "$exact_repo/scripts"
+    printf 'README.md filter=dsr-include-test\n' > "$exact_repo/.gitattributes"
+    printf 'worktree-smudged\n' > "$exact_repo/README.md"
+    printf 'notice-tree\n' > "$exact_repo/NOTICE.txt"
+    printf '#!/usr/bin/env bash\nprintf companion\n' > "$exact_repo/scripts/companion.sh"
+    chmod 755 "$exact_repo/scripts/companion.sh"
+    ln -s README.md "$exact_repo/README.link"
+    git -C "$exact_repo" add .gitattributes README.md README.link NOTICE.txt scripts/companion.sh
+    git -C "$exact_repo" -c commit.gpgsign=false commit -qm "test release tree"
+    local exact_revision
+    exact_revision=$(git -C "$exact_repo" rev-parse HEAD)
+    cat > "$exact_config" << 'EOF'
+include_files:
+  - README.md
+EOF
+
+    local exact_staged exact_tree_bytes ambient_bytes
+    exact_tree_bytes=$(git -C "$exact_repo" show "${exact_revision}:README.md")
+    ambient_bytes=$(cat "$exact_repo/README.md")
+    if [[ -z "$(git -C "$exact_repo" status --porcelain --untracked-files=all)" ]] &&
+       [[ "$exact_tree_bytes" == "release-tree" ]] &&
+       [[ "$ambient_bytes" == "worktree-smudged" ]] &&
+       exact_staged=$(_act_stage_workspace_include_files \
+           "$exact_config" "$exact_repo" "$exact_artifact_dir" "$exact_revision") &&
+       [[ "$exact_staged" == "README.md" ]] &&
+       [[ "$(cat "$exact_artifact_dir/README.md")" == "$exact_tree_bytes" ]] &&
+       [[ "$(cat "$exact_artifact_dir/README.md")" != "$ambient_bytes" ]]; then
+        log_pass "Strict companion files use exact release-tree bytes despite clean smudge filters"
+    else
+        log_fail "Strict companion files must not use clean-but-smudged worktree bytes"
+    fi
+
+    local exact_archive="$TEMP_DIR/workspace-include-exact.tar.gz"
+    local smudged_archive="$TEMP_DIR/workspace-include-smudged.tar.gz"
+    local wrong_mode_dir="$TEMP_DIR/workspace-include-wrong-mode"
+    local wrong_mode_archive="$TEMP_DIR/workspace-include-wrong-mode.tar.gz"
+    mkdir -p "$wrong_mode_dir"
+    cp "$exact_artifact_dir/README.md" "$wrong_mode_dir/README.md"
+    chmod 755 "$wrong_mode_dir/README.md"
+    tar czf "$exact_archive" -C "$exact_artifact_dir" README.md
+    tar czf "$smudged_archive" -C "$exact_repo" README.md
+    tar czf "$wrong_mode_archive" -C "$wrong_mode_dir" README.md
+    if _act_validate_workspace_archive_release_tree_includes \
+           "$exact_archive" "tar.gz" "$exact_config" "$exact_repo" "$exact_revision" &&
+       ! _act_validate_workspace_archive_release_tree_includes \
+           "$smudged_archive" "tar.gz" "$exact_config" "$exact_repo" "$exact_revision" &&
+       ! _act_validate_workspace_archive_release_tree_includes \
+           "$wrong_mode_archive" "tar.gz" "$exact_config" "$exact_repo" "$exact_revision"; then
+        log_pass "Strict archives bind companion bytes and mode to the release tree"
+    else
+        log_fail "Strict archives must reject smudged bytes and mode substitutions"
+    fi
+
+    local original_blob replacement_blob replacement_artifact_dir replacement_source_archive replacement_config
+    original_blob=$(git -C "$exact_repo" rev-parse "${exact_revision}:NOTICE.txt")
+    replacement_blob=$(printf 'replacement-ref-bytes\n' | \
+        git -C "$exact_repo" hash-object -w --stdin)
+    git -C "$exact_repo" replace "$original_blob" "$replacement_blob"
+    replacement_artifact_dir="$TEMP_DIR/workspace-include-replacement-artifacts"
+    replacement_source_archive="$TEMP_DIR/workspace-include-no-replace-source.tar"
+    replacement_config="$TEMP_DIR/workspace-include-no-replace.yaml"
+    mkdir -p "$replacement_artifact_dir"
+    cat > "$replacement_config" << 'EOF'
+include_files:
+  - NOTICE.txt
+EOF
+    local replaced_bytes replacement_staged notice_tree_bytes
+    replaced_bytes=$(git -C "$exact_repo" cat-file blob "$original_blob")
+    notice_tree_bytes=$(_act_strict_git -C "$exact_repo" show "${exact_revision}:NOTICE.txt")
+    if [[ "$replaced_bytes" == "replacement-ref-bytes" ]] &&
+       _act_validate_strict_checkout_at_revision \
+           "$exact_repo" "$exact_revision" "replacement-ref control" &&
+       replacement_staged=$(_act_stage_workspace_include_files \
+           "$replacement_config" "$exact_repo" "$replacement_artifact_dir" "$exact_revision") &&
+       [[ "$replacement_staged" == "NOTICE.txt" ]] &&
+       [[ "$notice_tree_bytes" == "notice-tree" ]] &&
+       [[ "$(cat "$replacement_artifact_dir/NOTICE.txt")" == "$notice_tree_bytes" ]] &&
+       _act_write_git_archive_evidence \
+           "$exact_repo" "$exact_revision" "$replacement_source_archive" &&
+       [[ "$(tar -xOf "$replacement_source_archive" NOTICE.txt)" == "$notice_tree_bytes" ]]; then
+        log_pass "Strict Git reads ignore local replacement refs"
+    else
+        log_fail "Strict Git reads must not authorize replacement objects"
+    fi
+
+    local rejected_include rejected_config rejected_artifact strict_boundary_ok=true
+    printf 'untracked worktree bytes\n' > "$exact_repo/UNTRACKED.txt"
+    for rejected_include in README.link UNTRACKED.txt; do
+        rejected_config="$TEMP_DIR/workspace-include-reject-${rejected_include//\//-}.yaml"
+        rejected_artifact="$TEMP_DIR/workspace-include-reject-${rejected_include//\//-}"
+        mkdir -p "$rejected_artifact"
+        printf 'include_files:\n  - %s\n' "$rejected_include" > "$rejected_config"
+        if _act_stage_workspace_include_files \
+               "$rejected_config" "$exact_repo" "$rejected_artifact" "$exact_revision" \
+               >/dev/null 2>&1 ||
+           [[ -e "$rejected_artifact/$rejected_include" || \
+              -L "$rejected_artifact/$rejected_include" ]]; then
+            strict_boundary_ok=false
+        fi
+    done
+    if $strict_boundary_ok; then
+        log_pass "Strict companion staging rejects committed symlinks and worktree-only files"
+    else
+        log_fail "Strict companion staging must admit only regular release-tree blobs"
+    fi
+
+    local executable_config="$TEMP_DIR/workspace-include-executable.yaml"
+    local executable_artifact="$TEMP_DIR/workspace-include-executable-artifacts"
+    local executable_archive="$TEMP_DIR/workspace-include-executable.tar.gz"
+    local nonexec_dir="$TEMP_DIR/workspace-include-nonexec"
+    local nonexec_archive="$TEMP_DIR/workspace-include-nonexec.tar.gz"
+    mkdir -p "$executable_artifact" "$nonexec_dir/scripts"
+    cat > "$executable_config" << 'EOF'
+include_files:
+  - scripts/companion.sh
+EOF
+    chmod 644 "$exact_repo/scripts/companion.sh"
+    local executable_staged
+    executable_staged=$(_act_stage_workspace_include_files \
+        "$executable_config" "$exact_repo" "$executable_artifact" "$exact_revision")
+    tar czf "$executable_archive" -C "$executable_artifact" scripts/companion.sh
+    cp "$executable_artifact/scripts/companion.sh" "$nonexec_dir/scripts/companion.sh"
+    chmod 644 "$nonexec_dir/scripts/companion.sh"
+    tar czf "$nonexec_archive" -C "$nonexec_dir" scripts/companion.sh
+    if [[ "$executable_staged" == "scripts/companion.sh" ]] &&
+       [[ -x "$executable_artifact/scripts/companion.sh" ]] &&
+       _act_validate_workspace_archive_release_tree_includes \
+           "$executable_archive" "tar.gz" "$executable_config" "$exact_repo" "$exact_revision" &&
+       ! _act_validate_workspace_archive_release_tree_includes \
+           "$nonexec_archive" "tar.gz" "$executable_config" "$exact_repo" "$exact_revision"; then
+        log_pass "Strict companion staging preserves executable release-tree mode"
+    else
+        log_fail "Strict companion staging must bind executable mode to the release tree"
+    fi
+}
+
+test_workspace_archive_collection_receipts() {
+    log_test "workspace binary collection receipts"
+
+    local original_dir="$TEMP_DIR/workspace-receipt-original"
+    local substitute_dir="$TEMP_DIR/workspace-receipt-substitute"
+    local original_archive="$TEMP_DIR/workspace-receipt-original.tar.gz"
+    local substitute_archive="$TEMP_DIR/workspace-receipt-substitute.tar.gz"
+    local receipt_config="$TEMP_DIR/workspace-receipt.yaml"
+    mkdir -p "$original_dir" "$substitute_dir"
+    printf 'AAAAAAAA' > "$original_dir/fw"
+    printf 'BBBBBBBB' > "$substitute_dir/fw"
+    tar czf "$original_archive" -C "$original_dir" fw
+    tar czf "$substitute_archive" -C "$substitute_dir" fw
+    cat > "$receipt_config" << 'EOF'
+workspace_binaries:
+  - fw
+EOF
+
+    local receipt bad_size_receipt identity
+    identity=$(_act_file_identity "$original_dir/fw")
+    receipt=$(jq -nc \
+        --arg path "$original_dir/fw" \
+        --arg sha256 "$(_act_sha256 "$original_dir/fw")" \
+        --argjson size_bytes "$(_act_file_size "$original_dir/fw")" \
+        --arg identity "$identity" \
+        '{path: $path, sha256: $sha256, size_bytes: $size_bytes, identity: $identity}')
+    bad_size_receipt=$(jq -c '.size_bytes += 1' <<< "$receipt")
+    if _act_validate_workspace_archive_collection_receipts \
+           "$original_archive" "tar.gz" "linux/amd64" "$receipt_config" "$receipt" &&
+       ! _act_validate_workspace_archive_collection_receipts \
+           "$substitute_archive" "tar.gz" "linux/amd64" "$receipt_config" "$receipt" &&
+       ! _act_validate_workspace_archive_collection_receipts \
+           "$original_archive" "tar.gz" "linux/amd64" "$receipt_config" "$bad_size_receipt" &&
+       ! _act_validate_workspace_archive_collection_receipts \
+           "$original_archive" "tar.gz" "linux/amd64" "$receipt_config" "$receipt" "$receipt"; then
+        log_pass "Workspace archives preserve exact collected binary bytes"
+    else
+        log_fail "Workspace archives must reject equal-size binary substitutions"
+    fi
+}
+
+test_strict_git_commit_replacement_binding() {
+    log_test "strict Git commit replacement binding"
+
+    local repo="$TEMP_DIR/strict-commit-replacement"
+    local protected_archive="$TEMP_DIR/strict-commit-replacement.tar"
+    mkdir -p "$repo"
+    git -C "$repo" init -q
+    git -C "$repo" config user.name "DSR Test"
+    git -C "$repo" config user.email "dsr-test.invalid"
+    printf 'authentic tree\n' > "$repo/tracked.txt"
+    git -C "$repo" add tracked.txt
+    git -C "$repo" -c commit.gpgsign=false commit -qm "authentic release"
+
+    local authentic_commit authentic_tree replacement_tree replacement_commit
+    authentic_commit=$(git -C "$repo" rev-parse HEAD)
+    authentic_tree=$(_act_strict_git -C "$repo" rev-parse "${authentic_commit}^{tree}")
+    printf 'replacement tree\n' > "$repo/tracked.txt"
+    git -C "$repo" add tracked.txt
+    replacement_tree=$(git -C "$repo" write-tree)
+    replacement_commit=$(printf 'replacement commit\n' | \
+        git -C "$repo" commit-tree "$replacement_tree" -p "$authentic_commit")
+    git -C "$repo" replace "$authentic_commit" "$replacement_commit"
+
+    local ordinary_status ordinary_tree ordinary_archive_bytes
+    ordinary_status=$(git -C "$repo" status --porcelain --untracked-files=all)
+    ordinary_tree=$(git -C "$repo" rev-parse "${authentic_commit}^{tree}")
+    ordinary_archive_bytes=$(git -C "$repo" archive "$authentic_commit" | \
+        tar -xOf - tracked.txt)
+    local replacement_rejected=false
+    if ! _act_validate_strict_checkout_at_revision \
+        "$repo" "$authentic_commit" "commit replacement control" >/dev/null 2>&1; then
+        replacement_rejected=true
+    fi
+
+    _act_strict_git -C "$repo" read-tree "$authentic_commit"
+    _act_strict_git -C "$repo" checkout-index -a -f
+    local authentic_accepted=false protected_archive_bytes=""
+    if _act_validate_strict_checkout_at_revision \
+           "$repo" "$authentic_commit" "authentic commit control" >/dev/null 2>&1 &&
+       _act_write_git_archive_evidence \
+           "$repo" "$authentic_commit" "$protected_archive"; then
+        authentic_accepted=true
+        protected_archive_bytes=$(tar -xOf "$protected_archive" tracked.txt)
+    fi
+
+    if [[ -z "$ordinary_status" && "$ordinary_tree" == "$replacement_tree" ]] &&
+       [[ "$ordinary_archive_bytes" == "replacement tree" ]] &&
+       $replacement_rejected && $authentic_accepted &&
+       [[ "$protected_archive_bytes" == "authentic tree" ]] &&
+       [[ "$authentic_tree" != "$replacement_tree" ]]; then
+        log_pass "Strict source identity cannot be reinterpreted by a replacement commit"
+    else
+        log_fail "Strict source identity must ignore commit and tree replacements"
+    fi
 }
 
 # Test act_cleanup function
@@ -555,6 +797,8 @@ main() {
     test_artifact_dirs
     test_artifact_zip_wrapper_classification
     test_workspace_include_staging
+    test_workspace_archive_collection_receipts
+    test_strict_git_commit_replacement_binding
     test_act_cleanup
     test_workflow_validation
     test_act_run_workflow_injects_tag_env

@@ -1828,6 +1828,14 @@ EOF
         [[ "$build_release_contract_json" != "null" ]] && build_release_contract_enabled=true
     fi
 
+    # A local refs/replace namespace must never reinterpret the commit named by
+    # a strict release contract. Keep the override function-scoped so ordinary
+    # development builds retain the caller's Git semantics.
+    if $build_release_contract_enabled; then
+        local GIT_NO_REPLACE_OBJECTS=1
+        export GIT_NO_REPLACE_OBJECTS
+    fi
+
     if $build_release_contract_enabled && $no_sync; then
         log_error "Strict release contract requires source synchronization; --no-sync is forbidden"
         return 4
@@ -3734,6 +3742,8 @@ _release_contract_preflight() {
     local manifest_file="$6"
     local contract_json="$7"
     local sidecar_mode="${8:-verify}"
+    local GIT_NO_REPLACE_OBJECTS=1
+    export GIT_NO_REPLACE_OBJECTS
 
     case "$sidecar_mode" in
         create|verify|plan) ;;
