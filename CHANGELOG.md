@@ -12,6 +12,22 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- Post-build archive packaging never wraps an existing archive inside
+  another archive. When the build already produced an archive for a target
+  (the native workspace collector always emits tar.gz/zip) and the repo's
+  `archive_format` asks for a different format, the new `src/packaging.sh`
+  module extracts the payload and rebuilds the requested format
+  independently, then proves member-set parity between both archives.
+  Previously the packager treated the built `.tar.gz` as a raw binary and
+  shipped a `.tar.xz` that contained the `.tar.gz` plus `include_files`
+  (observed on the published mcp_agent_mail_rust v0.3.30 and v0.3.31
+  assets, which had to be repacked by hand). Repos whose installers enforce
+  an exact flat member contract (payload binaries only) can now also set
+  `include_extra_files: false` (or `flat_archive: true`) in their repos.d
+  yaml to keep configured `include_files` out of release archives entirely
+  — staging, packaging, and the strict workspace-archive validators all
+  honor the flag. Default behavior is unchanged: `include_files` continue
+  to ship inside archives unless a repo opts out.
 - `dsr repos validate` now cross-checks `repos.yaml` against
   `repos.d/<tool>.yaml` and fails on divergence: mismatched keys, build keys
   present only in the registry (the build runner ignores them), `repos.d`
