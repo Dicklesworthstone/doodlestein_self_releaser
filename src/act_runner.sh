@@ -182,6 +182,34 @@ _act_stream_workspace_zip() {
     (cd "$artifact_dir" && zip -q - "$@")
 }
 
+# Per-repo flat-archive contract: when a repo's installer enforces an exact
+# payload member set (workspace binaries only), its repos.d yaml sets
+# `include_extra_files: false` (or `flat_archive: true`) and configured
+# include_files are neither staged into nor expected inside release archives.
+# Default is "true" (historic behavior: include_files ship inside archives).
+_act_include_files_in_archives() {
+    local config_file="$1"
+    local extra flat
+
+    [[ -n "$config_file" && -f "$config_file" && ! -L "$config_file" ]] || {
+        echo "true"
+        return 0
+    }
+    command -v yq &>/dev/null || {
+        echo "true"
+        return 0
+    }
+    # NOTE: `.key // ""` would swallow a boolean false (false // "" -> ""),
+    # so read the raw value and compare its string form.
+    extra=$(yq -r '.include_extra_files' "$config_file" 2>/dev/null)
+    flat=$(yq -r '.flat_archive' "$config_file" 2>/dev/null)
+    if [[ "$extra" == "false" || "$flat" == "true" ]]; then
+        echo "false"
+    else
+        echo "true"
+    fi
+}
+
 _act_is_safe_workspace_include_path() {
     local path="$1"
     [[ "$path" =~ ^[A-Za-z0-9][A-Za-z0-9._+/-]*$ ]] || return 1
@@ -273,6 +301,10 @@ _act_stage_workspace_include_files() {
     [[ -d "$source_root" && ! -L "$source_root" ]] || return 7
     [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 7
     command -v yq &>/dev/null || return 7
+    if [[ "$(_act_include_files_in_archives "$config_file")" == "false" ]]; then
+        # Flat-archive repo: extras never enter the archive payload.
+        return 0
+    fi
     configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 7
     if [[ -n "$revision" ]]; then
         local resolved_revision
@@ -522,6 +554,10 @@ _act_validate_workspace_archive_release_tree_includes() {
        [[ "$resolved_revision" != "$revision" ]]; then
         return 4
     fi
+    if [[ "$(_act_include_files_in_archives "$config_file")" == "false" ]]; then
+        # Flat-archive repo: no extras are expected inside the archive.
+        return 0
+    fi
     configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 4
 
     local include tree_metadata tree_mode tree_object archived_object mode
@@ -740,7 +776,13 @@ _act_validate_workspace_archive() {
     done <<< "$configured"
     [[ ${#binary_members[@]} -gt 0 ]] || return 4
 
-    configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 4
+    if [[ "$(_act_include_files_in_archives "$config_file")" == "false" ]]; then
+        # Flat-archive repo: the expected member closure is the workspace
+        # binaries alone; configured include_files must not appear.
+        configured=""
+    else
+        configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 4
+    fi
     while IFS= read -r include; do
         [[ -n "$include" ]] || continue
         _act_is_safe_workspace_include_path "$include" || return 4

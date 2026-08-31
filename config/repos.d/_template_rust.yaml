@@ -140,6 +140,13 @@ include_files:
   - README.md
   - LICENSE
 
+# Flat-archive contract: when the tool's installer enforces an exact archive
+# member set (payload binaries only, no README/LICENSE inside), disable
+# in-archive extras. Either spelling works; default keeps include_files
+# inside archives.
+# include_extra_files: false
+# flat_archive: true
+
 # Environment variables for builds
 env:
   CARGO_INCREMENTAL: "0"

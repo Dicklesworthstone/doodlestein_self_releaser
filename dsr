@@ -2753,6 +2753,14 @@ EOF
 
         if command -v yq &>/dev/null; then
             if [[ -f "$tool_config" ]]; then
+                # Per-repo flat-archive contract: consumers whose installers
+                # enforce an exact payload member set opt out of in-archive
+                # extras with `include_extra_files: false` / `flat_archive:
+                # true` (see packaging_include_files_in_archives).
+                if declare -F packaging_include_files_in_archives &>/dev/null && \
+                   [[ "$(packaging_include_files_in_archives "$tool_config")" == "false" ]]; then
+                    return 0
+                fi
                 yq -r '.include_files[]?' "$tool_config" 2>/dev/null
                 return 0
             fi
@@ -2760,6 +2768,13 @@ EOF
                 # See _build_get_archive_format above — same strenv()
                 # rationale: $tool came from a CLI flag and may be
                 # unsanitised at the boundary.
+                local reg_extra reg_flat
+                # `// ""` would swallow a boolean false; read raw values.
+                reg_extra=$(DSR_TOOL="$tool" yq -r '.tools[strenv(DSR_TOOL)].include_extra_files' "$DSR_REPOS_FILE" 2>/dev/null)
+                reg_flat=$(DSR_TOOL="$tool" yq -r '.tools[strenv(DSR_TOOL)].flat_archive' "$DSR_REPOS_FILE" 2>/dev/null)
+                if [[ "$reg_extra" == "false" || "$reg_flat" == "true" ]]; then
+                    return 0
+                fi
                 DSR_TOOL="$tool" yq -r '.tools[strenv(DSR_TOOL)].include_files[]?' "$DSR_REPOS_FILE" 2>/dev/null
                 return 0
             fi
@@ -2904,6 +2919,42 @@ EOF
             return 0
         fi
 
+        # If the build already produced an ARCHIVE for this target (the
+        # native workspace collector always emits tar.gz/zip), never treat
+        # it as a raw binary member: wrapping an archive inside another
+        # archive shipped corrupted assets (mcp_agent_mail_rust v0.3.30 /
+        # v0.3.31 tar.xz-wrapping-tar.gz). Rebuild the requested format
+        # independently from the extracted payload instead, preserving the
+        # exact member set.
+        local input_format
+        input_format=$(packaging_format_for_name "$(basename "$binary_path")")
+        if [[ "$input_format" != "none" ]]; then
+            if [[ "$format" == "binary" ]]; then
+                log_warn "Build artifact for $tool $target is an archive; skipping raw binary asset packaging"
+                return 0
+            fi
+            local normalized_format="$format"
+            [[ "$format" == "tgz" ]] && normalized_format="tar.gz"
+            if [[ "$input_format" == "$normalized_format" ]]; then
+                log_info "Archive already produced for $tool $target ($format); skipping packaging"
+                return 0
+            fi
+            if [[ -f "$archive_path" ]]; then
+                log_warn "Overwriting existing archive: $archive_path"
+            fi
+            if packaging_repack_archive "$binary_path" "$input_format" "$archive_path" "$normalized_format"; then
+                log_info "Rebuilt $format archive independently from $(basename "$binary_path") payload: $versioned_name"
+                _build_manifest_add_entry "$archive_path" "$target" "$format"
+                if [[ -n "$compat_name" && "$compat_name" != "$versioned_name" ]] && \
+                   _build_is_archive_ext "$compat_name"; then
+                    _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format"
+                fi
+            else
+                log_error "Failed to rebuild $format archive from $(basename "$binary_path"): $archive_path"
+            fi
+            return 0
+        fi
+
         local -a include_files=()
         local include
         while IFS= read -r include; do
@@ -3038,6 +3089,7 @@ EOF
         local manifest_file="$6"
 
         _dsr_require artifact_naming
+        _dsr_require packaging
 
         local repo_path binary_name
         repo_path=$(config_get_tool_field "$tool" "local_path" "" 2>/dev/null || echo "")

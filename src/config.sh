@@ -659,7 +659,8 @@ config_registry_divergence_json() {
             "main_package", "workspace_binaries", "build_cmd", "build_profile",
             "targets", "target_triples", "cross_compile", "host_paths", "env",
             "artifact_naming", "install_script_compat", "install_script_path",
-            "archive_format", "include_files", "sibling_crates",
+            "archive_format", "include_files", "include_extra_files",
+            "flat_archive", "sibling_crates",
             "release_contract", "act_job_map", "workflow", "linux_glibc_floor",
             "derive_cargo_build_target"];
         {
