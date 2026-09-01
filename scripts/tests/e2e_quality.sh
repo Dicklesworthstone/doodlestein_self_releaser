@@ -205,11 +205,11 @@ test_quality_missing_tool_error() {
     local status
     status=$(exec_status)
 
-    # Nonexistent tool with no checks configured returns 0 (vacuous pass)
-    if [[ "$status" -eq 0 ]]; then
-        pass "quality returns 0 for tool with no checks (vacuous pass)"
+    # Missing tools and zero-check configurations fail closed.
+    if [[ "$status" -eq 4 ]]; then
+        pass "quality returns config-error exit code 4 for an unknown tool"
     else
-        fail "quality should return 0 for unknown tool with no checks (got: $status)"
+        fail "quality should return config-error exit code 4 for an unknown tool (got: $status)"
     fi
 
     harness_teardown
@@ -253,12 +253,39 @@ test_quality_dry_run() {
     local status
     status=$(exec_status)
 
-    # Dry-run should succeed
-    if [[ "$status" -eq 0 ]]; then
-        pass "quality --dry-run succeeds"
+    # Dry-run is a plan, never a passing quality gate.
+    if [[ "$status" -eq 2 ]]; then
+        pass "quality --dry-run returns planned exit code 2"
     else
-        fail "quality --dry-run should succeed (exit: $status)"
+        fail "quality --dry-run should return planned exit code 2 (got: $status)"
         echo "stderr: $(exec_stderr | head -10)"
+    fi
+
+    harness_teardown
+}
+
+test_quality_global_dry_run_does_not_execute_checks() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for global quality dry-run test"
+        return 0
+    fi
+
+    harness_setup
+    seed_quality_fixtures
+
+    # failing-tool's only check is `false`. If the global flag is lost during
+    # dispatch, this returns the ordinary failure code instead of planned=2.
+    exec_run "$DSR_CMD" --dry-run quality --tool failing-tool
+    local status
+    status=$(exec_status)
+
+    if [[ "$status" -eq 2 ]] && exec_stderr_contains "PLAN"; then
+        pass "global --dry-run reaches quality gate without executing checks"
+    else
+        fail "global --dry-run must plan quality checks (exit: $status)"
+        echo "stderr: $(exec_stderr | head -20)"
     fi
 
     harness_teardown
@@ -297,10 +324,10 @@ test_quality_dry_run_json_valid() {
     local output
     output=$(exec_stdout)
 
-    if echo "$output" | jq . >/dev/null 2>&1; then
-        pass "quality --dry-run --json produces valid JSON"
+    if echo "$output" | jq -e '.status == "planned" and .exit_code == 2' >/dev/null 2>&1; then
+        pass "quality --dry-run --json reports planned status"
     else
-        fail "quality --dry-run --json should produce valid JSON"
+        fail "quality --dry-run --json should report planned status and code 2"
         echo "output: $output"
     fi
 
@@ -375,11 +402,11 @@ test_quality_no_checks_configured() {
     local status
     status=$(exec_status)
 
-    # Tool without checks should succeed (nothing to fail)
-    if [[ "$status" -eq 0 ]]; then
-        pass "quality for tool without checks succeeds"
+    # A zero-check release gate proves nothing and must fail closed.
+    if [[ "$status" -eq 4 ]]; then
+        pass "quality for tool without checks returns config-error exit code 4"
     else
-        fail "quality for tool without checks should succeed (exit: $status)"
+        fail "quality for tool without checks should return config-error exit code 4 (got: $status)"
         echo "stderr: $(exec_stderr | head -10)"
     fi
 
@@ -473,6 +500,7 @@ test_quality_missing_tool_json_valid
 echo ""
 echo "Dry-Run Mode:"
 test_quality_dry_run
+test_quality_global_dry_run_does_not_execute_checks
 test_quality_dry_run_shows_checks
 test_quality_dry_run_json_valid
 

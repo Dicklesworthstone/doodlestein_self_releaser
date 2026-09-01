@@ -3432,7 +3432,12 @@ EOF
 # Quality gates command - run pre-release checks
 cmd_quality() {
     local tool_name=""
-    local dry_run=false
+    # Honor both supported spellings:
+    #   dsr --dry-run quality ...
+    #   dsr quality ... --dry-run
+    # The global parser consumes the former before dispatch, so resetting this
+    # to false here would execute checks that the operator only asked to plan.
+    local dry_run="$DRY_RUN"
     local skip_checks=false
     local work_dir=""
 
