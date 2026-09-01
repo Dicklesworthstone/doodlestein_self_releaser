@@ -199,10 +199,15 @@ _qg_run_single_check() {
         echo "# ----"
     } > "$log_file"
 
+    # Quality checks are non-interactive release gates.  Isolate their stdin so
+    # a command such as `ssh`, `rch`, or `read` cannot consume the caller's
+    # control stream (including the list of checks that qg_run_checks is
+    # iterating).  A check may still opt into a specific input with its own
+    # explicit redirection.
     if [[ -n "$work_dir" && -d "$work_dir" ]]; then
-        (cd "$work_dir" && eval "$cmd") >> "$log_file" 2>&1 || exit_code=$?
+        (cd "$work_dir" && eval "$cmd") </dev/null >> "$log_file" 2>&1 || exit_code=$?
     else
-        (eval "$cmd") >> "$log_file" 2>&1 || exit_code=$?
+        (eval "$cmd") </dev/null >> "$log_file" 2>&1 || exit_code=$?
     fi
     echo "# exit_code: $exit_code" >> "$log_file"
 
@@ -380,7 +385,11 @@ EOF
     local passed=0 failed=0 planned=0 idx=0
     total_start_ms=$(_qg_now_ms)
 
-    while IFS= read -r cmd; do
+    # Materialize the complete command inventory before executing anything.
+    # Executed checks must never share the pipe that carries this control data.
+    local check_commands=()
+    mapfile -t check_commands < <(echo "$checks" | jq -r '.[]')
+    for cmd in "${check_commands[@]}"; do
         [[ -z "$cmd" ]] && continue
         idx=$((idx + 1))
 
@@ -394,7 +403,7 @@ EOF
             planned) planned=$((planned + 1)) ;;
             *)       failed=$((failed + 1)) ;;
         esac
-    done < <(echo "$checks" | jq -r '.[]')
+    done
 
     total_end_ms=$(_qg_now_ms)
     local total_duration_ms=$((total_end_ms - total_start_ms))
@@ -416,8 +425,25 @@ EOF
         checks_json='[]'
     fi
 
+    local observed executed classified incomplete=false
+    observed=${#results[@]}
+    executed=$((passed + failed))
+    classified=$((passed + failed + planned))
+    if [[ "$observed" -ne "$check_count" || "$classified" -ne "$check_count" ]]; then
+        incomplete=true
+        _qg_log_error "Quality gate inventory incomplete: observed=$observed classified=$classified expected=$check_count"
+    elif $dry_run && [[ "$planned" -ne "$check_count" ]]; then
+        incomplete=true
+        _qg_log_error "Dry-run inventory incomplete: planned=$planned expected=$check_count"
+    elif ! $dry_run && [[ "$executed" -ne "$check_count" ]]; then
+        incomplete=true
+        _qg_log_error "Executed quality gate inventory incomplete: executed=$executed expected=$check_count"
+    fi
+
     local overall
-    if $dry_run; then
+    if $incomplete; then
+        overall="incomplete"
+    elif $dry_run; then
         overall="planned"
     elif $moving; then
         overall="invalidated-moving-source"
@@ -442,6 +468,8 @@ EOF
         --arg run_dir "$run_dir" \
         --argjson dry_run "$dry_run" \
         --argjson checks "$checks_json" \
+        --argjson observed "$observed" \
+        --argjson executed "$executed" \
         --argjson passed "$passed" \
         --argjson failed "$failed" \
         --argjson planned "$planned" \
@@ -459,6 +487,8 @@ EOF
             source_after: $snap_after,
             run_dir: $run_dir,
             checks: $checks,
+            observed: $observed,
+            executed: $executed,
             passed: $passed,
             failed: $failed,
             planned: $planned,
@@ -473,6 +503,10 @@ EOF
     echo "$result_json"
 
     # Log summary + exit per contract
+    if $incomplete; then
+        _qg_log_error "Quality gates INCOMPLETE: observed $observed/$check_count, executed $executed/$check_count — receipt: $run_dir/receipt.json"
+        return 1
+    fi
     if $dry_run; then
         _qg_log_warn "Dry run: $planned/$check_count planned, 0 executed — not a pass"
         return 2

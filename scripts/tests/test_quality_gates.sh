@@ -559,6 +559,42 @@ test_run_checks_all_pass() {
     teardown_test_env
 }
 
+test_run_checks_isolates_control_stream_from_check_stdin() {
+    ((TESTS_RUN++))
+    if ! command -v yq &>/dev/null; then
+        skip "yq not available"
+        return
+    fi
+
+    setup_test_env
+    create_repos_yaml 'tools:
+  test-tool:
+    checks:
+      - "IFS= read -r ignored || true"
+      - "echo ran_after_stdin_consumer"
+'
+    local result exit_code=0
+    result=$(qg_run_checks test-tool 2>/dev/null) || exit_code=$?
+
+    local status passed observed executed total second_output
+    status=$(echo "$result" | jq -r '.status')
+    passed=$(echo "$result" | jq -r '.passed')
+    observed=$(echo "$result" | jq -r '.observed')
+    executed=$(echo "$result" | jq -r '.executed')
+    total=$(echo "$result" | jq -r '.total')
+    second_output=$(echo "$result" | jq -r '.checks[1].output_preview')
+
+    if [[ "$exit_code" -eq 0 && "$status" == "passed" && \
+          "$passed" == "2" && "$observed" == "2" && \
+          "$executed" == "2" && "$total" == "2" && \
+          "$second_output" == *"ran_after_stdin_consumer"* ]]; then
+        pass "qg_run_checks isolates the check inventory from child stdin"
+    else
+        fail "qg_run_checks stdin isolation: exit=$exit_code status=$status passed=$passed observed=$observed executed=$executed total=$total"
+    fi
+    teardown_test_env
+}
+
 test_run_checks_some_fail() {
     ((TESTS_RUN++))
     if ! command -v yq &>/dev/null; then
@@ -1088,6 +1124,7 @@ main() {
     test_run_checks_dry_run
     test_run_checks_no_checks_configured
     test_run_checks_all_pass
+    test_run_checks_isolates_control_stream_from_check_stdin
     test_run_checks_some_fail
     test_run_checks_all_fail
     test_run_checks_json_output_structure

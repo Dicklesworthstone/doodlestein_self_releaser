@@ -149,6 +149,37 @@ teardown() {
     assert_equal "$total" "2"
 }
 
+@test "qg_run_checks isolates check inventory from child stdin" {
+    skip_unless_command yq "yq required for config parsing"
+
+    cat > "$DSR_CONFIG_DIR/repos.yaml" << 'EOF'
+tools:
+  stdin-tool:
+    checks:
+      - "IFS= read -r ignored || true"
+      - "echo ran_after_stdin_consumer"
+EOF
+
+    run qg_run_checks "stdin-tool"
+    [[ "$status" -eq 0 ]]
+
+    local json_output receipt_status passed observed executed total second_output
+    json_output=$(echo "$output" | grep -E '^\{' | head -1)
+    receipt_status=$(echo "$json_output" | jq -r '.status')
+    passed=$(echo "$json_output" | jq '.passed')
+    observed=$(echo "$json_output" | jq '.observed')
+    executed=$(echo "$json_output" | jq '.executed')
+    total=$(echo "$json_output" | jq '.total')
+    second_output=$(echo "$json_output" | jq -r '.checks[1].output_preview')
+
+    assert_equal "$receipt_status" "passed"
+    assert_equal "$passed" "2"
+    assert_equal "$observed" "2"
+    assert_equal "$executed" "2"
+    assert_equal "$total" "2"
+    assert_contains "$second_output" "ran_after_stdin_consumer"
+}
+
 @test "qg_run_checks reports failures" {
     skip_unless_command yq "yq required for config parsing"
 
