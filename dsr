@@ -9739,6 +9739,7 @@ cmd_version() {
             local target="${1:-}"
             local push=false
             local tag_all=false
+            local dry_run="$DRY_RUN"
             local language=""
             local main_package=""
 
@@ -9747,7 +9748,7 @@ cmd_version() {
                 case "$1" in
                     --push) push=true; shift ;;
                     --all) tag_all=true; shift ;;
-                    --dry-run|-n) shift ;;  # Already handled by global DRY_RUN
+                    --dry-run|-n) dry_run=true; shift ;;
                     -*) shift ;;
                     *)
                         if [[ -z "$target" || "$target" == --* ]]; then
@@ -9762,7 +9763,7 @@ cmd_version() {
                 # Tag all configured tools
                 local -a args=()
                 $push && args+=("--push")
-                $DRY_RUN && args+=("--dry-run")
+                $dry_run && args+=("--dry-run")
                 $JSON_MODE && args+=("--json")
                 version_tag_all "${args[@]}"
                 return $?
@@ -9794,7 +9795,7 @@ cmd_version() {
 
             local -a tag_args=()
             $push && tag_args+=("--push")
-            $DRY_RUN && tag_args+=("--dry-run")
+            $dry_run && tag_args+=("--dry-run")
             [[ -n "$language" ]] && tag_args+=("--language" "$language")
             [[ -n "$main_package" ]] && tag_args+=("--main-package" "$main_package")
 

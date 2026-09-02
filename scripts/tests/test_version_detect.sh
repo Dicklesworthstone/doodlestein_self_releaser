@@ -494,6 +494,28 @@ test_dry_run_outputs_what_would_happen() {
     harness_teardown
 }
 
+test_cli_trailing_dry_run_does_not_create_tag() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    local repo_dir="$TEST_TMPDIR/rust-repo"
+    create_rust_repo "$repo_dir" "1.0.0"
+
+    local output status=0
+    output=$("$PROJECT_ROOT/dsr" version tag "$repo_dir" --dry-run 2>&1) || status=$?
+
+    if [[ "$status" -eq 0 ]] &&
+       [[ "$output" == *"[DRY-RUN] Would create tag: v1.0.0"* ]] &&
+       [[ "$output" != *"Created tag v1.0.0"* ]] &&
+       ! git -C "$repo_dir" show-ref --tags --verify "refs/tags/v1.0.0" &>/dev/null; then
+        pass "CLI trailing --dry-run previews without creating a tag"
+    else
+        fail "CLI trailing --dry-run must not create or report a created tag"
+    fi
+
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: JSON Output
 # ============================================================================
@@ -714,6 +736,7 @@ echo ""
 echo "--dry-run Behavior:"
 test_dry_run_does_not_create_tag
 test_dry_run_outputs_what_would_happen
+test_cli_trailing_dry_run_does_not_create_tag
 
 echo ""
 echo "JSON Output:"
