@@ -3228,6 +3228,19 @@ EOF
             done
         done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.artifact_path // "")] | @tsv' 2>/dev/null)
 
+        # Build-produced exact additional assets are not children of the
+        # primary release-contract staging directory.  Collect their explicit
+        # descriptor-bound paths before manifest generation so the output
+        # directory contains every build-manifest row.
+        while IFS=$'\t' read -r target file; do
+            [[ -z "$file" ]] && continue
+            _build_collect_artifact_file "$file" "$target"
+        done < <(echo "$result" | jq -r '
+            .targets[]? as $target |
+            ($target.additional_artifacts // [])[]? |
+            [$target.platform, (.path // "")] | @tsv
+        ' 2>/dev/null)
+
         while IFS=$'\t' read -r target method dir; do
             [[ -z "$dir" || ! -d "$dir" ]] && continue
             while IFS= read -r -d '' file; do
@@ -3470,7 +3483,7 @@ USAGE:
 OPTIONS:
     -t, --tool <name>    Tool to check (required)
     -n, --dry-run        Show checks without running them
-    --skip-checks        Skip all checks (for testing)
+    --skip-checks        Skip ordinary checks; required checks still run
     -w, --work-dir       Directory to run checks in
 
 DESCRIPTION:
@@ -3891,8 +3904,15 @@ _release_contract_preflight() {
         return 4
     }
 
-    local expected_count
+    local expected_count base_additional_json base_additional_count expected_manifest_count
     expected_count=$(jq -r '.exact_primary_assets | length' <<< "$contract_json")
+    base_additional_json=$(jq -c '
+        [(.exact_additional_assets // [])[] |
+         select((endswith(".sha256") or endswith(".minisig") or
+                 startswith("SHA256SUMS")) | not)] | sort
+    ' <<< "$contract_json") || return 4
+    base_additional_count=$(jq -r 'length' <<< "$base_additional_json") || return 4
+    expected_manifest_count=$((expected_count + base_additional_count))
     local expected_dependencies_json='[]'
     if ! declare -F config_get_release_source_dependencies_json &>/dev/null; then
         log_error "Strict release dependency-pin helper is unavailable"
@@ -3906,6 +3926,8 @@ _release_contract_preflight() {
         --arg tool "$tool_name" \
         --arg tag "$tag" \
         --argjson expected_count "$expected_count" \
+        --argjson expected_manifest_count "$expected_manifest_count" \
+        --argjson base_additional "$base_additional_json" \
         --argjson expected_dependencies "$expected_dependencies_json" \
         --argjson contract "$contract_json" '
         .tool == $tool and
@@ -3920,10 +3942,13 @@ _release_contract_preflight() {
         .summary.success == $expected_count and
         .summary.failed == 0 and
         (.artifacts | type == "array") and
-        (.artifacts | length == $expected_count) and
-        ([.artifacts[].target] | unique | length) == $expected_count and
-        ([.artifacts[].name] | unique | length) == $expected_count and
-        ([.artifacts[] | {key: .target, value: .name}] | from_entries) == $contract.exact_primary_assets and
+        (.artifacts | length == $expected_manifest_count) and
+        ([.artifacts[].name] | unique | length) == $expected_manifest_count and
+        ([.artifacts[] | select(.target != "additional") |
+          {key: .target, value: .name}] | from_entries) ==
+            $contract.exact_primary_assets and
+        ([.artifacts[] | select(.target == "additional") | .name] | sort) ==
+            $base_additional and
         all(.artifacts[];
             (.target | type == "string") and
             (.name | type == "string") and
@@ -4221,6 +4246,7 @@ _release_contract_preflight() {
     done
 
     local additional_name additional_path additional_sha additional_size
+    local additional_manifest_sha additional_manifest_size
     while IFS= read -r additional_name; do
         [[ -n "$additional_name" ]] || {
             log_error "Release contract contains an empty additional asset name"
@@ -4240,18 +4266,162 @@ _release_contract_preflight() {
             log_error "Could not determine size for additional asset: $additional_path"
             return 4
         }
+        additional_manifest_sha=$(jq -r --arg name "$additional_name" '
+            .artifacts[] | select(.target == "additional" and .name == $name) |
+            .sha256
+        ' "$manifest_file")
+        additional_manifest_size=$(jq -r --arg name "$additional_name" '
+            .artifacts[] | select(.target == "additional" and .name == $name) |
+            .size_bytes
+        ' "$manifest_file")
+        if [[ "$additional_sha" != "$additional_manifest_sha" || \
+              "$additional_size" != "$additional_manifest_size" ]]; then
+            log_error "Additional asset does not match its build-manifest receipt: $additional_name"
+            return 4
+        fi
         planned_assets+=("$(jq -nc \
             --arg name "$additional_name" \
             --arg path "$additional_path" \
             --arg sha256 "$additional_sha" \
             --argjson size_bytes "$additional_size" \
             '{target: "additional", name: $name, path: $path, sha256: $sha256, size_bytes: $size_bytes, kind: "additional"}')")
-    done < <(jq -r '
-        (if has("exact_additional_assets")
-         then .exact_additional_assets
-         else []
-         end) | sort[]
-    ' <<< "$contract_json")
+
+        sidecar="${additional_path}.sha256"
+        if jq -e --arg name "${additional_name}.sha256" '
+            (.exact_additional_assets // []) | index($name) != null
+        ' <<< "$contract_json" >/dev/null 2>&1; then
+            sidecar_line="$additional_sha  $additional_name"
+            expected_sidecar_size=$(printf '%s\n' "$sidecar_line" | wc -c | tr -d '[:space:]')
+            expected_sidecar_sha=$(_release_sha256_line "$sidecar_line") || return 4
+            if [[ "$sidecar_mode" == "create" && ! -e "$sidecar" && ! -L "$sidecar" ]]; then
+                (set -o noclobber; printf '%s\n' "$sidecar_line" > "$sidecar") || return 4
+            fi
+            if [[ "$sidecar_mode" != "plan" || -e "$sidecar" || -L "$sidecar" ]]; then
+                [[ -f "$sidecar" && ! -L "$sidecar" ]] || return 4
+                actual_sidecar_size=$(_release_file_size "$sidecar") || return 4
+                actual_sidecar_sha=$(_release_sha256 "$sidecar") || return 4
+                [[ "$actual_sidecar_size" == "$expected_sidecar_size" &&
+                   "$actual_sidecar_sha" == "$expected_sidecar_sha" ]] || return 4
+            fi
+            planned_assets+=("$(jq -nc \
+                --arg name "${additional_name}.sha256" --arg path "$sidecar" \
+                --arg sha256 "$expected_sidecar_sha" \
+                --arg source_sha256 "$additional_sha" \
+                --argjson size_bytes "$expected_sidecar_size" '
+                {target: "additional", name: $name, path: $path,
+                 sha256: $sha256, source_sha256: $source_sha256,
+                 size_bytes: $size_bytes, kind: "checksum"}')")
+        fi
+
+        signature="${additional_path}.minisig"
+        if jq -e --arg name "${additional_name}.minisig" '
+            (.exact_additional_assets // []) | index($name) != null
+        ' <<< "$contract_json" >/dev/null 2>&1; then
+            [[ -n "$minisign_public_key_file" ]] || return 4
+            if [[ "$sidecar_mode" == "create" && ! -e "$signature" && ! -L "$signature" ]]; then
+                signing_private_key="${SIGNING_PRIVATE_KEY:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/secrets/minisign.key}"
+                signing_sign_exact "$additional_path" "$signature" \
+                    "$signing_private_key" "$minisign_public_key_token" \
+                    "dsr strict release $tool_name $tag additional $additional_sha" \
+                    "$additional_sha" || return 4
+            fi
+            [[ -f "$signature" && ! -L "$signature" ]] || return 4
+            signing_verify_exact "$additional_path" "$signature" \
+                "$minisign_public_key_token" || return 4
+            [[ "$(_release_sha256 "$additional_path")" == "$additional_sha" &&
+               "$(_release_file_size "$additional_path")" == "$additional_size" ]] || return 4
+            signature_sha=$(_release_sha256 "$signature") || return 4
+            signature_size=$(_release_file_size "$signature") || return 4
+            planned_assets+=("$(jq -nc \
+                --arg name "${additional_name}.minisig" --arg path "$signature" \
+                --arg sha256 "$signature_sha" --arg source_sha256 "$additional_sha" \
+                --arg public_key_sha256 "$minisign_public_key_sha256" \
+                --arg public_key_token "$minisign_public_key_token" \
+                --argjson size_bytes "$signature_size" '
+                {target: "additional", name: $name, path: $path,
+                 sha256: $sha256, source_sha256: $source_sha256,
+                 public_key_sha256: $public_key_sha256,
+                 public_key_token: $public_key_token,
+                 size_bytes: $size_bytes, kind: "minisign"}')")
+        fi
+    done < <(jq -r '.[]' <<< "$base_additional_json")
+
+    # A contracted aggregate checksum is derived from every manifest-bound
+    # primary and base additional artifact.  It is never accepted as an
+    # unrelated pre-existing file.
+    if jq -e '(.exact_additional_assets // []) | index("SHA256SUMS") != null' \
+        <<< "$contract_json" >/dev/null 2>&1; then
+        local aggregate_path="$artifacts_dir/SHA256SUMS"
+        local aggregate_lines aggregate_sha aggregate_size
+        aggregate_lines=$(
+            for ((idx = 0; idx < ${#primary_names[@]}; idx++)); do
+                printf '%s  %s\n' "${primary_shas[$idx]}" "${primary_names[$idx]}"
+            done
+            while IFS= read -r additional_name; do
+                [[ -n "$additional_name" ]] || continue
+                additional_path="$artifacts_dir/$additional_name"
+                printf '%s  %s\n' "$(_release_sha256 "$additional_path")" "$additional_name"
+            done < <(jq -r '.[]' <<< "$base_additional_json")
+        )
+        aggregate_lines=$(printf '%s\n' "$aggregate_lines" | LC_ALL=C sort)
+        aggregate_sha=$(_release_sha256_line "$aggregate_lines") || return 4
+        aggregate_size=$(printf '%s\n' "$aggregate_lines" | wc -c | tr -d '[:space:]')
+        if [[ "$sidecar_mode" == "create" && ! -e "$aggregate_path" && ! -L "$aggregate_path" ]]; then
+            (set -o noclobber; printf '%s\n' "$aggregate_lines" > "$aggregate_path") || return 4
+        fi
+        if [[ "$sidecar_mode" != "plan" || -e "$aggregate_path" || -L "$aggregate_path" ]]; then
+            [[ -f "$aggregate_path" && ! -L "$aggregate_path" ]] || return 4
+            [[ "$(_release_sha256 "$aggregate_path")" == "$aggregate_sha" &&
+               "$(_release_file_size "$aggregate_path")" == "$aggregate_size" ]] || return 4
+        fi
+        planned_assets+=("$(jq -nc \
+            --arg path "$aggregate_path" --arg sha256 "$aggregate_sha" \
+            --argjson size_bytes "$aggregate_size" '
+            {target: "additional", name: "SHA256SUMS", path: $path,
+             sha256: $sha256, size_bytes: $size_bytes,
+             kind: "aggregate-checksum"}')")
+
+        if jq -e '(.exact_additional_assets // []) |
+            index("SHA256SUMS.minisig") != null' \
+            <<< "$contract_json" >/dev/null 2>&1; then
+            signature="${aggregate_path}.minisig"
+            [[ -n "$minisign_public_key_file" ]] || return 4
+            if [[ "$sidecar_mode" == "create" && ! -e "$signature" && ! -L "$signature" ]]; then
+                signing_private_key="${SIGNING_PRIVATE_KEY:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/secrets/minisign.key}"
+                signing_sign_exact "$aggregate_path" "$signature" \
+                    "$signing_private_key" "$minisign_public_key_token" \
+                    "dsr strict release $tool_name $tag aggregate $aggregate_sha" \
+                    "$aggregate_sha" || return 4
+            fi
+            [[ -f "$signature" && ! -L "$signature" ]] || return 4
+            signing_verify_exact "$aggregate_path" "$signature" \
+                "$minisign_public_key_token" || return 4
+            signature_sha=$(_release_sha256 "$signature") || return 4
+            signature_size=$(_release_file_size "$signature") || return 4
+            planned_assets+=("$(jq -nc \
+                --arg path "$signature" --arg sha256 "$signature_sha" \
+                --arg source_sha256 "$aggregate_sha" \
+                --arg public_key_sha256 "$minisign_public_key_sha256" \
+                --arg public_key_token "$minisign_public_key_token" \
+                --argjson size_bytes "$signature_size" '
+                {target: "additional", name: "SHA256SUMS.minisig", path: $path,
+                 sha256: $sha256, source_sha256: $source_sha256,
+                 public_key_sha256: $public_key_sha256,
+                 public_key_token: $public_key_token,
+                 size_bytes: $size_bytes, kind: "minisign"}')")
+        fi
+    fi
+
+    local planned_additional_names contracted_additional_names
+    planned_additional_names=$(printf '%s\n' "${planned_assets[@]}" | jq -sr \
+        '[.[] | select(.target == "additional") | .name] | sort | join("\n")') || return 4
+    contracted_additional_names=$(jq -r \
+        '(.exact_additional_assets // []) | sort | join("\n")' \
+        <<< "$contract_json") || return 4
+    if [[ "$planned_additional_names" != "$contracted_additional_names" ]]; then
+        log_error "Strict additional release plan does not match exact_additional_assets"
+        return 4
+    fi
 
     manifest_sha_after=$(_release_sha256 "$manifest_file") || return 4
     if [[ "$manifest_sha_before" != "$manifest_sha_after" ]]; then
@@ -7093,13 +7263,13 @@ OPTIONS:
     -t, --tool <name>      Tool to build/release
     -V, --version <ver>    Version to release (default: detect from version files)
     --build-only           Build artifacts but don't create release
-    --skip-checks          Skip pre-release quality checks
+    --skip-checks          Skip ordinary quality checks; required checks still run
     -r, --resume           Resume interrupted build
     -o, --output-dir <dir> Output directory for artifacts
 
 DESCRIPTION:
     End-to-end fallback pipeline when GitHub Actions is throttled:
-    1. Pre-release quality checks (unless --skip-checks)
+    1. Required checks, plus ordinary checks unless --skip-checks is set
     2. Build all targets using act + native hosts
     3. Generate manifest, checksums, signatures
     4. Verify artifacts match manifest
@@ -7109,7 +7279,7 @@ EXAMPLES:
     dsr fallback ntm                        Full pipeline
     dsr fallback ntm --version 1.2.3        Specific version
     dsr fallback ntm --build-only           Build without releasing
-    dsr fallback ntm --skip-checks          Skip quality gates
+    dsr fallback ntm --skip-checks          Run only required quality gates
     dsr --dry-run fallback ntm              Show plan without executing
 
 EXIT CODES:
@@ -7247,18 +7417,26 @@ EOF
     local exit_code=0
 
     # === Step 1: Pre-release checks ===
-    if ! $skip_checks; then
+    # qg_run_checks owns the bypass policy.  Calling it even when the operator
+    # requests --skip-checks ensures repository-defined required checks cannot
+    # be bypassed by the fallback wrapper.
+    local quality_args=("$tool_name" --work-dir "$local_path")
+    if $skip_checks; then
+        quality_args+=(--skip-checks)
+        log_info "=== Step 1/4: Required Pre-release Checks ==="
+    else
         log_info "=== Step 1/4: Pre-release Checks ==="
+    fi
         # Bug: this previously called `quality_run_checks` — a name that
         # only exists in the original bd-36r design doc, never in any
         # shipped module. The real function is `qg_run_checks` (defined
         # in src/quality_gates.sh). The 2>/dev/null on the call hid the
         # `command not found` message, so the if branch always fell to
         # the else: every `dsr fallback` run that didn't pass
-        # --skip-checks aborted at "Quality checks failed" with no
+        # ordinary runs aborted at "Quality checks failed" with no
         # diagnostic path forward. Calling the correct function makes
         # the pipeline actually executable.
-        if qg_run_checks "$tool_name" --work-dir "$local_path"; then
+        if qg_run_checks "${quality_args[@]}"; then
             checks_status="passed"
             log_ok "Quality checks passed"
         else
@@ -7270,9 +7448,6 @@ EOF
             fi
             return 6
         fi
-    else
-        log_info "=== Step 1/4: Pre-release Checks (skipped) ==="
-    fi
 
     # === Step 2: Acquire lock and build ===
     log_info "=== Step 2/4: Build Artifacts ==="

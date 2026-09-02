@@ -86,7 +86,11 @@ EOF
 }
 
 cleanup_fixtures() {
-    rm -rf "$TEMP_DIR"
+    if [[ "${DSR_TEST_KEEP_TMP:-0}" == "1" ]]; then
+        echo "Retained test fixture: $TEMP_DIR" >&2
+    else
+        rm -rf "$TEMP_DIR"
+    fi
 }
 
 # Test act_can_run function
@@ -548,6 +552,84 @@ EOF
     fi
 }
 
+test_workspace_archive_contract_format_and_members() {
+    log_test "configured workspace archive format and fixed authority members"
+    if ! command -v yq &>/dev/null; then
+        log_skip "yq unavailable"
+        return
+    fi
+
+    local config="$TEMP_DIR/process-family.yaml"
+    local root="$TEMP_DIR/process-family"
+    local archive="$TEMP_DIR/process-family.tar.xz"
+    mkdir -p "$root"
+    cat > "$config" <<'EOF'
+workspace_binaries:
+  - ft
+  - frankenterm-mux-server
+  - frankenterm-pty-guardian
+workspace_archive_files:
+  darwin/arm64:
+    - name: verify-components.sh
+      executable: true
+    - name: ft-darwin-arm64.component-manifest.json
+      executable: false
+archive_format:
+  darwin: tar.xz
+  windows: zip
+include_extra_files: false
+EOF
+    local binary
+    for binary in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        printf '\xcf\xfa\xed\xfe\x0c\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
+            > "$root/$binary"
+        chmod 0755 "$root/$binary"
+    done
+    printf '#!/bin/sh\nexit 0\n' > "$root/verify-components.sh"
+    chmod 0755 "$root/verify-components.sh"
+    printf '{"schema_version":"ft.atomic_component_manifest.v1"}\n' \
+        > "$root/ft-darwin-arm64.component-manifest.json"
+    chmod 0644 "$root/ft-darwin-arm64.component-manifest.json"
+
+    local receipt receipts=() identity
+    for binary in ft frankenterm-mux-server frankenterm-pty-guardian; do
+        identity=$(_act_file_identity "$root/$binary")
+        receipt=$(jq -nc --arg path "$root/$binary" \
+            --arg sha256 "$(_act_sha256 "$root/$binary")" \
+            --argjson size_bytes "$(_act_file_size "$root/$binary")" \
+            --arg identity "$identity" \
+            '{path: $path, sha256: $sha256, size_bytes: $size_bytes, identity: $identity}')
+        receipts+=("$receipt")
+    done
+    _act_stream_workspace_tar_xz "$root" \
+        ft frankenterm-mux-server frankenterm-pty-guardian \
+        verify-components.sh ft-darwin-arm64.component-manifest.json > "$archive"
+
+    if [[ "$(_act_workspace_archive_format "$config" darwin/arm64)" == "tar.xz" &&
+          "$(_act_workspace_archive_format "$config" windows/amd64)" == "zip" ]] && \
+       _act_validate_workspace_archive \
+           "$archive" tar.xz darwin/arm64 "$config" && \
+       _act_validate_workspace_archive_collection_receipts \
+           "$archive" tar.xz darwin/arm64 "$config" "${receipts[@]}"; then
+        log_pass "configured tar.xz carries the exact three binaries, verifier, and manifest"
+    else
+        log_fail "configured tar.xz process-family closure was rejected"
+    fi
+
+    printf 'extra\n' > "$root/frankenterm-gui"
+    chmod 0755 "$root/frankenterm-gui"
+    _act_stream_workspace_tar_xz "$root" \
+        ft frankenterm-mux-server frankenterm-pty-guardian \
+        verify-components.sh ft-darwin-arm64.component-manifest.json \
+        frankenterm-gui > "$TEMP_DIR/process-family-extra.tar.xz"
+    if ! _act_validate_workspace_archive \
+        "$TEMP_DIR/process-family-extra.tar.xz" tar.xz darwin/arm64 "$config"; then
+        log_pass "process-family archive rejects a sixth uncontracted member"
+    else
+        log_fail "process-family archive accepted an uncontracted member"
+    fi
+}
+
 test_strict_git_commit_replacement_binding() {
     log_test "strict Git commit replacement binding"
 
@@ -607,6 +689,11 @@ test_strict_git_commit_replacement_binding() {
 # Test act_cleanup function
 test_act_cleanup() {
     log_test "act_cleanup"
+
+    if [[ "${DSR_TEST_KEEP_TMP:-0}" == "1" ]]; then
+        log_skip "Cleanup mutation disabled while retaining test fixtures"
+        return
+    fi
 
     export ACT_ARTIFACTS_DIR="$TEMP_DIR/artifacts"
     export ACT_LOGS_DIR="$TEMP_DIR/logs"
@@ -798,6 +885,7 @@ main() {
     test_artifact_zip_wrapper_classification
     test_workspace_include_staging
     test_workspace_archive_collection_receipts
+    test_workspace_archive_contract_format_and_members
     test_strict_git_commit_replacement_binding
     test_act_cleanup
     test_workflow_validation

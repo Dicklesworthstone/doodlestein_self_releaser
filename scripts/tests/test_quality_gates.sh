@@ -46,7 +46,11 @@ setup_test_env() {
 
 teardown_test_env() {
     if [[ -n "${TEST_TMPDIR:-}" && -d "$TEST_TMPDIR" ]]; then
-        rm -rf "$TEST_TMPDIR"
+        if [[ "${DSR_TEST_KEEP_TMP:-0}" == "1" ]]; then
+            echo "Retained test fixture: $TEST_TMPDIR" >&2
+        else
+            rm -rf "$TEST_TMPDIR"
+        fi
     fi
 }
 
@@ -86,6 +90,38 @@ test_get_checks_with_yq() {
         pass "qg_get_checks returns configured checks"
     else
         fail "qg_get_checks: expected 2 checks, got $count"
+    fi
+    teardown_test_env
+}
+
+test_get_checks_required_inventory() {
+    ((TESTS_RUN++))
+    if ! command -v yq &>/dev/null; then
+        skip "yq not available"
+        return
+    fi
+
+    setup_test_env
+    create_repos_yaml 'tools:
+  test-tool:
+    checks:
+      - "ordinary"
+    required_checks:
+      - "required-one"
+      - "required-two"
+'
+    local all required ordinary
+    all=$(qg_get_checks test-tool)
+    required=$(qg_get_checks test-tool required)
+    ordinary=$(qg_get_checks test-tool ordinary)
+    if jq -e '. == ["required-one", "required-two", "ordinary"]' \
+           <<< "$all" >/dev/null && \
+       jq -e '. == ["required-one", "required-two"]' \
+           <<< "$required" >/dev/null && \
+       jq -e '. == ["ordinary"]' <<< "$ordinary" >/dev/null; then
+        pass "qg_get_checks preserves required and ordinary inventories"
+    else
+        fail "qg_get_checks did not preserve required inventory"
     fi
     teardown_test_env
 }
@@ -173,7 +209,11 @@ test_get_checks_missing_file() {
 
     setup_test_env
     # Don't create the file
-    rm -f "$DSR_REPOS_FILE"
+    [[ ! -e "$DSR_REPOS_FILE" ]] || {
+        fail "test fixture unexpectedly created repos.yaml"
+        teardown_test_env
+        return
+    }
 
     local checks exit_code=0
     checks=$(qg_get_checks "test-tool" 2>/dev/null) || exit_code=$?
@@ -466,6 +506,63 @@ test_run_checks_skip_checks() {
         pass "qg_run_checks --skip-checks skips execution"
     else
         fail "qg_run_checks --skip-checks: skipped=$skipped"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_skip_cannot_bypass_required() {
+    ((TESTS_RUN++))
+    if ! command -v yq &>/dev/null; then
+        skip "yq not available"
+        return
+    fi
+
+    setup_test_env
+    create_repos_yaml 'tools:
+  test-tool:
+    checks:
+      - "false"
+    required_checks:
+      - "test -n \"$DSR_QUALITY_RUN_DIR\""
+'
+    local result exit_code=0
+    result=$(qg_run_checks test-tool --skip-checks 2>/dev/null) || exit_code=$?
+    if [[ "$exit_code" -eq 0 ]] && jq -e '
+        .skipped == false and .status == "passed" and
+        .total == 1 and .executed == 1 and .passed == 1 and
+        .checks[0].command == "test -n \"$DSR_QUALITY_RUN_DIR\""
+    ' <<< "$result" >/dev/null; then
+        pass "--skip-checks executes the required inventory with a durable run directory"
+    else
+        fail "--skip-checks bypassed or failed required inventory: exit=$exit_code result=$result"
+    fi
+    teardown_test_env
+}
+
+test_run_checks_required_failure_is_not_skippable() {
+    ((TESTS_RUN++))
+    if ! command -v yq &>/dev/null; then
+        skip "yq not available"
+        return
+    fi
+
+    setup_test_env
+    create_repos_yaml 'tools:
+  test-tool:
+    checks:
+      - "true"
+    required_checks:
+      - "false"
+'
+    local result exit_code=0
+    result=$(qg_run_checks test-tool --skip-checks 2>/dev/null) || exit_code=$?
+    if [[ "$exit_code" -eq 1 ]] && jq -e '
+        .skipped == false and .status == "failed" and
+        .total == 1 and .failed == 1
+    ' <<< "$result" >/dev/null; then
+        pass "required check failure remains fatal under --skip-checks"
+    else
+        fail "required check failure was bypassed: exit=$exit_code result=$result"
     fi
     teardown_test_env
 }
@@ -1097,6 +1194,7 @@ main() {
 
     echo "qg_get_checks Tests:"
     test_get_checks_with_yq
+    test_get_checks_required_inventory
     test_get_checks_empty_array
     test_get_checks_missing_section
     test_get_checks_unknown_tool
@@ -1121,6 +1219,8 @@ main() {
     test_run_checks_help_flag
     test_run_checks_unknown_option
     test_run_checks_skip_checks
+    test_run_checks_skip_cannot_bypass_required
+    test_run_checks_required_failure_is_not_skippable
     test_run_checks_dry_run
     test_run_checks_no_checks_configured
     test_run_checks_all_pass

@@ -24,6 +24,8 @@
 #         - "cargo clippy --all-targets --locked -- -D warnings"
 #         - "cargo test --locked"
 #         - "cargo fmt --check"
+#       required_checks:              # still run when --skip-checks is requested
+#         - "bash scripts/release-gates.sh"
 #
 # Exit codes (qg_run_checks):
 #   0 - every configured check EXECUTED and passed
@@ -105,6 +107,14 @@ _qg_source_snapshot() {
 # Returns: JSON array of check commands on stdout; rc per header.
 qg_get_checks() {
     local tool_name="$1"
+    local selection="${2:-all}"
+    local selector
+    case "$selection" in
+        all) selector="((\$tool.required_checks // []) + (\$tool.checks // []))" ;;
+        required) selector="(\$tool.required_checks // [])" ;;
+        ordinary) selector="(\$tool.checks // [])" ;;
+        *) return 4 ;;
+    esac
 
     if ! command -v yq &>/dev/null; then
         _qg_log_error "yq required for reading tool configuration"
@@ -143,11 +153,29 @@ qg_get_checks() {
             _qg_log_error "Tool '$tool_name' is not configured in $repos_file"
             return 4
         fi
-        DSR_TOOL="$tool_name" yq -o=json '.[strenv(DSR_TOOL)].checks // []' "$repos_file" 2>/dev/null
-        return 0
+        local checks
+        checks=$(DSR_TOOL="$tool_name" yq -o=json \
+            ".[strenv(DSR_TOOL)] as \$tool | $selector" \
+            "$repos_file" 2>/dev/null) || return 4
+        if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' \
+            <<< "$checks" >/dev/null 2>&1; then
+            _qg_log_error "Tool '$tool_name' has an invalid check inventory"
+            return 4
+        fi
+        printf '%s\n' "$checks"
+        return
     fi
 
-    DSR_TOOL="$tool_name" yq -o=json '.tools[strenv(DSR_TOOL)].checks // []' "$repos_file" 2>/dev/null
+    local checks
+    checks=$(DSR_TOOL="$tool_name" yq -o=json \
+        ".tools[strenv(DSR_TOOL)] as \$tool | $selector" \
+        "$repos_file" 2>/dev/null) || return 4
+    if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' \
+        <<< "$checks" >/dev/null 2>&1; then
+        _qg_log_error "Tool '$tool_name' has an invalid check inventory"
+        return 4
+    fi
+    printf '%s\n' "$checks"
 }
 
 # Run a single check command
@@ -250,7 +278,7 @@ _qg_run_single_check() {
 # Usage: qg_run_checks <tool_name> [options]
 # Options:
 #   --dry-run       Plan checks without executing (exit 2, never a pass)
-#   --skip-checks   Skip all checks (return success; explicit operator bypass)
+#   --skip-checks   Skip ordinary checks; configured required checks still run
 #   --work-dir      Directory to run checks in
 # Returns: evidence-complete aggregate receipt JSON on stdout; also
 # retained durably next to the per-check logs. Exit codes per header.
@@ -283,7 +311,7 @@ Run quality gate checks before release (fail-closed, evidence-complete).
 
 Options:
   --dry-run       Plan checks without executing (exit 2, never a pass)
-  --skip-checks   Skip all checks (explicit operator bypass)
+  --skip-checks   Skip ordinary checks; configured required checks still run
   --work-dir      Directory to run checks in
 
 Exit Codes:
@@ -310,26 +338,42 @@ EOF
         return 4
     fi
 
-    # Handle skip-checks (an explicit operator bypass, visibly labeled)
+    # A repository may define release-critical checks that are not bypassable.
+    # --skip-checks keeps its historic behavior only when that required set is
+    # empty; otherwise it suppresses ordinary checks and executes the complete
+    # required inventory with normal evidence and moving-source fencing.
     if $skip_checks; then
-        _qg_log_warn "Skipping quality checks (--skip-checks)"
-        jq -nc --arg tool "$tool_name" '{
-            tool: $tool,
-            status: "skipped",
-            skipped: true,
-            checks: [],
-            passed: 0,
-            failed: 0,
-            planned: 0,
-            total: 0,
-            duration_ms: 0
-        }'
-        return 0
+        local required_checks required_rc=0 required_count=0
+        required_checks=$(qg_get_checks "$tool_name" required) || required_rc=$?
+        if [[ $required_rc -ne 0 ]]; then
+            return 4
+        fi
+        required_count=$(jq -r 'length' <<< "$required_checks" 2>/dev/null) || return 4
+        if [[ "$required_count" -eq 0 ]]; then
+            _qg_log_warn "Skipping quality checks (--skip-checks)"
+            jq -nc --arg tool "$tool_name" '{
+                tool: $tool,
+                status: "skipped",
+                skipped: true,
+                checks: [],
+                passed: 0,
+                failed: 0,
+                planned: 0,
+                total: 0,
+                duration_ms: 0
+            }'
+            return 0
+        fi
+        _qg_log_warn "--skip-checks cannot bypass $required_count required check(s); ordinary checks are omitted"
     fi
 
     # Get checks for tool — configuration failures are HARD failures.
     local checks rc=0
-    checks=$(qg_get_checks "$tool_name") || rc=$?
+    if $skip_checks; then
+        checks=$(qg_get_checks "$tool_name" required) || rc=$?
+    else
+        checks=$(qg_get_checks "$tool_name") || rc=$?
+    fi
     if [[ $rc -ne 0 ]]; then
         jq -nc --arg tool "$tool_name" --argjson rc "$rc" '{
             tool: $tool,
@@ -394,7 +438,9 @@ EOF
         idx=$((idx + 1))
 
         local result status
-        result=$(_qg_run_single_check "$cmd" "$work_dir" "$dry_run" "$run_dir/check-$idx.log")
+        result=$(DSR_QUALITY_RUN_DIR="$run_dir" \
+            _qg_run_single_check "$cmd" "$work_dir" "$dry_run" \
+                "$run_dir/check-$idx.log")
         results+=("$result")
 
         status=$(echo "$result" | jq -r '.status')

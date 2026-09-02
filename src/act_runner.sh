@@ -170,16 +170,83 @@ _act_stream_remote_windows_file() {
         "powershell -NoProfile -NonInteractive -Command \"${ps_command}\""
 }
 
-_act_stream_workspace_tar() {
+_act_stream_workspace_tar_gz() {
     local artifact_dir="$1"
     shift
-    (cd "$artifact_dir" && tar czf - "$@")
+    (
+        set -o pipefail
+        (cd "$artifact_dir" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - "$@") | gzip -c
+    )
+}
+
+_act_stream_workspace_tar_xz() {
+    local artifact_dir="$1"
+    shift
+    (
+        set -o pipefail
+        (cd "$artifact_dir" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - "$@") | xz -c
+    )
 }
 
 _act_stream_workspace_zip() {
     local artifact_dir="$1"
     shift
     (cd "$artifact_dir" && zip -q - "$@")
+}
+
+# Resolve the native workspace archive format from the per-repository build
+# contract.  Native collection used to hard-code gzip for every Unix target,
+# even when artifact_naming and the strict release contract required tar.xz.
+# A configured format is authoritative; an unsupported value fails closed.
+_act_workspace_archive_format() {
+    local config_file="$1"
+    local platform="$2"
+    local target_os="${platform%%/*}"
+    local format=""
+
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    command -v yq &>/dev/null || return 3
+    format=$(DSR_TARGET_OS="$target_os" yq -r \
+        '.archive_format[strenv(DSR_TARGET_OS)] // ""' "$config_file" 2>/dev/null) || return 4
+    if [[ -z "$format" || "$format" == "null" ]]; then
+        if [[ "$platform" == windows/* ]]; then
+            format="zip"
+        else
+            format="tar.gz"
+        fi
+    fi
+    case "$format" in
+        tar.gz|tar.xz|zip) printf '%s\n' "$format" ;;
+        *)
+            _log_error "Unsupported workspace archive format for $platform: $format"
+            return 4
+            ;;
+    esac
+}
+
+# Additional fixed archive members produced by the build command.  These are
+# deliberately separate from workspace_binaries: scripts and manifests are
+# package authority, but they must never be architecture-validated as native
+# executables.  The target-keyed mapping keeps Windows packages independent of
+# the POSIX installer's five-member process-family contract.
+_act_workspace_archive_files_json() {
+    local config_file="$1"
+    local target="$2"
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    command -v yq &>/dev/null || return 3
+    DSR_TARGET_PLATFORM="$target" yq -o=json -I=0 \
+        '.workspace_archive_files[strenv(DSR_TARGET_PLATFORM)] // []' \
+        "$config_file" 2>/dev/null
+}
+
+_act_workspace_additional_artifacts_json() {
+    local config_file="$1"
+    local target="$2"
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    command -v yq &>/dev/null || return 3
+    DSR_TARGET_PLATFORM="$target" yq -o=json -I=0 \
+        '.workspace_additional_artifacts[strenv(DSR_TARGET_PLATFORM)] // []' \
+        "$config_file" 2>/dev/null
 }
 
 # Per-repo flat-archive contract: when a repo's installer enforces an exact
@@ -728,6 +795,167 @@ _act_validate_target_archive() {
         _act_read_archive_hex_bytes "$archive" "$format" "$expected_entry"
 }
 
+# Verify the additional macOS application archive as one manifest-bound
+# namespace without extracting it or launching any packaged process.  The
+# detached component manifest must describe every regular file below the app,
+# and every described digest/mode must match the tar stream.  Directories and
+# safe relative symlinks are allowed; hard links and special entries are not.
+_act_validate_macos_app_archive() {
+    local archive="$1"
+    local source_revision="$2"
+    local version="$3"
+    command -v python3 &>/dev/null || return 3
+    python3 - "$archive" "$source_revision" "${version#v}" <<'PY'
+import hashlib
+import json
+import os
+import posixpath
+import stat
+import sys
+import tarfile
+
+archive, source_revision, version = sys.argv[1:]
+maximum_archive_bytes = 8 * 1024 * 1024 * 1024
+maximum_members = 100_010
+maximum_manifest_bytes = 16 * 1024 * 1024
+schema = "ft.atomic_component_manifest.v1"
+feature = "application-family-gui-ft-mux-server-pty-guardian-default-features-v1"
+
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(archive, flags)
+try:
+    before = os.fstat(fd)
+    named = os.stat(archive, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size <= 0
+        or before.st_size > maximum_archive_bytes
+        or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        raise SystemExit("unsafe or oversized macOS app archive")
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+
+    regular = {}
+    detached = None
+    member_count = 0
+    with os.fdopen(os.dup(fd), "rb", closefd=True) as stream:
+        with tarfile.open(fileobj=stream, mode="r:xz") as package:
+            for member in package:
+                member_count += 1
+                if member_count > maximum_members:
+                    raise SystemExit("macOS app archive exceeds member-count bound")
+                name = member.name
+                encoded = name.encode("utf-8")
+                normalized = posixpath.normpath(name)
+                if (
+                    not encoded
+                    or len(encoded) > 4096
+                    or name.startswith("/")
+                    or "\\" in name
+                    or normalized != name.rstrip("/")
+                    or any(part in ("", ".", "..") for part in name.rstrip("/").split("/"))
+                ):
+                    raise SystemExit(f"unsafe macOS app archive path: {name!r}")
+                if name == "FrankenTerm.app.component-manifest.json":
+                    if detached is not None or not member.isfile() or member.size > maximum_manifest_bytes:
+                        raise SystemExit("invalid detached macOS component manifest entry")
+                    handle = package.extractfile(member)
+                    if handle is None:
+                        raise SystemExit("unreadable detached macOS component manifest")
+                    detached = handle.read(maximum_manifest_bytes + 1)
+                    if len(detached) != member.size:
+                        raise SystemExit("truncated detached macOS component manifest")
+                    continue
+                if not (name == "FrankenTerm.app" or name.startswith("FrankenTerm.app/")):
+                    raise SystemExit(f"unexpected macOS app archive root: {name!r}")
+                if member.isdir():
+                    continue
+                if member.issym():
+                    target = member.linkname
+                    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+                    if target.startswith("/") or not resolved.startswith("FrankenTerm.app/"):
+                        raise SystemExit(f"escaping macOS app symlink: {name!r}")
+                    continue
+                if not member.isfile() or member.islnk():
+                    raise SystemExit(f"unsupported macOS app archive member: {name!r}")
+                relative = name.removeprefix("FrankenTerm.app/")
+                if relative in regular:
+                    raise SystemExit(f"duplicate macOS app file: {relative!r}")
+                handle = package.extractfile(member)
+                if handle is None:
+                    raise SystemExit(f"unreadable macOS app file: {relative!r}")
+                digest = hashlib.sha256()
+                observed = 0
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    observed += len(chunk)
+                    digest.update(chunk)
+                if observed != member.size:
+                    raise SystemExit(f"truncated macOS app file: {relative!r}")
+                regular[relative] = (digest.hexdigest(), observed, bool(member.mode & 0o111))
+
+    if detached is None:
+        raise SystemExit("macOS app archive lacks detached component manifest")
+    manifest = json.loads(detached)
+    if manifest.get("schema_version") != schema:
+        raise SystemExit("unsupported macOS component manifest schema")
+    claimed_id = manifest.get("manifest_id")
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_id", None)
+    canonical = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    # The producer's canonical JSON has no trailing newline in the hashed
+    # payload.  Accept exactly that definition, not ordinary pretty JSON.
+    canonical_without_newline = canonical[:-1]
+    expected_id = "sha256:" + hashlib.sha256(canonical_without_newline).hexdigest()
+    if claimed_id != expected_id:
+        raise SystemExit("macOS component manifest identity mismatch")
+    identity_value = manifest.get("identity", {})
+    if (
+        identity_value.get("source_revision") != source_revision
+        or identity_value.get("version") != version
+        or identity_value.get("target") != "aarch64-apple-darwin"
+        or identity_value.get("profile") != "release-interactive"
+        or identity_value.get("feature_contract") != feature
+    ):
+        raise SystemExit("macOS component manifest release identity mismatch")
+    files = manifest.get("files")
+    if not isinstance(files, list) or len(files) != len(regular):
+        raise SystemExit("macOS component manifest inventory count mismatch")
+    expected = {}
+    components = set()
+    for record in files:
+        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+            raise SystemExit("invalid macOS component manifest file record")
+        path = record["path"]
+        if path in expected:
+            raise SystemExit("duplicate macOS component manifest path")
+        expected[path] = (record.get("sha256"), record.get("bytes"), record.get("executable"))
+        component = record.get("component")
+        if isinstance(component, str):
+            components.add(component)
+    if expected != regular:
+        raise SystemExit("macOS app bytes do not match detached component manifest")
+    if components != {"frankenterm-gui", "ft", "frankenterm-mux-server", "frankenterm-pty-guardian"}:
+        raise SystemExit("macOS app manifest lacks the exact four process roles")
+    inventory = manifest.get("inventory", {})
+    if inventory.get("mode") != "exact" or inventory.get("file_count") != len(regular):
+        raise SystemExit("macOS app manifest inventory authority mismatch")
+
+    after = os.fstat(fd)
+    renamed = os.stat(archive, follow_symlinks=False)
+    if (
+        identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (after.st_dev, after.st_ino) != (renamed.st_dev, renamed.st_ino)
+    ):
+        raise SystemExit("macOS app archive changed during manifest verification")
+finally:
+    os.close(fd)
+PY
+}
+
 # Validate a release archive that was already assembled by the strict native
 # workspace collector. Unlike the single-binary archive path above, this form
 # must retain every configured workspace binary and companion notice while
@@ -776,6 +1004,28 @@ _act_validate_workspace_archive() {
     done <<< "$configured"
     [[ ${#binary_members[@]} -gt 0 ]] || return 4
 
+    local archive_files_json archive_file_json archive_file executable
+    archive_files_json=$(_act_workspace_archive_files_json "$config_file" "$target") || return $?
+    if ! jq -e '
+        type == "array" and
+        all(.[];
+            type == "object" and
+            (keys | sort) == ["executable", "name"] and
+            (.name | type == "string") and
+            (.executable | type == "boolean")
+        )
+    ' <<< "$archive_files_json" >/dev/null 2>&1; then
+        return 4
+    fi
+    while IFS= read -r archive_file_json; do
+        [[ -n "$archive_file_json" ]] || continue
+        archive_file=$(jq -r '.name' <<< "$archive_file_json") || return 4
+        _act_is_safe_basename "$archive_file" || return 4
+        [[ -z "${seen_members[$archive_file]:-}" ]] || return 4
+        seen_members["$archive_file"]=1
+        expected_members+=("$archive_file")
+    done < <(jq -c '.[]' <<< "$archive_files_json")
+
     if [[ "$(_act_include_files_in_archives "$config_file")" == "false" ]]; then
         # Flat-archive repo: the expected member closure is the workspace
         # binaries alone; configured include_files must not appear.
@@ -815,6 +1065,16 @@ _act_validate_workspace_archive() {
                 ;;
         esac
         [[ "$mode" == -* ]] || return 4
+        archive_file_json=$(jq -c --arg name "$member" \
+            '.[] | select(.name == $name)' <<< "$archive_files_json") || return 4
+        if [[ -n "$archive_file_json" ]]; then
+            executable=$(jq -r '.executable' <<< "$archive_file_json") || return 4
+            if [[ "$executable" == "true" ]]; then
+                [[ "$mode" == *x* ]] || return 4
+            else
+                [[ "$mode" != *x* ]] || return 4
+            fi
+        fi
     done
 
     for member in "${binary_members[@]}"; do
@@ -1006,14 +1266,22 @@ _act_stage_contract_primary() {
                 ;;
             tar.gz)
                 command -v tar &>/dev/null || exit 4
-                COPYFILE_DISABLE=1 tar --no-xattrs -czf - -C "$(dirname "$source_path")" \
-                    "$(basename "$source_path")" >&9 || exit 4
+                (
+                    set -o pipefail
+                    (cd "$(dirname "$source_path")" && \
+                        COPYFILE_DISABLE=1 tar --no-xattrs -cf - \
+                            "$(basename "$source_path")") | gzip -c
+                ) >&9 || exit 4
                 chmod 600 /dev/fd/9 || exit 4
                 ;;
             tar.xz)
                 command -v tar &>/dev/null || exit 4
-                COPYFILE_DISABLE=1 tar --no-xattrs -cJf - -C "$(dirname "$source_path")" \
-                    "$(basename "$source_path")" >&9 || exit 4
+                (
+                    set -o pipefail
+                    (cd "$(dirname "$source_path")" && \
+                        COPYFILE_DISABLE=1 tar --no-xattrs -cf - \
+                            "$(basename "$source_path")") | xz -c
+                ) >&9 || exit 4
                 chmod 600 /dev/fd/9 || exit 4
                 ;;
             zip)
@@ -5268,6 +5536,7 @@ act_run_native_build() {
 
     # Determine result
     local status local_artifact_path="" local_artifact_paths=()
+    local local_additional_artifact_paths=() additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
     if [[ $exit_code -eq 0 ]]; then
@@ -5495,6 +5764,161 @@ act_run_native_build() {
             fi
         done
 
+        # Collect configured non-binary package members separately from the
+        # architecture-validated executable receipts.  The build command may
+        # produce a verifier and detached component manifest beside its native
+        # binaries; both must be copied through a fresh held destination inode
+        # before they can enter the exact archive closure.
+        local workspace_archive_files_json="[]"
+        workspace_archive_files_json=$(_act_workspace_archive_files_json \
+            "$config_file" "$platform") || download_failed=true
+        if ! jq -e '
+            type == "array" and
+            all(.[];
+                type == "object" and
+                (keys | sort) == ["executable", "name"] and
+                (.name | type == "string") and
+                (.executable | type == "boolean")
+            )
+        ' <<< "$workspace_archive_files_json" >/dev/null 2>&1; then
+            _log_error "Invalid workspace_archive_files configuration for $platform"
+            download_failed=true
+            workspace_archive_files_json='[]'
+        fi
+
+        local archive_file_json archive_file archive_file_executable
+        local archive_file_remote archive_file_local archive_file_receipt archive_file_mode
+        while IFS= read -r archive_file_json; do
+            [[ -n "$archive_file_json" ]] || continue
+            archive_file=$(jq -r '.name' <<< "$archive_file_json") || {
+                download_failed=true
+                continue
+            }
+            archive_file_executable=$(jq -r '.executable' <<< "$archive_file_json") || {
+                download_failed=true
+                continue
+            }
+            if ! _act_is_safe_basename "$archive_file" || \
+               [[ -e "$artifact_dir/$archive_file" || -L "$artifact_dir/$archive_file" ]]; then
+                _log_error "Unsafe or colliding workspace archive member: $archive_file"
+                download_failed=true
+                continue
+            fi
+            archive_file_remote=$(act_get_remote_artifact_path \
+                "$language" "$remote_path" "$build_env" "$archive_file" \
+                "$platform" "$build_profile")
+            archive_file_local="$artifact_dir/$archive_file"
+            archive_file_mode=600
+            [[ "$archive_file_executable" == "true" ]] && archive_file_mode=700
+            archive_file_receipt=""
+            if $strict_native_build; then
+                if _act_is_local_host "$host"; then
+                    archive_file_receipt=$(_act_collect_stream_exclusive \
+                        "$archive_file_local" "$archive_file_mode" \
+                        _act_stream_local_file "$archive_file_remote") || archive_file_receipt=""
+                elif _act_is_windows_host "$host"; then
+                    archive_file_receipt=$(_act_collect_stream_exclusive \
+                        "$archive_file_local" "$archive_file_mode" \
+                        _act_stream_remote_windows_file \
+                        "$ssh_destination" "$archive_file_remote") || archive_file_receipt=""
+                else
+                    archive_file_receipt=$(_act_collect_stream_exclusive \
+                        "$archive_file_local" "$archive_file_mode" \
+                        _act_stream_remote_unix_file \
+                        "$ssh_destination" "$archive_file_remote") || archive_file_receipt=""
+                fi
+                if [[ -n "$archive_file_receipt" ]]; then
+                    local_artifact_paths+=("$archive_file_local")
+                else
+                    _log_error "Failed to collect workspace archive member $archive_file from $host"
+                    download_failed=true
+                fi
+            elif _act_is_local_host "$host"; then
+                if [[ -f "$archive_file_remote" && ! -L "$archive_file_remote" ]] && \
+                   cp "$archive_file_remote" "$archive_file_local" && \
+                   chmod "$archive_file_mode" "$archive_file_local"; then
+                    local_artifact_paths+=("$archive_file_local")
+                else
+                    download_failed=true
+                fi
+            elif scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                    -o StrictHostKeyChecking=accept-new \
+                    "${ssh_destination}:${archive_file_remote}" \
+                    "$archive_file_local" >/dev/null 2>&1 && \
+                 chmod "$archive_file_mode" "$archive_file_local"; then
+                local_artifact_paths+=("$archive_file_local")
+            else
+                download_failed=true
+            fi
+        done < <(jq -c '.[]' <<< "$workspace_archive_files_json")
+
+        # Build-produced release assets (currently the manifest-bound macOS app
+        # archive) are collected and receipted but never folded into the process
+        # archive.  The receipt is carried in the target result so strict
+        # manifest generation can require its exact name, bytes, and identity.
+        local additional_json="[]" additional_name additional_remote additional_local
+        local additional_receipt
+        additional_json=$(_act_workspace_additional_artifacts_json \
+            "$config_file" "$platform") || download_failed=true
+        if ! jq -e 'type == "array" and all(.[]; type == "string")' \
+            <<< "$additional_json" >/dev/null 2>&1; then
+            _log_error "Invalid workspace_additional_artifacts configuration for $platform"
+            download_failed=true
+            additional_json='[]'
+        fi
+        while IFS= read -r additional_name; do
+            [[ -n "$additional_name" ]] || continue
+            if ! _act_is_safe_basename "$additional_name" || \
+               [[ -e "$artifact_dir/$additional_name" || -L "$artifact_dir/$additional_name" ]]; then
+                _log_error "Unsafe or colliding additional release artifact: $additional_name"
+                download_failed=true
+                continue
+            fi
+            additional_remote=$(act_get_remote_artifact_path \
+                "$language" "$remote_path" "$build_env" "$additional_name" \
+                "$platform" "$build_profile")
+            additional_local="$artifact_dir/$additional_name"
+            additional_receipt=""
+            if $strict_native_build; then
+                if _act_is_local_host "$host"; then
+                    additional_receipt=$(_act_collect_stream_exclusive \
+                        "$additional_local" 600 _act_stream_local_file \
+                        "$additional_remote") || additional_receipt=""
+                elif _act_is_windows_host "$host"; then
+                    additional_receipt=$(_act_collect_stream_exclusive \
+                        "$additional_local" 600 _act_stream_remote_windows_file \
+                        "$ssh_destination" "$additional_remote") || additional_receipt=""
+                else
+                    additional_receipt=$(_act_collect_stream_exclusive \
+                        "$additional_local" 600 _act_stream_remote_unix_file \
+                        "$ssh_destination" "$additional_remote") || additional_receipt=""
+                fi
+                if [[ -n "$additional_receipt" ]]; then
+                    local_additional_artifact_paths+=("$additional_local")
+                    additional_artifact_receipts+=("$additional_receipt")
+                else
+                    _log_error "Failed to collect additional release artifact $additional_name from $host"
+                    download_failed=true
+                fi
+            else
+                if _act_is_local_host "$host" && \
+                   [[ -f "$additional_remote" && ! -L "$additional_remote" ]] && \
+                   cp "$additional_remote" "$additional_local" && \
+                   chmod 600 "$additional_local"; then
+                    local_additional_artifact_paths+=("$additional_local")
+                elif ! _act_is_local_host "$host" && \
+                     scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+                         -o StrictHostKeyChecking=accept-new \
+                         "${ssh_destination}:${additional_remote}" \
+                         "$additional_local" >/dev/null 2>&1 && \
+                     chmod 600 "$additional_local"; then
+                    local_additional_artifact_paths+=("$additional_local")
+                else
+                    download_failed=true
+                fi
+            fi
+        done < <(jq -r '.[]' <<< "$additional_json")
+
         # Set final status and artifact path(s)
         if [[ "$download_failed" == true ]]; then
             if $strict_native_build || [[ ${#local_artifact_paths[@]} -eq 0 ]]; then
@@ -5511,10 +5935,18 @@ act_run_native_build() {
         if [[ -n "$workspace_binaries" && ${#local_artifact_paths[@]} -gt 0 && "$status" != "failed" ]]; then
             _log_info "Packaging ${#local_artifact_paths[@]} workspace binaries into release tarball..."
 
-            # Determine archive format
-            local archive_ext="tar.gz"
-            if [[ "$platform" == windows/* ]]; then
-                archive_ext="zip"
+            # The repository archive_format contract is authoritative.  The
+            # strict native lane must not emit gzip bytes and merely rename
+            # them with a .tar.xz primary name downstream.
+            local archive_ext=""
+            if ! archive_ext=$(_act_workspace_archive_format \
+                "$config_file" "$platform"); then
+                _log_error "Unable to resolve workspace archive format for $platform"
+                status="failed"
+                exit_code=7
+                local_artifact_path=""
+                local_artifact_paths=()
+                archive_ext=""
             fi
 
             # Parse platform for naming: linux/amd64 -> linux-amd64
@@ -5536,7 +5968,8 @@ act_run_native_build() {
                 source "$script_dir/artifact_naming.sh" 2>/dev/null || true
             fi
 
-            if declare -F artifact_naming_generate_dual_for_tool &>/dev/null; then
+            if [[ -n "$archive_ext" ]] && \
+               declare -F artifact_naming_generate_dual_for_tool &>/dev/null; then
                 local os arch names_json
                 os="${platform%/*}"
                 arch="${platform#*/}"
@@ -5544,7 +5977,7 @@ act_run_native_build() {
                 archive_name=$(echo "$names_json" | jq -r '.versioned // empty' 2>/dev/null)
             fi
 
-            if [[ -z "$archive_name" ]]; then
+            if [[ -n "$archive_ext" && -z "$archive_name" ]]; then
                 archive_name="${tool_name}-${version_stripped}-${plat_name}.${archive_ext}"
             fi
             local archive_path="$artifact_dir/$archive_name"
@@ -5557,7 +5990,9 @@ act_run_native_build() {
 
             local staged_workspace_includes=""
             local workspace_include_revision=""
-            if $strict_native_build; then
+            if [[ -z "$archive_ext" ]]; then
+                :
+            elif $strict_native_build; then
                 if [[ ! "$release_git_sha" =~ ^[0-9a-f]{40}$ || "$release_git_sha" =~ ^0{40}$ ]]; then
                     _log_error "Strict workspace companion-file staging requires an exact release commit"
                     jq -nc --arg platform "$platform" \
@@ -5586,19 +6021,28 @@ act_run_native_build() {
             if $strict_native_build; then
                 local archive_receipt="" archive_mode=700
                 [[ "$platform" == windows/* ]] && archive_mode=600
-                if [[ "$archive_ext" == "zip" ]]; then
-                    if command -v zip &>/dev/null; then
+                case "$archive_ext" in
+                    zip)
+                        if command -v zip &>/dev/null; then
+                            archive_receipt=$(_act_collect_stream_exclusive \
+                                "$archive_path" "$archive_mode" \
+                                _act_stream_workspace_zip "$artifact_dir" \
+                                "${archive_files[@]}") || archive_receipt=""
+                        fi
+                        ;;
+                    tar.gz)
                         archive_receipt=$(_act_collect_stream_exclusive \
                             "$archive_path" "$archive_mode" \
-                            _act_stream_workspace_zip "$artifact_dir" \
+                            _act_stream_workspace_tar_gz "$artifact_dir" \
                             "${archive_files[@]}") || archive_receipt=""
-                    fi
-                else
-                    archive_receipt=$(_act_collect_stream_exclusive \
-                        "$archive_path" "$archive_mode" \
-                        _act_stream_workspace_tar "$artifact_dir" \
-                        "${archive_files[@]}") || archive_receipt=""
-                fi
+                        ;;
+                    tar.xz)
+                        archive_receipt=$(_act_collect_stream_exclusive \
+                            "$archive_path" "$archive_mode" \
+                            _act_stream_workspace_tar_xz "$artifact_dir" \
+                            "${archive_files[@]}") || archive_receipt=""
+                        ;;
+                esac
                 if [[ -n "$archive_receipt" ]] && \
                    ! _act_validate_workspace_archive_release_tree_includes \
                        "$archive_path" "$archive_ext" "$config_file" \
@@ -5649,16 +6093,31 @@ act_run_native_build() {
                     # Fall back to comma-separated paths
                     local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
                 fi
+            elif [[ "$archive_ext" == "tar.gz" ]]; then
+                archive_output=$(cd "$artifact_dir" && \
+                    COPYFILE_DISABLE=1 tar --no-xattrs -czf "$archive_name" \
+                        "${archive_files[@]}" 2>&1)
+                if [[ -f "$archive_path" ]]; then
+                    _log_ok "Created archive: $archive_path"
+                    local_artifact_path="$archive_path"
+                    local_artifact_paths=("$archive_path")
+                else
+                    _log_warn "Failed to create tar.gz archive"
+                    _log_warn "tar output: $archive_output"
+                    echo "Archive creation failed: $archive_output" >> "$log_file"
+                    local_artifact_path=$(IFS=','; echo "${local_artifact_paths[*]}")
+                fi
             else
-                # Unix: use tar
-                archive_output=$(cd "$artifact_dir" && tar czf "$archive_name" "${archive_files[@]}" 2>&1)
+                archive_output=$(cd "$artifact_dir" && \
+                    COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$archive_name" \
+                        "${archive_files[@]}" 2>&1)
                 if [[ -f "$archive_path" ]]; then
                     _log_ok "Created archive: $archive_path"
                     # Update artifact path to point to the archive
                     local_artifact_path="$archive_path"
                     local_artifact_paths=("$archive_path")
                 else
-                    _log_warn "Failed to create tar archive"
+                    _log_warn "Failed to create tar.xz archive"
                     _log_warn "tar output: $archive_output"
                     echo "Archive creation failed: $archive_output" >> "$log_file"
                     # Fall back to comma-separated paths
@@ -5691,6 +6150,26 @@ act_run_native_build() {
     if [[ -n "${local_artifact_path:-}" ]]; then
         artifact_paths_json=$(echo "$local_artifact_path" | tr ',' '\n' | jq -R . | jq -sc .)
     fi
+    local additional_artifacts_json="[]"
+    if [[ ${#additional_artifact_receipts[@]} -gt 0 ]]; then
+        additional_artifacts_json=$(printf '%s\n' \
+            "${additional_artifact_receipts[@]}" | jq -s '.') || return 4
+    elif [[ ${#local_additional_artifact_paths[@]} -gt 0 ]]; then
+        local additional_path additional_sha additional_size additional_identity
+        local additional_records=()
+        for additional_path in "${local_additional_artifact_paths[@]}"; do
+            additional_sha=$(_act_sha256 "$additional_path") || return 4
+            additional_size=$(_act_file_size "$additional_path") || return 4
+            additional_identity=$(_act_file_identity "$additional_path") || return 4
+            additional_records+=("$(jq -nc \
+                --arg path "$additional_path" --arg sha256 "${additional_sha,,}" \
+                --argjson size_bytes "$additional_size" \
+                --arg identity "$additional_identity" \
+                '{path: $path, sha256: $sha256, size_bytes: $size_bytes, identity: $identity}')")
+        done
+        additional_artifacts_json=$(printf '%s\n' \
+            "${additional_records[@]}" | jq -s '.') || return 4
+    fi
 
     jq -nc \
         --arg tool "$tool_name" \
@@ -5701,6 +6180,7 @@ act_run_native_build() {
         --argjson duration "$duration" \
         --arg artifact_path "${local_artifact_path:-}" \
         --argjson artifact_paths "$artifact_paths_json" \
+        --argjson additional_artifacts "$additional_artifacts_json" \
         --arg collected_sha256 "$collected_sha256" \
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
@@ -5717,6 +6197,7 @@ act_run_native_build() {
             duration_seconds: $duration,
             artifact_path: $artifact_path,
             artifact_paths: $artifact_paths,
+            additional_artifacts: $additional_artifacts,
             collected_sha256: (if $collected_sha256 == "" then null else $collected_sha256 end),
             collected_size_bytes: (if $collected_size_bytes == 0 then null else $collected_size_bytes end),
             collected_identity: (if $collected_identity == "" then null else $collected_identity end),
@@ -5760,6 +6241,25 @@ _act_result_artifact_receipts() {
             seen_paths["$path"]=1
             artifact_paths+=("$path")
         done < <(printf '%s\n' "$legacy_paths" | tr ',' '\n')
+    fi
+
+    local additional_count
+    additional_count=$(jq -er '
+        (.additional_artifacts // []) |
+        if type == "array" then length
+        else error("additional_artifacts must be an array") end
+    ' <<< "$result_json" 2>/dev/null) || return 4
+    while IFS= read -r -d '' path; do
+        [[ -n "$path" && -z "${seen_paths[$path]:-}" ]] || continue
+        seen_paths["$path"]=1
+        artifact_paths+=("$path")
+    done < <(jq -j '
+        (.additional_artifacts // [])[]? | .path |
+        select(type == "string" and length > 0) | ., "\u0000"
+    ' <<< "$result_json" 2>/dev/null)
+    if [[ "$additional_count" -gt 0 && \
+          ${#artifact_paths[@]} -lt "$additional_count" ]]; then
+        return 4
     fi
 
     artifact_dir=$(jq -r '.artifact_dir // empty' <<< "$result_json" 2>/dev/null)
@@ -6752,12 +7252,19 @@ _act_generate_contract_manifest() {
         return 4
     fi
 
-    local expected_count
+    local expected_count base_additional_json base_additional_count manifest_artifact_count
     expected_count=$(jq -r '.exact_primary_assets | length' <<< "$contract_json")
     if [[ ! "$expected_count" =~ ^[1-9][0-9]*$ ]]; then
         _log_error "Release contract has no primary assets"
         return 4
     fi
+    base_additional_json=$(jq -c '
+        [(.exact_additional_assets // [])[] |
+         select((endswith(".sha256") or endswith(".minisig") or
+                 startswith("SHA256SUMS")) | not)] | sort
+    ' <<< "$contract_json") || return 4
+    base_additional_count=$(jq -r 'length' <<< "$base_additional_json") || return 4
+    manifest_artifact_count=$((expected_count + base_additional_count))
 
     if ! jq -e --argjson contract "$contract_json" '
         ($contract.exact_primary_assets | keys) as $expected_targets |
@@ -6943,7 +7450,67 @@ _act_generate_contract_manifest() {
         artifacts+=("$artifact_json")
     done < <(jq -r '.exact_primary_assets | keys[]' <<< "$contract_json")
 
-    if [[ ${#artifacts[@]} -ne $expected_count ]]; then
+    local additional_name additional_matches additional_receipt additional_path
+    local additional_sha additional_size additional_identity_before additional_identity_after
+    local additional_format additional_json
+    while IFS= read -r additional_name; do
+        [[ -n "$additional_name" ]] || continue
+        _act_is_safe_basename "$additional_name" || return 4
+        additional_matches=$(jq -c --arg name "$additional_name" '
+            [.targets[].additional_artifacts[]? |
+             select((.path | type) == "string" and
+                    (.path | split("/") | last) == $name)]
+        ' <<< "$result_json") || return 4
+        if [[ "$(jq -r 'length' <<< "$additional_matches")" -ne 1 ]]; then
+            _log_error "Strict manifest requires one collected additional artifact: $additional_name"
+            return 4
+        fi
+        additional_receipt=$(jq -c '.[0]' <<< "$additional_matches") || return 4
+        if ! jq -e '
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            (.size_bytes | type == "number" and . > 0 and floor == .) and
+            (.identity | type == "string" and
+             test("^(gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)$"))
+        ' <<< "$additional_receipt" >/dev/null 2>&1; then
+            return 4
+        fi
+        additional_path=$(jq -r '.path' <<< "$additional_receipt") || return 4
+        [[ -f "$additional_path" && ! -L "$additional_path" &&
+           "$(basename "$additional_path")" == "$additional_name" ]] || return 4
+        additional_sha=$(jq -r '.sha256' <<< "$additional_receipt") || return 4
+        additional_size=$(jq -r '.size_bytes' <<< "$additional_receipt") || return 4
+        additional_identity_before=$(_act_file_identity "$additional_path") || return 4
+        [[ "$additional_identity_before" == \
+           "$(jq -r '.identity' <<< "$additional_receipt")" ]] || return 4
+        [[ "$(_act_sha256 "$additional_path")" == "$additional_sha" &&
+           "$(_act_file_size "$additional_path")" == "$additional_size" ]] || return 4
+        if [[ "$additional_name" == FrankenTerm-*.app.tar.xz ]] && \
+           ! _act_validate_macos_app_archive \
+                "$additional_path" "$git_sha" "$version"; then
+            _log_error "macOS app archive is not bound to its detached component manifest: $additional_name"
+            return 4
+        fi
+        additional_identity_after=$(_act_file_identity "$additional_path") || return 4
+        [[ "$additional_identity_after" == "$additional_identity_before" ]] || return 4
+        additional_format=$(_act_archive_format "$additional_name")
+        [[ "$additional_format" != "none" ]] || additional_format="binary"
+        additional_json=$(jq -nc \
+            --arg name "$additional_name" --arg sha "$additional_sha" \
+            --argjson size "$additional_size" --arg format "$additional_format" '
+            {
+                name: $name,
+                target: "additional",
+                sha256: $sha,
+                size_bytes: $size,
+                archive_format: $format,
+                signed: false,
+                signature_file: ""
+            }
+        ') || return 4
+        artifacts+=("$additional_json")
+    done < <(jq -r '.[]' <<< "$base_additional_json")
+
+    if [[ ${#artifacts[@]} -ne $manifest_artifact_count ]]; then
         _log_error "Manifest artifact count does not match release contract"
         return 4
     fi
@@ -6992,10 +7559,17 @@ _act_generate_contract_manifest() {
         return 4
     fi
 
-    if ! jq -e --argjson contract "$contract_json" '
-        (.artifacts | length) == ($contract.exact_primary_assets | length) and
-        all(.artifacts[]; $contract.exact_primary_assets[.target] == .name) and
-        ([.artifacts[].target] | length) == ([.artifacts[].target] | unique | length)
+    if ! jq -e --argjson contract "$contract_json" \
+        --argjson base_additional "$base_additional_json" '
+        (.artifacts | length) ==
+            (($contract.exact_primary_assets | length) + ($base_additional | length)) and
+        ([.artifacts[] | select(.target != "additional") |
+          {key: .target, value: .name}] | from_entries) ==
+            $contract.exact_primary_assets and
+        ([.artifacts[] | select(.target == "additional") | .name] | sort) ==
+            $base_additional and
+        ([.artifacts[].name] | length) ==
+            ([.artifacts[].name] | unique | length)
     ' <<< "$manifest" >/dev/null 2>&1; then
         _log_error "Final manifest does not match the release contract"
         return 4

@@ -186,6 +186,23 @@ release_contract:
     linux/amd64: focrworkspace-1.0.0-linux_amd64.tar.gz
 EOF
 
+cat > "$ACT_REPOS_DIR/focrextra.yaml" << EOF
+tool_name: focrextra
+repo: Test/focrextra
+local_path: $TEMP_DIR/source-repo
+language: rust
+binary_name: focr
+build_cmd: cargo build --release
+targets:
+  - linux/amd64
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: focrextra-linux-amd64.tar.gz
+  exact_additional_assets:
+    - supplemental.tar.xz
+EOF
+
 echo "== act_get_build_cmd =="
 
 # Test get_build_cmd
@@ -1096,7 +1113,7 @@ write_minimal_target_binary "$workspace_bundle_dir/focr" "linux/amd64"
 write_minimal_target_binary "$workspace_bundle_dir/fw" "linux/amd64"
 printf 'workspace readme\n' > "$workspace_bundle_dir/README.md"
 printf 'workspace notice\n' > "$workspace_bundle_dir/docs/NOTICE.txt"
-tar -czf "$workspace_archive_source" -C "$workspace_bundle_dir" \
+COPYFILE_DISABLE=1 tar --no-xattrs -czf "$workspace_archive_source" -C "$workspace_bundle_dir" \
     focr fw README.md docs/NOTICE.txt
 workspace_archive_result=$(with_collection_receipt \
     "$(jq -nc --arg path "$workspace_archive_source" '{
@@ -1121,7 +1138,7 @@ fi
 workspace_extra_archive="$TEMP_DIR/prepackaged-workspace-extra/focrworkspace-1.0.0-linux_amd64.tar.gz"
 mkdir -p "$(dirname "$workspace_extra_archive")"
 printf 'unexpected\n' > "$workspace_bundle_dir/extra.txt"
-tar -czf "$workspace_extra_archive" -C "$workspace_bundle_dir" \
+COPYFILE_DISABLE=1 tar --no-xattrs -czf "$workspace_extra_archive" -C "$workspace_bundle_dir" \
     focr fw README.md docs/NOTICE.txt extra.txt
 workspace_extra_result=$(with_collection_receipt \
     "$(jq -nc --arg path "$workspace_extra_archive" '{
@@ -1183,7 +1200,8 @@ else
     fail "strict archive validation accepted a non-executable Unix member"
 fi
 
-tar -cJf "$TEMP_DIR/valid.tar.xz" -C "$(dirname "$archive_linux_source")" focr
+COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$TEMP_DIR/valid.tar.xz" \
+    -C "$(dirname "$archive_linux_source")" focr
 if _act_validate_target_archive \
     "$TEMP_DIR/valid.tar.xz" "tar.xz" "focr" "linux/amd64" 2>/dev/null; then
     pass "strict archive validation accepts a valid one-file tar.xz"
@@ -1316,6 +1334,85 @@ if jq -e --arg sha "$(_act_sha256 "$workspace_archive_source")" '
     pass "strict manifest accepts a validated prepackaged multi-binary workspace archive"
 else
     fail "strict manifest rejected the validated workspace archive: $workspace_manifest"
+fi
+
+extra_primary_result=$(_act_stage_contract_primary \
+    "focrextra" "v1.0.0" "550e8400-e29b-41d4-a716-446655440044" \
+    "linux/amd64" "$archive_linux_result" \
+    "$(config_get_release_contract_json focrextra)")
+extra_payload_dir="$TEMP_DIR/additional-payload"
+extra_payload="$TEMP_DIR/supplemental.tar.xz"
+mkdir -p "$extra_payload_dir"
+printf 'manifest-bound additional bytes\n' > "$extra_payload_dir/proof.txt"
+tar -cJf "$extra_payload" -C "$extra_payload_dir" proof.txt
+extra_receipt=$(jq -nc --arg path "$extra_payload" \
+    --arg sha256 "$(_act_sha256 "$extra_payload")" \
+    --argjson size_bytes "$(_act_file_size "$extra_payload")" \
+    --arg identity "$(_act_file_identity "$extra_payload")" \
+    '{path: $path, sha256: $sha256, size_bytes: $size_bytes, identity: $identity}')
+extra_primary_result=$(jq -c --argjson receipt "$extra_receipt" \
+    '.additional_artifacts = [$receipt]' <<< "$extra_primary_result")
+extra_manifest_input=$(jq -nc \
+    --arg sha "$contract_sha" --arg ref "$contract_ref" \
+    --argjson target "$extra_primary_result" '
+    {
+        tool: "focrextra",
+        version: "v1.0.0",
+        run_id: "550e8400-e29b-41d4-a716-446655440044",
+        git_sha: $sha,
+        git_ref: $ref,
+        source_dependencies: [],
+        status: "success",
+        summary: {total: 1, success: 1, failed: 0},
+        targets: [$target]
+    }
+')
+extra_manifest=$(
+    (
+        ACT_REPO_LOCAL_PATH="$TEMP_DIR/source-repo"
+        git() {
+            case "$*" in
+                *"rev-parse --verify HEAD^{commit}"*|*"rev-parse --verify refs/tags/v1.0.0^{commit}"*)
+                    printf '%s\n' "$contract_sha"
+                    ;;
+                *"status --porcelain --untracked-files=all"*) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        act_generate_manifest "$extra_manifest_input" ""
+    ) 2>/dev/null
+)
+if jq -e --arg extra_sha "$(_act_sha256 "$extra_payload")" '
+    (.artifacts | length) == 2 and
+    any(.artifacts[];
+        .target == "additional" and .name == "supplemental.tar.xz" and
+        .sha256 == $extra_sha and .archive_format == "tar.xz")
+' <<< "$extra_manifest" >/dev/null; then
+    pass "strict manifest binds the configured additional artifact bytes"
+else
+    fail "strict manifest omitted or rejected its additional artifact: $extra_manifest"
+fi
+
+missing_extra_status=0
+missing_extra_input=$(jq -c '.targets[0].additional_artifacts = []' \
+    <<< "$extra_manifest_input")
+(
+    ACT_REPO_LOCAL_PATH="$TEMP_DIR/source-repo"
+    git() {
+        case "$*" in
+            *"rev-parse --verify HEAD^{commit}"*|*"rev-parse --verify refs/tags/v1.0.0^{commit}"*)
+                printf '%s\n' "$contract_sha"
+                ;;
+            *"status --porcelain --untracked-files=all"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    act_generate_manifest "$missing_extra_input" ""
+) >/dev/null 2>&1 || missing_extra_status=$?
+if [[ "$missing_extra_status" -eq 4 ]]; then
+    pass "strict manifest fails closed when a base additional artifact is missing"
+else
+    fail "strict manifest accepted a missing base additional artifact"
 fi
 
 changing_source="$TEMP_DIR/changing-source/focr"
@@ -2769,7 +2866,11 @@ else
 fi
 
 # Cleanup
-rm -rf "$TEMP_DIR"
+if [[ "${DSR_TEST_KEEP_TMP:-0}" == "1" ]]; then
+    echo "Retained test fixture: $TEMP_DIR" >&2
+else
+    rm -rf "$TEMP_DIR"
+fi
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
