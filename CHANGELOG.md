@@ -27,7 +27,10 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
   code. Both work under cmd.exe and PowerShell login shells. Note: a
   PowerShell 5.1 login shell reports any non-zero remote exit as 1 over
   OpenSSH; dsr's Windows paths rely on zero/non-zero only. Test mocks decode
-  encoded commands before asserting on them.
+  encoded commands before asserting on them. rsync to Windows receivers now
+  uses `--blocking-io` on a dedicated (non-ControlMaster) ssh transport:
+  over a multiplexed channel the Windows rsync failed intermittently with
+  "safe_write ... Resource temporarily unavailable (11)" (exit 12).
 
 - Post-build archive packaging never wraps an existing archive inside
   another archive. When the build already produced an archive for a target

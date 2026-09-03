@@ -3098,15 +3098,24 @@ _act_sync_source() {
         fi
 
         local rsync_remote_path="$remote_path"
+        local -a rsync_io_opts=()
+        local rsync_transport="ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new"
         if _act_is_windows_host "$host"; then
             rsync_remote_path=$(_act_windows_rsync_path "$remote_path")
+            # Windows OpenSSH plus rsync's non-blocking socket writes fail with
+            # "safe_write ... Resource temporarily unavailable (11)" (exit 12)
+            # when the transport is a multiplexed ControlMaster channel. Use
+            # blocking I/O on a dedicated connection for Windows receivers.
+            rsync_io_opts=(--blocking-io)
+            rsync_transport+=" -o ControlMaster=no -o ControlPath=none"
         fi
 
         # Use rsync for efficient sync
         local sync_cmd_output sync_cmd_status
         sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+            "${rsync_io_opts[@]}" \
             "${exclude_args[@]}" \
-            -e "ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new" \
+            -e "$rsync_transport" \
             "$local_path/" "$ssh_destination:$rsync_remote_path/" 2>&1)
         sync_cmd_status=$?
         if [[ "$sync_cmd_status" -eq 0 ]]; then
