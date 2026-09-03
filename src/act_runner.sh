@@ -2868,7 +2868,8 @@ _act_windows_encoded_powershell() {
         _log_error "iconv and base64 are required to encode a Windows PowerShell command"
         return 3
     fi
-    encoded=$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
+    # Progress records would otherwise reach stderr as CLIXML noise over ssh.
+    encoded=$(printf '%s' "\$ProgressPreference='SilentlyContinue'; $script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
     printf 'powershell -NoProfile -NonInteractive -EncodedCommand %s' "$encoded"
 }
 

@@ -67,6 +67,7 @@ _test_decode_remote_command() {
         encoded="${command##*-EncodedCommand }"
         encoded="${encoded%% *}"
         decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null)
+        decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
         # A cmd.exe line wrapped by _act_windows_cmd_via_powershell: unwrap it
         # so assertions see the cmd line the host would run.
         if [[ "$decoded" == "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"* ]]; then
