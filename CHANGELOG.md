@@ -30,7 +30,9 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
   encoded commands before asserting on them. rsync to Windows receivers now
   uses `--blocking-io` on a dedicated (non-ControlMaster) ssh transport:
   over a multiplexed channel the Windows rsync failed intermittently with
-  "safe_write ... Resource temporarily unavailable (11)" (exit 12).
+  "safe_write ... Resource temporarily unavailable (11)" (exit 12); a
+  Windows receiver that still drops the stream is retried up to three times
+  (rsync is idempotent).
 
 - Post-build archive packaging never wraps an existing archive inside
   another archive. When the build already produced an archive for a target

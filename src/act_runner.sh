@@ -3110,14 +3110,28 @@ _act_sync_source() {
             rsync_transport+=" -o ControlMaster=no -o ControlPath=none"
         fi
 
-        # Use rsync for efficient sync
+        # Use rsync for efficient sync. Windows receivers still drop the
+        # stream intermittently (exit 12, EAGAIN in the Windows rsync port),
+        # typically when another ssh session to the host is active; rsync is
+        # idempotent, so retry a bounded number of times before giving up.
         local sync_cmd_output sync_cmd_status
-        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
-            "${rsync_io_opts[@]}" \
-            "${exclude_args[@]}" \
-            -e "$rsync_transport" \
-            "$local_path/" "$ssh_destination:$rsync_remote_path/" 2>&1)
-        sync_cmd_status=$?
+        local sync_attempt sync_attempts=1
+        if _act_is_windows_host "$host"; then
+            sync_attempts=3
+        fi
+        for (( sync_attempt = 1; sync_attempt <= sync_attempts; sync_attempt++ )); do
+            sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+                "${rsync_io_opts[@]}" \
+                "${exclude_args[@]}" \
+                -e "$rsync_transport" \
+                "$local_path/" "$ssh_destination:$rsync_remote_path/" 2>&1)
+            sync_cmd_status=$?
+            if [[ "$sync_cmd_status" -ne 12 || "$sync_attempt" -ge "$sync_attempts" ]]; then
+                break
+            fi
+            _log_warn "rsync to $host dropped the stream (exit 12); retrying ($sync_attempt/$sync_attempts)"
+            sleep 3
+        done
         if [[ "$sync_cmd_status" -eq 0 ]]; then
             local duration=$(($(date +%s) - start_time))
             _log_ok "Sync completed in ${duration}s (rsync)"
