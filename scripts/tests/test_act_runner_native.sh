@@ -57,6 +57,29 @@ echo "0" > "$RSYNC_EXIT_CODE_FILE"
 # Source the module under test
 source "$SRC_DIR/act_runner.sh"
 
+# Decode a `-EncodedCommand` payload back to the PowerShell text so mocks can
+# assert on the script the host would actually run (mirrors the helper in
+# test_act_orchestration.sh). A cmd.exe line wrapped by
+# _act_windows_cmd_via_powershell is unwrapped to the cmd line itself.
+_test_decode_remote_command() {
+    local command="$1" encoded decoded inner
+    if [[ "$command" == *"-EncodedCommand "* ]]; then
+        encoded="${command##*-EncodedCommand }"
+        encoded="${encoded%% *}"
+        decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null)
+        decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
+        if [[ "$decoded" == "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"* ]]; then
+            inner="${decoded#*FromBase64String(\'}"
+            inner="${inner%%\'*}"
+            printf '%s' "$inner" | base64 -d 2>/dev/null
+            return 0
+        fi
+        printf '%s' "$decoded"
+        return 0
+    fi
+    printf '%s' "$command"
+}
+
 # ============================================================================
 # Mock Functions (override after sourcing act_runner.sh)
 # ============================================================================
@@ -77,7 +100,8 @@ _act_run_with_timeout() {
 # Mock _act_ssh_exec - captures args to file
 _act_ssh_exec() {
     local host="$1"
-    local cmd="$2"
+    local cmd
+    cmd=$(_test_decode_remote_command "$2")
     # Append for subshell-safe capture: a build now issues follow-up exec
     # calls (stage-root cleanup) and the build command must stay recorded.
     printf '%s\n' "HOST:$host" "CMD:$cmd" >> "$SSH_ARGS_FILE"
@@ -138,7 +162,12 @@ scp() {
 }
 
 ssh() {
-    printf '%s\n' "$@" > "$RAW_SSH_ARGS_FILE"
+    local -a ssh_args=()
+    local ssh_arg
+    for ssh_arg in "$@"; do
+        ssh_args+=("$(_test_decode_remote_command "$ssh_arg")")
+    done
+    printf '%s\n' "${ssh_args[@]}" > "$RAW_SSH_ARGS_FILE"
     local exit_code
     exit_code=$(cat "$RAW_SSH_EXIT_CODE_FILE")
     if [[ "$exit_code" -eq 0 && -n "${MOCK_SSH_STREAM_FILE:-}" ]]; then
@@ -852,8 +881,9 @@ test_windows_strict_validation_failure_stops_build() {
     local status=0
     (
         _act_ssh_exec() {
-            local command_text="$2"
-            if [[ "$command_text" == powershell* && \
+            local command_text
+            command_text=$(_test_decode_remote_command "$2")
+            if [[ "$2" == powershell* && \
                   "$command_text" == *"throw 'Strict CARGO_HOME"* && \
                   "$command_text" == *'$process=[Diagnostics.Process]::Start'* ]]; then
                 return 1
@@ -1952,7 +1982,7 @@ test_windows_strict_cargo_metadata_command() {
     (
         _act_is_windows_host() { return 0; }
         _act_ssh_exec() {
-            printf '%s\n' "$2" > "$command_file"
+            printf '%s\n' "$(_test_decode_remote_command "$2")" > "$command_file"
             printf '%s\n' 'C:\build\source'
             printf '%s\n' '{"workspace_root":"C:\\\\build\\\\source","packages":[{"manifest_path":"C:\\\\build\\\\source\\\\Cargo.toml","source":null}]}'
         }

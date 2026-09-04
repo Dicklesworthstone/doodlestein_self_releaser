@@ -33,6 +33,9 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
   "safe_write ... Resource temporarily unavailable (11)" (exit 12); a
   Windows receiver that still drops the stream is retried up to three times
   (rsync is idempotent).
+- Test mocks in `test_act_runner_native.sh` and `test_act_orchestration.sh`
+  decode `-EncodedCommand` payloads so assertions see the script the host
+  would run.
 
 - Post-build archive packaging never wraps an existing archive inside
   another archive. When the build already produced an archive for a target
