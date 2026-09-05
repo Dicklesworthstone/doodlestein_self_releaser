@@ -474,25 +474,35 @@ test_canary_uses_configured_binary_and_installer_arguments() {
 tool_name: frankenterm
 binary_name: ft
 canary_installer_args: []
+canary_packages:
+  - python3
+  - minisign
 YAML
 
-    local binary_name installer_args default_args installer_args_status=0
+    local binary_name installer_args default_args packages install_cmd
+    local installer_args_status=0
     binary_name=$(DSR_CONFIG_DIR="$config_dir" _canary_get_binary_name frankenterm)
     installer_args=$(DSR_CONFIG_DIR="$config_dir" \
         _canary_get_installer_args frankenterm safe) || installer_args_status=$?
     default_args=$(DSR_CONFIG_DIR="$config_dir" \
         _canary_get_installer_args unconfigured vibe)
+    packages=$(DSR_CONFIG_DIR="$config_dir" _canary_get_packages frankenterm)
+    install_cmd=$(_canary_get_install_cmd ubuntu:24.04 python3 minisign)
 
     if [[ "$binary_name" == "ft" ]] && [[ "$installer_args_status" -eq 0 ]] && \
        [[ -z "$installer_args" ]] && \
-       [[ "$default_args" == $'--mode\nvibe\n--non-interactive' ]]; then
-        pass "canary honors configured binary name and exact installer argv"
+       [[ "$default_args" == $'--mode\nvibe\n--non-interactive' ]] && \
+       [[ "$packages" == $'python3\nminisign' ]] && \
+       [[ "$install_cmd" == *"python3 minisign"* ]]; then
+        pass "canary honors configured binary, installer argv, and prerequisites"
     else
         fail "canary should distinguish the repository key, binary, and installer argv"
         echo "binary: $binary_name"
         echo "configured args status: $installer_args_status"
         printf 'configured args: %q\n' "$installer_args"
         printf 'default args: %q\n' "$default_args"
+        printf 'packages: %q\n' "$packages"
+        printf 'install command: %q\n' "$install_cmd"
     fi
 
     cat > "$config_dir/repos.d/invalid.yaml" <<'YAML'
@@ -500,12 +510,19 @@ tool_name: invalid
 binary_name: invalid
 canary_installer_args:
   - ""
+canary_packages:
+  - 'python3;touch-pwned'
 YAML
     if DSR_CONFIG_DIR="$config_dir" _canary_get_installer_args invalid safe \
         >/dev/null 2>&1; then
         fail "canary accepted an empty configured installer argument"
     else
         pass "canary rejects malformed configured installer argv"
+    fi
+    if DSR_CONFIG_DIR="$config_dir" _canary_get_packages invalid >/dev/null 2>&1; then
+        fail "canary accepted an unsafe prerequisite package"
+    else
+        pass "canary rejects unsafe prerequisite package tokens"
     fi
 
     harness_teardown

@@ -97,16 +97,26 @@ canary_check_docker() {
 # Get the package manager install command for a given image
 _canary_get_install_cmd() {
     local image="$1"
+    shift
+    local packages="curl ca-certificates"
+    local package
+    for package in "$@"; do
+        if [[ ! "$package" =~ ^[A-Za-z0-9.+_-]+$ ]]; then
+            log_error "Invalid canary prerequisite package: $package"
+            return 4
+        fi
+        packages+=" $package"
+    done
 
     case "$image" in
         ubuntu*|debian*)
-            echo "apt-get update -qq && apt-get install -y -qq curl ca-certificates"
+            echo "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $packages"
             ;;
         fedora*|centos*|rhel*)
-            echo "dnf install -y -q curl ca-certificates"
+            echo "dnf install -y -q $packages"
             ;;
         alpine*)
-            echo "apk add --no-cache curl ca-certificates bash"
+            echo "apk add --no-cache bash $packages"
             ;;
         *)
             echo "echo 'Unknown package manager for $image' >&2; exit 1"
@@ -186,6 +196,43 @@ _canary_get_installer_args() {
     printf '%s\n' --mode "$mode" --non-interactive
 }
 
+# Emit package-manager names that the owned installer deliberately treats as
+# prerequisites rather than bootstrapping itself.  The same conservative token
+# grammar is valid for apt, dnf, and apk package names and prevents this config
+# from becoming shell source inside the generated container script.
+_canary_get_packages() {
+    local tool="$1"
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local config_file="$config_dir/repos.d/$tool.yaml"
+
+    [[ -f "$config_file" ]] || return 0
+    if ! command -v yq &>/dev/null || ! command -v jq &>/dev/null; then
+        log_error "yq and jq are required to read canary_packages"
+        return 3
+    fi
+    if ! yq -e 'has("canary_packages")' "$config_file" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local packages_json
+    if ! packages_json=$(yq -o=json -I=0 '.canary_packages' \
+            "$config_file" 2>/dev/null); then
+        log_error "Invalid canary_packages configuration for $tool"
+        return 4
+    fi
+    if ! jq -e '
+            if type == "array" and
+               all(.[]; type == "string" and test("^[A-Za-z0-9.+_-]+$"))
+            then true
+            else error("canary_packages must be an array of safe package names")
+            end
+        ' <<< "$packages_json" >/dev/null; then
+        log_error "Invalid canary_packages configuration for $tool"
+        return 4
+    fi
+    jq -r '.[]' <<< "$packages_json"
+}
+
 # ============================================================================
 # Test Execution
 # ============================================================================
@@ -224,6 +271,12 @@ canary_run_test() {
     for installer_arg in "${installer_args[@]}"; do
         installer_args_shell+=" $(_canary_shell_escape "$installer_arg")"
     done
+    local canary_packages_output
+    canary_packages_output=$(_canary_get_packages "$tool") || return $?
+    local -a canary_packages=()
+    if [[ -n "$canary_packages_output" ]]; then
+        mapfile -t canary_packages <<< "$canary_packages_output"
+    fi
 
     local installer_path
     local installer_url
@@ -251,7 +304,7 @@ canary_run_test() {
 
     # Create test script
     local install_deps
-    install_deps=$(_canary_get_install_cmd "$image")
+    install_deps=$(_canary_get_install_cmd "$image" "${canary_packages[@]}") || return $?
     local shell
     shell=$(_canary_get_shell "$image")
 

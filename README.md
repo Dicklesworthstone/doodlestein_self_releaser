@@ -338,6 +338,7 @@ the executable to probe. Generated DSR installers receive `--mode <mode>
 tool_name: frankenterm
 binary_name: ft
 canary_installer_args: []
+canary_packages: [python3, minisign]
 ```
 
 Installer failure, a missing configured executable, or a failed probe makes the
