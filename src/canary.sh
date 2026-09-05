@@ -168,15 +168,19 @@ _canary_get_installer_args() {
             log_error "Invalid canary_installer_args configuration for $tool"
             return 4
         fi
-        jq -er '
+        if ! jq -e '
                 if type == "array" and
                    all(.[]; type == "string" and length > 0 and
                             (contains("\n") | not) and (contains("\r") | not))
-                then .[]
+                then true
                 else error("canary_installer_args must be an array of non-empty single-line strings")
                 end
-            ' <<< "$args_json"
-        return $?
+            ' <<< "$args_json" >/dev/null; then
+            log_error "Invalid canary_installer_args configuration for $tool"
+            return 4
+        fi
+        jq -r '.[]' <<< "$args_json"
+        return 0
     fi
 
     printf '%s\n' --mode "$mode" --non-interactive

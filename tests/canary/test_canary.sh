@@ -476,19 +476,21 @@ binary_name: ft
 canary_installer_args: []
 YAML
 
-    local binary_name installer_args default_args
+    local binary_name installer_args default_args installer_args_status=0
     binary_name=$(DSR_CONFIG_DIR="$config_dir" _canary_get_binary_name frankenterm)
     installer_args=$(DSR_CONFIG_DIR="$config_dir" \
-        _canary_get_installer_args frankenterm safe)
+        _canary_get_installer_args frankenterm safe) || installer_args_status=$?
     default_args=$(DSR_CONFIG_DIR="$config_dir" \
         _canary_get_installer_args unconfigured vibe)
 
-    if [[ "$binary_name" == "ft" ]] && [[ -z "$installer_args" ]] && \
+    if [[ "$binary_name" == "ft" ]] && [[ "$installer_args_status" -eq 0 ]] && \
+       [[ -z "$installer_args" ]] && \
        [[ "$default_args" == $'--mode\nvibe\n--non-interactive' ]]; then
         pass "canary honors configured binary name and exact installer argv"
     else
         fail "canary should distinguish the repository key, binary, and installer argv"
         echo "binary: $binary_name"
+        echo "configured args status: $installer_args_status"
         printf 'configured args: %q\n' "$installer_args"
         printf 'default args: %q\n' "$default_args"
     fi
