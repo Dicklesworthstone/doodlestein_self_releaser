@@ -128,6 +128,60 @@ _canary_get_shell() {
     esac
 }
 
+# Resolve the executable name independently from the repository/tool key.  A
+# number of repositories intentionally ship a shorter binary name (for
+# example, frankenterm ships `ft`).
+_canary_get_binary_name() {
+    local tool="$1"
+    local binary_name=""
+
+    if declare -F config_get_tool_field &>/dev/null; then
+        binary_name=$(config_get_tool_field "$tool" "binary_name" "" 2>/dev/null || echo "")
+    fi
+    [[ -n "$binary_name" ]] || binary_name="$tool"
+    if [[ ! "$binary_name" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+        log_error "Invalid canary binary_name for $tool"
+        return 4
+    fi
+    printf '%s\n' "$binary_name"
+}
+
+# Emit one installer argument per line.  Generated DSR installers use the
+# historical mode flags by default; repositories with an owned installer can
+# declare `canary_installer_args` in repos.d/<tool>.yaml, including an empty
+# array when the installer needs no arguments.
+_canary_get_installer_args() {
+    local tool="$1"
+    local mode="$2"
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local config_file="$config_dir/repos.d/$tool.yaml"
+
+    if [[ -f "$config_file" ]] && command -v yq &>/dev/null && \
+       yq -e 'has("canary_installer_args")' "$config_file" >/dev/null 2>&1; then
+        if ! command -v jq &>/dev/null; then
+            log_error "jq is required to read canary_installer_args"
+            return 3
+        fi
+        local args_json
+        if ! args_json=$(yq -o=json -I=0 '.canary_installer_args' \
+                "$config_file" 2>/dev/null); then
+            log_error "Invalid canary_installer_args configuration for $tool"
+            return 4
+        fi
+        jq -er '
+                if type == "array" and
+                   all(.[]; type == "string" and length > 0 and
+                            (contains("\n") | not) and (contains("\r") | not))
+                then .[]
+                else error("canary_installer_args must be an array of non-empty single-line strings")
+                end
+            ' <<< "$args_json"
+        return $?
+    fi
+
+    printf '%s\n' --mode "$mode" --non-interactive
+}
+
 # ============================================================================
 # Test Execution
 # ============================================================================
@@ -140,6 +194,32 @@ canary_run_test() {
     local image="$2"
     local mode="${3:-vibe}"
     local verbose="${4:-false}"
+
+    if [[ ! "$tool" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        log_error "Invalid canary tool name: $tool"
+        return 4
+    fi
+    case "$mode" in
+        vibe|safe) ;;
+        *)
+            log_error "Invalid canary mode: $mode"
+            return 4
+            ;;
+    esac
+
+    local binary_name
+    binary_name=$(_canary_get_binary_name "$tool") || return $?
+    local installer_args_output
+    installer_args_output=$(_canary_get_installer_args "$tool" "$mode") || return $?
+    local -a installer_args=()
+    if [[ -n "$installer_args_output" ]]; then
+        mapfile -t installer_args <<< "$installer_args_output"
+    fi
+    local installer_args_shell=""
+    local installer_arg
+    for installer_arg in "${installer_args[@]}"; do
+        installer_args_shell+=" $(_canary_shell_escape "$installer_arg")"
+    done
 
     local installer_path
     local installer_url
@@ -201,41 +281,57 @@ fi
 echo "Installing $tool..."
 if [ -f "/install.sh" ]; then
     # Local installer
-    $shell /install.sh --mode $mode --non-interactive 2>&1 || true
+    if ! $shell /install.sh$installer_args_shell 2>&1; then
+        echo "Installer failed" >&2
+        exit 1
+    fi
 else
     # Remote installer
-    curl -sSL "$installer_source" | $shell -s -- --mode $mode --non-interactive 2>&1 || true
+    if ! curl -A "OpenAI File Downloader, XaiImageApiFetch/1.0" -fsSL "$installer_source" |
+        $shell -s --$installer_args_shell 2>&1; then
+        echo "Installer failed" >&2
+        exit 1
+    fi
 fi
+
+export PATH="\$HOME/.local/bin:/usr/local/bin:/usr/bin:\$PATH"
 
 # Verify installation
 echo ""
 echo "=== Verification ==="
 
 # Check if binary is in PATH
-if command -v $tool &>/dev/null; then
-    echo "✓ $tool found in PATH"
+binary_name=$(_canary_shell_escape "$binary_name")
+if command -v "\$binary_name" >/dev/null 2>&1; then
+    echo "✓ \$binary_name found in PATH"
 
     # Try --version
-    if $tool --version 2>&1; then
-        echo "✓ $tool --version works"
+    if "\$binary_name" --version 2>&1; then
+        echo "✓ \$binary_name --version works"
     else
-        echo "! $tool --version failed (exit: \$?)"
+        status=\$?
+        echo "✗ \$binary_name --version failed (exit: \$status)" >&2
+        exit 1
     fi
 
     # Try --help
-    if $tool --help 2>&1 | head -5; then
-        echo "✓ $tool --help works"
+    if "\$binary_name" --help >/tmp/dsr-canary-help.txt 2>&1; then
+        head -5 /tmp/dsr-canary-help.txt
+        echo "✓ \$binary_name --help works"
     else
-        echo "! $tool --help failed (exit: \$?)"
+        status=\$?
+        head -5 /tmp/dsr-canary-help.txt
+        echo "✗ \$binary_name --help failed (exit: \$status)" >&2
+        exit 1
     fi
 else
-    echo "✗ $tool NOT found in PATH"
+    echo "✗ \$binary_name NOT found in PATH"
     echo "PATH: \$PATH"
 
     # Check common install locations
     for dir in /usr/local/bin /usr/bin ~/.local/bin; do
-        if [ -f "\$dir/$tool" ]; then
-            echo "Found at: \$dir/$tool"
+        if [ -f "\$dir/\$binary_name" ]; then
+            echo "Found at: \$dir/\$binary_name"
         fi
     done
 

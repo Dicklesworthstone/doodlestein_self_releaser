@@ -320,6 +320,29 @@ dsr release --repo ntm --version v1.2.3 --draft # Create draft release
 dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
 ```
 
+### `dsr canary`
+
+Run a repository's installer in a clean Linux container, then require its
+installed executable's `--version` and `--help` probes to succeed:
+
+```bash
+dsr canary run ntm --os ubuntu:24.04 --mode safe
+```
+
+The repository key and installed executable may differ. `binary_name` selects
+the executable to probe. Generated DSR installers receive `--mode <mode>
+--non-interactive` by default; an owned installer can declare its exact argv in
+`repos.d/<tool>.yaml` (including an empty array):
+
+```yaml
+tool_name: frankenterm
+binary_name: ft
+canary_installer_args: []
+```
+
+Installer failure, a missing configured executable, or a failed probe makes the
+canary fail; none of those conditions are informational successes.
+
 ### `dsr fallback`
 
 Full pipeline: check → build → release.

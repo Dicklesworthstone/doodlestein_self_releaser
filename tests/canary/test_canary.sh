@@ -164,10 +164,16 @@ test_canary_detects_no_docker() {
     ((TESTS_RUN++))
     harness_setup
 
-    # Create a fake PATH without docker
+    # Shadow any host Docker while retaining the ordinary utilities needed by
+    # the test harness and dsr's Bash-version guard.
     mkdir -p "$TEST_TMPDIR/bin"
+    cat > "$TEST_TMPDIR/bin/docker" <<'SH'
+#!/bin/sh
+exit 1
+SH
+    chmod +x "$TEST_TMPDIR/bin/docker"
 
-    PATH="$TEST_TMPDIR/bin" exec_run "$DSR_CMD" canary run ntm
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" canary run ntm
     local status
     status=$(exec_status)
 
@@ -185,10 +191,15 @@ test_canary_json_no_docker() {
     ((TESTS_RUN++))
     harness_setup
 
-    # Create a fake PATH without docker
+    # Shadow any host Docker without hiding jq/date/bash from the harness.
     mkdir -p "$TEST_TMPDIR/bin"
+    cat > "$TEST_TMPDIR/bin/docker" <<'SH'
+#!/bin/sh
+exit 1
+SH
+    chmod +x "$TEST_TMPDIR/bin/docker"
 
-    PATH="$TEST_TMPDIR/bin" exec_run "$DSR_CMD" --json canary run ntm
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json canary run ntm
     local output
     output=$(exec_stdout)
 
@@ -449,6 +460,71 @@ test_canary_get_shell() {
     fi
 }
 
+test_canary_uses_configured_binary_and_installer_arguments() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    source "$PROJECT_ROOT/src/logging.sh"
+    source "$PROJECT_ROOT/src/config.sh"
+    source "$PROJECT_ROOT/src/canary.sh"
+
+    local config_dir="$TEST_TMPDIR/config"
+    mkdir -p "$config_dir/repos.d"
+    cat > "$config_dir/repos.d/frankenterm.yaml" <<'YAML'
+tool_name: frankenterm
+binary_name: ft
+canary_installer_args: []
+YAML
+
+    local binary_name installer_args default_args
+    binary_name=$(DSR_CONFIG_DIR="$config_dir" _canary_get_binary_name frankenterm)
+    installer_args=$(DSR_CONFIG_DIR="$config_dir" \
+        _canary_get_installer_args frankenterm safe)
+    default_args=$(DSR_CONFIG_DIR="$config_dir" \
+        _canary_get_installer_args unconfigured vibe)
+
+    if [[ "$binary_name" == "ft" ]] && [[ -z "$installer_args" ]] && \
+       [[ "$default_args" == $'--mode\nvibe\n--non-interactive' ]]; then
+        pass "canary honors configured binary name and exact installer argv"
+    else
+        fail "canary should distinguish the repository key, binary, and installer argv"
+        echo "binary: $binary_name"
+        printf 'configured args: %q\n' "$installer_args"
+        printf 'default args: %q\n' "$default_args"
+    fi
+
+    cat > "$config_dir/repos.d/invalid.yaml" <<'YAML'
+tool_name: invalid
+binary_name: invalid
+canary_installer_args:
+  - ""
+YAML
+    if DSR_CONFIG_DIR="$config_dir" _canary_get_installer_args invalid safe \
+        >/dev/null 2>&1; then
+        fail "canary accepted an empty configured installer argument"
+    else
+        pass "canary rejects malformed configured installer argv"
+    fi
+
+    harness_teardown
+}
+
+test_canary_script_fails_closed() {
+    ((TESTS_RUN++))
+
+    local source="$PROJECT_ROOT/src/canary.sh"
+    if grep -Fq '2>&1 || true' "$source"; then
+        fail "canary still ignores an installer failure"
+    elif grep -Fq 'echo "Installer failed" >&2' "$source" && \
+         grep -Fq 'exit 1' "$source" && \
+         grep -Fq '"\$binary_name" --version' "$source" && \
+         grep -Fq '"\$binary_name" --help' "$source"; then
+        pass "canary installer and executable probes fail closed"
+    else
+        fail "canary fail-closed installer/probe contract is incomplete"
+    fi
+}
+
 test_canary_matrix_config() {
     ((TESTS_RUN++))
 
@@ -528,6 +604,8 @@ echo ""
 echo "Unit Tests (Canary Module):"
 test_canary_get_install_cmd
 test_canary_get_shell
+test_canary_uses_configured_binary_and_installer_arguments
+test_canary_script_fails_closed
 test_canary_matrix_config
 test_canary_modes_config
 
