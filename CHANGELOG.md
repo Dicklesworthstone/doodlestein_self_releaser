@@ -12,6 +12,31 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- Windows hosts whose OpenSSH `DefaultShell` is PowerShell could not run any
+  generated command: a command sent as `powershell -Command "..."` is parsed
+  by that outer PowerShell first, which expands every `$variable` inside the
+  double quotes to nothing before the inner powershell sees the script
+  (observed as "Missing variable name after foreach" parse errors within
+  seconds on wlap), and cmd-style lines (`cmd /c "if not exist ..."`,
+  `where rsync >NUL`, `rmdir /s /q`, `cd /d ... && set ...`) were re-parsed
+  by PowerShell too, so source sync failed at `mkdir` and the rsync probe was
+  always negative. Every PowerShell script now travels as `-EncodedCommand`
+  (UTF-16LE base64, `_act_windows_encoded_powershell`), and every cmd.exe
+  line goes through `_act_windows_cmd_via_powershell`, which hands the
+  base64-decoded line to `cmd.exe /d /s /c` verbatim and propagates its exit
+  code. Both work under cmd.exe and PowerShell login shells. Note: a
+  PowerShell 5.1 login shell reports any non-zero remote exit as 1 over
+  OpenSSH; dsr's Windows paths rely on zero/non-zero only. Test mocks decode
+  encoded commands before asserting on them. rsync to Windows receivers now
+  uses `--blocking-io` on a dedicated (non-ControlMaster) ssh transport:
+  over a multiplexed channel the Windows rsync failed intermittently with
+  "safe_write ... Resource temporarily unavailable (11)" (exit 12); a
+  Windows receiver that still drops the stream is retried up to three times
+  (rsync is idempotent).
+- Test mocks in `test_act_runner_native.sh` and `test_act_orchestration.sh`
+  decode `-EncodedCommand` payloads so assertions see the script the host
+  would run.
+
 - Post-build archive packaging never wraps an existing archive inside
   another archive. When the build already produced an archive for a target
   (the native workspace collector always emits tar.gz/zip) and the repo's

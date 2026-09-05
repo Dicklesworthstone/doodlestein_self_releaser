@@ -59,6 +59,30 @@ source "$SCRIPT_DIR/src/config.sh"
 source "$SCRIPT_DIR/src/build_state.sh"
 source "$SCRIPT_DIR/src/act_runner.sh"
 
+# Decode a `-EncodedCommand` payload back to the PowerShell text so mocks can
+# assert on the script the host would actually run.
+_test_decode_remote_command() {
+    local command="$1" encoded decoded inner
+    if [[ "$command" == *"-EncodedCommand "* ]]; then
+        encoded="${command##*-EncodedCommand }"
+        encoded="${encoded%% *}"
+        decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null)
+        decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
+        # A cmd.exe line wrapped by _act_windows_cmd_via_powershell: unwrap it
+        # so assertions see the cmd line the host would run.
+        if [[ "$decoded" == "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"* ]]; then
+            inner="${decoded#*FromBase64String(\'}"
+            inner="${inner%%\'*}"
+            printf '%s' "$inner" | base64 -d 2>/dev/null
+            return 0
+        fi
+        printf '%s' "$decoded"
+        return 0
+    fi
+    printf '%s' "$command"
+}
+
+
 # Verify ACT_REPOS_DIR is correctly set from DSR_CONFIG_DIR
 ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d"
 
@@ -2086,7 +2110,7 @@ closure_windows_metadata_command_status=0
 (
     _act_is_windows_host() { return 0; }
     _act_ssh_exec() {
-        printf '%s\n' "$2" > "$closure_windows_metadata_command_file"
+        printf '%s\n' "$(_test_decode_remote_command "$2")" > "$closure_windows_metadata_command_file"
         printf '%s\n{}\n' 'C:/build/source'
     }
     _act_validate_cargo_metadata_source_closure() { return 0; }
@@ -2431,7 +2455,7 @@ strict_unix_file_status=0
     _act_get_ssh_destination() { printf 'mock-unix\n'; }
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local remote_command="${!#}"
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         "$BASH" -c "$remote_command"
     }
     _act_verify_strict_checkout_snapshot \
@@ -2455,7 +2479,7 @@ strict_unix_gitlink_status=0
     _act_get_ssh_destination() { printf 'mock-unix\n'; }
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local remote_command="${!#}"
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.autocrlf \
             GIT_CONFIG_VALUE_0=true "$BASH" -c "$remote_command"
     }
@@ -2481,7 +2505,7 @@ strict_unix_symlink_status=0
     _act_get_ssh_destination() { printf 'mock-unix\n'; }
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local remote_command="${!#}"
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         "$BASH" -c "$remote_command"
     }
     _act_verify_strict_checkout_snapshot \
@@ -2503,7 +2527,7 @@ strict_windows_gitlink_status=0
     _act_get_ssh_destination() { printf 'mock-windows\n'; }
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local remote_command="${!#}" manifest_digest
+        local remote_command manifest_digest; remote_command=$(_test_decode_remote_command "${!#}")
         printf '%s\n' "$remote_command" > "$strict_windows_gitlink_command_file"
         manifest_digest=$(printf '%s\n' "$remote_command" | grep -Eo '[0-9a-f]{64}' | head -1)
         printf '%s %s\n' "$strict_windows_archive_digest" "$manifest_digest"
@@ -2530,7 +2554,7 @@ strict_windows_verify_status=0
     _act_get_ssh_destination() { printf 'mock-windows\n'; }
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local remote_command="${!#}" manifest_digest
+        local remote_command manifest_digest; remote_command=$(_test_decode_remote_command "${!#}")
         if [[ "$remote_command" == *"Get-ChildItem"* && "$remote_command" == *'.Count -ne '* ]]; then
             return 20
         fi
@@ -2555,7 +2579,7 @@ strict_windows_reparse_status=0
     _act_get_ssh_destination() { printf 'mock-windows\n'; }
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local remote_command="${!#}" manifest_digest
+        local remote_command manifest_digest; remote_command=$(_test_decode_remote_command "${!#}")
         if [[ "$remote_command" == *"ReparsePoint"* ]]; then
             return 21
         fi
@@ -2580,7 +2604,7 @@ strict_windows_sync_status=0
     _act_get_ssh_destination() { printf 'mock-windows\n'; }
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local remote_command="${!#}"
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         if [[ "$remote_command" == *"ReparsePoint"* ]]; then
             return 22
         fi
@@ -2625,7 +2649,7 @@ strict_windows_scp_status=0
         fi
     }
     ssh() {
-        local remote_command="${!#}"
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         printf '%s\n' "$remote_command" >> "$strict_windows_ssh_log"
         if [[ "$remote_command" == *'Get-FileHash'*'.source.manifest'* ]]; then
             cat "$strict_windows_manifest_digest_file"
@@ -2702,7 +2726,7 @@ stdin_loop_second_status=0
 (
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local detached=false argument remote_command="${!#}"
+        local detached=false argument remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         for argument in "$@"; do
             [[ "$argument" == "-n" ]] && detached=true
         done
@@ -2739,7 +2763,7 @@ printf 'post-build dependency mutation\n' >> \
 (
     _act_run_with_timeout() { shift; "$@"; }
     ssh() {
-        local detached=false argument remote_command="${!#}"
+        local detached=false argument remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         for argument in "$@"; do
             [[ "$argument" == "-n" ]] && detached=true
         done
