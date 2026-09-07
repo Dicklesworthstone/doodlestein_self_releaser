@@ -2255,12 +2255,22 @@ printf 'tilde namespace license\n' > \
 mkdir -p "$strict_sync_repo/vendor/github.com/alecthomas/chroma/v2/lexers/embedded"
 printf 'sharp lexer fixture\n' > \
     "$strict_sync_repo/vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml"
+mkdir -p "$strict_sync_repo/vendor/harfbuzz/fonts"
+printf 'font fixture with character set\n' > \
+    "$strict_sync_repo/vendor/harfbuzz/fonts/Mplus1p-Regular.660E,6975.ttf"
+printf 'font fixture with variation axes\n' > \
+    "$strict_sync_repo/vendor/harfbuzz/fonts/Roboto.wght=300,wdth=90.ttf"
+printf 'font fixture with parenthesized suffix\n' > \
+    "$strict_sync_repo/vendor/harfbuzz/fonts/fuzz-harfbuzz_fuzzer(1)"
 printf 'ignored.cache\n' > "$strict_sync_repo/.gitignore"
 printf 'must never reach a strict builder\n' > "$strict_sync_repo/ignored.cache"
 git -C "$strict_sync_repo" init -q
 git -C "$strict_sync_repo" add tracked.txt crlf.txt .gitignore 'site/functions/model/[[path]].js' \
     'vendor/git.sr.ht/~sbinet/gg/LICENSE.md' \
-    'vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml'
+    'vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml' \
+    'vendor/harfbuzz/fonts/Mplus1p-Regular.660E,6975.ttf' \
+    'vendor/harfbuzz/fonts/Roboto.wght=300,wdth=90.ttf' \
+    'vendor/harfbuzz/fonts/fuzz-harfbuzz_fuzzer(1)'
 git -C "$strict_sync_repo" update-index --add \
     --cacheinfo "160000,$strict_gitlink_sha,vendor/submodule"
 mkdir -p "$strict_sync_repo/vendor/submodule"
@@ -2369,8 +2379,11 @@ if [[ $strict_sync_status -eq 0 && -n "$strict_sync_root" && \
       -f "$strict_sync_root/site/functions/model/[[path]].js" && \
       -f "$strict_sync_root/vendor/git.sr.ht/~sbinet/gg/LICENSE.md" && \
       -f "$strict_sync_root/vendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml" && \
+      -f "$strict_sync_root/vendor/harfbuzz/fonts/Mplus1p-Regular.660E,6975.ttf" && \
+      -f "$strict_sync_root/vendor/harfbuzz/fonts/Roboto.wght=300,wdth=90.ttf" && \
+      -f "$strict_sync_root/vendor/harfbuzz/fonts/fuzz-harfbuzz_fuzzer(1)" && \
       -f "$strict_sync_root/crlf.txt" && \
-      "$strict_sync_object_count" == "20" ]] && \
+      "$strict_sync_object_count" == "25" ]] && \
    grep -Fq "$strict_gitlink_sha"$'\t160000\tvendor/submodule' "$strict_sync_manifest" && \
    grep -Fq $'\t100644\tsite/functions/model/[[path]].js' "$strict_sync_manifest" && \
    grep -Fq $'\t100644\tvendor/git.sr.ht/~sbinet/gg/LICENSE.md' "$strict_sync_manifest" && \
@@ -2559,7 +2572,7 @@ strict_windows_gitlink_status=0
 ) >/dev/null 2>&1 || strict_windows_gitlink_status=$?
 if [[ $strict_windows_gitlink_status -eq 0 ]] && \
    grep -Fq "parts[1] -eq '160000'" "$strict_windows_gitlink_command_file" && \
-   grep -Fq '^[A-Za-z0-9_./+@~#\[\]-]+$' "$strict_windows_gitlink_command_file" && \
+   grep -Fq '^[A-Za-z0-9_./+@~#,=()\[\]-]+$' "$strict_windows_gitlink_command_file" && \
    grep -Fq 'git hash-object --no-filters -- $node' "$strict_windows_gitlink_command_file" && \
    grep -Fq 'Get-ChildItem -LiteralPath $node -Force' "$strict_windows_gitlink_command_file"; then
     pass "strict Windows verification accepts safe namespace paths and requires empty gitlinks"
