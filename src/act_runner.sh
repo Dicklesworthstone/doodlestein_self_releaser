@@ -1049,19 +1049,21 @@ _act_validate_workspace_archive() {
     fi
 
     local mode size executable=false
+    # Drain each listing even after finding the member: early awk exit can
+    # SIGPIPE tar/unzip and reject a valid large archive under pipefail.
     for member in "${expected_members[@]}"; do
         case "$format" in
             tar.gz)
                 mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
                 ;;
             tar.xz)
                 mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
                 ;;
             zip)
                 mode=$(unzip -Z -l "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
                 ;;
         esac
         [[ "$mode" == -* ]] || return 4
@@ -1084,15 +1086,15 @@ _act_validate_workspace_archive() {
         case "$format" in
             tar.gz)
                 mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
                 ;;
             tar.xz)
                 mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
                 ;;
             zip)
                 mode=$(unzip -Z -l "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry { print $1; exit }') || return 4
+                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
                 ;;
         esac
         [[ "$mode" == *x* ]] && executable=true

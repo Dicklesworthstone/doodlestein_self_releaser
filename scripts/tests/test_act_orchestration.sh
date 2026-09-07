@@ -1159,6 +1159,26 @@ else
     fail "strict staging rejected or rewrote a valid multi-binary workspace archive"
 fi
 
+# Keep the real archive and member checks, but make abandoning a verbose
+# listing deterministically observable even on fast machines with tiny files.
+# Empty trailing lines cannot change the selected member's metadata.
+workspace_listing_tar=$(command -v gtar || command -v tar)
+gtar() {
+    "$workspace_listing_tar" "$@" || return $?
+    case "$1" in
+        -tvzf|-tvJf)
+            awk 'BEGIN { for (i=0; i<262144; i++) print "" }'
+            ;;
+    esac
+}
+if _act_validate_workspace_archive "$workspace_archive_source" tar.gz linux/amd64 \
+    "$ACT_REPOS_DIR/focrworkspace.yaml"; then
+    pass "workspace validation drains verbose producers under pipefail"
+else
+    fail "workspace validation abandoned a verbose archive producer"
+fi
+unset -f gtar
+
 workspace_extra_archive="$TEMP_DIR/prepackaged-workspace-extra/focrworkspace-1.0.0-linux_amd64.tar.gz"
 mkdir -p "$(dirname "$workspace_extra_archive")"
 printf 'unexpected\n' > "$workspace_bundle_dir/extra.txt"
