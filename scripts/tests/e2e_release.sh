@@ -208,8 +208,10 @@ YAML
         --arg git_sha "$STRICT_GIT_SHA" \
         --arg linux_sha "$linux_sha" \
         --arg darwin_sha "$darwin_sha" \
+        --arg additional_sha "$additional_sha" \
         --argjson linux_size "$linux_size" \
-        --argjson darwin_size "$darwin_size" '
+        --argjson darwin_size "$darwin_size" \
+        --argjson additional_size "$additional_size" '
         {
             schema_version: "1.0.0",
             tool: $tool,
@@ -222,7 +224,8 @@ YAML
             summary: {total: 2, success: 2, failed: 0},
             artifacts: [
                 {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $linux_sha, size_bytes: $linux_size},
-                {name: ($tool + "-darwin-arm64"), target: "darwin/arm64", sha256: $darwin_sha, size_bytes: $darwin_size}
+                {name: ($tool + "-darwin-arm64"), target: "darwin/arm64", sha256: $darwin_sha, size_bytes: $darwin_size},
+                {name: ($tool + ".sbom.json"), target: "additional", sha256: $additional_sha, size_bytes: $additional_size}
             ]
         }
     ' > "$STRICT_ARTIFACTS_DIR/${tool}-${tag}-manifest.json"
@@ -374,6 +377,81 @@ YAML
             {id: 7, name: "test-tool-darwin-arm64.minisig", size: $darwin_sig_size, state: "uploaded", digest: ("sha256:" + $darwin_sig_sha)}
         ]
     ' <<< "$STRICT_REMOTE_ASSETS")
+    STRICT_EXPECTED_UPLOAD_ASSETS="$STRICT_REMOTE_ASSETS"
+    export STRICT_REMOTE_ASSETS STRICT_EXPECTED_UPLOAD_ASSETS
+}
+
+enable_strict_signed_aggregate_contract() {
+    local aggregate_name="$1"
+    local windows_name="test-tool-windows-amd64.exe"
+    local windows_path="$STRICT_ARTIFACTS_DIR/$windows_name"
+    printf 'windows release binary\n' > "$windows_path"
+    local windows_sha windows_size
+    windows_sha=$(test_sha256 "$windows_path")
+    windows_size=$(test_file_size "$windows_path")
+    minisign -S -s "$STRICT_MINISIGN_SECRET_KEY" -m "$windows_path" \
+        -t "dsr strict release test-tool v1.0.0 windows/amd64 $windows_sha" \
+        >/dev/null 2>&1 || return 1
+
+    # Keep the previous SBOM file as an unselected artifact. This contract is
+    # the three-platform, eleven-asset shape used by Asupersync releases.
+    cat > "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" << YAML
+tool_name: test-tool
+repo: testuser/test-tool
+local_path: $STRICT_REPO_DIR
+language: go
+binary_name: test-tool
+targets: [linux/amd64, darwin/arm64, windows/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: test-tool-linux-amd64
+    darwin/arm64: test-tool-darwin-arm64
+    windows/amd64: $windows_name
+  minisign_public_key_file: release/keys/test-tool.pub
+  exact_additional_assets:
+    - $aggregate_name
+    - ${aggregate_name}.minisig
+dispatch:
+  enabled: true
+  repos: [testuser/downstream]
+YAML
+    jq --arg name "$windows_name" --arg sha "$windows_sha" \
+        --argjson size "$windows_size" '
+        .summary = {total: 3, success: 3, failed: 0} |
+        .artifacts = ([.artifacts[] | select(.target != "additional")] +
+            [{name: $name, target: "windows/amd64", sha256: $sha, size_bytes: $size}])
+    ' "$STRICT_MANIFEST_PATH" > "${STRICT_MANIFEST_PATH}.aggregate"
+    mv "${STRICT_MANIFEST_PATH}.aggregate" "$STRICT_MANIFEST_PATH"
+
+    local aggregate_path="$STRICT_ARTIFACTS_DIR/$aggregate_name"
+    jq -r '.artifacts[] | "\(.sha256)  \(.name)"' "$STRICT_MANIFEST_PATH" |
+        LC_ALL=C sort > "$aggregate_path"
+    local aggregate_sha
+    aggregate_sha=$(test_sha256 "$aggregate_path")
+    minisign -S -s "$STRICT_MINISIGN_SECRET_KEY" -m "$aggregate_path" \
+        -t "dsr strict release test-tool v1.0.0 aggregate $aggregate_sha" \
+        >/dev/null 2>&1 || return 1
+
+    STRICT_REMOTE_ASSETS=$(jq -c '[.[] | select(.name != "test-tool.sbom.json")]' \
+        <<< "$STRICT_REMOTE_ASSETS")
+    local name path sha size id=10
+    for name in "$windows_name" "${windows_name}.sha256" "${windows_name}.minisig" \
+        "$aggregate_name" "${aggregate_name}.minisig"; do
+        path="$STRICT_ARTIFACTS_DIR/$name"
+        if [[ "$name" == "${windows_name}.sha256" ]]; then
+            sha=$(test_sha256_line "$windows_sha  $windows_name")
+            size=$(printf '%s  %s\n' "$windows_sha" "$windows_name" | wc -c | tr -d '[:space:]')
+        else
+            sha=$(test_sha256 "$path")
+            size=$(test_file_size "$path")
+        fi
+        STRICT_REMOTE_ASSETS=$(jq -c --arg name "$name" --arg sha "$sha" \
+            --argjson size "$size" --argjson id "$id" '
+            . + [{id: $id, name: $name, size: $size, state: "uploaded", digest: ("sha256:" + $sha)}]
+        ' <<< "$STRICT_REMOTE_ASSETS")
+        id=$((id + 1))
+    done
     STRICT_EXPECTED_UPLOAD_ASSETS="$STRICT_REMOTE_ASSETS"
     export STRICT_REMOTE_ASSETS STRICT_EXPECTED_UPLOAD_ASSETS
 }
@@ -1271,6 +1349,81 @@ test_strict_release_uploads_exact_verified_minisign_set() {
     harness_teardown
 }
 
+test_strict_release_uploads_exact_signed_aggregate_assets() {
+    local aggregate_name
+    for aggregate_name in SHA256SUMS SHA256SUMS.txt; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_strict_release_fixture
+        if ! enable_strict_minisign_contract || \
+           ! enable_strict_signed_aggregate_contract "$aggregate_name"; then
+            fail "signed aggregate fixture setup failed: $aggregate_name"
+            harness_teardown
+            continue
+        fi
+        create_strict_github_mocks
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+            --artifacts "$STRICT_ARTIFACTS_DIR" --no-dispatch
+
+        local status uploads expected_uploads downloads expected_downloads
+        status=$(exec_status)
+        uploads=$(sed -n 's/^upload://p' "$STRICT_MUTATION_LOG" | LC_ALL=C sort)
+        expected_uploads=$(printf '%s\n' test-tool-linux-amd64{,.sha256,.minisig} \
+            test-tool-darwin-arm64{,.sha256,.minisig} \
+            test-tool-windows-amd64.exe{,.sha256,.minisig} \
+            "$aggregate_name" "${aggregate_name}.minisig" | LC_ALL=C sort)
+        downloads=$(sed -n 's/^download://p' "$STRICT_READ_LOG" | LC_ALL=C sort -u)
+        expected_downloads=$(printf '%s\n' test-tool-linux-amd64{,.minisig} \
+            test-tool-darwin-arm64{,.minisig} test-tool-windows-amd64.exe{,.minisig} \
+            "$aggregate_name" "${aggregate_name}.minisig" | LC_ALL=C sort)
+        if [[ $status -eq 0 && "$uploads" == "$expected_uploads" && \
+              "$downloads" == "$expected_downloads" ]] && \
+           [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG")" -eq 1 ]] && \
+           exec_stdout | jq -e '.details.dispatch.status == "skipped"' >/dev/null; then
+            pass "signed $aggregate_name publishes exactly eleven assets and verifies all four pairs without dispatch"
+        else
+            fail "signed $aggregate_name must retain exact names, four verified pairs and no dispatch"
+            echo "status: $status"
+            echo "mutations: $(cat "$STRICT_MUTATION_LOG")"
+            echo "stderr: $(exec_stderr | tail -25)"
+        fi
+        remove_strict_github_mocks
+        harness_teardown
+    done
+}
+
+test_strict_release_rejects_changed_signed_aggregate_before_mutation() {
+    local changed_name
+    for changed_name in SHA256SUMS.txt SHA256SUMS.txt.minisig; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_strict_release_fixture
+        if ! enable_strict_minisign_contract || \
+           ! enable_strict_signed_aggregate_contract SHA256SUMS.txt; then
+            fail "signed aggregate negative fixture setup failed"
+            harness_teardown
+            continue
+        fi
+        printf 'tampered\n' > "$STRICT_ARTIFACTS_DIR/$changed_name"
+        local before_sha status
+        before_sha=$(test_sha256 "$STRICT_ARTIFACTS_DIR/$changed_name")
+        create_strict_github_mocks
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+            --artifacts "$STRICT_ARTIFACTS_DIR" --no-dispatch
+        status=$(exec_status)
+        if [[ $status -eq 4 && ! -s "$STRICT_MUTATION_LOG" && \
+              "$(test_sha256 "$STRICT_ARTIFACTS_DIR/$changed_name")" == "$before_sha" ]]; then
+            pass "changed $changed_name fails before publication without overwrite"
+        else
+            fail "changed $changed_name must fail before mutation"
+            echo "status: $status"
+            echo "stderr: $(exec_stderr | tail -20)"
+        fi
+        remove_strict_github_mocks
+        harness_teardown
+    done
+}
+
 test_strict_release_creates_missing_minisign_sidecars() {
     ((TESTS_RUN++))
     harness_setup
@@ -1570,6 +1723,12 @@ release_contract:
   exact_additional_assets:
     - test-tool.missing.sbom.json
 YAML
+    # Keep a manifest receipt for the declared name so the missing-file guard,
+    # rather than the earlier manifest-name guard, is the causal rejection.
+    jq '(.artifacts[] | select(.target == "additional") | .name) =
+        "test-tool.missing.sbom.json"' "$STRICT_MANIFEST_PATH" \
+        > "${STRICT_MANIFEST_PATH}.missing"
+    mv "${STRICT_MANIFEST_PATH}.missing" "$STRICT_MANIFEST_PATH"
     create_strict_github_mocks
 
     PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
@@ -2650,6 +2809,8 @@ if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_release_rejects_invalid_tag_ruleset_before_mutation
     test_strict_release_rejects_stale_ruleset_receipt_before_publish
     test_strict_release_uploads_exact_verified_minisign_set
+    test_strict_release_uploads_exact_signed_aggregate_assets
+    test_strict_release_rejects_changed_signed_aggregate_before_mutation
     test_strict_release_creates_missing_minisign_sidecars
     test_strict_release_rejects_wrong_key_signature_before_mutation
     test_strict_release_rejects_divergent_pinned_key_before_mutation
@@ -2723,6 +2884,8 @@ test_strict_release_records_live_tag_ruleset_receipt
 test_strict_release_rejects_invalid_tag_ruleset_before_mutation
 test_strict_release_rejects_stale_ruleset_receipt_before_publish
 test_strict_release_uploads_exact_verified_minisign_set
+test_strict_release_uploads_exact_signed_aggregate_assets
+test_strict_release_rejects_changed_signed_aggregate_before_mutation
 test_strict_release_creates_missing_minisign_sidecars
 test_strict_release_rejects_wrong_key_signature_before_mutation
 test_strict_release_rejects_divergent_pinned_key_before_mutation

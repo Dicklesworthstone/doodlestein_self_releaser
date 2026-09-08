@@ -234,6 +234,13 @@ one `<primary>.minisig` per contracted primary, and verifies downloaded release
 bytes before publication and during `dsr release verify`. The private key stays
 outside the repository and may be selected with `DSR_MINISIGN_KEY`.
 
+An exact release contract may include `SHA256SUMS` or `SHA256SUMS.txt` in
+`exact_additional_assets`, together with its `.minisig` signature. DSR derives
+the aggregate from the manifest's primary and additional payloads and verifies
+the downloaded aggregate and signature as well as every primary signature.
+List primary signatures only through `minisign_public_key_file`; they are
+implicit assets and must not also appear in `exact_additional_assets`.
+
 Repositories that protect release tags can also pin
 `release_contract.github_tag_ruleset.repository_id` and `ruleset_id`. DSR then
 fails closed unless authenticated, no-cache GitHub reads prove that the exact

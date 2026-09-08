@@ -238,7 +238,9 @@ YAML
         --arg tag "$tag" \
         --arg git_sha "$STRICT_VERIFY_SHA" \
         --arg sha "$sha" \
-        --argjson size "$size" '
+        --arg additional_sha "$additional_sha" \
+        --argjson size "$size" \
+        --argjson additional_size "$additional_size" '
         {
             schema_version: "1.0.0",
             tool: $tool,
@@ -250,7 +252,8 @@ YAML
             status: "success",
             summary: {total: 1, success: 1, failed: 0},
             artifacts: [
-                {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $sha, size_bytes: $size}
+                {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $sha, size_bytes: $size},
+                {name: ($tool + ".sbom.spdx.json"), target: "additional", sha256: $additional_sha, size_bytes: $additional_size}
             ]
         }
     ' > "$artifacts_dir/${tool}-${tag}-manifest.json"
@@ -336,6 +339,48 @@ YAML
     ' <<< "$STRICT_VERIFY_ASSETS")
     STRICT_VERIFY_EXPECTED_ASSETS="$STRICT_VERIFY_ASSETS"
     export STRICT_VERIFY_SHA STRICT_VERIFY_ASSETS STRICT_VERIFY_EXPECTED_ASSETS
+}
+
+enable_strict_verify_signed_aggregate_contract() {
+    local aggregate_name="SHA256SUMS.txt"
+    local aggregate_path="$STRICT_VERIFY_ARTIFACTS_DIR/$aggregate_name"
+    cat > "$DSR_CONFIG_DIR/repos.d/test-tool.yaml" << YAML
+tool_name: test-tool
+repo: testuser/test-tool
+local_path: $STRICT_VERIFY_REPO
+language: go
+binary_name: test-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: test-tool-linux-amd64
+  minisign_public_key_file: release/keys/test-tool.pub
+  exact_additional_assets:
+    - test-tool.sbom.spdx.json
+    - $aggregate_name
+    - ${aggregate_name}.minisig
+YAML
+    jq -r '.artifacts[] | "\(.sha256)  \(.name)"' "$STRICT_VERIFY_MANIFEST_PATH" |
+        LC_ALL=C sort > "$aggregate_path"
+    local aggregate_sha
+    aggregate_sha=$(test_sha256 "$aggregate_path")
+    minisign -S -s "$TEST_TMPDIR/test-tool-verify.key" -m "$aggregate_path" \
+        -t "dsr strict release test-tool v1.0.0 aggregate $aggregate_sha" \
+        >/dev/null 2>&1 || return 1
+    local name path sha size id=5
+    for name in "$aggregate_name" "${aggregate_name}.minisig"; do
+        path="$STRICT_VERIFY_ARTIFACTS_DIR/$name"
+        sha=$(test_sha256 "$path")
+        size=$(test_file_size "$path")
+        STRICT_VERIFY_ASSETS=$(jq -c --arg name "$name" --arg sha "$sha" \
+            --argjson size "$size" --argjson id "$id" '
+            . + [{id: $id, name: $name, size: $size, state: "uploaded", digest: ("sha256:" + $sha)}]
+        ' <<< "$STRICT_VERIFY_ASSETS")
+        id=$((id + 1))
+    done
+    STRICT_VERIFY_EXPECTED_ASSETS="$STRICT_VERIFY_ASSETS"
+    export STRICT_VERIFY_ASSETS STRICT_VERIFY_EXPECTED_ASSETS
 }
 
 enable_strict_verify_tag_ruleset_contract() {
@@ -1304,6 +1349,49 @@ test_strict_verify_accepts_downloaded_minisign_pair() {
 
     remove_strict_verify_mock_gh
     harness_teardown
+}
+
+test_strict_verify_checks_signed_aggregate_served_bytes() {
+    local corrupt_name
+    for corrupt_name in none SHA256SUMS.txt SHA256SUMS.txt.minisig; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_strict_verify_fixture
+        if ! enable_strict_verify_minisign_contract || \
+           ! enable_strict_verify_signed_aggregate_contract; then
+            fail "signed aggregate verification fixture setup failed"
+            harness_teardown
+            continue
+        fi
+        if [[ "$corrupt_name" != "none" ]]; then
+            export STRICT_VERIFY_CORRUPT_REMOTE_ASSET_NAME="$corrupt_name"
+        fi
+        create_strict_verify_mock_gh
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json \
+            release verify test-tool v1.0.0
+        local status output
+        status=$(exec_status)
+        output=$(exec_stdout)
+        if [[ "$corrupt_name" == "none" && $status -eq 0 ]] && \
+           jq -e '.details.verification.expected == 6 and
+                  .details.verification.present == 6 and
+                  .details.verification.remote_records_valid == true' \
+               <<< "$output" >/dev/null; then
+            pass "strict verify accepts the signed aggregate and primary pairs"
+        elif [[ "$corrupt_name" != "none" && $status -eq 1 ]] && \
+             jq -e '.details.verification.remote_records_valid == false' \
+                 <<< "$output" >/dev/null && \
+             exec_stderr_contains "bytes differ from the frozen plan"; then
+            pass "strict verify rejects corrupt served $corrupt_name despite matching metadata"
+        else
+            fail "strict signed aggregate verification must check served bytes: $corrupt_name"
+            echo "status: $status"
+            echo "output: $output"
+            echo "stderr: $(exec_stderr | tail -20)"
+        fi
+        remove_strict_verify_mock_gh
+        harness_teardown
+    done
 }
 
 test_strict_verify_reports_live_tag_ruleset_receipt() {
@@ -2526,6 +2614,7 @@ if [[ "${DSR_RELEASE_VERIFY_STRICT_ONLY:-0}" == "1" ]]; then
     test_strict_verify_rejects_extra_or_incomplete_remote_assets
     test_strict_verify_rejects_remote_digest_mismatch
     test_strict_verify_accepts_downloaded_minisign_pair
+    test_strict_verify_checks_signed_aggregate_served_bytes
     test_strict_verify_reports_live_tag_ruleset_receipt
     test_strict_verify_rejects_corrupt_download_with_matching_metadata
     test_strict_verify_rejects_tag_move_after_signed_byte_check
@@ -2580,6 +2669,7 @@ test_strict_verify_requires_exact_names_sizes_and_sidecars
 test_strict_verify_rejects_extra_or_incomplete_remote_assets
 test_strict_verify_rejects_remote_digest_mismatch
 test_strict_verify_accepts_downloaded_minisign_pair
+test_strict_verify_checks_signed_aggregate_served_bytes
 test_strict_verify_reports_live_tag_ruleset_receipt
 test_strict_verify_rejects_corrupt_download_with_matching_metadata
 test_strict_verify_rejects_tag_move_after_signed_byte_check
