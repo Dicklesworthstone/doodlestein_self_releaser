@@ -5888,7 +5888,8 @@ EOF
             fi
 
             if [[ "$planned_kind" == "primary" || "$planned_kind" == "checksum" || \
-                  "$planned_kind" == "minisign" || "$planned_kind" == "additional" ]]; then
+                  "$planned_kind" == "minisign" || "$planned_kind" == "additional" || \
+                  "$planned_kind" == "aggregate-checksum" ]]; then
                 planned_sha=$(jq -r '.sha256' <<< "$planned_asset")
                 current_sha=$(_release_sha256 "$file" 2>/dev/null || true)
                 if [[ "$current_sha" != "$planned_sha" ]]; then
