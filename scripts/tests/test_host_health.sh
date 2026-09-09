@@ -349,6 +349,38 @@ test_disk_space_forces_kilobytes_with_512_byte_default() {
     fi
 }
 
+test_windows_disk_probe_survives_bash_default_shell() {
+    ((TESTS_RUN++))
+
+    local result status=0
+    result=$(
+        (
+            powershell() {
+                [[ "$1 $2 $3" == '-NoProfile -NonInteractive -EncodedCommand' ]] || return 91
+                local script
+                script=$(printf '%s' "$4" | base64 -d | iconv -f UTF-16LE -t UTF-8) || return 92
+                [[ "$script" == *'$d=Get-CimInstance Win32_LogicalDisk'* &&
+                   "$script" == *"DeviceID='C:'"* &&
+                   "$script" == *'$d.FreeSpace/$d.Size'* ]] || return 93
+                printf '50\r\n2097152\r\n'
+            }
+            export -f powershell
+            _hh_exec_on_host() {
+                # A real Bash parse catches the original accidental $d
+                # expansion before the PowerShell process receives its argv.
+                bash -uc "$4"
+            }
+            _hh_check_disk_space "testwindows" "ssh" "example.invalid" "windows/amd64"
+        )
+    ) || status=$?
+
+    if [[ $status -eq 0 ]] && echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2 and .status == "ok"' &>/dev/null; then
+        pass "Windows disk probe preserves PowerShell variables through Bash"
+    else
+        fail "Windows disk probe failed through Bash: status=$status result=$result"
+    fi
+}
+
 test_disk_space_rejects_non_numeric_fields() {
     ((TESTS_RUN++))
 
@@ -909,6 +941,7 @@ test_local_disk_space_has_status
 test_disk_space_forces_kilobytes_with_512_byte_default
 test_disk_space_rejects_non_numeric_fields
 test_disk_space_rejects_numeric_output_from_failed_command
+test_windows_disk_probe_survives_bash_default_shell
 test_human_disk_error_reports_probe_failure
 test_local_toolchains_check
 test_local_clock_drift

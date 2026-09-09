@@ -428,9 +428,17 @@ _hh_check_disk_space() {
 
     local df_output df_status=0
     if [[ "$platform" == windows/* ]]; then
-        # Use PowerShell for Windows: get C: drive usage percentage and free space in KB
-        df_output=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
-            "powershell -NoProfile -Command \"\$d=Get-WmiObject Win32_LogicalDisk -Filter \\\"DeviceID='C:'\\\"; [math]::Round(100-(\$d.FreeSpace/\$d.Size*100)); [math]::Round(\$d.FreeSpace/1KB)\"") || df_status=$?
+        # Windows SSH may launch Bash, which expands $d inside a quoted
+        # -Command before PowerShell sees it. Encode the script so either
+        # shell passes the exact program through, including the drive filter.
+        local disk_probe
+        if disk_probe=$(printf '%s' '$ErrorActionPreference="Stop"; $d=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='"'"'C:'"'"'"; [math]::Round(100-($d.FreeSpace/$d.Size*100)); [math]::Round($d.FreeSpace/1KB)' \
+            | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n'); then
+            df_output=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
+                "powershell -NoProfile -NonInteractive -EncodedCommand $disk_probe") || df_status=$?
+        else
+            df_status=$?
+        fi
     else
         df_output=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
             "LC_ALL=C df -Pk /") || df_status=$?
