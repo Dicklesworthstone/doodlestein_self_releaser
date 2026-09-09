@@ -952,6 +952,51 @@ test_strict_collector_rejects_partial_producer_failure() {
     fi
 }
 
+test_strict_collection_loop_streams_every_remote_artifact() {
+    log_test "Strict collection: remote streams never drain the collection loop"
+    reset_state
+
+    # Production collects workspace members and additional artifacts inside
+    # `while read` loops fed by process substitutions.  A remote stream that
+    # inherits that stdin (ssh without -n) swallows the loop's remaining
+    # lines, so only the FIRST artifact was ever collected — silently, since
+    # the loop simply ended.  The fake ssh reads stdin to EOF exactly like
+    # the real one before answering; three artifacts per transport are
+    # expected on the other side.
+    local loop_dir="$MOCK_DIR/strict-loop"
+    local collected_file="$loop_dir/collected.txt"
+    mkdir -p "$loop_dir/unix" "$loop_dir/windows"
+    (
+        ssh() {
+            cat >/dev/null
+            printf 'artifact bytes for %s\n' "${!#}"
+        }
+        local name
+        while IFS= read -r name; do
+            if _act_collect_stream_exclusive "$loop_dir/unix/$name" 600 \
+                    _act_stream_remote_unix_file mock-unix "/remote/$name" >/dev/null; then
+                printf 'unix:%s\n' "$name" >> "$collected_file"
+            fi
+        done < <(printf '%s\n' first second third)
+        while IFS= read -r name; do
+            if _act_collect_stream_exclusive "$loop_dir/windows/$name" 600 \
+                    _act_stream_remote_windows_file mock-windows "C:/remote/$name" >/dev/null; then
+                printf 'windows:%s\n' "$name" >> "$collected_file"
+            fi
+        done < <(printf '%s\n' first second third)
+    ) 2>/dev/null
+
+    local expected
+    expected=$(printf '%s\n' unix:first unix:second unix:third \
+        windows:first windows:second windows:third)
+    if [[ -f "$collected_file" && "$(cat "$collected_file")" == "$expected" && \
+          -s "$loop_dir/unix/third" && -s "$loop_dir/windows/third" ]]; then
+        log_pass "Every artifact in the collection loop was streamed"
+    else
+        log_fail "Collection loop lost artifacts: collected=$(tr '\n' ' ' < "$collected_file" 2>/dev/null)"
+    fi
+}
+
 test_strict_windows_bare_name_retry_uses_fresh_destination() {
     log_test "Strict collection: Windows bare-name retry gets a fresh destination"
     reset_state
@@ -2033,6 +2078,7 @@ main() {
     test_windows_strict_validation_failure_stops_build
     test_strict_collector_keeps_symlink_victim_unchanged
     test_strict_collector_rejects_partial_producer_failure
+    test_strict_collection_loop_streams_every_remote_artifact
     test_strict_windows_bare_name_retry_uses_fresh_destination
     test_unix_chained_with_and
     test_unix_host_path_override

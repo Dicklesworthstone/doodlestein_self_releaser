@@ -103,7 +103,12 @@ _act_collect_stream_exclusive() {
             path_identity_before=$(_act_file_identity "$destination") || exit 4
             [[ "$fd_identity_before" == "$path_identity_before" ]] || exit 4
 
-            "$@" >&9 || exit 7
+            # The producer never reads stdin.  Callers stream inside
+            # `while read` loops fed by here-strings and process
+            # substitutions; a producer that inherits that stdin (ssh does)
+            # drains the loop's remaining lines, so only the first artifact
+            # is ever collected.
+            "$@" >&9 </dev/null || exit 7
             chmod "$mode" /dev/fd/9 || exit 4
 
             local fd_identity_after path_identity_after sha_before size_before
@@ -151,7 +156,11 @@ _act_stream_remote_unix_file() {
     local ssh_destination="$1"
     local source_path="$2"
     local quoted_path="'${source_path//\'/\'\\\'\'}'"
-    ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+    # -n: never forward the caller's stdin.  These streams run inside
+    # `while read` collection loops; without -n ssh drains the loop's
+    # remaining lines and every artifact after the first is silently lost.
+    ssh -n \
+        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
         "$ssh_destination" "cat -- $quoted_path"
@@ -163,7 +172,10 @@ _act_stream_remote_windows_file() {
     local ps_path="${source_path//\'/\'\'}"
     local ps_command
     ps_command="\$ErrorActionPreference='Stop'; \$input=[IO.File]::OpenRead('${ps_path}'); \$output=\$null; try { \$output=[Console]::OpenStandardOutput(); \$input.CopyTo(\$output); \$output.Flush() } finally { if (\$null -ne \$output) { \$output.Dispose() }; \$input.Dispose() }"
-    ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+    # -n for the same reason as the Unix stream: never drain the caller's
+    # collection loop through the ssh session's stdin.
+    ssh -n \
+        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
         "$ssh_destination" \
