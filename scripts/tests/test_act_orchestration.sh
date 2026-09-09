@@ -2749,7 +2749,8 @@ if [[ $strict_windows_scp_status -eq 0 ]] && \
    [[ $(wc -l < "$strict_windows_scp_log") -eq 2 ]] && \
    grep -Fq '.source.tar' "$strict_windows_scp_log" && \
    grep -Fq '.source.manifest' "$strict_windows_scp_log" && \
-   ! grep -Fq 'OpenStandardInput' "$strict_windows_ssh_log"; then
+   ! grep -Fq 'OpenStandardInput' "$strict_windows_ssh_log" &&
+   grep -Fq "& (Join-Path \$env:SystemRoot 'System32\\tar.exe') -xf" "$strict_windows_ssh_log"; then
     pass "strict mocked Windows sync uploads with SCP before independent verification"
 else
     fail "strict mocked Windows sync did not preserve the SCP and verification contract"
