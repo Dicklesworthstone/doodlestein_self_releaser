@@ -2988,17 +2988,20 @@ _act_windows_stage_build_script() {
     _act_windows_encoded_powershell "$guard" pwsh
 }
 
-# Resolve an NTFS short spelling of the same target directory. Perl and
-# native build tools can still impose MAX_PATH despite Rust's long-path support.
-# Record both spellings; never relocate build outputs or change source bytes.
+# Use a physically shallow output root: MSVC expands NTFS short names while
+# resolving nested includes, so a short spelling of a deep root is insufficient.
+# The full run UUID and a checked marker bind this directory to one source run.
+# Existing output trees are retained; this helper never moves or deletes them.
 _act_windows_short_target_directory() {
-    local host="$1" path="$2" script short
+    local host="$1" path="$2" run_id="$3" platform="$4" script short result
     [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
-    script="\$ErrorActionPreference='Stop'; if (-not (Test-Path -LiteralPath '$path')) { New-Item -ItemType Directory -Path '$path' | Out-Null }; \$item=Get-Item -LiteralPath '$path' -Force; if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cargo target is not a plain directory' }; \$fso=New-Object -ComObject Scripting.FileSystemObject; \$short=\$fso.GetFolder(\$item.FullName).ShortPath; \$originalId=& fsutil.exe file queryfileid \$item.FullName; if (\$LASTEXITCODE -ne 0) { throw 'Original target identity query failed' }; \$shortId=& fsutil.exe file queryfileid \$short; if (\$LASTEXITCODE -ne 0 -or \$originalId -ne \$shortId) { throw 'Short target identity mismatch' }; Write-Output \$short.Replace('\\','/')"
-    short=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$script" pwsh)" 60) || return 4
-    short="${short//$'\r'/}"
-    [[ "$short" =~ ^[A-Za-z]:/[A-Za-z0-9_./~+-]+$ && "$short" != *..* ]] || return 4
-    [[ "${short:0:1}" == "${path:0:1}" ]] || return 4
+    _act_is_uuid "$run_id" || return 4
+    [[ "$platform" == windows/amd64 || "$platform" == windows/arm64 ]] || return 4
+    short="${path:0:2}/d/t/$run_id/${platform#windows/}"
+    script="\$ErrorActionPreference='Stop'; \$root='${path:0:2}/'; foreach (\$part in @('d','t','$run_id')) { \$root=Join-Path \$root \$part; if (-not (Test-Path -LiteralPath \$root)) { New-Item -ItemType Directory -Path \$root | Out-Null }; \$item=Get-Item -LiteralPath \$root -Force; if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cargo target ancestor is not a plain directory' } }; \$created=\$false; if (-not (Test-Path -LiteralPath '$short')) { New-Item -ItemType Directory -Path '$short' | Out-Null; \$created=\$true }; \$item=Get-Item -LiteralPath '$short' -Force; if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cargo target is not a plain directory' }; \$marker=Join-Path \$item.FullName '.dsr-source-target'; if (\$created) { [IO.File]::WriteAllText(\$marker,'$path',[Text.UTF8Encoding]::new(\$false)) }; \$file=Get-Item -LiteralPath \$marker -Force; if (\$file.PSIsContainer -or ((\$file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or [IO.File]::ReadAllText(\$marker) -cne '$path') { throw 'Cargo target source identity mismatch' }; \$ancestor=\$item; while (\$null -ne \$ancestor) { foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$ancestor.FullName ('.cargo/'+\$name))) { throw 'Cargo target ancestor configuration is forbidden' } }; \$ancestor=\$ancestor.Parent }; Write-Output '$short'"
+    result=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$script" pwsh)" 60) || return 4
+    result="${result//$'\r'/}"
+    [[ "$result" == "$short" ]] || return 4
     printf '%s' "$short"
 }
 
@@ -5325,7 +5328,7 @@ act_run_native_build() {
             return 4
         fi
         if _act_is_windows_host "$host"; then
-            strict_cargo_target_dir=$(_act_windows_short_target_directory "$host" "$canonical_cargo_target_dir") || return 4
+            strict_cargo_target_dir=$(_act_windows_short_target_directory "$host" "$canonical_cargo_target_dir" "$run_id" "$platform") || return 4
         fi
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" || "$env_pair" == CARGO_TARGET_DIR=* || \
@@ -5379,14 +5382,15 @@ act_run_native_build() {
         fi
         cargo_isolation_json=$(jq -nc \
             --arg cargo_home "$strict_cargo_home" \
-            --arg canonical_target_dir "$canonical_cargo_target_dir" \
+            --arg snapshot_target_dir "$canonical_cargo_target_dir" \
             --arg target_dir "$strict_cargo_target_dir" '
                 {
                     mode: "strict-release-snapshot",
                     source_boundary: "canonical-fresh-source-root",
                     cargo_home: $cargo_home,
                     target_dir: $target_dir,
-                    canonical_target_dir: $canonical_target_dir,
+                    canonical_target_dir: $target_dir,
+                    snapshot_target_dir: $snapshot_target_dir,
                     ancestor_config_policy: "reject",
                     cache_reuse: ["registry", "git"]
                 }
