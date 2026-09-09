@@ -317,6 +317,20 @@ regular companion file named by `include_files`; every path component must be
 free of symlinks. Unsafe paths, missing files, and collisions with a binary fail
 the target instead of silently producing an incomplete release archive.
 
+Use `workspace_binaries_by_target` when executable families differ by platform.
+Each target entry replaces the complete `workspace_binaries` list for that
+target, including collection and archive verification. For example:
+
+```yaml
+workspace_binaries: [ft, frankenterm-mux-server, frankenterm-pty-guardian]
+workspace_binaries_by_target:
+  windows/amd64: [ft, frankenterm-mux-server, frankenterm-pty-guardian, frankenterm-gui]
+```
+
+Unlisted targets retain the default list. Invalid lists and colliding Windows
+executable names fail before collection; native binaries do not belong in
+`workspace_archive_files`, which is reserved for companion files.
+
 ### `dsr release`
 
 Upload artifacts to GitHub Release.

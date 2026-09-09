@@ -104,6 +104,42 @@ export LOG_LEVEL=0
 log_init >/dev/null 2>&1
 build_state_init
 
+# Target-specific executable families must use real selection and reject
+# malformed declarations before a native executable can enter an archive.
+family_config="$TEMP_DIR/family-targets.yaml"
+cat > "$family_config" <<'EOF'
+workspace_binaries: [ft, frankenterm-mux-server]
+workspace_binaries_by_target:
+  windows/amd64: [ft, frankenterm-mux-server, frankenterm-gui.EXE]
+  linux/arm64: []
+EOF
+if [[ "$(_act_workspace_binaries_for_target "$family_config" windows/amd64)" == \
+      $'ft\nfrankenterm-mux-server\nfrankenterm-gui.exe' ]] && \
+   [[ "$(_act_workspace_binaries_for_target "$family_config" darwin/arm64)" == \
+      $'ft\nfrankenterm-mux-server' ]] && \
+   [[ -z "$(_act_workspace_binaries_for_target "$family_config" linux/arm64)" ]]; then
+    pass "target executable override preserves other platforms and explicit empty selection"
+else
+    fail "target executable family selection changed the wrong platform"
+fi
+
+for invalid_family in \
+    '{"workspace_binaries_by_target":{"windows/amd64":["ft","FT.EXE"]}}' \
+    '{"workspace_binaries_by_target":{"windows/amd64":["../ft"]}}' \
+    '{"workspace_binaries_by_target":{"windows/amd64":["ft\nGUI"]}}' \
+    '{"workspace_binaries_by_target":{"windows/amd64":["ft\n"]}}' \
+    '{"workspace_binaries_by_target":{"windows/amd64":null}}' \
+    '{"workspace_binaries_by_target":[]}' \
+    '{"workspace_binaries":[false]}' \
+    '{"workspace_binaries":["ft","ft"]}'; do
+    printf '%s\n' "$invalid_family" > "$family_config"
+    if _act_workspace_binaries_for_target "$family_config" windows/amd64 >/dev/null 2>&1; then
+        fail "invalid target executable family was admitted"
+    else
+        pass "invalid target executable family is rejected"
+    fi
+done
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Hybrid Build Orchestration Tests"
 echo "═══════════════════════════════════════════════════════════════"
@@ -1185,6 +1221,35 @@ else
 fi
 
 workspace_bundle_dir="$TEMP_DIR/prepackaged-workspace"
+windows_family_dir="$TEMP_DIR/windows-family"
+mkdir -p "$windows_family_dir"
+cat > "$TEMP_DIR/windows-family.yaml" <<'EOF'
+workspace_binaries: [focr]
+workspace_binaries_by_target:
+  windows/amd64: [focr, gui]
+include_files: []
+EOF
+write_minimal_target_binary "$windows_family_dir/focr.exe" "windows/amd64"
+write_minimal_target_binary "$windows_family_dir/gui.exe" "windows/amd64"
+(cd "$windows_family_dir" && zip -q "$TEMP_DIR/windows-family.zip" focr.exe gui.exe)
+(cd "$windows_family_dir" && zip -q "$TEMP_DIR/windows-family-missing.zip" focr.exe)
+if _act_validate_workspace_archive "$TEMP_DIR/windows-family.zip" zip windows/amd64 \
+       "$TEMP_DIR/windows-family.yaml" && \
+   ! _act_validate_workspace_archive "$TEMP_DIR/windows-family-missing.zip" zip windows/amd64 \
+       "$TEMP_DIR/windows-family.yaml" >/dev/null 2>&1; then
+    pass "Windows target family validates both native members and rejects missing GUI"
+else
+    fail "Windows target archive did not enforce its executable override"
+fi
+write_minimal_target_binary "$windows_family_dir/gui.exe" "linux/amd64"
+(cd "$windows_family_dir" && zip -q "$TEMP_DIR/windows-family-wrong-arch.zip" focr.exe gui.exe)
+if _act_validate_workspace_archive "$TEMP_DIR/windows-family-wrong-arch.zip" zip windows/amd64 \
+       "$TEMP_DIR/windows-family.yaml" >/dev/null 2>&1; then
+    fail "Windows GUI bypassed native architecture validation"
+else
+    pass "Windows GUI override retains native architecture validation"
+fi
+
 workspace_archive_source="$TEMP_DIR/focrworkspace-1.0.0-linux_amd64.tar.gz"
 mkdir -p "$workspace_bundle_dir/docs"
 write_minimal_target_binary "$workspace_bundle_dir/focr" "linux/amd64"

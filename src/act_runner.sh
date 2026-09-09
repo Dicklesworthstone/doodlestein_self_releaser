@@ -236,11 +236,52 @@ _act_workspace_archive_format() {
     esac
 }
 
-# Additional fixed archive members produced by the build command.  These are
-# deliberately separate from workspace_binaries: scripts and manifests are
-# package authority, but they must never be architecture-validated as native
-# executables.  The target-keyed mapping keeps Windows packages independent of
-# the POSIX installer's five-member process-family contract.
+# A target override replaces the complete executable list. Use this same
+# selection for collection, archive validation and final manifest validation.
+_act_workspace_binaries_for_target() {
+    local config_file="$1" target="$2" config_json selected binary normalized
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || return 4
+    selected=$(jq -ce --arg target "$target" '
+        def names: type == "array" and all(.[];
+            type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$")
+            and (contains("\n") | not));
+        if type != "object" then error("invalid repository config")
+        elif (has("workspace_binaries") and (.workspace_binaries | names | not))
+            then error("invalid workspace_binaries")
+        elif (has("workspace_binaries_by_target") and
+            (.workspace_binaries_by_target |
+                (type == "object" and all(.[]; names)) | not))
+            then error("invalid workspace_binaries_by_target")
+        else (.workspace_binaries_by_target // {}) as $overrides |
+            if ($overrides | has($target)) then $overrides[$target]
+            else (.workspace_binaries // []) end
+        end
+    ' <<< "$config_json") || return 4
+    local -A seen=()
+    local -a binaries=()
+    while IFS= read -r binary; do
+        [[ -n "$binary" ]] || continue
+        _act_is_safe_basename "$binary" || return 4
+        normalized="$binary"
+        if [[ "$target" == windows/* ]]; then
+            normalized="${binary,,}"
+            normalized="${normalized%.exe}.exe"
+            if [[ "${binary,,}" == *.exe ]]; then
+                binary="${binary:0:${#binary}-4}.exe"
+            fi
+        fi
+        [[ -z "${seen[$normalized]:-}" ]] || return 4
+        seen["$normalized"]=1
+        binaries+=("$binary")
+    done < <(jq -r '.[]' <<< "$selected")
+    if [[ ${#binaries[@]} -gt 0 ]]; then
+        printf '%s\n' "${binaries[@]}"
+    fi
+}
+
+# Scripts and manifests are separate from native executables and must never
+# bypass native architecture validation by being used to declare a binary.
 _act_workspace_archive_files_json() {
     local config_file="$1"
     local target="$2"
@@ -690,7 +731,7 @@ _act_validate_workspace_archive_collection_receipts() {
     command -v yq &>/dev/null || return 4
     local -A receipt_expected_members=() receipt_seen_members=()
     local configured="" binary expected_member expected_count=0
-    configured=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
+    configured=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
     while IFS= read -r binary; do
         [[ -n "$binary" ]] || continue
         _act_is_safe_basename "$binary" || return 4
@@ -1003,7 +1044,7 @@ _act_validate_workspace_archive() {
     local -a binary_members=() expected_members=()
     local -A seen_members=()
     local binary member include
-    configured=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
+    configured=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
     while IFS= read -r binary; do
         [[ -n "$binary" ]] || continue
         _act_is_safe_basename "$binary" || return 4
@@ -1197,7 +1238,7 @@ _act_stage_contract_primary() {
     source_format=$(_act_archive_format "$source_basename")
     if $source_is_contract_asset && [[ "$source_format" != "none" ]]; then
         local workspace_binaries
-        workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
+        workspace_binaries=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
         if [[ -n "$workspace_binaries" ]]; then
             _act_validate_workspace_archive \
                 "$source_path" "$source_format" "$target" "$config_file" || return 4
@@ -5245,7 +5286,7 @@ act_run_native_build() {
 
     # Check for workspace_binaries (multi-binary Rust workspaces)
     local workspace_binaries
-    workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null)
+    workspace_binaries=$(_act_workspace_binaries_for_target "$config_file" "$platform") || return 4
 
     if [[ -z "$local_path" || -z "$build_cmd" ]]; then
         _log_error "Missing local_path or build_cmd in config"
@@ -7512,7 +7553,6 @@ _act_generate_contract_manifest() {
         _log_error "Strict release manifest requires a safe configured binary_name"
         return 4
     fi
-    workspace_binaries=$(yq -r '.workspace_binaries // [] | .[]' "$config_file" 2>/dev/null) || return 4
 
     local source_dependencies_json
     if ! _act_is_uuid "$run_id"; then
@@ -7580,6 +7620,7 @@ _act_generate_contract_manifest() {
     local target_json artifact_path artifact_dir
     local frozen_sha frozen_size frozen_identity
     while IFS= read -r target; do
+        workspace_binaries=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
         [[ -n "$target" ]] || continue
         expected_name=$(jq -r --arg target "$target" '.exact_primary_assets[$target]' <<< "$contract_json")
         if ! _act_is_safe_basename "$expected_name"; then

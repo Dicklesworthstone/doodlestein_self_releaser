@@ -656,7 +656,7 @@ config_registry_divergence_json() {
 
     jq -nc --argjson registry "$registry_json" --argjson repo "$repo_json" '
         def build_keys: ["repo", "local_path", "language", "binary_name",
-            "main_package", "workspace_binaries", "build_cmd", "build_profile",
+            "main_package", "workspace_binaries", "workspace_binaries_by_target", "build_cmd", "build_profile",
             "targets", "target_triples", "cross_compile", "host_paths", "env",
             "artifact_naming", "install_script_compat", "install_script_path",
             "archive_format", "include_files", "include_extra_files",
