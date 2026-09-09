@@ -129,6 +129,20 @@ else
 fi
 
 oversized_windows_script=$(awk 'BEGIN { srand(1); for (i=0;i<16000;i++) printf "%c",33+int(rand()*90) }')
+for script_to_stage in "Write-Output 'small'; exit 37" "$large_windows_script" "$medium_windows_script"; do
+    command_to_stage=$(_act_windows_encoded_powershell "$script_to_stage" pwsh)
+    decoded_to_stage=$(_act_windows_command_script "$command_to_stage")
+    if [[ "$decoded_to_stage" == "\$ProgressPreference='SilentlyContinue'; $script_to_stage" ]]; then
+        pass "plain-file staging recovers exact original script bytes"
+    else
+        fail "plain-file staging changed the script"
+    fi
+done
+if _act_windows_command_script 'pwsh -Command Write-Output unexpected' >/dev/null 2>&1; then
+    fail "plain-file staging accepted a non-generated command form"
+else
+    pass "plain-file staging refuses arbitrary command syntax"
+fi
 oversized_windows_status=0
 _act_windows_encoded_powershell "$oversized_windows_script" >/dev/null 2>&1 || oversized_windows_status=$?
 if [[ $oversized_windows_status -eq 4 ]]; then

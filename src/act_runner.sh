@@ -2932,6 +2932,62 @@ _act_windows_cmd_via_powershell() {
     _act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')); \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.FileName=\$env:ComSpec; \$psi.Arguments='/d /s /c \"' + \$c + '\"'; \$psi.UseShellExecute=\$false; \$p=[System.Diagnostics.Process]::Start(\$psi); \$p.WaitForExit(); exit \$p.ExitCode"
 }
 
+# Recover only command forms produced above; never evaluate launcher text.
+_act_windows_command_script() {
+    local command="$1" encoded decoded compressed
+    case "$command" in
+        powershell\ -NoProfile\ -NonInteractive\ -EncodedCommand\ *|pwsh\ -NoProfile\ -NonInteractive\ -EncodedCommand\ *)
+            encoded="${command##*-EncodedCommand }"
+            [[ "$encoded" =~ ^[A-Za-z0-9+/=]+$ ]] || return 4
+            decoded=$(printf '%s' "$encoded" | base64 -d | iconv -f UTF-16LE -t UTF-8) || return 4
+            if [[ "$decoded" != "\$DSRScriptGzip='"* ]]; then
+                printf '%s' "$decoded"
+                return 0
+            fi
+            compressed="${decoded#\$DSRScriptGzip=\'}"
+            compressed="${compressed%%\'*}"
+            ;;
+        powershell\ -NoProfile\ -NonInteractive\ -Command\ *|pwsh\ -NoProfile\ -NonInteractive\ -Command\ *)
+            [[ "$command" == *'-Command "& ([ScriptBlock]::Create([IO.StreamReader]::new('* ]] || return 4
+            compressed="${command#*FromBase64String(\'}"
+            compressed="${compressed%%\'*}"
+            ;;
+        *) return 4 ;;
+    esac
+    [[ "$compressed" =~ ^[A-Za-z0-9+/=]+$ ]] || return 4
+    printf '%s' "$compressed" | base64 -d | gzip -dc
+}
+
+# Keep native build code as an inspectable file rather than a compressed
+# in-memory launcher. Retain it outside the immutable source tree. Windows
+# file sharing pins the verified bytes against writes/deletion during execution.
+_act_windows_stage_build_script() {
+    local host="$1" source_root="$2" script="$3"
+    local destination uuid local_dir local_script remote_dir remote_script digest setup guard
+    destination=$(_act_get_ssh_destination "$host") || return 4
+    uuid=$(_act_generate_uuid) || return 4
+    _act_is_uuid "$uuid" || return 4
+    source_root="${source_root//\\//}"
+    [[ "$source_root" =~ ^[A-Za-z]:/ && "$source_root" != *"'"* ]] || return 4
+    remote_dir="${source_root%/*}/launcher-$uuid"
+    remote_script="$remote_dir/build.ps1"
+    mkdir -p "$ACT_ARTIFACTS_DIR" || return 4
+    local_dir=$(mktemp -d "$ACT_ARTIFACTS_DIR/windows-launcher.XXXXXXXX") || return 4
+    local_script="$local_dir/build.ps1"
+    (umask 077; printf '%s\n' "$script" > "$local_script") || return 4
+    digest=$(_act_sha256 "$local_script") || return 4
+    setup="\$ErrorActionPreference='Stop'; \$parent=Get-Item -LiteralPath '${source_root%/*}' -Force; if (-not \$parent.PSIsContainer -or ((\$parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher parent is not a plain directory' }; if (Test-Path -LiteralPath '$remote_dir') { throw 'Launcher destination already exists' }; New-Item -ItemType Directory -Path '$remote_dir' | Out-Null; \$acl=Get-Acl -LiteralPath '$remote_dir'; \$acl.SetAccessRuleProtection(\$true,\$false); \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; \$rule=[Security.AccessControl.FileSystemAccessRule]::new(\$user,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$rule); Set-Acl -LiteralPath '$remote_dir' -AclObject \$acl"
+    setup+="; \$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18'); \$systemRule=[Security.AccessControl.FileSystemAccessRule]::new(\$system,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$systemRule); Set-Acl -LiteralPath '$remote_dir' -AclObject \$acl"
+    _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$setup" pwsh)" 60 >&2 || return 4
+    scp -q -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new "$local_script" "$destination:$remote_script" >&2 || return 4
+    # A normal custom scan retains Defender policy; no exclusion, policy
+    # bypass, or restoration of quarantined content is permitted here.
+    guard="\$ErrorActionPreference='Stop'; \$item=Get-Item -LiteralPath '$remote_script' -Force; if (\$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher is not a plain file' }; \$scanner=Join-Path \$env:ProgramFiles 'Windows Defender/MpCmdRun.exe'; if (Test-Path -LiteralPath \$scanner) { & \$scanner -Scan -ScanType 3 -File \$item.FullName; if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' } }; \$held=[IO.File]::Open('$remote_script',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { \$actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(\$held)); if (\$actual -ne '$digest') { throw 'Launcher digest mismatch' }; & '$remote_script'; exit \$LASTEXITCODE } finally { \$held.Dispose() }"
+    _log_info "Windows build script retained: $local_script (sha256=$digest), host path $remote_script"
+    _act_windows_encoded_powershell "$guard" pwsh
+}
+
 _act_windows_cmd_path() {
     local path="${1:-}"
     path="${path//\//\\}"
@@ -5690,6 +5746,12 @@ act_run_native_build() {
             env_exports+="export PATH='${nonstrict_stage_root}/.dsr-bin':\"\$PATH\"; "
         fi
         remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
+    fi
+
+    if $strict_rust_build && _act_is_windows_host "$host"; then
+        local windows_build_script
+        windows_build_script=$(_act_windows_command_script "$remote_cmd") || return 4
+        remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
     fi
 
     # Execute on remote host
