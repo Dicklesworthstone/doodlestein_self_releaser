@@ -67,6 +67,11 @@ _test_decode_remote_command() {
         encoded="${command##*-EncodedCommand }"
         encoded="${encoded%% *}"
         decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null)
+        if [[ "$decoded" == "\$DSRScriptGzip='"* ]]; then
+            inner="${decoded#\$DSRScriptGzip=\'}"
+            inner="${inner%%\'*}"
+            decoded=$(printf '%s' "$inner" | base64 -d 2>/dev/null | gzip -dc) || return 1
+        fi
         decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
         # A cmd.exe line wrapped by _act_windows_cmd_via_powershell: unwrap it
         # so assertions see the cmd line the host would run.
@@ -96,6 +101,24 @@ echo "════════════════════════�
 echo "  Hybrid Build Orchestration Tests"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
+
+large_windows_script="$(printf '# %5000s\n' '')"$'\n'"Write-Output '界面'; exit 37"
+large_windows_command=$(_act_windows_encoded_powershell "$large_windows_script")
+if [[ ${#large_windows_command} -lt 7100 ]] && \
+   [[ "$(_test_decode_remote_command "$large_windows_command")" == "$large_windows_script" ]]; then
+    pass "large Windows scripts round-trip UTF-8 and newlines within the command limit"
+else
+    fail "large Windows script transport changed bytes or exceeded its limit"
+fi
+
+oversized_windows_script=$(awk 'BEGIN { srand(1); for (i=0;i<16000;i++) printf "%c",33+int(rand()*90) }')
+oversized_windows_status=0
+_act_windows_encoded_powershell "$oversized_windows_script" >/dev/null 2>&1 || oversized_windows_status=$?
+if [[ $oversized_windows_status -eq 4 ]]; then
+    pass "incompressible oversized Windows scripts fail before remote truncation"
+else
+    fail "oversized Windows script transport did not fail closed"
+fi
 
 # Check if yq is available (required for YAML parsing)
 if ! command -v yq &>/dev/null; then
@@ -2623,7 +2646,9 @@ strict_windows_gitlink_status=0
 if [[ $strict_windows_gitlink_status -eq 0 ]] && \
    grep -Fq "parts[1] -eq '160000'" "$strict_windows_gitlink_command_file" && \
    grep -Fq '^[A-Za-z0-9_./+@~#,=()\[\]-]+$' "$strict_windows_gitlink_command_file" && \
-   grep -Fq 'git hash-object --no-filters -- $node' "$strict_windows_gitlink_command_file" && \
+   grep -Fq 'hash-object --no-filters --stdin-paths' "$strict_windows_gitlink_command_file" && \
+   grep -Fq '$LASTEXITCODE -ne 0' "$strict_windows_gitlink_command_file" && \
+   grep -Fq '$hashes.Count -ne $expected.Count' "$strict_windows_gitlink_command_file" && \
    grep -Fq 'Get-ChildItem -LiteralPath $node -Force' "$strict_windows_gitlink_command_file"; then
     pass "strict Windows verification accepts safe namespace paths and requires empty gitlinks"
 else

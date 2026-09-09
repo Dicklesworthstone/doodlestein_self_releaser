@@ -2877,14 +2877,32 @@ _act_is_windows_host() {
 # command has no quoting layer for any shell (bash, ssh, cmd, or PowerShell)
 # to disturb, so the script arrives byte-exact.
 _act_windows_encoded_powershell() {
-    local script="$1" encoded
+    local script="$1" executable="${2:-powershell}" encoded payload compressed wrapper
+    case "$executable" in powershell|pwsh) ;; *) return 4 ;; esac
     if ! command -v iconv >/dev/null 2>&1 || ! command -v base64 >/dev/null 2>&1; then
         _log_error "iconv and base64 are required to encode a Windows PowerShell command"
         return 3
     fi
     # Progress records would otherwise reach stderr as CLIXML noise over ssh.
-    encoded=$(printf '%s' "\$ProgressPreference='SilentlyContinue'; $script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
-    printf 'powershell -NoProfile -NonInteractive -EncodedCommand %s' "$encoded"
+    payload="\$ProgressPreference='SilentlyContinue'; $script"
+    encoded=$(printf '%s' "$payload" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
+    # Windows shell launchers can truncate commands at 8191 characters. Keep
+    # headroom for the executable/options and transport wrapper. Compression
+    # preserves the original script bytes, including newlines and UTF-8 text.
+    if [[ ${#encoded} -gt 7000 ]]; then
+        if ! command -v gzip >/dev/null 2>&1; then
+            _log_error "gzip is required to transport a large Windows PowerShell command"
+            return 3
+        fi
+        compressed=$(printf '%s' "$payload" | gzip -n -c | base64 | tr -d '\r\n') || return 4
+        wrapper="\$DSRScriptGzip='$compressed'; try { \$DSRScriptMemory=[IO.MemoryStream]::new([Convert]::FromBase64String(\$DSRScriptGzip)); \$DSRScriptReader=[IO.StreamReader]::new([IO.Compression.GZipStream]::new(\$DSRScriptMemory,[IO.Compression.CompressionMode]::Decompress),[Text.Encoding]::UTF8); try { \$DSRScriptText=\$DSRScriptReader.ReadToEnd() } finally { \$DSRScriptReader.Dispose() }; & ([ScriptBlock]::Create(\$DSRScriptText)) } catch { throw }"
+        encoded=$(printf '%s' "$wrapper" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
+        if [[ ${#encoded} -gt 7000 ]]; then
+            _log_error "Windows PowerShell command exceeds the transport limit after compression"
+            return 4
+        fi
+    fi
+    printf '%s -NoProfile -NonInteractive -EncodedCommand %s' "$executable" "$encoded"
 }
 
 # Run a cmd.exe command line on a Windows host regardless of the OpenSSH login
@@ -3899,6 +3917,61 @@ printf '%s %s\\n' "\$archive_digest" "\$manifest_digest"
 EOF
 }
 
+_act_windows_strict_snapshot_verify_script() {
+    local remote_path="$1" snapshot_parent="$2" remote_archive="$3" remote_manifest="$4"
+    local expected_manifest_digest="$5" expected_object_count="$6" reparse_guard
+    reparse_guard=$(_act_windows_reparse_guard_script) || return 4
+    cat << EOF
+\$ErrorActionPreference='Stop'
+$reparse_guard
+Assert-PlainDirectory '$snapshot_parent'
+Assert-PlainDirectory '$remote_path'
+Assert-PlainFile '$remote_archive'
+Assert-PlainFile '$remote_manifest'
+\$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '$remote_manifest').Hash.ToLowerInvariant()
+if (\$manifestHash -ne '$expected_manifest_digest') { exit 19 }
+\$paths=[Collections.Generic.List[string]]::new()
+\$expected=[Collections.Generic.List[string]]::new()
+\$gitlinks=[Collections.Generic.List[string]]::new()
+foreach (\$line in Get-Content -LiteralPath '$remote_manifest') {
+    \$parts=\$line.Split([char]9,3)
+    if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or
+        ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or
+        (\$parts[2] -notmatch '^[A-Za-z0-9_./+@~#,=()\[\]-]+$') -or
+        \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { exit 21 }
+    \$node=Join-Path '$remote_path' \$parts[2]
+    if (\$parts[1] -eq '160000') {
+        Assert-PlainDirectory \$node
+        if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { exit 21 }
+        \$gitlinks.Add(\$node)
+    } else {
+        Assert-PlainFile \$node
+        \$paths.Add(\$parts[2])
+        \$expected.Add(\$parts[0])
+    }
+}
+# Validated paths are ASCII with no quoting or newline characters. One native
+# Git process hashes the ordered inventory without applying ambient filters.
+if (\$paths.Count -gt 0) {
+    \$hashes=@(\$paths | & git -C '$remote_path' hash-object --no-filters --stdin-paths)
+    if ((\$LASTEXITCODE -ne 0) -or (\$hashes.Count -ne \$expected.Count)) { exit 21 }
+    for (\$i=0; \$i -lt \$expected.Count; \$i++) {
+        if (\$hashes[\$i] -cne \$expected[\$i]) { exit 21 }
+        Assert-PlainFile (Join-Path '$remote_path' \$paths[\$i])
+    }
+}
+foreach (\$node in \$gitlinks) {
+    Assert-PlainDirectory \$node
+    if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { exit 21 }
+}
+\$items=@(Get-ChildItem -LiteralPath '$remote_path' -Force -Recurse -ErrorAction Stop)
+if (\$items.Count -ne $expected_object_count) { exit 20 }
+foreach (\$item in \$items) { Assert-NoReparseChain \$item }
+\$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '$remote_archive').Hash.ToLowerInvariant()
+Write-Output (\$archiveHash + ' ' + \$manifestHash)
+EOF
+}
+
 _act_verify_strict_checkout_snapshot() {
     local host="$1"
     local local_path="$2"
@@ -3946,13 +4019,18 @@ _act_verify_strict_checkout_snapshot() {
             return 4
         fi
     elif _act_is_windows_host "$host"; then
-        local win_remote_path win_snapshot_parent win_remote_archive win_remote_manifest ps_command verify_output reparse_guard
+        local win_remote_path win_snapshot_parent win_remote_archive win_remote_manifest ps_command verify_output verify_script
         win_remote_path=$(_act_windows_cmd_path "$remote_path")
         win_snapshot_parent=$(_act_windows_cmd_path "$snapshot_parent")
         win_remote_archive=$(_act_windows_cmd_path "$remote_archive")
         win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
-        reparse_guard=$(_act_windows_reparse_guard_script)
-        ps_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; \$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant(); if (\$manifestHash -ne '${expected_manifest_digest}') { exit 19 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 20 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; \$ok=\$true; Get-Content -LiteralPath '${win_remote_manifest}' | ForEach-Object { \$parts=\$_.Split([char]9,3); if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or (\$parts[2] -notmatch '^[A-Za-z0-9_./+@~#,=()\[\]-]+$') -or \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { \$ok=\$false } else { \$node=Join-Path '${win_remote_path}' \$parts[2]; try { if (\$parts[1] -eq '160000') { Assert-PlainDirectory \$node; if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { \$ok=\$false } } else { Assert-PlainFile \$node; \$actual=(git hash-object --no-filters -- \$node).Trim(); if (\$actual -ne \$parts[0]) { \$ok=\$false } } } catch { \$ok=\$false } } }; if (-not \$ok) { exit 21 }; \$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant(); Write-Output (\$archiveHash + ' ' + \$manifestHash)")"
+        verify_script=$(_act_windows_strict_snapshot_verify_script \
+            "$win_remote_path" "$win_snapshot_parent" "$win_remote_archive" "$win_remote_manifest" \
+            "$expected_manifest_digest" "$expected_object_count") || return 4
+        # PowerShell 7 is required here: Windows PowerShell 5 cannot inspect
+        # valid tracked paths longer than MAX_PATH, even after native tar has
+        # extracted them successfully. Missing pwsh must fail verification.
+        ps_command=$(_act_windows_encoded_powershell "$verify_script" pwsh) || return 4
         verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
