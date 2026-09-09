@@ -2898,8 +2898,19 @@ _act_windows_encoded_powershell() {
         wrapper="\$DSRScriptGzip='$compressed'; try { \$DSRScriptMemory=[IO.MemoryStream]::new([Convert]::FromBase64String(\$DSRScriptGzip)); \$DSRScriptReader=[IO.StreamReader]::new([IO.Compression.GZipStream]::new(\$DSRScriptMemory,[IO.Compression.CompressionMode]::Decompress),[Text.Encoding]::UTF8); try { \$DSRScriptText=\$DSRScriptReader.ReadToEnd() } finally { \$DSRScriptReader.Dispose() }; & ([ScriptBlock]::Create(\$DSRScriptText)) } catch { throw }"
         encoded=$(printf '%s' "$wrapper" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
         if [[ ${#encoded} -gt 7000 ]]; then
-            _log_error "Windows PowerShell command exceeds the transport limit after compression"
-            return 4
+            # Avoid encoding the already-base64 payload a second time. This
+            # fixed expression has no shell expansions: the only substituted
+            # value is base64, never source text. Double quotes protect its
+            # operators from cmd/Bash; PowerShell has no variables to expand.
+            # The reader is process-local and exits with this one-shot host.
+            wrapper="& ([ScriptBlock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('$compressed')),[IO.Compression.CompressionMode]::Decompress),[Text.Encoding]::UTF8).ReadToEnd()))"
+            wrapper="$executable -NoProfile -NonInteractive -Command \"$wrapper\""
+            if [[ ${#wrapper} -gt 7000 ]]; then
+                _log_error "Windows PowerShell command exceeds the transport limit after compression"
+                return 4
+            fi
+            printf '%s' "$wrapper"
+            return 0
         fi
     fi
     printf '%s -NoProfile -NonInteractive -EncodedCommand %s' "$executable" "$encoded"

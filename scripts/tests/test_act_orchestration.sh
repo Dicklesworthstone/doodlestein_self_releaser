@@ -63,6 +63,13 @@ source "$SCRIPT_DIR/src/act_runner.sh"
 # assert on the script the host would actually run.
 _test_decode_remote_command() {
     local command="$1" encoded decoded inner
+    if [[ "$command" == *'-Command "& ([ScriptBlock]::Create([IO.StreamReader]::new('* ]]; then
+        inner="${command#*FromBase64String(\'}"
+        inner="${inner%%\'*}"
+        decoded=$(printf '%s' "$inner" | base64 -d 2>/dev/null | gzip -dc) || return 1
+        printf '%s' "${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
+        return 0
+    fi
     if [[ "$command" == *"-EncodedCommand "* ]]; then
         encoded="${command##*-EncodedCommand }"
         encoded="${encoded%% *}"
@@ -109,6 +116,16 @@ if [[ ${#large_windows_command} -lt 7100 ]] && \
     pass "large Windows scripts round-trip UTF-8 and newlines within the command limit"
 else
     fail "large Windows script transport changed bytes or exceeded its limit"
+fi
+
+medium_windows_script="# $(awk 'BEGIN { srand(2); for (i=0;i<3500;i++) printf "%c",33+int(rand()*90) }')"$'\n'"Write-Output '界面'; exit 37"
+medium_windows_command=$(_act_windows_encoded_powershell "$medium_windows_script" pwsh)
+if [[ "$medium_windows_command" == 'pwsh -NoProfile -NonInteractive -Command '* ]] && \
+   [[ ${#medium_windows_command} -le 7000 ]] && \
+   [[ "$(_test_decode_remote_command "$medium_windows_command")" == "$medium_windows_script" ]]; then
+    pass "moderately compressible Windows scripts avoid nested base64 expansion"
+else
+    fail "moderately compressible Windows script transport changed bytes or exceeded its limit"
 fi
 
 oversized_windows_script=$(awk 'BEGIN { srand(1); for (i=0;i<16000;i++) printf "%c",33+int(rand()*90) }')
