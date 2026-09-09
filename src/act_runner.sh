@@ -3360,7 +3360,9 @@ _act_tracked_manifest_object_count() {
 _act_verify_tracked_manifest_local() {
     local root_path="$1"
     local manifest_file="$2"
-    local object_id mode relative_path actual_id parent expected_count actual_count gitlink_contents
+    local object_id mode relative_path parent expected_count actual_count gitlink_contents
+    local hashes expected_hashes hash_index
+    local -a hash_paths=() hash_ids=() hash_modes=()
 
     if [[ ! -d "$root_path" || -L "$root_path" ]] || \
        ! expected_count=$(_act_tracked_manifest_object_count "$manifest_file"); then
@@ -3380,12 +3382,13 @@ _act_verify_tracked_manifest_local() {
             fi
         else
             if [[ ! -f "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
-               ! actual_id=$(git hash-object --no-filters -- "$root_path/$relative_path" 2>/dev/null) || \
-               [[ "$actual_id" != "$object_id" ]] || \
                { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
                { [[ "$mode" == "100644" ]] && [[ -x "$root_path/$relative_path" ]]; }; then
                 return 4
             fi
+            hash_paths+=("$relative_path")
+            hash_ids+=("$object_id")
+            hash_modes+=("$mode")
         fi
         parent="$relative_path"
         while [[ "$parent" == */* ]]; do
@@ -3395,6 +3398,33 @@ _act_verify_tracked_manifest_local() {
             fi
         done
     done < "$manifest_file"
+
+    # The validated relative paths contain no newline, quote or backslash,
+    # so stdin-paths passes them literally without shell or Git path quoting.
+    # Hash the entire inventory with one Git process; large native releases
+    # previously spawned tens of thousands of processes during each capture.
+    if [[ ${#hash_paths[@]} -gt 0 ]]; then
+        hashes=$(printf '%s\n' "${hash_paths[@]}" | \
+            git -C "$root_path" hash-object --no-filters --stdin-paths 2>/dev/null) || return 4
+        expected_hashes=$(printf '%s\n' "${hash_ids[@]}") || return 4
+        [[ "$hashes" == "$expected_hashes" ]] || return 4
+        # Retain the post-hash mode and ancestor checks as well: a matching
+        # byte digest cannot authorize a link or permission change during Git.
+        for ((hash_index=0; hash_index<${#hash_paths[@]}; hash_index++)); do
+            relative_path="${hash_paths[hash_index]}"
+            mode="${hash_modes[hash_index]}"
+            [[ -f "$root_path/$relative_path" && ! -L "$root_path/$relative_path" ]] || return 4
+            if { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
+               { [[ "$mode" == "100644" ]] && [[ -x "$root_path/$relative_path" ]]; }; then
+                return 4
+            fi
+            parent="$relative_path"
+            while [[ "$parent" == */* ]]; do
+                parent="${parent%/*}"
+                [[ -d "$root_path/$parent" && ! -L "$root_path/$parent" ]] || return 4
+            done
+        done
+    fi
 
     actual_count=$(find "$root_path" -mindepth 1 -print 2>/dev/null | wc -l | tr -d '[:space:]')
     [[ "$actual_count" =~ ^[0-9]+$ && "$actual_count" == "$expected_count" ]]

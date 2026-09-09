@@ -2419,6 +2419,56 @@ else
     fail "strict byte verification applied operator Git line-ending filters"
 fi
 
+strict_hash_calls="$TEMP_DIR/strict-hash-calls"
+strict_batch_status=0
+(
+    git() {
+        if [[ "$*" == *" hash-object "* ]]; then
+            printf 'hash\n' >> "$strict_hash_calls"
+        fi
+        command git "$@"
+    }
+    _act_verify_tracked_manifest_local "$strict_sync_root" "$strict_sync_manifest"
+) >/dev/null 2>&1 || strict_batch_status=$?
+if [[ $strict_batch_status -eq 0 && "$(wc -l < "$strict_hash_calls" | tr -d ' ')" == "1" ]]; then
+    pass "strict source inventory hashes every file with one Git process"
+else
+    fail "strict source inventory failed or launched per-file Git processes"
+fi
+
+strict_batch_status=0
+(
+    git() {
+        command git "$@" || return
+        if [[ "$*" == *" hash-object "* ]]; then
+            return 23
+        fi
+    }
+    _act_verify_tracked_manifest_local "$strict_sync_root" "$strict_sync_manifest"
+) >/dev/null 2>&1 || strict_batch_status=$?
+if [[ $strict_batch_status -eq 4 ]]; then
+    pass "strict batch hashing rejects valid stdout from failed Git"
+else
+    fail "strict batch hashing ignored Git failure"
+fi
+
+strict_batch_status=0
+(
+    git() {
+        command git "$@" || return
+        if [[ "$*" == *" hash-object "* ]]; then
+            chmod +x "$strict_sync_root/tracked.txt"
+        fi
+    }
+    _act_verify_tracked_manifest_local "$strict_sync_root" "$strict_sync_manifest"
+) >/dev/null 2>&1 || strict_batch_status=$?
+chmod -x "$strict_sync_root/tracked.txt"
+if [[ $strict_batch_status -eq 4 ]]; then
+    pass "strict batch hashing rejects mode changes during hashing"
+else
+    fail "strict batch hashing accepted a post-hash mode change"
+fi
+
 strict_gitlink_tamper_root="$TEMP_DIR/strict-gitlink-tamper/run/source"
 if _act_sync_strict_checkout \
         "trj" "$strict_sync_repo" "$strict_sync_sha" "$strict_gitlink_tamper_root" \
