@@ -225,6 +225,12 @@ useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
+Windows Rust source staging uses Robocopy with eight copy threads to avoid the
+per-file PowerShell overhead on large dependency trees. It preserves empty
+directories, file attributes, timestamps, and links without following link targets.
+Copy failures, unexpected destination files, and mismatches stop the build;
+the copy never purges files. Compiler concurrency and build time limits are unchanged.
+
 ### 4. Set Up Signing (Recommended)
 
 ```bash
