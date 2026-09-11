@@ -5995,7 +5995,9 @@ act_run_native_build() {
     # reaches any in-command cleanup — or multi-GB staging copies accumulate
     # until the temp filesystem fills and later targets die with ENOSPC.
     # rm -rf / rmdir do not follow the cargo cache symlinks/junctions inside.
-    if [[ -n "$nonstrict_stage_root" && "$nonstrict_stage_root" == */dsr-build-* ]]; then
+    if [[ "${DSR_KEEP_BUILD_STAGES:-0}" == "1" && -n "$nonstrict_stage_root" ]]; then
+        _log_info "Retaining build stage root $nonstrict_stage_root on $host (DSR_KEEP_BUILD_STAGES=1)"
+    elif [[ -n "$nonstrict_stage_root" && "$nonstrict_stage_root" == */dsr-build-* ]]; then
         local cleanup_ok=true
         if _act_is_windows_host "$host"; then
             local win_cleanup_path
