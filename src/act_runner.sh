@@ -3079,12 +3079,12 @@ _act_windows_cmd_via_powershell() {
 # without changing the supervisor's own exit code.
 _act_windows_build_guard_script() {
     local timeout_sec="${1:-$_ACT_BUILD_TIMEOUT}"
-    local command="${2:?Windows build command required}" command_b64
+    local script="${2:?Windows build script required}" script_quoted
     if [[ ! "$timeout_sec" =~ ^[1-9][0-9]{0,6}$ ]] || (( timeout_sec > 2147483 )); then
         _log_error "Windows build timeout must be 1..2147483 seconds"
         return 4
     fi
-    command_b64=$(printf '%s' "$command" | base64 | tr -d '\r\n') || return 4
+    script_quoted="${script//\'/\'\'}"
     cat <<'POWERSHELL'
 $ErrorActionPreference='Stop'
 Add-Type -TypeDefinition @'
@@ -3206,7 +3206,16 @@ public static class DSRNativeBuildGuard {
 }
 '@
 POWERSHELL
-    printf 'exit [DSRNativeBuildGuard]::Run([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('\''%s'\'')), %s)\n' "$command_b64" "$timeout_sec"
+    # Keep the original source visible in the staged Defender-scanned file.
+    # Encoding is only for the child command-line transport after admission.
+    printf '$dsrBuildScript='\''%s'\''\n' "$script_quoted"
+    cat <<'POWERSHELL'
+$dsrBuildEncoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($dsrBuildScript))
+$dsrPowerShell=Join-Path $PSHOME 'powershell.exe'
+if (-not (Test-Path -LiteralPath $dsrPowerShell -PathType Leaf)) { $dsrPowerShell=Join-Path $PSHOME 'pwsh.exe' }
+$dsrBuildCommand='"' + $dsrPowerShell + '" -NoProfile -NonInteractive -EncodedCommand ' + $dsrBuildEncoded
+POWERSHELL
+    printf 'exit [DSRNativeBuildGuard]::Run($dsrBuildCommand, %s)\n' "$timeout_sec"
 }
 
 # Recover only command forms produced above; never evaluate launcher text.
@@ -6117,7 +6126,7 @@ act_run_native_build() {
     if _act_is_windows_host "$host"; then
         local windows_build_script windows_build_guard
         windows_build_script=$(_act_windows_command_script "$remote_cmd") || return 4
-        windows_build_guard=$(_act_windows_build_guard_script "$_ACT_BUILD_TIMEOUT" "$remote_cmd") || return 4
+        windows_build_guard=$(_act_windows_build_guard_script "$_ACT_BUILD_TIMEOUT" "$windows_build_script") || return 4
         windows_build_script="$windows_build_guard"
         if $strict_rust_build; then
             remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
