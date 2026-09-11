@@ -3073,6 +3073,142 @@ _act_windows_cmd_via_powershell() {
     _act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')); \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.FileName=\$env:ComSpec; \$psi.Arguments='/d /s /c \"' + \$c + '\"'; \$psi.UseShellExecute=\$false; \$p=[System.Diagnostics.Process]::Start(\$psi); \$p.WaitForExit(); exit \$p.ExitCode"
 }
 
+# The supervisor stays outside its unnamed kill-on-close job. Create the build
+# suspended, assign it before any code can spawn children, and only then resume
+# it. Closing the supervisor's non-inheritable handle retires all descendants
+# without changing the supervisor's own exit code.
+_act_windows_build_guard_script() {
+    local timeout_sec="${1:-$_ACT_BUILD_TIMEOUT}"
+    local command="${2:?Windows build command required}" command_b64
+    if [[ ! "$timeout_sec" =~ ^[1-9][0-9]{0,6}$ ]] || (( timeout_sec > 2147483 )); then
+        _log_error "Windows build timeout must be 1..2147483 seconds"
+        return 4
+    fi
+    command_b64=$(printf '%s' "$command" | base64 | tr -d '\r\n') || return 4
+    cat <<'POWERSHELL'
+$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class DSRNativeBuildGuard {
+    [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
+        public long ProcessTime, JobTime;
+        public uint Flags;
+        public UIntPtr MinimumWorkingSet, MaximumWorkingSet;
+        public uint ActiveProcesses;
+        public UIntPtr Affinity;
+        public uint Priority, Scheduling;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct IoCounters {
+        public ulong ReadOperations, WriteOperations, OtherOperations;
+        public ulong ReadBytes, WriteBytes, OtherBytes;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ExtendedLimits {
+        public BasicLimits Basic;
+        public IoCounters Io;
+        public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct StartupInfo {
+        public uint Size;
+        public string Reserved, Desktop, Title;
+        public uint X, Y, Width, Height, XChars, YChars, Fill, Flags;
+        public ushort Show, ReservedCount;
+        public IntPtr ReservedBytes, Input, Output, Error;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ProcessInfo {
+        public IntPtr Process, Thread;
+        public uint ProcessId, ThreadId;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetInformationJobObject(IntPtr job, int kind,
+        ref ExtendedLimits limits, uint length);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool TerminateJobObject(IntPtr job, uint code);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool TerminateProcess(IntPtr process, uint code);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr GetStdHandle(int kind);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool CreateProcess(string application, StringBuilder command,
+        IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles,
+        uint flags, IntPtr environment, string directory,
+        ref StartupInfo startup, out ProcessInfo process);
+    static IntPtr InheritableStandardHandle(int kind) {
+        IntPtr handle = GetStdHandle(kind);
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1) ||
+                !SetHandleInformation(handle, 1, 1))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return handle;
+    }
+    public static int Run(string command, int seconds) {
+        uint milliseconds = checked((uint)seconds * 1000);
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        ProcessInfo process = new ProcessInfo();
+        try {
+            ExtendedLimits limits = new ExtendedLimits();
+            limits.Basic.Flags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if (!SetInformationJobObject(job, 9, ref limits,
+                    (uint)Marshal.SizeOf(typeof(ExtendedLimits))))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            StartupInfo startup = new StartupInfo();
+            startup.Size = (uint)Marshal.SizeOf(typeof(StartupInfo));
+            startup.Flags = 0x100; // STARTF_USESTDHANDLES
+            startup.Input = InheritableStandardHandle(-10);
+            startup.Output = InheritableStandardHandle(-11);
+            startup.Error = InheritableStandardHandle(-12);
+            if (!CreateProcess(null, new StringBuilder(command), IntPtr.Zero,
+                    IntPtr.Zero, true, 4, IntPtr.Zero, null, ref startup, out process))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!AssignProcessToJobObject(job, process.Process))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (ResumeThread(process.Thread) == UInt32.MaxValue)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            uint waited = WaitForSingleObject(process.Process, milliseconds);
+            if (waited == 258) {
+                if (!TerminateJobObject(job, 124))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (WaitForSingleObject(process.Process, 60000) != 0)
+                    throw new InvalidOperationException("Timed-out build did not terminate");
+                return 124;
+            }
+            if (waited != 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            uint code;
+            if (!GetExitCodeProcess(process.Process, out code))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return unchecked((int)code);
+        } finally {
+            // This also covers assignment failure: the suspended child must
+            // not survive just because it never entered the job.
+            if (process.Process != IntPtr.Zero) {
+                TerminateProcess(process.Process, 1);
+                CloseHandle(process.Process);
+            }
+            if (process.Thread != IntPtr.Zero) CloseHandle(process.Thread);
+            CloseHandle(job);
+        }
+    }
+}
+'@
+POWERSHELL
+    printf 'exit [DSRNativeBuildGuard]::Run([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('\''%s'\'')), %s)\n' "$command_b64" "$timeout_sec"
+}
+
 # Recover only command forms produced above; never evaluate launcher text.
 _act_windows_command_script() {
     local command="$1" encoded decoded compressed
@@ -5977,15 +6113,25 @@ act_run_native_build() {
         remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
     fi
 
-    if $strict_rust_build && _act_is_windows_host "$host"; then
-        local windows_build_script
+    local build_transport_timeout="$_ACT_BUILD_TIMEOUT"
+    if _act_is_windows_host "$host"; then
+        local windows_build_script windows_build_guard
         windows_build_script=$(_act_windows_command_script "$remote_cmd") || return 4
-        remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
+        windows_build_guard=$(_act_windows_build_guard_script "$_ACT_BUILD_TIMEOUT" "$remote_cmd") || return 4
+        windows_build_script="$windows_build_guard"
+        if $strict_rust_build; then
+            remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
+        else
+            remote_cmd=$(_act_windows_encoded_powershell "$windows_build_script") || return 4
+        fi
+        # Let the remote deadline retire its job before killing the transport.
+        # This grace is not additional build time and never enables local work.
+        build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 60))
     fi
 
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
-    _act_ssh_exec "$host" "$remote_cmd" 2>&1 | tee "$log_file"
+    _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
     local exit_code=${PIPESTATUS[0]}
 
     # The ephemeral stage root (isolated source copy + fresh cargo-home) is
