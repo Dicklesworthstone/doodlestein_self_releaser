@@ -62,18 +62,21 @@ source "$SRC_DIR/act_runner.sh"
 # test_act_orchestration.sh). A cmd.exe line wrapped by
 # _act_windows_cmd_via_powershell is unwrapped to the cmd line itself.
 _test_decode_remote_command() {
-    local command="$1" encoded decoded inner
-    if [[ "$command" == *"-EncodedCommand "* ]]; then
-        encoded="${command##*-EncodedCommand }"
-        encoded="${encoded%% *}"
-        decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null)
-        decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
-        if [[ "$decoded" == "\$DSRScriptGzip='"* ]]; then
-            inner="${decoded#*\'}"
-            inner="${inner%%\'*}"
-            decoded=$(printf '%s' "$inner" | python3 -c \
-                'import base64,gzip,sys; sys.stdout.write(gzip.decompress(base64.b64decode(sys.stdin.read(), validate=True)).decode("utf-8"))') || return 1
+    local command="$1" decoded inner
+    if [[ "$command" == powershell\ -NoProfile\ -NonInteractive\ * ||
+          "$command" == pwsh\ -NoProfile\ -NonInteractive\ * ]]; then
+        decoded=$(_act_windows_command_script "$command") || return 1
+        if [[ "$decoded" == *'$dsrBuildScript='* ]]; then
+            decoded=$(printf '%s' "$decoded" | python3 -c '
+import re, sys
+source = sys.stdin.read()
+match = re.search(r"(?m)^\$dsrBuildScript=\x27((?:[^\x27]|\x27\x27)*)\x27\n\$dsrBuildEncoded=", source)
+if match is None:
+    raise SystemExit("missing guarded build script")
+sys.stdout.write(match[1].replace("\x27\x27", "\x27"))
+') || return 1
         fi
+        decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
         if [[ "$decoded" == "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"* ]]; then
             inner="${decoded#*FromBase64String(\'}"
             inner="${inner%%\'*}"
@@ -1196,6 +1199,36 @@ test_unix_fallback_to_local_path() {
 # Test Cases: Windows Command Construction
 # ============================================================================
 
+test_windows_build_guard_transport_and_timeout_validation() {
+    log_test "Windows guard: literal source survives transport and invalid deadlines fail"
+    local script=$'Write-Output '\''日本語 '\'''\'' quoted'\''\nexit 37'
+    local guard encoded decoded bad rejected=true
+    guard=$(_act_windows_build_guard_script 30 "$script") || {
+        log_fail "Guard construction failed"
+        return
+    }
+    encoded=$(_act_windows_encoded_powershell "$guard") || {
+        log_fail "Guard transport encoding failed"
+        return
+    }
+    decoded=$(_test_decode_remote_command "$encoded")
+    if [[ "$decoded" == "$script" ]]; then
+        log_pass "Guard preserves exact Unicode, quoting, newline and exit script"
+    else
+        log_fail "Guard changed the original build script"
+    fi
+    for bad in 0 -1 2147484 invalid '1;exit'; do
+        if _act_windows_build_guard_script "$bad" "$script" >/dev/null 2>&1; then
+            rejected=false
+        fi
+    done
+    if $rejected; then
+        log_pass "Guard rejects invalid or overflowing remote deadlines"
+    else
+        log_fail "Guard accepted an invalid remote deadline"
+    fi
+}
+
 test_windows_cd_command() {
     log_test "Windows: cd /d with double quotes and backslashes"
     reset_state
@@ -2198,6 +2231,7 @@ main() {
     test_unix_fallback_to_local_path
 
     # Windows command construction
+    test_windows_build_guard_transport_and_timeout_validation
     test_windows_cd_command
     test_windows_env_set_syntax
     test_windows_slash_conversion
