@@ -68,6 +68,12 @@ _test_decode_remote_command() {
         encoded="${encoded%% *}"
         decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null)
         decoded="${decoded#\$ProgressPreference=\'SilentlyContinue\'; }"
+        if [[ "$decoded" == "\$DSRScriptGzip='"* ]]; then
+            inner="${decoded#*\'}"
+            inner="${inner%%\'*}"
+            decoded=$(printf '%s' "$inner" | python3 -c \
+                'import base64,gzip,sys; sys.stdout.write(gzip.decompress(base64.b64decode(sys.stdin.read(), validate=True)).decode("utf-8"))') || return 1
+        fi
         if [[ "$decoded" == "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"* ]]; then
             inner="${decoded#*FromBase64String(\'}"
             inner="${inner%%\'*}"
@@ -107,6 +113,10 @@ _act_ssh_exec() {
     printf '%s\n' "HOST:$host" "CMD:$cmd" >> "$SSH_ARGS_FILE"
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
+    if [[ "$exit_code" -eq 0 && "$cmd" == *"Cargo target source identity mismatch"* && \
+          "$cmd" =~ Write-Output\ \'([A-Za-z]:/d/t/[0-9a-f-]+/(amd64|arm64))\' ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
     return "$exit_code"
 }
 
@@ -155,6 +165,14 @@ scp() {
     if [[ "$exit_code" -eq 0 ]]; then
         # Materialize the target file (last arg) to simulate a download
         local target="${!#}"
+        if [[ "$target" == *:* ]]; then
+            # Launcher uploads must not create a bogus host:path tree locally.
+            local source="${*: -2:1}"
+            if [[ "$target" == */build.ps1 && -f "$source" ]]; then
+                cat "$source" > "$MOCK_DIR/staged-build.ps1"
+            fi
+            return 0
+        fi
         mkdir -p "$(dirname "$target")" 2>/dev/null || true
         write_mock_artifact "$target" 2>/dev/null || true
     fi
@@ -187,6 +205,17 @@ rsync() {
 # Handles: yq -r 'query' file OR yq 'query' file
 yq() {
     local query
+
+    # The strict workspace selector now validates the entire JSON config.
+    # These command-construction fixtures are single-binary repositories.
+    if [[ "${1:-}" == -o=json && "${2:-}" == -I=0 ]]; then
+        case "${3:-}" in
+            .) printf '{}\n'; return 0 ;;
+            '.workspace_archive_files[strenv(DSR_TARGET_PLATFORM)] // []'|\
+            '.workspace_additional_artifacts[strenv(DSR_TARGET_PLATFORM)] // []')
+                printf '[]\n'; return 0 ;;
+        esac
+    fi
 
     # Skip -r flag if present
     if [[ "$1" == "-r" ]]; then
@@ -268,6 +297,7 @@ yq() {
 
 # Reset test state
 reset_state() {
+    : > "$MOCK_DIR/staged-build.ps1"
     rm -f "$SSH_ARGS_FILE" "$SCP_ARGS_FILE" "$RAW_SSH_ARGS_FILE" "$RSYNC_ARGS_FILE"
     echo "0" > "$SSH_EXIT_CODE_FILE"
     echo "0" > "$SCP_EXIT_CODE_FILE"
@@ -297,6 +327,7 @@ reset_state() {
 get_ssh_cmd() {
     if [[ -f "$SSH_ARGS_FILE" ]]; then
         grep "^CMD:" "$SSH_ARGS_FILE" | sed 's/^CMD://'
+        cat "$MOCK_DIR/staged-build.ps1"
     else
         echo ""
     fi
@@ -547,7 +578,10 @@ test_unix_rust_isolation_executes_outside_operator_config() {
     MOCK_ARTIFACT_KIND="elf-amd64"
     MOCK_SIBLING_RELATIVE="operator-dep"
     MOCK_SIBLING_LOCAL_PATH="$sibling_root"
-    MOCK_BUILD_CMD='git diff-index --quiet HEAD -- && cargo check --offline --quiet && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release" && { printf "\177ELF\002\001"; head -c 12 /dev/zero; printf "\076\000"; head -c 44 /dev/zero; } > "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool" && chmod 755 "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool"'
+    # This checks Cargo configuration isolation on the executing host. The
+    # separately synthetic ELF collection fixture does not require installing
+    # a Linux standard library on a Mac merely to check a two-function library.
+    MOCK_BUILD_CMD='git diff-index --quiet HEAD -- && cargo check --offline --quiet --target "$(rustc -vV | sed -n "s/^host: //p")" && if cargo operator-alias >/dev/null 2>&1; then exit 91; fi && printf "%s\n%s\n" "$PWD" "$CARGO_HOME" > "$DSR_PROBE_OUTPUT" && mkdir -p "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release" && { printf "\177ELF\002\001"; head -c 12 /dev/zero; printf "\076\000"; head -c 44 /dev/zero; } > "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool" && chmod 755 "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release/tool"'
     MOCK_PLATFORM_ENV="CARGO_HOME=$operator_home/.cargo
 CARGO_TARGET_DIR=relative-operator-target
 DSR_PROBE_OUTPUT=$probe_output"
@@ -651,6 +685,10 @@ xwin_cache_dir|match
 XwIn_MsVc_SySrOoT_Download_Url|match
 DSR_RELEASE_GIT_SHA|match
 dsr_release_git_ref|match
+FT_ATOMIC_BUILD_IDENTITY|match
+ft_atomic_build_profile|match
+FT_ATOMIC_BUILD_IDENTITY_EXTRA|miss
+NOT_FT_ATOMIC_BUILD_PROFILE|miss
 XWIN|miss
 XWINNER_CACHE_DIR|miss
 NOT_XWIN_CACHE_DIR|miss
@@ -663,6 +701,70 @@ CASES
     else
         log_fail "Unexpected XWIN influence classifications:$failures"
     fi
+}
+
+test_frankenterm_windows_archive_manifest() {
+    log_test "Windows family ZIP: exact manifest bytes and hostile namespace rejection"
+    local fixture="$MOCK_DIR/windows-family-zip"
+    mkdir "$fixture" || { log_fail "Cannot create Windows ZIP fixtures"; return; }
+    python3 - "$fixture" <<'PY'
+import hashlib, json, pathlib, stat, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+components = {"ft.exe":"ft", "frankenterm-gui.exe":"frankenterm-gui",
+    "frankenterm-mux-server.exe":"frankenterm-mux-server",
+    "frankenterm-pty-guardian.exe":"frankenterm-pty-guardian"}
+files = {name: ("synthetic ZIP-parser fixture: " + name).encode() for name in components}
+files["verify-components.sh"] = b"synthetic verifier fixture"
+manifest_name = "ft-windows-amd64.component-manifest.json"
+records = []
+for name, data in files.items():
+    record = dict(path=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                  executable=name.endswith(".sh"), kind="executable" if name in components else "verifier")
+    if name in components:
+        record["component"] = components[name]
+    records.append(record)
+manifest = dict(schema_version="ft.atomic_component_manifest.v1", identity=dict(
+    build_id="a"*64, source_revision="b"*40, version="1.2.3",
+    target="x86_64-pc-windows-msvc", profile="release-interactive",
+    feature_contract="application-family-gui-ft-mux-server-pty-guardian-default-features-v1"),
+    inventory=dict(mode="exact", file_count=5), files=records)
+def encoded(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+manifest["manifest_id"] = "sha256:" + hashlib.sha256(encoded(manifest)).hexdigest()
+files[manifest_name] = encoded(manifest)
+for case in ("valid", "bytes", "manifest", "duplicate", "case", "traversal", "missing", "symlink"):
+    entries = list(files.items())
+    if case == "bytes": entries[0] = (entries[0][0], b"changed executable")
+    if case == "manifest": entries[-1] = (manifest_name, files[manifest_name].replace(b'"1.2.3"', b'"9.9.9"'))
+    if case == "duplicate": entries[-1] = entries[0]
+    if case == "case": entries[0] = ("FT.exe", entries[0][1])
+    if case == "traversal": entries[0] = ("../ft.exe", entries[0][1])
+    if case == "missing": entries.pop(1)
+    with zipfile.ZipFile(root / (case + ".zip"), "x") as archive:
+        for name, data in entries:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            mode = stat.S_IFREG | (0o700 if name.endswith(".sh") else 0o600)
+            if case == "symlink" and name == "ft.exe": mode = stat.S_IFLNK | 0o777
+            info.external_attr = mode << 16
+            archive.writestr(info, data)
+PY
+    if [[ $? -ne 0 ]]; then log_fail "Windows ZIP fixture generation failed"; return; fi
+    local revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    local identity=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    local case
+    if _act_validate_frankenterm_windows_archive "$fixture/valid.zip" "$revision" 1.2.3 "$identity"; then
+        log_pass "Exact Windows family ZIP manifest accepted (parser fixture only)"
+    else
+        log_fail "Exact Windows family ZIP manifest rejected"
+    fi
+    for case in bytes manifest duplicate case traversal missing symlink; do
+        if _act_validate_frankenterm_windows_archive "$fixture/$case.zip" "$revision" 1.2.3 "$identity" >/dev/null 2>&1; then
+            log_fail "Windows ZIP accepted invalid $case fixture"
+        else
+            log_pass "Windows ZIP rejected $case fixture"
+        fi
+    done
 }
 
 test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
@@ -681,7 +783,7 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     export DSR_RELEASE_GIT_SHA="ambient-evil-sha"
     export DSR_RELEASE_GIT_REF="ambient-evil-ref"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-unix-artifact"
-    printf 'strict unix artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
+    write_mock_artifact "$MOCK_SSH_STREAM_FILE"
 
     local result
     result=$(act_run_native_build \
@@ -743,7 +845,7 @@ test_unix_strict_rust_executes_xwin_sanitizer_before_exports() {
     mkdir -p "$strict_root/source" "$strict_root/.cargo-home"
     MOCK_BUILD_CMD="printf '%s\\n' \"\${XWIN_CACHE_DIR-<unset>}\" \"\${XWIN_CROSS_COMPILER-<unset>}\" > '$observed_env'"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/unix-xwin-order/artifact"
-    printf 'strict unix xwin artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
+    write_mock_artifact "$MOCK_SSH_STREAM_FILE"
     export XWIN_CACHE_DIR="/ambient/evil-xwin-cache"
     export XWIN_CROSS_COMPILER="ambient-evil-compiler"
 
@@ -790,11 +892,11 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     export XWIN_CACHE_DIR="C:/ambient/evil-xwin-cache"
     export XWIN_CROSS_COMPILER="ambient-evil-compiler"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-windows-artifact"
-    printf 'strict windows artifact bytes\n' > "$MOCK_SSH_STREAM_FILE"
+    MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
 
     local result
     result=$(act_run_native_build \
-        "tool" "windows/amd64" "v1.0.0" "run1" \
+        "tool" "windows/amd64" "v1.0.0" "12345678-1234-4234-8234-123456789abc" \
         "C:/build/.dsr-release-snapshots/tool-run/source" 2>/dev/null)
 
     local cmd scp_args raw_ssh_args expected_target expected_home expected_home_win
@@ -806,7 +908,7 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     last_xwin_value_b64=$(printf '%s' 'C:/pinned/xwin-cache-last' | base64 | tr -d '\r\n')
     first_xwin_prefix="${cmd%%"$first_xwin_value_b64"*}"
     last_xwin_prefix="${cmd%%"$last_xwin_value_b64"*}"
-    expected_target="C:/build/.dsr-release-snapshots/tool-run/.cargo-target-windows-amd64"
+    expected_target="C:/d/t/12345678-1234-4234-8234-123456789abc/amd64"
     expected_home="C:/build/.dsr-release-snapshots/tool-run/.cargo-home"
     expected_home_win="C:\\build\\.dsr-release-snapshots\\tool-run\\.cargo-home"
     if [[ "$cmd" == *"$expected_home_win"* && \
@@ -823,7 +925,7 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
           "$cmd" != *"C:/ambient/evil-linker.exe"* && \
           "$cmd" != *"CARGO_TARGET_DIR=in-tree-target"* && \
           "$cmd" != *"CARGO_HOME=C:/ambient/cargo-home"* && \
-          -z "$scp_args" && "$raw_ssh_args" == *"File]::OpenRead"* && \
+          "$scp_args" == *"/build.ps1"* && "$raw_ssh_args" == *"File]::OpenRead"* && \
           "$raw_ssh_args" == *"CopyTo"* && \
           "$raw_ssh_args" == *'$output.Dispose()'* ]] && \
        echo "$result" | jq -e \
@@ -1005,32 +1107,35 @@ test_strict_windows_bare_name_retry_uses_fresh_destination() {
     MOCK_BINARY_NAME="tool"
 
     local attempts_file="$MOCK_DIR/strict-windows-retry-attempts"
+    local complete_file="$MOCK_DIR/strict-windows-complete"
+    MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$complete_file"
     local result
     result=$(
         ssh() {
-            local remote_command="${!#}"
+            local remote_command
+            remote_command=$(_test_decode_remote_command "${!#}")
             printf '%s\n' "$remote_command" >> "$attempts_file"
             if [[ "$remote_command" == *"tool.exe"* ]]; then
                 printf 'partial exe attempt\n'
                 return 1
             fi
-            printf 'complete bare-name artifact\n'
+            cat "$complete_file"
         }
         act_run_native_build \
-            "tool" "windows/amd64" "v1.0.0" "strict-fallback" \
+            "tool" "windows/amd64" "v1.0.0" "23456789-1234-4234-8234-123456789abc" \
             "C:/build/.dsr-release-snapshots/tool-run/source" 2>/dev/null
     )
 
     local collected_path attempt_count retained_count
     collected_path=$(jq -r '.artifact_path // empty' <<< "$result")
     attempt_count=$(wc -l < "$attempts_file" | tr -d ' ')
-    retained_count=$(find "$ACT_ARTIFACTS_DIR" -path '*strict-fallback*' \
+    retained_count=$(find "$ACT_ARTIFACTS_DIR" -path '*23456789-1234-4234-8234-123456789abc*' \
         -type f -name 'tool.exe' | wc -l | tr -d ' ')
     if [[ "$attempt_count" -eq 2 && "$retained_count" -eq 2 && \
-          "$collected_path" == */retry.*/tool.exe && -z "$(get_scp_args)" ]] && \
+          "$collected_path" == */retry.*/tool.exe && "$(get_scp_args)" == *"/build.ps1"* ]] && \
        jq -e '.status == "success" and (.collected_sha256 | test("^[0-9a-f]{64}$"))' \
            <<< "$result" >/dev/null; then
-        log_pass "Strict Windows retry retained partial evidence and streamed the bare name without scp"
+        log_pass "Strict Windows retry retained partial evidence and streamed the bare-name executable"
     else
         log_fail "Strict Windows retry did not isolate attempts: result=$result attempts=$attempt_count files=$retained_count"
     fi
@@ -2056,6 +2161,13 @@ test_windows_strict_cargo_metadata_command() {
 # ============================================================================
 
 main() {
+    if [[ "${1:-}" == --windows-family-only ]]; then
+        test_rust_build_influence_name_xwin_boundaries
+        test_frankenterm_windows_archive_manifest
+        printf 'Windows family parser tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     echo "================================================================"
     echo "  act_runner.sh Native Build Unit Tests"
     echo "================================================================"
@@ -2071,6 +2183,7 @@ main() {
     test_unix_rust_isolation_executes_outside_operator_config
     test_windows_rust_isolation_receipt_matches_command
     test_rust_build_influence_name_xwin_boundaries
+    test_frankenterm_windows_archive_manifest
     test_unix_strict_rust_forces_out_of_snapshot_target_dir
     test_unix_strict_rust_executes_xwin_sanitizer_before_exports
     test_windows_strict_rust_forces_out_of_snapshot_target_dir

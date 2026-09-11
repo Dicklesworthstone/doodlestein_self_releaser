@@ -1009,6 +1009,106 @@ finally:
 PY
 }
 
+# Windows process-family manifests are produced on the POSIX coordinator.
+# Re-read the final ZIP through one held descriptor after collection-receipt
+# checks, binding its complete namespace and bytes to that manifest.
+_act_validate_frankenterm_windows_archive() {
+    local archive="$1" revision="$2" version="$3" build_id="$4"
+    python3 - "$archive" "$revision" "${version#v}" "$build_id" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+import zipfile
+
+path, revision, version, build_id = sys.argv[1:]
+manifest_name = "ft-windows-amd64.component-manifest.json"
+components = {
+    "ft.exe": "ft",
+    "frankenterm-gui.exe": "frankenterm-gui",
+    "frankenterm-mux-server.exe": "frankenterm-mux-server",
+    "frankenterm-pty-guardian.exe": "frankenterm-pty-guardian",
+}
+expected_names = set(components) | {"verify-components.sh", manifest_name}
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate Windows manifest object key")
+        result[key] = value
+    return result
+if not getattr(os, "O_NOFOLLOW", 0):
+    raise SystemExit("Windows archive verification requires POSIX no-follow authority")
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    before = os.fstat(fd)
+    def identity(value):
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= 4 * 1024**3:
+        raise SystemExit("unsafe Windows family archive")
+    regular = {}
+    with os.fdopen(os.dup(fd), "rb") as stream, zipfile.ZipFile(stream) as package:
+        members = package.infolist()
+        # Exact spelling and cardinality also reject case aliases, duplicates,
+        # directories, traversal, ADS names and unexpected executable members.
+        if len(members) != len(expected_names) or {item.filename for item in members} != expected_names:
+            raise SystemExit("Windows family ZIP namespace mismatch")
+        total = 0
+        for item in members:
+            mode = item.external_attr >> 16
+            total += item.file_size
+            if (not stat.S_ISREG(mode) or item.flag_bits & 1
+                or item.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                or not 0 < item.file_size <= 1024**3 or total > 4 * 1024**3):
+                raise SystemExit("unsupported Windows family ZIP member")
+            if item.filename == manifest_name:
+                if item.file_size > 8 * 1024**2:
+                    raise SystemExit("oversized Windows family manifest")
+                manifest = json.loads(package.read(item), object_pairs_hook=unique_object)
+                continue
+            digest = hashlib.sha256()
+            count = 0
+            with package.open(item) as member:
+                while chunk := member.read(1024**2):
+                    count += len(chunk)
+                    if count > item.file_size:
+                        raise SystemExit("Windows family member size changed")
+                    digest.update(chunk)
+            if count != item.file_size:
+                raise SystemExit("truncated Windows family member")
+            regular[item.filename] = (digest.hexdigest(), count, bool(mode & 0o111))
+    unsigned = dict(manifest)
+    claimed_id = unsigned.pop("manifest_id", None)
+    canonical = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    if claimed_id != "sha256:" + hashlib.sha256(canonical).hexdigest():
+        raise SystemExit("Windows family manifest digest mismatch")
+    expected_identity = {
+        "build_id": build_id, "source_revision": revision, "version": version,
+        "target": "x86_64-pc-windows-msvc", "profile": "release-interactive",
+        "feature_contract": "application-family-gui-ft-mux-server-pty-guardian-default-features-v1",
+    }
+    if manifest.get("schema_version") != "ft.atomic_component_manifest.v1" or manifest.get("identity") != expected_identity:
+        raise SystemExit("Windows family release identity mismatch")
+    records = manifest.get("files", [])
+    if len(records) != len(regular) or {record.get("path") for record in records} != set(regular):
+        raise SystemExit("Windows family manifest namespace mismatch")
+    for record in records:
+        name = record["path"]
+        if (record.get("sha256"), record.get("bytes"), record.get("executable")) != regular[name]:
+            raise SystemExit("Windows family archive bytes differ from verified manifest")
+        if name in components and (record.get("component") != components[name] or record.get("kind") != "executable"):
+            raise SystemExit("Windows family process role mismatch")
+    inventory = manifest.get("inventory", {})
+    if inventory.get("mode") != "exact" or inventory.get("file_count") != len(regular):
+        raise SystemExit("Windows family inventory is not exact")
+    if identity(before) != identity(os.fstat(fd)) or identity(before) != identity(os.stat(path, follow_symlinks=False)):
+        raise SystemExit("Windows family archive changed during verification")
+finally:
+    os.close(fd)
+PY
+}
+
 # Validate a release archive that was already assembled by the strict native
 # workspace collector. Unlike the single-binary archive path above, this form
 # must retain every configured workspace binary and companion notice while
@@ -4862,6 +4962,7 @@ _act_is_rust_build_influence_name() {
     local normalized_name="${1^^}"
     case "$normalized_name" in
         CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
+        FT_ATOMIC_BUILD_IDENTITY|FT_ATOMIC_BUILD_PROFILE|\
         CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
         CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|\
         SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|\
@@ -4873,6 +4974,58 @@ _act_is_rust_build_influence_name() {
             return 1
             ;;
     esac
+}
+
+# FrankenTerm's native processes embed one canonical family identity at compile
+# time. Derive it on the POSIX coordinator, including for Windows, using the
+# verifier from the exact release tree. A later manifest cannot seal an already
+# compiled development binary.
+_act_frankenterm_build_identity() {
+    local source_root="$1" revision="$2" version="$3" target="$4" profile="$5"
+    local verifier="scripts/atomic-component-manifest.sh"
+    if [[ ! "$revision" =~ ^[0-9a-f]{40}$ || "$revision" =~ ^0{40}$ || \
+          "$profile" != release-interactive || \
+          ! -f "$source_root/$verifier" || -L "$source_root/$verifier" ]] || \
+       ! git -C "$source_root" cat-file -e "$revision:$verifier" || \
+       ! git -C "$source_root" diff --quiet "$revision" -- "$verifier"; then
+        _log_error "FrankenTerm build identity requires the exact release verifier and interactive profile"
+        return 4
+    fi
+    local identity
+    identity=$(bash "$source_root/$verifier" derive-build-id \
+        --source-revision "$revision" --version "${version#v}" \
+        --target "$target" --profile "$profile" \
+        --feature-contract application-family-gui-ft-mux-server-pty-guardian-default-features-v1) || return 4
+    [[ "$identity" =~ ^[0-9a-f]{64}$ && ! "$identity" =~ ^0{64}$ ]] || return 4
+    printf '%s\n' "$identity"
+}
+
+_act_finalize_frankenterm_windows_family() {
+    local root="$1" source_root="$2" revision="$3" version="$4" profile="$5"
+    local target=x86_64-pc-windows-msvc identity verifier_receipt
+    identity=$(_act_frankenterm_build_identity \
+        "$source_root" "$revision" "$version" "$target" "$profile") || return 4
+    verifier_receipt=$(_act_collect_stream_exclusive \
+        "$root/verify-components.sh" 700 _act_stream_local_file \
+        "$source_root/scripts/atomic-component-manifest.sh") || return 4
+    [[ -n "$verifier_receipt" ]] || return 4
+    # This verifies PE bytes on the POSIX coordinator. It is deliberately not
+    # a claim that the POSIX descriptor-based verifier runs on native Windows.
+    bash "$root/verify-components.sh" generate \
+        --root "$root" --source-root "$source_root" \
+        --output "$root/ft-windows-amd64.component-manifest.json" \
+        --build-id "$identity" --source-revision "$revision" \
+        --version "${version#v}" --target "$target" --profile "$profile" \
+        --feature-contract application-family-gui-ft-mux-server-pty-guardian-default-features-v1 \
+        --entry executable:cli:ft.exe:ft \
+        --entry executable:gui:frankenterm-gui.exe:frankenterm-gui \
+        --entry executable:mux-server:frankenterm-mux-server.exe:frankenterm-mux-server \
+        --entry executable:pty-guardian:frankenterm-pty-guardian.exe:frankenterm-pty-guardian \
+        --entry verifier:offline-verifier:verify-components.sh \
+        --source-match verify-components.sh=scripts/atomic-component-manifest.sh \
+        --input font.payload=crates/frankenterm/assets/Pragmasevka_NF.zip.zst >/dev/null || return 4
+    bash "$root/verify-components.sh" verify --root "$root" \
+        --manifest "$root/ft-windows-amd64.component-manifest.json" >/dev/null
 }
 
 # Resolve the remote path to a built binary for SCP retrieval.
@@ -5389,6 +5542,17 @@ act_run_native_build() {
         if [[ -n "$release_git_sha" ]]; then
             strict_build_env+=$'\n'"DSR_RELEASE_GIT_SHA=$release_git_sha"
             strict_build_env+=$'\n'"DSR_RELEASE_GIT_REF=$release_git_ref"
+        fi
+        if [[ "$tool_name" == frankenterm ]]; then
+            local atomic_target atomic_identity
+            atomic_target=$(act_get_build_env_value "$strict_build_env" CARGO_BUILD_TARGET) || return 4
+            atomic_identity=$(_act_frankenterm_build_identity \
+                "$local_path" "$release_git_sha" "$version" \
+                "$atomic_target" "$build_profile") || return 4
+            # Last assignment is authoritative in both POSIX and Windows
+            # launchers and in the recorded build-influence environment.
+            strict_build_env+=$'\n'"FT_ATOMIC_BUILD_IDENTITY=$atomic_identity"
+            strict_build_env+=$'\n'"FT_ATOMIC_BUILD_PROFILE=$build_profile"
         fi
         build_env="$strict_build_env"
 
@@ -6107,6 +6271,17 @@ act_run_native_build() {
 
         local archive_file_json archive_file archive_file_executable
         local archive_file_remote archive_file_local archive_file_receipt archive_file_mode
+        local coordinator_windows_family=false
+        if $strict_native_build && ! $download_failed && \
+           [[ "$tool_name" == frankenterm && "$platform" == windows/amd64 ]]; then
+            if _act_finalize_frankenterm_windows_family \
+                "$artifact_dir" "$local_path" "$release_git_sha" "$version" "$build_profile"; then
+                coordinator_windows_family=true
+            else
+                _log_error "Windows application family failed component verification"
+                download_failed=true
+            fi
+        fi
         while IFS= read -r archive_file_json; do
             [[ -n "$archive_file_json" ]] || continue
             archive_file=$(jq -r '.name' <<< "$archive_file_json") || {
@@ -6117,6 +6292,12 @@ act_run_native_build() {
                 download_failed=true
                 continue
             }
+            if $coordinator_windows_family && \
+               [[ "$archive_file" == verify-components.sh || \
+                  "$archive_file" == ft-windows-amd64.component-manifest.json ]]; then
+                local_artifact_paths+=("$artifact_dir/$archive_file")
+                continue
+            fi
             if ! _act_is_safe_basename "$archive_file" || \
                [[ -e "$artifact_dir/$archive_file" || -L "$artifact_dir/$archive_file" ]]; then
                 _log_error "Unsafe or colliding workspace archive member: $archive_file"
@@ -6374,6 +6555,13 @@ act_run_native_build() {
                        "$archive_path" "$archive_ext" "$platform" "$config_file" \
                        "${strict_collection_receipts[@]}"; then
                     _log_error "Strict workspace archive binaries do not match collection receipts for $platform"
+                    archive_receipt=""
+                fi
+                if [[ -n "$archive_receipt" && "$tool_name" == frankenterm && \
+                      "$platform" == windows/amd64 ]] && \
+                   ! _act_validate_frankenterm_windows_archive \
+                       "$archive_path" "$release_git_sha" "$version" "$atomic_identity"; then
+                    _log_error "Windows family ZIP failed final component-manifest verification"
                     archive_receipt=""
                 fi
                 if [[ -n "$archive_receipt" ]]; then
