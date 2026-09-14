@@ -577,7 +577,7 @@ build_state_update_target() {
 }
 
 # Bind a run to the inputs required for an honest resume.
-# Args: tool version run_id git_sha git_ref source_roots_json output_dir parallel_jobs
+# Args: tool version run_id git_sha git_ref source_roots_json output_dir parallel_jobs target_hosts_json
 build_state_set_context() {
   local tool="$1"
   local version="$2"
@@ -588,24 +588,29 @@ build_state_set_context() {
   [[ -n "$source_roots_json" ]] || source_roots_json='{}'
   local output_dir="${7:-}"
   local parallel_jobs="${8:-1}"
+  local target_hosts_json="${9:-}"
+  [[ -n "$target_hosts_json" ]] || target_hosts_json='{}'
 
   local tool_dir state_file now
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
   state_file="$tool_dir/$run_id/state.json"
   [[ -f "$state_file" ]] || return 1
   jq -e 'type == "object"' <<< "$source_roots_json" &>/dev/null || return 1
+  jq -e 'type == "object"' <<< "$target_hosts_json" &>/dev/null || return 1
   [[ "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || return 1
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
   _build_state_jq_update "$state_file" \
     --arg sha "$git_sha" --arg ref "$git_ref" \
     --argjson source_roots "$source_roots_json" \
+    --argjson target_hosts "$target_hosts_json" \
     --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
     --arg now "$now" '
       .git_sha = $sha |
       .git_ref = $ref |
       .context = {
         source_roots: $source_roots,
+        target_hosts: $target_hosts,
         output_dir: $output_dir,
         parallel_jobs: $parallel_jobs
       } |

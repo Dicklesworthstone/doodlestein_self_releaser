@@ -789,10 +789,13 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     write_mock_artifact "$MOCK_SSH_STREAM_FILE"
 
     local result
-    result=$(act_run_native_build \
-        "tool" "darwin/arm64" "v1.0.0" "run1" \
-        "/remote/.dsr-release-snapshots/tool-run/source" \
-        "1111111111111111111111111111111111111111" "v1.0.0" 2>/dev/null)
+    result=$(
+        host_health_is_ready() { [[ "$1" == "mmini" ]]; }
+        act_run_native_build \
+            "tool" "darwin/arm64" "v1.0.0" "run1" \
+            "/remote/.dsr-release-snapshots/tool-run/source" \
+            "1111111111111111111111111111111111111111" "v1.0.0" "mmini" 2>/dev/null
+    )
 
     local cmd scp_args raw_ssh_args expected_target expected_home
     cmd=$(get_ssh_cmd)
@@ -950,6 +953,54 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
     unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER
     unset CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+}
+
+test_strict_native_source_binding() {
+    log_test "Strict native source binding: reject absent or unhealthy authority before side effects"
+    local binding_case result status source_root bound_host sentinel
+    for binding_case in missing-root missing-host unhealthy missing-health; do
+        reset_state
+        source_root="/remote/release/source"
+        bound_host="mmini"
+        sentinel="$MOCK_DIR/binding-$binding_case-side-effect"
+        [[ "$binding_case" == "missing-root" ]] && source_root=""
+        [[ "$binding_case" == "missing-host" ]] && bound_host=""
+        status=0
+        result=$(
+            act_get_native_host() { printf 'selected\n' >> "$sentinel"; printf 'wlap\n'; }
+            act_get_local_path() { printf 'configured\n' >> "$sentinel"; printf '/local/path/tool\n'; }
+            _act_ssh_exec() { printf 'ssh\n' >> "$sentinel"; return 99; }
+            host_health_is_ready() { [[ "$binding_case" != "unhealthy" ]]; }
+            [[ "$binding_case" != "missing-health" ]] || unset -f host_health_is_ready
+            act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" \
+                "$source_root" "1111111111111111111111111111111111111111" "v1.0.0" "$bound_host"
+        ) || status=$?
+        if [[ "$status" -eq 4 && ! -e "$sentinel" ]] && \
+           jq -e '.status == "error" and .exit_code == 4' <<< "$result" >/dev/null; then
+            log_pass "Strict $binding_case fails before selection, configuration, or SSH"
+        else
+            log_fail "Strict $binding_case escaped its source boundary: status=$status result=$result"
+        fi
+    done
+
+    reset_state
+    sentinel="$MOCK_DIR/binding-positive-selector"
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/binding-positive-artifact"
+    write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+    status=0
+    result=$(
+        act_get_native_host() { printf 'selected\n' > "$sentinel"; printf 'wlap\n'; }
+        host_health_is_ready() { [[ "$1" == "mmini" ]]; }
+        act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" \
+            "/remote/release/source" "1111111111111111111111111111111111111111" "v1.0.0" "mmini"
+    ) || status=$?
+    if [[ "$status" -eq 0 && ! -e "$sentinel" ]] && \
+       jq -e '.status == "success" and .host == "mmini"' <<< "$result" >/dev/null && \
+       [[ "$(get_ssh_cmd)" == *"/remote/release/source"* ]]; then
+        log_pass "Strict native build stays on its synchronized host despite selector drift"
+    else
+        log_fail "Strict native build lost its source host: status=$status result=$result"
+    fi
 }
 
 test_unix_strict_validation_failure_stops_build() {
@@ -2220,6 +2271,7 @@ main() {
     test_unix_strict_rust_forces_out_of_snapshot_target_dir
     test_unix_strict_rust_executes_xwin_sanitizer_before_exports
     test_windows_strict_rust_forces_out_of_snapshot_target_dir
+    test_strict_native_source_binding
     test_unix_strict_validation_failure_stops_build
     test_windows_strict_validation_failure_stops_build
     test_strict_collector_keeps_symlink_victim_unchanged
