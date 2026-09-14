@@ -439,7 +439,7 @@ Build artifacts locally using act or native compilation.
 
 ```bash
 dsr build --repo <name> [--targets <list>] [--version <tag>]
-          [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]]
+          [--parallel[=N] | --jobs <N>] [--resume[=RUN_ID]] [--diagnostic-native]
 ```
 
 | Flag | Default | Description |
@@ -452,11 +452,36 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--resume[=RUN_ID]` | off | Reuse verified completed targets and retry incomplete targets |
 | `--output-dir` | state directory | Artifact collection directory, bound into resume state |
 | `--no-sync` | false | Skip ordinary source sync (forbidden by strict release contracts) |
+| `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
 
 Target logs and result receipts are isolated by target and attempt. Aggregation
 is deterministic in requested-target order. Partial artifacts remain available
 for resume, but no authoritative manifest is emitted until the full target set
 succeeds.
+
+`--diagnostic-native` requires an enabled strict release contract and an explicit
+nonempty, unique subset of its native targets. The clean tagged source, pinned
+dependencies, immutable per-host snapshot, and executable/application family
+checks remain mandatory. Required additional artifacts are selected from the
+configured `workspace_additional_artifacts[target]` ownership, never from the
+outputs that happen to exist. Normal strict release builds still require the
+complete exact target set.
+
+Diagnostic output is isolated at
+`$DSR_STATE_DIR/diagnostics/<tool>-<tag>/<run-id>` with a directory-purpose
+receipt; `--output-dir`, `--no-sync`, `--sync-only`, and `--only-act` are
+rejected. Build details, run context, target receipts, and the manifest carry
+`build_purpose: "diagnostic-native"` and `publishable: false`. Same-purpose
+resume retains its source/host/output binding; missing or mixed strict purpose
+in state or target receipts is refused before worker admission.
+
+Release and release verification reject diagnostic directories/manifests,
+including `--fix`, even after strict configuration is removed. Diagnostic
+artifacts cannot be reused by a release build. Strict release manifests require
+explicit `build_purpose: "release"` and `publishable: true` at the root and on
+every artifact; unclassified older strict manifests require a new build.
+Neither a diagnostic build nor the `publishable` classification certifies
+quality gates or measured native performance.
 
 ---
 

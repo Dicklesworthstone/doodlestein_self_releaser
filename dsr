@@ -1589,6 +1589,8 @@ cmd_build() {
     local sync_only=false
     local only_act=false
     local only_native=false
+    local build_purpose="release"
+    local -a purpose_args=()
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -1657,6 +1659,11 @@ cmd_build() {
                 only_native=true
                 shift
                 ;;
+            --diagnostic-native)
+                build_purpose="diagnostic-native"
+                purpose_args=(--diagnostic-native)
+                shift
+                ;;
             --dry-run|-n)
                 dry_run=true
                 shift
@@ -1684,6 +1691,8 @@ OPTIONS:
     --sync-only            Sync source to remote hosts without building
     --only-act             Only build targets that use act (Linux, no SSH)
     --only-native          Only build targets that require native SSH builds
+    --diagnostic-native    Strict tagged native subset for local measurements;
+                           isolated outputs can never be published as a release
     -n, --dry-run          Show the validated build plan without executing it
 
 DESCRIPTION:
@@ -1709,6 +1718,7 @@ EXAMPLES:
     dsr build ntm --no-sync                 Build without syncing source
     dsr build ntm --only-act                Build only act targets (Linux)
     dsr build ntm --only-native             Build only native targets (macOS/Win)
+    dsr build frankenterm --version 0.15.6-rc.13 --diagnostic-native --target darwin/arm64
 
 EXIT CODES:
     0  - All builds succeeded
@@ -1765,6 +1775,11 @@ EOF
     fi
     if $resume && $sync_only; then
         log_error "--resume and --sync-only are mutually exclusive"
+        return 4
+    fi
+    if [[ "$build_purpose" == "diagnostic-native" ]] && \
+       { [[ ${#targets[@]} -eq 0 ]] || $output_dir_explicit || $only_act || $sync_only; }; then
+        log_error "--diagnostic-native requires explicit native targets and its private default output directory; --only-act/--sync-only are unsupported"
         return 4
     fi
 
@@ -1828,6 +1843,10 @@ EOF
         build_release_contract_json=$(config_get_release_contract_json "$tool_name") || return $?
         [[ "$build_release_contract_json" != "null" ]] && build_release_contract_enabled=true
     fi
+    if [[ "$build_purpose" == "diagnostic-native" ]] && ! $build_release_contract_enabled; then
+        log_error "--diagnostic-native requires an enabled strict release contract"
+        return 4
+    fi
 
     # A local refs/replace namespace must never reinterpret the commit named by
     # a strict release contract. Keep the override function-scoped so ordinary
@@ -1876,6 +1895,11 @@ EOF
     # Set output directory default (tool-version)
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     [[ -z "$output_dir" ]] && output_dir="$state_dir/artifacts/${tool_name}-${tag}"
+    if [[ "$build_purpose" == "diagnostic-native" ]]; then
+        build_run_id=$(_act_generate_uuid) || return 4
+        _act_is_uuid "$build_run_id" || return 4
+        output_dir="$state_dir/diagnostics/${tool_name}-${tag}/$build_run_id"
+    fi
     [[ "$output_dir" != "/" ]] && output_dir="${output_dir%/}"
 
     # Get targets from args or config
@@ -1932,13 +1956,20 @@ EOF
     fi
 
     if $build_release_contract_enabled; then
-        local requested_targets_json contract_targets_json
+        local requested_targets_json
         # shellcheck disable=SC2086  # target_list is intentionally word-split into one target per line.
         requested_targets_json=$(printf '%s\n' $target_list | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
-        contract_targets_json=$(jq -c '.exact_primary_assets | keys | sort' <<< "$build_release_contract_json")
-        if [[ "$requested_targets_json" != "$contract_targets_json" ]]; then
-            log_error "Strict release contract requires the complete configured target set"
+        if ! _act_contract_for_build_purpose "$tool_name" "$build_release_contract_json" \
+            "$requested_targets_json" "$build_purpose" >/dev/null; then
             return 4
+        fi
+        if [[ "$build_purpose" == "diagnostic-native" ]]; then
+            for target in $target_list; do
+                if act_platform_uses_act "$tool_name" "$target"; then
+                    log_error "Diagnostic target $target must use the strict native runner"
+                    return 4
+                fi
+            done
         fi
     fi
 
@@ -1953,6 +1984,11 @@ EOF
             return 4
         fi
         resume_run_id=$(jq -r '.run_id // empty' <<< "$resume_state")
+        if ! _act_build_purpose_matches "$(jq -c '.context // {}' <<< "$resume_state")" \
+            "$build_purpose" "$build_release_contract_enabled"; then
+            log_error "Resume purpose is missing or differs from the requested build"
+            return 4
+        fi
         if ! _act_is_uuid "$resume_run_id" || \
            [[ "$(jq -r '.status // empty' <<< "$resume_state")" == "completed" ]] || \
            [[ "$(jq -r '.status // empty' <<< "$resume_state")" == "cancelled" ]]; then
@@ -1977,6 +2013,11 @@ EOF
         current_sha=$(git -C "$local_path" rev-parse --verify HEAD 2>/dev/null || true)
         if ! $output_dir_explicit && [[ -n "$resume_output" ]]; then
             output_dir="$resume_output"
+        fi
+        if [[ "$build_purpose" == "diagnostic-native" && \
+              "$output_dir" != "$state_dir/diagnostics/${tool_name}-${tag}/$resume_run_id" ]]; then
+            log_error "Diagnostic resume output is outside its bound private namespace"
+            return 4
         fi
         if [[ ! "$resume_sha" =~ ^[0-9a-f]{40}$ || "$current_sha" != "$resume_sha" || \
               -z "$resume_output" || "$resume_output" != "$output_dir" ]]; then
@@ -2033,6 +2074,7 @@ EOF
         log_info "  Targets:    $target_list"
         log_info "  Output:     $output_dir"
         log_info "  Concurrency: $parallel_jobs"
+        log_info "  Purpose:    $build_purpose"
         $resume && log_info "  Resume run: $resume_run_id"
         if $sync_only; then
             log_info "  Source sync: planned (sync only; no build)"
@@ -2053,7 +2095,9 @@ EOF
                 --arg resume_run_id "$resume_run_id" \
                 --argjson no_sync "$no_sync" \
                 --argjson sync_only "$sync_only" \
+                --arg purpose "$build_purpose" \
                 '{repo: $repo, tool: $tool, version: $version, targets: $targets,
+                  build_purpose: $purpose, publishable: ($purpose == "release"),
                   output_dir: $output_dir, parallel_jobs: $parallel_jobs,
                   resume_run_id: $resume_run_id, no_sync: $no_sync,
                   sync_only: $sync_only, mode: "dry_run"}')"
@@ -2112,6 +2156,27 @@ EOF
         fi
     fi
 
+    if [[ "$build_purpose" == "diagnostic-native" ]]; then
+        local purpose_marker="$output_dir/.dsr-build-purpose.json"
+        if $resume; then
+            if [[ ! -f "$purpose_marker" || -L "$purpose_marker" ]] || \
+               ! jq -es --arg run "$resume_run_id" --arg sha "$build_source_sha" '
+                    length == 1 and (.[0] | type == "object" and
+                    .build_purpose == "diagnostic-native" and .publishable == false and
+                    .run_id == $run and .git_sha == $sha)
+                ' "$purpose_marker" >/dev/null; then
+                log_error "Diagnostic output purpose receipt is missing or inconsistent"
+                return 4
+            fi
+        elif ! (umask 077; set -o noclobber;
+            jq -nc --arg run "$build_run_id" --arg sha "$build_source_sha" \
+                '{build_purpose: "diagnostic-native", publishable: false,
+                  run_id: $run, git_sha: $sha}' > "$purpose_marker"); then
+            log_error "Could not persist diagnostic output purpose"
+            return 4
+        fi
+    fi
+
     # The orchestrator is captured through command substitution below, so any
     # shell-local initialization it performs cannot propagate back into this
     # coordinator. Initialize the parent before source sync or build work so
@@ -2167,7 +2232,10 @@ EOF
     # Sync source to remote hosts (unless --no-sync)
     elif ! $no_sync; then
         if $build_release_contract_enabled; then
-            if ! build_run_id=$(_act_generate_uuid) || ! _act_is_uuid "$build_run_id"; then
+            if [[ -z "$build_run_id" ]]; then
+                build_run_id=$(_act_generate_uuid) || return 4
+            fi
+            if ! _act_is_uuid "$build_run_id"; then
                 log_error "Could not generate a strict release build run ID"
                 return 4
             fi
@@ -2267,7 +2335,7 @@ EOF
     $resume && orchestration_resume_args=(--resume-run-id "$resume_run_id")
     # shellcheck disable=SC2086
     full_output=$(act_orchestrate_build "$tool_name" "$version" \
-        "${build_source_args[@]}" "${orchestration_resume_args[@]}" \
+        "${build_source_args[@]}" "${orchestration_resume_args[@]}" "${purpose_args[@]}" \
         --parallel-jobs "$parallel_jobs" --output-dir "$output_dir" -- \
         $target_list 2>&1) || orchestrator_exit=$?
 
@@ -3413,6 +3481,8 @@ EOF
 {
   "tool": "$tool_name",
   "version": "$version",
+  "build_purpose": "$build_purpose",
+  "publishable": $( [[ "$build_purpose" == "release" ]] && printf true || printf false ),
   "targets": $(echo "$target_list" | tr ' ' '\n' | jq -R . | jq -s .),
   "total": $total,
   "success": $success,
@@ -3427,6 +3497,8 @@ EOF
     else
         echo ""
         log_info "=== Build Summary ==="
+        log_info "Purpose:  $build_purpose"
+        [[ "$build_purpose" == "diagnostic-native" ]] && log_warn "Diagnostic artifacts cannot be published or reused by a release build"
         log_info "Tool:     $tool_name"
         log_info "Version:  $version"
         log_info "Duration: ${duration}s"
@@ -3812,6 +3884,47 @@ _release_contract_verify_local_asset() {
     return 0
 }
 
+# This guard also applies when a tool's strict contract has since been removed.
+# A missing diagnostic manifest must never fall through to upload-all behavior.
+_release_require_publishable_artifacts() {
+    local artifacts_dir="$1" manifest_file="$2" strict="${3:-false}"
+    local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    local physical_dir diagnostic_root
+    physical_dir=$(cd "$artifacts_dir" 2>/dev/null && pwd -P) || return 4
+    diagnostic_root=$(cd "$state_dir/diagnostics" 2>/dev/null && pwd -P) || diagnostic_root=""
+    if [[ -n "$diagnostic_root" && ( "$physical_dir" == "$diagnostic_root" ||
+          "$physical_dir" == "$diagnostic_root/"* ) ]]; then
+        log_error "Native diagnostic outputs are not publishable release artifacts"
+        return 4
+    fi
+    local marker="$artifacts_dir/.dsr-build-purpose.json"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+        if [[ ! -f "$marker" || -L "$marker" ]] || \
+           ! jq -es 'length == 1 and (.[0] | type == "object" and
+                .build_purpose == "release" and .publishable == true)' "$marker" >/dev/null; then
+            log_error "Artifact directory carries non-publishable or invalid build purpose"
+            return 4
+        fi
+    fi
+    if [[ -e "$manifest_file" || -L "$manifest_file" ]]; then
+        if [[ ! -f "$manifest_file" || -L "$manifest_file" ]] || \
+           ! jq -es --argjson strict "$strict" '
+                def release_purpose:
+                    if has("build_purpose") or has("publishable") or $strict
+                    then .build_purpose == "release" and .publishable == true
+                    else true end;
+                length == 1 and (.[0] | type == "object" and
+                    release_purpose and all(.artifacts[]?; release_purpose))
+            ' "$manifest_file" >/dev/null; then
+            log_error "Manifest purpose is missing, mixed, or not publishable as a release"
+            return 4
+        fi
+    elif [[ "$strict" == "true" ]]; then
+        log_error "Strict release requires an explicitly release-purpose manifest"
+        return 4
+    fi
+}
+
 # Validate an opt-in release contract and return the closed upload plan as JSON.
 # No GitHub mutation is allowed before this succeeds. sidecar_mode is create,
 # verify, or plan. Creation uses noclobber; an existing sidecar is always
@@ -3827,6 +3940,8 @@ _release_contract_preflight() {
     local sidecar_mode="${8:-verify}"
     local GIT_NO_REPLACE_OBJECTS=1
     export GIT_NO_REPLACE_OBJECTS
+
+    _release_require_publishable_artifacts "$artifacts_dir" "$manifest_file" true || return 4
 
     case "$sidecar_mode" in
         create|verify|plan) ;;
@@ -5241,6 +5356,9 @@ EOF
         return 4
     fi
 
+    _release_require_publishable_artifacts "$artifacts_dir" \
+        "$artifacts_dir/${tool_name}-${tag}-manifest.json" false || return 4
+
     # Find manifest
     local manifest_file="$artifacts_dir/${tool_name}-${tag}-manifest.json"
     if [[ ! -f "$manifest_file" ]]; then
@@ -5258,6 +5376,8 @@ EOF
     else
         log_warn "No manifest found, will upload all files in artifacts directory"
     fi
+    _release_require_publishable_artifacts "$artifacts_dir" "$manifest_file" \
+        "$release_contract_enabled" || return 4
 
     # Freeze user-visible release metadata before the strict upload plan is
     # computed. The same object is required at creation and every remote check.
@@ -6579,6 +6699,21 @@ EOF
 
     log_info "Verifying release $tool_name $tag from $repo"
 
+    # Reject local diagnostic/mixed authority before any remote lookup or repair.
+    local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    local artifacts_dir="$state_dir/artifacts/${tool_name}-${tag}"
+    local manifest_file="$artifacts_dir/${tool_name}-${tag}-manifest.json"
+    if [[ ! -f "$manifest_file" ]]; then
+        manifest_file="$state_dir/artifacts/${tool_name}-${tag}-manifest.json"
+    fi
+    if [[ -d "$artifacts_dir" ]]; then
+        _release_require_publishable_artifacts "$artifacts_dir" "$manifest_file" \
+            "$release_contract_enabled" || return 4
+    elif [[ -f "$manifest_file" ]] || $release_contract_enabled; then
+        _release_require_publishable_artifacts "${manifest_file%/*}" "$manifest_file" \
+            "$release_contract_enabled" || return 4
+    fi
+
     # Record start time
     local start_time
     start_time=$(date +%s)
@@ -6639,13 +6774,6 @@ EOF
     log_info "Release has $asset_count asset(s)"
 
     # Load build manifest if available
-    local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
-    local artifacts_dir=""
-    local manifest_file="$state_dir/artifacts/${tool_name}-${tag}/${tool_name}-${tag}-manifest.json"
-    if [[ ! -f "$manifest_file" ]]; then
-        manifest_file="$state_dir/artifacts/${tool_name}-${tag}-manifest.json"
-    fi
-
     local manifest_exists=false
     local expected_assets=()
     local release_contract_plan='{}'

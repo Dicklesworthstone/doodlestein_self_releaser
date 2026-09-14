@@ -217,15 +217,16 @@ YAML
             tool: $tool,
             version: $tag,
             run_id: "strict-test",
+            build_purpose: "release", publishable: true,
             source: {git_sha: $git_sha, git_ref: $tag, dependencies: []},
             built_at: "2026-01-30T12:00:00Z",
             duration_ms: 1,
             status: "success",
             summary: {total: 2, success: 2, failed: 0},
             artifacts: [
-                {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $linux_sha, size_bytes: $linux_size},
-                {name: ($tool + "-darwin-arm64"), target: "darwin/arm64", sha256: $darwin_sha, size_bytes: $darwin_size},
-                {name: ($tool + ".sbom.json"), target: "additional", sha256: $additional_sha, size_bytes: $additional_size}
+                {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $linux_sha, size_bytes: $linux_size, build_purpose: "release", publishable: true},
+                {name: ($tool + "-darwin-arm64"), target: "darwin/arm64", sha256: $darwin_sha, size_bytes: $darwin_size, build_purpose: "release", publishable: true},
+                {name: ($tool + ".sbom.json"), target: "additional", sha256: $additional_sha, size_bytes: $additional_size, build_purpose: "release", publishable: true}
             ]
         }
     ' > "$STRICT_ARTIFACTS_DIR/${tool}-${tag}-manifest.json"
@@ -420,7 +421,8 @@ YAML
         --argjson size "$windows_size" '
         .summary = {total: 3, success: 3, failed: 0} |
         .artifacts = ([.artifacts[] | select(.target != "additional")] +
-            [{name: $name, target: "windows/amd64", sha256: $sha, size_bytes: $size}])
+            [{name: $name, target: "windows/amd64", sha256: $sha, size_bytes: $size,
+              build_purpose: "release", publishable: true}])
     ' "$STRICT_MANIFEST_PATH" > "${STRICT_MANIFEST_PATH}.aggregate"
     mv "${STRICT_MANIFEST_PATH}.aggregate" "$STRICT_MANIFEST_PATH"
 
@@ -2641,6 +2643,127 @@ test_strict_build_rejects_no_sync() {
 }
 
 # ============================================================================
+# Tests: diagnostic build purpose (local CLI and mocked publication boundary)
+# ============================================================================
+
+test_diagnostic_native_cli_plan() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    printf '\nworkspace_additional_artifacts:\n  darwin/arm64: [test-tool.sbom.json]\n' \
+        >> "$DSR_CONFIG_DIR/repos.d/test-tool.yaml"
+    cat > "$DSR_CONFIG_DIR/hosts.yaml" <<'YAML'
+schema_version: "1.0.0"
+hosts:
+  mmini:
+    platform: darwin/arm64
+    connection: local
+platform_mapping:
+  darwin/arm64: mmini
+YAML
+    exec_run "$DSR_CMD" --json build test-tool --version v1.0.0 \
+        --diagnostic-native --target darwin/arm64 --dry-run
+    if [[ "$(exec_status)" -eq 0 ]] && jq -e --arg root "$DSR_STATE_DIR/diagnostics/" '
+        .details.build_purpose == "diagnostic-native" and .details.publishable == false and
+        (.details.output_dir | startswith($root)) and
+        [.details.targets[].platform] == ["darwin/arm64"] and
+        all(.details.targets[]; .method == "native" and .host == "mmini")
+    ' <<< "$(exec_stdout)" >/dev/null; then
+        pass "explicit diagnostic CLI plan keeps private purpose and native target binding"
+    else
+        fail "diagnostic native CLI plan rejected valid tagged input"
+        echo "stderr: $(exec_stderr)"
+    fi
+    exec_run "$DSR_CMD" build test-tool --version v1.0.0 --target darwin/arm64 --dry-run
+    if [[ "$(exec_status)" -eq 4 ]] && exec_stderr_contains 'complete configured target set'; then
+        pass "normal strict CLI still refuses a partial target set"
+    else
+        fail "normal strict CLI partial target guard changed"
+    fi
+    local option
+    for option in --no-sync --sync-only --only-act; do
+        exec_run "$DSR_CMD" build test-tool --version v1.0.0 --diagnostic-native \
+            --target darwin/arm64 --dry-run "$option"
+        if [[ "$(exec_status)" -eq 4 ]]; then
+            pass "diagnostic CLI refuses $option"
+        else
+            fail "diagnostic CLI admitted $option"
+        fi
+    done
+    exec_run "$DSR_CMD" build test-tool --version v1.0.0 --diagnostic-native --dry-run
+    if [[ "$(exec_status)" -eq 4 ]] && exec_stderr_contains 'explicit native targets'; then
+        pass "diagnostic CLI refuses implicit target selection"
+    else
+        fail "diagnostic CLI admitted implicit target selection"
+    fi
+    printf 'dirty source\n' >> "$STRICT_REPO_DIR/source.txt"
+    exec_run "$DSR_CMD" build test-tool --version v1.0.0 --diagnostic-native \
+        --target darwin/arm64 --allow-dirty --dry-run
+    if [[ "$(exec_status)" -eq 4 ]] && exec_stderr_contains 'clean source tree'; then
+        pass "diagnostic CLI preserves strict clean-tagged source despite --allow-dirty"
+    else
+        fail "diagnostic CLI weakened strict source authority"
+    fi
+    harness_teardown
+}
+
+test_release_refuses_diagnostic_purpose() {
+    local purpose_case mutation
+    for purpose_case in diagnostic missing mixed-artifact inconsistent config-drift diagnostic-stream namespace-no-manifest marker-no-manifest marker-stream; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_strict_release_fixture
+        create_strict_github_mocks
+        mutation='.'
+        case "$purpose_case" in
+            diagnostic|config-drift) mutation='.build_purpose = "diagnostic-native" | .publishable = false' ;;
+            missing) mutation='del(.build_purpose)' ;;
+            mixed-artifact) mutation='.artifacts[0].build_purpose = "diagnostic-native" | .artifacts[0].publishable = false' ;;
+            inconsistent) mutation='.publishable = false' ;;
+        esac
+        local original_manifest changed_manifest
+        original_manifest=$(cat "$STRICT_MANIFEST_PATH")
+        changed_manifest=$(jq "$mutation" <<< "$original_manifest")
+        printf '%s\n' "$changed_manifest" > "$STRICT_MANIFEST_PATH"
+        if [[ "$purpose_case" == config-drift || "$purpose_case" == *no-manifest || "$purpose_case" == *stream ]]; then
+            yq -i 'del(.release_contract)' "$DSR_CONFIG_DIR/repos.d/test-tool.yaml"
+        fi
+        if [[ "$purpose_case" == diagnostic-stream ]]; then
+            jq '.build_purpose = "diagnostic-native" | .publishable = false' \
+                <<< "$original_manifest" > "$STRICT_MANIFEST_PATH"
+            printf '%s\n' "$original_manifest" >> "$STRICT_MANIFEST_PATH"
+        fi
+        if [[ "$purpose_case" == namespace-no-manifest ]]; then
+            STRICT_ARTIFACTS_DIR="$DSR_STATE_DIR/diagnostics/test-tool-v1.0.0/diagnostic-fixture"
+            mkdir -p "$STRICT_ARTIFACTS_DIR"
+            printf 'retained diagnostic bytes\n' > "$STRICT_ARTIFACTS_DIR/test-tool-darwin-arm64"
+        elif [[ "$purpose_case" == marker-no-manifest || "$purpose_case" == marker-stream ]]; then
+            # A moved diagnostic directory still carries its private marker.
+            STRICT_ARTIFACTS_DIR="$TEST_TMPDIR/moved-diagnostic"
+            mkdir -p "$STRICT_ARTIFACTS_DIR"
+            printf '{"build_purpose":"diagnostic-native","publishable":false}\n' \
+                > "$STRICT_ARTIFACTS_DIR/.dsr-build-purpose.json"
+            printf 'retained diagnostic bytes\n' > "$STRICT_ARTIFACTS_DIR/test-tool-darwin-arm64"
+            if [[ "$purpose_case" == marker-stream ]]; then
+                printf '{"build_purpose":"release","publishable":true}\n' \
+                    >> "$STRICT_ARTIFACTS_DIR/.dsr-build-purpose.json"
+            fi
+        fi
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" release test-tool v1.0.0 \
+            --artifacts "$STRICT_ARTIFACTS_DIR"
+        if [[ "$(exec_status)" -eq 4 && ! -s "$STRICT_MUTATION_LOG" ]] && \
+           { exec_stderr_contains 'purpose' || exec_stderr_contains 'not publishable'; }; then
+            pass "release rejects $purpose_case without publication mutation"
+        else
+            fail "release purpose boundary failed: $purpose_case status=$(exec_status)"
+            echo "stderr: $(exec_stderr)"
+        fi
+        remove_strict_github_mocks
+        harness_teardown
+    done
+}
+
+# ============================================================================
 # Tests: JSON Output
 # ============================================================================
 
@@ -2804,6 +2927,8 @@ echo ""
 
 if [[ "${DSR_E2E_RELEASE_STRICT_ONLY:-0}" == "1" ]]; then
     echo "Strict Release Contract Tests (mocked GitHub):"
+    test_diagnostic_native_cli_plan
+    test_release_refuses_diagnostic_purpose
     test_strict_release_uploads_exact_set_then_publishes
     test_strict_release_records_live_tag_ruleset_receipt
     test_strict_release_rejects_invalid_tag_ruleset_before_mutation
@@ -2925,6 +3050,8 @@ test_strict_release_incomplete_remote_asset_stays_draft
 test_strict_release_invalid_remote_asset_id_stays_draft
 test_strict_build_rejects_untracked_source_even_allow_dirty
 test_strict_build_rejects_no_sync
+test_diagnostic_native_cli_plan
+test_release_refuses_diagnostic_purpose
 
 echo ""
 echo "JSON Output Tests:"

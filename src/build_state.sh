@@ -590,6 +590,8 @@ build_state_set_context() {
   local parallel_jobs="${8:-1}"
   local target_hosts_json="${9:-}"
   [[ -n "$target_hosts_json" ]] || target_hosts_json='{}'
+  local build_purpose="${10:-release}"
+  [[ "$build_purpose" == "release" || "$build_purpose" == "diagnostic-native" ]] || return 1
 
   local tool_dir state_file now
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
@@ -604,11 +606,14 @@ build_state_set_context() {
     --arg sha "$git_sha" --arg ref "$git_ref" \
     --argjson source_roots "$source_roots_json" \
     --argjson target_hosts "$target_hosts_json" \
+    --arg build_purpose "$build_purpose" \
     --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
     --arg now "$now" '
       .git_sha = $sha |
       .git_ref = $ref |
       .context = {
+        build_purpose: $build_purpose,
+        publishable: ($build_purpose == "release"),
         source_roots: $source_roots,
         target_hosts: $target_hosts,
         output_dir: $output_dir,

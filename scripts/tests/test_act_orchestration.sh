@@ -1561,6 +1561,7 @@ archive_manifest_input=$(jq -nc \
     --argjson windows "$archive_windows_staged" '
     {
         tool: "focrarchive",
+        build_purpose: "release", publishable: true,
         version: "v1.0.0",
         run_id: "550e8400-e29b-41d4-a716-446655440040",
         git_sha: $sha,
@@ -1568,7 +1569,7 @@ archive_manifest_input=$(jq -nc \
         source_dependencies: [],
         status: "success",
         summary: {total: 2, success: 2, failed: 0},
-        targets: [$linux, $windows]
+        targets: ([$linux, $windows] | map(. + {build_purpose: "release", publishable: true}))
     }
 ')
 archive_manifest=$(
@@ -1605,6 +1606,7 @@ workspace_manifest_input=$(jq -nc \
     --argjson linux "$workspace_archive_staged" '
     {
         tool: "focrworkspace",
+        build_purpose: "release", publishable: true,
         version: "v1.0.0",
         run_id: "550e8400-e29b-41d4-a716-446655440042",
         git_sha: $sha,
@@ -1612,7 +1614,7 @@ workspace_manifest_input=$(jq -nc \
         source_dependencies: [],
         status: "success",
         summary: {total: 1, success: 1, failed: 0},
-        targets: [$linux]
+        targets: [$linux + {build_purpose: "release", publishable: true}]
     }
 ')
 workspace_manifest=$(
@@ -1640,7 +1642,9 @@ if jq -e --arg sha "$(_act_sha256 "$workspace_archive_source")" '
         size_bytes: .artifacts[0].size_bytes,
         archive_format: "tar.gz",
         signed: false,
-        signature_file: ""
+        signature_file: "",
+        build_purpose: "release",
+        publishable: true
     }]
 ' <<< "$workspace_manifest" &>/dev/null; then
     pass "strict manifest accepts a validated prepackaged multi-binary workspace archive"
@@ -1669,6 +1673,7 @@ extra_manifest_input=$(jq -nc \
     --argjson target "$extra_primary_result" '
     {
         tool: "focrextra",
+        build_purpose: "release", publishable: true,
         version: "v1.0.0",
         run_id: "550e8400-e29b-41d4-a716-446655440044",
         git_sha: $sha,
@@ -1676,7 +1681,7 @@ extra_manifest_input=$(jq -nc \
         source_dependencies: [],
         status: "success",
         summary: {total: 1, success: 1, failed: 0},
-        targets: [$target]
+        targets: [$target + {build_purpose: "release", publishable: true}]
     }
 ')
 extra_manifest=$(
@@ -3256,6 +3261,202 @@ if [[ $absolute_path_status -ne 0 ]]; then
     pass "strict sync rejects absolute Cargo sibling paths instead of rewriting tag bytes"
 else
     fail "strict sync accepted and could mutate an absolute Cargo sibling path"
+fi
+
+# Diagnostic purpose controls exercise the real coordinator, staging, receipts,
+# and manifest against a real clean tagged local repository. Only the native
+# transport/source-root verifier is simulated; these are not native build proofs.
+diagnostic_repo="$TEMP_DIR/diagnostic-source"
+mkdir -p "$diagnostic_repo"
+git -C "$diagnostic_repo" init -q
+git -C "$diagnostic_repo" config user.name DSR-Test
+git -C "$diagnostic_repo" config user.email dsr-test@example.invalid
+printf 'diagnostic source\n' > "$diagnostic_repo/source.txt"
+git -C "$diagnostic_repo" add source.txt
+git -C "$diagnostic_repo" commit -qm 'diagnostic source fixture'
+git -C "$diagnostic_repo" tag v1.0.0
+diagnostic_sha=$(git -C "$diagnostic_repo" rev-parse HEAD)
+diagnostic_run="550e8400-e29b-41d4-a716-446655440091"
+diagnostic_root=$(_act_strict_source_root_path "$diagnostic_repo" diagnostictest "$diagnostic_run" mmini)
+diagnostic_roots=$(jq -nc --arg root "$diagnostic_root" '{mmini: $root}')
+diagnostic_calls="$TEMP_DIR/diagnostic-native-calls"
+diagnostic_payload="$TEMP_DIR/diagnostictest"
+write_minimal_target_binary "$diagnostic_payload" darwin/arm64
+cat > "$ACT_REPOS_DIR/diagnostictest.yaml" <<EOF
+tool_name: diagnostictest
+repo: test/diagnostictest
+local_path: $diagnostic_repo
+language: go
+build_cmd: go build ./...
+binary_name: diagnostictest
+targets: [linux/amd64, darwin/arm64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: diagnostictest-linux-amd64
+    darwin/arm64: diagnostictest-darwin-arm64
+EOF
+run_diagnostic_fixture() (
+    act_platform_uses_act() { return 1; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    _act_verify_strict_source_roots() {
+        [[ "$1" == diagnostictest && "$2" == "$diagnostic_sha" && "$3" == "$diagnostic_roots" ]]
+    }
+    act_run_native_build() {
+        printf '%s\n' "$*" >> "$diagnostic_calls"
+        [[ "$2" == darwin/arm64 && "$5" == "$diagnostic_root" &&
+           "$6" == "$diagnostic_sha" && "$7" == v1.0.0 && "$8" == mmini ]] || return 99
+        # A command's claim to be publishable is deliberately hostile input.
+        with_collection_receipt "$(jq -nc --arg path "$diagnostic_payload" \
+            '{platform: "darwin/arm64", host: "mmini", method: "native",
+              status: "success", artifact_path: $path, artifact_paths: [$path],
+              build_purpose: "release", publishable: true}')" "$diagnostic_payload"
+    }
+    act_orchestrate_build diagnostictest v1.0.0 "$@" \
+        --git-sha "$diagnostic_sha" --git-ref v1.0.0 --run-id "$diagnostic_run" \
+        --output-dir "$DSR_STATE_DIR/diagnostics/diagnostictest-v1.0.0/$diagnostic_run" \
+        --source-roots-json "$diagnostic_roots" \
+        --target-hosts-json '{"darwin/arm64":"mmini"}' -- darwin/arm64
+)
+diagnostic_status=0
+run_diagnostic_fixture > "$TEMP_DIR/diagnostic-normal-refused.json" \
+    2> "$TEMP_DIR/diagnostic-normal-refused.log" || diagnostic_status=$?
+if [[ "$diagnostic_status" -eq 4 && ! -e "$diagnostic_calls" ]]; then
+    pass "normal strict subset is refused before native transport"
+else
+    fail "normal strict subset reached native transport"
+fi
+diagnostic_status=0
+diagnostic_result=$(run_diagnostic_fixture --diagnostic-native \
+    2> "$TEMP_DIR/diagnostic-native.log") || diagnostic_status=$?
+act_load_repo_config diagnostictest >/dev/null 2>&1 || diagnostic_status=$?
+diagnostic_manifest=$(act_generate_manifest "$diagnostic_result" "" \
+    2> "$TEMP_DIR/diagnostic-manifest.log") || diagnostic_status=$?
+diagnostic_state=$(build_state_get diagnostictest v1.0.0 "$diagnostic_run")
+if [[ "$diagnostic_status" -eq 0 && "$(wc -l < "$diagnostic_calls" | tr -d ' ')" -eq 1 ]] && \
+   jq -en --argjson result "$diagnostic_result" --argjson manifest "$diagnostic_manifest" \
+       --argjson state "$diagnostic_state" --arg sha "$diagnostic_sha" '
+        $result.status == "success" and $result.summary == {total:1, success:1, failed:0} and
+        $result.build_purpose == "diagnostic-native" and $result.publishable == false and
+        all($result.targets[]; .build_purpose == "diagnostic-native" and .publishable == false) and
+        $state.context.build_purpose == "diagnostic-native" and $state.context.publishable == false and
+        $manifest.source.git_sha == $sha and $manifest.source.git_ref == "v1.0.0" and
+        $manifest.build_purpose == "diagnostic-native" and $manifest.publishable == false and
+        $manifest.requested_targets == ["darwin/arm64"] and
+        ($manifest.artifacts | length) == 1 and
+        all($manifest.artifacts[]; .target == "darwin/arm64" and
+            .build_purpose == "diagnostic-native" and .publishable == false)
+    ' >/dev/null; then
+    pass "diagnostic subset keeps source/target receipts and cannot inherit command publication claims"
+else
+    fail "diagnostic subset purpose/source/manifest mismatch (status=$diagnostic_status)"
+fi
+diagnostic_target=$(jq -c '.targets[0]' <<< "$diagnostic_result")
+diagnostic_stream=$(printf '%s\n%s\n' "$diagnostic_target" \
+    '{"build_purpose":"release","publishable":true}')
+if ! _act_build_purpose_matches "$diagnostic_stream" release true; then
+    pass "purpose authority rejects diagnostic-then-release JSON streams"
+else
+    fail "purpose authority accepted the last object of a mixed JSON stream"
+fi
+if _act_target_result_available "$diagnostic_target" diagnostic-native true && \
+   ! _act_target_result_available "$diagnostic_target" release true && \
+   ! _act_target_result_available "$diagnostic_target"; then
+    pass "diagnostic bytes can only be reused by the same explicit purpose"
+else
+    fail "diagnostic artifact availability crossed purpose boundary"
+fi
+for purpose_mutation in \
+    'del(.build_purpose)' '.publishable = true' \
+    'del(.requested_targets)' '.targets[0].method = "act"' \
+    '.targets[0].build_purpose = "release"' 'del(.targets[0].publishable)' \
+    '.build_purpose = "release" | .publishable = true | .targets[] |= (.build_purpose = "release" | .publishable = true)'; do
+    poisoned_result=$(jq -c "$purpose_mutation" <<< "$diagnostic_result")
+    if act_generate_manifest "$poisoned_result" "" \
+        > "$TEMP_DIR/diagnostic-poison-output" 2> "$TEMP_DIR/diagnostic-poison.log"; then
+        fail "strict manifest accepted purpose mutation: $purpose_mutation"
+    else
+        pass "strict manifest refuses purpose mutation: $purpose_mutation"
+    fi
+done
+
+# Configuration removal cannot relabel the already classified result through
+# the ordinary manifest writer.
+if ( _act_release_contract_json() { printf 'null\n'; }
+     act_generate_manifest "$diagnostic_result" "" ) \
+    > "$TEMP_DIR/diagnostic-config-drift-output" 2> "$TEMP_DIR/diagnostic-config-drift.log"; then
+    fail "ordinary manifest writer laundered diagnostic result after config drift"
+else
+    pass "ordinary manifest writer rejects diagnostic result after config drift"
+fi
+
+# Each mutation restores the same real run context first. Check embedded state
+# and immutable sidecars independently; no additional native work may be admitted.
+diagnostic_workspace=$(build_state_workspace diagnostictest v1.0.0 "$diagnostic_run")
+diagnostic_state_file="$diagnostic_workspace/state.json"
+diagnostic_sidecar=$(jq -r '.targets[0].result_path' <<< "$diagnostic_result")
+diagnostic_saved_sidecar=$(cat "$diagnostic_sidecar")
+for purpose_case in context_missing context_mixed embedded_missing embedded_mixed sidecar_missing sidecar_mixed sidecar_stream; do
+    printf '%s\n' "$diagnostic_saved_sidecar" > "$diagnostic_sidecar"
+    case "$purpose_case" in
+        context_missing) purpose_mutation='del(.context.build_purpose)' ;;
+        context_mixed) purpose_mutation='.context.build_purpose = "release" | .context.publishable = true' ;;
+        embedded_missing) purpose_mutation='del(.target_statuses["darwin/arm64"].result.build_purpose)' ;;
+        embedded_mixed) purpose_mutation='.target_statuses["darwin/arm64"].result.publishable = true' ;;
+        sidecar_missing)
+            purpose_mutation='.'
+            jq 'del(.build_purpose)' <<< "$diagnostic_saved_sidecar" > "$diagnostic_sidecar" ;;
+        sidecar_mixed)
+            purpose_mutation='.'
+            jq '.publishable = true' <<< "$diagnostic_saved_sidecar" > "$diagnostic_sidecar" ;;
+        sidecar_stream)
+            purpose_mutation='.'
+            jq '.build_purpose = "release" | .publishable = true' <<< "$diagnostic_saved_sidecar" > "$diagnostic_sidecar"
+            printf '%s\n' "$diagnostic_saved_sidecar" >> "$diagnostic_sidecar" ;;
+    esac
+    jq "$purpose_mutation" <<< "$diagnostic_state" > "$diagnostic_state_file"
+    diagnostic_status=0
+    run_diagnostic_fixture --diagnostic-native --resume-run-id "$diagnostic_run" \
+        > "$TEMP_DIR/diagnostic-resume-$purpose_case.json" \
+        2> "$TEMP_DIR/diagnostic-resume-$purpose_case.log" || diagnostic_status=$?
+    if [[ "$diagnostic_status" -eq 4 && "$(wc -l < "$diagnostic_calls" | tr -d ' ')" -eq 1 ]]; then
+        pass "resume refuses $purpose_case before any native work"
+    else
+        fail "resume admitted invalid diagnostic purpose: $purpose_case status=$diagnostic_status"
+    fi
+done
+printf '%s\n' "$diagnostic_saved_sidecar" > "$diagnostic_sidecar"
+printf '%s\n' "$diagnostic_state" > "$diagnostic_state_file"
+diagnostic_status=0
+diagnostic_resumed=$(run_diagnostic_fixture --diagnostic-native --resume-run-id "$diagnostic_run" \
+    2> "$TEMP_DIR/diagnostic-resume-same-purpose.log") || diagnostic_status=$?
+if [[ "$diagnostic_status" -eq 0 && "$(wc -l < "$diagnostic_calls" | tr -d ' ')" -eq 1 ]] && \
+   jq -e '.status == "success" and .targets[0].resume_reused == true and
+       .targets[0].build_purpose == "diagnostic-native" and .targets[0].publishable == false' \
+       <<< "$diagnostic_resumed" >/dev/null; then
+    pass "same-purpose diagnostic resume reuses the frozen target without rebuilding"
+else
+    fail "same-purpose diagnostic resume lost exact retained authority"
+fi
+
+# Configured family requirements are selected before output exists; absent
+# selected additions and ambiguous/unowned additions must fail closed.
+diagnostic_contract=$(config_get_release_contract_json diagnostictest)
+diagnostic_owned_contract=$(jq '.exact_additional_assets = ["darwin-proof", "linux-proof", "SHA256SUMS"]' <<< "$diagnostic_contract")
+printf '\nworkspace_additional_artifacts:\n  darwin/arm64: [darwin-proof]\n  linux/amd64: [linux-proof]\n' >> "$ACT_REPOS_DIR/diagnostictest.yaml"
+diagnostic_projection=$(_act_contract_for_build_purpose diagnostictest "$diagnostic_owned_contract" \
+    '["darwin/arm64"]' diagnostic-native)
+if jq -e '.exact_additional_assets == ["darwin-proof"] and
+    (.exact_primary_assets | keys) == ["darwin/arm64"]' <<< "$diagnostic_projection" >/dev/null && \
+   ! _act_generate_contract_manifest "$diagnostic_result" "" "$diagnostic_owned_contract" \
+       > "$TEMP_DIR/diagnostic-missing-family.json" 2> "$TEMP_DIR/diagnostic-missing-family.log" && \
+   ! _act_contract_for_build_purpose diagnostictest "$diagnostic_contract" \
+       '["darwin/arm64"]' diagnostic-native > "$TEMP_DIR/diagnostic-unowned.json" \
+       2> "$TEMP_DIR/diagnostic-unowned.log"; then
+    pass "diagnostic projection requires selected configured additions and rejects unowned mappings"
+else
+    fail "diagnostic projection weakened configured family requirements"
 fi
 
 # Cleanup

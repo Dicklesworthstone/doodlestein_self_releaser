@@ -311,6 +311,31 @@ Parallel builds keep attempt-scoped logs and results per target. A partial run
 preserves verified completed artifacts; resume retries only incomplete targets.
 The authoritative manifest is withheld until every requested target succeeds.
 
+For native performance measurements of a tool with a strict release contract,
+use an explicit diagnostic build:
+
+```bash
+dsr build frankenterm --version 0.15.6-rc.13 --diagnostic-native --target darwin/arm64
+```
+
+This builds only the requested native targets while retaining the clean tagged
+source, pinned dependency, immutable host snapshot, and application family
+checks. It requires explicit targets and writes to
+`$DSR_STATE_DIR/diagnostics/<tool>-<tag>/<run-id>`; `--output-dir`, `--no-sync`,
+and `--sync-only` are unavailable in this mode. Additional assets must have
+exact target ownership in `workspace_additional_artifacts`.
+
+Diagnostic run state, target receipts, and manifests record
+`build_purpose: "diagnostic-native"` and `publishable: false`. Resume requires
+the same purpose and source bindings. Release, release verification, and
+release artifact reuse reject diagnostic outputs, even if the tool's strict
+contract is subsequently removed. Strict release manifests require explicit
+`build_purpose: "release"` and `publishable: true` on the manifest and its
+artifacts; older unclassified strict manifests must be rebuilt. An ordinary
+release build still requires the complete configured strict target set.
+Diagnostic completion proves only the selected build, not release readiness
+or a performance improvement.
+
 For Rust workspaces that ship more than one executable, list each name under
 `workspace_binaries`. DSR packages them together and also includes every
 regular companion file named by `include_files`; every path component must be

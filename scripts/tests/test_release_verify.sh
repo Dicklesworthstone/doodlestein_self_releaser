@@ -246,14 +246,15 @@ YAML
             tool: $tool,
             version: $tag,
             run_id: "strict-verify",
+            build_purpose: "release", publishable: true,
             source: {git_sha: $git_sha, git_ref: $tag, dependencies: []},
             built_at: "2026-01-30T12:00:00Z",
             duration_ms: 1,
             status: "success",
             summary: {total: 1, success: 1, failed: 0},
             artifacts: [
-                {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $sha, size_bytes: $size},
-                {name: ($tool + ".sbom.spdx.json"), target: "additional", sha256: $additional_sha, size_bytes: $additional_size}
+                {name: ($tool + "-linux-amd64"), target: "linux/amd64", sha256: $sha, size_bytes: $size, build_purpose: "release", publishable: true},
+                {name: ($tool + ".sbom.spdx.json"), target: "additional", sha256: $additional_sha, size_bytes: $additional_size, build_purpose: "release", publishable: true}
             ]
         }
     ' > "$artifacts_dir/${tool}-${tag}-manifest.json"
@@ -1195,6 +1196,49 @@ test_verify_detects_extra_assets() {
 
     remove_release_verify_mock_gh
     harness_teardown
+}
+
+test_verify_refuses_diagnostic_purpose_before_remote_access() {
+    local purpose_case mutation
+    for purpose_case in diagnostic missing mixed-artifact inconsistent config-drift; do
+        ((TESTS_RUN++))
+        harness_setup
+        seed_strict_verify_fixture
+        local manifest="$DSR_STATE_DIR/artifacts/test-tool-v1.0.0/test-tool-v1.0.0-manifest.json"
+        local original
+        original=$(cat "$manifest")
+        case "$purpose_case" in
+            diagnostic|config-drift) mutation='.build_purpose = "diagnostic-native" | .publishable = false' ;;
+            missing) mutation='del(.build_purpose)' ;;
+            mixed-artifact) mutation='.artifacts[0].build_purpose = "diagnostic-native" | .artifacts[0].publishable = false' ;;
+            inconsistent) mutation='.publishable = false' ;;
+        esac
+        jq "$mutation" <<< "$original" > "$manifest"
+        if [[ "$purpose_case" == config-drift ]]; then
+            yq -i 'del(.release_contract)' "$DSR_CONFIG_DIR/repos.d/test-tool.yaml"
+        fi
+        export DIAGNOSTIC_VERIFY_REMOTE_LOG="$TEST_TMPDIR/diagnostic-verify-remote.log"
+        gh() {
+            if [[ "${1:-}" == auth ]]; then
+                [[ "${2:-}" == token ]] && printf 'diagnostic-test-token\n'
+                return 0
+            fi
+            printf '%s\n' "$*" >> "$DIAGNOSTIC_VERIFY_REMOTE_LOG"
+            return 99
+        }
+        export -f gh
+        exec_run "$DSR_CMD" release verify test-tool v1.0.0 --fix
+        if [[ "$(exec_status)" -eq 4 && ! -e "$DIAGNOSTIC_VERIFY_REMOTE_LOG" ]] && \
+           exec_stderr_contains 'purpose'; then
+            pass "release verify refuses $purpose_case before remote access or repair"
+        else
+            fail "release verify purpose boundary failed: $purpose_case status=$(exec_status)"
+            echo "stderr: $(exec_stderr)"
+        fi
+        unset -f gh
+        unset DIAGNOSTIC_VERIFY_REMOTE_LOG
+        harness_teardown
+    done
 }
 
 test_strict_verify_requires_exact_names_sizes_and_sidecars() {
@@ -2665,6 +2709,7 @@ echo "Asset Comparison Tests (mocked gh):"
 test_verify_all_assets_present
 test_verify_detects_missing_assets
 test_verify_detects_extra_assets
+test_verify_refuses_diagnostic_purpose_before_remote_access
 test_strict_verify_requires_exact_names_sizes_and_sidecars
 test_strict_verify_rejects_extra_or_incomplete_remote_assets
 test_strict_verify_rejects_remote_digest_mismatch

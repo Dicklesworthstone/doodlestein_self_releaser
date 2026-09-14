@@ -1560,6 +1560,78 @@ _act_release_contract_json() {
     printf '%s\n' "$contract"
 }
 
+# Purpose is persisted authority, not a hint inferred from the selected targets.
+# Legacy ordinary builds may omit it; strict builds and every diagnostic require it.
+_act_build_purpose_matches() {
+    local document="$1" expected="$2" require_purpose="${3:-true}"
+    jq -es --arg expected "$expected" --argjson required "$require_purpose" '
+        if length != 1 or (.[0] | type) != "object" then false else .[0] |
+        if (has("build_purpose") or has("publishable")) then
+            .build_purpose == $expected and
+            ($expected == "release" or $expected == "diagnostic-native") and
+            .publishable == ($expected == "release")
+        else ($required | not) and $expected == "release" end end
+    ' <<< "$document" >/dev/null 2>&1
+}
+
+# Project only the artifact inventory, retaining all other strict validators.
+# Additional assets must have unambiguous configured target ownership; observed
+# outputs can never determine which family members a diagnostic is required to have.
+_act_contract_for_build_purpose() {
+    local tool="$1" contract="$2" requested="$3" purpose="$4"
+    if ! jq -en --argjson contract "$contract" --argjson requested "$requested" '
+        ($requested | type == "array" and length > 0) and
+        ($requested | length) == ($requested | unique | length) and
+        (($requested - ($contract.exact_primary_assets | keys)) | length) == 0
+    ' >/dev/null 2>&1; then
+        _log_error "Build targets must be a nonempty unique subset of the strict contract"
+        return 4
+    fi
+    if [[ "$purpose" == "release" ]]; then
+        if ! jq -en --argjson contract "$contract" --argjson requested "$requested" \
+            '($requested | sort) == ($contract.exact_primary_assets | keys | sort)' >/dev/null; then
+            _log_error "Strict release contract requires the complete configured target set"
+            return 4
+        fi
+        printf '%s\n' "$contract"
+        return 0
+    fi
+    [[ "$purpose" == "diagnostic-native" ]] || return 4
+    local ownership='{}' target additional
+    while IFS= read -r target; do
+        if act_platform_uses_act "$tool" "$target"; then
+            _log_error "Diagnostic target $target must use the strict native runner"
+            return 4
+        fi
+    done < <(jq -r '.[]' <<< "$requested")
+    while IFS= read -r target; do
+        additional=$(_act_workspace_additional_artifacts_json "$ACT_REPOS_DIR/$tool.yaml" "$target") || return 4
+        if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' \
+            <<< "$additional" >/dev/null; then
+            _log_error "Diagnostic additional artifact ownership is invalid for $target"
+            return 4
+        fi
+        ownership=$(jq -nc --argjson owners "$ownership" --arg target "$target" \
+            --argjson additional "$additional" '$owners + {($target): $additional}') || return 4
+    done < <(jq -r '.exact_primary_assets | keys[]' <<< "$contract")
+    if ! jq -en --argjson owners "$ownership" --argjson contract "$contract" '
+        [$owners[][]] as $owned |
+        [($contract.exact_additional_assets // [])[] |
+         select((endswith(".sha256") or endswith(".minisig") or startswith("SHA256SUMS")) | not)] as $expected |
+        ($owned | length) == ($owned | unique | length) and
+        ($owned | sort) == ($expected | sort)
+    ' >/dev/null; then
+        _log_error "Diagnostic builds require exact configured ownership of additional assets"
+        return 4
+    fi
+    jq -nc --argjson contract "$contract" --argjson requested "$requested" \
+        --argjson owners "$ownership" '
+        $contract |
+        .exact_primary_assets |= with_entries(select(.key as $key | $requested | index($key))) |
+        .exact_additional_assets = [$requested[] as $target | $owners[$target][]]
+    '
+}
+
 _act_release_source_dependencies_json() {
     local tool_name="$1"
     local dependencies
@@ -7036,6 +7108,8 @@ _act_result_artifact_receipts() {
 # artifacts recorded at target completion.
 _act_target_result_available() {
     local result_json="$1"
+    local purpose="${2:-release}" require_purpose="${3:-false}"
+    _act_build_purpose_matches "$result_json" "$purpose" "$require_purpose" || return 1
     jq -e '(.status == "success" or .status == "ok" or .status == "passed")' \
         <<< "$result_json" &>/dev/null || return 1
     local expected actual
@@ -7173,6 +7247,7 @@ _act_run_target_worker() {
     local release_git_sha="${11:-}"
     local release_git_ref="${12:-}"
     local bound_host="${13:-}"
+    local build_purpose="${14:-release}"
 
     local host="${bound_host:-act-local}"
     local slot_id="${run_id}-${target//\//-}-attempt-${attempt}"
@@ -7180,6 +7255,10 @@ _act_run_target_worker() {
 
     _act_write_worker_result() {
         local body="$1"
+        # Never trust build-command stdout to classify an artifact for publication.
+        body=$(jq -c --arg purpose "$build_purpose" \
+            '. + {build_purpose: $purpose, publishable: ($purpose == "release")}' \
+            <<< "$body") || return 4
         (
             umask 077
             set -o noclobber
@@ -7291,9 +7370,14 @@ act_orchestrate_build() {
     local supplied_run_id="" source_roots_json="{}"
     local target_hosts_json='{}'
     local parallel_jobs=1 resume_run=false supplied_output_dir=""
+    local build_purpose="release"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --diagnostic-native)
+                build_purpose="diagnostic-native"
+                shift
+                ;;
             --git-sha)
                 [[ $# -ge 2 ]] || { _log_error "--git-sha requires a value"; return 4; }
                 supplied_git_sha="$2"
@@ -7378,6 +7462,11 @@ act_orchestrate_build() {
 
     local strict_release_contract=false
     [[ "$release_contract_json" != "null" ]] && strict_release_contract=true
+    if [[ "$build_purpose" == "diagnostic-native" ]] && \
+       { ! $strict_release_contract || [[ ${#targets_arg[@]} -eq 0 ]]; }; then
+        _log_error "Diagnostic native builds require a strict contract and explicit native targets"
+        return 4
+    fi
 
     # Get targets (from args or config)
     local targets
@@ -7406,12 +7495,8 @@ act_orchestrate_build() {
     fi
 
     if $strict_release_contract; then
-        if ! jq -en \
-            --argjson contract "$release_contract_json" \
-            --argjson requested "$requested_targets_json" '
-                ($requested | length) == ($requested | unique | length) and
-                ($requested | sort) == ($contract.exact_primary_assets | keys | sort)
-            ' >/dev/null 2>&1; then
+        if ! _act_contract_for_build_purpose "$tool_name" "$release_contract_json" \
+            "$requested_targets_json" "$build_purpose" >/dev/null; then
             _log_error "Strict release contract requires the exact configured target set"
             jq -nc --arg tool "$tool_name" --arg error "Release target set does not match contract" \
                 '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
@@ -7540,6 +7625,13 @@ act_orchestrate_build() {
             return 4
         fi
     fi
+    if [[ "$build_purpose" == "diagnostic-native" ]]; then
+        local diagnostic_output="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/diagnostics/${tool_name}-v${version#v}/$requested_run_id"
+        if [[ "$supplied_output_dir" != "$diagnostic_output" ]]; then
+            _log_error "Diagnostic orchestration requires its run-bound private output namespace"
+            return 4
+        fi
+    fi
 
     if command -v build_state_create &>/dev/null; then
         # build_state_create is captured below, so any initialization it did
@@ -7569,6 +7661,33 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
+            if ! _act_build_purpose_matches "$(jq -c '.context // {}' <<< "$resume_state")" \
+                "$build_purpose" "$strict_release_contract"; then
+                _log_error "Resume build purpose is missing or differs from this request"
+                _act_release_orchestration_lock
+                return 4
+            fi
+            # Inspect both authorities before admitting any resumed worker.
+            # A valid embedded result cannot launder a differently purposed sidecar.
+            local resume_entry resume_receipt resume_result_path
+            while IFS= read -r resume_entry; do
+                resume_receipt=$(jq -c '.result // empty' <<< "$resume_entry")
+                if [[ -n "$resume_receipt" ]] && \
+                   ! _act_build_purpose_matches "$resume_receipt" "$build_purpose" "$strict_release_contract"; then
+                    _log_error "Resume target result has missing or different build purpose"
+                    _act_release_orchestration_lock
+                    return 4
+                fi
+                resume_result_path=$(jq -r '.result_path // empty' <<< "$resume_entry")
+                if [[ -n "$resume_result_path" && -s "$resume_result_path" ]]; then
+                    if ! resume_receipt=$(jq -ce '.' "$resume_result_path") || \
+                       ! _act_build_purpose_matches "$resume_receipt" "$build_purpose" "$strict_release_contract"; then
+                        _log_error "Resume sidecar has missing or different build purpose"
+                        _act_release_orchestration_lock
+                        return 4
+                    fi
+                fi
+            done < <(jq -c '.target_statuses[]?' <<< "$resume_state")
             resume_requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
                 jq -Rsc 'split("\n") | map(select(length > 0))')
             if ! jq -en --argjson state "$resume_state" --arg run_id "$requested_run_id" \
@@ -7606,8 +7725,8 @@ act_orchestrate_build() {
             if ! run_id=$(DSR_RUN_ID="$requested_run_id" \
                 build_state_create "$tool_name" "$version" "${targets// /,}") || \
                [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id" || \
-               ! build_state_set_context "$tool_name" "$version" "$run_id" \
-                    "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" "$target_hosts_json"; then
+                ! build_state_set_context "$tool_name" "$version" "$run_id" \
+                    "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" "$target_hosts_json" "$build_purpose"; then
                 _log_error "Build state could not retain the run context"
                 _act_release_orchestration_lock
                 return 4
@@ -7658,7 +7777,11 @@ act_orchestrate_build() {
         local host="${worker_hosts[$index]}" attempt="${worker_attempts[$index]}"
         local finished_result status extra
         if [[ -s "$result_path" ]] && finished_result=$(jq -ce '.' "$result_path" 2>/dev/null); then
-            :
+            if ! _act_build_purpose_matches "$finished_result" "$build_purpose" true; then
+                finished_result=$(jq -nc --arg target "$finished_target" --arg host "$host" \
+                    '{platform: $target, host: $host, status: "failed", exit_code: 4,
+                      error: "Worker result purpose is missing or inconsistent"}')
+            fi
         else
             finished_result=$(jq -nc --arg target "$finished_target" --arg host "$host" \
                 --argjson exit_code "$worker_status" \
@@ -7667,7 +7790,9 @@ act_orchestrate_build() {
         fi
         finished_result=$(jq -c --arg log_path "$log_path" --arg result_path "$result_path" \
             --argjson attempt "$attempt" \
-            '. + {log_path: $log_path, result_path: $result_path, attempt: $attempt}' \
+            --arg purpose "$build_purpose" \
+            '. + {log_path: $log_path, result_path: $result_path, attempt: $attempt,
+                  build_purpose: $purpose, publishable: ($purpose == "release")}' \
             <<< "$finished_result")
         final_results["$finished_target"]="$finished_result"
         status=$(jq -r '.status // "unknown"' <<< "$finished_result")
@@ -7754,14 +7879,27 @@ act_orchestrate_build() {
         fi
 
         if $resume_run; then
-            if [[ -n "$persisted_result" ]] && _act_target_result_available "$persisted_result"; then
+            if [[ -n "$persisted_result" ]] && \
+               ! _act_build_purpose_matches "$persisted_result" "$build_purpose" "$strict_release_contract"; then
+                _log_error "Resume target result has missing or different build purpose: $target"
+                interrupted=true
+                break
+            fi
+            if [[ -n "$persisted_result" ]] && _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
                 final_results["$target"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 _log_info "Resume: reusing completed target $target"
                 continue
             fi
             if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
-               persisted_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null) && \
-               _act_target_result_available "$persisted_result"; then
+               persisted_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
+                if ! _act_build_purpose_matches "$persisted_result" "$build_purpose" "$strict_release_contract"; then
+                    _log_error "Resume sidecar has missing or different build purpose: $target"
+                    interrupted=true
+                    break
+                fi
+            fi
+            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
+               _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
                 final_results["$target"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 if $state_available; then
                     if ! build_state_update_target "$tool_name" "$version" "$target" "completed" \
@@ -7824,7 +7962,7 @@ act_orchestrate_build() {
 
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
-            "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" &
+            "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" &
         worker_pids+=("$!")
         worker_targets+=("$target")
         worker_results+=("$result_path")
@@ -7858,6 +7996,14 @@ act_orchestrate_build() {
             ordered_result=$(jq -nc --arg target "$target" \
                 '{platform: $target, status: "failed", exit_code: 6, error: "No target result"}')
         fi
+        if [[ "$(jq -r '.status // empty' <<< "$ordered_result")" == "success" ]] && \
+           ! _act_build_purpose_matches "$ordered_result" "$build_purpose" "$strict_release_contract"; then
+            ordered_result=$(jq -c '.status = "failed" | .exit_code = 4 |
+                .error = "Target purpose failed final aggregation"' <<< "$ordered_result") || return 4
+        fi
+        ordered_result=$(jq -c --arg purpose "$build_purpose" \
+            '. + {build_purpose: $purpose, publishable: ($purpose == "release")}' \
+            <<< "$ordered_result") || return 4
         results+=("$ordered_result")
         if [[ "$(jq -r '.status // "unknown"' <<< "$ordered_result")" == "success" ]]; then
             success_count=$((success_count + 1))
@@ -7938,8 +8084,13 @@ act_orchestrate_build() {
         --argjson success "$success_count" \
         --argjson failed "$fail_count" \
         --argjson targets "$results_json" \
+        --arg purpose "$build_purpose" \
+        --argjson requested_targets "$requested_targets_json" \
         '{
             tool: $tool,
+            build_purpose: $purpose,
+            publishable: ($purpose == "release"),
+            requested_targets: $requested_targets,
             version: $version,
             run_id: $run_id,
             git_sha: $git_sha,
@@ -8001,6 +8152,28 @@ _act_generate_contract_manifest() {
     git_sha=$(jq -r '.git_sha // empty' <<< "$result_json")
     git_ref=$(jq -r '.git_ref // empty' <<< "$result_json")
     status=$(jq -r '.status // empty' <<< "$result_json")
+
+    local build_purpose requested_targets
+    build_purpose=$(jq -r '.build_purpose // empty' <<< "$result_json")
+    if ! _act_build_purpose_matches "$result_json" "$build_purpose" || \
+       ! jq -e --arg purpose "$build_purpose" '
+            all(.targets[]; .build_purpose == $purpose and
+                .publishable == ($purpose == "release") and
+                (if $purpose == "diagnostic-native" then .method == "native" else true end))
+        ' <<< "$result_json" >/dev/null; then
+        _log_error "Strict manifest requires consistent explicit build purpose on every result"
+        return 4
+    fi
+    if [[ "$build_purpose" == "diagnostic-native" ]]; then
+        requested_targets=$(jq -ce '.requested_targets' <<< "$result_json") || {
+            _log_error "Diagnostic manifest requires the explicitly requested target set"
+            return 4
+        }
+    else
+        requested_targets=$(jq -c '.requested_targets // [.targets[].platform]' <<< "$result_json") || return 4
+    fi
+    contract_json=$(_act_contract_for_build_purpose "$tool" "$contract_json" \
+        "$requested_targets" "$build_purpose") || return 4
 
     local config_file="$ACT_REPOS_DIR/${tool}.yaml"
     local binary_name workspace_binaries
@@ -8318,8 +8491,13 @@ _act_generate_contract_manifest() {
         --argjson summary "$summary_json" \
         --argjson build_environments "$build_environments_json" \
         --argjson artifacts "$artifacts_json" \
+        --arg purpose "$build_purpose" \
+        --argjson requested_targets "$requested_targets" \
         '{
             schema_version: "1.0.0",
+            build_purpose: $purpose,
+            publishable: ($purpose == "release"),
+            requested_targets: $requested_targets,
             tool: $tool,
             version: $version,
             run_id: $run_id,
@@ -8329,7 +8507,8 @@ _act_generate_contract_manifest() {
             status: $status,
             summary: $summary,
             build_environments: $build_environments,
-            artifacts: $artifacts
+            artifacts: ($artifacts | map(. + {build_purpose: $purpose,
+                         publishable: ($purpose == "release")}))
         }'); then
         _log_error "Failed to serialize release manifest"
         return 4
@@ -8388,6 +8567,14 @@ act_generate_manifest() {
     if [[ "$release_contract_json" != "null" ]]; then
         _act_generate_contract_manifest "$result_json" "$output_file" "$release_contract_json"
         return $?
+    fi
+    if ! _act_build_purpose_matches "$result_json" release false || \
+       ! jq -e 'all(.targets[];
+            if has("build_purpose") or has("publishable")
+            then .build_purpose == "release" and .publishable == true
+            else true end)' <<< "$result_json" >/dev/null; then
+        _log_error "Non-release results cannot be converted to an ordinary release manifest"
+        return 4
     fi
     if ! _act_is_uuid "$run_id"; then
         _log_error "Manifest requires a schema-valid run UUID"
@@ -8743,12 +8930,14 @@ act_generate_manifest() {
             version: $version,
             run_id: $run_id,
             source: {git_sha: $git_sha, git_ref: $git_ref, dependencies: []},
+            build_purpose: "release",
+            publishable: true,
             built_at: $built_at,
             duration_ms: $duration_ms,
             status: $status,
             summary: $summary,
             build_environments: $build_environments,
-            artifacts: $artifacts
+            artifacts: ($artifacts | map(. + {build_purpose: "release", publishable: true}))
         }') || {
             _log_error "Failed to serialize manifest"
             return 4
