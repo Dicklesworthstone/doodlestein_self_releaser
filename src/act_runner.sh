@@ -5734,6 +5734,20 @@ act_run_native_build() {
             strict_build_env+=$'\n'"DSR_RELEASE_GIT_REF=$release_git_ref"
         fi
         if [[ "$tool_name" == frankenterm ]]; then
+            # The sealed family identity binds the committed Cargo profiles,
+            # not environment overrides. Check the merged global/target env
+            # before deriving that identity or starting any compiler command.
+            local profile_override_name
+            while IFS= read -r env_pair; do
+                [[ "$env_pair" == *=* ]] || continue
+                profile_override_name="${env_pair%%=*}"
+                if [[ "${profile_override_name^^}" == CARGO_PROFILE_* ]]; then
+                    _log_error "FrankenTerm sealed build forbids profile override $profile_override_name; change committed Cargo.toml instead"
+                    jq -nc --arg variable "$profile_override_name" \
+                        '{status: "error", exit_code: 4, error: ("FrankenTerm sealed build forbids profile override " + $variable + "; change committed Cargo.toml instead")}'
+                    return 4
+                fi
+            done <<< "$strict_build_env"
             local atomic_target atomic_identity
             atomic_target=$(act_get_build_env_value "$strict_build_env" CARGO_BUILD_TARGET) || return 4
             atomic_identity=$(_act_frankenterm_build_identity \

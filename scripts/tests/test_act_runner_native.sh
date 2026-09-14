@@ -668,6 +668,131 @@ test_windows_rust_isolation_receipt_matches_command() {
     fi
 }
 
+test_frankenterm_profile_override_rejection() {
+    log_test "Strict FrankenTerm: merged profile overrides fail before identity or compilation"
+    local platform placement case_dir remote_root bound_host result status key
+    local MOCK_LANGUAGE=rust MOCK_BUILD_CMD=PROFILE_BUILD_MUST_NOT_RUN
+    local MOCK_BUILD_PROFILE=release-interactive MOCK_TOOL_NAME=frankenterm
+    local MOCK_LOCAL_PATH=/local/path/frankenterm MOCK_BINARY_NAME=tool
+    local MOCK_GLOBAL_ENV MOCK_PLATFORM_ENV
+    local SSH_ARGS_FILE SCP_ARGS_FILE RAW_SSH_ARGS_FILE RSYNC_ARGS_FILE
+    touch "$ACT_REPOS_DIR/frankenterm.yaml"
+
+    for platform in darwin/arm64 linux/amd64 linux/arm64 windows/amd64; do
+        case "$platform" in
+            windows/*) remote_root=C:/build/.dsr-release-snapshots/profile/source; bound_host=wlap ;;
+            darwin/*) remote_root=/remote/.dsr-release-snapshots/profile/source; bound_host=mmini ;;
+            *) remote_root=/remote/.dsr-release-snapshots/profile/source; bound_host=trj ;;
+        esac
+        for placement in global target clean; do
+            case_dir="$MOCK_DIR/profile-${platform//\//-}-$placement"
+            mkdir -p "$case_dir"
+            SSH_ARGS_FILE="$case_dir/ssh"
+            SCP_ARGS_FILE="$case_dir/scp"
+            RAW_SSH_ARGS_FILE="$case_dir/raw-ssh"
+            RSYNC_ARGS_FILE="$case_dir/rsync"
+            : > "$MOCK_DIR/staged-build.ps1"
+            MOCK_GLOBAL_ENV=""
+            MOCK_PLATFORM_ENV=$'CARGO_PROFILE=allowed-near-prefix\nCARGO_PROFILES_RELEASE_OPT_LEVEL=allowed-near-prefix\nCARGO_BUILD_JOBS=2'
+            if [[ "$placement" == global ]]; then
+                key=CARGO_PROFILE_RELEASE_INTERACTIVE_OPT_LEVEL
+                MOCK_GLOBAL_ENV="$key=private-profile-value"
+            elif [[ "$placement" == target ]]; then
+                key=cArGo_PrOfIlE_ReLeAsE_PaNiC
+                MOCK_PLATFORM_ENV+=$'\n'"$key="
+            fi
+            status=0
+            result=$(
+                host_health_is_ready() { return 0; }
+                _log_error() { printf '%s\n' "$*" >&2; }
+                _act_frankenterm_build_identity() {
+                    printf 'identity reached\n' > "$case_dir/identity-reached"
+                    return 73
+                }
+                # Ambient inputs are removed by the existing host launcher;
+                # they must not be mistaken for explicitly configured inputs.
+                export CARGO_PROFILE_RELEASE_OPT_LEVEL=ambient-profile-value
+                act_run_native_build frankenterm "$platform" v1.0.0 22222222-2222-4222-8222-222222222222 \
+                    "$remote_root" 1111111111111111111111111111111111111111 v1.0.0 "$bound_host" \
+                    2> "$case_dir/stderr"
+            ) || status=$?
+            if [[ "$placement" == clean ]]; then
+                if [[ "$status" -eq 4 && -s "$case_dir/identity-reached" ]]; then
+                    log_pass "$platform source profile reaches identity despite unrelated or ambient inputs"
+                else
+                    log_fail "$platform source profile did not reach identity: status=$status result=$result"
+                fi
+            elif [[ "$status" -eq 4 && ! -e "$case_dir/identity-reached" ]] && \
+                 jq -e --arg key "$key" \
+                    '.status == "error" and .exit_code == 4 and
+                     (.error | contains($key)) and
+                     (.error | contains("change committed Cargo.toml")) and
+                     (.error | contains("private-profile-value") | not)' <<< "$result" >/dev/null && \
+                 grep -F "$key" "$case_dir/stderr" >/dev/null && \
+                 grep -F 'change committed Cargo.toml' "$case_dir/stderr" >/dev/null && \
+                 ! grep -F 'private-profile-value' "$case_dir/stderr" >/dev/null && \
+                 ! grep -F 'PROFILE_BUILD_MUST_NOT_RUN' "$SSH_ARGS_FILE" >/dev/null 2>&1; then
+                log_pass "$platform $placement override rejected before identity/build without its value"
+            else
+                log_fail "$platform $placement profile override escaped rejection: status=$status result=$result"
+            fi
+        done
+    done
+}
+
+test_profile_overrides_preserve_ordinary_and_other_tools() {
+    log_test "Ordinary FrankenTerm and strict other tools retain configured profile overrides"
+    local platform mode tool_name case_dir result status command remote_root run_id encoded_key
+    local MOCK_LANGUAGE=rust MOCK_BUILD_CMD=env MOCK_BUILD_PROFILE=release-interactive
+    local MOCK_BINARY_NAME=tool MOCK_LOCAL_PATH=/local/path/tool
+    local MOCK_GLOBAL_ENV=CARGO_PROFILE_RELEASE_INTERACTIVE_OPT_LEVEL=3
+    local MOCK_PLATFORM_ENV="" MOCK_SSH_STREAM_FILE
+    local SSH_ARGS_FILE SCP_ARGS_FILE RAW_SSH_ARGS_FILE RSYNC_ARGS_FILE
+    touch "$ACT_REPOS_DIR/tool.yaml" "$ACT_REPOS_DIR/frankenterm.yaml"
+    for platform in darwin/arm64 windows/amd64; do
+        for mode in ordinary-frankenterm strict-other-tool; do
+            case_dir="$MOCK_DIR/profile-preserved-${platform//\//-}-$mode"
+            mkdir -p "$case_dir"
+            SSH_ARGS_FILE="$case_dir/ssh"
+            SCP_ARGS_FILE="$case_dir/scp"
+            RAW_SSH_ARGS_FILE="$case_dir/raw-ssh"
+            RSYNC_ARGS_FILE="$case_dir/rsync"
+            : > "$MOCK_DIR/staged-build.ps1"
+            MOCK_SSH_STREAM_FILE="$case_dir/artifact"
+            if [[ "$platform" == windows/* ]]; then
+                MOCK_LOCAL_PATH=C:/build/tool
+                remote_root=C:/build/.dsr-release-snapshots/profile/source
+                MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            else
+                MOCK_LOCAL_PATH=/local/path/tool
+                remote_root=/remote/.dsr-release-snapshots/profile/source
+                MOCK_ARTIFACT_KIND=macho-arm64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            fi
+            status=0
+            if [[ "$mode" == ordinary-frankenterm ]]; then
+                tool_name=frankenterm
+                run_id=33333333-3333-4333-8333-333333333333
+                result=$(act_run_native_build "$tool_name" "$platform" v1.0.0 "$run_id" 2>/dev/null) || status=$?
+            else
+                tool_name=tool
+                run_id=44444444-4444-4444-8444-444444444444
+                result=$(act_run_native_build "$tool_name" "$platform" v1.0.0 "$run_id" "$remote_root" 2>/dev/null) || status=$?
+            fi
+            command=$(get_ssh_cmd)
+            encoded_key=$(printf '%s' CARGO_PROFILE_RELEASE_INTERACTIVE_OPT_LEVEL | base64 | tr -d '\r\n')
+            if [[ "$status" -eq 0 && ( "$command" == *CARGO_PROFILE_RELEASE_INTERACTIVE_OPT_LEVEL* || \
+                  "$command" == *"$encoded_key"* ) ]] && \
+               jq -e '.status == "success" and
+                  .build_influence_env.CARGO_PROFILE_RELEASE_INTERACTIVE_OPT_LEVEL == "3"' \
+                  <<< "$result" >/dev/null; then
+                log_pass "$platform $mode preserves the configured profile and its receipt"
+            else
+                log_fail "$platform $mode changed ordinary profile behavior: status=$status result=$result"
+            fi
+        done
+    done
+}
+
 test_rust_build_influence_name_xwin_boundaries() {
     log_test "Rust build influence names: XWIN matching is case-insensitive and bounded"
 
@@ -2413,6 +2538,13 @@ test_windows_strict_cargo_metadata_command() {
 # ============================================================================
 
 main() {
+    if [[ "${1:-}" == --profile-env-only ]]; then
+        test_frankenterm_profile_override_rejection
+        test_profile_overrides_preserve_ordinary_and_other_tools
+        printf 'Profile environment tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --sdk-env-only ]]; then
         test_rust_build_influence_name_xwin_boundaries
         test_unix_rust_sdk_environment
@@ -2447,6 +2579,8 @@ main() {
     test_unix_rust_keeps_configured_cargo_path_env
     test_unix_rust_isolation_executes_outside_operator_config
     test_windows_rust_isolation_receipt_matches_command
+    test_frankenterm_profile_override_rejection
+    test_profile_overrides_preserve_ordinary_and_other_tools
     test_rust_build_influence_name_xwin_boundaries
     test_unix_rust_sdk_environment
     test_windows_rust_sdk_environment
