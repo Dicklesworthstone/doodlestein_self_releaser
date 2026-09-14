@@ -697,6 +697,24 @@ XWINNER_CACHE_DIR|miss
 NOT_XWIN_CACHE_DIR|miss
 XWIN-CACHE-DIR|miss
 DSR_RELEASE_GIT_SHA_EXTRA|miss
+OPENSSL_DIR|match
+openssl_static|match
+X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR|match
+aarch64_unknown_linux_gnu_OPENSSL_NO_VENDOR|match
+PKG_CONFIG|match
+PKG_CONFIG_PATH_aarch64-unknown-linux-gnu|match
+PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu|match
+HOST_PKG_CONFIG|match
+TARGET_PKG_CONFIG_SYSROOT_DIR|match
+FONTCONFIG_NO_PKG_CONFIG|match
+LIBCLANG_PATH|match
+libclang_path|match
+OPENSSL|miss
+OPENSSLX_DIR|miss
+NOTPKG_CONFIG|miss
+HOST_PKG_CONFIGURED|miss
+LIBCLANG_PATH_EXTRA|miss
+NOT_LIBCLANG_PATH|miss
 CASES
 
     if [[ -z "$failures" ]]; then
@@ -704,6 +722,156 @@ CASES
     else
         log_fail "Unexpected XWIN influence classifications:$failures"
     fi
+}
+
+test_unix_rust_sdk_environment() {
+    log_test "Unix strict and ordinary Rust: configured SDK selectors replace ambient values"
+    local mode result cmd launch observed status
+    for mode in strict ordinary; do
+        reset_state
+        MOCK_LANGUAGE=rust
+        MOCK_PLATFORM_ENV=$'OPENSSL_DIR=/configured/openssl with spaces\nOPENSSL_STATIC=1\nPKG_CONFIG=/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/configured/pkgconfig\nLIBCLANG_PATH=/configured/libclang'
+        MOCK_BUILD_CMD="env"
+        MOCK_SSH_STREAM_FILE="$MOCK_DIR/sdk-unix-$mode-artifact"
+        write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+        status=0
+        if [[ "$mode" == strict ]]; then
+            result=$(act_run_native_build tool darwin/arm64 v1.0.0 sdk-unix \
+                /remote/.dsr-release-snapshots/sdk/source 2>/dev/null) || status=$?
+        else
+            result=$(act_run_native_build tool darwin/arm64 v1.0.0 sdk-unix 2>/dev/null) || status=$?
+        fi
+        cmd=$(get_ssh_cmd)
+        if [[ "$status" -ne 0 || "$cmd" != *'for sdk_variable in '* ]]; then
+            log_fail "$mode Unix SDK command construction failed: status=$status result=$result"
+            continue
+        fi
+        # Execute the actual generated environment portion without staging a
+        # source tree or running a compiler. The configured build command is env.
+        launch="for sdk_variable in ${cmd#*for sdk_variable in }"
+        observed=$(OPENSSL_DIR=/ambient/openssl OPENSSL_NO_VENDOR=1 \
+            X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=/ambient/target-openssl \
+            PKG_CONFIG=/ambient/pkg-config TARGET_PKG_CONFIG_PATH=/ambient/target-pc \
+            HOST_PKG_CONFIG=/ambient/host-pc FONTCONFIG_NO_PKG_CONFIG=1 \
+            LIBCLANG_PATH=/ambient/libclang LIBCLANG_PATH_EXTRA=preserve \
+            "$BASH" -c "set -e; $launch") || status=$?
+        if [[ "$status" -eq 0 ]] && printf '%s\n' "$observed" | \
+            grep -Fx 'OPENSSL_DIR=/configured/openssl with spaces' >/dev/null && \
+           printf '%s\n' "$observed" | grep -Fx 'LIBCLANG_PATH_EXTRA=preserve' >/dev/null && \
+           ! printf '%s\n' "$observed" | grep -E '^(OPENSSL_NO_VENDOR|X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR|TARGET_PKG_CONFIG_PATH|HOST_PKG_CONFIG|FONTCONFIG_NO_PKG_CONFIG)=' >/dev/null && \
+           jq -e '.status == "success" and
+             .build_influence_env.OPENSSL_DIR == "/configured/openssl with spaces" and
+             .build_influence_env.OPENSSL_STATIC == "1" and
+             .build_influence_env.PKG_CONFIG == "/configured/pkg-config" and
+             .build_influence_env.PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu == "/configured/pkgconfig" and
+             .build_influence_env.LIBCLANG_PATH == "/configured/libclang" and
+             (.build_influence_env | has("OPENSSL_NO_VENDOR") | not)' <<< "$result" >/dev/null; then
+            log_pass "$mode Unix generated SDK cleanup removes inherited selectors and records configured values"
+        else
+            log_fail "$mode Unix SDK environment/receipt mismatch: status=$status result=$result"
+        fi
+        status=0
+        observed=$(env 'PKG_CONFIG_PATH_aarch64-unknown-linux-gnu=/ambient/target-pc' \
+            "$BASH" -c "set -e; $launch" 2>&1) || status=$?
+        if [[ "$status" -eq 4 && "$observed" == *'SDK environment name cannot be isolated by this shell: PKG_CONFIG_PATH_aarch64-unknown-linux-gnu'* ]]; then
+            log_pass "$mode Unix refuses inherited SDK names that shell unset silently preserves"
+        else
+            log_fail "$mode Unix leaked an unsupported target SDK selector: status=$status"
+        fi
+    done
+}
+
+test_windows_rust_sdk_environment() {
+    log_test "Windows strict and ordinary Rust: SDK cleanup, last assignment, and receipt agree"
+    local mode result cmd status script observed env_section first_prefix last_prefix
+    local first_b64 last_b64
+    first_b64=$(printf '%s' 'C:/configured/first' | base64 | tr -d '\r\n')
+    last_b64=$(printf '%s' 'C:/configured/last with spaces' | base64 | tr -d '\r\n')
+    for mode in strict ordinary; do
+        reset_state
+        MOCK_LANGUAGE=rust
+        MOCK_BUILD_CMD='echo fixture-only'
+        MOCK_LOCAL_PATH='C:/Users/dsr/projects/tool'
+        MOCK_PLATFORM_ENV=$'OpenSSL_DIR=C:/configured/first\nopenssl_dir=C:/configured/last with spaces\nOPENSSL_STATIC=1\nX86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=C:/configured/target\nPKG_CONFIG=C:/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=C:/configured/pkgconfig\nLIBCLANG_PATH=C:/configured/libclang'
+        MOCK_SSH_STREAM_FILE="$MOCK_DIR/sdk-windows-$mode-artifact"
+        MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+        status=0
+        if [[ "$mode" == strict ]]; then
+            result=$(act_run_native_build tool windows/amd64 v1.0.0 \
+                12345678-1234-4234-8234-123456789abc \
+                C:/build/.dsr-release-snapshots/sdk/source 2>/dev/null) || status=$?
+        else
+            result=$(act_run_native_build tool windows/amd64 v1.0.0 sdk-windows 2>/dev/null) || status=$?
+        fi
+        cmd=$(get_ssh_cmd)
+        first_prefix="${cmd%%"$first_b64"*}"
+        last_prefix="${cmd%%"$last_b64"*}"
+        if [[ "$status" -ne 0 || "$cmd" != *"$first_b64"* || "$cmd" != *"$last_b64"* || \
+              ${#first_prefix} -ge ${#last_prefix} ]] || \
+           ! jq -e '.status == "success" and
+             .build_influence_env.OPENSSL_DIR == "C:/configured/last with spaces" and
+             ([.build_influence_env | keys[] | select(ascii_upcase == "OPENSSL_DIR")] | length) == 1 and
+             .build_influence_env.OPENSSL_STATIC == "1" and
+             .build_influence_env.X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR == "C:/configured/target" and
+             .build_influence_env.PKG_CONFIG == "C:/configured/pkg-config" and
+             .build_influence_env.PKG_CONFIG_LIBDIR_AARCH64_UNKNOWN_LINUX_GNU == "C:/configured/pkgconfig" and
+             .build_influence_env.LIBCLANG_PATH == "C:/configured/libclang"' <<< "$result" >/dev/null; then
+            log_fail "$mode Windows SDK command/receipt mismatch: status=$status result=$result"
+            continue
+        fi
+        log_pass "$mode Windows SDK receipt preserves configured values and case-insensitive last assignment"
+        if ! command -v pwsh >/dev/null 2>&1; then
+            printf 'SKIP %s Windows SDK runtime control: pwsh is not installed\n' "$mode"
+            continue
+        fi
+        # Run only the generated environment mutations. StringDictionary has
+        # Windows' case-insensitive environment semantics even on a POSIX test
+        # host; this is a PowerShell control, not a native Windows build proof.
+        env_section="${cmd#*\$psi.UseShellExecute=\$false; }"
+        env_section="${env_section%%\$psi.FileName=*}"
+        if [[ "$mode" == strict ]]; then
+            # The staged job guard stores the script in a single-quoted
+            # PowerShell string. All configured values here are base64.
+            env_section="${env_section//\'\'/\'}"
+        fi
+        if [[ "$env_section" == "$cmd" || "$env_section" != *"$(_act_rust_sdk_influence_regex)"* ]]; then
+            log_fail "$mode Windows generated environment section is missing"
+            continue
+        fi
+        script="$MOCK_DIR/sdk-windows-$mode.ps1"
+        cat > "$script" <<'POWERSHELL'
+$ErrorActionPreference = 'Stop'
+$sdkEnvironment = New-Object System.Collections.Specialized.StringDictionary
+foreach ($sdkName in @('OPENSSL_DIR', 'OPENSSL_NO_VENDOR', 'X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR', 'PKG_CONFIG', 'PKG_CONFIG_PATH_aarch64-unknown-linux-gnu', 'HOST_PKG_CONFIG', 'TARGET_PKG_CONFIG_PATH', 'FONTCONFIG_NO_PKG_CONFIG', 'LIBCLANG_PATH')) {
+    $sdkEnvironment[$sdkName] = 'ambient-value'
+}
+$sdkEnvironment['LIBCLANG_PATH_EXTRA'] = 'preserve'
+$psi = [pscustomobject]@{ EnvironmentVariables = $sdkEnvironment }
+POWERSHELL
+        printf '%s\n' "$env_section" >> "$script"
+        cat >> "$script" <<'POWERSHELL'
+$sdkObserved = @{}
+foreach ($sdkName in $psi.EnvironmentVariables.Keys) {
+    $sdkObserved[$sdkName.ToUpperInvariant()] = $psi.EnvironmentVariables[$sdkName]
+}
+$sdkObserved | ConvertTo-Json -Compress
+POWERSHELL
+        observed=$(pwsh -NoProfile -NonInteractive -File "$script") || status=$?
+        if [[ "$status" -eq 0 ]] && jq -e '
+            .OPENSSL_DIR == "C:/configured/last with spaces" and .OPENSSL_STATIC == "1" and
+            .X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR == "C:/configured/target" and
+            .PKG_CONFIG == "C:/configured/pkg-config" and
+            .PKG_CONFIG_LIBDIR_AARCH64_UNKNOWN_LINUX_GNU == "C:/configured/pkgconfig" and
+            .LIBCLANG_PATH == "C:/configured/libclang" and .LIBCLANG_PATH_EXTRA == "preserve" and
+            (has("OPENSSL_NO_VENDOR") | not) and
+            (has("PKG_CONFIG_PATH_AARCH64-UNKNOWN-LINUX-GNU") | not) and
+            (has("HOST_PKG_CONFIG") | not) and (has("TARGET_PKG_CONFIG_PATH") | not) and
+            (has("FONTCONFIG_NO_PKG_CONFIG") | not)' <<< "$observed" >/dev/null; then
+            log_pass "$mode Windows generated PowerShell removes ambient SDK selectors before configured assignments"
+        else
+            log_fail "$mode Windows generated SDK cleanup failed: status=$status observed=$observed"
+        fi
+    done
 }
 
 test_frankenterm_windows_archive_manifest() {
@@ -789,10 +957,13 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     write_mock_artifact "$MOCK_SSH_STREAM_FILE"
 
     local result
-    result=$(act_run_native_build \
-        "tool" "darwin/arm64" "v1.0.0" "run1" \
-        "/remote/.dsr-release-snapshots/tool-run/source" \
-        "1111111111111111111111111111111111111111" "v1.0.0" 2>/dev/null)
+    result=$(
+        host_health_is_ready() { [[ "$1" == "mmini" ]]; }
+        act_run_native_build \
+            "tool" "darwin/arm64" "v1.0.0" "run1" \
+            "/remote/.dsr-release-snapshots/tool-run/source" \
+            "1111111111111111111111111111111111111111" "v1.0.0" "mmini" 2>/dev/null
+    )
 
     local cmd scp_args raw_ssh_args expected_target expected_home
     cmd=$(get_ssh_cmd)
@@ -950,6 +1121,54 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
     unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER
     unset CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+}
+
+test_strict_native_source_binding() {
+    log_test "Strict native source binding: reject absent or unhealthy authority before side effects"
+    local binding_case result status source_root bound_host sentinel
+    for binding_case in missing-root missing-host unhealthy missing-health; do
+        reset_state
+        source_root="/remote/release/source"
+        bound_host="mmini"
+        sentinel="$MOCK_DIR/binding-$binding_case-side-effect"
+        [[ "$binding_case" == "missing-root" ]] && source_root=""
+        [[ "$binding_case" == "missing-host" ]] && bound_host=""
+        status=0
+        result=$(
+            act_get_native_host() { printf 'selected\n' >> "$sentinel"; printf 'wlap\n'; }
+            act_get_local_path() { printf 'configured\n' >> "$sentinel"; printf '/local/path/tool\n'; }
+            _act_ssh_exec() { printf 'ssh\n' >> "$sentinel"; return 99; }
+            host_health_is_ready() { [[ "$binding_case" != "unhealthy" ]]; }
+            [[ "$binding_case" != "missing-health" ]] || unset -f host_health_is_ready
+            act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" \
+                "$source_root" "1111111111111111111111111111111111111111" "v1.0.0" "$bound_host"
+        ) || status=$?
+        if [[ "$status" -eq 4 && ! -e "$sentinel" ]] && \
+           jq -e '.status == "error" and .exit_code == 4' <<< "$result" >/dev/null; then
+            log_pass "Strict $binding_case fails before selection, configuration, or SSH"
+        else
+            log_fail "Strict $binding_case escaped its source boundary: status=$status result=$result"
+        fi
+    done
+
+    reset_state
+    sentinel="$MOCK_DIR/binding-positive-selector"
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/binding-positive-artifact"
+    write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+    status=0
+    result=$(
+        act_get_native_host() { printf 'selected\n' > "$sentinel"; printf 'wlap\n'; }
+        host_health_is_ready() { [[ "$1" == "mmini" ]]; }
+        act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" \
+            "/remote/release/source" "1111111111111111111111111111111111111111" "v1.0.0" "mmini"
+    ) || status=$?
+    if [[ "$status" -eq 0 && ! -e "$sentinel" ]] && \
+       jq -e '.status == "success" and .host == "mmini"' <<< "$result" >/dev/null && \
+       [[ "$(get_ssh_cmd)" == *"/remote/release/source"* ]]; then
+        log_pass "Strict native build stays on its synchronized host despite selector drift"
+    else
+        log_fail "Strict native build lost its source host: status=$status result=$result"
+    fi
 }
 
 test_unix_strict_validation_failure_stops_build() {
@@ -2194,6 +2413,19 @@ test_windows_strict_cargo_metadata_command() {
 # ============================================================================
 
 main() {
+    if [[ "${1:-}" == --sdk-env-only ]]; then
+        test_rust_build_influence_name_xwin_boundaries
+        test_unix_rust_sdk_environment
+        test_windows_rust_sdk_environment
+        test_unix_strict_rust_forces_out_of_snapshot_target_dir
+        test_unix_strict_rust_executes_xwin_sanitizer_before_exports
+        test_windows_strict_rust_forces_out_of_snapshot_target_dir
+        test_windows_rust_isolation_receipt_matches_command
+        test_strict_native_source_binding
+        printf 'SDK environment tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --windows-family-only ]]; then
         test_rust_build_influence_name_xwin_boundaries
         test_frankenterm_windows_archive_manifest
@@ -2216,10 +2448,13 @@ main() {
     test_unix_rust_isolation_executes_outside_operator_config
     test_windows_rust_isolation_receipt_matches_command
     test_rust_build_influence_name_xwin_boundaries
+    test_unix_rust_sdk_environment
+    test_windows_rust_sdk_environment
     test_frankenterm_windows_archive_manifest
     test_unix_strict_rust_forces_out_of_snapshot_target_dir
     test_unix_strict_rust_executes_xwin_sanitizer_before_exports
     test_windows_strict_rust_forces_out_of_snapshot_target_dir
+    test_strict_native_source_binding
     test_unix_strict_validation_failure_stops_build
     test_windows_strict_validation_failure_stops_build
     test_strict_collector_keeps_symlink_victim_unchanged

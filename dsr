@@ -1817,6 +1817,7 @@ EOF
     local build_source_ref=""
     local build_run_id=""
     local build_source_roots_json="{}"
+    local build_target_hosts_json="{}"
     local -a build_source_args=()
     local -a build_sync_args=()
     if declare -F config_get_release_contract_json &>/dev/null; then
@@ -1985,10 +1986,19 @@ EOF
         build_source_sha="$resume_sha"
         build_source_ref="$resume_ref"
         build_source_roots_json=$(jq -cS '.context.source_roots // {}' <<< "$resume_state")
+        build_target_hosts_json=$(jq -cS '.context.target_hosts // {}' <<< "$resume_state")
         if $build_release_contract_enabled && \
            ! jq -e 'type == "object" and length > 0 and all(.[]; type == "string" and length > 0)' \
                 <<< "$build_source_roots_json" &>/dev/null; then
             log_error "Strict resume state has no valid source-root snapshot"
+            return 4
+        fi
+        if $build_release_contract_enabled && \
+           ! jq -e --argjson targets "$requested_targets_json" '
+                type == "object" and (keys | sort) == $targets and
+                all(.[]; type == "string" and test("^[A-Za-z0-9_-]+$"))
+            ' <<< "$build_target_hosts_json" &>/dev/null; then
+            log_error "Strict resume state has no valid target-host snapshot; start a fresh build"
             return 4
         fi
         log_info "Resuming build run $resume_run_id"
@@ -2151,6 +2161,7 @@ EOF
             --git-sha "$build_source_sha"
             --git-ref "$build_source_ref"
             --source-roots-json "$build_source_roots_json"
+            --target-hosts-json "$build_target_hosts_json"
         )
         log_info "Reusing strict source snapshot for resumed run $resume_run_id"
     # Sync source to remote hosts (unless --no-sync)
@@ -2211,6 +2222,7 @@ EOF
         fi
 
         if $build_release_contract_enabled; then
+            build_target_hosts_json=$(jq -ce '.target_hosts | objects' <<< "$sync_json") || return 4
             if ! build_source_roots_json=$(jq -ce '
                 .source_roots |
                 if type == "object" and all(.[]; type == "string" and length > 0)
@@ -2226,6 +2238,7 @@ EOF
                 --git-ref "$build_source_ref"
                 --run-id "$build_run_id"
                 --source-roots-json "$build_source_roots_json"
+                --target-hosts-json "$build_target_hosts_json"
             )
         fi
 

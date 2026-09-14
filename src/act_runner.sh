@@ -4696,6 +4696,7 @@ act_sync_sources() {
     # runs use the working tree; strict act runs receive a local tracked-only root.
     local hosts_to_sync=()
     local host_paths=()
+    local target_hosts_json='{}'
     for target in $targets; do
         local host remote_path
         if act_platform_uses_act "$tool_name" "$target"; then
@@ -4708,8 +4709,15 @@ act_sync_sources() {
             [[ -n "$remote_path" ]] || remote_path="$local_path"
         fi
         if [[ -z "$host" ]]; then
+            if $strict_release; then
+                _log_error "No source snapshot host is available for strict target: $target"
+                echo '{"status":"error","error":"Missing strict source snapshot host"}'
+                return 4
+            fi
             continue
         fi
+        target_hosts_json=$(jq -c --arg target "$target" --arg host "$host" \
+            '.[$target] = $host' <<< "$target_hosts_json") || return 4
 
         # Refuse a POSIX source root on a Windows host before any host is
         # synced (issue #8): rsync would create or target the wrong location
@@ -4753,7 +4761,7 @@ act_sync_sources() {
 
     if [[ ${#hosts_to_sync[@]} -eq 0 ]]; then
         _log_info "No build locations need source sync"
-        echo '{"status":"skipped","synced":0,"hosts":[],"source_roots":{}}'
+        echo '{"status":"skipped","synced":0,"hosts":[],"source_roots":{},"target_hosts":{}}'
         return 0
     fi
 
@@ -4890,13 +4898,15 @@ act_sync_sources() {
         --argjson duration "$total_duration" \
         --argjson hosts "$results_json" \
         --argjson source_roots "$source_roots_json" \
+        --argjson target_hosts "$target_hosts_json" \
         '{
             status: $status,
             synced: $synced,
             failed: $failed,
             duration_seconds: $duration,
             hosts: $hosts,
-            source_roots: $source_roots
+            source_roots: $source_roots,
+            target_hosts: $target_hosts
         }'
 
     if [[ $failed -gt 0 ]]; then
@@ -5119,8 +5129,24 @@ _act_default_rust_target_triple() {
     esac
 }
 
+# Shared by receipt selection and both native launchers. OpenSSL accepts a
+# target-triple prefix; pkg-config accepts target suffixes and HOST_/TARGET_
+# prefixes, including selectors for the pkg-config executable itself.
+_act_rust_sdk_influence_regex() {
+    printf '%s\n' '^(OPENSSL_|.+_OPENSSL_|PKG_CONFIG($|_)|(HOST|TARGET)_PKG_CONFIG($|_)|.+_NO_PKG_CONFIG$|LIBCLANG_PATH$)'
+}
+
+_act_windows_rust_sdk_env_cleanup() {
+    local sdk_regex
+    sdk_regex=$(_act_rust_sdk_influence_regex)
+    printf '%s' "\$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if (\$key -match '${sdk_regex}') { \$psi.EnvironmentVariables.Remove(\$key) } }; "
+}
+
 _act_is_rust_build_influence_name() {
     local normalized_name="${1^^}"
+    local sdk_regex
+    sdk_regex=$(_act_rust_sdk_influence_regex)
+    [[ "$normalized_name" =~ $sdk_regex ]] && return 0
     case "$normalized_name" in
         CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
         FT_ATOMIC_BUILD_IDENTITY|FT_ATOMIC_BUILD_PROFILE|\
@@ -5518,7 +5544,7 @@ _act_ssh_exec() {
 
 # Run native build on remote host via SSH
 # Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
-#        [remote_path_override] [release_git_sha] [release_git_ref]
+#        [remote_path_override] [release_git_sha] [release_git_ref] [bound_host]
 # Returns: JSON result with status, exit_code, artifact info
 act_run_native_build() {
     local tool_name="$1"
@@ -5528,9 +5554,28 @@ act_run_native_build() {
     local remote_path_override="${5:-}"
     local release_git_sha="${6:-}"
     local release_git_ref="${7:-}"
+    local bound_host="${8:-}"
+
+    # A strict identity must never degrade to ordinary staging when a source
+    # binding is absent. Check before configuration, SSH, or filesystem work.
+    if [[ -n "$release_git_sha" || -n "$release_git_ref" ]] && \
+       [[ -z "$remote_path_override" || -z "$bound_host" ]]; then
+        _log_error "Strict native build requires a bound host and source root"
+        jq -nc '{status: "error", exit_code: 4, error: "Missing strict native source binding"}'
+        return 4
+    fi
+    if [[ -n "$release_git_sha" || -n "$release_git_ref" ]]; then
+        if ! declare -F host_health_is_ready &>/dev/null || \
+           ! host_health_is_ready "$bound_host"; then
+            _log_error "Pinned strict build host is not ready: $bound_host"
+            jq -nc '{status: "error", exit_code: 4, error: "Pinned strict build host is not ready"}'
+            return 4
+        fi
+    fi
 
     local host
-    host=$(act_get_native_host "$platform" "$tool_name")
+    host="$bound_host"
+    [[ -n "$host" ]] || host=$(act_get_native_host "$platform" "$tool_name")
     if [[ -z "$host" ]]; then
         _log_error "No native host configured for platform: $platform"
         jq -nc --arg platform "$platform" \
@@ -5900,11 +5945,16 @@ act_run_native_build() {
         fi
 
         local nonstrict_entries=() nonstrict_name nonstrict_value
+        local nonstrict_windows_receipt=false
+        _act_is_windows_host "$host" && nonstrict_windows_receipt=true
         while IFS= read -r nonstrict_pair; do
             [[ -n "$nonstrict_pair" && "$nonstrict_pair" == *=* ]] || continue
             nonstrict_name="${nonstrict_pair%%=*}"
             nonstrict_value="${nonstrict_pair#*=}"
             if _act_is_rust_build_influence_name "$nonstrict_name"; then
+                if $nonstrict_windows_receipt; then
+                    nonstrict_name="${nonstrict_name^^}"
+                fi
                 nonstrict_entries+=("$(jq -nc \
                     --arg key "$nonstrict_name" --arg value "$nonstrict_value" \
                     '{key: $key, value: $value}')")
@@ -5912,7 +5962,8 @@ act_run_native_build() {
         done <<< "$build_env"
         if [[ ${#nonstrict_entries[@]} -gt 0 ]]; then
             build_influence_env_json=$(printf '%s\n' "${nonstrict_entries[@]}" | \
-                jq -cs 'sort_by(.key) | from_entries') || return 4
+                jq -cs 'reduce .[] as $entry ({}; .[$entry.key] = $entry.value)
+                    | to_entries | sort_by(.key) | from_entries') || return 4
         fi
         cargo_isolation_json=$(jq -nc \
             --arg original_source_root "$remote_path" \
@@ -6025,7 +6076,8 @@ act_run_native_build() {
         # Convert forward slashes to backslashes for Windows paths
         remote_cmd=$(_act_windows_cmd_via_powershell "cd /d \"${win_path}\" && ${env_exports}${build_cmd}") || return 4
         if $strict_rust_build; then
-            local ps_build_b64 ps_env_assignments="" env_name env_value env_name_b64 env_value_b64
+            local ps_build_b64 ps_env_assignments env_name env_value env_name_b64 env_value_b64
+            ps_env_assignments=$(_act_windows_rust_sdk_env_cleanup)
             if ! command -v base64 >/dev/null 2>&1; then
                 _log_error "base64 is required to construct a strict Windows build"
                 return 3
@@ -6046,7 +6098,8 @@ act_run_native_build() {
             win_stage_root=$(_act_windows_cmd_path "$nonstrict_stage_root") || return 4
             win_source_root=$(_act_windows_cmd_path "$nonstrict_source_root") || return 4
             win_cargo_home=$(_act_windows_cmd_path "$nonstrict_cargo_home") || return 4
-            local ps_build_b64 ps_env_assignments="" env_name env_value env_name_b64 env_value_b64
+            local ps_build_b64 ps_env_assignments env_name env_value env_name_b64 env_value_b64
+            ps_env_assignments=$(_act_windows_rust_sdk_env_cleanup)
             local ps_sibling_copies="" sibling_win_remote sibling_win_staged
             local ps_copy_function
             ps_copy_function=$(_act_windows_source_copy_function) || return 4
@@ -6079,6 +6132,15 @@ act_run_native_build() {
         local env_name
         if $strict_rust_build; then
             env_exports+="test -d '$strict_cargo_home'; test ! -L '$strict_cargo_home'; for name in config config.toml credentials credentials.toml; do test ! -e '$strict_cargo_home'/\$name; test ! -L '$strict_cargo_home'/\$name; done; ancestor='${remote_path%/*}'; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; "
+        fi
+        if [[ "$language" == "rust" ]]; then
+            local sdk_regex
+            sdk_regex=$(_act_rust_sdk_influence_regex)
+            # Enumerate on the build host, not the coordinator. Bash's unset
+            # silently leaves inherited names containing '-' in the process
+            # environment. Reject those unsupported export identifiers before
+            # a higher-priority target SDK selector can escape isolation.
+            env_exports+="for sdk_variable in \$(env | sed 's/=.*//' | grep -Ei '${sdk_regex}' || true); do if ! printf '%s\\n' \"\$sdk_variable\" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then printf '[dsr] SDK environment name cannot be isolated by this shell: %s; clear it on the build host and configure an underscore-spelled selector in DSR\\n' \"\$sdk_variable\" >&2; exit 4; fi; unset \"\$sdk_variable\"; done; "
         fi
         for env_name in "${cargo_env_to_unset[@]}"; do
             env_exports+="unset $env_name; "
@@ -7004,26 +7066,39 @@ _act_build_orchestration_target() {
     local source_roots_json="$7"
     local release_git_sha="${8:-}"
     local release_git_ref="${9:-}"
+    local bound_host="${10:-}"
 
-    local host="act-local"
-    if [[ "$strict_release_contract" != "true" ]] && \
-       ! act_platform_uses_act "$tool_name" "$target"; then
+    local host="${bound_host:-act-local}" remote_path_override=""
+    if [[ "$strict_release_contract" == "true" ]]; then
+        if [[ -z "$bound_host" ]] || ! remote_path_override=$(jq -er --arg host "$bound_host" \
+            '.[$host] | strings | select(length > 0)' <<< "$source_roots_json"); then
+            _log_error "Missing strict target host/source binding"
+            jq -nc '{status: "error", exit_code: 4, error: "Missing strict target host/source binding"}'
+            return 4
+        fi
+    elif [[ -z "$bound_host" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
         host=$(act_get_native_host "$target" "$tool_name")
-    elif [[ "$strict_release_contract" == "true" ]]; then
-        host=$(act_get_native_host "$target" "$tool_name")
+    fi
+    # Ordinary run provenance is not a strict snapshot identity. Only strict
+    # callers may pass these values to the native snapshot boundary.
+    if [[ "$strict_release_contract" != "true" ]]; then
+        release_git_sha=""
+        release_git_ref=""
     fi
 
     _log_info "--- Building target: $target ---"
 
     local result exit_code=0 full_output=""
     if act_platform_uses_act "$tool_name" "$target"; then
+        if [[ "$strict_release_contract" == "true" ]]; then
+            _log_error "Strict target configuration changed to an unbound build method"
+            jq -nc '{status: "error", exit_code: 4, error: "Strict release targets must use native builds"}'
+            return 4
+        fi
         local job workflow local_path extra_flags
         job=$(act_get_job_for_target "$tool_name" "$target")
         workflow="$ACT_REPO_WORKFLOW"
         local_path="$ACT_REPO_LOCAL_PATH"
-        if [[ "$strict_release_contract" == "true" ]]; then
-            local_path=$(jq -r '.act // empty' <<< "$source_roots_json")
-        fi
         extra_flags=$(act_get_flags "$tool_name" "$target")
         _log_info "Method: act (job=$job)"
 
@@ -7043,15 +7118,10 @@ _act_build_orchestration_target() {
         result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
             '. + {platform: $target, method: $method, host: $host}' <<< "$result")
     else
-        host=$(act_get_native_host "$target" "$tool_name")
         _log_info "Method: native (host=$host)"
-        local remote_path_override=""
-        if [[ "$strict_release_contract" == "true" ]]; then
-            remote_path_override=$(jq -r --arg host "$host" '.[$host] // empty' <<< "$source_roots_json")
-        fi
         full_output=$(act_run_native_build \
             "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" \
-            "$release_git_sha" "$release_git_ref" 2>&1) || exit_code=$?
+            "$release_git_sha" "$release_git_ref" "$host" 2>&1) || exit_code=$?
         [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
         result=$(printf '%s\n' "$full_output" | grep '^{' | tail -1)
         if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
@@ -7108,11 +7178,9 @@ _act_run_target_worker() {
     local source_roots_json="${10}"
     local release_git_sha="${11:-}"
     local release_git_ref="${12:-}"
+    local bound_host="${13:-}"
 
-    local host="act-local"
-    if ! act_platform_uses_act "$tool_name" "$target"; then
-        host=$(act_get_native_host "$target" "$tool_name")
-    fi
+    local host="${bound_host:-act-local}"
     local slot_id="${run_id}-${target//\//-}-attempt-${attempt}"
     local slot_acquired=false
 
@@ -7124,6 +7192,17 @@ _act_run_target_worker() {
             printf '%s\n' "$body" > "$result_path"
         )
     }
+
+    if [[ "$strict_release_contract" == "true" ]] && \
+       { [[ -z "$bound_host" ]] || ! jq -e --arg host "$bound_host" \
+           '.[$host] | type == "string" and length > 0' <<< "$source_roots_json" >/dev/null; }; then
+        _act_write_worker_result '{"status":"failed","exit_code":4,"error":"Missing strict worker source binding"}' || return 4
+        return 4
+    fi
+
+    if [[ -z "$bound_host" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
+        host=$(act_get_native_host "$target" "$tool_name")
+    fi
 
     if declare -F selector_acquire_slot &>/dev/null; then
         if ! selector_acquire_slot "$host" "$slot_id" --wait; then
@@ -7166,7 +7245,7 @@ _act_run_target_worker() {
     _act_build_orchestration_target \
         "$tool_name" "$version" "$run_id" "$target" \
         "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
-        "$release_git_sha" "$release_git_ref" \
+        "$release_git_sha" "$release_git_ref" "$host" \
         >> "$log_path" 2>&1 &
     worker_pid=$!
     # The process group remains distinct after monitor mode is disabled; this
@@ -7216,6 +7295,7 @@ act_orchestrate_build() {
     local targets_arg=()
     local supplied_git_sha="" supplied_git_ref=""
     local supplied_run_id="" source_roots_json="{}"
+    local target_hosts_json='{}'
     local parallel_jobs=1 resume_run=false supplied_output_dir=""
 
     while [[ $# -gt 0 ]]; do
@@ -7238,6 +7318,11 @@ act_orchestrate_build() {
             --source-roots-json)
                 [[ $# -ge 2 ]] || { _log_error "--source-roots-json requires a value"; return 4; }
                 source_roots_json="$2"
+                shift 2
+                ;;
+            --target-hosts-json)
+                [[ $# -ge 2 ]] || { _log_error "--target-hosts-json requires a value"; return 4; }
+                target_hosts_json="$2"
                 shift 2
                 ;;
             --parallel-jobs)
@@ -7369,15 +7454,21 @@ act_orchestrate_build() {
         git_sha="$supplied_git_sha"
         git_ref="$supplied_git_ref"
 
-        local expected_native_hosts_json actual_source_hosts_json target_host
-        expected_native_hosts_json=$(for target in $targets; do
-            if act_platform_uses_act "$tool_name" "$target"; then
-                printf 'act\n'
-            else
-                target_host=$(act_get_native_host "$target" "$tool_name")
-                [[ -n "$target_host" ]] && printf '%s\n' "$target_host"
-            fi
-        done | jq -Rsc 'split("\n") | map(select(length > 0)) | unique | sort')
+        # Source synchronization is the host-selection authority. Re-running
+        # the capacity selector here or in workers can select an unsynced host.
+        local expected_native_hosts_json actual_source_hosts_json requested_host_targets
+        # shellcheck disable=SC2086  # one configured target per word
+        requested_host_targets=$(printf '%s\n' $targets | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
+        if ! expected_native_hosts_json=$(jq -ce --argjson targets "$requested_host_targets" '
+            if type == "object" and (keys | sort) == $targets and
+               all(.[]; type == "string" and test("^[A-Za-z0-9_-]+$"))
+            then [.[]] | unique | sort else error("invalid target host bindings") end
+        ' <<< "$target_hosts_json"); then
+            _log_error "Missing or invalid strict target host bindings"
+            jq -nc --arg tool "$tool_name" \
+                '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: "Missing or invalid strict target host bindings", targets: []}'
+            return 4
+        fi
         if ! _act_is_uuid "$supplied_run_id" || \
            ! actual_source_hosts_json=$(jq -c 'if type == "object" and all(.[]; type == "string" and length > 0) then keys | sort else error("invalid source roots") end' \
                 <<< "$source_roots_json" 2>/dev/null) || \
@@ -7509,13 +7600,20 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
+            if $strict_release_contract && \
+               [[ "$(jq -cS '.context.target_hosts // {}' <<< "$resume_state")" != \
+                  "$(jq -cS '.' <<< "$target_hosts_json")" ]]; then
+                _log_error "Resume target hosts do not match the strict snapshot"
+                _act_release_orchestration_lock
+                return 4
+            fi
             run_id="$requested_run_id"
         else
             if ! run_id=$(DSR_RUN_ID="$requested_run_id" \
                 build_state_create "$tool_name" "$version" "${targets// /,}") || \
                [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id" || \
                ! build_state_set_context "$tool_name" "$version" "$run_id" \
-                    "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs"; then
+                    "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" "$target_hosts_json"; then
                 _log_error "Build state could not retain the run context"
                 _act_release_orchestration_lock
                 return 4
@@ -7710,7 +7808,9 @@ act_orchestrate_build() {
             break
         fi
         host="act-local"
-        if ! act_platform_uses_act "$tool_name" "$target"; then
+        if $strict_release_contract; then
+            host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || return 4
+        elif ! act_platform_uses_act "$tool_name" "$target"; then
             host=$(act_get_native_host "$target" "$tool_name")
         fi
 
@@ -7730,7 +7830,7 @@ act_orchestrate_build() {
 
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
-            "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" &
+            "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" &
         worker_pids+=("$!")
         worker_targets+=("$target")
         worker_results+=("$result_path")

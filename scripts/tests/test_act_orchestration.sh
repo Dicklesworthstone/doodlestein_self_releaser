@@ -984,6 +984,8 @@ with_collection_receipt() {
 
 contract_sha="2222222222222222222222222222222222222222"
 contract_ref="v1.0.0"
+contract_target_hosts=$(config_get_release_contract_json "focrtest" | \
+    jq -c '.exact_primary_assets | with_entries(.value = "stub-host")')
 contract_raw_root="$TEMP_DIR/contract-raw"
 mkdir -p "$contract_raw_root/shared-evidence"
 printf '{"kind":"build-evidence"}\n' > "$contract_raw_root/shared-evidence/evidence.json"
@@ -1072,7 +1074,8 @@ noncanonical_root_result=$(
         act_orchestrate_build "focrtest" "v1.0.0" \
             --git-sha "$contract_sha" --git-ref "$contract_ref" \
             --run-id "550e8400-e29b-41d4-a716-446655440029" \
-            --source-roots-json '{"stub-host":"/tmp/caller-chosen-root"}'
+            --source-roots-json '{"stub-host":"/tmp/caller-chosen-root"}' \
+            --target-hosts-json "$contract_target_hosts"
     ) 2>/dev/null
 ) || noncanonical_root_status=$?
 if [[ $noncanonical_root_status -eq 4 ]] && \
@@ -1086,10 +1089,12 @@ contract_run_id="550e8400-e29b-41d4-a716-446655440030"
 contract_source_root=$(_act_strict_source_root_path \
     "$TEMP_DIR/source-repo" "focrtest" "$contract_run_id")
 contract_source_roots=$(jq -nc --arg path "$contract_source_root" '{"stub-host": $path}')
+contract_selector_log="$TEMP_DIR/strict-selector-drift.log"
+contract_slot_log="$TEMP_DIR/strict-host-slots.log"
 contract_result=$(
     (
-        unset -f build_state_create build_state_update_status build_state_update_host
-        unset -f build_lock_acquire build_lock_release
+        build_lock_acquire() { return 0; }
+        build_lock_release() { return 0; }
 
         git() {
             case "$*" in
@@ -1101,7 +1106,9 @@ contract_result=$(
             esac
         }
         act_platform_uses_act() { return 1; }
-        act_get_native_host() { printf 'stub-host\n'; }
+        act_get_native_host() { printf 'selected\n' >> "$contract_selector_log"; printf 'unsynced-host\n'; }
+        selector_acquire_slot() { printf '%s\n' "$1" >> "$contract_slot_log"; }
+        selector_release_slot() { return 0; }
         _act_validate_strict_cargo_source_closure() { return 0; }
         _act_verify_strict_source_roots() { return 0; }
         act_run_native_build() {
@@ -1109,6 +1116,7 @@ contract_result=$(
             local remote_override="$5"
             local release_git_sha="$6"
             local release_git_ref="$7"
+            [[ "${8:-}" == "stub-host" ]] || return 99
             local target_slug="${target//\//-}"
             local raw_name="focr"
             [[ "$target" == windows/* ]] && raw_name="focr.exe"
@@ -1141,7 +1149,8 @@ contract_result=$(
         act_orchestrate_build "focrtest" "v1.0.0" \
             --git-sha "$contract_sha" --git-ref "$contract_ref" \
             --run-id "$contract_run_id" \
-            --source-roots-json "$contract_source_roots"
+            --source-roots-json "$contract_source_roots" \
+            --target-hosts-json "$contract_target_hosts"
     ) 2>/dev/null
 )
 
@@ -1162,6 +1171,146 @@ if echo "$contract_result" | jq -e \
     pass "strict orchestration passes supplied source identity to all 6 native builds"
 else
     fail "strict orchestration source/summary mismatch: $contract_result"
+fi
+
+contract_state=$(build_state_get "focrtest" "v1.0.0" "$contract_run_id")
+if [[ ! -e "$contract_selector_log" && -f "$contract_slot_log" ]] && \
+   [[ "$(wc -l < "$contract_slot_log" | tr -d ' ')" -eq 6 ]] && \
+   [[ "$(sort -u "$contract_slot_log")" == "stub-host" ]] && \
+   jq -e --argjson hosts "$contract_target_hosts" --argjson roots "$contract_source_roots" \
+       '.context.target_hosts == $hosts and .context.source_roots == $roots' \
+       <<< "$contract_state" >/dev/null; then
+    pass "strict scheduling, slots, native execution, and persisted resume share the synchronized host binding"
+else
+    fail "strict source binding was reselected or lost from persisted state"
+fi
+
+for binding_case in absent malformed missing-target extra-target missing-root changed-resume-host legacy-resume; do
+    binding_hosts="$contract_target_hosts"
+    binding_roots="$contract_source_roots"
+    binding_resume_args=()
+    case "$binding_case" in
+        absent) binding_hosts='{}' ;;
+        malformed) binding_hosts='[]' ;;
+        missing-target) binding_hosts=$(jq -c 'del(."linux/amd64")' <<< "$binding_hosts") ;;
+        extra-target) binding_hosts=$(jq -c '. + {"extra/target":"stub-host"}' <<< "$binding_hosts") ;;
+        missing-root) binding_roots='{}' ;;
+        changed-resume-host|legacy-resume) binding_resume_args=(--resume-run-id "$contract_run_id") ;;
+    esac
+    binding_sentinel="$TEMP_DIR/strict-binding-$binding_case-reached-worker"
+    binding_error_log="$TEMP_DIR/strict-binding-$binding_case-error.log"
+    binding_status=0
+    (
+        _act_validate_contract_source_identity() { return 0; }
+        _act_validate_strict_cargo_source_closure() { return 0; }
+        _act_verify_strict_source_roots() { return 0; }
+        act_platform_uses_act() { return 1; }
+        act_get_native_host() { printf 'selected\n' > "$binding_sentinel"; printf 'unsynced-host\n'; }
+        _act_run_target_worker() { printf 'worker\n' > "$binding_sentinel"; return 99; }
+        build_lock_acquire() { return 0; }
+        build_lock_release() { return 0; }
+        if [[ "$binding_case" == "changed-resume-host" || "$binding_case" == "legacy-resume" ]]; then
+            build_state_get() {
+                if [[ "$binding_case" == "legacy-resume" ]]; then
+                    jq -c 'del(.context.target_hosts)' <<< "$contract_state"
+                else
+                    jq -c '.context.target_hosts["linux/amd64"] = "other-host"' <<< "$contract_state"
+                fi
+            }
+        fi
+        act_orchestrate_build "focrtest" "v1.0.0" \
+            --git-sha "$contract_sha" --git-ref "$contract_ref" \
+            --run-id "$contract_run_id" --source-roots-json "$binding_roots" \
+            --target-hosts-json "$binding_hosts" "${binding_resume_args[@]}"
+    ) >/dev/null 2> "$binding_error_log" || binding_status=$?
+    binding_reason_matches=true
+    if [[ "$binding_case" == "changed-resume-host" || "$binding_case" == "legacy-resume" ]]; then
+        grep -Fq "Resume target hosts do not match the strict snapshot" "$binding_error_log" || binding_reason_matches=false
+    fi
+    if [[ "$binding_status" -eq 4 && ! -e "$binding_sentinel" && "$binding_reason_matches" == true ]]; then
+        pass "strict $binding_case is rejected before selection or worker launch"
+    else
+        fail "strict $binding_case admitted unsynchronized source authority: status=$binding_status"
+    fi
+done
+
+strict_resume_status=0
+strict_resume_result=$(
+    _act_validate_contract_source_identity() { return 0; }
+    _act_validate_strict_cargo_source_closure() { return 0; }
+    _act_verify_strict_source_roots() { return 0; }
+    act_platform_uses_act() { return 1; }
+    act_get_native_host() { printf 'selected\n' >> "$contract_selector_log"; printf 'unsynced-host\n'; }
+    _act_run_target_worker() { printf 'worker\n' >> "$contract_selector_log"; return 99; }
+    build_lock_acquire() { return 0; }
+    build_lock_release() { return 0; }
+    act_orchestrate_build "focrtest" "v1.0.0" --resume-run-id "$contract_run_id" \
+        --git-sha "$contract_sha" --git-ref "$contract_ref" \
+        --run-id "$contract_run_id" --source-roots-json "$contract_source_roots" \
+        --target-hosts-json "$contract_target_hosts"
+) || strict_resume_status=$?
+if [[ "$strict_resume_status" -eq 0 && ! -e "$contract_selector_log" ]] && \
+   jq -e '.status == "success" and (.targets | length) == 6 and all(.targets[]; .resume_reused == true)' \
+       <<< "$strict_resume_result" >/dev/null; then
+    pass "strict resume reuses all six verified targets without reselecting a source host"
+else
+    fail "strict resume lost its frozen source binding: status=$strict_resume_status result=$strict_resume_result"
+fi
+
+for worker_binding_case in missing-host missing-root; do
+    worker_binding_host="stub-host"
+    worker_binding_roots="$contract_source_roots"
+    [[ "$worker_binding_case" != "missing-host" ]] || worker_binding_host=""
+    [[ "$worker_binding_case" != "missing-root" ]] || worker_binding_roots='{}'
+    worker_binding_sentinel="$TEMP_DIR/worker-$worker_binding_case-side-effect"
+    worker_binding_result="$TEMP_DIR/worker-$worker_binding_case-result.json"
+    worker_binding_status=0
+    (
+        act_get_native_host() { printf 'selected\n' > "$worker_binding_sentinel"; printf 'unsynced-host\n'; }
+        selector_acquire_slot() { printf 'slot\n' > "$worker_binding_sentinel"; return 99; }
+        _act_build_orchestration_target() { printf 'build\n' > "$worker_binding_sentinel"; return 99; }
+        _act_run_target_worker focrtest v1.0.0 "$contract_run_id" linux/amd64 1 \
+            "$TEMP_DIR/worker-$worker_binding_case.log" "$worker_binding_result" \
+            true null "$worker_binding_roots" "$contract_sha" "$contract_ref" "$worker_binding_host"
+    ) || worker_binding_status=$?
+    if [[ "$worker_binding_status" -eq 4 && ! -e "$worker_binding_sentinel" ]] && \
+       jq -e '.status == "failed" and .exit_code == 4' "$worker_binding_result" >/dev/null; then
+        pass "strict worker $worker_binding_case fails before selection, capacity, or execution"
+    else
+        fail "strict worker $worker_binding_case escaped its source boundary"
+    fi
+done
+
+ordinary_identity=$(
+    act_platform_uses_act() { return 1; }
+    act_run_native_build() {
+        jq -nc --arg root "$5" --arg sha "$6" --arg ref "$7" --arg host "$8" \
+            '{status:"failed",exit_code:6,root:$root,sha:$sha,ref:$ref,host:$host}'
+        return 6
+    }
+    _act_build_orchestration_target testool v1.0.0 ordinary linux/amd64 false null '{}' \
+        "$contract_sha" main trj
+)
+if jq -e '.root == "" and .sha == "" and .ref == "" and .host == "trj"' \
+    <<< "$ordinary_identity" >/dev/null; then
+    pass "ordinary run provenance does not impersonate a strict native snapshot"
+else
+    fail "ordinary native build received an incomplete strict identity"
+fi
+
+strict_method_sentinel="$TEMP_DIR/strict-method-drift-executed"
+strict_method_status=0
+strict_method_result=$(
+    act_platform_uses_act() { return 0; }
+    act_run_workflow() { printf 'workflow\n' > "$strict_method_sentinel"; return 99; }
+    _act_build_orchestration_target focrtest v1.0.0 "$contract_run_id" linux/amd64 \
+        true null "$contract_source_roots" "$contract_sha" "$contract_ref" stub-host
+) || strict_method_status=$?
+if [[ "$strict_method_status" -eq 4 && ! -e "$strict_method_sentinel" ]] && \
+   jq -e '.error == "Strict release targets must use native builds"' <<< "$strict_method_result" >/dev/null; then
+    pass "strict target rejects build-method drift before executing any workflow"
+else
+    fail "strict target escaped native source binding after configuration drift"
 fi
 
 staged_valid=true
@@ -2480,6 +2629,20 @@ else
 fi
 
 strict_sync_status=0
+strict_missing_host_status=0
+strict_missing_host_sentinel="$TEMP_DIR/strict-missing-host-sync-ran"
+(
+    act_get_native_host() { return 1; }
+    _act_sync_strict_checkout() { printf 'sync\n' > "$strict_missing_host_sentinel"; return 99; }
+    act_sync_sources "synctest" --strict-release \
+        --run-id "$strict_sync_run_id" --git-sha "$strict_sync_sha" -- "linux/amd64"
+) >/dev/null 2>&1 || strict_missing_host_status=$?
+if [[ "$strict_missing_host_status" -eq 4 && ! -e "$strict_missing_host_sentinel" ]]; then
+    pass "strict sync refuses a missing target host before writing any snapshot"
+else
+    fail "strict sync skipped an unbound target or reached snapshot creation"
+fi
+
 strict_sync_output=$(
     (
         rsync() { return 99; }
@@ -2508,7 +2671,8 @@ if [[ $strict_sync_status -eq 0 && -n "$strict_sync_root" && \
    grep -Fq $'\t100644\tvendor/git.sr.ht/~sbinet/gg/LICENSE.md' "$strict_sync_manifest" && \
    grep -Fq $'\t100644\tvendor/github.com/alecthomas/chroma/v2/lexers/embedded/c#.xml' "$strict_sync_manifest" && \
    echo "$strict_sync_output" | jq -e \
-        '.status == "success" and (.source_roots | keys) == ["trj"]' &>/dev/null; then
+        '.status == "success" and (.source_roots | keys) == ["trj"] and
+         .target_hosts == {"linux/amd64":"trj"}' &>/dev/null; then
     pass "strict sync authenticates gitlinks as empty directory placeholders"
 else
     fail "strict fresh source sync failed: status=$strict_sync_status output=$strict_sync_output"
