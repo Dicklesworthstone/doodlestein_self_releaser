@@ -5113,8 +5113,24 @@ _act_default_rust_target_triple() {
     esac
 }
 
+# Shared by receipt selection and both native launchers. OpenSSL accepts a
+# target-triple prefix; pkg-config accepts target suffixes and HOST_/TARGET_
+# prefixes, including selectors for the pkg-config executable itself.
+_act_rust_sdk_influence_regex() {
+    printf '%s\n' '^(OPENSSL_|.+_OPENSSL_|PKG_CONFIG($|_)|(HOST|TARGET)_PKG_CONFIG($|_)|.+_NO_PKG_CONFIG$|LIBCLANG_PATH$)'
+}
+
+_act_windows_rust_sdk_env_cleanup() {
+    local sdk_regex
+    sdk_regex=$(_act_rust_sdk_influence_regex)
+    printf '%s' "\$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if (\$key -match '${sdk_regex}') { \$psi.EnvironmentVariables.Remove(\$key) } }; "
+}
+
 _act_is_rust_build_influence_name() {
     local normalized_name="${1^^}"
+    local sdk_regex
+    sdk_regex=$(_act_rust_sdk_influence_regex)
+    [[ "$normalized_name" =~ $sdk_regex ]] && return 0
     case "$normalized_name" in
         CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
         FT_ATOMIC_BUILD_IDENTITY|FT_ATOMIC_BUILD_PROFILE|\
@@ -5913,11 +5929,16 @@ act_run_native_build() {
         fi
 
         local nonstrict_entries=() nonstrict_name nonstrict_value
+        local nonstrict_windows_receipt=false
+        _act_is_windows_host "$host" && nonstrict_windows_receipt=true
         while IFS= read -r nonstrict_pair; do
             [[ -n "$nonstrict_pair" && "$nonstrict_pair" == *=* ]] || continue
             nonstrict_name="${nonstrict_pair%%=*}"
             nonstrict_value="${nonstrict_pair#*=}"
             if _act_is_rust_build_influence_name "$nonstrict_name"; then
+                if $nonstrict_windows_receipt; then
+                    nonstrict_name="${nonstrict_name^^}"
+                fi
                 nonstrict_entries+=("$(jq -nc \
                     --arg key "$nonstrict_name" --arg value "$nonstrict_value" \
                     '{key: $key, value: $value}')")
@@ -5925,7 +5946,8 @@ act_run_native_build() {
         done <<< "$build_env"
         if [[ ${#nonstrict_entries[@]} -gt 0 ]]; then
             build_influence_env_json=$(printf '%s\n' "${nonstrict_entries[@]}" | \
-                jq -cs 'sort_by(.key) | from_entries') || return 4
+                jq -cs 'reduce .[] as $entry ({}; .[$entry.key] = $entry.value)
+                    | to_entries | sort_by(.key) | from_entries') || return 4
         fi
         cargo_isolation_json=$(jq -nc \
             --arg original_source_root "$remote_path" \
@@ -6038,7 +6060,8 @@ act_run_native_build() {
         # Convert forward slashes to backslashes for Windows paths
         remote_cmd=$(_act_windows_cmd_via_powershell "cd /d \"${win_path}\" && ${env_exports}${build_cmd}") || return 4
         if $strict_rust_build; then
-            local ps_build_b64 ps_env_assignments="" env_name env_value env_name_b64 env_value_b64
+            local ps_build_b64 ps_env_assignments env_name env_value env_name_b64 env_value_b64
+            ps_env_assignments=$(_act_windows_rust_sdk_env_cleanup)
             if ! command -v base64 >/dev/null 2>&1; then
                 _log_error "base64 is required to construct a strict Windows build"
                 return 3
@@ -6059,7 +6082,8 @@ act_run_native_build() {
             win_stage_root=$(_act_windows_cmd_path "$nonstrict_stage_root") || return 4
             win_source_root=$(_act_windows_cmd_path "$nonstrict_source_root") || return 4
             win_cargo_home=$(_act_windows_cmd_path "$nonstrict_cargo_home") || return 4
-            local ps_build_b64 ps_env_assignments="" env_name env_value env_name_b64 env_value_b64
+            local ps_build_b64 ps_env_assignments env_name env_value env_name_b64 env_value_b64
+            ps_env_assignments=$(_act_windows_rust_sdk_env_cleanup)
             local ps_sibling_copies="" sibling_win_remote sibling_win_staged
             if ! command -v base64 >/dev/null 2>&1; then
                 _log_error "base64 is required to construct an isolated Windows Rust build"
@@ -6090,6 +6114,15 @@ act_run_native_build() {
         local env_name
         if $strict_rust_build; then
             env_exports+="test -d '$strict_cargo_home'; test ! -L '$strict_cargo_home'; for name in config config.toml credentials credentials.toml; do test ! -e '$strict_cargo_home'/\$name; test ! -L '$strict_cargo_home'/\$name; done; ancestor='${remote_path%/*}'; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; "
+        fi
+        if [[ "$language" == "rust" ]]; then
+            local sdk_regex
+            sdk_regex=$(_act_rust_sdk_influence_regex)
+            # Enumerate on the build host, not the coordinator. Bash's unset
+            # silently leaves inherited names containing '-' in the process
+            # environment. Reject those unsupported export identifiers before
+            # a higher-priority target SDK selector can escape isolation.
+            env_exports+="for sdk_variable in \$(env | sed 's/=.*//' | grep -Ei '${sdk_regex}' || true); do if ! printf '%s\\n' \"\$sdk_variable\" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then printf '[dsr] SDK environment name cannot be isolated by this shell: %s; clear it on the build host and configure an underscore-spelled selector in DSR\\n' \"\$sdk_variable\" >&2; exit 4; fi; unset \"\$sdk_variable\"; done; "
         fi
         for env_name in "${cargo_env_to_unset[@]}"; do
             env_exports+="unset $env_name; "
