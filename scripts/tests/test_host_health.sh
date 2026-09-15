@@ -919,6 +919,137 @@ test_health_check_with_retry_context() {
 # Run All Tests
 # ============================================================================
 
+test_windows_split_storage_admission() {
+    local mode script result expected status
+    if ! command -v pwsh >/dev/null; then
+        ((TESTS_RUN++))
+        fail "PowerShell is required to execute Windows storage admission tests"
+        return
+    fi
+    script=$(
+        config_windows_storage_json() {
+            printf '%s' '{"drive":"R","source_drive":"C","server":"192.0.2.1","export":"/owned/builds","source_budget_bytes":2147483648,"source_reserve_bytes":8589934592,"target_min_free_bytes":21474836480}'
+        }
+        config_windows_storage_session_script fixture
+    )
+    for mode in valid wrong_mapping low_source low_target unavailable; do
+        ((TESTS_RUN++))
+        case "$mode" in
+            valid) expected='ADMITTED:0' ;;
+            wrong_mapping) expected='DSR NFS mapping identity mismatch:0' ;;
+            low_source) expected='DSR source/cache capacity admission failed:0' ;;
+            low_target) expected='DSR target capacity admission failed:0' ;;
+            unavailable) expected='DSR NFS mount failed:1' ;;
+        esac
+        status=0
+        result=$(
+            {
+                printf "\$mode='%s';\n" "$mode"
+                cat <<'POWERSHELL'
+$global:mountCalls=0
+$env:SystemRoot='/fixture'
+$env:CARGO_HOME='C:/cargo'
+function Get-Item { return [pscustomobject]@{PSIsContainer=$true;Attributes=16;Parent=$null} }
+function Get-CimInstance {
+    param($ClassName,$Filter)
+    if ($Filter -eq "DeviceID='C:'") {
+        $free=if($mode -eq 'low_source'){9GB}else{12GB}
+        return [pscustomobject]@{DeviceID='C:';DriveType=3;FileSystem='NTFS';FreeSpace=$free;Size=500GB}
+    }
+    if($mode -eq 'unavailable'){return $null}
+    $provider=if($mode -eq 'wrong_mapping'){'\wrongoreign'}else{'\\192.0.2.1\owned\builds'}
+    $free=if($mode -eq 'low_target'){19GB}else{100GB}
+    return [pscustomobject]@{DeviceID='R:';DriveType=4;FileSystem='NFS';ProviderName=$provider;FreeSpace=$free;Size=500GB}
+}
+function Get-PSDrive { param($Name); return $null }
+function Join-Path { param($Path,$ChildPath); return 'Invoke-TestMount' }
+function Invoke-TestMount { $global:mountCalls++; $global:LASTEXITCODE=53 }
+try {
+POWERSHELL
+                printf '%s\n' "$script"
+                printf '%s\n' 'Write-Output ("ADMITTED:"+$global:mountCalls)' '} catch { Write-Output ($_.Exception.Message+":"+$global:mountCalls) }'
+                printf '\n'
+            } | pwsh -NoLogo -NoProfile -NonInteractive -Command -
+        ) || status=$?
+        result=$(printf '%s' "$result" | tr -d '\r')
+        if [[ $status -eq 0 && "$result" == "$expected" ]]; then
+            pass "Windows split-storage $mode admission executes expected branch"
+        else
+            fail "Windows split-storage $mode: status=$status result=$result expected=$expected"
+        fi
+    done
+}
+
+test_windows_storage_optional_config() {
+    local result status=0 fixture="$TEMP_DIR/windows-storage-optional.yaml" ordinary_fixture="$TEMP_DIR/windows-storage-ordinary.yaml"
+    printf 'hosts:\n  ordinary:\n    platform: windows/amd64\n  opted:\n    windows_storage: false\n' > "$fixture"
+    printf 'hosts:\n  ordinary:\n    platform: windows/amd64\n' > "$ordinary_fixture"
+    ((TESTS_RUN++))
+    result=$(
+        export DSR_HOSTS_FILE="$ordinary_fixture"
+        command() {
+            if [[ "${1:-}" == -v && "${2:-}" == yq ]]; then return 1; fi
+            builtin command "$@"
+        }
+        local ordinary=0 opted=0
+        config_windows_storage_json ordinary >/dev/null || ordinary=$?
+        export DSR_HOSTS_FILE="$fixture"
+        config_windows_storage_json opted >/dev/null || opted=$?
+        printf '%s:%s' "$ordinary" "$opted"
+    ) || status=$?
+    if [[ $status -eq 0 && "$result" == 1:4 ]]; then
+        pass "Missing yq preserves ordinary hosts and refuses configured split storage"
+    else
+        fail "Missing-yq config behavior: status=$status result=$result"
+    fi
+    ((TESTS_RUN++))
+    status=0
+    (
+        export DSR_HOSTS_FILE="$ordinary_fixture"
+        command() {
+            if [[ "${1:-}" == -v && "${2:-}" == yq ]]; then return 1; fi
+            builtin command "$@"
+        }
+        grep() { return 2; }
+        config_windows_storage_json ordinary >/dev/null
+    ) || status=$?
+    if [[ $status -eq 4 ]]; then pass "Unreadable yq-less configuration fails closed";
+    else fail "Unreadable yq-less configuration returned $status"; fi
+    ((TESTS_RUN++))
+    status=0
+    (export DSR_HOSTS_FILE="$fixture"; config_windows_storage_json opted >/dev/null) || status=$?
+    if [[ $status -eq 4 ]]; then pass "False split-storage contract is malformed, not absent";
+    else fail "False split-storage contract returned $status"; fi
+    local syntax complex_fixture
+    for syntax in flow quoted; do
+        ((TESTS_RUN++))
+        complex_fixture="$TEMP_DIR/windows-storage-$syntax.yaml"
+        if [[ "$syntax" == flow ]]; then
+            printf 'hosts: {ordinary: {windows_storage: false}}\n' > "$complex_fixture"
+        else
+            printf 'hosts:\n  "ordinary":\n    "windows_storage": false\n' > "$complex_fixture"
+        fi
+        status=0
+        (
+            export DSR_HOSTS_FILE="$complex_fixture"
+            command() {
+                if [[ "${1:-}" == -v && "${2:-}" == yq ]]; then return 1; fi
+                builtin command "$@"
+            }
+            config_windows_storage_json ordinary >/dev/null
+        ) || status=$?
+        if [[ $status -eq 4 ]]; then pass "Yq-less $syntax contract cannot bypass admission";
+        else fail "Yq-less $syntax contract returned $status"; fi
+    done
+}
+
+if [[ "${1:-}" == --windows-storage-only ]]; then
+    test_windows_storage_optional_config
+    test_windows_split_storage_admission
+    [[ $TESTS_FAILED -eq 0 ]]
+    exit $?
+fi
+
 echo "=== Host Health Module Tests ==="
 echo ""
 
@@ -942,6 +1073,8 @@ test_disk_space_forces_kilobytes_with_512_byte_default
 test_disk_space_rejects_non_numeric_fields
 test_disk_space_rejects_numeric_output_from_failed_command
 test_windows_disk_probe_survives_bash_default_shell
+test_windows_storage_optional_config
+test_windows_split_storage_admission
 test_human_disk_error_reports_probe_failure
 test_local_toolchains_check
 test_local_clock_drift
@@ -988,7 +1121,11 @@ test_resume_plan_generation
 test_health_check_with_retry_context
 
 # Cleanup
-rm -rf "$TEMP_DIR"
+if [[ "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then
+    rm -rf "$TEMP_DIR"
+else
+    printf 'Retained fixtures: %s\n' "$TEMP_DIR"
+fi
 
 # Summary
 echo ""

@@ -214,6 +214,8 @@ yq() {
     if [[ "${1:-}" == -o=json && "${2:-}" == -I=0 ]]; then
         case "${3:-}" in
             .) printf '{}\n'; return 0 ;;
+            '.hosts[strenv(DSR_STORAGE_HOST)].windows_storage')
+                printf 'null\n'; return 0 ;;
             '.workspace_archive_files[strenv(DSR_TARGET_PLATFORM)] // []'|\
             '.workspace_additional_artifacts[strenv(DSR_TARGET_PLATFORM)] // []')
                 printf '[]\n'; return 0 ;;
@@ -2509,7 +2511,7 @@ test_windows_strict_cargo_metadata_command() {
     (
         _act_is_windows_host() { return 0; }
         _act_ssh_exec() {
-            printf '%s\n' "$(_test_decode_remote_command "$2")" > "$command_file"
+            printf '%s\n' "$(_test_decode_remote_command "$2")" >> "$command_file"
             printf '%s\n' 'C:\build\source'
             printf '%s\n' '{"workspace_root":"C:\\\\build\\\\source","packages":[{"manifest_path":"C:\\\\build\\\\source\\\\Cargo.toml","source":null}]}'
         }
@@ -2537,7 +2539,122 @@ test_windows_strict_cargo_metadata_command() {
 # Run All Tests
 # ============================================================================
 
+test_windows_split_target_and_collection() {
+    log_test "Windows split storage preserves source binding and initializes collection"
+    local result status=0
+    result=$(
+        source "$SRC_DIR/config.sh"
+        config_windows_storage_json() {
+            printf '%s' '{"drive":"R","source_drive":"C","server":"192.0.2.1","export":"/owned/builds","source_budget_bytes":2147483648,"source_reserve_bytes":8589934592,"target_min_free_bytes":21474836480}'
+        }
+        reset_state
+        local canonical='C:/owned/run/.cargo-target-windows-amd64' target command
+        target=$(_act_windows_short_target_directory mock-windows "$canonical" \
+            12345678-1234-4234-8234-123456789abc windows/amd64) || exit 1
+        [[ "$target" == R:/d/t/12345678-1234-4234-8234-123456789abc/amd64 ]] || exit 2
+        command=$(get_ssh_cmd)
+        [[ "$command" == *"\$root='R:/'"* && "$command" == *"'$canonical'"* &&
+           "$command" == *"Build scratch is not a plain directory"* ]] || exit 3
+        MOCK_SSH_STREAM_FILE="$MOCK_DIR/split-stream-input"
+        MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+        _act_stream_remote_windows_file mock-windows "$target/tool.exe" > "$MOCK_DIR/split-stream-output" || exit 4
+        cmp "$MOCK_SSH_STREAM_FILE" "$MOCK_DIR/split-stream-output" || exit 5
+        command=$(get_raw_ssh_args)
+        [[ "$command" == *"DSR NFS mapping identity mismatch"* &&
+           "$command" == *"File]::OpenRead"* && "$command" == *'-o fileaccess=777'* ]] || exit 6
+        printf 'split-target-and-binary-collection-pass'
+    ) || status=$?
+    if [[ $status -eq 0 && "$result" == split-target-and-binary-collection-pass ]]; then
+        log_pass "Mapped output retains canonical source marker and binary-safe initialized collection"
+    else
+        log_fail "Split target/collection: status=$status result=$result"
+    fi
+}
+
+test_windows_split_source_budget() {
+    log_test "Windows source admission charges retained archives and sibling allocations"
+    local mode result status script expected
+    if ! command -v pwsh >/dev/null; then log_fail "PowerShell required for source admission tests"; return; fi
+    script=$(
+        _act_windows_storage_config() {
+            printf '%s' '{"source_drive":"C","source_budget_bytes":2147483648,"source_reserve_bytes":8589934592}'
+        }
+        _act_windows_source_budget_script fixture C:/owned/run 400000000 20000
+    )
+    for mode in valid sibling_overflow low_source; do
+        status=0
+        expected=ADMITTED
+        [[ "$mode" == valid ]] || expected='Source archives and sibling allocation exceed split-storage admission'
+        result=$(
+            {
+                printf "\$ErrorActionPreference='Stop'; \$mode='%s';\n" "$mode"
+                cat <<'POWERSHELL'
+function Test-Path { return ($mode -eq 'sibling_overflow') }
+function Get-ChildItem { return [pscustomobject]@{Attributes=0;PSIsContainer=$false;Length=1500000000} }
+function Get-CimInstance { $free=if($mode -eq 'low_source'){8800000000}else{12GB}; return [pscustomobject]@{FreeSpace=$free} }
+try {
+POWERSHELL
+                printf '%s\n' "$script"
+                printf '%s\n\n' 'Write-Output ADMITTED } catch { Write-Output $_.Exception.Message }'
+            } | pwsh -NoLogo -NoProfile -NonInteractive -Command -
+        ) || status=$?
+        result=$(printf '%s' "$result" | tr -d '\r')
+        if [[ $status -eq 0 && "$result" == "$expected" ]]; then
+            log_pass "Source allocation $mode causal branch"
+        else
+            log_fail "Source allocation $mode: status=$status result=$result expected=$expected"
+        fi
+    done
+}
+
+test_windows_cache_junction_identity() {
+    log_test "Windows cache junctions must resolve to the admitted ambient targets"
+    local mode script result expected status
+    script=$(_act_windows_cache_junction_guard_script C:/owned/run/.cargo-home true) || { log_fail "Cache guard generation failed"; return; }
+    for mode in valid wrong_target plain_directory; do
+        expected=ADMITTED
+        [[ "$mode" != wrong_target ]] || expected='Strict Cargo cache junction target mismatch'
+        [[ "$mode" != plain_directory ]] || expected='Strict Cargo cache junction authority missing'
+        status=0
+        result=$(
+            {
+                printf "\$mode='%s';\n" "$mode"
+                cat <<'POWERSHELL'
+$env:CARGO_HOME='C:/ambient'
+function Test-Path { return $true }
+function Join-Path { param($Path,$ChildPath); return "$Path/$ChildPath" }
+function Resolve-Path { param($LiteralPath); return [pscustomobject]@{ProviderPath=$LiteralPath} }
+function Get-Item {
+    param($LiteralPath)
+    $name=($LiteralPath -split '/')[-1]
+    $target=if($mode -eq 'wrong_target'){"D:/foreign/$name"}else{"C:/ambient/$name"}
+    $attributes=if($mode -eq 'plain_directory'){0}else{1024}
+    return [pscustomobject]@{PSIsContainer=$true;Attributes=$attributes;Target=@($target)}
+}
+try {
+POWERSHELL
+                printf '%s\n' "$script"
+                printf '%s\n\n' 'Write-Output ADMITTED } catch { Write-Output $_.Exception.Message }'
+            } | pwsh -NoLogo -NoProfile -NonInteractive -Command -
+        ) || status=$?
+        result=$(printf '%s' "$result" | tr -d '\r')
+        if [[ $status -eq 0 && "$result" == "$expected" ]]; then
+            log_pass "Cache junction $mode causal branch"
+        else
+            log_fail "Cache junction $mode: status=$status result=$result expected=$expected"
+        fi
+    done
+}
+
 main() {
+    if [[ "${1:-}" == --windows-storage-only ]]; then
+        test_windows_split_target_and_collection
+        test_windows_split_source_budget
+        test_windows_cache_junction_identity
+        printf 'Windows storage tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --profile-env-only ]]; then
         test_frankenterm_profile_override_rejection
         test_profile_overrides_preserve_ordinary_and_other_tools
@@ -2653,6 +2770,9 @@ main() {
     test_result_json_method_native
     test_result_json_success_has_artifact
     test_windows_strict_cargo_metadata_command
+    test_windows_split_target_and_collection
+    test_windows_split_source_budget
+    test_windows_cache_junction_identity
 
     # Derived build identity, Windows path guard, glibc floor (issues #7/#8/#9)
     test_rust_derives_build_target_and_dsr_env
@@ -2674,7 +2794,11 @@ main() {
     echo -e "  ${RED}Failed:${NC}  $FAIL_COUNT"
 
     # Cleanup
-    rm -rf "$MOCK_DIR"
+    if [[ "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then
+        rm -rf "$MOCK_DIR"
+    else
+        printf 'Retained fixtures: %s\n' "$MOCK_DIR"
+    fi
 
     if [[ $FAIL_COUNT -gt 0 ]]; then
         exit 1

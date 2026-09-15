@@ -33,6 +33,99 @@ DSR_SCHEMA_VERSION="1.0.0"
 # Loaded config values (associative array)
 declare -gA DSR_CONFIG
 
+# Optional Windows split-storage contract. The source and private Cargo home
+# stay on NTFS; only target output and scratch use the explicitly named NFS
+# export. Return 1 when absent, 4 for any malformed contract.
+config_windows_storage_json() {
+    local host="$1" value hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
+    [[ "$host" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || return 4
+    [[ -f "$hosts_file" ]] || return 1
+    if ! command -v yq >/dev/null 2>&1; then
+        # Preserve the existing yq-less fallback for simple files with no
+        # possible opt-in. Complex YAML or any storage declaration requires
+        # a real parser; indentation guessing cannot prove absence.
+        local scan_status=0
+        LC_ALL=C grep -Eq "windows_storage|[{}&*!]|^[[:space:]]*[\"'?%]" "$hosts_file" || scan_status=$?
+        case "$scan_status" in
+            1) return 1 ;;
+            *) return 4 ;;
+        esac
+    fi
+    value=$(DSR_STORAGE_HOST="$host" yq -o=json -I=0 \
+        '.hosts[strenv(DSR_STORAGE_HOST)].windows_storage' "$hosts_file") || return 4
+    [[ "$value" != null ]] || return 1
+    jq -e '
+        type == "object" and
+        (keys | sort) == (["drive", "export", "server", "source_budget_bytes", "source_drive", "source_reserve_bytes", "target_min_free_bytes"] | sort) and
+        (.drive | type == "string" and test("^[D-Z]$")) and
+        (.source_drive | type == "string" and test("^[A-Z]$")) and
+        .drive != .source_drive and
+        (.server | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9.-]*$")) and
+        (.export | type == "string" and test("^/[A-Za-z0-9_/-]+[A-Za-z0-9_.-]*$") and (contains("..") | not)) and
+        (.source_budget_bytes | type == "number" and floor == . and . >= 2147483648 and . <= 1099511627776) and
+        (.source_reserve_bytes | type == "number" and floor == . and . >= 8589934592 and . <= 1099511627776) and
+        (.target_min_free_bytes | type == "number" and floor == . and . >= 21474836480 and . <= 1099511627776)
+    ' <<< "$value" >/dev/null || return 4
+    printf '%s\n' "$value"
+}
+
+# This script must run in the SAME Windows logon session as its consumer.
+# Native NFS mappings disappear between SSH sessions. In particular, a UNC
+# path can read successfully while refusing byte-range locks.
+config_windows_storage_session_script() {
+    local host="$1" value drive source_drive server export_path reserve budget target_min provider
+    value=$(config_windows_storage_json "$host") || return $?
+    drive=$(jq -r '.drive' <<< "$value")
+    source_drive=$(jq -r '.source_drive' <<< "$value")
+    server=$(jq -r '.server' <<< "$value")
+    export_path=$(jq -r '.export' <<< "$value")
+    reserve=$(jq -r '.source_reserve_bytes' <<< "$value")
+    budget=$(jq -r '.source_budget_bytes' <<< "$value")
+    target_min=$(jq -r '.target_min_free_bytes' <<< "$value")
+    provider="\\\\$server${export_path//\//\\}"
+    cat <<EOF
+\$ErrorActionPreference='Stop';
+\$dsrSourceDisk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${source_drive}:'";
+if (\$null -eq \$dsrSourceDisk -or \$dsrSourceDisk.DriveType -ne 3 -or \$dsrSourceDisk.FileSystem -ne 'NTFS' -or \$dsrSourceDisk.FreeSpace -lt ([long]$reserve + [long]$budget)) { throw 'DSR source/cache capacity admission failed' };
+\$dsrAmbientCargo=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' };
+if (-not \$dsrAmbientCargo.Replace([char]92,[char]47).StartsWith('${source_drive}:/',[StringComparison]::OrdinalIgnoreCase)) { throw 'DSR cache volume is outside source capacity admission' };
+\$dsrCacheNode=Get-Item -LiteralPath \$dsrAmbientCargo -Force;
+while (\$null -ne \$dsrCacheNode) { if ((\$dsrCacheNode.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or ((\$dsrCacheNode.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'DSR ambient cache ancestor is not a plain directory' }; \$dsrCacheNode=\$dsrCacheNode.Parent };
+foreach (\$name in @('registry','git')) { \$cachePath=Join-Path \$dsrAmbientCargo \$name; if (Test-Path -LiteralPath \$cachePath) { \$cacheItem=Get-Item -LiteralPath \$cachePath -Force; if (-not \$cacheItem.PSIsContainer -or ((\$cacheItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'DSR cache storage is outside admitted plain directory' } } };
+\$dsrTargetDisk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${drive}:'";
+if (\$null -eq \$dsrTargetDisk) {
+    if (Get-PSDrive -Name '$drive' -ErrorAction SilentlyContinue) { throw 'DSR target drive is already occupied' };
+    & (Join-Path \$env:SystemRoot 'System32/mount.exe') -o anon -o mtype=hard -o fileaccess=777 '${server}:${export_path}' '${drive}:' | Out-Null;
+    if (\$LASTEXITCODE -ne 0) { throw 'DSR NFS mount failed' };
+    \$dsrTargetDisk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${drive}:'";
+};
+if (\$null -eq \$dsrTargetDisk -or \$dsrTargetDisk.DriveType -ne 4 -or \$dsrTargetDisk.FileSystem -ne 'NFS' -or \$dsrTargetDisk.ProviderName -cne '$provider') { throw 'DSR NFS mapping identity mismatch' };
+if (\$dsrTargetDisk.FreeSpace -lt [long]$target_min) { throw 'DSR target capacity admission failed' };
+EOF
+}
+
+# Retained tiny probe: no deletion, and no "lock worked" claim based only on
+# one process. Both exclusion while held and acquisition after release matter.
+config_windows_storage_lock_script() {
+    local value drive
+    value=$(config_windows_storage_json "$1") || return $?
+    drive=$(jq -r '.drive' <<< "$value")
+    cat <<EOF
+\$dsrProbePath='${drive}:/.dsr-lock-'+[Guid]::NewGuid().ToString('N')+'.probe';
+\$dsrProbe=[IO.File]::Open(\$dsrProbePath,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite);
+try {
+    \$dsrProbe.SetLength(1); \$dsrProbe.Flush(\$true); \$dsrProbe.Lock(0,1);
+    \$dsrChild='\$ErrorActionPreference="Stop"; \$f=[IO.File]::Open("'+\$dsrProbePath+'",[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite); try { try { \$f.Lock(0,1); \$f.Unlock(0,1); exit 7 } catch [IO.IOException] { exit 0 } } finally { \$f.Dispose() }';
+    \$dsrEncoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(\$dsrChild));
+    & (Join-Path \$env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -EncodedCommand \$dsrEncoded;
+    if (\$LASTEXITCODE -ne 0) { throw 'DSR NFS lock exclusion failed' };
+    \$dsrProbe.Unlock(0,1);
+    & (Join-Path \$env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -EncodedCommand \$dsrEncoded;
+    if (\$LASTEXITCODE -ne 7) { throw 'DSR NFS lock acquisition failed' };
+} finally { \$dsrProbe.Dispose() };
+EOF
+}
+
 # Colors for output (if not disabled)
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
     _CFG_RED=$'\033[0;31m'

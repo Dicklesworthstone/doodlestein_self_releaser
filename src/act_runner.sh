@@ -167,19 +167,19 @@ _act_stream_remote_unix_file() {
 }
 
 _act_stream_remote_windows_file() {
-    local ssh_destination="$1"
+    local host="$1"
     local source_path="$2"
     local ps_path="${source_path//\'/\'\'}"
     local ps_command
     ps_command="\$ErrorActionPreference='Stop'; \$input=[IO.File]::OpenRead('${ps_path}'); \$output=\$null; try { \$output=[Console]::OpenStandardOutput(); \$input.CopyTo(\$output); \$output.Flush() } finally { if (\$null -ne \$output) { \$output.Dispose() }; \$input.Dispose() }"
     # -n for the same reason as the Unix stream: never drain the caller's
     # collection loop through the ssh session's stdin.
-    ssh -n \
-        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
-        -o BatchMode=yes \
-        -o StrictHostKeyChecking=accept-new \
-        "$ssh_destination" \
-        "$(_act_windows_encoded_powershell "${ps_command}")"
+    local ssh_destination command
+    ssh_destination=$(_act_get_ssh_destination "$host") || return 4
+    command=$(_act_windows_encoded_powershell "$ps_command") || return 4
+    command=$(_act_windows_storage_command "$host" "$command") || return 4
+    ssh -n -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new "$ssh_destination" "$command"
 }
 
 _act_stream_workspace_tar_gz() {
@@ -2748,6 +2748,28 @@ _act_get_host_field() {
     printf '%s\n' "$value"
 }
 
+_act_windows_storage_config() {
+    if ! declare -F config_windows_storage_json >/dev/null; then
+        source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh"
+    fi
+    config_windows_storage_json "$1"
+}
+
+_act_windows_storage_command() {
+    local host="$1" command="$2" storage status=0 initializer decoded executable=powershell
+    storage=$(_act_windows_storage_config "$host") || status=$?
+    if [[ $status -eq 1 ]]; then printf '%s' "$command"; return 0; fi
+    [[ $status -eq 0 ]] || return 4
+    # A command substitution cannot import functions into its parent shell.
+    if ! declare -F config_windows_storage_session_script >/dev/null; then
+        source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh"
+    fi
+    initializer=$(config_windows_storage_session_script "$host") || return 4
+    decoded=$(_act_windows_command_script "$command") || return 4
+    [[ "$command" == pwsh\ * ]] && executable=pwsh
+    _act_windows_encoded_powershell "$initializer"$'\n'"$decoded" "$executable"
+}
+
 _act_get_host_platform() {
     local host="${1:-}"
     local platform
@@ -3356,7 +3378,17 @@ _act_windows_short_target_directory() {
     _act_is_uuid "$run_id" || return 4
     [[ "$platform" == windows/amd64 || "$platform" == windows/arm64 ]] || return 4
     short="${path:0:2}/d/t/$run_id/${platform#windows/}"
-    script="\$ErrorActionPreference='Stop'; \$root='${path:0:2}/'; foreach (\$part in @('d','t','$run_id')) { \$root=Join-Path \$root \$part; if (-not (Test-Path -LiteralPath \$root)) { New-Item -ItemType Directory -Path \$root | Out-Null }; \$item=Get-Item -LiteralPath \$root -Force; if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cargo target ancestor is not a plain directory' } }; \$created=\$false; if (-not (Test-Path -LiteralPath '$short')) { New-Item -ItemType Directory -Path '$short' | Out-Null; \$created=\$true }; \$item=Get-Item -LiteralPath '$short' -Force; if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cargo target is not a plain directory' }; \$marker=Join-Path \$item.FullName '.dsr-source-target'; if (\$created) { [IO.File]::WriteAllText(\$marker,'$path',[Text.UTF8Encoding]::new(\$false)) }; \$file=Get-Item -LiteralPath \$marker -Force; if (\$file.PSIsContainer -or ((\$file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or [IO.File]::ReadAllText(\$marker) -cne '$path') { throw 'Cargo target source identity mismatch' }; \$ancestor=\$item; while (\$null -ne \$ancestor) { foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$ancestor.FullName ('.cargo/'+\$name))) { throw 'Cargo target ancestor configuration is forbidden' } }; \$ancestor=\$ancestor.Parent }; Write-Output '$short'"
+    local storage storage_status=0
+    storage=$(_act_windows_storage_config "$host") || storage_status=$?
+    [[ $storage_status -eq 0 || $storage_status -eq 1 ]] || return 4
+    if [[ $storage_status -eq 0 ]]; then
+        [[ "${path:0:1}" == "$(jq -r '.source_drive' <<< "$storage")" ]] || return 4
+        short="$(jq -r '.drive' <<< "$storage"):/d/t/$run_id/${platform#windows/}"
+    fi
+    script="\$ErrorActionPreference='Stop'; \$root='${short:0:2}/'; foreach (\$part in @('d','t','$run_id')) { \$root=Join-Path \$root \$part; if (-not (Test-Path -LiteralPath \$root)) { New-Item -ItemType Directory -Path \$root | Out-Null }; \$item=Get-Item -LiteralPath \$root -Force; if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cargo target ancestor is not a plain directory' } }; \$created=\$false; if (-not (Test-Path -LiteralPath '$short')) { New-Item -ItemType Directory -Path '$short' | Out-Null; \$created=\$true }; \$item=Get-Item -LiteralPath '$short' -Force; if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Cargo target is not a plain directory' }; \$marker=Join-Path \$item.FullName '.dsr-source-target'; if (\$created) { [IO.File]::WriteAllText(\$marker,'$path',[Text.UTF8Encoding]::new(\$false)) }; \$file=Get-Item -LiteralPath \$marker -Force; if (\$file.PSIsContainer -or ((\$file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or [IO.File]::ReadAllText(\$marker) -cne '$path') { throw 'Cargo target source identity mismatch' }; \$ancestor=\$item; while (\$null -ne \$ancestor) { foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$ancestor.FullName ('.cargo/'+\$name))) { throw 'Cargo target ancestor configuration is forbidden' } }; \$ancestor=\$ancestor.Parent }; Write-Output '$short'"
+    if [[ $storage_status -eq 0 ]]; then
+        script+="; \$scratch=Join-Path '$short' 'scratch'; if (-not (Test-Path -LiteralPath \$scratch)) { New-Item -ItemType Directory -Path \$scratch | Out-Null }; \$scratchItem=Get-Item -LiteralPath \$scratch -Force; if (-not \$scratchItem.PSIsContainer -or ((\$scratchItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Build scratch is not a plain directory' }"
+    fi
     result=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$script" pwsh)" 60) || return 4
     result="${result//$'\r'/}"
     [[ "$result" == "$short" ]] || return 4
@@ -4082,6 +4114,26 @@ _act_validate_cargo_metadata_source_closure() {
     return 0
 }
 
+_act_windows_cache_junction_guard_script() {
+    local cargo_home="$1" require_links="${2:-false}"
+    [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
+       ( "$require_links" == true || "$require_links" == false ) ]] || return 4
+    cat <<EOF
+\$ErrorActionPreference='Stop';
+\$dsrAmbient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' };
+foreach (\$name in @('registry','git')) {
+    \$expected=Join-Path \$dsrAmbient \$name; \$link=Join-Path '$cargo_home' \$name;
+    if (Test-Path -LiteralPath \$link) {
+        \$item=Get-Item -LiteralPath \$link -Force; \$targets=@(\$item.Target);
+        if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -or \$targets.Count -ne 1 -or -not (Test-Path -LiteralPath \$expected -PathType Container)) { throw 'Strict Cargo cache junction authority missing' };
+        \$actual=(Resolve-Path -LiteralPath \$targets[0] -ErrorAction Stop).ProviderPath;
+        \$wanted=(Resolve-Path -LiteralPath \$expected -ErrorAction Stop).ProviderPath;
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals(\$actual.TrimEnd('\\','/'),\$wanted.TrimEnd('\\','/'))) { throw 'Strict Cargo cache junction target mismatch' };
+    } elseif (\$$require_links -and (Test-Path -LiteralPath \$expected -PathType Container)) { throw 'Strict Cargo cache junction absent after metadata' };
+};
+EOF
+}
+
 _act_strict_cargo_metadata_json() {
     local host="$1"
     local source_root="$2"
@@ -4102,10 +4154,20 @@ _act_strict_cargo_metadata_json() {
         metadata_command="set -e; umask 077; physical_source_root=\$(cd '$source_root' && pwd -P); strict_home=\"\${physical_source_root%/*}/.cargo-home\"; ambient_home=\${CARGO_HOME:-\$HOME/.cargo}; if test -e \"\$strict_home\" || test -L \"\$strict_home\"; then test -d \"\$strict_home\"; test ! -L \"\$strict_home\"; else mkdir \"\$strict_home\"; fi; test -d \"\$strict_home\"; test ! -L \"\$strict_home\"; for name in config config.toml credentials credentials.toml; do test ! -e \"\$strict_home/\$name\"; test ! -L \"\$strict_home/\$name\"; done; for name in registry git; do if test -d \"\$ambient_home/\$name\"; then if test -e \"\$strict_home/\$name\" || test -L \"\$strict_home/\$name\"; then test -L \"\$strict_home/\$name\"; else ln -s \"\$ambient_home/\$name\" \"\$strict_home/\$name\"; fi; test \"\$(cd \"\$strict_home/\$name\" && pwd -P)\" = \"\$(cd \"\$ambient_home/\$name\" && pwd -P)\"; else test ! -e \"\$strict_home/\$name\"; test ! -L \"\$strict_home/\$name\"; fi; done; ancestor=\${physical_source_root%/*}; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; cd \"\$physical_source_root\"; printf '%s\\n' \"\$physical_source_root\"; CARGO_HOME=\"\$strict_home\" cargo metadata --locked --offline --all-features --format-version 1 --manifest-path \"\$physical_source_root/Cargo.toml\""
     fi
 
+    if _act_is_windows_host "$host"; then
+        local cache_guard metadata_script
+        cache_guard=$(_act_windows_cache_junction_guard_script "$strict_cargo_home") || return 4
+        metadata_script=$(_act_windows_command_script "$metadata_command") || return 4
+        metadata_command=$(_act_windows_encoded_powershell "$cache_guard"$'\n'"$metadata_script") || return 4
+    fi
     if ! metadata_output=$(_act_ssh_exec "$host" "$metadata_command" "$_ACT_SYNC_TIMEOUT") || \
        [[ "$metadata_output" != *$'\n'* ]]; then
         _log_error "Locked offline Cargo metadata failed for strict source root on $host"
         return 4
+    fi
+    if _act_is_windows_host "$host"; then
+        cache_guard=$(_act_windows_cache_junction_guard_script "$strict_cargo_home" true) || return 4
+        _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$cache_guard")" "$_ACT_SYNC_TIMEOUT" >/dev/null || return 4
     fi
     canonical_source_root="${metadata_output%%$'\n'*}"
     canonical_source_root="${canonical_source_root%$'\r'}"
@@ -4134,6 +4196,33 @@ _act_validate_strict_cargo_source_closure() {
 
 _act_windows_reparse_guard_script() {
     printf '%s' "function Assert-NoReparseChain { param([System.IO.FileSystemInfo]\$Item); for (\$node=\$Item; \$null -ne \$node; \$node=\$node.Parent) { if ((\$node.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'NTFS ReparsePoint is forbidden in a strict release snapshot' } } }; function Assert-PlainDirectory { param([string]\$Path); \$item=Get-Item -LiteralPath \$Path -Force -ErrorAction Stop; if (-not \$item.PSIsContainer) { throw 'Strict release directory is not a directory' }; Assert-NoReparseChain \$item }; function Assert-PlainFile { param([string]\$Path); \$item=Get-Item -LiteralPath \$Path -Force -ErrorAction Stop; if (\$item.PSIsContainer) { throw 'Strict release file is not a file' }; Assert-NoReparseChain \$item };"
+}
+
+_act_windows_source_budget_script() {
+    local host="$1" parent="$2" archive_bytes="$3" object_count="$4" storage status=0 budget reserve drive
+    storage=$(_act_windows_storage_config "$host") || status=$?
+    [[ $status -ne 1 ]] || return 0
+    [[ $status -eq 0 && "$parent" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$parent" != *..* &&
+       "$archive_bytes" =~ ^[0-9]{1,12}$ && "$object_count" =~ ^[0-9]{1,9}$ ]] || return 4
+    budget=$(jq -r '.source_budget_bytes' <<< "$storage")
+    reserve=$(jq -r '.source_reserve_bytes' <<< "$storage")
+    drive=$(jq -r '.source_drive' <<< "$storage")
+    [[ "${parent:0:1}" == "$drive" ]] || return 4
+    # Archives are uncompressed git tar files. Two archive lengths bound the
+    # retained archive plus expanded bytes; per-object allocation overhead is
+    # additionally charged. Each sibling is admitted against this same parent.
+    cat <<EOF
+\$dsrIncoming=([long]$archive_bytes * 2)+([long]$object_count * 4096)+16777216;
+\$dsrExisting=[long]0;
+if (Test-Path -LiteralPath '$parent') {
+    foreach (\$entry in Get-ChildItem -LiteralPath '$parent' -Force -Recurse -ErrorAction Stop) {
+        if ((\$entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Source budget encountered a reparse point' };
+        \$dsrExisting+=4096; if (-not \$entry.PSIsContainer) { \$dsrExisting+=\$entry.Length };
+    };
+};
+\$dsrDisk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${drive}:'";
+if ((\$dsrExisting+\$dsrIncoming) -gt [long]$budget -or \$null -eq \$dsrDisk -or \$dsrDisk.FreeSpace -lt ([long]$reserve+\$dsrIncoming)) { throw 'Source archives and sibling allocation exceed split-storage admission' };
+EOF
 }
 
 _act_sync_strict_checkout() {
@@ -4231,6 +4320,14 @@ _act_sync_strict_checkout() {
             parent_setup="Assert-PlainDirectory '${win_snapshot_parent}'"
         fi
         setup_command="$(_act_windows_encoded_powershell "${reparse_guard} ${parent_setup}; if ((Test-Path -LiteralPath '${win_remote_path}') -or (Test-Path -LiteralPath '${win_remote_archive}')) { exit 17 }; New-Item -ItemType Directory -Path '${win_remote_path}' | Out-Null; Assert-PlainDirectory '${win_remote_path}'")"
+        local source_budget_script source_archive_bytes setup_script
+        source_archive_bytes=$(_act_file_size "$archive_path") || return 4
+        source_budget_script=$(_act_windows_source_budget_script "$host" "$snapshot_parent" "$source_archive_bytes" "$expected_object_count") || return 4
+        if [[ -n "$source_budget_script" ]]; then
+            setup_script=$(_act_windows_command_script "$setup_command") || return 4
+            setup_command=$(_act_windows_encoded_powershell "$source_budget_script"$'\n'"$setup_script") || return 4
+            setup_command=$(_act_windows_storage_command "$host" "$setup_command") || return 4
+        fi
         verify_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; & (Join-Path \$env:SystemRoot 'System32\\tar.exe') -xf '${win_remote_archive}' -C '${win_remote_path}'; if (\$LASTEXITCODE -ne 0) { exit 18 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 19 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant()")"
         if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
@@ -5204,7 +5301,7 @@ _act_is_rust_build_influence_name() {
     sdk_regex=$(_act_rust_sdk_influence_regex)
     [[ "$normalized_name" =~ $sdk_regex ]] && return 0
     case "$normalized_name" in
-        CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
+        CARGO_*|RUST*|XWIN_*|TEMP|TMP|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
         FT_ATOMIC_BUILD_IDENTITY|FT_ATOMIC_BUILD_PROFILE|\
         CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
         CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|\
@@ -5584,6 +5681,10 @@ _act_ssh_exec() {
     local cmd="$2"
     local timeout_sec="${3:-$_ACT_BUILD_TIMEOUT}"
 
+    if _act_is_windows_host "$host"; then
+        cmd=$(_act_windows_storage_command "$host" "$cmd") || return 4
+    fi
+
     if _act_is_local_host "$host"; then
         _act_run_with_timeout "$timeout_sec" bash -lc "$cmd"
     else
@@ -5801,6 +5902,18 @@ act_run_native_build() {
         fi
         strict_build_env+="CARGO_TARGET_DIR=$strict_cargo_target_dir"
         strict_build_env+=$'\n'"CARGO_HOME=$strict_cargo_home"
+        if _act_is_windows_host "$host"; then
+            local split_storage_status=0
+            _act_windows_storage_config "$host" >/dev/null || split_storage_status=$?
+            [[ $split_storage_status -eq 0 || $split_storage_status -eq 1 ]] || return 4
+            if [[ $split_storage_status -eq 0 ]]; then
+                strict_build_env+=$'\n'"TEMP=$strict_cargo_target_dir/scratch"
+                strict_build_env+=$'\n'"TMP=$strict_cargo_target_dir/scratch"
+                # Existing cache is admitted by offline metadata. Never grow
+                # the system-volume cache by downloading during this lane.
+                strict_build_env+=$'\n'"CARGO_NET_OFFLINE=true"
+            fi
+        fi
         if [[ -n "$release_git_sha" ]]; then
             strict_build_env+=$'\n'"DSR_RELEASE_GIT_SHA=$release_git_sha"
             strict_build_env+=$'\n'"DSR_RELEASE_GIT_REF=$release_git_ref"
@@ -6274,6 +6387,16 @@ act_run_native_build() {
     if _act_is_windows_host "$host"; then
         local windows_build_script windows_build_guard
         windows_build_script=$(_act_windows_command_script "$remote_cmd") || return 4
+        local windows_storage_status=0 windows_lock_script
+        _act_windows_storage_config "$host" >/dev/null || windows_storage_status=$?
+        [[ $windows_storage_status -eq 0 || $windows_storage_status -eq 1 ]] || return 4
+        if [[ $windows_storage_status -eq 0 ]]; then
+            if ! declare -F config_windows_storage_lock_script >/dev/null; then
+                source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh"
+            fi
+            windows_lock_script=$(config_windows_storage_lock_script "$host") || return 4
+            windows_build_script="$windows_lock_script"$'\n'"$windows_build_script"
+        fi
         windows_build_guard=$(_act_windows_build_guard_script "$_ACT_BUILD_TIMEOUT" "$windows_build_script") || return 4
         windows_build_script="$windows_build_guard"
         if $strict_rust_build; then
@@ -6406,7 +6529,7 @@ act_run_native_build() {
                     collection_receipt=$(_act_collect_stream_exclusive \
                         "$this_artifact_path" "$collection_mode" \
                         _act_stream_remote_windows_file \
-                        "$ssh_destination" "$remote_artifact_path") || collection_receipt=""
+                        "$host" "$remote_artifact_path") || collection_receipt=""
                 else
                     collection_receipt=$(_act_collect_stream_exclusive \
                         "$this_artifact_path" "$collection_mode" \
@@ -6425,7 +6548,7 @@ act_run_native_build() {
                             collection_receipt=$(_act_collect_stream_exclusive \
                                 "$this_artifact_path" "$collection_mode" \
                                 _act_stream_remote_windows_file \
-                                "$ssh_destination" "$alt_remote_artifact_path") || collection_receipt=""
+                                "$host" "$alt_remote_artifact_path") || collection_receipt=""
                         else
                             collection_receipt=$(_act_collect_stream_exclusive \
                                 "$this_artifact_path" "$collection_mode" \
@@ -6623,7 +6746,7 @@ act_run_native_build() {
                     archive_file_receipt=$(_act_collect_stream_exclusive \
                         "$archive_file_local" "$archive_file_mode" \
                         _act_stream_remote_windows_file \
-                        "$ssh_destination" "$archive_file_remote") || archive_file_receipt=""
+                        "$host" "$archive_file_remote") || archive_file_receipt=""
                 else
                     archive_file_receipt=$(_act_collect_stream_exclusive \
                         "$archive_file_local" "$archive_file_mode" \
@@ -6690,7 +6813,7 @@ act_run_native_build() {
                 elif _act_is_windows_host "$host"; then
                     additional_receipt=$(_act_collect_stream_exclusive \
                         "$additional_local" 600 _act_stream_remote_windows_file \
-                        "$ssh_destination" "$additional_remote") || additional_receipt=""
+                        "$host" "$additional_remote") || additional_receipt=""
                 else
                     additional_receipt=$(_act_collect_stream_exclusive \
                         "$additional_local" 600 _act_stream_remote_unix_file \

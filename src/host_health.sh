@@ -426,6 +426,36 @@ _hh_check_disk_space() {
     local ssh_host="$3"
     local platform="${4:-}"
 
+    if [[ "$platform" == windows/* ]]; then
+        local storage storage_status=0 storage_script storage_probe storage_result
+        storage=$(config_windows_storage_json "$hostname") || storage_status=$?
+        if [[ $storage_status -eq 0 ]]; then
+            storage_script=$(config_windows_storage_session_script "$hostname") || return 4
+            storage_script+=$'\n'"$(config_windows_storage_lock_script "$hostname")" || return 4
+            # Preserve the source volume's actual pressure. A split layout is
+            # admitted by BOTH role budgets, never by substituting NFS free
+            # space for the system disk or suppressing its warning.
+            storage_script+=$'\n''$sourceUsage=[math]::Round(100-($dsrSourceDisk.FreeSpace/$dsrSourceDisk.Size*100)); $targetUsage=[math]::Round(100-($dsrTargetDisk.FreeSpace/$dsrTargetDisk.Size*100)); $status=if($sourceUsage -gt 90 -or $targetUsage -gt 90){"warning"}else{"ok"}; @{path=$dsrSourceDisk.DeviceID; usage_percent=$sourceUsage; available_gb=[math]::Round($dsrSourceDisk.FreeSpace/1GB,2); status=$status; admission="split-storage-role-budgets-v1"; source=@{path=$dsrSourceDisk.DeviceID; free_bytes=$dsrSourceDisk.FreeSpace; size_bytes=$dsrSourceDisk.Size}; target=@{path=$dsrTargetDisk.DeviceID; provider=$dsrTargetDisk.ProviderName; free_bytes=$dsrTargetDisk.FreeSpace; size_bytes=$dsrTargetDisk.Size}; lock_probe="independent-process-exclusion-and-reacquisition"} | ConvertTo-Json -Depth 4 -Compress'
+            # Compress before encoding; Windows command transport has an
+            # 8191-character ceiling, including the executable and options.
+            storage_probe=$(printf '%s' "$storage_script" | gzip -n -c | base64 | tr -d '\r\n') || return 4
+            storage_probe="& ([ScriptBlock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('$storage_probe')),[IO.Compression.CompressionMode]::Decompress),[Text.Encoding]::UTF8).ReadToEnd()))"
+            storage_probe=$(printf '%s' "$storage_probe" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
+            [[ ${#storage_probe} -lt 7000 ]] || return 4
+            if storage_result=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
+                "powershell -NoProfile -NonInteractive -EncodedCommand $storage_probe") && \
+               jq -e '.admission == "split-storage-role-budgets-v1" and (.status == "ok" or .status == "warning")' <<< "$storage_result" >/dev/null; then
+                jq --argjson contract "$storage" '. + {storage_contract:$contract}' <<< "$storage_result"
+                return 0
+            fi
+            echo '{"path":"split-storage","status":"error","available_gb":null,"error":"Windows source/target capacity, mapping identity, or lock admission failed"}'
+            return 1
+        elif [[ $storage_status -ne 1 ]]; then
+            echo '{"path":"split-storage","status":"error","available_gb":null,"error":"Invalid Windows split-storage contract"}'
+            return 1
+        fi
+    fi
+
     local df_output df_status=0
     if [[ "$platform" == windows/* ]]; then
         # Windows SSH may launch Bash, which expands $d inside a quoted
