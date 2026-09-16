@@ -11255,4 +11255,9 @@ main() {
     esac
 }
 
-main "$@"
+# Parse dispatch and exit together: a long-running command may outlive an
+# in-place tool update. Never resume reading changed source after it returns.
+{
+    main "$@"
+    exit $?
+}

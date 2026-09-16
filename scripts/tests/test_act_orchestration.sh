@@ -3666,6 +3666,42 @@ else
     fail "failed-target relocation violated retained authority"
 fi
 
+# A long-running main must not resume parsing newly appended/replaced source.
+# Exercise the actual entrypoint and retain an old-dispatch negative control.
+test_dispatch_source_growth() (
+    local fixture="$TEMP_DIR/dispatch-source-growth" status expected mode script
+    mkdir -p "$fixture"
+    tail -n 4 "$SCRIPT_DIR/dsr" > "$fixture/entrypoint"
+    for mode in current legacy; do
+        for expected in 0 7; do
+            script="$fixture/$mode-$expected.sh"
+            cat > "$script" <<'EOF'
+main() {
+    printf 'printf "UNEXPECTED_APPEND\\n"\nexit 99\n' >> "$0"
+    return "$1"
+}
+EOF
+            if [[ "$mode" == current ]]; then
+                cat "$fixture/entrypoint" >> "$script"
+            else
+                printf 'main "$@"\n' >> "$script"
+            fi
+            status=0
+            bash "$script" "$expected" > "$script.stdout" 2> "$script.stderr" || status=$?
+            if [[ "$mode" == current ]]; then
+                [[ "$status" -eq "$expected" && ! -s "$script.stdout" && ! -s "$script.stderr" ]] || exit 1
+            else
+                [[ "$status" -eq 99 && "$(cat "$script.stdout")" == UNEXPECTED_APPEND ]] || exit 1
+            fi
+        done
+    done
+)
+if test_dispatch_source_growth; then
+    pass "dispatch preserves command status without parsing source appended during main"
+else
+    fail "dispatch resumed parsing changed source or lost command status"
+fi
+
 # Cleanup
 if [[ "${DSR_TEST_KEEP_TMP:-0}" == "1" ]]; then
     echo "Retained test fixture: $TEMP_DIR" >&2
