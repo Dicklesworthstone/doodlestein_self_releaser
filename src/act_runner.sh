@@ -3102,6 +3102,22 @@ _act_is_windows_host() {
     [[ "$(_act_get_host_platform "$host")" == windows/* ]]
 }
 
+# Emit the copy operation used for fresh Windows Rust staging directories.
+# Copy links themselves, preserve empty directories, and never purge either tree.
+# A fresh destination permits only Robocopy's unchanged/copied success statuses;
+# extras and mismatches are rejected along with ordinary copy failures.
+_act_windows_source_copy_function() {
+    cat <<'POWERSHELL'
+function Copy-DsrSourceTree {
+    param([string]$SourcePath, [string]$DestinationPath)
+    & robocopy.exe $SourcePath $DestinationPath /E /COPY:DAT /DCOPY:DAT /R:0 /W:0 /MT:8 /SL /SJ /NFL /NDL /NJH /NJS /NP
+    if ($LASTEXITCODE -notin @(0, 1)) {
+        throw ("Rust source copy did not produce a clean replica (robocopy exit {0})" -f $LASTEXITCODE)
+    }
+}
+POWERSHELL
+}
+
 # Encode a PowerShell script for `-EncodedCommand` (UTF-16LE, base64).
 #
 # Windows hosts run OpenSSH with PowerShell as the login shell, so a command
@@ -6284,6 +6300,8 @@ act_run_native_build() {
             local ps_build_b64 ps_env_assignments env_name env_value env_name_b64 env_value_b64
             ps_env_assignments=$(_act_windows_rust_sdk_env_cleanup)
             local ps_sibling_copies="" sibling_win_remote sibling_win_staged
+            local ps_copy_function
+            ps_copy_function=$(_act_windows_source_copy_function) || return 4
             if ! command -v base64 >/dev/null 2>&1; then
                 _log_error "base64 is required to construct an isolated Windows Rust build"
                 return 3
@@ -6303,9 +6321,9 @@ act_run_native_build() {
                     "${remote_path%/*}/$sibling_relative") || return 4
                 sibling_win_staged=$(_act_windows_cmd_path \
                     "$nonstrict_stage_root/$sibling_relative") || return 4
-                ps_sibling_copies+="\$sibling=Get-Item -LiteralPath '${sibling_win_remote}' -Force; if (-not \$sibling.PSIsContainer -or ((\$sibling.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust sibling source root must be a plain directory' }; New-Item -ItemType Directory -Path '${sibling_win_staged}' | Out-Null; Get-ChildItem -LiteralPath \$sibling.FullName -Force | Copy-Item -Destination '${sibling_win_staged}' -Recurse -Force; "
+                ps_sibling_copies+="\$sibling=Get-Item -LiteralPath '${sibling_win_remote}' -Force; if (-not \$sibling.PSIsContainer -or ((\$sibling.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust sibling source root must be a plain directory' }; New-Item -ItemType Directory -Path '${sibling_win_staged}' | Out-Null; Copy-DsrSourceTree -SourcePath \$sibling.FullName -DestinationPath '${sibling_win_staged}'; "
             done
-            remote_cmd="$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$source=Get-Item -LiteralPath '${win_path}' -Force; if (-not \$source.PSIsContainer -or ((\$source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust source root must be a plain directory' }; \$ancestor=\$source.Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { \$candidate=Join-Path \$cargoDir \$name; if (Test-Path -LiteralPath \$candidate) { [Console]::Error.WriteLine('[dsr] excluding inherited Cargo config: ' + \$candidate) } }; \$ancestor=\$ancestor.Parent }; \$root=Split-Path -Parent '${win_stage_root}'; New-Item -ItemType Directory -Path \$root -Force | Out-Null; if (Test-Path -LiteralPath '${win_stage_root}') { throw 'Rust isolation path already exists' }; New-Item -ItemType Directory -Path '${win_stage_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_source_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_cargo_home}' | Out-Null; Get-ChildItem -LiteralPath \$source.FullName -Force | Copy-Item -Destination '${win_source_root}' -Recurse -Force; ${ps_sibling_copies}if (Test-Path -LiteralPath (Join-Path '${win_source_root}' '.git')) { & git -C '${win_source_root}' status --porcelain --untracked-files=no | Out-Null; if (\$LASTEXITCODE -ne 0) { throw 'Unable to refresh staged Git index metadata' } }; foreach (\$name in @('registry')) { \$cache=Join-Path (Join-Path \$env:USERPROFILE '.cargo') \$name; \$link=Join-Path '${win_cargo_home}' \$name; if (Test-Path -LiteralPath \$cache -PathType Container) { New-Item -ItemType Junction -Path \$link -Target \$cache | Out-Null; if (((Get-Item -LiteralPath \$link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'Cargo cache link is not isolated' } } }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path '${win_cargo_home}' \$name)) { throw 'Ephemeral CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}' -Force).Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Staging root inherits Cargo configuration' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.EnvironmentVariables['CARGO_HOME']='${win_cargo_home}'; \$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_source_root}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode")"
+            remote_cmd="$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; ${ps_copy_function}; \$source=Get-Item -LiteralPath '${win_path}' -Force; if (-not \$source.PSIsContainer -or ((\$source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust source root must be a plain directory' }; \$ancestor=\$source.Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { \$candidate=Join-Path \$cargoDir \$name; if (Test-Path -LiteralPath \$candidate) { [Console]::Error.WriteLine('[dsr] excluding inherited Cargo config: ' + \$candidate) } }; \$ancestor=\$ancestor.Parent }; \$root=Split-Path -Parent '${win_stage_root}'; New-Item -ItemType Directory -Path \$root -Force | Out-Null; if (Test-Path -LiteralPath '${win_stage_root}') { throw 'Rust isolation path already exists' }; New-Item -ItemType Directory -Path '${win_stage_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_source_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_cargo_home}' | Out-Null; Copy-DsrSourceTree -SourcePath \$source.FullName -DestinationPath '${win_source_root}'; ${ps_sibling_copies}if (Test-Path -LiteralPath (Join-Path '${win_source_root}' '.git')) { & git -C '${win_source_root}' status --porcelain --untracked-files=no | Out-Null; if (\$LASTEXITCODE -ne 0) { throw 'Unable to refresh staged Git index metadata' } }; foreach (\$name in @('registry')) { \$cache=Join-Path (Join-Path \$env:USERPROFILE '.cargo') \$name; \$link=Join-Path '${win_cargo_home}' \$name; if (Test-Path -LiteralPath \$cache -PathType Container) { New-Item -ItemType Junction -Path \$link -Target \$cache | Out-Null; if (((Get-Item -LiteralPath \$link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'Cargo cache link is not isolated' } } }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path '${win_cargo_home}' \$name)) { throw 'Ephemeral CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}' -Force).Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Staging root inherits Cargo configuration' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.EnvironmentVariables['CARGO_HOME']='${win_cargo_home}'; \$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_source_root}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode")"
         fi
     else
         # Unix: use bash/zsh compatible syntax
@@ -6421,7 +6439,9 @@ act_run_native_build() {
     # reaches any in-command cleanup — or multi-GB staging copies accumulate
     # until the temp filesystem fills and later targets die with ENOSPC.
     # rm -rf / rmdir do not follow the cargo cache symlinks/junctions inside.
-    if [[ -n "$nonstrict_stage_root" && "$nonstrict_stage_root" == */dsr-build-* ]]; then
+    if [[ "${DSR_KEEP_BUILD_STAGES:-0}" == "1" && -n "$nonstrict_stage_root" ]]; then
+        _log_info "Retaining build stage root $nonstrict_stage_root on $host (DSR_KEEP_BUILD_STAGES=1)"
+    elif [[ -n "$nonstrict_stage_root" && "$nonstrict_stage_root" == */dsr-build-* ]]; then
         local cleanup_ok=true
         if _act_is_windows_host "$host"; then
             local win_cleanup_path

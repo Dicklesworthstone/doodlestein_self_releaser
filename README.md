@@ -219,6 +219,18 @@ source tree plus Cargo target will exhaust. Set `build_root` on a host to stage 
 overrides it for strict release snapshots. Either way dsr refuses to stage onto a tmpfs/ramfs
 root and tells you to set `build_root`.
 
+Set `DSR_KEEP_BUILD_STAGES=1` to retain isolated Rust source and Cargo-home staging
+directories after a native build, including failed or cancelled builds. This is
+useful for inspecting a build or when automatic deletion is prohibited. Retained
+stages consume disk space; the build log records their paths. Source isolation,
+artifact collection, and verification run normally.
+
+Windows Rust source staging uses Robocopy with eight copy threads to avoid the
+per-file PowerShell overhead on large dependency trees. It preserves empty
+directories, file attributes, timestamps, and links without following link targets.
+Copy failures, unexpected destination files, and mismatches stop the build;
+the copy never purges files. Compiler concurrency and build time limits are unchanged.
+
 ### 4. Set Up Signing (Recommended)
 
 ```bash
