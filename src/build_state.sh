@@ -622,6 +622,26 @@ build_state_set_context() {
       .updated_at = $now'
 }
 
+# Atomically replace only a failed target's host binding, preserving its attempt
+# history and every completed target. Caller holds the orchestration lock.
+build_state_relocate_failed_target() {
+  local tool="$1" version="$2" run_id="$3" before="$4" target="$5"
+  local host="$6" roots="$7" receipt="$8" tool_dir state_file
+  tool_dir=$(_build_get_tool_dir "$tool" "$version")
+  state_file="$tool_dir/$run_id/state.json"
+  _build_state_jq_update "$state_file" \
+    --argjson before "$before" --arg target "$target" --arg host "$host" \
+    --argjson roots "$roots" --argjson receipt "$receipt" '
+      if . != $before or .target_statuses[$target].status != "failed" or
+         (.status == "completed" or .status == "cancelled")
+      then error("relocation state changed or target is not failed")
+      else
+        .relocations = ((.relocations // []) + [$receipt]) |
+        .context.target_hosts[$target] = $host |
+        .context.source_roots = $roots
+      end'
+}
+
 # Add artifact to build state
 build_state_add_artifact() {
   local tool="$1"

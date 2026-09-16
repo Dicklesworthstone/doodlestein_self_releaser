@@ -1584,6 +1584,8 @@ cmd_build() {
     local dry_run="$DRY_RUN"
     local parallel_jobs=1
     local resume=false resume_selector="latest"
+    local resume_target_host=""
+    local resume_target_host_approval=""
     local allow_dirty=false
     local no_sync=false
     local sync_only=false
@@ -1639,6 +1641,16 @@ cmd_build() {
                 resume_selector="${1#*=}"
                 shift
                 ;;
+            --resume-target-host)
+                [[ $# -ge 2 && -z "$resume_target_host" ]] || return 4
+                resume_target_host="$2"
+                shift 2
+                ;;
+            --resume-target-host-approval)
+                [[ $# -ge 2 && -z "$resume_target_host_approval" ]] || return 4
+                resume_target_host_approval="$2"
+                shift 2
+                ;;
             --allow-dirty)
                 allow_dirty=true
                 shift
@@ -1686,6 +1698,10 @@ OPTIONS:
     -p, --parallel[=N]     Build targets concurrently (default bound: 2)
         --jobs <N>         Explicit target concurrency bound (1-32)
     -r, --resume[=RUN_ID]  Resume latest or selected interrupted build
+    --resume-target-host TARGET=HOST
+                          Relocate one failed strict native target; retain prior attempts
+    --resume-target-host-approval FILE
+                          Required operator-approved prior/current configuration hashes
     --allow-dirty          Allow building with uncommitted changes
     --no-sync              Skip source sync to remote hosts
     --sync-only            Sync source to remote hosts without building
@@ -1846,6 +1862,13 @@ EOF
     if [[ "$build_purpose" == "diagnostic-native" ]] && ! $build_release_contract_enabled; then
         log_error "--diagnostic-native requires an enabled strict release contract"
         return 4
+    fi
+    if [[ -n "$resume_target_host" || -n "$resume_target_host_approval" ]]; then
+        if ! $resume || ! $build_release_contract_enabled ||
+           [[ "$build_purpose" != "release" || -z "$resume_target_host" || -z "$resume_target_host_approval" ]]; then
+            log_error "Target relocation requires a strict release resume and its approval file"
+            return 4
+        fi
     fi
 
     # A local refs/replace namespace must never reinterpret the commit named by
@@ -2333,6 +2356,13 @@ EOF
     local full_output orchestrator_exit=0
     local -a orchestration_resume_args=()
     $resume && orchestration_resume_args=(--resume-run-id "$resume_run_id")
+    if [[ -n "$resume_target_host" ]]; then
+        $resume && $build_release_contract_enabled && [[ -n "$resume_target_host_approval" ]] || return 4
+        orchestration_resume_args+=(--resume-target-host "$resume_target_host" \
+            --resume-target-host-approval "$resume_target_host_approval")
+    elif [[ -n "$resume_target_host_approval" ]]; then
+        return 4
+    fi
     # shellcheck disable=SC2086
     full_output=$(act_orchestrate_build "$tool_name" "$version" \
         "${build_source_args[@]}" "${orchestration_resume_args[@]}" "${purpose_args[@]}" \

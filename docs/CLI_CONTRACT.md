@@ -450,6 +450,8 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--parallel[=N]` | off (bound 2 when enabled) | Run independent targets concurrently |
 | `--jobs` | 1 | Explicit concurrency bound from 1 through 32 |
 | `--resume[=RUN_ID]` | off | Reuse verified completed targets and retry incomplete targets |
+| `--resume-target-host TARGET=HOST` | off | Relocate one failed native target during a strict release resume |
+| `--resume-target-host-approval FILE` | required with relocation | Operator-reviewed JSON binding the run, target, replacement host and configuration hashes |
 | `--output-dir` | state directory | Artifact collection directory, bound into resume state |
 | `--no-sync` | false | Skip ordinary source sync (forbidden by strict release contracts) |
 | `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
@@ -458,6 +460,36 @@ Target logs and result receipts are isolated by target and attempt. Aggregation
 is deterministic in requested-target order. Partial artifacts remain available
 for resume, but no authoritative manifest is emitted until the full target set
 succeeds.
+
+Relocation requires the original controller to have released the build lock,
+the selected target to be failed, and no target to be running. Completed or
+cancelled runs and diagnostic builds are refused.
+The approval file is a regular JSON file with these required fields:
+
+```json
+{
+  "run_id": "<original-run-uuid>",
+  "target": "windows/amd64",
+  "new_host": "windows-backup",
+  "prior_repo_config_path": "/path/to/retained-original-repo.yaml",
+  "prior_repo_config_sha256": "<original-invocation-config-sha256>",
+  "repo_config_sha256": "<reviewed-current-repo-config-sha256>",
+  "hosts_config_sha256": "<reviewed-hosts.yaml-sha256>"
+}
+```
+
+The operator must establish the prior config's provenance from the original
+invocation receipt. DSR checks actual file hashes and permits only the selected
+target's `cross_compile` host, build command, environment, and legacy `hosts`
+entry to differ. Global settings and all other target settings must match.
+Retained failed result/log files must agree with the old host and frozen source;
+completed artifacts and result files must still verify. Replacement staging and
+its pinned dependency closure are verified before an atomic state transition.
+The run records the prior context, configuration delta, source archive/manifest
+hashes, and prior attempt hashes; the next worker uses the next attempt number.
+After an interrupted staging attempt, only an exactly verified canonical
+snapshot may be reused. Partial snapshots are retained and refused, not merged
+or overwritten. No successful target is rebuilt by relocation admission.
 
 `--diagnostic-native` requires an enabled strict release contract and an explicit
 nonempty, unique subset of its native targets. The clean tagged source, pinned

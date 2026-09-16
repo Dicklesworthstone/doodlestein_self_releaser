@@ -7420,6 +7420,20 @@ _act_run_target_worker() {
         host=$(act_get_native_host "$target" "$tool_name")
     fi
 
+    # The native runner deliberately names its log with the immutable source
+    # run UUID. Scope its existing log-directory setting to this attempt so a
+    # retry cannot overwrite the file named by an older result receipt.
+    local ACT_LOGS_DIR="$ACT_LOGS_DIR"
+    if ! act_platform_uses_act "$tool_name" "$target"; then
+        ACT_LOGS_DIR="${log_path%.log}.native"
+        if ! (umask 077; mkdir "$ACT_LOGS_DIR"); then
+            _act_write_worker_result "$(jq -nc --arg target "$target" --arg host "$host" \
+                '{platform:$target,host:$host,status:"failed",exit_code:4,
+                  error:"Native attempt log directory already exists or is unavailable"}')" || return 4
+            return 4
+        fi
+    fi
+
     if declare -F selector_acquire_slot &>/dev/null; then
         if ! selector_acquire_slot "$host" "$slot_id" --wait; then
             local slot_failure
@@ -7504,6 +7518,156 @@ _act_run_target_worker() {
 #        [--git-sha SHA --git-ref TAG --parallel-jobs N --resume-run-id UUID]
 #        [targets...]
 # Returns: JSON with aggregated results
+# Called only under the existing coordinator lock, after normal resume identity
+# checks. Source staging is confined to the explicitly selected replacement host.
+_act_relocation_source_inventory() {
+    local tool="$1" revision="$2" dependencies records='[]' item path sha label manifest archive_digest manifest_digest
+    dependencies=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
+    dependencies=$(jq -c --arg path "$ACT_REPO_LOCAL_PATH" --arg sha "$revision" \
+        '[{relative_path: "source", local_path: $path, git_sha: $sha}] + .' <<< "$dependencies") || return 4
+    while IFS= read -r item; do
+        path=$(jq -r '.local_path' <<< "$item")
+        sha=$(jq -r '.git_sha' <<< "$item")
+        label=$(jq -r '.relative_path' <<< "$item")
+        manifest=$(mktemp -d "${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/relocation-manifest.XXXXXXXX") || return 4
+        manifest="$manifest/tracked.manifest"
+        _act_write_tracked_manifest "$path" "$sha" "$manifest" || return 4
+        archive_digest=$(_act_git_archive_sha256 "$path" "$sha") || return 4
+        manifest_digest=$(_act_sha256 "$manifest") || return 4
+        [[ "$archive_digest" =~ ^[0-9a-f]{64}$ && "$manifest_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
+        records=$(jq -c --arg path "$label" --arg sha "$sha" --arg archive "$archive_digest" \
+            --arg manifest "$manifest_digest" '. + [{path: $path, git_sha: $sha,
+            archive_sha256: $archive, manifest_sha256: $manifest}]' <<< "$records") || return 4
+    done < <(jq -c '.[]' <<< "$dependencies")
+    printf '%s\n' "$records"
+}
+
+_act_relocate_failed_target() {
+    local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
+    local target="${request%%=*}" host="${request#*=}" old_host configured_host
+    local config_file="$ACT_REPOS_DIR/${tool}.yaml" hosts_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml"
+    local entry result result_path sync_json roots hosts receipt repo_hash hosts_hash
+    local prior_result prior_log result_hash log_hash
+    local approval prior_config prior_config_hash prior_json current_json projection
+    local source_inventory dependency_checkouts replacement_path replacement_root
+    [[ "$request" == *=* && "$target" =~ ^[a-z]+/[a-z0-9]+$ &&
+       "$host" =~ ^[A-Za-z0-9_-]+$ ]] || return 4
+    old_host=$(jq -er --arg target "$target" '.context.target_hosts[$target] | strings' <<< "$before") || return 4
+    [[ "$host" != "$old_host" ]] || return 4
+    [[ -f "$approval_file" && ! -L "$approval_file" ]] || return 4
+    approval=$(jq -ce --arg target "$target" --arg host "$host" --arg run "$run_id" '
+        select(.run_id == $run and .target == $target and .new_host == $host) |
+        select(all([.prior_repo_config_sha256,.repo_config_sha256,.hosts_config_sha256][];
+                   type == "string" and test("^[0-9a-f]{64}$")))' "$approval_file") || return 4
+    prior_config=$(jq -er '.prior_repo_config_path | strings' <<< "$approval") || return 4
+    [[ -f "$prior_config" && ! -L "$prior_config" ]] || return 4
+    prior_config_hash=$(_act_sha256 "$prior_config") || return 4
+    [[ "$prior_config_hash" == "$(jq -r '.prior_repo_config_sha256' <<< "$approval")" ]] || return 4
+    prior_json=$(yq -o=json '.' "$prior_config") || return 4
+    current_json=$(yq -o=json '.' "$config_file") || return 4
+    # Only the failed target's explicit command/environment/routing may differ.
+    # Global source/profile/contract and every completed target stay identical.
+    projection='del(.cross_compile[$target].host,.cross_compile[$target].build_cmd,.cross_compile[$target].env,.hosts[$target])'
+    [[ "$(jq -cS --arg target "$target" "$projection" <<< "$prior_json")" == \
+       "$(jq -cS --arg target "$target" "$projection" <<< "$current_json")" ]] || return 4
+    jq -e --arg target "$target" '
+      .context.build_purpose == "release" and .context.publishable == true and
+      .status != "completed" and .status != "cancelled" and
+      .target_statuses[$target].status == "failed" and
+      all(.target_statuses[]; .status != "running")
+    ' <<< "$before" >/dev/null || return 4
+    act_platform_uses_act "$tool" "$target" && return 4
+    configured_host=$(act_get_native_host "$target" "$tool") || return 4
+    [[ "$configured_host" == "$host" && "$(_act_get_host_platform "$host")" == "$target" ]] || return 4
+    prior_result=$(jq -er --arg target "$target" '.target_statuses[$target].result_path | strings' <<< "$before") || return 4
+    prior_log=$(jq -er --arg target "$target" '.target_statuses[$target].log_path | strings' <<< "$before") || return 4
+    [[ -f "$prior_result" && ! -L "$prior_result" && -f "$prior_log" && ! -L "$prior_log" ]] || return 4
+    jq -e --arg target "$target" --arg host "$old_host" \
+        '.platform == $target and .host == $host and .status == "failed" and .build_purpose == "release" and .publishable == true' \
+        "$prior_result" >/dev/null || return 4
+    result_hash=$(_act_sha256 "$prior_result") || return 4
+    log_hash=$(_act_sha256 "$prior_log") || return 4
+    [[ "$result_hash" =~ ^[0-9a-f]{64}$ && "$log_hash" =~ ^[0-9a-f]{64}$ ]] || return 4
+    result=$(jq -c --arg target "$target" '.target_statuses[$target].result' <<< "$before") || return 4
+    [[ "$(jq -cS 'del(.log_path,.result_path,.attempt)' "$prior_result")" == \
+       "$(jq -cS 'del(.log_path,.result_path,.attempt)' <<< "$result")" ]] || return 4
+    jq -e --arg sha "$(jq -r '.git_sha' <<< "$before")" --arg ref "$(jq -r '.git_ref' <<< "$before")" \
+        '.build_influence_env.DSR_RELEASE_GIT_SHA == $sha and .build_influence_env.DSR_RELEASE_GIT_REF == $ref' \
+        "$prior_result" >/dev/null || return 4
+    # An unavailable successful artifact is not permission to silently rebuild
+    # or relocate it. Preserve all successful receipt identities before staging.
+    while IFS= read -r entry; do
+        result=$(jq -c '.result // empty' <<< "$entry")
+        result_path=$(jq -r '.result_path // empty' <<< "$entry")
+        [[ -n "$result" ]] && _act_target_result_available "$result" release true || return 4
+        if [[ -n "$result_path" ]]; then
+            [[ -f "$result_path" && ! -L "$result_path" ]] || return 4
+            [[ "$(jq -cS 'del(.log_path,.result_path,.attempt)' "$result_path")" == \
+               "$(jq -cS 'del(.log_path,.result_path,.attempt)' <<< "$result")" ]] || return 4
+        fi
+    done < <(jq -c '.target_statuses[] | select(.status == "completed")' <<< "$before")
+    repo_hash=$(_act_sha256 "$config_file") || return 4
+    hosts_hash=$(_act_sha256 "$hosts_file") || return 4
+    [[ "$repo_hash" == "$(jq -r '.repo_config_sha256' <<< "$approval")" &&
+       "$hosts_hash" == "$(jq -r '.hosts_config_sha256' <<< "$approval")" ]] || return 4
+    if ! sync_json=$(act_sync_sources "$tool" --strict-release --run-id "$run_id" \
+        --git-sha "$(jq -r '.git_sha' <<< "$before")" -- "$target"); then
+        # A previous attempt may have finished immutable staging before a
+        # later verification or state write failed. Reuse only the complete
+        # canonical snapshot whose archive, manifest and checkout all verify
+        # against the pinned source; never merge into a partial destination.
+        replacement_path=$(yq -r '.host_paths.'"$host"' // ""' "$config_file") || return 4
+        [[ -n "$replacement_path" ]] || replacement_path="$ACT_REPO_LOCAL_PATH"
+        replacement_root=$(_act_strict_source_root_path "$replacement_path" "$tool" "$run_id" "$host") || return 4
+        roots=$(jq -cn --arg host "$host" --arg root "$replacement_root" '{($host):$root}') || return 4
+        _act_verify_strict_source_roots "$tool" "$(jq -r '.git_sha' <<< "$before")" "$roots" || return 4
+        sync_json=$(jq -cn --arg target "$target" --arg host "$host" --argjson roots "$roots" \
+            '{status:"success",failed:0,reused_verified_snapshot:true,
+              target_hosts:{($target):$host},source_roots:$roots}') || return 4
+    fi
+    jq -e --arg target "$target" --arg host "$host" '
+      .status == "success" and .failed == 0 and
+      .target_hosts == {($target): $host} and
+      (.source_roots | keys) == [$host]
+    ' <<< "$sync_json" >/dev/null || return 4
+    hosts=$(jq -c --arg target "$target" --arg host "$host" '.context.target_hosts + {($target): $host}' <<< "$before") || return 4
+    roots=$(jq -cn --argjson prior "$(jq -c '.context.source_roots' <<< "$before")" \
+        --argjson added "$(jq -c '.source_roots' <<< "$sync_json")" --argjson hosts "$hosts" \
+        '($prior + $added) | with_entries(select(.key as $key | $hosts | any(. == $key)))') || return 4
+    _act_verify_strict_source_roots "$tool" "$(jq -r '.git_sha' <<< "$before")" "$roots" || return 4
+    if [[ "$ACT_REPO_LANGUAGE" == "rust" ]]; then
+        dependency_checkouts=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
+        _act_validate_strict_cargo_source_closure "$host" \
+            "$(jq -r --arg host "$host" '.[$host]' <<< "$roots")" \
+            "$dependency_checkouts" || return 4
+    fi
+    source_inventory=$(_act_relocation_source_inventory "$tool" "$(jq -r '.git_sha' <<< "$before")") || return 4
+    [[ "$(_act_sha256 "$config_file")" == "$repo_hash" &&
+       "$(_act_sha256 "$hosts_file")" == "$hosts_hash" &&
+       "$(_act_sha256 "$prior_result")" == "$result_hash" &&
+       "$(_act_sha256 "$prior_log")" == "$log_hash" ]] || return 4
+    receipt=$(jq -cn --arg target "$target" --arg old "$old_host" --arg new "$host" \
+        --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo_hash "$repo_hash" \
+        --arg hosts_hash "$hosts_hash" --arg result_hash "$result_hash" --arg log_hash "$log_hash" \
+        --argjson prior "$before" --argjson sync "$sync_json" '
+        {target: $target, old_host: $old, new_host: $new, at: $now,
+         git_sha: $prior.git_sha, git_ref: $prior.git_ref,
+         prior_target: $prior.target_statuses[$target], prior_context: $prior.context,
+         repo_config_sha256: $repo_hash, hosts_config_sha256: $hosts_hash,
+         prior_result_sha256: $result_hash, prior_log_sha256: $log_hash,
+         verified_source_sync: $sync}') || return 4
+    receipt=$(jq -c --argjson approval "$approval" --argjson old "$prior_json" --argjson new "$current_json" \
+        --argjson inventory "$source_inventory" \
+        --arg target "$target" '. + {approval: $approval,
+          verified_source_inventory: $inventory,
+          configuration_delta: {prior: $old.cross_compile[$target], replacement: $new.cross_compile[$target],
+            prior_host: $old.hosts[$target], replacement_host: $new.hosts[$target]}}' \
+        <<< "$receipt") || return 4
+    build_state_relocate_failed_target "$tool" "$version" "$run_id" "$before" \
+        "$target" "$host" "$roots" "$receipt" || return 4
+    build_state_get "$tool" "$version" "$run_id"
+}
+
 act_orchestrate_build() {
     local tool_name="$1"
     local version="$2"
@@ -7513,6 +7677,8 @@ act_orchestrate_build() {
     local supplied_run_id="" source_roots_json="{}"
     local target_hosts_json='{}'
     local parallel_jobs=1 resume_run=false supplied_output_dir=""
+    local resume_target_host=""
+    local resume_target_host_approval=""
     local build_purpose="release"
 
     while [[ $# -gt 0 ]]; do
@@ -7557,6 +7723,16 @@ act_orchestrate_build() {
                 resume_run=true
                 shift 2
                 ;;
+            --resume-target-host)
+                [[ $# -ge 2 && -z "$resume_target_host" ]] || return 4
+                resume_target_host="$2"
+                shift 2
+                ;;
+            --resume-target-host-approval)
+                [[ $# -ge 2 && -z "$resume_target_host_approval" ]] || return 4
+                resume_target_host_approval="$2"
+                shift 2
+                ;;
             --output-dir)
                 [[ $# -ge 2 ]] || { _log_error "--output-dir requires a value"; return 4; }
                 supplied_output_dir="$2"
@@ -7586,6 +7762,12 @@ act_orchestrate_build() {
     if $resume_run && ! _act_is_uuid "$supplied_run_id"; then
         _log_error "--resume-run-id requires a schema-valid UUID"
         return 4
+    fi
+    if [[ -n "$resume_target_host" || -n "$resume_target_host_approval" ]]; then
+        if ! $resume_run || [[ "$build_purpose" != "release" ||
+             -z "$resume_target_host" || -z "$resume_target_host_approval" ]]; then
+            return 4
+        fi
     fi
 
     # Load config
@@ -7723,6 +7905,16 @@ act_orchestrate_build() {
                     '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
                 return 4
             fi
+            # A failed host need not remain reachable to replace it. The
+            # locked transition below verifies the replacement's complete
+            # source and Cargo closure before changing state. Still validate
+            # this host when any other target retains its source authority.
+            if [[ -n "$resume_target_host" ]] && jq -en \
+                --argjson hosts "$target_hosts_json" --arg host "$source_host" \
+                --arg target "${resume_target_host%%=*}" \
+                '[$hosts | to_entries[] | select(.value == $host) | .key] == [$target]' >/dev/null; then
+                continue
+            fi
             if [[ "$ACT_REPO_LANGUAGE" == "rust" ]] && \
                ! _act_validate_strict_cargo_source_closure \
                     "$source_host" "$actual_source_root" "$source_dependency_checkouts_json"; then
@@ -7804,6 +7996,20 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
+            # Once a relocation pins reviewed configuration, an ordinary
+            # subsequent retry must not silently run a different command or
+            # alter the completed targets' configuration.
+            if [[ -z "$resume_target_host" ]] && jq -e '(.relocations // [] | length) > 0' \
+                <<< "$resume_state" >/dev/null; then
+                if [[ "$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml")" != \
+                      "$(jq -r '.relocations[-1].repo_config_sha256' <<< "$resume_state")" ||
+                      "$(_act_sha256 "${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml")" != \
+                      "$(jq -r '.relocations[-1].hosts_config_sha256' <<< "$resume_state")" ]]; then
+                    _log_error "Configuration changed after the approved relocation"
+                    _act_release_orchestration_lock
+                    return 4
+                fi
+            fi
             if ! _act_build_purpose_matches "$(jq -c '.context // {}' <<< "$resume_state")" \
                 "$build_purpose" "$strict_release_contract"; then
                 _log_error "Resume build purpose is missing or differs from this request"
@@ -7864,7 +8070,22 @@ act_orchestrate_build() {
                 return 4
             fi
             run_id="$requested_run_id"
+            if [[ -n "$resume_target_host" ]]; then
+                if ! $strict_release_contract ||
+                   ! resume_state=$(_act_relocate_failed_target "$tool_name" "$version" \
+                        "$run_id" "$resume_state" "$resume_target_host" "$resume_target_host_approval"); then
+                    _log_error "Failed-target relocation refused; prior attempts retained"
+                    _act_release_orchestration_lock
+                    return 4
+                fi
+                source_roots_json=$(jq -c '.context.source_roots' <<< "$resume_state")
+                target_hosts_json=$(jq -c '.context.target_hosts' <<< "$resume_state")
+            fi
         else
+            if [[ -n "$resume_target_host" ]]; then
+                _act_release_orchestration_lock
+                return 4
+            fi
             if ! run_id=$(DSR_RUN_ID="$requested_run_id" \
                 build_state_create "$tool_name" "$version" "${targets// /,}") || \
                [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id" || \

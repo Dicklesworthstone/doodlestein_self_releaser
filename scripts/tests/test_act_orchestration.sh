@@ -789,10 +789,12 @@ resume_first=$(
         act_get_native_host() { printf 'host-%s\n' "${1//\//-}"; }
         act_run_native_build() {
             local target="$2" slug="${2//\//-}"
+            local native_log="$ACT_LOGS_DIR/testool-${slug}-${4}.log"
+            printf 'first attempt source %s\n' "$4" > "$native_log"
             printf 'call\n' >> "$resume_calls/$slug"
             if [[ "$target" == "darwin/arm64" ]]; then
-                jq -nc --arg platform "$target" \
-                    '{platform: $platform, status: "failed", exit_code: 9, error: "fixture failure"}'
+                jq -nc --arg platform "$target" --arg log "$native_log" \
+                    '{platform: $platform, status: "failed", exit_code: 9, error: "fixture failure",log_file:$log}'
                 return 9
             fi
             local artifact="$resume_output/$slug"
@@ -807,6 +809,8 @@ resume_first=$(
     ) 2> "$resume_first_log"
 ) || resume_first_status=$?
 resume_run_id=$(jq -r '.run_id // empty' <<< "$resume_first")
+resume_first_native_log=$(jq -r '.targets[] | select(.platform == "darwin/arm64") | .log_file' <<< "$resume_first")
+resume_first_native_hash=$(_act_sha256 "$resume_first_native_log")
 
 # A completed target is reusable only while its artifact bytes and filesystem
 # identity still match the immutable receipt. Mutate one successful artifact so
@@ -823,12 +827,14 @@ resume_second=$(
         act_get_native_host() { printf 'host-%s\n' "${1//\//-}"; }
         act_run_native_build() {
             local target="$2" slug="${2//\//-}"
+            local native_log="$ACT_LOGS_DIR/testool-${slug}-${4}.log"
+            printf 'second attempt source %s\n' "$4" > "$native_log"
             printf 'call\n' >> "$resume_calls/$slug"
             local artifact="$resume_output/$slug"
             printf 'artifact %s\n' "$target" > "$artifact"
-            jq -nc --arg platform "$target" --arg path "$artifact" '
+            jq -nc --arg platform "$target" --arg path "$artifact" --arg log "$native_log" '
                 {platform: $platform, status: "success", exit_code: 0,
-                 artifact_path: $path, artifact_paths: [$path]}'
+                 artifact_path: $path, artifact_paths: [$path],log_file:$log}'
         }
         act_orchestrate_build "testool" "v-resume" \
             --resume-run-id "$resume_run_id" --parallel-jobs 2 \
@@ -863,6 +869,38 @@ else
     fail "resume replay mismatch: first=$resume_first_status second=$resume_second_status calls=$linux_calls/$darwin_calls/$windows_calls state=$resume_state_status result=$resume_second"
     tail -20 "$resume_first_log" >&2 || true
     tail -20 "$resume_second_log" >&2 || true
+fi
+
+resume_second_native_log=$(jq -r '.targets[] | select(.platform == "darwin/arm64") | .log_file' <<< "$resume_second")
+if [[ "$resume_first_native_log" != "$resume_second_native_log" &&
+      "$(_act_sha256 "$resume_first_native_log")" == "$resume_first_native_hash" &&
+      "$(cat "$resume_first_native_log")" == "first attempt source $resume_run_id" &&
+      "$(cat "$resume_second_native_log")" == "second attempt source $resume_run_id" ]]; then
+    pass "native retries preserve old log bytes and keep the exact source run UUID"
+else
+    fail "native retry changed the prior log or source run UUID"
+fi
+
+if (
+    occupied_log="$TEMP_DIR/occupied-attempt.log"
+    occupied_result="$TEMP_DIR/occupied-attempt.json"
+    occupied_calls="$TEMP_DIR/occupied-attempt-calls"
+    mkdir "${occupied_log%.log}.native"
+    printf 'retained native evidence\n' > "${occupied_log%.log}.native/keep.log"
+    act_platform_uses_act() { return 1; }
+    act_get_native_host() { printf 'fixture-native\n'; }
+    act_run_native_build() { printf 'unexpected invocation\n' > "$occupied_calls"; return 99; }
+    occupied_status=0
+    _act_run_target_worker testool v1 22222222-2222-4222-8222-222222222222 windows/amd64 2 \
+        "$occupied_log" "$occupied_result" false null '{}' '' '' fixture-native release || occupied_status=$?
+    [[ "$occupied_status" -eq 4 && ! -e "$occupied_calls" &&
+       "$(cat "${occupied_log%.log}.native/keep.log")" == 'retained native evidence' ]] &&
+        jq -e '.status == "failed" and .exit_code == 4 and
+            .error == "Native attempt log directory already exists or is unavailable"' "$occupied_result" >/dev/null
+) 2>/dev/null; then
+    pass "existing native attempt log directory refuses launch without changing evidence"
+else
+    fail "existing native attempt log directory did not protect retained evidence"
 fi
 
 cancel_root="$TEMP_DIR/cancel-orchestration"
@@ -2403,7 +2441,7 @@ closure_windows_metadata_command_status=0
 (
     _act_is_windows_host() { return 0; }
     _act_ssh_exec() {
-        printf '%s\n' "$(_test_decode_remote_command "$2")" > "$closure_windows_metadata_command_file"
+        printf '%s\n' "$(_test_decode_remote_command "$2")" >> "$closure_windows_metadata_command_file"
         printf '%s\n{}\n' 'C:/build/source'
     }
     _act_validate_cargo_metadata_source_closure() { return 0; }
@@ -3457,6 +3495,175 @@ if jq -e '.exact_additional_assets == ["darwin-proof"] and
     pass "diagnostic projection requires selected configured additions and rejects unowned mappings"
 else
     fail "diagnostic projection weakened configured family requirements"
+fi
+
+# Relocation admission uses real retained state and attempt files. Only remote
+# transfer/verification are fixture boundaries; no network or compiler runs.
+test_failed_target_relocation() (
+    local run='d942514f-43b5-4a55-9988-23d44bf18b50' version='v-relocation'
+    local tool='relocationtest' sha="$strict_gitlink_sha"
+    local approval="$TEMP_DIR/relocation-approval.json" prior="$TEMP_DIR/relocation-prior.yaml"
+    local config="$ACT_REPOS_DIR/relocationtest.yaml" before after receipt failure status
+    local log="$TEMP_DIR/relocation-old.log" result="$TEMP_DIR/relocation-old.json"
+    local good="$TEMP_DIR/relocation-completed.bin" good_hash old_hash sync_calls="$TEMP_DIR/relocation-sync"
+    local ACT_REPO_LANGUAGE=go ACT_REPO_LOCAL_PATH="$strict_gitlink_repo"
+    local good_sidecar="$TEMP_DIR/relocation-good.json" staged="$TEMP_DIR/relocation-staged"
+    local expected_archive expected_manifest manifest="$TEMP_DIR/relocation-expected.manifest"
+    expected_archive=$(_act_git_archive_sha256 "$ACT_REPO_LOCAL_PATH" "$sha") || exit 1
+    _act_write_tracked_manifest "$ACT_REPO_LOCAL_PATH" "$sha" "$manifest" || exit 1
+    expected_manifest=$(_act_sha256 "$manifest") || exit 1
+    printf 'completed bytes\n' > "$good"
+    printf 'original failed attempt\n' > "$log"
+    printf '{"cross_compile":{"windows/amd64":{"host":"wlap","build_cmd":"old"}},"build_profile":"release-interactive"}\n' > "$prior"
+    printf '{"cross_compile":{"windows/amd64":{"host":"wsurf","build_cmd":"new"}},"build_profile":"release-interactive"}\n' > "$config"
+    good_hash=$(_act_sha256 "$good")
+    receipt=$(jq -nc --arg path "$good" --arg hash "$good_hash" \
+        '{status:"success",host:"trj",platform:"linux/amd64",build_purpose:"release",publishable:true,artifact_path:$path,collected_sha256:$hash}')
+    printf '%s\n' "$receipt" > "$good_sidecar"
+    failure=$(jq -nc --arg sha "$sha" \
+        '{status:"failed",host:"wlap",platform:"windows/amd64",build_purpose:"release",publishable:true,
+          build_influence_env:{DSR_RELEASE_GIT_SHA:$sha,DSR_RELEASE_GIT_REF:"v-relocation"}}')
+    printf '%s\n' "$failure" > "$result"
+    old_hash=$(_act_sha256 "$result")
+    DSR_RUN_ID="$run" build_state_create "$tool" "$version" 'linux/amd64,windows/amd64' >/dev/null || exit 1
+    build_state_set_context "$tool" "$version" "$run" "$sha" "$version" \
+        '{"trj":"/old-linux/source","wlap":"C:/old/source"}' "$TEMP_DIR" 1 \
+        '{"linux/amd64":"trj","windows/amd64":"wlap"}' release || exit 1
+    build_state_update_target "$tool" "$version" linux/amd64 completed \
+        "$(jq -nc --argjson result "$receipt" --arg path "$good_sidecar" '{attempts:1,result:$result,result_path:$path}')" "$run" || exit 1
+    build_state_update_target "$tool" "$version" windows/amd64 failed \
+        "$(jq -nc --argjson result "$failure" --arg path "$result" --arg log "$log" \
+        '{attempts:1,result:$result,result_path:$path,log_path:$log}')" "$run" || exit 1
+    before=$(build_state_get "$tool" "$version" "$run") || exit 1
+    jq -n --arg run "$run" --arg path "$prior" --arg old "$(_act_sha256 "$prior")" \
+        --arg new "$(_act_sha256 "$config")" --arg hosts "$(_act_sha256 "$DSR_CONFIG_DIR/hosts.yaml")" \
+        '{run_id:$run,target:"windows/amd64",new_host:"wsurf",prior_repo_config_path:$path,
+          prior_repo_config_sha256:$old,repo_config_sha256:$new,hosts_config_sha256:$hosts}' > "$approval"
+    act_platform_uses_act() { return 1; }
+    act_get_native_host() { printf 'wsurf\n'; }
+    _act_get_host_platform() { printf 'windows/amd64\n'; }
+    _act_target_result_available() {
+        [[ "$(jq -r .status <<< "$1")" == success ]] &&
+            [[ "$(_act_sha256 "$(jq -r .artifact_path <<< "$1")")" == "$(jq -r .collected_sha256 <<< "$1")" ]]
+    }
+    _act_verify_strict_source_roots() {
+        [[ "${RELOCATION_BAD_SOURCE:-0}" == 0 && -f "$staged" ]] &&
+            [[ "$3" == '{"trj":"/old-linux/source","wsurf":"C:/new/source"}' || "$3" == '{"wsurf":"C:/new/source"}' ]]
+    }
+    _act_release_source_dependency_checkouts_json() { printf '[]\n'; }
+    _act_strict_source_root_path() {
+        case "$4" in trj) printf '/old-linux/source\n';; wlap) printf 'C:/old/source\n';; wsurf) printf 'C:/new/source\n';; *) return 4;; esac
+    }
+    act_sync_sources() {
+        printf 'sync\n' >> "$sync_calls"
+        [[ "${RELOCATION_FAIL_SYNC:-0}" == 0 ]] || return 4
+        [[ ! -e "$staged" ]] || return 4
+        printf 'complete staged snapshot\n' > "$staged"
+        printf '{"status":"success","failed":0,"target_hosts":{"windows/amd64":"wsurf"},"source_roots":{"wsurf":"C:/new/source"}}\n'
+    }
+    for status in completed running pending; do
+        if _act_relocate_failed_target "$tool" "$version" "$run" \
+            "$(jq -c --arg status "$status" '.target_statuses["windows/amd64"].status=$status' <<< "$before")" \
+            windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    done
+    [[ ! -e "$sync_calls" ]] || exit 1
+    # Tampering actual retained sidecars or artifact bytes must refuse before
+    # transport, independently of the in-memory state's unchanged claims.
+    printf '{"host":"foreign"}\n' > "$result"
+    if _act_relocate_failed_target "$tool" "$version" "$run" "$before" windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    printf '%s\n' "$failure" > "$result"
+    printf '{"status":"success","host":"foreign"}\n' > "$good_sidecar"
+    if _act_relocate_failed_target "$tool" "$version" "$run" "$before" windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    printf '%s\n' "$receipt" > "$good_sidecar"
+    printf 'tampered completed bytes\n' > "$good"
+    if _act_relocate_failed_target "$tool" "$version" "$run" "$before" windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    printf 'completed bytes\n' > "$good"
+    [[ ! -e "$sync_calls" ]] || exit 1
+    # Changed failure provenance cannot be supplied as strings in the approval.
+    if _act_relocate_failed_target "$tool" "$version" "$run" \
+        "$(jq -c '.target_statuses["windows/amd64"].result.host="foreign"' <<< "$before")" \
+        windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    [[ ! -e "$sync_calls" ]] || exit 1
+    # Even an operator-approved current config hash cannot authorize unrelated
+    # release profile drift through a target-only relocation.
+    local bad_config="$TEMP_DIR/relocation-bad-config.yaml" bad_approval="$TEMP_DIR/relocation-bad-approval.json"
+    jq '.build_profile="release-abort-probe"' "$config" > "$bad_config"
+    local bad_config_dir="$TEMP_DIR/relocation-bad-config"
+    mkdir -p "$bad_config_dir"
+    cp "$bad_config" "$bad_config_dir/$tool.yaml"
+    jq --arg hash "$(_act_sha256 "$bad_config")" '.repo_config_sha256=$hash' "$approval" > "$bad_approval"
+    if ACT_REPOS_DIR="$bad_config_dir" _act_relocate_failed_target "$tool" "$version" "$run" "$before" \
+        windows/amd64=wsurf "$bad_approval" >/dev/null 2>&1; then exit 1; fi
+    [[ ! -e "$sync_calls" ]] || exit 1
+    if RELOCATION_FAIL_SYNC=1 _act_relocate_failed_target "$tool" "$version" "$run" "$before" \
+        windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    [[ "$(build_state_get "$tool" "$version" "$run")" == "$before" ]] || exit 1
+    if RELOCATION_BAD_SOURCE=1 _act_relocate_failed_target "$tool" "$version" "$run" "$before" \
+        windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    [[ "$(build_state_get "$tool" "$version" "$run")" == "$before" ]] || exit 1
+    # Existing but invalid staging remains a refusal, never an overwrite.
+    if RELOCATION_BAD_SOURCE=1 _act_relocate_failed_target "$tool" "$version" "$run" "$before" \
+        windows/amd64=wsurf "$approval" >/dev/null 2>&1; then exit 1; fi
+    [[ "$(build_state_get "$tool" "$version" "$run")" == "$before" ]] || exit 1
+    # Exercise the real resumed scheduler: the relocated target starts attempt
+    # two, while the successful target never reaches native execution.
+    build_lock_acquire() { [[ "${RELOCATION_LOCK_HELD:-0}" == 0 ]]; }
+    build_lock_release() { return 0; }
+    unset -f selector_acquire_slot selector_release_slot
+    act_load_repo_config() { return 0; }
+    _act_release_contract_json() { printf '{}\n'; }
+    # Packaging has its own real-file tests above; this fixture exercises
+    # coordinator admission and immutable attempt receipts without a compiler.
+    _act_stage_contract_primary() { printf '%s\n' "$5"; }
+    _act_contract_for_build_purpose() { return 0; }
+    _act_validate_contract_source_identity() { return 0; }
+    _act_release_source_dependencies_json() { printf '[]\n'; }
+    _act_release_source_dependency_checkouts_json() { printf '[]\n'; }
+    local native_calls="$TEMP_DIR/relocation-native-calls" resumed
+    act_run_native_build() {
+        printf '%s\n' "$2" >> "$native_calls"
+        [[ "$2" == windows/amd64 && "$8" == wsurf && "$5" == C:/new/source && "$6" == "$sha" && "$7" == "$version" ]] || return 99
+        jq -nc --arg path "$good" --arg hash "$good_hash" \
+            '{status:"success",exit_code:0,host:"wsurf",platform:"windows/amd64",build_purpose:"release",publishable:true,
+              artifact_path:$path,artifact_paths:[$path],collected_sha256:$hash}'
+    }
+    local sync_before lock_status=0 args=("$tool" "$version" --resume-run-id "$run"
+        --resume-target-host windows/amd64=wsurf --resume-target-host-approval "$approval"
+        --git-sha "$sha" --git-ref "$version" --output-dir "$TEMP_DIR"
+        --source-roots-json '{"trj":"/old-linux/source","wlap":"C:/old/source"}'
+        --target-hosts-json '{"linux/amd64":"trj","windows/amd64":"wlap"}' -- linux/amd64 windows/amd64)
+    sync_before=$(cat "$sync_calls")
+    RELOCATION_LOCK_HELD=1 act_orchestrate_build "${args[@]}" >/dev/null 2>&1 || lock_status=$?
+    [[ "$lock_status" -eq 2 && "$(cat "$sync_calls")" == "$sync_before" && ! -e "$native_calls" ]] || exit 1
+    resumed=$(act_orchestrate_build "${args[@]}") || exit 1
+    [[ "$(cat "$native_calls")" == windows/amd64 ]] || exit 1
+    jq -e '.summary == {total:2,success:2,failed:0} and .targets[0].resume_reused == true' <<< "$resumed" >/dev/null || exit 1
+    after=$(build_state_get "$tool" "$version" "$run") || exit 1
+    jq -e --argjson old "$before" --arg hash "$old_hash" --arg archive "$expected_archive" --arg manifest "$expected_manifest" '
+        .context.target_hosts["windows/amd64"] == "wsurf" and
+        .context.source_roots == {trj:"/old-linux/source",wsurf:"C:/new/source"} and
+        .relocations[0].prior_result_sha256 == $hash and
+        .relocations[0].verified_source_sync.reused_verified_snapshot == true and
+        .relocations[0].verified_source_inventory[0].archive_sha256 == $archive and
+        .relocations[0].verified_source_inventory[0].manifest_sha256 == $manifest and
+        .target_statuses["windows/amd64"].attempts == 2 and
+        .target_statuses["linux/amd64"] == $old.target_statuses["linux/amd64"] and
+        .relocations[0].prior_target == $old.target_statuses["windows/amd64"]' <<< "$after" >/dev/null || exit 1
+    [[ "$(_act_sha256 "$result")" == "$old_hash" && "$(_act_sha256 "$good")" == "$good_hash" ]] || exit 1
+    if build_state_relocate_failed_target "$tool" "$version" "$run" "$before" windows/amd64 \
+        wsurf '{"wsurf":"other"}' '{}' >/dev/null 2>&1; then exit 1; fi
+    # A later ordinary retry remains bound to the approved command/config.
+    if ACT_REPOS_DIR="$bad_config_dir" act_orchestrate_build "$tool" "$version" \
+        --resume-run-id "$run" --git-sha "$sha" --git-ref "$version" --output-dir "$TEMP_DIR" \
+        --source-roots-json '{"trj":"/old-linux/source","wsurf":"C:/new/source"}' \
+        --target-hosts-json '{"linux/amd64":"trj","windows/amd64":"wsurf"}' \
+        -- linux/amd64 windows/amd64 >/dev/null 2>&1; then exit 1; fi
+    [[ "$(build_state_get "$tool" "$version" "$run")" == "$after" && "$(cat "$native_calls")" == windows/amd64 ]] || exit 1
+)
+if test_failed_target_relocation; then
+    pass "failed-target relocation preserves completed bytes, attempt count, history and failed-staging authority"
+else
+    fail "failed-target relocation violated retained authority"
 fi
 
 # Cleanup

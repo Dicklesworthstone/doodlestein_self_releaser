@@ -323,6 +323,23 @@ Parallel builds keep attempt-scoped logs and results per target. A partial run
 preserves verified completed artifacts; resume retries only incomplete targets.
 The authoritative manifest is withheld until every requested target succeeds.
 
+A failed strict native target can move to another configured host during an
+explicit resume, after the original controller has released its build lock:
+
+```bash
+dsr build ntm --version v1.2.3 --resume=<run-id> \
+  --resume-target-host windows/amd64=windows-backup \
+  --resume-target-host-approval /path/to/reviewed-relocation.json
+```
+
+The approval pins the prior and replacement configuration hashes; its fields
+are specified in [CLI_CONTRACT.md](docs/CLI_CONTRACT.md). Only that failed
+target's host, command, or environment may change. Completed target settings,
+artifacts, and old attempt receipts are retained. DSR verifies the same frozen
+source and dependency archives on the replacement before updating run state.
+A retry may reuse an already staged canonical snapshot only after full byte
+verification; partial or mismatched staging is refused without overwriting it.
+
 For native performance measurements of a tool with a strict release contract,
 use an explicit diagnostic build:
 
