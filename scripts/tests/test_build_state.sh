@@ -527,6 +527,189 @@ test_build_state_exec_with_retry() {
   BUILD_RETRY_BASE_DELAY=5
 }
 
+# Checkpoint transactions use real concurrent processes and files. Only the
+# command boundary is replaced for deterministic write-failure/crash injection.
+run_state_regression() {
+  local name="$1"
+  shift
+  ((TESTS_RUN++))
+  if ( "$@" ); then
+    pass "$name"
+  else
+    fail "$name"
+  fi
+}
+
+test_checkpoint_validation() {
+  local dir="$TEMP_DIR/checkpoint-validation" filter before source status
+  mkdir "$dir" || return 1
+  source="$dir/state.json"
+  before='{"run_id":"fixed","counter":0}'
+  for filter in 'empty' '., .' '[]' 'null' 'true' '"text"' 'error("injected")' \
+    '.run_id = "other"'; do
+    printf '%s\n' "$before" > "$source"
+    status=0
+    _build_state_jq_update "$source" "$filter" 2>/dev/null || status=$?
+    [[ $status -ne 0 && "$(cat "$source")" == "$before" ]] || return 1
+  done
+  for before in '' '{} {}' '[]' 'null' '{broken'; do
+    printf '%s' "$before" > "$source"
+    status=0
+    _build_state_jq_update "$source" '{counter:1}' 2>/dev/null || status=$?
+    [[ $status -ne 0 && "$(cat "$source")" == "$before" ]] || return 1
+  done
+  [[ -z "$(find "$dir" -mindepth 1 -type d -print)" ]]
+}
+
+test_checkpoint_foreign_temp_preserved() {
+  local source="$TEMP_DIR/foreign-temp-state.json"
+  printf '{"counter":0}\n' > "$source"
+  printf 'another writer owns these bytes\n' > "$source.tmp.$$"
+  _build_state_jq_update "$source" '.counter += 1' || return 1
+  [[ "$(cat "$source.tmp.$$")" == 'another writer owns these bytes' ]] &&
+    jq -e '.counter == 1' "$source" >/dev/null
+}
+
+test_checkpoint_concurrent_increments() {
+  local source="$TEMP_DIR/concurrent-state.json" worker iteration pid result=0
+  local -a pids=()
+  printf '{"counter":0}\n' > "$source"
+  for worker in 1 2 3 4 5 6 7 8; do
+    (
+      for iteration in 1 2 3 4 5 6; do
+        _build_state_jq_update "$source" '.counter += 1' || exit 1
+      done
+    ) &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || result=1; done
+  [[ $result -eq 0 ]] && jq -e '.counter == 48' "$source" >/dev/null
+}
+
+test_checkpoint_symlinks_rejected() {
+  local original="$TEMP_DIR/symlink-original.json" source="$TEMP_DIR/symlink-state.json"
+  printf '{"counter":0}\n' > "$original"
+  ln -s "$original" "$source" || return 1
+  ! _build_state_jq_update "$source" '.counter = 1' || return 1
+  [[ -L "$source" ]] && jq -e '.counter == 0' "$original" >/dev/null || return 1
+  source="$TEMP_DIR/symlink-lock-state.json"
+  printf '{"counter":0}\n' > "$source"
+  ln -s "$original" "$source.update.lock" || return 1
+  ! _build_state_jq_update "$source" '.counter = 1' || return 1
+  [[ -L "$source.update.lock" ]] && jq -e '.counter == 0' "$original" "$source" >/dev/null
+}
+
+test_checkpoint_publication_failure() {
+  local source="$TEMP_DIR/failed-publication.json"
+  printf '{"counter":0}\n' > "$source"
+  mv() { return 1; }
+  ! _build_state_jq_update "$source" '.counter = 1' || return 1
+  unset -f mv
+  jq -e '.counter == 0' "$source" >/dev/null || return 1
+  _build_state_jq_update "$source" '.counter = 2' &&
+    jq -e '.counter == 2' "$source" >/dev/null
+}
+
+test_checkpoint_external_write_detected() {
+  local source="$TEMP_DIR/external-write.json" status=0
+  printf '{"counter":0}\n' > "$source"
+  jq() {
+    if [[ "${1:-}" == '.counter = 99' ]]; then
+      printf '{"counter":17}\n' > "$source"
+    fi
+    command jq "$@"
+  }
+  _build_state_jq_update "$source" '.counter = 99' 2>/dev/null || status=$?
+  unset -f jq
+  [[ $status -ne 0 ]] && jq -e '.counter == 17' "$source" >/dev/null
+}
+
+test_checkpoint_caller_scope_preserved() {
+  local source="$TEMP_DIR/caller-scope.json" before after old_umask mode
+  printf '{"counter":0}\n' > "$source"
+  trap ':' INT TERM
+  before=$(trap -p INT TERM)
+  old_umask=$(umask)
+  umask 000
+  _build_state_jq_update "$source" '.counter = 1' || return 1
+  [[ "$(umask)" == 0000 ]] || return 1
+  umask "$old_umask"
+  after=$(trap -p INT TERM)
+  mode=$(stat -c %a "$source" 2>/dev/null || stat -f %Lp "$source")
+  [[ "$before" == "$after" && "$mode" == 600 ]]
+}
+
+test_checkpoint_timeout_and_independent_files() {
+  local label="${1:-native}"
+  local source="$TEMP_DIR/$label-locked-state.json" other="$TEMP_DIR/$label-independent-state.json"
+  local ready="$TEMP_DIR/$label-update-lock-ready" stop="$TEMP_DIR/$label-update-lock-stop"
+  local pid step status=0 result=0
+  printf '{"counter":0}\n' > "$source"
+  printf '{"counter":0}\n' > "$other"
+  : > "$source.update.lock"
+  (
+    exec 9<> "$source.update.lock" || exit 1
+    _build_state_wait_lock 9 1 || exit 1
+    : > "$ready"
+    for step in {1..500}; do
+      [[ -e "$stop" ]] && exit 0
+      sleep 0.01
+    done
+    exit 1
+  ) &
+  pid=$!
+  for step in {1..300}; do [[ -e "$ready" ]] && break; sleep 0.01; done
+  [[ -e "$ready" ]] || result=1
+  DSR_STATE_LOCK_TIMEOUT=0 _build_state_jq_update "$source" '.counter = 1' \
+    2>/dev/null || status=$?
+  [[ $status -ne 0 ]] || result=1
+  jq -e '.counter == 0' "$source" >/dev/null || result=1
+  DSR_STATE_LOCK_TIMEOUT=0 _build_state_jq_update "$other" '.counter = 1' || result=1
+  : > "$stop"
+  wait "$pid" || result=1
+  _build_state_jq_update "$source" '.counter = 2' || result=1
+  [[ $result -eq 0 ]] && jq -e '.counter == 2' "$source" >/dev/null
+}
+
+test_checkpoint_crash_recovery() {
+  local source="$TEMP_DIR/crashed-writer.json" status=0
+  printf '{"counter":0}\n' > "$source"
+  jq() {
+    if [[ "${1:-}" == '.counter = 91' ]]; then
+      # This is the isolated update subshell, never the caller/test runner.
+      kill -KILL "$BASHPID"
+    fi
+    command jq "$@"
+  }
+  _build_state_jq_update "$source" '.counter = 91' 2>/dev/null || status=$?
+  unset -f jq
+  [[ $status -ne 0 ]] && jq -e '.counter == 0' "$source" >/dev/null || return 1
+  DSR_STATE_LOCK_TIMEOUT=0 _build_state_jq_update "$source" '.counter = 1' &&
+    jq -e '.counter == 1' "$source" >/dev/null
+}
+
+test_checkpoint_python_lock_backend() {
+  command -v python3 >/dev/null || return 1
+  # Hide only flock discovery; use the actual standard-library fallback and
+  # actual inherited descriptors, not a mock lock implementation.
+  command() {
+    if [[ "$#" -eq 2 && "$1" == -v && "$2" == flock ]]; then return 1; fi
+    builtin command "$@"
+  }
+  test_checkpoint_timeout_and_independent_files python
+}
+
+test_checkpoint_lock_config() {
+  local source="$TEMP_DIR/invalid-lock-timeout.json" value
+  printf '{"counter":0}\n' > "$source"
+  for value in -1 1.5 nope 3601 99999; do
+    ! DSR_STATE_LOCK_TIMEOUT="$value" _build_state_jq_update "$source" '.counter = 1' \
+      2>/dev/null || return 1
+  done
+  DSR_STATE_LOCK_TIMEOUT=0000 _build_state_jq_update "$source" '.counter = 2' &&
+    jq -e '.counter == 2' "$source" >/dev/null
+}
+
 # Cleanup
 cleanup() {
   rm -rf "$TEMP_DIR"
@@ -574,6 +757,19 @@ test_build_state_get_retry_count
 test_build_state_can_retry
 test_build_state_resume
 test_build_state_exec_with_retry
+
+# Checkpoint transaction regressions
+run_state_regression "checkpoint rejects invalid input/output and identity drift" test_checkpoint_validation
+run_state_regression "checkpoint preserves another writer's PID-named temporary file" test_checkpoint_foreign_temp_preserved
+run_state_regression "48 overlapping checkpoint writes lose no updates" test_checkpoint_concurrent_increments
+run_state_regression "checkpoint rejects source/lock symlinks without changing their targets" test_checkpoint_symlinks_rejected
+run_state_regression "failed checkpoint publication preserves old state and permits retry" test_checkpoint_publication_failure
+run_state_regression "checkpoint detects non-cooperating writes" test_checkpoint_external_write_detected
+run_state_regression "checkpoint preserves caller traps/umask and mode 0600" test_checkpoint_caller_scope_preserved
+run_state_regression "checkpoint lock wait is bounded and unrelated runs remain writable" test_checkpoint_timeout_and_independent_files
+run_state_regression "killed checkpoint writer does not strand the lock" test_checkpoint_crash_recovery
+run_state_regression "Python lock fallback retains the lock in the owning shell" test_checkpoint_python_lock_backend
+run_state_regression "checkpoint validates bounded timeout configuration" test_checkpoint_lock_config
 
 echo ""
 echo "=========================================="
