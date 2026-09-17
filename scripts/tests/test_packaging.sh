@@ -163,6 +163,321 @@ packaging_repack_archive "$GZ" tar.gz "$GZ" tar.gz 2>/dev/null && \
     log_pass "repack refuses same source and destination"
 
 # ---------------------------------------------------------------------------
+log_test "transactional archive publication"
+
+ATOMIC_DIR="$TEMP_DIR/atomic output"
+mkdir -p "$ATOMIC_DIR"
+printf 'previous release bytes\n' > "$ATOMIC_DIR/previous"
+cp "$ATOMIC_DIR/previous" "$ATOMIC_DIR/release.tar.gz"
+
+# Fault injection is limited to the compressor boundary; filesystem checks
+# and publication run through the real packaging implementation.
+if (
+    tar() {
+        if [[ "${1:-}" == "--no-xattrs" ]]; then
+            printf 'partial archive\n' > "$3"
+            return 42
+        fi
+        command tar "$@"
+    }
+    packaging_build_archive tar.gz "$ATOMIC_DIR/release.tar.gz" "$PAYLOAD" am
+); then
+    log_fail "compressor failure reported"
+else
+    [[ $? -eq 4 ]] && log_pass "compressor failure reported" || log_fail "compressor failure exit code"
+fi
+cmp -s "$ATOMIC_DIR/previous" "$ATOMIC_DIR/release.tar.gz" && \
+    log_pass "compressor failure preserves previous release" || log_fail "compressor failure preserves previous release"
+
+if (
+    tar() {
+        if [[ "${1:-}" == "--no-xattrs" ]]; then
+            printf 'not an archive\n' > "$3"
+            return 0
+        fi
+        command tar "$@"
+    }
+    packaging_build_archive tar.gz "$ATOMIC_DIR/release.tar.gz" "$PAYLOAD" am
+); then
+    log_fail "invalid compressor output refused"
+else
+    log_pass "invalid compressor output refused"
+fi
+cmp -s "$ATOMIC_DIR/previous" "$ATOMIC_DIR/release.tar.gz" && \
+    log_pass "invalid output preserves previous release" || log_fail "invalid output preserves previous release"
+
+cp "$ATOMIC_DIR/previous" "$ATOMIC_DIR/release.tar.xz"
+if (
+    packaging_build_archive() {
+        # A valid archive with the wrong payload must not be promoted either.
+        command tar -cJf "$2" -C "$3" am
+    }
+    packaging_repack_archive "$GZ" tar.gz "$ATOMIC_DIR/release.tar.xz" tar.xz
+) 2>/dev/null; then
+    log_fail "repack member mismatch refused"
+else
+    log_pass "repack member mismatch refused"
+fi
+cmp -s "$ATOMIC_DIR/previous" "$ATOMIC_DIR/release.tar.xz" && \
+    log_pass "repack validation failure preserves previous release" || log_fail "repack validation failure preserves previous release"
+
+ln -s "$ATOMIC_DIR/previous" "$ATOMIC_DIR/symlink.tar.gz"
+if packaging_build_archive tar.gz "$ATOMIC_DIR/symlink.tar.gz" "$PAYLOAD" am; then
+    log_fail "symlink destination refused"
+else
+    log_pass "symlink destination refused"
+fi
+if packaging_build_archive tar.gz "$PAYLOAD/am" "$PAYLOAD" am 2>/dev/null; then
+    log_fail "payload cannot overwrite itself"
+else
+    log_pass "payload cannot overwrite itself"
+fi
+
+caller_trap=$(trap -p EXIT)
+if packaging_build_archive tar.gz "$ATOMIC_DIR/release.tar.gz" "$PAYLOAD" am > "$ATOMIC_DIR/stdout"; then
+    log_pass "successful archive atomically replaces previous release"
+else
+    log_fail "successful archive atomically replaces previous release"
+fi
+[[ ! -s "$ATOMIC_DIR/stdout" ]] && log_pass "packaging stdout stays clean" || log_fail "packaging stdout stays clean"
+[[ "$(trap -p EXIT)" == "$caller_trap" ]] && log_pass "caller cleanup trap preserved" || log_fail "caller cleanup trap preserved"
+[[ -z "$(find "$ATOMIC_DIR" -name '.dsr-*' -print)" ]] && \
+    log_pass "staging directories cleaned after success and failure" || log_fail "staging directories cleaned after success and failure"
+
+if command -v zip &>/dev/null && command -v unzip &>/dev/null; then
+    packaging_build_archive zip "$ATOMIC_DIR/release.zip" "$PAYLOAD" am README.md && \
+        log_pass "zip staged and published" || log_fail "zip staged and published"
+    packaging_build_archive zip "$ATOMIC_DIR/release.zip" "$PAYLOAD" am && \
+        log_pass "zip replaced with reduced member set" || log_fail "zip replaced with reduced member set"
+    [[ "$(packaging_payload_members "$ATOMIC_DIR/release.zip" zip)" == "am" ]] && \
+        log_pass "old zip entries cannot leak into new release" || log_fail "old zip entries cannot leak into new release"
+else
+    log_skip "zip tools unavailable for atomic zip tests"
+fi
+
+# ---------------------------------------------------------------------------
+log_test "archive type and extraction boundary validation"
+
+SAFE_DIR="$TEMP_DIR/safe-extraction"
+mkdir -p "$SAFE_DIR/source/docs" "$SAFE_DIR/outside" "$SAFE_DIR/destination"
+printf 'release payload\n' > "$SAFE_DIR/source/docs/payload"
+printf 'do not touch\n' > "$SAFE_DIR/outside/payload"
+cp "$SAFE_DIR/outside/payload" "$SAFE_DIR/expected"
+ln -s "$SAFE_DIR/outside" "$SAFE_DIR/source/redirect"
+tar -czf "$SAFE_DIR/link.tar.gz" -C "$SAFE_DIR/source" redirect docs/payload
+if packaging_extract_payload "$SAFE_DIR/link.tar.gz" tar.gz "$SAFE_DIR/destination" 2>/dev/null; then
+    log_fail "tar symlink rejected before extraction"
+else
+    [[ ! -e "$SAFE_DIR/destination/redirect" && ! -e "$SAFE_DIR/destination/docs" ]] && \
+        log_pass "tar symlink rejected before extraction" || log_fail "tar symlink rejected before extraction"
+fi
+
+tar -czf "$SAFE_DIR/safe.tar.gz" -C "$SAFE_DIR/source" docs/payload
+ln -s "$SAFE_DIR/outside" "$SAFE_DIR/destination/docs"
+if packaging_extract_payload "$SAFE_DIR/safe.tar.gz" tar.gz "$SAFE_DIR/destination" 2>/dev/null; then
+    log_fail "existing destination symlink rejected"
+else
+    log_pass "existing destination symlink rejected"
+fi
+cmp -s "$SAFE_DIR/expected" "$SAFE_DIR/outside/payload" && \
+    log_pass "destination escape leaves outside file untouched" || log_fail "destination escape leaves outside file untouched"
+
+mkdir -p "$SAFE_DIR/hard-destination/docs"
+ln "$SAFE_DIR/outside/payload" "$SAFE_DIR/hard-destination/docs/payload"
+if packaging_extract_payload "$SAFE_DIR/safe.tar.gz" tar.gz "$SAFE_DIR/hard-destination" 2>/dev/null; then
+    log_fail "existing hardlinked destination file rejected"
+else
+    log_pass "existing hardlinked destination file rejected"
+fi
+cmp -s "$SAFE_DIR/expected" "$SAFE_DIR/outside/payload" && \
+    log_pass "hardlink escape leaves outside file untouched" || log_fail "hardlink escape leaves outside file untouched"
+
+ln "$SAFE_DIR/source/docs/payload" "$SAFE_DIR/source/hardlink"
+tar -czf "$SAFE_DIR/hardlink.tar.gz" -C "$SAFE_DIR/source" docs/payload hardlink
+if packaging_validate_archive "$SAFE_DIR/hardlink.tar.gz" tar.gz 2>/dev/null; then
+    log_fail "tar hardlink rejected"
+else
+    log_pass "tar hardlink rejected"
+fi
+mkfifo "$SAFE_DIR/source/pipe"
+tar -czf "$SAFE_DIR/fifo.tar.gz" -C "$SAFE_DIR/source" pipe
+if packaging_validate_archive "$SAFE_DIR/fifo.tar.gz" tar.gz 2>/dev/null; then
+    log_fail "FIFO rejected before extraction"
+else
+    log_pass "FIFO rejected before extraction"
+fi
+tar -czf "$SAFE_DIR/duplicate.tar.gz" -C "$SAFE_DIR/source" docs/payload docs/payload
+if packaging_validate_archive "$SAFE_DIR/duplicate.tar.gz" tar.gz 2>/dev/null; then
+    log_fail "duplicate members rejected"
+else
+    log_pass "duplicate members rejected"
+fi
+for unsafe in 'C:payload' 'docs\payload' $'docs/line\nbreak' $'docs/tab\tname'; do
+    if packaging_member_is_safe "$unsafe"; then
+        log_fail "nonportable path rejected"
+    else
+        log_pass "nonportable path rejected"
+    fi
+done
+
+if command -v zip &>/dev/null && command -v unzip &>/dev/null; then
+    (cd "$SAFE_DIR/source" && zip -q -y "$SAFE_DIR/link.zip" redirect docs/payload)
+    if packaging_validate_archive "$SAFE_DIR/link.zip" zip 2>/dev/null; then
+        log_fail "ZIP symlink rejected"
+    else
+        log_pass "ZIP symlink rejected"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+log_test "prebuilt reuse and byte-level payload parity"
+
+PARITY_DIR="$TEMP_DIR/parity"
+mkdir -p "$PARITY_DIR"
+cp "$GZ" "$PARITY_DIR/original.gz"
+if (
+    packaging_build_archive() { return 99; }
+    packaging_repack_archive "$GZ" tgz "$PARITY_DIR/copied.tar.gz" tar.gz
+); then
+    log_pass "same-format repack does not invoke compression"
+else
+    log_fail "same-format repack does not invoke compression"
+fi
+cmp -s "$GZ" "$PARITY_DIR/copied.tar.gz" && \
+    log_pass "prebuilt compressed bytes preserved exactly" || log_fail "prebuilt compressed bytes preserved exactly"
+ln "$PARITY_DIR/copied.tar.gz" "$PARITY_DIR/copied-inode"
+packaging_repack_archive "$GZ" tar.gz "$PARITY_DIR/copied.tar.gz" tgz >/dev/null 2>&1 && \
+    log_pass "same-format retry succeeds" || log_fail "same-format retry succeeds"
+[[ "$PARITY_DIR/copied.tar.gz" -ef "$PARITY_DIR/copied-inode" ]] && \
+    log_pass "same-format retry does not replace identical file" || log_fail "same-format retry does not replace identical file"
+
+packaging_repack_archive "$GZ" tar.gz "$PARITY_DIR/converted.tar.xz" tar.xz
+ln "$PARITY_DIR/converted.tar.xz" "$PARITY_DIR/converted-inode"
+if (
+    packaging_build_archive() { return 99; }
+    packaging_repack_archive "$GZ" tar.gz "$PARITY_DIR/converted.tar.xz" tar.xz
+) 2>/dev/null; then
+    log_pass "cross-format retry reuses verified archive without compression"
+else
+    log_fail "cross-format retry reuses verified archive without compression"
+fi
+[[ "$PARITY_DIR/converted.tar.xz" -ef "$PARITY_DIR/converted-inode" ]] && \
+    log_pass "cross-format retry preserves existing archive inode" || log_fail "cross-format retry preserves existing archive inode"
+
+cp -R "$PAYLOAD" "$PARITY_DIR/build-payload"
+packaging_build_archive tar.gz "$PARITY_DIR/built.tar.gz" "$PARITY_DIR/build-payload" am README.md
+ln "$PARITY_DIR/built.tar.gz" "$PARITY_DIR/built-inode"
+touch -t 202001010101 "$PARITY_DIR/build-payload/am"
+if (
+    tar() {
+        [[ "${1:-}" != "--no-xattrs" ]] || return 99
+        command tar "$@"
+    }
+    packaging_build_archive tar.gz "$PARITY_DIR/built.tar.gz" "$PARITY_DIR/build-payload" am README.md
+) 2>/dev/null; then
+    log_pass "metadata-only source changes do not force recompression"
+else
+    log_fail "metadata-only source changes do not force recompression"
+fi
+[[ "$PARITY_DIR/built.tar.gz" -ef "$PARITY_DIR/built-inode" ]] && \
+    log_pass "idempotent archive build preserves original bytes and inode" || log_fail "idempotent archive build preserves original bytes and inode"
+
+printf 'changed binary bytes\n' > "$PARITY_DIR/build-payload/am"
+packaging_build_archive tar.gz "$PARITY_DIR/built.tar.gz" "$PARITY_DIR/build-payload" am README.md && \
+    log_pass "changed binary invalidates prebuilt reuse" || log_fail "changed binary invalidates prebuilt reuse"
+[[ ! "$PARITY_DIR/built.tar.gz" -ef "$PARITY_DIR/built-inode" ]] && \
+    log_pass "changed payload publishes a new archive" || log_fail "changed payload publishes a new archive"
+
+ln "$PARITY_DIR/built.tar.gz" "$PARITY_DIR/before-mode-change"
+chmod 0644 "$PARITY_DIR/build-payload/am"
+if packaging_build_archive tar.gz "$PARITY_DIR/built.tar.gz" "$PARITY_DIR/build-payload" am README.md && \
+   [[ ! "$PARITY_DIR/built.tar.gz" -ef "$PARITY_DIR/before-mode-change" ]]; then
+    log_pass "executable-only change invalidates prebuilt reuse"
+else
+    log_fail "executable-only change invalidates prebuilt reuse"
+fi
+
+cp -R "$PAYLOAD" "$PARITY_DIR/wrong-bytes"
+printf 'corrupt binary\n' > "$PARITY_DIR/wrong-bytes/am"
+cp -R "$PAYLOAD" "$PARITY_DIR/wrong-mode"
+chmod 0644 "$PARITY_DIR/wrong-mode/am"
+for mismatch in wrong-bytes wrong-mode; do
+    cp "$PARITY_DIR/original.gz" "$PARITY_DIR/protected.tar.xz"
+    if (
+        packaging_build_archive() {
+            command tar -cJf "$2" -C "$PARITY_DIR/$mismatch" am mcp-agent-mail README.md LICENSE
+        }
+        packaging_repack_archive "$GZ" tar.gz "$PARITY_DIR/protected.tar.xz" tar.xz
+    ) 2>/dev/null; then
+        log_fail "same-name $mismatch output refused"
+    else
+        log_pass "same-name $mismatch output refused"
+    fi
+    cmp -s "$PARITY_DIR/original.gz" "$PARITY_DIR/protected.tar.xz" && \
+        log_pass "$mismatch failure preserves previous artifact" || log_fail "$mismatch failure preserves previous artifact"
+done
+
+mkdir -p "$PARITY_DIR/nested/docs"
+printf 'nested file\n' > "$PARITY_DIR/nested/docs/guide with spaces"
+for format in tar.gz tar.xz zip; do
+    if [[ "$format" == "zip" ]] && ! command -v zip &>/dev/null; then
+        log_skip "zip unavailable for nested parity"
+        continue
+    fi
+    if packaging_build_archive "$format" "$PARITY_DIR/nested.$format" "$PARITY_DIR/nested" docs; then
+        [[ "$(packaging_payload_members "$PARITY_DIR/nested.$format" "$format")" == 'docs/guide with spaces' ]] && \
+            log_pass "$format recursively includes selected directory payload" || log_fail "$format recursively includes selected directory payload"
+    else
+        log_fail "$format recursively includes selected directory payload"
+    fi
+done
+
+ln -s "$PARITY_DIR/original.gz" "$PARITY_DIR/nested/docs/link"
+if packaging_build_archive zip "$PARITY_DIR/linked.zip" "$PARITY_DIR/nested" docs 2>/dev/null; then
+    log_fail "directory selection cannot follow a nested symlink"
+else
+    log_pass "directory selection cannot follow a nested symlink"
+fi
+
+mkdir "$PARITY_DIR/restrictive"
+if (umask 077; packaging_extract_payload "$GZ" tar.gz "$PARITY_DIR/restrictive"); then
+    [[ "$(_pkg_executable_bits "$PARITY_DIR/restrictive/am")" == "$(_pkg_executable_bits "$PAYLOAD/am")" ]] && \
+        log_pass "restrictive caller umask does not strip executable bits" || log_fail "restrictive caller umask does not strip executable bits"
+else
+    log_fail "restrictive caller umask does not strip executable bits"
+fi
+
+if command -v zip &>/dev/null && command -v unzip &>/dev/null; then
+    for format in tar.gz tar.xz zip; do
+        packaging_build_archive "$format" "$PARITY_DIR/source.$format" "$PAYLOAD" am mcp-agent-mail README.md LICENSE
+    done
+    for src_format in tar.gz tar.xz zip; do
+        for dest_format in tar.gz tar.xz zip; do
+            [[ "$src_format" != "$dest_format" ]] || continue
+            if packaging_repack_archive "$PARITY_DIR/source.$src_format" "$src_format" \
+                "$PARITY_DIR/converted-$src_format.$dest_format" "$dest_format"; then
+                log_pass "$src_format to $dest_format verified conversion"
+            else
+                log_fail "$src_format to $dest_format verified conversion"
+            fi
+        done
+    done
+    if (
+        command() {
+            if [[ "${1:-}" == "-v" && "${2:-}" == "unzip" ]]; then
+                return 1
+            fi
+            builtin command "$@"
+        }
+        packaging_repack_archive "$PARITY_DIR/source.zip" zip "$PARITY_DIR/no-unzip.tar.gz" tar.gz
+    ); then
+        log_fail "missing source dependency reported"
+    else
+        [[ $? -eq 3 ]] && log_pass "missing source dependency exit code preserved" || log_fail "missing source dependency exit code preserved"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 log_test "packaging_include_files_in_archives flag"
 
 FLAG_DIR="$TEMP_DIR/flags"
