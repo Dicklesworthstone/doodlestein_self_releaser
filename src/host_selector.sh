@@ -95,10 +95,186 @@ _sel_limit_from_config() {
 # Usage: selector_init
 selector_init() {
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    [[ ! -L "$state_dir" ]] || return 4
+    mkdir -p -- "$state_dir" || return 4
+    state_dir=$(cd "$state_dir" && pwd -P) || return 4
     _SELECTOR_STATE_DIR="$state_dir/selector"
     _SELECTOR_LOCKS_DIR="$_SELECTOR_STATE_DIR/locks"
+    local directory
+    for directory in "$_SELECTOR_STATE_DIR" "$_SELECTOR_LOCKS_DIR" "$_SELECTOR_STATE_DIR/mutexes"; do
+        [[ ! -L "$directory" ]] || return 4
+        (umask 077; mkdir -p -- "$directory") || return 4
+        [[ -d "$directory" && ! -L "$directory" ]] || return 4
+    done
+}
 
-    mkdir -p "$_SELECTOR_LOCKS_DIR"
+_sel_prepare_host() {
+    _sel_safe_component "$1" || return 4
+    selector_init || return $?
+    local directory="$_SELECTOR_LOCKS_DIR/$1"
+    [[ ! -L "$directory" ]] || return 4
+    (umask 077; mkdir -p -- "$directory") || return 4
+    [[ -d "$directory" && ! -L "$directory" ]] || return 4
+}
+
+# Pin one mutex implementation per state directory. Otherwise two invocations
+# with different PATHs could use independent flock/mkdir locks concurrently.
+_sel_lock_backend() (
+    local marker="$_SELECTOR_STATE_DIR/lock-backend" temporary backend
+    if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+        backend=mkdir
+        if command -v flock &>/dev/null; then backend=flock; fi
+        temporary=$(mktemp "$_SELECTOR_STATE_DIR/.backend.XXXXXXXX") || return 4
+        local cleanup
+        printf -v cleanup 'rm -f -- %q' "$temporary"
+        # shellcheck disable=SC2064
+        trap "$cleanup" EXIT
+        printf '%s\n' "$backend" > "$temporary" || return 4
+        # A competing initializer can publish first; read the winning marker.
+        ln -- "$temporary" "$marker" 2>/dev/null || { [[ -f "$marker" ]] || return 4; }
+    fi
+    [[ -f "$marker" && ! -L "$marker" ]] || return 4
+    backend=$(cat -- "$marker") || return 4
+    case "$backend" in
+        flock) command -v flock &>/dev/null || return 3 ;;
+        mkdir) ;;
+        *) return 4 ;;
+    esac
+    printf '%s\n' "$backend"
+)
+
+# All ledger readers/writers use the same per-host mutex. The fallback is
+# deliberately NOT stolen by age: a paused process can still own an old lock.
+# A SIGKILL during a mkdir critical section requires operator inspection of
+# that guard; ordinary errors/INT/TERM release it via a subshell-scoped trap.
+_sel_with_lock() (
+    local hostname="$1" budget="$2" backend guard status started cleanup
+    shift 2
+    [[ "$budget" =~ ^[0-9]{1,5}$ ]] || return 4
+    budget=$((10#$budget))
+    backend=$(_sel_lock_backend) || return $?
+    guard="$_SELECTOR_STATE_DIR/mutexes/$hostname"
+    if [[ "$backend" == flock ]]; then
+        [[ ! -L "$guard" && ( ! -e "$guard" || -f "$guard" ) ]] || return 4
+        # Append-open acquires a descriptor without truncating an existing file.
+        umask 077
+        exec 9>> "$guard" || return 4
+        if flock -x -w "$budget" 9; then :; else
+            status=$?
+            [[ $status -eq 1 ]] && return 2
+            return 4
+        fi
+    else
+        guard+=".d"
+        started=$SECONDS
+        while ! (umask 077; mkdir -- "$guard") 2>/dev/null; do
+            [[ -d "$guard" && ! -L "$guard" ]] || return 4
+            if ((SECONDS - started >= budget)); then
+                _sel_log_warn "Host mutex busy; inspect abandoned guards rather than stealing them: $guard"
+                return 2
+            fi
+            sleep 0.1 || return 5
+        done
+        printf -v cleanup 'rmdir -- %q 2>/dev/null || true' "$guard"
+        # shellcheck disable=SC2064
+        trap "$cleanup" EXIT
+    fi
+    trap 'exit 5' HUP INT TERM
+    "$@"
+)
+
+_sel_boot_id() {
+    local boot
+    if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+        IFS= read -r boot < /proc/sys/kernel/random/boot_id || return 3
+    else
+        boot=$(LC_ALL=C sysctl -n kern.boottime 2>/dev/null) || return 3
+    fi
+    [[ -n "$boot" && "$boot" != *[[:cntrl:]]* ]] || return 3
+    printf '%s\n' "$boot"
+}
+
+# Return 1 only for a known dead/zombie process, 3/4 for an unavailable probe.
+# Pair the PID with its start identity to avoid reclaiming a live long build
+# or treating a recycled PID as the worker that originally acquired the slot.
+_sel_process_start() {
+    local pid="$1" info state
+    [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] || return 4
+    if [[ -d /proc/self ]]; then
+        if ! IFS= read -r info 2>/dev/null < "/proc/$pid/stat"; then
+            [[ -d "/proc/$pid" ]] && return 4
+            return 1
+        fi
+        local -a fields=()
+        read -r -a fields <<< "${info##*) }"
+        [[ ${#fields[@]} -ge 20 && "${fields[19]}" =~ ^[0-9]+$ ]] || return 4
+        case "${fields[0]}" in Z|X) return 1 ;; esac
+        printf 'proc:%s\n' "${fields[19]}"
+    else
+        command -v ps &>/dev/null || return 3
+        info=$(LC_ALL=C ps -p "$pid" -o lstart= -o stat= 2>/dev/null) || return 1
+        info="${info%"${info##*[![:space:]]}"}"
+        [[ -n "$info" ]] || return 1
+        state="${info##* }"
+        case "$state" in Z*|X*) return 1 ;; esac
+        info="${info%"$state"}"
+        info="${info#"${info%%[![:space:]]*}"}"
+        info="${info%"${info##*[![:space:]]}"}"
+        [[ -n "$info" ]] || return 4
+        printf 'ps:%s\n' "$info"
+    fi
+}
+
+_sel_slot_record() {
+    local path="$1" hostname="$2" run_id="$3"
+    [[ -f "$path" && ! -L "$path" ]] || return 4
+    jq -ces --arg host "$hostname" --arg run "$run_id" '
+        if length == 1 and (.[0] | type == "object" and .schema == 1 and
+            .host == $host and .run_id == $run and
+            (.pid | type == "number" and floor == . and . > 0 and . <= 2147483647) and
+            all(.node, .boot, .start; type == "string" and length > 0 and
+                (test("[\u0000-\u001f\u007f]") | not)))
+        then .[0] else error("unrecognized slot owner") end' "$path" 2>/dev/null
+}
+
+_sel_owner_live() {
+    local record="$1" node="$2" boot="$3" pid start observed owner_node owner_boot status=0
+    # State is controller-local. Never reclaim another controller's evidence.
+    owner_node=$(jq -r '.node' <<< "$record") || return 0
+    owner_boot=$(jq -r '.boot' <<< "$record") || return 0
+    [[ "$owner_node" == "$node" ]] || return 0
+    [[ "$owner_boot" == "$boot" ]] || return 1
+    pid=$(jq -r '.pid' <<< "$record") || return 0
+    start=$(jq -r '.start' <<< "$record") || return 0
+    observed=$(_sel_process_start "$pid") || status=$?
+    [[ $status -eq 1 ]] && return 1
+    [[ $status -eq 0 ]] || return 0  # probe unavailable: keep capacity reserved
+    [[ "$observed" == "$start" ]]
+}
+
+# Caller holds the host mutex. Reads are non-destructive; only an acquisition
+# reaps provably dead records. Unknown/old-format files reserve capacity until
+# inspected, rather than being expired merely because an hour has elapsed.
+_sel_usage_locked() {
+    local hostname="$1" reap="${2:-false}" path record node boot count=0
+    node=$(uname -n) || return 3
+    boot=$(_sel_boot_id) || return $?
+    for path in "$_SELECTOR_LOCKS_DIR/$hostname/"*.lock; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -f "$path" && ! -L "$path" ]] || return 4
+        local run_id="${path##*/}"
+        run_id="${run_id%.lock}"
+        if record=$(_sel_slot_record "$path" "$hostname" "$run_id") &&
+           ! _sel_owner_live "$record" "$node" "$boot"; then
+            if [[ "$reap" == true ]]; then
+                rm -f -- "$path" || return 4
+                _sel_log_info "Reclaimed dead worker slot on $hostname: $run_id"
+            fi
+        else
+            count=$((count + 1))
+        fi
+    done
+    printf '%s\n' "$count"
 }
 
 # Get concurrency limit for a host
@@ -116,49 +292,15 @@ selector_get_limit() {
 # Returns: number of active builds
 selector_get_usage() {
     local hostname="${1:-}"
-    _sel_safe_component "$hostname" || return 4
-
-    [[ -z "$_SELECTOR_LOCKS_DIR" ]] && selector_init
-
-    local lock_dir="$_SELECTOR_LOCKS_DIR/$hostname"
-    if [[ ! -d "$lock_dir" ]]; then
-        echo "0"
-        return 0
-    fi
-
-    # Count active locks (not stale)
-    local count=0
-    local now
-    now=$(date +%s)
-    local stale_threshold=3600  # 1 hour
-
-    # Use nullglob to handle no matches gracefully
-    local lock_files
-    lock_files=$(find "$lock_dir" -maxdepth 1 -name '*.lock' -type f 2>/dev/null || true)
-
-    while IFS= read -r lock_file; do
-        [[ -z "$lock_file" || ! -f "$lock_file" ]] && continue
-
-        local lock_time
-        lock_time=$(stat -c %Y "$lock_file" 2>/dev/null || stat -f %m "$lock_file" 2>/dev/null || echo 0)
-        local age=$((now - lock_time))
-
-        if [[ $age -lt $stale_threshold ]]; then
-            ((count++))
-        else
-            # Remove stale lock
-            rm -f "$lock_file" 2>/dev/null
-        fi
-    done <<< "$lock_files"
-
-    echo "$count"
+    _sel_prepare_host "$hostname" || return $?
+    _sel_with_lock "$hostname" "${DSR_SELECTOR_LOCK_TIMEOUT:-30}" _sel_usage_locked "$hostname"
 }
 
 # Check if host has available capacity
 # Usage: selector_has_capacity <hostname>
 # Returns: 0 if has capacity, 1 if at limit
 selector_has_capacity() {
-    local hostname="$1"
+    local hostname="${1:-}"
 
     local limit usage
     limit=$(selector_get_limit "$hostname") || return $?
@@ -169,121 +311,76 @@ selector_has_capacity() {
 
 # Acquire a build slot on a host
 # Usage: selector_acquire_slot <hostname> <run_id> [--wait]
-# Returns: 0 on success, 2 if at capacity
+# DSR_SELECTOR_WAIT_TIMEOUT bounds --wait (default 300s); mutex waits are
+# separately bounded by DSR_SELECTOR_LOCK_TIMEOUT (default 30s).
+# Returns: 0 acquired/idempotent, 2 busy/deadline, 3 dependency, 4 invalid, 5 interrupted.
 selector_acquire_slot() {
     local hostname="${1:-}"
-    local run_id="${2:-$(date +%s)-$$}"
+    local owner_pid="$BASHPID"
+    local run_id="${2:-$(date +%s)-$owner_pid}"
     local wait_mode=false
     _sel_safe_component "$hostname" && _sel_safe_component "$run_id" || return 4
+    [[ $# -le 3 && ( $# -lt 3 || "$3" == --wait ) ]] || return 4
     [[ "${3:-}" == "--wait" ]] && wait_mode=true
-
-    [[ -z "$_SELECTOR_LOCKS_DIR" ]] && selector_init
-
-    local lock_dir="$_SELECTOR_LOCKS_DIR/$hostname"
-    mkdir -p "$lock_dir"
-
-    local slot_file="$lock_dir/${run_id}.lock"
-    local global_lock_file="$_SELECTOR_STATE_DIR/selector.lock"
-    
-    # Helper to run in critical section
-    _with_lock() {
-        if command -v flock &>/dev/null; then
-            (
-                flock -x 200
-                "$@"
-            ) 200>"$global_lock_file"
-        else
-            # Fallback: mkdir-based locking (atomic on POSIX systems).
-            # Using a DIFFERENT local name (_mkdir_lock) to avoid
-            # shadowing the outer selector_acquire_slot's $lock_dir —
-            # if a future edit to _try_acquire ever references $lock_dir
-            # it will now see the correct per-host path rather than the
-            # global lock.
-            local _mkdir_lock="$global_lock_file.d"
-            local max_wait=30
-            local waited=0
-            # Treat the lock as stale if it's been held longer than
-            # max_wait * 2 — matches flock's implicit release on process
-            # death and prevents permanent wedging if a previous holder
-            # was SIGKILL'd before reaching the rmdir cleanup below.
-            local stale_ceiling=$((max_wait * 2))
-            while ! mkdir "$_mkdir_lock" 2>/dev/null; do
-                local lock_age=0
-                if [[ -d "$_mkdir_lock" ]]; then
-                    local lock_mtime
-                    lock_mtime=$(stat -c %Y "$_mkdir_lock" 2>/dev/null || stat -f %m "$_mkdir_lock" 2>/dev/null || echo 0)
-                    local now
-                    now=$(date +%s)
-                    lock_age=$((now - lock_mtime))
-                fi
-                if [[ $lock_age -ge $stale_ceiling ]]; then
-                    _sel_log_warn "Clearing stale mkdir lock (age=${lock_age}s): $_mkdir_lock"
-                    rmdir "$_mkdir_lock" 2>/dev/null || true
-                    continue
-                fi
-                if [[ $waited -ge $max_wait ]]; then
-                    _sel_log_warn "Lock acquisition timeout (flock unavailable, using mkdir fallback)"
-                    return 2
-                fi
-                sleep 1
-                waited=$((waited + 1))
-            done
-            # Ensure the lock is released even if the command SIGTERMs,
-            # returns non-zero, or triggers an ERR trap. The trap is
-            # RETURN-scoped so it fires when _with_lock returns, which
-            # includes the normal path below AND any early return from
-            # within the wrapped command via `exit` in the caller.
-            # shellcheck disable=SC2064  # expand _mkdir_lock now
-            trap "rmdir '$_mkdir_lock' 2>/dev/null; trap - RETURN" RETURN
-            "$@"
-            local ret=$?
-            rmdir "$_mkdir_lock" 2>/dev/null
-            trap - RETURN
-            return $ret
+    local wait_budget="${DSR_SELECTOR_WAIT_TIMEOUT:-300}" lock_budget="${DSR_SELECTOR_LOCK_TIMEOUT:-30}"
+    [[ "$wait_budget" =~ ^[0-9]{1,5}$ && "$lock_budget" =~ ^[0-9]{1,5}$ ]] || return 4
+    wait_budget=$((10#$wait_budget)) lock_budget=$((10#$lock_budget))
+    local node boot start record status started=$SECONDS remaining budget limit
+    _sel_prepare_host "$hostname" || return $?
+    node=$(uname -n) || return 3
+    boot=$(_sel_boot_id) || return $?
+    start=$(_sel_process_start "$owner_pid") || return 3
+    record=$(jq -nc --arg host "$hostname" --arg run "$run_id" --arg node "$node" \
+        --arg boot "$boot" --arg start "$start" --argjson pid "$owner_pid" \
+        '{schema:1,host:$host,run_id:$run,pid:$pid,node:$node,boot:$boot,start:$start}') || return 4
+    while true; do
+        budget=$lock_budget
+        if $wait_mode; then
+            remaining=$((wait_budget - (SECONDS - started)))
+            ((remaining >= 0)) || remaining=0
+            ((budget <= remaining)) || budget=$remaining
         fi
-    }
-
-    # Helper to attempt acquisition
-    _try_acquire() {
-        selector_has_capacity "$hostname" || return $?
-        printf '%s\n' "$run_id" > "$slot_file" || return 4
-        touch "$slot_file" || return 4
-    }
-
-    local acquire_status
-    if $wait_mode; then
-        _sel_log_info "Host $hostname at capacity, waiting..."
-        while true; do
-            if _with_lock _try_acquire; then
-                break
-            else
-                acquire_status=$?
-                [[ $acquire_status -eq 1 ]] || return "$acquire_status"
-            fi
-            sleep 5 || return 5
-        done
-    else
-        if _with_lock _try_acquire; then
-            :
+        if _sel_with_lock "$hostname" "$budget" _sel_try_acquire "$hostname" "$run_id" "$record"; then
+            _sel_log_ok "Acquired slot on $hostname: $run_id"
+            return 0
         else
-            acquire_status=$?
-            [[ $acquire_status -eq 1 ]] || return "$acquire_status"
-            local limit usage
-            limit=$(selector_get_limit "$hostname")
-            usage=$(selector_get_usage "$hostname")
-            _sel_log_warn "Host $hostname at capacity ($usage/$limit)"
+            status=$?
+            [[ $status -eq 2 ]] || return "$status"
+        fi
+        limit=$(selector_get_limit "$hostname") || return $?
+        if ! $wait_mode || ((limit == 0 || SECONDS - started >= wait_budget)); then
+            _sel_log_warn "No build slot available on $hostname (capacity/ownership/deadline)"
             return 2
         fi
-    fi
-
-    local usage
-    usage=$(selector_get_usage "$hostname")
-    local limit
-    limit=$(selector_get_limit "$hostname")
-    _sel_log_ok "Acquired slot on $hostname ($usage/$limit)"
-
-    return 0
+        sleep 0.1 || return 5
+    done
 }
+
+_sel_try_acquire() {
+    local hostname="$1" run_id="$2" record="$3" existing usage limit
+    local slot="$_SELECTOR_LOCKS_DIR/$hostname/$run_id.lock"
+    limit=$(selector_get_limit "$hostname") || return $?
+    usage=$(_sel_usage_locked "$hostname" true) || return $?
+    if [[ -e "$slot" || -L "$slot" ]]; then
+        existing=$(_sel_slot_record "$slot" "$hostname" "$run_id") || return 2
+        jq -e --argjson owner "$record" '. == $owner' <<< "$existing" >/dev/null && return 0
+        return 2  # another process cannot share a run ID or release its slot
+    fi
+    ((usage < limit)) || return 2
+    _sel_publish_slot "$slot" "$record"
+}
+
+_sel_publish_slot() (
+    local slot="$1" record="$2" temporary cleanup
+    temporary=$(mktemp "${slot%/*}/.slot.XXXXXXXX") || return 4
+    printf -v cleanup 'rm -f -- %q' "$temporary"
+    # shellcheck disable=SC2064
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    printf '%s\n' "$record" > "$temporary" || return 4
+    # Publish complete bytes with no-clobber semantics, never truncate a peer.
+    ln -- "$temporary" "$slot" || return 4
+)
 
 # Release a build slot on a host
 # Usage: selector_release_slot <hostname> <run_id>
@@ -291,15 +388,25 @@ selector_release_slot() {
     local hostname="${1:-}"
     local run_id="${2:-}"
     _sel_safe_component "$hostname" && _sel_safe_component "$run_id" || return 4
+    local owner_pid="$BASHPID" node boot start
+    _sel_prepare_host "$hostname" || return $?
+    node=$(uname -n) || return 3
+    boot=$(_sel_boot_id) || return $?
+    start=$(_sel_process_start "$owner_pid") || return 3
+    _sel_with_lock "$hostname" "${DSR_SELECTOR_LOCK_TIMEOUT:-30}" \
+        _sel_release_owned "$hostname" "$run_id" "$owner_pid" "$node" "$boot" "$start"
+}
 
-    [[ -z "$_SELECTOR_LOCKS_DIR" ]] && selector_init
-
-    local lock_file="$_SELECTOR_LOCKS_DIR/$hostname/${run_id}.lock"
-
-    if [[ -f "$lock_file" ]]; then
-        rm -f "$lock_file"
-        _sel_log_info "Released slot on $hostname"
-    fi
+_sel_release_owned() {
+    local hostname="$1" run_id="$2" pid="$3" node="$4" boot="$5" start="$6" record
+    local slot="$_SELECTOR_LOCKS_DIR/$hostname/$run_id.lock"
+    [[ -e "$slot" || -L "$slot" ]] || return 0
+    record=$(_sel_slot_record "$slot" "$hostname" "$run_id") || return 4
+    jq -e --argjson pid "$pid" --arg node "$node" --arg boot "$boot" --arg start "$start" \
+        '.pid == $pid and .node == $node and .boot == $boot and .start == $start' \
+        <<< "$record" >/dev/null || return 2
+    rm -f -- "$slot" || return 4
+    _sel_log_info "Released slot on $hostname: $run_id"
 }
 
 # Get hosts that can build a target
