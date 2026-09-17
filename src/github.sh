@@ -24,6 +24,9 @@ GH_RETRY_DELAY="${GH_RETRY_DELAY:-5}"  # seconds
 # Last HTTP response metadata (curl path)
 _GH_LAST_HTTP_CODE=""
 _GH_LAST_ETAG=""
+_GH_LAST_RETRY_AFTER=""
+_GH_LAST_RATE_REMAINING=""
+_GH_LAST_RATE_RESET=""
 
 # Colors for output (if not disabled)
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
@@ -197,7 +200,7 @@ _gh_get_etag() {
 # Make GitHub API request
 # Usage: gh_api <endpoint> [--method GET|POST|PATCH|DELETE] [--data <json>] [--no-cache]
 # Returns: JSON response on stdout, sets exit code
-gh_api() {
+gh_api() (
     local endpoint=""
     local method="GET"
     local data=""
@@ -206,14 +209,17 @@ gh_api() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --method|-X)
+                [[ $# -ge 2 && -n "$2" ]] || return 4
                 method="$2"
                 shift 2
                 ;;
             --data|-d)
+                [[ $# -ge 2 ]] || return 4
                 data="$2"
                 shift 2
                 ;;
             --post)
+                [[ $# -ge 2 ]] || return 4
                 method="POST"
                 data="$2"
                 shift 2
@@ -237,6 +243,16 @@ gh_api() {
         _gh_log_error "Usage: gh_api <endpoint>"
         return 4
     fi
+    local max_attempts="${GH_MAX_RETRIES:-3}" retry_delay="${GH_RETRY_DELAY:-5}"
+    if [[ ! "$max_attempts" =~ ^([1-9]|10)$ || ! "$retry_delay" =~ ^[0-9]{1,4}$ ]]; then
+        _gh_log_error "Invalid API retry configuration"
+        return 4
+    fi
+    retry_delay=$((10#$retry_delay))
+    if ! command -v jq &>/dev/null; then
+        _gh_log_error "jq is required for GitHub JSON responses"
+        return 3
+    fi
 
     # Reset last response metadata (set by curl path)
     _GH_LAST_HTTP_CODE=""
@@ -245,36 +261,62 @@ gh_api() {
     # Check cache for GET requests
     if [[ "$method" == "GET" ]] && ! $no_cache; then
         local cached
-        if cached=$(_gh_get_cache "$endpoint"); then
+        if cached=$(_gh_get_cache "$endpoint") &&
+           jq -es 'length == 1' <<< "$cached" >/dev/null 2>&1; then
             echo "$cached"
             return 0
         fi
     fi
 
     # Try gh CLI first, then curl
-    local response
-    local exit_code
+    local response="" response_file cleanup_command
+    local exit_code using_curl
     local retries=0
+    response_file=$(mktemp "${TMPDIR:-/tmp}/dsr-api-response.XXXXXXXX") || return 8
+    printf -v cleanup_command 'rm -f -- %q' "$response_file"
+    trap "$cleanup_command" EXIT
+    trap 'exit 5' INT TERM
 
-    while [[ $retries -lt $GH_MAX_RETRIES ]]; do
+    while [[ $retries -lt $max_attempts ]]; do
+        _GH_LAST_HTTP_CODE=""
+        _GH_LAST_ETAG=""
+        _GH_LAST_RETRY_AFTER=""
+        _GH_LAST_RATE_REMAINING=""
+        _GH_LAST_RATE_RESET=""
+        # Do not use response=$(transport): that subshell discards HTTP/ETag
+        # metadata, turns 304 into empty success, and loses retry classification.
+        exit_code=0
+        using_curl=false
         if gh_check 2>/dev/null; then
-            response=$(_gh_api_with_gh "$endpoint" "$method" "$data" "$no_cache")
-            exit_code=$?
+            _gh_api_with_gh "$endpoint" "$method" "$data" "$no_cache" > "$response_file" || exit_code=$?
         else
             gh_check_token || return 3
-            response=$(_gh_api_with_curl "$endpoint" "$method" "$data" "$no_cache")
-            exit_code=$?
+            using_curl=true
+            _gh_api_with_curl "$endpoint" "$method" "$data" "$no_cache" > "$response_file" || exit_code=$?
         fi
+        response=$(cat "$response_file") || return 8
 
         # Check for rate limit
         if [[ $exit_code -eq 0 ]]; then
             # Handle 304 Not Modified from curl path
-            if [[ "$method" == "GET" ]] && ! $no_cache && [[ "${_GH_LAST_HTTP_CODE:-}" == "304" ]]; then
+            if [[ "${_GH_LAST_HTTP_CODE:-}" == "304" ]]; then
                 local cached_raw
-                if cached_raw=$(_gh_get_cache_raw "$endpoint"); then
+                if [[ "$method" == "GET" ]] && ! $no_cache &&
+                   cached_raw=$(_gh_get_cache_raw "$endpoint") &&
+                   jq -es 'length == 1' <<< "$cached_raw" >/dev/null 2>&1; then
+                    local etag="${_GH_LAST_ETAG:-}"
+                    [[ -n "$etag" ]] || etag=$(_gh_get_etag "$endpoint")
+                    printf '%s\n' "$cached_raw" | _gh_set_cache "$endpoint" "$etag"
                     echo "$cached_raw"
                     return 0
                 fi
+                _gh_log_error "Unexpected 304 without a usable cached response for $endpoint"
+                return 8
+            fi
+            if [[ "$method" == "GET" ]] &&
+               ! jq -es 'length == 1' <<< "$response" >/dev/null 2>&1; then
+                _gh_log_error "GitHub returned an invalid JSON response for $endpoint"
+                return 8
             fi
 
             # Cache GET responses
@@ -283,12 +325,17 @@ gh_api() {
             fi
             echo "$response"
             return 0
-        elif _gh_is_rate_limited "$response"; then
+        elif _gh_is_rate_limited "$response" ||
+             { [[ "$method" == "GET" ]] &&
+               { [[ "${_GH_LAST_HTTP_CODE:-}" =~ ^(408|429|5[0-9][0-9])$ ]] ||
+                 { $using_curl && [[ -z "${_GH_LAST_HTTP_CODE:-}" && $exit_code -ne 3 ]]; }; }; }; then
             ((retries++))
-            if [[ $retries -lt $GH_MAX_RETRIES ]]; then
-                local wait_time=$((GH_RETRY_DELAY * retries))
-                _gh_log_warn "Rate limited. Waiting ${wait_time}s (retry $retries/$GH_MAX_RETRIES)"
-                sleep "$wait_time"
+            if [[ $retries -lt $max_attempts ]]; then
+                local rate_limited=false
+                if [[ "${_GH_LAST_HTTP_CODE:-}" == "429" ]] || _gh_is_rate_limited "$response"; then
+                    rate_limited=true
+                fi
+                _gh_retry_pause "$retry_delay" "$retries" "$rate_limited" || return $?
             fi
         else
             # Non-rate-limit error
@@ -297,10 +344,10 @@ gh_api() {
         fi
     done
 
-    _gh_log_error "Rate limit exceeded after $GH_MAX_RETRIES retries"
+    _gh_log_error "API request failed after $max_attempts attempts"
     echo "$response"
     return 8
-}
+)
 
 # Download one release asset by immutable GitHub asset ID into an explicit,
 # previously absent destination. The response is binary, so it deliberately
@@ -610,6 +657,8 @@ _gh_api_with_curl() {
     local curl_args=(
         -s
         -S
+        --connect-timeout 15
+        --max-time 60
         -X "$method"
         -H "Accept: application/vnd.github+json"
         -H "Authorization: Bearer $gh_token"
@@ -624,7 +673,7 @@ _gh_api_with_curl() {
 
     # Add ETag if available
     local etag=""
-    if ! $no_cache; then
+    if [[ "$method" == "GET" ]] && ! $no_cache; then
         etag=$(_gh_get_etag "$endpoint")
         if [[ -n "$etag" ]]; then
             curl_args+=(-H "If-None-Match: $etag")
@@ -637,36 +686,97 @@ _gh_api_with_curl() {
 
     local raw headers body status_line http_code etag
     local curl_status=0
-    raw=$(curl -D - "${curl_args[@]}" "$url") || curl_status=$?
+    # Preserve trailing header separators on body-less 204/304 responses.
+    # Command substitution otherwise strips the final newline in CRLFCRLF.
+    raw=$(curl -D - "${curl_args[@]}" "$url"; curl_status=$?; printf '\034'; exit "$curl_status") || curl_status=$?
+    raw="${raw%$'\034'}"
     if [[ $curl_status -ne 0 ]]; then
         _GH_LAST_HTTP_CODE=""
         _GH_LAST_ETAG=""
         return $curl_status
     fi
 
-    if [[ "$raw" == *$'\r\n\r\n'* ]]; then
-        headers="${raw%%$'\r\n\r\n'*}"
-        body="${raw#*$'\r\n\r\n'}"
-    elif [[ "$raw" == *$'\n\n'* ]]; then
-        headers="${raw%%$'\n\n'*}"
-        body="${raw#*$'\n\n'}"
-    else
-        headers=""
-        body="$raw"
+    # curl -D - may include a proxy CONNECT response and interim 1xx
+    # responses. Only the final header block describes the JSON body.
+    body="$raw"
+    http_code=""
+    while [[ "$body" == HTTP/* ]]; do
+        if [[ "$body" == *$'\r\n\r\n'* ]]; then
+            headers="${body%%$'\r\n\r\n'*}"
+            body="${body#*$'\r\n\r\n'}"
+        elif [[ "$body" == *$'\n\n'* ]]; then
+            headers="${body%%$'\n\n'*}"
+            body="${body#*$'\n\n'}"
+        else
+            _gh_log_error "Incomplete GitHub HTTP response"
+            return 8
+        fi
+        status_line="${headers%%$'\n'*}"
+        if [[ ! "$status_line" =~ ^HTTP/[0-9.]+[[:space:]]([1-5][0-9][0-9])([[:space:]]|$) ]]; then
+            _gh_log_error "Invalid GitHub HTTP status line"
+            return 8
+        fi
+        http_code="${BASH_REMATCH[1]}"
+        etag=$(_gh_response_header etag "$headers")
+    done
+    if [[ -z "$http_code" || "$http_code" == 1* ||
+          "$status_line" == *"Connection established"* ]]; then
+        _gh_log_error "Missing final GitHub HTTP response"
+        return 8
     fi
-
-    status_line=$(printf '%s\n' "$headers" | head -n 1)
-    http_code=$(printf '%s\n' "$status_line" | awk '{print $2}')
-    etag=$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1)=="etag"{print $2}' | tr -d '\r')
 
     _GH_LAST_HTTP_CODE="${http_code:-}"
     _GH_LAST_ETAG="${etag:-}"
+    _GH_LAST_RETRY_AFTER=$(_gh_response_header retry-after "$headers")
+    _GH_LAST_RATE_REMAINING=$(_gh_response_header x-ratelimit-remaining "$headers")
+    _GH_LAST_RATE_RESET=$(_gh_response_header x-ratelimit-reset "$headers")
 
     echo "$body"
-    if [[ -n "$http_code" && "$http_code" -ge 400 ]]; then
-        return 22
+    [[ "$http_code" == 2* || "$http_code" == "304" ]] && return 0
+    return 22
+}
+
+# Read the last occurrence of a response header, accepting case and optional
+# whitespace variations. Called only on headers, never the JSON body.
+_gh_response_header() {
+    printf '%s\n' "$2" | awk -v wanted="$1" '
+        index($0, ":") > 0 && tolower(substr($0, 1, index($0, ":") - 1)) == wanted {
+            sub(/^[^:]*:[ \t]*/, ""); sub(/[ \t\r]+$/, ""); value=$0
+        }
+        END {if (value != "") print value}
+    '
+}
+
+# Honor GitHub backoff before another request, including reconciliation GETs.
+# Long server cooldowns return NETWORK_ERROR rather than sleeping indefinitely
+# or retrying early. GH_MAX_RETRY_WAIT (seconds, default 300) bounds the pause.
+_gh_retry_pause() {
+    local base="$1" attempt="$2" rate_limited="${3:-false}"
+    local ceiling="${GH_MAX_RETRY_WAIT:-300}" floor=0 now
+    [[ "$ceiling" =~ ^[0-9]{1,5}$ ]] || return 4
+    ceiling=$((10#$ceiling))
+    local wait_time=$((base * (1 << (attempt - 1))))
+    if [[ -n "${_GH_LAST_RETRY_AFTER:-}" ]]; then
+        [[ "$_GH_LAST_RETRY_AFTER" =~ ^[0-9]{1,9}$ ]] || {
+            _gh_log_error "Unusable Retry-After header; refusing an early retry"
+            return 8
+        }
+        floor=$((10#$_GH_LAST_RETRY_AFTER))
+    elif [[ "${_GH_LAST_RATE_REMAINING:-}" == "0" ]]; then
+        [[ "${_GH_LAST_RATE_RESET:-}" =~ ^[0-9]{1,12}$ ]] || return 8
+        now=$(date +%s) || return 8
+        floor=$((10#$_GH_LAST_RATE_RESET - now))
+        ((floor > 0)) || floor=0
+    elif $rate_limited; then
+        floor=$((60 * (1 << (attempt - 1))))
     fi
-    return 0
+    ((wait_time >= floor)) || wait_time="$floor"
+    if ((wait_time > ceiling)); then
+        _gh_log_warn "GitHub retry requires ${wait_time}s; exceeds GH_MAX_RETRY_WAIT=${ceiling}s"
+        return 8
+    fi
+    _gh_log_warn "Retrying after ${wait_time}s (attempt $attempt)"
+    sleep "$wait_time" || return 5
 }
 
 # Check if response indicates rate limiting
@@ -973,7 +1083,7 @@ gh_upload_asset_named() (
     local max_attempts="${GH_MAX_RETRIES:-3}" retry_delay="${GH_RETRY_DELAY:-5}"
     local timeout="${GH_UPLOAD_TIMEOUT:-900}"
     local repo release_id token workdir sha snapshot_sha size asset response
-    local attempt=0 status http_code curl_status retryable
+    local attempt=0 status http_code curl_status retryable headers paused rate_limited
 
     # Accept only GitHub's documented upload endpoint and optional URI template.
     # In particular, do not forward a token to arbitrary hosts or follow redirects.
@@ -1006,7 +1116,12 @@ gh_upload_asset_named() (
     sha=$(_gh_asset_sha256 "$file_path") || return $?
     umask 077
     workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-asset-upload.XXXXXXXX") || return 4
-    trap 'rm -f -- "$workdir/payload" "$workdir/response" "$workdir/verified"; rmdir -- "$workdir" 2>/dev/null || true' EXIT
+    # A direct function return can pop locals before the subshell EXIT trap.
+    # Freeze safely quoted paths now; do not look up workdir during cleanup.
+    local cleanup_command
+    printf -v cleanup_command 'rm -f -- %q %q %q %q; rmdir -- %q 2>/dev/null || true' \
+        "$workdir/payload" "$workdir/response" "$workdir/verified" "$workdir/headers" "$workdir"
+    trap "$cleanup_command" EXIT
     trap 'exit 5' INT TERM
     cp -- "$file_path" "$workdir/payload" || return 4
     snapshot_sha=$(_gh_asset_sha256 "$workdir/payload") || return $?
@@ -1034,6 +1149,7 @@ gh_upload_asset_named() (
         attempt=$((attempt + 1))
         curl_status=0
         : > "$workdir/response" || return 4
+        : > "$workdir/headers" || return 4
         http_code=$(curl -sS --connect-timeout 15 --max-time "$timeout" \
             -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -1041,15 +1157,23 @@ gh_upload_asset_named() (
             -H "X-GitHub-Api-Version: 2022-11-28" \
             -H "Content-Type: $content_type" \
             --data-binary "@$workdir/payload" \
-            -o "$workdir/response" -w '%{http_code}' \
+            -D "$workdir/headers" -o "$workdir/response" -w '%{http_code}' \
             "$upload_url") || curl_status=$?
         response=$(cat "$workdir/response" 2>/dev/null) || response=""
+        headers=$(cat "$workdir/headers") || return 8
+        _GH_LAST_RETRY_AFTER=$(_gh_response_header retry-after "$headers")
+        _GH_LAST_RATE_REMAINING=$(_gh_response_header x-ratelimit-remaining "$headers")
+        _GH_LAST_RATE_RESET=$(_gh_response_header x-ratelimit-reset "$headers")
         if ((curl_status == 0)) && [[ "$http_code" == "201" ]]; then
             _gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$response" "$workdir"
             return $?
         fi
 
-        retryable=false
+        retryable=false paused=false rate_limited=false
+        if [[ "$http_code" == "429" ]] ||
+           { [[ "$http_code" == "403" ]] && _gh_is_rate_limited "$response"; }; then
+            rate_limited=true
+        fi
         if ((curl_status != 0)) || [[ "$http_code" =~ ^(408|429|5[0-9][0-9])$ ]]; then
             retryable=true
         elif [[ "$http_code" == "403" ]] && _gh_is_rate_limited "$response"; then
@@ -1060,6 +1184,13 @@ gh_upload_asset_named() (
         elif [[ "$http_code" != "422" ]]; then
             _gh_log_error "Upload failed for $upload_name (HTTP ${http_code:-unknown}, curl $curl_status)"
             return 7
+        fi
+
+        # A rate-limit response applies to reads too: do not immediately send
+        # a reconciliation GET while GitHub explicitly asks us to back off.
+        if $rate_limited || [[ -n "$_GH_LAST_RETRY_AFTER" || "$_GH_LAST_RATE_REMAINING" == "0" ]]; then
+            _gh_retry_pause "$retry_delay" "$attempt" "$rate_limited" || return $?
+            paused=true
         fi
 
         # The server may have stored all bytes before the connection failed.
@@ -1078,9 +1209,8 @@ gh_upload_asset_named() (
             _gh_log_error "GitHub rejected asset $upload_name without a matching remote upload"
             return 7
         fi
-        if ((attempt < max_attempts)); then
-            _gh_log_warn "Retrying asset upload $upload_name ($attempt/$max_attempts)"
-            sleep "$((retry_delay * attempt))"
+        if ((attempt < max_attempts)) && ! $paused; then
+            _gh_retry_pause "$retry_delay" "$attempt" false || return $?
         fi
     done
     _gh_log_error "Asset upload exhausted $max_attempts attempt(s): $upload_name"
