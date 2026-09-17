@@ -113,7 +113,13 @@ _act_ssh_exec() {
     cmd=$(_test_decode_remote_command "$2")
     # Append for subshell-safe capture: a build now issues follow-up exec
     # calls (stage-root cleanup) and the build command must stay recorded.
-    printf '%s\n' "HOST:$host" "CMD:$cmd" >> "$SSH_ARGS_FILE"
+    # Prefix every line so get_ssh_cmd retains the complete PowerShell command,
+    # including the body and tail of embedded functions.
+    printf '%s\n' "HOST:$host" >> "$SSH_ARGS_FILE"
+    local command_line
+    while IFS= read -r command_line || [[ -n "$command_line" ]]; do
+        printf 'CMD:%s\n' "$command_line" >> "$SSH_ARGS_FILE"
+    done <<< "$cmd"
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
     if [[ "$exit_code" -eq 0 && "$cmd" == *"Cargo target source identity mismatch"* && \

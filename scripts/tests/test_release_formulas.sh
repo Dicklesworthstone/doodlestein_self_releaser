@@ -34,7 +34,6 @@ export NO_COLOR=1
 
 CASE="" SCENARIO="" API_CALLS="" GIT_CALLS="" TAG_CALLS=""
 SHA=0123456789abcdef0123456789abcdef01234567
-OLD_HASH=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HASH=""
 
 seed() {
@@ -205,7 +204,7 @@ check 'dry run plans five exact assets' json_is "$CASE/output.json" '.details.as
 check 'dry run reports planned, not pushed' json_is "$CASE/output.json" '.details.homebrew.status=="planned" and .details.scoop.status=="planned" and .details.pushed==false and .details.work_dir==null'
 check 'dry run creates no persistent workspace' test ! -e "$DSR_STATE_DIR/formulas"
 check 'dry run never invokes Git' test ! -s "$GIT_CALLS"
-check 'dry run cleans its temporary workspace' equal "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)" 0
+check 'dry run cleans its temporary workspace' equal "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d '[:space:]')" 0
 check 'dry run leaves Homebrew remote unchanged' equal "$(remote_sha homebrew)" "$before_brew"
 check 'dry run leaves Scoop remote unchanged' equal "$(remote_sha scoop)" "$before_scoop"
 check 'release reads are uncached' bash -c '! grep "^api " "$1" | grep -v -- "--no-cache"' _ "$API_CALLS"
@@ -218,7 +217,7 @@ check 'review mode succeeds' equal "$RESULT" 0
 check 'review mode retains both real local commits' json_is "$CASE/output.json" '.details.homebrew.status=="committed" and .details.scoop.status=="committed" and .details.pushed==false'
 check 'review workspace is retained' test -d "$workspace/homebrew/.git"
 check 'review receipt is retained' test -s "$workspace/result.json"
-check 'review workspace is private' equal "$(stat -c %a "$workspace")" 700
+check 'review workspace is private' equal "$(stat -c '%a' "$workspace" 2>/dev/null || stat -f '%Lp' "$workspace" 2>/dev/null)" 700
 check 'review Homebrew remote is unchanged' equal "$(remote_sha homebrew)" "$before_brew"
 check 'review Scoop remote is unchanged' equal "$(remote_sha scoop)" "$before_scoop"
 check 'review creates no remote pushes' no_pushes

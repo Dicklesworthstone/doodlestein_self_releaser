@@ -81,12 +81,26 @@ _pkg_path_has_no_links() {
     done
 }
 
+# BSD tar auto-detects compression even when the caller requests another format.
+# Check the container signature before accepting members under a declared format.
+_pkg_archive_matches_format() {
+    local archive="$1" format="$2" magic
+    [[ -f "$archive" && ! -L "$archive" ]] || return 4
+    magic=$(head -c 6 "$archive" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d '[:space:]')
+    case "$format" in
+        tar.gz|tgz) [[ "$magic" == 1f8b* ]] || return 4 ;;
+        tar.xz) [[ "$magic" == fd377a585a00* ]] || return 4 ;;
+        zip) [[ "$magic" == 504b0304* || "$magic" == 504b0506* || "$magic" == 504b0708* ]] || return 4 ;;
+        *) return 4 ;;
+    esac
+}
+
 # List archive members, one per line.
 packaging_list_members() {
     local archive="$1"
     local format="$2"
 
-    [[ -f "$archive" && ! -L "$archive" ]] || return 4
+    _pkg_archive_matches_format "$archive" "$format" || return $?
     case "$format" in
         tar.gz|tgz)
             command -v tar &>/dev/null || return 3

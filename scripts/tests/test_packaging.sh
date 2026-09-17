@@ -330,6 +330,18 @@ if command -v zip &>/dev/null && command -v unzip &>/dev/null; then
 fi
 
 # ---------------------------------------------------------------------------
+log_test "declared compression matches the archive container"
+if packaging_validate_archive "$GZ" tar.xz 2>/dev/null; then
+    log_fail "tar.gz rejected as tar.xz"
+else
+    log_pass "tar.gz rejected as tar.xz"
+fi
+if packaging_validate_archive "$XZ" tar.gz 2>/dev/null; then
+    log_fail "tar.xz rejected as tar.gz"
+else
+    log_pass "tar.xz rejected as tar.gz"
+fi
+
 log_test "prebuilt reuse and byte-level payload parity"
 
 PARITY_DIR="$TEMP_DIR/parity"
@@ -401,10 +413,17 @@ cp -R "$PAYLOAD" "$PARITY_DIR/wrong-bytes"
 printf 'corrupt binary\n' > "$PARITY_DIR/wrong-bytes/am"
 cp -R "$PAYLOAD" "$PARITY_DIR/wrong-mode"
 chmod 0644 "$PARITY_DIR/wrong-mode/am"
+mkdir -p "$PARITY_DIR/prior-payload"
+printf 'prior binary bytes\n' > "$PARITY_DIR/prior-payload/am"
+chmod 0755 "$PARITY_DIR/prior-payload/am"
+packaging_build_archive tar.xz "$PARITY_DIR/prior.tar.xz" "$PARITY_DIR/prior-payload" am
 for mismatch in wrong-bytes wrong-mode; do
-    cp "$PARITY_DIR/original.gz" "$PARITY_DIR/protected.tar.xz"
+    cp "$PARITY_DIR/prior.tar.xz" "$PARITY_DIR/protected.tar.xz"
+    ln "$PARITY_DIR/protected.tar.xz" "$PARITY_DIR/protected-inode-$mismatch"
+    marker="$PARITY_DIR/invoked-$mismatch"
     if (
         packaging_build_archive() {
+            touch "$marker"
             command tar -cJf "$2" -C "$PARITY_DIR/$mismatch" am mcp-agent-mail README.md LICENSE
         }
         packaging_repack_archive "$GZ" tar.gz "$PARITY_DIR/protected.tar.xz" tar.xz
@@ -413,8 +432,12 @@ for mismatch in wrong-bytes wrong-mode; do
     else
         log_pass "same-name $mismatch output refused"
     fi
-    cmp -s "$PARITY_DIR/original.gz" "$PARITY_DIR/protected.tar.xz" && \
+    [[ -f "$marker" ]] && \
+        log_pass "$mismatch compressor actually invoked" || log_fail "$mismatch compressor actually invoked"
+    cmp -s "$PARITY_DIR/prior.tar.xz" "$PARITY_DIR/protected.tar.xz" && \
         log_pass "$mismatch failure preserves previous artifact" || log_fail "$mismatch failure preserves previous artifact"
+    [[ "$PARITY_DIR/protected.tar.xz" -ef "$PARITY_DIR/protected-inode-$mismatch" ]] && \
+        log_pass "$mismatch failure preserves previous artifact inode" || log_fail "$mismatch failure preserves previous artifact inode"
 done
 
 mkdir -p "$PARITY_DIR/nested/docs"
@@ -576,6 +599,8 @@ else
             log_warn() { :; }
             log_error() { echo "ERR: $*" >&2; }
             declare -A existing_archive_formats=()
+            # Read by the production function sourced from EXTRACTED below.
+            # shellcheck disable=SC2034
             existing_archive_formats["linux/amd64"]="tar.gz"
             _build_get_archive_format() { echo "$cfg_format"; }
             _build_detect_compat_ext() { echo ""; }
@@ -597,6 +622,8 @@ else
             _build_emit_compat_alias() { :; }
             _build_emit_binary_alias() { :; }
             source "$PROJECT_ROOT/src/packaging.sh"
+            # The production function is extracted and syntax-checked above.
+            # shellcheck disable=SC1090
             source "$EXTRACTED"
             _build_package_archive_for_target "mcp-agent-mail" "0.3.31" "linux/amd64" \
                 "$outdir" "" "mcp-agent-mail" "$override"
