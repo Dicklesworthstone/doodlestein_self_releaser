@@ -332,6 +332,89 @@ status=0
 _formulas_scoop apply "$CASE/array.bad.json" "$CASE/plan.json" 1.0.1 > "$CASE/array.bad.out" 2> "$CASE/array.bad.err" || status=$?
 check 'Scoop mismatched URL/hash arrays are rejected' nonzero "$status"
 
+# Scoop resolves URL and hash overrides independently. In particular a hash-
+# only architecture must follow the updated inherited URL, while an URL-only
+# architecture must not inherit the newly calculated hash of a different file.
+cat > "$CASE/inherited.json" <<'JSON'
+{"version":"1.0.0","url":"https://github.com/owner/tool/releases/download/v1.0.0/tool.zip","hash":"old-root","extract_dir":"tool-1.0.0","architecture":{"64bit":{"hash":"old-override","extract_dir":"intel-1.0.0"},"arm64":{"url":"https://github.com/owner/tool/releases/download/v1.0.0/tool-arm64.zip","bin":"arm.exe"},"32bit":{"bin":"generic.exe"}}}
+JSON
+ARM_HASH=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+jq -nc --arg hash "$HASH" --arg arm "$ARM_HASH" '{
+  "https://github.com/owner/tool/releases/download/v1.0.0/tool.zip":
+    {url:"https://github.com/owner/tool/releases/download/v1.0.1/tool.zip",sha256:$hash},
+  "https://github.com/owner/tool/releases/download/v1.0.0/tool-arm64.zip":
+    {url:"https://github.com/owner/tool/releases/download/v1.0.1/tool-arm64.zip",sha256:$arm}
+}' > "$CASE/inherited.plan.json"
+status=0
+_formulas_scoop apply "$CASE/inherited.json" "$CASE/inherited.plan.json" 1.0.1 \
+    > "$CASE/inherited.updated" 2> "$CASE/inherited.err" || status=$?
+check 'Scoop independent inheritance renders successfully' equal "$status" 0
+check 'inherited URL gets the new architecture checksum' json_is "$CASE/inherited.updated" ".architecture[\"64bit\"].hash==\"$HASH\" and (.architecture[\"64bit\"] | has(\"url\") | not)"
+check 'URL-only ARM64 override gets its own verified hash' json_is "$CASE/inherited.updated" ".architecture.arm64.hash==\"$ARM_HASH\" and (.architecture.arm64.url | endswith(\"tool-arm64.zip\"))"
+check 'inherited extraction directories update without explicit URL' json_is "$CASE/inherited.updated" '.extract_dir=="tool-1.0.1" and .architecture["64bit"].extract_dir=="intel-1.0.1"'
+check 'architecture with no download overrides keeps inheritance' json_is "$CASE/inherited.updated" '.architecture["32bit"]=={bin:"generic.exe"}'
+
+jq '.extract_dir=["tool-1.0.0",null] |
+    .architecture={"64bit":{"hash":["old-arch","arch-auxiliary"],"extract_dir":["intel-1.0.0",null]}}' \
+    "$CASE/array.json" > "$CASE/inherited-array.json"
+status=0
+_formulas_scoop apply "$CASE/inherited-array.json" "$CASE/inherited.plan.json" 1.0.1 \
+    > "$CASE/inherited-array.updated" 2> "$CASE/inherited-array.err" || status=$?
+check 'inherited URL arrays render successfully' equal "$status" 0
+check 'inherited arrays preserve the architecture auxiliary hash' json_is "$CASE/inherited-array.updated" ".architecture[\"64bit\"].hash==[\"$HASH\",\"arch-auxiliary\"] and .hash==[\"$HASH\",\"auxiliary\"]"
+check 'extraction arrays retain null placeholders and update versions' json_is "$CASE/inherited-array.updated" '.extract_dir==["tool-1.0.1",null] and .architecture["64bit"].extract_dir==["intel-1.0.1",null]'
+jq '.architecture["64bit"].hash=["only-one"]' "$CASE/inherited-array.json" > "$CASE/inherited-bad.json"
+status=0
+_formulas_scoop apply "$CASE/inherited-bad.json" "$CASE/inherited.plan.json" 1.0.1 \
+    > "$CASE/inherited-bad.out" 2> "$CASE/inherited-bad.err" || status=$?
+check 'inherited URL/hash length mismatch is rejected' nonzero "$status"
+
+# The shared verified plan is a performance cache, not permission to skip the
+# second recipe's independent version-to-tag consistency validation.
+printf '{}\n' > "$CASE/plan.json"
+printf '{"version":"1.0.0","urls":["https://github.com/owner/tool/releases/download/v1.0.0/tool-linux-x86_64.tar.gz"]}\n' > "$CASE/consistent.scan.json"
+status=0
+_formulas_plan_assets owner/tool v1.0.1 9 "$CASE/consistent.scan.json" "$CASE" \
+    > "$CASE/consistent.out" 2> "$CASE/consistent.err" || status=$?
+check 'exact shared URL creates a verified plan entry' equal "$status" 0
+jq '.version="2.0.0"' "$CASE/consistent.scan.json" > "$CASE/inconsistent.scan.json"
+status=0
+_formulas_plan_assets owner/tool v1.0.1 9 "$CASE/inconsistent.scan.json" "$CASE" \
+    > "$CASE/inconsistent.out" 2> "$CASE/inconsistent.err" || status=$?
+check 'shared cached URL cannot bypass recipe version validation' equal "$status" 4
+
+seed inherited-publish || exit 1
+cat > "$CASE/scoop-source/bucket/tool.json" <<'JSON'
+{"version":"1.0.0","url":"https://github.com/owner/tool/releases/download/v1.0.0/tool-1.0.0-x86_64-pc-windows-msvc.zip","hash":"old-root","extract_dir":"tool-1.0.0","architecture":{"64bit":{"hash":"old-override","extract_dir":"intel-1.0.0"},"arm64":{"url":"https://github.com/owner/tool/releases/download/v1.0.0/tool-1.0.0-aarch64-pc-windows-msvc.zip#/tool.zip","bin":"arm.exe"}}}
+JSON
+command git -C "$CASE/scoop-source" add bucket/tool.json || exit 1
+command git -C "$CASE/scoop-source" commit -qm 'seed independent inheritance' || exit 1
+command git -C "$CASE/scoop-source" push -q "$CASE/scoop.git" HEAD:refs/heads/main || exit 1
+before_brew=$(remote_sha homebrew)
+invoke false --push --skip-homebrew
+check 'Scoop-only inherited recipe publishes through the command' equal "$RESULT" 0
+check 'Scoop-only command reports skipped Homebrew and actual push' json_is "$CASE/output.json" '.details.homebrew.status=="skipped" and .details.scoop.status=="pushed"'
+check 'Scoop-only command never changes Homebrew' equal "$(remote_sha homebrew)" "$before_brew"
+command git --git-dir="$CASE/scoop.git" show main:bucket/tool.json > "$CASE/published.json" || exit 1
+check 'published inherited hash and extraction directory are current' json_is "$CASE/published.json" ".architecture[\"64bit\"].hash==\"$HASH\" and .architecture[\"64bit\"].extract_dir==\"intel-1.0.1\" and (.architecture[\"64bit\"] | has(\"url\") | not)"
+before_scoop=$(remote_sha scoop)
+invoke false --push --skip-homebrew
+check 'inherited publication is idempotent' equal "$RESULT" 0
+check 'inherited retry produces no new commit' equal "$(remote_sha scoop)" "$before_scoop"
+
+seed inherited-invalid-publish || exit 1
+cat > "$CASE/scoop-source/bucket/tool.json" <<'JSON'
+{"version":"1.0.0","url":["https://github.com/owner/tool/releases/download/v1.0.0/tool-1.0.0-x86_64-pc-windows-msvc.zip","https://example.org/runtime.exe"],"hash":["old-app","auxiliary"],"architecture":{"64bit":{"hash":["missing-auxiliary"]}}}
+JSON
+command git -C "$CASE/scoop-source" add bucket/tool.json || exit 1
+command git -C "$CASE/scoop-source" commit -qm 'seed invalid inherited hash array' || exit 1
+command git -C "$CASE/scoop-source" push -q "$CASE/scoop.git" HEAD:refs/heads/main || exit 1
+before_brew=$(remote_sha homebrew); before_scoop=$(remote_sha scoop)
+invoke false --push
+check 'command refuses an inconsistent inherited checksum array' nonzero "$RESULT"
+check 'inherited preflight failure prevents Homebrew publication' equal "$(remote_sha homebrew)" "$before_brew"
+check 'inherited preflight failure prevents Scoop publication' equal "$(remote_sha scoop)" "$before_scoop"
+
 for args in '--tool' '--version' '--homebrew-tap' '--scoop-bucket' '--unknown' 'tool' 'tool v1.0.1 extra' '../tool v1.0.1' 'tool ../../v1' 'tool v1.0.1 --skip-homebrew --skip-scoop'; do
     status=0
     # Intentional splitting: each fixture contains plain CLI words only.

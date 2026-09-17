@@ -220,13 +220,30 @@ _formulas_scoop() {
       if $mode == "scan" then {version: .version, urls: [scopes[] | .url | urls[]]}
       elif $mode == "apply" then
         $plans[0] as $plan |
-        def update_scope:
-          if .url == null then . else
-            (.url | urls) as $urls |
-            (if .hash == null then [$urls[] | null]
-             elif (.hash | type) == "string" and (.url | type) == "string" then [.hash]
-             elif (.hash | type) == "array" and (.url | type) == "array" and
-                  (.hash | length) == ($urls | length) then .hash
+        def update_extract:
+          def replace_version:
+            if ($original.version | length) > 0 then
+              split($original.version) | join($version)
+            else . end;
+          if .extract_dir == null then .
+          elif (.extract_dir | type) == "string" then .extract_dir |= replace_version
+          elif (.extract_dir | type) == "array" and
+               all(.extract_dir[]; . == null or type == "string") then
+            .extract_dir |= map(if . == null then . else replace_version end)
+          else error("invalid Scoop extraction directories") end;
+        # Resolve each property against the ORIGINAL generic scope. Resolving
+        # against the updated root would pair a still-old inherited URL with
+        # a newly written hash, or leave a hash-only override stale.
+        def update_scope($defaults):
+          . as $scope |
+          (.url // $defaults.url) as $effective_url |
+          (.hash // $defaults.hash) as $effective_hash |
+          if $effective_url == null then update_extract else
+            ($effective_url | urls) as $urls |
+            (if $effective_hash == null then [$urls[] | null]
+             elif ($effective_hash | type) == "string" and ($effective_url | type) == "string" then [$effective_hash]
+             elif ($effective_hash | type) == "array" and ($effective_url | type) == "array" and
+                  ($effective_hash | length) == ($urls | length) then $effective_hash
              else error("Scoop URL/hash shape mismatch") end) as $hashes |
             [range(0; $urls | length) as $i |
               if $plan[$urls[$i]] != null then
@@ -235,17 +252,20 @@ _formulas_scoop() {
                 {url: $urls[$i], hash: $hashes[$i]}
               else error("unverified auxiliary Scoop download") end
             ] as $updated |
-            if (.url | type) == "array" then
-              .url = [$updated[].url] | .hash = [$updated[].hash]
-            else .url = $updated[0].url | .hash = $updated[0].hash end |
-            if (.extract_dir | type) == "string" and ($original.version | length) > 0 then
-              .extract_dir |= (split($original.version) | join($version))
+            if $scope.url != null then
+              .url = (if ($effective_url | type) == "array" then [$updated[].url] else $updated[0].url end)
+            else . end |
+            if $scope.url != null or $scope.hash != null then
+              .hash = (if ($effective_url | type) == "array" then [$updated[].hash] else $updated[0].hash end)
             else . end
+            | update_extract
           end;
         if ([scopes[] | .url | urls[] | select($plan[.] != null)] | length) == 0
         then error("no verified Scoop application assets") else . end |
-        .version = $version | update_scope |
-        if .architecture != null then .architecture |= with_entries(.value |= update_scope) else . end
+        .version = $version | update_scope({}) |
+        if .architecture != null then
+          .architecture |= with_entries(.value |= update_scope($original))
+        else . end
       else error("unknown Scoop operation") end
     ' "$recipe"
 }
@@ -267,9 +287,6 @@ _formulas_plan_assets() {
     while IFS= read -r url; do
         [[ -n "$url" ]] || continue
         [[ "${url,,}" == "${prefix,,}"* ]] || continue
-        if jq -e --arg url "$url" 'has($url)' "$work/plan.json" >/dev/null; then
-            continue
-        fi
         base="${url%%#*}" fragment=""
         if [[ "$base" != "$url" ]]; then
             fragment="#${url#*#}"
@@ -287,6 +304,9 @@ _formulas_plan_assets() {
         if [[ -n "$old_version" && "${old_version#v}" != "${old_tag#v}" ]]; then
             log_error "Recipe version and release URL disagree: $url"
             return 4
+        fi
+        if jq -e --arg url "$url" 'has($url)' "$work/plan.json" >/dev/null; then
+            continue
         fi
         new_tag="$tag"
         [[ "$old_tag" != v* ]] && new_tag="${tag#v}"
