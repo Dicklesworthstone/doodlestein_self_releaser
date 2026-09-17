@@ -144,6 +144,17 @@ _an_safe_asset_name() {
     [[ "$1" =~ ^[a-zA-Z0-9._+-]+$ && "$1" != "." && "$1" != ".." ]]
 }
 
+# Check normalized discovery candidates without loading a user's config or
+# executing any part of the candidate. A glob or intermediate shell variable
+# is not an artifact naming template, even when it scores well heuristically.
+_an_resolvable_pattern() {
+    local probe="$1" token
+    for token in '${name}' '${version}' '${os}' '${arch}' '${target}' '${target_triple}' '${ext}'; do
+        probe="${probe//"$token"/value}"
+    done
+    _an_safe_asset_name "$probe"
+}
+
 # Parse install.sh and extract expected artifact naming pattern
 # Args: install_path [tool_name]
 # Output: Normalized pattern string (stdout) or empty on failure
@@ -235,8 +246,17 @@ artifact_naming_parse_install_script() {
             *'.${EXT}') normalized="${normalized%'.${EXT}'}" ;;
         esac
 
+        if ! _an_resolvable_pattern "$normalized"; then
+            _an_log_debug "Skipping unresolved install pattern: $cand"
+            continue
+        fi
         normalized_candidates+=("$normalized")
     done
+
+    if [[ ${#normalized_candidates[@]} -eq 0 ]]; then
+        _an_log_debug "No resolvable artifact pattern found in install script"
+        return 1
+    fi
 
     local best=""
     if [[ -n "$tool_name" ]]; then
@@ -589,7 +609,8 @@ artifact_naming_validate() {
 # Output: Compat pattern (stdout)
 _an_derive_compat_from_versioned() {
     local versioned="$1"
-    local compat="$versioned"
+    local compat
+    compat=$(_an_normalize_pattern "$versioned") || return $?
 
     # Remove the version component together with ONE adjacent separator and
     # any literal v/V glued to it, longest forms first. The old ordering
@@ -600,12 +621,10 @@ _an_derive_compat_from_versioned() {
         -e 's/([-_.])[vV]?\$\{version\}([-_.])/\1/g' \
         -e 's/^[vV]?\$\{version\}[-_.]//' \
         -e 's/[-_.][vV]?\$\{version\}$//' \
-        -e 's/[vV]?\$\{version\}//g')
+        -e 's/[vV]?\$\{version\}//g') || return $?
 
-    # Clean up any double separators left behind
-    compat=$(printf '%s' "$compat" | sed -E 's/--+/-/g; s/__+/_/g')
-
-    echo "$compat"
+    # Do not collapse separators inside literal tool names (my__tool).
+    printf '%s\n' "$compat"
 }
 
 # Score a pattern for selection (higher is better)
@@ -630,8 +649,17 @@ _an_choose_workflow_pattern() {
     local best=""
     local best_score=-1
 
+    if ! jq -es 'length == 1 and (.[0] | type == "array" and
+        all(.[]; type == "string" and (test("[\u0000-\u001f\u007f]") | not)))' \
+        <<< "$patterns_json" >/dev/null 2>&1; then
+        _an_log_warn "Workflow artifact patterns must be a JSON array of strings"
+        return 1
+    fi
+
     while IFS= read -r pattern; do
         [[ -z "$pattern" ]] && continue
+        pattern=$(_an_normalize_pattern "$pattern") || return $?
+        _an_resolvable_pattern "$pattern" || continue
         local score
         score=$(_an_score_pattern "$pattern")
         if [[ "$score" -gt "$best_score" ]]; then
@@ -661,14 +689,11 @@ artifact_naming_get_versioned_pattern() {
     local pattern
     pattern=$(config_get_artifact_naming "$tool" 2>/dev/null || echo "")
     if [[ -n "$pattern" ]]; then
-        local config_norm default_norm
-        config_norm=$(_an_normalize_pattern "$pattern")
-        default_norm=$(_an_normalize_pattern '${name}-${version}-${os}-${arch}')
-        if [[ "$config_norm" != "$default_norm" ]]; then
-            _an_log_info "Using artifact_naming from config: $pattern"
-            echo "$pattern"
-            return 0
-        fi
+        # config_get_artifact_naming returns empty for an absent field. An
+        # explicitly configured default-looking pattern is still an override.
+        _an_log_info "Using artifact_naming from config: $pattern"
+        printf '%s\n' "$pattern"
+        return 0
     fi
 
     if [[ -z "$workflow_path" ]]; then
@@ -679,7 +704,11 @@ artifact_naming_get_versioned_pattern() {
         local full_path="$repo_path/$workflow_path"
         if [[ -f "$full_path" ]]; then
             local patterns_json
-            patterns_json=$(artifact_naming_parse_workflow "$full_path" 2>/dev/null || echo "[]")
+            # Parsers can emit a fallback value on failure. Do not concatenate
+            # that output with another JSON document ("[]\n[]").
+            if ! patterns_json=$(artifact_naming_parse_workflow "$full_path" 2>/dev/null); then
+                patterns_json='[]'
+            fi
             local chosen
             chosen=$(_an_choose_workflow_pattern "$patterns_json")
             if [[ -n "$chosen" ]]; then
@@ -703,19 +732,15 @@ artifact_naming_get_versioned_pattern() {
         done
         if [[ -n "$goreleaser_path" ]]; then
             local goreleaser_pattern
-            goreleaser_pattern=$(artifact_naming_parse_goreleaser "$goreleaser_path" 2>/dev/null || echo "")
-            if [[ -n "$goreleaser_pattern" ]]; then
+            if ! goreleaser_pattern=$(artifact_naming_parse_goreleaser "$goreleaser_path" 2>/dev/null); then
+                goreleaser_pattern=""
+            fi
+            if [[ -n "$goreleaser_pattern" ]] && _an_resolvable_pattern "$goreleaser_pattern"; then
                 _an_log_info "Using goreleaser-derived pattern: $goreleaser_pattern"
                 echo "$goreleaser_pattern"
                 return 0
             fi
         fi
-    fi
-
-    if [[ -n "$pattern" ]]; then
-        _an_log_info "Using default artifact_naming from config: $pattern"
-        echo "$pattern"
-        return 0
     fi
 
     _an_log_debug "No versioned pattern found for $tool, using default"
@@ -817,7 +842,7 @@ artifact_naming_substitute() {
 # Get the compat pattern for a tool using precedence:
 # 1. Explicit install_script_compat from config (highest priority)
 # 2. Auto-detect from install_script_path if set
-# 3. Derive from artifact_naming by stripping version (fallback)
+# 3. Derive from the selected versioned pattern by stripping version (fallback)
 #
 # Args: tool_name local_repo_path
 # Output: Compat pattern (stdout) or empty
@@ -825,6 +850,9 @@ artifact_naming_substitute() {
 artifact_naming_get_compat_pattern() {
     local tool="$1"
     local repo_path="${2:-}"
+    # Optional resolved versioned pattern avoids reading discovery sources
+    # twice during one release plan. Empty explicitly means the default.
+    local versioned_pattern="${3:-}"
 
     _an_log_debug "Getting compat pattern for: $tool"
 
@@ -846,7 +874,9 @@ artifact_naming_get_compat_pattern() {
     if [[ -n "$install_path" && -n "$repo_path" ]]; then
         local full_path="$repo_path/$install_path"
         if [[ -f "$full_path" ]]; then
-            detected_pattern=$(artifact_naming_parse_install_script "$full_path" "$tool")
+            if ! detected_pattern=$(artifact_naming_parse_install_script "$full_path" "$tool"); then
+                detected_pattern=""
+            fi
             if [[ -n "$detected_pattern" ]]; then
                 if [[ -n "$explicit_compat" && "$explicit_compat" != "$detected_pattern" ]]; then
                     _an_log_warn "install_script_compat differs from install.sh; using explicit override: $explicit_compat"
@@ -871,13 +901,15 @@ artifact_naming_get_compat_pattern() {
         return 0
     fi
 
-    # Priority 3: Derive from artifact_naming by stripping version
-    local artifact_naming
-    artifact_naming=$(config_get_artifact_naming "$tool" 2>/dev/null || echo "")
-    if [[ -n "$artifact_naming" ]]; then
+    # Both names must share the selected source: workflow/GoReleaser discovery
+    # must not silently switch back to generic names for installer aliases.
+    if [[ $# -lt 3 ]]; then
+        versioned_pattern=$(artifact_naming_get_versioned_pattern "$tool" "$repo_path") || return $?
+    fi
+    if [[ -n "$versioned_pattern" ]]; then
         local derived
-        derived=$(_an_derive_compat_from_versioned "$artifact_naming")
-        _an_log_info "Derived compat pattern from artifact_naming: $derived"
+        derived=$(_an_derive_compat_from_versioned "$versioned_pattern") || return $?
+        _an_log_info "Derived compat pattern from selected versioned pattern: $derived"
         echo "$derived"
         return 0
     fi
@@ -919,13 +951,11 @@ artifact_naming_generate_dual_for_tool() {
     fi
     [[ -z "$naming_name" ]] && naming_name="$tool"
 
-    # Get compat pattern using precedence logic
-    local compat_pattern
-    compat_pattern=$(artifact_naming_get_compat_pattern "$tool" "$repo_path") || return $?
-
-    # Get versioned pattern using precedence logic
-    local versioned_pattern
+    # Resolve discovery once; absent an explicit installer override, use the
+    # same naming family for both versioned and installer-compatible assets.
+    local versioned_pattern compat_pattern
     versioned_pattern=$(artifact_naming_get_versioned_pattern "$tool" "$repo_path") || return $?
+    compat_pattern=$(artifact_naming_get_compat_pattern "$tool" "$repo_path" "$versioned_pattern") || return $?
 
     # Generate dual names; pass config tool name ($tool) for config lookups
     artifact_naming_generate_dual "$naming_name" "$version" "$os" "$arch" "$ext" "$compat_pattern" "$versioned_pattern" "$tool"

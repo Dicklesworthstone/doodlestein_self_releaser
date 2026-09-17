@@ -131,5 +131,90 @@ reject 'unsafe extension' names app v1 linux amd64 '../zip'
 reject 'missing arguments' artifact_naming_generate_dual app
 reject 'substitute missing arguments' artifact_naming_substitute '${name}'
 
+# Selection and fallback regressions use real installer files and the real
+# selection/derivation pipeline. Only workflow/GoReleaser parser boundaries
+# are fixtures, so these tests need neither yq nor access to a remote repo.
+fixture=$(mktemp -d "${TMPDIR:-/tmp}/dsr-naming-contract.XXXXXXXX") || exit 1
+trap 'rm -f -- "$fixture/install.sh" "$fixture/workflow.yml" "$fixture/.goreleaser.yml"; rmdir -- "$fixture"' EXIT
+: > "$fixture/workflow.yml"
+: > "$fixture/.goreleaser.yml"
+cat > "$fixture/install.sh" <<'INSTALL'
+TAR="$NAME-$VERSION-$OS-$ARCH-$UNRESOLVED.tar.gz"
+asset_name="$NAME-$TARGET_TRIPLE.tar.gz"
+INSTALL
+
+expect 'installer skips higher-scoring unresolved variables' '${name}-${target_triple}' \
+    artifact_naming_parse_install_script "$fixture/install.sh" app
+expect 'derive uppercase/unbraced version' '${name}-${target_triple}' \
+    _an_derive_compat_from_versioned '$APP-v$VERSION-$TARGET_TRIPLE'
+expect 'derive preserves literal underscores' 'my__app_${os}_${arch}' \
+    _an_derive_compat_from_versioned 'my__app_v${VERSION}_${platform}'
+expect 'derive leading version' '${name}-${target}' \
+    _an_derive_compat_from_versioned 'v${version}-${name}-${target}'
+expect 'derive trailing version' '${name}-${target}' \
+    _an_derive_compat_from_versioned '${name}-${target}-v${version}'
+expect 'workflow ignores globs and unresolved candidates' '${name}_${version}_${target_triple}' \
+    _an_choose_workflow_pattern '["${name}-${version}-${os}-${arch}-$UNKNOWN","${name}-${version}-${os}-${arch}*","${APP}\u005f${VERSION}\u005f$TARGET_TRIPLE"]'
+
+expect_absent() {
+    local label="$1" actual status=0
+    shift
+    actual=$("$@" 2>/dev/null) || status=$?
+    if [[ $status -eq 1 && -z "$actual" ]]; then
+        passed=$((passed + 1))
+    else
+        failed=$((failed + 1))
+        printf 'FAIL %s: expected no candidate, got exit %s: %s\n' "$label" "$status" "$actual" >&2
+    fi
+}
+for patterns in '[]' '{}' '[null]' '[42]' '["*.tar.gz"]' '[] []' \
+    '["$UNKNOWN"]' '["${name}\n${target}"]'; do
+    expect_absent "no usable workflow template: $patterns" _an_choose_workflow_pattern "$patterns"
+done
+
+resolver_names() (
+    local configured="$1" workflow="$2" goreleaser="$3" compat="$4" install="$5" workflow_status="${6:-0}"
+    config_get_artifact_naming() { printf '%s' "$configured"; }
+    config_get_install_script_compat() { printf '%s' "$compat"; }
+    config_get_install_script_path() { printf '%s' "$install"; }
+    config_get_tool_field() {
+        case "$2" in tool_name) printf '%s' app ;; workflow) printf '%s' workflow.yml ;; esac
+    }
+    artifact_naming_parse_workflow() { printf '%s\n' "$workflow"; return "$workflow_status"; }
+    artifact_naming_parse_goreleaser() { printf '%s\n' "$goreleaser"; }
+    local result
+    result=$(artifact_naming_generate_dual_for_tool registered-app v1 linux amd64 tar.xz "$fixture") || return $?
+    jq -ces 'if length == 1 then .[0] | [.versioned, .compat, .same]
+        else error("multiple naming plans") end' <<< "$result"
+)
+
+expect 'explicit default-looking config outranks discovery' \
+    '["app-1-linux-x86_64.tar.xz","app-linux-x86_64.tar.xz",false]' \
+    resolver_names '${name}-${version}-${os}-${arch}' '["${name}_${version}_${target_triple}"]' '' '' ''
+expect 'legacy workflow source shared by both names' \
+    '["app_1_x86_64-unknown-linux-musl.tar.xz","app_x86_64-unknown-linux-musl.tar.xz",false]' \
+    resolver_names '' '["${name}_${version}_${target_triple}"]' '' '' ''
+expect 'GoReleaser source shared after workflow fails' \
+    '["app-v1-x86_64-unknown-linux-musl.tar.xz","app-x86_64-unknown-linux-musl.tar.xz",false]' \
+    resolver_names '' '["wrong-${version}-${os}-${arch}"]' '${name}-v${version}-${target_triple}' '' '' 1
+expect 'missing optional sources keep default behavior' \
+    '["app-1-linux-x86_64.tar.xz","app-linux-x86_64.tar.xz",false]' \
+    resolver_names '' '[]' '' '' '' 1
+expect 'installer explicit override outranks auto-detection' \
+    '["app-v1-x86_64-unknown-linux-musl.tar.xz","app_linux_x86_64.tar.xz",false]' \
+    resolver_names '$APP-v$VERSION-$TARGET_TRIPLE' '[]' '' '${name}_${os}_${arch}' install.sh
+expect 'real installer pattern outranks derived alias' \
+    '["app_1_linux_x86_64.tar.xz","app-x86_64-unknown-linux-musl.tar.xz",false]' \
+    resolver_names '${name}_${version}_${os}_${arch}' '[]' '' '' install.sh
+cat > "$fixture/install.sh" <<'INSTALL'
+TAR="$UNKNOWN.tar.gz"
+INSTALL
+expect_absent 'installer with no resolvable pattern' artifact_naming_parse_install_script "$fixture/install.sh" app
+expect 'unsupported installer falls back to selected source' \
+    '["app_1_x86_64-unknown-linux-musl.tar.xz","app_x86_64-unknown-linux-musl.tar.xz",false]' \
+    resolver_names '' '["${name}_${version}_${target_triple}"]' '' '' install.sh
+reject 'explicit unsupported config fails rather than silently using discovery' \
+    resolver_names '$UNKNOWN' '["${name}-${version}-${target}"]' '' '' ''
+
 printf 'Artifact naming contract: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]
