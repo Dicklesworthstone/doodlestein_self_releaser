@@ -45,55 +45,127 @@ _build_state_sha256() {
   return 3
 }
 
-# Safely update a JSON file using jq
-# Usage: _build_state_jq_update <state_file> <jq_args...>
-# This function:
-#   1. Runs jq with the given arguments
-#   2. Validates the output is non-empty valid JSON
-#   3. Atomically replaces the original file
-#   4. Returns 1 on any failure (jq error, empty output, mv failure)
-_build_state_jq_update() {
-  local state_file="$1"
-  shift  # remaining args are jq filter and arguments
+# Lock an inherited descriptor, not a pathname that will be replaced. The
+# owning shell keeps the descriptor open for the entire transaction. Python's
+# standard-library flock is the macOS fallback when util-linux flock is absent.
+# These are local-filesystem locks; build state must not live on a filesystem
+# that does not implement flock. Never unlink a lock sidecar: that would create
+# a second lock domain while another process still holds the old inode.
+_build_state_wait_lock() {
+  local fd="$1" timeout="$2"
+  if command -v flock &>/dev/null; then
+    flock -x -w "$timeout" "$fd"
+  elif command -v python3 &>/dev/null; then
+    python3 - "$fd" "$timeout" <<'PY'
+import errno
+import fcntl
+import sys
+import time
 
-  local tmp_file="${state_file}.tmp.$$"
-
-  # Run jq into a private, exclusive temporary file. The original state is
-  # mode 0600; creating an update under the caller's ambient umask would make
-  # the replacement world-readable after mv.
-  if [[ -e "$tmp_file" || -L "$tmp_file" ]] || ! (
-      umask 077
-      set -o noclobber
-      jq "$@" "$state_file" > "$tmp_file" 2>/dev/null
-  ); then
-    log_error "Failed to update state: jq parse/filter error"
-    rm -f "$tmp_file"
+fd, timeout = int(sys.argv[1]), int(sys.argv[2])
+deadline = time.monotonic() + timeout
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+            raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            sys.exit(1)
+        time.sleep(min(0.05, remaining))
+PY
+  else
+    log_error "State updates require flock or Python 3 with fcntl"
     return 1
   fi
-
-  # Verify jq produced valid non-empty output
-  if [[ ! -s "$tmp_file" ]]; then
-    log_error "Failed to update state: jq produced empty output"
-    rm -f "$tmp_file"
-    return 1
-  fi
-
-  # Validate it's valid JSON
-  if ! jq -e '.' "$tmp_file" >/dev/null 2>&1; then
-    log_error "Failed to update state: jq produced invalid JSON"
-    rm -f "$tmp_file"
-    return 1
-  fi
-
-  # Atomic replace
-  if ! mv "$tmp_file" "$state_file"; then
-    log_error "Failed to update state: could not replace file"
-    rm -f "$tmp_file"
-    return 1
-  fi
-
-  return 0
 }
+
+_build_state_file_identity() {
+  stat -Lc '%d:%i' "$1" 2>/dev/null || stat -Lf '%d:%i' "$1" 2>/dev/null
+}
+
+# Serialized read/modify/write transaction. A rename alone prevents partial
+# JSON but does not prevent parallel writers from losing one another's updates.
+# Lock acquisition is bounded by DSR_STATE_LOCK_TIMEOUT (seconds, default 30).
+# Unique staging also prevents a failed writer from deleting another writer's
+# temporary file; Bash subshells share $$, so a PID-only name is not unique.
+# Returns 1 on any failure, preserving the previous checkpoint and caller traps.
+_build_state_jq_update() (
+  local state_file="$1"
+  shift
+  local lock_file="${state_file}.update.lock"
+  local timeout="${DSR_STATE_LOCK_TIMEOUT:-30}"
+  local workdir tmp_file before_file cleanup_command lock_identity
+
+  if [[ ! "$timeout" =~ ^[0-9]{1,4}$ ]] || ((10#$timeout > 3600)); then
+    log_error "Invalid DSR_STATE_LOCK_TIMEOUT (expected 0..3600 seconds)"
+    return 1
+  fi
+  timeout=$((10#$timeout))
+  [[ $# -gt 0 && -f "$state_file" && ! -L "$state_file" ]] || return 1
+  umask 077
+
+  # Exclusive creation is safe under concurrent first use. Opening an existing
+  # sidecar must neither truncate it nor follow a symlink.
+  if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+    (set -o noclobber; : > "$lock_file") 2>/dev/null || true
+  fi
+  [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
+  exec 9<> "$lock_file" || return 1
+  if ! _build_state_wait_lock 9 "$timeout"; then
+    log_error "Could not acquire state update lock within ${timeout}s: $state_file"
+    return 1
+  fi
+  lock_identity=$(_build_state_file_identity /dev/fd/9) || return 1
+  if [[ -L "$lock_file" || ! -f "$lock_file" ||
+        "$(_build_state_file_identity "$lock_file")" != "$lock_identity" ||
+        -L "$state_file" || ! -f "$state_file" ]]; then
+    log_error "State or lock identity changed while acquiring update lock"
+    return 1
+  fi
+
+  workdir=$(mktemp -d "${state_file}.update.XXXXXXXX") || return 1
+  tmp_file="$workdir/next.json"
+  before_file="$workdir/before.json"
+  printf -v cleanup_command 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' \
+    "$tmp_file" "$before_file" "$workdir"
+  trap "$cleanup_command" EXIT
+  trap 'exit 5' INT TERM
+
+  if ! cp -- "$state_file" "$before_file" ||
+     ! jq -es 'length == 1 and (.[0] | type == "object")' \
+       "$before_file" >/dev/null 2>&1; then
+    log_error "State checkpoint must contain exactly one JSON object"
+    return 1
+  fi
+  if ! jq "$@" "$before_file" > "$tmp_file" 2>/dev/null ||
+     ! jq -es 'length == 1 and (.[0] | type == "object")' \
+       "$tmp_file" >/dev/null 2>&1; then
+    log_error "State update must produce exactly one JSON object"
+    return 1
+  fi
+  if ! jq -ne --slurpfile before "$before_file" --slurpfile after "$tmp_file" '
+      all(["tool", "version", "run_id", "created_at"][];
+        . as $key | $before[0][$key] == $after[0][$key])
+    ' >/dev/null 2>&1; then
+    log_error "State update attempted to change immutable run identity"
+    return 1
+  fi
+
+  # Detect non-cooperating writers too. Cooperating writers cannot enter until
+  # this subshell closes descriptor 9; readers always see a complete document.
+  if [[ -L "$state_file" || ! -f "$state_file" || -L "$lock_file" ||
+        "$(_build_state_file_identity "$lock_file")" != "$lock_identity" ]] ||
+     ! cmp -s "$state_file" "$before_file"; then
+    log_error "State changed outside the checkpoint transaction"
+    return 1
+  fi
+  chmod 600 "$tmp_file" || return 1
+  mv -f -- "$tmp_file" "$state_file" || return 1
+  return 0
+)
 
 # Initialize build state system
 build_state_init() {
