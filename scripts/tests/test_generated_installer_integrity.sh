@@ -35,21 +35,31 @@ asset="demo-1.2.3-$os-$arch.tar.gz"
 tar -czf "$work/remote/$asset" -C "$work/payload" demo || exit 1
 hash=$(sha256sum < "$work/remote/$asset" | awk '{print $1}')
 export REMOTE="$work/remote" CALLS="$work/calls" ASSET="$asset"
-export CURL_FAIL=0 GH_FAIL=0 CHECKSUM_MODE=good
+export CURL_FAIL=0 GH_FAIL=0 LATEST_MODE=none GH_VIEW_TAG=''
+export LATEST_JSON='{"tag_name":"v1.2.3"}' LATEST_URL='https://github.com/example/demo/releases/tag/v1.2.3'
 cat > "$work/transports/curl" <<'TRANSPORT'
 #!/usr/bin/env bash
 set -uo pipefail
-url='' dest=''
+url='' dest='' effective=false
 while (($#)); do
     case "$1" in
         -o|--output) dest="$2"; shift 2 ;;
-        --proto|--proto-redir|--connect-timeout|--max-time|--retry) shift 2 ;;
+        --proto|--proto-redir|--connect-timeout|--max-time|--retry|--max-redirs) shift 2 ;;
+        -w) effective=true; shift 2 ;;
         https:*) url="$1"; shift ;;
         *) shift ;;
     esac
 done
 printf 'curl %s\n' "$url" >> "$CALLS"
 [[ "$CURL_FAIL" == 0 ]] || exit 22
+if [[ "$url" == https://api.github.com/* ]]; then
+    [[ "$LATEST_MODE" == api ]] || exit 22
+    printf '%s\n' "$LATEST_JSON"; exit 0
+fi
+if $effective; then
+    [[ "$LATEST_MODE" == redirect || "$LATEST_MODE" == api ]] || exit 22
+    printf '%s' "$LATEST_URL"; exit 0
+fi
 name="${url##*/}"
 [[ -f "$REMOTE/$name" ]] || exit 22
 cp "$REMOTE/$name" "$dest"
@@ -57,6 +67,11 @@ TRANSPORT
 cat > "$work/transports/gh" <<'TRANSPORT'
 #!/usr/bin/env bash
 set -uo pipefail
+if [[ "${1:-} ${2:-}" == 'release view' ]]; then
+    printf 'gh view\n' >> "$CALLS"
+    [[ "$GH_FAIL" == 0 && -n "$GH_VIEW_TAG" ]] || exit 1
+    printf '%s\n' "$GH_VIEW_TAG"; exit 0
+fi
 asset='' dest=''
 while (($#)); do
     case "$1" in
@@ -72,11 +87,12 @@ TRANSPORT
 chmod +x "$work/transports/curl" "$work/transports/gh"
 export PATH="$work/transports:$PATH"
 case_id=0 status=0 case_dir=''
+VERSION_ARGS=(--version v1.2.3)
 run_install() {
     case_id=$((case_id + 1)); case_dir="$work/case-$case_id"
     mkdir -p "$case_dir"
     status=0
-    bash "$installer" --version v1.2.3 --dir "$case_dir/bin" --cache-dir "$case_dir/cache" \
+    bash "$installer" "${VERSION_ARGS[@]}" --dir "$case_dir/bin" --cache-dir "$case_dir/cache" \
         --non-interactive --json --no-skills "$@" > "$case_dir/out" 2> "$case_dir/err" || status=$?
 }
 success() { [[ $status -eq 0 && -x "$case_dir/bin/demo" ]] && jq -es 'length == 1 and .[0].status == "success"' "$case_dir/out" >/dev/null; }
@@ -161,5 +177,160 @@ printf 'invalid signature\n' > "$REMOTE/$asset.minisig"
 run_install
 check 'configured signing key fails closed on verification failure' blocked
 check 'signature verifier was reached after checksum success' grep -q '^minisign$' "$CALLS"
+
+# Continue with an unsigned fixture; checksums remain mandatory.
+cat > "$DSR_CONFIG_DIR/repos.d/demo.yaml" <<'CONFIG'
+tool_name: demo
+repo: example/demo
+binary_name: demo
+artifact_naming: ${name}-${version}-${os}-${arch}
+CONFIG
+installer=$(install_gen_create demo 2>> "$work/generate.log") || exit 1
+VERSION_ARGS=()
+LATEST_MODE=api
+run_install
+check 'latest release can be resolved from valid API metadata' success
+LATEST_MODE=redirect
+run_install
+check 'API throttling recovers through the public release redirect' success
+for redirect in https://github.com/other/demo/releases/tag/v1.2.3 \
+    https://example.org/example/demo/releases/tag/v1.2.3 \
+    https://github.com/example/demo/releases/latest \
+    https://github.com/example/demo/releases/tag/../bad; do
+    LATEST_URL="$redirect"
+    run_install
+    check "untrusted latest redirect rejected: $redirect" blocked
+done
+LATEST_MODE=api
+LATEST_JSON='{"tag_name":null}'
+run_install
+check 'invalid API result is not accepted as a version' blocked
+GH_VIEW_TAG=v1.2.3 CURL_FAIL=1
+run_install --prefer-gh
+check 'private latest release discovery works through gh' success
+GH_VIEW_TAG='' CURL_FAIL=0
+before=$(wc -l < "$CALLS")
+run_install --offline
+check 'offline latest requires an explicit version' test "$status" -eq 4
+check 'offline latest makes no network request' test "$(wc -l < "$CALLS")" -eq "$before"
+check 'preflight failure produces one error JSON object' jq -es 'length == 1 and .[0].status == "error"' "$case_dir/out"
+VERSION_ARGS=(--version v1.2.3)
+
+# Real upgrades, hardlinks, and write failures. Fail only the final install
+# operations, not fixture construction, transport copies, or cache staging.
+export REAL_CP REAL_CHMOD REAL_MV INSTALL_FAULT=''
+REAL_CP=$(command -v cp); REAL_CHMOD=$(command -v chmod); REAL_MV=$(command -v mv)
+cat > "$work/transports/cp" <<'FAULT'
+#!/usr/bin/env bash
+last="${!#}"
+if [[ "$last" == *'/.demo.install.'*'/payload' && "$INSTALL_FAULT" == copy ]]; then
+    printf partial > "$last"; exit 1
+fi
+exec "$REAL_CP" "$@"
+FAULT
+cat > "$work/transports/chmod" <<'FAULT'
+#!/usr/bin/env bash
+last="${!#}"
+[[ "$last" != *'/.demo.install.'*'/payload' || "$INSTALL_FAULT" != chmod ]] || exit 1
+exec "$REAL_CHMOD" "$@"
+FAULT
+cat > "$work/transports/mv" <<'FAULT'
+#!/usr/bin/env bash
+if [[ "$INSTALL_FAULT" == rename ]]; then
+    for arg in "$@"; do [[ "$arg" != *'/.demo.install.'*'/payload' ]] || exit 1; done
+fi
+exec "$REAL_MV" "$@"
+FAULT
+chmod +x "$work/transports/cp" "$work/transports/chmod" "$work/transports/mv"
+mkdir -p "$work/upgrade"
+printf 'original binary\n' > "$work/old"
+for fault in copy chmod rename; do
+    cp "$work/old" "$work/upgrade/demo"
+    INSTALL_FAULT="$fault"
+    run_install --dir "$work/upgrade" --yes
+    check "failed $fault returns failure" test "$status" -ne 0
+    check "failed $fault preserves existing binary" cmp -s "$work/old" "$work/upgrade/demo"
+    check "failed $fault emits error JSON" jq -es 'length == 1 and .[0].status == "error"' "$case_dir/out"
+done
+INSTALL_FAULT=''
+run_install --dir "$work/upgrade" --yes
+check 'successful atomic replacement returns success' test "$status" -eq 0
+check 'successful replacement installs exact verified payload' cmp -s "$work/case-1/bin/demo" "$work/upgrade/demo"
+mkdir -p "$work/hardlinked"
+cp "$work/old" "$work/outside"
+ln "$work/outside" "$work/hardlinked/demo"
+run_install --dir "$work/hardlinked" --yes
+check 'upgrade can replace a hardlinked destination' test "$status" -eq 0
+check 'hardlink peer is not truncated or modified' cmp -s "$work/old" "$work/outside"
+mkdir -p "$work/linked"
+ln -s "$work/outside" "$work/linked/demo"
+run_install --dir "$work/linked" --yes
+check 'symlink install destination is refused' test "$status" -ne 0
+check 'symlink target remains unchanged' cmp -s "$work/old" "$work/outside"
+
+# Generate archived payloads with unsafe paths/types and duplicate binaries.
+# Every archive has a correct checksum: integrity alone is not shape validation.
+if command -v python3 >/dev/null; then
+    python3 - "$work" <<'ARCHIVES'
+import io, pathlib, sys, tarfile, zipfile
+w = pathlib.Path(sys.argv[1]); payload = b'#!/bin/sh\necho demo\n'
+cases = {
+    'traversal': [('../escape', 'file')],
+    'absolute': [(str(w / 'escaped'), 'file')],
+    'symlink': [('demo', 'symlink')],
+    'hardlink': [('demo', 'hardlink')],
+    'fifo': [('demo', 'fifo')],
+    'duplicate': [('demo', 'file'), ('demo', 'file')],
+    'ambiguous': [('a/demo', 'file'), ('b/demo', 'file')],
+    'normal-nested': [('./bin/demo', 'file')],
+}
+for name, entries in cases.items():
+    with tarfile.open(w / (name + '.tar.gz'), 'w:gz') as tf:
+        for path, kind in entries:
+            info = tarfile.TarInfo(path); info.mode = 0o755
+            if kind == 'file':
+                info.size = len(payload); tf.addfile(info, io.BytesIO(payload))
+            else:
+                info.type = {'symlink': tarfile.SYMTYPE, 'hardlink': tarfile.LNKTYPE, 'fifo': tarfile.FIFOTYPE}[kind]
+                info.linkname = str(w / 'outside'); tf.addfile(info)
+with zipfile.ZipFile(w / 'normal.zip', 'w') as zf:
+    zf.writestr('bin/demo', payload)
+for fmt, mode in [('tar', 'w'), ('tar.xz', 'w:xz')]:
+    with tarfile.open(w / ('normal.' + fmt), mode) as tf:
+        info = tarfile.TarInfo('bin/demo'); info.size = len(payload); info.mode = 0o755
+        tf.addfile(info, io.BytesIO(payload))
+ARCHIVES
+    cp "$REMOTE/$asset" "$work/release.saved"
+    for shape in traversal absolute symlink hardlink fifo duplicate ambiguous; do
+        cp "$work/$shape.tar.gz" "$REMOTE/$asset"
+        bad_hash=$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')
+        set_manifest "$bad_hash  $asset"
+        run_install
+        check "checksum-valid $shape archive is rejected" blocked
+    done
+    check 'unsafe archive extraction did not escape its root' test ! -e "$work/escaped"
+    cp "$work/normal-nested.tar.gz" "$REMOTE/$asset"
+    set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"
+    run_install
+    check 'ordinary dot-prefixed nested archive remains supported' success
+    # Exercise raw payload and zip configuration through the generated main.
+    # No copied installer logic; source its harmless --help entry point first.
+    for format in none exe zip tar tar.xz; do
+        source_file="$work/case-1/bin/demo"
+        case "$format" in zip|tar|tar.xz) source_file="$work/normal.$format" ;; esac
+        remote_name="demo-1.2.3-$os-$arch"
+        [[ "$format" == none ]] || remote_name+=".$format"
+        digest=$(sha256sum < "$source_file" | awk '{print $1}')
+        printf '%s  %s\n' "$digest" "$remote_name" > "$source_file.sha256"
+        status=0
+        bash -c 'source "$1" --help >/dev/null 2>&1; ARCHIVE_FORMAT_LINUX="$2"; ARCHIVE_FORMAT_DARWIN="$2";
+            main --version v1.2.3 --offline "$3" --dir "$4" --no-skills --non-interactive' \
+            bash "$installer" "$format" "$source_file" "$work/format-$format" > "$work/$format.out" 2> "$work/$format.err" || status=$?
+        check "generated installer supports $format payload" test "$status" -eq 0
+        check "$format payload is installed executable" test -x "$work/format-$format/demo"
+    done
+else
+    echo 'SKIP: python3 unavailable for adversarial archive construction'
+fi
 printf 'Generated installer integrity: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]

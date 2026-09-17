@@ -104,6 +104,7 @@ MINISIGN_PUBKEY="__MINISIGN_PUBKEY__"
 _VERSION=""
 _INSTALL_DIR="${HOME}/.local/bin"
 _JSON_MODE=false
+_JSON_EMITTED=false
 _VERIFY=true
 _REQUIRE_SIGNATURES=false
 _NON_INTERACTIVE=false
@@ -149,6 +150,7 @@ _json_result() {
     local path="${4:-}"
 
     if $_JSON_MODE; then
+        _JSON_EMITTED=true
         if command -v jq &>/dev/null; then
             jq -nc \
                 --arg tool "$TOOL_NAME" \
@@ -262,9 +264,10 @@ _cache_put() (
 
     mkdir -p "$cache_dir" || return 1
     [[ ! -L "$cache_dir" ]] || return 1
-    local stage suffix
+    local stage suffix cleanup
     stage=$(mktemp -d "$cache_dir/.verified.XXXXXXXX") || return 1
-    trap 'rm -rf -- "$stage"' EXIT
+    printf -v cleanup 'rm -rf -- %q' "$stage"
+    trap "$cleanup" EXIT
     for suffix in '' .sha256 .minisig; do
         if [[ "$suffix" == .minisig && ! -f "$src_file$suffix" ]]; then
             continue
@@ -340,6 +343,7 @@ _apply_artifact_pattern() {
     local arch="$3"
     local version_num="$4"
     local format="$5"
+    [[ "$format" != none ]] || format=""
 
     local name="$pattern"
     local arch_alias
@@ -359,6 +363,10 @@ _apply_artifact_pattern() {
     name="${name//\$\{TARGET_TRIPLE\}/$target_triple}"
 
     if [[ "$pattern" == *'${ext}'* || "$pattern" == *'${EXT}'* ]]; then
+        if [[ -z "$format" ]]; then
+            name="${name//\.\$\{ext\}/}"
+            name="${name//\.\$\{EXT\}/}"
+        fi
         name="${name//\$\{ext\}/$format}"
         name="${name//\$\{EXT\}/$format}"
         echo "$name"
@@ -370,7 +378,7 @@ _apply_artifact_pattern() {
         return 0
     fi
 
-    echo "${name}.${format}"
+    if [[ -n "$format" ]]; then echo "${name}.${format}"; else echo "$name"; fi
 }
 
 # ============================================================================
@@ -385,7 +393,7 @@ _fetch_release_asset() {
     [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" 2>/dev/null &&
+        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
             return 0
         fi
@@ -396,7 +404,7 @@ _fetch_release_asset() {
         return 0
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" 2>/dev/null &&
+        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
             return 0
         fi
@@ -404,45 +412,56 @@ _fetch_release_asset() {
     return 1
 }
 
-# Get latest version from GitHub
-_get_latest_version() {
-    local api_url="https://api.github.com/repos/$REPO/releases/latest"
-    local response
-
-    if ! command -v curl &>/dev/null; then
-        _log_error "curl is required but not installed"
-        return 3
-    fi
-
-    response=$(curl -sSfL "$api_url" 2>/dev/null) || {
-        _log_error "Failed to fetch latest version from GitHub"
-        return 1
-    }
-
-    # Extract tag_name from JSON (works with jq or POSIX tools)
-    if command -v jq &>/dev/null; then
-        echo "$response" | jq -r '.tag_name'
-    else
-        # Avoid non-portable grep -P (not available on macOS/BSD)
-        echo "$response" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
-    fi
+# A tag becomes one URL and cache-path component; never accept API null,
+# multiple results, redirects to other repositories, or path/query syntax.
+_valid_release_version() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$1" != null ]]
 }
 
-# Construct download URL
-_get_download_url() {
-    local version="$1"
-    local platform="$2"
-    local format="$3"
-
-    local os="${platform%/*}"
-    local arch="${platform#*/}"
-    local version_num="${version#v}"
-
-    # Apply artifact naming pattern
-    local final_name
-    final_name=$(_apply_artifact_pattern "$ARTIFACT_NAMING" "$os" "$arch" "$version_num" "$format")
-
-    echo "https://github.com/$REPO/releases/download/$version/${final_name}"
+# Use authenticated discovery for private repos and an API-independent public
+# redirect when the releases API is throttled. Never guess a tag from a date.
+_get_latest_version() {
+    local api_url="https://api.github.com/repos/$REPO/releases/latest"
+    local response version="" effective prefix="https://github.com/$REPO/releases/tag/"
+    $_OFFLINE_MODE && return 4
+    if $_PREFER_GH && command -v gh &>/dev/null; then
+        if version=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
+           _valid_release_version "$version"; then
+            printf '%s\n' "$version"; return 0
+        fi
+    fi
+    if command -v curl &>/dev/null; then
+        if response=$(curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 10 \
+            --max-time 30 "$api_url" 2>/dev/null); then
+            if command -v jq &>/dev/null; then
+                version=$(jq -er -s 'if length == 1 and (.[0].tag_name | type == "string")
+                    then .[0].tag_name else error("invalid release") end' <<< "$response" 2>/dev/null) || version=""
+                if _valid_release_version "$version"; then
+                    printf '%s\n' "$version"; return 0
+                fi
+            fi
+        fi
+        # HEAD follows only HTTPS redirects. Pin the final owner/repo and tag
+        # route rather than accepting a login page, another repo, or /latest.
+        if effective=$(curl -sSfIL --proto '=https' --proto-redir '=https' --max-redirs 5 \
+            --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' \
+            "https://github.com/$REPO/releases/latest" 2>/dev/null) && [[ "$effective" == "$prefix"* ]]; then
+            version="${effective#"$prefix"}"
+            version="${version//%2B/+}"; version="${version//%2b/+}"
+            if _valid_release_version "$version"; then
+                _log_info "Resolved latest release without the GitHub API: $version"
+                printf '%s\n' "$version"; return 0
+            fi
+        fi
+    fi
+    if ! $_PREFER_GH && command -v gh &>/dev/null; then
+        if version=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
+           _valid_release_version "$version"; then
+            printf '%s\n' "$version"; return 0
+        fi
+    fi
+    _log_error "Cannot resolve latest release; use --version with an existing release tag"
+    return 1
 }
 
 # Accept exactly one SHA256 record for the RELEASE name, not the staging name.
@@ -564,7 +583,9 @@ _verify_minisign() {
 
     # Verify
     _log_info "Verifying signature..."
-    if minisign -Vm "$file" -p "$pubkey_file" -x "$sig_file" >/dev/null 2>&1; then
+    local key_args=(-p "$pubkey_file")
+    [[ "$MINISIGN_PUBKEY" == *$'\n'* ]] || key_args=(-P "$MINISIGN_PUBKEY")
+    if minisign -Vm "$file" "${key_args[@]}" -x "$sig_file" >/dev/null 2>&1; then
         _log_ok "Signature verified"
         return 0
     else
@@ -574,48 +595,95 @@ _verify_minisign() {
     fi
 }
 
-# Extract archive
+# Validate both paths and entry types before extracting any bytes. The private
+# extraction directory is new, so no pre-existing links can redirect writes.
 _extract_archive() {
     local archive="$1"
     local dest_dir="$2"
-    local format="${archive##*.}"
-
-    mkdir -p "$dest_dir"
-
-    case "$archive" in
-        *.tar.gz|*.tgz)
-            tar -xzf "$archive" -C "$dest_dir"
-            ;;
-        *.tar.xz)
-            tar -xJf "$archive" -C "$dest_dir"
-            ;;
-        *.tar)
-            tar -xf "$archive" -C "$dest_dir"
-            ;;
-        *.zip)
-            if command -v unzip &>/dev/null; then
-                unzip -q "$archive" -d "$dest_dir"
-            else
-                _log_error "unzip required to extract .zip files"
-                return 1
-            fi
-            ;;
-        *)
-            _log_error "Unknown archive format: $archive"
-            return 1
-            ;;
+    local format="$3" members listing member line count=0 types=0 untyped=false
+    [[ -f "$archive" && ! -L "$archive" && -s "$archive" && ! -e "$dest_dir" && ! -L "$dest_dir" ]] || return 1
+    local tar_args=()
+    case "$format" in
+        none|exe)
+            mkdir -- "$dest_dir" || return 1
+            cp -- "$archive" "$dest_dir/$BINARY_NAME" || return 1
+            return 0 ;;
+        tar.gz|tgz) tar_args=(-z) ;;
+        tar.xz) tar_args=(-J) ;;
+        tar) ;;
+        zip) command -v unzip &>/dev/null || return 3 ;;
+        *) return 4 ;;
     esac
+    if [[ "$format" == zip ]]; then
+        members=$(unzip -Z1 "$archive" 2>/dev/null) || return 1
+        listing=$(LC_ALL=C unzip -Z -l "$archive" 2>/dev/null) || return 1
+    else
+        members=$(tar "${tar_args[@]}" -tf "$archive" 2>/dev/null) || return 1
+        listing=$(LC_ALL=C tar "${tar_args[@]}" -tvf "$archive" 2>/dev/null) || return 1
+    fi
+    [[ -n "$members" ]] || return 1
+    local -A seen=()
+    while IFS= read -r member; do
+        count=$((count + 1))
+        [[ "$member" != /* && "$member" != *[[:cntrl:]]* && "$member" != *\\* && "$member" != *:* ]] || return 1
+        while [[ "$member" == ./* ]]; do member="${member#./}"; done
+        member="${member%/}"
+        [[ -n "$member" && "$member" != . ]] || continue
+        [[ "$member" != -* ]] || return 1
+        case "/$member/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+        [[ -z "${seen[$member]:-}" ]] || { _log_error "Duplicate archive member: $member"; return 1; }
+        seen["$member"]=1
+    done <<< "$members"
+    while IFS= read -r line; do
+        if [[ "$format" == zip ]]; then
+            case "$line" in 'Archive: '*|'Zip file size: '*) continue ;; esac
+            [[ "$line" =~ ^[0-9]+[[:space:]]files?, ]] && continue
+        fi
+        case "${line:0:1}" in
+            -|d) types=$((types + 1)) ;;
+            '?')
+                [[ "$format" == zip ]] || return 1
+                untyped=true; types=$((types + 1)) ;;
+            *) _log_error "Archive contains a link, special file, or unrecognized entry"; return 1 ;;
+        esac
+    done <<< "$listing"
+    [[ "$count" -eq "$types" ]] || return 1
+    if $untyped; then
+        # ZIP writers may record permissions but omit S_IFREG (Python's
+        # writestr does this). Accept zero type bits, not arbitrary unknown
+        # types, and require an attribute record for every entry.
+        local attributes=0 mode
+        listing=$(LC_ALL=C unzip -Z -v "$archive" 2>/dev/null) || return 1
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]+Unix\ file\ attributes\ \(([0-7]{6})\ octal\) ]]; then
+                mode=$((8#${BASH_REMATCH[1]} & 0170000))
+                ((mode == 0 || mode == 0100000 || mode == 0040000)) || return 1
+                attributes=$((attributes + 1))
+            fi
+        done <<< "$listing"
+        [[ "$attributes" -eq "$count" ]] || return 1
+    fi
+    mkdir -- "$dest_dir" || return 1
+    if [[ "$format" == zip ]]; then
+        unzip -q "$archive" -d "$dest_dir" || return 1
+    else
+        tar "${tar_args[@]}" --no-same-owner --no-same-permissions -xf "$archive" -C "$dest_dir" || return 1
+    fi
 }
 
-# Install binary
-_install_binary() {
+# Stage in the destination filesystem, compare bytes, set final permissions,
+# then rename. A failed copy/chmod/rename must leave an existing binary intact.
+_install_binary() (
     local src_binary="$1"
     local dest_dir="$2"
 
     local dest_binary="$dest_dir/$BINARY_NAME"
 
-    # Create install directory
-    mkdir -p "$dest_dir"
+    [[ -f "$src_binary" && ! -L "$src_binary" && -s "$src_binary" && ! -L "$dest_dir" ]] || return 1
+    mkdir -p -- "$dest_dir" || return 1
+    [[ ! -L "$dest_binary" && ( ! -e "$dest_binary" || -f "$dest_binary" ) ]] || {
+        _log_error "Refusing a linked or non-regular install destination: $dest_binary"; return 1;
+    }
 
     # Check if binary already exists
     if [[ -f "$dest_binary" ]]; then
@@ -627,7 +695,7 @@ _install_binary() {
             fi
 
             _log_warn "Binary already exists: $dest_binary"
-            read -rp "Overwrite? [y/N] " response
+            read -rp "Overwrite? [y/N] " response || return 1
             if [[ ! "$response" =~ ^[yY] ]]; then
                 _log_info "Installation cancelled"
                 return 1
@@ -635,9 +703,20 @@ _install_binary() {
         fi
     fi
 
-    # Install
-    cp "$src_binary" "$dest_binary"
-    chmod +x "$dest_binary"
+    local stage cleanup expected actual
+    expected=$(_file_sha256 "$src_binary") || return $?
+    stage=$(mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || return 1
+    printf -v cleanup 'rm -rf -- %q' "$stage"
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    cp -- "$src_binary" "$stage/payload" || return 1
+    chmod 755 "$stage/payload" || return 1
+    actual=$(_file_sha256 "$stage/payload") || return $?
+    [[ "$actual" == "$expected" ]] || return 1
+    [[ ! -L "$dest_binary" && ( ! -e "$dest_binary" || -f "$dest_binary" ) ]] || return 1
+    mv -f -- "$stage/payload" "$dest_binary" || return 1
+    [[ -f "$dest_binary" && ! -L "$dest_binary" && -x "$dest_binary" ]] || return 1
+    [[ "$(_file_sha256 "$dest_binary")" == "$expected" ]] || return 1
 
     _log_ok "Installed to: $dest_binary"
 
@@ -649,7 +728,7 @@ _install_binary() {
     fi
 
     return 0
-}
+)
 
 # ============================================================================
 # SKILL INSTALLATION
@@ -895,6 +974,12 @@ main() {
     platform=$(_detect_platform) || return $?
     _log_info "Platform: $platform"
 
+    if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
+          ! "$TOOL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
+          ! "$BINARY_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+        _log_error "Invalid installer identity"
+        return 4
+    fi
     # Get version
     if [[ -z "$_VERSION" ]]; then
         if $_OFFLINE_MODE; then
@@ -905,11 +990,8 @@ main() {
         _VERSION=$(_get_latest_version) || return $?
     fi
     # These values become URL/path components, never shell or glob patterns.
-    if [[ ! "$_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ || "$_VERSION" == null ||
-          ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
-          ! "$TOOL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
-          ! "$BINARY_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
-        _log_error "Invalid release version or installer identity"
+    if ! _valid_release_version "$_VERSION"; then
+        _log_error "Invalid release version"
         return 4
     fi
     _log_info "Version: $_VERSION"
@@ -963,26 +1045,21 @@ main() {
 
     _verify_checksum "$archive_file" "$asset_name" || return $?
     _verify_minisign "$archive_file" "$asset_name" || return $?
+    # Extract
+    _log_info "Extracting..."
+    _extract_archive "$archive_file" "$extract_dir" "$format" || return $?
+
+    # Find binary
+    local binary_path candidates
+    candidates=$(find "$extract_dir" -type f \( -name "$BINARY_NAME" -o -name "${BINARY_NAME}.exe" \) -print) || return 1
+    if [[ -z "$candidates" || "$candidates" == *$'\n'* ]]; then
+        _log_error "Archive must contain exactly one matching binary"
+        return 1
+    fi
+    binary_path="$candidates"
     if ! $_OFFLINE_MODE; then
         _cache_put "$archive_file" "$_VERSION" "$platform" "$format" || \
             _log_warn "Could not cache verified archive"
-    fi
-
-    # Extract
-    _log_info "Extracting..."
-    _extract_archive "$archive_file" "$extract_dir" || return $?
-
-    # Find binary
-    local binary_path
-    binary_path=$(find "$extract_dir" -name "$BINARY_NAME" -type f | head -1)
-    if [[ -z "$binary_path" ]]; then
-        # Try with .exe for Windows
-        binary_path=$(find "$extract_dir" -name "${BINARY_NAME}.exe" -type f | head -1)
-    fi
-
-    if [[ -z "$binary_path" ]]; then
-        _log_error "Binary not found in archive"
-        return 1
     fi
 
     # Install
@@ -994,8 +1071,12 @@ main() {
     # Verify installation
     local installed_path="$_INSTALL_DIR/$BINARY_NAME"
     if [[ -f "$installed_path" ]]; then
-        local installed_version
-        installed_version=$("$installed_path" --version 2>/dev/null | head -1 || echo "unknown")
+        local installed_version="unknown" timeout_cmd=""
+        if command -v timeout &>/dev/null; then timeout_cmd=timeout
+        elif command -v gtimeout &>/dev/null; then timeout_cmd=gtimeout; fi
+        if [[ -n "$timeout_cmd" ]]; then
+            installed_version=$("$timeout_cmd" 10 "$installed_path" --version 2>/dev/null | head -1) || installed_version="unknown"
+        fi
         _log_ok "Installation complete!"
         _log_info "Version: $installed_version"
 
@@ -1008,8 +1089,17 @@ main() {
     fi
 }
 
-# Run main
-main "$@"
+# Emit one machine-readable result on every failure, including preflight.
+for arg in "$@"; do [[ "$arg" != --json ]] || _JSON_MODE=true; done
+if main "$@"; then
+    :
+else
+    status=$?
+    if ! $_JSON_EMITTED; then
+        _json_result "error" "Installation failed (exit $status)" "$_VERSION" ""
+    fi
+    exit "$status"
+fi
 TEMPLATE_START
 }
 
