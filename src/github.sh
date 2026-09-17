@@ -859,144 +859,233 @@ gh_create_release() {
     gh_api "repos/$repo/releases" --post "$data"
 }
 
-# Upload release asset
-# Usage: gh_upload_asset <upload_url> <file_path> [--content-type <type>]
+# Upload under the local filename. Named and unnamed uploads share the same
+# content-verified retry path; stdout contains exactly one GitHub asset object.
+# Usage: gh_upload_asset <upload_url> <file_path> [content_type]
 gh_upload_asset() {
-    local upload_url="$1"
-    local file_path="$2"
+    local upload_url="${1:-}"
+    local file_path="${2:-}"
     local content_type="${3:-application/octet-stream}"
-
-    if [[ -z "$upload_url" ]] || [[ -z "$file_path" ]]; then
-        _gh_log_error "Usage: gh_upload_asset <upload_url> <file_path>"
-        return 4
-    fi
-
-    if [[ ! -f "$file_path" ]]; then
-        _gh_log_error "File not found: $file_path"
-        return 4
-    fi
-
-    local filename
-    filename=$(basename "$file_path")
-
-    # Validate filename contains only safe characters for URL
-    # Release assets should only have alphanumeric, dash, underscore, dot, plus
-    if [[ ! "$filename" =~ ^[a-zA-Z0-9._+-]+$ ]]; then
-        _gh_log_error "Invalid filename for upload: $filename (contains unsafe characters)"
-        return 4
-    fi
-
-    # Remove template part from upload_url
-    upload_url="${upload_url%\{*}"
-    local encoded_filename="${filename//+/%2B}"
-    upload_url+="?name=$encoded_filename"
-
-    local token=""
-    if command -v secrets_get_gh_token &>/dev/null; then
-        token=$(secrets_get_gh_token 2>/dev/null || true)
-    fi
-    if [[ -z "$token" ]] && gh_check 2>/dev/null; then
-        token=$(gh auth token 2>/dev/null || true)
-    fi
-    [[ -z "$token" ]] && token="${GITHUB_TOKEN:-}"
-
-    if [[ -z "$token" ]]; then
-        _gh_log_error "No GitHub token available for asset upload"
-        _gh_log_error "Run: gh auth login  OR  export GITHUB_TOKEN=..."
-        return 3
-    fi
-
-    # Use -w to capture HTTP status, don't use -f so we can capture error response body
-    local http_code response
-    response=$(curl -sS \
-        -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer $token" \
-        -H "Content-Type: $content_type" \
-        --data-binary "@$file_path" \
-        -w "\n__HTTP_CODE__%{http_code}" \
-        "$upload_url" 2>&1)
-
-    http_code="${response##*__HTTP_CODE__}"
-    response="${response%__HTTP_CODE__*}"
-
-    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
-        echo "$response"
-        return 0
-    else
-        _gh_log_error "Upload failed with HTTP $http_code"
-        # Output response for debugging (may contain GitHub error message)
-        echo "$response" >&2
-        return 7
-    fi
+    gh_upload_asset_named "$upload_url" "$file_path" "${file_path##*/}" "$content_type"
 }
 
-# Upload release asset with a specific name
-# Usage: gh_upload_asset_named <upload_url> <file_path> <upload_name> [content_type]
-# This allows uploading the same file with a different name
-gh_upload_asset_named() {
-    local upload_url="$1"
-    local file_path="$2"
-    local upload_name="$3"
+# Hash file contents rather than hash-tool filename output (paths may contain
+# spaces or backslashes). Both Linux and macOS have a supported implementation.
+_gh_asset_sha256() {
+    local hash
+    if command -v sha256sum &>/dev/null; then
+        hash=$(sha256sum < "$1") || return 4
+    elif command -v shasum &>/dev/null; then
+        hash=$(shasum -a 256 < "$1") || return 4
+    else
+        _gh_log_error "sha256sum or shasum is required for verified asset uploads"
+        return 3
+    fi
+    hash="${hash%% *}"
+    [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || return 4
+    printf '%s\n' "$hash"
+}
+
+# Search the complete, uncached release inventory, not the truncated embedded
+# .assets array. Return 0 + one asset, 1 for absence, 7 for ambiguity, 8 for an
+# unavailable/incomplete inventory. Never interpret a failed GET as absence.
+_gh_find_release_asset() {
+    local repo="$1" release_id="$2" name="$3"
+    local page=1 response matches count found=""
+    while ((page <= 100)); do
+        if ! response=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache); then
+            _gh_log_error "Cannot read release asset inventory for $repo/$release_id"
+            return 8
+        fi
+        if ! jq -es 'length == 1 and (.[0] | type == "array" and length <= 100 and
+            all(.[]; type == "object" and (.name | type == "string") and
+                (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991)))' \
+            <<< "$response" >/dev/null 2>&1; then
+            _gh_log_error "Invalid release asset inventory for $repo/$release_id"
+            return 8
+        fi
+        matches=$(jq -c --arg name "$name" '[.[] | select(.name == $name)]' <<< "$response") || return 8
+        count=$(jq -r 'length' <<< "$matches") || return 8
+        if ((count > 1)) || { ((count == 1)) && [[ -n "$found" ]]; }; then
+            _gh_log_error "Ambiguous release asset name: $name"
+            return 7
+        fi
+        if ((count == 1)); then
+            found=$(jq -c '.[0]' <<< "$matches") || return 8
+        fi
+        count=$(jq -r 'length' <<< "$response") || return 8
+        if ((count < 100)); then
+            [[ -n "$found" ]] || return 1
+            printf '%s\n' "$found"
+            return 0
+        fi
+        page=$((page + 1))
+    done
+    _gh_log_error "Release inventory exceeded the 100-page safety limit"
+    return 8
+}
+
+# An HTTP success, matching name, or matching size alone is NOT upload proof.
+# Older GitHub assets can lack a digest: read their bytes by immutable asset ID
+# and hash those, rather than accepting name/size or following an untrusted URL.
+_gh_verify_uploaded_asset() {
+    local repo="$1" name="$2" size="$3" sha="$4" asset="$5" workdir="$6"
+    local asset_id digest downloaded_sha downloaded_size
+    if ! jq -es --arg name "$name" --argjson size "$size" '
+        length == 1 and (.[0] | type == "object" and
+        .name == $name and .state == "uploaded" and .size == $size and
+        (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991))
+    ' <<< "$asset" >/dev/null 2>&1; then
+        _gh_log_error "Asset receipt does not match the complete upload: $name"
+        return 7
+    fi
+    digest=$(jq -r 'if .digest == null then "" else .digest end' <<< "$asset") || return 7
+    if [[ -n "$digest" ]]; then
+        if [[ "$digest" != "sha256:$sha" ]]; then
+            _gh_log_error "Release asset SHA256 mismatch: $name (existing bytes left untouched)"
+            return 7
+        fi
+    else
+        asset_id=$(jq -r '.id' <<< "$asset") || return 7
+        if ! gh_download_release_asset "$repo" "$asset_id" "$workdir/verified"; then
+            _gh_log_error "Cannot verify digest-less release asset: $name"
+            return 8
+        fi
+        downloaded_sha=$(_gh_asset_sha256 "$workdir/verified") || return $?
+        downloaded_size=$(wc -c < "$workdir/verified") || return 4
+        downloaded_size="${downloaded_size//[[:space:]]/}"
+        if [[ "$downloaded_sha" != "$sha" || "$downloaded_size" != "$size" ]]; then
+            _gh_log_error "Downloaded release asset differs from upload source: $name"
+            return 7
+        fi
+    fi
+    jq -c '.' <<< "$asset"
+}
+
+# Upload a frozen file snapshot, or reuse an identical complete remote asset.
+# On an ambiguous POST failure, reconcile by name AND content before retrying.
+# No remote assets are deleted or replaced, including incomplete starter assets.
+# GH_MAX_RETRIES bounds POST attempts (1..10); GH_UPLOAD_TIMEOUT bounds each
+# POST in seconds (default 900). A subshell scopes cleanup/signal traps locally.
+gh_upload_asset_named() (
+    local upload_url="${1:-}" file_path="${2:-}" upload_name="${3:-}"
     local content_type="${4:-application/octet-stream}"
+    local max_attempts="${GH_MAX_RETRIES:-3}" retry_delay="${GH_RETRY_DELAY:-5}"
+    local timeout="${GH_UPLOAD_TIMEOUT:-900}"
+    local repo release_id token workdir sha snapshot_sha size asset response
+    local attempt=0 status http_code curl_status retryable
 
-    if [[ -z "$upload_url" ]] || [[ -z "$file_path" ]] || [[ -z "$upload_name" ]]; then
-        _gh_log_error "Usage: gh_upload_asset_named <upload_url> <file_path> <upload_name>"
+    # Accept only GitHub's documented upload endpoint and optional URI template.
+    # In particular, do not forward a token to arbitrary hosts or follow redirects.
+    upload_url="${upload_url%\{\?name,label\}}"
+    if [[ ! "$upload_url" =~ ^https://uploads\.github\.com/repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/([1-9][0-9]*)/assets$ ]]; then
+        _gh_log_error "Invalid GitHub release upload URL"
         return 4
     fi
-
-    if [[ ! -f "$file_path" ]]; then
-        _gh_log_error "File not found: $file_path"
+    repo="${BASH_REMATCH[1]}" release_id="${BASH_REMATCH[2]}"
+    if [[ ! "$upload_name" =~ ^[A-Za-z0-9._+-]+$ || "$upload_name" == "." || "$upload_name" == ".." ||
+          ! -f "$file_path" || -L "$file_path" || ! -s "$file_path" ||
+          "$content_type" == *$'\r'* || "$content_type" == *$'\n'* ]]; then
+        _gh_log_error "Upload requires a safe name and a nonempty regular file: $upload_name"
         return 4
     fi
-
-    # Validate filename contains only safe characters for URL
-    if [[ ! "$upload_name" =~ ^[a-zA-Z0-9._+-]+$ ]]; then
-        _gh_log_error "Invalid upload name: $upload_name (contains unsafe characters)"
+    if [[ ! "$max_attempts" =~ ^([1-9]|10)$ || ! "$retry_delay" =~ ^[0-9]{1,4}$ ||
+          ! "$timeout" =~ ^[1-9][0-9]{0,5}$ ]]; then
+        _gh_log_error "Invalid upload retry/timeout configuration"
         return 4
     fi
-
-    # Remove template part from upload_url
-    upload_url="${upload_url%\{*}"
-    local encoded_upload_name="${upload_name//+/%2B}"
-    upload_url+="?name=$encoded_upload_name"
-
-    local token=""
-    if command -v secrets_get_gh_token &>/dev/null; then
-        token=$(secrets_get_gh_token 2>/dev/null || true)
-    fi
-    if [[ -z "$token" ]] && gh_check 2>/dev/null; then
-        token=$(gh auth token 2>/dev/null || true)
-    fi
-    [[ -z "$token" ]] && token="${GITHUB_TOKEN:-}"
-
-    if [[ -z "$token" ]]; then
-        _gh_log_error "No GitHub token available for asset upload"
+    retry_delay=$((10#$retry_delay))
+    if ! command -v curl &>/dev/null || ! command -v jq &>/dev/null; then
+        _gh_log_error "curl and jq are required for verified asset uploads"
         return 3
     fi
-
-    local http_code response
-    response=$(curl -sS \
-        -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer $token" \
-        -H "Content-Type: $content_type" \
-        --data-binary "@$file_path" \
-        -w "\n__HTTP_CODE__%{http_code}" \
-        "$upload_url" 2>&1)
-
-    http_code="${response##*__HTTP_CODE__}"
-    response="${response%__HTTP_CODE__*}"
-
-    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
-        echo "$response"
-        return 0
-    else
-        _gh_log_error "Upload failed with HTTP $http_code for $upload_name"
-        echo "$response" >&2
-        return 7
+    token=$(_gh_resolve_token) || {
+        _gh_log_error "No GitHub token available for asset upload"
+        return 3
+    }
+    sha=$(_gh_asset_sha256 "$file_path") || return $?
+    umask 077
+    workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-asset-upload.XXXXXXXX") || return 4
+    trap 'rm -f -- "$workdir/payload" "$workdir/response" "$workdir/verified"; rmdir -- "$workdir" 2>/dev/null || true' EXIT
+    trap 'exit 5' INT TERM
+    cp -- "$file_path" "$workdir/payload" || return 4
+    snapshot_sha=$(_gh_asset_sha256 "$workdir/payload") || return $?
+    if [[ "$snapshot_sha" != "$sha" || -L "$file_path" ]] ||
+       [[ "$(_gh_asset_sha256 "$file_path")" != "$sha" ]]; then
+        _gh_log_error "Upload source changed while being staged: $upload_name"
+        return 4
     fi
-}
+    chmod 400 "$workdir/payload" || return 4
+    size=$(wc -c < "$workdir/payload") || return 4
+    size="${size//[[:space:]]/}"
+    upload_url+="?name=${upload_name//+/%2B}"
+
+    while ((attempt < max_attempts)); do
+        status=0
+        asset=$(_gh_find_release_asset "$repo" "$release_id" "$upload_name") || status=$?
+        if ((status == 0)); then
+            _gh_log_info "Verifying existing release asset: $upload_name"
+            _gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir"
+            return $?
+        elif ((status != 1)); then
+            return "$status"
+        fi
+
+        attempt=$((attempt + 1))
+        curl_status=0
+        : > "$workdir/response" || return 4
+        http_code=$(curl -sS --connect-timeout 15 --max-time "$timeout" \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $token" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: $content_type" \
+            --data-binary "@$workdir/payload" \
+            -o "$workdir/response" -w '%{http_code}' \
+            "$upload_url") || curl_status=$?
+        response=$(cat "$workdir/response" 2>/dev/null) || response=""
+        if ((curl_status == 0)) && [[ "$http_code" == "201" ]]; then
+            _gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$response" "$workdir"
+            return $?
+        fi
+
+        retryable=false
+        if ((curl_status != 0)) || [[ "$http_code" =~ ^(408|429|5[0-9][0-9])$ ]]; then
+            retryable=true
+        elif [[ "$http_code" == "403" ]] && _gh_is_rate_limited "$response"; then
+            retryable=true
+        elif [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+            _gh_log_error "GitHub rejected upload authorization for $upload_name"
+            return 3
+        elif [[ "$http_code" != "422" ]]; then
+            _gh_log_error "Upload failed for $upload_name (HTTP ${http_code:-unknown}, curl $curl_status)"
+            return 7
+        fi
+
+        # The server may have stored all bytes before the connection failed.
+        # A 422 can likewise mean another publisher won the name race. Only
+        # identical uploaded bytes count as recovery; a starter/conflict fails.
+        status=0
+        asset=$(_gh_find_release_asset "$repo" "$release_id" "$upload_name") || status=$?
+        if ((status == 0)); then
+            _gh_log_info "Reconciling upload response failure: $upload_name"
+            _gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir"
+            return $?
+        elif ((status != 1)); then
+            return "$status"
+        fi
+        if ! $retryable; then
+            _gh_log_error "GitHub rejected asset $upload_name without a matching remote upload"
+            return 7
+        fi
+        if ((attempt < max_attempts)); then
+            _gh_log_warn "Retrying asset upload $upload_name ($attempt/$max_attempts)"
+            sleep "$((retry_delay * attempt))"
+        fi
+    done
+    _gh_log_error "Asset upload exhausted $max_attempts attempt(s): $upload_name"
+    return 8
+)
 
 # Upload release asset with dual naming for install.sh compatibility (bd-1tv.3)
 # Usage: gh_upload_asset_dual <upload_url> <file_path> <tool> <version> <os> <arch> <ext> [repo_path]
@@ -1059,7 +1148,7 @@ gh_upload_asset_dual() {
 
     # Upload with versioned name
     _gh_log_info "Uploading: $versioned_name"
-    if gh_upload_asset_named "$upload_url" "$file_path" "$versioned_name" "$content_type" 2>/dev/null; then
+    if gh_upload_asset_named "$upload_url" "$file_path" "$versioned_name" "$content_type" >/dev/null; then
         versioned_result="uploaded"
         _gh_log_ok "  Uploaded: $versioned_name"
     else
@@ -1070,10 +1159,11 @@ gh_upload_asset_dual() {
     # Upload with compat name (if different)
     if [[ "$same_names" != "true" && "$versioned_result" == "uploaded" ]]; then
         _gh_log_info "Uploading compat name: $compat_name"
-        if gh_upload_asset_named "$upload_url" "$file_path" "$compat_name" "$content_type" 2>/dev/null; then
+        if gh_upload_asset_named "$upload_url" "$file_path" "$compat_name" "$content_type" >/dev/null; then
             compat_result="uploaded"
             _gh_log_ok "  Uploaded: $compat_name"
         else
+            compat_result="failed"
             compat_error="Upload failed for $compat_name"
             _gh_log_error "  $compat_error"
         fi
@@ -1220,7 +1310,7 @@ gh_repository_dispatch() {
     local payload_json="${3:-"{}"}"
 
     if [[ -z "$repo" || -z "$event_type" ]]; then
-        _gh_log_error "Usage: gh_repository_dispatch <owner/repo> <event_type> [payload_json]"
+        _gh_log_error "Usage: gh_repository_dispatch <owner/repo> <event_type>"
         return 4
     fi
 
@@ -1284,6 +1374,7 @@ export -f gh_init_cache gh_check gh_check_token _gh_resolve_token gh_api
 export -f gh_download_release_asset
 export -f gh_get_immutable_tag_ruleset_receipt
 export -f gh_workflow_runs gh_workflow_run gh_releases gh_latest_release
-export -f gh_create_release gh_upload_asset gh_compare gh_tags gh_repo
+export -f gh_create_release gh_upload_asset gh_upload_asset_named gh_upload_asset_dual
+export -f gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch
 export -f gh_clear_cache
