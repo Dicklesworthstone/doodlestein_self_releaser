@@ -93,54 +93,55 @@ _an_default_target_triple() {
 # Input: Pattern with various variable syntaxes
 # Output: Pattern with normalized ${name}, ${version}, ${os}, ${arch} variables
 #
-# NOTE: We use sed for all replacements because bash parameter expansion
-# interprets ${var} in the replacement string, causing corruption like
-# ${os-${arch}}-${arch}}}} instead of ${os}-${arch}
-#
-# shellcheck disable=SC2016 # We intentionally use single quotes to prevent expansion
+# Read whole variable tokens, not prefixes: $TARGET_TRIPLE is not $TARGET.
+# Unknown variables/expressions remain literal for the renderer to reject;
+# neither workflow expressions nor shell substitutions are ever evaluated.
 _an_normalize_pattern() {
     local pattern="$1"
-    local result="$pattern"
+    local rest="$pattern" result="" token key canonical
+    local workflow_re='^\$\{\{[[:space:]]*([^}]+)\}\}'
+    local braced_re='^\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}'
+    local bare_re='^\$([a-zA-Z_][a-zA-Z0-9_]*)'
 
     _an_log_debug "Normalizing pattern: $pattern"
-
-    # Use sed for all substitutions to avoid bash interpreting ${var} in replacements
-    # Normalize TARGET/PLATFORM -> combined forms (must come before OS/ARCH to avoid double replacement)
-    result=$(printf '%s' "$result" | sed 's/\${TARGET}/${target}/g; s/\$TARGET/${target}/g')
-    result=$(printf '%s' "$result" | sed 's/\${TARGET_TRIPLE}/${target_triple}/g; s/\$TARGET_TRIPLE/${target_triple}/g')
-    result=$(printf '%s' "$result" | sed 's/\${platform}/${os}_${arch}/g; s/\${PLATFORM}/${os}_${arch}/g; s/\$platform/${os}_${arch}/g; s/\$PLATFORM/${os}_${arch}/g')
-
-    # Normalize OS/GOOS variants
-    result=$(printf '%s' "$result" | sed 's/\${OS}/${os}/g; s/\${GOOS}/${os}/g; s/\$OS/${os}/g; s/\$GOOS/${os}/g')
-
-    # Normalize ARCH/GOARCH variants
-    result=$(printf '%s' "$result" | sed 's/\${ARCH}/${arch}/g; s/\${GOARCH}/${arch}/g; s/\$ARCH/${arch}/g; s/\$GOARCH/${arch}/g')
-
-    # Normalize NAME/TOOL/APP variants
-    result=$(printf '%s' "$result" | sed 's/\${NAME}/${name}/g; s/\${TOOL}/${name}/g; s/\${APP}/${name}/g')
-    result=$(printf '%s' "$result" | sed 's/\$NAME/${name}/g; s/\$TOOL/${name}/g; s/\$APP/${name}/g')
-
-    # Normalize VERSION
-    result=$(printf '%s' "$result" | sed 's/\${VERSION}/${version}/g; s/\$VERSION/${version}/g')
-
-    # Normalize EXT variable to ${ext} (preserve extension semantics)
-    # Handle .${EXT} pattern (with leading dot) to avoid double dots
-    result=$(printf '%s' "$result" | sed 's/\.\${EXT}/.${ext}/g; s/\.\$EXT/.${ext}/g')
-    # Handle ${EXT} without leading dot
-    result=$(printf '%s' "$result" | sed 's/\${EXT}/${ext}/g; s/\$EXT/${ext}/g')
-
-    # Handle GitHub Actions matrix syntax
-    # ${{ matrix.goos }} -> ${os}
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*matrix\.(goos|os)[[:space:]]*\}\}/${os}/g')
-    # ${{ matrix.goarch }} -> ${arch}
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*matrix\.(goarch|arch)[[:space:]]*\}\}/${arch}/g')
-    # ${{ matrix.target }} -> ${target_triple}
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*matrix\.target[[:space:]]*\}\}/${target_triple}/g')
-    # Strip version from pattern for compat comparison
-    result=$(printf '%s' "$result" | sed -E 's/\$\{\{[[:space:]]*(github\.ref_name|env\.VERSION)[[:space:]]*\}\}/${version}/g')
+    while [[ -n "$rest" ]]; do
+        canonical=""
+        if [[ "$rest" =~ $workflow_re ]]; then
+            token="${BASH_REMATCH[0]}" key="${BASH_REMATCH[1]}"
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            case "$key" in
+                matrix.os|matrix.goos) canonical='${os}' ;;
+                matrix.arch|matrix.goarch) canonical='${arch}' ;;
+                matrix.target|matrix.target_triple) canonical='${target_triple}' ;;
+                github.ref_name|env.VERSION) canonical='${version}' ;;
+            esac
+        elif [[ "$rest" =~ $braced_re || "$rest" =~ $bare_re ]]; then
+            token="${BASH_REMATCH[0]}" key="${BASH_REMATCH[1]}"
+            case "$key" in
+                name|NAME|tool|TOOL|app|APP) canonical='${name}' ;;
+                version|VERSION) canonical='${version}' ;;
+                os|OS|goos|GOOS) canonical='${os}' ;;
+                arch|ARCH|goarch|GOARCH) canonical='${arch}' ;;
+                target|TARGET) canonical='${target}' ;;
+                target_triple|TARGET_TRIPLE) canonical='${target_triple}' ;;
+                platform|PLATFORM) canonical='${os}_${arch}' ;;
+                ext|EXT) canonical='${ext}' ;;
+            esac
+        else
+            token="${rest:0:1}"
+        fi
+        result+="${canonical:-$token}"
+        rest="${rest:${#token}}"
+    done
 
     _an_log_debug "Normalized to: $result"
     printf '%s' "$result"
+}
+
+# Match the release uploader's filename contract before returning a plan.
+_an_safe_asset_name() {
+    [[ "$1" =~ ^[a-zA-Z0-9._+-]+$ && "$1" != "." && "$1" != ".." ]]
 }
 
 # Parse install.sh and extract expected artifact naming pattern
@@ -436,66 +437,46 @@ artifact_naming_parse_goreleaser() {
 # Output: JSON object with both names (stdout)
 # Exit: 0 on success
 artifact_naming_generate_dual() {
-    local tool="$1"
-    local version="$2"
-    local os="$3"
-    local arch="$4"
-    local ext="${5:-tar.gz}"
+    [[ $# -ge 4 ]] || return 4
+    local tool="$1" version="$2" os="$3" arch="$4"
+    local ext="${5-tar.gz}"
     local compat_pattern="${6:-}"  # Optional explicit compat pattern
     local versioned_pattern="${7:-}"  # Optional explicit versioned pattern
     local config_tool="${8:-$tool}"  # Config tool name for arch alias / target triple lookups
 
     _an_log_debug "Generating dual names: tool=$tool version=$version os=$os arch=$arch ext=$ext"
 
-    local ext_value="$ext"
-    [[ "$ext_value" == "none" ]] && ext_value=""
-
-    # Generate versioned name (config/workflow pattern or default)
-    local versioned=""
-    if [[ -n "$versioned_pattern" ]]; then
-        local rendered
-        rendered=$(artifact_naming_substitute "$versioned_pattern" "$tool" "$version" "$os" "$arch" "$ext_value" "$config_tool")
-        # If pattern did not include ${ext}, append extension if missing
-        if [[ "$versioned_pattern" == *'${ext}'* || "$versioned_pattern" == *'${EXT}'* ]]; then
-            versioned="$rendered"
-        else
-            versioned=$(_an_append_ext_if_missing "$rendered" "$ext_value")
-        fi
-    else
-        local version_stripped="${version#v}"
-        if [[ -n "$ext_value" ]]; then
-            versioned="${tool}-${version_stripped}-${os}-${arch}.${ext_value}"
-        else
-            versioned="${tool}-${version_stripped}-${os}-${arch}"
-        fi
+    if ! command -v jq &>/dev/null; then
+        _an_log_error "jq is required to generate an artifact naming plan"
+        return 3
     fi
+    local ext_value="$ext" versioned compat
+    [[ "$ext_value" == "none" ]] && ext_value=""
+    [[ -n "$versioned_pattern" ]] || versioned_pattern='${name}-${version}-${os}-${arch}'
+    [[ -n "$compat_pattern" ]] || compat_pattern='${name}-${os}-${arch}'
+    versioned_pattern=$(_an_normalize_pattern "$versioned_pattern") || return $?
+    compat_pattern=$(_an_normalize_pattern "$compat_pattern") || return $?
 
-    # Generate compat name
-    local compat
-    if [[ -n "$compat_pattern" ]]; then
-        # Use explicit pattern if provided
-        compat=$(artifact_naming_substitute "$compat_pattern" "$tool" "$version" "$os" "$arch" "$ext_value" "$config_tool")
-        if [[ "$compat_pattern" == *'${ext}'* || "$compat_pattern" == *'${EXT}'* ]]; then
-            : # Extension explicitly controlled by pattern
-        else
-            compat=$(_an_append_ext_if_missing "$compat" "$ext_value")
-        fi
-    else
-        # Default compat: no version
-        if [[ -n "$ext_value" ]]; then
-            compat="${tool}-${os}-${arch}.${ext_value}"
-        else
-            compat="${tool}-${os}-${arch}"
-        fi
+    versioned=$(artifact_naming_substitute "$versioned_pattern" "$tool" "$version" "$os" "$arch" "$ext_value" "$config_tool") || return $?
+    compat=$(artifact_naming_substitute "$compat_pattern" "$tool" "$version" "$os" "$arch" "$ext_value" "$config_tool") || return $?
+    # An explicit extension token owns the suffix, including an empty suffix
+    # for raw binaries. Never add an archive extension to that result.
+    if [[ "$versioned_pattern" != *'${ext}'* ]]; then
+        versioned=$(_an_append_ext_if_missing "$versioned" "$ext_value") || return $?
+    fi
+    if [[ "$compat_pattern" != *'${ext}'* ]]; then
+        compat=$(_an_append_ext_if_missing "$compat" "$ext_value") || return $?
+    fi
+    if ! _an_safe_asset_name "$versioned" || ! _an_safe_asset_name "$compat"; then
+        _an_log_error "Artifact patterns must produce safe, nonempty release filenames"
+        return 4
     fi
 
     _an_log_debug "Versioned: $versioned"
     _an_log_debug "Compat: $compat"
 
-    # Output JSON
-    printf '{"versioned":"%s","compat":"%s","same":%s}\n' \
-        "$versioned" "$compat" \
-        "$(if [[ "$versioned" == "$compat" ]]; then echo "true"; else echo "false"; fi)"
+    jq -cn --arg versioned "$versioned" --arg compat "$compat" \
+        '{versioned: $versioned, compat: $compat, same: ($versioned == $compat)}'
 }
 
 # Validate that all naming sources are consistent
@@ -746,16 +727,25 @@ artifact_naming_get_versioned_pattern() {
 # Args: pattern tool version os arch ext
 # Output: Substituted string (stdout)
 artifact_naming_substitute() {
+    [[ $# -ge 5 ]] || return 4
     local pattern="$1"
     local tool="$2"
     local version="$3"
     local os="$4"
     local arch="$5"
-    local ext="${6:-tar.gz}"
+    local ext="${6-tar.gz}"
     local config_tool="${7:-$tool}"  # Config tool name for arch alias / target triple lookups
 
-    local result="$pattern"
+    local result
     local version_stripped="${version#v}"
+    [[ "$ext" == "none" ]] && ext=""
+    if ! _an_safe_asset_name "$tool" || ! _an_safe_asset_name "$version_stripped" ||
+       ! _an_safe_asset_name "$os" || ! _an_safe_asset_name "$arch" ||
+       { [[ -n "$ext" ]] && ! _an_safe_asset_name "$ext"; }; then
+        _an_log_error "Invalid artifact naming input"
+        return 4
+    fi
+    result=$(_an_normalize_pattern "$pattern") || return $?
 
     # Ensure config helpers are available (for arch alias + target triple)
     if ! declare -F config_get_arch_alias &>/dev/null; then
@@ -777,6 +767,11 @@ artifact_naming_substitute() {
         target_triple=$(config_get_target_triple "$config_tool" "${os}/${arch}" 2>/dev/null || echo "")
     fi
     [[ -z "$target_triple" ]] && target_triple=$(_an_default_target_triple "$os" "$arch")
+
+    if ! _an_safe_asset_name "$arch_resolved" || ! _an_safe_asset_name "$target_triple"; then
+        _an_log_error "Invalid configured architecture alias or target triple"
+        return 4
+    fi
 
     local target="${os}-${arch_resolved}"
 
@@ -805,12 +800,18 @@ artifact_naming_substitute() {
     result="${result//\$\{TARGET_TRIPLE\}/$target_triple}"
 
     # Replace extension placeholders; handle ".${ext}" before bare "${ext}"
-    result="${result//\.\$\{ext\}/.${ext}}"
-    result="${result//\.\$\{EXT\}/.${ext}}"
+    local ext_suffix=""
+    [[ -z "$ext" ]] || ext_suffix=".$ext"
+    result="${result//\.\$\{ext\}/$ext_suffix}"
+    result="${result//\.\$\{EXT\}/$ext_suffix}"
     result="${result//\$\{ext\}/$ext}"
     result="${result//\$\{EXT\}/$ext}"
 
-    echo "$result"
+    if ! _an_safe_asset_name "$result"; then
+        _an_log_error "Unresolved or unsafe artifact naming pattern: $pattern"
+        return 4
+    fi
+    printf '%s\n' "$result"
 }
 
 # Get the compat pattern for a tool using precedence:
@@ -894,11 +895,12 @@ artifact_naming_get_compat_pattern() {
 # Output: JSON object with versioned and compat names
 # Exit: 0 on success
 artifact_naming_generate_dual_for_tool() {
+    [[ $# -ge 4 ]] || return 4
     local tool="$1"
     local version="$2"
     local os="$3"
     local arch="$4"
-    local ext="${5:-tar.gz}"
+    local ext="${5-tar.gz}"
     local repo_path="${6:-}"
 
     # Ensure config helpers are available
@@ -919,11 +921,11 @@ artifact_naming_generate_dual_for_tool() {
 
     # Get compat pattern using precedence logic
     local compat_pattern
-    compat_pattern=$(artifact_naming_get_compat_pattern "$tool" "$repo_path")
+    compat_pattern=$(artifact_naming_get_compat_pattern "$tool" "$repo_path") || return $?
 
     # Get versioned pattern using precedence logic
     local versioned_pattern
-    versioned_pattern=$(artifact_naming_get_versioned_pattern "$tool" "$repo_path")
+    versioned_pattern=$(artifact_naming_get_versioned_pattern "$tool" "$repo_path") || return $?
 
     # Generate dual names; pass config tool name ($tool) for config lookups
     artifact_naming_generate_dual "$naming_name" "$version" "$os" "$arch" "$ext" "$compat_pattern" "$versioned_pattern" "$tool"
