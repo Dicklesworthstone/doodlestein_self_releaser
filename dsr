@@ -5189,9 +5189,7 @@ cmd_release() {
                 shift
                 ;;
             --resume|-r)
-                # shellcheck disable=SC2034
                 resume=true
-                log_warn "--resume is not yet implemented; proceeding with fresh upload"
                 shift
                 ;;
             --verify-upgrade)
@@ -5409,6 +5407,64 @@ EOF
     _release_require_publishable_artifacts "$artifacts_dir" "$manifest_file" \
         "$release_contract_enabled" || return 4
 
+    # Saved upload names are not evidence that GitHub still serves these bytes.
+    # Freeze the ordinary manifest and verify every required local artifact
+    # before creating a release or replacing any generated checksum sidecars.
+    local ordinary_manifest='null'
+    local -A ordinary_expected_sha=()
+    local -a ordinary_files=()
+    if ! $release_contract_enabled && $manifest_exists; then
+        if [[ -L "$manifest_file" ]] || ! ordinary_manifest=$(jq -ces '
+            if length == 1 and (.[0] | type == "object") and
+               (.[0].artifacts | type == "array" and length > 0) and
+               all(.[0].artifacts[];
+                   type == "object" and
+                   ((.name // .filename) | type == "string" and
+                       test("^[A-Za-z0-9][A-Za-z0-9._+-]*$")) and
+                   (.sha256 | type == "string" and test("^[0-9a-f]{64}$")))
+            then .[0] else error("invalid release manifest") end
+        ' "$manifest_file" 2>/dev/null); then
+            log_error "Release requires one valid, nonempty artifact manifest"
+            return 4
+        fi
+        if ! jq -e --arg tool "$tool_name" --arg tag "$tag" '
+            (.tool == null or .tool == $tool) and
+            (.version == null or (.version | ltrimstr("v")) == ($tag | ltrimstr("v"))) and
+            (.status == null or .status == "success") and
+            (.summary.failed == null or .summary.failed == 0)
+        ' <<< "$ordinary_manifest" >/dev/null; then
+            log_error "Manifest does not describe a successful build of $tool_name $tag"
+            return 4
+        fi
+        local required_name required_sha actual_sha
+        while IFS=$'\t' read -r required_name required_sha; do
+            if [[ ! -s "$artifacts_dir/$required_name" || -L "$artifacts_dir/$required_name" ]] ||
+               ! actual_sha=$(_gh_asset_sha256 "$artifacts_dir/$required_name") ||
+               [[ "$actual_sha" != "$required_sha" ]]; then
+                log_error "Required artifact is missing or differs from the manifest: $required_name"
+                return 4
+            fi
+            ordinary_expected_sha["$required_name"]="$required_sha"
+        done < <(jq -r '.artifacts[] | [(.name // .filename), .sha256] | @tsv' <<< "$ordinary_manifest")
+        ordinary_expected_sha["${manifest_file##*/}"]=$(_gh_asset_sha256 "$manifest_file") || return 4
+    elif ! $release_contract_enabled; then
+        local ordinary_file ordinary_name
+        while IFS= read -r -d '' ordinary_file; do
+            ordinary_name="${ordinary_file##*/}"
+            if [[ ! "$ordinary_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
+                  ! -s "$ordinary_file" || -L "$ordinary_file" ]]; then
+                log_error "Invalid or empty release artifact: $ordinary_name"
+                return 4
+            fi
+            ordinary_expected_sha["$ordinary_name"]=$(_gh_asset_sha256 "$ordinary_file") || return 4
+            ordinary_files+=("$ordinary_file")
+        done < <(find "$artifacts_dir" -maxdepth 1 -type f -print0)
+        if [[ ${#ordinary_files[@]} -eq 0 ]]; then
+            log_error "No release artifacts were selected"
+            return 4
+        fi
+    fi
+
     # Freeze user-visible release metadata before the strict upload plan is
     # computed. The same object is required at creation and every remote check.
     local release_body="Release $version"
@@ -5503,7 +5559,7 @@ EOF
                     log_info "  Would upload: $name"
                     file_count=$((file_count + 1))
                 fi
-            done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
+            done < <(jq -r '.artifacts[] | .name // .filename' <<< "$ordinary_manifest")
         else
             while IFS= read -r file; do
                 log_info "  Would upload: $(basename "$file")"
@@ -5641,9 +5697,25 @@ EOF
         fi
     fi
 
-    # shellcheck disable=SC2086
-    release_json=$(gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args 2>&1)
-    local create_status=$?
+    local create_status=0
+    if $resume && ! $release_contract_enabled; then
+        # Authenticated collection reads include drafts. A failed lookup is
+        # unknown, not permission to create another release or trust a journal.
+        local resume_scan
+        if ! resume_scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") ||
+           ! release_json=$(jq -ces '
+               if length == 1 and .[0].count == 1 and
+                  (.[0].release | type == "object")
+               then .[0].release else error("release not found or ambiguous") end
+           ' <<< "$resume_scan" 2>/dev/null); then
+            log_error "Cannot resume without one observable release for $repo $tag"
+            return 7
+        fi
+        log_info "Resuming $tag by verifying remote asset contents"
+    else
+        # shellcheck disable=SC2086
+        release_json=$(gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args 2>&1) || create_status=$?
+    fi
 
     if [[ $create_status -ne 0 ]]; then
         if $release_contract_enabled; then
@@ -5679,7 +5751,7 @@ EOF
             fi
         else
             # Check if release already exists
-            release_json=$(gh_api "repos/$repo/releases/tags/$tag" 2>/dev/null)
+            release_json=$(gh_api "repos/$repo/releases/tags/$tag" --no-cache 2>/dev/null)
             if [[ -n "$release_json" ]] && echo "$release_json" | jq -e '.id' &>/dev/null; then
                 log_info "Release $tag already exists, using existing release"
             else
@@ -5695,6 +5767,27 @@ EOF
     release_id=$(echo "$release_json" | jq -r '.id')
     upload_url=$(echo "$release_json" | jq -r '.upload_url')
     release_url=$(echo "$release_json" | jq -r '.html_url')
+
+    if ! $release_contract_enabled; then
+        if ! jq -es --arg repo "$repo" --arg tag "$tag" '
+            length == 1 and (.[0] |
+                (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+                .tag_name == $tag and (.draft | type == "boolean") and
+                (.prerelease | type == "boolean") and
+                (.html_url | type == "string" and startswith("https://github.com/" + $repo + "/releases/")) and
+                (.upload_url == ("https://uploads.github.com/repos/" + $repo +
+                    "/releases/" + (.id | tostring) + "/assets{?name,label}") or
+                 .upload_url == ("https://uploads.github.com/repos/" + $repo +
+                    "/releases/" + (.id | tostring) + "/assets")))
+        ' <<< "$release_json" >/dev/null 2>&1; then
+            log_error "Release response has the wrong identity or upload destination"
+            return 7
+        fi
+        # An existing draft does not become public merely because --draft was
+        # omitted on retry. Downstream dispatch must use observed state.
+        draft=$(jq -r '.draft' <<< "$release_json")
+        prerelease=$(jq -r '.prerelease' <<< "$release_json")
+    fi
 
     if $release_contract_enabled; then
         if ! jq -e \
@@ -5728,14 +5821,6 @@ EOF
         log_ok "Staging draft created: $release_url"
     else
         log_ok "Release created: $release_url"
-    fi
-
-    # Cache existing release assets to avoid duplicate upload failures
-    local -A release_asset_ids=()
-    if command -v jq &>/dev/null; then
-        while IFS=$'\t' read -r asset_name asset_id; do
-            [[ -n "$asset_name" && -n "$asset_id" && "$asset_id" != "null" ]] && release_asset_ids["$asset_name"]="$asset_id"
-        done < <(echo "$release_json" | jq -r '.assets[]? | [.name, (.id|tostring)] | @tsv' 2>/dev/null)
     fi
 
     # Collect files to upload
@@ -5862,7 +5947,7 @@ EOF
                     fi
                 fi
             fi
-        done < <(jq -r '.artifacts[]? | [.name // "", .sha256 // "", .target // "", .archive_format // ""] | @tsv' "$manifest_file" 2>/dev/null)
+        done < <(jq -r '.artifacts[] | [.name // .filename, .sha256, .target // "", .archive_format // ""] | @tsv' <<< "$ordinary_manifest")
 
         if [[ -s "$sha256sums_file" ]]; then
             local line_count
@@ -5884,7 +5969,7 @@ EOF
             else
                 log_warn "Manifest references missing artifact: $name"
             fi
-        done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
+        done < <(jq -r '.artifacts[] | .name // .filename' <<< "$ordinary_manifest")
 
         # Include manifest and common sidecar files (checksums, per-asset .sha256
         # one-liners that curl-pipe-bash installers fetch as `${URL}.sha256`,
@@ -5897,9 +5982,9 @@ EOF
             2>/dev/null)
     else
         # Fallback: upload all files in artifacts directory
-        while IFS= read -r file; do
+        for file in "${ordinary_files[@]}"; do
             _release_add_file "$file"
-        done < <(find "$artifacts_dir" -maxdepth 1 -type f 2>/dev/null)
+        done
     fi
     fi
 
@@ -5927,33 +6012,10 @@ EOF
         return 1
     fi
 
-    local already_uploaded=()
+    # This set records only verified uploads made in this invocation. Never
+    # seed it from a local journal: names can outlive deleted/replaced assets.
     local -A uploaded_name_set=()
-    if $resume && [[ -f "$upload_state_file" ]]; then
-        while IFS= read -r name; do
-            if [[ -n "$name" ]]; then
-                already_uploaded+=("$name")
-                uploaded_name_set["$name"]=1
-            fi
-        done < <(jq -r '.uploaded[]?.name // empty' "$upload_state_file" 2>/dev/null)
-        log_info "Resuming: ${#already_uploaded[@]} file(s) already uploaded"
-    fi
-
-    _release_delete_asset() {
-        local name="$1"
-        local asset_id="${release_asset_ids[$name]:-}"
-        if [[ -n "$asset_id" ]]; then
-            log_info "Deleting existing asset: $name"
-            if gh_api "repos/$repo/releases/assets/$asset_id" --method DELETE --no-cache >/dev/null 2>&1; then
-                unset "release_asset_ids[$name]"
-                return 0
-            else
-                log_error "Failed to delete existing asset: $name"
-                return 1
-            fi
-        fi
-        return 0
-    }
+    local -A uploaded_sha_set=()
 
     _release_arch_aliases() {
         local name="$1"
@@ -5987,31 +6049,56 @@ EOF
     # Map manifest artifact names to targets and formats (for dual-name uploads)
     local -A manifest_targets=()
     local -A manifest_formats=()
-    if $manifest_exists && [[ -f "$manifest_file" ]]; then
+    if ! $release_contract_enabled && $manifest_exists; then
         while IFS=$'\t' read -r name target format; do
             [[ -z "$name" ]] && continue
             manifest_targets["$name"]="$target"
             manifest_formats["$name"]="$format"
-        done < <(jq -r '.artifacts[]? | [.name // .filename // "", .target // "", .archive_format // ""] | @tsv' "$manifest_file" 2>/dev/null)
+        done < <(jq -r '.artifacts[] | [.name // .filename, .target // "", .archive_format // ""] | @tsv' <<< "$ordinary_manifest")
     fi
 
-    _release_save_state() {
-        jq -nc --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
-            '{uploaded: $uploaded}' > "$upload_state_file"
-    }
+    _release_save_state() (
+        # Keep the previous journal on a failed write. Journals are diagnostic
+        # receipts, never an authorization to skip remote content verification.
+        local state_parent="${upload_state_file%/*}" temporary cleanup
+        [[ -d "$state_parent" && ! -L "$state_parent" && ! -L "$upload_state_file" ]] || return 1
+        [[ ! -e "$upload_state_file" || -f "$upload_state_file" ]] || return 1
+        umask 077
+        temporary=$(mktemp "$state_parent/.dsr-upload-state.XXXXXXXX") || return 1
+        printf -v cleanup 'rm -f -- %q' "$temporary"
+        trap "$cleanup" EXIT
+        trap 'exit 5' INT TERM
+        jq -nc --arg repo "$repo" --arg tag "$tag" --argjson release_id "$release_id" \
+            --arg run_id "${DSR_RUN_ID:-unknown}" \
+            --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
+            '{schema:"dsr.release_upload_receipt.v1",repo:$repo,tag:$tag,
+              release_id:$release_id,run_id:$run_id,uploaded:$uploaded}' > "$temporary" || return 1
+        [[ -s "$temporary" ]] && jq -es 'length==1 and (.[0]|type=="object")' "$temporary" >/dev/null || return 1
+        mv -f -- "$temporary" "$upload_state_file"
+    )
 
     _release_record_uploaded() {
         local name="$1"
         local status="$2"
         local size_bytes="$3"
         local content_type="$4"
-        uploaded_assets+=("$(jq -nc \
+        local receipt="${5:-null}" sha="${6:-}" record
+        if ! record=$(jq -nc \
             --arg name "$name" \
             --argjson size "$size_bytes" \
             --arg content_type "$content_type" \
             --arg status "$status" \
-            '{name: $name, size_bytes: $size, content_type: $content_type, status: $status}')")
-        _release_save_state
+            --arg sha256 "$sha" --argjson receipt "$receipt" \
+            '{name: $name, size_bytes: $size, content_type: $content_type, status: $status}
+             + (if $sha256 == "" then {} else {sha256:$sha256,remote_id:$receipt.id} end)'); then
+            _release_record_failed "$name" "Could not encode verified upload receipt"
+            return 1
+        fi
+        uploaded_assets+=("$record")
+        if ! _release_save_state; then
+            _release_record_failed "$name" "Upload verified but receipt persistence failed"
+            return 1
+        fi
     }
 
     _release_record_failed() {
@@ -6093,6 +6180,15 @@ EOF
             continue
         fi
 
+        local upload_sha
+        if [[ ! -f "$file" || -L "$file" || ! -s "$file" ]] ||
+           ! upload_sha=$(_gh_asset_sha256 "$file") ||
+           { [[ -n "${ordinary_expected_sha[$filename]:-}" ]] &&
+             [[ "$upload_sha" != "${ordinary_expected_sha[$filename]}" ]]; }; then
+            _release_record_failed "$filename" "Artifact changed after release preflight"
+            continue
+        fi
+
         # Dual-name upload for manifest artifacts (versioned + compat)
         local manifest_target="${manifest_targets[$filename]:-}"
         if [[ -n "$manifest_target" ]]; then
@@ -6154,29 +6250,23 @@ EOF
                     local upload_name
                     for upload_name in "${upload_names[@]}"; do
                         if [[ -n "${uploaded_name_set[$upload_name]:-}" ]]; then
+                            if [[ "${uploaded_sha_set[$upload_name]:-}" != "$upload_sha" ]]; then
+                                _release_record_failed "$upload_name" "Different artifact contents resolve to the same upload name"
+                                continue
+                            fi
                             log_info "  Skipping (already handled in this run): $upload_name"
                             skipped_assets+=("$upload_name")
                             continue
                         fi
-                        # Use literal string match (not regex) to avoid metacharacters like . being interpreted
-                        if printf '%s\n' "${already_uploaded[@]}" | grep -Fxq "$upload_name"; then
-                            log_info "  Skipping (already uploaded): $upload_name"
-                            skipped_assets+=("$upload_name")
+                        local upload_result
+                        if upload_result=$(gh_upload_asset_named "$upload_url" "$file" "$upload_name" "$content_type"); then
+                            log_ok "  Verified upload: $upload_name ($size_bytes bytes)"
+                            _release_record_uploaded "$upload_name" "uploaded" "$size_bytes" "$content_type" "$upload_result" "$upload_sha"
                             uploaded_name_set["$upload_name"]=1
-                            continue
-                        fi
-                        if _release_delete_asset "$upload_name"; then
-                            if gh_upload_asset_named "$upload_url" "$file" "$upload_name" "$content_type" 2>&1; then
-                                log_ok "  Uploaded: $upload_name ($size_bytes bytes)"
-                                _release_record_uploaded "$upload_name" "uploaded" "$size_bytes" "$content_type"
-                                uploaded_name_set["$upload_name"]=1
-                            else
-                                local upload_error="Upload failed for $upload_name"
-                                log_error "  $upload_error"
-                                _release_record_failed "$upload_name" "$upload_error"
-                            fi
+                            uploaded_sha_set["$upload_name"]="$upload_sha"
                         else
-                            _release_record_failed "$upload_name" "Failed to delete existing asset"
+                            log_error "  Failed to upload: $upload_name"
+                            _release_record_failed "$upload_name" "Verified upload failed (see release log): $upload_result"
                         fi
                     done
                     continue
@@ -6184,36 +6274,29 @@ EOF
             fi
         fi
 
-        # Skip if already uploaded (resume mode or already in release)
+        # Deduplicate only content-verified names from this invocation.
         if [[ -n "${uploaded_name_set[$filename]:-}" ]]; then
+            if [[ "${uploaded_sha_set[$filename]:-}" != "$upload_sha" ]]; then
+                _release_record_failed "$filename" "Different artifact contents resolve to the same upload name"
+                continue
+            fi
             log_info "[$idx/$total_files] Skipping (already handled in this run): $filename"
             skipped_assets+=("$filename")
             continue
         fi
-        # Use literal string match (not regex) to avoid metacharacters like . being interpreted
-        if printf '%s\n' "${already_uploaded[@]}" | grep -Fxq "$filename"; then
-            log_info "[$idx/$total_files] Skipping (already uploaded): $filename"
-            skipped_assets+=("$filename")
-            uploaded_name_set["$filename"]=1
-            continue
-        fi
-
         log_info "[$idx/$total_files] Uploading: $filename"
 
         # Upload
         local upload_result
-        if _release_delete_asset "$filename"; then
-            if upload_result=$(gh_upload_asset "$upload_url" "$file" "$content_type" 2>&1); then
-                log_ok "  Uploaded: $filename ($size_bytes bytes)"
-                _release_record_uploaded "$filename" "uploaded" "$size_bytes" "$content_type"
-                uploaded_name_set["$filename"]=1
-            else
-                log_error "  Failed to upload: $filename"
-                log_error "  Error: $upload_result"
-                _release_record_failed "$filename" "$upload_result"
-            fi
+        if upload_result=$(gh_upload_asset "$upload_url" "$file" "$content_type"); then
+            log_ok "  Verified upload: $filename ($size_bytes bytes)"
+            _release_record_uploaded "$filename" "uploaded" "$size_bytes" "$content_type" "$upload_result" "$upload_sha"
+            uploaded_name_set["$filename"]=1
+            uploaded_sha_set["$filename"]="$upload_sha"
         else
-            _release_record_failed "$filename" "Failed to delete existing asset"
+            log_error "  Failed to upload: $filename"
+            log_error "  Error: $upload_result"
+            _release_record_failed "$filename" "Verified upload failed (see release log): $upload_result"
         fi
     done
 
@@ -6403,7 +6486,7 @@ EOF
                 fi
             fi
         fi
-    elif $manifest_exists && [[ -f "$manifest_file" ]]; then
+    elif $manifest_exists; then
         verification_status="ok"
         while IFS= read -r expected_file; do
             [[ -z "$expected_file" ]] && continue
@@ -6429,8 +6512,48 @@ EOF
             if ! $found; then
                 missing_assets+=("$expected_file")
                 verification_status="incomplete"
+                _release_record_failed "$expected_file" "Required artifact was not verified on GitHub"
             fi
-        done < <(jq -r '.artifacts[]?.name // .artifacts[]?.filename // empty' "$manifest_file" 2>/dev/null)
+        done < <(jq -r '.artifacts[] | .name // .filename' <<< "$ordinary_manifest")
+    fi
+
+    if ! $release_contract_enabled; then
+        # Re-read by immutable release ID after all uploads. A local journal,
+        # an earlier POST response, or an earlier matching name is not proof
+        # that the final release still contains the selected artifact bytes.
+        _release_recheck_uploaded() (
+            local record="$1" name sha size expected_id observed workdir cleanup
+            name=$(jq -er '.name' <<< "$record") || return 1
+            sha=$(jq -er '.sha256' <<< "$record") || return 1
+            size=$(jq -er '.size_bytes' <<< "$record") || return 1
+            expected_id=$(jq -er '.remote_id' <<< "$record") || return 1
+            observed=$(_gh_find_release_asset "$repo" "$release_id" "$name") || return 1
+            [[ "$(jq -r '.id' <<< "$observed")" == "$expected_id" ]] || return 1
+            umask 077
+            workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-verify.XXXXXXXX") || return 1
+            printf -v cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$workdir/verified" "$workdir"
+            trap "$cleanup" EXIT
+            trap 'exit 5' INT TERM
+            _gh_verify_uploaded_asset "$repo" "$name" "$size" "$sha" "$observed" "$workdir" >/dev/null
+        )
+        local verified_record observed_release
+        [[ "$verification_status" == "skipped" ]] && verification_status="ok"
+        for verified_record in "${uploaded_assets[@]}"; do
+            if ! _release_recheck_uploaded "$verified_record"; then
+                _release_record_failed "$(jq -r '.name' <<< "$verified_record")" \
+                    "Remote artifact changed or could not be reverified after upload"
+                verification_status="incomplete"
+            fi
+        done
+        if ! observed_release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) ||
+           ! jq -ens --argjson expected "$release_json" --argjson observed "$observed_release" '
+               def identity: {id,tag_name,upload_url,draft,prerelease};
+               ($observed | type == "object") and
+               (($observed | identity) == ($expected | identity))
+           ' >/dev/null 2>&1; then
+            _release_record_failed "release-verification" "Release identity or visibility changed after upload"
+            verification_status="incomplete"
+        fi
     fi
 
     # Calculate duration after contract verification and publication.
