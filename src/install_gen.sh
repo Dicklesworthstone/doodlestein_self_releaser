@@ -63,11 +63,12 @@ _install_gen_template() {
 # Options:
 #   -v, --version VERSION    Install specific version (default: latest)
 #   -d, --dir DIR            Installation directory (default: ~/.local/bin)
-#   --verify                 Verify checksum + minisign signature
+#   --verify                 Verify checksums (always enabled)
+#   --require-signatures     Require a configured key and valid minisign signature
 #   --json                   Output JSON for automation
 #   --non-interactive        No prompts, fail on missing consent
 #   --cache-dir DIR          Cache directory (default: ~/.cache/dsr/installers)
-#   --offline                Use cached archives only (fail if not cached)
+#   --offline [ARCHIVE]      No network; requires --version and local checksum evidence
 #   --prefer-gh              Prefer gh release download for private repos
 #   --no-skills              Skip AI coding agent skill installation
 #   --help                   Show this help
@@ -92,8 +93,8 @@ BINARY_NAME="__BINARY_NAME__"
 ARCHIVE_FORMAT_LINUX="__ARCHIVE_FORMAT_LINUX__"
 ARCHIVE_FORMAT_DARWIN="__ARCHIVE_FORMAT_DARWIN__"
 ARCHIVE_FORMAT_WINDOWS="__ARCHIVE_FORMAT_WINDOWS__"
-# shellcheck disable=SC2154  # ${name} etc are literal patterns substituted at runtime
-ARTIFACT_NAMING="__ARTIFACT_NAMING__"
+# The template is data, not shell code. Expand its variables only in the renderer.
+ARTIFACT_NAMING='__ARTIFACT_NAMING__'
 
 # Minisign public key for signature verification (embedded from dsr config)
 # If empty, signature verification is skipped
@@ -103,7 +104,7 @@ MINISIGN_PUBKEY="__MINISIGN_PUBKEY__"
 _VERSION=""
 _INSTALL_DIR="${HOME}/.local/bin"
 _JSON_MODE=false
-_VERIFY=false
+_VERIFY=true
 _REQUIRE_SIGNATURES=false
 _NON_INTERACTIVE=false
 _AUTO_YES=false
@@ -239,7 +240,7 @@ _cache_get() {
     local cache_file
     cache_file=$(_cache_path "$version" "$platform" "$format")
 
-    if [[ -f "$cache_file" ]]; then
+    if [[ -f "$cache_file" && ! -L "$cache_file" && -s "$cache_file" ]]; then
         _log_info "Using cached archive: $cache_file"
         echo "$cache_file"
         return 0
@@ -247,8 +248,9 @@ _cache_get() {
     return 1
 }
 
-# Save archive to cache
-_cache_put() {
+# Save only verified bytes and their evidence. Each file is atomically replaced;
+# interrupted or concurrent updates can cause a verification failure, not a bypass.
+_cache_put() (
     local src_file="$1"
     local version="$2"
     local platform="$3"
@@ -258,20 +260,37 @@ _cache_put() {
     local cache_dir
     cache_dir=$(dirname "$cache_file")
 
-    mkdir -p "$cache_dir"
-    # Atomic write: copy to a sibling .tmp then rename.  Without this,
-    # a Ctrl-C between cp's open() and final fsync leaves a truncated
-    # file in the cache, and the next invocation happily uses it
-    # (the cache check is just `[[ -f ]]`), causing a corrupt-archive
-    # extraction failure with no obvious cause.  rename(2) is atomic
-    # within a filesystem.
-    local tmp_file="${cache_file}.tmp.$$"
-    if cp "$src_file" "$tmp_file" && mv -f "$tmp_file" "$cache_file"; then
-        _log_info "Cached archive: $cache_file"
-    else
-        rm -f "$tmp_file" 2>/dev/null || true
-        _log_warn "Failed to cache archive: $cache_file"
-    fi
+    mkdir -p "$cache_dir" || return 1
+    [[ ! -L "$cache_dir" ]] || return 1
+    local stage suffix
+    stage=$(mktemp -d "$cache_dir/.verified.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    for suffix in '' .sha256 .minisig; do
+        if [[ "$suffix" == .minisig && ! -f "$src_file$suffix" ]]; then
+            continue
+        fi
+        [[ -f "$src_file$suffix" && ! -L "$src_file$suffix" ]] || return 1
+        cp -- "$src_file$suffix" "$stage/payload$suffix" || return 1
+    done
+    for suffix in .sha256 .minisig ''; do
+        [[ -f "$stage/payload$suffix" ]] || continue
+        [[ ! -L "$cache_file$suffix" && ( ! -e "$cache_file$suffix" || -f "$cache_file$suffix" ) ]] || return 1
+        mv -f -- "$stage/payload$suffix" "$cache_file$suffix" || return 1
+    done
+    _log_info "Cached verified archive: $cache_file"
+)
+
+# Copy evidence alongside staged bytes; never follow a supplied sidecar symlink.
+_copy_local_archive() {
+    local source="$1" destination="$2" suffix
+    [[ -f "$source" && ! -L "$source" && -s "$source" ]] || return 1
+    cp -- "$source" "$destination" || return 1
+    for suffix in .sha256 .minisig; do
+        if [[ -e "$source$suffix" || -L "$source$suffix" ]]; then
+            [[ -f "$source$suffix" && ! -L "$source$suffix" ]] || return 1
+            cp -- "$source$suffix" "$destination$suffix" || return 1
+        fi
+    done
 }
 
 # ============================================================================
@@ -358,48 +377,31 @@ _apply_artifact_pattern() {
 # GH CLI DOWNLOAD
 # ============================================================================
 
-# Download release asset using gh CLI (supports private repos)
-_gh_download() {
-    local version="$1"
-    local platform="$2"
-    local format="$3"
-    local dest="$4"
-
-    if ! command -v gh &>/dev/null; then
-        return 1
-    fi
-
-    # Check gh auth status
-    if ! gh auth status &>/dev/null; then
-        _log_warn "gh not authenticated - falling back to curl"
-        return 1
-    fi
-
-    local os="${platform%/*}"
-    local arch="${platform#*/}"
-    local version_num="${version#v}"
-
-    # Construct asset name from pattern
-    local asset_name
-    asset_name=$(_apply_artifact_pattern "$ARTIFACT_NAMING" "$os" "$arch" "$version_num" "$format")
-
-    _log_info "Downloading via gh release download: $asset_name"
-
-    local dest_dir
-    dest_dir=$(dirname "$dest")
-
-    if gh release download "$version" --repo "$REPO" --pattern "$asset_name" --dir "$dest_dir" 2>/dev/null; then
-        # gh downloads with the original filename, move to our destination
-        local downloaded_file="$dest_dir/$asset_name"
-        if [[ -f "$downloaded_file" && "$downloaded_file" != "$dest" ]]; then
-            mv "$downloaded_file" "$dest"
+# Fetch one exact asset for payloads AND their checksum/signature sidecars.
+# Transport fallback happens here, before verification, never after it fails.
+_fetch_release_asset() {
+    local asset="$1" dest="$2" url
+    $_OFFLINE_MODE && return 1
+    [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
+    url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
+    if $_PREFER_GH && command -v gh &>/dev/null; then
+        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" 2>/dev/null &&
+           [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
+            return 0
         fi
-        _log_ok "Downloaded via gh CLI"
-        return 0
-    else
-        _log_warn "gh release download failed - falling back to curl"
-        return 1
     fi
+    if command -v curl &>/dev/null &&
+       curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 \
+           --retry 2 "$url" -o "$dest" 2>/dev/null && [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
+        return 0
+    fi
+    if ! $_PREFER_GH && command -v gh &>/dev/null; then
+        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" 2>/dev/null &&
+           [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # Get latest version from GitHub
@@ -443,78 +445,98 @@ _get_download_url() {
     echo "https://github.com/$REPO/releases/download/$version/${final_name}"
 }
 
-# Download and verify checksum
-_download_and_verify() {
-    local url="$1"
-    local dest="$2"
-    local checksums_url="$3"
-
-    _log_info "Downloading from: $url"
-
-    if ! curl -sSfL "$url" -o "$dest" 2>/dev/null; then
-        _log_error "Download failed"
-        return 1
-    fi
-
-    # Verify checksum if available
-    if [[ -n "$checksums_url" ]]; then
-        local checksums
-        if ! checksums=$(curl -sSfL "$checksums_url" 2>/dev/null); then
-            _log_error "Failed to download checksums"
-            return 1
-        fi
-
-        if [[ -n "$checksums" ]]; then
-            local expected_sha
-            local filename
-            filename=$(basename "$dest")
-            # Match the EXACT filename. Earlier this used
-            #   grep "$filename" | awk '{print $1}'
-            # which (a) treated $filename as a regex — so the dot in
-            # `bv.tar.gz` matched any single char and would happily
-            # accept a hash for `bvXtarYgz`, and (b) used substring
-            # matching, so `bv.tar.gz` also matched `prebv.tar.gz` or
-            # `bv.tar.gz.minisig`. Either path could feed the wrong
-            # hash into the verifier — silently downgrading the
-            # integrity check or outright accepting a tampered asset.
-            # Use awk with literal field equality on the second column,
-            # accepting both the `<hash>  <name>` (text) and
-            # `<hash> *<name>` (binary) sha256sum conventions.
-            expected_sha=$(printf '%s\n' "$checksums" | awk -v fname="$filename" '
-                $2 == fname || $2 == "*" fname {print $1; exit}
-            ')
-
-            if [[ -n "$expected_sha" ]]; then
-                local actual_sha
-                if command -v sha256sum &>/dev/null; then
-                    actual_sha=$(sha256sum "$dest" | awk '{print $1}')
-                elif command -v shasum &>/dev/null; then
-                    actual_sha=$(shasum -a 256 "$dest" | awk '{print $1}')
-                fi
-
-                if [[ "$actual_sha" == "$expected_sha" ]]; then
-                    _log_ok "Checksum verified"
-                else
-                    _log_error "Checksum mismatch!"
-                    _log_error "Expected: $expected_sha"
-                    _log_error "Got:      $actual_sha"
-                    rm -f "$dest"
-                    return 1
-                fi
-            fi
-        fi
-    fi
-
-    return 0
+# Accept exactly one SHA256 record for the RELEASE name, not the staging name.
+# Hash-only sidecars are allowed only when fetched as <asset>.sha256.
+_checksum_expected() {
+    local manifest="$1" asset="$2" hash_only="${3:-false}"
+    [[ -f "$manifest" && ! -L "$manifest" && -s "$manifest" ]] || return 1
+    LC_ALL=C awk -v name="$asset" -v bare="$hash_only" '
+        { sub(/\r$/, "") }
+        /^[[:space:]]*$/ || /^#/ { next }
+        {
+            records++
+            hash=substr($0,1,64); sep=substr($0,65,2); file=substr($0,67)
+            if ((sep == "  " || sep == " *") && file == name) {
+                count++; value=hash
+                if (length(hash) != 64 || hash !~ /^[0-9a-fA-F]+$/) bad=1
+            }
+            if (bare == "true" && length($0) == 64 && $0 ~ /^[0-9a-fA-F]+$/) {
+                raw++; value=$0
+            }
+        }
+        END {
+            if (!bad && ((count == 1 && raw == 0) || (count == 0 && raw == 1 && records == 1)))
+                print tolower(value)
+            else exit 1
+        }' "$manifest"
 }
 
-# Verify minisign signature
+# Hash stdin so filename quoting from sha256sum/shasum cannot alter the digest.
+_file_sha256() {
+    local result
+    if command -v sha256sum &>/dev/null; then
+        result=$(sha256sum < "$1") || return 1
+    elif command -v shasum &>/dev/null; then
+        result=$(shasum -a 256 < "$1") || return 1
+    else
+        _log_error "sha256sum or shasum is required"
+        return 3
+    fi
+    result="${result%% *}"
+    [[ "$result" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$result"
+}
+
+# Check every acquisition path; write normalized evidence only after a match.
+_verify_checksum() {
+    local file="$1" asset="$2" expected actual candidate manifest hash_only=false
+    manifest="$file.sha256"
+    if [[ -e "$manifest" || -L "$manifest" ]]; then
+        expected=$(_checksum_expected "$manifest" "$asset" true) || {
+            _log_error "Invalid local checksum evidence for $asset"; return 1;
+        }
+    else
+        if $_OFFLINE_MODE; then
+            _log_error "Offline archive requires a .sha256 sidecar for $asset"
+            return 1
+        fi
+        manifest="$file.checksums.download"
+        local found=false
+        for candidate in "$asset.sha256" checksums.sha256 \
+            "${TOOL_NAME}-${_VERSION#v}-SHA256SUMS.txt" SHA256SUMS.txt checksums.txt; do
+            if _fetch_release_asset "$candidate" "$manifest"; then
+                found=true
+                [[ "$candidate" != "$asset.sha256" ]] || hash_only=true
+                break
+            fi
+        done
+        if ! $found; then
+            _log_error "No release checksums available for $asset"
+            return 1
+        fi
+        expected=$(_checksum_expected "$manifest" "$asset" "$hash_only") || {
+            _log_error "Checksum manifest must contain exactly one valid entry for $asset"; return 1;
+        }
+    fi
+    actual=$(_file_sha256 "$file") || return $?
+    if [[ "$actual" != "$expected" ]]; then
+        _log_error "Checksum mismatch for $asset"
+        return 1
+    fi
+    printf '%s  %s\n' "$expected" "$asset" > "$file.sha256" || return 1
+    _log_ok "Checksum verified: $asset"
+}
+
+# A configured key is a trust requirement, including cached and offline bytes.
+# Missing signatures/tools never silently downgrade a signed installer.
 _verify_minisign() {
     local file="$1"
-    local sig_url="$2"
+    local asset="$2"
 
     # Skip if no public key configured
-    if [[ -z "$MINISIGN_PUBKEY" || "$MINISIGN_PUBKEY" == "__MINISIGN_PUBKEY__" ]]; then
+    # Do not repeat the full placeholder here: generation would replace both
+    # sides of that comparison and silently disable every configured key.
+    if [[ -z "$MINISIGN_PUBKEY" || "$MINISIGN_PUBKEY" == __MINISIGN_* ]]; then
         if $_REQUIRE_SIGNATURES; then
             _log_error "Signature verification required but no public key configured"
             return 1
@@ -522,44 +544,32 @@ _verify_minisign() {
         return 0
     fi
 
-    # Check if minisign is available
     if ! command -v minisign &>/dev/null; then
-        if $_REQUIRE_SIGNATURES; then
-            _log_error "minisign required for signature verification but not installed"
-            _log_info "Install: https://jedisct1.github.io/minisign/"
-            return 1
-        fi
-        _log_warn "minisign not available - skipping signature verification"
-        return 0
+        _log_error "minisign required for the configured signing key but not installed"
+        return 3
     fi
 
-    # Download signature
     local sig_file="${file}.minisig"
-    _log_info "Downloading signature..."
-    if ! curl -sSfL "$sig_url" -o "$sig_file" 2>/dev/null; then
-        if $_REQUIRE_SIGNATURES; then
-            _log_error "Signature download failed"
-            return 1
-        fi
-        _log_warn "No signature available - skipping verification"
-        return 0
+    if [[ ! -e "$sig_file" && ! -L "$sig_file" ]]; then
+        _fetch_release_asset "$asset.minisig" "$sig_file" || {
+            _log_error "Signature unavailable for $asset"; return 1;
+        }
     fi
+    [[ -f "$sig_file" && ! -L "$sig_file" && -s "$sig_file" ]] || return 1
 
     # Create temp file for public key
     local pubkey_file
-    pubkey_file=$(mktemp)
-    echo "$MINISIGN_PUBKEY" > "$pubkey_file"
+    pubkey_file="${file}.pubkey"
+    printf '%s\n' "$MINISIGN_PUBKEY" > "$pubkey_file" || return 1
 
     # Verify
     _log_info "Verifying signature..."
-    if minisign -Vm "$file" -p "$pubkey_file" 2>/dev/null; then
+    if minisign -Vm "$file" -p "$pubkey_file" -x "$sig_file" >/dev/null 2>&1; then
         _log_ok "Signature verified"
-        rm -f "$pubkey_file" "$sig_file"
         return 0
     else
         _log_error "Signature verification FAILED!"
         _log_error "The file may have been tampered with."
-        rm -f "$pubkey_file" "$sig_file"
         return 1
     fi
 }
@@ -814,10 +824,12 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -v|--version)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
                 _VERSION="$2"
                 shift 2
                 ;;
             -d|--dir)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
                 _INSTALL_DIR="$2"
                 shift 2
                 ;;
@@ -843,6 +855,7 @@ main() {
                 shift
                 ;;
             --offline)
+                _OFFLINE_MODE=true
                 # --offline alone means cache-only mode
                 # --offline <path> means use explicit archive
                 if [[ "${2:-}" =~ ^- ]] || [[ -z "${2:-}" ]]; then
@@ -854,6 +867,7 @@ main() {
                 fi
                 ;;
             --cache-dir)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
                 _CACHE_DIR="$2"
                 shift 2
                 ;;
@@ -883,41 +897,53 @@ main() {
 
     # Get version
     if [[ -z "$_VERSION" ]]; then
+        if $_OFFLINE_MODE; then
+            _log_error "Offline installation requires --version; latest cannot be resolved without network"
+            return 4
+        fi
         _log_info "Fetching latest version..."
         _VERSION=$(_get_latest_version) || return $?
+    fi
+    # These values become URL/path components, never shell or glob patterns.
+    if [[ ! "$_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ || "$_VERSION" == null ||
+          ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
+          ! "$TOOL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
+          ! "$BINARY_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+        _log_error "Invalid release version or installer identity"
+        return 4
     fi
     _log_info "Version: $_VERSION"
 
     # Get archive format
     local format
     format=$(_get_archive_format "$platform")
+    case "$format" in tar.gz|tgz|tar.xz|zip|tar|none|exe) ;; *) return 4 ;; esac
+    local asset_name
+    asset_name=$(_apply_artifact_pattern "$ARTIFACT_NAMING" "${platform%/*}" \
+        "${platform#*/}" "${_VERSION#v}" "$format") || return $?
+    [[ "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
+        _log_error "Unresolved or unsafe release asset name: $asset_name"; return 4;
+    }
 
     # Create temp directory. _TEMP_DIR is a script-scope global so the
     # EXIT trap can still see it after main() returns and locals are
     # popped.
-    _TEMP_DIR=$(mktemp -d)
+    _TEMP_DIR=$(mktemp -d) || return 1
     trap _cleanup_temp_dir EXIT
     local temp_dir="$_TEMP_DIR"
 
     local archive_file="$temp_dir/${TOOL_NAME}.${format}"
     local extract_dir="$temp_dir/extracted"
 
-    # Download or use offline archive
-    local from_cache=false
+    # Acquisition has no authority to skip verification.
     if [[ -n "$_OFFLINE_ARCHIVE" ]]; then
-        # Explicit offline archive path
-        if [[ ! -f "$_OFFLINE_ARCHIVE" ]]; then
-            _log_error "Offline archive not found: $_OFFLINE_ARCHIVE"
-            return 1
-        fi
-        cp "$_OFFLINE_ARCHIVE" "$archive_file"
+        _copy_local_archive "$_OFFLINE_ARCHIVE" "$archive_file" || return $?
         _log_info "Using offline archive: $_OFFLINE_ARCHIVE"
     else
         # Check cache first
         local cached_file
         if cached_file=$(_cache_get "$_VERSION" "$platform" "$format"); then
-            cp "$cached_file" "$archive_file"
-            from_cache=true
+            _copy_local_archive "$cached_file" "$archive_file" || return $?
         elif $_OFFLINE_MODE; then
             # Offline mode requires cache hit
             _log_error "Offline mode: no cached archive for $TOOL_NAME $_VERSION ($platform)"
@@ -926,50 +952,20 @@ main() {
             _json_result "error" "No cached archive available" "$_VERSION" ""
             return 1
         else
-            # Download from network
-            local download_url
-            download_url=$(_get_download_url "$_VERSION" "$platform" "$format")
-            local download_success=false
-
-            # Try gh release download first if preferred
-            if $_PREFER_GH && _gh_download "$_VERSION" "$platform" "$format" "$archive_file"; then
-                download_success=true
-            fi
-
-            # Fall back to curl
-            if ! $download_success; then
-                local checksums_url=""
-                if $_VERIFY; then
-                    checksums_url="https://github.com/$REPO/releases/download/$_VERSION/${TOOL_NAME}-${_VERSION#v}-SHA256SUMS.txt"
-                fi
-
-                if _download_and_verify "$download_url" "$archive_file" "$checksums_url"; then
-                    download_success=true
-                else
-                    # If curl failed and gh is available, try gh as last resort
-                    if ! $_PREFER_GH && _gh_download "$_VERSION" "$platform" "$format" "$archive_file"; then
-                        download_success=true
-                    fi
-                fi
-            fi
-
-            if ! $download_success; then
+            if ! _fetch_release_asset "$asset_name" "$archive_file"; then
                 _log_error "Failed to download archive"
                 _json_result "error" "Download failed" "$_VERSION" ""
                 return 1
             fi
 
-            # Cache the downloaded archive for future use
-            _cache_put "$archive_file" "$_VERSION" "$platform" "$format"
         fi
+    fi
 
-        # Verify minisign signature if available (skip for cached files by default)
-        if ! $from_cache && { $_VERIFY || $_REQUIRE_SIGNATURES; }; then
-            local download_url
-            download_url=$(_get_download_url "$_VERSION" "$platform" "$format")
-            local sig_url="${download_url}.minisig"
-            _verify_minisign "$archive_file" "$sig_url" || return $?
-        fi
+    _verify_checksum "$archive_file" "$asset_name" || return $?
+    _verify_minisign "$archive_file" "$asset_name" || return $?
+    if ! $_OFFLINE_MODE; then
+        _cache_put "$archive_file" "$_VERSION" "$platform" "$format" || \
+            _log_warn "Could not cache verified archive"
     fi
 
     # Extract
@@ -1110,6 +1106,8 @@ install_gen_create() {
     # Strip surrounding quotes if present
     artifact_naming="${artifact_naming#\"}"
     artifact_naming="${artifact_naming%\"}"
+    artifact_naming="${artifact_naming#\'}"
+    artifact_naming="${artifact_naming%\'}"
 
     # If no explicit artifact_naming, try to derive from workflow
     if [[ -z "$artifact_naming" && -n "$local_path" && -n "$workflow_path" ]]; then
@@ -1151,6 +1149,12 @@ install_gen_create() {
 
     if [[ -z "$artifact_naming" ]]; then
         artifact_naming='${name}-${version}-${os}-${arch}'
+    fi
+    # This value is embedded in a shell single-quoted literal. Reject a quote
+    # rather than letting configuration create executable installer code.
+    if [[ "$artifact_naming" == *\'* || "$artifact_naming" == *[[:cntrl:]]* ]]; then
+        log_error "Unsafe artifact_naming template"
+        return 4
     fi
 
     # Target triple + arch alias overrides (optional)
