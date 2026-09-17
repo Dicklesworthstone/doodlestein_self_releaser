@@ -501,6 +501,12 @@ build_state_get() {
   local version="$2"
   local run_id="${3:-latest}"
 
+  if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ||
+        ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ ]]; then
+    log_error "Invalid build state tool/version namespace"
+    return 1
+  fi
+
   local tool_dir
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
 
@@ -514,14 +520,26 @@ build_state_get() {
     fi
   fi
 
-  local state_file="$tool_dir/$run_id/state.json"
-
-  if [[ -f "$state_file" ]]; then
-    cat "$state_file"
-  else
+  if [[ ! "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    log_error "Invalid build state run identifier"
+    return 1
+  fi
+  local state_file="$tool_dir/$run_id/state.json" state
+  if [[ ! -f "$state_file" || -L "$state_file" || -L "$tool_dir/$run_id" ]]; then
     log_error "Build state not found: $state_file"
     return 1
   fi
+  # Read once, validate that exact snapshot, then return it. A second cat after
+  # validation could return a different generation than the one just checked.
+  state=$(cat -- "$state_file") || return 1
+  if ! jq -es --arg tool "$tool" --arg version "$version" --arg run_id "$run_id" '
+      length == 1 and (.[0] | type == "object" and
+        .tool == $tool and .version == $version and .run_id == $run_id)
+    ' <<< "$state" >/dev/null 2>&1; then
+    log_error "Build checkpoint is malformed or belongs to a different run: $state_file"
+    return 1
+  fi
+  printf '%s\n' "$state"
 }
 
 # Update build status
@@ -562,7 +580,7 @@ build_state_update_host() {
   local extra_json="${5:-}"  # Additional JSON to merge (default empty)
   local run_id="${6:-latest}"
 
-  # Default to empty JSON object if not provided or invalid
+  # An omitted payload is empty; malformed evidence must never become success.
   : "${extra_json:="{}"}"
 
   local tool_dir
@@ -579,10 +597,9 @@ build_state_update_host() {
   local now
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-  # Ensure extra_json is valid JSON (default to empty object)
-  # Use jq for proper validation
-  if [[ -z "$extra_json" ]] || ! echo "$extra_json" | jq empty &>/dev/null; then
-    extra_json='{}'
+  if ! jq -es 'length == 1 and (.[0] | type == "object")' <<< "$extra_json" &>/dev/null; then
+    log_error "Invalid host state evidence for $host"
+    return 1
   fi
 
   # Update host status using safe helper. Propagate failure so callers
@@ -630,8 +647,9 @@ build_state_update_target() {
   local now
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-  if [[ -z "$extra_json" ]] || ! jq -e 'type == "object"' <<< "$extra_json" &>/dev/null; then
-    extra_json='{}'
+  if ! jq -es 'length == 1 and (.[0] | type == "object")' <<< "$extra_json" &>/dev/null; then
+    log_error "Invalid target state evidence for $target"
+    return 1
   fi
 
   if ! _build_state_jq_update "$state_file" \
@@ -841,14 +859,14 @@ build_state_can_resume() {
   status=$(echo "$state" | jq -r '.status')
 
   case "$status" in
-    running|failed)
+    created|running|failed)
       return 0  # Can resume
       ;;
     completed|cancelled)
       return 1  # Cannot resume
       ;;
     *)
-      return 0  # Unknown status, try to resume
+      return 1  # Unknown/missing status is not a resumable checkpoint
       ;;
   esac
 }
@@ -886,18 +904,15 @@ build_state_pending_hosts() {
   local state
   state=$(build_state_get "$tool" "$version" "$run_id" 2>/dev/null) || return 1
 
-  # Hosts not yet started or with pending status
-  local all_targets completed failed
-  all_targets=$(echo "$state" | jq -r '.targets[]?' 2>/dev/null)
-  completed=$(build_state_completed_hosts "$tool" "$version" "$run_id")
-  failed=$(build_state_failed_hosts "$tool" "$version" "$run_id")
-
-  # Return targets that aren't completed or failed
-  for target in $all_targets; do
-    if ! echo "$completed $failed" | grep -qw "$target"; then
-      echo "$target"
-    fi
-  done
+  # Target platforms are not host names. Use explicit host routing where
+  # available, while still reading older host-named target inventories.
+  jq -r '
+    . as $s |
+    (((.hosts // {}) | keys) + [(.context.target_hosts // {})[]] +
+      [.targets[]? | select(contains("/") | not)] | unique)[] as $host |
+    ($s.hosts[$host].status // "pending") as $status |
+    select($status == "pending" or $status == "running") | $host
+  ' <<< "$state"
 }
 
 # Target-keyed status queries used by the orchestrator and resume planner.
@@ -906,7 +921,8 @@ build_state_completed_targets() {
   state=$(build_state_get "$1" "$2" "${3:-latest}" 2>/dev/null) || return 1
   jq -r '
     .target_statuses // {} | to_entries[] |
-    select(.value.status == "completed" and (.value.result | type) == "object") |
+    select(.value.status == "completed" and (.value.result | type) == "object" and
+      (.value.result | length) > 0) |
     .key
   ' <<< "$state"
 }
@@ -924,7 +940,8 @@ build_state_pending_targets() {
     . as $state |
     $state.targets[]? as $target |
     ($state.target_statuses[$target] // {status: "pending"}) as $entry |
-    select($entry.status != "completed" or ($entry.result | type) != "object") |
+    select($entry.status != "completed" or ($entry.result | type) != "object" or
+      ($entry.result | length) == 0) |
     $target
   ' <<< "$state"
 }
@@ -1039,24 +1056,36 @@ BUILD_RETRY_MAX="${DSR_RETRY_MAX:-3}"
 BUILD_RETRY_BASE_DELAY="${DSR_RETRY_DELAY:-5}"  # Base delay in seconds
 BUILD_RETRY_MAX_DELAY="${DSR_RETRY_MAX_DELAY:-300}"  # Max delay (5 min)
 
+_build_retry_config_valid() {
+  if [[ ! "$BUILD_RETRY_MAX" =~ ^[0-9]{1,4}$ ||
+        ! "$BUILD_RETRY_BASE_DELAY" =~ ^[0-9]{1,5}$ ||
+        ! "$BUILD_RETRY_MAX_DELAY" =~ ^[0-9]{1,5}$ ]] ||
+     ((10#$BUILD_RETRY_MAX < 1 || 10#$BUILD_RETRY_MAX > 1000 ||
+       10#$BUILD_RETRY_BASE_DELAY > 86400 || 10#$BUILD_RETRY_MAX_DELAY > 86400)); then
+    log_error "Invalid retry configuration (1..1000 attempts, delays 0..86400 seconds)"
+    return 4
+  fi
+}
+
 # Calculate exponential backoff with jitter
 # Args: attempt_number
 # Returns: delay in seconds
 _build_calc_backoff() {
   local attempt="$1"
-
-  # Exponential backoff: base * 2^attempt
-  local delay=$((BUILD_RETRY_BASE_DELAY * (1 << attempt)))
-
-  # Cap at max delay
-  if [[ $delay -gt $BUILD_RETRY_MAX_DELAY ]]; then
-    delay=$BUILD_RETRY_MAX_DELAY
-  fi
-
-  # Add jitter (0-25% of delay) to avoid thundering herd
+  _build_retry_config_valid || return 4
+  [[ "$attempt" =~ ^[0-9]{1,4}$ ]] && ((10#$attempt <= 1000)) || return 4
+  attempt=$((10#$attempt))
+  local delay=$((10#$BUILD_RETRY_BASE_DELAY)) cap=$((10#$BUILD_RETRY_MAX_DELAY)) i=0
+  ((delay > cap)) && delay=$cap
+  # Saturate before multiplication; a large attempt must not wrap a bit shift
+  # into a negative delay or a fresh, unexpectedly short retry interval.
+  while ((i < attempt && delay > 0 && delay < cap)); do
+    if ((delay > cap / 2)); then delay=$cap; else delay=$((delay * 2)); fi
+    i=$((i + 1))
+  done
   local jitter=$((RANDOM % (delay / 4 + 1)))
   delay=$((delay + jitter))
-
+  ((delay > cap)) && delay=$cap
   echo "$delay"
 }
 
@@ -1064,8 +1093,13 @@ _build_calc_backoff() {
 # Args: max_retries command [args...]
 # Returns: Exit code of last attempt
 build_retry_with_backoff() {
+  [[ $# -ge 2 ]] || return 4
   local max_retries="${1:-$BUILD_RETRY_MAX}"
   shift
+  _build_retry_config_valid || return 4
+  [[ "$max_retries" =~ ^[0-9]{1,4}$ && -n "$1" ]] &&
+    ((10#$max_retries >= 1 && 10#$max_retries <= 1000)) || return 4
+  max_retries=$((10#$max_retries))
 
   local attempt=0
   local exit_code=0
@@ -1086,9 +1120,9 @@ build_retry_with_backoff() {
     fi
 
     local delay
-    delay=$(_build_calc_backoff "$attempt")
+    delay=$(_build_calc_backoff "$attempt") || return 4
     log_warn "Attempt $attempt failed (exit $exit_code), retrying in ${delay}s..."
-    sleep "$delay"
+    sleep "$delay" || return 5
   done
 
   return $exit_code
@@ -1103,6 +1137,7 @@ build_state_record_retry() {
   local attempt="$4"
   local error_msg="$5"
   local run_id="${6:-latest}"
+  [[ "$attempt" =~ ^[1-9][0-9]{0,3}$ ]] && ((attempt <= 1000)) || return 4
 
   local tool_dir
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
@@ -1126,7 +1161,7 @@ build_state_record_retry() {
      .hosts[$host].last_error = $error |
      .hosts[$host].last_retry_at = $now |
      .hosts[$host].retries = ((.hosts[$host].retries // []) + [{attempt: $attempt, error: $error, at: $now}]) |
-     .updated_at = $now'
+     .updated_at = $now' || return 1
 
   log_debug "Recorded retry $attempt for $host: $error_msg"
 }
@@ -1143,9 +1178,15 @@ build_state_get_retry_count() {
   local state
   state=$(build_state_get "$tool" "$version" "$run_id" 2>/dev/null) || return 1
 
-  local count
-  count=$(echo "$state" | jq -r --arg host "$host" '.hosts[$host].retry_count // 0')
-  echo "$count"
+  jq -er --arg host "$host" '
+    if (.hosts | type) != "object" then error("invalid host inventory") else
+      if .hosts | has($host) then .hosts[$host] else {} end
+    end |
+    if type != "object" then error("invalid host retry evidence") else . end |
+    (if has("retry_count") then .retry_count else 0 end) |
+    if type == "number" and floor == . and . >= 0 and . <= 9007199254740991
+    then . else error("invalid saved retry count") end
+  ' <<< "$state"
 }
 
 # Reset retry count for a host (on success)
@@ -1181,11 +1222,12 @@ build_state_can_retry() {
   local version="$2"
   local host="$3"
   local run_id="${4:-latest}"
+  _build_retry_config_valid || return 1
 
   local count
-  count=$(build_state_get_retry_count "$tool" "$version" "$host" "$run_id")
+  count=$(build_state_get_retry_count "$tool" "$version" "$host" "$run_id") || return 1
 
-  if [[ $count -ge $BUILD_RETRY_MAX ]]; then
+  if ((count >= 10#$BUILD_RETRY_MAX)); then
     return 1  # Exceeded
   fi
   return 0  # Can retry
@@ -1193,7 +1235,9 @@ build_state_can_retry() {
 
 # Resume a failed or interrupted build
 # Args: tool version [run_id]
-# Returns: JSON with resume plan
+# Returns: JSON with resume plan from ONE validated checkpoint generation.
+# Completed-target entries remain candidates for the orchestrator's separate
+# source/artifact verification; an empty result is never completion evidence.
 build_state_resume() {
   local tool="$1"
   local version="$2"
@@ -1201,93 +1245,66 @@ build_state_resume() {
 
   local state
   state=$(build_state_get "$tool" "$version" "$run_id" 2>/dev/null) || {
-    echo '{"error": "Build state not found", "can_resume": false}'
+    echo '{"error": "Build state missing or invalid", "can_resume": false}'
     return 1
   }
 
-  local status
-  status=$(echo "$state" | jq -r '.status')
-
-  if [[ "$status" == "completed" ]]; then
-    echo '{"error": "Build already completed", "can_resume": false}'
+  if ! _build_retry_config_valid; then
+    echo '{"error": "Invalid retry configuration", "can_resume": false}'
     return 1
   fi
 
-  if [[ "$status" == "cancelled" ]]; then
-    echo '{"error": "Build was cancelled", "can_resume": false}'
-    return 1
-  fi
-
-  # Keep legacy host fields for callers that display fleet telemetry. The
-  # authoritative resume plan is target-keyed because multiple targets may
-  # share one host.
-  local completed_hosts failed_hosts pending_hosts
-  completed_hosts=$(build_state_completed_hosts "$tool" "$version" "$run_id" | jq -R -s 'split("\n") | map(select(. != ""))')
-  failed_hosts=$(build_state_failed_hosts "$tool" "$version" "$run_id" | jq -R -s 'split("\n") | map(select(. != ""))')
-  pending_hosts=$(build_state_pending_hosts "$tool" "$version" "$run_id" | jq -R -s 'split("\n") | map(select(. != ""))')
-
-  # Check which failed hosts can be retried
-  local retryable_hosts=()
-  local exceeded_hosts=()
-  while IFS= read -r host; do
-    [[ -z "$host" ]] && continue
-    if build_state_can_retry "$tool" "$version" "$host" "$run_id"; then
-      retryable_hosts+=("$host")
-    else
-      exceeded_hosts+=("$host")
-    fi
-  done < <(build_state_failed_hosts "$tool" "$version" "$run_id")
-
-  local actual_run_id
-  actual_run_id=$(echo "$state" | jq -r '.run_id')
-
-  # Build resume plan - handle empty arrays properly
-  local retryable_json exceeded_json
-  if [[ ${#retryable_hosts[@]} -gt 0 ]]; then
-    retryable_json=$(printf '%s\n' "${retryable_hosts[@]}" | jq -R -s 'split("\n") | map(select(. != ""))')
-  else
-    retryable_json="[]"
-  fi
-  if [[ ${#exceeded_hosts[@]} -gt 0 ]]; then
-    exceeded_json=$(printf '%s\n' "${exceeded_hosts[@]}" | jq -R -s 'split("\n") | map(select(. != ""))')
-  else
-    exceeded_json="[]"
-  fi
-
-  local target_plan
-  target_plan=$(jq -c --argjson retry_max "$BUILD_RETRY_MAX" '
-    . as $state |
-    reduce $state.targets[]? as $target (
+  local plan
+  if ! plan=$(jq -ce --argjson retry_max "$((10#$BUILD_RETRY_MAX))" '
+    def counter($key): if has($key) then .[$key] else 0 end;
+    def valid_counter($key):
+      counter($key) | type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+    def entry_status: if has("status") then .status else "pending" end;
+    def valid_status:
+      entry_status as $status |
+      ["pending", "running", "completed", "failed", "cancelled", "skipped"] | index($status) != null;
+    . as $s |
+    if (.status != "created" and .status != "running" and .status != "failed") or
+       (.targets | type) != "array" or
+       (all(.targets[]; type == "string" and length > 0) | not) or
+       (.targets | unique | length) != (.targets | length) or
+       (.hosts | type) != "object" or
+       (all(.hosts[]; type == "object" and valid_status and valid_counter("retry_count")) | not) or
+       (.target_statuses != null and (.target_statuses | type) != "object") or
+       (all((.target_statuses // {})[];
+         type == "object" and valid_status and valid_counter("attempts")) | not) or
+       (all((.target_statuses // {}) | keys[]; . as $t | $s.targets | index($t) != null) | not) or
+       (.context != null and (.context | type) != "object") or
+       (.context.target_hosts != null and (.context.target_hosts | type) != "object") or
+       (all((.context.target_hosts // {})[]; type == "string" and length > 0) | not)
+    then error("invalid or non-resumable checkpoint") else . end |
+    # No further build_state_get/readlink calls: latest may now name a new run.
+    (((.hosts | keys) + [(.context.target_hosts // {})[]] +
+      [.targets[] | select(contains("/") | not)]) | unique |
+      map(. as $host | {name: $host, entry: ($s.hosts[$host] // {})})) as $hosts |
+    [$hosts[] | select(.entry.status == "completed") | .name] as $completed |
+    [$hosts[] | select(.entry.status == "failed") | .name] as $failed |
+    [$hosts[] | select((.entry | entry_status) == "pending" or .entry.status == "running") |
+      select((.entry | counter("retry_count")) < $retry_max) | .name] as $pending |
+    [$hosts[] | select(.entry.status == "failed" and
+      (.entry | counter("retry_count")) < $retry_max) | .name] as $retryable |
+    [$hosts[] | select((.entry | entry_status) == "pending" or
+      .entry.status == "running" or .entry.status == "failed") |
+      select((.entry | counter("retry_count")) >= $retry_max) | .name] as $exceeded |
+    (reduce .targets[] as $target (
       {completed: [], retryable: [], exceeded: []};
-      ($state.target_statuses[$target] // {status: "pending", attempts: 0}) as $entry |
-      if ($entry.status == "completed" and ($entry.result | type) == "object") then
-        .completed += [$target]
-      elif (($entry.attempts // 0) >= $retry_max and $entry.status == "failed") then
-        .exceeded += [$target]
-      else
-        .retryable += [$target]
-      end
-    )
-  ' <<< "$state") || return 1
-
-  jq -nc \
-    --arg tool "$tool" \
-    --arg version "$version" \
-    --arg run_id "$actual_run_id" \
-    --arg status "$status" \
-    --argjson completed "$completed_hosts" \
-    --argjson failed "$failed_hosts" \
-    --argjson pending "$pending_hosts" \
-    --argjson retryable "$retryable_json" \
-    --argjson exceeded "$exceeded_json" \
-    --argjson target_plan "$target_plan" \
-    --argjson context "$(jq -c '.context // {}' <<< "$state")" \
-    '{
+      ($s.target_statuses[$target] // {}) as $entry |
+      if ($entry.status == "completed" and ($entry.result | type) == "object" and
+          ($entry.result | length) > 0) then .completed += [$target]
+      elif (($entry | counter("attempts")) >= $retry_max) then .exceeded += [$target]
+      else .retryable += [$target] end
+    )) as $target_plan |
+    {
       can_resume: true,
-      tool: $tool,
-      version: $version,
-      run_id: $run_id,
-      current_status: $status,
+      tool: $s.tool,
+      version: $s.version,
+      run_id: $s.run_id,
+      current_status: $s.status,
       completed_hosts: $completed,
       failed_hosts: $failed,
       pending_hosts: $pending,
@@ -1297,60 +1314,109 @@ build_state_resume() {
       completed_targets: $target_plan.completed,
       targets_to_process: $target_plan.retryable,
       exceeded_target_retry_limit: $target_plan.exceeded,
-      context: $context
-    }'
+      context: ($s.context // {})
+    }
+  ' <<< "$state" 2>/dev/null); then
+    log_error "Cannot resume an invalid, completed, or cancelled checkpoint"
+    echo '{"error": "Checkpoint is invalid or not resumable", "can_resume": false}'
+    return 1
+  fi
+  printf '%s\n' "$plan"
 }
 
 # Execute a build step for a host with automatic retry
 # Args: tool version host command [args...]
-# Returns: 0 on success, 1 on permanent failure
-build_state_exec_with_retry() {
+# Returns: 0 on recorded success, 1 on failure, 2 on concurrent execution,
+# 4 on invalid retry configuration, 5 on interruption. Pin the run once and
+# reserve each attempt before invoking the command, so a crash consumes budget.
+# A per-host kernel lock allows different hosts to run concurrently.
+build_state_exec_with_retry() (
+  [[ $# -ge 4 ]] || return 4
   local tool="$1"
   local version="$2"
   local host="$3"
   shift 3
+  [[ -n "$host" && -n "$1" ]] || return 4
+  _build_retry_config_valid || return 4
 
-  # Check if we can still retry
-  if ! build_state_can_retry "$tool" "$version" "$host"; then
-    log_error "Host $host has exceeded retry limit"
-    return 1
+  local state run_id workspace state_file key lock_file lock_identity
+  state=$(build_state_get "$tool" "$version") || return 1
+  run_id=$(jq -er '.run_id' <<< "$state") || return 1
+  workspace=$(build_state_workspace "$tool" "$version" "$run_id") || return 1
+  state_file="$workspace/state.json"
+  key=$(_build_state_sha256 /dev/stdin <<< "$host") || return 3
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
+  lock_file="$workspace/host-$key.retry.lock"
+  if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+    (umask 077; set -o noclobber; : > "$lock_file") 2>/dev/null || true
   fi
+  [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
+  exec 8<> "$lock_file" || return 1
+  _build_state_wait_lock 8 0 || return 2
+  lock_identity=$(_build_state_file_identity /dev/fd/8) || return 1
+  [[ ! -L "$lock_file" && "$(_build_state_file_identity "$lock_file")" == "$lock_identity" ]] || return 1
+  trap 'exit 5' INT TERM
 
-  local attempt=0
-  local max_attempts=$BUILD_RETRY_MAX
-  local exit_code=0
+  local attempt next_attempt now delay exit_code outcome
+  local max_attempts=$((10#$BUILD_RETRY_MAX))
+  attempt=$(build_state_get_retry_count "$tool" "$version" "$host" "$run_id") || return 1
 
-  while [[ $attempt -lt $max_attempts ]]; do
-    # Mark host as running
-    build_state_update_host "$tool" "$version" "$host" "running" '{}' >/dev/null 2>&1
-
-    if "$@"; then
-      # Success - reset retries and mark completed
-      build_state_reset_retries "$tool" "$version" "$host" >/dev/null 2>&1
-      build_state_update_host "$tool" "$version" "$host" "completed" '{}' >/dev/null 2>&1
-      return 0
-    fi
-    exit_code=$?
-
-    attempt=$((attempt + 1))
-
-    # Record the retry
-    build_state_record_retry "$tool" "$version" "$host" "$attempt" "exit code $exit_code"
-
-    if [[ $attempt -ge $max_attempts ]]; then
-      log_error "Host $host failed after $max_attempts attempts"
-      build_state_update_host "$tool" "$version" "$host" "failed" "{\"exit_code\": $exit_code}" >/dev/null 2>&1
+  while ((attempt < max_attempts)); do
+    next_attempt=$((attempt + 1))
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    if ! _build_state_jq_update "$state_file" \
+        --arg host "$host" --arg now "$now" --argjson before "$attempt" \
+        --argjson attempt "$next_attempt" '
+        (.hosts[$host] // {}) as $h |
+        if (.status != "created" and .status != "running" and .status != "failed") or
+           (if $h | has("retry_count") then $h.retry_count else 0 end) != $before
+        then error("run or retry budget changed") else
+          .hosts[$host] = ($h + {status: "running", retry_count: $attempt,
+            active_attempt: $attempt, attempts_started: (($h.attempts_started // 0) + 1),
+            updated_at: $now}) | .updated_at = $now
+        end'; then
       return 1
     fi
+    attempt=$next_attempt
 
-    local delay
-    delay=$(_build_calc_backoff "$attempt")
+    if "$@"; then
+      exit_code=0
+      outcome=completed
+    else
+      exit_code=$?
+      outcome=failed
+      case "$exit_code" in 5|130|143) outcome=cancelled ;; esac
+    fi
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    # Status, count, and the actual exit code are one transaction. Never claim
+    # success or launch another attempt if the completion receipt was not saved.
+    if ! _build_state_jq_update "$state_file" \
+        --arg host "$host" --arg now "$now" --arg status "$outcome" \
+        --argjson attempt "$attempt" --argjson code "$exit_code" '
+        if (.status != "created" and .status != "running" and .status != "failed") or
+           .hosts[$host].retry_count != $attempt or .hosts[$host].status != "running"
+        then error("attempt ownership changed") else
+          .hosts[$host] |= (. + {status: $status, exit_code: $code,
+            active_attempt: null, updated_at: $now} |
+            if $code == 0 then .retry_count = 0 | .last_error = null else
+              .last_error = "exit code \($code)" | .last_retry_at = $now |
+              .retries = ((.retries // []) +
+                [{attempt: $attempt, error: .last_error, exit_code: $code, at: $now}])
+            end) | .updated_at = $now
+        end'; then
+      return 1
+    fi
+    [[ "$outcome" == completed ]] && return 0
+    [[ "$outcome" == cancelled ]] && return 5
+    ((attempt >= max_attempts)) && break
+    delay=$(_build_calc_backoff "$attempt") || return 4
     log_warn "Host $host attempt $attempt failed, retrying in ${delay}s..."
-    sleep "$delay"
+    sleep "$delay" || return 5
   done
 
+  log_error "Host $host exhausted its $max_attempts attempt budget for run $run_id"
   return 1
-}
+)
 
 # Export functions
 export -f build_state_init build_lock_acquire build_lock_release build_lock_check build_lock_info

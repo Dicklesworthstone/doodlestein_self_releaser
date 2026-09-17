@@ -710,6 +710,338 @@ test_checkpoint_lock_config() {
     jq -e '.counter == 2' "$source" >/dev/null
 }
 
+# Resume/retry tests use actual checkpoints. Every fixture has a separate tool
+# namespace so the suite can exercise latest-pointer changes without cross-talk.
+seed_resume_fixture() {
+  local tool="$1" targets="${2:-linux/amd64,darwin/arm64}"
+  build_state_init || return 1
+  DSR_RUN_ID="${tool}-run" build_state_create "$tool" v1.0.0 "$targets" >/dev/null || return 1
+  RESUME_STATE_FILE="$_BUILD_STATE_DIR/$tool/v1.0.0/${tool}-run/state.json"
+}
+
+test_state_read_identity_and_shape() {
+  seed_resume_fixture read-identity || return 1
+  local before filter invalid output status
+  before=$(cat "$RESUME_STATE_FILE")
+  for filter in '.tool = "other"' '.version = "v9.0.0"' '.run_id = "other"' \
+    '., .' '[]' 'null'; do
+    jq "$filter" <<< "$before" > "$RESUME_STATE_FILE" || return 1
+    status=0
+    output=$(build_state_get read-identity v1.0.0 2>/dev/null) || status=$?
+    [[ $status -ne 0 && -z "$output" ]] || return 1
+  done
+  for invalid in '' '{broken'; do
+    printf '%s' "$invalid" > "$RESUME_STATE_FILE"
+    ! build_state_get read-identity v1.0.0 >/dev/null 2>&1 || return 1
+  done
+  printf '%s\n' "$before" > "$RESUME_STATE_FILE"
+  [[ "$(build_state_get read-identity v1.0.0)" == "$before" ]] || return 1
+  ! build_state_get ../read-identity v1.0.0 >/dev/null 2>&1 || return 1
+  ! build_state_get read-identity v1.0.0 ../outside >/dev/null 2>&1 || return 1
+  mv "$RESUME_STATE_FILE" "$RESUME_STATE_FILE.saved" || return 1
+  ln -s "$RESUME_STATE_FILE.saved" "$RESUME_STATE_FILE" || return 1
+  ! build_state_get read-identity v1.0.0 >/dev/null 2>&1
+}
+
+test_resume_unknown_status_rejected() {
+  seed_resume_fixture unknown-status || return 1
+  local status plan code
+  for status in completed cancelled unknown null; do
+    _build_state_jq_update "$RESUME_STATE_FILE" --arg status "$status" '.status = $status' || return 1
+    ! build_state_can_resume unknown-status v1.0.0 || return 1
+    code=0
+    plan=$(build_state_resume unknown-status v1.0.0 2>/dev/null) || code=$?
+    [[ $code -ne 0 ]] && jq -es 'length == 1 and .[0].can_resume == false' \
+      <<< "$plan" >/dev/null || return 1
+  done
+  for status in created running failed; do
+    _build_state_jq_update "$RESUME_STATE_FILE" --arg status "$status" '.status = $status' || return 1
+    build_state_can_resume unknown-status v1.0.0 || return 1
+  done
+  _build_state_jq_update "$RESUME_STATE_FILE" 'del(.status)' || return 1
+  ! build_state_can_resume unknown-status v1.0.0
+}
+
+test_state_evidence_rejection() {
+  seed_resume_fixture bad-evidence || return 1
+  local evidence before
+  before=$(cat "$RESUME_STATE_FILE")
+  for evidence in '[]' 'null' 'true' '42' '{} {}' '{broken'; do
+    ! build_state_update_host bad-evidence v1.0.0 trj completed "$evidence" \
+      2>/dev/null || return 1
+    ! build_state_update_target bad-evidence v1.0.0 linux/amd64 completed "$evidence" \
+      2>/dev/null || return 1
+    [[ "$(cat "$RESUME_STATE_FILE")" == "$before" ]] || return 1
+  done
+}
+
+test_resume_single_snapshot_after_latest_moves() {
+  seed_resume_fixture moving-latest linux/amd64 || return 1
+  local first_state="$RESUME_STATE_FILE" second_state old_get calls="$TEMP_DIR/resume-read.calls"
+  _build_state_jq_update "$first_state" '
+    .hosts = {trj:{status:"failed",retry_count:1}} |
+    .context = {target_hosts:{"linux/amd64":"trj"}, marker:"first"} |
+    .target_statuses["linux/amd64"] = {status:"failed",attempts:1}' || return 1
+  DSR_RUN_ID=second-run build_state_create moving-latest v1.0.0 darwin/arm64 >/dev/null || return 1
+  second_state="$_BUILD_STATE_DIR/moving-latest/v1.0.0/second-run/state.json"
+  _build_state_jq_update "$second_state" '
+    .hosts = {mmini:{status:"completed"}} | .context = {marker:"second"}' || return 1
+  ln -sfn moving-latest-run "$_BUILD_STATE_DIR/moving-latest/v1.0.0/latest"
+  old_get=$(declare -f build_state_get)
+  # Preserve the real reader and move latest only after it returns its snapshot.
+  eval "${old_get/build_state_get ()/saved_build_state_get ()}"
+  build_state_get() {
+    local value
+    value=$(saved_build_state_get "$@") || return 1
+    printf 'read\n' >> "$calls"
+    ln -sfn second-run "$_BUILD_STATE_DIR/moving-latest/v1.0.0/latest"
+    printf '%s\n' "$value"
+  }
+  local plan
+  plan=$(build_state_resume moving-latest v1.0.0) || return 1
+  [[ "$(wc -l < "$calls")" -eq 1 ]] || return 1
+  jq -e '.run_id == "moving-latest-run" and .context.marker == "first" and
+    .failed_hosts == ["trj"] and .hosts_to_process == ["trj"] and
+    .completed_hosts == [] and .targets_to_process == ["linux/amd64"]' <<< "$plan" >/dev/null
+}
+
+test_resume_host_routing_and_target_evidence() {
+  seed_resume_fixture route-plan linux/amd64,darwin/arm64,windows/amd64 || return 1
+  _build_state_jq_update "$RESUME_STATE_FILE" '
+    .context.target_hosts = {"linux/amd64":"trj","darwin/arm64":"mmini","windows/amd64":"wlap"} |
+    .hosts = {trj:{status:"completed"},mmini:{status:"running",retry_count:1}} |
+    .target_statuses = {
+      "linux/amd64":{status:"completed",attempts:1,result:{artifact:"candidate"}},
+      "darwin/arm64":{status:"completed",attempts:1,result:{}},
+      "windows/amd64":{status:"running",attempts:3}}' || return 1
+  local plan pending completed
+  plan=$(build_state_resume route-plan v1.0.0) || return 1
+  pending=$(build_state_pending_hosts route-plan v1.0.0) || return 1
+  completed=$(build_state_completed_targets route-plan v1.0.0) || return 1
+  [[ "$pending" == $'mmini\nwlap' && "$completed" == linux/amd64 ]] || return 1
+  jq -e '.completed_hosts == ["trj"] and .hosts_to_process == ["mmini","wlap"] and
+    .completed_targets == ["linux/amd64"] and .targets_to_process == ["darwin/arm64"] and
+    .exceeded_target_retry_limit == ["windows/amd64"]' <<< "$plan" >/dev/null || return 1
+  seed_resume_fixture legacy-hosts trj,mmini,wlap || return 1
+  build_state_update_host legacy-hosts v1.0.0 trj completed || return 1
+  [[ "$(build_state_pending_hosts legacy-hosts v1.0.0)" == $'mmini\nwlap' ]]
+}
+
+test_resume_rejects_malformed_inventory() {
+  seed_resume_fixture bad-plan || return 1
+  local original filter status plan
+  original=$(cat "$RESUME_STATE_FILE")
+  for filter in '.targets = ["linux/amd64","linux/amd64"]' '.targets = null' \
+    '.targets = [1]' '.hosts = []' '.hosts.trj = false' \
+    '.hosts.trj = {status:"failed",retry_count:-1}' \
+    '.hosts.trj = {status:"failed",retry_count:"0"}' \
+    '.hosts.trj = {status:"running",retry_count:null}' \
+    '.hosts.trj = {status:"mystery"}' '.target_statuses["linux/amd64"].attempts = 1.5' \
+    '.target_statuses["linux/amd64"].attempts = false' '.target_statuses.other = {}' \
+    '.context = []' '.context.target_hosts = {"linux/amd64":null}'; do
+    jq "$filter" <<< "$original" > "$RESUME_STATE_FILE" || return 1
+    status=0
+    plan=$(build_state_resume bad-plan v1.0.0 2>/dev/null) || status=$?
+    [[ $status -ne 0 ]] && jq -es 'length == 1 and .[0].can_resume == false' \
+      <<< "$plan" >/dev/null || return 1
+  done
+}
+
+test_retry_budget_validation() {
+  local marker="$TEMP_DIR/invalid-retry-command" value status
+  retry_command() { : > "$marker"; }
+  for value in 0 -1 1.5 nope 1001; do
+    status=0
+    build_retry_with_backoff "$value" retry_command 2>/dev/null || status=$?
+    [[ $status -eq 4 && ! -e "$marker" ]] || return 1
+  done
+  ! build_retry_with_backoff 2 '' 2>/dev/null || return 1
+  status=0
+  BUILD_RETRY_BASE_DELAY=0 build_retry_with_backoff 02 bash -c 'exit 17' \
+    2>/dev/null || status=$?
+  [[ $status -eq 17 ]]
+}
+
+test_retry_backoff_is_bounded() {
+  local BUILD_RETRY_MAX=3 BUILD_RETRY_BASE_DELAY=5 BUILD_RETRY_MAX_DELAY=7
+  local attempt iteration delay
+  for attempt in 0 1 2 63 64 1000; do
+    for iteration in 1 2 3 4 5 6 7 8; do
+      delay=$(_build_calc_backoff "$attempt") || return 1
+      [[ "$delay" =~ ^[0-9]+$ ]] && ((delay <= 7)) || return 1
+    done
+  done
+  BUILD_RETRY_BASE_DELAY=0
+  [[ "$(_build_calc_backoff 1000)" == 0 ]] || return 1
+  BUILD_RETRY_BASE_DELAY=00005 BUILD_RETRY_MAX_DELAY=00000
+  [[ "$(_build_calc_backoff 0001)" == 0 ]] || return 1
+  BUILD_RETRY_BASE_DELAY=-1
+  ! _build_calc_backoff 1 2>/dev/null
+}
+
+test_retry_unreadable_budget_blocks_execution() {
+  seed_resume_fixture bad-budget || return 1
+  local original value status marker="$TEMP_DIR/bad-budget-command"
+  original=$(cat "$RESUME_STATE_FILE")
+  retry_command() { : > "$marker"; }
+  ! build_state_can_retry missing-tool v1.0.0 trj 2>/dev/null || return 1
+  for value in null false '"0"' -1 1.5; do
+    jq --argjson value "$value" '.hosts.trj = {status:"failed",retry_count:$value}' \
+      <<< "$original" > "$RESUME_STATE_FILE" || return 1
+    ! build_state_can_retry bad-budget v1.0.0 trj 2>/dev/null || return 1
+    status=0
+    build_state_exec_with_retry bad-budget v1.0.0 trj retry_command 2>/dev/null || status=$?
+    [[ $status -ne 0 && ! -e "$marker" ]] || return 1
+  done
+  for value in null false '[]' '"invalid"'; do
+    jq --argjson value "$value" '.hosts.trj = $value' \
+      <<< "$original" > "$RESUME_STATE_FILE" || return 1
+    ! build_state_can_retry bad-budget v1.0.0 trj 2>/dev/null || return 1
+    status=0
+    build_state_exec_with_retry bad-budget v1.0.0 trj retry_command 2>/dev/null || status=$?
+    [[ $status -ne 0 && ! -e "$marker" ]] || return 1
+  done
+}
+
+test_retry_preserves_exit_code_and_saved_budget() {
+  seed_resume_fixture saved-budget trj || return 1
+  _build_state_jq_update "$RESUME_STATE_FILE" '.hosts.trj = {status:"failed",retry_count:2}' || return 1
+  local BUILD_RETRY_MAX=3 BUILD_RETRY_BASE_DELAY=0
+  local marker="$TEMP_DIR/saved-budget-command" status=0
+  retry_command() { printf 'attempt\n' >> "$marker"; return 17; }
+  build_state_exec_with_retry saved-budget v1.0.0 trj retry_command 2>/dev/null || status=$?
+  [[ $status -ne 0 && "$(wc -l < "$marker")" -eq 1 ]] || return 1
+  jq -e '.hosts.trj.status == "failed" and .hosts.trj.retry_count == 3 and
+    .hosts.trj.exit_code == 17 and .hosts.trj.retries[0].attempt == 3 and
+    .hosts.trj.retries[0].error == "exit code 17"' "$RESUME_STATE_FILE" >/dev/null || return 1
+  ! build_state_exec_with_retry saved-budget v1.0.0 trj retry_command 2>/dev/null || return 1
+  [[ "$(wc -l < "$marker")" -eq 1 ]]
+}
+
+test_retry_success_and_failure_share_receipt() {
+  seed_resume_fixture retry-success trj || return 1
+  local BUILD_RETRY_MAX=3 BUILD_RETRY_BASE_DELAY=0 marker="$TEMP_DIR/retry-success-command"
+  retry_command() {
+    if [[ ! -e "$marker" ]]; then : > "$marker"; return 23; fi
+    return 0
+  }
+  build_state_exec_with_retry retry-success v1.0.0 trj retry_command || return 1
+  jq -e '.hosts.trj.status == "completed" and .hosts.trj.exit_code == 0 and
+    .hosts.trj.retry_count == 0 and .hosts.trj.attempts_started == 2 and
+    .hosts.trj.active_attempt == null and .hosts.trj.retries[0].exit_code == 23' \
+    "$RESUME_STATE_FILE" >/dev/null
+}
+
+test_retry_reservation_failure_prevents_command() {
+  seed_resume_fixture reservation-failure trj || return 1
+  local marker="$TEMP_DIR/reservation-command" status=0
+  retry_command() { : > "$marker"; }
+  _build_state_jq_update() { return 1; }
+  build_state_exec_with_retry reservation-failure v1.0.0 trj retry_command || status=$?
+  [[ $status -ne 0 && ! -e "$marker" ]]
+}
+
+test_retry_receipt_failure_stops_execution() {
+  local code tool marker status
+  local BUILD_RETRY_BASE_DELAY=0
+  for code in 0 17; do
+    tool="receipt-failure-$code"
+    seed_resume_fixture "$tool" trj || return 1
+    marker="$TEMP_DIR/$tool-command"
+    retry_command() { printf 'attempt\n' >> "$marker"; return "$code"; }
+    mv() {
+      [[ ! -e "$marker" ]] || return 1
+      command mv "$@"
+    }
+    status=0
+    build_state_exec_with_retry "$tool" v1.0.0 trj retry_command 2>/dev/null || status=$?
+    unset -f mv
+    [[ $status -ne 0 && "$(wc -l < "$marker")" -eq 1 ]] || return 1
+    jq -e '.hosts.trj.status == "running" and .hosts.trj.retry_count == 1' \
+      "$RESUME_STATE_FILE" >/dev/null || return 1
+  done
+}
+
+test_retry_pins_run_when_latest_moves() {
+  seed_resume_fixture retry-latest trj || return 1
+  local first="$RESUME_STATE_FILE" second before
+  DSR_RUN_ID=second-run build_state_create retry-latest v1.0.0 mmini >/dev/null || return 1
+  second="$_BUILD_STATE_DIR/retry-latest/v1.0.0/second-run/state.json"
+  before=$(cat "$second")
+  ln -sfn retry-latest-run "$_BUILD_STATE_DIR/retry-latest/v1.0.0/latest"
+  retry_command() {
+    ln -sfn second-run "$_BUILD_STATE_DIR/retry-latest/v1.0.0/latest"
+  }
+  build_state_exec_with_retry retry-latest v1.0.0 trj retry_command || return 1
+  [[ "$(cat "$second")" == "$before" ]] &&
+    jq -e '.hosts.trj.status == "completed" and .hosts.trj.exit_code == 0' "$first" >/dev/null
+}
+
+test_retry_interruption_is_not_retried() {
+  local code tool marker status
+  local BUILD_RETRY_BASE_DELAY=0
+  for code in 5 130 143; do
+    tool="retry-interrupted-$code"
+    seed_resume_fixture "$tool" trj || return 1
+    marker="$TEMP_DIR/$tool-command"
+    retry_command() { printf 'attempt\n' >> "$marker"; return "$code"; }
+    status=0
+    build_state_exec_with_retry "$tool" v1.0.0 trj retry_command 2>/dev/null || status=$?
+    [[ $status -eq 5 && "$(wc -l < "$marker")" -eq 1 ]] || return 1
+    jq -e --argjson code "$code" '.hosts.trj.status == "cancelled" and
+      .hosts.trj.exit_code == $code and .hosts.trj.retry_count == 1' "$RESUME_STATE_FILE" \
+      >/dev/null || return 1
+  done
+}
+
+test_retry_host_execution_lock() {
+  seed_resume_fixture host-execution trj,mmini || return 1
+  local ready="$TEMP_DIR/host-execution-ready" stop="$TEMP_DIR/host-execution-stop"
+  local forbidden="$TEMP_DIR/host-execution-duplicate" pid step status=0 result=0
+  slow_command() {
+    : > "$ready"
+    for step in {1..1000}; do [[ -e "$stop" ]] && return 0; sleep 0.01; done
+    return 19
+  }
+  duplicate_command() { : > "$forbidden"; }
+  build_state_exec_with_retry host-execution v1.0.0 trj slow_command &
+  pid=$!
+  for step in {1..500}; do [[ -e "$ready" ]] && break; sleep 0.01; done
+  [[ -e "$ready" ]] || result=1
+  build_state_exec_with_retry host-execution v1.0.0 trj duplicate_command \
+    2>/dev/null || status=$?
+  [[ $status -eq 2 && ! -e "$forbidden" ]] || result=1
+  build_state_exec_with_retry host-execution v1.0.0 mmini true || result=1
+  : > "$stop"
+  wait "$pid" || result=1
+  [[ $result -eq 0 ]] && jq -e '.hosts.trj.status == "completed" and
+    .hosts.mmini.status == "completed"' "$RESUME_STATE_FILE" >/dev/null
+}
+
+test_retry_crash_consumes_reserved_attempt() {
+  seed_resume_fixture retry-crash trj || return 1
+  local status=0 marker="$TEMP_DIR/retry-crash-command" BUILD_RETRY_MAX=1
+  crash_command() { kill -KILL "$BASHPID"; }
+  retry_command() { : > "$marker"; }
+  build_state_exec_with_retry retry-crash v1.0.0 trj crash_command \
+    2>/dev/null || status=$?
+  [[ $status -ne 0 ]] && jq -e '.hosts.trj.status == "running" and
+    .hosts.trj.retry_count == 1' "$RESUME_STATE_FILE" >/dev/null || return 1
+  ! build_state_exec_with_retry retry-crash v1.0.0 trj retry_command \
+    2>/dev/null || return 1
+  [[ ! -e "$marker" ]] || return 1
+  BUILD_RETRY_MAX=2
+  build_state_exec_with_retry retry-crash v1.0.0 trj retry_command || return 1
+  [[ -e "$marker" ]] && jq -e '.hosts.trj.status == "completed" and
+    .hosts.trj.attempts_started == 2' "$RESUME_STATE_FILE" >/dev/null
+}
+
+test_retry_record_failure_propagates() {
+  seed_resume_fixture retry-record trj || return 1
+  _build_state_jq_update() { return 1; }
+  ! build_state_record_retry retry-record v1.0.0 trj 1 'failure'
+}
+
 # Cleanup
 cleanup() {
   rm -rf "$TEMP_DIR"
@@ -770,6 +1102,26 @@ run_state_regression "checkpoint lock wait is bounded and unrelated runs remain 
 run_state_regression "killed checkpoint writer does not strand the lock" test_checkpoint_crash_recovery
 run_state_regression "Python lock fallback retains the lock in the owning shell" test_checkpoint_python_lock_backend
 run_state_regression "checkpoint validates bounded timeout configuration" test_checkpoint_lock_config
+
+# Single-generation resume and durable retry execution regressions
+run_state_regression "state reads reject malformed checkpoints and wrong run identities" test_state_read_identity_and_shape
+run_state_regression "resume rejects unknown or terminal run statuses" test_resume_unknown_status_rejected
+run_state_regression "state writes reject invalid supplied host/target evidence" test_state_evidence_rejection
+run_state_regression "resume uses one checkpoint even when latest moves mid-read" test_resume_single_snapshot_after_latest_moves
+run_state_regression "resume maps real hosts and rejects empty target completion evidence" test_resume_host_routing_and_target_evidence
+run_state_regression "resume rejects malformed target/host inventories and counters" test_resume_rejects_malformed_inventory
+run_state_regression "generic retry rejects zero or invalid budgets before execution" test_retry_budget_validation
+run_state_regression "exponential retry backoff never exceeds its cap or overflows" test_retry_backoff_is_bounded
+run_state_regression "missing or invalid saved retry budgets cannot launch commands" test_retry_unreadable_budget_blocks_execution
+run_state_regression "retry execution preserves real exit codes and saved attempt budget" test_retry_preserves_exit_code_and_saved_budget
+run_state_regression "retry success/failure receipts are complete and atomic" test_retry_success_and_failure_share_receipt
+run_state_regression "failed attempt reservation prevents command execution" test_retry_reservation_failure_prevents_command
+run_state_regression "failed completion receipt prevents success or another retry" test_retry_receipt_failure_stops_execution
+run_state_regression "retry receipts stay bound to their original run after latest moves" test_retry_pins_run_when_latest_moves
+run_state_regression "interrupted commands record cancellation and are not retried" test_retry_interruption_is_not_retried
+run_state_regression "same-host execution is exclusive while other hosts overlap" test_retry_host_execution_lock
+run_state_regression "killed retry execution consumes budget and releases its host lock" test_retry_crash_consumes_reserved_attempt
+run_state_regression "retry history persistence errors propagate to the caller" test_retry_record_failure_propagates
 
 echo ""
 echo "=========================================="
