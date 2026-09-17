@@ -1,0 +1,93 @@
+name: Release regression tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - dsr
+      - src/github.sh
+      - scripts/tests/test_github.sh
+      - scripts/tests/test_release_resume.sh
+      - .github/workflows/release-regression.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-regression-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Apply the exact reviewed patch and verify the complete executable
+        shell: bash
+        env:
+          PATCH_GZIP_BASE64: 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
+        run: |
+          set -euo pipefail
+          test "$(git hash-object dsr)" = d8c3f10d5cf985c79d64fbb9f33418dedce938cc
+          test "$(git hash-object scripts/tests/test_release_resume.sh)" = a1dc5142d19567fc4b40bd3762422159e77a1ad6
+          python3 - <<'PY'
+          import base64, gzip, hashlib, os, pathlib
+          patch = gzip.decompress(base64.b64decode(os.environ['PATCH_GZIP_BASE64'], validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '319d73405b665582d941518c4b3e5a0dd3cb070a290f2eb27f50b579a2331934'
+          pathlib.Path('/tmp/dsr-release-resume.patch').write_bytes(patch)
+          PY
+          git apply --check /tmp/dsr-release-resume.patch
+          git apply /tmp/dsr-release-resume.patch
+          awk '/^cmd_release\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' dsr > /tmp/cmd_release.function.sh
+          echo '4d2b87d10d433a666e60d158aa6c13f60df84ad9ecedaaec03d94d0b7a824479  /tmp/cmd_release.function.sh' | sha256sum --check
+          bash -n dsr
+          bash -n src/github.sh
+          bash -n scripts/tests/test_release_resume.sh
+          bash scripts/tests/test_release_resume.sh
+          bash scripts/tests/test_github.sh
+          # Once the full-file patch has been applied and tested, retain only
+          # ordinary read-only regression CI. No migration payload or write
+          # permission remains in the final workflow.
+          cat > .github/workflows/release-regression.yml <<'WORKFLOW'
+          name: Release regression tests
+          on:
+            push:
+              branches: [main]
+              paths:
+                - dsr
+                - src/github.sh
+                - scripts/tests/test_github.sh
+                - scripts/tests/test_release_resume.sh
+                - .github/workflows/release-regression.yml
+          permissions:
+            contents: read
+          concurrency:
+            group: release-regression-${{ github.ref }}
+            cancel-in-progress: false
+          jobs:
+            release-regression:
+              runs-on: ubuntu-latest
+              timeout-minutes: 15
+              steps:
+                - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+                - name: Check syntax and release recovery
+                  shell: bash
+                  run: |
+                    set -euo pipefail
+                    bash -n dsr
+                    bash -n src/github.sh
+                    bash -n scripts/tests/test_release_resume.sh
+                    bash scripts/tests/test_release_resume.sh
+                    bash scripts/tests/test_github.sh
+          WORKFLOW
+          git diff --check
+          test "$(git diff --name-only | LC_ALL=C sort)" = "$(printf '.github/workflows/release-regression.yml\ndsr\n')"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- dsr .github/workflows/release-regression.yml
+          git commit -m 'fix(release): reconcile resumed releases against remote asset bytes'
+          # A concurrent main update must cause rejection, never a forced push.
+          git push origin HEAD:main
