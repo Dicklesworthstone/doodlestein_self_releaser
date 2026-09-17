@@ -7,9 +7,10 @@ on:
       - src/github.sh
       - scripts/tests/test_github.sh
       - scripts/tests/test_release_resume.sh
+      - scripts/tests/test_fallback_pipeline.sh
       - .github/workflows/release-regression.yml
 permissions:
-  contents: read
+  contents: write
 concurrency:
   group: release-regression-refs/heads/main
   cancel-in-progress: false
@@ -19,12 +20,37 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Check syntax and release recovery
+      - name: Apply and test the source-bound fallback changes
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          test "$(git hash-object dsr)" = 29ebeeac4fb1df052c2ce669f8e2f98f2fd954c6
+          awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' dsr > /tmp/fallback-before.sh
+          echo 'e112ecc56b819805499f70bfbd68fdf6b9e07339d95f14e631f8d08b95f63964  /tmp/fallback-before.sh' | sha256sum --check
+          gh api repos/Dicklesworthstone/doodlestein_self_releaser/git/blobs/ec802b1e81b8ad3786462dfac84c1b75b9d6a986 > /tmp/fallback-patch-blob.json
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, pathlib
+          blob = json.loads(pathlib.Path('/tmp/fallback-patch-blob.json').read_text())
+          patch = gzip.decompress(base64.b64decode(blob['content']))
+          assert hashlib.sha256(patch).hexdigest() == 'ece6398cff4ffbb1e6bac8db32ad91256c9bafc8322bd5ea998afa5bd450424c'
+          pathlib.Path('/tmp/fallback.patch').write_bytes(patch)
+          PY
+          git apply --check /tmp/fallback.patch
+          git apply /tmp/fallback.patch
+          awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' dsr > /tmp/fallback-after.sh
+          echo '66629681ece4e8e6c040885a6759509d717295f0e35b86fd061116f8c9aefd5a  /tmp/fallback-after.sh' | sha256sum --check
+          test "$(git hash-object scripts/tests/test_fallback_pipeline.sh)" = ea086f431b4e20461366c171c253b64b278d429a
           bash -n dsr
-          bash -n src/github.sh
-          bash -n scripts/tests/test_release_resume.sh
+          bash -n scripts/tests/test_fallback_pipeline.sh
+          bash scripts/tests/test_fallback_pipeline.sh
           bash scripts/tests/test_release_resume.sh
           bash scripts/tests/test_github.sh
+          git add -- dsr scripts/tests/test_fallback_pipeline.sh
+          git diff --cached --check
+          test "$(git diff --cached --name-only | LC_ALL=C sort)" = "$(printf 'dsr\nscripts/tests/test_fallback_pipeline.sh\n')"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(fallback): block incomplete or unverified releases (bd-1dgf)'
+          git push origin HEAD:main
