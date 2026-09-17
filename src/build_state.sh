@@ -54,7 +54,11 @@ _build_state_sha256() {
 _build_state_wait_lock() {
   local fd="$1" timeout="$2"
   if command -v flock &>/dev/null; then
-    flock -x -w "$timeout" "$fd"
+    if [[ "$timeout" == 0 ]]; then
+      flock -x -n "$fd"
+    else
+      flock -x -w "$timeout" "$fd"
+    fi
   elif command -v python3 &>/dev/null; then
     python3 - "$fd" "$timeout" <<'PY'
 import errno
@@ -84,6 +88,28 @@ PY
 
 _build_state_file_identity() {
   stat -Lc '%d:%i' "$1" 2>/dev/null || stat -Lf '%d:%i' "$1" 2>/dev/null
+}
+
+# Darwin's /dev/fd entries have a synthetic device number even with stat -L.
+# Inspect the inherited descriptor itself so the lock and pathname identities
+# are comparable, while still detecting replacement of the locked sidecar.
+_build_state_fd_identity() {
+  local fd="$1"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+  if command -v python3 &>/dev/null; then
+    python3 - "$fd" <<'PY'
+import os
+import sys
+
+identity = os.fstat(int(sys.argv[1]))
+print(f"{identity.st_dev}:{identity.st_ino}")
+PY
+  elif [[ -d /proc/self/fd ]]; then
+    _build_state_file_identity "/proc/self/fd/$fd"
+  else
+    log_error "Descriptor identity verification requires Python 3 or procfs"
+    return 1
+  fi
 }
 
 # Serialized read/modify/write transaction. A rename alone prevents partial
@@ -118,7 +144,7 @@ _build_state_jq_update() (
     log_error "Could not acquire state update lock within ${timeout}s: $state_file"
     return 1
   fi
-  lock_identity=$(_build_state_file_identity /dev/fd/9) || return 1
+  lock_identity=$(_build_state_fd_identity 9) || return 1
   if [[ -L "$lock_file" || ! -f "$lock_file" ||
         "$(_build_state_file_identity "$lock_file")" != "$lock_identity" ||
         -L "$state_file" || ! -f "$state_file" ]]; then
@@ -131,6 +157,8 @@ _build_state_jq_update() (
   before_file="$workdir/before.json"
   printf -v cleanup_command 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' \
     "$tmp_file" "$before_file" "$workdir"
+  # Paths are deliberately shell-quoted and frozen before the caller changes scope.
+  # shellcheck disable=SC2064
   trap "$cleanup_command" EXIT
   trap 'exit 5' INT TERM
 
@@ -1353,7 +1381,7 @@ build_state_exec_with_retry() (
   [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
   exec 8<> "$lock_file" || return 1
   _build_state_wait_lock 8 0 || return 2
-  lock_identity=$(_build_state_file_identity /dev/fd/8) || return 1
+  lock_identity=$(_build_state_fd_identity 8) || return 1
   [[ ! -L "$lock_file" && "$(_build_state_file_identity "$lock_file")" == "$lock_identity" ]] || return 1
   trap 'exit 5' INT TERM
 

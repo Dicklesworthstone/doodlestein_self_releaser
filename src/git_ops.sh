@@ -140,6 +140,10 @@ git_ops_is_dirty() {
     return 1
   fi
 
+  # Refresh index stat cache to avoid false positives when files have
+  # updated mtime/ctime or after commit-tree/read-tree with identical content.
+  git -C "$repo_path" update-index -q --ignore-submodules --refresh 2>/dev/null || true
+
   # git diff-index returns 0 if NO changes, 1 if changes exist
   # We invert: return 0 (true) if dirty, 1 (false) if clean
   if git -C "$repo_path" diff-index --quiet HEAD -- 2>/dev/null; then

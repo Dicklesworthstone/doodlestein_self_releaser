@@ -274,6 +274,8 @@ gh_api() (
     local retries=0
     response_file=$(mktemp "${TMPDIR:-/tmp}/dsr-api-response.XXXXXXXX") || return 8
     printf -v cleanup_command 'rm -f -- %q' "$response_file"
+    # Freeze the safely quoted local path before the subshell EXIT trap runs.
+    # shellcheck disable=SC2064
     trap "$cleanup_command" EXIT
     trap 'exit 5' INT TERM
 
@@ -1121,6 +1123,7 @@ gh_upload_asset_named() (
     local cleanup_command
     printf -v cleanup_command 'rm -f -- %q %q %q %q; rmdir -- %q 2>/dev/null || true' \
         "$workdir/payload" "$workdir/response" "$workdir/verified" "$workdir/headers" "$workdir"
+    # shellcheck disable=SC2064
     trap "$cleanup_command" EXIT
     trap 'exit 5' INT TERM
     cp -- "$file_path" "$workdir/payload" || return 4

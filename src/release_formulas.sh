@@ -488,6 +488,8 @@ HELP
     if [[ "$dry_run" == "true" ]]; then
         work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-formulas.XXXXXXXX") || return 4
         printf -v cleanup 'rm -rf -- %q' "$work"
+        # Freeze the safely quoted local path before the subshell EXIT trap runs.
+        # shellcheck disable=SC2064
         trap "$cleanup" EXIT
     else
         state_root="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/formulas"

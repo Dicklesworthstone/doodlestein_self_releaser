@@ -260,6 +260,7 @@ test_build_state_can_resume() {
     fail "build_state_can_resume should return true for failed"
   fi
 
+  ((TESTS_RUN++))
   build_state_update_status "ntm6" "v1.0.0" "completed"
   if build_state_can_resume "ntm6" "v1.0.0"; then
     fail "build_state_can_resume should return false for completed"
@@ -570,13 +571,39 @@ test_checkpoint_foreign_temp_preserved() {
     jq -e '.counter == 1' "$source" >/dev/null
 }
 
+test_checkpoint_descriptor_identity() {
+  local source="$TEMP_DIR/descriptor-state.json" lock_identity
+  printf '{"counter":0}\n' > "$source"
+  : > "$source.update.lock"
+  exec 9<> "$source.update.lock" || return 1
+  lock_identity=$(_build_state_fd_identity 9) || return 1
+  [[ "$lock_identity" == "$(_build_state_file_identity "$source.update.lock")" ]] || return 1
+  mv "$source.update.lock" "$source.original-lock" || return 1
+  : > "$source.update.lock"
+  [[ "$lock_identity" == "$(_build_state_fd_identity 9)" ]] || return 1
+  [[ "$lock_identity" != "$(_build_state_file_identity "$source.update.lock")" ]] || return 1
+  exec 9>&-
+  ! _build_state_fd_identity invalid 2>/dev/null
+}
+
+test_checkpoint_replaced_lock_rejected() {
+  local source="$TEMP_DIR/replaced-lock-state.json" status=0
+  printf '{"counter":0}\n' > "$source"
+  _build_state_wait_lock() {
+    mv "$source.update.lock" "$source.original-lock" || return 1
+    : > "$source.update.lock"
+  }
+  _build_state_jq_update "$source" '.counter = 1' 2>/dev/null || status=$?
+  [[ $status -ne 0 ]] && jq -e '.counter == 0' "$source" >/dev/null
+}
+
 test_checkpoint_concurrent_increments() {
-  local source="$TEMP_DIR/concurrent-state.json" worker iteration pid result=0
+  local source="$TEMP_DIR/concurrent-state.json" _worker _iteration pid result=0
   local -a pids=()
   printf '{"counter":0}\n' > "$source"
-  for worker in 1 2 3 4 5 6 7 8; do
+  for _worker in 1 2 3 4 5 6 7 8; do
     (
-      for iteration in 1 2 3 4 5 6; do
+      for _iteration in 1 2 3 4 5 6; do
         _build_state_jq_update "$source" '.counter += 1' || exit 1
       done
     ) &
@@ -643,7 +670,7 @@ test_checkpoint_timeout_and_independent_files() {
   local label="${1:-native}"
   local source="$TEMP_DIR/$label-locked-state.json" other="$TEMP_DIR/$label-independent-state.json"
   local ready="$TEMP_DIR/$label-update-lock-ready" stop="$TEMP_DIR/$label-update-lock-stop"
-  local pid step status=0 result=0
+  local pid _step status=0 result=0
   printf '{"counter":0}\n' > "$source"
   printf '{"counter":0}\n' > "$other"
   : > "$source.update.lock"
@@ -651,14 +678,14 @@ test_checkpoint_timeout_and_independent_files() {
     exec 9<> "$source.update.lock" || exit 1
     _build_state_wait_lock 9 1 || exit 1
     : > "$ready"
-    for step in {1..500}; do
+    for _step in {1..500}; do
       [[ -e "$stop" ]] && exit 0
       sleep 0.01
     done
     exit 1
   ) &
   pid=$!
-  for step in {1..300}; do [[ -e "$ready" ]] && break; sleep 0.01; done
+  for _step in {1..300}; do [[ -e "$ready" ]] && break; sleep 0.01; done
   [[ -e "$ready" ]] || result=1
   DSR_STATE_LOCK_TIMEOUT=0 _build_state_jq_update "$source" '.counter = 1' \
     2>/dev/null || status=$?
@@ -864,9 +891,9 @@ test_retry_budget_validation() {
 
 test_retry_backoff_is_bounded() {
   local BUILD_RETRY_MAX=3 BUILD_RETRY_BASE_DELAY=5 BUILD_RETRY_MAX_DELAY=7
-  local attempt iteration delay
+  local attempt _iteration delay
   for attempt in 0 1 2 63 64 1000; do
-    for iteration in 1 2 3 4 5 6 7 8; do
+    for _iteration in 1 2 3 4 5 6 7 8; do
       delay=$(_build_calc_backoff "$attempt") || return 1
       [[ "$delay" =~ ^[0-9]+$ ]] && ((delay <= 7)) || return 1
     done
@@ -997,16 +1024,16 @@ test_retry_interruption_is_not_retried() {
 test_retry_host_execution_lock() {
   seed_resume_fixture host-execution trj,mmini || return 1
   local ready="$TEMP_DIR/host-execution-ready" stop="$TEMP_DIR/host-execution-stop"
-  local forbidden="$TEMP_DIR/host-execution-duplicate" pid step status=0 result=0
+  local forbidden="$TEMP_DIR/host-execution-duplicate" pid _step status=0 result=0
   slow_command() {
     : > "$ready"
-    for step in {1..1000}; do [[ -e "$stop" ]] && return 0; sleep 0.01; done
+    for _step in {1..1000}; do [[ -e "$stop" ]] && return 0; sleep 0.01; done
     return 19
   }
   duplicate_command() { : > "$forbidden"; }
   build_state_exec_with_retry host-execution v1.0.0 trj slow_command &
   pid=$!
-  for step in {1..500}; do [[ -e "$ready" ]] && break; sleep 0.01; done
+  for _step in {1..500}; do [[ -e "$ready" ]] && break; sleep 0.01; done
   [[ -e "$ready" ]] || result=1
   build_state_exec_with_retry host-execution v1.0.0 trj duplicate_command \
     2>/dev/null || status=$?
@@ -1093,6 +1120,8 @@ test_build_state_exec_with_retry
 # Checkpoint transaction regressions
 run_state_regression "checkpoint rejects invalid input/output and identity drift" test_checkpoint_validation
 run_state_regression "checkpoint preserves another writer's PID-named temporary file" test_checkpoint_foreign_temp_preserved
+run_state_regression "descriptor identity matches its file and survives pathname replacement" test_checkpoint_descriptor_identity
+run_state_regression "checkpoint rejects a replaced lock after opening its descriptor" test_checkpoint_replaced_lock_rejected
 run_state_regression "48 overlapping checkpoint writes lose no updates" test_checkpoint_concurrent_increments
 run_state_regression "checkpoint rejects source/lock symlinks without changing their targets" test_checkpoint_symlinks_rejected
 run_state_regression "failed checkpoint publication preserves old state and permits retry" test_checkpoint_publication_failure

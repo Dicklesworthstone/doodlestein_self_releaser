@@ -35,7 +35,7 @@ setup() {
 
   # Create a test repository
   mkdir -p "$TEST_REPO"
-  git -C "$TEST_REPO" init --quiet
+  git -C "$TEST_REPO" init --quiet --initial-branch=main
   git -C "$TEST_REPO" config user.email "test@example.com"
   git -C "$TEST_REPO" config user.name "Test User"
 
@@ -60,8 +60,7 @@ setup() {
   git -C "$TEST_REPO" commit --quiet -m "Feature work"
 
   # Return to main branch
-  git -C "$TEST_REPO" checkout master --quiet 2>/dev/null || \
-    git -C "$TEST_REPO" checkout main --quiet 2>/dev/null || true
+  git -C "$TEST_REPO" checkout main --quiet
 }
 
 teardown() {
@@ -199,6 +198,21 @@ test_untracked_file_detection() {
   [[ $result -eq 0 ]]
 }
 
+test_commit_tree_stat_identical_not_dirty() {
+  local tree commit
+  tree=$(git -C "$TEST_REPO" write-tree)
+  commit=$(git -C "$TEST_REPO" commit-tree "$tree" -p HEAD -m "Commit tree test")
+  git -C "$TEST_REPO" update-ref HEAD "$commit"
+  sleep 1
+  touch "$TEST_REPO/file.txt"
+  ! git_ops_is_dirty "$TEST_REPO"
+}
+
+test_read_tree_content_identical_not_dirty() {
+  git -C "$TEST_REPO" read-tree HEAD
+  ! git_ops_is_dirty "$TEST_REPO"
+}
+
 test_dirty_status_clean() {
   local status
   status=$(git_ops_dirty_status "$TEST_REPO")
@@ -274,7 +288,7 @@ test_list_tags_pattern() {
 test_current_branch() {
   local branch
   branch=$(git_ops_current_branch "$TEST_REPO")
-  [[ "$branch" == "master" || "$branch" == "main" ]]
+  [[ "$branch" == "main" ]]
 }
 
 test_head_sha() {
@@ -372,6 +386,8 @@ main() {
   run_test "modified_file_is_dirty" test_modified_file_is_dirty
   run_test "staged_file_is_dirty" test_staged_file_is_dirty
   run_test "untracked_file_detection" test_untracked_file_detection
+  run_test "commit_tree_stat_identical_not_dirty" test_commit_tree_stat_identical_not_dirty
+  run_test "read_tree_content_identical_not_dirty" test_read_tree_content_identical_not_dirty
   run_test "dirty_status_clean" test_dirty_status_clean
   run_test "dirty_status_modified" test_dirty_status_modified
   run_test "dirty_status_untracked" test_dirty_status_untracked
