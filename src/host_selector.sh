@@ -39,6 +39,58 @@ _sel_log_ok()    { echo "${_SEL_GREEN}[selector]${_SEL_NC} $*" >&2; }
 _sel_log_warn()  { echo "${_SEL_YELLOW}[selector]${_SEL_NC} $*" >&2; }
 _sel_log_error() { echo "${_SEL_RED}[selector]${_SEL_NC} $*" >&2; }
 
+# Host aliases and run IDs are path components, never paths or expressions.
+_sel_safe_component() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$ ]]
+}
+
+# Read one configuration snapshot. JSON is valid YAML and can be read directly;
+# ordinary YAML requires yq. Never silently replace an unreadable/invalid
+# configured limit with the default (that can overcommit a build machine).
+_sel_hosts_json() {
+    local file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsr}/hosts.yaml}"
+    local config
+    command -v jq &>/dev/null || return 3
+    if [[ ! -e "$file" && ! -L "$file" ]]; then
+        printf '%s\n' '{"hosts":{}}'
+        return 0
+    fi
+    [[ -f "$file" && -r "$file" && ! -L "$file" ]] || return 4
+    if ! config=$(jq -cs 'if length == 1 then .[0] else error("multiple configs") end' "$file" 2>/dev/null); then
+        if ! command -v yq &>/dev/null; then
+            _sel_log_error "yq is required to read host configuration: $file"
+            return 3
+        fi
+        config=$(yq -o=json -I=0 '.' "$file" 2>/dev/null) || return 4
+    fi
+    if ! jq -es 'length == 1 and (.[0] | type == "object" and
+        (if has("hosts") then (.hosts | type == "object") else true end) and
+        ((.hosts // {}) | all(to_entries[];
+            (.key | test("^[A-Za-z0-9][A-Za-z0-9._+\\-]{0,199}$") and
+                (test("[\u0000-\u001f\u007f]") | not)) and
+            (.value | type == "object" and
+                (if has("concurrency") then (.concurrency | type == "number" and
+                    floor == . and . >= 0 and . <= 1024) else true end) and
+                (if has("enabled") then (.enabled | type == "boolean") else true end) and
+                (if has("platform") then (.platform | type == "string" and
+                    test("^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$") and
+                    (test("[\u0000-\u001f\u007f]") | not)) else true end) and
+                (if has("connection") then (.connection == "local" or .connection == "ssh") else true end)
+            )
+        )))' <<< "$config" >/dev/null 2>&1; then
+        _sel_log_error "Invalid host configuration: $file"
+        return 4
+    fi
+    jq -c '. + {hosts: (.hosts // {})}' <<< "$config"
+}
+
+_sel_limit_from_config() {
+    local hostname="$1" config="$2"
+    jq -r --arg h "$hostname" --argjson default "$_SELECTOR_DEFAULT_MAX_PARALLEL" '
+        if .hosts[$h].enabled == false then 0
+        else (.hosts[$h].concurrency // $default) end' <<< "$config"
+}
+
 # Initialize selector state
 # Usage: selector_init
 selector_init() {
@@ -53,29 +105,18 @@ selector_init() {
 # Usage: selector_get_limit <hostname>
 # Returns: max parallel builds for host
 selector_get_limit() {
-    local hostname="$1"
-    local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
-
-    if [[ ! -f "$hosts_file" ]] || ! command -v yq &>/dev/null; then
-        echo "$_SELECTOR_DEFAULT_MAX_PARALLEL"
-        return 0
-    fi
-
-    # Use strenv() to bind $hostname into the yq path safely; spliced
-    # interpolation would let a hostname containing a yq metachar
-    # (`.`, `[`, `(`, …) silently match the wrong key or evaluate an
-    # unintended expression.  Same defense-in-depth class as the
-    # round-4 config.sh fix.
-    local limit
-    limit=$(DSR_HOST="$hostname" yq -r ".hosts[strenv(DSR_HOST)].concurrency // $_SELECTOR_DEFAULT_MAX_PARALLEL" "$hosts_file" 2>/dev/null)
-    echo "${limit:-$_SELECTOR_DEFAULT_MAX_PARALLEL}"
+    local hostname="${1:-}" config
+    _sel_safe_component "$hostname" || return 4
+    config=$(_sel_hosts_json) || return $?
+    _sel_limit_from_config "$hostname" "$config"
 }
 
 # Get current slot usage for a host
 # Usage: selector_get_usage <hostname>
 # Returns: number of active builds
 selector_get_usage() {
-    local hostname="$1"
+    local hostname="${1:-}"
+    _sel_safe_component "$hostname" || return 4
 
     [[ -z "$_SELECTOR_LOCKS_DIR" ]] && selector_init
 
@@ -120,8 +161,8 @@ selector_has_capacity() {
     local hostname="$1"
 
     local limit usage
-    limit=$(selector_get_limit "$hostname")
-    usage=$(selector_get_usage "$hostname")
+    limit=$(selector_get_limit "$hostname") || return $?
+    usage=$(selector_get_usage "$hostname") || return $?
 
     [[ "$usage" -lt "$limit" ]]
 }
@@ -130,9 +171,10 @@ selector_has_capacity() {
 # Usage: selector_acquire_slot <hostname> <run_id> [--wait]
 # Returns: 0 on success, 2 if at capacity
 selector_acquire_slot() {
-    local hostname="$1"
+    local hostname="${1:-}"
     local run_id="${2:-$(date +%s)-$$}"
     local wait_mode=false
+    _sel_safe_component "$hostname" && _sel_safe_component "$run_id" || return 4
     [[ "${3:-}" == "--wait" ]] && wait_mode=true
 
     [[ -z "$_SELECTOR_LOCKS_DIR" ]] && selector_init
@@ -203,25 +245,29 @@ selector_acquire_slot() {
 
     # Helper to attempt acquisition
     _try_acquire() {
-        if selector_has_capacity "$hostname"; then
-            echo "$run_id" > "$slot_file"
-            touch "$slot_file"
-            return 0
-        else
-            return 1
-        fi
+        selector_has_capacity "$hostname" || return $?
+        printf '%s\n' "$run_id" > "$slot_file" || return 4
+        touch "$slot_file" || return 4
     }
 
+    local acquire_status
     if $wait_mode; then
         _sel_log_info "Host $hostname at capacity, waiting..."
         while true; do
             if _with_lock _try_acquire; then
                 break
+            else
+                acquire_status=$?
+                [[ $acquire_status -eq 1 ]] || return "$acquire_status"
             fi
-            sleep 5
+            sleep 5 || return 5
         done
     else
-        if ! _with_lock _try_acquire; then
+        if _with_lock _try_acquire; then
+            :
+        else
+            acquire_status=$?
+            [[ $acquire_status -eq 1 ]] || return "$acquire_status"
             local limit usage
             limit=$(selector_get_limit "$hostname")
             usage=$(selector_get_usage "$hostname")
@@ -242,8 +288,9 @@ selector_acquire_slot() {
 # Release a build slot on a host
 # Usage: selector_release_slot <hostname> <run_id>
 selector_release_slot() {
-    local hostname="$1"
-    local run_id="$2"
+    local hostname="${1:-}"
+    local run_id="${2:-}"
+    _sel_safe_component "$hostname" && _sel_safe_component "$run_id" || return 4
 
     [[ -z "$_SELECTOR_LOCKS_DIR" ]] && selector_init
 
@@ -264,49 +311,52 @@ selector_get_candidates() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --target) target="$2"; shift 2 ;;
-            --capability) capability="$2"; shift 2 ;;
-            *) shift ;;
+            --target) [[ $# -ge 2 && -n "$2" ]] || return 4; target="$2"; shift 2 ;;
+            --capability) [[ $# -ge 2 && -n "$2" ]] || return 4; capability="$2"; shift 2 ;;
+            *) _sel_log_error "Unknown selector option: $1"; return 4 ;;
         esac
     done
 
     local os=""
     if [[ -n "$target" ]]; then
+        [[ "$target" =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$ ]] || return 4
         os="${target%/*}"
     fi
+    [[ -z "$capability" ]] || _sel_safe_component "$capability" || return 4
+
+    local config
+    config=$(_sel_hosts_json) || return $?
 
     # Get healthy hosts
     local healthy_hosts
+    declare -F host_health_get_healthy_hosts &>/dev/null || return 3
     if [[ -n "$capability" ]]; then
-        healthy_hosts=$(host_health_get_healthy_hosts --for-capability "$capability" --json 2>/dev/null)
+        healthy_hosts=$(host_health_get_healthy_hosts --for-capability "$capability" --json) || return $?
     else
-        healthy_hosts=$(host_health_get_healthy_hosts --json 2>/dev/null)
+        healthy_hosts=$(host_health_get_healthy_hosts --json) || return $?
     fi
 
-    if [[ -z "$healthy_hosts" || "$healthy_hosts" == "[]" || "$healthy_hosts" == "null" ]]; then
-        echo "[]"
-        return 0
+    if ! jq -es 'length == 1 and (.[0] | type == "array" and all(.[];
+        type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]{0,199}$") and
+        (test("[\u0000-\u001f\u007f]") | not)))' <<< "$healthy_hosts" >/dev/null 2>&1; then
+        _sel_log_error "Host health returned an invalid host inventory"
+        return 4
     fi
-
-    # Get hosts config for platform filtering
-    local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
 
     # Build candidates with scores
     local candidates=()
     while IFS= read -r hostname; do
         [[ -z "$hostname" ]] && continue
 
-        # Get host info.  See selector_get_limit above — we bind
-        # $hostname through strenv() so a yq-metachar in the
-        # hostname (`.`, `[`, …) can't reshape the path expression.
+        # A stale health cache is not authority to schedule a removed/disabled
+        # host. All scheduling fields come from the same config snapshot.
+        jq -e --arg h "$hostname" '.hosts | has($h)' <<< "$config" >/dev/null || continue
         local platform="" connection=""
-        if [[ -f "$hosts_file" ]] && command -v yq &>/dev/null; then
-            platform=$(DSR_HOST="$hostname" yq -r '.hosts[strenv(DSR_HOST)].platform // ""' "$hosts_file" 2>/dev/null)
-            connection=$(DSR_HOST="$hostname" yq -r '.hosts[strenv(DSR_HOST)].connection // "ssh"' "$hosts_file" 2>/dev/null)
-        fi
+        platform=$(jq -r --arg h "$hostname" '.hosts[$h].platform // ""' <<< "$config") || return 4
+        connection=$(jq -r --arg h "$hostname" '.hosts[$h].connection // "ssh"' <<< "$config") || return 4
 
         # Filter by target platform if specified
-        if [[ -n "$os" && -n "$platform" ]]; then
+        if [[ -n "$os" ]]; then
             local host_os="${platform%/*}"
             if [[ "$host_os" != "$os" ]]; then
                 continue
@@ -317,8 +367,9 @@ selector_get_candidates() {
         local score=100
         local usage limit
 
-        usage=$(selector_get_usage "$hostname")
-        limit=$(selector_get_limit "$hostname")
+        limit=$(_sel_limit_from_config "$hostname" "$config") || return 4
+        ((limit > 0)) || continue
+        usage=$(selector_get_usage "$hostname") || return $?
 
         # Prefer hosts with more available capacity
         local available=$((limit - usage))
@@ -347,13 +398,13 @@ selector_get_candidates() {
                 limit: $limit,
                 available: $available,
                 score: $score
-            }')
+            }') || return 4
         candidates+=("$candidate")
-    done < <(echo "$healthy_hosts" | jq -r '.[]')
+    done < <(jq -r 'unique[]' <<< "$healthy_hosts")
 
     # Return sorted by score (descending)
     if [[ ${#candidates[@]} -gt 0 ]]; then
-        printf '%s\n' "${candidates[@]}" | jq -s 'sort_by(-.score)'
+        printf '%s\n' "${candidates[@]}" | jq -s 'sort_by([-.score, .hostname])'
     else
         echo "[]"
     fi
@@ -370,13 +421,14 @@ selector_choose_host() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --target) target="$2"; shift 2 ;;
-            --capability) capability="$2"; shift 2 ;;
-            --prefer) prefer="$2"; shift 2 ;;
+            --target) [[ $# -ge 2 && -n "$2" ]] || return 4; target="$2"; shift 2 ;;
+            --capability) [[ $# -ge 2 && -n "$2" ]] || return 4; capability="$2"; shift 2 ;;
+            --prefer) [[ $# -ge 2 && -n "$2" ]] || return 4; prefer="$2"; shift 2 ;;
             --json) json_mode=true; shift ;;
-            *) shift ;;
+            *) _sel_log_error "Unknown selector option: $1"; return 4 ;;
         esac
     done
+    [[ -z "$prefer" ]] || _sel_safe_component "$prefer" || return 4
 
     # Get candidates
     local candidates_args=()
@@ -384,7 +436,7 @@ selector_choose_host() {
     [[ -n "$capability" ]] && candidates_args+=(--capability "$capability")
 
     local candidates
-    candidates=$(selector_get_candidates "${candidates_args[@]}")
+    candidates=$(selector_get_candidates "${candidates_args[@]}") || return $?
 
     if [[ -z "$candidates" || "$candidates" == "[]" || "$candidates" == "null" ]]; then
         _sel_log_error "No suitable hosts found for target=$target capability=$capability"
@@ -407,7 +459,9 @@ selector_choose_host() {
 
     # Otherwise pick highest score with capacity
     if [[ -z "$chosen" ]]; then
-        chosen=$(echo "$candidates" | jq -r '.[0] | select(.available > 0) | .hostname')
+        # Filter BEFORE taking the first element. The local-host score bonus
+        # can otherwise keep an idle remote host behind a completely full one.
+        chosen=$(jq -r '[.[] | select(.available > 0)][0].hostname // empty' <<< "$candidates")
         reason="highest score with capacity"
     fi
 
@@ -447,29 +501,34 @@ selector_choose_host() {
 # Usage: selector_queue_status [--json]
 # Returns: JSON object with per-host usage
 selector_queue_status() {
-    local json_mode=false
-    [[ "${1:-}" == "--json" ]] && json_mode=true
+    [[ $# -eq 0 || ( $# -eq 1 && "$1" == "--json" ) ]] || return 4
 
-    [[ -z "$_SELECTOR_LOCKS_DIR" ]] && selector_init
+    if [[ -z "$_SELECTOR_LOCKS_DIR" ]]; then
+        selector_init || return 4
+    fi
 
-    local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
+    local config path
+    config=$(_sel_hosts_json) || return $?
     local status=()
 
-    # Get all configured hosts
+    # Include synthetic act-local and removed hosts that still own build slots,
+    # not only hosts that currently occur in the configuration.
     local hostnames
-    if [[ -f "$hosts_file" ]] && command -v yq &>/dev/null; then
-        hostnames=$(yq -r '.hosts | keys | .[]' "$hosts_file" 2>/dev/null)
-    else
-        # Fall back to lock directories
-        hostnames=$(ls "$_SELECTOR_LOCKS_DIR" 2>/dev/null || echo "")
-    fi
+    hostnames=$(jq -r '.hosts | keys[]' <<< "$config") || return 4
+    for path in "$_SELECTOR_LOCKS_DIR"/*; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -d "$path" && ! -L "$path" ]] || return 4
+        _sel_safe_component "${path##*/}" || return 4
+        hostnames+=$'\n'"${path##*/}"
+    done
+    hostnames=$(printf '%s\n' "$hostnames" | LC_ALL=C sort -u) || return 4
 
     while IFS= read -r hostname; do
         [[ -z "$hostname" ]] && continue
 
         local usage limit available
-        usage=$(selector_get_usage "$hostname")
-        limit=$(selector_get_limit "$hostname")
+        usage=$(selector_get_usage "$hostname") || return $?
+        limit=$(_sel_limit_from_config "$hostname" "$config") || return 4
         available=$((limit - usage))
 
         local entry
@@ -484,7 +543,7 @@ selector_queue_status() {
                 limit: $limit,
                 available: $available,
                 at_capacity: ($available <= 0)
-            }')
+            }') || return 4
         status+=("$entry")
     done <<< "$hostnames"
 
