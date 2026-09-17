@@ -537,6 +537,15 @@ remove_strict_verify_mock_gh() {
     unset -f gh curl
     unset STRICT_VERIFY_RELEASE_PAGE_ONE_FILE STRICT_VERIFY_RELEASE_PAGE_TWO_FILE
     unset STRICT_VERIFY_RELEASE_LIST_LOG STRICT_VERIFY_RELEASE_ID_LOG
+    if [[ ${STRICT_FIX_PRIOR_GH_RETRY_DELAY+x} ]]; then
+        if [[ "$STRICT_FIX_PRIOR_GH_RETRY_DELAY" == "__unset__" ]]; then
+            unset GH_RETRY_DELAY
+        else
+            export GH_RETRY_DELAY="$STRICT_FIX_PRIOR_GH_RETRY_DELAY"
+        fi
+    fi
+    unset STRICT_FIX_PRIOR_GH_RETRY_DELAY
+    unset STRICT_FIX_500_RESPONSE_MARKER
 }
 
 create_strict_verify_oversized_release_pages() {
@@ -616,6 +625,7 @@ create_strict_verify_fix_mock_gh() {
     STRICT_FIX_POST_UPLOAD_GET_COUNT_FILE="$mock_dir/post-upload-get-count"
     STRICT_FIX_RULESET_GET_COUNT_FILE="$mock_dir/ruleset-get-count"
     STRICT_FIX_TAG_NAME_FILE="$mock_dir/tag-name"
+    STRICT_FIX_500_RESPONSE_MARKER="$mock_dir/fixture-500-response"
     mkdir -p "$STRICT_FIX_UPLOADED_ASSETS_DIR"
     printf '%s\n' "$STRICT_VERIFY_ASSETS" > "$STRICT_FIX_ASSETS_FILE"
     printf '%s\n' "$STRICT_VERIFY_EXPECTED_ASSETS" > "$STRICT_FIX_EXPECTED_ASSETS_FILE"
@@ -640,7 +650,10 @@ create_strict_verify_fix_mock_gh() {
     export STRICT_FIX_TAG_GET_COUNT_FILE STRICT_FIX_POST_UPLOAD_MUTATION_MARKER
     export STRICT_FIX_UPLOAD_OCCURRED_FILE STRICT_FIX_POST_UPLOAD_GET_COUNT_FILE
     export STRICT_FIX_RULESET_GET_COUNT_FILE
-    export STRICT_FIX_TAG_NAME_FILE
+    export STRICT_FIX_TAG_NAME_FILE STRICT_FIX_500_RESPONSE_MARKER
+    STRICT_FIX_PRIOR_GH_RETRY_DELAY="${GH_RETRY_DELAY-__unset__}"
+    export STRICT_FIX_PRIOR_GH_RETRY_DELAY
+    export GH_RETRY_DELAY=0
 
     _strict_fix_release_json() {
         jq -nc \
@@ -650,7 +663,7 @@ create_strict_verify_fix_mock_gh() {
             {
                 id: 123,
                 tag_name: $tag_name,
-                upload_url: "https://uploads.example.invalid/releases/123/assets{?name,label}",
+                upload_url: "https://uploads.github.com/repos/testuser/test-tool/releases/123/assets{?name,label}",
                 html_url: "https://example.invalid/v1.0.0",
                 draft: $draft,
                 assets: $assets
@@ -800,6 +813,10 @@ create_strict_verify_fix_mock_gh() {
                         fi
                         return 0
                         ;;
+                    repos/testuser/test-tool/releases/123/assets\?*|repos/testuser/test-tool/releases/123/assets)
+                        cat "$STRICT_FIX_ASSETS_FILE"
+                        return 0
+                        ;;
                     repos/testuser/test-tool/releases/assets/*)
                         local asset_id="${endpoint##*/}"
                         if [[ "$method" == "GET" ]]; then
@@ -844,20 +861,43 @@ create_strict_verify_fix_mock_gh() {
     }
 
     curl() {
-        local url="${!#}" data_arg="" content_type="" arg
+        local url="" data_arg="" content_type="" output="" header_file="" arg
         while [[ $# -gt 0 ]]; do
             arg="$1"
             shift
-            if [[ "$arg" == "--data-binary" && $# -gt 0 ]]; then
-                data_arg="$1"
-                shift
-            elif [[ "$arg" == "-H" && $# -gt 0 ]]; then
-                case "$1" in
-                    Content-Type:*) content_type="${1#Content-Type: }" ;;
-                esac
-                shift
-            fi
+            case "$arg" in
+                --data-binary)
+                    [[ $# -gt 0 ]] || return 1
+                    data_arg="$1"
+                    shift
+                    ;;
+                -o)
+                    [[ $# -gt 0 ]] || return 1
+                    output="$1"
+                    shift
+                    ;;
+                -D)
+                    [[ $# -gt 0 ]] || return 1
+                    header_file="$1"
+                    shift
+                    ;;
+                -w)
+                    [[ $# -gt 0 ]] || return 1
+                    shift
+                    ;;
+                -H)
+                    [[ $# -gt 0 ]] || return 1
+                    case "$1" in
+                        Content-Type:*) content_type="${1#Content-Type: }" ;;
+                    esac
+                    shift
+                    ;;
+                http://*|https://*)
+                    url="$arg"
+                    ;;
+            esac
         done
+        [[ -n "$url" ]] || return 1
         local file_path="${data_arg#@}"
         local asset_name="${url##*?name=}"
         local expected
@@ -869,11 +909,15 @@ create_strict_verify_fix_mock_gh() {
             expected=$(jq -c --arg name "$asset_name" '.[] | select(.name == $name)' \
                 "$STRICT_FIX_EXPECTED_ASSETS_FILE")
             if [[ "$data_arg" != @* || ! -f "$file_path" || -z "$expected" ]]; then
-                printf '{}\n__HTTP_CODE__422'
+                [[ -n "$output" ]] && printf '{}\n' > "$output"
+                [[ -n "$header_file" ]] && printf 'HTTP/2 422 Unprocessable Entity\r\n\r\n' > "$header_file"
+                printf '422'
                 return 0
             fi
             cp "$file_path" "$STRICT_FIX_UPLOADED_ASSETS_DIR/$asset_name" || {
-                printf '{}\n__HTTP_CODE__500'
+                [[ -n "$output" ]] && printf '{}\n' > "$output"
+                [[ -n "$header_file" ]] && printf 'HTTP/2 500 Internal Server Error\r\n\r\n' > "$header_file"
+                printf '500'
                 return 0
             }
             jq -c --arg name "$asset_name" --argjson expected "$expected" '
@@ -900,12 +944,19 @@ create_strict_verify_fix_mock_gh() {
         fi
 
         if [[ "${STRICT_FIX_UPLOAD_MODE:-success}" == "ambiguous_publish" ]]; then
+            : > "$STRICT_FIX_500_RESPONSE_MARKER"
             printf 'false\n' > "$STRICT_FIX_DRAFT_FILE"
-            printf '{"message":"ambiguous"}\n__HTTP_CODE__500'
+            [[ -n "$output" ]] && printf '{"message":"ambiguous"}\n' > "$output"
+            [[ -n "$header_file" ]] && printf 'HTTP/2 500 Internal Server Error\r\n\r\n' > "$header_file"
+            printf '500'
         elif [[ "${STRICT_FIX_UPLOAD_MODE:-success}" == "fail_without_commit" ]]; then
-            printf '{"message":"failed"}\n__HTTP_CODE__500'
+            [[ -n "$output" ]] && printf '{"message":"failed"}\n' > "$output"
+            [[ -n "$header_file" ]] && printf 'HTTP/2 500 Internal Server Error\r\n\r\n' > "$header_file"
+            printf '500'
         else
-            printf '{"state":"uploaded"}\n__HTTP_CODE__201'
+            [[ -n "$output" ]] && printf '%s\n' "$expected" > "$output"
+            [[ -n "$header_file" ]] && printf 'HTTP/2 201 Created\r\n\r\n' > "$header_file"
+            printf '201'
         fi
         return 0
     }
@@ -2041,12 +2092,18 @@ test_strict_fix_failed_clobber_restores_draft() {
 
     if [[ $status -eq 1 && "$draft_state" == "true" && \
           -f "${STRICT_VERIFY_PRIMARY_PATH}.sha256" && \
+          -f "$STRICT_FIX_500_RESPONSE_MARKER" && \
+          -f "$STRICT_FIX_UPLOADED_ASSETS_DIR/test-tool-linux-amd64.sha256" && \
           -s "$STRICT_FIX_UPLOAD_LOG" && -s "$STRICT_FIX_PATCH_LOG" ]] && \
+        cmp -s "$STRICT_FIX_UPLOADED_ASSETS_DIR/test-tool-linux-amd64.sha256" "${STRICT_VERIFY_PRIMARY_PATH}.sha256" && \
         grep -q '\.sha256' "$STRICT_FIX_UPLOAD_LOG" && \
-        exec_stderr_contains "ambiguous failure"; then
-        pass "strict --fix treats an ambiguous missing-asset upload as failed and restores draft state"
+        exec_stderr_contains "Uploaded to ID-bound draft" && \
+        { exec_stderr_contains "draft state changed" || \
+          exec_stderr_contains "frozen-plan or tag revalidation"; } && \
+        exec_stderr_contains "release remains a draft"; then
+        pass "strict --fix reconciles committed bytes during ambiguous upload but restores draft after failing public draft fence"
     else
-        fail "strict --fix must fail and re-draft after an ambiguous missing-asset upload"
+        fail "strict --fix must reconcile committed bytes and re-draft after failing public draft fence"
         echo "status: $status, draft: $draft_state"
         echo "stderr: $(exec_stderr | tail -30)"
     fi
@@ -2646,6 +2703,21 @@ trap cleanup EXIT
 # ============================================================================
 # Run All Tests
 # ============================================================================
+
+if [[ $# -gt 0 ]]; then
+    selected_count=$#
+    for selected_test in "$@"; do
+        if [[ "$selected_test" != test_* ]] || ! declare -F "$selected_test" >/dev/null; then
+            echo "Unknown test function: $selected_test" >&2
+            exit 2
+        fi
+        "$selected_test"
+    done
+    printf 'Tests run: %s\nPassed: %s\nSkipped: %s\nFailed: %s\n' \
+        "$TESTS_RUN" "$TESTS_PASSED" "$TESTS_SKIPPED" "$TESTS_FAILED"
+    [[ "$TESTS_RUN" -eq "$selected_count" && "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+fi
 
 echo "=== Tests: dsr release verify (bd-1jt.5.12) ==="
 echo ""
