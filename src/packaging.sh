@@ -29,6 +29,14 @@ _pkg_log_warn() {
     fi
 }
 
+_pkg_log_info() {
+    if declare -F log_info &>/dev/null; then
+        log_info "$@"
+    else
+        echo "INFO: $*" >&2
+    fi
+}
+
 # Infer archive format from a file name. Mirrors _act_archive_format but is
 # sourceable without the act_runner module.
 packaging_format_for_name() {
@@ -45,11 +53,32 @@ packaging_format_for_name() {
 packaging_member_is_safe() {
     local member="$1"
     [[ -n "$member" && "$member" != /* && "$member" != -* ]] || return 1
-    [[ "$member" != *$'\n'* ]] || return 1
+    # Backslashes are ambiguous in tar's quoted listings and Windows paths;
+    # colons can denote drive-relative paths or alternate data streams.
+    [[ "$member" != *[[:cntrl:]]* && "$member" != *\\* && "$member" != *:* ]] || return 1
     case "/${member%/}/" in
         *"/../"*|*"//"*|*"/./"*) return 1 ;;
     esac
     return 0
+}
+
+# Refuse links and special files at any existing component of a payload path.
+# The root belongs to the caller; members cannot redirect writes outside it.
+_pkg_path_has_no_links() {
+    local root="$1" member="${2%/}" component path="$1"
+    [[ -d "$root" && ! -L "$root" ]] || return 1
+    while [[ -n "$member" ]]; do
+        component="${member%%/*}"
+        path="$path/$component"
+        [[ ! -L "$path" ]] || return 1
+        if [[ "$member" == */* ]]; then
+            [[ ! -e "$path" || -d "$path" ]] || return 1
+            member="${member#*/}"
+        else
+            [[ ! -e "$path" || -f "$path" || -d "$path" ]] || return 1
+            break
+        fi
+    done
 }
 
 # List archive members, one per line.
@@ -59,8 +88,14 @@ packaging_list_members() {
 
     [[ -f "$archive" && ! -L "$archive" ]] || return 4
     case "$format" in
-        tar.gz|tgz) tar -tzf "$archive" 2>/dev/null ;;
-        tar.xz) tar -tJf "$archive" 2>/dev/null ;;
+        tar.gz|tgz)
+            command -v tar &>/dev/null || return 3
+            tar -tzf "$archive" 2>/dev/null
+            ;;
+        tar.xz)
+            command -v tar &>/dev/null || return 3
+            tar -tJf "$archive" 2>/dev/null
+            ;;
         zip)
             command -v unzip &>/dev/null || return 3
             unzip -Z1 "$archive" 2>/dev/null
@@ -80,9 +115,58 @@ packaging_payload_members() {
     printf '%s\n' "$members" | { grep -v '/$' || true; } | LC_ALL=C sort
 }
 
+# Release payloads contain regular files and directories, not links, devices
+# or FIFOs. Names alone cannot establish that invariant. Inspect the type
+# column as well, never parse names from the human-readable verbose listing.
+# Reject unknown listing formats rather than silently omitting a record.
+packaging_validate_archive() {
+    local archive="$1" format="$2" members member listing line
+    local count=0 type_count=0
+    local -A seen=()
+    members=$(packaging_list_members "$archive" "$format") || return $?
+    [[ -n "$members" ]] || return 4
+    while IFS= read -r member; do
+        if ! packaging_member_is_safe "$member"; then
+            _pkg_log_error "Refusing unsafe archive member: $member"
+            return 4
+        fi
+        member="${member%/}"
+        if [[ -n "${seen[$member]:-}" ]]; then
+            _pkg_log_error "Refusing duplicate archive member: $member"
+            return 4
+        fi
+        seen["$member"]=1
+        count=$((count + 1))
+    done <<< "$members"
+    case "$format" in
+        tar.gz|tgz) listing=$(LC_ALL=C tar -tvzf "$archive" 2>/dev/null) || return 4 ;;
+        tar.xz) listing=$(LC_ALL=C tar -tvJf "$archive" 2>/dev/null) || return 4 ;;
+        zip) listing=$(LC_ALL=C unzip -Z -l "$archive" 2>/dev/null) || return 4 ;;
+        *) return 4 ;;
+    esac
+    while IFS= read -r line; do
+        if [[ "$format" == "zip" ]]; then
+            case "$line" in
+                'Archive: '*|'Zip file size: '*) continue ;;
+            esac
+            [[ "$line" =~ ^[0-9]+[[:space:]]files?, ]] && continue
+        fi
+        case "${line:0:1}" in
+            -|d) type_count=$((type_count + 1)) ;;
+            *)
+                _pkg_log_error "Refusing non-regular or unrecognized archive entry in $archive"
+                return 4
+                ;;
+        esac
+    done <<< "$listing"
+    [[ "$count" -eq "$type_count" ]] || return 4
+}
+
 # Extract every member of an archive into an existing destination directory,
-# refusing unsafe member paths first.
-packaging_extract_payload() {
+# refusing unsafe members and conflicting destination files first. In
+# particular, overwriting an existing hardlinked file could mutate a file
+# outside the destination even though neither path contains a symlink.
+packaging_extract_payload() (
     local archive="$1"
     local format="$2"
     local dest="$3"
@@ -91,32 +175,92 @@ packaging_extract_payload() {
     [[ -f "$archive" && ! -L "$archive" ]] || return 4
     [[ -d "$dest" && ! -L "$dest" ]] || return 4
 
-    members=$(packaging_list_members "$archive" "$format") || return 4
-    [[ -n "$members" ]] || return 4
+    packaging_validate_archive "$archive" "$format" || return $?
+    members=$(packaging_list_members "$archive" "$format") || return $?
     while IFS= read -r member; do
-        [[ -z "$member" ]] && continue
-        if ! packaging_member_is_safe "$member"; then
-            _pkg_log_error "Refusing unsafe archive member: $member"
+        if ! _pkg_path_has_no_links "$dest" "$member"; then
+            _pkg_log_error "Refusing unsafe extraction destination for: $member"
+            return 4
+        fi
+        if [[ -e "$dest/${member%/}" && ! -d "$dest/${member%/}" ]]; then
+            _pkg_log_error "Refusing to overwrite existing payload member: $member"
             return 4
         fi
     done <<< "$members"
 
+    # A caller's restrictive umask must not silently strip executable bits.
+    # Do not adopt the archive's user/group identities on a privileged host.
+    umask 022
     case "$format" in
-        tar.gz|tgz) tar -xzf "$archive" -C "$dest" 2>/dev/null || return 4 ;;
-        tar.xz) tar -xJf "$archive" -C "$dest" 2>/dev/null || return 4 ;;
+        tar.gz|tgz) tar --no-same-owner -xzf "$archive" -C "$dest" 2>/dev/null || return 4 ;;
+        tar.xz) tar --no-same-owner -xJf "$archive" -C "$dest" 2>/dev/null || return 4 ;;
         zip)
             command -v unzip &>/dev/null || return 3
             unzip -q -o "$archive" -d "$dest" 2>/dev/null || return 4
             ;;
         *) return 4 ;;
     esac
+)
+
+# Expand selected directories without following links. This also establishes
+# the exact expected file set, so zip cannot silently archive only a directory
+# entry while tar recursively includes the files beneath it.
+_pkg_selected_payload_members() (
+    set -o pipefail
+    local root="$1" member path name
+    shift
+    {
+        for member in "$@"; do
+            find "$root/$member" -print0 || return 4
+        done
+    } | while IFS= read -r -d '' path; do
+        name="${path#"$root"/}"
+        packaging_member_is_safe "$name" || return 4
+        if [[ -L "$path" || ( ! -f "$path" && ! -d "$path" ) ]]; then
+            _pkg_log_error "Refusing linked or special payload member: $name"
+            return 4
+        fi
+        [[ ! -f "$path" ]] || printf '%s\n' "$name"
+    done | LC_ALL=C sort -u
+)
+
+# Compare executable mode bits, not -x (which depends on the current user's
+# identity). Support both GNU stat and the BSD stat shipped on macOS.
+_pkg_executable_bits() {
+    local mode
+    mode=$(stat -c '%a' "$1" 2>/dev/null) || \
+        mode=$(stat -f '%Lp' "$1" 2>/dev/null) || return 4
+    [[ "$mode" =~ ^[0-7]{1,4}$ ]] || return 4
+    printf '%s\n' "$((8#$mode & 0111))"
 }
+
+# Return 0 for equal file sets, contents and executable bits, 1 for a payload
+# mismatch, or 3/4 for a dependency/validation failure. Archive timestamps,
+# compression settings and ownership deliberately do not define equality.
+_pkg_archive_matches_payload() (
+    local archive="$1" format="$2" payload="$3" expected="$4"
+    local actual workdir member source_bits archive_bits
+    actual=$(packaging_payload_members "$archive" "$format") || return $?
+    [[ -n "$expected" && "$actual" == "$expected" ]] || return 1
+    workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-payload-check.XXXXXXXX") || return 4
+    trap 'rm -rf -- "$workdir"' EXIT
+    trap 'exit 5' HUP INT TERM
+    packaging_extract_payload "$archive" "$format" "$workdir" || return $?
+    while IFS= read -r member; do
+        _pkg_path_has_no_links "$payload" "$member" || return 4
+        [[ -f "$payload/$member" && -f "$workdir/$member" ]] || return 1
+        cmp -s "$payload/$member" "$workdir/$member" || return 1
+        source_bits=$(_pkg_executable_bits "$payload/$member") || return $?
+        archive_bits=$(_pkg_executable_bits "$workdir/$member") || return $?
+        [[ "$source_bits" == "$archive_bits" ]] || return 1
+    done <<< "$expected"
+)
 
 # Build one archive of the requested format from a payload directory and an
 # explicit member list. This is the only sanctioned way to produce an archive
 # from bytes that may have lived in another archive: the compression never
 # sees the source archive, only the extracted payload files.
-packaging_build_archive() {
+packaging_build_archive() (
     local format="$1"
     local archive_path="$2"
     local payload_dir="$3"
@@ -135,6 +279,10 @@ packaging_build_archive() {
             _pkg_log_error "Archive member missing from payload directory: $member"
             return 4
         fi
+        if ! _pkg_path_has_no_links "$payload_dir" "$member"; then
+            _pkg_log_error "Refusing linked or special payload member: $member"
+            return 4
+        fi
     done
 
     case "$archive_path" in
@@ -142,31 +290,67 @@ packaging_build_archive() {
         *) archive_path="$PWD/$archive_path" ;;
     esac
 
+    # Never let a failed compressor truncate an already published artifact.
+    # Staging beside the destination keeps the final rename on one filesystem.
+    [[ ! -L "$archive_path" && ( ! -e "$archive_path" || -f "$archive_path" ) ]] || return 4
+    local archive_dir workdir staged members
+    archive_dir=$(cd "$(dirname "$archive_path")" && pwd -P) || return 4
+    archive_path="$archive_dir/$(basename "$archive_path")"
+    payload_dir=$(cd "$payload_dir" && pwd -P) || return 4
+    for member in "$@"; do
+        if [[ "$archive_path" -ef "$payload_dir/$member" ]] || \
+           [[ -d "$payload_dir/$member" && "$archive_path" == "$payload_dir/${member%/}/"* ]]; then
+            _pkg_log_error "Archive destination overlaps its payload: $archive_path"
+            return 4
+        fi
+    done
+    case "$format" in
+        tar.gz|tgz|tar.xz) command -v tar &>/dev/null || return 3 ;;
+        zip) command -v zip &>/dev/null && command -v unzip &>/dev/null || return 3 ;;
+        *) _pkg_log_error "Unsupported archive format: $format"; return 4 ;;
+    esac
+
+    members=$(_pkg_selected_payload_members "$payload_dir" "$@") || return $?
+    [[ -n "$members" ]] || return 4
+    if [[ -f "$archive_path" ]] && \
+       _pkg_archive_matches_payload "$archive_path" "$format" "$payload_dir" "$members" 2>/dev/null; then
+        _pkg_log_info "Reusing verified archive without recompression: $archive_path"
+        return 0
+    fi
+
+    workdir=$(mktemp -d "$archive_dir/.dsr-package.XXXXXXXX") || return 4
+    staged="$workdir/artifact.$format"
+    trap 'rm -rf -- "$workdir"' EXIT
+    trap 'exit 5' HUP INT TERM
+
     case "$format" in
         tar.gz|tgz)
-            COPYFILE_DISABLE=1 tar --no-xattrs -czf "$archive_path" \
+            COPYFILE_DISABLE=1 tar --no-xattrs -czf "$staged" \
                 -C "$payload_dir" "$@" || return 4
             ;;
         tar.xz)
-            COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$archive_path" \
+            COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$staged" \
                 -C "$payload_dir" "$@" || return 4
             ;;
         zip)
-            command -v zip &>/dev/null || return 3
-            (cd "$payload_dir" && zip -q -X -FS "$archive_path" "$@") || return 4
-            ;;
-        *)
-            _pkg_log_error "Unsupported archive format: $format"
-            return 4
+            (cd "$payload_dir" && zip -q -r -X "$staged" "$@") || return 4
             ;;
     esac
-}
+
+    if ! _pkg_archive_matches_payload "$staged" "$format" "$payload_dir" "$members"; then
+        _pkg_log_error "Archive payload verification failed: $archive_path"
+        return 4
+    fi
+    [[ ! -L "$archive_path" && ( ! -e "$archive_path" || -f "$archive_path" ) ]] || return 4
+    mv -f -- "$staged" "$archive_path" || return 4
+)
 
 # Rebuild an existing archive in a different format, independently: extract
 # the source payload, build the destination format from the payload files,
-# then prove both archives carry the identical member set. The destination is
-# never a wrapper around the source.
-packaging_repack_archive() {
+# then prove both archives carry identical files, bytes and executable bits.
+# Same-format source archives are authoritative and copied byte-for-byte,
+# never recompressed. Equivalent existing cross-format destinations are reused.
+packaging_repack_archive() (
     local src="$1"
     local src_format="$2"
     local dest="$3"
@@ -178,41 +362,49 @@ packaging_repack_archive() {
         return 4
     fi
 
-    local workdir payload status=0
-    workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-repack.XXXXXXXX") || return 4
+    [[ ! -L "$dest" && ( ! -e "$dest" || -f "$dest" ) ]] || return 4
+    [[ "$src_format" != "tgz" ]] || src_format="tar.gz"
+    [[ "$dest_format" != "tgz" ]] || dest_format="tar.gz"
+    local workdir payload dest_dir staged
+    dest_dir=$(cd "$(dirname "$dest")" && pwd -P) || return 4
+    dest="$dest_dir/$(basename "$dest")"
+    workdir=$(mktemp -d "$dest_dir/.dsr-repack.XXXXXXXX") || return 4
+    trap 'rm -rf -- "$workdir"' EXIT
+    trap 'exit 5' HUP INT TERM
     payload="$workdir/payload"
-    if ! mkdir "$payload"; then
-        rm -rf "$workdir"
-        return 4
-    fi
+    staged="$workdir/artifact.$dest_format"
+    mkdir "$payload" || return 4
 
     local -a members=()
-    local member src_members dest_members
-    if ! src_members=$(packaging_payload_members "$src" "$src_format") || \
-       [[ -z "$src_members" ]]; then
-        rm -rf "$workdir"
-        return 4
-    fi
+    local member src_members
+    src_members=$(packaging_payload_members "$src" "$src_format") || return $?
+    [[ -n "$src_members" ]] || return 4
     while IFS= read -r member; do
         [[ -n "$member" ]] && members+=("$member")
     done <<< "$src_members"
 
-    if ! packaging_extract_payload "$src" "$src_format" "$payload"; then
-        rm -rf "$workdir"
+    packaging_extract_payload "$src" "$src_format" "$payload" || return $?
+
+    if [[ "$src_format" == "$dest_format" ]]; then
+        if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+            _pkg_log_info "Reusing byte-identical prebuilt archive: $dest"
+            return 0
+        fi
+        cp -- "$src" "$staged" || return 4
+    elif [[ -f "$dest" ]] && \
+         _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" 2>/dev/null; then
+        _pkg_log_info "Reusing verified cross-format archive without recompression: $dest"
+        return 0
+    else
+        packaging_build_archive "$dest_format" "$staged" "$payload" "${members[@]}" || return $?
+    fi
+    if ! _pkg_archive_matches_payload "$staged" "$dest_format" "$payload" "$src_members"; then
+        _pkg_log_error "Repacked archive payload does not match source: $dest"
         return 4
     fi
-
-    if ! packaging_build_archive "$dest_format" "$dest" "$payload" "${members[@]}"; then
-        status=4
-    elif ! dest_members=$(packaging_payload_members "$dest" "$dest_format") || \
-         [[ "$dest_members" != "$src_members" ]]; then
-        _pkg_log_error "Repacked archive member set does not match source: $dest"
-        status=4
-    fi
-
-    rm -rf "$workdir"
-    return "$status"
-}
+    [[ ! -L "$dest" && ( ! -e "$dest" || -f "$dest" ) ]] || return 4
+    mv -f -- "$staged" "$dest" || return 4
+)
 
 # Read the per-repo switch that controls whether configured include_files
 # (README/LICENSE style extras) are added INSIDE release archives. Consumers
