@@ -624,11 +624,22 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         artifacts) sbom_generate_artifacts "$@" ;;
         verify) sbom_verify "$@" ;;
         verify-artifacts) sbom_verify_artifacts "$@" ;;
+        publish-artifacts|verify-release)
+            # Load GitHub transport only for the explicitly requested remote path.
+            source "$(dirname "${BASH_SOURCE[0]}")/sbom_release.sh" || exit 3
+            if [[ "$_sbom_command" == publish-artifacts ]]; then
+                sbom_publish_artifacts "$@"
+            else
+                sbom_verify_release "$@"
+            fi
+            ;;
         json) sbom_generate_json "$@" ;;
         help|--help|-h)
             printf '%s\n' \
                 'Usage: bash src/sbom.sh <command> <path> [options]' \
                 'Commands: generate, project, artifacts, verify, verify-artifacts, json' \
+                'Remote: publish-artifacts DIR --repo OWNER/REPO --tag vVERSION [--dry-run]' \
+                '        verify-release --repo OWNER/REPO --tag vVERSION --manifest-sha256 SHA256' \
                 'Single scan: --format spdx|cyclonedx --output FILE --quiet' \
                 'Release set: --format spdx|cyclonedx --output-dir DIRECTORY' \
                 'Verification checks local integrity, not signatures or build provenance.' ;;

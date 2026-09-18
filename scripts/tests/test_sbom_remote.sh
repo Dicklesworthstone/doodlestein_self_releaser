@@ -12,6 +12,7 @@ CASE='' ART='' REMOTE='' PIN='' FORMAT=spdx checks=0 failures=0 status=0 output=
 export DSR_GH_TOKEN=dsr-test-credential GH_TOKEN=wrong-cli-credential GITHUB_TOKEN=wrong-token GH_HOST=enterprise.example.test
 export SBOM_REMOTE_TIMEOUT=10 SBOM_REMOTE_MAX_DOCUMENT_BYTES=67108864 SBOM_OUTPUT_DIR=''
 syft() {
+    [[ "${SYFT_DISABLED:-false}" != true ]] || return 99
     local format=spdx name=fixture arg
     for arg in "$@"; do
         case "$arg" in cyclonedx-json) format=cyclonedx ;; file:*) name="${arg##*/}" ;; esac
@@ -41,6 +42,7 @@ new_case() {
     CASE="$WORK/$1"; ART="$CASE/artifacts"; REMOTE="$CASE/remote"
     mkdir -p "$ART" "$REMOTE/bytes"
     FORMAT="${2:-spdx}"
+    SYFT_DISABLED=false
     printf 'first\0payload\n' > "$ART/a.tar.gz"
     printf 'second payload\n' > "$ART/b.tar.xz"
     sbom_generate_artifacts "$ART" --format "$FORMAT" > "$CASE/generated" 2> "$CASE/generation.log" || {
@@ -79,6 +81,18 @@ gh_api() {
         repos/acme/tool/releases/42) cat "$REMOTE/release.json" ;;
         'repos/acme/tool/releases/42/assets?per_page=100&page='*)
             page="${1##*page=}"
+            # Publication's seventh inventory read is its last gate, after the
+            # independent verifier has finished. Recreate a newly added proof
+            # there, with identical bytes but a different immutable asset ID.
+            if [[ "$MODE" == final-proof-id && "$page" -eq 1 &&
+                  "$(grep -c '/assets?' "$CASE/api.log")" -eq 7 ]]; then
+                local previous_id
+                previous_id=$(jq -r '.[] | select(.name == "a.tar.gz.sbom.spdx.json") | .id' "$REMOTE/inventory.json")
+                cp "$REMOTE/bytes/$previous_id" "$REMOTE/bytes/9100"
+                jq 'map(if .name == "a.tar.gz.sbom.spdx.json" then .id = 9100 else . end)' \
+                    "$REMOTE/inventory.json" > "$REMOTE/inventory.next"
+                mv "$REMOTE/inventory.next" "$REMOTE/inventory.json"
+            fi
             [[ "$MODE" != second-page-failure || "$page" -ne 2 ]] || return 8
             if [[ "$MODE" == duplicate-page && "$page" -eq 2 ]]; then
                 jq '.[0:3]' "$REMOTE/inventory.json"
@@ -114,6 +128,10 @@ gh_download_release_asset() {
             mode) jq '.draft = false' "$REMOTE/release.json" > "$REMOTE/release.next"; mv "$REMOTE/release.next" "$REMOTE/release.json" ;;
             repo) jq '.id = 99' "$REMOTE/repository.json" > "$REMOTE/repository.next"; mv "$REMOTE/repository.next" "$REMOTE/repository.json" ;;
             asset-id) jq '.[0].id = 9000' "$REMOTE/inventory.json" > "$REMOTE/inventory.next"; mv "$REMOTE/inventory.next" "$REMOTE/inventory.json" ;;
+            proof-id)
+                cp "$REMOTE/bytes/103" "$REMOTE/bytes/9000"
+                jq 'map(if .name == "a.tar.gz.sbom.spdx.json" then .id = 9000 else . end)' \
+                    "$REMOTE/inventory.json" > "$REMOTE/inventory.next"; mv "$REMOTE/inventory.next" "$REMOTE/inventory.json" ;;
             extra) printf late > "$CASE/late.zip"; remote_add late.zip "$CASE/late.zip" ;;
         esac
     fi
@@ -149,6 +167,9 @@ set_remote_manifest() {
         'map(if .id == $id then .digest = ("sha256:" + $sha) | .size = $size else . end)' \
         "$REMOTE/inventory.json" > "$REMOTE/inventory.next" && mv "$REMOTE/inventory.next" "$REMOTE/inventory.json"
 }
+# The publication suite reuses this real inventory and transport fixture setup.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
 for format in spdx cyclonedx; do
     new_case "complete-$format" "$format"
     capture verify

@@ -22,6 +22,12 @@ bash src/sbom.sh verify-artifacts dist/v1.2.3 \
   --format cyclonedx --output-dir release-metadata/v1.2.3
 
 bash src/sbom.sh json dist/v1.2.3/tool.tar.gz --format spdx
+
+# Attach the verified inventory to an existing release with matching payloads.
+bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+  --repo OWNER/REPO --tag v1.2.3 --dry-run
+bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+  --repo OWNER/REPO --tag v1.2.3
 ```
 
 For sourced usage, the corresponding APIs are `sbom_generate`,
@@ -33,8 +39,9 @@ object on failure and returns the failing process status. Single scans accept
 `SBOM_OUTPUT_DIR` is the fallback when that option is omitted.
 
 These new batch commands are not automatically invoked by `dsr release`, and the
-monolithic CLI does not yet dispatch `dsr sbom artifacts` or
-`dsr sbom verify-artifacts`. Use the module entry points shown above.
+monolithic CLI does not yet dispatch these batch or remote subcommands. Use the
+`bash src/sbom.sh` module entry points shown above; they now include
+`publish-artifacts` and `verify-release`.
 
 ## Output identity and coverage
 
@@ -137,12 +144,13 @@ artifacts and SBOMs. The remote verifier checks both, against a manifest digest
 chosen independently of the release being inspected:
 
 ```bash
-bash src/sbom_release.sh verify --repo OWNER/REPO --tag v1.2.3 \
+bash src/sbom.sh verify-release --repo OWNER/REPO --tag v1.2.3 \
   --manifest-sha256 EXPECTED_64_HEX_SHA256 --format spdx
 ```
 
-For sourced use, load `src/sbom_release.sh` and call `sbom_verify_release` with
-the same options. Supply the digest from a separately verified local inventory
+The equivalent dedicated command is `bash src/sbom_release.sh verify`. For sourced
+use, load `src/sbom_release.sh` and call `sbom_verify_release` with the same options.
+Supply the digest from a separately verified local inventory
 or another trusted channel; obtaining both the manifest and its purported
 trusted digest from the same untrusted release is not authentication.
 
@@ -184,3 +192,96 @@ multi-request atomic transaction.
 real hashing/files and process-group deadlines with explicit GitHub/Syft fixtures.
 It includes both formats, digest-less assets, full pagination, malformed proofs,
 missing/extra payloads, identity changes, and a TERM-resistant transfer descendant.
+
+## Publish verified SBOMs to an existing release
+
+`publish-artifacts` closes the gap between a local inventory and the release
+people actually download. It requires a completed local SBOM inventory, an
+existing GitHub release and tag, and already-uploaded binary/archive payloads.
+It does not run Syft implicitly, create tags or releases, upload raw payloads,
+change release visibility, or promote a draft.
+
+```bash
+# Generate locally first; this is the only step that needs Syft.
+bash src/sbom.sh artifacts dist/v1.2.3 --format spdx
+
+# Read-only preflight: local verification plus uncached remote observations.
+bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+  --repo OWNER/REPO --tag v1.2.3 --format spdx --dry-run
+
+# Add documents to the existing draft; the complete inventory is uploaded last.
+bash src/sbom.sh publish-artifacts dist/v1.2.3 \
+  --repo OWNER/REPO --tag v1.2.3 --format spdx
+```
+
+For separately stored metadata, pass the same `--output-dir DIRECTORY` used for
+generation. `SBOM_OUTPUT_DIR` is the fallback. The equivalent dedicated command is
+`bash src/sbom_release.sh publish ARTIFACTS ...`; the sourced API is
+`sbom_publish_artifacts ARTIFACTS ...`. `--format cyclonedx` uses the separate
+CycloneDX document/manifest names.
+
+Publication performs these gates in order:
+
+1. Verify the exact local payload set, manifest and SBOM bindings. Copy only the
+   public documents into private snapshots and freeze their hashes and sizes.
+2. Bind the existing GitHub repository, release and tag. Verify the exact remote
+   payload namespace, every payload hash, and its size against the local artifact.
+3. Preflight **all** planned metadata names before uploading any of them. Existing
+   identical assets are reused; conflicting bytes, incomplete starter assets, or
+   orphan signatures are hard failures. A complete aggregate with missing SBOMs
+   is not silently repaired underneath its existing completeness claim.
+4. Upload missing individual SBOM documents. Re-download and validate every remote
+   document, recheck local evidence and remote identities, then upload the aggregate
+   last. Proof IDs become fixed once their bytes have been verified.
+5. Run the independent remote verifier against the frozen local manifest digest.
+   Recheck local evidence and the final remote inventory before returning success.
+
+By default, additions are allowed only for a draft. Adding SBOMs to an already
+published release requires `--allow-published`. A complete, identical published
+release can always be verified on a read-only retry without that override.
+The option grants only additive metadata publication: no existing assets are
+deleted or replaced, and GitHub immutability settings are not bypassed. This
+standalone operation does not load or amend a repository's strict `release_contract`;
+operators must ensure the permitted release asset set includes these SBOM names.
+
+If the second SBOM upload fails, the first remains available for retry. If only
+the aggregate upload fails, a retry reuses both verified documents and uploads
+only the missing aggregate. A lost upload acknowledgement does not become false
+success; a later retry reconciles the retained asset by content. Completed retries
+make no upload calls and preserve remote asset IDs. Known conflicting later targets
+are rejected before earlier missing targets are uploaded.
+
+Only `<artifact>.sbom.spdx.json` (or `.cdx.json`) and the matching
+`sbom-manifest.*.json` are published. Local plans, `.dsr.json` cache receipts and
+signature sidecars are **not** uploaded. Signatures are not generated or verified.
+An existing matching remote document can retain its signature, but an orphan
+signature cannot acquire newly uploaded unsigned bytes. Use a separate signing
+workflow when authenticity is required. Names must also satisfy the existing
+GitHub uploader's safe filename contract; unsupported names fail before uploads.
+
+Success prints one JSON publication receipt containing the independent verification
+result. `sbom_upload_attempts` counts document adapter calls, not newly created assets
+(a concurrent publisher can win and cause the adapter to reuse bytes).
+`manifest_upload_attempted` records whether that call was needed. Dry-run performs
+remote reads but no upload calls and returns `status: "planned"`, never a verified
+publication result. The existing `DRY_RUN=true` setting is honored as well.
+
+The verification receipt includes `asset_inventory_sha256`: SHA256 of the newline-
+terminated, compact JSON inventory with recursively sorted object keys and rows
+sorted by name. It binds the observed asset IDs, names, sizes, states and digests.
+The publisher compares its final observation to that fingerprint; a newly uploaded
+proof cannot be recreated under another ID after verification and still pass the
+last gate. This digest is an observation, not a signature or proof of provenance.
+
+Individual uploads are not a transaction. A late remote or local change can leave
+already-published assets, including an aggregate, while the command returns failure.
+Nothing is deleted to hide that failure; verify the current release before relying
+on it. Failed local verification retains its local error status, transport deadlines
+return 5, remote integrity conflicts return 7, and transport failures remain nonzero.
+
+`bash scripts/tests/test_sbom_publish.sh` tests the real local inventories and
+publication/verification flow with explicit GitHub/Syft fixtures. It covers both
+formats, interrupted uploads, ambiguous acknowledgements, aggregate-last ordering,
+preflight conflicts, dry-run, publication permissions, aliases, source and proof
+drift, deadlines, CLI dispatch and concurrent publishers. It performs no live
+GitHub release operation and uses no production credentials or signing keys.
