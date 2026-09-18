@@ -616,9 +616,13 @@ signing_get_public_key() {
     fi
 }
 
-# Sign multiple files (batch signing)
+# Sign a frozen set, not a sequence of independently changing file paths.
+# Preflight every input/retained signature before invoking the private key;
+# stage every missing signature before publishing any new public sidecar.
+# Multi-file publication is not atomic. Late conflicts leave valid completed
+# sidecars in place so the same batch can be verified and resumed safely.
 # Usage: signing_sign_batch <file1> [file2] [file3] ...
-signing_sign_batch() {
+signing_sign_batch() (
     if [[ $# -eq 0 ]]; then
         _sign_log_error "Usage: signing_sign_batch <file1> [file2] ..."
         return 4
@@ -626,42 +630,101 @@ signing_sign_batch() {
 
     signing_require_minisign || return 3
 
-    if [[ ! -f "$SIGNING_PRIVATE_KEY" ]]; then
-        _sign_log_error "Private key not found: $SIGNING_PRIVATE_KEY"
-        return 3
-    fi
-
-    local total=$#
-    local success=0
-    local failed=0
-
-    _sign_log_info "Signing $total file(s)..."
-    _sign_log_info "You may be prompted for your key password multiple times."
-    echo ""
-
+    local token private_key="$SIGNING_PRIVATE_KEY" file parent name canonical prior duplicate
+    local digest signature i stage piece cleanup='' pending=0 reused=0
+    local -a files=() digests=() signature_digests=() staged=()
+    token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY") || return 3
+    # Canonicalize path aliases, not hardlink aliases: distinct release names
+    # (versioned and installer-compatible) must each get their own signature.
     for file in "$@"; do
-        if [[ ! -f "$file" ]]; then
-            _sign_log_warn "Skipping (not found): $file"
-            ((failed++))
-            continue
+        if [[ ! -f "$file" || -L "$file" || "$file" == *[[:cntrl:]]* ]]; then
+            _sign_log_error "Invalid batch artifact: $file"
+            return 4
         fi
-
-        if signing_sign "$file" 2>/dev/null; then
-            ((success++))
+        parent="${file%/*}"
+        [[ "$parent" != "$file" ]] || parent=.
+        name="${file##*/}"
+        parent=$(cd "$parent" && pwd -P) || return 4
+        canonical="$parent/$name"
+        duplicate=false
+        for prior in "${files[@]}"; do
+            [[ "$prior" != "$canonical" ]] || duplicate=true
+        done
+        $duplicate && continue
+        digest=$(_signing_sha256 "$canonical") || return $?
+        files+=("$canonical")
+        digests+=("$digest")
+    done
+    # Otherwise foo and foo.minisig could be both a planned input and output.
+    for file in "${files[@]}"; do
+        for prior in "${files[@]}"; do
+            if [[ "$prior" == "$file.minisig" ]]; then
+                _sign_log_error "Batch input overlaps a signature output: $prior"
+                return 4
+            fi
+        done
+    done
+    for ((i=0; i<${#files[@]}; i++)); do
+        file="${files[i]}" signature="${files[i]}.minisig"
+        staged+=("")
+        if [[ -e "$signature" || -L "$signature" ]]; then
+            digest=$(_signing_sha256 "$signature") || return $?
+            _signing_reuse "$file" "$signature" "$token" "${digests[i]}" || return $?
+            [[ "$(_signing_sha256 "$signature")" == "$digest" ]] || return 4
+            signature_digests+=("$digest")
+            reused=$((reused + 1))
         else
-            _sign_log_error "Failed to sign: $file"
-            ((failed++))
+            signature_digests+=("")
+            pending=$((pending + 1))
         fi
     done
-
-    echo ""
-    _sign_log_info "Batch signing complete: $success succeeded, $failed failed"
-
-    if [[ $failed -gt 0 ]]; then
-        return 1
+    if ((pending > 0)) && [[ ! -f "$private_key" || -L "$private_key" || ! -s "$private_key" ]]; then
+        _sign_log_error "Private key is required for $pending unsigned artifact(s)"
+        return 3
     fi
+    _sign_log_info "Signing frozen batch: ${#files[@]} artifact(s), $pending new, $reused retained"
+    umask 077
+    trap 'exit 5' HUP INT TERM
+    for ((i=0; i<${#files[@]}; i++)); do
+        [[ -z "${signature_digests[i]}" ]] || continue
+        file="${files[i]}"
+        parent="${file%/*}" name="${file##*/}"
+        stage=$(mktemp -d "$parent/.${name}.dsr-batch.XXXXXXXX") || return 4
+        printf -v piece 'rm -f -- %q; rmdir -- %q 2>/dev/null || true;' "$stage/signature" "$stage"
+        cleanup+="$piece"
+        # shellcheck disable=SC2064 # Freeze only our private staging paths.
+        trap "$cleanup" EXIT
+        staged[i]="$stage/signature"
+        signing_sign_exact "$file" "${staged[i]}" "$private_key" "$token" \
+            "dsr artifact $name sha256:${digests[i]}" "${digests[i]}" || return $?
+        signature_digests[i]=$(_signing_sha256 "${staged[i]}") || return $?
+    done
+    # The final staged signature could have been produced after an earlier
+    # input/sidecar changed. Recheck the whole plan before exposing any output.
+    for ((i=0; i<${#files[@]}; i++)); do
+        file="${files[i]}" signature="${staged[i]:-${files[i]}.minisig}"
+        _signing_reuse "$file" "$signature" "$token" "${digests[i]}" || return $?
+        [[ "$(_signing_sha256 "$signature")" == "${signature_digests[i]}" ]] || return 4
+    done
+    for ((i=0; i<${#files[@]}; i++)); do
+        [[ -n "${staged[i]}" ]] || continue
+        signature="${files[i]}.minisig"
+        if ! ln -- "${staged[i]}" "$signature"; then
+            _sign_log_error "Signature publication conflict; completed sidecars retained: $signature"
+            return 4
+        fi
+        [[ ! -L "$signature" && "$signature" -ef "${staged[i]}" ]] || return 4
+    done
+    # Success means complete coverage of the original frozen set, with no
+    # changed inputs or replaced sidecars during staged publication.
+    for ((i=0; i<${#files[@]}; i++)); do
+        file="${files[i]}" signature="${files[i]}.minisig"
+        _signing_reuse "$file" "$signature" "$token" "${digests[i]}" || return $?
+        [[ "$(_signing_sha256 "$signature")" == "${signature_digests[i]}" ]] || return 4
+    done
+    _sign_log_ok "Verified complete signing batch: ${#files[@]} artifact(s)"
     return 0
-}
+)
 
 # Predicate used by orchestrators to decide whether to call into the
 # signing pipeline. Honors:
@@ -691,44 +754,44 @@ signing_is_enabled() {
     signing_check >/dev/null 2>&1
 }
 
-# Sign every file in a directory matching a glob pattern. Convenience
-# wrapper that expands the pattern (skipping already-signed sigs and
-# obvious non-artifacts like checksums and SBOMs) and forwards to
-# signing_sign_batch.
+# Sign release payloads AND integrity/provenance documents matching a basename
+# glob. Detached signatures themselves are the only excluded regular files.
+# An empty selection or unsafe candidate is a failure, not completed signing.
 # Usage: signing_sign_files <dir> <glob_pattern>
-signing_sign_files() {
+signing_sign_files() (
     local dir="${1:-}"
     local pattern="${2:-*}"
 
-    if [[ -z "$dir" || ! -d "$dir" ]]; then
+    if [[ -z "$dir" || ! -d "$dir" || -L "$dir" || -z "$pattern" || "$pattern" == */* ]]; then
         _sign_log_error "signing_sign_files: directory not found: $dir"
         return 4
     fi
 
-    # Build the list of candidates with explicit globbing so the caller
-    # doesn't have to. Skip files that wouldn't make sense to sign:
-    # checksums, SBOMs, provenance, existing signatures.
+    # Scope glob/IFS changes to this subshell and do not inherit exclusions or
+    # disabled globbing from the calling shell. Quoted directory, data-only glob.
     local -a files=()
     local f
+    local IFS=''
+    unset GLOBIGNORE
+    set +f
     shopt -s nullglob
+    shopt -u failglob dotglob
     for f in "$dir"/$pattern; do
-        [[ -f "$f" ]] || continue
-        case "$(basename "$f")" in
+        [[ ! -d "$f" || -L "$f" ]] || continue
+        case "${f##*/}" in
             *.minisig|*.sig|*.asc) continue ;;
-            *SHA256*|*sha256*|*checksums*) continue ;;
-            *.sbom.*|*.intoto.jsonl) continue ;;
         esac
+        [[ -f "$f" && ! -L "$f" ]] || { _sign_log_error "Unsafe signing candidate: $f"; return 4; }
         files+=("$f")
     done
-    shopt -u nullglob
 
     if [[ ${#files[@]} -eq 0 ]]; then
         _sign_log_warn "signing_sign_files: no files match $dir/$pattern"
-        return 0
+        return 4
     fi
 
     signing_sign_batch "${files[@]}"
-}
+)
 
 # Export functions for use by other scripts
 export -f signing_require_minisign signing_check signing_init signing_fix_permissions

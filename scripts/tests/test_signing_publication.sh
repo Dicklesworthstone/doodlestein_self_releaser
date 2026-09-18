@@ -8,7 +8,7 @@ TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-signing-test.XXXXXXXX") || exit 1
 trap 'rm -rf -- "$TEMP"' EXIT
 export DSR_CONFIG_DIR="$TEMP/config" NO_COLOR=1
 mkdir -p "$DSR_CONFIG_DIR/secrets" "$TEMP/artifacts"
-source "${DSR_SIGNING_MODULE:-$ROOT/src/signing.sh}"
+source "${DSR_SIGNING_MODULE:-$ROOT/src/signing.sh}" || exit 1
 TOKEN=$(printf 'A%.0s' {1..56})
 OTHER=$(printf 'B%.0s' {1..56})
 printf 'untrusted comment: fixture public key\n%s\n' "$TOKEN" > "$SIGNING_PUBLIC_KEY"
@@ -49,6 +49,11 @@ minisign() {
             sig-link) ln -s "$TARGET" "$signature"; return 0 ;;
             input-change) printf 'drifted artifact\n' >> "$TARGET" ;;
             public-change) printf 'untrusted comment: changed\n%s\n' "$OTHER" > "$PUBFILE" ;;
+            batch-second-fail)
+                [[ "$trusted" != *' batch-b '* ]] || { printf partial > "$signature"; return 23; } ;;
+            batch-late-change)
+                [[ "$trusted" != *' late-b '* ]] || printf 'late drift\n' >> "$TARGET" ;;
+            private-change) printf '%s\n' "$OTHER" > "$key" ;;
         esac
         # An incrementing untrusted field makes accidental re-signing visible.
         [[ "$untrusted" != fixture ]] || untrusted="fixture-$(wc -l < "$CALLS")"
@@ -87,7 +92,7 @@ new_file() {
     MODE=normal TARGET="$artifact"
     printf 'untrusted comment: fixture public key\n%s\n' "$TOKEN" > "$SIGNING_PUBLIC_KEY"
 }
-no_staging() { [[ -z "$(find "$TEMP/artifacts" -name '*.dsr-signing.*' -print)" ]]; }
+no_staging() { [[ -z "$(find "$TEMP/artifacts" \( -name '*.dsr-signing.*' -o -name '*.dsr-batch.*' \) -print)" ]]; }
 new_file release.tar.gz
 run signing_sign "$artifact"
 check 'ordinary signing publishes a sidecar only after verification' equal "$status" 0
@@ -143,7 +148,8 @@ run signing_sign "$artifact"
 check 'in-flight public key change does not change pinned trust identity' equal "$status" 0
 MODE=normal
 check 'signature verifies with the original pinned token' signing_verify_exact "$artifact" "$artifact.minisig" "$TOKEN"
-check 'signature does not verify with substituted public token' bash -c 'test "$1" != "$2"' _ "$TOKEN" "$(sed -n '2p' "$SIGNING_PUBLIC_KEY")"
+run signing_verify_exact "$artifact" "$artifact.minisig" "$OTHER"
+check 'signature does not verify with substituted public token' test "$status" -ne 0
 for mode in verify-input-change verify-signature-change; do
     new_file "$mode"
     signing_sign "$artifact" >/dev/null 2>&1 || exit 1
@@ -197,5 +203,184 @@ run signing_sign "$artifact"
 check 'staging cleanup leaves caller EXIT trap unchanged' equal "$(trap -p EXIT)" "$trap_before"
 check 'staging umask does not leak to caller' equal "$(umask)" "$umask_before"
 check 'all failure stages are cleaned' no_staging
+
+# A release signing batch is complete or failed, never a best-effort success.
+new_file batch-a; a="$artifact"
+before=$(grep -c '^-S ' "$CALLS")
+run signing_sign_batch "$a" "$TEMP/absent"
+check 'missing later input fails whole-batch preflight' equal "$status" 4
+check 'preflight failure invokes no signer' equal "$before" "$(grep -c '^-S ' "$CALLS")"
+check 'preflight failure publishes no early signature' test ! -e "$a.minisig"
+new_file batch-b; b="$artifact"
+MODE=batch-second-fail
+run signing_sign_batch "$a" "$b"
+check 'later signing failure fails the batch' test "$status" -ne 0
+check 'later signing failure does not publish the first staged signature' test ! -e "$a.minisig"
+check 'later signing failure publishes no partial final signature' test ! -e "$b.minisig"
+check 'failed whole-batch staging is removed' no_staging
+MODE=normal
+run signing_sign_batch "$a" "$b"
+check 'complete staged batch succeeds' equal "$status" 0
+check 'batch has no blank lines or signer noise on stdout' equal "$output" ''
+check 'first batch artifact verifies' signing_verify "$a"
+check 'second batch artifact verifies' signing_verify "$b"
+asig=$(_signing_sha256 "$a.minisig"); bsig=$(_signing_sha256 "$b.minisig")
+before=$(grep -c '^-S ' "$CALLS")
+run signing_sign_batch "$a" "$b" "$TEMP/artifacts/./batch-a"
+check 'duplicate path spellings are deduplicated and resume succeeds' equal "$status" 0
+check 'batch retry does not sign completed assets again' equal "$before" "$(grep -c '^-S ' "$CALLS")"
+check 'batch retry preserves first signature bytes' equal "$asig" "$(_signing_sha256 "$a.minisig")"
+check 'batch retry preserves second signature bytes' equal "$bsig" "$(_signing_sha256 "$b.minisig")"
+SIGNING_PRIVATE_KEY="$TEMP/private-key-offline"
+run signing_sign_batch "$a" "$b"
+check 'fully signed batch can resume without private key' equal "$status" 0
+SIGNING_PRIVATE_KEY="$private"
+new_file new-duplicate; a="$artifact"
+before=$(grep -c '^-S ' "$CALLS")
+run signing_sign_batch "$a" "$a" "$TEMP/artifacts/./new-duplicate"
+check 'duplicate new path has one signing operation' equal "$(grep -c '^-S ' "$CALLS")" "$((before + 1))"
+check 'duplicate new path does not cause publication conflict' equal "$status" 0
+new_file tool-1.2.3-linux-amd64.tar.gz; a="$artifact"
+b="$TEMP/artifacts/tool-linux-amd64.tar.gz"
+ln "$a" "$b"
+before=$(grep -c '^-S ' "$CALLS")
+run signing_sign_batch "$a" "$b"
+check 'versioned and compat hardlink aliases both sign' equal "$status" 0
+check 'distinct asset names are not deduplicated by inode' equal "$(grep -c '^-S ' "$CALLS")" "$((before + 2))"
+check 'versioned artifact signature binds its release name' grep -q 'tool-1.2.3-linux-amd64.tar.gz sha256:' "$a.minisig"
+check 'compat artifact signature binds its release name' grep -q 'tool-linux-amd64.tar.gz sha256:' "$b.minisig"
+check 'compat artifact sidecar verifies' signing_verify "$b"
+new_file overlap; a="$artifact"
+printf 'existing sidecar\n' > "$a.minisig"
+before=$(grep -c '^-S ' "$CALLS")
+run signing_sign_batch "$a" "$a.minisig"
+check 'batch input/output overlap rejected before signing' equal "$status" 4
+check 'overlap rejection has no signer calls' equal "$before" "$(grep -c '^-S ' "$CALLS")"
+new_file preflight-first; a="$artifact"
+new_file preflight-corrupt; b="$artifact"
+printf invalid > "$b.minisig"
+before=$(grep -c '^-S ' "$CALLS")
+run signing_sign_batch "$a" "$b"
+check 'bad retained signature blocks the whole batch' test "$status" -ne 0
+check 'bad retained signature checked before signing earlier unsigned file' equal "$before" "$(grep -c '^-S ' "$CALLS")"
+check 'retained conflict does not publish unrelated signature' test ! -e "$a.minisig"
+check 'corrupt existing signature is not overwritten' equal "$(cat "$b.minisig")" invalid
+new_file planned-a; a="$artifact"
+new_file planned-b; b="$artifact"
+MODE=input-change TARGET="$b"
+run signing_sign_batch "$a" "$b"
+check 'later artifact mutation fails its frozen digest check' test "$status" -ne 0
+check 'changed later input does not publish earlier staged sidecar' test ! -e "$a.minisig"
+check 'changed later input does not publish a signature for new bytes' test ! -e "$b.minisig"
+new_file late-a; a="$artifact"
+new_file late-b; b="$artifact"
+MODE=batch-late-change TARGET="$a"
+run signing_sign_batch "$a" "$b"
+check 'earlier input mutation during last signer is caught by set validation' test "$status" -ne 0
+check 'set validation failure publishes no early sidecar' test ! -e "$a.minisig"
+check 'set validation failure publishes no later sidecar' test ! -e "$b.minisig"
+new_file retained; a="$artifact"
+signing_sign "$a" >/dev/null 2>&1 || exit 1
+new_file unsigned; b="$artifact"
+MODE=input-change TARGET="$a.minisig"
+run signing_sign_batch "$a" "$b"
+check 'retained signature drift during new signing is detected' test "$status" -ne 0
+check 'retained signature drift prevents new public sidecar' test ! -e "$b.minisig"
+new_file key-a; a="$artifact"
+new_file key-b; b="$artifact"
+MODE=private-change
+run signing_sign_batch "$a" "$b"
+check 'changing private key cannot produce a mixed-key release set' test "$status" -ne 0
+check 'mixed-key attempt leaves first final sidecar absent' test ! -e "$a.minisig"
+check 'mixed-key attempt leaves second final sidecar absent' test ! -e "$b.minisig"
+printf '%s\n' "$TOKEN" > "$SIGNING_PRIVATE_KEY"
+new_file public-a; a="$artifact"
+new_file public-b; b="$artifact"
+MODE=public-change
+run signing_sign_batch "$a" "$b"
+check 'batch pins one public key for the entire operation' equal "$status" 0
+MODE=normal
+check 'first member verifies against pinned batch key' signing_verify_exact "$a" "$a.minisig" "$TOKEN"
+check 'second member verifies against pinned batch key' signing_verify_exact "$b" "$b.minisig" "$TOKEN"
+
+# Real hardlink publication, with a fault only at a selected FINAL sidecar.
+# Earlier successful publications must remain valid and reusable after failure.
+new_file publish-a; a="$artifact"
+new_file publish-b; b="$artifact"
+FAIL_LINK="$b.minisig"
+ln() {
+    [[ "${!#}" != "$FAIL_LINK" ]] || return 1
+    command ln "$@"
+}
+run signing_sign_batch "$a" "$b"
+check 'late publication failure fails the whole batch' equal "$status" 4
+check 'completed early sidecar survives late failure' signing_verify "$a"
+check 'failed late publication leaves destination absent' test ! -e "$b.minisig"
+asig=$(_signing_sha256 "$a.minisig")
+unset -f ln
+run signing_sign_batch "$a" "$b"
+check 'partial publication can be safely resumed' equal "$status" 0
+check 'resume never rewrites the completed early signature' equal "$asig" "$(_signing_sha256 "$a.minisig")"
+check 'resume completes missing late signature' signing_verify "$b"
+check 'all batch failure/success stages cleaned' no_staging
+
+# Competing publishers use real OS processes and the real atomic ln primitive.
+new_file concurrent-a; a="$artifact"
+new_file concurrent-b; b="$artifact"
+pids=()
+for n in 1 2 3 4 5 6; do
+    (code=0; signing_sign_batch "$a" "$b" > "$TEMP/race-$n.out" 2> "$TEMP/race-$n.err" || code=$?;
+     printf '%s\n' "$code" > "$TEMP/race-$n.status") &
+    pids+=("$!")
+done
+for pid in "${pids[@]}"; do wait "$pid" || exit 1; done
+check 'at least one competing batch completes' grep -q '^0$' "$TEMP"/race-*.status
+check 'competing publishers fail only on publication conflict or succeed' bash -c '! grep -Ev "^(0|4)$" "$@"' _ "$TEMP"/race-*.status
+check 'concurrent first artifact signature verifies' signing_verify "$a"
+check 'concurrent second artifact signature verifies' signing_verify "$b"
+check 'competing signing invocations leave no staging directories' no_staging
+
+# Directory selection signs release evidence as well as binaries; filenames
+# containing 'sha256' must not be silently filtered out of the release set.
+MODE=normal
+dir="$TEMP/directory with spaces"
+mkdir "$dir"
+for name in tool-v1.tar.gz tool.tar.gz checksums.sha256 tool.sbom.json tool.intoto.jsonl sha256-tool.zip; do
+    printf 'payload %s\n' "$name" > "$dir/$name"
+done
+run signing_sign_files "$dir" '*'
+check 'directory signing produces full release-evidence coverage' equal "$status" 0
+check 'directory signing keeps stdout empty' equal "$output" ''
+for name in tool-v1.tar.gz tool.tar.gz checksums.sha256 tool.sbom.json tool.intoto.jsonl sha256-tool.zip; do
+    check "directory signature verifies: $name" signing_verify "$dir/$name"
+done
+before=$(grep -c '^-S ' "$CALLS")
+run signing_sign_files "$dir" '*'
+check 'directory retry retains verified signatures and skips detached sidecars' equal "$status" 0
+check 'directory retry does not create signatures of signatures' test ! -e "$dir/tool.tar.gz.minisig.minisig"
+check 'directory retry has no new signer calls' equal "$before" "$(grep -c '^-S ' "$CALLS")"
+option_result=$(
+    shopt -s nullglob failglob; set -f; GLOBIGNORE='*'; IFS=:
+    old=$(shopt -p nullglob failglob); flags="$-"
+    signing_sign_files "$dir" '*.tar.gz' >/dev/null 2>&1 || exit 1
+    [[ "$(shopt -p nullglob failglob)" == "$old" && "$-" == "$flags" && "$GLOBIGNORE" == '*' && "$IFS" == : ]]
+    printf '%s' "$?"
+)
+check 'directory selection does not inherit or leak caller glob/IFS policy' equal "$option_result" 0
+run signing_sign_files "$dir" '*.does-not-exist'
+check 'empty signing selection is a failure instead of false completion' equal "$status" 4
+run signing_sign_files "$dir" '../*'
+check 'directory glob cannot escape requested directory' equal "$status" 4
+unsafe="$TEMP/unsafe-selection"
+mkdir "$unsafe"
+printf artifact > "$unsafe/a.tar.gz"
+ln -s "$dir/tool.tar.gz" "$unsafe/z.tar.gz"
+run signing_sign_files "$unsafe" '*.tar.gz'
+check 'linked candidate fails directory preflight' equal "$status" 4
+check 'invalid directory selection produces no earlier signature' test ! -e "$unsafe/a.tar.gz.minisig"
+mkfifo "$unsafe/z.pipe"
+run signing_sign_files "$unsafe" '*.pipe'
+check 'special file candidate rejected without reading or hanging' equal "$status" 4
+check 'final staging tree is empty' no_staging
 printf 'Signing publication: %s passed, %s failed\n' "$passed" "$failed"
 [[ "$failed" == 0 ]]
