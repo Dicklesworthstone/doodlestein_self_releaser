@@ -248,10 +248,12 @@ signing_sign() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --trusted-comment|-t)
+                [[ $# -ge 2 && -n "$2" ]] || return 4
                 trusted_comment="$2"
                 shift 2
                 ;;
             --untrusted-comment|-c)
+                [[ $# -ge 2 && -n "$2" ]] || return 4
                 untrusted_comment="$2"
                 shift 2
                 ;;
@@ -290,39 +292,30 @@ EOF
         return 4
     fi
 
-    if [[ ! -f "$file" ]]; then
-        _sign_log_error "File not found: $file"
+    if [[ ! -f "$file" || -L "$file" || "$file" == *[[:cntrl:]]* ||
+          "$trusted_comment" == *[[:cntrl:]]* || "$untrusted_comment" == *[[:cntrl:]]* ]]; then
+        _sign_log_error "Signing requires a regular file and single-line comments: $file"
         return 4
     fi
 
     signing_require_minisign || return 3
 
-    if [[ ! -f "$SIGNING_PRIVATE_KEY" ]]; then
-        _sign_log_error "Private key not found: $SIGNING_PRIVATE_KEY"
-        _sign_log_info "Run: dsr signing init"
-        return 3
+    # Freeze the configured trust key before invoking the signer. A successful
+    # minisign exit alone is not proof that the correct key or bytes were used.
+    local token digest signature="${file}.minisig"
+    token=$(signing_public_key_token "$SIGNING_PUBLIC_KEY") || return 3
+    digest=$(_signing_sha256 "$file") || return $?
+    if [[ -e "$signature" || -L "$signature" ]]; then
+        _signing_reuse "$file" "$signature" "$token" "$digest" \
+            "$trusted_comment" "$untrusted_comment" || return $?
+        _sign_log_ok "Retained verified signature: $signature"
+        return 0
     fi
-
-    # Build minisign command
-    local minisign_args=(-S -s "$SIGNING_PRIVATE_KEY" -m "$file")
-
-    if [[ -n "$trusted_comment" ]]; then
-        minisign_args+=(-t "$trusted_comment")
-    fi
-
-    if [[ -n "$untrusted_comment" ]]; then
-        minisign_args+=(-c "$untrusted_comment")
-    fi
-
-    _sign_log_info "Signing: $file"
-    _sign_log_info "You may be prompted for your key password."
-
-    if ! minisign "${minisign_args[@]}"; then
-        _sign_log_error "Failed to sign file"
-        return 1
-    fi
-
-    _sign_log_ok "Signature created: ${file}.minisig"
+    [[ -n "$trusted_comment" ]] || trusted_comment="dsr artifact ${file##*/} sha256:$digest"
+    _sign_log_info "Signing and verifying: $file"
+    signing_sign_exact "$file" "$signature" "$SIGNING_PRIVATE_KEY" "$token" \
+        "$trusted_comment" "$digest" "$untrusted_comment" || return $?
+    _sign_log_ok "Verified signature created: $signature"
     return 0
 }
 
@@ -335,6 +328,7 @@ signing_verify() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --public-key|-p)
+                [[ $# -ge 2 && -n "$2" ]] || return 4
                 public_key="$2"
                 shift 2
                 ;;
@@ -389,9 +383,12 @@ EOF
 
     _sign_log_info "Verifying: $file"
 
-    if ! minisign -V -p "$public_key" -m "$file"; then
+    local token status=0
+    token=$(signing_public_key_token "$public_key") || return 3
+    signing_verify_exact "$file" "$sig_file" "$token" || status=$?
+    if [[ "$status" != 0 ]]; then
         _sign_log_error "Signature verification FAILED"
-        return 1
+        return "$status"
     fi
 
     _sign_log_ok "Signature verified successfully"
@@ -422,6 +419,7 @@ signing_public_key_token() {
 # Verify an explicit detached signature with an inline, already-pinned public
 # key. `-H` rejects the legacy non-prehashed signature format.
 signing_verify_exact() {
+    [[ $# -eq 3 ]] || return 4
     local file="$1"
     local signature="$2"
     local public_key_token="$3"
@@ -431,7 +429,7 @@ signing_verify_exact() {
         _sign_log_error "Signed input must be a regular non-symlink file: $file"
         return 4
     fi
-    if [[ ! -f "$signature" || -L "$signature" ]]; then
+    if [[ ! -f "$signature" || -L "$signature" || ! -s "$signature" ]]; then
         _sign_log_error "Signature must be a regular non-symlink file: $signature"
         return 4
     fi
@@ -440,19 +438,48 @@ signing_verify_exact() {
         return 4
     fi
 
+    local before signature_before status=0
+    before=$(_signing_sha256 "$file") || return $?
+    signature_before=$(_signing_sha256 "$signature") || return $?
     minisign -V -H -q -P "$public_key_token" \
-        -m "$file" -x "$signature" >/dev/null 2>&1
+        -m "$file" -x "$signature" >/dev/null 2>&1 || status=$?
+    [[ "$status" == 0 ]] || return "$status"
+    [[ "$(_signing_sha256 "$file")" == "$before" &&
+       "$(_signing_sha256 "$signature")" == "$signature_before" ]] || {
+        _sign_log_error "Artifact or signature changed during verification: $file"
+        return 4
+    }
 }
 
 _signing_sha256() {
-    local file="$1"
+    local file="$1" digest
+    [[ -f "$file" && ! -L "$file" ]] || return 4
     if command -v sha256sum &>/dev/null; then
-        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+        digest=$(sha256sum < "$file") || return 4
     elif command -v shasum &>/dev/null; then
-        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+        digest=$(shasum -a 256 < "$file") || return 4
     else
         return 3
     fi
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ && -f "$file" && ! -L "$file" ]] || return 4
+    printf '%s\n' "$digest"
+}
+
+# Resume is verification, never re-signing. Preserve existing bytes even on a
+# conflict: changing a timestamp/comment breaks content-verified upload resume.
+_signing_reuse() {
+    local file="$1" signature="$2" token="$3" digest="$4"
+    local trusted="${5:-}" untrusted="${6:-}" signature_digest
+    signature_digest=$(_signing_sha256 "$signature") || return $?
+    if [[ -n "$trusted" && "$(sed -n '3{s/\r$//;p;}' "$signature")" != "trusted comment: $trusted" ]] ||
+       [[ -n "$untrusted" && "$(sed -n '1{s/\r$//;p;}' "$signature")" != "untrusted comment: $untrusted" ]]; then
+        _sign_log_error "Existing signature has different requested comments: $signature"
+        return 4
+    fi
+    signing_verify_exact "$file" "$signature" "$token" || return $?
+    [[ "$(_signing_sha256 "$file")" == "$digest" &&
+       "$(_signing_sha256 "$signature")" == "$signature_digest" ]] || return 4
 }
 
 # Create one exact detached signature without ever overwriting an existing
@@ -460,14 +487,16 @@ _signing_sha256() {
 # with the pinned public key, and only then published with an atomic hard link.
 # Once published, a late failure never unlinks the shared destination pathname;
 # Bash cannot atomically prove inode ownership and unlink it without a race.
-signing_sign_exact() {
+signing_sign_exact() (
+    [[ $# -ge 5 && $# -le 7 ]] || return 4
     local file="$1"
     local signature="$2"
     local private_key="$3"
     local public_key_token="$4"
     local trusted_comment="$5"
     local expected_file_sha256="${6:-}"
-    local signature_parent signature_name staging_dir staged_signature
+    local untrusted_comment="${7:-}"
+    local signature_parent signature_name staging_dir staged_signature snapshot cleanup
     local file_sha256_before="" file_sha256_after=""
     local status=0
 
@@ -476,7 +505,7 @@ signing_sign_exact() {
         _sign_log_error "Signed input must be a regular non-symlink file: $file"
         return 4
     fi
-    if [[ ! -f "$private_key" || -L "$private_key" ]]; then
+    if [[ ! -f "$private_key" || -L "$private_key" || ! -s "$private_key" ]]; then
         _sign_log_error "Private key must be a regular non-symlink file: $private_key"
         return 3
     fi
@@ -484,8 +513,9 @@ signing_sign_exact() {
         _sign_log_error "Refusing to overwrite existing signature: $signature"
         return 4
     fi
-    if [[ -z "$trusted_comment" || "$trusted_comment" == *$'\r'* || \
-          "$trusted_comment" == *$'\n'* ]]; then
+    if [[ ! "$public_key_token" =~ ^[A-Za-z0-9+/]{40,}={0,2}$ ||
+          -z "$trusted_comment" || "$trusted_comment" == *[[:cntrl:]]* ||
+          "$untrusted_comment" == *[[:cntrl:]]* ]]; then
         _sign_log_error "Trusted comment must be one non-empty line"
         return 4
     fi
@@ -503,25 +533,48 @@ signing_sign_exact() {
     signature_parent="${signature%/*}"
     [[ "$signature_parent" == "$signature" ]] && signature_parent="."
     signature_name="${signature##*/}"
+    [[ -n "$signature_name" && "$signature_name" != . && "$signature_name" != .. &&
+       "$signature_name" != *[[:cntrl:]]* && -d "$signature_parent" && ! -L "$signature_parent" ]] || return 4
+    umask 077
     staging_dir=$(mktemp -d \
         "$signature_parent/.${signature_name}.dsr-signing.XXXXXX") || {
         _sign_log_error "Could not create an isolated signature staging directory"
         return 4
     }
     staged_signature="$staging_dir/$signature_name"
+    snapshot="$staging_dir/payload"
+    # The destination basename can be 'payload'; keep snapshot and signature
+    # distinct without assuming a particular sidecar suffix.
+    [[ "$snapshot" != "$staged_signature" ]] || snapshot="$staging_dir/input"
+    printf -v cleanup 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' \
+        "$snapshot" "$staged_signature" "$staging_dir"
+    # shellcheck disable=SC2064 # Freeze safely quoted local paths for EXIT.
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    cp -- "$file" "$snapshot" || return 4
+    chmod 400 "$snapshot" || return 4
+    if [[ "$(_signing_sha256 "$snapshot")" != "$file_sha256_before" ||
+          "$(_signing_sha256 "$file")" != "$file_sha256_before" ]]; then
+        _sign_log_error "Input changed while freezing signing bytes: $file"
+        return 4
+    fi
+    local minisign_args=(-S -s "$private_key" -m "$snapshot" -x "$staged_signature" -t "$trusted_comment")
+    [[ -z "$untrusted_comment" ]] || minisign_args+=(-c "$untrusted_comment")
 
-    if ! minisign -S -s "$private_key" -m "$file" -x "$staged_signature" \
-        -t "$trusted_comment" >/dev/null 2>&1; then
+    if ! minisign "${minisign_args[@]}" >/dev/null 2>&1; then
         _sign_log_error "Could not create detached signature: $signature"
         status=4
-    elif ! signing_verify_exact "$file" "$staged_signature" "$public_key_token"; then
+    elif ! signing_verify_exact "$snapshot" "$staged_signature" "$public_key_token"; then
         _sign_log_error "Private key does not match the pinned public key"
         status=4
     elif ! file_sha256_after=$(_signing_sha256 "$file") || \
          [[ "$file_sha256_after" != "$file_sha256_before" ]]; then
         _sign_log_error "Input changed while its detached signature was staged: $file"
         status=4
-    elif ! ln "$staged_signature" "$signature"; then
+    elif ! signing_verify_exact "$file" "$staged_signature" "$public_key_token"; then
+        _sign_log_error "Staged signature does not verify against the original artifact"
+        status=4
+    elif ! ln -- "$staged_signature" "$signature"; then
         _sign_log_error "Could not atomically publish signature without clobbering: $signature"
         status=4
     elif [[ -L "$signature" || ! "$signature" -ef "$staged_signature" ]]; then
@@ -541,10 +594,8 @@ signing_sign_exact() {
         status=4
     fi
 
-    rm -f -- "$staged_signature"
-    rmdir -- "$staging_dir" 2>/dev/null || true
     return "$status"
-}
+)
 
 # Get the public key content for embedding
 # Usage: signing_get_public_key [--oneline]
