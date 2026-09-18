@@ -5,7 +5,7 @@
 #
 # Coverage:
 # - SLSA v1 provenance generation
-# - In-toto statement structure validation
+# - In-Toto statement structure validation
 # - Subject digest verification
 # - Artifact tampering detection
 #
@@ -124,25 +124,17 @@ teardown() {
     assert_equal "$invocation_id" "test-run-12345"
 }
 
-@test "slsa_generate includes timestamps" {
+@test "slsa_generate records observation time without inventing build times" {
     local artifact="$TEST_ARTIFACTS/test-binary"
     echo "binary" > "$artifact"
 
     run slsa_generate "$artifact"
     [[ "$status" -eq 0 ]]
 
-    # Check startedOn and finishedOn exist and are valid ISO8601
-    local started finished
-    started="$(jq -r '.predicate.runDetails.metadata.startedOn' "${artifact}.intoto.jsonl")"
-    finished="$(jq -r '.predicate.runDetails.metadata.finishedOn' "${artifact}.intoto.jsonl")"
-
-    # Should be non-null
-    [[ "$started" != "null" ]]
-    [[ "$finished" != "null" ]]
-
-    # Should match ISO8601 pattern (basic check)
-    [[ "$started" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]
-    [[ "$finished" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]
+    jq -e '.dsr_evidence.kind == "post-build-observation" and
+        (.dsr_evidence.observedOn | type == "string") and
+        (.predicate.runDetails.metadata | has("startedOn") | not) and
+        (.predicate.runDetails.metadata | has("finishedOn") | not)' "${artifact}.intoto.jsonl"
 }
 
 @test "slsa_generate includes build definition" {
@@ -213,13 +205,13 @@ teardown() {
     [[ ! -f "$TEST_ARTIFACTS/batch/tool.sig.intoto.jsonl" ]]
 }
 
-@test "slsa_generate_batch skips existing provenance" {
+@test "slsa_generate_batch rejects invalid existing provenance without overwriting" {
     mkdir -p "$TEST_ARTIFACTS/batch"
     echo "binary" > "$TEST_ARTIFACTS/batch/tool"
     echo '{"existing": true}' > "$TEST_ARTIFACTS/batch/tool.intoto.jsonl"
 
     run slsa_generate_batch "$TEST_ARTIFACTS/batch"
-    [[ "$status" -eq 0 ]]
+    [[ "$status" -ne 0 ]]
 
     # Should not overwrite existing
     local content
@@ -325,11 +317,14 @@ EOF
 # SLSA JSON Output Tests
 # ============================================================================
 
+# Bats merges stderr by default; these assertions concern the JSON stream.
+slsa_json_stdout() { slsa_generate_json "$@" 2>/dev/null; }
+
 @test "slsa_generate_json returns valid JSON" {
     local artifact="$TEST_ARTIFACTS/test-binary"
     echo "binary" > "$artifact"
 
-    run slsa_generate_json "$artifact"
+    run slsa_json_stdout "$artifact"
     [[ "$status" -eq 0 ]]
 
     # Should be valid JSON
@@ -340,7 +335,7 @@ EOF
     local artifact="$TEST_ARTIFACTS/test-binary"
     echo "binary" > "$artifact"
 
-    run slsa_generate_json "$artifact"
+    run slsa_json_stdout "$artifact"
     [[ "$status" -eq 0 ]]
 
     local json_status
@@ -349,7 +344,8 @@ EOF
 }
 
 @test "slsa_generate_json reports error status on failure" {
-    run slsa_generate_json "/nonexistent/file"
+    run slsa_json_stdout "/nonexistent/file"
+    [[ "$status" -ne 0 ]]
 
     local json_status
     json_status=$(echo "$output" | jq -r '.status')
@@ -360,7 +356,7 @@ EOF
     local artifact="$TEST_ARTIFACTS/test-binary"
     echo "binary" > "$artifact"
 
-    run slsa_generate_json "$artifact"
+    run slsa_json_stdout "$artifact"
     [[ "$status" -eq 0 ]]
 
     local duration
