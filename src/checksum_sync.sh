@@ -116,165 +116,223 @@ _cs_is_safe_path() {
     return 0
 }
 
-# Compute SHA256 for a file (portable: sha256sum or shasum -a 256)
-# Usage: _cs_sha256 <file>
+# Hash stdin, not a pathname printed by the hash tool. GNU sha256sum escapes
+# certain filenames; that escape prefix is not part of the actual digest.
 _cs_sha256() {
-    local file="$1"
-
+    local file="${1:-}" digest
+    [[ -f "$file" && ! -L "$file" ]] || return 4
     if command -v sha256sum &>/dev/null; then
-        sha256sum "$file" 2>/dev/null | awk '{print $1}'
-        return $?
+        digest=$(sha256sum < "$file") || return 1
+    elif command -v shasum &>/dev/null; then
+        digest=$(shasum -a 256 < "$file") || return 1
+    else
+        return 3
     fi
-
-    if command -v shasum &>/dev/null; then
-        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
-        return $?
-    fi
-
-    return 3
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-fA-F]{64}$ && -f "$file" && ! -L "$file" ]] || return 1
+    printf '%s\n' "${digest,,}"
 }
 
-# ============================================================================
-# Checksum Operations
-# ============================================================================
+# Portable, unescaped sha256sum member names. Spaces are supported; escaped
+# filenames, controls, absolute/drive paths, options and traversal are not.
+# A single conventional ./ prefix is normalized before duplicate detection.
+_cs_member_name() {
+    local name="${1:-}"
+    name="${name#./}"
+    [[ -n "$name" && "$name" != /* && "$name" != -* && "$name" != */ &&
+       "$name" != *[[:cntrl:]]* && "$name" != *\\* && "$name" != *:* ]] || return 4
+    case "/$name/" in *'/../'*|*'/./'*|*'//'*) return 4 ;; esac
+    printf '%s\n' "$name"
+}
 
-# Generate SHA256 checksums for files in a directory
-# Args: dir [--output file]
-# Returns: 0 on success, writes checksums to stdout or file
-checksum_generate() {
-    local dir=""
-    local output=""
-    local include_pattern="*"
-    local exclude_pattern=""
+_cs_regular_member() {
+    local root="$1" name="$2" part cursor="$1"
+    [[ -d "$root" && ! -L "$root" ]] || return 4
+    while [[ "$name" == */* ]]; do
+        part="${name%%/*}"; name="${name#*/}"
+        cursor="$cursor/$part"
+        [[ -d "$cursor" && ! -L "$cursor" ]] || return 4
+    done
+    [[ -f "$cursor/$name" && ! -L "$cursor/$name" ]]
+}
 
-    while [[ $# -gt 0 ]]; do
+# Validate a WHOLE manifest before emitting any records. No empty success,
+# duplicate names (including ./ aliases), malformed rows or ignored HTML.
+# Args: manifest_file
+# stdout: normalized text-mode SHA256 records, sorted by filename in C locale.
+# Both sha256sum text/binary modes, uppercase digests, CRLF, comments, and a
+# final record without a newline are accepted. This validates syntax, NOT trust.
+checksum_manifest_normalize() (
+    [[ $# -eq 1 && -f "$1" && ! -L "$1" && -s "$1" ]] || return 4
+    local manifest="$1" line hash sep name key rows='' count=0
+    local -A seen=()
+    # Bash read would silently remove NUL bytes. Reject them before parsing.
+    LC_ALL=C tr -d '\000' < "$manifest" | cmp -s - "$manifest" || return 4
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -n "$line" && "$line" != \#* ]] || continue
+        [[ "$line" == *[![:space:]]* ]] || continue
+        hash="${line:0:64}"; sep="${line:64:2}"; name="${line:66}"
+        if [[ ! "$hash" =~ ^[0-9a-fA-F]{64}$ || ( "$sep" != '  ' && "$sep" != ' *' ) ]]; then
+            _cs_log_error "Malformed checksum record"
+            return 4
+        fi
+        name=$(_cs_member_name "$name") || { _cs_log_error "Unsafe checksum member"; return 4; }
+        # Prefix the associative key to keep even unusual literal names data.
+        key="member:$name"
+        [[ -z "${seen[$key]:-}" ]] || { _cs_log_error "Duplicate checksum member: $name"; return 4; }
+        seen["$key"]=1
+        rows+="${hash,,}  $name"$'\n'
+        count=$((count + 1))
+    done < "$manifest"
+    ((count > 0)) || { _cs_log_error "Checksum manifest has no records"; return 4; }
+    # Fixed 66-byte hash/separator prefix. sort's key includes the complete
+    # filename, including its spaces, not just a whitespace-delimited word.
+    printf '%s' "$rows" | LC_ALL=C sort -k1.67
+)
+
+# Directory releases are flat. Preserve existing metadata exclusion by default;
+# --include-metadata covers README/text, SBOM and provenance payloads as well.
+# Integrity manifests/signatures never hash themselves or form signature cycles.
+_cs_skip_member() {
+    case "$1" in
+        *.sha256|*.sha512|*.md5|*.minisig|*.sig|*.asc|*SHA256SUMS*|checksums.txt) return 0 ;;
+    esac
+    if [[ "$2" != true ]]; then
+        case "$1" in *.txt|*.intoto.jsonl|*.sbom.*) return 0 ;; esac
+    fi
+    return 1
+}
+
+# Record selection with checked find output and NUL-delimited pathname reads.
+# Linked/special candidates must fail, not silently disappear from the set.
+_cs_select_members() (
+    local root="$1" include="$2" exclude="$3" metadata="$4" output="$5" inventory="$6"
+    local file name members=''
+    find "$root" -mindepth 1 -maxdepth 1 -print0 > "$inventory" || return 1
+    while IFS= read -r -d '' file; do
+        [[ ! -d "$file" || -L "$file" ]] || continue
+        name="${file##*/}"
+        [[ "$name" == $include ]] || continue
+        [[ -z "$exclude" || ! "$name" =~ $exclude ]] || continue
+        [[ "$file" != "$output" ]] || continue
+        _cs_skip_member "$name" "$metadata" && continue
+        _cs_member_name "$name" >/dev/null || return 4
+        [[ -f "$file" && ! -L "$file" ]] || { _cs_log_error "Unsafe checksum candidate: $name"; return 4; }
+        [[ -z "$output" || ! "$file" -ef "$output" ]] || {
+            _cs_log_error "Checksum output aliases an artifact: $name"; return 4;
+        }
+        members+="$name"$'\n'
+    done < "$inventory"
+    [[ -n "$members" ]] || { _cs_log_error "No artifacts selected for checksums"; return 7; }
+    printf '%s' "$members" | LC_ALL=C sort
+)
+
+# Generate a complete deterministic manifest, including separate versioned and
+# compatibility names even when their bytes/inodes match. No partial stdout or
+# truncated old output after hashing, selection or publication failures.
+# Args: dir [--output file] [--include glob] [--exclude regex] [--include-metadata]
+checksum_generate() (
+    local dir='' output='' include='*' exclude='' metadata=false option
+    while (($#)); do
         case "$1" in
-            --output|-o)
-                output="$2"
-                shift 2
-                ;;
-            --include|-i)
-                include_pattern="$2"
-                shift 2
-                ;;
-            --exclude|-e)
-                exclude_pattern="$2"
-                shift 2
-                ;;
-            *)
-                dir="$1"
-                shift
-                ;;
+            --output|-o|--include|-i|--exclude|-e)
+                [[ $# -ge 2 && -n "$2" ]] || return 4
+                option="$1"
+                case "$option" in
+                    --output|-o) output="$2" ;;
+                    --include|-i) include="$2" ;;
+                    *) exclude="$2" ;;
+                esac
+                shift 2 ;;
+            --include-metadata) metadata=true; shift ;;
+            --) shift; [[ $# -eq 1 && -z "$dir" ]] || return 4; dir="$1"; shift ;;
+            -*) return 4 ;;
+            *) [[ -z "$dir" ]] || return 4; dir="$1"; shift ;;
         esac
     done
-
-    if [[ -z "$dir" || ! -d "$dir" ]]; then
-        _cs_log_error "Directory required"
-        return 4
-    fi
-
-    local checksums=""
-
-    # Find files matching include pattern, excluding unwanted files
-    while IFS= read -r file; do
-        [[ -z "$file" ]] && continue
-
-        local filename
-        filename=$(basename "$file")
-
-        # Skip checksums, signatures, and provenance files
-        case "$filename" in
-            *.txt|*.sha256|*.sha512|*.md5|*.minisig|*.sig|*.asc|*.intoto.jsonl|*.sbom.*)
-                continue
-                ;;
-        esac
-
-        # Skip if matches exclude pattern
-        if [[ -n "$exclude_pattern" && "$filename" =~ $exclude_pattern ]]; then
-            continue
-        fi
-
-        local sha256
-        sha256=$(_cs_sha256 "$file" 2>/dev/null || echo "")
-        if [[ -n "$sha256" ]]; then
-            checksums+="$sha256  $filename"$'\n'
-        fi
-    done < <(find "$dir" -maxdepth 1 -type f -name "$include_pattern" 2>/dev/null | sort)
-
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" && "$include" != */* ]] || return 4
+    local regex_status=0
+    [[ '' =~ $exclude ]] || regex_status=$?
+    [[ "$regex_status" != 2 ]] || return 4
+    dir=$(cd "$dir" && pwd -P) || return 4
+    local parent="${TMPDIR:-/tmp}" name work cleanup members again member digest hash_status
     if [[ -n "$output" ]]; then
-        echo -n "$checksums" > "$output"
+        parent=$(dirname "$output"); name=$(basename "$output")
+        _cs_member_name "$name" >/dev/null || return 4
+        [[ -d "$parent" && ! -L "$parent" && ! -L "$output" &&
+           ( ! -e "$output" || -f "$output" ) ]] || return 4
+        parent=$(cd "$parent" && pwd -P) || return 4
+        output="$parent/$name"
+    fi
+    work=$(mktemp -d "$parent/.dsr-checksums.XXXXXXXX") || return 1
+    printf -v cleanup 'rm -f -- %q %q %q %q; rmdir -- %q 2>/dev/null || true' \
+        "$work/inventory" "$work/manifest" "$work/normalized" "$work/verify.log" "$work"
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    members=$(_cs_select_members "$dir" "$include" "$exclude" "$metadata" "$output" "$work/inventory") || return $?
+    : > "$work/manifest" || return 1
+    while IFS= read -r member; do
+        digest=$(_cs_sha256 "$dir/$member") || {
+            hash_status=$?; _cs_log_error "Cannot hash artifact: $member"; return "$hash_status";
+        }
+        printf '%s  %s\n' "$digest" "$member" >> "$work/manifest" || return 1
+    done <<< "$members"
+    checksum_manifest_normalize "$work/manifest" > "$work/normalized" || return $?
+    # Rehash the entire selection after collecting it; a late producer must
+    # not silently change an earlier artifact or add/remove a release name.
+    checksum_verify "$work/normalized" "$dir" >/dev/null 2> "$work/verify.log" || {
+        hash_status=$?; cat "$work/verify.log" >&2; return "$hash_status";
+    }
+    again=$(_cs_select_members "$dir" "$include" "$exclude" "$metadata" "$output" "$work/inventory") || return $?
+    [[ "$members" == "$again" ]] || { _cs_log_error "Artifact selection changed while hashing"; return 1; }
+    if [[ -n "$output" ]]; then
+        [[ ! -L "$output" && ( ! -e "$output" || -f "$output" ) ]] || return 4
+        if [[ -f "$output" ]] && cmp -s "$work/normalized" "$output"; then
+            _cs_log_info "Retaining identical checksum manifest: $output"
+            return 0
+        fi
+        mv -f -- "$work/normalized" "$output" || return 1
     else
-        echo -n "$checksums"
+        cat "$work/normalized" || return 1
     fi
-}
+)
 
-# Verify checksums from a manifest file
-# Args: checksums_file dir
-# Returns: 0 if all match, 1 if mismatch
-checksum_verify() {
-    local checksums_file="$1"
-    local dir="$2"
-
-    if [[ ! -f "$checksums_file" ]]; then
-        _cs_log_error "Checksums file not found: $checksums_file"
-        return 4
-    fi
-
-    if [[ ! -d "$dir" ]]; then
-        _cs_log_error "Directory not found: $dir"
-        return 4
-    fi
-
-    local failed=0
-    local verified=0
-
+# Verify every record; --strict also enforces complete flat-directory coverage
+# under the same selection policy as generation. Syntax errors are exit 4,
+# missing/mismatching payloads exit 1, unavailable hash tools exit 3.
+# Args: manifest dir [--strict] [--include-metadata]
+checksum_verify() (
+    [[ $# -ge 2 ]] || return 4
+    local manifest="$1" dir="$2" strict=false metadata=false
+    shift 2
+    while (($#)); do
+        case "$1" in --strict) strict=true ;; --include-metadata) metadata=true ;; *) return 4 ;; esac
+        shift
+    done
+    [[ -d "$dir" && ! -L "$dir" ]] || return 4
+    dir=$(cd "$dir" && pwd -P) || return 4
+    local normalized line expected name actual verified=0 listed='' selected work cleanup canonical_manifest
+    normalized=$(checksum_manifest_normalize "$manifest") || return $?
     while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        [[ "$line" =~ ^# ]] && continue
-
-        # Parse sha256sum format: "<hash>  <filename>" or "<hash> *<filename>"
-        # (the second field starts after exactly two characters past the
-        # hash — a space+space or space+asterisk separator). Using awk
-        # '{print $2}' only captured the first word of filenames that
-        # contained spaces; future dsr artifact-naming experiments that
-        # permit spaces (or releases signed by upstream tools that do)
-        # would silently report "file not found" for every such entry.
-        local expected_sha filename
-        expected_sha="${line%%[[:space:]]*}"
-        local rest="${line#$expected_sha}"
-        # Strip the 2-char separator: either "  " or " *"
-        rest="${rest#??}"
-        filename="$rest"
-
-        local file_path="$dir/$filename"
-        if [[ ! -f "$file_path" ]]; then
-            _cs_log_warn "File not found: $filename"
-            ((failed++))
-            continue
-        fi
-
-        local actual_sha
-        actual_sha=$(_cs_sha256 "$file_path" 2>/dev/null || echo "")
-
-        if [[ "$expected_sha" == "$actual_sha" ]]; then
-            _cs_log_debug "✓ $filename"
-            ((verified++))
-        else
-            _cs_log_error "✗ $filename: checksum mismatch"
-            _cs_log_error "  Expected: $expected_sha"
-            _cs_log_error "  Actual:   $actual_sha"
-            ((failed++))
-        fi
-    done < "$checksums_file"
-
-    if [[ $failed -gt 0 ]]; then
-        _cs_log_error "Verification failed: $failed file(s)"
-        return 1
+        expected="${line:0:64}"; name="${line:66}"
+        _cs_regular_member "$dir" "$name" || { _cs_log_error "Missing or unsafe artifact: $name"; return 1; }
+        actual=$(_cs_sha256 "$dir/$name") || return $?
+        [[ "$actual" == "$expected" ]] || { _cs_log_error "Checksum mismatch: $name"; return 1; }
+        listed+="$name"$'\n'
+        verified=$((verified + 1))
+    done <<< "$normalized"
+    if $strict; then
+        canonical_manifest="$(cd "$(dirname "$manifest")" && pwd -P)/$(basename "$manifest")" || return 4
+        work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-checksum-verify.XXXXXXXX") || return 1
+        printf -v cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$work/inventory" "$work"
+        trap "$cleanup" EXIT
+        trap 'exit 5' HUP INT TERM
+        selected=$(_cs_select_members "$dir" '*' '' "$metadata" "$canonical_manifest" "$work/inventory") || return $?
+        [[ "${listed%$'\n'}" == "$selected" ]] || { _cs_log_error "Manifest does not cover the exact release asset set"; return 1; }
     fi
-
     _cs_log_ok "Verified $verified file(s)"
-    return 0
-}
+)
 
 # ============================================================================
 # Repository Sync
@@ -529,7 +587,7 @@ EOF
     local checksums_content=""
     if [[ -n "$artifacts_dir" && -d "$artifacts_dir" ]]; then
         _cs_log_info "Generating checksums from: $artifacts_dir"
-        checksums_content=$(checksum_generate "$artifacts_dir")
+        checksums_content=$(checksum_generate "$artifacts_dir") || return $?
     else
         # Try to fetch from GitHub release
         _cs_log_info "Fetching checksums from GitHub release..."
@@ -718,4 +776,4 @@ checksum_sync_json() {
 # Exports
 # ============================================================================
 
-export -f checksum_generate checksum_verify checksum_sync checksum_sync_json
+export -f checksum_manifest_normalize checksum_generate checksum_verify checksum_sync checksum_sync_json

@@ -186,13 +186,8 @@ teardown() {
 }
 
 @test "_cs_is_safe_path accepts temp directories" {
-    local temp_dir
-    temp_dir=$(mktemp -d)
-
-    run _cs_is_safe_path "$temp_dir"
+    run _cs_is_safe_path "$TEST_TMPDIR"
     [[ "$status" -eq 0 ]]
-
-    rm -rf "$temp_dir"
 }
 
 # ============================================================================
@@ -273,15 +268,14 @@ teardown() {
     [[ "$count" -eq 3 ]]
 }
 
-@test "checksum_sync handles empty artifacts directory" {
+@test "checksum_sync rejects an empty release artifact set" {
     local empty_dir="$TEST_TMPDIR/empty"
     mkdir -p "$empty_dir"
 
     run checksum_generate "$empty_dir"
-    [[ "$status" -eq 0 ]]
-
-    # Should return empty/no output
-    [[ -z "$output" ]] || [[ "$output" == "" ]]
+    [[ "$status" -eq 7 ]]
+    # Bats combines stderr and stdout: the missing-artifact diagnostic is expected.
+    [[ ! "$output" =~ [a-f0-9]{64} ]]
 }
 
 @test "checksum_generate maintains consistent output format" {
