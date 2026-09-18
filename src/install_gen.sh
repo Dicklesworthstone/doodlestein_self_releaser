@@ -49,7 +49,7 @@ _IG_OUTPUT_DIR="${DSR_INSTALLER_DIR:-./installers}"
 _install_gen_template() {
     # Parameters passed to template - used via placeholder substitution
     # $1=tool_name, $2=repo, $3=binary_name, $4=archive_linux, $5=archive_darwin
-    # $6=archive_windows, $7=artifact_naming, $8=language (unused in template)
+    # $6=archive_windows, $7=artifact_naming, $8=language
 
     cat << 'TEMPLATE_START'
 #!/usr/bin/env bash
@@ -70,6 +70,10 @@ _install_gen_template() {
 #   --cache-dir DIR          Cache directory (default: ~/.cache/dsr/installers)
 #   --offline [ARCHIVE]      No network; requires --version and local checksum evidence
 #   --prefer-gh              Prefer gh release download for private repos
+#   --from-source            Build source instead of downloading (explicit code-execution consent)
+#   --allow-source-build     Allow source fallback when discovery/download is unavailable
+#   --source-ref REF         With --from-source: HEAD, full SHA, refs/heads/* or refs/tags/*
+#   --source-timeout SECONDS  Per-command source-build limit (default: 3600)
 #   --no-skills              Skip AI coding agent skill installation
 #   --help                   Show this help
 #
@@ -83,6 +87,8 @@ _install_gen_template() {
 #   - Verifies checksums by default
 #   - Supports offline installation from cached archives
 #   - Caches downloads for future offline use
+#   - Source builds are opt-in, never signed releases, and never cached as releases
+#   - --yes permits replacement only; it does not authorize source execution
 
 set -uo pipefail
 
@@ -100,6 +106,15 @@ ARTIFACT_NAMING='__ARTIFACT_NAMING__'
 # If empty, signature verification is skipped
 MINISIGN_PUBKEY="__MINISIGN_PUBKEY__"
 
+# Validated source selection, embedded as data by the generator. The source
+# engine below is embedded too: installed clients need no DSR checkout.
+SOURCE_LANGUAGE='__SOURCE_LANGUAGE__'
+SOURCE_SUBDIR='__SOURCE_SUBDIR__'
+SOURCE_ENTRY='__SOURCE_ENTRY__'
+SOURCE_PACKAGE='__SOURCE_PACKAGE__'
+
+__SOURCE_BUILD_ENGINE__
+
 # Runtime state
 _VERSION=""
 _INSTALL_DIR="${HOME}/.local/bin"
@@ -114,6 +129,12 @@ _CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dsr/installers"
 _OFFLINE_MODE=false
 _PREFER_GH=false
 _SKIP_SKILLS=false
+_FROM_SOURCE=false
+_ALLOW_SOURCE_BUILD=false
+_SOURCE_REF=""
+_SOURCE_TIMEOUT=3600
+_SOURCE_RECEIPT=null
+_KEEP_SOURCE_LOGS=false
 # Working directory created by main(). Declared at script scope so the
 # EXIT trap (which fires AFTER main returns and its locals have been
 # popped) can still see it and clean up. Leaving this as `local temp_dir`
@@ -122,7 +143,11 @@ _SKIP_SKILLS=false
 _TEMP_DIR=""
 _cleanup_temp_dir() {
     if [[ -n "${_TEMP_DIR:-}" && -d "$_TEMP_DIR" ]]; then
-        rm -rf "$_TEMP_DIR"
+        if $_KEEP_SOURCE_LOGS && [[ -d "$_TEMP_DIR/source-build" ]]; then
+            _log_warn "Source build diagnostics retained at: $_TEMP_DIR/source-build"
+        else
+            rm -rf "$_TEMP_DIR"
+        fi
     fi
 }
 
@@ -158,7 +183,10 @@ _json_result() {
                 --arg message "$message" \
                 --arg version "$version" \
                 --arg path "$path" \
-                '{tool: $tool, status: $status, message: $message, version: $version, path: $path}'
+                --argjson source_receipt "$_SOURCE_RECEIPT" \
+                '{tool: $tool, status: $status, message: $message, version: $version, path: $path}
+                 + if $status == "success" and $source_receipt != null
+                   then {method:"source", signed_release:false, source:$source_receipt} else {} end'
         else
             # Fallback for systems without jq - escape JSON special characters
             # Order matters: escape backslashes first, then quotes, then control chars
@@ -897,6 +925,61 @@ _install_skills() {
     return 0
 }
 
+# Source fallback is deliberately separate from artifact verification. Only
+# discovery/acquisition failures may call this path; a bad checksum, signature,
+# archive, cache entry, or install must terminate the original release path.
+_install_from_source() {
+    local reason="$1" ref="${_SOURCE_REF:-}" receipt payload actual installed_path
+    if ! $_ALLOW_SOURCE_BUILD || $_OFFLINE_MODE || $_REQUIRE_SIGNATURES; then
+        _log_error "Source fallback requires --allow-source-build (or --from-source), online mode, and no --require-signatures"
+        return 4
+    fi
+    if [[ -z "$ref" ]]; then
+        if [[ -n "$_VERSION" ]]; then ref="refs/tags/$_VERSION"; else ref=HEAD; fi
+    fi
+    _log_warn "$reason; source builds execute repository and dependency code"
+    _log_warn "Building $REPO at $ref locally; this is NOT a signed release"
+    if [[ -z "$_TEMP_DIR" ]]; then
+        _TEMP_DIR=$(mktemp -d) || return 1
+        trap _cleanup_temp_dir EXIT
+    fi
+    local args=(--allow-build --subdir "$SOURCE_SUBDIR" --timeout "$_SOURCE_TIMEOUT")
+    [[ -z "$SOURCE_ENTRY" ]] || args+=(--entry "$SOURCE_ENTRY")
+    [[ -z "$SOURCE_PACKAGE" ]] || args+=(--package "$SOURCE_PACKAGE")
+    _KEEP_SOURCE_LOGS=true
+    receipt=$(install_source_build "$REPO" "$ref" "$SOURCE_LANGUAGE" "$BINARY_NAME" \
+        "$_TEMP_DIR/source-build" "${args[@]}") || return $?
+    # Consume a single complete receipt and recheck the selected payload. Do
+    # not let compiler stdout become success JSON or a different install path.
+    if ! jq -es --arg repo "$REPO" --arg ref "$ref" --arg language "$SOURCE_LANGUAGE" '
+        length == 1 and (.[0] | type == "object" and .schema_version == 1 and
+        .method == "source" and .signed_release == false and
+        .repository == $repo and .requested_ref == $ref and .language == $language and
+        (.source_commit | type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$")) and
+        (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.size_bytes | type == "number" and floor == . and . > 0) and
+        (.compiler | type == "string" and length > 0) and (.path | type == "string"))
+    ' <<< "$receipt" >/dev/null 2>&1; then
+        _log_error "Invalid source build receipt"
+        return 6
+    fi
+    payload=$(jq -r '.path' <<< "$receipt") || return 6
+    [[ "$payload" == "$_TEMP_DIR/source-build/output/"* ]] || return 6
+    _isb_path_in_tree "$_TEMP_DIR/source-build/output" "${payload#"$_TEMP_DIR/source-build/output/"}" || return 6
+    actual=$(_file_sha256 "$payload") || return $?
+    [[ "$actual" == "$(jq -r '.sha256' <<< "$receipt")" ]] || return 6
+    [[ "$(wc -c < "$payload" | tr -d '[:space:]')" == "$(jq -r '.size_bytes' <<< "$receipt")" ]] || return 6
+    _install_binary "$payload" "$_INSTALL_DIR" || return $?
+    installed_path="$_INSTALL_DIR/$BINARY_NAME"
+    [[ "$(_file_sha256 "$installed_path")" == "$actual" ]] || return 6
+    # The public receipt must not point at a temporary payload removed on exit.
+    _SOURCE_RECEIPT=$(jq -c 'del(.path)' <<< "$receipt") || return 6
+    _KEEP_SOURCE_LOGS=false
+    _install_skills
+    _log_ok "Installed local source build at commit $(jq -r '.source_commit' <<< "$receipt")"
+    _json_result success "Installed from source (not a signed release)" "$_VERSION" "$installed_path"
+}
+
 # Main installation function
 main() {
     # Parse arguments
@@ -954,6 +1037,23 @@ main() {
                 _PREFER_GH=true
                 shift
                 ;;
+            --from-source)
+                _FROM_SOURCE=true
+                _ALLOW_SOURCE_BUILD=true
+                shift
+                ;;
+            --allow-source-build)
+                _ALLOW_SOURCE_BUILD=true
+                shift
+                ;;
+            --source-ref|--source-timeout)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                case "$1" in
+                    --source-ref) _SOURCE_REF="$2" ;;
+                    --source-timeout) _SOURCE_TIMEOUT="$2" ;;
+                esac
+                shift 2
+                ;;
             --no-skills)
                 _SKIP_SKILLS=true
                 shift
@@ -969,6 +1069,20 @@ main() {
         esac
     done
 
+    [[ "$_SOURCE_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
+    if [[ -n "$_SOURCE_REF" ]] && { ! $_FROM_SOURCE || [[ -n "$_VERSION" ]]; }; then
+        _log_error "--source-ref requires --from-source and cannot be combined with --version"
+        return 4
+    fi
+    if $_ALLOW_SOURCE_BUILD && { $_OFFLINE_MODE || $_REQUIRE_SIGNATURES; }; then
+        _log_error "Source builds cannot satisfy --offline or --require-signatures"
+        return 4
+    fi
+    if [[ -n "$_VERSION" ]] && ! _valid_release_version "$_VERSION"; then
+        _log_error "Invalid release version"
+        return 4
+    fi
+
     # Detect platform
     local platform
     platform=$(_detect_platform) || return $?
@@ -980,6 +1094,10 @@ main() {
         _log_error "Invalid installer identity"
         return 4
     fi
+    if $_FROM_SOURCE; then
+        _install_from_source "Explicit --from-source request"
+        return $?
+    fi
     # Get version
     if [[ -z "$_VERSION" ]]; then
         if $_OFFLINE_MODE; then
@@ -987,7 +1105,16 @@ main() {
             return 4
         fi
         _log_info "Fetching latest version..."
-        _VERSION=$(_get_latest_version) || return $?
+        local discovery_status=0
+        _VERSION=$(_get_latest_version) || discovery_status=$?
+        if ((discovery_status != 0)); then
+            _VERSION=""
+            if $_ALLOW_SOURCE_BUILD; then
+                _install_from_source "Latest release could not be resolved"
+                return $?
+            fi
+            return "$discovery_status"
+        fi
     fi
     # These values become URL/path components, never shell or glob patterns.
     if ! _valid_release_version "$_VERSION"; then
@@ -1035,6 +1162,10 @@ main() {
             return 1
         else
             if ! _fetch_release_asset "$asset_name" "$archive_file"; then
+                if $_ALLOW_SOURCE_BUILD; then
+                    _install_from_source "Release payload unavailable for $platform"
+                    return $?
+                fi
                 _log_error "Failed to download archive"
                 _json_result "error" "Download failed" "$_VERSION" ""
                 return 1
@@ -1173,6 +1304,7 @@ install_gen_create() {
     local repo binary_name language workflow_path local_path
     local archive_linux archive_darwin archive_windows
     local artifact_naming
+    local source_subdir source_entry source_package source_engine field value
 
     tool_name=$(_install_gen_yaml_get "$config_file" "tool_name" "$tool_name")
     repo=$(_install_gen_yaml_get "$config_file" "repo" "")
@@ -1180,6 +1312,28 @@ install_gen_create() {
     language=$(_install_gen_yaml_get "$config_file" "language" "go")
     workflow_path=$(_install_gen_yaml_get "$config_file" "workflow" ".github/workflows/release.yml")
     local_path=$(_install_gen_yaml_get "$config_file" "local_path" "")
+
+    # Embed the source engine as code, but source-selection fields as validated
+    # literals. Failure must precede creation or replacement of any installer.
+    [[ -f "$_IG_SCRIPT_DIR/install_source.sh" && ! -L "$_IG_SCRIPT_DIR/install_source.sh" ]] || return 3
+    # shellcheck source=./install_source.sh
+    source "$_IG_SCRIPT_DIR/install_source.sh" || return 3
+    source_engine=$(cat "$_IG_SCRIPT_DIR/install_source.sh") || return 3
+    [[ -n "$source_engine" && "$language" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] || return 4
+    for field in source_subdir source_entry source_package; do
+        value=$(_install_gen_yaml_get "$config_file" "$field" "") || return 4
+        case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+        esac
+        printf -v "$field" '%s' "$value"
+    done
+    source_subdir="${source_subdir:-.}"
+    _isb_relative_path "$source_subdir" || return 4
+    [[ -z "$source_entry" ]] || _isb_relative_path "$source_entry" || return 4
+    [[ -z "$source_package" ]] || _isb_name "$source_package" || return 4
+    [[ "$language" != rust || -z "$source_entry" ]] || return 4
+    [[ "$language" == rust || -z "$source_package" ]] || return 4
 
     # Archive formats (with yq for nested keys)
     if command -v yq &>/dev/null; then
@@ -1354,6 +1508,13 @@ install_gen_create() {
     template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
     template="${template//__TARGET_TRIPLE_CASES__/$target_triple_cases}"
     template="${template//__ARCH_ALIAS_CASES__/$arch_alias_cases}"
+    template="${template//__SOURCE_LANGUAGE__/"$language"}"
+    template="${template//__SOURCE_SUBDIR__/"$source_subdir"}"
+    template="${template//__SOURCE_ENTRY__/"$source_entry"}"
+    template="${template//__SOURCE_PACKAGE__/"$source_package"}"
+    # Quoted replacement is essential: Bash 5.2's patsub_replacement otherwise
+    # treats every ampersand in the engine as the matched placeholder text.
+    template="${template//__SOURCE_BUILD_ENGINE__/"$source_engine"}"
 
     # Handle skill content - archive the full skill tree when available
     if [[ -n "$skill_root" || -n "$skill_file" ]]; then
