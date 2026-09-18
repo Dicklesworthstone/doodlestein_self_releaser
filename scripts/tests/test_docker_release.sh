@@ -13,6 +13,8 @@ export DK_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
 unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN DOCKER_OUTPUT_DIR
 export DOCKER_REGISTRY=ghcr.io/acme DOCKER_BUILDER_NAME=dsr-test-builder
 export DOCKER_PLATFORMS=linux/amd64,linux/arm64
+export DOCKER_CERTIFICATE_IDENTITY=builder@example.test
+export DOCKER_CERTIFICATE_OIDC_ISSUER=https://issuer.example.test
 cat > "$WORK/bin/docker" <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -23,6 +25,23 @@ case "$*" in
     buildx\ create*) exit 0 ;;
     login*) cat > "$DK_WORK/token.stdin"; [[ "${DK_MODE:-}" != login-fail ]]; exit $? ;;
 esac
+if [[ "${1:-} ${2:-} ${3:-}" == 'buildx imagetools inspect' ]]; then
+    ref="$4"
+    [[ "${DK_MODE:-}" != registry-fail ]] || exit 19
+    digest="${ref##*@sha256:}"
+    if [[ "$ref" != *@* ]]; then
+        if [[ "${DK_MODE:-}" == tag-drift || -f "$DK_REGISTRY/tag-moved" ]]; then echo changed; exit; fi
+        digest="${DK_DIGEST#sha256:}"
+    fi
+    if [[ "$5" == --raw ]]; then
+        [[ "${DK_MODE:-}" != raw-corrupt ]] || { printf corrupt; exit; }
+        cat "$DK_REGISTRY/raw/$digest"
+    elif [[ "$5" == --format && "$6" == '{{json .Image}}' ]]; then
+        [[ "${DK_MODE:-}" != config-mismatch ]] || { echo '{"os":"linux","architecture":"s390x"}'; exit; }
+        cat "$DK_REGISTRY/config/$digest"
+    else exit 98; fi
+    exit
+fi
 [[ "${1:-} ${2:-}" == 'buildx build' ]] || { echo "Unexpected Docker command: $*" >&2; exit 98; }
 metadata='' dest=''
 while [[ $# -gt 0 ]]; do
@@ -53,13 +72,16 @@ cat > "$WORK/bin/syft" <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
 jq -nc --args '$ARGS.positional' -- syft "$@" >> "$DK_CALLS"
+[[ "${DK_SYFT_DISABLED:-false}" != true ]] || exit 99
+[[ "${DK_MODE:-}" != second-scan-fail || "$1" != *"$DK_ARM64" ]] || exit 17
 case "${DK_MODE:-}" in
     syft-fail) echo partial; exit 17 ;;
     syft-empty) exit 0 ;;
     syft-invalid) echo '{"spdxVersion":true}'; exit 0 ;;
     syft-multiple) printf '{}\n{}\n'; exit 0 ;;
 esac
-cat "$DK_WORK/spdx.json"
+platform="${3:-default}"
+jq --arg platform "$platform" --arg nonce "${DK_SCAN_NONCE:-}" '.name = ($platform + $nonce)' "$DK_WORK/spdx.json"
 SH
 cat > "$WORK/bin/cosign" <<'SH'
 #!/usr/bin/env bash
@@ -67,7 +89,57 @@ set -uo pipefail
 jq -nc --args '$ARGS.positional' -- cosign "$@" >> "$DK_CALLS"
 [[ "${DK_MODE:-}" != sign-fail || "$1" != sign ]] || exit 18
 [[ "${DK_MODE:-}" != attest-fail || "$1" != attest ]] || exit 18
-echo 'signer diagnostic on stdout'
+action="$1"; image="${*: -1}"; digest="${image##*@sha256:}"
+identity='' issuer='' predicate=''
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --certificate-identity) identity="$2"; shift 2 ;;
+        --certificate-oidc-issuer) issuer="$2"; shift 2 ;;
+        --predicate) predicate="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+if [[ "$action" == verify || "$action" == verify-attestation ]]; then
+    [[ "$identity" == builder@example.test && "$issuer" == https://issuer.example.test ]] || exit 18
+fi
+case "$action" in
+    sign)
+        [[ "${DK_MODE:-}" != false-sign ]] || exit 0
+        printf signature > "$DK_REGISTRY/signed/$digest"
+        echo 'signer diagnostic on stdout' ;;
+    verify)
+        [[ "${DK_MODE:-}" != verify-sign-fail ]] || exit 18
+        [[ "${DK_MODE:-}" != empty-sign ]] || { echo '[]'; exit; }
+        [[ -f "$DK_REGISTRY/signed/$digest" ]] || exit 18
+        [[ "${DK_MODE:-}" != wrong-sign-digest ]] || digest="$(printf '0%.0s' {1..64})"
+        jq -nc --arg digest "sha256:$digest" '[{critical:{image:{"docker-manifest-digest":$digest}}}]' ;;
+    attest)
+        [[ "${DK_MODE:-}" != false-attest ]] || exit 0
+        [[ "${DK_MODE:-}" != second-attest-fail || "$image" != *"$DK_ARM64" ]] || exit 18
+        jq -nc --arg name "${image%@*}" --arg digest "$digest" --slurpfile sbom "$predicate" \
+            '{_type:"https://in-toto.io/Statement/v0.1",predicateType:"https://spdx.dev/Document",
+              subject:[{name:$name,digest:{sha256:$digest}}],predicate:$sbom[0]}' > "$DK_REGISTRY/statement.json"
+        filter='.'
+        case "${DK_MODE:-}" in
+            wrong-subject) filter='.subject[0].digest.sha256 = ("0"*64)' ;;
+            wrong-subject-name) filter='.subject[0].name = "other/repository"' ;;
+            wrong-predicate-type) filter='.predicateType = "https://example.test/wrong"' ;;
+            changed-predicate) filter='.predicate.name = "not-what-was-scanned"' ;;
+        esac
+        jq -c "$filter" "$DK_REGISTRY/statement.json" | jq -Rnc 'input | {payloadType:"application/vnd.in-toto+json",payload:(. | @base64)}' \
+            >> "$DK_REGISTRY/attestations/$digest.jsonl"
+        [[ "${DK_MODE:-}" != late-tag-drift ]] || : > "$DK_REGISTRY/tag-moved"
+        echo 'attester diagnostic on stdout' ;;
+    verify-attestation)
+        [[ "${DK_MODE:-}" != verify-attest-fail ]] || exit 18
+        case "${DK_MODE:-}" in
+            empty-attestation) echo '[]'; exit ;;
+            malformed-envelope) echo '{"payload":"not base64","payloadType":"application/vnd.in-toto+json"}'; exit ;;
+            wrong-envelope) echo '{"payload":"e30=","payloadType":"not-in-toto"}'; exit ;;
+        esac
+        cat "$DK_REGISTRY/attestations/$digest.jsonl" ;;
+    *) echo "Unexpected Cosign operation: $action" >&2; exit 98 ;;
+esac
 SH
 cat > "$WORK/bin/gh" <<'SH'
 #!/usr/bin/env bash
@@ -81,6 +153,45 @@ cat > "$WORK/spdx.json" <<'JSON'
 JSON
 source "$MODULE"
 checks=0 failures=0 status=0 CASE='' REPO='' output=''
+# The registry fixture serves exact serialized bytes addressed by their REAL
+# SHA256. Malformed inventory tests can change the bytes and recompute the pin;
+# raw-corruption tests deliberately serve different bytes for an existing pin.
+freeze_index() {
+    DK_DIGEST="sha256:$(_dk_hash "$DK_REGISTRY/index.json")"
+    export DK_DIGEST
+    cp "$DK_REGISTRY/index.json" "$DK_REGISTRY/raw/${DK_DIGEST#sha256:}"
+}
+edit_index() {
+    jq "$1" "$DK_REGISTRY/index.json" > "$DK_REGISTRY/edited.json"
+    cp "$DK_REGISTRY/edited.json" "$DK_REGISTRY/index.json"
+    freeze_index
+}
+init_registry() {
+    export DK_REGISTRY="$CASE/registry"
+    mkdir -p "$DK_REGISTRY/raw" "$DK_REGISTRY/config" "$DK_REGISTRY/signed" "$DK_REGISTRY/attestations"
+    local arch config_sha sha size
+    : > "$DK_REGISTRY/descriptors.jsonl"
+    for arch in amd64 arm64; do
+        jq -nc --arg arch "$arch" '{os:"linux",architecture:$arch} +
+            (if $arch == "arm64" then {variant:"v8"} else {} end)' > "$DK_REGISTRY/config-$arch.json"
+        config_sha=$(_dk_hash "$DK_REGISTRY/config-$arch.json")
+        jq -nc --arg sha "sha256:$config_sha" --argjson size "$(wc -c < "$DK_REGISTRY/config-$arch.json")" \
+            '{schemaVersion:2,mediaType:"application/vnd.oci.image.manifest.v1+json",
+              config:{mediaType:"application/vnd.oci.image.config.v1+json",digest:$sha,size:$size},layers:[]}' > "$DK_REGISTRY/image-$arch.json"
+        sha=$(_dk_hash "$DK_REGISTRY/image-$arch.json")
+        cp "$DK_REGISTRY/image-$arch.json" "$DK_REGISTRY/raw/$sha"
+        cp "$DK_REGISTRY/config-$arch.json" "$DK_REGISTRY/config/$sha"
+        [[ "$arch" != arm64 ]] || export DK_ARM64="$sha"
+        [[ "$arch" != amd64 ]] || export DK_AMD64="$sha"
+        size=$(wc -c < "$DK_REGISTRY/image-$arch.json")
+        jq -nc --arg digest "sha256:$sha" --argjson size "$size" --arg arch "$arch" \
+            '{mediaType:"application/vnd.oci.image.manifest.v1+json",digest:$digest,size:$size,
+              platform:{os:"linux",architecture:$arch}}' >> "$DK_REGISTRY/descriptors.jsonl"
+    done
+    jq -sc '{schemaVersion:2,mediaType:"application/vnd.oci.image.index.v1+json",manifests:.}' \
+        "$DK_REGISTRY/descriptors.jsonl" > "$DK_REGISTRY/index.json"
+    freeze_index
+}
 new_case() {
     CASE="$WORK/cases/$1"; REPO="$CASE/project with spaces"
     mkdir -p "$REPO/docker"
@@ -90,7 +201,10 @@ new_case() {
     : > "$DK_CALLS"
     export DOCKER_OUTPUT_DIR="$CASE/output"
     DRY_RUN=false
+    export DK_SYFT_DISABLED=false DK_SCAN_NONCE=''
+    export DOCKER_CERTIFICATE_IDENTITY=builder@example.test DOCKER_CERTIFICATE_OIDC_ISSUER=https://issuer.example.test
     unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+    init_registry
 }
 capture() {
     status=0
@@ -198,13 +312,14 @@ done
 new_case release
 capture release
 check 'build/push/sign/attest flow succeeds' test "$status" -eq 0
-check 'release refers to immutable built digest' jq -e --arg ref "ghcr.io/acme/tool@$DK_DIGEST" '.reference == $ref and .status == "complete" and .signature == "submitted"' "$CASE/stdout"
-check 'scanner uses registry transport with same pinned digest' jq -e -s --arg ref "registry:ghcr.io/acme/tool@$DK_DIGEST" 'any(.[]; .[0] == "syft" and .[1] == $ref)' "$DK_CALLS"
-check 'sign and attest never target a mutable tag' jq -e -s --arg ref "ghcr.io/acme/tool@$DK_DIGEST" 'all(.[] | select(.[0] == "cosign"); .[-1] == $ref)' "$DK_CALLS"
+check 'release refers to immutable built digest' jq -e --arg ref "ghcr.io/acme/tool@$DK_DIGEST" '.reference == $ref and .status == "verified" and .signature == "verified"' "$CASE/stdout"
+check 'scanner uses registry transport with pinned child digests' jq -e -s --arg amd64 "registry:ghcr.io/acme/tool@sha256:$DK_AMD64" --arg arm64 "registry:ghcr.io/acme/tool@sha256:$DK_ARM64" \
+    '[.[] | select(.[0] == "syft") | .[1]] | sort == ([$amd64,$arm64] | sort)' "$DK_CALLS"
+check 'sign and attest never target a mutable tag' jq -e -s 'all(.[] | select(.[0] == "cosign"); .[-1] | test("^ghcr.io/acme/tool@sha256:[0-9a-f]{64}$"))' "$DK_CALLS"
 : > "$DK_CALLS"
 capture release --skip-sign
 check 'explicit skip-sign works without skipping attestation' test "$status" -eq 0
-check 'skip-sign is explicitly reported' jq -e '.signature == "skipped" and .sbom == "submitted"' "$CASE/stdout"
+check 'skip-sign is explicitly reported' jq -e '.signature == "skipped" and .sbom == "verified"' "$CASE/stdout"
 check 'skip-sign does not invoke image signing' no_call_kind sign
 check 'skip-sign still attaches required SBOM' jq -e -s 'any(.[]; index("attest") != null)' "$DK_CALLS"
 
@@ -251,6 +366,145 @@ check 'GHCR login uses stdin' test "$status" -eq 0
 check 'token bytes travel only over stdin' test "$(cat "$WORK/token.stdin")" = third
 check 'token is absent from invocation log' bash -c '! grep -F third "$1"' bash "$DK_CALLS"
 check 'token is absent from stdout and stderr' bash -c '! grep -F third "$1" "$2"' bash "$CASE/stdout" "$CASE/stderr"
+
+new_case platform-evidence
+capture release
+check 'verified receipt covers the exact two requested platforms' jq -e '[.platforms[].platform] == ["linux/amd64","linux/arm64"]' "$CASE/stdout"
+check 'each platform has a verified SPDX predicate digest' jq -e 'all(.platforms[]; .status == "verified" and (.predicate_sha256 | test("^[0-9a-f]{64}$")))' "$CASE/stdout"
+check 'all platform scans complete before first signature publication' jq -e -s '
+    [to_entries[] | select(.value[0] == "syft") | .key] as $scans |
+    [to_entries[] | select(.value[0:2] == ["cosign","sign"]) | .key] as $signs |
+    ($scans | max) < ($signs | min)' "$DK_CALLS"
+check 'signature is on the exact built index, not one platform' jq -e -s --arg ref "ghcr.io/acme/tool@$DK_DIGEST" '
+    all(.[] | select(.[0:2] == ["cosign","sign"]); .[-1] == $ref)' "$DK_CALLS"
+check 'both attestations are on the platform child manifests' jq -e -s --arg a "ghcr.io/acme/tool@sha256:$DK_AMD64" --arg b "ghcr.io/acme/tool@sha256:$DK_ARM64" '
+    [.[] | select(.[0:2] == ["cosign","attest"]) | .[-1]] | sort == ([$a,$b] | sort)' "$DK_CALLS"
+check 'verification uses exact trust policy without insecure bypasses' jq -e -s '
+    all(.[] | select(.[0] == "cosign" and (.[1] | startswith("verify")));
+        .[index("--certificate-identity")+1] == "builder@example.test" and
+        .[index("--certificate-oidc-issuer")+1] == "https://issuer.example.test" and
+        all(.[]; startswith("--insecure") | not))' "$DK_CALLS"
+: > "$DK_CALLS"
+DK_SYFT_DISABLED=true
+capture docker_verify_release "ghcr.io/acme/tool@$DK_DIGEST" --platform linux/amd64,linux/arm64
+check 'standalone verification succeeds without scanner' test "$status" -eq 0
+check 'read-only verifier does not scan' no_call_kind syft
+check 'read-only verifier does not sign or attest' jq -e -s 'all(.[]; .[0:2] != ["cosign","sign"] and .[0:2] != ["cosign","attest"])' "$DK_CALLS"
+check 'read-only verifier does not build, log in, or select builder' jq -e -s '
+    all(.[]; .[0] != "login" and .[0:2] != ["buildx","build"] and .[0:2] != ["buildx","inspect"] and .[0:2] != ["buildx","create"])' "$DK_CALLS"
+capture bash "$MODULE" verify "ghcr.io/acme/tool@$DK_DIGEST"
+check 'standalone verification CLI dispatch works' test "$status" -eq 0
+capture bash -c 'docker_verify_release "$1"' bash "ghcr.io/acme/tool@$DK_DIGEST"
+check 'exported verifier has all required helper functions' test "$status" -eq 0
+capture docker_verify_release "ghcr.io/acme/tool@$DK_DIGEST" --platform linux/amd64
+check 'verifier enforces explicitly requested complete platform set' test "$status" -eq 7
+capture docker_verify_release "ghcr.io/acme/tool@$DK_DIGEST" --certificate-identity stranger@example.test
+check 'wrong signer identity cannot verify' test "$status" -eq 7
+capture docker_verify_release "ghcr.io/acme/tool@$DK_DIGEST" --certificate-oidc-issuer https://wrong.example.test
+check 'wrong OIDC issuer cannot verify' test "$status" -eq 7
+
+new_case missing-policy
+unset DOCKER_CERTIFICATE_IDENTITY DOCKER_CERTIFICATE_OIDC_ISSUER
+capture release
+check 'missing trust policy stops release before push' test "$status" -eq 4
+check 'missing trust policy invokes no external adapters' no_calls
+capture release --dry-run
+check 'planning does not require live authentication policy' test "$status" -eq 0
+check 'policy-free planning still has no external effects' no_calls
+capture release --certificate-identity builder@example.test --certificate-oidc-issuer https://issuer.example.test
+check 'explicit trust policy flags work without environment defaults' test "$status" -eq 0
+
+for mode in registry-fail raw-corrupt config-mismatch tag-drift; do
+    new_case "registry-$mode"; DK_MODE="$mode"
+    capture release
+    check "$mode prevents release completion" nonzero "$status"
+    check "$mode is rejected before scanning" no_call_kind syft
+    check "$mode is rejected before signing" no_call_kind cosign
+done
+
+for shape in missing extra duplicate unknown unbound-evidence bad-size bad-digest empty; do
+    new_case "index-$shape"
+    case "$shape" in
+        missing) edit_index '.manifests = [.manifests[0]]' ;;
+        extra) edit_index '.manifests += [(.manifests[0] | .platform.architecture = "s390x")]' ;;
+        duplicate) edit_index '.manifests += [.manifests[0]]' ;;
+        unknown) edit_index '.manifests[0].platform = {os:"unknown",architecture:"unknown"}' ;;
+        unbound-evidence) edit_index '.manifests += [(.manifests[0] | .platform = {os:"unknown",architecture:"unknown"} |
+            .annotations = {"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":("sha256:"+("0"*64))})]' ;;
+        bad-size) edit_index '.manifests[0].size += 1' ;;
+        bad-digest) edit_index '.manifests[0].digest = "sha256:bad"' ;;
+        empty) edit_index '.manifests = []' ;;
+    esac
+    capture release
+    check "$shape registry inventory is not a complete release" test "$status" -eq 7
+    check "$shape inventory cannot produce Cosign evidence" no_call_kind cosign
+done
+
+new_case buildkit-evidence
+edit_index '.manifests += [(.manifests[0] | .platform = {os:"unknown",architecture:"unknown"} |
+    .annotations = {"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":.digest})]'
+capture release
+check 'recognized BuildKit evidence does not invent an executable platform' test "$status" -eq 0
+check 'BuildKit evidence is not scanned as an extra architecture' jq -e '.platforms | length == 2' "$CASE/stdout"
+
+new_case arm64-variant
+edit_index '.manifests[1].platform.variant = "v8"'
+capture release --platform linux/amd64,linux/arm64/v8
+check 'default arm64 variant is normalized without losing coverage' test "$status" -eq 0
+check 'arm64 variant receipt has stable platform identity' jq -e '[.platforms[].platform] == ["linux/amd64","linux/arm64"]' "$CASE/stdout"
+
+new_case single-image
+export DK_DIGEST="sha256:$DK_AMD64"
+capture release --platform linux/amd64
+check 'single image manifest works without an index' test "$status" -eq 0
+check 'single manifest uses platform from its configuration' jq -e '[.platforms[].platform] == ["linux/amd64"]' "$CASE/stdout"
+capture release
+check 'single manifest cannot satisfy two-platform release' test "$status" -eq 7
+
+for mode in false-sign empty-sign wrong-sign-digest verify-sign-fail false-attest empty-attestation malformed-envelope wrong-envelope verify-attest-fail wrong-subject wrong-subject-name wrong-predicate-type changed-predicate; do
+    new_case "$mode"; DK_MODE="$mode"
+    capture release
+    check "$mode cannot masquerade as verified release" test "$status" -eq 7
+    check "$mode has no completion receipt" test -z "$output"
+done
+
+new_case second-scan-fail
+DK_MODE=second-scan-fail
+capture release
+check 'second architecture scan failure propagates' test "$status" -eq 1
+check 'second scan failure publishes no partial Cosign evidence' no_call_kind cosign
+
+new_case interrupted-evidence
+DK_MODE=second-attest-fail
+capture release
+check 'second architecture upload failure propagates' test "$status" -eq 1
+check 'already-published first-platform attestation is retained' test -s "$DK_REGISTRY/attestations/$DK_AMD64.jsonl"
+check 'interrupted evidence publication emits no complete receipt' test -z "$output"
+DK_MODE=''
+: > "$DK_CALLS"
+capture docker_attest_sbom "ghcr.io/acme/tool@$DK_DIGEST"
+check 'existing digest can finish attestations without rebuilding' test "$status" -eq 0
+check 'evidence recovery never invokes a build' jq -e -s 'all(.[]; .[0:2] != ["buildx","build"])' "$DK_CALLS"
+capture docker_verify_release "ghcr.io/acme/tool@$DK_DIGEST"
+check 'recovered multiarch release independently verifies' test "$status" -eq 0
+
+new_case old-attestations
+capture release
+check 'initial attestation set succeeds' test "$status" -eq 0
+cp "$CASE/stdout" "$CASE/first-receipt.json"
+DK_SCAN_NONCE=-new-scan
+capture release
+check 'old valid attestations do not prevent verifying a new matching scan' test "$status" -eq 0
+check 'release receipt binds new predicates rather than retained old ones' jq -e --slurpfile old "$CASE/first-receipt.json" '
+    [.platforms[].predicate_sha256] != [$old[0].platforms[].predicate_sha256]' "$CASE/stdout"
+check 'existing attestations are not deleted on a newer scan' test "$(wc -l < "$DK_REGISTRY/attestations/$DK_AMD64.jsonl")" -eq 2
+
+new_case late-tag-drift
+DK_MODE=late-tag-drift
+capture release
+check 'tag drift after evidence publication prevents completion' test "$status" -eq 7
+check 'late tag drift does not delete already-published attestations' test -s "$DK_REGISTRY/attestations/$DK_ARM64.jsonl"
+check 'late tag drift emits no misleading success receipt' test -z "$output"
 
 printf '\nContainer regression checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]

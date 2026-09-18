@@ -150,7 +150,7 @@ teardown() {
 @test "docker_release requires version" {
     run docker_release ubs
     [[ "$status" -eq 4 ]]
-    assert_contains "$output" "Tool and version required"
+    assert_contains "$output" "Version required"
 }
 
 @test "docker_release --help shows usage" {

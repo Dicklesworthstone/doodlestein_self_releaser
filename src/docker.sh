@@ -309,38 +309,294 @@ _dk_spdx_valid() {
         (.creationInfo | type == "object") and
         (if has("packages") then .packages | type == "array" else true end))' "$1" >/dev/null 2>&1
 }
-docker_attest_sbom() (
-    local image="${1:-}" dry="${DRY_RUN:-false}" work
-    [[ $# -eq 0 ]] || shift
-    while [[ $# -gt 0 ]]; do
-        case "$1" in --dry-run|-n) dry=true; shift ;; *) return 4 ;; esac
-    done
-    [[ -n "$image" ]] || { _dk_log_error 'Image reference required'; return 4; }
+
+# Buildx --raw preserves exact registry manifest bytes (no added newline).
+# Hash BEFORE parsing, so a dishonest/mistaken digest field cannot satisfy a pin.
+_dk_fetch_manifest() {
+    local image="$1" file="$2"
     _dk_pinned_valid "$image" || return 4
-    [[ "$dry" != true ]] || { _dk_log_info "[dry-run] Would attest $image"; return 0; }
-    _dk_dependency jq && _dk_dependency syft && docker_check_cosign || return 3
-    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-container-sbom.XXXXXXXX") || return 1
+    docker buildx imagetools inspect "$image" --raw > "$file" || return 8
+    [[ "$(_dk_hash "$file")" == "${image##*@sha256:}" ]] || {
+        _dk_log_error "Registry manifest digest mismatch: $image"; return 7;
+    }
+    jq -e -s 'length == 1 and (.[0] | type == "object" and .schemaVersion == 2)' "$file" >/dev/null || return 7
+}
+
+# Normalize the default arm64 variant without conflating arm/v6 and arm/v7.
+# Only image manifests are executable platforms. BuildKit attestation entries
+# must identify themselves AND reference a real executable manifest in the set.
+_dk_registry_inventory() (
+    local image="$1" expected="$2" work="$3" media rows row digest platform config actual size raw
+    _dk_fetch_manifest "$image" "$work/root.json" || return $?
+    media=$(jq -r '.mediaType' "$work/root.json") || return 7
+    case "$media" in
+        application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json)
+            rows=$(jq -ec '
+                def digest: type == "string" and test("^sha256:[0-9a-f]{64}$");
+                def size: type == "number" and . > 0 and . == floor;
+                def image: .mediaType == "application/vnd.oci.image.manifest.v1+json" or
+                    .mediaType == "application/vnd.docker.distribution.manifest.v2+json";
+                def evidence: .annotations["vnd.docker.reference.type"] == "attestation-manifest";
+                def platform: .os + "/" + .architecture +
+                    (if (.variant // "") == "" or (.architecture == "arm64" and .variant == "v8")
+                     then "" else "/" + .variant end);
+                .manifests as $all |
+                if ($all | type != "array" or length == 0) then error("empty index") else . end |
+                if all($all[]; image and (.digest | digest) and (.size | size) and
+                    (if evidence then .platform.os == "unknown" and .platform.architecture == "unknown" and
+                        (.annotations["vnd.docker.reference.digest"] | digest)
+                     else .platform.os == "linux" and
+                        (.platform.architecture | type == "string" and test("^[a-z0-9_]+$")) and
+                        (.platform.variant // "" | type == "string" and test("^[a-z0-9_.-]*$")) end))
+                then . else error("unsupported descriptor") end |
+                [$all[] | select(evidence | not)] as $images |
+                if ($images | length) == 0 or
+                    any($all[] | select(evidence); .annotations["vnd.docker.reference.digest"] as $d |
+                        [$images[].digest] | index($d) == null)
+                then error("unbound index evidence") else . end |
+                [$images[] | {digest,size,platform:(.platform | platform)}] |
+                if (map(.platform) | unique | length) != length or
+                   (map(.digest) | unique | length) != length
+                then error("duplicate platform or image") else sort_by(.platform) end
+            ' "$work/root.json") || return 7 ;;
+        application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json)
+            rows=$(jq -nc --arg digest "${image##*@}" --argjson size "$(wc -c < "$work/root.json")" \
+                '[{digest:$digest,size:$size,platform:null}]') || return 7 ;;
+        *) _dk_log_error 'Unsupported registry manifest type'; return 7 ;;
+    esac
+    : > "$work/inventory.jsonl" || return 1
+    local lines reference
+    lines=$(jq -c '.[]' <<< "$rows") || return 7
+    while IFS= read -r row; do
+        digest=$(jq -r '.digest' <<< "$row") || return 7
+        platform=$(jq -r '.platform // ""' <<< "$row") || return 7
+        size=$(jq -r '.size' <<< "$row") || return 7
+        reference="${image%@*}@$digest"
+        raw="$work/${digest#sha256:}.json"
+        _dk_fetch_manifest "$reference" "$raw" || return $?
+        [[ "$(wc -c < "$raw")" -eq "$size" ]] || return 7
+        jq -e '
+            def d: type == "string" and test("^sha256:[0-9a-f]{64}$");
+            (.mediaType == "application/vnd.oci.image.manifest.v1+json" or
+             .mediaType == "application/vnd.docker.distribution.manifest.v2+json") and
+            (.config.digest | d) and (.config.size | type == "number" and . > 0 and . == floor) and
+            (.layers | type == "array" and all(.[]; (.digest | d) and
+                (.size | type == "number" and . >= 0 and . == floor)))
+        ' "$raw" >/dev/null || return 7
+        # .Image is loaded by Docker's content-addressed resolver. It is parsed
+        # configuration, not original config bytes; Docker is a trusted adapter.
+        docker buildx imagetools inspect "$reference" --format '{{json .Image}}' > "$work/config.json" || return 8
+        config=$(jq -ec -s 'if length == 1 then .[0] else error("config stream") end |
+            if type == "object" and .os == "linux" and
+               (.architecture | type == "string" and test("^[a-z0-9_]+$")) and
+               (.variant // "" | type == "string" and test("^[a-z0-9_.-]*$"))
+            then .os + "/" + .architecture +
+                (if (.variant // "") == "" or (.architecture == "arm64" and .variant == "v8")
+                 then "" else "/" + .variant end)
+            else error("invalid platform config") end' "$work/config.json") || return 7
+        actual=$(jq -r . <<< "$config") || return 7
+        [[ -z "$platform" || "$platform" == "$actual" ]] || {
+            _dk_log_error "Index/config platform mismatch: $reference"; return 7;
+        }
+        jq -nc --arg reference "$reference" --arg digest "$digest" --arg platform "$actual" \
+            '{reference:$reference,digest:$digest,platform:$platform}' >> "$work/inventory.jsonl" || return 1
+    done <<< "$lines"
+    rows=$(jq -sc 'sort_by(.platform)' "$work/inventory.jsonl") || return 7
+    jq -e --argjson expected "$expected" '
+        def normalize: if . == "linux/arm64/v8" then "linux/arm64" else . end;
+        ($expected | length) == 0 or (map(.platform) | sort) == ($expected | map(normalize) | sort)
+    ' <<< "$rows" >/dev/null || { _dk_log_error 'Registry platform set differs from requested build'; return 7; }
+    printf '%s\n' "$rows"
+)
+
+_dk_verify_policy() {
+    [[ -n "$1" && "$1" != *[[:cntrl:]]* && "$2" == https://* && "$2" != *[[:space:]]* ]] || {
+        _dk_log_error 'Set an exact --certificate-identity and --certificate-oidc-issuer (or DOCKER_CERTIFICATE_IDENTITY / DOCKER_CERTIFICATE_OIDC_ISSUER)'; return 4;
+    }
+}
+_dk_verify_signature() {
+    local image="$1" identity="$2" issuer="$3" file="$4"
+    cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+        --output json "$image" > "$file" || return 7
+    jq -e -s --arg digest "${image##*@}" 'length == 1 and (.[0] | type == "array" and length > 0 and
+        all(.[]; .critical.image["docker-manifest-digest"] == $digest))' "$file" >/dev/null || return 7
+}
+
+# Inspect only Cosign-VERIFIED DSSE payloads, never a download of unauthenticated
+# attestations. Require a named subject and SPDX predicate; on publication also
+# require that the authenticated predicate equals the document we just scanned.
+_dk_verify_attestation() {
+    local image="$1" identity="$2" issuer="$3" work="$4" expected="${5:-}" payload hash
+    cosign verify-attestation --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+        --type spdxjson --output json "$image" > "$work/attestations.jsonl" || return 7
+    jq -ec -s --arg digest "${image##*@sha256:}" --arg repository "${image%@*}" '
+        [.[] | if type == "array" then .[] else . end] |
+        if length > 0 and all(.[]; type == "object" and .payloadType == "application/vnd.in-toto+json" and
+            (.payload | type == "string" and length > 0)) then . else error("missing DSSE") end |
+        map(.payload | @base64d | fromjson) |
+        .[] | select((._type == "https://in-toto.io/Statement/v0.1" or ._type == "https://in-toto.io/Statement/v1") and
+            .predicateType == "https://spdx.dev/Document" and
+            (.subject | type == "array" and length > 0 and
+                any(.[]; .name == $repository and .digest.sha256 == $digest))) | .predicate
+    ' "$work/attestations.jsonl" > "$work/predicates.jsonl" || return 7
+    [[ -s "$work/predicates.jsonl" ]] || return 7
+    while IFS= read -r payload; do
+        printf '%s\n' "$payload" > "$work/predicate.json" || return 1
+        _dk_spdx_valid "$work/predicate.json" || continue
+        if [[ -n "$expected" ]]; then
+            jq -e --slurpfile expected "$expected" '. == $expected[0]' "$work/predicate.json" >/dev/null || continue
+        fi
+        jq -cS . "$work/predicate.json" > "$work/canonical.json" || return 1
+        hash=$(_dk_hash "$work/canonical.json") || return $?
+        printf '%s\n' "$hash"
+        return 0
+    done < "$work/predicates.jsonl"
+    _dk_log_error "No matching verified SPDX attestation: $image"
+    return 7
+}
+
+_dk_prepare_sboms() {
+    local inventory="$1" work="$2" row reference platform file count=0 lines hash
+    lines=$(jq -c '.[]' <<< "$inventory") || return 1
+    : > "$work/scans.jsonl" || return 1
+    while IFS= read -r row; do
+        reference=$(jq -r '.reference' <<< "$row") || return 1
+        platform=$(jq -r '.platform' <<< "$row") || return 1
+        file="$work/sbom-$count.json"
+        syft "registry:$reference" --platform "$platform" -o spdx-json > "$file" || return 1
+        _dk_spdx_valid "$file" || { _dk_log_error "Invalid SPDX for $platform"; return 1; }
+        hash=$(_dk_hash "$file") || return $?
+        jq -c --arg file "$file" --arg hash "$hash" '. + {file:$file,sbom_sha256:$hash}' <<< "$row" \
+            >> "$work/scans.jsonl" || return 1
+        count=$((count+1))
+    done <<< "$lines"
+    jq -sc . "$work/scans.jsonl"
+}
+_dk_publish_sboms() {
+    local scans="$1" identity="$2" issuer="$3" work="$4" lines row reference file hash predicate
+    lines=$(jq -c '.[]' <<< "$scans") || return 1
+    : > "$work/verified.jsonl" || return 1
+    while IFS= read -r row; do
+        reference=$(jq -r '.reference' <<< "$row") || return 1
+        file=$(jq -r '.file' <<< "$row") || return 1
+        hash=$(jq -r '.sbom_sha256' <<< "$row") || return 1
+        [[ "$(_dk_hash "$file")" == "$hash" ]] || return 7
+        cosign attest --yes --predicate "$file" --type spdxjson "$reference" >&2 || return 1
+        [[ "$(_dk_hash "$file")" == "$hash" ]] || return 7
+        predicate=$(_dk_verify_attestation "$reference" "$identity" "$issuer" "$work" "$file") || return $?
+        [[ "$(_dk_hash "$file")" == "$hash" ]] || return 7
+        jq -c --arg predicate "$predicate" 'del(.file) + {status:"verified",predicate_sha256:$predicate}' <<< "$row" \
+            >> "$work/verified.jsonl" || return 1
+    done <<< "$lines"
+    jq -sc . "$work/verified.jsonl"
+}
+
+# Verify or attest an EXISTING immutable image without a source checkout/build.
+# Verification needs no scanner, login, builder setup, upload, or tag mutation.
+_dk_evidence_command() (
+    local action="$1" image="${2:-}" expected='[]' skip=false dry="${DRY_RUN:-false}" work inventory after rows='[]'
+    local identity="${DOCKER_CERTIFICATE_IDENTITY:-}" issuer="${DOCKER_CERTIFICATE_OIDC_ISSUER:-}" lines row ref hash scans
+    local expected_scans='' expected_file='' expected_hash=''
+    shift
+    [[ $# -eq 0 ]] || shift
+    # Internal release verification additionally binds the exact freshly scanned
+    # predicates. The public read-only verifier accepts any valid matching SPDX
+    # from the configured signer, so older attestations may coexist on an image.
+    if [[ "$action" == verify-scans ]]; then
+        [[ $# -gt 0 ]] || return 4
+        expected_scans="$1"; shift
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --certificate-identity|--certificate-oidc-issuer|--platform|-p)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                case "$1" in
+                    --certificate-identity) identity="$2" ;;
+                    --certificate-oidc-issuer) issuer="$2" ;;
+                    *) expected=$(_dk_platforms "$2") || return 4 ;;
+                esac
+                shift 2 ;;
+            --skip-sign) skip=true; shift ;;
+            --dry-run|-n) dry=true; shift ;;
+            *) return 4 ;;
+        esac
+    done
+    _dk_pinned_valid "$image" || return 4
+    _dk_dependency jq || return $?
+    if [[ "$dry" == true ]]; then
+        jq -nc --arg image "$image" --arg action "$action" '{status:"planned",reference:$image,operation:$action}'
+        return $?
+    fi
+    _dk_verify_policy "$identity" "$issuer" || return $?
+    _dk_dependency docker && docker_check_cosign || return 3
+    [[ "$action" != attest ]] || _dk_dependency syft || return 3
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-container-evidence.XXXXXXXX") || return 1
     trap 'rm -rf -- "$work"' EXIT
     trap 'exit 5' HUP INT TERM
-    syft "registry:$image" -o spdx-json > "$work/sbom.json" || return 1
-    _dk_spdx_valid "$work/sbom.json" || { _dk_log_error 'Invalid scanner output; refusing attestation'; return 1; }
-    cosign attest --yes --predicate "$work/sbom.json" --type spdxjson "$image" >&2 || return 1
+    inventory=$(_dk_registry_inventory "$image" "$expected" "$work") || return $?
+    if [[ "$action" == attest ]]; then
+        scans=$(_dk_prepare_sboms "$inventory" "$work") || return $?
+        rows=$(_dk_publish_sboms "$scans" "$identity" "$issuer" "$work") || return $?
+    else
+        $skip || _dk_verify_signature "$image" "$identity" "$issuer" "$work/signature.json" || return $?
+        lines=$(jq -c '.[]' <<< "$inventory") || return 1
+        while IFS= read -r row; do
+            ref=$(jq -r '.reference' <<< "$row") || return 1
+            if [[ -n "$expected_scans" ]]; then
+                scans=$(jq -ec --arg ref "$ref" '[.[] | select(.reference == $ref)] |
+                    if length == 1 then .[0] else error("missing or duplicate expected scan") end' <<< "$expected_scans") || return 7
+                expected_file=$(jq -r '.file' <<< "$scans") || return 7
+                expected_hash=$(jq -r '.sbom_sha256' <<< "$scans") || return 7
+                [[ "$(_dk_hash "$expected_file")" == "$expected_hash" ]] || return 7
+            fi
+            hash=$(_dk_verify_attestation "$ref" "$identity" "$issuer" "$work" "$expected_file") || return $?
+            [[ -z "$expected_file" || "$(_dk_hash "$expected_file")" == "$expected_hash" ]] || return 7
+            rows=$(jq -c --argjson row "$row" --arg hash "$hash" '. + [$row + {predicate_sha256:$hash,status:"verified"}]' <<< "$rows") || return 1
+        done <<< "$lines"
+    fi
+    after=$(_dk_registry_inventory "$image" "$expected" "$work") || return $?
+    [[ "$inventory" == "$after" ]] || return 7
+    jq -nc --arg image "$image" --arg identity "$identity" --arg issuer "$issuer" --arg action "$action" \
+        --argjson skip "$skip" --argjson rows "$rows" '
+        {schema_version:1,kind:"dsr-container-evidence",status:"verified",reference:$image,platforms:$rows,
+         certificate_identity:$identity,certificate_oidc_issuer:$issuer,
+         signature:(if $action == "attest" then "not_checked" elif $skip then "skipped" else "verified" end)}'
 )
+docker_attest_sbom() { _dk_evidence_command attest "$@"; }
+docker_verify_release() { _dk_evidence_command verify "$@"; }
+
+_dk_check_tags() {
+    local build="$1" work="$2" tags tag digest
+    tags=$(jq -r '.tags[]' <<< "$build") || return 1
+    digest=$(jq -r '.digest' <<< "$build") || return 1
+    while IFS= read -r tag; do
+        docker buildx imagetools inspect "$tag" --raw > "$work/tag.json" || return 8
+        [[ "sha256:$(_dk_hash "$work/tag.json")" == "$digest" ]] || {
+            _dk_log_error "Published tag no longer refers to this build: $tag"; return 7;
+        }
+    done <<< "$tags"
+}
 
 # Release failures are never downgraded to warnings. Dependencies are checked
 # before push; completed external effects are not deleted to hide a late error.
-docker_release() {
-    local skip=false arg plan build image status
+docker_release() (
+    local skip=false plan build image work inventory after scans evidence expected result
+    local identity="${DOCKER_CERTIFICATE_IDENTITY:-}" issuer="${DOCKER_CERTIFICATE_OIDC_ISSUER:-}"
     local -a args=()
-    for arg in "$@"; do
-        case "$arg" in
-            --skip-sign) skip=true ;;
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --certificate-identity|--certificate-oidc-issuer)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                case "$1" in --certificate-identity) identity="$2" ;; *) issuer="$2" ;; esac
+                shift 2 ;;
+            --skip-sign) skip=true; shift ;;
             --help|-h)
                 printf '%s\n' 'docker_release - Build, push, sign, and attest container image' \
-                    'Usage: docker_release TOOL VERSION [build options] [--skip-sign] [--dry-run]' >&2
+                    'Usage: docker_release TOOL VERSION [build options] [--skip-sign] [--dry-run]' \
+                    '  --certificate-identity ID --certificate-oidc-issuer HTTPS_ISSUER' >&2
                 return 0 ;;
             --push|--local|--output) _dk_log_error 'Release requires registry export'; return 4 ;;
-            *) args+=("$arg") ;;
+            *) args+=("$1"); shift ;;
         esac
     done
     [[ ${#args[@]} -gt 0 ]] || { _dk_log_error 'Tool and version required'; return 4; }
@@ -349,18 +605,42 @@ docker_release() {
         jq -c --argjson skip "$skip" '. + {kind:"dsr-container-release",signature:(if $skip then "skipped" else "planned" end),sbom:"planned"}' <<< "$plan"
         return $?
     fi
+    _dk_verify_policy "$identity" "$issuer" || return $?
     docker_check_cosign && _dk_dependency syft || return 3
     build=$(_dk_build_execute "$plan") || return $?
     image=$(jq -er '.reference' <<< "$build") || return 1
     _dk_pinned_valid "$image" || return 1
+    expected=$(jq -c '.platforms' <<< "$plan") || return 1
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-container-release.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    trap 'exit 5' HUP INT TERM
+    inventory=$(_dk_registry_inventory "$image" "$expected" "$work") || return $?
+    _dk_check_tags "$build" "$work" || return $?
+    # Complete ALL scans before publishing any new Cosign evidence.
+    scans=$(_dk_prepare_sboms "$inventory" "$work") || return $?
+    _dk_check_tags "$build" "$work" || return $?
     if ! $skip; then
-        if docker_sign "$image"; then :; else status=$?; return "$status"; fi
+        docker_sign "$image" || return $?
+        _dk_verify_signature "$image" "$identity" "$issuer" "$work/signature.json" || return $?
     fi
-    if docker_attest_sbom "$image"; then :; else status=$?; return "$status"; fi
-    jq -nc --argjson build "$build" --argjson skip "$skip" '
-        {schema_version:1,kind:"dsr-container-release",status:"complete",build:$build,
-         reference:$build.reference,signature:(if $skip then "skipped" else "submitted" end),sbom:"submitted"}'
-}
+    evidence=$(_dk_publish_sboms "$scans" "$identity" "$issuer" "$work") || return $?
+    # Independently reread the entire remote evidence set after all writes.
+    local -a verify_args=("$image" --certificate-identity "$identity" --certificate-oidc-issuer "$issuer")
+    $skip && verify_args+=(--skip-sign)
+    result=$(_dk_evidence_command verify-scans "$image" "$scans" "${verify_args[@]:1}") || return $?
+    # An older but valid attestation is not a substitute for the just-scanned one.
+    jq -e --argjson published "$evidence" '
+        (.platforms | map({reference,predicate_sha256}) | sort_by(.reference)) ==
+        ($published | map({reference,predicate_sha256}) | sort_by(.reference))
+    ' <<< "$result" >/dev/null || return 7
+    after=$(_dk_registry_inventory "$image" "$expected" "$work") || return $?
+    [[ "$inventory" == "$after" ]] || return 7
+    _dk_check_tags "$build" "$work" || return $?
+    jq -nc --argjson build "$build" --argjson skip "$skip" --argjson evidence "$evidence" --argjson result "$result" '
+        {schema_version:1,kind:"dsr-container-release",status:"verified",build:$build,
+         reference:$build.reference,signature:(if $skip then "skipped" else "verified" end),
+         sbom:"verified",platforms:$evidence,verification:$result}'
+)
 
 _dk_json() (
     local operation="$1" status=0 output='' error='' work start=$SECONDS
@@ -387,6 +667,9 @@ export -f docker_attest_sbom docker_release docker_build_json docker_release_jso
 export -f _dk_log_info _dk_log_ok _dk_log_warn _dk_log_error _dk_log_debug
 export -f _dk_dependency _dk_resolve_gh_token _dk_tag_valid _dk_repository_valid _dk_pinned_valid
 export -f _dk_platforms _dk_hash _dk_build_plan _dk_build_execute _dk_spdx_valid _dk_json
+export -f _dk_fetch_manifest _dk_registry_inventory _dk_verify_policy _dk_verify_signature
+export -f _dk_verify_attestation _dk_prepare_sboms _dk_publish_sboms _dk_evidence_command
+export -f docker_verify_release _dk_check_tags
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -uo pipefail
@@ -397,9 +680,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         release) docker_release "$@" ;;
         sign) docker_sign "$@" ;;
         attest) docker_attest_sbom "$@" ;;
+        verify) docker_verify_release "$@" ;;
         build-json) docker_build_json "$@" ;;
         release-json) docker_release_json "$@" ;;
-        help|--help|-h) printf '%s\n' 'Usage: bash src/docker.sh build|release|sign|attest|build-json|release-json [options]' ;;
+        help|--help|-h) printf '%s\n' 'Usage: bash src/docker.sh build|release|sign|attest|verify|build-json|release-json [options]' ;;
         *) _dk_log_error "Unknown container command: $_dk_cmd"; exit 4 ;;
     esac
     exit $?
