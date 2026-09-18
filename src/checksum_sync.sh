@@ -338,90 +338,149 @@ checksum_verify() (
 # Repository Sync
 # ============================================================================
 
-# Clone a repository to a temp directory
-# Args: repo [--branch branch]
-# Returns: path to cloned repo on stdout
-_cs_clone_repo() {
-    local repo="$1"
-    local branch="${2:-}"
+_cs_repo_name() { [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; }
 
-    # Ensure we're working in /tmp
-    local temp_dir
-    temp_dir=$(mktemp -d "/tmp/dsr-checksum-sync-XXXXXX")
-
-    if ! _cs_is_safe_path "$temp_dir"; then
-        rm -rf "$temp_dir"
-        return 1
-    fi
-
-    local clone_args=(--depth 1)
-    [[ -n "$branch" ]] && clone_args+=(--branch "$branch")
-
-    local repo_url="https://github.com/$repo.git"
-    if git clone "${clone_args[@]}" "$repo_url" "$temp_dir/repo" 2>/dev/null; then
-        echo "$temp_dir/repo"
-        return 0
-    else
-        _cs_log_error "Failed to clone: $repo"
-        rm -rf "$temp_dir"
-        return 1
-    fi
+_cs_repo_member() {
+    local name
+    name=$(_cs_member_name "${1:-}") || return 4
+    case "/${name,,}/" in *'/.git/'*) return 4 ;; esac
+    printf '%s\n' "$name"
 }
 
-# Update checksums in a target repository
-# Args: repo_path checksums_content [--commit] [--push]
-_cs_update_repo_checksums() {
-    local repo_path="$1"
-    local checksums_content="$2"
-    local commit=false
-    local push=false
-    local checksums_file=""
+# Preserve credential helpers and operator URL mappings, but never let ambient
+# Git plumbing redirect writes into another worktree/index. Paths stay literal.
+_cs_git() (
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    unset GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+    unset GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
+    export GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1
+    git -c core.fsmonitor=false -c submodule.recurse=false "$@"
+)
 
+# New private checkout owned by this sync invocation. Keep it on failure and
+# after an unpushed commit: deleting it would discard the only completed work.
+_cs_clone_repo() {
+    local repo="$1" destination="$2"
+    _cs_repo_name "$repo" && [[ ! -e "$destination" && ! -L "$destination" ]] || return 4
+    _cs_is_safe_path "$destination" || return 4
+    _cs_git clone --depth 1 --no-recurse-submodules "https://github.com/$repo.git" "$destination" >&2 || return 8
+    printf '%s\n' "$destination"
+}
+
+# Atomic manifest update, commit ONLY its literal path, and explicitly push
+# the current branch when requested (also on an unchanged retry). No force.
+# Reject user edits to the target; unrelated staged work is never committed.
+# Args: repo_path checksums_content [--commit] [--push] [--checksums-file path]
+# stdout: one update receipt on success; failures retain checkout diagnostics.
+_cs_update_repo_checksums() (
+    [[ $# -ge 2 ]] || return 4
+    local repo_path="$1" content="$2" commit=false push=false member=SHA256SUMS.txt
     shift 2
-    while [[ $# -gt 0 ]]; do
+    while (($#)); do
         case "$1" in
             --commit) commit=true; shift ;;
             --push) push=true; shift ;;
-            --checksums-file) checksums_file="$2"; shift 2 ;;
-            *) shift ;;
+            --checksums-file) [[ $# -ge 2 && -n "$2" ]] || return 4; member="$2"; shift 2 ;;
+            *) return 4 ;;
         esac
     done
-
-    if ! _cs_is_safe_path "$repo_path"; then
-        return 1
-    fi
-
-    # Find or create checksums file
-    if [[ -z "$checksums_file" ]]; then
-        checksums_file="SHA256SUMS.txt"
-    fi
-
-    local full_path="$repo_path/$checksums_file"
-
-    # Update checksums
-    echo -n "$checksums_content" > "$full_path"
-    _cs_log_ok "Updated: $checksums_file"
-
+    if $push && ! $commit; then return 4; fi
+    command -v jq >/dev/null || return 3
+    [[ -d "$repo_path" && ! -L "$repo_path" ]] || return 4
+    repo_path=$(cd "$repo_path" && pwd -P) || return 4
+    _cs_is_safe_path "$repo_path" || return 4
+    member=$(_cs_repo_member "$member") || return 4
+    local top branch='' head='' stage cleanup normalized full_path parent cursor rest part tracked=false changed=false
+    local publish_stage='' publish_cleanup
+    top=$(_cs_git -C "$repo_path" rev-parse --show-toplevel) || return 4
+    [[ "$top" == "$repo_path" ]] || return 4
     if $commit; then
-        git -C "$repo_path" add "$checksums_file"
-        if ! git -C "$repo_path" diff --cached --quiet; then
-            git -C "$repo_path" commit -m "Update checksums" >/dev/null 2>&1
-            _cs_log_ok "Committed changes"
-
-            if $push; then
-                if git -C "$repo_path" push >/dev/null 2>&1; then
-                    _cs_log_ok "Pushed to remote"
-                else
-                    _cs_log_error "Push failed"
-                    return 1
-                fi
-            fi
-        else
-            _cs_log_info "No changes to commit"
-        fi
+        head=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 4
+        branch=$(_cs_git -C "$repo_path" symbolic-ref -q HEAD) || return 4
     fi
+    # Resolve only directory components, refusing links before creating/writing
+    # anything under the requested repository-relative path.
+    cursor="$repo_path"; rest="$member"
+    while [[ "$rest" == */* ]]; do
+        part="${rest%%/*}"; rest="${rest#*/}"; cursor="$cursor/$part"
+        [[ ! -L "$cursor" && ( ! -e "$cursor" || -d "$cursor" ) ]] || return 4
+    done
+    full_path="$repo_path/$member"; parent="$cursor"
+    [[ ! -L "$full_path" && ( ! -e "$full_path" || -f "$full_path" ) ]] || return 4
+    if _cs_git -C "$repo_path" ls-files --error-unmatch -- "$member" >/dev/null 2>&1; then tracked=true; fi
+    if $tracked; then
+        _cs_git -C "$repo_path" diff --quiet -- "$member" &&
+        _cs_git -C "$repo_path" diff --cached --quiet -- "$member" || {
+            _cs_log_error "Checksum destination has uncommitted changes: $member"; return 2;
+        }
+    elif [[ -e "$full_path" ]]; then
+        _cs_log_error "Refusing to replace an untracked checksum file: $member"; return 2
+    fi
+    # Syntax is checked before even creating missing target directories.
+    stage=$(mktemp -d "$repo_path/.dsr-checksum-update.XXXXXXXX") || return 1
+    printf -v cleanup 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' "$stage/input" "$stage/manifest" "$stage"
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    printf '%s\n' "$content" > "$stage/input" || return 1
+    checksum_manifest_normalize "$stage/input" > "$stage/manifest" || return $?
+    if [[ ! -f "$full_path" ]] || ! cmp -s "$stage/manifest" "$full_path"; then
+        mkdir -p -- "$parent" || return 1
+        [[ ! -L "$full_path" && ( ! -e "$full_path" || -f "$full_path" ) ]] || return 4
+        # The target subdirectory can be a different mounted filesystem. Stage
+        # beside the final path so mv is a rename, not a cross-device copy.
+        publish_stage=$(mktemp -d "$parent/.dsr-checksum-output.XXXXXXXX") || return 1
+        printf -v publish_cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$publish_stage/manifest" "$publish_stage"
+        trap "$cleanup; $publish_cleanup" EXIT
+        cp -- "$stage/manifest" "$publish_stage/manifest" || return 1
+        cmp -s "$stage/manifest" "$publish_stage/manifest" || return 1
+        chmod 644 "$publish_stage/manifest" || return 1
+        mv -f -- "$publish_stage/manifest" "$full_path" || return 1
+        changed=true
+    fi
+    if $commit && $changed; then
+        _cs_git -C "$repo_path" add -- "$member" || return 1
+        # --only explicitly excludes unrelated staged changes. Do not suppress
+        # commit failures (missing identity, rejected hooks, signing failures).
+        _cs_git -C "$repo_path" commit --only -m "Update checksums" -- "$member" >&2 || return 1
+        head=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 1
+    fi
+    if $commit; then
+        normalized=$(checksum_manifest_normalize "$stage/input") || return 1
+        [[ "$(_cs_git -C "$repo_path" show "HEAD:$member")" == "$normalized" ]] || return 1
+    fi
+    if $push; then
+        _cs_git -C "$repo_path" push --porcelain origin "HEAD:$branch" >&2 || return 8
+    fi
+    jq -nc --arg path "$repo_path" --arg file "$member" --arg sha "$head" --arg branch "$branch" \
+        --argjson changed "$changed" --argjson pushed "$push" \
+        '{checkout:$path,checksums_file:$file,changed:$changed,pushed:$pushed,
+          commit:(if $sha == "" then null else $sha end),branch:$branch}'
+)
 
-    return 0
+# Only transport failures try another source. A downloaded but malformed
+# manifest is fatal, never a reason to select a different set of checksums.
+_cs_fetch_manifest() {
+    local repo="$1" tag="$2" tool="$3" output="$4" prefer="$5" transport candidate
+    local transports=(curl gh)
+    [[ "$prefer" != true ]] || transports=(gh curl)
+    for candidate in checksums.sha256 SHA256SUMS.txt "${tool}-${tag#v}-SHA256SUMS.txt" checksums.txt; do
+        for transport in "${transports[@]}"; do
+            command -v "$transport" >/dev/null || continue
+            if [[ "$transport" == curl ]]; then
+                curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
+                    "https://github.com/$repo/releases/download/${tag//+/%2B}/$candidate" -o "$output" 2>/dev/null || continue
+            else
+                GH_HOST=github.com gh release download "$tag" --repo "$repo" --pattern "$candidate" \
+                    --output "$output" --clobber 2>/dev/null || continue
+            fi
+            checksum_manifest_normalize "$output" >/dev/null || return 4
+            printf '%s\n' "$candidate"
+            return 0
+        done
+    done
+    _cs_log_error "No checksum manifest available for $repo $tag"
+    return 7
 }
 
 # ============================================================================
@@ -437,343 +496,228 @@ _cs_update_repo_checksums() {
 #   --push                  Push changes to remote
 #   --open-issue            Open security review issue instead of auto-merge
 #   --dry-run               Show what would be done
-checksum_sync() {
-    local tool_name=""
-    local version=""
-    local artifacts_dir=""
-    local target_repos=()
-    local checksums_file="SHA256SUMS.txt"
-    local push_changes=false
-    local open_issue=false
-    local dry_run=false
-    local is_external=false
-
-    # Parse arguments
-    while [[ $# -gt 0 ]]; do
+checksum_sync() (
+    local tool_name='' version='' repo='' artifacts_dir='' manifest='' checksums_file=SHA256SUMS.txt
+    local push_changes=false review=false dry_run=false json=false metadata=false prefer=false
+    local workspace='' tag='' source_kind='' source_asset='' manifest_sha='' error='' arg option
+    local start_time=$SECONDS synced=0 failed=0 planned=0 issues_opened=0
+    local -a target_repos=() results=()
+    for arg in "$@"; do [[ "$arg" != --json ]] || json=true; done
+    command -v jq >/dev/null || {
+        _cs_log_error 'jq is required for checksum sync'
+        if $json; then printf '%s\n' '{"status":"error","exit_code":3,"error":"jq is required"}'; fi
+        return 3
+    }
+    _cs_sync_finish() {
+        local code=$? overall=success entries
+        trap - EXIT
+        if ((code != 0)); then
+            overall=error
+            ((synced + issues_opened == 0)) || overall=partial
+            [[ -n "$error" ]] || error="Checksum sync failed (exit $code)"
+        fi
+        entries=$(printf '%s\n' "${results[@]}" | jq -s '.') || exit 1
+        if $json; then
+            jq -nc --arg status "$overall" --argjson code "$code" --arg tool "$tool_name" \
+                --arg version "$tag" --arg repo "$repo" --arg workspace "$workspace" --arg error "$error" \
+                --arg source "$source_kind" --arg asset "$source_asset" --arg digest "$manifest_sha" \
+                --argjson duration "$((SECONDS - start_time))" --argjson results "$entries" \
+                --argjson synced "$synced" --argjson failed "$failed" --argjson planned "$planned" \
+                --argjson issues "$issues_opened" --argjson dry_run "$dry_run" \
+                '{status:$status,exit_code:$code,tool:$tool,version:$version,repository:$repo,
+                  workspace:(if $workspace == "" then null else $workspace end),dry_run:$dry_run,
+                  source:{kind:$source,asset:$asset,manifest_sha256:$digest},
+                  error:(if $error == "" then null else $error end),duration_seconds:$duration,
+                  synced:$synced,failed:$failed,planned:$planned,issues_opened:$issues,results:$results}' || exit 1
+        fi
+        [[ -z "$workspace" ]] || _cs_log_info "Checksum sync workspace retained: $workspace"
+        exit "$code"
+    }
+    trap _cs_sync_finish EXIT
+    trap 'error="Sync interrupted"; exit 5' HUP INT TERM
+    while (($#)); do
         case "$1" in
-            --tool|-t)
-                tool_name="$2"
-                shift 2
-                ;;
-            --version|-V)
-                version="$2"
-                shift 2
-                ;;
-            --artifacts-dir|-a)
-                artifacts_dir="$2"
-                shift 2
-                ;;
-            --target-repo|-r)
-                target_repos+=("$2")
-                shift 2
-                ;;
-            --checksums-file)
-                checksums_file="$2"
-                shift 2
-                ;;
-            --push)
-                push_changes=true
-                shift
-                ;;
-            --open-issue)
-                open_issue=true
-                shift
-                ;;
-            --external)
-                is_external=true
-                shift
-                ;;
-            --dry-run|-n)
-                dry_run=true
-                shift
-                ;;
+            --tool|-t|--version|-V|--repo|--artifacts-dir|-a|--manifest|--target-repo|-r|--checksums-file)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { error="Missing value for $1"; return 4; }
+                option="$1"
+                case "$option" in
+                    --tool|-t) tool_name="$2" ;;
+                    --version|-V) version="$2" ;;
+                    --repo) repo="$2" ;;
+                    --artifacts-dir|-a) artifacts_dir="$2" ;;
+                    --manifest) manifest="$2" ;;
+                    --target-repo|-r) target_repos+=("$2") ;;
+                    --checksums-file) checksums_file="$2" ;;
+                esac
+                shift 2 ;;
+            --push) push_changes=true; shift ;;
+            --external|--open-issue) review=true; shift ;;
+            --dry-run|-n) dry_run=true; shift ;;
+            --json) shift ;;
+            --include-metadata) metadata=true; shift ;;
+            --prefer-gh) prefer=true; shift ;;
             --help|-h)
-                cat << 'EOF'
-checksum_sync - Sync checksums to downstream repos
-
+                cat >&2 <<'EOF'
+checksum_sync - Sync validated release checksums to downstream repositories
 USAGE:
-    checksum_sync <tool> <version>
-    checksum_sync --tool <name> --version <tag> [options]
-
+    checksum_sync TOOL VERSION [--repo OWNER/REPO] [options]
+    bash src/checksum_sync.sh sync TOOL VERSION [options]
 OPTIONS:
-    -t, --tool <name>           Tool to sync checksums for
-    -V, --version <ver>         Version/tag to sync
-    -a, --artifacts-dir <dir>   Directory with release artifacts
-    -r, --target-repo <repo>    Target repository (can repeat)
-    --checksums-file <file>     Checksums file name (default: SHA256SUMS.txt)
-    --push                      Push changes to remote repos
-    --open-issue                Open security review issue (for external tools)
-    --external                  Treat as external tool (triggers review)
-    -n, --dry-run               Show what would be done
-
-DESCRIPTION:
-    After a dsr release, updates checksum manifests in downstream repositories.
-
-    For internal tools: auto-commits and optionally pushes changes.
-    For external tools: opens a security review issue instead of auto-merge.
-
-    All operations happen in /tmp to avoid modifying /data/projects.
-
-EXAMPLES:
-    checksum_sync ntm v1.2.3                      # Auto-detect artifacts
-    checksum_sync ntm v1.2.3 --push               # Commit and push
-    checksum_sync ntm v1.2.3 --external           # Open review issue
-    checksum_sync ntm v1.2.3 --dry-run            # Preview changes
-
-EXIT CODES:
-    0  - Checksums synced successfully
-    1  - Sync failed
-    3  - Authentication error
-    4  - Invalid arguments
-    7  - Artifacts not found
+    --artifacts-dir DIR      Generate and reverify local release checksums
+    --manifest FILE          Use an existing manifest (syntax checked, not authenticated)
+    --target-repo OWNER/REPO Downstream destination; repeat for multiple repositories
+    --checksums-file PATH    Repository-relative output (default: SHA256SUMS.txt)
+    --include-metadata       Include text, SBOM and provenance in local generation
+    --prefer-gh              Prefer authenticated GitHub CLI release downloads
+    --push                   Push the checksum commit to the current branch; never force
+    --external, --open-issue Open a security review issue instead of committing
+    --dry-run                Validate and plan without cloning or writing remote repositories
+    --json                   One result with per-target outcomes and retained checkout paths
+Local commits and failed checkouts are retained in the reported private workspace.
+Download-only manifests are syntax-validated, not proof of artifact authenticity.
 EOF
-                return 0
-                ;;
-            -*)
-                _cs_log_error "Unknown option: $1"
-                return 4
-                ;;
+                return 0 ;;
+            -*) error="Unknown option: $1"; return 4 ;;
             *)
-                # Positional arguments: tool, version
-                if [[ -z "$tool_name" ]]; then
-                    tool_name="$1"
-                elif [[ -z "$version" ]]; then
-                    version="$1"
-                fi
-                shift
-                ;;
+                if [[ -z "$tool_name" ]]; then tool_name="$1"
+                elif [[ -z "$version" ]]; then version="$1"
+                else error='Too many positional arguments'; return 4; fi
+                shift ;;
         esac
     done
-
-    # Validate required arguments
-    if [[ -z "$tool_name" ]]; then
-        _cs_log_error "Tool name required"
-        return 4
+    error='Invalid checksum sync configuration'
+    [[ "$tool_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || return 4
+    [[ "$version" != null && "$version" != v ]] || return 4
+    tag="v${version#v}"
+    checksums_file=$(_cs_repo_member "$checksums_file") || return 4
+    [[ -z "$manifest" || -z "$artifacts_dir" ]] || return 4
+    [[ -z "$manifest" || ( -f "$manifest" && ! -L "$manifest" ) ]] || return 4
+    [[ -z "$artifacts_dir" || ( -d "$artifacts_dir" && ! -L "$artifacts_dir" ) ]] || return 4
+    if [[ -z "$repo" ]]; then
+        if declare -F act_get_repo >/dev/null; then
+            repo=$(act_get_repo "$tool_name") || return 4
+        fi
+        [[ -n "$repo" ]] || repo="Dicklesworthstone/$tool_name"
     fi
-
-    if [[ -z "$version" ]]; then
-        _cs_log_error "Version required"
-        return 4
-    fi
-
-    # Record start time
-    local start_time
-    start_time=$(date +%s)
-
-    # Normalize version
-    local tag="${version#v}"
-    tag="v$tag"
-
-    _cs_log_info "Syncing checksums for $tool_name $tag"
-
-    # If artifacts directory not specified, try to find release artifacts
-    if [[ -z "$artifacts_dir" ]]; then
-        # Try common locations
-        local state_dir="${DSR_STATE_DIR:-$HOME/.local/state/dsr}"
-        local possible_dirs=(
-            "$state_dir/releases/$tool_name/$tag"
-            "$state_dir/artifacts/$tool_name/$tag"
-            "/tmp/dsr-release-$tool_name-$tag"
-        )
-        for dir in "${possible_dirs[@]}"; do
-            if [[ -d "$dir" ]]; then
-                artifacts_dir="$dir"
-                break
-            fi
+    _cs_repo_name "$repo" || return 4
+    ((${#target_repos[@]} > 0)) || target_repos=("$repo")
+    local target key
+    local -A seen=()
+    local -a unique_targets=()
+    for target in "${target_repos[@]}"; do
+        _cs_repo_name "$target" || return 4
+        key="${target,,}"
+        [[ -z "${seen[$key]:-}" ]] || continue
+        seen["$key"]=1; unique_targets+=("$target")
+    done
+    error=''
+    local root="${TMPDIR:-/tmp}"
+    root=$(cd "$root" && pwd -P) || return 4
+    _cs_is_safe_path "$root" || { error='Protected temporary root'; return 4; }
+    workspace=$(mktemp -d "$root/dsr-checksum-sync.XXXXXXXX") || return 1
+    workspace=$(cd "$workspace" && pwd -P) || return 1
+    local content='' candidate state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    if [[ -z "$artifacts_dir" && -z "$manifest" ]]; then
+        for candidate in "$state_dir/releases/$tool_name/$tag" "$state_dir/artifacts/$tool_name/$tag" "/tmp/dsr-release-$tool_name-$tag"; do
+            [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+            artifacts_dir="$candidate"; break
         done
     fi
-
-    # Generate checksums
-    local checksums_content=""
-    if [[ -n "$artifacts_dir" && -d "$artifacts_dir" ]]; then
+    if [[ -n "$artifacts_dir" ]]; then
+        source_kind=local_artifacts
         _cs_log_info "Generating checksums from: $artifacts_dir"
-        checksums_content=$(checksum_generate "$artifacts_dir") || return $?
+        local -a generate_args=()
+        $metadata && generate_args+=(--include-metadata)
+        checksum_generate "$artifacts_dir" --output "$workspace/manifest" "${generate_args[@]}" || {
+            local rc=$?; error='Local artifact checksum generation failed'; return "$rc";
+        }
+    elif [[ -n "$manifest" ]]; then
+        source_kind=provided_manifest
+        checksum_manifest_normalize "$manifest" > "$workspace/manifest" || { error='Invalid provided manifest'; return 4; }
     else
-        # Try to fetch from GitHub release
-        _cs_log_info "Fetching checksums from GitHub release..."
-        local repo
-        if command -v act_get_repo &>/dev/null; then
-            repo=$(act_get_repo "$tool_name" 2>/dev/null)
-        fi
-        [[ -z "$repo" ]] && repo="Dicklesworthstone/$tool_name"
-
-        local checksums_url="https://github.com/$repo/releases/download/$tag/${tool_name}-${tag#v}-SHA256SUMS.txt"
-        checksums_content=$(curl -sL "$checksums_url" 2>/dev/null)
-
-        if [[ -z "$checksums_content" ]]; then
-            _cs_log_error "Could not find checksums for $tool_name $tag"
-            _cs_log_error "Tried: $checksums_url"
-            return 7
-        fi
+        source_kind=release_manifest
+        source_asset=$(_cs_fetch_manifest "$repo" "$tag" "$tool_name" "$workspace/download" "$prefer") || {
+            local rc=$?; error='Release checksum download or validation failed'; return "$rc";
+        }
+        checksum_manifest_normalize "$workspace/download" > "$workspace/manifest" || return 4
     fi
-
-    if [[ -z "$checksums_content" ]]; then
-        _cs_log_error "No checksums to sync"
-        return 7
-    fi
-
-    _cs_log_debug "Checksums content:"
-    _cs_log_debug "$checksums_content"
-
-    # If no target repos specified, use default (the tool's own repo)
-    if [[ ${#target_repos[@]} -eq 0 ]]; then
-        local default_repo=""
-        if command -v act_get_repo &>/dev/null; then
-            default_repo=$(act_get_repo "$tool_name" 2>/dev/null) || default_repo=""
-        fi
-        [[ -z "$default_repo" ]] && default_repo="Dicklesworthstone/$tool_name"
-        target_repos=("$default_repo")
-    fi
-
-    local synced=0
-    local failed=0
-    local issues_opened=0
-    local results=()
-
-    for target_repo in "${target_repos[@]}"; do
-        _cs_log_info "Updating: $target_repo"
-
+    content=$(cat "$workspace/manifest") || return 1
+    manifest_sha=$(_cs_sha256 "$workspace/manifest") || return $?
+    local index=0 checkout receipt rc action entry issue_url body
+    for target in "${unique_targets[@]}"; do
+        index=$((index + 1)); rc=0; receipt='{}'; checkout=''; action=update
         if $dry_run; then
-            _cs_log_info "[dry-run] Would update $checksums_file in $target_repo"
-            _cs_log_info "[dry-run] Checksums:"
-            echo "$checksums_content" | head -5 >&2
-            [[ $(echo "$checksums_content" | wc -l) -gt 5 ]] && _cs_log_info "[dry-run] ..."
-            ((synced++))
-            continue
-        fi
-
-        # For external tools, open an issue instead of auto-merge
-        if $is_external || $open_issue; then
-            _cs_log_info "Opening security review issue for external tool..."
-
-            local issue_title="Security Review: Update checksums for $tool_name $tag"
-            local issue_body="## Checksum Update Request
-
-Tool: \`$tool_name\`
-Version: \`$tag\`
-
-### Proposed Checksums
-\`\`\`
-$checksums_content
-\`\`\`
-
-### Action Required
-Please review and verify these checksums before merging.
-
-- [ ] Checksums match official release
-- [ ] No unexpected changes
-- [ ] Source verified
-
-/cc @maintainer"
-
-            if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-                if gh issue create --repo "$target_repo" --title "$issue_title" --body "$issue_body" >/dev/null 2>&1; then
-                    _cs_log_ok "Security review issue opened in $target_repo"
-                    ((issues_opened++))
-                    results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "issue_opened", status: "success"}')")
-                else
-                    _cs_log_error "Failed to open issue in $target_repo"
-                    ((failed++))
-                    results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "issue_opened", status: "error"}')")
-                fi
+            action=planned; planned=$((planned + 1))
+            _cs_log_info "[dry-run] Would update $checksums_file in $target"
+        elif $review; then
+            action=issue_opened
+            body=$(printf '## Checksum review: %s %s\n\nManifest SHA256: `%s`\n\nSource: %s\n\nValidate against the official release before accepting.\n\n```text\n%s\n```\n' \
+                "$tool_name" "$tag" "$manifest_sha" "$source_kind" "$content") || return 1
+            if ! command -v gh >/dev/null; then rc=3
+            elif issue_url=$(GH_HOST=github.com gh issue create --repo "$target" \
+                --title "Security Review: Update checksums for $tool_name $tag" --body "$body" 2> "$workspace/target-$index.log"); then
+                receipt=$(jq -nc --arg url "$issue_url" '{issue_url:$url}') || return 1
+                issues_opened=$((issues_opened + 1))
+            else rc=$?; fi
+        else
+            checkout="$workspace/target-$index"
+            if ! _cs_clone_repo "$target" "$checkout" > "$workspace/target-$index.path" 2> "$workspace/target-$index.log"; then
+                rc=8; action=clone
             else
-                _cs_log_warn "gh CLI not available, cannot open issue"
-                _cs_log_info "Manual review required for: $target_repo"
-                ((failed++))
-                results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "issue_opened", status: "error", reason: "gh_unavailable"}')")
+                local -a update_args=(--commit --checksums-file "$checksums_file")
+                $push_changes && update_args+=(--push)
+                receipt=$(_cs_update_repo_checksums "$checkout" "$content" "${update_args[@]}" 2>> "$workspace/target-$index.log") || rc=$?
+                ((rc != 0)) || synced=$((synced + 1))
             fi
-            continue
         fi
-
-        # Clone repo to temp directory
-        local repo_path
-        repo_path=$(_cs_clone_repo "$target_repo")
-        if [[ -z "$repo_path" ]]; then
-            _cs_log_error "Failed to clone $target_repo"
-            ((failed++))
-            results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "clone", status: "error"}')")
-            continue
+        if ((rc != 0)); then
+            failed=$((failed + 1)); receipt='{}'
+            _cs_log_error "$action failed for $target (exit $rc); checkout/logs retained"
         fi
-
-        # Update checksums
-        local update_args=(--commit)
-        $push_changes && update_args+=(--push)
-        update_args+=(--checksums-file "$checksums_file")
-
-        if _cs_update_repo_checksums "$repo_path" "$checksums_content" "${update_args[@]}"; then
-            ((synced++))
-            results+=("$(jq -nc --arg repo "$target_repo" --argjson pushed "$push_changes" '{repo: $repo, action: "updated", status: "success", pushed: $pushed}')")
-        else
-            ((failed++))
-            results+=("$(jq -nc --arg repo "$target_repo" '{repo: $repo, action: "update", status: "error"}')")
-        fi
-
-        # Cleanup
-        rm -rf "$(dirname "$repo_path")"
+        entry=$(jq -nc --arg repo "$target" --arg action "$action" --arg path "$checkout" \
+            --argjson code "$rc" --argjson receipt "$receipt" \
+            '{repo:$repo,action:$action,status:(if $code == 0 then "success" else "error" end),
+              exit_code:$code,checkout:(if $path == "" then null else $path end)} + $receipt') || return 1
+        results+=("$entry")
     done
-
-    # Calculate duration
-    local end_time duration
-    end_time=$(date +%s)
-    duration=$((end_time - start_time))
-
-    # Determine overall status
-    local status="success"
-    local exit_code=0
-    if [[ $failed -gt 0 ]]; then
-        if [[ $synced -eq 0 && $issues_opened -eq 0 ]]; then
-            status="error"
-            exit_code=1
-        else
-            status="partial"
-            exit_code=1
-        fi
-    fi
-
-    # Output summary
-    _cs_log_info ""
-    _cs_log_info "=== Checksum Sync Summary ==="
-    _cs_log_info "Tool:     $tool_name"
-    _cs_log_info "Version:  $tag"
-    _cs_log_info "Synced:   $synced repo(s)"
-    [[ $issues_opened -gt 0 ]] && _cs_log_info "Issues:   $issues_opened opened"
-    [[ $failed -gt 0 ]] && _cs_log_error "Failed:   $failed repo(s)"
-    _cs_log_info "Duration: ${duration}s"
-
-    return $exit_code
-}
+    _cs_log_info "Checksum sync: $synced updated, $issues_opened review issues, $planned planned, $failed failed"
+    ((failed == 0)) || { error='One or more downstream updates failed'; return 1; }
+    return 0
+)
 
 # JSON output wrapper
-checksum_sync_json() {
-    local args=("$@")
-    local start_time
-    start_time=$(date +%s)
-
-    local output status="success" exit_code=0
-    output=$(checksum_sync "${args[@]}" 2>&1) || {
-        exit_code=$?
-        status="error"
-    }
-
-    local end_time duration
-    end_time=$(date +%s)
-    duration=$((end_time - start_time))
-
-    jq -nc \
-        --arg status "$status" \
-        --argjson exit_code "$exit_code" \
-        --arg output "$output" \
-        --argjson duration "$duration" \
-        '{
-            status: $status,
-            exit_code: $exit_code,
-            output: $output,
-            duration_seconds: $duration
-        }'
-}
+checksum_sync_json() (
+    command -v jq >/dev/null || { checksum_sync --json "$@"; return $?; }
+    local stage cleanup root code=0
+    root=$(cd "${TMPDIR:-/tmp}" && pwd -P) || return 4
+    if ! _cs_is_safe_path "$root"; then checksum_sync --json "$@"; return $?; fi
+    stage=$(mktemp -d "$root/dsr-checksum-json.XXXXXXXX") || return 1
+    printf -v cleanup 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' "$stage/result" "$stage/log" "$stage"
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    checksum_sync --json "$@" > "$stage/result" 2> "$stage/log" || code=$?
+    jq -ce -s --rawfile output "$stage/log" '
+        if length == 1 and (.[0] | type == "object") then .[0] + {output:$output}
+        else error("invalid sync result") end' "$stage/result" || return 1
+    return "$code"
+)
 
 # ============================================================================
 # Exports
 # ============================================================================
 
 export -f checksum_manifest_normalize checksum_generate checksum_verify checksum_sync checksum_sync_json
+
+# Standalone entry point as well as a sourceable module. No release or remote
+# mutation occurs merely by sourcing this file.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    command="${1:-}"; shift 2>/dev/null || true
+    case "$command" in
+        generate) checksum_generate "$@" ;;
+        verify) checksum_verify "$@" ;;
+        normalize) checksum_manifest_normalize "$@" ;;
+        sync) checksum_sync "$@" ;;
+        *) printf 'Usage: checksum_sync.sh {generate|verify|normalize|sync} [arguments]\n' >&2; exit 4 ;;
+    esac
+    exit $?
+fi
