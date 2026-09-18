@@ -219,17 +219,19 @@ EOF
     skip_unless_command syft "syft not installed"
 
     local artifacts="$TEST_TMPDIR/artifacts"
-    mkdir -p "$artifacts"
-    echo "binary1" > "$artifacts/tool1"
-    echo "binary2" > "$artifacts/tool2"
+    local payload="$TEST_TMPDIR/payload"
+    mkdir -p "$artifacts" "$payload"
+    echo 'module example.com/release' > "$payload/go.mod"
+    tar -czf "$artifacts/tool1.tar.gz" -C "$payload" go.mod
+    tar -czf "$artifacts/tool2.tar.gz" -C "$payload" go.mod
 
     run sbom_generate_artifacts "$artifacts" --format spdx
-    # May generate 0-2 SBOMs depending on syft's ability to scan simple files
-    # Important thing is it doesn't crash
     [[ "$status" -eq 0 ]]
+    assert_file_exists "$artifacts/tool1.tar.gz.sbom.spdx.json"
+    assert_file_exists "$artifacts/tool2.tar.gz.sbom.spdx.json"
 }
 
-@test "sbom_generate_artifacts skips existing SBOMs" {
+@test "sbom_generate_artifacts rejects invalid retained SBOMs without overwriting" {
     skip_unless_command syft "syft not installed"
 
     local artifacts="$TEST_TMPDIR/artifacts"
@@ -238,7 +240,7 @@ EOF
     echo '{"existing": true}' > "$artifacts/tool.sbom.spdx.json"
 
     run sbom_generate_artifacts "$artifacts" --format spdx
-    [[ "$status" -eq 0 ]]
+    [[ "$status" -ne 0 ]]
 
     # Should not overwrite existing
     local content
@@ -250,14 +252,19 @@ EOF
     skip_unless_command syft "syft not installed"
 
     local artifacts="$TEST_TMPDIR/artifacts"
-    mkdir -p "$artifacts"
-    echo "binary" > "$artifacts/tool"
+    local payload="$TEST_TMPDIR/payload"
+    mkdir -p "$artifacts" "$payload"
+    echo 'module example.com/release' > "$payload/go.mod"
+    tar -czf "$artifacts/tool.tar.gz" -C "$payload" go.mod
     echo "checksum" > "$artifacts/checksums.txt"
     echo "signature" > "$artifacts/tool.sig"
 
     run sbom_generate_artifacts "$artifacts"
     # txt and sig files should be skipped
     [[ "$status" -eq 0 ]]
+    assert_file_exists "$artifacts/tool.tar.gz.sbom.spdx.json"
+    [[ ! -e "$artifacts/checksums.txt.sbom.spdx.json" ]]
+    [[ ! -e "$artifacts/tool.sig.sbom.spdx.json" ]]
 }
 
 @test "sbom_generate_artifacts fails for nonexistent directory" {
@@ -276,7 +283,12 @@ EOF
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
   "SPDXID": "SPDXRef-DOCUMENT",
-  "name": "test-sbom"
+  "name": "test-sbom",
+  "documentNamespace": "https://example.test/sbom/test",
+  "creationInfo": {
+    "creators": ["Tool: test-sbom"],
+    "created": "2026-09-18T00:00:00Z"
+  }
 }
 EOF
 
