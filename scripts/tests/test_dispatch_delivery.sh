@@ -71,6 +71,7 @@ check() {
 }
 new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"; export DP_TEST_CASE="$CASE"
+    export DSR_STATE_DIR="$CASE/state"
     : > "$CASE/calls"; : > "$CASE/argv"; : > "$CASE/gh-calls"
     unset DP_MODE DRY_RUN
     export DSR_GH_TOKEN=dsr-explicit GITHUB_TOKEN=github-other GH_TOKEN=gh-other
@@ -135,7 +136,7 @@ export DRY_RUN=true
 capture dispatch_event owner/repo release
 check 'global dry-run is honored' test "$(count)" -eq 0
 
-for payload in 'null' '[]' 'true' '1' '{}'\$'\n''{}' 'garbage'; do
+for payload in 'null' '[]' 'true' '1' $'{}\n{}' 'garbage'; do
     new_case "payload-$checks"
     capture dispatch_event owner/repo release --payload "$payload" --dry-run
     check "invalid payload rejected ($payload)" test "$status" -eq 4
@@ -148,6 +149,9 @@ check 'more than ten client keys are rejected' test "$status" -eq 4
 payload=$(jq -nc '{text:("x"*65536)}')
 capture dispatch_event owner/repo release --payload "$payload"
 check 'oversized UTF8 payload is rejected' test "$status" -eq 4
+payload=$(jq -nc '{text:("x"*65500)}')
+capture dispatch_event owner/repo release --payload "$payload"
+check 'total request overhead is included in size validation' test "$status" -eq 4
 event=$(printf '%0101d' 1)
 capture dispatch_event owner/repo "$event"
 check 'event longer than 100 characters rejected' test "$status" -eq 4
@@ -211,6 +215,7 @@ check 'JSON wrapper success is valid JSON' jq -e '.status=="success" and .detail
 capture dispatch_release_json test-tool 1.2.3 --sha invalid
 check 'JSON wrapper preserves invalid argument exit' test "$status" -eq 4
 check 'JSON wrapper error remains structured' jq -e '.status=="error" and .exit_code==4' "$CASE/out"
+check 'JSON failure includes a usable diagnostic' jq -e '.error|type=="string" and length>0' "$CASE/out"
 
 new_case exports
 capture bash -c 'dispatch_event owner/repo release --dry-run'
