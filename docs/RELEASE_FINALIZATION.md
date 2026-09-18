@@ -2,9 +2,10 @@
 
 `src/release_finalize.sh` connects the existing local SBOM inventory, GitHub
 metadata publisher, remote verifier, draft publication and persistent downstream
-handoff into one recoverable operation. Release payloads must already be uploaded
-to an existing release and
-its tag must already exist. It does not build or upload binaries.
+handoff into one recoverable operation. With `--upload-payloads`, it first uploads
+the exact binary/archive set from a successful build manifest. Without that flag,
+release payloads must already be uploaded. The release and its tag must already
+exist; this command does not build binaries or create tags/releases.
 
 ```bash
 bash src/release_finalize.sh /path/to/artifacts \
@@ -29,6 +30,92 @@ the artifact directory. The generator's verified retry path reuses finished SBOM
 without requiring another Syft scan. `--dry-run` (or `DRY_RUN=true`) validates
 arguments and prints a plan without authentication, API calls, scans or persistent
 state creation. A plan is not a verification result.
+
+## Optional manifest-bound payload uploads
+
+The complete upload-to-publication flow uses the existing finalization entry point:
+
+```bash
+bash src/release_finalize.sh /path/to/artifacts \
+  --repo owner/tool --tag v1.2.3 --sha FULL_40_CHARACTER_COMMIT \
+  --upload-payloads --build-manifest /path/to/build-manifest.json \
+  --output-dir /path/to/sbom-metadata --promote \
+  --tool tool --dispatch-repos owner/checksums,owner/formulas,owner/canaries
+```
+
+`--upload-payloads` and `--build-manifest` must be supplied together. The manifest
+must satisfy the existing complete successful DSR build profile: schema `1.0.0`,
+`status: success`, expected source commit and version, unique named artifacts with
+SHA256 and positive sizes, and consistent successful target coverage. Recorded
+host results, when present, must agree with that coverage. The manifest's tool
+must also match `--tool` when dispatch is requested. Arbitrary embedded artifact
+paths are ignored: files are selected only by validated flat names under the
+explicit artifact directory.
+
+The local top-level payload namespace must match the manifest exactly. Versioned
+and installer-compatible hardlink names remain distinct assets. Selection uses
+the existing SBOM payload policy, excluding text/JSON/checksum/signature metadata.
+This stage uploads only those manifest-selected binaries/archives, **not** the
+private build manifest, local upload state, checksum files, or signature sidecars.
+Arrange separately required signing/checksum publication before finalization;
+this option is not a substitute for those policies.
+
+Before the first upload, every selected file is hashed and copied into a private
+snapshot. Temporary free space must accommodate the complete selected payload
+set, including separate copies of aliases. All occupied remote payload names are
+then checked before any write. A mismatching digest, size, incomplete `starter`
+asset, extra payload, or orphan signature is a conflict, never clobber permission.
+A present GitHub SHA256 digest must match; only a missing/null digest permits the
+immutable-asset-ID download fallback. A claimed successful upload must subsequently
+appear with the returned ID and matching bytes in a fresh remote inventory.
+
+Missing payloads may be uploaded only to a draft. A complete matching public
+release can be verified on a read-only retry, but an incomplete public release is
+not modified. Uploads do not publish the draft: `--promote` remains a separate
+explicit choice. The ordinary no-promotion result is `ready`.
+
+The finalizer passes a private copy of the selected build manifest to the uploader
+and checks its hash against the original plan. A different valid manifest appearing
+after planning cannot silently select a new build for upload.
+
+The frozen upload plan records the exact manifest hash, source/version, full
+artifact set, repository/release identities, and confirmed payload IDs. Completed
+uploads survive later failures. The same invocation resumes only missing work;
+a lost acknowledgement is reconciled by observing retained remote bytes rather
+than blindly repeating the upload. A retry cannot omit an unfinished target,
+change the manifest, or silently accept replacement IDs for previously verified
+payloads. No release assets are deleted or replaced.
+
+Integrated payload state lives inside the finalization's private session under
+`payloads/`. The original upload selection is also frozen in finalization state
+and cannot be changed or omitted on retry. Local build hashes and uploaded asset
+IDs remain bound through SBOM verification, promotion, and every guarded dispatch
+attempt. An SBOM inventory describing different payload bytes blocks promotion.
+Changing source files after promotion returns failure without rolling back the
+already-public release. Results that reach finalization include a `payloads`
+receipt alongside the release verification and dispatch outcomes. Earlier failures
+retain completed upload state for the next identical invocation.
+
+The payload stage is independently usable without scanning or promotion:
+
+```bash
+bash src/release_payloads.sh /path/to/artifacts \
+  --build-manifest /path/to/build-manifest.json \
+  --repo owner/tool --tag v1.2.3 --sha FULL_40_CHARACTER_COMMIT
+```
+
+Its sourced API is `release_upload_payloads`. Standalone state defaults to
+`${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-payloads`, with
+`--state-dir` available to select another root. Success prints one verified JSON
+receipt; failures preserve nonzero process status and do not print a verified
+receipt. `--dry-run` validates the local manifest and file set without credentials,
+remote operations, scans or persistent state. It does not validate remote state.
+
+The build manifest is trusted producer input, not cryptographic proof of build
+execution. Upload state is trusted local recovery information. Local and remote
+checks narrow observed change windows; they cannot form a transaction across the
+filesystem, GitHub, and downstream receivers. Existing signature/provenance trust
+boundaries below still apply.
 
 ## Verified downstream handoff
 
@@ -125,7 +212,7 @@ raw promotion API responses or credentials into diagnostics.
 ## Scope and requirements
 
 This is an explicit finalization entry point, not an implicit change to `dsr release`.
-It composes the existing library APIs rather than replacing payload publication.
+It composes the existing library APIs; manifest-bound payload uploading is opt-in.
 A complete local inventory requires Syft only when scans are missing. Runtime
 requirements include Bash 4+, jq, SHA256 tooling, `flock`, and the existing GitHub
 transport dependencies. Publishing a draft requires the GitHub CLI (`gh`).
@@ -138,6 +225,8 @@ deletes assets, rolls back the release, or conceals a partial external outcome.
 
 ```bash
 bash scripts/tests/test_release_finalize.sh
+bash scripts/tests/test_release_payloads.sh
+bash scripts/tests/test_release_payload_pipeline.sh
 ```
 
 This regression suite uses the production finalizer and dispatch outbox with real
@@ -147,3 +236,11 @@ destinations and rate-limit retries, and changes after persisted sending intent.
 SBOM library calls and GitHub transport are
 explicit file-backed fixtures. It does not exercise a live registry, real Syft,
 GitHub authentication or native macOS/Windows operation.
+
+The additional payload suites exercise real build-manifest validation, hashing,
+private snapshots, state publication and competing publishers. The integrated
+suite runs the production uploader and finalizer, including the build-binding
+guard used by dispatch. GitHub transport, SBOM creation/publication and downstream
+delivery are explicit fixtures; the existing finalizer suite separately exercises
+the production dispatch outbox. These tests do not assert live GitHub behavior or
+cryptographic verification.

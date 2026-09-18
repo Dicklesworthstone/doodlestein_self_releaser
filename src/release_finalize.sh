@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Verified release finalization: local inventory -> remote evidence -> promotion.
-# This composes the existing SBOM APIs; it does not build or upload payloads.
+# Optional manifest-bound payload upload precedes the existing SBOM APIs.
 # A verified SBOM inventory is byte-integrity evidence, not a signed build claim.
 
 _RELEASE_FINALIZE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -13,6 +13,26 @@ _rf_require() {
         source "$_RELEASE_FINALIZE_DIR/sbom_release.sh" || return 3
     fi
     _sbr_require
+}
+
+_rf_payload_require() {
+    if ! declare -F release_upload_payloads >/dev/null; then
+        # shellcheck source=src/release_payloads.sh
+        source "$_RELEASE_FINALIZE_DIR/release_payloads.sh" || return 3
+    fi
+    _rup_require
+}
+
+# These inputs are scoped by _rf_execute, not taken from caller environment.
+# Keep the generated SBOM set tied to the original successful build throughout
+# promotion and every guarded downstream POST, not just at upload time.
+_rf_payload_gate() {
+    [[ -n "${_RF_BUILD_PLAN:-}" ]] || return 0
+    local manifest="$1" work="$2" actual expected
+    _rup_check_files "$_RF_PAYLOAD_ROOT" "$_RF_BUILD_MANIFEST" "$_RF_BUILD_PLAN" "$work" || return $?
+    actual=$(jq -cS '[.artifacts[].artifact|{name,sha256}]|sort_by(.name)' "$manifest") || return 7
+    expected=$(jq -cS '[.artifacts[]|{name,sha256}]|sort_by(.name)' <<< "$_RF_BUILD_PLAN") || return 1
+    [[ "$actual" == "$expected" ]] || { _rf_log 'SBOM inventory differs from the selected build'; return 7; }
 }
 
 _rf_digest() (
@@ -120,6 +140,10 @@ _rf_gate() {
     [[ "$fingerprint" == "$(jq -r '.asset_inventory_sha256' <<< "$evidence")" ]] || {
         _rf_log 'Release assets changed after verification'; return 7;
     }
+    _rf_payload_gate "$manifest" "$work" || return $?
+    if [[ -n "${_RF_BUILD_PLAN:-}" ]]; then
+        _rup_preflight "$repo" "$inventory" "$_RF_BUILD_PLAN" "$_RF_PAYLOAD_ASSETS" "$work" || return $?
+    fi
 }
 
 _rf_promote() {
@@ -168,9 +192,11 @@ _rf_execute() (
     local promote=false dry="${DRY_RUN:-false}"
     local tool='' dispatch_repos='' dispatch_run='' dispatch_root='' retry_uncertain=false
     local selected='' handoff=null dispatch_plan='' dispatch_result=null dispatch_rc=0 payload
+    local upload_payloads=false build_manifest='' upload_plan=null payload_result=null
+    local _RF_PAYLOAD_ROOT='' _RF_BUILD_MANIFEST='' _RF_BUILD_PLAN='' _RF_PAYLOAD_ASSETS=''
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --repo|--tag|--sha|--format|--output-dir|--state-dir|--tool|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir)
+            --repo|--tag|--sha|--format|--output-dir|--state-dir|--tool|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--build-manifest)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --repo) [[ -z "$repo" ]] || return 4; repo="$2" ;;
@@ -183,9 +209,11 @@ _rf_execute() (
                     --dispatch-repos) [[ -z "$dispatch_repos" ]] || return 4; dispatch_repos="$2" ;;
                     --dispatch-run-id) [[ -z "$dispatch_run" ]] || return 4; dispatch_run="$2" ;;
                     --dispatch-state-dir) [[ -z "$dispatch_root" ]] || return 4; dispatch_root="$2" ;;
+                    --build-manifest) [[ -z "$build_manifest" ]] || return 4; build_manifest="$2" ;;
                 esac
                 shift 2 ;;
             --promote) promote=true; shift ;;
+            --upload-payloads) upload_payloads=true; shift ;;
             --dry-run|-n) dry=true; shift ;;
             --retry-uncertain) retry_uncertain=true; shift ;;
             -*) _rf_log "Unknown option: $1"; return 4 ;;
@@ -213,13 +241,27 @@ _rf_execute() (
     elif [[ -n "$tool$dispatch_run$dispatch_root" || "$retry_uncertain" == true ]]; then
         _rf_log 'Dispatch options require --dispatch-repos'; return 4
     fi
+    if [[ "$upload_payloads" == true ]]; then
+        [[ -n "$build_manifest" ]] || { _rf_log '--upload-payloads requires --build-manifest'; return 4; }
+        _rf_payload_require || return $?
+        payload_result=$(release_upload_payloads "$root" --build-manifest "$build_manifest" \
+            --repo "$repo" --tag "$tag" --sha "$sha" --dry-run) || return $?
+        upload_plan=$(jq -ceS 'select(.kind=="dsr-release-payload-publication" and .status=="planned" and .dry_run==true)|.plan' <<< "$payload_result") || return 7
+        [[ -z "$tool" || "$tool" == "$(jq -r '.tool' <<< "$upload_plan")" ]] || {
+            _rf_log 'Dispatch tool differs from the build manifest'; return 4;
+        }
+    elif [[ -n "$build_manifest" ]]; then
+        _rf_log '--build-manifest requires --upload-payloads'; return 4
+    fi
     if [[ "$dry" == true ]]; then
-        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" '
+        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" --argjson upload_plan "$upload_plan" '
             {kind:"dsr-release-finalization-result",status:"planned",dry_run:true,exit_code:0,
              repo:$repo,tag:$tag,expected_sha:$sha,format:$format,promote:$promote,
              dispatch_repos:(if $selected=="" then [] else ($selected|split("\n")) end),
-             stages:["pin release","generate or reuse SBOMs","publish and verify evidence",
-                     (if $promote then "promote without changing latest" else "retain release mode" end)]}'
+             payload_plan:$upload_plan,
+             stages:(["pin release"]+(if $upload_plan==null then [] else ["upload and verify build payloads"] end)+
+                     ["generate or reuse SBOMs","publish and verify evidence",
+                     (if $promote then "promote without changing latest" else "retain release mode" end)])}'
         return $?
     fi
     command -v flock >/dev/null || { _rf_log 'flock is required'; return 3; }
@@ -285,10 +327,45 @@ _rf_execute() (
         state=$(jq -cS --argjson handoff "$handoff" '.handoff=$handoff' <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
+    saved=$(jq -cS '.payload_plan // null' <<< "$state") || return 1
+    [[ "$saved" == null || "$saved" == "$upload_plan" ]] || {
+        _rf_log 'Cannot change or omit the frozen build payload plan'; return 2;
+    }
+    if [[ "$upload_payloads" == true ]]; then
+        state=$(jq -cS --argjson selection "$upload_plan" '.payload_plan=$selection' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+        # The uploader must consume the already selected manifest, not a new
+        # build that appeared between the planning read and this invocation.
+        # Keep the original path for later guards, but freeze the input bytes.
+        local build_snapshot build_pin
+        build_pin=$(jq -r '.manifest_sha256' <<< "$upload_plan") || return 1
+        [[ "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
+        build_snapshot=$(mktemp "$work/build-manifest.XXXXXXXX") || return 1
+        cp -- "$build_manifest" "$build_snapshot" || return 1
+        chmod 400 "$build_snapshot" || return 1
+        [[ "$(_rf_hash "$build_snapshot")" == "$build_pin" &&
+           "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
+        payload_result=$(release_upload_payloads "$root" --build-manifest "$build_snapshot" \
+            --repo "$repo" --tag "$tag" --sha "$sha" --state-dir "$session/payloads") || return $?
+        jq -es --argjson selection "$upload_plan" 'length==1 and (.[0]|
+            .kind=="dsr-release-payload-publication" and .status=="verified" and .dry_run==false and
+            .manifest_sha256==$selection.manifest_sha256 and .tool==$selection.tool and
+            (.assets|type=="array") and (.assets|map(.name)|sort)==($selection.artifacts|map(.name)|sort))' \
+            <<< "$payload_result" >/dev/null || return 7
+        [[ "$(_rf_context_key "$payload_result" "$repo" "$tag" "$sha")" == "$context_key" &&
+           "$(jq -r '.release.draft' <<< "$payload_result")" == "$initial_draft" ]] || return 7
+        _RF_PAYLOAD_ROOT="$root"; _RF_BUILD_MANIFEST="$build_manifest"; _RF_BUILD_PLAN="$upload_plan"
+        _RF_PAYLOAD_ASSETS=$(jq -cS '.assets' <<< "$payload_result") || return 1
+        saved=$(jq -cS '.payload_verification.assets // null' <<< "$state") || return 1
+        [[ "$saved" == null || "$saved" == "$_RF_PAYLOAD_ASSETS" ]] || return 7
+        state=$(jq -cS --argjson receipt "$payload_result" '.payload_verification=$receipt' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+    fi
     case "$format" in spdx) manifest_name=sbom-manifest.spdx.json ;; *) manifest_name=sbom-manifest.cdx.json ;; esac
     manifest="$output_dir/$manifest_name"
     # This API reuses verified completed inventories without requiring Syft.
     sbom_generate_artifacts "$root" --format "$format" --output-dir "$output_dir" > "$work/scan.out" || return $?
+    _rf_payload_gate "$manifest" "$work" || return $?
     pin=$(_rf_hash "$manifest") || return $?
     saved=$(jq -r '.manifest_sha256 // ""' <<< "$state") || return 1
     [[ -z "$saved" || "$saved" == "$pin" ]] || { _rf_log 'Local SBOM inventory changed for this release'; return 2; }
@@ -361,10 +438,10 @@ _rf_execute() (
         if ((dispatch_rc == 0)); then status=complete; else status=incomplete; fi
     fi
     jq -nc --arg status "$status" --arg file "$file" --argjson verification "$verification" \
-        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" '
+        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" '
         {kind:"dsr-release-finalization-result",status:$status,exit_code:$exit_code,dry_run:false,
          state_file:$file,promotion_attempted:$attempted,promotion_transport_exit_code:$rc,
-         verification:$verification,dispatch:$dispatch}' || return 1
+         verification:$verification,dispatch:$dispatch,payloads:$payloads}' || return 1
     return "$dispatch_rc"
 )
 
@@ -403,9 +480,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         --help|-h|'')
             printf '%s\n' 'Usage: bash src/release_finalize.sh ARTIFACTS --repo OWNER/REPO --tag vVERSION --sha COMMIT' \
                 'Options: --promote --format spdx|cyclonedx --output-dir DIR --state-dir DIR --dry-run' \
+                'Payloads: --upload-payloads --build-manifest FILE (resumable uploads to an existing draft)' \
                 'Handoff: --tool NAME --dispatch-repos OWNER/A,OWNER/B [--dispatch-run-id ID] [--dispatch-state-dir DIR] [--retry-uncertain]' \
                 'Default: attach and verify SBOMs, retaining draft mode. --promote explicitly publishes the draft.' \
-                'Existing payloads must already be uploaded. This does not verify signatures or build provenance.' ;;
+                'Without --upload-payloads, payloads must already exist. This does not verify signatures or build provenance.' ;;
         *) release_finalize "$@"; exit $? ;;
     esac
 fi
