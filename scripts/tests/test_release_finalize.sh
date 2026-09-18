@@ -134,6 +134,45 @@ fi
 cat "$RF_CASE/context.json"
 SH
 chmod +x "$WORK/bin/gh"
+cat > "$WORK/bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+cat >/dev/null
+url="${*: -1}" body='' headers='' output=''
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --data-binary) body="${2#@}"; shift 2 ;;
+        --dump-header) headers="$2"; shift 2 ;;
+        --output) output="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+repo="${url#https://api.github.com/repos/}"; repo="${repo%/dispatches}"
+printf 'post %s\n' "$repo" >> "$RF_CASE/calls"
+cp "$body" "$RF_CASE/${repo//\//_}.json"
+jq -c --arg repo "$repo" '.+{destination:$repo}' "$body" >> "$RF_CASE/posts.jsonl"
+code=204 rc=0 extra=''
+case "${RF_MODE:-}" in
+    dispatch-reject) [[ "$repo" != owner/b ]] || code=422 ;;
+    dispatch-uncertain) if [[ "$repo" == owner/b ]]; then code=000; rc=28; fi ;;
+    dispatch-after-first|dispatch-after-last)
+        if [[ ( "$RF_MODE" == dispatch-after-first && "$repo" == owner/a ) ||
+              ( "$RF_MODE" == dispatch-after-last && "$repo" == owner/b ) ]]; then
+            jq '.[0].id+=100' "$RF_CASE/inventory.json" > "$RF_CASE/changed-inventory.json"
+            mv "$RF_CASE/changed-inventory.json" "$RF_CASE/inventory.json"
+        fi ;;
+    dispatch-rate-change)
+        code=429; extra=$'Retry-After: 0\r\n'
+        jq '.tag_commit=("2"*40)' "$RF_CASE/context.json" > "$RF_CASE/changed-context.json"
+        mv "$RF_CASE/changed-context.json" "$RF_CASE/context.json" ;;
+esac
+printf 'HTTP/2 %s\r\n%s\r\n' "$code" "$extra" > "$headers"
+printf '{}' > "$output"
+printf '%s' "$code"
+exit "$rc"
+SH
+chmod +x "$WORK/bin/curl"
+source "${DISPATCH_TEST_MODULE:-$ROOT/src/dispatch.sh}"
 source "$MODULE"
 checks=0 failures=0 CASE='' status=0 output=''
 check() {
@@ -144,6 +183,8 @@ check() {
 new_case() {
     CASE="$WORK/cases/$1"; mkdir -p "$CASE/artifacts" "$CASE/meta"
     export RF_CASE="$CASE" DSR_STATE_DIR="$CASE/state"
+    export DSR_GH_TOKEN=fixture-token DISPATCH_RETRY_DELAY=0 DISPATCH_MAX_WAIT=0 DISPATCH_MAX_RETRIES=3
+    unset DISPATCH_STATE_DIR
     unset RF_MODE DRY_RUN
     : > "$CASE/calls"
     printf 'real payload bytes\n' > "$CASE/artifacts/tool.tar.gz"
@@ -156,7 +197,9 @@ new_case() {
 run_finalize() { release_finalize "$CASE/artifacts" --repo owner/tool --tag v1.0.0 --sha "$RF_SHA" --output-dir "$CASE/meta" "$@"; }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; output=$(cat "$CASE/out"); }
 count() { grep -c -x "$1" "$CASE/calls" || true; }
-state_path() { find "$CASE/state" -name state.json -print | head -1; }
+state_path() { find "$CASE/state/release-finalize" -name state.json -print | head -1; }
+outbox_path() { find "$CASE/state/dispatch" -name state.json -print | head -1; }
+handoff() { run_finalize --tool tool --dispatch-repos owner/a,owner/b --promote "$@"; }
 
 new_case ready
 capture run_finalize
@@ -304,6 +347,129 @@ new_case cyclonedx
 capture run_finalize --format cyclonedx --promote
 check 'CycloneDX finalization is supported' test "$status" -eq 0
 check 'CycloneDX evidence uses its own manifest name' jq -e '.verification.manifest.name=="sbom-manifest.cdx.json"' "$CASE/out"
+
+new_case handoff
+capture handoff
+check 'one command finalizes release and acknowledges downstream handoff' test "$status" -eq 0
+check 'complete result separates release verification from dispatch acknowledgement' jq -e '.status=="complete" and .verification.release.draft==false and .dispatch.status=="accepted"' "$CASE/out"
+check 'each downstream target receives one event' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,1'
+check 'downstream event is bound to the exact verified evidence' jq -e '.client_payload | .sha=="1111111111111111111111111111111111111111" and .release_evidence.release_id==42 and .release_evidence.manifest.asset_id==3 and (.release_evidence.asset_inventory_sha256|length)==64' "$CASE/owner_a.json"
+check 'publication precedes every downstream event' bash -c '[[ "$(grep -n "^patch$" "$1"|cut -d: -f1)" -lt "$(grep -n "^post owner/a$" "$1"|cut -d: -f1)" ]]' bash "$CASE/calls"
+cp "$CASE/owner_a.json" "$CASE/first-event.json"
+capture handoff
+check 'completed handoff retry succeeds' test "$status" -eq 0
+check 'completed handoff retry sends no duplicate events' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,1'
+check 'completed handoff retry does not republish' test "$(count patch)" -eq 1
+check 'handoff plan preserves immutable requests' cmp -s "$CASE/owner_a.json" "$CASE/first-event.json"
+
+new_case handoff-after-ready
+capture run_finalize
+capture handoff
+check 'an initially separate verification can acquire a handoff once' test "$status" -eq 0
+capture run_finalize --promote
+check 'a recorded handoff cannot silently be omitted' test "$status" -eq 2
+capture run_finalize --tool tool --dispatch-repos owner/a --promote
+check 'a recorded handoff cannot silently lose a destination' test "$status" -eq 2
+
+new_case handoff-reject
+export RF_MODE=dispatch-reject
+capture handoff
+check 'downstream rejection makes finalization incomplete' test "$status" -eq 1
+check 'incomplete JSON retains already-published release and both outcomes' jq -e '.status=="incomplete" and .verification.release.draft==false and [.dispatch.results[].outcome]==["accepted","rejected"]' "$CASE/out"
+cp "$CASE/owner_b.json" "$CASE/rejected-event.json"
+unset RF_MODE
+capture handoff
+check 'partial handoff recovers without rebuilding or promotion' test "$status" -eq 0
+check 'partial recovery sends only the rejected destination' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,2'
+check 'partial recovery preserves exact evidence-bearing request' cmp -s "$CASE/owner_b.json" "$CASE/rejected-event.json"
+check 'partial recovery does not repeat promotion' test "$(count patch)" -eq 1
+
+new_case handoff-uncertain
+export RF_MODE=dispatch-uncertain
+capture handoff
+check 'lost downstream acknowledgement returns uncertainty' test "$status" -eq 8
+unset RF_MODE
+capture handoff
+check 'ordinary finalizer retry does not replay uncertain delivery' test "$(count 'post owner/b')" -eq 1
+check 'uncertainty remains visible after ordinary retry' jq -e '.status=="incomplete" and .dispatch.results[1].outcome=="uncertain"' "$CASE/out"
+capture handoff --retry-uncertain
+check 'explicit uncertain replay is supported by the integrated command' test "$status" -eq 0
+check 'explicit uncertain retry revisits only that destination' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,2'
+
+new_case changed-during-handoff
+export RF_MODE=dispatch-after-first
+capture handoff
+check 'asset movement during handoff returns failure' test "$status" -eq 7
+check 'asset movement prevents later destinations from being triggered' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,0'
+check 'already accepted and unsent outcomes survive the late gate failure' jq -e '[.dispatch.results[].outcome]==["accepted","pending"]' "$CASE/out"
+
+new_case changed-after-last
+export RF_MODE=dispatch-after-last
+capture handoff
+check 'change after the final POST prevents false overall completion' test "$status" -eq 7
+check 'post-delivery failure retains actual acknowledged outcomes' jq -e '.status=="incomplete" and .dispatch.status=="accepted"' "$CASE/out"
+
+new_case changed-during-rate-limit
+export RF_MODE=dispatch-rate-change
+capture handoff
+check 'release gate runs again before a rate-limit retry' test "$status" -eq 7
+check 'rate-limit gate prevents second POST and all later destinations' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,0'
+check 'rate-limit gate produces a retryable blocked outcome' jq -e '.dispatch.results[0].outcome=="blocked" and .dispatch.results[0].receipt.attempts==1' "$CASE/out"
+
+new_case post-intent-gate
+mv() {
+    local src="${*: -2:1}"
+    if [[ "$src" == */state.* ]] && jq -e '.kind=="dsr-dispatch-outbox" and any(.deliveries[];.history[-1].outcome=="sending")' "$src" >/dev/null 2>&1; then
+        command mv "$@" || return $?
+        jq '.tag_commit=("2"*40)' "$RF_CASE/context.json" > "$RF_CASE/changed-context.json"
+        command mv "$RF_CASE/changed-context.json" "$RF_CASE/context.json"
+    else command mv "$@"; fi
+}
+capture handoff
+check 'release movement after persisted intent still prevents POST' test "$(count 'post owner/a')" -eq 0
+check 'pre-POST gate failure is blocked, not falsely uncertain' jq -e '.dispatch.results[0].outcome=="blocked" and .dispatch.results[0].receipt.attempts==0' "$CASE/out"
+unset -f mv
+jq --arg sha "$RF_SHA" '.tag_commit=$sha' "$CASE/context.json" > "$CASE/restored-context.json"
+mv "$CASE/restored-context.json" "$CASE/context.json"
+capture handoff
+check 'known-unsent blocked delivery resumes without uncertain replay consent' test "$status" -eq 0
+check 'blocked recovery sends each destination once' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,1'
+
+new_case malformed-handoff
+capture run_finalize --tool tool --dispatch-repos owner/a,../invalid --promote
+check 'invalid downstream target fails before all library effects' test ! -s "$CASE/calls"
+capture run_finalize --dispatch-repos owner/a --promote
+check 'tool identity is required for downstream events' test "$status" -eq 4
+capture run_finalize --tool tool --dispatch-repos owner/a,owner/b
+check 'a draft cannot trigger downstream without explicit promotion consent' test "$status" -eq 4
+check 'unapproved draft cannot upload evidence or dispatch' test "$(count publish),$(count 'post owner/a')" = '0,0'
+
+new_case dispatch-dry
+capture handoff --dry-run
+check 'handoff dry-run does not call transport or scanner libraries' test ! -s "$CASE/calls"
+check 'handoff dry-run does not create state' test ! -e "$CASE/state"
+check 'handoff dry-run lists the selected destinations' jq -e '.dispatch_repos==["owner/a","owner/b"]' "$CASE/out"
+
+new_case existing-outbox-conflict
+capture dispatch_release tool v1.0.0 --sha "$RF_SHA" --source-repo owner/tool --repos owner/a,owner/b
+check 'existing generic dispatch fixture completed' test "$status" -eq 0
+capture handoff
+check 'mismatched old outbox is not silently upgraded or resent' test "$status" -eq 2
+check 'mismatched old outbox prevents promotion' test "$(count patch)" -eq 0
+check 'mismatched old outbox creates no extra events' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,1'
+
+new_case handoff-concurrent
+pids=()
+for i in 1 2 3 4; do
+    bash "$MODULE" "$CASE/artifacts" --repo owner/tool --tag v1.0.0 --sha "$RF_SHA" --output-dir "$CASE/meta" --promote \
+        --tool tool --dispatch-repos owner/a,owner/b > "$CASE/worker-$i.out" 2> "$CASE/worker-$i.err" &
+    pids+=("$!")
+done
+succeeded=0
+for pid in "${pids[@]}"; do if wait "$pid"; then succeeded=$((succeeded+1)); fi; done
+check 'one complete concurrent pipeline succeeds' test "$succeeded" -ge 1
+check 'concurrent pipelines publish once' test "$(count patch)" -eq 1
+check 'concurrent pipelines dispatch each target once' test "$(count 'post owner/a'),$(count 'post owner/b')" = '1,1'
 
 printf '\nRelease finalization checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]

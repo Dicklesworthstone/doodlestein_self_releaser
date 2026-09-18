@@ -130,14 +130,47 @@ _rf_promote() {
         --input "$work/promote.json" > "$work/promote.response" 2> "$work/promote.error"
 }
 
+_rf_dispatch_require() {
+    if ! declare -F _dp_release_plan >/dev/null || ! declare -F _dp_release_outbox >/dev/null; then
+        # shellcheck source=src/dispatch.sh
+        source "$_RELEASE_FINALIZE_DIR/dispatch.sh" || return 3
+    fi
+    _dp_config
+}
+
+# Validate retained handoff state before promotion, without starting any sends.
+# The outbox repeats this validation under its own lock when delivery begins.
+_rf_dispatch_preflight() {
+    local plan="$1" root="$2" identity key file hash
+    identity=$(jq -Sc '{source_repo,tool:.payload.tool,version:.payload.version,run_id:.payload.run_id}' <<< "$plan") || return 1
+    key=$(_dp_digest_text "$identity") || return $?
+    file="$root/$key/state.json"
+    [[ ! -L "$root" && ! -L "$root/$key" ]] || return 2
+    hash=$(_dp_state_hash "$file") || return $?
+    if [[ "$hash" != absent ]]; then
+        _dp_state_valid "$file" "$plan" || { _rf_log 'Conflicting or corrupt dispatch outbox'; return 2; }
+        [[ "$(_dp_state_hash "$file")" == "$hash" ]] || return 2
+    fi
+}
+
+# These prefixed locals are scoped by _rf_execute and inherited by the outbox's
+# subshell. Its repo/body/work locals must not shadow the frozen source context.
+_rf_dispatch_guard() {
+    [[ "$(_rf_hash "$_RF_GUARD_STATE")" == "$_RF_GUARD_STATE_HASH" ]] || return 2
+    _rf_gate "$_RF_GUARD_REPO" "$_RF_GUARD_TAG" "$_RF_GUARD_SHA" "$_RF_GUARD_EVIDENCE" \
+        false "$_RF_GUARD_MANIFEST" "$_RF_GUARD_WORK"
+}
+
 _rf_execute() (
     set -uo pipefail
     umask 077
     local root='' repo='' tag='' sha='' format=spdx output_dir='' state_dir=''
     local promote=false dry="${DRY_RUN:-false}"
+    local tool='' dispatch_repos='' dispatch_run='' dispatch_root='' retry_uncertain=false
+    local selected='' handoff=null dispatch_plan='' dispatch_result=null dispatch_rc=0 payload
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --repo|--tag|--sha|--format|--output-dir|--state-dir)
+            --repo|--tag|--sha|--format|--output-dir|--state-dir|--tool|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --repo) [[ -z "$repo" ]] || return 4; repo="$2" ;;
@@ -146,10 +179,15 @@ _rf_execute() (
                     --format) format="$2" ;;
                     --output-dir) [[ -z "$output_dir" ]] || return 4; output_dir="$2" ;;
                     --state-dir) [[ -z "$state_dir" ]] || return 4; state_dir="$2" ;;
+                    --tool) [[ -z "$tool" ]] || return 4; tool="$2" ;;
+                    --dispatch-repos) [[ -z "$dispatch_repos" ]] || return 4; dispatch_repos="$2" ;;
+                    --dispatch-run-id) [[ -z "$dispatch_run" ]] || return 4; dispatch_run="$2" ;;
+                    --dispatch-state-dir) [[ -z "$dispatch_root" ]] || return 4; dispatch_root="$2" ;;
                 esac
                 shift 2 ;;
             --promote) promote=true; shift ;;
             --dry-run|-n) dry=true; shift ;;
+            --retry-uncertain) retry_uncertain=true; shift ;;
             -*) _rf_log "Unknown option: $1"; return 4 ;;
             *) [[ -z "$root" ]] || return 4; root="$1"; shift ;;
         esac
@@ -164,10 +202,22 @@ _rf_execute() (
     [[ -n "$output_dir" ]] || output_dir="$root"
     [[ ! -L "$output_dir" && "$output_dir" != *[[:cntrl:]]* && "$output_dir" != *\\* ]] || return 4
     case "$format" in spdx|spdx-json) format=spdx ;; cyclonedx|cdx|cyclonedx-json) format=cyclonedx ;; *) return 4 ;; esac
+    if [[ -n "$dispatch_repos" ]]; then
+        [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { _rf_log '--tool is required for downstream delivery'; return 4; }
+        [[ -n "$dispatch_run" ]] || dispatch_run="$tool-$tag"
+        [[ "$dispatch_run" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$ ]] || return 4
+        _rf_dispatch_require || return $?
+        selected=$(_dp_repos "$dispatch_repos") || return $?
+        [[ -n "$dispatch_root" ]] || dispatch_root="${DISPATCH_STATE_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/dispatch}"
+        [[ ! -L "$dispatch_root" && "$dispatch_root" != *[[:cntrl:]]* && "$dispatch_root" != *\\* ]] || return 4
+    elif [[ -n "$tool$dispatch_run$dispatch_root" || "$retry_uncertain" == true ]]; then
+        _rf_log 'Dispatch options require --dispatch-repos'; return 4
+    fi
     if [[ "$dry" == true ]]; then
-        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" '
+        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" '
             {kind:"dsr-release-finalization-result",status:"planned",dry_run:true,exit_code:0,
              repo:$repo,tag:$tag,expected_sha:$sha,format:$format,promote:$promote,
+             dispatch_repos:(if $selected=="" then [] else ($selected|split("\n")) end),
              stages:["pin release","generate or reuse SBOMs","publish and verify evidence",
                      (if $promote then "promote without changing latest" else "retain release mode" end)]}'
         return $?
@@ -180,6 +230,17 @@ _rf_execute() (
         _rf_log 'Remote release does not match the selected source commit'; return 7;
     }
     initial_draft=$(jq -r '.release.draft' <<< "$context") || return 7
+    if [[ -n "$selected" ]]; then
+        [[ "$initial_draft" == false || "$promote" == true ]] || {
+            _rf_log 'Dispatch requires a public release; use --promote for a draft'; return 4;
+        }
+        command -v curl >/dev/null || return 3
+        dispatch_check_auth || return $?
+        mkdir -p -- "$dispatch_root" || return 1
+        dispatch_root=$(cd "$dispatch_root" && pwd -P) || return 1
+        handoff=$(jq -cSn --arg tool "$tool" --arg run "$dispatch_run" --arg root "$dispatch_root" --arg selected "$selected" \
+            '{tool:$tool,run_id:$run,outbox_root:$root,repos:($selected|split("\n"))}') || return 1
+    fi
     if [[ "$initial_draft" == true && "$promote" == true ]]; then
         command -v gh >/dev/null || { _rf_log 'gh is required for draft promotion'; return 3; }
     fi
@@ -216,6 +277,14 @@ _rf_execute() (
         state=$(cat "$file") || return 1
         [[ "$(_rf_hash "$file")" == "$oldhash" ]] || return 2
     fi
+    saved=$(jq -cS '.handoff // null' <<< "$state") || return 1
+    [[ "$saved" == null || "$saved" == "$handoff" ]] || {
+        _rf_log 'Cannot change or omit the frozen downstream handoff'; return 2;
+    }
+    if [[ "$handoff" != null && "$saved" == null ]]; then
+        state=$(jq -cS --argjson handoff "$handoff" '.handoff=$handoff' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+    fi
     case "$format" in spdx) manifest_name=sbom-manifest.spdx.json ;; *) manifest_name=sbom-manifest.cdx.json ;; esac
     manifest="$output_dir/$manifest_name"
     # This API reuses verified completed inventories without requiring Syft.
@@ -242,6 +311,14 @@ _rf_execute() (
     state=$(jq -cS --argjson verification "$verification" \
         '.verification=$verification | if .phase=="published" then . else .phase="evidence_ready" end' <<< "$state") || return 1
     oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+    if [[ -n "$selected" ]]; then
+        payload=$(jq -nc --arg tool "$tool" --arg tag "$tag" --arg sha "$sha" --arg run "$dispatch_run" --argjson evidence "$evidence" '
+            {tool:$tool,version:$tag,sha:$sha,run_id:$run,
+             release_evidence:($evidence|{repository_id:.repository.id,release_id:.release.id,
+                 format,manifest,artifact_count,asset_inventory_sha256,verification_policy})}') || return 1
+        dispatch_plan=$(_dp_release_plan "${repo,,}" "$selected" "$payload") || return $?
+        _rf_dispatch_preflight "$dispatch_plan" "$dispatch_root" || return $?
+    fi
     _rf_gate "$repo" "$tag" "$sha" "$evidence" "$initial_draft" "$manifest" "$work" || return $?
     local promotion_attempted=false promotion_rc=0 status=ready
     if [[ "$initial_draft" == true && "$promote" == true ]]; then
@@ -269,11 +346,26 @@ _rf_execute() (
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     [[ "$(_rf_hash "$file")" == "$oldhash" ]] || return 2
+    if [[ -n "$selected" ]]; then
+        # Published evidence and local state remain pinned for the entire fan-out.
+        local _RF_GUARD_REPO="$repo" _RF_GUARD_TAG="$tag" _RF_GUARD_SHA="$sha" _RF_GUARD_EVIDENCE="$evidence"
+        local _RF_GUARD_MANIFEST="$manifest" _RF_GUARD_WORK="$work" _RF_GUARD_STATE="$file" _RF_GUARD_STATE_HASH="$oldhash"
+        [[ "$initial_draft" == false ]] || return 7
+        dispatch_result=$(_dp_release_outbox "$dispatch_plan" "$dispatch_root" "$retry_uncertain" false _rf_dispatch_guard) || dispatch_rc=$?
+        if ! jq -e -s --argjson rc "$dispatch_rc" 'length==1 and (.[0]|.exit_code==$rc and
+            (.status=="accepted" or .status=="incomplete") and (.results|type=="array"))' <<< "$dispatch_result" >/dev/null 2>&1; then
+            dispatch_result=null
+            ((dispatch_rc != 0)) || dispatch_rc=1
+        fi
+        if ((dispatch_rc == 0)); then _rf_dispatch_guard || dispatch_rc=$?; fi
+        if ((dispatch_rc == 0)); then status=complete; else status=incomplete; fi
+    fi
     jq -nc --arg status "$status" --arg file "$file" --argjson verification "$verification" \
-        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" '
-        {kind:"dsr-release-finalization-result",status:$status,exit_code:0,dry_run:false,
+        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" '
+        {kind:"dsr-release-finalization-result",status:$status,exit_code:$exit_code,dry_run:false,
          state_file:$file,promotion_attempted:$attempted,promotion_transport_exit_code:$rc,
-         verification:$verification}'
+         verification:$verification,dispatch:$dispatch}' || return 1
+    return "$dispatch_rc"
 )
 
 # Exactly one result even on failure, preserving the process exit. No live API
@@ -294,8 +386,12 @@ release_finalize() (
     if ((rc != 0)); then
         error=$(head -c 8192 "$work/diagnostics") || return 1
         [[ -n "$error" ]] || error="Release finalization failed (exit $rc)"
-        jq -nc --arg error "$error" --argjson rc "$rc" --argjson duration "$((SECONDS-start))" \
-            '{kind:"dsr-release-finalization-result",status:"error",exit_code:$rc,error:$error,duration_seconds:$duration}' || return 1
+        if jq -e -s --argjson rc "$rc" 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and .exit_code==$rc)' <<< "$result" >/dev/null 2>&1; then
+            jq -c --arg error "$error" --argjson duration "$((SECONDS-start))" '.+{error:$error,duration_seconds:$duration}' <<< "$result" || return 1
+        else
+            jq -nc --arg error "$error" --argjson rc "$rc" --argjson duration "$((SECONDS-start))" \
+                '{kind:"dsr-release-finalization-result",status:"error",exit_code:$rc,error:$error,duration_seconds:$duration}' || return 1
+        fi
     else
         jq -c --argjson duration "$((SECONDS-start))" '.+{duration_seconds:$duration}' <<< "$result" || return 1
     fi
@@ -307,6 +403,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         --help|-h|'')
             printf '%s\n' 'Usage: bash src/release_finalize.sh ARTIFACTS --repo OWNER/REPO --tag vVERSION --sha COMMIT' \
                 'Options: --promote --format spdx|cyclonedx --output-dir DIR --state-dir DIR --dry-run' \
+                'Handoff: --tool NAME --dispatch-repos OWNER/A,OWNER/B [--dispatch-run-id ID] [--dispatch-state-dir DIR] [--retry-uncertain]' \
                 'Default: attach and verify SBOMs, retaining draft mode. --promote explicitly publishes the draft.' \
                 'Existing payloads must already be uploaded. This does not verify signatures or build provenance.' ;;
         *) release_finalize "$@"; exit $? ;;

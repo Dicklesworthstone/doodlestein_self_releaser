@@ -99,8 +99,9 @@ _dp_result() {
 # timeout, 5xx or unrecognized acknowledgement may follow a completed POST.
 _dp_deliver() (
     set -o pipefail
-    local repo="$1" event="$2" body="$3" work attempt=0 rc=0 http=''
+    local repo="$1" event="$2" body="$3" guard="${4:-}" work attempt=0 rc=0 http=''
     local outcome=uncertain code=8 delay retry_after remaining reset now retry_at=null
+    [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || return 3
     dispatch_check_auth || return $?
     command -v curl >/dev/null || { _dp_log_error 'curl is required'; return 3; }
     work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dispatch.XXXXXXXX") || return 1
@@ -108,7 +109,17 @@ _dp_deliver() (
     trap 'exit 5' HUP INT TERM
     printf '%s' "$body" > "$work/body" || return 1
     while (( attempt < ${DISPATCH_MAX_RETRIES:-3} )); do
-        attempt=$((attempt + 1)); rc=0; http=''
+        rc=0; http=''
+        # Release orchestration may require a fresh evidence gate before EVERY
+        # POST, including retries after a definitive rate-limit rejection.
+        if [[ -n "$guard" ]]; then
+            if "$guard" "$repo" "$event" "$body"; then :; else
+                code=$?; outcome=blocked; retry_at=null
+                ((code >= 1 && code <= 8)) || code=7
+                break
+            fi
+        fi
+        attempt=$((attempt + 1))
         : > "$work/headers"; : > "$work/code"
         _dp_http "$repo" "$work/body" "$work" || rc=$?
         http=$(cat "$work/code")
@@ -313,7 +324,7 @@ _dp_state_valid() {
         def integer: type=="number" and .>=0 and .==floor;
         def receipt($r; $t):
             type=="object" and .repo==$r.repo and .event_type=="dsr-release" and
-            (.attempts|integer and .>=1 and .<=10) and
+            (.attempts|integer and .<=10) and (.outcome=="blocked" or .attempts>=1) and
             (.http_status==null or (.http_status|type=="string" and test("^[0-9]{3}$"))) and
             (.retry_not_before==null or (.retry_not_before|integer and .<=9999999999)) and
             (.outcome=="rate_limited" or .retry_not_before==null) and .outcome==$t.outcome and
@@ -322,7 +333,10 @@ _dp_state_valid() {
                 (.exit_code==3 and (.http_status=="401" or .http_status=="403" or .http_status==null)) or
                 (.exit_code==7 and (["400","404","405","410","422"]|index($t.receipt.http_status))!=null)
              elif .outcome=="rate_limited" then .exit_code==8 and (.http_status=="403" or .http_status=="429")
-             elif .outcome=="uncertain" then .exit_code==8 else false end);
+             elif .outcome=="uncertain" then .exit_code==8
+             elif .outcome=="blocked" then .http_status==null and
+                 (.exit_code|integer and .>=1 and .<=8)
+             else false end);
         length==1 and (.[0] | . as $s |
             type=="object" and .schema_version==1 and .kind=="dsr-dispatch-outbox" and .plan==$plan and
             (.deliveries|type=="array" and length==($plan.requests|length)) and
@@ -374,8 +388,9 @@ _dp_outbox_summary() {
 _dp_release_outbox() (
     set -o pipefail
     umask 077
-    local plan="$1" root="$2" retry_uncertain="$3" inspect="$4" identity key session file
+    local plan="$1" root="$2" retry_uncertain="$3" inspect="$4" guard="${5:-}" identity key session file
     local work='' state next oldhash current i indices repo body receipt outcome rc=0 retry_at now result
+    [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || return 3
     identity=$(jq -Sc '{source_repo,tool:.payload.tool,version:.payload.version,run_id:.payload.run_id}' <<< "$plan") || return 1
     key=$(_dp_digest_text "$identity") || return $?
     [[ -n "$root" && "$root" != *[[:cntrl:]]* && "$root" != *\\* && ! -L "$root" ]] || return 4
@@ -433,6 +448,9 @@ _dp_release_outbox() (
         command -v curl >/dev/null || { rc=3; break; }
         repo=$(jq -r --argjson i "$i" '.plan.requests[$i].repo' <<< "$state") || return 1
         body=$(jq -r --argjson i "$i" '.plan.requests[$i].body' <<< "$state") || return 1
+        if [[ -n "$guard" ]]; then
+            if "$guard" "$repo" dsr-release "$body"; then :; else rc=$?; break; fi
+        fi
         next=$(jq -Sc --argjson i "$i" '
             (.deliveries[$i].history[-1].outcome // "pending") as $previous |
             .deliveries[$i].history += [{sequence:((.deliveries[$i].history|length)+1),
@@ -443,10 +461,10 @@ _dp_release_outbox() (
         # Persist intent BEFORE crossing the POST boundary. Any interruption
         # after this point leaves a sending/uncertain state, not pending work.
         result=0
-        receipt=$(_dp_deliver "$repo" dsr-release "$body") || result=$?
+        receipt=$(_dp_deliver "$repo" dsr-release "$body" "$guard") || result=$?
         if ! jq -e -s --arg repo "$repo" --argjson rc "$result" '
                 length==1 and (.[0]|type=="object" and .repo==$repo and .event_type=="dsr-release" and
-                .exit_code==$rc and (.attempts|type=="number" and .>=1) and
+                .exit_code==$rc and (.attempts|type=="number" and .>=0) and
                 ((.outcome=="accepted" and $rc==0 and .http_status=="204") or
                  (.outcome!="accepted" and $rc!=0)))' <<< "$receipt" >/dev/null 2>&1; then
             receipt=$(_dp_result "$repo" dsr-release uncertain 8 1 '') || return 1
@@ -455,6 +473,7 @@ _dp_release_outbox() (
             '.deliveries[$i].history[-1] += {outcome:$receipt.outcome,receipt:$receipt}' <<< "$state") || return 1
         oldhash=$(_dp_state_write "$file" "$next" "$oldhash" "$work" "$plan") || return $?
         state="$next"
+        if [[ "$(jq -r '.outcome' <<< "$receipt")" == blocked ]]; then rc="$result"; break; fi
     done <<< "$indices"
     current=$(_dp_state_hash "$file") || return $?
     [[ "$current" == "$oldhash" ]] || return 2
