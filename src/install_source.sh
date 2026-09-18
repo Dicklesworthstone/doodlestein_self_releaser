@@ -235,7 +235,8 @@ install_source_freshness() (
     [[ "$status" != 5 ]] || return 5
     if ((status != 0)) || ! head=$(jq -er -s '
         if length == 1 and (.[0] | type == "array" and length == 1)
-        then .[0][0].sha | select(type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
+        then .[0][0].sha | select(type == "string" and (length == 40 or length == 64)
+            and (test("[^0-9a-f]") | not))
         else empty end' "$directory/head.json" 2>/dev/null); then
         _isb_freshness_unknown 'default branch revision unavailable'; return
     fi
@@ -245,7 +246,8 @@ install_source_freshness() (
     _isb_freshness_get "repos/$repo/commits/$encoded_tag" "$directory/base.json" "$prefer" || status=$?
     [[ "$status" != 5 ]] || return 5
     if ((status != 0)) || ! base=$(jq -er -s '
-        if length == 1 then .[0].sha | select(type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
+        if length == 1 then .[0].sha | select(type == "string" and (length == 40 or length == 64)
+            and (test("[^0-9a-f]") | not))
         else empty end' "$directory/base.json" 2>/dev/null); then
         _isb_freshness_unknown 'release tag revision unavailable'; return
     fi
@@ -285,6 +287,10 @@ _isb_compile() (
     case "$language" in
         rust)
             [[ -f Cargo.toml && ! -L Cargo.toml ]] || return 4
+            # rustup proxies may auto-install a missing repository-selected
+            # toolchain. Source consent never grants toolchain installation.
+            # https://rust-lang.github.io/rustup/environment-variables.html
+            export RUSTUP_AUTO_INSTALL=0
             _isb_run "$limit" "$output/compiler.log" rustc -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             host=$(sed -n 's/^host: //p' "$output/compiler.log")
             [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 6

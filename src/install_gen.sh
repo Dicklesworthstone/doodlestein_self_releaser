@@ -75,6 +75,10 @@ _install_gen_template() {
 #   --source-ref REF         With --from-source: HEAD, full SHA, refs/heads/* or refs/tags/*
 #   --source-timeout SECONDS  Per-command source-build limit (default: 3600)
 #   --source-if-stale N       With --allow-source-build: build head if latest is >N commits behind
+#   --allow-build            Alias for --allow-source-build
+#   --build-timeout SECONDS   Alias for --source-timeout
+#   --prefer-source-if-stale  Use --source-if-stale with a default threshold of 10
+#   --stale-threshold N       Threshold for --prefer-source-if-stale (0 through 999999)
 #   --no-skills              Skip AI coding agent skill installation
 #   --help                   Show this help
 #
@@ -990,6 +994,7 @@ _install_from_source() {
 
 # Main installation function
 main() {
+    local prefer_stale=false stale_threshold=10 stale_threshold_set=false
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1050,15 +1055,25 @@ main() {
                 _ALLOW_SOURCE_BUILD=true
                 shift
                 ;;
-            --allow-source-build)
+            --allow-source-build|--allow-build)
                 _ALLOW_SOURCE_BUILD=true
                 shift
                 ;;
-            --source-ref|--source-timeout|--source-if-stale)
+            --prefer-source-if-stale)
+                prefer_stale=true
+                shift
+                ;;
+            --stale-threshold)
+                [[ $# -ge 2 && -n "$2" ]] || return 4
+                stale_threshold="$2"
+                stale_threshold_set=true
+                shift 2
+                ;;
+            --source-ref|--source-timeout|--build-timeout|--source-if-stale)
                 [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
                 case "$1" in
                     --source-ref) _SOURCE_REF="$2" ;;
-                    --source-timeout) _SOURCE_TIMEOUT="$2" ;;
+                    --source-timeout|--build-timeout) _SOURCE_TIMEOUT="$2" ;;
                     --source-if-stale) _SOURCE_IF_STALE="$2" ;;
                 esac
                 shift 2
@@ -1078,6 +1093,15 @@ main() {
         esac
     done
 
+    # Both CLI spellings use the same post-verification freshness path. Never
+    # silently resolve conflicting thresholds by whichever flag appeared last.
+    if $prefer_stale; then
+        [[ "$stale_threshold" =~ ^(0|[1-9][0-9]{0,5})$ && -z "$_SOURCE_IF_STALE" ]] || return 4
+        _SOURCE_IF_STALE="$stale_threshold"
+    elif $stale_threshold_set; then
+        _log_error "--stale-threshold requires --prefer-source-if-stale"
+        return 4
+    fi
     [[ "$_SOURCE_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
     if [[ -n "$_SOURCE_IF_STALE" ]]; then
         if [[ ! "$_SOURCE_IF_STALE" =~ ^(0|[1-9][0-9]{0,5})$ || -n "$_VERSION" ]] ||
