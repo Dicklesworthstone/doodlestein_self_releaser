@@ -161,7 +161,7 @@ _sbom_output_state() {
 # 3 missing dependency, 4 invalid input. No partial output is published.
 sbom_generate() (
     set -o pipefail
-    local target="${1:-}" format="$SBOM_DEFAULT_FORMAT" output="" quiet=false
+    local target="${1:-}" format="${SBOM_DEFAULT_FORMAT:-spdx}" output="" quiet=false
     [[ $# -gt 0 ]] && shift
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -190,7 +190,7 @@ sbom_generate() (
     local extension output_dir prior current workdir staged input_hash="" snapshot="" relative
     extension=$(_sbom_extension "$format") || return $?
     if [[ -z "$output" ]]; then
-        if [[ -n "$SBOM_OUTPUT_DIR" ]]; then
+        if [[ -n "${SBOM_OUTPUT_DIR:-}" ]]; then
             output="$SBOM_OUTPUT_DIR/$(basename -- "$target").sbom.$extension"
         elif [[ -d "$target" ]]; then
             output="$target/sbom.$extension"
@@ -287,7 +287,8 @@ sbom_generate_project() {
 
 _sbom_is_metadata() {
     case "$1" in
-        *.txt|*.json|*.yaml|*.yml|*.md|*.minisig|*.sig|*.asc|*.sha256|*.sha512|*.sum|\
+        *.txt|*.json|*.jsonl|*.spdx|*.pub|*.cdx.xml|*.sbom.xml|*.yaml|*.yml|*.md|\
+        *.minisig|*.sig|*.asc|*.sha256|*.sha512|*.sum|\
         SHA256SUMS|SHA512SUMS|CHECKSUMS|checksums|LICENSE|LICENSE.*|NOTICE|README)
             return 0 ;;
         *) return 1 ;;
@@ -312,45 +313,268 @@ _sbom_select_artifacts() (
     done < "$listing" | LC_ALL=C sort
 )
 
-# Batch generation never trusts the mere existence of an old sidecar. Each
-# selected input is scanned and each output validated; failures remain nonzero.
-sbom_generate_artifacts() (
-    local root="${1:-}" format="$SBOM_DEFAULT_FORMAT" workdir selected name
+# Freeze the selected release namespace AND every artifact digest. Hardlink
+# aliases remain separate named assets. Enumeration and hashing errors propagate.
+_sbom_snapshot_artifacts() (
+    set -o pipefail
+    local root="$1" scratch="$2" selected name digest
+    selected=$(_sbom_select_artifacts "$root" "$scratch") || return $?
+    [[ -n "$selected" ]] || { _sbom_log error "No release artifacts selected"; return 4; }
+    while IFS= read -r name; do
+        digest=$(_sbom_hash "$root/$name") || return $?
+        jq -nc --arg name "$name" --arg sha256 "$digest" '{name:$name,sha256:$sha256}' || return 1
+    done <<< "$selected" | jq -sc 'sort_by(.name)'
+)
+
+# A receipt is an unauthenticated local scan observation binding one named
+# artifact to the EXACT published SBOM bytes. It is not a signature or provenance.
+_sbom_receipt_shape() {
+    local file="$1" format="$2" extension="$3" kind="$4"
+    [[ -f "$file" && ! -L "$file" ]] || return 4
+    jq -e -s --arg format "$format" --arg ext "$extension" --arg kind "$kind" '
+        def name: type == "string" and length > 0 and . != "." and . != ".." and
+            (test("[/\\\\\\x00-\\x1f\\x7f]") | not);
+        def digest: type == "string" and test("^[0-9a-f]{64}$");
+        def entry: type == "object" and .schema_version == 1 and
+            .kind == "dsr-sbom-artifact" and .format == $format and
+            (.artifact | type == "object" and (.name | name) and (.sha256 | digest)) and
+            (.sbom | type == "object" and (.name | name) and (.sha256 | digest)) and
+            .sbom.name == (.artifact.name + ".sbom." + $ext);
+        length == 1 and (.[0] |
+            if $kind == "artifact" then entry
+            else type == "object" and .schema_version == 1 and
+                .kind == "dsr-sbom-release" and .status == "complete" and .format == $format and
+                .selection_policy == "top-level-artifacts-v1" and
+                (.artifacts | type == "array" and length > 0 and all(.[]; entry)) and
+                ((.artifacts | map(.artifact.name) | unique | length) == (.artifacts | length))
+            end)
+    ' "$file" >/dev/null 2>&1
+}
+
+_sbom_verify_entry() {
+    local entry="$1" root="$2" output_dir="$3" format="$4"
+    local name digest doc doc_digest observed
+    name=$(jq -r '.artifact.name' <<< "$entry") || return 1
+    digest=$(jq -r '.artifact.sha256' <<< "$entry") || return 1
+    doc=$(jq -r '.sbom.name' <<< "$entry") || return 1
+    doc_digest=$(jq -r '.sbom.sha256' <<< "$entry") || return 1
+    [[ -n "$name" && "$name" != */* && "$name" != *[[:cntrl:]]* &&
+       "$name" != *\\* && "$doc" == "$name.sbom.$(_sbom_extension "$format")" ]] || return 2
+    [[ "$(_sbom_hash "$root/$name")" == "$digest" ]] || return 2
+    observed=$(_sbom_hash "$output_dir/$doc") || return $?
+    [[ "$observed" == "$doc_digest" ]] || return 2
+    _sbom_validate "$output_dir/$doc" "$format" || return $?
+    [[ "$(_sbom_hash "$root/$name")" == "$digest" &&
+       "$(_sbom_hash "$output_dir/$doc")" == "$doc_digest" ]] || return 2
+}
+
+# Publish immutable receipts/manifests without clobbering another publisher.
+# A byte-identical retained result is a successful, byte-stable retry.
+_sbom_publish_record() {
+    local staged="$1" output="$2"
+    [[ ! -L "$output" && ( ! -e "$output" || -f "$output" ) ]] || return 2
+    if [[ -f "$output" ]]; then
+        cmp -s "$staged" "$output" && return 0
+        _sbom_log error "Conflicting retained SBOM record: $output"
+        return 2
+    fi
+    _sbom_has_signature "$output" && return 2
+    if ! ln -- "$staged" "$output" 2>/dev/null; then
+        [[ -f "$output" && ! -L "$output" ]] && cmp -s "$staged" "$output" && return 0
+        _sbom_log error "Cannot publish SBOM record: $output"
+        return 2
+    fi
+}
+
+# Verify a complete manifest independently of Syft and the per-artifact cache.
+# The caller freezes its hash around this read. Validate the public document
+# here too, before allowing any entry to select a filesystem path.
+_sbom_verify_manifest() {
+    local manifest="$1" root="$2" output_dir="$3" format="$4" inputs="$5"
+    local recorded entries entry
+    _sbom_receipt_shape "$manifest" "$format" "$(_sbom_extension "$format")" release || return 2
+    recorded=$(jq -c '[.artifacts[].artifact | {name,sha256}] | sort_by(.name)' "$manifest") || return 1
+    [[ "$recorded" == "$inputs" ]] || {
+        _sbom_log error "SBOM manifest does not match the exact current release set"; return 2;
+    }
+    entries=$(jq -c '.artifacts[]' "$manifest") || return 1
+    while IFS= read -r entry; do
+        _sbom_verify_entry "$entry" "$root" "$output_dir" "$format" || return $?
+    done <<< "$entries"
+}
+
+# Shared batch engine. The aggregate is published only after all inputs and
+# proofs are reverified. Individual completed pairs survive a later scan failure.
+# An interrupted doc-without-receipt is rescanned (never blindly trusted); an
+# invalid receipt or a receipt whose source/proof changed is a hard conflict.
+_sbom_artifacts() (
+    set -o pipefail
+    local action="$1" root="${2:-}" format="${SBOM_DEFAULT_FORMAT:-spdx}" output_dir="${SBOM_OUTPUT_DIR:-}"
+    shift
     [[ $# -gt 0 ]] && shift
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --format|-f)
-                [[ $# -ge 2 && -n "$2" ]] || return 4
-                format="$2"; shift 2 ;;
+            --format|-f|--output-dir)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
+                case "$1" in --format|-f) format="$2" ;; *) output_dir="$2" ;; esac
+                shift 2 ;;
             *) _sbom_log error "Unknown SBOM batch option: $1"; return 4 ;;
         esac
     done
     format=$(_sbom_format "$format") || return $?
-    [[ -d "$root" && ! -L "$root" ]] || return 4
+    [[ -d "$root" && ! -L "$root" && "$root" != *[[:cntrl:]]* && "$root" != *\\* ]] || return 4
     root=$(cd "$root" && pwd -P) || return 4
-    workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-sbom-batch.XXXXXXXX") || return 1
+    [[ -n "$output_dir" ]] || output_dir="$root"
+    [[ ! -L "$output_dir" && "$output_dir" != *[[:cntrl:]]* && "$output_dir" != *\\* ]] || return 4
+    command -v jq >/dev/null || return 3
+    if [[ "$action" == generate ]]; then
+        mkdir -p -- "$output_dir" || return 1
+    fi
+    [[ -d "$output_dir" ]] || return 4
+    output_dir=$(cd "$output_dir" && pwd -P) || return 4
+    local extension manifest plan plan_hash workdir inputs after prior hash recorded entry name digest doc receipt
+    local expected actual staged_receipt generated=0 reused=0 status=0
+    extension=$(_sbom_extension "$format") || return $?
+    manifest="$output_dir/sbom-manifest.$extension"
+    plan="$output_dir/sbom-plan.$extension"
+    if [[ "$action" == verify ]]; then
+        workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-sbom-verify.XXXXXXXX") || return 1
+    else
+        workdir=$(mktemp -d "$output_dir/.dsr-sbom-batch.XXXXXXXX") || return 1
+    fi
     trap 'rm -rf -- "$workdir"' EXIT
     trap 'exit 5' HUP INT TERM
-    selected=$(_sbom_select_artifacts "$root" "$workdir/list") || return $?
-    [[ -n "$selected" ]] || { _sbom_log error "No release artifacts selected"; return 4; }
-    command -v jq >/dev/null || return 3
-    sbom_check || return $?
-    local generated=0 failed=0
+    inputs=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+    prior=$(_sbom_output_state "$manifest") || return $?
+    if [[ "$prior" != absent ]]; then
+        _sbom_receipt_shape "$manifest" "$format" "$extension" release &&
+            _sbom_verify_manifest "$manifest" "$root" "$output_dir" "$format" "$inputs" || {
+                _sbom_log error "Invalid or stale complete SBOM manifest: $manifest"; return 2;
+            }
+        after=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+        [[ "$inputs" == "$after" && "$(_sbom_hash "$manifest")" == "$prior" ]] || return 2
+        _sbom_log ok "Verified complete SBOM release set without rescanning: $manifest"
+        printf '%s\n' "$manifest"
+        return 0
+    fi
+    [[ "$action" == generate ]] || { _sbom_log error "SBOM manifest not found: $manifest"; return 4; }
+    _sbom_has_signature "$manifest" && return 2
+    # Persist the entire intended input set before scanning, so an interrupted
+    # retry cannot silently drop an unfinished target or accept changed bytes.
+    plan_hash=$(_sbom_output_state "$plan") || return $?
+    if [[ "$plan_hash" != absent ]]; then
+        jq -e -s --arg format "$format" --argjson inputs "$inputs" '
+            length == 1 and (.[0] | type == "object" and .schema_version == 1 and
+                .kind == "dsr-sbom-plan" and .format == $format and
+                .selection_policy == "top-level-artifacts-v1" and .artifacts == $inputs)
+        ' "$plan" >/dev/null 2>&1 || {
+            _sbom_log error "SBOM retry differs from the frozen release plan"; return 2;
+        }
+        [[ "$(_sbom_hash "$plan")" == "$plan_hash" ]] || return 2
+    else
+        _sbom_has_signature "$plan" && return 2
+    fi
+    : > "$workdir/entries.jsonl" || return 1
+    # Preflight EVERY retained record before any scan or publication. Never
+    # repair a forged/stale binding by silently switching to regeneration.
+    local -A receipt_hashes=()
+    recorded=$(jq -r '.[].name' <<< "$inputs") || return 1
     while IFS= read -r name; do
-        if sbom_generate "$root/$name" --format "$format" --quiet; then
+        doc="$output_dir/$name.sbom.$extension"
+        receipt="$doc.dsr.json"
+        hash=$(_sbom_output_state "$receipt") || return $?
+        receipt_hashes["$name"]="$hash"
+        if [[ "$hash" != absent ]]; then
+            _sbom_receipt_shape "$receipt" "$format" "$extension" artifact || return 2
+            entry=$(jq -c . "$receipt") || return 1
+            actual=$(jq -c '.artifact | {name,sha256}' <<< "$entry") || return 1
+            expected=$(jq -c --arg name "$name" '.[] | select(.name == $name)' <<< "$inputs") || return 1
+            [[ "$actual" == "$expected" ]] || return 2
+            _sbom_verify_entry "$entry" "$root" "$output_dir" "$format" || return $?
+            [[ "$(_sbom_hash "$receipt")" == "$hash" ]] || return 2
+        else
+            _sbom_has_signature "$receipt" && return 2
+            [[ ! -L "$doc" && ( ! -e "$doc" || -f "$doc" ) ]] || return 2
+            if [[ -f "$doc" ]]; then
+                _sbom_validate "$doc" "$format" || return 2
+            fi
+            _sbom_has_signature "$doc" && return 2
+        fi
+    done <<< "$recorded"
+    if [[ "$plan_hash" == absent ]]; then
+        jq -nc --arg format "$format" --argjson inputs "$inputs" '
+            {schema_version:1,kind:"dsr-sbom-plan",format:$format,
+             selection_policy:"top-level-artifacts-v1",artifacts:$inputs}' \
+            > "$workdir/plan.json" || return 1
+        _sbom_publish_record "$workdir/plan.json" "$plan" || return $?
+        plan_hash=$(_sbom_hash "$plan") || return $?
+    fi
+    while IFS= read -r name; do
+        doc="$output_dir/$name.sbom.$extension"
+        receipt="$doc.dsr.json"
+        digest=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .sha256' <<< "$inputs") || return 1
+        hash="${receipt_hashes[$name]}"
+        if [[ "$hash" == absent ]]; then
+            # Capture a receipt only for the frozen input actually scanned.
+            [[ "$(_sbom_hash "$root/$name")" == "$digest" ]] || return 2
+            if sbom_generate "$root/$name" --format "$format" --output "$doc" --quiet > "$workdir/scan.out"; then
+                :
+            else
+                status=$?
+                _sbom_log error "Incomplete SBOM release set; completed pairs retained ($name failed)"
+                return "$status"
+            fi
+            [[ "$(_sbom_hash "$root/$name")" == "$digest" ]] || return 2
+            actual=$(_sbom_hash "$doc") || return $?
+            # Each published hardlink needs its own staging inode. Reusing one
+            # staging filename would truncate an earlier public receipt.
+            staged_receipt=$(mktemp "$workdir/receipt.XXXXXXXX") || return 1
+            jq -nc --arg format "$format" --arg name "$name" --arg digest "$digest" \
+                --arg doc "${doc##*/}" --arg doc_digest "$actual" '
+                {schema_version:1,kind:"dsr-sbom-artifact",format:$format,
+                 artifact:{name:$name,sha256:$digest},sbom:{name:$doc,sha256:$doc_digest}}' \
+                > "$staged_receipt" || return 1
+            _sbom_receipt_shape "$staged_receipt" "$format" "$extension" artifact || return 1
+            _sbom_publish_record "$staged_receipt" "$receipt" || return $?
+            hash=$(_sbom_hash "$receipt") || return $?
             generated=$((generated + 1))
         else
-            failed=$((failed + 1))
+            reused=$((reused + 1))
         fi
-    done <<< "$selected"
-    _sbom_log info "SBOM generation complete: $generated generated, $failed failed"
-    [[ "$failed" -eq 0 ]]
+        [[ "$(_sbom_hash "$receipt")" == "$hash" ]] || return 2
+        entry=$(jq -c . "$receipt") || return 1
+        _sbom_verify_entry "$entry" "$root" "$output_dir" "$format" || return $?
+        [[ "$(_sbom_hash "$receipt")" == "$hash" ]] || return 2
+        printf '%s\n' "$entry" >> "$workdir/entries.jsonl" || return 1
+    done <<< "$recorded"
+    jq -sc --arg format "$format" '
+        {schema_version:1,kind:"dsr-sbom-release",status:"complete",format:$format,
+         selection_policy:"top-level-artifacts-v1",artifacts:sort_by(.artifact.name)}' \
+        "$workdir/entries.jsonl" > "$workdir/manifest.json" || return 1
+    _sbom_receipt_shape "$workdir/manifest.json" "$format" "$extension" release || return 1
+    after=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+    [[ "$inputs" == "$after" && "$(_sbom_hash "$plan")" == "$plan_hash" ]] || {
+        _sbom_log error "Release set or frozen plan changed during SBOM generation"; return 2;
+    }
+    _sbom_verify_manifest "$workdir/manifest.json" "$root" "$output_dir" "$format" "$inputs" || return $?
+    _sbom_publish_record "$workdir/manifest.json" "$manifest" || return $?
+    # Recheck final public files, not only private staging, before success.
+    hash=$(_sbom_hash "$manifest") || return $?
+    _sbom_verify_manifest "$manifest" "$root" "$output_dir" "$format" "$inputs" || return $?
+    after=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+    [[ "$inputs" == "$after" && "$(_sbom_hash "$manifest")" == "$hash" ]] || return 2
+    _sbom_log ok "Complete SBOM release set: $generated generated, $reused reused"
+    printf '%s\n' "$manifest"
 )
+
+# stdout: the complete manifest path, ONLY on complete success.
+sbom_generate_artifacts() { _sbom_artifacts generate "$@"; }
+sbom_verify_artifacts() { _sbom_artifacts verify "$@"; }
 
 # JSON is emitted on failure too, but never changes a failing process exit code.
 # Diagnostics are captured separately, not spliced into output_file.
 sbom_generate_json() (
-    local target="${1:-}" format="$SBOM_DEFAULT_FORMAT" arg previous="" status=0
+    local target="${1:-}" format="${SBOM_DEFAULT_FORMAT:-spdx}" arg previous="" status=0
     local start=$SECONDS workdir output="" error="" state=success
     for arg in "$@"; do
         case "$previous" in --format|-f) format="$arg" ;; esac
@@ -385,3 +609,30 @@ export -f sbom_generate_artifacts sbom_verify sbom_generate_json
 export -f _sbom_log _sbom_format _sbom_extension _sbom_hash _sbom_validate
 export -f _sbom_glob_literal _sbom_has_signature _sbom_output_state
 export -f _sbom_is_metadata _sbom_select_artifacts
+export -f _sbom_snapshot_artifacts _sbom_receipt_shape _sbom_verify_entry
+export -f _sbom_publish_record _sbom_verify_manifest _sbom_artifacts sbom_verify_artifacts
+
+# Standalone module entry points expose complete release-set operations without
+# relying on the monolithic dsr CLI (which currently exposes generate/verify).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    set -uo pipefail
+    _sbom_command="${1:-help}"
+    [[ $# -gt 0 ]] && shift
+    case "$_sbom_command" in
+        generate) sbom_generate "$@" ;;
+        project) sbom_generate_project "$@" ;;
+        artifacts) sbom_generate_artifacts "$@" ;;
+        verify) sbom_verify "$@" ;;
+        verify-artifacts) sbom_verify_artifacts "$@" ;;
+        json) sbom_generate_json "$@" ;;
+        help|--help|-h)
+            printf '%s\n' \
+                'Usage: bash src/sbom.sh <command> <path> [options]' \
+                'Commands: generate, project, artifacts, verify, verify-artifacts, json' \
+                'Single scan: --format spdx|cyclonedx --output FILE --quiet' \
+                'Release set: --format spdx|cyclonedx --output-dir DIRECTORY' \
+                'Verification checks local integrity, not signatures or build provenance.' ;;
+        *) _sbom_log error "Unknown SBOM command: $_sbom_command"; exit 4 ;;
+    esac
+    exit $?
+fi
