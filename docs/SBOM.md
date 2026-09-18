@@ -129,3 +129,58 @@ fixture, not a real inventory scan. The batch suite also has an optional real-Sy
 archive integration case and reports a skip when Syft is unavailable. The Bats
 suite contains real-Syft integration cases as well. None of these tests performs a
 live GitHub release or accesses production signing keys.
+
+## Verify the actual GitHub release
+
+Local verification alone does not establish that the release serves the same
+artifacts and SBOMs. The remote verifier checks both, against a manifest digest
+chosen independently of the release being inspected:
+
+```bash
+bash src/sbom_release.sh verify --repo OWNER/REPO --tag v1.2.3 \
+  --manifest-sha256 EXPECTED_64_HEX_SHA256 --format spdx
+```
+
+For sourced use, load `src/sbom_release.sh` and call `sbom_verify_release` with
+the same options. Supply the digest from a separately verified local inventory
+or another trusted channel; obtaining both the manifest and its purported
+trusted digest from the same untrusted release is not authentication.
+
+The verifier resolves the existing tag and freezes numeric repository/release
+identities. It reads every asset page without caching, requires the exact payload
+namespace under the local selection policy, and checks every recorded SHA256.
+Older assets without GitHub SHA256 metadata are downloaded by immutable asset ID
+and hashed. A present mismatching or unsupported digest is an error, not permission
+to fall back to weaker checks. Every SBOM document and the aggregate manifest are
+downloaded by asset ID; their bytes, sizes and document contracts are checked.
+
+A second uncached observation rejects changed release identities/modes, moved
+tags, deleted/recreated asset IDs, missing files and late additions. Success prints
+one JSON verification receipt. Failure returns nonzero with no success receipt.
+Drafts and published releases can both be verified. An existing unambiguous tag is
+required; no release, tag or asset is created or modified by verification.
+
+The public GitHub host and one credential are frozen for the operation. Credentials
+follow `DSR_GH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, then the existing adapter's token
+resolution. Caller environment variables, traps, umask and job control are not
+changed. Syft and local payloads are not required for remote verification.
+
+`SBOM_REMOTE_TIMEOUT` bounds each adapter operation, including retries and child
+processes (default 900 seconds). `SBOM_REMOTE_MAX_DOCUMENT_BYTES` limits advertised
+SBOM/manifest size before downloading (default 67108864 bytes); downloaded length
+must also match the advertised size. Binary payload fallback downloads are not
+subject to the document-size limit. Deadlines return exit code 5, invalid options
+4, missing dependencies/credentials 3, integrity failures 7, and failed GitHub
+reads/downloads 8. This is a per-operation deadline, not a whole-release deadline.
+
+Remote verification trusts GitHub's asset identity and advertised SHA256 when
+present. It does not verify Minisign signatures, authenticate the scanner, prove
+builder identity, or attest source/toolchain provenance. Its repository/tag binding
+describes the release observed now; the local SBOM format does not contain a signed
+repository/tag binding. Filesystem and API observations are not a multi-file or
+multi-request atomic transaction.
+
+`bash scripts/tests/test_sbom_remote.sh` exercises the local inventory implementation,
+real hashing/files and process-group deadlines with explicit GitHub/Syft fixtures.
+It includes both formats, digest-less assets, full pagination, malformed proofs,
+missing/extra payloads, identity changes, and a TERM-resistant transfer descendant.
