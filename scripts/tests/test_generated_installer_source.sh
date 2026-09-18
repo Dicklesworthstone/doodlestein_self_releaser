@@ -33,6 +33,7 @@ GO
 "$GIT_REAL" -C "$TEMP/upstream" add project
 "$GIT_REAL" -C "$TEMP/upstream" commit -qm initial
 "$GIT_REAL" -C "$TEMP/upstream" tag -a v1.0.0 -m release
+"$GIT_REAL" -C "$TEMP/upstream" tag v1.0.0+build.1
 TAG_PIN=$("$GIT_REAL" -C "$TEMP/upstream" rev-parse HEAD)
 cat > "$TEMP/upstream/project/cmd/app/main.go" <<'GO'
 package main
@@ -41,6 +42,8 @@ func main() { fmt.Println("default-source-v2") }
 GO
 "$GIT_REAL" -C "$TEMP/upstream" commit -qam next
 HEAD_PIN=$("$GIT_REAL" -C "$TEMP/upstream" rev-parse HEAD)
+export TAG_PIN HEAD_PIN FRESHNESS_MODE=normal FRESHNESS_COUNT=1
+export SOURCE_UPSTREAM="$TEMP/upstream"
 "$GIT_REAL" config --file "$GIT_CONFIG_GLOBAL" url."file://$TEMP/upstream".insteadOf https://github.com/example/source-app.git
 cat > "$TEMP/config/repos.d/app.yaml" <<'YAML'
 tool_name: app
@@ -63,6 +66,61 @@ export ASSET
 COPYFILE_DISABLE=1 tar -czf "$TEMP/releases/$ASSET" -C "$TEMP/releases" app
 hash=$(sha256sum < "$TEMP/releases/$ASSET" 2>/dev/null || shasum -a 256 < "$TEMP/releases/$ASSET")
 printf '%s  %s\n' "${hash%% *}" "$ASSET" > "$TEMP/releases/$ASSET.sha256"
+# API-boundary fixtures share response construction across curl and gh. The
+# selected commits themselves exist in the real test repository above.
+cat > "$TEMP/bin/freshness-response" <<'FRESHNESS'
+#!/usr/bin/env bash
+set -uo pipefail
+endpoint="$1" mode="$FRESHNESS_MODE"
+[[ "$mode" != unavailable ]] || exit 22
+head="$HEAD_PIN"
+[[ "$mode" != identical ]] || head="$TAG_PIN"
+case "$endpoint" in
+    */commits\?per_page=1)
+        case "$mode" in
+            bad-head) printf '[{"sha":"not-a-commit"}]\n' ;;
+            multiple-heads) printf '[{"sha":"%s"},{"sha":"%s"}]\n' "$head" "$head" ;;
+            *) printf '[{"sha":"%s"}]\n' "$head" ;;
+        esac
+        ;;
+    */commits/tags%2Fv1.0.0)
+        if [[ "$mode" == bad-tag ]]; then printf '{"sha":null}\n'
+        else printf '{"sha":"%s"}\n' "$TAG_PIN"; fi
+        ;;
+    */compare/*)
+        [[ "$endpoint" == *"/$TAG_PIN...$head?per_page=1" ]] || exit 22
+        if [[ "$mode" == move-head ]]; then
+            printf '\n// change after freshness observation\n' >> "$SOURCE_UPSTREAM/project/cmd/app/main.go"
+            "$GIT_REAL" -C "$SOURCE_UPSTREAM" commit -qam 'advance after observation'
+        fi
+        body=$(jq -nc --arg base "$TAG_PIN" --arg head "$head" --argjson count "$FRESHNESS_COUNT" '
+            {base_commit:{sha:$base}, merge_base_commit:{sha:$base}, status:"ahead",
+             ahead_by:$count, behind_by:0, total_commits:$count,
+             commits:[{sha:$base}]}')
+        # The returned page deliberately does not end at head. Metadata count
+        # and the separately pinned head, not this page, must drive selection.
+        case "$mode" in
+            identical) body=$(jq '.status="identical" | .ahead_by=0 | .total_commits=0 | .commits=[]' <<< "$body") ;;
+            diverged) body=$(jq '.status="diverged" | .behind_by=1' <<< "$body") ;;
+            behind) body=$(jq '.status="behind" | .behind_by=1 | .ahead_by=0 | .total_commits=0' <<< "$body") ;;
+            wrong-base) body=$(jq --arg head "$head" '.base_commit.sha=$head' <<< "$body") ;;
+            wrong-ancestor) body=$(jq --arg head "$head" '.merge_base_commit.sha=$head' <<< "$body") ;;
+            wrong-total) body=$(jq '.total_commits += 1' <<< "$body") ;;
+            negative) body=$(jq '.ahead_by=-1 | .total_commits=-1' <<< "$body") ;;
+            fractional) body=$(jq '.ahead_by=1.5 | .total_commits=1.5' <<< "$body") ;;
+            string-count) body=$(jq '.ahead_by="99" | .total_commits="99"' <<< "$body") ;;
+            huge-count) body=$(jq '.ahead_by=1e30 | .total_commits=1e30' <<< "$body") ;;
+            missing-count) body=$(jq 'del(.ahead_by)' <<< "$body") ;;
+            zero-ahead) body=$(jq '.ahead_by=0 | .total_commits=0' <<< "$body") ;;
+            bad-status) body=$(jq '.status="identical"' <<< "$body") ;;
+            malformed) body='not json' ;;
+            multiple-json) body="$body $body" ;;
+        esac
+        printf '%s\n' "$body"
+        ;;
+    *) exit 22 ;;
+esac
+FRESHNESS
 cat > "$TEMP/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -76,6 +134,10 @@ while (($#)); do
 done
 printf 'curl %s\n' "$url" >> "$CALLS"
 case "$url" in
+    https://api.github.com/*/commits*|https://api.github.com/*/compare/*)
+        [[ "$FRESHNESS_MODE" != private ]] || exit 22
+        freshness-response "$url" > "$dest"
+        ;;
     */releases/latest)
         [[ "$MODE" != discovery-fail ]] || exit 22
         printf '{"tag_name":"v1.0.0"}\n'
@@ -98,6 +160,10 @@ CURL
 cat > "$TEMP/bin/gh" <<'GH'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$CALLS"
+if [[ "$1" == api ]]; then
+    freshness-response "${!#}"
+    exit $?
+fi
 exit 1
 GH
 cat > "$TEMP/bin/git" <<'GIT'
@@ -149,6 +215,10 @@ run_case() {
     CASE="$TEMP/results/$name"
     mkdir -p "$CASE/tmp"
     export CALLS="$CASE/calls" TMPDIR="$CASE/tmp"
+    if [[ "$name" == symlink-temp ]]; then
+        ln -s "$CASE/tmp" "$CASE/tmp-alias"
+        TMPDIR="$CASE/tmp-alias"
+    fi
     : > "$CALLS"
     status=0
     bash "$INSTALLER" --json --non-interactive --no-skills --cache-dir "$CASE/cache" \
@@ -166,6 +236,13 @@ run_case force-tag discovery-fail --from-source --version v1.0.0 --source-timeou
 check 'explicit source version builds its tag' equal "$status" 0
 check 'explicit source version never silently builds HEAD' source_json "$TAG_PIN"
 check 'tagged executable runs' equal "$("$CASE/install/app")" tagged-source-v1
+run_case build-metadata discovery-fail --from-source --version v1.0.0+build.1 --source-timeout 60
+check 'semver build metadata is accepted in source tag pins' equal "$status" 0
+check 'build-metadata tag preserves its source commit' source_json "$TAG_PIN"
+run_case symlink-temp discovery-fail --from-source --version v1.0.0 --source-timeout 60
+check 'symlinked temporary root supports source receipts' equal "$status" 0
+check 'physical temp path still binds the selected source' source_json "$TAG_PIN"
+check 'physical temp tree is cleaned after success' equal "$(find "$CASE/tmp" -mindepth 1 -print)" ''
 run_case pinned discovery-fail --from-source --source-ref "$TAG_PIN" --source-timeout 60
 check 'explicit source commit is supported' equal "$status" 0
 check 'commit receipt is pinned' source_json "$TAG_PIN"
@@ -252,6 +329,82 @@ bash "$INSTALLER" --json --non-interactive --no-skills --dir "$CASE/install" --f
     --version v1.0.0 --source-timeout 60 > "$CASE/third.json" 2> "$CASE/third.err" || status=$?
 check 'authorized source replacement succeeds' equal "$status" 0
 check 'replacement installs selected revision' equal "$("$CASE/install/app")" tagged-source-v1
+
+# Opt-in latest-release freshness policy is evaluated AFTER integrity checks.
+# Remove the signing fixture to exercise ordinary verified-release delivery.
+cat > "$TEMP/config/repos.d/app.yaml" <<'YAML'
+tool_name: app
+repo: example/source-app
+binary_name: app
+language: go
+source_subdir: project
+source_entry: cmd/app
+artifact_naming: '${name}-${version}-${os}-${arch}'
+YAML
+INSTALLER=$(install_gen_create app) || exit 1
+run_case freshness-boundary good --allow-source-build --source-if-stale 1
+check 'release exactly at threshold stays release-first' equal "$status" 0
+check 'fresh comparison does not invoke compiler' no_source
+check 'fresh decision retains both immutable pins and distance' jq -e \
+    --arg base "$TAG_PIN" --arg head "$HEAD_PIN" \
+    '.freshness.status == "fresh" and .freshness.release_commit == $base and
+     .freshness.head_commit == $head and .freshness.commits_behind == 1 and .freshness.threshold == 1' "$CASE/out.json"
+run_case freshness-stale good --allow-source-build --source-if-stale 0 --source-timeout 60
+check 'release over threshold builds the observed default revision' equal "$status" 0
+check 'stale source receipt binds the observed commit' source_json "$HEAD_PIN"
+check 'source is not mislabeled with the stale release version' equal "$(jq -r '.version' "$CASE/out.json")" ''
+check 'stale release identity is retained separately' jq -e \
+    '.freshness.status == "stale" and .freshness.release_version == "v1.0.0"' "$CASE/out.json"
+check 'stale source does not populate release cache' test ! -e "$CASE/cache"
+FRESHNESS_MODE=identical
+run_case freshness-identical good --allow-source-build --source-if-stale 0
+check 'identical revisions are fresh even with zero threshold' equal "$status" 0
+check 'identical revisions have zero distance' jq -e '.freshness.status == "fresh" and .freshness.commits_behind == 0' "$CASE/out.json"
+check 'identical comparison does not compile' no_source
+for mode in unavailable bad-head multiple-heads bad-tag diverged behind wrong-base wrong-ancestor wrong-total \
+    negative fractional string-count huge-count missing-count zero-ahead bad-status malformed multiple-json; do
+    FRESHNESS_MODE="$mode"
+    run_case "freshness-$mode" good --allow-source-build --source-if-stale 0
+    check "unknown freshness keeps verified release: $mode" equal "$status" 0
+    check "invalid freshness cannot authorize compilation: $mode" no_source
+    check "unknown decision is explicit in JSON: $mode" jq -e '.freshness.status == "unknown" and (has("source") | not)' "$CASE/out.json"
+done
+FRESHNESS_MODE=private
+GH_HOST=unrelated.example run_case freshness-private good --prefer-gh --allow-source-build --source-if-stale 1
+check 'authenticated gh can provide private-repo freshness metadata' equal "$status" 0
+check 'gh metadata transport is pinned to github.com' grep -q '^gh api --hostname github.com --method GET' "$CALLS"
+check 'private comparison returns a fresh decision' jq -e '.freshness.status == "fresh"' "$CASE/out.json"
+FRESHNESS_MODE=normal FRESHNESS_COUNT=1001
+run_case freshness-large good --allow-source-build --source-if-stale 10 --source-timeout 60
+check 'large comparison count is not truncated to page length' equal "$status" 0
+check 'large comparison preserves full count' jq -e '.freshness.commits_behind == 1001 and .freshness.status == "stale"' "$CASE/out.json"
+check 'last commit in page is not mistaken for head' source_json "$HEAD_PIN"
+FRESHNESS_COUNT=1
+run_case stale-integrity checksum-bad --allow-source-build --source-if-stale 0
+check 'staleness policy cannot bypass bad checksum' equal "$status" 1
+check 'staleness is not checked before artifact integrity' bash -c '! grep -Eq "/commits|/compare/" "$1"' _ "$CALLS"
+check 'stale checksum failure does not compile' no_source
+for policy in no-consent explicit-version forced-source negative fraction leading-zero too-large missing; do
+    case "$policy" in
+        no-consent) args=(--source-if-stale 0 --yes) ;;
+        explicit-version) args=(--source-if-stale 0 --allow-source-build --version v1.0.0) ;;
+        forced-source) args=(--source-if-stale 0 --from-source) ;;
+        negative) args=(--source-if-stale -1 --allow-source-build) ;;
+        fraction) args=(--source-if-stale 0.5 --allow-source-build) ;;
+        leading-zero) args=(--source-if-stale 01 --allow-source-build) ;;
+        too-large) args=(--source-if-stale 1000000 --allow-source-build) ;;
+        missing) args=(--allow-source-build --source-if-stale) ;;
+    esac
+    run_case "stale-policy-$policy" good "${args[@]}"
+    check "invalid stale policy rejected: $policy" equal "$status" 4
+    check "invalid stale policy has no network calls: $policy" no_http
+done
+FRESHNESS_MODE=move-head
+run_case freshness-racing-head good --allow-source-build --source-if-stale 0 --source-timeout 60
+check 'moving default branch does not change the selected source revision' equal "$status" 0
+check 'head race builds the original observed pin' source_json "$HEAD_PIN"
+check 'race fixture really advanced the branch' test "$("$GIT_REAL" -C "$SOURCE_UPSTREAM" rev-parse HEAD)" != "$HEAD_PIN"
+
 # Invalid embedded source config must not clobber an existing generated file.
 original=$(_isb_sha256 "$INSTALLER")
 printf 'source_package: bad-package\n' >> "$TEMP/config/repos.d/app.yaml"

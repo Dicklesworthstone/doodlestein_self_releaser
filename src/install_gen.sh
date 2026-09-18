@@ -74,6 +74,7 @@ _install_gen_template() {
 #   --allow-source-build     Allow source fallback when discovery/download is unavailable
 #   --source-ref REF         With --from-source: HEAD, full SHA, refs/heads/* or refs/tags/*
 #   --source-timeout SECONDS  Per-command source-build limit (default: 3600)
+#   --source-if-stale N       With --allow-source-build: build head if latest is >N commits behind
 #   --no-skills              Skip AI coding agent skill installation
 #   --help                   Show this help
 #
@@ -134,6 +135,8 @@ _ALLOW_SOURCE_BUILD=false
 _SOURCE_REF=""
 _SOURCE_TIMEOUT=3600
 _SOURCE_RECEIPT=null
+_SOURCE_IF_STALE=""
+_RELEASE_FRESHNESS=null
 _KEEP_SOURCE_LOGS=false
 # Working directory created by main(). Declared at script scope so the
 # EXIT trap (which fires AFTER main returns and its locals have been
@@ -184,9 +187,11 @@ _json_result() {
                 --arg version "$version" \
                 --arg path "$path" \
                 --argjson source_receipt "$_SOURCE_RECEIPT" \
+                --argjson freshness "$_RELEASE_FRESHNESS" \
                 '{tool: $tool, status: $status, message: $message, version: $version, path: $path}
                  + if $status == "success" and $source_receipt != null
-                   then {method:"source", signed_release:false, source:$source_receipt} else {} end'
+                   then {method:"source", signed_release:false, source:$source_receipt} else {} end
+                 + if $freshness != null then {freshness:$freshness} else {} end'
         else
             # Fallback for systems without jq - escape JSON special characters
             # Order matters: escape backslashes first, then quotes, then control chars
@@ -941,6 +946,9 @@ _install_from_source() {
     _log_warn "Building $REPO at $ref locally; this is NOT a signed release"
     if [[ -z "$_TEMP_DIR" ]]; then
         _TEMP_DIR=$(mktemp -d) || return 1
+        # macOS /var and user TMPDIR aliases may be symlinks. Match the source
+        # engine's physical paths rather than rejecting its valid receipt.
+        _TEMP_DIR=$(cd "$_TEMP_DIR" && pwd -P) || return 1
         trap _cleanup_temp_dir EXIT
     fi
     local args=(--allow-build --subdir "$SOURCE_SUBDIR" --timeout "$_SOURCE_TIMEOUT")
@@ -1046,11 +1054,12 @@ main() {
                 _ALLOW_SOURCE_BUILD=true
                 shift
                 ;;
-            --source-ref|--source-timeout)
+            --source-ref|--source-timeout|--source-if-stale)
                 [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
                 case "$1" in
                     --source-ref) _SOURCE_REF="$2" ;;
                     --source-timeout) _SOURCE_TIMEOUT="$2" ;;
+                    --source-if-stale) _SOURCE_IF_STALE="$2" ;;
                 esac
                 shift 2
                 ;;
@@ -1070,6 +1079,14 @@ main() {
     done
 
     [[ "$_SOURCE_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
+    if [[ -n "$_SOURCE_IF_STALE" ]]; then
+        if [[ ! "$_SOURCE_IF_STALE" =~ ^(0|[1-9][0-9]{0,5})$ || -n "$_VERSION" ]] ||
+           ! $_ALLOW_SOURCE_BUILD || $_FROM_SOURCE; then
+            _log_error "--source-if-stale needs --allow-source-build, a nonnegative integer, and latest-release mode (no --version or --from-source)"
+            return 4
+        fi
+        command -v jq >/dev/null 2>&1 || return 3
+    fi
     if [[ -n "$_SOURCE_REF" ]] && { ! $_FROM_SOURCE || [[ -n "$_VERSION" ]]; }; then
         _log_error "--source-ref requires --from-source and cannot be combined with --version"
         return 4
@@ -1138,6 +1155,7 @@ main() {
     # EXIT trap can still see it after main() returns and locals are
     # popped.
     _TEMP_DIR=$(mktemp -d) || return 1
+    _TEMP_DIR=$(cd "$_TEMP_DIR" && pwd -P) || return 1
     trap _cleanup_temp_dir EXIT
     local temp_dir="$_TEMP_DIR"
 
@@ -1188,6 +1206,33 @@ main() {
         return 1
     fi
     binary_path="$candidates"
+    # A stale-release policy must NEVER launder a bad artifact into a source
+    # build. Check it only after integrity, extraction and binary selection.
+    if [[ -n "$_SOURCE_IF_STALE" ]]; then
+        local freshness_args=() freshness_status=0
+        $_PREFER_GH && freshness_args+=(--prefer-gh)
+        _RELEASE_FRESHNESS=$(install_source_freshness "$REPO" "$_VERSION" "$_SOURCE_IF_STALE" \
+            "$temp_dir/freshness" "${freshness_args[@]}") || freshness_status=$?
+        [[ "$freshness_status" != 5 ]] || return 5
+        if ((freshness_status != 0)); then
+            _RELEASE_FRESHNESS=$(jq -nc --arg tag "$_VERSION" \
+                '{status:"unknown", release_version:$tag, reason:"freshness check unavailable"}') || return 1
+        fi
+        case "$(jq -r '.status' <<< "$_RELEASE_FRESHNESS")" in
+            stale)
+                _SOURCE_REF=$(jq -r '.head_commit' <<< "$_RELEASE_FRESHNESS") || return 1
+                _log_warn "Release $_VERSION is $(jq -r '.commits_behind' <<< "$_RELEASE_FRESHNESS") commits behind the observed default branch"
+                # The selected head is newer than the release; do not label it
+                # with the old version or resolve a moving branch a second time.
+                _VERSION=""
+                _install_from_source "Explicit stale-release policy selected pinned revision $_SOURCE_REF"
+                return $?
+                ;;
+            unknown) _log_warn "Freshness unknown; keeping the verified release" ;;
+            fresh) _log_info "Latest release is within the requested commit-distance threshold" ;;
+            *) return 1 ;;
+        esac
+    fi
     if ! $_OFFLINE_MODE; then
         _cache_put "$archive_file" "$_VERSION" "$platform" "$format" || \
             _log_warn "Could not cache verified archive"

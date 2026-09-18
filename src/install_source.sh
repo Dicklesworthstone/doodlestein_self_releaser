@@ -29,7 +29,7 @@ _isb_relative_path() {
 _isb_ref() {
     [[ "$1" == HEAD || "$1" =~ ^[0-9a-fA-F]{40}$ || "$1" =~ ^[0-9a-fA-F]{64}$ ]] && return 0
     case "$1" in refs/heads/*|refs/tags/*) ;; *) return 1 ;; esac
-    [[ "$1" =~ ^refs/(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] &&
+    [[ "$1" =~ ^refs/(heads|tags)/[A-Za-z0-9_][A-Za-z0-9._+/-]*$ ]] &&
         git check-ref-format "$1" >/dev/null 2>&1
 }
 
@@ -160,6 +160,120 @@ _isb_checkout() {
 }
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
+
+# Freshness is advisory release metadata, NOT artifact or commit-signature
+# verification. Query only GitHub's API and do not inherit a GH_HOST override.
+# Separate API bytes from diagnostic logs so warnings cannot become JSON.
+_isb_freshness_request() {
+    local transport="$1" endpoint="$2" destination="$3"
+    if [[ "$transport" == gh ]]; then
+        gh api --hostname github.com --method GET \
+            -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
+            "$endpoint" > "$destination"
+    else
+        curl -sSf --proto '=https' --connect-timeout 10 --max-time 30 \
+            -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
+            "https://api.github.com/$endpoint" -o "$destination"
+    fi
+}
+
+_isb_freshness_get() {
+    local endpoint="$1" destination="$2" prefer="$3" transport status
+    local transports=(curl gh)
+    [[ "$prefer" != true ]] || transports=(gh curl)
+    for transport in "${transports[@]}"; do
+        command -v "$transport" >/dev/null 2>&1 || continue
+        status=0
+        _isb_run 35 "$destination.$transport.log" _isb_freshness_request \
+            "$transport" "$endpoint" "$destination" 2>/dev/null || status=$?
+        if ((status == 0)) && [[ -f "$destination" && ! -L "$destination" ]] &&
+           jq -es 'length == 1' "$destination" >/dev/null 2>&1; then
+            return 0
+        fi
+        # An actual cancellation is not an unavailable API. Watchdog timeouts
+        # do count as unavailable; their marker distinguishes the two cases.
+        if ((status == 5)) && [[ ! -e "$destination.$transport.log.timeout" ]]; then
+            return 5
+        fi
+    done
+    return 8
+}
+
+# Print one decision about the latest release's distance from the default
+# branch. Resolve tag and head to immutable commits BEFORE comparing, and use
+# ahead_by/total_commits, never the length/last entry of a paginated commit list.
+# API docs: https://docs.github.com/en/rest/commits/commits#compare-two-commits
+# Usage: install_source_freshness owner/repo tag threshold new_dir [--prefer-gh]
+# Stale means strictly MORE than threshold commits behind an ancestral head.
+# Unavailable, malformed or divergent history is "unknown", never permission
+# to compile. This helper does not fetch Git objects or execute repository code.
+install_source_freshness() (
+    local repo="${1:-}" tag="${2:-}" threshold="${3:-}" directory="${4:-}" prefer=false
+    [[ $# -eq 4 || ( $# -eq 5 && "$5" == --prefer-gh ) ]] || return 4
+    [[ $# -ne 5 ]] || prefer=true
+    [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ &&
+       "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$tag" != null &&
+       "$threshold" =~ ^(0|[1-9][0-9]{0,5})$ ]] || return 4
+    command -v jq >/dev/null 2>&1 || return 3
+    _isb_freshness_unknown() {
+        jq -nc --arg repo "$repo" --arg tag "$tag" --argjson threshold "$threshold" --arg reason "$1" \
+            '{status:"unknown", repository:$repo, release_version:$tag, threshold:$threshold, reason:$reason}'
+    }
+    command -v ps >/dev/null 2>&1 || { _isb_freshness_unknown 'process watchdog unavailable'; return; }
+    [[ -n "$directory" && ! -e "$directory" && ! -L "$directory" && "$directory" != */ ]] || return 4
+    local parent name status=0 head base encoded_tag decision
+    parent=$(dirname "$directory"); name=$(basename "$directory")
+    _isb_name "$name" && [[ -d "$parent" && ! -L "$parent" ]] || return 4
+    parent=$(cd "$parent" && pwd -P) || return 4
+    directory="$parent/$name"
+    umask 077
+    mkdir "$directory" || return 1
+    trap 'exit 5' HUP INT TERM
+    # Omitted sha on list-commits means the repository's default branch, not
+    # a hard-coded branch name or the default branch of a different repo.
+    _isb_freshness_get "repos/$repo/commits?per_page=1" "$directory/head.json" "$prefer" || status=$?
+    [[ "$status" != 5 ]] || return 5
+    if ((status != 0)) || ! head=$(jq -er -s '
+        if length == 1 and (.[0] | type == "array" and length == 1)
+        then .[0][0].sha | select(type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
+        else empty end' "$directory/head.json" 2>/dev/null); then
+        _isb_freshness_unknown 'default branch revision unavailable'; return
+    fi
+    # tags/ disambiguates a same-named branch; Get a commit peels annotated tags.
+    encoded_tag=$(jq -nr --arg tag "tags/$tag" '$tag | @uri') || return 1
+    status=0
+    _isb_freshness_get "repos/$repo/commits/$encoded_tag" "$directory/base.json" "$prefer" || status=$?
+    [[ "$status" != 5 ]] || return 5
+    if ((status != 0)) || ! base=$(jq -er -s '
+        if length == 1 then .[0].sha | select(type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
+        else empty end' "$directory/base.json" 2>/dev/null); then
+        _isb_freshness_unknown 'release tag revision unavailable'; return
+    fi
+    status=0
+    _isb_freshness_get "repos/$repo/compare/$base...$head?per_page=1" "$directory/compare.json" "$prefer" || status=$?
+    [[ "$status" != 5 ]] || return 5
+    if ((status != 0)); then
+        _isb_freshness_unknown 'commit comparison unavailable'; return
+    fi
+    if ! decision=$(jq -ce -s --arg repo "$repo" --arg tag "$tag" --arg base "$base" --arg head "$head" \
+        --argjson threshold "$threshold" '
+        def count: type == "number" and floor == . and . >= 0 and . <= 1000000000;
+        if length != 1 then error("multiple comparisons") else .[0] end |
+        if type != "object" or .base_commit.sha != $base or
+           (.ahead_by | count | not) or (.behind_by | count | not) or
+           (.total_commits | count | not) or .total_commits != .ahead_by or
+           .behind_by != 0 or .merge_base_commit.sha != $base or
+           (if $head == $base then .status != "identical" or .ahead_by != 0
+            else .status != "ahead" or .ahead_by <= 0 end)
+        then error("incomplete, inconsistent or non-ancestral comparison")
+        else {status:(if .ahead_by > $threshold then "stale" else "fresh" end),
+              repository:$repo, release_version:$tag, release_commit:$base,
+              head_commit:$head, commits_behind:.ahead_by, threshold:$threshold}
+        end' "$directory/compare.json" 2>/dev/null); then
+        _isb_freshness_unknown 'comparison is invalid or history is not ancestral'; return
+    fi
+    printf '%s\n' "$decision"
+)
 
 # Build only the requested executable, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
