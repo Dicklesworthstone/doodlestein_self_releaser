@@ -177,6 +177,19 @@ add_payloads() { local name; for name in a.tar.gz b.tar.xz compat.tar.gz; do rem
 nonzero() { [[ "$1" -ne 0 ]]; }
 no_public_proofs() { [[ "$(find "$PROOFS" -maxdepth 1 -type f | wc -l)" == 0 ]]; }
 
+fixture_private_payload() {
+    local hash size
+    cp "$WORK/private" "$ART/a.tar.gz"
+    hash=$(_slsa_sha256 "$ART/a.tar.gz"); size=$(wc -c < "$ART/a.tar.gz")
+    jq --arg hash "$hash" --argjson size "$size" \
+        '.artifacts|=map(if .name=="a.tar.gz" or .name=="compat.tar.gz" then .sha256=$hash|.size_bytes=$size else . end)' \
+        "$MANIFEST" > "$CASE/build-next.json"
+    cp "$CASE/build-next.json" "$MANIFEST"
+}
+
+# Reuse the explicit transport/cryptographic fixtures in orchestration tests.
+if [[ "${RI_HARNESS_ONLY:-false}" == true && "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
+
 new_case complete
 capture prepare
 check 'all payloads and aliases produce a signed bundle' test "$status" -eq 0
@@ -225,6 +238,12 @@ new_case wrong-key
 capture call prepare --secret-key "$WORK/wrong-private"
 check 'wrong private key rejected by real Ed25519 verification' nonzero "$status"
 check 'wrong private key publishes nothing' no_public_proofs
+new_case private-payload
+fixture_private_payload
+capture call prepare --secret-key "$ART/compat.tar.gz"
+check 'private key cannot overlap a selected payload even through a hardlink' test "$status" -eq 4
+check 'private-key payload overlap is rejected before signing' test ! -s "$CASE/signs"
+check 'private-key payload overlap publishes no proof files' no_public_proofs
 new_case source-drift
 export RI_SIGN_DRIFT="$ART/a.tar.gz"
 capture prepare

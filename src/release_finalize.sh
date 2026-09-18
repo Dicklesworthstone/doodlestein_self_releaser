@@ -23,6 +23,67 @@ _rf_payload_require() {
     _rup_require
 }
 
+_rf_integrity_require() {
+    if ! declare -F release_publish_integrity >/dev/null; then
+        # shellcheck source=src/release_integrity.sh
+        source "$_RELEASE_FINALIZE_DIR/release_integrity.sh" || return 3
+    fi
+    _ri_require
+}
+
+# Bind the verified signature receipt to the selected key, signed manifest and
+# exact expected asset records. A bare authenticated:true is not a receipt.
+_rf_integrity_key() {
+    local receipt="$1" repo="$2" tag="$3" sha="$4" token="$5" hash="$6" selection="$7" documents="$8" context
+    context=$(_rf_context_key "$receipt" "$repo" "$tag" "$sha") || return 7
+    jq -ecsS --argjson context "$context" --arg token "$token" --arg hash "$hash" \
+        --argjson selection "$selection" --argjson documents "$documents" '
+        def id: type=="number" and .>0 and .<=9007199254740991 and .==floor;
+        ($selection.artifacts+$documents|sort_by(.name)) as $records |
+        if length==1 and (.[0]|. as $r|
+            .schema_version==1 and .kind=="dsr-release-integrity-verification" and
+            .status=="verified" and .authenticated==true and .public_key==$token and
+            .verification_policy=="minisign-all-payloads-and-checksums" and
+            (.manifest|type=="object" and .name=="release-integrity.json" and .sha256==$hash and (.asset_id|id)) and
+            (.assets|type=="array" and all(.[];type=="object" and (.id|id) and .state=="uploaded")) and
+            ((.assets|map(.name)|sort)==($records|map(.name))) and
+            ((.assets|map(.id)|unique|length)==(.assets|length)) and
+            all($records[];. as $p|[$r.assets[]|select(.name==$p.name)] as $a|
+                ($a|length)==1 and $a[0].size==$p.size and
+                ($a[0].digest==null or $a[0].digest=="" or $a[0].digest==("sha256:"+$p.sha256))) and
+            ([.assets[]|select(.name=="release-integrity.json")|.id]==[.manifest.asset_id]))
+        then .[0]|{context:$context,authenticated,verification_policy,public_key,manifest,assets:(.assets|sort_by(.name))}
+        else error("missing or mismatched signature verification evidence") end' <<< "$receipt" 2>/dev/null
+}
+
+# Signature verification authenticates frozen bytes. Rehash those bytes and keep
+# the SBOM payload set identical at later gates; do not repeatedly sign or fetch
+# the whole release before every downstream HTTP retry.
+_rf_integrity_inputs_gate() {
+    [[ -n "${_RF_INTEGRITY_SELECTION:-}" ]] || return 0
+    local work="$1"
+    [[ "$(_rf_hash "$_RF_INTEGRITY_BUILD")" == "$(jq -r '.manifest_sha256' <<< "$_RF_INTEGRITY_SELECTION")" ]] || return 2
+    _ri_local_unchanged "$_RF_INTEGRITY_ROOT" "$_RF_INTEGRITY_OUTPUT" \
+        "$_RF_INTEGRITY_SELECTION" "$_RF_INTEGRITY_DOCUMENTS" "$work"
+}
+
+_rf_integrity_local_gate() {
+    [[ -n "${_RF_INTEGRITY_SELECTION:-}" ]] || return 0
+    local manifest="$1" work="$2" actual expected
+    _rf_integrity_inputs_gate "$work" || return $?
+    actual=$(jq -cS '[.artifacts[].artifact|{name,sha256}]|sort_by(.name)' "$manifest") || return 7
+    expected=$(jq -cS '[.artifacts[]|{name,sha256}]|sort_by(.name)' <<< "$_RF_INTEGRITY_SELECTION") || return 1
+    [[ "$actual" == "$expected" ]] || { _rf_log 'SBOM inventory differs from the signed release'; return 7; }
+}
+
+_rf_integrity_assets_gate() {
+    [[ -n "${_RF_INTEGRITY_ASSETS:-}" ]] || return 0
+    jq -en --argjson current "$1" --argjson pinned "$_RF_INTEGRITY_ASSETS" \
+        'all($pinned[];. as $a|[$current[]|select(.name==$a.name)]==[$a])' >/dev/null || {
+            _rf_log 'Signed release asset identity changed'; return 7;
+        }
+}
+
 # These inputs are scoped by _rf_execute, not taken from caller environment.
 # Keep the generated SBOM set tied to the original successful build throughout
 # promotion and every guarded downstream POST, not just at upload time.
@@ -95,7 +156,9 @@ _rf_evidence_key() {
 _rf_state_valid() {
     jq -es --argjson plan "$2" '
         def digest: type=="string" and test("^[0-9a-f]{64}$");
-        length==1 and (.[0] | type=="object" and .schema_version==1 and
+        def record: type=="object" and (.name|type=="string" and length>0) and (.sha256|digest) and
+            (.size|type=="number" and .>0 and .==floor);
+        length==1 and (.[0] | . as $s | type=="object" and .schema_version==1 and
             .kind=="dsr-release-finalization" and .plan==$plan and
             (.manifest_sha256==null or (.manifest_sha256|digest)) and
             (.verification==null or (.verification|type=="object" and .status=="verified")) and
@@ -103,7 +166,23 @@ _rf_state_valid() {
             (.phase=="preparing" or .phase=="evidence_ready" or .phase=="promoting" or .phase=="published") and
             (if .phase=="preparing" then .verification==null
              else .manifest_sha256!=null and .verification!=null and
-                  .verification.manifest.sha256==.manifest_sha256 end))
+                  .verification.manifest.sha256==.manifest_sha256 end) and
+            (if has("integrity_policy") then
+                (.integrity_policy|type=="object" and .required==true and
+                    (.public_key|type=="string" and test("^[A-Za-z0-9+/]{40,}={0,2}$")) and
+                    (.output_dir|type=="string" and length>0) and
+                    (.selection|type=="object" and (.manifest_sha256|digest))) and
+                (if .integrity_manifest_sha256==null then
+                    .integrity_documents==null and .integrity_verification==null
+                 else (.integrity_manifest_sha256|digest) and
+                    (.integrity_documents|type=="array" and length>0 and all(.[];record)) and
+                    (if .integrity_verification==null then true else
+                        (.integrity_verification|type=="object" and
+                            .kind=="dsr-release-integrity-verification" and .status=="verified" and .authenticated==true and
+                            .public_key==$s.integrity_policy.public_key and
+                            .manifest.sha256==$s.integrity_manifest_sha256) end) end) and
+                (.phase=="preparing" or .integrity_verification!=null)
+             else .integrity_manifest_sha256==null and .integrity_documents==null and .integrity_verification==null end))
     ' "$1" >/dev/null 2>&1
 }
 
@@ -144,6 +223,8 @@ _rf_gate() {
     if [[ -n "${_RF_BUILD_PLAN:-}" ]]; then
         _rup_preflight "$repo" "$inventory" "$_RF_BUILD_PLAN" "$_RF_PAYLOAD_ASSETS" "$work" || return $?
     fi
+    _rf_integrity_local_gate "$manifest" "$work" || return $?
+    _rf_integrity_assets_gate "$inventory"
 }
 
 _rf_promote() {
@@ -194,9 +275,14 @@ _rf_execute() (
     local selected='' handoff=null dispatch_plan='' dispatch_result=null dispatch_rc=0 payload
     local upload_payloads=false build_manifest='' upload_plan=null payload_result=null
     local _RF_PAYLOAD_ROOT='' _RF_BUILD_MANIFEST='' _RF_BUILD_PLAN='' _RF_PAYLOAD_ASSETS=''
+    local require_signatures=false public_key='' secret_key='' integrity_dir='' integrity_token=''
+    local integrity_selection=null integrity_policy=null integrity_result=null integrity_hash='' integrity_key=null
+    local build_snapshot='' build_pin='' public_snapshot='' integrity_documents=''
+    local _RF_INTEGRITY_ROOT='' _RF_INTEGRITY_OUTPUT='' _RF_INTEGRITY_SELECTION='' _RF_INTEGRITY_DOCUMENTS=''
+    local _RF_INTEGRITY_BUILD='' _RF_INTEGRITY_ASSETS=''
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --repo|--tag|--sha|--format|--output-dir|--state-dir|--tool|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--build-manifest)
+            --repo|--tag|--sha|--format|--output-dir|--state-dir|--tool|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--build-manifest|--public-key|--secret-key|--integrity-dir)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --repo) [[ -z "$repo" ]] || return 4; repo="$2" ;;
@@ -210,10 +296,14 @@ _rf_execute() (
                     --dispatch-run-id) [[ -z "$dispatch_run" ]] || return 4; dispatch_run="$2" ;;
                     --dispatch-state-dir) [[ -z "$dispatch_root" ]] || return 4; dispatch_root="$2" ;;
                     --build-manifest) [[ -z "$build_manifest" ]] || return 4; build_manifest="$2" ;;
+                    --public-key) [[ -z "$public_key" ]] || return 4; public_key="$2" ;;
+                    --secret-key) [[ -z "$secret_key" ]] || return 4; secret_key="$2" ;;
+                    --integrity-dir) [[ -z "$integrity_dir" ]] || return 4; integrity_dir="$2" ;;
                 esac
                 shift 2 ;;
             --promote) promote=true; shift ;;
             --upload-payloads) upload_payloads=true; shift ;;
+            --require-signatures) require_signatures=true; shift ;;
             --dry-run|-n) dry=true; shift ;;
             --retry-uncertain) retry_uncertain=true; shift ;;
             -*) _rf_log "Unknown option: $1"; return 4 ;;
@@ -250,16 +340,39 @@ _rf_execute() (
         [[ -z "$tool" || "$tool" == "$(jq -r '.tool' <<< "$upload_plan")" ]] || {
             _rf_log 'Dispatch tool differs from the build manifest'; return 4;
         }
-    elif [[ -n "$build_manifest" ]]; then
-        _rf_log '--build-manifest requires --upload-payloads'; return 4
+    elif [[ -n "$build_manifest" && "$require_signatures" == false ]]; then
+        _rf_log '--build-manifest requires --upload-payloads or --require-signatures'; return 4
+    fi
+    if [[ "$require_signatures" == true ]]; then
+        [[ -n "$build_manifest" && -n "$public_key" ]] || {
+            _rf_log '--require-signatures needs --build-manifest and --public-key'; return 4;
+        }
+        _rf_integrity_require || return $?
+        integrity_token=$(signing_public_key_token "$public_key") || return $?
+        integrity_result=$(release_prepare_integrity "$root" --build-manifest "$build_manifest" \
+            --repo "$repo" --tag "$tag" --sha "$sha" --public-key "$public_key" --dry-run) || return $?
+        integrity_selection=$(jq -ceS --arg token "$integrity_token" \
+            'select(.kind=="dsr-release-integrity-plan" and .status=="planned" and .dry_run==true and .public_key==$token)|.selection' \
+            <<< "$integrity_result") || return 7
+        [[ "$upload_plan" == null || "$upload_plan" == "$integrity_selection" ]] || return 7
+        [[ -z "$tool" || "$tool" == "$(jq -r '.tool' <<< "$integrity_selection")" ]] || return 4
+        [[ -n "$integrity_dir" ]] || integrity_dir="$output_dir"
+        [[ ! -L "$integrity_dir" && "$integrity_dir" != *[[:cntrl:]]* && "$integrity_dir" != *\\* ]] || return 4
+        integrity_result=null
+    elif [[ -n "$public_key$secret_key$integrity_dir" ]]; then
+        _rf_log 'Signing options require --require-signatures'; return 4
     fi
     if [[ "$dry" == true ]]; then
-        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" --argjson upload_plan "$upload_plan" '
+        jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" --argjson upload_plan "$upload_plan" \
+            --argjson signed "$require_signatures" --arg key "$integrity_token" '
             {kind:"dsr-release-finalization-result",status:"planned",dry_run:true,exit_code:0,
              repo:$repo,tag:$tag,expected_sha:$sha,format:$format,promote:$promote,
              dispatch_repos:(if $selected=="" then [] else ($selected|split("\n")) end),
              payload_plan:$upload_plan,
-             stages:(["pin release"]+(if $upload_plan==null then [] else ["upload and verify build payloads"] end)+
+             require_signatures:$signed,public_key:(if $signed then $key else null end),
+             stages:(["pin release"]+(if $signed then ["prepare and verify signed release bundle"] else [] end)+
+                     (if $upload_plan==null then [] else ["upload and verify build payloads"] end)+
+                     (if $signed then ["publish and authenticate payload/checksum signatures"] else [] end)+
                      ["generate or reuse SBOMs","publish and verify evidence",
                      (if $promote then "promote without changing latest" else "retain release mode" end)])}'
         return $?
@@ -288,6 +401,12 @@ _rf_execute() (
     fi
     mkdir -p -- "$output_dir" || return 1
     output_dir=$(cd "$output_dir" && pwd -P) || return 4
+    if [[ "$require_signatures" == true ]]; then
+        mkdir -p -- "$integrity_dir" || return 1
+        integrity_dir=$(cd "$integrity_dir" && pwd -P) || return 4
+        integrity_policy=$(jq -cSn --arg token "$integrity_token" --arg dir "$integrity_dir" --argjson selection "$integrity_selection" \
+            '{required:true,public_key:$token,output_dir:$dir,selection:$selection}') || return 1
+    fi
     [[ -n "$state_dir" ]] || state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-finalize"
     [[ "$state_dir" != *[[:cntrl:]]* && "$state_dir" != *\\* && ! -L "$state_dir" ]] || return 4
     mkdir -p -- "$state_dir" || return 1
@@ -319,6 +438,19 @@ _rf_execute() (
         state=$(cat "$file") || return 1
         [[ "$(_rf_hash "$file")" == "$oldhash" ]] || return 2
     fi
+    saved=$(jq -cS '.integrity_policy // null' <<< "$state") || return 1
+    [[ "$saved" == null || "$saved" == "$integrity_policy" ]] || {
+        _rf_log 'Cannot change or omit the frozen signature policy'; return 2;
+    }
+    if [[ "$integrity_policy" != null && "$saved" == null ]]; then
+        # Adding proof assets changes the immutable inventory in a completed
+        # finalization. Require selecting this policy before that inventory binds.
+        [[ "$(jq -r '.phase' <<< "$state")" == preparing ]] || {
+            _rf_log 'Signature policy must be selected before evidence finalization'; return 2;
+        }
+        state=$(jq -cS --argjson policy "$integrity_policy" '.integrity_policy=$policy' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+    fi
     saved=$(jq -cS '.handoff // null' <<< "$state") || return 1
     [[ "$saved" == null || "$saved" == "$handoff" ]] || {
         _rf_log 'Cannot change or omit the frozen downstream handoff'; return 2;
@@ -331,20 +463,52 @@ _rf_execute() (
     [[ "$saved" == null || "$saved" == "$upload_plan" ]] || {
         _rf_log 'Cannot change or omit the frozen build payload plan'; return 2;
     }
-    if [[ "$upload_payloads" == true ]]; then
-        state=$(jq -cS --argjson selection "$upload_plan" '.payload_plan=$selection' <<< "$state") || return 1
-        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
-        # The uploader must consume the already selected manifest, not a new
-        # build that appeared between the planning read and this invocation.
-        # Keep the original path for later guards, but freeze the input bytes.
-        local build_snapshot build_pin
-        build_pin=$(jq -r '.manifest_sha256' <<< "$upload_plan") || return 1
+    if [[ "$upload_payloads" == true || "$require_signatures" == true ]]; then
+        if [[ "$require_signatures" == true ]]; then
+            build_pin=$(jq -r '.manifest_sha256' <<< "$integrity_selection") || return 1
+        else
+            build_pin=$(jq -r '.manifest_sha256' <<< "$upload_plan") || return 1
+        fi
         [[ "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
         build_snapshot=$(mktemp "$work/build-manifest.XXXXXXXX") || return 1
         cp -- "$build_manifest" "$build_snapshot" || return 1
         chmod 400 "$build_snapshot" || return 1
         [[ "$(_rf_hash "$build_snapshot")" == "$build_pin" &&
            "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
+    fi
+    if [[ "$require_signatures" == true ]]; then
+        # Freeze the selected public token; subsequent mutation of the key file
+        # cannot silently change which key this invocation trusts. Never copy the
+        # secret key into finalization state or public output.
+        public_snapshot="$work/trusted-minisign.pub"
+        printf 'untrusted comment: pinned finalization key\n%s\n' "$integrity_token" > "$public_snapshot" || return 1
+        local -a sign_args=("$root" --build-manifest "$build_snapshot" --repo "$repo" --tag "$tag" --sha "$sha"
+            --public-key "$public_snapshot" --output-dir "$integrity_dir")
+        [[ -z "$secret_key" ]] || sign_args+=(--secret-key "$secret_key")
+        release_prepare_integrity "${sign_args[@]}" > "$work/integrity-prepare.json" || return $?
+        _ri_verify_set "$root" "$integrity_dir" "$repo" "$tag" "$sha" "$integrity_token" "$work" || return $?
+        _ri_matches_selection "$integrity_dir/release-integrity.json" "$integrity_selection" || return 2
+        integrity_hash=$(_rf_hash "$integrity_dir/release-integrity.json") || return $?
+        integrity_documents=$(_ri_documents "$integrity_dir") || return $?
+        saved=$(jq -r '.integrity_manifest_sha256 // ""' <<< "$state") || return 1
+        [[ -z "$saved" || "$saved" == "$integrity_hash" ]] || return 2
+        saved=$(jq -cS '.integrity_documents // null' <<< "$state") || return 1
+        [[ "$saved" == null || "$saved" == "$(jq -cS . <<< "$integrity_documents")" ]] || return 2
+        state=$(jq -cS --arg hash "$integrity_hash" --argjson docs "$integrity_documents" \
+            '.integrity_manifest_sha256=$hash|.integrity_documents=$docs' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+        [[ "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
+        _RF_INTEGRITY_ROOT="$root"; _RF_INTEGRITY_OUTPUT="$integrity_dir"; _RF_INTEGRITY_BUILD="$build_manifest"
+        _RF_INTEGRITY_SELECTION="$integrity_selection"; _RF_INTEGRITY_DOCUMENTS="$integrity_documents"
+    fi
+    if [[ "$upload_payloads" == true ]]; then
+        state=$(jq -cS --argjson selection "$upload_plan" '.payload_plan=$selection' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+        # The uploader must consume the already selected manifest, not a new
+        # build that appeared between the planning read and this invocation.
+        # Keep the original path for later guards, but freeze the input bytes.
+        [[ "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
+        [[ "$(_rf_hash "$build_snapshot")" == "$build_pin" ]] || return 2
         payload_result=$(release_upload_payloads "$root" --build-manifest "$build_snapshot" \
             --repo "$repo" --tag "$tag" --sha "$sha" --state-dir "$session/payloads") || return $?
         jq -es --argjson selection "$upload_plan" 'length==1 and (.[0]|
@@ -361,11 +525,30 @@ _rf_execute() (
         state=$(jq -cS --argjson receipt "$payload_result" '.payload_verification=$receipt' <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
+    if [[ "$require_signatures" == true ]]; then
+        _rf_integrity_inputs_gate "$work" || return $?
+        integrity_result=$(release_publish_integrity "$root" --build-manifest "$build_snapshot" \
+            --repo "$repo" --tag "$tag" --sha "$sha" --public-key "$public_snapshot" \
+            --output-dir "$integrity_dir" --manifest-sha256 "$integrity_hash") || return $?
+        integrity_key=$(_rf_integrity_key "$integrity_result" "$repo" "$tag" "$sha" "$integrity_token" \
+            "$integrity_hash" "$integrity_selection" "$integrity_documents") || return 7
+        [[ "$(jq -cS '.context' <<< "$integrity_key")" == "$context_key" &&
+           "$(jq -r '.release.draft' <<< "$integrity_result")" == "$initial_draft" ]] || return 7
+        saved=$(jq -cS '.integrity_verification // null' <<< "$state") || return 1
+        if [[ "$saved" != null ]]; then
+            [[ "$(_rf_integrity_key "$saved" "$repo" "$tag" "$sha" "$integrity_token" \
+                "$integrity_hash" "$integrity_selection" "$integrity_documents")" == "$integrity_key" ]] || return 7
+        fi
+        _RF_INTEGRITY_ASSETS=$(jq -cS '.assets' <<< "$integrity_key") || return 1
+        state=$(jq -cS --argjson receipt "$integrity_result" '.integrity_verification=$receipt' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
+    fi
     case "$format" in spdx) manifest_name=sbom-manifest.spdx.json ;; *) manifest_name=sbom-manifest.cdx.json ;; esac
     manifest="$output_dir/$manifest_name"
     # This API reuses verified completed inventories without requiring Syft.
     sbom_generate_artifacts "$root" --format "$format" --output-dir "$output_dir" > "$work/scan.out" || return $?
     _rf_payload_gate "$manifest" "$work" || return $?
+    _rf_integrity_local_gate "$manifest" "$work" || return $?
     pin=$(_rf_hash "$manifest") || return $?
     saved=$(jq -r '.manifest_sha256 // ""' <<< "$state") || return 1
     [[ -z "$saved" || "$saved" == "$pin" ]] || { _rf_log 'Local SBOM inventory changed for this release'; return 2; }
@@ -376,6 +559,11 @@ _rf_execute() (
     state=$(jq -cS --arg sha "$pin" '.manifest_sha256=$sha' <<< "$state") || return 1
     oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     [[ "$(_sbr_context "$repo" "$tag" "$work")" == "$context" ]] || { _rf_log 'Release changed before SBOM publication'; return 7; }
+    if [[ "$require_signatures" == true ]]; then
+        local integrity_inventory
+        integrity_inventory=$(_sbr_inventory "$repo" "$(jq -r '.release.id' <<< "$context")" "$work") || return $?
+        _rf_integrity_assets_gate "$integrity_inventory" || return $?
+    fi
     result=$(sbom_publish_artifacts "$root" --repo "$repo" --tag "$tag" --format "$format" --output-dir "$output_dir") || return $?
     jq -es 'length==1 and (.[0]|.kind=="dsr-sbom-publication" and .status=="verified" and .dry_run==false)' <<< "$result" >/dev/null || return 7
     verification=$(sbom_verify_release --repo "$repo" --tag "$tag" --format "$format" --manifest-sha256 "$pin") || return $?
@@ -389,10 +577,12 @@ _rf_execute() (
         '.verification=$verification | if .phase=="published" then . else .phase="evidence_ready" end' <<< "$state") || return 1
     oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     if [[ -n "$selected" ]]; then
-        payload=$(jq -nc --arg tool "$tool" --arg tag "$tag" --arg sha "$sha" --arg run "$dispatch_run" --argjson evidence "$evidence" '
+        payload=$(jq -nc --arg tool "$tool" --arg tag "$tag" --arg sha "$sha" --arg run "$dispatch_run" --argjson evidence "$evidence" --argjson integrity "$integrity_key" '
             {tool:$tool,version:$tag,sha:$sha,run_id:$run,
              release_evidence:($evidence|{repository_id:.repository.id,release_id:.release.id,
-                 format,manifest,artifact_count,asset_inventory_sha256,verification_policy})}') || return 1
+                 format,manifest,artifact_count,asset_inventory_sha256,verification_policy})} |
+            if $integrity==null then . else
+                .release_evidence.integrity=($integrity|{verification_policy,public_key,manifest}) end') || return 1
         dispatch_plan=$(_dp_release_plan "${repo,,}" "$selected" "$payload") || return $?
         _rf_dispatch_preflight "$dispatch_plan" "$dispatch_root" || return $?
     fi
@@ -414,6 +604,18 @@ _rf_execute() (
             _rf_log 'Promotion did not yield the expected published release; retry rechecks remote state'; return 7;
         }
         initial_draft=false
+    fi
+    if [[ "$require_signatures" == true ]]; then
+        # Independently authenticate the final remote bytes again after SBOM
+        # publication and any draft promotion, then pin the same verified IDs
+        # throughout downstream handoff. No fallback to unsigned completion.
+        integrity_result=$(release_verify_remote_integrity --repo "$repo" --tag "$tag" --sha "$sha" \
+            --public-key "$public_snapshot" --manifest-sha256 "$integrity_hash") || return $?
+        [[ "$(_rf_integrity_key "$integrity_result" "$repo" "$tag" "$sha" "$integrity_token" \
+            "$integrity_hash" "$integrity_selection" "$integrity_documents")" == "$integrity_key" &&
+           "$(jq -r '.release.draft' <<< "$integrity_result")" == "$initial_draft" ]] || return 7
+        state=$(jq -cS --argjson receipt "$integrity_result" '.integrity_verification=$receipt' <<< "$state") || return 1
+        oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
     sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" >/dev/null || return $?
     _rf_gate "$repo" "$tag" "$sha" "$evidence" "$initial_draft" "$manifest" "$work" || return $?
@@ -438,10 +640,10 @@ _rf_execute() (
         if ((dispatch_rc == 0)); then status=complete; else status=incomplete; fi
     fi
     jq -nc --arg status "$status" --arg file "$file" --argjson verification "$verification" \
-        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" '
+        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" --argjson integrity "$integrity_result" '
         {kind:"dsr-release-finalization-result",status:$status,exit_code:$exit_code,dry_run:false,
          state_file:$file,promotion_attempted:$attempted,promotion_transport_exit_code:$rc,
-         verification:$verification,dispatch:$dispatch,payloads:$payloads}' || return 1
+         verification:$verification,dispatch:$dispatch,payloads:$payloads,integrity:$integrity}' || return 1
     return "$dispatch_rc"
 )
 
@@ -481,9 +683,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             printf '%s\n' 'Usage: bash src/release_finalize.sh ARTIFACTS --repo OWNER/REPO --tag vVERSION --sha COMMIT' \
                 'Options: --promote --format spdx|cyclonedx --output-dir DIR --state-dir DIR --dry-run' \
                 'Payloads: --upload-payloads --build-manifest FILE (resumable uploads to an existing draft)' \
+                'Signatures: --require-signatures --build-manifest FILE --public-key FILE [--secret-key FILE] [--integrity-dir DIR]' \
                 'Handoff: --tool NAME --dispatch-repos OWNER/A,OWNER/B [--dispatch-run-id ID] [--dispatch-state-dir DIR] [--retry-uncertain]' \
                 'Default: attach and verify SBOMs, retaining draft mode. --promote explicitly publishes the draft.' \
-                'Without --upload-payloads, payloads must already exist. This does not verify signatures or build provenance.' ;;
+                'Without --upload-payloads, payloads must already exist. Signatures require explicit policy; no build-provenance claim.' ;;
         *) release_finalize "$@"; exit $? ;;
     esac
 fi

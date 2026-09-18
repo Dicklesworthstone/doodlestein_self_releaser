@@ -109,6 +109,15 @@ _ri_publish_file() {
 _ri_prepare() (
     local root="$1" manifest="$2" selection="$3" repo="$4" tag="$5" sha="$6"
     local token="$7" private="$8" output="$9" work cleanup name names path sig hash record rows checksum
+    # A misconfigured secret-key path must not also be treated as a release
+    # payload. Compare file identity (including hardlinks) before copying inputs,
+    # publishing proofs or handing the selected set to the binary uploader.
+    names=$(jq -r '.artifacts[].name' <<< "$selection") || return 1
+    while IFS= read -r name; do
+        if [[ -n "$private" && "$private" -ef "$root/$name" ]]; then
+            _ri_log 'Signing key overlaps a selected release payload'; return 4
+        fi
+    done <<< "$names"
     # Staging belongs to the output filesystem; final publication never truncates.
     mkdir -p -- "$output" || return 1
     output=$(cd "$output" && pwd -P) || return 4
@@ -124,7 +133,6 @@ _ri_prepare() (
         return 0
     fi
     mkdir "$work/payloads" "$work/proofs" || return 1
-    names=$(jq -r '.artifacts[].name' <<< "$selection") || return 1
     printf '%s\n' "$selection" > "$work/selection.json" || return 1
     _ri_checksums "$work/selection.json" > "$work/proofs/checksums.sha256" || return 1
     # Snapshot every input and preflight ALL retained signatures before signing.

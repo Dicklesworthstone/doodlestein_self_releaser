@@ -6,6 +6,8 @@ handoff into one recoverable operation. With `--upload-payloads`, it first uploa
 the exact binary/archive set from a successful build manifest. Without that flag,
 release payloads must already be uploaded. The release and its tag must already
 exist; this command does not build binaries or create tags/releases.
+`--require-signatures` additionally prepares and authenticates signed payloads
+and checksums, with a frozen operator-selected key, before allowing promotion.
 
 ```bash
 bash src/release_finalize.sh /path/to/artifacts \
@@ -43,7 +45,8 @@ bash src/release_finalize.sh /path/to/artifacts \
   --tool tool --dispatch-repos owner/checksums,owner/formulas,owner/canaries
 ```
 
-`--upload-payloads` and `--build-manifest` must be supplied together. The manifest
+`--upload-payloads` requires `--build-manifest`. A build manifest can also be
+supplied with `--require-signatures` when payloads already exist. The manifest
 must satisfy the existing complete successful DSR build profile: schema `1.0.0`,
 `status: success`, expected source commit and version, unique named artifacts with
 SHA256 and positive sizes, and consistent successful target coverage. Recorded
@@ -57,8 +60,9 @@ and installer-compatible hardlink names remain distinct assets. Selection uses
 the existing SBOM payload policy, excluding text/JSON/checksum/signature metadata.
 This stage uploads only those manifest-selected binaries/archives, **not** the
 private build manifest, local upload state, checksum files, or signature sidecars.
-Arrange separately required signing/checksum publication before finalization;
-this option is not a substitute for those policies.
+Use the explicit `--require-signatures` policy below to prepare, publish and
+verify the signed checksum/payload bundle in the same finalization invocation.
+The payload-upload option alone is not a substitute for that policy.
 
 Before the first upload, every selected file is hashed and copied into a private
 snapshot. Temporary free space must accommodate the complete selected payload
@@ -116,6 +120,48 @@ execution. Upload state is trusted local recovery information. Local and remote
 checks narrow observed change windows; they cannot form a transaction across the
 filesystem, GitHub, and downstream receivers. Existing signature/provenance trust
 boundaries below still apply.
+
+## Required payload and checksum signatures
+
+```bash
+bash src/release_finalize.sh /path/to/artifacts \
+  --repo owner/tool --tag v1.2.3 --sha FULL_40_CHARACTER_COMMIT \
+  --upload-payloads --build-manifest /path/to/build-manifest.json \
+  --require-signatures --public-key /path/to/trusted-minisign.pub \
+  --secret-key /path/to/minisign.key --integrity-dir /path/to/integrity \
+  --output-dir /path/to/sbom-metadata --promote
+```
+
+This policy signs every payload, canonical `checksums.sha256`, and a sanitized
+`release-integrity.json` binding repository/tag/commit and the complete named
+signature set. All signatures are staged and verified before any binary upload.
+After payloads exist, missing integrity assets are uploaded to the draft, and an
+independent verifier downloads and authenticates every payload and signature.
+The master manifest signature is published last. Complete local bundles can be
+reused without the private key; partial remote publication resumes missing work.
+
+The selected public-key token, build selection and proof hashes are frozen in
+finalization state. A retry cannot remove the requirement, switch keys, change
+the signed set or reinterpret damaged signed state as unsigned. The same payload
+set must appear in the SBOM inventory. Signature assets and local proof hashes
+remain pinned through promotion and guarded dispatch; the complete remote signed
+set is independently verified again after any promotion. Downstream evidence
+includes the selected key and signed manifest reference, but receivers must use
+their own trusted-key policy rather than trusting a delivered key automatically.
+
+`--secret-key` is optional and otherwise uses the signing module configuration.
+`--integrity-dir` defaults to the SBOM output directory. A public-key file and
+build manifest are mandatory when signatures are required, including when the
+binary-upload stage is omitted. Select this policy before evidence finalization;
+it cannot be bolted onto an already-bound unsigned finalization by changing the
+saved inventory. Missing proofs are never added to a published release.
+
+Successful results include a separate `integrity` receipt. This authenticates
+payload bytes, checksums and the selected release identity, not build execution
+or the contents of the unsigned SBOM documents. A late failure leaves existing
+uploads or an already-public release intact and returns nonzero without unsigned
+fallback. See [RELEASE_INTEGRITY.md](RELEASE_INTEGRITY.md) for standalone commands,
+retry rules, resource requirements and the precise trust boundary.
 
 ## Verified downstream handoff
 
@@ -217,9 +263,11 @@ A complete local inventory requires Syft only when scans are missing. Runtime
 requirements include Bash 4+, jq, SHA256 tooling, `flock`, and the existing GitHub
 transport dependencies. Publishing a draft requires the GitHub CLI (`gh`).
 
-The evidence establishes equality with the selected inventory, not cryptographic
-signature validity, scanner completeness, freedom from vulnerabilities, or build
-provenance. Do the required signing/provenance checks separately. A published
+Without `--require-signatures`, evidence establishes equality with the selected
+inventory, not cryptographic authenticity. With it, the signed payload/checksum
+bundle is authenticated against the independently selected Minisign key. Neither
+mode establishes scanner completeness, freedom from vulnerabilities, or build
+provenance; SBOM documents are not signed by this bundle. A published
 release can remain published even when a later check fails; the finalizer never
 deletes assets, rolls back the release, or conceals a partial external outcome.
 
@@ -227,6 +275,8 @@ deletes assets, rolls back the release, or conceals a partial external outcome.
 bash scripts/tests/test_release_finalize.sh
 bash scripts/tests/test_release_payloads.sh
 bash scripts/tests/test_release_payload_pipeline.sh
+bash scripts/tests/test_release_integrity.sh
+bash scripts/tests/test_release_integrity_finalize.sh
 ```
 
 This regression suite uses the production finalizer and dispatch outbox with real
@@ -244,3 +294,11 @@ guard used by dispatch. GitHub transport, SBOM creation/publication and downstre
 delivery are explicit fixtures; the existing finalizer suite separately exercises
 the production dispatch outbox. These tests do not assert live GitHub behavior or
 cryptographic verification.
+
+The integrity suites exercise real Ed25519/Blake2b verification through an
+explicit Python reference Minisign adapter, with optional native interoperability
+when Minisign is installed. The signed finalization suite runs the production
+finalizer and integrity module; SBOM generation, payload-upload orchestration,
+dispatch and GitHub transport are explicit subsystem fixtures. It verifies
+policy preservation, stage-change rejection, partial recovery and competing
+finalizers without accessing production keys or live releases.
