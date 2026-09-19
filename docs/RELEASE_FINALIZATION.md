@@ -4,8 +4,9 @@
 metadata publisher, remote verifier, draft publication and persistent downstream
 handoff into one recoverable operation. With `--upload-payloads`, it first uploads
 the exact binary/archive set from a successful build manifest. Without that flag,
-release payloads must already be uploaded. The release and its tag must already
-exist; this command does not build binaries or create tags/releases.
+release payloads must already be uploaded. The tag must already exist. Releases
+must also exist unless `--create-draft` explicitly selects recoverable draft
+creation; this command does not build binaries or intentionally create/move tags.
 `--require-signatures` additionally prepares and authenticates signed payloads
 and checksums, with a frozen operator-selected key, before allowing promotion.
 
@@ -32,6 +33,94 @@ the artifact directory. The generator's verified retry path reuses finished SBOM
 without requiring another Syft scan. `--dry-run` (or `DRY_RUN=true`) validates
 arguments and prints a plan without authentication, API calls, scans or persistent
 state creation. A plan is not a verification result.
+
+## Create the draft in the verified pipeline
+
+The verified path can start with a successful local build and an existing tag,
+without manually creating a GitHub release first:
+
+```bash
+bash src/release_finalize.sh /path/to/artifacts \
+  --repo owner/tool --tag v1.2.3 --sha FULL_40_CHARACTER_COMMIT \
+  --create-draft --upload-payloads --build-manifest /path/to/build-manifest.json \
+  --release-name 'Tool v1.2.3' --release-notes-file /path/to/release-notes.md \
+  --require-signatures --public-key /path/to/trusted-minisign.pub \
+  --secret-key /path/to/minisign.key --integrity-dir /path/to/integrity \
+  --output-dir /path/to/sbom-metadata --promote
+```
+
+`--create-draft` requires the manifest-bound upload stage. It does not imply
+`--promote`, signing, or downstream delivery: those policies remain explicit.
+Omitting `--promote` leaves the verified release as a draft. Adding downstream
+destinations while creating a draft requires `--promote`. Both signing modes,
+including `--prepared-signatures`, compose with this option.
+
+Drafts use the selected full commit, `draft: true`, and `make_latest: "false"`.
+`--release-name` defaults to the tag; notes default to an empty body.
+`--release-notes-file` selects a text file of at most 64 KiB, with trailing newlines
+preserved. The finalizer snapshots the planned note text so a later file change
+cannot silently change the creation request. `--prerelease` explicitly selects
+prerelease mode; otherwise it is false. These metadata options are rejected
+without `--create-draft`, rather than ignored. Generated release notes are not
+requested because the recovery plan must describe an exact request.
+
+The tag must resolve to the selected SHA. Repository identity and complete,
+uncached release listings are checked before creation. A matching existing draft
+can be reused without editing it. A published release not already bound by the
+preparation state is not adopted. Duplicate tags/releases, malformed pagination,
+changed notes/title/prerelease mode, or a moved tag fail closed. Read failures are
+not interpreted as evidence that a release is missing.
+
+The finalizer's lock covers draft creation as well as subsequent stages. The
+preparation engine records the exact request and sending intent before issuing
+one POST, then independently re-reads the release. A lost acknowledgement can
+therefore be recovered without another POST. If the outcome remains uncertain,
+normal retries do not recreate the draft. Inspect GitHub before adding
+`--retry-creation`; this is distinct from `--retry-uncertain`, which authorizes
+uncertain downstream event delivery. Neither flag authorizes the other kind of
+retry. A previously observed release that disappears is a conflict, not permission
+to replace it. Retained finalization state also forces existing-only reconciliation,
+even if its nested preparation state has been lost.
+
+Preparation state lives in `preparation/` under the private finalization session.
+Once finalization state is bound, its creation plan cannot be changed, added or
+omitted on retry. The created release identity is passed into the existing payload,
+signature, SBOM and promotion gates, and rechecked before payload publication.
+Successful results include a `preparation` receipt with the request, release
+identity, creation-attempt count and state path. This records the preparation
+stage; the separate final `verification` receipt describes the release after any
+promotion. Earlier failures retain preparation state for the same-command retry.
+
+Local payload validation and prepared-only signature authentication occur before
+creation. Actual signing in `--require-signatures` mode occurs afterward but before
+binary upload: a signing failure may leave an empty draft, never an unsigned
+published release. Later failures do not delete the draft or completed assets.
+
+This is not a distributed exactly-once transaction. Cooperating processes sharing
+the state directory are serialized; unrelated machines and other GitHub writers
+can race. Independent reads detect observed conflicts but cannot make a read and
+POST atomic. The GitHub release API can create a missing tag from `target_commitish`;
+if another writer deletes the already-verified tag during that window, GitHub may
+recreate it at the explicitly selected SHA. No Git-ref creation or mutation API is
+called by this module. State must remain trusted, private local storage; atomic
+replacement is not a power-loss durability guarantee.
+
+The preparation stage is independently usable without artifacts or scans:
+
+```bash
+bash src/release_prepare.sh \
+  --repo owner/tool --tag v1.2.3 --sha FULL_40_CHARACTER_COMMIT \
+  --name 'Tool v1.2.3' --notes-file /path/to/release-notes.md
+```
+
+Its sourced API is `release_prepare`. Standalone `--state-dir` defaults to
+`${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-prepare`.
+Standalone `--retry-uncertain` corresponds to integrated `--retry-creation`.
+`--existing-only` forbids a creation POST even when no preparation state exists.
+`--dry-run` validates local arguments and notes without authentication, remote
+reads or persistent state. A prepared receipt is not verification of release
+assets, signatures or build provenance. Live preparation requires Bash 4+, Git,
+jq, SHA256 tooling, `flock`, `gh` and credentials with repository write access.
 
 ## Optional manifest-bound payload uploads
 
@@ -277,6 +366,8 @@ bash scripts/tests/test_release_payloads.sh
 bash scripts/tests/test_release_payload_pipeline.sh
 bash scripts/tests/test_release_integrity.sh
 bash scripts/tests/test_release_integrity_finalize.sh
+bash scripts/tests/test_release_prepare.sh
+bash scripts/tests/test_release_prepare_finalize.sh
 ```
 
 This regression suite uses the production finalizer and dispatch outbox with real
@@ -302,3 +393,12 @@ finalizer and integrity module; SBOM generation, payload-upload orchestration,
 dispatch and GitHub transport are explicit subsystem fixtures. It verifies
 policy preservation, stage-change rejection, partial recovery and competing
 finalizers without accessing production keys or live releases.
+
+The preparation suites execute the production preparation and finalization state
+machines with real JSON, hashing, locks, files and competing processes. They cover
+lost creation acknowledgements, uncertainty, source/metadata drift, failed later
+stages, existing-release compatibility and recovery after promotion. GitHub reads,
+tag resolution, authentication and transport timeouts are fixtures. In the new
+integrated suite, payload, SBOM and dispatch boundaries are also fixtures over
+local/simulated-remote files. Signature fixtures deliberately fail to check stage
+ordering; these tests do not claim successful cryptographic verification.

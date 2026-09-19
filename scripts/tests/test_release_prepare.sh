@@ -38,6 +38,16 @@ _sbr_api() {
     esac
 }
 gh() {
+    if [[ "${5:-}" == PATCH ]]; then
+        [[ "$1 $2 $3 $4 $5 $6 $7" == 'api --hostname github.com --method PATCH repos/acme/tool/releases/42 --input' ]] || return 98
+        jq -e '.=={draft:false,make_latest:"false"}' "$8" >/dev/null || return 98
+        printf 'PATCH\n' >> "$CASE/calls"
+        [[ ! -e "$CASE/patch-fail" ]] || return 8
+        mutate "$CASE/release" '.draft=false' || return 1
+        [[ ! -e "$CASE/patch-lost" ]] || return 8
+        cat "$CASE/release"
+        return
+    fi
     [[ "$1 $2 $3 $4 $5 $6 $7" == 'api --hostname github.com --method POST repos/acme/tool/releases --input' ]] || return 98
     printf 'POST\n' >> "$CASE/calls"
     cp "$8" "$CASE/request"
@@ -67,7 +77,7 @@ run() {
 }
 check() {
     TOTAL=$((TOTAL+1))
-    if "$@"; then PASSED=$((PASSED+1)); else
+    if "$@"; then PASSED=$((PASSED+1)); printf 'ok %s - %s\n' "$TOTAL" "$*"; else
         FAILED=$((FAILED+1)); printf 'FAIL %s: %s (rc=%s)\n%s\n' "$TOTAL" "$*" "$RC" "$OUT" >&2
         cat "$CASE/diagnostics" >&2 2>/dev/null || true
     fi
@@ -81,6 +91,19 @@ mutate() {
     tmp=$(mktemp "$CASE/mutation.XXXXXXXX")
     jq "$expression" "$file" > "$tmp" && mv "$tmp" "$file"
 }
+
+[[ "${DSR_PREPARE_FIXTURES_ONLY:-false}" != true ]] || return 0
+
+new_case
+run --existing-only
+check assert_rc 2
+check posts 0
+run
+check assert_rc 0
+run --existing-only
+check assert_rc 0
+check posts 1
+check json '.[0].plan.request.draft and .[0].plan.repo=="acme/tool"'
 
 new_case
 run --dry-run

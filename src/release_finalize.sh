@@ -23,6 +23,13 @@ _rf_payload_require() {
     _rup_require
 }
 
+_rf_prepare_require() {
+    if ! declare -F release_prepare >/dev/null; then
+        # shellcheck source=src/release_prepare.sh
+        source "$_RELEASE_FINALIZE_DIR/release_prepare.sh" || return 3
+    fi
+}
+
 _rf_integrity_require() {
     if ! declare -F release_publish_integrity >/dev/null; then
         # shellcheck source=src/release_integrity.sh
@@ -214,6 +221,17 @@ _rf_state_valid() {
             (if .phase=="preparing" then .verification==null
              else .manifest_sha256!=null and .verification!=null and
                   .verification.manifest.sha256==.manifest_sha256 end) and
+            (if has("preparation_plan") then
+                (.preparation_plan|type=="object" and .repo==$s.plan.context.repository.full_name and
+                    (.request|type=="object" and .tag_name==$s.plan.context.release.tag_name and
+                        .target_commitish==$s.plan.context.tag_commit and .draft==true and .make_latest=="false" and
+                        .prerelease==$s.plan.context.release.prerelease and
+                        (.name|type=="string" and length>0) and (.body|type=="string"))) and
+                (.preparation|type=="object" and .kind=="dsr-release-preparation-result" and
+                    .status=="prepared" and .exit_code==0 and .dry_run==false and .plan==$s.preparation_plan and
+                    (.context|del(.release.draft))==$s.plan.context and
+                    (.context.release.draft|type=="boolean"))
+             else .preparation==null end) and
             (if has("integrity_policy") then
                 (.integrity_policy|type=="object" and .required==true and
                     ((has("mode")|not) or .mode=="prepared") and
@@ -330,9 +348,12 @@ _rf_execute() (
     local _RF_INTEGRITY_BUILD='' _RF_INTEGRITY_ASSETS=''
     local prepared_signatures=false prepared_plan=null integrity_snapshot='' integrity_work=''
     local _RF_PREPARED_PUBLIC_KEY='' _RF_PREPARED_TOKEN=''
+    local create_draft=false release_name='' release_notes='' prerelease=false retry_creation=false
+    local preparation_plan=null preparation_result=null preparation_notes=''
+    local -a preparation_args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --repo|--tag|--sha|--format|--output-dir|--state-dir|--tool|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--build-manifest|--public-key|--secret-key|--integrity-dir)
+            --repo|--tag|--sha|--format|--output-dir|--state-dir|--tool|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--build-manifest|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --repo) [[ -z "$repo" ]] || return 4; repo="$2" ;;
@@ -349,9 +370,14 @@ _rf_execute() (
                     --public-key) [[ -z "$public_key" ]] || return 4; public_key="$2" ;;
                     --secret-key) [[ -z "$secret_key" ]] || return 4; secret_key="$2" ;;
                     --integrity-dir) [[ -z "$integrity_dir" ]] || return 4; integrity_dir="$2" ;;
+                    --release-name) [[ -z "$release_name" ]] || return 4; release_name="$2" ;;
+                    --release-notes-file) [[ -z "$release_notes" ]] || return 4; release_notes="$2" ;;
                 esac
                 shift 2 ;;
             --promote) promote=true; shift ;;
+            --create-draft) create_draft=true; shift ;;
+            --prerelease) prerelease=true; shift ;;
+            --retry-creation) retry_creation=true; shift ;;
             --upload-payloads) upload_payloads=true; shift ;;
             --require-signatures) require_signatures=true; shift ;;
             --prepared-signatures) prepared_signatures=true; shift ;;
@@ -432,16 +458,35 @@ _rf_execute() (
     elif [[ -n "$public_key$secret_key$integrity_dir" ]]; then
         _rf_log 'Signing options require --require-signatures'; return 4
     fi
+    if [[ "$create_draft" == true ]]; then
+        [[ "$upload_payloads" == true ]] || { _rf_log '--create-draft requires --upload-payloads and --build-manifest'; return 4; }
+        [[ -z "$selected" || "$promote" == true ]] || { _rf_log 'Creating a draft for dispatch requires --promote'; return 4; }
+        _rf_prepare_require || return $?
+        preparation_args=(--repo "$repo" --tag "$tag" --sha "$sha")
+        [[ -z "$release_name" ]] || preparation_args+=(--name "$release_name")
+        [[ -z "$release_notes" ]] || preparation_args+=(--notes-file "$release_notes")
+        [[ "$prerelease" == false ]] || preparation_args+=(--prerelease)
+        preparation_result=$(release_prepare "${preparation_args[@]}" \
+            --state-dir "${state_dir:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-finalize}" --dry-run) || return $?
+        preparation_plan=$(jq -ecsS 'if length==1 and (.[0]|.kind=="dsr-release-preparation-result" and
+            .status=="planned" and .dry_run==true and .exit_code==0) then .[0].plan else error("invalid draft plan") end' \
+            <<< "$preparation_result") || return 7
+        preparation_result=null
+    elif [[ -n "$release_name$release_notes" || "$prerelease" == true || "$retry_creation" == true ]]; then
+        _rf_log 'Draft metadata and --retry-creation require --create-draft'; return 4
+    fi
     if [[ "$dry" == true ]]; then
         jq -nc --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg format "$format" --argjson promote "$promote" --arg selected "$selected" --argjson upload_plan "$upload_plan" \
-            --argjson signed "$require_signatures" --argjson prepared "$prepared_signatures" --arg key "$integrity_token" '
+            --argjson signed "$require_signatures" --argjson prepared "$prepared_signatures" --arg key "$integrity_token" --argjson preparation "$preparation_plan" '
             {kind:"dsr-release-finalization-result",status:"planned",dry_run:true,exit_code:0,
              repo:$repo,tag:$tag,expected_sha:$sha,format:$format,promote:$promote,
              dispatch_repos:(if $selected=="" then [] else ($selected|split("\n")) end),
              payload_plan:$upload_plan,
              require_signatures:$signed,public_key:(if $signed then $key else null end),
              prepared_signatures:$prepared,
-             stages:((if $prepared then ["authenticate prepared bundle"] else [] end)+["pin release"]+
+             preparation_plan:$preparation,
+             stages:((if $prepared then ["authenticate prepared bundle"] else [] end)+
+                     (if $preparation==null then [] else ["create or reconcile source-pinned draft"] end)+["pin release"]+
                      (if $signed and ($prepared|not) then ["prepare and verify signed release bundle"] else [] end)+
                      (if $upload_plan==null then [] else ["upload and verify build payloads"] end)+
                      (if $signed then ["publish and authenticate payload/checksum signatures"] else [] end)+
@@ -450,9 +495,55 @@ _rf_execute() (
         return $?
     fi
     command -v flock >/dev/null || { _rf_log 'flock is required'; return 3; }
+    [[ -n "$state_dir" ]] || state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-finalize"
+    [[ "$state_dir" != *[[:cntrl:]]* && "$state_dir" != *\\* && ! -L "$state_dir" ]] || return 4
     _rf_require || return $?
+    # Serialize creation as well as upload/finalization, and inspect retained
+    # state before any create attempt. Never replace an already-bound release.
+    mkdir -p -- "$state_dir" || return 1
+    state_dir=$(cd "$state_dir" && pwd -P) || return 1
+    local session key plan file state oldhash work cleanup manifest_name manifest pin saved result verification evidence bound=''
+    key=$(jq -cSn --arg repo "${repo,,}" --arg tag "$tag" '{repo:$repo,tag:$tag}' | _rf_digest) || return $?
+    session="$state_dir/$key"
+    [[ ! -L "$session" ]] || return 2
+    mkdir -p -- "$session" || return 1
+    [[ ! -L "$session/lock" && ( ! -e "$session/lock" || -f "$session/lock" ) ]] || return 2
+    exec 8>> "$session/lock" || return 1
+    flock -n 8 || { _rf_log 'Release finalization is already active'; return 2; }
+    work=$(mktemp -d "$session/.work.XXXXXXXX") || return 1
+    printf -v cleanup 'rm -rf -- %q' "$work"
+    # shellcheck disable=SC2064
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    file="$session/state.json"
+    oldhash=$(_rf_file_state "$file") || return $?
+    if [[ "$oldhash" != absent ]]; then
+        saved=$(jq -cS .plan "$file") || return 2
+        _rf_state_valid "$file" "$saved" || { _rf_log 'Invalid finalization state'; return 2; }
+        [[ "$(jq -cS '.preparation_plan // null' "$file")" == "$preparation_plan" ]] || {
+            _rf_log 'Cannot change or omit the frozen draft-creation plan'; return 2;
+        }
+        [[ "$(_rf_hash "$file")" == "$oldhash" ]] || return 2
+    fi
     local context context_key initial_draft
-    context=$(_sbr_context "$repo" "$tag" "${TMPDIR:-/tmp}") || return $?
+    if [[ "$create_draft" == true ]]; then
+        # Use the planned note bytes, not a mutable file reread after preflight.
+        preparation_notes="$work/release-notes"
+        jq -jr .request.body <<< "$preparation_plan" > "$preparation_notes" || return 1
+        chmod 400 "$preparation_notes" || return 1
+        preparation_args=(--repo "$repo" --tag "$tag" --sha "$sha" --state-dir "$session/preparation"
+            --name "$(jq -r .request.name <<< "$preparation_plan")" --notes-file "$preparation_notes")
+        [[ "$prerelease" == false ]] || preparation_args+=(--prerelease)
+        [[ "$retry_creation" == false ]] || preparation_args+=(--retry-uncertain)
+        [[ "$oldhash" == absent ]] || preparation_args+=(--existing-only)
+        preparation_result=$(release_prepare "${preparation_args[@]}") || return $?
+        context=$(jq -ecsS --argjson plan "$preparation_plan" 'if length==1 and (.[0]|
+            .kind=="dsr-release-preparation-result" and .status=="prepared" and .exit_code==0 and
+            .dry_run==false and .plan==$plan) then .[0].context else error("invalid draft receipt") end' \
+            <<< "$preparation_result") || return 7
+    else
+        context=$(_sbr_context "$repo" "$tag" "$work") || return $?
+    fi
     context_key=$(_rf_context_key "$context" "$repo" "$tag" "$sha") || {
         _rf_log 'Remote release does not match the selected source commit'; return 7;
     }
@@ -482,31 +573,13 @@ _rf_execute() (
             integrity_policy=$(jq -cS '.mode="prepared"' <<< "$integrity_policy") || return 1
         fi
     fi
-    [[ -n "$state_dir" ]] || state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/release-finalize"
-    [[ "$state_dir" != *[[:cntrl:]]* && "$state_dir" != *\\* && ! -L "$state_dir" ]] || return 4
-    mkdir -p -- "$state_dir" || return 1
-    state_dir=$(cd "$state_dir" && pwd -P) || return 1
-    local session key plan file state oldhash work cleanup manifest_name manifest pin saved result verification evidence bound=''
-    key=$(jq -cSn --arg repo "${repo,,}" --arg tag "$tag" '{repo:$repo,tag:$tag}' | _rf_digest) || return $?
-    session="$state_dir/$key"
-    [[ ! -L "$session" ]] || return 2
-    mkdir -p -- "$session" || return 1
-    [[ ! -L "$session/lock" && ( ! -e "$session/lock" || -f "$session/lock" ) ]] || return 2
-    exec 8>> "$session/lock" || return 1
-    flock -n 8 || { _rf_log 'Release finalization is already active'; return 2; }
-    work=$(mktemp -d "$session/.work.XXXXXXXX") || return 1
-    printf -v cleanup 'rm -rf -- %q' "$work"
-    # shellcheck disable=SC2064
-    trap "$cleanup" EXIT
-    trap 'exit 5' HUP INT TERM
-    file="$session/state.json"
     plan=$(jq -cSn --argjson context "$context_key" --arg root "$root" --arg output "$output_dir" --arg format "$format" \
         '{context:$context,artifacts_dir:$root,output_dir:$output,format:$format}') || return 1
-    oldhash=$(_rf_file_state "$file") || return $?
     if [[ "$oldhash" == absent ]]; then
-        state=$(jq -cSn --argjson plan "$plan" \
+        state=$(jq -cSn --argjson plan "$plan" --argjson preparation "$preparation_plan" --argjson receipt "$preparation_result" \
             '{schema_version:1,kind:"dsr-release-finalization",plan:$plan,manifest_sha256:null,
-              verification:null,promotion_attempts:0,phase:"preparing"}') || return 1
+              verification:null,promotion_attempts:0,phase:"preparing"} |
+             if $preparation==null then . else .+{preparation_plan:$preparation,preparation:$receipt} end') || return 1
         oldhash=$(_rf_save "$file" "$state" absent "$work" "$plan") || return $?
     else
         _rf_state_valid "$file" "$plan" || { _rf_log 'Invalid or conflicting finalization plan'; return 2; }
@@ -597,6 +670,9 @@ _rf_execute() (
         [[ "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
         [[ "$(_rf_hash "$build_snapshot")" == "$build_pin" ]] || return 2
         _rf_integrity_inputs_gate "$work" || return $?
+        [[ "$(_sbr_context "$repo" "$tag" "$work")" == "$context" ]] || {
+            _rf_log 'Release changed before payload publication'; return 7;
+        }
         payload_result=$(release_upload_payloads "$root" --build-manifest "$build_snapshot" \
             --repo "$repo" --tag "$tag" --sha "$sha" --state-dir "$session/payloads") || return $?
         jq -es --argjson selection "$upload_plan" 'length==1 and (.[0]|
@@ -744,10 +820,10 @@ _rf_execute() (
         if ((dispatch_rc == 0)); then status=complete; else status=incomplete; fi
     fi
     jq -nc --arg status "$status" --arg file "$file" --argjson verification "$verification" \
-        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" --argjson integrity "$integrity_result" '
+        --argjson attempted "$promotion_attempted" --argjson rc "$promotion_rc" --argjson dispatch "$dispatch_result" --argjson exit_code "$dispatch_rc" --argjson payloads "$payload_result" --argjson integrity "$integrity_result" --argjson preparation "$preparation_result" '
         {kind:"dsr-release-finalization-result",status:$status,exit_code:$exit_code,dry_run:false,
          state_file:$file,promotion_attempted:$attempted,promotion_transport_exit_code:$rc,
-         verification:$verification,dispatch:$dispatch,payloads:$payloads,integrity:$integrity}' || return 1
+         verification:$verification,dispatch:$dispatch,payloads:$payloads,integrity:$integrity,preparation:$preparation}' || return 1
     return "$dispatch_rc"
 )
 
@@ -786,6 +862,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         --help|-h|'')
             printf '%s\n' 'Usage: bash src/release_finalize.sh ARTIFACTS --repo OWNER/REPO --tag vVERSION --sha COMMIT' \
                 'Options: --promote --format spdx|cyclonedx --output-dir DIR --state-dir DIR --dry-run' \
+                'Draft creation: --create-draft --upload-payloads --build-manifest FILE [--release-name TITLE] [--release-notes-file FILE] [--prerelease] [--retry-creation]' \
                 'Payloads: --upload-payloads --build-manifest FILE (resumable uploads to an existing draft)' \
                 'Signatures: --require-signatures --build-manifest FILE --public-key FILE [--secret-key FILE] [--integrity-dir DIR]' \
                 'Prepared only: --prepared-signatures --integrity-dir DIR --public-key FILE (never signs; build manifest optional unless uploading)' \

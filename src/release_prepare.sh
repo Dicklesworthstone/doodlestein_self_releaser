@@ -145,6 +145,7 @@ _rp_post() {
 _rp_execute() (
     set -uo pipefail
     local repo='' tag='' sha='' name='' notes='' root='' retry=false dry="${DRY_RUN:-false}" prerelease=false
+    local existing_only=false
     local -A seen=()
     while (($#)); do
         [[ -z "${seen[$1]:-}" ]] || { _rp_log "Repeated option: $1"; return 4; }
@@ -159,6 +160,7 @@ _rp_execute() (
                 shift 2 ;;
             --prerelease) prerelease=true; shift ;;
             --retry-uncertain) retry=true; shift ;;
+            --existing-only) existing_only=true; shift ;;
             --dry-run) dry=true; shift ;;
             *) _rp_log "Unknown option: $1"; return 4 ;;
         esac
@@ -219,6 +221,9 @@ _rp_execute() (
     fi
     id=$(_rp_find "$repo" "$tag") || return $?
     if [[ "$id" == null ]]; then
+        [[ "$existing_only" == false ]] || {
+            _rp_log 'A bound finalization requires an existing release; refusing creation'; return 2;
+        }
         [[ "$(jq -r '.context==null and .candidate_id==null' <<< "$state")" == true ]] || {
             _rp_log 'A previously observed release disappeared; refusing replacement'; return 2;
         }
@@ -268,9 +273,9 @@ _rp_execute() (
        "$(_rp_context "$plan" "$source" "$id")" == "$context" ]] || return 7
     state=$(jq -cS --argjson context "$context" '.phase="prepared"|.context=$context' <<< "$state") || return 1
     old=$(_rp_save "$file" "$state" "$old" "$plan") || return $?
-    jq -cn --argjson context "$context" --argjson attempts "$(jq -r .attempts <<< "$state")" --arg file "$file" \
+    jq -cn --argjson plan "$plan" --argjson context "$context" --argjson attempts "$(jq -r .attempts <<< "$state")" --arg file "$file" \
         '{kind:"dsr-release-preparation-result",status:"prepared",exit_code:0,dry_run:false,
-            context:$context,creation_attempts:$attempts,state_file:$file}'
+            plan:$plan,context:$context,creation_attempts:$attempts,state_file:$file}'
 )
 
 release_prepare() (
@@ -288,7 +293,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
         --help|-h|'')
             printf '%s\n' 'Usage: bash src/release_prepare.sh --repo OWNER/REPO --tag TAG --sha FULL_COMMIT' \
-                'Options: --name TITLE --notes-file FILE --prerelease --state-dir DIR --dry-run --retry-uncertain' \
+                'Options: --name TITLE --notes-file FILE --prerelease --state-dir DIR --dry-run --retry-uncertain --existing-only' \
                 'Requires an existing source-pinned tag. Creates drafts only; never publishes or edits releases.' >&2 ;;
         *) release_prepare "$@"; exit $? ;;
     esac
