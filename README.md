@@ -225,6 +225,38 @@ useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
+Strict native Unix Rust builds can opt into a host-local intermediate cache with
+`strict_cargo_cache_root: /absolute/private/cache` in the repository build config.
+The operator must create that canonical directory owned by the build user with
+mode 0700; symlink and writable ancestor paths are refused. This requires Python
+3.11+ and Cargo 1.91.1+ (`build.build-dir`). Windows and ordinary builds reject
+this option. No active build configuration is changed automatically.
+
+DSR still builds the immutable source snapshot with an isolated Cargo home and a
+fresh final target directory. A namespace includes the tool, target, configured
+command, profile, compiler identities, build environment, and macOS SDK settings.
+Cargo checks source/dependency freshness across releases. An exclusive lock
+covers the complete build command and detachment of hard-linked final outputs;
+contention fails explicitly. Artifact collection uses only the private run's
+outputs, never the shared intermediates, and requires a successful build/cache
+receipt. Existing source, family, signature, and test gates remain mandatory.
+The cache is trusted build-host state, not independent source provenance. Retain
+its directory between runs; DSR does not prune it. Benefit must be measured as
+dependency reuse: final linking and test execution are not skipped.
+The receipt hashes resolved Cargo/rustc executables separately from launch
+wrappers. SDK settings/Xcode identity and configured native tool hashes are
+namespace inputs; this is not a recursive digest of SDK headers or the Rust
+sysroot. Those installations must remain immutable during cache use; replace
+the private cache root when modifying their bytes in place without changing
+their recorded identities.
+Unknown Cargo/rustc launcher scripts are refused even if their version output
+matches. Explicit `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` are unsupported
+with caching; omit the cache option for recipes requiring those wrappers.
+The reviewed RCH shim v4/toolchain wrapper v3 bytes are accepted only with the
+native bypass and without real-executable overrides; upgrades require review.
+For default Apple C/C++ launchers, the receipt also hashes the actual clang
+selected by `xcrun --find`, rather than treating `/usr/bin/cc` as that compiler.
+
 Windows Rust source staging uses Robocopy with eight copy threads to avoid the
 per-file PowerShell overhead on large dependency trees. It preserves empty
 directories, file attributes, timestamps, and links without following link targets.
@@ -767,7 +799,8 @@ the frozen receipt and blocks publication or verification.
 
 - **Not a CI/CD replacement** — It's a fallback for when GH Actions is slow, not a complete build system
 - **No hosted runners** — You need your own machines for macOS/Windows builds
-- **No caching** — Each build starts fresh (act has some layer caching)
+- **Caching is opt-in** — Strict Unix Rust builds may reuse intermediates as
+  described above; other builds start fresh (act has some layer caching).
 
 ### Known Limitations
 

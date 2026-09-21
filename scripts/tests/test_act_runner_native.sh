@@ -12,6 +12,130 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
 
+# Retained, non-destructive cache tests. The compilation lane must be invoked
+# through RCH/DSR; the ordinary lane runs no compiler or build command.
+if [[ "${1:-}" == --strict-cargo-cache-tests || "${1:-}" == --strict-cargo-cache-cargo-tests ]]; then
+    source "$SRC_DIR/act_runner.sh"
+    # Matches the native host launcher; the Cargo test mode belongs on RCH/DSR.
+    export RCH_CARGO_WRAPPER_BYPASS=1 RCH_DISABLED=1
+    cache_test_root=$(mktemp -d /var/tmp/dsr-cargo-cache-test.XXXXXXXX) || exit 1
+    cache_test_root=$(cd "$cache_test_root" && pwd -P)
+    printf 'Retained cache fixture: %s\n' "$cache_test_root"
+    mkdir -m 700 "$cache_test_root/cache" "$cache_test_root/source" || exit 1
+    printf '[package]\nname="cache_probe"\nversion="0.1.0"\nedition="2021"\n' > "$cache_test_root/source/Cargo.toml"
+    cache_contract='{"tool":"cache-test","platform":"native","profile":"dev","command":"fixture"}'
+    cache_run() (
+        cd "$cache_test_root/source" || exit 1
+        export CARGO_TARGET_DIR="$cache_test_root/$1"
+        bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/cache" "$cache_contract" "$2")"
+    )
+    if [[ "$1" == --strict-cargo-cache-cargo-tests ]]; then
+        mkdir -p "$cache_test_root/dep/src" "$cache_test_root/source/src" || exit 1
+        cat > "$cache_test_root/dep/Cargo.toml" <<'EOF'
+[package]
+name="cache_dep"
+version="0.1.0"
+edition="2021"
+EOF
+        printf 'pub fn value() -> u32 { 42 }\n' > "$cache_test_root/dep/src/lib.rs"
+        printf '\n[dependencies]\ncache_dep={path="../dep"}\n' >> "$cache_test_root/source/Cargo.toml"
+        printf 'fn main() { println!("first:{}", cache_dep::value()); }\n' > "$cache_test_root/source/src/main.rs"
+        cache_run first 'cargo build --offline --message-format=json' > "$cache_test_root/first.jsonl" || exit 1
+        [[ "$("$cache_test_root/first/debug/cache_probe")" == first:42 ]] || exit 1
+        # A distinct immutable source path; the stable dependency simulates the
+        # unchanged registry source, while first-party source must be recompiled.
+        cp -R "$cache_test_root/source" "$cache_test_root/second-source" || exit 1
+        printf 'fn main() { println!("second:{}", cache_dep::value()); }\n' > "$cache_test_root/second-source/src/main.rs"
+        (
+            cd "$cache_test_root/second-source" || exit 1
+            export CARGO_TARGET_DIR="$cache_test_root/second"
+            bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/cache" "$cache_contract" 'cargo build --offline --message-format=json')"
+        ) > "$cache_test_root/second.jsonl" || exit 1
+        [[ "$("$cache_test_root/second/debug/cache_probe")" == second:42 ]] || exit 1
+        python3 - "$cache_test_root/second.jsonl" <<'PY' || exit 1
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.startswith('{')]
+assert any(row.get('reason') == 'compiler-artifact' and row['target']['name'] == 'cache_dep' and row['fresh'] for row in rows)
+assert any(row.get('reason') == 'compiler-artifact' and row['target']['name'] == 'cache_probe' and not row['fresh'] for row in rows)
+PY
+        cp -R "$cache_test_root/source" "$cache_test_root/invalid-source" || exit 1
+        printf 'compile_error!("planted cache stale-output refusal");\n' > "$cache_test_root/invalid-source/src/main.rs"
+        if (
+            cd "$cache_test_root/invalid-source" || exit 1
+            export CARGO_TARGET_DIR="$cache_test_root/failed"
+            bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/cache" "$cache_contract" 'cargo build --offline --message-format=json')"
+        ) > "$cache_test_root/failed.jsonl"; then
+            echo 'FAIL: invalid source accepted' >&2; exit 1
+        fi
+        [[ ! -e "$cache_test_root/failed/debug/cache_probe" && ! -e "$cache_test_root/failed.cache-receipt.json" ]] || exit 1
+        [[ "$("$cache_test_root/first/debug/cache_probe")" == first:42 ]] || exit 1
+        echo 'PASS: actual two-source dependency reuse, changed marker, failed-build stale-output refusal'
+        exit 0
+    fi
+    cache_run first 'mkdir -p "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"; printf first > "$CARGO_BUILD_BUILD_DIR/shared"; ln "$CARGO_BUILD_BUILD_DIR/shared" "$CARGO_TARGET_DIR/result"' || exit 1
+    python3 - "$cache_test_root" <<'PY' || exit 1
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+receipt = json.loads((root / 'first.cache-receipt.json').read_text())
+assert (root / 'first/result').stat().st_nlink == 1
+(pathlib.Path(receipt['build_dir']) / 'shared').write_text('changed-cache')
+assert (root / 'first/result').read_text() == 'first'
+PY
+    cache_run same 'mkdir -p "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"' || exit 1
+    (export RUSTFLAGS='--cfg dsr_cache_changed'; cache_run changed 'mkdir -p "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"') || exit 1
+    (cache_contract='{"tool":"cache-test","platform":"native","profile":"dev","command":"changed"}'; cache_run configured 'mkdir -p "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"') || exit 1
+    python3 - "$cache_test_root" <<'PY' || exit 1
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+def key(name):
+    return json.loads((root / (name + '.cache-receipt.json')).read_text())['namespace']
+assert key('first') == key('same')
+assert key('first') != key('changed')
+assert key('first') != key('configured')
+PY
+    cache_run holder 'mkdir -p "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"; touch "$CARGO_TARGET_DIR/ready"; sleep 3' &
+    holder_pid=$!
+    for _ in {1..100}; do
+        [[ -e "$cache_test_root/holder/ready" ]] && break
+        sleep 0.05
+    done
+    [[ -e "$cache_test_root/holder/ready" ]] || exit 1
+    if cache_run contender 'exit 0'; then
+        echo 'FAIL: concurrent custody admitted' >&2; exit 1
+    fi
+    wait "$holder_pid" || exit 1
+    ln -s "$cache_test_root/cache" "$cache_test_root/unsafe" || exit 1
+    if (
+        cd "$cache_test_root/source" || exit 1
+        export CARGO_TARGET_DIR="$cache_test_root/unsafe-target"
+        bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/unsafe" "$cache_contract" 'exit 0')"
+    ); then
+        echo 'FAIL: symlink cache admitted' >&2; exit 1
+    fi
+    if cache_run first 'exit 0'; then
+        echo 'FAIL: nonfresh final target admitted' >&2; exit 1
+    fi
+    mkdir "$cache_test_root/fake-bin" || exit 1
+    # Same version output is insufficient: this unknown launcher injects a
+    # build flag while forwarding version probes unchanged. No build is run.
+    real_launcher=$(command -v cargo)
+    printf '#!/bin/sh\nexport RUSTFLAGS="--cfg injected_by_unknown_wrapper"\nexec "%s" "$@"\n' "$real_launcher" > "$cache_test_root/fake-bin/cargo"
+    chmod 700 "$cache_test_root/fake-bin/cargo" || exit 1
+    if (export PATH="$cache_test_root/fake-bin:$PATH"; cache_run unknown-wrapper 'exit 0'); then
+        echo 'FAIL: same-version unknown compiler script admitted' >&2; exit 1
+    fi
+    [[ ! -e "$cache_test_root/unknown-wrapper.cache-receipt.json" ]] || exit 1
+    if (export RUSTC_WRAPPER="$cache_test_root/fake-bin/cargo"; cache_run rustc-wrapper 'exit 0'); then
+        echo 'FAIL: explicit rustc wrapper admitted' >&2; exit 1
+    fi
+    if cache_run linked-final 'mkdir -p "$CARGO_BUILD_BUILD_DIR"; ln -s "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"'; then
+        echo 'FAIL: linked final target admitted' >&2; exit 1
+    fi
+    [[ ! -e "$cache_test_root/linked-final.cache-receipt.json" ]] || exit 1
+    echo 'PASS: namespace reuse/flags/config invalidation, hardlink detachment, exclusive custody, unsafe path/nonfresh output/unknown and rustc wrapper/linked final refusal'
+    exit 0
+fi
+
 # Colors
 if [[ -z "${NO_COLOR:-}" && -t 2 ]]; then
     RED=$'\033[0;31m'

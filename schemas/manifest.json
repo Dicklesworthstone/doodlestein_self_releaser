@@ -237,6 +237,28 @@
           },
           "uniqueItems": true
         },
+        "intermediate_cache": {
+          "type": "object",
+          "required": ["mode", "root", "custody", "final_outputs", "receipt"],
+          "properties": {
+            "mode": {"const": "host-private-cargo-build-dir-v1"},
+            "root": {"type": "string", "pattern": "^/"},
+            "custody": {"const": "exclusive-build-and-final-output-detachment"},
+            "final_outputs": {"const": "per-run"},
+            "receipt": {
+              "type": "object",
+              "required": ["namespace", "build_dir", "contract", "final_output_policy"],
+              "properties": {
+                "namespace": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "build_dir": {"type": "string", "pattern": "^/"},
+                "contract": {"type": "object"},
+                "final_output_policy": {"const": "fresh-run-target-detached-under-custody"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
         "sibling_roots": {
           "type": "array",
           "items": {

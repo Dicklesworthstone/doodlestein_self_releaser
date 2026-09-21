@@ -5715,6 +5715,188 @@ _act_ssh_exec() {
     fi
 }
 
+# Emit a host-side wrapper for opt-in intermediate Cargo caching. Final outputs
+# remain in the run's fresh target directory; no cached output is collected on
+# failure. Python owns the advisory lock through build and output detachment.
+_act_strict_cargo_cache_script() {
+    local cache_root="$1" cache_contract="$2" command="$3"
+    local root_q contract_q command_q
+    printf -v root_q '%q' "$cache_root"
+    printf -v contract_q '%q' "$cache_contract"
+    printf -v command_q '%q' "$command"
+    printf 'python3 - %s %s %s <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
+    cat <<'PY'
+import fcntl, hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys, tempfile, tomllib
+
+def require(ok, message):
+    if not ok:
+        raise RuntimeError('strict Cargo cache: ' + message)
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1048576), b''):
+            h.update(block)
+    return h.hexdigest()
+
+def probe(argv):
+    return subprocess.check_output(argv, text=True, timeout=30).strip()
+
+root = pathlib.Path(sys.argv[1])
+require(root.is_absolute() and root.resolve() == root, 'root must be a canonical absolute path')
+for path in [root, *root.parents]:
+    info = path.lstat()
+    require(stat.S_ISDIR(info.st_mode) and not path.is_symlink(), 'unsafe root ancestor')
+    require(info.st_uid in (0, os.getuid()), 'foreign root ancestor')
+    require(not info.st_mode & 0o022 or (info.st_uid == 0 and info.st_mode & stat.S_ISVTX), 'writable root ancestor')
+info = root.stat()
+require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700, 'root must be owned mode 0700')
+target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
+require(target.is_absolute() and not target.exists() and not target.is_symlink(), 'final target must be fresh')
+require(not target.is_relative_to(root) and not root.is_relative_to(target), 'cache and final target must be separate')
+require(not root.is_relative_to(pathlib.Path.cwd()) and not pathlib.Path.cwd().is_relative_to(root), 'cache and source must be separate')
+require(not os.environ.get('RUSTC_WRAPPER') and not os.environ.get('RUSTC_WORKSPACE_WRAPPER'),
+        'explicit rustc wrappers are unsupported by the cache identity contract')
+cargo = probe(['cargo', '-V'])
+version = re.match(r'cargo (\d+)\.(\d+)\.(\d+)', cargo)
+require(version and tuple(map(int, version.groups())) >= (1, 91, 1), 'Cargo >=1.91.1 with build.build-dir support required')
+rustc = probe([os.environ.get('RUSTC', 'rustc'), '-vV'])
+# Reviewed managed RCH shim v4 and toolchain wrapper v3, identical on the
+# native Mac and Linux proof host. A changed script requires renewed review;
+# matching a comment or a version response is not executable authority.
+rch_shim_hash = '015f36047d1b732ada59b8644f7fde5e327803a11e56d571d2603af25c970ed7'
+rch_toolchain_hash = 'd5966567e177ce968f272848ab8e249da3d9bfca40f90237480e1fbe6bd9d2d0'
+def compiler_identity(program, tool, version_args, observed):
+    selected = shutil.which(program)
+    require(selected, 'compiler executable missing: ' + tool)
+    selected = pathlib.Path(selected).resolve()
+    with selected.open('rb') as stream:
+        is_wrapper = stream.read(2) == b'#!'
+    if is_wrapper:
+        require(tool == 'cargo' and digest(selected) in (rch_shim_hash, rch_toolchain_hash),
+                'unrecognized selected compiler script: ' + tool)
+        require(os.environ.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
+                not os.environ.get('RCH_REAL_CARGO') and not os.environ.get('RCH_SHIM_REAL_CARGO'),
+                'RCH cache resolution requires local bypass without executable overrides')
+    actual = selected
+    if is_wrapper or selected.name == 'rustup':
+        rustup = shutil.which('rustup')
+        require(rustup, 'rustup executable missing')
+        rustup = pathlib.Path(rustup).resolve()
+        with rustup.open('rb') as stream:
+            require(stream.read(2) != b'#!', 'rustup resolver cannot be a script')
+        require(is_wrapper or selected == rustup, 'unrecognized rustup launcher')
+        actual = pathlib.Path(probe(['rustup', 'which', tool])).resolve()
+        require(probe([str(actual), *version_args]) == observed, 'wrapper/toolchain version disagreement: ' + tool)
+    toolchain_launcher = {'path': str(actual), 'sha256': digest(actual)}
+    with actual.open('rb') as stream:
+        is_toolchain_wrapper = stream.read(2) == b'#!'
+    if is_toolchain_wrapper and tool == 'cargo':
+        # RCH's managed toolchain wrapper has a documented local bypass used
+        # by this runner. Bind that wrapper too, then hash its real executable.
+        require(os.environ.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
+                digest(actual) == rch_toolchain_hash, 'unsupported toolchain Cargo wrapper')
+        actual = (actual.parent / 'cargo-rch-real').resolve()
+        require(probe([str(actual), *version_args]) == observed, 'RCH real Cargo version disagreement')
+    with actual.open('rb') as stream:
+        require(stream.read(2) != b'#!' and actual.name != 'rustup', 'unresolved compiler wrapper: ' + tool)
+    return {'selected_path': str(selected), 'selected_sha256': digest(selected),
+            'toolchain_launcher': toolchain_launcher,
+            'executable_path': str(actual), 'executable_sha256': digest(actual)}
+compilers = {'cargo': compiler_identity('cargo', 'cargo', ['-V'], cargo),
+             'rustc': compiler_identity(os.environ.get('RUSTC', 'rustc'), 'rustc', ['-vV'], rustc)}
+# Source identity/version are deliberately not cache namespace inputs. Cargo
+# fingerprints the newly verified source; the final artifact embeds its identity.
+excluded = {'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
+            'DSR_RELEASE_GIT_SHA', 'DSR_RELEASE_GIT_REF',
+            'FT_ATOMIC_BUILD_IDENTITY', 'FT_ATOMIC_BUILD_PROFILE'}
+influences = {k: v for k, v in os.environ.items() if k not in excluded and
+              (k.startswith(('CARGO_', 'RUST', 'XWIN_')) or
+               re.search(r'(^|_)(CC|CXX|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', k))}
+tools = {}
+for name in ('CC', 'CXX', 'AR', 'LD'):
+    argv = shlex.split(os.environ.get(name, {'CC': 'cc', 'CXX': 'c++', 'AR': 'ar', 'LD': 'ld'}[name]))
+    executable = shutil.which(argv[0])
+    require(executable, 'missing tool ' + name)
+    tools[name] = {'argv': argv, 'path': str(pathlib.Path(executable).resolve()), 'sha256': digest(executable)}
+    if sys.platform == 'darwin' and str(pathlib.Path(executable).resolve()) in (
+            '/usr/bin/cc', '/usr/bin/c++', '/usr/bin/clang', '/usr/bin/clang++'):
+        tool = 'clang++' if name == 'CXX' else 'clang'
+        actual = pathlib.Path(probe(['xcrun', '--find', tool])).resolve()
+        require(actual != pathlib.Path(executable).resolve(), 'xcrun did not resolve Apple compiler launcher')
+        tools[name]['selected_compiler'] = {'path': str(actual), 'sha256': digest(actual)}
+sdk = None
+if sys.platform == 'darwin':
+    sdk_path = pathlib.Path(os.environ.get('SDKROOT') or probe(['xcrun', '--show-sdk-path'])).resolve()
+    settings = sdk_path / 'SDKSettings.json'
+    require(settings.is_file(), 'SDK settings unavailable')
+    sdk = {'path': str(sdk_path), 'settings_sha256': digest(settings),
+           'xcode': probe(['xcodebuild', '-version'])}
+contract = {'schema': 1, 'configuration': json.loads(sys.argv[2]), 'cargo': cargo,
+            'rustc': rustc, 'compilers': compilers, 'tools': tools, 'sdk': sdk, 'environment': influences}
+with open('Cargo.toml', 'rb') as manifest:
+    contract['profiles'] = tomllib.load(manifest).get('profile', {})
+contract['cargo_config'] = {name: digest(name) for name in ('.cargo/config', '.cargo/config.toml')
+                            if pathlib.Path(name).is_file()}
+key = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+namespace = root / key
+try:
+    namespace.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+info = namespace.lstat()
+require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700, 'unsafe namespace')
+lock_path = namespace / 'custody.lock'
+fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, 'r+') as lock:
+    info = os.fstat(lock.fileno())
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600, 'unsafe lock')
+    # Contention is explicit refusal, not an unbounded wait consuming build time.
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    require(os.stat(lock_path, follow_symlinks=False).st_ino == info.st_ino, 'lock identity changed')
+    build_dir = namespace / 'build'
+    if build_dir.exists() or build_dir.is_symlink():
+        info = build_dir.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid(), 'unsafe intermediate directory')
+    os.environ['CARGO_BUILD_BUILD_DIR'] = str(build_dir)
+    print('DSR_CARGO_CACHE namespace=' + key, flush=True)
+    # The child shell inherits custody so controller interruption cannot release
+    # the lock while its build command is still running.
+    code = subprocess.call(['bash', '-e', '-c', sys.argv[3]], pass_fds=(lock.fileno(),))
+    if code != 0:
+        sys.exit(code if code > 0 else 128 - code)
+    require(build_dir.is_dir(), 'Cargo did not create configured intermediate directory')
+    info = target.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid(), 'final target must remain a plain owned directory')
+    # Cargo can hard-link final executables to intermediates. Sever such links
+    # under custody before another run may update the shared cache. These are
+    # exclusively this run's files; retained failed copies are never collected.
+    def traversal_failed(error):
+        raise error
+    for directory, dirs, files in os.walk(target, followlinks=False, onerror=traversal_failed):
+        for name in dirs + files:
+            path = pathlib.Path(directory) / name
+            require(not path.is_symlink(), 'symlink in final target')
+        for name in files:
+            path = pathlib.Path(directory) / name
+            info = path.stat()
+            require(stat.S_ISREG(info.st_mode), 'nonregular final output')
+            if info.st_nlink > 1:
+                with tempfile.NamedTemporaryFile(dir=directory, prefix='.dsr-detach-', delete=False) as copy:
+                    with path.open('rb') as source:
+                        shutil.copyfileobj(source, copy)
+                    os.fchmod(copy.fileno(), stat.S_IMODE(info.st_mode))
+                    copy.flush()
+                    os.fsync(copy.fileno())
+                os.replace(copy.name, path)
+    receipt = target.parent / (target.name + '.cache-receipt.json')
+    with receipt.open('x') as stream:
+        json.dump({'namespace': key, 'build_dir': str(build_dir), 'contract': contract,
+                   'final_output_policy': 'fresh-run-target-detached-under-custody'}, stream, sort_keys=True)
+PY
+    printf 'DSR_CARGO_CACHE_PY\n'
+}
+
 # Run native build on remote host via SSH
 # Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
 #        [remote_path_override] [release_git_sha] [release_git_ref] [bound_host]
@@ -5779,6 +5961,21 @@ act_run_native_build() {
 
     local language
     language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+    local strict_cache_root strict_cache_contract=''
+    strict_cache_root=$(yq -r '.strict_cargo_cache_root // ""' "$config_file" 2>/dev/null) || return 4
+    if [[ -n "$strict_cache_root" ]]; then
+        if [[ "$language" != rust || -z "$remote_path_override" ]] || \
+           _act_is_windows_host "$host" || \
+           [[ ! "$strict_cache_root" =~ ^/[A-Za-z0-9_./+-]+$ || "$strict_cache_root" == *..* ]]; then
+            _log_error "strict_cargo_cache_root requires strict Unix Rust and a canonical absolute private directory"
+            return 4
+        fi
+        strict_cache_contract=$(jq -nc --arg tool "$tool_name" --arg platform "$platform" \
+            --arg profile "$build_profile" --arg command "$build_cmd" --arg environment "$build_env" \
+            '{tool: $tool, platform: $platform, profile: $profile, command: $command,
+              configured_environment: ($environment | split("\n") | map(select(
+                test("^(CARGO_HOME|CARGO_TARGET_DIR|CARGO_BUILD_BUILD_DIR|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|FT_ATOMIC_BUILD_IDENTITY|FT_ATOMIC_BUILD_PROFILE)=") | not)))}') || return 4
+    fi
 
     # A target whose platform differs from the host's is a cross build even
     # when the scheduler labels it "native for this host" (issue #7). The
@@ -5889,6 +6086,11 @@ act_run_native_build() {
             fi
         fi
         local strict_cargo_target_dir="${remote_path%/*}/.cargo-target-${platform//\//-}"
+        if [[ -n "$strict_cache_root" ]]; then
+            # A retry also gets a fresh final-output destination. The host
+            # wrapper refuses any collision rather than reusing stale output.
+            strict_cargo_target_dir+="-$(date +%s)-$$-$RANDOM"
+        fi
         local canonical_cargo_target_dir="$strict_cargo_target_dir"
         local strict_cargo_home="${remote_path%/*}/.cargo-home"
         local strict_build_env="" env_pair
@@ -5905,6 +6107,7 @@ act_run_native_build() {
         fi
         while IFS= read -r env_pair; do
             [[ -z "$env_pair" || "$env_pair" == CARGO_TARGET_DIR=* || \
+               ( -n "$strict_cache_root" && "$env_pair" == CARGO_BUILD_BUILD_DIR=* ) || \
                "$env_pair" == CARGO_HOME=* || \
                "$env_pair" == DSR_RELEASE_GIT_SHA=* || \
                "$env_pair" == DSR_RELEASE_GIT_REF=* ]] && continue
@@ -6005,6 +6208,12 @@ act_run_native_build() {
                     cache_reuse: ["registry", "git"]
                 }
             ') || return 4
+        if [[ -n "$strict_cache_root" ]]; then
+            cargo_isolation_json=$(jq --arg root "$strict_cache_root" \
+                '.intermediate_cache = {mode: "host-private-cargo-build-dir-v1", root: $root,
+                  custody: "exclusive-build-and-final-output-detachment", final_outputs: "per-run"}' \
+                <<< "$cargo_isolation_json") || return 4
+        fi
     elif [[ "$language" == "rust" ]]; then
         # Ordinary Rust builds must be just as independent of operator Cargo
         # configuration as strict release builds.  Remove any configured
@@ -6398,7 +6607,13 @@ act_run_native_build() {
             cargo_home_prefix+=$(_act_zig_shim_prefix_sh "${nonstrict_stage_root}/.dsr-bin")
             env_exports+="export PATH='${nonstrict_stage_root}/.dsr-bin':\"\$PATH\"; "
         fi
-        remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
+        if [[ -n "$strict_cache_root" ]]; then
+            local cached_build
+            cached_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd") || return 4
+            remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$cached_build"
+        else
+            remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
+        fi
     fi
 
     local build_transport_timeout="$_ACT_BUILD_TIMEOUT"
@@ -6431,6 +6646,20 @@ act_run_native_build() {
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
     local exit_code=${PIPESTATUS[0]}
+    if [[ $exit_code -eq 0 && -n "$strict_cache_root" ]]; then
+        local cache_receipt
+        if cache_receipt=$(_act_ssh_exec "$host" \
+                "cat '${strict_cargo_target_dir}.cache-receipt.json'" 30) && \
+           jq -e '.namespace | test("^[0-9a-f]{64}$")' <<< "$cache_receipt" >/dev/null && \
+           jq -e '.final_output_policy == "fresh-run-target-detached-under-custody"' \
+                <<< "$cache_receipt" >/dev/null; then
+            cargo_isolation_json=$(jq --argjson receipt "$cache_receipt" \
+                '.intermediate_cache.receipt = $receipt' <<< "$cargo_isolation_json") || exit_code=4
+        else
+            _log_error "Strict Cargo cache receipt missing or invalid; refusing artifact collection"
+            exit_code=4
+        fi
+    fi
 
     # The ephemeral stage root (isolated source copy + fresh cargo-home) is
     # never needed once the build command has exited: artifacts are collected
