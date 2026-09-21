@@ -23,6 +23,9 @@ if [[ "${1:-}" == --strict-cargo-cache-tests || "${1:-}" == --strict-cargo-cache
     printf 'Retained cache fixture: %s\n' "$cache_test_root"
     mkdir -m 700 "$cache_test_root/cache" "$cache_test_root/source" || exit 1
     printf '[package]\nname="cache_probe"\nversion="0.1.0"\nedition="2021"\n' > "$cache_test_root/source/Cargo.toml"
+    mkdir "$cache_test_root/source/src" || exit 1
+    printf 'fn main() {}\n' > "$cache_test_root/source/src/main.rs"
+    printf 'version = 4\n[[package]]\nname = "cache_probe"\nversion = "0.1.0"\n' > "$cache_test_root/source/Cargo.lock"
     cache_contract='{"tool":"cache-test","platform":"native","profile":"dev","command":"fixture"}'
     cache_run() (
         cd "$cache_test_root/source" || exit 1
@@ -39,27 +42,68 @@ edition="2021"
 EOF
         printf 'pub fn value() -> u32 { 42 }\n' > "$cache_test_root/dep/src/lib.rs"
         printf '\n[dependencies]\ncache_dep={path="../dep"}\n' >> "$cache_test_root/source/Cargo.toml"
+        cat > "$cache_test_root/source/Cargo.lock" <<'EOF'
+version = 4
+[[package]]
+name = "cache_dep"
+version = "0.1.0"
+[[package]]
+name = "cache_probe"
+version = "0.1.0"
+dependencies = ["cache_dep"]
+EOF
         printf 'fn main() { println!("first:{}", cache_dep::value()); }\n' > "$cache_test_root/source/src/main.rs"
-        cache_run first 'cargo build --offline --message-format=json' > "$cache_test_root/first.jsonl" || exit 1
-        [[ "$("$cache_test_root/first/debug/cache_probe")" == first:42 ]] || exit 1
         # A distinct immutable source path; the stable dependency simulates the
-        # unchanged registry source, while first-party source must be recompiled.
+        # unchanged registry source. Precreate ALL snapshots before compilation:
+        # newer mtimes would conceal stale workspace artifacts in Cargo's cache.
         cp -R "$cache_test_root/source" "$cache_test_root/second-source" || exit 1
-        printf 'fn main() { println!("second:{}", cache_dep::value()); }\n' > "$cache_test_root/second-source/src/main.rs"
+        printf 'fn main() { println!("other:{}", cache_dep::value()); }\n' > "$cache_test_root/second-source/src/main.rs"
+        cp -R "$cache_test_root/source" "$cache_test_root/invalid-source" || exit 1
+        printf 'compile_error!("planted cache stale-output refusal");\n' > "$cache_test_root/invalid-source/src/main.rs"
+        cp -R "$cache_test_root/source" "$cache_test_root/script-source" || exit 1
+        mkdir -p "$cache_test_root/script-dep/src" || exit 1
+        cp "$cache_test_root/dep/Cargo.toml" "$cache_test_root/script-dep/Cargo.toml" || exit 1
+        printf 'include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n' > "$cache_test_root/script-dep/src/lib.rs"
+        printf '42\n' > "$cache_test_root/script-dep/input.txt"
+        cat > "$cache_test_root/script-dep/build.rs" <<'EOF'
+fn main() {
+    println!("cargo::rerun-if-changed=input.txt");
+    let input = std::fs::read_to_string("input.txt").unwrap();
+    std::fs::write(std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("generated.rs"),
+        format!("pub fn value() -> u32 {{ {} }}", input.trim())).unwrap();
+}
+EOF
+        cat > "$cache_test_root/script-source/Cargo.toml" <<'EOF'
+[package]
+name="cache_probe"
+version="0.1.0"
+edition="2021"
+[dependencies]
+cache_dep={path="../script-dep", optional=true}
+EOF
+        python3 - "$cache_test_root" <<'PY' || exit 1
+import os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for name in ('source', 'second-source', 'invalid-source', 'dep', 'script-source', 'script-dep'):
+    for path in (root / name).rglob('*'):
+        if path.is_file():
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+assert (root / 'source/src/main.rs').stat().st_size == (root / 'second-source/src/main.rs').stat().st_size
+PY
+        cache_run first 'cargo build --frozen --message-format=json' > "$cache_test_root/first.jsonl" || exit 1
+        [[ "$("$cache_test_root/first/debug/cache_probe")" == first:42 ]] || exit 1
         (
             cd "$cache_test_root/second-source" || exit 1
             export CARGO_TARGET_DIR="$cache_test_root/second"
             bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/cache" "$cache_contract" 'cargo build --offline --message-format=json')"
         ) > "$cache_test_root/second.jsonl" || exit 1
-        [[ "$("$cache_test_root/second/debug/cache_probe")" == second:42 ]] || exit 1
+        [[ "$("$cache_test_root/second/debug/cache_probe")" == other:42 ]] || exit 1
         python3 - "$cache_test_root/second.jsonl" <<'PY' || exit 1
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.startswith('{')]
 assert any(row.get('reason') == 'compiler-artifact' and row['target']['name'] == 'cache_dep' and row['fresh'] for row in rows)
 assert any(row.get('reason') == 'compiler-artifact' and row['target']['name'] == 'cache_probe' and not row['fresh'] for row in rows)
 PY
-        cp -R "$cache_test_root/source" "$cache_test_root/invalid-source" || exit 1
-        printf 'compile_error!("planted cache stale-output refusal");\n' > "$cache_test_root/invalid-source/src/main.rs"
         if (
             cd "$cache_test_root/invalid-source" || exit 1
             export CARGO_TARGET_DIR="$cache_test_root/failed"
@@ -69,7 +113,17 @@ PY
         fi
         [[ ! -e "$cache_test_root/failed/debug/cache_probe" && ! -e "$cache_test_root/failed.cache-receipt.json" ]] || exit 1
         [[ "$("$cache_test_root/first/debug/cache_probe")" == first:42 ]] || exit 1
-        echo 'PASS: actual two-source dependency reuse, changed marker, failed-build stale-output refusal'
+        if (
+            cd "$cache_test_root/script-source" || exit 1
+            export CARGO_TARGET_DIR="$cache_test_root/script-final"
+            bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/cache" "$cache_contract" 'cargo build --frozen --all-features --message-format=json')"
+        ) > "$cache_test_root/script.jsonl" 2> "$cache_test_root/script.stderr"; then
+            echo 'FAIL: transitive build script accepted' >&2; exit 1
+        fi
+        cat "$cache_test_root/script.stderr"
+        grep -q 'strict cache does not support build scripts' "$cache_test_root/script.stderr" || exit 1
+        [[ ! -e "$cache_test_root/script-final" && ! -e "$cache_test_root/script-final.cache-receipt.json" ]] || exit 1
+        echo 'PASS: equal-old-timestamp dependency reuse, changed marker, failed-build refusal, transitive build-script refusal'
         exit 0
     fi
     cache_run first 'mkdir -p "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"; printf first > "$CARGO_BUILD_BUILD_DIR/shared"; ln "$CARGO_BUILD_BUILD_DIR/shared" "$CARGO_TARGET_DIR/result"' || exit 1

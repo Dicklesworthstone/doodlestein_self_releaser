@@ -5805,6 +5805,20 @@ def compiler_identity(program, tool, version_args, observed):
             'executable_path': str(actual), 'executable_sha256': digest(actual)}
 compilers = {'cargo': compiler_identity('cargo', 'cargo', ['-V'], cargo),
              'rustc': compiler_identity(os.environ.get('RUSTC', 'rustc'), 'rustc', ['-vV'], rustc)}
+require('-nightly' in cargo and '-nightly' in rustc,
+        'strict cache requires nightly Cargo/rustc checksum freshness')
+require('checksum-freshness' in probe(['cargo', '-Z', 'help']),
+        'Cargo checksum-freshness capability unavailable')
+os.environ['CARGO_UNSTABLE_CHECKSUM_FRESHNESS'] = 'true'
+os.environ['CARGO_BUILD_FINGERPRINT'] = 'content'
+# Cargo still timestamps build-script rerun-if-changed inputs in checksum mode.
+# Refuse the entire resolved graph rather than accepting stale generated code.
+# --frozen prevents this admission probe from modifying the sealed lockfile or
+# fetching dependencies. A future broader contract needs separate input proof.
+metadata = json.loads(probe(['cargo', 'metadata', '--format-version=1', '--frozen', '--all-features']))
+require(not any('custom-build' in target['kind']
+                for package in metadata['packages'] for target in package['targets']),
+        'strict cache does not support build scripts: rerun-if-changed remains timestamp-based')
 # Source identity/version are deliberately not cache namespace inputs. Cargo
 # fingerprints the newly verified source; the final artifact embeds its identity.
 excluded = {'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
@@ -5832,7 +5846,8 @@ if sys.platform == 'darwin':
     require(settings.is_file(), 'SDK settings unavailable')
     sdk = {'path': str(sdk_path), 'settings_sha256': digest(settings),
            'xcode': probe(['xcodebuild', '-version'])}
-contract = {'schema': 1, 'configuration': json.loads(sys.argv[2]), 'cargo': cargo,
+contract = {'schema': 2, 'source_freshness': 'nightly-content-no-build-scripts-v1',
+            'configuration': json.loads(sys.argv[2]), 'cargo': cargo,
             'rustc': rustc, 'compilers': compilers, 'tools': tools, 'sdk': sdk, 'environment': influences}
 with open('Cargo.toml', 'rb') as manifest:
     contract['profiles'] = tomllib.load(manifest).get('profile', {})

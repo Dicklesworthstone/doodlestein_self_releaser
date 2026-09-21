@@ -229,13 +229,23 @@ Strict native Unix Rust builds can opt into a host-local intermediate cache with
 `strict_cargo_cache_root: /absolute/private/cache` in the repository build config.
 The operator must create that canonical directory owned by the build user with
 mode 0700; symlink and writable ancestor paths are refused. This requires Python
-3.11+ and Cargo 1.91.1+ (`build.build-dir`). Windows and ordinary builds reject
+3.11+ and nightly Cargo/rustc with `build.build-dir` and checksum-freshness
+support. Stable toolchains and graphs containing any build script are refused:
+Cargo still uses timestamps for `rerun-if-changed` inputs even in checksum mode.
+Admission uses frozen, offline dependency metadata and requires an existing
+lockfile and locally available dependencies. Windows and ordinary builds reject
 this option. No active build configuration is changed automatically.
+The configured recipe is trusted: every Cargo invocation must build the admitted
+workspace and preserve DSR's forced freshness environment. Recipes that change
+the Cargo workspace via `cd` or `--manifest-path`, or override freshness settings,
+are unsupported. DSR does not parse arbitrary shell recipes to prove this rule.
 
 DSR still builds the immutable source snapshot with an isolated Cargo home and a
 fresh final target directory. A namespace includes the tool, target, configured
 command, profile, compiler identities, build environment, and macOS SDK settings.
-Cargo checks source/dependency freshness across releases. An exclusive lock
+Cargo checks source/dependency contents across releases, including snapshots
+whose changed files have equal or older timestamps. This option cannot currently
+be enabled for projects with build scripts, including FrankenTerm. An exclusive lock
 covers the complete build command and detachment of hard-linked final outputs;
 contention fails explicitly. Artifact collection uses only the private run's
 outputs, never the shared intermediates, and requires a successful build/cache
