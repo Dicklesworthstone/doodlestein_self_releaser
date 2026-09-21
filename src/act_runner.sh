@@ -3821,7 +3821,7 @@ _act_write_tracked_manifest() {
                         ( "$mode" == "100644" || "$mode" == "100755" ) ) || \
                       ( "$object_type" == "commit" && "$mode" == "160000" ) ) || \
                   ! "$object_id" =~ ^[0-9a-f]{40}$ || \
-                  ! "$path" =~ ^[][A-Za-z0-9_./+@~#,=()-]+$ || "$path" == *..* || \
+                  ! "$path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ || "$path" == *..* || \
                   ( "$mode" != "160000" && \
                     ( ! -f "$repo_path/$path" || -L "$repo_path/$path" ) ) ]]; then
                 _log_error "Strict release tracked path cannot be represented safely: $path"
@@ -3846,7 +3846,7 @@ _act_tracked_manifest_object_count() {
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
            ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
-           "$relative_path" =~ ^[][A-Za-z0-9_./+@~#,=()-]+$ && \
+           "$relative_path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
         if [[ "$mode" == "160000" ]]; then
             expected_objects["d:$relative_path"]=1
@@ -3880,7 +3880,7 @@ _act_verify_tracked_manifest_local() {
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
            ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
-           "$relative_path" =~ ^[][A-Za-z0-9_./+@~#,=()-]+$ && \
+           "$relative_path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
         if [[ "$mode" == "160000" ]]; then
             if [[ ! -d "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
@@ -4445,13 +4445,13 @@ while IFS="\$tab" read -r object_id mode relative_path; do
     printf '%s\\n' "\$object_id" | grep -Eq '^[0-9a-f]{40}\$'
     case "\$mode" in 100644|100755|160000) :;; *) exit 21;; esac
     case "\$relative_path" in /*|*..*) exit 21;; esac
-    printf '%s\\n' "\$relative_path" | grep -Eq '^[][A-Za-z0-9_./+@~#,=()-]+\$'
+    printf '%s\\n' "\$relative_path" | grep -Eq '^[][A-Za-z0-9_./+@~#,=() -]+\$'
     node='$remote_path'/\$relative_path
     parent=\$relative_path
     while test "\${parent#*/}" != "\$parent"; do
         parent=\${parent%/*}
-        test -d '$remote_path'/\$parent
-        test ! -L '$remote_path'/\$parent
+        test -d '$remote_path'/"\$parent"
+        test ! -L '$remote_path'/"\$parent"
     done
     if test "\$mode" = 160000; then
         test -d "\$node"
@@ -4492,7 +4492,7 @@ foreach (\$line in Get-Content -LiteralPath '$remote_manifest') {
     \$parts=\$line.Split([char]9,3)
     if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or
         ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or
-        (\$parts[2] -notmatch '^[A-Za-z0-9_./+@~#,=()\[\]-]+$') -or
+        (\$parts[2] -notmatch '^[A-Za-z0-9_./+@~#,=()\[\] -]+$') -or
         \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { exit 21 }
     \$node=Join-Path '$remote_path' \$parts[2]
     if (\$parts[1] -eq '160000') {
