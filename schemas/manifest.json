@@ -4,7 +4,17 @@
   "title": "DSR Build Manifest",
   "description": "Schema for dsr build manifests - the source of truth for artifact metadata",
   "type": "object",
-  "required": ["schema_version", "tool", "version", "run_id", "source", "built_at", "status", "summary", "artifacts"],
+  "required": [
+    "schema_version",
+    "tool",
+    "version",
+    "run_id",
+    "source",
+    "built_at",
+    "status",
+    "summary",
+    "artifacts"
+  ],
   "properties": {
     "schema_version": {
       "type": "string",
@@ -208,7 +218,14 @@
     },
     "cargo_isolation": {
       "type": "object",
-      "required": ["mode", "source_boundary", "cargo_home", "target_dir", "ancestor_config_policy", "cache_reuse"],
+      "required": [
+        "mode",
+        "source_boundary",
+        "cargo_home",
+        "target_dir",
+        "ancestor_config_policy",
+        "cache_reuse"
+      ],
       "properties": {
         "mode": {
           "type": "string",

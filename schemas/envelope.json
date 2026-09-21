@@ -4,12 +4,34 @@
   "title": "DSR Response Envelope",
   "description": "Base envelope for all dsr --json responses",
   "type": "object",
-  "required": ["command", "status", "exit_code", "run_id", "started_at", "duration_ms", "tool", "version"],
+  "required": [
+    "command",
+    "status",
+    "exit_code",
+    "run_id",
+    "started_at",
+    "duration_ms",
+    "tool",
+    "version"
+  ],
   "properties": {
     "command": {
       "type": "string",
       "description": "Subcommand that was executed",
-      "enum": ["check", "watch", "status", "report", "build", "release", "fallback", "repos", "prune", "config", "doctor", "signing"]
+      "enum": [
+        "check",
+        "watch",
+        "status",
+        "report",
+        "build",
+        "release",
+        "fallback",
+        "repos",
+        "prune",
+        "config",
+        "doctor",
+        "signing"
+      ]
     },
     "schema_version": {
       "type": "string",

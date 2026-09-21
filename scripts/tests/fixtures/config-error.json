@@ -11,15 +11,11 @@
   "schema_version": "1.0.0",
   "artifacts": [],
   "warnings": [],
-  "errors": [
-    {"code": "E031", "message": "missing schema_version"}
-  ],
+  "errors": [{ "code": "E031", "message": "missing schema_version" }],
   "details": {
     "action": "validate",
     "config_file": "~/.config/dsr/config.yaml",
     "valid": false,
-    "errors": [
-      {"code": "E031", "message": "missing schema_version", "key": "schema_version"}
-    ]
+    "errors": [{ "code": "E031", "message": "missing schema_version", "key": "schema_version" }]
   }
 }

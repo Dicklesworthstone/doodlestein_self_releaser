@@ -11,9 +11,7 @@
   "schema_version": "1.0.0",
   "artifacts": [],
   "warnings": [],
-  "errors": [
-    {"code": "E040", "message": "Docker not running"}
-  ],
+  "errors": [{ "code": "E040", "message": "Docker not running" }],
   "details": {
     "generated_at": "2026-01-30T15:10:03Z",
     "overall_status": "error",

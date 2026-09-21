@@ -11,9 +11,7 @@
   "schema_version": "1.0.0",
   "artifacts": [],
   "warnings": [],
-  "errors": [
-    {"code": "E010", "message": "build failed"}
-  ],
+  "errors": [{ "code": "E010", "message": "build failed" }],
   "details": {
     "repo": "ntm",
     "version": "v1.2.3",

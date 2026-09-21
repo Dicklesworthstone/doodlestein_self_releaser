@@ -11,9 +11,7 @@
   "schema_version": "1.0.0",
   "artifacts": [],
   "warnings": [],
-  "errors": [
-    {"code": "E060", "message": "report data unavailable"}
-  ],
+  "errors": [{ "code": "E060", "message": "report data unavailable" }],
   "details": {
     "generated_at": "2026-01-30T15:21:02Z",
     "summary": {
@@ -21,8 +19,6 @@
       "failures_last_24h": 0,
       "throttled_repos": 0
     },
-    "alerts": [
-      {"code": "E060", "message": "report data unavailable", "severity": "error"}
-    ]
+    "alerts": [{ "code": "E060", "message": "report data unavailable", "severity": "error" }]
   }
 }

@@ -11,14 +11,10 @@
   "schema_version": "1.0.0",
   "artifacts": [],
   "warnings": [],
-  "errors": [
-    {"code": "E052", "message": "repo already exists"}
-  ],
+  "errors": [{ "code": "E052", "message": "repo already exists" }],
   "details": {
     "action": "add",
     "repo": "dicklesworthstone/ntm",
-    "errors": [
-      {"code": "E052", "message": "repo already exists"}
-    ]
+    "errors": [{ "code": "E052", "message": "repo already exists" }]
   }
 }

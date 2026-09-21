@@ -18,8 +18,6 @@
     "cutoff_days": 30,
     "pruned_count": 12,
     "bytes_freed": 104857600,
-    "pruned_paths": [
-      {"path": "~/.local/state/dsr/logs/2025-12-01/run.log", "size_bytes": 2048}
-    ]
+    "pruned_paths": [{ "path": "~/.local/state/dsr/logs/2025-12-01/run.log", "size_bytes": 2048 }]
   }
 }

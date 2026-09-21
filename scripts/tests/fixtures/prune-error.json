@@ -11,17 +11,13 @@
   "schema_version": "1.0.0",
   "artifacts": [],
   "warnings": [],
-  "errors": [
-    {"code": "E050", "message": "state directory not found"}
-  ],
+  "errors": [{ "code": "E050", "message": "state directory not found" }],
   "details": {
     "state_dir": "~/.local/state/dsr",
     "dry_run": true,
     "cutoff_days": 30,
     "pruned_count": 0,
     "bytes_freed": 0,
-    "errors": [
-      {"code": "E050", "message": "state directory not found"}
-    ]
+    "errors": [{ "code": "E050", "message": "state directory not found" }]
   }
 }
