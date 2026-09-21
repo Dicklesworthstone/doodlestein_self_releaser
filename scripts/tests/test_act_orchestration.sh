@@ -2543,6 +2543,83 @@ fi
 echo ""
 echo "== strict fresh source sync =="
 
+# Exercise the actual Git archive, manifest and generated Unix verifier without
+# SSH. Spaces are data; manifest separators and traversal remain forbidden.
+strict_space_repo="$TEMP_DIR/strict-space-repo"
+strict_space_root="$TEMP_DIR/strict-space-root"
+strict_space_archive="$TEMP_DIR/strict-space.tar"
+strict_space_manifest="$TEMP_DIR/strict-space.manifest"
+strict_space_status=0
+(
+    set -e
+    mkdir -p "$strict_space_repo/space directory" "$strict_space_root"
+    printf 'literal archive payload\n' > "$strict_space_repo/space directory/hello world.sh"
+    chmod +x "$strict_space_repo/space directory/hello world.sh"
+    git -C "$strict_space_repo" init -q
+    git -C "$strict_space_repo" add -- .
+    git -C "$strict_space_repo" -c user.name=DSR-Test -c user.email=dsr-test@example.invalid \
+        commit -qm 'space path fixture'
+    sha=$(git -C "$strict_space_repo" rev-parse HEAD)
+    _act_write_tracked_manifest "$strict_space_repo" "$sha" "$strict_space_manifest"
+    _act_write_git_archive_evidence "$strict_space_repo" "$sha" "$strict_space_archive"
+    tar -xf "$strict_space_archive" -C "$strict_space_root"
+    count=$(_act_tracked_manifest_object_count "$strict_space_manifest")
+    test "$count" = 2
+    cmp "$strict_space_repo/space directory/hello world.sh" "$strict_space_root/space directory/hello world.sh"
+    _act_verify_tracked_manifest_local "$strict_space_root" "$strict_space_manifest"
+    digest=$(_act_sha256 "$strict_space_manifest")
+    script=$(_act_unix_strict_snapshot_verify_script "$strict_space_root" "$strict_space_archive" \
+        "$strict_space_manifest" "$digest" "$count")
+    sh -c "$script"
+    printf 'changed bytes\n' >> "$strict_space_root/space directory/hello world.sh"
+    if _act_verify_tracked_manifest_local "$strict_space_root" "$strict_space_manifest"; then exit 1; fi
+    if sh -c "$script"; then exit 1; fi
+) > "$TEMP_DIR/strict-space-test.log" 2>&1
+strict_space_status=$?
+if [[ $strict_space_status -eq 0 ]]; then
+    pass "strict archives preserve spaced file and ancestor names and reject changed bytes"
+else
+    cat "$TEMP_DIR/strict-space-test.log"
+    fail "strict archive spaced-path roundtrip failed"
+fi
+
+strict_bad_index=0
+for strict_bad_path in $'tab\tname' $'line\nname' '../escape' '/absolute'; do
+    strict_bad_index=$((strict_bad_index + 1))
+    strict_bad_manifest="$TEMP_DIR/strict-bad-$strict_bad_index.manifest"
+    printf '%040d\t100644\t%s\n' 1 "$strict_bad_path" > "$strict_bad_manifest"
+    strict_bad_status=0
+    (
+        set -e
+        if _act_tracked_manifest_object_count "$strict_bad_manifest"; then exit 1; fi
+        if _act_verify_tracked_manifest_local "$strict_space_root" "$strict_bad_manifest"; then exit 1; fi
+        digest=$(_act_sha256 "$strict_bad_manifest")
+        script=$(_act_unix_strict_snapshot_verify_script "$strict_space_root" "$strict_space_archive" \
+            "$strict_bad_manifest" "$digest" 2)
+        if sh -c "$script"; then exit 1; fi
+        # Real tracked control characters must fail during manifest admission,
+        # before tar extraction. Git cannot contain the traversal fixtures.
+        if [[ "$strict_bad_index" -le 2 ]]; then
+            repo="$TEMP_DIR/strict-bad-repo-$strict_bad_index"
+            mkdir -p "$repo"
+            printf 'unsafe name payload\n' > "$repo/$strict_bad_path"
+            git -C "$repo" init -q
+            git -C "$repo" add -- .
+            git -C "$repo" -c user.name=DSR-Test -c user.email=dsr-test@example.invalid \
+                commit -qm 'control character fixture'
+            sha=$(git -C "$repo" rev-parse HEAD)
+            if _act_write_tracked_manifest "$repo" "$sha" "$TEMP_DIR/rejected-$strict_bad_index.manifest"; then exit 1; fi
+        fi
+    ) > "$TEMP_DIR/strict-bad-$strict_bad_index.log" 2>&1
+    strict_bad_status=$?
+    if [[ "$strict_bad_status" -eq 0 ]]; then
+        pass "strict source rejects unsafe path case $strict_bad_index"
+    else
+        cat "$TEMP_DIR/strict-bad-$strict_bad_index.log"
+        fail "strict source accepted unsafe path case $strict_bad_index"
+    fi
+done
+
 strict_sync_repo="$TEMP_DIR/strict-sync-repo"
 strict_sync_base="$TEMP_DIR/strict-sync-remote/project"
 strict_sync_run_id="550e8400-e29b-41d4-a716-446655440040"

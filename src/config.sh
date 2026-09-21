@@ -756,7 +756,7 @@ config_registry_divergence_json() {
             "workspace_archive_files", "workspace_additional_artifacts",
             "flat_archive", "sibling_crates",
             "release_contract", "act_job_map", "workflow", "linux_glibc_floor",
-            "derive_cargo_build_target"];
+            "derive_cargo_build_target", "strict_cargo_cache_root"];
         {
             registry: ($registry != null),
             repo_config: ($repo != null),
