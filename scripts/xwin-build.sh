@@ -6,7 +6,10 @@ source "$SCRIPT_DIR/../src/xwin_build.sh" || exit 3
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     printf '%s\n' 'Usage: xwin-build.sh --manifest FILE --project DIR --bin NAME --run-dir NEW_DIR' \
         '       [--package NAME] [--cache-dir DIR] [--cargo-cache DIR] [--offline] [--timeout SECONDS]' \
-        'Build one release-profile Windows ARM64 executable; stdout is a verified JSON receipt.'
+        '       [--release-repo OWNER/REPO --release-tag vX.Y.Z --source-sha COMMIT]' \
+        '       [--tool NAME] [--asset-name NAME.exe]' \
+        'Build one Windows ARM64 executable; stdout is a verified JSON receipt.' \
+        'Release mode stages committed source and emits release/build-manifest.json for DSR publication.'
     exit 0
 fi
 _xwb_build "$@" &

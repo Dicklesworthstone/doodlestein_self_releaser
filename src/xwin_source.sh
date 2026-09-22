@@ -275,6 +275,7 @@ try:
     print(json.dumps({"metadata_sha256": hashlib.sha256(encoded).hexdigest(),
                       "package_id": selected["id"], "package": selected["name"], "version": selected["version"],
                       "binary": binary, "manifest": local_file(selected["manifest_path"]),
+                      "binary_source": local_file(target["src_path"]),
                       "resolved_packages": len(nodes), "features": sorted(selected_nodes[0]["features"])}))
 except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
     print("[xwin-source] " + str(error), file=sys.stderr)

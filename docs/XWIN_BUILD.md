@@ -1,11 +1,12 @@
 # Build with the pinned Windows ARM64 view
 
-The standalone `scripts/xwin-build.sh` entry point consumes the manifest
-specified in [XWIN_TOOLCHAIN.md](XWIN_TOOLCHAIN.md), runs the pinned cargo-xwin
-plugin, and admits a release-profile executable only after toolchain
-revalidation and ARM64 PE verification. It is suitable for a project already
-staged by DSR. It does not replace the existing source, publication, signing,
-or native-host release gates, or automatically change `dsr build` routing.
+`scripts/xwin-build.sh` consumes the manifest specified in
+[XWIN_TOOLCHAIN.md](XWIN_TOOLCHAIN.md), runs the pinned cargo-xwin plugin, and
+admits an executable only after toolchain revalidation and ARM64 PE verification.
+The opt-in release mode stages an exact Git commit and emits DSR's existing
+successful-build manifest for the verified publication pipeline. Ordinary mode
+still accepts an already-staged project. Neither mode automatically changes
+`dsr build` routing or publishes a GitHub release.
 
 ## Invocation
 
@@ -34,7 +35,7 @@ package; `--bin NAME` is mandatory. The build always uses `--release`,
 regular `Cargo.toml` and `Cargo.lock`. `--timeout SECONDS` bounds compilation
 (default 3600; range 1..86400). `--cache-dir DIR` selects the prepared-view
 cache. Build execution also requires Python 3, GNU timeout, and util-linux
-setsid on a Linux host.
+setsid on a Linux host. Release mode requires Python 3.9+ and Git.
 
 `--offline` requests Cargo's offline behavior. Without it, Cargo may fetch
 locked dependencies. `--cargo-cache` is optional: only its `registry/` and
@@ -45,7 +46,100 @@ runner intentionally does not inherit proxy variables, registry credentials,
 or arbitrary environment overrides. Projects requiring custom registries
 must supply appropriate reviewed project configuration.
 
-## What is enforced and retained
+## Source-pinned release mode
+
+Supply all three identity flags together. `SOURCE_SHA` below is the reviewed,
+full 40-character commit to release, not an inference from a produced binary.
+The selected local tag must already exist and point to that commit; the runner
+does not create, move, or push tags.
+
+```bash
+bash scripts/xwin-build.sh \
+  --manifest /opt/pinned/windows-arm64-toolchain.json \
+  --project /home/builder/projects/example-tool \
+  --bin example-tool --package example-tool \
+  --run-dir /var/tmp/dsr-runs/windows-arm64-release-001 \
+  --release-repo owner/example-tool --release-tag v1.2.3 \
+  --source-sha "$SOURCE_SHA" \
+  --tool example-tool --asset-name example-tool-aarch64-pc-windows-msvc.exe \
+  --cargo-cache /home/builder/.cargo --offline > windows-arm64-result.json
+```
+
+`--tool` defaults to the binary name. `--asset-name` defaults to
+`<binary>-aarch64-pc-windows-msvc.exe`. These options require the complete release
+identity and must produce safe basenames. The artifact directory contains only
+that admitted executable; private evidence and the manifest live outside it.
+
+The source checkout must be the clean Git worktree root, with HEAD and the local
+release tag equal to `--source-sha`. Its origin must match `--release-repo` as a
+credential-free GitHub HTTPS or git SSH URL. All compiled local inputs must be
+committed, including `Cargo.lock`. Ignored/untracked files are not copied.
+
+The runner materializes raw Git blobs into `run/source`, checking their Git
+object hashes and preserving executable modes. It does not build directly from
+the original checkout or use `git archive`: export-ignore/export-subst attributes
+cannot silently alter the release source. Links, submodules, unsafe paths, and
+local Cargo path dependencies outside the committed snapshot are rejected.
+Sibling-repository staging is not supported by this release mode. The snapshot
+must also live outside ancestor Cargo configurations. The source commit's time
+sets `SOURCE_DATE_EPOCH` in the controlled build environment.
+
+Before and after compilation, the pinned Cargo runs complete, locked metadata
+resolution with `--filter-platform aarch64-pc-windows-msvc`, in the same snapshot
+and controlled top-level environment. The runner validates workspace membership,
+local manifest/target paths, dependency edges, binary selection, active required
+features, and package version equality with the release tag. Full canonical
+metadata graphs and selection receipts must agree before/after. `--timeout`
+bounds each metadata command as well as the build command, not the entire run.
+
+The admitted workspace package is passed explicitly to cargo-xwin. Its JSON
+compiler-artifact message must identify the selected package, binary source,
+feature set, non-test profile and exact target-directory executable, followed by
+a successful build-finished result. A pre-existing filename or a valid ARM64 PE
+header alone cannot satisfy these checks. Workspaces whose metadata and actual
+build feature resolution differ are rejected, not silently treated as equivalent.
+
+Every file in the committed snapshot is inventoried and rechecked after the
+build. New/deleted source files, byte or executable-mode changes, altered source
+receipts, dependency graphs, control files, toolchain pins or version evidence
+prevent release success. Evidence is producer-controlled local state, not a
+sandbox against malicious build scripts or a privileged concurrent writer.
+
+## Existing DSR publication handoff
+
+Successful release mode creates both files through one directory rename:
+
+- `run/release/build-manifest.json`: DSR schema `1.0.0`, one successful
+  `windows/arm64` target and its exact executable name/hash/size.
+- `run/release/result.json`: the verified build receipt, including the manifest's
+  path and SHA-256. Stdout contains this same receipt.
+
+The manifest retains the pinned repository/tag/commit, complete source inventory,
+Cargo graph digest and selection, toolchain/header/library evidence, tool version
+hashes, command and normalized build-influence environment. Full metadata and
+version output remain in the run directory. Large inventories are read through
+files rather than passed as process arguments.
+
+The runner validates its manifest using the same successful-build profile that
+DSR's manifest-bound payload publisher and SLSA mapper consume. The following is
+an explicit, separate publication step using the existing finalizer:
+
+```bash
+bash src/release_finalize.sh /var/tmp/dsr-runs/windows-arm64-release-001/artifacts \
+  --repo owner/example-tool --tag v1.2.3 --sha "$SOURCE_SHA" \
+  --create-draft --upload-payloads \
+  --build-manifest /var/tmp/dsr-runs/windows-arm64-release-001/release/build-manifest.json \
+  --output-dir /var/tmp/dsr-runs/windows-arm64-release-001/sbom
+```
+
+This example intentionally does not promote the draft. Signing, promotion,
+repository authentication, remote tag verification and downstream delivery remain
+the finalizer's explicit policies; see [RELEASE_FINALIZATION.md](RELEASE_FINALIZATION.md).
+A one-target manifest does not claim completion of a multi-platform release
+contract. Native orchestration state/resume and multi-target aggregation are not
+added by this standalone handoff. No GitHub API is called during the build.
+
+## What is enforced in both modes
 
 The runner uses a fresh HOME, Cargo home, target directory, and cargo-xwin
 working cache. The latter selects the verified sysroot using the clang
@@ -58,9 +152,8 @@ alias called `xwin` cannot substitute a different command.
 
 A project's own `.cargo/config` and `.cargo/config.toml` remain meaningful:
 their presence and bytes are captured before and after the build, alongside
-`Cargo.toml` and `Cargo.lock`. Configurations in ancestor directories are
-rejected; use DSR's existing source isolation before invoking this entry
-point. A local target JSON file cannot shadow the selected built-in target.
+`Cargo.toml` and `Cargo.lock`. Configurations in ancestors of the actual build
+snapshot are rejected. A local target JSON cannot shadow the built-in target.
 
 Required tool paths/hashes, generated tool-selection links, and captured
 version-output hashes are checked before and after execution. Full verbose
@@ -69,41 +162,45 @@ Cargo/rustc versions and normal cargo-xwin/LLVM versions are retained under
 the pinned archives after the build, rejecting missing or changed headers and
 libraries even when a local receipt has been edited to agree with them.
 
-On success, `result.json` and stdout contain the same JSON receipt with the
-artifact SHA-256/size, manifest identity, full toolchain evidence, source
-configuration hashes, command arguments, normalized invocation environment,
-version-output hashes, and build-log path. The artifact is copied into the
-run's `artifacts/` directory before verification. It must be a PE32+ executable
-with machine `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`), valid bounded headers and
-section data, and a file-backed executable entry point. Wrong architectures,
-DLLs, truncated files, and symlink outputs are rejected without executing them.
-This validates the executable container, not every Windows loader semantic.
+Ordinary mode returns `run/result.json`; release mode returns the manifest-bound
+pair described above. Both retain the artifact SHA-256/size, manifest identity,
+full toolchain evidence, source configuration hashes, command arguments,
+normalized invocation environment, version-output hashes and build-log path.
+The artifact is copied into `run/artifacts/` before verification. It must be a
+PE32+ executable with machine `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`), bounded
+headers and section data, and a file-backed executable entry point. Wrong
+architectures, DLLs, truncated files and symlink outputs are rejected without
+executing them. This validates the container, not every Windows loader semantic.
 
-Failure retains logs and `failure.json`, emits no success receipt, and never
-creates `result.json`. Partial files can remain in the failed run directory;
-only a successful receipt admits the artifact. Compiler exit codes are
-preserved; timeout returns 124 (or 137 for forced termination), cancellation
-returns 5, and validation drift returns 7. Cancellation propagates from the
-CLI to its owned compiler process group and does not signal unrelated builds.
+Failure retains logs and `failure.json` and emits no success receipt. Release
+validation failures do not publish `run/release/`. Partial files and private
+staging can remain; only the final receipt admits the artifact. Compiler exit
+codes are preserved; timeout returns 124 (or 137 for forced termination),
+cancellation returns 5, and validation drift returns 7. Cancellation propagates
+from the CLI to its owned compiler process group, not unrelated builds.
 
 ## Evidence limits and tests
 
-This receipt records the controlled top-level invocation, not every environment
-change performed by Cargo configuration or a build script. It does not attest
-every source file, dynamic library, standard-library component, nested tool,
-or compiler-generated subprocess. It is not signed provenance. Automatic
-propagation through strict native build state/public manifests remains under
-`bd-10we`.
+The receipts record the controlled top-level invocation, not every environment
+change performed by cargo-xwin, Cargo configuration or a build script. Metadata
+parity does not attest the plugin's internal compiler environment. Ordinary
+mode observes only source configuration files; release mode additionally pins
+the entire committed snapshot. Neither mode attests every dynamic library,
+standard-library component, remote dependency's bytes, nested tool or
+compiler-generated subprocess. This is not signed provenance. Automatic
+propagation through strict native build state remains under `bd-10we`.
 
 ```bash
 bash scripts/tests/test_xwin_toolchain.sh
 bash scripts/tests/test_xwin_build.sh
 bash scripts/tests/test_xwin_toolchain_scale.sh
+bash scripts/tests/test_xwin_source.sh
+bash scripts/tests/test_xwin_release_build.sh
 ```
 
 The build tests use command-boundary stand-ins for Cargo, rustc, and cargo-xwin,
-but real installed clang headers, NEON compilation, ARM64 import-library
-construction, and lld-link executable generation. They require Linux and LLVM
-and report a skip when those tools are absent. No actual BLAKE3 1.8.5 plus
-ring Rust build or Windows-host execution is claimed. That production
+but real Git source snapshots, installed clang headers, NEON compilation, ARM64
+import-library construction and lld-link executable generation. They require
+Linux and LLVM and report a skip when those tools are absent. No actual BLAKE3
+1.8.5 plus ring Rust build or Windows-host execution is claimed. That production
 acceptance check remains necessary before closing `dsr-h4y0`.
