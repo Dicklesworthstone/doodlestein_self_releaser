@@ -867,8 +867,86 @@ EOF
     fi
 }
 
+test_timeout_descendant_cancellation() {
+    log_test "Real timeout descendant cancellation"
+    if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+module = sys.argv[1]
+root = tempfile.mkdtemp(prefix="dsr-timeout-cancellation-")
+print("retained timeout fixture:", root)
+for case, seconds in (("cancel", 30), ("deadline", 1)):
+    marker = os.path.join(root, case + ".pid")
+    script = '''source "$1"
+_act_run_with_timeout "$2" bash -c 'sleep 30 & echo $! > "$1"; wait' _ "$3"
+'''
+    wrapper = subprocess.Popen(
+        ["bash", "-c", script, "_", module, str(seconds), marker],
+        start_new_session=True,
+    )
+    child = None
+    group = None
+    try:
+        for _ in range(100):
+            if os.path.exists(marker) and os.path.getsize(marker):
+                child = int(open(marker).read())
+                break
+            time.sleep(0.02)
+        assert child is not None, "timeout child did not start"
+        group = os.getpgid(child)
+        assert group != wrapper.pid, "exercise timeout's nested process group"
+        if case == "cancel":
+            os.killpg(wrapper.pid, signal.SIGTERM)
+        status = wrapper.wait(timeout=5)
+        assert status in ((-signal.SIGTERM, 143) if case == "cancel" else (124,)), (case, status)
+        for _ in range(100):
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child)],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(case + " left a running descendant")
+    finally:
+        # These process groups belong only to this newly spawned fixture.
+        for owned in (wrapper.pid, group):
+            if owned is not None:
+                try:
+                    os.killpg(owned, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        wrapper.wait(timeout=5)
+result = subprocess.run(
+    ["bash", "-c", 'source "$1"; _act_run_with_timeout 5 cat', "_", module],
+    input="stdin remains available\n", text=True, capture_output=True,
+)
+assert result.returncode == 0 and result.stdout == "stdin remains available\n", result
+result = subprocess.run(
+    ["bash", "-c", 'source "$1"; _act_run_with_timeout 5 bash -c "exit 7"', "_", module]
+)
+assert result.returncode == 7, result.returncode
+PY
+    then
+        log_pass "cancellation and deadline drain descendants; stdin and exit status survive"
+    else
+        log_fail "timeout subprocess lifetime regression"
+    fi
+}
+
 # Main
 main() {
+    if [[ "${1:-}" == "--timeout-only" ]]; then
+        test_timeout_descendant_cancellation
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     echo "═══════════════════════════════════════════════════════════════"
     echo "  act_runner.sh Unit Tests"
     echo "═══════════════════════════════════════════════════════════════"
@@ -892,6 +970,7 @@ main() {
     test_act_run_workflow_injects_tag_env
     test_act_run_workflow_isolates_parent_write_workflows
     test_act_analyze_workflow
+    test_timeout_descendant_cancellation
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════"

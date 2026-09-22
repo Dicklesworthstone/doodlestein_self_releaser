@@ -1780,17 +1780,39 @@ _act_timeout_cmd() {
     echo "$_ACT_TIMEOUT_CMD"
 }
 
-_act_run_with_timeout() {
+_act_run_with_timeout() (
     local seconds="$1"
     shift
     local cmd
     cmd=$(_act_timeout_cmd)
     if [[ -n "$cmd" ]]; then
-        "$cmd" "$seconds" "$@"
+        # GNU timeout creates its own process group. Forward cancellation from
+        # the orchestration group into that group before releasing our waiter.
+        # --foreground would lose timeout's descendant deadline enforcement.
+        local timeout_pid="" cancel_status=0
+        _act_timeout_cancel() {
+            # A signal may arrive between the background fork and recording $!.
+            # Defer forwarding until the exact owned PID is available.
+            cancel_status=$1
+            [[ -n "$timeout_pid" ]] || return 0
+            trap '' INT TERM
+            kill -TERM -- "-$timeout_pid" 2>/dev/null ||
+                kill -TERM "$timeout_pid" 2>/dev/null || true
+            wait "$timeout_pid" 2>/dev/null || true
+            exit "$1"
+        }
+        trap '_act_timeout_cancel 130' INT
+        trap '_act_timeout_cancel 143' TERM
+        "$cmd" "$seconds" "$@" <&0 &
+        timeout_pid=$!
+        if (( cancel_status != 0 )); then
+            _act_timeout_cancel "$cancel_status"
+        fi
+        wait "$timeout_pid"
     else
         "$@"
     fi
-}
+)
 
 # Return the first act config file in a home directory that has --bind without
 # a matching --user container option.
