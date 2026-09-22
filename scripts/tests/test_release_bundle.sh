@@ -60,6 +60,7 @@ make_plan() {
         required_targets:["linux/amd64","darwin/arm64","windows/arm64"],builds:.}' "$WORK/entries.jsonl" > "$dest" || exit 1
 }
 collect() { local plan=$1 output=$2; shift 2; release_bundle --plan "$plan" --output-dir "$output" "$@"; }
+[[ "${DSR_BUNDLE_FIXTURES_ONLY:-false}" != true ]] || return 0
 make_fixture "$WORK/builds"
 make_plan "$WORK/builds" "$WORK/plan.json"
 run_code 'dry run plans the entire target matrix' 0 collect "$WORK/plan.json" "$WORK/dry" --dry-run

@@ -127,6 +127,61 @@ This leaves a draft; signing and promotion remain explicit finalizer policies.
 Keep generated SBOM/signature metadata outside the immutable bundle payload
 directory. See `RELEASE_FINALIZATION.md` for publication and recovery options.
 
+## One-command finalization
+
+The existing finalizer entry point also accepts a build set directly:
+
+```bash
+bash src/release_finalize.sh --build-set /srv/build-set.json \
+  --bundle-dir /srv/release-bundle --create-draft \
+  --require-signatures --public-key /srv/keys/release.pub \
+  --secret-key /srv/keys/release.key
+```
+
+Collection must reach a verified complete matrix before the finalizer engine
+is called. Missing inputs return a single finalization JSON envelope with
+`status: waiting_for_builds` and exit `1`; ready checkpoints remain available.
+Repeating the same invocation resumes ingestion and then enters the existing
+manifest-bound payload upload, signing, SBOM and remote verification stages.
+An engine failure retains its exit code and diagnostic together with the bundle
+receipt; the same invocation reuses the stable aggregate on publication retry.
+
+The plan owns `--repo`, `--tag`, `--sha`, `--tool`, `--build-manifest` and
+`--upload-payloads`; do not supply those flags in build-set mode. Other supported
+finalizer policies remain explicit. `--create-draft` is not implied, and neither
+signing mode implies `--promote`. Add `--promote` only when publication of the
+verified draft is intended. Prepared-signature mode and downstream dispatch
+options pass through to the same existing engine and its checks.
+
+Metadata defaults to `bundle-dir/metadata` and finalization state to
+`bundle-dir/finalization`, outside the immutable `release/` and `inputs/`
+directories. Explicit output/state/integrity paths must be absolute and must
+stay outside those protected directories. This prevents a generated SBOM or
+state file from changing the admitted payload namespace and breaking retries.
+
+`--dry-run` validates the build-set plan and the option structure without
+collecting payloads or invoking the finalizer. It reports `policy_verified:
+false`: it has not authenticated a key, examined prepared signatures, contacted
+GitHub, or verified remote publication policy. The live engine still performs
+its full preflight before any release mutation.
+
+The original artifacts-first CLI and sourced `release_finalize` API are
+unchanged. A sourced caller uses `release_finalize_build_set --build-set FILE
+--bundle-dir DIR ...` for the new flow. The existing engine is retained without
+byte changes in `src/release_finalize_core.sh`; its source/signature/promotion
+and persistent dispatch gates have not been replaced by a second implementation.
+
+Run the handoff regression suite with:
+
+```bash
+bash scripts/tests/test_release_bundle_finalize.sh
+```
+
+This suite uses real bundle collection and manifest/payload validation, with a
+finalizer function-boundary stand-in instead of live GitHub publication. It
+checks that incomplete or corrupted sets cannot reach that boundary, that
+publication retries preserve identity, and that policy arguments remain exact.
+
 ## Boundaries
 
 This collects producer evidence; it does not authenticate it, recompile the
