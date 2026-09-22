@@ -21,7 +21,7 @@ _xwt_require() {
     [[ "$(uname -s)" == Linux ]] || {
         _xwt_log 'Toolchain preparation requires a Linux build host'; return 3;
     }
-    for tool in jq sha256sum flock find sort cp mv stat; do
+    for tool in jq sha256sum flock find sort cp mv stat cmp mktemp mkdir; do
         command -v "$tool" >/dev/null || { _xwt_log "Required tool missing: $tool"; return 3; }
     done
     if ! declare -F packaging_extract_payload >/dev/null; then
@@ -34,7 +34,7 @@ _xwt_require() {
 # parsers do not share one quoting convention. Archive input paths may contain
 # spaces; they are only ever passed as individual shell arguments.
 _xwt_manifest() {
-    jq -cSe 'def text: type=="string" and length>0 and (test("[\\x00-\\x1f\\x7f]")|not);
+    jq -csSe 'def text: type=="string" and length>0 and (test("[\\x00-\\x1f\\x7f]")|not);
         def hash: type=="string" and test("^[0-9a-f]{64}$");
         def relative: text and (startswith("/")|not) and
             (split("/")|all(.!="" and .!="." and .!=".." and (startswith("-")|not))) and
@@ -42,6 +42,7 @@ _xwt_manifest() {
         def archive: type=="object" and (keys==["path","prefix","sha256","url"]) and
             (.path|text and startswith("/")) and (.prefix|relative) and (.sha256|hash) and
             (.url|text and test("^https://[^/@?#]+/[^?#]+$") and (test("[[:space:]]")|not));
+        (if length==1 then .[0] else error("expected one manifest document") end) |
         if type=="object" and (keys==["aliases","headers","schema_version","sysroot","target","tools"]) and
             .schema_version==1 and .target=="aarch64-pc-windows-msvc" and
             (.sysroot|archive) and (.headers|archive) and
@@ -93,10 +94,12 @@ _xwt_inventory() (
         else
             return 7
         fi
-        jq -cn --arg path "$name" --arg type "$type" --arg sha "$hash" --argjson size "$size" \
-            '{path:$path,type:$type,sha256:$sha,size_bytes:$size}' >> "$index" || return 1
+        # Member validation forbids tabs/newlines. Encode JSON once, not once
+        # per SDK header, and never put the complete inventory in argv.
+        printf '%s\t%s\t%s\t%s\n' "$name" "$type" "$hash" "$size" >> "$index" || return 1
     done < "$index.sorted"
-    jq -csS 'sort_by(.path)' "$index"
+    jq -RcsS 'split("\n") | map(select(length>0) | split("\t") |
+        {path:.[0],type:.[1],sha256:.[2],size_bytes:(.[3]|tonumber)}) | sort_by(.path)' "$index"
 )
 
 # Snapshot before hashing/extraction so a changing input cannot select members
@@ -175,16 +178,14 @@ xwin_toolchain_prepare() (
     [[ -f "$manifest" && ! -L "$manifest" && "$mode" =~ ^(prepare|verify)$ ]] || return 4
     _xwt_require || return $?
     [[ -n "$root" ]] || root="${XDG_CACHE_HOME:-$HOME/.cache}/dsr/xwin-toolchains"
-    [[ "$root" == /* && "$root" != *[[:space:]]* && "$root" != *[\;\\:]* && ! -L "$root" ]] || return 4
-    local work plan key view expected actual evidence status=prepared
-    # Validate exactly one JSON document before the normal jq projection.
-    jq -es 'length==1' "$manifest" >/dev/null 2>&1 || return 4
+    [[ "$root" == /* && "$root" != *[[:space:][:cntrl:]]* && "$root" != *[\;\\:]* && ! -L "$root" ]] || return 4
+    local work plan key view status=prepared
     plan=$(_xwt_manifest "$manifest") || return $?
     _xwt_check_tools "$plan" || return $?
     if [[ "$mode" == verify && ! -d "$root" ]]; then return 7; fi
     mkdir -p -- "$root" || return 1
     root=$(cd "$root" && pwd -P) || return 1
-    [[ "$root" != *[[:space:]]* && "$root" != *[\;\\:]* ]] || return 4
+    [[ "$root" != *[[:space:][:cntrl:]]* && "$root" != *[\;\\:]* ]] || return 4
     work=$(mktemp -d "$root/.prepare.XXXXXXXX") || return 1
     trap 'rm -rf -- "$work"' EXIT
     trap 'exit 5' HUP INT TERM
@@ -199,29 +200,28 @@ xwin_toolchain_prepare() (
     _xwt_unpack "$plan" sysroot "$work" || return $?
     _xwt_unpack "$plan" headers "$work" || return $?
     _xwt_materialize "$plan" "$work" || return $?
-    expected=$(_xwt_inventory "$work/view" "$work/expected") || return $?
-    evidence=$(jq -cnS --arg key "$key" --argjson plan "$plan" --argjson files "$expected" \
-        '{schema_version:1,kind:"dsr-xwin-toolchain",manifest_sha256:$key,target:$plan.target,
-          inputs:$plan,files:$files}') || return 1
-    printf '%s\n' "$evidence" > "$work/view/evidence.json" || return 1
+    _xwt_inventory "$work/view" "$work/expected" > "$work/expected.json" || return $?
+    jq -cnS --arg key "$key" --slurpfile plan "$work/manifest.json" --slurpfile files "$work/expected.json" \
+        '{schema_version:1,kind:"dsr-xwin-toolchain",manifest_sha256:$key,target:$plan[0].target,
+          inputs:$plan[0],files:$files[0]}' > "$work/view/evidence.json" || return 1
     _xwt_check_tools "$plan" || return $?
     if [[ -d "$view" ]]; then
         [[ -f "$view/evidence.json" && ! -L "$view/evidence.json" ]] || return 7
         cmp -s "$work/view/evidence.json" "$view/evidence.json" || {
             _xwt_log 'Retained toolchain evidence differs from pinned inputs'; return 7;
         }
-        actual=$(_xwt_inventory "$view" "$work/actual") || return $?
-        [[ "$actual" == "$expected" ]] || { _xwt_log 'Retained toolchain files have drifted'; return 7; }
+        _xwt_inventory "$view" "$work/actual" > "$work/actual.json" || return $?
+        cmp -s "$work/actual.json" "$work/expected.json" || { _xwt_log 'Retained toolchain files have drifted'; return 7; }
         status=verified
     else
         mv -T -- "$work/view" "$view" || return 2
     fi
     _xwt_check_tools "$plan" || return $?
     _xwt_log "$status Windows ARM64 toolchain: $key"
-    jq -cn --arg status "$status" --arg view "$view" --arg key "$key" --argjson evidence "$evidence" \
+    jq -cn --arg status "$status" --arg view "$view" --arg key "$key" --slurpfile evidence "$view/evidence.json" \
         '{kind:"dsr-xwin-toolchain-result",status:$status,view:$view,manifest_sha256:$key,
-          evidence:$evidence,environment:{XWIN_CROSS_COMPILER:"clang",
-            XWIN_MSVC_SYSROOT_DOWNLOAD_URL:$evidence.inputs.sysroot.url,
+          evidence:$evidence[0],environment:{XWIN_CROSS_COMPILER:"clang",
+            XWIN_MSVC_SYSROOT_DOWNLOAD_URL:$evidence[0].inputs.sysroot.url,
             CFLAGS:("-nobuiltininc -isystem "+$view+"/include"),
             CXXFLAGS:("-nobuiltininc -isystem "+$view+"/include"),LIB:($view+"/lib")}}'
 )
