@@ -201,14 +201,17 @@ _xwb_source_location() {
 # Cargo-xwin's internal subprocess environment is not asserted by this receipt.
 _xwb_metadata() {
     local project="$1" run="$2" phase="$3" binary="$4" package="$5" version="$6" offline="$7" seconds="$8" argument
+    local source_set_receipt="${9:-}"
     local -a environment=() command=("$run/bin/cargo" metadata --locked --format-version 1
         --filter-platform aarch64-pc-windows-msvc --manifest-path "$project/Cargo.toml")
+    local -a source_args=()
+    [[ -z "$source_set_receipt" ]] || source_args=("$source_set_receipt")
     while IFS= read -r -d '' argument; do environment+=("$argument"); done < "$run/environment.nul"
     [[ "$offline" == false ]] || command+=(--offline)
     _xwb_run "$project" "$run/metadata-$phase.log" "$seconds" --stdout "$run/metadata-$phase.raw.json" \
         env -i "${environment[@]}" "${command[@]}" || return $?
     xwin_source_metadata "$run/metadata-$phase.raw.json" "$project" "$binary" "$package" \
-        "$run/metadata-$phase.json" "$version" > "$run/selection-$phase.json"
+        "$run/metadata-$phase.json" "$version" "${source_args[@]}" > "$run/selection-$phase.json"
 }
 
 # Emit the established DSR manifest profile, not a parallel release format.
@@ -222,6 +225,12 @@ _xwb_export_release() {
     finished=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || return 1
     duration=$(( $(date +%s) - started ))
     ((duration >= 0)) || return 7
+    # Dependency pins must survive both graph admissions and the manifest
+    # handoff; an omitted list must not turn a sibling build into a root-only
+    # release. Full repository/tree/file evidence remains in source_snapshot.
+    jq -en --slurpfile source "$run/release-source.json" --slurpfile selection "$run/selection-after.json" '
+        (($source[0].dependencies // [] | map({relative_path,git_sha}) | sort_by(.relative_path)) ==
+         ($selection[0].source_dependencies | sort_by(.relative_path)))' >/dev/null || return 7
     mkdir "$run/.release-ready" || return 2
     jq -cn --arg tag "$tag" --arg tool "$tool" --arg asset "$asset" --arg uuid "$uuid" \
         --arg finished "$finished" --argjson duration "$duration" --arg source_hash "$source_hash" \
@@ -230,7 +239,8 @@ _xwb_export_release() {
         $result[0] as $r | $source[0] as $s |
         {schema_version:"1.0.0",tool:$tool,version:$tag,run_id:$uuid,
          build_purpose:"release",publishable:true,requested_targets:["windows/arm64"],
-         source:{git_sha:$s.git_sha,git_ref:$s.git_ref,repository:$s.repository,dependencies:[],
+         source:{git_sha:$s.git_sha,git_ref:$s.git_ref,repository:$s.repository,
+             dependencies:($s.dependencies // [] | map({relative_path,git_sha}) | sort_by(.relative_path)),
              snapshot_sha256:$s.snapshot_sha256,receipt_sha256:$source_hash},
          built_at:$finished,duration_ms:($duration*1000),status:"success",
          summary:{total:1,success:1,failed:0},
@@ -249,7 +259,9 @@ _xwb_export_release() {
     [[ "$(_xwt_hash "$run/artifacts/$asset")" == "$(jq -r '.artifact.sha256' "$run/.result.json")" ]] || return 7
     manifest_sha=$(_xwt_hash "$run/.release-ready/build-manifest.json") || return $?
     jq -c --arg path "$run/release/build-manifest.json" --arg sha "$manifest_sha" \
-        '.+{release_manifest:{path:$path,sha256:$sha}}' "$run/.result.json" \
+        --slurpfile selection "$run/selection-after.json" \
+        '.+{release_manifest:{path:$path,sha256:$sha},source_dependencies:$selection[0].source_dependencies,
+            resolved_siblings:$selection[0].resolved_siblings}' "$run/.result.json" \
         > "$run/.release-ready/result.json" || return 1
     [[ ! -e "$run/release" && ! -L "$run/release" ]] || return 2
     mv -T -- "$run/.release-ready" "$run/release" || return 1
@@ -263,13 +275,14 @@ _xwb_build() {
     umask 077
     local manifest='' project='' run='' binary='' package='' cache='' cargo_cache='' seconds=3600 offline=false
     local release_repo='' release_tag='' release_tool='' source_sha='' asset_name='' release=false
+    local sibling_crates='' sibling_hash='' source_set_receipt=''
     local -A seen=()
     while (($#)); do
         [[ -n "$1" && -z "${seen[$1]:-}" ]] || return 4
         seen[$1]=1
         case "$1" in
             --offline) offline=true; shift ;;
-            --manifest|--project|--run-dir|--bin|--package|--cache-dir|--cargo-cache|--timeout|--release-repo|--release-tag|--source-sha|--tool|--asset-name)
+            --manifest|--project|--run-dir|--bin|--package|--cache-dir|--cargo-cache|--timeout|--release-repo|--release-tag|--source-sha|--tool|--asset-name|--sibling-crates)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --manifest) manifest=$2 ;; --project) project=$2 ;; --run-dir) run=$2 ;;
@@ -277,6 +290,7 @@ _xwb_build() {
                     --cargo-cache) cargo_cache=$2 ;; --timeout) seconds=$2 ;;
                     --release-repo) release_repo=$2 ;; --release-tag) release_tag=$2 ;;
                     --source-sha) source_sha=$2 ;; --tool) release_tool=$2 ;; --asset-name) asset_name=$2 ;;
+                    --sibling-crates) sibling_crates=$2 ;;
                 esac
                 shift 2 ;;
             *) _xwt_log "Unknown build option: $1"; return 4 ;;
@@ -289,7 +303,7 @@ _xwb_build() {
        "$seconds" =~ ^[0-9]{1,5}$ ]] || return 4
     seconds=$((10#$seconds))
     ((seconds > 0 && seconds <= 86400)) || return 4
-    if [[ -n "$release_repo$release_tag$source_sha$release_tool$asset_name" ]]; then
+    if [[ -n "$release_repo$release_tag$source_sha$release_tool$asset_name$sibling_crates" ]]; then
         [[ -n "$release_repo" && -n "$release_tag" && "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return 4
         release=true
         [[ -n "$release_tool" ]] || release_tool=$binary
@@ -299,6 +313,7 @@ _xwb_build() {
         # shellcheck source=src/xwin_source.sh
         source "$_XWIN_BUILD_DIR/xwin_source.sh" || return 3
         python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || return 3
+        [[ -z "$sibling_crates" || ( -f "$sibling_crates" && ! -L "$sibling_crates" ) ]] || return 4
     else
         asset_name="$binary.exe"
     fi
@@ -338,10 +353,22 @@ _xwb_build() {
     trap "$exit_trap" EXIT
     trap _xwb_interrupt HUP INT TERM
     if [[ "$release" == true ]]; then
-        xwin_source_snapshot "$project" "$source_sha" "$release_tag" "$release_repo" \
-            "$run/source" "$run/release-source.json" || return $?
+        if [[ -n "$sibling_crates" ]]; then
+            # Freeze operator-selected pins before reading any sibling. Only
+            # this copy is consumed, and its identity is retained across all
+            # compiler/metadata/version commands along with the source receipt.
+            cp -- "$sibling_crates" "$run/sibling-crates.json" || return 1
+            sibling_hash=$(_xwt_hash "$run/sibling-crates.json") || return $?
+            xwin_source_snapshot_set "$project" "$source_sha" "$release_tag" "$release_repo" \
+                "$run/source" "$run/release-source.json" "$run/sibling-crates.json" || return $?
+            project="$run/source/project"
+            source_set_receipt="$run/release-source.json"
+        else
+            xwin_source_snapshot "$project" "$source_sha" "$release_tag" "$release_repo" \
+                "$run/source" "$run/release-source.json" || return $?
+            project="$run/source"
+        fi
         source_hash=$(_xwt_hash "$run/release-source.json") || return $?
-        project="$run/source"
         _xwb_source_location "$project" "$target" || return $?
         uuid=$(python3 -c 'import uuid; print(uuid.uuid4())') || return 1
     fi
@@ -387,13 +414,14 @@ _xwb_build() {
     _xwb_source_inputs "$project" > "$run/source-before.json" || return $?
     _xwb_versions "$plan" "$project" "$run/versions-before" "$run/environment.nul" > "$run/versions-before.json" || return $?
     if [[ "$release" == true ]]; then
-        _xwb_metadata "$project" "$run" before "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" || return $?
+        _xwb_metadata "$project" "$run" before "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" || return $?
         metadata_hash=$(_xwt_hash "$run/metadata-before.json") || return $?
         selection_hash=$(_xwt_hash "$run/selection-before.json") || return $?
         # Make Cargo build the very package admitted by metadata, even for a
         # virtual workspace with multiple default members.
         package=$(jq -r '.package' "$run/selection-before.json") || return 7
-        xwin_source_verify "$project" "$run/release-source.json" || return $?
+        xwin_source_verify "$run/source" "$run/release-source.json" || return $?
+        [[ -z "$sibling_hash" || "$(_xwt_hash "$run/sibling-crates.json")" == "$sibling_hash" ]] || return 7
     fi
     # Invoke the pinned plugin directly: a project's Cargo alias named xwin
     # must not substitute a different executable for the attested plugin.
@@ -420,10 +448,11 @@ _xwb_build() {
         [[ "$source_hash" == "$(_xwt_hash "$run/release-source.json")" &&
            "$metadata_hash" == "$(_xwt_hash "$run/metadata-before.json")" &&
            "$selection_hash" == "$(_xwt_hash "$run/selection-before.json")" ]] || return 7
-        _xwb_metadata "$project" "$run" after "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" || return $?
+        [[ -z "$sibling_hash" || "$(_xwt_hash "$run/sibling-crates.json")" == "$sibling_hash" ]] || return 7
+        _xwb_metadata "$project" "$run" after "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" || return $?
         cmp -s "$run/metadata-before.json" "$run/metadata-after.json" || { _xwt_log 'Cargo dependency graph changed'; return 7; }
         cmp -s "$run/selection-before.json" "$run/selection-after.json" || return 7
-        xwin_source_verify "$project" "$run/release-source.json" || return $?
+        xwin_source_verify "$run/source" "$run/release-source.json" || return $?
         jq -es --slurpfile selected "$run/selection-after.json" \
             --arg path "$run/target/$target/release/$binary.exe" --arg project "$project" '
             all(.[];type=="object") and
@@ -458,6 +487,7 @@ _xwb_build() {
           build_influence_env:$environment[0],command:$command[0],tool_versions:$versions[0],
           toolchain:$toolchain[0].evidence,build_log:($run+"/build.log")}' > "$run/.result.json" || return 1
     if [[ "$release" == true ]]; then
+        [[ -z "$sibling_hash" || "$(_xwt_hash "$run/sibling-crates.json")" == "$sibling_hash" ]] || return 7
         _xwb_export_release "$run" "$release_repo" "$release_tag" "$release_tool" "$asset_name" "$source_hash" "$uuid" "$started"
         return $?
     fi

@@ -79,9 +79,9 @@ The runner materializes raw Git blobs into `run/source`, checking their Git
 object hashes and preserving executable modes. It does not build directly from
 the original checkout or use `git archive`: export-ignore/export-subst attributes
 cannot silently alter the release source. Links, submodules, unsafe paths, and
-local Cargo path dependencies outside the committed snapshot are rejected.
-Sibling-repository staging is not supported by this release mode. The snapshot
-must also live outside ancestor Cargo configurations. The source commit's time
+local Cargo path dependencies outside the admitted source roots are rejected.
+Sibling repositories require the explicit pins described below. The snapshot
+must also live outside ancestor Cargo configurations. The primary commit's time
 sets `SOURCE_DATE_EPOCH` in the controlled build environment.
 
 Before and after compilation, the pinned Cargo runs complete, locked metadata
@@ -104,6 +104,79 @@ build. New/deleted source files, byte or executable-mode changes, altered source
 receipts, dependency graphs, control files, toolchain pins or version evidence
 prevent release success. Evidence is producer-controlled local state, not a
 sandbox against malicious build scripts or a privileged concurrent writer.
+
+### Pinned sibling repositories
+
+Projects using `path = "../helper"` can include independently committed local
+dependencies by adding `--sibling-crates /opt/pinned/siblings.json` to the
+release-mode invocation. This flag requires the complete release identity; it
+does not enable unpinned dependencies in ordinary mode. The input is a JSON
+array, not a second toolchain manifest or an automatically loaded repos.d file:
+
+```json
+[
+  {
+    "relative_path": "helper",
+    "local_path": "/home/builder/projects/helper",
+    "revision": "<reviewed full 40-character helper commit>",
+    "repo": "owner/helper"
+  },
+  {
+    "relative_path": "types",
+    "local_path": "/home/builder/projects/types",
+    "revision": "<reviewed full 40-character types commit>",
+    "repo": "owner/types"
+  }
+]
+```
+
+Replace the deliberately invalid placeholders with reviewed commit pins. Each
+descriptor must contain exactly these four fields. Supply 1..32 repositories
+with absolute checkout paths and unique safe destination basenames; `project`
+is reserved, and case-insensitive name collisions are rejected. Each checkout
+must be a clean Git worktree root with HEAD equal to its selected revision and
+origin matching its selected GitHub repository. Sibling libraries need a
+committed `Cargo.toml`, but do not need a lockfile or the primary's release tag.
+All source-tree admissions finish before the source boundary is created.
+
+The runner freezes the input plan in `run/sibling-crates.json`, and stages:
+
+```text
+run/source/
+  project/   # primary release commit; actual Cargo working directory
+  helper/    # separately pinned helper commit
+  types/     # separately pinned transitive dependency commit
+```
+
+`../helper` from the primary and `../types` from helper therefore retain their
+normal relative layout. Every repository is materialized from raw Git blobs,
+not its mutable working directory. No Cargo manifest or dependency path is
+rewritten. The primary lockfile must already describe the selected dependency
+graph. Unlisted roots, absolute references back to the original checkout, and
+dependencies escaping these sibling roots fail admission. Nested layouts that
+cannot be represented by these sibling basenames are not supported.
+
+Both metadata observations validate local manifests and target sources against
+the admitted source set. Only the primary repository can supply the selected
+release binary. Its reachable sibling names are recorded in `resolved_siblings`;
+all explicitly staged dependency revisions are retained in `source_dependencies`
+on the final result and in `source.dependencies` on the release manifest.
+Declared but unused siblings remain identified as staged inputs, not asserted
+to have compiled. The full per-repository Git tree, origin, commit, timestamp
+and file-inventory evidence remains in the manifest's `source_snapshot`.
+
+These compact dependency pins use the same `{relative_path, git_sha}` records
+consumed by the existing SLSA mapper and release-bundle collector. A bundle can
+therefore require matching sibling revisions across native and Windows shards;
+it does not discard them when combining targets. See
+[RELEASE_BUNDLES.md](RELEASE_BUNDLES.md) for aggregation.
+
+The entire staged boundary is reverified before and after compilation and again
+at release export, including sibling file bytes, executable modes and the
+top-level source namespace. A changed private sibling plan, source receipt or
+dependency graph prevents a successful release. Later changes to the original
+checkout do not alter a previously completed snapshot. No original repository,
+tag, lockfile, or installed toolchain is modified by this staging step.
 
 ## Existing DSR publication handoff
 
@@ -201,6 +274,10 @@ bash scripts/tests/test_xwin_release_build.sh
 The build tests use command-boundary stand-ins for Cargo, rustc, and cargo-xwin,
 but real Git source snapshots, installed clang headers, NEON compilation, ARM64
 import-library construction and lld-link executable generation. They require
-Linux and LLVM and report a skip when those tools are absent. No actual BLAKE3
+Linux and LLVM and report a skip when those tools are absent. Sibling integration
+tests additionally compile C from one committed sibling with a header from a
+second, verify that a changed reviewed header pin changes the linked bytes,
+and reject staged sibling/plan/metadata drift without emitting a release.
+These are not actual Cargo path-dependency compilation tests. No actual BLAKE3
 1.8.5 plus ring Rust build or Windows-host execution is claimed. That production
 acceptance check remains necessary before closing `dsr-h4y0`.
