@@ -117,6 +117,8 @@ else:
     response = {'kind':'dsr-xwin-build', 'status':'verified', 'exit_code':0,
                 'release_manifest':{'path':str(manifest), 'sha256':hashlib.sha256(manifest.read_bytes()).hexdigest()}}
 if mode == 'wrong-receipt': response['exit_code'] = 7
+if mode == 'null-details': response['details'] = None
+if mode == 'array-details': response['details'] = []
 print(json.dumps(response))
 ''')
     script = repo / "src/release_builds.sh"
@@ -203,11 +205,18 @@ print(json.dumps(response))
     check('interrupted import completion is reconciled without rebuilding', trace.read_bytes()==before_trace and read(output/'state.json')['jobs']['linux']['complete'] is not None)
     # Drive individual native failure gates through the real collector.
     single=dict(plan,required_targets=a['targets'],builds=[a]); encode(work/'single.json',single)
-    for mode in ('wrong-source','bad-hash','diagnostic','config-drift','extra-config','silent','wrong-receipt'):
+    for mode in ('wrong-source','bad-hash','diagnostic','config-drift','extra-config','silent','wrong-receipt','null-details','array-details'):
         controls['linux'].write_text(mode)
         folder=work/('reject-'+mode)
         run(folder,1,work/'single.json')
         check(mode+' never admits a completed checkpoint', not (folder/'completed/linux').exists() and not (folder/'bundle').exists())
+    controls['linux'].write_text('null-details')
+    mixed = dict(plan, required_targets=['linux/amd64', 'darwin/arm64'], builds=[a, b])
+    encode(work/'malformed-mixed.json', mixed)
+    result = run(work/'malformed-mixed', 1, work/'malformed-mixed.json', extra=('--jobs', '2'))
+    check('malformed completion does not cancel an independent successful job',
+          result['failed_builds']==['linux'] and result['completed_builds']==1 and
+          (work/'malformed-mixed/completed/darwin/build-manifest.json').is_file())
     controls['linux'].write_text('good')
     # Missing reviewed file/hash fails before any child starts.
     changed=json.loads(json.dumps(single)); changed['builds'][0]['config_files']['config.yaml']='0'*64; encode(work/'badpin.json',changed)
@@ -251,6 +260,36 @@ print(json.dumps(response))
     check('cancellation kills compiler descendants',stopped(int(Path(str(controls['linux'])+'.pid').read_text())))
     controls['linux'].write_text('good'); run(work/'cancel',selected=work/'slow.json')
     check('interrupted attempt is retained while a fresh retry succeeds', [r['status'] for r in read(work/'cancel/state.json')['jobs']['linux']['attempts']]==['interrupted','completed'])
+    # A killed coordinator cannot perform finally cleanup. Its live driver
+    # must nevertheless retain the inherited lock and prevent a second build.
+    controls['linux'].write_text('slow')
+    prior=trace.read_text().count('start')
+    out=open(work/'crash.stdout','wb'); err=open(work/'crash.stderr','wb')
+    proc=subprocess.Popen(['bash',str(script),'--plan',str(work/'slow.json'),'--output-dir',str(work/'crash')],stdout=out,stderr=err)
+    group=None
+    try:
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline and trace.read_text().count('start')==prior: time.sleep(.03)
+        check('crash probe reached its own native driver',trace.read_text().count('start')>prior)
+        event=json.loads(trace.read_text().splitlines()[-1])
+        group=os.getpgid(event['pid'])
+        check('crash probe driver owns a separate process group',group!=os.getpgrp())
+        proc.kill(); proc.wait(timeout=5)
+        run(work/'crash',2,work/'slow.json')
+        check('live driver keeps the coordinator lock after parent SIGKILL',not stopped(event['pid']))
+    finally:
+        if group is not None:
+            try: os.killpg(group,signal.SIGTERM)
+            except ProcessLookupError: pass
+        if proc.poll() is None:
+            proc.terminate(); proc.wait(timeout=10)
+        out.close();err.close()
+    deadline=time.monotonic()+10
+    while time.monotonic()<deadline and not stopped(event['pid']): time.sleep(.03)
+    check('crash probe driver has terminated before recovery',stopped(event['pid']))
+    controls['linux'].write_text('good'); run(work/'crash',selected=work/'slow.json')
+    check('crash recovery never adopts unacknowledged compiler output',
+          [r['status'] for r in read(work/'crash/state.json')['jobs']['linux']['attempts']]==['interrupted','completed'])
     controls['linux'].write_text('leak'); run(work/'leak',selected=work/'single.json')
     check('successful builder cannot leave detached group children running',stopped(int(Path(str(controls['linux'])+'.pid').read_text())))
     controls['linux'].write_text('good')

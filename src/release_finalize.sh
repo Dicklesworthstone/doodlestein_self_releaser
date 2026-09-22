@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Public entry point for existing finalization and complete build-set ingestion.
+# Public entry point for finalization, build-set ingestion and build execution.
 # The existing engine is retained byte-for-byte in release_finalize_core.sh.
 _RELEASE_FINALIZE_ENTRY_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/release_finalize_core.sh
 source "$_RELEASE_FINALIZE_ENTRY_DIR/release_finalize_core.sh" || { return 3 2>/dev/null || exit 3; }
 
-# Build-set mode owns repo/tag/SHA/tool and the aggregate manifest. Publication
+# Build-plan/set mode owns repo/tag/SHA/tool and the aggregate manifest. Publication
 # policy remains explicit and is still checked by the existing engine.
-_rf_build_set_execute() (
+_rf_build_set_execute() {
     set -uo pipefail
     local plan='' bundle='' dry="${DRY_RUN:-false}" option value work canonical
     local require_signatures=false prepared=false create=false promote=false dispatch=''
     local public='' secret='' integrity='' notes='' title='' prerelease=false retry_creation=false
     local dispatch_run='' dispatch_state='' retry_delivery=false format=spdx metadata='' state=''
+    local build_plan='' build_dir='' build_jobs=1 build_worker=0 cleanup
     local -a forwarded=() collect_args=()
     local -A seen=()
     while (($#)); do
@@ -21,17 +22,18 @@ _rf_build_set_execute() (
         [[ -n "$option" && -z "${seen[$option]:-}" ]] || return 4
         seen[$option]=1
         case "$option" in
-            --build-set|--bundle-dir|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir)
+            --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 value=$2
                 case "$option" in
                     --build-set) plan=$value ;; --bundle-dir) bundle=$value ;;
+                    --build-plan) build_plan=$value ;; --build-dir) build_dir=$value ;; --build-jobs) build_jobs=$value ;;
                     --format) format=$value ;; --output-dir) metadata=$value ;; --state-dir) state=$value ;;
                     --public-key) public=$value ;; --secret-key) secret=$value ;; --integrity-dir) integrity=$value ;;
                     --release-name) title=$value ;; --release-notes-file) notes=$value ;;
                     --dispatch-repos) dispatch=$value ;; --dispatch-run-id) dispatch_run=$value ;; --dispatch-state-dir) dispatch_state=$value ;;
                 esac
-                case "$option" in --build-set|--bundle-dir) ;; *) forwarded+=("$option" "$value") ;; esac
+                case "$option" in --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs) ;; *) forwarded+=("$option" "$value") ;; esac
                 shift 2 ;;
             --dry-run) dry=true; shift ;;
             --require-signatures|--prepared-signatures|--create-draft|--promote|--prerelease|--retry-creation|--retry-uncertain)
@@ -44,7 +46,16 @@ _rf_build_set_execute() (
             *) printf '[release-finalize] Unknown or plan-owned build-set option: %s\n' "$option" >&2; return 4 ;;
         esac
     done
-    [[ -f "$plan" && ! -L "$plan" && "$dry" =~ ^(true|false)$ ]] || return 4
+    [[ "$dry" =~ ^(true|false)$ ]] || return 4
+    if [[ -n "$build_plan" ]]; then
+        [[ -z "$plan$bundle" && -f "$build_plan" && ! -L "$build_plan" && -n "$build_dir" &&
+           "$build_jobs" =~ ^[0-9]{1,2}$ ]] || return 4
+        build_jobs=$((10#$build_jobs))
+        ((build_jobs >= 1 && build_jobs <= 32)) || return 4
+        bundle="$build_dir/bundle"
+    else
+        [[ -f "$plan" && ! -L "$plan" && -z "$build_dir" && -z "${seen[--build-jobs]:-}" ]] || return 4
+    fi
     case "$format" in spdx|spdx-json|cyclonedx|cdx|cyclonedx-json) ;; *) return 4 ;; esac
     if [[ "$prepared" == true ]]; then
         [[ "$require_signatures" == false && -z "$secret" && -n "$public" && -n "$integrity" ]] || return 4
@@ -68,11 +79,16 @@ _rf_build_set_execute() (
     # shellcheck source=src/release_bundle.sh
     source "$_RELEASE_FINALIZE_ENTRY_DIR/release_bundle.sh" || return 3
     _rb_require || return $?
+    [[ -z "$build_plan" ]] || _rb_path "$build_dir" || return 4
     _rb_path "$bundle" || return 4
     [[ "$bundle" != / && "$bundle" != */ ]] || return 4
     for value in "$metadata" "$state" "$integrity" "$dispatch_state"; do
         [[ -n "$value" ]] || continue
         _rb_path "$value" || return 4
+        if [[ -n "$build_plan" && ( "$value" == "$build_dir" || "$value" == "$build_dir/"* ) &&
+              "$value" != "$bundle/"* ]]; then
+            _rb_log 'Finalizer outputs inside a build directory must stay in its bundle namespace'; return 4
+        fi
         case "$value" in
             "$bundle"|"$bundle/"|"$bundle/release"|"$bundle/release/"*|"$bundle/inputs"|"$bundle/inputs/"*)
                 _rb_log 'Finalizer output/state must stay outside immutable release and input directories'; return 4 ;;
@@ -81,9 +97,66 @@ _rf_build_set_execute() (
     [[ -n "$metadata" ]] || forwarded+=(--output-dir "$bundle/metadata")
     [[ -n "$state" ]] || forwarded+=(--state-dir "$bundle/finalization")
     work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-build-set-finalize.XXXXXXXX") || return 1
-    trap 'rm -rf -- "$work"' EXIT
-    trap 'exit 5' HUP INT TERM
-    canonical=$(_rb_plan "$plan") || return $?
+    printf -v cleanup 'rm -rf -- %q' "$work"
+    # shellcheck disable=SC2064
+    trap "$cleanup" EXIT
+    _rf_build_plan_cancel() {
+        trap '' HUP INT TERM
+        if ((build_worker > 0)); then
+            kill -TERM "$build_worker" 2>/dev/null || true
+            wait "$build_worker" 2>/dev/null || true
+        fi
+        exit 5
+    }
+    trap _rf_build_plan_cancel HUP INT TERM
+    printf 'null\n' > "$work/build-result.json" || return 1
+    if [[ -n "$build_plan" ]]; then
+        # Validate policy syntax above before any expensive builds. The engine
+        # still authenticates keys and checks live release policy afterward.
+        bash "$_RELEASE_FINALIZE_ENTRY_DIR/release_builds.sh" --plan "$build_plan" \
+            --output-dir "$build_dir" --jobs "$build_jobs" --dry-run > "$work/build-preview.json" || return $?
+        jq -ecs 'if length==1 and (.[0]|.kind=="dsr-release-builds" and .status=="planned" and
+            .exit_code==0 and .dry_run==true and .publishable==false)
+            then .[0].plan else error("invalid build plan preview") end' \
+            "$work/build-preview.json" > "$work/execution-plan.json" || return 7
+        if [[ "$dry" == true ]]; then
+            jq -cn --args '$ARGS.positional' -- "${forwarded[@]}" > "$work/options.json" || return 1
+            jq -cn --slurpfile builds "$work/build-preview.json" --slurpfile options "$work/options.json" \
+                '{kind:"dsr-release-finalization-result",status:"planned",exit_code:0,dry_run:true,
+                  stage:"build-plan",builds:$builds[0],finalization_options:$options[0],policy_verified:false}'
+            return $?
+        fi
+        local build_rc=0 build_set_pin
+        bash "$_RELEASE_FINALIZE_ENTRY_DIR/release_builds.sh" --plan "$work/execution-plan.json" \
+            --output-dir "$build_dir" --jobs "$build_jobs" > "$work/build-result.json" &
+        build_worker=$!
+        wait "$build_worker" || build_rc=$?
+        build_worker=0
+        jq -es --argjson rc "$build_rc" 'length==1 and (.[0]|.kind=="dsr-release-builds" and .exit_code==$rc)' \
+            "$work/build-result.json" >/dev/null || return 7
+        if ((build_rc != 0)); then
+            jq -cn --argjson rc "$build_rc" --slurpfile builds "$work/build-result.json" \
+                '{kind:"dsr-release-finalization-result",status:(if $rc==1 then "builds_incomplete" else "error" end),
+                  exit_code:$rc,dry_run:false,stage:"build",builds:$builds[0]}'
+            return "$build_rc"
+        fi
+        jq -es --arg root "$build_dir" --slurpfile preview "$work/build-preview.json" '
+            length==1 and (.[0]|.status=="verified" and .publishable==true and .dry_run==false and
+                .plan_sha256==$preview[0].plan_sha256 and .build_set==($root+"/build-set.json") and
+                .bundle.status=="verified" and .bundle.targets==$preview[0].plan.required_targets and
+                (.build_set_sha256|type=="string" and test("^[0-9a-f]{64}$")))' \
+            "$work/build-result.json" >/dev/null || return 7
+        build_set_pin=$(jq -r .build_set_sha256 "$work/build-result.json") || return 1
+        [[ "$(_slsa_sha256 "$build_dir/build-set.json")" == "$build_set_pin" ]] || return 7
+        canonical=$(_rb_plan "$build_dir/build-set.json") || return $?
+        [[ "$(_slsa_sha256 "$build_dir/build-set.json")" == "$build_set_pin" ]] || return 7
+        jq -en --slurpfile expected "$work/execution-plan.json" --argjson actual "$canonical" '
+            $expected[0] as $p | all(["repo","tool","tag","source_sha","required_targets"][];
+                . as $key | $actual[$key]==$p[$key]) and
+            ($actual.builds|map({id,targets}))==($p.builds|map({id,targets}))' >/dev/null || return 7
+    else
+        canonical=$(_rb_plan "$plan") || return $?
+    fi
     printf '%s\n' "$canonical" > "$work/plan.json" || return 1
     local repo tag sha tool pin rc=0 result
     repo=$(jq -r .repo "$work/plan.json") || return 1
@@ -131,21 +204,35 @@ _rf_build_set_execute() (
         .exit_code==$rc and (if $rc==0 then (.status=="ready" or .status=="published" or .status=="complete") else true end))' \
         "$work/finalization.json" >/dev/null || return 7
     [[ "$(_slsa_sha256 "$bundle/release/build-manifest.json")" == "$pin" ]] || return 7
-    result=$(jq -c --slurpfile bundle "$work/collection.json" '.+{bundle:$bundle[0]}' "$work/finalization.json") || return 1
+    result=$(jq -c --slurpfile bundle "$work/collection.json" --slurpfile builds "$work/build-result.json" \
+        '.+{bundle:$bundle[0]} | if $builds[0]==null then . else .+{builds:$builds[0]} end' "$work/finalization.json") || return 1
     printf '%s\n' "$result"
     return "$rc"
-)
+}
 
 # The sourced legacy release_finalize API is unchanged. The build-set API is
 # explicit and returns exactly one envelope, including collection failures.
-release_finalize_build_set() (
-    local work rc=0
+_rf_build_set_result() {
+    local work rc=0 worker cleanup interrupted=false
     command -v jq >/dev/null || return 3
     umask 077
     work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-build-set-result.XXXXXXXX") || return 1
-    trap 'rm -rf -- "$work"' EXIT
-    trap 'exit 5' HUP INT TERM
-    _rf_build_set_execute "$@" > "$work/result.json" 2> "$work/diagnostics" || rc=$?
+    printf -v cleanup 'rm -rf -- %q' "$work"
+    # shellcheck disable=SC2064
+    trap "$cleanup" EXIT
+    _rf_build_set_execute "$@" > "$work/result.json" 2> "$work/diagnostics" &
+    worker=$!
+    _rf_build_set_cancel() {
+        trap '' HUP INT TERM
+        interrupted=true
+        kill -TERM "$worker" 2>/dev/null || true
+    }
+    trap _rf_build_set_cancel HUP INT TERM
+    wait "$worker" || rc=$?
+    if [[ "$interrupted" == true ]]; then
+        wait "$worker" 2>/dev/null || true
+        rc=5
+    fi
     if jq -es --argjson rc "$rc" 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and .exit_code==$rc)' \
         "$work/result.json" >/dev/null 2>&1; then
         cat "$work/result.json"
@@ -157,7 +244,10 @@ release_finalize_build_set() (
               error:(if $error=="" then "Build-set finalization failed" else $error end)}' || return 1
     fi
     return "$rc"
-)
+}
+
+release_finalize_build_set() ( _rf_build_set_result "$@"; )
+release_finalize_build_plan() ( _rf_build_set_result "$@"; )
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
@@ -165,8 +255,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             bash "$_RELEASE_FINALIZE_ENTRY_DIR/release_finalize_core.sh" --help || exit $?
             printf '\n%s\n' 'Build set: --build-set PLAN.json --bundle-dir DIR [existing finalizer policy options]' \
                 'Collect the complete pinned target matrix before any release API call; retry resumes verified imports.' \
-                'Identity, manifest and --upload-payloads come from the plan. Signing and --promote remain explicit.' ;;
-        --build-set) release_finalize_build_set "$@"; exit $? ;;
+                'Identity, manifest and --upload-payloads come from the plan. Signing and --promote remain explicit.'
+            printf '\n%s\n' 'Build plan: --build-plan PLAN.json --build-dir DIR [--build-jobs N] [finalizer policy options]' \
+                'Execute native/xwin jobs, retain completed checkpoints, assemble every target, then finalize.' ;;
+        --build-set|--build-plan) _rf_build_set_result "$@"; exit $? ;;
         *) release_finalize "$@"; exit $? ;;
     esac
 fi

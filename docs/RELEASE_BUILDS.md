@@ -148,8 +148,8 @@ A local advisory lock is held for the whole run and inherited by driver process
 trees. Another coordinator cannot start while those owners still hold it, even
 when the original coordinator dies. Do not unlink the lock to bypass a live
 owner. SIGTERM/SIGINT/HUP cancel only the current invocation's process groups;
-no PID read from state is signaled. Child processes are stopped after timeout,
-cancellation, or normal driver exit. The coordinator retains attempt logs.
+no PID read from state is signaled. Owned process-group descendants are stopped
+after timeout, cancellation, or normal driver exit. The coordinator retains logs.
 This does not guarantee cancellation of a remote host after a network partition.
 
 The completed `build-set.json` feeds the existing finalizer without constructing
@@ -175,3 +175,64 @@ Run `bash scripts/tests/test_release_builds.sh` for subprocess, retry, timeout,
 cancellation, configuration-pin and collector admission tests. The tests run real
 processes and filesystem/hash operations, with explicit stand-ins at native and
 xwin compiler-driver boundaries; they do not claim live host or Rust execution.
+
+## Build and finalize in one invocation
+
+The existing finalizer can execute the input plan before collecting and publishing
+the selected outputs. Supply `--build-plan` as the first option:
+
+```bash
+bash src/release_finalize.sh --build-plan /srv/release-plan.json \
+  --build-dir /srv/release-run --build-jobs 2 \
+  --create-draft --require-signatures \
+  --public-key /srv/keys/release.pub --secret-key /srv/keys/release.key
+```
+
+This command does not imply `--promote`. Its publication stage uses the unchanged
+finalizer engine, including its source, signature, SBOM, remote verification and
+recovery checks. Add `--promote` only when publishing the verified draft is intended.
+The sourced API is `release_finalize_build_plan` with the same arguments.
+
+Build-plan mode is mutually exclusive with `--build-set` and `--bundle-dir`.
+It owns repository, tag, source SHA, tool, manifest and payload-upload selection;
+do not supply `--repo`, `--tag`, `--sha`, `--tool`, `--build-manifest`, or
+`--upload-payloads` yourself. `--build-jobs` is the controller's job-concurrency
+bound; native per-job target concurrency still comes from the input plan.
+
+Before starting builders, the entry point validates option structure, signature
+mode conflicts, local policy-file selections and output-directory constraints.
+This is not cryptographic key validation or remote policy admission: the real
+engine performs those checks after successful builds and before its release
+mutations. A bad signing key can therefore fail finalization after compilation,
+while leaving the completed build checkpoints available. Policy files are selected
+again by the engine when publication begins; they are not attested build inputs.
+
+Failed builds return one finalization envelope with `stage: build`,
+`status: builds_incomplete`, exit `1`, and the controller's result. No finalizer
+engine invocation occurs until every job passes manifest/payload admission.
+Repeating the same command retries failed jobs, revalidates completed ones, and
+then enters finalization. The generated build set is rechecked against the frozen
+input plan's identity, job IDs, targets and manifest hashes before handoff.
+
+Successful execution retains `builds` and `bundle` receipts alongside the engine's
+finalization result. A publication failure preserves its exit code and diagnostic;
+the same command retries without recompiling already-admitted jobs. CLI signal
+handling forwards cancellation through the finalizer worker to the build
+coordinator and its owned compiler process groups, returning exit `5` rather than
+a completion claim. Attempt logs and recoverable checkpoints are retained.
+
+Metadata defaults to `build-dir/bundle/metadata`, and finalization state to
+`build-dir/bundle/finalization`. Explicit output/state/integrity paths under the
+build directory must remain in its bundle namespace, outside `bundle/release`
+and `bundle/inputs`. They cannot overlap build attempts or completed checkpoints.
+
+Combined `--dry-run` validates the input plan and policy-option structure without
+executing builders, creating build state, or invoking the publication engine.
+It reports `policy_verified: false`. The existing artifacts-first and build-set
+entry points continue to use their original result shapes.
+
+Run `bash scripts/tests/test_release_builds_finalize.sh` for combined execution,
+failed-target gating, publication retries, exact policy forwarding and cancellation
+tests. Native compilation and the network finalizer are explicit boundary
+stand-ins; the coordinator, bundle collector and local manifest/payload validation
+run normally. No live GitHub publication or native-host execution is claimed.

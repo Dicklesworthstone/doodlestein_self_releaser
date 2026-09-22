@@ -325,7 +325,8 @@ def finish_job(item):
                 "builder did not return a typed completion object")
         if job["driver"] == "dsr":
             require(response.get("command") == "build" and response.get("status") == "success" and response.get("exit_code") == 0 and
-                    response.get("details", {}).get("manifest") == str(manifest), "native completion envelope does not bind its manifest")
+                    isinstance(response.get("details"), dict) and response["details"].get("manifest") == str(manifest),
+                    "native completion envelope does not bind its manifest")
             for filename, pin in job["config_files"].items():
                 require(digest(attempt / "config" / filename) == pin, "native configuration snapshot changed")
             actual = set()
