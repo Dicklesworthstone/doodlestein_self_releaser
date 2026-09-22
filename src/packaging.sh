@@ -364,13 +364,32 @@ packaging_build_archive() (
 # then prove both archives carry identical files, bytes and executable bits.
 # Same-format source archives are authoritative and copied byte-for-byte,
 # never recompressed. Equivalent existing cross-format destinations are reused.
+# Optional trailing arguments `<include_root> <include>...` stage configured
+# companion files (README/LICENSE style include_files) from <include_root>
+# into the payload before the destination archive is built. Regression
+# context (rano v0.2.1): the native staging lane wraps a lone binary into an
+# archive, and a payload-preserving repack then shipped that archive without
+# the LICENSE the previous release carried, silently. Includes are subject to
+# the same member-safety rules as extracted payload members, may never shadow
+# a payload member, and force a rebuild even when source and destination
+# formats match (a byte-copy of the source could not contain them).
 packaging_repack_archive() (
     local src="$1"
     local src_format="$2"
     local dest="$3"
     local dest_format="$4"
+    local include_root="${5:-}"
+    shift 4
+    [[ $# -eq 0 ]] || shift
+    local -a includes=("$@")
 
     [[ -f "$src" && ! -L "$src" ]] || return 4
+    if [[ ${#includes[@]} -gt 0 ]]; then
+        [[ -n "$include_root" && -d "$include_root" && ! -L "$include_root" ]] || {
+            _pkg_log_error "Include root is not a directory: ${include_root:-<empty>}"
+            return 4
+        }
+    fi
     if [[ "$src" -ef "$dest" ]]; then
         _pkg_log_error "Repack source and destination are the same file: $src"
         return 4
@@ -399,7 +418,45 @@ packaging_repack_archive() (
 
     packaging_extract_payload "$src" "$src_format" "$payload" || return $?
 
-    if [[ "$src_format" == "$dest_format" ]]; then
+    local include include_parent
+    for include in "${includes[@]}"; do
+        if ! packaging_member_is_safe "$include"; then
+            _pkg_log_error "Refusing unsafe include member: $include"
+            return 4
+        fi
+        if ! _pkg_path_has_no_links "$include_root" "$include" || \
+           [[ ! -f "$include_root/$include" ]]; then
+            _pkg_log_error "Include is missing or not a regular non-symlink file: $include"
+            return 4
+        fi
+        if [[ -e "$payload/$include" || -L "$payload/$include" ]] || \
+           ! _pkg_path_has_no_links "$payload" "$include"; then
+            _pkg_log_error "Include collides with an archive payload member: $include"
+            return 4
+        fi
+        include_parent=$(dirname "$payload/$include")
+        mkdir -p -- "$include_parent" || return 4
+        cp -- "$include_root/$include" "$payload/$include" || return 4
+        if [[ -x "$include_root/$include" ]]; then
+            chmod 0755 "$payload/$include" || return 4
+        else
+            chmod 0644 "$payload/$include" || return 4
+        fi
+        members+=("$include")
+    done
+    if [[ ${#includes[@]} -gt 0 ]]; then
+        # The parity contract now covers payload members plus includes.
+        src_members=$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)
+    fi
+
+    if [[ ${#includes[@]} -gt 0 ]]; then
+        if [[ -f "$dest" ]] && \
+           _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" 2>/dev/null; then
+            _pkg_log_info "Reusing verified archive that already carries the configured includes: $dest"
+            return 0
+        fi
+        packaging_build_archive "$dest_format" "$staged" "$payload" "${members[@]}" || return $?
+    elif [[ "$src_format" == "$dest_format" ]]; then
         if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
             _pkg_log_info "Reusing byte-identical prebuilt archive: $dest"
             return 0

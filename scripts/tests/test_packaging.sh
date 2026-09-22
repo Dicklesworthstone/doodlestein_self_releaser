@@ -681,6 +681,192 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+log_test "packaging_repack_archive stages configured include_files (GH#16)"
+
+# The native staging lane wraps a lone binary into an archive; the repack
+# must be able to add README/LICENSE style includes from the repo checkout
+# instead of preserving the thinner member set silently.
+INC_DIR="$TEMP_DIR/include-root"
+INC_PAYLOAD="$TEMP_DIR/lone-payload"
+mkdir -p "$INC_DIR" "$INC_PAYLOAD"
+printf 'fake-rano-binary-%s\n' "$RANDOM" > "$INC_PAYLOAD/rano"
+chmod 0755 "$INC_PAYLOAD/rano"
+printf 'MIT license text\n' > "$INC_DIR/LICENSE"
+printf '# rano\n' > "$INC_DIR/README.md"
+chmod 0644 "$INC_DIR/LICENSE" "$INC_DIR/README.md"
+LONE_GZ="$TEMP_DIR/rano-lone.tar.gz"
+packaging_build_archive tar.gz "$LONE_GZ" "$INC_PAYLOAD" rano
+[[ "$(sorted_members "$LONE_GZ" tar.gz)" == "rano" ]] && \
+    log_pass "lone-binary fixture archive contains only the binary" || \
+    log_fail "lone-binary fixture archive contains only the binary"
+
+INC_XZ="$TEMP_DIR/rano-with-includes.tar.xz"
+if packaging_repack_archive "$LONE_GZ" tar.gz "$INC_XZ" tar.xz "$INC_DIR" LICENSE README.md; then
+    log_pass "repack with includes succeeds"
+else
+    log_fail "repack with includes succeeds"
+fi
+INC_MEMBERS=$(sorted_members "$INC_XZ" tar.xz 2>/dev/null)
+EXPECTED_INC_MEMBERS=$(printf 'LICENSE\nREADME.md\nrano\n')
+[[ "$INC_MEMBERS" == "$EXPECTED_INC_MEMBERS" ]] && \
+    log_pass "repacked archive carries binary plus includes" || \
+    log_fail "repacked archive carries binary plus includes ('$INC_MEMBERS')"
+INC_EXTRACT="$TEMP_DIR/extract-includes"
+mkdir -p "$INC_EXTRACT"
+packaging_extract_payload "$INC_XZ" tar.xz "$INC_EXTRACT"
+cmp -s "$INC_DIR/LICENSE" "$INC_EXTRACT/LICENSE" && cmp -s "$INC_PAYLOAD/rano" "$INC_EXTRACT/rano" && \
+    log_pass "include and binary bytes preserved" || log_fail "include and binary bytes preserved"
+[[ -x "$INC_EXTRACT/rano" && ! -x "$INC_EXTRACT/LICENSE" ]] && \
+    log_pass "executable bits: binary kept, include not executable" || \
+    log_fail "executable bits: binary kept, include not executable"
+
+# Same-format repack with includes must rebuild rather than byte-copy.
+INC_SAME="$TEMP_DIR/rano-same-format.tar.gz"
+packaging_repack_archive "$LONE_GZ" tar.gz "$INC_SAME" tar.gz "$INC_DIR" LICENSE
+[[ "$(sorted_members "$INC_SAME" tar.gz 2>/dev/null)" == "$(printf 'LICENSE\nrano\n')" ]] && \
+    log_pass "same-format repack with includes rebuilds the archive" || \
+    log_fail "same-format repack with includes rebuilds the archive"
+
+# A verified destination that already carries the includes is reused.
+before_inc_sha=$(shasum -a 256 "$INC_XZ" | awk '{print $1}')
+packaging_repack_archive "$LONE_GZ" tar.gz "$INC_XZ" tar.xz "$INC_DIR" LICENSE README.md >/dev/null 2>&1
+after_inc_sha=$(shasum -a 256 "$INC_XZ" | awk '{print $1}')
+[[ "$before_inc_sha" == "$after_inc_sha" ]] && \
+    log_pass "destination already carrying includes is reused unchanged" || \
+    log_fail "destination already carrying includes is reused unchanged"
+
+# Includes may never shadow a payload member, escape the root, or be links.
+packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc1.tar.xz" tar.xz "$INC_PAYLOAD" rano 2>/dev/null && \
+    log_fail "include colliding with payload member refused" || \
+    log_pass "include colliding with payload member refused"
+packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc2.tar.xz" tar.xz "$INC_DIR" ../LICENSE 2>/dev/null && \
+    log_fail "include escaping the root refused" || log_pass "include escaping the root refused"
+packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc3.tar.xz" tar.xz "$INC_DIR" MISSING 2>/dev/null && \
+    log_fail "missing include refused" || log_pass "missing include refused"
+ln -s LICENSE "$INC_DIR/LINKED"
+packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc4.tar.xz" tar.xz "$INC_DIR" LINKED 2>/dev/null && \
+    log_fail "symlink include refused" || log_pass "symlink include refused"
+packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc5.tar.xz" tar.xz "" LICENSE 2>/dev/null && \
+    log_fail "empty include root refused" || log_pass "empty include root refused"
+for bad in "$TEMP_DIR"/bad-inc*.tar.xz; do
+    [[ -e "$bad" ]] && log_fail "refused repack left no artifact ($(basename "$bad"))"
+done
+ls "$TEMP_DIR"/.dsr-repack.* >/dev/null 2>&1 && \
+    log_fail "refused repacks leave no workdir behind" || log_pass "refused repacks leave no workdir behind"
+
+# ---------------------------------------------------------------------------
+log_test "dsr packager adds missing include_files on the lone-binary lane (GH#16)"
+
+if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
+    run_build_package_with_repo() {
+        # $1 = configured format, $2 = artifact path, $3 = output dir,
+        # $4 = versioned name, $5 = repo_path, $6 = warn log file
+        local cfg_format="$1" override="$2" outdir="$3" versioned="$4" repo="$5" warnlog="$6"
+        (
+            set -uo pipefail
+            log_info() { :; }
+            log_warn() { echo "$*" >> "$warnlog"; }
+            log_error() { echo "ERR: $*" >&2; }
+            declare -A existing_archive_formats=()
+            # shellcheck disable=SC2034
+            existing_archive_formats["linux/amd64"]="tar.gz"
+            _build_get_archive_format() { echo "$cfg_format"; }
+            _build_detect_compat_ext() { echo ""; }
+            _build_detect_install_ext() { return 0; }
+            _build_find_binary() { return 0; }
+            _build_get_include_files() { printf 'LICENSE\nREADME.md\nCHANGELOG.md\n'; }
+            _build_is_archive_ext() {
+                case "$1" in
+                    *.tar.gz|*.tgz|*.tar.xz|*.zip) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+            artifact_naming_generate_dual_for_tool() {
+                printf '{"versioned":"%s","compat":"%s"}\n' "$versioned" "$versioned"
+            }
+            _build_manifest_add_entry() { :; }
+            _build_emit_compat_alias() { :; }
+            _build_emit_binary_alias() { :; }
+            source "$PROJECT_ROOT/src/packaging.sh"
+            # shellcheck disable=SC1090
+            source "$EXTRACTED"
+            _build_package_archive_for_target "rano" "0.2.1" "linux/amd64" \
+                "$outdir" "$repo" "rano" "$override"
+        )
+    }
+
+    # The rano v0.2.1 shape: lane produced a lone-binary tar.gz, config wants
+    # tar.xz, LICENSE and README.md exist in the checkout, CHANGELOG.md does
+    # not (must warn, not fail).
+    RANO_OUT="$TEMP_DIR/rano-out"
+    mkdir -p "$RANO_OUT"
+    RANO_GZ="$RANO_OUT/rano-lone.tar.gz"
+    cp "$LONE_GZ" "$RANO_GZ"
+    RANO_WARN="$RANO_OUT/warnings.log"
+    : > "$RANO_WARN"
+    run_build_package_with_repo "tar.xz" "$RANO_GZ" "$RANO_OUT" \
+        "rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz" "$INC_DIR" "$RANO_WARN" >/dev/null 2>&1
+    RANO_XZ="$RANO_OUT/rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz"
+    [[ "$(sorted_members "$RANO_XZ" tar.xz 2>/dev/null)" == "$EXPECTED_INC_MEMBERS" ]] && \
+        log_pass "lone-binary tar.gz -> tar.xz gains LICENSE and README.md" || \
+        log_fail "lone-binary tar.gz -> tar.xz gains LICENSE and README.md ('$(sorted_members "$RANO_XZ" tar.xz 2>/dev/null)')"
+    grep -q "Include file not found for rano: CHANGELOG.md" "$RANO_WARN" && \
+        log_pass "missing configured include is warned about" || \
+        log_fail "missing configured include is warned about"
+
+    # Same-format lane archive already occupying the release name: bytes are
+    # left alone (receipts may bind to them) but the omission is reported.
+    RANO_OUT2="$TEMP_DIR/rano-out2"
+    mkdir -p "$RANO_OUT2"
+    RANO_GZ2="$RANO_OUT2/rano-0.2.1-x86_64-unknown-linux-gnu.tar.gz"
+    cp "$LONE_GZ" "$RANO_GZ2"
+    RANO_WARN2="$RANO_OUT2/warnings.log"
+    : > "$RANO_WARN2"
+    before_rano_sha=$(shasum -a 256 "$RANO_GZ2" | awk '{print $1}')
+    run_build_package_with_repo "tar.gz" "$RANO_GZ2" "$RANO_OUT2" \
+        "rano-0.2.1-x86_64-unknown-linux-gnu.tar.gz" "$INC_DIR" "$RANO_WARN2" >/dev/null 2>&1
+    after_rano_sha=$(shasum -a 256 "$RANO_GZ2" | awk '{print $1}')
+    [[ "$before_rano_sha" == "$after_rano_sha" ]] && \
+        log_pass "same-format release-named archive is not mutated" || \
+        log_fail "same-format release-named archive is not mutated"
+    grep -q "lacks configured include_files: LICENSE README.md" "$RANO_WARN2" && \
+        log_pass "same-format omission is reported loudly" || \
+        log_fail "same-format omission is reported loudly"
+
+    # Same-format lane archive under a non-release name is rebuilt with the
+    # includes into the release name.
+    RANO_OUT3="$TEMP_DIR/rano-out3"
+    mkdir -p "$RANO_OUT3"
+    RANO_GZ3="$RANO_OUT3/rano-lone.tar.gz"
+    cp "$LONE_GZ" "$RANO_GZ3"
+    RANO_WARN3="$RANO_OUT3/warnings.log"
+    : > "$RANO_WARN3"
+    run_build_package_with_repo "tar.gz" "$RANO_GZ3" "$RANO_OUT3" \
+        "rano-0.2.1-x86_64-unknown-linux-gnu.tar.gz" "$INC_DIR" "$RANO_WARN3" >/dev/null 2>&1
+    [[ "$(sorted_members "$RANO_OUT3/rano-0.2.1-x86_64-unknown-linux-gnu.tar.gz" tar.gz 2>/dev/null)" == "$EXPECTED_INC_MEMBERS" ]] && \
+        log_pass "same-format lane archive is rebuilt with includes under the release name" || \
+        log_fail "same-format lane archive is rebuilt with includes under the release name"
+
+    # Unresolved local_path with configured includes: warn, never silent.
+    RANO_OUT4="$TEMP_DIR/rano-out4"
+    mkdir -p "$RANO_OUT4"
+    RANO_GZ4="$RANO_OUT4/rano-lone.tar.gz"
+    cp "$LONE_GZ" "$RANO_GZ4"
+    RANO_WARN4="$RANO_OUT4/warnings.log"
+    : > "$RANO_WARN4"
+    run_build_package_with_repo "tar.xz" "$RANO_GZ4" "$RANO_OUT4" \
+        "rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz" "" "$RANO_WARN4" >/dev/null 2>&1
+    grep -q "local_path is unresolved" "$RANO_WARN4" && \
+        log_pass "unresolved local_path with include_files is warned about" || \
+        log_fail "unresolved local_path with include_files is warned about"
+    [[ "$(sorted_members "$RANO_OUT4/rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz" tar.xz 2>/dev/null)" == "rano" ]] && \
+        log_pass "unresolved local_path still produces the payload-only archive" || \
+        log_fail "unresolved local_path still produces the payload-only archive"
+else
+    log_skip "dsr include_files packager scenarios (extraction unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed, $SKIP_COUNT skipped"
 [[ $FAIL_COUNT -eq 0 ]] || exit 1

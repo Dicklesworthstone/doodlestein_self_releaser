@@ -12,6 +12,19 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- Configured `include_files` (LICENSE, README.md, ...) were silently dropped
+  from release archives whenever the build lane had already wrapped the
+  payload in an archive: the payload-preserving repack kept the lane's exact
+  member set, and a same-format lane archive was reused untouched, so
+  `rano` v0.2.1 built without the MIT notice v0.2.0 carried and no warning
+  ever fired (#16). The packager now compares the lane archive's members
+  against the configured includes, stages any missing ones from the repo
+  checkout into the rebuilt archive (same safety rules as payload members:
+  no path escapes, no links, no shadowing of a payload member), warns about
+  a configured include that is absent from the checkout, warns instead of
+  mutating when the lane archive already occupies the release name, and
+  warns when `local_path` cannot be resolved at all.
+
 - Windows hosts whose OpenSSH `DefaultShell` is PowerShell could not run any
   generated command: a command sent as `powershell -Command "..."` is parsed
   by that outer PowerShell first, which expands every `$variable` inside the

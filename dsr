@@ -2995,10 +2995,29 @@ EOF
             return 0
         fi
 
+        local -a include_files=()
+        local include
+        while IFS= read -r include; do
+            [[ -z "$include" ]] && continue
+            include_files+=("$include")
+        done < <(_build_get_include_files "$tool" 2>/dev/null)
+        if [[ ${#include_files[@]} -gt 0 && -z "$repo_path" && "$format" != "binary" ]]; then
+            # A configured include list with nowhere to read it from must
+            # never degrade into a quietly thinner archive (GH#16).
+            log_warn "include_files configured for $tool (${include_files[*]}) but local_path is unresolved; $target archive will omit them"
+        fi
+
         local existing_format="${existing_archive_formats[$target]:-}"
         if [[ -n "$existing_format" && "$existing_format" == "$format" ]]; then
-            log_info "Archive already produced for $tool $target ($format); skipping packaging"
-            return 0
+            if [[ ${#include_files[@]} -gt 0 && -n "$repo_path" && "$format" != "binary" ]]; then
+                # Fall through: the lane's archive may lack the configured
+                # include_files, which is verified against its member list
+                # below (GH#16) rather than assumed.
+                :
+            else
+                log_info "Archive already produced for $tool $target ($format); skipping packaging"
+                return 0
+            fi
         fi
 
         local naming_ext="$format"
@@ -3046,14 +3065,47 @@ EOF
             fi
             local normalized_format="$format"
             [[ "$format" == "tgz" ]] && normalized_format="tar.gz"
+
+            # The build lane may have wrapped a lone binary (or a workspace
+            # payload) without the configured include_files. Determine which
+            # includes the produced archive still lacks so the repack adds
+            # them instead of silently preserving a thinner member set (GH#16:
+            # rano v0.2.1 lost its LICENSE this way, with no diagnostic).
+            local -a missing_includes=()
+            if [[ -n "$repo_path" && ${#include_files[@]} -gt 0 ]]; then
+                local existing_members
+                existing_members=$(packaging_payload_members "$binary_path" "$input_format" 2>/dev/null || echo "")
+                for include in "${include_files[@]}"; do
+                    if [[ ! -f "$repo_path/$include" ]]; then
+                        log_warn "Include file not found for $tool: $include"
+                    elif ! grep -qxF -- "$include" <<< "$existing_members"; then
+                        missing_includes+=("$include")
+                    fi
+                done
+            fi
+
             if [[ "$input_format" == "$normalized_format" ]]; then
-                log_info "Archive already produced for $tool $target ($format); skipping packaging"
-                return 0
+                if [[ ${#missing_includes[@]} -gt 0 && "$binary_path" -ef "$archive_path" ]]; then
+                    # The lane's archive already occupies the release name;
+                    # rebuilding it in place would sever any receipt bound
+                    # to its bytes, so report loudly instead of mutating.
+                    log_warn "Archive $versioned_name for $tool $target lacks configured include_files: ${missing_includes[*]}"
+                    return 0
+                fi
+                if [[ ${#missing_includes[@]} -eq 0 ]]; then
+                    log_info "Archive already produced for $tool $target ($format); skipping packaging"
+                    return 0
+                fi
             fi
             if [[ -f "$archive_path" ]]; then
                 log_warn "Overwriting existing archive: $archive_path"
             fi
-            if packaging_repack_archive "$binary_path" "$input_format" "$archive_path" "$normalized_format"; then
+            local -a repack_includes=()
+            if [[ ${#missing_includes[@]} -gt 0 ]]; then
+                repack_includes=("$repo_path" "${missing_includes[@]}")
+                log_info "Adding configured include_files to $versioned_name: ${missing_includes[*]}"
+            fi
+            if packaging_repack_archive "$binary_path" "$input_format" "$archive_path" "$normalized_format" "${repack_includes[@]}"; then
                 log_info "Rebuilt $format archive independently from $(basename "$binary_path") payload: $versioned_name"
                 _build_manifest_add_entry "$archive_path" "$target" "$format"
                 if [[ -n "$compat_name" && "$compat_name" != "$versioned_name" ]] && \
@@ -3065,13 +3117,6 @@ EOF
             fi
             return 0
         fi
-
-        local -a include_files=()
-        local include
-        while IFS= read -r include; do
-            [[ -z "$include" ]] && continue
-            include_files+=("$include")
-        done < <(_build_get_include_files "$tool" 2>/dev/null)
 
         if [[ "$format" == "binary" ]]; then
             if [[ -f "$archive_path" ]]; then
