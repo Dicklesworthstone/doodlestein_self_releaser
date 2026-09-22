@@ -8,6 +8,15 @@ xwin_source_snapshot() {
     _xws_source snapshot "$@"
 }
 
+# Args: project commit tag repo new_source_boundary receipt sibling_plan.json
+# The primary lives at boundary/project; ../<relative_path> dependencies keep
+# their Cargo layout without rewriting manifests or copying working-tree bytes.
+xwin_source_snapshot_set() {
+    [[ $# == 7 ]] || return 4
+    command -v python3 >/dev/null && command -v git >/dev/null || return 3
+    _xws_source snapshot-set "$@"
+}
+
 xwin_source_verify() {
     [[ $# == 2 ]] || return 4
     command -v python3 >/dev/null || return 3
@@ -89,27 +98,20 @@ def publish(path, value):
     finally:
         os.unlink(temporary)
 
-try:
-    mode = sys.argv[1]
-    if mode == "verify":
-        root, receipt = map(Path, sys.argv[2:])
-        evidence = read_json(receipt)
-        require(evidence.get("schema_version") == 1 and evidence.get("kind") == "dsr-xwin-source", "invalid source receipt")
-        files = inventory(root)
-        require(files == evidence.get("files"), "source snapshot changed during the build")
-        require(hashlib.sha256(canonical(files)).hexdigest() == evidence.get("snapshot_sha256"), "source inventory digest mismatch")
-        sys.exit(0)
-    require(mode == "snapshot", "unknown source operation")
-    project, commit, tag, repo, destination, receipt = sys.argv[2:]
-    require(re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40, "expected an explicit SHA-1 source commit")
-    require(re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", tag), "expected a version tag")
-    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo) and ".." not in repo, "invalid release repository")
+def digest_files(files):
+    return hashlib.sha256(canonical(files)).hexdigest()
+
+def sibling_name(name):
+    require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name)
+            and ".." not in name and name.lower() != "project", "invalid or reserved sibling name")
+
+def inspect_project(project, commit, tag, repo):
+    require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40, "expected an explicit SHA-1 source commit")
+    require(tag is None or re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", tag), "expected a version tag")
+    require(isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo) and ".." not in repo, "invalid source repository")
     project = Path(project)
     require(project.is_dir() and not project.is_symlink(), "invalid project directory")
     project = project.resolve()
-    root, receipt = Path(destination), Path(receipt)
-    require(root.is_absolute() and root.parent.is_dir() and not root.exists() and not root.is_symlink(), "snapshot destination must be a new absolute directory")
-    require(not receipt.is_relative_to(root), "receipt must live outside the source snapshot")
     environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_NO_REPLACE_OBJECTS="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
@@ -118,7 +120,8 @@ try:
         return subprocess.run(command + list(args), env=environment, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
     require(Path(os.fsdecode(git("rev-parse", "--show-toplevel")).strip()).resolve() == project, "project must be the Git worktree root")
     require(git("rev-parse", "--verify", "HEAD^{commit}").decode().strip() == commit, "HEAD differs from the selected source commit")
-    require(git("rev-parse", "--verify", "refs/tags/" + tag + "^{commit}").decode().strip() == commit, "local release tag differs from the selected commit")
+    if tag is not None:
+        require(git("rev-parse", "--verify", "refs/tags/" + tag + "^{commit}").decode().strip() == commit, "local release tag differs from the selected commit")
     require(not git("status", "--porcelain=v1", "-z", "--untracked-files=normal"), "source checkout must be clean")
     origin = git("config", "--get", "remote.origin.url").decode().strip()
     require(origin in ("https://github.com/" + repo, "https://github.com/" + repo + ".git",
@@ -140,13 +143,20 @@ try:
         require(re.fullmatch(r"[0-9a-f]{40}", oid), "invalid Git object identity")
         entries.append((name, file_mode, oid))
     require(entries and len(entries) <= 100000, "empty or oversized source tree")
-    require({"Cargo.toml", "Cargo.lock"}.issubset({item[0] for item in entries}), "Cargo.toml and Cargo.lock must both be committed")
+    required = {"Cargo.toml", "Cargo.lock"} if tag is not None else {"Cargo.toml"}
+    require(required.issubset({item[0] for item in entries}), "required Cargo manifests/lockfile must be committed")
+    return {"project": str(project), "command": command, "environment": environment, "entries": entries,
+            "identity": {"repository": "https://github.com/" + repo, "git_sha": commit,
+                         "git_ref": "refs/tags/" + tag if tag is not None else commit,
+                         "git_tree": tree, "source_date_epoch": int(epoch)}}
+
+def write_snapshot(selection, root):
     root.mkdir(mode=0o700)
     # Read raw Git objects, not a working tree or git archive: attributes such
     # as export-ignore/export-subst must not silently change release inputs.
-    process = subprocess.Popen(command + ["cat-file", "--batch"], env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    process = subprocess.Popen(selection["command"] + ["cat-file", "--batch"], env=selection["environment"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
-        for name, file_mode, oid in entries:
+        for name, file_mode, oid in selection["entries"]:
             process.stdin.write((oid + "\n").encode("ascii"))
             process.stdin.flush()
             object_header = process.stdout.readline().decode("ascii").split()
@@ -173,10 +183,78 @@ try:
             process.wait()
         process.stdout.close()
     files = inventory(root)
-    evidence = {"schema_version": 1, "kind": "dsr-xwin-source", "repository": "https://github.com/" + repo,
-                "git_sha": commit, "git_ref": "refs/tags/" + tag, "git_tree": tree,
-                "source_date_epoch": int(epoch), "files": files,
-                "snapshot_sha256": hashlib.sha256(canonical(files)).hexdigest()}
+    return {"schema_version": 1, "kind": "dsr-xwin-source", **selection["identity"],
+            "files": files, "snapshot_sha256": digest_files(files)}
+
+def verify(root, evidence):
+    require(evidence.get("schema_version") == 1 and evidence.get("kind") == "dsr-xwin-source", "invalid source receipt")
+    files = inventory(root)
+    require(files == evidence.get("files"), "source snapshot changed during the build")
+    require(digest_files(files) == evidence.get("snapshot_sha256"), "source inventory digest mismatch")
+    if "primary_path" in evidence:
+        require(evidence["primary_path"] == "project", "invalid primary source layout")
+        dependencies = evidence.get("dependencies")
+        require(isinstance(dependencies, list) and 0 < len(dependencies) <= 32, "invalid pinned sibling set")
+        names = []
+        for dependency in dependencies:
+            name = dependency["relative_path"]
+            sibling_name(name)
+            names.append(name)
+            require(re.fullmatch(r"[0-9a-f]{40}", dependency["git_sha"]) and dependency["git_sha"] != "0" * 40, "invalid sibling revision")
+            subset = [{**entry, "path": entry["path"][len(name) + 1:]} for entry in files if entry["path"].startswith(name + "/")]
+            require(subset and digest_files(subset) == dependency["snapshot_sha256"], "sibling source inventory differs from its pin")
+        require(len({name.lower() for name in names}) == len(names), "ambiguous sibling names")
+        require({p.name for p in root.iterdir()} == {"project", *names}, "source-set namespace differs from plan")
+        primary = [{**entry, "path": entry["path"][8:]} for entry in files if entry["path"].startswith("project/")]
+        require(primary and digest_files(primary) == evidence.get("primary_snapshot_sha256"), "primary source inventory differs from its pin")
+    else:
+        require(not evidence.get("dependencies"), "sibling evidence requires a source-set layout")
+
+try:
+    mode = sys.argv[1]
+    if mode == "verify":
+        root, receipt = map(Path, sys.argv[2:])
+        verify(root, read_json(receipt))
+        sys.exit(0)
+    require(mode in ("snapshot", "snapshot-set"), "unknown source operation")
+    project, commit, tag, repo, destination, receipt = sys.argv[2:8]
+    root, receipt = Path(destination), Path(receipt)
+    require(root.is_absolute() and root.parent.is_dir() and not root.exists() and not root.is_symlink(), "snapshot destination must be a new absolute directory")
+    require(receipt.parent.is_dir() and not receipt.exists() and not receipt.is_symlink(), "source receipt destination already exists")
+    require(not receipt.resolve().is_relative_to(root.resolve()), "receipt must live outside the source snapshot")
+    primary = inspect_project(project, commit, tag, repo)
+    siblings = []
+    if mode == "snapshot-set":
+        plan = read_json(Path(sys.argv[8]))
+        require(isinstance(plan, list) and 0 < len(plan) <= 32, "expected 1..32 pinned sibling repositories")
+        names, projects = set(), {primary["project"]}
+        for entry in plan:
+            require(isinstance(entry, dict) and set(entry) == {"relative_path", "local_path", "revision", "repo"}, "invalid sibling descriptor")
+            name = entry["relative_path"]
+            sibling_name(name)
+            require(name.lower() not in names, "duplicate sibling destination")
+            require(isinstance(entry["local_path"], str) and Path(entry["local_path"]).is_absolute(), "sibling checkout must be absolute")
+            selected = inspect_project(entry["local_path"], entry["revision"], None, entry["repo"])
+            require(selected["project"] not in projects, "source checkout selected more than once")
+            names.add(name.lower())
+            projects.add(selected["project"])
+            siblings.append((name, selected))
+        # All checkout identities and Git trees are admitted before creating
+        # the destination. No working-tree or .cargo files are copied later.
+        root.mkdir(mode=0o700)
+        evidence = write_snapshot(primary, root / "project")
+        evidence["primary_snapshot_sha256"] = evidence["snapshot_sha256"]
+        evidence["primary_path"] = "project"
+        evidence["dependencies"] = []
+        for name, selected in sorted(siblings):
+            sibling = write_snapshot(selected, root / name)
+            evidence["dependencies"].append({"relative_path": name, **selected["identity"],
+                                              "snapshot_sha256": sibling["snapshot_sha256"]})
+        evidence["files"] = inventory(root)
+        evidence["snapshot_sha256"] = digest_files(evidence["files"])
+    else:
+        evidence = write_snapshot(primary, root)
+    verify(root, evidence)
     publish(receipt, evidence)
 except (Rejected, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
     print("[xwin-source] " + str(error), file=sys.stderr)
@@ -185,12 +263,19 @@ PY
 }
 
 # Validate the selected binary and complete Cargo graph. Every local/path
-# package must come from the committed snapshot; sibling/absolute path escapes
-# are refused rather than being advertised as pinned source dependencies.
+# package must come from the primary snapshot or an explicitly pinned sibling.
+# The optional seventh argument is the verified source-set receipt, never a
+# general filesystem allowlist. Unlisted/absolute path escapes remain errors.
 # stdout is a small selection receipt; the full canonical graph stays in a file.
 xwin_source_metadata() {
-    [[ $# == 6 ]] || return 4
+    [[ $# == 6 || $# == 7 ]] || return 4
     command -v python3 >/dev/null || return 3
+    if [[ $# == 7 ]]; then
+        local boundary
+        [[ -d "$2" && ! -L "$2" ]] || return 7
+        boundary=$(cd "$2/.." && pwd -P) || return 7
+        xwin_source_verify "$boundary" "$7" || return $?
+    fi
     python3 - "$@" <<'PY'
 import hashlib
 import json
@@ -199,7 +284,7 @@ import stat
 import sys
 
 try:
-    input_file, root, binary, package, output_file, version = sys.argv[1:]
+    input_file, root, binary, package, output_file, version = sys.argv[1:7]
     root = Path(root).resolve()
     def require(condition, message):
         if not condition:
@@ -210,16 +295,30 @@ try:
             require(key not in obj, "duplicate Cargo metadata key")
             obj[key] = value
         return obj
-    def local_file(name):
+    allowed = {root: ""}
+    dependencies = []
+    if len(sys.argv) == 8:
+        with open(sys.argv[7]) as stream:
+            source = json.load(stream, object_pairs_hook=pairs)
+        require(source.get("primary_path") == "project" and root.name == "project", "metadata requires the admitted primary layout")
+        dependencies = source["dependencies"]
+        for dependency in dependencies:
+            allowed[root.parent / dependency["relative_path"]] = dependency["relative_path"]
+    def local_file(name, primary_only=False):
         path = Path(name)
-        require(path.is_absolute() and path.is_relative_to(root), "unbound local Cargo source: " + str(name))
-        current = root
-        for part in path.relative_to(root).parts:
+        matches = [base for base in allowed if path.is_absolute() and path.is_relative_to(base)]
+        require(len(matches) == 1, "unbound local Cargo source: " + str(name))
+        base = matches[0]
+        require(not primary_only or base == root, "release binary must belong to the primary repository")
+        current = base
+        require(current.is_dir() and not current.is_symlink(), "linked Cargo source root")
+        for part in path.relative_to(base).parts:
             require(part not in (".", ".."), "noncanonical Cargo source path")
             current /= part
             require(not current.is_symlink(), "linked Cargo source path")
         require(path.is_file() and stat.S_ISREG(path.stat().st_mode), "missing local Cargo source")
-        return path.relative_to(root).as_posix()
+        relative = path.relative_to(base).as_posix()
+        return relative if base == root else "../" + allowed[base] + "/" + relative
     with open(input_file) as stream:
         graph = json.load(stream, object_pairs_hook=pairs)
     require(graph.get("version") == 1 and isinstance(graph.get("resolve"), dict), "complete Cargo metadata v1 graph required")
@@ -258,6 +357,19 @@ try:
     selected_nodes = [n for n in nodes if n["id"] == selected["id"]]
     require(len(selected_nodes) == 1, "selected package missing from dependency resolution")
     require(set(target.get("required-features", [])) <= set(selected_nodes[0]["features"]), "selected binary requires inactive features")
+    manifest = local_file(selected["manifest_path"], primary_only=True)
+    binary_source = local_file(target["src_path"], primary_only=True)
+    reachable, pending = set(), [selected["id"]]
+    by_id = {node["id"]: node for node in nodes}
+    while pending:
+        identity = pending.pop()
+        if identity in reachable:
+            continue
+        reachable.add(identity)
+        pending.extend(by_id[identity]["dependencies"])
+    resolved_siblings = sorted({label for base, label in allowed.items() if label and any(
+        p["id"] in reachable and p["source"] is None and Path(p["manifest_path"]).is_relative_to(base)
+        for p in packages)})
     # Cargo documents package-array dependencies for ALL targets; only resolve
     # is platform-filtered. Retain both and compare the same canonical graph.
     graph["packages"] = sorted(packages, key=lambda p: p["id"])
@@ -274,8 +386,9 @@ try:
         stream.write(encoded)
     print(json.dumps({"metadata_sha256": hashlib.sha256(encoded).hexdigest(),
                       "package_id": selected["id"], "package": selected["name"], "version": selected["version"],
-                      "binary": binary, "manifest": local_file(selected["manifest_path"]),
-                      "binary_source": local_file(target["src_path"]),
+                      "binary": binary, "manifest": manifest, "binary_source": binary_source,
+                      "source_dependencies": [{"relative_path": d["relative_path"], "git_sha": d["git_sha"]} for d in dependencies],
+                      "resolved_siblings": resolved_siblings,
                       "resolved_packages": len(nodes), "features": sorted(selected_nodes[0]["features"])}))
 except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
     print("[xwin-source] " + str(error), file=sys.stderr)
