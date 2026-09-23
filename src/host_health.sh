@@ -304,6 +304,24 @@ _hh_cache_valid() {
         return 1
     fi
 
+    # A hostname can switch between local and split storage, or change its
+    # mapping/budgets. A fresh timestamp does not authorize the new contract.
+    local storage storage_status=0
+    storage=$(config_windows_storage_json "$hostname") || storage_status=$?
+    case "$storage_status" in
+        0)
+            jq -e --argjson storage "$storage" \
+                '.checks.disk_space.storage_contract == $storage' \
+                "$cache_file" >/dev/null 2>&1 || return 1
+            ;;
+        1)
+            jq -e '.checks.disk_space | .storage_contract == null and
+                .admission != "split-storage-role-budgets-v1" and .path != "split-storage"' \
+                "$cache_file" >/dev/null 2>&1 || return 1
+            ;;
+        *) return 1 ;;
+    esac
+
     if ! jq -e --arg hostname "$hostname" '
         type == "object" and
         .hostname == $hostname and
@@ -317,6 +335,8 @@ _hh_cache_valid() {
         (.checks | type == "object") and
         (.checks.connectivity | type == "object") and
         (.checks.disk_space | type == "object") and
+        (.checks.disk_space.admission != "split-storage-role-budgets-v1" or
+         .checks.disk_space.lock_range == "cargo-win32-whole-u64-v1") and
         (.checks.toolchains | type == "object") and
         (.checks.docker | type == "object") and
         (.checks.clock_drift | type == "object") and
@@ -418,6 +438,21 @@ _hh_check_connectivity() {
     fi
 }
 
+# Encode only the split-storage probe. The outer command is trusted ASCII:
+# payload text (including Unicode, quotes and shell metacharacters) exists only
+# inside gzip/base64, never as shell syntax. Avoid wrapping that base64 again
+# in UTF-16/base64, which exceeds Windows' command limit for the Win32 probe.
+_hh_windows_storage_command() {
+    local payload wrapper command
+    payload=$(gzip -n -c | base64 | tr -d '\r\n') || return 4
+    [[ "$payload" =~ ^[A-Za-z0-9+/=]+$ ]] || return 4
+    wrapper="& ([ScriptBlock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('$payload')),[IO.Compression.CompressionMode]::Decompress),[Text.Encoding]::UTF8).ReadToEnd()))"
+    case "$wrapper" in *'$'*|*'`'*|*'"'*|*'\\'*) return 4 ;; esac
+    command="powershell -NoProfile -NonInteractive -Command \"$wrapper\""
+    [[ ${#command} -lt 7000 ]] || return 4
+    printf '%s\n' "$command"
+}
+
 # Check disk space
 # Returns: JSON object { "path": str, "usage_percent": int, "available_gb": float, "status": str }
 _hh_check_disk_space() {
@@ -435,16 +470,11 @@ _hh_check_disk_space() {
             # Preserve the source volume's actual pressure. A split layout is
             # admitted by BOTH role budgets, never by substituting NFS free
             # space for the system disk or suppressing its warning.
-            storage_script+=$'\n''$sourceUsage=[math]::Round(100-($dsrSourceDisk.FreeSpace/$dsrSourceDisk.Size*100)); $targetUsage=[math]::Round(100-($dsrTargetDisk.FreeSpace/$dsrTargetDisk.Size*100)); $status=if($sourceUsage -gt 90 -or $targetUsage -gt 90){"warning"}else{"ok"}; @{path=$dsrSourceDisk.DeviceID; usage_percent=$sourceUsage; available_gb=[math]::Round($dsrSourceDisk.FreeSpace/1GB,2); status=$status; admission="split-storage-role-budgets-v1"; source=@{path=$dsrSourceDisk.DeviceID; free_bytes=$dsrSourceDisk.FreeSpace; size_bytes=$dsrSourceDisk.Size}; target=@{path=$dsrTargetDisk.DeviceID; provider=$dsrTargetDisk.ProviderName; free_bytes=$dsrTargetDisk.FreeSpace; size_bytes=$dsrTargetDisk.Size}; lock_probe="independent-process-exclusion-and-reacquisition"} | ConvertTo-Json -Depth 4 -Compress'
-            # Compress before encoding; Windows command transport has an
-            # 8191-character ceiling, including the executable and options.
-            storage_probe=$(printf '%s' "$storage_script" | gzip -n -c | base64 | tr -d '\r\n') || return 4
-            storage_probe="& ([ScriptBlock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('$storage_probe')),[IO.Compression.CompressionMode]::Decompress),[Text.Encoding]::UTF8).ReadToEnd()))"
-            storage_probe=$(printf '%s' "$storage_probe" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n') || return 4
-            [[ ${#storage_probe} -lt 7000 ]] || return 4
+            storage_script+=$'\n''$sourceUsage=[math]::Round(100-($dsrSourceDisk.FreeSpace/$dsrSourceDisk.Size*100)); $targetUsage=[math]::Round(100-($dsrTargetDisk.FreeSpace/$dsrTargetDisk.Size*100)); $status=if($sourceUsage -gt 90 -or $targetUsage -gt 90){"warning"}else{"ok"}; @{path=$dsrSourceDisk.DeviceID; usage_percent=$sourceUsage; available_gb=[math]::Round($dsrSourceDisk.FreeSpace/1GB,2); status=$status; admission="split-storage-role-budgets-v1"; source=@{path=$dsrSourceDisk.DeviceID; free_bytes=$dsrSourceDisk.FreeSpace; size_bytes=$dsrSourceDisk.Size}; target=@{path=$dsrTargetDisk.DeviceID; provider=$dsrTargetDisk.ProviderName; free_bytes=$dsrTargetDisk.FreeSpace; size_bytes=$dsrTargetDisk.Size}; lock_probe="independent-process-exclusion-and-reacquisition"; lock_range="cargo-win32-whole-u64-v1"} | ConvertTo-Json -Depth 4 -Compress'
+            storage_probe=$(printf '%s' "$storage_script" | _hh_windows_storage_command) || return 4
             if storage_result=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
-                "powershell -NoProfile -NonInteractive -EncodedCommand $storage_probe") && \
-               jq -e '.admission == "split-storage-role-budgets-v1" and (.status == "ok" or .status == "warning")' <<< "$storage_result" >/dev/null; then
+                "$storage_probe") && \
+               jq -e '.admission == "split-storage-role-budgets-v1" and .lock_range == "cargo-win32-whole-u64-v1" and (.status == "ok" or .status == "warning")' <<< "$storage_result" >/dev/null; then
                 jq --argjson contract "$storage" '. + {storage_contract:$contract}' <<< "$storage_result"
                 return 0
             fi

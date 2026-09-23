@@ -104,24 +104,57 @@ if (\$dsrTargetDisk.FreeSpace -lt [long]$target_min) { throw 'DSR target capacit
 EOF
 }
 
-# Retained tiny probe: no deletion, and no "lock worked" claim based only on
-# one process. Both exclusion while held and acquisition after release matter.
+# Retained tiny file, but Cargo locks the full unsigned 64-bit byte range.
+# FileStream.Lock takes a signed length and cannot express that contract.
+# Both exclusion while held and acquisition after release matter.
 config_windows_storage_lock_script() {
     local value drive
     value=$(config_windows_storage_json "$1") || return $?
     drive=$(jq -r '.drive' <<< "$value")
     cat <<EOF
+\$dsrLockNative=@'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class DsrCargoFileLock {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Overlapped {
+        public UIntPtr Internal, InternalHigh;
+        public uint Offset, OffsetHigh;
+        public IntPtr Event;
+    }
+    [DllImport("kernel32.dll", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LockFileEx(SafeFileHandle file, uint flags, uint reserved, uint low, uint high, ref Overlapped overlapped);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnlockFileEx(SafeFileHandle file, uint reserved, uint low, uint high, ref Overlapped overlapped);
+    public static int TryLock(SafeFileHandle file, uint low, uint high) {
+        var overlapped = new Overlapped();
+        return LockFileEx(file, 3, 0, low, high, ref overlapped) ? 0 : Marshal.GetLastWin32Error();
+    }
+    public static int Unlock(SafeFileHandle file, uint low, uint high) {
+        var overlapped = new Overlapped();
+        return UnlockFileEx(file, 0, low, high, ref overlapped) ? 0 : Marshal.GetLastWin32Error();
+    }
+}
+'@;
+Add-Type -TypeDefinition \$dsrLockNative;
 \$dsrProbePath='${drive}:/.dsr-lock-'+[Guid]::NewGuid().ToString('N')+'.probe';
 \$dsrProbe=[IO.File]::Open(\$dsrProbePath,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite);
 try {
-    \$dsrProbe.SetLength(1); \$dsrProbe.Flush(\$true); \$dsrProbe.Lock(0,1);
-    \$dsrChild='\$ErrorActionPreference="Stop"; \$f=[IO.File]::Open("'+\$dsrProbePath+'",[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite); try { try { \$f.Lock(0,1); \$f.Unlock(0,1); exit 7 } catch [IO.IOException] { exit 0 } } finally { \$f.Dispose() }';
+    \$dsrProbe.SetLength(1); \$dsrProbe.Flush(\$true);
+    \$dsrLockError=[DsrCargoFileLock]::TryLock(\$dsrProbe.SafeFileHandle,[uint32]::MaxValue,[uint32]::MaxValue);
+    if (\$dsrLockError -ne 0) { throw "DSR Cargo whole-u64 initial lock failed: \$dsrLockError" };
+    \$dsrNativeEncoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(\$dsrLockNative));
+    \$dsrChild='\$ErrorActionPreference="Stop"; Add-Type -TypeDefinition ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String("'+\$dsrNativeEncoded+'"))); \$f=[IO.File]::Open("'+\$dsrProbePath+'",[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite); try { \$result=[DsrCargoFileLock]::TryLock(\$f.SafeFileHandle,[uint32]::MaxValue,[uint32]::MaxValue); if (\$result -eq 0) { \$unlockError=[DsrCargoFileLock]::Unlock(\$f.SafeFileHandle,[uint32]::MaxValue,[uint32]::MaxValue); if (\$unlockError -ne 0) { throw "DSR Cargo child unlock failed: \$unlockError" } }; exit \$result } finally { \$f.Dispose() }';
     \$dsrEncoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(\$dsrChild));
     & (Join-Path \$env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -EncodedCommand \$dsrEncoded;
-    if (\$LASTEXITCODE -ne 0) { throw 'DSR NFS lock exclusion failed' };
-    \$dsrProbe.Unlock(0,1);
+    if (\$LASTEXITCODE -ne 33) { throw "DSR Cargo whole-u64 lock exclusion failed: \$LASTEXITCODE" };
+    \$dsrLockError=[DsrCargoFileLock]::Unlock(\$dsrProbe.SafeFileHandle,[uint32]::MaxValue,[uint32]::MaxValue);
+    if (\$dsrLockError -ne 0) { throw "DSR Cargo whole-u64 unlock failed: \$dsrLockError" };
     & (Join-Path \$env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -EncodedCommand \$dsrEncoded;
-    if (\$LASTEXITCODE -ne 7) { throw 'DSR NFS lock acquisition failed' };
+    if (\$LASTEXITCODE -ne 0) { throw "DSR Cargo whole-u64 lock reacquisition failed: \$LASTEXITCODE" };
 } finally { \$dsrProbe.Dispose() };
 EOF
 }

@@ -980,6 +980,221 @@ POWERSHELL
     done
 }
 
+test_windows_storage_transport() {
+    local command result status=0 expected
+    command=$(cat <<'POWERSHELL' | _hh_windows_storage_command
+$marker='DSR-界-é'
+Write-Output $marker
+Write-Output 'literal $HOME ` " ; & Write-Output EXTRA_COMMAND'
+POWERSHELL
+    ) || status=$?
+    expected=$'DSR-界-é\nliteral $HOME ` " ; & Write-Output EXTRA_COMMAND'
+    ((TESTS_RUN++))
+    result=$(
+        powershell() {
+            [[ $# -eq 4 && "$1 $2 $3" == '-NoProfile -NonInteractive -Command' ]] || return 91
+            pwsh -NoLogo "$@"
+        }
+        export -f powershell
+        # A real shell parse must preserve exactly one PowerShell command,
+        # which itself decompresses and executes the original Unicode script.
+        bash -uc "$command"
+    ) || status=$?
+    result=$(printf '%s' "$result" | tr -d '\r')
+    if [[ $status -eq 0 && "$result" == "$expected" ]]; then
+        pass "Storage transport preserves Unicode and multiline shell literals through Bash and PowerShell"
+    else
+        fail "Storage transport status=$status result=$result"
+    fi
+    ((TESTS_RUN++))
+    status=0
+    result=$(printf 'Write-Output "row-%s"\n' {1..6000} | _hh_windows_storage_command) || status=$?
+    if [[ $status -eq 4 && -z "$result" ]]; then pass "Overlong storage command refuses before transport";
+    else fail "Overlong storage command status=$status output_bytes=${#result}"; fi
+    ((TESTS_RUN++))
+    status=0
+    result=$(
+        config_windows_storage_json() {
+            printf '%s' '{"drive":"R","source_drive":"C","server":"192.0.2.1","export":"/owned/builds","source_budget_bytes":2147483648,"source_reserve_bytes":8589934592,"target_min_free_bytes":21474836480}'
+        }
+        _hh_exec_on_host() {
+            [[ ${#4} -lt 7000 && "$4" == 'powershell -NoProfile -NonInteractive -Command "& '* ]] || return 91
+            # Transport-size control only; native admission is exercised by
+            # the separate parent/child primitive controls and Windows probe.
+            printf '%s' '{"admission":"split-storage-role-budgets-v1","status":"ok","lock_range":"cargo-win32-whole-u64-v1"}'
+        }
+        _hh_check_disk_space fixture ssh example.invalid windows/amd64
+    ) || status=$?
+    if [[ $status -eq 0 ]] && jq -e '.lock_range=="cargo-win32-whole-u64-v1"' <<< "$result" >/dev/null; then
+        pass "Complete Win32 storage probe fits the unchanged transport limit"
+    else fail "Complete Win32 storage transport refused: status=$status result=$result"; fi
+}
+
+test_windows_cargo_lock_range() {
+    local script mode result status expected model="$TEMP_DIR/lock-model.ps1"
+    local storage_fixture="$TEMP_DIR/lock-storage.yaml"
+    cat > "$storage_fixture" <<'YAML'
+hosts:
+  lockcontract:
+    windows_storage:
+      drive: R
+      source_drive: C
+      server: storage.example
+      export: /exports/builds
+      source_budget_bytes: 2147483648
+      source_reserve_bytes: 8589934592
+      target_min_free_bytes: 21474836480
+YAML
+    local DSR_HOSTS_FILE="$storage_fixture" contract
+    contract=$(config_windows_storage_json lockcontract)
+    _hh_init_cache
+    result=$(_test_health_result_json "lockcontract" "ok" "true" | jq \
+        --argjson contract "$contract" '.platform="windows/amd64" |
+        .checks.disk_space.storage_contract=$contract |
+        .checks.disk_space.admission="split-storage-role-budgets-v1"')
+    _hh_cache_write lockcontract "$result"
+    ((TESTS_RUN++))
+    if _hh_cache_valid lockcontract; then fail "Legacy one-byte cached admission must be reprobed";
+    else pass "Legacy one-byte cached admission is refused"; fi
+    _hh_cache_write lockcontract "$(jq '.checks.disk_space.lock_range="cargo-win32-whole-u64-v1"' <<< "$result")"
+    ((TESTS_RUN++))
+    if _hh_cache_valid lockcontract; then pass "Whole-u64 cached admission retains normal TTL";
+    else fail "Whole-u64 cached admission unexpectedly refused"; fi
+    local current_result ordinary_result changed_contract
+    current_result=$(_hh_cache_read lockcontract)
+    ordinary_result=$(_test_health_result_json "lockcontract" "ok" "true" | jq '.platform="windows/amd64"')
+    _hh_cache_write lockcontract "$ordinary_result"
+    ((TESTS_RUN++))
+    if _hh_cache_valid lockcontract; then fail "Local cached health must not admit new split storage";
+    else pass "Local-to-split storage change invalidates cached health"; fi
+    for changed_contract in \
+        "$(jq '.server="other.example"' <<< "$contract")" \
+        "$(jq '.target_min_free_bytes=42949672960' <<< "$contract")"; do
+        _hh_cache_write lockcontract "$(jq --argjson contract "$changed_contract" \
+            '.checks.disk_space.storage_contract=$contract' <<< "$current_result")"
+        ((TESTS_RUN++))
+        if _hh_cache_valid lockcontract; then fail "Changed storage identity/budget must be reprobed";
+        else pass "Changed storage identity/budget invalidates cached health"; fi
+    done
+    _hh_cache_write lockcontract "$current_result"
+    ((TESTS_RUN++))
+    if (DSR_HOSTS_FILE="$TEMP_DIR/absent-storage.yaml"; _hh_cache_valid lockcontract); then
+        fail "Split cached health must not survive storage removal"
+    else pass "Split-to-local storage change invalidates cached health"; fi
+    _hh_cache_write lockcontract "$(jq '.healthy=false | .status="error" |
+        .checks.disk_space={path:"split-storage",status:"error"}' <<< "$current_result")"
+    ((TESTS_RUN++))
+    if (DSR_HOSTS_FILE="$TEMP_DIR/absent-storage.yaml"; _hh_cache_valid lockcontract); then
+        fail "Historical split failure must not survive storage removal"
+    else pass "Split-to-local storage change invalidates cached failure"; fi
+    _hh_cache_write lockcontract "$ordinary_result"
+    ((TESTS_RUN++))
+    if (DSR_HOSTS_FILE="$TEMP_DIR/absent-storage.yaml"; _hh_cache_valid lockcontract); then
+        pass "Unchanged local storage retains normal cache TTL"
+    else fail "Unchanged local storage cache unexpectedly refused"; fi
+    printf 'hosts:\n  lockcontract:\n    windows_storage: false\n' > "$TEMP_DIR/invalid-lock-storage.yaml"
+    ((TESTS_RUN++))
+    if (DSR_HOSTS_FILE="$TEMP_DIR/invalid-lock-storage.yaml"; _hh_cache_valid lockcontract); then
+        fail "Invalid current storage contract must not reuse cached health"
+    else pass "Invalid current storage contract invalidates cached health"; fi
+    if ! command -v pwsh >/dev/null; then
+        ((TESTS_RUN++)); fail "PowerShell is required for Cargo lock admission controls"; return
+    fi
+    script=$(
+        config_windows_storage_json() { printf '%s' '{"drive":"R"}'; }
+        config_windows_storage_lock_script fixture
+    )
+    # Execute the generated parent AND independently launched child logic.
+    # Only the unavailable Win32 primitive is modeled; this is not native NFS
+    # proof. In particular this model admits a one-byte lock while refusing
+    # Cargo's whole-u64 range, matching the retained Windows counterexample.
+    cat > "$model" <<'POWERSHELL'
+class DsrCargoFileLock {
+    static [int] TryLock([object] $file, [uint32] $low, [uint32] $high) {
+        if ($env:DSR_LOCK_MODE -eq 'one_byte_only' -and ($low -ne 1 -or $high -ne 0)) { return 33 }
+        if ($env:DSR_LOCK_MODE -eq 'reacquire_failure' -and $env:DSR_LOCK_RELEASED -eq '1') { return 33 }
+        if ($env:DSR_LOCK_HELD -eq '1') {
+            if ($env:DSR_LOCK_MODE -eq 'wrong_exclusion') { return 5 }
+            if ($env:DSR_LOCK_MODE -eq 'no_exclusion' -or $env:DSR_LOCK_MODE -eq 'no_exclusion_unlock_failure') { return 0 }
+            return 33
+        }
+        $env:DSR_LOCK_HELD='1'; return 0
+    }
+    static [int] Unlock([object] $file, [uint32] $low, [uint32] $high) {
+        if ($env:DSR_LOCK_MODE -eq 'unlock_failure') { return 5 }
+        if ($env:DSR_LOCK_MODE -eq 'no_exclusion_unlock_failure' -and
+            $env:DSR_LOCK_CHILD -eq '1' -and $env:DSR_LOCK_RELEASED -ne '1') { return 33 }
+        $env:DSR_LOCK_HELD='0'; $env:DSR_LOCK_RELEASED='1'; return 0
+    }
+}
+function Add-Type {
+    param([string] $TypeDefinition)
+    if (-not $TypeDefinition.Contains('LockFileEx(file, 3, 0, low, high, ref overlapped)') -or
+        -not $TypeDefinition.Contains('UnlockFileEx(file, 0, low, high, ref overlapped)')) {
+        throw 'Probe no longer uses the reviewed nonblocking exclusive Win32 contract'
+    }
+}
+function Join-Path { param($Path,$ChildPath); return 'Invoke-LockChild' }
+function Invoke-LockChild {
+    param([switch] $NoProfile, [switch] $NonInteractive, [string] $EncodedCommand)
+    $child=[IO.File]::ReadAllText($env:DSR_LOCK_MODEL)+[Environment]::NewLine+
+        [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($EncodedCommand))
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+    $env:DSR_LOCK_CHILD='1'
+    & $env:DSR_LOCK_PWSH -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded
+    $childStatus=$LASTEXITCODE
+    $env:DSR_LOCK_CHILD='0'
+    $global:LASTEXITCODE=$childStatus
+}
+POWERSHELL
+    for mode in valid one_byte_only wrong_exclusion no_exclusion no_exclusion_unlock_failure unlock_failure reacquire_failure; do
+        ((TESTS_RUN++))
+        case "$mode" in
+            valid) expected='ADMITTED' ;;
+            one_byte_only) expected='ONE_BYTE_ADMITTED;DSR Cargo whole-u64 initial lock failed: 33' ;;
+            wrong_exclusion) expected='DSR Cargo whole-u64 lock exclusion failed: 5' ;;
+            no_exclusion) expected='DSR Cargo whole-u64 lock exclusion failed: 0' ;;
+            no_exclusion_unlock_failure) expected='DSR Cargo whole-u64 lock exclusion failed: 1' ;;
+            unlock_failure) expected='DSR Cargo whole-u64 unlock failed: 5' ;;
+            reacquire_failure) expected='DSR Cargo whole-u64 lock reacquisition failed: 33' ;;
+        esac
+        status=0
+        result=$(
+            {
+                cat "$model"
+                cat <<'POWERSHELL'
+$ErrorActionPreference='Stop'
+$env:SystemRoot='/fixture'
+$env:DSR_LOCK_HELD='0'; $env:DSR_LOCK_RELEASED='0'
+Set-Location $env:DSR_LOCK_ROOT
+[Environment]::CurrentDirectory=$env:DSR_LOCK_ROOT
+[void][IO.Directory]::CreateDirectory('R:')
+$prefix=''
+if ($env:DSR_LOCK_MODE -eq 'one_byte_only') {
+    if ([DsrCargoFileLock]::TryLock($null,1,0) -ne 0 -or
+        [DsrCargoFileLock]::TryLock($null,1,0) -ne 33 -or
+        [DsrCargoFileLock]::Unlock($null,1,0) -ne 0 -or
+        [DsrCargoFileLock]::TryLock($null,1,0) -ne 0) { throw 'one-byte control did not pass' }
+    [void][DsrCargoFileLock]::Unlock($null,1,0)
+    $prefix='ONE_BYTE_ADMITTED;'
+}
+try {
+POWERSHELL
+                printf '%s\n' "$script"
+                printf '%s\n' 'Write-Output ($prefix+"ADMITTED")' '} catch { Write-Output ($prefix+$_.Exception.Message) }'
+                printf '\n'
+            } | DSR_LOCK_MODEL="$model" DSR_LOCK_MODE="$mode" DSR_LOCK_ROOT="$TEMP_DIR" \
+                DSR_LOCK_PWSH="$(command -v pwsh)" pwsh -NoLogo -NoProfile -NonInteractive -Command -
+        ) || status=$?
+        result=$(printf '%s' "$result" | tr -d '\r')
+        if [[ $status -eq 0 && "$result" == "$expected" ]]; then
+            pass "Cargo whole-u64 lock $mode admission control"
+        else
+            fail "Cargo lock $mode: status=$status result=$result expected=$expected"
+        fi
+    done
+}
+
 test_windows_storage_optional_config() {
     local result status=0 fixture="$TEMP_DIR/windows-storage-optional.yaml" ordinary_fixture="$TEMP_DIR/windows-storage-ordinary.yaml"
     printf 'hosts:\n  ordinary:\n    platform: windows/amd64\n  opted:\n    windows_storage: false\n' > "$fixture"
@@ -1046,6 +1261,8 @@ test_windows_storage_optional_config() {
 if [[ "${1:-}" == --windows-storage-only ]]; then
     test_windows_storage_optional_config
     test_windows_split_storage_admission
+    test_windows_storage_transport
+    test_windows_cargo_lock_range
     [[ $TESTS_FAILED -eq 0 ]]
     exit $?
 fi
@@ -1075,6 +1292,8 @@ test_disk_space_rejects_numeric_output_from_failed_command
 test_windows_disk_probe_survives_bash_default_shell
 test_windows_storage_optional_config
 test_windows_split_storage_admission
+test_windows_storage_transport
+test_windows_cargo_lock_range
 test_human_disk_error_reports_probe_failure
 test_local_toolchains_check
 test_local_clock_drift
