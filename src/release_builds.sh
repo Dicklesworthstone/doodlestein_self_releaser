@@ -135,7 +135,7 @@ def validate(value):
         base = {"id", "driver", "targets", "timeout"}
         kind = job["driver"]
         if kind == "dsr":
-            require({"config_dir", "config_files"} <= set(job) and set(job) <= base | {"config_dir", "config_files", "jobs"}, "invalid native job", 4)
+            require({"config_dir", "config_files"} <= set(job) and set(job) <= base | {"config_dir", "config_files", "jobs", "resume"}, "invalid native job", 4)
             path(job["config_dir"])
             files = job["config_files"]
             require(isinstance(files, dict) and 3 <= len(files) <= 64 and
@@ -144,6 +144,7 @@ def validate(value):
                 require(matches(filename, r"(?:config\.yaml|repos\.yaml|hosts\.yaml|repos\.d/[A-Za-z0-9][A-Za-z0-9_-]*\.yaml)") and sha(pin), "invalid configuration pin", 4)
             job.setdefault("jobs", 1)
             require(integer(job["jobs"], 1, 32), "invalid native target concurrency", 4)
+            require(type(job.get("resume", False)) is bool, "native resume must be boolean", 4)
         elif kind == "xwin":
             require({"project", "toolchain_manifest", "toolchain_sha256", "binary"} <= set(job) and
                     set(job) <= base | {"project", "toolchain_manifest", "toolchain_sha256", "binary", "package", "asset_name", "siblings", "cargo_cache", "cache_dir", "offline"}, "invalid xwin job", 4)
@@ -234,6 +235,98 @@ def copy_pin(source, target, pin):
     require(digest(target) == pin and digest(source) == pin, "build input changed while snapshotting")
     target.chmod(0o400)
 
+def run_uuid(value):
+    return matches(value, r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+def native_command(job, session, resume_id=None):
+    command = ["bash", str(module.parent / "dsr"), "--json", "--non-interactive", "build", "--tool", plan["tool"],
+               "--version", plan["tag"], "--targets", ",".join(job["targets"]), "--jobs", str(job["jobs"]),
+               "--output-dir", str(session / "output")]
+    if resume_id is not None:
+        command.append("--resume=" + resume_id)
+    return command
+
+def native_config(job, session):
+    cfg = plain(session / "config", "dir")
+    for filename, pin in job["config_files"].items():
+        require(digest(cfg / filename) == pin, "native configuration snapshot changed")
+    actual = set()
+    for directory, dirs, files in os.walk(cfg, followlinks=False):
+        for filename in dirs + files:
+            p = Path(directory) / filename
+            plain(p, "dir" if filename in dirs else "file")
+            if filename in files:
+                actual.add(p.relative_to(cfg).as_posix())
+    require(actual == set(job["config_files"]), "native configuration namespace changed")
+
+def native_checkpoint(job, session):
+    # This namespace was supplied by this coordinator to exactly one fresh
+    # native build. Never follow 'latest', pick a newer run, or read paths from
+    # a manifest. DSR itself remains responsible for validating target receipts,
+    # source roots, configuration fingerprints and host bindings during resume.
+    directory = plain(session / "state/builds" / plan["tool"] / plan["tag"])
+    if not directory.exists():
+        return None
+    plain(directory, "dir")
+    candidates = []
+    for child in directory.iterdir():
+        if child.name == "latest":
+            continue
+        if child.name.startswith("."):
+            plain(child, "file")
+            continue
+        require(run_uuid(child.name), "unexpected native build namespace")
+        plain(child, "dir")
+        candidates.append(child / "state.json")
+    if not candidates:
+        return None
+    require(len(candidates) == 1, "ambiguous native runs; refusing to select by recency")
+    state_file = candidates[0]
+    pin = digest(state_file)
+    checkpoint = load(state_file)
+    require(isinstance(checkpoint, dict), "native checkpoint must be an object")
+    context = checkpoint.get("context")
+    require(checkpoint.get("tool") == plan["tool"] and checkpoint.get("version") == plan["tag"] and
+            checkpoint.get("run_id") == state_file.parent.name and checkpoint.get("targets") == job["targets"] and
+            checkpoint.get("git_sha") == plan["source_sha"] and isinstance(context, dict) and
+            context.get("output_dir") == str(session / "output"), "native checkpoint identity differs from the build plan")
+    require(context.get("build_purpose", "release") == "release" and context.get("publishable", True) is True,
+            "non-release native checkpoint cannot be resumed")
+    require(checkpoint.get("status") in ("created", "running", "failed", "partial", "interrupted", "targets-complete", "completed", "cancelled"),
+            "unknown native checkpoint status")
+    require(digest(state_file) == pin, "native checkpoint changed while reading")
+    return state_file, pin, checkpoint
+
+def native_session(job, record, attempt):
+    if not job.get("resume", False):
+        return attempt, None, None
+    prior = next((a for a in reversed(record["attempts"][:-1]) if "native" in a), None)
+    if prior is None:
+        return attempt, None, None
+    origin = prior["native"]["session_attempt"]
+    session = plain(attempt.parent / ("%06d" % origin), "dir")
+    previous = plain(attempt.parent / ("%06d" % prior["number"]), "dir")
+    require(load(previous / "inputs.json") == {"plan_sha256": plan_hash, "job": job} and
+            load(previous / "command.json") == native_command(job, session, prior["native"]["resume_run_id"]),
+            "retained native invocation changed")
+    native_config(job, session)
+    observed = native_checkpoint(job, session)
+    if observed is None:
+        require(prior["native"]["run_id"] is None, "previously observed native run disappeared")
+        # A preflight/sync failure may occur before DSR creates any run state.
+        # Retain its files, but never reuse that uncheckpointed output directory.
+        return attempt, None, None
+    state_file, pin, checkpoint = observed
+    identity = checkpoint["run_id"]
+    require(prior["native"]["run_id"] in (None, identity), "retained native run identity changed")
+    require(checkpoint["status"] not in ("completed", "cancelled"),
+            "native run is terminal and cannot be resumed; retained output requires inspection")
+    plain(session / "output", "dir")
+    write(attempt / "native-before.json", checkpoint)
+    require(digest(state_file) == pin, "native checkpoint changed before resume")
+    print("[release-builds] Resuming " + job["id"] + " native run " + identity, file=sys.stderr)
+    return session, identity, pin
+
 def start_job(job):
     record = state["jobs"][job["id"]]
     attempt = root / "attempts" / job["id"] / ("%06d" % (len(record["attempts"]) + 1))
@@ -250,22 +343,22 @@ def start_job(job):
             accept(job, attempt, entry)
             return
         if job["driver"] == "dsr":
-            for filename, pin in job["config_files"].items():
-                copy_pin(Path(job["config_dir"]) / filename, attempt / "config" / filename, pin)
+            session, resume_id, resume_pin = native_session(job, record, attempt)
+            if session == attempt:
+                for filename, pin in job["config_files"].items():
+                    copy_pin(Path(job["config_dir"]) / filename, attempt / "config" / filename, pin)
             # Freeze all config file selectors. Preserve native host credentials
             # and toolchain environment, as the ordinary DSR builder does.
             for key in list(environment):
                 if key.startswith("DSR_") or key in ("DRY_RUN", "JSON_MODE"):
                     environment.pop(key)
-            cfg = str(attempt / "config")
+            cfg = str(session / "config")
             environment.update(DSR_CONFIG_DIR=cfg, DSR_CONFIG_FILE=cfg + "/config.yaml",
                                DSR_REPOS_FILE=cfg + "/repos.yaml", DSR_HOSTS_FILE=cfg + "/hosts.yaml",
-                               DSR_STATE_DIR=str(attempt / "state"))
-            command = ["bash", str(module.parent / "dsr"), "--json", "--non-interactive", "build", "--tool", plan["tool"],
-                       "--version", plan["tag"], "--targets", ",".join(job["targets"]), "--jobs", str(job["jobs"]),
-                       "--output-dir", str(attempt / "output")]
-            manifest = attempt / "output" / (plan["tool"] + "-" + plan["tag"] + "-manifest.json")
-            artifacts = attempt / "output"
+                               DSR_STATE_DIR=str(session / "state"))
+            command = native_command(job, session, resume_id)
+            manifest = session / "output" / (plan["tool"] + "-" + plan["tag"] + "-manifest.json")
+            artifacts = session / "output"
         else:
             copy_pin(Path(job["toolchain_manifest"]), attempt / "toolchain.json", job["toolchain_sha256"])
             command = ["bash", str(module.parent / "scripts/xwin-build.sh"), "--manifest", str(attempt / "toolchain.json"),
@@ -285,6 +378,11 @@ def start_job(job):
         plain(Path(command[1]), "file")
         write(attempt / "command.json", command)
         write(attempt / "inputs.json", {"plan_sha256": plan_hash, "job": job})
+        if job["driver"] == "dsr" and job.get("resume", False):
+            item["native"] = {"session_attempt": int(session.name), "resume_run_id": resume_id, "run_id": resume_id}
+            if resume_id is not None:
+                native_file = session / "state/builds" / plan["tool"] / plan["tag"] / resume_id / "state.json"
+                require(digest(native_file) == resume_pin, "native state changed before driver launch")
         item["status"] = "running"
         save_state()
         # A inherited high descriptor keeps the coordinator lock occupied even
@@ -295,7 +393,7 @@ def start_job(job):
                                     start_new_session=True, pass_fds=(lockfd,))
         active[job["id"]] = (proc, job, attempt, manifest, artifacts)
         print("[release-builds] Started " + job["id"] + "; log: " + str(attempt / "stderr.log"), file=sys.stderr)
-    except (Failure, OSError) as exc:
+    except (Failure, OSError, ValueError) as exc:
         item.update(status="failed", exit_code=getattr(exc, "code", 7))
         save_state()
         print("[release-builds] " + job["id"] + ": " + str(exc), file=sys.stderr)
@@ -319,6 +417,23 @@ def finish_job(item):
     kill_group(proc, signal.SIGKILL)
     record = state["jobs"][job["id"]]
     try:
+        if job["driver"] == "dsr" and job.get("resume", False):
+            native = record["attempts"][-1]["native"]
+            session = attempt.parent / ("%06d" % native["session_attempt"])
+            native_config(job, session)
+            observed = native_checkpoint(job, session)
+            if observed is not None:
+                _, _, checkpoint = observed
+                require(native["run_id"] in (None, checkpoint["run_id"]), "native builder switched run identity")
+                native["run_id"] = checkpoint["run_id"]
+                write(attempt / "native-after.json", checkpoint)
+            else:
+                require(native["run_id"] is None, "native builder removed its bound checkpoint")
+            if code == 0:
+                native_manifest = load(manifest)
+                require(observed is not None and checkpoint["status"] == "completed" and
+                        isinstance(native_manifest, dict) and native_manifest.get("run_id") == native["run_id"],
+                        "native success does not bind its completed run")
         require(code == 0, "builder exited " + str(code), code if 0 < code < 256 else 5)
         response = load(attempt / "stdout.json")
         require(isinstance(response, dict) and type(response.get("exit_code")) is int,
@@ -327,16 +442,7 @@ def finish_job(item):
             require(response.get("command") == "build" and response.get("status") == "success" and response.get("exit_code") == 0 and
                     isinstance(response.get("details"), dict) and response["details"].get("manifest") == str(manifest),
                     "native completion envelope does not bind its manifest")
-            for filename, pin in job["config_files"].items():
-                require(digest(attempt / "config" / filename) == pin, "native configuration snapshot changed")
-            actual = set()
-            for directory, dirs, files in os.walk(attempt / "config", followlinks=False):
-                for filename in dirs + files:
-                    p = Path(directory) / filename
-                    plain(p, "dir" if filename in dirs else "file")
-                    if filename in files:
-                        actual.add(p.relative_to(attempt / "config").as_posix())
-            require(actual == set(job["config_files"]), "native configuration namespace changed")
+            native_config(job, session if job.get("resume", False) else attempt)
         else:
             require(response.get("kind") == "dsr-xwin-build" and response.get("status") == "verified" and response.get("exit_code") == 0 and
                     response.get("release_manifest") == {"path": str(manifest), "sha256": digest(manifest)}, "xwin completion receipt does not bind its manifest")
@@ -417,9 +523,21 @@ try:
         require(isinstance(record, dict) and set(record) == {"attempts", "complete", "candidate"} and
                 isinstance(record["attempts"], list), "invalid job checkpoint", 2)
         for number, attempt in enumerate(record["attempts"], 1):
-            require(isinstance(attempt, dict) and set(attempt) == {"number", "status", "exit_code"} and attempt["number"] == number and
+            require(isinstance(attempt, dict) and {"number", "status", "exit_code"} <= set(attempt) <= {"number", "status", "exit_code", "native"} and attempt["number"] == number and
                     attempt["status"] in ("starting", "running", "failed", "interrupted", "completed") and
                     (attempt["exit_code"] is None or integer(attempt["exit_code"], 0, 255)), "invalid attempt checkpoint", 2)
+            if "native" in attempt:
+                native = attempt["native"]
+                require(job["driver"] == "dsr" and job.get("resume", False) and isinstance(native, dict) and
+                        set(native) == {"session_attempt", "resume_run_id", "run_id"} and
+                        integer(native["session_attempt"], 1, number) and
+                        (native["run_id"] is None or run_uuid(native["run_id"])) and
+                        (native["resume_run_id"] is None or (run_uuid(native["resume_run_id"]) and
+                         native["resume_run_id"] == native["run_id"] and native["session_attempt"] < number)),
+                        "invalid native resume binding", 2)
+                owner = record["attempts"][native["session_attempt"] - 1].get("native", {})
+                require(owner.get("session_attempt") == native["session_attempt"] and owner.get("resume_run_id") is None and
+                        owner.get("run_id") in (None, native["run_id"]), "native session ownership changed", 2)
         destination = root / "completed" / job["id"]
         entry = record["complete"] or record["candidate"]
         if destination.exists() or destination.is_symlink():

@@ -8,7 +8,8 @@ manifest hashes that cannot exist before compilation. No release API is called.
 Three drivers are supported:
 
 - `dsr`: run the existing `dsr --json --non-interactive build` command with a
-  frozen configuration and private per-attempt state/output directories.
+  frozen configuration and private state/output directories; optionally resume
+  the exact native run after a partial failure.
 - `xwin`: run the source-pinned Windows ARM64 runner, including its toolchain,
   Cargo metadata, committed source, optional siblings, and PE admission gates.
 - `import`: accept an already-produced manifest selected by its explicit SHA-256.
@@ -134,8 +135,51 @@ manifests, wrong-source manifests and corrupt payloads cannot complete a job.
 An incomplete invocation returns exit 1 and lists failed jobs; their specific
 exit codes remain in `state.json`. The same command retries failed/interrupted
 jobs in fresh attempt directories and independently revalidates completed jobs.
-It does not transparently resume a failed compiler's intermediate build state;
-the existing native `dsr build --resume` remains a separate operator workflow.
+Native jobs can opt into exact-run resume as described below. Without that
+option, failed native and xwin jobs restart in fresh state/output directories.
+
+### Resume partial native jobs
+
+Add `"resume": true` to a `driver: "dsr"` job before the first invocation to
+retain successful native targets when another target fails. This is a boolean
+job policy, not a global CLI flag, and belongs to the frozen input plan. Omitted
+or `false` preserves fresh-attempt behavior. Xwin/import jobs do not accept it.
+
+On retry the coordinator calls the existing `dsr build --resume=RUN_UUID` with
+the same frozen configuration, private state root, output directory, version,
+and target ordering as the original native run. It never follows the `latest`
+symlink, selects a newer run by timestamp, or supplies `--no-sync` to bypass
+source admission. DSR's existing resume checks still validate source roots,
+host/configuration bindings and each retained target's artifact evidence.
+
+Each coordinator attempt retains separate command/input receipts and stdout/
+stderr logs. Its `native` state record identifies the owning `session_attempt`,
+the observed `run_id`, and the explicit `resume_run_id` (null for a fresh run).
+`native-before.json` and `native-after.json` preserve the underlying checkpoint
+observations. The native backend may update its state and retry failed target
+outputs in the original session; earlier coordinator logs are never overwritten.
+
+The source SHA, tool, version, target list and output path must agree with the
+input plan. Changed configuration snapshots, ambiguous/missing native runs,
+modified invocation receipts, symlinked checkpoints, or diagnostic state fail
+before execution. A backend rejection is not retried as a fresh build. The
+original external configuration directory may go offline after admission;
+resume revalidates and consumes the frozen copy. Required source checkouts and
+remote hosts remain subject to the native builder's own availability checks.
+
+A failure before any native checkpoint exists gets a new isolated session.
+An already-observed checkpoint that disappears is an error. Native `completed`
+or `cancelled` state cannot be resumed by DSR and is not automatically adopted
+as a successful coordinator job. Retained output in that situation requires
+inspection. Successful resume must bind its final manifest to the same native
+run UUID and a completed native checkpoint before ordinary bundle admission.
+
+This is native **target-level** resume, not a promise to reuse every failed
+compiler's intermediate cache or to continue a remote process after a network
+partition. Run `bash scripts/tests/test_release_builds_resume.sh` for exact-run
+selection, target retention, state/configuration drift and failure-boundary
+tests. Native compilation/SSH is an explicit command-boundary fixture; the
+coordinator and full bundle/SLSA modules run unchanged apart from this feature.
 
 Successful checkpoints no longer depend on original compiler-output paths.
 Losing the acknowledgement after atomic checkpoint import is reconciled using
