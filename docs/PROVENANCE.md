@@ -114,6 +114,109 @@ The same verifier accepts `--build-type URI` and `--invocation-id ID` policies.
 Without `--public-key`, verification only checks structure, named bytes and
 policy. It explicitly reports that the signer is not authenticated.
 
+## Publish signed provenance and verify GitHub bytes
+
+The remote companion, `src/slsa_remote.sh`, uses the existing uncached release
+and numeric-asset-ID transport. It does not use statement-embedded download
+URLs, infer a trust key from GitHub, or execute downloaded binaries.
+
+After generating and signing the manifest-backed statement above, attach it
+to an existing draft whose complete payload set has already been uploaded:
+
+```bash
+bash src/slsa_remote.sh publish-release /path/to/release.intoto.jsonl /path/to/dist \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_SHA" \
+  --builder https://example.org/builders/dsr-production \
+  --public-key /path/to/trusted-minisign.pub \
+  --targets linux/amd64,windows/arm64
+```
+
+Use the actual full source commit and entire expected platform matrix. The
+publisher first authenticates the local statement and checks every named local
+payload. It then verifies the existing remote tag, complete payload namespace,
+downloaded payload hashes/sizes, and any occupied provenance names before an
+upload. It uploads only `release.intoto.jsonl` and its `.minisig` sidecar, from
+frozen private copies, in that order. It does not upload binaries, the private
+build manifest, keys, or working-state files. No private key is accepted and no
+signing, tag/release creation, promotion, deletion or asset replacement occurs.
+
+The default local signature is `<statement>.minisig`; `--signature FILE`
+selects another already-prepared signature. `--statement-name NAME.intoto.jsonl`
+selects the remote basename for both the statement and its signature.
+`--dry-run` (also `DRY_RUN=true` for publication) authenticates local inputs but
+makes no remote calls and reports `remote_verified: false`.
+
+Only drafts may acquire missing provenance assets. An already-complete public
+release can be reverified without writes. Conflicting occupied bytes, incomplete
+`starter` assets, or an orphan `.minisig` are errors. Each missing name gets one
+upload attempt. A lost acknowledgement returns failure; repeating the same
+command re-reads existing assets and uploads only what is still missing. Keep
+the exact signed input files for retry rather than signing a new pair. Accepted
+uploads are not rolled back when a later operation fails.
+
+Before success, the publisher independently downloads and authenticates the
+remote statement and signature again and rechecks every payload. That result
+must refer to the original repository/release identity and the expected final
+asset inventory, not merely another release with matching names. Changes to
+the original local statement/signature/payloads or selected public key also
+prevent success. The success receipt includes upload count and the complete
+remote verification receipt.
+
+A consumer can verify the GitHub release without local artifacts, a source
+checkout, or the private build manifest:
+
+```bash
+bash src/slsa_remote.sh verify-release \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_SHA" \
+  --builder https://example.org/builders/dsr-production \
+  --public-key /path/to/trusted-minisign.pub \
+  --targets linux/amd64,windows/arm64
+```
+
+Every identity option shown is required. Both the signed target matrix and the
+recorded artifact targets must equal the operator's matrix; a signed subset
+cannot redefine success. All installer aliases remain separate subjects. The
+complete remote non-metadata payload namespace must equal the signed subjects.
+The profile requires DSR manifest-backed SLSA v1 statements, not observation-only
+statements or an arbitrary producer's in-toto extension profile.
+
+`--statement-sha256`, `--manifest-sha256`, and `--invocation-id` optionally pin an
+exact statement, private manifest digest, and build invocation independently.
+Without those optional pins, a trusted producer can issue another statement
+for the selected repository/tag/commit/matrix; the verifier does not impose a
+chronological anti-replay policy. The public receipt retains all these observed
+identities, statement/signature asset IDs, and an inventory digest.
+
+All payloads are downloaded and hashed even when the API advertises digests.
+Conflicting or unsupported API digests are rejected, never downgraded to a
+different trust path. Missing digests are acceptable only after byte verification.
+The final uncached release/tag/inventory reads must equal the initial observation.
+No success JSON is emitted on failure. Dependency, argument, interruption and
+network failures preserve codes 3, 4, 5 and 8; policy/drift failures use 7 and
+the existing local signature/asset verifier may return 1.
+
+Live operations require Bash 4+, jq, Minisign, SHA-256 tools, normal filesystem
+utilities, and the existing public-GitHub adapter with credentials. They do not
+need Syft or build-host configuration. `SBOM_REMOTE_TIMEOUT` bounds adapter
+operations. Remote statements default to the existing 64 MiB document limit;
+signatures are limited to 64 KiB. `SLSA_REMOTE_MAX_PAYLOAD_BYTES` defaults to
+8 GiB for the sum of declared payload sizes. Allow temporary space for the
+complete set; publication performs payload verification both before and after
+its uploads. These are admission limits and timeouts, not a streaming disk quota
+against an HTTP server lying about its response size.
+
+These commands are explicit operations and do not change the finalizer's default
+policy or automatically gate promotion. Remote observations are not an atomic
+GitHub transaction. Signatures authenticate the producer's statement, not the
+truth of its compilation claim, every toolchain component, or a SLSA build level.
+Sourceable APIs are `slsa_publish_release` and `slsa_verify_remote`.
+
+Run `bash scripts/tests/test_slsa_remote.sh` for complete-set policy, byte drift,
+remote identity changes, interrupted upload recovery and read-only retry tests.
+The suite uses real statement generation, hashing and filesystem operations;
+GitHub transport helpers and Minisign are explicit fixtures, not live API or
+cryptographic acceptance tests.
+
 ## Observation-only statements
 
 `generate ARTIFACT [--repo-path DIR]` remains available for inspection. It marks

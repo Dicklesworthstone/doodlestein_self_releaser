@@ -55,9 +55,21 @@ chmod 755 "$WORK/bin/minisign"
 export PATH="$WORK/bin:$PATH" SLSA_TEST_CRYPTO_CALLS="$WORK/crypto.calls"
 # Transport contracts are tested here with local immutable-ID files. Actual
 # pagination/auth/HTTP deadlines are owned and tested by sbom_release.sh.
-_sbr_require() { return 0; }
+_sbr_require() { printf 'require\n' >> "$WORK/network.calls"; }
 _sbr_run() { "$@"; }
-_sbr_context() { cat "$WORK/context.json"; }
+_sbr_context() {
+    printf 'context\n' >> "$WORK/network.calls"
+    if [[ "$MODE" == readback-swap && -s "$WORK/swap-ready" ]]; then
+        local count
+        count=$(cat "$WORK/swap-count"); count=$((count+1)); printf '%s\n' "$count" > "$WORK/swap-count"
+        if ((count <= 2)); then
+            jq -c '.release.id=999|.release.node_id="other-release"|
+                .release.upload_url="https://uploads.github.com/repos/owner/demo/releases/999/assets{?name,label}"' "$WORK/context.json"
+            return
+        fi
+    fi
+    cat "$WORK/context.json"
+}
 _sbr_inventory() { jq -cS 'sort_by(.name)' "$WORK/inventory.json"; }
 _sbr_named_asset() { jq -ce --arg name "$2" '[.[]|select(.name==$name)]|if length==1 then .[0] else error("missing/ambiguous") end' <<< "$1" || return 7; }
 _sbr_payload_names() { jq -c '[.[]|select(.name|endswith(".jsonl") or endswith(".minisig") or endswith(".json") or endswith(".txt")|not)|.name]|sort' <<< "$1"; }
@@ -87,6 +99,9 @@ gh_download_release_asset() {
     [[ "$MODE" != download-error ]] || return 8
     [[ "$MODE" != download-timeout ]] || return 5
     cp "$WORK/remote/$id" "$dest" || return 8
+    if [[ "$MODE" == readback-swap && "$id" == 5 && ! -s "$WORK/swap-ready" ]]; then
+        printf ready > "$WORK/swap-ready"; printf '0\n' > "$WORK/swap-count"
+    fi
     if [[ "$MODE" == lying-api && "$id" == 3 ]]; then printf corrupt >> "$dest"; fi
     if [[ "$id" == 3 ]]; then
         case "$MODE" in
@@ -121,6 +136,8 @@ reset_remote() {
     done
     jq -cs 'sort_by(.name)' "$WORK/records" > "$WORK/inventory.json"
     : > "$WORK/download.calls"
+    : > "$WORK/network.calls"
+    : > "$WORK/swap-ready"
 }
 refresh_proof() {
     sign_fixture "$WORK/remote/4" "$WORK/remote/5"
@@ -199,6 +216,111 @@ expect 'unsafe statement name rejected' 4 slsa_verify_remote "${BASE[@]}" --stat
 expect 'expected target matrix is mandatory' 4 slsa_verify_remote --repo owner/demo --tag v1.2.3 --sha "$PIN" --builder dsr:test --public-key "$WORK/trusted.pub"
 expect 'duplicate expected platforms rejected' 4 slsa_verify_remote --repo owner/demo --tag v1.2.3 --sha "$PIN" --builder dsr:test --public-key "$WORK/trusted.pub" --targets linux/amd64,linux/amd64
 check 'argument rejection performs no downloads' test ! -s "$WORK/download.calls"
+check 'argument rejection performs no remote preflight' test ! -s "$WORK/network.calls"
+
+# Publication transport fixture: complete immutable asset records and a guarded
+# addition-only inventory. POST responses can be lost after their bytes land.
+_sbr_publication_gate() {
+    local observed current
+    observed=$(_sbr_context "$1" "$2" "$6") || return $?
+    current=$(_sbr_inventory "$1" 10 "$6") || return $?
+    [[ "$observed" == "$3" ]] || return 7
+    jq -en --argjson before "$4" --argjson after "$current" --argjson names "$5" '
+        all($before[];. as $a|[$after[]|select(.name==$a.name)]==[$a]) and
+        ([$before[]|select(.name as $n|$names|index($n)==null)]==
+         [$after[]|select(.name as $n|$names|index($n)==null)])' >/dev/null || return 7
+    printf '%s\n' "$current"
+}
+gh_upload_asset_named() {
+    local url=$1 file=$2 name=$3 id record
+    [[ "$url" == 'https://uploads.github.com/repos/owner/demo/releases/10/assets{?name,label}' ]] || return 99
+    [[ "${GH_MAX_RETRIES:-}" == 1 ]] || return 99
+    printf '%s\n' "$name" >> "$WORK/upload.calls"
+    jq -e --arg name "$name" 'all(.[];.name!=$name)' "$WORK/inventory.json" >/dev/null || return 8
+    id=$(jq '[.[].id]|max+1' "$WORK/inventory.json") || return 8
+    cp "$file" "$WORK/remote/$id" || return 8
+    record=$(jq -cn --arg name "$name" --argjson id "$id" --arg sha "$(_slsa_sha256 "$file")" \
+        --argjson size "$(wc -c < "$file")" '{id:$id,name:$name,size:$size,state:"uploaded",digest:("sha256:"+$sha)}') || return 8
+    jq --argjson record "$record" '.+[$record]|sort_by(.name)' "$WORK/inventory.json" > "$WORK/changed" || return 8
+    cp "$WORK/changed" "$WORK/inventory.json"
+    case "$MODE:$name" in
+        lost-statement:release.intoto.jsonl|lost-signature:release.intoto.jsonl.minisig) return 8 ;;
+        corrupt-upload:*) printf corrupt >> "$WORK/remote/$id" ;;
+        mutate-local:*) printf changed >> "$WORK/proofs/release.intoto.jsonl" ;;
+        wrong-receipt:*) record=$(jq -c '.id+=100' <<< "$record") ;;
+        tag-on-upload:*) jq '.tag_commit=("b"*40)' "$WORK/context.json" > "$WORK/changed"; cp "$WORK/changed" "$WORK/context.json" ;;
+    esac
+    printf '%s\n' "$record"
+}
+reset_publication() {
+    reset_remote
+    jq 'map(select(.id<4))' "$WORK/inventory.json" > "$WORK/changed"; cp "$WORK/changed" "$WORK/inventory.json"
+    : > "$WORK/upload.calls"
+}
+publish() { slsa_publish_release "$WORK/proofs/release.intoto.jsonl" "$WORK/assets" "${BASE[@]}" "$@"; }
+reset_publication
+expect 'publication dry run authenticates local proof without remote calls' 0 publish --dry-run
+check 'dry run is not remote verification' jq -e '.status=="planned" and .dry_run and .local_statement_authenticated and (.remote_verified|not)' "$WORK/result"
+check 'dry run performs no remote preflight or upload' bash -c '[[ ! -s "$1/network.calls" && ! -s "$1/upload.calls" ]]' _ "$WORK"
+expect 'signed provenance pair publishes to a matching complete draft' 0 publish
+check 'publisher returns independent authenticated verification' jq -e '.status=="verified" and .upload_attempts==2 and .verification.authenticated and .verification.artifact_count==3' "$WORK/result"
+check 'only statement then detached signature are uploaded' bash -c '[[ $(paste -sd, "$1") == release.intoto.jsonl,release.intoto.jsonl.minisig ]]' _ "$WORK/upload.calls"
+check 'published statement and signature bytes equal selected local inputs' bash -c 'cmp -s "$1/remote/4" "$1/proofs/release.intoto.jsonl" && cmp -s "$1/remote/5" "$1/proofs/release.intoto.jsonl.minisig"' _ "$WORK"
+BEFORE=$(wc -l < "$WORK/upload.calls")
+expect 'identical publication retry is read-only' 0 publish
+check 'retry never uploads the same names again' test "$BEFORE" = "$(wc -l < "$WORK/upload.calls")"
+check 'retry reports zero uploads' jq -e '.upload_attempts==0' "$WORK/result"
+jq '.release.draft=false' "$WORK/context.json" > "$WORK/changed"; cp "$WORK/changed" "$WORK/context.json"
+expect 'already-complete published release may be reverified read-only' 0 publish
+check 'published release retry does not mutate assets' test "$BEFORE" = "$(wc -l < "$WORK/upload.calls")"
+for phase in statement signature; do
+    reset_publication; MODE="lost-$phase"
+    expect "lost $phase acknowledgement returns failure" 8 publish
+    COUNT=$(wc -l < "$WORK/upload.calls")
+    MODE=normal
+    expect "retry recovers lost $phase acknowledgement" 0 publish
+    check 'recovery never repeats an accepted upload' test "$(wc -l < "$WORK/upload.calls")" = 2
+    if [[ "$phase" == signature ]]; then
+        check 'completed pair needs no new uploads after lost acknowledgement' test "$COUNT" = "$(wc -l < "$WORK/upload.calls")"
+    fi
+done
+reset_publication
+jq '.release.draft=false' "$WORK/context.json" > "$WORK/changed"; cp "$WORK/changed" "$WORK/context.json"
+expect 'missing proof cannot be attached to an already-public release' 4 publish
+check 'public release refusal makes no POST' test ! -s "$WORK/upload.calls"
+reset_remote
+jq 'map(select(.id!=4))' "$WORK/inventory.json" > "$WORK/changed"; cp "$WORK/changed" "$WORK/inventory.json"
+: > "$WORK/upload.calls"
+expect 'orphan signature cannot acquire a new statement' 7 publish
+check 'orphan refusal makes no POST' test ! -s "$WORK/upload.calls"
+reset_remote
+# A different valid signature/proof pair still cannot occupy the selected names.
+jq '.predicate.runDetails.metadata.invocationId="other-build"' "$WORK/remote/4" > "$WORK/changed"; cp "$WORK/changed" "$WORK/remote/4"
+refresh_proof
+: > "$WORK/upload.calls"
+expect 'conflicting occupied proof is never replaced' 7 publish
+check 'all occupied proof conflicts are found before upload' test ! -s "$WORK/upload.calls"
+for mode in wrong-receipt corrupt-upload tag-on-upload readback-swap; do
+    reset_publication; MODE=$mode
+    expect "$mode prevents publication success" 7 publish
+done
+reset_publication
+cp "$WORK/proofs/release.intoto.jsonl" "$WORK/saved-proof"
+MODE=mutate-local
+expect 'changing selected local proof during upload is not success' 7 publish
+cp "$WORK/saved-proof" "$WORK/proofs/release.intoto.jsonl"
+reset_publication
+printf corrupt >> "$WORK/assets/demo-windows.exe"
+expect 'local payload corruption is rejected before remote preflight' 1 publish
+check 'local corruption starts no remote operation' test ! -s "$WORK/network.calls"
+printf 'windows release payload\n' > "$WORK/assets/demo-windows.exe"
+reset_publication
+MODE=lying-api
+expect 'remote payload corruption blocks provenance upload' 7 publish
+check 'payload preflight happens before any proof upload' test ! -s "$WORK/upload.calls"
+reset_publication
+expect 'private key option is not accepted by the publisher' 4 publish --secret-key /private/key
+expect 'verification cannot be downgraded to a dry run' 4 slsa_verify_remote "${BASE[@]}" --dry-run
 check 'private temporary work is cleaned' bash -c '[[ -z $(find "$1" -name "dsr-slsa-remote.*" -print -quit) ]]' _ "$WORK"
-printf '\nRemote SLSA verification: %s passed, %s failed\n' "$PASS" "$FAIL"
+printf '\nRemote SLSA verification/publication: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
