@@ -134,6 +134,10 @@ if mode == 'wrong-manifest-run': value['run_id'] = str(uuid.uuid4())
 if mode == 'wrong-state-run': state['run_id'] = str(uuid.uuid4())
 manifest.write_text(json.dumps(value))
 state['status'] = 'completed'; save()
+if mode == 'import-corrupt':
+    # The command is successful, but the actual collector must refuse the
+    # damaged payload. Recovery must retain its manifest pin, not compile anew.
+    Path(state['target_statuses'][targets[0]]['path']).write_bytes(b'damaged transfer')
 print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details':{'manifest':str(manifest)}}))
 ''')
     script = repo / 'src/release_builds.sh'
@@ -244,6 +248,92 @@ print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details
         check(mode+' cannot admit success', not (case/'run/completed/native').exists())
     case=fixture('preflight',mode='preflight'); invoke(case,1); (case/'control').write_text('good'); invoke(case)
     check('failure before native checkpoint creation gets a fresh isolated session', read(case/'run/state.json')['jobs']['native']['attempts'][1]['native']['session_attempt']==2)
+
+    # A retained candidate is a distinct recovery phase: the native command
+    # finished, but import failed or the coordinator lost its acknowledgement.
+    def import_failure(label):
+        case = fixture(label, mode='import-corrupt')
+        invoke(case, 1)
+        record = read(case/'run/state.json')['jobs']['native']
+        check(label+': finished command has a selected candidate but no checkpoint',
+              record['candidate'] is not None and record['complete'] is None and
+              read(checkpoint(case))['status']=='completed' and not (case/'run/completed/native').exists())
+        return case
+    def repair_payload(case):
+        (session(case)/'output/demo-darwin-arm64.bin').write_bytes(b'built native fixture darwin/arm64\n')
+    case = import_failure('admission-retry')
+    pin = read(case/'run/state.json')['jobs']['native']['candidate']['manifest_sha256']
+    repair_payload(case)
+    before = events(case)
+    (case/'config').rename(case/'config-offline')
+    invoke(case)
+    record = read(case/'run/state.json')['jobs']['native']
+    check('failed import recovers without any compiler invocation', events(case)==before and len(record['attempts'])==1)
+    check('recovery preserves the selected manifest bytes and native UUID',
+          sha(case/'run/completed/native/build-manifest.json')==pin and
+          read(case/'run/completed/native/build-manifest.json')['run_id']==read(checkpoint(case))['run_id'])
+    check('import recovery retains its own admission diagnostics',
+          len(list(session(case).glob('admission-recovery-*/admission.log')))==1)
+    invoke(case)
+    check('recovered release retries remain compile-free', events(case)==before)
+
+    case = import_failure('interrupted-import')
+    repair_payload(case)
+    # Simulate death after selecting the manifest, before import/acknowledgement.
+    value = read(case/'run/state.json')
+    value['jobs']['native']['attempts'][-1].update(status='running', exit_code=None)
+    write(case/'run/state.json', value)
+    before=events(case); invoke(case)
+    check('interrupted candidate admission resumes instead of restarting the completed native run', events(case)==before)
+    case = import_failure('still-corrupt')
+    before=events(case); invoke(case,1)
+    record=read(case/'run/state.json')['jobs']['native']
+    check('continued corruption retains the pin and never falls back to compilation',
+          events(case)==before and record['candidate'] is not None and len(record['attempts'])==1 and
+          not (case/'run/completed/native').exists())
+    for label, change in (
+        ('candidate-manifest-drift', lambda c:(session(c)/'output/demo-v1.2.3-manifest.json').write_text('{}')),
+        ('candidate-config-drift', lambda c:(session(c)/'config/config.yaml').write_text('{}')),
+        ('candidate-command-drift', lambda c:write(session(c)/'command.json', ['bash','/outside'])),
+        ('candidate-input-drift', lambda c:write(session(c)/'inputs.json', {})),
+        ('candidate-envelope-drift', lambda c:write(session(c)/'stdout.json', {'exit_code':0})),
+        ('candidate-snapshot-drift', lambda c:write(session(c)/'native-after.json', {})),
+        ('candidate-state-drift', lambda c:write(checkpoint(c), dict(read(checkpoint(c)), status='failed'))),
+    ):
+        case=import_failure(label); repair_payload(case)
+        no_launch(case, lambda:change(case), label+' blocks adoption without a replacement build')
+        check(label+': original candidate remains selected', read(case/'run/state.json')['jobs']['native']['candidate'] is not None)
+    case=import_failure('candidate-path-drift'); repair_payload(case)
+    value=read(case/'run/state.json'); value['jobs']['native']['candidate']['manifest']='/outside/manifest.json'
+    no_launch(case, lambda:write(case/'run/state.json',value), 'candidate paths cannot redirect recovered import')
+
+    # Interrupt a real native-driver process after it has checkpointed one
+    # target. Resume must preserve that target and terminate its sleeper first.
+    case=fixture('signal-resume', mode='slow')
+    out=open(case/'cancel.stdout','wb'); err=open(case/'cancel.stderr','wb')
+    process=subprocess.Popen(['bash',str(script),'--plan',str(case/'plan.json'),'--output-dir',str(case/'run')],stdout=out,stderr=err)
+    try:
+        until=time.monotonic()+15
+        while time.monotonic()<until and not (case/'control.pid').exists(): time.sleep(.03)
+        check('signal test reaches native target checkpoint', (case/'control.pid').exists())
+        identity=read(checkpoint(case))['run_id']
+        saved=session(case)/'output/demo-darwin-arm64.bin'
+        inode=saved.stat().st_ino
+        process.send_signal(signal.SIGTERM)
+        code=process.wait(timeout=10)
+        check('native resume coordinator cancellation remains exit 5', code==5)
+    finally:
+        if process.poll() is None:
+            process.terminate(); process.wait(timeout=10)
+        out.close(); err.close()
+    pid=(case/'control.pid').read_text().strip()
+    status=Path('/proc')/pid/'stat'
+    check('interrupted native descendants stop before recovery', not status.exists() or status.read_text().split(') ',1)[1].split()[0]=='Z')
+    (case/'control').write_text('good'); invoke(case)
+    check('interruption resumes the checkpointed UUID and retained successful target',
+          read(checkpoint(case))['run_id']==identity and saved.stat().st_ino==inode and
+          len([e for e in events(case) if e['event']=='compile' and e['target']=='darwin/arm64'])==1)
+
     case=fixture('disabled',resume=False); invoke(case,1); (case/'control').write_text('good'); invoke(case)
     check('disabled resume preserves fresh-attempt behavior', not any(a.startswith('--resume') for e in events(case) for a in e['args']))
     case=fixture('bad-option'); value=read(case/'plan.json'); value['builds'][0]['resume']='true'; write(case/'plan.json',value); invoke(case,4)

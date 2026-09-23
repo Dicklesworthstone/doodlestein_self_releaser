@@ -169,16 +169,34 @@ remote hosts remain subject to the native builder's own availability checks.
 
 A failure before any native checkpoint exists gets a new isolated session.
 An already-observed checkpoint that disappears is an error. Native `completed`
-or `cancelled` state cannot be resumed by DSR and is not automatically adopted
-as a successful coordinator job. Retained output in that situation requires
-inspection. Successful resume must bind its final manifest to the same native
-run UUID and a completed native checkpoint before ordinary bundle admission.
+or `cancelled` state cannot be resumed by DSR. A bare completed checkpoint is
+not automatically adopted as a successful coordinator job. Successful resume
+must bind its final manifest to the same native run UUID and a completed native
+checkpoint before ordinary bundle admission.
+
+For resume-enabled native jobs, the coordinator can also recover a failed or
+interrupted **artifact import after successful compilation**. This requires its
+already-persisted `candidate` manifest pin: the driver must have exited zero and
+passed completion checks before that pin was selected. Recovery revalidates the
+original command/input receipts, frozen configuration, successful JSON envelope,
+completed native UUID and checkpoint snapshot, then imports only the previously
+selected manifest and its exact payload hashes. It does not rerun the compiler,
+invent a new manifest pin, or infer success from files left in an output folder.
+
+Each such retry retains an `admission-recovery-*` directory under the original
+attempt, containing its selection and admission log. Continued corruption or a
+missing payload keeps the candidate selected and the job incomplete; another
+compiler is not started as a fallback. Repairing/transferring the originally
+selected bytes permits retry without repeating a completed build. A terminal
+native run with no coordinator candidate still requires inspection: this does
+not recover a driver exit that the coordinator never observed or acknowledged.
 
 This is native **target-level** resume, not a promise to reuse every failed
 compiler's intermediate cache or to continue a remote process after a network
 partition. Run `bash scripts/tests/test_release_builds_resume.sh` for exact-run
-selection, target retention, state/configuration drift and failure-boundary
-tests. Native compilation/SSH is an explicit command-boundary fixture; the
+selection, target retention, signal cancellation, interrupted import recovery,
+state/configuration drift and failure-boundary tests. Native compilation/SSH
+is an explicit command-boundary fixture; the
 coordinator and full bundle/SLSA modules run unchanged apart from this feature.
 
 Successful checkpoints no longer depend on original compiler-output paths.

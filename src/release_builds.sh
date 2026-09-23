@@ -398,18 +398,56 @@ def start_job(job):
         save_state()
         print("[release-builds] " + job["id"] + ": " + str(exc), file=sys.stderr)
 
-def accept(job, attempt, entry):
+def accept(job, attempt, entry, admission_dir=None):
     record = state["jobs"][job["id"]]
     # Persist the selected manifest BEFORE importing. A crash between import
     # and the completion update can only reuse that exact pinned selection.
     record["candidate"] = entry
     save_state()
     destination = root / "completed" / job["id"]
-    helper("_rb_import", entry, destination, attempt)
+    helper("_rb_import", entry, destination, admission_dir or attempt)
     record["complete"] = entry
     record["candidate"] = None
     record["attempts"][-1].update(status="completed", exit_code=0)
     save_state()
+
+def recover_native_import(job, record):
+    # A persisted candidate means the coordinator observed a zero driver exit
+    # and validated its completion, then selected these exact manifest bytes.
+    # This is not permission to adopt a bare 'completed' native state. Retain
+    # the pin on failed import; never invoke a fresh compiler to replace it.
+    previous = record["attempts"][-1]
+    native = previous.get("native")
+    require(isinstance(native, dict) and run_uuid(native.get("run_id")),
+            "candidate has no bound native run", 2)
+    attempt = plain(root / "attempts" / job["id"] / ("%06d" % previous["number"]), "dir")
+    session = plain(attempt.parent / ("%06d" % native["session_attempt"]), "dir")
+    candidate = record["candidate"]
+    require(isinstance(candidate, dict) and sha(candidate.get("manifest_sha256")), "invalid candidate pin", 2)
+    manifest = session / "output" / (plan["tool"] + "-" + plan["tag"] + "-manifest.json")
+    expected = selected(job, manifest, session / "output", candidate["manifest_sha256"])
+    require(candidate == expected, "candidate paths or target identity changed", 2)
+    require(load(attempt / "inputs.json") == {"plan_sha256": plan_hash, "job": job} and
+            load(attempt / "command.json") == native_command(job, session, native["resume_run_id"]),
+            "completed native invocation changed")
+    native_config(job, session)
+    observed = native_checkpoint(job, session)
+    require(observed is not None, "completed native checkpoint disappeared")
+    _, _, checkpoint = observed
+    require(checkpoint["status"] == "completed" and checkpoint["run_id"] == native["run_id"] and
+            load(attempt / "native-after.json") == checkpoint, "completed native checkpoint changed")
+    response = load(attempt / "stdout.json")
+    require(isinstance(response, dict) and response.get("command") == "build" and
+            response.get("status") == "success" and type(response.get("exit_code")) is int and
+            response["exit_code"] == 0 and isinstance(response.get("details"), dict) and
+            response["details"].get("manifest") == str(manifest), "completed native envelope changed")
+    require(digest(manifest) == candidate["manifest_sha256"], "selected native manifest changed")
+    value = load(manifest)
+    require(isinstance(value, dict) and value.get("run_id") == native["run_id"], "candidate native run changed")
+    recovery = Path(tempfile.mkdtemp(prefix="admission-recovery-", dir=attempt))
+    write(recovery / "selection.json", candidate)
+    accept(job, attempt, candidate, recovery)
+    print("[release-builds] Recovered completed native import: " + job["id"], file=sys.stderr)
 
 def finish_job(item):
     proc, job, attempt, manifest, artifacts = item
@@ -549,6 +587,18 @@ try:
             record["attempts"][-1].update(status="completed", exit_code=0)
         else:
             require(record["complete"] is None, "completed build disappeared")
+            if record["candidate"] is not None and job["driver"] == "dsr" and job.get("resume", False):
+                try:
+                    require(record["attempts"], "native candidate has no attempt", 2)
+                    recover_native_import(job, record)
+                except (Failure, OSError, ValueError) as exc:
+                    if record["attempts"]:
+                        record["attempts"][-1].update(status="failed", exit_code=getattr(exc, "code", 7))
+                    save_state()
+                    print("[release-builds] " + job["id"] + ": " + str(exc), file=sys.stderr)
+                # Both success and rejection finish this job's work for this
+                # invocation. Independent queued jobs may still make progress.
+                continue
             if record["attempts"] and record["attempts"][-1]["status"] in ("running", "starting"):
                 record["attempts"][-1].update(status="interrupted", exit_code=5)
             record["candidate"] = None
