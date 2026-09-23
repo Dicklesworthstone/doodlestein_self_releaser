@@ -264,13 +264,15 @@ PY
 
 # Validate the selected binary and complete Cargo graph. Every local/path
 # package must come from the primary snapshot or an explicitly pinned sibling.
-# The optional seventh argument is the verified source-set receipt, never a
-# general filesystem allowlist. Unlisted/absolute path escapes remain errors.
+# The optional seventh argument is the verified source-set receipt (or empty),
+# never a filesystem allowlist. The eighth is a JSON array of requested binary
+# names; the fourth argument optionally restricts all binaries to one package.
+# Unlisted/absolute path escapes remain errors. All selections share one graph.
 # stdout is a small selection receipt; the full canonical graph stays in a file.
 xwin_source_metadata() {
-    [[ $# == 6 || $# == 7 ]] || return 4
+    [[ $# == 6 || $# == 7 || $# == 8 ]] || return 4
     command -v python3 >/dev/null || return 3
-    if [[ $# == 7 ]]; then
+    if [[ $# -ge 7 && -n "$7" ]]; then
         local boundary
         [[ -d "$2" && ! -L "$2" ]] || return 7
         boundary=$(cd "$2/.." && pwd -P) || return 7
@@ -280,6 +282,7 @@ xwin_source_metadata() {
 import hashlib
 import json
 from pathlib import Path
+import re
 import stat
 import sys
 
@@ -297,7 +300,7 @@ try:
         return obj
     allowed = {root: ""}
     dependencies = []
-    if len(sys.argv) == 8:
+    if len(sys.argv) >= 8 and sys.argv[7]:
         with open(sys.argv[7]) as stream:
             source = json.load(stream, object_pairs_hook=pairs)
         require(source.get("primary_path") == "project" and root.name == "project", "metadata requires the admitted primary layout")
@@ -342,24 +345,33 @@ try:
                 local_file(target["src_path"])
     defaults = graph.get("workspace_default_members", [graph["resolve"].get("root")])
     require(isinstance(defaults, list) and set(defaults) <= set(members), "invalid default workspace selection")
-    candidates = []
-    for p in packages:
-        if p["id"] not in members or p["source"] is not None:
-            continue
-        if package and p["name"] != package or not package and p["id"] not in defaults:
-            continue
-        for target in p["targets"]:
-            if target["name"] == binary and "bin" in target["kind"]:
-                candidates.append((p, target))
-    require(len(candidates) == 1, "binary/package selection is missing or ambiguous")
-    selected, target = candidates[0]
-    require(selected["version"] == version, "Cargo package version differs from the release tag")
-    selected_nodes = [n for n in nodes if n["id"] == selected["id"]]
-    require(len(selected_nodes) == 1, "selected package missing from dependency resolution")
-    require(set(target.get("required-features", [])) <= set(selected_nodes[0]["features"]), "selected binary requires inactive features")
-    manifest = local_file(selected["manifest_path"], primary_only=True)
-    binary_source = local_file(target["src_path"], primary_only=True)
-    reachable, pending = set(), [selected["id"]]
+    binaries = json.loads(sys.argv[8]) if len(sys.argv) == 9 else [binary]
+    require(isinstance(binaries, list) and 1 <= len(binaries) <= 32 and all(
+        isinstance(b, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", b)
+        for b in binaries) and binaries[0] == binary and
+        len({b.lower() for b in binaries}) == len(binaries), "invalid or colliding binary selection")
+    selections = []
+    for binary_name in binaries:
+        candidates = []
+        for p in packages:
+            if p["id"] not in members or p["source"] is not None:
+                continue
+            if package and p["name"] != package or not package and p["id"] not in defaults:
+                continue
+            for target in p["targets"]:
+                if target["name"] == binary_name and "bin" in target["kind"]:
+                    candidates.append((p, target))
+        require(len(candidates) == 1, "binary/package selection is missing or ambiguous: " + binary_name)
+        selected, target = candidates[0]
+        require(selected["version"] == version, "Cargo package version differs from the release tag: " + selected["name"])
+        selected_nodes = [n for n in nodes if n["id"] == selected["id"]]
+        require(len(selected_nodes) == 1, "selected package missing from dependency resolution")
+        require(set(target.get("required-features", [])) <= set(selected_nodes[0]["features"]), "selected binary requires inactive features")
+        selections.append({"package_id": selected["id"], "package": selected["name"], "version": selected["version"],
+                           "binary": binary_name, "manifest": local_file(selected["manifest_path"], primary_only=True),
+                           "binary_source": local_file(target["src_path"], primary_only=True),
+                           "features": sorted(selected_nodes[0]["features"])})
+    reachable, pending = set(), [s["package_id"] for s in selections]
     by_id = {node["id"]: node for node in nodes}
     while pending:
         identity = pending.pop()
@@ -384,12 +396,11 @@ try:
     encoded = (json.dumps(graph, sort_keys=True, separators=(",", ":")) + "\n").encode()
     with open(output_file, "xb") as stream:
         stream.write(encoded)
-    print(json.dumps({"metadata_sha256": hashlib.sha256(encoded).hexdigest(),
-                      "package_id": selected["id"], "package": selected["name"], "version": selected["version"],
-                      "binary": binary, "manifest": manifest, "binary_source": binary_source,
+    print(json.dumps({**selections[0], "binaries": selections,
+                      "metadata_sha256": hashlib.sha256(encoded).hexdigest(),
                       "source_dependencies": [{"relative_path": d["relative_path"], "git_sha": d["git_sha"]} for d in dependencies],
                       "resolved_siblings": resolved_siblings,
-                      "resolved_packages": len(nodes), "features": sorted(selected_nodes[0]["features"])}))
+                      "resolved_packages": len(nodes)}))
 except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
     print("[xwin-source] " + str(error), file=sys.stderr)
     sys.exit(7)
