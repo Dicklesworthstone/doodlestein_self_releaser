@@ -4,6 +4,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 for tool in jq sha256sum; do command -v "$tool" >/dev/null || { echo "SKIP: $tool required"; exit 0; }; done
 source "$ROOT/src/slsa.sh" || exit 1
+source "$ROOT/src/release_payloads.sh" || exit 1
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-slsa-release.XXXXXXXX") || exit 1
 trap 'rm -rf -- "$TEMP"' EXIT
 mkdir -p "$TEMP/assets" "$TEMP/proofs" "$TEMP/modified" "$TEMP/bin"
@@ -125,6 +126,95 @@ for mutation in partial failed empty duplicate escape null-sha control-sha wrong
     check "invalid or incomplete manifest fails: $mutation" test "$status" -ne 0
     check "failed $mutation manifest publishes nothing" test ! -e "$TEMP/proofs/reject-$mutation"
 done
+# Release eligibility is shared with direct payload uploads and signature
+# preparation, not just the build-set collector. All these fixtures have valid
+# source hashes, successful counts and unchanged payload bytes: only the
+# publication policy differs. No network, signer or alternate parser is used.
+for mutation in diagnostic not-publishable null-publishable string-publishable numeric-publishable \
+    null-purpose unknown-purpose artifact-diagnostic artifact-private alias-private artifact-null \
+    artifact-string artifact-purpose-null incomplete-request extra-request duplicate-request \
+    empty-request null-request object-request string-request invalid-request \
+    recorded-repo recorded-url null-repo numeric-repo credentials-repo suffix-repo \
+    bundle-repo missing-bundle-repo null-bundle-repo; do
+    case "$mutation" in
+        diagnostic) filter='.build_purpose="diagnostic-native" | .publishable=false' ;;
+        not-publishable) filter='.publishable=false' ;;
+        null-publishable) filter='.publishable=null' ;;
+        string-publishable) filter='.publishable="true"' ;;
+        numeric-publishable) filter='.publishable=1' ;;
+        null-purpose) filter='.build_purpose=null' ;;
+        unknown-purpose) filter='.build_purpose="debug"' ;;
+        artifact-diagnostic) filter='.build_purpose="release" | .publishable=true | .artifacts[2].build_purpose="diagnostic-native"' ;;
+        artifact-private) filter='.publishable=true | .artifacts[2].publishable=false' ;;
+        alias-private) filter='.artifacts[1].publishable=false' ;;
+        artifact-null) filter='.artifacts[2].publishable=null' ;;
+        artifact-string) filter='.artifacts[2].publishable="true"' ;;
+        artifact-purpose-null) filter='.artifacts[2].build_purpose=null' ;;
+        incomplete-request) filter='.requested_targets=["linux/amd64"]' ;;
+        extra-request) filter='.requested_targets=["linux/amd64","windows/amd64","darwin/arm64"]' ;;
+        duplicate-request) filter='.requested_targets=["linux/amd64","linux/amd64","windows/amd64"]' ;;
+        empty-request) filter='.requested_targets=[]' ;;
+        null-request) filter='.requested_targets=null' ;;
+        object-request) filter='.requested_targets={"linux/amd64":true,"windows/amd64":true}' ;;
+        string-request) filter='.requested_targets="linux/amd64,windows/amd64"' ;;
+        invalid-request) filter='.requested_targets=["linux/amd64",null]' ;;
+        recorded-repo) filter='.source.repository="other/app"' ;;
+        recorded-url) filter='.source.repository="https://github.com/other/app"' ;;
+        null-repo) filter='.source.repository=null' ;;
+        numeric-repo) filter='.source.repository=1' ;;
+        credentials-repo) filter='.source.repository="https://token@github.com/example/app"' ;;
+        suffix-repo) filter='.source.repository="https://github.com/example/app/extra"' ;;
+        bundle-repo) filter='.bundle_evidence={kind:"manifest-bound-build-set",repo:"other/app"}' ;;
+        missing-bundle-repo) filter='.bundle_evidence={kind:"manifest-bound-build-set"}' ;;
+        null-bundle-repo) filter='.bundle_evidence={kind:"manifest-bound-build-set",repo:null}' ;;
+    esac
+    candidate="$TEMP/modified/policy-$mutation.json"
+    jq "$filter" "$manifest" > "$candidate" || exit 1
+    run _rup_manifest "$candidate" example/app v1.2.3 "$PIN"
+    check "direct upload admission rejects $mutation" equal "$status" 4
+    check "rejected $mutation emits no upload selection" equal "$output" ''
+    run slsa_generate_manifest "$candidate" "$TEMP/assets" --repository example/app \
+        --output "$TEMP/proofs/policy-$mutation"
+    check "release provenance rejects $mutation" equal "$status" 4
+    check "rejected $mutation creates no final proof" test ! -e "$TEMP/proofs/policy-$mutation"
+done
+
+# Optional legacy declarations remain optional. Explicit release declarations,
+# unordered target matrices and both existing repository spellings are admitted.
+for variant in explicit-release reordered-targets plain-repository url-repository bundle-repository extensions; do
+    case "$variant" in
+        explicit-release) filter='.build_purpose="release" | .publishable=true | .artifacts |= map(.+{build_purpose:"release",publishable:true})' ;;
+        reordered-targets) filter='.requested_targets=["windows/amd64","linux/amd64"]' ;;
+        plain-repository) filter='.source.repository="example/app"' ;;
+        url-repository) filter='.source.repository="https://github.com/example/app"' ;;
+        bundle-repository) filter='.bundle_evidence={kind:"manifest-bound-build-set",repo:"example/app",authenticated:false}' ;;
+        extensions) filter='.private_extension={policy:"not-a-release-declaration"}' ;;
+    esac
+    candidate="$TEMP/modified/valid-$variant.json"
+    jq "$filter" "$manifest" > "$candidate" || exit 1
+    run _rup_manifest "$candidate" example/app v1.2.3 "$PIN"
+    check "direct upload admission accepts $variant" equal "$status" 0
+    check "accepted $variant keeps every payload alias" jq -e \
+        --arg pin "$(_slsa_sha256 "$candidate")" \
+        '.manifest_sha256==$pin and (.artifacts|length)==3' <<< "$output"
+    run slsa_generate_manifest "$candidate" "$TEMP/assets" --repository example/app --builder dsr/test \
+        --output "$TEMP/proofs/valid-$variant"
+    check "release provenance accepts $variant" equal "$status" 0
+    run slsa_verify_release "$TEMP/proofs/valid-$variant" "$TEMP/assets" --manifest "$candidate" \
+        --repository example/app --builder dsr/test
+    check "accepted $variant verifies against the same manifest" equal "$status" 0
+done
+
+# Failure must not rewrite an already admitted statement. Manifest-backed
+# verification applies the policy even when the payload bytes still match.
+run slsa_generate_manifest "$TEMP/modified/policy-diagnostic.json" "$TEMP/assets" \
+    --repository example/app --builder dsr/test --output "$proof"
+check 'diagnostic metadata cannot reuse a release proof pathname' equal "$status" 4
+check 'refused diagnostic leaves the existing release proof intact' equal "$prior" "$(_slsa_sha256 "$proof")"
+run slsa_verify_release "$proof" "$TEMP/assets" --manifest "$TEMP/modified/policy-diagnostic.json" \
+    --repository example/app --builder dsr/test
+check 'manifest-backed verification refuses a diagnostic declaration' equal "$status" 4
+
 cat "$manifest" "$manifest" > "$TEMP/modified/multiple.json"
 run slsa_generate_manifest "$TEMP/modified/multiple.json" "$TEMP/assets" --repository example/app --output "$TEMP/proofs/multiple"
 check 'multiple manifest documents rejected' equal "$status" 4
