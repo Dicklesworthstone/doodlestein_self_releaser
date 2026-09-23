@@ -28,9 +28,13 @@ does not invent a build start time. The complete manifest is bound by SHA256;
 private environment values and build-local paths are not copied into the public
 statement. Retain the original manifest bytes to audit that evidence.
 
-The manifest schema does not identify repository ownership. `--repository`
+The core manifest schema does not require repository ownership. `--repository`
 therefore supplies an explicit `owner/repo` binding, recorded as caller-supplied.
-The producer is responsible for its correctness. No repository name is inferred
+When `source.repository` is present, it must match that selection as either
+`owner/repo` or `https://github.com/owner/repo`, using the same exact spelling.
+A `manifest-bound-build-set` receipt's `bundle_evidence.repo` must agree too;
+publishing an aggregate directly cannot discard its selected repository.
+The producer remains responsible for correctness. No repository name is inferred
 from the tool name, current directory, or artifact location.
 
 This profile accepts UTC second-resolution `built_at` timestamps, the schema's
@@ -38,6 +42,27 @@ Linux/macOS/Windows targets, and tar.gz, tar.xz, ZIP, binary or none formats. It
 rejects partial/failed builds, missing targets, duplicate names, invalid pins,
 and metadata that disagrees with successful target coverage. This is validation
 of the fields consumed by this profile, not a general JSON Schema validator.
+
+Successful compilation alone does not make a build publishable. Explicit
+`build_purpose` and `publishable` declarations, at both manifest and artifact
+level, must be `"release"` and the JSON boolean `true`, respectively. Diagnostic,
+debug, false, null and mistyped declarations are rejected. This includes aliases
+that share an inode with an otherwise eligible payload. Older manifests may omit
+these fields; explicit null is not equivalent to omission. `generate` remains
+available for observation-only statements about non-release artifacts.
+
+When `requested_targets` is present, it must be a nonempty array of distinct
+valid targets matching the artifact target set exactly. Order does not matter;
+aliases do not count as extra targets. A missing platform cannot be concealed
+by reducing the summary counts to describe only the successful subset.
+
+These checks live in the shared manifest admission used by direct payload
+uploads, manifest-bound signature preparation, and the finalizer, not only
+bundle collection. Rejected manifests return exit `4` before an upload selection
+or final provenance file is emitted. This validates producer declarations, not
+their authenticity: an unsigned manifest can still omit or falsify evidence.
+Verification without an expected manifest cannot recover policy fields omitted
+from a previously generated statement.
 
 Identical retries retain existing statement bytes. Conflicting statements and
 orphan detached signatures are never overwritten. Publication is atomic for a

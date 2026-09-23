@@ -320,6 +320,9 @@ _slsa_repository() {
 # Map a complete successful DSR manifest to a deterministic multi-subject
 # statement. This validates the fields used by this profile, not every future
 # extension in schemas/manifest.json. No arbitrary embedded paths are read.
+# Also used by payload publication and signature preparation: a successful
+# diagnostic build is not a release. Check explicit purpose/coverage/repository
+# declarations here so the direct finalizer cannot bypass the bundle's gates.
 _slsa_manifest_statement() {
     local manifest="$1" repository="$2" builder="$3" digest statement
     repository=$(_slsa_repository "$repository") || return $?
@@ -332,6 +335,11 @@ _slsa_manifest_statement() {
         def commit: type == "string" and length == 40 and test("^[0-9a-f]{40}$") and . != ("0" * 40);
         def count: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
         def target: text and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
+        def release_eligible:
+            (if has("build_purpose") then .build_purpose == "release" else true end) and
+            (if has("publishable") then .publishable == true else true end);
+        def repository_matches:
+            text and (. == $repo or . == ($repo | ltrimstr("https://github.com/")));
         def timestamp: text and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") and
             (. as $s | try (fromdateiso8601 | todateiso8601 == $s) catch false);
         if length == 1 then .[0] else error("expected one build manifest") end |
@@ -342,12 +350,25 @@ _slsa_manifest_statement() {
            (.source.dependencies | type != "array" or
                (all(.[]; type == "object" and (.relative_path | name) and (.git_sha | commit)) | not))
         then error("incomplete or unsuccessful build manifest") else . end |
+        if (release_eligible | not)
+        then error("build is not publishable release output") else . end |
+        if (.source | has("repository")) and (.source.repository | repository_matches | not)
+        then error("recorded source repository differs from selected release") else . end |
+        if (.bundle_evidence? | type) == "object" and
+           .bundle_evidence.kind == "manifest-bound-build-set" and
+           (.bundle_evidence.repo | repository_matches | not)
+        then error("recorded bundle repository differs from selected release") else . end |
         if (.artifacts | type != "array" or length == 0 or
             (all(.[]; type == "object" and (.name | name) and (.sha256 | sha) and
+                release_eligible and
                 (.target | target) and (.size_bytes | count and . > 0) and
                 (.archive_format | . == "tar.gz" or . == "tar.xz" or . == "zip" or . == "binary" or . == "none")) | not))
         then error("invalid artifact records") else . end |
         (.artifacts | map(.target) | unique) as $targets |
+        if has("requested_targets") and
+           (.requested_targets | type != "array" or length == 0 or
+               (all(.[]; target) | not) or (sort != $targets))
+        then error("release does not cover its exact requested target matrix") else . end |
         if (.summary | type != "object" or (.total | count | not) or (.success | count | not) or
             .failed != 0 or .total != .success or .total != ($targets | length)) or
            ((.artifacts | map(.name) | unique | length) != (.artifacts | length)) or
