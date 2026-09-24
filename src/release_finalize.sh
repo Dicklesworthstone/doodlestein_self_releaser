@@ -15,6 +15,7 @@ _rf_build_set_execute() {
     local public='' secret='' integrity='' notes='' title='' prerelease=false retry_creation=false
     local dispatch_run='' dispatch_state='' retry_delivery=false format=spdx metadata='' state=''
     local build_plan='' build_dir='' build_jobs=1 build_worker=0 cleanup
+    local packaging_recipe='' package='' selected_manifest selected_artifacts selected_pin
     local -a forwarded=() collect_args=()
     local -A seen=()
     while (($#)); do
@@ -23,19 +24,20 @@ _rf_build_set_execute() {
         [[ -n "$option" && -z "${seen[$option]:-}" ]] || return 4
         seen[$option]=1
         case "$option" in
-            --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--provenance-builder)
+            --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--packaging-recipe|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--provenance-builder)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 value=$2
                 case "$option" in
                     --build-set) plan=$value ;; --bundle-dir) bundle=$value ;;
                     --build-plan) build_plan=$value ;; --build-dir) build_dir=$value ;; --build-jobs) build_jobs=$value ;;
+                    --packaging-recipe) packaging_recipe=$value ;;
                     --format) format=$value ;; --output-dir) metadata=$value ;; --state-dir) state=$value ;;
                     --public-key) public=$value ;; --secret-key) secret=$value ;; --integrity-dir) integrity=$value ;;
                     --provenance-builder) provenance_builder=$value ;;
                     --release-name) title=$value ;; --release-notes-file) notes=$value ;;
                     --dispatch-repos) dispatch=$value ;; --dispatch-run-id) dispatch_run=$value ;; --dispatch-state-dir) dispatch_state=$value ;;
                 esac
-                case "$option" in --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs) ;; *) forwarded+=("$option" "$value") ;; esac
+                case "$option" in --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--packaging-recipe) ;; *) forwarded+=("$option" "$value") ;; esac
                 shift 2 ;;
             --dry-run) dry=true; shift ;;
             --require-signatures|--prepared-signatures|--create-draft|--promote|--prerelease|--retry-creation|--retry-uncertain|--require-provenance)
@@ -51,6 +53,7 @@ _rf_build_set_execute() {
     done
     [[ "$dry" =~ ^(true|false)$ ]] || return 4
     if [[ -n "$build_plan" ]]; then
+        [[ -z "$packaging_recipe" ]] || { _rf_log 'Packaging currently requires --build-set'; return 4; }
         [[ -z "$plan$bundle" && -f "$build_plan" && ! -L "$build_plan" && -n "$build_dir" &&
            "$build_jobs" =~ ^[0-9]{1,2}$ ]] || return 4
         build_jobs=$((10#$build_jobs))
@@ -97,6 +100,10 @@ _rf_build_set_execute() {
     [[ -z "$build_plan" ]] || _rb_path "$build_dir" || return 4
     _rb_path "$bundle" || return 4
     [[ "$bundle" != / && "$bundle" != */ ]] || return 4
+    package="$bundle/packaged"
+    if [[ -z "$packaging_recipe" && ( -e "$package" || -L "$package" ) ]]; then
+        _rf_log 'A retained packaging selection requires --packaging-recipe on retry'; return 2
+    fi
     for value in "$metadata" "$state" "$integrity" "$dispatch_state"; do
         [[ -n "$value" ]] || continue
         _rb_path "$value" || return 4
@@ -105,7 +112,7 @@ _rf_build_set_execute() {
             _rb_log 'Finalizer outputs inside a build directory must stay in its bundle namespace'; return 4
         fi
         case "$value" in
-            "$bundle"|"$bundle/"|"$bundle/release"|"$bundle/release/"*|"$bundle/inputs"|"$bundle/inputs/"*)
+            "$bundle"|"$bundle/"|"$bundle/release"|"$bundle/release/"*|"$bundle/inputs"|"$bundle/inputs/"*|"$package"|"$package/"*)
                 _rb_log 'Finalizer output/state must stay outside immutable release and input directories'; return 4 ;;
         esac
     done
@@ -125,6 +132,13 @@ _rf_build_set_execute() {
     }
     trap _rf_build_plan_cancel HUP INT TERM
     printf 'null\n' > "$work/build-result.json" || return 1
+    printf 'null\n' > "$work/packaging-preview.json" || return 1
+    printf 'null\n' > "$work/packaging-result.json" || return 1
+    if [[ -n "$packaging_recipe" ]]; then
+        # shellcheck source=src/release_packaging_pipeline.sh
+        source "$_RELEASE_FINALIZE_ENTRY_DIR/release_packaging_pipeline.sh" || return 3
+        _rf_packaging_preview "$packaging_recipe" "$work" || return $?
+    fi
     if [[ -n "$build_plan" ]]; then
         # Validate policy syntax above before any expensive builds. The engine
         # still authenticates keys and checks live release policy afterward.
@@ -175,6 +189,9 @@ _rf_build_set_execute() {
         canonical=$(_rb_plan "$plan") || return $?
     fi
     printf '%s\n' "$canonical" > "$work/plan.json" || return 1
+    if [[ -n "$packaging_recipe" ]]; then
+        _rf_packaging_contract "$work/plan.json" "$work/packaging-preview.json" || return $?
+    fi
     local repo tag sha tool pin rc=0 result
     repo=$(jq -r .repo "$work/plan.json") || return 1
     tag=$(jq -r .tag "$work/plan.json") || return 1
@@ -188,9 +205,10 @@ _rf_build_set_execute() {
         release_bundle "${collect_args[@]}" --dry-run > "$work/collection.json" || return $?
         jq -cn --args '$ARGS.positional' -- "${forwarded[@]}" > "$work/options.json" || return 1
         jq -cn --slurpfile collection "$work/collection.json" --slurpfile options "$work/options.json" \
+            --slurpfile packaging "$work/packaging-preview.json" \
             '{kind:"dsr-release-finalization-result",status:"planned",exit_code:0,dry_run:true,
               stage:"build-set-plan",bundle:$collection[0],finalization_options:$options[0],
-              policy_verified:false}'
+              policy_verified:false} | if $packaging[0]==null then . else .+{packaging:$packaging[0]} end'
         return $?
     fi
     release_bundle "${collect_args[@]}" > "$work/collection.json" || rc=$?
@@ -212,18 +230,46 @@ _rf_build_set_execute() {
         "$work/collection.json" >/dev/null || return 7
     pin=$(jq -r .manifest_sha256 "$work/collection.json") || return 1
     [[ "$(_slsa_sha256 "$bundle/release/build-manifest.json")" == "$pin" ]] || return 7
+    selected_manifest="$bundle/release/build-manifest.json"
+    selected_artifacts="$bundle/release/artifacts"
+    selected_pin="$pin"
+    if [[ -n "$packaging_recipe" ]]; then
+        bash "$_RELEASE_FINALIZE_ENTRY_DIR/release_packaging.sh" --recipe "$work/packaging-recipe.json" \
+            --manifest "$selected_manifest" --manifest-sha256 "$pin" --artifacts-dir "$selected_artifacts" \
+            --output-dir "$package" --repo "$repo" --tag "$tag" --sha "$sha" > "$work/packaging-result.json" &
+        build_worker=$!
+        wait "$build_worker" || rc=$?
+        build_worker=0
+        if ((rc != 0)); then
+            jq -es --argjson rc "$rc" 'length==1 and (.[0]|.kind=="dsr-release-packaging" and
+                .status=="error" and .publishable==false and .exit_code==$rc)' \
+                "$work/packaging-result.json" >/dev/null || return 7
+            jq -cn --argjson rc "$rc" --slurpfile bundle "$work/collection.json" \
+                --slurpfile packaging "$work/packaging-result.json" \
+                '{kind:"dsr-release-finalization-result",status:"error",exit_code:$rc,dry_run:false,
+                  stage:"packaging",bundle:$bundle[0],packaging:$packaging[0]}'
+            return "$rc"
+        fi
+        _rf_packaging_handoff "$package" "$pin" "$work/plan.json" "$work" || return $?
+        selected_manifest="$package/release/build-manifest.json"
+        selected_artifacts="$package/release/artifacts"
+        selected_pin=$(jq -r .manifest_sha256 "$work/packaging-result.json") || return 1
+    fi
     # All previous signing, source, draft-creation, upload, promotion and outbox
     # gates run in the shared engine, including explicit provenance admission.
     # Never infer --promote or signing.
-    release_finalize "$bundle/release/artifacts" --repo "$repo" --tag "$tag" --sha "$sha" \
-        --upload-payloads --build-manifest "$bundle/release/build-manifest.json" \
+    release_finalize "$selected_artifacts" --repo "$repo" --tag "$tag" --sha "$sha" \
+        --upload-payloads --build-manifest "$selected_manifest" \
         "${forwarded[@]}" > "$work/finalization.json" || rc=$?
     jq -es --argjson rc "$rc" 'length==1 and (.[0]|.kind=="dsr-release-finalization-result" and
         .exit_code==$rc and (if $rc==0 then (.status=="ready" or .status=="published" or .status=="complete") else true end))' \
         "$work/finalization.json" >/dev/null || return 7
     [[ "$(_slsa_sha256 "$bundle/release/build-manifest.json")" == "$pin" ]] || return 7
+    [[ "$(_slsa_sha256 "$selected_manifest")" == "$selected_pin" ]] || return 7
     result=$(jq -c --slurpfile bundle "$work/collection.json" --slurpfile builds "$work/build-result.json" \
-        '.+{bundle:$bundle[0]} | if $builds[0]==null then . else .+{builds:$builds[0]} end' "$work/finalization.json") || return 1
+        --slurpfile packaging "$work/packaging-result.json" \
+        '.+{bundle:$bundle[0]} | (if $builds[0]==null then . else .+{builds:$builds[0]} end) |
+         if $packaging[0]==null then . else .+{packaging:$packaging[0]} end' "$work/finalization.json") || return 1
     printf '%s\n' "$result"
     return "$rc"
 }
@@ -274,6 +320,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             printf '\n%s\n' 'Build set: --build-set PLAN.json --bundle-dir DIR [existing finalizer policy options]' \
                 'Collect the complete pinned target matrix before any release API call; retry resumes verified imports.' \
                 'Identity, manifest and --upload-payloads come from the plan. Signing and --promote remain explicit.'
+            printf '%s\n' 'Add --packaging-recipe RECIPE.json to package a build set before signing and finalization.'
             printf '\n%s\n' 'Build plan: --build-plan PLAN.json --build-dir DIR [--build-jobs N] [finalizer policy options]' \
                 'Execute native/xwin jobs, retain completed checkpoints, assemble every target, then finalize.' ;;
         --build-set|--build-plan) _rf_build_set_result "$@"; exit $? ;;
