@@ -1,6 +1,6 @@
-# Package a build set before finalization
+# Build, package and finalize a release
 
-The build-set finalizer can turn a verified multi-target producer bundle into
+The build-set and build-plan finalizer can turn a verified producer bundle into
 installer-ready archives and aliases before applying its existing publication
 policy. Supply the same recipe accepted by [release packaging](RELEASE_PACKAGING.md):
 
@@ -19,15 +19,49 @@ release a draft: packaging never implies `--promote`, signing, or downstream
 delivery. Existing prepared-signature, provenance and promotion rules still
 apply. The ordinary artifact-directory finalizer is unchanged.
 
+## Execute a build plan and package its outputs
+
+The same option works with the existing native, Windows ARM64 and import jobs:
+
+```bash
+bash src/release_finalize.sh \
+  --build-plan /srv/release-plan.json --build-dir /srv/release-run \
+  --build-jobs 2 --packaging-recipe /srv/packaging.json \
+  --require-signatures --public-key /srv/keys/release.pub \
+  --secret-key /srv/keys/release.key \
+  --require-provenance --provenance-builder https://example.org/builders/dsr
+```
+
+The recipe is normalized and frozen into the invocation's private workspace
+before any compiler starts. Its target matrix and declared producer asset
+requirements must match the build plan. Windows ARM64 jobs additionally expose
+their exact binary selection: a recipe missing a selected companion is rejected
+even without a global `required_assets` list. These failures occur before build
+state, compiler/toolchain access or release API calls. Live packaging still
+verifies the actual completed producer inventory and every payload hash.
+
+The existing build coordinator controls concurrency, timeouts and native resume.
+An unsuccessful job yields `stage: "build"` with the coordinator's receipt;
+successful independent jobs retain their verified checkpoints. Packaging starts
+only after the complete matrix has been admitted and collected. Retrying the
+same plan reuses completed jobs and retries incomplete jobs under the existing
+resume policy. A packaging or publication failure does not discard compilation.
+
+In build-plan mode, `BUNDLE` below means `BUILD_DIR/bundle`. Final results retain
+`builds`, `bundle` and `packaging` as separate stages. Even a packaging-stage
+error retains the successful build and collection receipts. Interrupting the
+combined invocation cancels its owned build or packaging process; it does not
+claim to cancel remote work after a network partition.
+
 ## Two contracts, one publication input
 
-The build set's optional `required_assets` describes the **producer** namespace,
+The plan's optional `required_assets` describes the **producer** namespace,
 including raw companion executables. The packaging recipe describes the final
 namespace: renamed binaries, independent archives, and byte-identical aliases.
 Do not replace the producer requirements with archive names the compiler does
 not emit. The finalizer checks the recipe's target matrix and, when declared,
 its input names, target assignments and raw/archive compatibility before
-collection. The packager independently requires every actual producer asset
+collection or compilation. The packager independently requires every producer asset
 and admits its bytes using the shared successful-release profile.
 
 `--dry-run` describes both contracts in one result and creates no persistent
@@ -78,6 +112,13 @@ aliases or manifests block publication without replacing their bytes. The
 existing finalization state additionally pins the selected signing/provenance
 policy and supports its existing acknowledgement-recovery behavior.
 
+Before packaging has begun, a failed build retains its build-plan identity but
+does not persist the packaging recipe. A new invocation may select a new recipe
+at that point, subject to the same preflight. This does not change compiler
+inputs. Once packaging starts, its persistent identity prevents changing that
+selection. Editing the external recipe during an active invocation cannot
+change its already-frozen selection; keep or restore that recipe for retries.
+
 These remain trusted local build-host operations, not a sandbox or a distributed
 transaction. Read [finalization](RELEASE_FINALIZATION.md) and
 [provenance](PROVENANCE.md) for the remote publication and authentication limits.
@@ -87,3 +128,9 @@ collector, manifest and finalizer integration checks. Signing, SBOM scanning and
 GitHub transport use the provenance suite's explicit file-backed fixtures. The
 tests do not claim live GitHub publication, native Minisign, or Rust/Windows
 compiler acceptance.
+
+Run `bash scripts/tests/test_release_packaging_build_plan.sh` for the actual
+coordinator's import/recovery path and native command dispatch, recipe freezing,
+pre-compilation contract checks and interruption. Native compilation is an
+explicit command-boundary fixture; the coordinator, collector, archive helpers,
+manifest admission and finalizer remain the real implementations.

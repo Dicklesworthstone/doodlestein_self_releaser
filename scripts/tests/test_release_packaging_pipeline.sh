@@ -47,6 +47,7 @@ print(json.dumps({str(p.relative_to(root)): [p.stat().st_ino, hashlib.sha256(p.r
 PY
 }
 
+[[ "${DSR_PACKAGING_FIXTURES_ONLY:-false}" != true ]] || return 0
 package_case preview
 run_code 'build-set preview describes input and final asset contracts' 0 package_flow --dry-run
 assert 'preview does not package, sign, or authenticate remote data' test ! -s "$CASE/calls"

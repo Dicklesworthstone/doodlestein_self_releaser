@@ -53,7 +53,6 @@ _rf_build_set_execute() {
     done
     [[ "$dry" =~ ^(true|false)$ ]] || return 4
     if [[ -n "$build_plan" ]]; then
-        [[ -z "$packaging_recipe" ]] || { _rf_log 'Packaging currently requires --build-set'; return 4; }
         [[ -z "$plan$bundle" && -f "$build_plan" && ! -L "$build_plan" && -n "$build_dir" &&
            "$build_jobs" =~ ^[0-9]{1,2}$ ]] || return 4
         build_jobs=$((10#$build_jobs))
@@ -148,11 +147,16 @@ _rf_build_set_execute() {
             .exit_code==0 and .dry_run==true and .publishable==false)
             then .[0].plan else error("invalid build plan preview") end' \
             "$work/build-preview.json" > "$work/execution-plan.json" || return 7
+        if [[ -n "$packaging_recipe" ]]; then
+            _rf_packaging_contract "$work/execution-plan.json" "$work/packaging-preview.json" || return $?
+        fi
         if [[ "$dry" == true ]]; then
             jq -cn --args '$ARGS.positional' -- "${forwarded[@]}" > "$work/options.json" || return 1
             jq -cn --slurpfile builds "$work/build-preview.json" --slurpfile options "$work/options.json" \
+                --slurpfile packaging "$work/packaging-preview.json" \
                 '{kind:"dsr-release-finalization-result",status:"planned",exit_code:0,dry_run:true,
-                  stage:"build-plan",builds:$builds[0],finalization_options:$options[0],policy_verified:false}'
+                  stage:"build-plan",builds:$builds[0],finalization_options:$options[0],policy_verified:false} |
+                 if $packaging[0]==null then . else .+{packaging:$packaging[0]} end'
             return $?
         fi
         local build_rc=0 build_set_pin
@@ -245,9 +249,10 @@ _rf_build_set_execute() {
                 .status=="error" and .publishable==false and .exit_code==$rc)' \
                 "$work/packaging-result.json" >/dev/null || return 7
             jq -cn --argjson rc "$rc" --slurpfile bundle "$work/collection.json" \
-                --slurpfile packaging "$work/packaging-result.json" \
+                --slurpfile packaging "$work/packaging-result.json" --slurpfile builds "$work/build-result.json" \
                 '{kind:"dsr-release-finalization-result",status:"error",exit_code:$rc,dry_run:false,
-                  stage:"packaging",bundle:$bundle[0],packaging:$packaging[0]}'
+                  stage:"packaging",bundle:$bundle[0],packaging:$packaging[0]} |
+                 if $builds[0]==null then . else .+{builds:$builds[0]} end'
             return "$rc"
         fi
         _rf_packaging_handoff "$package" "$pin" "$work/plan.json" "$work" || return $?
@@ -320,7 +325,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             printf '\n%s\n' 'Build set: --build-set PLAN.json --bundle-dir DIR [existing finalizer policy options]' \
                 'Collect the complete pinned target matrix before any release API call; retry resumes verified imports.' \
                 'Identity, manifest and --upload-payloads come from the plan. Signing and --promote remain explicit.'
-            printf '%s\n' 'Add --packaging-recipe RECIPE.json to package a build set before signing and finalization.'
+            printf '%s\n' 'Add --packaging-recipe RECIPE.json to either mode to package before signing and finalization.'
             printf '\n%s\n' 'Build plan: --build-plan PLAN.json --build-dir DIR [--build-jobs N] [finalizer policy options]' \
                 'Execute native/xwin jobs, retain completed checkpoints, assemble every target, then finalize.' ;;
         --build-set|--build-plan) _rf_build_set_result "$@"; exit $? ;;

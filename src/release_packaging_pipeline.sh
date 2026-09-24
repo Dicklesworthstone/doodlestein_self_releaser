@@ -32,7 +32,16 @@ _rf_packaging_contract() {
                     any($p.required_assets[]; .name==$n and (.archive_format|raw)))
                 else any($p.required_assets[]; .name==$a.source and
                     ((.archive_format|raw)==($a.archive_format|raw))) end)
-         else true end)' >/dev/null || {
+         else true end) and
+        # Xwin advertises its exact binary inventory even without an optional
+        # global asset contract. Do not start a compiler for an impossible
+        # recipe that drops a selected companion or asks for another binary.
+        all($p.builds[] | select(.driver?=="xwin"); . as $job |
+            [($job.binaries // [$job.binary])[] |
+                {name:($job.asset_name // (. + "-aarch64-pc-windows-msvc.exe")),target:"windows/arm64"}] as $expected |
+            ([$r.inputs[]|select(.target=="windows/arm64")]|sort_by(.name))==($expected|sort_by(.name)) and
+            all($r.recipe.artifacts[]|select(.target=="windows/arm64");
+                has("members") or (.archive_format|raw)))' >/dev/null || {
         _rf_log 'Packaging recipe differs from the producer target/asset contract'; return 4;
     }
 }
