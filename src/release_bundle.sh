@@ -26,21 +26,29 @@ _rb_plan() {
         def path: text and startswith("/") and (contains("\\")|not);
         def target: type=="string" and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
         def targets: type=="array" and length>0 and all(.[];target) and (unique|length)==length;
+        def assets: type=="array" and length>0 and length<=256 and all(.[];
+            type=="object" and keys==["archive_format","name","target"] and
+            (.name|name and length<=128) and (.target|target) and
+            (.archive_format|.=="tar.gz" or .=="tar.xz" or .=="zip" or .=="binary" or .=="none")) and
+            (map(.name|ascii_downcase)|unique|length)==length;
         if length==1 then .[0] else error("expected one build-set plan") end |
         if type=="object" and
-            keys==["builds","repo","required_targets","schema_version","source_sha","tag","tool"] and
+            (del(.required_assets)|keys)==["builds","repo","required_targets","schema_version","source_sha","tag","tool"] and
             .schema_version==1 and (.tool|name) and
             (.repo|text and test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$") and (contains("..")|not)) and
             (.tag|text and test("^v[0-9]+\\.[0-9]+\\.[0-9]+([+-][A-Za-z0-9.+-]+)?$")) and
             (.source_sha|type=="string" and test("^[0-9a-f]{40}$") and .!=("0"*40)) and
             (.required_targets|targets) and
+            (if has("required_assets") then (.required_assets|assets) and
+                ([.required_assets[].target]|unique|sort)==(.required_targets|sort) else true end) and
             (.builds|type=="array" and length>0 and length<=100 and all(.[];
                 type=="object" and keys==["artifacts_dir","id","manifest","manifest_sha256","targets"] and
                 (.id|name) and (.manifest|path) and (.artifacts_dir|path) and
                 (.manifest_sha256|hash) and (.targets|targets))) and
             ((.builds|map(.id)|unique|length)==(.builds|length)) and
             (([.builds[].targets[]]|sort)==(.required_targets|sort))
-        then .required_targets|=sort | .builds|= (map(.targets|=sort)|sort_by(.id))
+        then .required_targets|=sort | .builds|= (map(.targets|=sort)|sort_by(.id)) |
+            if has("required_assets") then .required_assets|=sort_by(.name) else . end
         else error("invalid or incomplete build-set plan") end
     ' "$1" || return 4
 }
@@ -92,10 +100,14 @@ _rb_shard_manifest() {
         (if has("publishable") then .publishable==true else true end) and
         ([.artifacts[].target]|unique|sort)==$input.targets and
         (if has("requested_targets") then (.requested_targets|sort)==$input.targets else true end) and
+        (if $p|has("required_assets") then
+            (.artifacts|map({name,target,archive_format})|sort_by(.name))==
+            ([$p.required_assets[]|select(.target as $t|$input.targets|index($t)!=null)]|sort_by(.name))
+         else true end) and
         all(.artifacts[];
             (if has("build_purpose") then .build_purpose=="release" else true end) and
             (if has("publishable") then .publishable==true else true end))
-    ' "$manifest" >/dev/null || { _rb_log 'Shard source, purpose, or targets differ from the build set'; return 7; }
+    ' "$manifest" >/dev/null || { _rb_log 'Shard source, purpose, targets, or required assets differ from the build set'; return 7; }
 }
 
 _rb_verify_shard() {
@@ -161,7 +173,8 @@ _rb_aggregate_manifest() {
              {id:$e.value.id,targets:$e.value.targets,manifest_sha256:$e.value.manifest_sha256,
               run_id:$builds[$e.key].run_id}],
          bundle_evidence:{kind:"manifest-bound-build-set",repo:$p.repo,plan_sha256:$s.plan_sha256,
-             authenticated:false,repository_binding:"operator-selected"}}
+             authenticated:false,repository_binding:"operator-selected"}} |
+        if $p|has("required_assets") then .required_assets=$p.required_assets else . end
         end' "$work/manifests.jsonl" > "$work/build-manifest.json" || return 7
 }
 

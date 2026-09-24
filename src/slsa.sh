@@ -369,6 +369,15 @@ _slsa_manifest_statement() {
            (.requested_targets | type != "array" or length == 0 or
                (all(.[]; target) | not) or (sort != $targets))
         then error("release does not cover its exact requested target matrix") else . end |
+        .artifacts as $artifacts |
+        if has("required_assets") and
+           (.required_assets | type != "array" or length == 0 or length > 256 or
+               (all(.[]; type == "object" and keys == ["archive_format","name","target"] and
+                   (.name | name and length <= 128) and (.target | target) and
+                   (.archive_format | . == "tar.gz" or . == "tar.xz" or . == "zip" or . == "binary" or . == "none")) | not) or
+               ((map(.name | ascii_downcase) | unique | length) != length) or
+               ((sort_by(.name)) != ($artifacts | map({name,target,archive_format}) | sort_by(.name))))
+        then error("release does not cover its exact required asset contract") else . end |
         if (.summary | type != "object" or (.total | count | not) or (.success | count | not) or
             .failed != 0 or .total != .success or .total != ($targets | length)) or
            ((.artifacts | map(.name) | unique | length) != (.artifacts | length)) or
