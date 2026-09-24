@@ -136,7 +136,9 @@ An incomplete invocation returns exit 1 and lists failed jobs; their specific
 exit codes remain in `state.json`. The same command retries failed/interrupted
 jobs in fresh attempt directories and independently revalidates completed jobs.
 Native jobs can opt into exact-run resume as described below. Without that
-option, failed native and xwin jobs restart in fresh state/output directories.
+option, failed native and xwin compilations restart in fresh state/output
+directories. A selected candidate from a successful compiler is instead
+recovered as described below, regardless of native target-resume policy.
 
 ### Resume partial native jobs
 
@@ -198,6 +200,42 @@ selection, target retention, signal cancellation, interrupted import recovery,
 state/configuration drift and failure-boundary tests. Native compilation/SSH
 is an explicit command-boundary fixture; the
 coordinator and full bundle/SLSA modules run unchanged apart from this feature.
+
+### Recover completed native and Windows ARM64 compilation
+
+Post-compilation import recovery also applies to `xwin` jobs and native jobs
+without `resume: true`. A zero compiler exit and valid completion envelope can
+select a manifest before copying all its payloads succeeds. Once that
+`candidate` exists, a retry preserves its exact hash and original attempt;
+it does not start a second compiler or select newer output to replace it.
+
+Re-run the same build-plan or combined finalization command. Recovery checks
+the original plan-bound `inputs.json`, reconstructs the exact command from the
+selected job, validates its completion envelope, and rehashes the selected
+manifest. Native jobs recheck their frozen configuration. Windows ARM64 jobs
+recheck the frozen toolchain and sibling-plan files and the complete selected
+binary inventory, including companions. The full collector still enforces
+source, release purpose, target coverage and every payload's size and hash.
+
+Missing or changed payloads keep the job incomplete. Restore or transfer the
+originally selected bytes, then retry; there is no repair, repinning or automatic
+recompilation fallback. Modified commands, input selectors, manifests, completion
+envelopes or pinned configuration block recovery. Independent jobs can still
+finish. Recovery logs and selections live in separate `admission-recovery-*`
+directories under the original attempt, without overwriting its compiler logs.
+
+After selection, the original external configuration/toolchain locations need
+not remain online: their retained copies are used. Compiler output must remain
+available until import finishes; afterward the verified `completed/` checkpoint
+is authoritative. This is recovery of a coordinator-acknowledged success, not
+permission to adopt output from a compiler whose exit was never observed. A
+nonzero driver exit still requires a fresh attempt even when stdout claims
+success. Ordinary `import` jobs continue to use their independently selected
+manifest pins and existing retry behavior; they never run a compiler.
+
+Run `bash scripts/tests/test_release_builds_recovery.sh`. The coordinator,
+collector, hashes and filesystem operations are real; native and Windows ARM64
+compiler commands are explicit fixtures, not live toolchain acceptance.
 
 Successful checkpoints no longer depend on original compiler-output paths.
 Losing the acknowledgement after atomic checkpoint import is reconciled using

@@ -285,6 +285,23 @@ def native_command(job, session, resume_id=None):
         command.append("--resume=" + resume_id)
     return command
 
+def xwin_command(job, attempt):
+    command = ["bash", str(module.parent / "scripts/xwin-build.sh"), "--manifest", str(attempt / "toolchain.json"),
+               "--project", job["project"], "--run-dir", str(attempt / "run"),
+               "--release-repo", plan["repo"], "--release-tag", plan["tag"], "--source-sha", plan["source_sha"],
+               "--tool", plan["tool"], "--timeout", str(job["timeout"])]
+    for binary in job["binaries"] if "binaries" in job else [job["binary"]]:
+        command += ["--bin", binary]
+    for key, option in (("package", "--package"), ("asset_name", "--asset-name"),
+                        ("cargo_cache", "--cargo-cache"), ("cache_dir", "--cache-dir")):
+        if key in job:
+            command += [option, job[key]]
+    if job["offline"]:
+        command.append("--offline")
+    if "siblings" in job:
+        command += ["--sibling-crates", str(attempt / "siblings.json")]
+    return command
+
 def native_config(job, session):
     cfg = plain(session / "config", "dir")
     for filename, pin in job["config_files"].items():
@@ -400,21 +417,9 @@ def start_job(job):
             artifacts = session / "output"
         else:
             copy_pin(Path(job["toolchain_manifest"]), attempt / "toolchain.json", job["toolchain_sha256"])
-            command = ["bash", str(module.parent / "scripts/xwin-build.sh"), "--manifest", str(attempt / "toolchain.json"),
-                       "--project", job["project"], "--run-dir", str(attempt / "run"),
-                       "--release-repo", plan["repo"], "--release-tag", plan["tag"], "--source-sha", plan["source_sha"],
-                       "--tool", plan["tool"], "--timeout", str(job["timeout"])]
-            for binary in job["binaries"] if "binaries" in job else [job["binary"]]:
-                command += ["--bin", binary]
-            for key, option in (("package", "--package"), ("asset_name", "--asset-name"),
-                                ("cargo_cache", "--cargo-cache"), ("cache_dir", "--cache-dir")):
-                if key in job:
-                    command += [option, job[key]]
-            if job["offline"]:
-                command.append("--offline")
             if "siblings" in job:
                 copy_pin(Path(job["siblings"]["path"]), attempt / "siblings.json", job["siblings"]["sha256"])
-                command += ["--sibling-crates", str(attempt / "siblings.json")]
+            command = xwin_command(job, attempt)
             manifest, artifacts = attempt / "run/release/build-manifest.json", attempt / "run/artifacts"
         plain(Path(command[1]), "file")
         write(attempt / "command.json", command)
@@ -489,6 +494,52 @@ def recover_native_import(job, record):
     write(recovery / "selection.json", candidate)
     accept(job, attempt, candidate, recovery)
     print("[release-builds] Recovered completed native import: " + job["id"], file=sys.stderr)
+
+def recover_compiled_import(job, record):
+    # Selection happened only after a zero driver exit and completion admission.
+    # Import failure is not compilation failure: never discard that selection
+    # or run another compiler merely because the original payload is missing.
+    if job["driver"] == "dsr" and job.get("resume", False):
+        recover_native_import(job, record)
+        return
+    previous = record["attempts"][-1]
+    attempt = plain(root / "attempts" / job["id"] / ("%06d" % previous["number"]), "dir")
+    candidate = record["candidate"]
+    require(isinstance(candidate, dict) and sha(candidate.get("manifest_sha256")), "invalid candidate pin", 2)
+    if job["driver"] == "dsr":
+        artifacts = attempt / "output"
+        manifest = artifacts / (plan["tool"] + "-" + plan["tag"] + "-manifest.json")
+        command = native_command(job, attempt)
+    else:
+        artifacts = attempt / "run/artifacts"
+        manifest = attempt / "run/release/build-manifest.json"
+        command = xwin_command(job, attempt)
+    require(candidate == selected(job, manifest, artifacts, candidate["manifest_sha256"]),
+            "candidate paths or target identity changed", 2)
+    require(load(attempt / "inputs.json") == {"plan_sha256": plan_hash, "job": job} and
+            load(attempt / "command.json") == command, "completed compiler invocation changed")
+    require(digest(manifest) == candidate["manifest_sha256"], "selected compiler manifest changed")
+    response = load(attempt / "stdout.json")
+    require(isinstance(response, dict) and type(response.get("exit_code")) is int and response["exit_code"] == 0,
+            "completed compiler envelope changed")
+    if job["driver"] == "dsr":
+        native_config(job, attempt)
+        require(response.get("command") == "build" and response.get("status") == "success" and
+                isinstance(response.get("details"), dict) and response["details"].get("manifest") == str(manifest),
+                "completed native envelope changed")
+    else:
+        require(response.get("kind") == "dsr-xwin-build" and response.get("status") == "verified" and
+                response.get("release_manifest") == {"path": str(manifest), "sha256": candidate["manifest_sha256"]},
+                "completed xwin envelope changed")
+        require(digest(attempt / "toolchain.json") == job["toolchain_sha256"], "toolchain plan changed")
+        if "siblings" in job:
+            require(digest(attempt / "siblings.json") == job["siblings"]["sha256"], "sibling plan changed")
+    recovery = Path(tempfile.mkdtemp(prefix="admission-recovery-", dir=attempt))
+    write(recovery / "selection.json", candidate)
+    # Reuse the full collector, including exact xwin binary-set admission. A
+    # successful receipt alone cannot import damaged or incomplete payloads.
+    accept(job, attempt, candidate, recovery)
+    print("[release-builds] Recovered completed compiler import: " + job["id"], file=sys.stderr)
 
 def finish_job(item):
     proc, job, attempt, manifest, artifacts = item
@@ -628,11 +679,11 @@ try:
             record["attempts"][-1].update(status="completed", exit_code=0)
         else:
             require(record["complete"] is None, "completed build disappeared")
-            if record["candidate"] is not None and job["driver"] == "dsr" and job.get("resume", False):
+            if record["candidate"] is not None and job["driver"] in ("dsr", "xwin"):
                 try:
-                    require(record["attempts"], "native candidate has no attempt", 2)
-                    recover_native_import(job, record)
-                except (Failure, OSError, ValueError) as exc:
+                    require(record["attempts"], "compiler candidate has no attempt", 2)
+                    recover_compiled_import(job, record)
+                except (Failure, OSError, ValueError, TypeError, KeyError) as exc:
                     if record["attempts"]:
                         record["attempts"][-1].update(status="failed", exit_code=getattr(exc, "code", 7))
                     save_state()
