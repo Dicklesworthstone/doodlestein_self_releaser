@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Public entry point for finalization, build-set ingestion and build execution.
-# The existing engine is retained byte-for-byte in release_finalize_core.sh.
+# All release policy gates share the engine in release_finalize_core.sh.
 _RELEASE_FINALIZE_ENTRY_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/release_finalize_core.sh
 source "$_RELEASE_FINALIZE_ENTRY_DIR/release_finalize_core.sh" || { return 3 2>/dev/null || exit 3; }
@@ -11,6 +11,7 @@ _rf_build_set_execute() {
     set -uo pipefail
     local plan='' bundle='' dry="${DRY_RUN:-false}" option value work canonical
     local require_signatures=false prepared=false create=false promote=false dispatch=''
+    local require_provenance=false provenance_builder=''
     local public='' secret='' integrity='' notes='' title='' prerelease=false retry_creation=false
     local dispatch_run='' dispatch_state='' retry_delivery=false format=spdx metadata='' state=''
     local build_plan='' build_dir='' build_jobs=1 build_worker=0 cleanup
@@ -22,7 +23,7 @@ _rf_build_set_execute() {
         [[ -n "$option" && -z "${seen[$option]:-}" ]] || return 4
         seen[$option]=1
         case "$option" in
-            --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir)
+            --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--provenance-builder)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 value=$2
                 case "$option" in
@@ -30,15 +31,17 @@ _rf_build_set_execute() {
                     --build-plan) build_plan=$value ;; --build-dir) build_dir=$value ;; --build-jobs) build_jobs=$value ;;
                     --format) format=$value ;; --output-dir) metadata=$value ;; --state-dir) state=$value ;;
                     --public-key) public=$value ;; --secret-key) secret=$value ;; --integrity-dir) integrity=$value ;;
+                    --provenance-builder) provenance_builder=$value ;;
                     --release-name) title=$value ;; --release-notes-file) notes=$value ;;
                     --dispatch-repos) dispatch=$value ;; --dispatch-run-id) dispatch_run=$value ;; --dispatch-state-dir) dispatch_state=$value ;;
                 esac
                 case "$option" in --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs) ;; *) forwarded+=("$option" "$value") ;; esac
                 shift 2 ;;
             --dry-run) dry=true; shift ;;
-            --require-signatures|--prepared-signatures|--create-draft|--promote|--prerelease|--retry-creation|--retry-uncertain)
+            --require-signatures|--prepared-signatures|--create-draft|--promote|--prerelease|--retry-creation|--retry-uncertain|--require-provenance)
                 case "$option" in
                     --require-signatures) require_signatures=true ;; --prepared-signatures) prepared=true ;;
+                    --require-provenance) require_provenance=true ;;
                     --create-draft) create=true ;; --promote) promote=true ;; --prerelease) prerelease=true ;;
                     --retry-creation) retry_creation=true ;; --retry-uncertain) retry_delivery=true ;;
                 esac
@@ -63,6 +66,18 @@ _rf_build_set_execute() {
         [[ -n "$public" ]] || return 4
     else
         [[ -z "$public$secret$integrity" ]] || return 4
+    fi
+    # Validate before starting builders. The complete manifest is selected by
+    # collection; the core later binds its exact digest, targets and invocation.
+    if [[ "$require_provenance" == true ]]; then
+        [[ ( "$require_signatures" == true || "$prepared" == true ) &&
+           -n "$provenance_builder" && "$provenance_builder" != *[[:cntrl:]]* ]] || {
+            printf '%s\n' '[release-finalize] Provenance requires a signature policy and --provenance-builder' >&2
+            return 4
+        }
+    elif [[ -n "$provenance_builder" ]]; then
+        printf '%s\n' '[release-finalize] --provenance-builder requires --require-provenance' >&2
+        return 4
     fi
     if [[ "$create" == false ]]; then
         [[ -z "$title$notes" && "$prerelease" == false && "$retry_creation" == false ]] || return 4
@@ -196,7 +211,8 @@ _rf_build_set_execute() {
     pin=$(jq -r .manifest_sha256 "$work/collection.json") || return 1
     [[ "$(_slsa_sha256 "$bundle/release/build-manifest.json")" == "$pin" ]] || return 7
     # All previous signing, source, draft-creation, upload, promotion and outbox
-    # gates still run in the unchanged engine. Never infer --promote or signing.
+    # gates run in the shared engine, including explicit provenance admission.
+    # Never infer --promote or signing.
     release_finalize "$bundle/release/artifacts" --repo "$repo" --tag "$tag" --sha "$sha" \
         --upload-payloads --build-manifest "$bundle/release/build-manifest.json" \
         "${forwarded[@]}" > "$work/finalization.json" || rc=$?

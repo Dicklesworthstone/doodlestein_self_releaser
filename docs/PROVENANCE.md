@@ -205,8 +205,8 @@ complete set; publication performs payload verification both before and after
 its uploads. These are admission limits and timeouts, not a streaming disk quota
 against an HTTP server lying about its response size.
 
-These commands are explicit operations and do not change the finalizer's default
-policy or automatically gate promotion. Remote observations are not an atomic
+These standalone commands do not change the finalizer's default policy. Select
+the integrated provenance policy below to gate promotion. Remote observations are not an atomic
 GitHub transaction. Signatures authenticate the producer's statement, not the
 truth of its compilation claim, every toolchain component, or a SLSA build level.
 Sourceable APIs are `slsa_publish_release` and `slsa_verify_remote`.
@@ -216,6 +216,108 @@ remote identity changes, interrupted upload recovery and read-only retry tests.
 The suite uses real statement generation, hashing and filesystem operations;
 GitHub transport helpers and Minisign are explicit fixtures, not live API or
 cryptographic acceptance tests.
+
+## Require provenance during finalization
+
+The existing finalizer can generate, sign, publish, and verify the exact
+manifest-backed statement as a required stage before publishing a draft:
+
+```bash
+bash src/release_finalize.sh /srv/dist \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_SHA" \
+  --upload-payloads --build-manifest /srv/build-manifest.json \
+  --require-signatures --public-key /srv/keys/release.pub \
+  --secret-key /srv/keys/release.key --integrity-dir /srv/integrity \
+  --require-provenance \
+  --provenance-builder https://example.org/builders/dsr-production \
+  --output-dir /srv/sbom --promote
+```
+
+Use the actual repository, reviewed source commit, successful manifest, key
+paths and expected builder identity. The tag and release must already exist
+unless the existing `--create-draft` policy is also selected. This example
+explicitly authorizes promotion; omitting `--promote` leaves the verified draft
+unpublished. Provenance never implies signing, promotion, or downstream delivery.
+
+`--require-provenance` requires `--provenance-builder`, a build manifest, and
+either `--require-signatures` or `--prepared-signatures`. It uses the same
+selected Minisign public key as the payload/checksum signature policy. Builder
+identity is literal text, not a command or an inference from the statement.
+Manifest `version` must equal the canonical selected tag, including its `v`
+prefix, to satisfy the remote provenance profile. The successful manifest's
+entire target matrix, every alias, invocation ID and SHA-256 become required
+remote verification inputs; none may be selected from a downloaded statement.
+
+Normal mode creates or reuses `release.intoto.jsonl` and its `.minisig` in the
+integrity directory, before uploading build payloads. The statement binds the
+exact private build manifest without publishing its raw environment values.
+Conflicting local files and orphan signatures are never overwritten. Once
+selected, the pair is copied into private staging for transport, and original
+bytes remain guarded throughout finalization. Only the existing payload and
+integrity publishers upload their own assets; the provenance publisher adds
+the statement pair after payload verification and before SBOM finalization.
+
+The finalizer independently re-verifies remote provenance after SBOM publication
+and before promotion, then again after any promotion and before downstream
+delivery. The statement, signature, builder, source, manifest and invocation
+identities must agree with the frozen policy, and both proof asset IDs must
+remain unchanged. The full asset inventory fingerprint must equal the SBOM
+verification's fingerprint. A boolean `authenticated: true` alone cannot pass.
+The final `provenance` receipt describes the last remote observation; downstream
+events retain the selected signer, builder, proof IDs/hashes and build identity.
+
+The policy lives in persistent finalization state from the start. A retry cannot
+add, omit or change it, select another builder or build manifest, regenerate a
+missing retained signature, or adopt new proof asset IDs. A lost upload
+acknowledgement is recovered by the existing publisher's exact-byte readback;
+the same invocation reuses the selected signed pair without signing it again.
+Keep the manifest, local proofs, key and finalization state available for retry.
+
+Prepared mode must already contain the exact manifest-backed statement and
+detached signature alongside the prepared payload/checksum proofs. It requires
+the private build manifest even when payload upload is not requested, so the
+finalizer can compare the exact statement rather than merely trusting its claim.
+It authenticates local inputs before release creation and never generates or
+signs provenance. Invalid prepared proof prevents remote effects and persistent
+state creation. Normal-mode dry-run pins the planned statement but neither signs
+nor verifies remote bytes; prepared-mode dry-run authenticates existing proofs.
+
+### Build plans and build sets
+
+The same two options are accepted by the existing combined entry points:
+
+```bash
+bash src/release_finalize.sh --build-plan /srv/release-plan.json \
+  --build-dir /srv/release-run --build-jobs 2 \
+  --require-signatures --public-key /srv/keys/release.pub \
+  --secret-key /srv/keys/release.key \
+  --require-provenance \
+  --provenance-builder https://example.org/builders/dsr-production
+```
+
+`--build-set FILE --bundle-dir DIR` accepts the same provenance options. The
+complete aggregate supplies the manifest and target matrix; do not override
+those plan-owned inputs. Invalid option combinations are rejected before
+builders or collection start. Successful builds alone do not bypass the core's
+provenance gate. Combined dry-run reports `policy_verified: false`: it validates
+the plan/option structure, not cryptographic inputs or remote policy. Default
+integrity/provenance output stays with metadata outside immutable payloads.
+
+A failure before promotion leaves the draft and completed assets available.
+Failure after a promotion has occurred blocks successful finalization and
+downstream sends, but does not delete assets or turn the release back into a
+draft. Repeating the same policy rechecks the published release. This is not a
+distributed transaction, chronological anti-replay service, or proof that a
+trusted producer's compilation claims are true. Local state and build hosts
+remain trusted, and no SLSA build-level certification is claimed.
+
+Run `bash scripts/tests/test_release_provenance_finalize.sh` and
+`bash scripts/tests/test_release_provenance_pipeline.sh`. They exercise the
+actual finalizer, entry point, complete SLSA mapper/verifier and payload-manifest
+admission functions. Signing, scanning, remote provenance/integrity transport
+and dispatch are explicit file-backed fixtures; the pipeline suite additionally
+uses deterministic producer/collector command fixtures. These are not live
+compiler, GitHub, Minisign cryptographic, or full-repository acceptance runs.
 
 ## Observation-only statements
 
@@ -229,8 +331,8 @@ code and keeps human logs off the JSON stream.
 
 ## Trust boundaries and testing
 
-These are standalone release operations; this change does not automatically
-attach provenance generation or authentication to `dsr release`. A valid
+Provenance is optional unless the explicit finalizer policy above is selected;
+it is not automatically attached to ordinary `dsr release`. A valid
 signature authenticates the selected producer's claim. It does not independently
 prove the truth of an untrusted manifest, toolchain identities, build isolation,
 or a SLSA build level. This format is signed JSON with a detached Minisign
