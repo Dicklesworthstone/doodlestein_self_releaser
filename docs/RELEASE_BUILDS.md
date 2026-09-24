@@ -252,6 +252,47 @@ no PID read from state is signaled. Owned process-group descendants are stopped
 after timeout, cancellation, or normal driver exit. The coordinator retains logs.
 This does not guarantee cancellation of a remote host after a network partition.
 
+### Bound artifact admission and collection
+
+The coordinator owns import, retained-checkpoint verification and final bundle
+collection subprocess groups as well as compiler groups. SIGTERM/SIGINT/HUP to
+the public coordinator interrupts a blocked copy or hash helper, stops its
+descendants, and returns exit `5`. Its lock stays inherited until the owned
+helpers stop. A helper that exits successfully cannot leave group descendants
+behind holding files or the lock. No process ID from saved build state is used.
+
+`--admission-timeout SECONDS` bounds each import, checkpoint verification and
+complete bundle-collection subprocess. It defaults to 900 seconds and accepts
+integers from 1 through 86400. This is separate from each compiler job's timeout:
+large artifact sets can use a larger admission budget without changing the
+frozen build plan or recompiling completed jobs. Planning reports the selected
+`admission_timeout` and does not start helpers. The combined finalizer uses the
+default admission budget; a custom budget can be selected with the standalone
+coordinator before passing its generated build set to finalization.
+
+```bash
+bash src/release_builds.sh --plan /srv/release-plan.json \
+  --output-dir /srv/release-run --jobs 2 --admission-timeout 1800
+```
+
+A per-job import deadline records exit `5` on its existing attempt and leaves
+the overall build incomplete (exit `1`), allowing independent jobs to finish.
+A deadline during retained-checkpoint verification or aggregate collection
+returns exit `5` without claiming publication readiness. Compiler candidates,
+completed checkpoints and earlier logs remain available for the same-command
+retry. The complete release is still admitted by the existing collector; time
+limits never waive payload, source, target or manifest checks.
+
+Termination includes up to five seconds for helper cleanup before killing its
+remaining process group. These are local process deadlines, not a guarantee
+against uninterruptible kernel I/O, escaped process sessions, or a remote host
+that continues after losing its connection. Run
+`bash scripts/tests/test_release_builds_admission.sh` for blocked import,
+checkpoint verification, collection, deadline, lock exclusion, retry and
+unrelated-process controls. The only substituted commands are explicit blocking
+copy/hash fixtures; the coordinator and complete collector/admission modules
+are real.
+
 The completed `build-set.json` feeds the existing finalizer without constructing
 manifest pins by hand:
 

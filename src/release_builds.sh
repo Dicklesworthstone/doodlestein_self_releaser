@@ -226,6 +226,33 @@ def kill_group(proc, sig):
     except ProcessLookupError:
         pass
 
+def run_admission(command, output, error=None):
+    # Import/verification can block on storage just as compilation can block
+    # on a host. Own the entire helper group and keep the coordinator lock in
+    # its descendants; never signal a PID restored from persistent state.
+    require(not interrupted, "build-plan execution interrupted", 5)
+    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
+                            stderr=error, start_new_session=True, pass_fds=(lockfd,))
+    deadline = time.monotonic() + args.admission_timeout
+    try:
+        while proc.poll() is None:
+            require(not interrupted, "build-plan execution interrupted during admission", 5)
+            require(time.monotonic() < deadline, "artifact admission timed out", 5)
+            time.sleep(0.05)
+        require(not interrupted, "build-plan execution interrupted during admission", 5)
+        return proc.returncode
+    finally:
+        # Even a successful helper must not leave group descendants holding
+        # output files or the lock. Give interrupted shells a cleanup window.
+        if proc.poll() is None:
+            kill_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        kill_group(proc, signal.SIGKILL)
+        proc.wait()
+
 def save_state():
     global state_hash
     identity = plain(root / "lock", "file").stat()
@@ -256,9 +283,8 @@ def helper(operation, entry, destination, directory):
     else:
         args = [str(destination), json.dumps(entry), str(root / "plan.json"), str(directory)]
     with open(directory / "admission.log", "ab") as log:
-        result = subprocess.run(["bash", "-c", command, "_", str(module), operation] + args,
-                                stdout=log, stderr=log, pass_fds=(lockfd,))
-    require(result.returncode == 0, "manifest/payload admission failed; see " + str(directory / "admission.log"), 7)
+        code = run_admission(["bash", "-c", command, "_", str(module), operation] + args, log, log)
+    require(code == 0, "manifest/payload admission failed; see " + str(directory / "admission.log"), 7)
 
 def selected(job, manifest, artifacts, pin=None):
     return {"id": job["id"], "targets": job["targets"], "manifest": str(manifest),
@@ -593,12 +619,14 @@ try:
     parser.add_argument("--plan", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--admission-timeout", type=int, default=900)
     parser.add_argument("--dry-run", action="store_true")
     # argparse otherwise accepts repeated flags and silently keeps the last one.
     flags = [a.split("=", 1)[0] for a in sys.argv[2:] if a.startswith("--")]
     require(len(flags) == len(set(flags)), "repeated build-plan option", 4)
     args = parser.parse_args(sys.argv[2:])
     require(integer(args.jobs, 1, 32), "jobs must be 1..32", 4)
+    require(integer(args.admission_timeout, 1, 86400), "admission-timeout must be 1..86400 seconds", 4)
     root = path(args.output_dir)
     plain(root)
     plan = validate(load(path(args.plan)))
@@ -606,7 +634,8 @@ try:
     require(os.environ.get("DRY_RUN", "false") in ("true", "false"), "invalid DRY_RUN", 4)
     if args.dry_run or os.environ.get("DRY_RUN") == "true":
         print(canonical({"kind": "dsr-release-builds", "status": "planned", "exit_code": 0, "dry_run": True,
-                         "publishable": False, "plan": plan, "plan_sha256": plan_hash, "jobs": args.jobs}).decode(), end="")
+                         "publishable": False, "plan": plan, "plan_sha256": plan_hash, "jobs": args.jobs,
+                         "admission_timeout": args.admission_timeout}).decode(), end="")
         sys.exit(0)
     require(sys.platform.startswith("linux"), "build-plan execution requires Linux", 3)
     for tool in ("bash", "jq", "flock", "timeout", "sha256sum"):
@@ -649,6 +678,7 @@ try:
     require({p.name for p in (root / "completed").iterdir()} <= set(state["jobs"]), "unexpected completed build")
     queued = []
     for job in plan["builds"]:
+        require(not interrupted, "build-plan execution interrupted", 5)
         record = state["jobs"][job["id"]]
         require(isinstance(record, dict) and set(record) == {"attempts", "complete", "candidate"} and
                 isinstance(record["attempts"], list), "invalid job checkpoint", 2)
@@ -716,7 +746,8 @@ try:
     failed = [j["id"] for j in plan["builds"] if state["jobs"][j["id"]]["complete"] is None]
     result = {"kind": "dsr-release-builds", "status": "incomplete" if failed else "verified", "exit_code": 1 if failed else 0,
               "dry_run": False, "publishable": not failed, "output_dir": str(root), "plan_sha256": plan_hash,
-              "failed_builds": failed, "completed_builds": len(plan["builds"]) - len(failed)}
+              "failed_builds": failed, "completed_builds": len(plan["builds"]) - len(failed),
+              "admission_timeout": args.admission_timeout}
     if not failed:
         collection = {key: plan[key] for key in ("schema_version", "repo", "tool", "tag", "source_sha", "required_targets")}
         if "required_assets" in plan:
@@ -731,8 +762,8 @@ try:
         with tempfile.TemporaryDirectory(prefix=".collect-result-", dir=root) as temporary:
             result_path = Path(temporary) / "bundle.json"
             with open(result_path, "wb") as output:
-                code = subprocess.call(["bash", str(module / "release_bundle.sh"), "--plan", str(root / "build-set.json"),
-                                        "--output-dir", str(root / "bundle")], stdout=output, pass_fds=(lockfd,))
+                code = run_admission(["bash", str(module / "release_bundle.sh"), "--plan", str(root / "build-set.json"),
+                                      "--output-dir", str(root / "bundle")], output)
             require(code == 0, "complete build-set failed bundle admission", code if 0 < code < 256 else 7)
             bundle = load(result_path)
         require(bundle.get("status") == "verified" and bundle.get("publishable") is True, "collector did not verify the build set")
