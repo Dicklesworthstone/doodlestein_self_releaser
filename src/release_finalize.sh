@@ -168,6 +168,8 @@ _rf_build_set_execute() {
         jq -en --slurpfile expected "$work/execution-plan.json" --argjson actual "$canonical" '
             $expected[0] as $p | all(["repo","tool","tag","source_sha","required_targets"][];
                 . as $key | $actual[$key]==$p[$key]) and
+            (($actual|has("required_assets"))==($p|has("required_assets"))) and
+            (if $p|has("required_assets") then $actual.required_assets==$p.required_assets else true end) and
             ($actual.builds|map({id,targets}))==($p.builds|map({id,targets}))' >/dev/null || return 7
     else
         canonical=$(_rb_plan "$plan") || return $?

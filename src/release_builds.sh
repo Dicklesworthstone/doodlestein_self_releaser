@@ -120,14 +120,32 @@ def targets(value):
             and len(set(value)) == len(value), "invalid or duplicate targets", 4)
     return sorted(value)
 
+def asset_contract(value, matrix):
+    require(isinstance(value, list) and 1 <= len(value) <= 256, "expected 1..256 required assets", 4)
+    for asset in value:
+        require(isinstance(asset, dict) and set(asset) == {"name", "target", "archive_format"} and
+                name(asset["name"]) and len(asset["name"]) <= 128 and asset["target"] in matrix and
+                asset["archive_format"] in ("tar.gz", "tar.xz", "zip", "binary", "none"), "invalid required asset", 4)
+    require(len({a["name"].casefold() for a in value}) == len(value) and
+            sorted({a["target"] for a in value}) == matrix, "required assets must uniquely cover every target", 4)
+    return sorted(value, key=lambda a: a["name"])
+
+def xwin_assets(job):
+    binaries = job["binaries"] if "binaries" in job else [job["binary"]]
+    return sorted([{"name": job.get("asset_name", binary + "-aarch64-pc-windows-msvc.exe"),
+                    "target": "windows/arm64", "archive_format": "binary"} for binary in binaries],
+                  key=lambda a: a["name"])
+
 def validate(value):
     required = {"schema_version", "repo", "tool", "tag", "source_sha", "required_targets", "builds"}
-    require(isinstance(value, dict) and set(value) == required and type(value["schema_version"]) is int and
+    require(isinstance(value, dict) and required <= set(value) <= required | {"required_assets"} and type(value["schema_version"]) is int and
             value["schema_version"] == 1, "invalid build-plan schema", 4)
     require(name(value["tool"]) and matches(value["repo"], r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and
             ".." not in value["repo"] and matches(value["tag"], r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
             matches(value["source_sha"], r"[0-9a-f]{40}") and value["source_sha"] != "0" * 40, "invalid release identity", 4)
     value["required_targets"] = targets(value["required_targets"])
+    if "required_assets" in value:
+        value["required_assets"] = asset_contract(value["required_assets"], value["required_targets"])
     require(isinstance(value["builds"], list) and 1 <= len(value["builds"]) <= 32, "expected 1..32 build jobs", 4)
     ids, matrix = [], []
     for job in value["builds"]:
@@ -146,10 +164,16 @@ def validate(value):
             require(integer(job["jobs"], 1, 32), "invalid native target concurrency", 4)
             require(type(job.get("resume", False)) is bool, "native resume must be boolean", 4)
         elif kind == "xwin":
-            require({"project", "toolchain_manifest", "toolchain_sha256", "binary"} <= set(job) and
-                    set(job) <= base | {"project", "toolchain_manifest", "toolchain_sha256", "binary", "package", "asset_name", "siblings", "cargo_cache", "cache_dir", "offline"}, "invalid xwin job", 4)
+            require({"project", "toolchain_manifest", "toolchain_sha256"} <= set(job) and
+                    set(job) <= base | {"project", "toolchain_manifest", "toolchain_sha256", "binary", "binaries", "package", "asset_name", "siblings", "cargo_cache", "cache_dir", "offline"} and
+                    ("binary" in job) != ("binaries" in job), "xwin requires exactly one of binary or binaries", 4)
             path(job["project"]); path(job["toolchain_manifest"])
-            require(sha(job["toolchain_sha256"]) and matches(job["binary"], r"[A-Za-z0-9][A-Za-z0-9_-]*"), "invalid toolchain pin or binary", 4)
+            binaries = job["binaries"] if "binaries" in job else [job["binary"]]
+            require(sha(job["toolchain_sha256"]) and isinstance(binaries, list) and 1 <= len(binaries) <= 32 and
+                    all(matches(b, r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}") for b in binaries) and
+                    len({b.casefold() for b in binaries}) == len(binaries), "invalid toolchain pin or binary set", 4)
+            if "binaries" in job:
+                job["binaries"] = sorted(binaries)
             require(job["targets"] == ["windows/arm64"], "xwin supports one Windows ARM64 target", 4)
             for key in ("cargo_cache", "cache_dir"):
                 if key in job:
@@ -157,7 +181,11 @@ def validate(value):
             if "package" in job:
                 require(matches(job["package"], r"[A-Za-z0-9][A-Za-z0-9_-]*"), "invalid package", 4)
             if "asset_name" in job:
-                require(name(job["asset_name"]) and job["asset_name"].endswith(".exe"), "invalid executable asset name", 4)
+                require(len(binaries) == 1 and name(job["asset_name"]) and job["asset_name"].endswith(".exe"),
+                        "asset_name can rename only one executable", 4)
+            if "required_assets" in value:
+                require([a for a in value["required_assets"] if a["target"] == "windows/arm64"] == xwin_assets(job),
+                        "required assets disagree with the xwin executable selection", 4)
             if "siblings" in job:
                 sibling = job["siblings"]
                 require(isinstance(sibling, dict) and set(sibling) == {"path", "sha256"} and sha(sibling["sha256"]), "invalid sibling-plan pin", 4)
@@ -211,6 +239,17 @@ def helper(operation, entry, destination, directory):
     # The source and program are fixed; untrusted JSON/paths are arguments, not
     # interpolated shell. A compact entry never contains the producer inventory.
     plain(directory, "dir")
+    job = next(j for j in plan["builds"] if j["id"] == entry["id"])
+    if job["driver"] == "xwin":
+        manifest = Path(entry["manifest"]) if operation == "_rb_import" else destination / "build-manifest.json"
+        require(digest(manifest) == entry["manifest_sha256"], "xwin manifest identity changed")
+        value = load(manifest)
+        require(isinstance(value, dict) and isinstance(value.get("artifacts"), list) and
+                all(isinstance(a, dict) and isinstance(a.get("name"), str) for a in value["artifacts"]),
+                "invalid xwin artifact inventory")
+        actual = sorted([{k: a.get(k) for k in ("name", "target", "archive_format")} for a in value["artifacts"]],
+                        key=lambda a: a["name"])
+        require(actual == xwin_assets(job), "xwin output omits or changes selected executables")
     command = 'source "$1/release_bundle.sh" || exit 3; _rb_require || exit $?; "$2" "$3" "$4" "$5" "$6"'
     if operation == "_rb_import":
         args = [json.dumps(entry), str(root / "plan.json"), str(destination), str(directory)]
@@ -362,9 +401,11 @@ def start_job(job):
         else:
             copy_pin(Path(job["toolchain_manifest"]), attempt / "toolchain.json", job["toolchain_sha256"])
             command = ["bash", str(module.parent / "scripts/xwin-build.sh"), "--manifest", str(attempt / "toolchain.json"),
-                       "--project", job["project"], "--bin", job["binary"], "--run-dir", str(attempt / "run"),
+                       "--project", job["project"], "--run-dir", str(attempt / "run"),
                        "--release-repo", plan["repo"], "--release-tag", plan["tag"], "--source-sha", plan["source_sha"],
                        "--tool", plan["tool"], "--timeout", str(job["timeout"])]
+            for binary in job["binaries"] if "binaries" in job else [job["binary"]]:
+                command += ["--bin", binary]
             for key, option in (("package", "--package"), ("asset_name", "--asset-name"),
                                 ("cargo_cache", "--cargo-cache"), ("cache_dir", "--cache-dir")):
                 if key in job:
@@ -627,6 +668,8 @@ try:
               "failed_builds": failed, "completed_builds": len(plan["builds"]) - len(failed)}
     if not failed:
         collection = {key: plan[key] for key in ("schema_version", "repo", "tool", "tag", "source_sha", "required_targets")}
+        if "required_assets" in plan:
+            collection["required_assets"] = plan["required_assets"]
         collection["builds"] = [selected(j, root / "completed" / j["id"] / "build-manifest.json", root / "completed" / j["id"] / "artifacts",
                                           state["jobs"][j["id"]]["complete"]["manifest_sha256"]) for j in plan["builds"]]
         if (root / "build-set.json").exists():

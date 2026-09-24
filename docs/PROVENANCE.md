@@ -64,6 +64,92 @@ their authenticity: an unsigned manifest can still omit or falsify evidence.
 Verification without an expected manifest cannot recover policy fields omitted
 from a previously generated statement.
 
+### Require every binary, archive and installer alias
+
+Platform coverage is not asset coverage: a manifest containing only one of two
+Windows executables still covers `windows/arm64`. An optional `required_assets`
+contract on a build plan or build-set plan selects the **exact** release payload
+names, their targets and declared formats before execution or collection. For example:
+
+```json
+"required_assets": [
+  {"name": "app.exe", "target": "windows/arm64", "archive_format": "binary"},
+  {"name": "helper.exe", "target": "windows/arm64", "archive_format": "binary"},
+  {"name": "app-windows-arm64.zip", "target": "windows/arm64", "archive_format": "zip"}
+]
+```
+
+Add this field to the existing plan JSON, beside `required_targets` and
+`builds`. List 1..256 records, with exactly the three fields shown; safe names
+are at most 128 characters and must also be unique ignoring ASCII letter case.
+Every required target must have at least one asset. List installer-compatible
+aliases separately even when they contain identical bytes. This is an exact
+contract, not a minimum set: extra, missing, renamed, wrong-target or
+wrong-format records fail. It does not produce archives, repair outputs or
+interpret extensions as proof of archive contents. Generated checksum,
+signature, SBOM and provenance sidecars are not build payload requirements.
+
+Collection checks each component against the portion assigned to its targets
+before retaining a checkpoint. The execution coordinator retains the contract
+in its frozen plan and generated build set, and the combined finalizer verifies
+that it has not been dropped or changed during handoff. The aggregate retains it;
+shared manifest admission enforces it again for direct uploads, signature
+preparation and provenance generation. Retry cannot change or remove the
+contract from an existing run or bundle. Reordering its records does not change the
+plan identity. The declaration is bound by the existing manifest SHA-256; no
+private configuration is added to the public statement.
+
+Absent `required_assets` preserves the existing manifest-selected asset set,
+except that xwin outputs must still match the selected binaries below. Explicit null, an
+empty list or an incomplete declaration is an error, not a fallback. A producer
+can falsify an unsigned declaration, so select the plan and trust policy
+independently rather than deriving expectations from an incomplete output.
+Run `bash scripts/tests/test_release_asset_contract.sh` for real collection,
+retry, direct-admission and source-manifest checks; no compiler or network
+service is needed.
+
+### Execute complete Windows binary sets
+
+An xwin job in `src/release_builds.sh` can select a complete workspace binary set
+using `"binaries": ["app", "helper"]` instead of `"binary": "app"`. Supply exactly
+one spelling, with 1..32 distinct binary names. Case-insensitive collisions and
+path-like names are refused. The coordinator sorts a binary list before freezing
+the plan, so reversing the selection does not invalidate a completed checkpoint.
+The existing pinned runner receives repeated literal `--bin` arguments in one
+invocation; its Cargo metadata and per-executable PE checks remain unchanged.
+
+For this selection, an execution plan would include:
+
+```json
+"required_assets": [
+  {"name": "app-aarch64-pc-windows-msvc.exe", "target": "windows/arm64", "archive_format": "binary"},
+  {"name": "helper-aarch64-pc-windows-msvc.exe", "target": "windows/arm64", "archive_format": "binary"}
+]
+```
+
+Include every other job's expected assets in the same top-level contract. An
+xwin job's portion must agree with the runner's binary naming; incompatible
+expectations fail before compilation. The optional `package` still selects one
+workspace package, while omitting it lets the existing runner resolve the chosen
+binaries across the admitted workspace. A single binary may use `asset_name`;
+a multi-binary job cannot rename the whole set with one filename.
+
+The coordinator compares the exact xwin name/target/format inventory both when
+importing a successful result and when revalidating completed checkpoints, even
+without `required_assets`. Missing companions, unexpected binaries, renamed
+outputs and substituted formats fail rather than becoming a successful one-target
+release. The existing shared manifest and file-hash checks still apply. This adds
+neither archive packaging nor arbitrary post-build commands: expecting a ZIP from
+the raw-executable xwin driver is an invalid execution plan. Use reviewed native
+or imported producer outputs for archive contracts.
+
+The same plan works through `release_finalize.sh --build-plan`; completed jobs
+remain reusable after another job fails or after original input directories go
+offline. Failed xwin jobs restart in fresh attempts, not reused compiler caches.
+Run `bash scripts/tests/test_release_builds_assets.sh` for controller, collection,
+retry and finalizer-handoff tests. Compiler and network-finalizer boundaries are
+explicit fixtures, not an actual Rust or Windows acceptance build.
+
 Identical retries retain existing statement bytes. Conflicting statements and
 orphan detached signatures are never overwritten. Publication is atomic for a
 single statement; trusted producer directories must remain stable while they
