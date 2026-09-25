@@ -213,7 +213,18 @@ try:
     class Parser(argparse.ArgumentParser):
         def error(self, message):
             raise Failure(message, 4)
-    parser = Parser(description="Authenticate and install a complete executable set; never execute payloads.", allow_abbrev=False)
+    if sys.argv[2:3] == ["describe-recipe"]:
+        parser = Parser(description="Validate and normalize an installation recipe; no authentication or writes.", allow_abbrev=False)
+        parser.add_argument("--recipe", required=True)
+        flags = [a.split("=", 1)[0] for a in sys.argv[3:] if a.startswith("--")]
+        need(len(flags) == len(set(flags)), "duplicate recipe option", 4)
+        args = parser.parse_args(sys.argv[3:])
+        selected = recipe(load(plain(args.recipe, "file"), 1048576))
+        print(canonical(dict(kind="dsr-install-recipe", recipe=selected, authenticated=False)).decode(), end="")
+        sys.exit(0)
+    parser = Parser(description="Authenticate and install a complete executable set; never execute payloads.",
+                    epilog="Generate a standalone pinned installer with: generate-installer --policy FILE --public-key FILE --output FILE",
+                    allow_abbrev=False)
     origin = parser.add_mutually_exclusive_group(required=True)
     origin.add_argument("--snapshot", help="Use a complete local snapshot without network access")
     origin.add_argument("--fetch", action="store_true", help="Fetch an exact signed release into private staging before installation")
@@ -406,5 +417,9 @@ PY
 
 release_install() ( _release_install_execute "$@"; )
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [[ "${1:-}" == generate-installer ]]; then
+        shift
+        exec bash "$_RELEASE_INSTALL_DIR/install_gen_release.sh" "$@"
+    fi
     _release_install_execute "$@"
 fi

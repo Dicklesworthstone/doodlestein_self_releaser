@@ -28,6 +28,7 @@ TRANSPORT
 } > "$INSTALL/src/sbom_release.sh"
 printf 'normal\n' > "$CASE/mode"
 export DSR_ONLINE_CASE="$CASE" DSR_GH_TOKEN=fixture-token GH_ENTERPRISE_TOKEN=must-not-inherit
+[[ "${DSR_ONLINE_FIXTURES_ONLY:-false}" != true ]] || return 0
 python3 - "$INSTALL" "$CASE" "$PIN" <<'PY'
 import copy
 import json

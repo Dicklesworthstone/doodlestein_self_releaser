@@ -8,6 +8,12 @@ run a downloaded executable, invoke an installation hook, or modify shell startu
 files. This is an explicit consumer command, not a silent change to the generated
 curl-bash installers or ordinary `dsr release` policy.
 
+For a distributable per-release script with embedded engines, recipes and trust
+policy, use `generate-installer` as described in
+[generated release installers](GENERATED_RELEASE_INSTALLERS.md). Consumers can
+then use online or offline installation without a DSR checkout or repeated
+policy/key arguments.
+
 ## Download and install in one invocation
 
 Use `--fetch` instead of `--snapshot DIR` to fetch the exact selected signed
