@@ -511,6 +511,91 @@ EOF
     fi
 }
 
+# Regression: the strict include check used to pipe `tar -tv` into an awk that
+# exited at the first match.  With a listing larger than a pipe buffer, tar
+# then died of SIGPIPE and pipefail turned a valid archive into "Strict
+# workspace archive includes do not match release tree" (slb on trj, 6/8
+# runs).  The member-mode lookup must survive that, yet a reader that really
+# fails must still reject the archive.
+test_workspace_archive_include_mode_large_listing() {
+    log_test "strict include mode check survives large archive listings"
+    if ! command -v yq &>/dev/null; then
+        log_skip "yq not available for strict include validation"
+        return
+    fi
+
+    local repo="$TEMP_DIR/include-sigpipe-repo"
+    local stage="$TEMP_DIR/include-sigpipe-stage"
+    local config="$TEMP_DIR/include-sigpipe.yaml"
+    local archive_gz="$TEMP_DIR/include-sigpipe.tar.gz"
+    local archive_xz="$TEMP_DIR/include-sigpipe.tar.xz"
+    mkdir -p "$repo" "$stage/padding"
+    git -C "$repo" init -q
+    git -C "$repo" config user.name "DSR Test"
+    git -C "$repo" config user.email "dsr-test.invalid"
+    printf 'release notes\n' > "$repo/README.md"
+    git -C "$repo" add README.md
+    git -C "$repo" -c commit.gpgsign=false commit -qm "include sigpipe fixture"
+    local revision
+    revision=$(git -C "$repo" rev-parse HEAD)
+    printf 'include_files:\n  - README.md\n' > "$config"
+    cp "$repo/README.md" "$stage/README.md"
+    chmod 644 "$stage/README.md"
+
+    # README.md is archived first, followed by ~300 KiB of listing, so an
+    # early-exiting consumer is guaranteed to close the pipe while tar still
+    # has several pipe buffers of output left to write.
+    local i pad
+    pad=$(printf 'p%.0s' {1..120})
+    for i in $(seq 1 2000); do
+        : > "$stage/padding/${pad}-$i"
+    done
+    COPYFILE_DISABLE=1 tar --no-xattrs -czf "$archive_gz" -C "$stage" README.md padding
+    COPYFILE_DISABLE=1 tar --no-xattrs -cJf "$archive_xz" -C "$stage" README.md padding
+
+    local listing_bytes
+    listing_bytes=$(tar -tvzf "$archive_gz" | wc -c | tr -d '[:space:]')
+    if [[ "$listing_bytes" -gt 262144 ]]; then
+        log_pass "fixture listing ($listing_bytes bytes) exceeds several pipe buffers"
+    else
+        log_fail "fixture listing too small to exercise SIGPIPE ($listing_bytes bytes)"
+    fi
+
+    local ok=true run
+    for run in 1 2 3 4 5; do
+        _act_validate_workspace_archive_release_tree_includes \
+            "$archive_gz" tar.gz "$config" "$repo" "$revision" || ok=false
+        _act_validate_workspace_archive_release_tree_includes \
+            "$archive_xz" tar.xz "$config" "$repo" "$revision" || ok=false
+    done
+    if $ok && [[ "$(_act_archive_member_mode "$archive_gz" tar.gz README.md)" == -rw-* ]] &&
+       [[ -z "$(_act_archive_member_mode "$archive_gz" tar.gz MISSING.md)" ]]; then
+        log_pass "large-listing archives validate on every run (no SIGPIPE false failure)"
+    else
+        log_fail "large-listing archive was rejected; member-mode lookup is SIGPIPE-sensitive"
+    fi
+
+    # A tar that prints a correct listing but exits non-zero is a genuine
+    # reader failure and must still reject the archive.
+    local shim_dir="$TEMP_DIR/include-sigpipe-failing-tar" real_tar
+    real_tar=$(command -v gtar || command -v tar)
+    mkdir -p "$shim_dir"
+    local shim
+    for shim in tar gtar; do
+        printf '#!/usr/bin/env bash\ncase "${1:-}" in -tv*) "%s" "$@"; exit 2 ;; esac\nexec "%s" "$@"\n' \
+            "$real_tar" "$real_tar" > "$shim_dir/$shim"
+        chmod 755 "$shim_dir/$shim"
+    done
+    if ( PATH="$shim_dir:$PATH"; hash -r
+         ! _act_archive_member_mode "$archive_gz" tar.gz README.md >/dev/null &&
+         ! _act_validate_workspace_archive_release_tree_includes \
+             "$archive_gz" tar.gz "$config" "$repo" "$revision" ); then
+        log_pass "a failing tar listing still rejects the archive"
+    else
+        log_fail "a failing tar listing must not be accepted"
+    fi
+}
+
 test_workspace_archive_collection_receipts() {
     log_test "workspace binary collection receipts"
 
@@ -962,6 +1047,7 @@ main() {
     test_artifact_dirs
     test_artifact_zip_wrapper_classification
     test_workspace_include_staging
+    test_workspace_archive_include_mode_large_listing
     test_workspace_archive_collection_receipts
     test_workspace_archive_contract_format_and_members
     test_strict_git_commit_replacement_binding

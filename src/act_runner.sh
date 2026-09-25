@@ -657,6 +657,29 @@ _act_archive_entry_stream() {
     esac
 }
 
+# Print the ls-style mode field of one named archive member (empty when the
+# member is absent).  The whole listing is captured before it is searched:
+# piping the reader into a consumer that stops at the first match (awk exit,
+# head, grep -q) lets the reader die of SIGPIPE, and pipefail then reports a
+# valid archive as unreadable -- a spurious strict-release failure that hit
+# roughly three of four slb builds on a GNU tar host.  A genuine reader
+# failure (corrupt archive, missing tool) still returns 4.
+_act_archive_member_mode() {
+    local archive="$1"
+    local format="$2"
+    local entry="$3"
+    local listing tar_reader="tar"
+    command -v gtar &>/dev/null && tar_reader="gtar"
+
+    case "$format" in
+        tar.gz) listing=$(LC_ALL=C "$tar_reader" -tvzf "$archive" 2>/dev/null) || return 4 ;;
+        tar.xz) listing=$(LC_ALL=C "$tar_reader" -tvJf "$archive" 2>/dev/null) || return 4 ;;
+        zip) listing=$(LC_ALL=C unzip -Z -l "$archive" 2>/dev/null) || return 4 ;;
+        *) return 4 ;;
+    esac
+    awk -v entry="$entry" '$NF == entry { print $1; exit }' <<< "$listing"
+}
+
 _act_validate_workspace_archive_release_tree_includes() {
     local archive="$1"
     local format="$2"
@@ -681,8 +704,6 @@ _act_validate_workspace_archive_release_tree_includes() {
     configured=$(yq -r '.include_files // [] | .[]' "$config_file" 2>/dev/null) || return 4
 
     local include tree_metadata tree_mode tree_object archived_object mode
-    local tar_reader="tar"
-    command -v gtar &>/dev/null && tar_reader="gtar"
     while IFS= read -r include; do
         [[ -n "$include" ]] || continue
         _act_is_safe_workspace_include_path "$include" || return 4
@@ -695,21 +716,7 @@ _act_validate_workspace_archive_release_tree_includes() {
         ) || return 4
         [[ "$archived_object" == "$tree_object" ]] || return 4
 
-        case "$format" in
-            tar.gz)
-                mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
-                    awk -v entry="$include" '$NF == entry { print $1; exit }') || return 4
-                ;;
-            tar.xz)
-                mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
-                    awk -v entry="$include" '$NF == entry { print $1; exit }') || return 4
-                ;;
-            zip)
-                mode=$(unzip -Z -l "$archive" 2>/dev/null | \
-                    awk -v entry="$include" '$NF == entry { print $1; exit }') || return 4
-                ;;
-            *) return 4 ;;
-        esac
+        mode=$(_act_archive_member_mode "$archive" "$format" "$include") || return 4
         [[ "$mode" == -* ]] || return 4
         if [[ "$tree_mode" == "100755" ]]; then
             [[ "$mode" == *x* ]] || return 4
@@ -827,8 +834,7 @@ _act_validate_target_archive() {
         zip)
             command -v unzip &>/dev/null || return 4
             entries=$(unzip -Z1 "$archive" 2>/dev/null) || return 4
-            mode=$(unzip -Z -l "$archive" 2>/dev/null | \
-                awk '$1 ~ /^-/ { print $1; exit }') || return 4
+            mode=$(_act_archive_member_mode "$archive" "$format" "$expected_entry") || return 4
             ;;
         *)
             _log_error "Unsupported strict release archive format: $format"
@@ -1202,23 +1208,8 @@ _act_validate_workspace_archive() {
     fi
 
     local mode size executable=false
-    # Drain each listing even after finding the member: early awk exit can
-    # SIGPIPE tar/unzip and reject a valid large archive under pipefail.
     for member in "${expected_members[@]}"; do
-        case "$format" in
-            tar.gz)
-                mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
-                ;;
-            tar.xz)
-                mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
-                ;;
-            zip)
-                mode=$(unzip -Z -l "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
-                ;;
-        esac
+        mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
         [[ "$mode" == -* ]] || return 4
         archive_file_json=$(jq -c --arg name "$member" \
             '.[] | select(.name == $name)' <<< "$archive_files_json") || return 4
@@ -1236,20 +1227,7 @@ _act_validate_workspace_archive() {
         size=$(_act_archive_entry_stream "$archive" "$format" "$member" 2>/dev/null | \
             wc -c | tr -d '[:space:]') || return 4
         executable=false
-        case "$format" in
-            tar.gz)
-                mode=$("$tar_reader" -tvzf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
-                ;;
-            tar.xz)
-                mode=$("$tar_reader" -tvJf "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
-                ;;
-            zip)
-                mode=$(unzip -Z -l "$archive" 2>/dev/null | \
-                    awk -v entry="$member" '$NF == entry && !found { print $1; found=1 }') || return 4
-                ;;
-        esac
+        mode=$(_act_archive_member_mode "$archive" "$format" "$member") || return 4
         [[ "$mode" == *x* ]] && executable=true
         _act_validate_target_binary_reader \
             "$archive::$member" "$target" "$size" "$executable" \
