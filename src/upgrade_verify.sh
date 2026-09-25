@@ -145,13 +145,15 @@ upgrade_verify_tool() {
     local latest_version=""
 
     # Check for common success patterns
-    if echo "$output" | grep -qi "found.*asset\|download.*available\|update.*available"; then
+    # Here-strings keep `grep -q` from SIGPIPE-ing a writer of large output,
+    # which pipefail would turn into a missed match.
+    if grep -qi "found.*asset\|download.*available\|update.*available" <<< "$output"; then
         found_asset=true
         log_ok "$tool_name update check: Found update"
-    elif echo "$output" | grep -qi "up.to.date\|no update\|already.*latest"; then
+    elif grep -qi "up.to.date\|no update\|already.*latest" <<< "$output"; then
         found_asset=true
         log_ok "$tool_name update check: Up to date"
-    elif echo "$output" | grep -qi "no suitable release asset\|asset not found\|failed to find"; then
+    elif grep -qi "no suitable release asset\|asset not found\|failed to find" <<< "$output"; then
         found_asset=false
         log_error "$tool_name update check: Asset naming mismatch"
         log_error "Output: $output"
@@ -247,8 +249,10 @@ upgrade_verify_all() {
         local binary_name
         binary_name=$(_upgrade_tool_binary_name "$tool_name")
         if command -v "$binary_name" &>/dev/null; then
+            # Capture --help before searching it: `--help | grep -q` lets a
+            # long help text SIGPIPE the tool and pipefail hides the match.
             if _upgrade_has_explicit_check_args "$tool_name" ||
-                    "$binary_name" --help 2>&1 | grep -q "upgrade"; then
+                    grep -q "upgrade" <<< "$("$binary_name" --help 2>&1)"; then
                 has_upgrade=true
             fi
         fi
@@ -350,7 +354,7 @@ upgrade_verify_json() {
         local found_asset=false
         local latest_version
         latest_version=$(_upgrade_extract_latest_version "$output")
-        if echo "$output" | grep -qi "up.to.date\|no update\|already.*latest\|current version\|found.*asset\|download.*available\|update.*available"; then
+        if grep -qi "up.to.date\|no update\|already.*latest\|current version\|found.*asset\|download.*available\|update.*available" <<< "$output"; then
             found_asset=true
             status=0
         elif [[ ${exit_code:-0} -eq 0 ]]; then

@@ -9278,7 +9278,9 @@ cmd_repos_discover() {
         # Check if has release workflow
         local has_workflow=false
         if [[ -d "$dir/.github/workflows" ]]; then
-            if grep -l -E 'release|build' "$dir/.github/workflows/"*.yml "$dir/.github/workflows/"*.yaml 2>/dev/null | head -1 >/dev/null; then
+            # grep -q decides by itself; `grep -l | head -1` could SIGPIPE
+            # grep when several workflows match and pipefail hid the result.
+            if grep -qE 'release|build' "$dir/.github/workflows/"*.yml "$dir/.github/workflows/"*.yaml 2>/dev/null; then
                 has_workflow=true
             fi
         fi

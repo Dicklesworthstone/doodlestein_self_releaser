@@ -833,9 +833,14 @@ _install_skill_archive_to_dir() {
 
     # Belt-and-suspenders: walk the staged tree and reject any
     # symlinks before we copy.  Catches whatever tar didn't filter.
-    if find "$stage_dir" -type l 2>/dev/null | grep -q .; then
+    # Capture the whole walk: `find | grep -q .` lets grep's early exit
+    # SIGPIPE find once many links exist, and pipefail then reported "no
+    # symlinks".  A failed walk refuses the install rather than passing it.
+    local staged_links=""
+    if ! staged_links=$(find "$stage_dir" -type l 2>/dev/null) || \
+       [[ -n "$staged_links" ]]; then
         rm -rf "$stage_dir" 2>/dev/null || true
-        _log_warn "Skill archive contains symbolic links; refusing to install"
+        _log_warn "Skill archive contains symbolic links (or could not be scanned); refusing to install"
         return 1
     fi
 
@@ -1275,7 +1280,14 @@ main() {
         if command -v timeout &>/dev/null; then timeout_cmd=timeout
         elif command -v gtimeout &>/dev/null; then timeout_cmd=gtimeout; fi
         if [[ -n "$timeout_cmd" ]]; then
-            installed_version=$("$timeout_cmd" 10 "$installed_path" --version 2>/dev/null | head -1) || installed_version="unknown"
+            # Capture, then keep the first line: `| head -1` can SIGPIPE a
+            # multi-line --version under pipefail and discard a good answer.
+            if installed_version=$("$timeout_cmd" 10 "$installed_path" --version 2>/dev/null) && \
+               [[ -n "$installed_version" ]]; then
+                installed_version="${installed_version%%$'\n'*}"
+            else
+                installed_version="unknown"
+            fi
         fi
         _log_ok "Installation complete!"
         _log_info "Version: $installed_version"

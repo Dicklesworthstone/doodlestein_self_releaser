@@ -784,7 +784,9 @@ _gh_retry_pause() {
 # Check if response indicates rate limiting
 _gh_is_rate_limited() {
     local response="$1"
-    if echo "$response" | grep -qi "rate limit"; then
+    # Here-string, not `echo | grep -q`: grep's early exit can SIGPIPE the
+    # writer of a large response body and pipefail would hide the match.
+    if grep -qi "rate limit" <<< "$response"; then
         return 0
     fi
     if echo "$response" | jq -e '.message | test("rate limit"; "i")' &>/dev/null 2>&1; then

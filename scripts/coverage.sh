@@ -110,7 +110,11 @@ is_function_tested() {
 
     # Search for function call in test files
     # Patterns: func_name, func_name $arg, func_name "arg", $(func_name)
-    echo "$test_files" | xargs grep -l -E "\b${func_name}\b" 2>/dev/null | head -1 | grep -q .
+    # Capture the hits: `| head -1` can SIGPIPE xargs/grep once several test
+    # files match, and pipefail would then report the function as uncovered.
+    local hits
+    hits=$(echo "$test_files" | xargs grep -l -E "\b${func_name}\b" 2>/dev/null) || true
+    [[ -n "$hits" ]]
 }
 
 # Get list of test files that call a function
