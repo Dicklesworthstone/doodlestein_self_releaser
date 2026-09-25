@@ -93,6 +93,11 @@ The sourceable APIs are `slsa_fetch_release` and `slsa_verify_snapshot` with the
 same arguments. Success emits one JSON object; failures return nonzero without
 a success object, following the existing remote SLSA API contract.
 
+For explicit multi-binary installation, [RELEASE_INSTALLATION.md](RELEASE_INSTALLATION.md)
+describes `src/release_install.sh`. It reauthenticates the snapshot, stages the
+selected archive members or raw executables, and activates one complete managed
+generation. Fetching a snapshot alone never installs or executes its contents.
+
 ## Limits and validation
 
 The host, tools, trusted-key selection and local cooperating-writer storage
