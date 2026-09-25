@@ -4,11 +4,14 @@
 _SLSA_REMOTE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 _slr_require() {
-    if ! declare -F slsa_verify_release >/dev/null; then
+    # Public SLSA functions may be exported by a parent shell without their
+    # private dependencies. A new CLI must still load a complete implementation.
+    if ! declare -F slsa_verify_release >/dev/null || ! declare -F _slsa_sha256 >/dev/null ||
+       ! declare -F _slsa_authenticate >/dev/null; then
         # shellcheck source=src/slsa.sh
         source "$_SLSA_REMOTE_DIR/slsa.sh" || return 3
     fi
-    if ! declare -F _sbr_context >/dev/null; then
+    if [[ "${1:-remote}" != local ]] && ! declare -F _sbr_context >/dev/null; then
         # shellcheck source=src/sbom_release.sh
         source "$_SLSA_REMOTE_DIR/sbom_release.sh" || return 3
     fi
@@ -132,6 +135,14 @@ _slr_verify_remote() {
         _slsa_log 'Release, tag, or provenance assets changed during verification'; return 7;
     }
     inventory_hash=$(_sbr_inventory_sha256 "$inventory" "$work") || return $?
+    # A fetch retains exactly the bytes verified above, never another download
+    # selected from the receipt. Ordinary verification/publication is unchanged.
+    if [[ "${4:-false}" == true ]]; then
+        mkdir "$work/snapshot" || return 1
+        ln -- "$proof" "$work/snapshot/release.intoto.jsonl" || return 1
+        ln -- "$signature" "$work/snapshot/release.intoto.jsonl.minisig" || return 1
+        mv -- "$work/payloads" "$work/snapshot/artifacts" || return 1
+    fi
     jq -cn --argjson context "$context" --argjson asset "$asset" --argjson signature "$signature_asset" \
         --arg proof_hash "$proof_hash" --arg signature_hash "$signature_hash" --arg inventory_hash "$inventory_hash" \
         --slurpfile policy "$policy" --slurpfile proof "$proof" '
@@ -144,6 +155,87 @@ _slr_verify_remote() {
          invocation_id:$proof[0].predicate.runDetails.metadata.invocationId,
          artifact_count:($proof[0].subject|length),asset_inventory_sha256:$inventory_hash,
          verification_policy:"trusted-minisign-slsa-v1-all-payload-bytes"}'
+}
+
+# Canonical local selections cannot redirect snapshot reads or publication.
+_slr_path() {
+    local path="$1" rest component current=''
+    [[ "$path" == /* && "$path" != / && "$path" != */ &&
+       "$path" != *[[:cntrl:]]* && "$path" != *\\* ]] || return 4
+    rest=${path#/}
+    while [[ -n "$rest" ]]; do
+        component=${rest%%/*}
+        [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 4
+        current+="/$component"
+        [[ ! -L "$current" ]] || return 4
+        [[ "$rest" == */* ]] || break
+        [[ ! -e "$current" || -d "$current" ]] || return 4
+        rest=${rest#*/}
+    done
+}
+
+_slr_snapshot_names() {
+    local root="$1" proof="$2" listing="$3" file name names='[]'
+    _slr_path "$root/artifacts" && [[ -d "$root/artifacts" ]] || return 7
+    # Include dotfiles in exact-namespace admission; never glob to choose which
+    # payloads are trusted. The signed statement chooses the complete set.
+    find "$root/artifacts" -mindepth 1 -maxdepth 1 -print0 > "$listing" || return 7
+    while IFS= read -r -d '' file; do
+        name=${file##*/}
+        [[ -f "$file" && ! -L "$file" ]] && _slsa_name "$name" || return 7
+        names=$(jq -cn --argjson names "$names" --arg name "$name" '$names+[$name]') || return 1
+    done < "$listing"
+    jq -en --argjson names "$names" --slurpfile proof "$proof" \
+        '($names|sort)==($proof[0].subject|map(.name)|sort)' >/dev/null || return 7
+}
+
+# Offline authentication does not inherit trust from download.json or from an
+# embedded key/policy. Every invocation supplies its own complete trust policy.
+_slr_verify_snapshot() {
+    local policy="$1" key="$2" root="$3" work="$4" proof signature proof_hash signature_hash expected file count=0
+    _slr_path "$root" && [[ -d "$root" ]] || return 4
+    for file in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        case "${file##*/}" in
+            artifacts) [[ -d "$file" && ! -L "$file" ]] || return 7 ;;
+            release.intoto.jsonl|release.intoto.jsonl.minisig|download.json)
+                [[ -f "$file" && ! -L "$file" ]] || return 7 ;;
+            *) return 7 ;;
+        esac
+        count=$((count+1))
+    done
+    [[ "$count" == 4 ]] || return 7
+    proof="$root/release.intoto.jsonl"; signature="$proof.minisig"
+    [[ $(wc -c < "$proof") -le 67108864 && $(wc -c < "$signature") -le 65536 ]] || return 7
+    proof_hash=$(_slsa_sha256 "$proof") || return $?
+    signature_hash=$(_slsa_sha256 "$signature") || return $?
+    expected=$(jq -r .statement_sha256 "$policy") || return 1
+    [[ -z "$expected" || "$expected" == "$proof_hash" ]] || return 7
+    _slr_policy "$proof" "$signature" "$key" "$policy" || return $?
+    local limit="${SLSA_REMOTE_MAX_PAYLOAD_BYTES:-8589934592}"
+    [[ "$limit" =~ ^[1-9][0-9]{0,15}$ ]] || return 4
+    jq -e --argjson limit "$limit" '.dsr_evidence.artifacts |
+        length<=256 and (map(.name|ascii_downcase)|unique|length)==length and
+        all(.[]; (.name|length<=128) and
+            (.archive_format|.=="binary" or .=="none" or .=="tar.gz" or .=="tar.xz" or .=="zip")) and
+        (map(.size_bytes)|add)<=$limit' "$proof" >/dev/null || return 7
+    _slr_snapshot_names "$root" "$proof" "$work/snapshot-names" || return $?
+    slsa_verify_release "$proof" "$root/artifacts" --builder "$(jq -r .builder "$policy")" \
+        --public-key "$key" --signature "$signature" \
+        --source-repository "https://github.com/$(jq -r .repo "$policy")" \
+        --source-commit "$(jq -r .source_sha "$policy")" || return $?
+    _slr_snapshot_names "$root" "$proof" "$work/snapshot-names" || return $?
+    [[ "$(_slsa_sha256 "$proof")" == "$proof_hash" && "$(_slsa_sha256 "$signature")" == "$signature_hash" ]] || return 7
+    jq -cnS --arg proof_hash "$proof_hash" --arg signature_hash "$signature_hash" --slurpfile proof "$proof" '
+        $proof[0] as $s | {statement_sha256:$proof_hash,signature_sha256:$signature_hash,
+        artifacts:($s.dsr_evidence.artifacts|sort_by(.name)|map(. as $a |
+            .+{sha256:($s.subject[]|select(.name==$a.name)|.digest.sha256)}))}' > "$work/snapshot-identity.json" || return 1
+    jq -cn --arg root "$root" --arg hash "$(_slsa_sha256 "$work/snapshot-identity.json")" \
+        --slurpfile identity "$work/snapshot-identity.json" --slurpfile policy "$policy" --slurpfile proof "$proof" '
+        {kind:"dsr-slsa-snapshot-verification",status:"verified",authenticated:true,remote_current:false,
+         snapshot:$root,snapshot_sha256:$hash,policy:$policy[0],
+         build_manifest_sha256:$proof[0].dsr_evidence.manifest_sha256,
+         invocation_id:$proof[0].predicate.runDetails.metadata.invocationId} + $identity[0]'
 }
 
 # Present proof names must match the frozen pair before ANY upload. A signature
@@ -251,13 +343,18 @@ _slr_publish() {
 _slr_execute() (
     set -uo pipefail
     umask 077
-    local action="$1" local_proof='' local_signature='' root='' dry=false
+    local action="$1" local_proof='' local_signature='' root='' dry=false output=''
     shift
     if [[ "$action" == publish ]]; then
         [[ $# -ge 2 ]] || return 4
         local_proof=$1; root=$2; shift 2
         dry="${DRY_RUN:-false}"
         [[ -f "$local_proof" && ! -L "$local_proof" && -d "$root" && ! -L "$root" ]] || return 4
+    fi
+    if [[ "$action" == snapshot ]]; then
+        [[ $# -ge 1 ]] || return 4
+        root=$1; shift
+        _slr_path "$root" && [[ -d "$root" ]] || return 4
     fi
     local repo='' tag='' sha='' builder='' public='' targets='' name=release.intoto.jsonl
     local expected='' manifest_hash='' invocation='' option work cleanup key_hash matrix
@@ -273,6 +370,7 @@ _slr_execute() (
             --public-key) public=$2 ;; --targets) targets=$2 ;; --statement-name) name=$2 ;;
             --statement-sha256) expected=$2 ;; --manifest-sha256) manifest_hash=$2 ;; --invocation-id) invocation=$2 ;;
             --signature) [[ "$action" == publish ]] || return 4; local_signature=$2 ;;
+            --output-dir) [[ "$action" == fetch ]] || return 4; output=$2 ;;
             *) return 4 ;;
         esac
         shift 2
@@ -289,8 +387,18 @@ _slr_execute() (
     matrix=$(jq -cne --arg targets "$targets" '$targets|split(",")|
         if length>0 and all(.[];test("^(linux|darwin|windows)/(amd64|arm64|386)$")) and (unique|length)==length
         then sort else error("invalid expected targets") end') || return 4
-    _slr_require || return $?
-    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-slsa-remote.XXXXXXXX") || return 1
+    if [[ "$action" == snapshot ]]; then _slr_require local || return $?; else _slr_require || return $?; fi
+    if [[ "$action" == fetch ]]; then
+        command -v flock >/dev/null && command -v python3 >/dev/null || return 3
+        _slr_path "$output" && _slr_path "$output.lock" && [[ -d "${output%/*}/" ]] || return 4
+        [[ ! -e "$output.lock" || -f "$output.lock" ]] || return 4
+        exec 9>> "$output.lock" || return 1
+        flock -n 9 || return 2
+        [[ ! -e "$output" && ! -L "$output" ]] || { _slsa_log 'Snapshot already exists; use verify-snapshot'; return 2; }
+        work=$(mktemp -d "${output%/*}/.dsr-fetch.XXXXXXXX") || return 1
+    else
+        work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-slsa-remote.XXXXXXXX") || return 1
+    fi
     printf -v cleanup 'rm -rf -- %q' "$work"
     # shellcheck disable=SC2064
     trap "$cleanup" EXIT
@@ -336,21 +444,49 @@ _slr_execute() (
             _slr_publish "$work/policy.json" "$work/trusted.pub" "$work" "$local_proof" "$local_signature" "$root" \
                 > "$work/result.json" || return $?
         fi
+    elif [[ "$action" == snapshot ]]; then
+        _slr_verify_snapshot "$work/policy.json" "$work/trusted.pub" "$root" "$work" > "$work/result.json" || return $?
+    elif [[ "$action" == fetch ]]; then
+        _sbr_require || return $?
+        _slr_verify_remote "$work/policy.json" "$work/trusted.pub" "$work" true > "$work/remote.json" || return $?
+        cp -- "$work/remote.json" "$work/snapshot/download.json" || return 1
+        _slr_verify_snapshot "$work/policy.json" "$work/trusted.pub" "$work/snapshot" "$work" > "$work/local.json" || return $?
+        jq -cn --arg output "$output" --slurpfile remote "$work/remote.json" --slurpfile local "$work/local.json" \
+            '{kind:"dsr-slsa-fetch",status:"verified",authenticated:true,snapshot:$output,
+              snapshot_sha256:$local[0].snapshot_sha256,verification:$remote[0]}' > "$work/result.json" || return 1
     else
         _sbr_require || return $?
         _slr_verify_remote "$work/policy.json" "$work/trusted.pub" "$work" > "$work/result.json" || return $?
     fi
     [[ "$(_slsa_sha256 "$public")" == "$key_hash" && "$(_slsa_sha256 "$work/trusted.pub")" == "$key_hash" ]] || return 7
+    if [[ "$action" == fetch ]]; then
+        _slr_path "$output" && _slr_path "$output.lock" || return 2
+        # The cooperating-writer lock and same-filesystem staging protect the
+        # single directory rename. Never adopt or overwrite an occupied path.
+        python3 - "$work/snapshot" "$output" <<'PY'
+import os, stat, sys
+source, dest = sys.argv[1:]
+held, named = os.fstat(9), os.lstat(dest + ".lock")
+if not stat.S_ISREG(named.st_mode) or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino) or os.path.lexists(dest):
+    sys.exit(2)
+os.rename(source, dest)
+PY
+        [[ $? == 0 ]] || return 2
+    fi
     cat "$work/result.json"
 )
 
 slsa_verify_remote() { _slr_execute verify "$@"; }
 slsa_publish_release() { _slr_execute publish "$@"; }
+slsa_fetch_release() { _slr_execute fetch "$@"; }
+slsa_verify_snapshot() { _slr_execute snapshot "$@"; }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-help}" in
         verify-release) shift; slsa_verify_remote "$@"; exit $? ;;
         publish-release) shift; slsa_publish_release "$@"; exit $? ;;
+        fetch-release) shift; slsa_fetch_release "$@"; exit $? ;;
+        verify-snapshot) shift; slsa_verify_snapshot "$@"; exit $? ;;
         help|--help|-h)
             printf '%s\n' 'Usage: bash src/slsa_remote.sh verify-release --repo OWNER/REPO --tag vVERSION --sha COMMIT' \
                 '       --builder ID --public-key FILE --targets linux/amd64,windows/arm64' \
@@ -358,6 +494,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 '       [--manifest-sha256 SHA256] [--invocation-id ID]' \
                 'Publish: publish-release STATEMENT ARTIFACTS (same required policy options)' \
                 '         [--signature FILE] [--dry-run]' \
+                'Fetch: fetch-release --output-dir NEW_DIR (same required policy options)' \
+                'Offline: verify-snapshot DIR (same required policy options; no network)' \
                 'Verify performs no writes. Publish adds only a signed statement pair to an existing draft.' ;;
         *) exit 4 ;;
     esac
