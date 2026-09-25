@@ -370,9 +370,11 @@ packaging_build_archive() (
 # context (rano v0.2.1): the native staging lane wraps a lone binary into an
 # archive, and a payload-preserving repack then shipped that archive without
 # the LICENSE the previous release carried, silently. Includes are subject to
-# the same member-safety rules as extracted payload members, may never shadow
-# a payload member, and force a rebuild even when source and destination
-# formats match (a byte-copy of the source could not contain them).
+# the same member-safety rules as extracted payload members. An existing
+# member satisfies an include only when its bytes and executable bits match;
+# it is never overwritten. Only genuinely missing includes require rebuilding.
+# Thus prebuilt archives that already satisfy the include contract retain their
+# exact compressed bytes, including when the include list contains duplicates.
 packaging_repack_archive() (
     local src="$1"
     local src_format="$2"
@@ -418,7 +420,8 @@ packaging_repack_archive() (
 
     packaging_extract_payload "$src" "$src_format" "$payload" || return $?
 
-    local include include_parent
+    local include include_parent include_bits payload_bits include_mode
+    local added_includes=0
     for include in "${includes[@]}"; do
         if ! packaging_member_is_safe "$include"; then
             _pkg_log_error "Refusing unsafe include member: $include"
@@ -429,27 +432,41 @@ packaging_repack_archive() (
             _pkg_log_error "Include is missing or not a regular non-symlink file: $include"
             return 4
         fi
-        if [[ -e "$payload/$include" || -L "$payload/$include" ]] || \
-           ! _pkg_path_has_no_links "$payload" "$include"; then
+        if ! _pkg_path_has_no_links "$payload" "$include"; then
             _pkg_log_error "Include collides with an archive payload member: $include"
             return 4
+        fi
+        include_bits=$(_pkg_executable_bits "$include_root/$include") || return $?
+        if [[ -e "$payload/$include" ]]; then
+            if [[ ! -f "$payload/$include" ]] || \
+               ! cmp -s "$include_root/$include" "$payload/$include"; then
+                _pkg_log_error "Include differs from the existing archive payload: $include"
+                return 4
+            fi
+            payload_bits=$(_pkg_executable_bits "$payload/$include") || return $?
+            if [[ "$include_bits" != "$payload_bits" ]]; then
+                _pkg_log_error "Include executable bits differ from the archive payload: $include"
+                return 4
+            fi
+            _pkg_log_info "Reusing verified include already present in the payload: $include"
+            continue
         fi
         include_parent=$(dirname "$payload/$include")
         mkdir -p -- "$include_parent" || return 4
         cp -- "$include_root/$include" "$payload/$include" || return 4
-        if [[ -x "$include_root/$include" ]]; then
-            chmod 0755 "$payload/$include" || return 4
-        else
-            chmod 0644 "$payload/$include" || return 4
-        fi
+        # Preserve the actual executable-bit contract, not -x (which depends
+        # on the invoking user's identity). Strip privileged/write mode bits.
+        printf -v include_mode '%o' "$((0644 | include_bits))"
+        chmod "$include_mode" "$payload/$include" || return 4
         members+=("$include")
+        added_includes=$((added_includes + 1))
     done
-    if [[ ${#includes[@]} -gt 0 ]]; then
+    if [[ "$added_includes" -gt 0 ]]; then
         # The parity contract now covers payload members plus includes.
         src_members=$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)
     fi
 
-    if [[ ${#includes[@]} -gt 0 ]]; then
+    if [[ "$added_includes" -gt 0 ]]; then
         if [[ -f "$dest" ]] && \
            _pkg_archive_matches_payload "$dest" "$dest_format" "$payload" "$src_members" 2>/dev/null; then
             _pkg_log_info "Reusing verified archive that already carries the configured includes: $dest"
