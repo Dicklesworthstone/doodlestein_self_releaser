@@ -129,3 +129,66 @@ a tiny C fixture when `cc` is available (otherwise it uses a shell executable).
 It tests all output formats, prebuilt preservation, independent repacking,
 producer disappearance, drift, malicious archive entries and compressor failure.
 No live GitHub, signing or Rust/Windows build acceptance is claimed.
+
+## Reproducible new archives
+
+Export `SOURCE_DATE_EPOCH` before packaging to make **newly constructed**
+archives independent of filesystem mtimes, member selection/creation order,
+user/group identities, time zone, umask and non-executable permission bits:
+
+```bash
+# Select a stable timestamp from the reviewed source, not the current clock.
+SOURCE_DATE_EPOCH=$(git -C /srv/source show -s --format=%ct "$SOURCE_COMMIT")
+export SOURCE_DATE_EPOCH
+
+bash src/release_packaging.sh --recipe /srv/packaging.json \
+  --manifest /srv/build/build-manifest.json \
+  --manifest-sha256 "$REVIEWED_PRODUCER_MANIFEST_SHA256" \
+  --artifacts-dir /srv/build/artifacts --output-dir /srv/packaged \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$SOURCE_COMMIT"
+```
+
+The same environment selection works with sourced `packaging_build_archive`
+and with cross-format `packaging_repack_archive`. It is opt-in: an unset
+variable retains the existing native archive-tool behavior. A set value must
+contain 1–10 decimal digits and be in `0..4294967295`, the common unsigned gzip
+timestamp range. Invalid values return `4` from the packaging helpers even if
+an existing archive could otherwise be reused. A new reproducible archive needs
+Python 3.8+ with standard gzip, lzma, tarfile and zipfile support; a missing
+interpreter or archive module returns dependency code `3`.
+
+The reproducible writer streams regular payload files in byte-sorted name
+order. It emits only the selected files, with parent directories implicit.
+Tar uses PAX format, uid/gid zero, empty owner/group names, the selected epoch,
+and mode `0644 | original executable bits`. Gzip has a fixed compression level
+and no embedded temporary filename; XZ has a fixed preset and checksum mode.
+ZIP uses DEFLATE, Unix file modes, and a UTC-derived DOS timestamp rounded down
+to two-second precision; epochs before 1980 are represented as 1980-01-01.
+Source timestamps, ownership and modes are never changed. Long safe paths and
+spaces are supported, while links, special files and unsafe names remain
+invalid. Every generated archive must pass the existing real extraction,
+file-set, byte and executable-bit parity checks before atomic publication.
+
+**Preserving producer bytes takes precedence over recompression.** Same-format
+prebuilt archives remain byte-for-byte copies. Verified completed archives
+remain unchanged, including their inodes, when only the epoch changes. To compare
+independent builds, use separate fresh output locations; this option does not
+rewrite previously admitted or signed bytes. Matching configured include files
+already present in a producer are verified by content and executable bits, not
+added again. Missing includes trigger a new archive; conflicting includes fail
+without overwriting either producer or prior destination.
+
+This is reproducible *packaging*, not proof of reproducible compilation or native
+platform qualification. Python and compression-library versions must be pinned
+for byte comparisons across toolchains. The environment timestamp is not added
+to the recipe or attested as build provenance: retain it with the build command
+and use the same value on fresh attempts. Existing output digests and the frozen
+completed package remain authoritative on resume.
+
+Run `bash scripts/tests/test_packaging_reproducible.sh` and
+`bash scripts/tests/test_packaging_prebuilt.sh`. The reproducibility suite builds
+independent tar.gz, tar.xz and ZIP files from differently ordered/timestamped
+source trees, checks archive metadata with independent readers, exercises
+invalid/boundary epochs, and verifies source preservation and failure atomicity.
+The prebuilt suite covers matching/missing/conflicting includes and byte/inode
+preservation. These are real local archive tests, not live release acceptance.
