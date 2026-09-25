@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install an explicitly selected executable set from an authenticated snapshot.
+# Install an explicitly selected executable set from local or fetched signed bytes.
 # One managed current symlink activates a complete generation; no payload runs.
 _RELEASE_INSTALL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
@@ -143,11 +143,12 @@ lockfd = None
 activated = False
 
 
-def helper(command, work):
+def helper(command, work, network=False):
     environment = os.environ.copy()
     for key in list(environment):
         if key.startswith("BASH_FUNC_") or key in ("BASH_ENV", "ENV", "TAR_OPTIONS", "GZIP", "XZ_OPT", "XZ_DEFAULTS",
-            "ZIPOPT", "UNZIP", "UNZIPOPT", "DSR_GH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+            "ZIPOPT", "UNZIP", "UNZIPOPT", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN") or (
+            not network and key in ("DSR_GH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")):
             environment.pop(key)
     environment.update(LC_ALL="C", TZ="UTC", COPYFILE_DISABLE="1")
     with (work / "helper.stderr").open("wb") as error:
@@ -212,8 +213,12 @@ try:
     class Parser(argparse.ArgumentParser):
         def error(self, message):
             raise Failure(message, 4)
-    parser = Parser(description="Install a complete executable set from signed local release bytes; no network or payload execution.", allow_abbrev=False)
-    for flag in ("snapshot", "recipe", "prefix", "repo", "tag", "sha", "builder", "targets", "public-key"):
+    parser = Parser(description="Authenticate and install a complete executable set; never execute payloads.", allow_abbrev=False)
+    origin = parser.add_mutually_exclusive_group(required=True)
+    origin.add_argument("--snapshot", help="Use a complete local snapshot without network access")
+    origin.add_argument("--fetch", action="store_true", help="Fetch an exact signed release into private staging before installation")
+    parser.add_argument("--allow-draft", action="store_true", help="With --fetch: permit an authenticated draft release")
+    for flag in ("recipe", "prefix", "repo", "tag", "sha", "builder", "targets", "public-key"):
         parser.add_argument("--" + flag, required=True)
     for flag in ("statement-sha256", "manifest-sha256", "invocation-id"):
         parser.add_argument("--" + flag)
@@ -224,12 +229,13 @@ try:
     need(len(flags) == len(set(flags)), "duplicate installation option", 4)
     args = parser.parse_args(sys.argv[2:])
     need(1 <= args.timeout <= 86400, "timeout must be 1..86400", 4)
-    snapshot = plain(args.snapshot, "dir")
+    need(not args.allow_draft or args.fetch, "--allow-draft requires --fetch", 4)
+    snapshot = None if args.fetch else plain(args.snapshot, "dir")
     recipe_file = plain(args.recipe, "file")
     public = plain(args.public_key, "file")
     prefix = plain(args.prefix)
     plain(prefix.parent, "dir")
-    for input_path in (snapshot, recipe_file, public):
+    for input_path in (recipe_file, public, *(() if snapshot is None else (snapshot,))):
         need(prefix != input_path and prefix not in input_path.parents and input_path not in prefix.parents,
              "installation prefix overlaps selected inputs", 4)
     selected = recipe(load(recipe_file, 1048576))
@@ -251,12 +257,37 @@ try:
             value = getattr(args, flag.replace("-", "_"))
             if value is not None:
                 policy += ["--" + flag, value]
+        fetched = None
+        if args.fetch:
+            snapshot = work / "snapshot"
+            output = helper(["bash", str(module / "slsa_remote.sh"), "fetch-release", "--output-dir", str(snapshot),
+                             "--public-key", str(work / "trusted.pub"), *policy], work, network=True)
+            fetched = json.loads(output, object_pairs_hook=pairs)
+            need(isinstance(fetched, dict) and fetched.get("kind") == "dsr-slsa-fetch" and
+                 fetched.get("status") == "verified" and fetched.get("authenticated") is True and
+                 fetched.get("snapshot") == str(snapshot) and isinstance(fetched.get("verification"), dict),
+                 "invalid authenticated download handoff")
+            observation = fetched["verification"]
+            need(observation.get("kind") == "dsr-slsa-remote-verification" and observation.get("authenticated") is True and
+                 observation.get("status") == "verified" and observation.get("tag_commit") == args.sha and
+                 isinstance(observation.get("repository"), dict) and observation["repository"].get("full_name") == args.repo and
+                 isinstance(observation.get("release"), dict) and observation["release"].get("tag_name") == args.tag and
+                 type(observation["release"].get("draft")) is bool, "download observation differs from selected release")
+            need(not observation["release"]["draft"] or args.allow_draft, "draft installation requires --allow-draft", 4)
+        # Reauthenticate the exact downloaded bytes, not a remote success field.
+        # From here onward no helper receives GitHub credentials or uses HTTP.
         output = helper(["bash", str(module / "slsa_remote.sh"), "verify-snapshot", str(snapshot),
                          "--public-key", str(work / "trusted.pub"), *policy], work)
         verified = json.loads(output, object_pairs_hook=pairs)
         need(isinstance(verified, dict) and verified.get("kind") == "dsr-slsa-snapshot-verification" and
              verified.get("authenticated") is True and verified.get("remote_current") is False and
              verified.get("snapshot") == str(snapshot), "invalid snapshot verification handoff")
+        if fetched is not None:
+            need(fetched.get("snapshot_sha256") == verified["snapshot_sha256"] and
+                 observation.get("statement", {}).get("sha256") == verified["statement_sha256"] and
+                 observation.get("signature", {}).get("sha256") == verified["signature_sha256"] and
+                 observation.get("build_manifest_sha256") == verified["build_manifest_sha256"] and
+                 observation.get("invocation_id") == verified["invocation_id"], "download and local authentication disagree")
         records = {a["name"]: a for a in verified["artifacts"]}
         for item in selected["executables"]:
             need(item["artifact"] in records and records[item["artifact"]]["target"] == selected["target"], "executable artifact is not a signed payload for this target", 4)
@@ -306,6 +337,12 @@ try:
                       bin_dir=str(prefix / "current/bin"), generation_bin_dir=str(prefix / "generations" / identity / "bin"),
                       executables=installed, snapshot_sha256=verified["snapshot_sha256"],
                       dry_run=args.dry_run)
+        if fetched is not None:
+            # The observation describes the just-completed fetch, not ongoing
+            # freshness. Exclude it from generation identity so offline reuse
+            # and a subsequent re-download select the same installed bytes.
+            result["download"] = dict(kind=fetched["kind"], snapshot_sha256=verified["snapshot_sha256"],
+                                      verification=observation)
         if not args.dry_run:
             lock_path = plain(str(prefix) + ".lock")
             lockfd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)

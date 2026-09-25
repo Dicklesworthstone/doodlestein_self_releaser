@@ -3,10 +3,58 @@
 `src/release_install.sh` installs explicitly selected executables from a signed
 [release snapshot](RELEASE_SNAPSHOTS.md). It authenticates the whole snapshot,
 extracts selected archive members, verifies a complete installation generation,
-and switches one managed `current` pointer. It does not download, publish, build,
+and switches one managed `current` pointer. It does not publish, build,
 run a downloaded executable, invoke an installation hook, or modify shell startup
 files. This is an explicit consumer command, not a silent change to the generated
 curl-bash installers or ordinary `dsr release` policy.
+
+## Download and install in one invocation
+
+Use `--fetch` instead of `--snapshot DIR` to fetch the exact selected signed
+release into private staging and install from those authenticated bytes:
+
+```bash
+bash src/release_install.sh --fetch \
+  --recipe /srv/policies/demo-install.json --prefix /home/alice/.local/demo \
+  --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
+  --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
+  --targets linux/amd64,darwin/arm64,windows/arm64
+```
+
+The same explicit source, signer, builder and complete target-matrix policy is
+required. Online mode runs the existing full `fetch-release` path, then performs
+the same offline snapshot authentication and generation installation used by
+`--snapshot`. The two receipts must agree on the exact snapshot, statement,
+signature, build-manifest and invocation identities. No second download selects
+different executable bytes after verification. The fetch needs the documented
+GitHub transport dependencies and credentials; it is read-only and never creates
+or promotes a release. There is no fallback to unsigned assets or source builds.
+
+Online installation requires a published release by default. Add `--allow-draft`
+to explicitly install an authenticated draft; this flag is valid only with
+`--fetch`. Draft rejection occurs after authentication but before archive
+extraction or installation-state changes. Prerelease tags remain explicit
+caller selections. Offline mode makes no current-publication claim and does not
+trust the historical download receipt to decide whether a release is public.
+
+`--dry-run --fetch` **does use the network** and authenticates/downloads the
+complete release, then extracts and verifies the installation generation without
+creating a prefix, lock or active pointer. Private fetch staging is cleaned on
+handled exits. `--timeout` also bounds the entire fetch helper, with the same
+owned-process cancellation and cleanup limits as verification/extraction. A
+failed fetch cannot alter the active generation.
+
+The result includes a `download` observation for online mode, without private
+temporary paths or credentials. `remote_current` remains `false`: an observation
+made during fetch is not a continuing promise that GitHub state has not changed.
+Re-downloading the same release or selecting an equivalent offline snapshot
+produces the same generation identity; transport receipts are not part of that
+identity. Every online retry fetches again rather than trusting a cached success.
+Use the separate `fetch-release` command to keep an offline snapshot permanently.
+
+Run `bash scripts/tests/test_release_install_fetch.sh` for the full fetch,
+offline authentication and installation handoff. GitHub transport and Minisign
+are explicit fixtures, not live HTTP or native cryptographic acceptance tests.
 
 ## Select the executables
 
