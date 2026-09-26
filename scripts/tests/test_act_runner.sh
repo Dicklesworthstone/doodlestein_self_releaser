@@ -561,8 +561,8 @@ test_workspace_archive_include_mode_large_listing() {
         log_fail "fixture listing too small to exercise SIGPIPE ($listing_bytes bytes)"
     fi
 
-    local ok=true run
-    for run in 1 2 3 4 5; do
+    local ok=true
+    for _ in 1 2 3 4 5; do
         _act_validate_workspace_archive_release_tree_includes \
             "$archive_gz" tar.gz "$config" "$repo" "$revision" || ok=false
         _act_validate_workspace_archive_release_tree_includes \
