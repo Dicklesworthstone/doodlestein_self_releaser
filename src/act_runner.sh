@@ -7572,6 +7572,18 @@ _act_build_orchestration_target() {
         fi
         result=$(jq -c --arg target "$target" --arg method "act" --arg host "$host" \
             '. + {platform: $target, method: $method, host: $host}' <<< "$result")
+        # A workflow that exits 0 but uploads nothing gives the release no
+        # binary; packaging would only warn and the build would still exit 0
+        # (bd-1ldf).  A missing count is treated as zero: fail closed.
+        if [[ "$exit_code" -eq 0 ]] && jq -e '
+               (.status == "success" or .status == "ok" or .status == "passed") and
+               ((.artifact_count // 0) | (type != "number" or . < 1))
+           ' <<< "$result" >/dev/null 2>&1; then
+            _log_error "act job '$job' for $target succeeded but produced no artifacts"
+            exit_code=6
+            result=$(jq -c '.status = "failed" | .exit_code = 6 |
+                .error = "act workflow completed without producing any artifacts"' <<< "$result")
+        fi
     else
         _log_info "Method: native (host=$host)"
         full_output=$(act_run_native_build \

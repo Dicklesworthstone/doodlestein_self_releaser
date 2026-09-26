@@ -1336,6 +1336,39 @@ else
     fail "ordinary native build received an incomplete strict identity"
 fi
 
+# bd-1ldf: an act job that exits 0 but collects no artifacts must fail the
+# target instead of letting packaging warn and the build exit 0.
+act_zero_artifact_check() {
+    local count_json="$1" status=0 output
+    output=$(
+        ACT_REPO_WORKFLOW=".github/workflows/release.yml" ACT_REPO_LOCAL_PATH="$TEMP_DIR"
+        act_platform_uses_act() { return 0; }
+        act_get_job_for_target() { printf 'build-linux\n'; }
+        act_get_flags() { :; }
+        act_run_workflow() {
+            jq -nc --argjson count "$count_json" \
+                '{status:"success",exit_code:0,artifact_count:$count}'
+        }
+        _act_build_orchestration_target testool v1.0.0 ordinary linux/amd64 false null '{}' \
+            2>/dev/null
+    ) || status=$?
+    printf '%s\t%s\n' "$status" "$output"
+}
+zero_artifact_result=$(act_zero_artifact_check 0)
+some_artifact_result=$(act_zero_artifact_check 2)
+missing_count_result=$(act_zero_artifact_check null)
+if [[ "${zero_artifact_result%%$'\t'*}" -eq 6 ]] &&
+   jq -e '.status == "failed" and .exit_code == 6 and (.error | test("without producing any artifacts"))' \
+       <<< "${zero_artifact_result#*$'\t'}" >/dev/null &&
+   [[ "${missing_count_result%%$'\t'*}" -eq 6 ]] &&
+   [[ "${some_artifact_result%%$'\t'*}" -eq 0 ]] &&
+   jq -e '.status == "success" and .artifact_count == 2 and .method == "act"' \
+       <<< "${some_artifact_result#*$'\t'}" >/dev/null; then
+    pass "act targets that collect zero artifacts fail closed"
+else
+    fail "act zero-artifact handling: zero=$zero_artifact_result some=$some_artifact_result missing=$missing_count_result"
+fi
+
 strict_method_sentinel="$TEMP_DIR/strict-method-drift-executed"
 strict_method_status=0
 strict_method_result=$(
