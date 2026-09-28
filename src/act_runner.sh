@@ -4345,14 +4345,18 @@ _act_sync_strict_checkout() {
             setup_command=$(_act_windows_storage_command "$host" "$setup_command") || return 4
         fi
         verify_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; & (Join-Path \$env:SystemRoot 'System32\\tar.exe') -xf '${win_remote_archive}' -C '${win_remote_path}'; if (\$LASTEXITCODE -ne 0) { exit 18 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 19 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant()")"
-        if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+        # stdin is closed on every transfer command: callers run this inside a
+        # `while read` loop over dependency checkouts, and an ssh that inherits
+        # the loop's stdin swallows the remaining entries, so only the first
+        # dependency reached a Windows host.
+        if ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$setup_command" || \
            ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$archive_path" \
-            "${ssh_destination}:${remote_archive}" || \
-           ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+            "${ssh_destination}:${remote_archive}" </dev/null || \
+           ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$verify_command"); then
             _log_error "Strict fresh Windows source sync failed for $label"
@@ -4634,7 +4638,7 @@ _act_verify_strict_source_roots() {
             dependency_local=$(jq -r '.local_path' <<< "$dependency")
             dependency_sha=$(jq -r '.git_sha' <<< "$dependency")
             if ! _act_verify_strict_checkout_snapshot "$host" "$dependency_local" "$dependency_sha" \
-                "${source_root%/source}/$relative_path" "dependency-${relative_path}.tar" "$relative_path"; then
+                "${source_root%/source}/$relative_path" "dependency-${relative_path}.tar" "$relative_path" </dev/null; then
                 return 4
             fi
         done < <(jq -c '.[]' <<< "$dependency_checkouts")
@@ -4996,7 +5000,7 @@ act_sync_sources() {
                     dependency_sha=$(jq -r '.git_sha' <<< "$dependency")
                     dependency_sync_output=$(_act_sync_strict_checkout "$host" "$dependency_local" "$dependency_sha" \
                         "${remote_path%/source}/$relative_path" \
-                        "dependency-${relative_path}.tar" "$relative_path" 2>&1)
+                        "dependency-${relative_path}.tar" "$relative_path" 2>&1 </dev/null)
                     dependency_sync_status=$?
                     [[ -n "$dependency_sync_output" ]] && printf '%s\n' "$dependency_sync_output" >&2
                     if [[ "$dependency_sync_status" -ne 0 ]]; then
