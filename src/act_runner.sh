@@ -2888,8 +2888,45 @@ _act_linux_glibc_floor() {
     printf '%s\n' "$floor"
 }
 
-# The cargo shim placed first on PATH by ordinary (non-strict) Linux Rust
-# builds when the glibc floor is active. `cargo build` becomes `cargo
+# The floor a collected Linux Rust artifact is held to after the build.
+# Where dsr routes `cargo build` through its shim this is the applied floor.
+# Where the repo's own build_cmd (zigbuild/cross) or a configured cross
+# toolchain owns the libc baseline, dsr applies nothing, but an EXPLICITLY
+# configured floor is still a release contract and is enforced on the bytes.
+# Prints nothing when no floor applies; rc 4 on an invalid value.
+_act_linux_glibc_floor_enforced() {
+    local tool_name="$1"
+    local platform="$2"
+    local config_file="$3"
+    local build_env="$4"
+    local build_cmd="$5"
+    local floor rc=0
+
+    floor=$(_act_linux_glibc_floor "$tool_name" "$platform" "$config_file" \
+        "$build_env" "$build_cmd") || rc=$?
+    [[ $rc -eq 4 ]] && return 4
+    if [[ -n "$floor" ]]; then
+        printf '%s\n' "$floor"
+        return 0
+    fi
+
+    case "$platform" in linux/*) ;; *) return 0 ;; esac
+    local triple
+    triple=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET" 2>/dev/null || true)
+    case "$triple" in *-linux-gnu) ;; *) return 0 ;; esac
+    floor="${DSR_LINUX_GLIBC_FLOOR:-}"
+    if [[ -z "$floor" ]]; then
+        floor=$(yq -r ".cross_compile.\"$platform\".linux_glibc_floor // .linux_glibc_floor // \"\"" \
+            "$config_file" 2>/dev/null)
+        [[ "$floor" == "null" ]] && floor=""
+    fi
+    # _act_linux_glibc_floor already rejected malformed values.
+    [[ -n "$floor" && "$floor" != "native" ]] || return 0
+    printf '%s\n' "$floor"
+}
+
+# The cargo shim placed first on PATH by Linux Rust builds (ordinary and
+# strict) when the glibc floor is active. `cargo build` becomes `cargo
 # zigbuild --target <triple>.<floor>`; every other cargo invocation passes
 # through untouched. Requires cargo-zigbuild >= 0.23.0 on the build host —
 # older releases hand rustc's aarch64 `--fix-cortex-a53-843419` erratum flag
@@ -3051,15 +3088,24 @@ _act_accept_collected_binary() {
         return 1
     fi
 
-    if [[ -n "$glibc_floor" ]]; then
-        local max_glibc
-        max_glibc=$(_act_max_glibc_version "$path" || true)
-        if [[ -n "$max_glibc" ]] && ! _act_glibc_version_le "$max_glibc" "$glibc_floor"; then
-            _log_error "Collected artifact needs GLIBC_$max_glibc, above the configured floor $glibc_floor: $path (the portable-build path was bypassed; see linux_glibc_floor in the repo config)"
-            return 1
-        fi
-    fi
+    _act_collected_glibc_within_floor "$path" "$glibc_floor"
+}
 
+# A Linux artifact must not need a newer glibc than its floor (issue #9 — a
+# floor that silently rises with the build host is exactly the defect the
+# floor exists to stop). Shared by ordinary and strict collection. An empty
+# floor, or a static/non-glibc binary, always passes.
+_act_collected_glibc_within_floor() {
+    local path="$1"
+    local glibc_floor="${2:-}"
+    [[ -n "$glibc_floor" ]] || return 0
+
+    local max_glibc
+    max_glibc=$(_act_max_glibc_version "$path" || true)
+    if [[ -n "$max_glibc" ]] && ! _act_glibc_version_le "$max_glibc" "$glibc_floor"; then
+        _log_error "Collected artifact needs GLIBC_$max_glibc, above the glibc floor $glibc_floor: $path. Refusing to ship a binary that will not start on older distributions. A plain \`cargo build\` is routed through \`cargo zigbuild --target <triple>.$glibc_floor\` automatically; a build_cmd or cross linker that owns its toolchain must honor the floor itself. Set linux_glibc_floor: native in the repo config only to accept the build host's glibc deliberately."
+        return 1
+    fi
     return 0
 }
 
@@ -4397,15 +4443,16 @@ _act_sync_strict_checkout() {
         reparse_guard=$(_act_windows_reparse_guard_script)
         manifest_preflight_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; if (Test-Path -LiteralPath '${win_remote_manifest}') { exit 20 }")"
         manifest_verify_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant()")"
-        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+        # stdin closed for the same reason as the archive transfer above.
+        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" \
             "$manifest_preflight_command" || return 4
         _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$manifest_path" \
-            "${ssh_destination}:${remote_manifest}" || return 4
-        remote_manifest_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+            "${ssh_destination}:${remote_manifest}" </dev/null || return 4
+        remote_manifest_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" \
             "$manifest_verify_command") || return 4
@@ -4628,8 +4675,11 @@ _act_verify_strict_source_roots() {
 
     while IFS=$'\t' read -r host source_root; do
         [[ -n "$host" && -n "$source_root" ]] || continue
+        # stdin closed like the dependency calls below: this runs inside the
+        # host `while read` loop, and a transfer that reads stdin would drain
+        # it and silently skip verifying every later host.
         if ! _act_verify_strict_checkout_snapshot "$host" "$ACT_REPO_LOCAL_PATH" \
-            "$source_revision" "$source_root" "source.tar" "$tool_name"; then
+            "$source_revision" "$source_root" "source.tar" "$tool_name" </dev/null; then
             return 4
         fi
         while IFS= read -r dependency; do
@@ -5322,6 +5372,7 @@ _act_is_rust_build_influence_name() {
     [[ "$normalized_name" =~ $sdk_regex ]] && return 0
     case "$normalized_name" in
         CARGO_*|RUST*|XWIN_*|TEMP|TMP|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
+        DSR_RUST_TARGET|DSR_ZIG_TARGET|DSR_LINUX_GLIBC_FLOOR|\
         FT_ATOMIC_BUILD_IDENTITY|FT_ATOMIC_BUILD_PROFILE|\
         CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
         CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|\
@@ -5920,6 +5971,36 @@ PY
 # Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
 #        [remote_path_override] [release_git_sha] [release_git_ref] [bound_host]
 # Returns: JSON result with status, exit_code, artifact info
+# Remove a per-target build stage root (dsr-build-*) on its host. rm -rf /
+# rmdir do not follow the cargo cache symlinks/junctions inside. Honors
+# DSR_KEEP_BUILD_STAGES=1 for post-mortems; never fails the build.
+_act_remove_build_stage_root() {
+    local host="$1"
+    local stage_root="${2:-}"
+
+    [[ -n "$stage_root" && "$stage_root" == */dsr-build-* ]] || return 0
+    if [[ "${DSR_KEEP_BUILD_STAGES:-0}" == "1" ]]; then
+        _log_info "Retaining build stage root $stage_root on $host (DSR_KEEP_BUILD_STAGES=1)"
+        return 0
+    fi
+    local cleanup_ok=true
+    if _act_is_windows_host "$host"; then
+        local win_cleanup_path
+        win_cleanup_path=$(_act_windows_cmd_path "$stage_root")
+        _act_ssh_exec "$host" \
+            "$(_act_windows_cmd_via_powershell "if exist \"$win_cleanup_path\" rmdir /s /q \"$win_cleanup_path\"")" \
+            120 >/dev/null 2>&1 || cleanup_ok=false
+    else
+        _act_ssh_exec "$host" \
+            "rm -rf '${stage_root//\'/\'\\\'\'}'" \
+            120 >/dev/null 2>&1 || cleanup_ok=false
+    fi
+    if ! $cleanup_ok; then
+        _log_warn "Could not remove build stage root $stage_root on $host"
+    fi
+    return 0
+}
+
 act_run_native_build() {
     local tool_name="$1"
     local platform="$2"
@@ -5980,6 +6061,42 @@ act_run_native_build() {
 
     local language
     language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
+
+    # Portable glibc floor for Linux Rust builds, ordinary AND strict (issue
+    # #9: a strict focr release once shipped needing GLIBC_2.39 because this
+    # gate skipped strict builds). Decided before any environment is frozen
+    # into cache contracts or receipts, applied on the build host through a
+    # cargo shim that turns `cargo build` into `cargo zigbuild --target
+    # <triple>.<floor>`, and enforced on the collected bytes. The applied
+    # floor and the enforced floor differ only when the repo's own build_cmd
+    # or cross toolchain owns the libc baseline: dsr then applies nothing but
+    # still enforces an explicitly configured floor.
+    local rust_glibc_floor="" rust_glibc_floor_enforced="" rust_zig_target="" rust_floor_triple=""
+    if [[ "$language" == "rust" && "$platform" == linux/* ]] && \
+       ! _act_is_windows_host "$host"; then
+        local floor_rc=0
+        rust_glibc_floor=$(_act_linux_glibc_floor "$tool_name" "$platform" "$config_file" \
+            "$build_env" "$build_cmd") || floor_rc=$?
+        if [[ "$floor_rc" -ne 4 ]]; then
+            rust_glibc_floor_enforced=$(_act_linux_glibc_floor_enforced "$tool_name" "$platform" \
+                "$config_file" "$build_env" "$build_cmd") || floor_rc=$?
+        fi
+        if [[ "$floor_rc" -eq 4 ]]; then
+            jq -nc '{status: "error", exit_code: 4, error: "Invalid linux_glibc_floor configuration"}'
+            return 4
+        fi
+        if [[ -n "$rust_glibc_floor" ]]; then
+            rust_floor_triple=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET")
+            rust_zig_target="${rust_floor_triple}.${rust_glibc_floor}"
+            build_env+=$'\n'"DSR_RUST_TARGET=$rust_floor_triple"
+            build_env+=$'\n'"DSR_ZIG_TARGET=$rust_zig_target"
+            build_env+=$'\n'"DSR_LINUX_GLIBC_FLOOR=$rust_glibc_floor"
+            _log_info "Linux glibc floor $rust_glibc_floor active for $platform (cargo build -> cargo zigbuild --target $rust_zig_target)"
+        elif [[ -n "$rust_glibc_floor_enforced" ]]; then
+            _log_info "Linux glibc floor $rust_glibc_floor_enforced enforced for $platform (the build command owns its toolchain)"
+        fi
+    fi
+
     local strict_cache_root strict_cache_contract=''
     strict_cache_root=$(yq -r '.strict_cargo_cache_root // ""' "$config_file" 2>/dev/null) || return 4
     if [[ -n "$strict_cache_root" ]]; then
@@ -6005,31 +6122,6 @@ act_run_native_build() {
     build_host_platform=$(_act_get_host_platform "$host" 2>/dev/null || true)
     if [[ -n "$build_host_platform" && "$build_host_platform" != "$platform" ]]; then
         _log_info "Target $platform is cross for host $host ($build_host_platform); requiring explicit target output"
-    fi
-
-    # Portable glibc floor for ordinary Linux Rust builds (issue #9). Decided
-    # here, applied on the build host through a cargo shim staged with the
-    # isolated source copy, and asserted after artifact collection. Strict
-    # release-contract builds are exempt (their build_cmds own their target
-    # handling and their pipeline is receipt-verified end to end).
-    local rust_glibc_floor="" rust_zig_target="" rust_floor_triple=""
-    if [[ "$language" == "rust" && "$platform" == linux/* && -z "$remote_path_override" ]] && \
-       ! _act_is_windows_host "$host"; then
-        local floor_rc=0
-        rust_glibc_floor=$(_act_linux_glibc_floor "$tool_name" "$platform" "$config_file" \
-            "$build_env" "$build_cmd") || floor_rc=$?
-        if [[ "$floor_rc" -eq 4 ]]; then
-            jq -nc '{status: "error", exit_code: 4, error: "Invalid linux_glibc_floor configuration"}'
-            return 4
-        fi
-        if [[ -n "$rust_glibc_floor" ]]; then
-            rust_floor_triple=$(act_get_build_env_value "$build_env" "CARGO_BUILD_TARGET")
-            rust_zig_target="${rust_floor_triple}.${rust_glibc_floor}"
-            build_env+=$'\n'"DSR_RUST_TARGET=$rust_floor_triple"
-            build_env+=$'\n'"DSR_ZIG_TARGET=$rust_zig_target"
-            build_env+=$'\n'"DSR_LINUX_GLIBC_FLOOR=$rust_glibc_floor"
-            _log_info "Linux glibc floor $rust_glibc_floor active for $platform (cargo build -> cargo zigbuild --target $rust_zig_target)"
-        fi
     fi
 
     # Check for workspace_binaries (multi-binary Rust workspaces)
@@ -6416,6 +6508,41 @@ act_run_native_build() {
         ') || return 4
     fi
 
+    # Per-target output stage. Ordinary non-Rust builds run in place, so a
+    # build_cmd like `go build -o ntm ./cmd/ntm` writes <source>/ntm for EVERY
+    # target; with --parallel, two targets on one host overwrite that file and
+    # one collects the other's binary (ntm 1.36.0: an amd64 build was about to
+    # ship as linux/arm64). When the orchestrator detects such a shared output
+    # (DSR_NATIVE_OUTPUT_STAGE=1), this target builds in its own copy of the
+    # source, so every in-tree output path is private to it. Rust needs no
+    # stage: its outputs are scoped by target triple and isolated above.
+    # Strict snapshots and Windows hosts are serialized by the orchestrator.
+    local output_stage_root="" output_stage_source="" output_stage_parent=""
+    if [[ "${DSR_NATIVE_OUTPUT_STAGE:-}" == 1 && "$language" != rust && \
+          -z "$remote_path_override" ]] && ! _act_is_windows_host "$host"; then
+        local output_stage_uuid output_stage_build_root="" output_stage_build_root_rc=0
+        output_stage_build_root=$(_act_get_host_build_root "$host") || output_stage_build_root_rc=$?
+        if [[ "$output_stage_build_root_rc" -eq 4 ]]; then
+            jq -nc '{status: "error", exit_code: 4, error: "Invalid hosts.yaml build_root"}'
+            return 4
+        fi
+        # /var/tmp, not /tmp: it exists on Linux and macOS and is not the
+        # RAM-backed tmpfs Linux often mounts at /tmp.
+        output_stage_parent="${output_stage_build_root:-/var/tmp}"
+        if [[ ! "$tool_name" =~ ^[A-Za-z0-9_.-]+$ || \
+              ! "${platform//\//-}" =~ ^[A-Za-z0-9_.-]+$ || \
+              "$output_stage_parent" != /* || "$output_stage_parent" == *$'\n'* ]] || \
+           ! output_stage_uuid=$(_act_generate_uuid); then
+            _log_error "Unable to derive a unique per-target output stage"
+            jq -nc '{status: "error", exit_code: 4, error: "Invalid output stage identity"}'
+            return 4
+        fi
+        output_stage_root="${output_stage_parent%/}/dsr-build-${tool_name}-${platform//\//-}-${output_stage_uuid//-/}"
+        output_stage_source="$output_stage_root/source"
+    fi
+    # Where in-tree outputs of this build land (collection reads from here).
+    local artifact_source_root="${output_stage_source:-$remote_path}"
+
     # Prepare log file
     local log_dir log_file
     log_dir="$ACT_LOGS_DIR"
@@ -6617,14 +6744,38 @@ act_run_native_build() {
             cargo_home_prefix="${isolation_root_guard}_dsr_src='$rp_q'; _dsr_ancestor=\${_dsr_src%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do if test -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\" || test -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; then printf '[dsr] excluding inherited Cargo config: %s\\n' \"\$_dsr_ancestor/.cargo/\$_dsr_name\" >&2; fi; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; _dsr_ancestor='${nonstrict_stage_root%/*}'; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do test ! -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; test ! -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; test ! -e '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_stage_root}'; test -d '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_source_root}' '${nonstrict_cargo_home}'; ${sibling_copy_prefix}for _dsr_name in registry; do if test -d \"\$HOME/.cargo/\$_dsr_name\"; then ln -s \"\$HOME/.cargo/\$_dsr_name\" '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; fi; done; for _dsr_name in config config.toml credentials credentials.toml; do test ! -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; done; cp -R \"\$_dsr_src/.\" '${nonstrict_source_root}/'; if test -e '${nonstrict_source_root}/.git' || test -L '${nonstrict_source_root}/.git'; then git -C '${nonstrict_source_root}' status --porcelain --untracked-files=no >/dev/null; fi; export CARGO_HOME='${nonstrict_cargo_home}'; "
             cd_cmd="cd '${nonstrict_source_root}'"
         fi
+        if [[ -n "$output_stage_root" ]]; then
+            # Copy the tree (including .git, which version stamps such as
+            # `git rev-parse HEAD` read) into this target's private stage and
+            # build there. The index refresh keeps `git describe --dirty`
+            # from reporting the copy's new inode metadata as modifications.
+            local stage_parent_q="${output_stage_parent//\'/\'\\\'\'}"
+            local stage_root_q="${output_stage_root//\'/\'\\\'\'}"
+            local stage_source_q="${output_stage_source//\'/\'\\\'\'}"
+            cargo_home_prefix="mkdir -p '${stage_parent_q}'; $(_act_ram_backed_guard_sh "$output_stage_parent")test -d '$rp_q'; test ! -e '${stage_root_q}'; test ! -L '${stage_root_q}'; mkdir '${stage_root_q}' '${stage_source_q}'; cp -R '$rp_q/.' '${stage_source_q}/'; if test -e '${stage_source_q}/.git' || test -L '${stage_source_q}/.git'; then git -C '${stage_source_q}' status --porcelain --untracked-files=no >/dev/null; fi; "
+            cd_cmd="cd '${stage_source_q}'"
+            _log_info "Building $platform in private output stage $output_stage_source (shared in-tree output on $host)"
+        fi
         # Stage the glibc-floor cargo shim beside the isolated source copy and
         # put it first on PATH, so a plain `cargo build` in the repo's
         # build_cmd is routed through cargo-zigbuild with the versioned
         # target (issue #9). `.dsr-bin` cannot collide with a sibling crate:
         # sibling names may not start with a dot.
-        if [[ -n "$rust_zig_target" ]] && $nonstrict_rust_isolate; then
-            cargo_home_prefix+=$(_act_zig_shim_prefix_sh "${nonstrict_stage_root}/.dsr-bin")
-            env_exports+="export PATH='${nonstrict_stage_root}/.dsr-bin':\"\$PATH\"; "
+        # A strict build must leave its source snapshot byte-identical, so its
+        # shim lives in the snapshot parent beside .cargo-home and the
+        # per-platform target directories, named per platform so concurrent
+        # targets of one snapshot never share (or race on) a shim.
+        if [[ -n "$rust_zig_target" ]]; then
+            local zig_shim_dir=""
+            if $nonstrict_rust_isolate; then
+                zig_shim_dir="${nonstrict_stage_root}/.dsr-bin"
+            elif $strict_rust_build; then
+                zig_shim_dir="${remote_path%/*}/.dsr-bin-${platform//\//-}"
+            fi
+            if [[ -n "$zig_shim_dir" ]]; then
+                cargo_home_prefix+=$(_act_zig_shim_prefix_sh "$zig_shim_dir")
+                env_exports+="export PATH='${zig_shim_dir}':\"\$PATH\"; "
+            fi
         fi
         if [[ -n "$strict_cache_root" ]]; then
             local cached_build
@@ -6686,26 +6837,9 @@ act_run_native_build() {
     # outcome — success, failure, and especially a timeout kill, which never
     # reaches any in-command cleanup — or multi-GB staging copies accumulate
     # until the temp filesystem fills and later targets die with ENOSPC.
-    # rm -rf / rmdir do not follow the cargo cache symlinks/junctions inside.
-    if [[ "${DSR_KEEP_BUILD_STAGES:-0}" == "1" && -n "$nonstrict_stage_root" ]]; then
-        _log_info "Retaining build stage root $nonstrict_stage_root on $host (DSR_KEEP_BUILD_STAGES=1)"
-    elif [[ -n "$nonstrict_stage_root" && "$nonstrict_stage_root" == */dsr-build-* ]]; then
-        local cleanup_ok=true
-        if _act_is_windows_host "$host"; then
-            local win_cleanup_path
-            win_cleanup_path=$(_act_windows_cmd_path "$nonstrict_stage_root")
-            _act_ssh_exec "$host" \
-                "$(_act_windows_cmd_via_powershell "if exist \"$win_cleanup_path\" rmdir /s /q \"$win_cleanup_path\"")" \
-                120 >/dev/null 2>&1 || cleanup_ok=false
-        else
-            _act_ssh_exec "$host" \
-                "rm -rf '${nonstrict_stage_root//\'/\'\\\'\'}'" \
-                120 >/dev/null 2>&1 || cleanup_ok=false
-        fi
-        if ! $cleanup_ok; then
-            _log_warn "Could not remove build stage root $nonstrict_stage_root on $host"
-        fi
-    fi
+    # An output stage (per-target source copy for in-tree outputs, below)
+    # holds the artifacts themselves, so it is removed only after collection.
+    _act_remove_build_stage_root "$host" "$nonstrict_stage_root"
 
     local end_time duration
     end_time=$(date +%s)
@@ -6754,6 +6888,7 @@ act_run_native_build() {
             binaries_to_download=("$binary_name")
         else
             _log_error "No binary_name or workspace_binaries configured"
+            _act_remove_build_stage_root "$host" "$output_stage_root"
             jq -nc '{status: "error", exit_code: 4, error: "No binaries configured"}'
             return 4
         fi
@@ -6761,6 +6896,7 @@ act_run_native_build() {
         # Sanity check: ensure we have binaries to download
         if [[ ${#binaries_to_download[@]} -eq 0 ]]; then
             _log_error "No binaries to download (workspace_binaries may be empty)"
+            _act_remove_build_stage_root "$host" "$output_stage_root"
             jq -nc '{status: "error", exit_code: 4, error: "No binaries to download"}'
             return 4
         fi
@@ -6768,7 +6904,7 @@ act_run_native_build() {
         local download_failed=false
         for bin in "${binaries_to_download[@]}"; do
             local remote_artifact_path
-            remote_artifact_path=$(act_get_remote_artifact_path "$language" "$remote_path" "$build_env" "$bin" "$platform" "$build_profile")
+            remote_artifact_path=$(act_get_remote_artifact_path "$language" "$artifact_source_root" "$build_env" "$bin" "$platform" "$build_profile")
 
             local artifact_filename
             artifact_filename=$(basename "$remote_artifact_path")
@@ -6834,8 +6970,13 @@ act_run_native_build() {
                           (.identity | test("^(gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)$"))' \
                        <<< "$collection_receipt" >/dev/null 2>&1; then
                     _log_ok "Artifact collected through held descriptor: $this_artifact_path"
-                    local_artifact_paths+=("$this_artifact_path")
-                    strict_collection_receipts+=("$collection_receipt")
+                    if _act_collected_glibc_within_floor "$this_artifact_path" "$rust_glibc_floor_enforced"; then
+                        local_artifact_paths+=("$this_artifact_path")
+                        strict_collection_receipts+=("$collection_receipt")
+                    else
+                        echo "Collected artifact exceeds glibc floor $rust_glibc_floor_enforced: $this_artifact_path" >> "$log_file"
+                        download_failed=true
+                    fi
                 else
                     _log_error "Failed to collect artifact $bin from $host"
                     echo "Strict stream collection failed for $bin: $remote_artifact_path" >> "$log_file"
@@ -6870,7 +7011,7 @@ act_run_native_build() {
                         file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
                         _log_info "Artifact size: $file_size bytes"
                     fi
-                    if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor"; then
+                    if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                         local_artifact_paths+=("$this_artifact_path")
                     else
                         echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
@@ -6891,7 +7032,7 @@ act_run_native_build() {
                     file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
                     _log_info "Artifact size: $file_size bytes"
                 fi
-                if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor"; then
+                if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                     local_artifact_paths+=("$this_artifact_path")
                 else
                     echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
@@ -6918,7 +7059,7 @@ act_run_native_build() {
                             file_size=$(stat -f%z "$this_artifact_path" 2>/dev/null || stat -c%s "$this_artifact_path" 2>/dev/null || echo "unknown")
                             _log_info "Artifact size: $file_size bytes"
                         fi
-                        if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor"; then
+                        if _act_accept_collected_binary "$this_artifact_path" "$platform" "$language" "$rust_glibc_floor_enforced"; then
                             local_artifact_paths+=("$this_artifact_path")
                         else
                             echo "Collected artifact failed $platform validation: $this_artifact_path" >> "$log_file"
@@ -6999,7 +7140,7 @@ act_run_native_build() {
                 continue
             fi
             archive_file_remote=$(act_get_remote_artifact_path \
-                "$language" "$remote_path" "$build_env" "$archive_file" \
+                "$language" "$artifact_source_root" "$build_env" "$archive_file" \
                 "$platform" "$build_profile")
             archive_file_local="$artifact_dir/$archive_file"
             archive_file_mode=600
@@ -7069,7 +7210,7 @@ act_run_native_build() {
                 continue
             fi
             additional_remote=$(act_get_remote_artifact_path \
-                "$language" "$remote_path" "$build_env" "$additional_name" \
+                "$language" "$artifact_source_root" "$build_env" "$additional_name" \
                 "$platform" "$build_profile")
             additional_local="$artifact_dir/$additional_name"
             additional_receipt=""
@@ -7114,6 +7255,11 @@ act_run_native_build() {
         done < <(jq -r '.[]' <<< "$additional_json")
 
         # Set final status and artifact path(s)
+        # Every remote output has been copied home; a staged build's private
+        # source copy is no longer needed by anything below.
+        _act_remove_build_stage_root "$host" "$output_stage_root"
+        output_stage_root=""
+
         if [[ "$download_failed" == true ]]; then
             if $strict_native_build || [[ ${#local_artifact_paths[@]} -eq 0 ]]; then
                 status="failed"
@@ -7344,6 +7490,9 @@ act_run_native_build() {
         status="failed"
         exit_code=6
     fi
+
+    # A failed or timed-out staged build never reached collection.
+    _act_remove_build_stage_root "$host" "$output_stage_root"
 
     # Return JSON result (pointing to LOCAL artifact path)
     # Build artifact_paths array from comma-separated string
@@ -7641,6 +7790,50 @@ _act_build_orchestration_target() {
     return "$exit_code"
 }
 
+# Output files a native target's build writes on its host, one
+# "<in-tree|external><TAB><path>" line per binary, so the orchestrator can keep
+# --parallel targets from overwriting each other's binaries. A path is
+# in-tree when it lies under the build's source root (a per-target source
+# copy then makes it private). A trailing .exe is dropped: Go's `-o name`
+# never appends it, so windows and unix targets can share one file. Rust
+# targets print nothing (Cargo scopes outputs by target triple), as do act
+# targets and unreadable configs (the build itself reports those).
+_act_native_output_paths() {
+    local tool_name="$1" target="$2" host="$3" strict="$4" source_roots_json="$5"
+    local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+    local language remote_path build_env build_profile binaries bin path
+
+    [[ -f "$config_file" ]] || return 0
+    act_platform_uses_act "$tool_name" "$target" && return 0
+    language=$(yq -r '.language // ""' "$config_file" 2>/dev/null) || return 0
+    [[ "$language" == rust ]] && return 0
+    if [[ "$strict" == true ]]; then
+        remote_path=$(jq -r --arg host "$host" '.[$host] // ""' <<< "$source_roots_json" 2>/dev/null) || return 0
+    else
+        remote_path=$(DSR_OUTPUT_HOST="$host" yq -r '.host_paths[strenv(DSR_OUTPUT_HOST)] // ""' \
+            "$config_file" 2>/dev/null) || remote_path=""
+        [[ "$remote_path" == null ]] && remote_path=""
+        [[ -n "$remote_path" ]] || remote_path=$(act_get_local_path "$tool_name" 2>/dev/null) || return 0
+    fi
+    remote_path="${remote_path%/}"
+    [[ -n "$remote_path" ]] || return 0
+    build_env=$(act_get_build_env "$tool_name" "$target" 2>/dev/null) || return 0
+    build_profile=$(yq -r '.build_profile // "release"' "$config_file" 2>/dev/null) || return 0
+    binaries=$(_act_workspace_binaries_for_target "$config_file" "$target" 2>/dev/null) || return 0
+    [[ -n "$binaries" ]] || binaries=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null) || return 0
+    while IFS= read -r bin; do
+        [[ -n "$bin" && "$bin" != null ]] || continue
+        path=$(act_get_remote_artifact_path "$language" "$remote_path" "$build_env" \
+            "$bin" "$target" "$build_profile") || continue
+        path="${path%.exe}"
+        if [[ "$path" == "$remote_path"/* ]]; then
+            printf 'in-tree\t%s\n' "$path"
+        else
+            printf 'external\t%s\n' "$path"
+        fi
+    done <<< "$binaries"
+}
+
 # Worker wrapper: reserve host capacity and write immutable attempt receipts.
 _act_run_target_worker() {
     local tool_name="$1" version="$2" run_id="$3" target="$4"
@@ -7695,11 +7888,27 @@ _act_run_target_worker() {
     fi
 
     if declare -F selector_acquire_slot &>/dev/null; then
-        if ! selector_acquire_slot "$host" "$slot_id" --wait; then
-            local slot_failure
-            slot_failure=$(jq -nc --arg target "$target" --arg host "$host" \
+        # A target whose host is at its concurrency limit queues for a slot
+        # rather than failing: its budget is one build timeout (the longest a
+        # running peer may legitimately hold the slot), unless the operator
+        # set DSR_SELECTOR_WAIT_TIMEOUT. The selector caps budgets at 99999s.
+        local slot_wait_budget="${DSR_SELECTOR_WAIT_TIMEOUT:-${_ACT_BUILD_TIMEOUT:-3600}}"
+        if [[ "$slot_wait_budget" =~ ^[0-9]+$ ]] && ((${#slot_wait_budget} > 5)); then
+            slot_wait_budget=99999
+        fi
+        local slot_status=0 slot_wait_started=$SECONDS
+        DSR_SELECTOR_WAIT_TIMEOUT="$slot_wait_budget" \
+            selector_acquire_slot "$host" "$slot_id" --wait || slot_status=$?
+        if [[ $slot_status -ne 0 ]]; then
+            local slot_failure slot_error
+            if [[ $slot_status -eq 2 ]]; then
+                slot_error="Host capacity acquisition failed: no build slot on $host after waiting $((SECONDS - slot_wait_started))s (budget ${slot_wait_budget}s; raise hosts.yaml concurrency, move the target to another host, or set DSR_SELECTOR_WAIT_TIMEOUT)"
+            else
+                slot_error="Host capacity acquisition failed on $host (selector status $slot_status)"
+            fi
+            slot_failure=$(jq -nc --arg target "$target" --arg host "$host" --arg error "$slot_error" \
                 '{platform: $target, host: $host, status: "failed", exit_code: 2,
-                  error: "Host capacity acquisition failed"}')
+                  error: $error}')
             _act_write_worker_result "$slot_failure" || return 4
             return 2
         fi
@@ -8391,8 +8600,29 @@ act_orchestrate_build() {
     local start_time target_index=0
     start_time=$(date +%s)
     local -a worker_pids=() worker_targets=() worker_results=() worker_logs=() worker_hosts=() worker_attempts=()
+    local -a worker_output_paths=()
     local active_workers=0
     declare -A final_results=() worker_reaped=()
+
+    # Print the first still-running target on <host> that writes any of the
+    # output paths in <paths> (lines from _act_native_output_paths).
+    _act_active_output_conflict() {
+        local conflict_host="$1" conflict_paths="$2" conflict_index path
+        [[ -n "$conflict_paths" ]] || return 0
+        for ((conflict_index = 0; conflict_index < ${#worker_pids[@]}; conflict_index++)); do
+            [[ -z "${worker_reaped[$conflict_index]:-}" ]] || continue
+            [[ "${worker_hosts[$conflict_index]}" == "$conflict_host" ]] || continue
+            [[ -n "${worker_output_paths[$conflict_index]}" ]] || continue
+            while IFS= read -r path; do
+                [[ -n "$path" ]] || continue
+                if grep -Fxq -- "${path#*$'\t'}" <<< "$(cut -f2- <<< "${worker_output_paths[$conflict_index]}")"; then
+                    printf '%s\n' "${worker_targets[$conflict_index]}"
+                    return 0
+                fi
+            done <<< "$conflict_paths"
+        done
+        return 0
+    }
 
     _act_record_worker_result() {
         local index="$1" worker_status="$2"
@@ -8570,6 +8800,32 @@ act_orchestrate_build() {
             host=$(act_get_native_host "$target" "$tool_name")
         fi
 
+        # Two concurrent targets on one host whose builds write the same file
+        # (`go build -o ntm` in one source tree) would collect each other's
+        # binaries. Give this target a private source copy when that makes
+        # the shared path its own; otherwise (strict snapshots, Windows hosts,
+        # outputs outside the tree) wait until the conflicting build is done.
+        local output_paths="" output_stage=0 output_conflict=""
+        if (( parallel_jobs > 1 )); then
+            output_paths=$(_act_native_output_paths "$tool_name" "$target" "$host" \
+                "$strict_release_contract" "$source_roots_json")
+            output_conflict=$(_act_active_output_conflict "$host" "$output_paths")
+            if [[ -n "$output_conflict" ]]; then
+                if ! $strict_release_contract && ! _act_is_windows_host "$host" && \
+                   ! grep -q '^external' <<< "$output_paths"; then
+                    output_stage=1
+                    output_paths=""
+                    _log_info "Target $target shares its output path on $host with $output_conflict; building it in a private source copy"
+                else
+                    _log_info "Target $target shares its output path on $host with $output_conflict; waiting for that build to finish"
+                    while [[ -n "$(_act_active_output_conflict "$host" "$output_paths")" ]]; do
+                        _act_reap_one_worker || { interrupted=true; break; }
+                    done
+                    $interrupted && break
+                fi
+            fi
+        fi
+
         if $state_available; then
             if ! build_state_update_target "$tool_name" "$version" "$target" "running" \
                 "$(jq -nc --arg host "$host" --arg log_path "$log_path" \
@@ -8584,10 +8840,12 @@ act_orchestrate_build() {
             fi
         fi
 
+        DSR_NATIVE_OUTPUT_STAGE="$output_stage" \
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" &
         worker_pids+=("$!")
+        worker_output_paths+=("$output_paths")
         worker_targets+=("$target")
         worker_results+=("$result_path")
         worker_logs+=("$log_path")

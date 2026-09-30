@@ -240,6 +240,29 @@ lease_deadline() {
 }
 expect 'capacity waits stop at a bounded deadline without creating a slot' 0 '' lease_deadline
 
+# Long queue waits back off (capped) instead of re-running the locked usage
+# scan every 100ms for hours, never overshoot their deadline, and say why they
+# gave up. Attempts are counted through the production try-acquire hook.
+lease_backoff() {
+    lease_env backoff || return 1
+    selector_acquire_slot gamma held || return 1
+    local started=$SECONDS status=0 attempts
+    eval "$(declare -f _sel_try_acquire | sed '1s/_sel_try_acquire/_sel_try_acquire_real/')"
+    _sel_try_acquire() { printf 'x' >> "$DSR_STATE_DIR/attempts"; _sel_try_acquire_real "$@"; }
+    DSR_SELECTOR_WAIT_TIMEOUT=3 DSR_SELECTOR_POLL_MAX=1 \
+        selector_acquire_slot gamma waiting --wait 2> "$DSR_STATE_DIR/wait.err" || status=$?
+    attempts=$(wc -c < "$DSR_STATE_DIR/attempts" | tr -d ' ')
+    [[ $status -eq 2 && $((SECONDS - started)) -le 4 ]] || return 1
+    # 0.1+0.2+0.4+0.8+1+1... reaches 3s in ~6 polls; 100ms polling needs ~30.
+    ((attempts >= 3 && attempts <= 10)) || return 1
+    grep -q 'No build slot on gamma within 3s (concurrency limit 1 reached)' "$DSR_STATE_DIR/wait.err" || return 1
+    status=0
+    DSR_SELECTOR_POLL_MAX=0 selector_acquire_slot gamma invalid --wait || status=$?
+    [[ $status -eq 4 && ! -e "$_SELECTOR_LOCKS_DIR/gamma/invalid.lock" ]] || return 1
+    selector_release_slot gamma held
+}
+expect 'queued waits back off, respect the deadline, and report the limit' 0 '' lease_backoff
+
 lease_guard() {
     lease_env guard mkdir || return 1
     mkdir "$_SELECTOR_STATE_DIR/mutexes/gamma.d" || return 1

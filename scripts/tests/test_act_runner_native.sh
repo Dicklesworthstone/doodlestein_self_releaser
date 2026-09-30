@@ -2686,6 +2686,172 @@ test_glibc_version_helpers() {
     fi
 }
 
+# An in-tree output shared with a concurrent same-host target (flagged by the
+# orchestrator via DSR_NATIVE_OUTPUT_STAGE=1) is built in a private source
+# copy, collected from that copy, and the copy is removed only afterwards.
+test_output_stage_builds_and_collects_privately() {
+    log_test "Output stage: shared in-tree output builds in a private source copy"
+    reset_state
+    MOCK_LANGUAGE="go"
+    MOCK_BINARY_NAME="tool"
+    MOCK_BUILD_CMD="go build -o tool ./cmd/tool"
+
+    local result status=0 capture scp_args stage_root
+    result=$(DSR_NATIVE_OUTPUT_STAGE=1 act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null) || status=$?
+    capture=$(get_ssh_capture)
+    scp_args=$(get_scp_args)
+    stage_root=$(grep -o "/var/tmp/dsr-build-tool-darwin-arm64-[0-9a-f]*" <<< "$capture" | head -1)
+
+    if [[ $status -eq 0 && -n "$stage_root" && \
+          "$capture" == *"mkdir '$stage_root' '$stage_root/source'; cp -R '/local/path/tool/.' '$stage_root/source/'"* && \
+          "$capture" == *"cd '$stage_root/source'; "*"go build -o tool ./cmd/tool"* && \
+          "$scp_args" == *":$stage_root/source/tool "* ]] && \
+       [[ "$(grep '^CMD:' "$SSH_ARGS_FILE" | tail -1)" == "CMD:rm -rf '$stage_root'" ]] && \
+       jq -e '.status == "success"' <<< "$result" >/dev/null; then
+        log_pass "Private copy built, collected from, then removed"
+    else
+        log_fail "Output stage misbehaved: status=$status scp=$scp_args capture=$capture result=$result"
+    fi
+
+    reset_state
+    MOCK_LANGUAGE="go"
+    MOCK_BINARY_NAME="tool"
+    MOCK_BUILD_CMD="go build -o tool ./cmd/tool"
+    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+    capture=$(get_ssh_capture)
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="tool"
+    MOCK_BUILD_CMD="cargo build --release"
+    DSR_NATIVE_OUTPUT_STAGE=1 act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+    if [[ "$capture" != *"dsr-build-tool"* && "$capture" == *"cd '/local/path/tool'"* && \
+          "$(get_ssh_capture)" != *"/var/tmp/dsr-build-tool-"* ]]; then
+        log_pass "No stage without a detected collision, and never for Rust"
+    else
+        log_fail "Output stage applied where it should not be"
+    fi
+}
+
+# A strict (release-contract) Linux Rust build once skipped the glibc floor
+# entirely, so focr v0.9.1 first shipped needing GLIBC_2.39 despite a
+# documented 2.17 floor. Strict builds must stage the zigbuild shim OUTSIDE
+# the byte-verified snapshot and hold the collected bytes to the floor.
+_run_strict_linux_rust_build() {
+    local platform="$1"
+    host_health_is_ready() { [[ "$1" == "ts1" ]]; }
+    act_run_native_build \
+        "tool" "$platform" "v1.0.0" "run1" \
+        "/remote/.dsr-release-snapshots/tool-run/source" \
+        "1111111111111111111111111111111111111111" "v1.0.0" "ts1"
+}
+
+test_strict_rust_linux_glibc_floor_shim_outside_snapshot() {
+    log_test "Strict Rust linux: configured glibc floor stages the shim beside the snapshot"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="tool"
+    MOCK_BUILD_CMD="cargo build --locked --release --bin tool"
+    MOCK_GLIBC_FLOOR="2.17"
+    MOCK_ARTIFACT_KIND="elf-arm64"
+    MOCK_PLATFORM_ENV="CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu"
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-glibc-ok"
+    write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+    printf '\0GLIBC_2.17\0GLIBC_2.2.5\0' >> "$MOCK_SSH_STREAM_FILE"
+
+    local result status=0 cmd shim_dir
+    result=$(_run_strict_linux_rust_build linux/arm64 2>/dev/null) || status=$?
+    cmd=$(get_ssh_capture)
+    shim_dir="/remote/.dsr-release-snapshots/tool-run/.dsr-bin-linux-arm64"
+
+    if [[ $status -eq 0 && "$cmd" == *"DSR_ZIG_SHIM_EOF"* && \
+          "$cmd" == *"cat > '$shim_dir/cargo'"* && \
+          "$cmd" == *"export PATH='$shim_dir':\"\$PATH\""* && \
+          "$cmd" == *'export "DSR_ZIG_TARGET=aarch64-unknown-linux-gnu.2.17"'* && \
+          "$cmd" != *"/source/.dsr-bin"* ]] && \
+       jq -e '.status == "success" and
+              .build_influence_env.DSR_ZIG_TARGET == "aarch64-unknown-linux-gnu.2.17" and
+              .build_influence_env.DSR_LINUX_GLIBC_FLOOR == "2.17"' <<< "$result" >/dev/null; then
+        log_pass "Strict build routes cargo build through zigbuild at the 2.17 floor and records it"
+    else
+        log_fail "Strict glibc floor shim missing or misplaced: status=$status result=$result cmd=$cmd"
+    fi
+}
+
+test_strict_rust_linux_glibc_floor_rejects_newer_glibc() {
+    log_test "Strict Rust linux: a collected binary above the floor fails the target"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="tool"
+    MOCK_BUILD_CMD="cargo build --locked --release --bin tool"
+    MOCK_GLIBC_FLOOR="2.17"
+    MOCK_ARTIFACT_KIND="elf-amd64"
+    MOCK_PLATFORM_ENV="CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu"
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/strict-glibc-too-new"
+    write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+    printf '\0GLIBC_2.17\0GLIBC_2.39\0' >> "$MOCK_SSH_STREAM_FILE"
+
+    local result status=0 errors
+    errors=$(
+        _log_error() { printf '%s\n' "$*" >&2; }
+        _run_strict_linux_rust_build linux/amd64 2>&1 >/dev/null
+    ) || true
+    result=$(_run_strict_linux_rust_build linux/amd64 2>/dev/null) || status=$?
+
+    if [[ $status -eq 7 ]] && \
+       jq -e '.status == "failed" and .artifact_paths == [] and .collected_sha256 == null' \
+           <<< "$result" >/dev/null && \
+       [[ "$errors" == *"needs GLIBC_2.39, above the glibc floor 2.17"* ]]; then
+        log_pass "GLIBC_2.39 binary refused under a 2.17 floor with an actionable error"
+    else
+        log_fail "Strict build accepted a binary above its glibc floor: status=$status result=$result errors=$errors"
+    fi
+}
+
+test_rust_linux_glibc_floor_enforced_for_owned_toolchain() {
+    log_test "Rust linux: an explicit floor is enforced even when build_cmd owns zigbuild"
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo zigbuild --release --target x86_64-unknown-linux-gnu"
+    MOCK_ARTIFACT_KIND="elf-amd64"
+
+    # scp's mock writes a bare ELF; wrap it to append a too-new version need.
+    local status_explicit=0 status_default=0 cmd
+    (
+        act_get_native_host() { echo ts1; }
+        scp() {
+            local target="${!#}"
+            mkdir -p "$(dirname "$target")"
+            write_mock_artifact "$target"
+            printf '\0GLIBC_2.39\0' >> "$target"
+        }
+        MOCK_GLIBC_FLOOR="2.28"
+        act_run_native_build "tool" "linux/amd64" "v1.0.0" "run1" >/dev/null 2>&1
+    ) || status_explicit=$?
+    cmd=$(get_ssh_capture)
+    reset_state
+    MOCK_LANGUAGE="rust"
+    MOCK_BINARY_NAME="mytool"
+    MOCK_BUILD_CMD="cargo zigbuild --release --target x86_64-unknown-linux-gnu"
+    MOCK_ARTIFACT_KIND="elf-amd64"
+    (
+        act_get_native_host() { echo ts1; }
+        scp() {
+            local target="${!#}"
+            mkdir -p "$(dirname "$target")"
+            write_mock_artifact "$target"
+            printf '\0GLIBC_2.39\0' >> "$target"
+        }
+        act_run_native_build "tool" "linux/amd64" "v1.0.0" "run1" >/dev/null 2>&1
+    ) || status_default=$?
+
+    if [[ $status_explicit -eq 7 && $status_default -eq 0 && "$cmd" != *"DSR_ZIG_SHIM_EOF"* ]]; then
+        log_pass "Owned toolchain: no shim, explicit floor enforced, unconfigured default not imposed"
+    else
+        log_fail "Owned-toolchain floor handling wrong: explicit=$status_explicit default=$status_default"
+    fi
+}
+
 test_windows_strict_cargo_metadata_command() {
     log_test "Strict Cargo metadata: Windows command is locked and offline"
     reset_state
@@ -2968,6 +3134,10 @@ main() {
     test_rust_linux_glibc_floor_skips_operator_linker
     test_collection_rejects_wrong_arch
     test_glibc_version_helpers
+    test_output_stage_builds_and_collects_privately
+    test_strict_rust_linux_glibc_floor_shim_outside_snapshot
+    test_strict_rust_linux_glibc_floor_rejects_newer_glibc
+    test_rust_linux_glibc_floor_enforced_for_owned_toolchain
 
     # Summary
     echo ""

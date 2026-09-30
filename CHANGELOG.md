@@ -12,6 +12,37 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- Strict release-contract builds skipped the Linux glibc floor entirely, so
+  focr v0.9.1 first came out needing GLIBC_2.39 despite a configured 2.17
+  floor. Strict Linux Rust builds now get the same floor as ordinary builds:
+  the zigbuild cargo shim is staged beside the snapshot (never inside it),
+  the floor is recorded in the build-influence receipt, and a collected
+  binary above the floor fails the target with a message naming the fix. An
+  explicitly configured floor is also enforced when the build_cmd or a cross
+  linker owns the toolchain.
+
+- `--parallel` targets on one host whose build writes the same in-tree file
+  (`go build -o ntm ./cmd/ntm`) overwrote each other, and one lane collected
+  the other's binary (ntm 1.36.0 linux/arm64 received an amd64 build; the
+  architecture check caught it). The orchestrator now detects the shared
+  output: the later target builds in a private source copy that is removed
+  after collection, or, where a copy cannot help (strict snapshots, Windows
+  hosts, an absolute shared GOBIN), waits for the conflicting build.
+
+- A target whose host was at its concurrency limit failed with "Host
+  capacity acquisition failed" after a fixed 300s while a peer build held the
+  slot for hours. Build workers now queue for one build timeout
+  (`DSR_BUILD_TIMEOUT`, or `DSR_SELECTOR_WAIT_TIMEOUT`), poll with capped
+  backoff, report their wait every minute, and name the host, wait and fix
+  when the budget really expires.
+
+- Strict source verification ran each host's source-snapshot check inside a
+  `while read` host loop without closing stdin, so a stdin-reading transfer
+  could skip verifying later hosts (the same drain that made Windows sync
+  copy only the first sibling crate, fixed in 1b45cf7). The call and the
+  remaining Windows manifest transfers now close stdin, and a regression test
+  covers every sibling on every host.
+
 - Configured `include_files` (LICENSE, README.md, ...) were silently dropped
   from release archives whenever the build lane had already wrapped the
   payload in an archive: the payload-preserving repack kept the lane's exact
