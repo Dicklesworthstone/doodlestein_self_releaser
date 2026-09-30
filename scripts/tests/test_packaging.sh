@@ -735,8 +735,14 @@ after_inc_sha=$(shasum -a 256 "$INC_XZ" | awk '{print $1}')
     log_pass "destination already carrying includes is reused unchanged" || \
     log_fail "destination already carrying includes is reused unchanged"
 
-# Includes may never shadow a payload member, escape the root, or be links.
-packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc1.tar.xz" tar.xz "$INC_PAYLOAD" rano 2>/dev/null && \
+# Includes may never shadow a payload member with different bytes, escape
+# the root, or be links. (An include byte- and mode-identical to the member
+# is satisfied idempotently since b03b078; see test_packaging_prebuilt.sh.)
+INC_CONFLICT="$TEMP_DIR/conflicting-include"
+mkdir -p "$INC_CONFLICT"
+printf 'a different rano\n' > "$INC_CONFLICT/rano"
+chmod 0755 "$INC_CONFLICT/rano"
+packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc1.tar.xz" tar.xz "$INC_CONFLICT" rano 2>/dev/null && \
     log_fail "include colliding with payload member refused" || \
     log_pass "include colliding with payload member refused"
 packaging_repack_archive "$LONE_GZ" tar.gz "$TEMP_DIR/bad-inc2.tar.xz" tar.xz "$INC_DIR" ../LICENSE 2>/dev/null && \
