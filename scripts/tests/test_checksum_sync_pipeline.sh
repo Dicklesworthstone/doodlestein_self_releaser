@@ -216,7 +216,8 @@ for kind in html empty duplicate nul; do
     before=$(wc -l < "$CALLS")
     run checksum_sync_json demo v1.2.3 --repo example/one --dry-run
     check "downloaded invalid manifest cannot become a sync plan: $kind" equal "$status" 4
-    check "invalid present manifest cannot fall through to another file: $kind" equal "$((before + 1))" "$(wc -l < "$CALLS")"
+    # BSD wc pads its count; compare numbers, not padded strings.
+    check "invalid present manifest cannot fall through to another file: $kind" equal "$((before + 1))" "$(wc -l < "$CALLS" | tr -d ' ')"
     check "invalid manifest has one machine-readable failure: $kind" json_is 'length==1 and .[0].status=="error" and .[0].planned==0'
 done
 mv "$HTTP_ROOT/checksums.sha256" "$TEMP/invalid-download.saved"

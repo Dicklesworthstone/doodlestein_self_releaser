@@ -12,6 +12,13 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- Release checksum generation always failed on macOS dispatchers: the
+  default (empty) exclusion regex was compiled for validation, and macOS
+  regcomp rejects an empty pattern. An empty exclusion is now never compiled.
+  The checksum-sync protected-root guard also compares against the
+  symlink-resolved protected paths, so a protected projects root reached
+  through a symlinked ancestor is still refused.
+
 - A non-interactive run whose act had no runner-image mapping (no `-P` and
   no actrc) died inside act's first-run image survey on EOF. dsr now stops
   before launching act with dependency exit 3 and the remedy
