@@ -34,17 +34,55 @@ package; `--bin NAME` is mandatory. The build always uses `--release`,
 `--locked`, and `--target aarch64-pc-windows-msvc`. The project must have a
 regular `Cargo.toml` and `Cargo.lock`. `--timeout SECONDS` bounds compilation
 (default 3600; range 1..86400). `--cache-dir DIR` selects the prepared-view
-cache. Build execution also requires Python 3, GNU timeout, and util-linux
-setsid on a Linux host. Release mode requires Python 3.9+ and Git.
+cache. Build execution also requires Python 3.9+, GNU timeout, and util-linux
+setsid on a Linux host. Release mode additionally requires Git.
 
 `--offline` requests Cargo's offline behavior. Without it, Cargo may fetch
 locked dependencies. `--cargo-cache` is optional: only its `registry/` and
-`git/` download directories are linked into a fresh Cargo home. Configuration,
-credentials, binaries, and unrelated files are not inherited. The linked
-cache remains writable by Cargo; it is not a frozen source snapshot. The
-runner intentionally does not inherit proxy variables, registry credentials,
-or arbitrary environment overrides. Projects requiring custom registries
-must supply appropriate reviewed project configuration.
+`git/` directories are copied into a fresh, independently owned Cargo home
+before any Cargo invocation. These are byte copies, not symlinks or source
+hardlinks: deleting the original cache or writing its files in place cannot
+change the prepared copy. Top-level Cargo configuration, credentials, binaries,
+and unrelated files are not inherited. The runner intentionally does not inherit
+proxy variables, registry credentials, or arbitrary environment overrides.
+Projects requiring custom registries must supply reviewed project configuration.
+
+The seed must be a real directory. Linked/special cache entries and Git
+gitdir/commondir/alternate-object storage pointers are rejected rather than
+retaining references outside the private home. Detected changes during copying
+fail preparation; use a quiescent cache or omit `--cargo-cache` to start empty.
+An empty cache normally needs network access, so combining it with `--offline`
+requires dependencies already supplied by reviewed project configuration.
+Preparation copies the entire selected cache trees and needs corresponding
+disk space; it is not a dependency-subset or copy-on-write optimization.
+`--timeout` also bounds each cache preparation/inventory command separately.
+Cancellation reaches its process group; diagnostics are retained in
+`run/cargo-cache-seed.log` and `run/cargo-cache-final.log`.
+
+Cargo can legitimately download, unpack, or maintain files in its private
+home. The result's `cargo_cache` field therefore retains separate seed and
+final inventory summaries, including receipt SHA-256, inventory SHA-256,
+file count and byte count. The release manifest retains the same field under
+`build_environments`. Full inventories live in
+`run/cargo-home/.dsr-cache-seed.json` and `run/cargo-cache-final.json`;
+changing seed evidence during the build prevents success. Inventories describe
+observed files, not proof of exactly which dependencies compiled, a frozen
+filesystem, or protection from malicious build scripts.
+
+The sourceable/directly runnable helper also supports independent preparation
+and later verification (all paths must be absolute):
+
+```bash
+bash src/cargo_cache.sh snapshot /home/builder/.cargo /var/tmp/new-cargo-home
+bash src/cargo_cache.sh inventory /var/tmp/new-cargo-home /var/tmp/cache-receipt.json
+bash src/cargo_cache.sh verify /var/tmp/new-cargo-home /var/tmp/cache-receipt.json
+```
+
+Snapshot and inventory destinations must not exist. Verification requires exact
+file/directory membership, bytes and executable bits; it does not rewrite a
+receipt after drift. This integration applies to the pinned runner only.
+The native orchestrator's Unix/Windows cache links remain separate work under
+issue #15; this change does not close that issue.
 
 ## Source-pinned release mode
 
@@ -264,6 +302,7 @@ compiler-generated subprocess. This is not signed provenance. Automatic
 propagation through strict native build state remains under `bd-10we`.
 
 ```bash
+bash scripts/tests/test_cargo_cache.sh
 bash scripts/tests/test_xwin_toolchain.sh
 bash scripts/tests/test_xwin_build.sh
 bash scripts/tests/test_xwin_toolchain_scale.sh

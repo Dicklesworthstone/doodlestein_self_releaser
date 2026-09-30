@@ -5,6 +5,12 @@ on:
     paths:
       - dsr
       - src/github.sh
+      - src/cargo_cache.sh
+      - src/packaging.sh
+      - 'src/xwin*.sh'
+      - 'scripts/xwin*.sh'
+      - 'scripts/tests/test_xwin*.sh'
+      - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_github.sh
       - scripts/tests/test_release_resume.sh
       - scripts/tests/test_fallback_pipeline.sh
@@ -37,3 +43,24 @@ jobs:
           bash scripts/tests/test_fallback_pipeline.sh
           bash scripts/tests/test_release_resume.sh
           bash scripts/tests/test_github.sh
+  private-cargo-cache:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install LLVM test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm jq shellcheck
+      - name: Check private cache and Windows build regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck -S warning src/cargo_cache.sh src/xwin_build.sh scripts/tests/test_cargo_cache.sh scripts/tests/test_xwin_build.sh
+          bash -n src/cargo_cache.sh
+          bash -n src/xwin_build.sh
+          bash scripts/tests/test_cargo_cache.sh
+          bash scripts/tests/test_xwin_build.sh
+          bash scripts/tests/test_xwin_release_build.sh
