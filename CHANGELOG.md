@@ -12,6 +12,12 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- A non-interactive run whose act had no runner-image mapping (no `-P` and
+  no actrc) died inside act's first-run image survey on EOF. dsr now stops
+  before launching act with dependency exit 3 and the remedy
+  (`act_overrides.platform_image` or a `-P` line in `~/.actrc`); repo
+  overrides and operator actrc files keep precedence (bd-1d26).
+
 - Strict release-contract builds skipped the Linux glibc floor entirely, so
   focr v0.9.1 first came out needing GLIBC_2.39 despite a configured 2.17
   floor. Strict Linux Rust builds now get the same floor as ordinary builds:

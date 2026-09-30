@@ -206,6 +206,23 @@ expect 'installer explicit override outranks auto-detection' \
 expect 'real installer pattern outranks derived alias' \
     '["app_1_linux_x86_64.tar.xz","app-x86_64-unknown-linux-musl.tar.xz",false]' \
     resolver_names '${name}_${version}_${os}_${arch}' '[]' '' '' install.sh
+# bd-1tv.12 upgrade path: a legacy config (artifact_naming only) and the same
+# config after adding the explicit install_script_compat the fallback derives
+# must name assets identically, and the legacy form must not warn.
+expect 'legacy v-prefixed underscore config derives its compat alias' \
+    '["app-v1-linux_x86_64.tar.xz","app-linux_x86_64.tar.xz",false]' \
+    resolver_names '${name}-v${version}-${os}_${arch}' '[]' '' '' ''
+legacy_upgrade_before=$(resolver_names '${name}-${version}-${os}-${arch}' '[]' '' '' '' 2> "$fixture/legacy.err")
+expect 'adding the derived install_script_compat changes nothing' "$legacy_upgrade_before" \
+    resolver_names '${name}-${version}-${os}-${arch}' '[]' '' '${name}-${os}-${arch}' ''
+if [[ -n "$legacy_upgrade_before" ]] && ! grep -Eqi 'warn|deprecat' "$fixture/legacy.err"; then
+    passed=$((passed + 1))
+else
+    failed=$((failed + 1))
+    printf 'FAIL legacy config emitted a warning or no plan: %s\n' "$(cat "$fixture/legacy.err")" >&2
+fi
+rm -f -- "$fixture/legacy.err"
+
 cat > "$fixture/install.sh" <<'INSTALL'
 TAR="$UNKNOWN.tar.gz"
 INSTALL

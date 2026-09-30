@@ -2053,6 +2053,37 @@ EOF
     echo "$isolated_home"
 }
 
+# True when dsr runs without a person to answer prompts: CI, the global
+# --non-interactive flag (NON_INTERACTIVE / DSR_NON_INTERACTIVE), or no
+# terminal on stdin. Mirrors guardrails' is_non_interactive, which this module
+# cannot assume is loaded.
+_act_session_is_non_interactive() {
+    [[ -n "${CI:-}" || "${NON_INTERACTIVE:-}" == "true" || \
+       "${DSR_NON_INTERACTIVE:-}" == "true" || ! -t 0 ]]
+}
+
+# True when act will not open its interactive first-run image survey: the
+# command carries a -P/--platform mapping, or any actrc act reads exists (act
+# then uses that file's mappings or its documented defaults — operator policy
+# either way). act reads ~/.actrc, $XDG_CONFIG_HOME/act/actrc (else
+# ~/.config/act/actrc) and ./.actrc.
+# Usage: _act_runner_image_config_present <home> [act argv...]
+_act_runner_image_config_present() {
+    local home="$1"
+    shift
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -P|-P?*|--platform|--platform=*) return 0 ;;
+        esac
+    done
+    local config
+    for config in "$home/.actrc" "${XDG_CONFIG_HOME:-$home/.config}/act/actrc" "$PWD/.actrc"; do
+        [[ -f "$config" ]] && return 0
+    done
+    return 1
+}
+
 # Run a workflow via act
 # Usage: act_run_workflow <repo_path> <workflow> [job] [event] [version] [extra_args...]
 # Returns: exit code (0=success, 1=partial, 6=build failed, 3=dependency error)
@@ -2133,6 +2164,15 @@ act_run_workflow() {
     local check_home="${HOME:-}"
     [[ -n "$isolated_home" ]] && check_home="$isolated_home"
     if ! act_check "$check_home"; then
+        return 3
+    fi
+
+    # The isolated home always carries a mapping; the operator's own config
+    # may not, and act then opens its first-run image survey, which exits on
+    # EOF without a terminal (bd-1d26). Fail before launching it.
+    if [[ -z "$isolated_home" ]] && _act_session_is_non_interactive && \
+       ! _act_runner_image_config_present "$check_home" "${act_cmd[@]}"; then
+        _log_error "act has no runner image mapping: no -P/--platform flag and no actrc (~/.actrc, \${XDG_CONFIG_HOME:-~/.config}/act/actrc, ./.actrc). Non-interactive act would stop at its first-run image survey. Set act_overrides.platform_image in repos.d/<tool>.yaml, or add a line such as '-P ubuntu-latest=catthehacker/ubuntu:full-22.04' to ~/.actrc."
         return 3
     fi
 

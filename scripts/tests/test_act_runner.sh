@@ -843,7 +843,15 @@ EOF
     act_check() { return 0; }
     timeout() { shift; "$@"; }
 
-    act_run_workflow "$TEMP_DIR" ".github/workflows/release.yml" "" "push" "1.2.3" >/dev/null 2>&1
+    # A runner-image mapping keeps non-interactive act out of its first-run
+    # survey (see test_act_run_workflow_requires_runner_image_mapping).
+    local original_home="$HOME"
+    export HOME="$TEMP_DIR/home-tag-env"
+    mkdir -p "$HOME"
+    printf -- '-P ubuntu-latest=catthehacker/ubuntu:act-latest\n' > "$HOME/.actrc"
+
+    act_run_workflow "$TEMP_DIR" ".github/workflows/release.yml" "" "push" "1.2.3" >/dev/null 2>&1 </dev/null
+    export HOME="$original_home"
 
     if [[ -f "$args_file" ]] && \
         grep -q "GITHUB_REF=refs/tags/v1.2.3" "$args_file" && \
@@ -860,6 +868,60 @@ EOF
         eval "$original_act_check"
     else
         unset -f act_check 2>/dev/null || true
+    fi
+}
+
+# bd-1d26: without any runner-image mapping, act opens a first-run image
+# survey that exits on EOF. A non-interactive run must fail with dependency
+# exit 3 and a remediation message before launching act, while a repo-level
+# -P override or an operator actrc (either location) keeps working.
+test_act_run_workflow_requires_runner_image_mapping() {
+    log_test "act_run_workflow fails closed without a runner image mapping"
+
+    export ACT_ARTIFACTS_DIR="$TEMP_DIR/artifacts"
+    export ACT_LOGS_DIR="$TEMP_DIR/logs"
+    mkdir -p "$ACT_ARTIFACTS_DIR" "$ACT_LOGS_DIR"
+    local bin_dir="$TEMP_DIR/bin-image-mapping" marker="$TEMP_DIR/image-mapping-act-ran"
+    local cwd="$TEMP_DIR/image-mapping-cwd" home status results=""
+    mkdir -p "$bin_dir" "$cwd"
+    printf '#!/usr/bin/env bash\nprintf ran > "%s"\nexit 0\n' "$marker" > "$bin_dir/act"
+    chmod +x "$bin_dir/act"
+
+    local scenario
+    for scenario in none repo-override home-actrc xdg-actrc; do
+        home="$TEMP_DIR/image-mapping-home-$scenario"
+        mkdir -p "$home"
+        rm -f "$marker"
+        case "$scenario" in
+            home-actrc) printf -- '--platform ubuntu-latest=img\n' > "$home/.actrc" ;;
+            xdg-actrc) mkdir -p "$home/xdg/act"; printf -- '-P ubuntu-latest=img\n' > "$home/xdg/act/actrc" ;;
+        esac
+        status=0
+        (
+            cd "$cwd" || exit 99
+            PATH="$bin_dir:$PATH"
+            export HOME="$home"
+            unset XDG_CONFIG_HOME CI
+            [[ "$scenario" == xdg-actrc ]] && export XDG_CONFIG_HOME="$home/xdg"
+            act_check() { return 0; }
+            timeout() { shift; "$@"; }
+            if [[ "$scenario" == repo-override ]]; then
+                act_run_workflow "$TEMP_DIR" ".github/workflows/release.yml" "" "push" "" \
+                    -P ubuntu-latest=img
+            else
+                act_run_workflow "$TEMP_DIR" ".github/workflows/release.yml" "" "push" ""
+            fi
+        ) > "$TEMP_DIR/image-mapping-$scenario.out" 2> "$TEMP_DIR/image-mapping-$scenario.err" </dev/null || status=$?
+        results+="$scenario:$status:$([[ -f "$marker" ]] && echo ran || echo skipped) "
+    done
+
+    if [[ "$results" == "none:3:skipped repo-override:0:ran home-actrc:0:ran xdg-actrc:0:ran " ]] && \
+       grep -q 'act has no runner image mapping' "$TEMP_DIR/image-mapping-none.err" && \
+       grep -q 'act_overrides.platform_image' "$TEMP_DIR/image-mapping-none.err" && \
+       [[ ! -s "$TEMP_DIR/image-mapping-none.out" ]]; then
+        log_pass "Missing mapping fails with exit 3 before act; override and both actrc locations run"
+    else
+        log_fail "Runner image mapping gate wrong: $results"
     fi
 }
 
@@ -1054,6 +1116,7 @@ main() {
     test_act_cleanup
     test_workflow_validation
     test_act_run_workflow_injects_tag_env
+    test_act_run_workflow_requires_runner_image_mapping
     test_act_run_workflow_isolates_parent_write_workflows
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
