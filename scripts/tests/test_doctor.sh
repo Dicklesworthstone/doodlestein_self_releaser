@@ -337,6 +337,52 @@ test_doctor_human_shows_ok_or_error() {
     fi
 }
 
+# bd-1tv.5: full doctor runs the artifact-naming consistency check (quick
+# mode does not), reports "ok" for a consistent registry and a warning that
+# names the drifting repo when config and install.sh disagree.
+test_doctor_artifact_naming_check() {
+    ((TESTS_RUN++))
+
+    local project="$TEMP_DIR/naming-project" config="$TEMP_DIR/naming-config"
+    mkdir -p "$project" "$config/repos.d"
+    cat > "$config/repos.yaml" <<EOF
+schema_version: "1.0.0"
+tools:
+  drifttool:
+    repo: example/drifttool
+    local_path: $project
+    language: go
+    targets: [linux/amd64]
+EOF
+    cat > "$config/repos.d/drifttool.yaml" <<EOF
+tool_name: drifttool
+repo: example/drifttool
+local_path: $project
+language: go
+targets: [linux/amd64]
+EOF
+    local quick consistent drift
+    quick=$(DSR_CONFIG_DIR="$config" "$DSR_CMD" --json doctor --quick 2>/dev/null)
+    consistent=$(DSR_CONFIG_DIR="$config" "$DSR_CMD" --json doctor 2>/dev/null)
+    # A versioned config while install.sh downloads an unversioned name,
+    # with no explicit install_script_compat, is the drift validate flags.
+    printf 'artifact_naming: "${name}-${version}-${os}-${arch}"\ninstall_script_path: install.sh\n' \
+        >> "$config/repos.d/drifttool.yaml"
+    printf '    artifact_naming: "${name}-${version}-${os}-${arch}"\n    install_script_path: install.sh\n' \
+        >> "$config/repos.yaml"
+    printf 'TAR="drifttool-${OS}-${ARCH}.tar.gz"\n' > "$project/install.sh"
+    drift=$(DSR_CONFIG_DIR="$config" "$DSR_CMD" --json doctor 2>/dev/null)
+
+    if jq -e '[.details.checks[] | select(.name == "artifact_naming")] | length == 0' <<< "$quick" >/dev/null 2>&1 &&
+       jq -e '.details.checks[] | select(.name == "artifact_naming") | .status == "ok"' <<< "$consistent" >/dev/null 2>&1 &&
+       jq -e '.details.checks[] | select(.name == "artifact_naming") |
+              .status == "warning" and .repos == ["drifttool"]' <<< "$drift" >/dev/null 2>&1; then
+        pass "doctor reports artifact naming drift per repo (skipped in --quick)"
+    else
+        fail "doctor artifact naming check wrong: quick=$(jq -c '[.details.checks[]|select(.name=="artifact_naming")]' <<< "$quick" 2>/dev/null) consistent=$(jq -c '[.details.checks[]|select(.name=="artifact_naming")]' <<< "$consistent" 2>/dev/null) drift=$(jq -c '[.details.checks[]|select(.name=="artifact_naming")]' <<< "$drift" 2>/dev/null)"
+    fi
+}
+
 # Cleanup
 cleanup() {
     rm -rf "$TEMP_DIR"
@@ -372,6 +418,7 @@ echo ""
 echo "Quick Mode:"
 test_doctor_quick_skips_build_tools
 test_doctor_respects_enabled_hosts_config
+test_doctor_artifact_naming_check
 
 echo ""
 echo "Exit Codes:"

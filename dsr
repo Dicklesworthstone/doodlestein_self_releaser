@@ -414,6 +414,7 @@ CHECKS:
 
     Config:
       - Configuration file validation
+      - Artifact naming consistency across registered repos (not in --quick)
 
 EXIT CODES:
     0  - All checks passed (or only warnings)
@@ -809,6 +810,44 @@ EOF
         log_warn "  config: invalid or missing"
         fixes+=("Initialize config: dsr config init")
         ((warnings++))
+    fi
+
+    # Artifact naming consistency (bd-1tv.5): catch config / install.sh /
+    # workflow naming drift during routine health checks, before a release
+    # uploads assets an installer cannot find. Delegates to the same
+    # validator as `dsr repos validate --naming`, in a child process so its
+    # human output and JSON envelope stay out of the doctor report.
+    if ! $quick_mode; then
+        local naming_report naming_counts naming_warn=0 naming_err=0 naming_repos=""
+        if naming_report=$(bash "$SCRIPT_DIR/dsr" --json repos validate --naming 2>/dev/null) &&
+           naming_counts=$(jq -er '[.details.validated[]? | (.naming.status // "ok")] |
+                "\(map(select(. == "warning")) | length) \(map(select(. == "error")) | length)"' \
+                <<< "$naming_report" 2>/dev/null); then
+            read -r naming_warn naming_err <<< "$naming_counts"
+            naming_repos=$(jq -c '[.details.validated[]? |
+                select((.naming.status // "ok") == "warning" or (.naming.status // "ok") == "error") | .repo]' \
+                <<< "$naming_report" 2>/dev/null || echo '[]')
+            if [[ "$naming_err" -gt 0 ]]; then
+                # Reported as an error check but counted as a warning: doctor's
+                # exit 3 means missing core dependencies, not config drift.
+                _add_check "artifact_naming" "error" ", \"message\": \"$naming_err repo(s) with naming errors\", \"repos\": $naming_repos"
+                log_error "  artifact naming: $naming_err repo(s) with errors (run 'dsr repos validate --naming')"
+                fixes+=("Align artifact naming: dsr repos validate --naming")
+                ((warnings++))
+            elif [[ "$naming_warn" -gt 0 ]]; then
+                _add_check "artifact_naming" "warning" ", \"message\": \"$naming_warn repo(s) with naming mismatches\", \"repos\": $naming_repos"
+                log_warn "  artifact naming: $naming_warn repo(s) with mismatches (run 'dsr repos validate --naming')"
+                fixes+=("Align artifact naming: dsr repos validate --naming")
+                ((warnings++))
+            else
+                _add_check "artifact_naming" "ok" ""
+                log_ok "  artifact naming: all registered repos consistent"
+            fi
+        else
+            _add_check "artifact_naming" "warning" ", \"message\": \"could not run naming validation\""
+            log_warn "  artifact naming: could not validate (no repos registered, or validation failed)"
+            ((warnings++))
+        fi
     fi
 
     # Summary

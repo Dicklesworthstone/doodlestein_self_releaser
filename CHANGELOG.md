@@ -12,6 +12,11 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- `dsr doctor` (full mode) now runs the artifact-naming consistency check
+  from `dsr repos validate --naming` and reports drifting repos by name, so a
+  config/install.sh/workflow naming mismatch shows up in routine health
+  checks instead of at release time (bd-1tv.5).
+
 - Release checksum generation always failed on macOS dispatchers: the
   default (empty) exclusion regex was compiled for validation, and macOS
   regcomp rejects an empty pattern. An empty exclusion is now never compiled.
