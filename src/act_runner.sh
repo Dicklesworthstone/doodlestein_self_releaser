@@ -6041,6 +6041,22 @@ _act_remove_build_stage_root() {
     return 0
 }
 
+# Cancellation path for the stage roots above. A cancelled worker TERMs the
+# whole build process group, which never reaches the ordinary removals after
+# the build command, so each source copy (multi-GB for large repos) would stay
+# in /var/tmp or the host's build_root with nothing to reap it. Installed only
+# inside the command-substitution subshell that runs act_run_native_build, so
+# no caller's traps are replaced. Dispositions are reset (not ignored) first so
+# the cleanup's own ssh/timeout children keep normal signal handling.
+_act_stage_cleanup_on_signal() {
+    local signal_status="$1" stage_root
+    trap - INT TERM
+    for stage_root in "${_ACT_SIGNAL_STAGE_ROOTS[@]}"; do
+        _act_remove_build_stage_root "$_ACT_SIGNAL_STAGE_HOST" "$stage_root" 2>/dev/null
+    done
+    exit "$signal_status"
+}
+
 act_run_native_build() {
     local tool_name="$1"
     local platform="$2"
@@ -6850,6 +6866,17 @@ act_run_native_build() {
         # Let the remote deadline retire its job before killing the transport.
         # This grace is not additional build time and never enables local work.
         build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 60))
+    fi
+
+    # A cancelled build still removes its stage roots (see
+    # _act_stage_cleanup_on_signal). Only in a subshell: the orchestrator
+    # always runs this function inside $(...), and a direct caller's traps
+    # must not be replaced.
+    if (( BASH_SUBSHELL > 0 )) && [[ -n "$nonstrict_stage_root$output_stage_root" ]]; then
+        _ACT_SIGNAL_STAGE_HOST="$host"
+        _ACT_SIGNAL_STAGE_ROOTS=("$nonstrict_stage_root" "$output_stage_root")
+        trap '_act_stage_cleanup_on_signal 130' INT
+        trap '_act_stage_cleanup_on_signal 143' TERM
     fi
 
     # Execute on remote host

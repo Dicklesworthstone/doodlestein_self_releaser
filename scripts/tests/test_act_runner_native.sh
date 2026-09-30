@@ -234,6 +234,12 @@ echo "0" > "$RSYNC_EXIT_CODE_FILE"
 
 # Source the module under test
 source "$SRC_DIR/act_runner.sh"
+# act_runner.sh derives ACT_CONFIG_DIR/ACT_REPOS_DIR from DSR_CONFIG_DIR at
+# source time, which silently pointed this suite's `touch`/`rm -f` of
+# tool.yaml and frankenterm.yaml at the operator's real ~/.config/dsr/repos.d.
+# Re-assert the fixture directories and refuse to run otherwise.
+export ACT_CONFIG_DIR="$MOCK_DIR" ACT_REPOS_DIR="$MOCK_DIR/repos.d"
+[[ "$ACT_REPOS_DIR" == "$MOCK_DIR"/* ]] || { echo "ACT_REPOS_DIR is not isolated: $ACT_REPOS_DIR" >&2; exit 1; }
 
 # Decode a `-EncodedCommand` payload back to the PowerShell text so mocks can
 # assert on the script the host would actually run (mirrors the helper in

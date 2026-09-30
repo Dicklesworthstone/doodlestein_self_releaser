@@ -12,6 +12,21 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- A cancelled build (Ctrl-C, or TERM to the orchestrator) left its per-target
+  source copy behind: the worker TERMs the build's process group, which never
+  reaches the removals after the build command, so each interrupted run kept a
+  full repo copy (`dsr-build-*`) in `/var/tmp` or the host's build_root. The
+  native build now removes its stage roots on INT/TERM as well. Test suites
+  no longer touch the operator's `~/.config/dsr/repos.d` (act_runner.sh reset
+  the fixture's `ACT_REPOS_DIR` when sourced, so the native suite created an
+  empty `repos.d/tool.yaml` there).
+
+- Upgrade note for strict (release-contract) Linux Rust builds: with no
+  `linux_glibc_floor` configured they now build at the 2.28 default floor via
+  `cargo zigbuild`, which needs cargo-zigbuild >= 0.23 and zig on the Linux
+  build host (a clear exit-4 error names this otherwise). Repos that must link
+  the host glibc set `linux_glibc_floor: native` for that platform.
+
 - `dsr doctor` (full mode) now runs the artifact-naming consistency check
   from `dsr repos validate --naming` and reports drifting repos by name, so a
   config/install.sh/workflow naming mismatch shows up in routine health

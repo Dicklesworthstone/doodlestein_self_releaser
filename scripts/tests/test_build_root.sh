@@ -26,6 +26,8 @@ mkdir -p "$ACT_LOGS_DIR" "$ACT_ARTIFACTS_DIR" "$ACT_REPOS_DIR"
 
 # shellcheck source=../../src/act_runner.sh
 source "$PROJECT_ROOT/src/act_runner.sh"
+# act_runner.sh resets these from DSR_CONFIG_DIR at source time; keep the fixture.
+export ACT_CONFIG_DIR="$TEMP_DIR" ACT_REPOS_DIR="$TEMP_DIR/repos.d"
 _log_info()  { :; }
 _log_error() { :; }
 _log_ok()    { :; }

@@ -3925,6 +3925,68 @@ else
     fail "parallel same-host targets still share one output file"
 fi
 
+# A cancelled run (Ctrl-C / TERM) TERMs every worker's build process group,
+# which never reaches the removals after the build command. The private
+# source copy must still be removed, or each interrupted release leaves a full
+# repo copy in /var/tmp with nothing to reap it.
+test_parallel_shared_output_stage_removed_on_cancel() (
+    local root="$TEMP_DIR/shared-output-cancel" orchestrator_pid waited
+    mkdir -p "$root/src" "$root/fixtures"
+    write_minimal_target_binary "$root/fixtures/amd64" linux/amd64
+    write_minimal_target_binary "$root/fixtures/arm64" linux/arm64
+    cat > "$ACT_REPOS_DIR/cancelout.yaml" <<EOF
+tool_name: cancelout
+repo: test/cancelout
+local_path: $root/src
+language: go
+binary_name: cancelout
+build_cmd: cp "$root/fixtures/\$GOARCH" cancelout && sleep 60
+targets: [linux/amd64, linux/arm64]
+act_job_map:
+  linux/amd64: null
+  linux/arm64: null
+cross_compile:
+  linux/amd64:
+    host: trj
+    env:
+      GOOS: linux
+      GOARCH: amd64
+  linux/arm64:
+    host: trj
+    env:
+      GOOS: linux
+      GOARCH: arm64
+EOF
+    build_lock_acquire() { return 0; }
+    build_lock_release() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    act_orchestrate_build cancelout v1.0.0-cancel --parallel-jobs 2 \
+        --output-dir "$root/out" -- linux/amd64 linux/arm64 \
+        > "$root/result.json" 2> "$root/orchestrator.log" &
+    orchestrator_pid=$!
+    # Wait for the staged lane's copy to exist and its build to be running.
+    for ((waited = 0; waited < 300; waited++)); do
+        compgen -G "/var/tmp/dsr-build-cancelout-linux-arm64-*/source/cancelout" >/dev/null && break
+        sleep 0.1
+    done
+    compgen -G "/var/tmp/dsr-build-cancelout-linux-arm64-*/source/cancelout" >/dev/null || {
+        kill -TERM "$orchestrator_pid" 2>/dev/null; wait "$orchestrator_pid" 2>/dev/null; exit 1; }
+    kill -TERM "$orchestrator_pid"
+    wait "$orchestrator_pid" 2>/dev/null
+    # Cleanup runs in the cancelled build's own subshell; allow it to finish.
+    for ((waited = 0; waited < 200; waited++)); do
+        compgen -G "/var/tmp/dsr-build-cancelout-linux-*" >/dev/null || exit 0
+        sleep 0.1
+    done
+    exit 1
+)
+if test_parallel_shared_output_stage_removed_on_cancel; then
+    pass "a cancelled parallel run removes the private output-stage source copy"
+else
+    fail "a cancelled parallel run left its output-stage source copy: $(compgen -G '/var/tmp/dsr-build-cancelout-linux-*' | tr '\n' ' ')"
+fi
+
 # Where a private source copy cannot make the shared file private (a Windows
 # host, or an absolute GOBIN outside the tree), the colliding targets run one
 # after the other; unrelated targets keep running in parallel.
