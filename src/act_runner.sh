@@ -3890,12 +3890,56 @@ _act_write_git_archive_evidence() {
     )
 }
 
+# A tracked symlink (mode 120000) is representable only when its target is a
+# safe relative path that stays inside the repository: resolved lexically from
+# the link's own directory, no component may climb above the repository root.
+# Absolute and escaping targets are refused. The target string is the blob.
+_act_strict_symlink_target_is_contained() {
+    local link_path="$1"
+    local target="$2"
+    local component depth=0
+    local -a parts=()
+
+    [[ -n "$target" && "$target" != /* && \
+       "$target" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ ]] || return 1
+    if [[ "$link_path" == */* ]]; then
+        IFS='/' read -r -a parts <<< "${link_path%/*}"
+        for component in "${parts[@]}"; do
+            [[ -z "$component" || "$component" == "." ]] && continue
+            depth=$((depth + 1))
+        done
+    fi
+    IFS='/' read -r -a parts <<< "$target"
+    for component in "${parts[@]}"; do
+        case "$component" in
+            ""|.) ;;
+            ..) depth=$((depth - 1)); ((depth >= 0)) || return 1 ;;
+            *) depth=$((depth + 1)) ;;
+        esac
+    done
+    return 0
+}
+
+# The checkout's link must be a symlink whose target equals the committed blob.
+_act_strict_symlink_is_representable() {
+    local repo_path="$1"
+    local path="$2"
+    local object_id="$3"
+    local committed_target
+
+    [[ -L "$repo_path/$path" ]] || return 1
+    committed_target=$(_act_strict_git -C "$repo_path" cat-file blob "$object_id" 2>/dev/null) || return 1
+    [[ "$(readlink "$repo_path/$path")" == "$committed_target" ]] || return 1
+    _act_strict_symlink_target_is_contained "$path" "$committed_target"
+}
+
 _act_write_tracked_manifest() {
     local repo_path="$1"
     local revision="$2"
     local output_file="$3"
     (
         local metadata path mode object_type object_id descriptor_inode path_inode
+        local kind
         set -C
         umask 077
         exec 9> "$output_file" || exit 4
@@ -3903,13 +3947,20 @@ _act_write_tracked_manifest() {
         while IFS=$'\t' read -r metadata path; do
             [[ -n "$metadata" && -n "$path" ]] || continue
             read -r mode object_type object_id <<< "$metadata"
-            if [[ ! ( ( "$object_type" == "blob" && \
-                        ( "$mode" == "100644" || "$mode" == "100755" ) ) || \
-                      ( "$object_type" == "commit" && "$mode" == "160000" ) ) || \
-                  ! "$object_id" =~ ^[0-9a-f]{40}$ || \
-                  ! "$path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ || "$path" == *..* || \
-                  ( "$mode" != "160000" && \
-                    ( ! -f "$repo_path/$path" || -L "$repo_path/$path" ) ) ]]; then
+            kind=""
+            if [[ "$object_type" == "blob" && ( "$mode" == "100644" || "$mode" == "100755" ) ]]; then
+                kind="file"
+            elif [[ "$object_type" == "commit" && "$mode" == "160000" ]]; then
+                kind="gitlink"
+            elif [[ "$object_type" == "blob" && "$mode" == "120000" ]]; then
+                kind="symlink"
+            fi
+            if [[ -z "$kind" || ! "$object_id" =~ ^[0-9a-f]{40}$ || \
+                  ! "$path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ || "$path" == *..* ]] || \
+               { [[ "$kind" == "file" ]] && \
+                 [[ ! -f "$repo_path/$path" || -L "$repo_path/$path" ]]; } || \
+               { [[ "$kind" == "symlink" ]] && \
+                 ! _act_strict_symlink_is_representable "$repo_path" "$path" "$object_id"; }; then
                 _log_error "Strict release tracked path cannot be represented safely: $path"
                 exit 4
             fi
@@ -3931,7 +3982,8 @@ _act_tracked_manifest_object_count() {
     [[ -f "$manifest_file" && ! -L "$manifest_file" ]] || return 4
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
-           ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
+           ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "120000" || \
+             "$mode" == "160000" ) && \
            "$relative_path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
         if [[ "$mode" == "160000" ]]; then
@@ -3955,7 +4007,7 @@ _act_verify_tracked_manifest_local() {
     local root_path="$1"
     local manifest_file="$2"
     local object_id mode relative_path parent expected_count actual_count gitlink_contents
-    local hashes expected_hashes hash_index
+    local hashes expected_hashes hash_index link_target link_hash
     local -a hash_paths=() hash_ids=() hash_modes=()
 
     if [[ ! -d "$root_path" || -L "$root_path" ]] || \
@@ -3965,7 +4017,8 @@ _act_verify_tracked_manifest_local() {
 
     while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
-           ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "160000" ) && \
+           ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "120000" || \
+             "$mode" == "160000" ) && \
            "$relative_path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
         if [[ "$mode" == "160000" ]]; then
@@ -3974,6 +4027,14 @@ _act_verify_tracked_manifest_local() {
                [[ -n "$gitlink_contents" ]]; then
                 return 4
             fi
+        elif [[ "$mode" == "120000" ]]; then
+            # The link itself is the tracked object: its target string must
+            # hash to the committed blob and stay inside the snapshot.
+            [[ -L "$root_path/$relative_path" ]] || return 4
+            link_target=$(readlink "$root_path/$relative_path") || return 4
+            _act_strict_symlink_target_is_contained "$relative_path" "$link_target" || return 4
+            link_hash=$(printf '%s' "$link_target" | git hash-object --no-filters --stdin 2>/dev/null) || return 4
+            [[ "$link_hash" == "$object_id" ]] || return 4
         else
             if [[ ! -f "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
                { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
@@ -4534,7 +4595,7 @@ tab=\$(printf '\\t')
 while IFS="\$tab" read -r object_id mode relative_path; do
     test -n "\$relative_path"
     printf '%s\\n' "\$object_id" | grep -Eq '^[0-9a-f]{40}\$'
-    case "\$mode" in 100644|100755|160000) :;; *) exit 21;; esac
+    case "\$mode" in 100644|100755|120000|160000) :;; *) exit 21;; esac
     case "\$relative_path" in /*|*..*) exit 21;; esac
     printf '%s\\n' "\$relative_path" | grep -Eq '^[][A-Za-z0-9_./+@~#,=() -]+\$'
     node='$remote_path'/\$relative_path
@@ -4549,6 +4610,32 @@ while IFS="\$tab" read -r object_id mode relative_path; do
         test ! -L "\$node"
         gitlink_contents=\$(find "\$node" -mindepth 1 -print -quit)
         test -z "\$gitlink_contents"
+    elif test "\$mode" = 120000; then
+        test -L "\$node"
+        target=\$(readlink "\$node")
+        test -n "\$target"
+        case "\$target" in /*) exit 21;; esac
+        printf '%s\\n' "\$target" | grep -Eq '^[][A-Za-z0-9_./+@~#,=() -]+\$'
+        depth=0
+        link_dir=\${relative_path%/*}
+        test "\$link_dir" = "\$relative_path" && link_dir=
+        set -f
+        old_ifs=\$IFS
+        IFS=/
+        for component in \$link_dir; do
+            case "\$component" in ''|.) :;; *) depth=\$((depth + 1));; esac
+        done
+        for component in \$target; do
+            case "\$component" in
+                ''|.) :;;
+                ..) depth=\$((depth - 1)); test "\$depth" -ge 0 || exit 21;;
+                *) depth=\$((depth + 1));;
+            esac
+        done
+        IFS=\$old_ifs
+        set +f
+        actual=\$(printf '%s' "\$target" | git hash-object --no-filters --stdin)
+        test "\$actual" = "\$object_id"
     else
         test -f "\$node"
         test ! -L "\$node"
