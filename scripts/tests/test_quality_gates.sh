@@ -510,6 +510,57 @@ test_run_checks_skip_checks() {
     teardown_test_env
 }
 
+test_run_checks_skip_unregistered_tool() {
+    ((TESTS_RUN++))
+    if ! command -v yq &>/dev/null; then
+        skip "yq not available"
+        return
+    fi
+
+    # Tools configured only in repos.d (xf, frankentui) have no repos.yaml
+    # entry and so no required set: --skip-checks must still skip.
+    setup_test_env
+    create_repos_yaml 'tools:
+  other-tool:
+    required_checks:
+      - "false"
+'
+    local result exit_code=0 missing_result missing_exit=0 bad_exit=0
+    result=$(qg_run_checks test-tool --skip-checks 2>/dev/null) || exit_code=$?
+    missing_result=$(DSR_REPOS_FILE="$TEST_TMPDIR/absent.yaml" \
+        qg_run_checks test-tool --skip-checks 2>/dev/null) || missing_exit=$?
+    create_repos_yaml 'tools: [unterminated'
+    qg_run_checks test-tool --skip-checks >/dev/null 2>&1 || bad_exit=$?
+    if [[ "$exit_code" -eq 0 && "$missing_exit" -eq 0 && "$bad_exit" -eq 4 ]] &&
+        jq -e '.skipped == true and .status == "skipped"' <<< "$result" >/dev/null &&
+        jq -e '.skipped == true' <<< "$missing_result" >/dev/null; then
+        pass "--skip-checks skips unregistered tools and fails closed on unreadable YAML"
+    else
+        fail "--skip-checks unregistered: exit=$exit_code missing=$missing_exit malformed=$bad_exit result=$result"
+    fi
+
+    # A registry of the wrong shape cannot prove the tool has no required
+    # checks, so it must not read as "unregistered".
+    ((TESTS_RUN++))
+    local shape shape_exit shapes_ok=true comment_exit=0
+    for shape in $'---\ntools: {}\n---\ntools:\n  test-tool:\n    required_checks: ["false"]' \
+                 $'tools:\n  - name: test-tool\n    required_checks: ["false"]' \
+                 'just a scalar' $'- test-tool\n- other'; do
+        create_repos_yaml "$shape"
+        shape_exit=0
+        qg_run_checks test-tool --skip-checks >/dev/null 2>&1 || shape_exit=$?
+        [[ "$shape_exit" -eq 4 ]] || { shapes_ok=false; echo "shape exit=$shape_exit: $shape" >&2; }
+    done
+    create_repos_yaml '# registry not populated yet'
+    qg_run_checks test-tool --skip-checks >/dev/null 2>&1 || comment_exit=$?
+    if $shapes_ok && [[ "$comment_exit" -eq 0 ]]; then
+        pass "--skip-checks fails closed on a wrong-shape registry; a comment-only one skips"
+    else
+        fail "--skip-checks wrong-shape registry: shapes_ok=$shapes_ok comment-only exit=$comment_exit"
+    fi
+    teardown_test_env
+}
+
 test_run_checks_skip_cannot_bypass_required() {
     ((TESTS_RUN++))
     if ! command -v yq &>/dev/null; then
@@ -1219,6 +1270,7 @@ main() {
     test_run_checks_help_flag
     test_run_checks_unknown_option
     test_run_checks_skip_checks
+    test_run_checks_skip_unregistered_tool
     test_run_checks_skip_cannot_bypass_required
     test_run_checks_required_failure_is_not_skippable
     test_run_checks_dry_run

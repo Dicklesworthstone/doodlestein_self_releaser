@@ -31,7 +31,7 @@
 set -uo pipefail
 
 # Version
-DSR_VERSION="0.1.2"
+DSR_VERSION="0.2.0"
 
 # Script directory (optimized: avoid dirname subshell where possible)
 _dsr_source="${BASH_SOURCE[0]}"
@@ -2194,8 +2194,9 @@ EOF
         # code. Quarantine any existing output to a sibling directory and
         # start empty. Resumed runs keep their partial output (its bytes are
         # verified against frozen receipts), and the strict path above already
-        # requires a fresh directory.
-        if ! $resume && [[ -d "$output_dir" && ! -L "$output_dir" ]] && \
+        # requires a fresh directory. --sync-only builds nothing, so it must
+        # leave the existing outputs where a following release expects them.
+        if ! $resume && ! $sync_only && [[ -d "$output_dir" && ! -L "$output_dir" ]] && \
            [[ -n "$(find "$output_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
             if [[ "$(basename "$output_dir")" == "${tool_name}-${tag}" ]]; then
                 local stale_output_dir
@@ -6150,6 +6151,7 @@ EOF
         umask 077
         temporary=$(mktemp "$state_parent/.dsr-upload-state.XXXXXXXX") || return 1
         printf -v cleanup 'rm -f -- %q' "$temporary"
+        # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
         trap "$cleanup" EXIT
         trap 'exit 5' INT TERM
         jq -nc --arg repo "$repo" --arg tag "$tag" --argjson release_id "$release_id" \
@@ -6616,6 +6618,7 @@ EOF
             umask 077
             workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-verify.XXXXXXXX") || return 1
             printf -v cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$workdir/verified" "$workdir"
+            # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
             trap "$cleanup" EXIT
             trap 'exit 5' INT TERM
             _gh_verify_uploaded_asset "$repo" "$name" "$size" "$sha" "$observed" "$workdir" >/dev/null
@@ -11156,8 +11159,15 @@ _docker_build() {
     [[ -n "$platforms" ]] && args+=(--platform "$platforms")
     $dry_run && args+=(--dry-run)
 
-    if docker_build "${args[@]}"; then
-        local duration=$(($(date +%s) - start_time))
+    # As in _docker_release: the module's stdout JSON belongs in the envelope.
+    local build_output="" exit_code=0
+    if $JSON_MODE; then
+        build_output=$(docker_build "${args[@]}") || exit_code=$?
+    else
+        docker_build "${args[@]}" || exit_code=$?
+    fi
+    local duration=$(($(date +%s) - start_time))
+    if [[ $exit_code -eq 0 ]]; then
         if $JSON_MODE; then
             local image="$DOCKER_REGISTRY/$tool:v${version#v}"
             json_envelope "docker-build" "ok" 0 "$(jq -nc \
@@ -11165,22 +11175,23 @@ _docker_build() {
                 --arg version "$version" \
                 --arg image "$image" \
                 --argjson pushed "$push" \
+                --arg result "$build_output" \
                 --argjson duration "$duration" \
-                '{tool: $tool, version: $version, image: $image, pushed: $pushed, duration_seconds: $duration}')"
+                '{tool: $tool, version: $version, image: $image, pushed: $pushed, duration_seconds: $duration,
+                  result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
         fi
         return 0
-    else
-        local exit_code=$?
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "docker-build" "error" "$exit_code" "$(jq -nc \
-                --arg tool "$tool" \
-                --arg version "$version" \
-                --argjson duration "$duration" \
-                '{tool: $tool, version: $version, duration_seconds: $duration}')"
-        fi
-        return $exit_code
     fi
+    if $JSON_MODE; then
+        json_envelope "docker-build" "error" "$exit_code" "$(jq -nc \
+            --arg tool "$tool" \
+            --arg version "$version" \
+            --arg result "$build_output" \
+            --argjson duration "$duration" \
+            '{tool: $tool, version: $version, duration_seconds: $duration,
+              result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
+    fi
+    return $exit_code
 }
 
 _docker_release() {
@@ -11188,11 +11199,22 @@ _docker_release() {
     local version=""
     local skip_sign=false
     local dry_run=false
+    local -a policy_args=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --skip-sign) skip_sign=true; shift ;;
             --dry-run|-n) dry_run=true; shift ;;
+            # The module verifies signatures and SBOM attestations against this
+            # keyless policy (also DOCKER_CERTIFICATE_IDENTITY/_OIDC_ISSUER).
+            --certificate-identity|--certificate-oidc-issuer)
+                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                    log_error "$1 requires a value"
+                    return 4
+                fi
+                policy_args+=("$1" "$2")
+                shift 2
+                ;;
             --help|-h) docker_release --help; return 0 ;;
             -*) log_error "Unknown option: $1"; return 4 ;;
             *)
@@ -11208,7 +11230,7 @@ _docker_release() {
 
     if [[ -z "$tool" || -z "$version" ]]; then
         log_error "Tool and version required"
-        log_info "Usage: dsr docker release <tool> <version>"
+        log_info "Usage: dsr docker release <tool> <version> [--certificate-identity ID --certificate-oidc-issuer URL] [--skip-sign] [--dry-run]"
         return 4
     fi
 
@@ -11218,31 +11240,41 @@ _docker_release() {
     local args=(--tool "$tool" --version "$version")
     $skip_sign && args+=(--skip-sign)
     $dry_run && args+=(--dry-run)
+    [[ ${#policy_args[@]} -eq 0 ]] || args+=("${policy_args[@]}")
 
-    if docker_release "${args[@]}"; then
-        local duration=$(($(date +%s) - start_time))
+    # The module prints its plan/result JSON on stdout. In --json mode that
+    # document goes inside the envelope, so stdout stays a single document.
+    local release_output="" exit_code=0
+    if $JSON_MODE; then
+        release_output=$(docker_release "${args[@]}") || exit_code=$?
+    else
+        docker_release "${args[@]}" || exit_code=$?
+    fi
+    local duration=$(($(date +%s) - start_time))
+    if [[ $exit_code -eq 0 ]]; then
         if $JSON_MODE; then
             local image="$DOCKER_REGISTRY/$tool:v${version#v}"
             json_envelope "docker-release" "ok" 0 "$(jq -nc \
                 --arg tool "$tool" \
                 --arg version "$version" \
                 --arg image "$image" \
+                --arg result "$release_output" \
                 --argjson duration "$duration" \
-                '{tool: $tool, version: $version, image: $image, duration_seconds: $duration}')"
+                '{tool: $tool, version: $version, image: $image, duration_seconds: $duration,
+                  result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
         fi
         return 0
-    else
-        local exit_code=$?
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            json_envelope "docker-release" "error" "$exit_code" "$(jq -nc \
-                --arg tool "$tool" \
-                --arg version "$version" \
-                --argjson duration "$duration" \
-                '{tool: $tool, version: $version, duration_seconds: $duration}')"
-        fi
-        return $exit_code
     fi
+    if $JSON_MODE; then
+        json_envelope "docker-release" "error" "$exit_code" "$(jq -nc \
+            --arg tool "$tool" \
+            --arg version "$version" \
+            --arg result "$release_output" \
+            --argjson duration "$duration" \
+            '{tool: $tool, version: $version, duration_seconds: $duration,
+              result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
+    fi
+    return $exit_code
 }
 
 _docker_sign() {

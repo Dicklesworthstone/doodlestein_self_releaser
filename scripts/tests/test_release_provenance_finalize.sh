@@ -169,7 +169,10 @@ sbom_verify_artifacts() {
 sbom_publish_artifacts() {
     trace sbom-publish
     add_asset sbom-manifest.spdx.json "$(arg --output-dir "$@")/sbom-manifest.spdx.json" || return $?
-    if [[ "$MODE" == remote-late-drift ]]; then printf drift >> "$CASE/remote/release.intoto.jsonl"; fi
+    # The remote copy keeps its 0400 staging mode: unlock it so drift happens.
+    if [[ "$MODE" == remote-late-drift ]]; then
+        chmod u+w "$CASE/remote/release.intoto.jsonl" && printf drift >> "$CASE/remote/release.intoto.jsonl"
+    fi
     printf '{"kind":"dsr-sbom-publication","status":"verified","dry_run":false}\n'
 }
 sbom_verify_release() {

@@ -561,7 +561,9 @@ signing_sign_exact() (
     local minisign_args=(-S -s "$private_key" -m "$snapshot" -x "$staged_signature" -t "$trusted_comment")
     [[ -z "$untrusted_comment" ]] || minisign_args+=(-c "$untrusted_comment")
 
-    if ! minisign "${minisign_args[@]}" >/dev/null 2>&1; then
+    # Keep stderr: it carries minisign's "Password:" prompt for an encrypted
+    # key, and hiding it makes signing look hung while it waits for input.
+    if ! minisign "${minisign_args[@]}" >/dev/null; then
         _sign_log_error "Could not create detached signature: $signature"
         status=4
     elif ! signing_verify_exact "$snapshot" "$staged_signature" "$public_key_token"; then

@@ -315,6 +315,19 @@ lease_symlink() {
 }
 expect 'host directory symlinks cannot redirect slot writes' 0 '' lease_symlink
 
+lease_relocated_state() {
+    mkdir -p "$work/relocated-real" || return 1
+    ln -s "$work/relocated-real" "$work/relocated-link" || return 1
+    lease_env relocated-link || return 1
+    local physical
+    physical=$(cd "$work/relocated-real" && pwd -P) || return 1
+    [[ "$_SELECTOR_LOCKS_DIR" == "$physical/selector/locks" ]] || return 1
+    selector_acquire_slot gamma relocated || return 1
+    [[ -f "$physical/selector/locks/gamma/relocated.lock" ]] || return 1
+    selector_release_slot gamma relocated
+}
+expect 'a symlinked state root is used through its physical path' 0 '' lease_relocated_state
+
 lease_race() {
     local backend="$1"
     lease_env "race-$backend" "$backend" || return 1

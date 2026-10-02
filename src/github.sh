@@ -1051,12 +1051,14 @@ _gh_verify_uploaded_asset() {
         (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991))
     ' <<< "$asset" >/dev/null 2>&1; then
         _gh_log_error "Asset receipt does not match the complete upload: $name"
+        _gh_log_error "An interrupted upload can leave an incomplete asset; after checking it, remove it (gh release delete-asset <tag> $name -R $repo) and re-run"
         return 7
     fi
     digest=$(jq -r 'if .digest == null then "" else .digest end' <<< "$asset") || return 7
     if [[ -n "$digest" ]]; then
         if [[ "$digest" != "sha256:$sha" ]]; then
             _gh_log_error "Release asset SHA256 mismatch: $name (existing bytes left untouched)"
+            _gh_log_error "dsr never replaces published assets: if the existing one is stale, remove it (gh release delete-asset <tag> $name -R $repo) and re-run, or release a new version"
             return 7
         fi
     else

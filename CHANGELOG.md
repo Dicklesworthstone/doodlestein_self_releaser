@@ -12,6 +12,95 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+## v0.2.0 -- 2026-10-01
+
+A large hardening release: strict release contracts, reproducible packaging,
+health/capacity-aware host scheduling, Windows cross builds via cargo-xwin with
+private Cargo caches, and fail-closed generated installers. Minor version bump
+because several defaults changed (see the upgrade notes).
+
+### Upgrade notes
+
+- Strict (release-contract) Linux Rust builds with no `linux_glibc_floor`
+  configured now build at the 2.28 default floor via `cargo zigbuild`, which
+  needs cargo-zigbuild >= 0.23 and zig on the Linux build host (a clear
+  exit-4 error names this otherwise). Repos that must link the host glibc set
+  `linux_glibc_floor: native` for that platform.
+- `dsr release` never replaces a published asset. v0.1.2 deleted and
+  re-uploaded a same-name asset; now an asset whose bytes differ fails that
+  upload (exit 1) and leaves the published bytes untouched. The error names
+  the asset and the `gh release delete-asset` command to use when it is stale.
+- Selector slot files written by v0.1.2 (a bare run id in
+  `~/.local/state/dsr/selector/locks/<host>/*.lock`) are treated as occupied
+  until inspected. If no v0.1.2 build is still running, remove leftovers
+  before the first v0.2.0 build, or that host stays at capacity.
+- `dsr docker release` publishes signed, SBOM-attested images and verifies
+  them against a keyless policy: pass `--certificate-identity` and
+  `--certificate-oidc-issuer` (or set `DOCKER_CERTIFICATE_IDENTITY` /
+  `DOCKER_CERTIFICATE_OIDC_ISSUER`); syft is required, and `:latest` is not
+  pushed.
+- Generated installers require `minisign` on the client when the repo
+  configures a public key, refuse a symlinked existing binary, and build from
+  source only under Bash 4+.
+
+### Fixed in the v0.2.0 release review
+
+- Generated `curl | bash` installers aborted on stock macOS Bash 3.2 for every
+  archived release, right after the checksum passed: archive extraction used
+  an associative array, and empty-array expansions tripped `set -u` before
+  Bash 4.4. Duplicate-member detection is now portable, and source builds
+  (which need Bash 4) refuse with a clear message instead of failing midway.
+  The integrity suite runs the generated installer under `/bin/bash` 3.2 when
+  one exists (or `DSR_TEST_LEGACY_BASH`).
+- `install_gen_create` printed ShellCheck findings on stdout ahead of the
+  installer path, so callers received a garbage path whenever the generated
+  script had a finding (it always had two: the deliberate early-expanded
+  cleanup traps, now annotated).
+- Generated installers exited 1 with no message when the install directory
+  was a symlink (common with dotfile managers); they now install into the
+  directory it resolves to.
+- `--skip-checks` failed with exit 4 for tools configured only in `repos.d`
+  (no `repos.yaml` entry), so `dsr fallback --skip-checks` could not release
+  them. Such tools have no required set and skip as before; a `repos.yaml`
+  that exists but cannot be read still fails closed.
+- Host capacity acquisition failed every build when the state directory was a
+  symlink; the selector now works through the physical path.
+- Minisign's password prompt was hidden, so signing with an encrypted key
+  looked hung. Its stderr is visible again.
+- Two concurrent xwin builds of the same target on one host: the second gave
+  up immediately (at verify time, discarding a finished compile). It now waits
+  up to `DSR_XWIN_TOOLCHAIN_LOCK_TIMEOUT` seconds (default 1800).
+- `dsr build --sync-only` quarantined the existing artifacts without building
+  anything, so a following `dsr release` found an empty directory.
+- `dsr docker release` rejected the `--certificate-*` options its module
+  requires, and `dsr --json docker build|release` wrote two JSON documents to
+  stdout; the module result now sits inside the envelope as `.result`.
+- Release build plans pinned an xwin output as the selected candidate before
+  checking that it contained exactly the selected executables, so a retry
+  into the same `--output-dir` re-imported the bad output forever instead of
+  compiling again. The inventory is now checked before anything is pinned;
+  import failures of a valid selection still recover without recompiling.
+- Several drift/corruption test cases appended to fixture files that dsr
+  stages read-only (0400). Run as a non-root user they corrupted nothing, so
+  dsr rightly succeeded and the cases failed; the fixtures now unlock their
+  copy first, and dsr's detection is exercised again.
+- `shellcheck -S warning` is clean again across `dsr`, `src/`, `scripts/` and
+  `install.sh` (16 warnings had accumulated since v0.1.2; the intentional
+  early-expanded cleanup traps are now annotated).
+
+### Known issues
+
+- `dsr --dry-run release` of a strict contract that uses minisign fails when
+  the signatures do not exist yet (plan mode cannot sign). Real releases are
+  unaffected.
+- On a macOS dispatcher, slot ownership compares `ps`/`sysctl` timestamps that
+  follow `TZ`; concurrent dsr runs with different `TZ` values can reclaim each
+  other's slots.
+- Native (non-xwin) Rust builds still symlink the host's `~/.cargo/registry`
+  into the release snapshot (#15); xwin builds use private cache snapshots.
+
+### Changes since v0.1.2
+
 - A cancelled build (Ctrl-C, or TERM to the orchestrator) left its per-target
   source copy behind: the worker TERMs the build's process group, which never
   reaches the removals after the build command, so each interrupted run kept a
@@ -20,12 +109,6 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
   no longer touch the operator's `~/.config/dsr/repos.d` (act_runner.sh reset
   the fixture's `ACT_REPOS_DIR` when sourced, so the native suite created an
   empty `repos.d/tool.yaml` there).
-
-- Upgrade note for strict (release-contract) Linux Rust builds: with no
-  `linux_glibc_floor` configured they now build at the 2.28 default floor via
-  `cargo zigbuild`, which needs cargo-zigbuild >= 0.23 and zig on the Linux
-  build host (a clear exit-4 error names this otherwise). Repos that must link
-  the host glibc set `linux_glibc_floor: native` for that platform.
 
 - `dsr doctor` (full mode) now runs the artifact-naming consistency check
   from `dsr repos validate --naming` and reports drifting repos by name, so a
@@ -182,6 +265,19 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
   README, license, and notice files. Companion paths are validated and staged
   without allowing a missing file, symlinked path component, traversal, or
   binary-name collision to produce an incomplete archive.
+
+## v0.1.2 -- 2026-08-02
+
+- Host selection is health- and capacity-aware: `act_get_native_host`
+  consults the selector between the per-repo `cross_compile` override and the
+  static `platform_mapping`, so a second same-platform host absorbs overflow
+  and covers an unhealthy, disabled, or sleeping primary. Every selector
+  failure falls back to the previous behavior; `DSR_DISABLE_HOST_SELECTOR=1`
+  opts out.
+- Disabled hosts are no longer silently re-selected through the compiled-in
+  default.
+- Quality-check durations are measured in milliseconds on BSD/macOS instead
+  of whole seconds (sub-second checks were recorded as `0ms`).
 
 ## v0.1.1 -- 2026-07-20
 

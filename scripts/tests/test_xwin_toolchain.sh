@@ -92,9 +92,27 @@ reject 'concatenated manifest documents are refused' 4 xwin_toolchain_prepare "$
 contended_prepare() (
     exec 8>> "$CACHE/$(jq -r .manifest_sha256 "$WORK/first.json").lock"
     flock -n 8 || exit 1
-    xwin_toolchain_prepare "$MANIFEST" "$CACHE"
+    DSR_XWIN_TOOLCHAIN_LOCK_TIMEOUT=1 xwin_toolchain_prepare "$MANIFEST" "$CACHE"
 )
 reject 'concurrent admission is bounded and refuses the occupied lock' 2 contended_prepare
+nowait_prepare() (
+    exec 8>> "$CACHE/$(jq -r .manifest_sha256 "$WORK/first.json").lock"
+    flock -n 8 || exit 1
+    DSR_XWIN_TOOLCHAIN_LOCK_TIMEOUT=0 xwin_toolchain_prepare "$MANIFEST" "$CACHE"
+)
+reject 'a zero lock timeout refuses an occupied lock without waiting' 2 nowait_prepare
+released_prepare() (
+    lock="$CACHE/$(jq -r .manifest_sha256 "$WORK/first.json").lock"
+    ( exec 8>> "$lock"; flock -n 8 || exit 1; touch "$WORK/held"; sleep 2 ) &
+    local tries=0 started
+    while [[ ! -e "$WORK/held" ]] && ((tries++ < 100)); do sleep 0.1; done
+    [[ -e "$WORK/held" ]] || exit 1
+    started=$SECONDS
+    DSR_XWIN_TOOLCHAIN_LOCK_TIMEOUT=30 xwin_toolchain_prepare "$MANIFEST" "$CACHE" || exit $?
+    # It must have waited for the holder rather than raced ahead of it.
+    ((SECONDS - started >= 1))
+)
+assert 'a concurrent preparation of the same view is waited for, not refused' released_prepare
 printf 'changed\n' >> "$WORK/tools/clang"
 reject 'compiler identity drift refused before cache reuse' 7 xwin_toolchain_prepare "$MANIFEST" "$CACHE" verify
 printf '#!/usr/bin/env bash\nprintf "clang version 1\\n"\n' > "$WORK/tools/clang"

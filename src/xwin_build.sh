@@ -394,6 +394,7 @@ _xwb_build() {
     # Freeze the path for source callers whose worker locals have unwound
     # before the containing subshell runs its EXIT trap.
     printf -v exit_trap '_xwb_finish %q' "$run"
+    # shellcheck disable=SC2064 # expand now: that freeze is the point
     trap "$exit_trap" EXIT
     trap _xwb_interrupt HUP INT TERM
     if [[ "$release" == true ]]; then

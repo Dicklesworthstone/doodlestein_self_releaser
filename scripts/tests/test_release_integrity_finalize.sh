@@ -139,6 +139,9 @@ gh() {
     jq '.release.draft=false' "$CASE/context.json" > "$CASE/ctx"; mv "$CASE/ctx" "$CASE/context.json"
     if [[ "$FI_MODE" == remote-after-promote ]]; then
         id=$(jq -r '.[]|select(.name=="a.tar.gz.minisig")|.id' "$CASE/remote/inventory.json")
+        # The staged signature copy is 0400; without this a non-root run
+        # never changes it and the drift case silently tests nothing.
+        chmod u+w "$CASE/remote/files/$id" || return 99
         printf changed >> "$CASE/remote/files/$id"
     fi
     if [[ "$FI_MODE" == local-after-promote ]]; then printf changed >> "$ART/a.tar.gz"; fi

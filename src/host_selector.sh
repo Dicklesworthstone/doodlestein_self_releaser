@@ -95,7 +95,8 @@ _sel_limit_from_config() {
 # Usage: selector_init
 selector_init() {
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
-    [[ ! -L "$state_dir" ]] || return 4
+    # The operator may relocate state with a symlinked root (build_state
+    # accepts one too); work in its physical path. Links below it stay refused.
     mkdir -p -- "$state_dir" || return 4
     state_dir=$(cd "$state_dir" && pwd -P) || return 4
     _SELECTOR_STATE_DIR="$state_dir/selector"
@@ -122,8 +123,8 @@ _sel_prepare_host() {
 _sel_lock_backend() (
     local marker="$_SELECTOR_STATE_DIR/lock-backend" temporary backend
     if [[ ! -e "$marker" && ! -L "$marker" ]]; then
-        backend=mkdir
-        if command -v flock &>/dev/null; then backend=flock; fi
+        backend='mkdir'
+        if command -v flock &>/dev/null; then backend='flock'; fi
         temporary=$(mktemp "$_SELECTOR_STATE_DIR/.backend.XXXXXXXX") || return 4
         local cleanup
         printf -v cleanup 'rm -f -- %q' "$temporary"
