@@ -12,6 +12,20 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+## v0.2.1 -- 2026-10-01
+
+- Rerunning `install.sh` never upgraded an install made with `--version`:
+  that clone is a shallow, detached checkout of a tag whose fetch refspec
+  only re-fetches the same tag, so `git pull` reported "Already up to date"
+  and the installer printed "Updated dsr to latest" while the old version
+  stayed in place. An explicit `--version` was likewise ignored whenever a
+  clone already existed. The installer now fetches and checks out the
+  requested tag in place, moves a pinned clone back onto `main` when no
+  version is given (the default), and pulls only a clone that is on a
+  branch. If a fresh clone fails after an in-place update could not be
+  done (for example a mistyped `--version`), the previous clone is restored
+  instead of leaving `dsr` pointing at a missing checkout.
+
 ## v0.2.0 -- 2026-10-01
 
 A large hardening release: strict release contracts, reproducible packaging,
