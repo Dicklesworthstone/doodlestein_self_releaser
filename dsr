@@ -5294,13 +5294,115 @@ _source_release_inputs_match() {
     fi
 }
 
+_source_release_read_private_receipt() {
+    local file="$1" receipt_dir="$2" tool="$3" tag="$4"
+    [[ -f "$file" && ! -L "$file" && -d "$receipt_dir" && ! -L "$receipt_dir" &&
+       "${file##*/}" == "$tool-$tag.json."* &&
+       "$(cd "${file%/*}" && pwd -P)" == "$(cd "$receipt_dir" && pwd -P)" ]] || return 4
+    python3 -I - "$file" "$receipt_dir" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+if not __debug__:
+    raise SystemExit("Source-only receipt validation requires enabled predicates")
+
+def identity(value):
+    return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns,
+            value.st_ctime_ns, value.st_mode, value.st_uid, value.st_nlink]
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate receipt field")
+        value[key] = item
+    return value
+
+directory_fd = receipt_fd = None
+try:
+    path, directory = map(os.path.abspath, sys.argv[1:])
+    assert os.path.dirname(path) == directory
+    assert os.path.realpath(directory) == directory
+    assert getattr(os, "O_NOFOLLOW", 0) and getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent = os.fstat(directory_fd)
+    assert stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.geteuid()
+    assert not parent.st_mode & 0o022
+    directory_identity = [parent.st_dev, parent.st_ino, parent.st_mode, parent.st_uid]
+    name = os.path.basename(path)
+    receipt_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    before = os.fstat(receipt_fd)
+    assert stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
+    assert stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1
+    assert 0 < before.st_size <= 1048576
+    assert identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) == identity(before)
+    chunks = []
+    remaining = 1048577
+    while remaining:
+        chunk = os.read(receipt_fd, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    assert len(raw) == before.st_size and len(raw) <= 1048576
+    record = json.loads(raw, object_pairs_hook=unique_object)
+    assert isinstance(record, dict)
+    assert identity(os.fstat(receipt_fd)) == identity(before)
+    assert identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) == identity(before)
+    named_parent = os.lstat(directory)
+    assert [named_parent.st_dev, named_parent.st_ino, named_parent.st_mode,
+            named_parent.st_uid] == directory_identity
+    print(json.dumps({"record": record, "identity": identity(before),
+                      "directory_identity": directory_identity,
+                      "sha256": hashlib.sha256(raw).hexdigest()}))
+except (OSError, ValueError, AssertionError):
+    raise SystemExit("Source-only receipt failed private descriptor validation")
+finally:
+    if receipt_fd is not None:
+        os.close(receipt_fd)
+    if directory_fd is not None:
+        os.close(directory_fd)
+PY
+}
+
+_source_release_resume_receipt_matches() {
+    local file="$1" dir="$2" tool="$3" tag="$4" fingerprint="$5" observed=""
+    [[ -z "$file" ]] && return 0
+    observed=$(_source_release_read_private_receipt "$file" "$dir" "$tool" "$tag") || return 4
+    jq -e --argjson expected "$fingerprint" '
+        {identity,directory_identity,sha256} == $expected
+    ' <<< "$observed" >/dev/null
+}
+
+_source_release_scan_created() {
+    local repo="$1" tag="$2" attempt=0 scan="" count=""
+    while ((attempt < 3)); do
+        scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+        count=$(jq -r '.count' <<< "$scan") || return 7
+        if [[ "$count" == 1 ]]; then printf '%s\n' "$scan"; return 0; fi
+        [[ "$count" == 0 ]] || return 7
+        attempt=$((attempt + 1))
+        ((attempt < 3)) && sleep 1
+    done
+    log_error "New source-only draft is not yet visible; retain and resume its private pending receipt"
+    return 7
+}
+
 cmd_release_source_only() {
     local tool="" version="" notes="" no_dispatch=false draft=false prerelease=false
+    local resume_receipt="" saved_receipt="" saved_sha="" saved_fingerprint="" resume_release_id=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --notes-file)
                 [[ $# -ge 2 && "$2" != -* ]] || return 4
                 notes="$2"; shift 2 ;;
+            --resume-receipt)
+                [[ $# -ge 2 && "$2" == /* ]] || return 4
+                resume_receipt="$2"; shift 2 ;;
             --no-dispatch) no_dispatch=true; shift ;;
             --draft) draft=true; shift ;;
             --prerelease) prerelease=true; shift ;;
@@ -5312,6 +5414,7 @@ Publishes an installer/source-only GitHub Release with exactly zero assets.
 Requires publication_mode: source-only in repos.d, a clean exact tagged checkout,
 the same peeled tag on GitHub, and explicit reviewed notes. Always verifies an
 owned draft before publication. --draft, --prerelease, and global --dry-run work.
+Use --resume-receipt /absolute/path to recover your private pending draft record.
 Binary artifact, resume, upgrade-verification, and dispatch options are refused.
 EOF
                 return 0 ;;
@@ -5379,47 +5482,83 @@ EOF
     # jq's rawfile preserves every trailing newline before the ownership nonce.
     notes_json=$(jq -n --rawfile body "$notes" '{body:$body}') || return 4
     [[ "$(_gh_asset_sha256 "$notes")" == "$notes_sha" ]] || return 4
+    local receipt_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/source-only"
     local scan="" nonce="" expected="" title="" body="" release="" release_id=""
     scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
-    [[ "$(jq -r '.count' <<< "$scan")" == 0 ]] || {
-        log_error "Source-only release already exists; refusing to replace or adopt it"
-        return 4
-    }
-    nonce=$(_release_contract_create_nonce) || return 4
+    if [[ -n "$resume_receipt" ]]; then
+        saved_receipt=$(_source_release_read_private_receipt "$resume_receipt" "$receipt_dir" "$tool" "$tag") || return 4
+        saved_sha=$(jq -r '.sha256' <<< "$saved_receipt") || return 4
+        saved_fingerprint=$(jq -c '{identity,directory_identity,sha256}' <<< "$saved_receipt") || return 4
+        saved_receipt=$(jq -c '.record' <<< "$saved_receipt") || return 4
+        _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" || return 4
+        jq -e --arg repo "$repo" --arg notes "$notes_sha" --arg config "$config_sha" \
+            --arg registry "$registry_sha" --argjson draft "$draft" '
+            .publication_mode == "source-only" and .status == "pending" and
+            .repo == $repo and .notes_sha256 == $notes and .config_sha256 == $config and
+            ((.registry_sha256 == $registry) or (.registry_sha256 == null and $registry == "absent")) and
+            (.requested_draft == null or .requested_draft == $draft)
+        ' <<< "$saved_receipt" >/dev/null || return 4
+        nonce=$(jq -er '.metadata.body | capture("\\n\\n<!-- dsr-source-only-create:(?<nonce>[0-9a-f]{64}) -->$").nonce' \
+            <<< "$saved_receipt") || return 4
+        [[ "$(jq -r '.count' <<< "$scan")" == 1 ]] || return 7
+    else
+        [[ "$(jq -r '.count' <<< "$scan")" == 0 ]] || {
+            log_error "Source-only release already exists; refusing to replace or adopt it"
+            return 4
+        }
+        nonce=$(_release_contract_create_nonce) || return 4
+    fi
     title="$tag (source only)"
     expected=$(jq -n --arg tag "$tag" --arg title "$title" --arg sha "$sha" \
         --arg nonce "$nonce" --argjson notes "$notes_json" --argjson prerelease "$prerelease" '
         {tag_name:$tag,name:$title,target_commitish:$sha,prerelease:$prerelease,
          body:($notes.body + "\n\n<!-- dsr-source-only-create:" + $nonce + " -->")}
     ') || return 4
+    if [[ -n "$resume_receipt" ]]; then
+        jq -e --argjson expected "$expected" '.metadata == $expected' <<< "$saved_receipt" >/dev/null || return 4
+        release=$(jq -c '.release' <<< "$scan") || return 7
+        release_id=$(jq -r '.id // empty' <<< "$release") || return 7
+        [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 7
+        _source_release_metadata_matches "$release" "$expected" "$release_id" true || return 7
+        _source_release_observe "$repo" "$release_id" "$expected" true >/dev/null || return 7
+        resume_release_id="$release_id"
+    fi
     body=$(jq -r '.body' <<< "$expected") || return 4
     if $DRY_RUN; then
         log_info "Would publish exact source $sha as $repo $tag with zero assets"
         $JSON_MODE && json_envelope "release source-only" "success" 0 "$expected"
         return 0
     fi
-    local receipt_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/source-only"
     mkdir -p "$receipt_dir" || return 7
     local receipt=""
     receipt=$(mktemp "$receipt_dir/$tool-$tag.json.XXXXXXXX") || return 7
     jq -n --argjson expected "$expected" --arg repo "$repo" --arg notes_sha "$notes_sha" \
-        --arg config_sha "$config_sha" '{publication_mode:"source-only",repo:$repo,
-        metadata:$expected,notes_sha256:$notes_sha,config_sha256:$config_sha,status:"pending"}' \
+        --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" --argjson draft "$draft" \
+        --arg resumed_from "$resume_receipt" --arg resumed_sha "$saved_sha" '
+        {publication_mode:"source-only",repo:$repo,metadata:$expected,notes_sha256:$notes_sha,
+         config_sha256:$config_sha,registry_sha256:$registry_sha,requested_draft:$draft,
+         resumed_from:$resumed_from,resumed_receipt_sha256:$resumed_sha,status:"pending"}' \
         > "$receipt" || return 7
     _source_release_identity "$repo" "$path" "$tag" "$sha" || return 4
     _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
         "$registry" "$registry_sha" || return 4
     # Create only as draft. A transport failure is reconciled by the unique
     # nonce-bound metadata, never by accepting someone else's same-tag draft.
-    local -a create_args=("$repo" "$tag" --name "$title" --body "$body" --draft --target-commitish "$sha")
-    $prerelease && create_args+=(--prerelease)
-    GH_MAX_RETRIES=1 gh_create_release "${create_args[@]}" >/dev/null || true
-    scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+    if [[ -n "$resume_receipt" ]]; then
+        _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" || return 4
+    else
+        local -a create_args=("$repo" "$tag" --name "$title" --body "$body" --draft --target-commitish "$sha")
+        $prerelease && create_args+=(--prerelease)
+        GH_MAX_RETRIES=1 gh_create_release "${create_args[@]}" >/dev/null || true
+    fi
+    scan=$(_source_release_scan_created "$repo" "$tag") || return 7
     release=$(jq -c '.release' <<< "$scan") || return 7
     release_id=$(jq -r '.id // empty' <<< "$release") || return 7
     [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 7
+    [[ -z "$resume_release_id" || "$release_id" == "$resume_release_id" ]] || return 7
     _source_release_metadata_matches "$release" "$expected" "$release_id" true || return 7
     if ! _source_release_observe "$repo" "$release_id" "$expected" true >/dev/null ||
+       ! _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" ||
        ! _source_release_identity "$repo" "$path" "$tag" "$sha" ||
        ! _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
             "$registry" "$registry_sha"; then
@@ -5431,6 +5570,7 @@ EOF
             --no-cache >/dev/null 2>&1 || true
     fi
     if ! release=$(_source_release_observe "$repo" "$release_id" "$expected" "$draft") ||
+       ! _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" ||
        ! _source_release_identity "$repo" "$path" "$tag" "$sha" ||
        ! _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
             "$registry" "$registry_sha"; then
@@ -5439,10 +5579,12 @@ EOF
     fi
     jq -n --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" \
         --arg notes_sha "$notes_sha" --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" \
+        --arg resumed_from "$resume_receipt" --arg resumed_sha "$saved_sha" \
         --argjson expected "$expected" --argjson release "$release" '
         {publication_mode:"source-only",repo:$repo,tag:$tag,git_sha:$sha,
          notes_sha256:$notes_sha,config_sha256:$config_sha,registry_sha256:$registry_sha,
          metadata:$expected,asset_count:0,release_id:$release.id,
+         resumed_from:$resumed_from,resumed_receipt_sha256:$resumed_sha,
          draft:$release.draft,url:$release.html_url,status:"success"}
     ' > "$receipt" || {
         _source_release_restore_draft "$repo" "$release_id" "$expected" || true

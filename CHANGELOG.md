@@ -18,6 +18,9 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
   Creation custody, metadata, tag identity, and both asset inventories are
   verified before publication; failures restore the newly owned release to
   draft. Source publication receipts remain separate from build manifests.
+  Bounded read-only reconciliation tolerates delayed draft visibility. Explicit
+  private pending-receipt recovery retains the original record and cannot
+  recreate a release or adopt an unrelated draft.
 
 - Strict source snapshots support direct contained relative symlinks, preserving
   their tracked target bytes and executable/file modes. Link admission and both

@@ -459,6 +459,16 @@ Use `--draft` to retain the verified draft, or global `--dry-run` to inspect the
 admission result without creating a release. Source-only configuration cannot
 be used by the normal binary publication command.
 
+If GitHub temporarily omits a newly created draft from its release list, DSR
+retains the private pending receipt. Retry with the same inputs and
+`--resume-receipt /absolute/path/to/the/receipt`. Recovery verifies the original
+nonce-bound draft and creates no new release; it retains the original receipt
+and records a separate recovery receipt. Ordinary `--resume` remains a binary
+publication option and is refused in source-only mode.
+Recovery requires Python 3 for bounded, no-follow descriptor validation of the
+private receipt and its directory; device, inode, and byte identity remain
+fixed through publication.
+
 ### `dsr canary`
 
 Run a repository's installer in a clean Linux container, then require its

@@ -14,11 +14,14 @@ import sys
 import tempfile
 
 root = Path(sys.argv[1])
+os.umask(0o077)
 work = Path(tempfile.mkdtemp(prefix='dsr-source-release-'))
 source = (root / 'dsr').read_text()
 names = ['_source_release_identity', '_source_release_metadata_matches',
          '_source_release_observe', '_source_release_restore_draft',
          '_source_release_inputs_match',
+         '_source_release_read_private_receipt', '_source_release_resume_receipt_matches',
+         '_source_release_scan_created',
          'cmd_release_source_only', 'cmd_release',
          '_release_contract_verify_remote_tag_identity',
          '_release_contract_scan_release_by_tag', '_release_contract_create_nonce',
@@ -53,6 +56,15 @@ if endpoint=='repos/owner/app/releases' and '--post' in args:
     sys.exit(1 if control.get('lost_post') else 0)
 if endpoint.startswith('repos/owner/app/releases?'):
     if control.get('scan_failure'): sys.exit(88)
+    if release is not None and control.get('omit_created'):
+        print('[]');sys.exit(0)
+    if release is not None and control.get('delay_created',0)>0:
+        control['delay_created']-=1;(case/'control.json').write_text(json.dumps(control))
+        print('[]');sys.exit(0)
+    if release is not None and control.get('switch_scan_id'):
+        calls=control.get('resume_scan_calls',0)+1
+        control['resume_scan_calls']=calls;(case/'control.json').write_text(json.dumps(control))
+        if calls>1:release=dict(release,id=10)
     if control.get('scan_malformed'): print('{}')
     else: print(json.dumps([release] if release is not None else []))
 elif endpoint.startswith('repos/owner/app/git/ref/tags/'):
@@ -71,6 +83,12 @@ elif endpoint=='repos/owner/app/releases/9' and '--method' in args:
     release_file.write_text(json.dumps(release)); print(json.dumps(release))
     sys.exit(1 if control.get('lost_patch') else 0)
 elif endpoint=='repos/owner/app/releases/9':
+    if control.get('receipt_replace'):
+        path=Path(control['receipt_path']);retained=path.with_name(path.name+'.retained')
+        path.rename(retained)
+        if control['receipt_replace']=='symlink':path.symlink_to(retained)
+        else:path.write_bytes(retained.read_bytes());path.chmod(0o600)
+        control['receipt_replace']=False;(case/'control.json').write_text(json.dumps(control))
     if control.get('wrong_observed_id'): release=dict(release,id=99)
     print(json.dumps(release))
 elif endpoint.startswith('repos/owner/app/releases/9/assets?'):
@@ -153,6 +171,81 @@ assert_ok('requested draft has no PATCH',not any('--method' in r for r in reques
 case,repo,config=setup('dry-run'); proc,requests=invoke(case,dry=True)
 assert_ok('dry-run admitted',proc.returncode==0)
 assert_ok('dry-run no mutation/receipt',not any('--post' in r or '--method' in r for r in requests) and not (case/'state').exists())
+
+case,repo,config=setup('delayed-visibility',{'delay_created':2}); proc,requests=invoke(case)
+assert_ok('delayed visibility reconciles',proc.returncode==0)
+assert_ok('delayed visibility creates once',sum('--post' in r for r in requests)==1)
+
+for label in ('resume','resume-legacy','resume-draft','resume-dry-run','resume-notes',
+              'resume-config','resume-registry','resume-tag','resume-mode','resume-symlink',
+              'resume-hardlink','resume-outside','resume-schema','resume-nonce',
+              'resume-metadata','resume-wrong-id','resume-hidden-asset','resume-lost-patch',
+              'resume-scan-id','resume-parent-mode','resume-inode','resume-path-race',
+              'resume-optimized-mode'):
+    case,repo,config=setup(label,{'omit_created':True})
+    initial_flags=['--notes-file',str(case/'notes.md'),'--no-dispatch']
+    if label=='resume-draft':initial_flags+=['--draft']
+    first,requests=invoke(case,initial_flags)
+    assert_ok(label+' omission keeps pending draft',first.returncode==7 and json.loads((case/'remote.json').read_text())['draft'] is True and not any('--method' in r for r in requests))
+    pending=next((case/'state'/'source-only').glob('*.json.*'))
+    if label=='resume-legacy':
+        data=json.loads(pending.read_text());data.pop('registry_sha256');data.pop('requested_draft');pending.write_text(json.dumps(data))
+    before=pending.read_bytes()
+    control={}
+    if label=='resume-notes':(case/'notes.md').write_text('changed reviewed notes')
+    if label=='resume-config':
+        config['local_path']=str(repo)+'/'
+        (case/'repos.d'/'app.yaml').write_text(json.dumps(config))
+    if label=='resume-registry':(case/'repos.yaml').write_text(json.dumps({'tools':{}}))
+    if label=='resume-tag':control['remote_tag_wrong']=True
+    if label=='resume-mode':pending.chmod(0o644)
+    if label=='resume-optimized-mode':
+        pending.chmod(0o644);os.environ['PYTHONOPTIMIZE']='1'
+    if label=='resume-parent-mode':pending.parent.chmod(0o770)
+    resume_path=pending
+    if label=='resume-symlink':
+        resume_path=pending.with_name(pending.name+'.link');resume_path.symlink_to(pending)
+    if label=='resume-hardlink':
+        resume_path=pending.with_name(pending.name+'.hard');os.link(pending,resume_path)
+    if label=='resume-outside':
+        resume_path=case/pending.name;shutil.copyfile(pending,resume_path);resume_path.chmod(0o600)
+    if label in ('resume-schema','resume-nonce','resume-metadata'):
+        data=json.loads(pending.read_text())
+        if label=='resume-schema':data['publication_mode']='binary'
+        if label=='resume-nonce':data['metadata']['body']=data['metadata']['body'].replace('dsr-source-only-create:','invalid-nonce:')
+        if label=='resume-metadata':data['metadata']['name']='peer title'
+        pending.write_text(json.dumps(data));before=pending.read_bytes()
+    if label=='resume-wrong-id':control['wrong_observed_id']=True
+    if label=='resume-hidden-asset':control['hidden_asset']=True
+    if label=='resume-lost-patch':control['lost_patch']=True
+    if label=='resume-scan-id':control['switch_scan_id']=True
+    if label in ('resume-inode','resume-path-race'):
+        control['receipt_replace']='symlink' if label=='resume-path-race' else 'regular'
+        control['receipt_path']=str(pending)
+    (case/'control.json').write_text(json.dumps(control))
+    flags=initial_flags+['--resume-receipt',str(resume_path)]
+    proc,requests=invoke(case,flags,dry=label=='resume-dry-run')
+    if label=='resume-optimized-mode':os.environ.pop('PYTHONOPTIMIZE',None)
+    assert_ok(label+' never recreates',sum('--post' in r for r in requests)==1)
+    assert_ok(label+' original pending bytes retained',pending.read_bytes()==before)
+    if label in ('resume','resume-legacy','resume-draft','resume-dry-run','resume-lost-patch'):
+        assert_ok(label+' admitted',proc.returncode==0)
+        if label in ('resume-draft','resume-dry-run'):
+            assert_ok(label+' no publication PATCH',not any('--method' in r for r in requests))
+        else:assert_ok(label+' published same owned ID',json.loads((case/'remote.json').read_text())['id']==9 and json.loads((case/'remote.json').read_text())['draft'] is False)
+        receipts=list((case/'state'/'source-only').glob('*.json.*'))
+        assert_ok(label+' recovery receipt count',len(receipts)==(1 if label=='resume-dry-run' else 2))
+    else:
+        assert_ok(label+' refused without mutation',proc.returncode in (4,7) and not any('--method' in r for r in requests))
+
+case,repo,config=setup('isolated-receipt-import',{'omit_created':True})
+first,requests=invoke(case)
+pending=next((case/'state'/'source-only').glob('*.json.*'))
+(case/'json.py').write_text('raise RuntimeError("untrusted local import")\n')
+reader=subprocess.run(['bash','-c','source "$1"; _source_release_read_private_receipt "$2" "$3" app v1.2.3',
+                      'receipt-import-test',str(functions),str(pending),str(pending.parent)],
+                      cwd=case,env=dict(os.environ,PYTHONOPTIMIZE='1'),capture_output=True,text=True,timeout=60)
+assert_ok('private reader isolates local imports and optimization',reader.returncode==0 and json.loads(reader.stdout)['record']['status']=='pending')
 
 for label,control in [('failed-scan',{'scan_failure':True}),('malformed-scan',{'scan_malformed':True}),
                       ('config-moves',{'config_moves':True}),('registry-appears',{'registry_appears':True}),
