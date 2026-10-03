@@ -10,6 +10,25 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ---
 
+## v0.2.3 -- 2026-10-03
+
+`dsr release source-only` accepts an exact crate or workspace tag with
+`--tag`, such as `fp-types-v0.4.0`, instead of a positional version. It preserves
+the supplied tag and requires the same clean checkout, matching local and
+remote peeled tag, private creation custody and empty asset inventories as
+version-based source publication. Supplying both forms, duplicate tags or an
+unsafe ref component is refused.
+
+The new route passes 132 exact-tag checks alongside the unchanged 175
+source-only, 95 strict-draft and 23 binary-recovery checks, plus Bash syntax and
+focused warning-level ShellCheck through the remote test lane. The GitHub HTTP
+boundary in these checks is a fixture; actual publication and installer
+qualification are separate release steps. Existing native Rust routing, audit
+performance and SPDX license-label limitations remain tracked in
+[#17](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/17),
+[#22](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/22)
+and [#24](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/24).
+
 ## v0.2.2 -- 2026-10-02
 
 - Strict release creation keeps adapter diagnostics separate from JSON. An

@@ -31,7 +31,7 @@
 set -uo pipefail
 
 # Version
-DSR_VERSION="0.2.2"
+DSR_VERSION="0.2.3"
 
 # Script directory (optimized: avoid dirname subshell where possible)
 _dsr_source="${BASH_SOURCE[0]}"
@@ -5558,10 +5558,13 @@ _source_release_scan_created() {
 }
 
 cmd_release_source_only() {
-    local tool="" version="" notes="" no_dispatch=false draft=false prerelease=false
+    local tool="" version="" exact_tag="" notes="" no_dispatch=false draft=false prerelease=false
     local resume_receipt="" saved_receipt="" saved_sha="" saved_fingerprint="" resume_release_id=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --tag)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* && -z "$exact_tag" ]] || return 4
+                exact_tag="$2"; shift 2 ;;
             --notes-file)
                 [[ $# -ge 2 && "$2" != -* ]] || return 4
                 notes="$2"; shift 2 ;;
@@ -5574,12 +5577,14 @@ cmd_release_source_only() {
             --help|-h)
                 cat <<'EOF'
 dsr release source-only <tool> <version> --notes-file <file> --no-dispatch
+dsr release source-only <tool> --tag <exact-tag> --notes-file <file> --no-dispatch
 
 Publishes an installer/source-only GitHub Release with exactly zero assets.
 Requires publication_mode: source-only in repos.d, a clean exact tagged checkout,
 the same peeled tag on GitHub, and explicit reviewed notes. Always verifies an
 owned draft before publication. --draft, --prerelease, and global --dry-run work.
 Use --resume-receipt /absolute/path to recover your private pending draft record.
+Use --tag instead of a version for a single-component crate or workspace tag.
 Binary artifact, resume, upgrade-verification, and dispatch options are refused.
 EOF
                 return 0 ;;
@@ -5592,9 +5597,14 @@ EOF
                 shift ;;
         esac
     done
-    [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ && -n "$version" &&
+    [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ &&
        -s "$notes" && ! -L "$notes" && "$no_dispatch" == true ]] || {
-        log_error "Source-only publication requires tool/version, regular reviewed notes and --no-dispatch"
+        log_error "Source-only publication requires a tool, regular reviewed notes and --no-dispatch"
+        return 4
+    }
+    [[ ( -n "$version" && -z "$exact_tag" ) ||
+       ( -z "$version" && -n "$exact_tag" ) ]] || {
+        log_error "Source-only publication requires exactly one version or --tag"
         return 4
     }
     _dsr_require github
@@ -5636,8 +5646,13 @@ EOF
     path=$(jq -r '.local_path' <<< "$config") || return 4
     [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
     [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 4
-    tag=$(git_ops_version_to_tag "$version") || return 4
-    [[ "$tag" =~ ^v[0-9][A-Za-z0-9._+-]*$ ]] || return 4
+    if [[ -n "$exact_tag" ]]; then
+        tag="$exact_tag"
+        [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || return 4
+    else
+        tag=$(git_ops_version_to_tag "$version") || return 4
+        [[ "$tag" =~ ^v[0-9][A-Za-z0-9._+-]*$ ]] || return 4
+    fi
     _act_strict_git check-ref-format "refs/tags/$tag" >/dev/null || return 4
     sha=$(_act_strict_git -C "$path" rev-parse --verify "refs/tags/$tag^{commit}") || return 4
     _source_release_identity "$repo" "$path" "$tag" "$sha" || return 4

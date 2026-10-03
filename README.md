@@ -449,6 +449,7 @@ publication_mode: source-only
 
 ```bash
 dsr release source-only example 1.2.3 --notes-file release-notes.md --no-dispatch
+dsr release source-only example --tag example-v1.2.3 --notes-file release-notes.md --no-dispatch
 ```
 
 This mode requires a clean checkout whose HEAD and local tag match the remote
@@ -458,6 +459,11 @@ legacy registry entries for the same tool, and build configuration are refused.
 Use `--draft` to retain the verified draft, or global `--dry-run` to inspect the
 admission result without creating a release. Source-only configuration cannot
 be used by the normal binary publication command.
+
+Use exactly one positional version or `--tag`. The explicit tag form preserves
+the exact crate or workspace tag; it accepts only a single Git ref component
+starting with a letter or digit, using letters, digits, `.`, `_`, `+`, or `-`.
+Both forms require the same clean checkout and local/remote peeled tag identity.
 
 If GitHub temporarily omits a newly created draft from its release list, DSR
 retains the private pending receipt. Retry with the same inputs and
