@@ -465,6 +465,26 @@ retains the private pending receipt. Retry with the same inputs and
 nonce-bound draft and creates no new release; it retains the original receipt
 and records a separate recovery receipt. Ordinary `--resume` remains a binary
 publication option and is refused in source-only mode.
+
+If strict binary creation succeeded but its controller stopped before
+publication, preserve the original private `dsr-api-response.*` POST response.
+Recovery requires a response that actually survived or was preserved; it cannot
+reconstruct creation custody from public release metadata.
+Use `dsr release verify TOOL VERSION --fix` to repair missing draft assets. Once
+all signed assets verify, finalize through DSR:
+
+```bash
+dsr release finalize TOOL VERSION --create-response /private/scratch/dsr-api-response.ABCDEF12 --no-dispatch
+```
+
+The response must remain a single-link, owner-only regular file in the same
+canonical private `TMPDIR` used by the GitHub adapter. Finalization verifies its
+original creation nonce, release ID and metadata against the current exact
+source and complete signed asset inventory. It freezes explicit configuration
+and registry inputs, writes private recovery evidence before publishing, and
+rechecks all evidence afterward. It never creates or uploads assets, accepts a
+tag lookup as custody, or dispatches workflows. Inventories of 100 or more
+assets are refused. Global dry-run performs verification without publication.
 Recovery requires Python 3 for bounded, no-follow descriptor validation of the
 private receipt and its directory; device, inode, and byte identity remain
 fixed through publication.

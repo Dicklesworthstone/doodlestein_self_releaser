@@ -12,6 +12,16 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- Strict release creation keeps adapter diagnostics separate from JSON. An
+  already repaired strict draft can be published with `dsr release finalize`
+  using its original private creation response. Finalization requires the same
+  nonce-bound release ID and metadata, frozen explicit configuration, a clean
+  tagged source, and every expected signed asset. Separate complete asset
+  inventories and source checks run before and after publication; private
+  pending and completion receipts preserve recovery evidence. This bounded
+  route refuses inventories of 100 or more assets and never uploads, recreates,
+  deletes, or dispatches a release.
+
 - `dsr release source-only` publishes installer/source-only GitHub Releases with
   zero uploaded assets. It requires explicit configuration, reviewed notes,
   disabled dispatch, and a clean checkout whose peeled tag matches GitHub.

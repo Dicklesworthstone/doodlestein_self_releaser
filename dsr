@@ -5296,8 +5296,9 @@ _source_release_inputs_match() {
 
 _source_release_read_private_receipt() {
     local file="$1" receipt_dir="$2" tool="$3" tag="$4"
+    local prefix="${5:-$tool-$tag.json.}"
     [[ -f "$file" && ! -L "$file" && -d "$receipt_dir" && ! -L "$receipt_dir" &&
-       "${file##*/}" == "$tool-$tag.json."* &&
+       "${file##*/}" == "$prefix"* &&
        "$(cd "${file%/*}" && pwd -P)" == "$(cd "$receipt_dir" && pwd -P)" ]] || return 4
     python3 -I - "$file" "$receipt_dir" <<'PY'
 import hashlib
@@ -5367,6 +5368,170 @@ finally:
     if directory_fd is not None:
         os.close(directory_fd)
 PY
+}
+
+_release_finalize_observe() {
+    local repo="$1" id="$2" plan="$3" draft="$4" tag="$5" metadata="$6"
+    local observed inventory
+    observed=$(_release_contract_verify_remote_assets "$repo" "$id" "$plan" "$draft" "$tag" "$metadata") || return 7
+    _source_release_metadata_matches "$observed" "$metadata" "$id" "$draft" || return 7
+    inventory=$(gh_api "repos/$repo/releases/$id/assets?per_page=100&page=1" --no-cache) || return 7
+    # This bounded recovery route admits fewer than 100 exact assets. A full
+    # page is ambiguous and must use a separately qualified paginated route.
+    jq -es --argjson observed "$observed" '
+        def records: map({id,name,state,size,digest}) | sort_by(.id);
+        length == 1 and (.[0] | type == "array" and length < 100 and
+        (records == ($observed.assets | records)))
+    ' <<< "$inventory" >/dev/null || return 7
+    printf '%s\n' "$observed"
+}
+
+cmd_release_finalize() {
+    local tool="" version="" response="" no_dispatch=false
+    while (($#)); do
+        case "$1" in
+            --create-response) [[ $# -ge 2 ]] || return 4; response="$2"; shift 2 ;;
+            --no-dispatch) no_dispatch=true; shift ;;
+            -*) log_error "Unsupported strict finalization option: $1"; return 4 ;;
+            *)
+                if [[ -z "$tool" ]]; then tool="$1"
+                elif [[ -z "$version" ]]; then version="$1"
+                else return 4; fi
+                shift ;;
+        esac
+    done
+    [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ &&
+       "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.-]+)?$ &&
+       "$response" == /* && "${response##*/}" =~ ^dsr-api-response\.[A-Za-z0-9]{8}$ &&
+       "$no_dispatch" == true ]] || return 4
+    gh_check || gh_check_token || return 3
+    local repo path tag contract config config_sha config_json registry registry_sha registry_json
+    config="$ACT_REPOS_DIR/$tool.yaml"
+    [[ -f "$config" && ! -L "$config" &&
+       "$(cd "${config%/*}" && pwd -P)" == "$(cd "${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d" && pwd -P)" ]] || return 4
+    config_sha=$(_gh_asset_sha256 "$config") || return 4
+    config_json=$(_config_read_single_mapping_json "$config") || return 4
+    [[ "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
+    jq -e --arg tool "$tool" '
+        (.tool_name == null or .tool_name == $tool) and .publication_mode == null and
+        (has("extends") | not) and (.repo | type == "string") and
+        (.local_path | type == "string" and startswith("/")) and
+        (.release_contract | type == "object")
+    ' <<< "$config_json" >/dev/null || return 4
+    registry="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
+    registry_sha=absent
+    if [[ -e "$registry" || -L "$registry" ]]; then
+        [[ -f "$registry" && ! -L "$registry" ]] || return 4
+        registry_sha=$(_gh_asset_sha256 "$registry") || return 4
+        registry_json=$(_config_read_single_mapping_json "$registry") || return 4
+        [[ "$(_gh_asset_sha256 "$registry")" == "$registry_sha" ]] || return 4
+        jq -e --arg tool "$tool" '(.tools | type == "object") and ((.tools | has($tool)) | not)' <<< "$registry_json" >/dev/null || return 4
+    fi
+    act_load_repo_config "$tool" || return 4
+    config_validate_release_contract "$tool" || return 4
+    repo=$(jq -r '.repo' <<< "$config_json") || return 4
+    path=$(jq -r '.local_path' <<< "$config_json") || return 4
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 4
+    tag=$(git_ops_version_to_tag "$version") || return 4
+    contract=$(jq -c '.release_contract' <<< "$config_json") || return 4
+    [[ "$contract" != null ]] || { log_error "Finalization requires a strict binary release contract"; return 4; }
+    local state_dir artifacts manifest
+    state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    artifacts="$state_dir/artifacts/$tool-$tag"
+    manifest="$artifacts/$tool-$tag-manifest.json"
+    local frozen plan saved metadata release_id receipt_sha receipt_dir scan observed
+    # Recovery authority is the original private POST response retained by the
+    # GitHub adapter, not a tag lookup, upload journal, or caller-supplied ID.
+    receipt_dir="${TMPDIR:-/tmp}"
+    frozen=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || return 4
+    saved=$(jq -c '.record' <<< "$frozen") || return 4
+    receipt_sha=$(jq -r '.sha256' <<< "$frozen") || return 4
+    plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
+    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 4
+    _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
+    if ! jq -e --arg repo "$repo" --arg tag "$tag" --arg sha "$(jq -r '.git_sha' <<< "$plan")" '
+        (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+        .tag_name == $tag and .name == $tag and .target_commitish == $sha and
+        .draft == true and (.prerelease | type == "boolean") and .assets == [] and
+        (.body | type == "string" and test("<!-- dsr-create-nonce:[0-9a-f]{64} -->$")) and
+        .upload_url == ("https://uploads.github.com/repos/" + $repo + "/releases/" + (.id | tostring) + "/assets{?name,label}") and
+        (.html_url | type == "string" and startswith("https://github.com/" + $repo + "/releases/"))
+    ' <<< "$saved" >/dev/null; then
+        log_error "Create response does not prove this exact new empty strict draft"
+        return 4
+    fi
+    release_id=$(jq -r '.id' <<< "$saved") || return 4
+    metadata=$(jq -c '{tag_name,name,body,prerelease,target_commitish}' <<< "$saved") || return 4
+    scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+    jq -e --argjson id "$release_id" '.count == 1 and .release.id == $id' <<< "$scan" >/dev/null || return 7
+    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" any "$tag" "$metadata") || return 7
+    local current_fingerprint current_plan
+    current_fingerprint=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || return 4
+    [[ "$current_fingerprint" == "$frozen" && -f "$config" && ! -L "$config" &&
+       "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
+    _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
+    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
+    jq -en --argjson a "$plan" --argjson b "$current_plan" '$a == $b' >/dev/null || return 4
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
+    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
+    if $DRY_RUN; then
+        log_info "Verified strict finalization plan for owned release ID $release_id"
+        $JSON_MODE && json_envelope "release-finalize" "dry_run" 0 "$(jq -nc --argjson id "$release_id" '{release_id:$id}')"
+        return 0
+    fi
+    local output final_output
+    mkdir -p "$state_dir/releases" || return 7
+    [[ -d "$state_dir/releases" && ! -L "$state_dir/releases" ]] || return 7
+    output=$(umask 077; mktemp "$state_dir/releases/$tool-$tag-finalization-pending.XXXXXXXX") || return 7
+    jq -n --arg repo "$repo" --arg tag "$tag" --argjson id "$release_id" \
+        --arg response "$response" --arg sha "$receipt_sha" --argjson plan "$plan" \
+        --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" --argjson metadata "$metadata" \
+        '{schema:"dsr.strict_finalization_receipt.v1",status:"pending",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,config_sha256:$config_sha,registry_sha256:$registry_sha,plan:$plan,metadata:$metadata}' > "$output" || return 7
+    jq -e '.status == "pending"' "$output" >/dev/null || return 7
+    # Re-observe all remote bytes and the complete original nonce-bound
+    # metadata immediately before changing only this proven draft's state.
+    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" any "$tag" "$metadata") || return 7
+    current_fingerprint=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || return 4
+    [[ "$current_fingerprint" == "$frozen" && -f "$config" && ! -L "$config" &&
+       "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
+    _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || return 4
+    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || return 4
+    jq -en --argjson a "$plan" --argjson b "$current_plan" '$a == $b' >/dev/null || return 4
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 7
+    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || return 7
+    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || return 4
+    if jq -e '.draft == true' <<< "$observed" >/dev/null; then
+        gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' --no-cache >/dev/null || true
+    fi
+    local valid=true
+    observed=$(_release_finalize_observe "$repo" "$release_id" "$(jq -c '.assets' <<< "$plan")" false "$tag" "$metadata") || valid=false
+    current_fingerprint=$(_source_release_read_private_receipt "$response" "$receipt_dir" "" "" "dsr-api-response.") || valid=false
+    [[ "$current_fingerprint" == "$frozen" && -f "$config" && ! -L "$config" &&
+       "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || valid=false
+    _source_release_inputs_match "$config" "$config_sha" "$response" "$receipt_sha" "$registry" "$registry_sha" || valid=false
+    current_plan=$(_release_contract_preflight "$tool" "$tag" "$repo" "$path" "$artifacts" "$manifest" "$contract" verify) || valid=false
+    jq -en --argjson a "$plan" --argjson b "${current_plan:-null}" '$a == $b' >/dev/null || valid=false
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || valid=false
+    _release_contract_verify_tag_ruleset_receipt "$(jq -c '.tag_ruleset_receipt' <<< "$plan")" || valid=false
+    _source_release_identity "$repo" "$path" "$tag" "$(jq -r '.git_sha' <<< "$plan")" || valid=false
+    if ! $valid; then
+        _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
+        log_error "Strict finalization failed post-publication revalidation"
+        return 7
+    fi
+    final_output=$(umask 077; mktemp "$state_dir/releases/$tool-$tag-finalized.XXXXXXXX") || {
+        _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
+        return 7
+    }
+    if ! jq -n --arg repo "$repo" --arg tag "$tag" --argjson id "$release_id" \
+        --arg response "$response" --arg sha "$receipt_sha" --argjson plan "$plan" \
+        --arg pending "$output" --argjson release "$observed" '{schema:"dsr.strict_finalization_receipt.v1",status:"success",repo:$repo,tag:$tag,release_id:$id,create_response:$response,create_response_sha256:$sha,pending_receipt:$pending,plan:$plan,release:$release}' > "$final_output"; then
+        _source_release_restore_draft "$repo" "$release_id" "$metadata" || true
+        return 7
+    fi
+    log_ok "Strict release finalized and verified: $(jq -r '.html_url' <<< "$observed")"
+    $JSON_MODE && json_envelope "release-finalize" "success" 0 "$(jq -nc --arg receipt "$final_output" --argjson id "$release_id" '{receipt:$receipt,release_id:$id}')"
+    return 0
 }
 
 _source_release_resume_receipt_matches() {
@@ -6172,7 +6337,7 @@ EOF
         log_info "Resuming $tag by verifying remote asset contents"
     else
         # shellcheck disable=SC2086
-        release_json=$(gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args 2>&1) || create_status=$?
+        release_json=$(gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
     fi
 
     if [[ $create_status -ne 0 ]]; then
@@ -11820,6 +11985,10 @@ main() {
         release)
             # Check for subcommand
             case "${1:-}" in
+                finalize)
+                    shift
+                    cmd_release_finalize "$@"
+                    ;;
                 source-only)
                     shift
                     cmd_release_source_only "$@"
