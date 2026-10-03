@@ -44,6 +44,9 @@ gh_upload_asset_named() {
     cp "$path" "$CASE/remote/$id" || return 1
     if [[ "${MODE:-}" == no_digest ]]; then receipt=$(jq '.digest=null' <<< "$receipt"); fi
     if [[ "${MODE:-}" == corrupt ]]; then
+        # The staged payload is 0400 and cp keeps that: make the fixture's
+        # remote copy writable or nothing is corrupted (non-root runs).
+        chmod u+w "$CASE/remote/$id" || return 1
         printf changed >> "$CASE/remote/$id"
         receipt=$(jq --arg digest "sha256:$(_slsa_sha256 "$CASE/remote/$id")" '.digest=$digest' <<< "$receipt")
     fi

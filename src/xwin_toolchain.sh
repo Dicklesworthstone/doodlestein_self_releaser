@@ -88,7 +88,7 @@ _xwt_inventory() (
         if [[ -d "$path" ]]; then
             type=directory hash='' size=0
         elif [[ -f "$path" ]]; then
-            type=file
+            type='file'
             hash=$(_xwt_hash "$path") || return $?
             size=$(stat -c '%s' -- "$path") || return 1
         else
@@ -193,8 +193,17 @@ xwin_toolchain_prepare() (
     key=$(_xwt_hash "$work/manifest.json") || return $?
     view="$root/$key"
     [[ ! -L "$root/$key.lock" && ( ! -e "$root/$key.lock" || -f "$root/$key.lock" ) ]] || return 2
+    # Concurrent builds of the same target share this view: wait for the other
+    # preparation (bounded) instead of failing, which at verify time would
+    # discard a finished compile.
+    local lock_wait="${DSR_XWIN_TOOLCHAIN_LOCK_TIMEOUT:-1800}"
+    [[ "$lock_wait" =~ ^[0-9]{1,6}$ ]] || return 4
+    lock_wait=$((10#$lock_wait))
     exec 9>> "$root/$key.lock" || return 1
-    flock -n 9 || { _xwt_log 'Toolchain preparation is already active'; return 2; }
+    # 0 keeps the old non-blocking refusal (some flock builds reject -w 0).
+    if ((lock_wait == 0)); then flock -n 9; else flock -w "$lock_wait" 9; fi || {
+        _xwt_log "Toolchain preparation still active after ${lock_wait}s"; return 2;
+    }
     [[ ! -L "$view" && ( ! -e "$view" || -d "$view" ) ]] || return 2
     [[ "$mode" != verify || -d "$view" ]] || return 7
     _xwt_unpack "$plan" sysroot "$work" || return $?

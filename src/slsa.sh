@@ -5,6 +5,7 @@
 # Sourceable API: slsa_generate, slsa_generate_batch, slsa_verify,
 # slsa_generate_json. Build timestamps are omitted unless backed by evidence.
 
+# shellcheck disable=SC2034 # spec version constant for scripts that source this module
 SLSA_SPEC_VERSION="1.0"
 SLSA_BUILDER_ID="${SLSA_BUILDER_ID:-https://github.com/Dicklesworthstone/doodlestein_self_releaser}"
 
@@ -420,7 +421,7 @@ _slsa_manifest_statement() {
 # bind the entire set to the same observation interval. This is not a snapshot
 # against an adversarial privileged filesystem writer; release dirs are trusted.
 _slsa_release_assets() {
-    local proof="$1" root="$2" rows name digest actual size expected pass
+    local proof="$1" root="$2" rows name digest actual size expected
     [[ -d "$root" && ! -L "$root" ]] || return 4
     _slsa_validate "$proof" || return 1
     if [[ "$(jq -r '.dsr_evidence.kind // ""' "$proof")" == build-manifest ]]; then
@@ -431,7 +432,7 @@ _slsa_release_assets() {
         ' "$proof" >/dev/null 2>&1 || return 1
     fi
     rows=$(jq -r '.subject[] | [.name,.digest.sha256] | @tsv' "$proof") || return 1
-    for pass in 1 2; do
+    for _ in 1 2; do
         while IFS=$'\t' read -r name digest; do
             _slsa_name "$name" || return 4
             actual=$(_slsa_sha256 "$root/$name") || return $?

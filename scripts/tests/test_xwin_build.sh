@@ -66,9 +66,22 @@ shift 2
 [[ ! -e "$CARGO_HOME/config.toml" && ! -e "$HOME/.cargo/config.toml" ]] || exit 94
 cmp -s "$LIB/kernel32.lib" "$LIB/Kernel32.lib" || exit 95
 mode=$(cat mode 2>/dev/null || printf normal)
+source_file=probe.c
 case "$mode" in
     fail) printf 'intentional compiler failure\n'; exit 42 ;;
     slow) sleep 60 & sleeper=$!; printf '%s\n' "$sleeper" > "$CARGO_TARGET_DIR.sleep-pid"; wait "$sleeper"; exit $? ;;
+    cache-wipe)
+        [[ -d "$CARGO_HOME/registry" && ! -L "$CARGO_HOME/registry" && ! -L "$CARGO_HOME/git" &&
+           ! -e "$CARGO_HOME/credentials.toml" ]] || exit 96
+        source_file="$CARGO_HOME/registry/src/probe.c"
+        cmp -s "$source_file" probe.c || exit 96
+        # Delete only this suite's generated seed, after the runner has
+        # prepared the private home and before the real compiler reads it.
+        ambient="${PWD%/project}/ambient-cache"
+        [[ -f "$ambient/test-owned" ]] || exit 96
+        rm -rf -- "$ambient/registry" "$ambient/git"
+        printf 'new dependency bytes\n' > "$CARGO_HOME/registry/new-dependency"
+        ;;
 esac
 mkdir -p "$CARGO_TARGET_DIR/aarch64-pc-windows-msvc/release"
 out="$CARGO_TARGET_DIR/aarch64-pc-windows-msvc/release/probe.exe"
@@ -80,7 +93,7 @@ else
     # Intentional splitting: these are the exact whitespace-free flags emitted
     # by DSR, not arbitrary user-supplied shell input.
     # shellcheck disable=SC2086
-    clang --target=aarch64-pc-windows-msvc -ffreestanding $CFLAGS -c probe.c -o "$TMPDIR/probe.obj" || exit $?
+    clang --target=aarch64-pc-windows-msvc -ffreestanding $CFLAGS -c "$source_file" -o "$TMPDIR/probe.obj" || exit $?
     # lld-link must discover Kernel32.lib from the emitted LIB environment,
     # not a release-local /libpath override or renamed source library.
     lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /machine:arm64 "/out:$out" "$TMPDIR/probe.obj" Kernel32.lib || exit $?
@@ -91,6 +104,9 @@ case "$mode" in
     corrupt-lock) printf '# changed\n' >> Cargo.lock ;;
     corrupt-config) mkdir -p .cargo; printf '[build]\njobs=1\n' > .cargo/config.toml ;;
     corrupt-shim) rm -- "$HOME/../bin/cargo"; ln -s /bin/false "$HOME/../bin/cargo" ;;
+    corrupt-cache-seed) printf '\n' >> "$CARGO_HOME/.dsr-cache-seed.json" ;;
+    corrupt-cache-summary) printf '\n' >> "$HOME/../cargo-cache-seed.json" ;;
+    linked-cache) mkdir -p "$CARGO_HOME/registry"; ln -s "$TMPDIR" "$CARGO_HOME/registry/external" ;;
     truncate) truncate -s 128 "$out" ;;
 esac
 printf 'compiled and linked probe\n'
@@ -124,8 +140,60 @@ assert 'before/after version maps agree' cmp -s "$WORK/good/versions-before.json
 assert 'LLVM NEON source remains unchanged' cmp -s "$RESOURCE/include/arm_neon.h" "$WORK/input/llvm/include/arm_neon.h"
 assert 'lowercase pinned sysroot was never renamed' test ! -e "$WORK/input/sdk/lib/aarch64-unknown-windows-msvc/Kernel32.lib"
 assert 'original source archive still matches pinned hash' bash -c '[[ "$(sha256sum "$1"|cut -d" " -f1)" == "$(jq -r .sysroot.sha256 "$2")" ]]' _ "$WORK/sdk.tar.xz" "$MANIFEST"
+assert 'unseeded build records an empty private cache' jq -e \
+    '.cargo_cache.mode=="private-copy" and .cargo_cache.seed.file_count==0 and .cargo_cache.final.file_count==0' "$WORK/success.json"
+mkdir -p "$WORK/ambient-cache/registry/src" "$WORK/ambient-cache/git/db"
+touch "$WORK/ambient-cache/test-owned"
+cp "$WORK/project/probe.c" "$WORK/ambient-cache/registry/src/probe.c"
+printf 'git cache bytes\n' > "$WORK/ambient-cache/git/db/input"
+printf 'not inherited\n' > "$WORK/ambient-cache/credentials.toml"
+printf 'not inherited\n' > "$WORK/ambient-cache/config.toml"
+printf 'cache-wipe\n' > "$WORK/project/mode"
+assert 'real ARM64 compilation survives original Cargo cache deletion' \
+    "${BUILD[@]}" --run-dir "$WORK/cache-wipe" --cargo-cache "$WORK/ambient-cache"
+assert 'fixture actually removed the original registry' test ! -e "$WORK/ambient-cache/registry"
+assert 'fixture actually removed the original git cache' test ! -e "$WORK/ambient-cache/git"
+assert 'seed and newly resolved dependency inventories retained' jq -e \
+    '.cargo_cache.mode=="private-copy" and .cargo_cache.seed.file_count==2 and .cargo_cache.final.file_count==3 and
+     (.cargo_cache.seed.inventory_sha256 != .cargo_cache.final.inventory_sha256) and .artifact.machine=="IMAGE_FILE_MACHINE_ARM64"' \
+    "$WORK/cache-wipe/result.json"
+assert 'completed private cache verifies independently' cargo_cache_verify \
+    "$WORK/cache-wipe/cargo-home" "$WORK/cache-wipe/cargo-cache-final.json"
+mkdir -p "$WORK/ambient-cache/registry"
+ln -s "$WORK/project" "$WORK/ambient-cache/registry/escape"
+reject 'unsafe seed fails before any compiler runs' 7 "${BUILD[@]}" --run-dir "$WORK/unsafe-cache" --cargo-cache "$WORK/ambient-cache"
+assert 'unsafe seed never starts compilation' test ! -e "$WORK/unsafe-cache/build.log"
 reject 'occupied run directory is never overwritten' 2 "${BUILD[@]}" --run-dir "$WORK/good"
-for MODE in fail wrong-arch truncate corrupt-lock corrupt-tool corrupt-header corrupt-config corrupt-shim; do
+# Stall the actual preparation subprocess boundary, not the compiler, to
+# prove large cache copies have their own deadline and cancellation handling.
+mkdir "$WORK/slow-controller"
+REAL_PYTHON=$(command -v python3)
+{
+    printf '#!/usr/bin/env bash\n'
+    printf 'if [[ "${3:-}" == snapshot ]]; then\n'
+    printf '  sleep 60 & sleeper=$!; printf "%%s\n" "$sleeper" > "$DSR_CACHE_TEST_PID_FILE"; wait "$sleeper"; exit $?\n'
+    printf 'fi\nexec %q "$@"\n' "$REAL_PYTHON"
+} > "$WORK/slow-controller/python3"
+chmod 755 "$WORK/slow-controller/python3"
+reject 'cache preparation deadline emits no successful receipt' 124 env \
+    PATH="$WORK/slow-controller:$PATH" DSR_CACHE_TEST_PID_FILE="$WORK/cache-deadline/target.sleep-pid" \
+    "${BUILD[@]}" --run-dir "$WORK/cache-deadline" --timeout 1
+assert 'cache timeout retains its failure code' jq -e '.exit_code==124' "$WORK/cache-deadline/failure.json"
+env PATH="$WORK/slow-controller:$PATH" DSR_CACHE_TEST_PID_FILE="$WORK/cache-cancel/target.sleep-pid" \
+    "${BUILD[@]}" --run-dir "$WORK/cache-cancel" > "$WORK/cache-cancel.stdout" 2> "$WORK/cache-cancel.stderr" &
+CACHE_PID=$!
+for ((n=0;n<500;n++)); do [[ ! -f "$WORK/cache-cancel/target.sleep-pid" ]] || break; sleep 0.05; done
+if [[ -f "$WORK/cache-cancel/target.sleep-pid" ]]; then
+    kill -TERM "$CACHE_PID"
+    RC=0; wait "$CACHE_PID" || RC=$?
+    assert 'CLI cancellation reaches cache preparation' test "$RC" = 5
+    assert 'cancelled cache preparation has no success output' test ! -s "$WORK/cache-cancel.stdout"
+    assert 'cancelled cache preparation retains its failure code' jq -e '.exit_code==5' "$WORK/cache-cancel/failure.json"
+else
+    bad 'cache preparation reached cancellation boundary'
+    kill -TERM "$CACHE_PID" 2>/dev/null || true; wait "$CACHE_PID" 2>/dev/null || true
+fi
+for MODE in fail wrong-arch truncate corrupt-lock corrupt-tool corrupt-header corrupt-config corrupt-shim corrupt-cache-seed corrupt-cache-summary linked-cache; do
     printf '%s\n' "$MODE" > "$WORK/project/mode"
     EXPECTED=7; [[ "$MODE" != fail ]] || EXPECTED=42
     reject "$MODE produces no successful receipt" "$EXPECTED" "${BUILD[@]}" --run-dir "$WORK/$MODE"
@@ -150,7 +218,10 @@ assert 'sourced build failure preserves caller traps and status' bash -c '
         jq -e ".exit_code==42" "$2/sourced/failure.json" >/dev/null
 ' _ "$ROOT" "$WORK"
 printf 'slow\n' > "$WORK/project/mode"
-reject 'deadline returns timeout without a success receipt' 124 "${BUILD[@]}" --run-dir "$WORK/deadline" --timeout 1
+# Cache preparation now shares the per-phase deadline. Allow its Python
+# startup to finish before exercising the deliberately slow compiler above;
+# the separate cache-deadline case still tests a one-second preparation limit.
+reject 'deadline returns timeout without a success receipt' 124 "${BUILD[@]}" --run-dir "$WORK/deadline" --timeout 10
 # SIGTERM to the CLI, not its group, must reach the owned compiler session.
 "${BUILD[@]}" --run-dir "$WORK/cancel" > "$WORK/cancel.stdout" 2> "$WORK/cancel.stderr" &
 BUILD_PID=$!
@@ -164,7 +235,7 @@ if [[ -f "$WORK/cancel/target.sleep-pid" ]]; then
 else
     bad 'build reached cancellation boundary'; kill -TERM "$BUILD_PID" 2>/dev/null || true; wait "$BUILD_PID" 2>/dev/null || true
 fi
-for RUN in deadline cancel; do
+for RUN in deadline cancel cache-deadline cache-cancel; do
     SLEEP_PID=$(cat "$WORK/$RUN/target.sleep-pid")
     assert "$RUN stops compiler descendants" python3 - "$SLEEP_PID" <<'PY'
 from pathlib import Path

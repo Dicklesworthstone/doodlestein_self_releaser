@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Real filesystem and Git-cache regressions; no network or Cargo toolchain.
+set -uo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+command -v python3 >/dev/null || { printf 'SKIP cargo cache: requires Python 3.9+\n' >&2; exit 0; }
+python3 -I - "$ROOT/src/cargo_cache.sh" "$@" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+MODULE = sys.argv.pop(1)
+
+
+class PrivateCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='dsr-cargo-cache-test.')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source = self.root / 'ambient cargo'
+        self.home = self.root / 'private cargo'
+        self.source.mkdir()
+        self.crate = self.source / 'registry/src/example/probe-1.0.0/src/lib.rs'
+        self.crate.parent.mkdir(parents=True)
+        self.crate.write_bytes(b'pub fn answer() -> u32 { 42 }\n')
+        self.archive = self.source / 'registry/cache/example/probe-1.0.0.crate'
+        self.archive.parent.mkdir(parents=True)
+        self.archive.write_bytes(b'cached archive\x00\xff\n')
+        self.script = self.source / 'git/checkouts/probe/revision/build.sh'
+        self.script.parent.mkdir(parents=True)
+        self.script.write_text('#!/bin/sh\nexit 0\n')
+        self.script.chmod(0o751)
+        (self.source / 'registry/index/empty').mkdir(parents=True)
+        (self.source / 'config.toml').write_text('[build]\nrustc-wrapper="untrusted"\n')
+        (self.source / 'credentials.toml').write_text('DO-NOT-COPY\n')
+        (self.source / 'bin').mkdir()
+        (self.source / 'bin/cargo').write_text('DO-NOT-COPY\n')
+
+    def invoke(self, operation, first, second, expected=0):
+        result = subprocess.run(['bash', MODULE, operation, str(first), str(second)],
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, expected, result.stderr)
+        if expected:
+            self.assertEqual(result.stdout, '', result.stdout)
+            self.assertIn('[cargo-cache]', result.stderr)
+            return None
+        self.assertEqual(result.stderr, '')
+        return json.loads(result.stdout)
+
+    def snapshot(self):
+        return self.invoke('snapshot', self.source, self.home)
+
+    def copied(self, source):
+        return self.home / source.relative_to(self.source)
+
+    def test_private_bytes_modes_and_inventory(self):
+        receipt = self.snapshot()
+        self.assertEqual(receipt['mode'], 'private-copy')
+        self.assertEqual(receipt['file_count'], 3)
+        self.assertEqual(receipt['caches'], ['git', 'registry'])
+        self.assertEqual(receipt['size_bytes'], sum(p.stat().st_size for p in (self.crate, self.archive, self.script)))
+        for original in (self.crate, self.archive, self.script):
+            copied = self.copied(original)
+            self.assertEqual(copied.read_bytes(), original.read_bytes())
+            self.assertNotEqual((copied.stat().st_dev, copied.stat().st_ino),
+                                (original.stat().st_dev, original.stat().st_ino))
+            self.assertEqual(copied.stat().st_mode & 0o111, original.stat().st_mode & 0o111)
+        self.assertTrue((self.home / 'registry/index/empty').is_dir())
+        self.assertEqual(self.home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(hashlib.sha256(Path(receipt['receipt_path']).read_bytes()).hexdigest(), receipt['receipt_sha256'])
+        verified = self.invoke('verify', self.home, receipt['receipt_path'])
+        self.assertEqual(verified, receipt)
+
+    def test_does_not_import_configuration_credentials_or_bins(self):
+        self.snapshot()
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), ['.dsr-cache-seed.json', 'git', 'registry'])
+
+    def test_original_cache_wipe_cannot_reach_private_files(self):
+        receipt = self.snapshot()
+        payload = self.copied(self.crate).read_bytes()
+        shutil.rmtree(self.source / 'registry')
+        shutil.rmtree(self.source / 'git')
+        self.assertEqual(self.copied(self.crate).read_bytes(), payload)
+        self.invoke('verify', self.home, receipt['receipt_path'])
+
+    def test_in_place_source_writes_cannot_reach_private_files(self):
+        receipt = self.snapshot()
+        payload = self.copied(self.crate).read_bytes()
+        self.crate.write_bytes(b'mutated through original inode\n')
+        self.script.chmod(0o600)
+        self.assertEqual(self.copied(self.crate).read_bytes(), payload)
+        self.invoke('verify', self.home, receipt['receipt_path'])
+
+    def test_private_writes_cannot_modify_ambient_cache(self):
+        self.snapshot()
+        original = self.crate.read_bytes()
+        self.copied(self.crate).write_bytes(b'private mutation\n')
+        self.assertEqual(self.crate.read_bytes(), original)
+
+    def test_empty_unseeded_home(self):
+        result = self.invoke('snapshot', '', self.home)
+        self.assertEqual(result['file_count'], 0)
+        self.assertEqual(result['caches'], [])
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_missing_seed_rejected(self):
+        self.invoke('snapshot', self.root / 'missing', self.home, 4)
+        self.assertFalse(self.home.exists())
+
+    def test_existing_home_never_overwritten(self):
+        self.home.mkdir()
+        marker = self.home / 'operator-file'
+        marker.write_bytes(b'keep me')
+        self.invoke('snapshot', self.source, self.home, 2)
+        self.assertEqual(marker.read_bytes(), b'keep me')
+
+    def test_overlapping_homes_rejected(self):
+        for dest in (self.source, self.source / 'nested', self.root):
+            with self.subTest(destination=dest):
+                self.invoke('snapshot', self.source, dest, 4)
+        self.assertTrue(self.crate.exists())
+
+    def test_relative_paths_rejected(self):
+        self.invoke('snapshot', self.source, 'relative-home', 4)
+        self.invoke('snapshot', 'relative-source', self.home, 4)
+
+    def test_top_level_seed_symlink_rejected(self):
+        link = self.root / 'source-link'
+        link.symlink_to(self.source, target_is_directory=True)
+        self.invoke('snapshot', link, self.home, 4)
+
+    def test_destination_dangling_symlink_preserved(self):
+        self.home.symlink_to(self.root / 'missing')
+        self.invoke('snapshot', self.source, self.home, 2)
+        self.assertTrue(self.home.is_symlink())
+
+    def test_nested_symlink_rejected_and_partial_copy_cleaned(self):
+        (self.crate.parent / 'escape').symlink_to(self.source / 'credentials.toml')
+        self.invoke('snapshot', self.source, self.home, 7)
+        self.assertFalse(self.home.exists())
+        self.assertEqual((self.source / 'credentials.toml').read_text(), 'DO-NOT-COPY\n')
+
+    def test_cache_root_symlink_rejected(self):
+        shutil.rmtree(self.source / 'git')
+        (self.source / 'git').symlink_to(self.source / 'registry', target_is_directory=True)
+        self.invoke('snapshot', self.source, self.home, 7)
+        self.assertFalse(self.home.exists())
+
+    def test_fifo_rejected_without_blocking(self):
+        os.mkfifo(self.crate.parent / 'fifo')
+        self.invoke('snapshot', self.source, self.home, 7)
+        self.assertFalse(self.home.exists())
+
+    def test_external_git_storage_pointers_rejected(self):
+        for relative in ('git/db/probe/objects/info/alternates', 'git/db/probe/commondir',
+                         'git/checkouts/probe/revision/.git'):
+            with self.subTest(path=relative):
+                path = self.source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('/outside/object/store\n')
+                self.invoke('snapshot', self.source, self.home, 7)
+                self.assertFalse(self.home.exists())
+                path.unlink()
+
+    def test_regular_git_clone_survives_seed_removal(self):
+        if shutil.which('git') is None:
+            self.skipTest('git not installed')
+        repository = self.source / 'git/checkouts/real/revision'
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True, capture_output=True)
+        (repository / 'Cargo.toml').write_text('[package]\nname="cache-probe"\nversion="1.0.0"\n')
+        subprocess.run(['git', '-C', str(repository), 'add', 'Cargo.toml'], check=True, capture_output=True)
+        subprocess.run(['git', '-C', str(repository), '-c', 'user.name=Cache Test', '-c',
+                        'user.email=cache-test@example.invalid', 'commit', '-qm', 'fixture'], check=True, capture_output=True)
+        receipt = self.snapshot()
+        shutil.rmtree(repository)
+        subprocess.run(['git', '-C', str(self.copied(repository)), 'fsck', '--full'], check=True, capture_output=True)
+        self.invoke('verify', self.home, receipt['receipt_path'])
+
+    def test_new_downloads_can_be_sealed_after_resolution(self):
+        seed = self.snapshot()
+        downloaded = self.home / 'registry/cache/example/new.crate'
+        downloaded.write_bytes(b'new locked dependency')
+        self.invoke('verify', self.home, seed['receipt_path'], 7)
+        result = self.invoke('inventory', self.home, self.root / 'resolved.json')
+        self.assertEqual(result['file_count'], 4)
+        self.assertEqual(result['mode'], 'inventory')
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_private_content_drift_rejected(self):
+        receipt = self.snapshot()
+        self.copied(self.crate).write_bytes(b'changed')
+        self.invoke('verify', self.home, receipt['receipt_path'], 7)
+
+    def test_private_executable_mode_drift_rejected(self):
+        receipt = self.snapshot()
+        self.copied(self.script).chmod(0o600)
+        self.invoke('verify', self.home, receipt['receipt_path'], 7)
+
+    def test_private_member_deletion_rejected(self):
+        receipt = self.snapshot()
+        self.copied(self.archive).unlink()
+        self.invoke('verify', self.home, receipt['receipt_path'], 7)
+
+    def test_private_member_addition_rejected(self):
+        receipt = self.snapshot()
+        (self.home / 'registry/unexpected').write_bytes(b'new')
+        self.invoke('verify', self.home, receipt['receipt_path'], 7)
+
+    def test_receipt_cannot_overwrite_cache_payload_or_existing_evidence(self):
+        receipt = self.snapshot()
+        original = self.copied(self.crate).read_bytes()
+        self.invoke('inventory', self.home, self.copied(self.crate), 4)
+        self.assertEqual(self.copied(self.crate).read_bytes(), original)
+        self.invoke('inventory', self.home, receipt['receipt_path'], 2)
+        self.invoke('verify', self.home, receipt['receipt_path'])
+
+    def test_receipt_is_bound_to_home(self):
+        receipt = self.snapshot()
+        other = self.root / 'other'
+        self.invoke('snapshot', self.source, other)
+        self.invoke('verify', other, receipt['receipt_path'], 7)
+
+    def test_malformed_and_symlink_receipts_rejected(self):
+        self.snapshot()
+        path = self.root / 'bad.json'
+        for text in ('{', '{}', '[]', '{"schema_version":1,"schema_version":1}'):
+            path.write_text(text)
+            self.invoke('verify', self.home, path, 7)
+        link = self.root / 'receipt-link'
+        link.symlink_to(self.home / '.dsr-cache-seed.json')
+        self.invoke('verify', self.home, link, 7)
+
+    def test_sourceable_api(self):
+        result = subprocess.run(['bash', '-uc', 'source "$1"; cargo_cache_snapshot "$2" "$3"',
+                                 'cache-test', MODULE, str(self.source), str(self.home)],
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['file_count'], 3)
+
+
+unittest.main(verbosity=2)
+PY

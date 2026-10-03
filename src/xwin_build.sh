@@ -4,6 +4,8 @@
 _XWIN_BUILD_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/xwin_toolchain.sh
 source "$_XWIN_BUILD_DIR/xwin_toolchain.sh"
+# shellcheck source=src/cargo_cache.sh
+source "$_XWIN_BUILD_DIR/cargo_cache.sh"
 
 # Validate headers AND bounded section data; a .exe suffix or MZ prefix alone
 # cannot establish the target. Never execute the candidate binary.
@@ -270,6 +272,7 @@ _xwb_export_release() {
          build_environments:[{target:"windows/arm64",method:"pinned-cargo-xwin",
              build_influence_env:$r.build_influence_env,tool_versions:$r.tool_versions,
              toolchain:$r.toolchain,cargo_metadata:$selection[0],source_snapshot:$s,
+             cargo_cache:$r.cargo_cache,
              command:$r.command}],
          artifacts:[$r.artifacts[] | {name,target:"windows/arm64",sha256,
              size_bytes,archive_format:"binary",signed:false,
@@ -360,7 +363,7 @@ _xwb_build() {
     _xwt_require || return $?
     binaries_json=$(jq -cn --args '$ARGS.positional' -- "${binaries[@]}") || return 1
     local tool plan view entry name path key rustc target=aarch64-pc-windows-msvc manifest_hash lock_hash child=0 exit_trap
-    local source_hash='' metadata_hash='' selection_hash='' controls='' uuid='' started
+    local source_hash='' metadata_hash='' selection_hash='' controls='' uuid='' started cargo_seed_controls
     started=$(date +%s) || return 1
     for tool in python3 setsid timeout readlink env; do command -v "$tool" >/dev/null || return 3; done
     project=$(cd "$project" && pwd -P) || return 4
@@ -376,7 +379,7 @@ _xwb_build() {
     mkdir -- "$run" || return 2
     run=$(cd "$run" && pwd -P) || return 4
     [[ "$run" != *[[:space:][:cntrl:]]* && "$run" != *[\;\\:]* ]] || return 4
-    mkdir "$run/bin" "$run/home" "$run/tmp" "$run/cargo-home" "$run/xwin" "$run/artifacts" || return 1
+    mkdir "$run/bin" "$run/home" "$run/tmp" "$run/xwin" "$run/artifacts" || return 1
     _xwb_finish() {
         local rc=$? directory="$1"
         if ((rc != 0)); then
@@ -391,6 +394,7 @@ _xwb_build() {
     # Freeze the path for source callers whose worker locals have unwound
     # before the containing subshell runs its EXIT trap.
     printf -v exit_trap '_xwb_finish %q' "$run"
+    # shellcheck disable=SC2064 # expand now: that freeze is the point
     trap "$exit_trap" EXIT
     trap _xwb_interrupt HUP INT TERM
     if [[ "$release" == true ]]; then
@@ -431,12 +435,17 @@ _xwb_build() {
         ln -s -- "$path" "$run/bin/$name" || return 1
     done
     if [[ -n "$cargo_cache" ]]; then
-        [[ -d "$cargo_cache" ]] || return 4
+        [[ -d "$cargo_cache" && ! -L "$cargo_cache" ]] || return 4
         cargo_cache=$(cd "$cargo_cache" && pwd -P) || return 4
-        for name in registry git; do
-            [[ ! -d "$cargo_cache/$name" ]] || ln -s -- "$cargo_cache/$name" "$run/cargo-home/$name" || return 1
-        done
     fi
+    # A private CARGO_HOME with links into an ambient cache is not private:
+    # host cache pruning can remove a dependency in the middle of a build.
+    # Copy independent inodes before any Cargo command, including metadata.
+    _xwt_log "Preparing private Cargo cache; evidence: $run/cargo-cache-seed.json"
+    _xwb_run "$project" "$run/cargo-cache-seed.log" "$seconds" --stdout "$run/cargo-cache-seed.json" \
+        bash "$_XWIN_BUILD_DIR/cargo_cache.sh" snapshot "$cargo_cache" "$run/cargo-home" || return $?
+    cargo_seed_controls=$(sha256sum -- "$run/cargo-cache-seed.json" \
+        "$run/cargo-home/.dsr-cache-seed.json") || return 1
     rustc=$(jq -r '.tools.rustc.path' <<< "$plan") || return 1
     local -a environment=("HOME=$run/home" "PATH=$run/bin:/usr/bin:/bin" "TMPDIR=$run/tmp" "LC_ALL=C" "TZ=UTC"
         "CARGO_HOME=$run/cargo-home" "CARGO_TARGET_DIR=$run/target" "CARGO_INCREMENTAL=0" "RUSTC=$rustc"
@@ -508,6 +517,13 @@ _xwb_build() {
     [[ "$manifest_hash" == "$(_xwt_hash "$project/Cargo.toml")" && "$lock_hash" == "$(_xwt_hash "$project/Cargo.lock")" ]] || return 7
     [[ "$(_xwt_hash "$run/manifest.json")" == "$key" ]] || return 7
     xwin_toolchain_prepare "$run/manifest.json" "$cache" verify > "$run/toolchain-after.json" || return $?
+    [[ "$cargo_seed_controls" == "$(sha256sum -- "$run/cargo-cache-seed.json" \
+        "$run/cargo-home/.dsr-cache-seed.json")" ]] || return 7
+    # Cargo may legitimately download or unpack dependencies in this private
+    # home. Retain both observations rather than claiming its final inventory
+    # equals the seed, or silently dropping newly resolved dependency bytes.
+    _xwb_run "$project" "$run/cargo-cache-final.log" "$seconds" --stdout "$run/cargo-cache.json" \
+        bash "$_XWIN_BUILD_DIR/cargo_cache.sh" inventory "$run/cargo-home" "$run/cargo-cache-final.json" || return $?
     : > "$run/artifacts.jsonl" || return 1
     for selected_binary in "${binaries[@]}"; do
         _pkg_path_has_no_links "$run/target" "$target/release/$selected_binary.exe" || return 7
@@ -526,10 +542,12 @@ _xwb_build() {
         --arg manifest "$manifest_hash" --arg lock "$lock_hash" --slurpfile artifacts "$run/artifacts.jsonl" \
         --slurpfile environment "$run/environment.json" --slurpfile command "$run/command.json" \
         --slurpfile source "$run/source-after.json" \
+        --slurpfile cache_seed "$run/cargo-cache-seed.json" --slurpfile cache_final "$run/cargo-cache.json" \
         --slurpfile versions "$run/versions-after.json" --slurpfile toolchain "$run/toolchain-after.json" \
         '{schema_version:1,kind:"dsr-xwin-build",status:"verified",exit_code:0,
           project:$project,target:"aarch64-pc-windows-msvc",cargo_manifest_sha256:$manifest,cargo_lock_sha256:$lock,
           manifest_sha256:$key,source_inputs:$source[0],artifacts:$artifacts,
+          cargo_cache:{mode:"private-copy",seed:$cache_seed[0],final:$cache_final[0]},
           build_influence_env:$environment[0],command:$command[0],tool_versions:$versions[0],
           toolchain:$toolchain[0].evidence,build_log:($run+"/build.log")} |
           if ($artifacts|length)==1 then .artifact=$artifacts[0] else . end' > "$run/.result.json" || return 1

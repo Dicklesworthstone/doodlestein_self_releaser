@@ -304,6 +304,7 @@ _cache_put() (
     local stage suffix cleanup
     stage=$(mktemp -d "$cache_dir/.verified.XXXXXXXX") || return 1
     printf -v cleanup 'rm -rf -- %q' "$stage"
+    # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command for this stage
     trap "$cleanup" EXIT
     for suffix in '' .sha256 .minisig; do
         if [[ "$suffix" == .minisig && ! -f "$src_file$suffix" ]]; then
@@ -655,11 +656,15 @@ _extract_archive() {
         members=$(unzip -Z1 "$archive" 2>/dev/null) || return 1
         listing=$(LC_ALL=C unzip -Z -l "$archive" 2>/dev/null) || return 1
     else
-        members=$(tar "${tar_args[@]}" -tf "$archive" 2>/dev/null) || return 1
-        listing=$(LC_ALL=C tar "${tar_args[@]}" -tvf "$archive" 2>/dev/null) || return 1
+        # ${a[@]+"${a[@]}"}: plain tar has no flag, and an empty "${a[@]}"
+        # is an unbound-variable abort under set -u before Bash 4.4.
+        members=$(tar ${tar_args[@]+"${tar_args[@]}"} -tf "$archive" 2>/dev/null) || return 1
+        listing=$(LC_ALL=C tar ${tar_args[@]+"${tar_args[@]}"} -tvf "$archive" 2>/dev/null) || return 1
     fi
     [[ -n "$members" ]] || return 1
-    local -A seen=()
+    # Runs under `curl | bash`, which is Bash 3.2 on stock macOS: no
+    # associative arrays. Collect normalized names, then look for repeats.
+    local normalized="" duplicate
     while IFS= read -r member; do
         count=$((count + 1))
         [[ "$member" != /* && "$member" != *[[:cntrl:]]* && "$member" != *\\* && "$member" != *:* ]] || return 1
@@ -668,9 +673,12 @@ _extract_archive() {
         [[ -n "$member" && "$member" != . ]] || continue
         [[ "$member" != -* ]] || return 1
         case "/$member/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
-        [[ -z "${seen[$member]:-}" ]] || { _log_error "Duplicate archive member: $member"; return 1; }
-        seen["$member"]=1
+        normalized+="$member"$'\n'
     done <<< "$members"
+    # A failed sort/uniq must not read as "no duplicates" (pipefail is on).
+    duplicate=$(printf '%s' "$normalized" | LC_ALL=C sort | LC_ALL=C uniq -d) || return 1
+    duplicate="${duplicate%%$'\n'*}"
+    [[ -z "$duplicate" ]] || { _log_error "Duplicate archive member: $duplicate"; return 1; }
     while IFS= read -r line; do
         if [[ "$format" == zip ]]; then
             case "$line" in 'Archive: '*|'Zip file size: '*) continue ;; esac
@@ -704,7 +712,7 @@ _extract_archive() {
     if [[ "$format" == zip ]]; then
         unzip -q "$archive" -d "$dest_dir" || return 1
     else
-        tar "${tar_args[@]}" --no-same-owner --no-same-permissions -xf "$archive" -C "$dest_dir" || return 1
+        tar ${tar_args[@]+"${tar_args[@]}"} --no-same-owner --no-same-permissions -xf "$archive" -C "$dest_dir" || return 1
     fi
 }
 
@@ -716,7 +724,17 @@ _install_binary() (
 
     local dest_binary="$dest_dir/$BINARY_NAME"
 
-    [[ -f "$src_binary" && ! -L "$src_binary" && -s "$src_binary" && ! -L "$dest_dir" ]] || return 1
+    [[ -f "$src_binary" && ! -L "$src_binary" && -s "$src_binary" ]] || return 1
+    if [[ -L "$dest_dir" ]]; then
+        # A symlinked bin dir (dotfile managers) is the user's choice: install
+        # into the directory it resolves to rather than through the link.
+        # Empty CDPATH: a relative --dir must not be resolved via CDPATH,
+        # which also makes cd print the directory into this capture.
+        dest_dir=$(CDPATH='' cd -P -- "$dest_dir" 2>/dev/null && pwd -P) || {
+            _log_error "Install directory is a dangling or unusable symlink: $2"; return 1;
+        }
+        dest_binary="$dest_dir/$BINARY_NAME"
+    fi
     mkdir -p -- "$dest_dir" || return 1
     [[ ! -L "$dest_binary" && ( ! -e "$dest_binary" || -f "$dest_binary" ) ]] || {
         _log_error "Refusing a linked or non-regular install destination: $dest_binary"; return 1;
@@ -744,6 +762,7 @@ _install_binary() (
     expected=$(_file_sha256 "$src_binary") || return $?
     stage=$(mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || return 1
     printf -v cleanup 'rm -rf -- %q' "$stage"
+    # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command for this stage
     trap "$cleanup" EXIT
     trap 'exit 5' HUP INT TERM
     cp -- "$src_binary" "$stage/payload" || return 1
@@ -758,7 +777,7 @@ _install_binary() (
     _log_ok "Installed to: $dest_binary"
 
     # Check if in PATH
-    if [[ ":$PATH:" != *":$dest_dir:"* ]]; then
+    if [[ ":$PATH:" != *":$dest_dir:"* && ":$PATH:" != *":$2:"* ]]; then
         _log_warn "$dest_dir is not in your PATH"
         _log_info "Add to your shell config:"
         _log_info "  export PATH=\"\$PATH:$dest_dir\""
@@ -947,6 +966,12 @@ _install_from_source() {
     if ! $_ALLOW_SOURCE_BUILD || $_OFFLINE_MODE || $_REQUIRE_SIGNATURES; then
         _log_error "Source fallback requires --allow-source-build (or --from-source), online mode, and no --require-signatures"
         return 4
+    fi
+    # The embedded source engine needs Bash 4 ($BASHPID, ${var,,}); stock
+    # macOS /bin/bash is 3.2. Refuse clearly instead of failing mid-build.
+    if ((BASH_VERSINFO[0] < 4)); then
+        _log_error "Source builds need Bash 4+ (this is $BASH_VERSION); rerun the installer under a newer bash (e.g. Homebrew's bash)"
+        return 3
     fi
     if [[ -z "$ref" ]]; then
         if [[ -n "$_VERSION" ]]; then ref="refs/tags/$_VERSION"; else ref=HEAD; fi
@@ -1241,7 +1266,7 @@ main() {
         local freshness_args=() freshness_status=0
         $_PREFER_GH && freshness_args+=(--prefer-gh)
         _RELEASE_FRESHNESS=$(install_source_freshness "$REPO" "$_VERSION" "$_SOURCE_IF_STALE" \
-            "$temp_dir/freshness" "${freshness_args[@]}") || freshness_status=$?
+            "$temp_dir/freshness" ${freshness_args[@]+"${freshness_args[@]}"}) || freshness_status=$?
         [[ "$freshness_status" != 5 ]] || return 5
         if ((freshness_status != 0)); then
             _RELEASE_FRESHNESS=$(jq -nc --arg tag "$_VERSION" \
@@ -1631,7 +1656,8 @@ install_gen_create() {
 
     # Validate with ShellCheck if available
     if command -v shellcheck &>/dev/null; then
-        if shellcheck -S warning "$output_file" 2>/dev/null; then
+        # Findings go to stdout, which must carry only the installer path.
+        if shellcheck -S warning "$output_file" >/dev/null 2>&1; then
             log_ok "ShellCheck validation passed"
         else
             log_warn "ShellCheck found issues (run: shellcheck $output_file)"

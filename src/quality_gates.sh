@@ -100,6 +100,41 @@ _qg_source_snapshot() {
     echo "${head}|${dirt_sha}|${lock_sha}"
 }
 
+# Is <tool> registered in repos.yaml (under tools: or the legacy top level)?
+# Returns 0 yes, 1 no (no, empty, or comment-only repos.yaml), 3 no yq, and
+# 4 when the file cannot be trusted to answer: invalid YAML, several
+# documents, or a top level / tools: that is not a mapping. A registry of the
+# wrong shape must not read as "no required checks".
+_qg_tool_registered() {
+    local tool_name="$1" documents state
+    local repos_file="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
+    if [[ -L "$repos_file" && ! -e "$repos_file" ]]; then
+        _qg_log_error "Repos file is a dangling symlink: $repos_file"
+        return 4
+    fi
+    [[ -s "$repos_file" ]] || return 1
+    if ! command -v yq &>/dev/null; then
+        _qg_log_error "yq required to read required checks from $repos_file"
+        return 3
+    fi
+    if ! documents=$(yq ea -o=json -I=0 '[.]' "$repos_file" 2>/dev/null); then
+        _qg_log_error "Repos file is not valid YAML: $repos_file"
+        return 4
+    fi
+    state=$(jq -r --arg tool "$tool_name" '
+        if length == 0 or (length == 1 and .[0] == null) then "absent"
+        elif length != 1 or (.[0] | type) != "object" then "invalid"
+        elif ((.[0].tools // {}) | type) != "object" then "invalid"
+        elif ((.[0].tools // {}) | has($tool)) or (.[0] | has($tool)) then "present"
+        else "absent" end' <<< "$documents" 2>/dev/null) || state=invalid
+    case "$state" in
+        present) return 0 ;;
+        absent) return 1 ;;
+    esac
+    _qg_log_error "Repos file must be one YAML mapping with tools: as a mapping: $repos_file"
+    return 4
+}
+
 # Get configured checks for a tool — FAIL CLOSED (bead oxmp): a missing
 # file, unreadable file, malformed YAML, or absent tool key is a
 # CONFIGURATION FAILURE (rc 4), never an empty success.
@@ -343,8 +378,16 @@ EOF
     # empty; otherwise it suppresses ordinary checks and executes the complete
     # required inventory with normal evidence and moving-source fencing.
     if $skip_checks; then
-        local required_checks required_rc=0 required_count=0
-        required_checks=$(qg_get_checks "$tool_name" required) || required_rc=$?
+        local required_checks='[]' required_rc=0 required_count=0 registered_rc=0
+        # A tool with no repos.yaml entry (or no repos.yaml) cannot declare a
+        # required set, so the historic skip applies. Only a registry that
+        # exists but cannot be read stays fatal.
+        _qg_tool_registered "$tool_name" || registered_rc=$?
+        case "$registered_rc" in
+            0) required_checks=$(qg_get_checks "$tool_name" required) || required_rc=$? ;;
+            1) ;;
+            *) required_rc=$registered_rc ;;
+        esac
         if [[ $required_rc -ne 0 ]]; then
             return 4
         fi

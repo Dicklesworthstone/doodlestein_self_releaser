@@ -39,7 +39,7 @@ umask 022
 OWNER="Dicklesworthstone"
 REPO="doodlestein_self_releaser"
 BINARY_NAME="dsr"
-INSTALLER_VERSION="0.1.2"
+INSTALLER_VERSION="0.2.2"
 GITHUB_RAW="https://raw.githubusercontent.com/${OWNER}/${REPO}"
 
 DEST="${DSR_DEST:-$HOME/.local/bin}"
@@ -535,6 +535,38 @@ print_clone_error() {
   done < <(sed -n '1,8p' "$error_file")
 }
 
+# Bring an existing install clone to the requested state in place. A clone
+# made with --version is a shallow, detached checkout of a tag whose
+# single-branch refspec only ever re-fetches that same tag, so a plain
+# `git pull` reports "Already up to date" forever (and an explicit --version
+# was ignored). Returns nonzero when the caller should re-clone instead.
+update_existing_clone() {
+  local ref
+  if [ "$VERSION_EXPLICIT" -eq 1 ] && [[ -n "$VERSION" && "$VERSION" != main ]]; then
+    build_clone_refs
+    for ref in "${CLONE_REFS[@]}"; do
+      if git -C "$REPO_DIR" fetch --quiet --depth 1 origin "+refs/tags/$ref:refs/tags/$ref" 2>/dev/null &&
+         git -C "$REPO_DIR" checkout --quiet --detach "refs/tags/$ref" 2>/dev/null; then
+        ok "Switched dsr to $ref"
+        return 0
+      fi
+    done
+    return 1
+  fi
+  # Default installs track main; move a pinned (detached) clone onto it.
+  if ! git -C "$REPO_DIR" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    git -C "$REPO_DIR" fetch --quiet --depth 1 origin "+refs/heads/main:refs/remotes/origin/main" 2>/dev/null || return 1
+    git -C "$REPO_DIR" checkout --quiet -B main refs/remotes/origin/main 2>/dev/null || return 1
+    git -C "$REPO_DIR" config --replace-all remote.origin.fetch "+refs/heads/main:refs/remotes/origin/main" || return 1
+    git -C "$REPO_DIR" branch --quiet --set-upstream-to=origin/main main 2>/dev/null || return 1
+    ok "Moved dsr from a pinned release onto main"
+    return 0
+  fi
+  git -C "$REPO_DIR" pull --quiet --ff-only 2>/dev/null || return 1
+  ok "Updated dsr to latest"
+  return 0
+}
+
 clone_or_update_repo() {
   if [[ -n "$OFFLINE_TARBALL" ]]; then
     # Offline mode: tarball contains the full repo tree
@@ -551,16 +583,15 @@ clone_or_update_repo() {
     return 0
   fi
 
+  local backup=""
   if [ -d "$REPO_DIR/.git" ]; then
-    # Existing clone: pull latest
     info "Updating existing dsr installation..."
-    if git -C "$REPO_DIR" pull --ff-only 2>/dev/null; then
-      ok "Updated dsr to latest"
+    if update_existing_clone; then
       return 0
     fi
-    # Pull failed (dirty state, etc.) — preserve the old clone, then re-clone.
-    warn "git pull failed; preserving existing clone and performing fresh clone..."
-    local backup
+    # In-place update failed (dirty state, missing ref, etc.) — preserve the
+    # old clone, then re-clone.
+    warn "In-place update failed; preserving existing clone and performing fresh clone..."
     backup="${REPO_DIR}.bak.$(date +%Y%m%d%H%M%S)"
     if mv "$REPO_DIR" "$backup" 2>/dev/null; then
       warn "Existing clone moved to $backup"
@@ -602,6 +633,11 @@ clone_or_update_repo() {
     err "Failed to clone dsr from GitHub"
   fi
   print_clone_error "$last_clone_error"
+  # A failed clone leaves no directory behind: put the working install back
+  # rather than leave dsr pointing at a missing checkout.
+  if [[ -n "$backup" ]] && [ ! -e "$REPO_DIR" ] && mv "$backup" "$REPO_DIR" 2>/dev/null; then
+    warn "Restored the previous install clone; dsr is unchanged"
+  fi
   exit 1
 }
 

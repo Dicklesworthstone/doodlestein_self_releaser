@@ -262,6 +262,16 @@ def save_state():
     write(root / "state.json", state, replace=True)
     state_hash = digest(root / "state.json")
 
+def require_xwin_inventory(job, manifest, pin):
+    require(digest(manifest) == pin, "xwin manifest identity changed")
+    value = load(manifest)
+    require(isinstance(value, dict) and isinstance(value.get("artifacts"), list) and
+            all(isinstance(a, dict) and isinstance(a.get("name"), str) for a in value["artifacts"]),
+            "invalid xwin artifact inventory")
+    actual = sorted([{k: a.get(k) for k in ("name", "target", "archive_format")} for a in value["artifacts"]],
+                    key=lambda a: a["name"])
+    require(actual == xwin_assets(job), "xwin output omits or changes selected executables")
+
 def helper(operation, entry, destination, directory):
     # The source and program are fixed; untrusted JSON/paths are arguments, not
     # interpolated shell. A compact entry never contains the producer inventory.
@@ -269,14 +279,7 @@ def helper(operation, entry, destination, directory):
     job = next(j for j in plan["builds"] if j["id"] == entry["id"])
     if job["driver"] == "xwin":
         manifest = Path(entry["manifest"]) if operation == "_rb_import" else destination / "build-manifest.json"
-        require(digest(manifest) == entry["manifest_sha256"], "xwin manifest identity changed")
-        value = load(manifest)
-        require(isinstance(value, dict) and isinstance(value.get("artifacts"), list) and
-                all(isinstance(a, dict) and isinstance(a.get("name"), str) for a in value["artifacts"]),
-                "invalid xwin artifact inventory")
-        actual = sorted([{k: a.get(k) for k in ("name", "target", "archive_format")} for a in value["artifacts"]],
-                        key=lambda a: a["name"])
-        require(actual == xwin_assets(job), "xwin output omits or changes selected executables")
+        require_xwin_inventory(job, manifest, entry["manifest_sha256"])
     command = 'source "$1/release_bundle.sh" || exit 3; _rb_require || exit $?; "$2" "$3" "$4" "$5" "$6"'
     if operation == "_rb_import":
         args = [json.dumps(entry), str(root / "plan.json"), str(destination), str(directory)]
@@ -472,6 +475,11 @@ def start_job(job):
 
 def accept(job, attempt, entry, admission_dir=None):
     record = state["jobs"][job["id"]]
+    # Only a valid selection may be pinned: an xwin output that omits or
+    # changes the selected executables fails this attempt and the retry
+    # compiles again, instead of re-importing the same bad bytes forever.
+    if job["driver"] == "xwin":
+        require_xwin_inventory(job, Path(entry["manifest"]), entry["manifest_sha256"])
     # Persist the selected manifest BEFORE importing. A crash between import
     # and the completion update can only reuse that exact pinned selection.
     record["candidate"] = entry

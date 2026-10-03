@@ -95,7 +95,8 @@ _sel_limit_from_config() {
 # Usage: selector_init
 selector_init() {
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
-    [[ ! -L "$state_dir" ]] || return 4
+    # The operator may relocate state with a symlinked root (build_state
+    # accepts one too); work in its physical path. Links below it stay refused.
     mkdir -p -- "$state_dir" || return 4
     state_dir=$(cd "$state_dir" && pwd -P) || return 4
     _SELECTOR_STATE_DIR="$state_dir/selector"
@@ -122,8 +123,8 @@ _sel_prepare_host() {
 _sel_lock_backend() (
     local marker="$_SELECTOR_STATE_DIR/lock-backend" temporary backend
     if [[ ! -e "$marker" && ! -L "$marker" ]]; then
-        backend=mkdir
-        if command -v flock &>/dev/null; then backend=flock; fi
+        backend='mkdir'
+        if command -v flock &>/dev/null; then backend='flock'; fi
         temporary=$(mktemp "$_SELECTOR_STATE_DIR/.backend.XXXXXXXX") || return 4
         local cleanup
         printf -v cleanup 'rm -f -- %q' "$temporary"
@@ -311,8 +312,13 @@ selector_has_capacity() {
 
 # Acquire a build slot on a host
 # Usage: selector_acquire_slot <hostname> <run_id> [--wait]
-# DSR_SELECTOR_WAIT_TIMEOUT bounds --wait (default 300s); mutex waits are
-# separately bounded by DSR_SELECTOR_LOCK_TIMEOUT (default 30s).
+# DSR_SELECTOR_WAIT_TIMEOUT bounds --wait (default 300s; build workers pass
+# their build timeout so a queued target waits for a slot instead of failing);
+# mutex waits are separately bounded by DSR_SELECTOR_LOCK_TIMEOUT (default
+# 30s). A waiting caller polls with capped exponential backoff (at most
+# DSR_SELECTOR_POLL_MAX seconds between attempts, default 5) and reports its
+# queue position on stderr every minute, so an hours-long wait is neither a
+# busy loop nor silent.
 # Returns: 0 acquired/idempotent, 2 busy/deadline, 3 dependency, 4 invalid, 5 interrupted.
 selector_acquire_slot() {
     local hostname="${1:-}"
@@ -323,9 +329,13 @@ selector_acquire_slot() {
     [[ $# -le 3 && ( $# -lt 3 || "$3" == --wait ) ]] || return 4
     [[ "${3:-}" == "--wait" ]] && wait_mode=true
     local wait_budget="${DSR_SELECTOR_WAIT_TIMEOUT:-300}" lock_budget="${DSR_SELECTOR_LOCK_TIMEOUT:-30}"
-    [[ "$wait_budget" =~ ^[0-9]{1,5}$ && "$lock_budget" =~ ^[0-9]{1,5}$ ]] || return 4
-    wait_budget=$((10#$wait_budget)) lock_budget=$((10#$lock_budget))
+    local poll_max="${DSR_SELECTOR_POLL_MAX:-5}"
+    [[ "$wait_budget" =~ ^[0-9]{1,5}$ && "$lock_budget" =~ ^[0-9]{1,5}$ && \
+       "$poll_max" =~ ^[1-9][0-9]{0,3}$ ]] || return 4
+    wait_budget=$((10#$wait_budget)) lock_budget=$((10#$lock_budget)) poll_max=$((10#$poll_max))
     local node boot start record status started=$SECONDS remaining budget limit
+    # Poll delay in tenths of a second: 0.1s, doubling to the cap.
+    local poll_tenths=1 next_report=$((SECONDS + 60)) usage
     _sel_prepare_host "$hostname" || return $?
     node=$(uname -n) || return 3
     boot=$(_sel_boot_id) || return $?
@@ -339,6 +349,9 @@ selector_acquire_slot() {
             remaining=$((wait_budget - (SECONDS - started)))
             ((remaining >= 0)) || remaining=0
             ((budget <= remaining)) || budget=$remaining
+            # The final attempt at the deadline still gets a real (1s) mutex
+            # bound: flock rejects a zero timeout outright.
+            ((budget >= 1 || lock_budget < 1)) || budget=1
         fi
         if _sel_with_lock "$hostname" "$budget" _sel_try_acquire "$hostname" "$run_id" "$record"; then
             _sel_log_ok "Acquired slot on $hostname: $run_id"
@@ -349,10 +362,24 @@ selector_acquire_slot() {
         fi
         limit=$(selector_get_limit "$hostname") || return $?
         if ! $wait_mode || ((limit == 0 || SECONDS - started >= wait_budget)); then
-            _sel_log_warn "No build slot available on $hostname (capacity/ownership/deadline)"
+            if $wait_mode && ((limit > 0)); then
+                _sel_log_warn "No build slot on $hostname within ${wait_budget}s (concurrency limit $limit reached)"
+            else
+                _sel_log_warn "No build slot available on $hostname (capacity/ownership/deadline)"
+            fi
             return 2
         fi
-        sleep 0.1 || return 5
+        if ((SECONDS >= next_report)); then
+            usage=$(selector_get_usage "$hostname" 2>/dev/null) || usage="?"
+            _sel_log_info "Waiting for a build slot on $hostname ($usage/$limit in use) for $((SECONDS - started))s of ${wait_budget}s: $run_id"
+            next_report=$((SECONDS + 60))
+        fi
+        remaining=$((wait_budget - (SECONDS - started)))
+        ((poll_tenths <= remaining * 10)) || poll_tenths=$((remaining * 10))
+        ((poll_tenths >= 1)) || poll_tenths=1
+        sleep "$((poll_tenths / 10)).$((poll_tenths % 10))" || return 5
+        poll_tenths=$((poll_tenths * 2))
+        ((poll_tenths <= poll_max * 10)) || poll_tenths=$((poll_max * 10))
     done
 }
 

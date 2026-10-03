@@ -2428,8 +2428,9 @@ act_load_repo_config() {
     ACT_REPO_LOCAL_PATH=$(yq -r '.local_path // ""' "$config_file")
     ACT_REPO_LANGUAGE=$(yq -r '.language // ""' "$config_file")
     ACT_REPO_WORKFLOW=$(yq -r '.workflow // ".github/workflows/release.yml"' "$config_file")
+    ACT_REPO_PUBLICATION_MODE=$(yq -r '.publication_mode // ""' "$config_file")
 
-    export ACT_REPO_NAME ACT_REPO_GITHUB ACT_REPO_LOCAL_PATH ACT_REPO_LANGUAGE ACT_REPO_WORKFLOW
+    export ACT_REPO_NAME ACT_REPO_GITHUB ACT_REPO_LOCAL_PATH ACT_REPO_LANGUAGE ACT_REPO_WORKFLOW ACT_REPO_PUBLICATION_MODE
 
     _log_info "Loaded config for $tool_name: $ACT_REPO_GITHUB"
     return 0

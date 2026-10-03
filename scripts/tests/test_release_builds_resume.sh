@@ -37,6 +37,12 @@ def write(p, value):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(value))
 
+def overwrite(p, text):
+    # dsr freezes inputs read-only (0400); unlock before simulating drift so
+    # the case also tests something when not run as root.
+    p.chmod(0o600)
+    p.write_text(text)
+
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
@@ -231,7 +237,7 @@ print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details
     no_launch(case, lambda:shutil.copytree(saved.parent, saved.parent.with_name('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')),
               'two native runs cannot be resolved by recency')
     case=fixture('changed-config'); invoke(case,1)
-    no_launch(case, lambda:(session(case)/'config/config.yaml').write_text('{}'), 'changed frozen config blocks resume')
+    no_launch(case, lambda:overwrite(session(case)/'config/config.yaml', '{}'), 'changed frozen config blocks resume')
     case=fixture('changed-command'); invoke(case,1)
     no_launch(case, lambda:write(session(case)/'command.json',['bash','/outside']), 'changed original invocation blocks resume')
     case=fixture('changed-inputs'); invoke(case,1)
@@ -293,7 +299,7 @@ print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details
           not (case/'run/completed/native').exists())
     for label, change in (
         ('candidate-manifest-drift', lambda c:(session(c)/'output/demo-v1.2.3-manifest.json').write_text('{}')),
-        ('candidate-config-drift', lambda c:(session(c)/'config/config.yaml').write_text('{}')),
+        ('candidate-config-drift', lambda c:overwrite(session(c)/'config/config.yaml', '{}')),
         ('candidate-command-drift', lambda c:write(session(c)/'command.json', ['bash','/outside'])),
         ('candidate-input-drift', lambda c:write(session(c)/'inputs.json', {})),
         ('candidate-envelope-drift', lambda c:write(session(c)/'stdout.json', {'exit_code':0})),

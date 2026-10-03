@@ -92,9 +92,18 @@ run_install() {
     case_id=$((case_id + 1)); case_dir="$work/case-$case_id"
     mkdir -p "$case_dir"
     status=0
-    bash "$installer" "${VERSION_ARGS[@]}" --dir "$case_dir/bin" --cache-dir "$case_dir/cache" \
-        --non-interactive --json --no-skills "$@" > "$case_dir/out" 2> "$case_dir/err" || status=$?
+    "${INSTALL_BASH:-bash}" "$installer" "${VERSION_ARGS[@]}" --dir "${INSTALL_DIR:-$case_dir/bin}" \
+        --cache-dir "$case_dir/cache" --non-interactive --json --no-skills "$@" \
+        > "$case_dir/out" 2> "$case_dir/err" || status=$?
 }
+# `curl | bash` on stock macOS runs Bash 3.2. DSR_TEST_LEGACY_BASH names a
+# pre-4 bash on hosts whose /bin/bash is modern; without one these cases skip.
+legacy_bash="${DSR_TEST_LEGACY_BASH:-/bin/bash}"
+if [[ -x "$legacy_bash" ]] && "$legacy_bash" -c '((BASH_VERSINFO[0] < 4))' 2>/dev/null; then
+    legacy_version=$("$legacy_bash" -c 'printf %s "$BASH_VERSION"')
+else
+    legacy_bash='' legacy_version=''
+fi
 success() { [[ $status -eq 0 && -x "$case_dir/bin/demo" ]] && jq -es 'length == 1 and .[0].status == "success"' "$case_dir/out" >/dev/null; }
 blocked() { [[ $status -ne 0 && ! -e "$case_dir/bin/demo" && ! -e "$case_dir/cache/demo/v1.2.3/$os-$arch.tar.gz" ]]; }
 set_manifest() { printf '%s\n' "$1" > "$REMOTE/checksums.sha256"; }
@@ -102,6 +111,30 @@ set_manifest "$hash  $asset"
 run_install
 check 'default install verifies release name, not temporary archive name' success
 cache="$case_dir/cache"
+mkdir -p "$work/real-bin" && ln -s "$work/real-bin" "$work/link-bin"
+INSTALL_DIR="$work/link-bin" run_install
+check 'symlinked install directory installs into its target' \
+    test "$status" -eq 0 -a -x "$work/real-bin/demo" -a -L "$work/link-bin"
+# With CDPATH exported, cd prints the directory it found; resolving a
+# relative symlinked --dir must not capture that line into the path.
+mkdir -p "$work/real-bin2" && ln -s "$work/real-bin2" "$work/link-bin2"
+orig_pwd=$PWD
+cd "$work" || exit 1
+CDPATH=. INSTALL_DIR=link-bin2 run_install
+cd "$orig_pwd" || exit 1
+check 'relative symlinked --dir under CDPATH installs into its target, no junk path' \
+    test "$status" -eq 0 -a -x "$work/real-bin2/demo" -a "$(find "$work" -maxdepth 1 -name 'link-bin2?*' | wc -l)" -eq 0
+if [[ -n "$legacy_bash" ]]; then
+    INSTALL_BASH="$legacy_bash" run_install
+    check "default tar.gz install works under Bash $legacy_version" success
+    INSTALL_BASH="$legacy_bash" run_install --from-source
+    check "source build under Bash $legacy_version refuses with a dependency error" \
+        test "$status" -eq 3 -a ! -e "$case_dir/bin/demo"
+    check 'legacy source-build refusal names the Bash requirement' grep -q 'Source builds need Bash 4+' "$case_dir/err"
+else
+    # Not "SKIP:" — run-all-tests.sh would mark the whole file skipped.
+    echo 'note: no pre-4 bash (set DSR_TEST_LEGACY_BASH); legacy-installer cases not run'
+fi
 check 'verified cache retains checksum evidence' test -s "$cache/demo/v1.2.3/$os-$arch.tar.gz.sha256"
 run_install --cache-dir "$cache" --offline
 check 'verified cached archive works offline' success
@@ -329,6 +362,19 @@ ARCHIVES
         check "generated installer supports $format payload" test "$status" -eq 0
         check "$format payload is installed executable" test -x "$work/format-$format/demo"
     done
+    if [[ -n "$legacy_bash" ]]; then
+        # Plain tar passes no decompression flag: the empty-array path.
+        status=0
+        "$legacy_bash" -c 'source "$1" --help >/dev/null 2>&1; ARCHIVE_FORMAT_LINUX=tar; ARCHIVE_FORMAT_DARWIN=tar;
+            main --version v1.2.3 --offline "$2" --dir "$3" --no-skills --non-interactive' \
+            bash "$installer" "$work/normal.tar" "$work/legacy-tar" > "$work/legacy-tar.out" 2> "$work/legacy-tar.err" || status=$?
+        check "plain tar payload installs under Bash $legacy_version" test "$status" -eq 0 -a -x "$work/legacy-tar/demo"
+        cp "$work/duplicate.tar.gz" "$REMOTE/$asset"
+        set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"
+        INSTALL_BASH="$legacy_bash" run_install
+        check "duplicate archive member is rejected under Bash $legacy_version" blocked
+        check 'legacy duplicate rejection names the member' grep -q 'Duplicate archive member: demo' "$case_dir/err"
+    fi
 else
     echo 'SKIP: python3 unavailable for adversarial archive construction'
 fi

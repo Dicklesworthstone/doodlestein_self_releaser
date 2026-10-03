@@ -108,7 +108,7 @@ _ri_publish_file() {
 
 _ri_prepare() (
     local root="$1" manifest="$2" selection="$3" repo="$4" tag="$5" sha="$6"
-    local token="$7" private="$8" output="$9" work cleanup name names path sig hash record rows checksum
+    local token="$7" private="$8" output="$9" work cleanup name names path sig hash record rows
     # A misconfigured secret-key path must not also be treated as a release
     # payload. Compare file identity (including hardlinks) before copying inputs,
     # publishing proofs or handing the selected set to the binary uploader.
@@ -253,9 +253,10 @@ _ri_local_unchanged() {
 
 _ri_remote_verify() (
     local repo="$1" tag="$2" sha="$3" token="$4" expected="$5" work="$6"
-    local context inventory id asset file manifest before documents names entries row name hash current key
+    local context inventory id asset file manifest before documents names entries row name hash current
     context=$(_sbr_context "$repo" "$tag" "$work") || return $?
-    key=$(_rup_context_key "$context" "$repo" "$tag" "$sha") || return 7
+    # The release must match the selected repository, tag and commit.
+    _rup_context_key "$context" "$repo" "$tag" "$sha" >/dev/null || return 7
     id=$(jq -r '.release.id' <<< "$context") || return 7
     inventory=$(_sbr_inventory "$repo" "$id" "$work") || return $?
     mkdir "$work/proofs" "$work/payloads" || return 1

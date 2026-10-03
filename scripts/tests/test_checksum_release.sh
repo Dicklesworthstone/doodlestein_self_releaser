@@ -9,6 +9,9 @@ for dependency in sha256sum jq; do
 done
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-checksum-test.XXXXXXXX") || exit 1
 trap 'rm -rf -- "$TEMP"' EXIT
+# checksum_generate resolves physical paths (pwd -P); fault hooks below match
+# on paths, so use the physical spelling (macOS /var is /private/var).
+TEMP=$(cd "$TEMP" && pwd -P) || exit 1
 export NO_COLOR=1
 passed=0 failed=0 status=0 result=''
 check() {

@@ -105,9 +105,19 @@ _cs_is_safe_path() {
         abs_path=$(_cs_normalize_path "$path")
     fi
 
+    # The candidate is symlink-resolved above, so compare it with each
+    # protected prefix both as written and symlink-resolved: a protected root
+    # reached through a symlinked ancestor (macOS /var -> /private/var, a
+    # /data -> /Volumes/... mount alias) must still be refused.
+    local protected resolved_protected
     for protected in "${CHECKSUM_SYNC_PROTECTED_PATHS[@]}"; do
+        resolved_protected="$protected"
+        if [[ -d "$protected" ]]; then
+            resolved_protected=$(cd "$protected" 2>/dev/null && pwd -P) || resolved_protected="$protected"
+        fi
         # Check for exact match OR path is inside protected directory
-        if [[ "$abs_path" == "$protected" || "$abs_path" == "$protected/"* ]]; then
+        if [[ "$abs_path" == "$protected" || "$abs_path" == "$protected/"* ||
+              "$abs_path" == "$resolved_protected" || "$abs_path" == "$resolved_protected/"* ]]; then
             _cs_log_error "Refusing to modify protected path: $abs_path"
             _cs_log_error "Protected prefix: $protected"
             return 1
@@ -213,6 +223,7 @@ _cs_select_members() (
     while IFS= read -r -d '' file; do
         [[ ! -d "$file" || -L "$file" ]] || continue
         name="${file##*/}"
+        # shellcheck disable=SC2053 # $include is a glob pattern by design
         [[ "$name" == $include ]] || continue
         [[ -z "$exclude" || ! "$name" =~ $exclude ]] || continue
         [[ "$file" != "$output" ]] || continue
@@ -252,9 +263,16 @@ checksum_generate() (
         esac
     done
     [[ -n "$dir" && -d "$dir" && ! -L "$dir" && "$include" != */* ]] || return 4
+    # Validate a supplied exclusion regex up front. An empty exclusion means
+    # "none" and is never compiled: macOS regcomp rejects the empty pattern
+    # ("empty (sub)expression"), which made every default generation fail
+    # on macOS dispatchers.
     local regex_status=0
-    [[ '' =~ $exclude ]] || regex_status=$?
-    [[ "$regex_status" != 2 ]] || return 4
+    if [[ -n "$exclude" ]]; then
+        # shellcheck disable=SC2319 # the [[ =~ ]] status itself: 2 = invalid regex
+        [[ '' =~ $exclude ]] || regex_status=$?
+        [[ "$regex_status" != 2 ]] || return 4
+    fi
     dir=$(cd "$dir" && pwd -P) || return 4
     local parent="${TMPDIR:-/tmp}" name work cleanup members again member digest hash_status
     if [[ -n "$output" ]]; then
@@ -268,6 +286,7 @@ checksum_generate() (
     work=$(mktemp -d "$parent/.dsr-checksums.XXXXXXXX") || return 1
     printf -v cleanup 'rm -f -- %q %q %q %q; rmdir -- %q 2>/dev/null || true' \
         "$work/inventory" "$work/manifest" "$work/normalized" "$work/verify.log" "$work"
+    # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
     trap "$cleanup" EXIT
     trap 'exit 5' HUP INT TERM
     members=$(_cs_select_members "$dir" "$include" "$exclude" "$metadata" "$output" "$work/inventory") || return $?
@@ -326,6 +345,7 @@ checksum_verify() (
         canonical_manifest="$(cd "$(dirname "$manifest")" && pwd -P)/$(basename "$manifest")" || return 4
         work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-checksum-verify.XXXXXXXX") || return 1
         printf -v cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$work/inventory" "$work"
+        # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
         trap "$cleanup" EXIT
         trap 'exit 5' HUP INT TERM
         selected=$(_cs_select_members "$dir" '*' '' "$metadata" "$canonical_manifest" "$work/inventory") || return $?
@@ -420,6 +440,7 @@ _cs_update_repo_checksums() (
     # Syntax is checked before even creating missing target directories.
     stage=$(mktemp -d "$repo_path/.dsr-checksum-update.XXXXXXXX") || return 1
     printf -v cleanup 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' "$stage/input" "$stage/manifest" "$stage"
+    # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
     trap "$cleanup" EXIT
     trap 'exit 5' HUP INT TERM
     printf '%s\n' "$content" > "$stage/input" || return 1
@@ -431,6 +452,7 @@ _cs_update_repo_checksums() (
         # beside the final path so mv is a rename, not a cross-device copy.
         publish_stage=$(mktemp -d "$parent/.dsr-checksum-output.XXXXXXXX") || return 1
         printf -v publish_cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$publish_stage/manifest" "$publish_stage"
+        # shellcheck disable=SC2064 # expand now: both are %q-quoted commands
         trap "$cleanup; $publish_cleanup" EXIT
         cp -- "$stage/manifest" "$publish_stage/manifest" || return 1
         cmp -s "$stage/manifest" "$publish_stage/manifest" || return 1
@@ -693,6 +715,7 @@ checksum_sync_json() (
     if ! _cs_is_safe_path "$root"; then checksum_sync --json "$@"; return $?; fi
     stage=$(mktemp -d "$root/dsr-checksum-json.XXXXXXXX") || return 1
     printf -v cleanup 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' "$stage/result" "$stage/log" "$stage"
+    # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
     trap "$cleanup" EXIT
     trap 'exit 5' HUP INT TERM
     checksum_sync --json "$@" > "$stage/result" 2> "$stage/log" || code=$?

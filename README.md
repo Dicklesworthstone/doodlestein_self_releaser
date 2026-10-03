@@ -437,6 +437,58 @@ dsr release --repo ntm --version v1.2.3 --draft # Create draft release
 dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
 ```
 
+For repositories whose existing release venue contains source only, use an
+explicit `repos.d/<tool>.yaml` configuration with these four fields:
+
+```yaml
+tool_name: example
+repo: owner/example
+local_path: /absolute/path/to/example
+publication_mode: source-only
+```
+
+```bash
+dsr release source-only example 1.2.3 --notes-file release-notes.md --no-dispatch
+```
+
+This mode requires a clean checkout whose HEAD and local tag match the remote
+tag. It creates and verifies its own draft before publishing, verifies an empty
+asset inventory, and retains a separate publication receipt. Existing releases,
+legacy registry entries for the same tool, and build configuration are refused.
+Use `--draft` to retain the verified draft, or global `--dry-run` to inspect the
+admission result without creating a release. Source-only configuration cannot
+be used by the normal binary publication command.
+
+If GitHub temporarily omits a newly created draft from its release list, DSR
+retains the private pending receipt. Retry with the same inputs and
+`--resume-receipt /absolute/path/to/the/receipt`. Recovery verifies the original
+nonce-bound draft and creates no new release; it retains the original receipt
+and records a separate recovery receipt. Ordinary `--resume` remains a binary
+publication option and is refused in source-only mode.
+
+If strict binary creation succeeded but its controller stopped before
+publication, preserve the original private `dsr-api-response.*` POST response.
+Recovery requires a response that actually survived or was preserved; it cannot
+reconstruct creation custody from public release metadata.
+Use `dsr release verify TOOL VERSION --fix` to repair missing draft assets. Once
+all signed assets verify, finalize through DSR:
+
+```bash
+dsr release finalize TOOL VERSION --create-response /private/scratch/dsr-api-response.ABCDEF12 --no-dispatch
+```
+
+The response must remain a single-link, owner-only regular file in the same
+canonical private `TMPDIR` used by the GitHub adapter. Finalization verifies its
+original creation nonce, release ID and metadata against the current exact
+source and complete signed asset inventory. It freezes explicit configuration
+and registry inputs, writes private recovery evidence before publishing, and
+rechecks all evidence afterward. It never creates or uploads assets, accepts a
+tag lookup as custody, or dispatches workflows. Inventories of 100 or more
+assets are refused. Global dry-run performs verification without publication.
+Recovery requires Python 3 for bounded, no-follow descriptor validation of the
+private receipt and its directory; device, inode, and byte identity remain
+fixed through publication.
+
 ### `dsr canary`
 
 Run a repository's installer in a clean Linux container, then require its
@@ -638,19 +690,34 @@ commands can branch on `DSR_TARGET_OS` / `DSR_TARGET_ARCH` /
 `DSR_TARGET_PLATFORM` / `DSR_TARGET_TRIPLE` without parsing paths. Opt out of
 the derivation with `derive_cargo_build_target: false`.
 
-Ordinary (non-strict) Linux Rust builds targeting `*-linux-gnu` default to a
-**portable glibc floor of 2.28**: a `cargo` shim staged with the isolated
-source routes `cargo build` through `cargo zigbuild --target <triple>.<floor>`
-(cargo-zigbuild >= 0.23.0 and zig must be on the build host), and the
-collected binary's versioned glibc symbols are asserted against the floor.
+Linux Rust builds targeting `*-linux-gnu` — ordinary and strict
+release-contract builds alike — default to a **portable glibc floor of
+2.28**: a `cargo` shim (staged with the isolated source, or beside a strict
+snapshot so the snapshot stays byte-identical) routes `cargo build` through
+`cargo zigbuild --target <triple>.<floor>` (cargo-zigbuild >= 0.23.0 and zig
+must be on the build host), and the collected binary's versioned glibc
+symbols are asserted against the floor; a binary above it fails the target.
 Without this, natively built amd64 binaries inherit the build host's glibc
 and stop starting on Debian 12 / Ubuntu 22.04 / RHEL 9-class systems the
 moment the build fleet upgrades. Configure per tool with
 `linux_glibc_floor: "2.28"` (or another `MAJOR.MINOR`), opt out with
 `linux_glibc_floor: native`; the floor is skipped automatically for musl
-triples, for platforms whose env carries an operator cross toolchain
-(`CARGO_TARGET_<T>_LINKER` / `CC_<t>`), and for build commands that already
-invoke `zigbuild`, `xwin`, or `cross`.
+triples, and dsr applies no shim for platforms whose env carries an operator
+cross toolchain (`CARGO_TARGET_<T>_LINKER` / `CC_<t>`) or build commands that
+already invoke `zigbuild`, `xwin`, or `cross` — but an explicitly configured
+`linux_glibc_floor` is still enforced on those binaries.
+
+With `--parallel`, two targets on one host whose build writes the same
+in-tree file (for example `go build -o tool ./cmd/tool`) no longer overwrite
+each other: the later target builds in a private copy of the source under
+`/var/tmp` (or the host's `build_root`), which is removed after collection.
+Where a private copy cannot help (strict snapshots, Windows hosts, outputs
+outside the tree such as a shared absolute `GOBIN`), the colliding targets
+run one after the other.
+
+A target whose host is at its `concurrency` limit waits for a slot for up to
+one build timeout (`DSR_BUILD_TIMEOUT`, default 3600s) instead of failing
+after five minutes; set `DSR_SELECTOR_WAIT_TIMEOUT` to choose another bound.
 
 ---
 

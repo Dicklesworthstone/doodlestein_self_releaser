@@ -3393,6 +3393,42 @@ else
     fail "strict sync reused a pre-existing source root"
 fi
 
+# Strict dependency sync and verification iterate `while read` loops over the
+# pinned sibling checkouts. A transfer command that inherits the loop's stdin
+# (ssh/scp without -n, as the Windows path once did) swallows the remaining
+# records, so only the FIRST sibling reached the host (focr: asupersync synced,
+# frankensqlite/frankentorch silently missing). The stubs below read stdin to
+# EOF exactly like such a transfer; every sibling on every host must still be
+# processed.
+dependency_loop_log="$TEMP_DIR/dependency-loop.log"
+dependency_loop_checkouts=$(jq -nc --arg sha "$strict_sync_sha" '[
+    {relative_path: "asupersync", local_path: "/deps/asupersync", git_sha: $sha},
+    {relative_path: "frankensqlite", local_path: "/deps/frankensqlite", git_sha: $sha},
+    {relative_path: "frankentorch", local_path: "/deps/frankentorch", git_sha: $sha}]')
+dependency_loop_status=0
+(
+    _act_release_source_dependency_checkouts_json() { printf '%s\n' "$dependency_loop_checkouts"; }
+    _act_validate_strict_checkout_at_revision() { return 0; }
+    _act_validate_no_absolute_cargo_paths() { return 0; }
+    _act_sync_strict_checkout() { cat > /dev/null; printf 'sync %s\n' "$6" >> "$dependency_loop_log"; }
+    act_sync_sources "synctest" --strict-release \
+        --run-id "550e8400-e29b-41d4-a716-446655440042" --git-sha "$strict_sync_sha" -- "linux/amd64"
+) >/dev/null 2>&1 || dependency_loop_status=$?
+(
+    _act_release_source_dependency_checkouts_json() { printf '%s\n' "$dependency_loop_checkouts"; }
+    _act_verify_strict_checkout_snapshot() { cat > /dev/null; printf 'verify %s %s\n' "$1" "$6" >> "$dependency_loop_log"; }
+    _act_verify_strict_source_roots synctest "$strict_sync_sha" \
+        '{"trj":"/r/trj/source","wlap":"C:/d/r/source"}'
+) >/dev/null 2>&1 || dependency_loop_status=$?
+if [[ $dependency_loop_status -eq 0 && "$(cat "$dependency_loop_log")" == \
+      "$(printf '%s\n' 'sync synctest' 'sync asupersync' 'sync frankensqlite' 'sync frankentorch' \
+          'verify trj synctest' 'verify trj asupersync' 'verify trj frankensqlite' 'verify trj frankentorch' \
+          'verify wlap synctest' 'verify wlap asupersync' 'verify wlap frankensqlite' 'verify wlap frankentorch')" ]]; then
+    pass "strict sync and verification reach every pinned sibling on every host"
+else
+    fail "a stdin-reading transfer drained the sibling/host loop (status=$dependency_loop_status): $(tr '\n' ';' < "$dependency_loop_log" 2>/dev/null)"
+fi
+
 printf '[dependencies]\nasupersync = { path = "/dp/asupersync" }\n' > "$strict_sync_repo/Cargo.toml"
 git -C "$strict_sync_repo" add Cargo.toml
 git -C "$strict_sync_repo" -c user.name=DSR-Test -c user.email=dsr-test@example.invalid \
@@ -3810,6 +3846,279 @@ if test_dispatch_source_growth; then
     pass "dispatch preserves command status without parsing source appended during main"
 else
     fail "dispatch resumed parsing changed source or lost command status"
+fi
+
+# --parallel targets on ONE host whose build_cmd writes the same in-tree file
+# (`go build -o ntm ./cmd/ntm`) used to overwrite each other's binary: ntm
+# 1.36.0's linux/arm64 lane collected the amd64 build. This drives the real
+# native runner on a local host with a build that holds the shared file across
+# a window. The negative control disables detection and must reproduce the
+# wrong-architecture collection; the fix gives the second target a private
+# source copy and both targets collect their own architecture.
+test_parallel_shared_output_isolation() (
+    local root="$TEMP_DIR/shared-output" mode status result
+    mkdir -p "$root/src" "$root/fixtures"
+    write_minimal_target_binary "$root/fixtures/amd64" linux/amd64
+    write_minimal_target_binary "$root/fixtures/arm64" linux/arm64
+    cat > "$ACT_REPOS_DIR/outtest.yaml" <<EOF
+tool_name: outtest
+repo: test/outtest
+local_path: $root/src
+language: go
+binary_name: outtest
+build_cmd: cp "$root/fixtures/\$GOARCH" outtest && sleep 3
+targets: [linux/amd64, linux/arm64]
+act_job_map:
+  linux/amd64: null
+  linux/arm64: null
+cross_compile:
+  linux/amd64:
+    host: trj
+    env:
+      GOOS: linux
+      GOARCH: amd64
+  linux/arm64:
+    host: trj
+    env:
+      GOOS: linux
+      GOARCH: arm64
+EOF
+    build_lock_acquire() { return 0; }
+    build_lock_release() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    for mode in control fixed; do
+        status=0
+        result=$(
+            if [[ "$mode" == control ]]; then
+                _act_native_output_paths() { :; }
+            fi
+            act_orchestrate_build outtest "v1.0.0-$mode" --parallel-jobs 2 \
+                --output-dir "$root/out-$mode" -- linux/amd64 linux/arm64
+        ) 2> "$root/$mode.log" || status=$?
+        printf '%s\n' "$result" > "$root/$mode.json"
+        if [[ "$mode" == control ]]; then
+            # Detection off: one lane must have collected the other's binary.
+            jq -e '.summary.failed >= 1' <<< "$result" >/dev/null || exit 1
+            jq -r '.targets[].log_path' <<< "$result" | xargs grep -l 'is not a linux/' >/dev/null || exit 1
+        else
+            [[ $status -eq 0 ]] || exit 1
+            jq -e '.status == "success" and .summary == {total: 2, success: 2, failed: 0}' \
+                <<< "$result" >/dev/null || exit 1
+            local platform artifact
+            for platform in linux/amd64 linux/arm64; do
+                artifact=$(jq -r --arg p "$platform" '.targets[] | select(.platform == $p) | .artifact_path' <<< "$result")
+                [[ -f "$artifact" ]] && _act_validate_target_binary "$artifact" "$platform" || exit 1
+            done
+            jq -r '.targets[] | select(.platform == "linux/arm64") | .log_path' <<< "$result" |
+                xargs grep -l 'private output stage /var/tmp/dsr-build-outtest-linux-arm64-' >/dev/null || exit 1
+            # The private copy is gone and the shared tree only ever held the
+            # in-place lane's output.
+            ! compgen -G "/var/tmp/dsr-build-outtest-linux-*" >/dev/null || exit 1
+            cmp -s "$root/src/outtest" "$root/fixtures/amd64" || exit 1
+        fi
+    done
+)
+if test_parallel_shared_output_isolation; then
+    pass "parallel same-host targets with a shared -o path each collect their own architecture"
+else
+    fail "parallel same-host targets still share one output file"
+fi
+
+# A cancelled run (Ctrl-C / TERM) TERMs every worker's build process group,
+# which never reaches the removals after the build command. The private
+# source copy must still be removed, or each interrupted release leaves a full
+# repo copy in /var/tmp with nothing to reap it.
+test_parallel_shared_output_stage_removed_on_cancel() (
+    local root="$TEMP_DIR/shared-output-cancel" orchestrator_pid waited
+    mkdir -p "$root/src" "$root/fixtures"
+    write_minimal_target_binary "$root/fixtures/amd64" linux/amd64
+    write_minimal_target_binary "$root/fixtures/arm64" linux/arm64
+    cat > "$ACT_REPOS_DIR/cancelout.yaml" <<EOF
+tool_name: cancelout
+repo: test/cancelout
+local_path: $root/src
+language: go
+binary_name: cancelout
+build_cmd: cp "$root/fixtures/\$GOARCH" cancelout && sleep 60
+targets: [linux/amd64, linux/arm64]
+act_job_map:
+  linux/amd64: null
+  linux/arm64: null
+cross_compile:
+  linux/amd64:
+    host: trj
+    env:
+      GOOS: linux
+      GOARCH: amd64
+  linux/arm64:
+    host: trj
+    env:
+      GOOS: linux
+      GOARCH: arm64
+EOF
+    build_lock_acquire() { return 0; }
+    build_lock_release() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    act_orchestrate_build cancelout v1.0.0-cancel --parallel-jobs 2 \
+        --output-dir "$root/out" -- linux/amd64 linux/arm64 \
+        > "$root/result.json" 2> "$root/orchestrator.log" &
+    orchestrator_pid=$!
+    # Wait for the staged lane's copy to exist and its build to be running.
+    for ((waited = 0; waited < 300; waited++)); do
+        compgen -G "/var/tmp/dsr-build-cancelout-linux-arm64-*/source/cancelout" >/dev/null && break
+        sleep 0.1
+    done
+    compgen -G "/var/tmp/dsr-build-cancelout-linux-arm64-*/source/cancelout" >/dev/null || {
+        kill -TERM "$orchestrator_pid" 2>/dev/null; wait "$orchestrator_pid" 2>/dev/null; exit 1; }
+    kill -TERM "$orchestrator_pid"
+    wait "$orchestrator_pid" 2>/dev/null
+    # Cleanup runs in the cancelled build's own subshell; allow it to finish.
+    for ((waited = 0; waited < 200; waited++)); do
+        compgen -G "/var/tmp/dsr-build-cancelout-linux-*" >/dev/null || exit 0
+        sleep 0.1
+    done
+    exit 1
+)
+if test_parallel_shared_output_stage_removed_on_cancel; then
+    pass "a cancelled parallel run removes the private output-stage source copy"
+else
+    fail "a cancelled parallel run left its output-stage source copy: $(compgen -G '/var/tmp/dsr-build-cancelout-linux-*' | tr '\n' ' ')"
+fi
+
+# Where a private source copy cannot make the shared file private (a Windows
+# host, or an absolute GOBIN outside the tree), the colliding targets run one
+# after the other; unrelated targets keep running in parallel.
+test_parallel_shared_output_serialization() (
+    local root="$TEMP_DIR/shared-output-serial" case_name
+    mkdir -p "$root"
+    build_lock_acquire() { return 0; }
+    build_lock_release() { return 0; }
+    selector_acquire_slot() { return 0; }
+    selector_release_slot() { return 0; }
+    act_run_native_build() {
+        local slug="${2//\//-}"
+        printf '%s start %s stage=%s\n' "$(date +%s%N)" "$slug" "${DSR_NATIVE_OUTPUT_STAGE:-}" >> "$root/$case_name.timeline"
+        sleep 1
+        printf '%s end %s\n' "$(date +%s%N)" "$slug" >> "$root/$case_name.timeline"
+        jq -nc --arg platform "$2" '{platform: $platform, status: "failed", exit_code: 6}'
+        return 6
+    }
+    for case_name in windows gobin; do
+        if [[ "$case_name" == windows ]]; then
+            cat > "$ACT_REPOS_DIR/serialtest.yaml" <<'EOF'
+tool_name: serialtest
+repo: test/serialtest
+local_path: C:/d/serialtest
+language: go
+binary_name: serialtest
+build_cmd: go build -o serialtest.exe ./cmd/serialtest
+targets: [windows/amd64, windows/arm64, linux/amd64]
+act_job_map: {windows/amd64: null, windows/arm64: null, linux/amd64: null}
+cross_compile:
+  windows/amd64: {host: wlap}
+  windows/arm64: {host: wlap}
+  linux/amd64: {host: trj}
+EOF
+            act_orchestrate_build serialtest "v1.0.0-$case_name" --parallel-jobs 3 \
+                --output-dir "$root/out-$case_name" -- linux/amd64 windows/amd64 windows/arm64 \
+                > /dev/null 2>&1
+        else
+            cat > "$ACT_REPOS_DIR/serialtest.yaml" <<'EOF'
+tool_name: serialtest
+repo: test/serialtest
+local_path: /srv/serialtest
+language: go
+binary_name: serialtest
+build_cmd: go build -o "$GOBIN/serialtest" ./cmd/serialtest
+targets: [linux/amd64, linux/arm64, darwin/arm64]
+act_job_map: {linux/amd64: null, linux/arm64: null, darwin/arm64: null}
+env:
+  GOBIN: /srv/shared-bin
+cross_compile:
+  linux/amd64: {host: trj}
+  linux/arm64: {host: trj}
+  darwin/arm64: {host: mmini}
+EOF
+            act_orchestrate_build serialtest "v1.0.0-$case_name" --parallel-jobs 3 \
+                --output-dir "$root/out-$case_name" -- darwin/arm64 linux/amd64 linux/arm64 \
+                > /dev/null 2>&1
+        fi
+    done
+    # Replay each timeline: the two colliding targets never overlap, the
+    # unrelated target (launched first) runs alongside them, and nothing was
+    # staged. A waiting target does hold back targets listed after it.
+    local first second third
+    for case_name in windows gobin; do
+        if [[ "$case_name" == windows ]]; then
+            first=windows-amd64 second=windows-arm64 third=linux-amd64
+        else
+            first=linux-amd64 second=linux-arm64 third=darwin-arm64
+        fi
+        ! grep -q 'stage=1' "$root/$case_name.timeline" || exit 1
+        awk -v a="$first" -v b="$second" -v c="$third" '
+            $2 == "start" { start[$3] = $1 } $2 == "end" { stop[$3] = $1 }
+            END {
+                if (!(a in stop) || !(b in start) || !(c in start)) exit 1
+                if (start[b] < stop[a]) exit 1
+                if (start[a] > stop[c]) exit 1
+            }' "$root/$case_name.timeline" || exit 1
+    done
+)
+if test_parallel_shared_output_serialization; then
+    pass "unstageable shared outputs (Windows host, external GOBIN) serialize only the colliding targets"
+else
+    fail "unstageable shared outputs ran concurrently or blocked unrelated targets"
+fi
+
+# A target whose host is at its concurrency limit must queue for a slot for up
+# to one build timeout instead of failing after the selector's short default
+# (trj's 4-slot lane failed focr linux/arm64 after 300s while a 2.5h build held
+# the slots). The failure, when the budget really expires, names the host,
+# the wait, and the fix.
+test_worker_capacity_wait_budget() (
+    local fixture="$TEMP_DIR/capacity-wait" budget_log status mode
+    mkdir -p "$fixture"
+    budget_log="$fixture/budgets"
+    act_platform_uses_act() { return 1; }
+    selector_release_slot() { return 0; }
+    _act_build_orchestration_target() {
+        printf 'built\n' >> "$fixture/built"
+        jq -nc '{platform: "linux/arm64", host: "trj", status: "failed", exit_code: 6}'
+        return 6
+    }
+    _ACT_BUILD_TIMEOUT=10800
+    for mode in default override granted; do
+        status=0
+        if [[ "$mode" == granted ]]; then
+            selector_acquire_slot() { printf '%s\n' "$DSR_SELECTOR_WAIT_TIMEOUT" >> "$budget_log"; return 0; }
+        else
+            selector_acquire_slot() { printf '%s\n' "$DSR_SELECTOR_WAIT_TIMEOUT" >> "$budget_log"; return 2; }
+        fi
+        if [[ "$mode" == override ]]; then
+            DSR_SELECTOR_WAIT_TIMEOUT=77 _act_run_target_worker capwait v1.0.0 capwait-run linux/arm64 1 \
+                "$fixture/$mode.log" "$fixture/$mode.json" false null '{}' "" "" trj \
+                > /dev/null 2>&1 || status=$?
+        else
+            _act_run_target_worker capwait v1.0.0 capwait-run linux/arm64 1 \
+                "$fixture/$mode.log" "$fixture/$mode.json" false null '{}' "" "" trj \
+                > /dev/null 2>&1 || status=$?
+        fi
+        printf '%s %s\n' "$mode" "$status" >> "$fixture/statuses"
+    done
+    [[ "$(cat "$budget_log")" == $'10800\n77\n10800' ]] || exit 1
+    [[ "$(cat "$fixture/statuses")" == $'default 2\noverride 2\ngranted 6' ]] || exit 1
+    [[ "$(cat "$fixture/built")" == built ]] || exit 1
+    jq -e '.exit_code == 2 and
+        (.error | startswith("Host capacity acquisition failed: no build slot on trj after waiting")) and
+        (.error | contains("budget 10800s"))' "$fixture/default.json" >/dev/null || exit 1
+    jq -e '.error | contains("budget 77s")' "$fixture/override.json" >/dev/null || exit 1
+)
+if test_worker_capacity_wait_budget; then
+    pass "capacity-limited targets queue for one build timeout and fail with an actionable error"
+else
+    fail "capacity-limited target wait budget or failure message is wrong"
 fi
 
 # Cleanup

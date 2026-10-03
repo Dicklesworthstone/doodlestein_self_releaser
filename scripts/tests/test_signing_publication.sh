@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 for tool in jq sha256sum; do command -v "$tool" >/dev/null || { echo "SKIP: $tool required"; exit 0; }; done
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-signing-test.XXXXXXXX") || exit 1
 trap 'rm -rf -- "$TEMP"' EXIT
+# Batch signing canonicalizes paths (pwd -P); fault hooks below match on
+# paths, so use the physical spelling (macOS /var is /private/var).
+TEMP=$(cd "$TEMP" && pwd -P) || exit 1
 export DSR_CONFIG_DIR="$TEMP/config" NO_COLOR=1
 mkdir -p "$DSR_CONFIG_DIR/secrets" "$TEMP/artifacts"
 source "${DSR_SIGNING_MODULE:-$ROOT/src/signing.sh}" || exit 1
