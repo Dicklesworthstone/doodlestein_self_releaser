@@ -10,7 +10,7 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ---
 
-## Unreleased
+## v0.2.2 -- 2026-10-02
 
 - Strict release creation keeps adapter diagnostics separate from JSON. An
   already repaired strict draft can be published with `dsr release finalize`
@@ -37,6 +37,27 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
   local and generated Unix verification reject paths that traverse another
   symlink, including an alias followed by `..` that would escape the snapshot.
   Symlink chains are conservatively refused; use a direct contained target.
+
+### Qualification
+
+The changed recovery paths pass 95 strict-draft, 175 source-only and 23 binary
+recovery checks through the required remote test lane, plus syntax and focused
+warning-level ShellCheck. Actual GitHub recovery published FrankenRedis v0.1.1
+and the source-only ACFS v0.10.0 release; independent public readback passed.
+FrankenRedis published-artifact runtime and prior-release upgrade checks passed
+91 assertions on an independent Linux host.
+
+The earlier symlink-candidate Bats comparison reported 288 passed/10 failed at
+v0.2.1 and 298 passed/the same 10 failed before the later release-recovery
+additions; all 10 added symlink assertions passed.
+A complete lint or native Rust-fixture pass is not claimed. Existing strict
+Unix audit performance and future RCH-native routing work remain tracked in
+[#22](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/22)
+and [#17](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/17).
+The distribution remains the existing signed, platform-neutral Bash bundle. The legacy
+SPDX license label does not represent the bundled license rider; complete
+license bytes remain in both source archives, and metadata classification is
+tracked in [#24](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/24).
 
 ## v0.2.1 -- 2026-10-01
 
