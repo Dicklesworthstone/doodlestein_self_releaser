@@ -117,19 +117,62 @@ _sha256() {
     [[ "$output" == *"cannot be represented safely: abs_link"* ]]
 }
 
-@test "containment is resolved lexically from the link's directory" {
-    run _act_strict_symlink_target_is_contained "a/b/link" "../c"
+@test "direct containment is resolved from the link's directory" {
+    mkdir -p "$REPO/a/b" "$REPO/a/c" "$REPO/c"
+    run _act_strict_symlink_target_is_contained "$REPO" "a/b/link" "../c"
     [ "$status" -eq 0 ]
-    run _act_strict_symlink_target_is_contained "a/b/link" "../../c"
+    run _act_strict_symlink_target_is_contained "$REPO" "a/b/link" "../../c"
     [ "$status" -eq 0 ]
-    run _act_strict_symlink_target_is_contained "a/b/link" "../../../c"
+    run _act_strict_symlink_target_is_contained "$REPO" "a/b/link" "../../../c"
     [ "$status" -ne 0 ]
-    run _act_strict_symlink_target_is_contained "link" "../c"
+    run _act_strict_symlink_target_is_contained "$REPO" "link" "../c"
     [ "$status" -ne 0 ]
-    run _act_strict_symlink_target_is_contained "a/link" "x/../../../c"
+    run _act_strict_symlink_target_is_contained "$REPO" "a/link" "x/../../../c"
     [ "$status" -ne 0 ]
-    run _act_strict_symlink_target_is_contained "a/link" "/etc/hosts"
+    run _act_strict_symlink_target_is_contained "$REPO" "a/link" "/etc/hosts"
     [ "$status" -ne 0 ]
-    run _act_strict_symlink_target_is_contained "a/link" ""
+    run _act_strict_symlink_target_is_contained "$REPO" "a/link" ""
     [ "$status" -ne 0 ]
+}
+
+@test "a contained alias followed by dot-dot cannot escape manifest admission" {
+    printf 'own scratch external marker\n' > "$TEST_TMPDIR/external"
+    ln -s . "$REPO/alias"
+    ln -s alias/../external "$REPO/link"
+    git -C "$REPO" add -- alias link
+    git -C "$REPO" commit -q -m alias-escape
+    [ "$(cat "$REPO/link")" = "own scratch external marker" ]
+    run _act_write_tracked_manifest "$REPO" HEAD "$TEST_TMPDIR/manifest-escape"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot be represented safely: link"* ]]
+}
+
+@test "both verifiers refuse an alias escape even with correct tracked hashes" {
+    printf 'own scratch external marker\n' > "$TEST_TMPDIR/external"
+    ln -s . "$REPO/alias"
+    ln -s alias/../external "$REPO/link"
+    git -C "$REPO" add -- alias link
+    git -C "$REPO" commit -q -m alias-escape
+    # Deliberately construct an otherwise authentic manifest without admission.
+    git -C "$REPO" ls-tree -r HEAD | awk '{print $3 "\t" $1 "\t" $4}' > "$TEST_TMPDIR/manifest"
+    _extract_snapshot "$TEST_TMPDIR/snap"
+    [ "$(cat "$TEST_TMPDIR/snap/link")" = "own scratch external marker" ]
+    run _act_verify_tracked_manifest_local "$TEST_TMPDIR/snap" "$TEST_TMPDIR/manifest"
+    [ "$status" -ne 0 ]
+    git -C "$REPO" archive --format=tar HEAD > "$TEST_TMPDIR/archive.tar"
+    count=$(_act_tracked_manifest_object_count "$TEST_TMPDIR/manifest")
+    _act_unix_strict_snapshot_verify_script "$TEST_TMPDIR/snap" "$TEST_TMPDIR/archive.tar" \
+        "$TEST_TMPDIR/manifest" "$(_sha256 "$TEST_TMPDIR/manifest")" "$count" > "$TEST_TMPDIR/verify.sh"
+    run sh "$TEST_TMPDIR/verify.sh"
+    [ "$status" -ne 0 ]
+}
+
+@test "direct targets that are themselves symlinks are conservatively refused" {
+    ln -s src/main.rs "$REPO/alias"
+    ln -s alias "$REPO/chain"
+    git -C "$REPO" add -- alias chain
+    git -C "$REPO" commit -q -m link-chain
+    run _act_write_tracked_manifest "$REPO" HEAD "$TEST_TMPDIR/manifest-chain"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot be represented safely: chain"* ]]
 }

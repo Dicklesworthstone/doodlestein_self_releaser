@@ -12,6 +12,19 @@ Commit links point to: `https://github.com/Dicklesworthstone/doodlestein_self_re
 
 ## Unreleased
 
+- `dsr release source-only` publishes installer/source-only GitHub Releases with
+  zero uploaded assets. It requires explicit configuration, reviewed notes,
+  disabled dispatch, and a clean checkout whose peeled tag matches GitHub.
+  Creation custody, metadata, tag identity, and both asset inventories are
+  verified before publication; failures restore the newly owned release to
+  draft. Source publication receipts remain separate from build manifests.
+
+- Strict source snapshots support direct contained relative symlinks, preserving
+  their tracked target bytes and executable/file modes. Link admission and both
+  local and generated Unix verification reject paths that traverse another
+  symlink, including an alias followed by `..` that would escape the snapshot.
+  Symlink chains are conservatively refused; use a direct contained target.
+
 ## v0.2.1 -- 2026-10-01
 
 - Rerunning `install.sh` never upgraded an install made with `--version`:

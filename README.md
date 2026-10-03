@@ -437,6 +437,28 @@ dsr release --repo ntm --version v1.2.3 --draft # Create draft release
 dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
 ```
 
+For repositories whose existing release venue contains source only, use an
+explicit `repos.d/<tool>.yaml` configuration with these four fields:
+
+```yaml
+tool_name: example
+repo: owner/example
+local_path: /absolute/path/to/example
+publication_mode: source-only
+```
+
+```bash
+dsr release source-only example 1.2.3 --notes-file release-notes.md --no-dispatch
+```
+
+This mode requires a clean checkout whose HEAD and local tag match the remote
+tag. It creates and verifies its own draft before publishing, verifies an empty
+asset inventory, and retains a separate publication receipt. Existing releases,
+legacy registry entries for the same tool, and build configuration are refused.
+Use `--draft` to retain the verified draft, or global `--dry-run` to inspect the
+admission result without creating a release. Source-only configuration cannot
+be used by the normal binary publication command.
+
 ### `dsr canary`
 
 Run a repository's installer in a clean Linux container, then require its

@@ -5227,6 +5227,232 @@ _release_contract_create_nonce() {
     printf '%s\n' "$nonce"
 }
 
+# Source-only releases deliberately have no build manifest or uploaded assets.
+# Their explicit configuration and CLI keep them separate from binary admission.
+_source_release_identity() {
+    local repo="$1" path="$2" tag="$3" expected_sha="$4" origin="" status=""
+    [[ -d "$path" && "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 4
+    [[ "$(cd "$path" && pwd -P)" == "$(_act_strict_git -C "$path" rev-parse --show-toplevel)" ]] || {
+        log_error "Source-only local_path must be the actual Git checkout root"
+        return 4
+    }
+    origin=$(_act_strict_git -C "$path" config --get remote.origin.url) || return 4
+    case "$origin" in
+        "https://github.com/$repo"|"https://github.com/$repo.git"|"git@github.com:$repo"|"git@github.com:$repo.git") ;;
+        *) log_error "Source-only checkout origin does not match its configured repository"; return 4 ;;
+    esac
+    status=$(_act_strict_git -C "$path" status --porcelain=v1 --untracked-files=all) || return 4
+    [[ -z "$status" && "$(_act_strict_git -C "$path" rev-parse --verify HEAD)" == "$expected_sha" &&
+       "$(_act_strict_git -C "$path" rev-parse --verify "refs/tags/$tag^{commit}")" == "$expected_sha" ]] || {
+        log_error "Source-only publication requires a clean checkout at the exact peeled tag"
+        return 4
+    }
+    _release_contract_verify_remote_tag_identity "$repo" "$tag" "$expected_sha" || return 4
+}
+
+_source_release_metadata_matches() {
+    local observed="$1" expected="$2" release_id="$3" draft="$4"
+    jq -es --argjson expected "$expected" --argjson id "$release_id" --arg draft "$draft" '
+        length == 1 and (.[0] | type == "object" and .id == $id and
+        .tag_name == $expected.tag_name and .name == $expected.name and
+        .body == $expected.body and .prerelease == $expected.prerelease and
+        .target_commitish == $expected.target_commitish and
+        (.draft | type == "boolean") and
+        ($draft == "any" or (.draft | tostring) == $draft))
+    ' <<< "$observed" >/dev/null 2>&1
+}
+
+_source_release_observe() {
+    local repo="$1" release_id="$2" expected="$3" draft="$4" observed="" assets=""
+    observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+    _source_release_metadata_matches "$observed" "$expected" "$release_id" "$draft" || return 1
+    jq -es 'length == 1 and .[0].assets == []' <<< "$observed" >/dev/null || return 1
+    # Embedded release.assets is not an authoritative complete inventory.
+    assets=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=1" --no-cache) || return 1
+    jq -es 'length == 1 and .[0] == []' <<< "$assets" >/dev/null || return 1
+    printf '%s\n' "$observed"
+}
+
+_source_release_restore_draft() {
+    local repo="$1" release_id="$2" expected="$3" tag=""
+    # Callers reach rollback only after full nonce-bound creation custody is
+    # proven. Later body drift must still return that owned ID/tag to draft.
+    tag=$(jq -r '.tag_name' <<< "$expected") || return 1
+    _release_contract_confirm_or_restore_bound_draft "$repo" "$release_id" "$tag"
+}
+
+_source_release_inputs_match() {
+    local config="$1" config_sha="$2" notes="$3" notes_sha="$4" registry="$5" registry_sha="$6"
+    [[ -f "$config" && ! -L "$config" && -f "$notes" && ! -L "$notes" &&
+       "$(_gh_asset_sha256 "$config")" == "$config_sha" &&
+       "$(_gh_asset_sha256 "$notes")" == "$notes_sha" ]] || return 1
+    if [[ "$registry_sha" == absent ]]; then
+        [[ ! -e "$registry" && ! -L "$registry" ]]
+    else
+        [[ -f "$registry" && ! -L "$registry" &&
+           "$(_gh_asset_sha256 "$registry")" == "$registry_sha" ]]
+    fi
+}
+
+cmd_release_source_only() {
+    local tool="" version="" notes="" no_dispatch=false draft=false prerelease=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --notes-file)
+                [[ $# -ge 2 && "$2" != -* ]] || return 4
+                notes="$2"; shift 2 ;;
+            --no-dispatch) no_dispatch=true; shift ;;
+            --draft) draft=true; shift ;;
+            --prerelease) prerelease=true; shift ;;
+            --help|-h)
+                cat <<'EOF'
+dsr release source-only <tool> <version> --notes-file <file> --no-dispatch
+
+Publishes an installer/source-only GitHub Release with exactly zero assets.
+Requires publication_mode: source-only in repos.d, a clean exact tagged checkout,
+the same peeled tag on GitHub, and explicit reviewed notes. Always verifies an
+owned draft before publication. --draft, --prerelease, and global --dry-run work.
+Binary artifact, resume, upgrade-verification, and dispatch options are refused.
+EOF
+                return 0 ;;
+            -*) log_error "Unsupported source-only option: $1"; return 4 ;;
+            *)
+                if [[ -z "$tool" ]]; then tool="$1"
+                elif [[ -z "$version" ]]; then version="$1"
+                else return 4
+                fi
+                shift ;;
+        esac
+    done
+    [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ && -n "$version" &&
+       -s "$notes" && ! -L "$notes" && "$no_dispatch" == true ]] || {
+        log_error "Source-only publication requires tool/version, regular reviewed notes and --no-dispatch"
+        return 4
+    }
+    _dsr_require github
+    _dsr_require git_ops
+    _dsr_require act_runner
+    if ! gh_check 2>/dev/null && ! gh_check_token 2>/dev/null; then return 3; fi
+    local config_file="$ACT_REPOS_DIR/$tool.yaml" config="" config_sha=""
+    [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
+    config_sha=$(_gh_asset_sha256 "$config_file") || return 4
+    config=$(_config_read_single_mapping_json "$config_file") || return 4
+    [[ "$(_gh_asset_sha256 "$config_file")" == "$config_sha" ]] || return 4
+    if ! jq -e --arg tool "$tool" 'type == "object" and
+        (((keys) - ["tool_name","repo","local_path","publication_mode"]) | length == 0) and
+        (.tool_name == null or .tool_name == $tool) and
+        (.repo | type == "string" and length > 0) and
+        (.local_path | type == "string" and startswith("/")) and
+        .publication_mode == "source-only"' <<< "$config" >/dev/null; then
+        log_error "Source-only mode requires explicit configuration without binary release/build fields"
+        return 4
+    fi
+    # repos.yaml is a real legacy inheritance path. Do not allow an explicit
+    # source-only file to shadow a binary contract/build entry there.
+    local registry="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
+    local registry_sha=absent registry_json=""
+    if [[ -e "$registry" || -L "$registry" ]]; then
+        [[ -f "$registry" && ! -L "$registry" ]] || return 4
+        registry_sha=$(_gh_asset_sha256 "$registry") || return 4
+        registry_json=$(_config_read_single_mapping_json "$registry") || return 4
+        [[ "$(_gh_asset_sha256 "$registry")" == "$registry_sha" ]] || return 4
+        if ! jq -e --arg tool "$tool" '
+            (.tools | type == "object") and ((.tools | has($tool)) | not)
+        ' <<< "$registry_json" >/dev/null; then
+            log_error "Source-only publication refuses conflicting legacy registry configuration"
+            return 4
+        fi
+    fi
+    local repo="" path="" tag="" sha="" notes_sha="" notes_size="" notes_json=""
+    repo=$(jq -r '.repo' <<< "$config") || return 4
+    path=$(jq -r '.local_path' <<< "$config") || return 4
+    [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 4
+    tag=$(git_ops_version_to_tag "$version") || return 4
+    [[ "$tag" =~ ^v[0-9][A-Za-z0-9._+-]*$ ]] || return 4
+    _act_strict_git check-ref-format "refs/tags/$tag" >/dev/null || return 4
+    sha=$(_act_strict_git -C "$path" rev-parse --verify "refs/tags/$tag^{commit}") || return 4
+    _source_release_identity "$repo" "$path" "$tag" "$sha" || return 4
+    notes_size=$(_release_file_size "$notes") || return 4
+    [[ "$notes_size" =~ ^[0-9]+$ ]] && ((notes_size > 0 && notes_size <= 1048576)) || return 4
+    notes_sha=$(_gh_asset_sha256 "$notes") || return 4
+    # jq's rawfile preserves every trailing newline before the ownership nonce.
+    notes_json=$(jq -n --rawfile body "$notes" '{body:$body}') || return 4
+    [[ "$(_gh_asset_sha256 "$notes")" == "$notes_sha" ]] || return 4
+    local scan="" nonce="" expected="" title="" body="" release="" release_id=""
+    scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+    [[ "$(jq -r '.count' <<< "$scan")" == 0 ]] || {
+        log_error "Source-only release already exists; refusing to replace or adopt it"
+        return 4
+    }
+    nonce=$(_release_contract_create_nonce) || return 4
+    title="$tag (source only)"
+    expected=$(jq -n --arg tag "$tag" --arg title "$title" --arg sha "$sha" \
+        --arg nonce "$nonce" --argjson notes "$notes_json" --argjson prerelease "$prerelease" '
+        {tag_name:$tag,name:$title,target_commitish:$sha,prerelease:$prerelease,
+         body:($notes.body + "\n\n<!-- dsr-source-only-create:" + $nonce + " -->")}
+    ') || return 4
+    body=$(jq -r '.body' <<< "$expected") || return 4
+    if $DRY_RUN; then
+        log_info "Would publish exact source $sha as $repo $tag with zero assets"
+        $JSON_MODE && json_envelope "release source-only" "success" 0 "$expected"
+        return 0
+    fi
+    local receipt_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/source-only"
+    mkdir -p "$receipt_dir" || return 7
+    local receipt=""
+    receipt=$(mktemp "$receipt_dir/$tool-$tag.json.XXXXXXXX") || return 7
+    jq -n --argjson expected "$expected" --arg repo "$repo" --arg notes_sha "$notes_sha" \
+        --arg config_sha "$config_sha" '{publication_mode:"source-only",repo:$repo,
+        metadata:$expected,notes_sha256:$notes_sha,config_sha256:$config_sha,status:"pending"}' \
+        > "$receipt" || return 7
+    _source_release_identity "$repo" "$path" "$tag" "$sha" || return 4
+    _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
+        "$registry" "$registry_sha" || return 4
+    # Create only as draft. A transport failure is reconciled by the unique
+    # nonce-bound metadata, never by accepting someone else's same-tag draft.
+    local -a create_args=("$repo" "$tag" --name "$title" --body "$body" --draft --target-commitish "$sha")
+    $prerelease && create_args+=(--prerelease)
+    GH_MAX_RETRIES=1 gh_create_release "${create_args[@]}" >/dev/null || true
+    scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+    release=$(jq -c '.release' <<< "$scan") || return 7
+    release_id=$(jq -r '.id // empty' <<< "$release") || return 7
+    [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 7
+    _source_release_metadata_matches "$release" "$expected" "$release_id" true || return 7
+    if ! _source_release_observe "$repo" "$release_id" "$expected" true >/dev/null ||
+       ! _source_release_identity "$repo" "$path" "$tag" "$sha" ||
+       ! _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
+            "$registry" "$registry_sha"; then
+        _source_release_restore_draft "$repo" "$release_id" "$expected" || true
+        return 7
+    fi
+    if ! $draft; then
+        gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' \
+            --no-cache >/dev/null 2>&1 || true
+    fi
+    if ! release=$(_source_release_observe "$repo" "$release_id" "$expected" "$draft") ||
+       ! _source_release_identity "$repo" "$path" "$tag" "$sha" ||
+       ! _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
+            "$registry" "$registry_sha"; then
+        _source_release_restore_draft "$repo" "$release_id" "$expected" || true
+        return 7
+    fi
+    jq -n --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" \
+        --arg notes_sha "$notes_sha" --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" \
+        --argjson expected "$expected" --argjson release "$release" '
+        {publication_mode:"source-only",repo:$repo,tag:$tag,git_sha:$sha,
+         notes_sha256:$notes_sha,config_sha256:$config_sha,registry_sha256:$registry_sha,
+         metadata:$expected,asset_count:0,release_id:$release.id,
+         draft:$release.draft,url:$release.html_url,status:"success"}
+    ' > "$receipt" || {
+        _source_release_restore_draft "$repo" "$release_id" "$expected" || true
+        return 7
+    }
+    log_info "Verified source-only release $repo $tag; receipt: $receipt"
+    $JSON_MODE && json_envelope "release source-only" "success" 0 "$(cat "$receipt")"
+    return 0
+}
+
 cmd_release() {
     local tool_name=""
     local version=""
@@ -5401,6 +5627,11 @@ EOF
     if ! act_load_repo_config "$tool_name" 2>/dev/null; then
         log_error "Tool '$tool_name' not found in repos.d"
         log_info "Available tools: $(act_list_tools 2>/dev/null | tr '\n' ' ')"
+        return 4
+    fi
+
+    if [[ "${ACT_REPO_PUBLICATION_MODE:-}" == source-only ]]; then
+        log_error "Source-only configuration requires 'dsr release source-only'"
         return 4
     fi
 
@@ -11447,6 +11678,10 @@ main() {
         release)
             # Check for subcommand
             case "${1:-}" in
+                source-only)
+                    shift
+                    cmd_release_source_only "$@"
+                    ;;
                 verify)
                     shift
                     cmd_release_verify "$@"

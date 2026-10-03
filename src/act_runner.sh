@@ -2428,8 +2428,9 @@ act_load_repo_config() {
     ACT_REPO_LOCAL_PATH=$(yq -r '.local_path // ""' "$config_file")
     ACT_REPO_LANGUAGE=$(yq -r '.language // ""' "$config_file")
     ACT_REPO_WORKFLOW=$(yq -r '.workflow // ".github/workflows/release.yml"' "$config_file")
+    ACT_REPO_PUBLICATION_MODE=$(yq -r '.publication_mode // ""' "$config_file")
 
-    export ACT_REPO_NAME ACT_REPO_GITHUB ACT_REPO_LOCAL_PATH ACT_REPO_LANGUAGE ACT_REPO_WORKFLOW
+    export ACT_REPO_NAME ACT_REPO_GITHUB ACT_REPO_LOCAL_PATH ACT_REPO_LANGUAGE ACT_REPO_WORKFLOW ACT_REPO_PUBLICATION_MODE
 
     _log_info "Loaded config for $tool_name: $ACT_REPO_GITHUB"
     return 0
@@ -3891,30 +3892,40 @@ _act_write_git_archive_evidence() {
 }
 
 # A tracked symlink (mode 120000) is representable only when its target is a
-# safe relative path that stays inside the repository: resolved lexically from
-# the link's own directory, no component may climb above the repository root.
-# Absolute and escaping targets are refused. The target string is the blob.
+# safe relative path that stays inside the repository. Check each component
+# before processing '..': a symlink component can change what its parent means.
+# Chained links are conservatively refused. The target string is the blob.
 _act_strict_symlink_target_is_contained() {
-    local link_path="$1"
-    local target="$2"
-    local component depth=0
+    local root_path="${1%/}"
+    local link_path="$2"
+    local target="$3"
+    local component cursor="$root_path"
     local -a parts=()
 
-    [[ -n "$target" && "$target" != /* && \
+    [[ -n "$root_path" && -d "$root_path" && ! -L "$root_path" && \
+       "$link_path" != /* && "$link_path" != *..* && \
+       -n "$target" && "$target" != /* && \
        "$target" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ ]] || return 1
     if [[ "$link_path" == */* ]]; then
         IFS='/' read -r -a parts <<< "${link_path%/*}"
         for component in "${parts[@]}"; do
             [[ -z "$component" || "$component" == "." ]] && continue
-            depth=$((depth + 1))
+            cursor="$cursor/$component"
+            [[ -d "$cursor" && ! -L "$cursor" ]] || return 1
         done
     fi
     IFS='/' read -r -a parts <<< "$target"
     for component in "${parts[@]}"; do
         case "$component" in
             ""|.) ;;
-            ..) depth=$((depth - 1)); ((depth >= 0)) || return 1 ;;
-            *) depth=$((depth + 1)) ;;
+            ..)
+                [[ "$cursor" != "$root_path" ]] || return 1
+                cursor="${cursor%/*}"
+                ;;
+            *)
+                cursor="$cursor/$component"
+                [[ ! -L "$cursor" ]] || return 1
+                ;;
         esac
     done
     return 0
@@ -3930,7 +3941,7 @@ _act_strict_symlink_is_representable() {
     [[ -L "$repo_path/$path" ]] || return 1
     committed_target=$(_act_strict_git -C "$repo_path" cat-file blob "$object_id" 2>/dev/null) || return 1
     [[ "$(readlink "$repo_path/$path")" == "$committed_target" ]] || return 1
-    _act_strict_symlink_target_is_contained "$path" "$committed_target"
+    _act_strict_symlink_target_is_contained "$repo_path" "$path" "$committed_target"
 }
 
 _act_write_tracked_manifest() {
@@ -4032,7 +4043,7 @@ _act_verify_tracked_manifest_local() {
             # hash to the committed blob and stay inside the snapshot.
             [[ -L "$root_path/$relative_path" ]] || return 4
             link_target=$(readlink "$root_path/$relative_path") || return 4
-            _act_strict_symlink_target_is_contained "$relative_path" "$link_target" || return 4
+            _act_strict_symlink_target_is_contained "$root_path" "$relative_path" "$link_target" || return 4
             link_hash=$(printf '%s' "$link_target" | git hash-object --no-filters --stdin 2>/dev/null) || return 4
             [[ "$link_hash" == "$object_id" ]] || return 4
         else
@@ -4616,20 +4627,23 @@ while IFS="\$tab" read -r object_id mode relative_path; do
         test -n "\$target"
         case "\$target" in /*) exit 21;; esac
         printf '%s\\n' "\$target" | grep -Eq '^[][A-Za-z0-9_./+@~#,=() -]+\$'
-        depth=0
+        cursor='$remote_path'
         link_dir=\${relative_path%/*}
         test "\$link_dir" = "\$relative_path" && link_dir=
         set -f
         old_ifs=\$IFS
         IFS=/
         for component in \$link_dir; do
-            case "\$component" in ''|.) :;; *) depth=\$((depth + 1));; esac
+            case "\$component" in
+                ''|.) :;;
+                *) cursor="\$cursor/\$component"; test -d "\$cursor"; test ! -L "\$cursor";;
+            esac
         done
         for component in \$target; do
             case "\$component" in
                 ''|.) :;;
-                ..) depth=\$((depth - 1)); test "\$depth" -ge 0 || exit 21;;
-                *) depth=\$((depth + 1));;
+                ..) test "\$cursor" != '$remote_path' || exit 21; cursor=\${cursor%/*};;
+                *) cursor="\$cursor/\$component"; test ! -L "\$cursor" || exit 21;;
             esac
         done
         IFS=\$old_ifs
