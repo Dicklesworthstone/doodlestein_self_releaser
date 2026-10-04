@@ -6673,10 +6673,21 @@ act_run_native_build() {
     # (DSR_NATIVE_OUTPUT_STAGE=1), this target builds in its own copy of the
     # source, so every in-tree output path is private to it. Rust needs no
     # stage: its outputs are scoped by target triple and isolated above.
-    # Strict snapshots and Windows hosts are serialized by the orchestrator.
+    # Strict non-Rust builds also need a private copy: installers and in-tree
+    # outputs must not add files to the immutable release source snapshot.
+    # Windows hosts remain serialized by the orchestrator.
     local output_stage_root="" output_stage_source="" output_stage_parent=""
-    if [[ "${DSR_NATIVE_OUTPUT_STAGE:-}" == 1 && "$language" != rust && \
-          -z "$remote_path_override" ]] && ! _act_is_windows_host "$host"; then
+    if [[ "$language" != rust ]] && \
+       { [[ "${DSR_NATIVE_OUTPUT_STAGE:-}" == 1 ]] || $strict_native_build; } && \
+       ! _act_is_windows_host "$host"; then
+        if $strict_native_build; then
+            local stage_dependencies
+            if ! stage_dependencies=$(_act_release_source_dependency_checkouts_json "$tool_name") || \
+               ! jq -e 'type == "array" and length == 0' <<< "$stage_dependencies" >/dev/null; then
+                _log_error "Strict non-Rust output staging requires no sibling source dependencies"
+                return 4
+            fi
+        fi
         local output_stage_uuid output_stage_build_root="" output_stage_build_root_rc=0
         output_stage_build_root=$(_act_get_host_build_root "$host") || output_stage_build_root_rc=$?
         if [[ "$output_stage_build_root_rc" -eq 4 ]]; then
@@ -6910,8 +6921,26 @@ act_run_native_build() {
             local stage_root_q="${output_stage_root//\'/\'\\\'\'}"
             local stage_source_q="${output_stage_source//\'/\'\\\'\'}"
             cargo_home_prefix="mkdir -p '${stage_parent_q}'; $(_act_ram_backed_guard_sh "$output_stage_parent")test -d '$rp_q'; test ! -e '${stage_root_q}'; test ! -L '${stage_root_q}'; mkdir '${stage_root_q}' '${stage_source_q}'; cp -R '$rp_q/.' '${stage_source_q}/'; if test -e '${stage_source_q}/.git' || test -L '${stage_source_q}/.git'; then git -C '${stage_source_q}' status --porcelain --untracked-files=no >/dev/null; fi; "
+            if $strict_native_build; then
+                local stage_manifest stage_manifest_digest stage_object_count stage_verification
+                stage_manifest="$ACT_ARTIFACTS_DIR/strict-source-verification/stage-${output_stage_uuid}.manifest"
+                if [[ -z "$release_git_sha" ]] || \
+                   ! mkdir -p "${stage_manifest%/*}" || \
+                   ! _act_write_tracked_manifest "$local_path" "$release_git_sha" "$stage_manifest" || \
+                   ! stage_manifest_digest=$(_act_sha256 "$stage_manifest") || \
+                   ! stage_object_count=$(_act_tracked_manifest_object_count "$stage_manifest") || \
+                   ! stage_verification=$(_act_unix_strict_snapshot_verify_script \
+                       "$output_stage_source" "${remote_path%/*}/.source.tar" \
+                       "${remote_path%/*}/.source.manifest" "$stage_manifest_digest" "$stage_object_count"); then
+                    _log_error "Unable to bind private output stage to strict source manifest"
+                    return 4
+                fi
+                # Check every staged input and reject extra files before the
+                # command runs; final verification still checks the original.
+                cargo_home_prefix+="${stage_verification}"$'\n'
+            fi
             cd_cmd="cd '${stage_source_q}'"
-            _log_info "Building $platform in private output stage $output_stage_source (shared in-tree output on $host)"
+            _log_info "Building $platform in private output stage $output_stage_source"
         fi
         # Stage the glibc-floor cargo shim beside the isolated source copy and
         # put it first on PATH, so a plain `cargo build` in the repo's
