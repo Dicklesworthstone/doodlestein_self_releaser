@@ -190,6 +190,37 @@ public release or concealing earlier effects. Dry-run validates the local build
 and public key and identifies signature stages without using the secret key,
 creating persistent state, reading GitHub, signing, or uploading.
 
+## Audit DSR's own published source assets
+
+DSR's source distribution uses a separate thirteen-asset contract: signed tar
+and ZIP source archives, the tagged installer, a skill archive, SPDX metadata,
+signed `SHA256SUMS`, and a public key. Audit an already downloaded set with:
+
+```bash
+bash scripts/verify-published-source.sh --self-test
+bash scripts/verify-published-source.sh \
+  --bundle <download-directory> --checkout <dsr-checkout> \
+  --tag <vX.Y.Z> --source-sha <independently-selected-40-character-commit> \
+  --public-key <independently-trusted-key> \
+  --trusted-key-sha256 <independently-trusted-key-file-sha256>
+```
+
+The local tag must peel to the selected commit. The verifier checks all six
+signatures, the five signed payload checksums, every source archive blob and
+permission against Git objects, the installer and skill against their tagged
+blobs, and the SPDX version/archive hash. It rejects extra or missing assets,
+unsafe paths, links, duplicate members and oversized archives. The complete
+gzip stream is checked before tar parsing; ZIP supports only stored/deflated
+members. Archive members
+are read in memory; no assets are extracted or executed and no files are
+modified or deleted. The bundled public key must match the independent key.
+
+The JSON receipt proves source byte custody and signatures. Fresh installation,
+upgrades, user-data preservation, build execution and runtime behavior still
+need separate tests. This audit recovers the source-fidelity checks from the
+published consumer harness without its fixed version, source-file count, worker
+paths or namespace setup.
+
 ## Resources and tests
 
 Preparation requires temporary space for all payload snapshots, including aliases.
