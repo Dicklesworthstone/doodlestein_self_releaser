@@ -47,6 +47,9 @@ def match(value, pattern):
 def name(value):
     return match(value, r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}") and ".." not in value
 
+def source_path(value):
+    return isinstance(value, str) and len(value) <= 1024 and len(value.split("/")) <= 16 and all(name(p) for p in value.split("/"))
+
 def path(value):
     need(isinstance(value, str) and value.startswith("/") and value != "/" and
          not any(ord(c) < 32 or ord(c) == 127 or c == "\\" for c in value) and
@@ -101,7 +104,7 @@ def recipe(value):
     for item in value["artifacts"]:
         need(isinstance(item, dict), "invalid packaging artifact", 4)
         base = {"name", "target", "archive_format"}
-        need(base <= set(item) <= base | {"source", "members", "aliases"} and
+        need(base <= set(item) <= base | {"source", "members", "aliases", "source_files"} and
              ("source" in item) != ("members" in item), "select source or members, not both", 4)
         need(name(item["name"]) and match(item["target"], r"(linux|darwin|windows)/(amd64|arm64|386)") and
              isinstance(item["archive_format"], str) and item["archive_format"] in ARCHIVES | RAW,
@@ -127,6 +130,20 @@ def recipe(value):
                 sources.add((member["source"], item["target"]))
             need(len(set(paths)) == len(paths), "colliding archive member names", 4)
             item["members"].sort(key=lambda m: m["path"])
+        if "source_files" in item:
+            need(item["archive_format"] in ARCHIVES and isinstance(item["source_files"], list) and
+                 1 <= len(item["source_files"]) <= 256, "source_files requires a nonempty archive companion list", 4)
+            paths = []
+            for member in item["source_files"]:
+                need(isinstance(member, dict) and set(member) == {"source", "path"} and
+                     source_path(member["source"]) and name(member["path"]), "invalid source companion mapping", 4)
+                paths.append(member["path"].lower())
+            # Producer members are never replaced by a source file, even if
+            # their contents happen to match. Prebuilt includes are checked
+            # against the extracted payload when its actual inventory is known.
+            paths += [m["path"].lower() for m in item.get("members", [])]
+            need(len(paths) == len(set(paths)), "colliding companion/member names", 4)
+            item["source_files"].sort(key=lambda m: m["path"])
     need(len(outputs) <= 256 and len({a["name"].lower() for a in outputs}) == len(outputs),
          "colliding or excessive output/alias names", 4)
     value["artifacts"].sort(key=lambda a: a["name"])
@@ -204,7 +221,143 @@ def copy_payload(source, dest):
     dest.chmod(0o644 | executable)
     need(digest(dest) == digest(source) and bits(source) == executable, "source changed during snapshot")
 
+def git_read(repository, *arguments):
+    global child
+    # Local object reads only: no replacement objects, lazy network fetches,
+    # ambient alternate repositories, credential helpers or attribute filters.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1",
+               GIT_ALLOW_PROTOCOL="", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    command = ["git", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-C", str(repository), *arguments]
+    child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, close_fds=False)
+    try:
+        output, _ = child.communicate(timeout=60)
+        need(child.returncode == 0, "cannot read pinned companion Git source", 4)
+        return output
+    except subprocess.TimeoutExpired:
+        raise Failure("companion Git read timed out", 5)
+    finally:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        child = None
+
+def companion_proof(base, create=False):
+    if not source_files:
+        return None
+    objects = base / "source/companions"
+    repository = None
+    if create:
+        need(args.source_repo is not None, "source_files requires --source-repo for initial packaging", 4)
+        need(shutil.which("git"), "source companions require Git", 3)
+        repository = path(args.source_repo)
+        need(git_read(repository, "rev-parse", "--show-toplevel").decode().rstrip("\n") == str(repository),
+             "source-repo must be the Git worktree root", 4)
+        origin = git_read(repository, "config", "--get", "remote.origin.url").decode().rstrip("\n")
+        need(origin in {prefix + args.repo + suffix for prefix in
+             ("https://github.com/", "git@github.com:", "ssh://git@github.com/") for suffix in ("", ".git")},
+             "companion source origin differs from selected repository", 4)
+        need(git_read(repository, "rev-parse", "--verify", "refs/tags/" + args.tag + "^{commit}").decode().strip() == args.sha,
+             "companion source tag differs from selected commit", 4)
+        objects.mkdir()
+    path(str(objects))
+    need(objects.is_dir(), "missing retained companion Git proof")
+    cached, total = {}, 0
+
+    def read_object(kind, oid):
+        nonlocal total
+        key = kind + "-" + oid
+        if key in cached:
+            return cached[key]
+        need(match(oid, r"[0-9a-f]{40}") and len(cached) < 2048, "invalid or excessive companion proof")
+        file = objects / key
+        if create:
+            size = git_read(repository, "cat-file", "-s", oid).strip()
+            need(re.fullmatch(rb"[0-9]{1,10}", size) is not None and int(size) <= 64 * 1024 * 1024,
+                 "companion Git object exceeds 64 MiB", 4)
+            need(total + int(size) <= 256 * 1024 * 1024, "companion Git proof exceeds 256 MiB", 4)
+            data = git_read(repository, "cat-file", kind, oid)
+            need(len(data) == int(size), "companion Git object size changed")
+        else:
+            size = regular(file).stat().st_size
+            need(size <= 64 * 1024 * 1024 and total + size <= 256 * 1024 * 1024, "oversized retained companion proof")
+            data = file.read_bytes()
+            need(len(data) == size, "retained companion object changed while reading")
+        total += len(data)
+        header = (kind + " " + str(len(data))).encode() + b"\0"
+        need(hashlib.sha1(header + data).hexdigest() == oid, "companion Git object does not match its identity")
+        if create:
+            with file.open("xb") as f:
+                f.write(data)
+        cached[key] = data
+        return data
+
+    # Keep the complete commit/tree chain, not just producer-written filename
+    # and hash claims. Retry can prove each blob/mode belongs to --sha without
+    # the original checkout or Git executable, even after receipts are edited.
+    commit = read_object("commit", args.sha)
+    first = commit.split(b"\n", 1)[0]
+    need(re.fullmatch(rb"tree [0-9a-f]{40}", first) is not None, "invalid companion source commit")
+    trees = {}
+    def tree(oid):
+        if oid not in trees:
+            data = read_object("tree", oid)
+            entries, pos = {}, 0
+            while pos < len(data):
+                space, end = data.find(b" ", pos), data.find(b"\0", pos)
+                need(pos < space < end and end + 21 <= len(data), "invalid companion source tree")
+                mode, filename = data[pos:space], data[space + 1:end]
+                need(re.fullmatch(rb"[0-7]{5,6}", mode) is not None and filename and b"/" not in filename and
+                     filename not in (b".", b"..") and filename not in entries, "invalid or duplicate Git tree entry")
+                entries[filename] = (mode.decode(), data[end + 1:end + 21].hex())
+                pos = end + 21
+            trees[oid] = entries
+        return trees[oid]
+    files = []
+    for selected_path in source_files:
+        oid = first[5:].decode()
+        parts = selected_path.split("/")
+        for index, part in enumerate(parts):
+            entry = tree(oid).get(part.encode())
+            need(entry is not None, "companion absent from pinned source: " + selected_path, 4)
+            mode, oid = entry
+            need(mode in (("100644", "100755") if index == len(parts) - 1 else ("40000",)),
+                 "companion path is not a regular Git file: " + selected_path, 4)
+        data = read_object("blob", oid)
+        files.append(dict(source=selected_path, git_blob_sha=oid, git_mode=mode,
+                          sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data)))
+    need({p.name for p in objects.iterdir()} == set(cached), "retained companion object namespace changed")
+    return dict(kind="git-commit-source-files", schema_version=1, git_sha=args.sha, files=files,
+                objects=[dict(name=k, sha256=hashlib.sha256(v).hexdigest(), size_bytes=len(v)) for k, v in sorted(cached.items())])
+
+def add_companions(base, item, payload, proof):
+    added = []
+    evidence = {f["source"]: f for f in (proof or {}).get("files", [])}
+    for member in item.get("source_files", []):
+        record = evidence[member["source"]]
+        dest = payload / member["path"]
+        # Includes are flat; a different case or a directory cannot satisfy
+        # one. Never overwrite a producer's existing member, even on retry.
+        matches = [p for p in payload.iterdir() if p.name.lower() == member["path"].lower()]
+        expected_bits = 0o111 if record["git_mode"] == "100755" else 0
+        if matches:
+            need(len(matches) == 1 and matches[0].name == member["path"] and
+                 matches[0].is_file() and not matches[0].is_symlink() and
+                 digest(dest) == record["sha256"] and bits(dest) == expected_bits,
+                 "companion conflicts with producer archive: " + member["path"], 4)
+        else:
+            copy_payload(base / "source/companions" / ("blob-" + record["git_blob_sha"]), dest)
+            dest.chmod(0o644 | expected_bits)
+            need(digest(dest) == record["sha256"] and bits(dest) == expected_bits, "companion materialization changed")
+            added.append(member["path"])
+    return added
+
 def materialize(base, records, work, build):
+    proof = companion_proof(base)
     for index, item in enumerate(selected["artifacts"]):
         dest = base / "artifacts" / item["name"]
         fmt = item["archive_format"]
@@ -220,21 +373,28 @@ def materialize(base, records, work, build):
                           magic[257:262] == b"ustar"), "archive bytes cannot masquerade as a raw member", 4)
                 copy_payload(source, payload / member["path"])
                 members.append(member["path"])
+            members = sorted(members + add_companions(base, item, payload, proof))
             if build:
                 helper("packaging", "packaging_build_archive", fmt, dest, payload, *members)
             helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, "\n".join(members))
         else:
             source = base / "source/artifacts" / item["source"]
             original = records[item["source"]]["archive_format"]
+            added = []
             if original in ARCHIVES:
                 helper("packaging", "packaging_extract_payload", source, original, payload)
                 members = helper("packaging", "packaging_payload_members", source, original)
+                added = add_companions(base, item, payload, proof)
+                members = "\n".join(sorted(members.split("\n") + added))
                 if build:
-                    helper("packaging", "packaging_repack_archive", source, original, dest, fmt)
+                    if added:
+                        helper("packaging", "packaging_build_archive", fmt, dest, payload, *members.split("\n"))
+                    else:
+                        helper("packaging", "packaging_repack_archive", source, original, dest, fmt)
                 helper("packaging", "_pkg_archive_matches_payload", dest, fmt, payload, members)
             elif build:
                 copy_payload(source, dest)
-            if original == fmt or original in RAW:
+            if (original == fmt and not added) or original in RAW:
                 need(digest(dest) == digest(source), "authoritative source bytes changed")
             if original in RAW:
                 need(bits(dest) == bits(source), "raw executable mode changed")
@@ -258,6 +418,8 @@ def derived_manifest(source, base):
     result["packaging_evidence"] = dict(kind="manifest-bound-packaging", schema_version=1,
         source_manifest_sha256=args.manifest_sha256, recipe_sha256=recipe_hash, recipe=selected,
         source_executable_bits={a["name"]: bits(base / "source/artifacts" / a["name"]) for a in source["artifacts"]})
+    if source_files:
+        result["packaging_evidence"]["source_companions"] = companion_proof(base)
     return result
 
 def result_for(base):
@@ -291,24 +453,30 @@ try:
     parser = Parser(description="Package a pinned producer manifest; no signing or network writes.", allow_abbrev=False)
     parser.add_argument("--recipe", required=True)
     parser.add_argument("--describe", action="store_true")
-    for option in ("manifest", "manifest-sha256", "artifacts-dir", "output-dir", "repo", "tag", "sha"):
+    for option in ("manifest", "manifest-sha256", "artifacts-dir", "output-dir", "repo", "tag", "sha", "source-repo"):
         parser.add_argument("--" + option)
     flags = [a.split("=", 1)[0] for a in sys.argv[2:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate packaging option", 4)
     args = parser.parse_args(sys.argv[2:])
     selected, expected_assets, inputs = recipe(load(path(args.recipe)))
+    source_files = sorted({m["source"] for a in selected["artifacts"] for m in a.get("source_files", [])})
+    need(len(source_files) <= 256, "too many distinct source companions", 4)
     recipe_hash = hashlib.sha256(canonical(selected)).hexdigest()
     if args.describe:
-        need(all(getattr(args, o) is None for o in ("manifest", "manifest_sha256", "artifacts_dir", "output_dir", "repo", "tag", "sha")),
+        need(all(getattr(args, o) is None for o in ("manifest", "manifest_sha256", "artifacts_dir", "output_dir", "repo", "tag", "sha", "source_repo")),
              "describe accepts only a recipe", 4)
         print(canonical(dict(kind="dsr-release-packaging-plan", recipe=selected, recipe_sha256=recipe_hash,
-                             required_assets=expected_assets, inputs=inputs)).decode(), end="")
+                             required_assets=expected_assets, inputs=inputs, source_files=source_files)).decode(), end="")
         sys.exit(0)
     need(match(args.repo, r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and ".." not in args.repo and
          match(args.tag, r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
          match(args.sha, r"[0-9a-f]{40}") and args.sha != "0" * 40 and
          match(args.manifest_sha256, r"[0-9a-f]{64}"), "invalid release or manifest pin", 4)
     root, incoming, original = path(args.output_dir), path(args.artifacts_dir), path(args.manifest)
+    if args.source_repo is not None:
+        checkout = path(args.source_repo)
+        need(source_files and checkout != root and checkout not in root.parents and root not in checkout.parents,
+             "companion source is unused or overlaps packaging output", 4)
     need(root != incoming and incoming not in root.parents and root not in incoming.parents and root not in original.parents,
          "packaging output overlaps producer inputs", 4)
     need(root.parent.is_dir(), "output parent does not exist", 4)
@@ -349,6 +517,7 @@ try:
             need(digest(original) == args.manifest_sha256 and digest(staged / "source/build-manifest.json") == args.manifest_sha256,
                  "producer manifest changed during snapshot")
             admit(original, incoming, work)
+            companion_proof(staged, create=True)
             write(staged / "recipe.json", selected)
             with tempfile.TemporaryDirectory(prefix="build-", dir=work) as build_work:
                 materialize(staged, records, Path(build_work), True)
