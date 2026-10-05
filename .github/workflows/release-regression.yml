@@ -7,11 +7,16 @@ on:
       - src/github.sh
       - src/cargo_cache.sh
       - src/packaging.sh
+      - src/config.sh
+      - src/host_health.sh
+      - src/logging.sh
       - 'src/xwin*.sh'
       - 'scripts/xwin*.sh'
       - 'scripts/tests/test_xwin*.sh'
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_github.sh
+      - scripts/tests/test_host_health.sh
+      - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_release_resume.sh
       - scripts/tests/test_fallback_pipeline.sh
       - .github/workflows/release-regression.yml
@@ -64,3 +69,31 @@ jobs:
           bash scripts/tests/test_cargo_cache.sh
           bash scripts/tests/test_xwin_build.sh
           bash scripts/tests/test_xwin_release_build.sh
+  host-admission:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install host-check test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq shellcheck golang-go openssh-client
+          mkdir -p "$RUNNER_TEMP/dsr-test-bin"
+          GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
+          echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Check host configuration and health admission
+        shell: bash
+        env:
+          DSR_TEST_REQUIRE_YQ: '1'
+        run: |
+          set -euo pipefail
+          yq --version
+          bash -n src/host_health.sh
+          bash -n scripts/tests/test_host_config_admission.sh
+          shellcheck -S warning src/host_health.sh scripts/tests/test_host_config_admission.sh
+          bash scripts/tests/test_host_config_admission.sh
+          bash scripts/tests/test_host_health.sh

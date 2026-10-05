@@ -53,6 +53,20 @@ _hh_parse_host_fallback() {
         return 1
     fi
 
+    # This is deliberately a small YAML subset, not an alias resolver. Never
+    # turn an unresolved alias, flow collection, merge, tag or second document
+    # into an empty capability list or a different SSH destination.
+    local scan_status=0
+    LC_ALL=C grep -Eq '[][{}&*!]|<<:|^---|^\.\.\.|^[[:space:]]*[?%]' "$hosts_file" || scan_status=$?
+    case "$scan_status" in
+        1) ;;
+        0)
+            _hh_log_error "Host configuration needs yq v4: $hosts_file"
+            return 3
+            ;;
+        *) return 4 ;;
+    esac
+
     # Simple state-machine parser for YAML host entries
     local in_hosts=false
     local in_target=false
@@ -79,7 +93,7 @@ _hh_parse_host_fallback() {
         fi
 
         # If in target, check for next host (exit target)
-        if $in_target && [[ "$line" =~ ^[[:space:]][[:space:]][a-zA-Z_][a-zA-Z0-9_]*: ]] && [[ ! "$line" =~ ^[[:space:]][[:space:]]${hostname}: ]]; then
+        if $in_target && [[ "$line" =~ ^[[:space:]][[:space:]][a-zA-Z_][a-zA-Z0-9_-]*: ]] && [[ ! "$line" =~ ^[[:space:]][[:space:]]${hostname}: ]]; then
             # Another host definition at same level - we're done
             break
         fi
@@ -94,15 +108,19 @@ _hh_parse_host_fallback() {
         if $in_target; then
             # Check for capabilities list
             if [[ "$line" =~ ^[[:space:]]+capabilities: ]]; then
+                [[ "$line" =~ ^[[:space:]]+capabilities:[[:space:]]*$ ]] || return 4
                 in_capabilities=true
                 continue
             fi
 
             # Parse capability items
             if $in_capabilities; then
-                if [[ "$line" =~ ^[[:space:]]+-[[:space:]]*([a-zA-Z0-9_]+) ]]; then
+                if [[ "$line" =~ ^[[:space:]]+-[[:space:]]*([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)[[:space:]]*$ ]]; then
                     capabilities+="${BASH_REMATCH[1]} "
                     continue
+                elif [[ "$line" =~ ^[[:space:]]+- ]]; then
+                    _hh_log_error "Capability syntax needs yq v4: $hostname"
+                    return 3
                 elif [[ "$line" =~ ^[[:space:]]+[a-zA-Z] ]]; then
                     in_capabilities=false
                 fi
@@ -127,6 +145,9 @@ _hh_parse_host_fallback() {
                 description="${description#\"}"
             elif [[ "$line" =~ ^[[:space:]]+concurrency:[[:space:]]*([0-9]+) ]]; then
                 concurrency="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+enabled: ]]; then
+                [[ "$line" =~ ^[[:space:]]+enabled:[[:space:]]*(true|false)[[:space:]]*$ ]] || return 4
+                enabled="${BASH_REMATCH[1]}"
             fi
         fi
     done < "$hosts_file"
@@ -140,6 +161,7 @@ _hh_parse_host_fallback() {
             --arg ssh_host "${ssh_host:-$hostname}" \
             --arg description "$description" \
             --argjson concurrency "$concurrency" \
+            --argjson enabled "$enabled" \
             --arg capabilities "$capabilities" \
             '{
                 platform: $platform,
@@ -147,8 +169,9 @@ _hh_parse_host_fallback() {
                 ssh_host: $ssh_host,
                 description: $description,
                 concurrency: $concurrency,
-                capabilities: $capabilities
-            }'
+                capabilities: ($capabilities | split(" ") | map(select(length > 0))),
+                enabled: $enabled
+            }' || return 4
         return 0
     fi
 
@@ -180,49 +203,105 @@ _hh_list_hosts_fallback() {
         fi
 
         # Host name at 2-space indent
-        if [[ "$line" =~ ^[[:space:]][[:space:]]([a-zA-Z_][a-zA-Z0-9_]*): ]]; then
+        if [[ "$line" =~ ^[[:space:]][[:space:]]([a-zA-Z_][a-zA-Z0-9_-]*): ]]; then
             local host_name="${BASH_REMATCH[1]}"
             local host_json
-            host_json=$(_hh_parse_host_fallback "$host_name" 2>/dev/null || true)
-            if [[ -n "$host_json" ]] && echo "$host_json" | jq -e '(.enabled // true) == true' >/dev/null 2>&1; then
+            host_json=$(_hh_get_host_config "$host_name") || return $?
+            if jq -e '.enabled == true' <<< "$host_json" >/dev/null; then
                 echo "$host_name"
             fi
         fi
     done < "$hosts_file"
 }
 
-# Get host config with yq fallback
+# Resolve the COMPLETE document before selecting a host. Serializing a YAML
+# fragment first leaves aliases pointing at anchors that are no longer present
+# (GH #21). Reuse the configuration layer's duplicate-key/single-document gate.
+_hh_read_hosts_json() {
+    local hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
+    local document hosts
+    document=$(_config_read_single_mapping_json "$hosts_file") || return 4
+    if ! hosts=$(jq -ceS '
+        .hosts | if type == "object" and
+            all(keys[]; test("^[A-Za-z][A-Za-z0-9_-]*$")) and
+            all(.[]; type == "object")
+        then . else error("hosts must be a mapping of named host objects") end
+    ' <<< "$document" 2>/dev/null); then
+        _hh_log_error "Invalid hosts mapping in: $hosts_file"
+        return 4
+    fi
+    printf '%s\n' "$hosts"
+}
+
+# Both parsers feed exactly one typed JSON object to health admission. Defaults
+# apply only to absent/null optional fields, never to malformed values. In
+# particular false is not the same as an absent enabled flag, and capabilities
+# must remain a list until explicitly joined for the toolchain probe.
+_hh_normalize_host_config() {
+    local hostname="$1" raw="$2" normalized
+    if ! normalized=$(jq -cSe --slurp --arg hostname "$hostname" '
+        if length == 1 then .[0] else error("expected one host object") end |
+        if type == "object" and
+            (.platform | type == "string" and test("^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$")) and
+            (.connection == null or .connection == "local" or .connection == "ssh") and
+            (.ssh_host == null or .ssh_host == "" or
+                (.ssh_host | type == "string" and test("^[^[:space:][:cntrl:]-][^[:space:][:cntrl:]]*$"))) and
+            (.description == null or (.description | type == "string")) and
+            (.enabled == null or (.enabled | type == "boolean")) and
+            (.capabilities == null or (.capabilities | type == "array" and
+                all(.[]; type == "string" and test("^[A-Za-z0-9_][A-Za-z0-9_.+-]*$"))))
+        then . + {
+            connection: (.connection // "ssh"),
+            ssh_host: (if .ssh_host == null or .ssh_host == "" then $hostname else .ssh_host end),
+            description: (.description // ""),
+            capabilities: (.capabilities // []),
+            enabled: (if .enabled == null then true else .enabled end)
+        } else error("invalid host configuration fields") end
+    ' <<< "$raw" 2>/dev/null); then
+        _hh_log_error "Invalid host configuration for: $hostname"
+        return 4
+    fi
+    printf '%s\n' "$normalized"
+}
+
+# Return self-contained JSON, 1 for a missing host, 3 for a missing parser, or
+# 4 for invalid configuration. A parser failure must never select a fallback.
 _hh_get_host_config() {
     local hostname="$1"
+    local hosts raw
+    [[ "$hostname" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || return 4
 
-    # Try yq first
     if command -v yq &>/dev/null; then
-        local result
-        result=$(config_get_host "$hostname" 2>/dev/null)
-        if [[ -n "$result" && "$result" != "null" ]]; then
-            echo "$result"
-            return 0
-        fi
+        hosts=$(_hh_read_hosts_json) || return $?
+        jq -e --arg host "$hostname" 'has($host)' <<< "$hosts" >/dev/null || return 1
+        raw=$(jq -c --arg host "$hostname" '.[$host]' <<< "$hosts") || return 4
+    else
+        raw=$(_hh_parse_host_fallback "$hostname") || return $?
     fi
-
-    # Fallback to simple parser
-    _hh_parse_host_fallback "$hostname"
+    _hh_normalize_host_config "$hostname" "$raw"
 }
 
 # List hosts with yq fallback
 _hh_list_hosts() {
-    # Try yq first
+    local hosts names name host_config result=""
     if command -v yq &>/dev/null; then
-        local result
-        result=$(config_list_hosts 2>/dev/null)
-        if [[ -n "$result" ]]; then
-            echo "$result"
-            return 0
-        fi
+        hosts=$(_hh_read_hosts_json) || return $?
+        names=$(jq -r 'keys[]' <<< "$hosts") || return 4
+        while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            host_config=$(jq -c --arg name "$name" '.[$name]' <<< "$hosts") || return 4
+            host_config=$(_hh_normalize_host_config "$name" "$host_config") || return $?
+            if jq -e '.enabled == true' <<< "$host_config" >/dev/null; then
+                result+="$name"$'\n'
+            fi
+        done <<< "$names"
+    else
+        # Capture the complete result so a later malformed entry cannot leave
+        # an apparently successful partial list on stdout.
+        result=$(_hh_list_hosts_fallback) || return $?
     fi
-
-    # Fallback to simple parser
-    _hh_list_hosts_fallback
+    [[ -z "$result" ]] || printf '%s\n' "${result%$'\n'}"
+    return 0
 }
 
 # Health check cache directory and TTL
@@ -714,66 +793,33 @@ host_health_check() {
         esac
     done
 
-    _hh_init_cache
-
-    # Check cache first
-    if $use_cache && _hh_cache_valid "$hostname"; then
-        local cached cached_healthy
-        cached=$(_hh_cache_read "$hostname")
-        cached_healthy=$(echo "$cached" | jq -r '.healthy')
-        if $json_mode; then
-            echo "$cached"
-        else
-            _hh_print_result "$hostname" "$cached"
-        fi
-        [[ "$cached_healthy" == "true" ]] && return 0 || return 1
-    fi
-
-    # Get host configuration (uses yq with fallback parser)
+    # Validate configuration before considering cached health or invoking SSH.
     config_load 2>/dev/null || true
-    local host_config
-    host_config=$(_hh_get_host_config "$hostname" 2>/dev/null)
-
-    if [[ -z "$host_config" || "$host_config" == "null" ]]; then
-        local error_result
-        error_result="{\"hostname\": \"$hostname\", \"status\": \"error\", \"error\": \"Host not configured\", \"healthy\": false}"
+    local host_config config_status=0
+    host_config=$(_hh_get_host_config "$hostname") || config_status=$?
+    if [[ $config_status -ne 0 ]]; then
+        local error_result message="Invalid host configuration"
+        [[ $config_status -ne 1 ]] || message="Host not configured"
+        [[ $config_status -ne 3 ]] || message="Host configuration requires yq v4"
+        error_result=$(jq -nc --arg hostname "$hostname" --arg error "$message" \
+            '{hostname:$hostname,status:"error",error:$error,healthy:false}')
         if $json_mode; then
             echo "$error_result"
         else
-            _hh_log_error "$hostname: Host not configured in hosts.yaml"
+            _hh_log_error "$hostname: $message"
         fi
+        [[ $config_status -ne 3 ]] || return 3
         return 4
     fi
 
-    # Extract host properties (works with both yq YAML output and fallback JSON)
+    # The admission boundary produces typed, normalized JSON in both modes.
     local connection ssh_host capabilities platform description enabled
-    # Try jq first (for fallback JSON), then yq (for YAML output)
-    if echo "$host_config" | jq -e '.' &>/dev/null 2>&1; then
-        # JSON format from fallback parser
-        connection=$(echo "$host_config" | jq -r '.connection // "ssh"')
-        ssh_host=$(echo "$host_config" | jq -r '.ssh_host // ""')
-        capabilities=$(echo "$host_config" | jq -r '.capabilities // ""')
-        platform=$(echo "$host_config" | jq -r '.platform // "unknown"')
-        description=$(echo "$host_config" | jq -r '.description // ""')
-        enabled=$(echo "$host_config" | jq -r '.enabled // true')
-    elif command -v yq &>/dev/null; then
-        # YAML format from yq
-        connection=$(echo "$host_config" | yq -r '.connection // "ssh"' 2>/dev/null || echo "ssh")
-        ssh_host=$(echo "$host_config" | yq -r '.ssh_host // ""' 2>/dev/null || echo "$hostname")
-        capabilities=$(echo "$host_config" | yq -r '.capabilities // [] | .[]' 2>/dev/null | tr '\n' ' ')
-        platform=$(echo "$host_config" | yq -r '.platform // "unknown"' 2>/dev/null || echo "unknown")
-        description=$(echo "$host_config" | yq -r '.description // ""' 2>/dev/null || echo "")
-        enabled=$(echo "$host_config" | yq -r '.enabled' 2>/dev/null || echo null)
-        [[ "$enabled" == "null" ]] && enabled=true
-    else
-        # Last resort: default values
-        connection="ssh"
-        ssh_host="$hostname"
-        capabilities=""
-        platform="unknown"
-        description=""
-        enabled=true
-    fi
+    connection=$(jq -r '.connection' <<< "$host_config")
+    ssh_host=$(jq -r '.ssh_host' <<< "$host_config")
+    capabilities=$(jq -r '.capabilities | join(" ")' <<< "$host_config")
+    platform=$(jq -r '.platform' <<< "$host_config")
+    description=$(jq -r '.description' <<< "$host_config")
+    enabled=$(jq -r '.enabled' <<< "$host_config")
 
     if [[ "$enabled" != "true" ]]; then
         local checked_at
@@ -799,8 +845,18 @@ host_health_check() {
         return 0
     fi
 
-    # Use hostname as ssh_host if not specified
-    [[ -z "$ssh_host" || "$ssh_host" == "null" ]] && ssh_host="$hostname"
+    _hh_init_cache
+    if $use_cache && _hh_cache_valid "$hostname"; then
+        local cached cached_healthy
+        cached=$(_hh_cache_read "$hostname")
+        cached_healthy=$(jq -r '.healthy' <<< "$cached")
+        if $json_mode; then
+            echo "$cached"
+        else
+            _hh_print_result "$hostname" "$cached"
+        fi
+        [[ "$cached_healthy" == "true" ]] && return 0 || return 1
+    fi
 
     # Perform health checks
     _hh_log_info "Checking $hostname ($platform)..."
@@ -983,14 +1039,16 @@ host_health_check_all() {
 
     config_load 2>/dev/null || true
 
-    local hosts
-    hosts=$(_hh_list_hosts 2>/dev/null | tr '\n' ' ')
+    local hosts hosts_status=0
+    hosts=$(_hh_list_hosts | tr '\n' ' ') || hosts_status=$?
 
-    if [[ -z "$hosts" ]]; then
+    if [[ $hosts_status -ne 0 || -z "$hosts" ]]; then
+        local message="No hosts configured"
+        [[ $hosts_status -eq 0 ]] || message="Invalid host configuration or missing YAML parser"
         if $json_mode; then
-            echo '{"hosts": [], "error": "No hosts configured"}'
+            jq -nc --arg error "$message" '{hosts:[],error:$error}'
         else
-            _hh_log_error "No hosts configured in hosts.yaml"
+            _hh_log_error "$message"
         fi
         return 4
     fi
