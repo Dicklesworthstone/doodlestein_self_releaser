@@ -2,7 +2,7 @@
 # Actual Git objects, producer admission, archive parity and immutable retries.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-for tool in python3 git jq tar zip unzip xz; do
+for tool in python3 git jq tar zip unzip xz flock find cp mv mktemp; do
     command -v "$tool" >/dev/null || { printf 'SKIP requires %s\n' "$tool"; exit 3; }
 done
 python3 - "$ROOT" <<'PY'
@@ -90,6 +90,8 @@ def run(output, expected=0, selected=None, source_repo=True, producer=None, env=
                "--repo", "owner/demo", "--tag", "v1.2.3", "--sha", commit]
     if source_repo:
         command += ["--source-repo", str(checkout)]
+    if os.environ.get('DSR_TEST_TRACE'):
+        print('RUN ' + str(output) + ' expect=' + str(expected), flush=True)
     p = subprocess.run(command, capture_output=True, timeout=90, env=env)
     result = json.loads(p.stdout)
     if p.returncode != expected or result["exit_code"] != expected:
@@ -97,6 +99,30 @@ def run(output, expected=0, selected=None, source_repo=True, producer=None, env=
     if expected:
         check(output.name + " refuses publication", not result["publishable"] and result["status"] == "error")
     return result
+
+def pipeline(function, *arguments, expected=0):
+    # Load production functions, not a replacement finalizer or fake Git API.
+    command = ['bash', '-c',
+               'source "$1/src/release_finalize.sh" || exit $?; '
+               'source "$1/src/release_bundle.sh" || exit $?; _rb_require || exit $?; '
+               'source "$1/src/release_packaging_pipeline.sh" || exit $?; '
+               'build_worker=0; shift; "$@"', '_', str(root), function, *map(str, arguments)]
+    p = subprocess.run(command, capture_output=True, timeout=90)
+    if p.returncode != expected:
+        raise AssertionError(f"{function}: expected {expected}, got {p.returncode}: {p.stdout.decode()}\n{p.stderr.decode()}")
+    return p
+
+def finalize_preview(plan_file, bundle, selected_recipe, source_repo=True, expected=0, extra=()):
+    command = ['bash', str(root / 'src/release_finalize.sh'), '--build-set', str(plan_file),
+               '--bundle-dir', str(bundle), '--packaging-recipe', str(selected_recipe), '--dry-run']
+    if source_repo:
+        command += ['--packaging-source-repo', str(checkout)]
+    p = subprocess.run(command + list(extra), capture_output=True, timeout=90)
+    value = json.loads(p.stdout)
+    if p.returncode != expected or value['exit_code'] != expected:
+        raise AssertionError(f"finalizer: expected {expected}, got {p.returncode}: {p.stdout.decode()}\n{p.stderr.decode()}")
+    check('finalizer dry-run never creates persistent bundle output', not bundle.exists())
+    return value
 
 try:
     checkout = work / "checkout"
@@ -143,6 +169,52 @@ try:
     p = subprocess.run(["bash", str(script), "--recipe", str(work / "preview.json"), "--describe"], capture_output=True, check=True)
     preview = json.loads(p.stdout)
     check("preview separates source companions from producer coverage", preview["source_files"] == sorted(committed) and len(preview["inputs"]) == 4)
+    preflight_cmd = ['bash', str(script), '--recipe', str(work / 'preview.json'), '--check-source',
+                     '--source-repo', str(checkout), '--repo', 'owner/demo', '--tag', 'v1.2.3', '--sha', commit]
+    preflight = subprocess.run(preflight_cmd, capture_output=True, check=True, timeout=90)
+    source_check = json.loads(preflight.stdout)
+    check('standalone source check is verified but never publishable',
+          source_check['kind'] == 'dsr-release-packaging-source-check' and source_check['exit_code'] == 0 and
+          source_check['status'] == 'verified' and source_check['publishable'] is False and
+          source_check['source_sha'] == commit and source_check['recipe_sha256'] == preview['recipe_sha256'])
+    for extra in (['--manifest', str(manifest)], ['--output-dir', str(work / 'forbidden-output')], ['--describe']):
+        p = subprocess.run(preflight_cmd + extra, capture_output=True, timeout=90)
+        check('source preflight refuses producer/output/describe mode mixing', p.returncode == 4 and not json.loads(p.stdout)['publishable'])
+    check('standalone source preflight does not publish persistent output', not (work / 'forbidden-output').exists())
+    plan = dict(schema_version=1, repo='owner/demo', tool='demo', tag='v1.2.3', source_sha=commit,
+                required_targets=['linux/amd64'], required_assets=original['required_assets'],
+                builds=[dict(id='native', manifest=str(manifest), manifest_sha256=pins[manifest],
+                             artifacts_dir=str(incoming), targets=['linux/amd64'])])
+    plan_file = work / 'build-set.json'
+    write(plan_file, plan)
+    pipeline_work = work / 'pipeline'
+    pipeline_work.mkdir()
+    pipeline('_rf_packaging_preview', work / 'preview.json', pipeline_work)
+    pipeline('_rf_packaging_contract', plan_file, pipeline_work / 'packaging-preview.json')
+    pipeline('_rf_packaging_source_preflight', plan_file, checkout, work / 'package-later', pipeline_work)
+    checked = json.loads((pipeline_work / 'packaging-source.json').read_text())
+    check('pipeline preflight checks the exact source closure before any producer import', checked == source_check and not (work / 'package-later').exists())
+    pipeline('_rf_packaging_source_preflight', plan_file, '', work / 'no-source', pipeline_work, expected=4)
+    p = finalize_preview(plan_file, work / 'dry-bundle', work / 'preview.json')
+    check('public finalizer accepts companion selection without forwarding it as release policy',
+          p['status'] == 'planned' and p['policy_verified'] is False and p['packaging']['source_files'] == sorted(committed) and
+          '--packaging-source-repo' not in p['finalization_options'] and str(checkout) not in p['finalization_options'])
+    p = finalize_preview(plan_file, work / 'dry-no-source', work / 'preview.json', source_repo=False, expected=4)
+    check('public finalizer refuses missing source before collection', p['status'] == 'error' and 'packaging-source-repo' in p['error'])
+    wrong_plan = dict(plan, source_sha='b' * 40)
+    write(work / 'wrong-source-plan.json', wrong_plan)
+    p = finalize_preview(work / 'wrong-source-plan.json', work / 'dry-wrong-source', work / 'preview.json', expected=4)
+    check('wrong source/tag prevents a planned finalization', p['status'] == 'error')
+    bad_recipe = copy.deepcopy(recipe)
+    bad_recipe['artifacts'][0]['source_files'][0]['source'] = 'absent'
+    write(work / 'missing-include.json', bad_recipe)
+    p = finalize_preview(plan_file, work / 'dry-missing-companion', work / 'missing-include.json', expected=4)
+    check('missing companion fails before compilation or collection', 'companion absent' in p['error'])
+    p = finalize_preview(plan_file, checkout / 'must-not-create', work / 'preview.json', expected=4)
+    check('finalizer refuses output overlapping the source checkout', 'overlaps packaging source' in p['error'])
+    p = finalize_preview(plan_file, work / 'dry-duplicate-source', work / 'preview.json', expected=4,
+                         extra=('--packaging-source-repo', str(checkout)))
+    check('duplicate source options are rejected', p['status'] == 'error')
     out = work / "packaged"
     result = run(out, env=dict(os.environ, GIT_DIR="/does/not/exist", GIT_WORK_TREE="/wrong", GIT_CONFIG_COUNT="1",
                                GIT_CONFIG_KEY_0="remote.origin.url", GIT_CONFIG_VALUE_0="https://wrong.invalid/repo"))
@@ -154,6 +226,25 @@ try:
     check("aliases retain final archive bytes", all(sha(dist / ("final." + f)) == sha(dist / ("compat." + f)) for f in ("tar.gz", "tar.xz", "zip")))
     exported = json.loads(Path(result["manifest"]).read_text())
     proof = exported["packaging_evidence"]["source_companions"]
+    check('preflight and completed package retain identical independently derived Git proof', proof == source_check['source_companions'])
+    write(pipeline_work / 'packaging-result.json', result)
+    pipeline('_rf_packaging_handoff', out, pins[manifest], plan_file, pipeline_work)
+    check('real completed package passes public finalization handoff', True)
+    manifest_out = Path(result['manifest'])
+    saved_manifest = manifest_out.read_bytes()
+    for label, mutate in (
+        ('missing-proof', lambda m: m['packaging_evidence'].pop('source_companions')),
+        ('wrong-proof-commit', lambda m: m['packaging_evidence']['source_companions'].update(git_sha='b' * 40)),
+        ('missing-companion', lambda m: m['packaging_evidence']['source_companions']['files'].pop()),
+    ):
+        forged = copy.deepcopy(exported)
+        mutate(forged)
+        write(manifest_out, forged)
+        write(pipeline_work / 'packaging-result.json', dict(result, manifest_sha256=sha(manifest_out)))
+        pipeline('_rf_packaging_handoff', out, pins[manifest], plan_file, pipeline_work, expected=7)
+        check('handoff rejects rewritten manifest/receipt with ' + label, True)
+        manifest_out.write_bytes(saved_manifest)
+    write(pipeline_work / 'packaging-result.json', result)
     check("packaging evidence does not invent compiler evidence", proof["git_sha"] == commit and
           proof["kind"] == "git-commit-source-files" and exported["build_environments"] == original["build_environments"] and
           exported["run_id"] == original["run_id"] and exported["built_at"] == original["built_at"])
@@ -168,6 +259,11 @@ try:
     for artifact in legacy["artifacts"]:
         del artifact["source_files"]
     legacy_result = run(work / "no-companions", selected=legacy, source_repo=False)
+    write(work / 'legacy-recipe.json', legacy)
+    p = finalize_preview(plan_file, work / 'dry-legacy-unused-source', work / 'legacy-recipe.json', expected=4)
+    check('finalizer rejects an unused source-repository selection', 'unused' in p['error'])
+    p = finalize_preview(plan_file, work / 'dry-legacy', work / 'legacy-recipe.json', source_repo=False)
+    check('existing recipes still plan without any companion source', p['status'] == 'planned')
     legacy_manifest = json.loads(Path(legacy_result["manifest"]).read_text())
     check("recipes without companions retain their existing evidence shape", "source_companions" not in legacy_manifest["packaging_evidence"])
     check("prebuilt preservation remains unchanged without companions", all(
@@ -248,7 +344,11 @@ try:
     incoming.rename(work / "offline-producer")
     manifest.rename(work / "offline-manifest")
     checkout.rename(work / "offline-source")
+    pipeline('_rf_packaging_source_preflight', plan_file, '', out, pipeline_work)
+    check('completed-package retry defers to retained Git proof rather than the missing checkout', True)
     run(out, source_repo=False)
+    pipeline('_rf_packaging_handoff', out, pins[manifest], plan_file, pipeline_work)
+    check('offline-reverified companion package still passes finalizer handoff', True)
     after = {str(p.relative_to(out)): (p.stat().st_ino, p.stat().st_mtime_ns, sha(p)) for p in out.rglob("*") if p.is_file()}
     check("offline resume revalidates evidence without rewriting any file", snapshots == after)
     print(f"Source companion integration: {passed} assertions passed", flush=True)

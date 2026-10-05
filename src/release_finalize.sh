@@ -15,8 +15,8 @@ _rf_build_set_execute() {
     local public='' secret='' integrity='' notes='' title='' prerelease=false retry_creation=false
     local dispatch_run='' dispatch_state='' retry_delivery=false format=spdx metadata='' state=''
     local build_plan='' build_dir='' build_jobs=1 build_worker=0 cleanup
-    local packaging_recipe='' package='' selected_manifest selected_artifacts selected_pin
-    local -a forwarded=() collect_args=()
+    local packaging_recipe='' packaging_source_repo='' package='' selected_manifest selected_artifacts selected_pin
+    local -a forwarded=() collect_args=() packaging_args=()
     local -A seen=()
     while (($#)); do
         option=$1
@@ -24,20 +24,21 @@ _rf_build_set_execute() {
         [[ -n "$option" && -z "${seen[$option]:-}" ]] || return 4
         seen[$option]=1
         case "$option" in
-            --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--packaging-recipe|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--provenance-builder)
+            --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--packaging-recipe|--packaging-source-repo|--format|--output-dir|--state-dir|--public-key|--secret-key|--integrity-dir|--release-name|--release-notes-file|--dispatch-repos|--dispatch-run-id|--dispatch-state-dir|--provenance-builder)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 value=$2
                 case "$option" in
                     --build-set) plan=$value ;; --bundle-dir) bundle=$value ;;
                     --build-plan) build_plan=$value ;; --build-dir) build_dir=$value ;; --build-jobs) build_jobs=$value ;;
                     --packaging-recipe) packaging_recipe=$value ;;
+                    --packaging-source-repo) packaging_source_repo=$value ;;
                     --format) format=$value ;; --output-dir) metadata=$value ;; --state-dir) state=$value ;;
                     --public-key) public=$value ;; --secret-key) secret=$value ;; --integrity-dir) integrity=$value ;;
                     --provenance-builder) provenance_builder=$value ;;
                     --release-name) title=$value ;; --release-notes-file) notes=$value ;;
                     --dispatch-repos) dispatch=$value ;; --dispatch-run-id) dispatch_run=$value ;; --dispatch-state-dir) dispatch_state=$value ;;
                 esac
-                case "$option" in --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--packaging-recipe) ;; *) forwarded+=("$option" "$value") ;; esac
+                case "$option" in --build-set|--bundle-dir|--build-plan|--build-dir|--build-jobs|--packaging-recipe|--packaging-source-repo) ;; *) forwarded+=("$option" "$value") ;; esac
                 shift 2 ;;
             --dry-run) dry=true; shift ;;
             --require-signatures|--prepared-signatures|--create-draft|--promote|--prerelease|--retry-creation|--retry-uncertain|--require-provenance)
@@ -52,6 +53,9 @@ _rf_build_set_execute() {
         esac
     done
     [[ "$dry" =~ ^(true|false)$ ]] || return 4
+    [[ -z "$packaging_source_repo" || -n "$packaging_recipe" ]] || {
+        _rf_log '--packaging-source-repo requires --packaging-recipe'; return 4;
+    }
     if [[ -n "$build_plan" ]]; then
         [[ -z "$plan$bundle" && -f "$build_plan" && ! -L "$build_plan" && -n "$build_dir" &&
            "$build_jobs" =~ ^[0-9]{1,2}$ ]] || return 4
@@ -99,6 +103,20 @@ _rf_build_set_execute() {
     [[ -z "$build_plan" ]] || _rb_path "$build_dir" || return 4
     _rb_path "$bundle" || return 4
     [[ "$bundle" != / && "$bundle" != */ ]] || return 4
+    if [[ -n "$packaging_source_repo" ]]; then
+        _rb_path "$packaging_source_repo" || return 4
+        [[ "$packaging_source_repo" != / && "$packaging_source_repo" != */ ]] || return 4
+        # Do not let compilation/collection or finalization write into the
+        # checkout selected exclusively for read-only companion object reads.
+        for value in "$bundle" "$build_dir" "$metadata" "$state" "$integrity" "$dispatch_state"; do
+            [[ -n "$value" ]] || continue
+            if [[ "$value" == "$packaging_source_repo" || "$value" == "$packaging_source_repo/"* ||
+                  "$packaging_source_repo" == "$value/"* ]]; then
+                _rf_log 'Finalizer/build output overlaps packaging source repository'; return 4
+            fi
+        done
+        packaging_args=(--source-repo "$packaging_source_repo")
+    fi
     package="$bundle/packaged"
     if [[ -z "$packaging_recipe" && ( -e "$package" || -L "$package" ) ]]; then
         _rf_log 'A retained packaging selection requires --packaging-recipe on retry'; return 2
@@ -149,6 +167,7 @@ _rf_build_set_execute() {
             "$work/build-preview.json" > "$work/execution-plan.json" || return 7
         if [[ -n "$packaging_recipe" ]]; then
             _rf_packaging_contract "$work/execution-plan.json" "$work/packaging-preview.json" || return $?
+            _rf_packaging_source_preflight "$work/execution-plan.json" "$packaging_source_repo" "$package" "$work" || return $?
         fi
         if [[ "$dry" == true ]]; then
             jq -cn --args '$ARGS.positional' -- "${forwarded[@]}" > "$work/options.json" || return 1
@@ -195,6 +214,9 @@ _rf_build_set_execute() {
     printf '%s\n' "$canonical" > "$work/plan.json" || return 1
     if [[ -n "$packaging_recipe" ]]; then
         _rf_packaging_contract "$work/plan.json" "$work/packaging-preview.json" || return $?
+        if [[ -z "$build_plan" ]]; then
+            _rf_packaging_source_preflight "$work/plan.json" "$packaging_source_repo" "$package" "$work" || return $?
+        fi
     fi
     local repo tag sha tool pin rc=0 result
     repo=$(jq -r .repo "$work/plan.json") || return 1
@@ -240,7 +262,8 @@ _rf_build_set_execute() {
     if [[ -n "$packaging_recipe" ]]; then
         bash "$_RELEASE_FINALIZE_ENTRY_DIR/release_packaging.sh" --recipe "$work/packaging-recipe.json" \
             --manifest "$selected_manifest" --manifest-sha256 "$pin" --artifacts-dir "$selected_artifacts" \
-            --output-dir "$package" --repo "$repo" --tag "$tag" --sha "$sha" > "$work/packaging-result.json" &
+            --output-dir "$package" --repo "$repo" --tag "$tag" --sha "$sha" \
+            "${packaging_args[@]}" > "$work/packaging-result.json" &
         build_worker=$!
         wait "$build_worker" || rc=$?
         build_worker=0
@@ -326,6 +349,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 'Collect the complete pinned target matrix before any release API call; retry resumes verified imports.' \
                 'Identity, manifest and --upload-payloads come from the plan. Signing and --promote remain explicit.'
             printf '%s\n' 'Add --packaging-recipe RECIPE.json to either mode to package before signing and finalization.'
+            printf '%s\n' 'Recipes with source_files also need --packaging-source-repo CHECKOUT for initial packaging.' \
+                'Companion Git objects are checked before builders start; completed packages can reverify offline.'
             printf '\n%s\n' 'Build plan: --build-plan PLAN.json --build-dir DIR [--build-jobs N] [finalizer policy options]' \
                 'Execute native/xwin jobs, retain completed checkpoints, assemble every target, then finalize.' ;;
         --build-set|--build-plan) _rf_build_set_result "$@"; exit $? ;;

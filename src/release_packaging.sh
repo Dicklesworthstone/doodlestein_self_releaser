@@ -453,6 +453,8 @@ try:
     parser = Parser(description="Package a pinned producer manifest; no signing or network writes.", allow_abbrev=False)
     parser.add_argument("--recipe", required=True)
     parser.add_argument("--describe", action="store_true")
+    parser.add_argument("--check-source", action="store_true",
+                        help="verify companion Git closure before building; no producer or persistent output")
     for option in ("manifest", "manifest-sha256", "artifacts-dir", "output-dir", "repo", "tag", "sha", "source-repo"):
         parser.add_argument("--" + option)
     flags = [a.split("=", 1)[0] for a in sys.argv[2:] if a.startswith("--")]
@@ -463,15 +465,28 @@ try:
     need(len(source_files) <= 256, "too many distinct source companions", 4)
     recipe_hash = hashlib.sha256(canonical(selected)).hexdigest()
     if args.describe:
-        need(all(getattr(args, o) is None for o in ("manifest", "manifest_sha256", "artifacts_dir", "output_dir", "repo", "tag", "sha", "source_repo")),
+        need(not args.check_source and all(getattr(args, o) is None for o in ("manifest", "manifest_sha256", "artifacts_dir", "output_dir", "repo", "tag", "sha", "source_repo")),
              "describe accepts only a recipe", 4)
         print(canonical(dict(kind="dsr-release-packaging-plan", recipe=selected, recipe_sha256=recipe_hash,
                              required_assets=expected_assets, inputs=inputs, source_files=source_files)).decode(), end="")
         sys.exit(0)
     need(match(args.repo, r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and ".." not in args.repo and
          match(args.tag, r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
-         match(args.sha, r"[0-9a-f]{40}") and args.sha != "0" * 40 and
-         match(args.manifest_sha256, r"[0-9a-f]{64}"), "invalid release or manifest pin", 4)
+         match(args.sha, r"[0-9a-f]{40}") and args.sha != "0" * 40,
+         "invalid release identity", 4)
+    if args.check_source:
+        need(source_files and args.source_repo is not None and
+             all(getattr(args, o) is None for o in ("manifest", "manifest_sha256", "artifacts_dir", "output_dir")),
+             "check-source requires companion recipe, source-repo and release identity only", 4)
+        with tempfile.TemporaryDirectory(prefix="dsr-companion-preflight-") as temporary:
+            base = Path(temporary).resolve()
+            (base / "source").mkdir()
+            proof = companion_proof(base, create=True)
+        print(canonical(dict(kind="dsr-release-packaging-source-check", status="verified", exit_code=0,
+                             publishable=False, repo=args.repo, tag=args.tag, source_sha=args.sha,
+                             recipe_sha256=recipe_hash, source_companions=proof)).decode(), end="")
+        sys.exit(0)
+    need(match(args.manifest_sha256, r"[0-9a-f]{64}"), "invalid manifest pin", 4)
     root, incoming, original = path(args.output_dir), path(args.artifacts_dir), path(args.manifest)
     if args.source_repo is not None:
         checkout = path(args.source_repo)

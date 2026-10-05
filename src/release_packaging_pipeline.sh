@@ -9,11 +9,55 @@ _rf_packaging_preview() {
         > "$work/packaging-preview.json" || return $?
     jq -ecs 'if length==1 and (.[0]|.kind=="dsr-release-packaging-plan" and
         (.recipe|type=="object") and (.recipe_sha256|type=="string" and test("^[0-9a-f]{64}$")) and
-        (.required_assets|type=="array" and length>0) and (.inputs|type=="array" and length>0))
+        (.required_assets|type=="array" and length>0) and (.inputs|type=="array" and length>0) and
+        (.source_files|type=="array") and
+        .source_files==([.recipe.artifacts[].source_files[]?.source]|unique|sort))
         then .[0].recipe else error("invalid packaging preview") end' \
         "$work/packaging-preview.json" | jq -cS . > "$work/packaging-recipe.json" || return 7
     [[ "$(_slsa_sha256 "$work/packaging-recipe.json")" == \
        "$(jq -r .recipe_sha256 "$work/packaging-preview.json")" ]] || return 7
+}
+
+# Validate the complete companion closure before launching builders, not after
+# expensive target compilation. This performs only local Git object reads and
+# temporary proof staging; neither producer success nor publication is claimed.
+# build_worker belongs to the caller's cancellation handler, just like builders.
+_rf_packaging_source_preflight() {
+    local plan="$1" checkout="$2" package="$3" work="$4" count repo tag sha rc=0
+    count=$(jq -er '.source_files|length' "$work/packaging-preview.json") || return 7
+    if [[ "$count" == 0 ]]; then
+        [[ -z "$checkout" ]] || { _rf_log 'Packaging source repository is unused by this recipe'; return 4; }
+        return 0
+    fi
+    if [[ -z "$checkout" ]]; then
+        # A completed package has retained commit/tree/blob objects. The full
+        # packager will reverify them before any signing or release API call.
+        # Directory existence alone is NOT proof and dry-run makes no such claim.
+        if _rb_path "$package/release" && [[ -d "$package/release" && ! -L "$package/release" ]]; then
+            _rf_log 'Retained source companions require full packaging revalidation before finalization'
+            return 0
+        fi
+        _rf_log 'Source companions require --packaging-source-repo before builds or collection'; return 4
+    fi
+    _rb_path "$checkout" || return 4
+    repo=$(jq -er .repo "$plan") || return 4
+    tag=$(jq -er .tag "$plan") || return 4
+    sha=$(jq -er .source_sha "$plan") || return 4
+    bash "$_RELEASE_FINALIZE_ENTRY_DIR/release_packaging.sh" --recipe "$work/packaging-recipe.json" \
+        --check-source --source-repo "$checkout" --repo "$repo" --tag "$tag" --sha "$sha" \
+        > "$work/packaging-source.json" &
+    build_worker=$!
+    wait "$build_worker" || rc=$?
+    build_worker=0
+    ((rc == 0)) || return "$rc"
+    jq -es --slurpfile preview "$work/packaging-preview.json" --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" '
+        length==1 and (.[0]|.kind=="dsr-release-packaging-source-check" and .status=="verified" and
+            .exit_code==0 and .publishable==false and .repo==$repo and .tag==$tag and .source_sha==$sha and
+            .recipe_sha256==$preview[0].recipe_sha256 and
+            .source_companions.kind=="git-commit-source-files" and .source_companions.schema_version==1 and
+            .source_companions.git_sha==$sha and
+            ([.source_companions.files[].source]|sort)==$preview[0].source_files)' \
+        "$work/packaging-source.json" >/dev/null || return 7
 }
 
 # Input requirements describe the producer, not the renamed/archived output.
@@ -66,7 +110,13 @@ _rf_packaging_handoff() {
             .requested_targets==$p.required_targets and .required_assets==$r.required_assets and
             .packaging_evidence.kind=="manifest-bound-packaging" and .packaging_evidence.schema_version==1 and
             .packaging_evidence.source_manifest_sha256==$source and
-            .packaging_evidence.recipe_sha256==$r.recipe_sha256 and .packaging_evidence.recipe==$r.recipe)' \
+            .packaging_evidence.recipe_sha256==$r.recipe_sha256 and .packaging_evidence.recipe==$r.recipe and
+            (if ($r.source_files|length)>0 then
+                .packaging_evidence.source_companions.kind=="git-commit-source-files" and
+                .packaging_evidence.source_companions.schema_version==1 and
+                .packaging_evidence.source_companions.git_sha==$p.source_sha and
+                ([.packaging_evidence.source_companions.files[].source]|sort)==$r.source_files
+             else (.packaging_evidence|has("source_companions")|not) end))' \
         "$package/release/build-manifest.json" >/dev/null || return 7
     [[ "$(_slsa_sha256 "$package/release/build-manifest.json")" == "$hash" ]] || return 7
 }
