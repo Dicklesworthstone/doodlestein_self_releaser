@@ -8,7 +8,64 @@ This document defines the standard artifact naming scheme for dsr builds.
 {tool}-{version}-{os}-{arch}[.exe][.archive]
 ```
 
-Note: dsr can derive naming from workflows (GoReleaser `name_template`, GitHub Actions `matrix.target`). Underscores and target triples are supported; the default format above is a fallback.
+Note: dsr can derive naming from workflows (GoReleaser `name_template`, GitHub Actions `matrix.target`). Underscores and target triples are supported; the default format above is a fallback. An explicit release contract takes precedence over these patterns for release output, as described below.
+
+### Exact per-target release names
+
+When `release_contract` is configured, its `exact_primary_assets` mapping owns
+release filenames. Native workspace collection uses the same config-aware
+resolver, so a mixed Full/Lite matrix no longer chooses the global Full pattern
+for a target whose authoritative basename says Lite (issue #26).
+
+```yaml
+binary_name: fsfs
+workspace_binaries: [fsfs]
+artifact_naming: '${name}-${version}-${target_triple}.${ext}'
+archive_format:
+  darwin: tar.xz
+targets: [darwin/arm64, darwin/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    darwin/arm64: fsfs-1.12.1-aarch64-apple-darwin.tar.xz
+    darwin/amd64: fsfs-lite-1.12.1-x86_64-apple-darwin.tar.xz
+```
+
+Exact names are literal basenames, not templates: the resolver does not rewrite
+an embedded version or infer an architecture from the name. Keep the contract
+consistent with the reviewed release. Missing target entries, unsafe names,
+control characters, collisions with other primaries or their declared/implicit
+sidecars, and invalid configuration are errors. A `.tar.xz` name cannot be
+returned for a gzip writer or vice versa. `.tgz` and `.tar.gz` both designate
+gzip; ZIP and raw binary names are handled explicitly.
+
+A closed release contract does not authorize extra inferred installer aliases.
+The existing dual-name result therefore returns the same exact primary in
+`versioned` and `compat`, with `same: true`. This does not create aliases listed
+as additional assets or relax their existing collection/verification checks.
+Without a release contract (including an explicit `null` opt-out), the existing
+pattern precedence and dual naming below remain unchanged.
+
+Diagnostic-native builds keep their existing pattern-derived names and remain
+nonpublishable. The resolver inherits the native orchestrator's `build_purpose`;
+standalone callers can pass an explicit seventh argument:
+
+```bash
+artifact_naming_generate_dual_for_tool \
+  search v1.12.1 darwin amd64 tar.xz /srv/search diagnostic-native
+```
+
+The six-argument API defaults to release naming outside a build context. Naming
+selection is not source, binary-architecture, signature, or publication proof.
+Native collection receipts, member validation, strict staging, and source/tag
+checks remain separate and unchanged. In particular, this fixes target-specific
+names, not automatic single-binary companion collection (issue #29).
+
+Run `bash scripts/tests/test_artifact_naming_contract.sh` for JSON-boundary
+naming tests and actual archive-byte checks. The production configuration-parser
+section runs when Mike Farah yq v4 and `src/config.sh` are available;
+`DSR_TEST_REQUIRE_YQ=1` makes a missing parser a failing prerequisite. Local
+archive fixtures do not claim cross-compilation or native ABI qualification.
 
 ### Components
 
@@ -184,7 +241,7 @@ Standard targets supported by dsr:
 
 ## Dual Naming for Install Script Compatibility
 
-dsr uploads artifacts with TWO naming conventions to ensure compatibility with both explicit version downloads and install.sh scripts:
+Without a closed release contract, dsr uploads artifacts with TWO naming conventions to ensure compatibility with both explicit version downloads and install.sh scripts:
 
 1. **Versioned name**: `{tool}-{version}-{os}-{arch}.{ext}` — For explicit version downloads
 2. **Compat name**: `{tool}-{os}-{arch}.{ext}` — For install.sh scripts expecting unversioned names
@@ -217,7 +274,7 @@ install_script_path: install.sh
 
 ### Precedence Rules
 
-When generating compat names, dsr uses this precedence:
+When generating compat names without a release contract, dsr uses this precedence:
 
 1. **install_script_compat** — Explicit override, highest priority
 2. **install_script_path** — Parse the script to auto-detect the expected pattern

@@ -1,237 +1,265 @@
 #!/usr/bin/env bash
-# Release-name contract regressions (bd-1tv / bd-1tv.12).
-# Runs without network, yq, installed repo configs, or a build host.
-# shellcheck disable=SC2016 # Literal naming templates are test inputs.
+# GH #26: the config-aware resolver used by native workspace collection must
+# honor exact Full/Lite names, not infer a different family after compilation.
+# JSON-boundary unit tests use explicit config accessors below; the optional
+# production YAML section uses the real config module and Mike Farah yq.
+# No GitHub calls or release publication. All archive operations are real.
+# shellcheck disable=SC2016
 set -uo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-# The override allows the same regressions to be run against a baseline module.
-# shellcheck source=../../src/artifact_naming.sh
-source "${DSR_NAMING_MODULE:-$PROJECT_ROOT/src/artifact_naming.sh}"
-command -v jq >/dev/null || { echo 'jq is required' >&2; exit 3; }
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+MODULE="${DSR_NAMING_TEST_MODULE:-$ROOT/src/artifact_naming.sh}"
+command -v jq >/dev/null || { echo 'SKIP: jq required' >&2; exit 3; }
+TEMP=$(mktemp -d) || exit 1
+trap 'rm -rf -- "$TEMP"' EXIT
+export DSR_CONFIG_DIR="$TEMP/config" DSR_REPOS_FILE="$TEMP/config/repos.yaml"
+mkdir -p "$DSR_CONFIG_DIR/repos.d" "$TEMP/checkout" || exit 1
+source "$MODULE"
+PASSED=0 FAILED=0 SKIPPED=0
 
-# Isolate config lookups, retaining the production normalizer and renderer.
-# Config identity deliberately differs from the executable's naming identity.
-config_get_arch_alias() {
-    if [[ "$1" == "registered-app" && "$2" == "amd64" ]]; then
-        printf '%s\n' x86_64
-    fi
+fixture() {
+    cat > "$DSR_CONFIG_DIR/repos.d/search.yaml" <<'JSON'
+{
+  "tool_name": "fsfs", "binary_name": "fsfs",
+  "artifact_naming": "${name}-${version}-${target_triple}.${ext}",
+  "install_script_compat": "${name}-${target_triple}.${ext}",
+  "release_contract": {
+    "checksum_sidecar": "sha256",
+    "exact_primary_assets": {
+      "darwin/arm64": "fsfs-1.12.1-aarch64-apple-darwin.tar.xz",
+      "darwin/amd64": "fsfs-lite-1.12.1-x86_64-apple-darwin.tar.xz",
+      "linux/amd64": "fsfs-1.12.1-x86_64-unknown-linux-gnu.tar.xz",
+      "linux/arm64": "fsfs-lite-1.12.1-aarch64-unknown-linux-gnu.tar.xz",
+      "windows/amd64": "fsfs-1.12.1-x86_64-pc-windows-msvc.zip",
+      "windows/arm64": "fsfs-1.12.1-aarch64-pc-windows-msvc.zip"
+    },
+    "exact_additional_assets": ["SHA256SUMS", "SHA256SUMS.minisig"],
+    "minisign_public_key_file": "minisign.pub"
+  }
 }
-config_get_target_triple() {
-    if [[ "$1" == "registered-app" && "$2" == "linux/amd64" ]]; then
-        printf '%s\n' x86_64-unknown-linux-musl
-    fi
+JSON
+    printf '{"tools":{}}\n' > "$DSR_REPOS_FILE"
+}
+
+# Explicit configuration-boundary fixture, not a fake yq executable. This
+# isolates naming decisions from YAML parsing. Production-parser tests below
+# run in a separate shell and do not inherit any of these functions.
+config_get_release_contract_json() {
+    jq -c '.release_contract' "$DSR_CONFIG_DIR/repos.d/$1.yaml"
 }
 config_get_tool_field() {
-    case "$2" in tool_name) printf '%s\n' app ;; esac
+    jq -r --arg field "$2" --arg fallback "${3:-}" \
+        '.[$field] // $fallback' "$DSR_CONFIG_DIR/repos.d/$1.yaml"
 }
-config_get_install_script_compat() { :; }
-config_get_install_script_path() { :; }
-config_get_artifact_naming() { :; }
+config_get_artifact_naming() { config_get_tool_field "$1" artifact_naming; }
+config_get_install_script_compat() { config_get_tool_field "$1" install_script_compat; }
+config_get_install_script_path() { printf '\n'; }
+config_get_arch_alias() { printf '\n'; }
+config_get_target_triple() { _an_default_target_triple "${2%/*}" "${2#*/}"; }
 
-passed=0 failed=0
-expect() {
-    local label="$1" expected="$2" actual status=0
-    shift 2
-    actual=$("$@") || status=$?
-    if [[ $status -eq 0 && "$actual" == "$expected" ]]; then
-        passed=$((passed + 1))
-    else
-        failed=$((failed + 1))
-        printf 'FAIL %s (exit %s)\n  expected: %s\n  actual:   %s\n' \
-            "$label" "$status" "$expected" "$actual" >&2
-    fi
-}
-reject() {
-    local label="$1" actual status=0
+run_test() {
+    local label="$1"
     shift
-    actual=$("$@" 2>/dev/null) || status=$?
-    if [[ $status -eq 4 && -z "$actual" ]]; then
-        passed=$((passed + 1))
+    if (fixture && "$@") > "$TEMP/test.stdout" 2> "$TEMP/test.stderr"; then
+        PASSED=$((PASSED + 1))
+        printf 'PASS: %s\n' "$label"
     else
-        failed=$((failed + 1))
-        printf 'FAIL %s: expected exit 4 and empty stdout, got %s: %s\n' \
-            "$label" "$status" "$actual" >&2
+        FAILED=$((FAILED + 1))
+        printf 'FAIL: %s\n' "$label"
+        cat "$TEMP/test.stdout" "$TEMP/test.stderr"
     fi
 }
-# Validate the entire output, not just the last JSON object in a stream.
-names() {
-    local result
-    result=$(artifact_naming_generate_dual "$@") || return $?
-    jq -ces 'if length == 1 and (.[0] | keys == ["compat","same","versioned"])
-        then .[0] | [.versioned, .compat, .same] else error("invalid naming plan") end' <<< "$result"
+
+contract() { jq -c .release_contract "$DSR_CONFIG_DIR/repos.d/search.yaml"; }
+expect_plan() {
+    local expected="$1" target="$2" ext="$3" result
+    result=$(artifact_naming_generate_dual_for_tool search v1.12.1 \
+        "${target%/*}" "${target#*/}" "$ext" "$TEMP/checkout") || return 1
+    jq -se --arg expected "$expected" 'length==1 and (.[0] |
+        keys==["compat","same","versioned"] and .versioned==$expected and
+        .compat==$expected and .same==true)' <<< "$result" >/dev/null
 }
 
-expect 'whole target token' '${target_triple}-${target}' _an_normalize_pattern '$TARGET_TRIPLE-$TARGET'
-expect 'unknown token is not a prefix match' '$NAME_SUFFIX-$OS_VERSION-$TARGET_TRIPLE_EXTRA' \
-    _an_normalize_pattern '$NAME_SUFFIX-$OS_VERSION-$TARGET_TRIPLE_EXTRA'
-expect 'canonical aliases' '${name}-${version}-${os}-${arch}-${target}-${target_triple}.${ext}' \
-    _an_normalize_pattern '${APP}-$VERSION-${GOOS}-$GOARCH-${TARGET}-$TARGET_TRIPLE.$EXT'
-expect 'lowercase bare variables' '${name}-${version}-${os}_${arch}' \
-    _an_normalize_pattern '$name-$version-$platform'
-expect 'workflow tokens' '${name}-${version}-${target_triple}-${os}-${arch}' \
-    _an_normalize_pattern '${name}-${{ github.ref_name }}-${{ matrix.target }}-${{ matrix.goos }}-${{ matrix.goarch }}'
-expect 'unknown expression stays intact' '${{ matrix.target || matrix.os }}' \
-    _an_normalize_pattern '${{ matrix.target || matrix.os }}'
-expect 'normalization is idempotent' '${name}-${version}-${os}_${arch}.${ext}' \
-    _an_normalize_pattern "$(_an_normalize_pattern '$APP-$VERSION-$PLATFORM.$EXT')"
+refuse() {
+    local expected="$1" output status=0
+    shift
+    output=$("$@") || status=$?
+    [[ "$status" == "$expected" && -z "$output" ]]
+}
 
-for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-    os="${platform%/*}" arch="${platform#*/}"
-    case "$platform" in
-        linux/amd64) triple=x86_64-unknown-linux-gnu ;;
-        linux/arm64) triple=aarch64-unknown-linux-gnu ;;
-        darwin/amd64) triple=x86_64-apple-darwin ;;
-        darwin/arm64) triple=aarch64-apple-darwin ;;
-        windows/amd64) triple=x86_64-pc-windows-msvc ;;
-        windows/arm64) triple=aarch64-pc-windows-msvc ;;
-    esac
-    expect "default names $platform" "[\"app-1.2.3-$os-$arch.tar.gz\",\"app-$os-$arch.tar.gz\",false]" \
-        names app v1.2.3 "$os" "$arch"
-    expect "bare triple $platform" "app-$triple.tar.xz" \
-        artifact_naming_substitute '$APP-$TARGET_TRIPLE.$EXT' app v1.2.3 "$os" "$arch" tar.xz
-    expect "workflow triple $platform" "app-1.2.3-$triple.zip" \
-        artifact_naming_substitute '${name}-${{ github.ref_name }}-${{ matrix.target }}.${ext}' \
-        app v1.2.3 "$os" "$arch" zip
-    for ext in '' none; do
-        expect "raw binary $platform ext=$ext" "[\"app-1.2.3-$triple\",\"app-$triple\",false]" \
-            names app v1.2.3 "$os" "$arch" "$ext" \
-            '$NAME-$TARGET_TRIPLE.$EXT' '$NAME-$VERSION-$TARGET_TRIPLE.$EXT'
+matrix() {
+    local target expected ext count=0
+    while IFS=$'\t' read -r target expected; do
+        ext=tar.xz
+        [[ "$target" != windows/* ]] || ext=zip
+        expect_plan "$expected" "$target" "$ext" || return 1
+        count=$((count + 1))
+    done < <(contract | jq -r '.exact_primary_assets | to_entries[] | [.key,.value] | @tsv')
+    [[ "$count" -eq 6 ]]
+}
+
+native_naming_call() {
+    # This is the resolver invocation used by act_run_native_build, including
+    # its captured stdout. No simulated compiler or artifact receipt is used.
+    local platform=darwin/amd64 archive_ext=tar.xz names_json archive_name
+    # shellcheck disable=SC2034 # Purpose is consumed by the called resolver.
+    local build_purpose=release
+    names_json=$(artifact_naming_generate_dual_for_tool search v1.12.1 \
+        "${platform%/*}" "${platform#*/}" "$archive_ext" "$TEMP/checkout" 2>/dev/null || echo '')
+    archive_name=$(jq -r '.versioned // empty' <<< "$names_json") || return 1
+    [[ "$archive_name" == fsfs-lite-1.12.1-x86_64-apple-darwin.tar.xz ]]
+}
+
+diagnostic() {
+    # shellcheck disable=SC2034 # Exercise the native caller's dynamic scope.
+    local build_purpose=diagnostic-native result
+    result=$(artifact_naming_generate_dual_for_tool search v1.12.1 darwin amd64 tar.xz "$TEMP/checkout") || return 1
+    jq -e '.versioned=="fsfs-1.12.1-x86_64-apple-darwin.tar.xz" and
+        .compat=="fsfs-x86_64-apple-darwin.tar.xz" and .same==false' <<< "$result" >/dev/null || return 1
+    # An explicit standalone purpose overrides its enclosing caller's purpose.
+    result=$(artifact_naming_generate_dual_for_tool search v1.12.1 darwin amd64 tar.xz "$TEMP/checkout" release) || return 1
+    jq -e '.versioned=="fsfs-lite-1.12.1-x86_64-apple-darwin.tar.xz" and .same==true' <<< "$result" >/dev/null
+}
+
+explicit_diagnostic() {
+    # shellcheck disable=SC2034 # Explicit argument must override this scope.
+    local build_purpose=release result
+    result=$(artifact_naming_generate_dual_for_tool search v1.12.1 darwin amd64 tar.xz "$TEMP/checkout" diagnostic-native) || return 1
+    jq -e '.versioned=="fsfs-1.12.1-x86_64-apple-darwin.tar.xz" and .same==false' <<< "$result" >/dev/null
+}
+
+legacy() {
+    local result
+    jq '.release_contract=null' "$DSR_CONFIG_DIR/repos.d/search.yaml" > "$TEMP/legacy.json" || return 1
+    cp "$TEMP/legacy.json" "$DSR_CONFIG_DIR/repos.d/search.yaml" || return 1
+    result=$(artifact_naming_generate_dual_for_tool search v1.12.1 darwin amd64 tar.xz "$TEMP/checkout") || return 1
+    jq -e '.versioned=="fsfs-1.12.1-x86_64-apple-darwin.tar.xz" and
+        .compat=="fsfs-x86_64-apple-darwin.tar.xz" and .same==false' <<< "$result" >/dev/null
+}
+
+absent_config() {
+    DSR_CONFIG_DIR="$TEMP/absent"
+    DSR_REPOS_FILE="$TEMP/absent/repos.yaml"
+    # With no repository configuration, even an unavailable YAML reader must
+    # not prevent the low-level unconfigured API from producing normal names.
+    config_get_release_contract_json() { return 3; }
+    config_get_tool_field() { printf '%s\n' "${3:-}"; }
+    local result
+    result=$(artifact_naming_generate_dual_for_tool search v1.12.1 linux amd64 tar.gz) || return 1
+    jq -e '.versioned=="search-1.12.1-linux-amd64.tar.gz" and
+        .compat=="search-linux-amd64.tar.gz" and .same==false' <<< "$result" >/dev/null
+}
+
+parser_failure() {
+    local code="$1"
+    config_get_release_contract_json() { return "$code"; }
+    refuse "$code" artifact_naming_generate_dual_for_tool search v1.12.1 darwin amd64 tar.xz
+}
+
+bad_contract() {
+    refuse 4 _an_contract_primary_plan "$1" linux/amd64 tar.xz
+}
+
+format_plan() {
+    local filename="$1" ext="$2" selected result
+    selected=$(jq -nc --arg name "$filename" \
+        '{checksum_sidecar:"sha256",exact_primary_assets:{"linux/amd64":$name}}') || return 1
+    result=$(_an_contract_primary_plan "$selected" linux/amd64 "$ext") || return 1
+    jq -e --arg name "$filename" '.versioned==$name and .compat==$name and .same==true' <<< "$result" >/dev/null
+}
+
+real_archives() {
+    for tool in cc tar xz zip unzip; do command -v "$tool" >/dev/null || return 3; done
+    local payload_dir="$TEMP/payload" artifacts="$TEMP/artifacts" target ext selected name before after member mode
+    local -a hash_command=(sha256sum)
+    command -v sha256sum >/dev/null || hash_command=(shasum -a 256)
+    mkdir -p "$payload_dir" "$artifacts" || return 1
+    printf 'int main(void) { return 17; }\n' > "$TEMP/app.c"
+    cc "$TEMP/app.c" -o "$payload_dir/fsfs" || return 1
+    chmod 751 "$payload_dir/fsfs" || return 1
+    printf 'Complete license and rider\n' > "$payload_dir/LICENSE"
+    before=$("${hash_command[@]}" "$payload_dir/fsfs") || return 1
+    for target in linux/amd64 linux/arm64 windows/amd64; do
+        ext=tar.xz
+        [[ "$target" != windows/* ]] || ext=zip
+        selected=$(artifact_naming_generate_dual_for_tool search v1.12.1 "${target%/*}" "${target#*/}" "$ext") || return 1
+        name=$(jq -r .versioned <<< "$selected") || return 1
+        if [[ "$ext" == tar.xz ]]; then
+            tar -cJf "$artifacts/$name" -C "$payload_dir" fsfs LICENSE || return 1
+            member=$(tar -xOJf "$artifacts/$name" fsfs | "${hash_command[@]}") || return 1
+        else
+            (cd "$payload_dir" && zip -q "$artifacts/$name" fsfs LICENSE) || return 1
+            member=$(unzip -p "$artifacts/$name" fsfs | "${hash_command[@]}") || return 1
+        fi
+        [[ "${member%% *}" == "${before%% *}" ]] || return 1
     done
-    expect "raw default $platform" "[\"app-1.2.3-$os-$arch\",\"app-$os-$arch\",false]" \
-        names app v1.2.3 "$os" "$arch" none
- done
-
-for ext in tar.gz tar.xz tgz zip exe; do
-    expect "one extension $ext" "[\"app-1-linux-amd64.$ext\",\"app-linux-amd64.$ext\",false]" \
-        names app v1 linux amd64 "$ext" '$NAME-$TARGET.$EXT' '$NAME-$VERSION-$TARGET.$EXT'
-done
-expect 'fixed extension preserved' '["app-1-linux-amd64.tar.xz","app-linux-amd64.tar.xz",false]' \
-    names app v1 linux amd64 tar.gz '${name}-${target}.tar.xz' '${name}-${version}-${target}.tar.xz'
-expect 'configured triple and arch alias' 'app-x86_64-linux-x86_64-x86_64-unknown-linux-musl' \
-    artifact_naming_substitute '$APP-$ARCH-$TARGET-$TARGET_TRIPLE' app v1 linux amd64 none registered-app
-expect 'default names honor config identity' '["app-1-linux-x86_64.tar.gz","app-linux-x86_64.tar.gz",false]' \
-    names app v1 linux amd64 tar.gz '' '' registered-app
-expect 'same alias is explicit' '["app-1-linux-amd64.tar.gz","app-1-linux-amd64.tar.gz",true]' \
-    names app v1 linux amd64 tar.gz '$NAME-$VERSION-$TARGET' '$NAME-$VERSION-$TARGET'
-expect 'literal v and prerelease metadata' 'app-v1.2.3-rc.1+build.2-linux_amd64' \
-    artifact_naming_substitute '$APP-v${VERSION}-$PLATFORM' app v1.2.3-rc.1+build.2 linux amd64
-expect 'literal name underscores' 'my__app-1-linux_amd64' \
-    artifact_naming_substitute '${name}-${version}-${platform}' my__app v1 linux amd64
-
-for pattern in '$UNKNOWN' '$TARGET_TRIPLE_EXTRA' '${name:-fallback}' \
-    '${{ matrix.unsupported }}' '${name}/../asset' '../${name}' '.' '..' \
-    '${name}"broken' '${name}\\broken' '${name} with spaces' '$(printf injected)' '`printf injected`'; do
-    reject "unsafe or unresolved pattern $pattern" names app v1 linux amd64 tar.gz "$pattern"
-done
-reject 'unsafe tool' names 'app"bad' v1 linux amd64
-reject 'unsafe version' names app 'v1/../../bad' linux amd64
-reject 'empty version after prefix' names app v linux amd64
-reject 'unsafe extension' names app v1 linux amd64 '../zip'
-reject 'missing arguments' artifact_naming_generate_dual app
-reject 'substitute missing arguments' artifact_naming_substitute '${name}'
-
-# Selection and fallback regressions use real installer files and the real
-# selection/derivation pipeline. Only workflow/GoReleaser parser boundaries
-# are fixtures, so these tests need neither yq nor access to a remote repo.
-fixture=$(mktemp -d "${TMPDIR:-/tmp}/dsr-naming-contract.XXXXXXXX") || exit 1
-trap 'rm -f -- "$fixture/install.sh" "$fixture/workflow.yml" "$fixture/.goreleaser.yml"; rmdir -- "$fixture"' EXIT
-: > "$fixture/workflow.yml"
-: > "$fixture/.goreleaser.yml"
-cat > "$fixture/install.sh" <<'INSTALL'
-TAR="$NAME-$VERSION-$OS-$ARCH-$UNRESOLVED.tar.gz"
-asset_name="$NAME-$TARGET_TRIPLE.tar.gz"
-INSTALL
-
-expect 'installer skips higher-scoring unresolved variables' '${name}-${target_triple}' \
-    artifact_naming_parse_install_script "$fixture/install.sh" app
-expect 'derive uppercase/unbraced version' '${name}-${target_triple}' \
-    _an_derive_compat_from_versioned '$APP-v$VERSION-$TARGET_TRIPLE'
-expect 'derive preserves literal underscores' 'my__app_${os}_${arch}' \
-    _an_derive_compat_from_versioned 'my__app_v${VERSION}_${platform}'
-expect 'derive leading version' '${name}-${target}' \
-    _an_derive_compat_from_versioned 'v${version}-${name}-${target}'
-expect 'derive trailing version' '${name}-${target}' \
-    _an_derive_compat_from_versioned '${name}-${target}-v${version}'
-expect 'workflow ignores globs and unresolved candidates' '${name}_${version}_${target_triple}' \
-    _an_choose_workflow_pattern '["${name}-${version}-${os}-${arch}-$UNKNOWN","${name}-${version}-${os}-${arch}*","${APP}\u005f${VERSION}\u005f$TARGET_TRIPLE"]'
-
-expect_absent() {
-    local label="$1" actual status=0
-    shift
-    actual=$("$@" 2>/dev/null) || status=$?
-    if [[ $status -eq 1 && -z "$actual" ]]; then
-        passed=$((passed + 1))
-    else
-        failed=$((failed + 1))
-        printf 'FAIL %s: expected no candidate, got exit %s: %s\n' "$label" "$status" "$actual" >&2
-    fi
+    [[ -f "$artifacts/fsfs-lite-1.12.1-aarch64-unknown-linux-gnu.tar.xz" ]] || return 1
+    [[ -f "$artifacts/fsfs-1.12.1-x86_64-unknown-linux-gnu.tar.xz" ]] || return 1
+    after=$("${hash_command[@]}" "$payload_dir/fsfs") || return 1
+    mode=$(stat -c %a "$payload_dir/fsfs" 2>/dev/null) || mode=$(stat -f %Lp "$payload_dir/fsfs") || return 1
+    [[ "$before" == "$after" && "$mode" == 751 ]]
+    # These test archives use one local binary to check naming/byte preservation;
+    # they are NOT evidence of cross compilation or target-ABI qualification.
 }
-for patterns in '[]' '{}' '[null]' '[42]' '["*.tar.gz"]' '[] []' \
-    '["$UNKNOWN"]' '["${name}\n${target}"]'; do
-    expect_absent "no usable workflow template: $patterns" _an_choose_workflow_pattern "$patterns"
+
+run_test 'native call selects the Lite name instead of the global Full family' native_naming_call
+run_test 'all six target-specific names obey the closed contract' matrix
+run_test 'diagnostic purpose retains old names; explicit release overrides it' diagnostic
+run_test 'explicit diagnostic purpose overrides a release caller' explicit_diagnostic
+run_test 'null contract preserves configured legacy dual naming' legacy
+run_test 'absent configuration does not add a YAML dependency' absent_config
+run_test 'unavailable configured parser propagates dependency error without a name' parser_failure 3
+run_test 'invalid configured parser result never falls back to inferred names' parser_failure 4
+run_test 'invalid purpose refuses output' refuse 4 artifact_naming_generate_dual_for_tool search v1.12.1 linux amd64 tar.xz '' invalid
+run_test 'missing target is not guessed from a global pattern' refuse 4 _an_contract_primary_plan "$(fixture && contract)" linux/386 tar.xz
+run_test 'archive compression cannot be relabeled by exact name' refuse 4 _an_contract_primary_plan "$(contract)" darwin/amd64 zip
+for pair in 'demo.tar.gz tar.gz' 'demo.tgz tgz' 'demo.tgz tar.gz' 'demo.tar.xz tar.xz' 'demo.zip zip' 'demo binary' 'demo none' 'demo.exe exe'; do
+    read -r filename extension <<< "$pair"
+    run_test "format-compatible exact name: $pair" format_plan "$filename" "$extension"
 done
+run_test 'empty extension retains raw exact name' format_plan demo ''
+for invalid in 'null' '[]' '{}' 'false' 'not-json' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{}}' \
+    '{"checksum_sidecar":"md5","exact_primary_assets":{"linux/amd64":"demo.tar.xz"}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":false}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"../demo.tar.xz"}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.tar.xz\n"}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"-demo.tar.xz"}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.sha256"}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.minisig"}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.tar.xz","linux/arm64":"DEMO.tar.xz"}}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.tar.xz"},"exact_additional_assets":null}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.tar.xz"},"exact_additional_assets":["demo.tar.xz.sha256"]}' \
+    '{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.tar.xz"},"minisign_public_key_file":"release.pub","exact_additional_assets":["demo.tar.xz.minisig"]}' \
+    $'{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64":"demo.tar.xz"}}\n{}'; do
+    run_test "invalid contract refuses a naming plan: $invalid" bad_contract "$invalid"
+done
+run_test 'real tar.xz/ZIP construction uses exact names without changing binary bytes' real_archives
 
-resolver_names() (
-    local configured="$1" workflow="$2" goreleaser="$3" compat="$4" install="$5" workflow_status="${6:-0}"
-    config_get_artifact_naming() { printf '%s' "$configured"; }
-    config_get_install_script_compat() { printf '%s' "$compat"; }
-    config_get_install_script_path() { printf '%s' "$install"; }
-    config_get_tool_field() {
-        case "$2" in tool_name) printf '%s' app ;; workflow) printf '%s' workflow.yml ;; esac
-    }
-    artifact_naming_parse_workflow() { printf '%s\n' "$workflow"; return "$workflow_status"; }
-    artifact_naming_parse_goreleaser() { printf '%s\n' "$goreleaser"; }
-    local result
-    result=$(artifact_naming_generate_dual_for_tool registered-app v1 linux amd64 tar.xz "$fixture") || return $?
-    jq -ces 'if length == 1 then .[0] | [.versioned, .compat, .same]
-        else error("multiple naming plans") end' <<< "$result"
-)
-
-expect 'explicit default-looking config outranks discovery' \
-    '["app-1-linux-x86_64.tar.xz","app-linux-x86_64.tar.xz",false]' \
-    resolver_names '${name}-${version}-${os}-${arch}' '["${name}_${version}_${target_triple}"]' '' '' ''
-expect 'legacy workflow source shared by both names' \
-    '["app_1_x86_64-unknown-linux-musl.tar.xz","app_x86_64-unknown-linux-musl.tar.xz",false]' \
-    resolver_names '' '["${name}_${version}_${target_triple}"]' '' '' ''
-expect 'GoReleaser source shared after workflow fails' \
-    '["app-v1-x86_64-unknown-linux-musl.tar.xz","app-x86_64-unknown-linux-musl.tar.xz",false]' \
-    resolver_names '' '["wrong-${version}-${os}-${arch}"]' '${name}-v${version}-${target_triple}' '' '' 1
-expect 'missing optional sources keep default behavior' \
-    '["app-1-linux-x86_64.tar.xz","app-linux-x86_64.tar.xz",false]' \
-    resolver_names '' '[]' '' '' '' 1
-expect 'installer explicit override outranks auto-detection' \
-    '["app-v1-x86_64-unknown-linux-musl.tar.xz","app_linux_x86_64.tar.xz",false]' \
-    resolver_names '$APP-v$VERSION-$TARGET_TRIPLE' '[]' '' '${name}_${os}_${arch}' install.sh
-expect 'real installer pattern outranks derived alias' \
-    '["app_1_linux_x86_64.tar.xz","app-x86_64-unknown-linux-musl.tar.xz",false]' \
-    resolver_names '${name}_${version}_${os}_${arch}' '[]' '' '' install.sh
-# bd-1tv.12 upgrade path: a legacy config (artifact_naming only) and the same
-# config after adding the explicit install_script_compat the fallback derives
-# must name assets identically, and the legacy form must not warn.
-expect 'legacy v-prefixed underscore config derives its compat alias' \
-    '["app-v1-linux_x86_64.tar.xz","app-linux_x86_64.tar.xz",false]' \
-    resolver_names '${name}-v${version}-${os}_${arch}' '[]' '' '' ''
-legacy_upgrade_before=$(resolver_names '${name}-${version}-${os}-${arch}' '[]' '' '' '' 2> "$fixture/legacy.err")
-expect 'adding the derived install_script_compat changes nothing' "$legacy_upgrade_before" \
-    resolver_names '${name}-${version}-${os}-${arch}' '[]' '' '${name}-${os}-${arch}' ''
-if [[ -n "$legacy_upgrade_before" ]] && ! grep -Eqi 'warn|deprecat' "$fixture/legacy.err"; then
-    passed=$((passed + 1))
+# Exercise the production YAML parser and its document/alias/precedence rules
+# when installed. Missing dependencies are not converted into a green test.
+if command -v yq >/dev/null && [[ -f "$ROOT/src/config.sh" ]]; then
+    run_test 'production config parser selects exact names from YAML aliases and rejects duplicate keys' \
+        bash -c '
+            source "$1/src/config.sh" || exit 1
+            source "$2" || exit 1
+            cat > "$DSR_CONFIG_DIR/repos.d/search.yaml" <<YAML
+common: &primaries
+  linux/amd64: fsfs-lite-linux.tar.xz
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: *primaries
+YAML
+            value=$(artifact_naming_generate_dual_for_tool search v1.12.1 linux amd64 tar.xz) || exit 1
+            jq -e '\''.versioned=="fsfs-lite-linux.tar.xz" and .same==true'\'' <<< "$value" >/dev/null || exit 1
+            printf "release_contract: null\nrelease_contract: {}\n" > "$DSR_CONFIG_DIR/repos.d/search.yaml"
+            code=0
+            value=$(artifact_naming_generate_dual_for_tool search v1.12.1 linux amd64 tar.xz) || code=$?
+            [[ $code -eq 4 && -z "$value" ]]
+        ' _ "$ROOT" "$MODULE"
 else
-    failed=$((failed + 1))
-    printf 'FAIL legacy config emitted a warning or no plan: %s\n' "$(cat "$fixture/legacy.err")" >&2
+    printf 'SKIP: production YAML integration requires Mike Farah yq v4 and src/config.sh\n'
+    SKIPPED=$((SKIPPED + 1))
+    if [[ "${DSR_TEST_REQUIRE_YQ:-0}" == 1 ]]; then FAILED=$((FAILED + 1)); fi
 fi
-rm -f -- "$fixture/legacy.err"
-
-cat > "$fixture/install.sh" <<'INSTALL'
-TAR="$UNKNOWN.tar.gz"
-INSTALL
-expect_absent 'installer with no resolvable pattern' artifact_naming_parse_install_script "$fixture/install.sh" app
-expect 'unsupported installer falls back to selected source' \
-    '["app_1_x86_64-unknown-linux-musl.tar.xz","app_x86_64-unknown-linux-musl.tar.xz",false]' \
-    resolver_names '' '["${name}_${version}_${target_triple}"]' '' '' install.sh
-reject 'explicit unsupported config fails rather than silently using discovery' \
-    resolver_names '$UNKNOWN' '["${name}-${version}-${target}"]' '' '' ''
-
-printf 'Artifact naming contract: %s passed, %s failed\n' "$passed" "$failed"
-[[ $failed -eq 0 ]]
+printf '\nExact release naming: %s passed, %s failed, %s skipped\n' "$PASSED" "$FAILED" "$SKIPPED"
+[[ $FAILED -eq 0 ]]

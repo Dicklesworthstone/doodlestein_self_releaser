@@ -920,10 +920,94 @@ artifact_naming_get_compat_pattern() {
     return 0
 }
 
+# A closed release contract owns the primary namespace. In particular, a
+# Full/Lite matrix need not share a global artifact_naming family (GH #26).
+# Consume canonical JSON from the configuration layer, not an inferred pattern.
+# Return no plan on malformed/missing target names or a compression mismatch.
+_an_contract_primary_plan() {
+    local contract="$1" target="$2" ext="$3" primary format
+    command -v jq &>/dev/null || return 3
+    if ! primary=$(jq -ers --arg target "$target" '
+        def name:
+            type == "string" and length > 0 and length <= 255 and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            (test("[\u0000-\u001f\u007f]") | not) and (contains("..") | not);
+        def primary:
+            name and (ascii_downcase | test("\\.(sha256|minisig)$") | not);
+        if length != 1 then error("expected one release contract") else .[0] end |
+        if type != "object" or .checksum_sidecar != "sha256" or
+           (.exact_primary_assets | type != "object" or length == 0 or
+               (all(.[]; primary) | not)) or
+           (if has("exact_additional_assets") then
+                (.exact_additional_assets | type != "array" or (all(.[]; name) | not))
+            else false end)
+        then error("invalid release naming contract") else . end |
+        [.exact_primary_assets[]] as $p |
+        ($p + ($p | map(. + ".sha256")) +
+            (if has("minisign_public_key_file") then ($p | map(. + ".minisig")) else [] end) +
+            (.exact_additional_assets // [])) as $names |
+        if ($names | map(ascii_downcase) | unique | length) != ($names | length)
+        then error("colliding release asset names") else . end |
+        .exact_primary_assets[$target] | if primary then . else error("missing primary target") end
+    ' <<< "$contract" 2>/dev/null); then
+        _an_log_error "Invalid or missing exact release primary for $target"
+        return 4
+    fi
+    case "$primary" in
+        *.tar.gz|*.tgz) format=tar.gz ;;
+        *.tar.xz) format=tar.xz ;;
+        *.zip) format=zip ;;
+        *) format=none ;;
+    esac
+    case "$ext" in
+        tgz) ext=tar.gz ;;
+        ''|binary) ext=none ;;
+        exe)
+            [[ "$primary" == *.exe ]] || return 4
+            ext=none
+            ;;
+        tar.gz|tar.xz|zip|none) ;;
+        *) _an_log_error "Unsupported release archive format: $ext"; return 4 ;;
+    esac
+    if [[ "$format" != "$ext" ]]; then
+        _an_log_error "Exact release primary $primary requires $format, not $ext"
+        return 4
+    fi
+    # A closed contract does not authorize an inferred installer alias. Using
+    # the same name prevents dual-name consumers from manufacturing extra assets.
+    jq -cn --arg primary "$primary" '{versioned:$primary,compat:$primary,same:true}'
+}
+
+# An absent configuration keeps the unconfigured naming API dependency-light.
+# A present configuration must be successfully parsed; never interpret a parser
+# failure as permission to fall back to a different archive family.
+_an_release_contract_for_tool() {
+    local tool="$1" config_dir="${DSR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsr}"
+    local registry="${DSR_REPOS_FILE:-$config_dir/repos.yaml}" file present=false
+    for file in "$config_dir/repos.d/$tool.yaml" "$registry"; do
+        if [[ -e "$file" || -L "$file" ]]; then
+            [[ -f "$file" ]] || { _an_log_error "Unreadable repository configuration: $file"; return 4; }
+            present=true
+            break
+        fi
+    done
+    if ! $present; then
+        printf 'null\n'
+        return 0
+    fi
+    if ! declare -F config_get_release_contract_json &>/dev/null; then
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 3
+        # shellcheck source=./config.sh
+        source "$script_dir/config.sh" || return 3
+    fi
+    config_get_release_contract_json "$tool"
+}
+
 # Generate dual names for a tool using config-aware precedence
 # This is the main entry point for the release workflow
 #
-# Args: tool_name version os arch ext repo_path
+# Args: tool_name version os arch ext repo_path [build_purpose]
 # Output: JSON object with versioned and compat names
 # Exit: 0 on success
 artifact_naming_generate_dual_for_tool() {
@@ -934,6 +1018,23 @@ artifact_naming_generate_dual_for_tool() {
     local arch="$4"
     local ext="${5-tar.gz}"
     local repo_path="${6:-}"
+    # Native orchestration dynamically scopes build_purpose into its workers.
+    # Preserve diagnostic naming; standalone callers can select it explicitly.
+    local purpose="${7-${build_purpose:-release}}"
+    case "$purpose" in release|diagnostic-native) ;; *) return 4 ;; esac
+    if ! _an_safe_asset_name "$tool" || ! _an_safe_asset_name "${version#v}" ||
+       ! _an_safe_asset_name "$os" || ! _an_safe_asset_name "$arch"; then
+        _an_log_error "Invalid artifact naming input"
+        return 4
+    fi
+    if [[ "$purpose" == release ]]; then
+        local contract
+        contract=$(_an_release_contract_for_tool "$tool") || return $?
+        if [[ "$contract" != null ]]; then
+            _an_contract_primary_plan "$contract" "$os/$arch" "$ext"
+            return $?
+        fi
+    fi
 
     # Ensure config helpers are available
     if ! declare -F config_get_tool_field &>/dev/null; then
