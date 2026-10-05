@@ -61,7 +61,7 @@ Native collection receipts, member validation, strict staging, and source/tag
 checks remain separate and unchanged. In particular, this fixes target-specific
 names, not automatic single-binary companion collection (issue #29).
 
-Run `bash scripts/tests/test_artifact_naming_contract.sh` for JSON-boundary
+Run `bash scripts/tests/test_artifact_naming_exact_primary.sh` for JSON-boundary
 naming tests and actual archive-byte checks. The production configuration-parser
 section runs when Mike Farah yq v4 and `src/config.sh` are available;
 `DSR_TEST_REQUIRE_YQ=1` makes a missing parser a failing prerequisite. Local
