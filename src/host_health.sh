@@ -370,18 +370,50 @@ _hh_init_cache() {
 # Get cache file path for a host
 _hh_cache_file() {
     local hostname="$1"
+    [[ "$hostname" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || return 4
     echo "$_HH_CACHE_DIR/${hostname}.json"
 }
 
-# Check if cache is valid (expected health-result shape and not expired)
-_hh_cache_valid() {
-    local hostname="$1"
-    local cache_file
-    cache_file=$(_hh_cache_file "$hostname")
+# Bind cached admission to the normalized host and the policy that produced it.
+# Retain only the digest, not arbitrary host fields (which may be private).
+# Bump the schema whenever probe/admission semantics change incompatibly.
+_hh_admission_fingerprint() {
+    local host_config="$1" contract digest
+    contract=$(jq -ncS --argjson host "$host_config" \
+        --arg disk_warn "$_HH_DISK_WARN_THRESHOLD" \
+        --arg disk_error "$_HH_DISK_ERROR_THRESHOLD" \
+        --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
+        --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
+        --arg command_timeout "$_HH_CMD_TIMEOUT" \
+        '{schema:"dsr-host-admission-v1",host:$host,policy:{
+            disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
+            ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(printf '%s\n' "$contract" | sha256sum) || return 3
+    elif command -v shasum >/dev/null 2>&1; then
+        digest=$(printf '%s\n' "$contract" | shasum -a 256) || return 3
+    else
+        return 3
+    fi
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 4
+    printf '%s\n' "$digest"
+}
 
-    if [[ ! -f "$cache_file" ]]; then
+# Read one snapshot and validate THAT result, not a pathname which another
+# health checker might replace between validation and consumption. The expected
+# fingerprint is mandatory at build admission; the optional form supports
+# existing low-level cache inspection without authorizing a build.
+_hh_cache_get() {
+    local hostname="$1"
+    local expected_fingerprint="${2:-}"
+    local cache_file result
+    cache_file=$(_hh_cache_file "$hostname") || return 1
+
+    if [[ ! -f "$cache_file" || -L "$cache_file" ]]; then
         return 1
     fi
+    result=$(_hh_cache_read "$hostname") || return 1
 
     # A hostname can switch between local and split storage, or change its
     # mapping/budgets. A fresh timestamp does not authorize the new contract.
@@ -391,19 +423,21 @@ _hh_cache_valid() {
         0)
             jq -e --argjson storage "$storage" \
                 '.checks.disk_space.storage_contract == $storage' \
-                "$cache_file" >/dev/null 2>&1 || return 1
+                <<< "$result" >/dev/null 2>&1 || return 1
             ;;
         1)
             jq -e '.checks.disk_space | .storage_contract == null and
                 .admission != "split-storage-role-budgets-v1" and .path != "split-storage"' \
-                "$cache_file" >/dev/null 2>&1 || return 1
+                <<< "$result" >/dev/null 2>&1 || return 1
             ;;
         *) return 1 ;;
     esac
 
-    if ! jq -e --arg hostname "$hostname" '
+    if ! jq -se --arg hostname "$hostname" --arg fingerprint "$expected_fingerprint" '
+        length == 1 and (.[0] |
         type == "object" and
         .hostname == $hostname and
+        ($fingerprint == "" or .admission_fingerprint == $fingerprint) and
         (.platform | type == "string") and
         (.description | type == "string") and
         (.connection | type == "string") and
@@ -419,45 +453,63 @@ _hh_cache_valid() {
         (.checks.toolchains | type == "object") and
         (.checks.docker | type == "object") and
         (.checks.clock_drift | type == "object") and
-        (.checked_at | type == "string")
-    ' "$cache_file" >/dev/null 2>&1; then
+        (.checked_at | type == "string"))
+    ' <<< "$result" >/dev/null 2>&1; then
         return 1
     fi
 
     local cache_age file_mtime now
-    now=$(date +%s)
+    now=$(date +%s) || return 1
     if [[ "$(uname)" == "Darwin" ]]; then
-        file_mtime=$(stat -f %m "$cache_file")
+        file_mtime=$(stat -f %m "$cache_file") || return 1
     else
-        file_mtime=$(stat -c %Y "$cache_file")
+        file_mtime=$(stat -c %Y "$cache_file") || return 1
     fi
+    [[ "$now" =~ ^[0-9]+$ && "$file_mtime" =~ ^[0-9]+$ ]] || return 1
     cache_age=$((now - file_mtime))
 
-    [[ $cache_age -lt $_HH_CACHE_TTL ]]
+    [[ $cache_age -ge 0 && $cache_age -lt $_HH_CACHE_TTL ]] || return 1
+    printf '%s\n' "$result"
+}
+
+# Check cache validity without emitting its contents.
+_hh_cache_valid() {
+    _hh_cache_get "$@" >/dev/null
 }
 
 # Read cached result
 _hh_cache_read() {
     local hostname="$1"
     local cache_file
-    cache_file=$(_hh_cache_file "$hostname")
+    cache_file=$(_hh_cache_file "$hostname") || return 4
     cat "$cache_file" 2>/dev/null
 }
 
 # Write cache result
-_hh_cache_write() {
+_hh_cache_write() (
     local hostname="$1"
     local result="$2"
-    local cache_file
-    cache_file=$(_hh_cache_file "$hostname")
-    echo "$result" > "$cache_file"
-}
+    local cache_file staged
+    cache_file=$(_hh_cache_file "$hostname") || return 4
+    # Never truncate a visible receipt or follow a linked destination. Stage
+    # privately in the same directory and publish through one atomic rename.
+    [[ ! -L "$cache_file" && ( ! -e "$cache_file" || -f "$cache_file" ) ]] || return 1
+    jq -se 'length == 1' <<< "$result" >/dev/null 2>&1 || return 1
+    staged=$(mktemp "$_HH_CACHE_DIR/.${hostname}.XXXXXXXX") || return 1
+    trap 'rm -f -- "$staged"' EXIT
+    trap 'exit 1' HUP INT TERM
+    printf '%s\n' "$result" > "$staged" || return 1
+    [[ ! -L "$cache_file" && ( ! -e "$cache_file" || -f "$cache_file" ) ]] || return 1
+    mv -f -- "$staged" "$cache_file"
+)
 
 # Clear cache for a host or all hosts
 host_health_clear_cache() {
     local hostname="${1:-}"
     if [[ -n "$hostname" ]]; then
-        rm -f "$(_hh_cache_file "$hostname")"
+        local cache_file
+        cache_file=$(_hh_cache_file "$hostname") || return 4
+        rm -f -- "$cache_file"
     else
         rm -f "$_HH_CACHE_DIR"/*.json 2>/dev/null
     fi
@@ -845,10 +897,15 @@ host_health_check() {
         return 0
     fi
 
-    _hh_init_cache
-    if $use_cache && _hh_cache_valid "$hostname"; then
-        local cached cached_healthy
-        cached=$(_hh_cache_read "$hostname")
+    local fingerprint="" cache_available=true cached cached_healthy
+    if ! fingerprint=$(_hh_admission_fingerprint "$host_config") || ! _hh_init_cache; then
+        # Health probes still work without a writable cache or a hash utility;
+        # an unbound or unwritable receipt is never used for admission.
+        cache_available=false
+        use_cache=false
+        _hh_log_warn "Health cache unavailable for $hostname; running fresh checks"
+    fi
+    if $use_cache && cached=$(_hh_cache_get "$hostname" "$fingerprint"); then
         cached_healthy=$(jq -r '.healthy' <<< "$cached")
         if $json_mode; then
             echo "$cached"
@@ -931,11 +988,13 @@ host_health_check() {
         --argjson docker "$docker_status" \
         --argjson clock_drift "$clock_drift" \
         --arg checked_at "$checked_at" \
+        --arg fingerprint "$fingerprint" \
         '{
             hostname: $hostname,
             platform: $platform,
             description: $description,
             connection: $connection,
+            admission_fingerprint: $fingerprint,
             status: $status,
             healthy: $healthy,
             errors: $errors,
@@ -951,7 +1010,9 @@ host_health_check() {
         }')
 
     # Cache the result
-    _hh_cache_write "$hostname" "$result"
+    if $cache_available; then
+        _hh_cache_write "$hostname" "$result" || _hh_log_warn "Could not cache health for $hostname"
+    fi
 
     if $json_mode; then
         echo "$result"
@@ -1121,7 +1182,10 @@ host_health_get_healthy_hosts() {
     done
 
     local all_results
-    all_results=$(host_health_check_all --json 2>/dev/null)
+    if ! all_results=$(host_health_check_all --json); then
+        _hh_log_error "Cannot select healthy hosts from an invalid host configuration"
+        return 4
+    fi
 
     local healthy_hosts
     if [[ -n "$capability" ]]; then

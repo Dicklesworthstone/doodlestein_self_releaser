@@ -239,6 +239,113 @@ invalid_beats_cache() {
     invalid_yaml 'hosts: [broken'
 }
 
+cache_fingerprint() {
+    local config baseline changed fingerprint
+    config=$(_hh_get_host_config local) || return 1
+    baseline=$(_hh_admission_fingerprint "$config") || return 1
+    [[ "$baseline" =~ ^[0-9a-f]{64}$ ]] || return 1
+    fingerprint=$(_hh_admission_fingerprint "$(jq 'to_entries | reverse | from_entries' <<< "$config")") || return 1
+    [[ "$baseline" == "$fingerprint" ]] || return 1
+    for change in '.ssh_host = "new-route.invalid"' '.connection = "ssh"' \
+        '.platform = "linux/arm64"' '.capabilities = ["rust"]' '.enabled = false'; do
+        changed=$(jq "$change" <<< "$config") || return 1
+        fingerprint=$(_hh_admission_fingerprint "$changed") || return 1
+        [[ "$baseline" != "$fingerprint" ]] || return 1
+    done
+    _HH_DISK_ERROR_THRESHOLD=80
+    fingerprint=$(_hh_admission_fingerprint "$config") || return 1
+    [[ "$baseline" != "$fingerprint" ]]
+}
+
+cache_reuse() {
+    local before after file held
+    before=$(host_health_check local --no-cache --json) || return 1
+    file=$(_hh_cache_file local) || return 1
+    held="$TEST_ROOT/held-$RUN"
+    ln "$file" "$held" || return 1
+    after=$(host_health_check local --json) || return 1
+    [[ "$after" == "$before" && "$file" -ef "$held" ]] || return 1
+    jq -e '.admission_fingerprint | test("^[0-9a-f]{64}$")' <<< "$after" >/dev/null
+}
+
+cache_policy_refusal() {
+    host_health_check local --json >/dev/null || return 1
+    _HH_DISK_ERROR_THRESHOLD=-1
+    local result status=0
+    result=$(host_health_check local --json) || status=$?
+    [[ $status -eq 1 ]] || return 1
+    jq -e '.healthy == false and .checks.disk_space.status == "error"' <<< "$result" >/dev/null
+}
+
+cache_capability_change() {
+    host_health_check local --json >/dev/null || return 1
+    cat > "$DSR_HOSTS_FILE" <<'YAML'
+hosts:
+  local:
+    platform: linux/amd64
+    connection: local
+YAML
+    local result
+    result=$(host_health_check local --json) || return 1
+    jq -e '.checks.toolchains == {}' <<< "$result" >/dev/null || return 1
+    ! host_health_is_ready local --require go
+}
+
+cache_legacy_refusal() {
+    local original legacy result
+    original=$(host_health_check local --json) || return 1
+    legacy=$(jq 'del(.admission_fingerprint)' <<< "$original") || return 1
+    _hh_cache_write local "$legacy" || return 1
+    result=$(host_health_check local --json) || return 1
+    jq -e '.admission_fingerprint | type == "string" and length == 64' <<< "$result" >/dev/null
+}
+
+cache_future_refusal() {
+    host_health_check local --json >/dev/null || return 1
+    touch -t 209901010000 "$(_hh_cache_file local)" || return 1
+    ! _hh_cache_valid local
+}
+
+cache_atomic_writes() {
+    _hh_init_cache || return 1
+    local file held
+    file=$(_hh_cache_file local) || return 1
+    held="$TEST_ROOT/held-$RUN"
+    _hh_cache_write local '{"generation":1}' || return 1
+    ln "$file" "$held" || return 1
+    _hh_cache_write local '{"generation":2}' || return 1
+    [[ ! "$file" -ef "$held" ]] || return 1
+    jq -e '.generation == 1' "$held" >/dev/null || return 1
+    jq -e '.generation == 2' "$file" >/dev/null || return 1
+    ! _hh_cache_write local 'broken JSON' || return 1
+    ! _hh_cache_write local $'{}\n{}' || return 1
+    jq -e '.generation == 2' "$file" >/dev/null || return 1
+    [[ -z $(find "$_HH_CACHE_DIR" -name '.local.*' -print) ]]
+}
+
+cache_symlink_refusal() {
+    _hh_init_cache || return 1
+    local file victim="$TEST_ROOT/victim-$RUN"
+    file=$(_hh_cache_file local) || return 1
+    printf 'untouched\n' > "$victim" || return 1
+    ln -s "$victim" "$file" || return 1
+    ! _hh_cache_write local '{}' || return 1
+    ! _hh_cache_valid local || return 1
+    [[ $(cat "$victim") == untouched && -L "$file" ]]
+}
+
+cache_unavailable() {
+    printf 'not a directory\n' > "$_HH_CACHE_DIR" || return 1
+    local result
+    result=$(host_health_check local --json) || return 1
+    jq -e '.healthy == true and .checks.toolchains.go.status == "ok"' <<< "$result" >/dev/null
+}
+
+selection_error() {
+    printf 'hosts: []\n' > "$DSR_HOSTS_FILE"
+    reject 4 host_health_get_healthy_hosts --json
+}
+
 run_test 'normalization defaults apply only to missing fields' normal_defaults
 run_test 'typed capabilities, SSH route and explicit false survive normalization' normal_values
 for invalid in 'null' '[]' '{}' 'false' \
@@ -266,12 +373,23 @@ run_test 'fallback refuses additional YAML documents' fallback_unsupported $'hos
 run_test 'missing host is a configuration refusal' missing_host
 run_test 'invalid label is rejected before cache access with valid JSON diagnostics' invalid_name
 run_test 'disabled host is not build-ready' disabled
+run_test 'cache identity binds canonical host configuration and admission policy' cache_fingerprint
+run_test 'cache writes replace atomically and never truncate a held prior receipt' cache_atomic_writes
+run_test 'linked cache destinations are neither followed nor replaced' cache_symlink_refusal
+run_test 'cache paths reject traversal labels' reject 4 _hh_cache_file ../outside
+run_test 'host selection propagates configuration errors instead of returning an empty success' selection_error
 if command -v go >/dev/null 2>&1; then
     run_test 'real local toolchain is admitted and require-go succeeds' live_local
     run_test 'real disk probe still refuses insufficient headroom' live_disk_refusal
+    run_test 'unchanged host and policy reuse the exact cache inode and receipt' cache_reuse
+    run_test 'tightened disk policy cannot reuse a cached healthy decision' cache_policy_refusal
+    run_test 'changed capabilities cannot reuse old build-readiness evidence' cache_capability_change
+    run_test 'legacy unbound cache is replaced by fresh admission evidence' cache_legacy_refusal
+    run_test 'future-dated cache is not considered fresh' cache_future_refusal
+    run_test 'unavailable cache does not prevent real health probes' cache_unavailable
 else
     echo 'SKIP: install Go for live local and disk-admission integration tests'
-    SKIPPED=$((SKIPPED + 2))
+    SKIPPED=$((SKIPPED + 8))
 fi
 if command -v ssh >/dev/null 2>&1; then
     run_test 'real unreachable SSH destination remains rejected' live_unreachable
