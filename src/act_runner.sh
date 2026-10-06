@@ -8282,7 +8282,7 @@ _act_relocation_source_inventory() {
 
 _act_relocate_failed_target() {
     local tool="$1" version="$2" run_id="$3" before="$4" request="$5" approval_file="$6"
-    local target="${request%%=*}" host="${request#*=}" old_host configured_host
+    local target="${request%%=*}" host="${request#*=}" old_host configured_host host_platform
     local config_file="$ACT_REPOS_DIR/${tool}.yaml" hosts_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml"
     local entry result result_path sync_json roots hosts receipt repo_hash hosts_hash
     local prior_result prior_log result_hash log_hash
@@ -8316,7 +8316,26 @@ _act_relocate_failed_target() {
     ' <<< "$before" >/dev/null || return 4
     act_platform_uses_act "$tool" "$target" && return 4
     configured_host=$(act_get_native_host "$target" "$tool") || return 4
-    [[ "$configured_host" == "$host" && "$(_act_get_host_platform "$host")" == "$target" ]] || return 4
+    [[ "$configured_host" == "$host" ]] || return 4
+    host_platform=$(_act_get_host_platform "$host") || return 4
+    if [[ "$host_platform" != "$target" ]]; then
+        # A native worker executes on its host OS while producing the requested
+        # target, just as act_run_native_build does for an initial cross build.
+        # Relocation may use that route only when the reviewed target-specific
+        # recipe explicitly selects this host and supplies a build command.
+        # A platform-mapping fallback alone cannot authorize a cross build.
+        if [[ ! "$host_platform" =~ ^[a-z]+/[a-z0-9]+$ ]] ||
+           ! jq -e --arg target "$target" --arg host "$host" '
+                .cross_compile[$target] as $cross |
+                ($cross | type == "object") and $cross.host == $host and
+                (($cross.build_cmd // .build_cmd) |
+                    type == "string" and test("[^[:space:]]"))
+            ' <<< "$current_json" >/dev/null; then
+            _log_error "Relocation to $host ($host_platform) requires an explicit cross_compile.$target host and build command"
+            return 4
+        fi
+        _log_info "Relocating $target to configured cross-build host $host ($host_platform)"
+    fi
     prior_result=$(jq -er --arg target "$target" '.target_statuses[$target].result_path | strings' <<< "$before") || return 4
     prior_log=$(jq -er --arg target "$target" '.target_statuses[$target].log_path | strings' <<< "$before") || return 4
     [[ -f "$prior_result" && ! -L "$prior_result" && -f "$prior_log" && ! -L "$prior_log" ]] || return 4
@@ -8384,11 +8403,11 @@ _act_relocate_failed_target() {
        "$(_act_sha256 "$hosts_file")" == "$hosts_hash" &&
        "$(_act_sha256 "$prior_result")" == "$result_hash" &&
        "$(_act_sha256 "$prior_log")" == "$log_hash" ]] || return 4
-    receipt=$(jq -cn --arg target "$target" --arg old "$old_host" --arg new "$host" \
+    receipt=$(jq -cn --arg target "$target" --arg old "$old_host" --arg new "$host" --arg host_platform "$host_platform" \
         --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo_hash "$repo_hash" \
         --arg hosts_hash "$hosts_hash" --arg result_hash "$result_hash" --arg log_hash "$log_hash" \
         --argjson prior "$before" --argjson sync "$sync_json" '
-        {target: $target, old_host: $old, new_host: $new, at: $now,
+        {target: $target, old_host: $old, new_host: $new, new_host_platform: $host_platform, at: $now,
          git_sha: $prior.git_sha, git_ref: $prior.git_ref,
          prior_target: $prior.target_statuses[$target], prior_context: $prior.context,
          repo_config_sha256: $repo_hash, hosts_config_sha256: $hosts_hash,

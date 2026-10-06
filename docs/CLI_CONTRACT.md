@@ -482,11 +482,19 @@ The operator must establish the prior config's provenance from the original
 invocation receipt. DSR checks actual file hashes and permits only the selected
 target's `cross_compile` host, build command, environment, and legacy `hosts`
 entry to differ. Global settings and all other target settings must match.
+The current recipe must resolve the selected target to the replacement host.
+Its platform may differ from the artifact target when `cross_compile[TARGET].host`
+explicitly selects it and the target has a nonempty build command, including an
+inherited global `build_cmd`. This supports Linux-hosted Linux ARM64 and Windows
+cross builds without mislabeling the build host. A platform-mapping fallback,
+unknown host platform, or missing cross-build command is refused before staging.
+The native worker still enforces the requested target's output and architecture.
 Retained failed result/log files must agree with the old host and frozen source;
 completed artifacts and result files must still verify. Replacement staging and
 its pinned dependency closure are verified before an atomic state transition.
-The run records the prior context, configuration delta, source archive/manifest
-hashes, and prior attempt hashes; the next worker uses the next attempt number.
+The run records the prior context, replacement host platform, configuration
+delta, source archive/manifest hashes, and prior attempt hashes; the next worker
+uses the next attempt number.
 After an interrupted staging attempt, only an exactly verified canonical
 snapshot may be reused. Partial snapshots are retained and refused, not merged
 or overwritten. No successful target is rebuilt by relocation admission.
