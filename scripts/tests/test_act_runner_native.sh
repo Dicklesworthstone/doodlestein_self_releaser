@@ -304,8 +304,50 @@ _act_ssh_exec() {
     while IFS= read -r command_line || [[ -n "$command_line" ]]; do
         printf 'CMD:%s\n' "$command_line" >> "$SSH_ARGS_FILE"
     done <<< "$cmd"
+    if [[ -n "${SDK_COMMAND_FILE:-}" && "$cmd" == *'for sdk_variable in '* ]]; then
+        printf '%s\n' "$cmd" > "$SDK_COMMAND_FILE"
+    fi
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
+    # These command-construction tests return explicit transport receipts.
+    # test_strict_cargo_private_cache.sh executes the real preparation, Cargo
+    # mutation, final inventory and refusal paths on actual private inodes.
+    if [[ "$exit_code" -eq 0 && ( "$cmd" == *DSR_PRIVATE_CACHE_COMPARE* ||
+                                  "$cmd" == *DSR_PRIVATE_CACHE_SEED* ) ]]; then
+        local fixture_source="" fixture_suffix="" fixture_home="" fixture_mode fixture_receipt
+        local source_prefix="physical_source_root=\$(cd '"
+        local suffix_prefix='strict_home="${physical_source_root%/*}/.cargo-home-'
+        while IFS= read -r command_line; do
+            case "$command_line" in
+                "$source_prefix"*)
+                    fixture_source=${command_line#"$source_prefix"}
+                    fixture_source=${fixture_source%%"' && pwd -P)"}
+                    ;;
+                "$suffix_prefix"*)
+                    fixture_suffix=${command_line#"$suffix_prefix"}
+                    fixture_suffix=${fixture_suffix%\"}
+                    ;;
+                "_dsr_cargo_home_guard '"*)
+                    fixture_home=${command_line#"_dsr_cargo_home_guard '"}
+                    fixture_home=${fixture_home%\'}
+                    ;;
+            esac
+        done <<< "$cmd"
+        if [[ "$cmd" == *DSR_PRIVATE_CACHE_COMPARE* ]]; then
+            [[ -n "$fixture_source" && -n "$fixture_suffix" ]] || return 99
+            fixture_home="${fixture_source%/*}/.cargo-home-$fixture_suffix"
+            fixture_mode=private-copy
+            fixture_receipt="$fixture_home/.dsr-cache-seed.json"
+        else
+            [[ -n "$fixture_home" ]] || return 99
+            fixture_mode=inventory
+            fixture_receipt="$fixture_home.final.json"
+        fi
+        jq -nc --arg home "$fixture_home" --arg mode "$fixture_mode" --arg receipt "$fixture_receipt" \
+            '{schema_version:1, mode:$mode, cargo_home:$home, receipt_path:$receipt,
+              receipt_sha256:("1" * 64), inventory_sha256:("2" * 64), caches:[], file_count:0, size_bytes:0}'
+        return 0
+    fi
     if [[ "$exit_code" -eq 0 && "$cmd" == *"Cargo target source identity mismatch"* && \
           "$cmd" =~ Write-Output\ \'([A-Za-z]:/d/t/[0-9a-f-]+/(amd64|arm64))\' ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
@@ -1043,12 +1085,13 @@ CASES
 
 test_unix_rust_sdk_environment() {
     log_test "Unix strict and ordinary Rust: configured SDK selectors replace ambient values"
-    local mode result cmd launch observed status
+    local mode result cmd launch observed status SDK_COMMAND_FILE
     for mode in strict ordinary; do
         reset_state
         MOCK_LANGUAGE=rust
         MOCK_PLATFORM_ENV=$'OPENSSL_DIR=/configured/openssl with spaces\nOPENSSL_STATIC=1\nPKG_CONFIG=/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/configured/pkgconfig\nLIBCLANG_PATH=/configured/libclang'
         MOCK_BUILD_CMD="env"
+        SDK_COMMAND_FILE="$MOCK_DIR/sdk-unix-$mode-command"
         MOCK_SSH_STREAM_FILE="$MOCK_DIR/sdk-unix-$mode-artifact"
         write_mock_artifact "$MOCK_SSH_STREAM_FILE"
         status=0
@@ -1058,7 +1101,9 @@ test_unix_rust_sdk_environment() {
         else
             result=$(act_run_native_build tool darwin/arm64 v1.0.0 sdk-unix 2>/dev/null) || status=$?
         fi
-        cmd=$(get_ssh_cmd)
+        # Execute only the build request, excluding the subsequent cache
+        # inventory request captured by the shared SSH transcript.
+        cmd=$(cat "$SDK_COMMAND_FILE" 2>/dev/null)
         if [[ "$status" -ne 0 || "$cmd" != *'for sdk_variable in '* ]]; then
             log_fail "$mode Unix SDK command construction failed: status=$status result=$result"
             continue
@@ -1287,8 +1332,9 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     scp_args=$(get_scp_args)
     raw_ssh_args=$(get_raw_ssh_args)
     expected_target="/remote/.dsr-release-snapshots/tool-run/.cargo-target-darwin-arm64"
-    expected_home="/remote/.dsr-release-snapshots/tool-run/.cargo-home"
-    if [[ "$cmd" == *"export \"CARGO_TARGET_DIR=$expected_target\""* && \
+    expected_home=$(jq -r '.build_influence_env.CARGO_HOME // empty' <<< "$result")
+    if [[ "$expected_home" == /remote/.dsr-release-snapshots/tool-run/.cargo-home-darwin-arm64-* && \
+          "$cmd" == *"export \"CARGO_TARGET_DIR=$expected_target\""* && \
           "$cmd" == *"export \"CARGO_HOME=$expected_home\""* && \
           "$cmd" == *"unset RUSTC_WRAPPER;"* && "$cmd" == *"unset RUSTFLAGS;"* && \
           "$cmd" == *'case "$variable" in CARGO_*|RUST*|XWIN_*'* && \
@@ -1305,6 +1351,10 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
        echo "$result" | jq -e \
             --arg home "$expected_home" \
             '.build_influence_env.CARGO_HOME == $home and
+             .cargo_isolation.cache_reuse == [] and
+             .cargo_isolation.dependency_cache.mode == "private-copy" and
+             .cargo_isolation.dependency_cache.seed.cargo_home == $home and
+             .cargo_isolation.dependency_cache.final.cargo_home == $home and
              .build_influence_env.RUSTFLAGS == "-C target-cpu=apple-m4" and
              .build_influence_env.XWIN_CACHE_DIR == "/pinned/xwin-cache" and
              .build_influence_env.XWIN_MSVC_SYSROOT_DOWNLOAD_URL == "https://example.invalid/pinned-sysroot.tar.xz" and
@@ -1333,7 +1383,8 @@ test_unix_strict_rust_executes_xwin_sanitizer_before_exports() {
 
     local strict_root="$MOCK_DIR/unix-xwin-order/run"
     local observed_env="$MOCK_DIR/unix-xwin-order/observed-env"
-    mkdir -p "$strict_root/source" "$strict_root/.cargo-home"
+    mkdir -p "$strict_root/source" "$strict_root/ambient"
+    bash "$SRC_DIR/cargo_cache.sh" snapshot "$strict_root/ambient" "$strict_root/.cargo-home" >/dev/null || return 1
     MOCK_BUILD_CMD="printf '%s\\n' \"\${XWIN_CACHE_DIR-<unset>}\" \"\${XWIN_CROSS_COMPILER-<unset>}\" > '$observed_env'"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/unix-xwin-order/artifact"
     write_mock_artifact "$MOCK_SSH_STREAM_FILE"
@@ -1500,7 +1551,7 @@ test_unix_strict_validation_failure_stops_build() {
 
     local status=0
     (
-        _act_ssh_exec() { /opt/homebrew/bin/bash -c "$2"; }
+        _act_ssh_exec() { "$BASH" -c "$2"; }
         act_run_native_build \
             "tool" "darwin/arm64" "v1.0.0" "run1" \
             "$strict_root/source" >/dev/null 2>&1

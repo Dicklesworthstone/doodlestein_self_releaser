@@ -216,6 +216,25 @@
         }
       }
     },
+    "cargo_cache_summary": {
+      "type": "object",
+      "required": [
+        "schema_version", "mode", "cargo_home", "receipt_path", "receipt_sha256",
+        "inventory_sha256", "caches", "file_count", "size_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "mode": {"enum": ["private-copy", "inventory"]},
+        "cargo_home": {"type": "string", "pattern": "^/"},
+        "receipt_path": {"type": "string", "pattern": "^/"},
+        "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "inventory_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "caches": {"type": "array", "items": {"enum": ["registry", "git"]}, "uniqueItems": true},
+        "file_count": {"type": "integer", "minimum": 0},
+        "size_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
     "cargo_isolation": {
       "type": "object",
       "required": [
@@ -253,6 +272,27 @@
             "type": "string"
           },
           "uniqueItems": true
+        },
+        "dependency_cache": {
+          "type": "object",
+          "description": "The final inventory is present only after successful Cargo execution and cache admission; failed targets retain their seed evidence.",
+          "required": ["mode", "seed"],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {"const": "private-copy"},
+            "seed": {
+              "allOf": [
+                {"$ref": "#/$defs/cargo_cache_summary"},
+                {"properties": {"mode": {"const": "private-copy"}}}
+              ]
+            },
+            "final": {
+              "allOf": [
+                {"$ref": "#/$defs/cargo_cache_summary"},
+                {"properties": {"mode": {"const": "inventory"}}}
+              ]
+            }
+          }
         },
         "intermediate_cache": {
           "type": "object",

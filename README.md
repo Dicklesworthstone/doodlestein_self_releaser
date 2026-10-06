@@ -225,6 +225,36 @@ useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
+Strict native Unix Rust builds copy the ambient `registry` and `git` download
+caches into private files before Cargo runs. They require Python 3.9+ on the
+build host. Configuration, credentials, symlinks, and external Git storage
+pointers are excluded or refused. The first successful locked, offline metadata
+resolution publishes a retained seed alongside the source snapshot. If that
+first resolution lacks dependencies, no seed is published: refill the ambient
+cache and retry. Once admitted, the seed survives deletion or in-place changes
+to the ambient cache, and every metadata invocation and target attempt receives
+a fresh copy. Parallel targets therefore do not share writable dependency files.
+
+Resume verifies the retained seed inventory before copying it. Changes to seed
+bytes or unsafe cache entries are refused; a legacy snapshot whose cache roots
+are symlinks requires a new strict run. Cargo may legitimately unpack archives
+or reconstruct Git checkouts in an attempt's private home. After a successful
+build, DSR checks that the attempt's seed receipt has its original digest and
+records the final inventory before collecting artifacts. Configuration, special
+files, symlinks, and hardlinks with owners outside the private cache trees block
+collection; hardlinks entirely within those trees are permitted. Build results
+record `cargo_isolation.dependency_cache.seed` and `.final`, with
+`cargo_isolation.cache_reuse: []`; failed targets retain their seed evidence
+without a final inventory. These are retained local integrity records;
+they do not protect against a build host rewriting all its evidence.
+
+The copies include the complete selected cache trees and remain alongside the
+strict snapshot, so allow disk space for the retained seed and each metadata or
+target attempt. Native Windows and ordinary non-strict native builds still
+share ambient dependency caches; the native Unix repair does not close those
+remaining parts of [issue #15](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/15).
+The cargo-xwin backend already uses private dependency copies separately.
+
 Strict native Unix Rust builds can opt into a host-local intermediate cache with
 `strict_cargo_cache_root: /absolute/private/cache` in the repository build config.
 The operator must create that canonical directory owned by the build user with

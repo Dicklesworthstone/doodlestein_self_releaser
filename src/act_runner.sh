@@ -4333,6 +4333,155 @@ _act_validate_cargo_metadata_source_closure() {
     return 0
 }
 
+# Use the installed cache implementation on the build host without requiring a
+# second DSR installation there. The emitted function is POSIX-shell callable;
+# its Python subprocess opens/copies cache entries without following links.
+_act_unix_cargo_cache_runtime() (
+    local module
+    module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cargo_cache.sh"
+    [[ -f "$module" && ! -L "$module" ]] || return 3
+    # shellcheck source=src/cargo_cache.sh
+    source "$module" || return 3
+    declare -f _cargo_cache_run
+    cat <<'SH'
+_dsr_cargo_home_guard() {
+    test -d "$1" && test ! -L "$1" || return 4
+    for dsr_name in config config.toml credentials credentials.toml; do
+        if test -e "$1/$dsr_name" || test -L "$1/$dsr_name"; then
+            printf '[dsr] private CARGO_HOME contains configuration: %s\n' "$dsr_name" >&2
+            return 4
+        fi
+    done
+}
+SH
+)
+
+# The canonical home is a retained seed: Cargo never writes to it. Metadata
+# and every target attempt receive independent inodes in a fresh home. This
+# lets resume verify its seed even after the ambient cache has been removed,
+# while normal Cargo unpacking cannot race another target's cache inventory.
+_act_unix_private_cargo_home_script() {
+    local source_root="$1" suffix="$2"
+    [[ "$source_root" =~ ^/[A-Za-z0-9_./+-]+$ && "$source_root" != *..* &&
+       "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9-]+$ ]] || return 4
+    printf 'set -e\numask 077\n'
+    _act_unix_cargo_cache_runtime || return $?
+    cat <<EOF
+physical_source_root=\$(cd '$source_root' && pwd -P)
+strict_home="\${physical_source_root%/*}/.cargo-home"
+dsr_seed_home=\$strict_home
+strict_home="\${physical_source_root%/*}/.cargo-home-$suffix"
+dsr_seed_pending=false
+if test -e "\$dsr_seed_home" || test -L "\$dsr_seed_home"; then
+    _dsr_cargo_home_guard "\$dsr_seed_home"
+    dsr_seed_summary=\$(_cargo_cache_run verify "\$dsr_seed_home" "\$dsr_seed_home/.dsr-cache-seed.json")
+    dsr_private_summary=\$(_cargo_cache_run snapshot "\$dsr_seed_home" "\$strict_home")
+    python3 -I - "\$dsr_seed_summary" "\$dsr_private_summary" <<'DSR_PRIVATE_CACHE_COMPARE'
+import json, sys
+seed, private = (json.loads(value) for value in sys.argv[1:])
+if (seed['mode'] != 'private-copy' or private['mode'] != 'private-copy' or
+        seed['inventory_sha256'] != private['inventory_sha256']):
+    sys.exit('private Cargo cache seed changed during preparation')
+DSR_PRIVATE_CACHE_COMPARE
+else
+    # Do not publish an incomplete seed if offline metadata cannot resolve
+    # yet. A later attempt can use repaired ambient downloads without ever
+    # replacing an admitted seed or overwriting the failed private attempt.
+    ambient_home=\${CARGO_HOME:-\$HOME/.cargo}
+    if test ! -e "\$ambient_home" && test ! -L "\$ambient_home"; then ambient_home=; fi
+    dsr_private_summary=\$(_cargo_cache_run snapshot "\$ambient_home" "\$strict_home")
+    dsr_seed_pending=true
+fi
+_dsr_cargo_home_guard "\$strict_home"
+EOF
+}
+
+_act_unix_cargo_metadata_body() {
+    cat <<'SH'
+ancestor=${physical_source_root%/*}
+while test "$ancestor" != / && test -n "$ancestor"; do
+    for name in config config.toml; do
+        test ! -e "$ancestor/.cargo/$name"; test ! -L "$ancestor/.cargo/$name"
+    done
+    ancestor=${ancestor%/*}; test -n "$ancestor" || ancestor=/
+done
+for variable in $(env | sed 's/=.*//'); do
+    case "$variable" in CARGO_*|RUST*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset "$variable";; esac
+done
+cd "$physical_source_root"
+(set -C; CARGO_HOME="$strict_home" cargo metadata --locked --offline --all-features --format-version 1 --manifest-path "$physical_source_root/Cargo.toml" > "$strict_home/.dsr-cargo-metadata.json")
+_dsr_cargo_home_guard "$strict_home"
+if $dsr_seed_pending; then
+    _cargo_cache_run snapshot "$strict_home" "$dsr_seed_home" >/dev/null
+fi
+SH
+}
+
+_act_prepare_unix_private_cargo_home() {
+    local host="$1" source_root="$2" suffix="$3" command summary metadata_body
+    command=$(_act_unix_private_cargo_home_script "$source_root" "$suffix") || return $?
+    # The orchestrator normally published the seed during its source-closure
+    # check. Direct native callers must pass the same admission if it is absent.
+    metadata_body=$(_act_unix_cargo_metadata_body) || return $?
+    command+=$'\n''if $dsr_seed_pending; then'$'\n'"$metadata_body"$'\n''fi'
+    command+=$'\n''printf '\''%s\n'\'' "$dsr_private_summary"'
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    jq -ce '
+        select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
+            (.cargo_home | type == "string" and startswith("/")) and
+            .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
+            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+    ' <<< "$summary"
+}
+
+# Cargo may legitimately add/unpack dependencies in the private attempt home.
+# Preserve its initial receipt, then observe the final inventory; equality to
+# the seed is deliberately not required. Linked/special/config-bearing cache
+# state, or a changed seed receipt, prevents artifact collection.
+_act_finish_unix_private_cargo_home() {
+    local host="$1" cargo_home="$2" seed_digest="$3" command summary
+    [[ "$cargo_home" =~ ^/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
+       "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
+    command=$(_act_unix_cargo_cache_runtime) || return $?
+    command+=$'\n'"$(cat <<EOF
+set -e
+_dsr_cargo_home_guard '$cargo_home'
+_dsr_verify_cache_seed() {
+    python3 -I - '$cargo_home/.dsr-cache-seed.json' '$seed_digest' <<'DSR_PRIVATE_CACHE_SEED'
+import hashlib, os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd, 'rb') as stream:
+    before = os.fstat(stream.fileno())
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        sys.exit('private Cargo cache seed receipt is not a plain file')
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1048576), b''):
+        digest.update(block)
+    if digest.hexdigest() != sys.argv[2]:
+        sys.exit('private Cargo cache seed receipt changed')
+    after = os.stat(sys.argv[1], follow_symlinks=False)
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    if identity(before) != identity(os.fstat(stream.fileno())) or identity(before) != identity(after):
+        sys.exit('private Cargo cache seed receipt changed during verification')
+DSR_PRIVATE_CACHE_SEED
+}
+_dsr_verify_cache_seed
+dsr_final_summary=\$(_cargo_cache_run inventory '$cargo_home' '$cargo_home.final.json')
+_dsr_cargo_home_guard '$cargo_home'
+_dsr_verify_cache_seed
+printf '%s\\n' "\$dsr_final_summary"
+EOF
+)"
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    jq -ce --arg home "$cargo_home" '
+        select(type == "object" and .schema_version == 1 and .mode == "inventory" and
+            .cargo_home == $home and .receipt_path == ($home + ".final.json") and
+            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+    ' <<< "$summary"
+}
+
 _act_windows_cache_junction_guard_script() {
     local cargo_home="$1" require_links="${2:-false}"
     [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
@@ -4370,7 +4519,12 @@ _act_strict_cargo_metadata_json() {
         win_manifest_path="${win_source_root}\\Cargo.toml"
         metadata_command="$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$strict='${win_cargo_home}'; \$ambient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }; if (-not (Test-Path -LiteralPath \$strict)) { New-Item -ItemType Directory -Path \$strict | Out-Null }; \$strictItem=Get-Item -LiteralPath \$strict -Force; if (-not \$strictItem.PSIsContainer -or ((\$strictItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not a plain directory' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$strict \$name)) { throw 'Strict CARGO_HOME contains ambient configuration' } }; foreach (\$name in @('registry','git')) { \$source=Join-Path \$ambient \$name; \$dest=Join-Path \$strict \$name; if (Test-Path -LiteralPath \$source -PathType Container) { if (-not (Test-Path -LiteralPath \$dest)) { New-Item -ItemType Junction -Path \$dest -Target \$source | Out-Null }; \$destItem=Get-Item -LiteralPath \$dest -Force; if (-not \$destItem.PSIsContainer -or ((\$destItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) { throw 'Strict Cargo cache is not an isolated junction' } } elseif (Test-Path -LiteralPath \$dest) { throw 'Strict Cargo cache has no ambient authority' } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; Get-ChildItem Env: | Where-Object { \$_.Name -match '^(CARGO_|RUST)' -or \$_.Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS)$' } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + \$_.Name) }; \$env:CARGO_HOME=\$strict; Set-Location -LiteralPath '${win_source_root}'; Write-Output ((Get-Location).Path); & cargo metadata --locked --offline --all-features --format-version 1 --manifest-path '${win_manifest_path}'; exit \$LASTEXITCODE")"
     else
-        metadata_command="set -e; umask 077; physical_source_root=\$(cd '$source_root' && pwd -P); strict_home=\"\${physical_source_root%/*}/.cargo-home\"; ambient_home=\${CARGO_HOME:-\$HOME/.cargo}; if test -e \"\$strict_home\" || test -L \"\$strict_home\"; then test -d \"\$strict_home\"; test ! -L \"\$strict_home\"; else mkdir \"\$strict_home\"; fi; test -d \"\$strict_home\"; test ! -L \"\$strict_home\"; for name in config config.toml credentials credentials.toml; do test ! -e \"\$strict_home/\$name\"; test ! -L \"\$strict_home/\$name\"; done; for name in registry git; do if test -d \"\$ambient_home/\$name\"; then if test -e \"\$strict_home/\$name\" || test -L \"\$strict_home/\$name\"; then test -L \"\$strict_home/\$name\"; else ln -s \"\$ambient_home/\$name\" \"\$strict_home/\$name\"; fi; test \"\$(cd \"\$strict_home/\$name\" && pwd -P)\" = \"\$(cd \"\$ambient_home/\$name\" && pwd -P)\"; else test ! -e \"\$strict_home/\$name\"; test ! -L \"\$strict_home/\$name\"; fi; done; ancestor=\${physical_source_root%/*}; while test \"\$ancestor\" != / && test -n \"\$ancestor\"; do for name in config config.toml; do test ! -e \"\$ancestor/.cargo/\$name\"; test ! -L \"\$ancestor/.cargo/\$name\"; done; ancestor=\${ancestor%/*}; test -n \"\$ancestor\" || ancestor=/; done; for variable in \$(env | sed 's/=.*//'); do case \"\$variable\" in CARGO_*|RUST*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset \"\$variable\";; esac; done; cd \"\$physical_source_root\"; printf '%s\\n' \"\$physical_source_root\"; CARGO_HOME=\"\$strict_home\" cargo metadata --locked --offline --all-features --format-version 1 --manifest-path \"\$physical_source_root/Cargo.toml\""
+        local metadata_attempt metadata_body
+        metadata_attempt=$(_act_generate_uuid) || return 3
+        metadata_command=$(_act_unix_private_cargo_home_script \
+            "$source_root" "metadata-${metadata_attempt//-/}") || return $?
+        metadata_body=$(_act_unix_cargo_metadata_body) || return $?
+        metadata_command+=$'\n'"$metadata_body"$'\n''printf '\''%s\n'\'' "$physical_source_root"; test -f "$strict_home/.dsr-cargo-metadata.json"; test ! -L "$strict_home/.dsr-cargo-metadata.json"; cat "$strict_home/.dsr-cargo-metadata.json"'
     fi
 
     if _act_is_windows_host "$host"; then
@@ -6409,6 +6563,7 @@ act_run_native_build() {
     local strict_native_build=false
     [[ -n "$remote_path_override" ]] && strict_native_build=true
     local strict_rust_build=false
+    local strict_private_cargo_cache=false strict_cargo_seed_json='null'
     local build_influence_env_json='{}'
     local cargo_isolation_json='null'
     local nonstrict_stage_root="" nonstrict_source_root="" nonstrict_cargo_home=""
@@ -6460,7 +6615,6 @@ act_run_native_build() {
             strict_build_env+=$'\n'
         fi
         strict_build_env+="CARGO_TARGET_DIR=$strict_cargo_target_dir"
-        strict_build_env+=$'\n'"CARGO_HOME=$strict_cargo_home"
         if _act_is_windows_host "$host"; then
             local split_storage_status=0
             _act_windows_storage_config "$host" >/dev/null || split_storage_status=$?
@@ -6502,6 +6656,19 @@ act_run_native_build() {
             strict_build_env+=$'\n'"FT_ATOMIC_BUILD_IDENTITY=$atomic_identity"
             strict_build_env+=$'\n'"FT_ATOMIC_BUILD_PROFILE=$build_profile"
         fi
+        if ! _act_is_windows_host "$host"; then
+            local cargo_attempt
+            cargo_attempt=$(_act_generate_uuid) || return 3
+            if ! strict_cargo_seed_json=$(_act_prepare_unix_private_cargo_home \
+                    "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}") || \
+               ! strict_cargo_home=$(jq -er '.cargo_home' <<< "$strict_cargo_seed_json"); then
+                _log_error "Unable to prepare a private strict Cargo cache on $host"
+                jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo cache preparation failed"}'
+                return 4
+            fi
+            strict_private_cargo_cache=true
+        fi
+        strict_build_env+=$'\n'"CARGO_HOME=$strict_cargo_home"
         build_env="$strict_build_env"
 
         local windows_build_receipt=false
@@ -6548,6 +6715,11 @@ act_run_native_build() {
                     cache_reuse: ["registry", "git"]
                 }
             ') || return 4
+        if $strict_private_cargo_cache; then
+            cargo_isolation_json=$(jq --argjson seed "$strict_cargo_seed_json" \
+                '.cache_reuse = [] | .dependency_cache = {mode: "private-copy", seed: $seed}' \
+                <<< "$cargo_isolation_json") || return 4
+        fi
         if [[ -n "$strict_cache_root" ]]; then
             cargo_isolation_json=$(jq --arg root "$strict_cache_root" \
                 '.intermediate_cache = {mode: "host-private-cargo-build-dir-v1", root: $root,
@@ -7085,6 +7257,19 @@ act_run_native_build() {
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
     local exit_code=${PIPESTATUS[0]}
+    if [[ $exit_code -eq 0 ]] && $strict_private_cargo_cache; then
+        local strict_cargo_final_json strict_cargo_seed_digest
+        strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4
+        if [[ $exit_code -eq 0 ]] && \
+           strict_cargo_final_json=$(_act_finish_unix_private_cargo_home \
+               "$host" "$strict_cargo_home" "$strict_cargo_seed_digest"); then
+            cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
+                '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
+        else
+            _log_error "Strict private Cargo cache failed final verification; refusing artifact collection"
+            exit_code=4
+        fi
+    fi
     if [[ $exit_code -eq 0 && -n "$strict_cache_root" ]]; then
         local cache_receipt
         if cache_receipt=$(_act_ssh_exec "$host" \

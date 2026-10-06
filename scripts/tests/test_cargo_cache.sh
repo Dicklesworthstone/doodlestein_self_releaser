@@ -102,6 +102,35 @@ class PrivateCacheTests(unittest.TestCase):
         self.copied(self.crate).write_bytes(b'private mutation\n')
         self.assertEqual(self.crate.read_bytes(), original)
 
+    def test_ambient_hardlinks_are_copied_into_private_inodes(self):
+        outside = self.root / 'operator-owned'
+        os.link(self.crate, outside)
+        receipt = self.snapshot()
+        copied = self.copied(self.crate)
+        self.assertEqual(copied.stat().st_nlink, 1)
+        outside.write_bytes(b'operator mutation through another name')
+        self.assertNotEqual(copied.read_bytes(), outside.read_bytes())
+        self.invoke('verify', self.home, receipt['receipt_path'])
+
+    def test_final_inventory_refuses_ambient_hardlink_grafts(self):
+        self.snapshot()
+        os.link(self.crate, self.home / 'registry/ambient-hardlink')
+        final = self.root / 'resolved.json'
+        self.invoke('inventory', self.home, final, 7)
+        self.assertFalse(final.exists())
+
+    def test_verification_refuses_external_ownership_without_byte_changes(self):
+        receipt = self.snapshot()
+        os.link(self.copied(self.crate), self.root / 'operator-owned')
+        self.invoke('verify', self.home, receipt['receipt_path'], 7)
+
+    def test_private_internal_hardlinks_can_be_inventoried_and_verified(self):
+        self.snapshot()
+        os.link(self.copied(self.crate), self.home / 'git/private-hardlink')
+        final = self.invoke('inventory', self.home, self.root / 'resolved.json')
+        self.assertEqual(final['file_count'], 4)
+        self.invoke('verify', self.home, final['receipt_path'])
+
     def test_empty_unseeded_home(self):
         result = self.invoke('snapshot', '', self.home)
         self.assertEqual(result['file_count'], 0)

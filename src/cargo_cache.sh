@@ -31,7 +31,7 @@ for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
 
 def identity(info):
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
-            info.st_mtime_ns, info.st_ctime_ns)
+            info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
 
 
 def absolute(path):
@@ -95,12 +95,16 @@ def external_git_reference(path, size):
              ('.git' in parts[:-1] or (len(parts) == 4 and parts[1] == 'db'))))
 
 
-def inventory(root, destination=None):
+def inventory(root, destination=None, require_private_links=False):
     files, directories, caches = [], [], []
+    inodes = {}
+    private_entries = {}
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
     def walk(parent, name, relative):
         before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if require_private_links:
+            private_entries[relative] = identity(before)
         if stat.S_ISDIR(before.st_mode):
             fd = os.open(name, flags, dir_fd=parent)
             try:
@@ -121,6 +125,15 @@ def inventory(root, destination=None):
         elif stat.S_ISREG(before.st_mode):
             if external_git_reference(relative, before.st_size):
                 raise Failure('external Git storage reference: ' + relative)
+            if require_private_links:
+                # Cargo can hardlink Git objects between its own database and
+                # checkout. Every link must belong to these inventoried trees;
+                # a regular file with an ambient owner is still shared state.
+                key = (before.st_dev, before.st_ino)
+                expected, count, first = inodes.get(key, (before.st_nlink, 0, relative))
+                if expected != before.st_nlink:
+                    raise Failure('cache hardlinks changed while reading: ' + relative)
+                inodes[key] = (expected, count + 1, first)
             if destination is None:
                 digest, size = read_regular(parent, name, before)
             else:
@@ -136,6 +149,27 @@ def inventory(root, destination=None):
                           'executable_bits': before.st_mode & 0o111})
         else:
             raise Failure('linked or special cache entry: ' + relative)
+
+    def recheck_private_links(parent, name, relative):
+        # A link created outside these trees changes no inventoried directory.
+        # Recheck file identity/nlink after the full count, including files that
+        # were hashed early, without following a replaced ancestor directory.
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if private_entries.get(relative) != identity(before):
+            raise Failure('private cache entry changed after reading: ' + relative)
+        if stat.S_ISDIR(before.st_mode):
+            fd = os.open(name, flags, dir_fd=parent)
+            try:
+                if identity(before) != identity(os.fstat(fd)):
+                    raise Failure('private cache directory replaced: ' + relative)
+                names = sorted(os.listdir(fd), key=os.fsencode)
+                for child in names:
+                    recheck_private_links(fd, child, relative + '/' + child)
+                if (identity(before) != identity(os.fstat(fd)) or
+                        identity(before) != identity(os.stat(name, dir_fd=parent, follow_symlinks=False))):
+                    raise Failure('private cache directory changed after reading: ' + relative)
+            finally:
+                os.close(fd)
 
     fd = os.open(root, flags)
     try:
@@ -161,8 +195,15 @@ def inventory(root, destination=None):
                 after = None
             if (before is None) != (after is None) or (before is not None and identity(before) != identity(after)):
                 raise Failure('cache root changed while reading: ' + name)
+        if require_private_links:
+            for name, before in selected.items():
+                if before is not None:
+                    recheck_private_links(fd, name, name)
     finally:
         os.close(fd)
+    for expected, count, first in inodes.values():
+        if expected != count:
+            raise Failure('cache file has hardlinks outside its private trees: ' + first)
     return {'caches': sorted(caches), 'directories': sorted(directories, key=os.fsencode),
             'files': sorted(files, key=lambda entry: os.fsencode(entry['path']))}
 
@@ -212,7 +253,7 @@ def main(args):
         complete = False
         try:
             selected = inventory(source, destination) if source else {'caches': [], 'directories': [], 'files': []}
-            if inventory(destination) != selected:
+            if inventory(destination, require_private_links=True) != selected:
                 raise Failure('private cache copy does not match its seed')
             receipt = {'schema_version': 1, 'kind': 'private-copy', 'cargo_home': destination,
                        'seed_source': source, 'inventory': selected}
@@ -232,7 +273,7 @@ def main(args):
         if any(inside(output, os.path.join(home, name)) for name in ('registry', 'git')):
             raise Failure('receipt must live outside the inventoried cache directories', 4)
         receipt = {'schema_version': 1, 'kind': 'inventory', 'cargo_home': home,
-                   'seed_source': None, 'inventory': inventory(home)}
+                   'seed_source': None, 'inventory': inventory(home, require_private_links=True)}
         return summary(path, receipt, new_receipt(path, receipt))
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as incoming:
@@ -247,7 +288,7 @@ def main(args):
             set(receipt) != {'schema_version', 'kind', 'cargo_home', 'seed_source', 'inventory'} or
             type(receipt['schema_version']) is not int or receipt['schema_version'] != 1 or
             receipt['kind'] not in ('private-copy', 'inventory') or receipt['cargo_home'] != home or
-            receipt['inventory'] != inventory(home)):
+            receipt['inventory'] != inventory(home, require_private_links=True)):
         raise Failure('private Cargo cache does not match its inventory')
     return summary(path, receipt, hashlib.sha256(data).hexdigest())
 

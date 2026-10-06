@@ -5,8 +5,11 @@ on:
     paths:
       - src/act_runner.sh
       - src/artifact_naming.sh
+      - src/cargo_cache.sh
       - src/config.sh
+      - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_native_single_archives.sh
+      - scripts/tests/test_strict_cargo_private_cache.sh
       - .github/workflows/native-archive-regression.yml
   workflow_dispatch:
 permissions:
@@ -32,11 +35,13 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip
+            sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip python3 cargo rustc
           else
             for tool in jq xz go; do
               command -v "$tool" >/dev/null || brew install "$tool"
             done
+            command -v python3 >/dev/null || brew install python
+            command -v cargo >/dev/null || brew install rust
             if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
             echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           fi
@@ -49,5 +54,10 @@ jobs:
           set -euo pipefail
           yq --version
           bash -n src/act_runner.sh
+          bash -n src/cargo_cache.sh
+          bash -n scripts/tests/test_cargo_cache.sh
           bash -n scripts/tests/test_native_single_archives.sh
+          bash -n scripts/tests/test_strict_cargo_private_cache.sh
+          bash scripts/tests/test_cargo_cache.sh
+          bash scripts/tests/test_strict_cargo_private_cache.sh
           bash scripts/tests/test_native_single_archives.sh
