@@ -79,6 +79,39 @@ _dsr_require() {
   _DSR_LOADED_MODULES[$module]=1
 }
 
+# Environment-backed global flags (docs/CLI_CONTRACT.md) must take effect
+# before the core modules below derive their paths, log level and colors.
+# Value flags are read only before the subcommand; --no-color anywhere before
+# a `--` terminator. main() validates and skips the same flags.
+_dsr_prescan_global_flags() {
+  local in_prefix=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --) return 0 ;;
+      --no-color) export NO_COLOR=1 ;;
+      --state-dir|--cache-dir|--config|-c|--log-level)
+        if $in_prefix && [[ $# -ge 2 && -n "$2" ]]; then
+          case "$1" in
+            --state-dir) export DSR_STATE_DIR="$2" ;;
+            --cache-dir) export DSR_CACHE_DIR="$2" ;;
+            --config|-c) export DSR_CONFIG_FILE="$2" ;;
+            --log-level) export DSR_LOG_LEVEL="$2" ;;
+          esac
+          shift
+        fi
+        ;;
+      --state-dir=*) $in_prefix && export DSR_STATE_DIR="${1#*=}" ;;
+      --cache-dir=*) $in_prefix && export DSR_CACHE_DIR="${1#*=}" ;;
+      --config=*) $in_prefix && export DSR_CONFIG_FILE="${1#*=}" ;;
+      --log-level=*) $in_prefix && export DSR_LOG_LEVEL="${1#*=}" ;;
+      -*) ;;
+      *) in_prefix=false ;;
+    esac
+    shift
+  done
+}
+_dsr_prescan_global_flags "$@"
+
 # Core modules (always needed)
 source "$SCRIPT_DIR/src/logging.sh"
 _DSR_LOADED_MODULES[logging]=1
@@ -12075,6 +12108,21 @@ main() {
                 NON_INTERACTIVE=true
                 shift
                 ;;
+            --no-color)
+                # Applied by _dsr_prescan_global_flags before logging loaded.
+                shift
+                ;;
+            --state-dir|--cache-dir|--config|-c|--log-level)
+                # Applied by _dsr_prescan_global_flags; require the value here.
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    log_error "Global option $1 requires a value"
+                    exit 4
+                fi
+                shift 2
+                ;;
+            --state-dir=*|--cache-dir=*|--config=*|--log-level=*)
+                shift
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -12093,14 +12141,41 @@ main() {
                 ;;
         esac
     done
-
-    # Resolve the command before initializing file logging. A dry-run must not
-    # create, rotate, compress, or delete log files merely to print a plan.
-    log_set_level_from_flags "$VERBOSE" "$QUIET"
+    case "${DSR_LOG_LEVEL:-info}" in
+        debug|info|warn|error) ;;
+        *)
+            log_error "Invalid log level: ${DSR_LOG_LEVEL} (expected debug, info, warn or error)"
+            exit 4
+            ;;
+    esac
 
     # Get command
     local command="${1:-}"
     shift 2>/dev/null || true
+
+    # Global flags apply to every subcommand (docs/CLI_CONTRACT.md), so the
+    # unambiguous boolean ones are also accepted after it: `dsr status --json`
+    # is `dsr --json status`. Arguments after a `--` terminator are untouched.
+    local -a command_args=()
+    local lift_globals=true global_arg
+    for global_arg in "$@"; do
+        if $lift_globals; then
+            case "$global_arg" in
+                --) lift_globals=false ;;
+                --json|-j) JSON_MODE=true; continue ;;
+                --verbose) VERBOSE=true; continue ;;
+                --quiet) QUIET=true; continue ;;
+                --non-interactive) NON_INTERACTIVE=true; continue ;;
+                --no-color) continue ;;
+            esac
+        fi
+        command_args+=("$global_arg")
+    done
+    set -- ${command_args[@]+"${command_args[@]}"}
+
+    # Resolve the command before initializing file logging. A dry-run must not
+    # create, rotate, compress, or delete log files merely to print a plan.
+    log_set_level_from_flags "$VERBOSE" "$QUIET"
 
     if [[ -z "$command" ]]; then
         show_help

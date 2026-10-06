@@ -325,6 +325,59 @@ test_help_flag_with_json() {
     harness_teardown
 }
 
+# Global flags apply to every subcommand (docs/CLI_CONTRACT.md).
+test_global_json_after_subcommand() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    exec_run "$DSR_CMD" status --json
+    if [[ "$(exec_status)" -eq 0 ]] && \
+       exec_stdout | jq -e '.command == "status" and .status == "success"' >/dev/null 2>&1; then
+        pass "dsr status --json emits the JSON envelope like dsr --json status"
+    else
+        fail "dsr status --json should accept the global flag (got: $(exec_status))"
+        echo "stderr: $(exec_stderr | tail -3)"
+    fi
+
+    harness_teardown
+}
+
+test_global_path_flags_take_effect() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    local state="$TEST_TMPDIR/flag-state" cache="$TEST_TMPDIR/flag-cache"
+    exec_run "$DSR_CMD" --state-dir "$state" --cache-dir "$cache" --no-color --log-level warn --json status
+    if [[ "$(exec_status)" -eq 0 ]] && [[ -d "$state/logs" ]] && \
+       exec_stdout | jq -e '.status == "success"' >/dev/null 2>&1 && \
+       ! exec_stderr | grep -q $'\033\\['; then
+        pass "dsr --state-dir/--cache-dir/--no-color/--log-level are honored"
+    else
+        fail "documented global path, color and log-level flags should be honored (got: $(exec_status))"
+        echo "stderr: $(exec_stderr | tail -3)"
+    fi
+
+    harness_teardown
+}
+
+test_global_flag_errors() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    local missing invalid
+    exec_run "$DSR_CMD" --state-dir
+    missing=$(exec_status)
+    exec_run "$DSR_CMD" --log-level loud status
+    invalid=$(exec_status)
+    if [[ "$missing" -eq 4 && "$invalid" -eq 4 ]]; then
+        pass "missing global option values and invalid log levels exit 4"
+    else
+        fail "global flag errors should exit 4 (missing=$missing invalid=$invalid)"
+    fi
+
+    harness_teardown
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -366,6 +419,12 @@ echo "Error Handling Tests:"
 test_unknown_command
 test_unknown_command_shows_error
 test_help_flag_with_json
+
+echo ""
+echo "Global Flag Tests:"
+test_global_json_after_subcommand
+test_global_path_flags_take_effect
+test_global_flag_errors
 
 echo ""
 echo "=========================================="
