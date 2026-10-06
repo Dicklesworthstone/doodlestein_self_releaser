@@ -1,6 +1,6 @@
-# One-time, reviewed patch application for the pending GH #29 repair.
-# Only the exact preimage blob is eligible. Tests run before a non-force main
-# push. The resulting commit replaces this job with read-only regression CI.
+# Apply only the reviewed, hash-pinned GH #29 patch to its exact preimage.
+# This job creates verified Git objects only. It never changes a branch or
+# publishes a release; main is advanced separately after the result is reviewed.
 name: Native archive regression tests
 on:
   push:
@@ -8,10 +8,6 @@ on:
     paths:
       - .github/workflows/native-archive-regression.yml
   workflow_dispatch:
-  workflow_run:
-    workflows: [Release regression tests]
-    types: [completed]
-    branches: [main]
 permissions:
   contents: write
 concurrency:
@@ -19,15 +15,12 @@ concurrency:
   cancel-in-progress: false
 jobs:
   apply-and-verify:
-    if: >-
-      github.repository == 'Dicklesworthstone/doodlestein_self_releaser' &&
-      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: main
           persist-credentials: false
       - name: Require exact reviewed runner preimage
         shell: bash
@@ -38,118 +31,20 @@ jobs:
           test -z "$(git status --porcelain)"
       - name: Apply digest-pinned native archive implementation and regressions
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Exact pending native-single-archives.patch, gzip+base64 transported
-          # to avoid reconstructing the 478 KB runner. The decoded patch is
-          # checked before application; it changes only the two named files.
-          cat > "$RUNNER_TEMP/native.patch.gz.b64" <<'DSR_PATCH_GZIP'
-          H4sIAAAAAAAC/809a3fbtpLf/SsQxS3FiKTsPFul7NZN3DZ78zpJeu/t2lodmqQsNhSpkpQfcfTfdx4ACD7kxEl3z+a0lkgCg8FgMG9QUTKfC9c9TSoRjMsi
-          HAdhNSvWWRYXXrkQJ917O67r9rXdGY1Gve1/+km4d/e+d+7eFyP8vH9f/PTTjrgt3sRlnp7FolrEIguqBL6e58X7chWEsQiKcIF35nmxDCoxL/IlNVzFhVvE
-          q7xMqry4FCfrJI0QWJhnVQEDe0K8ZFhhnqZxWCV5JtZlHIkqF4ugiNwwj2Jx+iFZIWwRn8UA5vcsuRBVUJzGlYPQ4G4mzhfwJyiqZI4TyoJlkp2KIIsIj7Iq
-          krASRZzGQRnr4eHGX+ukwOGCwrv44O24t8UBPp4np2u8LyeUlCJYV4u8SCpC9zFAFuusXK9WeVFBu7MgXcP0gyQtRZjmMANvZwSwMhFfrNIkhBXbDuqkjLNK
-          5FnsIFhJy0ghvSqSZVBcIjgcL03iUiQVDJMvV0VclkgyCfskhi9A9TSo8I6I4nmwTqvSE+8WOG5a5tANaFgSNKBQGle5HrJ0gIpJuIAh47MkX5fppTjNK6Rg
-          Uqgx8gzuRusCyVtWwSl8ejtihkTX/DCTAGfcZ2iLqx2B/9I8DFJJ39k8SWN/sLs/MJ8p3OHB3cYDXu9ZXsKTK9Xqm2/GdzaDHbduxiP6g8HOqOemGvrPMs/M
-          Bqt1AUyK2Fzdm7i7V8SoM3l34kq+2cBQgrsdHYnBrnw+EL6vWevjx9aDKAlOs7ysktCV22Y6xVZFXK2LTNznOQI8dw49DdIMxLffilvCfd6+3epPkwdmWCKz
-          u2fi8i/x7Y/jKD4bZ+s0NZre46aSGLvDp2/fzN4dvPn18N3s1VuYuqbwAGG4hTjmDvjP8ppLegTMGWdnTRj2VIzHYjCw2hjfrfGxu7gnc5r+B+jFwAdMRXUB
-          RBxgV5z5Y2TGrMaL+wLFJUNQ6/Mki/Lzcnynp4NBgQFIlUH9JE7LuL8dCofTD0bTeSJJmTA3bKc+LKHx8M/tSyPhaO6E9cFFyH28EO4zfw/W4PMJO2qsNIzr
-          wqYH1QFLLPJSNBab7/KNBin5gWRmk60tho//QMSYkmhSP5HLE2dReZ5Ui+HAk3S0BUpy4zbdw2USmtQNKHHahXPR7HPxqT641qoDfqflBl7FNo/rrtApjbPT
-          aoF8tE/6Y+gd7cGOE9XlKiZezE/+BE2loOHTuj9BjYsiL4YDkPzQDgQ5SHZhaEGlXgLUdgAGMBAfaxBDwKG123BY4hjG35wqzXPYbs/Y2oQuqpHsdCCxbTa8
-          ESA5b95QDWKLLspHu3k5bePN5OltCURoIFOTsYXRcl2iohOB4IkhM716K5bBaoXTJHLaIijFrqHGW+QdNp7JKd5q00qOn2Sg3JOoZeMM7DbtTJhILmTrJlfz
-          tMx2GldF7iaeascRPKlhJMyhJ69n2paKL1AJS3NhFpRlXJVHcqNLyWy3acwbgHGQPbvE0g+2cZXZxBAG9pYVVRQlhJV9A0blMjaXT9tmHxvbU5EKl2tAG7Ru
-          adyrW+nHNRhzeVumawQmNopKMmGbCCpCm1TklW+gRMB32/uLG7Yw5aZd/LgxyGmktNRmg67w0myl9o4lfvjhh1pHoOoY2F1jIwxInCv9mmQ7epkY5EcWqR9h
-          LBunn1VzYX1THmeW0e3x47rbHZsdh3vfOfvoODz4zrn7kBwHtM8PlHJB07NIIpKGKdiJJRnnyDFghwJ7XMThugpO0likSQnOwe8l+htguZbAGwipjJWTgN5A
-          7TM4encSZ5FkJT6YJxmYd6B/k3kMcqN+Sub5v0A35GtwpgxXBkdu2uHKtFN8gJZ013hGeMDYYMmDjPfEW1gUlE4Jms9Fvj5d0FzjCwCP9yXuMAs0ooESIL0y
-          GOzXpGJIYbqOYlLzpfj58JdXbw4JgJpnEYdxsiJ3Alj1QwwkAIWyiAtoBcjDVN6TbS4CBHcSgFtwArQA9EG9QyskTgnAswrM+fJ9QtKTlgJolWelGP76m7h9
-          93vbE4fLVXUplxCBqVWEZakSEO5RUobgqhF6bTrKBUMxjX4Do4DeGW04hKbJzORN0Av5E2U8yICs4xsGaREHETggOQyPPACzrYihaUHfBOc1HJpjQ9mW4lyv
-          uOEDLoMEvbkQCHcqHbcXQRUupK9LnmTB7m9hlfUaKumMoOIL4Nen2tav+YPIj+5EyaorA4cKlryowM9lwMRdLtFHrS4SqETNJvlArHJ0IuOy62oRSeEJ6scZ
-          L9Kn/C25luRimTanXC1YC8kqGW71NPmgZNNNnaX/b66S+HuNbPIBFM2kmQ2c37Kn+Ys2mjvty20drjG/hWl+E7NMavs0KIrgktVgkKZgvk4NSU1CXrVUSpzC
-          JCAfh4P/Pjpw/ytwP+y530/rr95sdHzsTu/sguprQCL7GNkfdlA5HByTukEWt+3tfeWwa4dEL97oxKNWabMn07FVumBJRoWPwFbcfiRir+tDYHSiZTtAncy58UKJeFvdHsgaTrHR39rQEWeefySG98OlA/QN3TpIs
-          3CJzDxp94Fl1PrjvfAea87uHzt090pztf8O2A9JYYUbEtr8GldnJpZQgTeLAIvXNvm6OxuXVhs22Wjt8bHrTZEoaTwXSWzK7LZ2p+rk2XJtAtiKDKBxN7ZYf
-          oU3YLxi36eF8zsBMgJo5Or7w0Hgot4QtfhR7Egn1sMeT1Z7ArY4ncDTtad/xDpquWG+frkvR8I0U16Ha7jLn57kjfQCb0Pr3LisMpR37DHG9Rjf1i7Z4Po1V
-          aztA21zFZVKSTm/6GWSmqG3VGYBJbw5Bgvj42BtCJ/hAc5xNcriQRjkIYrvPD5f/jjzD0MLYRSK1hJS9ff61ioWXppE26NlQmtJH0+5DvNG9+Ey/hM0L9wB0
-          ZJz5QxaMDx7ev+c8EqMHD7975HyvJSO3BdstrzDcLMP+KzCBwS7R1yfACONdc0I7Nwob6qlsGeiq7/54fHw8Hm+MeGFfq5E/AM6MDfa/Ld4ZBr72JbTNq60x
-          tGzrvAJCEeV6Pk8uPBPYk9pq1oYnUZtMZm3qGU4X+Hm5CFYrhEj/1+BuMv9vvKP4cHp08e8pfm54lipuKvhb26nsgzPYiRr5rrAAh6cc4/7gvzO2Emdsa6uk
-          QylTYTdovpPF5wKNPbHEdNP+3t6jBw8odaYtP5UwuwlUZN89Z0+M9p173z1C1h3dvjVel8UYOHIcZ2fgl2EqDpNrwMzS5pUQ3JMiAJfEQY/QLfN1gWk2cmjU
-          srrKByziUxlxKcl5eZnL9WLHQy4xucllcprJoBnA/W19AvblCfARe8wJJq+CZElOEIhJ4a5zcExXMSa2dkZvXr16B2ZrGMGCDaOkIDcOmODng7e/zd6++v3N
-          k0Ow6jYDe+x58B9Z5avzSLivQe4ZYfDVJThh2T3RDIVfiThc5GKgngIyKjIyED9+e/cxOl6VuPdYbHZGqpEL4yNaA5Aw1us/rA6FZcOd0WAwOLyIizApOYdZ
-          GCSvveUTkCvvic6cYtNbSEYO8gJJvDMC4jnkLQPTFGUdfqjyPIVLuV4yP+agybGQDqlcNLgoGAmA95J9zKS5sWFDw36FVa+aoQP2SN2D18/ESb7OogDjDf/5
-          9tXL8R8HL54DbYKilOBWRR6TUkxRI71otQwsTUbFFUFYtkJFvuMBFYwja2WsrtNs4+MrajQgVe1qNhBYL2fLRxdMVS4eEjE/t5Iuv++jLjI9LXvjfwAWTGZxl
-          +OHNfzPNcEekZC5O5VSuSJMuEJyPcZGpjWiDMrsQaADTrSX+grQrCqBSgzmCxsrknKBahZYCaJWzbDCCAAInunDdKutou/AdBBA4MrDczBMZskXSQHzN/P/M
-          rxllGvjgwsgDZCDCCGLlu10RXe7GPhXCpPxOxoYeNlZCdMD08YoakYCStrdd/IurBBLYo/Z3LYkhDm6BVddifAGOrEGSnrGcUymRA9mzn41D13ldGdoU2zCKMi
-          UbTBVIOIvSDTZRJhqXSrINJigltduapwhTHFoDVxiVUASQVYWtBwEBXaAqJhCOxzItMBzczVGjsPGCbCXpiYJKGo6+UoMckeaDtNyRoivvk7AhhR5Gni/rXDlgs
-          JmzQQMgViTzKAg8Rpm0kdEhmD60X0sipc+cYWYviFaj7OAsvJ8IaYVeH4g1IgbKKwNYwbJ8iwF349rIEOh7Cph7es5lt4wKoU6+FBzMdHqkpuTgPubMojNFM
-          rgGD1wIFWs4sB4nHRLenThiscDvN8nW1Wlf+u2Idw6gwcR7YY1sE6w3knOV839KIpCCb5RY47ovkfSx+CYpggeOf3Ze7miljbSFB7/TRs1CsodjLW76P8Ptw
-          VcQgDXwrKgsZGnFZ37iWTaQrsWbCF3sgtjGWpy52RpSfW8Th+2EanMQpCq0sSnAjqqU9TfMTjOoQjAY36KaT9tIdQNsCnxySDUmg5eQkLiPw9BtkfH3w9i0Y
-          giMh8Zin63KhVoHxLBfBEHe0wkxah1IqAMmDuw8eUgsPLSLwP4H1hrbtLeKLKDlFu1nDOi+SKqa2DhdnKKDUnZ7OMGg3RMHiRevlqhxyOw1C8tYQNvB6CbYY
-          yPU7d96ft7BrcSuGPYfLYDUE3kO1ILvaNlC+y4AOr438jtIWHvoP9+RINWFicPPn60wGu+8AXMCmCP09Pa3tG0fQzhHm1nkMIJN59Rgufhrgs5kUNXK3wPLU
-          g6nZ4KCwj/rnUeMu+YCZToGBdbdYfyMLkFALYZSVsesoNBjaDeKucOMAWC+KscnQ9gr0u1ZDC8zGmjwqK6B4nBbSUWFOK02y9cU4WEYP78M0VaDJt8DUtZiK
-          9Xx969PxVeikYqAvqWonyRYxclTk/xKAZ6TWhCxKnwItIL6HlsbTVUTgzWIjdTxkRMuue5pMyuVFsC0T2PaguLIwHspJAhib/bE+TuYNmIOyXgIm21mAW8JQ
-          RQDtVHgAhaOMO4D2R5GA8500Int67q3U/7ZRG9FiCkFLTMTdBi7aiVQ4yS6tZPtkS2vZDHkWL00dIjFrawjnDnV2NOfjM1wI22mEhPqJQtoAL/roQViMOnPo
-          2bO0sfs2mNpfd5v7SzJ8dx8RPtdvH2yoNgPtJfSWZ3WKzRdXluE6WxPeMFY7wGJNrqy+GAveN7ce9ZfFG9Zms5GWC0cQyXZpbFR1VSzpCsxccND1Q3Upnyrf
-          XT3W1/Rcb0gsPLmQg3GqE00j/st4sY1kmj289/4GYvBMJ5ZyvT1rBMgQIdRYtSTjxiNLUCP4VBY6lVWqTKSKEVgOSwMZ1bwxQA5YGan7JkCnL8xUy1FJSar2
-          uah8nygqY0wXlbNVtDYrO1D21ehaaXwahJeYlqvLJdjmUdkpkIOX4CMG55bTtzYbp8awBZtcTiMBSOkLIUc8iRfBWZIX/VD7Vhz3/zWjAYayJlQv3CdQ/8o9
-          hptrOzp1ihYXOy7OwDHlutplvDyJYd5RElbDpjBwugrRP5K4gnGygm5T22mo1uNMPmgOH1M2WRqdaC1hvW+pllbO7vNxmNpN8O1KAxAE5edCqxMafouqR3BZ
-          xdZ0Y86RbvVNTrnJGgmZIS/VtPXQN6C1ovLN8AaM+zCUrG7UYyxpC9DTbTzZHRgJo/GyrkOsw6eA2TU8mnMlQ3MtSxHlpGKjIl/dlFMaNGooD5gDDWd1aPUv
-          ViL1rqUgK2t9lRjvEusAlNzhvw9vuImbCoxVJWoi3Mpt7VaT7YCDtZaMAlBADpUbmaX3HAuQ8LwxLx/8pQb8VXpTWtMZ01ZpFzVtKW6tURGviiGCsHuJbpDB
-          51bG+jpgZt+XaEprFpXw1eY4u9oAStJpP5rCnzka0f0L2yapNLg/dxsRJ9sddXZjFgKxA+ves76wWp+F9lZG2AATbl8SrghR9VIyellnCqwR2qxs/EsF/ukl
-          UIaP3KDAe8pE60FEByeXWCCjSobUMYTG+H10aGp8X7ZsWhKIyw1MhtZsKLLVnAoYIxuH+MR55BxN66d0b2O0LoKid9YG+dEaAQpUf/vUeXluOnNpn+niCaRB
-          246WNLCdYcdMJlu3Z8JSP6iaSD5GgnE9Hu5q47QG9tWXL7T2lgA/Aa7WQ+YhB05ANc3XKA20qPhakmkHjYjFfEFhqC4Zop56LvE+jldGERhZdzpPYDmtZTex
-          VU6v1Sl0spw6hKC/2dfhU1txtcOmtLgSEF9hybUlZL9l97fOSK98XEpHeg42QKM8ruGgbCW0cuzac/hcPvn6WZnnzNDf5DpJ5XBp+d2pIe1MSmMiIW4b3xh7
-          nb3P8nMN0q3ZQ0UteEeV17IqbSw9OttHbSPD0nYF2SD8jS0f+nZxaNWx0hIFiC8jmRbSH4+f9KV9MXmRAwbWk8kx5y+jpDjWBADkEIOOi29GRbTlZiTwNF9F
-          +Rpj+Ubem+06zFsQZEYW3Ngnk7FGYCwRGAdbTK6t1PgKGljd8Q0CmFK+OX06IKkAinIF48njepcl+/rdyfZMlZtQaOi2OLxgb5mKkMNqXWdPOVE9AeKKRZBF
-          Lgoh9KhjrE6r4gKaxZihS2OU6HX1NVY7qGSjW6yz2h1ZcgqRoHABuKqo0elMI1FLhxmxvo9OYpbxKigAZHr5GIuvZYguPkswOQU+2Vylw4EgjerzMM+LCCQi
-          WFIe5YW2JuheHrx79s/D2euDJ/84+PVw9vPzV0/+oZeZEevk+I4+0X1qc06Dwr1AciO2KcOnvuBAZbMdDRmfJhius+rij9eU0TbrsXXlGVd5KIcbhCV4pOlx
-          pkLAGaaOrONM1yYdHYldjNzPKLjoxn+J/bv3cYmMpYOijKYX5usMdA6iRIVS+59KHllbkvCYb16eJKfrfE2l0OssOAuSFHesYneuo/bV0LDp4ws5dHMxuMER
-          tZ80WsN8HYZjTymfUAAuRR21txit2OUHmHRVjcwAfWFZVm9tR7eKwsxgfvzISZHd/6C6jd4ygEYBrM74c969TMBwomS9ijkoRqcd9qySO8fVvpwMbmFSDZlA
-          bhZzZ+mCd1VUAvIR5gkAW6erQXplMfaeRSANOD+S5ylVnxP1qb45k3XMsliEip6L7WcOrRvW77Wrte2BOK4ZzrrCw84whzia7JK8oxMOlbzAYyWTCmy/DSzq
-          Zmc0Mwt6ND/WE+orp7874NuqJOreQNkss1PYNOBmw837jePIxhnnB4P6zDqIXrjzcKDqSiK4etToiORl/xqdeTk1/2zfu+vdk8fFFfYkzX2cmwkAax7WpV+u
-          Q8w4CL2t/T1ooKdkYsRqwYOngyYNUg5izziOADaDeS/5EHN2FgDXt5Ezq6S6hMYmrJ6aWvOcCHxXRTNmLyZ6syCtCdcN+hqVPqynpFVtHsxUWY6vhGqPmbw7
-          /HRusH14wOBts+IRNzwJKCNmovaGZVZvdvi7e8wXWsOiNYocjYMXemfdalY4IhzueWV0/QaNl41RmMikxLI4/9He3ucCpvYPVXtJW0U/SfUZHiEPlrP4IkzX
-          JcquFufhlJCACGzAx15kF15WSq8idXi39NK3nwH6BtIqZTtnYJkifR/YRmlDo4qRH4sf23NhErs1WEr3DrTyRCV7pS2EdwcvXh++mT159fz54ZN3h08n7t6G
-          z07oytRmVQ7WeNDhJfHjj71kVGnlnREoKjGSinEkUG/VwjoLpWBmOQGQ+Is8i0KnZGpTYFCbBQ2hK8+tAKmhSc8CqJMtIDlo+ZqSpAuKjyaBSGm21jJGwVPi
-          pdFM3WypBZ7XRM7P0ROZ1HNyGkhPdqmWpI0tQFgEDU+LsLxAW0xuTOyfXD56U3foBmUPBVURALLuUYvQTJnNU2GYRDZzHXZFuqPklRNRE13ObIVsuPfAbufLSJi
-          NNeQikxaxS71EFxf5j4BRw16O9QYbNh2vpnTzQAVIVpJxr3+stQdFm1Yk4YlWDI8DftAHEh75h1Me0trjHZgzFh5ukihn8BYQHvekyG7btcwL2IvWFd5WKRz
-          HWyGZkMiD9AlysPSsmuC4KSTqqKaqivr+bMnhy/fHloTMTyxnijnAUy1OCvj4+wg4pIpLE6HtS1AMDhiL394/34nqEIDjd8cHjx9cegtI4b4RoYO+PZxtvsL
-          BSUm3/y2ex0oqgpJUzRPCQzYomiHlovjjAzMPdn50YMH3c6HL16/+4P76RE2tXvrDKOgChwUwza6upoeHpiFy3JoliBJGmI3eVNayVyrhYCU7PTCBYAcEliD
-          +hShN01rK+NX0GizSJWWNBYNHNz3MSy3V14u8TuYokO9VmZD7xRfvANsebIGjFpDyQ5ofIM36SanGXDLcdZcKPW0XJ+UFdchEYsFUYT5FoPlkE7E70v4+5oP
-          +Erzvz5pi+3xfTsl11xQV7h2qSwR+v0G42Kb2+Ip+GMnMTu36KhX8mzJwgDn0nFicJYS8PHnmOeWrxFSlZJBRKdU+GAqB6b0yY8QeC8TOOAYoEjvWrx89Q59
-          Ziqdphj4yaUs8ju5ZO8cd55n0FjTvUFcTOWrnSQPgGNAoLE6Bh/bkkGYH5XfNJOqSRKKr5DGLqxJGKdBggYx14bJHqEh82RNtRda9eMGkqBMBQYwhmd5EoHh
-          ryTf/qPHYsOLLWEgDlewTbDomSWDzCJwNgHEGGUZ4QanG60NhRGU3QSMivWfQ9sB4Y0FYGPUy1fWxXcPZ5wBlDF6maW0VKlLgPLOuNMCuwwwLxMzXBBeIUWc
-          jLJerAfmwleq8QxxRWkOHHT9ijIcrSza9a1W82gDVwxrrgtI5FT6GXUcMJnrpq6KbMltMrSmWuMCqVRz8YOEyM/TBSHCYsWMShphZveGPObne09BGLLKRNGWSxno
-          kraLKjHNYwK0p7o2a3/PbtVh7T8y+OUIR5oC+mZ3wCYFy627SHhXrhN9N0qYkIwOKlY6syOOhppXJPNgqqfNLvbUCMRIX8UXOopqjbBd3YLkadFBK00jFx9Z
-          dvN4L7Vu1eLlJ3+a1Y9yJJdHGlkePLdaB+LaK9zTS8ZezV71yiOhUBaoys8RU2lkuavQVaCW5VkoSwGbfAIITbeB5hk61hgkVnE5QRGB8VnUAcTnEzAwyjxF
-          gT3OcpkxA3GN18AbE84PSpbpG0lziTqY6AvFId1Vk9vucxcNmMODlWstmgQnt72Warj7Pmc9GQdjOT+9mI0ubUqv1jgzZltED9v4vrpB1WSKvz97+QEorD3I
-          hzR2QTDm5f7+5648rnK37K3DDy6iaTkwEHxXQngmQzMwFo0Kn/v73l794SKfzCQTIQJMqz48wD2OV+YBFe8JKMg4es1XFEPFQ6x0mrMH49vibb6MxfPn/3yB
-          dUhs+NC7MMpFshKKN/SbMQDhV2+JAejNfj3wnnIVDpk/SQVSEiT4PHgfixegetxXZmYFE+Z4oIzfOgiGSQ9AeT7gSZGXpRb6ZrSXZJ7KPY8sTF3QZOWhCsPZ
-          WKUJ7LkMDwUc7U2dxhGD9vHVHlJ9YgsCTzaUYe/Oae883nfGYB0lRiBdBlk328rUUp673O00WyMHYULPTSMfB0O/DxRNxMLH/VfquLHDrNZk+lohdgjQmKdJ
-          h//rit2tYsqgqDrxUh85MU/v/OPZa5WvCpHFalWvztcZrDbRfKYLordV/qKtaryjx5rQyQ9t4drQ4Ab1Xz3l0K2ZIi5HXZDTo36QU4OJEWFXTcyTpvcQDE7g
-          A8sG0S3LbtR5CkowSVtNHqGZLytjSeAKJDMWjxjLgAJEnYPz/itZ/QKffJwHxdOH1n6TZvXV0sP2SNjJ8AOltoZL20Gz3ns7e/bi1dPD4RJ0PqUR0xk6bhji
-          2n9o2yQWlkipD+Dtz3Oivy2LqQkZeWrPy1dxxvOwiskdi/CpzLSUxoXxwJQDURd7AzqMlu2AcU0+sB64QtObq2ZB5CBlll5SUi9EhKm5BNHYpaYjq23LLyYr
-          bBnLMSoifN3o2evZ08Nfnh+8O3zaS3ty7NtevUSn5dMcfMkkIXUcEWxa+kCMnhOAxfZIhcUtvsoCUVD78Cr9TCUYtFu/huelNGwUtUx+C12KhkxD+TcsyDYfv3BeL
-          ttCS79uY4Xwiq9aZ8KqMnU2N8wkej2yzyteST2HxLiiuJx8GDH3YGBwyecw3KayOf7qdKi+IIuI8IkaSez9jxOXZKwZA4oxSs3Hh64OBMrc55OBYp6ZrzwHe
-          UoVOXGkJbZYrANE45ySrmiV49SpTuhj5+8pvSUFZ+6j0xuDdYEkPm8SyoQ1z5DZ14I3gzK/pM1Knph7L837h3OG52PVhP5/BjvnBl4hQHezPCzrwVZ8Dqslj
-          npOtTxhy1OvEUi9UFslyKU0jVfJjN1RWjptAHYN0CBLuCYqkzpIsV/Pyt5z1Q+pwyNdunG0iqs35E2MttqNCTmrV6bQTUcqWJ5+axhD4uf0vGxFxduZToVld
-          7eBsTWX4vF+rITOSbdvXHnf6Xh13QmobzvUtXXD4qfKCucrg6xo2caW+bRx6v/WVCXkzwetWHBtLD1dte3Nj2WZlD71EzEvzICqHCkCzLAePiXWKHWRZENXT
-          xnRin1KzKrDFj5FDZTrAmvq+cWpLvWW3Sw05aD0Slh+gvSNLYnTFDIg4mRCuh5PDw1gWdou170hcnzQ8DTmQrojUbwnQ46C9QZHDIsZ9UcUZnsJDZv8EtzdP
-          gzJyDmxyZlQUY0YRrLSsDdOpJY2xLYj69vGvbQe/wvmpj68ngAWPV/iFKintRoMvESf+J+0xawRoGi4DvdadSaUiCPzZJFfTbOq0IF1lnsJvkdPX6mB+2j1J
-          JlfVp7omxSbNojXTlWCmMA6dwYzgE4wCYnNMwADLJ2HrrSeymMxS5dJkkfn+F1LabrhdnGXXFXq1b+FR/Q+/KboOiMlTtRZHFzuFsCTxanO/2+JIDTn11VqY
-          p9advfzh3t5nIrGXP9rb+zR1uUrO8L/5hTEyNSBo5DGyAe10w8iXnw6a+R3xYuxx9cYZmE9UF7LW1Ud4VH+MpkstSdoZU5QpyMiyiy1fitJprJOn2EFxQ83M
-          +Nw855gFq3KRV7xJFGyn2w+3SffuEvXNLCtNiFylSWUH8uUvcbdmWDMqkk6pUlC0N4UzU8xdgUkxk55l2YQOG5VyrUpz2+2ggipV8KUiH1v9ZQeW3a0hvAGq
-          PbURW8jgNPHq8hMWYLmy8Nt4c2+G5xGxbER6N/wuVFYeFJNXq/21y93FSAWgXK6IoyRXJWM79HIo/brYKl9Dn8hypHj+m+Szbb6mOsmU9QrWQxq5eIe1g9Gs
-          4WBiC1qEKyV+Jl2BtDF6A1jGHHvaDo3QZ3LeZE9oJGpOkGePWtTOU/MFZM134Cbq7EcdmwT2D5LCchDnTyBtK+OgofA7ev5aHX9TrUP5HTSYQJZRNYKpyK/V
-          tthTDnqa59HnKNm8SE7x5dZ+Q5Bjb6dmDyQAvyIA3Y4qdvRrrIgmxoverXMw209dWcdgOWmwPIkCsZwsvdkM5oeW1GxWp9Qd8Gqoi9BdOFFrO18o68y6BIUO
-          v27NxZ2xHSUjZ+wMl0fm9RTDwP8LeEm5ej1eFCZEhPDLjTDRYzbMUTxMklUtdlVsAC4wL/FQtjO1QxBpMULcoExM7GQKD2jImqYDAst7/Pp5WxOhGaNZy9M/
-          u2HVRJQvUFUQkOH79KQGwhVFptjAt+Sx9UHCg32nP/mtZUL9oIC2fOj1YIF8nT/+vJKhA/XeOAU7zvDabqQ2KV6BEMBZUoaNFVh3HsqqzK9RpmoXKzI5xqtd
-          eFDbpExbktQRnEeNCI6RCbmuiwzxGK1RjMi6FT7qQr9YxQF/rLpxuGpn0mS5JqPCSEAyuH/UCpxP/SOGPe24JjNnrsUkck4L064+kS9gHTNeYyRuEjVebC9g
-          i5/pCmM8DIEy3UFdMh/zNNg+beT4DTrkK9YnV3oaFCxWWQB9pnSeBpXezxMk5sYkED6WPgQswZ07ecM8KgonNOaOjU0d0fC65TEBwqJE9FxWlfxSC8nKpmaF
-          2cbVsKE2WN8UXV1DugQocsXvlfgCW6AHqsHa8nAR/uZaAfxf0S89uBxMNX9xhYqcqDhERhWwjIkqiaggIuMXBjx5/Tsf3cHAqQoC2D+qIygyg5bh/q0YaiN/
-          h77YLd+g8xbr4PGXWgb4USdb1ELPndk2Y+BriKwNno4RttXooWn1vOYBtqi1ztAUc9UR0a2NjXc+TP0rnAu+62FndM1MFSsbvzNRnwWT7Uv+AQlJWT79gjzR
-          faPGDZhbkQg5HLvV7vzHmuH/ljWo9d31xL85T3F4gqm73bJU/ntw3vpZQbWf9G+BwMhA+op/gjEwjqZuJaOM0RAmMgcebCf6FvFqIKgw0yc2g5AqxWCvYiVH
-          Eprxc7OQ0sHGWonXRYikAPFFgXoYqcxwFfFVqrgMVFCp3Tx+PSsNjkcYUcddX28IszLrE/GljJSAnlvyBy67v7aIgWaqo9yIQMWsS/n+xMfiSqa1NzJtjWd/
-          wgW6nviAqkZlivtNLE9bGq9lrbPH8s0EOFV2il7/sfM/n6WHMEh0AAA=
-          DSR_PATCH_GZIP
-          base64 --decode "$RUNNER_TEMP/native.patch.gz.b64" | gzip --decompress > "$RUNNER_TEMP/native.patch"
+          # These four binary Git blobs are the exact reviewed patch compressed
+          # with gzip, split solely for connector transport. Verify every blob
+          # and the complete decoded patch before changing either source file.
+          : > "$RUNNER_TEMP/native.patch.gz"
+          for blob in bd863d8af7d8a23d4eeaf43e9d2e71f3146abfce c3d70ac26d6ed054c2327f84e6c121359474425b bad2467c5f03453547060e969a285177a36e842d 06840cace11d146c0be037e1887c87e11315f5ac; do
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$blob" --jq .content | base64 --decode > "$RUNNER_TEMP/native.part"
+            test "$(git hash-object "$RUNNER_TEMP/native.part")" = "$blob"
+            cat "$RUNNER_TEMP/native.part" >> "$RUNNER_TEMP/native.patch.gz"
+          done
+          gzip --decompress --stdout "$RUNNER_TEMP/native.patch.gz" > "$RUNNER_TEMP/native.patch"
           test "$(wc -c < "$RUNNER_TEMP/native.patch")" -eq 29768
           echo "6bc8c1dd283e9e303a4e4b66ff54216e07a056d4223332e15d492946685507a3  $RUNNER_TEMP/native.patch" | sha256sum --check
           git apply --check "$RUNNER_TEMP/native.patch"
@@ -173,68 +68,27 @@ jobs:
           bash -n src/act_runner.sh
           bash -n scripts/tests/test_native_single_archives.sh
           bash scripts/tests/test_native_single_archives.sh
-      - name: Commit verified implementation directly to main
+      - name: Store tested Git objects without changing any branch
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Remove this workflow's write authority in the implementation commit.
-          # Do not retain a generic code-writing workflow or a patch replay job.
-          cat > .github/workflows/native-archive-regression.yml <<'DSR_READ_ONLY_WORKFLOW'
-          name: Native archive regression tests
-          on:
-            push:
-              branches: [main]
-              paths:
-                - src/act_runner.sh
-                - src/artifact_naming.sh
-                - src/config.sh
-                - scripts/tests/test_native_single_archives.sh
-                - .github/workflows/native-archive-regression.yml
-            workflow_dispatch:
-          permissions:
-            contents: read
-          concurrency:
-            group: native-archive-regression-main
-            cancel-in-progress: false
-          jobs:
-            native-archives:
-              runs-on: ubuntu-24.04
-              timeout-minutes: 20
-              steps:
-                - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-                  with:
-                    persist-credentials: false
-                - name: Install native archive regression dependencies
-                  shell: bash
-                  run: |
-                    set -euo pipefail
-                    sudo apt-get update
-                    sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip
-                    mkdir -p "$RUNNER_TEMP/dsr-test-bin"
-                    GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
-                    echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
-                - name: Validate actual native archive collection and receipts
-                  shell: bash
-                  run: |
-                    set -euo pipefail
-                    yq --version
-                    bash -n src/act_runner.sh
-                    bash -n scripts/tests/test_native_single_archives.sh
-                    bash scripts/tests/test_native_single_archives.sh
-          DSR_READ_ONLY_WORKFLOW
           git diff --check
-          # No source other than the reviewed runner may have been edited.
           test "$(git diff --name-only -- src scripts tests dsr)" = src/act_runner.sh
           test "$(git ls-files --others --exclude-standard)" = scripts/tests/test_native_single_archives.sh
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- src/act_runner.sh scripts/tests/test_native_single_archives.sh .github/workflows/native-archive-regression.yml
-          git commit -m 'fix(native): include pinned companions in strict single-binary archives' \
-            -m 'Apply the reviewed GH #29 repair: use the shared archive collector for singleton archive contracts; derive compression from exact primaries; retain raw and diagnostic behavior; normalize Windows executable suffixes.' \
-            -m 'Validated on a full Ubuntu checkout with real yq, Git objects, compiler-produced binaries, archive streams and receipt checks via test_native_single_archives.sh. No live remote release, signing or Rust build is claimed. Convert the one-time application workflow into read-only ongoing regression CI. Refs #29.'
-          # A concurrent main update is a conflict, never authority to overwrite.
-          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/main
-          printf 'Applied native archive implementation: %s\n' "$(git rev-parse HEAD)"
+          source_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@src/act_runner.sh --jq .sha)
+          test_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@scripts/tests/test_native_single_archives.sh --jq .sha)
+          test "$source_blob" = "$(git hash-object src/act_runner.sh)"
+          test "$test_blob" = "$(git hash-object scripts/tests/test_native_single_archives.sh)"
+          jq -nc --arg base "$(git rev-parse HEAD^{tree})" --arg source "$source_blob" --arg tests "$test_blob" \
+            '{base_tree:$base,tree:[{path:"src/act_runner.sh",mode:"100644",type:"blob",sha:$source},{path:"scripts/tests/test_native_single_archives.sh",mode:"100755",type:"blob",sha:$tests}]}' > "$RUNNER_TEMP/native-tree.json"
+          tree=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/trees" --input "$RUNNER_TEMP/native-tree.json" --jq .sha)
+          jq -nc --arg parent "$(git rev-parse HEAD)" --arg tree "$tree" \
+            '{message:"fix(native): include pinned companions in strict single-binary archives\n\nVerified with the full runner, production yq, real Git objects, compiler-produced binaries, archive streams and receipt checks. No remote release, signing or Rust build is claimed. Refs #29.",tree:$tree,parents:[$parent]}' > "$RUNNER_TEMP/native-commit.json"
+          commit=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" --input "$RUNNER_TEMP/native-commit.json" --jq .sha)
+          printf 'DSR_NATIVE_VERIFIED_PARENT %s\n' "$(git rev-parse HEAD)"
+          printf 'DSR_NATIVE_VERIFIED_SOURCE %s\n' "$source_blob"
+          printf 'DSR_NATIVE_VERIFIED_TEST %s\n' "$test_blob"
+          printf 'DSR_NATIVE_VERIFIED_TREE %s\n' "$tree"
+          printf 'DSR_NATIVE_VERIFIED_COMMIT %s\n' "$commit"
