@@ -24,6 +24,15 @@
       "minimum": 0,
       "description": "Number of recent items to keep"
     },
+    "keep_releases": {
+      "type": "boolean",
+      "description": "Whether artifacts of published releases were kept regardless of age"
+    },
+    "kept_for_releases": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Old artifact sets kept because dsr published their release"
+    },
     "pruned_count": {
       "type": "integer",
       "minimum": 0,

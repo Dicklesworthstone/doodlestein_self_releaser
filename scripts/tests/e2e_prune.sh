@@ -340,6 +340,96 @@ test_prune_respects_keep_last() {
     harness_teardown
 }
 
+# The layout dsr writes: artifacts/<tool>-<tag>/ beside its manifest, a
+# release journal for published tags, and UUID-named build runs with `latest`.
+seed_real_layout() {
+    local s="$DSR_STATE_DIR" run
+    mkdir -p "$s/artifacts" "$s/releases" "$s/builds/tool/v1.0.0"
+    for run in tool-v1.0.0 tool-v1.1.0 tool-v2.0.0; do
+        mkdir -p "$s/artifacts/$run"
+        echo payload > "$s/artifacts/$run/tool-linux-amd64.tar.gz"
+        printf '{"tool":"tool","version":"%s"}\n' "${run#tool-}" > "$s/artifacts/$run-manifest.json"
+    done
+    echo '{"uploaded":[]}' > "$s/releases/tool-v1.0.0-upload.json"
+    for run in 11111111-1111-4111-8111-111111111111 22222222-2222-4222-8222-222222222222 \
+        33333333-3333-4333-8333-333333333333 44444444-4444-4444-8444-444444444444; do
+        mkdir -p "$s/builds/tool/v1.0.0/$run"
+        echo '{}' > "$s/builds/tool/v1.0.0/$run/state.json"
+    done
+    ln -s 11111111-1111-4111-8111-111111111111 "$s/builds/tool/v1.0.0/latest"
+    # Oldest first; tool-v2.0.0 and run 4444... stay recent.
+    touch -d '90 days ago' "$s/artifacts/tool-v1.0.0" "$s/artifacts/tool-v1.0.0-manifest.json" \
+        "$s/builds/tool/v1.0.0/11111111-1111-4111-8111-111111111111"
+    touch -d '80 days ago' "$s/artifacts/tool-v1.1.0" "$s/artifacts/tool-v1.1.0-manifest.json" \
+        "$s/builds/tool/v1.0.0/22222222-2222-4222-8222-222222222222"
+    touch -d '70 days ago' "$s/builds/tool/v1.0.0/33333333-3333-4333-8333-333333333333"
+}
+
+test_prune_real_layout_keeps_releases_and_latest() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    if ! touch -d '1 day ago' "$TEST_TMPDIR" 2>/dev/null; then
+        skip "touch -d unavailable"
+        harness_teardown
+        return 0
+    fi
+    seed_real_layout
+    local s="$DSR_STATE_DIR" problems=()
+
+    exec_run "$DSR_CMD" --json prune --max-age 30 --keep-last 1 --force
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("exit $(exec_status)")
+    [[ ! -e "$s/artifacts/tool-v1.1.0" && ! -e "$s/artifacts/tool-v1.1.0-manifest.json" ]] ||
+        problems+=("old unreleased artifact set kept")
+    [[ -d "$s/artifacts/tool-v1.0.0" && -f "$s/artifacts/tool-v1.0.0-manifest.json" ]] ||
+        problems+=("published release artifacts removed")
+    [[ -d "$s/artifacts/tool-v2.0.0" ]] || problems+=("newest artifact set removed")
+    [[ -d "$s/builds/tool/v1.0.0/11111111-1111-4111-8111-111111111111" ]] ||
+        problems+=("run that latest points to removed")
+    [[ -d "$s/builds/tool/v1.0.0/44444444-4444-4444-8444-444444444444" ]] || problems+=("newest run removed")
+    [[ ! -e "$s/builds/tool/v1.0.0/22222222-2222-4222-8222-222222222222" &&
+       ! -e "$s/builds/tool/v1.0.0/33333333-3333-4333-8333-333333333333" ]] ||
+        problems+=("old UUID runs beyond keep-last kept")
+    exec_stdout | jq -e '.details.keep_releases == true and .details.kept_for_releases == 1' >/dev/null ||
+        problems+=("details do not report the kept release")
+
+    exec_run "$DSR_CMD" prune --max-age 30 --keep-last 1 --no-keep-releases --force
+    [[ ! -e "$s/artifacts/tool-v1.0.0" ]] || problems+=("--no-keep-releases kept the released set")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "prune removes old artifact sets and UUID runs, keeping releases, latest and keep-last"
+    else
+        fail "prune real layout: ${problems[*]}"
+        echo "stderr: $(exec_stderr | tail -10)"
+    fi
+    harness_teardown
+}
+
+test_prune_global_dry_run_deletes_nothing() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_minimal_config
+    if ! touch -d '1 day ago' "$TEST_TMPDIR" 2>/dev/null; then
+        skip "touch -d unavailable"
+        harness_teardown
+        return 0
+    fi
+    seed_real_layout
+    local before after
+    before=$(find "$DSR_STATE_DIR" | sort)
+
+    exec_run "$DSR_CMD" --json --dry-run prune --max-age 30 --keep-last 1 --force
+    after=$(find "$DSR_STATE_DIR" | sort)
+    if [[ "$(exec_status)" -eq 0 && "$before" == "$after" ]] &&
+       exec_stdout | jq -e '.details.dry_run == true and .details.pruned_count >= 3' >/dev/null; then
+        pass "global --dry-run prune lists items but deletes nothing"
+    else
+        fail "global --dry-run prune must not delete"
+        diff <(echo "$before") <(echo "$after") | head -5
+    fi
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: Error handling
 # ============================================================================
@@ -515,6 +605,8 @@ echo ""
 echo "Actual Prune Tests:"
 test_prune_removes_old_logs
 test_prune_respects_keep_last
+test_prune_real_layout_keeps_releases_and_latest
+test_prune_global_dry_run_deletes_nothing
 
 echo ""
 echo "Error Handling Tests:"

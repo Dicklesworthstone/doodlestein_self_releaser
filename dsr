@@ -10800,15 +10800,25 @@ EOF
 }
 
 cmd_prune() {
-    local dry_run=false
+    # The global --dry-run (dsr -n prune) must never delete either.
+    local dry_run="${DRY_RUN:-false}"
     local max_age_days=30
     local keep_last=5
+    local keep_releases=true
     local force=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run|-n)
                 dry_run=true
+                shift
+                ;;
+            --keep-releases|--keep-releases=true)
+                keep_releases=true
+                shift
+                ;;
+            --no-keep-releases|--keep-releases=false)
+                keep_releases=false
                 shift
                 ;;
             --max-age|--cutoff-days)
@@ -10833,8 +10843,14 @@ USAGE:
 OPTIONS:
     -n, --dry-run       Show what would be removed without deleting
         --max-age DAYS  Remove items older than DAYS (default: 30)
-        --keep-last N   Keep the most recent N build runs per tool/version (default: 5)
+        --keep-last N   Always keep the N most recent artifact sets per tool
+                        and build runs per tool/version (default: 5)
+        --keep-releases Never remove artifacts of a release dsr published (default)
+        --no-keep-releases
+                        Also remove old artifacts of published releases
         --force         Skip confirmation prompt
+
+A build run that `latest` points to is always kept (it is what resume uses).
 
 EXAMPLES:
     dsr prune --dry-run
@@ -10969,34 +10985,84 @@ EOF
         done < <(find "$state_dir/manifests" -type f -mtime +"$max_age_days" 2>/dev/null)
     fi
 
-    # Prune old artifacts (by version directories)
+    # Prune old artifact sets: $state_dir/artifacts/<tool>-<tag>/ and its
+    # <tool>-<tag>-manifest.json. The keep_last newest sets of each tool stay,
+    # and so (with --keep-releases) does every set whose release dsr
+    # published, recorded as releases/<tool>-<tag>-upload.json.
+    local kept_for_releases=0
     if [[ -d "$state_dir/artifacts" ]]; then
-        while IFS= read -r path; do
-            _prune_consider "$path"
-        done < <(find "$state_dir/artifacts" -mindepth 2 -maxdepth 2 -type d -mtime +"$max_age_days" 2>/dev/null)
+        local entry set_name set_tool set_manifest set_mtime
+        local -A set_seen=() set_group=() set_time=()
+        while IFS= read -r -d '' entry; do
+            set_name="${entry##*/}"
+            [[ -f "$entry" && "$set_name" == *-manifest.json ]] && set_name="${set_name%-manifest.json}"
+            [[ -d "$entry" || -f "$entry" ]] || continue
+            [[ -z "${set_seen[$set_name]:-}" ]] || continue
+            set_seen["$set_name"]=1
+            set_tool=""
+            for set_manifest in "$state_dir/artifacts/$set_name-manifest.json" \
+                "$state_dir/artifacts/$set_name"/*-manifest.json; do
+                [[ -f "$set_manifest" && ! -L "$set_manifest" ]] || continue
+                set_tool=$(jq -r '.tool // empty | strings' "$set_manifest" 2>/dev/null) && [[ -n "$set_tool" ]] && break
+            done
+            if [[ -z "$set_tool" && "$set_name" =~ ^(.+)-v?[0-9]+\.[0-9]+ ]]; then
+                set_tool="${BASH_REMATCH[1]}"
+            fi
+            set_group["$set_name"]="${set_tool:-$set_name}"
+            if [[ -e "$state_dir/artifacts/$set_name" ]]; then
+                set_mtime=$(_prune_mtime_epoch "$state_dir/artifacts/$set_name")
+            else
+                set_mtime=$(_prune_mtime_epoch "$state_dir/artifacts/$set_name-manifest.json")
+            fi
+            set_time["$set_name"]="$set_mtime"
+        done < <(find "$state_dir/artifacts" -mindepth 1 -maxdepth 1 \( -type d -o -type f \) -print0 2>/dev/null)
+
+        local -A group_kept=()
+        local group
+        while IFS=' ' read -r set_mtime set_name; do
+            [[ -n "$set_name" ]] || continue
+            group="${set_group[$set_name]}"
+            group_kept["$group"]=$(( ${group_kept[$group]:-0} + 1 ))
+            [[ ${group_kept[$group]} -le $keep_last ]] && continue
+            [[ "$set_mtime" -le "$cutoff_epoch" ]] || continue
+            if $keep_releases && [[ -e "$state_dir/releases/$set_name-upload.json" ]]; then
+                kept_for_releases=$((kept_for_releases + 1))
+                continue
+            fi
+            [[ -d "$state_dir/artifacts/$set_name" && ! -L "$state_dir/artifacts/$set_name" ]] &&
+                _prune_consider "$state_dir/artifacts/$set_name"
+            [[ -f "$state_dir/artifacts/$set_name-manifest.json" ]] &&
+                _prune_consider "$state_dir/artifacts/$set_name-manifest.json"
+        done < <(for set_name in "${!set_time[@]}"; do
+                     printf '%s %s\n' "${set_time[$set_name]}" "$set_name"
+                 done | sort -rn)
     fi
 
-    # Prune old build runs beyond keep_last
+    # Prune old build runs beyond keep_last: every run directory, whatever
+    # its ID scheme, except the one `latest` points to.
     if [[ -d "$state_dir/builds" ]]; then
-        local tool_dir version_dir
+        local tool_dir version_dir latest_run
         for tool_dir in "$state_dir/builds"/*; do
-            [[ -d "$tool_dir" ]] || continue
+            [[ -d "$tool_dir" && ! -L "$tool_dir" ]] || continue
             for version_dir in "$tool_dir"/*; do
-                [[ -d "$version_dir" ]] || continue
+                [[ -d "$version_dir" && ! -L "$version_dir" ]] || continue
+                latest_run=""
+                [[ -L "$version_dir/latest" ]] && latest_run=$(readlink "$version_dir/latest" 2>/dev/null)
 
                 local run_dirs=()
                 while IFS= read -r line; do
                     run_dirs+=("$line")
                 done < <(
-                    find "$version_dir" -maxdepth 1 -type d -name 'run-*' 2>/dev/null | while read -r dir; do
+                    find "$version_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | while read -r dir; do
                         local mtime
                         mtime=$(_prune_mtime_epoch "$dir")
                         echo "$mtime $dir"
-                    done | sort -rn | awk '{print $2}'
+                    done | sort -rn | cut -d' ' -f2-
                 )
 
                 local idx=0
-                for run_dir in "${run_dirs[@]}"; do
+                for run_dir in ${run_dirs[@]+"${run_dirs[@]}"}; do
+                    [[ "${run_dir##*/}" == "$latest_run" ]] && continue
                     idx=$((idx + 1))
                     if [[ $idx -le $keep_last ]]; then
                         continue
@@ -11035,11 +11101,15 @@ EOF
             --argjson dry_run "$dry_run" \
             --argjson cutoff_days "$max_age_days" \
             --argjson keep_last "$keep_last" \
+            --argjson keep_releases "$keep_releases" \
+            --argjson kept_for_releases "$kept_for_releases" \
             --argjson pruned_count "$pruned_count" \
             --argjson bytes_freed "$bytes_freed" \
             --argjson pruned_paths "$pruned_json" \
             --argjson errors "$errors_json" \
-            '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last, pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths, errors: $errors}')
+            '{state_dir: $state_dir, dry_run: $dry_run, cutoff_days: $cutoff_days, keep_last: $keep_last,
+              keep_releases: $keep_releases, kept_for_releases: $kept_for_releases,
+              pruned_count: $pruned_count, bytes_freed: $bytes_freed, pruned_paths: $pruned_paths, errors: $errors}')
         json_envelope "prune" "$status" "$exit_code" "$details_json"
     else
         if $dry_run; then

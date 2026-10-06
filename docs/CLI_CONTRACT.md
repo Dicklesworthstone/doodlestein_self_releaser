@@ -756,9 +756,13 @@ dsr prune [--dry-run] [--max-age <days>] [--keep-last <n>] [--force]
 |------|---------|-------------|
 | `--dry-run` | false | Show what would be deleted without deleting |
 | `--max-age` | 30 | Delete items older than N days |
-| `--keep-last` | 5 | Always keep the N most recent items per repo |
-| `--keep-releases` | true | Never delete artifacts for published releases |
+| `--keep-last` | 5 | Always keep the N most recent artifact sets per tool and build runs per tool/version |
+| `--keep-releases` | true | Never delete artifacts for published releases (`--no-keep-releases` to include them) |
 | `--force` | false | Skip confirmation prompt |
+
+Artifact sets are `artifacts/<tool>-<tag>/` with their `<tool>-<tag>-manifest.json`;
+a set is published when `releases/<tool>-<tag>-upload.json` exists. The build run
+`latest` points to is always kept. The global `--dry-run` applies.
 
 **Exit codes:**
 - `0`: Prune completed successfully
