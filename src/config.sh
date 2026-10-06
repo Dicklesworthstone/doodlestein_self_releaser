@@ -603,11 +603,12 @@ config_show() {
         echo "  repos.yaml:  $DSR_REPOS_FILE"
         echo ""
         echo "Values:"
+        # A key, or a section of dotted keys (signing -> signing.enabled).
         for k in "${!DSR_CONFIG[@]}"; do
-            if [[ -z "$key" || "$k" == "$key" ]]; then
+            if [[ -z "$key" || "$k" == "$key" || "$k" == "$key".* ]]; then
                 printf "  %-20s = %s\n" "$k" "${DSR_CONFIG[$k]}"
             fi
-        done
+        done | LC_ALL=C sort
     fi
 }
 

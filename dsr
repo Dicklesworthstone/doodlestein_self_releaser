@@ -262,6 +262,9 @@ cmd_config() {
         validate)
             cmd_config_validate "$@"
             ;;
+        migrate)
+            cmd_config_migrate "$@"
+            ;;
         edit)
             cmd_config_edit "$@"
             ;;
@@ -274,22 +277,26 @@ USAGE:
 
 SUBCOMMANDS:
     init        Initialize configuration directories and files
-    show        Show current configuration
+    show        Show current configuration (--section <name> for one part)
     get <key>   Get a specific config value
-    set <k>=<v> Set a config value
+    set <k>=<v> Set a config value (saved to config.yaml; requires yq)
     validate    Validate configuration files
+    migrate     Bring config.yaml to the current schema (backup first)
     edit        Open config in $EDITOR
 
 OPTIONS:
     --json      Output in JSON format
     --force     Overwrite existing files (init only)
+    --dry-run   Report migration changes without writing (migrate only)
 
 EXAMPLES:
     dsr config init              Create default config files
     dsr config show              Show all configuration
+    dsr config show --section signing
     dsr config get threshold_seconds
     dsr config set log_level=debug
     dsr config validate
+    dsr config migrate --dry-run
 EOF
             ;;
         *)
@@ -300,24 +307,28 @@ EOF
     esac
 }
 
+# Every config subcommand answers --json with one "config" envelope whose
+# details.action names the subcommand (schemas/config-details.json).
+_config_envelope() {
+    local exit_code="$1" details="$2" status="success"
+    [[ "$exit_code" -eq 0 ]] || status="error"
+    json_envelope "config" "$status" "$exit_code" "$details"
+}
+
 cmd_config_init() {
     local force=false
     [[ "${1:-}" == "--force" ]] && force=true
 
     if $JSON_MODE; then
-        local status
+        local status=0
         if $force; then
-            config_init --force >/dev/null 2>&1
-            status=$?
+            config_init --force >/dev/null 2>&1 || status=$?
         else
-            config_init >/dev/null 2>&1
-            status=$?
+            config_init >/dev/null 2>&1 || status=$?
         fi
-        if [[ $status -eq 0 ]]; then
-            json_envelope "config init" "success" 0 "{\"config_dir\": \"$DSR_CONFIG_DIR\", \"initialized\": true}"
-        else
-            json_envelope "config init" "error" $status "{\"error\": \"initialization failed\"}"
-        fi
+        _config_envelope "$status" "$(jq -nc --arg dir "$DSR_CONFIG_DIR" --arg file "$DSR_CONFIG_FILE" \
+            --argjson initialized "$([[ $status -eq 0 ]] && echo true || echo false)" \
+            '{action: "init", config_dir: $dir, config_file: $file, initialized: $initialized}')"
         return $status
     else
         if $force; then
@@ -329,11 +340,58 @@ cmd_config_init() {
 }
 
 cmd_config_show() {
-    if $JSON_MODE; then
-        config_show --json
-    else
-        config_show "$@"
+    local section=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --section)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "--section requires a name"; return 4; }
+                section="$2"
+                shift 2
+                ;;
+            --section=*)
+                section="${1#*=}"
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                return 4
+                ;;
+            *)
+                section="$1"
+                shift
+                ;;
+        esac
+    done
+
+    config_load
+    # A section is a key or a dotted prefix: `signing` shows signing.enabled.
+    local -a keys=()
+    local k
+    for k in "${!DSR_CONFIG[@]}"; do
+        [[ -z "$section" || "$k" == "$section" || "$k" == "$section".* ]] && keys+=("$k")
+    done
+    if [[ -n "$section" && ${#keys[@]} -eq 0 ]]; then
+        log_error "No configuration under: $section"
+        $JSON_MODE && _config_envelope 4 "$(jq -nc --arg section "$section" \
+            '{action: "show", section: $section, values: {}}')"
+        return 4
     fi
+
+    if ! $JSON_MODE; then
+        config_show "$section"
+        return $?
+    fi
+    local values='{}'
+    for k in ${keys[@]+"${keys[@]}"}; do
+        values=$(jq -c --arg k "$k" --arg v "${DSR_CONFIG[$k]}" '. + {($k): $v}' <<< "$values")
+    done
+    _config_envelope 0 "$(jq -nc --argjson values "$values" --arg section "$section" \
+        --arg config_dir "$DSR_CONFIG_DIR" --arg cache_dir "$DSR_CACHE_DIR" --arg state_dir "$DSR_STATE_DIR" \
+        --arg config_file "$DSR_CONFIG_FILE" --arg hosts_file "$DSR_HOSTS_FILE" --arg repos_file "$DSR_REPOS_FILE" '
+        {action: "show", config_dir: $config_dir, cache_dir: $cache_dir, state_dir: $state_dir,
+         config_file: $config_file, hosts_file: $hosts_file, repos_file: $repos_file,
+         section: (if $section == "" then null else $section end),
+         values: ($values | to_entries | sort_by(.key) | from_entries)}')"
 }
 
 cmd_config_get() {
@@ -349,11 +407,14 @@ cmd_config_get() {
 
     if [[ -z "$value" ]]; then
         log_error "Key not found: $key"
+        $JSON_MODE && _config_envelope 4 "$(jq -nc --arg key "$key" \
+            '{action: "get", key: $key, errors: [{code: "E031", message: "key not found"}]}')"
         return 4
     fi
 
     if $JSON_MODE; then
-        echo "{\"key\": \"$key\", \"value\": \"$value\"}"
+        _config_envelope 0 "$(jq -nc --arg key "$key" --arg value "$value" \
+            '{action: "get", key: $key, value: $value}')"
     else
         echo "$value"
     fi
@@ -368,28 +429,102 @@ cmd_config_set() {
 
     local key="${input%%=*}"
     local value="${input#*=}"
+    local status=0 reason=""
 
-    config_load
-    config_set "$key" "$value" --persist
+    # A one-shot CLI has no "in memory": the value is saved or the command fails.
+    if ! command -v yq &>/dev/null; then
+        log_error "Saving configuration requires yq (mikefarah/yq v4)"
+        status=3 reason="yq is not installed"
+    elif [[ ! -f "$DSR_CONFIG_FILE" ]]; then
+        log_error "No configuration file at $DSR_CONFIG_FILE; run 'dsr config init' first"
+        status=4 reason="configuration file not found"
+    else
+        config_load
+        config_set "$key" "$value" --persist || status=$?
+        [[ $status -eq 0 ]] || reason="could not write $DSR_CONFIG_FILE"
+    fi
 
     if $JSON_MODE; then
-        echo "{\"key\": \"$key\", \"value\": \"$value\", \"persisted\": true}"
+        _config_envelope "$status" "$(jq -nc --arg key "$key" --arg value "$value" \
+            --arg file "$DSR_CONFIG_FILE" --arg reason "$reason" '
+            {action: "set", key: $key, value: $value, config_file: $file, persisted: ($reason == "")}
+            + (if $reason == "" then {} else {errors: [{message: $reason,
+                code: (if ($reason | test("not found|not installed")) then "E031" else "E030" end)}]} end)')"
     fi
+    return $status
 }
 
 cmd_config_validate() {
+    local status=0
+    config_load
     if $JSON_MODE; then
-        config_load
-        if config_validate 2>/dev/null; then
-            json_envelope "config validate" "success" 0 "{\"valid\": true}"
-        else
-            json_envelope "config validate" "error" 4 "{\"valid\": false}"
-            return 4
-        fi
-    else
-        config_load
-        config_validate
+        config_validate 2>/dev/null || status=4
+        _config_envelope "$status" "$(jq -nc --arg file "$DSR_CONFIG_FILE" \
+            --argjson valid "$([[ $status -eq 0 ]] && echo true || echo false)" \
+            '{action: "validate", config_file: $file, valid: $valid}')"
+        return $status
     fi
+    config_validate
+}
+
+# Bring config.yaml to this dsr's schema version, backing it up first.
+# Schema 1.0.0 is the only version so far: migration stamps a missing
+# schema_version and refuses versions this dsr does not know.
+cmd_config_migrate() {
+    local dry_run="${DRY_RUN:-false}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n) dry_run=true; shift ;;
+            *) log_error "Unknown option: $1"; return 4 ;;
+        esac
+    done
+
+    local target="$DSR_SCHEMA_VERSION" from="" status=0 reason="" backup=""
+    local -a changed=()
+    if [[ ! -f "$DSR_CONFIG_FILE" ]]; then
+        status=4 reason="configuration file not found; run 'dsr config init'"
+    elif ! command -v yq &>/dev/null; then
+        status=3 reason="yq (mikefarah/yq v4) is required"
+    elif ! from=$(yq -r '.schema_version // "" | tostring' "$DSR_CONFIG_FILE" 2>/dev/null); then
+        status=4 reason="configuration file is not valid YAML"
+    elif [[ -z "$from" || "$from" == null ]]; then
+        from=""
+        changed+=(schema_version)
+    elif [[ "$from" != "$target" ]]; then
+        status=4 reason="unknown schema_version $from (this dsr supports $target)"
+    fi
+
+    if [[ $status -eq 0 && ${#changed[@]} -gt 0 ]]; then
+        if $dry_run; then
+            log_info "[DRY RUN] Would set schema_version: $target in $DSR_CONFIG_FILE (backup first)"
+        else
+            backup="$DSR_CONFIG_FILE.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+            if [[ -e "$backup" ]] || ! cp -p -- "$DSR_CONFIG_FILE" "$backup"; then
+                status=1 reason="could not create backup $backup" backup=""
+            elif ! DSR_SET_VALUE="$target" yq -i '.schema_version = strenv(DSR_SET_VALUE)' "$DSR_CONFIG_FILE"; then
+                status=1 reason="could not write $DSR_CONFIG_FILE (backup kept at $backup)"
+            else
+                log_ok "Migrated $DSR_CONFIG_FILE to schema $target (backup: $backup)"
+            fi
+        fi
+    elif [[ $status -eq 0 ]]; then
+        log_ok "$DSR_CONFIG_FILE is already at schema $target; nothing to migrate"
+    fi
+    [[ $status -eq 0 ]] || log_error "Config migration failed: $reason"
+
+    if $JSON_MODE; then
+        _config_envelope "$status" "$(jq -nc --arg file "$DSR_CONFIG_FILE" --arg from "$from" \
+            --arg to "$target" --arg backup "$backup" --arg reason "$reason" \
+            --argjson dry_run "$dry_run" \
+            --argjson changed "$(printf '%s\n' ${changed[@]+"${changed[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" '
+            {action: "migrate", config_file: $file,
+             from_version: (if $from == "" then null else $from end), to_version: $to,
+             changed_keys: $changed, backup_path: (if $backup == "" then null else $backup end),
+             dry_run: $dry_run} | with_entries(select(.value != null))
+            + (if $reason == "" then {} else {errors: [{message: $reason,
+                code: (if ($reason | test("not found|required")) then "E031" else "E030" end)}]} end)')"
+    fi
+    return $status
 }
 
 cmd_config_edit() {

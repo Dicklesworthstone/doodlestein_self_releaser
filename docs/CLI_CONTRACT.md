@@ -710,6 +710,13 @@ dsr config edit
 - Creates backup before migration
 - Reports all changes made
 
+Schema `1.0.0` is the only version so far: `migrate` stamps a missing
+`schema_version` (after a timestamped `config.yaml.bak.*` backup) and refuses a
+version it does not know (exit 4). `show --section <name>` selects a key or a
+dotted section (`signing` shows `signing.enabled`). `set` saves to
+`config.yaml` (requires yq) or fails; it never reports an unsaved value. Every
+`--json` answer is a `config` envelope with `details.action`.
+
 ---
 
 ### `dsr doctor`

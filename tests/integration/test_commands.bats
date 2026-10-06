@@ -285,7 +285,8 @@ _queued_release_run() {
     run harness_run_dsr check --all ntm
     assert_equal "0" "$status"
     grep -q 'api repos/Dicklesworthstone/ntm/actions/runs' "$TEST_TMPDIR/gh.calls"
-    ! grep -q 'actions/workflows/' "$TEST_TMPDIR/gh.calls"
+    run grep -q 'actions/workflows/' "$TEST_TMPDIR/gh.calls"
+    assert_equal "1" "$status"
 }
 
 @test "dsr check --json reports throttled runs in the documented shape" {
@@ -352,7 +353,8 @@ PY
     assert_contains "$output" "Throttled run detected: 12345"
     assert_contains "$output" "dsr fallback ntm --version v1.2.3"
     [[ ! -e "$DSR_STATE_DIR/fallback-12345.log" ]]
-    ! jq -e '.runs["12345"]' "$DSR_STATE_DIR/triggered.json" 2>/dev/null
+    run jq -e '.runs["12345"]' "$DSR_STATE_DIR/triggered.json"
+    [[ "$status" -ne 0 ]]
 }
 
 @test "dsr watch --auto-fallback starts the tool's fallback at the run's tag" {
@@ -531,6 +533,63 @@ PY
         skip "Config validate requires yq"
     fi
     assert_equal "0" "$status"
+}
+
+@test "dsr config set saves the value or fails, never claims an unsaved write" {
+    _dsr_json config set threshold_seconds=300
+    assert_equal "4" "$status"
+    echo "$json" | jq -e '.command == "config" and .status == "error" and
+        .details.action == "set" and .details.persisted == false'
+
+    harness_create_config
+    _dsr_json config set threshold_seconds=300
+    assert_equal "0" "$status"
+    echo "$json" | jq -e '.details.persisted == true'
+    run harness_run_dsr config get threshold_seconds
+    assert_contains "$output" "300"
+    grep -q '^threshold_seconds: "\{0,1\}300' "$DSR_CONFIG_DIR/config.yaml"
+}
+
+@test "dsr config show --section and get answer with config envelopes" {
+    harness_create_config
+    _dsr_json config show --section signing
+    assert_equal "0" "$status"
+    echo "$json" | jq -e '.command == "config" and .details.action == "show" and
+        .details.section == "signing" and .details.values == {"signing.enabled": "false"}'
+
+    _dsr_json config show --section no_such_section
+    assert_equal "4" "$status"
+
+    _dsr_json config get log_level
+    echo "$json" | jq -e '.command == "config" and .details == {"action": "get", "key": "log_level", "value": "debug"}'
+}
+
+@test "dsr config migrate stamps a missing schema_version after a backup" {
+    harness_create_config
+    sed -i.orig '/^schema_version/d' "$DSR_CONFIG_DIR/config.yaml"
+    rm -f "$DSR_CONFIG_DIR/config.yaml.orig"
+
+    _dsr_json config migrate --dry-run
+    assert_equal "0" "$status"
+    echo "$json" | jq -e '.details.dry_run and .details.changed_keys == ["schema_version"]'
+    run grep -q '^schema_version' "$DSR_CONFIG_DIR/config.yaml"
+    assert_equal "1" "$status"
+
+    _dsr_json config migrate
+    assert_equal "0" "$status"
+    local backup
+    backup=$(echo "$json" | jq -r '.details.backup_path')
+    [[ -f "$backup" ]]
+    run grep -q '^schema_version' "$backup"
+    assert_equal "1" "$status"
+    grep -q '^schema_version: "\{0,1\}1.0.0' "$DSR_CONFIG_DIR/config.yaml"
+
+    _dsr_json config migrate
+    echo "$json" | jq -e '.details.from_version == "1.0.0" and .details.changed_keys == []'
+
+    sed -i.orig 's/^schema_version.*/schema_version: "9.9.9"/' "$DSR_CONFIG_DIR/config.yaml"
+    _dsr_json config migrate
+    assert_equal "4" "$status"
 }
 
 # ============================================================================
