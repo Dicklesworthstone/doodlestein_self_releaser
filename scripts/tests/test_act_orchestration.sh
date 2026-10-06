@@ -572,8 +572,8 @@ else
     fail "act_generate_manifest mislabeled targets: linux_amd=$linux_amd_target linux_arm=$linux_arm_target windows=$windows_target darwin=$darwin_target"
 fi
 
-# Spot-check the musl filename pattern — it must collapse to "linux/<arch>"
-# (libc choice is a filename detail, not a separate dsr target).
+# The musl filename keeps the scheduling platform "linux/<arch>", while
+# target_triple preserves its configured libc identity in the receipt.
 mkdir -p "$TEMP_DIR/musl"
 echo "musl-amd64-binary" > "$TEMP_DIR/musl/testool-v1.0.0-linux_musl_amd64.tar.gz"
 musl_result=$(jq -nc --arg dir "$TEMP_DIR/musl" '{
@@ -582,12 +582,32 @@ musl_result=$(jq -nc --arg dir "$TEMP_DIR/musl" '{
   status: "success", summary: {total: 1, success: 1, failed: 0},
   targets: [{ platform: "linux/amd64", host: "trj", method: "act", status: "success", artifact_dir: $dir }]
 }')
-musl_target=$(act_generate_manifest "$musl_result" "" | jq -r '.artifacts[0].target')
-
-if [[ "$musl_target" == "linux/amd64" ]]; then
-    pass "act_generate_manifest maps linux_musl_amd64 → linux/amd64"
+musl_status=0
+musl_manifest=$(act_generate_manifest "$musl_result" "" \
+    2> "$TEMP_DIR/musl-unconfigured.stderr") || musl_status=$?
+if [[ "$musl_status" -eq 4 && -z "$musl_manifest" ]] && \
+   grep -Fq 'unconfigured target variant' "$TEMP_DIR/musl-unconfigured.stderr"; then
+    pass "act_generate_manifest refuses musl under the default GNU-only configuration"
 else
-    fail "act_generate_manifest mapped musl variant to '$musl_target' (expected linux/amd64)"
+    fail "act_generate_manifest admitted an unconfigured musl variant (status $musl_status)"
+fi
+
+# Isolate the explicit variant policy so the remaining testool build and
+# orchestration fixtures retain their own unchanged configuration.
+yq '.tool_name="musltestool" |
+    .target_triples."linux/amd64"=["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]' \
+    "$ACT_REPOS_DIR/testool.yaml" > "$ACT_REPOS_DIR/musltestool.yaml"
+musl_result=$(jq '.tool="musltestool"' <<< "$musl_result")
+musl_status=0
+musl_manifest=$(act_generate_manifest "$musl_result" "") || musl_status=$?
+musl_target=$(jq -r '.artifacts[0].target' <<< "$musl_manifest")
+musl_triple=$(jq -r '.artifacts[0].target_triple' <<< "$musl_manifest")
+
+if [[ "$musl_status" -eq 0 && "$musl_target" == "linux/amd64" && \
+      "$musl_triple" == "x86_64-unknown-linux-musl" ]]; then
+    pass "act_generate_manifest maps configured musl to linux/amd64 with its explicit target_triple"
+else
+    fail "act_generate_manifest mapped configured musl to '$musl_target' / '$musl_triple' (status $musl_status)"
 fi
 
 echo ""
@@ -2515,7 +2535,7 @@ if [[ $closure_alias_command_status -eq 0 ]] && \
         "$closure_alias_command_file" && \
    grep -Fq 'ancestor=${physical_source_root%/*}' "$closure_alias_command_file" && \
    grep -Fq 'cd "$physical_source_root"' "$closure_alias_command_file" && \
-   grep -Fq 'manifest-path "$physical_source_root/Cargo.toml"' \
+   grep -Fq "'--manifest-path', str(pathlib.Path.cwd() / 'Cargo.toml')" \
         "$closure_alias_command_file"; then
     pass "strict Cargo metadata normalizes the macOS /tmp alias at the producer"
 else
