@@ -9248,13 +9248,21 @@ EOF
     # The dry-run path must also remain entirely free of filesystem writes.
     local checks_status="pending" build_status="pending" verification_status="pending"
     local signing_status="skipped" release_status="pending" artifacts_count=0
+    # steps[] (schemas/fallback-details.json): the throttle check, then build
+    # (quality gate, build, verification, signing), then release. Each step's
+    # outcome follows from the phase that ended the run.
+    local fallback_check_step="null" fallback_trigger=""
+    local fallback_build_started_ms="" fallback_release_started_ms=""
+    _fallback_now_ms() {
+        _get_ms_timestamp 2>/dev/null || echo $(( $(date +%s) * 1000 ))
+    }
 
     _fallback_result() {
         local rc="$1" phase="${2:-complete}" error="${3:-}" status="success" details
         if [[ "$phase" == "plan" ]]; then
             status="dry_run"
         elif [[ "$rc" != 0 ]]; then
-            status="failed"
+            status="error"
             [[ "$rc" == 1 ]] && status="partial"
         fi
         if $JSON_MODE; then
@@ -9268,13 +9276,34 @@ EOF
                 --argjson skip_checks "$skip_checks" --argjson resume "$resume" \
                 --arg resume_run_id "$resume_run_id" \
                 --argjson duration "$(($(date +%s) - start_time))" \
-                '{tool:$tool,version:$version,repo:$repo,run_id:$run_id,
+                --argjson rc "$rc" --argjson now_ms "$(_fallback_now_ms)" \
+                --argjson check_step "$fallback_check_step" --arg trigger "$fallback_trigger" \
+                --arg build_started "$fallback_build_started_ms" \
+                --arg release_started "$fallback_release_started_ms" '
+                def step($command; $failed; $started; $ended):
+                    {command: $command,
+                     status: (if $failed | not then "success" elif $rc == 1 then "partial" else "error" end),
+                     exit_code: (if $failed then $rc else 0 end),
+                     duration_ms: ([($ended - $started), 0] | max)}
+                    + (if $failed and $error != "" then {error: $error} else {} end);
+                ($phase | IN("checks", "build", "verification", "signing")) as $build_failed |
+                ($now_ms) as $end |
+                {tool:$tool,version:$version,repo:$repo,run_id:$run_id,
                   output_dir:$output_dir,phase:$phase,error:(if $error=="" then null else $error end),
                   phases:{checks:$checks,build:$build,verification:$verification,
                           signing:$signing,release:$release},
+                  steps: ([
+                      ($check_step // empty),
+                      (if $build_started == "" then empty else
+                          step("build"; $build_failed; ($build_started | tonumber);
+                               (if $release_started == "" then $end else ($release_started | tonumber) end)) end),
+                      (if $release_started == "" then empty else
+                          step("release"; $phase == "release"; ($release_started | tonumber); $end) end)
+                  ]),
                   artifacts_count:$artifacts,duration_seconds:$duration,
                   build_only:$build_only,skip_checks:$skip_checks,resume:$resume,
-                  resume_run_id:$resume_run_id}') || return 4
+                  resume_run_id:$resume_run_id}
+                + (if $trigger == "" then {} else {trigger: $trigger} end)') || return 4
             json_envelope fallback "$status" "$rc" "$details"
         else
             log_info "Fallback $status: $tool_name $tag (phase: $phase; artifacts: $artifacts_count)"
@@ -9360,6 +9389,34 @@ EOF
             return 4
         fi
     fi
+
+    # Throttle check: records why the fallback ran. It never blocks one that
+    # was asked for, and a build-only run publishes nothing, so it skips it.
+    if ! $build_only; then
+        local check_started check_result="" check_rc=0 check_workflow check_threshold
+        check_started=$(_fallback_now_ms)
+        check_workflow=$(config_get_tool_field "$tool_name" "workflow" "" 2>/dev/null) || check_workflow=""
+        config_load 2>/dev/null || true
+        check_threshold=$(config_get threshold_seconds 600 2>/dev/null) || check_threshold=600
+        [[ "$check_threshold" =~ ^[1-9][0-9]{0,6}$ ]] || check_threshold=600
+        check_result=$(_check_repo "$repo" "$check_threshold" "$(date +%s)" "${check_workflow##*/}" 2>/dev/null) ||
+            check_rc=$?
+        jq -e 'type == "object"' <<< "$check_result" >/dev/null 2>&1 || check_result='{}'
+        case "$check_rc" in
+            1) fallback_trigger=$(jq -r --argjson t "$check_threshold" '"release workflow throttled: \((.queued_count // 0) + (.stuck_in_progress_count // 0)) run(s) over \($t)s"' <<< "$check_result")
+               log_info "Fallback trigger: $fallback_trigger" ;;
+            0) fallback_trigger="manual: no throttled release run detected"
+               log_warn "No throttled run of $repo's release workflow detected; continuing as requested" ;;
+            *) fallback_trigger="manual: throttle check unavailable"
+               log_warn "Could not check $repo for throttling (exit $check_rc); continuing as requested" ;;
+        esac
+        fallback_check_step=$(jq -nc --argjson rc "$check_rc" --argjson started "$check_started" \
+            --argjson ended "$(_fallback_now_ms)" --argjson result "$check_result" '
+            {command: "check", status: (if $rc <= 1 then "success" else "error" end), exit_code: $rc,
+             throttled: ($rc == 1), duration_ms: ([($ended - $started), 0] | max)}
+            + (if $rc > 1 then {error: ($result.error // "throttle check failed")} else {} end)')
+    fi
+    fallback_build_started_ms=$(_fallback_now_ms)
 
     local -a quality_args=("$tool_name" --work-dir "$local_path")
     $skip_checks && quality_args+=(--skip-checks)
@@ -9516,6 +9573,7 @@ EOF
     if $build_only; then
         release_status="skipped"
     else
+        fallback_release_started_ms=$(_fallback_now_ms)
         local -a release_args=("$tool_name" "$version" --artifacts "$output_dir")
         if $resume && [[ "$contract" == null ]]; then
             local scan

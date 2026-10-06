@@ -644,6 +644,13 @@ This is the main command for automated fallback. Equivalent to:
 dsr check --repo $REPO && dsr build --repo $REPO && dsr release --repo $REPO
 ```
 
+The check step records why the fallback ran (`details.trigger`, e.g. "release
+workflow throttled: 1 run(s) over 600s"); it does not block a fallback that was
+asked for, since `dsr check` itself exits 1 exactly when throttled. Its step
+carries `throttled` and the check's own exit code. The build step covers the
+quality gate, build, artifact verification and signing; `--build-only` runs
+the build step alone. `details.steps[]` lists the steps that ran.
+
 ---
 
 ### `dsr repos`

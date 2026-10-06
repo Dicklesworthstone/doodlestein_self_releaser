@@ -21,6 +21,12 @@ act_load_repo_config() { return 0; }
 act_get_local_path() { printf '%s\n' "$CASE/source"; }
 act_get_repo() { printf '%s\n' owner/tool; }
 act_get_targets() { printf '%s\n' "$TARGETS"; }
+# The throttle check finds one queued release run: the fallback's trigger.
+_check_repo() {
+    printf 'THROTTLE %s\n' "$1" >> "$CALLS"
+    printf '{"repo":"%s","status":"throttled","queued_count":1,"stuck_in_progress_count":0}\n' "$1"
+    return 1
+}
 config_get_tool_field() { printf '\n'; }
 config_get_release_contract_json() { printf '%s\n' "$CONTRACT"; }
 config_validate_release_contract() { return "$CONFIG_RC"; }
@@ -199,7 +205,11 @@ test_success() {
 }
 test_build_failure() {
     setup "build-$1"; BUILD_RC="$1"; run_fallback
-    [[ "$RC" == "$1" ]] && one_result && blocked
+    [[ "$RC" == "$1" ]] && one_result && blocked &&
+        jq -e --argjson rc "$1" '[.details.steps[].command] == ["check", "build"] and
+            .details.steps[0].throttled and .details.steps[1].exit_code == $rc and
+            .details.steps[1].status == (if $rc == 1 then "partial" else "error" end) and
+            (.details.trigger | startswith("release workflow throttled"))' "$CASE/stdout" >/dev/null
 }
 test_manifest_failure() {
     setup "manifest-$1"; MANIFEST_MODE="$1"; run_fallback
@@ -233,12 +243,15 @@ test_quality_failure() {
 }
 test_build_only() {
     setup build_only; run_fallback --build-only
-    [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^RELEASE' "$CALLS" &&
-        jq -e '.details.phases.release=="skipped"' "$CASE/stdout" >/dev/null
+    [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^RELEASE\|^THROTTLE' "$CALLS" &&
+        jq -e '.details.phases.release=="skipped" and [.details.steps[].command] == ["build"]' \
+            "$CASE/stdout" >/dev/null
 }
 test_release_failure() {
     setup "release-$1"; RELEASE_RC="$1"; run_fallback
-    [[ "$RC" == "$1" && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^NOTIFY fallback.success' "$CALLS"
+    [[ "$RC" == "$1" && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^NOTIFY fallback.success' "$CALLS" &&
+        jq -e --argjson rc "$1" '[.details.steps[] | [.command, .exit_code]] ==
+            [["check", 1], ["build", 0], ["release", $rc]]' "$CASE/stdout" >/dev/null
 }
 test_resume_reaches_build() {
     setup resume; checkpoint failed; run_fallback --resume

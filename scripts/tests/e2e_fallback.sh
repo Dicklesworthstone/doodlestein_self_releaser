@@ -414,6 +414,11 @@ if [[ "$1" == "api" ]]; then
       if [[ "$page" == 1 ]]; then cat "$state/assets.json"; else echo '[]'; fi ;;
     repos/testuser/test-tool/releases/assets/*:GET)
       cat "$state/asset-${endpoint##*/}" ;;
+    repos/testuser/test-tool/actions/workflows/release.yml/runs\?per_page=*:GET)
+      # One release run queued for an hour: the reason the fallback runs.
+      jq -nc --arg created "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" \
+        '{workflow_runs: [{id: 42, status: "queued", created_at: $created, name: "Release",
+          path: ".github/workflows/release.yml", head_branch: "v1.2.3"}]}' ;;
     *)
       echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
   esac
@@ -540,6 +545,31 @@ test_fallback_pipeline_mocked() {
         fail "fallback should report artifacts_count >= 1"
     fi
 
+    # Contract steps: the throttle check (why it ran), build, release.
+    if echo "$output" | jq -e '.details.repo == "testuser/test-tool" and
+            [.details.steps[].command] == ["check", "build", "release"] and
+            (.details.steps[0] | .throttled == true and .exit_code == 1 and .status == "success") and
+            ([.details.steps[1:][] | .status == "success" and .exit_code == 0] | all) and
+            (.details.trigger | startswith("release workflow throttled: 1 run(s) over 600s"))' >/dev/null 2>&1; then
+        pass "fallback reports check/build/release steps and the throttle that triggered it"
+    else
+        fail "fallback should report contract steps and trigger"
+        echo "steps: $(echo "$output" | jq -c '{steps: .details.steps, trigger: .details.trigger}' 2>/dev/null)"
+    fi
+    if python3 -c 'import jsonschema' 2>/dev/null; then
+        if printf '%s\n' "$output" | python3 -I -c '
+import json, sys, jsonschema
+doc = json.load(sys.stdin)
+root = sys.argv[1]
+for name, instance in (("envelope.json", doc), ("fallback-details.json", doc["details"])):
+    jsonschema.Draft202012Validator(json.load(open(f"{root}/schemas/{name}"))).validate(instance)
+' "$PROJECT_ROOT" 2>/dev/null; then
+            pass "fallback envelope and details satisfy the published schemas"
+        else
+            fail "fallback output should satisfy envelope.json and fallback-details.json"
+        fi
+    fi
+
     local act_calls gh_calls curl_calls
     act_calls=$(mock_call_count "act")
     gh_calls=$(mock_call_count "gh")
@@ -619,7 +649,8 @@ test_fallback_build_only_mocked() {
     local output
     output=$(exec_stdout)
 
-    if echo "$output" | jq -e '.details.phases.build == "success" and .details.phases.release == "skipped"' >/dev/null 2>&1; then
+    if echo "$output" | jq -e '.details.phases.build == "success" and .details.phases.release == "skipped" and
+            [.details.steps[].command] == ["build"] and (.details | has("trigger") | not)' >/dev/null 2>&1; then
         pass "fallback --build-only reports build success and skipped release"
     else
         fail "fallback --build-only should report build success and skipped release"
