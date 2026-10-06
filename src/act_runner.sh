@@ -209,24 +209,44 @@ _act_stream_workspace_zip() {
 # Resolve the native workspace archive format from the per-repository build
 # contract.  Native collection used to hard-code gzip for every Unix target,
 # even when artifact_naming and the strict release contract required tar.xz.
-# A configured format is authoritative; an unsupported value fails closed.
+# An explicit format is authoritative; absent one, an archived strict primary
+# supplies its compression format before platform defaults. This also covers
+# singleton archives, which previously got their format only during staging.
 _act_workspace_archive_format() {
     local config_file="$1"
     local platform="$2"
     local target_os="${platform%%/*}"
-    local format=""
+    local format="" config_json
+    local purpose="${3:-${build_purpose:-release}}"
 
+    [[ "$purpose" == release || "$purpose" == diagnostic-native ]] || return 4
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
-    command -v yq &>/dev/null || return 3
-    format=$(DSR_TARGET_OS="$target_os" yq -r \
-        '.archive_format[strenv(DSR_TARGET_OS)] // ""' "$config_file" 2>/dev/null) || return 4
-    if [[ -z "$format" || "$format" == "null" ]]; then
-        if [[ "$platform" == windows/* ]]; then
-            format="zip"
-        else
-            format="tar.gz"
-        fi
-    fi
+    command -v yq &>/dev/null && command -v jq &>/dev/null || return 3
+    config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || return 4
+    format=$(jq -ers --arg os "$target_os" --arg target "$platform" --arg purpose "$purpose" '
+        def compression:
+            if endswith(".tar.gz") or endswith(".tgz") then "tar.gz"
+            elif endswith(".tar.xz") then "tar.xz"
+            elif endswith(".zip") then "zip" else "" end;
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("expected one repository configuration") end |
+        (if .archive_format == null then ""
+         elif (.archive_format | type) == "string" then .archive_format
+         elif (.archive_format | type) == "object" then
+             if .archive_format[$os] == null then "" else .archive_format[$os] end
+         else error("archive_format must be a string or OS mapping") end) as $configured |
+        (if ($configured | type) != "string" then error("invalid archive format")
+         elif $configured == "tgz" then "tar.gz" else $configured end) as $format |
+        (if $purpose == "release" then (.release_contract.exact_primary_assets[$target] // "")
+         else "" end) as $primary |
+        (if ($primary | type) == "string" then ($primary | compression)
+         else error("invalid exact primary name") end) as $required |
+        if $format != "" and $required != "" and $format != $required
+        then error("archive format differs from exact primary contract")
+        elif $format != "" then $format
+        elif $required != "" then $required
+        elif $os == "windows" then "zip" else "tar.gz" end
+    ' <<< "$config_json") || return 4
     case "$format" in
         tar.gz|tar.xz|zip) printf '%s\n' "$format" ;;
         *)
@@ -238,14 +258,26 @@ _act_workspace_archive_format() {
 
 # A target override replaces the complete executable list. Use this same
 # selection for collection, archive validation and final manifest validation.
+# Without a workspace list, an archived release primary is a singleton archive
+# inventory. Sending it through the existing collector stages pinned Git
+# include_files BEFORE the archive receipt is frozen, rather than packaging a
+# bare binary later and silently skipping companions (GH #29). Empty target
+# overrides still discard the workspace list, selecting only binary_name for
+# archived primaries, just as native collection already does for that case.
+# Raw primaries and configurations without a contract remain unchanged.
+# Match the naming resolver's existing purpose context. Diagnostic singleton
+# builds must not start using release-only archive names or include policies.
 _act_workspace_binaries_for_target() {
     local config_file="$1" target="$2" config_json selected binary normalized
+    local purpose="${3:-${build_purpose:-release}}"
+    [[ "$purpose" == release || "$purpose" == diagnostic-native ]] || return 4
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || return 4
-    selected=$(jq -ce --arg target "$target" '
+    selected=$(jq -ces --arg target "$target" --arg purpose "$purpose" '
         def names: type == "array" and all(.[];
             type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$")
             and (contains("\n") | not));
+        if length == 1 then .[0] else error("expected one repository configuration") end |
         if type != "object" then error("invalid repository config")
         elif (has("workspace_binaries") and (.workspace_binaries | names | not))
             then error("invalid workspace_binaries")
@@ -254,8 +286,20 @@ _act_workspace_binaries_for_target() {
                 (type == "object" and all(.[]; names)) | not))
             then error("invalid workspace_binaries_by_target")
         else (.workspace_binaries_by_target // {}) as $overrides |
-            if ($overrides | has($target)) then $overrides[$target]
-            else (.workspace_binaries // []) end
+            (if ($overrides | has($target)) then $overrides[$target]
+             else (.workspace_binaries // []) end) as $binaries |
+            if ($binaries | length) > 0 then $binaries
+            elif $purpose != "release" then []
+            elif .release_contract == null then []
+            elif (.release_contract | type) != "object" or
+                 (.release_contract.exact_primary_assets | type) != "object"
+            then error("invalid release archive contract")
+            else .release_contract.exact_primary_assets[$target] as $primary |
+                if ($primary | type) != "string" then error("missing exact primary for target")
+                elif ($primary | test("\\.(tar\\.gz|tgz|tar\\.xz|zip)$")) then
+                    [.binary_name] | if names then . else error("archive requires binary_name") end
+                else [] end
+            end
         end
     ' <<< "$config_json") || return 4
     local -A seen=()
@@ -5643,7 +5687,9 @@ act_get_remote_artifact_path() {
     local remote_artifact_path="$artifact_base/$binary_name"
     if [[ "$platform" == windows/* ]]; then
         remote_artifact_path="${remote_artifact_path//\\//}"
-        remote_artifact_path+=".exe"
+        # The archive inventory already normalizes an explicit .exe suffix.
+        # Collection must not turn that selected executable into app.exe.exe.
+        remote_artifact_path="${remote_artifact_path%.[eE][xX][eE]}.exe"
     fi
 
     printf '%s\n' "$remote_artifact_path"

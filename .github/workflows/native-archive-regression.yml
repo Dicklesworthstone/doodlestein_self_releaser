@@ -1,69 +1,49 @@
-# Apply only the reviewed, hash-pinned GH #29 patch to its exact preimage.
-# This job creates verified Git objects only. It never changes a branch or
-# publishes a release; main is advanced separately after the result is reviewed.
 name: Native archive regression tests
 on:
   push:
     branches: [main]
     paths:
+      - src/act_runner.sh
+      - src/artifact_naming.sh
+      - src/config.sh
+      - scripts/tests/test_native_single_archives.sh
       - .github/workflows/native-archive-regression.yml
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
-  group: native-archive-repair-macos
-  cancel-in-progress: true
+  group: native-archive-regression-main
+  cancel-in-progress: false
 jobs:
-  apply-and-verify:
-    if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser'
-    runs-on: macos-15
+  native-archives:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Require exact reviewed runner preimage
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git hash-object src/act_runner.sh)" = 2feee5248e2c21fb3c8b51861e1a38166ccfc70f
-          test ! -e scripts/tests/test_native_single_archives.sh
-          test -z "$(git status --porcelain)"
-      - name: Apply digest-pinned native archive implementation and regressions
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # These four binary Git blobs are the exact reviewed patch compressed
-          # with gzip, split solely for connector transport. Verify every blob
-          # and the complete decoded patch before changing either source file.
-          : > "$RUNNER_TEMP/native.patch.gz"
-          for blob in bd863d8af7d8a23d4eeaf43e9d2e71f3146abfce c3d70ac26d6ed054c2327f84e6c121359474425b bad2467c5f03453547060e969a285177a36e842d 06840cace11d146c0be037e1887c87e11315f5ac; do
-            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$blob" --jq .content | base64 -d > "$RUNNER_TEMP/native.part"
-            test "$(git hash-object "$RUNNER_TEMP/native.part")" = "$blob"
-            cat "$RUNNER_TEMP/native.part" >> "$RUNNER_TEMP/native.patch.gz"
-          done
-          gzip --decompress --stdout "$RUNNER_TEMP/native.patch.gz" > "$RUNNER_TEMP/native.patch"
-          test "$(wc -c < "$RUNNER_TEMP/native.patch")" -eq 29768
-          echo "6bc8c1dd283e9e303a4e4b66ff54216e07a056d4223332e15d492946685507a3  $RUNNER_TEMP/native.patch" | shasum -a 256 --check
-          git apply --check "$RUNNER_TEMP/native.patch"
-          git apply "$RUNNER_TEMP/native.patch"
-          git diff --check
-          git diff -- src/act_runner.sh
       - name: Install native archive regression dependencies
         shell: bash
         run: |
           set -euo pipefail
-          for tool in jq xz go; do
-            command -v "$tool" >/dev/null || brew install "$tool"
-          done
-          if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends jq clang lld xz-utils zip unzip
+          else
+            for tool in jq xz go; do
+              command -v "$tool" >/dev/null || brew install "$tool"
+            done
+            if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
+            echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          fi
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
-      - name: Validate full runner and actual YAML, Git and archive paths
+      - name: Validate actual native archive collection and receipts
         shell: bash
         run: |
           set -euo pipefail
@@ -71,27 +51,3 @@ jobs:
           bash -n src/act_runner.sh
           bash -n scripts/tests/test_native_single_archives.sh
           bash scripts/tests/test_native_single_archives.sh
-      - name: Store tested Git objects without changing any branch
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git diff --check
-          test "$(git diff --name-only -- src scripts tests dsr)" = src/act_runner.sh
-          test "$(git ls-files --others --exclude-standard)" = scripts/tests/test_native_single_archives.sh
-          source_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@src/act_runner.sh --jq .sha)
-          test_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@scripts/tests/test_native_single_archives.sh --jq .sha)
-          test "$source_blob" = "$(git hash-object src/act_runner.sh)"
-          test "$test_blob" = "$(git hash-object scripts/tests/test_native_single_archives.sh)"
-          jq -nc --arg base "$(git rev-parse HEAD^{tree})" --arg source "$source_blob" --arg tests "$test_blob" \
-            '{base_tree:$base,tree:[{path:"src/act_runner.sh",mode:"100644",type:"blob",sha:$source},{path:"scripts/tests/test_native_single_archives.sh",mode:"100755",type:"blob",sha:$tests}]}' > "$RUNNER_TEMP/native-tree.json"
-          tree=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/trees" --input "$RUNNER_TEMP/native-tree.json" --jq .sha)
-          jq -nc --arg parent "$(git rev-parse HEAD)" --arg tree "$tree" \
-            '{message:"fix(native): include pinned companions in strict single-binary archives\n\nVerified with the full runner, production yq, real Git objects, compiler-produced binaries, archive streams and receipt checks. No remote release, signing or Rust build is claimed. Refs #29.",tree:$tree,parents:[$parent]}' > "$RUNNER_TEMP/native-commit.json"
-          commit=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" --input "$RUNNER_TEMP/native-commit.json" --jq .sha)
-          printf 'DSR_NATIVE_VERIFIED_PARENT %s\n' "$(git rev-parse HEAD)"
-          printf 'DSR_NATIVE_VERIFIED_SOURCE %s\n' "$source_blob"
-          printf 'DSR_NATIVE_VERIFIED_TEST %s\n' "$test_blob"
-          printf 'DSR_NATIVE_VERIFIED_TREE %s\n' "$tree"
-          printf 'DSR_NATIVE_VERIFIED_COMMIT %s\n' "$commit"
