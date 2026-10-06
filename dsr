@@ -4094,11 +4094,15 @@ _release_contract_preflight() {
          then ($primaries | map(. + ".minisig"))
          else []
          end) as $signatures |
-        ($primaries + ($primaries | map(. + ".sha256")) + $signatures + $additional) as $all_assets |
+        (.build_manifest_assets // []) as $manifest_names |
+        has("build_manifest_assets") as $has_manifest_names |
+        ($primaries + ($primaries | map(. + ".sha256")) + $signatures + $additional +
+            (if ($manifest_names | type) == "array" then $manifest_names else [] end)) as $all_assets |
         type == "object" and
         has("checksum_sidecar") and
         has("exact_primary_assets") and
         (((keys) - [
+            "build_manifest_assets",
             "checksum_sidecar",
             "exact_additional_assets",
             "exact_primary_assets",
@@ -4110,6 +4114,13 @@ _release_contract_preflight() {
         (.exact_primary_assets | length > 0) and
         ($additional | type == "array") and
         ([$additional[] | safe_name] | all) and
+        ($manifest_names | type == "array" and length <= 2 and
+            (($has_manifest_names | not) or length >= 1)) and
+        ([$manifest_names[] | safe_name and
+            (ascii_downcase | endswith(".json")) and
+            (ascii_downcase | test("\\.(sha256|minisig)$") | not) and
+            (. as $name | ["SHA256SUMS", "SHA256SUMS.txt", "checksums.txt"] |
+                index($name) | not)] | all) and
         ((has("minisign_public_key_file") | not) or
          (.minisign_public_key_file | safe_project_path)) and
         ((has("github_tag_ruleset") | not) or
@@ -4661,6 +4672,43 @@ _release_contract_preflight() {
         map(select(. == "SHA256SUMS" or . == "SHA256SUMS.txt" or
                    . == "checksums.txt")) | sort[]' \
         <<< "$contract_json")
+
+    # Public names for the frozen build manifest (GH #18). Its bytes are the
+    # strict manifest validated above, bound by the plan's manifest_sha256
+    # rather than by a self-referential manifest row. A copy is created only
+    # in create mode and without clobbering; an existing copy must already be
+    # an identical regular file. A name equal to the generated manifest's own
+    # basename publishes that file directly.
+    local manifest_asset_name manifest_asset_path manifest_size_before
+    manifest_size_before=$(_release_file_size "$manifest_file") || return 4
+    while IFS= read -r manifest_asset_name; do
+        [[ -n "$manifest_asset_name" ]] || continue
+        manifest_asset_path="$artifacts_dir/$manifest_asset_name"
+        if [[ "$manifest_asset_path" != "$manifest_file" ]]; then
+            if [[ "$sidecar_mode" == "create" && ! -e "$manifest_asset_path" && \
+                  ! -L "$manifest_asset_path" ]]; then
+                if ! (set -o noclobber; cat -- "$manifest_file" > "$manifest_asset_path"); then
+                    log_error "Could not create public build manifest without clobbering: $manifest_asset_path"
+                    return 4
+                fi
+            fi
+            if [[ "$sidecar_mode" != "plan" || -e "$manifest_asset_path" || -L "$manifest_asset_path" ]]; then
+                if [[ ! -f "$manifest_asset_path" || -L "$manifest_asset_path" ]] || \
+                   [[ "$(_release_sha256 "$manifest_asset_path")" != "$manifest_sha_before" ]] || \
+                   [[ "$(_release_file_size "$manifest_asset_path")" != "$manifest_size_before" ]]; then
+                    log_error "Public build manifest must be a regular file identical to the build manifest: $manifest_asset_name"
+                    return 4
+                fi
+            fi
+        fi
+        planned_assets+=("$(jq -nc \
+            --arg name "$manifest_asset_name" --arg path "$manifest_asset_path" \
+            --arg sha256 "$manifest_sha_before" \
+            --argjson size_bytes "$manifest_size_before" '
+            {target: "metadata", name: $name, path: $path,
+             sha256: $sha256, size_bytes: $size_bytes,
+             kind: "build-manifest"}')")
+    done < <(jq -r '(.build_manifest_assets // [])[]' <<< "$contract_json")
 
     local planned_additional_names contracted_additional_names
     planned_additional_names=$(printf '%s\n' "${planned_assets[@]}" | jq -sr \
@@ -6896,7 +6944,7 @@ EOF
 
             if [[ "$planned_kind" == "primary" || "$planned_kind" == "checksum" || \
                   "$planned_kind" == "minisign" || "$planned_kind" == "additional" || \
-                  "$planned_kind" == "aggregate-checksum" ]]; then
+                  "$planned_kind" == "aggregate-checksum" || "$planned_kind" == "build-manifest" ]]; then
                 planned_sha=$(jq -r '.sha256' <<< "$planned_asset")
                 current_sha=$(_release_sha256 "$file" 2>/dev/null || true)
                 if [[ "$current_sha" != "$planned_sha" ]]; then
@@ -7952,6 +8000,14 @@ EOF
                             break
                         fi
                     fi
+                    # A public build-manifest copy is the frozen manifest's bytes.
+                    if [[ "${expected_asset_kinds[$missing]:-}" == "build-manifest" && \
+                          ! -e "$file_path" && ! -L "$file_path" ]] && \
+                       ! (set -o noclobber; cat -- "$manifest_file" > "$file_path"); then
+                        log_error "Could not create public build manifest without clobbering: $file_path"
+                        strict_fix_failed=true
+                        break
+                    fi
 
                     if ! _release_contract_verify_local_asset \
                         "$file_path" "$missing" \
@@ -7998,7 +8054,10 @@ EOF
                 local planned_name planned_path planned_source_sha planned_source_name
                 local bound_sidecar_draft_json=""
                 for planned_name in "${expected_assets[@]}"; do
-                    [[ "${expected_asset_kinds[$planned_name]:-}" == "checksum" ]] || continue
+                    case "${expected_asset_kinds[$planned_name]:-}" in
+                        checksum|build-manifest) ;;
+                        *) continue ;;
+                    esac
                     planned_path="${expected_asset_paths[$planned_name]:-}"
                     if [[ ! -e "$planned_path" && ! -L "$planned_path" ]]; then
                         bound_sidecar_draft_json=$(_release_contract_observe_bound_draft \
@@ -8007,6 +8066,21 @@ EOF
                             log_error "Strict release left draft state before sidecar materialization"
                             strict_fix_failed=true
                             break
+                        fi
+                        if [[ "${expected_asset_kinds[$planned_name]}" == "build-manifest" ]]; then
+                            if ! (set -o noclobber; cat -- "$manifest_file" > "$planned_path"); then
+                                log_error "Could not materialize public build manifest: $planned_path"
+                                strict_fix_failed=true
+                                break
+                            fi
+                            if ! _release_contract_verify_local_asset \
+                                "$planned_path" "$planned_name" \
+                                "${expected_asset_sizes[$planned_name]:-}" \
+                                "${expected_asset_shas[$planned_name]:-}"; then
+                                strict_fix_failed=true
+                                break
+                            fi
+                            continue
                         fi
                         planned_source_sha="${expected_asset_source_shas[$planned_name]:-}"
                         planned_source_name="${planned_name%.sha256}"

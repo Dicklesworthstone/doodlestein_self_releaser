@@ -1220,6 +1220,86 @@ test_strict_release_uploads_exact_set_then_publishes() {
     harness_teardown
 }
 
+# GH #18: a tool whose repository key differs from its historical public
+# manifest name publishes the frozen build manifest under the contracted
+# names, byte-identical, inside the closed verified upload set.
+seed_strict_build_manifest_assets() {
+    local manifest="$STRICT_ARTIFACTS_DIR/test-tool-v1.0.0-manifest.json" manifest_sha manifest_size
+    yq -i '.release_contract.build_manifest_assets = ["tt-v1.0.0-manifest.json", "test-tool-v1.0.0-manifest.json"]' \
+        "$DSR_CONFIG_DIR/repos.d/test-tool.yaml"
+    manifest_sha=$(test_sha256 "$manifest")
+    manifest_size=$(test_file_size "$manifest")
+    STRICT_REMOTE_ASSETS=$(jq -c --arg digest "sha256:$manifest_sha" --argjson size "$manifest_size" '
+        . + [{id: 6, name: "tt-v1.0.0-manifest.json", size: $size, state: "uploaded", digest: $digest},
+             {id: 7, name: "test-tool-v1.0.0-manifest.json", size: $size, state: "uploaded", digest: $digest}]
+    ' <<< "$STRICT_REMOTE_ASSETS")
+    STRICT_EXPECTED_UPLOAD_ASSETS="$STRICT_REMOTE_ASSETS"
+    export STRICT_REMOTE_ASSETS STRICT_EXPECTED_UPLOAD_ASSETS
+}
+
+test_strict_release_publishes_bound_build_manifest_names() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    seed_strict_build_manifest_assets
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status uploads expected_uploads
+    status=$(exec_status)
+    uploads=$(sed -n 's/^upload://p' "$STRICT_MUTATION_LOG" 2>/dev/null | sort)
+    expected_uploads=$(printf '%s\n' \
+        test-tool-darwin-arm64 test-tool-darwin-arm64.sha256 \
+        test-tool-linux-amd64 test-tool-linux-amd64.sha256 \
+        test-tool-v1.0.0-manifest.json test-tool.sbom.json tt-v1.0.0-manifest.json | sort)
+
+    if [[ $status -eq 0 && "$uploads" == "$expected_uploads" ]] && \
+       cmp -s "$STRICT_ARTIFACTS_DIR/test-tool-v1.0.0-manifest.json" \
+           "$STRICT_ARTIFACTS_DIR/tt-v1.0.0-manifest.json" && \
+       [[ ! -L "$STRICT_ARTIFACTS_DIR/tt-v1.0.0-manifest.json" ]] && \
+       [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]] && \
+       exec_stdout | jq -e '.details.draft == false and .details.verification == "exact"' >/dev/null 2>&1; then
+        pass "strict release publishes the frozen build manifest under its contracted public names"
+    else
+        fail "strict release must publish contracted build manifest names inside the exact set"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
+test_strict_release_refuses_substituted_build_manifest_copy() {
+    ((TESTS_RUN++))
+    harness_setup
+    seed_strict_release_fixture
+    seed_strict_build_manifest_assets
+    printf '{"tool":"test-tool","forged":true}\n' > "$STRICT_ARTIFACTS_DIR/tt-v1.0.0-manifest.json"
+    create_strict_github_mocks
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release test-tool v1.0.0 \
+        --artifacts "$STRICT_ARTIFACTS_DIR"
+    local status
+    status=$(exec_status)
+
+    if [[ $status -eq 4 ]] && [[ ! -s "$STRICT_MUTATION_LOG" ]] && \
+       grep -q '"forged":true' "$STRICT_ARTIFACTS_DIR/tt-v1.0.0-manifest.json" && \
+       exec_stderr_contains "identical to the build manifest"; then
+        pass "strict release refuses a substituted public manifest copy before any GitHub mutation"
+    else
+        fail "strict release must refuse a substituted public manifest copy before mutation"
+        echo "status: $status"
+        echo "mutations: $(cat "$STRICT_MUTATION_LOG" 2>/dev/null || true)"
+        echo "stderr: $(exec_stderr | tail -20)"
+    fi
+
+    remove_strict_github_mocks
+    harness_teardown
+}
+
 test_strict_release_records_live_tag_ruleset_receipt() {
     ((TESTS_RUN++))
     harness_setup
@@ -3034,6 +3114,8 @@ test_release_missing_artifacts_dir
 echo ""
 echo "Strict Release Contract Tests (mocked GitHub):"
 test_strict_release_uploads_exact_set_then_publishes
+test_strict_release_publishes_bound_build_manifest_names
+test_strict_release_refuses_substituted_build_manifest_copy
 test_strict_release_records_live_tag_ruleset_receipt
 test_strict_release_rejects_invalid_tag_ruleset_before_mutation
 test_strict_release_rejects_stale_ruleset_receipt_before_publish

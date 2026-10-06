@@ -1114,6 +1114,7 @@ config_validate_release_contract() {
         elif (($contract | has("checksum_sidecar")) | not) then false
         elif (($contract | has("exact_primary_assets")) | not) then false
         elif (($contract | keys) - [
+            "build_manifest_assets",
             "checksum_sidecar",
             "exact_additional_assets",
             "exact_primary_assets",
@@ -1123,6 +1124,16 @@ config_validate_release_contract() {
         elif $contract.checksum_sidecar != "sha256" then false
         elif ($contract.exact_primary_assets | type) != "object" then false
         elif (($contract.exact_additional_assets // []) | type) != "array" then false
+        # Public names for the generated build manifest (GH #18): one or two
+        # literal .json basenames; the second is a byte-identical alias.
+        elif ($contract | has("build_manifest_assets")) and
+             (($contract.build_manifest_assets | type) != "array" or
+              ($contract.build_manifest_assets | length) < 1 or
+              ($contract.build_manifest_assets | length) > 2 or
+              ([$contract.build_manifest_assets[] |
+                 safe_primary and (ascii_downcase | endswith(".json")) and
+                 (. as $name | ["SHA256SUMS", "SHA256SUMS.txt", "checksums.txt"] |
+                     index($name) | not)] | all | not)) then false
         elif ($contract | has("minisign_public_key_file")) and
              (($contract.minisign_public_key_file | safe_project_path) | not) then false
         elif ($contract | has("github_tag_ruleset")) and
@@ -1153,7 +1164,8 @@ config_validate_release_contract() {
                 then ($primaries | map(. + ".minisig"))
                 else []
                 end) as $signatures |
-            ($primaries + ($primaries | map(. + ".sha256")) + $signatures + $additional) as $all_assets |
+            ($primaries + ($primaries | map(. + ".sha256")) + $signatures + $additional +
+                ($contract.build_manifest_assets // [])) as $all_assets |
             (($contract.exact_primary_assets | keys | sort) == ($targets | sort)) and
             ([$contract.exact_primary_assets[] | safe_primary] | all) and
             ([$additional[] | safe_name] | all) and

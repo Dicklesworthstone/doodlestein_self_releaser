@@ -546,8 +546,11 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
 
 When a repository opts into `release_contract`, DSR creates a new empty draft,
-uploads only the contracted primaries, their checksum sidecars, and the regular
-files explicitly listed by the optional `exact_additional_assets` array. Every
+uploads only the contracted primaries, their checksum sidecars, the regular
+files explicitly listed by the optional `exact_additional_assets` array, and
+the generated build manifest under the one or two literal `.json` names in the
+optional `build_manifest_assets` array (bound to the frozen manifest's SHA-256
+and size; the build manifest is not published otherwise). Every
 planned file is bound by exact basename, byte size, and SHA-256 before upload;
 unsafe names, case-fold collisions, symlinks, missing files, and unlisted remote
 assets fail closed. Publication occurs only after exact no-cache asset,

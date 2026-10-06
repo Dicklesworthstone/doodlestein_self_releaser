@@ -579,6 +579,42 @@ YAML
     config_validate_release_contract contract-tool
 }
 
+test_release_contract_accepts_build_manifest_assets() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: eidetic_engine_cli
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: ee-x86_64-unknown-linux-gnu.tar.xz}
+  build_manifest_assets: [ee-v0.17.0-manifest.json, eidetic_engine_cli-v0.17.0-manifest.json]
+YAML
+  # The fixture file is named contract-tool.yaml; its tool_name is unused here.
+  config_validate_release_contract contract-tool
+}
+
+test_release_contract_rejects_invalid_build_manifest_assets() {
+  release_contract_test_deps_available || return 0
+  local names
+  for names in '[]' '[a.json, b.json, c.json]' '[../ee-manifest.json]' '[ee-manifest.txt]' \
+      '[ee-manifest.json.sha256]' '[EE-X86_64-UNKNOWN-LINUX-GNU.TAR.XZ.json, ee-x86_64-unknown-linux-gnu.tar.xz.json]' \
+      '[ee-manifest.json, EE-MANIFEST.JSON]' '[ee-x86_64-unknown-linux-gnu.tar.xz]' '"ee-manifest.json"'; do
+    write_contract_tool_config << YAML
+tool_name: contract-tool
+targets: [linux/amd64]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: ee-x86_64-unknown-linux-gnu.tar.xz}
+  exact_additional_assets: [ee-x86_64-unknown-linux-gnu.tar.xz.json]
+  build_manifest_assets: $names
+YAML
+    if config_validate_release_contract contract-tool 2>/dev/null; then
+      echo "accepted invalid build_manifest_assets: $names" >&2
+      return 1
+    fi
+  done
+}
+
 test_release_contract_rejects_invalid_github_tag_ruleset() {
   release_contract_test_deps_available || return 0
 
@@ -1384,6 +1420,8 @@ main() {
   run_test "release_contract_rejects_extra_target" test_release_contract_rejects_extra_target
   run_test "release_contract_rejects_duplicate_primary_names" test_release_contract_rejects_duplicate_primary_names
   run_test "release_contract_rejects_empty_primary_name" test_release_contract_rejects_empty_primary_name
+  run_test "release_contract_accepts_build_manifest_assets" test_release_contract_accepts_build_manifest_assets
+  run_test "release_contract_rejects_invalid_build_manifest_assets" test_release_contract_rejects_invalid_build_manifest_assets
   run_test "release_contract_rejects_unsafe_primary_name" test_release_contract_rejects_unsafe_primary_name
   run_test "release_contract_rejects_primary_path" test_release_contract_rejects_primary_path
   run_test "release_contract_rejects_dotdot_primary" test_release_contract_rejects_dotdot_primary

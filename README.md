@@ -350,6 +350,29 @@ must be a regular file; retries refuse mismatched or linked aggregates.
 List primary signatures only through `minisign_public_key_file`; they are
 implicit assets and must not also appear in `exact_additional_assets`.
 
+A strict release publishes its generated build manifest only when the contract
+names it. `build_manifest_assets` lists one or two literal `.json` basenames;
+the second is a byte-identical compatibility alias. This lets a tool whose
+repository key differs from its binary keep a historical manifest name:
+
+```yaml
+tool_name: eidetic_engine_cli
+binary_name: ee
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: {linux/amd64: ee-x86_64-unknown-linux-gnu.tar.xz}
+  build_manifest_assets: [ee-v0.17.0-manifest.json]
+```
+
+Each name is bound to the frozen manifest's own SHA-256 and size in the upload
+plan (not by a self-referential manifest row), so no receipt is fabricated and
+the generated JSON is never edited. DSR writes the copy into the artifact
+directory without clobbering; an existing copy must already be an identical
+regular file. The copies join the closed upload set and are verified on GitHub
+with every other asset, including by `dsr release verify --fix`, which can
+restore a missing copy. Names must not collide (case-insensitively) with any
+other planned asset or a derived checksum aggregate.
+
 Repositories that protect release tags can also pin
 `release_contract.github_tag_ruleset.repository_id` and `ruleset_id`. DSR then
 fails closed unless authenticated, no-cache GitHub reads prove that the exact

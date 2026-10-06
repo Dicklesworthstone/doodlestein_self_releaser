@@ -945,7 +945,7 @@ _an_contract_primary_plan() {
         [.exact_primary_assets[]] as $p |
         ($p + ($p | map(. + ".sha256")) +
             (if has("minisign_public_key_file") then ($p | map(. + ".minisig")) else [] end) +
-            (.exact_additional_assets // [])) as $names |
+            (.exact_additional_assets // []) + (.build_manifest_assets // [])) as $names |
         if ($names | map(ascii_downcase) | unique | length) != ($names | length)
         then error("colliding release asset names") else . end |
         .exact_primary_assets[$target] | if primary then . else error("missing primary target") end
