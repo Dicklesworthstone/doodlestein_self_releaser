@@ -643,12 +643,24 @@ create_strict_github_mocks() {
                                 name: "v1.0.0",
                                 body: $body,
                                 prerelease: false,
-                                upload_url: "https://uploads.example.invalid/assets{?name,label}",
+                                upload_url: "https://uploads.github.com/repos/testuser/test-tool/releases/123/assets{?name,label}",
                                 html_url: "https://example.invalid/v1.0.0",
                                 draft: true,
                                 assets: $assets
                             }]
                         '
+                        ;;
+                    repos/testuser/test-tool/releases/123/assets\?per_page=100\&page=*:GET)
+                        # Inventory read by the verified uploader: only assets
+                        # whose POST reached the server are present.
+                        local uploaded_names='[]'
+                        if [[ -f "$STRICT_MUTATION_LOG" ]]; then
+                            uploaded_names=$(sed -n 's/^upload://p' "$STRICT_MUTATION_LOG" |
+                                jq -Rsc 'split("\n") | map(select(length > 0))')
+                        fi
+                        jq -c --argjson uploaded "$uploaded_names" \
+                            '[.[] | select(.name as $name | $uploaded | index($name))]' \
+                            <<< "$STRICT_REMOTE_ASSETS"
                         ;;
                     repos/testuser/test-tool/releases\?per_page=100\&page=2:GET)
                         local tag_release_get_count=0
@@ -700,7 +712,7 @@ create_strict_github_mocks() {
                             name: "v1.0.0",
                             body: $body,
                             prerelease: false,
-                            upload_url: "https://uploads.example.invalid/assets{?name,label}",
+                            upload_url: "https://uploads.github.com/repos/testuser/test-tool/releases/123/assets{?name,label}",
                             html_url: "https://example.invalid/v1.0.0",
                             draft: true,
                             assets: []
@@ -762,7 +774,7 @@ create_strict_github_mocks() {
                                 name: "v1.0.0",
                                 body: $body,
                                 prerelease: false,
-                                upload_url: "https://uploads.example.invalid/assets{?name,label}",
+                                upload_url: "https://uploads.github.com/repos/testuser/test-tool/releases/123/assets{?name,label}",
                                 html_url: "https://example.invalid/v1.0.0",
                                 draft: $draft,
                                 assets: $assets
@@ -857,10 +869,12 @@ create_strict_github_mocks() {
         esac
     }
 
+    # Mirrors gh_upload_asset's curl contract: the body goes to -o, headers to
+    # -D, and the HTTP status is the only stdout (-w '%{http_code}').
     curl() {
         local url="${!#}"
         local name="${url##*?name=}"
-        local data_arg=""
+        local data_arg="" response_file="" headers_file=""
         local arg
         while [[ $# -gt 0 ]]; do
             arg="$1"
@@ -868,8 +882,20 @@ create_strict_github_mocks() {
             if [[ "$arg" == "--data-binary" && $# -gt 0 ]]; then
                 data_arg="$1"
                 shift
+            elif [[ "$arg" == "-o" && $# -gt 0 ]]; then
+                response_file="$1"
+                shift
+            elif [[ "$arg" == "-D" && $# -gt 0 ]]; then
+                headers_file="$1"
+                shift
             fi
         done
+        [[ -n "$response_file" && -n "$headers_file" ]] || return 2
+        _strict_upload_reply() {
+            printf 'HTTP/1.1 %s Mock\r\n\r\n' "$1" > "$headers_file"
+            printf '%s\n' "$2" > "$response_file"
+            printf '%s' "$1"
+        }
         name="${name//%2B/+}"
         local file_path="${data_arg#@}"
         local expected_record expected_size expected_digest actual_size actual_sha
@@ -877,7 +903,7 @@ create_strict_github_mocks() {
             <<< "$STRICT_EXPECTED_UPLOAD_ASSETS")
         if [[ "$data_arg" != @* || ! -f "$file_path" || -z "$expected_record" ]]; then
             printf 'upload-invalid:%s\n' "$name" >> "$STRICT_MUTATION_LOG"
-            printf '{}\n__HTTP_CODE__422'
+            _strict_upload_reply 422 '{}'
             return 0
         fi
         expected_size=$(jq -r '.size' <<< "$expected_record")
@@ -890,7 +916,7 @@ create_strict_github_mocks() {
         fi
         if [[ "$actual_size" != "$expected_size" || "sha256:$actual_sha" != "$expected_digest" ]]; then
             printf 'upload-invalid:%s\n' "$name" >> "$STRICT_MUTATION_LOG"
-            printf '{}\n__HTTP_CODE__422'
+            _strict_upload_reply 422 '{}'
             return 0
         fi
         : > "$STRICT_UPLOAD_STARTED_FILE"
@@ -908,12 +934,11 @@ create_strict_github_mocks() {
         printf 'upload:%s\n' "$name" >> "$STRICT_MUTATION_LOG"
         if [[ "${STRICT_UPLOAD_COMMIT_ERROR_ON_NAME:-}" == "$name" ]]; then
             printf 'upload-response-error:%s\n' "$name" >> "$STRICT_MUTATION_LOG"
-            printf '{"message":"simulated response failure"}\n__HTTP_CODE__500'
+            _strict_upload_reply 500 '{"message":"simulated response failure"}'
             return 0
         fi
-        jq -nc --arg name "$name" --arg digest "$expected_digest" --argjson size "$expected_size" \
-            '{id:1,name:$name,state:"uploaded",digest:$digest,size:$size}'
-        printf '__HTTP_CODE__201'
+        _strict_upload_reply 201 "$(jq -c '{id, name, state: "uploaded", digest, size}' \
+            <<< "$expected_record")"
     }
 
     export -f gh curl strict_mock_ruleset_json
@@ -1798,17 +1823,21 @@ test_strict_upload_commit_then_error_reconciles_exact_draft() {
     local status
     status=$(exec_status)
 
+    # The verified uploader reconciles a committed POST whose response failed
+    # by reading the release inventory (name, size and server digest) before
+    # any retry, so the asset is never POSTed twice; the strict release then
+    # re-verifies the exact remote set before publishing.
     if [[ $status -eq 0 ]] && \
        [[ "$(grep -c '^upload-response-error:test-tool-linux-amd64$' \
            "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]] && \
+       [[ "$(grep -c '^upload:test-tool-linux-amd64$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]] && \
        [[ "$(grep -c '^publish$' "$STRICT_MUTATION_LOG" 2>/dev/null)" -eq 1 ]] && \
-       exec_stderr_contains "reconciled by exact no-cache draft verification" && \
        exec_stdout | jq -e '
            .details.draft == false and
            .details.failed == 0 and
            .details.success == 5 and
-           any(.details.assets_uploaded[];
-               .name == "test-tool-linux-amd64" and .status == "reconciled")
+           .details.verification == "exact" and
+           any(.details.assets_uploaded[]; .name == "test-tool-linux-amd64")
        ' >/dev/null 2>&1; then
         pass "strict upload clears a response-only failure after exact draft reconciliation"
     else
