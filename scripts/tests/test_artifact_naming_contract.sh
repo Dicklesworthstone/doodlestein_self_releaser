@@ -233,5 +233,46 @@ expect 'unsupported installer falls back to selected source' \
 reject 'explicit unsupported config fails rather than silently using discovery' \
     resolver_names '$UNKNOWN' '["${name}-${version}-${target}"]' '' '' ''
 
+# Variants of one platform (bd-cdcz): the configured triple a produced
+# artifact belongs to, and names rendered for one variant.
+config_get_target_triples() {
+    case "$1 $2" in
+        'variant-app linux/amd64') printf '%s\n' x86_64-unknown-linux-gnu x86_64-unknown-linux-musl ;;
+        'variant-app linux/arm64') printf '%s\n' aarch64-unknown-linux-gnu aarch64-unknown-linux-gnueabihf ;;
+        'bad-app linux/amd64') return 4 ;;
+    esac
+}
+variant() {
+    local result
+    result=$(artifact_naming_artifact_variant "$@") || return $?
+    printf '%s\n' "${result//$'\t'/ }"
+}
+expect 'full triple names its variant' 'x86_64-unknown-linux-musl triple' \
+    variant variant-app linux amd64 app-1.0-x86_64-unknown-linux-musl.tar.gz
+expect 'primary triple names its variant' 'x86_64-unknown-linux-gnu triple' \
+    variant variant-app linux amd64 app-1.0-x86_64-unknown-linux-gnu.tar.gz
+expect 'longest configured triple wins' 'aarch64-unknown-linux-gnueabihf triple' \
+    variant variant-app linux arm64 app-aarch64-unknown-linux-gnueabihf.tar.gz
+expect 'libc word names its variant' 'x86_64-unknown-linux-musl libc' \
+    variant variant-app linux amd64 app_linux_amd64_musl.tar.gz
+expect 'libc letters inside another word name nothing' 'x86_64-unknown-linux-gnu primary' \
+    variant variant-app linux amd64 app-muslin-linux-amd64.tar.gz
+expect 'undecorated name is the primary variant' 'x86_64-unknown-linux-gnu primary' \
+    variant variant-app linux amd64 app-linux-amd64.tar.gz
+expect 'unconfigured libc word is an unknown variant' 'x86_64-unknown-linux-gnu unknown' \
+    variant registered-app linux amd64 app-linux-amd64-musl.tar.gz
+reject 'invalid target_triples configuration' variant bad-app linux amd64 app-linux-amd64.tar.gz
+substitute_variant() {
+    local _AN_TARGET_TRIPLE_OVERRIDE="$1"
+    shift
+    artifact_naming_substitute "$@"
+}
+expect 'unconfigured platform renders its default triple' 'app-1-x86_64-unknown-linux-gnu.tar.gz' \
+    artifact_naming_substitute '${name}-${version}-${target_triple}.${ext}' app v1 linux amd64 tar.gz variant-app
+expect 'variant override renders that triple' 'app-1-x86_64-unknown-linux-musl.tar.gz' \
+    substitute_variant x86_64-unknown-linux-musl '${name}-${version}-${target_triple}.${ext}' app v1 linux amd64 tar.gz variant-app
+reject 'unsafe variant triple' \
+    artifact_naming_generate_dual_for_variant app v1 linux amd64 tar.gz '' '../x86_64'
+
 printf 'Artifact naming contract: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]

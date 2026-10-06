@@ -378,5 +378,90 @@ ARCHIVES
 else
     echo 'SKIP: python3 unavailable for adversarial archive construction'
 fi
+# A configured arch alias names the asset alone: the generated alias table
+# once fell through to the default and resolved "x86_64\namd64".
+case "$arch" in amd64) arch_alias=x86_64 ;; *) arch_alias=aarch64 ;; esac
+cat > "$DSR_CONFIG_DIR/repos.d/adem.yaml" <<CONFIG
+tool_name: adem
+repo: example/adem
+binary_name: adem
+artifact_naming: \${name}-\${version}-\${os}-\${arch}
+arch_aliases:
+  $arch: $arch_alias
+CONFIG
+ainstaller=$(install_gen_create adem 2>> "$work/generate.log") || exit 1
+mkdir -p "$work/apayload"
+printf '#!/usr/bin/env bash\nprintf "adem 1.2.3\\n"\n' > "$work/apayload/adem"
+chmod +x "$work/apayload/adem"
+tar -czf "$REMOTE/adem-1.2.3-$os-$arch_alias.tar.gz" -C "$work/apayload" adem || exit 1
+set_manifest "$(sha256sum < "$REMOTE/adem-1.2.3-$os-$arch_alias.tar.gz" | awk '{print $1}')  adem-1.2.3-$os-$arch_alias.tar.gz"
+case_id=$((case_id + 1)); case_dir="$work/case-$case_id"; mkdir -p "$case_dir"; status=0
+bash "$ainstaller" --version v1.2.3 --dir "$case_dir/bin" --cache-dir "$case_dir/cache" \
+    --non-interactive --json --no-skills > "$case_dir/out" 2> "$case_dir/err" || status=$?
+check 'arch alias names the downloaded asset' test "$status" -eq 0 -a -x "$case_dir/bin/adem"
+
+# Platforms that ship gnu and musl builds (bd-cdcz): the installer selects the
+# variant by --libc or by this system's C library, and falls back to the
+# primary variant, saying so, when the release has no matching build.
+if [[ "$os" == linux ]]; then
+    case "$arch" in amd64) cpu=x86_64 ;; *) cpu=aarch64 ;; esac
+    cat > "$DSR_CONFIG_DIR/repos.d/vdemo.yaml" <<CONFIG
+tool_name: vdemo
+repo: example/vdemo
+binary_name: vdemo
+artifact_naming: \${name}-\${version}-\${target_triple}
+target_triples:
+  linux/$arch:
+    - $cpu-unknown-linux-gnu
+    - $cpu-unknown-linux-musl
+CONFIG
+    sed -e 's/^tool_name: vdemo/tool_name: vgnu/' -e 's#example/vdemo#example/vgnu#' \
+        -e 's/^binary_name: vdemo/binary_name: vgnu/' -e '/-musl$/d' \
+        "$DSR_CONFIG_DIR/repos.d/vdemo.yaml" > "$DSR_CONFIG_DIR/repos.d/vgnu.yaml"
+    vinstaller=$(install_gen_create vdemo 2>> "$work/generate.log") || exit 1
+    ginstaller=$(install_gen_create vgnu 2>> "$work/generate.log") || exit 1
+    check 'multi-variant installer parses' bash -n "$vinstaller"
+    manifest_lines=''
+    for libc in gnu musl; do
+        for tool in vdemo vgnu; do
+            mkdir -p "$work/vpayload-$tool-$libc"
+            printf '#!/usr/bin/env bash\nprintf "%s %s\\n"\n' "$tool" "$libc" > "$work/vpayload-$tool-$libc/$tool"
+            chmod +x "$work/vpayload-$tool-$libc/$tool"
+            vasset="$tool-1.2.3-$cpu-unknown-linux-$libc.tar.gz"
+            tar -czf "$REMOTE/$vasset" -C "$work/vpayload-$tool-$libc" "$tool" || exit 1
+            manifest_lines+="$(sha256sum < "$REMOTE/$vasset" | awk '{print $1}')  $vasset"$'\n'
+        done
+    done
+    set_manifest "${manifest_lines%$'\n'}"
+    # vgnu releases only its gnu build.
+    rm -- "$REMOTE/vgnu-1.2.3-$cpu-unknown-linux-musl.tar.gz"
+    run_variant() {
+        local variant_installer="$1"; shift
+        case_id=$((case_id + 1)); case_dir="$work/case-$case_id"
+        mkdir -p "$case_dir"
+        status=0
+        bash "$variant_installer" --version v1.2.3 --dir "$case_dir/bin" --cache-dir "$case_dir/cache" \
+            --non-interactive --json --no-skills "$@" > "$case_dir/out" 2> "$case_dir/err" || status=$?
+    }
+    installed_as() { [[ $status -eq 0 && "$("$case_dir/bin/$1" 2>/dev/null)" == "$1 $2" ]]; }
+    run_variant "$vinstaller" --libc musl
+    check '--libc musl installs the musl build' installed_as vdemo musl
+    check 'selected target triple is reported' grep -q "Target: $cpu-unknown-linux-musl" "$case_dir/err"
+    run_variant "$vinstaller" --libc gnu
+    check '--libc gnu installs the gnu build' installed_as vdemo gnu
+    host_libc=gnu
+    if compgen -G '/lib/ld-musl-*.so.1' >/dev/null || compgen -G '/usr/lib/ld-musl-*.so.1' >/dev/null ||
+       { command -v ldd >/dev/null && ldd --version 2>&1 | grep -qi musl; }; then
+        host_libc=musl
+    fi
+    run_variant "$vinstaller"
+    check "default selection follows this system's C library ($host_libc)" installed_as vdemo "$host_libc"
+    run_variant "$ginstaller" --libc musl
+    check 'unreleased variant falls back to the primary build' installed_as vgnu gnu
+    check 'fallback is reported' grep -q "No musl build of vgnu is released for linux/$arch; installing $cpu-unknown-linux-gnu" "$case_dir/err"
+    run_variant "$vinstaller" --libc uclibc
+    check 'unknown --libc value is refused' test "$status" -eq 4 -a ! -e "$case_dir/bin/vdemo"
+fi
+
 printf 'Generated installer integrity: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]

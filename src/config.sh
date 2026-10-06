@@ -1074,6 +1074,9 @@ config_validate_release_contract() {
     local contract_json targets_json
 
     contract_json=$(config_get_release_contract_json "$toolname") || return $?
+    # Target triples decide release asset names with or without a contract;
+    # every build, release and `config validate` passes through here.
+    config_validate_target_triples "$toolname" "$contract_json" || return 4
     [[ "$contract_json" == "null" ]] && return 0
 
     if ! targets_json=$(_config_get_tool_targets_json "$toolname"); then
@@ -1211,35 +1214,93 @@ config_get_artifact_naming() {
     config_get_tool_field "$toolname" "artifact_naming" ""
 }
 
-# Get target triple override for a tool/platform
+# Raw target_triples mapping for a tool as JSON (repos.d file first, then the
+# registry), or null when neither configures one.
+_config_target_triples_json() {
+    local toolname="$1"
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml"
+    local value_json="null"
+
+    command -v yq &>/dev/null || { echo null; return 0; }
+    if [[ -f "$tool_config" ]]; then
+        value_json=$(yq -o=json '.target_triples' "$tool_config" 2>/dev/null) || return 4
+    fi
+    if [[ -z "$value_json" || "$value_json" == "null" ]] && [[ -f "${DSR_REPOS_FILE:-}" ]]; then
+        value_json=$(DSR_TOOL="$toolname" yq -o=json '.tools[strenv(DSR_TOOL)].target_triples' \
+            "$DSR_REPOS_FILE" 2>/dev/null) || return 4
+    fi
+    [[ -n "$value_json" ]] || value_json="null"
+    jq -c . <<< "$value_json" 2>/dev/null || return 4
+}
+
+# Target triples configured for one platform, primary first.
+# A platform maps to one triple or to a list of variants (bd-cdcz):
+#   target_triples:
+#     linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+# The first entry is the primary variant: native builds compile it, and an
+# artifact whose name identifies no variant is named as it. Prints one triple
+# per line, or nothing when the platform is not configured.
+# Usage: config_get_target_triples <toolname> <platform>
+# Exit: 0 on success, 4 on an invalid mapping
+config_get_target_triples() {
+    local toolname="$1"
+    local platform="$2"
+    local mapping_json
+    mapping_json=$(_config_target_triples_json "$toolname") || {
+        _cfg_log_error "Could not read target_triples for $toolname"
+        return 4
+    }
+    jq -r --arg platform "$platform" '
+        def triple: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("..") | not);
+        if . == null then empty
+        elif type != "object" then error("target_triples must map platforms to triples")
+        else .[$platform] |
+            if . == null then empty
+            elif triple then .
+            elif type == "array" and length > 0 and all(.[]; triple) and length == (unique | length) then .[]
+            else error("expected a triple or a non-empty list of distinct triples") end
+        end' <<< "$mapping_json" 2>/dev/null || {
+        _cfg_log_error "Invalid target_triples for $toolname $platform: expected a triple or a non-empty list of distinct triples"
+        return 4
+    }
+}
+
+# Primary target triple for a tool/platform
 # Usage: config_get_target_triple <toolname> <platform>
 # Returns: Target triple (e.g., "x86_64-unknown-linux-gnu") or empty
 config_get_target_triple() {
-    local toolname="$1"
-    local platform="$2"
+    local triples
+    triples=$(config_get_target_triples "$1" "$2") || return $?
+    printf '%s\n' "${triples%%$'\n'*}"
+}
 
-    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
-    local tool_config="$config_dir/repos.d/${toolname}.yaml"
-
-    if [[ -f "$tool_config" ]] && command -v yq &>/dev/null; then
-        local value
-        value=$(yq -r ".target_triples.\"$platform\" // \"\"" "$tool_config" 2>/dev/null)
-        if [[ -n "$value" && "$value" != "null" ]]; then
-            echo "$value"
-            return 0
-        fi
+# Validate every target_triples entry of a tool. A strict release contract
+# names exactly one primary asset per target, so it admits one variant only.
+# Usage: config_validate_target_triples <toolname> <contract_json|null>
+config_validate_target_triples() {
+    local toolname="$1" contract_json="${2:-null}"
+    local mapping_json platform triples
+    mapping_json=$(_config_target_triples_json "$toolname") || {
+        _cfg_log_error "Could not read target_triples for $toolname"
+        return 4
+    }
+    [[ "$mapping_json" == "null" ]] && return 0
+    if ! jq -e 'type == "object"' <<< "$mapping_json" >/dev/null 2>&1; then
+        _cfg_log_error "Invalid target_triples for $toolname: expected a mapping of platform to triple(s)"
+        return 4
     fi
-
-    if [[ -f "$DSR_REPOS_FILE" ]] && command -v yq &>/dev/null; then
-        local value
-        value=$(yq -r ".tools.$toolname.target_triples.\"$platform\" // \"\"" "$DSR_REPOS_FILE" 2>/dev/null)
-        if [[ -n "$value" && "$value" != "null" ]]; then
-            echo "$value"
-            return 0
+    while IFS= read -r platform; do
+        if [[ ! "$platform" =~ ^[a-z0-9]+/[a-z0-9_]+$ ]]; then
+            _cfg_log_error "Invalid target_triples platform for $toolname: $platform (expected os/arch)"
+            return 4
         fi
-    fi
-
-    echo ""
+        triples=$(config_get_target_triples "$toolname" "$platform") || return 4
+        if [[ "$contract_json" != "null" && "$triples" == *$'\n'* ]]; then
+            _cfg_log_error "release_contract for $toolname admits one target triple per platform; $platform lists several variants"
+            return 4
+        fi
+    done < <(jq -r 'keys[]' <<< "$mapping_json")
 }
 
 # Get arch alias override for a tool/arch
@@ -1377,5 +1438,6 @@ export -f config_get_host config_get_tool config_list_hosts config_list_tools
 export -f config_get_host_for_platform
 export -f config_get_tool_field config_get_install_script_compat config_get_install_script_path
 export -f config_get_artifact_naming config_get_target_triple config_get_arch_alias
+export -f _config_target_triples_json config_get_target_triples config_validate_target_triples
 export -f config_get_release_contract_json config_validate_release_contract
 export -f config_get_release_source_dependencies_json

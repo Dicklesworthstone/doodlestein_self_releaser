@@ -259,9 +259,14 @@ artifact_naming: "${name}-${version}-${os}_${arch}"
 # Option 1: Explicit compat pattern (recommended for edge cases)
 install_script_compat: "${name}-${os}-${arch}"
 
-# Optional: target triple overrides (for workflows using matrix.target)
+# Optional: target triple overrides (for workflows using matrix.target).
+# A list ships several variants of one platform, primary first: each artifact
+# is named for its own variant and installers pick gnu or musl at run time
+# (see "gnu and musl variants of one platform" in the README).
 target_triples:
-  linux/amd64: x86_64-unknown-linux-gnu
+  linux/amd64:
+    - x86_64-unknown-linux-gnu
+    - x86_64-unknown-linux-musl
   darwin/arm64: aarch64-apple-darwin
 
 # Optional: arch aliases for install.sh compat (amd64 -> x86_64)

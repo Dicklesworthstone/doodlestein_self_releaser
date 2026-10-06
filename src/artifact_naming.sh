@@ -787,9 +787,14 @@ artifact_naming_substitute() {
         [[ -n "$arch_alias" ]] && arch_resolved="$arch_alias"
     fi
 
-    local target_triple=""
-    if declare -F config_get_target_triple &>/dev/null; then
-        target_triple=$(config_get_target_triple "$config_tool" "${os}/${arch}" 2>/dev/null || echo "")
+    # A caller naming one variant of a multi-variant platform (bd-cdcz) sets
+    # _AN_TARGET_TRIPLE_OVERRIDE; otherwise the platform's primary triple.
+    local target_triple="${_AN_TARGET_TRIPLE_OVERRIDE:-}"
+    if [[ -z "$target_triple" ]] && declare -F config_get_target_triple &>/dev/null; then
+        if ! target_triple=$(config_get_target_triple "$config_tool" "${os}/${arch}" 2>/dev/null); then
+            _an_log_error "Invalid target_triples for $config_tool ${os}/${arch}"
+            return 4
+        fi
     fi
     [[ -z "$target_triple" ]] && target_triple=$(_an_default_target_triple "$os" "$arch")
 
@@ -1062,6 +1067,72 @@ artifact_naming_generate_dual_for_tool() {
     artifact_naming_generate_dual "$naming_name" "$version" "$os" "$arch" "$ext" "$compat_pattern" "$versioned_pattern" "$tool"
 }
 
+# Dual names of one variant (target triple) of a platform (bd-cdcz), e.g. the
+# musl build of linux/amd64. ${target_triple} renders as this variant.
+# Args: tool_name version os arch ext repo_path target_triple
+artifact_naming_generate_dual_for_variant() {
+    [[ $# -ge 7 ]] || return 4
+    _an_safe_asset_name "$7" || return 4
+    local _AN_TARGET_TRIPLE_OVERRIDE="$7"
+    artifact_naming_generate_dual_for_tool "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+# Variant (target triple) a produced artifact belongs to (bd-cdcz). An
+# artifact names its variant by the full triple, or by the triple's last
+# component (gnu, musl, msvc, ...) as a separate word of its name. A name that
+# identifies no configured variant belongs to the primary one, unless it
+# carries a libc token no configured variant uses: then it is an unknown
+# variant, which never claims a shared name over a known one.
+# Args: tool os arch filename
+# Output: "<triple>\t<how>"; how is triple|libc|primary|unknown
+artifact_naming_artifact_variant() {
+    [[ $# -ge 4 ]] || return 4
+    local tool="$1" os="$2" arch="$3" filename="$4"
+    local -a triples=()
+    local triple listed
+    if declare -F config_get_target_triples &>/dev/null; then
+        listed=$(config_get_target_triples "$tool" "$os/$arch" 2>/dev/null) || return 4
+        while IFS= read -r triple; do
+            [[ -n "$triple" ]] && triples+=("$triple")
+        done <<< "$listed"
+    fi
+    [[ ${#triples[@]} -gt 0 ]] || triples=("$(_an_default_target_triple "$os" "$arch")")
+
+    # Longest full triple first, so ...-gnueabihf is never read as ...-gnu.
+    local best=""
+    for triple in "${triples[@]}"; do
+        if [[ "$filename" == *"$triple"* && ${#triple} -gt ${#best} ]]; then
+            best="$triple"
+        fi
+    done
+    if [[ -n "$best" ]]; then
+        printf '%s\ttriple\n' "$best"
+        return 0
+    fi
+
+    local words=" ${filename//[-_.]/ } " env matched="" matches=0
+    for triple in "${triples[@]}"; do
+        env="${triple##*-}"
+        if [[ "$words" == *" $env "* ]]; then
+            matched="$triple"
+            matches=$((matches + 1))
+        fi
+    done
+    if [[ $matches -eq 1 ]]; then
+        printf '%s\tlibc\n' "$matched"
+        return 0
+    fi
+
+    local token
+    for token in gnu musl gnueabi gnueabihf musleabi musleabihf gnux32 gnullvm msvc uclibc; do
+        if [[ "$words" == *" $token "* ]]; then
+            printf '%s\tunknown\n' "${triples[0]}"
+            return 0
+        fi
+    done
+    printf '%s\tprimary\n' "${triples[0]}"
+}
+
 # Name of the release asset a project's own curl|bash installer downloads for
 # one target, computed independently of install_script_compat so a release can
 # be checked against what the installer actually requests (bd-1tv.10). The
@@ -1137,3 +1208,4 @@ export -f artifact_naming_installer_expected_name
 export -f artifact_naming_generate_dual artifact_naming_validate
 export -f artifact_naming_substitute
 export -f artifact_naming_get_compat_pattern artifact_naming_get_versioned_pattern artifact_naming_generate_dual_for_tool
+export -f artifact_naming_generate_dual_for_variant artifact_naming_artifact_variant

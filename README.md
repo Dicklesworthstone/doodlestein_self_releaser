@@ -817,6 +817,38 @@ cross toolchain (`CARGO_TARGET_<T>_LINKER` / `CC_<t>`) or build commands that
 already invoke `zigbuild`, `xwin`, or `cross` — but an explicitly configured
 `linux_glibc_floor` is still enforced on those binaries.
 
+### gnu and musl variants of one platform
+
+A platform may list several target triples when a release ships, for example,
+both a glibc and a static musl build of `linux/amd64`:
+
+```yaml
+artifact_naming: "${name}-${version}-${target_triple}"
+install_script_compat: "${name}-${target_triple}"
+target_triples:
+  linux/amd64:
+    - x86_64-unknown-linux-gnu    # primary
+    - x86_64-unknown-linux-musl
+```
+
+The first entry is the primary variant: native builds compile it
+(`CARGO_BUILD_TARGET`), and an artifact whose name identifies no variant is
+named as it. A workflow run through act builds every variant; `dsr build`
+collects them under the platform, gives each variant it produced its own
+installer-compatible alias and configured `include_files`, and names any
+configured variant the build did not produce. `dsr release` publishes each
+artifact only under its own variant's names (an artifact names its variant by
+the full triple or by a separate `gnu`/`musl` word). When the naming pattern
+cannot tell variants apart (no `${target_triple}`), a name several variants
+derive goes to the artifact it already names, else to the primary variant,
+and the release says so instead of failing on a same-name collision.
+Generated installers select the musl or gnu build from the system's C library
+(`ld-musl` loader or `ldd --version`), accept `--libc gnu|musl`, and fall back
+to the primary variant with a warning when the release has no matching build.
+A `release_contract` names one exact primary asset per target, so it admits a
+single triple per platform; `dsr config validate` rejects empty, duplicate or
+malformed lists.
+
 With `--parallel`, two targets on one host whose build writes the same
 in-tree file (for example `go build -o tool ./cmd/tool`) no longer overwrite
 each other: the later target builds in a private copy of the source under

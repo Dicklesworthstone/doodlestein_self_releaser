@@ -656,6 +656,124 @@ test_build_refuses_attested_thin_lane_archive() {
     harness_teardown
 }
 
+# A gnu+musl tool (bd-cdcz) whose act lane builds both variants of linux/amd64.
+seed_variant_lane_fixture() {
+    local repo_dir="$1"
+    seed_lane_archive_fixture "$repo_dir"
+    cat > "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" << YAML
+tool_name: lane-tool
+repo: testuser/lane-tool
+local_path: "$repo_dir"
+language: rust
+binary_name: lane-tool
+workflow: .github/workflows/release.yml
+targets:
+  - linux/amd64
+act_job_map:
+  linux/amd64: build
+artifact_naming: "\${name}-\${version}-\${target_triple}"
+install_script_compat: "\${name}-\${target_triple}"
+archive_format:
+  linux: tar.gz
+include_files:
+  - LICENSE
+target_triples:
+  linux/amd64:
+    - x86_64-unknown-linux-gnu
+    - x86_64-unknown-linux-musl
+act_overrides:
+  platform_image: catthehacker/ubuntu:act-latest
+YAML
+    mock_command_script "act" "$(cat <<'EOF'
+if [[ "${1:-}" == "--version" ]]; then echo "act version 0.2.87"; exit 0; fi
+artifact_dir="" prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--artifact-server-path" ]]; then artifact_dir="$arg"; break; fi
+  prev="$arg"
+done
+[[ -n "$artifact_dir" ]] || exit 0
+libcs="gnu musl"
+[[ -z "${LANE_GNU_ONLY:-}" ]] || libcs="gnu"
+for libc in $libcs; do
+  mkdir -p "$artifact_dir/payload-$libc"
+  printf '#!/bin/sh\necho %s\n' "$libc" > "$artifact_dir/payload-$libc/lane-tool"
+  chmod 755 "$artifact_dir/payload-$libc/lane-tool"
+  tar -C "$artifact_dir/payload-$libc" -czf \
+    "$artifact_dir/lane-tool-1.2.3-x86_64-unknown-linux-$libc.tar.gz" lane-tool
+  rm -r "$artifact_dir/payload-$libc"
+done
+exit 0
+EOF
+)"
+}
+
+test_build_packages_each_target_triple_variant() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for target triple variant test"
+        return 0
+    fi
+
+    harness_setup
+    local repo_dir output_dir
+    repo_dir="$(harness_tmpdir)/variant-repo"
+    output_dir="$(harness_tmpdir)/variant-out"
+    seed_variant_lane_fixture "$repo_dir"
+
+    exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    local status libc name problems=()
+    status=$(exec_status)
+    [[ "$status" -eq 0 ]] || problems+=("exit $status")
+    for libc in gnu musl; do
+        for name in "lane-tool-1.2.3-x86_64-unknown-linux-$libc.tar.gz" "lane-tool-x86_64-unknown-linux-$libc.tar.gz"; do
+            [[ "$(tar -xzOf "$output_dir/$name" lane-tool 2>/dev/null | tail -1)" == "echo $libc" ]] ||
+                problems+=("$name does not hold the $libc build")
+            [[ "$(tar -tzf "$output_dir/$name" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')" == "LICENSE lane-tool " ]] ||
+                problems+=("$name lacks LICENSE")
+            jq -e --arg name "$name" '[.artifacts[] | select(.name == $name and .target == "linux/amd64")] | length == 1' \
+                "$output_dir/lane-tool-v1.2.3-manifest.json" >/dev/null 2>&1 || problems+=("manifest lacks $name")
+        done
+    done
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "build gives every target triple variant its own archive, alias and companions"
+    else
+        fail "build should package each variant: ${problems[*]}"
+        echo "stderr: $(exec_stderr | tail -15)"
+    fi
+
+    harness_teardown
+}
+
+test_build_names_unproduced_target_triple_variant() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for unproduced variant test"
+        return 0
+    fi
+
+    harness_setup
+    local repo_dir output_dir
+    repo_dir="$(harness_tmpdir)/variant-repo"
+    output_dir="$(harness_tmpdir)/variant-out"
+    seed_variant_lane_fixture "$repo_dir"
+
+    LANE_GNU_ONLY=1 exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    if [[ "$(exec_status)" -eq 0 ]] &&
+       [[ -f "$output_dir/lane-tool-x86_64-unknown-linux-gnu.tar.gz" ]] &&
+       [[ ! -e "$output_dir/lane-tool-x86_64-unknown-linux-musl.tar.gz" ]] &&
+       exec_stderr | grep -q 'Variant x86_64-unknown-linux-musl of lane-tool linux/amd64 was not produced by this build'; then
+        pass "build names a configured variant the lane did not produce"
+    else
+        fail "build should report the missing musl variant"
+        echo "stderr: $(exec_stderr | tail -15)"
+    fi
+
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: JSON Schema Validation (on error)
 # ============================================================================
@@ -760,6 +878,8 @@ echo ""
 echo "Lane Archives and include_files:"
 test_build_completes_lane_archive_with_include_files
 test_build_refuses_attested_thin_lane_archive
+test_build_packages_each_target_triple_variant
+test_build_names_unproduced_target_triple_variant
 
 echo ""
 echo "JSON Output Validation:"

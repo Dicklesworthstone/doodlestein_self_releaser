@@ -1266,6 +1266,105 @@ YAML
 # Tests: Edge Cases
 # ============================================================================
 
+# ============================================================================
+# Tests: target_triples variants (bd-cdcz)
+# ============================================================================
+
+test_target_triples_list_keeps_order_and_primary() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64, darwin/arm64]
+target_triples:
+  linux/amd64:
+    - x86_64-unknown-linux-musl
+    - x86_64-unknown-linux-gnu
+  darwin/arm64: aarch64-apple-darwin
+YAML
+
+  [[ "$(config_get_target_triples contract-tool linux/amd64)" == $'x86_64-unknown-linux-musl\nx86_64-unknown-linux-gnu' ]] &&
+    [[ "$(config_get_target_triple contract-tool linux/amd64)" == "x86_64-unknown-linux-musl" ]] &&
+    [[ "$(config_get_target_triples contract-tool darwin/arm64)" == "aarch64-apple-darwin" ]] &&
+    [[ -z "$(config_get_target_triples contract-tool windows/amd64)" ]] &&
+    config_validate_release_contract contract-tool
+}
+
+test_target_triples_registry_list() {
+  release_contract_test_deps_available || return 0
+  mkdir -p "$DSR_CONFIG_DIR"
+  cat > "$DSR_REPOS_FILE" << 'YAML'
+tools:
+  registry-tool:
+    target_triples:
+      linux/arm64: [aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl]
+YAML
+
+  [[ "$(config_get_target_triples registry-tool linux/arm64)" == $'aarch64-unknown-linux-gnu\naarch64-unknown-linux-musl' ]]
+}
+
+test_target_triples_rejects_invalid_entries() {
+  release_contract_test_deps_available || return 0
+  local value
+  for value in '[]' '[x86_64-unknown-linux-gnu, x86_64-unknown-linux-gnu]' '"x86 64"' '[ok-triple, "../up"]' '{a: b}'; do
+    write_contract_tool_config << YAML
+tool_name: contract-tool
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: $value
+YAML
+    config_get_target_triples contract-tool linux/amd64 >/dev/null && return 1
+    config_validate_release_contract contract-tool && return 1
+  done
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+target_triples: [x86_64-unknown-linux-gnu]
+YAML
+  ! config_validate_release_contract contract-tool
+}
+
+test_target_triples_variants_rejected_by_release_contract() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-x86_64-unknown-linux-gnu
+YAML
+  ! config_validate_release_contract contract-tool || return 1
+
+  # One listed triple is a single variant and stays admissible.
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-musl]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64: contract-tool-x86_64-unknown-linux-musl
+YAML
+  config_validate_release_contract contract-tool
+}
+
+test_config_validate_rejects_invalid_target_triples() {
+  release_contract_test_deps_available || return 0
+  config_init
+  config_load
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: []
+YAML
+
+  ! config_validate
+}
+
 test_load_handles_empty_config() {
   config_init
   # Create empty config file
@@ -1434,6 +1533,14 @@ main() {
   run_test "release_contract_rejects_casefold_duplicate_additional_assets" test_release_contract_rejects_casefold_duplicate_additional_assets
   run_test "release_contract_rejects_unsupported_mode" test_release_contract_rejects_unsupported_mode
   run_test "release_contract_rejects_duplicate_configured_target" test_release_contract_rejects_duplicate_configured_target
+
+  echo ""
+  echo "Target Triple Variant Tests:"
+  run_test "target_triples_list_keeps_order_and_primary" test_target_triples_list_keeps_order_and_primary
+  run_test "target_triples_registry_list" test_target_triples_registry_list
+  run_test "target_triples_rejects_invalid_entries" test_target_triples_rejects_invalid_entries
+  run_test "target_triples_variants_rejected_by_release_contract" test_target_triples_variants_rejected_by_release_contract
+  run_test "config_validate_rejects_invalid_target_triples" test_config_validate_rejects_invalid_target_triples
 
   echo ""
   echo "Edge Case Tests:"

@@ -5818,7 +5818,9 @@ act_get_build_env() {
             local derived_triple
             derived_triple=$(act_get_build_env_value "$result" "CARGO_BUILD_TARGET" 2>/dev/null || true)
             if [[ -z "$derived_triple" ]]; then
-                derived_triple=$(yq -r ".target_triples.\"$platform\" // \"\"" "$config_file" 2>/dev/null)
+                # A list of variants (bd-cdcz) builds its first, primary entry.
+                derived_triple=$(yq -r ".target_triples.\"$platform\" | select(tag == \"!!seq\") // [.] | .[0] // \"\"" \
+                    "$config_file" 2>/dev/null)
                 [[ "$derived_triple" == "null" ]] && derived_triple=""
                 [[ -n "$derived_triple" ]] || \
                     derived_triple=$(_act_default_rust_target_triple "$platform" 2>/dev/null || true)

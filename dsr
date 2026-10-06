@@ -3111,6 +3111,82 @@ EOF
         return 0
     }
 
+    # Configured include_files an archive lacks, one per line (GH#16, GH#29).
+    _build_archive_missing_includes() {
+        local tool="$1" archive="$2" archive_format="$3" repo_path="$4"
+        local include members
+        [[ -n "$repo_path" ]] || return 0
+        members=$(packaging_payload_members "$archive" "$archive_format" 2>/dev/null || echo "")
+        while IFS= read -r include; do
+            [[ -n "$include" ]] || continue
+            if [[ ! -f "$repo_path/$include" ]]; then
+                log_warn "Include file not found for $tool: $include"
+            elif ! grep -qxF -- "$include" <<< "$members"; then
+                printf '%s\n' "$include"
+            fi
+        done < <(_build_get_include_files "$tool" 2>/dev/null)
+    }
+
+    # Platforms with several target-triple variants (bd-cdcz), e.g. gnu and
+    # musl builds of linux/amd64. The build lane produces each variant's
+    # archive; give every non-primary variant it produced its own
+    # installer-compatible alias, and name the variants it did not produce.
+    # Native builds compile the primary variant only.
+    _build_emit_variant_aliases() {
+        local tool="$1" version="$2" target="$3" format="$4" naming_ext="$5"
+        local output_dir="$6" repo_path="$7" primary_versioned="$8"
+        local listed triple names_json versioned compat
+        local -a triples=()
+        listed=$(config_get_target_triples "$tool" "$target" 2>/dev/null) || return 0
+        while IFS= read -r triple; do
+            [[ -n "$triple" ]] && triples+=("$triple")
+        done <<< "$listed"
+        [[ ${#triples[@]} -gt 1 ]] || return 0
+        log_debug "Target triples for $tool $target: ${triples[*]} (primary ${triples[0]})"
+
+        for triple in "${triples[@]:1}"; do
+            names_json=$(artifact_naming_generate_dual_for_variant "$tool" "$version" \
+                "${target%/*}" "${target#*/}" "$naming_ext" "$repo_path" "$triple" 2>/dev/null) || names_json=""
+            versioned=$(jq -r '.versioned // empty' <<< "$names_json" 2>/dev/null) || versioned=""
+            compat=$(jq -r '.compat // empty' <<< "$names_json" 2>/dev/null) || compat=""
+            if [[ -z "$versioned" ]]; then
+                log_warn "Unable to name variant $triple of $tool $target"
+                continue
+            fi
+            if [[ "$versioned" == "$primary_versioned" ]]; then
+                log_warn "artifact_naming for $tool does not distinguish the variants of $target (add \${target_triple}); only ${triples[0]} gets installer names"
+                return 0
+            fi
+            if [[ ! -f "$output_dir/$versioned" || -L "$output_dir/$versioned" ]]; then
+                log_warn "Variant $triple of $tool $target was not produced by this build ($versioned); installers selecting it will find no asset"
+                continue
+            fi
+            log_info "Variant $triple of $tool $target: $versioned"
+            local variant_format include
+            local -a missing=()
+            variant_format=$(packaging_format_for_name "$versioned")
+            if [[ "$format" != "binary" && "$variant_format" != none && -n "$repo_path" ]]; then
+                while IFS= read -r include; do
+                    [[ -n "$include" ]] && missing+=("$include")
+                done < <(_build_archive_missing_includes "$tool" "$output_dir/$versioned" \
+                    "$variant_format" "$repo_path")
+                if [[ ${#missing[@]} -gt 0 ]] && ! _build_complete_lane_archive "$tool" "$target" \
+                        "$format" "$output_dir/$versioned" "$variant_format" "$compat" \
+                        "$output_dir" "$repo_path" "${missing[@]}"; then
+                    continue
+                fi
+            fi
+            [[ -n "$compat" && "$compat" != "$versioned" ]] || continue
+            if [[ "$format" == "binary" ]]; then
+                _build_emit_binary_alias "$output_dir/$versioned" "$compat" "$output_dir" "$target"
+            elif _build_is_archive_ext "$compat"; then
+                _build_emit_compat_alias "$output_dir/$versioned" "$compat" "$output_dir" "$target" "$format"
+            else
+                log_warn "Variant $triple of $tool $target: installer name $compat is not an archive; no alias emitted"
+            fi
+        done
+    }
+
     _build_package_archive_for_target() {
         local tool="$1"
         local version="$2"
@@ -3476,6 +3552,11 @@ EOF
             names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" "$naming_ext" "$repo_path" 2>/dev/null || echo "")
             versioned_name=$(echo "$names_json" | jq -r '.versioned // empty' 2>/dev/null)
             compat_name=$(echo "$names_json" | jq -r '.compat // empty' 2>/dev/null)
+
+            if [[ "$format" != "none" ]]; then
+                _build_emit_variant_aliases "$tool" "$version" "$target" "$format" "$naming_ext" \
+                    "$output_dir" "$repo_path" "$versioned_name"
+            fi
 
             local existing_format="${existing_archive_formats[$target]:-}"
             if [[ -z "$existing_format" && -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
@@ -6342,17 +6423,22 @@ EOF
         log_ok "Strict release contract preflight passed"
     fi
 
-    # Every name one manifest artifact is published under: the manifest name,
-    # then its versioned and installer-compatible names and the x86_64/aarch64
-    # spelling of the compat name. SHA256SUMS, the upload loop and the dry-run
-    # plan all use this list, so a plan always matches what is uploaded.
-    _release_artifact_upload_names() {
-        local filename="$1" target="$2" format="$3"
+    # Every name one manifest artifact could be published under: the manifest
+    # name, then its versioned and installer-compatible names and the
+    # x86_64/aarch64 spelling of the compat name, all rendered for the variant
+    # (target triple) the artifact belongs to (bd-cdcz), so a musl build of
+    # linux/amd64 never takes the gnu build's names.
+    _release_artifact_candidate_names() {
+        local filename="$1" target="$2" format="$3" triple="${4:-}"
         local -a names=("$filename")
         local os arch ext names_json versioned compat alias candidate existing duplicate
         if [[ "$target" == */* ]]; then
             os="${target%/*}"
             arch="${target#*/}"
+            if [[ -z "$triple" ]]; then
+                triple=$(artifact_naming_artifact_variant "$tool_name" "$os" "$arch" "$filename" 2>/dev/null) || triple=""
+                triple="${triple%%$'\t'*}"
+            fi
             ext="$format"
             case "$ext" in
                 none) ext="" ;;
@@ -6369,8 +6455,15 @@ EOF
                     *.exe) ext="exe" ;;
                 esac
             fi
-            if [[ -n "$ext" ]] && names_json=$(artifact_naming_generate_dual_for_tool \
-                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" 2>/dev/null); then
+            names_json=""
+            if [[ -n "$ext" && -n "$triple" ]]; then
+                names_json=$(artifact_naming_generate_dual_for_variant \
+                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" "$triple" 2>/dev/null) || names_json=""
+            elif [[ -n "$ext" ]]; then
+                names_json=$(artifact_naming_generate_dual_for_tool \
+                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" 2>/dev/null) || names_json=""
+            fi
+            if [[ -n "$names_json" ]]; then
                 versioned=$(jq -r '.versioned // empty' <<< "$names_json" 2>/dev/null) || versioned=""
                 compat=$(jq -r '.compat // empty' <<< "$names_json" 2>/dev/null) || compat=""
                 alias=""
@@ -6393,6 +6486,102 @@ EOF
         fi
         printf '%s\n' "${names[@]}"
     }
+
+    # Resolve the upload names of every manifest artifact together. Variants
+    # whose naming pattern cannot tell them apart (no ${target_triple}) still
+    # derive the same compat name; a name claimed by artifacts with different
+    # bytes goes to the artifact it already names, else to the platform's
+    # primary variant, else to none, instead of failing the release on a
+    # same-name collision or letting manifest order pick the bytes.
+    local -A release_upload_plan=()
+    _release_plan_upload_names() {
+        local -A claimants=() rank=() sha_of=() artifact_candidates=()
+        local -a order=()
+        local a_name a_sha a_target a_format variant triple how primary candidate
+        while IFS=$'\t' read -r a_name a_sha a_target a_format; do
+            [[ -n "$a_name" ]] || continue
+            order+=("$a_name")
+            sha_of["$a_name"]="$a_sha"
+            triple="" how="" rank["$a_name"]=2
+            if [[ "$a_target" == */* ]] && variant=$(artifact_naming_artifact_variant \
+                    "$tool_name" "${a_target%/*}" "${a_target#*/}" "$a_name" 2>/dev/null); then
+                triple="${variant%%$'\t'*}"
+                how="${variant#*$'\t'}"
+                primary=$(config_get_target_triple "$tool_name" "$a_target" 2>/dev/null) || primary=""
+                if [[ "$how" == unknown ]]; then
+                    rank["$a_name"]=0
+                elif [[ -n "$primary" && "$triple" != "$primary" ]]; then
+                    rank["$a_name"]=1
+                fi
+                log_debug "Release variant for $a_name: $triple ($how)"
+            fi
+            artifact_candidates["$a_name"]=$(_release_artifact_candidate_names \
+                "$a_name" "$a_target" "$a_format" "$triple")
+            while IFS= read -r candidate; do
+                [[ -n "$candidate" ]] || continue
+                claimants["$candidate"]+="$a_name"$'\n'
+            done <<< "${artifact_candidates[$a_name]}"
+        done < <(jq -r '.artifacts[] | [(.name // .filename), .sha256, .target // "", .archive_format // ""] | @tsv' \
+            <<< "$ordinary_manifest")
+
+        local claimant winner best best_count distinct_sha first_sha
+        local -A reported=()
+        for a_name in "${order[@]}"; do
+            local planned=""
+            while IFS= read -r candidate; do
+                [[ -n "$candidate" ]] || continue
+                winner="" distinct_sha=false first_sha=""
+                while IFS= read -r claimant; do
+                    [[ -n "$claimant" ]] || continue
+                    [[ -z "$first_sha" ]] && first_sha="${sha_of[$claimant]}"
+                    [[ "${sha_of[$claimant]}" != "$first_sha" ]] && distinct_sha=true
+                done <<< "${claimants[$candidate]}"
+                if $distinct_sha; then
+                    if [[ -n "${sha_of[$candidate]+set}" ]]; then
+                        winner="$candidate"
+                    else
+                        best=-1 best_count=0
+                        while IFS= read -r claimant; do
+                            [[ -n "$claimant" ]] || continue
+                            if [[ ${rank[$claimant]} -gt $best ]]; then
+                                best=${rank[$claimant]} best_count=1 winner="$claimant"
+                            elif [[ ${rank[$claimant]} -eq $best ]]; then
+                                best_count=$((best_count + 1))
+                            fi
+                        done <<< "${claimants[$candidate]}"
+                        [[ $best_count -eq 1 ]] || winner=""
+                    fi
+                    if [[ -z "${reported[$candidate]:-}" ]]; then
+                        reported["$candidate"]=1
+                        if [[ -n "$winner" ]]; then
+                            log_info "Upload name $candidate is derived by several variants; publishing it as $winner"
+                        else
+                            log_warn "Upload name $candidate is derived by several variants with no primary among them; not publishing it"
+                        fi
+                    fi
+                    [[ "$winner" == "$a_name" ]] || continue
+                fi
+                planned+="$candidate"$'\n'
+            done <<< "${artifact_candidates[$a_name]}"
+            release_upload_plan["$a_name"]="$planned"
+        done
+    }
+
+    # The names one manifest artifact is published under. SHA256SUMS, the
+    # upload loop and the dry-run plan all use this list, so a plan always
+    # matches what is uploaded.
+    _release_artifact_upload_names() {
+        local filename="$1" target="$2" format="$3"
+        if [[ -n "${release_upload_plan[$filename]+set}" ]]; then
+            printf '%s' "${release_upload_plan[$filename]}"
+            return 0
+        fi
+        _release_artifact_candidate_names "$filename" "$target" "$format"
+    }
+
+    if [[ "$ordinary_manifest" != null ]]; then
+        _release_plan_upload_names
+    fi
 
     # Check the names a project's own curl|bash installer downloads against the
     # published (or planned) asset names read from stdin, one per line

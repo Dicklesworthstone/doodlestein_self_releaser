@@ -16,6 +16,7 @@ log_info() { printf 'INFO: %s\n' "$*" >&2; }
 log_ok() { log_info "$@"; }
 log_warn() { printf 'WARN: %s\n' "$*" >&2; }
 log_error() { printf 'ERROR: %s\n' "$*" >&2; }
+log_debug() { :; }
 log_set_tool() { :; }
 _dsr_require() { :; }
 act_load_repo_config() { return 0; }
@@ -371,6 +372,81 @@ test_installer_mismatch_does_not_fail_verified_release() {
         grep -q 'downloads tool-linux-x86_64.tar.xz' "$CASE/stderr"
 }
 
+# bd-cdcz: gnu and musl builds of one platform. Each is published under the
+# names of its own variant; a name both derive (naming without
+# ${target_triple}) goes to the artifact it already names, else to the
+# primary variant -- never to manifest order or a same-name upload failure.
+variant_fixture() {
+    artifact_naming_artifact_variant() {
+        case "$4" in
+            *musl*) printf 'x86_64-unknown-linux-musl\tlibc\n' ;;
+            *) printf 'x86_64-unknown-linux-gnu\tprimary\n' ;;
+        esac
+    }
+    config_get_target_triple() { printf 'x86_64-unknown-linux-gnu\n'; }
+    artifact_naming_generate_dual_for_variant() {
+        local platform="$3-$4"
+        [[ "$TRIPLE_NAMING" == true ]] && platform="$7"
+        jq -nc --arg versioned "tool-${2#v}-$platform.$5" --arg compat "tool-$platform.$5" \
+            '{versioned:$versioned,compat:$compat,same:($versioned==$compat)}'
+    }
+    local name rows='[]' sha
+    for name in "$@"; do
+        printf '%s payload\n' "$name" > "$CASE/artifacts/$name"
+        sha=$(_gh_asset_sha256 "$CASE/artifacts/$name") || return 1
+        rows=$(jq -c --arg name "$name" --arg sha "$sha" \
+            '. + [{name:$name,sha256:$sha,target:"linux/amd64",archive_format:"tar.gz"}]' <<< "$rows")
+    done
+    jq -nc --argjson rows "$rows" '{tool:"tool",version:"v1.2.3",status:"success",artifacts:$rows}' > \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json"
+}
+
+planned_names() {
+    jq -c --arg name "$1" '.details.plan.artifacts[] | select(.name == $name) | .upload_names' "$CASE/stdout"
+}
+
+test_variants_publish_under_their_own_triple_names() {
+    setup variant_triples
+    TRIPLE_NAMING=true
+    variant_fixture tool-1.2.3-x86_64-unknown-linux-musl.tar.gz tool-1.2.3-x86_64-unknown-linux-gnu.tar.gz
+    DRY_RUN=true
+    run_release --resume
+    [[ $STATUS -eq 0 ]] &&
+        [[ "$(planned_names tool-1.2.3-x86_64-unknown-linux-musl.tar.gz)" == \
+            '["tool-1.2.3-x86_64-unknown-linux-musl.tar.gz","tool-x86_64-unknown-linux-musl.tar.gz"]' ]] &&
+        [[ "$(planned_names tool-1.2.3-x86_64-unknown-linux-gnu.tar.gz)" == \
+            '["tool-1.2.3-x86_64-unknown-linux-gnu.tar.gz","tool-x86_64-unknown-linux-gnu.tar.gz"]' ]]
+}
+
+test_shared_variant_names_go_to_the_primary_build() {
+    setup variant_shared
+    TRIPLE_NAMING=false
+    # The musl row comes first: manifest order must not pick the bytes.
+    variant_fixture tool-1.2.3-linux-amd64-musl.tar.gz tool-1.2.3-linux-amd64.tar.gz
+    DRY_RUN=true
+    run_release --resume
+    [[ $STATUS -eq 0 ]] &&
+        [[ "$(planned_names tool-1.2.3-linux-amd64-musl.tar.gz)" == '["tool-1.2.3-linux-amd64-musl.tar.gz"]' ]] &&
+        [[ "$(planned_names tool-1.2.3-linux-amd64.tar.gz)" == \
+            '["tool-1.2.3-linux-amd64.tar.gz","tool-linux-amd64.tar.gz","tool-linux-x86_64.tar.gz"]' ]] &&
+        grep -q 'Upload name tool-linux-amd64.tar.gz is derived by several variants; publishing it as tool-1.2.3-linux-amd64.tar.gz' "$CASE/stderr"
+}
+
+test_shared_variant_names_upload_without_collision() {
+    setup variant_upload
+    TRIPLE_NAMING=false
+    variant_fixture tool-1.2.3-linux-amd64-musl.tar.gz tool-1.2.3-linux-amd64.tar.gz
+    run_release --resume
+    local gnu_sha compat_sha
+    gnu_sha=$(_gh_asset_sha256 "$CASE/artifacts/tool-1.2.3-linux-amd64.tar.gz")
+    compat_sha=$(jq -r '.[] | select(.name == "tool-linux-amd64.tar.gz") | .digest' "$CASE/inventory.json")
+    [[ $STATUS -eq 0 && "$compat_sha" == "sha256:$gnu_sha" ]] &&
+        [[ "$(grep -c '^POST tool-linux-amd64.tar.gz$' "$CALLS")" == 1 ]] &&
+        grep -Fxq 'POST tool-1.2.3-linux-amd64-musl.tar.gz' "$CALLS" &&
+        grep -q "^$gnu_sha  tool-linux-amd64.tar.gz\$" "$CASE/artifacts/SHA256SUMS" &&
+        ! grep -q 'Different artifact contents' "$CASE/stderr"
+}
+
 test_remote_drift_after_upload_prevents_success() {
     setup final_drift
     FINAL_DRIFT=true
@@ -471,6 +547,8 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_strict_preflight_remains_required test_dry_run_has_no_network_or_checkpoint_writes \
     test_dry_run_plans_every_upload_name test_dry_run_reports_installer_mismatch \
     test_release_records_installer_check_after_upload test_installer_mismatch_does_not_fail_verified_release \
+    test_variants_publish_under_their_own_triple_names test_shared_variant_names_go_to_the_primary_build \
+    test_shared_variant_names_upload_without_collision \
     test_remote_drift_after_upload_prevents_success test_release_visibility_drift_prevents_dispatch \
     test_checkpoint_symlink_failure_preserves_foreign_file test_checkpoint_receipt_is_bound_and_private \
     test_partial_release_resumes_only_missing_upload test_completed_release_resume_does_not_reupload \

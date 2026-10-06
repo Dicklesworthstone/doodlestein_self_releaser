@@ -80,6 +80,7 @@ _install_gen_template() {
 #   --prefer-source-if-stale  Use --source-if-stale with a default threshold of 10
 #   --stale-threshold N       Threshold for --prefer-source-if-stale (0 through 999999)
 #   --no-skills              Skip AI coding agent skill installation
+#   --libc gnu|musl          Linux build variant to install (default: this system's C library)
 #   --help                   Show this help
 #
 # AI Coding Agent Skills:
@@ -142,6 +143,8 @@ _SOURCE_RECEIPT=null
 _SOURCE_IF_STALE=""
 _RELEASE_FRESHNESS=null
 _KEEP_SOURCE_LOGS=false
+_LIBC=""
+_TARGET_TRIPLE=""
 # Working directory created by main(). Declared at script scope so the
 # EXIT trap (which fires AFTER main returns and its locals have been
 # popped) can still see it and clean up. Leaving this as `local temp_dir`
@@ -356,7 +359,9 @@ __ARCH_ALIAS_CASES__
     echo "$arch"
 }
 
-_resolve_target_triple() {
+# Target triples released for a platform, primary first. A platform that
+# ships gnu and musl builds lists both.
+_target_triple_candidates() {
     local os="$1"
     local arch="$2"
 
@@ -373,6 +378,52 @@ __TARGET_TRIPLE_CASES__
         windows/arm64) echo "aarch64-pc-windows-msvc" ;;
         *) echo "${os}-${arch}" ;;
     esac
+}
+
+# C library of this Linux system: musl or gnu.
+_detect_linux_libc() {
+    local loader
+    for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
+        if [[ -e "$loader" ]]; then
+            echo musl
+            return 0
+        fi
+    done
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+        echo musl
+        return 0
+    fi
+    echo gnu
+}
+
+# The variant to install: the --libc request, else this Linux system's C
+# library. When the release has no such variant, install the primary one.
+_select_target_triple() {
+    local os="$1" arch="$2" candidates libc="$_LIBC" triple
+    candidates=$(_target_triple_candidates "$os" "$arch")
+    if [[ "$os" != linux || ( "$candidates" != *" "* && -z "$libc" ) ]]; then
+        echo "${candidates%% *}"
+        return 0
+    fi
+    [[ -n "$libc" ]] || libc=$(_detect_linux_libc)
+    for triple in $candidates; do
+        if [[ -n "$libc" && "${triple##*-}" == "$libc"* ]]; then
+            echo "$triple"
+            return 0
+        fi
+    done
+    _log_warn "No ${libc:-matching} build of $TOOL_NAME is released for ${os}/${arch}; installing ${candidates%% *}"
+    echo "${candidates%% *}"
+}
+
+_resolve_target_triple() {
+    if [[ -n "$_TARGET_TRIPLE" ]]; then
+        echo "$_TARGET_TRIPLE"
+        return 0
+    fi
+    local candidates
+    candidates=$(_target_triple_candidates "$1" "$2")
+    echo "${candidates%% *}"
 }
 
 _apply_artifact_pattern() {
@@ -1112,6 +1163,14 @@ main() {
                 _SKIP_SKILLS=true
                 shift
                 ;;
+            --libc)
+                [[ $# -ge 2 && "$2" =~ ^(gnu|musl)$ ]] || {
+                    _log_error "--libc requires gnu or musl"
+                    return 4
+                }
+                _LIBC="$2"
+                shift 2
+                ;;
             --help|-h)
                 grep '^#' "$0" | grep -v '^#!/' | sed 's/^# //' | sed 's/^#//'
                 return 0
@@ -1158,6 +1217,15 @@ main() {
     local platform
     platform=$(_detect_platform) || return $?
     _log_info "Platform: $platform"
+    _TARGET_TRIPLE=$(_select_target_triple "${platform%/*}" "${platform#*/}")
+    if [[ ! "$_TARGET_TRIPLE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        _log_error "Unresolved target triple for $platform"
+        return 4
+    fi
+    if [[ "$platform" == linux/* ]] &&
+       [[ -n "$_LIBC" || "$(_target_triple_candidates "${platform%/*}" "${platform#*/}")" == *" "* ]]; then
+        _log_info "Target: $_TARGET_TRIPLE"
+    fi
 
     if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
           ! "$TOOL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
@@ -1511,14 +1579,34 @@ install_gen_create() {
     local target_triple_cases=""
     local arch_alias_cases=""
     if command -v yq &>/dev/null; then
+        # A platform lists one triple or several variants, primary first
+        # (bd-cdcz); the installer picks among them at run time. Both sides
+        # become installer code, so only plain names are admitted.
+        local triples_tsv
+        if ! triples_tsv=$(yq -r '.target_triples // {} | to_entries[] |
+                [.key, ((.value | select(tag == "!!seq") | join(" ")) // .value)] | @tsv' \
+                "$config_file" 2>/dev/null); then
+            log_error "Invalid target_triples in $config_file"
+            return 4
+        fi
         while IFS=$'\t' read -r platform triple; do
             [[ -z "$platform" || -z "$triple" || "$platform" == "null" || "$triple" == "null" ]] && continue
-            target_triple_cases+=$'        '"$platform"$') echo "'"$triple"'" ;;'$'\n'
-        done < <(yq -r '.target_triples // {} | to_entries[] | [.key, .value] | @tsv' "$config_file" 2>/dev/null)
+            if [[ ! "$platform" =~ ^[a-z0-9]+/[a-z0-9_]+$ ||
+                  ! "$triple" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*( [A-Za-z0-9][A-Za-z0-9._-]*)*$ ]]; then
+                log_error "Invalid target_triples entry for $platform: $triple"
+                return 4
+            fi
+            # Return: the template's default table below must not also print.
+            target_triple_cases+=$'        '"$platform"$') echo "'"$triple"'"; return 0 ;;'$'\n'
+        done <<< "$triples_tsv"
 
         while IFS=$'\t' read -r arch alias; do
             [[ -z "$arch" || -z "$alias" || "$arch" == "null" || "$alias" == "null" ]] && continue
-            arch_alias_cases+=$'        '"$arch"$') echo "'"$alias"'" ;;'$'\n'
+            if [[ ! "$arch" =~ ^[a-z0-9_]+$ || ! "$alias" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                log_error "Invalid arch_aliases entry: $arch: $alias"
+                return 4
+            fi
+            arch_alias_cases+=$'        '"$arch"$') echo "'"$alias"'"; return 0 ;;'$'\n'
         done < <(yq -r '.arch_aliases // {} | to_entries[] | [.key, .value] | @tsv' "$config_file" 2>/dev/null)
     fi
 
