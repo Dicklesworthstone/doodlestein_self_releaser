@@ -1,93 +1,47 @@
-# Narrow source-object preparation; no branch/ref mutation or release writes.
 name: Snapshot verification regression tests
 on:
   push:
     branches: [main]
     paths:
+      - src/act_runner.sh
+      - scripts/tests/test_unix_snapshot_batch.sh
       - .github/workflows/snapshot-regression.yml
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
-  group: unix-snapshot-repair-linux-slim
+  group: unix-snapshot-regression-main
   cancel-in-progress: false
 jobs:
-  verify-repair:
-    if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser'
-    runs-on: ubuntu-slim
+  verify-snapshot:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Install verification dependencies
+      - name: Install POSIX snapshot verification dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3 git jq gcc tar gzip zip unzip xz-utils minisign golang-go gh
-          mkdir -p "$RUNNER_TEMP/dsr-test-bin"
-          GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
-          echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
-      - name: Retrieve reviewed repair and exact regression blobs
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(git hash-object src/act_runner.sh)" = 75db6e9a7e8e0b7b3ad07225778efd39dd2a562c
-          test "$(git hash-object dsr)" = cf6a26ea90c2c8a386fbc87a62132150521237b2
-          test -z "$(git status --porcelain)"
-          test ! -e scripts/tests/test_unix_snapshot_batch.sh
-          test ! -e scripts/tests/test_legacy_checksum_aggregate.sh
-          gh api "repos/$GITHUB_REPOSITORY/git/blobs/8d7216779f4169ba76d558c511c9345c7391e05d" --jq .content | base64 -d > "$RUNNER_TEMP/aggregate.patch"
-          gh api "repos/$GITHUB_REPOSITORY/git/blobs/b8c1e544ad00074b4b4f149b12c52a3b4734f6a3" --jq .content | base64 -d > "$RUNNER_TEMP/snapshot.patch"
-          echo "75e5c2c9787735f70563b5b7b547cebc543b48631a34a38ff6c97a619d9e63fb  $RUNNER_TEMP/aggregate.patch" | sha256sum --check
-          echo "a7a9e33ceae3231ae9700318f45c3273a9e1fa957d6ec0c84b6bd0613d911db7  $RUNNER_TEMP/snapshot.patch" | sha256sum --check
-          gh api "repos/$GITHUB_REPOSITORY/git/blobs/d9c6a7144ae973d2538e263f5339895e695d13b9" --jq .content | base64 -d > scripts/tests/test_legacy_checksum_aggregate.sh
-          gh api "repos/$GITHUB_REPOSITORY/git/blobs/07fd9a26af90cf07a60986b1f9b61dfe2766c6ef" --jq .content | base64 -d > scripts/tests/test_unix_snapshot_batch.sh
-          test "$(git hash-object scripts/tests/test_legacy_checksum_aggregate.sh)" = d9c6a7144ae973d2538e263f5339895e695d13b9
-          test "$(git hash-object scripts/tests/test_unix_snapshot_batch.sh)" = 07fd9a26af90cf07a60986b1f9b61dfe2766c6ef
-          git apply --check "$RUNNER_TEMP/aggregate.patch"
-          git apply --check "$RUNNER_TEMP/snapshot.patch"
-      - name: Require the original per-file process regression
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends python3 git tar mawk grep coreutils dash
+          else
+            command -v python3 >/dev/null || brew install python
+            command -v git >/dev/null || brew install git
+            if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
+            echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Verify generated snapshot program against real Git and filesystem mutations
         shell: bash
         run: |
           set -euo pipefail
-          rc=0
-          bash scripts/tests/test_unix_snapshot_batch.sh > "$RUNNER_TEMP/snapshot-baseline.log" 2>&1 || rc=$?
-          cat "$RUNNER_TEMP/snapshot-baseline.log"
-          test "$rc" -ne 0
-          grep -F 'AssertionError: sh hashes regular files in one Git process plus the symlink probe' "$RUNNER_TEMP/snapshot-baseline.log"
-      - name: Verify snapshot and checksum repairs together
-        shell: bash
-        run: |
-          set -euo pipefail
-          git apply "$RUNNER_TEMP/aggregate.patch"
-          git apply "$RUNNER_TEMP/snapshot.patch"
           git diff --check
-          bash -n dsr
           bash -n src/act_runner.sh
           bash -n scripts/tests/test_unix_snapshot_batch.sh
-          bash -n scripts/tests/test_legacy_checksum_aggregate.sh
           bash scripts/tests/test_unix_snapshot_batch.sh
-          bash scripts/tests/test_legacy_checksum_aggregate.sh
-      - name: Store tested objects without changing any branch
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(git diff --name-only)" = $'dsr\nsrc/act_runner.sh'
-          test "$(git ls-files --others --exclude-standard)" = $'scripts/tests/test_legacy_checksum_aggregate.sh\nscripts/tests/test_unix_snapshot_batch.sh'
-          source_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@src/act_runner.sh --jq .sha)
-          command_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@dsr --jq .sha)
-          test "$source_blob" = "$(git hash-object src/act_runner.sh)"
-          test "$command_blob" = "$(git hash-object dsr)"
-          jq -nc --arg base "$(git rev-parse HEAD^{tree})" --arg source "$source_blob" --arg command "$command_blob" \
-            '{base_tree:$base,tree:[{path:"src/act_runner.sh",mode:"100644",type:"blob",sha:$source},{path:"dsr",mode:"100755",type:"blob",sha:$command},{path:"scripts/tests/test_legacy_checksum_aggregate.sh",mode:"100755",type:"blob",sha:"d9c6a7144ae973d2538e263f5339895e695d13b9"},{path:"scripts/tests/test_unix_snapshot_batch.sh",mode:"100755",type:"blob",sha:"07fd9a26af90cf07a60986b1f9b61dfe2766c6ef"}]}' > "$RUNNER_TEMP/snapshot-tree.json"
-          tree=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/trees" --input "$RUNNER_TEMP/snapshot-tree.json" --jq .sha)
-          printf 'DSR_SNAPSHOT_VERIFIED_PARENT %s\n' "$(git rev-parse HEAD)"
-          printf 'DSR_SNAPSHOT_VERIFIED_SOURCE %s\n' "$source_blob"
-          printf 'DSR_SNAPSHOT_VERIFIED_COMMAND %s\n' "$command_blob"
-          printf 'DSR_SNAPSHOT_VERIFIED_TREE %s\n' "$tree"

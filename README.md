@@ -288,10 +288,14 @@ one `<primary>.minisig` per contracted primary, and verifies downloaded release
 bytes before publication and during `dsr release verify`. The private key stays
 outside the repository and may be selected with `DSR_MINISIGN_KEY`.
 
-An exact release contract may include `SHA256SUMS` or `SHA256SUMS.txt` in
-`exact_additional_assets`, together with its `.minisig` signature. DSR derives
-the aggregate from the manifest's primary and additional payloads and verifies
-the downloaded aggregate and signature as well as every primary signature.
+An exact release contract may include `SHA256SUMS`, `SHA256SUMS.txt`, or the
+legacy `checksums.txt` in `exact_additional_assets`, together with each selected
+aggregate's `.minisig` signature. All three names use the same sorted checksum
+entries, derived from the manifest's primary and additional payloads after
+native collection; they do not belong to an individual build target. DSR
+verifies the downloaded aggregate and signature as well as every primary
+signature. An existing aggregate must already match those exact bytes and
+must be a regular file; retries refuse mismatched or linked aggregates.
 List primary signatures only through `minisign_public_key_file`; they are
 implicit assets and must not also appear in `exact_additional_assets`.
 

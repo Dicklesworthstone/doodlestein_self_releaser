@@ -4152,7 +4152,7 @@ _release_contract_preflight() {
     base_additional_json=$(jq -c '
         [(.exact_additional_assets // [])[] |
          select((endswith(".sha256") or endswith(".minisig") or
-                 startswith("SHA256SUMS")) | not)] | sort
+                 . == "SHA256SUMS" or . == "SHA256SUMS.txt" or . == "checksums.txt") | not)] | sort
     ' <<< "$contract_json") || return 4
     base_additional_count=$(jq -r 'length' <<< "$base_additional_json") || return 4
     expected_manifest_count=$((expected_count + base_additional_count))
@@ -4592,6 +4592,8 @@ _release_contract_preflight() {
     # A contracted aggregate checksum is derived from every manifest-bound
     # primary and base additional artifact.  It is never accepted as an
     # unrelated pre-existing file.
+    # Only these exact conventional basenames are derived aggregates. Legacy
+    # checksums.txt is an alias of the same sorted payload inventory (GH #28).
     local aggregate_name
     while IFS= read -r aggregate_name; do
         local aggregate_path="$artifacts_dir/$aggregate_name"
@@ -4656,7 +4658,8 @@ _release_contract_preflight() {
                  size_bytes: $size_bytes, kind: "minisign"}')")
         fi
     done < <(jq -r '(.exact_additional_assets // []) |
-        map(select(. == "SHA256SUMS" or . == "SHA256SUMS.txt")) | sort[]' \
+        map(select(. == "SHA256SUMS" or . == "SHA256SUMS.txt" or
+                   . == "checksums.txt")) | sort[]' \
         <<< "$contract_json")
 
     local planned_additional_names contracted_additional_names

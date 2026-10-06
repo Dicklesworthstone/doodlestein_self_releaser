@@ -1639,7 +1639,8 @@ _act_contract_for_build_purpose() {
     if ! jq -en --argjson owners "$ownership" --argjson contract "$contract" '
         [$owners[][]] as $owned |
         [($contract.exact_additional_assets // [])[] |
-         select((endswith(".sha256") or endswith(".minisig") or startswith("SHA256SUMS")) | not)] as $expected |
+         select((endswith(".sha256") or endswith(".minisig") or
+                 . == "SHA256SUMS" or . == "SHA256SUMS.txt" or . == "checksums.txt") | not)] as $expected |
         ($owned | length) == ($owned | unique | length) and
         ($owned | sort) == ($expected | sort)
     ' >/dev/null; then
@@ -4646,13 +4647,18 @@ else
     manifest_digest=\$(shasum -a 256 '$remote_manifest' | awk '{print \$1}')
 fi
 test "\$manifest_digest" = '$expected_manifest_digest'
+# Validate the complete manifest in one process. Per-file grep and Git
+# launches made large source snapshots spend most of their time spawning
+# processes instead of reading the tracked bytes. Keep the same path alphabet.
+LC_ALL=C awk -F '\\t' '
+    NF != 3 || length(\$1) != 40 || \$1 ~ /[^0-9a-f]/ ||
+    \$2 !~ /^(100644|100755|120000|160000)\$/ ||
+    \$3 !~ /^[][A-Za-z0-9_.\/+@~#,=() -]+\$/ ||
+    substr(\$3,1,1) == "/" || index(\$3,"..") || seen[\$3]++ { bad=1; exit }
+    END { if (bad || NR == 0) exit 21 }
+' '$remote_manifest'
 tab=\$(printf '\\t')
-while IFS="\$tab" read -r object_id mode relative_path; do
-    test -n "\$relative_path"
-    printf '%s\\n' "\$object_id" | grep -Eq '^[0-9a-f]{40}\$'
-    case "\$mode" in 100644|100755|120000|160000) :;; *) exit 21;; esac
-    case "\$relative_path" in /*|*..*) exit 21;; esac
-    printf '%s\\n' "\$relative_path" | grep -Eq '^[][A-Za-z0-9_./+@~#,=() -]+\$'
+while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_path"; do
     node='$remote_path'/\$relative_path
     parent=\$relative_path
     while test "\${parent#*/}" != "\$parent"; do
@@ -4697,10 +4703,30 @@ while IFS="\$tab" read -r object_id mode relative_path; do
     else
         test -f "\$node"
         test ! -L "\$node"
-        actual=\$(git hash-object --no-filters -- "\$node")
-        test "\$actual" = "\$object_id"
         if test "\$mode" = 100755; then test -x "\$node"; else test ! -x "\$node"; fi
     fi
+done < '$remote_manifest'
+# The validated alphabet excludes quotes, backslashes and newlines: stdin
+# paths are literal and cannot acquire Git's quoted-path interpretation.
+# Capture both projections first so a producer error is never masked by Git.
+hash_paths=\$(LC_ALL=C awk -F '\\t' '\$2 == "100644" || \$2 == "100755" { print \$3 }' '$remote_manifest')
+expected_hashes=\$(LC_ALL=C awk -F '\\t' '\$2 == "100644" || \$2 == "100755" { print \$1 }' '$remote_manifest')
+if test -n "\$hash_paths"; then
+    hashes=\$(printf '%s\\n' "\$hash_paths" | git -C '$remote_path' hash-object --no-filters --stdin-paths)
+    test "\$hashes" = "\$expected_hashes"
+fi
+# A matching byte digest cannot authorize a link or executable-mode change
+# during the batch. Recheck regular objects and their ancestor chains.
+while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_path"; do
+    case "\$mode" in 100644|100755) :;; *) continue;; esac
+    node='$remote_path'/\$relative_path
+    test -f "\$node"; test ! -L "\$node"
+    if test "\$mode" = 100755; then test -x "\$node"; else test ! -x "\$node"; fi
+    parent=\$relative_path
+    while test "\${parent#*/}" != "\$parent"; do
+        parent=\${parent%/*}
+        test -d '$remote_path'/"\$parent"; test ! -L '$remote_path'/"\$parent"
+    done
 done < '$remote_manifest'
 actual_count=\$(find '$remote_path' -mindepth 1 -print | wc -l | tr -d '[:space:]')
 test "\$actual_count" = '$expected_object_count'
@@ -9334,7 +9360,7 @@ _act_generate_contract_manifest() {
     base_additional_json=$(jq -c '
         [(.exact_additional_assets // [])[] |
          select((endswith(".sha256") or endswith(".minisig") or
-                 startswith("SHA256SUMS")) | not)] | sort
+                 . == "SHA256SUMS" or . == "SHA256SUMS.txt" or . == "checksums.txt") | not)] | sort
     ' <<< "$contract_json") || return 4
     base_additional_count=$(jq -r 'length' <<< "$base_additional_json") || return 4
     manifest_artifact_count=$((expected_count + base_additional_count))
