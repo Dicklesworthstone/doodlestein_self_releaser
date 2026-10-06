@@ -329,6 +329,9 @@ targets:
   - linux/amd64
 act_job_map:
   linux/amd64: build
+# Non-interactive act fails closed without a runner image mapping.
+act_overrides:
+  platform_image: catthehacker/ubuntu:act-latest
 YAML
 }
 
@@ -363,8 +366,20 @@ exit 0
 EOF
 )"
 
+    # A small stateful GitHub: one release (id 123, tag v1.2.3) whose asset
+    # inventory holds exactly what the verified uploader POSTed, with GitHub's
+    # server-side digests, so release re-verification reads real state.
     mock_command_script "gh" "$(cat <<'EOF'
 echo "$@" >> "$MOCK_LOG_DIR/gh.calls"
+state="$MOCK_LOG_DIR/github-state"
+mkdir -p "$state"
+[[ -f "$state/assets.json" ]] || echo '[]' > "$state/assets.json"
+release_json() {
+  jq -nc --slurpfile assets "$state/assets.json" '{
+    id: 123, tag_name: "v1.2.3", name: "v1.2.3", draft: false, prerelease: false,
+    upload_url: "https://uploads.github.com/repos/testuser/test-tool/releases/123/assets{?name,label}",
+    html_url: "https://github.com/testuser/test-tool/releases/tag/v1.2.3", assets: $assets[0]}'
+}
 if [[ "$1" == "auth" && "$2" == "status" ]]; then
   echo "Logged in"
   exit 0
@@ -374,10 +389,34 @@ if [[ "$1" == "auth" && "$2" == "token" ]]; then
   exit 0
 fi
 if [[ "$1" == "api" ]]; then
-  cat >/dev/null
-  cat <<JSON
-{"id": 123, "upload_url": "https://uploads.example.com/repos/testuser/test-tool/releases/123/assets{?name,label}", "html_url": "https://github.com/testuser/test-tool/releases/tag/v1.2.3"}
-JSON
+  endpoint="$2"
+  shift 2
+  method=GET
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -X|--method) method="$2"; shift 2 ;;
+      --input) cat >/dev/null; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  page="${endpoint##*page=}"
+  case "$endpoint:$method" in
+    repos/testuser/test-tool/releases:POST)
+      : > "$state/created"; release_json ;;
+    repos/testuser/test-tool/releases/123:GET)
+      release_json ;;
+    repos/testuser/test-tool/releases/tags/v1.2.3:GET)
+      [[ -f "$state/created" ]] || { echo 'gh: Not Found (HTTP 404)' >&2; exit 1; }
+      release_json ;;
+    repos/testuser/test-tool/releases\?per_page=100\&page=*:GET)
+      if [[ -f "$state/created" && "$page" == 1 ]]; then release_json | jq -c '[.]'; else echo '[]'; fi ;;
+    repos/testuser/test-tool/releases/123/assets\?per_page=100\&page=*:GET)
+      if [[ "$page" == 1 ]]; then cat "$state/assets.json"; else echo '[]'; fi ;;
+    repos/testuser/test-tool/releases/assets/*:GET)
+      cat "$state/asset-${endpoint##*/}" ;;
+    *)
+      echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  esac
   exit 0
 fi
 echo "{}"
@@ -385,9 +424,36 @@ exit 0
 EOF
 )"
 
+    # The verified uploader's curl contract: body to -o, headers to -D, the
+    # HTTP status alone on stdout. The asset enters the shared inventory.
     mock_command_script "curl" "$(cat <<'EOF'
 echo "$@" >> "$MOCK_LOG_DIR/curl.calls"
-printf '{"ok":true}\n__HTTP_CODE__201'
+response="" headers="" payload="" url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) response="$2"; shift 2 ;;
+    -D) headers="$2"; shift 2 ;;
+    --data-binary) payload="${2#@}"; shift 2 ;;
+    https://uploads.github.com/*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$response" && -n "$headers" && -f "$payload" && -n "$url" ]] || exit 2
+state="$MOCK_LOG_DIR/github-state"
+mkdir -p "$state"
+[[ -f "$state/assets.json" ]] || echo '[]' > "$state/assets.json"
+name="${url##*\?name=}"
+name="${name//%2B/+}"
+id=$(( $(jq 'length' "$state/assets.json") + 1000 ))
+cp "$payload" "$state/asset-$id"
+sha=$(sha256sum "$payload" | awk '{print $1}')
+size=$(wc -c < "$payload" | tr -d ' ')
+jq -c --arg name "$name" --argjson id "$id" --argjson size "$size" --arg sha "$sha" \
+  '. + [{id: $id, name: $name, state: "uploaded", size: $size, digest: ("sha256:" + $sha)}]' \
+  "$state/assets.json" > "$state/assets.next" && mv "$state/assets.next" "$state/assets.json"
+jq -c '.[-1]' "$state/assets.json" > "$response"
+printf 'HTTP/1.1 201 Created\r\n\r\n' > "$headers"
+printf '201'
 exit 0
 EOF
 )"

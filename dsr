@@ -3625,22 +3625,17 @@ EOF
         local build_details authoritative_manifest=""
         $all_targets_succeeded && [[ $manifest_failed == false && -f "$manifest_file" ]] && \
             authoritative_manifest="$manifest_file"
-        build_details=$(cat << EOF
-{
-  "tool": "$tool_name",
-  "version": "$version",
-  "build_purpose": "$build_purpose",
-  "publishable": $( [[ "$build_purpose" == "release" ]] && printf true || printf false ),
-  "targets": $(echo "$target_list" | tr ' ' '\n' | jq -R . | jq -s .),
-  "total": $total,
-  "success": $success,
-  "failed": $failed,
-  "duration_seconds": $duration,
-  "output_dir": "$output_dir",
-  "manifest": "$authoritative_manifest"
-}
-EOF
-)
+        build_details=$(jq -n \
+            --arg tool "$tool_name" --arg version "$version" \
+            --arg build_purpose "$build_purpose" --arg targets "$target_list" \
+            --argjson total "$total" --argjson success "$success" --argjson failed "$failed" \
+            --argjson duration "$duration" --arg output_dir "$output_dir" \
+            --arg manifest "$authoritative_manifest" '
+            {tool: $tool, version: $version, build_purpose: $build_purpose,
+             publishable: ($build_purpose == "release"),
+             targets: ($targets | split(" ") | map(select(length > 0))),
+             total: $total, success: $success, failed: $failed,
+             duration_seconds: $duration, output_dir: $output_dir, manifest: $manifest}') || return 4
         json_envelope "build" "$final_status" "$final_exit" "$build_details"
     else
         echo ""
@@ -8604,7 +8599,12 @@ EOF
         _fallback_result "$rc" checks "Quality checks failed"
         return "$rc"
     fi
-    checks_status="passed"
+    # A skipped gate must not be recorded as a passed one.
+    if $skip_checks; then
+        checks_status="skipped"
+    else
+        checks_status="passed"
+    fi
 
     local -a build_args=("$tool_name" --version "$version" --output-dir "$output_dir")
     $resume && build_args+=("--resume=$resume_run_id")
