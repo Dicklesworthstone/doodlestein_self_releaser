@@ -7,7 +7,8 @@ setup() {
     harness_setup
     harness_source_module "dispatch"
     unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN DRY_RUN
-    export DSR_STATE_DIR="$TEST_TMPDIR/state"
+    # Not pre-created by the harness, so tests can prove what dispatch writes.
+    export DSR_STATE_DIR="$TEST_TMPDIR/dispatch-state"
     PIN=1111111111111111111111111111111111111111
 }
 teardown() { harness_teardown; }

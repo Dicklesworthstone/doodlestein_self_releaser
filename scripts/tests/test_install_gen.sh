@@ -84,8 +84,8 @@ test_template_cache_get_logic() {
     local template
     template=$(_install_gen_template 2>/dev/null)
 
-    # Verify cache check logic
-    if grep -q 'if \[\[ -f "\$cache_file" \]\]' <<< "$template"; then
+    # A cache hit must be a nonempty regular file, never a symlink.
+    if grep -qF 'if [[ -f "$cache_file" && ! -L "$cache_file" && -s "$cache_file" ]]' <<< "$template"; then
         pass "template has cache file check"
     else
         fail "template missing cache file check"
@@ -103,13 +103,14 @@ test_template_cache_put_logic() {
     local template
     template=$(_install_gen_template 2>/dev/null)
 
-    # Verify cache put creates directories and writes the cache file
-    # atomically (cp to a tmp sibling then mv).  The previous
-    # `cp "$src_file" "$cache_file"` form left truncated files in
-    # the cache after a Ctrl-C; the test now requires the safer form.
-    if grep -q 'mkdir -p "\$cache_dir"' <<< "$template" && \
-       grep -q 'cp "\$src_file" "\$tmp_file"' <<< "$template" && \
-       grep -q 'mv -f "\$tmp_file" "\$cache_file"' <<< "$template"; then
+    # Verify cache put creates directories and writes the cache entry
+    # atomically: payload and sidecars are copied into a private stage in
+    # the cache directory, then renamed into place. A direct
+    # `cp "$src_file" "$cache_file"` left truncated files after a Ctrl-C.
+    if grep -qF 'mkdir -p "$cache_dir"' <<< "$template" && \
+       grep -qF 'stage=$(mktemp -d "$cache_dir/.verified.XXXXXXXX")' <<< "$template" && \
+       grep -qF 'cp -- "$src_file$suffix" "$stage/payload$suffix"' <<< "$template" && \
+       grep -qF 'mv -f -- "$stage/payload$suffix" "$cache_file$suffix"' <<< "$template"; then
         pass "template has cache put logic (atomic write)"
     else
         fail "template missing atomic cache put logic"
@@ -205,10 +206,13 @@ test_template_has_gh_download_function() {
     local template
     template=$(_install_gen_template 2>/dev/null)
 
-    if grep -q "_gh_download" <<< "$template"; then
-        pass "template includes _gh_download function"
+    # Every release asset (payload and sidecars) is fetched by one function
+    # with a gh release download fallback for private or throttled repos.
+    if grep -qF '_fetch_release_asset() {' <<< "$template" && \
+       grep -qF 'gh release download "$_VERSION" --repo "$REPO" --pattern "$asset"' <<< "$template"; then
+        pass "template includes gh release download fallback"
     else
-        fail "template missing _gh_download function"
+        fail "template missing gh release download fallback"
     fi
 
     teardown
