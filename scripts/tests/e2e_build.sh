@@ -506,6 +506,157 @@ test_build_real_with_docker() {
 }
 
 # ============================================================================
+# Tests: Lane archives and configured include_files (GH#29)
+# ============================================================================
+
+# A repo whose act lane archives the executable alone under the exact release
+# name, while the config declares LICENSE and README.md as companions.
+seed_lane_archive_fixture() {
+    local repo_dir="$1"
+
+    mkdir -p "$repo_dir/.github/workflows"
+    cat > "$repo_dir/.github/workflows/release.yml" << 'YAML'
+name: Release
+on:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "build"
+YAML
+    echo "lane tool" > "$repo_dir/README.md"
+    echo "MIT License" > "$repo_dir/LICENSE"
+    git -C "$repo_dir" init -q
+    git -C "$repo_dir" -c user.email=test@example.com -c user.name=Test add .
+    git -C "$repo_dir" -c user.email=test@example.com -c user.name=Test commit -qm init
+    git -C "$repo_dir" tag v1.2.3
+
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    cat > "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml" << YAML
+tool_name: lane-tool
+repo: testuser/lane-tool
+local_path: "$repo_dir"
+language: go
+binary_name: lane-tool
+workflow: .github/workflows/release.yml
+targets:
+  - linux/amd64
+act_job_map:
+  linux/amd64: build
+archive_format:
+  linux: tar.gz
+include_files:
+  - LICENSE
+  - README.md
+act_overrides:
+  platform_image: catthehacker/ubuntu:act-latest
+YAML
+
+    mock_init
+    mock_command "docker" "Docker OK" 0
+    mock_command_script "act" "$(cat <<'EOF'
+if [[ "${1:-}" == "--version" ]]; then echo "act version 0.2.87"; exit 0; fi
+artifact_dir="" prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--artifact-server-path" ]]; then artifact_dir="$arg"; break; fi
+  prev="$arg"
+done
+[[ -n "$artifact_dir" ]] || exit 0
+name="lane-tool-1.2.3-linux-amd64.tar.gz"
+mkdir -p "$artifact_dir/payload"
+printf '#!/bin/sh\necho lane-tool\n' > "$artifact_dir/payload/lane-tool"
+chmod 755 "$artifact_dir/payload/lane-tool"
+tar -C "$artifact_dir/payload" -czf "$artifact_dir/$name" lane-tool
+rm -r "$artifact_dir/payload"
+if [[ -n "${LANE_SIDECAR:-}" ]]; then
+  (cd "$artifact_dir" && sha256sum "$name" > "$name.sha256")
+fi
+exit 0
+EOF
+)"
+}
+
+test_build_completes_lane_archive_with_include_files() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]] || ! command -v sha256sum &>/dev/null; then
+        skip "yq and sha256sum required for lane archive packaging test"
+        return 0
+    fi
+
+    harness_setup
+    local repo_dir output_dir
+    repo_dir="$(harness_tmpdir)/lane-repo"
+    output_dir="$(harness_tmpdir)/lane-out"
+    seed_lane_archive_fixture "$repo_dir"
+
+    exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    local status archive alias manifest members alias_members problems=()
+    status=$(exec_status)
+    archive="$output_dir/lane-tool-1.2.3-linux-amd64.tar.gz"
+    alias="$output_dir/lane-tool-linux-amd64.tar.gz"
+    manifest="$output_dir/lane-tool-v1.2.3-manifest.json"
+    members=$(tar -tzf "$archive" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')
+    alias_members=$(tar -tzf "$alias" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')
+
+    [[ "$status" -eq 0 ]] || problems+=("exit $status")
+    [[ "$members" == "LICENSE README.md lane-tool " ]] || problems+=("archive members: $members")
+    [[ "$alias_members" == "LICENSE README.md lane-tool " ]] || problems+=("alias members: $alias_members")
+    local name sha size actual_sha actual_size
+    while IFS=$'\t' read -r name sha size; do
+        actual_sha=$(sha256sum "$output_dir/$name" 2>/dev/null | awk '{print $1}')
+        actual_size=$(wc -c < "$output_dir/$name" 2>/dev/null | tr -d ' ')
+        [[ "$sha" == "$actual_sha" && "$size" == "$actual_size" ]] || \
+            problems+=("manifest row for $name does not describe its bytes")
+    done < <(jq -r '.artifacts[] | [.name, .sha256, (.size_bytes | tostring)] | @tsv' "$manifest" 2>/dev/null)
+    jq -e '[.artifacts[].name] | index("lane-tool-1.2.3-linux-amd64.tar.gz") != null' \
+        "$manifest" >/dev/null 2>&1 || problems+=("manifest lacks the release archive")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "build completes a release-named lane archive with configured include_files"
+    else
+        fail "build should complete the lane archive with include_files: ${problems[*]}"
+        echo "stderr: $(exec_stderr | tail -15)"
+    fi
+
+    harness_teardown
+}
+
+test_build_refuses_attested_thin_lane_archive() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]] || ! command -v sha256sum &>/dev/null; then
+        skip "yq and sha256sum required for attested lane archive test"
+        return 0
+    fi
+
+    harness_setup
+    local repo_dir output_dir
+    repo_dir="$(harness_tmpdir)/lane-repo"
+    output_dir="$(harness_tmpdir)/lane-out"
+    seed_lane_archive_fixture "$repo_dir"
+
+    LANE_SIDECAR=1 exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    local status archive members
+    status=$(exec_status)
+    archive="$output_dir/lane-tool-1.2.3-linux-amd64.tar.gz"
+    members=$(tar -tzf "$archive" 2>/dev/null | tr '\n' ' ')
+
+    if [[ "$status" -eq 1 ]] && [[ "$members" == "lane-tool " ]] &&
+       (cd "$output_dir" && sha256sum -c --quiet lane-tool-1.2.3-linux-amd64.tar.gz.sha256 >/dev/null 2>&1) &&
+       exec_stdout | jq -e '.status == "partial"' >/dev/null 2>&1 &&
+       exec_stderr | grep -q "lacks configured include_files (LICENSE README.md), but lane-tool-1.2.3-linux-amd64.tar.gz.sha256 attests"; then
+        pass "build fails visibly instead of rebuilding a sidecar-attested thin archive"
+    else
+        fail "build should refuse an attested thin lane archive (exit $status, members: $members)"
+        echo "stderr: $(exec_stderr | tail -15)"
+    fi
+
+    harness_teardown
+}
+
+# ============================================================================
 # Tests: JSON Schema Validation (on error)
 # ============================================================================
 
@@ -604,6 +755,11 @@ test_build_rejects_unconfigured_target
 echo ""
 echo "Real Build (when deps available):"
 test_build_real_with_docker
+
+echo ""
+echo "Lane Archives and include_files:"
+test_build_completes_lane_archive_with_include_files
+test_build_refuses_attested_thin_lane_archive
 
 echo ""
 echo "JSON Output Validation:"

@@ -3034,6 +3034,83 @@ EOF
         [[ -n "$candidate" ]] && printf '%s\n' "$candidate"
     }
 
+    # Complete a build lane's same-format archive that already occupies the
+    # release name but lacks configured include_files (GH#29). It is rebuilt
+    # atomically from its own payload plus the missing includes; the manifest
+    # row and a byte-identical compat alias follow the new bytes. Lane
+    # checksums or signatures attest the thin bytes and cannot be regenerated
+    # here, so they fail the build visibly instead of shipping either a thin
+    # archive or a broken attestation.
+    _build_complete_lane_archive() {
+        local tool="$1" target="$2" format="$3" archive_path="$4"
+        local archive_format="$5" compat_name="$6" output_dir="$7" repo_path="$8"
+        shift 8
+        local -a missing=("$@")
+
+        local name compat_path=""
+        name=$(basename "$archive_path")
+        if [[ -n "$compat_name" && "$compat_name" != "$name" && \
+              -f "$output_dir/$compat_name" && ! -L "$output_dir/$compat_name" ]] && \
+           cmp -s "$output_dir/$compat_name" "$archive_path"; then
+            compat_path="$output_dir/$compat_name"
+        fi
+
+        local attested_name attestation aggregate
+        for attested_name in "$name" ${compat_path:+"$compat_name"}; do
+            for attestation in "$output_dir/$attested_name".sha256 "$output_dir/$attested_name".sha512 \
+                "$output_dir/$attested_name".minisig "$output_dir/$attested_name".sig \
+                "$output_dir/$attested_name".asc; do
+                if [[ -e "$attestation" || -L "$attestation" ]]; then
+                    log_error "Archive $attested_name for $tool $target lacks configured include_files (${missing[*]}), but $(basename "$attestation") attests its current bytes; refusing to rebuild it"
+                    collect_failed=true
+                    return 1
+                fi
+            done
+            for aggregate in "$output_dir"/SHA256SUMS* "$output_dir"/*checksums*.txt; do
+                [[ -f "$aggregate" ]] || continue
+                if awk -v n="$attested_name" '{f=$2; sub(/^\*/, "", f); if (f == n) found=1} END {exit !found}' "$aggregate"; then
+                    log_error "Archive $attested_name for $tool $target lacks configured include_files (${missing[*]}), but $(basename "$aggregate") lists its current bytes; refusing to rebuild it"
+                    collect_failed=true
+                    return 1
+                fi
+            done
+        done
+
+        local workdir thin completed=true
+        if ! workdir=$(mktemp -d "$output_dir/.dsr-complete.XXXXXXXX"); then
+            log_error "Could not stage completion of $name for $tool $target"
+            collect_failed=true
+            return 1
+        fi
+        thin="$workdir/$name"
+        if ! cp -p -- "$archive_path" "$thin" || \
+           ! packaging_repack_archive "$thin" "$archive_format" "$archive_path" "$archive_format" \
+               "$repo_path" "${missing[@]}"; then
+            log_error "Could not add configured include_files (${missing[*]}) to $name for $tool $target"
+            completed=false
+        else
+            log_info "Added configured include_files to $name: ${missing[*]}"
+            _build_manifest_add_entry "$archive_path" "$target" "$format"
+            if [[ -n "$compat_path" ]]; then
+                if cp -- "$archive_path" "$workdir/compat" && \
+                   mv -f -- "$workdir/compat" "$compat_path"; then
+                    log_info "Refreshed compat alias $compat_name with the completed archive"
+                    _build_manifest_add_entry "$compat_path" "$target" "$format"
+                else
+                    log_error "Could not refresh compat alias $compat_name for $tool $target"
+                    completed=false
+                fi
+            fi
+        fi
+        rm -f -- "$thin" "$workdir/compat"
+        rmdir -- "$workdir" 2>/dev/null || true
+        if ! $completed; then
+            collect_failed=true
+            return 1
+        fi
+        return 0
+    }
+
     _build_package_archive_for_target() {
         local tool="$1"
         local version="$2"
@@ -3158,16 +3235,19 @@ EOF
             fi
 
             if [[ "$input_format" == "$normalized_format" ]]; then
-                if [[ ${#missing_includes[@]} -gt 0 && "$binary_path" -ef "$archive_path" ]]; then
-                    # The lane's archive already occupies the release name;
-                    # rebuilding it in place would sever any receipt bound
-                    # to its bytes, so report loudly instead of mutating.
-                    log_warn "Archive $versioned_name for $tool $target lacks configured include_files: ${missing_includes[*]}"
-                    return 0
-                fi
                 if [[ ${#missing_includes[@]} -eq 0 ]]; then
                     log_info "Archive already produced for $tool $target ($format); skipping packaging"
                     return 0
+                fi
+                if [[ "$binary_path" -ef "$archive_path" ]]; then
+                    # The lane's archive already occupies the release name
+                    # but lacks configured include_files (GH#29). Complete
+                    # it in place, or fail the build visibly when lane
+                    # checksums or signatures attest the thin bytes.
+                    _build_complete_lane_archive "$tool" "$target" "$format" \
+                        "$archive_path" "$normalized_format" "$compat_name" \
+                        "$output_dir" "$repo_path" "${missing_includes[@]}"
+                    return $?
                 fi
             fi
             if [[ -f "$archive_path" ]]; then
@@ -3410,6 +3490,18 @@ EOF
                     existing_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" 2>/dev/null || echo "")
                 fi
 
+                if [[ -n "$existing_path" && "$format" != "binary" && -n "$repo_path" && \
+                      -n "$(_build_get_include_files "$tool" 2>/dev/null)" ]]; then
+                    # A matching format says nothing about the members: the
+                    # lane may have archived the executable alone (GH#29).
+                    # Verify configured include_files before skipping.
+                    _build_package_archive_for_target "$tool" "$version" "$target" \
+                        "$output_dir" "$repo_path" "$binary_name" "$existing_path"
+                    if [[ -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
+                        existing_path="$output_dir/$versioned_name"
+                    fi
+                fi
+
                 if [[ -n "$existing_path" ]]; then
                     if [[ "$format" == "binary" ]]; then
                         _build_emit_binary_alias "$existing_path" "$compat_name" "$output_dir" "$target"
@@ -3571,26 +3663,34 @@ EOF
 
     if $all_targets_succeeded && ! $build_release_contract_enabled && \
        [[ -f "$manifest_file" && ${#extra_manifest_entries[@]} -gt 0 ]]; then
-        local -A manifest_names=()
-        local entry entry_name
-        while IFS= read -r entry_name; do
-            [[ -n "$entry_name" ]] && manifest_names["$entry_name"]=1
-        done < <(jq -r '.artifacts[]?.name // empty' "$manifest_file" 2>/dev/null)
-
-        local -a filtered_entries=()
-        for entry in "${extra_manifest_entries[@]}"; do
-            entry_name=$(echo "$entry" | jq -r '.name // empty' 2>/dev/null)
-            if [[ -n "$entry_name" && -z "${manifest_names[$entry_name]:-}" ]]; then
-                filtered_entries+=("$entry")
-            fi
-        done
-
-        if [[ ${#filtered_entries[@]} -gt 0 ]]; then
-            local extra_json merged
-            extra_json=$(printf '%s\n' "${filtered_entries[@]}" | jq -s '.')
-            merged=$(jq --argjson extra "$extra_json" '.artifacts = (.artifacts // []) + $extra' "$manifest_file")
+        # Packaging can rebuild a collected archive in place (GH#29), so the
+        # last packaged row for a name describes its final bytes: refresh the
+        # digest and size of a row already in the manifest, append the rest.
+        local extra_json merge_result merged
+        extra_json=$(printf '%s\n' "${extra_manifest_entries[@]}" | jq -s '.')
+        if merge_result=$(jq -c --argjson extra "$extra_json" '
+            (reduce $extra[] as $e ({}; .[$e.name] = $e)) as $latest |
+            (reduce $extra[] as $e ([]; if any(.[]; . == $e.name) then . else . + [$e.name] end)) as $order |
+            ((.artifacts // []) | map(.name)) as $present |
+            ((.artifacts // []) | map(select($latest[.name] != null and
+                ($latest[.name].sha256 != .sha256 or $latest[.name].size_bytes != .size_bytes))) | length) as $refreshed |
+            ($order | map(select(. as $n | $present | any(.[]; . == $n) | not))) as $added |
+            {refreshed: $refreshed, added: ($added | length), manifest: (
+                .artifacts = (((.artifacts // []) | map(
+                    if $latest[.name] != null
+                    then . + {sha256: $latest[.name].sha256, size_bytes: $latest[.name].size_bytes}
+                    else . end)) + ($added | map($latest[.])))
+            )}' "$manifest_file") && \
+           merged=$(jq '.manifest' <<< "$merge_result"); then
             printf '%s\n' "$merged" > "$manifest_file"
-            log_info "Added ${#filtered_entries[@]} packaged artifact(s) to manifest"
+            local refreshed_count added_count
+            refreshed_count=$(jq -r '.refreshed' <<< "$merge_result")
+            added_count=$(jq -r '.added' <<< "$merge_result")
+            [[ "$added_count" -gt 0 ]] && log_info "Added $added_count packaged artifact(s) to manifest"
+            [[ "$refreshed_count" -gt 0 ]] && log_info "Refreshed $refreshed_count manifest digest(s) for archives rebuilt by packaging"
+        else
+            log_error "Failed to merge packaged artifacts into the build manifest"
+            manifest_failed=true
         fi
     fi
 

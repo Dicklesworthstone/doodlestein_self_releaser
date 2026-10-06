@@ -583,6 +583,9 @@ log_test "dsr _build_package_archive_for_target regression (extracted)"
 EXTRACTED="$TEMP_DIR/extracted_build_package_archive_for_target.sh"
 awk '/^    _build_package_archive_for_target\(\) \{/{flag=1} flag{print} flag && /^    \}$/ && !/_build_package_archive_for_target/{exit}' \
     "$PROJECT_ROOT/dsr" > "$EXTRACTED"
+# Its in-place completion helper for release-named lane archives (GH#29).
+awk '/^    _build_complete_lane_archive\(\) \{/{flag=1} flag{print} flag && /^    \}$/{exit}' \
+    "$PROJECT_ROOT/dsr" >> "$EXTRACTED"
 
 if ! bash -n "$EXTRACTED" 2>/dev/null || ! grep -q "packaging_repack_archive" "$EXTRACTED"; then
     log_fail "extract _build_package_archive_for_target from dsr"
@@ -766,13 +769,16 @@ log_test "dsr packager adds missing include_files on the lone-binary lane (GH#16
 if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
     run_build_package_with_repo() {
         # $1 = configured format, $2 = artifact path, $3 = output dir,
-        # $4 = versioned name, $5 = repo_path, $6 = warn log file
+        # $4 = versioned name, $5 = repo_path, $6 = warn log file,
+        # $7 = compat name (defaults to the versioned name)
         local cfg_format="$1" override="$2" outdir="$3" versioned="$4" repo="$5" warnlog="$6"
+        local compat="${7:-$4}"
         (
             set -uo pipefail
             log_info() { :; }
             log_warn() { echo "$*" >> "$warnlog"; }
-            log_error() { echo "ERR: $*" >&2; }
+            log_error() { echo "ERR: $*" >> "$warnlog"; }
+            collect_failed=false
             declare -A existing_archive_formats=()
             # shellcheck disable=SC2034
             existing_archive_formats["linux/amd64"]="tar.gz"
@@ -788,9 +794,12 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
                 esac
             }
             artifact_naming_generate_dual_for_tool() {
-                printf '{"versioned":"%s","compat":"%s"}\n' "$versioned" "$versioned"
+                printf '{"versioned":"%s","compat":"%s"}\n' "$versioned" "$compat"
             }
-            _build_manifest_add_entry() { :; }
+            _build_manifest_add_entry() {
+                printf '%s\t%s\n' "$(basename "$1")" "$(shasum -a 256 "$1" | awk '{print $1}')" \
+                    >> "$outdir/manifest_calls.tsv"
+            }
             _build_emit_compat_alias() { :; }
             _build_emit_binary_alias() { :; }
             source "$PROJECT_ROOT/src/packaging.sh"
@@ -798,6 +807,7 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
             source "$EXTRACTED"
             _build_package_archive_for_target "rano" "0.2.1" "linux/amd64" \
                 "$outdir" "$repo" "rano" "$override"
+            echo "collect_failed=$collect_failed" >> "$warnlog"
         )
     }
 
@@ -820,24 +830,60 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
         log_pass "missing configured include is warned about" || \
         log_fail "missing configured include is warned about"
 
-    # Same-format lane archive already occupying the release name: bytes are
-    # left alone (receipts may bind to them) but the omission is reported.
+    # Same-format lane archive already occupying the release name without
+    # the includes (GH#29): completed in place from its own payload, the new
+    # digest is handed to the manifest, and a compat alias that was a byte
+    # copy of the thin archive follows it.
     RANO_OUT2="$TEMP_DIR/rano-out2"
     mkdir -p "$RANO_OUT2"
-    RANO_GZ2="$RANO_OUT2/rano-0.2.1-x86_64-unknown-linux-gnu.tar.gz"
+    RANO_NAME2="rano-0.2.1-x86_64-unknown-linux-gnu.tar.gz"
+    RANO_GZ2="$RANO_OUT2/$RANO_NAME2"
     cp "$LONE_GZ" "$RANO_GZ2"
+    cp "$LONE_GZ" "$RANO_OUT2/rano-x86_64-unknown-linux-gnu.tar.gz"
     RANO_WARN2="$RANO_OUT2/warnings.log"
     : > "$RANO_WARN2"
-    before_rano_sha=$(shasum -a 256 "$RANO_GZ2" | awk '{print $1}')
     run_build_package_with_repo "tar.gz" "$RANO_GZ2" "$RANO_OUT2" \
-        "rano-0.2.1-x86_64-unknown-linux-gnu.tar.gz" "$INC_DIR" "$RANO_WARN2" >/dev/null 2>&1
-    after_rano_sha=$(shasum -a 256 "$RANO_GZ2" | awk '{print $1}')
-    [[ "$before_rano_sha" == "$after_rano_sha" ]] && \
-        log_pass "same-format release-named archive is not mutated" || \
-        log_fail "same-format release-named archive is not mutated"
-    grep -q "lacks configured include_files: LICENSE README.md" "$RANO_WARN2" && \
-        log_pass "same-format omission is reported loudly" || \
-        log_fail "same-format omission is reported loudly"
+        "$RANO_NAME2" "$INC_DIR" "$RANO_WARN2" \
+        "rano-x86_64-unknown-linux-gnu.tar.gz" >/dev/null 2>&1
+    rano_sha2=$(shasum -a 256 "$RANO_GZ2" | awk '{print $1}')
+    [[ "$(sorted_members "$RANO_GZ2" tar.gz 2>/dev/null)" == "$EXPECTED_INC_MEMBERS" ]] && \
+        log_pass "release-named lane archive is completed with its includes" || \
+        log_fail "release-named lane archive is completed with its includes ('$(sorted_members "$RANO_GZ2" tar.gz 2>/dev/null)')"
+    grep -qxF "$RANO_NAME2"$'\t'"$rano_sha2" "$RANO_OUT2/manifest_calls.tsv" 2>/dev/null && \
+        log_pass "completed archive digest is handed to the manifest" || \
+        log_fail "completed archive digest is handed to the manifest"
+    cmp -s "$RANO_GZ2" "$RANO_OUT2/rano-x86_64-unknown-linux-gnu.tar.gz" && \
+        grep -qxF "rano-x86_64-unknown-linux-gnu.tar.gz"$'\t'"$rano_sha2" "$RANO_OUT2/manifest_calls.tsv" && \
+        log_pass "byte-copy compat alias follows the completed archive" || \
+        log_fail "byte-copy compat alias follows the completed archive"
+    rano_staging=("$RANO_OUT2"/.dsr-*)
+    grep -qx "collect_failed=false" "$RANO_WARN2" && [[ ! -e "${rano_staging[0]}" ]] && \
+        log_pass "completion succeeds and leaves no staging behind" || \
+        log_fail "completion succeeds and leaves no staging behind"
+
+    # A lane sidecar or aggregate attests the thin bytes; rebuilding would
+    # break it, so the archive is left alone and the build is failed.
+    for attest_kind in sidecar aggregate; do
+        RANO_OUT5="$TEMP_DIR/rano-out5-$attest_kind"
+        mkdir -p "$RANO_OUT5"
+        cp "$LONE_GZ" "$RANO_OUT5/$RANO_NAME2"
+        if [[ "$attest_kind" == sidecar ]]; then
+            (cd "$RANO_OUT5" && shasum -a 256 "$RANO_NAME2" > "$RANO_NAME2.sha256")
+        else
+            (cd "$RANO_OUT5" && shasum -a 256 "$RANO_NAME2" > SHA256SUMS)
+        fi
+        RANO_WARN5="$RANO_OUT5/warnings.log"
+        : > "$RANO_WARN5"
+        before_rano_sha=$(shasum -a 256 "$RANO_OUT5/$RANO_NAME2" | awk '{print $1}')
+        run_build_package_with_repo "tar.gz" "$RANO_OUT5/$RANO_NAME2" "$RANO_OUT5" \
+            "$RANO_NAME2" "$INC_DIR" "$RANO_WARN5" >/dev/null 2>&1
+        after_rano_sha=$(shasum -a 256 "$RANO_OUT5/$RANO_NAME2" | awk '{print $1}')
+        [[ "$before_rano_sha" == "$after_rano_sha" ]] && \
+            grep -q "lacks configured include_files (LICENSE README.md), but .* its current bytes" "$RANO_WARN5" && \
+            grep -qx "collect_failed=true" "$RANO_WARN5" && \
+            log_pass "attested ($attest_kind) thin archive fails the build without mutation" || \
+            log_fail "attested ($attest_kind) thin archive fails the build without mutation"
+    done
 
     # Same-format lane archive under a non-release name is rebuilt with the
     # includes into the release name.

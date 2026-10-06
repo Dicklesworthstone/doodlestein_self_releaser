@@ -491,6 +491,16 @@ regular companion file named by `include_files`; every path component must be
 free of symlinks. Unsafe paths, missing files, and collisions with a binary fail
 the target instead of silently producing an incomplete release archive.
 
+Ordinary (non-strict) builds apply the same rule to archives a build lane
+already produced: an act or prebuilt archive in the configured format is
+checked for its `include_files` members rather than trusted because the
+format matches. If it lacks some of them, DSR rebuilds it from its own payload
+plus the missing companions, refreshes the manifest digest, and updates a
+compat alias that was a byte copy of it. When a lane `.sha256`, `.minisig` or
+`SHA256SUMS` entry already attests the thin bytes, the build ends `partial`
+(exit 1) naming the archive rather than ship a stale attestation or an
+incomplete archive. `flat_archive: true` opts out as before.
+
 Use `workspace_binaries_by_target` when executable families differ by platform.
 Each target entry replaces the complete `workspace_binaries` list for that
 target, including collection and archive verification. For example:
