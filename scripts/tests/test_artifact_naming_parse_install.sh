@@ -412,6 +412,81 @@ test_empty_file() {
 }
 
 # =============================================================================
+# TEST: INSTALLER EXPECTED NAMES (bd-1tv.10)
+# =============================================================================
+
+# A repository whose install.sh downloads ${name}-${os}-${arch}.tar.gz and a
+# config that names the tool; the release check compares against this name.
+setup_installer_repo() {
+    INSTALLER_ROOT=$(mktemp -d)
+    INSTALLER_REPO="$INSTALLER_ROOT/repo"
+    mkdir -p "$INSTALLER_REPO" "$INSTALLER_ROOT/config/repos.d"
+    export DSR_CONFIG_DIR="$INSTALLER_ROOT/config"
+    export DSR_REPOS_FILE="$INSTALLER_ROOT/config/repos.yaml"
+    printf 'tool_name: mytool\n' > "$INSTALLER_ROOT/config/repos.d/mytool.yaml"
+}
+
+test_installer_expected_name_matching_ext() {
+    log_test "Installer expected name uses the installer's pattern and the artifact extension"
+    setup_installer_repo
+    cat > "$INSTALLER_REPO/install.sh" <<'SH'
+#!/bin/sh
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+TAR="mytool-${OS}-${ARCH}.tar.gz"
+curl -fsSL "https://github.com/o/mytool/releases/download/${VERSION}/${TAR}" -o "$TAR"
+SH
+    local result
+    result=$(artifact_naming_installer_expected_name mytool v1.2.3 linux amd64 tar.gz "$INSTALLER_REPO" 2>/dev/null)
+    assert_eq "mytool-linux-amd64.tar.gz" "$(jq -r '.name' <<< "$result")" "expected name from install.sh"
+    assert_eq "false" "$(jq -r '.ext_mismatch' <<< "$result")" "matching extension is not a mismatch"
+    assert_eq "install.sh" "$(jq -r '.script' <<< "$result")" "default installer path is install.sh"
+    rm -rf "$INSTALLER_ROOT"
+}
+
+test_installer_expected_name_hardcoded_ext_mismatch() {
+    log_test "An installer hardcoding .tar.gz expects .tar.gz even when the release builds .tar.xz"
+    setup_installer_repo
+    cat > "$INSTALLER_REPO/install.sh" <<'SH'
+#!/bin/sh
+asset_name="mytool-${OS}-${ARCH}.tar.gz"
+SH
+    local result
+    result=$(artifact_naming_installer_expected_name mytool v1.2.3 darwin arm64 tar.xz "$INSTALLER_REPO" 2>/dev/null)
+    assert_eq "mytool-darwin-arm64.tar.gz" "$(jq -r '.name' <<< "$result")" "installer's literal extension wins"
+    assert_eq "true" "$(jq -r '.ext_mismatch' <<< "$result")" "extension mismatch is reported"
+    rm -rf "$INSTALLER_ROOT"
+}
+
+test_installer_expected_name_configured_path() {
+    log_test "install_script_path in the tool config selects the installer"
+    setup_installer_repo
+    mkdir -p "$INSTALLER_REPO/scripts"
+    printf 'tool_name: mytool\ninstall_script_path: scripts/get.sh\n' > "$DSR_CONFIG_DIR/repos.d/mytool.yaml"
+    cat > "$INSTALLER_REPO/scripts/get.sh" <<'SH'
+#!/bin/sh
+TAR="mytool-${VERSION}-${TARGET}.${EXT}"
+SH
+    local result
+    result=$(artifact_naming_installer_expected_name mytool v2.0.0 linux arm64 tar.gz "$INSTALLER_REPO" 2>/dev/null)
+    assert_eq "mytool-2.0.0-linux-arm64.tar.gz" "$(jq -r '.name' <<< "$result")" "versioned installer pattern"
+    assert_eq "scripts/get.sh" "$(jq -r '.script' <<< "$result")" "configured installer path reported"
+    rm -rf "$INSTALLER_ROOT"
+}
+
+test_installer_expected_name_absent() {
+    log_test "No installer or no download pattern is not an expectation"
+    setup_installer_repo
+    local status=0
+    artifact_naming_installer_expected_name mytool v1.0.0 linux amd64 tar.gz "$INSTALLER_REPO" >/dev/null 2>&1 || status=$?
+    assert_eq "1" "$status" "missing install.sh returns 1"
+    printf '#!/bin/sh\necho no downloads here\n' > "$INSTALLER_REPO/install.sh"
+    status=0
+    artifact_naming_installer_expected_name mytool v1.0.0 linux amd64 tar.gz "$INSTALLER_REPO" >/dev/null 2>&1 || status=$?
+    assert_eq "1" "$status" "pattern-free install.sh returns 1"
+    rm -rf "$INSTALLER_ROOT"
+}
+
+# =============================================================================
 # PRINT SUMMARY
 # =============================================================================
 
@@ -507,6 +582,15 @@ main() {
     test_multiple_patterns_first_wins
     test_commented_pattern_ignored
     test_empty_file
+    end_phase "pass" $((TEST_COUNT - phase_tests))
+
+    # Phase 6: Installer expectations used by release verification
+    start_phase "installer_expected_names"
+    phase_tests=$TEST_COUNT
+    test_installer_expected_name_matching_ext
+    test_installer_expected_name_hardcoded_ext_mismatch
+    test_installer_expected_name_configured_path
+    test_installer_expected_name_absent
     end_phase "pass" $((TEST_COUNT - phase_tests))
 
     print_summary

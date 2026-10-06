@@ -490,7 +490,23 @@ Upload artifacts to GitHub Release.
 dsr release --repo ntm --version v1.2.3         # Upload to release
 dsr release --repo ntm --version v1.2.3 --draft # Create draft release
 dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
+dsr --dry-run release --repo ntm --version v1.2.3   # Show the exact upload plan, change nothing
 ```
+
+The dry-run plan lists every name each artifact will be published under (its
+manifest name, versioned name, installer-compatible name and `x86_64`/`aarch64`
+aliases), the build manifest, the generated `SHA256SUMS` and per-name `.sha256`
+sidecars, and existing signatures/SBOMs; with `--json` the same plan is in
+`details.plan`. It uses the same naming code as the real upload.
+
+Both the dry-run and the real release check the project's own curl|bash
+installer (`install_script_path`, else `install.sh` in the checkout): for each
+non-Windows target dsr computes the asset name the installer downloads,
+including an archive extension the script hardcodes, and confirms the release
+publishes it. A miss is reported as a warning with the missing name (and in
+`details.installer_check`), never as a release failure, so you learn about a
+broken `curl | bash` before your users do. Fix `install.sh` or set
+`install_script_compat`, then run `dsr repos validate`.
 
 For repositories whose existing release venue contains source only, use an
 explicit `repos.d/<tool>.yaml` configuration with these four fields:

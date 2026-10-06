@@ -1062,8 +1062,78 @@ artifact_naming_generate_dual_for_tool() {
     artifact_naming_generate_dual "$naming_name" "$version" "$os" "$arch" "$ext" "$compat_pattern" "$versioned_pattern" "$tool"
 }
 
+# Name of the release asset a project's own curl|bash installer downloads for
+# one target, computed independently of install_script_compat so a release can
+# be checked against what the installer actually requests (bd-1tv.10). The
+# installer is install_script_path from the tool config, else <repo>/install.sh.
+# When the script spells out archive extensions literally and none matches
+# the artifact's, the installer's first literal extension is used: a release
+# that ships .tar.xz cannot satisfy an installer hardcoding .tar.gz.
+# Args: tool version os arch ext repo_path
+# Output: {"script","pattern","name","ext","ext_mismatch"} JSON (stdout)
+# Exit: 0 on success, 1 when no installer pattern can be resolved, 4 bad input
+artifact_naming_installer_expected_name() {
+    [[ $# -ge 6 ]] || return 4
+    local tool="$1" version="$2" os="$3" arch="$4" ext="$5" repo_path="$6"
+    command -v jq &>/dev/null || return 3
+    [[ -n "$repo_path" && -d "$repo_path" ]] || return 1
+
+    if ! declare -F config_get_install_script_path &>/dev/null; then
+        local script_dir
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        # shellcheck source=./config.sh
+        source "$script_dir/config.sh" 2>/dev/null || true
+    fi
+    local install_path=""
+    install_path=$(config_get_install_script_path "$tool" 2>/dev/null || echo "")
+    [[ -n "$install_path" ]] || install_path="install.sh"
+    [[ "$install_path" != /* && "$install_path" != *..* ]] || return 1
+    local full_path="$repo_path/$install_path"
+    [[ -f "$full_path" && ! -L "$full_path" ]] || return 1
+
+    local pattern
+    pattern=$(artifact_naming_parse_install_script "$full_path" "$tool" 2>/dev/null) || return 1
+    [[ -n "$pattern" ]] || return 1
+
+    local naming_name=""
+    if declare -F config_get_tool_field &>/dev/null; then
+        naming_name=$(config_get_tool_field "$tool" "tool_name" "" 2>/dev/null || echo "")
+        [[ -n "$naming_name" ]] || naming_name=$(config_get_tool_field "$tool" "binary_name" "" 2>/dev/null || echo "")
+    fi
+    [[ -n "$naming_name" ]] || naming_name="$tool"
+
+    # Literal archive extensions the installer mentions, in first-seen order.
+    local -a installer_exts=()
+    local literal seen=" "
+    while IFS= read -r literal; do
+        literal="${literal#.}"
+        [[ -n "$literal" && "$seen" != *" $literal "* ]] || continue
+        installer_exts+=("$literal")
+        seen+="$literal "
+    done < <(grep -oE '\.(tar\.gz|tar\.xz|tgz|zip)([^A-Za-z0-9]|$)' "$full_path" 2>/dev/null |
+             sed -E 's/[^A-Za-z0-9]$//')
+    local expected_ext="$ext" ext_mismatch=false
+    [[ "$expected_ext" == "none" ]] && expected_ext=""
+    if [[ -n "$expected_ext" && "$expected_ext" != "exe" && ${#installer_exts[@]} -gt 0 && \
+          "$seen" != *" $expected_ext "* ]]; then
+        expected_ext="${installer_exts[0]}"
+        ext_mismatch=true
+    fi
+
+    local name
+    name=$(artifact_naming_substitute "$pattern" "$naming_name" "$version" "$os" "$arch" "$expected_ext" "$tool" 2>/dev/null) || return 1
+    if [[ "$pattern" != *'${ext}'* ]]; then
+        name=$(_an_append_ext_if_missing "$name" "$expected_ext") || return 1
+    fi
+    _an_safe_asset_name "$name" || return 1
+    jq -cn --arg script "$install_path" --arg pattern "$pattern" --arg name "$name" \
+        --arg ext "$expected_ext" --argjson ext_mismatch "$ext_mismatch" \
+        '{script: $script, pattern: $pattern, name: $name, ext: $ext, ext_mismatch: $ext_mismatch}'
+}
+
 # Export functions
 export -f artifact_naming_parse_install_script artifact_naming_parse_workflow artifact_naming_parse_goreleaser
+export -f artifact_naming_installer_expected_name
 export -f artifact_naming_generate_dual artifact_naming_validate
 export -f artifact_naming_substitute
 export -f artifact_naming_get_compat_pattern artifact_naming_get_versioned_pattern artifact_naming_generate_dual_for_tool

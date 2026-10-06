@@ -299,6 +299,78 @@ test_dry_run_has_no_network_or_checkpoint_writes() {
         jq -e '.status=="dry_run"' "$CASE/stdout" >/dev/null
 }
 
+# bd-1tv.3.5: the plan lists every name each artifact is published under,
+# the same list the upload loop uses, without touching GitHub or the disk.
+test_dry_run_plans_every_upload_name() {
+    setup dryrun_plan
+    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
+    manifest tool-linux-amd64.tar.gz linux/amd64 tar.gz
+    DRY_RUN=true
+    run_release --resume
+    [[ $STATUS -eq 0 && ! -s "$CALLS" && ! -e "$CASE/artifacts/SHA256SUMS" ]] &&
+        jq -e '.status=="dry_run" and .details.dry_run and .details.plan.strict==false and
+            .details.plan.artifacts[0].upload_names ==
+                ["tool-linux-amd64.tar.gz","tool-1.2.3-linux-amd64.tar.gz","tool-linux-x86_64.tar.gz"] and
+            .details.plan.artifacts[0].target=="linux/amd64" and
+            (.details.plan.artifacts[0].sha256 | test("^[0-9a-f]{64}$")) and
+            (.details.plan.additional_files | index("tool-v1.2.3-manifest.json")) != null and
+            .details.installer_check.status=="skipped"' "$CASE/stdout" >/dev/null &&
+        grep -q 'also as: tool-1.2.3-linux-amd64.tar.gz, tool-linux-x86_64.tar.gz' "$CASE/stderr"
+}
+
+# bd-1tv.10: names the project's installer downloads are checked against
+# the plan and, after upload, against the verified release. A mismatch warns
+# with guidance but never turns a verified release into a failure.
+installer_fixture() {
+    git init -q "$CASE/checkout" &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid \
+            commit -q --allow-empty -m fixture &&
+        git -C "$CASE/checkout" tag v1.2.3 || return 1
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    artifact_naming_installer_expected_name() {
+        jq -nc --arg name "$INSTALLER_EXPECTS" \
+            '{script:"install.sh",pattern:"x",name:$name,ext:"tar.gz",ext_mismatch:false}'
+    }
+    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
+    manifest tool-linux-amd64.tar.gz linux/amd64 tar.gz
+}
+
+test_dry_run_reports_installer_mismatch() {
+    setup installer_dry
+    installer_fixture
+    INSTALLER_EXPECTS=tool-x86_64-unknown-linux-gnu.tar.gz
+    DRY_RUN=true
+    run_release --resume
+    [[ $STATUS -eq 0 && ! -s "$CALLS" ]] &&
+        jq -e '.details.installer_check.status=="mismatch" and
+            .details.installer_check.missing==["tool-x86_64-unknown-linux-gnu.tar.gz"]' \
+            "$CASE/stdout" >/dev/null &&
+        grep -q 'downloads tool-x86_64-unknown-linux-gnu.tar.gz, which this release does not publish' "$CASE/stderr" &&
+        grep -q 'install_script_compat' "$CASE/stderr"
+}
+
+test_release_records_installer_check_after_upload() {
+    setup installer_upload
+    installer_fixture
+    INSTALLER_EXPECTS=tool-linux-x86_64.tar.gz
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && grep -Fxq 'POST tool-linux-x86_64.tar.gz' "$CALLS" &&
+        jq -e '.details.installer_check.status=="ok" and
+            .details.installer_check.expected==[{target:"linux/amd64",name:"tool-linux-x86_64.tar.gz",
+                present:true,ext_mismatch:false}]' "$CASE/stdout" >/dev/null
+}
+
+test_installer_mismatch_does_not_fail_verified_release() {
+    setup installer_mismatch
+    installer_fixture
+    INSTALLER_EXPECTS=tool-linux-x86_64.tar.xz
+    run_release --resume
+    [[ $STATUS -eq 0 ]] &&
+        jq -e '.status=="success" and .details.installer_check.status=="mismatch"' "$CASE/stdout" >/dev/null &&
+        grep -q 'downloads tool-linux-x86_64.tar.xz' "$CASE/stderr"
+}
+
 test_remote_drift_after_upload_prevents_success() {
     setup final_drift
     FINAL_DRIFT=true
@@ -397,6 +469,8 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_missing_manifest_artifact_blocks_creation test_changed_local_manifest_artifact_blocks_creation \
     test_wrong_release_identity_cannot_upload test_lost_upload_response_reconciles_real_bytes \
     test_strict_preflight_remains_required test_dry_run_has_no_network_or_checkpoint_writes \
+    test_dry_run_plans_every_upload_name test_dry_run_reports_installer_mismatch \
+    test_release_records_installer_check_after_upload test_installer_mismatch_does_not_fail_verified_release \
     test_remote_drift_after_upload_prevents_success test_release_visibility_drift_prevents_dispatch \
     test_checkpoint_symlink_failure_preserves_foreign_file test_checkpoint_receipt_is_bound_and_private \
     test_partial_release_resumes_only_missing_upload test_completed_release_resume_does_not_reupload \

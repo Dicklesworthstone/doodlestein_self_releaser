@@ -6166,6 +6166,127 @@ EOF
         log_ok "Strict release contract preflight passed"
     fi
 
+    # Every name one manifest artifact is published under: the manifest name,
+    # then its versioned and installer-compatible names and the x86_64/aarch64
+    # spelling of the compat name. SHA256SUMS, the upload loop and the dry-run
+    # plan all use this list, so a plan always matches what is uploaded.
+    _release_artifact_upload_names() {
+        local filename="$1" target="$2" format="$3"
+        local -a names=("$filename")
+        local os arch ext names_json versioned compat alias candidate existing duplicate
+        if [[ "$target" == */* ]]; then
+            os="${target%/*}"
+            arch="${target#*/}"
+            ext="$format"
+            case "$ext" in
+                none) ext="" ;;
+                # Raw binaries: build packaging already emitted their compat
+                # copy as its own manifest row; only Windows names carry .exe.
+                binary) ext=""; [[ "$os" == windows ]] && ext="exe" ;;
+            esac
+            if [[ -z "$ext" && "$format" != binary ]]; then
+                case "$filename" in
+                    *.tar.gz) ext="tar.gz" ;;
+                    *.tgz) ext="tgz" ;;
+                    *.tar.xz) ext="tar.xz" ;;
+                    *.zip) ext="zip" ;;
+                    *.exe) ext="exe" ;;
+                esac
+            fi
+            if [[ -n "$ext" ]] && names_json=$(artifact_naming_generate_dual_for_tool \
+                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" 2>/dev/null); then
+                versioned=$(jq -r '.versioned // empty' <<< "$names_json" 2>/dev/null) || versioned=""
+                compat=$(jq -r '.compat // empty' <<< "$names_json" 2>/dev/null) || compat=""
+                alias=""
+                case "$arch" in
+                    amd64) alias="${compat//-amd64/-x86_64}"; alias="${alias//_amd64/_x86_64}" ;;
+                    arm64) alias="${compat//-arm64/-aarch64}"; alias="${alias//_arm64/_aarch64}" ;;
+                esac
+                for candidate in "$versioned" "$compat" "$alias"; do
+                    [[ -n "$candidate" ]] || continue
+                    duplicate=false
+                    for existing in "${names[@]}"; do
+                        if [[ "$existing" == "$candidate" ]]; then
+                            duplicate=true
+                            break
+                        fi
+                    done
+                    $duplicate || names+=("$candidate")
+                done
+            fi
+        fi
+        printf '%s\n' "${names[@]}"
+    }
+
+    # Check the names a project's own curl|bash installer downloads against the
+    # published (or planned) asset names read from stdin, one per line
+    # (bd-1tv.10). Windows targets are installed by other means. Prints one
+    # JSON report; never fails the release, since an installer is the
+    # project's code, not a release input.
+    _release_installer_check() {
+        local -A names_present=()
+        local -a expected=()
+        local name target format os arch ext expectation expected_name script=""
+        while IFS= read -r name; do
+            [[ -n "$name" ]] && names_present["$name"]=1
+        done
+        if ! $manifest_exists || [[ -z "$local_path" || ! -d "$local_path" ]]; then
+            jq -nc '{status: "skipped", reason: "no manifest or local checkout"}'
+            return 0
+        fi
+        while IFS=$'\t' read -r name target format; do
+            [[ "$target" == */* ]] || continue
+            os="${target%/*}"
+            arch="${target#*/}"
+            [[ "$os" == windows ]] && continue
+            ext="$format"
+            case "$ext" in none|binary) ext="" ;; esac
+            if [[ -z "$ext" ]]; then
+                case "$name" in
+                    *.tar.gz) ext="tar.gz" ;;
+                    *.tgz) ext="tgz" ;;
+                    *.tar.xz) ext="tar.xz" ;;
+                    *.zip) ext="zip" ;;
+                esac
+            fi
+            expectation=$(artifact_naming_installer_expected_name "$tool_name" "$version" \
+                "$os" "$arch" "$ext" "$local_path" 2>/dev/null) || continue
+            expected_name=$(jq -r '.name' <<< "$expectation") || continue
+            script=$(jq -r '.script' <<< "$expectation") || continue
+            expected+=("$(jq -c --arg target "$target" --argjson present \
+                "$([[ -n "${names_present[$expected_name]:-}" ]] && echo true || echo false)" \
+                '{target: $target, name, present: $present, ext_mismatch}' <<< "$expectation")")
+        done < <(jq -r '.artifacts[] | [(.name // .filename), (.target // ""), (.archive_format // "")] | @tsv' \
+            <<< "$ordinary_manifest")
+        if [[ ${#expected[@]} -eq 0 ]]; then
+            jq -nc '{status: "skipped", reason: "no installer download pattern found"}'
+            return 0
+        fi
+        printf '%s\n' "${expected[@]}" | jq -sc --arg script "$script" '
+            unique_by(.target, .name) as $expected |
+            {status: (if all($expected[]; .present) then "ok" else "mismatch" end),
+             script: $script, expected: $expected,
+             missing: [$expected[] | select(.present | not) | .name]}'
+    }
+
+    _release_report_installer_check() {
+        local report="$1" missing
+        case "$(jq -r '.status' <<< "$report")" in
+            ok)
+                log_ok "Installer $(jq -r '.script' <<< "$report") finds every asset it downloads"
+                ;;
+            mismatch)
+                while IFS= read -r missing; do
+                    log_warn "Installer $(jq -r '.script' <<< "$report") downloads $missing, which this release does not publish"
+                done < <(jq -r '.missing[]' <<< "$report")
+                if jq -e 'any(.expected[]; .ext_mismatch)' <<< "$report" >/dev/null; then
+                    log_warn "  The installer hardcodes a different archive extension than this release builds"
+                fi
+                log_warn "  Fix install.sh or set install_script_compat in repos.d/$tool_name.yaml, then check with: dsr repos validate"
+                ;;
+        esac
+    }
+
     # Dry-run mode: show planned actions and exit
     if $DRY_RUN; then
         log_info "[dry-run] Would execute release:"
@@ -6185,31 +6306,83 @@ EOF
         fi
         log_info "  Prerelease:  $prerelease"
 
-        # List files that would be uploaded
-        local file_count=0
+        # List exactly what would be uploaded: every name of every artifact,
+        # then the manifest, generated checksums and existing sidecars.
+        local file_count=0 plan_entry plan_size plan_sha plan_names
+        local -a plan_artifacts=() plan_extra=() plan_all_names=()
         if $release_contract_enabled; then
             while IFS= read -r name; do
                 [[ -z "$name" ]] && continue
                 log_info "  Would upload: $name"
+                plan_all_names+=("$name")
                 file_count=$((file_count + 1))
             done < <(jq -r '.assets[].name' <<< "$release_contract_plan")
         elif $manifest_exists && [[ -f "$manifest_file" ]]; then
-            while IFS= read -r name; do
-                [[ -z "$name" ]] && continue
-                if [[ -f "$artifacts_dir/$name" ]]; then
-                    log_info "  Would upload: $name"
-                    file_count=$((file_count + 1))
+            local plan_name plan_target plan_format
+            while IFS=$'\t' read -r plan_name plan_sha plan_target plan_format; do
+                [[ -n "$plan_name" && -f "$artifacts_dir/$plan_name" ]] || continue
+                plan_size=$(_release_file_size "$artifacts_dir/$plan_name" 2>/dev/null || echo 0)
+                plan_names=$(_release_artifact_upload_names "$plan_name" "$plan_target" "$plan_format" |
+                    jq -Rsc 'split("\n") | map(select(length > 0))') || return 4
+                plan_entry=$(jq -nc --arg name "$plan_name" --arg path "$artifacts_dir/$plan_name" \
+                    --arg target "$plan_target" --arg sha256 "$plan_sha" \
+                    --argjson size_bytes "${plan_size:-0}" --argjson names "$plan_names" \
+                    '{name: $name, path: $path, target: $target, size_bytes: $size_bytes,
+                      sha256: $sha256, upload_names: $names}') || return 4
+                plan_artifacts+=("$plan_entry")
+                log_info "  Would upload: $plan_name (${plan_target:-untargeted}, $plan_size bytes, sha256 ${plan_sha:0:16}…)"
+                if [[ $(jq 'length' <<< "$plan_names") -gt 1 ]]; then
+                    log_info "      also as: $(jq -r '.[1:] | join(", ")' <<< "$plan_names")"
                 fi
-            done < <(jq -r '.artifacts[] | .name // .filename' <<< "$ordinary_manifest")
+                while IFS= read -r name; do
+                    plan_all_names+=("$name")
+                done < <(jq -r '.[]' <<< "$plan_names")
+            done < <(jq -r '.artifacts[] | [(.name // .filename), .sha256, (.target // ""), (.archive_format // "")] | @tsv' \
+                <<< "$ordinary_manifest")
+            log_info "  Would upload: ${manifest_file##*/} (build manifest)"
+            plan_extra+=("${manifest_file##*/}")
+            # SHA256SUMS and the per-name .sha256 sidecars are regenerated at
+            # upload time; other signatures and evidence are uploaded as found.
+            local unique_names
+            unique_names=$(printf '%s\n' "${plan_all_names[@]}" | sort -u | grep -c . || true)
+            log_info "  Would generate: SHA256SUMS ($unique_names entries) + $unique_names per-asset .sha256 sidecars"
+            local extra_file
+            while IFS= read -r extra_file; do
+                [[ -n "$extra_file" ]] || continue
+                case "${extra_file##*/}" in SHA256SUMS|*.sha256) continue ;; esac
+                log_info "  Would upload: ${extra_file##*/} (existing sidecar)"
+                plan_extra+=("${extra_file##*/}")
+            done < <(find "$artifacts_dir" -maxdepth 1 -type f \
+                \( -name 'SHA256SUMS*' -o -name '*.minisig' -o -name '*.sbom.*' -o -name '*.intoto.jsonl' \) \
+                2>/dev/null | sort)
+            plan_all_names+=("${plan_extra[@]}" SHA256SUMS)
+            file_count=$(printf '%s\n' "${plan_all_names[@]}" | sort -u | grep -c . || true)
+            file_count=$((file_count + unique_names))
         else
             while IFS= read -r file; do
                 log_info "  Would upload: $(basename "$file")"
+                plan_all_names+=("$(basename "$file")")
                 file_count=$((file_count + 1))
             done < <(find "$artifacts_dir" -maxdepth 1 -type f 2>/dev/null)
         fi
         log_info "  Total files: $file_count"
 
+        local installer_report='{"status":"skipped","reason":"strict release contracts publish an exact asset set"}'
+        if ! $release_contract_enabled; then
+            installer_report=$(printf '%s\n' "${plan_all_names[@]}" | _release_installer_check) || \
+                installer_report='{"status":"skipped","reason":"installer check failed to run"}'
+            _release_report_installer_check "$installer_report"
+        fi
+        log_info "=== No changes made (dry-run) ==="
+
         if $JSON_MODE; then
+            local plan_artifacts_json='[]' plan_extra_json='[]'
+            if [[ ${#plan_artifacts[@]} -gt 0 ]]; then
+                plan_artifacts_json=$(printf '%s\n' "${plan_artifacts[@]}" | jq -sc '.') || return 4
+            fi
+            if [[ ${#plan_extra[@]} -gt 0 ]]; then
+                plan_extra_json=$(printf '%s\n' "${plan_extra[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 4
+            fi
             json_envelope "release" "dry_run" 0 "$(jq -nc \
                 --arg tool "$tool_name" \
                 --arg version "$tag" \
@@ -6218,7 +6391,18 @@ EOF
                 --argjson draft "$requested_draft" \
                 --argjson prerelease "$prerelease" \
                 --argjson file_count "$file_count" \
-                '{tool: $tool, version: $version, repo: $repo, artifacts_dir: $artifacts_dir, draft: $draft, prerelease: $prerelease, file_count: $file_count, mode: "dry_run"}')"
+                --argjson artifacts "$plan_artifacts_json" \
+                --argjson extra "$plan_extra_json" \
+                --argjson strict "$release_contract_enabled" \
+                --argjson installer "$installer_report" \
+                --argjson contract_assets "$(if $release_contract_enabled; then jq -c '[.assets[].name]' <<< "$release_contract_plan"; else echo '[]'; fi)" \
+                '{tool: $tool, version: $version, tag: $version, repo: $repo,
+                  artifacts_dir: $artifacts_dir, draft: $draft, prerelease: $prerelease,
+                  file_count: $file_count, mode: "dry_run", dry_run: true,
+                  plan: (if $strict then {strict: true, assets: $contract_assets}
+                         else {strict: false, artifacts: $artifacts, additional_files: $extra,
+                               generated: ["SHA256SUMS", "<name>.sha256 per uploaded name"]} end),
+                  installer_check: $installer}')"
         fi
         return 0
     fi
@@ -6532,62 +6716,14 @@ EOF
         while IFS=$'\t' read -r a_name a_sha256 a_target a_format; do
             [[ -z "$a_name" || -z "$a_sha256" ]] && continue
 
-            # Primary name from manifest (skip if a prior row already wrote it).
-            if [[ -z "${sha_seen[$a_name]:-}" ]]; then
-                _emit_sha_entry "$a_sha256" "$a_name"
-                sha_seen["$a_name"]=1
-            fi
-
-            # Compute alias names this artifact will also be uploaded as
-            local a_os="${a_target%/*}" a_arch="${a_target#*/}"
-            local a_ext="$a_format"
-            [[ "$a_ext" == "none" ]] && a_ext=""
-            if [[ -z "$a_ext" ]]; then
-                case "$a_name" in
-                    *.tar.xz) a_ext="tar.xz" ;; *.tar.gz) a_ext="tar.gz" ;;
-                    *.tgz)    a_ext="tgz" ;;     *.zip)    a_ext="zip" ;;
-                    *.exe)    a_ext="exe" ;;      *)       a_ext="" ;;
-                esac
-            fi
-
-            if [[ -n "$a_ext" && -n "$a_os" && -n "$a_arch" ]]; then
-                local dual_json=""
-                dual_json=$(artifact_naming_generate_dual_for_tool "$tool_name" "$version" "$a_os" "$a_arch" "$a_ext" "$local_path" 2>/dev/null || echo "")
-                if [[ -n "$dual_json" ]]; then
-                    local versioned="" compat=""
-                    versioned=$(echo "$dual_json" | jq -r '.versioned // empty')
-                    compat=$(echo "$dual_json" | jq -r '.compat // empty')
-
-                    # Add versioned and compat names
-                    local alias_name=""
-                    for alias_name in "$versioned" "$compat"; do
-                        [[ -z "$alias_name" || -n "${sha_seen[$alias_name]:-}" ]] && continue
-                        _emit_sha_entry "$a_sha256" "$alias_name"
-                        sha_seen["$alias_name"]=1
-                    done
-
-                    # Add arch aliases (amd64↔x86_64, arm64↔aarch64) for compat name
-                    # only — matches the upload loop which calls _release_arch_aliases
-                    # solely on compat_name (not versioned_name).
-                    if [[ -n "$compat" ]]; then
-                        local arch_alias=""
-                        case "$a_arch" in
-                            amd64)
-                                arch_alias="${compat//-amd64/-x86_64}"
-                                arch_alias="${arch_alias//_amd64/_x86_64}"
-                                ;;
-                            arm64)
-                                arch_alias="${compat//-arm64/-aarch64}"
-                                arch_alias="${arch_alias//_arm64/_aarch64}"
-                                ;;
-                        esac
-                        if [[ -n "$arch_alias" && "$arch_alias" != "$compat" && -z "${sha_seen[$arch_alias]:-}" ]]; then
-                            _emit_sha_entry "$a_sha256" "$arch_alias"
-                            sha_seen["$arch_alias"]=1
-                        fi
-                    fi
-                fi
-            fi
+            # Every name this artifact is uploaded as (primary, versioned,
+            # compat, arch aliases); a name a prior row already wrote is skipped.
+            local alias_name=""
+            while IFS= read -r alias_name; do
+                [[ -z "$alias_name" || -n "${sha_seen[$alias_name]:-}" ]] && continue
+                _emit_sha_entry "$a_sha256" "$alias_name"
+                sha_seen["$alias_name"]=1
+            done < <(_release_artifact_upload_names "$a_name" "$a_target" "$a_format")
         done < <(jq -r '.artifacts[] | [.name // .filename, .sha256, .target // "", .archive_format // ""] | @tsv' <<< "$ordinary_manifest")
 
         if [[ -s "$sha256sums_file" ]]; then
@@ -6657,35 +6793,6 @@ EOF
     # seed it from a local journal: names can outlive deleted/replaced assets.
     local -A uploaded_name_set=()
     local -A uploaded_sha_set=()
-
-    _release_arch_aliases() {
-        local name="$1"
-        local arch="$2"
-        local -a aliases=()
-
-        case "$arch" in
-            amd64)
-                if [[ "$name" == *"amd64"* ]]; then
-                    local alias
-                    alias="${name//-amd64/-x86_64}"
-                    alias="${alias//_amd64/_x86_64}"
-                    [[ "$alias" != "$name" ]] && aliases+=("$alias")
-                fi
-                ;;
-            arm64)
-                if [[ "$name" == *"arm64"* ]]; then
-                    local alias
-                    alias="${name//-arm64/-aarch64}"
-                    alias="${alias//_arm64/_aarch64}"
-                    [[ "$alias" != "$name" ]] && aliases+=("$alias")
-                fi
-                ;;
-        esac
-
-        if [[ ${#aliases[@]} -gt 0 ]]; then
-            printf '%s\n' "${aliases[@]}"
-        fi
-    }
 
     # Map manifest artifact names to targets and formats (for dual-name uploads)
     local -A manifest_targets=()
@@ -6831,88 +6938,39 @@ EOF
             continue
         fi
 
-        # Dual-name upload for manifest artifacts (versioned + compat)
+        # Dual-name upload for manifest artifacts: the primary name plus its
+        # versioned, installer-compatible and arch-alias names (deduped).
         local manifest_target="${manifest_targets[$filename]:-}"
         if [[ -n "$manifest_target" ]]; then
-            local os arch ext
-            os="${manifest_target%/*}"
-            arch="${manifest_target#*/}"
-            ext="${manifest_formats[$filename]:-}"
-            if [[ -z "$ext" || "$ext" == "none" ]]; then
-                case "$filename" in
-                    *.tar.gz) ext="tar.gz" ;;
-                    *.tgz) ext="tgz" ;;
-                    *.tar.xz) ext="tar.xz" ;;
-                    *.zip) ext="zip" ;;
-                    *.exe) ext="exe" ;;
-                    *) ext="" ;;
-                esac
-            fi
+            local -a upload_names=()
+            mapfile -t upload_names < <(_release_artifact_upload_names \
+                "$filename" "$manifest_target" "${manifest_formats[$filename]:-}")
+            if [[ ${#upload_names[@]} -gt 1 ]]; then
+                log_info "[$idx/$total_files] Uploading asset variants for: $filename"
 
-            if [[ -n "$ext" ]]; then
-                local names_json versioned_name compat_name same_names
-                names_json=$(artifact_naming_generate_dual_for_tool "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" 2>/dev/null || echo "")
-                versioned_name=$(echo "$names_json" | jq -r '.versioned // empty')
-                compat_name=$(echo "$names_json" | jq -r '.compat // empty')
-                same_names=$(echo "$names_json" | jq -r '.same // false')
-                [[ "$same_names" != "true" && "$same_names" != "false" ]] && same_names="false"
-
-                # If naming couldn't be resolved, fall back to original upload flow
-                if [[ -z "$versioned_name" && -z "$compat_name" ]]; then
-                    log_warn "No naming pattern resolved for $filename; uploading original name only"
-                else
-                    # Upload original + variant names (deduped)
-                    local -a upload_names=()
-                    upload_names+=("$filename")
-                    if [[ -n "$versioned_name" && "$versioned_name" != "$filename" ]]; then
-                        upload_names+=("$versioned_name")
-                    fi
-                    if [[ -n "$compat_name" && "$compat_name" != "$filename" && "$compat_name" != "$versioned_name" ]]; then
-                        upload_names+=("$compat_name")
-                    fi
-                    if [[ -n "$compat_name" ]]; then
-                        while IFS= read -r alias_name; do
-                            [[ -z "$alias_name" ]] && continue
-                            local seen_alias=false
-                            local existing
-                            for existing in "${upload_names[@]}"; do
-                                if [[ "$existing" == "$alias_name" ]]; then
-                                    seen_alias=true
-                                    break
-                                fi
-                            done
-                            if ! $seen_alias; then
-                                upload_names+=("$alias_name")
-                            fi
-                        done < <(_release_arch_aliases "$compat_name" "$arch")
-                    fi
-
-                    log_info "[$idx/$total_files] Uploading asset variants for: $filename"
-
-                    local upload_name
-                    for upload_name in "${upload_names[@]}"; do
-                        if [[ -n "${uploaded_name_set[$upload_name]:-}" ]]; then
-                            if [[ "${uploaded_sha_set[$upload_name]:-}" != "$upload_sha" ]]; then
-                                _release_record_failed "$upload_name" "Different artifact contents resolve to the same upload name"
-                                continue
-                            fi
-                            log_info "  Skipping (already handled in this run): $upload_name"
-                            skipped_assets+=("$upload_name")
+                local upload_name
+                for upload_name in "${upload_names[@]}"; do
+                    if [[ -n "${uploaded_name_set[$upload_name]:-}" ]]; then
+                        if [[ "${uploaded_sha_set[$upload_name]:-}" != "$upload_sha" ]]; then
+                            _release_record_failed "$upload_name" "Different artifact contents resolve to the same upload name"
                             continue
                         fi
-                        local upload_result
-                        if upload_result=$(gh_upload_asset_named "$upload_url" "$file" "$upload_name" "$content_type"); then
-                            log_ok "  Verified upload: $upload_name ($size_bytes bytes)"
-                            _release_record_uploaded "$upload_name" "uploaded" "$size_bytes" "$content_type" "$upload_result" "$upload_sha"
-                            uploaded_name_set["$upload_name"]=1
-                            uploaded_sha_set["$upload_name"]="$upload_sha"
-                        else
-                            log_error "  Failed to upload: $upload_name"
-                            _release_record_failed "$upload_name" "Verified upload failed (see release log): $upload_result"
-                        fi
-                    done
-                    continue
-                fi
+                        log_info "  Skipping (already handled in this run): $upload_name"
+                        skipped_assets+=("$upload_name")
+                        continue
+                    fi
+                    local upload_result
+                    if upload_result=$(gh_upload_asset_named "$upload_url" "$file" "$upload_name" "$content_type"); then
+                        log_ok "  Verified upload: $upload_name ($size_bytes bytes)"
+                        _release_record_uploaded "$upload_name" "uploaded" "$size_bytes" "$content_type" "$upload_result" "$upload_sha"
+                        uploaded_name_set["$upload_name"]=1
+                        uploaded_sha_set["$upload_name"]="$upload_sha"
+                    else
+                        log_error "  Failed to upload: $upload_name"
+                        _release_record_failed "$upload_name" "Verified upload failed (see release log): $upload_result"
+                    fi
+                done
+                continue
             fi
         fi
 
@@ -7199,6 +7257,28 @@ EOF
         fi
     fi
 
+    # Would the project's own curl|bash installer find its downloads on this
+    # release? Warn loudly when not; the upload itself remains authoritative.
+    local installer_report='{"status":"skipped","reason":"strict release contracts publish an exact asset set"}'
+    if ! $release_contract_enabled; then
+        local -A installer_published=()
+        local installer_asset installer_name
+        for installer_asset in "${uploaded_assets[@]}"; do
+            installer_name=$(jq -r '.name // empty' <<< "$installer_asset" 2>/dev/null) || continue
+            [[ -n "$installer_name" ]] && installer_published["$installer_name"]=1
+        done
+        for installer_name in "${skipped_assets[@]}"; do
+            installer_published["$installer_name"]=1
+        done
+        if [[ ${#installer_published[@]} -gt 0 ]]; then
+            installer_report=$(printf '%s\n' "${!installer_published[@]}" | _release_installer_check) || \
+                installer_report='{"status":"skipped","reason":"installer check failed to run"}'
+        else
+            installer_report='{"status":"skipped","reason":"no assets were published"}'
+        fi
+        _release_report_installer_check "$installer_report"
+    fi
+
     # Calculate duration after contract verification and publication.
     local end_time duration
     end_time=$(date +%s)
@@ -7293,6 +7373,7 @@ EOF
             --arg dispatch_event "$dispatch_event" \
             --arg dispatch_repos "$dispatch_repos" \
             --argjson dispatch_results "$dispatch_results_json" \
+            --argjson installer_check "$installer_report" \
             '{
                 repo: $repo,
                 version: $version,
@@ -7305,6 +7386,7 @@ EOF
                 assets_uploaded: $uploaded,
                 assets_failed: $failed,
                 verification: $verification,
+                installer_check: $installer_check,
                 tag_ruleset_receipt: $tag_ruleset_receipt,
                 total: $total,
                 success: $success,
