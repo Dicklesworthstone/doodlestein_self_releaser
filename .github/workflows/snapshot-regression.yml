@@ -9,12 +9,12 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: unix-snapshot-repair-main
+  group: unix-snapshot-repair-intel
   cancel-in-progress: false
 jobs:
   verify-repair:
     if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser'
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
