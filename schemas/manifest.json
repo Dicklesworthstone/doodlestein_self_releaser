@@ -218,7 +218,7 @@
     },
     "toolchain_executable": {
       "type": "object",
-      "description": "One executable as resolved in the strict build shell: the PATH selection and, for rustup proxies, launcher scripts and Apple launchers, the executable it dispatches to.",
+      "description": "One executable selected in the strict build shell, with a resolved dispatch target for proven rustup proxies and Apple launchers. Arbitrary scripts retain their own identity.",
       "required": ["program", "selected_path", "selected_sha256", "selected_kind", "version"],
       "additionalProperties": false,
       "properties": {
@@ -242,6 +242,29 @@
         "cwd": {"type": "string", "pattern": "^/"},
         "target_triple": {"type": "string"},
         "linker_variable": {"type": ["string", "null"]},
+        "selection": {
+          "type": "object",
+          "required": ["rustup_toolchain", "cargo_commands", "cargo_config"],
+          "additionalProperties": false,
+          "properties": {
+            "rustup_toolchain": {"type": ["string", "null"]},
+            "cargo_commands": {
+              "type": "array", "minItems": 1, "uniqueItems": true,
+              "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
+            },
+            "cargo_config": {
+              "type": "array",
+              "items": {
+                "type": "object", "required": ["path", "sha256"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": {"type": "string", "pattern": "^/"},
+                  "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                }
+              }
+            }
+          }
+        },
         "tools": {
           "type": "object",
           "required": ["cargo", "rustc"],

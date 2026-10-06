@@ -6495,9 +6495,12 @@ PY
 # overrides and configured linkers resolve exactly as they do for the build.
 # Mode "record" writes the identity JSON to <output> without clobbering;
 # mode "verify" re-probes after the build and fails if any identity changed.
-# Each tool records the selected executable (what the shell runs) and, for
-# rustup proxies, launcher scripts and Apple /usr/bin compiler launchers, the
-# executable it dispatches to, with SHA-256 digests and verbose versions.
+# The reviewed invocation boundary accepts direct Cargo commands with a common
+# literal toolchain and target, including the effective CARGO_BUILD_TARGET.
+# Unresolved shell selection, conflicting invocations and Cargo --config/-C
+# overrides are refused rather than attesting a default that may not run.
+# Each tool records the selected executable and, for proven rustup proxies and
+# Apple /usr/bin compiler launchers, its dispatch target and content digest.
 # Args: mode output_json build_cmd extra_tools(space-separated)
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}"
@@ -6509,7 +6512,7 @@ _act_toolchain_identity_script() {
     printf -v extra_q '%q' "$extra_tools"
     printf 'python3 -I - %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$mode" "$output_q" "$command_q" "$extra_q"
     cat <<'PY'
-import hashlib, json, os, pathlib, re, shutil, subprocess, sys
+import hashlib, json, os, pathlib, re, shlex, shutil, subprocess, sys
 
 mode, output, command, extra = sys.argv[1:5]
 
@@ -6524,30 +6527,326 @@ def digest(path):
             h.update(block)
     return h.hexdigest()
 
-def run(argv):
+def shell_word(raw, variables=()):
+    # Read a bounded shell word without evaluating code. Quotes and ordinary
+    # escapes are preserved by shlex's non-POSIX lexer. Only explicitly known
+    # environment substitutions are admitted, never command substitution,
+    # globs, shell parameter operators or a second round of word splitting.
+    value, quote, index = '', '', 0
+    while index < len(raw):
+        char = raw[index]
+        if char in "\"'" and (not quote or quote == char):
+            quote = '' if quote else char
+            index += 1
+            continue
+        if char == '\\' and quote != "'":
+            index += 1
+            if index == len(raw):
+                fail('unfinished escape in Cargo invocation')
+            if quote == '"' and raw[index] not in '$`"\\\n':
+                value += '\\'
+            if raw[index] != '\n':
+                value += raw[index]
+            index += 1
+            continue
+        if char == '$' and quote != "'":
+            match = re.match(r'\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))', raw[index:])
+            name = (match.group(1) or match.group(2)) if match else None
+            if name not in variables or name not in os.environ:
+                fail('dynamic Cargo selection is unsupported; use a literal selector or configured CARGO_BUILD_TARGET')
+            replacement = os.environ[name]
+            if not quote and any(char.isspace() or char in '*?[' for char in replacement):
+                fail('Cargo argument expansion would split or glob: ' + name)
+            value += replacement
+            index += len(match.group(0))
+            continue
+        if (char == '`' and quote != "'") or (not quote and char in '*?[]{}~'):
+            fail('dynamic Cargo argument is unsupported: ' + raw)
+        value += char
+        index += 1
+    if quote:
+        fail('unfinished quote in Cargo invocation')
+    return value
+
+
+def influences(name):
+    return name == 'PATH' or name.startswith(('CARGO_', 'RUST'))
+
+
+def cargo_configuration():
+    # Cargo searches from cwd towards the filesystem root (and CARGO_HOME).
+    # Strict staging has already excluded inherited/private-home config, but
+    # tracked .cargo/config{,.toml} remains a legitimate source of selection.
+    # Read only the literal selectors we can attest, preserving Cargo's nearer
+    # file precedence and config-relative executable paths. Do not approximate
+    # cfg expressions, aliases, includes, or configuration-driven env changes.
+    paths = []
+    for directory in reversed([pathlib.Path.cwd(), *pathlib.Path.cwd().parents]):
+        legacy, modern = directory / '.cargo/config', directory / '.cargo/config.toml'
+        if legacy.exists() or legacy.is_symlink():
+            paths.append(legacy)
+        elif modern.exists() or modern.is_symlink():
+            paths.append(modern)
+    cargo_home = pathlib.Path(os.environ.get('CARGO_HOME', str(pathlib.Path.home() / '.cargo')))
+    for name in ('config', 'config.toml'):
+        path = cargo_home / name
+        if path.exists() or path.is_symlink():
+            if path not in paths:
+                fail('strict toolchain attestation forbids private-home Cargo configuration')
+    config, receipts = {'build': {}, 'target': {}, 'alias': {}}, []
+    if not paths:
+        return config, receipts
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        import tomllib
+    except ImportError:
+        fail('Python 3.11+ is required to attest a tracked Cargo configuration file')
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            fail('Cargo configuration must be a regular file: ' + str(path))
+        raw = path.read_bytes()
+        try:
+            current = tomllib.loads(raw.decode('utf-8'))
+        except (ValueError, UnicodeError) as error:
+            fail('invalid Cargo configuration: ' + str(error))
+        if 'include' in current:
+            fail('Cargo configuration includes require an explicitly attested selection')
+        if any(influences(name) for name in current.get('env', {})):
+            fail('Cargo configuration changes the compiler environment; use the configured build environment')
+        for section in ('build', 'target', 'alias'):
+            if section in current and not isinstance(current[section], dict):
+                fail('invalid Cargo configuration section: ' + section)
+        build = dict(current.get('build', {}))
+        for key in ('rustc', 'rustc-wrapper', 'rustc-workspace-wrapper'):
+            if key in build:
+                if not isinstance(build[key], str):
+                    fail('Cargo build.' + key + ' must be a literal executable path')
+                if '/' in build[key] and not pathlib.Path(build[key]).is_absolute():
+                    build[key] = str((path.parent.parent / build[key]).resolve())
+        config['build'].update(build)
+        for target, values in current.get('target', {}).items():
+            if not isinstance(values, dict):
+                fail('invalid Cargo target configuration')
+            values = dict(values)
+            if target.startswith('cfg(') and ('linker' in values or 'rustflags' in values):
+                fail('Cargo cfg-based compiler selection is not statically attested; use an exact target table')
+            if 'linker' in values:
+                if not isinstance(values['linker'], str):
+                    fail('Cargo target linker must be a literal executable path')
+                if '/' in values['linker'] and not pathlib.Path(values['linker']).is_absolute():
+                    values['linker'] = str((path.parent.parent / values['linker']).resolve())
+            config['target'].setdefault(target, {}).update(values)
+        config['alias'].update(current.get('alias', {}))
+        receipts.append({'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()})
+    return config, receipts
+
+
+cargo_config, cargo_config_receipts = cargo_configuration()
+
+
+def joined_shell_lines(text):
+    result, quote, index = '', '', 0
+    while index < len(text):
+        char = text[index]
+        if char == '\\' and quote != "'" and index + 1 < len(text):
+            if text[index + 1] != '\n':
+                result += text[index:index + 2]
+            index += 2
+            continue
+        if char in "\"'" and (not quote or quote == char):
+            quote = '' if quote else char
+        result += char
+        index += 1
+    return result
+
+
+def invocation_selection():
+    try:
+        lexer = shlex.shlex(joined_shell_lines(command), posix=False, punctuation_chars=';&|()<>\n')
+        lexer.whitespace = ' \t\r'
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError as error:
+        fail('cannot read Cargo invocation: ' + str(error))
+    statements, current = [], []
+    for token in tokens:
+        if token and all(char in ';&|()\n' for char in token):
+            if token == '&':
+                fail('background Cargo commands cannot be bounded by the final identity check')
+            if current:
+                statements.append(current)
+                current = []
+            if '(' in token or ')' in token or token == '&':
+                statements.append(['__unsupported_shell_context__'])
+        else:
+            current.append(token)
+    if current:
+        statements.append(current)
+
+    selections, commands, context_change = [], [], None
+    for words in statements:
+        # A redirection can occur anywhere in a simple command: arguments
+        # after it still reach Cargo. Remove each operator/operand, preserving
+        # subsequent selectors instead of truncating at the first redirection.
+        # Here-documents and process substitutions need a full shell parser;
+        # refuse them rather than treating their bodies as Cargo invocations.
+        arguments, index = [], 0
+        while index < len(words):
+            token = words[index]
+            if token and all(char in '<>&|' for char in token):
+                if token not in ('<', '>', '>>', '<>', '>|', '>&', '<&', '&>', '&>>') or \
+                        index + 1 == len(words) or \
+                        all(char in '<>&|()' for char in words[index + 1]):
+                    fail('unsupported shell redirection in the attested Cargo command')
+                if arguments and arguments[-1].isdigit():
+                    arguments.pop()
+                index += 2
+                continue
+            arguments.append(token)
+            index += 1
+        words = arguments
+        if not words:
+            continue
+        assignments, cursor = {}, 0
+        while cursor < len(words) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', words[cursor]):
+            name, value = words[cursor].split('=', 1)
+            assignments[name] = value
+            cursor += 1
+        if cursor == len(words):
+            if any(influences(name) for name in assignments):
+                context_change = 'shell environment assignment'
+            continue
+        program = shell_word(words[cursor])
+        cursor += 1
+        if program == 'command':
+            if cursor < len(words) and words[cursor] == '--':
+                cursor += 1
+            if cursor == len(words):
+                continue
+            program = shell_word(words[cursor])
+            cursor += 1
+        if program == 'env':
+            while cursor < len(words) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', words[cursor]):
+                name, value = words[cursor].split('=', 1)
+                assignments[name] = value
+                cursor += 1
+            if cursor == len(words):
+                continue
+            if words[cursor].startswith('-') and any('cargo' in raw for raw in words[cursor:]):
+                fail('env options around Cargo are unsupported; configure the build environment')
+            program = shell_word(words[cursor])
+            cursor += 1
+        if program != 'cargo':
+            if pathlib.PurePosixPath(program).name == 'cargo' or \
+                    (program in ('rustup', 'sh', 'bash', 'zsh', 'dash', 'env', 'exec', 'eval', 'source', '.') and
+                     any('cargo' in raw for raw in words[cursor:])):
+                fail('wrapped Cargo invocation is unsupported; use a direct cargo command')
+            if program in ('cd', 'pushd', 'popd', 'source', '.', 'eval', 'exec',
+                           'export', 'unset', 'set', 'alias', 'unalias',
+                           '__unsupported_shell_context__'):
+                context_change = program
+            continue
+        if context_change:
+            fail('Cargo context changes inside build_cmd (' + context_change +
+                 '); configure its environment/cwd outside the command')
+        env = dict(os.environ)
+        for name, raw in assignments.items():
+            if name in ('CARGO_HOME', 'CARGO_TARGET_DIR'):
+                fail('build_cmd cannot replace the admitted ' + name)
+            env[name] = shell_word(raw)
+        argv = [shell_word(raw, ('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR', 'CARGO_HOME'))
+                for raw in words[cursor:]]
+        toolchain = env.get('RUSTUP_TOOLCHAIN') or None
+        explicit_toolchain = False
+        if argv and argv[0].startswith('+'):
+            toolchain, argv = argv[0][1:], argv[1:]
+            explicit_toolchain = True
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', toolchain):
+                fail('Cargo +toolchain must be one literal installed toolchain name')
+        for arg in argv:
+            if arg == '--config' or arg.startswith('--config=') or arg == '-C' or arg.startswith('-C'):
+                fail('Cargo --config/-C changes selection outside the attested invocation; use the configured build environment/cwd')
+        # Only reviewed Cargo global options can precede the subcommand. Cargo
+        # aliases and opaque shell drivers cannot prove which compiler ran.
+        cursor = 0
+        while cursor < len(argv) and argv[cursor].startswith('-'):
+            option = argv[cursor]
+            if option in ('-Z', '--color'):
+                cursor += 2
+            elif option in ('-v', '-vv', '--verbose', '-q', '--quiet', '--locked', '--offline', '--frozen') or \
+                    option.startswith(('-Z', '--color=')):
+                cursor += 1
+            else:
+                fail('unsupported Cargo global selector: ' + option)
+        if cursor >= len(argv) or not re.fullmatch(r'[a-z][a-z0-9-]*', argv[cursor]):
+            fail('a direct Cargo subcommand is required for strict toolchain attestation')
+        subcommand = argv[cursor]
+        if subcommand in cargo_config['alias']:
+            fail('Cargo alias cannot be attested as a direct compiler invocation: ' + subcommand)
+        if re.search(r'(?:^|\s)-C\s*linker(?:[=\s]|$)', ' '.join(argv)) or \
+                (subcommand == 'rustc' and '--' in argv and
+                 any(arg == '--target' or arg.startswith('--target=') for arg in argv[argv.index('--') + 1:])):
+            fail('cargo rustc compiler selectors require an explicit target/linker configuration')
+        commands.append(subcommand)
+        targets = []
+        while cursor < len(argv):
+            arg = argv[cursor]
+            if arg == '--target':
+                cursor += 1
+                if cursor >= len(argv):
+                    fail('Cargo --target requires a literal target')
+                targets.append(argv[cursor])
+            elif arg.startswith('--target='):
+                targets.append(arg.split('=', 1)[1])
+            cursor += 1
+        if len(set(targets)) > 1:
+            fail('multiple Cargo targets cannot share one toolchain identity receipt')
+        target = targets[0] if targets else env.get('CARGO_BUILD_TARGET', cargo_config['build'].get('target', ''))
+        if not isinstance(target, str) or (target and not re.fullmatch(r'[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+(?:\.[0-9.]+)?', target)):
+            fail('Cargo target must be a literal target triple, not a dynamic or JSON target')
+        selection = {'toolchain': toolchain, 'target': target,
+                     'environment': {name: value for name, value in env.items() if influences(name)}}
+        # An explicit + selector has higher priority than RUSTUP_TOOLCHAIN.
+        selection['environment']['RUSTUP_TOOLCHAIN'] = toolchain or ''
+        selections.append((selection, env, explicit_toolchain))
+    if not selections:
+        fail('strict toolchain attestation requires a direct Cargo invocation in build_cmd')
+    if any(selection[0] != selections[0][0] for selection in selections[1:]):
+        fail('conflicting Cargo toolchain, target or environment selections in build_cmd')
+    selection, env, _ = selections[0]
+    if selection['toolchain']:
+        env['RUSTUP_TOOLCHAIN'] = selection['toolchain']
+    return selection, env, any(row[2] for row in selections), sorted(set(commands))
+
+
+selection, probe_env, explicit_toolchain, cargo_commands = invocation_selection()
+
+
+def run(argv, required=True):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=probe_env)
     except (OSError, subprocess.TimeoutExpired) as error:
         fail('cannot run ' + argv[0] + ': ' + str(error))
+    if result.returncode and required:
+        fail('toolchain probe failed for ' + argv[0] + ': ' + result.stderr.strip())
     return (result.stdout or result.stderr).strip()
 
 def is_script(path):
     with open(path, 'rb') as stream:
         return stream.read(2) == b'#!'
 
-rustup = shutil.which('rustup')
+rustup = shutil.which('rustup', path=probe_env.get('PATH'))
 rustup_digest = digest(pathlib.Path(rustup).resolve()) if rustup else None
 
 def identity(name, program, version_args, rustup_tool=None, required=True):
-    selected = shutil.which(program)
+    selected = shutil.which(program, path=probe_env.get('PATH'))
     if not selected:
         if required:
             fail('required executable not found on the build PATH: ' + program)
         return None
-    selected = pathlib.Path(selected)
+    selected = pathlib.Path(selected).absolute()
     resolved_selected = selected.resolve()
-    version = run([str(selected), *version_args])
-    if version_args != ['-vV']:
+    version = run([str(selected), *version_args]) if version_args else ''
+    if version_args and version_args[-1] != '-vV':
         version = version.splitlines()[0] if version else ''
     record = {'program': program, 'selected_path': str(selected),
               'selected_sha256': digest(resolved_selected),
@@ -6555,10 +6854,11 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
               'version': version}
     actual = None
     proxy = rustup_digest is not None and record['selected_sha256'] == rustup_digest
-    if rustup_tool and rustup and (proxy or record['selected_kind'] == 'script'):
+    if rustup_tool and rustup and proxy:
         which = run([rustup, 'which', rustup_tool])
-        if which and pathlib.Path(which).is_file():
-            actual = pathlib.Path(which).resolve()
+        if not which or not pathlib.Path(which).is_file():
+            fail('rustup did not resolve the selected ' + rustup_tool)
+        actual = pathlib.Path(which).resolve()
     if sys.platform == 'darwin' and str(resolved_selected) in (
             '/usr/bin/cc', '/usr/bin/c++', '/usr/bin/clang', '/usr/bin/clang++', '/usr/bin/ld'):
         tool = {'/usr/bin/c++': 'clang++', '/usr/bin/clang++': 'clang++', '/usr/bin/ld': 'ld'}.get(
@@ -6572,11 +6872,34 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
         record['resolved_kind'] = 'script' if is_script(actual) else 'executable'
     return record
 
-triple = os.environ.get('CARGO_BUILD_TARGET', '')
-linker_variable = 'CARGO_TARGET_' + re.sub(r'[^A-Za-z0-9]', '_', triple).upper() + '_LINKER' if triple else ''
-linker = os.environ.get(linker_variable, '') if linker_variable else ''
-tools = {'cargo': identity('cargo', 'cargo', ['-vV'], 'cargo'),
-         'rustc': identity('rustc', os.environ.get('RUSTC') or 'rustc', ['-vV'], 'rustc')}
+triple = selection['target']
+cargo_version_args = (['+' + selection['toolchain']] if explicit_toolchain else []) + ['-vV']
+compiler = probe_env.get('RUSTC') or probe_env.get('CARGO_BUILD_RUSTC') or cargo_config['build'].get('rustc') or 'rustc'
+tools = {'cargo': identity('cargo', 'cargo', cargo_version_args, 'cargo'),
+         'rustc': identity('rustc', compiler, ['-vV'], 'rustc')}
+if not triple:
+    triple = next((line.split(': ', 1)[1] for line in tools['rustc']['version'].splitlines()
+                   if line.startswith('host: ')), '')
+    if not triple:
+        fail('rustc did not report its default host target')
+linker_variable = 'CARGO_TARGET_' + re.sub(r'[^A-Za-z0-9]', '_', triple).upper() + '_LINKER'
+configured_linker = cargo_config['target'].get(triple, {}).get('linker', '')
+linker = probe_env.get(linker_variable) or configured_linker
+rustflags = [value for name, value in probe_env.items() if name.endswith('RUSTFLAGS')]
+rustflags += [cargo_config['build'].get('rustflags', []),
+              cargo_config['target'].get(triple, {}).get('rustflags', [])]
+for flags in rustflags:
+    text = ' '.join(flags) if isinstance(flags, list) else flags
+    if not isinstance(text, str) or re.search(r'(?:^|\s|\x1f)-C\s*linker(?:[=\s]|$)', text):
+        fail('rustflags linker overrides require an explicit target linker configuration')
+for wrapper in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+                'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER'):
+    if probe_env.get(wrapper):
+        tools[wrapper.lower()] = identity(wrapper.lower(), probe_env[wrapper], [])
+for key in ('rustc-wrapper', 'rustc-workspace-wrapper'):
+    if cargo_config['build'].get(key) and not probe_env.get(key.upper().replace('-', '_')) and \
+            not probe_env.get('CARGO_BUILD_' + key.upper().replace('-', '_')):
+        tools[key.replace('-', '_')] = identity(key, cargo_config['build'][key], [])
 # An explicitly configured linker must exist; the default cc may legitimately
 # be absent on hosts that link through cargo-zigbuild.
 default_linker = identity('linker', linker or 'cc', ['--version'], required=bool(linker))
@@ -6584,11 +6907,11 @@ if default_linker:
     tools['linker'] = default_linker
 # Cargo subcommands named by the build command, and helpers DSR itself routes
 # the build through (cargo-zigbuild and zig for the portable glibc floor).
-plugins = set(re.findall(r'(?:^|[\s;&|(])cargo\s+(?:\+[\w.-]+\s+)?([a-z][a-z0-9-]*)', command))
+plugins = set(cargo_commands)
 plugins.update(name[len('cargo-'):] for name in extra.split() if name.startswith('cargo-'))
 for sub in sorted(plugins):
     program = 'cargo-' + sub
-    if shutil.which(program):
+    if shutil.which(program, path=probe_env.get('PATH')):
         tools[program] = identity(program, program, ['--version'], program, required=False)
 for name in sorted(set(extra.split())):
     if not name.startswith('cargo-') and name not in tools:
@@ -6596,7 +6919,10 @@ for name in sorted(set(extra.split())):
         if record:
             tools[name] = record
 result = {'schema_version': 1, 'cwd': os.getcwd(), 'target_triple': triple,
-          'linker_variable': linker_variable if linker else None, 'tools': tools}
+          'linker_variable': linker_variable if probe_env.get(linker_variable) else None, 'tools': tools,
+          'selection': {'rustup_toolchain': selection['toolchain'],
+                        'cargo_commands': cargo_commands,
+                        'cargo_config': cargo_config_receipts}}
 
 if mode == 'record':
     try:

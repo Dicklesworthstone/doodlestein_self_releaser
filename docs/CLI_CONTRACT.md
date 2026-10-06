@@ -560,15 +560,30 @@ unpublished and suppresses dispatch and upgrade hooks.
 Strict native builds trust the configured build host and its installed
 compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and
 records the explicit build-influence environment. On Unix hosts, strict Rust
-builds also attest the toolchain they ran: inside the build's own shell (same
-working directory, environment and PATH, including DSR's glibc-floor shim),
-just before the configured command, DSR records the selected `cargo`, `rustc`,
-linker (`CARGO_TARGET_<TRIPLE>_LINKER` or `cc`), the Cargo subcommands the
-command names, and `cargo-zigbuild`/`zig` when DSR routes through them, each
-with its path, SHA-256 and verbose version. rustup proxies, launcher scripts
-and Apple `/usr/bin` compiler launchers are also resolved to the executable
-they dispatch to. The same probe runs again after the build; any difference
-refuses artifact collection. The receipt is bound into the target result and
+builds also attest their direct Cargo invocations. Inside the build's own
+shell (same working directory, environment and PATH, including DSR's
+glibc-floor shim), DSR reads the command's literal `+toolchain` and `--target`
+selectors before probing. The command-line toolchain overrides
+`RUSTUP_TOOLCHAIN`; the command-line target overrides `CARGO_BUILD_TARGET`.
+Quoted literals, the effective `$CARGO_BUILD_TARGET`, and compound commands
+with a common Cargo selection are supported. DSR records Cargo and rustc
+paths, SHA-256 digests and verbose versions, the selected target linker,
+named Cargo plugins, and `cargo-zigbuild`/`zig` when DSR routes through them.
+Explicit `RUSTC`/`CARGO_BUILD_RUSTC` executables and compiler wrappers retain
+their own identities; arbitrary scripts are not mislabeled as rustup's
+compiler. Proven rustup proxies and Apple `/usr/bin` compiler launchers also
+record their resolved executable. Literal tracked Cargo configuration can
+select the compiler, target and linker; those configuration files are hashed
+into the receipt and require Python 3.11+ to parse.
+
+Conflicting toolchains/targets, dynamic selectors, Cargo `--config`/`-C`,
+compiler-selecting shell context changes, opaque Cargo drivers, Cargo aliases,
+configuration includes/`cfg` selectors, and configuration-driven compiler
+environment changes cannot be represented by one proven selection and are
+refused before compilation. Move those selections into the repository's
+configured build environment or a supported literal Cargo invocation. The
+same probe runs after the build; changed executables or configuration refuse
+artifact collection. The receipt is bound into the target result and
 the manifest as `build_environments[].cargo_isolation.toolchain`. It is
 evidence recorded by the build host, not a defense against a host that
 rewrites its own executables and receipts, and it does not cover dynamically
