@@ -593,6 +593,88 @@ PY
 }
 
 # ============================================================================
+# DSR REPORT TESTS
+# ============================================================================
+
+_iso_ago() {
+    date -u -d "$1 ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+        date -u -v-"${1// /}" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# Today's run log: a watcher whose fallback (ntm) failed with exit 6 while it
+# ran, a later successful build of bv, and status calls that are not runs.
+_write_report_log() {
+    local day="$DSR_STATE_DIR/logs/$(date +%Y-%m-%d)"
+    mkdir -p "$day"
+    cat > "$day/run.log" << EOF
+{"ts":"$(_iso_ago '3 hours')","run_id":"w1","level":"info","cmd":"watch","msg":"Session started"}
+{"ts":"$(_iso_ago '170 minutes')","run_id":"f1","level":"info","cmd":"fallback","msg":"Session started"}
+{"ts":"$(_iso_ago '169 minutes')","run_id":"f1","level":"info","cmd":"fallback","tool":"ntm","msg":"Building ntm"}
+{"ts":"$(_iso_ago '165 minutes')","run_id":"w1","level":"warn","cmd":"watch","msg":"Throttled run detected"}
+{"ts":"$(_iso_ago '160 minutes')","run_id":"f1","level":"info","cmd":"fallback","msg":"Session finished","exit_code":6}
+{"ts":"$(_iso_ago '2 hours')","run_id":"b1","level":"info","cmd":"build","msg":"Session started"}
+{"ts":"$(_iso_ago '119 minutes')","run_id":"b1","level":"info","cmd":"build","tool":"bv","msg":"Building bv"}
+{"ts":"$(_iso_ago '118 minutes')","run_id":"b1","level":"info","cmd":"build","msg":"Session finished","exit_code":0}
+{"ts":"$(_iso_ago '90 minutes')","run_id":"s1","level":"info","cmd":"status","msg":"Session started"}
+{"ts":"$(_iso_ago '90 minutes')","run_id":"s1","level":"info","cmd":"status","msg":"Session finished","exit_code":0}
+{"ts":"$(_iso_ago '1 hour')","run_id":"w1","level":"info","cmd":"watch","msg":"Session finished","exit_code":0}
+EOF
+    ln -sfn "$(date +%Y-%m-%d)" "$DSR_STATE_DIR/logs/latest"
+    mkdir -p "$DSR_STATE_DIR/check"
+    printf '{"checked_at":"%s","threshold_seconds":600,"repos_checked":["o/a","o/b"],"throttled":["o/a"],"skipped":[]}\n' \
+        "$(_iso_ago '5 minutes')" > "$DSR_STATE_DIR/check/last.json"
+}
+
+@test "dsr report summarizes runs, failures and throttling from the run logs" {
+    harness_create_config
+    _write_report_log
+
+    _dsr_json report
+    assert_equal "0" "$status"
+    # status and report calls are not runs; the newest run is listed first.
+    echo "$json" | jq -e '.command == "report" and
+        .details.summary == {"runs_last_24h": 3, "failures_last_24h": 1, "throttled_repos": 1, "in_progress": 0} and
+        [.details.recent_runs[] | .command] == ["build", "fallback", "watch"]'
+    echo "$json" | jq -e '[.details.recent_runs[] | select(.command == "fallback")][0] |
+        .repo == "ntm" and .exit_code == 6 and .status == "error" and .duration_ms == 600000'
+    echo "$json" | jq -e '.details.alerts == [{"code": "E010", "severity": "error",
+        "message": "fallback ntm exited 6 at \(.details.recent_runs[] | select(.command == "fallback") | .started_at)"}]'
+
+    _dsr_json report --repo ntm
+    echo "$json" | jq -e '[.details.recent_runs[].command] == ["fallback"] and .details.repo == "ntm"'
+
+    _dsr_json report --since 30m
+    echo "$json" | jq -e '.details.window.runs == 0 and .details.summary.runs_last_24h >= 3'
+
+    run harness_run_dsr report --since soon
+    assert_equal "4" "$status"
+}
+
+@test "dsr check records its result for report and status" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs ''
+
+    run harness_run_dsr check ntm
+    assert_equal "8" "$status"
+    jq -e '.repos_checked == ["Dicklesworthstone/ntm"] and .skipped == ["Dicklesworthstone/ntm"] and
+        .threshold_seconds == 600' "$DSR_STATE_DIR/check/last.json"
+
+    _dsr_json report
+    echo "$json" | jq -e '[.details.recent_runs[] | select(.command == "check")][0].exit_code == 8 and
+        (.details.alerts | map(.code) | index("E003")) != null'
+
+    _dsr_json status
+    echo "$json" | jq -e '.details.queue.throttled_count == 0 and .details.queue.threshold_seconds == 600 and
+        .details.last_run.command == "check" and .details.overall_status == "degraded"'
+
+    # A dry-run check leaves the recorded result alone.
+    rm -f "$DSR_STATE_DIR/check/last.json"
+    run harness_run_dsr --dry-run check ntm
+    [[ ! -e "$DSR_STATE_DIR/check/last.json" ]]
+}
+
+# ============================================================================
 # DSR STATUS TESTS
 # ============================================================================
 

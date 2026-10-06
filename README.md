@@ -691,8 +691,28 @@ System + last run summary.
 ```bash
 dsr status                                      # Show cached summary
 dsr status --refresh                            # Refresh host health checks
+dsr status --compact                            # One line (prompts, tmux)
+dsr status --watch                              # Redraw until interrupted
 dsr status --json                               # JSON output
 ```
+
+Exit 0 is healthy, 1 degraded (an unhealthy host, or the last command —
+status/help/version/report aside — failed), 3 unhealthy (no configuration).
+The summary includes the last command's outcome and the last `dsr check`
+result.
+
+### `dsr report`
+
+Recent activity from the run logs every command writes.
+
+```bash
+dsr report                                      # Last 24h: runs, failures, throttling
+dsr report --since 7d --limit 50                # A longer window
+dsr report --repo ntm --json                    # One tool, machine-readable
+```
+
+Each run lists its command, tool, outcome and duration; failed runs (usage
+errors and interrupts aside) also appear as alerts with their error codes.
 
 ### `dsr version`
 

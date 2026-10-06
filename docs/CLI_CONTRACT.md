@@ -777,6 +777,12 @@ dsr report [--since <duration>] [--limit <n>] [--repo <name>]
 | `--limit` | 20 | Max recent runs in report |
 | `--repo` | all | Scope report to a repo |
 
+Runs come from the run logs (`Session started`/`Session finished` records,
+rotated logs included); status, help, version and report invocations are not
+runs, and usage errors (4) or interrupts are not failures. `summary` always
+covers the last 24h; `window` covers `--since`. `throttled_repos` comes from
+the last `dsr check` result (`state/check/last.json`) when it is under a day old.
+
 **Exit codes:**
 - `0`: Report generated
 - `3`: Report failed (missing data or dependencies)

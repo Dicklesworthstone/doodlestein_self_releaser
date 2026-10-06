@@ -175,6 +175,7 @@ COMMANDS:
     doctor      System diagnostics
     signing     Manage minisign keys and signing
     status      System and last run summary
+    report      Recent runs, failures and throttling
     version     Detect and tag versions from version files
     canary      Test installers in Docker containers
     sbom        Generate Software Bill of Materials
@@ -1110,6 +1111,24 @@ _check_configured_repos() {
     )
 }
 
+# Save the outcome of one check as state/check/last.json (atomic replace).
+_check_save_snapshot() {
+    local threshold="$1"
+    shift
+    local dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/check" tmp
+    mkdir -p "$dir" 2>/dev/null || return 0
+    tmp=$(mktemp "$dir/.last.XXXXXXXX" 2>/dev/null) || return 0
+    if printf '%s\n' "$@" | jq -sc --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson threshold "$threshold" '
+            {checked_at: $at, threshold_seconds: $threshold, repos_checked: [.[].repo],
+             throttled: [.[] | select(.status == "throttled") | .repo],
+             skipped: [.[] | select(.status == "error") | .repo]}' > "$tmp" 2>/dev/null &&
+       mv -f -- "$tmp" "$dir/last.json"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+}
+
 cmd_check() {
     local repos=()
     local threshold=""
@@ -1265,6 +1284,9 @@ EOF
             _check_print_result "$result"
         fi
     done
+
+    # The last result, for `dsr report` and `dsr status` (not under dry-run).
+    ${DRY_RUN:-false} || _check_save_snapshot "$threshold" "${results[@]}"
 
     # Throttling is actionable even when another repo could not be read; an
     # unreadable repo is never reported as healthy.
@@ -11433,6 +11455,185 @@ EOF
 # STATUS SUBCOMMAND
 # ============================================================================
 
+# Sessions recorded in run logs read from stdin (oldest first), as a JSON
+# array of {run_id, command, tool, started_at, finished_at, exit_code}. A
+# finish closes the open session of the same run and command, so concurrent
+# dsr processes sharing one log (a watcher and the fallbacks it starts) pair
+# correctly; the first tool a session logs is its tool.
+_dsr_log_sessions() {
+    jq -Rnc '
+        reduce (inputs | fromjson? | select(type == "object" and (.run_id | type) == "string")) as $e
+            ({sessions: [], open: {}};
+             ($e.run_id + "\u0000" + ($e.cmd // "")) as $key |
+             if $e.msg == "Session started" then
+                 .open[$key] = (.sessions | length) |
+                 .sessions += [{run_id: $e.run_id, command: ($e.cmd // ""), tool: $e.tool,
+                                started_at: $e.ts, finished_at: null, exit_code: null}]
+             elif .open[$key] == null then .
+             elif $e.msg == "Session finished" then
+                 .sessions[.open[$key]] += {finished_at: $e.ts, exit_code: $e.exit_code} |
+                 del(.open[$key])
+             elif $e.tool != null and .sessions[.open[$key]].tool == null then
+                 .sessions[.open[$key]].tool = $e.tool
+             else . end) | .sessions'
+}
+
+# Print the logs (rotated .gz included) of the dated log directories on or
+# after <YYYY-MM-DD>, oldest first.
+_dsr_cat_run_logs_since() {
+    local log_dir="$1" first_day="$2" day_dir file
+    for day_dir in "$log_dir"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+        [[ -d "$day_dir" && ! -L "$day_dir" && ! "${day_dir##*/}" < "$first_day" ]] || continue
+        for file in "$day_dir"/run.log.gz "$day_dir"/run.log; do
+            [[ -f "$file" && ! -L "$file" ]] || continue
+            if [[ "$file" == *.gz ]]; then
+                gzip -dc -- "$file" 2>/dev/null || true
+            else
+                cat -- "$file"
+            fi
+        done
+    done
+}
+
+# Recent activity from the run logs (docs/CLI_CONTRACT.md `dsr report`).
+cmd_report() {
+    local since="24h" limit=20 repo_filter=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --since)
+                [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,5}[smhd]$ ]] || {
+                    log_error "--since requires a duration such as 30m, 24h or 7d"; return 4; }
+                since="$2"; shift 2 ;;
+            --limit)
+                [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,3}$ ]] || {
+                    log_error "--limit requires a positive number"; return 4; }
+                limit="$2"; shift 2 ;;
+            --repo)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "--repo requires a tool name"; return 4; }
+                repo_filter="$2"; shift 2 ;;
+            --help|-h)
+                cat << 'EOF'
+dsr report - Recent runs, failures and throttling
+
+USAGE:
+    dsr report [--since <duration>] [--limit <n>] [--repo <tool>]
+
+OPTIONS:
+    --since <d>    Lookback window: 30m, 24h, 7d (default: 24h)
+    --limit <n>    Most recent runs to list (default: 20)
+    --repo <tool>  Only runs for this tool
+    --json         JSON output (global flag)
+
+Reads the run logs every dsr command writes (status, help, version and
+report themselves are not listed) and the last `dsr check` result.
+
+EXIT CODES:
+    0  - Report generated
+    3  - No run logs to report on
+    4  - Invalid arguments
+EOF
+                return 0 ;;
+            *)
+                log_error "Unknown option: $1"
+                log_info "Run 'dsr report --help' for usage"
+                return 4 ;;
+        esac
+    done
+
+    local unit_seconds
+    case "${since: -1}" in
+        s) unit_seconds=1 ;; m) unit_seconds=60 ;; h) unit_seconds=3600 ;; d) unit_seconds=86400 ;;
+    esac
+    local now window_start first_day generated_at
+    now=$(date +%s)
+    window_start=$(( now - ${since%?} * unit_seconds ))
+    (( window_start > now - 86400 )) && first_day=$(( now - 86400 )) || first_day=$window_start
+    # Directory dates are local; read one more day than the window needs.
+    first_day=$(date -d "@$(( first_day - 86400 ))" +%Y-%m-%d 2>/dev/null ||
+        date -r "$(( first_day - 86400 ))" +%Y-%m-%d)
+    generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
+    local log_dir="$state_dir/logs"
+    if [[ ! -d "$log_dir" ]]; then
+        log_error "No run logs at $log_dir"
+        $JSON_MODE && json_envelope "report" "error" 3 "$(jq -nc --arg g "$generated_at" '
+            {generated_at: $g, summary: {runs_last_24h: 0, failures_last_24h: 0, throttled_repos: 0},
+             alerts: [{code: "E060", message: "report data unavailable: no run logs", severity: "error"}]}')"
+        return 3
+    fi
+
+    local sessions check_snapshot="null"
+    sessions=$(_dsr_cat_run_logs_since "$log_dir" "$first_day" | _dsr_log_sessions) || sessions='[]'
+    if [[ -f "$state_dir/check/last.json" && ! -L "$state_dir/check/last.json" ]]; then
+        check_snapshot=$(jq -c 'select(type == "object")' "$state_dir/check/last.json" 2>/dev/null) || check_snapshot="null"
+        [[ -n "$check_snapshot" ]] || check_snapshot="null"
+    fi
+
+    local details
+    details=$(jq -nc --argjson sessions "$sessions" --argjson check "$check_snapshot" \
+        --argjson now "$now" --argjson window_start "$window_start" --argjson limit "$limit" \
+        --arg since "$since" --arg repo "$repo_filter" --arg generated_at "$generated_at" '
+        def epoch: (try fromdateiso8601 catch null);
+        # Usage errors (4) and interrupts (5, 130) are not failures.
+        def failed: .exit_code != 0 and (.exit_code | IN(4, 5, 130) | not);
+        def alert_code: {"3": "E041", "6": "E010", "7": "E020", "8": "E003"}[.exit_code | tostring]
+            // (if .command == "release" then "E020"
+                elif (.command | IN("build", "fallback", "quality")) then "E010"
+                elif (.command | IN("check", "watch")) then "E003" else "E030" end);
+        [$sessions[] | select((.command | IN("", "status", "help", "version", "report")) | not)
+            | select($repo == "" or .tool == $repo)
+            | . + {start: (.started_at | epoch)} | select(.start != null)] as $runs |
+        [$runs[] | select(.exit_code | type == "number")] as $finished |
+        [$finished[] | select(.start >= $now - 86400)] as $day |
+        [$finished[] | select(.start >= $window_start)] as $window |
+        ($check != null and (($check.checked_at // "") | epoch // 0) >= $now - 86400) as $fresh_check |
+        {
+            generated_at: $generated_at,
+            summary: {
+                runs_last_24h: ($day | length),
+                failures_last_24h: ([$day[] | select(failed)] | length),
+                throttled_repos: (if $fresh_check then ($check.throttled // [] | length) else 0 end),
+                in_progress: ([$runs[] | select(.exit_code == null and .start >= $window_start)] | length)
+            },
+            window: {since: $since, from: ($window_start | todate), runs: ($window | length),
+                     failures: ([$window[] | select(failed)] | length)},
+            recent_runs: [$window | reverse | .[:$limit][] | {
+                repo: (.tool // ""), command, exit_code,
+                status: (if .exit_code == 0 then "success" elif .exit_code == 1 then "partial" else "error" end),
+                run_id, started_at,
+                duration_ms: (((.finished_at | epoch) // .start) - .start | if . < 0 then 0 else . * 1000 end)
+            }],
+            alerts: ([$window | reverse | .[] | select(failed) | {
+                code: alert_code, severity: "error",
+                message: "\(.command)\(if .tool then " " + .tool else "" end) exited \(.exit_code) at \(.started_at)"
+            }] | .[:10])
+        } + (if $repo == "" then {} else {repo: $repo} end)') || {
+        log_error "Could not build the report"
+        $JSON_MODE && json_envelope "report" "error" 3 "$(jq -nc --arg g "$generated_at" '
+            {generated_at: $g, summary: {runs_last_24h: 0, failures_last_24h: 0, throttled_repos: 0},
+             alerts: [{code: "E060", message: "report generation failed", severity: "error"}]}')"
+        return 3
+    }
+
+    if $JSON_MODE; then
+        json_envelope "report" "success" 0 "$details"
+        return 0
+    fi
+    jq -r '
+        "Report (last \(.window.since)): \(.window.runs) run(s), \(.window.failures) failure(s)",
+        "Last 24h: \(.summary.runs_last_24h) run(s), \(.summary.failures_last_24h) failure(s), \(.summary.throttled_repos) throttled repo(s)",
+        (if .summary.in_progress > 0 then "In progress: \(.summary.in_progress)" else empty end),
+        "",
+        (if (.recent_runs | length) == 0 then "No runs in this window."
+         else (.recent_runs[] |
+             "  \(.started_at)  \(.command | . + (" " * (9 - length)))  \(if .repo == "" then "-" else .repo end)  \(.status) (exit \(.exit_code), \((.duration_ms / 1000) | floor)s)")
+         end),
+        (if (.alerts | length) > 0 then "", "Alerts:", (.alerts[] | "  [\(.code)] \(.message)") else empty end)
+    ' <<< "$details" >&2
+    return 0
+}
+
 # Get last run info from log directory
 _status_get_last_run() {
     local state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
@@ -11458,24 +11659,16 @@ _status_get_last_run() {
     # last session of any kind.
     local day_log summary=""
     while IFS= read -r day_log; do
-        # A finish belongs to the session it follows (same run and command).
-        summary=$(jq -Rnc --arg log "$day_log" '
-            reduce (inputs | fromjson? | select(type == "object")) as $e ([];
-                if $e.msg == "Session started" then . + [{start: $e}]
-                elif $e.msg == "Session finished" and length > 0 and .[-1].end == null and
-                     .[-1].start.run_id == $e.run_id and .[-1].start.cmd == $e.cmd
-                then .[-1].end = $e
-                else . end) |
-            ([.[] | select((.start.cmd // "") | IN("", "status", "help", "version") | not)] | last) as $session |
-            if $session == null then empty else
-                $session.start as $start | $session.end as $end |
-                {run_id: $start.run_id, timestamp: $start.ts, started_at: $start.ts,
-                 log_file: $log, command: $start.cmd}
-                + (if $end == null or ($end.exit_code | type) != "number" then {} else
-                    {completed_at: $end.ts, exit_code: $end.exit_code,
-                     status: (if $end.exit_code == 0 then "success"
-                              elif $end.exit_code == 1 then "partial" else "error" end)} end)
-            end' "$day_log" 2>/dev/null) || summary=""
+        summary=$(_dsr_log_sessions < "$day_log" 2>/dev/null | jq -c --arg log "$day_log" '
+            ([.[] | select(.command | IN("", "status", "help", "version", "report") | not)] | last) as $s |
+            if $s == null then empty else
+                {run_id: $s.run_id, timestamp: $s.started_at, started_at: $s.started_at,
+                 log_file: $log, command: $s.command}
+                + (if ($s.exit_code | type) != "number" then {} else
+                    {completed_at: $s.finished_at, exit_code: $s.exit_code,
+                     status: (if $s.exit_code == 0 then "success"
+                              elif $s.exit_code == 1 then "partial" else "error" end)} end)
+            end' 2>/dev/null) || summary=""
         [[ -n "$summary" ]] && break
     done < <(find "$log_dir" -mindepth 2 -maxdepth 2 -name run.log -type f 2>/dev/null | sort -r | head -7)
 
@@ -11611,6 +11804,14 @@ EOF
     config_status=$(_status_get_config)
     signing_status=$(_status_get_signing)
 
+    # The last `dsr check` result, if any (state/check/last.json).
+    local check_snapshot="null"
+    local check_file="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/check/last.json"
+    if [[ -f "$check_file" && ! -L "$check_file" ]]; then
+        check_snapshot=$(jq -c 'select(type == "object")' "$check_file" 2>/dev/null) || check_snapshot="null"
+        [[ -n "$check_snapshot" ]] || check_snapshot="null"
+    fi
+
     # Get host health (refresh if requested)
     if $refresh; then
         log_info "Refreshing host health..."
@@ -11645,6 +11846,7 @@ EOF
         --argjson last_run "$last_run" \
         --argjson config "$config_status" \
         --argjson signing "$signing_status" \
+        --argjson check "$check_snapshot" \
         --argjson hosts "$hosts_status" '
         ($hosts | to_entries | map(.value as $h | {
             host: .key,
@@ -11668,6 +11870,9 @@ EOF
             config: $config,
             signing: $signing,
             hosts: $host_list,
+            queue: (if $check == null then null else
+                {throttled_count: ($check.throttled // [] | length),
+                 threshold_seconds: $check.threshold_seconds, checked_at: $check.checked_at} end),
             warnings: ([
                 (if ($config.valid | not) then "no configuration (run dsr config init)" else empty end),
                 ($bad_hosts[] | "host \(.) is unhealthy"),
@@ -11675,7 +11880,7 @@ EOF
                  then "last command \($last_run.command) exited \($last_run.exit_code)" else empty end),
                 (if ($signing.configured | not) then "signing keypair not configured" else empty end)
             ])
-        }' 2>/dev/null) || json_output='{"overall_status": "error"}'
+        } | with_entries(select(.value != null))' 2>/dev/null) || json_output='{"overall_status": "error"}'
 
     local overall status_exit=0 envelope_status="success"
     overall=$(jq -r '.overall_status // "error"' <<< "$json_output")
@@ -13223,6 +13428,9 @@ main() {
             ;;
         status)
             cmd_status "$@"
+            ;;
+        report)
+            cmd_report "$@"
             ;;
         version)
             cmd_version "$@"
