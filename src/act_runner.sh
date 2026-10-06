@@ -10611,6 +10611,14 @@ act_generate_manifest() {
     run_id=$(jq -r '.run_id // empty' <<< "$result_json")
     status=$(jq -r '.status // empty' <<< "$result_json")
 
+    # Standalone workflow collection must consult the same configuration as
+    # dsr build/release before deciding whether this is a strict manifest.
+    local manifest_module_dir
+    manifest_module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 3
+    if ! declare -F config_get_release_contract_json &>/dev/null; then
+        # shellcheck source=./config.sh
+        source "$manifest_module_dir/config.sh" || return 3
+    fi
     local release_contract_json="null"
     if ! release_contract_json=$(_act_release_contract_json "$tool"); then
         return 4
@@ -10618,6 +10626,11 @@ act_generate_manifest() {
     if [[ "$release_contract_json" != "null" ]]; then
         _act_generate_contract_manifest "$result_json" "$output_file" "$release_contract_json"
         return $?
+    fi
+    config_validate_target_triples "$tool" || return 4
+    if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
+        # shellcheck source=./artifact_naming.sh
+        source "$manifest_module_dir/artifact_naming.sh" || return 3
     fi
     if ! _act_build_purpose_matches "$result_json" release false || \
        ! jq -e 'all(.targets[];
@@ -10693,8 +10706,8 @@ act_generate_manifest() {
     # cross-platform artifacts under a single act job (e.g. release.yml that
     # builds linux/darwin/windows from the "build-release" job).
     #
-    # musl variants are mapped to plain "linux/<arch>" — the libc choice is a
-    # filename detail (e.g. linux_musl_amd64), not a separate dsr target.
+    # musl variants share the "linux/<arch>" scheduling target; their declared
+    # ABI is retained separately as target_triple on each artifact row.
     _act_infer_target_from_name() {
         local nm="$1"
         local os="" arch=""
@@ -10708,6 +10721,17 @@ act_generate_manifest() {
             *_x86_64*|*-x86_64*|*_amd64*|*-amd64*)   arch="amd64" ;;
         esac
         [[ -n "$os" && -n "$arch" ]] && printf '%s/%s\n' "$os" "$arch"
+    }
+
+    _act_manifest_target_triple() {
+        local target="$1" name="$2" variant triple how
+        variant=$(artifact_naming_artifact_variant "$tool" "${target%/*}" "${target#*/}" "$name") || return 4
+        IFS=$'\t' read -r triple how <<< "$variant"
+        if [[ -z "$triple" || "$how" == unknown ]]; then
+            _log_error "Artifact has an unconfigured target variant: $name ($target)"
+            return 4
+        fi
+        printf '%s\n' "$triple"
     }
 
     _act_manifest_add_file() {
@@ -10762,6 +10786,8 @@ act_generate_manifest() {
         if [[ -n "$inferred_target" ]]; then
             target="$inferred_target"
         fi
+        local target_triple
+        target_triple=$(_act_manifest_target_triple "$target" "$name") || return 4
 
         local sig_file=""
         local signed=false
@@ -10774,6 +10800,7 @@ act_generate_manifest() {
         artifact_json=$(jq -nc \
             --arg name "$name" \
             --arg target "$target" \
+            --arg target_triple "$target_triple" \
             --arg sha "$sha" \
             --argjson size "$size" \
             --arg format "$format" \
@@ -10782,6 +10809,7 @@ act_generate_manifest() {
             '{
                 name: $name,
                 target: $target,
+                target_triple: $target_triple,
                 sha256: $sha,
                 size_bytes: $size,
                 archive_format: $format,
@@ -10827,7 +10855,7 @@ act_generate_manifest() {
         if ! command -v unzip &>/dev/null; then
             _log_warn "unzip not available; treating $zip_file as artifact"
             _act_manifest_add_file "$zip_file" "$target"
-            return 0
+            return $?
         fi
 
         local entries
@@ -10899,17 +10927,21 @@ act_generate_manifest() {
             if [[ -n "$inferred_target" ]]; then
                 entry_target="$inferred_target"
             fi
+            local target_triple
+            target_triple=$(_act_manifest_target_triple "$entry_target" "$name") || return 4
 
             local artifact_json
             artifact_json=$(jq -nc \
                 --arg name "$name" \
                 --arg target "$entry_target" \
+                --arg target_triple "$target_triple" \
                 --arg sha "$sha" \
                 --argjson size "$size" \
                 --arg format "$format" \
                 '{
                     name: $name,
                     target: $target,
+                    target_triple: $target_triple,
                     sha256: $sha,
                     size_bytes: $size,
                     archive_format: $format,
@@ -10934,15 +10966,15 @@ act_generate_manifest() {
         artifact_dir=$(echo "$target_json" | jq -r '.artifact_dir // empty' 2>/dev/null)
 
         if [[ -n "$artifact_path" && -f "$artifact_path" ]]; then
-            _act_manifest_add_file "$artifact_path" "$target"
+            _act_manifest_add_file "$artifact_path" "$target" || return $?
         fi
 
         if [[ -n "$artifact_dir" && -d "$artifact_dir" ]]; then
             while IFS= read -r -d '' file; do
                 if [[ "$file" == *.zip ]]; then
-                    _act_manifest_add_zip_entries "$file" "$target"
+                    _act_manifest_add_zip_entries "$file" "$target" || return $?
                 else
-                    _act_manifest_add_file "$file" "$target"
+                    _act_manifest_add_file "$file" "$target" || return $?
                 fi
             done < <(find "$artifact_dir" -type f -print0 2>/dev/null)
         fi

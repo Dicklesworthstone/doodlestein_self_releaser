@@ -463,6 +463,7 @@ artifact_naming_generate_dual() {
     local compat_pattern="${6:-}"  # Optional explicit compat pattern
     local versioned_pattern="${7:-}"  # Optional explicit versioned pattern
     local config_tool="${8:-$tool}"  # Config tool name for arch alias / target triple lookups
+    local _AN_TARGET_TRIPLE_OVERRIDE="${9:-${_AN_TARGET_TRIPLE_OVERRIDE:-}}"
 
     _an_log_debug "Generating dual names: tool=$tool version=$version os=$os arch=$arch ext=$ext"
 
@@ -749,7 +750,7 @@ artifact_naming_get_versioned_pattern() {
 }
 
 # Substitute variables in a naming pattern
-# Args: pattern tool version os arch ext
+# Args: pattern tool version os arch ext [config_tool] [target_triple]
 # Output: Substituted string (stdout)
 artifact_naming_substitute() {
     [[ $# -ge 5 ]] || return 4
@@ -789,7 +790,7 @@ artifact_naming_substitute() {
 
     # A caller naming one variant of a multi-variant platform (bd-cdcz) sets
     # _AN_TARGET_TRIPLE_OVERRIDE; otherwise the platform's primary triple.
-    local target_triple="${_AN_TARGET_TRIPLE_OVERRIDE:-}"
+    local target_triple="${8:-${_AN_TARGET_TRIPLE_OVERRIDE:-}}"
     if [[ -z "$target_triple" ]] && declare -F config_get_target_triple &>/dev/null; then
         if ! target_triple=$(config_get_target_triple "$config_tool" "${os}/${arch}" 2>/dev/null); then
             _an_log_error "Invalid target_triples for $config_tool ${os}/${arch}"
@@ -1012,7 +1013,7 @@ _an_release_contract_for_tool() {
 # Generate dual names for a tool using config-aware precedence
 # This is the main entry point for the release workflow
 #
-# Args: tool_name version os arch ext repo_path [build_purpose]
+# Args: tool_name version os arch ext repo_path [build_purpose] [target_triple]
 # Output: JSON object with versioned and compat names
 # Exit: 0 on success
 artifact_naming_generate_dual_for_tool() {
@@ -1026,6 +1027,7 @@ artifact_naming_generate_dual_for_tool() {
     # Native orchestration dynamically scopes build_purpose into its workers.
     # Preserve diagnostic naming; standalone callers can select it explicitly.
     local purpose="${7-${build_purpose:-release}}"
+    local _AN_TARGET_TRIPLE_OVERRIDE="${8:-${_AN_TARGET_TRIPLE_OVERRIDE:-}}"
     case "$purpose" in release|diagnostic-native) ;; *) return 4 ;; esac
     if ! _an_safe_asset_name "$tool" || ! _an_safe_asset_name "${version#v}" ||
        ! _an_safe_asset_name "$os" || ! _an_safe_asset_name "$arch"; then
@@ -1098,19 +1100,38 @@ artifact_naming_artifact_variant() {
     fi
     [[ ${#triples[@]} -gt 0 ]] || triples=("$(_an_default_target_triple "$os" "$arch")")
 
-    # Longest full triple first, so ...-gnueabihf is never read as ...-gnu.
-    local best=""
+    # Match complete tokens: ...-gnueabihf must not become ...-gnu. More than
+    # one full triple is contradictory, not a license to choose the longest.
+    local best="" triple_re
     for triple in "${triples[@]}"; do
-        if [[ "$filename" == *"$triple"* && ${#triple} -gt ${#best} ]]; then
+        triple_re="${triple//./\\.}"
+        if [[ "$filename" =~ (^|[-_.])$triple_re([-_.]|$) ]]; then
+            if [[ -n "$best" && "$best" != "$triple" ]]; then
+                _an_log_error "Artifact names conflicting target triples: $filename"
+                return 4
+            fi
             best="$triple"
         fi
     done
+
+    local words=" ${filename//[-_.]/ } " env matched="" matches=0 token indicated_env=""
+    for token in gnu musl gnueabi gnueabihf musleabi musleabihf gnux32 gnullvm msvc uclibc; do
+        if [[ "$words" == *" $token "* ]]; then
+            if [[ -n "$indicated_env" && "$indicated_env" != "$token" ]]; then
+                _an_log_error "Artifact names conflicting libc variants: $filename"
+                return 4
+            fi
+            indicated_env="$token"
+        fi
+    done
     if [[ -n "$best" ]]; then
+        if [[ -n "$indicated_env" && "$indicated_env" != "${best##*-}" ]]; then
+            _an_log_error "Artifact libc disagrees with its target triple: $filename"
+            return 4
+        fi
         printf '%s\ttriple\n' "$best"
         return 0
     fi
-
-    local words=" ${filename//[-_.]/ } " env matched="" matches=0
     for triple in "${triples[@]}"; do
         env="${triple##*-}"
         if [[ "$words" == *" $env "* ]]; then
@@ -1123,13 +1144,10 @@ artifact_naming_artifact_variant() {
         return 0
     fi
 
-    local token
-    for token in gnu musl gnueabi gnueabihf musleabi musleabihf gnux32 gnullvm msvc uclibc; do
-        if [[ "$words" == *" $token "* ]]; then
-            printf '%s\tunknown\n' "${triples[0]}"
-            return 0
-        fi
-    done
+    if [[ -n "$indicated_env" ]]; then
+        printf '%s\tunknown\n' "${triples[0]}"
+        return 0
+    fi
     printf '%s\tprimary\n' "${triples[0]}"
 }
 
@@ -1140,12 +1158,14 @@ artifact_naming_artifact_variant() {
 # When the script spells out archive extensions literally and none matches
 # the artifact's, the installer's first literal extension is used: a release
 # that ships .tar.xz cannot satisfy an installer hardcoding .tar.gz.
-# Args: tool version os arch ext repo_path
+# Args: tool version os arch ext repo_path [target_triple]
 # Output: {"script","pattern","name","ext","ext_mismatch"} JSON (stdout)
 # Exit: 0 on success, 1 when no installer pattern can be resolved, 4 bad input
 artifact_naming_installer_expected_name() {
     [[ $# -ge 6 ]] || return 4
     local tool="$1" version="$2" os="$3" arch="$4" ext="$5" repo_path="$6"
+    local _AN_TARGET_TRIPLE_OVERRIDE="${7:-${_AN_TARGET_TRIPLE_OVERRIDE:-}}"
+    [[ -z "$_AN_TARGET_TRIPLE_OVERRIDE" ]] || _an_safe_asset_name "$_AN_TARGET_TRIPLE_OVERRIDE" || return 4
     command -v jq &>/dev/null || return 3
     [[ -n "$repo_path" && -d "$repo_path" ]] || return 1
 

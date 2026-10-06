@@ -100,6 +100,62 @@ br-v1.2.3-linux_amd64.tar.gz
 dcg-x86_64-unknown-linux-gnu.tar.xz
 ```
 
+### GNU and musl variants from one workflow
+
+An ordinary release may retain both libc variants under the same scheduling
+platform. List their triples in order; the first entry is the primary for native
+builds and for filenames that do not identify a variant:
+
+```yaml
+targets: [linux/amd64]
+target_triples:
+  linux/amd64:
+    - x86_64-unknown-linux-gnu
+    - x86_64-unknown-linux-musl
+artifact_naming: '${name}-${version}-${target_triple}.${ext}'
+install_script_compat: '${name}-${target_triple}.${ext}'
+linux_libc_fallback: none
+```
+
+Workflow collection retains each artifact's `target_triple` alongside its
+`target: linux/amd64`. A full triple or a separate `gnu`/`musl` word identifies
+the variant; an unmarked name uses the configured primary. Conflicting triples
+or libc markers are errors. This field records the declared naming identity;
+it does not attest the executable's ABI. Packaging and release naming use the
+retained triple, so a musl artifact does not become GNU when configuration order
+changes or when both artifacts arrive through one act job.
+
+Shared installer aliases remain supported and have one deterministic owner.
+Use a target-qualified pattern when installers must select both variants. The
+generated installer refuses to install a nonprimary variant through an alias
+whose name is also used by the primary, and rejects literal libc markers that
+contradict the selected triple.
+
+Generated installers inspect the host libc before selecting an artifact. They
+recognize musl even when `ldd --version` writes to stderr and exits nonzero, and
+do not guess GNU if libc discovery is inconclusive. `--libc gnu` and
+`--libc musl` select exactly that configured variant; an unavailable explicit
+request fails. Configured target triples also become part of each cache key, so
+GNU and musl archives and their checksum/signature evidence remain independent.
+These installers do not adopt older platform-only cache entries.
+
+The default `linux_libc_fallback: none` requires the detected variant. Setting
+`linux_libc_fallback: musl` permits an automatic GNU host to use a configured
+musl variant when GNU is unconfigured or its payload/cache entry is unavailable.
+This is appropriate only for a musl build the project supports on GNU hosts.
+The policy never substitutes GNU on musl, never overrides an explicit `--libc`
+request, and never retries another libc after checksum, signature, extraction,
+or binary-selection failure. Offline fallback follows the same policy and reads
+only the selected variant's verified cache entry.
+
+Native builds still compile the primary only; workflow-produced artifacts can
+carry the full list. A strict `release_contract` continues to admit one primary
+per platform. These paths do not yet implement a native GNU-plus-musl build
+matrix. `scripts/tests/test_multi_variant_installer.sh` compiles and executes
+real GNU and musl Rust fixtures when both standard libraries are installed, and
+checks selection, isolated offline caches, corruption refusal, and the fallback
+policy using fixture release transports.
+
 ## Checksum Files
 
 ### SHA256SUMS

@@ -841,11 +841,12 @@ target_triples:
   linux/amd64:
     - x86_64-unknown-linux-gnu    # primary
     - x86_64-unknown-linux-musl
+linux_libc_fallback: none
 ```
 
 The first entry is the primary variant: native builds compile it
 (`CARGO_BUILD_TARGET`), and an artifact whose name identifies no variant is
-named as it. A workflow run through act builds every variant; `dsr build`
+named as it. A workflow run through act can build both variants; `dsr build`
 collects them under the platform, gives each variant it produced its own
 installer-compatible alias and configured `include_files`, and names any
 configured variant the build did not produce. `dsr release` publishes each
@@ -854,12 +855,22 @@ the full triple or by a separate `gnu`/`musl` word). When the naming pattern
 cannot tell variants apart (no `${target_triple}`), a name several variants
 derive goes to the artifact it already names, else to the primary variant,
 and the release says so instead of failing on a same-name collision.
-Generated installers select the musl or gnu build from the system's C library
-(`ld-musl` loader or `ldd --version`), accept `--libc gnu|musl`, and fall back
-to the primary variant with a warning when the release has no matching build.
+Workflow manifests retain each artifact's `target_triple`, so packaging and
+release do not infer a different variant later. Contradictory full triples or
+libc markers fail collection. This is declared naming metadata, not ABI proof.
+Generated installers detect GNU or musl (including musl `ldd --version` output
+on stderr with a nonzero status), and `--libc gnu|musl` selects an exact variant.
+An unavailable or unknown libc fails. The default `linux_libc_fallback: none`
+can be changed to `musl` to allow automatic GNU-to-musl fallback when the GNU
+payload is unavailable; it never permits musl-to-GNU fallback, overrides an
+explicit `--libc`, or retries after integrity failure. Each configured triple
+gets an independent archive/checksum/signature cache, including offline use.
+To install both variants, use target-qualified names: a nonprimary variant
+cannot be downloaded through a shared alias owned by the primary.
 A `release_contract` names one exact primary asset per target, so it admits a
 single triple per platform; `dsr config validate` rejects empty, duplicate or
-malformed lists.
+malformed lists. Native builds still compile only the primary; native matrix
+expansion remains unimplemented.
 
 With `--parallel`, two targets on one host whose build writes the same
 in-tree file (for example `go build -o tool ./cmd/tool`) no longer overwrite

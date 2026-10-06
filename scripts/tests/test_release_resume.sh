@@ -5,6 +5,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$PROJECT_ROOT/src/github.sh"
+source "$PROJECT_ROOT/src/artifact_naming.sh"
 # Load the real command without dispatching the CLI or contacting build hosts.
 source <(awk '/^cmd_release\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 
@@ -359,7 +360,7 @@ test_release_records_installer_check_after_upload() {
     [[ $STATUS -eq 0 ]] && grep -Fxq 'POST tool-linux-x86_64.tar.gz' "$CALLS" &&
         jq -e '.details.installer_check.status=="ok" and
             .details.installer_check.expected==[{target:"linux/amd64",name:"tool-linux-x86_64.tar.gz",
-                present:true,ext_mismatch:false}]' "$CASE/stdout" >/dev/null
+                target_triple:"x86_64-unknown-linux-gnu",present:true,ext_mismatch:false}]' "$CASE/stdout" >/dev/null
 }
 
 test_installer_mismatch_does_not_fail_verified_release() {
@@ -384,18 +385,24 @@ variant_fixture() {
         esac
     }
     config_get_target_triple() { printf 'x86_64-unknown-linux-gnu\n'; }
+    config_get_target_triples_json() {
+        printf '["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]\n'
+    }
     artifact_naming_generate_dual_for_variant() {
         local platform="$3-$4"
         [[ "$TRIPLE_NAMING" == true ]] && platform="$7"
         jq -nc --arg versioned "tool-${2#v}-$platform.$5" --arg compat "tool-$platform.$5" \
             '{versioned:$versioned,compat:$compat,same:($versioned==$compat)}'
     }
-    local name rows='[]' sha
+    local name rows='[]' sha triple
     for name in "$@"; do
         printf '%s payload\n' "$name" > "$CASE/artifacts/$name"
         sha=$(_gh_asset_sha256 "$CASE/artifacts/$name") || return 1
-        rows=$(jq -c --arg name "$name" --arg sha "$sha" \
-            '. + [{name:$name,sha256:$sha,target:"linux/amd64",archive_format:"tar.gz"}]' <<< "$rows")
+        triple=$(artifact_naming_artifact_variant tool linux amd64 "$name") || return 1
+        triple="${triple%%$'\t'*}"
+        rows=$(jq -c --arg name "$name" --arg sha "$sha" --arg triple "$triple" \
+            '. + [{name:$name,sha256:$sha,target:"linux/amd64",target_triple:$triple,
+                   archive_format:"tar.gz"}]' <<< "$rows")
     done
     jq -nc --argjson rows "$rows" '{tool:"tool",version:"v1.2.3",status:"success",artifacts:$rows}' > \
         "$CASE/artifacts/tool-v1.2.3-manifest.json"

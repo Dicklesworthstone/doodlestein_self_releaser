@@ -401,8 +401,8 @@ bash "$ainstaller" --version v1.2.3 --dir "$case_dir/bin" --cache-dir "$case_dir
 check 'arch alias names the downloaded asset' test "$status" -eq 0 -a -x "$case_dir/bin/adem"
 
 # Platforms that ship gnu and musl builds (bd-cdcz): the installer selects the
-# variant by --libc or by this system's C library, and falls back to the
-# primary variant, saying so, when the release has no matching build.
+# variant by --libc or by this system's C library. An unavailable explicit
+# musl request must fail; a valid GNU checksum does not make it musl-compatible.
 if [[ "$os" == linux ]]; then
     case "$arch" in amd64) cpu=x86_64 ;; *) cpu=aarch64 ;; esac
     cat > "$DSR_CONFIG_DIR/repos.d/vdemo.yaml" <<CONFIG
@@ -457,8 +457,8 @@ CONFIG
     run_variant "$vinstaller"
     check "default selection follows this system's C library ($host_libc)" installed_as vdemo "$host_libc"
     run_variant "$ginstaller" --libc musl
-    check 'unreleased variant falls back to the primary build' installed_as vgnu gnu
-    check 'fallback is reported' grep -q "No musl build of vgnu is released for linux/$arch; installing $cpu-unknown-linux-gnu" "$case_dir/err"
+    check 'unavailable explicit musl never installs the GNU primary' test "$status" -eq 4 -a ! -e "$case_dir/bin/vgnu"
+    check 'unavailable libc variant is reported' grep -q "No musl build of vgnu is configured for linux/$arch" "$case_dir/err"
     run_variant "$vinstaller" --libc uclibc
     check 'unknown --libc value is refused' test "$status" -eq 4 -a ! -e "$case_dir/bin/vdemo"
 fi

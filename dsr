@@ -2901,6 +2901,7 @@ EOF
         local file="$1"
         local target="$2"
         local format="$3"
+        local target_triple="${4:-}"
 
         [[ -z "$file" || ! -f "$file" ]] && return 0
         [[ -z "$target" ]] && return 0
@@ -2926,6 +2927,7 @@ EOF
             --arg sha "$sha" \
             --argjson size "$size" \
             --arg format "$format" \
+            --arg target_triple "$target_triple" \
             '{
                 name: $name,
                 target: $target,
@@ -2934,7 +2936,7 @@ EOF
                 archive_format: $format,
                 signed: false,
                 signature_file: ""
-            }')
+            } + (if $target_triple == "" then {} else {target_triple: $target_triple} end)')
 
         extra_manifest_entries+=("$artifact_json")
     }
@@ -2945,6 +2947,7 @@ EOF
         local output_dir="$3"
         local target="$4"
         local format="$5"
+        local target_triple="${6:-}"
 
         [[ -z "$compat_name" || -z "$src_path" || ! -f "$src_path" ]] && return 0
 
@@ -2966,7 +2969,7 @@ EOF
 
         if cp "$src_path" "$compat_path"; then
             log_info "Created compat alias: $compat_name"
-            _build_manifest_add_entry "$compat_path" "$target" "$format"
+            _build_manifest_add_entry "$compat_path" "$target" "$format" "$target_triple"
             return 0
         fi
 
@@ -2987,6 +2990,7 @@ EOF
         local compat_name="$2"
         local output_dir="$3"
         local target="$4"
+        local target_triple="${5:-}"
 
         [[ -z "$src_path" || -z "$compat_name" ]] && return 0
 
@@ -3002,7 +3006,7 @@ EOF
 
         if cp "$src_path" "$compat_path"; then
             log_info "Created binary alias: $compat_name"
-            _build_manifest_add_entry "$compat_path" "$target" "binary"
+            _build_manifest_add_entry "$compat_path" "$target" "binary" "$target_triple"
             return 0
         fi
 
@@ -3015,19 +3019,23 @@ EOF
         local output_dir="$2"
         local target="$3"
         local format="$4"
+        local target_triple="${5:-}"
 
         if [[ -f "$manifest_file" ]]; then
             local name
-            name=$(jq -r --arg t "$target" --arg f "$format" '
-                .artifacts[]? | select(.target == $t) | select(.archive_format == $f) | .name
+            name=$(jq -r --arg t "$target" --arg f "$format" --arg triple "$target_triple" '
+                .artifacts[]? | select(.target == $t) |
+                select($triple == "" or .target_triple == $triple) |
+                select(.archive_format == $f) | .name
             ' "$manifest_file" 2>/dev/null | head -1)
             if [[ -n "$name" && -f "$output_dir/$name" ]]; then
                 echo "$output_dir/$name"
                 return 0
             fi
 
-            name=$(jq -r --arg t "$target" '
-                .artifacts[]? | select(.target == $t) | .name
+            name=$(jq -r --arg t "$target" --arg triple "$target_triple" '
+                .artifacts[]? | select(.target == $t) |
+                select($triple == "" or .target_triple == $triple) | .name
             ' "$manifest_file" 2>/dev/null | head -1)
             if [[ -n "$name" && -f "$output_dir/$name" ]]; then
                 echo "$output_dir/$name"
@@ -3200,7 +3208,8 @@ EOF
     _build_complete_lane_archive() {
         local tool="$1" target="$2" format="$3" archive_path="$4"
         local archive_format="$5" compat_name="$6" output_dir="$7" repo_path="$8"
-        shift 8
+        local target_triple="$9"
+        shift 9
         local -a missing=("$@")
 
         local name compat_path=""
@@ -3246,12 +3255,12 @@ EOF
             completed=false
         else
             log_info "Added configured include_files to $name: ${missing[*]}"
-            _build_manifest_add_entry "$archive_path" "$target" "$format"
+            _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
             if [[ -n "$compat_path" ]]; then
                 if cp -- "$archive_path" "$workdir/compat" && \
                    mv -f -- "$workdir/compat" "$compat_path"; then
                     log_info "Refreshed compat alias $compat_name with the completed archive"
-                    _build_manifest_add_entry "$compat_path" "$target" "$format"
+                    _build_manifest_add_entry "$compat_path" "$target" "$format" "$target_triple"
                 else
                     log_error "Could not refresh compat alias $compat_name for $tool $target"
                     completed=false
@@ -3291,7 +3300,7 @@ EOF
     _build_emit_variant_aliases() {
         local tool="$1" version="$2" target="$3" format="$4" naming_ext="$5"
         local output_dir="$6" repo_path="$7" primary_versioned="$8"
-        local listed triple names_json versioned compat
+        local listed triple names_json versioned compat variant_path
         local -a triples=()
         listed=$(config_get_target_triples "$tool" "$target" 2>/dev/null) || return 0
         while IFS= read -r triple; do
@@ -3313,30 +3322,52 @@ EOF
                 log_warn "artifact_naming for $tool does not distinguish the variants of $target (add \${target_triple}); only ${triples[0]} gets installer names"
                 return 0
             fi
-            if [[ ! -f "$output_dir/$versioned" || -L "$output_dir/$versioned" ]]; then
+            variant_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$triple" 2>/dev/null || true)
+            if [[ -z "$variant_path" || -L "$variant_path" ]]; then
                 log_warn "Variant $triple of $tool $target was not produced by this build ($versioned); installers selecting it will find no asset"
                 continue
             fi
             log_info "Variant $triple of $tool $target: $versioned"
             local variant_format include
             local -a missing=()
-            variant_format=$(packaging_format_for_name "$versioned")
+            variant_format=$(packaging_format_for_name "${variant_path##*/}")
+            local requested_format="$format"
+            [[ "$requested_format" == tgz ]] && requested_format=tar.gz
+            if [[ "$requested_format" == binary && "$variant_format" != none ]]; then
+                log_error "Variant $triple is an archive; refusing to publish archive bytes as a raw executable"
+                collect_failed=true
+                return 1
+            fi
+            if [[ "$requested_format" != binary && "$variant_format" != "$requested_format" ]]; then
+                # A platform job can emit a different container for each
+                # libc variant. Convert the actual payload before assigning
+                # a new extension; copying xz bytes to a .tar.gz alias makes
+                # the release impossible to install.
+                _build_package_archive_for_target "$tool" "$version" "$target" \
+                    "$output_dir" "$repo_path" "$binary_name" "$variant_path" "$triple" || return 1
+                if [[ ! -f "$output_dir/$versioned" ]]; then
+                    log_error "Could not package $triple as $requested_format: $versioned"
+                    collect_failed=true
+                    return 1
+                fi
+                continue
+            fi
             if [[ "$format" != "binary" && "$variant_format" != none && -n "$repo_path" ]]; then
                 while IFS= read -r include; do
                     [[ -n "$include" ]] && missing+=("$include")
-                done < <(_build_archive_missing_includes "$tool" "$output_dir/$versioned" \
+                done < <(_build_archive_missing_includes "$tool" "$variant_path" \
                     "$variant_format" "$repo_path")
                 if [[ ${#missing[@]} -gt 0 ]] && ! _build_complete_lane_archive "$tool" "$target" \
-                        "$format" "$output_dir/$versioned" "$variant_format" "$compat" \
-                        "$output_dir" "$repo_path" "${missing[@]}"; then
+                        "$format" "$variant_path" "$variant_format" "$compat" \
+                        "$output_dir" "$repo_path" "$triple" "${missing[@]}"; then
                     continue
                 fi
             fi
             [[ -n "$compat" && "$compat" != "$versioned" ]] || continue
             if [[ "$format" == "binary" ]]; then
-                _build_emit_binary_alias "$output_dir/$versioned" "$compat" "$output_dir" "$target"
+                _build_emit_binary_alias "$variant_path" "$compat" "$output_dir" "$target" "$triple" || collect_failed=true
             elif _build_is_archive_ext "$compat"; then
-                _build_emit_compat_alias "$output_dir/$versioned" "$compat" "$output_dir" "$target" "$format"
+                _build_emit_compat_alias "$variant_path" "$compat" "$output_dir" "$target" "$format" "$triple" || collect_failed=true
             else
                 log_warn "Variant $triple of $tool $target: installer name $compat is not an archive; no alias emitted"
             fi
@@ -3351,6 +3382,7 @@ EOF
         local repo_path="$5"
         local binary_name="$6"
         local binary_override="${7:-}"
+        local target_triple="${8:-}"
 
         local os arch
         os="${target%/*}"
@@ -3390,6 +3422,10 @@ EOF
         fi
 
         local existing_format="${existing_archive_formats[$target]:-}"
+        if [[ -n "$target_triple" && -n "$binary_override" && -f "$binary_override" ]]; then
+            existing_format=$(packaging_format_for_name "${binary_override##*/}")
+            [[ "$existing_format" != none ]] || existing_format=""
+        fi
         if [[ -n "$existing_format" && "$existing_format" == "$format" ]]; then
             if [[ ${#include_files[@]} -gt 0 && -n "$repo_path" && "$format" != "binary" ]]; then
                 # Fall through: the lane's archive may lack the configured
@@ -3409,13 +3445,19 @@ EOF
         fi
 
         local names_json versioned_name
-        names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" "$naming_ext" "$repo_path" 2>/dev/null || echo "")
+        if ! names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" \
+                "$naming_ext" "$repo_path" release "$target_triple"); then
+            log_error "Unable to resolve archive names for $tool $target ${target_triple:-}"
+            collect_failed=true
+            return 1
+        fi
         versioned_name=$(echo "$names_json" | jq -r '.versioned // empty' 2>/dev/null)
         local compat_name
         compat_name=$(echo "$names_json" | jq -r '.compat // empty' 2>/dev/null)
         if [[ -z "$versioned_name" ]]; then
-            log_warn "Unable to resolve archive name for $tool $target ($format)"
-            return 0
+            log_error "Unable to resolve archive name for $tool $target ($format)"
+            collect_failed=true
+            return 1
         fi
 
         local archive_path="$output_dir/$versioned_name"
@@ -3423,12 +3465,13 @@ EOF
         local binary_path=""
         if [[ -n "$binary_override" && -f "$binary_override" ]]; then
             binary_path="$binary_override"
-        else
+        elif [[ -z "$target_triple" ]]; then
             binary_path=$(_build_find_binary "$output_dir" "$binary_name" "$os" 2>/dev/null || echo "")
         fi
         if [[ -z "$binary_path" || ! -f "$binary_path" ]]; then
-            log_warn "Binary not found for $tool $target; skipping archive packaging"
-            return 0
+            log_error "Binary not found for $tool $target ${target_triple:-}; cannot package the requested variant"
+            collect_failed=true
+            return 1
         fi
 
         # If the build already produced an ARCHIVE for this target (the
@@ -3442,8 +3485,9 @@ EOF
         input_format=$(packaging_format_for_name "$(basename "$binary_path")")
         if [[ "$input_format" != "none" ]]; then
             if [[ "$format" == "binary" ]]; then
-                log_warn "Build artifact for $tool $target is an archive; skipping raw binary asset packaging"
-                return 0
+                log_error "Build artifact for $tool $target is an archive; refusing to publish archive bytes as a raw executable"
+                collect_failed=true
+                return 1
             fi
             local normalized_format="$format"
             [[ "$format" == "tgz" ]] && normalized_format="tar.gz"
@@ -3478,7 +3522,7 @@ EOF
                     # checksums or signatures attest the thin bytes.
                     _build_complete_lane_archive "$tool" "$target" "$format" \
                         "$archive_path" "$normalized_format" "$compat_name" \
-                        "$output_dir" "$repo_path" "${missing_includes[@]}"
+                        "$output_dir" "$repo_path" "$target_triple" "${missing_includes[@]}"
                     return $?
                 fi
             fi
@@ -3492,13 +3536,15 @@ EOF
             fi
             if packaging_repack_archive "$binary_path" "$input_format" "$archive_path" "$normalized_format" "${repack_includes[@]}"; then
                 log_info "Rebuilt $format archive independently from $(basename "$binary_path") payload: $versioned_name"
-                _build_manifest_add_entry "$archive_path" "$target" "$format"
+                _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
                 if [[ -n "$compat_name" && "$compat_name" != "$versioned_name" ]] && \
                    _build_is_archive_ext "$compat_name"; then
-                    _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format"
+                    _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
                 fi
             else
                 log_error "Failed to rebuild $format archive from $(basename "$binary_path"): $archive_path"
+                collect_failed=true
+                return 1
             fi
             return 0
         fi
@@ -3507,14 +3553,16 @@ EOF
             if [[ -f "$archive_path" ]]; then
                 log_warn "Overwriting existing binary asset: $archive_path"
             fi
-            if cp "$binary_path" "$archive_path"; then
+            if [[ "$binary_path" -ef "$archive_path" ]] || cp "$binary_path" "$archive_path"; then
                 chmod +x "$archive_path" 2>/dev/null || true
-                _build_manifest_add_entry "$archive_path" "$target" "binary"
+                _build_manifest_add_entry "$archive_path" "$target" "binary" "$target_triple"
                 if [[ -n "$compat_name" && "$compat_name" != "$versioned_name" ]]; then
-                    _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target"
+                    _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
                 fi
             else
                 log_error "Failed to create binary asset: $archive_path"
+                collect_failed=true
+                return 1
             fi
             return 0
         fi
@@ -3541,16 +3589,18 @@ EOF
             # AppleDouble ._* members that GNU tar exposes on Linux. Both are
             # required for cross-platform strict installer member allowlists.
             if COPYFILE_DISABLE=1 tar "${tar_args[@]}"; then
-                _build_manifest_add_entry "$archive_path" "$target" "$format"
+                _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
                 if [[ -n "$compat_name" ]]; then
                     if _build_is_archive_ext "$compat_name"; then
-                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format"
+                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
                     else
-                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target"
+                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
                     fi
                 fi
             else
                 log_error "Failed to create archive: $archive_path"
+                collect_failed=true
+                return 1
             fi
             return 0
         fi
@@ -3574,16 +3624,18 @@ EOF
                 done
             fi
             if COPYFILE_DISABLE=1 tar "${tar_args[@]}"; then
-                _build_manifest_add_entry "$archive_path" "$target" "$format"
+                _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
                 if [[ -n "$compat_name" ]]; then
                     if _build_is_archive_ext "$compat_name"; then
-                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format"
+                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
                     else
-                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target"
+                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
                     fi
                 fi
             else
                 log_error "Failed to create archive: $archive_path"
+                collect_failed=true
+                return 1
             fi
             return 0
         fi
@@ -3607,16 +3659,18 @@ EOF
                 done
             fi
             if zip -j -q -FS "$archive_path" "${zip_inputs[@]}"; then
-                _build_manifest_add_entry "$archive_path" "$target" "$format"
+                _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
                 if [[ -n "$compat_name" ]]; then
                     if _build_is_archive_ext "$compat_name"; then
-                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format"
+                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
                     else
-                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target"
+                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
                     fi
                 fi
             else
                 log_error "Failed to create archive: $archive_path"
+                collect_failed=true
+                return 1
             fi
         fi
     }
@@ -3681,9 +3735,19 @@ EOF
 
         for target in "${targets[@]}"; do
             log_info "Packaging installer archive for $tool $target"
-            local os arch format names_json versioned_name compat_name
+            local os arch format names_json versioned_name compat_name primary_triple
             os="${target%/*}"
             arch="${target#*/}"
+            primary_triple=$(config_get_target_triple "$tool" "$target") || {
+                collect_failed=true
+                return 1
+            }
+            if [[ -z "$primary_triple" && -f "$manifest_file" ]]; then
+                primary_triple=$(jq -r --arg target "$target" '
+                    [.artifacts[]? | select(.target == $target) | .target_triple // empty] |
+                    (map(select(endswith("-gnu"))) + .) | .[0] // ""
+                ' "$manifest_file") || return 1
+            fi
             format=$(_build_get_archive_format "$tool" "$os")
 
             local compat_ext
@@ -3705,7 +3769,11 @@ EOF
                 [[ "$os" == "windows" ]] && naming_ext="exe"
             fi
 
-            names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" "$naming_ext" "$repo_path" 2>/dev/null || echo "")
+            names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" \
+                "$naming_ext" "$repo_path" release "$primary_triple") || {
+                collect_failed=true
+                return 1
+            }
             versioned_name=$(echo "$names_json" | jq -r '.versioned // empty' 2>/dev/null)
             compat_name=$(echo "$names_json" | jq -r '.compat // empty' 2>/dev/null)
 
@@ -3714,18 +3782,18 @@ EOF
                     "$output_dir" "$repo_path" "$versioned_name"
             fi
 
-            local existing_format="${existing_archive_formats[$target]:-}"
-            if [[ -z "$existing_format" && -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
-                existing_format="$format"
-                existing_archive_formats["$target"]="$format"
+            # The primary's actual container determines whether it needs
+            # repacking. A later musl row for this platform cannot make a
+            # GNU xz archive look like an already-built gzip archive.
+            local existing_path="" existing_format=""
+            existing_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$primary_triple" 2>/dev/null || true)
+            if [[ -z "$existing_path" && ! -f "$manifest_file" && -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
+                existing_path="$output_dir/$versioned_name"
+            fi
+            if [[ -n "$existing_path" ]]; then
+                existing_format=$(packaging_format_for_name "${existing_path##*/}")
             fi
             if [[ -n "$existing_format" && "$existing_format" == "$format" ]]; then
-                local existing_path=""
-                if [[ -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
-                    existing_path="$output_dir/$versioned_name"
-                else
-                    existing_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" 2>/dev/null || echo "")
-                fi
 
                 if [[ -n "$existing_path" && "$format" != "binary" && -n "$repo_path" && \
                       -n "$(_build_get_include_files "$tool" 2>/dev/null)" ]]; then
@@ -3733,7 +3801,7 @@ EOF
                     # lane may have archived the executable alone (GH#29).
                     # Verify configured include_files before skipping.
                     _build_package_archive_for_target "$tool" "$version" "$target" \
-                        "$output_dir" "$repo_path" "$binary_name" "$existing_path"
+                        "$output_dir" "$repo_path" "$binary_name" "$existing_path" "$primary_triple" || return 1
                     if [[ -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
                         existing_path="$output_dir/$versioned_name"
                     fi
@@ -3741,15 +3809,15 @@ EOF
 
                 if [[ -n "$existing_path" ]]; then
                     if [[ "$format" == "binary" ]]; then
-                        _build_emit_binary_alias "$existing_path" "$compat_name" "$output_dir" "$target"
+                        _build_emit_binary_alias "$existing_path" "$compat_name" "$output_dir" "$target" "$primary_triple" || collect_failed=true
                     elif [[ -n "$compat_name" ]]; then
                         if _build_is_archive_ext "$compat_name"; then
-                            _build_emit_compat_alias "$existing_path" "$compat_name" "$output_dir" "$target" "$format"
+                            _build_emit_compat_alias "$existing_path" "$compat_name" "$output_dir" "$target" "$format" "$primary_triple" || collect_failed=true
                         else
                             local binary_path
                             binary_path=$(_build_find_binary "$output_dir" "$binary_name" "$os" 2>/dev/null || echo "")
                             if [[ -n "$binary_path" ]]; then
-                                _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target"
+                                _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$primary_triple" || collect_failed=true
                             else
                                 log_warn "Binary not found for $tool $target to create compat alias"
                             fi
@@ -3764,14 +3832,20 @@ EOF
             fi
 
             local binary_override=""
-            binary_override=$(echo "$result_json" | jq -r --arg t "$target" '.targets[]? | select(.platform == $t) | .artifact_path // empty' 2>/dev/null | head -1)
+            if [[ -n "$existing_path" ]]; then
+                binary_override="$existing_path"
+            elif [[ -n "$primary_triple" ]]; then
+                binary_override=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$primary_triple" 2>/dev/null || true)
+            else
+                binary_override=$(echo "$result_json" | jq -r --arg t "$target" '.targets[]? | select(.platform == $t) | .artifact_path // empty' 2>/dev/null | head -1)
+            fi
             if [[ -n "$binary_override" && "$binary_override" == *","* ]]; then
                 binary_override="${binary_override%%,*}"
             fi
             if [[ -z "$binary_override" || ! -f "$binary_override" ]]; then
                 binary_override=""
             fi
-            _build_package_archive_for_target "$tool" "$version" "$target" "$output_dir" "$repo_path" "$binary_name" "$binary_override"
+            _build_package_archive_for_target "$tool" "$version" "$target" "$output_dir" "$repo_path" "$binary_name" "$binary_override" "$primary_triple" || return 1
         done
     }
 
@@ -6475,6 +6549,8 @@ EOF
                    type == "object" and
                    ((.name // .filename) | type == "string" and
                        test("^[A-Za-z0-9][A-Za-z0-9._+-]*$")) and
+                   (.target_triple == null or
+                       (.target_triple | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$"))) and
                    (.sha256 | type == "string" and test("^[0-9a-f]{64}$")))
             then .[0] else error("invalid release manifest") end
         ' "$manifest_file" 2>/dev/null); then
@@ -6592,14 +6668,13 @@ EOF
             os="${target%/*}"
             arch="${target#*/}"
             if [[ -z "$triple" ]]; then
-                triple=$(artifact_naming_artifact_variant "$tool_name" "$os" "$arch" "$filename" 2>/dev/null) || triple=""
+                triple=$(artifact_naming_artifact_variant "$tool_name" "$os" "$arch" "$filename") || return 4
                 triple="${triple%%$'\t'*}"
             fi
             ext="$format"
             case "$ext" in
                 none) ext="" ;;
-                # Raw binaries: build packaging already emitted their compat
-                # copy as its own manifest row; only Windows names carry .exe.
+                # Only Windows raw binary names carry an extension.
                 binary) ext=""; [[ "$os" == windows ]] && ext="exe" ;;
             esac
             if [[ -z "$ext" && "$format" != binary ]]; then
@@ -6612,12 +6687,12 @@ EOF
                 esac
             fi
             names_json=""
-            if [[ -n "$ext" && -n "$triple" ]]; then
+            if [[ ( -n "$ext" || "$format" == binary ) && -n "$triple" ]]; then
                 names_json=$(artifact_naming_generate_dual_for_variant \
-                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" "$triple" 2>/dev/null) || names_json=""
-            elif [[ -n "$ext" ]]; then
+                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" "$triple") || return 4
+            elif [[ -n "$ext" || "$format" == binary ]]; then
                 names_json=$(artifact_naming_generate_dual_for_tool \
-                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path" 2>/dev/null) || names_json=""
+                    "$tool_name" "$version" "$os" "$arch" "$ext" "$local_path") || return 4
             fi
             if [[ -n "$names_json" ]]; then
                 versioned=$(jq -r '.versioned // empty' <<< "$names_json" 2>/dev/null) || versioned=""
@@ -6649,35 +6724,73 @@ EOF
     # bytes goes to the artifact it already names, else to the platform's
     # primary variant, else to none, instead of failing the release on a
     # same-name collision or letting manifest order pick the bytes.
-    local -A release_upload_plan=()
+    local -A release_upload_plan=() release_artifact_triples=()
     _release_plan_upload_names() {
         local -A claimants=() rank=() sha_of=() artifact_candidates=()
         local -a order=()
-        local a_name a_sha a_target a_format variant triple how primary candidate
-        while IFS=$'\t' read -r a_name a_sha a_target a_format; do
+        local a_name a_sha a_target a_format a_triple variant triple how primary candidate configured
+        while IFS=$'\t' read -r a_name a_sha a_target a_format a_triple; do
+            [[ "$a_target" == "-" ]] && a_target=""
+            [[ "$a_format" == "-" ]] && a_format=""
+            [[ "$a_triple" == "-" ]] && a_triple=""
             [[ -n "$a_name" ]] || continue
+            if [[ -n "${sha_of[$a_name]+set}" ]]; then
+                log_error "Duplicate artifact name in release manifest: $a_name"
+                return 4
+            fi
             order+=("$a_name")
             sha_of["$a_name"]="$a_sha"
             triple="" how="" rank["$a_name"]=2
-            if [[ "$a_target" == */* ]] && variant=$(artifact_naming_artifact_variant \
-                    "$tool_name" "${a_target%/*}" "${a_target#*/}" "$a_name" 2>/dev/null); then
+            configured='[]'
+            if [[ "$a_target" == */* ]] && declare -F config_get_target_triples_json &>/dev/null; then
+                configured=$(config_get_target_triples_json "$tool_name" "$a_target") || return 4
+                if [[ $(jq 'length' <<< "$configured") -gt 1 && -z "$a_triple" ]]; then
+                    log_error "Multi-variant artifact $a_name must retain its target_triple in the build manifest"
+                    return 4
+                fi
+                if [[ -n "$a_triple" && $(jq 'length' <<< "$configured") -gt 0 ]] &&
+                   ! jq -e --arg triple "$a_triple" 'index($triple) != null' <<< "$configured" >/dev/null; then
+                    log_error "Declared target_triple for $a_name is not configured for $a_target: $a_triple"
+                    return 4
+                fi
+            fi
+            if [[ -n "$a_triple" && "$a_target" != */* ]]; then
+                log_error "Manifest artifact $a_name has a target_triple without a platform"
+                return 4
+            fi
+            if [[ "$a_target" == */* ]]; then
+                if ! variant=$(artifact_naming_artifact_variant \
+                        "$tool_name" "${a_target%/*}" "${a_target#*/}" "$a_name"); then
+                    log_error "Cannot reconcile target_triple with artifact name: $a_name"
+                    return 4
+                fi
                 triple="${variant%%$'\t'*}"
                 how="${variant#*$'\t'}"
-                primary=$(config_get_target_triple "$tool_name" "$a_target" 2>/dev/null) || primary=""
+                if [[ -n "$a_triple" && ( "$how" == triple || "$how" == libc ) && "$a_triple" != "$triple" ]]; then
+                    log_error "Declared target_triple for $a_name contradicts the artifact's variant name"
+                    return 4
+                fi
                 if [[ "$how" == unknown ]]; then
-                    rank["$a_name"]=0
-                elif [[ -n "$primary" && "$triple" != "$primary" ]]; then
+                    log_error "Cannot identify the declared variant of release artifact $a_name"
+                    return 4
+                fi
+                [[ -z "$a_triple" ]] || triple="$a_triple"
+                primary=$(config_get_target_triple "$tool_name" "$a_target" 2>/dev/null) || primary=""
+                if [[ -n "$primary" && "$triple" != "$primary" ]]; then
                     rank["$a_name"]=1
                 fi
                 log_debug "Release variant for $a_name: $triple ($how)"
             fi
+            [[ -z "$a_triple" ]] || triple="$a_triple"
+            release_artifact_triples["$a_name"]="$triple"
             artifact_candidates["$a_name"]=$(_release_artifact_candidate_names \
-                "$a_name" "$a_target" "$a_format" "$triple")
+                "$a_name" "$a_target" "$a_format" "$triple") || return 4
             while IFS= read -r candidate; do
                 [[ -n "$candidate" ]] || continue
                 claimants["$candidate"]+="$a_name"$'\n'
             done <<< "${artifact_candidates[$a_name]}"
-        done < <(jq -r '.artifacts[] | [(.name // .filename), .sha256, .target // "", .archive_format // ""] | @tsv' \
+        done < <(jq -r 'def field: if . == null or . == "" then "-" else . end;
+            .artifacts[] | [(.name // .filename), .sha256, (.target | field), (.archive_format | field), (.target_triple | field)] | @tsv' \
             <<< "$ordinary_manifest")
 
         local claimant winner best best_count distinct_sha first_sha
@@ -6701,7 +6814,7 @@ EOF
                             [[ -n "$claimant" ]] || continue
                             if [[ ${rank[$claimant]} -gt $best ]]; then
                                 best=${rank[$claimant]} best_count=1 winner="$claimant"
-                            elif [[ ${rank[$claimant]} -eq $best ]]; then
+                            elif [[ ${rank[$claimant]} -eq $best && "${sha_of[$claimant]}" != "${sha_of[$winner]}" ]]; then
                                 best_count=$((best_count + 1))
                             fi
                         done <<< "${claimants[$candidate]}"
@@ -6736,7 +6849,70 @@ EOF
     }
 
     if [[ "$ordinary_manifest" != null ]]; then
-        _release_plan_upload_names
+        _release_plan_upload_names || return 4
+    fi
+
+    # Check the resolved ownership plan before any GitHub mutation. Shared
+    # aliases keep their configured primary owner, but explicit artifact
+    # bytes cannot collide with metadata or generated checksum names. Freeze
+    # this inventory for the dry-run, checksums and actual upload loop.
+    local -A ordinary_upload_names=() ordinary_alias_sha=() ordinary_alias_owner=()
+    local -A ordinary_generated_names=()
+    local -a ordinary_extra_files=()
+    if ! $release_contract_enabled && $manifest_exists; then
+        local row_name resolved_names alias_name alias_sha
+        while IFS= read -r row_name; do
+            resolved_names="${release_upload_plan[$row_name]%$'\n'}"
+            ordinary_upload_names["$row_name"]="$resolved_names"
+            alias_sha="${ordinary_expected_sha[$row_name]}"
+            while IFS= read -r alias_name; do
+                [[ -n "$alias_name" ]] || continue
+                if [[ ! "$alias_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+                    log_error "Unsafe upload name for $row_name: $alias_name"
+                    return 4
+                fi
+                if [[ -n "${ordinary_alias_sha[$alias_name]:-}" && "${ordinary_alias_sha[$alias_name]}" != "$alias_sha" ]]; then
+                    log_error "Upload name $alias_name maps to different artifact contents: ${ordinary_alias_owner[$alias_name]} and $row_name"
+                    return 4
+                fi
+                ordinary_alias_sha["$alias_name"]="$alias_sha"
+                ordinary_alias_owner["$alias_name"]="$row_name"
+                ordinary_generated_names["$alias_name.sha256"]=1
+            done <<< "$resolved_names"
+        done < <(jq -r '.artifacts[] | .name // .filename' <<< "$ordinary_manifest")
+
+        ordinary_generated_names[SHA256SUMS]=1
+        for alias_name in "${!ordinary_generated_names[@]}" "${manifest_file##*/}"; do
+            if [[ -n "${ordinary_alias_sha[$alias_name]:-}" ]]; then
+                log_error "Artifact upload name $alias_name collides with release metadata or a generated checksum"
+                return 4
+            fi
+            if [[ -L "$artifacts_dir/$alias_name" ||
+                  ( -e "$artifacts_dir/$alias_name" && ! -f "$artifacts_dir/$alias_name" ) ]]; then
+                log_error "Release metadata path must be a regular file: $alias_name"
+                return 4
+            fi
+        done
+        ordinary_extra_files+=("$manifest_file")
+        local extra_file extra_name extra_sha
+        while IFS= read -r -d '' extra_file; do
+            extra_name="${extra_file##*/}"
+            [[ -z "${ordinary_generated_names[$extra_name]:-}" ]] || continue
+            [[ "$extra_file" != "$manifest_file" ]] || continue
+            if [[ ! "$extra_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
+                  ! -s "$extra_file" || -L "$extra_file" ]] ||
+               ! extra_sha=$(_gh_asset_sha256 "$extra_file"); then
+                log_error "Invalid release sidecar: $extra_name"
+                return 4
+            fi
+            if [[ -n "${ordinary_alias_sha[$extra_name]:-}" && "${ordinary_alias_sha[$extra_name]}" != "$extra_sha" ]]; then
+                log_error "Upload name $extra_name collides with an existing release sidecar"
+                return 4
+            fi
+            ordinary_expected_sha["$extra_name"]="$extra_sha"
+            ordinary_extra_files+=("$extra_file")
+        done < <(find "$artifacts_dir" -maxdepth 1 -type f \
+            \( -name 'SHA256SUMS*' -o -name '*.sha256' -o -name '*.minisig' -o -name '*.sbom.*' -o -name '*.intoto.jsonl' \) -print0)
     fi
 
     # Check the names a project's own curl|bash installer downloads against the
@@ -6747,7 +6923,7 @@ EOF
     _release_installer_check() {
         local -A names_present=()
         local -a expected=()
-        local name target format os arch ext expectation expected_name script=""
+        local name target format target_triple os arch ext expectation expected_name script=""
         while IFS= read -r name; do
             [[ -n "$name" ]] && names_present["$name"]=1
         done
@@ -6755,7 +6931,11 @@ EOF
             jq -nc '{status: "skipped", reason: "no manifest or local checkout"}'
             return 0
         fi
-        while IFS=$'\t' read -r name target format; do
+        while IFS=$'\t' read -r name target format target_triple; do
+            [[ "$target" == "-" ]] && target=""
+            [[ "$format" == "-" ]] && format=""
+            [[ "$target_triple" == "-" ]] && target_triple=""
+            [[ -n "$target_triple" ]] || target_triple="${release_artifact_triples[$name]:-}"
             [[ "$target" == */* ]] || continue
             os="${target%/*}"
             arch="${target#*/}"
@@ -6771,20 +6951,22 @@ EOF
                 esac
             fi
             expectation=$(artifact_naming_installer_expected_name "$tool_name" "$version" \
-                "$os" "$arch" "$ext" "$local_path" 2>/dev/null) || continue
+                "$os" "$arch" "$ext" "$local_path" "$target_triple" 2>/dev/null) || continue
             expected_name=$(jq -r '.name' <<< "$expectation") || continue
             script=$(jq -r '.script' <<< "$expectation") || continue
-            expected+=("$(jq -c --arg target "$target" --argjson present \
+            expected+=("$(jq -c --arg target "$target" --arg target_triple "$target_triple" --argjson present \
                 "$([[ -n "${names_present[$expected_name]:-}" ]] && echo true || echo false)" \
-                '{target: $target, name, present: $present, ext_mismatch}' <<< "$expectation")")
-        done < <(jq -r '.artifacts[] | [(.name // .filename), (.target // ""), (.archive_format // "")] | @tsv' \
+                '{target: $target, name, present: $present, ext_mismatch} +
+                 (if $target_triple == "" then {} else {target_triple: $target_triple} end)' <<< "$expectation")")
+        done < <(jq -r 'def field: if . == null or . == "" then "-" else . end;
+            .artifacts[] | [(.name // .filename), (.target | field), (.archive_format | field), (.target_triple | field)] | @tsv' \
             <<< "$ordinary_manifest")
         if [[ ${#expected[@]} -eq 0 ]]; then
             jq -nc '{status: "skipped", reason: "no installer download pattern found"}'
             return 0
         fi
         printf '%s\n' "${expected[@]}" | jq -sc --arg script "$script" '
-            unique_by(.target, .name) as $expected |
+            unique_by(.target, .target_triple, .name) as $expected |
             {status: (if all($expected[]; .present) then "ok" else "mismatch" end),
              script: $script, expected: $expected,
              missing: [$expected[] | select(.present | not) | .name]}'
@@ -6839,17 +7021,22 @@ EOF
                 file_count=$((file_count + 1))
             done < <(jq -r '.assets[].name' <<< "$release_contract_plan")
         elif $manifest_exists && [[ -f "$manifest_file" ]]; then
-            local plan_name plan_target plan_format
-            while IFS=$'\t' read -r plan_name plan_sha plan_target plan_format; do
+            local plan_name plan_target plan_triple
+            while IFS=$'\t' read -r plan_name plan_sha plan_target plan_triple; do
+                [[ "$plan_target" == "-" ]] && plan_target=""
+                [[ "$plan_triple" == "-" ]] && plan_triple=""
+                [[ -n "$plan_triple" ]] || plan_triple="${release_artifact_triples[$plan_name]:-}"
                 [[ -n "$plan_name" && -f "$artifacts_dir/$plan_name" ]] || continue
                 plan_size=$(_release_file_size "$artifacts_dir/$plan_name" 2>/dev/null || echo 0)
-                plan_names=$(_release_artifact_upload_names "$plan_name" "$plan_target" "$plan_format" |
-                    jq -Rsc 'split("\n") | map(select(length > 0))') || return 4
+                plan_names=$(jq -Rsc 'split("\n") | map(select(length > 0))' \
+                    <<< "${ordinary_upload_names[$plan_name]}") || return 4
                 plan_entry=$(jq -nc --arg name "$plan_name" --arg path "$artifacts_dir/$plan_name" \
                     --arg target "$plan_target" --arg sha256 "$plan_sha" \
+                    --arg target_triple "$plan_triple" \
                     --argjson size_bytes "${plan_size:-0}" --argjson names "$plan_names" \
                     '{name: $name, path: $path, target: $target, size_bytes: $size_bytes,
-                      sha256: $sha256, upload_names: $names}') || return 4
+                      sha256: $sha256, upload_names: $names} +
+                      (if $target_triple == "" then {} else {target_triple: $target_triple} end)') || return 4
                 plan_artifacts+=("$plan_entry")
                 log_info "  Would upload: $plan_name (${plan_target:-untargeted}, $plan_size bytes, sha256 ${plan_sha:0:16}…)"
                 if [[ $(jq 'length' <<< "$plan_names") -gt 1 ]]; then
@@ -6858,7 +7045,8 @@ EOF
                 while IFS= read -r name; do
                     plan_all_names+=("$name")
                 done < <(jq -r '.[]' <<< "$plan_names")
-            done < <(jq -r '.artifacts[] | [(.name // .filename), .sha256, (.target // ""), (.archive_format // "")] | @tsv' \
+            done < <(jq -r 'def field: if . == null or . == "" then "-" else . end;
+                .artifacts[] | [(.name // .filename), .sha256, (.target | field), (.target_triple | field)] | @tsv' \
                 <<< "$ordinary_manifest")
             log_info "  Would upload: ${manifest_file##*/} (build manifest)"
             plan_extra+=("${manifest_file##*/}")
@@ -6868,14 +7056,11 @@ EOF
             unique_names=$(printf '%s\n' "${plan_all_names[@]}" | sort -u | grep -c . || true)
             log_info "  Would generate: SHA256SUMS ($unique_names entries) + $unique_names per-asset .sha256 sidecars"
             local extra_file
-            while IFS= read -r extra_file; do
-                [[ -n "$extra_file" ]] || continue
-                case "${extra_file##*/}" in SHA256SUMS|*.sha256) continue ;; esac
+            for extra_file in "${ordinary_extra_files[@]}"; do
+                [[ "$extra_file" != "$manifest_file" ]] || continue
                 log_info "  Would upload: ${extra_file##*/} (existing sidecar)"
                 plan_extra+=("${extra_file##*/}")
-            done < <(find "$artifacts_dir" -maxdepth 1 -type f \
-                \( -name 'SHA256SUMS*' -o -name '*.minisig' -o -name '*.sbom.*' -o -name '*.intoto.jsonl' \) \
-                2>/dev/null | sort)
+            done
             plan_all_names+=("${plan_extra[@]}" SHA256SUMS)
             file_count=$(printf '%s\n' "${plan_all_names[@]}" | sort -u | grep -c . || true)
             file_count=$((file_count + unique_names))
@@ -7234,7 +7419,7 @@ EOF
         # `sha256sum --check` for the colliding name.
         local -A sha_seen=()
 
-        while IFS=$'\t' read -r a_name a_sha256 a_target a_format; do
+        while IFS=$'\t' read -r a_name a_sha256; do
             [[ -z "$a_name" || -z "$a_sha256" ]] && continue
 
             # Every name this artifact is uploaded as (primary, versioned,
@@ -7244,8 +7429,8 @@ EOF
                 [[ -z "$alias_name" || -n "${sha_seen[$alias_name]:-}" ]] && continue
                 _emit_sha_entry "$a_sha256" "$alias_name"
                 sha_seen["$alias_name"]=1
-            done < <(_release_artifact_upload_names "$a_name" "$a_target" "$a_format")
-        done < <(jq -r '.artifacts[] | [.name // .filename, .sha256, .target // "", .archive_format // ""] | @tsv' <<< "$ordinary_manifest")
+            done <<< "${ordinary_upload_names[$a_name]}"
+        done < <(jq -r '.artifacts[] | [.name // .filename, .sha256] | @tsv' <<< "$ordinary_manifest")
 
         if [[ -s "$sha256sums_file" ]]; then
             local line_count
@@ -7272,12 +7457,12 @@ EOF
         # Include manifest and common sidecar files (checksums, per-asset .sha256
         # one-liners that curl-pipe-bash installers fetch as `${URL}.sha256`,
         # signatures, SBOM, provenance).
-        _release_add_file "$manifest_file"
-        while IFS= read -r extra_file; do
+        for extra_file in "${ordinary_extra_files[@]}"; do
             _release_add_file "$extra_file"
-        done < <(find "$artifacts_dir" -maxdepth 1 -type f \
-            \( -name 'SHA256SUMS*' -o -name '*.sha256' -o -name '*.minisig' -o -name '*.sbom.*' -o -name '*.intoto.jsonl' \) \
-            2>/dev/null)
+        done
+        for name in "${!ordinary_generated_names[@]}"; do
+            _release_add_file "$artifacts_dir/$name"
+        done
     else
         # Fallback: upload all files in artifacts directory
         for file in "${ordinary_files[@]}"; do
@@ -7314,17 +7499,6 @@ EOF
     # seed it from a local journal: names can outlive deleted/replaced assets.
     local -A uploaded_name_set=()
     local -A uploaded_sha_set=()
-
-    # Map manifest artifact names to targets and formats (for dual-name uploads)
-    local -A manifest_targets=()
-    local -A manifest_formats=()
-    if ! $release_contract_enabled && $manifest_exists; then
-        while IFS=$'\t' read -r name target format; do
-            [[ -z "$name" ]] && continue
-            manifest_targets["$name"]="$target"
-            manifest_formats["$name"]="$format"
-        done < <(jq -r '.artifacts[] | [.name // .filename, .target // "", .archive_format // ""] | @tsv' <<< "$ordinary_manifest")
-    fi
 
     _release_save_state() (
         # Keep the previous journal on a failed write. Journals are diagnostic
@@ -7461,11 +7635,9 @@ EOF
 
         # Dual-name upload for manifest artifacts: the primary name plus its
         # versioned, installer-compatible and arch-alias names (deduped).
-        local manifest_target="${manifest_targets[$filename]:-}"
-        if [[ -n "$manifest_target" ]]; then
+        if [[ -n "${ordinary_upload_names[$filename]:-}" ]]; then
             local -a upload_names=()
-            mapfile -t upload_names < <(_release_artifact_upload_names \
-                "$filename" "$manifest_target" "${manifest_formats[$filename]:-}")
+            mapfile -t upload_names <<< "${ordinary_upload_names[$filename]}"
             if [[ ${#upload_names[@]} -gt 1 ]]; then
                 log_info "[$idx/$total_files] Uploading asset variants for: $filename"
 

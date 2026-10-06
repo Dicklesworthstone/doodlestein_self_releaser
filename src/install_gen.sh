@@ -107,6 +107,7 @@ ARCHIVE_FORMAT_DARWIN="__ARCHIVE_FORMAT_DARWIN__"
 ARCHIVE_FORMAT_WINDOWS="__ARCHIVE_FORMAT_WINDOWS__"
 # The template is data, not shell code. Expand its variables only in the renderer.
 ARTIFACT_NAMING='__ARTIFACT_NAMING__'
+LINUX_LIBC_FALLBACK='__LINUX_LIBC_FALLBACK__'
 
 # Minisign public key for signature verification (embedded from dsr config)
 # If empty, signature verification is skipped
@@ -269,9 +270,7 @@ _cache_path() {
     local version="$1"
     local platform="$2"
     local format="$3"
-    local os="${platform%/*}"
-    local arch="${platform#*/}"
-    echo "${_CACHE_DIR}/${TOOL_NAME}/${version}/${os}-${arch}.${format}"
+    echo "${_CACHE_DIR}/${TOOL_NAME}/${version}/${platform//\//-}.${format}"
 }
 
 # Check if cached archive exists
@@ -359,15 +358,21 @@ __ARCH_ALIAS_CASES__
     echo "$arch"
 }
 
-# Target triples released for a platform, primary first. A platform that
-# ships gnu and musl builds lists both.
-_target_triple_candidates() {
+# Configured targets are distinct from the default table: their cache entries
+# are qualified by the actual selected triple, including scalar overrides.
+_configured_target_triples() {
     local os="$1"
     local arch="$2"
-
     case "${os}/${arch}" in
 __TARGET_TRIPLE_CASES__
     esac
+    return 1
+}
+
+# Target triples released for a platform, primary first.
+_target_triple_candidates() {
+    local os="$1" arch="$2"
+    _configured_target_triples "$os" "$arch" && return 0
 
     case "${os}/${arch}" in
         linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
@@ -380,40 +385,84 @@ __TARGET_TRIPLE_CASES__
     esac
 }
 
-# C library of this Linux system: musl or gnu.
+# Inspect ldd itself, never a downloaded executable. musl's version command
+# writes to stderr and may exit nonzero; capture the text independently of rc.
+# An installed alternate musl loader must not override a recognized GNU host.
 _detect_linux_libc() {
-    local loader
+    local version="" loader
+    if command -v ldd >/dev/null 2>&1; then
+        version=$(ldd --version 2>&1) || true
+        case "${version,,}" in
+            *musl*) echo musl; return 0 ;;
+            *"gnu libc"*|*"gnu c library"*|*glibc*) echo gnu; return 0 ;;
+        esac
+    fi
+    if command -v getconf >/dev/null 2>&1; then
+        version=$(getconf GNU_LIBC_VERSION 2>/dev/null) || true
+        [[ "${version,,}" != *glibc* ]] || { echo gnu; return 0; }
+    fi
     for loader in /lib/ld-musl-*.so.1 /usr/lib/ld-musl-*.so.1; do
         if [[ -e "$loader" ]]; then
             echo musl
             return 0
         fi
     done
-    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
-        echo musl
-        return 0
-    fi
-    echo gnu
+    return 1
 }
 
 # The variant to install: the --libc request, else this Linux system's C
-# library. When the release has no such variant, install the primary one.
+# library. Explicit requests are exact. An automatic GNU -> musl fallback is
+# allowed only by linux_libc_fallback: musl; musl never falls back to GNU.
 _select_target_triple() {
     local os="$1" arch="$2" candidates libc="$_LIBC" triple
     candidates=$(_target_triple_candidates "$os" "$arch")
-    if [[ "$os" != linux || ( "$candidates" != *" "* && -z "$libc" ) ]]; then
+    if [[ "$os" != linux ]]; then
+        [[ -z "$libc" ]] || { _log_error "--libc is supported only on Linux"; return 4; }
         echo "${candidates%% *}"
         return 0
     fi
-    [[ -n "$libc" ]] || libc=$(_detect_linux_libc)
+    if [[ -z "$libc" ]] && ! libc=$(_detect_linux_libc); then
+        _log_error "Cannot identify Linux libc; use --libc gnu or --libc musl to select a known variant"
+        return 4
+    fi
     for triple in $candidates; do
         if [[ -n "$libc" && "${triple##*-}" == "$libc"* ]]; then
             echo "$triple"
             return 0
         fi
     done
-    _log_warn "No ${libc:-matching} build of $TOOL_NAME is released for ${os}/${arch}; installing ${candidates%% *}"
-    echo "${candidates%% *}"
+    if [[ -z "$_LIBC" && "$libc" == gnu && "$LINUX_LIBC_FALLBACK" == musl ]]; then
+        for triple in $candidates; do
+            if [[ "${triple##*-}" == musl* ]]; then
+                _log_warn "No GNU variant configured; using the explicit GNU-to-musl fallback: $triple"
+                echo "$triple"
+                return 0
+            fi
+        done
+    fi
+    _log_error "No $libc build of $TOOL_NAME is configured for ${os}/${arch}"
+    return 4
+}
+
+# A second acquisition candidate is permitted only for automatic GNU selection.
+# The caller never consults it after checksum/signature/extraction failure.
+_fallback_target_triple() {
+    local os="$1" arch="$2" selected="$3" triple candidates
+    [[ "$os" == linux && "${selected##*-}" == gnu* &&
+       -z "$_LIBC" && "$LINUX_LIBC_FALLBACK" == musl ]] || return 0
+    candidates=$(_target_triple_candidates "$os" "$arch")
+    for triple in $candidates; do
+        if [[ "${triple##*-}" == musl* ]]; then echo "$triple"; return 0; fi
+    done
+}
+
+_target_cache_platform() {
+    local platform="$1"
+    if _configured_target_triples "${platform%/*}" "${platform#*/}" >/dev/null || [[ -n "$_LIBC" ]]; then
+        printf '%s/%s\n' "$platform" "$_TARGET_TRIPLE"
+    else
+        printf '%s\n' "$platform"
+    fi
 }
 
 _resolve_target_triple() {
@@ -468,6 +517,36 @@ _apply_artifact_pattern() {
     fi
 
     if [[ -n "$format" ]]; then echo "${name}.${format}"; else echo "$name"; fi
+}
+
+# Generic aliases belong to the configured primary. A nonprimary variant must
+# have a distinct download name; otherwise a musl request could fetch GNU bytes
+# even with separate cache entries and a valid checksum.
+_variant_asset_name() {
+    local os="$1" arch="$2" version="$3" format="$4" name candidates primary primary_name
+    name=$(_apply_artifact_pattern "$ARTIFACT_NAMING" "$os" "$arch" "$version" "$format") || return $?
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$name" != *..* ]] || {
+        _log_error "Unresolved or unsafe release asset name: $name"; return 4;
+    }
+    if [[ "$os" == linux ]]; then
+        local words=" ${name//[-_.]/ } " libc="${_TARGET_TRIPLE##*-}" token
+        for token in gnu musl gnueabi gnueabihf musleabi musleabihf gnux32 gnullvm uclibc; do
+            if [[ "$words" == *" $token "* && "$libc" != "$token" ]]; then
+                _log_error "Asset name $name contradicts selected target $_TARGET_TRIPLE"
+                return 4
+            fi
+        done
+    fi
+    candidates=$(_target_triple_candidates "$os" "$arch")
+    primary="${candidates%% *}"
+    if [[ "$_TARGET_TRIPLE" != "$primary" ]]; then
+        primary_name=$(_TARGET_TRIPLE="$primary" _apply_artifact_pattern "$ARTIFACT_NAMING" "$os" "$arch" "$version" "$format") || return $?
+        if [[ "$name" == "$primary_name" ]]; then
+            _log_error "Artifact naming does not distinguish $_TARGET_TRIPLE from primary $primary; use a target-qualified pattern"
+            return 4
+        fi
+    fi
+    printf '%s\n' "$name"
 }
 
 # ============================================================================
@@ -1217,15 +1296,6 @@ main() {
     local platform
     platform=$(_detect_platform) || return $?
     _log_info "Platform: $platform"
-    _TARGET_TRIPLE=$(_select_target_triple "${platform%/*}" "${platform#*/}")
-    if [[ ! "$_TARGET_TRIPLE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-        _log_error "Unresolved target triple for $platform"
-        return 4
-    fi
-    if [[ "$platform" == linux/* ]] &&
-       [[ -n "$_LIBC" || "$(_target_triple_candidates "${platform%/*}" "${platform#*/}")" == *" "* ]]; then
-        _log_info "Target: $_TARGET_TRIPLE"
-    fi
 
     if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
           ! "$TOOL_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
@@ -1237,6 +1307,14 @@ main() {
         _install_from_source "Explicit --from-source request"
         return $?
     fi
+    _TARGET_TRIPLE=$(_select_target_triple "${platform%/*}" "${platform#*/}") || return $?
+    if [[ ! "$_TARGET_TRIPLE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        _log_error "Unresolved target triple for $platform"
+        return 4
+    fi
+    local install_targets="$_TARGET_TRIPLE" fallback_triple
+    fallback_triple=$(_fallback_target_triple "${platform%/*}" "${platform#*/}" "$_TARGET_TRIPLE") || return $?
+    [[ -z "$fallback_triple" ]] || install_targets+=$'\n'"$fallback_triple"
     # Get version
     if [[ -z "$_VERSION" ]]; then
         if $_OFFLINE_MODE; then
@@ -1267,11 +1345,6 @@ main() {
     format=$(_get_archive_format "$platform")
     case "$format" in tar.gz|tgz|tar.xz|zip|tar|none|exe) ;; *) return 4 ;; esac
     local asset_name
-    asset_name=$(_apply_artifact_pattern "$ARTIFACT_NAMING" "${platform%/*}" \
-        "${platform#*/}" "${_VERSION#v}" "$format") || return $?
-    [[ "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
-        _log_error "Unresolved or unsafe release asset name: $asset_name"; return 4;
-    }
 
     # Create temp directory. _TEMP_DIR is a script-scope global so the
     # EXIT trap can still see it after main() returns and locals are
@@ -1281,41 +1354,45 @@ main() {
     trap _cleanup_temp_dir EXIT
     local temp_dir="$_TEMP_DIR"
 
-    local archive_file="$temp_dir/${TOOL_NAME}.${format}"
+    local archive_file="" cache_platform="$platform" cached_file acquired=false
     local extract_dir="$temp_dir/extracted"
 
-    # Acquisition has no authority to skip verification.
-    if [[ -n "$_OFFLINE_ARCHIVE" ]]; then
-        _copy_local_archive "$_OFFLINE_ARCHIVE" "$archive_file" || return $?
-        _log_info "Using offline archive: $_OFFLINE_ARCHIVE"
-    else
-        # Check cache first
-        local cached_file
-        if cached_file=$(_cache_get "$_VERSION" "$platform" "$format"); then
+    # Select the target before cache lookup. Each candidate has its own bytes
+    # and sidecars; a failed acquisition cannot leave evidence for another ABI.
+    while IFS= read -r _TARGET_TRIPLE; do
+        [[ -n "$_TARGET_TRIPLE" ]] || continue
+        _log_info "Target: $_TARGET_TRIPLE"
+        asset_name=$(_variant_asset_name "${platform%/*}" "${platform#*/}" "${_VERSION#v}" "$format") || return $?
+        cache_platform=$(_target_cache_platform "$platform") || return $?
+        archive_file="$temp_dir/${_TARGET_TRIPLE}-${TOOL_NAME}.${format}"
+        if [[ -n "$_OFFLINE_ARCHIVE" ]]; then
+            _copy_local_archive "$_OFFLINE_ARCHIVE" "$archive_file" || return $?
+            _log_info "Using offline archive: $_OFFLINE_ARCHIVE"
+        elif cached_file=$(_cache_get "$_VERSION" "$cache_platform" "$format"); then
             _copy_local_archive "$cached_file" "$archive_file" || return $?
         elif $_OFFLINE_MODE; then
-            # Offline mode requires cache hit
-            _log_error "Offline mode: no cached archive for $TOOL_NAME $_VERSION ($platform)"
-            _log_info "Cache location: $_CACHE_DIR/$TOOL_NAME/$_VERSION/"
-            _log_info "Download first without --offline flag"
-            _json_result "error" "No cached archive available" "$_VERSION" ""
-            return 1
-        else
-            if ! _fetch_release_asset "$asset_name" "$archive_file"; then
-                if $_ALLOW_SOURCE_BUILD; then
-                    _install_from_source "Release payload unavailable for $platform"
-                    return $?
-                fi
-                _log_error "Failed to download archive"
-                _json_result "error" "Download failed" "$_VERSION" ""
-                return 1
-            fi
-
+            _log_warn "Offline mode: no cached archive for $TOOL_NAME $_VERSION ($_TARGET_TRIPLE)"
+            continue
+        elif ! _fetch_release_asset "$asset_name" "$archive_file"; then
+            _log_warn "Release payload unavailable: $asset_name"
+            continue
         fi
+        # Integrity failure is final. The fallback policy grants another
+        # acquisition attempt only; it never launders rejected release bytes.
+        _verify_checksum "$archive_file" "$asset_name" || return $?
+        _verify_minisign "$archive_file" "$asset_name" || return $?
+        acquired=true
+        break
+    done <<< "$install_targets"
+    if ! $acquired; then
+        if $_ALLOW_SOURCE_BUILD; then
+            _install_from_source "Release payload unavailable for $platform"
+            return $?
+        fi
+        _log_error "No release payload available for $platform under the configured libc policy"
+        _json_result "error" "No release payload available" "$_VERSION" ""
+        return 1
     fi
-
-    _verify_checksum "$archive_file" "$asset_name" || return $?
-    _verify_minisign "$archive_file" "$asset_name" || return $?
     # Extract
     _log_info "Extracting..."
     _extract_archive "$archive_file" "$extract_dir" "$format" || return $?
@@ -1356,7 +1433,7 @@ main() {
         esac
     fi
     if ! $_OFFLINE_MODE; then
-        _cache_put "$archive_file" "$_VERSION" "$platform" "$format" || \
+        _cache_put "$archive_file" "$_VERSION" "$cache_platform" "$format" || \
             _log_warn "Could not cache verified archive"
     fi
 
@@ -1477,7 +1554,7 @@ install_gen_create() {
     # Extract values
     local repo binary_name language workflow_path local_path
     local archive_linux archive_darwin archive_windows
-    local artifact_naming
+    local artifact_naming linux_libc_fallback=none
     local source_subdir source_entry source_package source_engine field value
 
     tool_name=$(_install_gen_yaml_get "$config_file" "tool_name" "$tool_name")
@@ -1579,6 +1656,19 @@ install_gen_create() {
     local target_triple_cases=""
     local arch_alias_cases=""
     if command -v yq &>/dev/null; then
+        if ! declare -F config_validate_target_triples &>/dev/null; then
+            # shellcheck source=./config.sh
+            source "$_IG_SCRIPT_DIR/config.sh" || return 3
+        fi
+        # The generator may prefer a repository-local config. Validate that
+        # exact file, not a same-named tool in the user's global registry.
+        local target_config_dir config_tool="${config_file##*/}"
+        config_tool="${config_tool%.yaml}"
+        target_config_dir=$(cd "$(dirname "$config_file")/.." && pwd) || return 3
+        DSR_CONFIG_DIR="$target_config_dir" DSR_REPOS_FILE='' \
+            config_validate_target_triples "$config_tool" || return 4
+        linux_libc_fallback=$(DSR_CONFIG_DIR="$target_config_dir" DSR_REPOS_FILE='' \
+            config_get_linux_libc_fallback "$config_tool") || return 4
         # A platform lists one triple or several variants, primary first
         # (bd-cdcz); the installer picks among them at run time. Both sides
         # become installer code, so only plain names are admitted.
@@ -1608,6 +1698,9 @@ install_gen_create() {
             fi
             arch_alias_cases+=$'        '"$arch"$') echo "'"$alias"'"; return 0 ;;'$'\n'
         done < <(yq -r '.arch_aliases // {} | to_entries[] | [.key, .value] | @tsv' "$config_file" 2>/dev/null)
+    elif grep -Eq '^[[:space:]]*(target_triples|linux_libc_fallback):' "$config_file"; then
+        log_error "yq is required to validate target triples and libc fallback policy"
+        return 3
     fi
 
     # Get minisign public key (from tool config or global dsr config)
@@ -1699,6 +1792,7 @@ install_gen_create() {
     template="${template//__ARCHIVE_FORMAT_DARWIN__/$archive_darwin}"
     template="${template//__ARCHIVE_FORMAT_WINDOWS__/$archive_windows}"
     template="${template//__ARTIFACT_NAMING__/$artifact_naming}"
+    template="${template//__LINUX_LIBC_FALLBACK__/$linux_libc_fallback}"
     template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
     template="${template//__TARGET_TRIPLE_CASES__/$target_triple_cases}"
     template="${template//__ARCH_ALIAS_CASES__/$arch_alias_cases}"

@@ -425,6 +425,12 @@
           "description": "Target platform in os/arch format",
           "pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"
         },
+        "target_triple": {
+          "type": "string",
+          "description": "Declared variant inferred from artifact naming and configured primary order; retained for packaging/release identity, not a binary ABI attestation",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "not": {"pattern": "\\.\\."}
+        },
         "sha256": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$",

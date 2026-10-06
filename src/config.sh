@@ -783,7 +783,7 @@ config_registry_divergence_json() {
     jq -nc --argjson registry "$registry_json" --argjson repo "$repo_json" '
         def build_keys: ["repo", "local_path", "language", "binary_name",
             "main_package", "workspace_binaries", "workspace_binaries_by_target", "build_cmd", "build_profile",
-            "targets", "target_triples", "cross_compile", "host_paths", "env",
+            "targets", "target_triples", "linux_libc_fallback", "cross_compile", "host_paths", "env",
             "artifact_naming", "install_script_compat", "install_script_path",
             "archive_format", "include_files", "include_extra_files",
             "workspace_archive_files", "workspace_additional_artifacts",
@@ -1266,6 +1266,43 @@ config_get_target_triples() {
     }
 }
 
+# Ordered JSON view for manifest/build consumers that must retain every variant.
+config_get_target_triples_json() {
+    local triples
+    triples=$(config_get_target_triples "$1" "$2") || return $?
+    printf '%s' "$triples" | jq -Rsc 'if length == 0 then [] else split("\n") end'
+}
+
+# Automatic installer fallback is opt-in, one-way GNU -> musl. Preserve field
+# presence: null/false are invalid policy values, not an absent configuration.
+config_get_linux_libc_fallback() {
+    local toolname="$1" config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local tool_config="$config_dir/repos.d/${toolname}.yaml" value_json='"none"' document
+    if [[ -f "$tool_config" ]]; then
+        document=$(_config_read_single_mapping_json "$tool_config") || return 4
+        if jq -e 'has("linux_libc_fallback")' <<< "$document" >/dev/null; then
+            value_json=$(jq -c '.linux_libc_fallback' <<< "$document") || return 4
+        elif [[ -f "${DSR_REPOS_FILE:-}" ]]; then
+            document=$(_config_read_single_mapping_json "$DSR_REPOS_FILE") || return 4
+            value_json=$(jq -c --arg tool "$toolname" '
+                .tools[$tool] // {} |
+                if has("linux_libc_fallback") then .linux_libc_fallback else "none" end
+            ' <<< "$document") || return 4
+        fi
+    elif [[ -f "${DSR_REPOS_FILE:-}" ]]; then
+        document=$(_config_read_single_mapping_json "$DSR_REPOS_FILE") || return 4
+        value_json=$(jq -c --arg tool "$toolname" '
+            .tools[$tool] // {} |
+            if has("linux_libc_fallback") then .linux_libc_fallback else "none" end
+        ' <<< "$document") || return 4
+    fi
+    jq -er 'if . == "none" or . == "musl" then . else error("invalid libc fallback") end' \
+        <<< "$value_json" 2>/dev/null || {
+        _cfg_log_error "Invalid linux_libc_fallback for $toolname: expected none or musl"
+        return 4
+    }
+}
+
 # Primary target triple for a tool/platform
 # Usage: config_get_target_triple <toolname> <platform>
 # Returns: Target triple (e.g., "x86_64-unknown-linux-gnu") or empty
@@ -1281,6 +1318,7 @@ config_get_target_triple() {
 config_validate_target_triples() {
     local toolname="$1" contract_json="${2:-null}"
     local mapping_json platform triples
+    config_get_linux_libc_fallback "$toolname" >/dev/null || return 4
     mapping_json=$(_config_target_triples_json "$toolname") || {
         _cfg_log_error "Could not read target_triples for $toolname"
         return 4
@@ -1438,6 +1476,7 @@ export -f config_get_host config_get_tool config_list_hosts config_list_tools
 export -f config_get_host_for_platform
 export -f config_get_tool_field config_get_install_script_compat config_get_install_script_path
 export -f config_get_artifact_naming config_get_target_triple config_get_arch_alias
-export -f _config_target_triples_json config_get_target_triples config_validate_target_triples
+export -f _config_target_triples_json config_get_target_triples config_get_target_triples_json config_validate_target_triples
+export -f config_get_linux_libc_fallback
 export -f config_get_release_contract_json config_validate_release_contract
 export -f config_get_release_source_dependencies_json
