@@ -27,10 +27,17 @@ if [[ "${1:-}" == --strict-cargo-cache-tests || "${1:-}" == --strict-cargo-cache
     printf 'fn main() {}\n' > "$cache_test_root/source/src/main.rs"
     printf 'version = 4\n[[package]]\nname = "cache_probe"\nversion = "0.1.0"\n' > "$cache_test_root/source/Cargo.lock"
     cache_contract='{"tool":"cache-test","platform":"native","profile":"dev","command":"fixture"}'
+    cache_test_mode="$1"
     cache_run() (
         cd "$cache_test_root/source" || exit 1
         export CARGO_TARGET_DIR="$cache_test_root/$1"
-        bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/cache" "$cache_contract" "$2")"
+        cache_command="$2"
+        if [[ "$cache_test_mode" == --strict-cargo-cache-tests ]]; then
+            # Supply an actual direct Cargo invocation for selection without
+            # compiling; the remaining fixture exercises custody/detachment.
+            cache_command='cargo metadata --frozen --format-version=1 >/dev/null; '"$cache_command"
+        fi
+        bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/cache" "$cache_contract" "$cache_command")"
     )
     if [[ "$1" == --strict-cargo-cache-cargo-tests ]]; then
         mkdir -p "$cache_test_root/dep/src" "$cache_test_root/source/src" || exit 1
@@ -154,7 +161,7 @@ PY
         sleep 0.05
     done
     [[ -e "$cache_test_root/holder/ready" ]] || exit 1
-    if cache_run contender 'exit 0'; then
+    if cache_run contender ':'; then
         echo 'FAIL: concurrent custody admitted' >&2; exit 1
     fi
     wait "$holder_pid" || exit 1
@@ -162,11 +169,11 @@ PY
     if (
         cd "$cache_test_root/source" || exit 1
         export CARGO_TARGET_DIR="$cache_test_root/unsafe-target"
-        bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/unsafe" "$cache_contract" 'exit 0')"
+        bash -c "$(_act_strict_cargo_cache_script "$cache_test_root/unsafe" "$cache_contract" 'cargo metadata --frozen --format-version=1 >/dev/null; :')"
     ); then
         echo 'FAIL: symlink cache admitted' >&2; exit 1
     fi
-    if cache_run first 'exit 0'; then
+    if cache_run first ':'; then
         echo 'FAIL: nonfresh final target admitted' >&2; exit 1
     fi
     mkdir "$cache_test_root/fake-bin" || exit 1
@@ -175,11 +182,11 @@ PY
     real_launcher=$(command -v cargo)
     printf '#!/bin/sh\nexport RUSTFLAGS="--cfg injected_by_unknown_wrapper"\nexec "%s" "$@"\n' "$real_launcher" > "$cache_test_root/fake-bin/cargo"
     chmod 700 "$cache_test_root/fake-bin/cargo" || exit 1
-    if (export PATH="$cache_test_root/fake-bin:$PATH"; cache_run unknown-wrapper 'exit 0'); then
+    if (export PATH="$cache_test_root/fake-bin:$PATH"; cache_run unknown-wrapper ':'); then
         echo 'FAIL: same-version unknown compiler script admitted' >&2; exit 1
     fi
     [[ ! -e "$cache_test_root/unknown-wrapper.cache-receipt.json" ]] || exit 1
-    if (export RUSTC_WRAPPER="$cache_test_root/fake-bin/cargo"; cache_run rustc-wrapper 'exit 0'); then
+    if (export RUSTC_WRAPPER="$cache_test_root/fake-bin/cargo"; cache_run rustc-wrapper ':'); then
         echo 'FAIL: explicit rustc wrapper admitted' >&2; exit 1
     fi
     if cache_run linked-final 'mkdir -p "$CARGO_BUILD_BUILD_DIR"; ln -s "$CARGO_BUILD_BUILD_DIR" "$CARGO_TARGET_DIR"'; then
@@ -1415,9 +1422,15 @@ test_unix_strict_rust_executes_xwin_sanitizer_before_exports() {
 
     local strict_root="$MOCK_DIR/unix-xwin-order/run"
     local observed_env="$MOCK_DIR/unix-xwin-order/observed-env"
-    mkdir -p "$strict_root/source" "$strict_root/ambient"
+    # The strict launcher now admits metadata for every compiler context,
+    # including reuse of a download seed. Exercise that real admission with a
+    # dependency-free Cargo project; this ordering fixture needs no compiler.
+    mkdir -p "$strict_root/source/src" "$strict_root/ambient"
+    printf '[package]\nname="tool"\nversion="0.1.0"\nedition="2021"\n' > "$strict_root/source/Cargo.toml"
+    printf 'fn main() {}\n' > "$strict_root/source/src/main.rs"
+    printf 'version = 4\n[[package]]\nname = "tool"\nversion = "0.1.0"\n' > "$strict_root/source/Cargo.lock"
     bash "$SRC_DIR/cargo_cache.sh" snapshot "$strict_root/ambient" "$strict_root/.cargo-home" >/dev/null || return 1
-    MOCK_BUILD_CMD="printf '%s\\n' \"\${XWIN_CACHE_DIR-<unset>}\" \"\${XWIN_CROSS_COMPILER-<unset>}\" > '$observed_env'"
+    MOCK_BUILD_CMD="cargo metadata --frozen --format-version=1 >/dev/null && printf '%s\\n' \"\${XWIN_CACHE_DIR-<unset>}\" \"\${XWIN_CROSS_COMPILER-<unset>}\" > '$observed_env'"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/unix-xwin-order/artifact"
     write_mock_artifact "$MOCK_SSH_STREAM_FILE"
     export XWIN_CACHE_DIR="/ambient/evil-xwin-cache"
@@ -1557,10 +1570,29 @@ test_strict_native_source_binding() {
     write_mock_artifact "$MOCK_SSH_STREAM_FILE"
     status=0
     result=$(
+        # Strict non-Rust staging reads the pinned source dependencies. Use
+        # the real config reader and parser for this single-repository fixture,
+        # preserving the host/source admission checks under test.
+        export DSR_CONFIG_DIR="$MOCK_DIR" DSR_REPOS_FILE="$MOCK_DIR/repos.yaml"
+        local binding_repo="$MOCK_DIR/binding-source" binding_blob binding_tree binding_sha
+        git init -q -b main "$binding_repo" || exit 1
+        printf 'package main\nfunc main() {}\n' > "$binding_repo/main.go"
+        binding_blob=$(git -C "$binding_repo" hash-object -w -- main.go) || exit 1
+        binding_tree=$(printf '100644 blob %s\tmain.go\n' "$binding_blob" | \
+            git -C "$binding_repo" mktree) || exit 1
+        binding_sha=$(git -C "$binding_repo" -c user.name='DSR Fixture' \
+            -c user.email='fixture@example.invalid' -c commit.gpgsign=false \
+            commit-tree "$binding_tree" -m 'Pinned source binding fixture') || exit 1
+        jq -nc --arg local_path "$binding_repo" \
+            '{tool_name:"tool", repo:"owner/tool", local_path:$local_path,
+              language:"go", binary_name:"tool", build_cmd:"go build", sibling_crates:[]}' \
+            > "$ACT_REPOS_DIR/tool.yaml" || exit 1
+        unset -f yq
+        source "$SRC_DIR/config.sh"
         act_get_native_host() { printf 'selected\n' > "$sentinel"; printf 'wlap\n'; }
         host_health_is_ready() { [[ "$1" == "mmini" ]]; }
         act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" \
-            "/remote/release/source" "1111111111111111111111111111111111111111" "v1.0.0" "mmini"
+            "/remote/release/source" "$binding_sha" "v1.0.0" "mmini"
     ) || status=$?
     if [[ "$status" -eq 0 && ! -e "$sentinel" ]] && \
        jq -e '.status == "success" and .host == "mmini"' <<< "$result" >/dev/null && \

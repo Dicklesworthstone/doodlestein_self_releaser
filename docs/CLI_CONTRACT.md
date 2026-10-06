@@ -580,6 +580,32 @@ record their resolved executable. Literal tracked Cargo configuration can
 select the compiler, target and linker; those configuration files are hashed
 into the receipt and require Python 3.11+ to parse.
 
+Strict Unix source-closure validation runs locked, offline, all-features Cargo
+metadata with each target's selected toolchain and configured environment.
+Targets sharing a host keep their own command overrides. Every native attempt
+rechecks metadata compatibility, including when it copies an already admitted
+download seed; a successful check with one compiler does not authorize another.
+The snapshot and retained seed remain unchanged when a later target refuses.
+
+The opt-in `strict_cargo_cache_root` path uses the same selection for version
+and capability checks, dependency metadata, and the cache namespace. Explicit
+`+toolchain`, `RUSTC`, `CARGO_BUILD_RUSTC`, tracked compiler configuration, and
+the effective target linker therefore reach the cache admission checks before
+the build command starts. The cache still requires supported nightly
+Cargo/rustc with content freshness, refuses build scripts and unsupported
+compiler wrappers, and holds custody until fresh final outputs are detached.
+Changing a source snapshot's path alone does not invalidate eligible reuse.
+Command-scoped assignments cannot override the cache's intermediate directory
+or content-freshness controls. Metadata and cache admission accept an explicit
+root `Cargo.toml`; a different `--manifest-path` is refused because it would
+select a dependency graph outside the validated root manifest.
+The supported shell boundary is foreground simple commands joined by `;`,
+`&&`, or `||`, with ordinary marker commands such as `printf` and `echo`.
+Shell declarations, variable-writing builtins or expansions, append/array
+assignments, lookup-changing builtins, compound control flow, and early shell
+termination are refused instead of executing a selection the probe cannot
+represent. Configure those selections outside `build_cmd`.
+
 Conflicting toolchains/targets, dynamic selectors, Cargo `--config`/`-C`,
 compiler-selecting shell context changes, opaque Cargo drivers, Cargo aliases,
 configuration includes/`cfg` selectors, and configuration-driven compiler

@@ -2427,7 +2427,9 @@ closure_metadata_command_status=0
 if [[ $closure_metadata_command_status -eq 0 ]] && \
    grep -Fq 'ancestor=${physical_source_root%/*}' "$closure_metadata_command_file" && \
    grep -Fq "cd '$closure_source_root'" "$closure_metadata_command_file" && \
-   grep -Fq "CARGO_HOME=\"\$strict_home\" cargo metadata --locked --offline --all-features --format-version 1" \
+   grep -Fq 'export CARGO_HOME="$strict_home" RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1' \
+        "$closure_metadata_command_file" && \
+   grep -Fq "cargo_argv + ['metadata', '--locked', '--offline', '--all-features'," \
         "$closure_metadata_command_file"; then
     pass "strict Cargo metadata uses the build cwd while isolating ancestor config"
 else

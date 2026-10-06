@@ -4433,6 +4433,7 @@ EOF
 }
 
 _act_unix_cargo_metadata_body() {
+    local build_cmd="${1-cargo build}" build_env="${2:-}" env_pair env_name
     cat <<'SH'
 ancestor=${physical_source_root%/*}
 while test "$ancestor" != / && test -n "$ancestor"; do
@@ -4442,10 +4443,30 @@ while test "$ancestor" != / && test -n "$ancestor"; do
     ancestor=${ancestor%/*}; test -n "$ancestor" || ancestor=/
 done
 for variable in $(env | sed 's/=.*//'); do
-    case "$variable" in CARGO_*|RUST*|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset "$variable";; esac
+    case "$variable" in CARGO_*|RUST*|XWIN_*|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS) unset "$variable";; esac
 done
 cd "$physical_source_root"
-(set -C; CARGO_HOME="$strict_home" cargo metadata --locked --offline --all-features --format-version 1 --manifest-path "$physical_source_root/Cargo.toml" > "$strict_home/.dsr-cargo-metadata.json")
+SH
+    # Restore the same configured environment as the native launcher after
+    # removing ambient selectors. CARGO_HOME remains this metadata attempt's
+    # private copy, including when the caller already has an admitted seed.
+    while IFS= read -r env_pair; do
+        [[ -n "$env_pair" ]] || continue
+        env_name="${env_pair%%=*}"
+        [[ "$env_pair" == *=* && "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
+        [[ "$env_name" == CARGO_HOME ]] && continue
+        printf 'export "%s"\n' "$env_pair"
+    done <<< "$build_env"
+    cat <<'SH'
+export CARGO_HOME="$strict_home" RCH_DISABLED=1 RCH_CARGO_WRAPPER_BYPASS=1
+(
+set -C
+{
+SH
+    _act_toolchain_identity_script metadata /dev/null "$build_cmd" || return $?
+    cat <<'SH'
+} > "$strict_home/.dsr-cargo-metadata.json"
+)
 _dsr_cargo_home_guard "$strict_home"
 if $dsr_seed_pending; then
     _cargo_cache_run snapshot "$strict_home" "$dsr_seed_home" >/dev/null
@@ -4455,11 +4476,12 @@ SH
 
 _act_prepare_unix_private_cargo_home() {
     local host="$1" source_root="$2" suffix="$3" command summary metadata_body
+    local build_cmd="${4-cargo build}" build_env="${5:-}"
     command=$(_act_unix_private_cargo_home_script "$source_root" "$suffix") || return $?
-    # The orchestrator normally published the seed during its source-closure
-    # check. Direct native callers must pass the same admission if it is absent.
-    metadata_body=$(_act_unix_cargo_metadata_body) || return $?
-    command+=$'\n''if $dsr_seed_pending; then'$'\n'"$metadata_body"$'\n''fi'
+    # An admitted download seed is reusable across targets, but its earlier
+    # metadata result is not compiler authority for a new target/toolchain.
+    metadata_body=$(_act_unix_cargo_metadata_body "$build_cmd" "$build_env") || return $?
+    command+=$'\n'"$metadata_body"
     command+=$'\n''printf '\''%s\n'\'' "$dsr_private_summary"'
     summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
     jq -ce '
@@ -4587,6 +4609,7 @@ EOF
 _act_strict_cargo_metadata_json() {
     local host="$1"
     local source_root="$2"
+    local build_cmd="${3-cargo build}" build_env="${4:-}"
     local metadata_command metadata_output metadata_json canonical_source_root
     local strict_cargo_home="${source_root%/*}/.cargo-home"
 
@@ -4605,7 +4628,7 @@ _act_strict_cargo_metadata_json() {
         metadata_attempt=$(_act_generate_uuid) || return 3
         metadata_command=$(_act_unix_private_cargo_home_script \
             "$source_root" "metadata-${metadata_attempt//-/}") || return $?
-        metadata_body=$(_act_unix_cargo_metadata_body) || return $?
+        metadata_body=$(_act_unix_cargo_metadata_body "$build_cmd" "$build_env") || return $?
         metadata_command+=$'\n'"$metadata_body"$'\n''printf '\''%s\n'\'' "$physical_source_root"; test -f "$strict_home/.dsr-cargo-metadata.json"; test ! -L "$strict_home/.dsr-cargo-metadata.json"; cat "$strict_home/.dsr-cargo-metadata.json"'
     fi
 
@@ -4640,13 +4663,30 @@ _act_validate_strict_cargo_source_closure() {
     local host="$1"
     local source_root="$2"
     local dependency_checkouts_json="$3"
+    local build_cmd="${4-cargo build}" build_env="${5:-}"
     local metadata_snapshot_json metadata_source_root metadata_json
 
-    metadata_snapshot_json=$(_act_strict_cargo_metadata_json "$host" "$source_root") || return $?
+    metadata_snapshot_json=$(_act_strict_cargo_metadata_json \
+        "$host" "$source_root" "$build_cmd" "$build_env") || return $?
     metadata_source_root=$(jq -r '.source_root' <<< "$metadata_snapshot_json") || return 4
     metadata_json=$(jq -c '.metadata' <<< "$metadata_snapshot_json") || return 4
     _act_validate_cargo_metadata_source_closure \
         "$metadata_source_root" "$dependency_checkouts_json" "$metadata_json"
+}
+
+# Source closure is evaluated in each target's compiler context, even when
+# several targets share one immutable source root and download seed.
+_act_validate_strict_target_cargo_source_closure() {
+    local tool="$1" platform="$2" version="$3" host="$4" source_root="$5" dependencies="$6"
+    local build_cmd build_env binary_name
+    build_cmd=$(act_get_build_cmd "$tool" "$platform") || return 4
+    build_env=$(act_get_build_env "$tool" "$platform") || return 4
+    binary_name=$(yq -r '.binary_name // ""' "$ACT_REPOS_DIR/${tool}.yaml") || return 4
+    build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool}" \
+        "$version" "${platform%%/*}" "${platform##*/}") || return 4
+    build_env+=$'\n'"CARGO_TARGET_DIR=${source_root%/*}/.cargo-target-${platform//\//-}"
+    _act_validate_strict_cargo_source_closure \
+        "$host" "$source_root" "$dependencies" "$build_cmd" "$build_env"
 }
 
 _act_windows_reparse_guard_script() {
@@ -6297,11 +6337,13 @@ _act_ssh_exec() {
 # failure. Python owns the advisory lock through build and output detachment.
 _act_strict_cargo_cache_script() {
     local cache_root="$1" cache_contract="$2" command="$3"
-    local root_q contract_q command_q
+    local root_q contract_q command_q selection_script
     printf -v root_q '%q' "$cache_root"
     printf -v contract_q '%q' "$cache_contract"
     printf -v command_q '%q' "$command"
-    printf 'python3 - %s %s %s <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
+    selection_script=$(_act_toolchain_identity_script context /dev/null "$command") || return $?
+    printf 'dsr_cache_context=$(\n%s\n) || exit $?\n' "$selection_script"
+    printf 'DSR_CARGO_TOOLCHAIN_CONTEXT="$dsr_cache_context" python3 -I - %s %s %s <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
     cat <<'PY'
 import fcntl, hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys, tempfile, tomllib
 
@@ -6317,7 +6359,16 @@ def digest(path):
     return h.hexdigest()
 
 def probe(argv):
-    return subprocess.check_output(argv, text=True, timeout=30).strip()
+    return subprocess.check_output(argv, text=True, timeout=30, env=probe_env).strip()
+
+context = json.loads(os.environ.pop('DSR_CARGO_TOOLCHAIN_CONTEXT'))
+probe_env = dict(os.environ, **context['environment'])
+cargo_argv = context['cargo_argv']
+compiler = context['compiler']
+selected_identity = context['identity']
+managed_variables = {'CARGO_BUILD_BUILD_DIR', 'CARGO_UNSTABLE_CHECKSUM_FRESHNESS', 'CARGO_BUILD_FINGERPRINT'}
+require(not managed_variables.intersection(context['assigned_environment']),
+        'build_cmd cannot override managed cache custody or freshness settings')
 
 root = pathlib.Path(sys.argv[1])
 require(root.is_absolute() and root.resolve() == root, 'root must be a canonical absolute path')
@@ -6332,19 +6383,21 @@ target = pathlib.Path(os.environ['CARGO_TARGET_DIR'])
 require(target.is_absolute() and not target.exists() and not target.is_symlink(), 'final target must be fresh')
 require(not target.is_relative_to(root) and not root.is_relative_to(target), 'cache and final target must be separate')
 require(not root.is_relative_to(pathlib.Path.cwd()) and not pathlib.Path.cwd().is_relative_to(root), 'cache and source must be separate')
-require(not os.environ.get('RUSTC_WRAPPER') and not os.environ.get('RUSTC_WORKSPACE_WRAPPER'),
+require(not any(name in selected_identity['tools'] for name in (
+            'rustc_wrapper', 'rustc_workspace_wrapper', 'cargo_build_rustc_wrapper',
+            'cargo_build_rustc_workspace_wrapper')),
         'explicit rustc wrappers are unsupported by the cache identity contract')
-cargo = probe(['cargo', '-V'])
+cargo = probe(cargo_argv + ['-V'])
 version = re.match(r'cargo (\d+)\.(\d+)\.(\d+)', cargo)
 require(version and tuple(map(int, version.groups())) >= (1, 91, 1), 'Cargo >=1.91.1 with build.build-dir support required')
-rustc = probe([os.environ.get('RUSTC', 'rustc'), '-vV'])
+rustc = probe([compiler, '-vV'])
 # Reviewed managed RCH shim v4 and toolchain wrapper v3, identical on the
 # native Mac and Linux proof host. A changed script requires renewed review;
 # matching a comment or a version response is not executable authority.
 rch_shim_hash = '015f36047d1b732ada59b8644f7fde5e327803a11e56d571d2603af25c970ed7'
 rch_toolchain_hash = 'd5966567e177ce968f272848ab8e249da3d9bfca40f90237480e1fbe6bd9d2d0'
 def compiler_identity(program, tool, version_args, observed):
-    selected = shutil.which(program)
+    selected = shutil.which(program, path=probe_env.get('PATH'))
     require(selected, 'compiler executable missing: ' + tool)
     selected = pathlib.Path(selected).resolve()
     with selected.open('rb') as stream:
@@ -6352,12 +6405,12 @@ def compiler_identity(program, tool, version_args, observed):
     if is_wrapper:
         require(tool == 'cargo' and digest(selected) in (rch_shim_hash, rch_toolchain_hash),
                 'unrecognized selected compiler script: ' + tool)
-        require(os.environ.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
-                not os.environ.get('RCH_REAL_CARGO') and not os.environ.get('RCH_SHIM_REAL_CARGO'),
+        require(probe_env.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
+                not probe_env.get('RCH_REAL_CARGO') and not probe_env.get('RCH_SHIM_REAL_CARGO'),
                 'RCH cache resolution requires local bypass without executable overrides')
     actual = selected
     if is_wrapper or selected.name == 'rustup':
-        rustup = shutil.which('rustup')
+        rustup = shutil.which('rustup', path=probe_env.get('PATH'))
         require(rustup, 'rustup executable missing')
         rustup = pathlib.Path(rustup).resolve()
         with rustup.open('rb') as stream:
@@ -6371,7 +6424,7 @@ def compiler_identity(program, tool, version_args, observed):
     if is_toolchain_wrapper and tool == 'cargo':
         # RCH's managed toolchain wrapper has a documented local bypass used
         # by this runner. Bind that wrapper too, then hash its real executable.
-        require(os.environ.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
+        require(probe_env.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
                 digest(actual) == rch_toolchain_hash, 'unsupported toolchain Cargo wrapper')
         actual = (actual.parent / 'cargo-rch-real').resolve()
         require(probe([str(actual), *version_args]) == observed, 'RCH real Cargo version disagreement')
@@ -6381,18 +6434,20 @@ def compiler_identity(program, tool, version_args, observed):
             'toolchain_launcher': toolchain_launcher,
             'executable_path': str(actual), 'executable_sha256': digest(actual)}
 compilers = {'cargo': compiler_identity('cargo', 'cargo', ['-V'], cargo),
-             'rustc': compiler_identity(os.environ.get('RUSTC', 'rustc'), 'rustc', ['-vV'], rustc)}
+             'rustc': compiler_identity(compiler, 'rustc', ['-vV'], rustc)}
 require('-nightly' in cargo and '-nightly' in rustc,
         'strict cache requires nightly Cargo/rustc checksum freshness')
-require('checksum-freshness' in probe(['cargo', '-Z', 'help']),
+require('checksum-freshness' in probe(cargo_argv + ['-Z', 'help']),
         'Cargo checksum-freshness capability unavailable')
 os.environ['CARGO_UNSTABLE_CHECKSUM_FRESHNESS'] = 'true'
 os.environ['CARGO_BUILD_FINGERPRINT'] = 'content'
+probe_env['CARGO_UNSTABLE_CHECKSUM_FRESHNESS'] = 'true'
+probe_env['CARGO_BUILD_FINGERPRINT'] = 'content'
 # Cargo still timestamps build-script rerun-if-changed inputs in checksum mode.
 # Refuse the entire resolved graph rather than accepting stale generated code.
 # --frozen prevents this admission probe from modifying the sealed lockfile or
 # fetching dependencies. A future broader contract needs separate input proof.
-metadata = json.loads(probe(['cargo', 'metadata', '--format-version=1', '--frozen', '--all-features']))
+metadata = json.loads(probe(cargo_argv + ['metadata', '--format-version=1', '--frozen', '--all-features']))
 require(not any('custom-build' in target['kind']
                 for package in metadata['packages'] for target in package['targets']),
         'strict cache does not support build scripts: rerun-if-changed remains timestamp-based')
@@ -6401,13 +6456,13 @@ require(not any('custom-build' in target['kind']
 excluded = {'CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR',
             'DSR_RELEASE_GIT_SHA', 'DSR_RELEASE_GIT_REF',
             'FT_ATOMIC_BUILD_IDENTITY', 'FT_ATOMIC_BUILD_PROFILE'}
-influences = {k: v for k, v in os.environ.items() if k not in excluded and
+influences = {k: v for k, v in probe_env.items() if k not in excluded and
               (k.startswith(('CARGO_', 'RUST', 'XWIN_')) or
                re.search(r'(^|_)(CC|CXX|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', k))}
 tools = {}
 for name in ('CC', 'CXX', 'AR', 'LD'):
-    argv = shlex.split(os.environ.get(name, {'CC': 'cc', 'CXX': 'c++', 'AR': 'ar', 'LD': 'ld'}[name]))
-    executable = shutil.which(argv[0])
+    argv = shlex.split(probe_env.get(name, {'CC': 'cc', 'CXX': 'c++', 'AR': 'ar', 'LD': 'ld'}[name]))
+    executable = shutil.which(argv[0], path=probe_env.get('PATH'))
     require(executable, 'missing tool ' + name)
     tools[name] = {'argv': argv, 'path': str(pathlib.Path(executable).resolve()), 'sha256': digest(executable)}
     if sys.platform == 'darwin' and str(pathlib.Path(executable).resolve()) in (
@@ -6418,7 +6473,7 @@ for name in ('CC', 'CXX', 'AR', 'LD'):
         tools[name]['selected_compiler'] = {'path': str(actual), 'sha256': digest(actual)}
 sdk = None
 if sys.platform == 'darwin':
-    sdk_path = pathlib.Path(os.environ.get('SDKROOT') or probe(['xcrun', '--show-sdk-path'])).resolve()
+    sdk_path = pathlib.Path(probe_env.get('SDKROOT') or probe(['xcrun', '--show-sdk-path'])).resolve()
     settings = sdk_path / 'SDKSettings.json'
     require(settings.is_file(), 'SDK settings unavailable')
     sdk = {'path': str(sdk_path), 'settings_sha256': digest(settings),
@@ -6426,6 +6481,9 @@ if sys.platform == 'darwin':
 contract = {'schema': 2, 'source_freshness': 'nightly-content-no-build-scripts-v1',
             'configuration': json.loads(sys.argv[2]), 'cargo': cargo,
             'rustc': rustc, 'compilers': compilers, 'tools': tools, 'sdk': sdk, 'environment': influences}
+# Include actual target/linker/plugin bytes without the fresh source cwd: two
+# immutable copies of the same project can still reuse eligible intermediates.
+contract['toolchain'] = {key: selected_identity[key] for key in ('target_triple', 'linker_variable', 'tools')}
 with open('Cargo.toml', 'rb') as manifest:
     contract['profiles'] = tomllib.load(manifest).get('profile', {})
 contract['cargo_config'] = {name: digest(name) for name in ('.cargo/config', '.cargo/config.toml')
@@ -6501,11 +6559,13 @@ PY
 # overrides are refused rather than attesting a default that may not run.
 # Each tool records the selected executable and, for proven rustup proxies and
 # Apple /usr/bin compiler launchers, its dispatch target and content digest.
+# Internal metadata mode runs locked/offline metadata with the same selection;
+# context mode passes selected executable authority to the intermediate cache.
 # Args: mode output_json build_cmd extra_tools(space-separated)
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}"
     local output_q command_q extra_q
-    [[ "$mode" == record || "$mode" == verify ]] || return 4
+    [[ "$mode" == record || "$mode" == verify || "$mode" == metadata || "$mode" == context ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     printf -v output_q '%q' "$output"
     printf -v command_q '%q' "$build_cmd"
@@ -6570,7 +6630,8 @@ def shell_word(raw, variables=()):
 
 
 def influences(name):
-    return name == 'PATH' or name.startswith(('CARGO_', 'RUST'))
+    return name == 'PATH' or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
+        r'(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', name))
 
 
 def cargo_configuration():
@@ -6667,6 +6728,22 @@ def invocation_selection():
         tokens = list(lexer)
     except ValueError as error:
         fail('cannot read Cargo invocation: ' + str(error))
+    # Simple foreground command lists are the boundary. Even a stateless
+    # marker can mutate the caller through a parameter-assignment/arithmetic
+    # expansion, so inspect all words, including redirection operands.
+    for raw in tokens:
+        quote, index = '', 0
+        while index < len(raw):
+            char = raw[index]
+            if char == '\\' and quote != "'":
+                index += 2
+                continue
+            if char in "\"'" and (not quote or quote == char):
+                quote = '' if quote else char
+            if char == '$' and quote != "'" and (raw.startswith(('$((', '$['), index) or
+                    re.match(r'\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[|:?=)', raw[index:])):
+                fail('shell word mutation is outside the attested Cargo invocation')
+            index += 1
     statements, current = [], []
     for token in tokens:
         if token and all(char in ';&|()\n' for char in token):
@@ -6682,7 +6759,7 @@ def invocation_selection():
     if current:
         statements.append(current)
 
-    selections, commands, context_change = [], [], None
+    selections, commands, assigned_environment, context_change = [], [], set(), None
     for words in statements:
         # A redirection can occur anywhere in a simple command: arguments
         # after it still reach Cargo. Remove each operator/operand, preserving
@@ -6707,8 +6784,10 @@ def invocation_selection():
         if not words:
             continue
         assignments, cursor = {}, 0
-        while cursor < len(words) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', words[cursor]):
+        while cursor < len(words) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=', words[cursor]):
             name, value = words[cursor].split('=', 1)
+            if name.endswith('+') or '[' in name:
+                fail('shell append/array assignments are outside the attested Cargo invocation')
             assignments[name] = value
             cursor += 1
         if cursor == len(words):
@@ -6723,10 +6802,16 @@ def invocation_selection():
             if cursor == len(words):
                 continue
             program = shell_word(words[cursor])
+            if program in ('-v', '-V'):
+                continue  # Command lookup queries do not execute their operands.
+            if program.startswith('-'):
+                fail('unsupported command wrapper options in the attested Cargo invocation')
             cursor += 1
         if program == 'env':
-            while cursor < len(words) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', words[cursor]):
+            while cursor < len(words) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*\+?=', words[cursor]):
                 name, value = words[cursor].split('=', 1)
+                if name.endswith('+'):
+                    fail('shell append assignments are outside the attested Cargo invocation')
                 assignments[name] = value
                 cursor += 1
             if cursor == len(words):
@@ -6740,15 +6825,25 @@ def invocation_selection():
                     (program in ('rustup', 'sh', 'bash', 'zsh', 'dash', 'env', 'exec', 'eval', 'source', '.') and
                      any('cargo' in raw for raw in words[cursor:])):
                 fail('wrapped Cargo invocation is unsupported; use a direct cargo command')
-            if program in ('cd', 'pushd', 'popd', 'source', '.', 'eval', 'exec',
-                           'export', 'unset', 'set', 'alias', 'unalias',
+            # These builtins/reserved words can alter shell variables, lookup,
+            # control flow or invocation scope. Do not infer their effects.
+            if program in ('cd', 'pushd', 'popd', 'source', '.', 'eval', 'exec', 'exit', 'return',
+                           'export', 'unset', 'set', 'shopt', 'alias', 'unalias',
+                           'declare', 'typeset', 'readonly', 'local', 'read', 'readarray',
+                           'mapfile', 'getopts', 'let', 'hash', 'enable', 'trap', 'builtin', 'command',
+                           'if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until', 'do', 'done',
+                           'case', 'esac', 'select', 'in', 'break', 'continue', 'function', 'functions',
+                           'unfunction', 'autoload', 'time', '!', 'coproc',
                            '__unsupported_shell_context__'):
                 context_change = program
+            if program == 'printf' and cursor < len(words) and shell_word(words[cursor]).startswith('-v'):
+                context_change = 'printf -v'
             continue
         if context_change:
             fail('Cargo context changes inside build_cmd (' + context_change +
                  '); configure its environment/cwd outside the command')
         env = dict(os.environ)
+        assigned_environment.update(assignments)
         for name, raw in assignments.items():
             if name in ('CARGO_HOME', 'CARGO_TARGET_DIR'):
                 fail('build_cmd cannot replace the admitted ' + name)
@@ -6787,7 +6882,7 @@ def invocation_selection():
                  any(arg == '--target' or arg.startswith('--target=') for arg in argv[argv.index('--') + 1:])):
             fail('cargo rustc compiler selectors require an explicit target/linker configuration')
         commands.append(subcommand)
-        targets = []
+        targets, manifests = [], []
         while cursor < len(argv):
             arg = argv[cursor]
             if arg == '--target':
@@ -6797,7 +6892,20 @@ def invocation_selection():
                 targets.append(argv[cursor])
             elif arg.startswith('--target='):
                 targets.append(arg.split('=', 1)[1])
+            elif arg in ('--manifest-path', '-m'):
+                cursor += 1
+                if cursor >= len(argv):
+                    fail('Cargo --manifest-path requires a literal manifest')
+                manifests.append(argv[cursor])
+            elif arg.startswith('--manifest-path='):
+                manifests.append(arg.split('=', 1)[1])
+            elif arg.startswith('-m'):
+                manifests.append(arg[2:].removeprefix('='))
             cursor += 1
+        if mode in ('metadata', 'context') and any(
+                not manifest or pathlib.Path(manifest).resolve() != (pathlib.Path.cwd() / 'Cargo.toml').resolve()
+                for manifest in manifests):
+            fail('selected Cargo manifest differs from the strict source root; use its root Cargo.toml')
         if len(set(targets)) > 1:
             fail('multiple Cargo targets cannot share one toolchain identity receipt')
         target = targets[0] if targets else env.get('CARGO_BUILD_TARGET', cargo_config['build'].get('target', ''))
@@ -6808,6 +6916,9 @@ def invocation_selection():
         # An explicit + selector has higher priority than RUSTUP_TOOLCHAIN.
         selection['environment']['RUSTUP_TOOLCHAIN'] = toolchain or ''
         selections.append((selection, env, explicit_toolchain))
+    if context_change:
+        fail('Cargo context changes inside build_cmd (' + context_change +
+             '); configure its environment/cwd outside the command')
     if not selections:
         fail('strict toolchain attestation requires a direct Cargo invocation in build_cmd')
     if any(selection[0] != selections[0][0] for selection in selections[1:]):
@@ -6815,20 +6926,32 @@ def invocation_selection():
     selection, env, _ = selections[0]
     if selection['toolchain']:
         env['RUSTUP_TOOLCHAIN'] = selection['toolchain']
-    return selection, env, any(row[2] for row in selections), sorted(set(commands))
+    return selection, env, any(row[2] for row in selections), sorted(set(commands)), sorted(assigned_environment)
 
 
-selection, probe_env, explicit_toolchain, cargo_commands = invocation_selection()
+selection, probe_env, explicit_toolchain, cargo_commands, assigned_environment = invocation_selection()
 
 
-def run(argv, required=True):
+def run(argv, required=True, timeout=60):
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=probe_env)
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=probe_env)
     except (OSError, subprocess.TimeoutExpired) as error:
         fail('cannot run ' + argv[0] + ': ' + str(error))
     if result.returncode and required:
         fail('toolchain probe failed for ' + argv[0] + ': ' + result.stderr.strip())
     return (result.stdout or result.stderr).strip()
+
+cargo_argv = ['cargo'] + (['+' + selection['toolchain']] if explicit_toolchain else [])
+if mode == 'metadata':
+    try:
+        metadata = json.loads(run(cargo_argv + ['metadata', '--locked', '--offline', '--all-features',
+                                   '--format-version=1', '--manifest-path', str(pathlib.Path.cwd() / 'Cargo.toml')],
+                                  timeout=300))
+    except ValueError as error:
+        fail('invalid selected Cargo metadata: ' + str(error))
+    json.dump(metadata, sys.stdout, sort_keys=True)
+    sys.stdout.write('\n')
+    sys.exit(0)
 
 def is_script(path):
     with open(path, 'rb') as stream:
@@ -6923,6 +7046,17 @@ result = {'schema_version': 1, 'cwd': os.getcwd(), 'target_triple': triple,
           'selection': {'rustup_toolchain': selection['toolchain'],
                         'cargo_commands': cargo_commands,
                         'cargo_config': cargo_config_receipts}}
+
+if mode == 'context':
+    # Transfer only selection-induced changes; the cache process already has
+    # the configured build environment. This value is neither logged nor
+    # retained in a receipt, and the original build keeps its shell scoping.
+    json.dump({'identity': result, 'cargo_argv': cargo_argv, 'compiler': compiler,
+               'assigned_environment': assigned_environment,
+               'environment': {key: value for key, value in probe_env.items()
+                               if os.environ.get(key) != value}}, sys.stdout, sort_keys=True)
+    sys.stdout.write('\n')
+    sys.exit(0)
 
 if mode == 'record':
     try:
@@ -7273,7 +7407,8 @@ act_run_native_build() {
             local cargo_attempt
             cargo_attempt=$(_act_generate_uuid) || return 3
             if ! strict_cargo_seed_json=$(_act_prepare_unix_private_cargo_home \
-                    "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}") || \
+                    "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}" \
+                    "$build_cmd" "$strict_build_env") || \
                ! strict_cargo_home=$(jq -er '.cargo_home' <<< "$strict_cargo_seed_json"); then
                 _log_error "Unable to prepare a private strict Cargo cache on $host"
                 jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo cache preparation failed"}'
@@ -9275,7 +9410,7 @@ _act_relocate_failed_target() {
     _act_verify_strict_source_roots "$tool" "$(jq -r '.git_sha' <<< "$before")" "$roots" || return 4
     if [[ "$ACT_REPO_LANGUAGE" == "rust" ]]; then
         dependency_checkouts=$(_act_release_source_dependency_checkouts_json "$tool") || return 4
-        _act_validate_strict_cargo_source_closure "$host" \
+        _act_validate_strict_target_cargo_source_closure "$tool" "$target" "$version" "$host" \
             "$(jq -r --arg host "$host" '.[$host]' <<< "$roots")" \
             "$dependency_checkouts" || return 4
     fi
@@ -9553,13 +9688,19 @@ act_orchestrate_build() {
                 '[$hosts | to_entries[] | select(.value == $host) | .key] == [$target]' >/dev/null; then
                 continue
             fi
-            if [[ "$ACT_REPO_LANGUAGE" == "rust" ]] && \
-               ! _act_validate_strict_cargo_source_closure \
-                    "$source_host" "$actual_source_root" "$source_dependency_checkouts_json"; then
-                _log_error "Strict Cargo source closure validation failed on $source_host"
-                jq -nc --arg tool "$tool_name" --arg error "Cargo source closure does not match pinned dependencies" \
-                    '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
-                return 4
+            if [[ "$ACT_REPO_LANGUAGE" == "rust" ]]; then
+                local metadata_target
+                while IFS= read -r metadata_target; do
+                    if ! _act_validate_strict_target_cargo_source_closure \
+                            "$tool_name" "$metadata_target" "$version" "$source_host" \
+                            "$actual_source_root" "$source_dependency_checkouts_json"; then
+                        _log_error "Strict Cargo source closure validation failed for $metadata_target on $source_host"
+                        jq -nc --arg tool "$tool_name" --arg error "Cargo source closure does not match pinned dependencies" \
+                            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+                        return 4
+                    fi
+                done < <(jq -r --arg host "$source_host" \
+                    'to_entries[] | select(.value == $host) | .key' <<< "$target_hosts_json")
             fi
         done < <(jq -r '.[]' <<< "$expected_native_hosts_json")
     else
