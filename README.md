@@ -219,6 +219,15 @@ source tree plus Cargo target will exhaust. Set `build_root` on a host to stage 
 overrides it for strict release snapshots. Either way dsr refuses to stage onto a tmpfs/ramfs
 root and tells you to set `build_root`.
 
+Strict snapshots must also live on a filesystem that preserves POSIX file modes. ExFAT, FAT
+and some FUSE/SMB mounts report every file as executable, so a tracked `100644` file can no
+longer be distinguished from a `100755` one. dsr verifies each extracted snapshot (bytes,
+modes, links and the exact node count) immediately after transfer, before any target compiles,
+and names the first offending path, its Git mode, the observed mode and the backing filesystem.
+On a Mac whose only large disk is an external ExFAT drive, create an APFS disk image on it
+(`hdiutil create -size 200g -fs APFS -volname dsr-builds /Volumes/External/dsr-builds.sparseimage
+-type SPARSE`), attach it, and point `build_root` at the mounted volume.
+
 Set `DSR_KEEP_BUILD_STAGES=1` to retain isolated Rust source and Cargo-home staging
 directories after a native build, including failed or cancelled builds. This is
 useful for inspecting a build or when automatic deletion is prohibited. Retained

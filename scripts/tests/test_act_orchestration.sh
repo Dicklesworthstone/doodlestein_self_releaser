@@ -3058,7 +3058,7 @@ strict_windows_gitlink_status=0
 ) >/dev/null 2>&1 || strict_windows_gitlink_status=$?
 if [[ $strict_windows_gitlink_status -eq 0 ]] && \
    grep -Fq "parts[1] -eq '160000'" "$strict_windows_gitlink_command_file" && \
-   grep -Fq '^[A-Za-z0-9_./+@~#,=()\[\]-]+$' "$strict_windows_gitlink_command_file" && \
+   grep -Fq '^[A-Za-z0-9_./+@~#,=()\[\] -]+$' "$strict_windows_gitlink_command_file" && \
    grep -Fq 'hash-object --no-filters --stdin-paths' "$strict_windows_gitlink_command_file" && \
    grep -Fq '$LASTEXITCODE -ne 0' "$strict_windows_gitlink_command_file" && \
    grep -Fq '$hashes.Count -ne $expected.Count' "$strict_windows_gitlink_command_file" && \
@@ -3172,7 +3172,12 @@ strict_windows_scp_status=0
     ssh() {
         local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
         printf '%s\n' "$remote_command" >> "$strict_windows_ssh_log"
-        if [[ "$remote_command" == *'Get-FileHash'*'.source.manifest'* ]]; then
+        if [[ "$remote_command" == *'hash-object --no-filters --stdin-paths'* ]]; then
+            # Pre-build admission of the extracted checkout (issue #20).
+            printf 'ADMISSION\n' >> "$strict_windows_ssh_log"
+            printf '%s %s\n' "$(cat "$strict_windows_archive_digest_file")" \
+                "$(cat "$strict_windows_manifest_digest_file")"
+        elif [[ "$remote_command" == *'Get-FileHash'*'.source.manifest'* ]]; then
             cat "$strict_windows_manifest_digest_file"
         elif [[ "$remote_command" == *'Get-FileHash'*'.source.tar'* ]]; then
             cat "$strict_windows_archive_digest_file"
@@ -3188,10 +3193,64 @@ if [[ $strict_windows_scp_status -eq 0 ]] && \
    grep -Fq '.source.tar' "$strict_windows_scp_log" && \
    grep -Fq '.source.manifest' "$strict_windows_scp_log" && \
    ! grep -Fq 'OpenStandardInput' "$strict_windows_ssh_log" &&
-   grep -Fq "& (Join-Path \$env:SystemRoot 'System32\\tar.exe') -xf" "$strict_windows_ssh_log"; then
-    pass "strict mocked Windows sync uploads with SCP before independent verification"
+   grep -Fq "& (Join-Path \$env:SystemRoot 'System32\\tar.exe') -xf" "$strict_windows_ssh_log" && \
+   [[ "$(tail -1 "$strict_windows_ssh_log")" == "ADMISSION" ]]; then
+    pass "strict mocked Windows sync uploads with SCP, then admits the extracted checkout"
 else
     fail "strict mocked Windows sync did not preserve the SCP and verification contract"
+fi
+
+# Issue #20: a remote Unix staging filesystem that cannot hold Git modes is
+# refused at sync time, naming the offending path, before any compiler runs.
+# The real generated verifier runs against the extracted copy; only the SSH
+# transport is replaced. chmod +x simulates ExFAT's all-executable view.
+strict_unix_mode_root="$TEMP_DIR/strict-unix-mode/run/source"
+strict_unix_mode_stderr="$TEMP_DIR/strict-unix-mode.stderr"
+strict_unix_mode_status=0
+(
+    _act_is_local_host() { return 1; }
+    _act_is_windows_host() { return 1; }
+    _act_get_ssh_destination() { printf 'mock-unix\n'; }
+    _act_run_with_timeout() { shift; "$@"; }
+    ssh() {
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
+        if [[ "$remote_command" == *'--stdin-paths'* ]]; then
+            chmod +x "$strict_unix_mode_root/tracked.txt"
+        fi
+        "$BASH" -c "$remote_command"
+    }
+    _act_sync_strict_checkout \
+        "mmini" "$strict_sync_repo" "$strict_sync_sha" "$strict_unix_mode_root" \
+        "source.tar" "unix-mode-admission"
+) >/dev/null 2>"$strict_unix_mode_stderr" || strict_unix_mode_status=$?
+if [[ $strict_unix_mode_status -eq 4 ]] && \
+   grep -Fq 'tracked.txt must have Git mode 100644' "$strict_unix_mode_stderr" && \
+   grep -Fq 'POSIX-mode-preserving filesystem' "$strict_unix_mode_stderr" && \
+   grep -Fq 'failed admission on mmini' "$strict_unix_mode_stderr"; then
+    pass "strict Unix sync refuses a mode-losing staging filesystem before building, naming the path"
+else
+    fail "strict Unix sync did not refuse a mode mismatch at admission (status $strict_unix_mode_status)"
+fi
+
+strict_unix_admit_root="$TEMP_DIR/strict-unix-admit/run/source"
+strict_unix_admit_status=0
+(
+    _act_is_local_host() { return 1; }
+    _act_is_windows_host() { return 1; }
+    _act_get_ssh_destination() { printf 'mock-unix\n'; }
+    _act_run_with_timeout() { shift; "$@"; }
+    ssh() {
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
+        "$BASH" -c "$remote_command"
+    }
+    _act_sync_strict_checkout \
+        "mmini" "$strict_sync_repo" "$strict_sync_sha" "$strict_unix_admit_root" \
+        "source.tar" "unix-admission"
+) >/dev/null 2>&1 || strict_unix_admit_status=$?
+if [[ $strict_unix_admit_status -eq 0 ]] && [[ -f "$strict_unix_admit_root/tracked.txt" ]]; then
+    pass "strict Unix sync admits an intact extracted checkout"
+else
+    fail "strict Unix sync refused an intact extracted checkout (status $strict_unix_admit_status)"
 fi
 
 cat > "$ACT_REPOS_DIR/stdinlooptest.yaml" << EOF

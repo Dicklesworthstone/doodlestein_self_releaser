@@ -4092,9 +4092,13 @@ _act_verify_tracked_manifest_local() {
             link_hash=$(printf '%s' "$link_target" | git hash-object --no-filters --stdin 2>/dev/null) || return 4
             [[ "$link_hash" == "$object_id" ]] || return 4
         else
-            if [[ ! -f "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
-               { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
+            if [[ ! -f "$root_path/$relative_path" || -L "$root_path/$relative_path" ]]; then
+                _log_error "Strict source snapshot refused: $relative_path is missing or not a regular file"
+                return 4
+            fi
+            if { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
                { [[ "$mode" == "100644" ]] && [[ -x "$root_path/$relative_path" ]]; }; then
+                _act_report_strict_mode_mismatch "$root_path" "$relative_path" "$mode"
                 return 4
             fi
             hash_paths+=("$relative_path")
@@ -4118,7 +4122,17 @@ _act_verify_tracked_manifest_local() {
         hashes=$(printf '%s\n' "${hash_paths[@]}" | \
             git -C "$root_path" hash-object --no-filters --stdin-paths 2>/dev/null) || return 4
         expected_hashes=$(printf '%s\n' "${hash_ids[@]}") || return 4
-        [[ "$hashes" == "$expected_hashes" ]] || return 4
+        if [[ "$hashes" != "$expected_hashes" ]]; then
+            local -a actual_hash_ids=()
+            mapfile -t actual_hash_ids <<< "$hashes"
+            for ((hash_index=0; hash_index<${#hash_paths[@]}; hash_index++)); do
+                if [[ "${actual_hash_ids[hash_index]:-}" != "${hash_ids[hash_index]}" ]]; then
+                    _log_error "Strict source snapshot refused: ${hash_paths[hash_index]} content does not match Git blob ${hash_ids[hash_index]}"
+                    break
+                fi
+            done
+            return 4
+        fi
         # Retain the post-hash mode and ancestor checks as well: a matching
         # byte digest cannot authorize a link or permission change during Git.
         for ((hash_index=0; hash_index<${#hash_paths[@]}; hash_index++)); do
@@ -4127,6 +4141,7 @@ _act_verify_tracked_manifest_local() {
             [[ -f "$root_path/$relative_path" && ! -L "$root_path/$relative_path" ]] || return 4
             if { [[ "$mode" == "100755" ]] && [[ ! -x "$root_path/$relative_path" ]]; } || \
                { [[ "$mode" == "100644" ]] && [[ -x "$root_path/$relative_path" ]]; }; then
+                _act_report_strict_mode_mismatch "$root_path" "$relative_path" "$mode"
                 return 4
             fi
             parent="$relative_path"
@@ -4138,7 +4153,28 @@ _act_verify_tracked_manifest_local() {
     fi
 
     actual_count=$(find "$root_path" -mindepth 1 -print 2>/dev/null | wc -l | tr -d '[:space:]')
-    [[ "$actual_count" =~ ^[0-9]+$ && "$actual_count" == "$expected_count" ]]
+    if [[ ! "$actual_count" =~ ^[0-9]+$ || "$actual_count" != "$expected_count" ]]; then
+        _log_error "Strict source snapshot refused: expected $expected_count filesystem nodes, found ${actual_count:-none} (extra or missing files)"
+        return 4
+    fi
+}
+
+# Explain a tracked file whose executable bit disagrees with its Git mode.
+# Filesystems without POSIX modes (ExFAT, FAT, some FUSE/SMB mounts) report
+# every file as executable; name the filesystem so the operator can restage.
+_act_report_strict_mode_mismatch() {
+    local root_path="$1" relative_path="$2" mode="$3"
+    local node="$root_path/$relative_path" filesystem="" mount_point="" actual=""
+    if [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+        filesystem=$(stat -f -c %T "$node" 2>/dev/null) || filesystem=""
+    fi
+    if [[ -z "$filesystem" ]]; then
+        mount_point=$(df -P "$node" 2>/dev/null | awk 'NR == 2 { print $6 }') || mount_point=""
+        filesystem=$(mount 2>/dev/null | awk -v mp="$mount_point" \
+            '$3 == mp { f = ($4 == "type") ? $5 : $4; gsub(/[(),]/, "", f); print f; exit }') || filesystem=""
+    fi
+    actual=$(ls -ld "$node" 2>/dev/null | awk '{ print $1 }') || actual=""
+    _log_error "Strict source snapshot refused: $relative_path must have Git mode $mode but the extracted file is ${actual:-unreadable} on filesystem ${filesystem:-unknown}; stage strict snapshots on a POSIX-mode-preserving filesystem (set build_root in hosts.yaml)"
 }
 
 _act_validate_strict_checkout_at_revision() {
@@ -4779,6 +4815,22 @@ _act_sync_strict_checkout() {
         _log_error "Transferred tracked-file manifest digest mismatch for $label"
         return 4
     fi
+
+    # Admit the extracted checkout before any compiler can use it (issue #20).
+    # The local copy was already verified on extraction above. Remote hosts
+    # run the same complete verifier the final aggregation uses, so a staging
+    # filesystem that cannot hold Git modes is refused now, with the offending
+    # path, rather than after every target in the matrix has compiled.
+    if ! _act_is_local_host "$host"; then
+        local admitted_digests
+        if ! admitted_digests=$(_act_run_strict_snapshot_verifier "$host" "$ssh_destination" \
+                "$remote_path" "$remote_archive" "$remote_manifest" \
+                "$local_manifest_digest" "$expected_object_count" </dev/null) || \
+           [[ "$admitted_digests" != "$local_digest $local_manifest_digest" ]]; then
+            _log_error "Extracted strict source snapshot failed admission on $host for $label; no target was built"
+            return 4
+        fi
+    fi
 }
 
 _act_unix_strict_snapshot_verify_script() {
@@ -4790,6 +4842,25 @@ _act_unix_strict_snapshot_verify_script() {
 
     cat << EOF
 set -e
+# Refusals name the offending tracked path. Filesystems without POSIX modes
+# (ExFAT, FAT, some FUSE/SMB mounts) report every file as executable, which
+# otherwise surfaces only after a complete build matrix (issue #20).
+dsr_snapshot_refuse() {
+    printf '[dsr] strict source snapshot refused: %s\\n' "\$1" >&2
+    exit 21
+}
+dsr_snapshot_mode_refuse() {
+    dsr_fs=
+    if test "\$(uname -s 2>/dev/null)" = Linux; then
+        dsr_fs=\$(stat -f -c %T "\$3" 2>/dev/null) || dsr_fs=
+    fi
+    if test -z "\$dsr_fs"; then
+        dsr_mount=\$(df -P "\$3" 2>/dev/null | awk 'NR == 2 { print \$6 }') || dsr_mount=
+        dsr_fs=\$(mount 2>/dev/null | awk -v mp="\$dsr_mount" '\$3 == mp { f = (\$4 == "type") ? \$5 : \$4; gsub(/[(),]/, "", f); print f; exit }') || dsr_fs=
+    fi
+    dsr_actual=\$(ls -ld "\$3" 2>/dev/null | awk '{ print \$1 }') || dsr_actual=
+    dsr_snapshot_refuse "\$1 must have Git mode \$2 but the extracted file is \${dsr_actual:-unreadable} on filesystem \${dsr_fs:-unknown}; stage strict snapshots on a POSIX-mode-preserving filesystem (set build_root in hosts.yaml)"
+}
 test -d '$remote_path'; test ! -L '$remote_path'
 test -f '$remote_archive'; test ! -L '$remote_archive'
 test -f '$remote_manifest'; test ! -L '$remote_manifest'
@@ -4855,9 +4926,13 @@ while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_pa
         actual=\$(printf '%s' "\$target" | git hash-object --no-filters --stdin)
         test "\$actual" = "\$object_id"
     else
-        test -f "\$node"
-        test ! -L "\$node"
-        if test "\$mode" = 100755; then test -x "\$node"; else test ! -x "\$node"; fi
+        test -f "\$node" || dsr_snapshot_refuse "\$relative_path is missing or not a regular file"
+        test ! -L "\$node" || dsr_snapshot_refuse "\$relative_path is a symbolic link"
+        if test "\$mode" = 100755; then
+            test -x "\$node" || dsr_snapshot_mode_refuse "\$relative_path" "\$mode" "\$node"
+        else
+            test ! -x "\$node" || dsr_snapshot_mode_refuse "\$relative_path" "\$mode" "\$node"
+        fi
     fi
 done < '$remote_manifest'
 # The validated alphabet excludes quotes, backslashes and newlines: stdin
@@ -4867,7 +4942,15 @@ hash_paths=\$(LC_ALL=C awk -F '\\t' '\$2 == "100644" || \$2 == "100755" { print 
 expected_hashes=\$(LC_ALL=C awk -F '\\t' '\$2 == "100644" || \$2 == "100755" { print \$1 }' '$remote_manifest')
 if test -n "\$hash_paths"; then
     hashes=\$(printf '%s\\n' "\$hash_paths" | git -C '$remote_path' hash-object --no-filters --stdin-paths)
-    test "\$hashes" = "\$expected_hashes"
+    if test "\$hashes" != "\$expected_hashes"; then
+        # Failure path only: name the first tracked file whose bytes differ.
+        while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_path"; do
+            case "\$mode" in 100644|100755) :;; *) continue;; esac
+            actual=\$(git -C '$remote_path' hash-object --no-filters -- "\$relative_path" 2>/dev/null) || actual=
+            test "\$actual" = "\$object_id" || dsr_snapshot_refuse "\$relative_path content does not match Git blob \$object_id"
+        done < '$remote_manifest'
+        dsr_snapshot_refuse "tracked file contents do not match the source manifest"
+    fi
 fi
 # A matching byte digest cannot authorize a link or executable-mode change
 # during the batch. Recheck regular objects and their ancestor chains.
@@ -4875,7 +4958,11 @@ while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_pa
     case "\$mode" in 100644|100755) :;; *) continue;; esac
     node='$remote_path'/\$relative_path
     test -f "\$node"; test ! -L "\$node"
-    if test "\$mode" = 100755; then test -x "\$node"; else test ! -x "\$node"; fi
+    if test "\$mode" = 100755; then
+        test -x "\$node" || dsr_snapshot_mode_refuse "\$relative_path" "\$mode" "\$node"
+    else
+        test ! -x "\$node" || dsr_snapshot_mode_refuse "\$relative_path" "\$mode" "\$node"
+    fi
     parent=\$relative_path
     while test "\${parent#*/}" != "\$parent"; do
         parent=\${parent%/*}
@@ -4883,7 +4970,7 @@ while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_pa
     done
 done < '$remote_manifest'
 actual_count=\$(find '$remote_path' -mindepth 1 -print | wc -l | tr -d '[:space:]')
-test "\$actual_count" = '$expected_object_count'
+test "\$actual_count" = '$expected_object_count' || dsr_snapshot_refuse "expected $expected_object_count filesystem nodes, found \$actual_count (extra or missing files)"
 printf '%s %s\\n' "\$archive_digest" "\$manifest_digest"
 EOF
 }
@@ -4989,41 +5076,52 @@ _act_verify_strict_checkout_snapshot() {
             _log_error "Strict source snapshot changed after build: $label"
             return 4
         fi
-    elif _act_is_windows_host "$host"; then
-        local win_remote_path win_snapshot_parent win_remote_archive win_remote_manifest ps_command verify_output verify_script
-        win_remote_path=$(_act_windows_cmd_path "$remote_path")
-        win_snapshot_parent=$(_act_windows_cmd_path "$snapshot_parent")
-        win_remote_archive=$(_act_windows_cmd_path "$remote_archive")
-        win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
-        verify_script=$(_act_windows_strict_snapshot_verify_script \
-            "$win_remote_path" "$win_snapshot_parent" "$win_remote_archive" "$win_remote_manifest" \
-            "$expected_manifest_digest" "$expected_object_count") || return 4
-        # PowerShell 7 is required here: Windows PowerShell 5 cannot inspect
-        # valid tracked paths longer than MAX_PATH, even after native tar has
-        # extracted them successfully. Missing pwsh must fail verification.
-        ps_command=$(_act_windows_encoded_powershell "$verify_script" pwsh) || return 4
-        verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
-            -n \
-            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$ps_command") || return 4
-        read -r actual_digest actual_manifest_digest <<< "$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1)"
     else
-        local remote_cmd verify_output
-        remote_cmd=$(_act_unix_strict_snapshot_verify_script "$remote_path" "$remote_archive" "$remote_manifest" "$expected_manifest_digest" "$expected_object_count") || return 4
-        verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
-            -n \
-            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_cmd") || return 4
-        read -r actual_digest actual_manifest_digest <<< "$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1)"
+        local verify_output
+        verify_output=$(_act_run_strict_snapshot_verifier "$host" "$ssh_destination" \
+            "$remote_path" "$remote_archive" "$remote_manifest" \
+            "$expected_manifest_digest" "$expected_object_count") || return 4
+        read -r actual_digest actual_manifest_digest <<< "$verify_output"
     fi
 
-    actual_digest=$(printf '%s' "$actual_digest" | tr '[:upper:]' '[:lower:]')
-    actual_manifest_digest=$(printf '%s' "$actual_manifest_digest" | tr '[:upper:]' '[:lower:]')
     if [[ "$actual_digest" != "$expected_digest" || \
           "$actual_manifest_digest" != "$expected_manifest_digest" ]]; then
         _log_error "Strict source snapshot identity changed after transfer: $label"
         return 4
     fi
+}
+
+# Run the complete extracted-checkout verifier on a remote Unix or Windows
+# host. Prints "<archive sha256> <manifest sha256>" in lowercase. The remote
+# verifier's own refusal diagnostics are passed through on stderr.
+_act_run_strict_snapshot_verifier() {
+    local host="$1" ssh_destination="$2" remote_path="$3" remote_archive="$4"
+    local remote_manifest="$5" expected_manifest_digest="$6" expected_object_count="$7"
+    local remote_cmd verify_output digests
+
+    if _act_is_windows_host "$host"; then
+        local verify_script
+        verify_script=$(_act_windows_strict_snapshot_verify_script \
+            "$(_act_windows_cmd_path "$remote_path")" \
+            "$(_act_windows_cmd_path "${remote_path%/*}")" \
+            "$(_act_windows_cmd_path "$remote_archive")" \
+            "$(_act_windows_cmd_path "$remote_manifest")" \
+            "$expected_manifest_digest" "$expected_object_count") || return 4
+        # PowerShell 7 is required here: Windows PowerShell 5 cannot inspect
+        # valid tracked paths longer than MAX_PATH, even after native tar has
+        # extracted them successfully. Missing pwsh must fail verification.
+        remote_cmd=$(_act_windows_encoded_powershell "$verify_script" pwsh) || return 4
+    else
+        remote_cmd=$(_act_unix_strict_snapshot_verify_script "$remote_path" "$remote_archive" \
+            "$remote_manifest" "$expected_manifest_digest" "$expected_object_count") || return 4
+    fi
+    verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
+        -n \
+        -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_cmd") || return 4
+    digests=$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1 | tr '[:upper:]' '[:lower:]')
+    [[ "$digests" =~ ^[0-9a-f]{64}\ [0-9a-f]{64}$ ]] || return 4
+    printf '%s\n' "$digests"
 }
 
 _act_verify_strict_source_roots() {
