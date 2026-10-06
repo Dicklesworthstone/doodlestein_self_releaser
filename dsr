@@ -947,24 +947,54 @@ _doctor_summary() {
 # CHECK SUBCOMMAND
 # ============================================================================
 
+# Configured tools as "tool<TAB>owner/repo<TAB>workflow" lines: repos.d files
+# first (flat keys, or the older github.repo/github.workflow layout), then
+# registry-only tools. One line per repository.
+_check_configured_repos() {
+    command -v yq &>/dev/null || return 0
+    local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
+    local registry="${DSR_REPOS_FILE:-$config_dir/repos.yaml}"
+    local file line repo
+    local -A seen=()
+    while IFS= read -r line; do
+        IFS=$'\t' read -r _ repo _ <<< "$line"
+        [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
+        [[ -z "${seen[${repo,,}]:-}" ]] || continue
+        seen["${repo,,}"]=1
+        printf '%s\n' "$line"
+    done < <(
+        for file in "$config_dir"/repos.d/*.yaml; do
+            [[ -f "$file" && "${file##*/}" != _* ]] || continue
+            yq -r '[(.tool_name // .name // ""), (.repo // .github.repo // ""),
+                    (.workflow // .github.workflow // "")] | @tsv' "$file" 2>/dev/null
+        done
+        if [[ -f "$registry" ]]; then
+            yq -r '.tools // {} | to_entries[] |
+                [.key, (.value.repo // ""), (.value.workflow // "")] | @tsv' "$registry" 2>/dev/null
+        fi
+    )
+}
+
 cmd_check() {
     local repos=()
-    local threshold=600  # 10 minutes in seconds
-    local check_all=false
+    local threshold=""
+    local all_workflows=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --repos|-r)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "$1 requires a value"; return 4; }
                 IFS=',' read -ra repos <<< "$2"
                 shift 2
                 ;;
             --threshold|-t)
+                [[ $# -ge 2 ]] || { log_error "$1 requires a value"; return 4; }
                 threshold="$2"
                 shift 2
                 ;;
             --all|-a)
-                check_all=true
+                all_workflows=true
                 shift
                 ;;
             --help|-h)
@@ -972,18 +1002,21 @@ cmd_check() {
 dsr check - Detect throttled GitHub Actions runs
 
 USAGE:
-    dsr check <repo>
-    dsr check --repos repo1,repo2
-    dsr check --all
+    dsr check [<repo>...] [--repos repo1,repo2] [--threshold <sec>] [--all]
 
 OPTIONS:
-    -r, --repos <list>      Comma-separated repos (e.g., ntm,bv)
-    -t, --threshold <sec>   Queue time threshold in seconds (default: 600)
-    -a, --all               Check all configured repos
+    -r, --repos <list>      Comma-separated repos or tool names (default: all configured)
+    -t, --threshold <sec>   Queue time threshold in seconds
+                            (default: threshold_seconds from config, else 600)
+    -a, --all               Check every workflow, not only each tool's release workflow
     --json                  JSON output (global flag)
 
+A configured tool's `workflow` names its release workflow; only that
+workflow's runs are checked unless --all is given.
+
 EXAMPLES:
-    dsr check Dicklesworthstone/ntm
+    dsr check                              All configured repos
+    dsr check ntm Dicklesworthstone/bv
     dsr check --repos ntm,bv --threshold 300
     dsr check --all --json
 
@@ -992,7 +1025,7 @@ EXIT CODES:
     1  - Throttling detected
     3  - Dependency error (gh not authenticated)
     4  - Invalid arguments
-    8  - Network/API error
+    8  - Network/API error (no throttling seen in the repos that answered)
 EOF
                 return 0
                 ;;
@@ -1009,21 +1042,53 @@ EOF
         esac
     done
 
-    # Load config for --all option
-    if $check_all; then
+    # The configured threshold (threshold_seconds, or DSR_THRESHOLD through
+    # config_load) applies unless --threshold overrides it.
+    if [[ -z "$threshold" ]]; then
         config_load 2>/dev/null || true
-        # Get repos from config (parse repos.yaml)
-        local repos_file="$DSR_CONFIG_DIR/repos.yaml"
-        if [[ -f "$repos_file" ]]; then
-            while IFS= read -r repo; do
-                [[ -n "$repo" ]] && repos+=("$repo")
-            done < <(grep -E '^\s+repo:' "$repos_file" 2>/dev/null | sed 's/.*repo:\s*//' | tr -d '"' || true)
-        fi
+        threshold=$(config_get threshold_seconds 600 2>/dev/null) || threshold=600
+        [[ -n "$threshold" ]] || threshold=600
+    fi
+    if [[ ! "$threshold" =~ ^[1-9][0-9]{0,6}$ ]]; then
+        log_error "Invalid threshold: $threshold (positive number of seconds)"
+        $JSON_MODE && json_envelope "check" "error" 4 \
+            "$(jq -nc --arg t "$threshold" '{error: "invalid threshold", threshold: $t}')"
+        return 4
     fi
 
-    # Validate we have repos to check
+    # Resolve each requested repo (or every configured one) to owner/repo,
+    # its dsr tool and its release workflow file.
+    local -a configured_repos=() targets=()
+    local line tool repo workflow arg found
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && configured_repos+=("$line")
+    done < <(_check_configured_repos)
     if [[ ${#repos[@]} -eq 0 ]]; then
-        log_error "No repos specified. Use: dsr check <repo> or --all"
+        targets=(${configured_repos[@]+"${configured_repos[@]}"})
+    else
+        for arg in "${repos[@]}"; do
+            [[ -n "$arg" ]] || continue
+            found=""
+            for line in ${configured_repos[@]+"${configured_repos[@]}"}; do
+                IFS=$'\t' read -r tool repo workflow <<< "$line"
+                if [[ "$arg" == "$tool" || "${arg,,}" == "${repo,,}" ]]; then
+                    found="$line"
+                    break
+                fi
+            done
+            if [[ -z "$found" ]]; then
+                # Unconfigured short names keep the historical default owner.
+                repo="$arg"
+                [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
+                found=$'\t'"$repo"$'\t'
+            fi
+            targets+=("$found")
+        done
+    fi
+
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        log_error "No repos to check: pass <repo> or --repos, or configure tools (dsr repos add)"
+        $JSON_MODE && json_envelope "check" "error" 4 '{"error": "no repositories configured or given"}'
         return 4
     fi
 
@@ -1038,19 +1103,26 @@ EOF
     fi
 
     # Process each repo
-    local any_throttled=false
+    local any_throttled=false any_error=false
     local results=()
     local now
     now=$(date +%s)
 
-    for repo in "${repos[@]}"; do
+    for line in "${targets[@]}"; do
+        IFS=$'\t' read -r tool repo workflow <<< "$line"
+        $all_workflows && workflow=""
         local result
-        result=$(_check_repo "$repo" "$threshold" "$now")
+        result=$(_check_repo "$repo" "$threshold" "$now" "${workflow##*/}")
         local status=$?
 
         if [[ $status -eq 1 ]]; then
             any_throttled=true
+        elif [[ $status -ne 0 ]]; then
+            any_error=true
         fi
+        result=$(jq -c --arg tool "$tool" '. + {tool: (if $tool == "" then null else $tool end)}' \
+            <<< "$result" 2>/dev/null) || result=$(jq -nc --arg repo "$repo" \
+            '{repo: $repo, status: "error", error: "unreadable check result"}')
 
         results+=("$result")
 
@@ -1059,18 +1131,40 @@ EOF
         fi
     done
 
-    # JSON output
+    # Throttling is actionable even when another repo could not be read; an
+    # unreadable repo is never reported as healthy.
+    # Envelope status per docs/CLI_CONTRACT.md: success|partial|error.
+    local summary_status="success" summary_exit=0
+    if $any_throttled; then
+        summary_status="partial" summary_exit=1
+    elif $any_error; then
+        summary_status="error" summary_exit=8
+    fi
+
+    # JSON output (schemas/check-details.json)
     if $JSON_MODE; then
         local results_json
         results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')
-        local summary_status="ok"
-        $any_throttled && summary_status="throttled"
-        json_envelope "check" "$summary_status" "$($any_throttled && echo 1 || echo 0)" \
-            "$(jq -nc --argjson repos "$results_json" --argjson threshold "$threshold" \
-                '{threshold_seconds: $threshold, repos: $repos}')"
+        json_envelope "check" "$summary_status" "$summary_exit" \
+            "$(jq -nc --argjson repos "$results_json" --argjson threshold "$threshold" '
+                {threshold_seconds: $threshold,
+                 repos_checked: [$repos[].repo],
+                 throttled: [$repos[] | select(.status == "throttled") | . as $r |
+                     ((.queued_runs // []) + (.stuck_runs // []))[] |
+                     ((.path // "") | split("/") | last) as $file |
+                     {repo: $r.repo, tool: $r.tool,
+                      workflow: (if $file != "" then $file else (.workflow_name // "unknown") end),
+                      run_id: .id, status: .status, queue_time_seconds: .age_seconds,
+                      threshold_seconds: $threshold, created_at: .created_at,
+                      started_at: .run_started_at, head_branch: .head_branch, html_url: .html_url} |
+                     with_entries(select(.value != null))],
+                 healthy: [$repos[] | select(.status == "ok") | .repo],
+                 skipped: [$repos[] | select(.status == "error") |
+                     {repo: .repo, reason: (.error // "check failed")}],
+                 repos: $repos}')"
     fi
 
-    $any_throttled && return 1 || return 0
+    return "$summary_exit"
 }
 
 # Check a single repo for throttling
@@ -1079,6 +1173,7 @@ _check_repo() {
     local repo="$1"
     local threshold="$2"
     local now="$3"
+    local workflow="${4:-}"
 
     # Resolve short repo name to owner/repo
     if [[ ! "$repo" =~ / ]]; then
@@ -1086,13 +1181,19 @@ _check_repo() {
         repo="Dicklesworthstone/$repo"
     fi
 
-    # Fetch workflow runs
+    # Fetch workflow runs: the release workflow's own runs when one is
+    # configured, so busy CI elsewhere neither hides nor fakes a throttle.
     local runs_json
-    runs_json=$(gh_workflow_runs "$repo" --limit 20 2>/dev/null)
+    local -a run_args=("$repo" --limit 20)
+    [[ -n "$workflow" ]] && run_args+=(--workflow "$workflow")
+    runs_json=$(gh_workflow_runs "${run_args[@]}" 2>/dev/null)
     local fetch_status=$?
 
-    if [[ $fetch_status -ne 0 ]] || [[ -z "$runs_json" ]]; then
-        echo '{"repo": "'"$repo"'", "status": "error", "error": "failed to fetch runs"}'
+    if [[ $fetch_status -ne 0 ]] || [[ -z "$runs_json" ]] ||
+       ! jq -e 'type == "object"' <<< "$runs_json" >/dev/null 2>&1; then
+        jq -nc --arg repo "$repo" --arg workflow "$workflow" \
+            '{repo: $repo, status: "error", error: "failed to fetch runs",
+              workflow: (if $workflow == "" then null else $workflow end)}'
         return 8
     fi
 
@@ -1110,6 +1211,8 @@ _check_repo() {
                 created_at: .created_at,
                 workflow_id: .workflow_id,
                 workflow_name: .name,
+                path: .path,
+                head_branch: .head_branch,
                 event: .event,
                 html_url: .html_url,
                 age_seconds: $age
@@ -1130,6 +1233,8 @@ _check_repo() {
                 run_started_at: .run_started_at,
                 workflow_id: .workflow_id,
                 workflow_name: .name,
+                path: .path,
+                head_branch: .head_branch,
                 event: .event,
                 html_url: .html_url,
                 age_seconds: $age
@@ -1155,6 +1260,7 @@ _check_repo() {
 
     jq -nc \
         --arg repo "$repo" \
+        --arg workflow "$workflow" \
         --arg status "$status" \
         --argjson threshold "$threshold" \
         --argjson queued_count "$queued_count" \
@@ -1164,6 +1270,7 @@ _check_repo() {
         --argjson stuck_runs "$stuck_runs" \
         '{
             repo: $repo,
+            workflow: (if $workflow == "" then null else $workflow end),
             status: $status,
             threshold_seconds: $threshold,
             queued_count: $queued_count,
@@ -1182,7 +1289,7 @@ _check_print_result() {
     local result="$1"
 
     local repo status queued stuck oldest_min
-    repo=$(echo "$result" | jq -r '.repo')
+    repo=$(echo "$result" | jq -r '.repo + (if .workflow then " (\(.workflow))" else "" end)')
     status=$(echo "$result" | jq -r '.status')
     queued=$(echo "$result" | jq -r '.queued_count')
     stuck=$(echo "$result" | jq -r '.stuck_in_progress_count')
@@ -1214,7 +1321,7 @@ _WATCH_TRIGGERED_FILE="$_WATCH_STATE_DIR/triggered.json"
 _WATCH_LOCK_FILE="$_WATCH_STATE_DIR/watch.lock"
 
 # Default settings
-_WATCH_DEFAULT_INTERVAL=300  # 5 minutes
+_WATCH_DEFAULT_INTERVAL=60   # 1 minute (docs/CLI_CONTRACT.md)
 _WATCH_JITTER_PERCENT=20     # ±20% jitter
 _WATCH_DEBOUNCE_WINDOW=180   # 3 minutes
 _WATCH_BACKOFF_INITIAL=60    # 1 minute initial backoff
@@ -1360,16 +1467,22 @@ _watch_jittered_sleep() {
     echo "$sleep_time"
 }
 
+# Throttled runs this watcher has already reported (without --auto-fallback),
+# so each is announced once per watcher rather than on every poll.
+declare -A _WATCH_REPORTED=()
+
 # Main watch loop iteration
+# Args: dry_run auto_fallback
 _watch_iteration() {
     local dry_run="$1"
+    local auto_fallback="${2:-false}"
     local triggered_count=0
 
     log_info "Running throttle check..."
 
-    # Run dsr check
+    # Run dsr check over every configured repo's release workflow.
     local check_output check_exit
-    if check_output=$("$0" --json check --all 2>/dev/null); then
+    if check_output=$("$0" --json check 2>/dev/null); then
         check_exit=0
         _WATCH_CURRENT_BACKOFF=0  # Reset backoff on success
     else
@@ -1387,17 +1500,18 @@ _watch_iteration() {
             log_warn "API error, backing off for ${_WATCH_CURRENT_BACKOFF}s"
             return 1
         fi
+        if [[ $check_exit -ne 1 ]]; then
+            log_error "Throttle check failed (exit $check_exit); run 'dsr check' for details"
+            return 1
+        fi
+        _WATCH_CURRENT_BACKOFF=0
     fi
 
-    # Parse check results - extract throttled runs from queued_runs and stuck_runs
-    # JSON structure: .details.repos[].{repo, queued_runs[], stuck_runs[]}
+    # Throttled runs: .details.throttled[] (schemas/check-details.json)
     local throttled_runs
-    throttled_runs=$(echo "$check_output" | jq -r '
-        .details.repos[]? |
-        . as $r |
-        ((.queued_runs // []) + (.stuck_runs // []))[] |
-        "\(.id)|\($r.repo)"
-    ' 2>/dev/null)
+    throttled_runs=$(jq -r '.details.throttled[]? |
+        [(.run_id | tostring), .repo, (.tool // ""), (.head_branch // "")] | @tsv' \
+        <<< "$check_output" 2>/dev/null)
 
     if [[ -z "$throttled_runs" ]]; then
         log_ok "No throttled runs detected"
@@ -1405,12 +1519,16 @@ _watch_iteration() {
     fi
 
     # Process each throttled run
-    while IFS='|' read -r run_id repo; do
+    local run_id repo tool_name ref
+    while IFS=$'\t' read -r run_id repo tool_name ref; do
         [[ -z "$run_id" ]] && continue
 
         # Check if already triggered
         if _watch_is_triggered "$run_id"; then
             log_debug "Run $run_id already triggered, skipping"
+            continue
+        fi
+        if ! $auto_fallback && [[ -n "${_WATCH_REPORTED[$run_id]:-}" ]]; then
             continue
         fi
 
@@ -1422,11 +1540,26 @@ _watch_iteration() {
                 "$run_id" || true
         fi
 
-        # Extract tool name from repo (e.g., "Dicklesworthstone/ntm" -> "ntm")
-        local tool_name="${repo##*/}"
+        # The dsr tool configured for this repository, and the release
+        # version when the run was started by a version tag.
+        local -a fallback_args=()
+        if [[ "$ref" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$ ]]; then
+            fallback_args=(--version "$ref")
+        fi
 
-        if $dry_run; then
-            log_info "[DRY RUN] Would trigger fallback for $tool_name (run $run_id)"
+        if ! $auto_fallback; then
+            _WATCH_REPORTED["$run_id"]=1
+            if [[ -n "$tool_name" ]]; then
+                log_info "Run 'dsr fallback $tool_name${fallback_args[*]:+ ${fallback_args[*]}}' or watch with --auto-fallback"
+            else
+                log_info "No dsr tool is configured for $repo; add it with 'dsr repos add' to enable fallback"
+            fi
+        elif [[ -z "$tool_name" ]]; then
+            _WATCH_REPORTED["$run_id"]=1
+            log_warn "No dsr tool is configured for $repo; not triggering a fallback"
+        elif $dry_run; then
+            log_info "[DRY RUN] Would trigger fallback for $tool_name${fallback_args[*]:+ ${fallback_args[*]}} (run $run_id)"
+            ((triggered_count++))
         else
             log_info "Triggering fallback for $tool_name..."
 
@@ -1437,7 +1570,8 @@ _watch_iteration() {
             # Note: --non-interactive is a global flag and must come before the subcommand
             local fallback_log="$_WATCH_STATE_DIR/fallback-${run_id}.log"
             log_info "Starting fallback for $tool_name (run $run_id)..."
-            "$0" --non-interactive fallback "$tool_name" >> "$fallback_log" 2>&1 &
+            "$0" --non-interactive fallback "$tool_name" ${fallback_args[@]+"${fallback_args[@]}"} \
+                >> "$fallback_log" 2>&1 &
             local fallback_pid=$!
             log_info "Fallback started (PID: $fallback_pid, log: $fallback_log)"
             if [[ "${DSR_NOTIFY_ENABLED:-false}" == "true" ]]; then
@@ -1446,13 +1580,16 @@ _watch_iteration() {
                     "Repo $repo run $run_id fallback started (PID: $fallback_pid)" \
                     "$run_id" || true
             fi
+            ((triggered_count++))
         fi
-
-        ((triggered_count++))
     done <<< "$throttled_runs"
 
     if [[ $triggered_count -gt 0 ]]; then
-        log_info "Triggered $triggered_count fallback(s)"
+        if $dry_run; then
+            log_info "Would trigger $triggered_count fallback(s)"
+        else
+            log_info "Triggered $triggered_count fallback(s)"
+        fi
     fi
 
     return 0
@@ -1461,7 +1598,9 @@ _watch_iteration() {
 cmd_watch() {
     local interval=$_WATCH_DEFAULT_INTERVAL
     local daemon_mode=false
-    local dry_run=false
+    # The global --dry-run (dsr -n watch) never starts a fallback either.
+    local dry_run="${DRY_RUN:-false}"
+    local auto_fallback=false
     local once_mode=false
     local notify_methods="none"
 
@@ -1469,8 +1608,13 @@ cmd_watch() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --interval|-i)
+                [[ $# -ge 2 ]] || { log_error "$1 requires a value"; return 4; }
                 interval="$2"
                 shift 2
+                ;;
+            --auto-fallback)
+                auto_fallback=true
+                shift
                 ;;
             --notify)
                 notify_methods="$2"
@@ -1500,16 +1644,19 @@ USAGE:
     dsr watch [options]
 
 OPTIONS:
-    --interval, -i <sec>   Poll interval in seconds (default: 300)
+    --interval, -i <sec>   Poll interval in seconds (default: 60)
+    --auto-fallback        Start `dsr fallback` for each throttled release run
     --daemon, -d           Run in background (daemon mode)
-    --dry-run, -n          Check but don't trigger fallbacks
+    --dry-run, -n          Check but don't trigger fallbacks (also the global -n)
     --once, -1             Single check and exit
     --notify <method>      Notification: slack|discord|desktop|terminal|none
     --json                 JSON output (global flag)
 
 BEHAVIOR:
-    - Polls all configured repos for throttled GH Actions runs
-    - Triggers fallback builds once per detected throttle
+    - Polls every configured repo's release workflow for throttled runs
+      (dsr check), at the configured threshold_seconds
+    - Reports each throttled run once; with --auto-fallback, starts one
+      fallback per run for the repo's dsr tool, at the run's version tag
     - Deduplicates by run ID (won't re-trigger same run)
     - Uses jittered intervals to avoid thundering herd
     - Exponential backoff on API errors (up to 1 hour)
@@ -1520,11 +1667,12 @@ STATE FILES:
     ~/.local/state/dsr/watch.lock      - Lock file (single instance)
 
 EXAMPLES:
-    dsr watch                  Start watching (foreground)
-    dsr watch --once           Single check and exit
-    dsr watch --dry-run        Check without triggering
-    dsr watch --interval 60    Poll every minute
-    dsr watch --daemon &       Run in background
+    dsr watch                         Report throttled runs (foreground)
+    dsr watch --auto-fallback         Also build and release on throttle
+    dsr watch --once                  Single check and exit
+    dsr watch --dry-run --auto-fallback   Show which fallbacks would start
+    dsr watch --interval 300          Poll every five minutes
+    dsr watch --daemon &              Run in background
 
 EXIT CODES:
     0  - Success (or clean shutdown)
@@ -1535,7 +1683,9 @@ EOF
                 return 0
                 ;;
             *)
-                shift
+                log_error "Unknown option: $1"
+                log_info "Run 'dsr watch --help' for usage"
+                return 4
                 ;;
         esac
     done
@@ -1559,7 +1709,7 @@ EOF
 
     # Run preflight check
     log_info "Running preflight check..."
-    if ! ./dsr doctor --quick &>/dev/null; then
+    if ! "$0" doctor --quick &>/dev/null; then
         log_error "Preflight check failed. Run 'dsr doctor' for details."
         return 3
     fi
@@ -1568,16 +1718,18 @@ EOF
     # Single check mode
     if $once_mode; then
         log_info "Running single check..."
-        _watch_iteration "$dry_run"
+        _watch_iteration "$dry_run" "$auto_fallback"
         local result=$?
 
         if $JSON_MODE; then
             local state
             state=$(_watch_load_triggered)
-            json_envelope "watch" "success" "$result" "$(jq -nc \
+            json_envelope "watch" "$([[ $result -eq 0 ]] && echo success || echo error)" "$result" "$(jq -nc \
                 --arg mode "once" \
                 --argjson state "$state" \
-                '{mode: $mode, triggered_state: $state}')"
+                --argjson auto_fallback "$auto_fallback" \
+                --argjson dry_run "$dry_run" \
+                '{mode: $mode, auto_fallback: $auto_fallback, dry_run: $dry_run, triggered_state: $state}')"
         fi
 
         return $result
@@ -1600,7 +1752,11 @@ EOF
         log_info "Starting watch mode (interval: ${interval}s, Ctrl+C to stop)..."
     fi
 
-    $dry_run && log_info "(dry-run mode - no fallbacks will be triggered)"
+    if $dry_run; then
+        log_info "(dry-run mode - no fallbacks will be triggered)"
+    elif ! $auto_fallback; then
+        log_info "(report-only mode - pass --auto-fallback to start fallbacks)"
+    fi
 
     # Clean old triggered entries on startup
     _watch_cleanup_triggered
@@ -1613,7 +1769,7 @@ EOF
         log_info "--- Iteration $iteration ---"
 
         # Run check
-        if ! _watch_iteration "$dry_run"; then
+        if ! _watch_iteration "$dry_run" "$auto_fallback"; then
             # Backoff on error
             if [[ $_WATCH_CURRENT_BACKOFF -gt 0 ]]; then
                 log_info "Sleeping ${_WATCH_CURRENT_BACKOFF}s (backoff)..."

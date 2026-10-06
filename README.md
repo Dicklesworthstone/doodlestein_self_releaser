@@ -425,6 +425,12 @@ dsr check --all                     # Check all workflows, not just releases
 dsr check --json                    # JSON output for scripting
 ```
 
+A configured tool's `workflow` is its release workflow; without `--all` only
+that workflow's runs count. The default threshold is `threshold_seconds` from
+the config (or `DSR_THRESHOLD`), else 600s. Exit 0 means no throttling, 1
+throttling (`.details.throttled[]` names repo, tool, workflow, run and its
+tag), 8 a GitHub API failure — an unreadable repo is never reported healthy.
+
 ### `dsr build`
 
 Build artifacts locally.
@@ -640,6 +646,12 @@ dsr watch                                       # Default: check every 60s
 dsr watch --interval 30 --auto-fallback         # Auto-trigger on throttle
 dsr watch --notify desktop                      # Desktop notifications
 ```
+
+Without `--auto-fallback` the watcher only reports (and notifies) each
+throttled release run once. With it, each run starts one `dsr fallback` for
+the repo's configured tool at the run's version tag; repos with no dsr tool
+are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
+fallbacks would start.
 
 ### `dsr repos`
 

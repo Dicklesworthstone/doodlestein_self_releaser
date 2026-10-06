@@ -223,6 +223,178 @@ echo "{}"
     assert_equal "3" "$status"
 }
 
+# A gh that answers auth and serves one run listing for ntm's API calls (no
+# runs elsewhere), recording each call; an empty listing is an API failure.
+_mock_gh_runs() {
+    printf '%s' "$1" > "$TEST_TMPDIR/runs.json"
+    export GH_RETRY_DELAY=0
+    mock_command_script "gh" "
+printf '%s\n' \"\$*\" >> \"$TEST_TMPDIR/gh.calls\"
+[[ \"\$1\" == auth ]] && exit 0
+if [[ \"\$1\" == api ]]; then
+    [[ -s \"$TEST_TMPDIR/runs.json\" ]] || { echo 'gh: Bad gateway (HTTP 502)' >&2; exit 1; }
+    if [[ \"\$*\" == *repos/Dicklesworthstone/ntm/* ]]; then
+        cat \"$TEST_TMPDIR/runs.json\"
+    else
+        echo '{\"workflow_runs\": []}'
+    fi
+    exit 0
+fi
+echo '{}'
+"
+}
+
+# The JSON envelope (stdout only) of one dsr run in $json, its exit in $status.
+_dsr_json() {
+    status=0
+    json=$(harness_run_dsr --json "$@" 2>/dev/null) || status=$?
+}
+
+_minutes_ago() {
+    date -u -d "$1 minutes ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null ||
+        date -u -v-"$1"M +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# A queued run of release.yml, 15 minutes old, started by tag v1.2.3.
+_queued_release_run() {
+    printf '{"workflow_runs":[{"id":12345,"status":"queued","created_at":"%s","name":"Release","path":".github/workflows/release.yml","head_branch":"v1.2.3","html_url":"https://github.com/Dicklesworthstone/ntm/actions/runs/12345"}]}' \
+        "$(_minutes_ago 15)"
+}
+
+@test "dsr check defaults to every configured repo's release workflow" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs '{"workflow_runs": []}'
+
+    _dsr_json check
+    assert_equal "0" "$status"
+    grep -q 'api repos/Dicklesworthstone/ntm/actions/workflows/release.yml/runs' "$TEST_TMPDIR/gh.calls"
+    grep -q 'api repos/Dicklesworthstone/beads_viewer/actions/workflows/release.yml/runs' "$TEST_TMPDIR/gh.calls"
+    # A registry-only tool without a workflow is checked across workflows.
+    grep -q 'api repos/test/test-tool/actions/runs' "$TEST_TMPDIR/gh.calls"
+    echo "$json" | jq -e '.details.repos_checked ==
+            ["Dicklesworthstone/beads_viewer","Dicklesworthstone/ntm","test/test-tool"] and
+        .details.healthy == .details.repos_checked and .details.throttled == [] and .details.skipped == []'
+}
+
+@test "dsr check --all checks every workflow" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs '{"workflow_runs": []}'
+
+    run harness_run_dsr check --all ntm
+    assert_equal "0" "$status"
+    grep -q 'api repos/Dicklesworthstone/ntm/actions/runs' "$TEST_TMPDIR/gh.calls"
+    ! grep -q 'actions/workflows/' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "dsr check --json reports throttled runs in the documented shape" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+
+    _dsr_json check ntm
+    assert_equal "1" "$status"
+    echo "$json" | jq -e '.status == "partial" and .exit_code == 1 and
+        (.details.throttled | length) == 1 and
+        (.details.throttled[0] | .repo == "Dicklesworthstone/ntm" and .tool == "ntm" and
+            .workflow == "release.yml" and .run_id == 12345 and .status == "queued" and
+            .head_branch == "v1.2.3" and .queue_time_seconds >= 600 and .threshold_seconds == 600) and
+        .details.healthy == []'
+
+    # The envelope and details satisfy the published schemas.
+    if python3 -c 'import jsonschema' 2>/dev/null; then
+        printf '%s\n' "$json" > "$TEST_TMPDIR/check.json"
+        python3 -I - "$TEST_TMPDIR/check.json" "$DSR_PROJECT_ROOT/schemas" <<'PY'
+import json, sys, jsonschema
+doc = json.load(open(sys.argv[1]))
+for name, instance in (("envelope.json", doc), ("check-details.json", doc["details"])):
+    schema = json.load(open(f"{sys.argv[2]}/{name}"))
+    jsonschema.Draft202012Validator(schema).validate(instance)
+PY
+    fi
+}
+
+@test "dsr check reports an API failure as exit 8, never as healthy" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs ''
+
+    _dsr_json check ntm
+    assert_equal "8" "$status"
+    echo "$json" | jq -e '.status == "error" and .exit_code == 8 and .details.healthy == [] and
+        .details.skipped == [{"repo": "Dicklesworthstone/ntm", "reason": "failed to fetch runs"}]'
+}
+
+@test "dsr check uses the configured threshold unless --threshold is given" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+
+    DSR_THRESHOLD=3600 _dsr_json check ntm
+    assert_equal "0" "$status"
+    echo "$json" | jq -e '.details.threshold_seconds == 3600'
+
+    DSR_THRESHOLD=3600 run harness_run_dsr check ntm --threshold 300
+    assert_equal "1" "$status"
+
+    run harness_run_dsr check ntm --threshold soon
+    assert_equal "4" "$status"
+}
+
+@test "dsr watch reports a throttled run without starting a fallback by default" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+
+    run harness_run_dsr --json watch --once
+    assert_equal "0" "$status"
+    assert_contains "$output" "Throttled run detected: 12345"
+    assert_contains "$output" "dsr fallback ntm --version v1.2.3"
+    [[ ! -e "$DSR_STATE_DIR/fallback-12345.log" ]]
+    ! jq -e '.runs["12345"]' "$DSR_STATE_DIR/triggered.json" 2>/dev/null
+}
+
+@test "dsr watch --auto-fallback starts the tool's fallback at the run's tag" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+
+    run harness_run_dsr watch --once --auto-fallback --dry-run
+    assert_equal "0" "$status"
+    assert_contains "$output" "[DRY RUN] Would trigger fallback for ntm --version v1.2.3 (run 12345)"
+
+    run harness_run_dsr watch --once --auto-fallback
+    assert_equal "0" "$status"
+    assert_contains "$output" "Fallback started"
+    [[ -e "$DSR_STATE_DIR/fallback-12345.log" ]]
+    jq -e '.runs["12345"]' "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "dsr watch honors the global --dry-run" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+
+    run harness_run_dsr --dry-run watch --once --auto-fallback
+    assert_equal "0" "$status"
+    assert_contains "$output" "[DRY RUN] Would trigger fallback for ntm"
+    [[ ! -e "$DSR_STATE_DIR/fallback-12345.log" ]]
+}
+
+@test "dsr watch rejects unknown options and runs outside the checkout" {
+    run harness_run_dsr watch --frobnicate
+    assert_equal "4" "$status"
+
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs '{"workflow_runs": []}'
+    cd "$TEST_TMPDIR"
+    run harness_run_dsr watch --once
+    assert_equal "0" "$status"
+    assert_contains "$output" "Preflight check passed"
+}
+
 # ============================================================================
 # DSR REPOS TESTS
 # ============================================================================

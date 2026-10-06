@@ -410,10 +410,14 @@ dsr check [--repos <list>] [--threshold <seconds>] [--all]
 | `--threshold` | 600 | Queue time threshold (seconds) |
 | `--all` | false | Check all workflows, not just releases |
 
+A configured tool's `workflow` names its release workflow. The threshold
+defaults to `threshold_seconds` (or `DSR_THRESHOLD`).
+
 **Exit codes:**
 - `0`: No throttling detected
 - `1`: Throttling detected (triggers fallback recommendation)
-- `3`: gh auth or API error
+- `3`: gh auth missing
+- `8`: GitHub API error for a repo (listed in `details.skipped`), with no throttling seen elsewhere
 
 ---
 
