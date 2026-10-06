@@ -312,6 +312,21 @@ _act_ssh_exec() {
     # These command-construction tests return explicit transport receipts.
     # test_strict_cargo_private_cache.sh executes the real preparation, Cargo
     # mutation, final inventory and refusal paths on actual private inodes.
+    # Ordinary builds prepare a private stage-root cache the same way.
+    if [[ "$exit_code" -eq 0 && "$cmd" == *'dsr_seed_summary=$(_cargo_cache_run snapshot "$ambient_home"'* ]]; then
+        local nonstrict_home=""
+        while IFS= read -r command_line; do
+            [[ "$command_line" == "_dsr_cargo_home_guard '"* ]] || continue
+            nonstrict_home=${command_line#"_dsr_cargo_home_guard '"}
+            nonstrict_home=${nonstrict_home%\'}
+        done <<< "$cmd"
+        [[ -n "$nonstrict_home" ]] || return 99
+        jq -nc --arg home "$nonstrict_home" \
+            '{schema_version:1, mode:"private-copy", cargo_home:$home,
+              receipt_path:($home + "/.dsr-cache-seed.json"), receipt_sha256:("3" * 64),
+              inventory_sha256:("4" * 64), caches:[], file_count:0, size_bytes:0}'
+        return 0
+    fi
     if [[ "$exit_code" -eq 0 && ( "$cmd" == *DSR_PRIVATE_CACHE_COMPARE* ||
                                   "$cmd" == *DSR_PRIVATE_CACHE_SEED* ) ]]; then
         local fixture_source="" fixture_suffix="" fixture_home="" fixture_mode fixture_receipt

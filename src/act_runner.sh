@@ -4471,6 +4471,52 @@ _act_prepare_unix_private_cargo_home() {
     ' <<< "$summary"
 }
 
+# Ordinary (non-strict) Unix Rust builds stage their source under a fresh,
+# unique stage root. Create that root here and give it a private copy of the
+# ambient registry and Git download caches, so a cache prune or in-place write
+# on the build host cannot reach a running build (issue #15). Cargo may still
+# download missing dependencies into the private home. Prints the seed summary.
+_act_prepare_unix_nonstrict_cargo_home() {
+    local host="$1" isolation_root="$2" stage_root="$3" cargo_home="$4" command summary path
+    # Paths are embedded in single quotes below; build roots may contain spaces.
+    for path in "$isolation_root" "$stage_root" "$cargo_home"; do
+        [[ "$path" == /* && "$path" != *"'"* && "$path" != *..* &&
+           "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 4
+    done
+    [[ "$stage_root" == "${isolation_root%/}/dsr-build-"* &&
+       "$cargo_home" == "$stage_root/"* ]] || return 4
+    command=$'set -e\numask 077\n'
+    command+=$(_act_unix_cargo_cache_runtime) || return $?
+    command+=$'\n'"mkdir -p '$isolation_root'; $(_act_ram_backed_guard_sh "$isolation_root")"
+    command+=$'\n'"$(cat <<EOF
+dsr_ancestor='${stage_root%/*}'
+while test -n "\$dsr_ancestor"; do
+    for dsr_name in config config.toml; do
+        test ! -e "\$dsr_ancestor/.cargo/\$dsr_name"; test ! -L "\$dsr_ancestor/.cargo/\$dsr_name"
+    done
+    test "\$dsr_ancestor" = / && break
+    dsr_ancestor=\${dsr_ancestor%/*}; test -n "\$dsr_ancestor" || dsr_ancestor=/
+done
+test ! -e '$stage_root'; test ! -L '$stage_root'
+mkdir '$stage_root'; test -d '$stage_root'; test ! -L '$stage_root'
+ambient_home=\${CARGO_HOME:-\$HOME/.cargo}
+if test ! -e "\$ambient_home" && test ! -L "\$ambient_home"; then ambient_home=; fi
+dsr_seed_summary=\$(_cargo_cache_run snapshot "\$ambient_home" '$cargo_home')
+_dsr_cargo_home_guard '$cargo_home'
+printf '%s\\n' "\$dsr_seed_summary"
+EOF
+)"
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    # The summary names the physical home (symlinked build roots resolve).
+    jq -ce --arg name "${cargo_home##*/}" '
+        select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
+            (.cargo_home | type == "string" and startswith("/") and endswith("/" + $name)) and
+            .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
+            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+    ' <<< "$summary"
+}
+
 # Cargo may legitimately add/unpack dependencies in the private attempt home.
 # Preserve its initial receipt, then observe the final inventory; equality to
 # the seed is deliberately not required. Linked/special/config-bearing cache
@@ -6831,7 +6877,9 @@ act_run_native_build() {
         # target/linker settings) and ensure the target directory is absolute
         # before the source is staged outside the operator's home directory.
         # An absolute target keeps artifact collection deterministic after the
-        # working directory moves to the isolated source copy.
+        # working directory moves to the isolated source copy. On Unix hosts the
+        # fresh CARGO_HOME holds private dependency-cache copies, prepared by
+        # _act_prepare_unix_nonstrict_cargo_home just before the build runs.
         local nonstrict_env="" nonstrict_pair nonstrict_target_dir=""
         local isolation_uuid isolation_suffix isolation_root
         if [[ ! "$tool_name" =~ ^[A-Za-z0-9_.-]+$ || \
@@ -6989,6 +7037,7 @@ act_run_native_build() {
             --arg source_root "$nonstrict_source_root" \
             --arg cargo_home "$nonstrict_cargo_home" \
             --arg target_dir "$nonstrict_target_dir" \
+            --argjson windows "$nonstrict_windows_receipt" \
             --argjson sibling_roots "$nonstrict_sibling_roots_json" '
             {
                 mode: "ephemeral-staged-source",
@@ -7002,7 +7051,9 @@ act_run_native_build() {
                 sibling_roots: $sibling_roots,
                 ancestor_config_policy: "detect-original-and-reject-staging",
                 excluded_cargo_home_entries: ["config", "config.toml", "credentials", "credentials.toml"],
-                cache_reuse: ["registry"]
+                # Unix homes receive private cache copies before the build
+                # (dependency_cache.seed); Windows still links the registry.
+                cache_reuse: (if $windows then ["registry"] else [] end)
             }
         ') || return 4
     fi
@@ -7244,14 +7295,16 @@ act_run_native_build() {
             # the working directory, so merely changing CARGO_HOME is not an
             # isolation boundary.  /private/tmp (macOS) and /var/tmp (other
             # Unix) are outside the user's home; their own ancestor chain is
-            # checked before use.  A fresh CARGO_HOME reuses only the registry download
-            # caches and cannot contain aliases, patches, source replacement,
-            # credentials, or compiler settings.  Unique directories avoid
-            # cross-target races and require no destructive pre-build cleanup.
+            # checked before use.  The stage root and its fresh CARGO_HOME were
+            # created by _act_prepare_unix_nonstrict_cargo_home: the home holds
+            # private copies of the registry and Git download caches only, and
+            # cannot contain aliases, patches, source replacement, credentials,
+            # or compiler settings.  Unique directories avoid cross-target
+            # races and require no destructive pre-build cleanup.
             local isolation_root_q="${isolation_root//\'/\'\\\'\'}"
             local isolation_root_guard
             isolation_root_guard="mkdir -p '${isolation_root_q}'; $(_act_ram_backed_guard_sh "$isolation_root")"
-            cargo_home_prefix="${isolation_root_guard}_dsr_src='$rp_q'; _dsr_ancestor=\${_dsr_src%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do if test -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\" || test -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; then printf '[dsr] excluding inherited Cargo config: %s\\n' \"\$_dsr_ancestor/.cargo/\$_dsr_name\" >&2; fi; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; _dsr_ancestor='${nonstrict_stage_root%/*}'; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do test ! -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; test ! -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; test ! -e '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_stage_root}'; test -d '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; mkdir '${nonstrict_source_root}' '${nonstrict_cargo_home}'; ${sibling_copy_prefix}for _dsr_name in registry; do if test -d \"\$HOME/.cargo/\$_dsr_name\"; then ln -s \"\$HOME/.cargo/\$_dsr_name\" '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; fi; done; for _dsr_name in config config.toml credentials credentials.toml; do test ! -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; done; cp -R \"\$_dsr_src/.\" '${nonstrict_source_root}/'; if test -e '${nonstrict_source_root}/.git' || test -L '${nonstrict_source_root}/.git'; then git -C '${nonstrict_source_root}' status --porcelain --untracked-files=no >/dev/null; fi; export CARGO_HOME='${nonstrict_cargo_home}'; "
+            cargo_home_prefix="${isolation_root_guard}_dsr_src='$rp_q'; _dsr_ancestor=\${_dsr_src%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do if test -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\" || test -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; then printf '[dsr] excluding inherited Cargo config: %s\\n' \"\$_dsr_ancestor/.cargo/\$_dsr_name\" >&2; fi; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; _dsr_ancestor='${nonstrict_stage_root%/*}'; while test -n \"\$_dsr_ancestor\"; do for _dsr_name in config config.toml; do test ! -e \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; test ! -L \"\$_dsr_ancestor/.cargo/\$_dsr_name\"; done; test \"\$_dsr_ancestor\" = / && break; _dsr_ancestor=\${_dsr_ancestor%/*}; test -n \"\$_dsr_ancestor\" || _dsr_ancestor=/; done; test -d '${nonstrict_stage_root}'; test ! -L '${nonstrict_stage_root}'; test -d '${nonstrict_cargo_home}'; test ! -L '${nonstrict_cargo_home}'; test ! -e '${nonstrict_source_root}'; test ! -L '${nonstrict_source_root}'; mkdir '${nonstrict_source_root}'; ${sibling_copy_prefix}for _dsr_name in registry git; do if test -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; then test -d '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; fi; done; for _dsr_name in config config.toml credentials credentials.toml; do test ! -e '${nonstrict_cargo_home}'/\"\$_dsr_name\"; test ! -L '${nonstrict_cargo_home}'/\"\$_dsr_name\"; done; cp -R \"\$_dsr_src/.\" '${nonstrict_source_root}/'; if test -e '${nonstrict_source_root}/.git' || test -L '${nonstrict_source_root}/.git'; then git -C '${nonstrict_source_root}' status --porcelain --untracked-files=no >/dev/null; fi; export CARGO_HOME='${nonstrict_cargo_home}'; "
             cd_cmd="cd '${nonstrict_source_root}'"
         fi
         if [[ -n "$output_stage_root" ]]; then
@@ -7351,10 +7404,50 @@ act_run_native_build() {
         trap '_act_stage_cleanup_on_signal 143' TERM
     fi
 
+    # Ordinary Unix Rust builds: create the stage root with a private copy of
+    # the dependency caches before the build command runs (issue #15).
+    local exit_code=0
+    local nonstrict_private_cargo_cache=false nonstrict_cargo_seed_json="" nonstrict_seed_home=""
+    if $nonstrict_rust_isolate && ! _act_is_windows_host "$host"; then
+        local nonstrict_prepare_status=0
+        nonstrict_cargo_seed_json=$(_act_prepare_unix_nonstrict_cargo_home "$host" \
+            "$isolation_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>"$log_file") || \
+            nonstrict_prepare_status=$?
+        [[ -s "$log_file" ]] && cat "$log_file" >&2
+        if [[ $nonstrict_prepare_status -eq 0 ]] && \
+           nonstrict_seed_home=$(jq -er '.cargo_home' <<< "$nonstrict_cargo_seed_json") && \
+           cargo_isolation_json=$(jq --argjson seed "$nonstrict_cargo_seed_json" \
+               '.dependency_cache = {mode: "private-copy", seed: $seed}' <<< "$cargo_isolation_json"); then
+            nonstrict_private_cargo_cache=true
+        else
+            _log_error "Unable to prepare a private Cargo dependency cache on $host (requires Python 3.9+); not building $platform" 2>&1 | tee -a "$log_file" >&2
+            exit_code=4
+        fi
+    fi
+
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
-    _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
-    local exit_code=${PIPESTATUS[0]}
+    if [[ $exit_code -eq 0 ]]; then
+        if $nonstrict_private_cargo_cache; then
+            _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee -a "$log_file"
+        else
+            _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
+        fi
+        exit_code=${PIPESTATUS[0]}
+    fi
+    if [[ $exit_code -eq 0 ]] && $nonstrict_private_cargo_cache; then
+        local nonstrict_cargo_final_json nonstrict_cargo_seed_digest
+        nonstrict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$nonstrict_cargo_seed_json") || exit_code=4
+        if [[ $exit_code -eq 0 ]] && \
+           nonstrict_cargo_final_json=$(_act_finish_unix_private_cargo_home \
+               "$host" "$nonstrict_seed_home" "$nonstrict_cargo_seed_digest"); then
+            cargo_isolation_json=$(jq --argjson final "$nonstrict_cargo_final_json" \
+                '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
+        else
+            _log_error "Private Cargo cache failed final verification; refusing artifact collection"
+            exit_code=4
+        fi
+    fi
     if [[ $exit_code -eq 0 ]] && $strict_private_cargo_cache; then
         local strict_cargo_final_json strict_cargo_seed_digest
         strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4

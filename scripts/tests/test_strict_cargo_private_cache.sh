@@ -100,6 +100,7 @@ ACT_LOGS_DIR=$DSR_TEST_LOGS
 _act_is_windows_host() { return 1; }
 _act_is_local_host() { return 0; }
 _act_get_host_platform() { printf '%s\n' "$DSR_TEST_PLATFORM"; }
+_act_get_host_build_root() { printf '%s\n' "${DSR_TEST_BUILD_ROOT:-}"; }
 act_get_native_host() { printf 'cache-fixture\n'; }
 _act_ssh_exec() { bash -c "$2"; }
 "$@"
@@ -253,5 +254,82 @@ check('concurrent targets own independent cache inodes and mutations',
       invoke(['bash', root / 'src/cargo_cache.sh', 'verify', parallel_homes[1],
               parallel_summaries[1]['receipt_path']]).returncode == 0)
 
-print(f'Strict native Unix Cargo cache: {checks} assertions passed; real offline compilation and local transport.', flush=True)
+# Ordinary (non-strict) native builds stage their source under a fresh root and
+# previously linked the ambient registry into it (issue #15). They now receive
+# the same private copies. Build a fresh ambient with the cached Git
+# dependency, then make the dependency's origin disappear.
+ordinary_ambient = work / 'ordinary-ambient'
+ordinary_ambient.mkdir()
+(work / 'retained-dependency').rename(dependency)
+ordinary_env = dict(environment, CARGO_HOME=str(ordinary_ambient))
+require(['cargo', 'metadata', '--format-version', '1', '--manifest-path', source / 'Cargo.toml'], env=ordinary_env)
+dependency.rename(work / 'retained-ordinary-dependency')
+ordinary_registry = ordinary_ambient / 'registry/cache/fixture/payload.crate'
+ordinary_registry.parent.mkdir(parents=True)
+ordinary_registry.write_bytes(b'ordinary registry marker\n')
+(ordinary_ambient / 'config.toml').write_text('[build]\nrustc-wrapper="/untrusted/operator-wrapper"\n')
+(ordinary_ambient / 'credentials.toml').write_text('private credentials must not be copied\n')
+ordinary_build_root = work / 'ordinary-build-root'
+ordinary_build_root.mkdir()
+ordinary_env['DSR_TEST_BUILD_ROOT'] = str(ordinary_build_root)
+wiped_ambient = work / 'ordinary-ambient-wiped'
+
+
+def ordinary_build(label, mutation='', successful=True, preparation=''):
+    probe = work / ('ordinary-home-' + str(checks))
+    command = ('printf "%s\\n" "$CARGO_HOME" > "$DSR_CACHE_PROBE"; ' + preparation +
+               'cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET"; ' + mutation)
+    configuration = {
+        'tool_name': 'cache-probe', 'repo': 'fixture/cache-probe', 'local_path': str(source),
+        'language': 'rust', 'binary_name': 'cache-probe', 'build_profile': 'debug',
+        'linux_glibc_floor': 'native', 'build_cmd': command,
+        'env': {'CARGO_BUILD_TARGET': triple, 'DSR_CACHE_PROBE': str(probe),
+                'DSR_ORDINARY_AMBIENT': str(ordinary_ambient), 'DSR_WIPED_AMBIENT': str(wiped_ambient)},
+    }
+    (configs / 'cache-probe.yaml').write_text(json.dumps(configuration))
+    result = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', 'ordinary-run', env=ordinary_env)
+    rows = [line for line in result.stdout.splitlines() if line.startswith(b'{')]
+    report = json.loads(rows[-1]) if rows else {}
+    if not (result.returncode == 0 if successful else result.returncode != 0):
+        print(result.stderr.decode(), flush=True)
+    if successful:
+        check(label, result.returncode == 0 and report.get('status') == 'success')
+    else:
+        check(label, result.returncode != 0 and report.get('status') != 'success' and
+              not report.get('artifact_paths') and not report.get('collected_sha256'))
+    return report, Path(probe.read_text().strip()) if probe.exists() else None
+
+
+# The ambient cache disappears after the build has started (a disk-hygiene
+# pass on the host): the offline build must still find every dependency.
+report, ordinary_home = ordinary_build(
+    'ordinary native build compiles offline after the ambient cache is wiped mid-build',
+    preparation='mv "$DSR_ORDINARY_AMBIENT" "$DSR_WIPED_AMBIENT"; ')
+wiped_ambient.rename(ordinary_ambient)
+isolation = report['cargo_isolation']
+cache = isolation.get('dependency_cache', {})
+check('ordinary result records a private copy instead of ambient cache reuse',
+      isolation['mode'] == 'ephemeral-staged-source' and isolation['cache_reuse'] == [] and
+      cache.get('mode') == 'private-copy' and cache['seed']['mode'] == 'private-copy' and
+      cache['final']['mode'] == 'inventory' and sorted(cache['seed']['caches']) == ['git', 'registry'])
+check('ordinary build ran with the recorded private Cargo home inside its stage root',
+      ordinary_home is not None and ordinary_home.resolve() == Path(cache['seed']['cargo_home']) and
+      str(ordinary_home).startswith(str(ordinary_build_root) + '/dsr-build-cache-probe-'))
+ordinary_private_registry = ordinary_home / 'registry/cache/fixture/payload.crate'
+check('ordinary private registry bytes are copied onto independent inodes',
+      ordinary_private_registry.read_bytes() == b'ordinary registry marker\n' and
+      not ordinary_private_registry.is_symlink() and
+      ordinary_private_registry.stat().st_ino != ordinary_registry.stat().st_ino and
+      not (ordinary_home / 'registry').is_symlink())
+check('ordinary private home excludes ambient configuration and credentials',
+      not (ordinary_home / 'config.toml').exists() and not (ordinary_home / 'credentials.toml').exists())
+check('ordinary collected executable runs with the committed dependency bytes',
+      require([report['artifact_path']]).strip() == '42')
+ordinary_build('a config-bearing ordinary private home refuses artifact admission',
+               'printf config > "$CARGO_HOME/config.toml"', False)
+_, second_ordinary_home = ordinary_build('a second ordinary build compiles with a fresh private home')
+check('ordinary builds never share a Cargo home',
+      second_ordinary_home is not None and second_ordinary_home != ordinary_home)
+
+print(f'Native Unix Cargo cache: {checks} assertions passed; real offline compilation and local transport.', flush=True)
 PY

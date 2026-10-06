@@ -259,9 +259,21 @@ they do not protect against a build host rewriting all its evidence.
 
 The copies include the complete selected cache trees and remain alongside the
 strict snapshot, so allow disk space for the retained seed and each metadata or
-target attempt. Native Windows and ordinary non-strict native builds still
-share ambient dependency caches; the native Unix repair does not close those
-remaining parts of [issue #15](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/15).
+target attempt.
+
+Ordinary (non-strict) native Unix Rust builds get the same protection. Each
+target's fresh stage root receives a private copy of the ambient `registry` and
+`git` caches (`${CARGO_HOME:-~/.cargo}`) before its build command starts, never
+the ambient configuration or credentials, so pruning or rewriting the host's
+Cargo cache cannot break a running build. Cargo may still download missing
+dependencies into the private home. After a successful build the private
+home's final inventory is checked like a strict one; configuration, links or
+special files added there refuse artifact collection. The result records
+`cargo_isolation.dependency_cache.seed`/`.final` with `cache_reuse: []`. This
+also requires Python 3.9+ on the build host, and the copy is removed with the
+stage root unless `DSR_KEEP_BUILD_STAGES=1`. Native Windows builds still link
+the ambient registry, the remaining part of
+[issue #15](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/15).
 The cargo-xwin backend already uses private dependency copies separately.
 
 Strict native Unix Rust builds can opt into a host-local intermediate cache with
