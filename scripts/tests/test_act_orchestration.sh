@@ -3253,6 +3253,36 @@ else
     fail "strict Unix sync refused an intact extracted checkout (status $strict_unix_admit_status)"
 fi
 
+# Issue #22: a verifier that exceeds DSR_SYNC_TIMEOUT names the host, the
+# snapshot and the remedy instead of failing as an anonymous sync error.
+strict_unix_timeout_root="$TEMP_DIR/strict-unix-timeout/run/source"
+strict_unix_timeout_stderr="$TEMP_DIR/strict-unix-timeout.stderr"
+strict_unix_timeout_status=0
+(
+    _act_is_local_host() { return 1; }
+    _act_is_windows_host() { return 1; }
+    _act_get_ssh_destination() { printf 'mock-unix\n'; }
+    _act_run_with_timeout() {
+        shift
+        [[ "${!#}" == *'--stdin-paths'* ]] && return 124
+        "$@"
+    }
+    ssh() {
+        local remote_command; remote_command=$(_test_decode_remote_command "${!#}")
+        "$BASH" -c "$remote_command"
+    }
+    _act_sync_strict_checkout \
+        "mmini" "$strict_sync_repo" "$strict_sync_sha" "$strict_unix_timeout_root" \
+        "source.tar" "unix-timeout"
+) >/dev/null 2>"$strict_unix_timeout_stderr" || strict_unix_timeout_status=$?
+if [[ $strict_unix_timeout_status -eq 4 ]] && \
+   grep -Fq "verification of $strict_unix_timeout_root on mmini timed out" "$strict_unix_timeout_stderr" && \
+   grep -Fq 'raise DSR_SYNC_TIMEOUT and resume' "$strict_unix_timeout_stderr"; then
+    pass "strict verifier timeout names the host, snapshot and remedy"
+else
+    fail "strict verifier timeout was not diagnosed (status $strict_unix_timeout_status)"
+fi
+
 cat > "$ACT_REPOS_DIR/stdinlooptest.yaml" << EOF
 tool_name: stdinlooptest
 repo: Test/stdinlooptest

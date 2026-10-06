@@ -5161,10 +5161,19 @@ _act_run_strict_snapshot_verifier() {
         remote_cmd=$(_act_unix_strict_snapshot_verify_script "$remote_path" "$remote_archive" \
             "$remote_manifest" "$expected_manifest_digest" "$expected_object_count") || return 4
     fi
+    local verify_status=0
     verify_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh \
         -n \
         -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-        -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_cmd") || return 4
+        -o StrictHostKeyChecking=accept-new "$ssh_destination" "$remote_cmd") || verify_status=$?
+    if [[ $verify_status -eq 124 ]]; then
+        # Large trees can exceed the default window (issue #22). Nothing was
+        # admitted; resume with a longer bound keeps every other check.
+        _log_error "Strict source verification of $remote_path on $host timed out after ${_ACT_SYNC_TIMEOUT}s; raise DSR_SYNC_TIMEOUT and resume"
+        return 4
+    elif [[ $verify_status -ne 0 ]]; then
+        return 4
+    fi
     digests=$(printf '%s\n' "$verify_output" | tr -d '\r' | tail -1 | tr '[:upper:]' '[:lower:]')
     [[ "$digests" =~ ^[0-9a-f]{64}\ [0-9a-f]{64}$ ]] || return 4
     printf '%s\n' "$digests"
