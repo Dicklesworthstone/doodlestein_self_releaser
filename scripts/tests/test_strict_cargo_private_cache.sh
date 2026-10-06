@@ -198,6 +198,25 @@ check('native result records private ownership and both inventories',
       cache['final']['file_count'] > cache['seed']['file_count'])
 check('native environment and receipt bind the actual attempt home',
       str(first_home) == report['build_influence_env']['CARGO_HOME'] == isolation['cargo_home'] == cache['seed']['cargo_home'])
+# bd-10we: the build's own shell attested the executables it ran.
+toolchain = isolation.get('toolchain', {})
+tools = toolchain.get('tools', {})
+
+
+def attested(record):
+    path = Path(record.get('resolved_path') or record['selected_path'])
+    return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == (
+        record.get('resolved_sha256') or record['selected_sha256'])
+
+
+check('strict build records cargo, rustc and linker identities from the build shell',
+      toolchain.get('schema_version') == 1 and toolchain.get('target_triple') == triple and
+      {'cargo', 'rustc', 'linker'} <= set(tools) and all(attested(tools[name]) for name in ('cargo', 'rustc', 'linker')))
+check('attested rustc is the compiler that reports the build host',
+      'host: ' in tools['rustc']['version'] and tools['rustc']['version'].startswith('rustc '))
+check('toolchain receipt lives beside the snapshot, never inside it',
+      Path(toolchain['cwd']).resolve() == source.resolve() and
+      not any(source.rglob('.dsr-toolchain-*')) and any(source.parent.glob('.dsr-toolchain-*.json')))
 check('collected executable runs with the committed dependency bytes',
       require([report['artifact_path']]).strip() == '42')
 check('native build preserves the retained source seed receipt', digest(seed / '.dsr-cache-seed.json') == seed_receipt_hash)
@@ -214,6 +233,11 @@ for label, mutation in (
     ('ambient hardlink graft', 'ln "$DSR_AMBIENT_CACHE_FILE" "$CARGO_HOME/registry/ambient-hardlink"'),
     ('special cache object', 'mkfifo "$CARGO_HOME/registry/fifo"'),
     ('modified seed receipt', 'printf "\\n" >> "$CARGO_HOME/.dsr-cache-seed.json"'),
+    # A build that swaps the compiler on PATH after compiling cannot have its
+    # artifacts attested by the identities recorded before it ran.
+    ('toolchain change during the build',
+     'mkdir -p "$CARGO_HOME/../swapped-bin"; ln -sf /bin/true "$CARGO_HOME/../swapped-bin/rustc"; '
+     'export PATH="$CARGO_HOME/../swapped-bin:$PATH"'),
 ):
     build(label + ' refuses artifact admission after successful compilation', mutation, False)
 

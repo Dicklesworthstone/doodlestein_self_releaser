@@ -312,6 +312,16 @@ _act_ssh_exec() {
     # These command-construction tests return explicit transport receipts.
     # test_strict_cargo_private_cache.sh executes the real preparation, Cargo
     # mutation, final inventory and refusal paths on actual private inodes.
+    # Strict Unix builds read back the toolchain identity their own shell
+    # recorded; test_strict_cargo_private_cache.sh probes real executables.
+    if [[ "$exit_code" -eq 0 && "$cmd" =~ ^cat\ \'/[^\']*/\.dsr-toolchain-[^\']+\.json\'$ ]]; then
+        jq -nc '
+            def tool($name): {program: $name, selected_path: ("/fixture/bin/" + $name),
+                selected_sha256: ("5" * 64), selected_kind: "executable", version: ($name + " 1.0.0")};
+            {schema_version: 1, cwd: "/remote/fixture", target_triple: "", linker_variable: null,
+             tools: {cargo: tool("cargo"), rustc: tool("rustc"), linker: tool("cc")}}'
+        return 0
+    fi
     # Ordinary builds prepare a private stage-root cache the same way.
     if [[ "$exit_code" -eq 0 && "$cmd" == *'dsr_seed_summary=$(_cargo_cache_run snapshot "$ambient_home"'* ]]; then
         local nonstrict_home=""
@@ -1126,6 +1136,13 @@ test_unix_rust_sdk_environment() {
         # Execute the actual generated environment portion without staging a
         # source tree or running a compiler. The configured build command is env.
         launch="for sdk_variable in ${cmd#*for sdk_variable in }"
+        # The strict toolchain attestation heredocs write receipts beside a
+        # real snapshot; test_strict_cargo_private_cache.sh runs them for real.
+        launch=$(printf '%s\n' "$launch" | awk '
+            skip && /^DSR_TOOLCHAIN_IDENTITY_PY$/ { skip = 0; next }
+            skip { next }
+            match($0, /python3 -I - (record|verify) /) { print substr($0, 1, RSTART - 1); skip = 1; next }
+            { print }')
         observed=$(OPENSSL_DIR=/ambient/openssl OPENSSL_NO_VENDOR=1 \
             X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=/ambient/target-openssl \
             PKG_CONFIG=/ambient/pkg-config TARGET_PKG_CONFIG_PATH=/ambient/target-pc \

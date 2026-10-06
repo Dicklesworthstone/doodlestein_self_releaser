@@ -6478,6 +6478,138 @@ PY
     printf 'DSR_CARGO_CACHE_PY\n'
 }
 
+# Emit a host-side probe of the executables a strict Unix Rust build actually
+# uses (bd-10we). It runs inside the build shell, after the build environment
+# is exported and the working directory is entered, so PATH shims, rustup
+# overrides and configured linkers resolve exactly as they do for the build.
+# Mode "record" writes the identity JSON to <output> without clobbering;
+# mode "verify" re-probes after the build and fails if any identity changed.
+# Each tool records the selected executable (what the shell runs) and, for
+# rustup proxies, launcher scripts and Apple /usr/bin compiler launchers, the
+# executable it dispatches to, with SHA-256 digests and verbose versions.
+# Args: mode output_json build_cmd extra_tools(space-separated)
+_act_toolchain_identity_script() {
+    local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}"
+    local output_q command_q extra_q
+    [[ "$mode" == record || "$mode" == verify ]] || return 4
+    [[ "$output" == /* && "$output" != *..* ]] || return 4
+    printf -v output_q '%q' "$output"
+    printf -v command_q '%q' "$build_cmd"
+    printf -v extra_q '%q' "$extra_tools"
+    printf 'python3 -I - %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$mode" "$output_q" "$command_q" "$extra_q"
+    cat <<'PY'
+import hashlib, json, os, pathlib, re, shutil, subprocess, sys
+
+mode, output, command, extra = sys.argv[1:5]
+
+def fail(message):
+    sys.stderr.write('[dsr] toolchain identity: ' + message + '\n')
+    sys.exit(86)
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1048576), b''):
+            h.update(block)
+    return h.hexdigest()
+
+def run(argv):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail('cannot run ' + argv[0] + ': ' + str(error))
+    return (result.stdout or result.stderr).strip()
+
+def is_script(path):
+    with open(path, 'rb') as stream:
+        return stream.read(2) == b'#!'
+
+rustup = shutil.which('rustup')
+rustup_digest = digest(pathlib.Path(rustup).resolve()) if rustup else None
+
+def identity(name, program, version_args, rustup_tool=None, required=True):
+    selected = shutil.which(program)
+    if not selected:
+        if required:
+            fail('required executable not found on the build PATH: ' + program)
+        return None
+    selected = pathlib.Path(selected)
+    resolved_selected = selected.resolve()
+    version = run([str(selected), *version_args])
+    if version_args != ['-vV']:
+        version = version.splitlines()[0] if version else ''
+    record = {'program': program, 'selected_path': str(selected),
+              'selected_sha256': digest(resolved_selected),
+              'selected_kind': 'script' if is_script(resolved_selected) else 'executable',
+              'version': version}
+    actual = None
+    proxy = rustup_digest is not None and record['selected_sha256'] == rustup_digest
+    if rustup_tool and rustup and (proxy or record['selected_kind'] == 'script'):
+        which = run([rustup, 'which', rustup_tool])
+        if which and pathlib.Path(which).is_file():
+            actual = pathlib.Path(which).resolve()
+    if sys.platform == 'darwin' and str(resolved_selected) in (
+            '/usr/bin/cc', '/usr/bin/c++', '/usr/bin/clang', '/usr/bin/clang++', '/usr/bin/ld'):
+        tool = {'/usr/bin/c++': 'clang++', '/usr/bin/clang++': 'clang++', '/usr/bin/ld': 'ld'}.get(
+            str(resolved_selected), 'clang')
+        found = run(['xcrun', '--find', tool])
+        if found and pathlib.Path(found).is_file():
+            actual = pathlib.Path(found).resolve()
+    if actual is not None and actual != resolved_selected:
+        record['resolved_path'] = str(actual)
+        record['resolved_sha256'] = digest(actual)
+        record['resolved_kind'] = 'script' if is_script(actual) else 'executable'
+    return record
+
+triple = os.environ.get('CARGO_BUILD_TARGET', '')
+linker_variable = 'CARGO_TARGET_' + re.sub(r'[^A-Za-z0-9]', '_', triple).upper() + '_LINKER' if triple else ''
+linker = os.environ.get(linker_variable, '') if linker_variable else ''
+tools = {'cargo': identity('cargo', 'cargo', ['-vV'], 'cargo'),
+         'rustc': identity('rustc', os.environ.get('RUSTC') or 'rustc', ['-vV'], 'rustc')}
+# An explicitly configured linker must exist; the default cc may legitimately
+# be absent on hosts that link through cargo-zigbuild.
+default_linker = identity('linker', linker or 'cc', ['--version'], required=bool(linker))
+if default_linker:
+    tools['linker'] = default_linker
+# Cargo subcommands named by the build command, and helpers DSR itself routes
+# the build through (cargo-zigbuild and zig for the portable glibc floor).
+plugins = set(re.findall(r'(?:^|[\s;&|(])cargo\s+(?:\+[\w.-]+\s+)?([a-z][a-z0-9-]*)', command))
+plugins.update(name[len('cargo-'):] for name in extra.split() if name.startswith('cargo-'))
+for sub in sorted(plugins):
+    program = 'cargo-' + sub
+    if shutil.which(program):
+        tools[program] = identity(program, program, ['--version'], program, required=False)
+for name in sorted(set(extra.split())):
+    if not name.startswith('cargo-') and name not in tools:
+        record = identity(name, name, ['version' if name == 'zig' else '--version'], required=False)
+        if record:
+            tools[name] = record
+result = {'schema_version': 1, 'cwd': os.getcwd(), 'target_triple': triple,
+          'linker_variable': linker_variable if linker else None, 'tools': tools}
+
+if mode == 'record':
+    try:
+        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        fail('cannot create identity receipt ' + output + ': ' + str(error))
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(result, stream, sort_keys=True)
+        stream.write('\n')
+else:
+    try:
+        with open(output) as stream:
+            recorded = json.load(stream)
+    except (OSError, ValueError) as error:
+        fail('cannot read identity receipt ' + output + ': ' + str(error))
+    if recorded != result:
+        changed = sorted(name for name in set(recorded.get('tools', {})) | set(tools)
+                         if recorded.get('tools', {}).get(name) != tools.get(name))
+        fail('build toolchain changed during the build (' + (', '.join(changed) or 'context') +
+             '); refusing to collect its artifacts')
+PY
+    printf 'DSR_TOOLCHAIN_IDENTITY_PY\n'
+}
+
 # Run native build on remote host via SSH
 # Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
 #        [remote_path_override] [release_git_sha] [release_git_ref] [bound_host]
@@ -6707,7 +6839,7 @@ act_run_native_build() {
     local strict_native_build=false
     [[ -n "$remote_path_override" ]] && strict_native_build=true
     local strict_rust_build=false
-    local strict_private_cargo_cache=false strict_cargo_seed_json='null'
+    local strict_private_cargo_cache=false strict_cargo_seed_json='null' strict_toolchain_receipt=""
     local build_influence_env_json='{}'
     local cargo_isolation_json='null'
     local nonstrict_stage_root="" nonstrict_source_root="" nonstrict_cargo_home=""
@@ -6811,6 +6943,9 @@ act_run_native_build() {
                 return 4
             fi
             strict_private_cargo_cache=true
+            # Per-attempt toolchain identity receipt beside the snapshot; the
+            # snapshot itself must stay byte-identical.
+            strict_toolchain_receipt="${remote_path%/*}/.dsr-toolchain-${platform//\//-}-${cargo_attempt//-/}.json"
         fi
         strict_build_env+=$'\n'"CARGO_HOME=$strict_cargo_home"
         build_env="$strict_build_env"
@@ -7358,13 +7493,23 @@ act_run_native_build() {
                 env_exports+="export PATH='${zig_shim_dir}':\"\$PATH\"; "
             fi
         fi
+        local effective_build="$build_cmd"
         if [[ -n "$strict_cache_root" ]]; then
-            local cached_build
-            cached_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd") || return 4
-            remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$cached_build"
-        else
-            remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$build_cmd"
+            effective_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd") || return 4
         fi
+        if [[ -n "$strict_toolchain_receipt" ]]; then
+            # Attest the toolchain in the build's own shell, then require the
+            # same identities once the build has finished (bd-10we).
+            local toolchain_extra="" toolchain_record toolchain_verify
+            [[ -n "$rust_zig_target" ]] && toolchain_extra="cargo-zigbuild zig"
+            toolchain_record=$(_act_toolchain_identity_script record \
+                "$strict_toolchain_receipt" "$build_cmd" "$toolchain_extra") || return 4
+            toolchain_verify=$(_act_toolchain_identity_script verify \
+                "$strict_toolchain_receipt" "$build_cmd" "$toolchain_extra") || return 4
+            # $(...) dropped each heredoc terminator's newline; restore it.
+            effective_build="$toolchain_record"$'\n'"$effective_build"$'\n'"$toolchain_verify"$'\n'
+        fi
+        remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$effective_build"
     fi
 
     local build_transport_timeout="$_ACT_BUILD_TIMEOUT"
@@ -7458,6 +7603,29 @@ act_run_native_build() {
                 '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
         else
             _log_error "Strict private Cargo cache failed final verification; refusing artifact collection"
+            exit_code=4
+        fi
+    fi
+    if [[ $exit_code -eq 0 && -n "$strict_toolchain_receipt" ]]; then
+        # The build command already re-probed and compared every identity;
+        # bind the attested executables into the target's isolation receipt.
+        local toolchain_identity_json=""
+        if toolchain_identity_json=$(_act_ssh_exec "$host" "cat '$strict_toolchain_receipt'" 30) && \
+           toolchain_identity_json=$(jq -ce '
+                select(type == "object" and .schema_version == 1 and
+                    (.cwd | type == "string" and startswith("/")) and
+                    (.tools | type == "object") and
+                    (.tools as $tools | all(("cargo", "rustc");
+                        $tools[.] | type == "object" and
+                        (.selected_path | type == "string" and startswith("/")) and
+                        (.selected_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                        (.version | type == "string" and length > 0))))
+            ' <<< "$toolchain_identity_json") && \
+           cargo_isolation_json=$(jq --argjson toolchain "$toolchain_identity_json" \
+               '.toolchain = $toolchain' <<< "$cargo_isolation_json"); then
+            :
+        else
+            _log_error "Strict toolchain identity receipt missing or invalid; refusing artifact collection"
             exit_code=4
         fi
     fi

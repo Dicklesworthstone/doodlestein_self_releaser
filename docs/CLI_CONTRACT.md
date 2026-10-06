@@ -559,11 +559,22 @@ unpublished and suppresses dispatch and upgrade hooks.
 
 Strict native builds trust the configured build host and its installed
 compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and
-records the explicit build-influence environment, but it does not yet attest
-the executable paths or hashes of the host toolchain. The tracked
-`rust-toolchain.toml`, source revisions, and final artifact hashes remain part
-of the release evidence; resistance to a compromised host toolchain is outside
-the current contract.
+records the explicit build-influence environment. On Unix hosts, strict Rust
+builds also attest the toolchain they ran: inside the build's own shell (same
+working directory, environment and PATH, including DSR's glibc-floor shim),
+just before the configured command, DSR records the selected `cargo`, `rustc`,
+linker (`CARGO_TARGET_<TRIPLE>_LINKER` or `cc`), the Cargo subcommands the
+command names, and `cargo-zigbuild`/`zig` when DSR routes through them, each
+with its path, SHA-256 and verbose version. rustup proxies, launcher scripts
+and Apple `/usr/bin` compiler launchers are also resolved to the executable
+they dispatch to. The same probe runs again after the build; any difference
+refuses artifact collection. The receipt is bound into the target result and
+the manifest as `build_environments[].cargo_isolation.toolchain`. It is
+evidence recorded by the build host, not a defense against a host that
+rewrites its own executables and receipts, and it does not cover dynamically
+loaded libraries or every compiler subprocess. Native Windows hosts still
+rely on the trusted-host contract. The tracked `rust-toolchain.toml`, source
+revisions, and final artifact hashes remain part of the release evidence.
 
 GitHub does not document a conditional compare-and-swap operation that covers a
 release, its assets, and its tag in one transaction. A same-credential actor can

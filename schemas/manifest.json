@@ -216,6 +216,39 @@
         }
       }
     },
+    "toolchain_executable": {
+      "type": "object",
+      "description": "One executable as resolved in the strict build shell: the PATH selection and, for rustup proxies, launcher scripts and Apple launchers, the executable it dispatches to.",
+      "required": ["program", "selected_path", "selected_sha256", "selected_kind", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "program": {"type": "string", "minLength": 1},
+        "selected_path": {"type": "string", "pattern": "^/"},
+        "selected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "selected_kind": {"enum": ["executable", "script"]},
+        "version": {"type": "string"},
+        "resolved_path": {"type": "string", "pattern": "^/"},
+        "resolved_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "resolved_kind": {"enum": ["executable", "script"]}
+      }
+    },
+    "toolchain_identity": {
+      "type": "object",
+      "description": "Strict native Unix Rust toolchain attestation, recorded in the build shell before the build and required unchanged after it.",
+      "required": ["schema_version", "cwd", "target_triple", "tools"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "cwd": {"type": "string", "pattern": "^/"},
+        "target_triple": {"type": "string"},
+        "linker_variable": {"type": ["string", "null"]},
+        "tools": {
+          "type": "object",
+          "required": ["cargo", "rustc"],
+          "additionalProperties": {"$ref": "#/$defs/toolchain_executable"}
+        }
+      }
+    },
     "cargo_cache_summary": {
       "type": "object",
       "required": [
@@ -273,6 +306,7 @@
           },
           "uniqueItems": true
         },
+        "toolchain": {"$ref": "#/$defs/toolchain_identity"},
         "dependency_cache": {
           "type": "object",
           "description": "The final inventory is present only after successful Cargo execution and cache admission; failed targets retain their seed evidence.",
