@@ -9,12 +9,12 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: unix-snapshot-repair-intel
+  group: unix-snapshot-repair-linux-slim
   cancel-in-progress: false
 jobs:
   verify-repair:
     if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser'
-    runs-on: macos-15-intel
+    runs-on: ubuntu-slim
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -24,11 +24,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for tool in jq go minisign; do
-            command -v "$tool" >/dev/null || brew install "$tool"
-          done
-          if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3 git jq gcc tar gzip zip unzip xz-utils minisign golang-go gh
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
@@ -45,8 +42,8 @@ jobs:
           test ! -e scripts/tests/test_legacy_checksum_aggregate.sh
           gh api "repos/$GITHUB_REPOSITORY/git/blobs/8d7216779f4169ba76d558c511c9345c7391e05d" --jq .content | base64 -d > "$RUNNER_TEMP/aggregate.patch"
           gh api "repos/$GITHUB_REPOSITORY/git/blobs/b8c1e544ad00074b4b4f149b12c52a3b4734f6a3" --jq .content | base64 -d > "$RUNNER_TEMP/snapshot.patch"
-          echo "75e5c2c9787735f70563b5b7b547cebc543b48631a34a38ff6c97a619d9e63fb  $RUNNER_TEMP/aggregate.patch" | shasum -a 256 --check
-          echo "a7a9e33ceae3231ae9700318f45c3273a9e1fa957d6ec0c84b6bd0613d911db7  $RUNNER_TEMP/snapshot.patch" | shasum -a 256 --check
+          echo "75e5c2c9787735f70563b5b7b547cebc543b48631a34a38ff6c97a619d9e63fb  $RUNNER_TEMP/aggregate.patch" | sha256sum --check
+          echo "a7a9e33ceae3231ae9700318f45c3273a9e1fa957d6ec0c84b6bd0613d911db7  $RUNNER_TEMP/snapshot.patch" | sha256sum --check
           gh api "repos/$GITHUB_REPOSITORY/git/blobs/d9c6a7144ae973d2538e263f5339895e695d13b9" --jq .content | base64 -d > scripts/tests/test_legacy_checksum_aggregate.sh
           gh api "repos/$GITHUB_REPOSITORY/git/blobs/07fd9a26af90cf07a60986b1f9b61dfe2766c6ef" --jq .content | base64 -d > scripts/tests/test_unix_snapshot_batch.sh
           test "$(git hash-object scripts/tests/test_legacy_checksum_aggregate.sh)" = d9c6a7144ae973d2538e263f5339895e695d13b9
