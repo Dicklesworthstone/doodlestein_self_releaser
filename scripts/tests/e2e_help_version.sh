@@ -329,6 +329,7 @@ test_help_flag_with_json() {
 test_global_json_after_subcommand() {
     ((TESTS_RUN++))
     harness_setup
+    harness_create_config
 
     exec_run "$DSR_CMD" status --json
     if [[ "$(exec_status)" -eq 0 ]] && \
@@ -342,9 +343,32 @@ test_global_json_after_subcommand() {
     harness_teardown
 }
 
+test_global_dry_run_after_release() {
+    ((TESTS_RUN++))
+    harness_setup
+
+    # release plans through the global flag, so it may follow the subcommand;
+    # a command that ignores the global dry-run must still refuse it rather
+    # than act for real.
+    exec_run "$DSR_CMD" release no-such-tool 1.2.3 --dry-run
+    local release_stderr release_status
+    release_stderr=$(exec_stderr)
+    release_status=$(exec_status)
+    exec_run "$DSR_CMD" status --dry-run
+    if ! grep -q 'Unknown option: --dry-run' <<< "$release_stderr" && [[ "$release_status" -ne 0 ]] &&
+       [[ "$(exec_status)" -eq 4 ]] && exec_stderr | grep -q 'Unknown option: --dry-run'; then
+        pass "dsr release ... --dry-run is the global dry-run; others still reject it"
+    else
+        fail "release should accept a trailing --dry-run (got $release_status: $(tail -2 <<< "$release_stderr"))"
+    fi
+
+    harness_teardown
+}
+
 test_global_path_flags_take_effect() {
     ((TESTS_RUN++))
     harness_setup
+    harness_create_config
 
     local state="$TEST_TMPDIR/flag-state" cache="$TEST_TMPDIR/flag-cache"
     exec_run "$DSR_CMD" --state-dir "$state" --cache-dir "$cache" --no-color --log-level warn --json status
@@ -423,6 +447,7 @@ test_help_flag_with_json
 echo ""
 echo "Global Flag Tests:"
 test_global_json_after_subcommand
+test_global_dry_run_after_release
 test_global_path_flags_take_effect
 test_global_flag_errors
 

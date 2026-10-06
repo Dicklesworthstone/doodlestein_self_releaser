@@ -740,8 +740,14 @@ dsr status [--watch] [--compact]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--watch` | false | Continuously update status display |
+| `--watch` | false | Continuously update status display (not with `--json`) |
+| `--interval` | 5 | Seconds between `--watch` redraws |
 | `--compact` | false | Minimal one-line summary |
+| `--refresh` | false | Re-run host health checks instead of reading the cache |
+
+`overall_status` is `error` without a valid configuration, `degraded` when a host
+is unhealthy or the last command (other than status/help/version) failed — a
+usage error (exit 4) or an interrupt does not count — and `ok` otherwise.
 
 **Exit codes:**
 - `0`: System healthy

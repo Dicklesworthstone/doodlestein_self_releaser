@@ -54,6 +54,7 @@ test_status_help() {
 test_status_runs_without_error() {
     ((TESTS_RUN++))
     harness_setup
+    harness_create_config
 
     exec_run "$DSR_CMD" status
     local status
@@ -259,6 +260,7 @@ test_status_json_stderr_empty() {
 test_status_empty_state_no_error() {
     ((TESTS_RUN++))
     harness_setup
+    harness_create_config
 
     # Clear state directory completely
     rm -rf "${DSR_STATE_DIR:?}"/* 2>/dev/null || true
@@ -303,15 +305,66 @@ test_status_empty_state_json_valid() {
 test_status_exit_code_zero() {
     ((TESTS_RUN++))
     harness_setup
+    harness_create_config
 
     exec_run "$DSR_CMD" status
     local status
     status=$(exec_status)
 
     if [[ "$status" -eq 0 ]]; then
-        pass "status exit code is 0"
+        pass "status exit code is 0 for a configured, healthy system"
     else
         fail "status should exit 0, got: $status"
+    fi
+
+    harness_teardown
+}
+
+# Contract exit codes: 3 unhealthy (no configuration), 1 degraded (the last
+# command failed), with a matching overall_status and envelope status.
+test_status_reports_health_in_exit_code() {
+    ((TESTS_RUN++))
+    harness_setup
+    local problems=()
+
+    exec_run "$DSR_CMD" --json status
+    [[ "$(exec_status)" -eq 3 ]] || problems+=("no config exit $(exec_status)")
+    exec_stdout | jq -e '.status == "error" and .exit_code == 3 and .details.overall_status == "error" and
+        (.details.warnings | index("no configuration (run dsr config init)")) != null' >/dev/null ||
+        problems+=("no-config details")
+
+    harness_create_config
+    # A usage error (exit 4) is recorded but is not a health problem.
+    exec_run "$DSR_CMD" check --threshold soon
+    exec_run "$DSR_CMD" --json status
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("usage error degraded status (exit $(exec_status))")
+    exec_stdout | jq -e '.details.last_run.command == "check" and .details.last_run.exit_code == 4' >/dev/null ||
+        problems+=("usage error not recorded: $(exec_stdout | jq -c '.details.last_run' 2>/dev/null)")
+
+    # A check whose GitHub API calls fail (exit 8) is the last real command.
+    export GH_RETRY_DELAY=0
+    mock_command_script "gh" '[[ "$1" == auth ]] && exit 0; exit 1'
+    exec_run "$DSR_CMD" check owner/repo
+    local check_status
+    check_status=$(exec_status)
+    exec_run "$DSR_CMD" --json status
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("failed last command exit $(exec_status) (check exited $check_status)")
+    exec_stdout | jq -e '.status == "partial" and
+        .details.overall_status == "degraded" and .details.last_run.command == "check" and
+        .details.last_run.exit_code == 8 and .details.last_run.status == "error"' >/dev/null ||
+        problems+=("degraded details: $(exec_stdout | jq -c '.details.last_run' 2>/dev/null)")
+
+    exec_run "$DSR_CMD" status --compact
+    [[ "$(exec_status)" -eq 1 ]] && exec_stderr | grep -q '^dsr: degraded | config ok | hosts ' ||
+        problems+=("compact line: $(exec_stderr | tail -1)")
+
+    exec_run "$DSR_CMD" --json status --watch
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("--watch with --json exit $(exec_status)")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "status exit codes, overall_status, --compact and --watch follow the contract"
+    else
+        fail "status health reporting: ${problems[*]}"
     fi
 
     harness_teardown
@@ -361,6 +414,7 @@ test_status_empty_state_json_valid
 echo ""
 echo "Exit Code:"
 test_status_exit_code_zero
+test_status_reports_health_in_exit_code
 
 echo ""
 echo "=========================================="

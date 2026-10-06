@@ -199,6 +199,19 @@ _log() {
   echo "${color}[${prefix}]${_LOG_NC} $msg" >&2
 }
 
+# Record how this session's command ended, in the run log only: `dsr status`
+# reports the last command's outcome from it.
+log_session_finished() {
+  local exit_code="$1"
+  [[ -n "$LOG_FILE" && "$exit_code" =~ ^[0-9]+$ ]] || return 0
+  local escaped_run_id escaped_cmd
+  _json_escape_var "$DSR_RUN_ID" escaped_run_id
+  _json_escape_var "${DSR_CURRENT_CMD:-}" escaped_cmd
+  printf '{"ts":"%s","run_id":"%s","level":"info","cmd":"%s","msg":"Session finished","exit_code":%s}\n' \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$escaped_run_id" "$escaped_cmd" "$exit_code" \
+    >> "$LOG_FILE" 2>/dev/null || true
+}
+
 # Convenience functions
 log_error() { _log error "$1" "${2:-}"; }
 log_warn()  { _log warn "$1" "${2:-}"; }
@@ -310,7 +323,7 @@ log_get_run_id() {
 # Export functions and variables
 export -f log_init log_error log_warn log_info log_debug log_ok log_timed
 export -f log_set_level_from_flags log_set_command log_set_tool log_set_host
-export -f log_clear_context log_get_file log_get_run_id
+export -f log_clear_context log_get_file log_get_run_id log_session_finished
 export -f _log _should_log _json_escape _json_escape_var _get_ms_timestamp
 export DSR_RUN_ID LOG_LEVEL LOG_FILE _DSR_MS_TIMESTAMP_METHOD
 export DSR_CURRENT_CMD DSR_CURRENT_TOOL DSR_CURRENT_HOST

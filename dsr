@@ -11318,19 +11318,41 @@ _status_get_last_run() {
         return
     fi
 
-    # Extract run_id and timestamp from last session start
-    local last_entry
-    last_entry=$(grep '"msg":"Session started"' "$run_log" 2>/dev/null | tail -1)
+    # The last real command (not status/help/version) and, once it finished,
+    # its exit code, searching back through the week's daily logs; else the
+    # last session of any kind.
+    local day_log summary=""
+    while IFS= read -r day_log; do
+        # A finish belongs to the session it follows (same run and command).
+        summary=$(jq -Rnc --arg log "$day_log" '
+            reduce (inputs | fromjson? | select(type == "object")) as $e ([];
+                if $e.msg == "Session started" then . + [{start: $e}]
+                elif $e.msg == "Session finished" and length > 0 and .[-1].end == null and
+                     .[-1].start.run_id == $e.run_id and .[-1].start.cmd == $e.cmd
+                then .[-1].end = $e
+                else . end) |
+            ([.[] | select((.start.cmd // "") | IN("", "status", "help", "version") | not)] | last) as $session |
+            if $session == null then empty else
+                $session.start as $start | $session.end as $end |
+                {run_id: $start.run_id, timestamp: $start.ts, started_at: $start.ts,
+                 log_file: $log, command: $start.cmd}
+                + (if $end == null or ($end.exit_code | type) != "number" then {} else
+                    {completed_at: $end.ts, exit_code: $end.exit_code,
+                     status: (if $end.exit_code == 0 then "success"
+                              elif $end.exit_code == 1 then "partial" else "error" end)} end)
+            end' "$day_log" 2>/dev/null) || summary=""
+        [[ -n "$summary" ]] && break
+    done < <(find "$log_dir" -mindepth 2 -maxdepth 2 -name run.log -type f 2>/dev/null | sort -r | head -7)
 
-    if [[ -n "$last_entry" ]]; then
-        local run_id ts
-        run_id=$(echo "$last_entry" | jq -r '.run_id // empty')
-        ts=$(echo "$last_entry" | jq -r '.ts // empty')
-        jq -nc --arg run_id "$run_id" --arg ts "$ts" --arg log "$run_log" \
-            '{run_id: $run_id, timestamp: $ts, log_file: $log}'
-    else
-        echo '{"run_id": null, "timestamp": null, "log_file": null}'
+    if [[ -z "$summary" ]]; then
+        summary=$(jq -Rnc --arg log "$run_log" '
+            ([inputs | fromjson? | select(type == "object" and .msg == "Session started")] | last) as $any |
+            if $any == null then {run_id: null, timestamp: null, log_file: null}
+            else {run_id: ($any.run_id // null), timestamp: ($any.ts // null), log_file: $log} end' \
+            "$run_log" 2>/dev/null) || summary=""
     fi
+    [[ -n "$summary" ]] || summary='{"run_id": null, "timestamp": null, "log_file": null}'
+    printf '%s\n' "$summary"
 }
 
 # Get config summary
@@ -11360,7 +11382,7 @@ _status_get_signing() {
 
 # Status command
 cmd_status() {
-    local refresh=false
+    local refresh=false compact=false watch=false interval=5
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -11368,6 +11390,22 @@ cmd_status() {
             --refresh|-r)
                 refresh=true
                 shift
+                ;;
+            --compact)
+                compact=true
+                shift
+                ;;
+            --watch|-w)
+                watch=true
+                shift
+                ;;
+            --interval|-i)
+                [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,4}$ ]] || {
+                    log_error "--interval requires a positive number of seconds"
+                    return 4
+                }
+                interval="$2"
+                shift 2
                 ;;
             --help|-h)
                 cat << 'EOF'
@@ -11378,11 +11416,15 @@ USAGE:
 
 OPTIONS:
     --refresh, -r    Refresh host health (makes network calls)
+    --compact        One-line summary
+    --watch, -w      Redraw the summary until interrupted
+    --interval <s>   Seconds between --watch redraws (default: 5)
     --json           JSON output (global flag)
 
 DESCRIPTION:
     Shows a quick summary of:
-    - Last run information (run_id, timestamp)
+    - Overall health (ok, degraded, error)
+    - Last command run (command, run_id, outcome)
     - Configuration status
     - Host health (from cache by default)
     - Signing configuration
@@ -11390,9 +11432,16 @@ DESCRIPTION:
     By default, status is read from local state only (<1s).
     Use --refresh to update host health checks.
 
+EXIT CODES:
+    0  - Healthy
+    1  - Degraded (an unhealthy host, or the last command failed)
+    3  - Unhealthy (no valid configuration)
+    4  - Invalid arguments
+
 EXAMPLES:
     dsr status                Show cached status
     dsr status --refresh      Refresh host health
+    dsr status --compact      One line, for prompts and tmux
     dsr status --json         Machine-readable output
 EOF
                 return 0
@@ -11403,6 +11452,22 @@ EOF
                 ;;
         esac
     done
+
+    if $watch; then
+        if $JSON_MODE; then
+            log_error "--watch redraws a terminal summary; it cannot be combined with --json"
+            return 4
+        fi
+        local watch_args=()
+        $refresh && watch_args+=(--refresh)
+        $compact && watch_args+=(--compact)
+        while true; do
+            [[ -t 2 ]] && printf '\033[H\033[2J' >&2
+            cmd_status ${watch_args[@]+"${watch_args[@]}"}
+            sleep "$interval" || break
+        done
+        return 0
+    fi
 
     # Collect status information
     local last_run config_status signing_status hosts_status
@@ -11436,41 +11501,92 @@ EOF
         hosts_status='{}'
     fi
 
-    # Build JSON output
+    # Build JSON output (schemas/status-details.json). Overall health: no
+    # valid config is an error (exit 3); an unhealthy host or a failed last
+    # command degrades it (exit 1). Missing signing keys only warn.
     local json_output
     json_output=$(jq -nc \
+        --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --argjson last_run "$last_run" \
         --argjson config "$config_status" \
         --argjson signing "$signing_status" \
-        --argjson hosts "$hosts_status" \
-        '{
+        --argjson hosts "$hosts_status" '
+        ($hosts | to_entries | map(.value as $h | {
+            host: .key,
+            status: (if $h.healthy == false then "error"
+                     else ({ok: "ok", warning: "warn", warn: "warn", error: "error"}[$h.status // ""] // "unknown") end),
+            platform: $h.platform,
+            last_checked_at: $h.checked_at,
+            message: (if (($h.errors // 0) | type) == "number" and (($h.errors // 0) + ($h.warnings // 0)) > 0
+                      then "\($h.errors // 0) error(s), \($h.warnings // 0) warning(s)" else null end)
+        } | with_entries(select(.value != null)))) as $host_list |
+        ([$host_list[] | select(.status == "error") | .host]) as $bad_hosts |
+        # A usage error (4) or an interrupt (5, 130) says nothing about health.
+        (($last_run.exit_code // 0) as $code | $code != 0 and ($code | IN(4, 5, 130) | not)) as $last_failed |
+        (if ($config.valid | not) then "error"
+         elif ($bad_hosts | length) > 0 or $last_failed then "degraded"
+         else "ok" end) as $overall |
+        {
+            generated_at: $generated_at,
+            overall_status: $overall,
             last_run: $last_run,
             config: $config,
             signing: $signing,
-            hosts: $hosts
-        }' 2>/dev/null) || json_output='{}'
+            hosts: $host_list,
+            warnings: ([
+                (if ($config.valid | not) then "no configuration (run dsr config init)" else empty end),
+                ($bad_hosts[] | "host \(.) is unhealthy"),
+                (if $last_failed
+                 then "last command \($last_run.command) exited \($last_run.exit_code)" else empty end),
+                (if ($signing.configured | not) then "signing keypair not configured" else empty end)
+            ])
+        }' 2>/dev/null) || json_output='{"overall_status": "error"}'
+
+    local overall status_exit=0 envelope_status="success"
+    overall=$(jq -r '.overall_status // "error"' <<< "$json_output")
+    case "$overall" in
+        ok) ;;
+        degraded) status_exit=1 envelope_status="partial" ;;
+        *) status_exit=3 envelope_status="error" ;;
+    esac
 
     if $JSON_MODE; then
-        json_envelope "status" "success" 0 "$json_output"
+        json_envelope "status" "$envelope_status" "$status_exit" "$json_output"
+    elif $compact; then
+        jq -r '"dsr: \(.overall_status)"
+            + " | config \(if .config.valid then "ok" else "missing" end)"
+            + " | hosts \([.hosts[] | select(.status == "ok" or .status == "warn")] | length)/\(.hosts | length) ok"
+            + " | last \(.last_run.command // "none")"
+            + (if .last_run.status then " \(.last_run.status)" else "" end)' <<< "$json_output" >&2
     else
-        # Human-readable output
-        echo ""
+        # Human-readable output (stderr; stdout carries structured data only)
+        echo "" >&2
         log_info "=== DSR Status ==="
-        echo ""
+        case "$overall" in
+            ok) log_ok "Overall: ok" ;;
+            degraded) log_warn "Overall: degraded" ;;
+            *) log_error "Overall: error" ;;
+        esac
+        echo "" >&2
 
         # Last run
-        local run_id ts
+        local run_id ts last_command last_outcome
         run_id=$(echo "$last_run" | jq -r '.run_id // "none"')
         ts=$(echo "$last_run" | jq -r '.timestamp // "never"')
+        last_command=$(echo "$last_run" | jq -r '.command // empty')
+        last_outcome=$(echo "$last_run" | jq -r 'if .exit_code == null then empty
+            else "\(.status) (exit \(.exit_code))" end')
 
         if [[ "$run_id" != "null" && "$run_id" != "none" ]]; then
             log_info "Last Run:"
+            [[ -n "$last_command" ]] && log_info "  Command:   $last_command"
             log_info "  Run ID:    $run_id"
             log_info "  Timestamp: $ts"
+            [[ -n "$last_outcome" ]] && log_info "  Outcome:   $last_outcome"
         else
             log_info "Last Run: no runs recorded"
         fi
-        echo ""
+        echo "" >&2
 
         # Config
         local config_valid config_path
@@ -11483,7 +11599,7 @@ EOF
         else
             log_warn "  Config: not found (run 'dsr config init')"
         fi
-        echo ""
+        echo "" >&2
 
         # Signing
         local signing_configured
@@ -11495,19 +11611,20 @@ EOF
         else
             log_warn "  Keypair: not configured (run 'dsr signing init')"
         fi
-        echo ""
+        echo "" >&2
 
         # Hosts (if any cached)
-        if [[ -n "$hosts_status" && "$hosts_status" != "{}" && "$hosts_status" != "null" ]]; then
-            log_info "Build Hosts (cached):"
-            echo "$hosts_status" | jq -r 'to_entries[] | "  \(.key): \(.value.status // "unknown")"' 2>/dev/null || true
+        if jq -e '.hosts | length > 0' <<< "$json_output" >/dev/null 2>&1; then
+            log_info "Build Hosts ($($refresh && echo refreshed || echo cached)):"
+            jq -r '.hosts[] | "  \(.host): \(.status)" + (if .message then " (\(.message))" else "" end)' \
+                <<< "$json_output" >&2 2>/dev/null || true
         else
             log_info "Build Hosts: no cached status (use --refresh)"
         fi
-        echo ""
+        echo "" >&2
     fi
 
-    return 0
+    return "$status_exit"
 }
 
 # ============================================================================
@@ -12854,6 +12971,15 @@ main() {
                 --quiet) QUIET=true; continue ;;
                 --non-interactive) NON_INTERACTIVE=true; continue ;;
                 --no-color) continue ;;
+                # release plans through the global DRY_RUN and parses no
+                # --dry-run of its own; commands that do parse one keep it,
+                # and those that ignore DRY_RUN must keep rejecting it.
+                --dry-run)
+                    if [[ "$command" == release ]]; then
+                        DRY_RUN=true
+                        continue
+                    fi
+                    ;;
             esac
         fi
         command_args+=("$global_arg")
@@ -12991,6 +13117,9 @@ main() {
             exit 4
             ;;
     esac
+    local command_status=$?
+    log_session_finished "$command_status"
+    return "$command_status"
 }
 
 # Parse dispatch and exit together: a long-running command may outlive an
