@@ -12,11 +12,11 @@ permissions:
   contents: write
 concurrency:
   group: native-archive-repair-main
-  cancel-in-progress: false
+  cancel-in-progress: true
 jobs:
   apply-and-verify:
     if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
