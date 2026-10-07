@@ -238,7 +238,7 @@ check 'source selection survives subsequent default-branch movement' equal "$STA
 check 'built SHA equals inspected SHA, not later HEAD' equal "$(jq -r .source.source_commit "$TEMP/results/moving.json")" "$inspected"
 check 'new uninspected branch content was not built' equal "$("$TEMP/out-moving/demo")" head-source-v2
 check 'test actually moved upstream after comparison' test "$("$REAL_GIT" -C "$TEMP/upstream" rev-parse HEAD)" != "$inspected"
-printf 'minisign_pubkey: RWfixturekey\n' >> "$TEMP/config/repos.d/demo.yaml"
+printf 'minisign_pubkey: RWTRzlfQB0VAo0r4gvzjiptFkA9w/VNamRJSxtMaclvkt88+QlEMjQmw\n' >> "$TEMP/config/repos.d/demo.yaml"
 INSTALLER=$(install_gen_create demo) || exit 1
 printf '#!/bin/sh\nexit 1\n' > "$TEMP/bin/minisign"
 chmod +x "$TEMP/bin/minisign"

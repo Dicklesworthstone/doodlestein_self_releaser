@@ -278,7 +278,7 @@ check 'checksum failure installs nothing' test ! -e "$CASE/install/app"
 check 'checksum failure emits one JSON error' error_json
 # A configured key does not pretend to sign locally compiled code, but on the
 # release path a signature failure is always fatal, even with fallback consent.
-printf 'minisign_pubkey: RWFIXTURE\n' >> "$TEMP/config/repos.d/app.yaml"
+printf 'minisign_pubkey: RWTRzlfQB0VAo0r4gvzjiptFkA9w/VNamRJSxtMaclvkt88+QlEMjQmw\n' >> "$TEMP/config/repos.d/app.yaml"
 INSTALLER=$(install_gen_create app) || exit 1
 run_case signature good --allow-source-build --version v1.0.0
 check 'failed configured signature prevents fallback' equal "$status" 1

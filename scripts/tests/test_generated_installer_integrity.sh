@@ -198,7 +198,7 @@ done
 run_install --version
 check 'missing version argument returns invalid-arguments status' test "$status" -eq 4
 # An embedded trust key must not be optional even without --require-signatures.
-printf 'minisign_pubkey: configured-test-key\n' >> "$DSR_CONFIG_DIR/repos.d/demo.yaml"
+printf 'minisign_pubkey: RWTRzlfQB0VAo0r4gvzjiptFkA9w/VNamRJSxtMaclvkt88+QlEMjQmw\n' >> "$DSR_CONFIG_DIR/repos.d/demo.yaml"
 installer=$(install_gen_create demo 2>> "$work/generate.log") || exit 1
 cat > "$work/transports/minisign" <<'SIGNER'
 #!/usr/bin/env bash
@@ -461,6 +461,54 @@ CONFIG
     check 'unavailable libc variant is reported' grep -q "No musl build of vgnu is configured for linux/$arch" "$case_dir/err"
     run_variant "$vinstaller" --libc uclibc
     check 'unknown --libc value is refused' test "$status" -eq 4 -a ! -e "$case_dir/bin/vdemo"
+fi
+
+# The installer verifies against the key `dsr signing init` wrote, and a
+# configured key that is not a minisign key is refused at generation (it is
+# spliced into the generated script).
+signing_key='RWTRzlfQB0VAo0r4gvzjiptFkA9w/VNamRJSxtMaclvkt88+QlEMjQmw'
+printf 'tool_name: kdemo\nrepo: example/kdemo\nbinary_name: kdemo\nartifact_naming: ${name}-${version}-${os}-${arch}\n' \
+    > "$DSR_CONFIG_DIR/repos.d/kdemo.yaml"
+printf 'untrusted comment: minisign public key\n%s\n' "$signing_key" > "$DSR_CONFIG_DIR/minisign.pub"
+kinstaller=$(install_gen_create kdemo 2>> "$work/generate.log")
+check 'installer embeds the dsr signing public key' grep -qx "MINISIGN_PUBKEY=\"$signing_key\"" "$kinstaller"
+rm -f -- "$DSR_CONFIG_DIR/minisign.pub"
+printf 'minisign_pubkey: x"; touch %s/pwned; "\n' "$work" >> "$DSR_CONFIG_DIR/repos.d/kdemo.yaml"
+gen_status=0
+install_gen_create kdemo >/dev/null 2>> "$work/generate.log" || gen_status=$?
+check 'a malformed configured key is refused, never embedded' test "$gen_status" -eq 4 -a ! -e "$work/pwned"
+
+# `-v 1.2.3` names the v1.2.3 release. (Earlier cases rebuilt the asset.)
+set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"
+: > "$CALLS"
+VERSION_ARGS=(--version 1.2.3)
+run_install
+check 'a bare version installs the v-tagged release' success
+check 'a bare version downloads from the v-tagged release' grep -q '/download/v1.2.3/' "$CALLS"
+VERSION_ARGS=(--version v1.2.3)
+
+# --mode: safe installs the verified release only; unknown modes are refused.
+run_install --mode safe
+check '--mode safe installs the verified release' success
+run_install --mode safe --allow-source-build
+check '--mode safe refuses source builds' test "$status" -eq 4 -a ! -e "$case_dir/bin/demo"
+run_install --mode turbo
+check 'an unknown --mode is refused' test "$status" -eq 4
+
+# Piped (`curl | bash`): --help still prints the usage, and replacing an
+# existing binary without a terminal says to use --yes instead of failing mute.
+help_out=$(bash -s -- --help < "$installer" 2>&1)
+check 'piped --help prints the usage' grep -q -- '--mode vibe|safe' <<< "$help_out"
+if command -v setsid >/dev/null; then
+    case_id=$((case_id + 1)); case_dir="$work/case-$case_id"
+    mkdir -p "$case_dir/bin"
+    printf 'previous\n' > "$case_dir/bin/demo"
+    status=0
+    setsid -w bash -s -- --version v1.2.3 --dir "$case_dir/bin" --cache-dir "$case_dir/cache" --no-skills \
+        < "$installer" > "$case_dir/out" 2> "$case_dir/err" || status=$?
+    check 'piped install without a terminal keeps the existing binary' \
+        test "$status" -eq 1 -a "$(cat "$case_dir/bin/demo")" == previous
+    check 'piped install without a terminal points at --yes' grep -q -- 'Re-run with --yes' "$case_dir/err"
 fi
 
 printf 'Generated installer integrity: %s passed, %s failed\n' "$passed" "$failed"

@@ -61,8 +61,11 @@ _install_gen_template() {
 #   curl -sSfL https://raw.githubusercontent.com/__REPO__/main/install.sh | bash -s -- --json
 #
 # Options:
-#   -v, --version VERSION    Install specific version (default: latest)
+#   -v, --version VERSION    Install specific version, e.g. 1.2.3 or v1.2.3 (default: latest)
 #   -d, --dir DIR            Installation directory (default: ~/.local/bin)
+#   -y, --yes                Replace an existing binary without asking
+#   --mode vibe|safe         vibe (default) also installs agent skills; safe installs
+#                            only the verified release binary (no skills, no source builds)
 #   --verify                 Verify checksums (always enabled)
 #   --require-signatures     Require a configured key and valid minisign signature
 #   --json                   Output JSON for automation
@@ -880,7 +883,14 @@ _install_binary() (
             fi
 
             _log_warn "Binary already exists: $dest_binary"
-            read -rp "Overwrite? [y/N] " response || return 1
+            # Under `curl ... | bash` stdin is the script itself; ask on the
+            # terminal, and without one say how to proceed.
+            local response=""
+            if ! read -rp "Overwrite? [y/N] " response < /dev/tty 2>/dev/null; then
+                _log_error "No terminal to confirm replacing $dest_binary"
+                _log_info "Re-run with --yes to replace it"
+                return 1
+            fi
             if [[ ! "$response" =~ ^[yY] ]]; then
                 _log_info "Installation cancelled"
                 return 1
@@ -1152,9 +1162,18 @@ _install_from_source() {
     _json_result success "Installed from source (not a signed release)" "$_VERSION" "$installed_path"
 }
 
+# The header comment is the help text. Run as `curl ... | bash` the script
+# has no file to read it back from, so the generator embeds a copy here.
+_usage() {
+    cat << 'DSR_INSTALLER_HELP'
+__HELP_TEXT__
+DSR_INSTALLER_HELP
+}
+
 # Main installation function
 main() {
     local prefer_stale=false stale_threshold=10 stale_threshold_set=false
+    local install_mode=vibe
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1188,6 +1207,14 @@ main() {
             -y|--yes)
                 _AUTO_YES=true
                 shift
+                ;;
+            --mode)
+                [[ $# -ge 2 && "$2" =~ ^(vibe|safe)$ ]] || {
+                    _log_error "--mode requires vibe or safe"
+                    return 4
+                }
+                install_mode="$2"
+                shift 2
                 ;;
             --offline)
                 _OFFLINE_MODE=true
@@ -1251,7 +1278,7 @@ main() {
                 shift 2
                 ;;
             --help|-h)
-                grep '^#' "$0" | grep -v '^#!/' | sed 's/^# //' | sed 's/^#//'
+                _usage
                 return 0
                 ;;
             *)
@@ -1290,6 +1317,19 @@ main() {
     if [[ -n "$_VERSION" ]] && ! _valid_release_version "$_VERSION"; then
         _log_error "Invalid release version"
         return 4
+    fi
+    # Release tags are v-prefixed; `-v 1.2.3` names the same release as
+    # `-v v1.2.3` (download URL, gh download and offline cache key alike).
+    if [[ "$_VERSION" =~ ^[0-9] ]]; then
+        _VERSION="v$_VERSION"
+    fi
+    # Safe mode installs only the verified release binary.
+    if [[ "$install_mode" == safe ]]; then
+        if $_ALLOW_SOURCE_BUILD; then
+            _log_error "--mode safe installs verified releases only; source builds are not allowed"
+            return 4
+        fi
+        _SKIP_SKILLS=true
     fi
 
     # Detect platform
@@ -1536,6 +1576,63 @@ _install_gen_yaml_get() {
     echo "$default"
 }
 
+# The key line of a minisign public key: the line itself, or the second line
+# of a minisign.pub file. Prints nothing (status 4) for anything else.
+_install_gen_pubkey_line() {
+    local text="$1" line
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [[ "$line" =~ ^RW[A-Za-z0-9+/]{54}$ ]]; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+    done <<< "$text"
+    return 4
+}
+
+# Resolve the installer's minisign public key, first match wins:
+#   1. minisign_pubkey in the tool config
+#   2. release_contract.minisign_public_key_file (relative to local_path)
+#   3. signing.minisign_pubkey in config.yaml
+#   4. minisign.pub written by `dsr signing init`
+# Prints "<source>\t<key>" (an empty key when none is configured); an
+# unreadable or malformed configured key is an error, never a silent skip.
+_install_gen_resolve_pubkey() {
+    local config_file="$1" local_path="$2"
+    local value="" source="" key_file="" key=""
+
+    value=$(_install_gen_yaml_get "$config_file" "minisign_pubkey" "")
+    [[ -n "$value" ]] && source="minisign_pubkey in $(basename "$config_file")"
+
+    if [[ -z "$value" ]]; then
+        key_file=$(_install_gen_yaml_get "$config_file" "release_contract.minisign_public_key_file" "")
+        if [[ -n "$key_file" ]]; then
+            if [[ -z "$local_path" || "$key_file" == /* || "$key_file" == *..* || ! -f "$local_path/$key_file" ]]; then
+                log_error "release_contract.minisign_public_key_file is not a readable file under local_path: $key_file"
+                return 4
+            fi
+            value=$(cat -- "$local_path/$key_file") || return 4
+            source="$key_file"
+        fi
+    fi
+
+    if [[ -z "$value" && -f "$_IG_CONFIG_DIR/config.yaml" ]]; then
+        value=$(_install_gen_yaml_get "$_IG_CONFIG_DIR/config.yaml" "signing.minisign_pubkey" "")
+        [[ -n "$value" ]] && source="signing.minisign_pubkey in config.yaml"
+    fi
+
+    if [[ -z "$value" && -f "$_IG_CONFIG_DIR/minisign.pub" ]]; then
+        value=$(cat -- "$_IG_CONFIG_DIR/minisign.pub") || return 4
+        source="$_IG_CONFIG_DIR/minisign.pub"
+    fi
+
+    if [[ -n "$value" ]] && ! key=$(_install_gen_pubkey_line "$value"); then
+        log_error "Not a minisign public key ($source)"
+        return 4
+    fi
+    printf '%s\t%s\n' "$source" "$key"
+}
+
 # Generate install.sh for a single tool
 install_gen_create() {
     local tool_name="${1:-}"
@@ -1703,15 +1800,18 @@ install_gen_create() {
         return 3
     fi
 
-    # Get minisign public key (from tool config or global dsr config)
-    local minisign_pubkey=""
-    minisign_pubkey=$(_install_gen_yaml_get "$config_file" "minisign_pubkey" "")
-    if [[ -z "$minisign_pubkey" ]]; then
-        # Try global config
-        local global_config="$_IG_CONFIG_DIR/config.yaml"
-        if [[ -f "$global_config" ]]; then
-            minisign_pubkey=$(_install_gen_yaml_get "$global_config" "signing.minisign_pubkey" "")
-        fi
+    # The minisign public key the installer verifies against. Releases signed
+    # by dsr ship .minisig files; an installer generated without the key
+    # would skip that verification without saying so.
+    local minisign_pubkey="" minisign_pubkey_source=""
+    minisign_pubkey=$(_install_gen_resolve_pubkey "$config_file" "$local_path") || return $?
+    minisign_pubkey_source="${minisign_pubkey%%$'\t'*}"
+    minisign_pubkey="${minisign_pubkey#*$'\t'}"
+    if [[ -n "$minisign_pubkey" ]]; then
+        log_info "Installer verifies minisign signatures with the key from $minisign_pubkey_source"
+    else
+        log_warn "No minisign public key for $tool_name: its installer will not verify signatures"
+        log_info "Run 'dsr signing init', or set minisign_pubkey in repos.d/${tool_name}.yaml"
     fi
 
     # Get skill content (prefer full skill directory, then fall back to SKILL.md only)
@@ -1783,6 +1883,13 @@ install_gen_create() {
         "$archive_windows" \
         "$artifact_naming" \
         "$language")
+
+    # --help prints the script's header comment; embed it so it also works
+    # when the script is piped into bash. Substituted first, so the help
+    # text's own placeholders are filled in below.
+    local help_text
+    help_text=$(awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' <<< "$template")
+    template="${template//__HELP_TEXT__/"$help_text"}"
 
     # Replace placeholders
     template="${template//__TOOL_NAME__/$tool_name}"
