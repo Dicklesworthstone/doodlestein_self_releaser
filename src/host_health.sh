@@ -1033,9 +1033,14 @@ _hh_print_result() {
     healthy=$(echo "$result" | jq -r '.healthy')
     platform=$(echo "$result" | jq -r '.platform')
 
+    [[ "$platform" == "null" ]] && platform="unknown platform"
     case "$status" in
         ok)
             _hh_log_ok "$hostname ($platform): healthy"
+            ;;
+        disabled)
+            _hh_log_info "$hostname ($platform): disabled"
+            return 0
             ;;
         warning)
             _hh_log_warn "$hostname ($platform): warnings present"
@@ -1054,6 +1059,9 @@ _hh_print_result() {
             ;;
         error)
             _hh_log_error "$hostname ($platform): unhealthy"
+            local result_error
+            result_error=$(jq -r '.error // empty' <<< "$result")
+            [[ -n "$result_error" ]] && _hh_log_error "  - $result_error"
             local reachable disk_status disk_usage disk_error
             reachable=$(echo "$result" | jq -r '.checks.connectivity.reachable')
             disk_status=$(echo "$result" | jq -r '.checks.disk_space.status')
@@ -1085,15 +1093,20 @@ _hh_print_result() {
 }
 
 # Check all configured hosts
-# Usage: host_health_check_all [--no-cache] [--json]
+# Usage: host_health_check_all [--no-cache] [--json] [--fail-unhealthy]
+# Returns 4 for an invalid host configuration. With --fail-unhealthy, also 1
+# when an enabled host is unhealthy (the report is still printed); without
+# it, unhealthy hosts are data, not a failure of the check.
 host_health_check_all() {
     local use_cache=true
     local json_mode=false
+    local fail_unhealthy=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-cache) use_cache=false; shift ;;
             --json) json_mode=true; shift ;;
+            --fail-unhealthy) fail_unhealthy=true; shift ;;
             *) shift ;;
         esac
     done
@@ -1118,6 +1131,7 @@ host_health_check_all() {
     local total_healthy=0
     local total_unhealthy=0
     local total_warnings=0
+    local total_disabled=0
 
     for hostname in $hosts; do
         local result
@@ -1125,18 +1139,27 @@ host_health_check_all() {
         $use_cache || cache_flag="--no-cache"
 
         result=$(host_health_check "$hostname" $cache_flag --json 2>/dev/null)
+        if ! jq -e 'type == "object"' <<< "$result" >/dev/null 2>&1; then
+            result=$(jq -nc --arg hostname "$hostname" \
+                '{hostname: $hostname, status: "error", healthy: false, error: "health check produced no result"}')
+        fi
         results+=("$result")
 
         local healthy status
         healthy=$(echo "$result" | jq -r '.healthy')
         status=$(echo "$result" | jq -r '.status')
 
-        if [[ "$healthy" == "true" ]]; then
+        # A host disabled in config is deliberately out of rotation, not a
+        # failure of the fleet.
+        if [[ "$status" == "disabled" ]]; then
+            ((total_disabled++))
+        elif [[ "$healthy" == "true" ]]; then
             ((total_healthy++))
         else
             ((total_unhealthy++))
         fi
         [[ "$status" == "warning" ]] && ((total_warnings++))
+        $json_mode || _hh_print_result "$hostname" "$result"
     done
 
     local checked_at
@@ -1150,21 +1173,28 @@ host_health_check_all() {
             --argjson healthy "$total_healthy" \
             --argjson unhealthy "$total_unhealthy" \
             --argjson warnings "$total_warnings" \
+            --argjson disabled "$total_disabled" \
             --arg checked_at "$checked_at" \
             '{
                 hosts: $hosts,
                 summary: {
-                    total: ($healthy + $unhealthy),
+                    total: ($healthy + $unhealthy + $disabled),
                     healthy: $healthy,
                     unhealthy: $unhealthy,
+                    disabled: $disabled,
                     warnings: $warnings
                 },
                 checked_at: $checked_at
             }'
     else
-        echo ""
-        _hh_log_info "Summary: $total_healthy healthy, $total_unhealthy unhealthy, $total_warnings with warnings"
+        echo "" >&2
+        _hh_log_info "Summary: $total_healthy healthy, $total_unhealthy unhealthy, $total_disabled disabled, $total_warnings with warnings"
     fi
+
+    if $fail_unhealthy && [[ $total_unhealthy -gt 0 ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # Get list of healthy hosts

@@ -404,6 +404,43 @@ test_health_all_json_valid() {
 # Tests: Cache Behavior
 # ============================================================================
 
+test_health_all_fails_and_names_unhealthy_host() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for health all test"
+        return 0
+    fi
+
+    harness_setup
+    seed_multi_host_fixtures
+    local problems=()
+
+    exec_run "$DSR_CMD" health all
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("human exit $(exec_status)")
+    exec_stderr_contains "fake-remote (darwin/arm64): unhealthy" || problems+=("unhealthy host not named")
+    exec_stderr_contains "local-test (linux/amd64)" || problems+=("healthy host not listed")
+    [[ -z "$(exec_stdout)" ]] || problems+=("human mode wrote stdout")
+
+    exec_run "$DSR_CMD" --json health all
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("json exit $(exec_status)")
+    exec_stdout | jq -e '.summary.unhealthy == 1 and
+        ([.hosts[] | select(.healthy == false) | .hostname] == ["fake-remote"])' >/dev/null 2>&1 ||
+        problems+=("json: $(exec_stdout | head -c 300)")
+
+    exec_run "$DSR_CMD" health all --frobnicate
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("unknown option exit $(exec_status)")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "health all exits 1 and names the unreachable host"
+    else
+        fail "health all with an unreachable host: ${problems[*]}"
+        echo "stderr: $(exec_stderr | tail -8)"
+    fi
+
+    harness_teardown
+}
+
 test_health_check_cache_created() {
     ((TESTS_RUN++))
 
@@ -558,6 +595,7 @@ echo ""
 echo "health all Tests:"
 test_health_all_succeeds
 test_health_all_json_valid
+test_health_all_fails_and_names_unhealthy_host
 
 echo ""
 echo "Cache Behavior Tests:"

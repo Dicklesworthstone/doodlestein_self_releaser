@@ -199,6 +199,36 @@ else
     fail "version_create_tag" "should warn about existing tag"
 fi
 
+# Test 9b: --push on an existing local tag publishes it, once, and never
+# replaces a different tag of the same name on origin.
+run_test "version_create_tag --push - existing local tag reaches origin"
+origin_dir="$TEMP_DIR/origin.git"
+git init -q --bare "$origin_dir"
+git -C "$node_dir" remote add origin "$origin_dir"
+tag_ref="refs/tags/v2.0.0-beta.1"
+local_tag_object=$(git -C "$node_dir" rev-parse "$tag_ref")
+output=$(version_create_tag "$node_dir" --push --dry-run 2>&1)
+if [[ "$output" == *"Would push existing tag"* ]] && ! git -C "$origin_dir" show-ref --verify -q "$tag_ref" &&
+   version_create_tag "$node_dir" --push 2>/dev/null &&
+   [[ "$(git -C "$origin_dir" rev-parse "$tag_ref" 2>/dev/null)" == "$local_tag_object" ]] &&
+   version_create_tag "$node_dir" --push 2>/dev/null; then
+    pass "Existing tag is pushed (dry run first pushes nothing; a repeat is a no-op)"
+else
+    fail "version_create_tag --push" "existing local tag did not reach origin: $output"
+fi
+
+run_test "version_create_tag --push - refuses a different tag on origin"
+git -C "$origin_dir" tag -d v2.0.0-beta.1 >/dev/null
+other_commit=$(git -C "$node_dir" commit-tree -m other "$(git -C "$node_dir" rev-parse 'HEAD^{tree}')")
+git -C "$node_dir" push -q origin "$other_commit:refs/tags/v2.0.0-beta.1"
+push_status=0
+version_create_tag "$node_dir" --push >/dev/null 2>&1 || push_status=$?
+if [[ $push_status -eq 2 && "$(git -C "$origin_dir" rev-parse "$tag_ref")" == "$other_commit" ]]; then
+    pass "A conflicting origin tag is reported (exit 2) and left unchanged"
+else
+    fail "version_create_tag --push" "conflict exit $push_status, origin $(git -C "$origin_dir" rev-parse "$tag_ref")"
+fi
+
 # Test 10: version_info_json
 run_test "version_info_json - returns valid JSON"
 json=$(version_info_json "$rust_dir")

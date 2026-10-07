@@ -417,9 +417,38 @@ version_create_tag() {
 
     local tag="v$version"
 
-    # Check if tag already exists
+    # An existing local tag is not created again, but --push still owes the
+    # remote that tag (a tag made earlier without --push otherwise never
+    # reaches origin and no release workflow starts). Origin holding a
+    # different object under the same name is a conflict, never overwritten.
     if git -C "$repo_path" show-ref --tags --verify "refs/tags/$tag" &>/dev/null; then
         log_warn "Tag $tag already exists"
+        $push || return 0
+
+        local local_object remote_listing remote_object
+        local_object=$(git -C "$repo_path" rev-parse "refs/tags/$tag") || return 1
+        if ! remote_listing=$(git -C "$repo_path" ls-remote --tags origin "refs/tags/$tag" 2>/dev/null); then
+            log_error "Cannot read tags from origin; $tag not pushed"
+            return 8
+        fi
+        remote_object=$(awk -v ref="refs/tags/$tag" '$2 == ref {print $1; exit}' <<< "$remote_listing")
+        if [[ "$remote_object" == "$local_object" ]]; then
+            log_ok "Tag $tag is already on origin"
+            return 0
+        elif [[ -n "$remote_object" ]]; then
+            log_error "origin has a different $tag ($remote_object, local $local_object); not overwriting"
+            return 2
+        fi
+        if $dry_run; then
+            log_info "[DRY-RUN] Would push existing tag $tag to origin"
+            return 0
+        fi
+        log_info "Pushing existing tag $tag to origin..."
+        if ! git -C "$repo_path" push origin "refs/tags/$tag"; then
+            log_error "Failed to push tag $tag"
+            return 1
+        fi
+        log_ok "Pushed tag $tag to origin"
         return 0
     fi
 

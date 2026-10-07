@@ -60,7 +60,7 @@ dsr repos validate            # Validate all configs
 dsr signing init              # Generate minisign keypair
 dsr signing sign <file>       # Sign a file
 dsr signing verify <file>     # Verify signature
-dsr sbom <project>            # Generate SBOM (SPDX/CycloneDX)
+dsr sbom generate <path>      # Generate SBOM (SPDX/CycloneDX); prints its path
 dsr slsa generate <artifact>  # Generate SLSA provenance
 dsr slsa verify <artifact>    # Verify provenance
 dsr quality <tool>            # Run pre-release quality checks
@@ -166,7 +166,7 @@ dsr fallback ntm 1.5.2
 # Check system dependencies
 dsr doctor
 
-# Check all build hosts are reachable
+# Check all build hosts are reachable (exit 1 names any unhealthy host)
 dsr health all
 
 # Check specific host
@@ -219,8 +219,8 @@ All commands support `--json` for machine-readable output:
 
 ```bash
 dsr check ntm --json | jq '.status'
-dsr health all --json | jq '.hosts[] | select(.status == "unhealthy")'
-dsr status --json | jq '.last_run'
+dsr health all --json | jq '.hosts[] | select(.healthy == false)'
+dsr status --json | jq '.details.last_run'
 ```
 
 ## Troubleshooting
@@ -261,7 +261,7 @@ machine you are running `dsr` on.
 dsr doctor --fix
 
 # Check host-specific toolchain
-dsr health check trj --json | jq '.toolchains'
+dsr health check trj --json | jq '.checks.toolchains'
 
 # Try building with verbose output
 dsr build ntm --verbose

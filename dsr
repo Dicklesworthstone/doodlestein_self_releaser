@@ -4392,7 +4392,8 @@ EXAMPLES:
 EXIT CODES:
     0  - All checks passed
     1  - One or more checks failed
-    4  - Invalid arguments
+    2  - Dry run: checks planned, none executed (never a pass)
+    4  - Invalid arguments, or no checks configured
 EOF
                 return 0
                 ;;
@@ -11399,11 +11400,17 @@ cmd_health_all() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-cache) no_cache=true; shift ;;
-            *) shift ;;
+            *)
+                log_error "Unknown option: $1"
+                log_info "Usage: dsr health all [--no-cache]"
+                return 4
+                ;;
         esac
     done
 
-    local -a flags=()
+    # Exit 1 when any enabled host is unhealthy, so `dsr health all && dsr
+    # build` stops at a dead host. Disabled hosts are not failures.
+    local -a flags=(--fail-unhealthy)
     $no_cache && flags+=("--no-cache")
     $JSON_MODE && flags+=("--json")
 
@@ -12455,7 +12462,8 @@ cmd_version() {
                 fi
                 return 0
             else
-                return 1
+                # 2 = origin holds a different tag, 8 = origin unreadable.
+                return $?
             fi
             ;;
 
