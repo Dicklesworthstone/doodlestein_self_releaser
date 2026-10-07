@@ -9681,14 +9681,33 @@ cmd_repos_list() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --format|-f)
+                [[ $# -ge 2 && "$2" =~ ^(table|json|plain)$ ]] || {
+                    log_error "--format requires table, json or plain"
+                    return 4
+                }
                 format="$2"
                 shift 2
                 ;;
+            --help|-h)
+                cat << 'EOF'
+dsr repos list - List registered repositories
+
+USAGE:
+    dsr repos list [--format table|plain|json]
+
+OPTIONS:
+    -f, --format <fmt>   table (default), plain (name: repo), or json (envelope)
+EOF
+                return 0
+                ;;
             *)
-                shift
+                log_error "Unknown option: $1"
+                return 4
                 ;;
         esac
     done
+    # --format json is the JSON envelope, exactly as the global --json.
+    [[ "$format" == json ]] && JSON_MODE=true
 
     # Load repos config
     if [[ ! -f "$DSR_REPOS_FILE" ]]; then
@@ -10835,12 +10854,25 @@ _validate_project_at_path() {
 # Discover repositories that could benefit from dsr
 cmd_repos_discover() {
     local search_path="/data/projects"
-    local apply=false
+    local apply=false org_filter="" language_filter=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --path|-p)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "$1 requires a directory"; return 4; }
                 search_path="$2"
+                shift 2
+                ;;
+            --org)
+                # Only checkouts whose GitHub remote belongs to this owner.
+                [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_.-]+$ ]] || { log_error "--org requires an owner name"; return 4; }
+                org_filter="$2"
+                shift 2
+                ;;
+            --language|-l)
+                [[ $# -ge 2 && "$2" =~ ^(rust|go|node)$ ]] || {
+                    log_error "--language requires rust, go or node"; return 4; }
+                language_filter="$2"
                 shift 2
                 ;;
             --apply)
@@ -10848,7 +10880,8 @@ cmd_repos_discover() {
                 shift
                 ;;
             *)
-                shift
+                log_error "Unknown option: $1"
+                return 4
                 ;;
         esac
     done
@@ -10884,15 +10917,18 @@ cmd_repos_discover() {
             continue
         fi
 
+        [[ -z "$language_filter" || "$language" == "$language_filter" ]] || continue
+
         # Get repo from git remote
         if [[ -d "$dir/.git" ]]; then
             local remote_url
             remote_url=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
-            if [[ -n "$remote_url" ]]; then
-                repo=$(echo "$remote_url" | sed -E 's#.*(github\.com[:/])([^/]+/[^/]+)(\.git)?$#\2#')
-                repo="${repo%.git}"
+            if [[ "$remote_url" =~ github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$ ]]; then
+                repo="${BASH_REMATCH[1]%.git}"
             fi
         fi
+        local owner="${repo%%/*}"
+        [[ -z "$org_filter" || ( -n "$repo" && "${owner,,}" == "${org_filter,,}" ) ]] || continue
 
         # Check if has release workflow
         local has_workflow=false
@@ -10948,7 +10984,13 @@ cmd_repos_discover() {
             local_path=$(echo "$entry" | jq -r '.local_path')
             language=$(echo "$entry" | jq -r '.language')
 
-            cmd_repos_add "$name" --local-path "$local_path" --language "$language" 2>/dev/null || true
+            # Register the GitHub repository when the checkout names one;
+            # check and fallback need it.
+            if [[ -n "$repo" ]]; then
+                cmd_repos_add "$repo" --name "$name" --local-path "$local_path" --language "$language" 2>/dev/null || true
+            else
+                cmd_repos_add "$name" --local-path "$local_path" --language "$language" 2>/dev/null || true
+            fi
         done
     fi
 }

@@ -119,12 +119,11 @@ test_repos_list_help() {
 
     exec_run "$DSR_CMD" repos list --help
 
-    # repos list --help runs the command (no subcommand help), output goes to stderr
-    if exec_stderr_contains "repos" || exec_stderr_contains "No repositories"; then
+    if [[ "$(exec_status)" -eq 0 ]] && exec_stdout_contains "dsr repos list" && exec_stdout_contains "--format"; then
         pass "repos list --help shows output"
     else
         fail "repos list --help should show output"
-        echo "stderr: $(exec_stderr | head -5)"
+        echo "stdout: $(exec_stdout | head -5)"
     fi
 
     harness_teardown
@@ -312,6 +311,58 @@ test_repos_validate_json_valid() {
 }
 
 # ============================================================================
+# Tests: discover filters and list formats
+# ============================================================================
+
+# Three local checkouts: Acme/alpha (rust), acme/beta (go), other/gamma (rust).
+seed_discoverable_checkouts() {
+    local root="$1" name
+    mkdir -p "$root/alpha" "$root/beta" "$root/gamma"
+    echo '[package]' > "$root/alpha/Cargo.toml"
+    echo 'module beta' > "$root/beta/go.mod"
+    echo '[package]' > "$root/gamma/Cargo.toml"
+    for name in alpha beta gamma; do
+        git -C "$root/$name" init -q
+    done
+    git -C "$root/alpha" remote add origin https://github.com/Acme/alpha.git
+    git -C "$root/beta" remote add origin git@github.com:acme/beta
+    git -C "$root/gamma" remote add origin https://github.com/other/gamma
+}
+
+test_repos_discover_filters_and_apply() {
+    ((TESTS_RUN++))
+    harness_setup
+    harness_create_config
+    local root="$TEST_TMPDIR/checkouts" problems=()
+    seed_discoverable_checkouts "$root"
+
+    exec_run "$DSR_CMD" --json repos discover --path "$root" --org acme --language rust
+    exec_stdout | jq -e '[.details.discovered[].repo] == ["Acme/alpha"]' >/dev/null ||
+        problems+=("--org/--language filter: $(exec_stdout | jq -c '[.details.discovered[].repo]' 2>/dev/null)")
+
+    exec_run "$DSR_CMD" repos discover --path "$root" --frobnicate
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("unknown option exit $(exec_status)")
+
+    # --apply registers each checkout with its GitHub repository.
+    exec_run "$DSR_CMD" repos discover --path "$root" --org acme --apply
+    exec_run "$DSR_CMD" repos list --format json
+    exec_stdout | jq -e '.command == "repos" and
+        ([.details.repos[] | select(.name == "alpha" or .name == "beta") | .repo] | sort) ==
+            ["Acme/alpha", "acme/beta"] and ([.details.repos[].name] | index("gamma") == null)' >/dev/null ||
+        problems+=("applied registry: $(exec_stdout | jq -c '[.details.repos[] | [.name, .repo]]' 2>/dev/null)")
+
+    exec_run "$DSR_CMD" repos list --format xml
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("invalid --format exit $(exec_status)")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "repos discover honors --org/--language, --apply keeps repos; list --format json is JSON"
+    else
+        fail "repos discover/list: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+# ============================================================================
 # Tests: Error Handling
 # ============================================================================
 
@@ -372,6 +423,10 @@ echo ""
 echo "repos validate Tests:"
 test_repos_validate_valid_config
 test_repos_validate_json_valid
+
+echo ""
+echo "repos discover/list formats:"
+test_repos_discover_filters_and_apply
 
 echo ""
 echo "Error Handling:"

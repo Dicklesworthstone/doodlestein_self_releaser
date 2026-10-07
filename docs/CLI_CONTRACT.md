@@ -685,6 +685,13 @@ dsr repos sync
 - Identifies repos with compatible release workflows
 - Suggests appropriate build targets based on language
 
+dsr builds from local checkouts, so discover scans `--path` (default
+`/data/projects`) for Rust, Go and Node projects and reads each checkout's
+GitHub `origin`. `--org` keeps checkouts whose GitHub owner matches
+(case-insensitive), `--language` keeps one language, and `--apply` registers
+each with its `owner/repo` and local path. `list --format json` is the JSON
+envelope; unknown options and formats exit 4.
+
 ---
 
 ### `dsr config`
