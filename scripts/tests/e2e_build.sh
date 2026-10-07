@@ -509,10 +509,63 @@ test_build_real_with_docker() {
 # Tests: Lane archives and configured include_files (GH#29)
 # ============================================================================
 
+# Use the public CLI when host reservations are available. Some hosted Linux
+# runners expose outer /proc PIDs to an inner Bash PID namespace. As in the
+# native-source-sync integration suite, substitute only slot acquisition and
+# release after a real failure plus independent namespace evidence. This
+# fixture already simulates act/Docker execution; packaging remains real.
+run_lane_build() (
+    local capacity_status=0 host_pid line namespace_line="" module
+    local -a namespace_pids=()
+    # shellcheck source=../../src/host_selector.sh
+    source "$PROJECT_ROOT/src/host_selector.sh"
+    selector_acquire_slot act-local packaging-probe > "$TEST_TMPDIR/capacity.out" \
+        2> "$TEST_TMPDIR/capacity.log" || capacity_status=$?
+    if [[ "$capacity_status" -eq 0 ]]; then
+        selector_release_slot act-local packaging-probe || return $?
+        exec "$DSR_CMD" --json build "$@"
+    fi
+    if [[ -r /proc/self/stat && -r /proc/self/status ]]; then
+        read -r host_pid _ < /proc/self/stat
+        while IFS= read -r line; do
+            [[ "$line" != NSpid:* ]] || namespace_line="${line#NSpid:}"
+        done < /proc/self/status
+        read -r -a namespace_pids <<< "$namespace_line"
+    fi
+    if [[ "$capacity_status" -ne 3 || ${#namespace_pids[@]} -lt 2 ||
+          "${host_pid:-}" == "$BASHPID" || "${namespace_pids[0]:-}" != "${host_pid:-}" ||
+          "${namespace_pids[${#namespace_pids[@]}-1]:-}" != "$BASHPID" ]]; then
+        echo "FAIL: lane capacity probe failed without PID namespace evidence ($capacity_status)" >&2
+        cat "$TEST_TMPDIR/capacity.log" >&2
+        return "$capacity_status"
+    fi
+    echo "BOUNDARY: proven /proc PID namespace mismatch; substituting act-local slot acquisition/release" >&2
+    for module in logging config build_state act_runner artifact_naming git_ops packaging; do
+        # shellcheck source=/dev/null
+        source "$PROJECT_ROOT/src/$module.sh" || return $?
+    done
+    selector_acquire_slot() {
+        [[ "$1" == act-local ]] || return 4
+        printf 'acquire %s %s\n' "$1" "$2" >> "$TEST_TMPDIR/reservations.log"
+    }
+    selector_release_slot() {
+        [[ "$1" == act-local ]] || return 4
+        printf 'release %s %s\n' "$1" "$2" >> "$TEST_TMPDIR/reservations.log"
+    }
+    export SCRIPT_DIR="$PROJECT_ROOT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1 [host_selector]=1)
+    # Run the actual command definitions, without changing their source.
+    # shellcheck disable=SC1090
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$DSR_CMD") || return $?
+    # shellcheck disable=SC1090
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$DSR_CMD") || return $?
+    cmd_build "$@"
+)
+
 # A repo whose act lane archives the executable alone under the exact release
 # name, while the config declares LICENSE and README.md as companions.
 seed_lane_archive_fixture() {
-    local repo_dir="$1"
+    local repo_dir="$1" readme_mode="${2:-644}" archive_format="${3:-tar.gz}"
 
     mkdir -p "$repo_dir/.github/workflows"
     cat > "$repo_dir/.github/workflows/release.yml" << 'YAML'
@@ -527,7 +580,8 @@ jobs:
 YAML
     echo "lane tool" > "$repo_dir/README.md"
     echo "MIT License" > "$repo_dir/LICENSE"
-    git -C "$repo_dir" init -q
+    chmod "$readme_mode" "$repo_dir/README.md"
+    git -C "$repo_dir" init -q -b main
     git -C "$repo_dir" -c user.email=test@example.com -c user.name=Test add .
     git -C "$repo_dir" -c user.email=test@example.com -c user.name=Test commit -qm init
     git -C "$repo_dir" tag v1.2.3
@@ -545,7 +599,7 @@ targets:
 act_job_map:
   linux/amd64: build
 archive_format:
-  linux: tar.gz
+  linux: $archive_format
 include_files:
   - LICENSE
   - README.md
@@ -567,7 +621,22 @@ name="lane-tool-1.2.3-linux-amd64.tar.gz"
 mkdir -p "$artifact_dir/payload"
 printf '#!/bin/sh\necho lane-tool\n' > "$artifact_dir/payload/lane-tool"
 chmod 755 "$artifact_dir/payload/lane-tool"
-tar -C "$artifact_dir/payload" -czf "$artifact_dir/$name" lane-tool
+members=(lane-tool)
+if [[ -n "${LANE_INCLUDE_STATE:-}" ]]; then
+  cp -p "$LANE_INCLUDE_ROOT/LICENSE" "$LANE_INCLUDE_ROOT/README.md" "$artifact_dir/payload/" || exit 1
+  members+=(LICENSE README.md)
+  case "$LANE_INCLUDE_STATE" in
+    wrong-content) printf 'different license\n' > "$artifact_dir/payload/LICENSE" ;;
+    wrong-mode) chmod 745 "$artifact_dir/payload/README.md" ;;
+  esac
+fi
+# Only transport/compiler execution is simulated. These are real archives;
+# non-default gzip compression makes unwanted recompression observable.
+set -o pipefail
+tar -C "$artifact_dir/payload" -cf - "${members[@]}" | gzip -1 -n > "$artifact_dir/$name" || exit 1
+if [[ -n "${LANE_ORIGINAL_ARCHIVE:-}" ]]; then
+  cp -p "$artifact_dir/$name" "$LANE_ORIGINAL_ARCHIVE" || exit 1
+fi
 rm -r "$artifact_dir/payload"
 if [[ -n "${LANE_SIDECAR:-}" ]]; then
   (cd "$artifact_dir" && sha256sum "$name" > "$name.sha256")
@@ -591,7 +660,7 @@ test_build_completes_lane_archive_with_include_files() {
     output_dir="$(harness_tmpdir)/lane-out"
     seed_lane_archive_fixture "$repo_dir"
 
-    exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir"
     local status archive alias manifest members alias_members problems=()
     status=$(exec_status)
     archive="$output_dir/lane-tool-1.2.3-linux-amd64.tar.gz"
@@ -646,7 +715,7 @@ test_build_refuses_attested_thin_lane_archive() {
     output_dir="$(harness_tmpdir)/lane-out"
     seed_lane_archive_fixture "$repo_dir"
 
-    LANE_SIDECAR=1 exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    LANE_SIDECAR=1 exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir"
     local status archive members
     status=$(exec_status)
     archive="$output_dir/lane-tool-1.2.3-linux-amd64.tar.gz"
@@ -663,6 +732,65 @@ test_build_refuses_attested_thin_lane_archive() {
     fi
 
     harness_teardown
+}
+
+test_build_checks_prebuilt_include_contract() {
+    local state format include
+    for state in complete wrong-content wrong-mode cross-format-conflict; do
+        ((TESTS_RUN++))
+        if [[ "$HAS_YQ" != "true" ]]; then
+            skip "yq required for prebuilt include contract ($state)"
+            continue
+        fi
+
+        harness_setup
+        local repo_dir output_dir original archive alias problems=()
+        repo_dir="$(harness_tmpdir)/prebuilt-repo"
+        output_dir="$(harness_tmpdir)/prebuilt-out"
+        original="$(harness_tmpdir)/original.tar.gz"
+        format=tar.gz
+        [[ "$state" != cross-format-conflict ]] || format=tar.xz
+        # Both copies of README are executable in the mode mismatch case:
+        # testing only -x would miss the additional other-execute permission.
+        seed_lane_archive_fixture "$repo_dir" 744 "$format"
+
+        local lane_state="$state"
+        [[ "$state" != cross-format-conflict ]] || lane_state=wrong-content
+        LANE_INCLUDE_STATE="$lane_state" LANE_INCLUDE_ROOT="$repo_dir" \
+            LANE_ORIGINAL_ARCHIVE="$original" exec_run run_lane_build lane-tool \
+                --version 1.2.3 --output-dir "$output_dir"
+        archive="$output_dir/lane-tool-1.2.3-linux-amd64.tar.gz"
+        alias="$output_dir/lane-tool-linux-amd64.$format"
+
+        cmp -s "$original" "$archive" || problems+=("prebuilt compressed bytes were changed")
+        if [[ "$state" == complete ]]; then
+            [[ "$(exec_status)" -eq 0 ]] || problems+=("exit $(exec_status)")
+            cmp -s "$original" "$alias" || problems+=("alias does not preserve prebuilt bytes")
+            exec_stdout | jq -e '.status == "success"' >/dev/null 2>&1 || \
+                problems+=("valid prebuilt archive was not successful")
+        else
+            include=LICENSE
+            [[ "$state" != wrong-mode ]] || include=README.md
+            [[ "$(exec_status)" -eq 1 ]] || problems+=("exit $(exec_status), expected partial failure")
+            exec_stdout | jq -e '.status == "partial" and .details.publishable == false and
+                .details.manifest_path == ""' >/dev/null 2>&1 || \
+                problems+=("mismatching prebuilt archive was advertised as publishable")
+            exec_stderr | grep -Eiq "include.*(differ|conflict).*${include}|${include}.*(differ|conflict)" || \
+                problems+=("diagnostic does not identify conflicting $include")
+            [[ ! -e "$alias" ]] || problems+=("installer alias was emitted for a rejected archive")
+            if [[ "$state" == cross-format-conflict && -e "$output_dir/lane-tool-1.2.3-linux-amd64.tar.xz" ]]; then
+                problems+=("format conversion published an archive with conflicting LICENSE")
+            fi
+        fi
+
+        if [[ ${#problems[@]} -eq 0 ]]; then
+            pass "build enforces the prebuilt include contract ($state) without changing lane bytes"
+        else
+            fail "prebuilt include contract ($state): ${problems[*]}"
+            echo "stderr: $(exec_stderr | tail -15)"
+        fi
+        harness_teardown
+    done
 }
 
 # A gnu+musl tool (bd-cdcz) whose act lane builds both variants of linux/amd64.
@@ -707,8 +835,17 @@ for libc in $libcs; do
   mkdir -p "$artifact_dir/payload-$libc"
   printf '#!/bin/sh\necho %s\n' "$libc" > "$artifact_dir/payload-$libc/lane-tool"
   chmod 755 "$artifact_dir/payload-$libc/lane-tool"
+  members=(lane-tool)
+  if [[ -n "${LANE_VARIANT_INCLUDE_CONFLICT:-}" ]]; then
+    cp -p "$LANE_INCLUDE_ROOT/LICENSE" "$artifact_dir/payload-$libc/LICENSE" || exit 1
+    [[ "$libc" != musl ]] || printf 'different license\n' > "$artifact_dir/payload-$libc/LICENSE"
+    members+=(LICENSE)
+  fi
   tar -C "$artifact_dir/payload-$libc" -czf \
-    "$artifact_dir/lane-tool-1.2.3-x86_64-unknown-linux-$libc.tar.gz" lane-tool
+    "$artifact_dir/lane-tool-1.2.3-x86_64-unknown-linux-$libc.tar.gz" "${members[@]}" || exit 1
+  if [[ "$libc" == musl && -n "${LANE_ORIGINAL_ARCHIVE:-}" ]]; then
+    cp -p "$artifact_dir/lane-tool-1.2.3-x86_64-unknown-linux-$libc.tar.gz" "$LANE_ORIGINAL_ARCHIVE" || exit 1
+  fi
   rm -r "$artifact_dir/payload-$libc"
 done
 exit 0
@@ -730,7 +867,7 @@ test_build_packages_each_target_triple_variant() {
     output_dir="$(harness_tmpdir)/variant-out"
     seed_variant_lane_fixture "$repo_dir"
 
-    exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir"
     local status libc name problems=()
     status=$(exec_status)
     [[ "$status" -eq 0 ]] || problems+=("exit $status")
@@ -769,7 +906,7 @@ test_build_names_unproduced_target_triple_variant() {
     output_dir="$(harness_tmpdir)/variant-out"
     seed_variant_lane_fixture "$repo_dir"
 
-    LANE_GNU_ONLY=1 exec_run "$DSR_CMD" --json build lane-tool --version 1.2.3 --output-dir "$output_dir"
+    LANE_GNU_ONLY=1 exec_run run_lane_build lane-tool --version 1.2.3 --output-dir "$output_dir"
     if [[ "$(exec_status)" -eq 0 ]] &&
        [[ -f "$output_dir/lane-tool-x86_64-unknown-linux-gnu.tar.gz" ]] &&
        [[ ! -e "$output_dir/lane-tool-x86_64-unknown-linux-musl.tar.gz" ]] &&
@@ -780,6 +917,43 @@ test_build_names_unproduced_target_triple_variant() {
         echo "stderr: $(exec_stderr | tail -15)"
     fi
 
+    harness_teardown
+}
+
+test_build_refuses_secondary_variant_include_conflict() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for secondary variant include contract"
+        return 0
+    fi
+
+    harness_setup
+    local repo_dir output_dir original archive problems=()
+    repo_dir="$(harness_tmpdir)/variant-repo"
+    output_dir="$(harness_tmpdir)/variant-out"
+    original="$(harness_tmpdir)/original-musl.tar.gz"
+    seed_variant_lane_fixture "$repo_dir"
+
+    LANE_VARIANT_INCLUDE_CONFLICT=1 LANE_INCLUDE_ROOT="$repo_dir" \
+        LANE_ORIGINAL_ARCHIVE="$original" exec_run run_lane_build lane-tool \
+            --version 1.2.3 --output-dir "$output_dir"
+    archive="$output_dir/lane-tool-1.2.3-x86_64-unknown-linux-musl.tar.gz"
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("exit $(exec_status), expected partial failure")
+    exec_stdout | jq -e '.status == "partial" and .details.publishable == false and
+        .details.manifest_path == ""' >/dev/null 2>&1 || \
+        problems+=("secondary variant conflict advertised a publishable build")
+    exec_stderr | grep -Eiq 'include.*(differ|conflict).*LICENSE|LICENSE.*(differ|conflict)' || \
+        problems+=("diagnostic does not identify conflicting LICENSE")
+    cmp -s "$original" "$archive" || problems+=("secondary prebuilt bytes were changed")
+    [[ ! -e "$output_dir/lane-tool-x86_64-unknown-linux-musl.tar.gz" ]] || \
+        problems+=("installer alias emitted for rejected musl variant")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "build refuses conflicting includes in a secondary target variant"
+    else
+        fail "secondary variant include contract: ${problems[*]}"
+        echo "stderr: $(exec_stderr | tail -15)"
+    fi
     harness_teardown
 }
 
@@ -887,8 +1061,10 @@ echo ""
 echo "Lane Archives and include_files:"
 test_build_completes_lane_archive_with_include_files
 test_build_refuses_attested_thin_lane_archive
+test_build_checks_prebuilt_include_contract
 test_build_packages_each_target_triple_variant
 test_build_names_unproduced_target_triple_variant
+test_build_refuses_secondary_variant_include_conflict
 
 echo ""
 echo "JSON Output Validation:"

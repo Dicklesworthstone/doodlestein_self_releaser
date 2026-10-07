@@ -3626,21 +3626,59 @@ EOF
         return 0
     }
 
-    # Configured include_files an archive lacks, one per line (GH#16, GH#29).
-    _build_archive_missing_includes() {
+    # A prebuilt companion satisfies include_files only when its bytes and
+    # executable bits match the configured source. Validate the complete
+    # archive before reporting missing members; callers must observe failure
+    # instead of treating an unreadable or conflicting archive as complete.
+    _build_archive_missing_includes() (
         local tool="$1" archive="$2" archive_format="$3" repo_path="$4"
-        local include members
-        [[ -n "$repo_path" ]] || return 0
-        members=$(packaging_payload_members "$archive" "$archive_format" 2>/dev/null || echo "")
+        local include configured payload source_bits archive_bits
+        local -a includes=() missing=()
+        configured=$(_build_get_include_files "$tool") || return 4
         while IFS= read -r include; do
-            [[ -n "$include" ]] || continue
-            if [[ ! -f "$repo_path/$include" ]]; then
-                log_warn "Include file not found for $tool: $include"
-            elif ! grep -qxF -- "$include" <<< "$members"; then
-                printf '%s\n' "$include"
+            [[ -n "$include" ]] && includes+=("$include")
+        done <<< "$configured"
+        [[ ${#includes[@]} -gt 0 ]] || return 0
+        if [[ -z "$repo_path" || ! -d "$repo_path" || -L "$repo_path" ]]; then
+            log_error "Cannot verify configured include_files for $tool without its source directory"
+            return 4
+        fi
+        payload=$(mktemp -d "${archive%/*}/.dsr-includes.XXXXXXXX") || return 4
+        trap 'rm -rf -- "$payload"' EXIT
+        trap 'exit 5' HUP INT TERM
+        if ! packaging_extract_payload "$archive" "$archive_format" "$payload"; then
+            log_error "Cannot verify configured include_files in the archive for $tool: $archive"
+            return 4
+        fi
+        for include in "${includes[@]}"; do
+            if ! packaging_member_is_safe "$include" ||
+               ! _pkg_path_has_no_links "$repo_path" "$include" ||
+               [[ ! -f "$repo_path/$include" ]]; then
+                log_error "Configured include for $tool is missing or unsafe: $include"
+                return 4
             fi
-        done < <(_build_get_include_files "$tool" 2>/dev/null)
-    }
+            if ! _pkg_path_has_no_links "$payload" "$include"; then
+                log_error "Configured include for $tool collides with an archive member: $include"
+                return 4
+            fi
+            if [[ -e "$payload/$include" ]]; then
+                if [[ ! -f "$payload/$include" ]] || ! cmp -s "$repo_path/$include" "$payload/$include"; then
+                    log_error "Configured include for $tool differs from the prebuilt archive: $include"
+                    return 4
+                fi
+                source_bits=$(_pkg_executable_bits "$repo_path/$include") || return 4
+                archive_bits=$(_pkg_executable_bits "$payload/$include") || return 4
+                if [[ "$source_bits" != "$archive_bits" ]]; then
+                    log_error "Configured include executable bits for $tool differ from the prebuilt archive: $include"
+                    return 4
+                fi
+            else
+                missing+=("$include")
+            fi
+        done
+        [[ ${#missing[@]} -eq 0 ]] || printf '%s\n' "${missing[@]}"
+        return 0
+    )
 
     # Platforms with several target-triple variants (bd-cdcz), e.g. gnu and
     # musl builds of linux/amd64. The build lane produces each variant's
@@ -3733,11 +3771,16 @@ EOF
                 fi
                 continue
             fi
-            if [[ "$format" != "binary" && "$variant_format" != none && -n "$repo_path" ]]; then
+            if [[ "$format" != "binary" && "$variant_format" != none ]]; then
+                local missing_text
+                if ! missing_text=$(_build_archive_missing_includes "$tool" "$variant_path" \
+                        "$variant_format" "$repo_path"); then
+                    collect_failed=true
+                    return 1
+                fi
                 while IFS= read -r include; do
                     [[ -n "$include" ]] && missing+=("$include")
-                done < <(_build_archive_missing_includes "$tool" "$variant_path" \
-                    "$variant_format" "$repo_path")
+                done <<< "$missing_text"
                 if [[ ${#missing[@]} -gt 0 ]] && ! _build_complete_lane_archive "$tool" "$target" \
                         "$format" "$variant_path" "$variant_format" "$compat" \
                         "$output_dir" "$repo_path" "$triple" "${missing[@]}"; then
@@ -3827,9 +3870,9 @@ EOF
             include_files+=("$include")
         done < <(_build_get_include_files "$tool" 2>/dev/null)
         if [[ ${#include_files[@]} -gt 0 && -z "$repo_path" && "$format" != "binary" ]]; then
-            # A configured include list with nowhere to read it from must
-            # never degrade into a quietly thinner archive (GH#16).
-            log_warn "include_files configured for $tool (${include_files[*]}) but local_path is unresolved; $target archive will omit them"
+            log_error "Cannot package configured include_files for $tool $target without its source directory"
+            collect_failed=true
+            return 1
         fi
 
         local existing_format="${existing_archive_formats[$target]:-}"
@@ -3911,17 +3954,15 @@ EOF
             # them instead of silently preserving a thinner member set (GH#16:
             # rano v0.2.1 lost its LICENSE this way, with no diagnostic).
             local -a missing_includes=()
-            if [[ -n "$repo_path" && ${#include_files[@]} -gt 0 ]]; then
-                local existing_members
-                existing_members=$(packaging_payload_members "$binary_path" "$input_format" 2>/dev/null || echo "")
-                for include in "${include_files[@]}"; do
-                    if [[ ! -f "$repo_path/$include" ]]; then
-                        log_warn "Include file not found for $tool: $include"
-                    elif ! grep -qxF -- "$include" <<< "$existing_members"; then
-                        missing_includes+=("$include")
-                    fi
-                done
+            local missing_text
+            if ! missing_text=$(_build_archive_missing_includes "$tool" "$binary_path" \
+                    "$input_format" "$repo_path"); then
+                collect_failed=true
+                return 1
             fi
+            while IFS= read -r include; do
+                [[ -n "$include" ]] && missing_includes+=("$include")
+            done <<< "$missing_text"
 
             if [[ "$input_format" == "$normalized_format" ]]; then
                 if [[ ${#missing_includes[@]} -eq 0 ]]; then
@@ -4212,7 +4253,7 @@ EOF
 
             if [[ "$format" != "none" ]]; then
                 _build_emit_variant_aliases "$tool" "$version" "$target" "$format" "$naming_ext" \
-                    "$output_dir" "$repo_path" "$versioned_name" "$result_json" "$compat_name"
+                    "$output_dir" "$repo_path" "$versioned_name" "$result_json" "$compat_name" || return 1
             fi
 
             # The primary's actual container determines whether it needs
@@ -4228,7 +4269,7 @@ EOF
             fi
             if [[ -n "$existing_format" && "$existing_format" == "$format" ]]; then
 
-                if [[ -n "$existing_path" && "$format" != "binary" && -n "$repo_path" && \
+                if [[ -n "$existing_path" && "$format" != "binary" && \
                       -n "$(_build_get_include_files "$tool" 2>/dev/null)" ]]; then
                     # A matching format says nothing about the members: the
                     # lane may have archived the executable alone (GH#29).
@@ -4411,7 +4452,9 @@ EOF
     fi
 
     if $all_targets_succeeded && ! $build_release_contract_enabled; then
-        _build_package_archives "$tool_name" "$version" "$output_dir" "$result" "$target_list" "$manifest_file"
+        if ! _build_package_archives "$tool_name" "$version" "$output_dir" "$result" "$target_list" "$manifest_file"; then
+            collect_failed=true
+        fi
     fi
 
     if $all_targets_succeeded && ! $build_release_contract_enabled && \
@@ -4476,7 +4519,7 @@ EOF
     # Output
     if $JSON_MODE; then
         local build_details authoritative_manifest=""
-        $all_targets_succeeded && [[ $manifest_failed == false && -f "$manifest_file" ]] && \
+        [[ $final_exit -eq 0 && -f "$manifest_file" ]] && \
             authoritative_manifest="$manifest_file"
         # Per-target results (schemas/build-details.json): which target
         # failed, where and how it built. A requested target without a
@@ -4507,7 +4550,7 @@ EOF
             --argjson duration "$duration" --arg output_dir "$output_dir" \
             --arg manifest "$authoritative_manifest" '
             {tool: $tool, repo: $repo, version: $version, build_purpose: $build_purpose,
-             publishable: ($build_purpose == "release"), run_id: $run_id,
+             publishable: ($build_purpose == "release" and $manifest != ""), run_id: $run_id,
              source_sync: $source_sync,
              targets: [($targets | split(" ") | map(select(length > 0)))[] as $platform |
                  ($results | map(select(.platform == $platform))) as $matches |
@@ -4539,10 +4582,10 @@ EOF
             log_info "  Failed:   $failed"
         fi
         echo ""
-        if $all_targets_succeeded && [[ $manifest_failed == false && -f "$manifest_file" ]]; then
+        if [[ $final_exit -eq 0 && -f "$manifest_file" ]]; then
             log_ok "Manifest: $manifest_file"
         elif [[ $success -gt 0 ]]; then
-            log_warn "Manifest withheld until every requested target succeeds"
+            log_warn "Manifest withheld until every requested target and packaging step succeeds"
         fi
         log_info "Artifacts: $output_dir"
     fi
