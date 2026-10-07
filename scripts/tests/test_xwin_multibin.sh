@@ -71,9 +71,21 @@ root = Path.cwd()
 mode = (root/'mode').read_text().strip()
 spec = [('server', 'server-package'), ('client', 'client-package')]
 if mode == 'same-package': spec = [(b, 'workspace-package') for b, _ in spec]
+requested = sorted({f for i,a in enumerate(args) if a == '--features' for f in args[i+1].split(',')})
+selection = {'features':requested,'all_features':'--all-features' in args,
+             'no_default_features':'--no-default-features' in args}
+def active_features(package):
+    if not mode.startswith('feature-'): return []
+    available = ['portable'] if package == 'server-package' else ['fast']
+    result = set([] if selection['no_default_features'] else ['default'])
+    if selection['all_features']: result.update(['default'] + available)
+    result.update(f.split('/')[-1] for f in requested if '/' not in f or f.split('/')[0] == package)
+    return sorted(result)
 def identity(package): return 'path+file://' + str(root) + '#' + package + '@1.2.3'
 with (Path(os.environ['HOME']).parent/'protocol-calls').open('a') as log:
     log.write(role + '\n')
+with (Path(os.environ['HOME']).parent/'protocol-options.jsonl').open('a') as log:
+    log.write(json.dumps({'role':role,'selection':selection})+'\n')
 if role == 'cargo':
     assert args[0] == 'metadata' and '--locked' in args and '--offline' in args
     packages = []
@@ -85,10 +97,13 @@ if role == 'cargo':
         if mode == 'inactive-feature':
             for b in binaries:
                 if b['name'] == 'client': b['required-features'] = ['not-selected']
+        if mode.startswith('feature-'):
+            for b in binaries:
+                b['required-features'] = ['portable' if b['name'] == 'server' else 'fast']
         packages.append({'id':identity(package), 'name':package, 'version':version, 'source':None,
                          'manifest_path':str(root/selected[0]/'Cargo.toml'), 'targets':binaries})
     members = [p['id'] for p in packages]
-    nodes = [{'id':i, 'dependencies':[], 'features':[], 'deps':[]} for i in members]
+    nodes = [{'id':p['id'], 'dependencies':[], 'features':active_features(p['name']), 'deps':[]} for p in packages]
     print(json.dumps({'version':1, 'workspace_root':str(root), 'workspace_members':members,
         'workspace_default_members':members, 'packages':packages,
         'resolve':{'root':None, 'nodes':nodes}, 'target_directory':os.environ['CARGO_TARGET_DIR']}))
@@ -119,7 +134,7 @@ for binary in binaries:
     package = dict(spec)[binary]
     message = {'reason':'compiler-artifact', 'package_id':identity(package),
         'target':{'name':binary, 'kind':['bin'], 'src_path':str(root/binary/'main.rs')},
-        'features':[], 'profile':{'test':False}, 'executable':str(exe)}
+        'features':active_features(package), 'profile':{'test':False}, 'executable':str(exe)}
     if binary == 'client':
         if mode == 'missing-secondary': exe.rename(exe.with_suffix('.hidden'))
         if mode == 'truncated-secondary': exe.write_bytes(exe.read_bytes()[:64])
@@ -132,6 +147,8 @@ for binary in binaries:
         if mode == 'missing-message': continue
         if mode == 'duplicate-message': messages.append(message)
     messages.append(message)
+if mode == 'feature-selection-drift':
+    (Path(os.environ['HOME']).parent/'feature-selection.json').write_text('{}\n')
 if mode == 'unexpected-binary':
     extra = json.loads(json.dumps(messages[0])); extra['target']['name'] = 'unplanned'; messages.append(extra)
 finished = {'reason':'build-finished', 'success':True}
@@ -211,6 +228,27 @@ if release:
     check('single binary retains the scalar receipt and custom release name', single['artifact']==single['artifacts'][0] and single['artifact']['name']=='server-custom.exe')
     ordinary, raw = build('ordinary', release=False)
     check('ordinary multi-binary mode also validates every output', [a['name'] for a in raw['artifacts']]==['server.exe','client.exe'])
+    explicit_flags = ('--features','client-package/fast,server-package/portable','--features','client-package/fast',
+                      '--no-default-features')
+    for mode, flags, expected in (
+        ('feature-explicit', explicit_flags,
+         {'features':['client-package/fast','server-package/portable'],'all_features':False,'no_default_features':True}),
+        ('feature-all', ('--all-features','--no-default-features'),
+         {'features':[],'all_features':True,'no_default_features':True}),
+    ):
+        directory, value = build(mode, extra=flags)
+        calls = [json.loads(line) for line in (directory/'protocol-options.jsonl').read_text().splitlines()]
+        check(mode+' passes identical selected features to both metadata phases and cargo-xwin',
+              [c['role'] for c in calls] == ['cargo','cargo-xwin','cargo'] and all(c['selection']==expected for c in calls))
+        check(mode+' retains immutable requested feature identity in result and release manifest',
+              value['feature_selection']==expected and read(directory/'feature-selection.json')==expected and
+              read(directory/'release/build-manifest.json')['build_environments'][0]['feature_selection']==expected)
+        check(mode+' admits the complete feature-gated binary family', len(value['artifacts'])==2)
+    ordinary_features, selected_raw = build('feature-ordinary', extra=explicit_flags, release=False)
+    check('ordinary builds also receive and retain explicit feature selection',
+          selected_raw['feature_selection']['features']==['client-package/fast','server-package/portable'] and
+          read(ordinary_features/'command.json').count('--features')==1)
+    build('feature-selection-drift', 7, extra=explicit_flags)
     for mode in ('metadata-missing','bad-version','inactive-feature','missing-message','duplicate-message','wrong-package',
                  'wrong-source','wrong-features','test-profile','unexpected-binary','early-finish','missing-secondary',
                  'truncated-secondary','linked-secondary','wrong-arch-secondary','source-drift'):
@@ -221,6 +259,8 @@ if release:
     for mode, bins, extra in (
         ('duplicate-bin', ('server','server'), ()), ('case-collision', ('server','SERVER'), ()),
         ('unsafe-bin', ('server','../client'), ()), ('single-name-for-multiple', ('server','client'), ('--asset-name','one.exe')),
+        ('unsafe-feature', ('server','client'), ('--features','worker//hidden')),
+        ('empty-feature', ('server','client'), ('--features',' , ')),
     ):
         output = build(mode, 4, binaries=bins, extra=extra)
         check(mode+' rejected before creating a run', not output.exists())

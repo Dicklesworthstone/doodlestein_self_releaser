@@ -10,7 +10,9 @@ for dependency in cargo rustc jq python3 rg; do
     }
 done
 # shellcheck source=../../src/xwin_source.sh
-source "$ROOT/src/xwin_source.sh"
+source "${XWIN_TEST_ROOT:-$ROOT}/src/xwin_source.sh"
+# shellcheck source=../../src/xwin_build.sh
+source "${XWIN_TEST_ROOT:-$ROOT}/src/xwin_build.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-xwin-workspace.XXXXXXXX") || exit 1
 printf 'Fixtures: %s\n' "$WORK"
 printf 'BOUNDARY: genuine Windows-filtered Cargo metadata and Linux compilation; no Windows linkage proof\n'
@@ -78,6 +80,8 @@ version = "1.2.3"
 edition = "2021"
 [features]
 hidden = []
+extra = []
+"naïve.1" = []
 [[bin]]
 name = "xwin-worker"
 path = "src/main.rs"
@@ -153,6 +157,88 @@ reject_bins package-restricted 'missing or ambiguous: xwin-helper' \
 reject_bins missing 'missing or ambiguous: nonexistent' xwin-family '' '["xwin-family","nonexistent"]'
 reject_bins inactive-feature 'requires inactive features' xwin-family '' '["xwin-family","xwin-hidden"]'
 reject_bins wrong-version 'differs from the release tag' xwin-family '' '["xwin-family"]' 9.9.9
+
+# Run the production metadata helper with genuine Cargo. These explicit
+# options were formerly rejected by the CLI and absent from metadata/build.
+metadata_features() {
+    local label="$1" all="$2" no_default="$3"; shift 3
+    local directory="$WORK/features-$label" selection status=0
+    selection=$(_xwb_feature_selection "$all" "$no_default" "$@") || return $?
+    mkdir -p "$directory/bin" || return 1
+    ln -s "$(command -v cargo)" "$directory/bin/cargo" || return 1
+    printf '%s\0' "PATH=$PATH" "HOME=$WORK" "CARGO_HOME=$CARGO_HOME" \
+        "CARGO_TARGET_DIR=$directory/target" "RUSTC=$(command -v rustc)" \
+        "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RCH_DISABLED=1" "RCH_CARGO_WRAPPER_BYPASS=1" \
+        > "$directory/environment.nul"
+    printf '%s\n' "$selection" > "$directory/features.json"
+    _xwb_metadata "$WORK/project" "$directory" before xwin-hidden '' 1.2.3 true 30 '' \
+        '["xwin-hidden","xwin-helper"]' "$selection" \
+        > "$directory/metadata.stdout" 2> "$directory/metadata.stderr" || status=$?
+    return "$status"
+}
+STATUS=0
+metadata_features explicit false true 'worker-package/hidden, helper-package/publish' \
+    'worker-package/extra worker-package/hidden' || STATUS=$?
+check 'explicit additive features admit two feature-gated workspace executables' equal "$STATUS" 0
+check 'repeat/comma/space forms freeze one sorted feature set' jq -e \
+    '. == {features:["helper-package/publish","worker-package/extra","worker-package/hidden"],all_features:false,no_default_features:true}' \
+    "$WORK/features-explicit/features.json"
+check 'genuine metadata enables requested features and disables package defaults' jq -e \
+    '[.binaries[].features] == [["extra","hidden"],["publish"]]' "$WORK/features-explicit/selection-before.json"
+STATUS=0
+metadata_features unqualified false false 'hidden' || STATUS=$?
+check 'Cargo unqualified feature selection reaches its workspace provider' equal "$STATUS" 0
+STATUS=0
+metadata_features all true true || STATUS=$?
+check 'all-features and no-default-features retain Cargo additive semantics' equal "$STATUS" 0
+check 'all-features includes the default feature and Unicode feature names' jq -e \
+    '[.binaries[].features] == [["extra","hidden","naïve.1"],["default","publish"]]' \
+    "$WORK/features-all/selection-before.json"
+STATUS=0
+metadata_features unicode false false 'worker-package/hidden,worker-package/naïve.1' || STATUS=$?
+check 'Cargo Unicode and dotted feature names survive argument transport' equal "$STATUS" 0
+STATUS=0
+metadata_features disabled false true 'worker-package/hidden' || STATUS=$?
+check 'omitting a required feature still refuses the selected family' equal "$STATUS" 7
+check 'required-feature failure emits no admitted selection' test ! -s "$WORK/features-disabled/selection-before.json"
+STATUS=0
+metadata_features unknown false false nonexistent || STATUS=$?
+check 'unknown but syntactically valid names fail through genuine Cargo resolution' equal "$STATUS" 101
+
+# The same canonical arguments consumed by the pinned build must cause actual
+# Rust compilation to select precisely the features admitted by metadata.
+FEATURE_ARGS=()
+while IFS= read -r argument; do FEATURE_ARGS+=("$argument"); done < <(
+    _xwb_feature_arguments "$(cat "$WORK/features-explicit/features.json")")
+STATUS=0
+cargo build --release --locked --offline --manifest-path "$WORK/project/Cargo.toml" \
+    --target-dir "$WORK/feature-target" --message-format=json \
+    --bin xwin-hidden --bin xwin-helper --package worker-package --package helper-package \
+    "${FEATURE_ARGS[@]}" > "$WORK/features.messages.jsonl" 2> "$WORK/features.build.log" || STATUS=$?
+check 'genuine Rust compilation succeeds for both explicitly enabled binaries' equal "$STATUS" 0
+check 'compiled hidden binary runs its committed implementation' equal \
+    "$("$WORK/feature-target/release/xwin-hidden" 2>/dev/null)" hidden-package
+check 'metadata feature identities equal the real compiler-artifact messages' \
+    python3 - "$WORK/features-explicit/selection-before.json" "$WORK/features.messages.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+selected = json.loads(Path(sys.argv[1]).read_text())["binaries"]
+actual = [json.loads(line) for line in Path(sys.argv[2]).read_text().splitlines()]
+actual = [m for m in actual if m.get("reason") == "compiler-artifact" and m.get("executable")]
+assert len(actual) == len(selected) == 2
+for expected in selected:
+    matches = [m for m in actual if m["package_id"] == expected["package_id"] and
+               m["target"]["name"] == expected["binary"]]
+    assert len(matches) == 1 and sorted(matches[0]["features"]) == expected["features"]
+PY
+for invalid in '' ' , ' '../hidden' 'worker//hidden' 'worker/' '/hidden' 'dep:hidden' \
+    'worker?/hidden' 'hidden;touch' 'hidden$(date)' $'hidden\nextra'; do
+    STATUS=0
+    _xwb_feature_selection false false "$invalid" > "$WORK/invalid-feature.json" \
+        2> "$WORK/invalid-feature.log" || STATUS=$?
+    check "invalid feature syntax refuses before launch: $(printf '%q' "$invalid")" equal "$STATUS" 4
+done
 
 # Add a second provider outside default-members using real Cargo metadata.
 # Default membership must never silently break an explicitly named ambiguity.

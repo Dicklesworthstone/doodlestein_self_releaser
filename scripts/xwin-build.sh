@@ -6,12 +6,14 @@ source "$SCRIPT_DIR/../src/xwin_build.sh" || exit 3
 if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     printf '%s\n' 'Usage: xwin-build.sh --manifest FILE --project DIR --bin NAME [--bin NAME ...] --run-dir NEW_DIR' \
         '       [--package NAME] [--cache-dir DIR] [--cargo-cache DIR] [--offline] [--timeout SECONDS]' \
+        '       [--features "NAME,PACKAGE/NAME ..."] [--all-features] [--no-default-features]' \
         '       [--release-repo OWNER/REPO --release-tag vX.Y.Z --source-sha COMMIT]' \
         '       [--tool NAME] [--asset-name NAME.exe] [--sibling-crates PINNED_SIBLINGS.json]' \
         'Build 1..32 Windows ARM64 executables in one invocation; stdout is a verified JSON receipt.' \
         'Release mode stages committed source and emits release/build-manifest.json for DSR publication.' \
         'Multiple binaries require --tool in release mode; --asset-name is only valid for a single binary.' \
-        'Use --package to select one workspace package, or let each binary resolve among default members.' \
+        'Use --package to select one workspace package, or resolve each explicit binary across workspace members.' \
+        'Feature lists are additive and repeatable; identical flags select metadata and the pinned build.' \
         'Sibling crates require release mode and explicit repository/commit pins; see docs/XWIN_BUILD.md.'
     exit 0
 fi

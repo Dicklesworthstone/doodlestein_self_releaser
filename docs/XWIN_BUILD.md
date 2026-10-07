@@ -37,6 +37,47 @@ regular `Cargo.toml` and `Cargo.lock`. `--timeout SECONDS` bounds compilation
 cache. Build execution also requires Python 3.9+, GNU timeout, and util-linux
 setsid on a Linux host. Release mode additionally requires Git.
 
+### Select Cargo features
+
+The runner accepts Cargo's `--features`, `--all-features`, and
+`--no-default-features` options in ordinary and source-pinned release modes.
+Repeated `--features` options add to one selection; each value can contain
+comma-separated or space-separated names. Workspace members can be addressed
+with `package-name/feature-name`:
+
+```bash
+bash scripts/xwin-build.sh \
+  --manifest /opt/pinned/windows-arm64-toolchain.json \
+  --project /var/tmp/dsr-staged/project \
+  --bin server --bin client \
+  --features "server-package/tls,client-package/cli" \
+  --no-default-features \
+  --run-dir /var/tmp/dsr-runs/windows-arm64-features-001 --offline
+```
+
+Names retain case and support Cargo's Unicode identifier characters, digits,
+underscores, and subsequent `-`, `+`, or `.`. Empty selections, control
+characters, malformed qualifiers, shell expressions, and manifest-only
+dependency expressions such as `dep:foo` or `foo?/bar` are refused before a run
+is created. Cargo checks whether syntactically valid features actually exist.
+The flags retain Cargo's additive semantics: `--all-features` can also enable
+the feature named `default` when `--no-default-features` is present. See
+[Cargo's feature selection rules](https://doc.rust-lang.org/cargo/reference/features.html#command-line-feature-options).
+
+The runner sorts and deduplicates requested names once and records them in
+`run/feature-selection.json`. The two locked metadata observations and the
+pinned cargo-xwin invocation receive the same feature arguments. A binary with
+`required-features` is admitted only when those features are active; all
+selected workspace binaries must still produce matching compiler-artifact
+records. A feature list cannot make an absent companion executable optional.
+
+The requested selection is retained as `feature_selection` in the result and
+release manifest's build environment, alongside the exact command and each
+binary's resolved features. Changing its private receipt during preparation,
+metadata, or compilation prevents release success. Metadata and actual
+compiler feature sets must agree; incompatible workspace feature resolution
+still fails admission.
+
 `--offline` requests Cargo's offline behavior. Without it, Cargo may fetch
 locked dependencies. `--cargo-cache` is optional: only its `registry/` and
 `git/` directories are copied into a fresh, independently owned Cargo home
@@ -308,6 +349,8 @@ bash scripts/tests/test_xwin_build.sh
 bash scripts/tests/test_xwin_toolchain_scale.sh
 bash scripts/tests/test_xwin_source.sh
 bash scripts/tests/test_xwin_release_build.sh
+bash scripts/tests/test_xwin_metadata_workspace.sh
+bash scripts/tests/test_xwin_multibin.sh
 ```
 
 The build tests use command-boundary stand-ins for Cargo, rustc, and cargo-xwin,
@@ -320,3 +363,11 @@ and reject staged sibling/plan/metadata drift without emitting a release.
 These are not actual Cargo path-dependency compilation tests. No actual BLAKE3
 1.8.5 plus ring Rust build or Windows-host execution is claimed. That production
 acceptance check remains necessary before closing `dsr-h4y0`.
+
+The workspace metadata suite separately runs genuine Windows-filtered Cargo
+resolution and native Rust compilation for explicit feature selections,
+default suppression, all-features, and multiple required-feature binaries.
+Those native executables run on the test host; that evidence does not claim a
+Rust Windows link. The multi-binary runner suite exercises the complete pinned
+build and release handoff with real LLVM ARM64 linking and explicit Cargo
+command-boundary fixtures, including feature-receipt drift refusal.

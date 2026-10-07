@@ -108,6 +108,35 @@ repositories, add `"siblings": {"path": "/srv/pinned/siblings.json",
 `--sibling-crates`; the existing runner enforces its individual repository pins.
 Toolchain and sibling manifests are configuration, not executable script text.
 
+For executables that need optional Cargo features, an xwin job may also set:
+
+```json
+{
+  "features": ["demo/cli", "demo/tls"],
+  "all_features": false,
+  "no_default_features": true
+}
+```
+
+These are fields on the existing xwin job. `features` is an array of separate
+Cargo feature names, including `package-name/feature-name` for workspace
+members. The two switches must be JSON booleans. Omitted fields select Cargo's
+ordinary defaults. Empty arrays and false switches normalize to omission;
+feature ordering and duplicates do not change plan identity. The pinned
+runner receives one normalized feature list and identical options for both
+metadata observations and compilation. `--all-features` retains Cargo's own
+additive behavior when combined with `--no-default-features`.
+
+Feature selections belong to the frozen build plan and exact command receipt.
+Retries and recovery cannot change a feature name or switch while reusing a
+completed compiler attempt. When a plan selects features, bundle admission
+also requires the producer manifest to retain that exact `feature_selection`
+under its Windows ARM64 build environment. Missing or contradictory evidence
+keeps the job incomplete. An explicitly recorded selection must also agree
+when the plan requests default features; a producer cannot silently disable
+defaults or add features to that plan. Multiple requested binaries must all pass the
+existing source, resolved-feature, and executable checks.
+
 An import job has exactly `id`, `driver: "import"`, `targets`, `manifest`,
 `manifest_sha256`, and `artifacts_dir`. It can be combined with either build
 driver. It never runs a compiler, and its output hash must be selected in advance.

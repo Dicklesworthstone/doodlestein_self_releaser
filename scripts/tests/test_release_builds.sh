@@ -7,7 +7,7 @@ for tool in python3 bash jq flock timeout sha256sum; do
     command -v "$tool" >/dev/null || { printf 'SKIP requires %s\n' "$tool"; exit 0; }
 done
 [[ "$(uname -s)" == Linux ]] || { printf 'SKIP requires Linux\n'; exit 0; }
-python3 - "$ROOT" <<'PY'
+python3 - "${RELEASE_BUILDS_TEST_ROOT:-$ROOT}" <<'PY'
 import hashlib
 import json
 import os
@@ -75,6 +75,11 @@ else:
     tool, tag, source = arg('--tool'), arg('--release-tag'), arg('--source-sha')
     assert arg('--release-repo') == 'owner/demo' and arg('--bin') == 'demo'
     assert arg('--package') == 'demo-package' and '--offline' in args
+    if '--features' in args:
+        assert arg('--features') == 'demo-package/cli,demo-package/tls'
+        assert '--all-features' in args and '--no-default-features' in args
+    else:
+        assert '--all-features' not in args and '--no-default-features' not in args
     assert json.loads(Path(arg('--sibling-crates')).read_text()) == []
 trace = Path(spec['trace'])
 def event(phase):
@@ -102,6 +107,14 @@ value = {'schema_version':'1.0.0', 'tool':tool, 'version':tag, 'run_id':'1234567
          'source':{'git_sha':source, 'git_ref':'refs/tags/'+tag, 'dependencies':[]}, 'built_at':'2026-09-22T00:00:00Z',
          'status':'success', 'summary':{'total':len(targets), 'success':len(targets), 'failed':0}, 'artifacts':artifacts,
          'build_environments':[{'target':target, 'method':kind, 'retained_evidence':'x'*150000} for target in targets]}
+if kind == 'xwin':
+    value['build_environments'][0]['feature_selection'] = {
+        'features':arg('--features').split(',') if '--features' in args else [], 'all_features':'--all-features' in args,
+        'no_default_features':'--no-default-features' in args}
+    if mode == 'feature-drift': value['build_environments'][0]['feature_selection']['features'] = []
+    if mode == 'feature-missing': del value['build_environments'][0]['feature_selection']
+    if mode == 'feature-boolean': value['build_environments'][0]['feature_selection']['all_features'] = 1
+    if mode == 'feature-reverse': value['build_environments'][0]['feature_selection']['no_default_features'] = True
 if mode == 'wrong-source': value['source']['git_sha'] = 'b'*40
 if mode == 'bad-hash': value['artifacts'][0]['sha256'] = '0'*64
 if mode == 'diagnostic': value['publishable'] = False
@@ -142,6 +155,8 @@ print(json.dumps(response))
     windows = {'id':'windows', 'driver':'xwin', 'targets':['windows/arm64'], 'project':str(work/'project'),
                'toolchain_manifest':str(toolchain), 'toolchain_sha256':sha(toolchain), 'binary':'demo',
                'package':'demo-package', 'offline':True, 'asset_name':'demo-windows-arm64.exe',
+               'features':['demo-package/tls','demo-package/cli','demo-package/tls'],
+               'all_features':True, 'no_default_features':True,
                'siblings':{'path':str(siblings),'sha256':sha(siblings)}}
     plan = {'schema_version':1,'repo':'owner/demo','tool':'demo','tag':'v1.2.3','source_sha':'a'*40,
             'required_targets':['linux/amd64','darwin/arm64','windows/arm64'],'builds':[a,b,windows]}
@@ -165,6 +180,9 @@ print(json.dumps(response))
     check('incomplete matrix has no publishable bundle', not (output/'bundle').exists() and not result['publishable'])
     state = read(output/'state.json')
     check('compiler status is retained per attempt', state['jobs']['windows']['attempts'][0]['exit_code']==42)
+    check('feature input ordering and duplicates normalize before a retry can observe them',
+          next(j for j in read(output/'plan.json')['builds'] if j['id']=='windows')['features'] ==
+          ['demo-package/cli','demo-package/tls'])
     events = [json.loads(line) for line in trace.read_text().splitlines()]
     live = maximum = 0
     for item in events:
@@ -179,6 +197,9 @@ print(json.dumps(response))
     check('all targets reach the existing bundle collector', result['bundle']['targets']==sorted(plan['required_targets']))
     check('large producer evidence survives full execution/aggregation', Path(result['bundle']['manifest']).stat().st_size>450000)
     check('complete manifests are pinned only after successful execution', all(sha(Path(j['manifest']))==j['manifest_sha256'] for j in read(output/'build-set.json')['builds']))
+    check('selected Cargo features survive publication-manifest aggregation',
+          next(e for e in read(Path(result['bundle']['manifest']))['build_environments'] if e['target']=='windows/arm64')['feature_selection'] ==
+          {'features':['demo-package/cli','demo-package/tls'],'all_features':True,'no_default_features':True})
     before_trace=trace.read_bytes()
     before_hash=result['bundle']['manifest_sha256']
     # Original compiler outputs are no longer the checkpoint authority.
@@ -187,12 +208,19 @@ print(json.dumps(response))
     result = run(output)
     check('completed builds are independently verified without recompilation', trace.read_bytes()==before_trace and result['bundle']['manifest_sha256']==before_hash)
     reordered=json.loads(json.dumps(plan)); reordered['builds'].reverse(); reordered['required_targets'].reverse()
+    next(j for j in reordered['builds'] if j['id']=='windows')['features'].reverse()
     encode(work/'reordered.json',reordered)
     result=run(output,selected=work/'reordered.json')
     check('plan ordering does not change recovery identity', result['bundle']['manifest_sha256']==before_hash)
     changed=json.loads(json.dumps(plan)); changed['builds'][0]['timeout']=12; encode(work/'changed.json',changed)
     run(output,2,work/'changed.json')
     check('changed plans cannot reuse completed work', trace.read_bytes()==before_trace)
+    for key, replacement in (('features',['demo-package/cli']), ('all_features',False), ('no_default_features',False)):
+        changed=json.loads(json.dumps(plan))
+        next(j for j in changed['builds'] if j['id']=='windows')[key]=replacement
+        encode(work/'changed-features.json',changed)
+        run(output,2,work/'changed-features.json')
+        check(key+' cannot change when reusing completed compilation',trace.read_bytes()==before_trace)
     checkpoint=output/'completed/linux/artifacts/demo-linux-amd64.bin'
     original_bytes=checkpoint.read_bytes(); checkpoint.write_bytes(b'corrupted')
     run(output,7)
@@ -218,6 +246,45 @@ print(json.dumps(response))
           result['failed_builds']==['linux'] and result['completed_builds']==1 and
           (work/'malformed-mixed/completed/darwin/build-manifest.json').is_file())
     controls['linux'].write_text('good')
+    feature_only=dict(plan,required_targets=windows['targets'],builds=[windows]); encode(work/'feature-only.json',feature_only)
+    for mode in ('feature-drift','feature-missing','feature-boolean'):
+        controls['windows'].write_text(mode)
+        folder=work/('reject-'+mode)
+        run(folder,1,work/'feature-only.json')
+        check(mode+' cannot admit a manifest with different Cargo feature authority',
+              not (folder/'completed/windows').exists() and not (folder/'bundle').exists())
+    controls['windows'].write_text('good')
+    default_features=json.loads(json.dumps(feature_only))
+    for key in ('features','all_features','no_default_features'):
+        del default_features['builds'][0][key]
+    encode(work/'default-features.json',default_features)
+    run(work/'default-features',selected=work/'default-features.json')
+    check('omitted options match an explicitly recorded default Cargo selection',
+          read(work/'default-features/completed/windows/build-manifest.json')['build_environments'][0]['feature_selection'] ==
+          {'features':[],'all_features':False,'no_default_features':False})
+    controls['windows'].write_text('feature-reverse')
+    run(work/'feature-reverse',1,work/'default-features.json')
+    check('default feature plan rejects a producer that explicitly disables defaults',
+          not (work/'feature-reverse/completed/windows').exists() and not (work/'feature-reverse/bundle').exists())
+    controls['windows'].write_text('good')
+    for label, key, value in (
+        ('string-features','features','demo-package/cli'),
+        ('empty-feature','features',['']),
+        ('joined-features','features',['cli,tls']),
+        ('path-feature','features',['../cli']),
+        ('expression-feature','features',['dep:cli']),
+        ('control-feature','features',['cli\ntls']),
+        ('string-all','all_features','true'),
+        ('numeric-default','no_default_features',1),
+    ):
+        invalid=json.loads(json.dumps(feature_only)); invalid['builds'][0][key]=value
+        encode(work/'invalid-features.json',invalid)
+        folder=work/('invalid-'+label); before_trace=trace.read_bytes()
+        run(folder,4,work/'invalid-features.json')
+        check(label+' fails before starting a builder or creating state', not folder.exists() and trace.read_bytes()==before_trace)
+    if os.environ.get('RELEASE_BUILDS_TEST_FEATURES_ONLY') == '1':
+        print(f'Cargo feature plan/recovery/admission checks: {passes} passed, 0 failed; process lifecycle cases not selected', flush=True)
+        sys.exit(0)
     # Missing reviewed file/hash fails before any child starts.
     changed=json.loads(json.dumps(single)); changed['builds'][0]['config_files']['config.yaml']='0'*64; encode(work/'badpin.json',changed)
     before_trace=trace.read_bytes(); run(work/'badpin',1,work/'badpin.json')

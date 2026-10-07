@@ -109,6 +109,15 @@ def matches(value, pattern):
 def name(value):
     return matches(value, r"[A-Za-z0-9][A-Za-z0-9._+-]*") and ".." not in value
 
+def cargo_feature(value):
+    # Same Cargo Unicode XID/name rules used by the pinned runner. A plan
+    # provides separate names, so commas/spaces are only CLI list separators.
+    def component(part):
+        return bool(part) and (part[0].isidentifier() or part[0] in "0123456789") and all(
+            c in "-+." or ("x" + c).isidentifier() for c in part[1:])
+    return isinstance(value, str) and len(value.split("/")) <= 2 and all(
+        component(part) for part in value.split("/"))
+
 def sha(value):
     return matches(value, r"[0-9a-f]{64}")
 
@@ -165,7 +174,7 @@ def validate(value):
             require(type(job.get("resume", False)) is bool, "native resume must be boolean", 4)
         elif kind == "xwin":
             require({"project", "toolchain_manifest", "toolchain_sha256"} <= set(job) and
-                    set(job) <= base | {"project", "toolchain_manifest", "toolchain_sha256", "binary", "binaries", "package", "asset_name", "siblings", "cargo_cache", "cache_dir", "offline"} and
+                    set(job) <= base | {"project", "toolchain_manifest", "toolchain_sha256", "binary", "binaries", "package", "asset_name", "siblings", "cargo_cache", "cache_dir", "offline", "features", "all_features", "no_default_features"} and
                     ("binary" in job) != ("binaries" in job), "xwin requires exactly one of binary or binaries", 4)
             path(job["project"]); path(job["toolchain_manifest"])
             binaries = job["binaries"] if "binaries" in job else [job["binary"]]
@@ -180,6 +189,17 @@ def validate(value):
                     path(job[key])
             if "package" in job:
                 require(matches(job["package"], r"[A-Za-z0-9][A-Za-z0-9_-]*"), "invalid package", 4)
+            if "features" in job:
+                require(isinstance(job["features"], list) and all(cargo_feature(f) for f in job["features"]),
+                        "features must be an array of Cargo feature names", 4)
+                job["features"] = sorted(set(job["features"]))
+                if not job["features"]:
+                    del job["features"]
+            for key in ("all_features", "no_default_features"):
+                if key in job:
+                    require(type(job[key]) is bool, key + " must be boolean", 4)
+                    if not job[key]:
+                        del job[key]
             if "asset_name" in job:
                 require(len(binaries) == 1 and name(job["asset_name"]) and job["asset_name"].endswith(".exe"),
                         "asset_name can rename only one executable", 4)
@@ -271,6 +291,20 @@ def require_xwin_inventory(job, manifest, pin):
     actual = sorted([{k: a.get(k) for k in ("name", "target", "archive_format")} for a in value["artifacts"]],
                     key=lambda a: a["name"])
     require(actual == xwin_assets(job), "xwin output omits or changes selected executables")
+    environments = value.get("build_environments", [])
+    has_selection = isinstance(environments, list) and any(isinstance(e, dict) and
+        e.get("target") == "windows/arm64" and "feature_selection" in e for e in environments)
+    if has_selection or job.get("features") or job.get("all_features") or job.get("no_default_features"):
+        expected = {"features": job.get("features", []), "all_features": job.get("all_features", False),
+                    "no_default_features": job.get("no_default_features", False)}
+        require(isinstance(environments, list) and all(isinstance(e, dict) for e in environments),
+                "invalid xwin build environments")
+        selected = [e for e in environments if e.get("target") == "windows/arm64"]
+        observed = selected[0].get("feature_selection") if len(selected) == 1 else None
+        require(isinstance(observed, dict) and
+                all(type(observed.get(key)) is bool for key in ("all_features", "no_default_features")) and
+                observed == expected,
+                "xwin manifest does not attest the selected Cargo features")
 
 def helper(operation, entry, destination, directory):
     # The source and program are fixed; untrusted JSON/paths are arguments, not
@@ -327,6 +361,11 @@ def xwin_command(job, attempt):
             command += [option, job[key]]
     if job["offline"]:
         command.append("--offline")
+    if job.get("features"):
+        command += ["--features", ",".join(job["features"])]
+    for key, option in (("all_features", "--all-features"), ("no_default_features", "--no-default-features")):
+        if job.get(key, False):
+            command.append(option)
     if "siblings" in job:
         command += ["--sibling-crates", str(attempt / "siblings.json")]
     return command

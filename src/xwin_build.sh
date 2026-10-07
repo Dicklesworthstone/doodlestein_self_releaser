@@ -7,6 +7,46 @@ source "$_XWIN_BUILD_DIR/xwin_toolchain.sh"
 # shellcheck source=src/cargo_cache.sh
 source "$_XWIN_BUILD_DIR/cargo_cache.sh"
 
+# Cargo accepts additive repeated/comma/space feature lists. Canonicalize once
+# before creating a run, then use the frozen selection for metadata and build.
+# Feature names follow Cargo's Unicode XID rules with its extra punctuation;
+# dependency-expression syntax (dep:foo and foo?/bar) belongs in Cargo.toml.
+_xwb_feature_selection() {
+    command -v python3 >/dev/null || return 3
+    python3 - "$@" <<'PY'
+import json
+import re
+import sys
+
+def component(value):
+    return bool(value) and (value[0].isidentifier() or value[0] in "0123456789") and all(
+        c in "-+." or ("x" + c).isidentifier() for c in value[1:])
+
+try:
+    all_features, no_default_features, *lists = sys.argv[1:]
+    if all_features not in ("true", "false") or no_default_features not in ("true", "false"):
+        raise ValueError("feature switches must be booleans")
+    features = set()
+    for value in lists:
+        names = [name for name in re.split("[ ,]+", value) if name]
+        if not names or any(len(name.split("/")) > 2 or not all(
+                component(part) for part in name.split("/")) for name in names):
+            raise ValueError("invalid Cargo feature list: " + repr(value))
+        features.update(names)
+    print(json.dumps({"features": sorted(features), "all_features": all_features == "true",
+                      "no_default_features": no_default_features == "true"}, sort_keys=True))
+except ValueError as error:
+    print("[xwin-build] " + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
+_xwb_feature_arguments() {
+    jq -r '[(if (.features|length)>0 then "--features", (.features|join(",")) else empty end),
+        (if .all_features then "--all-features" else empty end),
+        (if .no_default_features then "--no-default-features" else empty end)] | .[]' <<< "$1"
+}
+
 # Validate headers AND bounded section data; a .exe suffix or MZ prefix alone
 # cannot establish the target. Never execute the candidate binary.
 xwin_validate_arm64_pe() {
@@ -204,12 +244,17 @@ _xwb_source_location() {
 _xwb_metadata() {
     local project="$1" run="$2" phase="$3" binary="$4" package="$5" version="$6" offline="$7" seconds="$8" argument
     local source_set_receipt="${9:-}" binaries_json="${10:-}"
+    local feature_selection="${11:-}" feature_arguments
     local -a environment=() command=("$run/bin/cargo" metadata --locked --format-version 1
         --filter-platform aarch64-pc-windows-msvc --manifest-path "$project/Cargo.toml")
     local -a source_args=()
     [[ -z "$source_set_receipt" ]] || source_args=("$source_set_receipt")
     [[ -z "$binaries_json" ]] || source_args=("$source_set_receipt" "$binaries_json")
     while IFS= read -r -d '' argument; do environment+=("$argument"); done < "$run/environment.nul"
+    if [[ -n "$feature_selection" ]]; then
+        feature_arguments=$(_xwb_feature_arguments "$feature_selection") || return 4
+        while IFS= read -r argument; do [[ -z "$argument" ]] || command+=("$argument"); done <<< "$feature_arguments"
+    fi
     [[ "$offline" == false ]] || command+=(--offline)
     _xwb_run "$project" "$run/metadata-$phase.log" "$seconds" --stdout "$run/metadata-$phase.raw.json" \
         env -i "${environment[@]}" "${command[@]}" || return $?
@@ -272,7 +317,7 @@ _xwb_export_release() {
          build_environments:[{target:"windows/arm64",method:"pinned-cargo-xwin",
              build_influence_env:$r.build_influence_env,tool_versions:$r.tool_versions,
              toolchain:$r.toolchain,cargo_metadata:$selection[0],source_snapshot:$s,
-             cargo_cache:$r.cargo_cache,
+             cargo_cache:$r.cargo_cache,feature_selection:$r.feature_selection,
              command:$r.command}],
          artifacts:[$r.artifacts[] | {name,target:"windows/arm64",sha256,
              size_bytes,archive_format:"binary",signed:false,
@@ -306,15 +351,18 @@ _xwb_build() {
     local manifest='' project='' run='' binary='' package='' cache='' cargo_cache='' seconds=3600 offline=false
     local release_repo='' release_tag='' release_tool='' source_sha='' asset_name='' release=false
     local sibling_crates='' sibling_hash='' source_set_receipt=''
-    local -a binaries=()
+    local all_features=false no_default_features=false feature_selection feature_arguments feature_hash argument
+    local -a binaries=() feature_lists=() feature_args=()
     local -A seen=() binary_names=()
     local selected_binary binaries_json
     while (($#)); do
-        [[ -n "$1" && ( "$1" == --bin || -z "${seen[$1]:-}" ) ]] || return 4
+        [[ -n "$1" && ( "$1" == --bin || "$1" == --features || -z "${seen[$1]:-}" ) ]] || return 4
         seen[$1]=1
         case "$1" in
             --offline) offline=true; shift ;;
-            --manifest|--project|--run-dir|--bin|--package|--cache-dir|--cargo-cache|--timeout|--release-repo|--release-tag|--source-sha|--tool|--asset-name|--sibling-crates)
+            --all-features) all_features=true; shift ;;
+            --no-default-features) no_default_features=true; shift ;;
+            --manifest|--project|--run-dir|--bin|--package|--cache-dir|--cargo-cache|--timeout|--release-repo|--release-tag|--source-sha|--tool|--asset-name|--sibling-crates|--features)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --manifest) manifest=$2 ;; --project) project=$2 ;; --run-dir) run=$2 ;;
@@ -323,11 +371,15 @@ _xwb_build() {
                     --release-repo) release_repo=$2 ;; --release-tag) release_tag=$2 ;;
                     --source-sha) source_sha=$2 ;; --tool) release_tool=$2 ;; --asset-name) asset_name=$2 ;;
                     --sibling-crates) sibling_crates=$2 ;;
+                    --features) feature_lists+=("$2") ;;
                 esac
                 shift 2 ;;
             *) _xwt_log "Unknown build option: $1"; return 4 ;;
         esac
     done
+    feature_selection=$(_xwb_feature_selection "$all_features" "$no_default_features" "${feature_lists[@]}") || return $?
+    feature_arguments=$(_xwb_feature_arguments "$feature_selection") || return 4
+    while IFS= read -r argument; do [[ -z "$argument" ]] || feature_args+=("$argument"); done <<< "$feature_arguments"
     (( ${#binaries[@]} >= 1 && ${#binaries[@]} <= 32 )) || return 4
     for selected_binary in "${binaries[@]}"; do
         [[ "$selected_binary" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ &&
@@ -380,6 +432,8 @@ _xwb_build() {
     run=$(cd "$run" && pwd -P) || return 4
     [[ "$run" != *[[:space:][:cntrl:]]* && "$run" != *[\;\\:]* ]] || return 4
     mkdir "$run/bin" "$run/home" "$run/tmp" "$run/xwin" "$run/artifacts" || return 1
+    printf '%s\n' "$feature_selection" > "$run/feature-selection.json" || return 1
+    feature_hash=$(_xwt_hash "$run/feature-selection.json") || return $?
     _xwb_finish() {
         local rc=$? directory="$1"
         if ((rc != 0)); then
@@ -464,7 +518,7 @@ _xwb_build() {
     _xwb_source_inputs "$project" > "$run/source-before.json" || return $?
     _xwb_versions "$plan" "$project" "$run/versions-before" "$run/environment.nul" > "$run/versions-before.json" || return $?
     if [[ "$release" == true ]]; then
-        _xwb_metadata "$project" "$run" before "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" || return $?
+        _xwb_metadata "$project" "$run" before "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" "$feature_selection" || return $?
         metadata_hash=$(_xwt_hash "$run/metadata-before.json") || return $?
         selection_hash=$(_xwt_hash "$run/selection-before.json") || return $?
         xwin_source_verify "$run/source" "$run/release-source.json" || return $?
@@ -483,10 +537,12 @@ _xwb_build() {
         [[ -z "$package" ]] || command+=(--package "$package")
     fi
     [[ "$offline" == false ]] || command+=(--offline)
+    command+=("${feature_args[@]}")
     [[ "$release" == false ]] || command+=(--message-format=json)
     jq -cn --args '$ARGS.positional' -- "${command[@]}" > "$run/command.json" || return 1
     controls=$(sha256sum -- "$run/environment.nul" "$run/environment.json" "$run/command.json" \
-        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json") || return 1
+        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json") || return 1
+    [[ "$feature_hash" == "$(_xwt_hash "$run/feature-selection.json")" ]] || return 7
     _xwt_log "Building ${binaries[*]} for Windows ARM64; log: $run/build.log"
     local rc=0
     local -a capture=()
@@ -497,13 +553,13 @@ _xwb_build() {
     child=0
     ((rc == 0)) || { _xwt_log "Build exited $rc; retained $run/build.log"; return "$rc"; }
     [[ "$controls" == "$(sha256sum -- "$run/environment.nul" "$run/environment.json" "$run/command.json" \
-        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json")" ]] || return 7
+        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json")" ]] || return 7
     if [[ "$release" == true ]]; then
         [[ "$source_hash" == "$(_xwt_hash "$run/release-source.json")" &&
            "$metadata_hash" == "$(_xwt_hash "$run/metadata-before.json")" &&
            "$selection_hash" == "$(_xwt_hash "$run/selection-before.json")" ]] || return 7
         [[ -z "$sibling_hash" || "$(_xwt_hash "$run/sibling-crates.json")" == "$sibling_hash" ]] || return 7
-        _xwb_metadata "$project" "$run" after "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" || return $?
+        _xwb_metadata "$project" "$run" after "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" "$feature_selection" || return $?
         cmp -s "$run/metadata-before.json" "$run/metadata-after.json" || { _xwt_log 'Cargo dependency graph changed'; return 7; }
         cmp -s "$run/selection-before.json" "$run/selection-after.json" || return 7
         xwin_source_verify "$run/source" "$run/release-source.json" || return $?
@@ -515,6 +571,7 @@ _xwb_build() {
     _xwb_source_inputs "$project" > "$run/source-after.json" || return $?
     cmp -s "$run/source-before.json" "$run/source-after.json" || return 7
     [[ "$manifest_hash" == "$(_xwt_hash "$project/Cargo.toml")" && "$lock_hash" == "$(_xwt_hash "$project/Cargo.lock")" ]] || return 7
+    [[ "$feature_hash" == "$(_xwt_hash "$run/feature-selection.json")" ]] || return 7
     [[ "$(_xwt_hash "$run/manifest.json")" == "$key" ]] || return 7
     xwin_toolchain_prepare "$run/manifest.json" "$cache" verify > "$run/toolchain-after.json" || return $?
     [[ "$cargo_seed_controls" == "$(sha256sum -- "$run/cargo-cache-seed.json" \
@@ -541,14 +598,14 @@ _xwb_build() {
     jq -cn --arg run "$run" --arg project "$project" --arg key "$key" \
         --arg manifest "$manifest_hash" --arg lock "$lock_hash" --slurpfile artifacts "$run/artifacts.jsonl" \
         --slurpfile environment "$run/environment.json" --slurpfile command "$run/command.json" \
-        --slurpfile source "$run/source-after.json" \
+        --slurpfile source "$run/source-after.json" --argjson feature_selection "$feature_selection" \
         --slurpfile cache_seed "$run/cargo-cache-seed.json" --slurpfile cache_final "$run/cargo-cache.json" \
         --slurpfile versions "$run/versions-after.json" --slurpfile toolchain "$run/toolchain-after.json" \
         '{schema_version:1,kind:"dsr-xwin-build",status:"verified",exit_code:0,
           project:$project,target:"aarch64-pc-windows-msvc",cargo_manifest_sha256:$manifest,cargo_lock_sha256:$lock,
           manifest_sha256:$key,source_inputs:$source[0],artifacts:$artifacts,
           cargo_cache:{mode:"private-copy",seed:$cache_seed[0],final:$cache_final[0]},
-          build_influence_env:$environment[0],command:$command[0],tool_versions:$versions[0],
+          build_influence_env:$environment[0],command:$command[0],feature_selection:$feature_selection,tool_versions:$versions[0],
           toolchain:$toolchain[0].evidence,build_log:($run+"/build.log")} |
           if ($artifacts|length)==1 then .artifact=$artifacts[0] else . end' > "$run/.result.json" || return 1
     if [[ "$release" == true ]]; then
