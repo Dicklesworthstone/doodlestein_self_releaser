@@ -305,6 +305,46 @@ test_doctor_fix_mode_shows_fixes() {
     fi
 }
 
+# --fix repairs what is safe to repair: a missing config, a missing actrc
+# (mapped to this user), an actrc binding without a user mapping (backed up).
+test_doctor_fix_applies_safe_fixes() {
+    ((TESTS_RUN++))
+    local home="$TEMP_DIR/fix-home" config_dir="$TEMP_DIR/fix-config" problems=() uid_gid output status
+    uid_gid="$(id -u):$(id -g)"
+    mkdir -p "$home"
+
+    output=$(HOME="$home" DSR_CONFIG_DIR="$config_dir" "$DSR_CMD" --json doctor --fix 2>/dev/null)
+    [[ -f "$config_dir/config.yaml" ]] || problems+=("config not created")
+    grep -qx -- "--container-options --user=$uid_gid" "$home/.actrc" 2>/dev/null ||
+        problems+=("actrc not created with --user=$uid_gid")
+    jq -e '(.details.fixed | length) == 2 and
+        ([.details.checks[] | select(.name == "actrc" or .name == "config") | .fixed] == [true, true])' \
+        <<< "$output" >/dev/null 2>&1 || problems+=("fixed not reported: $(jq -c '.details.fixed' <<< "$output" 2>/dev/null)")
+
+    printf -- '--bind\n-P ubuntu-latest=catthehacker/ubuntu:act-latest\n' > "$home/.actrc"
+    HOME="$home" DSR_CONFIG_DIR="$config_dir" "$DSR_CMD" doctor --fix >/dev/null 2>&1
+    local backups=("$home"/.actrc.bak.*)
+    [[ "$(tail -1 "$home/.actrc")" == "--container-options --user=$uid_gid" ]] ||
+        problems+=("user mapping not appended")
+    if [[ ! -f "${backups[0]}" ]] || grep -q -- '--user' "${backups[0]}"; then
+        problems+=("no backup of the original")
+    fi
+
+    # doctor may exit 3 for missing core dependencies; only the actrc line matters.
+    output=$(HOME="$home" DSR_CONFIG_DIR="$config_dir" "$DSR_CMD" doctor 2>&1)
+    grep -q 'actrc: configured correctly' <<< "$output" || problems+=("fixed actrc not accepted")
+
+    status=0
+    "$DSR_CMD" doctor --frobnicate >/dev/null 2>&1 || status=$?
+    [[ "$status" -eq 4 ]] || problems+=("unknown option exit $status")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "doctor --fix creates config and actrc and repairs the user mapping"
+    else
+        fail "doctor --fix: ${problems[*]}"
+    fi
+}
+
 # ============================================================================
 # Tests: Human-Readable Output
 # ============================================================================
@@ -427,6 +467,7 @@ test_doctor_exit_code_zero_or_three
 echo ""
 echo "Fix Mode:"
 test_doctor_fix_mode_shows_fixes
+test_doctor_fix_applies_safe_fixes
 
 echo ""
 echo "Human-Readable Output:"

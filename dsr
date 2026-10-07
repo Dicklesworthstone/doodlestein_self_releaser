@@ -541,9 +541,36 @@ cmd_config_edit() {
 # DOCTOR SUBCOMMAND
 # ============================================================================
 
+# doctor --fix: append the invoking user's UID:GID mapping to an actrc that
+# binds the workspace without one, after a timestamped backup. Prints the
+# backup path.
+_doctor_fix_actrc_user() {
+    local file="$1" backup
+    backup="$file.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+    [[ -f "$file" && ! -L "$file" && ! -e "$backup" ]] || return 1
+    cp -p -- "$file" "$backup" || return 1
+    printf -- '--container-options --user=%s:%s\n' "$(id -u)" "$(id -g)" >> "$file" || return 1
+    printf '%s\n' "$backup"
+}
+
+# doctor --fix: create a missing actrc from config/actrc.example, mapped to
+# the invoking user's UID:GID instead of the example's 1000:1000.
+_doctor_create_actrc() {
+    local file="$1" example="$SCRIPT_DIR/config/actrc.example" tmp
+    [[ -f "$example" && ! -e "$file" && ! -L "$file" ]] || return 1
+    tmp=$(mktemp "$file.XXXXXXXX") || return 1
+    if sed -E "s/--user=[0-9]+:[0-9]+/--user=$(id -u):$(id -g)/" "$example" > "$tmp" &&
+       grep -q -- "--user=$(id -u):$(id -g)" "$tmp" && mv -n -- "$tmp" "$file" && [[ ! -e "$tmp" ]]; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
 cmd_doctor() {
     local quick_mode=false
     local fix_mode=false
+    local -a fixed=()
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -565,7 +592,11 @@ USAGE:
 
 OPTIONS:
     --quick, -q     Quick check (core deps + auth only)
-    --fix, -f       Suggest fixes for issues found
+    --fix, -f       Apply safe fixes, list remediation for the rest:
+                    creates a missing config (dsr config init), creates a
+                    missing ~/.actrc from config/actrc.example mapped to your
+                    UID:GID, and adds that mapping to an actrc that binds
+                    without one (backup first). Never installs software.
     --json          JSON output (global flag)
 
 CHECKS:
@@ -592,13 +623,15 @@ EXIT CODES:
 EXAMPLES:
     dsr doctor              Full diagnostics
     dsr doctor --quick      Core deps only
-    dsr doctor --fix        Show remediation steps
+    dsr doctor --fix        Apply safe fixes, show remediation steps
     dsr doctor --json       Machine-readable output
 EOF
                 return 0
                 ;;
             *)
-                shift
+                log_error "Unknown option: $1"
+                log_info "Run 'dsr doctor --help' for usage"
+                return 4
                 ;;
         esac
     done
@@ -772,7 +805,13 @@ EOF
             has_user=true
         fi
 
-        if $has_bind && ! $has_user; then
+        local actrc_backup=""
+        if $has_bind && ! $has_user && $fix_mode &&
+           actrc_backup=$(_doctor_fix_actrc_user "$actrc_file"); then
+            _add_check "actrc" "ok" ", \"file\": \"$actrc_file\", \"bind\": true, \"user_mapping\": true, \"fixed\": true"
+            log_ok "  actrc: fixed - added --container-options --user=$(id -u):$(id -g) (backup: $actrc_backup)"
+            fixed+=("actrc: added --user=$(id -u):$(id -g) to $actrc_file (backup $actrc_backup)")
+        elif $has_bind && ! $has_user; then
             _add_check "actrc" "error" ", \"message\": \"--bind without --user causes UID mismatch\", \"file\": \"$actrc_file\""
             log_error "  actrc: CRITICAL - --bind without --user flag"
             log_error "         Files created by act will have wrong ownership (UID 1001)"
@@ -787,6 +826,10 @@ EOF
             _add_check "actrc" "ok" ", \"file\": \"$actrc_file\", \"bind\": false"
             log_ok "  actrc: present (no --bind, no UID concerns)"
         fi
+    elif $fix_mode && _doctor_create_actrc "$actrc_file"; then
+        _add_check "actrc" "ok" ", \"file\": \"$actrc_file\", \"bind\": true, \"user_mapping\": true, \"fixed\": true"
+        log_ok "  actrc: created from config/actrc.example (--user=$(id -u):$(id -g))"
+        fixed+=("actrc: created $actrc_file from config/actrc.example")
     else
         _add_check "actrc" "warning" ", \"message\": \"not found\", \"file\": \"$actrc_file\""
         log_warn "  actrc: ~/.actrc not found"
@@ -974,6 +1017,13 @@ EOF
     if config_validate &>/dev/null 2>&1; then
         _add_check "config" "ok" ""
         log_ok "  config: valid"
+    elif $fix_mode && [[ ! -e "$DSR_CONFIG_FILE" ]] && config_init >/dev/null 2>&1 &&
+         config_load 2>/dev/null && config_validate &>/dev/null; then
+        # Only a missing configuration is created; an invalid one is the
+        # operator's to repair (dsr config validate names the problem).
+        _add_check "config" "ok" ", \"fixed\": true"
+        log_ok "  config: created defaults (dsr config init)"
+        fixed+=("config: created $DSR_CONFIG_FILE (dsr config init)")
     else
         _add_check "config" "warning" ", \"message\": \"invalid or missing\""
         log_warn "  config: invalid or missing"
@@ -1047,8 +1097,15 @@ _doctor_summary() {
     fi
 
     # Show fixes if requested
+    if [[ "$fix_mode" == "true" && ${#fixed[@]} -gt 0 ]]; then
+        echo "" >&2
+        log_ok "Applied fixes:"
+        for fix in "${fixed[@]}"; do
+            log_ok "  ✓ $fix"
+        done
+    fi
     if [[ "$fix_mode" == "true" && ${#fixes[@]} -gt 0 ]]; then
-        echo ""
+        echo "" >&2
         log_info "Suggested fixes:"
         for fix in "${fixes[@]}"; do
             log_info "  → $fix"
@@ -1063,11 +1120,13 @@ _doctor_summary() {
             --argjson warnings "$warnings" \
             --arg overall_status "$overall_status" \
             --argjson checks "$checks_json" \
+            --argjson fixed "$(printf '%s\n' ${fixed[@]+"${fixed[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             '{
                 overall_status: $overall_status,
                 errors: $errors,
                 warnings: $warnings,
-                checks: $checks
+                checks: $checks,
+                fixed: $fixed
             }')
         local status_str
         [[ "$errors" -eq 0 ]] && status_str="success" || status_str="error"

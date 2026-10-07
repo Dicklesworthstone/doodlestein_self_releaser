@@ -681,7 +681,7 @@ System diagnostics.
 
 ```bash
 dsr doctor                                      # Check all dependencies
-dsr doctor --fix                                # Auto-fix issues where possible
+dsr doctor --fix                                # Fix config/actrc; list the rest
 ```
 
 ### `dsr status`
