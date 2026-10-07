@@ -6124,27 +6124,60 @@ _release_finalize_observe() {
 
 cmd_release_finalize() {
     local tool="" version="" response="" no_dispatch=false
+    local usage="Usage: dsr release finalize <tool> <version> --create-response /abs/path/dsr-api-response.XXXXXXXX --no-dispatch"
     while (($#)); do
         case "$1" in
-            --create-response) [[ $# -ge 2 ]] || return 4; response="$2"; shift 2 ;;
+            --create-response)
+                [[ $# -ge 2 ]] || { log_error "--create-response requires a path"; return 4; }
+                response="$2"; shift 2 ;;
             --no-dispatch) no_dispatch=true; shift ;;
-            -*) log_error "Unsupported strict finalization option: $1"; return 4 ;;
+            --help|-h)
+                cat << 'EOF'
+dsr release finalize - Publish a verified strict draft from its creation response
+
+USAGE:
+    dsr release finalize <tool> <version> --create-response <path> --no-dispatch
+
+OPTIONS:
+    --create-response <path>  Absolute path of the preserved private
+                              dsr-api-response.XXXXXXXX POST response that
+                              created the draft (creation custody)
+    --no-dispatch             Required: finalization does not dispatch
+
+Finalization re-verifies every signed asset, the source tag and the release
+contract, then publishes the draft. See README "strict releases".
+EOF
+                return 0 ;;
+            -*) log_error "Unsupported strict finalization option: $1"; log_info "$usage"; return 4 ;;
             *)
                 if [[ -z "$tool" ]]; then tool="$1"
                 elif [[ -z "$version" ]]; then version="$1"
-                else return 4; fi
+                else log_error "Unexpected argument: $1"; log_info "$usage"; return 4; fi
                 shift ;;
         esac
     done
-    [[ "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ &&
-       "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.-]+)?$ &&
-       "$response" == /* && "${response##*/}" =~ ^dsr-api-response\.[A-Za-z0-9]{8}$ &&
-       "$no_dispatch" == true ]] || return 4
+    if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ||
+          ! "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.-]+)?$ ]]; then
+        log_error "A tool name and a semantic version are required"
+        log_info "$usage"
+        return 4
+    fi
+    if [[ "$response" != /* || ! "${response##*/}" =~ ^dsr-api-response\.[A-Za-z0-9]{8}$ ]]; then
+        log_error "--create-response must be the absolute path of a preserved dsr-api-response.XXXXXXXX file"
+        return 4
+    fi
+    if [[ "$no_dispatch" != true ]]; then
+        log_error "release finalize requires --no-dispatch (finalization never dispatches)"
+        return 4
+    fi
     gh_check || gh_check_token || return 3
     local repo path tag contract config config_sha config_json registry registry_sha registry_json
     config="$ACT_REPOS_DIR/$tool.yaml"
-    [[ -f "$config" && ! -L "$config" &&
-       "$(cd "${config%/*}" && pwd -P)" == "$(cd "${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d" && pwd -P)" ]] || return 4
+    if [[ ! -f "$config" || -L "$config" ||
+          "$(cd "${config%/*}" && pwd -P)" != "$(cd "${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d" && pwd -P)" ]]; then
+        log_error "Strict finalization needs repos.d/$tool.yaml as a regular file in ${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d"
+        return 4
+    fi
     config_sha=$(_gh_asset_sha256 "$config") || return 4
     config_json=$(_config_read_single_mapping_json "$config") || return 4
     [[ "$(_gh_asset_sha256 "$config")" == "$config_sha" ]] || return 4
@@ -13232,18 +13265,18 @@ SUBCOMMANDS:
 OPTIONS:
     --builder, -b <id>   Builder identity URL
     --output, -o <file>  Output file (default: <artifact>.intoto.jsonl)
-    --repo-path <dir>    Source repo to read git provenance from
-                         (default: artifact's directory, then PWD)
+    --repo-path <dir>    Source checkout to record (origin URL, commit, ref,
+                         dirty flag). Without it no source is recorded.
 
 DESCRIPTION:
-    Generates SLSA v1 provenance (in-toto Statement) for release artifacts.
-    Provides verifiable build provenance for supply chain security.
+    Generates an SLSA v1 provenance statement (in-toto) for an artifact.
+    It is a post-build observation, not an authenticated build record.
 
-    The provenance includes:
+    The statement includes:
     - Artifact name and SHA256 digest
     - Builder identity
-    - Build timestamps
-    - Git source info (resolved via --repo-path / artifact dir / PWD)
+    - Observation time (not an invented build start/finish)
+    - Git source info, only from an explicit --repo-path
 
 EXAMPLES:
     dsr slsa generate ./build/ntm-linux-amd64
@@ -13390,21 +13423,26 @@ dsr docker - Multi-arch Docker image building
 
 USAGE:
     dsr docker build <tool> <version> [options]
-    dsr docker release <tool> <version> [options]
-    dsr docker sign <image>
+    dsr docker release <tool> <version> --certificate-identity <id>
+                       --certificate-oidc-issuer <https-url> [options]
+    dsr docker sign <registry/repository@sha256:<digest>>
     dsr docker setup
 
 SUBCOMMANDS:
     build     Build multi-arch Docker image
     release   Build, push, sign, and attest image
-    sign      Sign container with cosign (keyless)
+    sign      Sign a digest-pinned image with cosign (keyless)
     setup     Setup buildx builder
 
 OPTIONS:
-    --push              Push to GHCR after build
-    --local             Build for local platform only
-    -p, --platform      Platforms (default: linux/amd64,linux/arm64)
+    --push              Push to GHCR after build (build only)
+    --local             Build for local platform only (build only)
+    -p, --platform      Platforms (build only; default: linux/amd64,linux/arm64)
     --skip-sign         Skip cosign signing (release only)
+    --certificate-identity, --certificate-oidc-issuer
+                        Keyless identity the release verifies its signature
+                        and SBOM attestation against (release only; or set
+                        DOCKER_CERTIFICATE_IDENTITY / _OIDC_ISSUER)
     -n, --dry-run       Show what would be done
 
 DESCRIPTION:
@@ -13417,8 +13455,11 @@ DESCRIPTION:
 EXAMPLES:
     dsr docker build ubs v1.2.3              # Build multi-arch
     dsr docker build ubs v1.2.3 --push       # Build and push
-    dsr docker release ubs v1.2.3            # Full release workflow
-    dsr docker sign ghcr.io/dicklesworthstone/ubs:v1.2.3
+    dsr docker release ubs v1.2.3 \
+        --certificate-identity https://github.com/OWNER/REPO/.github/workflows/release.yml@refs/tags/v1.2.3 \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com
+    dsr docker sign ghcr.io/dicklesworthstone/ubs@sha256:<64-hex digest>
+                                             # Tags are refused: sign the digest
 
 EXIT CODES:
     0  - Success

@@ -820,6 +820,20 @@ fi
     assert_contains "$output" "USAGE:"
 }
 
+@test "dsr release finalize explains its usage errors" {
+    run harness_run_dsr release finalize --help
+    assert_equal "0" "$status"
+    [[ "$output" == *"--create-response"* ]]
+
+    run bash -c '"$1" release finalize tool 1.0.0 --no-dispatch 2>&1 >/dev/null' _ "$PROJECT_ROOT/dsr"
+    assert_equal "4" "$status"
+    [[ "$output" == *"--create-response must be the absolute path"* ]]
+
+    run bash -c '"$1" release finalize tool 1.0.0 --create-response /tmp/dsr-api-response.ABCDEF12 2>&1 >/dev/null' _ "$PROJECT_ROOT/dsr"
+    assert_equal "4" "$status"
+    [[ "$output" == *"requires --no-dispatch"* ]]
+}
+
 @test "dsr release without args shows error" {
     harness_create_config
 
