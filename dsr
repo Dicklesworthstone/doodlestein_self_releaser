@@ -212,6 +212,22 @@ show_version() {
     fi
 }
 
+# Run a command, keeping its stdout (its result) apart from its stderr (its
+# diagnostics): stdout goes to _DSR_CAPTURED_OUT, stderr is replayed to
+# stderr and kept, color codes stripped, in _DSR_CAPTURED_ERR.
+# Usage: _dsr_capture <command> [args...]; returns the command's status.
+_dsr_capture() {
+    local err_file status=0
+    _DSR_CAPTURED_OUT=""
+    _DSR_CAPTURED_ERR=""
+    err_file=$(mktemp "${TMPDIR:-/tmp}/dsr-stderr.XXXXXX") || return 1
+    _DSR_CAPTURED_OUT=$("$@" 2> "$err_file") || status=$?
+    _DSR_CAPTURED_ERR=$(sed $'s/\x1b\\[[0-9;]*m//g' "$err_file")
+    cat -- "$err_file" >&2
+    rm -f -- "$err_file"
+    return "$status"
+}
+
 # JSON envelope helper
 # Usage: json_envelope <command> <status> <exit_code> [details_json]
 json_envelope() {
@@ -219,6 +235,16 @@ json_envelope() {
     local vstatus="$2"  # renamed to avoid potential conflict
     local exit_code="$3"
     local details="${4:-"{}"}"
+    # stdout must stay one JSON document: details that are not exactly one
+    # JSON value (a caller pasting log text or two objects) are carried as a
+    # string instead of corrupting the envelope.
+    local normalized
+    if normalized=$(jq -ces 'if length == 1 then .[0] else error("not one value") end' <<< "$details" 2>/dev/null); then
+        details="$normalized"
+    else
+        log_warn "Internal: $cmd produced malformed JSON details; reporting them as text"
+        details=$(jq -nc --arg raw "$details" '{error: "malformed details", raw: $raw}')
+    fi
     local run_id
     run_id=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "unknown")
     local started_at
@@ -12599,7 +12625,7 @@ _verify_upgrade() {
     local tool_name=""
     local all_tools=false
     local build_from_source=false
-    local dry_run_flag=false
+    local dry_run_flag="${DRY_RUN:-false}"
     local version=""
 
     while [[ $# -gt 0 ]]; do
@@ -12642,10 +12668,10 @@ _verify_upgrade() {
     if $all_tools; then
         log_info "Verifying upgrade command for all tools..."
 
-        if upgrade_verify_all "${args[@]}"; then
+        if upgrade_verify_all ${args[@]+"${args[@]}"}; then
             local duration=$(($(date +%s) - start_time))
             if $JSON_MODE; then
-                json_envelope "verify-upgrade" "ok" 0 "{\"mode\": \"all\", \"duration_seconds\": $duration}"
+                json_envelope "verify-upgrade" "success" 0 "{\"mode\": \"all\", \"dry_run\": $dry_run_flag, \"duration_seconds\": $duration}"
             else
                 log_ok "All upgrade verifications passed"
             fi
@@ -12653,7 +12679,7 @@ _verify_upgrade() {
         else
             local duration=$(($(date +%s) - start_time))
             if $JSON_MODE; then
-                json_envelope "verify-upgrade" "failed" 1 "{\"mode\": \"all\", \"duration_seconds\": $duration}"
+                json_envelope "verify-upgrade" "error" 1 "{\"mode\": \"all\", \"dry_run\": $dry_run_flag, \"duration_seconds\": $duration}"
             else
                 log_error "Some upgrade verifications failed"
             fi
@@ -12666,27 +12692,45 @@ _verify_upgrade() {
         return 4
     fi
 
-    if upgrade_verify_tool "$tool_name" "${args[@]}"; then
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            local result
-            result=$(upgrade_verify_json "$tool_name" "${args[@]}" 2>/dev/null || echo '{}')
-            json_envelope "verify-upgrade" "ok" 0 "$(echo "$result" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
-        else
-            log_ok "Upgrade verification passed for $tool_name"
-        fi
-        return 0
+    # Run the update check exactly once. The structured runner reports the
+    # check's output and versions, but it neither builds nor dry-runs, so
+    # those cases (and a binary missing from PATH, which the plain runner
+    # builds) go through upgrade_verify_tool and report its verdict.
+    local verify_status=0 details=""
+    local binary_name
+    binary_name=$(_upgrade_tool_binary_name "$tool_name")
+    if $JSON_MODE && ! $dry_run_flag && ! $build_from_source &&
+       { command -v "$binary_name" &>/dev/null || command -v "$tool_name" &>/dev/null; }; then
+        details=$(upgrade_verify_json "$tool_name" ${args[@]+"${args[@]}"}) || verify_status=$?
     else
-        local duration=$(($(date +%s) - start_time))
-        if $JSON_MODE; then
-            local result
-            result=$(upgrade_verify_json "$tool_name" "${args[@]}" 2>/dev/null || echo '{}')
-            json_envelope "verify-upgrade" "failed" 1 "$(echo "$result" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
-        else
-            log_error "Upgrade verification failed for $tool_name"
+        upgrade_verify_tool "$tool_name" ${args[@]+"${args[@]}"} || verify_status=$?
+        local outcome="passed"
+        if [[ $verify_status -ne 0 ]]; then
+            outcome="failed"
+        elif $dry_run_flag; then
+            outcome="planned"
         fi
-        return 1
+        details=$(jq -nc --arg tool "$tool_name" --arg status "$outcome" \
+            --argjson dry_run "$dry_run_flag" --argjson built "$build_from_source" \
+            '{tool: $tool, status: $status, dry_run: $dry_run, built_from_source: $built}')
     fi
+    local exit_code=0
+    if [[ $verify_status -eq 4 ]]; then
+        exit_code=4
+    elif [[ $verify_status -ne 0 ]]; then
+        exit_code=1
+    fi
+
+    local duration=$(($(date +%s) - start_time))
+    if $JSON_MODE; then
+        json_envelope "verify-upgrade" "$([[ $exit_code -eq 0 ]] && echo success || echo error)" "$exit_code" \
+            "$(jq -c --argjson duration "$duration" '. + {duration_seconds: $duration}' <<< "$details")"
+    elif [[ $exit_code -eq 0 ]]; then
+        log_ok "Upgrade verification passed for $tool_name"
+    else
+        log_error "Upgrade verification failed for $tool_name"
+    fi
+    return "$exit_code"
 }
 
 # ============================================================================
@@ -13096,25 +13140,31 @@ _sbom_generate() {
     local -a args=()
     [[ -n "$output" ]] && args+=("--output" "$output")
 
-    if result=$(sbom_generate "$target" --format "$format" "${args[@]}" 2>&1); then
+    # The SBOM path is stdout; diagnostics stay on stderr, where a failure's
+    # cause (syft missing, unreadable target) is shown instead of discarded.
+    if _dsr_capture sbom_generate "$target" --format "$format" ${args[@]+"${args[@]}"}; then
         local duration=$(($(date +%s) - start_time))
         if $JSON_MODE; then
-            json_envelope "sbom-generate" "ok" 0 "$(jq -nc \
+            json_envelope "sbom-generate" "success" 0 "$(jq -nc \
                 --arg target "$target" \
                 --arg format "$format" \
-                --arg output "$result" \
+                --arg output "$_DSR_CAPTURED_OUT" \
                 --argjson duration "$duration" \
                 '{target: $target, format: $format, output: $output, duration_seconds: $duration}')"
         else
-            log_ok "SBOM generated: $result"
+            printf '%s\n' "$_DSR_CAPTURED_OUT"
         fi
         return 0
     else
         local exit_code=$?
         local duration=$(($(date +%s) - start_time))
+        if [[ -z "$_DSR_CAPTURED_ERR" ]]; then
+            _DSR_CAPTURED_ERR="SBOM generation failed for $target (exit $exit_code)"
+            log_error "$_DSR_CAPTURED_ERR"
+        fi
         if $JSON_MODE; then
             json_envelope "sbom-generate" "error" "$exit_code" "$(jq -nc \
-                --arg error "$result" \
+                --arg error "$_DSR_CAPTURED_ERR" \
                 --argjson duration "$duration" \
                 '{error: $error, duration_seconds: $duration}')"
         fi
@@ -13228,6 +13278,11 @@ _slsa_generate() {
         log_error "Artifact path required"
         return 4
     fi
+    if [[ ! -f "$artifact" ]]; then
+        log_error "Artifact not found (or not a regular file): $artifact"
+        $JSON_MODE && json_envelope "slsa-generate" "error" 4 "$(jq -nc --arg artifact "$artifact" '{error: "artifact not found", artifact: $artifact}')"
+        return 4
+    fi
 
     local start_time
     start_time=$(date +%s)
@@ -13236,25 +13291,29 @@ _slsa_generate() {
     [[ -n "$output" ]] && args+=("--output" "$output")
     [[ -n "$repo_path" ]] && args+=("--repo-path" "$repo_path")
 
-    if result=$(slsa_generate "$artifact" --builder "$builder_id" "${args[@]}" 2>&1); then
+    if _dsr_capture slsa_generate "$artifact" --builder "$builder_id" ${args[@]+"${args[@]}"}; then
         local duration=$(($(date +%s) - start_time))
         if $JSON_MODE; then
-            json_envelope "slsa-generate" "ok" 0 "$(jq -nc \
+            json_envelope "slsa-generate" "success" 0 "$(jq -nc \
                 --arg artifact "$artifact" \
                 --arg builder "$builder_id" \
-                --arg output "$result" \
+                --arg output "$_DSR_CAPTURED_OUT" \
                 --argjson duration "$duration" \
                 '{artifact: $artifact, builder: $builder, output: $output, duration_seconds: $duration}')"
         else
-            log_ok "SLSA provenance generated: $result"
+            printf '%s\n' "$_DSR_CAPTURED_OUT"
         fi
         return 0
     else
         local exit_code=$?
         local duration=$(($(date +%s) - start_time))
+        if [[ -z "$_DSR_CAPTURED_ERR" ]]; then
+            _DSR_CAPTURED_ERR="SLSA provenance generation failed for $artifact (exit $exit_code; 4 = invalid arguments, output path or repository)"
+            log_error "$_DSR_CAPTURED_ERR"
+        fi
         if $JSON_MODE; then
             json_envelope "slsa-generate" "error" "$exit_code" "$(jq -nc \
-                --arg error "$result" \
+                --arg error "$_DSR_CAPTURED_ERR" \
                 --argjson duration "$duration" \
                 '{error: $error, duration_seconds: $duration}')"
         fi

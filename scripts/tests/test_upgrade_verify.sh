@@ -356,6 +356,81 @@ EOF
     harness_teardown
 }
 
+# A tool whose update check fails, counting every invocation.
+make_counting_tool() {
+    local name="$1" exit_status="$2"
+    cat > "$TEST_TMPDIR/bin/$name" << EOF
+#!/bin/bash
+echo run >> "$TEST_TMPDIR/$name.calls"
+echo "Error: no suitable release asset for this platform"
+exit $exit_status
+EOF
+    chmod +x "$TEST_TMPDIR/bin/$name"
+}
+
+test_cli_json_failure_is_one_envelope_from_one_run() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+    make_counting_tool cli-fail 1
+    local problems=() output
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$PROJECT_ROOT/dsr" --json verify upgrade cli-fail
+    output=$(exec_stdout)
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("exit $(exec_status)")
+    jq -es 'length == 1 and (.[0] | .status == "error" and .exit_code == 1 and
+        .details.status == "failed" and .details.tool == "cli-fail" and
+        (.details.output | contains("no suitable release asset")))' <<< "$output" >/dev/null 2>&1 ||
+        problems+=("envelope: $(head -c 400 <<< "$output")")
+    [[ "$(wc -l < "$TEST_TMPDIR/cli-fail.calls")" -eq 1 ]] ||
+        problems+=("check ran $(wc -l < "$TEST_TMPDIR/cli-fail.calls") times")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "verify upgrade --json reports a failed check as one envelope from one run"
+    else
+        fail "verify upgrade --json failure: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+test_cli_dry_run_runs_and_builds_nothing() {
+    ((TESTS_RUN++))
+    harness_setup
+    setup_module
+    make_counting_tool cli-dry 0
+    # A buildable checkout whose build would be recorded by the cargo stub.
+    mkdir -p "$TEST_TMPDIR/src/cli-src"
+    echo '[package]' > "$TEST_TMPDIR/src/cli-src/Cargo.toml"
+    printf 'tool_name: cli-src\nlocal_path: %s\n' "$TEST_TMPDIR/src/cli-src" > "$TEST_TMPDIR/repos.d/cli-src.yaml"
+    cat > "$TEST_TMPDIR/bin/cargo" << EOF
+#!/bin/bash
+echo "\$*" >> "$TEST_TMPDIR/cargo.calls"
+exit 1
+EOF
+    chmod +x "$TEST_TMPDIR/bin/cargo"
+    local problems=()
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$PROJECT_ROOT/dsr" --json verify upgrade cli-dry --dry-run
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("--dry-run exit $(exec_status)")
+    exec_stdout | jq -e '.details.status == "planned" and .details.dry_run == true' >/dev/null 2>&1 ||
+        problems+=("--dry-run envelope: $(exec_stdout | head -c 300)")
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$PROJECT_ROOT/dsr" -n --json verify upgrade cli-dry
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("-n exit $(exec_status)")
+    [[ ! -e "$TEST_TMPDIR/cli-dry.calls" ]] || problems+=("dry runs ran the update check")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$PROJECT_ROOT/dsr" verify upgrade cli-src --build-from-source --dry-run
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("build dry-run exit $(exec_status)")
+    [[ ! -e "$TEST_TMPDIR/cargo.calls" ]] || problems+=("dry run invoked cargo: $(cat "$TEST_TMPDIR/cargo.calls")")
+    exec_stderr_contains "Would build cli-src from source" || problems+=("no build plan on stderr")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "verify upgrade --dry-run neither runs the check nor builds"
+    else
+        fail "verify upgrade dry run: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: Upgrade Check Parsing
 # ============================================================================
@@ -655,6 +730,8 @@ test_json_has_required_fields
 test_json_error_for_missing_tool
 test_json_uses_configured_check_args
 test_json_reports_exact_version_mismatch
+test_cli_json_failure_is_one_envelope_from_one_run
+test_cli_dry_run_runs_and_builds_nothing
 
 echo ""
 echo "Repository Finding Tests:"

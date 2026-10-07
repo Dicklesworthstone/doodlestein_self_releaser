@@ -83,16 +83,22 @@ upgrade_verify_tool() {
             return 1
         fi
 
-        log_info "Building $binary_name from source for $tool_name..."
-        bin_path=$(_upgrade_build_tool "$tool_name" "$repo_dir" "$binary_name")
+        if $dry_run; then
+            # A dry run reports the build; it does not compile anything.
+            log_info "[DRY RUN] Would build $binary_name from source in $repo_dir"
+            bin_path="<$binary_name built from $repo_dir>"
+        else
+            log_info "Building $binary_name from source for $tool_name..."
+            bin_path=$(_upgrade_build_tool "$tool_name" "$repo_dir" "$binary_name")
 
-        if [[ -z "$bin_path" || ! -x "$bin_path" ]]; then
-            log_error "Failed to build $binary_name for $tool_name"
-            return 1
+            if [[ -z "$bin_path" || ! -x "$bin_path" ]]; then
+                log_error "Failed to build $binary_name for $tool_name"
+                return 1
+            fi
+
+            # Track the tmpdir for cleanup (bin_path is like /tmp/xxx/tool)
+            built_tmpdir=$(dirname "$bin_path")
         fi
-
-        # Track the tmpdir for cleanup (bin_path is like /tmp/xxx/tool)
-        built_tmpdir=$(dirname "$bin_path")
     fi
 
     if [[ -z "$bin_path" ]]; then

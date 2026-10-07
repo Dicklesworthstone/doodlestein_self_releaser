@@ -894,6 +894,53 @@ fi
     assert_equal "0" "$status"
 }
 
+@test "sbom generate: path on stdout, failure cause on stderr and in JSON" {
+    harness_create_config
+    printf 'artifact\n' > "$TEST_TMPDIR/artifact.bin"
+    # A scanner that fails with a specific reason.
+    mock_command_script "syft" 'echo "scanner exploded: disk quota" >&2; exit 2'
+
+    local out err
+    run bash -c '"$1" sbom generate "$2" 2>"$3"' _ "$PROJECT_ROOT/dsr" "$TEST_TMPDIR/artifact.bin" "$TEST_TMPDIR/err.txt"
+    assert_equal "1" "$status"
+    assert_equal "" "$output"
+    grep -q "scanner exploded: disk quota" "$TEST_TMPDIR/err.txt"
+
+    _dsr_json sbom generate "$TEST_TMPDIR/artifact.bin"
+    assert_equal "1" "$status"
+    jq -e '.status == "error" and (.details.error | contains("scanner exploded: disk quota")) and
+        (.details.error | contains("\u001b") | not)' <<< "$json"
+}
+
+@test "slsa generate: stdout and JSON output are exactly the provenance path" {
+    harness_create_config
+    printf 'artifact\n' > "$TEST_TMPDIR/tool.tar.gz"
+    local proof="$TEST_TMPDIR/tool.tar.gz.intoto.jsonl"
+
+    # Outside any Git checkout, so no source observation is attempted.
+    cd "$TEST_TMPDIR"
+    run bash -c '"$1" slsa generate "$2" 2>/dev/null' _ "$PROJECT_ROOT/dsr" "$TEST_TMPDIR/tool.tar.gz"
+    assert_equal "0" "$status"
+    assert_equal "$proof" "$output"
+
+    _dsr_json slsa generate "$TEST_TMPDIR/tool.tar.gz"
+    assert_equal "0" "$status"
+    jq -e --arg proof "$proof" '.status == "success" and .details.output == $proof' <<< "$json"
+
+    run bash -c '"$1" slsa generate "$2" 2>&1 >/dev/null' _ "$PROJECT_ROOT/dsr" "$TEST_TMPDIR/missing.tar.gz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"missing.tar.gz"* || "$output" == *"rtifact"* ]]
+}
+
+@test "json_envelope never emits malformed details" {
+    # The function body ends at the first "}" line after its heredoc's EOF.
+    run bash -c 'source "$1/src/logging.sh"
+        eval "$(awk "/^json_envelope\\(\\)/{on=1} on{print} on && /^EOF\$/{eof=1} eof && /^}\$/{exit}" "$1/dsr")"
+        DSR_VERSION=test json_envelope verify-upgrade error 1 "$(printf "%s\n%s" "{\"a\":1}" "{}")" 2>/dev/null' _ "$PROJECT_ROOT"
+    assert_equal "0" "$status"
+    jq -e '.details.error == "malformed details" and (.details.raw | startswith("{\"a\":1}"))' <<< "$output"
+}
+
 # ============================================================================
 # EXIT CODE CONSISTENCY TESTS
 # ============================================================================
