@@ -499,6 +499,44 @@ opt-out clears it while preserving recorded host/path bindings and history.
 An ordinary sync receipt records transfer admission; strict releases continue
 to require their frozen source snapshot.
 
+Normal ordinary native builds request fresh source staging. Each distinct host
+gets an exclusively created directory under `hosts.yaml` `build_root` (default
+`/var/tmp` on Unix or the drive's `Users/Public` on Windows). The main source
+and configured siblings are synchronized there; existing host checkouts remain
+available independently. `--sync-only` retains its configured-path behavior.
+Staged roots are retained for subsequent resume, including explicit `--no-sync`
+resume. Windows Git-context import requires PowerShell 7 and Git; Unix import
+requires Bash, Git, jq, and a SHA-256 utility.
+
+Before any host transfer, DSR captures the main and Git-backed sibling HEADs,
+symbolic branches, and exact tag object IDs in standalone bundles. A successful
+staged sync has `staged_ordinary: true` and a top-level `git_context` containing
+`git_sha`, `git_ref`, `bundle_sha256`, `tags`, `core_autocrlf`, and `core_eol`.
+The top-level `sibling_git_contexts` records the captured contexts of Git-backed
+siblings by directory name. Successful host rows retain their restored
+`git_context` and `sibling_git_contexts`, with host-local `bundle_path` and
+`source_root` in each context. Host/path receipts bind the build to these staged
+locations and captured Git identity. Corrupt bundles, failed imports, or
+changes to controller HEAD, branch, tags, or line-ending settings prevent admission.
+
+The imported repository contains its own Git objects and index. Only the
+validated line-ending settings `core.autocrlf` (`false`, `true`, or `input`) and
+`core.eol` (`native`, `lf`, or `crlf`) are preserved from the effective controller
+configuration; their defaults are `false` and `native`. Other Git configuration,
+including custom filters, hooks, credentials, and linked-worktree pointers, is
+not transported. Import initializes an absent `.git` and seeds its index from
+HEAD without checking out or resetting working files. Staged and unstaged
+controller edits retain their file contents but appear as unstaged edits in the private
+index. This supports commit, branch, tag ancestry, and dirty version stamping
+while preserving the controller index. Ordinary transfers are not an atomic
+snapshot of concurrently edited working files.
+
+Git context requires a top-level, non-shallow SHA-1 worktree. Sparse checkouts
+and `assume-unchanged`/`skip-worktree` index entries are refused before host
+transfer. Required sibling paths must exist, have safe unique directory names,
+and stay beside the main source; Git-backed siblings meet the same context
+requirements, while plain source directories can synchronize without Git.
+
 Relocation requires the original controller to have released the build lock,
 the selected target to be failed, and no target to be running. Completed or
 cancelled runs and diagnostic builds are refused.

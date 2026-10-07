@@ -459,6 +459,25 @@ completed artifacts remain reusable, and sync failures do not consume compiler
 retries. `--sync-only` exits 1 if any host fails. Use `--no-sync` when you manage
 the remote sources separately; it explicitly bypasses the sync gate on resume.
 
+Normal native builds stage source in fresh directories under the host's
+configured `build_root`, or its default disk staging location. Each stage
+receives the controller's Git HEAD, branch, and tags through a verified bundle,
+so Git-based build scripts work on first-time hosts and linked worktrees.
+Dirty and untracked files included by ordinary sync retain their contents.
+The private Git repository preserves the controller's `core.autocrlf` and
+`core.eol` settings so line-ending normalization does not create false dirty
+version stamps. Existing host checkout metadata, other Git configuration,
+hooks, and credentials are not copied into the build repository. Git-backed
+sibling crates receive their own contexts, and a missing required sibling
+blocks sync.
+
+The source must be a complete, non-shallow SHA-1 repository worktree at its
+top-level directory. Sparse checkouts and files marked `assume-unchanged` or
+`skip-worktree` are refused because their dirty-state semantics cannot be
+reconstructed from the transferred files. Source directories and bundle
+receipts remain available for resume. `--sync-only` continues to synchronize
+the configured checkout paths; `--no-sync` uses externally managed sources.
+
 A failed strict native target can move to another configured host during an
 explicit resume, after the original controller has released its build lock:
 

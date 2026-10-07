@@ -2773,6 +2773,8 @@ EOF
                 --git-sha "$build_source_sha"
                 --
             )
+        elif ! $sync_only; then
+            build_sync_args=(--stage-ordinary --)
         fi
 
         log_info "Syncing source to remote build hosts..."
@@ -2846,6 +2848,28 @@ EOF
             # Retain failure evidence as well as successful host/path bindings.
             # The coordinator persists blocked targets before any compilation.
             build_source_args+=(--source-sync-json "$sync_json")
+            if ! $sync_only && [[ "$(jq -r '.status' <<< "$sync_json")" != skipped ]]; then
+                local staged_git_sha staged_git_ref
+                if ! staged_git_sha=$(jq -er '
+                    select(.staged_ordinary == true) | .git_context.git_sha |
+                    strings | select(test("^[0-9a-f]{40}$"))' <<< "$sync_json") || \
+                   ! staged_git_ref=$(jq -er '
+                    .git_context.git_ref | strings |
+                    if . == "" then "HEAD" else ltrimstr("refs/heads/") end' <<< "$sync_json"); then
+                    log_error "Staged ordinary sync did not retain its source Git identity"
+                    return 4
+                fi
+                if $resume && { [[ "$staged_git_sha" != "$build_source_sha" ]] || \
+                                [[ "$staged_git_ref" != "$build_source_ref" ]]; }; then
+                    log_error "Source Git identity changed while preparing the resumed build"
+                    return 4
+                fi
+                build_source_sha="$staged_git_sha"
+                build_source_ref="$staged_git_ref"
+                if ! $resume; then
+                    build_source_args+=(--git-sha "$build_source_sha" --git-ref "$build_source_ref")
+                fi
+            fi
         fi
         if $build_release_contract_enabled; then
             build_target_hosts_json=$(jq -ce '.target_hosts | objects' <<< "$sync_json") || return 4

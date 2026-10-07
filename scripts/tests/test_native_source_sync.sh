@@ -57,8 +57,24 @@ if $receiver; then
         exit 12
     fi
 fi
-if (($# == 1)); then /bin/bash -c "$1"; status=$?
+if (($# == 1)) && [[ "$1" == bash\ -c\ * ]]; then
+    # SSH passes its command through the account's login shell before the
+    # explicit Bash interpreter. Exercise that outer boundary with POSIX sh.
+    printf '%s\n' "$host" >> "$SYNC_TEST_WORK/posix-git-imports"
+    /bin/sh -c "$1"; status=$?
+elif (($# == 1)); then /bin/bash -c "$1"; status=$?
 else "$@"; status=$?; fi
+if [[ $status -eq 0 && -e "$SYNC_TEST_WORK/corrupt-git-bundle" &&
+      "$*" == *"cat > '"*"/.dsr-context-source.bundle'" ]]; then
+    # Corrupt only the actual newly received context bundle. The real Git
+    # importer must detect this transfer damage before any Cargo invocation.
+    command_text="$*"
+    bundle="${command_text##*cat > }"
+    bundle="${bundle#\'}"; bundle="${bundle%\'}"
+    [[ "$bundle" == "$SYNC_TEST_WORK/stages/"* && -f "$bundle" ]] || exit 255
+    printf '\nintentional transport corruption\n' >> "$bundle"
+    printf '%s\n' "$bundle" >> "$SYNC_TEST_WORK/corrupted-bundles"
+fi
 if $receiver && [[ $status -eq 0 && "$host" == fixture-repair && -e "$SYNC_TEST_WORK/change-mapping-after-sync" ]]; then
     # The source receipt names fixture-repair. Change only the fixture's
     # subsequent selection policy after that real transfer has completed.
@@ -274,11 +290,14 @@ run_build mixed 1 syncmixed --version 1.2.4 --jobs 2 --output-dir "$MIXED_OUTPUT
 check 'healthy host completes while failed source sync remains a failed task' jq -e \
     '.details.success==1 and .details.failed==1' "$WORK/mixed.json"
 check 'public build JSON retains the complete partial source synchronization receipt' jq -e \
-    --arg healthy "$WORK/hosts/healthy" --arg bad "$WORK/hosts/bad" '
+    --arg root "$WORK/stages/" '
     .details.source_sync | .status=="partial" and .synced==1 and .failed==1 and
     .target_hosts=={"linux/amd64":"healthybox","linux/arm64":"badbox"} and
-    .source_roots=={healthybox:$healthy} and
-    any(.hosts[]; .host=="badbox" and .path==$bad and .status=="failed" and
+    .staged_ordinary==true and
+    (.source_roots.healthybox | startswith($root) and endswith("/source")) and
+    any(.hosts[]; .host=="healthybox" and .status=="success" and
+        (.path | startswith($root) and endswith("/source"))) and
+    any(.hosts[]; .host=="badbox" and .status=="failed" and
         (.error | contains("intentional rsync receiver connection loss")))' "$WORK/mixed.json"
 check 'public failed target exposes source stage, original host receipt, error and log path' jq -e '
     .details as $details |
@@ -421,6 +440,207 @@ reject_receipt extra-target "$(jq -c '.target_hosts["darwin/amd64"]="healthybox"
 reject_receipt multiple-documents "$valid"$'\n'"$valid"
 reject_receipt conflicting-hosts "$valid" --target-hosts-json '{"linux/amd64":"badbox","linux/arm64":"badbox"}'
 reject_receipt conflicting-roots "$valid" --source-roots-json '{"healthybox":"/not-the-synced-root"}'
+
+# Ordinary builds need usable Git history as well as current worktree bytes.
+# A linked controller worktree, a real sibling crate, and an unrelated dirty
+# host checkout exercise this through the same public command/transport path.
+mkdir -p "$WORK/git-source/src" "$WORK/gitdependency/src" || exit 1
+cat > "$WORK/git-source/build.rs" <<'RUST'
+use std::{env, fs::OpenOptions, io::Write, process::Command};
+fn git(args: &[&str]) -> String {
+    let result = Command::new("git").args(args).output().unwrap();
+    assert!(result.status.success(), "Git metadata unavailable: {:?}: {}", args,
+        String::from_utf8_lossy(&result.stderr));
+    String::from_utf8(result.stdout).unwrap().trim().to_string()
+}
+fn main() {
+    let mut events = OpenOptions::new().create(true).append(true)
+        .open(env::var("SYNC_TEST_COMPILERS").unwrap()).unwrap();
+    writeln!(events, "{}:{}", env::var("CARGO_PKG_NAME").unwrap(), env::var("TARGET").unwrap()).unwrap();
+    println!("cargo:rustc-env=BUILD_GIT_SHA={}", git(&["rev-parse", "HEAD"]));
+    println!("cargo:rustc-env=BUILD_GIT_DESCRIBE={}", git(&["describe", "--tags", "--always", "--dirty"]));
+    println!("cargo:rustc-env=BUILD_GIT_BRANCH={}", git(&["symbolic-ref", "--short", "HEAD"]));
+}
+RUST
+cp "$WORK/git-source/build.rs" "$WORK/gitdependency/build.rs" || exit 1
+cat > "$WORK/gitdependency/Cargo.toml" <<'TOML'
+[package]
+name = "gitdependency"
+version = "1.0.0"
+edition = "2021"
+TOML
+cat > "$WORK/gitdependency/src/lib.rs" <<'RUST'
+pub fn stamp() -> String {
+    format!("{}|{}|{}|{}", env!("BUILD_GIT_SHA"), env!("BUILD_GIT_DESCRIBE"),
+        env!("BUILD_GIT_BRANCH"), include_str!("message.txt").trim())
+}
+RUST
+printf 'SIBLING_OLD\n' > "$WORK/gitdependency/src/message.txt"
+git -C "$WORK/gitdependency" init -q -b main || exit 1
+git -C "$WORK/gitdependency" add Cargo.toml build.rs src || exit 1
+git -C "$WORK/gitdependency" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm old-sibling || exit 1
+git clone -q "$WORK/gitdependency" "$WORK/hosts/gitdependency" || exit 1
+printf 'SIBLING_NEW\n' > "$WORK/gitdependency/src/message.txt"
+git -C "$WORK/gitdependency" add src/message.txt || exit 1
+git -C "$WORK/gitdependency" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm current-sibling || exit 1
+git -C "$WORK/gitdependency" -c user.name=Fixture -c user.email=fixture@example.invalid tag -a v1.1.0 -m sibling-release || exit 1
+printf 'SIBLING_DIRTY\n' > "$WORK/gitdependency/src/message.txt"
+
+cat > "$WORK/git-source/Cargo.toml" <<'TOML'
+[package]
+name = "gitfixture"
+version = "1.0.0"
+edition = "2021"
+[dependencies]
+gitdependency = { path = "../gitdependency" }
+TOML
+cat > "$WORK/git-source/src/main.rs" <<'RUST'
+fn main() {
+    println!("{}|{}|{}|{}|{}|{}|{}", include_str!("message.txt").trim(),
+        env!("BUILD_GIT_SHA"), env!("BUILD_GIT_DESCRIBE"), env!("BUILD_GIT_BRANCH"),
+        include_str!("../config.txt").trim(), include_str!("../untracked.txt").trim(),
+        gitdependency::stamp());
+}
+RUST
+printf 'OLD_SOURCE\n' > "$WORK/git-source/src/message.txt"
+printf 'CLEAN_CONFIG\n' > "$WORK/git-source/config.txt"
+cargo generate-lockfile --offline --manifest-path "$WORK/git-source/Cargo.toml" || exit 1
+git -C "$WORK/git-source" init -q -b main || exit 1
+git -C "$WORK/git-source" add Cargo.toml Cargo.lock build.rs src config.txt || exit 1
+git -C "$WORK/git-source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm git-metadata-base || exit 1
+git -C "$WORK/git-source" -c user.name=Fixture -c user.email=fixture@example.invalid tag -a v3.0.0 -m main-release || exit 1
+git clone -q "$WORK/git-source" "$WORK/hosts/git-stale" || exit 1
+printf 'HOST_PRIVATE_EDIT\n' > "$WORK/hosts/git-stale/src/message.txt"
+git -C "$WORK/hosts/git-stale" add src/message.txt || exit 1
+printf 'HOST_PRIVATE_FILE\n' > "$WORK/hosts/git-stale/private.txt"
+printf 'HOST_SIBLING_PRIVATE\n' > "$WORK/hosts/gitdependency/private.txt"
+printf 'controller current commit\n' > "$WORK/git-source/current.txt"
+git -C "$WORK/git-source" add current.txt || exit 1
+git -C "$WORK/git-source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm current-controller || exit 1
+git -C "$WORK/git-source" worktree add -q --force "$WORK/controller-linked" main || exit 1
+printf 'NEW_SOURCE\n' > "$WORK/controller-linked/src/message.txt"
+git -C "$WORK/controller-linked" add src/message.txt || exit 1
+printf 'DIRTY_CONFIG\n' > "$WORK/controller-linked/config.txt"
+printf 'LOCAL_NOTE\n' > "$WORK/controller-linked/untracked.txt"
+git -C "$WORK/git-source" config credential.helper 'fixture-private-do-not-copy'
+printf 'private controller hook\n' > "$WORK/git-source/.git/hooks/dsr-private-fixture"
+
+snapshot_git_tree() {
+    local root="$1" index; shift
+    git -C "$root" rev-parse HEAD || return 1
+    git -C "$root" symbolic-ref HEAD || return 1
+    index=$(git -C "$root" rev-parse --git-path index) || return 1
+    [[ "$index" == /* ]] || index="$root/$index"
+    _act_sha256 "$index" || return 1
+    GIT_OPTIONAL_LOCKS=0 git -C "$root" status --porcelain=v1 || return 1
+    local name
+    for name in "$@"; do _act_sha256 "$root/$name" || return 1; done
+}
+GIT_SHA=$(git -C "$WORK/controller-linked" rev-parse HEAD) || exit 1
+GIT_DESCRIBE=$(git -C "$WORK/controller-linked" describe --tags --always --dirty) || exit 1
+GIT_BRANCH=$(git -C "$WORK/controller-linked" symbolic-ref --short HEAD) || exit 1
+SIBLING_SHA=$(git -C "$WORK/gitdependency" rev-parse HEAD) || exit 1
+SIBLING_DESCRIBE=$(git -C "$WORK/gitdependency" describe --tags --always --dirty) || exit 1
+SIBLING_BRANCH=$(git -C "$WORK/gitdependency" symbolic-ref --short HEAD) || exit 1
+EXPECTED_GIT_OUTPUT="NEW_SOURCE|$GIT_SHA|$GIT_DESCRIBE|$GIT_BRANCH|DIRTY_CONFIG|LOCAL_NOTE|$SIBLING_SHA|$SIBLING_DESCRIBE|$SIBLING_BRANCH|SIBLING_DIRTY"
+# Finish fixture metadata reads before taking ownership fingerprints: Git
+# describe --dirty refreshes its index even with GIT_OPTIONAL_LOCKS=0.
+# Every subsequent DSR build and recovery must preserve these exact bytes.
+CONTROLLER_BEFORE=$(snapshot_git_tree "$WORK/controller-linked" .git src/message.txt config.txt untracked.txt Cargo.toml) || exit 1
+CONTROLLER_CONFIG=$(_act_sha256 "$WORK/git-source/.git/config") || exit 1
+HOST_BEFORE=$(snapshot_git_tree "$WORK/hosts/git-stale" src/message.txt private.txt Cargo.toml) || exit 1
+HOST_SIBLING_BEFORE=$(snapshot_git_tree "$WORK/hosts/gitdependency" src/message.txt private.txt Cargo.toml) || exit 1
+SIBLING_BEFORE=$(snapshot_git_tree "$WORK/gitdependency" src/message.txt Cargo.toml) || exit 1
+jq --arg source "$WORK/controller-linked" --arg sibling "$WORK/gitdependency" --arg work "$WORK" '
+    .tool_name="gitstale" | .repo="example/gitstale" | .local_path=$source |
+    .binary_name="gitfixture" | .targets=["linux/amd64"] |
+    .act_job_map={"linux/amd64":null} |
+    .target_triples={"linux/amd64":"x86_64-unknown-linux-gnu"} |
+    .hosts={"linux/amd64":"healthybox"} |
+    .host_paths={healthybox:($work+"/hosts/git-stale"),unsyncedbox:($work+"/hosts/git-fresh")} |
+    .sibling_crates=[{local_path:$sibling,relative_path:"gitdependency"}] |
+    .build_cmd="printf '\''gitfixture-start\\n'\'' >> \"$SYNC_TEST_COMMANDS\"; cargo build --release --locked --offline"
+    ' "$ACT_REPOS_DIR/syncmixed.yaml" > "$ACT_REPOS_DIR/gitstale.yaml" || exit 1
+jq '.tool_name="gitfresh" | .repo="example/gitfresh" | .hosts={"linux/amd64":"unsyncedbox"}' \
+    "$ACT_REPOS_DIR/gitstale.yaml" > "$ACT_REPOS_DIR/gitfresh.yaml" || exit 1
+check 'fixture preparation preserves controller and sibling ownership fingerprints' test \
+    "$CONTROLLER_BEFORE/$SIBLING_BEFORE" = \
+    "$(snapshot_git_tree "$WORK/controller-linked" .git src/message.txt config.txt untracked.txt Cargo.toml)/$(snapshot_git_tree "$WORK/gitdependency" src/message.txt Cargo.toml)"
+for kind in stale fresh; do
+    run_build "git-$kind" 0 "git$kind" --version 3.0.1 --allow-dirty --output-dir "$WORK/git-$kind-output"
+    check "$kind Git build reports a fresh private source root and controller metadata" jq -e \
+        --arg sha "$GIT_SHA" --arg root "$WORK/stages/" '
+        .details.source_sync | .staged_ordinary==true and .git_context.git_sha==$sha and
+        .git_context.git_ref=="refs/heads/main" and
+        all(.hosts[]; .status=="success" and (.path | startswith($root) and endswith("/source")) and
+            .git_context.git_sha==$sha and .git_context.source_root==.path)
+        ' "$WORK/git-$kind.json"
+    build_state_get "git$kind" 3.0.1 > "$WORK/git-$kind-state.json" || true
+    git_artifact=$(jq -r '.target_statuses["linux/amd64"].result.artifact_path // empty' "$WORK/git-$kind-state.json")
+    if [[ -n "$git_artifact" && -x "$git_artifact" ]]; then
+        check "$kind executable embeds current Git HEAD/tag/branch and dirty main/sibling bytes" \
+            test "$("$git_artifact")" = "$EXPECTED_GIT_OUTPUT"
+    else
+        check "$kind Git metadata build produces an executable" false
+    fi
+done
+check 'Git imports pass through a real POSIX shell before explicit Bash' test -s "$WORK/posix-git-imports"
+check 'normal fresh-host build never creates or imports into its configured checkout path' test ! -e "$WORK/hosts/git-fresh"
+check 'normal builds preserve stale host HEAD/index/private files and worktree bytes' test \
+    "$HOST_BEFORE" = "$(snapshot_git_tree "$WORK/hosts/git-stale" src/message.txt private.txt Cargo.toml)"
+check 'normal builds preserve unrelated host sibling checkout and private files' test \
+    "$HOST_SIBLING_BEFORE" = "$(snapshot_git_tree "$WORK/hosts/gitdependency" src/message.txt private.txt Cargo.toml)"
+check 'normal builds preserve linked controller index/pointer/staged/unstaged/untracked bytes' test \
+    "$CONTROLLER_BEFORE" = "$(snapshot_git_tree "$WORK/controller-linked" .git src/message.txt config.txt untracked.txt Cargo.toml)"
+check 'normal builds preserve controller private Git configuration' test \
+    "$CONTROLLER_CONFIG" = "$(_act_sha256 "$WORK/git-source/.git/config")"
+check 'normal builds preserve dirty controller sibling Git state and bytes' test \
+    "$SIBLING_BEFORE" = "$(snapshot_git_tree "$WORK/gitdependency" src/message.txt Cargo.toml)"
+
+# A real bundle transfer damaged in transit must remain a source-stage error,
+# with no compiler admission; repairing only that boundary permits resume.
+: > "$WORK/corrupt-git-bundle"
+GIT_COMMANDS_BEFORE=$(count "$WORK/build-commands" gitfixture-start)
+GIT_COMPILERS_BEFORE=$(count "$WORK/compiler-events" "gitfixture:$GNU")
+run_build git-corrupt 6 gitstale --version 3.0.2 --allow-dirty --output-dir "$WORK/git-corrupt-output"
+check 'corruption fixture actually changes a transferred standalone Git bundle' test -s "$WORK/corrupted-bundles"
+check 'failed Git import never invokes the configured native command' test \
+    "$(count "$WORK/build-commands" gitfixture-start)" -eq "$GIT_COMMANDS_BEFORE"
+check 'failed Git import never runs genuine Cargo build.rs' test \
+    "$(count "$WORK/compiler-events" "gitfixture:$GNU")" -eq "$GIT_COMPILERS_BEFORE"
+build_state_get gitstale 3.0.2 > "$WORK/git-corrupt-state.json" || true
+GIT_RUN=$(jq -r '.run_id // empty' "$WORK/git-corrupt-state.json")
+check 'Git import failure persists its source-stage receipt for resume' jq -e '
+    .target_statuses["linux/amd64"] | .status=="failed" and .result.stage=="source_sync" and
+    .result.source_sync.status=="failed" and (.result.error | length>0)
+    ' "$WORK/git-corrupt-state.json"
+if [[ -s "$WORK/corrupted-bundles" ]]; then
+    while IFS= read -r corrupted; do
+        check 'damaged bundle refuses before creating staged Git metadata' test ! -e "${corrupted%/*}/source/.git"
+    done < "$WORK/corrupted-bundles"
+fi
+mv "$WORK/corrupt-git-bundle" "$WORK/corrupt-git-bundle.disabled" || exit 1
+if [[ -n "$GIT_RUN" ]]; then
+    run_build git-import-recovered 0 gitstale --version 3.0.2 --allow-dirty --resume="$GIT_RUN" --output-dir "$WORK/git-corrupt-output"
+    build_state_get gitstale 3.0.2 "$GIT_RUN" > "$WORK/git-import-recovered-state.json" || true
+    git_artifact=$(jq -r '.target_statuses["linux/amd64"].result.artifact_path // empty' "$WORK/git-import-recovered-state.json")
+    if [[ -n "$git_artifact" && -x "$git_artifact" ]]; then
+        check 'resumed Git import builds the exact current source and Git metadata' test \
+            "$("$git_artifact")" = "$EXPECTED_GIT_OUTPUT"
+    else
+        check 'resumed Git import produces an executable' false
+    fi
+    check 'repaired Git import compiles exactly once after admission' test \
+        "$(count "$WORK/build-commands" gitfixture-start)" -eq "$((GIT_COMMANDS_BEFORE + 1))"
+    check 'repaired import uses a different private root from the refused attempt' jq -e \
+        --slurpfile failed "$WORK/git-corrupt-state.json" '
+        .target_statuses["linux/amd64"].result.source_sync.path !=
+            $failed[0].target_statuses["linux/amd64"].result.source_sync.path
+        ' "$WORK/git-import-recovered-state.json"
+fi
+check 'Git recovery still preserves controller state and original host checkout' test \
+    "$CONTROLLER_BEFORE/$HOST_BEFORE" = \
+    "$(snapshot_git_tree "$WORK/controller-linked" .git src/message.txt config.txt untracked.txt Cargo.toml)/$(snapshot_git_tree "$WORK/hosts/git-stale" src/message.txt private.txt Cargo.toml)"
 
 printf 'Results: %s passed, %s failed; evidence %s\n' "$PASS" "$FAIL" "$WORK"
 [[ "$FAIL" -eq 0 ]]

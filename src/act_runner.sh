@@ -5261,6 +5261,146 @@ _act_verify_strict_source_roots() {
     done < <(jq -r 'to_entries | sort_by(.key)[] | [.key, .value] | @tsv' <<< "$source_roots_json")
 }
 
+# Export once before any host writes. Missing siblings and layouts that could
+# escape or collide with the main staged tree are configuration failures.
+_act_export_ordinary_git_contexts() {
+    local config_file="$1" local_path="$2" context_parent="$3"
+    local sources='[]' contexts='[]' item relative source context count index
+    local sibling_names_seen=' source cargo-home '
+    sources=$(jq -nc --arg path "$local_path" '[{relative_path:"source",local_path:$path}]') || return 4
+    count=$(yq -r '.sibling_crates // [] | length' "$config_file") || return 4
+    [[ "$count" =~ ^[0-9]+$ ]] || return 4
+    for ((index=0; index<count; index++)); do
+        source=$(yq -r ".sibling_crates[$index].local_path // \"\"" "$config_file") || return 4
+        relative=$(yq -r ".sibling_crates[$index].relative_path // \"\"" "$config_file") || return 4
+        [[ -n "$relative" ]] || relative="${source##*/}"
+        if [[ ! -d "$source" || -L "$source" ||
+              ! "$relative" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
+              "$relative" == *..* || "$relative" == *. ||
+              "$sibling_names_seen" == *" ${relative,,} "* ]]; then
+            _log_error "Missing sibling source or invalid staged sibling name: $source ($relative)"
+            return 4
+        fi
+        sibling_names_seen+="${relative,,} "
+        sources=$(jq -c --arg path "$source" --arg relative "$relative" \
+            '. + [{relative_path:$relative,local_path:$path}]' <<< "$sources") || return 4
+    done
+    while IFS= read -r item; do
+        source=$(jq -r .local_path <<< "$item") || return 4
+        relative=$(jq -r .relative_path <<< "$item") || return 4
+        context=null
+        if [[ "$relative" == source ]] ||
+           _git_ops_build_git -C "$source" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            if ! context=$(git_ops_export_build_context "$source" "$context_parent/$relative"); then
+                _log_error "Cannot export Git build context for $source (requires a complete SHA1 Git worktree)"
+                return 4
+            fi
+        fi
+        contexts=$(jq -c --argjson item "$item" --argjson context "$context" \
+            '. + [$item + {context:$context}]' <<< "$contexts") || return 4
+    done < <(jq -c '.[]' <<< "$sources")
+    printf '%s\n' "$contexts"
+}
+
+_act_verify_ordinary_git_contexts() {
+    local contexts="$1" item source context
+    while IFS= read -r item; do
+        source=$(jq -r .local_path <<< "$item") || return 4
+        [[ -d "$source" && ! -L "$source" ]] || return 4
+        context=$(jq -c .context <<< "$item") || return 4
+        if [[ "$context" != null ]] && ! git_ops_verify_build_context "$source" "$context"; then
+            _log_error "Controller Git HEAD, branch, or tags changed during source transfer: $source"
+            return 4
+        fi
+    done < <(jq -c '.[]' <<< "$contexts")
+}
+
+_act_ordinary_source_root_path() {
+    local host="$1" identity="$2" configured_path="$3" root="" root_status=0
+    _act_is_uuid "$identity" || return 4
+    root=$(_act_get_host_build_root "$host") || root_status=$?
+    [[ "$root_status" != 4 ]] || return 4
+    if [[ -z "$root" ]]; then
+        if _act_is_windows_host "$host"; then
+            root='C:/Users/Public'
+            [[ ! "$configured_path" =~ ^[A-Za-z]:[/\\] ]] || root="${configured_path:0:2}/Users/Public"
+        else
+            root=/var/tmp
+        fi
+    fi
+    identity="${identity//-/}"
+    if _act_is_windows_host "$host"; then identity="${identity:0:12}"; fi
+    printf '%s/dsr-source-%s/source\n' "${root%/}" "$identity"
+}
+
+_act_prepare_ordinary_source_root() {
+    local host="$1" source_root="$2" parent="${2%/*}" base command
+    base="${parent%/*}"
+    if _act_is_windows_host "$host"; then
+        local win_source win_parent win_base guard
+        win_source=$(_act_windows_cmd_path "$source_root") || return 4
+        win_parent=$(_act_windows_cmd_path "$parent") || return 4
+        win_base=$(_act_windows_cmd_path "$base") || return 4
+        guard=$(_act_windows_reparse_guard_script) || return 4
+        command=$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; $guard New-Item -ItemType Directory -Force -Path '$win_base' | Out-Null; Assert-PlainDirectory '$win_base'; if (Get-Item -LiteralPath '$win_parent' -Force -ErrorAction SilentlyContinue) { throw 'Ordinary source stage already exists' }; New-Item -ItemType Directory -Path '$win_parent' | Out-Null; Assert-PlainDirectory '$win_parent'; New-Item -ItemType Directory -Path '$win_source' | Out-Null; Assert-PlainDirectory '$win_source'; Write-Output (Get-Item -LiteralPath '$win_source' -Force).FullName" pwsh) || return 4
+    else
+        command="set -e; umask 077; mkdir -p '$base'; test -d '$base'; test ! -L '$base'; $(_act_ram_backed_guard_sh "$base")test ! -e '$parent'; test ! -L '$parent'; mkdir '$parent' '$source_root'; cd '$source_root'; pwd -P"
+    fi
+    _act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null
+}
+
+# Import only into a fresh stage, never into an operator checkout. The same
+# Git helper validates the transferred bundle before creating a private .git.
+_act_restore_ordinary_git_context() {
+    local host="$1" source_root="$2" context="$3" relative="$4"
+    local bundle remote_bundle remote_context command restored destination
+    bundle=$(jq -r .bundle_path <<< "$context") || return 4
+    remote_bundle="${source_root%/*}/.dsr-context-${relative}.bundle"
+    remote_context=$(jq -c --arg path "$remote_bundle" '.bundle_path=$path' <<< "$context") || return 4
+    if _act_is_local_host "$host"; then
+        (umask 077; set -C; cat "$bundle" > "$remote_bundle") || return 4
+        restored=$(git_ops_restore_build_context "$source_root" "$remote_context") || return 4
+    elif _act_is_windows_host "$host"; then
+        destination=$(_act_get_ssh_destination "$host") || return 4
+        local win_bundle win_source script guard
+        win_bundle=$(_act_windows_cmd_path "$remote_bundle") || return 4
+        win_source=$(_act_windows_cmd_path "$source_root") || return 4
+        remote_context=$(jq -c --arg path "$win_bundle" '.bundle_path=$path' <<< "$context") || return 4
+        guard=$(_act_windows_reparse_guard_script) || return 4
+        command=$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; $guard Assert-PlainDirectory '$win_source'; if (Get-Item -LiteralPath '$win_bundle' -Force -ErrorAction SilentlyContinue) { throw 'Git context bundle already exists' }" pwsh) || return 4
+        _act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null || return 4
+        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$bundle" \
+            "$destination:$remote_bundle" </dev/null || return 4
+        script=$(git_ops_build_context_powershell "$win_source" "$remote_context") || return 4
+        command=$(_act_windows_encoded_powershell "$script" pwsh) || return 4
+        restored=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return 4
+    else
+        destination=$(_act_get_ssh_destination "$host") || return 4
+        local script quoted_script quoted_source quoted_context
+        command="set -e; set -C; umask 077; test -d '${source_root%/*}'; test ! -L '${source_root%/*}'; cat > '$remote_bundle'"
+        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$destination" "$command" \
+            < "$bundle" || return 4
+        script=$(declare -f _git_ops_build_git _git_ops_build_sha256 _git_ops_build_refs git_ops_restore_build_context) || return 4
+        script=$'set -uo pipefail\n'"$script"
+        printf -v quoted_source '%q' "$source_root"
+        printf -v quoted_context '%q' "$remote_context"
+        script+=$'\n'"git_ops_restore_build_context $quoted_source $quoted_context"
+        # The SSH login shell need not be Bash. Use POSIX quoting for its
+        # outer argument; only the explicit Bash interpreter reads the script.
+        quoted_script="'${script//\'/\'\\\'\'}'"
+        command="bash -c $quoted_script"
+        restored=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT" </dev/null) || return 4
+    fi
+    # Logs belong on stderr; the importer returns exactly one JSON receipt.
+    jq -sce --argjson expected "$remote_context" --arg root "$source_root" '
+        def path: gsub("\\\\";"/") | if test("^[A-Za-z]:/") then ascii_downcase else . end;
+        select(length == 1) | .[0] | select((del(.source_root)) == $expected) |
+        select((.source_root | path) == ($root | path)) | .source_root=$root' \
+        <<< "$restored"
+}
+
 # Sync sibling crates and patch Cargo.toml for remote builds
 # Usage: _act_sync_sibling_crates <host> <remote_project_path> <config_file> <sibling_count>
 # When a Rust project uses [patch.crates-io] with absolute local paths (e.g.,
@@ -5292,8 +5432,8 @@ _act_sync_sibling_crates() {
         [[ -z "$sib_relative" ]] && sib_relative=$(basename "$sib_local")
 
         if [[ ! -d "$sib_local" ]]; then
-            _log_warn "Sibling crate not found locally: $sib_local"
-            continue
+            _log_error "Required sibling crate not found locally: $sib_local"
+            return 1
         fi
 
         # Sync sibling crate to <parent>/<relative_path> on remote host
@@ -5368,13 +5508,14 @@ _act_sync_sibling_crates() {
 }
 
 # Sync source to all native build hosts for a tool
-# Usage: act_sync_sources <tool_name> [--strict-release --run-id UUID --git-sha SHA --] [targets...]
+# Usage: act_sync_sources <tool_name> [--stage-ordinary | --strict-release --run-id UUID --git-sha SHA] [--] [targets...]
 # Returns: JSON with sync results
 act_sync_sources() {
     local tool_name="$1"
     shift
     local targets_arg=()
     local strict_release=false
+    local stage_ordinary=false ordinary_stage_id="" ordinary_contexts='[]' primary_git_context=null sibling_git_contexts='{}'
     local strict_run_id=""
     local strict_git_sha=""
 
@@ -5382,6 +5523,10 @@ act_sync_sources() {
         case "$1" in
             --strict-release)
                 strict_release=true
+                shift
+                ;;
+            --stage-ordinary)
+                stage_ordinary=true
                 shift
                 ;;
             --run-id)
@@ -5410,6 +5555,12 @@ act_sync_sources() {
                 ;;
         esac
     done
+
+    if $stage_ordinary && $strict_release; then
+        _log_error "Ordinary source staging cannot replace a strict snapshot"
+        echo '{"status":"error","error":"Conflicting source staging modes"}'
+        return 4
+    fi
 
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
     if [[ ! -f "$config_file" ]]; then
@@ -5485,6 +5636,7 @@ act_sync_sources() {
     # runs use the working tree; strict act runs receive a local tracked-only root.
     local hosts_to_sync=()
     local host_paths=()
+    local configured_host_paths=()
     local target_hosts_json='{}'
     for target in $targets; do
         local host remote_path
@@ -5507,6 +5659,19 @@ act_sync_sources() {
         fi
         target_hosts_json=$(jq -c --arg target "$target" --arg host "$host" \
             '.[$target] = $host' <<< "$target_hosts_json") || return 4
+        local already_added=false
+        for h in "${hosts_to_sync[@]}"; do
+            if [[ "$h" == "$host" ]]; then
+                already_added=true
+                break
+            fi
+        done
+        $already_added && continue
+        local configured_remote_path="$remote_path"
+        if $stage_ordinary; then
+            ordinary_stage_id=$(_act_generate_uuid) || return 4
+            remote_path=$(_act_ordinary_source_root_path "$host" "$ordinary_stage_id" "$configured_remote_path") || return 4
+        fi
 
         # Refuse a POSIX source root on a Windows host before any host is
         # synced (issue #8): rsync would create or target the wrong location
@@ -5523,18 +5688,6 @@ act_sync_sources() {
             esac
         fi
 
-        # Skip duplicates
-        local already_added=false
-        for h in "${hosts_to_sync[@]}"; do
-            if [[ "$h" == "$host" ]]; then
-                already_added=true
-                break
-            fi
-        done
-        if $already_added; then
-            continue
-        fi
-
         if $strict_release; then
             if ! remote_path=$(_act_strict_source_root_path \
                 "$remote_path" "$tool_name" "$strict_run_id" "$host"); then
@@ -5546,12 +5699,32 @@ act_sync_sources() {
 
         hosts_to_sync+=("$host")
         host_paths+=("$remote_path")
+        configured_host_paths+=("$configured_remote_path")
     done
 
     if [[ ${#hosts_to_sync[@]} -eq 0 ]]; then
         _log_info "No build locations need source sync"
         echo '{"status":"skipped","synced":0,"hosts":[],"source_roots":{},"target_hosts":{}}'
         return 0
+    fi
+
+    if $stage_ordinary; then
+        if ! declare -F git_ops_export_build_context >/dev/null; then
+            local git_module="${BASH_SOURCE[0]%/*}/git_ops.sh"
+            # shellcheck source=src/git_ops.sh
+            source "$git_module" || return 4
+        fi
+        local context_base context_parent
+        context_base="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/source-contexts"
+        mkdir -p "$context_base" || return 4
+        context_parent=$(mktemp -d "$context_base/ordinary.XXXXXXXX") || return 4
+        if ! ordinary_contexts=$(_act_export_ordinary_git_contexts "$config_file" "$local_path" "$context_parent"); then
+            echo '{"status":"error","error":"Cannot capture ordinary source Git contexts"}'
+            return 4
+        fi
+        primary_git_context=$(jq -c '.[0].context | del(.bundle_path)' <<< "$ordinary_contexts") || return 4
+        sibling_git_contexts=$(jq -c '[.[] | select(.relative_path != "source" and .context != null) |
+            {key:.relative_path,value:(.context | del(.bundle_path))}] | from_entries' <<< "$ordinary_contexts") || return 4
     fi
 
     _log_info "Syncing to ${#hosts_to_sync[@]} host(s): ${hosts_to_sync[*]}"
@@ -5582,6 +5755,7 @@ act_sync_sources() {
     for i in "${!hosts_to_sync[@]}"; do
         local host="${hosts_to_sync[$i]}"
         local remote_path="${host_paths[$i]}"
+        local restored_primary=null restored_siblings='{}'
 
         # Capture each host's full sync transcript so failures can report the
         # underlying cause (in the log and in the per-host JSON) instead of a
@@ -5593,6 +5767,22 @@ act_sync_sources() {
             if host_sync_output=$(_act_sync_strict_checkout "$host" "$local_path" "$strict_git_sha" \
                 "$remote_path" "source.tar" "$tool_name" 2>&1); then
                 source_synced=true
+            fi
+        elif $stage_ordinary; then
+            local prepared_source_root stage_name="${remote_path%/source}"
+            stage_name="${stage_name##*/}"
+            if host_sync_output=$(_act_prepare_ordinary_source_root "$host" "$remote_path" 2>&1); then
+                prepared_source_root=$(printf '%s\n' "$host_sync_output" | tr -d '\r' | tail -1)
+                prepared_source_root="${prepared_source_root//\\//}"
+                if [[ "$prepared_source_root" =~ ^([A-Za-z]:)?/[A-Za-z0-9_./:+-]+$ &&
+                      "$prepared_source_root" == */"$stage_name"/source && "$prepared_source_root" != *..* ]]; then
+                    remote_path="$prepared_source_root"
+                    if host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" "${main_sync_excludes[@]}" 2>&1); then
+                        source_synced=true
+                    fi
+                else
+                    host_sync_output="Fresh source stage did not return its canonical path"
+                fi
             fi
         elif host_sync_output=$(_act_sync_source "$host" "$local_path" "$remote_path" \
             "${main_sync_excludes[@]}" 2>&1); then
@@ -5636,9 +5826,47 @@ act_sync_sources() {
                 fi
             fi
 
+            if $sync_ok && $stage_ordinary; then
+                local context_entry context_relative context_value restored_context import_output
+                while IFS= read -r context_entry; do
+                    context_relative=$(jq -r .relative_path <<< "$context_entry") || return 4
+                    context_value=$(jq -c .context <<< "$context_entry") || return 4
+                    [[ "$context_value" != null ]] || continue
+                    if import_output=$(_act_restore_ordinary_git_context "$host" \
+                        "${remote_path%/*}/$context_relative" "$context_value" "$context_relative" 2>&1); then
+                        restored_context=$(printf '%s\n' "$import_output" | grep '^{' | tail -1)
+                        if ! jq -e 'type == "object"' <<< "$restored_context" >/dev/null 2>&1; then
+                            host_sync_output="Git context import returned no valid receipt for $context_relative"
+                            sync_ok=false
+                            break
+                        fi
+                        if [[ "$context_relative" == source ]]; then
+                            restored_primary="$restored_context"
+                        else
+                            restored_siblings=$(jq -c --arg name "$context_relative" --argjson receipt "$restored_context" \
+                                '.[$name]=$receipt' <<< "$restored_siblings") || return 4
+                        fi
+                    else
+                        host_sync_output="Git context import failed for $context_relative: $import_output"
+                        printf '%s\n' "$host_sync_output" >&2
+                        sync_ok=false
+                        break
+                    fi
+                done < <(jq -c '.[]' <<< "$ordinary_contexts")
+                if $sync_ok && ! _act_verify_ordinary_git_contexts "$ordinary_contexts"; then
+                    host_sync_output="Controller Git context changed during source synchronization"
+                    sync_ok=false
+                fi
+            fi
+
             if $sync_ok; then
                 ((synced++))
-                results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"success\"}")
+                results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
+                    --arg configured_path "${configured_host_paths[$i]}" --argjson staged "$stage_ordinary" \
+                    --argjson context "$restored_primary" --argjson siblings "$restored_siblings" \
+                    '{host:$host,path:$path,status:"success"} +
+                     (if $staged then {configured_path:$configured_path,git_context:$context,
+                       sibling_git_contexts:$siblings} else {} end)')")
                 source_root_entries+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     '{key: $host, value: $path}')")
             else
@@ -5654,6 +5882,20 @@ act_sync_sources() {
                 '{host: $host, path: $path, status: "failed", error: $error}')")
         fi
     done
+
+    # Earlier hosts cannot remain admitted if the controller identity moved
+    # while a later host was transferring its source or context bundle.
+    if $stage_ordinary && ! _act_verify_ordinary_git_contexts "$ordinary_contexts"; then
+        synced=0
+        failed=${#hosts_to_sync[@]}
+        source_root_entries=()
+        local failed_results=() prior_result
+        for prior_result in "${results[@]}"; do
+            failed_results+=("$(jq -c '.status="failed" |
+                .error="Controller Git context changed during source synchronization"' <<< "$prior_result")")
+        done
+        results=("${failed_results[@]}")
+    fi
 
     local total_duration=$(($(date +%s) - start_time))
 
@@ -5688,6 +5930,9 @@ act_sync_sources() {
         --argjson hosts "$results_json" \
         --argjson source_roots "$source_roots_json" \
         --argjson target_hosts "$target_hosts_json" \
+        --argjson staged_ordinary "$stage_ordinary" \
+        --argjson git_context "$primary_git_context" \
+        --argjson sibling_git_contexts "$sibling_git_contexts" \
         '{
             status: $status,
             synced: $synced,
@@ -5696,7 +5941,8 @@ act_sync_sources() {
             hosts: $hosts,
             source_roots: $source_roots,
             target_hosts: $target_hosts
-        }'
+        } + (if $staged_ordinary then {staged_ordinary:true,git_context:$git_context,
+            sibling_git_contexts:$sibling_git_contexts} else {} end)'
 
     if [[ $failed -gt 0 ]]; then
         return 1
@@ -9708,6 +9954,16 @@ _act_validate_source_sync_receipt() {
     jq -sce --argjson tasks "$build_tasks" '
       def text: type == "string" and length > 0 and (test("[[:cntrl:]]") | not);
       def host: type == "string" and test("^[A-Za-z0-9_-]+$");
+      def path: gsub("\\\\";"/") | if test("^[A-Za-z]:/") then ascii_downcase else . end;
+      def context:
+        type == "object" and
+        (.git_sha | type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40)) and
+        (.git_ref | type == "string" and (. == "" or startswith("refs/heads/"))) and
+        (.bundle_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.core_autocrlf == "false" or .core_autocrlf == "true" or .core_autocrlf == "input") and
+        (.core_eol == "lf" or .core_eol == "crlf" or .core_eol == "native") and
+        (.tags | type == "object" and all(to_entries[];
+          (.key | startswith("refs/tags/")) and (.value | type == "string" and test("^[0-9a-f]{40}$"))));
       select(length == 1) | .[0] |
       . as $receipt |
       ([$tasks[] | select(.method == "native") | .platform] | unique | sort) as $native |
@@ -9732,6 +9988,23 @@ _act_validate_source_sync_receipt() {
         elif $failed == 0 then .status == "success"
         elif $success == 0 then .status == "failed"
         else .status == "partial" end) |
+      select(if has("staged_ordinary") then
+        .staged_ordinary == true and (.git_context | context) and
+        (.sibling_git_contexts | type == "object" and all(to_entries[];
+          (.key | test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not)) and
+          (.value | context))) and
+        all(.hosts[] | select(.status == "success"); . as $row |
+          (.git_context | context) and
+          ((.git_context | del(.bundle_path,.source_root)) == $receipt.git_context) and
+          (.git_context.bundle_path | text) and
+          ((.git_context.source_root | path) == (.path | path)) and
+          (.sibling_git_contexts | type == "object") and
+          ((.sibling_git_contexts | keys) == ($receipt.sibling_git_contexts | keys)) and
+          all(.sibling_git_contexts | to_entries[]; . as $sibling |
+            (.value | context) and (.value.bundle_path | text) and
+            ((.value | del(.bundle_path,.source_root)) == $receipt.sibling_git_contexts[$sibling.key]) and
+            ((.value.source_root | path) == (($row.path | sub("/source$";"")) + "/" + .key | path))))
+        else true end) |
       $receipt
     ' <<< "$receipt"
 }
@@ -9948,6 +10221,18 @@ act_orchestrate_build() {
         fi
         target_hosts_json=$(jq -c '.target_hosts' <<< "$source_sync_json") || return 4
         source_roots_json=$(jq -c '.source_roots' <<< "$source_sync_json") || return 4
+        if jq -e '.staged_ordinary == true' <<< "$source_sync_json" >/dev/null; then
+            local context_sha context_ref
+            context_sha=$(jq -r '.git_context.git_sha' <<< "$source_sync_json") || return 4
+            context_ref=$(jq -r '.git_context.git_ref | if . == "" then "HEAD" else sub("^refs/heads/";"") end' <<< "$source_sync_json") || return 4
+            if [[ -n "$supplied_git_sha" && "$supplied_git_sha" != "$context_sha" ]] ||
+               [[ -n "$supplied_git_ref" && "$supplied_git_ref" != "$context_ref" ]]; then
+                _log_error "Staged Git context differs from requested build identity"
+                return 4
+            fi
+            supplied_git_sha="$context_sha"
+            supplied_git_ref="$context_ref"
+        fi
     fi
 
     _log_info "Orchestrating build for $tool_name $version"
