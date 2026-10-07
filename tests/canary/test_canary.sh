@@ -282,6 +282,106 @@ test_canary_schedule_show() {
     harness_teardown
 }
 
+# File-backed crontab: the user's real crontab is never read or written.
+make_fake_crontab() {
+    mkdir -p "$TEST_TMPDIR/bin"
+    export FAKE_CRONTAB="$TEST_TMPDIR/crontab.txt"
+    cat > "$TEST_TMPDIR/bin/crontab" << 'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    -l) [[ -f "$FAKE_CRONTAB" ]] || { echo "no crontab for user" >&2; exit 1; }; cat "$FAKE_CRONTAB" ;;
+    -) cat > "$FAKE_CRONTAB" ;;
+    *) exit 2 ;;
+esac
+SH
+    chmod +x "$TEST_TMPDIR/bin/crontab"
+}
+
+test_canary_schedule_dry_run_and_validation() {
+    ((TESTS_RUN++))
+    harness_setup
+    make_fake_crontab
+    local problems=() keep='15 3 * * * /usr/bin/backup'
+    printf '%s\n' "$keep" > "$FAKE_CRONTAB"
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json canary schedule --dry-run
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("dry-run exit $(exec_status)")
+    exec_stdout | jq -e '.details.dry_run == true and (.details.entry | startswith("0 6 * * * ")) and
+        (.details.entry | contains(" canary run --all --json >> "))' >/dev/null 2>&1 ||
+        problems+=("dry-run envelope: $(exec_stdout | head -c 300)")
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" -n canary schedule --unschedule
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("-n unschedule exit $(exec_status)")
+    [[ "$(cat "$FAKE_CRONTAB")" == "$keep" ]] || problems+=("dry runs changed crontab")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" canary schedule --cron $'0 6 * * *\n* * * * * rm -rf ~'
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("multi-line cron exit $(exec_status)")
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" canary schedule --frobnicate
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("unknown option exit $(exec_status)")
+    [[ "$(cat "$FAKE_CRONTAB")" == "$keep" ]] || problems+=("rejected input changed crontab")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" canary schedule --cron '30 5 * * 1-5'
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" canary schedule --cron '@daily'
+    [[ "$(exec_status)" -eq 0 && "$(grep -c 'dsr canary' "$FAKE_CRONTAB")" -eq 1 ]] &&
+        grep -qxF -- "$keep" "$FAKE_CRONTAB" && grep -q '^@daily .* canary run --all' "$FAKE_CRONTAB" ||
+        problems+=("reschedule: $(cat "$FAKE_CRONTAB")")
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" canary schedule --unschedule
+    [[ "$(exec_status)" -eq 0 && "$(cat "$FAKE_CRONTAB")" == "$keep" ]] ||
+        problems+=("unschedule: $(cat "$FAKE_CRONTAB")")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "canary schedule honors --dry-run, rejects bad cron input, replaces and removes only its entry"
+    else
+        fail "canary schedule: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+# docker stub: every image builds; the container for cass fails.
+make_fake_docker() {
+    mkdir -p "$TEST_TMPDIR/bin"
+    cat > "$TEST_TMPDIR/bin/docker" << 'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    info|build|rmi) exit 0 ;;
+    run) [[ "$*" == *-cass-* ]] && { echo "Installer failed"; exit 1; }
+         echo "=== Canary test PASSED ==="; exit 0 ;;
+esac
+exit 1
+SH
+    chmod +x "$TEST_TMPDIR/bin/docker"
+}
+
+test_canary_run_all_results_are_json() {
+    ((TESTS_RUN++))
+    harness_setup
+    make_fake_docker
+    local problems=() output tools
+    tools=$(find "$PROJECT_ROOT/installers" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | jq -Rsc 'split("\n") | map(select(length > 0))')
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json canary run --all
+    output=$(exec_stdout)
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("exit $(exec_status)")
+    jq -e --argjson tools "$tools" '.status == "error" and
+        ([.details.results[].tool] | sort) == $tools and
+        ([.details.results[] | select(.status == "failed") | .tool] == ["cass"]) and
+        .details.failed == 1 and .details.passed == (($tools | length) - 1)' <<< "$output" >/dev/null 2>&1 ||
+        problems+=("envelope: $(head -c 400 <<< "$output")")
+
+    exec_run "$DSR_CMD" --json canary results
+    exec_stdout | jq -e '.failed == 1 and (.timestamp | type == "string")' >/dev/null 2>&1 ||
+        problems+=("saved results: $(exec_stdout | head -c 300)")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" canary run --all
+    [[ -z "$(exec_stdout)" ]] && exec_stderr_contains "  cass: failed" || problems+=("human summary missing or on stdout")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "canary run --all reports and saves per-tool results"
+    else
+        fail "canary run --all: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
 # ============================================================================
 # Tests: With Docker (when available)
 # ============================================================================
@@ -618,6 +718,11 @@ test_canary_results_json
 echo ""
 echo "Schedule Command Tests:"
 test_canary_schedule_show
+test_canary_schedule_dry_run_and_validation
+
+echo ""
+echo "Run --all (stubbed Docker):"
+test_canary_run_all_results_are_json
 
 echo ""
 echo "Unit Tests (Canary Module):"

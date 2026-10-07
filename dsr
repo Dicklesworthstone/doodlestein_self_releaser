@@ -12716,7 +12716,7 @@ USAGE:
     dsr canary run <tool> [--os <image>] [--mode <vibe|safe>]
     dsr canary run --all [--os <image>]
     dsr canary matrix [--tools <list>]
-    dsr canary schedule [--cron <expr>]
+    dsr canary schedule [--cron <expr>] [--unschedule] [--show] [--dry-run]
     dsr canary results
 
 SUBCOMMANDS:
@@ -12730,7 +12730,10 @@ OPTIONS:
     --mode <mode>   Installation mode: vibe or safe (default: vibe)
     --all           Test all tools with installers
     --tools <list>  Comma-separated list of tools
-    --cron <expr>   Cron schedule (default: "0 6 * * *")
+    --cron <expr>   Cron schedule: five fields or @daily-style (default: "0 6 * * *")
+    --unschedule    Remove the canary crontab entry
+    --show          Show the canary crontab entry
+    --dry-run       Show the crontab change without making it
 
 EXAMPLES:
     dsr canary run ntm                      Test ntm on ubuntu:24.04
@@ -12805,13 +12808,20 @@ _canary_run() {
 
     if $all_tools; then
         log_info "Running canary tests for all tools on $image ($mode mode)..."
-        results=$(canary_run_image "$image" --mode "$mode" 2>&1)
-        local status=$?
+        # stdout is the results object; progress and container output stay
+        # on stderr instead of being parsed as part of it.
+        local status=0
+        results=$(canary_run_image "$image" --mode "$mode") || status=$?
+        if ! jq -e 'type == "object" and has("results")' <<< "$results" >/dev/null 2>&1; then
+            log_error "Canary run produced no results"
+            $JSON_MODE && json_envelope "canary" "error" 1 '{"error": "canary run produced no results"}'
+            return 1
+        fi
 
         if $JSON_MODE; then
             local duration=$(($(date +%s) - start_time))
-            json_envelope "canary" "$([[ $status -eq 0 ]] && echo "ok" || echo "failed")" "$status" \
-                "$(echo "$results" | jq --argjson duration "$duration" '. + {duration_seconds: $duration}')"
+            json_envelope "canary" "$([[ $status -eq 0 ]] && echo "success" || echo "error")" "$status" \
+                "$(echo "$results" | jq -c --argjson duration "$duration" '. + {duration_seconds: $duration}')"
         else
             echo "$results" | jq -r '
                 "Results for \(.image) (\(.mode) mode):",
@@ -12819,11 +12829,10 @@ _canary_run() {
                 "  Failed: \(.failed)",
                 "",
                 (.results[] | "  \(.tool): \(.status)")
-            '
+            ' >&2
         fi
 
-        # Save results
-        canary_save_results "$results" 2>/dev/null || true
+        canary_save_results "$results" || log_warn "Could not save canary results"
 
         return $status
     fi
@@ -12838,7 +12847,7 @@ _canary_run() {
     if canary_run_test "$tool" "$image" "$mode" "$verbose"; then
         local duration=$(($(date +%s) - start_time))
         if $JSON_MODE; then
-            json_envelope "canary" "ok" 0 "$(jq -nc \
+            json_envelope "canary" "success" 0 "$(jq -nc \
                 --arg tool "$tool" \
                 --arg image "$image" \
                 --arg mode "$mode" \
@@ -12851,7 +12860,7 @@ _canary_run() {
     else
         local duration=$(($(date +%s) - start_time))
         if $JSON_MODE; then
-            json_envelope "canary" "failed" 1 "$(jq -nc \
+            json_envelope "canary" "error" 1 "$(jq -nc \
                 --arg tool "$tool" \
                 --arg image "$image" \
                 --arg mode "$mode" \
@@ -12918,12 +12927,14 @@ _canary_matrix() {
 }
 
 _canary_schedule() {
-    local cron_expr=""
+    local cron_expr="$CANARY_DEFAULT_SCHEDULE"
     local unschedule=false
+    local dry_run="${DRY_RUN:-false}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --cron)
+                [[ $# -ge 2 ]] || { log_error "--cron requires a schedule"; return 4; }
                 cron_expr="$2"
                 shift 2
                 ;;
@@ -12935,19 +12946,44 @@ _canary_schedule() {
                 canary_show_schedule
                 return 0
                 ;;
-            *)
+            --dry-run)
+                dry_run=true
                 shift
+                ;;
+            *)
+                log_error "Unknown schedule option: $1"
+                log_info "Usage: dsr canary schedule [--cron <expr>] [--unschedule] [--show] [--dry-run]"
+                return 4
                 ;;
         esac
     done
 
-    if $unschedule; then
-        canary_unschedule
-    elif [[ -n "$cron_expr" ]]; then
-        canary_schedule "$cron_expr"
-    else
-        canary_schedule
+    local action="schedule" entry="" status=0
+    $unschedule && action="unschedule"
+    if ! $unschedule && ! entry=$(canary_cron_entry "$cron_expr"); then
+        log_error "Invalid cron schedule: $cron_expr (five fields or @daily-style keyword)"
+        $JSON_MODE && json_envelope "canary" "error" 4 "$(jq -nc --arg cron "$cron_expr" '{action: "schedule", error: "invalid cron schedule", cron: $cron}')"
+        return 4
     fi
+
+    if $dry_run; then
+        if $unschedule; then
+            log_info "[dry-run] Would remove crontab lines containing 'dsr canary'"
+        else
+            log_info "[dry-run] Would install crontab entry: $entry"
+        fi
+    elif $unschedule; then
+        canary_unschedule || status=$?
+    else
+        canary_schedule "$cron_expr" || status=$?
+    fi
+
+    if $JSON_MODE; then
+        json_envelope "canary" "$([[ $status -eq 0 ]] && echo success || echo error)" "$status" \
+            "$(jq -nc --arg action "$action" --arg entry "$entry" --argjson dry_run "$dry_run" \
+                '{action: $action, entry: (if $entry == "" then null else $entry end), dry_run: $dry_run}')"
+    fi
+    return "$status"
 }
 
 _canary_results() {

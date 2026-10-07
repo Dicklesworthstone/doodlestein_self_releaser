@@ -626,20 +626,29 @@ canary_run_macos() {
 # Save canary results to state directory
 canary_save_results() {
     local results_json="$1"
-    local timestamp
+    local timestamp stamped tmp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    mkdir -p "$CANARY_STATE_DIR"
+    # Only a single results object is saved, and latest.json is replaced
+    # atomically: unparseable input must never truncate the previous results.
+    if ! stamped=$(jq -cse --arg ts "$timestamp" \
+            'if length == 1 and (.[0] | type == "object") then .[0] + {timestamp: $ts} else error("not one results object") end' \
+            <<< "$results_json" 2>/dev/null); then
+        log_error "Canary results are not a JSON object; previous results kept"
+        return 1
+    fi
 
-    # Save latest results
-    echo "$results_json" | jq --arg ts "$timestamp" '. + {timestamp: $ts}' \
-        > "$CANARY_STATE_DIR/latest.json"
+    mkdir -p "$CANARY_STATE_DIR" || return 1
+    tmp=$(mktemp "$CANARY_STATE_DIR/latest.json.XXXXXX") || return 1
+    if ! printf '%s\n' "$stamped" > "$tmp" || ! mv -f "$tmp" "$CANARY_STATE_DIR/latest.json"; then
+        rm -f "$tmp"
+        return 1
+    fi
 
     # Archive with date
     local date_str
     date_str=$(date +%Y-%m-%d)
-    echo "$results_json" | jq --arg ts "$timestamp" '. + {timestamp: $ts}' \
-        >> "$CANARY_STATE_DIR/history-$date_str.jsonl"
+    printf '%s\n' "$stamped" >> "$CANARY_STATE_DIR/history-$date_str.jsonl" || return 1
 
     log_info "Results saved to $CANARY_STATE_DIR"
 }
@@ -658,21 +667,57 @@ canary_get_latest() {
 # Scheduling
 # ============================================================================
 
-# Setup daily canary cron job
-canary_schedule() {
-    local schedule="${1:-0 6 * * *}"  # Default: 6am daily
+CANARY_DEFAULT_SCHEDULE="0 6 * * *"  # 6am daily
 
-    local script_path
+# A cron schedule: five fields or an @keyword. Anything else (a newline in
+# particular) could add arbitrary crontab lines.
+canary_validate_cron() {
+    local expr="$1"
+    local field='[0-9A-Za-z*/,-]+'
+    [[ "$expr" =~ ^@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)$ ]] && return 0
+    [[ "$expr" =~ ^${field}[[:blank:]]+${field}[[:blank:]]+${field}[[:blank:]]+${field}[[:blank:]]+${field}$ ]]
+}
+
+# Print the crontab line that runs the canary suite on <schedule>.
+canary_cron_entry() {
+    local schedule="${1:-$CANARY_DEFAULT_SCHEDULE}"
+    local script_path log_file
+    canary_validate_cron "$schedule" || return 4
     script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dsr"
+    log_file="$CANARY_STATE_DIR/cron.log"
+    printf '%s %q canary run --all --json >> %q 2>&1\n' "$schedule" "$script_path" "$log_file"
+}
 
-    # Check if already scheduled
-    if crontab -l 2>/dev/null | grep -q "dsr canary run --all"; then
-        log_warn "Canary already scheduled. Updating..."
-        crontab -l 2>/dev/null | grep -v "dsr canary" | crontab -
+# Current crontab, empty when the user has none.
+_canary_crontab_current() {
+    crontab -l 2>/dev/null || true
+}
+
+# Setup daily canary cron job, replacing an existing canary entry.
+canary_schedule() {
+    local schedule="${1:-$CANARY_DEFAULT_SCHEDULE}"
+    local entry current kept
+
+    if ! entry=$(canary_cron_entry "$schedule"); then
+        log_error "Invalid cron schedule: $schedule"
+        return 4
+    fi
+    if ! command -v crontab &>/dev/null; then
+        log_error "crontab not available; cannot schedule canary runs"
+        return 3
     fi
 
-    # Add new cron entry
-    (crontab -l 2>/dev/null; echo "$schedule $script_path canary run --all --json >> $CANARY_STATE_DIR/cron.log 2>&1") | crontab -
+    current=$(_canary_crontab_current)
+    if grep -q "dsr canary" <<< "$current"; then
+        log_warn "Canary already scheduled. Updating..."
+    fi
+    kept=$(grep -v "dsr canary" <<< "$current" || true)
+
+    mkdir -p "$CANARY_STATE_DIR" || return 1
+    if ! printf '%s%s\n' "${kept:+$kept$'\n'}" "$entry" | crontab -; then
+        log_error "crontab rejected the canary entry; schedule unchanged"
+        return 1
+    fi
 
     log_ok "Canary scheduled: $schedule"
     log_info "Log file: $CANARY_STATE_DIR/cron.log"
@@ -689,10 +734,20 @@ canary_show_schedule() {
 
 # Remove canary from cron
 canary_unschedule() {
-    if crontab -l 2>/dev/null | grep -q "dsr canary"; then
-        crontab -l 2>/dev/null | grep -v "dsr canary" | crontab -
-        log_ok "Canary schedule removed"
-    else
-        log_info "No canary schedule to remove"
+    local current kept
+    if ! command -v crontab &>/dev/null; then
+        log_error "crontab not available"
+        return 3
     fi
+    current=$(_canary_crontab_current)
+    if ! grep -q "dsr canary" <<< "$current"; then
+        log_info "No canary schedule to remove"
+        return 0
+    fi
+    kept=$(grep -v "dsr canary" <<< "$current" || true)
+    if ! printf '%s\n' "$kept" | crontab -; then
+        log_error "crontab rejected the update; canary schedule not removed"
+        return 1
+    fi
+    log_ok "Canary schedule removed"
 }
