@@ -659,11 +659,11 @@ Manage repository registry.
 
 ```bash
 dsr repos list [--format table|json]
-dsr repos add <owner/repo> [--local-path <path>] [--language <lang>]
-dsr repos remove <name>
+dsr repos add <owner/repo> [--local-path <path>] [--language <lang>] [--dry-run]
+dsr repos remove <name> [--dry-run]
 dsr repos validate [--repo <name>]
 dsr repos discover [--org <name>] [--language <lang>]
-dsr repos sync
+dsr repos sync [--dry-run]
 ```
 
 | Subcommand | Description |
@@ -691,6 +691,14 @@ GitHub `origin`. `--org` keeps checkouts whose GitHub owner matches
 (case-insensitive), `--language` keeps one language, and `--apply` registers
 each with its `owner/repo` and local path. `list --format json` is the JSON
 envelope; unknown options and formats exit 4.
+
+`add`, `remove` and `sync` write `repos.yaml`. With `--dry-run` (or the global
+`-n`) they show the change and leave the file alone (`details.dry_run`). A
+failed write exits 1 rather than reporting success. `validate` exits 1 when
+any repository has errors (JSON mode included) and 4 when `--repo` names
+nothing in `repos.yaml` or `repos.d`. `sync` needs GitHub access (exit 3
+without it) and exits 1, `partial` or `error`, when some repositories could
+not be synced.
 
 ---
 

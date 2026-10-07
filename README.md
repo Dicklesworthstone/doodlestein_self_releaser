@@ -586,7 +586,8 @@ If strict binary creation succeeded but its controller stopped before
 publication, preserve the original private `dsr-api-response.*` POST response.
 Recovery requires a response that actually survived or was preserved; it cannot
 reconstruct creation custody from public release metadata.
-Use `dsr release verify TOOL VERSION --fix` to repair missing draft assets. Once
+Use `dsr release verify TOOL VERSION --fix` to repair missing draft assets
+(add `--dry-run` to list the uploads without performing them). Once
 all signed assets verify, finalize through DSR:
 
 ```bash

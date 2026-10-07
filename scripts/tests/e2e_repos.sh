@@ -363,6 +363,135 @@ test_repos_discover_filters_and_apply() {
 }
 
 # ============================================================================
+# Tests: dry runs, write failures and exit codes
+# ============================================================================
+
+test_repos_add_remove_dry_run_change_nothing() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos add/remove"
+        return 0
+    fi
+    harness_setup
+    seed_repos_fixtures
+    local before problems=()
+    before=$(sha256sum < "$DSR_CONFIG_DIR/repos.yaml")
+
+    exec_run "$DSR_CMD" --json repos add acme/new-tool --dry-run
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("add --dry-run exit $(exec_status)")
+    exec_stdout | jq -e '.details.dry_run == true and .details.added[0].repo == "acme/new-tool"' >/dev/null 2>&1 ||
+        problems+=("add plan: $(exec_stdout | jq -c '.details' 2>/dev/null)")
+    exec_run "$DSR_CMD" -n repos add acme/other-tool
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("-n add exit $(exec_status)")
+    exec_run "$DSR_CMD" repos remove test-tool --dry-run
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("remove --dry-run exit $(exec_status)")
+    exec_run "$DSR_CMD" -n repos remove test-tool
+    [[ "$(exec_status)" -eq 0 ]] || problems+=("-n remove exit $(exec_status)")
+    [[ "$(sha256sum < "$DSR_CONFIG_DIR/repos.yaml")" == "$before" ]] ||
+        problems+=("dry runs changed repos.yaml: $(yq -o=json -I0 '.tools | keys' "$DSR_CONFIG_DIR/repos.yaml")")
+
+    exec_run "$DSR_CMD" repos remove test-tool --frobnicate
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("remove unknown option exit $(exec_status)")
+
+    exec_run "$DSR_CMD" --json repos remove test-tool
+    exec_stdout | jq -e '.details.removed == [{name: "test-tool", repo: "testuser/test-tool"}] and
+        .details.dry_run == false' >/dev/null 2>&1 || problems+=("remove: $(exec_stdout | jq -c '.details' 2>/dev/null)")
+    exec_run "$DSR_CMD" repos add acme/new-tool --local-path "$TEST_TMPDIR"
+    [[ "$(yq -o=json -I0 '.tools | keys' "$DSR_CONFIG_DIR/repos.yaml")" == '["another-tool","new-tool"]' &&
+       "$(yq '.tools.new-tool.repo' "$DSR_CONFIG_DIR/repos.yaml")" == "acme/new-tool" ]] ||
+        problems+=("real add/remove: $(yq -o=json -I0 '.tools' "$DSR_CONFIG_DIR/repos.yaml")")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "repos add/remove honor --dry-run and -n; real add/remove still write"
+    else
+        fail "repos add/remove dry runs: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+test_repos_validate_exit_codes() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos validate"
+        return 0
+    fi
+    harness_setup
+    seed_repos_fixtures
+    local problems=()
+
+    exec_run "$DSR_CMD" --json repos validate --repo test-tol --skip-naming
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("unknown --repo exit $(exec_status)")
+    exec_stdout | jq -e '.status == "error" and .details.errors[0].repo == "test-tol"' >/dev/null 2>&1 ||
+        problems+=("unknown --repo envelope: $(exec_stdout | head -c 300)")
+    exec_run "$DSR_CMD" repos validate --frobnicate
+    [[ "$(exec_status)" -eq 4 ]] || problems+=("unknown option exit $(exec_status)")
+
+    # A registry entry with neither repo nor local_path is an error.
+    yq -i '.tools.broken-tool = {"language": "go"}' "$DSR_CONFIG_DIR/repos.yaml"
+    exec_run "$DSR_CMD" --json repos validate --repo broken-tool --skip-naming
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("json error exit $(exec_status)")
+    exec_stdout | jq -e '.status == "error" and .exit_code == 1' >/dev/null 2>&1 ||
+        problems+=("json error envelope: $(exec_stdout | head -c 300)")
+    exec_run "$DSR_CMD" repos validate --repo broken-tool --skip-naming
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("human error exit $(exec_status)")
+    [[ -z "$(exec_stdout)" ]] || problems+=("human mode wrote stdout")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "repos validate exits 1 on errors in JSON mode and 4 for an unknown --repo"
+    else
+        fail "repos validate exit codes: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+# gh stub: authenticated; test-tool resolves, another-tool fails.
+make_sync_gh_stub() {
+    mkdir -p "$TEST_TMPDIR/bin"
+    cat > "$TEST_TMPDIR/bin/gh" << 'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+    "auth status") exit 0 ;;
+    "api repos/testuser/test-tool") echo '{"full_name":"testuser/test-tool","default_branch":"trunk"}'; exit 0 ;;
+esac
+echo '{"message":"Not Found"}'
+exit 1
+EOF
+    chmod +x "$TEST_TMPDIR/bin/gh"
+}
+
+test_repos_sync_dry_run_and_partial_failure() {
+    ((TESTS_RUN++))
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos sync"
+        return 0
+    fi
+    harness_setup
+    seed_repos_fixtures
+    make_sync_gh_stub
+    local before problems=()
+    before=$(sha256sum < "$DSR_CONFIG_DIR/repos.yaml")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" GH_MAX_RETRIES=1 exec_run "$DSR_CMD" --json repos sync --dry-run
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("dry-run exit $(exec_status)")
+    exec_stdout | jq -e '.status == "partial" and .details.synced == 1 and .details.failed == 1 and
+        .details.dry_run == true and .details.errors[0].repo == "another-tool"' >/dev/null 2>&1 ||
+        problems+=("dry-run envelope: $(exec_stdout | jq -c '{status, details}' 2>/dev/null)")
+    [[ "$(sha256sum < "$DSR_CONFIG_DIR/repos.yaml")" == "$before" ]] || problems+=("--dry-run wrote repos.yaml")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" GH_MAX_RETRIES=1 exec_run "$DSR_CMD" repos sync
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("partial exit $(exec_status)")
+    [[ "$(yq '.tools.test-tool.default_branch' "$DSR_CONFIG_DIR/repos.yaml")" == "trunk" ]] ||
+        problems+=("default_branch not written")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "repos sync honors --dry-run and exits 1 when a repository fails"
+    else
+        fail "repos sync: ${problems[*]}"
+    fi
+    harness_teardown
+}
+
+# ============================================================================
 # Tests: Error Handling
 # ============================================================================
 
@@ -427,6 +556,12 @@ test_repos_validate_json_valid
 echo ""
 echo "repos discover/list formats:"
 test_repos_discover_filters_and_apply
+
+echo ""
+echo "Dry runs and exit codes:"
+test_repos_add_remove_dry_run_change_nothing
+test_repos_validate_exit_codes
+test_repos_sync_dry_run_and_partial_failure
 
 echo ""
 echo "Error Handling:"

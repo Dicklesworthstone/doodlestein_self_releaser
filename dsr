@@ -1038,7 +1038,10 @@ EOF
     # human output and JSON envelope stay out of the doctor report.
     if ! $quick_mode; then
         local naming_report naming_counts naming_warn=0 naming_err=0 naming_repos=""
-        if naming_report=$(bash "$SCRIPT_DIR/dsr" --json repos validate --naming 2>/dev/null) &&
+        # Validation exits 1 when it finds errors; the report is still the
+        # envelope on stdout, so read it whatever the exit code.
+        naming_report=$(bash "$SCRIPT_DIR/dsr" --json repos validate --naming 2>/dev/null || true)
+        if jq -e '.details.action == "validate"' <<< "$naming_report" >/dev/null 2>&1 &&
            naming_counts=$(jq -er '[.details.validated[]? | (.naming.status // "ok")] |
                 "\(map(select(. == "warning")) | length) \(map(select(. == "error")) | length)"' \
                 <<< "$naming_report" 2>/dev/null); then
@@ -8385,6 +8388,7 @@ OPTIONS:
     -V, --version <ver>     Version to verify (or second positional arg)
     -c, --verify-checksums  Download assets and verify SHA256 checksums
     --fix                   Re-upload missing assets (strict contracts require a draft)
+    --dry-run               With --fix, list the uploads without performing them
 
 DESCRIPTION:
     Compares a GitHub release against the build manifest to verify all
@@ -8784,7 +8788,32 @@ EOF
     # Repair missing assets if requested. Existing wrong bytes are never
     # deleted or clobbered by strict repair.
     local assets_to_fix=("${missing_assets[@]}" "${size_mismatches[@]}" "${digest_mismatches[@]}")
-    if $fix_missing && { $release_contract_enabled || [[ ${#assets_to_fix[@]} -gt 0 ]]; }; then
+    local -a planned_fixes=()
+    local planned_fix
+    if $fix_missing && ${DRY_RUN:-false}; then
+        # --fix under --dry-run reports the repair plan and changes nothing:
+        # no upload, no clobber, no locally materialized sidecar.
+        if $release_contract_enabled; then
+            if [[ ${#extra_assets[@]} -gt 0 || ${#size_mismatches[@]} -gt 0 || \
+                  ${#digest_mismatches[@]} -gt 0 ]]; then
+                log_warn "Strict repair would refuse: the draft has extra, wrong-size or wrong-digest assets"
+            else
+                planned_fixes=(${missing_assets[@]+"${missing_assets[@]}"})
+            fi
+        else
+            for planned_fix in ${assets_to_fix[@]+"${assets_to_fix[@]}"}; do
+                if [[ -f "$state_dir/artifacts/${tool_name}-${tag}/$planned_fix" ]]; then
+                    planned_fixes+=("$planned_fix")
+                else
+                    log_warn "  Not found locally: $planned_fix"
+                fi
+            done
+        fi
+        for planned_fix in ${planned_fixes[@]+"${planned_fixes[@]}"}; do
+            log_info "[dry-run] Would upload: $planned_fix"
+        done
+    elif $fix_missing && { $release_contract_enabled || [[ ${#assets_to_fix[@]} -gt 0 ]]; }; then
+        planned_fixes=(${assets_to_fix[@]+"${assets_to_fix[@]}"})
         if [[ ${#assets_to_fix[@]} -gt 0 ]]; then
             if $release_contract_enabled; then
                 log_info "Strict repair found ${#missing_assets[@]} missing asset(s)"
@@ -9074,6 +9103,9 @@ EOF
             --argjson tag_ruleset_receipt "$strict_tag_ruleset_receipt" \
             --argjson checksum_verified "$(printf '%s\n' "${verified_checksums[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson checksum_errors "$(printf '%s\n' "${checksum_errors[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --argjson fix_requested "$fix_missing" \
+            --argjson dry_run "${DRY_RUN:-false}" \
+            --argjson planned_fixes "$(printf '%s\n' ${planned_fixes[@]+"${planned_fixes[@]}"} | jq -Rsc 'split("\n") | map(select(length > 0))')" \
             --argjson duration "$duration" \
             '{
                 repo: $repo,
@@ -9103,6 +9135,8 @@ EOF
                     verified: $checksum_verified,
                     errors: $checksum_errors
                 },
+                repair: (if $fix_requested then
+                    {dry_run: $dry_run, uploads: $planned_fixes} else null end),
                 duration_seconds: $duration
             }')
         json_envelope "release-verify" "$status" "$exit_code" "$details"
@@ -9831,6 +9865,7 @@ cmd_repos_add() {
     local local_path=""
     local language=""
     local name=""
+    local dry_run="${DRY_RUN:-false}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -9845,6 +9880,10 @@ cmd_repos_add() {
             --name|-n)
                 name="$2"
                 shift 2
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
                 ;;
             -*)
                 log_error "Unknown option: $1"
@@ -9924,14 +9963,14 @@ cmd_repos_add() {
     fi
 
     # Ensure repos file exists
-    if [[ ! -f "$DSR_REPOS_FILE" ]]; then
+    if [[ ! -f "$DSR_REPOS_FILE" ]] && ! $dry_run; then
         log_warn "Repos file not found, running config init..."
         config_init >/dev/null 2>&1
     fi
 
     # Check if already exists
     local existing
-    existing=$(yq ".tools.$name" "$DSR_REPOS_FILE" 2>/dev/null)
+    existing=$(DSR_ADD_NAME="$name" yq '.tools[strenv(DSR_ADD_NAME)]' "$DSR_REPOS_FILE" 2>/dev/null)
     if [[ "$existing" != "null" && -n "$existing" ]]; then
         log_error "Repository '$name' already exists"
         log_info "Use 'dsr repos remove $name' first, or choose a different name"
@@ -9941,19 +9980,26 @@ cmd_repos_add() {
         return 4
     fi
 
-    # Build the tool entry
-    local tool_yaml=""
-    tool_yaml+="repo: \"${repo:-}\""
-    [[ -n "$local_path" ]] && tool_yaml+="\n    local_path: \"$local_path\""
-    [[ -n "$language" ]] && tool_yaml+="\n    language: \"$language\""
-    tool_yaml+="\n    targets:\n      - linux/amd64\n      - darwin/arm64\n      - windows/amd64"
-
-    # Add to repos.yaml using yq
-    yq -i ".tools.$name = {}" "$DSR_REPOS_FILE"
-    [[ -n "$repo" ]] && yq -i ".tools.$name.repo = \"$repo\"" "$DSR_REPOS_FILE"
-    [[ -n "$local_path" ]] && yq -i ".tools.$name.local_path = \"$local_path\"" "$DSR_REPOS_FILE"
-    [[ -n "$language" ]] && yq -i ".tools.$name.language = \"$language\"" "$DSR_REPOS_FILE"
-    yq -i ".tools.$name.targets = [\"linux/amd64\", \"darwin/arm64\", \"windows/amd64\"]" "$DSR_REPOS_FILE"
+    # Add to repos.yaml in one write, values passed as data rather than
+    # spliced into the yq expression. Dry runs show the entry only.
+    local write_status=0
+    if ! $dry_run; then
+        DSR_ADD_NAME="$name" DSR_ADD_REPO="${repo:-}" DSR_ADD_PATH="${local_path:-}" \
+        DSR_ADD_LANG="${language:-}" yq -i '
+            .tools[strenv(DSR_ADD_NAME)] = {
+                "repo": strenv(DSR_ADD_REPO), "local_path": strenv(DSR_ADD_PATH),
+                "language": strenv(DSR_ADD_LANG),
+                "targets": ["linux/amd64", "darwin/arm64", "windows/amd64"]} |
+            del(.tools[strenv(DSR_ADD_NAME)][] | select(. == ""))
+        ' "$DSR_REPOS_FILE" || write_status=$?
+    fi
+    if [[ $write_status -ne 0 ]]; then
+        log_error "Could not write $DSR_REPOS_FILE; '$name' was not added"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 1 "$(jq -nc --arg name "$name" '{action: "add", repo: $name, errors: [{code: "E052", message: "registry write failed", repo: $name}]}')"
+        fi
+        return 1
+    fi
 
     if $JSON_MODE; then
         local added_json
@@ -9963,7 +10009,13 @@ cmd_repos_add() {
             --arg local_path "${local_path:-}" \
             --arg language "${language:-}" \
             '{name: $name, repo: $repo, local_path: $local_path, language: $language, targets: ["linux/amd64", "darwin/arm64", "windows/amd64"]}')
-        json_envelope "repos" "success" 0 "$(jq -nc --argjson added "[$added_json]" '{action: "add", added: $added}')"
+        json_envelope "repos" "success" 0 "$(jq -nc --argjson added "[$added_json]" --argjson dry_run "$dry_run" '{action: "add", added: $added, dry_run: $dry_run}')"
+    elif $dry_run; then
+        log_info "[dry-run] Would add repository: $name"
+        [[ -n "$repo" ]] && log_info "  repo: $repo"
+        [[ -n "$local_path" ]] && log_info "  local_path: $local_path"
+        [[ -n "$language" ]] && log_info "  language: $language"
+        return 0
     else
         log_ok "Added repository: $name"
         [[ -n "$repo" ]] && log_info "  repo: $repo"
@@ -9983,10 +10035,44 @@ cmd_repos_add() {
 
 # Remove a repository from the registry
 cmd_repos_remove() {
-    local name="${1:-}"
+    local name=""
+    local dry_run="${DRY_RUN:-false}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            --help|-h)
+                cat << 'EOF'
+dsr repos remove - Remove a repository from the registry
+
+USAGE:
+    dsr repos remove <name> [--dry-run]
+
+OPTIONS:
+    --dry-run   Show the entry that would be removed; change nothing
+EOF
+                return 0
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                return 4
+                ;;
+            *)
+                if [[ -n "$name" ]]; then
+                    log_error "repos remove takes one name (got '$name' and '$1')"
+                    return 4
+                fi
+                name="$1"
+                shift
+                ;;
+        esac
+    done
 
     if [[ -z "$name" ]]; then
-        log_error "Usage: dsr repos remove <name>"
+        log_error "Usage: dsr repos remove <name> [--dry-run]"
         return 4
     fi
 
@@ -10005,7 +10091,7 @@ cmd_repos_remove() {
 
     # Check if exists
     local existing
-    existing=$(yq ".tools.$name" "$DSR_REPOS_FILE" 2>/dev/null)
+    existing=$(DSR_RM_NAME="$name" yq '.tools[strenv(DSR_RM_NAME)]' "$DSR_REPOS_FILE" 2>/dev/null)
     if [[ "$existing" == "null" || -z "$existing" ]]; then
         log_error "Repository '$name' not found"
         if $JSON_MODE; then
@@ -10013,12 +10099,22 @@ cmd_repos_remove() {
         fi
         return 4
     fi
+    local removed_repo
+    removed_repo=$(DSR_RM_NAME="$name" yq '.tools[strenv(DSR_RM_NAME)].repo // ""' "$DSR_REPOS_FILE" 2>/dev/null)
 
-    # Remove from repos.yaml
-    yq -i "del(.tools.$name)" "$DSR_REPOS_FILE"
+    if ! $dry_run && ! DSR_RM_NAME="$name" yq -i 'del(.tools[strenv(DSR_RM_NAME)])' "$DSR_REPOS_FILE"; then
+        log_error "Could not write $DSR_REPOS_FILE; '$name' was not removed"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 1 "$(jq -nc --arg name "$name" '{action: "remove", repo: $name, errors: [{code: "E052", message: "registry write failed", repo: $name}]}')"
+        fi
+        return 1
+    fi
 
     if $JSON_MODE; then
-        json_envelope "repos" "success" 0 "$(jq -nc --arg name "$name" '{action: "remove", removed: [{name: $name}]}')"
+        json_envelope "repos" "success" 0 "$(jq -nc --arg name "$name" --arg repo "$removed_repo" \
+            --argjson dry_run "$dry_run" '{action: "remove", removed: [{name: $name, repo: $repo}], dry_run: $dry_run}')"
+    elif $dry_run; then
+        log_info "[dry-run] Would remove repository: $name${removed_repo:+ ($removed_repo)}"
     else
         log_ok "Removed repository: $name"
     fi
@@ -10401,11 +10497,14 @@ EXAMPLES:
 EOF
                 return 0
                 ;;
+            -*)
+                log_error "Unknown option: $1"
+                log_info "Run 'dsr repos validate --help' for usage"
+                return 4
+                ;;
             *)
                 # For backward compat: first positional arg is repo filter
-                if [[ -z "$repo_filter" && "$1" != -* ]]; then
-                    repo_filter="$1"
-                fi
+                [[ -z "$repo_filter" ]] && repo_filter="$1"
                 shift
                 ;;
         esac
@@ -10434,6 +10533,18 @@ EOF
 
     local tools_json
     tools_json=$(yq -o=json '.tools // {}' "$DSR_REPOS_FILE" 2>/dev/null)
+
+    # A filter naming nothing must not validate "successfully" (a typo would
+    # otherwise pass the release preflight it is meant to guard).
+    if [[ -n "$repo_filter" ]] &&
+       ! jq -e --arg name "$repo_filter" 'has($name)' <<< "$tools_json" >/dev/null 2>&1 &&
+       [[ ! -f "${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/${repo_filter}.yaml" ]]; then
+        log_error "Repository '$repo_filter' not found in repos.yaml or repos.d"
+        if $JSON_MODE; then
+            json_envelope "repos" "error" 4 "$(jq -nc --arg name "$repo_filter" '{action: "validate", repo: $name, validated: [], errors: [{code: "E052", message: "repo not found", repo: $name}]}')"
+        fi
+        return 4
+    fi
 
     local results=()
     local errors=0
@@ -10664,8 +10775,9 @@ EOF
             status="partial"
         fi
         json_envelope "repos" "$status" "$exit_code" "$(jq -nc --argjson validated "$results_json" '{action: "validate", validated: $validated}')"
+        return "$exit_code"
     else
-        echo ""
+        echo "" >&2
         if [[ $errors -gt 0 ]]; then
             log_error "Validation found $errors error(s), $warnings warning(s)"
             return 1
@@ -11056,15 +11168,57 @@ cmd_repos_discover() {
 
 # Sync repository metadata from GitHub
 cmd_repos_sync() {
+    local dry_run="${DRY_RUN:-false}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            --help|-h)
+                cat << 'EOF'
+dsr repos sync - Record each repository's default branch from GitHub
+
+USAGE:
+    dsr repos sync [--dry-run]
+
+OPTIONS:
+    --dry-run   Fetch and show the values; do not write repos.yaml
+
+EXIT CODES:
+    0  All repositories synced
+    1  Some repositories could not be synced
+    3  yq or GitHub authentication unavailable
+    4  No repos file
+EOF
+                return 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                return 4
+                ;;
+        esac
+    done
+
     log_info "Syncing repository metadata from GitHub..."
 
     if [[ ! -f "$DSR_REPOS_FILE" ]]; then
         log_error "Repos file not found"
+        $JSON_MODE && json_envelope "repos" "error" 4 '{"action": "sync", "errors": [{"code": "E052", "message": "repos file not found"}]}'
         return 4
     fi
 
     if ! command -v yq &>/dev/null; then
         log_error "yq required for sync"
+        $JSON_MODE && json_envelope "repos" "error" 3 '{"action": "sync", "errors": [{"code": "E041", "message": "yq required"}]}'
+        return 3
+    fi
+
+    # Without GitHub access nothing can be synced; that is a dependency
+    # error, not one failure per repository.
+    if ! gh_check 2>/dev/null && ! gh_check_token 2>/dev/null; then
+        log_error "GitHub authentication required (gh auth login or GITHUB_TOKEN)"
+        $JSON_MODE && json_envelope "repos" "error" 3 '{"action": "sync", "errors": [{"code": "E001", "message": "GitHub authentication required"}]}'
         return 3
     fi
 
@@ -11073,6 +11227,7 @@ cmd_repos_sync() {
 
     local synced=0
     local failed=0
+    local -a errors=()
 
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
@@ -11087,35 +11242,47 @@ cmd_repos_sync() {
 
         log_info "Syncing $name ($repo)..."
 
-        # Fetch repo info from GitHub
-        if gh_check 2>/dev/null || gh_check_token 2>/dev/null; then
-            local repo_info
-            repo_info=$(gh_repo "$repo" 2>/dev/null) || {
-                log_warn "$name: failed to fetch repo info"
-                ((failed++))
-                continue
-            }
-
-            local default_branch
-            default_branch=$(echo "$repo_info" | jq -r '.default_branch // "main"')
-
-            # Update the entry with synced data
-            yq -i ".tools.$name.default_branch = \"$default_branch\"" "$DSR_REPOS_FILE"
-            ((synced++))
-            log_ok "$name: synced (default_branch: $default_branch)"
-        else
-            log_warn "$name: GitHub auth not available"
+        local repo_info default_branch
+        if ! repo_info=$(gh_repo "$repo" 2>/dev/null) ||
+           ! default_branch=$(jq -er '.default_branch | select(type == "string" and length > 0)' <<< "$repo_info" 2>/dev/null); then
+            log_warn "$name: failed to fetch repo info"
+            errors+=("$(jq -nc --arg repo "$name" '{code: "E003", message: "failed to fetch repository metadata", repo: $repo}')")
             ((failed++))
+            continue
         fi
+
+        if $dry_run; then
+            log_info "[dry-run] $name: would set default_branch: $default_branch"
+        elif ! DSR_SYNC_NAME="$name" DSR_SYNC_BRANCH="$default_branch" \
+                yq -i '.tools[strenv(DSR_SYNC_NAME)].default_branch = strenv(DSR_SYNC_BRANCH)' "$DSR_REPOS_FILE"; then
+            log_warn "$name: could not write $DSR_REPOS_FILE"
+            errors+=("$(jq -nc --arg repo "$name" '{code: "E052", message: "registry write failed", repo: $repo}')")
+            ((failed++))
+            continue
+        else
+            log_ok "$name: synced (default_branch: $default_branch)"
+        fi
+        ((synced++))
 
     done < <(echo "$tools_json" | jq -r 'keys[]')
 
+    local status="success" exit_code=0
+    if [[ $failed -gt 0 ]]; then
+        exit_code=1
+        status="partial"
+        [[ $synced -eq 0 ]] && status="error"
+    fi
+
     if $JSON_MODE; then
-        json_envelope "repos" "success" 0 "$(jq -nc --argjson synced "$synced" --argjson failed "$failed" '{action: "sync", synced: $synced, failed: $failed}')"
+        local errors_json='[]'
+        [[ ${#errors[@]} -gt 0 ]] && errors_json=$(printf '%s\n' "${errors[@]}" | jq -sc '.')
+        json_envelope "repos" "$status" "$exit_code" "$(jq -nc --argjson synced "$synced" --argjson failed "$failed" \
+            --argjson dry_run "$dry_run" --argjson errors "$errors_json" \
+            '{action: "sync", synced: $synced, failed: $failed, dry_run: $dry_run, errors: $errors}')"
     else
-        echo ""
         log_info "Sync complete: $synced synced, $failed failed"
     fi
+    return "$exit_code"
 }
 
 # ============================================================================

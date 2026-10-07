@@ -2632,6 +2632,91 @@ test_verify_fix_attempts_upload() {
     harness_teardown
 }
 
+test_verify_fix_dry_run_uploads_nothing() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos.yaml parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_repos_config
+    seed_manifest "test-tool" "v1.0.0"
+    local upload_log="$TEST_TMPDIR/upload.log" problems=() output
+    create_mock_gh '{
+        "id": 12345,
+        "html_url": "https://github.com/testuser/test-tool/releases/tag/v1.0.0",
+        "assets": [
+            {"name": "test-tool-linux-amd64", "browser_download_url": "https://example.com/a"},
+            {"name": "SHA256SUMS", "browser_download_url": "https://example.com/c"}
+        ]
+    }' 0 0 0 "$upload_log"
+
+    # Both spellings: trailing --dry-run and the global -n.
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0 --fix --dry-run
+    output=$(exec_stdout)
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("trailing --dry-run exit $(exec_status)")
+    jq -e '.details.repair == {dry_run: true, uploads: ["test-tool-darwin-arm64"]} and
+        .details.assets.missing == ["test-tool-darwin-arm64"]' <<< "$output" >/dev/null 2>&1 ||
+        problems+=("plan: $(jq -c '.details.repair' <<< "$output" 2>/dev/null)")
+    exec_stderr_contains "Would upload: test-tool-darwin-arm64" || problems+=("no plan on stderr")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" -n release verify test-tool v1.0.0 --fix
+    [[ "$(exec_status)" -eq 1 ]] || problems+=("-n exit $(exec_status)")
+    [[ ! -s "$upload_log" ]] || problems+=("uploaded: $(cat "$upload_log")")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "release verify --fix --dry-run lists the uploads and performs none"
+    else
+        fail "release verify --fix --dry-run: ${problems[*]}"
+        echo "stderr: $(exec_stderr | tail -10)"
+    fi
+
+    remove_release_verify_mock_gh
+    harness_teardown
+}
+
+test_strict_fix_dry_run_leaves_draft_and_sidecars_untouched() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for strict release contract parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_strict_verify_fixture
+    STRICT_VERIFY_ASSETS=$(jq -c \
+        'map(select(.name != "test-tool.sbom.spdx.json"))' \
+        <<< "$STRICT_VERIFY_ASSETS")
+    export STRICT_VERIFY_ASSETS
+    unset STRICT_FIX_UPLOAD_MODE STRICT_FIX_MUTATE_LOCAL_ON_RELEASE_ID
+    create_strict_verify_fix_mock_gh true
+    local before after output
+    before=$(find "$DSR_STATE_DIR" -type f | sort | xargs sha256sum)
+
+    PATH="$TEST_TMPDIR/bin:$PATH" exec_run "$DSR_CMD" --json release verify test-tool v1.0.0 --fix --dry-run
+    output=$(exec_stdout)
+    after=$(find "$DSR_STATE_DIR" -type f | sort | xargs sha256sum)
+
+    if [[ "$(exec_status)" -eq 1 && ! -s "$STRICT_FIX_UPLOAD_LOG" && "$before" == "$after" && \
+          "$(cat "$STRICT_FIX_DRAFT_FILE")" == "true" ]] &&
+        jq -e '.details.repair == {dry_run: true, uploads: ["test-tool.sbom.spdx.json"]}' \
+            <<< "$output" >/dev/null 2>&1; then
+        pass "strict --fix --dry-run plans the draft repair without uploading or writing sidecars"
+    else
+        fail "strict --fix --dry-run must not mutate the draft or local state"
+        echo "status: $(exec_status), uploads: $(cat "$STRICT_FIX_UPLOAD_LOG" 2>/dev/null)"
+        echo "repair: $(jq -c '.details.repair' <<< "$output" 2>/dev/null)"
+        diff <(echo "$before") <(echo "$after") | head -5
+    fi
+
+    remove_strict_verify_mock_gh
+    unset -f _strict_fix_release_json
+    harness_teardown
+}
+
 test_verify_fix_reports_not_found_locally() {
     ((TESTS_RUN++))
 
@@ -2825,7 +2910,9 @@ test_strict_fix_rejects_manifest_mutation_after_upload
 test_strict_fix_rejects_local_tag_mutation_after_upload
 test_strict_fix_refuses_release_tag_rebind_before_mutation
 test_strict_fix_final_get_rejects_postcheck_asset_flip
+test_strict_fix_dry_run_leaves_draft_and_sidecars_untouched
 test_verify_fix_attempts_upload
+test_verify_fix_dry_run_uploads_nothing
 test_verify_fix_reports_not_found_locally
 
 echo ""
