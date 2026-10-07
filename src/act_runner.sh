@@ -4593,24 +4593,183 @@ EOF
     ' <<< "$summary"
 }
 
-_act_windows_cache_junction_guard_script() {
-    local cargo_home="$1" require_links="${2:-false}"
-    [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
-       ( "$require_links" == true || "$require_links" == false ) ]] || return 4
+_act_windows_cargo_cache_runtime() {
+    local module
+    module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cargo_cache_windows.ps1"
+    [[ -f "$module" && ! -L "$module" ]] || return 3
+    cat "$module"
+}
+
+# The cache implementation may exceed Windows command-line limits. Retain an
+# inspectable, verified script on the host when inline transport cannot fit.
+_act_windows_cache_command() {
+    local host="$1" source_root="$2" script="$3" command
+    if command=$(_act_windows_encoded_powershell "$script" pwsh 2>/dev/null); then
+        printf '%s' "$command"
+    else
+        _act_windows_stage_build_script "$host" "$source_root" "$script"
+    fi
+}
+
+_act_windows_private_cargo_home_script() {
+    local source_root="$1" suffix="$2"
+    source_root="${source_root//\\//}"
+    [[ "$source_root" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$source_root" != *..* &&
+       "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9-]+$ ]] || return 4
+    _act_windows_cargo_cache_runtime || return $?
     cat <<EOF
-\$ErrorActionPreference='Stop';
-\$dsrAmbient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' };
-foreach (\$name in @('registry','git')) {
-    \$expected=Join-Path \$dsrAmbient \$name; \$link=Join-Path '$cargo_home' \$name;
-    if (Test-Path -LiteralPath \$link) {
-        \$item=Get-Item -LiteralPath \$link -Force; \$targets=@(\$item.Target);
-        if (-not \$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -or \$targets.Count -ne 1 -or -not (Test-Path -LiteralPath \$expected -PathType Container)) { throw 'Strict Cargo cache junction authority missing' };
-        \$actual=(Resolve-Path -LiteralPath \$targets[0] -ErrorAction Stop).ProviderPath;
-        \$wanted=(Resolve-Path -LiteralPath \$expected -ErrorAction Stop).ProviderPath;
-        if (-not [StringComparer]::OrdinalIgnoreCase.Equals(\$actual.TrimEnd('\\','/'),\$wanted.TrimEnd('\\','/'))) { throw 'Strict Cargo cache junction target mismatch' };
-    } elseif (\$$require_links -and (Test-Path -LiteralPath \$expected -PathType Container)) { throw 'Strict Cargo cache junction absent after metadata' };
-};
+\$ErrorActionPreference='Stop'
+\$dsrSourceGuards=Open-DsrCachePathGuard '$source_root'
+\$dsrPhysicalSource=(Get-Item -LiteralPath '$source_root' -Force).FullName.Replace('\\','/')
+\$dsrSourceParent=Split-Path -Parent \$dsrPhysicalSource
+\$dsrSeedHome=Join-Path \$dsrSourceParent '.cargo-home'
+\$dsrStrictHome=Join-Path \$dsrSourceParent '.cargo-home-$suffix'
+\$dsrSeedPending=\$false
+if (Get-Item -LiteralPath \$dsrSeedHome -Force -ErrorAction SilentlyContinue) {
+    Assert-DsrCargoHome -Path \$dsrSeedHome
+    \$dsrSeedSummary=Invoke-DsrCargoCache -Operation verify -First \$dsrSeedHome -Second (Join-Path \$dsrSeedHome '.dsr-cache-seed.json')
+    \$dsrPrivateSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrSeedHome -Second \$dsrStrictHome
+    if (\$dsrSeedSummary.mode -ne 'private-copy' -or \$dsrPrivateSummary.inventory_sha256 -ne \$dsrSeedSummary.inventory_sha256) {
+        throw 'Private Cargo cache seed changed during preparation'
+    }
+} else {
+    \$dsrAmbient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }
+    if (-not (Get-Item -LiteralPath \$dsrAmbient -Force -ErrorAction SilentlyContinue)) { \$dsrAmbient='' }
+    \$dsrPrivateSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second \$dsrStrictHome
+    \$dsrSeedPending=\$true
+}
+Assert-DsrCargoHome -Path \$dsrStrictHome
 EOF
+}
+
+_act_windows_cargo_metadata_body() {
+    local build_env="${1:-}" env_pair env_name env_value name_b64 value_b64
+    cat <<'POWERSHELL'
+$dsrAncestor=(Get-Item -LiteralPath $dsrPhysicalSource -Force).Parent
+while ($null -ne $dsrAncestor) {
+    foreach ($dsrName in @('config','config.toml')) {
+        if (Get-Item -LiteralPath (Join-Path $dsrAncestor.FullName ".cargo/$dsrName") -Force -ErrorAction SilentlyContinue) {
+            throw 'Untracked ancestor Cargo config is forbidden'
+        }
+    }
+    $dsrAncestor=$dsrAncestor.Parent
+}
+Get-ChildItem Env: | Where-Object {
+    $_.Name -match '^(CARGO_|RUST|XWIN_)' -or $_.Name -match '^DSR_RELEASE_GIT_(SHA|REF)$' -or
+    $_.Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)' -or
+    $_.Name -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$'
+} | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }
+POWERSHELL
+    while IFS= read -r env_pair; do
+        [[ -n "$env_pair" ]] || continue
+        env_name="${env_pair%%=*}" env_value="${env_pair#*=}"
+        [[ "$env_pair" == *=* && "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
+        [[ "${env_name^^}" == CARGO_HOME ]] && continue
+        name_b64=$(printf '%s' "$env_name" | base64 | tr -d '\r\n') || return 4
+        value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
+        printf "[Environment]::SetEnvironmentVariable([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')),[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')),'Process')\n" "$name_b64" "$value_b64"
+    done <<< "$build_env"
+    cat <<'POWERSHELL'
+$env:CARGO_HOME=$dsrStrictHome
+$env:CARGO_NET_OFFLINE='true'
+$env:RCH_DISABLED='1'
+$env:RCH_CARGO_WRAPPER_BYPASS='1'
+Set-Location -LiteralPath $dsrPhysicalSource
+$dsrMetadata=@(& cargo metadata --locked --offline --all-features --format-version 1 --manifest-path (Join-Path $dsrPhysicalSource 'Cargo.toml'))
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$dsrMetadataText=($dsrMetadata -join "`n") + "`n"
+$dsrMetadataValue=ConvertFrom-Json -InputObject $dsrMetadataText -ErrorAction Stop
+if ($dsrMetadataValue -isnot [pscustomobject] -or $dsrMetadataValue.packages -isnot [array] -or
+    $dsrMetadataValue.packages.Count -eq 0 -or $dsrMetadataValue.workspace_root -isnot [string] -or
+    -not $dsrMetadataValue.workspace_root) { throw 'Invalid locked Cargo metadata; seed not admitted' }
+$dsrMetadataPath=Join-Path $dsrStrictHome '.dsr-cargo-metadata.json'
+$dsrMetadataStream=[IO.File]::Open($dsrMetadataPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+try {
+    $dsrMetadataBytes=[Text.Encoding]::UTF8.GetBytes($dsrMetadataText)
+    $dsrMetadataStream.Write($dsrMetadataBytes,0,$dsrMetadataBytes.Length)
+    $dsrMetadataStream.Flush($true)
+} finally { $dsrMetadataStream.Dispose() }
+Assert-DsrCargoHome -Path $dsrStrictHome
+Assert-DsrCargoSeed -CargoHome $dsrStrictHome -ExpectedSha256 $dsrPrivateSummary.receipt_sha256
+if ($dsrSeedPending) {
+    Invoke-DsrCargoCache -Operation snapshot -First $dsrStrictHome -Second $dsrSeedHome | Out-Null
+}
+foreach ($dsrSourceGuard in $dsrSourceGuards) { $dsrSourceGuard.Dispose() }
+POWERSHELL
+}
+
+_act_prepare_windows_private_cargo_home() {
+    local host="$1" source_root="$2" suffix="$3" build_env="${5:-}" script command summary
+    script=$(_act_windows_private_cargo_home_script "$source_root" "$suffix") || return $?
+    script+=$'\n'"$(_act_windows_cargo_metadata_body "$build_env")" || return $?
+    script+=$'\n''$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
+    command=$(_act_windows_cache_command "$host" "$source_root" "$script") || return $?
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    jq -ce '
+        select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
+            (.cargo_home | type == "string" and test("^[A-Za-z]:/")) and
+            .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
+            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+    ' <<< "$summary"
+}
+
+_act_prepare_windows_nonstrict_cargo_home() {
+    local host="$1" source_root="$2" stage_root="$3" cargo_home="$4" script command summary path
+    for path in "$stage_root" "$cargo_home"; do
+        [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
+    done
+    [[ "$stage_root" == */dsr-build-* && "$cargo_home" == "$stage_root/"* ]] || return 4
+    script=$(_act_windows_cargo_cache_runtime) || return $?
+    script+=$'\n'"$(cat <<EOF
+\$ErrorActionPreference='Stop'
+\$dsrParent=Split-Path -Parent '$stage_root'
+[IO.Directory]::CreateDirectory(\$dsrParent) | Out-Null
+if (Get-Item -LiteralPath '$stage_root' -Force -ErrorAction SilentlyContinue) { throw 'Rust isolation path already exists' }
+[IO.Directory]::CreateDirectory('$stage_root') | Out-Null
+\$dsrAmbient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }
+if (-not (Get-Item -LiteralPath \$dsrAmbient -Force -ErrorAction SilentlyContinue)) { \$dsrAmbient='' }
+\$dsrSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second '$cargo_home'
+Assert-DsrCargoHome -Path '$cargo_home'
+\$dsrSummary | ConvertTo-Json -Compress -Depth 100
+exit 0
+EOF
+)"
+    command=$(_act_windows_cache_command "$host" "$source_root" "$script") || return $?
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    jq -ce --arg home "$cargo_home" '
+        select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
+            (.cargo_home | ascii_downcase) == ($home | ascii_downcase) and
+            .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
+            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+    ' <<< "$summary"
+}
+
+_act_finish_windows_private_cargo_home() {
+    local host="$1" cargo_home="$2" seed_digest="$3" script command summary
+    [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
+       "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
+    script=$(_act_windows_cargo_cache_runtime) || return $?
+    script+=$'\n'"$(cat <<EOF
+\$ErrorActionPreference='Stop'
+Assert-DsrCargoHome -Path '$cargo_home'
+Assert-DsrCargoSeed -CargoHome '$cargo_home' -ExpectedSha256 '$seed_digest'
+\$dsrFinal=Invoke-DsrCargoCache -Operation inventory -First '$cargo_home' -Second '$cargo_home.final.json'
+Assert-DsrCargoHome -Path '$cargo_home'
+Assert-DsrCargoSeed -CargoHome '$cargo_home' -ExpectedSha256 '$seed_digest'
+\$dsrFinal | ConvertTo-Json -Compress -Depth 100
+exit 0
+EOF
+)"
+    command=$(_act_windows_cache_command "$host" "$cargo_home" "$script") || return $?
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    jq -ce --arg home "$cargo_home" '
+        select(type == "object" and .schema_version == 1 and .mode == "inventory" and
+            .cargo_home == $home and .receipt_path == ($home + ".final.json") and
+            (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+    ' <<< "$summary"
 }
 
 _act_strict_cargo_metadata_json() {
@@ -4618,18 +4777,20 @@ _act_strict_cargo_metadata_json() {
     local source_root="$2"
     local build_cmd="${3-cargo build}" build_env="${4:-}"
     local metadata_command metadata_output metadata_json canonical_source_root
-    local strict_cargo_home="${source_root%/*}/.cargo-home"
 
     if [[ ! "$source_root" =~ ^[A-Za-z0-9_./:+-]+$ || "$source_root" == *..* ]]; then
         _log_error "Unsafe strict Cargo source root"
         return 4
     fi
     if _act_is_windows_host "$host"; then
-        local win_source_root win_cargo_home win_manifest_path
+        local win_source_root metadata_attempt metadata_script metadata_body
         win_source_root=$(_act_windows_cmd_path "$source_root")
-        win_cargo_home=$(_act_windows_cmd_path "$strict_cargo_home")
-        win_manifest_path="${win_source_root}\\Cargo.toml"
-        metadata_command="$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$strict='${win_cargo_home}'; \$ambient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }; if (-not (Test-Path -LiteralPath \$strict)) { New-Item -ItemType Directory -Path \$strict | Out-Null }; \$strictItem=Get-Item -LiteralPath \$strict -Force; if (-not \$strictItem.PSIsContainer -or ((\$strictItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not a plain directory' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$strict \$name)) { throw 'Strict CARGO_HOME contains ambient configuration' } }; foreach (\$name in @('registry','git')) { \$source=Join-Path \$ambient \$name; \$dest=Join-Path \$strict \$name; if (Test-Path -LiteralPath \$source -PathType Container) { if (-not (Test-Path -LiteralPath \$dest)) { New-Item -ItemType Junction -Path \$dest -Target \$source | Out-Null }; \$destItem=Get-Item -LiteralPath \$dest -Force; if (-not \$destItem.PSIsContainer -or ((\$destItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) { throw 'Strict Cargo cache is not an isolated junction' } } elseif (Test-Path -LiteralPath \$dest) { throw 'Strict Cargo cache has no ambient authority' } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; Get-ChildItem Env: | Where-Object { \$_.Name -match '^(CARGO_|RUST)' -or \$_.Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS)$' } | ForEach-Object { Remove-Item -LiteralPath ('Env:' + \$_.Name) }; \$env:CARGO_HOME=\$strict; Set-Location -LiteralPath '${win_source_root}'; Write-Output ((Get-Location).Path); & cargo metadata --locked --offline --all-features --format-version 1 --manifest-path '${win_manifest_path}'; exit \$LASTEXITCODE")"
+        metadata_attempt=$(_act_generate_uuid) || return 3
+        metadata_script=$(_act_windows_private_cargo_home_script \
+            "$win_source_root" "metadata-${metadata_attempt//-/}") || return $?
+        metadata_body=$(_act_windows_cargo_metadata_body "$build_env") || return $?
+        metadata_script+=$'\n'"$metadata_body"$'\n''Write-Output $dsrPhysicalSource; Get-Content -LiteralPath $dsrMetadataPath -Raw; exit 0'
+        metadata_command=$(_act_windows_cache_command "$host" "$win_source_root" "$metadata_script") || return $?
     else
         local metadata_attempt metadata_body
         metadata_attempt=$(_act_generate_uuid) || return 3
@@ -4639,20 +4800,10 @@ _act_strict_cargo_metadata_json() {
         metadata_command+=$'\n'"$metadata_body"$'\n''printf '\''%s\n'\'' "$physical_source_root"; test -f "$strict_home/.dsr-cargo-metadata.json"; test ! -L "$strict_home/.dsr-cargo-metadata.json"; cat "$strict_home/.dsr-cargo-metadata.json"'
     fi
 
-    if _act_is_windows_host "$host"; then
-        local cache_guard metadata_script
-        cache_guard=$(_act_windows_cache_junction_guard_script "$strict_cargo_home") || return 4
-        metadata_script=$(_act_windows_command_script "$metadata_command") || return 4
-        metadata_command=$(_act_windows_encoded_powershell "$cache_guard"$'\n'"$metadata_script") || return 4
-    fi
     if ! metadata_output=$(_act_ssh_exec "$host" "$metadata_command" "$_ACT_SYNC_TIMEOUT") || \
        [[ "$metadata_output" != *$'\n'* ]]; then
         _log_error "Locked offline Cargo metadata failed for strict source root on $host"
         return 4
-    fi
-    if _act_is_windows_host "$host"; then
-        cache_guard=$(_act_windows_cache_junction_guard_script "$strict_cargo_home" true) || return 4
-        _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$cache_guard")" "$_ACT_SYNC_TIMEOUT" >/dev/null || return 4
     fi
     canonical_source_root="${metadata_output%%$'\n'*}"
     canonical_source_root="${canonical_source_root%$'\r'}"
@@ -7804,18 +7955,19 @@ act_run_native_build() {
             strict_build_env+=$'\n'"FT_ATOMIC_BUILD_IDENTITY=$atomic_identity"
             strict_build_env+=$'\n'"FT_ATOMIC_BUILD_PROFILE=$build_profile"
         fi
+        local cargo_attempt cargo_prepare=_act_prepare_unix_private_cargo_home
+        cargo_attempt=$(_act_generate_uuid) || return 3
+        _act_is_windows_host "$host" && cargo_prepare=_act_prepare_windows_private_cargo_home
+        if ! strict_cargo_seed_json=$("$cargo_prepare" \
+                "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}" \
+                "$build_cmd" "$strict_build_env") || \
+           ! strict_cargo_home=$(jq -er '.cargo_home' <<< "$strict_cargo_seed_json"); then
+            _log_error "Unable to prepare a private strict Cargo cache on $host"
+            jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo cache preparation failed"}'
+            return 4
+        fi
+        strict_private_cargo_cache=true
         if ! _act_is_windows_host "$host"; then
-            local cargo_attempt
-            cargo_attempt=$(_act_generate_uuid) || return 3
-            if ! strict_cargo_seed_json=$(_act_prepare_unix_private_cargo_home \
-                    "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}" \
-                    "$build_cmd" "$strict_build_env") || \
-               ! strict_cargo_home=$(jq -er '.cargo_home' <<< "$strict_cargo_seed_json"); then
-                _log_error "Unable to prepare a private strict Cargo cache on $host"
-                jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo cache preparation failed"}'
-                return 4
-            fi
-            strict_private_cargo_cache=true
             # Per-attempt toolchain identity receipt beside the snapshot; the
             # snapshot itself must stay byte-identical.
             strict_toolchain_receipt="${remote_path%/*}/.dsr-toolchain-${platform//\//-}-${cargo_attempt//-/}.json"
@@ -7885,9 +8037,9 @@ act_run_native_build() {
         # target/linker settings) and ensure the target directory is absolute
         # before the source is staged outside the operator's home directory.
         # An absolute target keeps artifact collection deterministic after the
-        # working directory moves to the isolated source copy. On Unix hosts the
-        # fresh CARGO_HOME holds private dependency-cache copies, prepared by
-        # _act_prepare_unix_nonstrict_cargo_home just before the build runs.
+        # working directory moves to the isolated source copy. The fresh
+        # CARGO_HOME holds private dependency-cache copies prepared just before
+        # the build runs on either host platform.
         local nonstrict_env="" nonstrict_pair nonstrict_target_dir=""
         local isolation_uuid isolation_suffix isolation_root
         if [[ ! "$tool_name" =~ ^[A-Za-z0-9_.-]+$ || \
@@ -8051,7 +8203,6 @@ act_run_native_build() {
             --arg source_root "$nonstrict_source_root" \
             --arg cargo_home "$nonstrict_cargo_home" \
             --arg target_dir "$nonstrict_target_dir" \
-            --argjson windows "$nonstrict_windows_receipt" \
             --argjson sibling_roots "$nonstrict_sibling_roots_json" '
             {
                 mode: "ephemeral-staged-source",
@@ -8065,9 +8216,7 @@ act_run_native_build() {
                 sibling_roots: $sibling_roots,
                 ancestor_config_policy: "detect-original-and-reject-staging",
                 excluded_cargo_home_entries: ["config", "config.toml", "credentials", "credentials.toml"],
-                # Unix homes receive private cache copies before the build
-                # (dependency_cache.seed); Windows still links the registry.
-                cache_reuse: (if $windows then ["registry"] else [] end)
+                cache_reuse: []
             }
         ') || return 4
     fi
@@ -8253,7 +8402,63 @@ act_run_native_build() {
                     "$nonstrict_stage_root/$sibling_relative") || return 4
                 ps_sibling_copies+="\$sibling=Get-Item -LiteralPath '${sibling_win_remote}' -Force; if (-not \$sibling.PSIsContainer -or ((\$sibling.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust sibling source root must be a plain directory' }; New-Item -ItemType Directory -Path '${sibling_win_staged}' | Out-Null; Copy-DsrSourceTree -SourcePath \$sibling.FullName -DestinationPath '${sibling_win_staged}'; "
             done
-            remote_cmd="$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; ${ps_copy_function}; \$source=Get-Item -LiteralPath '${win_path}' -Force; if (-not \$source.PSIsContainer -or ((\$source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Rust source root must be a plain directory' }; \$ancestor=\$source.Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { \$candidate=Join-Path \$cargoDir \$name; if (Test-Path -LiteralPath \$candidate) { [Console]::Error.WriteLine('[dsr] excluding inherited Cargo config: ' + \$candidate) } }; \$ancestor=\$ancestor.Parent }; \$root=Split-Path -Parent '${win_stage_root}'; New-Item -ItemType Directory -Path \$root -Force | Out-Null; if (Test-Path -LiteralPath '${win_stage_root}') { throw 'Rust isolation path already exists' }; New-Item -ItemType Directory -Path '${win_stage_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_source_root}' | Out-Null; New-Item -ItemType Directory -Path '${win_cargo_home}' | Out-Null; Copy-DsrSourceTree -SourcePath \$source.FullName -DestinationPath '${win_source_root}'; ${ps_sibling_copies}if (Test-Path -LiteralPath (Join-Path '${win_source_root}' '.git')) { & git -C '${win_source_root}' status --porcelain --untracked-files=no | Out-Null; if (\$LASTEXITCODE -ne 0) { throw 'Unable to refresh staged Git index metadata' } }; foreach (\$name in @('registry')) { \$cache=Join-Path (Join-Path \$env:USERPROFILE '.cargo') \$name; \$link=Join-Path '${win_cargo_home}' \$name; if (Test-Path -LiteralPath \$cache -PathType Container) { New-Item -ItemType Junction -Path \$link -Target \$cache | Out-Null; if (((Get-Item -LiteralPath \$link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'Cargo cache link is not isolated' } } }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path '${win_cargo_home}' \$name)) { throw 'Ephemeral CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_source_root}' -Force).Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Staging root inherits Cargo configuration' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.EnvironmentVariables['CARGO_HOME']='${win_cargo_home}'; \$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_source_root}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode")"
+            local ps_nonstrict_build
+            ps_nonstrict_build=$(cat <<EOF
+\$ErrorActionPreference='Stop'
+$ps_copy_function
+$(_act_windows_reparse_guard_script)
+Assert-PlainDirectory '${win_path}'
+Assert-PlainDirectory '${win_stage_root}'
+Assert-PlainDirectory '${win_cargo_home}'
+Assert-PlainFile '${win_cargo_home}\\.dsr-cache-seed.json'
+\$source=Get-Item -LiteralPath '${win_path}' -Force
+\$ancestor=\$source.Parent
+while (\$null -ne \$ancestor) {
+    foreach (\$name in @('config','config.toml')) {
+        \$candidate=Join-Path \$ancestor.FullName ".cargo/\$name"
+        if (Test-Path -LiteralPath \$candidate) { [Console]::Error.WriteLine('[dsr] excluding inherited Cargo config: ' + \$candidate) }
+    }
+    \$ancestor=\$ancestor.Parent
+}
+New-Item -ItemType Directory -Path '${win_source_root}' | Out-Null
+Copy-DsrSourceTree -SourcePath \$source.FullName -DestinationPath '${win_source_root}'
+$ps_sibling_copies
+if (Test-Path -LiteralPath (Join-Path '${win_source_root}' '.git')) {
+    & git -C '${win_source_root}' status --porcelain --untracked-files=no | Out-Null
+    if (\$LASTEXITCODE -ne 0) { throw 'Unable to refresh staged Git index metadata' }
+}
+foreach (\$name in @('registry','git')) {
+    \$cache=Join-Path '${win_cargo_home}' \$name
+    if (Get-Item -LiteralPath \$cache -Force -ErrorAction SilentlyContinue) { Assert-PlainDirectory \$cache }
+}
+foreach (\$name in @('config','config.toml','credentials','credentials.toml')) {
+    if (Get-Item -LiteralPath (Join-Path '${win_cargo_home}' \$name) -Force -ErrorAction SilentlyContinue) { throw 'Ephemeral CARGO_HOME contains configuration' }
+}
+\$ancestor=(Get-Item -LiteralPath '${win_source_root}' -Force).Parent
+while (\$null -ne \$ancestor) {
+    foreach (\$name in @('config','config.toml')) {
+        if (Get-Item -LiteralPath (Join-Path \$ancestor.FullName ".cargo/\$name") -Force -ErrorAction SilentlyContinue) { throw 'Staging root inherits Cargo configuration' }
+    }
+    \$ancestor=\$ancestor.Parent
+}
+\$psi=New-Object System.Diagnostics.ProcessStartInfo
+\$psi.UseShellExecute=\$false
+\$keys=@(\$psi.EnvironmentVariables.Keys)
+foreach (\$key in \$keys) {
+    if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) }
+}
+$ps_env_assignments
+\$psi.EnvironmentVariables['CARGO_HOME']='${win_cargo_home}'
+\$psi.FileName=\$env:ComSpec
+\$psi.WorkingDirectory='${win_source_root}'
+\$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}'))
+\$psi.Arguments='/d /s /c ' + \$command
+\$process=[Diagnostics.Process]::Start(\$psi)
+\$process.WaitForExit()
+exit \$process.ExitCode
+EOF
+            ) || return 4
+            remote_cmd=$(_act_windows_encoded_powershell "$ps_nonstrict_build" pwsh) || return 4
         fi
     else
         # Unix: use bash/zsh compatible syntax
@@ -8410,7 +8615,7 @@ act_run_native_build() {
         if $strict_rust_build; then
             remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
         else
-            remote_cmd=$(_act_windows_encoded_powershell "$windows_build_script") || return 4
+            remote_cmd=$(_act_windows_encoded_powershell "$windows_build_script" pwsh) || return 4
         fi
         # Let the remote deadline retire its job before killing the transport.
         # This grace is not additional build time and never enables local work.
@@ -8428,14 +8633,21 @@ act_run_native_build() {
         trap '_act_stage_cleanup_on_signal 143' TERM
     fi
 
-    # Ordinary Unix Rust builds: create the stage root with a private copy of
+    # Ordinary Rust builds: create the stage root with a private copy of
     # the dependency caches before the build command runs (issue #15).
     local exit_code=0
     local nonstrict_private_cargo_cache=false nonstrict_cargo_seed_json="" nonstrict_seed_home=""
-    if $nonstrict_rust_isolate && ! _act_is_windows_host "$host"; then
-        local nonstrict_prepare_status=0
-        nonstrict_cargo_seed_json=$(_act_prepare_unix_nonstrict_cargo_home "$host" \
-            "$isolation_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>"$log_file") || \
+    local cargo_finish=_act_finish_unix_private_cargo_home
+    _act_is_windows_host "$host" && cargo_finish=_act_finish_windows_private_cargo_home
+    if $nonstrict_rust_isolate; then
+        local nonstrict_prepare_status=0 nonstrict_prepare=_act_prepare_unix_nonstrict_cargo_home
+        local nonstrict_prepare_root="$isolation_root"
+        if _act_is_windows_host "$host"; then
+            nonstrict_prepare=_act_prepare_windows_nonstrict_cargo_home
+            nonstrict_prepare_root="$remote_path"
+        fi
+        nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
+            "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>"$log_file") || \
             nonstrict_prepare_status=$?
         [[ -s "$log_file" ]] && cat "$log_file" >&2
         if [[ $nonstrict_prepare_status -eq 0 ]] && \
@@ -8444,7 +8656,7 @@ act_run_native_build() {
                '.dependency_cache = {mode: "private-copy", seed: $seed}' <<< "$cargo_isolation_json"); then
             nonstrict_private_cargo_cache=true
         else
-            _log_error "Unable to prepare a private Cargo dependency cache on $host (requires Python 3.9+); not building $platform" 2>&1 | tee -a "$log_file" >&2
+            _log_error "Unable to prepare a private Cargo dependency cache on $host; not building $platform" 2>&1 | tee -a "$log_file" >&2
             exit_code=4
         fi
     fi
@@ -8463,7 +8675,7 @@ act_run_native_build() {
         local nonstrict_cargo_final_json nonstrict_cargo_seed_digest
         nonstrict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$nonstrict_cargo_seed_json") || exit_code=4
         if [[ $exit_code -eq 0 ]] && \
-           nonstrict_cargo_final_json=$(_act_finish_unix_private_cargo_home \
+           nonstrict_cargo_final_json=$("$cargo_finish" \
                "$host" "$nonstrict_seed_home" "$nonstrict_cargo_seed_digest"); then
             cargo_isolation_json=$(jq --argjson final "$nonstrict_cargo_final_json" \
                 '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
@@ -8476,7 +8688,7 @@ act_run_native_build() {
         local strict_cargo_final_json strict_cargo_seed_digest
         strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4
         if [[ $exit_code -eq 0 ]] && \
-           strict_cargo_final_json=$(_act_finish_unix_private_cargo_home \
+           strict_cargo_final_json=$("$cargo_finish" \
                "$host" "$strict_cargo_home" "$strict_cargo_seed_digest"); then
             cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
                 '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4

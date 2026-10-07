@@ -234,9 +234,10 @@ useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
-Strict native Unix Rust builds copy the ambient `registry` and `git` download
-caches into private files before Cargo runs. They require Python 3.9+ on the
-build host. Configuration, credentials, symlinks, and external Git storage
+Strict native Rust builds copy the ambient `registry` and `git` download
+caches into private files before Cargo runs. Unix hosts require Python 3.9+;
+Windows hosts require PowerShell 7 and a local NTFS Cargo cache. Configuration,
+credentials, symlinks, Windows reparse points, and external Git storage
 pointers are excluded or refused. The first successful locked, offline metadata
 resolution publishes a retained seed alongside the source snapshot. If that
 first resolution lacks dependencies, no seed is published: refill the ambient
@@ -246,7 +247,7 @@ a fresh copy. Parallel targets therefore do not share writable dependency files.
 
 Resume verifies the retained seed inventory before copying it. Changes to seed
 bytes or unsafe cache entries are refused; a legacy snapshot whose cache roots
-are symlinks requires a new strict run. Cargo may legitimately unpack archives
+are symlinks or Windows junctions requires a new strict run. Cargo may legitimately unpack archives
 or reconstruct Git checkouts in an attempt's private home. After a successful
 build, DSR checks that the attempt's seed receipt has its original digest and
 records the final inventory before collecting artifacts. Configuration, special
@@ -261,7 +262,7 @@ The copies include the complete selected cache trees and remain alongside the
 strict snapshot, so allow disk space for the retained seed and each metadata or
 target attempt.
 
-Ordinary (non-strict) native Unix Rust builds get the same protection. Each
+Ordinary (non-strict) native Rust builds get the same protection. Each
 target's fresh stage root receives a private copy of the ambient `registry` and
 `git` caches (`${CARGO_HOME:-~/.cargo}`) before its build command starts, never
 the ambient configuration or credentials, so pruning or rewriting the host's
@@ -270,10 +271,11 @@ dependencies into the private home. After a successful build the private
 home's final inventory is checked like a strict one; configuration, links or
 special files added there refuse artifact collection. The result records
 `cargo_isolation.dependency_cache.seed`/`.final` with `cache_reuse: []`. This
-also requires Python 3.9+ on the build host, and the copy is removed with the
-stage root unless `DSR_KEEP_BUILD_STAGES=1`. Native Windows builds still link
-the ambient registry, the remaining part of
-[issue #15](https://github.com/Dicklesworthstone/doodlestein_self_releaser/issues/15).
+requires Python 3.9+ on Unix or PowerShell 7 on Windows, and the copy is removed
+with the stage root unless `DSR_KEEP_BUILD_STAGES=1`. Windows uses native file
+handles to refuse reparse points, concurrent file writes during copying and
+external hardlinks in private caches. The same seed/final inventory fields are
+retained for both host platforms; Windows receipt paths use `C:/...` form.
 The cargo-xwin backend already uses private dependency copies separately.
 
 Strict native Unix Rust builds can opt into a host-local intermediate cache with

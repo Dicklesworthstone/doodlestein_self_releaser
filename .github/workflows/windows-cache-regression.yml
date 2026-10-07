@@ -1,0 +1,33 @@
+name: Native Windows Cargo cache regression tests
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/act_runner.sh
+      - src/cargo_cache_windows.ps1
+      - schemas/manifest.json
+      - scripts/tests/test_cargo_cache_windows.ps1
+      - .github/workflows/windows-cache-regression.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-cache-regression-main
+  cancel-in-progress: false
+jobs:
+  windows-cargo-cache:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify private caches with native NTFS handles and real Cargo
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSVersionTable.PSVersion
+          cargo --version
+          git --version
+          & ./scripts/tests/test_cargo_cache_windows.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

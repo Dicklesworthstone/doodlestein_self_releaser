@@ -685,7 +685,17 @@ unpublished and suppresses dispatch and upgrade hooks.
 
 Strict native builds trust the configured build host and its installed
 compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and
-records the explicit build-influence environment. On Unix hosts, strict Rust
+records the explicit build-influence environment. Both strict and ordinary
+native Rust builds copy `registry` and `git` into independent Cargo homes.
+Metadata and target attempts never compile through ambient cache symlinks or
+Windows junctions. Strict metadata admits a retained seed only after successful
+locked offline resolution; retries verify it before making another private copy.
+Collection requires the original seed-receipt digest and a valid final inventory,
+retained under `cargo_isolation.dependency_cache` with `cache_reuse: []`.
+Windows uses PowerShell 7 and native NTFS handles, rejects reparses and external
+private-cache hardlinks, and records drive-qualified forward-slash paths.
+
+On Unix hosts, strict Rust
 builds also attest their direct Cargo invocations. Inside the build's own
 shell (same working directory, environment and PATH, including DSR's
 glibc-floor shim), DSR reads the command's literal `+toolchain` and `--target`

@@ -257,6 +257,10 @@ _test_decode_remote_command() {
     if [[ "$command" == powershell\ -NoProfile\ -NonInteractive\ * ||
           "$command" == pwsh\ -NoProfile\ -NonInteractive\ * ]]; then
         decoded=$(_act_windows_command_script "$command") || return 1
+        if [[ "$decoded" == *"[IO.File]::Open("* && "$decoded" == *"Launcher digest mismatch"* &&
+              -s "$MOCK_DIR/staged-command.ps1" ]]; then
+            decoded=$(cat "$MOCK_DIR/staged-command.ps1") || return 1
+        fi
         if [[ "$decoded" == *'$dsrBuildScript='* ]]; then
             decoded=$(printf '%s' "$decoded" | python3 -c '
 import re, sys
@@ -316,6 +320,46 @@ _act_ssh_exec() {
     fi
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
+    # Exercise the actual Windows orchestration; only remote filesystem/cache
+    # responses are fixtures here. test_cargo_cache_windows.ps1 runs the helper
+    # and generated admission scripts against real files and Cargo.
+    if [[ "$exit_code" -eq 0 && "$cmd" == *'function Invoke-DsrCargoCache '* ]]; then
+        local cache_home="" cache_source="" cache_suffix="" cache_mode=private-copy cache_receipt
+        local source_prefix="\$dsrPhysicalSource=(Get-Item -LiteralPath '"
+        local suffix_prefix="\$dsrStrictHome=Join-Path \$dsrSourceParent '"
+        while IFS= read -r command_line; do
+            case "$command_line" in
+                "$source_prefix"*)
+                    cache_source=${command_line#"$source_prefix"}
+                    cache_source=${cache_source%%\'*}
+                    ;;
+                "$suffix_prefix"*)
+                    cache_suffix=${command_line#"$suffix_prefix"}
+                    cache_suffix=${cache_suffix%\'}
+                    ;;
+                "Assert-DsrCargoHome -Path '"*)
+                    cache_home=${command_line#"Assert-DsrCargoHome -Path '"}
+                    cache_home=${cache_home%\'}
+                    ;;
+            esac
+        done <<< "$cmd"
+        if [[ "$cmd" == *'$dsrPrivateSummary | ConvertTo-Json'* ]]; then
+            [[ -n "$cache_source" && -n "$cache_suffix" ]] || return 99
+            cache_home="${cache_source%/*}/$cache_suffix"
+        elif [[ "$cmd" == *'$dsrFinal | ConvertTo-Json'* ]]; then
+            cache_mode=inventory
+        elif [[ "$cmd" != *'$dsrSummary | ConvertTo-Json'* ]]; then
+            return 99
+        fi
+        [[ -n "$cache_home" ]] || return 99
+        cache_receipt="$cache_home/.dsr-cache-seed.json"
+        [[ "$cache_mode" != inventory ]] || cache_receipt="$cache_home.final.json"
+        jq -nc --arg home "$cache_home" --arg mode "$cache_mode" --arg receipt "$cache_receipt" \
+            '{schema_version:1, mode:$mode, cargo_home:$home, receipt_path:$receipt,
+              receipt_sha256:("3" * 64), inventory_sha256:("4" * 64), caches:["git","registry"],
+              file_count:2, size_bytes:10}'
+        return 0
+    fi
     # These command-construction tests return explicit transport receipts.
     # test_strict_cargo_private_cache.sh executes the real preparation, Cargo
     # mutation, final inventory and refusal paths on actual private inodes.
@@ -436,7 +480,10 @@ scp() {
             # Launcher uploads must not create a bogus host:path tree locally.
             local source="${*: -2:1}"
             if [[ "$target" == */build.ps1 && -f "$source" ]]; then
-                cat "$source" > "$MOCK_DIR/staged-build.ps1"
+                cat "$source" > "$MOCK_DIR/staged-command.ps1"
+                if grep -q '\$dsrBuildScript=' "$source"; then
+                    cat "$source" > "$MOCK_DIR/staged-build.ps1"
+                fi
             fi
             return 0
         fi
@@ -567,6 +614,7 @@ yq() {
 # Reset test state
 reset_state() {
     : > "$MOCK_DIR/staged-build.ps1"
+    : > "$MOCK_DIR/staged-command.ps1"
     rm -f "$SSH_ARGS_FILE" "$SCP_ARGS_FILE" "$RAW_SSH_ARGS_FILE" "$RSYNC_ARGS_FILE"
     echo "0" > "$SSH_EXIT_CODE_FILE"
     echo "0" > "$SCP_EXIT_CODE_FILE"
@@ -1228,7 +1276,8 @@ test_windows_rust_sdk_environment() {
         # Run only the generated environment mutations. StringDictionary has
         # Windows' case-insensitive environment semantics even on a POSIX test
         # host; this is a PowerShell control, not a native Windows build proof.
-        env_section="${cmd#*\$psi.UseShellExecute=\$false; }"
+        env_section="${cmd#*\$psi.UseShellExecute=\$false}"
+        env_section="${env_section#; }"
         env_section="${env_section%%\$psi.FileName=*}"
         if [[ "$mode" == strict ]]; then
             # The staged job guard stores the script in a single-quoted
@@ -1496,8 +1545,8 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     first_xwin_prefix="${cmd%%"$first_xwin_value_b64"*}"
     last_xwin_prefix="${cmd%%"$last_xwin_value_b64"*}"
     expected_target="C:/d/t/12345678-1234-4234-8234-123456789abc/amd64"
-    expected_home="C:/build/.dsr-release-snapshots/tool-run/.cargo-home"
-    expected_home_win="C:\\build\\.dsr-release-snapshots\\tool-run\\.cargo-home"
+    expected_home=$(jq -r '.cargo_isolation.cargo_home // ""' <<< "$result")
+    expected_home_win="${expected_home//\//\\}"
     if [[ "$cmd" == *"$expected_home_win"* && \
           "$cmd" == *'$cargoHome=Get-Item'* && \
           "$cmd" != *'$home=Get-Item'* && \
@@ -1518,6 +1567,10 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
        echo "$result" | jq -e \
             --arg home "$expected_home" \
             '.build_influence_env.CARGO_HOME == $home and
+             ($home | startswith("C:/build/.dsr-release-snapshots/tool-run/.cargo-home-windows-amd64-")) and
+             .cargo_isolation.cache_reuse == [] and
+             .cargo_isolation.dependency_cache.seed.mode == "private-copy" and
+             .cargo_isolation.dependency_cache.final.mode == "inventory" and
              .build_influence_env.RUSTFLAGS == "-C target-feature=+crt-static" and
              .build_influence_env.XWIN_CACHE_DIR == "C:/pinned/xwin-cache-last" and
              ([.build_influence_env | keys[] | select(ascii_upcase == "XWIN_CACHE_DIR")] | length) == 1 and
@@ -2991,14 +3044,14 @@ test_windows_strict_cargo_metadata_command() {
     ) 2>/dev/null || status=$?
 
     if [[ $status -eq 0 ]] && \
-       grep -Fq "if (-not (Test-Path -LiteralPath \$strict))" "$command_file" && \
-       grep -Fq "if (-not (Test-Path -LiteralPath \$dest))" "$command_file" && \
-       grep -Fq "contains ambient configuration" "$command_file" && \
-       grep -Fq "\$env:CARGO_HOME=\$strict" "$command_file" && \
-       grep -Fq "Set-Location -LiteralPath 'C:\build\source'; Write-Output ((Get-Location).Path)" \
-            "$command_file" && \
+       grep -Fq 'Invoke-DsrCargoCache -Operation verify -First $dsrSeedHome' "$command_file" && \
+       grep -Fq 'Invoke-DsrCargoCache -Operation snapshot -First $dsrSeedHome -Second $dsrStrictHome' "$command_file" && \
+       grep -Fq 'Assert-DsrCargoHome -Path $dsrStrictHome' "$command_file" && \
+       grep -Fq '$env:CARGO_HOME=$dsrStrictHome' "$command_file" && \
+       grep -Fq 'Set-Location -LiteralPath $dsrPhysicalSource' "$command_file" && \
+       ! grep -Fq 'New-Item -ItemType Junction' "$command_file" && \
        ! grep -Fq 'physical_source_root=' "$command_file" && \
-       grep -Fq "cargo metadata --locked --offline --all-features --format-version 1 --manifest-path 'C:\build\source\Cargo.toml'" \
+       grep -Fq "cargo metadata --locked --offline --all-features --format-version 1 --manifest-path (Join-Path \$dsrPhysicalSource 'Cargo.toml')" \
             "$command_file"; then
         log_pass "Windows strict metadata command is locked and offline"
     else
@@ -3078,42 +3131,55 @@ POWERSHELL
     done
 }
 
-test_windows_cache_junction_identity() {
-    log_test "Windows cache junctions must resolve to the admitted ambient targets"
-    local mode script result expected status
-    script=$(_act_windows_cache_junction_guard_script C:/owned/run/.cargo-home true) || { log_fail "Cache guard generation failed"; return; }
-    for mode in valid wrong_target plain_directory; do
-        expected=ADMITTED
-        [[ "$mode" != wrong_target ]] || expected='Strict Cargo cache junction target mismatch'
-        [[ "$mode" != plain_directory ]] || expected='Strict Cargo cache junction authority missing'
-        status=0
-        result=$(
-            {
-                printf "\$mode='%s';\n" "$mode"
-                cat <<'POWERSHELL'
-$env:CARGO_HOME='C:/ambient'
-function Test-Path { return $true }
-function Join-Path { param($Path,$ChildPath); return "$Path/$ChildPath" }
-function Resolve-Path { param($LiteralPath); return [pscustomobject]@{ProviderPath=$LiteralPath} }
-function Get-Item {
-    param($LiteralPath)
-    $name=($LiteralPath -split '/')[-1]
-    $target=if($mode -eq 'wrong_target'){"D:/foreign/$name"}else{"C:/ambient/$name"}
-    $attributes=if($mode -eq 'plain_directory'){0}else{1024}
-    return [pscustomobject]@{PSIsContainer=$true;Attributes=$attributes;Target=@($target)}
-}
-try {
-POWERSHELL
-                printf '%s\n' "$script"
-                printf '%s\n\n' 'Write-Output ADMITTED } catch { Write-Output $_.Exception.Message }'
-            } | pwsh -NoLogo -NoProfile -NonInteractive -Command -
-        ) || status=$?
-        result=$(printf '%s' "$result" | tr -d '\r')
-        if [[ $status -eq 0 && "$result" == "$expected" ]]; then
-            log_pass "Cache junction $mode causal branch"
-        else
-            log_fail "Cache junction $mode: status=$status result=$result expected=$expected"
-        fi
+test_windows_private_cache_collection() {
+    log_test "Windows private caches bind seed/final receipts and gate collection"
+    local mode boundary result status command
+    for mode in ordinary strict; do
+        for boundary in admitted prepare_failure final_failure; do
+            reset_state
+            MOCK_LANGUAGE=rust
+            MOCK_BUILD_CMD='cargo build --release'
+            MOCK_LOCAL_PATH='C:/Users/dsr/projects/tool'
+            MOCK_SSH_STREAM_FILE="$MOCK_DIR/cache-windows-artifact"
+            MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+            status=0
+            result=$(
+                if [[ "$boundary" == prepare_failure ]]; then
+                    _act_prepare_windows_private_cargo_home() { return 7; }
+                    _act_prepare_windows_nonstrict_cargo_home() { return 7; }
+                elif [[ "$boundary" == final_failure ]]; then
+                    _act_finish_windows_private_cargo_home() { return 7; }
+                fi
+                if [[ "$mode" == strict ]]; then
+                    act_run_native_build tool windows/amd64 v1.0.0 \
+                        12345678-1234-4234-8234-123456789abc C:/build/cache-run/source
+                else
+                    act_run_native_build tool windows/amd64 v1.0.0 cache-windows
+                fi
+            ) 2>/dev/null || status=$?
+            command=$(get_ssh_cmd)
+            if [[ "$boundary" == admitted ]] && [[ "$status" -eq 0 ]] &&
+               [[ "$command" != *'New-Item -ItemType Junction'* ]] &&
+               jq -e '.status == "success" and .cargo_isolation.cache_reuse == [] and
+                   .cargo_isolation.dependency_cache.mode == "private-copy" and
+                   .cargo_isolation.dependency_cache.seed.mode == "private-copy" and
+                   .cargo_isolation.dependency_cache.final.mode == "inventory" and
+                   .cargo_isolation.dependency_cache.seed.cargo_home == .cargo_isolation.cargo_home and
+                   .cargo_isolation.dependency_cache.final.cargo_home == .cargo_isolation.cargo_home and
+                   .cargo_isolation.dependency_cache.seed.file_count == 2' <<< "$result" >/dev/null; then
+                log_pass "$mode Windows build preserves private dependency cache authority"
+            elif [[ "$boundary" != admitted && "$status" -ne 0 ]] &&
+                 jq -e '.status != "success" and ((.artifact_path // "") == "") and
+                     (.cargo_isolation.dependency_cache.final == null)' <<< "$result" >/dev/null; then
+                if [[ "$boundary" != prepare_failure || "$command" != *'$process=[Diagnostics.Process]::Start($psi)'* ]]; then
+                    log_pass "$mode Windows $boundary refuses artifact collection"
+                else
+                    log_fail "$mode Windows ran a compiler after cache preparation failed"
+                fi
+            else
+                log_fail "$mode Windows $boundary did not enforce private cache custody: status=$status result=$result"
+            fi
+        done
     done
 }
 
@@ -3243,7 +3309,7 @@ main() {
     test_windows_strict_cargo_metadata_command
     test_windows_split_target_and_collection
     test_windows_split_source_budget
-    test_windows_cache_junction_identity
+    test_windows_private_cache_collection
 
     # Derived build identity, Windows path guard, glibc floor (issues #7/#8/#9)
     test_rust_derives_build_target_and_dsr_env
