@@ -606,6 +606,22 @@ Recovery requires Python 3 for bounded, no-follow descriptor validation of the
 private receipt and its directory; device, inode, and byte identity remain
 fixed through publication.
 
+### `dsr installer`
+
+Generate the `curl | bash` installer for a tool from its `repos.d/<tool>.yaml`:
+
+```bash
+dsr installer generate ntm                 # writes installers/ntm/install.sh
+dsr installer generate --all --dry-run     # list what would be generated
+dsr installer validate ntm                 # syntax, ShellCheck, safety checks
+```
+
+The default output directory (`installers/` beside dsr, or
+`DSR_INSTALLER_DIR`, or `--output-dir`) is the one `dsr canary` tests. Commit
+each generated `install.sh` to its tool's repository. Regenerate after
+changing a tool's naming or targets, or the signing key, since the key is
+embedded at generation (see "Installers and Verification").
+
 ### `dsr canary`
 
 Run a repository's installer in a clean Linux container, then require its

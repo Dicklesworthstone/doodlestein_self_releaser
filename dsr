@@ -178,6 +178,7 @@ COMMANDS:
     report      Recent runs, failures and throttling
     version     Detect and tag versions from version files
     canary      Test installers in Docker containers
+    installer   Generate and validate curl|bash installers
     sbom        Generate Software Bill of Materials
     slsa        Generate SLSA provenance attestation
     docker      Build multi-arch Docker images
@@ -12814,6 +12815,126 @@ _verify_upgrade() {
 }
 
 # ============================================================================
+# INSTALLER SUBCOMMAND - Generate curl|bash installers
+# ============================================================================
+
+cmd_installer() {
+    local subcmd="${1:-}"
+    shift 2>/dev/null || true
+    local output_dir="${DSR_INSTALLER_DIR:-$SCRIPT_DIR/installers}"
+    local all=false dry_run="${DRY_RUN:-false}"
+    local -a tools=()
+
+    case "$subcmd" in
+        generate|validate) ;;
+        --help|-h|help|"")
+            cat << 'EOF'
+dsr installer - Generate and validate curl|bash installers
+
+USAGE:
+    dsr installer generate <tool>... [--output-dir DIR] [--dry-run]
+    dsr installer generate --all [--output-dir DIR] [--dry-run]
+    dsr installer validate <tool>... [--output-dir DIR]
+
+DESCRIPTION:
+    Writes <output-dir>/<tool>/install.sh from repos.d/<tool>.yaml: platform
+    and libc detection, checksum verification, minisign verification with
+    the configured key (or the `dsr signing init` key), staleness-aware
+    source fallback, offline caching and agent-skill installation.
+    The default output directory is the one `dsr canary` tests:
+    installers/ beside dsr (override with --output-dir or DSR_INSTALLER_DIR).
+    Commit each generated install.sh to its tool's repository so the
+    documented `curl ... | bash` URL serves it.
+
+    validate checks syntax, ShellCheck and the required safety elements.
+
+EXIT CODES:
+    0  - All installers generated/valid
+    1  - Some tools failed
+    4  - Invalid arguments or tool configuration
+EOF
+            return 0
+            ;;
+        *)
+            log_error "Unknown installer subcommand: $subcmd"
+            log_info "Run 'dsr installer --help' for usage"
+            return 4
+            ;;
+    esac
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) all=true; shift ;;
+            --output-dir|-o)
+                [[ $# -ge 2 && -n "$2" ]] || { log_error "$1 requires a directory"; return 4; }
+                output_dir="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            -*) log_error "Unknown option: $1"; return 4 ;;
+            *) tools+=("$1"); shift ;;
+        esac
+    done
+
+    _dsr_require install_gen
+    _IG_OUTPUT_DIR="$output_dir"
+
+    if $all; then
+        [[ ${#tools[@]} -eq 0 ]] || { log_error "Give tool names or --all, not both"; return 4; }
+        local repos_d="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d" config_file
+        for config_file in "$repos_d"/*.yaml; do
+            [[ -f "$config_file" && "${config_file##*/}" != _* ]] || continue
+            tools+=("$(basename "$config_file" .yaml)")
+        done
+    fi
+    if [[ ${#tools[@]} -eq 0 ]]; then
+        log_error "No tools given (name them, or use --all with tools in repos.d)"
+        log_info "Run 'dsr installer --help' for usage"
+        return 4
+    fi
+
+    local tool path status=0 last_status=0 ok=0
+    local -a results=()
+    for tool in "${tools[@]}"; do
+        status=0 path="$output_dir/$tool/install.sh"
+        if [[ ! "$tool" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            log_error "Invalid tool name: $tool"
+            status=4
+        elif [[ "$subcmd" == validate ]]; then
+            install_gen_validate "$tool" >&2 || status=$?
+        elif $dry_run; then
+            log_info "[dry-run] Would generate $path"
+        else
+            path=$(install_gen_create "$tool") || status=$?
+        fi
+        if [[ $status -eq 0 ]]; then
+            ((ok++))
+        else
+            last_status=$status
+            log_error "$subcmd failed for $tool (exit $status)"
+        fi
+        results+=("$(jq -nc --arg tool "$tool" --arg path "$path" --argjson status "$status" \
+            '{tool: $tool, path: $path, ok: ($status == 0), exit_code: $status}')")
+    done
+
+    local exit_code=0
+    if [[ $ok -lt ${#tools[@]} ]]; then
+        exit_code=1
+        [[ $ok -eq 0 ]] && exit_code="$last_status"
+    fi
+    if $JSON_MODE; then
+        local status_word=success
+        [[ $exit_code -eq 0 ]] || status_word=$([[ $ok -gt 0 ]] && echo partial || echo error)
+        json_envelope "installer" "$status_word" "$exit_code" "$(printf '%s\n' "${results[@]}" | jq -sc \
+            --arg action "$subcmd" --arg output_dir "$output_dir" --argjson dry_run "$dry_run" \
+            '{action: $action, output_dir: $output_dir, dry_run: $dry_run, installers: .}')"
+    else
+        [[ "$subcmd" == generate ]] && ! $dry_run && [[ $ok -gt 0 ]] &&
+            jq -r 'select(.ok) | .path' <<< "$(printf '%s\n' "${results[@]}")"
+        log_info "Installer $subcmd: $ok of ${#tools[@]} succeeded"
+    fi
+    return "$exit_code"
+}
+
+# ============================================================================
 # CANARY SUBCOMMAND - Installer Testing in Docker
 # ============================================================================
 
@@ -13948,6 +14069,9 @@ main() {
             ;;
         canary)
             cmd_canary "$@"
+            ;;
+        installer)
+            cmd_installer "$@"
             ;;
         sbom)
             cmd_sbom "$@"

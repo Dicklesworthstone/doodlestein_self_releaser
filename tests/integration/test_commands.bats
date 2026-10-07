@@ -853,6 +853,40 @@ fi
     assert_contains "$output" "USAGE:"
 }
 
+@test "dsr installer generates, validates and dry-runs installers from repos.d" {
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    local tool
+    for tool in alpha beta; do
+        printf 'tool_name: %s\nrepo: example/%s\nbinary_name: %s\nartifact_naming: ${name}-${version}-${os}-${arch}\n' \
+            "$tool" "$tool" "$tool" > "$DSR_CONFIG_DIR/repos.d/$tool.yaml"
+    done
+    local out="$TEST_TMPDIR/installers"
+
+    run bash -c '"$1" installer generate --all --output-dir "$2" --dry-run 2>/dev/null' _ "$PROJECT_ROOT/dsr" "$out"
+    assert_equal "0" "$status"
+    [[ ! -e "$out" ]]
+
+    run bash -c '"$1" installer generate alpha --output-dir "$2" 2>/dev/null' _ "$PROJECT_ROOT/dsr" "$out"
+    assert_equal "0" "$status"
+    assert_equal "$out/alpha/install.sh" "$output"
+    bash -n "$out/alpha/install.sh"
+
+    _dsr_json installer generate --all --output-dir "$out"
+    assert_equal "0" "$status"
+    jq -e '[.details.installers[] | select(.ok) | .tool] == ["alpha", "beta"]' <<< "$json"
+    [[ -f "$out/beta/install.sh" ]]
+
+    run harness_run_dsr installer validate alpha --output-dir "$out"
+    assert_equal "0" "$status"
+
+    _dsr_json installer generate alpha missing-tool --output-dir "$out"
+    assert_equal "1" "$status"
+    jq -e '.status == "partial" and ([.details.installers[] | select(.ok | not) | .tool] == ["missing-tool"])' <<< "$json"
+
+    run harness_run_dsr installer frobnicate
+    assert_equal "4" "$status"
+}
+
 @test "dsr release finalize explains its usage errors" {
     run harness_run_dsr release finalize --help
     assert_equal "0" "$status"
