@@ -6,7 +6,7 @@
 #
 # install_source_build owner/repo ref language binary new_directory --allow-build
 #   [--subdir relative/path] [--entry relative/path] [--package cargo_package]
-#   [--timeout seconds]
+#   [--bin name ...] [--timeout seconds]
 # Timeout applies to each fetch/compiler command, including its children.
 # stdout: one receipt JSON after a successful build; stderr: progress/errors.
 # Exit: 3 missing dependency, 4 invalid input, 5 timeout/interruption,
@@ -16,6 +16,16 @@ _isb_log() { printf '[source-build] %s\n' "$*" >&2; }
 
 _isb_name() {
     [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]
+}
+
+_isb_binary_name() {
+    local name="$1"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            [[ "${name,,}" != *.exe ]] || name="${name%????}"
+            name+=.exe ;;
+    esac
+    printf '%s\n' "$name"
 }
 
 _isb_relative_path() {
@@ -277,13 +287,17 @@ install_source_freshness() (
     printf '%s\n' "$decision"
 )
 
-# Build only the requested executable, into a new private output directory.
+# Build only the requested executable family, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
 _isb_compile() (
     local language="$1" tree="$2" output="$3" binary="$4" entry="$5" package="$6" limit="$7"
-    local status=0 host target mod=readonly
+    shift 7
+    local -a binaries=("$@") targets=()
+    ((${#binaries[@]})) || binaries=("$binary")
+    [[ "$language" == rust || ${#binaries[@]} -eq 1 ]] || return 4
+    local status=0 host target name mod=readonly
     cd "$tree" || return 4
-    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) binary="${binary%.exe}.exe" ;; esac
+    binary=$(_isb_binary_name "$binary") || return 4
     case "$language" in
         rust)
             [[ -f Cargo.toml && ! -L Cargo.toml ]] || return 4
@@ -294,10 +308,52 @@ _isb_compile() (
             _isb_run "$limit" "$output/compiler.log" rustc -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             host=$(sed -n 's/^host: //p' "$output/compiler.log")
             [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 6
-            local -a args=(build --locked --release --target "$host" --target-dir "$output/target" --bin "${binary%.exe}")
-            [[ -z "$package" ]] || args+=(--package "$package")
+            local -a args=(build --locked --release --message-format=json-render-diagnostics
+                --target "$host" --target-dir "$output/target")
+            if [[ -n "$package" ]]; then
+                args+=(--package "$package")
+            elif ((${#binaries[@]} > 1)); then
+                # A package-root workspace defaults to building only its root
+                # package. Explicit family members can live in other packages.
+                args+=(--workspace)
+            fi
+            for name in "${binaries[@]}"; do
+                name=$(_isb_binary_name "$name") || return 4
+                args+=(--bin "${name%.exe}")
+                targets+=("$output/target/$host/release/$name")
+            done
             _isb_run "$limit" "$output/build.log" cargo "${args[@]}" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            target="$output/target/$host/release/$binary"
+            local artifact_path windows_paths=false
+            case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows_paths=true ;; esac
+            for target in "${targets[@]}"; do
+                name="${target##*/}"
+                artifact_path="$target"
+                if $windows_paths; then
+                    command -v cygpath >/dev/null 2>&1 || {
+                        _isb_log 'cygpath is required to validate native Windows Cargo output paths'; return 3;
+                    }
+                    artifact_path=$(cygpath -am "$target") || return 6
+                fi
+                # A workspace can contain several packages providing the same
+                # --bin name. Cargo can exit zero after warning that their
+                # executable paths collide. Only one actual compiler artifact
+                # may provide each requested output, using Cargo's resolved
+                # package/default-feature/required-feature selection.
+                if ! jq -eRs --arg name "${name%.exe}" --arg path "$artifact_path" \
+                    --argjson windows "$windows_paths" '
+                    def native_path:
+                        if $windows then gsub("\\\\"; "/") | ascii_downcase else . end;
+                    [split("\n")[] | fromjson? |
+                        select(.reason == "compiler-artifact" and .target.name == $name and
+                            (.target.kind | type == "array" and index("bin") != null))] |
+                    length == 1 and (.[0].executable | type == "string") and
+                    (.[0].executable | native_path) == ($path | native_path) and
+                    (.[0].package_id | type == "string" and length > 0)
+                ' "$output/build.log" >/dev/null; then
+                    _isb_log "Cargo did not identify exactly one executable provider for: $name"
+                    return 6
+                fi
+            done
             ;;
         go)
             [[ -f go.mod && ! -L go.mod ]] || return 4
@@ -320,6 +376,7 @@ _isb_compile() (
             [[ "$(cat "$output/package.log")" == main ]] || { _isb_log 'Requested Go package is not one executable'; return 6; }
             target="$output/$binary"
             _isb_run "$limit" "$output/build.log" go build "-mod=$mod" -trimpath -o "$target" "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            targets+=("$target")
             ;;
         bun|typescript)
             [[ -f package.json && ! -L package.json ]] || return 4
@@ -338,14 +395,17 @@ _isb_compile() (
             _isb_run "$limit" "$output/dependencies.log" bun install --frozen-lockfile || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             target="$output/$binary"
             _isb_run "$limit" "$output/build.log" bun build --compile --outfile "$target" "./$entry" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
+            targets+=("$target")
             ;;
         *) return 4 ;;
     esac
-    _isb_path_in_tree "$output" "${target#"$output"/}" && [[ -f "$target" && -s "$target" ]] || {
-        _isb_log 'Build did not produce a nonempty regular executable'; return 6;
-    }
-    chmod 755 "$target" || return 1
-    printf '%s\n' "$target"
+    for target in "${targets[@]}"; do
+        _isb_path_in_tree "$output" "${target#"$output"/}" && [[ -f "$target" && -s "$target" ]] || {
+            _isb_log "Build did not produce a nonempty regular executable: ${target##*/}"; return 6;
+        }
+        chmod 755 "$target" || return 1
+    done
+    printf '%s\n' "${targets[@]}"
 )
 
 install_source_build() (
@@ -353,16 +413,18 @@ install_source_build() (
     [[ $# -ge 5 ]] || return 4
     shift 5
     local allow=false subdir=. entry='' package='' limit=3600
+    local -a binaries=()
     while (($#)); do
         case "$1" in
             --allow-build) allow=true; shift ;;
-            --subdir|--entry|--package|--timeout)
+            --subdir|--entry|--package|--timeout|--bin)
                 [[ $# -ge 2 && -n "$2" ]] || return 4
                 case "$1" in
                     --subdir) subdir="$2" ;;
                     --entry) entry="$2" ;;
                     --package) package="$2" ;;
                     --timeout) limit="$2" ;;
+                    --bin) binaries+=("$2") ;;
                 esac
                 shift 2 ;;
             *) return 4 ;;
@@ -380,6 +442,37 @@ install_source_build() (
     case "$language" in rust|go|bun|typescript) ;; *) _isb_log "Unsupported source language: $language"; return 4 ;; esac
     [[ "$language" != rust || -z "$entry" ]] || { _isb_log 'Rust selects the configured binary, not --entry'; return 4; }
     [[ "$language" == rust || -z "$package" ]] || { _isb_log '--package is only supported for Rust'; return 4; }
+    ((${#binaries[@]})) || binaries=("$binary")
+    if [[ "$language" != rust && ${#binaries[@]} -gt 1 ]]; then
+        _isb_log 'Executable families are supported only for Rust source builds'
+        return 4
+    fi
+    local -A binary_keys=()
+    local -a binary_names=()
+    local selected key primary_name primary_index=-1 index=0 windows=false
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=true ;; esac
+    primary_name=$(_isb_binary_name "$binary") || return 4
+    for selected in "${binaries[@]}"; do
+        _isb_name "$selected" || { _isb_log "Unsafe executable name: $selected"; return 4; }
+        key="${selected,,}"
+        key="${key%.exe}"
+        if [[ -n "${binary_keys[$key]:-}" ]]; then
+            _isb_log "Duplicate or colliding executable name: $selected"
+            return 4
+        fi
+        binary_keys[$key]=1
+        selected=$(_isb_binary_name "$selected") || return 4
+        binary_names+=("$selected")
+        if [[ "$selected" == "$primary_name" ]] ||
+           { $windows && [[ "${selected,,}" == "${primary_name,,}" ]]; }; then
+            primary_index=$index
+        fi
+        index=$((index + 1))
+    done
+    if ((primary_index < 0)); then
+        _isb_log "Requested executable family must include primary binary: $binary"
+        return 4
+    fi
     local tool
     for tool in git jq ps; do
         command -v "$tool" >/dev/null 2>&1 || { _isb_log "Required source-build dependency missing: $tool"; return 3; }
@@ -398,7 +491,7 @@ install_source_build() (
     destination="$parent/$name"
     umask 077
     mkdir "$destination" || return 1
-    local tree="$destination/source" output="$destination/output" status=0 commit payload sha size receipt
+    local tree="$destination/source" output="$destination/output" status=0 commit payload sha size receipt payloads
     mkdir "$output" || return 1
     _isb_log "Fetching $repo at $ref into an isolated checkout"
     _isb_run "$limit" "$destination/fetch.log" _isb_checkout "$repo" "$ref" "$tree" || {
@@ -414,22 +507,40 @@ install_source_build() (
     _isb_path_in_tree "$tree" "$subdir" && [[ -d "$tree/$subdir" ]] || return 4
     local build_root
     build_root=$(cd "$tree/$subdir" && pwd -P) || return 4
-    _isb_log "Building $binary from pinned commit $commit ($language)"
-    payload=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit") || return $?
+    _isb_log "Building ${binary_names[*]} from pinned commit $commit ($language)"
+    payloads=$(_isb_compile "$language" "$build_root" "$output" "$binary" "$entry" "$package" "$limit" "${binaries[@]}") || return $?
     # Preserve the source pin through compilation. Build scripts may not move
     # HEAD or modify tracked inputs and then claim they built the pinned tree.
     [[ "$(_isb_git -C "$tree" rev-parse --verify 'HEAD^{commit}')" == "$commit" ]] || return 6
     _isb_git -C "$tree" diff --quiet HEAD -- || { _isb_log 'Build modified tracked source inputs'; return 6; }
-    [[ "$payload" == "$output/"* && "$payload" != *$'\n'* ]] || return 6
-    sha=$(_isb_sha256 "$payload") || return $?
-    size=$(wc -c < "$payload") || return 1
-    size="${size//[[:space:]]/}"
+    local -a binary_receipts=()
+    local primary_payload='' primary_sha='' primary_size='' binaries_json
+    index=0
+    while IFS= read -r payload; do
+        [[ $index -lt ${#binary_names[@]} && "$payload" == "$output/"* &&
+           "${payload##*/}" == "${binary_names[$index]}" ]] || return 6
+        _isb_path_in_tree "$output" "${payload#"$output"/}" || return 6
+        sha=$(_isb_sha256 "$payload") || return $?
+        size=$(wc -c < "$payload") || return 1
+        size="${size//[[:space:]]/}"
+        binary_receipts+=("$(jq -nc --arg name "${binary_names[$index]}" --arg path "$payload" \
+            --arg sha "$sha" --argjson size "$size" \
+            '{name:$name,path:$path,sha256:$sha,size_bytes:$size}')") || return 1
+        if ((index == primary_index)); then
+            primary_payload="$payload"; primary_sha="$sha"; primary_size="$size"
+        fi
+        index=$((index + 1))
+    done <<< "$payloads"
+    [[ $index -eq ${#binary_names[@]} && -n "$primary_payload" ]] || return 6
+    payload="$primary_payload"; sha="$primary_sha"; size="$primary_size"
+    binaries_json=$(printf '%s\n' "${binary_receipts[@]}" | jq -sc '.') || return 1
     receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
+        --argjson binaries "$binaries_json" \
         --arg compiler "$(cat "$output/compiler.log")" \
         '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
-          signed_release:false}') || return 1
+          binaries:$binaries,signed_release:false}') || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"

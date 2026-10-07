@@ -163,6 +163,8 @@ compiler_contracts() (
             link) ln -s "$base/tree/Cargo.toml" "$base/output/target/x86_64-test-linux-gnu/release/fixture" ;;
             *) printf 'fixture executable\n' > "$base/output/target/x86_64-test-linux-gnu/release/fixture" ;;
         esac
+        jq -nc --arg path "$base/output/target/x86_64-test-linux-gnu/release/fixture" \
+            '{reason:"compiler-artifact",package_id:"fixture-package",target:{name:"fixture",kind:["bin"]},executable:$path}'
     }
     bun() {
         printf '%s\n' "$@" >> "$base/bun.args"
