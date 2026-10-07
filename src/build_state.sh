@@ -684,9 +684,19 @@ build_state_update_target() {
       --arg target "$target" --arg status "$target_status" --arg now "$now" \
       --argjson extra "$extra_json" '
         .target_statuses = (.target_statuses // {}) |
+        (.target_statuses[$target] // {attempts: 0}) as $prior |
         .target_statuses[$target] =
-          ((.target_statuses[$target] // {attempts: 0}) + $extra +
+          ($prior + $extra +
            {status: $status, updated_at: $now}) |
+        # A source-sync failure reserves an immutable attempt receipt, but no
+        # compiler was admitted. Count each such attempt once so repairing a
+        # disconnected host does not exhaust its compiler retry allowance.
+        if $status == "failed" and $extra.result.stage == "source_sync" and
+           ($prior.status != "failed" or $prior.result.stage != "source_sync" or
+            $prior.attempts != $extra.attempts)
+        then .target_statuses[$target].source_sync_failures =
+          (($prior.source_sync_failures // 0) + 1)
+        else . end |
         .updated_at = $now'; then
     return 1
   fi
@@ -697,6 +707,7 @@ build_state_update_target() {
 # Bind a run to the inputs required for an honest resume.
 # Args: tool version run_id git_sha git_ref source_roots_json output_dir
 #       parallel_jobs target_hosts_json build_purpose build_tasks_json matrix_config_sha256
+#       source_sync_json
 build_state_set_context() {
   local tool="$1"
   local version="$2"
@@ -712,6 +723,7 @@ build_state_set_context() {
   local build_purpose="${10:-release}"
   [[ "$build_purpose" == "release" || "$build_purpose" == "diagnostic-native" ]] || return 1
   local build_tasks_json="${11:-}" native_matrix_config_sha256="${12:-}"
+  local source_sync_json="${13:-null}"
 
   local tool_dir state_file now
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
@@ -742,6 +754,8 @@ build_state_set_context() {
   fi
   jq -e 'type == "object"' <<< "$source_roots_json" &>/dev/null || return 1
   jq -e 'type == "object"' <<< "$target_hosts_json" &>/dev/null || return 1
+  jq -es 'length == 1 and (.[0] == null or (.[0] | type == "object"))' \
+    <<< "$source_sync_json" &>/dev/null || return 1
   [[ "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || return 1
   now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -749,6 +763,7 @@ build_state_set_context() {
     --arg sha "$git_sha" --arg ref "$git_ref" \
     --argjson source_roots "$source_roots_json" \
     --argjson target_hosts "$target_hosts_json" \
+    --argjson source_sync "$source_sync_json" \
     --arg build_purpose "$build_purpose" \
     --argjson build_tasks "$build_tasks_json" \
     --arg native_matrix_config_sha256 "$native_matrix_config_sha256" \
@@ -761,6 +776,7 @@ build_state_set_context() {
         publishable: ($build_purpose == "release"),
         source_roots: $source_roots,
         target_hosts: $target_hosts,
+        source_sync: $source_sync,
         build_tasks: $build_tasks,
         native_matrix_config_sha256: $native_matrix_config_sha256,
         output_dir: $output_dir,
@@ -768,7 +784,45 @@ build_state_set_context() {
       } |
       .target_statuses = (reduce $build_tasks[] as $task ({};
         .[$task.key] = {status: "pending", attempts: 0})) |
+      .source_sync_history = (if $source_sync == null then []
+        else [{recorded_at: $now, receipt: $source_sync}] end) |
       .updated_at = $now'
+}
+
+# Refresh an ordinary run's sync admission evidence without changing completed
+# targets or their attempt receipts. The coordinator validates the receipt and
+# holds the orchestration lock. A null receipt records an explicit sync opt-out.
+# Args: tool version run_id source_sync_json source_roots_json target_hosts_json
+build_state_set_source_sync() {
+  local tool="$1" version="$2" run_id="$3" source_sync_json="$4"
+  local source_roots_json="$5" target_hosts_json="$6" tool_dir state_file now
+  if ! jq -en --argjson receipt "$source_sync_json" \
+      --argjson roots "$source_roots_json" --argjson hosts "$target_hosts_json" '
+        ($receipt == null or ($receipt | type == "object")) and
+        ($roots | type == "object") and all($roots[]; type == "string" and length > 0) and
+        ($hosts | type == "object") and all($hosts[]; type == "string" and length > 0) and
+        ($receipt == null or ($receipt.source_roots == $roots and $receipt.target_hosts == $hosts))
+      ' >/dev/null 2>&1; then
+    log_error "Invalid source-sync context for run $run_id"
+    return 1
+  fi
+  tool_dir=$(_build_get_tool_dir "$tool" "$version")
+  state_file="$tool_dir/$run_id/state.json"
+  [[ -f "$state_file" ]] || return 1
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  _build_state_jq_update "$state_file" \
+    --argjson source_sync "$source_sync_json" --argjson roots "$source_roots_json" \
+    --argjson hosts "$target_hosts_json" --arg now "$now" '
+      if .status == "completed" or .status == "cancelled"
+      then error("cannot refresh source sync for a terminal run")
+      else
+        .context.source_sync = $source_sync |
+        .context.source_roots = $roots |
+        .context.target_hosts = $hosts |
+        .source_sync_history = ((.source_sync_history // []) +
+          [{recorded_at: $now, receipt: $source_sync}]) |
+        .updated_at = $now
+      end'
 }
 
 # Atomically replace only a failed target's host binding, preserving its attempt
@@ -1333,7 +1387,9 @@ build_state_resume() {
        (all(.hosts[]; type == "object" and valid_status and valid_counter("retry_count")) | not) or
        (.target_statuses != null and (.target_statuses | type) != "object") or
        (all((.target_statuses // {})[];
-         type == "object" and valid_status and valid_counter("attempts")) | not) or
+         type == "object" and valid_status and valid_counter("attempts") and
+         valid_counter("source_sync_failures") and
+         (counter("source_sync_failures") <= counter("attempts"))) | not) or
        (tasks | type) != "array" or
        ([tasks[].key] | unique | length) != (tasks | length) or
        (all(tasks[]; (.key | type == "string" and length > 0) and
@@ -1372,7 +1428,8 @@ build_state_resume() {
       ($s.target_statuses[$target] // {}) as $entry |
       if ($entry.status == "completed" and ($entry.result | type) == "object" and
           ($entry.result | length) > 0) then .completed += [$target]
-      elif (($entry | counter("attempts")) >= $retry_max) then .exceeded += [$target]
+      elif (($entry | counter("attempts") - counter("source_sync_failures")) >= $retry_max)
+      then .exceeded += [$target]
       else .retryable += [$target] end
     )) as $target_plan |
     {

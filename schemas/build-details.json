@@ -40,6 +40,10 @@
     "parallel_builds": {
       "type": "boolean",
       "description": "Whether builds ran in parallel"
+    },
+    "source_sync": {
+      "type": ["object", "null"],
+      "description": "Complete ordinary source synchronization receipt, including host/path bindings and failed transfers; null when synchronization was bypassed or the build used strict snapshots"
     }
   },
   "$defs": {
@@ -104,6 +108,22 @@
         "error": {
           "type": "string",
           "description": "Error message if failed"
+        },
+        "stage": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Failure stage; source_sync means no compiler or capacity slot was started"
+        },
+        "source_sync": {
+          "type": "object",
+          "required": ["host", "path", "status"],
+          "properties": {
+            "host": {"type": "string", "minLength": 1},
+            "path": {"type": "string", "minLength": 1},
+            "status": {"enum": ["success", "failed"]},
+            "error": {"type": "string"}
+          },
+          "description": "Original synchronization receipt for this target's selected host"
         },
         "retry_count": {
           "type": "integer",

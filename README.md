@@ -449,6 +449,16 @@ Parallel builds keep attempt-scoped logs and results per target. A partial run
 preserves verified completed artifacts; resume retries only incomplete targets.
 The authoritative manifest is withheld until every requested target succeeds.
 
+Ordinary builds retain each host's source-sync result and build from the path
+that was successfully synced. Rsync compares file contents so equal sizes and
+timestamps cannot hide source edits. If a transfer fails, that host's unfinished
+native targets fail at the `source_sync` stage before acquiring a build slot
+or launching a compiler. Other synced hosts can continue. Repair the connection
+and use `--resume` to sync again and retry the blocked targets; verified
+completed artifacts remain reusable, and sync failures do not consume compiler
+retries. `--sync-only` exits 1 if any host fails. Use `--no-sync` when you manage
+the remote sources separately; it explicitly bypasses the sync gate on resume.
+
 A failed strict native target can move to another configured host during an
 explicit resume, after the original controller has released its build lock:
 

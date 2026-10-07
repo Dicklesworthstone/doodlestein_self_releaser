@@ -804,7 +804,7 @@ test_state_evidence_rejection() {
 
 test_resume_single_snapshot_after_latest_moves() {
   seed_resume_fixture moving-latest linux/amd64 || return 1
-  local first_state="$RESUME_STATE_FILE" second_state old_get calls="$TEMP_DIR/resume-read.calls"
+  local first_state="$RESUME_STATE_FILE" second_state calls="$TEMP_DIR/resume-read.calls"
   _build_state_jq_update "$first_state" '
     .hosts = {trj:{status:"failed",retry_count:1}} |
     .context = {target_hosts:{"linux/amd64":"trj"}, marker:"first"} |
@@ -814,12 +814,16 @@ test_resume_single_snapshot_after_latest_moves() {
   _build_state_jq_update "$second_state" '
     .hosts = {mmini:{status:"completed"}} | .context = {marker:"second"}' || return 1
   ln -sfn moving-latest-run "$_BUILD_STATE_DIR/moving-latest/v1.0.0/latest"
-  old_get=$(declare -f build_state_get)
-  # Preserve the real reader and move latest only after it returns its snapshot.
-  eval "${old_get/build_state_get ()/saved_build_state_get ()}"
+  # Load the real reader in a subshell, preserving this observation wrapper
+  # without evaluating a rewritten function body. Move latest after the read.
   build_state_get() {
     local value
-    value=$(saved_build_state_get "$@") || return 1
+    value=$(
+      # shellcheck source=../../src/build_state.sh
+      source "$PROJECT_ROOT/src/build_state.sh"
+      build_state_init || exit 1
+      build_state_get "$@"
+    ) || return 1
     printf 'read\n' >> "$calls"
     ln -sfn second-run "$_BUILD_STATE_DIR/moving-latest/v1.0.0/latest"
     printf '%s\n' "$value"
@@ -865,6 +869,10 @@ test_resume_rejects_malformed_inventory() {
     '.hosts.trj = {status:"running",retry_count:null}' \
     '.hosts.trj = {status:"mystery"}' '.target_statuses["linux/amd64"].attempts = 1.5' \
     '.target_statuses["linux/amd64"].attempts = false' '.target_statuses.other = {}' \
+    '.target_statuses["linux/amd64"].source_sync_failures = -1' \
+    '.target_statuses["linux/amd64"].source_sync_failures = "0"' \
+    '.target_statuses["linux/amd64"].source_sync_failures = 1.5' \
+    '.target_statuses["linux/amd64"].source_sync_failures = 99' \
     '.context = []' '.context.target_hosts = {"linux/amd64":null}'; do
     jq "$filter" <<< "$original" > "$RESUME_STATE_FILE" || return 1
     status=0
@@ -1096,6 +1104,85 @@ test_native_matrix_resume_tasks() {
   ! build_state_resume matrix-state v1.0.0 "$run_id" >/dev/null 2>&1
 }
 
+test_source_sync_context_refresh() {
+  local run_id partial repaired roots hosts before after
+  run_id=$(build_state_create sync-context v1.0.0 linux/amd64,linux/arm64) || return 1
+  hosts='{"linux/amd64":"healthy","linux/arm64":"offline"}'
+  roots='{"healthy":"/work/healthy"}'
+  partial=$(jq -nc --argjson hosts "$hosts" --argjson roots "$roots" '
+    {status:"partial",synced:1,failed:1,target_hosts:$hosts,source_roots:$roots,
+     hosts:[{host:"healthy",path:"/work/healthy",status:"success"},
+       {host:"offline",path:"/work/offline",status:"failed",error:"disconnected"}]}') || return 1
+  build_state_set_context sync-context v1.0.0 "$run_id" commit main "$roots" /output 2 \
+    "$hosts" release '' '' "$partial" || return 1
+  build_state_update_target sync-context v1.0.0 linux/amd64 completed \
+    '{"attempts":1,"result":{"status":"success","artifact_path":"/output/retained"}}' "$run_id" || return 1
+  build_state_update_status sync-context v1.0.0 partial "$run_id" || return 1
+  before=$(build_state_get sync-context v1.0.0 "$run_id") || return 1
+  roots='{"healthy":"/work/healthy","offline":"/work/offline"}'
+  repaired=$(jq -c --argjson roots "$roots" '
+    .status = "success" | .synced = 2 | .failed = 0 | .source_roots = $roots |
+    .hosts[1].status = "success" | del(.hosts[1].error)' <<< "$partial") || return 1
+  if build_state_set_source_sync sync-context v1.0.0 "$run_id" "$repaired" '{}' "$hosts" \
+      2>/dev/null; then return 1; fi
+  [[ "$(build_state_get sync-context v1.0.0 "$run_id")" == "$before" ]] || return 1
+  build_state_set_source_sync sync-context v1.0.0 "$run_id" "$repaired" "$roots" "$hosts" || return 1
+  after=$(build_state_get sync-context v1.0.0 "$run_id") || return 1
+  jq -en --argjson before "$before" --argjson after "$after" --argjson repaired "$repaired" '
+    $after.context.source_sync == $repaired and
+    $after.target_statuses == $before.target_statuses and
+    $after.context.output_dir == $before.context.output_dir and
+    ($after.source_sync_history | length) == 2 and
+    $after.source_sync_history[0].receipt == $before.context.source_sync and
+    $after.source_sync_history[1].receipt == $repaired' >/dev/null || return 1
+  build_state_set_source_sync sync-context v1.0.0 "$run_id" null "$roots" "$hosts" || return 1
+  build_state_get sync-context v1.0.0 "$run_id" | jq -e --argjson roots "$roots" --argjson hosts "$hosts" '
+    .context.source_sync == null and .context.source_roots == $roots and
+    .context.target_hosts == $hosts and (.source_sync_history | length) == 3 and
+    .source_sync_history[-1].receipt == null and .target_statuses["linux/amd64"].attempts == 1' \
+    >/dev/null || return 1
+  build_state_update_status sync-context v1.0.0 completed "$run_id" || return 1
+  before=$(build_state_get sync-context v1.0.0 "$run_id") || return 1
+  if build_state_set_source_sync sync-context v1.0.0 "$run_id" "$repaired" "$roots" "$hosts" \
+      2>/dev/null; then return 1; fi
+  [[ "$(build_state_get sync-context v1.0.0 "$run_id")" == "$before" ]]
+}
+
+test_source_sync_compiler_retry_budget() {
+  local run_id attempt extra plan
+  local BUILD_RETRY_MAX=3
+  run_id=$(build_state_create sync-budget v1.0.0 linux/amd64) || return 1
+  build_state_set_context sync-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' || return 1
+  build_state_update_status sync-budget v1.0.0 failed "$run_id" || return 1
+  for attempt in 1 2 3 4; do
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{status:"failed",stage:"source_sync",attempt:$attempt}}') || return 1
+    build_state_update_target sync-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    # Re-recording a failed receipt cannot mint another compiler retry.
+    build_state_update_target sync-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+  done
+  plan=$(build_state_resume sync-budget v1.0.0 "$run_id") || return 1
+  jq -e '.targets_to_process == ["linux/amd64"] and .exceeded_target_retry_limit == []' \
+    <<< "$plan" >/dev/null || return 1
+  build_state_get sync-budget v1.0.0 "$run_id" | jq -e '
+    .target_statuses["linux/amd64"].attempts == 4 and
+    .target_statuses["linux/amd64"].source_sync_failures == 4' >/dev/null || return 1
+  for attempt in 5 6 7; do
+    extra=$(jq -nc --argjson attempt "$attempt" '{attempts:$attempt,result:null}') || return 1
+    build_state_update_target sync-budget v1.0.0 linux/amd64 running "$extra" "$run_id" || return 1
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{status:"failed",stage:"build",attempt:$attempt}}') || return 1
+    build_state_update_target sync-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume sync-budget v1.0.0 "$run_id") || return 1
+    if ((attempt < 7)); then
+      jq -e '.targets_to_process == ["linux/amd64"]' <<< "$plan" >/dev/null || return 1
+    else
+      jq -e '.targets_to_process == [] and .exceeded_target_retry_limit == ["linux/amd64"]' \
+        <<< "$plan" >/dev/null || return 1
+    fi
+  done
+}
+
 # Cleanup
 cleanup() {
   if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
@@ -1171,6 +1258,8 @@ run_state_regression "resume uses one checkpoint even when latest moves mid-read
 run_state_regression "resume maps real hosts and rejects empty target completion evidence" test_resume_host_routing_and_target_evidence
 run_state_regression "resume rejects malformed target/host inventories and counters" test_resume_rejects_malformed_inventory
 run_state_regression "native variant checkpoints resume only failed tasks and reject duplicate identities" test_native_matrix_resume_tasks
+run_state_regression "source-sync refresh preserves completed artifacts and records repair/opt-out history" test_source_sync_context_refresh
+run_state_regression "source-sync failures preserve the compiler retry allowance without double counting" test_source_sync_compiler_retry_budget
 run_state_regression "generic retry rejects zero or invalid budgets before execution" test_retry_budget_validation
 run_state_regression "exponential retry backoff never exceeds its cap or overflows" test_retry_backoff_is_bounded
 run_state_regression "missing or invalid saved retry budgets cannot launch commands" test_retry_unreadable_budget_blocks_execution

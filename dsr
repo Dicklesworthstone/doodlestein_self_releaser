@@ -2201,6 +2201,9 @@ DESCRIPTION:
     Before building on remote hosts (macOS/Windows), source code is
     automatically synced via rsync. Use --no-sync to skip this step
     if you manage sync separately, or --sync-only to sync without building.
+    A failed sync blocks that host's unfinished native targets; other
+    synced hosts can build. Resume resyncs and retains verified completed
+    artifacts. --sync-only returns nonzero if any host fails to sync.
 
 TARGETS:
     Configured per tool in ~/.config/dsr/repos.d/<tool>.yaml
@@ -2773,9 +2776,9 @@ EOF
         fi
 
         log_info "Syncing source to remote build hosts..."
-        local sync_output sync_json sync_status sync_detail
+        local sync_output sync_json sync_status sync_detail sync_exit=0
         # shellcheck disable=SC2086
-        sync_output=$(act_sync_sources "$tool_name" "${build_sync_args[@]}" $target_list 2>&1)
+        sync_output=$(act_sync_sources "$tool_name" "${build_sync_args[@]}" $target_list 2>&1) || sync_exit=$?
         sync_json=$(printf '%s\n' "$sync_output" | grep '^{' | tail -1)
         # Everything that is not the structured summary is the sync transcript
         # (module logs plus the underlying rsync/ssh/tar diagnostics). It must
@@ -2785,41 +2788,64 @@ EOF
             sync_status="unknown"
         fi
 
-        if [[ "$sync_status" == "success" || "$sync_status" == "skipped" ]]; then
-            local synced
-            synced=$(jq -r '.synced // 0' <<< "$sync_json" 2>/dev/null || echo 0)
-            if [[ "$synced" -gt 0 ]]; then
-                log_ok "Source synced to $synced host(s)"
+        # Both the command result and the host receipt must agree. A success
+        # string alone cannot authorize builds after a failed transfer.
+        local sync_receipt_valid=true
+        case "$sync_status:$sync_exit" in
+            success:0|skipped:0|partial:1|failed:1) ;;
+            *) sync_receipt_valid=false ;;
+        esac
+        if ! $build_release_contract_enabled && $sync_receipt_valid; then
+            local sync_tasks_json='[]' sync_method
+            for target in $target_list; do
+                sync_method=native
+                if act_platform_uses_act "$tool_name" "$target"; then sync_method=act; fi
+                sync_tasks_json=$(jq -c --arg platform "$target" --arg method "$sync_method" \
+                    '. + [{platform: $platform, method: $method}]' <<< "$sync_tasks_json") || return 4
+            done
+            if ! sync_json=$(_act_validate_source_sync_receipt "$sync_json" "$sync_tasks_json"); then
+                sync_receipt_valid=false
             fi
-        elif [[ "$sync_status" == "partial" ]]; then
+        fi
+        if ! $sync_receipt_valid; then
             [[ -n "$sync_detail" ]] && printf '%s\n' "$sync_detail" >&2
-            if $build_release_contract_enabled; then
-                log_error "Strict source sync was incomplete"
-                return 1
-            fi
-            log_warn "Some hosts failed to sync - builds may fail"
-        else
-            [[ -n "$sync_detail" ]] && printf '%s\n' "$sync_detail" >&2
-            log_error "Source sync failed"
+            log_error "Source sync failed or returned incomplete host evidence"
             if $JSON_MODE; then
                 local sync_error_json
                 if ! sync_error_json=$(jq -nc \
-                    --arg error "Source sync failed" \
+                    --arg error "Source sync failed or returned incomplete host evidence" \
                     --argjson sync "${sync_json:-null}" \
-                    '{error: $error, sync: $sync}' 2>/dev/null); then
-                    sync_error_json='{"error":"Source sync failed"}'
+                    --argjson exit_code "$sync_exit" \
+                    '{error: $error, sync: $sync, sync_exit_code: $exit_code}' 2>/dev/null); then
+                    sync_error_json='{"error":"Source sync failed or returned incomplete host evidence"}'
                 fi
                 json_envelope "build" "error" 1 "$sync_error_json"
             fi
             return 1
         fi
 
-        if ! $build_release_contract_enabled; then
-            # The hosts the source was synced to are where it must build.
-            local ordinary_target_hosts_json
-            if ordinary_target_hosts_json=$(jq -ce '.target_hosts | objects' <<< "$sync_json" 2>/dev/null); then
-                build_source_args+=(--target-hosts-json "$ordinary_target_hosts_json")
+        if [[ "$sync_status" == "success" || "$sync_status" == "skipped" ]]; then
+            local synced
+            synced=$(jq -r '.synced // 0' <<< "$sync_json" 2>/dev/null || echo 0)
+            if [[ "$synced" -gt 0 ]]; then
+                log_ok "Source synced to $synced host(s)"
             fi
+        else
+            [[ -n "$sync_detail" ]] && printf '%s\n' "$sync_detail" >&2
+            if $build_release_contract_enabled; then
+                log_error "Strict source sync was incomplete"
+                if $JSON_MODE; then
+                    json_envelope "build" "error" 1 "$sync_json"
+                fi
+                return 1
+            fi
+            log_warn "Source sync failed on some hosts; their unfinished native targets will be blocked"
+        fi
+
+        if ! $build_release_contract_enabled; then
+            # Retain failure evidence as well as successful host/path bindings.
+            # The coordinator persists blocked targets before any compilation.
+            build_source_args+=(--source-sync-json "$sync_json")
         fi
         if $build_release_contract_enabled; then
             build_target_hosts_json=$(jq -ce '.target_hosts | objects' <<< "$sync_json") || return 4
@@ -2844,6 +2870,15 @@ EOF
 
         # If --sync-only, we're done
         if $sync_only; then
+            if [[ "$sync_status" == "partial" || "$sync_status" == "failed" ]]; then
+                log_error "Source sync was incomplete (--sync-only mode)"
+                if $JSON_MODE; then
+                    local sync_envelope_status=error
+                    [[ "$sync_status" == "partial" ]] && sync_envelope_status=partial
+                    json_envelope "build" "$sync_envelope_status" 1 "$sync_json"
+                fi
+                return 1
+            fi
             log_ok "Sync completed (--sync-only mode)"
             if $JSON_MODE; then
                 json_envelope "build" "success" 0 "$sync_json"
@@ -2852,8 +2887,11 @@ EOF
         fi
     fi
 
+    if $no_sync; then
+        build_source_args+=(--no-source-sync-gate)
+    fi
     if $resume && ! $build_release_contract_enabled; then
-        build_source_args=(--git-sha "$build_source_sha" --git-ref "$build_source_ref")
+        build_source_args+=(--git-sha "$build_source_sha" --git-ref "$build_source_ref")
     fi
 
     # Record start time
@@ -4430,6 +4468,9 @@ EOF
             + (if (.artifact_paths | type) == "array" then {artifact_paths} else {} end)
             + (if (.target_triple | type) == "string" then {target_triple} else {} end)
             + (if (.task_key | type) == "string" then {task_key} else {} end)
+            + (if (.stage | type) == "string" then {stage} else {} end)
+            + (if (.source_sync | type) == "object" then {source_sync} else {} end)
+            + (if (.log_path | type) == "string" then {log_path} else {} end)
             + (if (.error | type) == "string" then {error} else {} end)
             + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \
             <<< "$result" 2>/dev/null) || target_results_json='[]'
@@ -4437,11 +4478,13 @@ EOF
             --arg tool "$tool_name" --arg version "$version" --arg repo "$build_repo" \
             --arg build_purpose "$build_purpose" --arg targets "$target_list" \
             --argjson results "$target_results_json" --arg run_id "$result_run_id" \
+            --argjson source_sync "$(jq -c '.source_sync // null' <<< "$result")" \
             --argjson total "$total" --argjson success "$success" --argjson failed "$failed" \
             --argjson duration "$duration" --arg output_dir "$output_dir" \
             --arg manifest "$authoritative_manifest" '
             {tool: $tool, repo: $repo, version: $version, build_purpose: $build_purpose,
              publishable: ($build_purpose == "release"), run_id: $run_id,
+             source_sync: $source_sync,
              targets: [($targets | split(" ") | map(select(length > 0)))[] as $platform |
                  ($results | map(select(.platform == $platform))) as $matches |
                  if ($matches | length) > 0 then $matches[]

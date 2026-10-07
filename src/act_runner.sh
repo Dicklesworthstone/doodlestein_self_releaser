@@ -3727,7 +3727,10 @@ _act_sync_source() {
 
         mkdir -p "$remote_path"
         local sync_cmd_output sync_cmd_status
-        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+        # Equal size and timestamp do not prove equal source bytes (for
+        # example, rapid checkouts or restored timestamps). A successful sync
+        # must replace those stale files before the host becomes buildable.
+        sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --checksum --delete \
             "${exclude_args[@]}" \
             "$local_path/" "$remote_path/" 2>&1)
         sync_cmd_status=$?
@@ -3778,7 +3781,7 @@ _act_sync_source() {
             sync_attempts=3
         fi
         for (( sync_attempt = 1; sync_attempt <= sync_attempts; sync_attempt++ )); do
-            sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --delete \
+            sync_cmd_output=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" rsync -az --checksum --delete \
                 "${rsync_io_opts[@]}" \
                 "${exclude_args[@]}" \
                 -e "$rsync_transport" \
@@ -7195,6 +7198,7 @@ _act_validate_native_target_command() {
 # Run native build on remote host via SSH
 # Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
 #        [remote_path_override] [release_git_sha] [release_git_ref] [bound_host]
+#        [selected_triple] [ordinary_source_root]
 # Returns: JSON result with status, exit_code, artifact info
 # Remove a per-target build stage root (dsr-build-*) on its host. rm -rf /
 # rmdir do not follow the cargo cache symlinks/junctions inside. Honors
@@ -7252,6 +7256,13 @@ act_run_native_build() {
     local release_git_ref="${7:-}"
     local bound_host="${8:-}"
     local selected_triple="${9:-}"
+    local ordinary_source_root="${10:-}"
+
+    if [[ -n "$ordinary_source_root" &&
+          ( -n "$remote_path_override" || -n "$release_git_sha" || -n "$release_git_ref" || -z "$bound_host" ) ]]; then
+        _log_error "Ordinary synchronized source roots cannot replace strict snapshot identity"
+        return 4
+    fi
 
     # A strict identity must never degrade to ordinary staging when a source
     # binding is absent. Check before configuration, SSH, or filesystem work.
@@ -7411,7 +7422,7 @@ act_run_native_build() {
 
     # Determine remote path (check host_paths.<host> first, fallback to local_path)
     local remote_path
-    remote_path="$remote_path_override"
+    remote_path="${remote_path_override:-$ordinary_source_root}"
     if [[ -z "$remote_path" ]]; then
         remote_path=$(yq -r '.host_paths.'"$host"' // ""' "$config_file" 2>/dev/null)
         if [[ -z "$remote_path" ]]; then
@@ -9169,7 +9180,7 @@ _act_build_orchestration_target() {
     local bound_host="${10:-}"
     local selected_triple="${11:-}"
 
-    local host="${bound_host:-act-local}" remote_path_override=""
+    local host="${bound_host:-act-local}" remote_path_override="" ordinary_source_root=""
     if [[ "$strict_release_contract" == "true" ]]; then
         if [[ -z "$bound_host" ]] || ! remote_path_override=$(jq -er --arg host "$bound_host" \
             '.[$host] | strings | select(length > 0)' <<< "$source_roots_json"); then
@@ -9179,6 +9190,9 @@ _act_build_orchestration_target() {
         fi
     elif [[ -z "$bound_host" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
         host=$(act_get_native_host "$target" "$tool_name")
+    fi
+    if [[ "$strict_release_contract" != "true" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
+        ordinary_source_root=$(jq -r --arg host "$host" '.[$host] // empty' <<< "$source_roots_json") || return 4
     fi
     # Ordinary run provenance is not a strict snapshot identity. Only strict
     # callers may pass these values to the native snapshot boundary.
@@ -9234,7 +9248,7 @@ _act_build_orchestration_target() {
         _log_info "Method: native (host=$host)"
         full_output=$(act_run_native_build \
             "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" \
-            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" 2>&1) || exit_code=$?
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" "$ordinary_source_root" 2>&1) || exit_code=$?
         [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
         result=$(printf '%s\n' "$full_output" | grep '^{' | tail -1)
         if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
@@ -9310,8 +9324,11 @@ _act_native_output_paths() {
     if [[ "$strict" == true ]]; then
         remote_path=$(jq -r --arg host "$host" '.[$host] // ""' <<< "$source_roots_json" 2>/dev/null) || return 0
     else
-        remote_path=$(DSR_OUTPUT_HOST="$host" yq -r '.host_paths[strenv(DSR_OUTPUT_HOST)] // ""' \
-            "$config_file" 2>/dev/null) || remote_path=""
+        remote_path=$(jq -r --arg host "$host" '.[$host] // ""' <<< "$source_roots_json" 2>/dev/null) || return 0
+        if [[ -z "$remote_path" ]]; then
+            remote_path=$(DSR_OUTPUT_HOST="$host" yq -r '.host_paths[strenv(DSR_OUTPUT_HOST)] // ""' \
+                "$config_file" 2>/dev/null) || remote_path=""
+        fi
         [[ "$remote_path" == null ]] && remote_path=""
         [[ -n "$remote_path" ]] || remote_path=$(act_get_local_path "$tool_name" 2>/dev/null) || return 0
     fi
@@ -9345,6 +9362,8 @@ _act_run_target_worker() {
     local bound_host="${13:-}"
     local build_purpose="${14:-release}"
     local selected_triple="${15:-}" task_key="${16:-$target}"
+    local source_sync_receipt="${17:-}"
+    [[ -n "$source_sync_receipt" ]] || source_sync_receipt=null
 
     local host="${bound_host:-act-local}"
     local slot_task="${task_key//\//-}"
@@ -9356,7 +9375,9 @@ _act_run_target_worker() {
         local body="$1"
         # Never trust build-command stdout to classify an artifact for publication.
         body=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
-            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
+            --argjson source_sync "$source_sync_receipt" \
+            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key} |
+             if $source_sync == null then . else .source_sync = $source_sync end' \
             <<< "$body") || return 4
         (
             umask 077
@@ -9374,6 +9395,19 @@ _act_run_target_worker() {
 
     if [[ -z "$bound_host" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
         host=$(act_get_native_host "$target" "$tool_name")
+    fi
+
+    if [[ "$source_sync_receipt" != null ]] &&
+       [[ "$(jq -r '.status' <<< "$source_sync_receipt")" != success ]]; then
+        local source_failure
+        source_failure=$(jq -nc --arg target "$target" --arg host "$host" \
+            --arg triple "$selected_triple" --argjson sync "$source_sync_receipt" \
+            '{platform:$target, host:$host, method:"native", status:"failed", exit_code:1,
+              stage:"source_sync", target_triple:(if $triple == "" then null else $triple end),
+              error:("Source synchronization failed for " + $host + ": " + ($sync.error // "transfer failed"))}') || return 4
+        jq -r '.error' <<< "$source_failure" >> "$log_path"
+        _act_write_worker_result "$source_failure" || return 4
+        return 1
     fi
 
     # The native runner deliberately names its log with the immutable source
@@ -9666,6 +9700,42 @@ _act_relocate_failed_target() {
     build_state_get "$tool" "$version" "$run_id"
 }
 
+# Ordinary synchronization selects the hosts and paths a build may use. It is
+# not a source-content attestation: a failed transfer must never authorize a
+# worker merely because an older checkout is still present at that path.
+_act_validate_source_sync_receipt() {
+    local receipt="$1" build_tasks="$2"
+    jq -sce --argjson tasks "$build_tasks" '
+      def text: type == "string" and length > 0 and (test("[[:cntrl:]]") | not);
+      def host: type == "string" and test("^[A-Za-z0-9_-]+$");
+      select(length == 1) | .[0] |
+      . as $receipt |
+      ([$tasks[] | select(.method == "native") | .platform] | unique | sort) as $native |
+      select(type == "object") |
+      select(.target_hosts | type == "object") |
+      select((.target_hosts | keys | sort) == $native) |
+      select(all(.target_hosts[]; host)) |
+      ([.target_hosts[]] | unique | sort) as $expected |
+      select(.hosts | type == "array") |
+      select(all(.hosts[]; type == "object" and (.host | host) and (.path | text) and
+        (.status == "success" or .status == "failed") and
+        (if has("error") then .error | type == "string" else true end))) |
+      select(([.hosts[].host] | sort) == $expected) |
+      select(.source_roots | type == "object") |
+      select(all(.source_roots[]; text)) |
+      select(.source_roots == ([.hosts[] | select(.status == "success") |
+        {key:.host, value:.path}] | from_entries)) |
+      ([.hosts[] | select(.status == "success")] | length) as $success |
+      ([.hosts[] | select(.status == "failed")] | length) as $failed |
+      select(.synced == $success and (.failed // 0) == $failed) |
+      select(if ($expected | length) == 0 then .status == "skipped"
+        elif $failed == 0 then .status == "success"
+        elif $success == 0 then .status == "failed"
+        else .status == "partial" end) |
+      $receipt
+    ' <<< "$receipt"
+}
+
 act_orchestrate_build() {
     local tool_name="$1"
     local version="$2"
@@ -9674,6 +9744,7 @@ act_orchestrate_build() {
     local supplied_git_sha="" supplied_git_ref=""
     local supplied_run_id="" source_roots_json="{}"
     local target_hosts_json='{}'
+    local source_sync_json="" source_sync_supplied=false no_source_sync_gate=false
     local parallel_jobs=1 resume_run=false supplied_output_dir=""
     local resume_target_host=""
     local resume_target_host_approval=""
@@ -9709,6 +9780,16 @@ act_orchestrate_build() {
                 [[ $# -ge 2 ]] || { _log_error "--target-hosts-json requires a value"; return 4; }
                 target_hosts_json="$2"
                 shift 2
+                ;;
+            --source-sync-json)
+                [[ $# -ge 2 && "$source_sync_supplied" == false ]] || { _log_error "--source-sync-json requires one receipt"; return 4; }
+                source_sync_json="$2"
+                source_sync_supplied=true
+                shift 2
+                ;;
+            --no-source-sync-gate)
+                no_source_sync_gate=true
+                shift
                 ;;
             --parallel-jobs)
                 [[ $# -ge 2 ]] || { _log_error "--parallel-jobs requires a value"; return 4; }
@@ -9846,6 +9927,27 @@ act_orchestrate_build() {
     if jq -e 'any(.[]; .key != .platform)' <<< "$build_tasks_json" >/dev/null; then
         native_matrix_config_sha256=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
         [[ "$native_matrix_config_sha256" =~ ^[0-9a-f]{64}$ ]] || return 4
+    fi
+
+    if $no_source_sync_gate && { $strict_release_contract || $source_sync_supplied; }; then
+        _log_error "Source synchronization opt-out cannot accompany a receipt or strict release"
+        return 4
+    fi
+    if $source_sync_supplied; then
+        if $strict_release_contract ||
+           ! source_sync_json=$(_act_validate_source_sync_receipt "$source_sync_json" "$build_tasks_json"); then
+            _log_error "Invalid or incomplete ordinary source synchronization receipt"
+            return 4
+        fi
+        if { [[ "$target_hosts_json" != '{}' ]] &&
+             [[ "$(jq -cS . <<< "$target_hosts_json")" != "$(jq -cS '.target_hosts' <<< "$source_sync_json")" ]]; } ||
+           { [[ "$source_roots_json" != '{}' ]] &&
+             [[ "$(jq -cS . <<< "$source_roots_json")" != "$(jq -cS '.source_roots' <<< "$source_sync_json")" ]]; }; then
+            _log_error "Source synchronization receipt conflicts with explicit host or path bindings"
+            return 4
+        fi
+        target_hosts_json=$(jq -c '.target_hosts' <<< "$source_sync_json") || return 4
+        source_roots_json=$(jq -c '.source_roots' <<< "$source_sync_json") || return 4
     fi
 
     _log_info "Orchestrating build for $tool_name $version"
@@ -10104,6 +10206,40 @@ act_orchestrate_build() {
                 source_roots_json=$(jq -c '.context.source_roots' <<< "$resume_state")
                 target_hosts_json=$(jq -c '.context.target_hosts' <<< "$resume_state")
             fi
+            if ! $strict_release_contract; then
+                if ! $source_sync_supplied; then
+                    # A retry uses the original source locations unless a new
+                    # complete synchronization receipt selects replacements.
+                    if ! target_hosts_json=$(jq -c '.context.target_hosts // {}' <<< "$resume_state") ||
+                       ! source_roots_json=$(jq -c '.context.source_roots // {}' <<< "$resume_state"); then
+                        _act_release_orchestration_lock
+                        return 4
+                    fi
+                    if ! $no_source_sync_gate; then
+                        if ! source_sync_json=$(jq -c '.context.source_sync // null' <<< "$resume_state"); then
+                            _act_release_orchestration_lock
+                            return 4
+                        fi
+                        if [[ "$source_sync_json" == null ]]; then
+                            source_sync_json=""
+                        elif ! source_sync_json=$(_act_validate_source_sync_receipt "$source_sync_json" "$build_tasks_json") ||
+                             [[ "$(jq -cS '.target_hosts' <<< "$source_sync_json")" != "$(jq -cS . <<< "$target_hosts_json")" ]] ||
+                             [[ "$(jq -cS '.source_roots' <<< "$source_sync_json")" != "$(jq -cS . <<< "$source_roots_json")" ]]; then
+                            _log_error "Saved source synchronization receipt or bindings are invalid"
+                            _act_release_orchestration_lock
+                            return 4
+                        fi
+                    fi
+                fi
+                if $source_sync_supplied || $no_source_sync_gate; then
+                    if ! build_state_set_source_sync "$tool_name" "$version" "$run_id" \
+                        "${source_sync_json:-null}" "$source_roots_json" "$target_hosts_json"; then
+                        _log_error "Could not retain resumed source synchronization context"
+                        _act_release_orchestration_lock
+                        return 4
+                    fi
+                fi
+            fi
         else
             if [[ -n "$resume_target_host" ]]; then
                 _act_release_orchestration_lock
@@ -10114,7 +10250,8 @@ act_orchestrate_build() {
                [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id" || \
                 ! build_state_set_context "$tool_name" "$version" "$run_id" \
                     "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" \
-                    "$target_hosts_json" "$build_purpose" "$build_tasks_json" "$native_matrix_config_sha256"; then
+                    "$target_hosts_json" "$build_purpose" "$build_tasks_json" "$native_matrix_config_sha256" \
+                    "${source_sync_json:-null}"; then
                 _log_error "Build state could not retain the run context"
                 _act_release_orchestration_lock
                 return 4
@@ -10290,11 +10427,20 @@ act_orchestrate_build() {
         $interrupted && break
         target_index=$((target_index + 1))
         local persisted_entry='{}' persisted_result="" persisted_result_path=""
-        local prior_attempts=0
+        local prior_attempts=0 prior_build_attempts=0
         if $state_available; then
             persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
                 jq -c --arg target "$task_key" '.target_statuses[$target] // {}')
             prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
+            if ! prior_build_attempts=$(jq -er '
+                (.attempts // 0) as $all | (.source_sync_failures // 0) as $sync |
+                select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                  ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and $sync <= $all) |
+                $all - $sync' <<< "$persisted_entry"); then
+                _log_error "Invalid source synchronization/build attempt counters for $task_key"
+                interrupted=true
+                break
+            fi
             persisted_result=$(jq -c '.result // empty' <<< "$persisted_entry")
             persisted_result_path=$(jq -r '.result_path // empty' <<< "$persisted_entry")
         fi
@@ -10341,7 +10487,7 @@ act_orchestrate_build() {
                 continue
             fi
             if [[ "$(jq -r '.status // "pending"' <<< "$persisted_entry")" == "failed" && \
-                  "$prior_attempts" -ge "${BUILD_RETRY_MAX:-3}" ]]; then
+                  "$prior_build_attempts" -ge "${BUILD_RETRY_MAX:-3}" ]]; then
                 final_results["$task_key"]=$(jq -c \
                     '.result // {platform: "'"$target"'", status: "failed", exit_code: 6,
                      error: "Target retry limit exceeded"}' <<< "$persisted_entry")
@@ -10375,6 +10521,11 @@ act_orchestrate_build() {
             host=$(jq -r --arg target "$target" '.[$target] // empty' <<< "$target_hosts_json" 2>/dev/null)
             [[ -n "$host" ]] || host=$(act_get_native_host "$target" "$tool_name")
         fi
+        local target_sync_receipt=null
+        if [[ -n "$source_sync_json" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
+            target_sync_receipt=$(jq -ce --arg host "$host" '.hosts[] | select(.host == $host)' \
+                <<< "$source_sync_json") || { interrupted=true; break; }
+        fi
 
         # Two concurrent targets on one host whose builds write the same file
         # (`go build -o ntm` in one source tree) would collect each other's
@@ -10382,7 +10533,8 @@ act_orchestrate_build() {
         # the shared path its own; otherwise (strict snapshots, Windows hosts,
         # outputs outside the tree) wait until the conflicting build is done.
         local output_paths="" output_stage=0 output_conflict=""
-        if (( parallel_jobs > 1 )); then
+        if (( parallel_jobs > 1 )) &&
+           { [[ "$target_sync_receipt" == null ]] || [[ "$(jq -r '.status' <<< "$target_sync_receipt")" == success ]]; }; then
             output_paths=$(_act_native_output_paths "$tool_name" "$target" "$host" \
                 "$strict_release_contract" "$source_roots_json")
             output_conflict=$(_act_active_output_conflict "$host" "$output_paths")
@@ -10420,7 +10572,7 @@ act_orchestrate_build() {
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
-            "$selected_triple" "$task_key" &
+            "$selected_triple" "$task_key" "$target_sync_receipt" &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
         worker_targets+=("$task_key")
@@ -10552,11 +10704,13 @@ act_orchestrate_build() {
         --argjson targets "$results_json" \
         --arg purpose "$build_purpose" \
         --argjson requested_targets "$requested_targets_json" \
+        --argjson source_sync "${source_sync_json:-null}" \
         '{
             tool: $tool,
             build_purpose: $purpose,
             publishable: ($purpose == "release"),
             requested_targets: $requested_targets,
+            source_sync: $source_sync,
             version: $version,
             run_id: $run_id,
             git_sha: $git_sha,

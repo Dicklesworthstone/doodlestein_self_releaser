@@ -458,6 +458,7 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--resume-target-host-approval FILE` | required with relocation | Operator-reviewed JSON binding the run, target, replacement host and configuration hashes |
 | `--output-dir` | state directory | Artifact collection directory, bound into resume state |
 | `--no-sync` | false | Skip ordinary source sync (forbidden by strict release contracts) |
+| `--sync-only` | false | Sync selected build hosts without compiling; exit 1 if any host fails |
 | `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
 
 Target logs and result receipts are isolated by task and attempt. Aggregation
@@ -474,6 +475,29 @@ independently, and refuses a changed ordered task list or repository
 configuration for a matrix run. Partial artifacts remain available for resume,
 but no authoritative manifest is emitted until all tasks succeed. A strict
 `release_contract` continues to permit one selected triple per platform.
+
+Ordinary source synchronization returns a complete receipt for the selected
+native targets, including target-to-host bindings, successful source paths,
+and each host's transfer result. The coordinator validates coverage, unique
+hosts, counts, status, and matching paths before admitting work. An unfinished
+target on a failed host produces an immutable failed attempt with
+`stage: "source_sync"` and the original host receipt in `source_sync`; no host
+capacity slot or compiler is started for it. Other synced targets and workflow
+targets can continue. The build command exits nonzero and withholds the
+authoritative manifest while any target remains unsuccessful.
+Both local and SSH rsync transfers use checksums to detect edited files whose
+sizes and timestamps match the older destination files.
+
+Run context and aggregate results retain the complete `source_sync` receipt.
+Resume syncs again, updates the ordinary host/path bindings, and records the
+new receipt in `source_sync_history`. It verifies completed artifact receipts
+before deciding which targets still need work. `attempts` counts retained
+target attempts, while `source_sync_failures` excludes transfers that never
+reached compilation from the compiler retry limit. Direct orchestration resume
+without a new receipt retains the saved gate; the explicit CLI `--no-sync`
+opt-out clears it while preserving recorded host/path bindings and history.
+An ordinary sync receipt records transfer admission; strict releases continue
+to require their frozen source snapshot.
 
 Relocation requires the original controller to have released the build lock,
 the selected target to be failed, and no target to be running. Completed or
