@@ -353,6 +353,86 @@ SCRIPT
     teardown_notify_test
 }
 
+test_notify_webhook_http_error_is_retried() {
+    ((TESTS_RUN++))
+    setup_notify_test
+
+    # Behaves like curl: an HTTP 404 from a revoked webhook exits 0 unless
+    # --fail is given (then 22). Every call is recorded.
+    mkdir -p "$TEST_TMPDIR/bin"
+    cat > "$TEST_TMPDIR/bin/curl" << SCRIPT
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TEST_TMPDIR/curl.calls"
+if [[ "\$*" == *revoked* ]]; then
+    [[ " \$* " == *" --fail "* ]] && exit 22
+    exit 0
+fi
+exit 0
+SCRIPT
+    chmod +x "$TEST_TMPDIR/bin/curl"
+    local problems=() stderr_output
+
+    PATH="$TEST_TMPDIR/bin:$PATH" DSR_NOTIFY_METHODS=slack \
+        DSR_SLACK_WEBHOOK="https://hooks.slack.com/services/revoked" \
+        bash -c 'source "$1"; _NOTIFY_STATE_DIR="$2"; _NOTIFY_SENT_FILE="$2/sent.jsonl"
+            notify_event e1 warn T M run-1; notify_event e1 warn T M run-1' \
+        _ "$PROJECT_ROOT/src/notify.sh" "$TEST_TMPDIR/notifications" 2> "$TEST_TMPDIR/err.txt"
+    stderr_output=$(cat "$TEST_TMPDIR/err.txt")
+    [[ "$(grep -c revoked "$TEST_TMPDIR/curl.calls")" -eq 2 ]] ||
+        problems+=("failed delivery suppressed the retry ($(grep -c revoked "$TEST_TMPDIR/curl.calls") posts)")
+    [[ "$stderr_output" == *"Slack notification failed"* ]] || problems+=("no failure warning")
+    grep -q -- "--max-time" "$TEST_TMPDIR/curl.calls" || problems+=("no --max-time")
+
+    PATH="$TEST_TMPDIR/bin:$PATH" DSR_NOTIFY_METHODS=slack \
+        DSR_SLACK_WEBHOOK="https://hooks.slack.com/services/working" \
+        bash -c 'source "$1"; _NOTIFY_STATE_DIR="$2"; _NOTIFY_SENT_FILE="$2/sent.jsonl"
+            notify_event e2 warn T M run-1; notify_event e2 warn T M run-1' \
+        _ "$PROJECT_ROOT/src/notify.sh" "$TEST_TMPDIR/notifications" 2>/dev/null
+    [[ "$(grep -c working "$TEST_TMPDIR/curl.calls")" -eq 1 ]] ||
+        problems+=("delivered event was not deduplicated")
+
+    if [[ ${#problems[@]} -eq 0 ]]; then
+        pass "a webhook HTTP error is a failed delivery and is retried; a delivered event is sent once"
+    else
+        fail "webhook failure handling: ${problems[*]}"
+    fi
+
+    teardown_notify_test
+}
+
+test_webhooks_from_config_notifications() {
+    ((TESTS_RUN++))
+    setup_notify_test
+
+    if ! command -v yq &>/dev/null; then
+        skip "yq required for nested config keys"
+        teardown_notify_test
+        return 0
+    fi
+    mkdir -p "$TEST_TMPDIR/cfg"
+    cat > "$TEST_TMPDIR/cfg/config.yaml" << 'YAML'
+schema_version: "1.0.0"
+notifications:
+  slack_webhook: "https://hooks.slack.com/services/T000/B000/cfg"
+  discord_webhook: "https://discord.com/api/webhooks/1/cfg"
+YAML
+    local got
+    got=$(env -u DSR_SLACK_WEBHOOK -u DSR_DISCORD_WEBHOOK DSR_CONFIG_DIR="$TEST_TMPDIR/cfg" \
+        DSR_CONFIG_FILE="$TEST_TMPDIR/cfg/config.yaml" bash -c '
+            source "$1/src/logging.sh"; source "$1/src/config.sh"; source "$1/src/secrets.sh"
+            secrets_get_slack_webhook; secrets_get_discord_webhook
+            DSR_SLACK_WEBHOOK=https://hooks.slack.com/services/T1/B1/env secrets_get_slack_webhook' \
+        _ "$PROJECT_ROOT" 2>/dev/null)
+
+    if [[ "$got" == $'https://hooks.slack.com/services/T000/B000/cfg\nhttps://discord.com/api/webhooks/1/cfg\nhttps://hooks.slack.com/services/T1/B1/env' ]]; then
+        pass "webhooks come from config notifications.* unless the environment sets them"
+    else
+        fail "config notifications webhooks not used: $got"
+    fi
+
+    teardown_notify_test
+}
+
 # ============================================================================
 # Tests: Discord notifications (mock webhook)
 # ============================================================================
@@ -632,6 +712,8 @@ echo ""
 echo "Slack Tests:"
 test_notify_slack_missing_webhook
 test_notify_slack_with_mock_curl
+test_notify_webhook_http_error_is_retried
+test_webhooks_from_config_notifications
 
 echo ""
 echo "Discord Tests:"

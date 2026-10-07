@@ -274,9 +274,25 @@ secrets_check_gh_auth() {
 # Slack Webhook
 # ============================================================================
 
+# A value from config.yaml (dotted key), loading the configuration when it
+# has not been loaded yet. Empty when unset or when config.sh is absent.
+_secrets_config_value() {
+    local key="$1" value=""
+    declare -F config_get >/dev/null || return 0
+    # Declared-but-never-loaded is unset under `set -u`; test it without
+    # expanding the array.
+    if [[ -z "${DSR_CONFIG[*]+loaded}" ]] && declare -F config_load >/dev/null; then
+        config_load >/dev/null 2>&1 || true
+    fi
+    value=$(config_get "$key" "")
+    [[ "$value" == "null" ]] && value=""
+    printf '%s' "$value"
+}
+
 # Get Slack webhook URL
 # Usage: secrets_get_slack_webhook
-# Returns: Webhook URL or empty
+# Returns: Webhook URL or empty (DSR_SLACK_WEBHOOK, else config
+# notifications.slack_webhook)
 secrets_get_slack_webhook() {
     local webhook=""
 
@@ -284,6 +300,9 @@ secrets_get_slack_webhook() {
     if [[ -n "${DSR_SLACK_WEBHOOK:-}" ]]; then
         webhook="$DSR_SLACK_WEBHOOK"
         _sec_log_info "Using Slack webhook from DSR_SLACK_WEBHOOK"
+    else
+        webhook=$(_secrets_config_value notifications.slack_webhook)
+        [[ -n "$webhook" ]] && _sec_log_info "Using Slack webhook from config notifications.slack_webhook"
     fi
 
     if [[ -z "$webhook" ]]; then
@@ -320,6 +339,9 @@ secrets_get_discord_webhook() {
     if [[ -n "${DSR_DISCORD_WEBHOOK:-}" ]]; then
         webhook="$DSR_DISCORD_WEBHOOK"
         _sec_log_info "Using Discord webhook from DSR_DISCORD_WEBHOOK"
+    else
+        webhook=$(_secrets_config_value notifications.discord_webhook)
+        [[ -n "$webhook" ]] && _sec_log_info "Using Discord webhook from config notifications.discord_webhook"
     fi
 
     if [[ -z "$webhook" ]]; then

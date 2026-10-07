@@ -654,6 +654,17 @@ the repo's configured tool at the run's version tag; repos with no dsr tool
 are reported, never guessed. `dsr --dry-run watch --auto-fallback` shows which
 fallbacks would start.
 
+`--notify` takes a comma-separated list of `terminal`, `slack`, `discord`,
+`desktop`, `agent_mail` (or `all`/`none`). Fallbacks started by the watcher
+report their outcome through the same channels. Slack and Discord webhooks come
+from `DSR_SLACK_WEBHOOK` / `DSR_DISCORD_WEBHOOK`, or from config.yaml:
+
+```yaml
+notifications:
+  slack_webhook: "https://hooks.slack.com/services/..."
+  discord_webhook: "https://discord.com/api/webhooks/..."
+```
+
 ### `dsr repos`
 
 Manage repository registry.

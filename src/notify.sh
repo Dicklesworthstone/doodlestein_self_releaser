@@ -152,11 +152,19 @@ _notify_slack() {
     payload="{\"text\":\"$(_notify_json_escape "$text")\"}"
   fi
 
-  if ! curl -sS -X POST -H "Content-type: application/json" --data "$payload" "$webhook" >/dev/null 2>&1; then
+  if ! _notify_post_json "$webhook" "$payload"; then
     _notify_log_warn "Slack notification failed"
     return 1
   fi
   return 0
+}
+
+# POST a JSON payload to a webhook. An HTTP error status (a revoked webhook's
+# 404, a 429) is a failure, and a hung endpoint cannot stall the caller.
+_notify_post_json() {
+  local webhook="$1" payload="$2"
+  curl -sS --fail --connect-timeout 10 --max-time "${DSR_NOTIFY_TIMEOUT:-20}" \
+    -X POST -H "Content-type: application/json" --data "$payload" "$webhook" >/dev/null 2>&1
 }
 
 _notify_discord() {
@@ -190,7 +198,7 @@ _notify_discord() {
     payload="{\"content\":\"$(_notify_json_escape "$text")\"}"
   fi
 
-  if ! curl -sS -X POST -H "Content-type: application/json" --data "$payload" "$webhook" >/dev/null 2>&1; then
+  if ! _notify_post_json "$webhook" "$payload"; then
     _notify_log_warn "Discord notification failed"
     return 1
   fi
@@ -304,26 +312,28 @@ notify_event() {
     )
   fi
 
-  local any_sent=false
+  # The event is recorded as sent (and so suppressed from then on) only when
+  # every requested channel delivered it; a failed webhook is retried by the
+  # next occurrence instead of being lost.
+  local all_sent=true
   local method
   IFS=',' read -ra _methods <<< "$methods"
   for method in "${_methods[@]}"; do
     case "$method" in
       terminal)
         _notify_terminal "$level" "$clean_title" "$clean_message"
-        any_sent=true
         ;;
       slack)
-        _notify_slack "$clean_title" "$clean_message" && any_sent=true
+        _notify_slack "$clean_title" "$clean_message" || all_sent=false
         ;;
       discord)
-        _notify_discord "$clean_title" "$clean_message" && any_sent=true
+        _notify_discord "$clean_title" "$clean_message" || all_sent=false
         ;;
       desktop)
-        _notify_desktop "$clean_title" "$clean_message" && any_sent=true
+        _notify_desktop "$clean_title" "$clean_message" || all_sent=false
         ;;
       agent_mail)
-        _notify_agent_mail "$payload" && any_sent=true
+        _notify_agent_mail "$payload" || all_sent=false
         ;;
       *)
         _notify_log_warn "Unknown notify method: $method"
@@ -335,10 +345,26 @@ notify_event() {
     fi
   done
 
-  if $any_sent; then
+  if $all_sent; then
     notify_mark_sent "$run_id" "$event"
   fi
 
+  return 0
+}
+
+# Validate a comma-separated method list (as given to --notify).
+# Usage: notify_validate_methods <methods>; prints the offending entry.
+notify_validate_methods() {
+  local methods="$1" method
+  local -a _methods=()
+  [[ -n "$methods" ]] || { printf '(empty)\n'; return 4; }
+  IFS=',' read -ra _methods <<< "$methods"
+  for method in "${_methods[@]}"; do
+    case "$method" in
+      terminal|slack|discord|desktop|agent_mail|all|none) ;;
+      *) printf '%s\n' "$method"; return 4 ;;
+    esac
+  done
   return 0
 }
 

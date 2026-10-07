@@ -878,6 +878,15 @@ Structured error codes for programmatic handling:
 | `DSR_THRESHOLD` | 600 | Default queue threshold |
 | `DSR_MINISIGN_KEY` | | Path to minisign private key |
 | `GITHUB_TOKEN` | | GitHub API token |
+| `DSR_SLACK_WEBHOOK` | config `notifications.slack_webhook` | Slack incoming webhook for `--notify slack` |
+| `DSR_DISCORD_WEBHOOK` | config `notifications.discord_webhook` | Discord webhook for `--notify discord` |
+| `DSR_NOTIFY_TIMEOUT` | 20 | Seconds allowed per webhook delivery |
+
+A webhook delivery that fails (an HTTP error such as a revoked webhook's 404, or
+a timeout) is reported and is not recorded as sent, so the next occurrence of
+the event is delivered again. `watch --notify` passes its methods to the
+fallbacks it starts; each fallback reports how it ended (`fallback.success`,
+`fallback.build_failed`, `fallback.release_failed`, or `fallback.failed`).
 
 ---
 

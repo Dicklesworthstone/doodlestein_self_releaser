@@ -373,6 +373,39 @@ PY
     jq -e '.runs["12345"]' "$DSR_STATE_DIR/triggered.json"
 }
 
+@test "dsr watch --notify validates its methods" {
+    run harness_run_dsr watch --once --notify
+    assert_equal "4" "$status"
+    assert_contains "$output" "--notify requires a method list"
+
+    run harness_run_dsr watch --once --notify slack,slak
+    assert_equal "4" "$status"
+    assert_contains "$output" "Unknown --notify method: slak"
+}
+
+@test "dsr watch --notify carries to the fallbacks it starts, which report how they ended" {
+    harness_create_config
+    _setup_repos_d
+    _mock_gh_runs "$(_queued_release_run)"
+    # The agent_mail hook records every delivered event payload.
+    printf '#!/usr/bin/env bash\ncat >> "%s/hook.log"; echo >> "%s/hook.log"\n' \
+        "$TEST_TMPDIR" "$TEST_TMPDIR" > "$TEST_TMPDIR/hook.sh"
+    chmod +x "$TEST_TMPDIR/hook.sh"
+
+    DSR_AGENT_MAIL_HOOK="$TEST_TMPDIR/hook.sh" run harness_run_dsr watch --once --auto-fallback --notify agent_mail
+    assert_equal "0" "$status"
+
+    # The fallback child runs detached; ntm's local_path does not exist here,
+    # so it stops at configuration and must say so through the same channel.
+    local i
+    for i in $(seq 1 60); do
+        grep -q '"event":"fallback\.' "$TEST_TMPDIR/hook.log" 2>/dev/null && break
+        sleep 1
+    done
+    jq -se '[.[].event] == ["watch.throttled", "watch.fallback_started", "fallback.failed"] and
+        (.[2].message | contains("ntm v1.2.3 fallback stopped in config"))' "$TEST_TMPDIR/hook.log"
+}
+
 @test "dsr watch honors the global --dry-run" {
     harness_create_config
     _setup_repos_d

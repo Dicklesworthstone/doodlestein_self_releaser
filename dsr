@@ -1862,6 +1862,7 @@ cmd_watch() {
                 shift
                 ;;
             --notify)
+                [[ $# -ge 2 && "$2" != -* ]] || { log_error "--notify requires a method list"; return 4; }
                 notify_methods="$2"
                 shift 2
                 ;;
@@ -1941,15 +1942,23 @@ EOF
         return 4
     fi
 
-    # Configure notifications for watch loop
+    local bad_method
+    if ! bad_method=$(notify_validate_methods "$notify_methods"); then
+        log_error "Unknown --notify method: $bad_method (terminal, slack, discord, desktop, agent_mail, all, none)"
+        return 4
+    fi
+
+    # Configure notifications for the watch loop. Exported: the fallbacks it
+    # starts are child processes and report their build and release outcome
+    # through the same channels.
     if [[ "$notify_methods" != "none" ]]; then
-        # shellcheck disable=SC2034  # Used by notify.sh
-        DSR_NOTIFY_METHODS="$notify_methods"
-        DSR_NOTIFY_ENABLED=true
+        export DSR_NOTIFY_METHODS="$notify_methods"
+        export DSR_NOTIFY_ENABLED=true
         notify_init >/dev/null 2>&1 || true
         log_info "Notifications enabled: $notify_methods"
     else
-        DSR_NOTIFY_ENABLED=false
+        export DSR_NOTIFY_METHODS=none
+        export DSR_NOTIFY_ENABLED=false
     fi
 
     # Run preflight check
@@ -9360,41 +9369,74 @@ EOF
     export DSR_RUN_ID="$run_id"
     log_set_tool "$tool_name"
 
-    if ! act_load_repo_config "$tool_name"; then
-        log_error "Tool '$tool_name' not found in repos.d"
-        return 4
-    fi
-    local local_path repo
-    local_path=$(act_get_local_path "$tool_name") || return 4
-    repo=$(act_get_repo "$tool_name") || return 4
-    [[ -d "$local_path" && -n "$repo" ]] || {
-        log_error "A local source directory and GitHub repository are required"
-        return 4
-    }
-    [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
+    local local_path="" repo="" contract="null" tag="" state_dir
 
-    local contract="null"
-    if declare -F config_get_release_contract_json >/dev/null; then
-        config_validate_release_contract "$tool_name" || return 4
-        contract=$(config_get_release_contract_json "$tool_name") || return 4
-        jq -es 'length == 1 and (.[0] == null or (.[0] | type == "object"))' \
-            <<< "$contract" >/dev/null || return 4
-    fi
-    if [[ -z "$version" ]]; then
-        local language main_package
-        language=$(config_get_tool_field "$tool_name" language "") || return 4
-        main_package=$(config_get_tool_field "$tool_name" main_package "") || return 4
-        version=$(version_detect "$local_path" "$language" "$main_package") || {
-            log_error "Cannot detect version; specify --version"
+    # Every real (non-plan) outcome is notified, so a watcher's "Fallback
+    # started" is always followed by how it ended. Fallbacks started by one
+    # watcher share its run id, so the dedup key also names tool and tag.
+    _fallback_notify() {
+        local rc="$1" phase="$2" error="$3" target="$tool_name ${tag:-$version}"
+        local event level title message
+        if [[ "$rc" == 0 ]]; then
+            event=fallback.success level=success title="Release Complete"
+            message="$target released successfully"
+        else
+            level=error
+            case "$phase" in
+                checks|build|verification|signing)
+                    event=fallback.build_failed title="Build Failed"
+                    message="$target did not build (phase $phase, exit $rc); release blocked" ;;
+                release)
+                    event=fallback.release_failed title="Release Failed"
+                    message="$target was built but its release did not complete (exit $rc)" ;;
+                *)
+                    event=fallback.failed title="Fallback Failed"
+                    message="$target fallback stopped in $phase (exit $rc)" ;;
+            esac
+            [[ -z "$error" ]] || message+=": $error"
+        fi
+        notify_event "$event" "$level" "$title" "$message" "$run_id:$tool_name:${tag:-$version}" >&2 || true
+    }
+
+    # Resolve repository, contract and tag (assigning the locals above).
+    _fallback_resolve() {
+        if ! act_load_repo_config "$tool_name"; then
+            log_error "Tool '$tool_name' not found in repos.d"
+            return 4
+        fi
+        local_path=$(act_get_local_path "$tool_name") || return 4
+        repo=$(act_get_repo "$tool_name") || return 4
+        [[ -d "$local_path" && -n "$repo" ]] || {
+            log_error "A local source directory and GitHub repository are required"
             return 4
         }
-    fi
-    local tag state_dir
-    tag=$(git_ops_version_to_tag "$version") || return 4
-    [[ "$tag" =~ ^v[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
-        log_error "Invalid release version: $version"
-        return 4
+        [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
+
+        if declare -F config_get_release_contract_json >/dev/null; then
+            config_validate_release_contract "$tool_name" || return 4
+            contract=$(config_get_release_contract_json "$tool_name") || return 4
+            jq -es 'length == 1 and (.[0] == null or (.[0] | type == "object"))' \
+                <<< "$contract" >/dev/null || return 4
+        fi
+        if [[ -z "$version" ]]; then
+            local language main_package
+            language=$(config_get_tool_field "$tool_name" language "") || return 4
+            main_package=$(config_get_tool_field "$tool_name" main_package "") || return 4
+            version=$(version_detect "$local_path" "$language" "$main_package") || {
+                log_error "Cannot detect version; specify --version"
+                return 4
+            }
+        fi
+        tag=$(git_ops_version_to_tag "$version") || return 4
+        [[ "$tag" =~ ^v[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || {
+            log_error "Invalid release version: $version"
+            return 4
+        }
     }
+    if ! _fallback_resolve; then
+        $dry_run || _fallback_notify 4 config "configuration could not be resolved"
+        return 4
+    fi
     state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     [[ -n "$output_dir" ]] || output_dir="$state_dir/artifacts/${tool_name}-${tag}"
     # Do not create this directory here: strict cmd_build requires it absent.
@@ -9462,6 +9504,7 @@ EOF
             log_info "Fallback $status: $tool_name $tag (phase: $phase; artifacts: $artifacts_count)"
             [[ -z "$error" ]] || log_error "$error"
         fi
+        [[ "$phase" == plan ]] || _fallback_notify "$rc" "$phase" "$error"
         return "$rc"
     }
 
@@ -9601,8 +9644,6 @@ EOF
         build_status="failed"
         [[ $rc -eq 1 ]] && build_status="partial"
         release_status="blocked"
-        notify_event fallback.build_failed error "Build Failed" \
-            "$tool_name $tag did not complete; release blocked" "$run_id" >&2 || true
         _fallback_result "$rc" build "Every requested target must succeed before publication"
         return "$rc"
     fi
@@ -9748,8 +9789,6 @@ EOF
             return "$rc"
         fi
         release_status="success"
-        notify_event fallback.success success "Release Complete" \
-            "$tool_name $tag released successfully" "$run_id" >&2 || true
     fi
     # Explicitly check release of the lock before reporting success. The EXIT
     # trap remains armed on failure, and restores no caller-owned trap state.
