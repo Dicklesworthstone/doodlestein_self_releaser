@@ -4600,6 +4600,33 @@ _act_windows_cargo_cache_runtime() {
     cat "$module"
 }
 
+_act_windows_cargo_context_runtime() {
+    local module
+    module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cargo_context_windows.ps1"
+    [[ -f "$module" && ! -L "$module" ]] || return 3
+    cat "$module"
+}
+
+# Both metadata and compilation construct their context from the same ordered
+# configured environment. The private home is managed by DSR and wins even
+# over a differently cased configured CARGO_HOME on Windows.
+_act_windows_cargo_context_setup() {
+    local build_cmd="${1-cargo build}" build_env="${2:-}" env_pair env_name name_b64 value_b64 command_b64
+    command_b64=$(printf '%s' "$build_cmd" | base64 | tr -d '\r\n') || return 3
+    printf '%s\n' '$dsrConfiguredEnvironment=[Collections.Generic.List[string]]::new()'
+    while IFS= read -r env_pair; do
+        [[ -n "$env_pair" ]] || continue
+        env_name="${env_pair%%=*}"
+        [[ "$env_pair" == *=* && "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
+        [[ "${env_name^^}" == CARGO_HOME ]] && continue
+        name_b64=$(printf '%s' "$env_name" | base64 | tr -d '\r\n') || return 3
+        value_b64=$(printf '%s' "${env_pair#*=}" | base64 | tr -d '\r\n') || return 3
+        printf "\$dsrConfiguredEnvironment.Add([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')) + '=' + [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')))\n" "$name_b64" "$value_b64"
+    done <<< "$build_env"
+    printf '%s\n' '$dsrConfiguredEnvironment.Add("CARGO_HOME=$dsrStrictHome")'
+    printf "\$dsrContext=New-DsrCargoContext -BuildCommand ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))) -SourceRoot \$dsrPhysicalSource -CargoHome \$dsrStrictHome -Environment (\$dsrConfiguredEnvironment.ToArray())\n" "$command_b64"
+}
+
 # The cache implementation may exceed Windows command-line limits. Retain an
 # inspectable, verified script on the host when inline transport cannot fit.
 _act_windows_cache_command() {
@@ -4643,7 +4670,8 @@ EOF
 }
 
 _act_windows_cargo_metadata_body() {
-    local build_env="${1:-}" env_pair env_name env_value name_b64 value_b64
+    local build_cmd="${1-cargo build}" build_env="${2:-}"
+    _act_windows_cargo_context_runtime || return $?
     cat <<'POWERSHELL'
 $dsrAncestor=(Get-Item -LiteralPath $dsrPhysicalSource -Force).Parent
 while ($null -ne $dsrAncestor) {
@@ -4654,30 +4682,13 @@ while ($null -ne $dsrAncestor) {
     }
     $dsrAncestor=$dsrAncestor.Parent
 }
-Get-ChildItem Env: | Where-Object {
-    $_.Name -match '^(CARGO_|RUST|XWIN_)' -or $_.Name -match '^DSR_RELEASE_GIT_(SHA|REF)$' -or
-    $_.Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)' -or
-    $_.Name -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$'
-} | ForEach-Object { Remove-Item -LiteralPath ('Env:' + $_.Name) }
 POWERSHELL
-    while IFS= read -r env_pair; do
-        [[ -n "$env_pair" ]] || continue
-        env_name="${env_pair%%=*}" env_value="${env_pair#*=}"
-        [[ "$env_pair" == *=* && "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
-        [[ "${env_name^^}" == CARGO_HOME ]] && continue
-        name_b64=$(printf '%s' "$env_name" | base64 | tr -d '\r\n') || return 4
-        value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
-        printf "[Environment]::SetEnvironmentVariable([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')),[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s')),'Process')\n" "$name_b64" "$value_b64"
-    done <<< "$build_env"
+    _act_windows_cargo_context_setup "$build_cmd" "$build_env" || return $?
     cat <<'POWERSHELL'
-$env:CARGO_HOME=$dsrStrictHome
-$env:CARGO_NET_OFFLINE='true'
-$env:RCH_DISABLED='1'
-$env:RCH_CARGO_WRAPPER_BYPASS='1'
-Set-Location -LiteralPath $dsrPhysicalSource
-$dsrMetadata=@(& cargo metadata --locked --offline --all-features --format-version 1 --manifest-path (Join-Path $dsrPhysicalSource 'Cargo.toml'))
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$dsrMetadataText=($dsrMetadata -join "`n") + "`n"
+$dsrMetadataResult=Invoke-DsrCargoContext -Context $dsrContext -Operation Metadata
+if ($dsrMetadataResult.Stderr) { [Console]::Error.Write($dsrMetadataResult.Stderr) }
+if ($dsrMetadataResult.ExitCode -ne 0) { exit $dsrMetadataResult.ExitCode }
+$dsrMetadataText=$dsrMetadataResult.Stdout
 $dsrMetadataValue=ConvertFrom-Json -InputObject $dsrMetadataText -ErrorAction Stop
 if ($dsrMetadataValue -isnot [pscustomobject] -or $dsrMetadataValue.packages -isnot [array] -or
     $dsrMetadataValue.packages.Count -eq 0 -or $dsrMetadataValue.workspace_root -isnot [string] -or
@@ -4691,6 +4702,8 @@ try {
 } finally { $dsrMetadataStream.Dispose() }
 Assert-DsrCargoHome -Path $dsrStrictHome
 Assert-DsrCargoSeed -CargoHome $dsrStrictHome -ExpectedSha256 $dsrPrivateSummary.receipt_sha256
+$dsrContextSummary=Write-DsrCargoContextReceipt -Context $dsrContext -Path (Join-Path $dsrStrictHome '.dsr-cargo-context.json')
+$dsrPrivateSummary.cargo_context=$dsrContextSummary
 if ($dsrSeedPending) {
     Invoke-DsrCargoCache -Operation snapshot -First $dsrStrictHome -Second $dsrSeedHome | Out-Null
 }
@@ -4699,9 +4712,9 @@ POWERSHELL
 }
 
 _act_prepare_windows_private_cargo_home() {
-    local host="$1" source_root="$2" suffix="$3" build_env="${5:-}" script command summary
+    local host="$1" source_root="$2" suffix="$3" build_cmd="${4-cargo build}" build_env="${5:-}" script command summary
     script=$(_act_windows_private_cargo_home_script "$source_root" "$suffix") || return $?
-    script+=$'\n'"$(_act_windows_cargo_metadata_body "$build_env")" || return $?
+    script+=$'\n'"$(_act_windows_cargo_metadata_body "$build_cmd" "$build_env")" || return $?
     script+=$'\n''$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
     command=$(_act_windows_cache_command "$host" "$source_root" "$script") || return $?
     summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
@@ -4710,8 +4723,57 @@ _act_prepare_windows_private_cargo_home() {
             (.cargo_home | type == "string" and test("^[A-Za-z]:/")) and
             .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
             (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
-            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
+            (.cargo_context | type == "object" and .schema_version == 1 and
+                (.fingerprint | test("^[0-9a-f]{64}$")) and
+                (.receipt_sha256 | test("^[0-9a-f]{64}$"))))
     ' <<< "$summary"
+}
+
+# The build uses the same context constructor and CMD launcher as admission.
+# The coordinator holds both digests, so changing a retained context receipt
+# cannot authorize a different command, configuration, or compiler environment.
+_act_windows_strict_cargo_build_script() {
+    local source_root="$1" cargo_home="$2" build_cmd="$3" build_env="$4"
+    local fingerprint="$5" receipt_digest="$6" seed_digest="$7" path
+    source_root="${source_root//\\//}" cargo_home="${cargo_home//\\//}"
+    for path in "$source_root" "$cargo_home"; do
+        [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
+    done
+    [[ "$fingerprint" =~ ^[0-9a-f]{64}$ && "$receipt_digest" =~ ^[0-9a-f]{64}$ &&
+       "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
+    _act_windows_cargo_cache_runtime || return $?
+    _act_windows_cargo_context_runtime || return $?
+    cat <<EOF
+\$ErrorActionPreference='Stop'
+\$dsrSourceGuards=Open-DsrCachePathGuard '$source_root'
+\$dsrPhysicalSource=(Get-Item -LiteralPath '$source_root' -Force).FullName.Replace('\\','/')
+\$dsrStrictHome='$cargo_home'
+\$dsrContextPath=Join-Path \$dsrStrictHome '.dsr-cargo-context.json'
+try {
+Assert-DsrCargoHome -Path \$dsrStrictHome
+Assert-DsrCargoSeed -CargoHome \$dsrStrictHome -ExpectedSha256 '$seed_digest'
+\$dsrAncestor=(Get-Item -LiteralPath \$dsrPhysicalSource -Force).Parent
+while (\$null -ne \$dsrAncestor) {
+    foreach (\$dsrName in @('config','config.toml')) {
+        if (Get-Item -LiteralPath (Join-Path \$dsrAncestor.FullName ".cargo/\$dsrName") -Force -ErrorAction SilentlyContinue) {
+            throw 'Untracked ancestor Cargo config is forbidden'
+        }
+    }
+    \$dsrAncestor=\$dsrAncestor.Parent
+}
+EOF
+    _act_windows_cargo_context_setup "$build_cmd" "$build_env" || return $?
+    cat <<EOF
+Assert-DsrCargoContextReceipt -Context \$dsrContext -Path \$dsrContextPath -Fingerprint '$fingerprint' -ReceiptSha256 '$receipt_digest'
+\$dsrBuildResult=Invoke-DsrCargoContext -Context \$dsrContext -Operation Build
+if (\$dsrBuildResult.ExitCode -ne 0) { exit \$dsrBuildResult.ExitCode }
+Assert-DsrCargoContextReceipt -Context \$dsrContext -Path \$dsrContextPath -Fingerprint '$fingerprint' -ReceiptSha256 '$receipt_digest'
+Assert-DsrCargoHome -Path \$dsrStrictHome
+Assert-DsrCargoSeed -CargoHome \$dsrStrictHome -ExpectedSha256 '$seed_digest'
+} finally { foreach (\$dsrSourceGuard in \$dsrSourceGuards) { \$dsrSourceGuard.Dispose() } }
+exit 0
+EOF
 }
 
 _act_prepare_windows_nonstrict_cargo_home() {
@@ -4788,7 +4850,7 @@ _act_strict_cargo_metadata_json() {
         metadata_attempt=$(_act_generate_uuid) || return 3
         metadata_script=$(_act_windows_private_cargo_home_script \
             "$win_source_root" "metadata-${metadata_attempt//-/}") || return $?
-        metadata_body=$(_act_windows_cargo_metadata_body "$build_env") || return $?
+        metadata_body=$(_act_windows_cargo_metadata_body "$build_cmd" "$build_env") || return $?
         metadata_script+=$'\n'"$metadata_body"$'\n''Write-Output $dsrPhysicalSource; Get-Content -LiteralPath $dsrMetadataPath -Raw; exit 0'
         metadata_command=$(_act_windows_cache_command "$host" "$win_source_root" "$metadata_script") || return $?
     else
@@ -7863,6 +7925,7 @@ act_run_native_build() {
     [[ -n "$remote_path_override" ]] && strict_native_build=true
     local strict_rust_build=false
     local strict_private_cargo_cache=false strict_cargo_seed_json='null' strict_toolchain_receipt=""
+    local strict_cargo_context_json='null'
     local build_influence_env_json='{}'
     local cargo_isolation_json='null'
     local nonstrict_stage_root="" nonstrict_source_root="" nonstrict_cargo_home=""
@@ -7967,7 +8030,13 @@ act_run_native_build() {
             return 4
         fi
         strict_private_cargo_cache=true
-        if ! _act_is_windows_host "$host"; then
+        if _act_is_windows_host "$host"; then
+            strict_cargo_context_json=$(jq -ce '.cargo_context | select(
+                type == "object" and .schema_version == 1 and
+                (.fingerprint | test("^[0-9a-f]{64}$")) and
+                (.receipt_sha256 | test("^[0-9a-f]{64}$")))' <<< "$strict_cargo_seed_json") || return 4
+            strict_cargo_seed_json=$(jq -c 'del(.cargo_context)' <<< "$strict_cargo_seed_json") || return 4
+        else
             # Per-attempt toolchain identity receipt beside the snapshot; the
             # snapshot itself must stay byte-identical.
             strict_toolchain_receipt="${remote_path%/*}/.dsr-toolchain-${platform//\//-}-${cargo_attempt//-/}.json"
@@ -8023,6 +8092,10 @@ act_run_native_build() {
             cargo_isolation_json=$(jq --argjson seed "$strict_cargo_seed_json" \
                 '.cache_reuse = [] | .dependency_cache = {mode: "private-copy", seed: $seed}' \
                 <<< "$cargo_isolation_json") || return 4
+        fi
+        if [[ "$strict_cargo_context_json" != null ]]; then
+            cargo_isolation_json=$(jq --argjson context "$strict_cargo_context_json" \
+                '.cargo_context = $context' <<< "$cargo_isolation_json") || return 4
         fi
         if [[ -n "$strict_cache_root" ]]; then
             cargo_isolation_json=$(jq --arg root "$strict_cache_root" \
@@ -8327,7 +8400,7 @@ act_run_native_build() {
 
     # Construct the remote command
     # Shell syntax depends on the build host OS, not only the target platform.
-    local remote_cmd
+    local remote_cmd windows_build_body=""
     if _act_is_windows_host "$host"; then
         # Windows: use cmd.exe compatible syntax
         # - Use double quotes for paths
@@ -8336,41 +8409,26 @@ act_run_native_build() {
         # Note: In cmd.exe, 'set VAR=value && ...' includes trailing space in value.
         # Using 'set "VAR=value"' protects the value from the space before &&.
         local win_path="${remote_path//\//\\}"
-        local env_exports=""
-        local env_name
-        if $strict_rust_build; then
-            local win_strict_cargo_home
-            win_strict_cargo_home=$(_act_windows_cmd_path "$strict_cargo_home")
-            env_exports+="$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$cargoHome=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$cargoHome.PSIsContainer -or ((\$cargoHome.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoHome.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }") && for /f \"tokens=1 delims==\" %V in ('set CARGO_ 2^>nul') do @set \"%V=\" & for /f \"tokens=1 delims==\" %V in ('set RUST 2^>nul') do @set \"%V=\" & "
-        fi
-        for env_name in "${cargo_env_to_unset[@]}"; do
-            env_exports+="set \"$env_name=\" && "
-        done
-        # build_env is newline-delimited to preserve values with spaces
-        while IFS= read -r env_pair; do
-            [[ -z "$env_pair" ]] && continue
-            env_exports+="set \"$env_pair\" && "
-        done <<< "$build_env"
-        # Convert forward slashes to backslashes for Windows paths
-        remote_cmd=$(_act_windows_cmd_via_powershell "cd /d \"${win_path}\" && ${env_exports}${build_cmd}") || return 4
-        if $strict_rust_build; then
-            local ps_build_b64 ps_env_assignments env_name env_value env_name_b64 env_value_b64
-            ps_env_assignments=$(_act_windows_rust_sdk_env_cleanup)
-            if ! command -v base64 >/dev/null 2>&1; then
-                _log_error "base64 is required to construct a strict Windows build"
-                return 3
-            fi
-            ps_build_b64=$(printf '%s' "$build_cmd" | base64 | tr -d '\r\n') || return 4
+        if ! $strict_rust_build && ! $nonstrict_rust_isolate; then
+            local env_exports="" env_name
+            for env_name in "${cargo_env_to_unset[@]}"; do
+                env_exports+="set \"$env_name=\" && "
+            done
+            # build_env is newline-delimited to preserve values with spaces.
             while IFS= read -r env_pair; do
-                [[ -n "$env_pair" && "$env_pair" == *=* ]] || continue
-                env_name="${env_pair%%=*}"
-                env_value="${env_pair#*=}"
-                [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 4
-                env_name_b64=$(printf '%s' "$env_name" | base64 | tr -d '\r\n') || return 4
-                env_value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
-                ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
+                [[ -z "$env_pair" ]] && continue
+                env_exports+="set \"$env_pair\" && "
             done <<< "$build_env"
-            remote_cmd="$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$cargoHome=Get-Item -LiteralPath '${win_strict_cargo_home}' -Force; if (-not \$cargoHome.PSIsContainer -or ((\$cargoHome.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Strict CARGO_HOME is not isolated' }; foreach (\$name in @('config','config.toml','credentials','credentials.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoHome.FullName \$name)) { throw 'Strict CARGO_HOME contains configuration' } }; \$ancestor=(Get-Item -LiteralPath '${win_path}').Parent; while (\$null -ne \$ancestor) { \$cargoDir=Join-Path \$ancestor.FullName '.cargo'; foreach (\$name in @('config','config.toml')) { if (Test-Path -LiteralPath (Join-Path \$cargoDir \$name)) { throw 'Untracked ancestor Cargo config is forbidden' } }; \$ancestor=\$ancestor.Parent }; \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.UseShellExecute=\$false; \$keys=@(\$psi.EnvironmentVariables.Keys); foreach (\$key in \$keys) { if ((\$key -match '^(CARGO_|RUST|XWIN_)') -or (\$key -match '^DSR_RELEASE_GIT_(SHA|REF)$') -or (\$key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or (\$key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) { \$psi.EnvironmentVariables.Remove(\$key) } }; ${ps_env_assignments}\$psi.FileName=\$env:ComSpec; \$psi.WorkingDirectory='${win_path}'; \$command=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ps_build_b64}')); \$psi.Arguments='/d /s /c ' + \$command; \$process=[Diagnostics.Process]::Start(\$psi); \$process.WaitForExit(); exit \$process.ExitCode")"
+            remote_cmd=$(_act_windows_cmd_via_powershell "cd /d \"${win_path}\" && ${env_exports}${build_cmd}") || return 4
+        fi
+        if $strict_rust_build; then
+            local context_fingerprint context_receipt_digest context_seed_digest
+            context_fingerprint=$(jq -er '.fingerprint' <<< "$strict_cargo_context_json") || return 4
+            context_receipt_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_context_json") || return 4
+            context_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || return 4
+            windows_build_body=$(_act_windows_strict_cargo_build_script \
+                "$remote_path" "$strict_cargo_home" "$build_cmd" "$build_env" \
+                "$context_fingerprint" "$context_receipt_digest" "$context_seed_digest") || return 4
         elif $nonstrict_rust_isolate; then
             local win_stage_root win_source_root win_cargo_home
             win_stage_root=$(_act_windows_cmd_path "$nonstrict_stage_root") || return 4
@@ -8395,6 +8453,8 @@ act_run_native_build() {
                 env_value_b64=$(printf '%s' "$env_value" | base64 | tr -d '\r\n') || return 4
                 ps_env_assignments+="\$psi.EnvironmentVariables[[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_name_b64}'))]=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${env_value_b64}')); "
             done <<< "$build_env"
+            # A native host must not re-offload its private source/cache paths.
+            ps_env_assignments+='$psi.EnvironmentVariables["RCH_DISABLED"]="1"; $psi.EnvironmentVariables["RCH_CARGO_WRAPPER_BYPASS"]="1"; '
             for sibling_relative in "${nonstrict_sibling_relatives[@]}"; do
                 sibling_win_remote=$(_act_windows_cmd_path \
                     "${remote_path%/*}/$sibling_relative") || return 4
@@ -8599,7 +8659,11 @@ EOF
     local build_transport_timeout="$_ACT_BUILD_TIMEOUT"
     if _act_is_windows_host "$host"; then
         local windows_build_script windows_build_guard
-        windows_build_script=$(_act_windows_command_script "$remote_cmd") || return 4
+        if [[ -n "$windows_build_body" ]]; then
+            windows_build_script="$windows_build_body"
+        else
+            windows_build_script=$(_act_windows_command_script "$remote_cmd") || return 4
+        fi
         local windows_storage_status=0 windows_lock_script
         _act_windows_storage_config "$host" >/dev/null || windows_storage_status=$?
         [[ $windows_storage_status -eq 0 || $windows_storage_status -eq 1 ]] || return 4

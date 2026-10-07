@@ -320,11 +320,16 @@ _act_ssh_exec() {
     fi
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
+    # Compilation itself is a transport boundary in this shell suite. The
+    # PowerShell context suite executes the shared launcher and Cargo for real.
+    if [[ "$cmd" == *'$dsrBuildResult=Invoke-DsrCargoContext -Context $dsrContext -Operation Build'* ]]; then
+        return "$exit_code"
+    fi
     # Exercise the actual Windows orchestration; only remote filesystem/cache
     # responses are fixtures here. test_cargo_cache_windows.ps1 runs the helper
     # and generated admission scripts against real files and Cargo.
     if [[ "$exit_code" -eq 0 && "$cmd" == *'function Invoke-DsrCargoCache '* ]]; then
-        local cache_home="" cache_source="" cache_suffix="" cache_mode=private-copy cache_receipt
+        local cache_home="" cache_source="" cache_suffix="" cache_mode=private-copy cache_receipt cache_context=false
         local source_prefix="\$dsrPhysicalSource=(Get-Item -LiteralPath '"
         local suffix_prefix="\$dsrStrictHome=Join-Path \$dsrSourceParent '"
         while IFS= read -r command_line; do
@@ -346,6 +351,7 @@ _act_ssh_exec() {
         if [[ "$cmd" == *'$dsrPrivateSummary | ConvertTo-Json'* ]]; then
             [[ -n "$cache_source" && -n "$cache_suffix" ]] || return 99
             cache_home="${cache_source%/*}/$cache_suffix"
+            cache_context=true
         elif [[ "$cmd" == *'$dsrFinal | ConvertTo-Json'* ]]; then
             cache_mode=inventory
         elif [[ "$cmd" != *'$dsrSummary | ConvertTo-Json'* ]]; then
@@ -355,9 +361,12 @@ _act_ssh_exec() {
         cache_receipt="$cache_home/.dsr-cache-seed.json"
         [[ "$cache_mode" != inventory ]] || cache_receipt="$cache_home.final.json"
         jq -nc --arg home "$cache_home" --arg mode "$cache_mode" --arg receipt "$cache_receipt" \
+            --argjson context "$cache_context" \
             '{schema_version:1, mode:$mode, cargo_home:$home, receipt_path:$receipt,
               receipt_sha256:("3" * 64), inventory_sha256:("4" * 64), caches:["git","registry"],
-              file_count:2, size_bytes:10}'
+              file_count:2, size_bytes:10}
+             + (if $context then {cargo_context:{schema_version:1,
+                 fingerprint:("5" * 64),receipt_sha256:("6" * 64)}} else {} end)'
         return 0
     fi
     # These command-construction tests return explicit transport receipts.
@@ -1234,12 +1243,13 @@ test_windows_rust_sdk_environment() {
     log_test "Windows strict and ordinary Rust: SDK cleanup, last assignment, and receipt agree"
     local mode result cmd status script observed env_section first_prefix last_prefix
     local first_b64 last_b64
+    local configured_marker='$dsrConfiguredEnvironment=[Collections.Generic.List[string]]::new()'
     first_b64=$(printf '%s' 'C:/configured/first' | base64 | tr -d '\r\n')
     last_b64=$(printf '%s' 'C:/configured/last with spaces' | base64 | tr -d '\r\n')
     for mode in strict ordinary; do
         reset_state
         MOCK_LANGUAGE=rust
-        MOCK_BUILD_CMD='echo fixture-only'
+        MOCK_BUILD_CMD='cargo build --release'
         MOCK_LOCAL_PATH='C:/Users/dsr/projects/tool'
         MOCK_PLATFORM_ENV=$'OpenSSL_DIR=C:/configured/first\nopenssl_dir=C:/configured/last with spaces\nOPENSSL_STATIC=1\nX86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=C:/configured/target\nPKG_CONFIG=C:/configured/pkg-config\nPKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=C:/configured/pkgconfig\nLIBCLANG_PATH=C:/configured/libclang'
         MOCK_SSH_STREAM_FILE="$MOCK_DIR/sdk-windows-$mode-artifact"
@@ -1276,17 +1286,25 @@ test_windows_rust_sdk_environment() {
         # Run only the generated environment mutations. StringDictionary has
         # Windows' case-insensitive environment semantics even on a POSIX test
         # host; this is a PowerShell control, not a native Windows build proof.
-        env_section="${cmd#*\$psi.UseShellExecute=\$false}"
-        env_section="${env_section#; }"
-        env_section="${env_section%%\$psi.FileName=*}"
         if [[ "$mode" == strict ]]; then
-            # The staged job guard stores the script in a single-quoted
-            # PowerShell string. All configured values here are base64.
+            # Execute the actual shared environment constructor with the
+            # ordered assignments emitted for the build. Its pure environment
+            # boundary needs no substitute Windows path or process semantics.
+            env_section="${cmd##*"$configured_marker"}"
+            env_section="${env_section%%\$dsrContext=New-DsrCargoContext*}"
             env_section="${env_section//\'\'/\'}"
-        fi
-        if [[ "$env_section" == "$cmd" || "$env_section" != *"$(_act_rust_sdk_influence_regex)"* ]]; then
-            log_fail "$mode Windows generated environment section is missing"
-            continue
+            if [[ "$env_section" == "$cmd" || "$env_section" != *"$last_b64"* ]]; then
+                log_fail "$mode Windows configured context environment is missing"
+                continue
+            fi
+        else
+            env_section="${cmd#*\$psi.UseShellExecute=\$false}"
+            env_section="${env_section#; }"
+            env_section="${env_section%%\$psi.FileName=*}"
+            if [[ "$env_section" == "$cmd" || "$env_section" != *"$(_act_rust_sdk_influence_regex)"* ]]; then
+                log_fail "$mode Windows generated environment section is missing"
+                continue
+            fi
         fi
         script="$MOCK_DIR/sdk-windows-$mode.ps1"
         cat > "$script" <<'POWERSHELL'
@@ -1298,7 +1316,23 @@ foreach ($sdkName in @('OPENSSL_DIR', 'OPENSSL_NO_VENDOR', 'X86_64_PC_WINDOWS_MS
 $sdkEnvironment['LIBCLANG_PATH_EXTRA'] = 'preserve'
 $psi = [pscustomobject]@{ EnvironmentVariables = $sdkEnvironment }
 POWERSHELL
+        if [[ "$mode" == strict ]]; then
+            printf '. '\''%s/cargo_context_windows.ps1'\''\n' "$SRC_DIR" >> "$script"
+            cat >> "$script" <<'POWERSHELL'
+foreach ($sdkName in $sdkEnvironment.Keys) {
+    [Environment]::SetEnvironmentVariable($sdkName,$sdkEnvironment[$sdkName],'Process')
+}
+$dsrStrictHome='C:/managed/cargo'
+$dsrConfiguredEnvironment=[Collections.Generic.List[string]]::new()
+POWERSHELL
+        fi
         printf '%s\n' "$env_section" >> "$script"
+        if [[ "$mode" == strict ]]; then
+            cat >> "$script" <<'POWERSHELL'
+$sdkContext=New-DsrCargoContextEnvironment -CargoHome $dsrStrictHome -Environment ($dsrConfiguredEnvironment.ToArray())
+$psi=[pscustomobject]@{EnvironmentVariables=$sdkContext.Environment}
+POWERSHELL
+        fi
         cat >> "$script" <<'POWERSHELL'
 $sdkObserved = @{}
 foreach ($sdkName in $psi.EnvironmentVariables.Keys) {
@@ -1535,7 +1569,7 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
         "tool" "windows/amd64" "v1.0.0" "12345678-1234-4234-8234-123456789abc" \
         "C:/build/.dsr-release-snapshots/tool-run/source" 2>/dev/null)
 
-    local cmd scp_args raw_ssh_args expected_target expected_home expected_home_win
+    local cmd scp_args raw_ssh_args expected_target expected_home
     local first_xwin_value_b64 last_xwin_value_b64 first_xwin_prefix last_xwin_prefix
     cmd=$(get_ssh_cmd)
     scp_args=$(get_scp_args)
@@ -1546,13 +1580,12 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
     last_xwin_prefix="${cmd%%"$last_xwin_value_b64"*}"
     expected_target="C:/d/t/12345678-1234-4234-8234-123456789abc/amd64"
     expected_home=$(jq -r '.cargo_isolation.cargo_home // ""' <<< "$result")
-    expected_home_win="${expected_home//\//\\}"
-    if [[ "$cmd" == *"$expected_home_win"* && \
-          "$cmd" == *'$cargoHome=Get-Item'* && \
-          "$cmd" != *'$home=Get-Item'* && \
-          "$cmd" == *"System.Diagnostics.ProcessStartInfo"* && \
+    if [[ "$cmd" == *"$expected_home"* && \
+          "$cmd" == *'Assert-DsrCargoHome -Path $dsrStrictHome'* && \
+          "$cmd" == *'New-DsrCargoContext -BuildCommand'* && \
+          "$cmd" == *"Diagnostics.ProcessStartInfo"* && \
           "$cmd" == *"^(CARGO_|RUST|XWIN_)"* && \
-          "$cmd" == *"EnvironmentVariables.Remove"* && \
+          "$cmd" == *"EnvironmentVariables.Clear"* && \
           "$cmd" == *"FromBase64String"* && \
           "$cmd" == *"$first_xwin_value_b64"* && \
           "$cmd" == *"$last_xwin_value_b64"* && \
@@ -1571,6 +1604,9 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
              .cargo_isolation.cache_reuse == [] and
              .cargo_isolation.dependency_cache.seed.mode == "private-copy" and
              .cargo_isolation.dependency_cache.final.mode == "inventory" and
+             .cargo_isolation.cargo_context.fingerprint == ("5" * 64) and
+             .cargo_isolation.cargo_context.receipt_sha256 == ("6" * 64) and
+             (.cargo_isolation.dependency_cache.seed | has("cargo_context") | not) and
              .build_influence_env.RUSTFLAGS == "-C target-feature=+crt-static" and
              .build_influence_env.XWIN_CACHE_DIR == "C:/pinned/xwin-cache-last" and
              ([.build_influence_env | keys[] | select(ascii_upcase == "XWIN_CACHE_DIR")] | length) == 1 and
@@ -1682,31 +1718,36 @@ test_unix_strict_validation_failure_stops_build() {
 }
 
 test_windows_strict_validation_failure_stops_build() {
-    log_test "Windows Rust strict build: validation guards process launch"
+    log_test "Windows Rust strict build: missing context authority guards process launch"
     reset_state
     MOCK_LANGUAGE="rust"
-    MOCK_BUILD_CMD="echo reached"
+    MOCK_BUILD_CMD="cargo build --release"
     local sentinel="$MOCK_DIR/windows-fail-fast-build-ran"
+    local prepared="$MOCK_DIR/windows-fail-fast-cache-prepared"
     local status=0
     (
+        # The fixture supplies storage and dependency preparation separately;
+        # this test observes the subsequent context-admission boundary.
+        _act_windows_short_target_directory() { printf '%s\n' 'C:/build/private-target'; }
+        _act_prepare_windows_private_cargo_home() {
+            printf 'prepared\n' > "$prepared"
+            # Valid private-cache evidence alone must not authorize a Windows
+            # compiler after metadata/build context binding became mandatory.
+            jq -nc '{schema_version:1,mode:"private-copy",cargo_home:"C:/build/private-home",
+                receipt_path:"C:/build/private-home/.dsr-cache-seed.json",receipt_sha256:("3"*64),
+                inventory_sha256:("4"*64),caches:[],file_count:0,size_bytes:0}'
+        }
         _act_ssh_exec() {
-            local command_text
-            command_text=$(_test_decode_remote_command "$2")
-            if [[ "$2" == powershell* && \
-                  "$command_text" == *"throw 'Strict CARGO_HOME"* && \
-                  "$command_text" == *'$process=[Diagnostics.Process]::Start'* ]]; then
-                return 1
-            fi
             printf 'reached\n' > "$sentinel"
             return 1
         }
         act_run_native_build \
-            "tool" "windows/amd64" "v1.0.0" "run1" \
+            "tool" "windows/amd64" "v1.0.0" "12345678-1234-4234-8234-123456789abc" \
             "C:/build/.dsr-release-snapshots/tool-run/source" >/dev/null 2>&1
     ) || status=$?
 
-    if [[ $status -ne 0 && ! -e "$sentinel" ]]; then
-        log_pass "Windows strict validation failure prevented process launch"
+    if [[ $status -ne 0 && -s "$prepared" && ! -e "$sentinel" ]]; then
+        log_pass "Windows context authority is required after successful private-cache preparation"
     else
         log_fail "Windows strict validation failure reached process launch"
     fi
@@ -3027,11 +3068,12 @@ test_rust_linux_glibc_floor_enforced_for_owned_toolchain() {
 }
 
 test_windows_strict_cargo_metadata_command() {
-    log_test "Strict Cargo metadata: Windows command is locked and offline"
+    log_test "Strict Cargo metadata: Windows uses the selected build command and locked offline closure"
     reset_state
 
     local command_file="$MOCK_DIR/windows_metadata_command.txt"
-    local status=0
+    local status=0 command_b64
+    command_b64=$(printf '%s' 'cargo +selected build --release --target x86_64-pc-windows-msvc' | base64 | tr -d '\r\n')
     (
         _act_is_windows_host() { return 0; }
         _act_ssh_exec() {
@@ -3040,18 +3082,21 @@ test_windows_strict_cargo_metadata_command() {
             printf '%s\n' '{"workspace_root":"C:\\\\build\\\\source","packages":[{"manifest_path":"C:\\\\build\\\\source\\\\Cargo.toml","source":null}]}'
         }
         _act_validate_strict_cargo_source_closure \
-            "wlap" "C:/build/source" '[]' >/dev/null
+            "wlap" "C:/build/source" '[]' \
+            'cargo +selected build --release --target x86_64-pc-windows-msvc' >/dev/null
     ) 2>/dev/null || status=$?
 
     if [[ $status -eq 0 ]] && \
        grep -Fq 'Invoke-DsrCargoCache -Operation verify -First $dsrSeedHome' "$command_file" && \
        grep -Fq 'Invoke-DsrCargoCache -Operation snapshot -First $dsrSeedHome -Second $dsrStrictHome' "$command_file" && \
        grep -Fq 'Assert-DsrCargoHome -Path $dsrStrictHome' "$command_file" && \
-       grep -Fq '$env:CARGO_HOME=$dsrStrictHome' "$command_file" && \
-       grep -Fq 'Set-Location -LiteralPath $dsrPhysicalSource' "$command_file" && \
+       grep -Fq 'New-DsrCargoContext -BuildCommand' "$command_file" && \
+       grep -Fq "$command_b64" "$command_file" && \
+       grep -Fq 'Invoke-DsrCargoContext -Context $dsrContext -Operation Metadata' "$command_file" && \
+       grep -Fq 'Write-DsrCargoContextReceipt -Context $dsrContext' "$command_file" && \
        ! grep -Fq 'New-Item -ItemType Junction' "$command_file" && \
        ! grep -Fq 'physical_source_root=' "$command_file" && \
-       grep -Fq "cargo metadata --locked --offline --all-features --format-version 1 --manifest-path (Join-Path \$dsrPhysicalSource 'Cargo.toml')" \
+       grep -Fq ' metadata --locked --offline --all-features --format-version 1' \
             "$command_file"; then
         log_pass "Windows strict metadata command is locked and offline"
     else

@@ -245,6 +245,26 @@ cache and retry. Once admitted, the seed survives deletion or in-place changes
 to the ambient cache, and every metadata invocation and target attempt receives
 a fresh copy. Parallel targets therefore do not share writable dependency files.
 
+Strict Windows Rust builds also use one Cargo command context for metadata and
+compilation. A literal `cargo +nightly build --release`, for example, resolves
+its dependencies with the selected nightly Cargo instead of the host's default.
+Both operations use the system CMD launcher with the same working directory,
+configured environment, compiler/SDK cleanup, and native-build RCH bypass.
+The admitted context is checked before and after compilation; changes to the
+command, relevant environment, Cargo configuration, or toolchain selection files
+prevent artifact collection. Results retain its digests under
+`cargo_isolation.cargo_context` without storing environment values in that receipt.
+
+This Windows boundary accepts one literal `cargo build` or `cargo rustc` command,
+an optional first `+toolchain`, and ordinary Cargo build options. Quote whole
+arguments containing spaces, such as `--features "feature_a feature_b"`.
+Shell chains, variable expansion, redirection, quote concatenation,
+`--config`/`-C`/`-Z`, alternate manifests, and compiler argument tails after `--`
+are refused before dependency admission. Metadata intentionally retains the
+locked, offline, all-features source-closure policy; it does not claim an exact
+feature graph match. Windows executable and linker identity attestation remains
+separate from this command-context guarantee.
+
 Resume verifies the retained seed inventory before copying it. Changes to seed
 bytes or unsafe cache entries are refused; a legacy snapshot whose cache roots
 are symlinks or Windows junctions requires a new strict run. Cargo may legitimately unpack archives

@@ -7,7 +7,8 @@ param(
     [string]$BackendPath = (Join-Path $PSScriptRoot '../../src/cargo_cache_windows.ps1'),
     [switch]$PortableStorageSemantics,
     [string]$BashPath,
-    [string]$GeneratedScriptPath
+    [string]$GeneratedScriptPath,
+    [switch]$InitializeBackendOnly
 )
 
 Set-StrictMode -Version Latest
@@ -23,13 +24,14 @@ if ($script:WindowsHost -and $PortableStorageSemantics) {
 }
 
 . $BackendPath
+. (Join-Path (Split-Path -Parent $BackendPath) 'cargo_context_windows.ps1')
 
 if ($PortableStorageSemantics) {
     if (-not $IsLinux -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'X64') {
         throw 'The explicit portable handle adapter is limited to Linux x86_64.'
     }
     if (-not $GeneratedScriptPath) {
-        Write-Output 'LIMITATION: Linux handle/path adapters; NTFS reparse, sharing, Windows path rules, and Windows compilation remain unproved.'
+        Write-Output 'LIMITATION: Linux handle/path and direct-process adapters; native CMD, NTFS, Windows paths, and Windows compilation remain unproved.'
     }
     # The OS handle and path representation boundaries are replaced. Open/fstat/dup are real libc
     # operations, rejecting symlinks and nonregular entries without following
@@ -123,7 +125,41 @@ public sealed class DsrLinuxCacheTestEntry : IDisposable {
             throw
         }
     }
+    function Get-DsrCargoCmdPath {
+        param($Environment)
+        # A stable inert path is bound into the receipt. No CMD is claimed on
+        # Linux: Invoke-DsrCargoCommand below uses the explicit process adapter.
+        return '/bin/false'
+    }
+    function Invoke-DsrCargoCommand {
+        param($Context, [string]$Command, [bool]$CaptureOutput=$false)
+        $tokens = @(Split-DsrCargoLiteralCommand -Command $Command)
+        $info = [Diagnostics.ProcessStartInfo]::new()
+        $info.FileName = $tokens[0].Value
+        $info.WorkingDirectory = $Context.SourceRoot
+        $info.UseShellExecute = $false
+        for ($index = 1; $index -lt $tokens.Count; $index++) { $info.ArgumentList.Add($tokens[$index].Value) }
+        $info.Environment.Clear()
+        foreach ($name in $Context.Environment.Keys) { $info.Environment[$name] = $Context.Environment[$name] }
+        $info.RedirectStandardOutput = $CaptureOutput
+        $info.RedirectStandardError = $CaptureOutput
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $info
+        try {
+            $null = $process.Start()
+            if ($CaptureOutput) {
+                $stdout = $process.StandardOutput.ReadToEndAsync()
+                $stderr = $process.StandardError.ReadToEndAsync()
+            }
+            if (-not $process.WaitForExit(120000)) { $process.Kill($true); throw 'Portable Cargo process timed out' }
+            $out = ''; $err = ''
+            if ($CaptureOutput) { $out = $stdout.GetAwaiter().GetResult(); $err = $stderr.GetAwaiter().GetResult() }
+            return [pscustomobject]@{ExitCode=$process.ExitCode; Stdout=$out; Stderr=$err}
+        } finally { $process.Dispose() }
+    }
 }
+
+if ($InitializeBackendOnly) { return }
 
 if ($GeneratedScriptPath) {
     & $GeneratedScriptPath
@@ -196,10 +232,11 @@ shift
 # Load the production backend in the child PowerShell harness; suppress only
 # its repeated transport embedding, retaining all orchestration code verbatim.
 _act_windows_cargo_cache_runtime() { :; }
+_act_windows_cargo_context_runtime() { :; }
 case "$1" in
 metadata)
     _act_windows_private_cargo_home_script "$2" "$3" || exit $?
-    _act_windows_cargo_metadata_body '' || exit $?
+    _act_windows_cargo_metadata_body 'cargo build' '' || exit $?
     printf '%s\n' '$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
     ;;
 ordinary|finish)

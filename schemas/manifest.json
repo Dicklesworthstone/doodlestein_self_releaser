@@ -298,6 +298,17 @@
         }
       }
     },
+    "cargo_context": {
+      "type": "object",
+      "description": "Strict Windows metadata/build command and environment agreement. Digests bind the held context receipt; this is not executable or linker attestation.",
+      "required": ["schema_version", "fingerprint", "receipt_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "cargo_cache_summary": {
       "type": "object",
       "required": [
@@ -356,6 +367,7 @@
           "uniqueItems": true
         },
         "toolchain": {"$ref": "#/$defs/toolchain_identity"},
+        "cargo_context": {"$ref": "#/$defs/cargo_context"},
         "dependency_cache": {
           "type": "object",
           "description": "The final inventory is present only after successful Cargo execution and cache admission; failed targets retain their seed evidence.",

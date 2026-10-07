@@ -695,6 +695,41 @@ retained under `cargo_isolation.dependency_cache` with `cache_reuse: []`.
 Windows uses PowerShell 7 and native NTFS handles, rejects reparses and external
 private-cache hardlinks, and records drive-qualified forward-slash paths.
 
+Strict Windows Cargo metadata and compilation share a native system CMD
+launcher (`/d /v:off /s /c`), working directory, and sanitized configured
+environment. Configured names are case-insensitive with last-assignment
+precedence; the private `CARGO_HOME` and both RCH bypass flags are enforced.
+The same SDK cleanup applies to both operations. CMD performs executable
+lookup for both, including current-directory and `PATHEXT` behavior.
+
+The supported Windows command is one foreground literal invocation of Cargo's
+`build` or `rustc` subcommand, optionally preceded by `+toolchain`. The literal
+toolchain reaches metadata as well as compilation. An explicit `--target`
+overrides `CARGO_BUILD_TARGET` and becomes metadata's `--filter-platform`;
+without an explicit command/environment target, metadata conservatively leaves
+the graph unfiltered. Metadata always retains `--locked --offline --all-features`
+for source closure. This is command/toolchain-context agreement, not a claim
+that the build and metadata have identical feature graphs.
+
+Whole-argument double quotes support literal paths and values containing spaces.
+Shell chains, expansions, redirection, metacharacters (including parentheses),
+quote concatenation such as `--features="a b"`, `--config`/`-C`/`-Z`, Cargo
+plugins, a non-root manifest, and `rustc` argument tails after `--` are refused
+before a dependency seed is admitted. Use `--features "a b"` and put compiler
+configuration in the configured build environment or tracked Cargo configuration.
+
+Each successful metadata attempt retains `.dsr-cargo-context.json` inside its
+private Cargo home. It binds the original build command, selected metadata
+command, source/home paths, relevant environment (including lookup controls and
+all configured names), Cargo manifests/configuration, toolchain selection files,
+and rustup settings through hashes. Environment values and command text are not
+stored in the context receipt. The coordinator holds the context fingerprint
+and receipt digest; the native build checks them before and after compilation.
+Drift refuses artifact collection. The three-field summary survives in target
+state and `build_environments[].cargo_isolation.cargo_context`. This evidence
+does not hash the selected Cargo, compiler, or linker executables: Windows still
+uses the documented trusted-host contract for those identities.
+
 On Unix hosts, strict Rust
 builds also attest their direct Cargo invocations. Inside the build's own
 shell (same working directory, environment and PATH, including DSR's
