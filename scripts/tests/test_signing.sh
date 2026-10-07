@@ -168,6 +168,27 @@ test_signing_init_force_and_dry_run() {
   run_cmd "replaced key pair passes signing_check" signing_check >/dev/null
 }
 
+test_signing_config_is_honored() {
+  # config_load stores config.yaml as dotted keys.
+  local out
+  out=$(bash -c '
+    source "$1/src/signing.sh"
+    declare -gA DSR_CONFIG=([signing.enabled]=false)
+    signing_wanted && echo wanted || echo off
+    DSR_CONFIG=([signing.enabled]=true [signing.key_path]="~/keys/release.key")
+    signing_wanted && echo wanted || echo off
+    echo "$SIGNING_PRIVATE_KEY"
+    DSR_MINISIGN_KEY=/env/key; SIGNING_PRIVATE_KEY=/env/key; signing_apply_config; echo "$SIGNING_PRIVATE_KEY"
+    DSR_CONFIG=([signing_enabled]=false); unset DSR_MINISIGN_KEY; signing_wanted && echo wanted || echo off
+  ' _ "$PROJECT_ROOT" 2>/dev/null)
+  ((TESTS_RUN++))
+  if [[ "$out" == $'off\nwanted\n'"$HOME/keys/release.key"$'\n/env/key\noff' ]]; then
+    pass "signing.enabled and signing.key_path from config.yaml are honored (env key wins)"
+  else
+    fail "signing config not honored: $(tr '\n' '|' <<< "$out")"
+  fi
+}
+
 test_signing_sign_and_verify() {
   local artifact="$TEMP_DIR/artifact.bin"
   echo "data" > "$artifact"
@@ -395,6 +416,7 @@ test_signing_init_creates_keys
 test_signing_check_valid
 test_signing_fix_permissions
 test_signing_init_force_and_dry_run
+test_signing_config_is_honored
 test_signing_sign_and_verify
 test_signing_verify_failure
 test_signing_sign_batch

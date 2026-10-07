@@ -769,24 +769,48 @@ signing_sign_batch() (
 # Returns 0 if signing should run, 1 otherwise.
 # Usage: signing_is_enabled
 signing_is_enabled() {
-    # Explicit env opt-out wins.
+    signing_wanted || return 1
+    # Final gate: only enabled if the keypair actually exists and is
+    # usable. signing_check writes diagnostic logs to stderr; suppress
+    # those here because callers use this as a "should I bother?" check.
+    signing_check >/dev/null 2>&1
+}
+
+# Whether configuration asks for signing, regardless of the keypair:
+# DSR_NO_SIGN / DSR_SIGNING_ENABLED opt out, else config.yaml's
+# signing.enabled (default true). Also applies signing.key_path.
+# Usage: signing_wanted
+signing_wanted() {
+    signing_apply_config
     if [[ "${DSR_NO_SIGN:-}" == "1" ]] || [[ "${DSR_NO_SIGN:-}" == "true" ]]; then
         return 1
     fi
     if [[ "${DSR_SIGNING_ENABLED:-}" == "false" ]] || [[ "${DSR_SIGNING_ENABLED:-}" == "0" ]]; then
         return 1
     fi
-    # config.sh loaded? Honor signing_enabled in the in-memory config.
     if declare -p DSR_CONFIG &>/dev/null; then
-        local cfg_value="${DSR_CONFIG[signing_enabled]:-true}"
-        case "$cfg_value" in
-            false|0|no|off) return 1 ;;
-        esac
+        # config_load stores YAML as dotted keys (signing.enabled); the
+        # environment override lands in signing_enabled.
+        local key cfg_value
+        for key in signing.enabled signing_enabled; do
+            cfg_value="${DSR_CONFIG[$key]:-true}"
+            case "$cfg_value" in
+                false|0|no|off) return 1 ;;
+            esac
+        done
     fi
-    # Final gate: only enabled if the keypair actually exists and is
-    # usable. signing_check writes diagnostic logs to stderr; suppress
-    # those here because callers use this as a "should I bother?" check.
-    signing_check >/dev/null 2>&1
+    return 0
+}
+
+# Use config.yaml's signing.key_path as the private key unless DSR_MINISIGN_KEY
+# names one. A leading ~ is the home directory.
+signing_apply_config() {
+    [[ -z "${DSR_MINISIGN_KEY:-}" ]] || return 0
+    declare -p DSR_CONFIG &>/dev/null || return 0
+    local key_path="${DSR_CONFIG[signing.key_path]:-}"
+    [[ -n "$key_path" && "$key_path" != null ]] || return 0
+    [[ "$key_path" == "~/"* ]] && key_path="$HOME/${key_path#\~/}"
+    SIGNING_PRIVATE_KEY="$key_path"
 }
 
 # Sign release payloads AND integrity/provenance documents matching a basename
@@ -832,4 +856,4 @@ signing_sign_files() (
 export -f signing_require_minisign signing_check signing_init signing_fix_permissions
 export -f signing_sign signing_verify signing_get_public_key signing_sign_batch
 export -f signing_public_key_token signing_verify_exact signing_sign_exact
-export -f signing_is_enabled signing_sign_files
+export -f signing_is_enabled signing_wanted signing_apply_config signing_sign_files

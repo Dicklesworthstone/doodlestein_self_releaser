@@ -74,6 +74,9 @@ qg_run_checks() {
     return "$QUALITY_RC"
 }
 signing_is_enabled() { [[ "$SIGN_ENABLED" == true ]]; }
+# Configuration asks for signing (independent of whether the keypair works).
+signing_wanted() { [[ "$SIGN_WANTED" == true ]]; }
+signing_check() { printf 'KEYCHECK\n' >> "$CALLS"; return 3; }
 signing_sign_batch() {
     printf 'SIGN %s\n' "$*" >> "$CALLS"
     printf 'signature output\n'
@@ -158,7 +161,8 @@ setup() {
     export DSR_STATE_DIR="$CASE/state"
     JSON_MODE=true DRY_RUN=false
     INIT_RC=0 LOCK_RC=0 UNLOCK_RC=0 QUALITY_RC=0 BUILD_RC=0 SIGN_RC=0 RELEASE_RC=0 CONFIG_RC=0
-    CONTRACT=null SIGN_ENABLED=true MANIFEST_MODE=valid SIGNAL_PHASE=""
+    CONTRACT=null SIGN_ENABLED=true SIGN_WANTED=true MANIFEST_MODE=valid SIGNAL_PHASE=""
+    SIGNING_PRIVATE_KEY="$CASE/keys/minisign.key" SIGNING_PUBLIC_KEY="$CASE/keys/minisign.pub"
     SIGN_MODE=valid SCAN_RC=0 RELEASE_EXISTS=false QUALITY_MUTATES_SOURCE=false
     RUN=11111111-1111-4111-8111-111111111111 SOURCE_SHA=0000000000000000000000000000000000000000
     TARGETS='linux/amd64 darwin/arm64'
@@ -345,6 +349,32 @@ test_signing_interruption() {
     setup "sign-interrupt-$1"; SIGN_RC="$1"; run_fallback
     [[ "$RC" == "$1" && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^RELEASE ' "$CALLS"
 }
+# Signing is configured but the keypair that exists cannot sign: never ship
+# unsigned assets that installers embedding that key would reject.
+test_unusable_signing_key_blocks_release() {
+    setup unusable_key; SIGN_ENABLED=false
+    mkdir -p "$CASE/keys"; printf 'key\n' > "$SIGNING_PRIVATE_KEY"
+    run_fallback
+    [[ "$RC" == 7 ]] && one_result && blocked && grep -q '^KEYCHECK' "$CALLS" &&
+        jq -e '.[0].details.phases.signing == "failed" and (.[0].details.error | contains("cannot sign"))' \
+            <(jq -s . "$CASE/stdout") >/dev/null
+}
+# With no keypair at all the release goes ahead unsigned, and says so.
+test_missing_signing_key_releases_unsigned_loudly() {
+    setup missing_key; SIGN_ENABLED=false
+    run_fallback
+    [[ "$RC" == 0 ]] && grep -q '^RELEASE ' "$CALLS" && ! grep -q '^SIGN ' "$CALLS" &&
+        grep -q 'releasing UNSIGNED' "$CASE/stderr" &&
+        jq -e '.details.phases.signing == "unsigned"' "$CASE/stdout" >/dev/null
+}
+# signing.enabled: false is an explicit opt-out: no warning, no failure.
+test_signing_disabled_by_config_is_quiet() {
+    setup signing_off; SIGN_ENABLED=false SIGN_WANTED=false
+    mkdir -p "$CASE/keys"; printf 'key\n' > "$SIGNING_PRIVATE_KEY"
+    run_fallback
+    [[ "$RC" == 0 ]] && ! grep -q 'UNSIGNED\|KEYCHECK' "$CASE/stderr" "$CALLS" &&
+        jq -e '.details.phases.signing == "skipped"' "$CASE/stdout" >/dev/null
+}
 
 run_test test_success
 for rc in 1 2 3 4 5 6 8 130 143; do run_test test_build_failure "$rc"; done
@@ -376,5 +406,8 @@ run_test test_signature_resume
 for mode in existing-corrupt existing-symlink missing corrupt mutate manifest; do run_test test_signature_failure "$mode"; done
 run_test test_release_scan_failure
 for rc in 5 130 143; do run_test test_signing_interruption "$rc"; done
+run_test test_unusable_signing_key_blocks_release
+run_test test_missing_signing_key_releases_unsigned_loudly
+run_test test_signing_disabled_by_config_is_quiet
 printf 'Results: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

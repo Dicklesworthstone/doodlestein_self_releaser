@@ -9775,6 +9775,20 @@ EOF
     # signatures), and never add generic sidecars to a strict closed contract.
     if [[ "$contract" != null ]]; then
         signing_status="contract-owned"
+    elif signing_wanted && ! signing_is_enabled; then
+        # Signing is configured but the keypair cannot sign. A key that
+        # exists but is unusable (minisign missing, wrong permissions, no
+        # public half) would ship unsigned assets that installers embedding
+        # that key reject, so it blocks the release. With no key at all the
+        # release is unsigned, and says so.
+        if [[ -e "${SIGNING_PRIVATE_KEY:-}" || -e "${SIGNING_PUBLIC_KEY:-}" ]]; then
+            signing_check >&2 || true
+            signing_status="failed"; release_status="blocked"
+            _fallback_result 7 signing "Signing is enabled but the keypair at ${SIGNING_PRIVATE_KEY:-} cannot sign (see above); fix it, or set signing.enabled: false"
+            return 7
+        fi
+        signing_status="unsigned"
+        log_warn "Signing is enabled but no keypair exists: releasing UNSIGNED (run 'dsr signing init', or set signing.enabled: false)"
     elif signing_is_enabled; then
         signing_status="running"
         local -a unsigned_paths=()
