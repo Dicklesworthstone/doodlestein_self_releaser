@@ -356,7 +356,11 @@ try:
         for p in packages:
             if p["id"] not in members or p["source"] is not None:
                 continue
-            if package and p["name"] != package or not package and p["id"] not in defaults:
+            # Every release binary is explicitly named. Resolve its provider
+            # across workspace members; the build runner passes those exact
+            # packages to Cargo. Default members only govern implicit builds
+            # and must not hide a requested provider or a name collision.
+            if package and p["name"] != package:
                 continue
             for target in p["targets"]:
                 if target["name"] == binary_name and "bin" in target["kind"]:
