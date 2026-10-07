@@ -2,6 +2,7 @@
 # Real Git/Cargo/rsync through ordinary source sync, build checkpoints and
 # resume. Only SSH/SCP transport stays local; a receiver disconnect is real
 # transfer failure. No compiler, source gate, scheduler or receipt is mocked.
+# Use --strict-publication-only for the successful strict build and seal case.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
@@ -265,6 +266,71 @@ run_build() {
     check "$label emits one matching command envelope" jq -es --argjson status "$STATUS" \
         'length==1 and .[0].command=="build" and .[0].exit_code==$status' "$WORK/$label.json"
 }
+
+test_strict_publication() {
+    # The ordinary extraction path has no host-health dependency. Strict
+    # workers must run the real readiness checks over the same local transport.
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh" || return 1
+    local strict_output="$WORK/strict-output" strict_manifest strict_sha compilers_before
+    strict_manifest="$strict_output/strictseal-v4.0.0-manifest.json"
+    strict_sha=$(git -C "$WORK/source" rev-parse HEAD) || return 1
+    compilers_before=$(count "$WORK/compiler-events" "$GNU")
+    git -C "$WORK/source" tag v4.0.0 || return 1
+    jq '.tool_name="strictseal" | .repo="example/strictseal" |
+        .build_cmd="cargo build --release --locked --offline" |
+        .targets=["linux/amd64"] | .act_job_map={"linux/amd64":null} |
+        .target_triples={"linux/amd64":"x86_64-unknown-linux-gnu"} |
+        .hosts={"linux/amd64":"healthybox"} |
+        .release_contract={checksum_sidecar:"sha256",
+            exact_primary_assets:{"linux/amd64":"syncfixture-x86_64-unknown-linux-gnu"}} |
+        del(.archive_format,.artifact_naming)' "$ACT_REPOS_DIR/syncmixed.yaml" \
+        > "$ACT_REPOS_DIR/strictseal.yaml" || return 1
+    run_build strict-seal 0 strictseal --version 4.0.0 --jobs 1 --output-dir "$strict_output"
+    if [[ $STATUS -ne 0 ]]; then
+        cat "$WORK/strict-seal.log" >&2
+        return 1
+    fi
+    build_state_get strictseal 4.0.0 > "$WORK/strict-state.json" || return 1
+    check 'strict build persists completed state with its successful native target' jq -e '
+        .status=="completed" and .target_statuses["linux/amd64"].status=="completed" and
+        .target_statuses["linux/amd64"].result.status=="success"
+        ' "$WORK/strict-state.json"
+    check 'strict manifest binds exact source, target, artifact and completed run' jq -e \
+        --arg sha "$strict_sha" --slurpfile state "$WORK/strict-state.json" \
+        --arg artifact_sha "$(_act_sha256 "$strict_output/syncfixture-x86_64-unknown-linux-gnu")" '
+        .run_id==$state[0].run_id and .source.git_sha==$sha and .source.git_ref=="v4.0.0" and
+        .status=="success" and .build_purpose=="release" and .publishable==true and
+        .summary.total==1 and .summary.success==1 and .summary.failed==0 and
+        .requested_targets==["linux/amd64"] and (.artifacts|length)==1 and
+        .artifacts[0].name=="syncfixture-x86_64-unknown-linux-gnu" and
+        .artifacts[0].target=="linux/amd64" and .artifacts[0].publishable==true and
+        .artifacts[0].sha256==$artifact_sha' "$strict_manifest"
+    check 'strict publication receipt seals exact manifest bytes and source identity' jq -e \
+        --arg sha "$strict_sha" --arg digest "$(_act_sha256 "$strict_manifest")" \
+        --slurpfile state "$WORK/strict-state.json" '
+        .publication_schema==1 and .publication_status=="completed" and
+        .build_purpose=="release" and .publishable==true and .run_id==$state[0].run_id and
+        .git_sha==$sha and .manifest_name=="strictseal-v4.0.0-manifest.json" and
+        .manifest_sha256==$digest' "$strict_output/.dsr-build-purpose.json"
+    check 'strict primary executes the current tagged source' test \
+        "$("$strict_output/syncfixture-x86_64-unknown-linux-gnu")" = 'NEW_SOURCE gnu'
+    check 'strict build compiles once using genuine Cargo build.rs' test \
+        "$(count "$WORK/compiler-events" "$GNU")" -eq "$((compilers_before + 1))"
+    check 'strict build leaves its tagged controller source clean' test \
+        -z "$(git -C "$WORK/source" status --porcelain --untracked-files=all)"
+    # shellcheck disable=SC1090
+    source <(awk '/^(_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    check 'strict completed output passes real release publication admission' \
+        _release_require_publishable_artifacts "$strict_output" "$strict_manifest" true
+}
+
+if [[ "${1:-}" == --strict-publication-only ]]; then
+    test_strict_publication || exit 1
+    printf 'Results: %s passed, %s failed; evidence %s\n' "$PASS" "$FAIL" "$WORK"
+    [[ "$FAIL" -eq 0 ]]
+    exit $?
+fi
 
 # Sync-only never invokes reservation, so both failure variants use the full
 # public executable even when the isolated capacity boundary is unavailable.
@@ -643,6 +709,8 @@ fi
 check 'Git recovery still preserves controller state and original host checkout' test \
     "$CONTROLLER_BEFORE/$HOST_BEFORE" = \
     "$(snapshot_git_tree "$WORK/controller-linked" .git src/message.txt config.txt untracked.txt Cargo.toml)/$(snapshot_git_tree "$WORK/hosts/git-stale" src/message.txt private.txt Cargo.toml)"
+
+test_strict_publication || exit 1
 
 printf 'Results: %s passed, %s failed; evidence %s\n' "$PASS" "$FAIL" "$WORK"
 [[ "$FAIL" -eq 0 ]]

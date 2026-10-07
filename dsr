@@ -1397,7 +1397,7 @@ EOF
         local results_json
         results_json=$(printf '%s\n' "${results[@]}" | jq -sc '.')
         json_envelope "check" "$summary_status" "$summary_exit" \
-            "$(jq -nc --argjson repos "$results_json" --argjson threshold "$threshold" '
+            "$(jq -c --argjson threshold "$threshold" '. as $repos |
                 {threshold_seconds: $threshold,
                  repos_checked: [$repos[].repo],
                  throttled: [$repos[] | select(.status == "throttled") | . as $r |
@@ -1412,7 +1412,7 @@ EOF
                  healthy: [$repos[] | select(.status == "ok") | .repo],
                  skipped: [$repos[] | select(.status == "error") |
                      {repo: .repo, reason: (.error // "check failed")}],
-                 repos: $repos}')"
+                 repos: $repos}' <<< "$results_json")"
     fi
 
     return "$summary_exit"
@@ -1432,12 +1432,12 @@ _check_repo() {
         repo="Dicklesworthstone/$repo"
     fi
 
-    # Fetch workflow runs: the release workflow's own runs when one is
-    # configured, so busy CI elsewhere neither hides nor fakes a throttle.
+    # Enumerate queued and in_progress runs independently, keeping the
+    # configured release workflow and refusing incomplete API inventories.
     local runs_json
-    local -a run_args=("$repo" --limit 20)
+    local -a run_args=("$repo")
     [[ -n "$workflow" ]] && run_args+=(--workflow "$workflow")
-    runs_json=$(gh_workflow_runs "${run_args[@]}" 2>/dev/null)
+    runs_json=$(gh_workflow_active_runs "${run_args[@]}")
     local fetch_status=$?
 
     if [[ $fetch_status -ne 0 ]] || [[ -z "$runs_json" ]] ||
@@ -1448,91 +1448,39 @@ _check_repo() {
         return 8
     fi
 
-    # Extract and analyze runs
-    local queued_runs stuck_runs
-    queued_runs=$(echo "$runs_json" | jq -c --argjson now "$now" --argjson threshold "$threshold" '
-        .workflow_runs // [] |
-        map(select(.status == "queued")) |
-        map(. as $run |
-            ($now - ($run.created_at | fromdateiso8601 // $now)) as $age |
-            select($age > $threshold) |
-            {
-                id: .id,
-                status: .status,
-                created_at: .created_at,
-                workflow_id: .workflow_id,
-                workflow_name: .name,
-                path: .path,
-                head_branch: .head_branch,
-                event: .event,
-                html_url: .html_url,
-                age_seconds: $age
-            }
-        )' 2>/dev/null || echo '[]')
-
-    stuck_runs=$(echo "$runs_json" | jq -c --argjson now "$now" --argjson threshold "$threshold" '
-        .workflow_runs // [] |
-        map(select(.status == "in_progress")) |
-        map(. as $run |
-            ($run.run_started_at // $run.created_at) as $start_time |
-            ($now - ($start_time | fromdateiso8601 // $now)) as $age |
-            select($age > $threshold) |
-            {
-                id: .id,
-                status: .status,
-                created_at: .created_at,
-                run_started_at: .run_started_at,
-                workflow_id: .workflow_id,
-                workflow_name: .name,
-                path: .path,
-                head_branch: .head_branch,
-                event: .event,
-                html_url: .html_url,
-                age_seconds: $age
-            }
-        )' 2>/dev/null || echo '[]')
-
-    # Count issues
-    local queued_count stuck_count
-    queued_count=$(echo "$queued_runs" | jq 'length')
-    stuck_count=$(echo "$stuck_runs" | jq 'length')
-
-    # Determine oldest queued time
-    local oldest_queued_sec=0
-    if [[ "$queued_count" -gt 0 ]]; then
-        oldest_queued_sec=$(echo "$queued_runs" | jq '[.[].age_seconds] | max // 0')
+    # Analyze the complete inventory in one stream. Malformed timestamps
+    # make the repository unreadable; they must not become an empty queue.
+    local result
+    if ! result=$(jq -ce --arg repo "$repo" --arg workflow "$workflow" \
+            --argjson now "$now" --argjson threshold "$threshold" '
+        .workflow_runs | map(
+            (.created_at | fromdateiso8601) as $created |
+            (if .status == "in_progress" and .run_started_at != null
+             then (.run_started_at | fromdateiso8601) else $created end) as $start |
+            ($now - $start) as $age | select($age > $threshold) |
+            {id: .id, status: .status, created_at: .created_at,
+             workflow_id: .workflow_id, workflow_name: .name, path: .path,
+             head_branch: .head_branch, event: .event, html_url: .html_url,
+             age_seconds: $age} +
+            (if .status == "in_progress" then {run_started_at: .run_started_at} else {} end)
+        ) |
+        {queued_runs: map(select(.status == "queued")),
+         stuck_runs: map(select(.status == "in_progress"))} |
+        . + {repo: $repo, workflow: (if $workflow == "" then null else $workflow end),
+             threshold_seconds: $threshold, queued_count: (.queued_runs | length),
+             stuck_in_progress_count: (.stuck_runs | length),
+             oldest_queued_seconds: ([.queued_runs[].age_seconds] | max // 0)} |
+        . + {oldest_queued_minutes: ((.oldest_queued_seconds / 60) | floor),
+             status: (if .queued_count > 0 or .stuck_in_progress_count > 0
+                      then "throttled" else "ok" end)}' <<< "$runs_json" 2>/dev/null); then
+        jq -nc --arg repo "$repo" --arg workflow "$workflow" \
+            '{repo: $repo, status: "error", error: "invalid active-run timestamps",
+              workflow: (if $workflow == "" then null else $workflow end)}'
+        return 8
     fi
 
-    # Build result
-    local status="ok"
-    if [[ "$queued_count" -gt 0 ]] || [[ "$stuck_count" -gt 0 ]]; then
-        status="throttled"
-    fi
-
-    jq -nc \
-        --arg repo "$repo" \
-        --arg workflow "$workflow" \
-        --arg status "$status" \
-        --argjson threshold "$threshold" \
-        --argjson queued_count "$queued_count" \
-        --argjson stuck_count "$stuck_count" \
-        --argjson oldest_queued_sec "$oldest_queued_sec" \
-        --argjson queued_runs "$queued_runs" \
-        --argjson stuck_runs "$stuck_runs" \
-        '{
-            repo: $repo,
-            workflow: (if $workflow == "" then null else $workflow end),
-            status: $status,
-            threshold_seconds: $threshold,
-            queued_count: $queued_count,
-            stuck_in_progress_count: $stuck_count,
-            oldest_queued_seconds: $oldest_queued_sec,
-            oldest_queued_minutes: (($oldest_queued_sec / 60) | floor),
-            queued_runs: $queued_runs,
-            stuck_runs: $stuck_runs
-        }'
-
-    [[ "$status" == "throttled" ]] && return 1 || return 0
+    printf '%s\n' "$result"
+    [[ "$(jq -r '.status' <<< "$result")" == "throttled" ]] && return 1 || return 0
 }
 
 # Print human-readable check result

@@ -867,6 +867,93 @@ gh_workflow_runs() {
     gh_api "$endpoint"
 }
 
+# Enumerate active runs for throttle detection. Filter before paginating so
+# completed runs cannot hide an older queue. GitHub limits filtered searches
+# to 1,000 results; refuse incomplete inventories instead of guessing healthy.
+# Usage: gh_workflow_active_runs <owner/repo> [--workflow <name>]
+gh_workflow_active_runs() {
+    local repo="${1:-}" workflow=""
+    [[ $# -gt 0 ]] && shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --workflow|-w)
+                [[ $# -ge 2 && -n "$2" ]] || return 4
+                workflow="$2"
+                shift 2
+                ;;
+            *) _gh_log_error "Unknown active-run option: $1"; return 4 ;;
+        esac
+    done
+    if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+       { [[ -n "$workflow" ]] && [[ ! "$workflow" =~ ^[a-zA-Z0-9._/-]+$ ]]; }; then
+        _gh_log_error "Invalid repository or workflow for active-run listing"
+        return 4
+    fi
+
+    local endpoint="repos/$repo/actions/runs"
+    [[ -n "$workflow" ]] && endpoint="repos/$repo/actions/workflows/$workflow/runs"
+    local runs='[]' status status_runs response page_runs page page_count
+    local total_count expected_count unique_count complete
+    for status in queued in_progress; do
+        status_runs='[]'
+        expected_count=0
+        complete=false
+        for ((page = 1; page <= 10; page++)); do
+            if ! response=$(gh_api "$endpoint?per_page=100&status=$status&page=$page" --no-cache); then
+                _gh_log_error "Cannot read $status workflow runs for $repo (page $page)"
+                return 8
+            fi
+            if ! jq -es --arg status "$status" 'length == 1 and (.[0] |
+                type == "object" and
+                (.total_count | type == "number" and . >= 0 and floor == . and . <= 9007199254740991) and
+                (.workflow_runs | type == "array" and length <= 100) and
+                .total_count >= (.workflow_runs | length) and
+                all(.workflow_runs[]; type == "object" and .status == $status and
+                    (.id | type == "number" and . > 0 and floor == . and . <= 9007199254740991) and
+                    (.created_at | type == "string") and
+                    (.run_started_at | type == "null" or type == "string") and
+                    all([.name, .path, .head_branch, .event, .html_url][];
+                        type == "null" or type == "string") and
+                    (.workflow_id | type == "null" or
+                        (type == "number" and . > 0 and floor == . and . <= 9007199254740991))))' \
+                    <<< "$response" >/dev/null 2>&1; then
+                _gh_log_error "Invalid $status workflow-run listing for $repo (page $page)"
+                return 8
+            fi
+            total_count=$(jq -r '.total_count' <<< "$response") || return 8
+            if ((total_count > 1000)); then
+                _gh_log_error "$status workflow-run listing for $repo exceeds GitHub's 1,000-result limit"
+                return 8
+            fi
+            ((total_count > expected_count)) && expected_count=$total_count
+            page_runs=$(jq -c '.workflow_runs' <<< "$response") || return 8
+            page_count=$(jq -r 'length' <<< "$page_runs") || return 8
+            # Stream full API records: a single page can exceed the operating
+            # system's argument-size limit. A repeated ID cannot fill a gap.
+            status_runs=$(printf '%s\n' "$status_runs" "$page_runs" | jq -sc '
+                add | reduce .[] as $run ({}; .[$run.id | tostring] = $run) | [.[]]') || return 8
+            unique_count=$(jq -r 'length' <<< "$status_runs") || return 8
+            if ((unique_count >= expected_count)); then
+                complete=true
+                break
+            fi
+            if ((page_count < 100)); then
+                _gh_log_error "Incomplete $status workflow-run listing for $repo: found $unique_count of $expected_count"
+                return 8
+            fi
+        done
+        if ! $complete; then
+            _gh_log_error "$status workflow-run listing for $repo exceeded the 10-page safety limit"
+            return 8
+        fi
+        # A queued run may start between queries. Prefer its later
+        # in_progress record and start time, retaining one record per run ID.
+        runs=$(printf '%s\n' "$runs" "$status_runs" | jq -sc '
+            add | reduce .[] as $run ({}; .[$run.id | tostring] = $run) | [.[]]') || return 8
+    done
+    printf '%s\n' "$runs" | jq -c '{total_count: length, workflow_runs: .}'
+}
+
 # Get a specific workflow run
 # Usage: gh_workflow_run <owner/repo> <run_id>
 gh_workflow_run() {
@@ -1510,7 +1597,7 @@ gh_clear_cache() {
 export -f gh_init_cache gh_check gh_check_token _gh_resolve_token gh_api
 export -f gh_download_release_asset
 export -f gh_get_immutable_tag_ruleset_receipt
-export -f gh_workflow_runs gh_workflow_run gh_releases gh_latest_release
+export -f gh_workflow_runs gh_workflow_active_runs gh_workflow_run gh_releases gh_latest_release
 export -f gh_create_release gh_upload_asset gh_upload_asset_named gh_upload_asset_dual
 export -f gh_compare gh_tags gh_repo
 export -f gh_resolve_tag_sha gh_repository_dispatch

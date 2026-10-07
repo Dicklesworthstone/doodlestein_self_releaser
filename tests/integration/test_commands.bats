@@ -144,10 +144,8 @@ fi
     harness_create_config
     _setup_repos_d
 
-    # Mock gh to return no queued runs (healthy)
-    mock_command_script "gh" '
-echo "{\"workflow_runs\": []}"
-'
+    # Serve a complete empty active-run inventory (healthy).
+    _mock_gh_runs '{"workflow_runs":[]}'
 
     run harness_run_dsr check ntm
     # Should succeed (no throttling)
@@ -163,9 +161,7 @@ echo "{\"workflow_runs\": []}"
     old_time=$(date -u -d "15 minutes ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-15M +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-01-30T11:45:00Z")
 
     # Mock gh to return a queued run that's been waiting too long
-    mock_command_script "gh" "
-echo '{\"workflow_runs\": [{\"id\": 12345, \"status\": \"queued\", \"created_at\": \"$old_time\", \"name\": \"Release\"}]}'
-"
+    _mock_gh_runs "{\"workflow_runs\":[{\"id\":12345,\"status\":\"queued\",\"created_at\":\"$old_time\",\"name\":\"Release\"}]}"
 
     run harness_run_dsr check ntm
     # Should fail (throttling detected)
@@ -177,9 +173,7 @@ echo '{\"workflow_runs\": [{\"id\": 12345, \"status\": \"queued\", \"created_at\
     harness_create_config
     _setup_repos_d
 
-    mock_command_script "gh" '
-echo "{\"workflow_runs\": []}"
-'
+    _mock_gh_runs '{"workflow_runs":[]}'
 
     run harness_run_dsr --json check ntm
 
@@ -228,20 +222,26 @@ echo "{}"
 _mock_gh_runs() {
     printf '%s' "$1" > "$TEST_TMPDIR/runs.json"
     export GH_RETRY_DELAY=0
-    mock_command_script "gh" "
-printf '%s\n' \"\$*\" >> \"$TEST_TMPDIR/gh.calls\"
-[[ \"\$1\" == auth ]] && exit 0
-if [[ \"\$1\" == api ]]; then
-    [[ -s \"$TEST_TMPDIR/runs.json\" ]] || { echo 'gh: Bad gateway (HTTP 502)' >&2; exit 1; }
-    if [[ \"\$*\" == *repos/Dicklesworthstone/ntm/* ]]; then
-        cat \"$TEST_TMPDIR/runs.json\"
+    mock_command_script "gh" "$(cat <<'SCRIPT'
+printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
+[[ "$1" == auth ]] && exit 0
+if [[ "$1" == api ]]; then
+    [[ -s "$TEST_TMPDIR/runs.json" ]] || { echo 'gh: Bad gateway (HTTP 502)' >&2; exit 1; }
+    if [[ "$*" == *repos/Dicklesworthstone/ntm/* ]]; then
+        desired=""
+        [[ "$*" == *status=queued* ]] && desired=queued
+        [[ "$*" == *status=in_progress* ]] && desired=in_progress
+        jq --arg desired "$desired" '
+            .workflow_runs |= map(select($desired == "" or .status == $desired)) |
+            .total_count = (.workflow_runs | length)' "$TEST_TMPDIR/runs.json"
     else
-        echo '{\"workflow_runs\": []}'
+        echo '{"total_count":0,"workflow_runs":[]}'
     fi
     exit 0
 fi
 echo '{}'
-"
+SCRIPT
+)"
 }
 
 # The JSON envelope (stdout only) of one dsr run in $json, its exit in $status.
@@ -265,6 +265,150 @@ _queued_release_run() {
 # actual CLI and YAML parser; only GitHub transport and child CLI calls vary.
 _routing_dsr() {
     "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" "$@" 2>/dev/null
+}
+
+# Serve API-shaped pages from one history; the CLI and gh_api wrapper still
+# perform selection, pagination, validation, timing and JSON assembly.
+_mock_active_inventory() {
+    export ACTIVE_FIXTURE_CASE="$1" GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+    jq -n --arg mode "$1" --arg old "$(_minutes_ago 15)" --arg fresh "$(_minutes_ago 1)" '
+        def run($id; $status; $time):
+            {id:$id,status:$status,created_at:$time,run_started_at:$time,
+             name:"Release",workflow_id:17,path:".github/workflows/release.yml",
+             head_branch:"v1.2.3",event:"push",
+             html_url:("https://github.com/Dicklesworthstone/ntm/actions/runs/"+($id|tostring))};
+        [range(1;21) | run(.;"completed";$fresh)] as $completed |
+        if $mode == "big" then
+            $completed + [range(1000;1900) | run(.;"queued";$old)]
+        elif $mode == "second" or $mode == "later-error" or $mode == "short-page" then
+            $completed + [range(1000;1100) | run(.;"queued";$fresh)] + [run(555;"queued";$old)]
+        elif $mode == "invalid-time" then
+            [run(555;"queued";"not-a-timestamp"),run(556;"queued";$old)]
+        elif $mode == "invalid-path" then
+            [run(555;"queued";$old) | .path = 42]
+        elif $mode == "duplicate" then
+            [run(555;"queued";$old),run(555;"in_progress";$fresh)]
+        else $completed + [run(555;"queued";$old)] end
+        ' > "$TEST_TMPDIR/active-history.json"
+    mock_command_script "gh" "$(cat <<'SCRIPT'
+printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
+[[ "$1" == auth ]] && exit 0
+[[ "$1" == api ]] || exit 99
+endpoint=""
+for arg in "$@"; do
+    [[ "$arg" == repos/*/actions/* ]] && endpoint="$arg"
+done
+[[ -n "$endpoint" ]] || exit 99
+desired=""
+[[ "$endpoint" == *status=queued* ]] && desired=queued
+[[ "$endpoint" == *status=in_progress* ]] && desired=in_progress
+limit=20
+[[ "$endpoint" == *per_page=100* ]] && limit=100
+page=$(sed -nE 's/.*[?&]page=([0-9]+).*/\1/p' <<< "$endpoint")
+[[ -n "$page" ]] || page=1
+if [[ "$ACTIVE_FIXTURE_CASE" == later-error && "$desired" == queued && "$page" -eq 2 ]]; then
+    echo 'gh: Bad gateway (HTTP 502)' >&2
+    exit 1
+fi
+jq --arg desired "$desired" --arg mode "$ACTIVE_FIXTURE_CASE" \
+    --argjson page "$page" --argjson limit "$limit" '
+    map(select($desired == "" or .status == $desired)) as $all |
+    {total_count:($all|length),workflow_runs:$all[(($page-1)*$limit):($page*$limit)]} |
+    if $desired == "queued" and $mode == "cap" then .total_count = 1001
+    elif $desired == "queued" and $mode == "malformed" then .workflow_runs = {}
+    elif $desired == "queued" and $mode == "short-page" and $page == 2 then .workflow_runs = []
+    else . end' "$TEST_TMPDIR/active-history.json"
+SCRIPT
+)"
+}
+
+@test "active scan: completed history cannot hide an older throttled release" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory hidden
+    run _routing_dsr --json check ntm
+    assert_equal "1" "$status"
+    echo "$output" | jq -e '.details.throttled | length == 1 and .[0].run_id == 555'
+    grep -q 'actions/workflows/release.yml/runs?per_page=100&status=queued&page=1' "$TEST_TMPDIR/gh.calls"
+    grep -q 'status=in_progress&page=1' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "active scan: an older throttled run after the first hundred is detected" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory second
+    run _routing_dsr --json check ntm
+    assert_equal "1" "$status"
+    echo "$output" | jq -e '.details.throttled | length == 1 and .[0].run_id == 555'
+    grep -q 'status=queued&page=2' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "active scan: a failed later page never reports the repository healthy" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory later-error
+    run _routing_dsr --json check ntm
+    assert_equal "8" "$status"
+    echo "$output" | jq -e '.status == "error" and .details.healthy == [] and
+        .details.skipped[0].repo == "Dicklesworthstone/ntm"'
+    grep -q 'status=queued&page=2' "$TEST_TMPDIR/gh.calls"
+    jq -e '.skipped == ["Dicklesworthstone/ntm"]' "$DSR_STATE_DIR/check/last.json"
+}
+
+@test "active scan: malformed capped or prematurely ended listings are errors" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in malformed cap short-page; do
+        _mock_active_inventory "$mode"
+        run _routing_dsr --json check ntm
+        assert_equal "8" "$status"
+        echo "$output" | jq -e '.status == "error" and .details.healthy == [] and
+            (.details.skipped | length) == 1'
+    done
+}
+
+@test "active scan: invalid active timestamps do not discard a real throttle" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory invalid-time
+    run _routing_dsr --json check ntm
+    assert_equal "8" "$status"
+    echo "$output" | jq -e '.details.healthy == [] and
+        .details.skipped[0].reason == "invalid active-run timestamps"'
+}
+
+@test "active scan: invalid run metadata produces a documented error" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory invalid-path
+    run _routing_dsr --json check ntm
+    assert_equal "8" "$status"
+    echo "$output" | jq -e '.details.healthy == [] and (.details.skipped | length) == 1'
+}
+
+@test "active scan: a started run replaces its older queued record" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory duplicate
+    run _routing_dsr --json check ntm
+    assert_equal "0" "$status"
+    echo "$output" | jq -e '.details.throttled == [] and
+        .details.healthy == ["Dicklesworthstone/ntm"]'
+}
+
+@test "active scan: large queues retain all throttled rows beyond argv limits" {
+    harness_create_config
+    _setup_repos_d
+    _mock_active_inventory big
+    run _routing_dsr --json check ntm
+    assert_equal "1" "$status"
+    [[ "$(printf '%s' "$output" | wc -c)" -gt 131072 ]]
+    echo "$output" | jq -e '(.details.throttled | length) == 900 and
+        (.details.throttled | map(.run_id) | unique | length) == 900 and
+        .details.repos[0].queued_count == 900'
+    grep -q 'status=queued&page=9' "$TEST_TMPDIR/gh.calls"
+    ! grep -q 'status=queued&page=10' "$TEST_TMPDIR/gh.calls"
 }
 
 _routing_watch() {
@@ -1212,7 +1356,7 @@ YAML
     harness_create_config
     _setup_repos_d
 
-    mock_command_script "gh" 'echo "{\"workflow_runs\": []}"'
+    _mock_gh_runs '{"workflow_runs":[]}'
 
     run harness_run_dsr --json check ntm
 

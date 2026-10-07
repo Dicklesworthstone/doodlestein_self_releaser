@@ -413,6 +413,14 @@ dsr check [--repos <list>] [--threshold <seconds>] [--all]
 A configured tool's `workflow` names its release workflow. The threshold
 defaults to `threshold_seconds` (or `DSR_THRESHOLD`).
 
+The check scans queued and in-progress runs separately and follows their
+pages, rather than taking a sample of recent completed and active history.
+Run IDs are deduplicated across the responses. A failed page, malformed
+active-run timestamp, or incomplete listing at GitHub's filtered-result limit
+makes that repository unreadable (`details.skipped`), never healthy. A known
+throttled run in another successfully checked repository still takes exit-code
+precedence over the unreadable repository.
+
 **Exit codes:**
 - `0`: No throttling detected
 - `1`: Throttling detected (triggers fallback recommendation)

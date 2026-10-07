@@ -426,10 +426,15 @@ dsr check --json                    # JSON output for scripting
 ```
 
 A configured tool's `workflow` is its release workflow; without `--all` only
-that workflow's runs count. The default threshold is `threshold_seconds` from
-the config (or `DSR_THRESHOLD`), else 600s. Exit 0 means no throttling, 1
+that workflow's runs count. Queued and in-progress runs are queried separately
+and paginated, so completed history cannot hide an older throttled release.
+The default threshold is `threshold_seconds` from the config (or
+`DSR_THRESHOLD`), else 600s. Exit 0 means no throttling, 1
 throttling (`.details.throttled[]` names repo, tool, workflow, run and its
-tag), 8 a GitHub API failure — an unreadable repo is never reported healthy.
+tag), and 8 an API or incomplete-listing error when no other repository is
+throttled. Failed pages, invalid active-run timestamps, and GitHub's filtered
+result limit cannot produce a healthy result; inspect `.details.skipped` for
+the affected repository.
 
 ### `dsr build`
 
