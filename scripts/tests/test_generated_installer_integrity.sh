@@ -256,7 +256,7 @@ REAL_CP=$(command -v cp); REAL_CHMOD=$(command -v chmod); REAL_MV=$(command -v m
 cat > "$work/transports/cp" <<'FAULT'
 #!/usr/bin/env bash
 last="${!#}"
-if [[ "$last" == *'/.demo.install.'*'/payload' && "$INSTALL_FAULT" == copy ]]; then
+if [[ "$last" == *'/.demo.install.'*'/new/demo' && "$INSTALL_FAULT" == copy ]]; then
     printf partial > "$last"; exit 1
 fi
 exec "$REAL_CP" "$@"
@@ -264,13 +264,13 @@ FAULT
 cat > "$work/transports/chmod" <<'FAULT'
 #!/usr/bin/env bash
 last="${!#}"
-[[ "$last" != *'/.demo.install.'*'/payload' || "$INSTALL_FAULT" != chmod ]] || exit 1
+[[ "$last" != *'/.demo.install.'*'/new/demo' || "$INSTALL_FAULT" != chmod ]] || exit 1
 exec "$REAL_CHMOD" "$@"
 FAULT
 cat > "$work/transports/mv" <<'FAULT'
 #!/usr/bin/env bash
 if [[ "$INSTALL_FAULT" == rename ]]; then
-    for arg in "$@"; do [[ "$arg" != *'/.demo.install.'*'/payload' ]] || exit 1; done
+    for arg in "$@"; do [[ "$arg" != *'/.demo.install.'*'/new/demo' ]] || exit 1; done
 fi
 exec "$REAL_MV" "$@"
 FAULT

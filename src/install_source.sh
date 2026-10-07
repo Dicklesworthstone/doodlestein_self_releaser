@@ -308,6 +308,8 @@ _isb_compile() (
             _isb_run "$limit" "$output/compiler.log" rustc -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
             host=$(sed -n 's/^host: //p' "$output/compiler.log")
             [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 6
+            local artifact_path cargo_name windows_paths=false
+            case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows_paths=true ;; esac
             local -a args=(build --locked --release --message-format=json-render-diagnostics
                 --target "$host" --target-dir "$output/target")
             if [[ -n "$package" ]]; then
@@ -319,16 +321,18 @@ _isb_compile() (
             fi
             for name in "${binaries[@]}"; do
                 name=$(_isb_binary_name "$name") || return 4
-                args+=(--bin "${name%.exe}")
+                cargo_name="$name"
+                $windows_paths && cargo_name="${cargo_name%.exe}"
+                args+=(--bin "$cargo_name")
                 targets+=("$output/target/$host/release/$name")
             done
             _isb_run "$limit" "$output/build.log" cargo "${args[@]}" || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
-            local artifact_path windows_paths=false
-            case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows_paths=true ;; esac
             for target in "${targets[@]}"; do
                 name="${target##*/}"
+                cargo_name="$name"
                 artifact_path="$target"
                 if $windows_paths; then
+                    cargo_name="${cargo_name%.exe}"
                     command -v cygpath >/dev/null 2>&1 || {
                         _isb_log 'cygpath is required to validate native Windows Cargo output paths'; return 3;
                     }
@@ -339,7 +343,7 @@ _isb_compile() (
                 # executable paths collide. Only one actual compiler artifact
                 # may provide each requested output, using Cargo's resolved
                 # package/default-feature/required-feature selection.
-                if ! jq -eRs --arg name "${name%.exe}" --arg path "$artifact_path" \
+                if ! jq -eRs --arg name "$cargo_name" --arg path "$artifact_path" \
                     --argjson windows "$windows_paths" '
                     def native_path:
                         if $windows then gsub("\\\\"; "/") | ascii_downcase else . end;
@@ -454,8 +458,11 @@ install_source_build() (
     primary_name=$(_isb_binary_name "$binary") || return 4
     for selected in "${binaries[@]}"; do
         _isb_name "$selected" || { _isb_log "Unsafe executable name: $selected"; return 4; }
-        key="${selected,,}"
-        key="${key%.exe}"
+        key="$selected"
+        if $windows; then
+            key="${key,,}"
+            key="${key%.exe}"
+        fi
         if [[ -n "${binary_keys[$key]:-}" ]]; then
             _isb_log "Duplicate or colliding executable name: $selected"
             return 4

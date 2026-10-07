@@ -149,6 +149,11 @@ _RELEASE_FRESHNESS=null
 _KEEP_SOURCE_LOGS=false
 _LIBC=""
 _TARGET_TRIPLE=""
+_INSTALL_PLATFORM=""
+_PRIMARY_INSTALL_NAME="$BINARY_NAME"
+_INSTALL_NAMES=()
+_INSTALL_PATHS=()
+_INSTALLED_BINARIES_JSON='[]'
 # Working directory created by main(). Declared at script scope so the
 # EXIT trap (which fires AFTER main returns and its locals have been
 # popped) can still see it and clean up. Leaving this as `local temp_dir`
@@ -181,6 +186,24 @@ _log_ok()    { echo "${_GREEN}[$TOOL_NAME]${_NC} $*" >&2; }
 _log_warn()  { echo "${_YELLOW}[$TOOL_NAME]${_NC} $*" >&2; }
 _log_error() { echo "${_RED}[$TOOL_NAME]${_NC} $*" >&2; }
 
+# Shared by success receipts and the jq-free installer path. Work bytewise so
+# UTF-8 remains unchanged while every JSON control character is escaped.
+_json_escape_str() {
+    local value="$1" char code index=0 LC_ALL=C
+    while ((index < ${#value})); do
+        char="${value:$index:1}"
+        case "$char" in
+            '"') printf '\\"' ;;
+            '\') printf '\\\\' ;;
+            *)
+                printf -v code '%d' "'$char"
+                if ((code < 32)); then printf '\\u%04x' "$code"
+                else printf '%s' "$char"; fi ;;
+        esac
+        index=$((index + 1))
+    done
+}
+
 # JSON output helper
 _json_result() {
     local status="$1"
@@ -199,32 +222,64 @@ _json_result() {
                 --arg path "$path" \
                 --argjson source_receipt "$_SOURCE_RECEIPT" \
                 --argjson freshness "$_RELEASE_FRESHNESS" \
+                --argjson binaries "$_INSTALLED_BINARIES_JSON" \
                 '{tool: $tool, status: $status, message: $message, version: $version, path: $path}
+                 + if $status == "success" then {binaries:$binaries} else {} end
                  + if $status == "success" and $source_receipt != null
                    then {method:"source", signed_release:false, source:$source_receipt} else {} end
                  + if $freshness != null then {freshness:$freshness} else {} end'
         else
-            # Fallback for systems without jq - escape JSON special characters
-            # Order matters: escape backslashes first, then quotes, then control chars
-            _json_escape_str() {
-                local s="$1"
-                s="${s//\\/\\\\}"      # \ -> \\
-                s="${s//\"/\\\"}"      # " -> \"
-                s="${s//$'\n'/\\n}"    # newline -> \n
-                s="${s//$'\t'/\\t}"    # tab -> \t
-                s="${s//$'\r'/\\r}"    # carriage return -> \r
-                printf '%s' "$s"
-            }
             local esc_tool esc_status esc_msg esc_ver esc_path
             esc_tool=$(_json_escape_str "$TOOL_NAME")
             esc_status=$(_json_escape_str "$status")
             esc_msg=$(_json_escape_str "$message")
             esc_ver=$(_json_escape_str "$version")
             esc_path=$(_json_escape_str "$path")
-            printf '{"tool":"%s","status":"%s","message":"%s","version":"%s","path":"%s"}\n' \
+            printf '{"tool":"%s","status":"%s","message":"%s","version":"%s","path":"%s"' \
                 "$esc_tool" "$esc_status" "$esc_msg" "$esc_ver" "$esc_path"
+            [[ "$status" != success ]] || printf ',"binaries":%s' "$_INSTALLED_BINARIES_JSON"
+            printf '}\n'
         fi
     fi
+}
+
+# Validated at generation time; no YAML or jq is needed on release clients.
+_workspace_binary_names() {
+    case "$1" in
+__WORKSPACE_BINARY_CASES__
+    esac
+}
+
+_select_install_family() {
+    local platform="$1" names name normalized seen='' primary_key key
+    names=$(_workspace_binary_names "$platform") || return 4
+    _INSTALL_PLATFORM="$platform"
+    _INSTALL_NAMES=()
+    _PRIMARY_INSTALL_NAME="$BINARY_NAME"
+    primary_key="$BINARY_NAME"
+    if [[ "$platform" == windows/* ]]; then
+        primary_key=$(printf '%s' "$primary_key" | tr '[:upper:]' '[:lower:]') || return 4
+        primary_key="${primary_key%.exe}.exe"
+    fi
+    local primary_found=false
+    while IFS= read -r name; do
+        [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$name" != *..* ]] || return 4
+        normalized="$name"; key="$name"
+        if [[ "$platform" == windows/* ]]; then
+            key=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]') || return 4
+            if [[ "$key" == *.exe ]]; then normalized="${name:0:${#name}-4}.exe"
+            else normalized="$name.exe"; fi
+            key="${key%.exe}.exe"
+        fi
+        case "$seen" in *"|$key|"*) return 4 ;; esac
+        seen+="|$key|"
+        if [[ "$key" == "$primary_key" ]]; then
+            primary_found=true
+            _PRIMARY_INSTALL_NAME="$normalized"
+        fi
+        _INSTALL_NAMES+=("$normalized")
+    done <<< "$names"
+    $primary_found || { _log_error "Executable family omits primary $BINARY_NAME"; return 4; }
 }
 
 # Detect platform (OS and architecture)
@@ -779,7 +834,7 @@ _extract_archive() {
     case "$format" in
         none|exe)
             mkdir -- "$dest_dir" || return 1
-            cp -- "$archive" "$dest_dir/$BINARY_NAME" || return 1
+            cp -- "$archive" "$dest_dir/$_PRIMARY_INSTALL_NAME" || return 1
             return 0 ;;
         tar.gz|tgz) tar_args=(-z) ;;
         tar.xz) tar_args=(-J) ;;
@@ -808,6 +863,11 @@ _extract_archive() {
         [[ -n "$member" && "$member" != . ]] || continue
         [[ "$member" != -* ]] || return 1
         case "/$member/" in *'/../'*|*'/./'*|*'//'*) return 1 ;; esac
+        if [[ "$_INSTALL_PLATFORM" == windows/* ]]; then
+            # A case-insensitive filesystem would overwrite these members
+            # during extraction, hiding the duplicate from binary selection.
+            member=$(printf '%s' "$member" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+        fi
         normalized+="$member"$'\n'
     done <<< "$members"
     # A failed sort/uniq must not read as "no duplicates" (pipefail is on).
@@ -851,82 +911,191 @@ _extract_archive() {
     fi
 }
 
-# Stage in the destination filesystem, compare bytes, set final permissions,
-# then rename. A failed copy/chmod/rename must leave an existing binary intact.
-_install_binary() (
-    local src_binary="$1"
-    local dest_dir="$2"
-
-    local dest_binary="$dest_dir/$BINARY_NAME"
-
-    [[ -f "$src_binary" && ! -L "$src_binary" && -s "$src_binary" ]] || return 1
+# Stage the complete family and backups on the destination filesystem before
+# replacing its first member. On failure, restore every touched destination;
+# unrelated executables are never moved or removed.
+# This function is launched only as a background job by _install_binaries.
+# A second function-body subshell would hide the actual writer behind $! and
+# leave it running when the parent forwards a signal to its tracked child.
+_install_family_transaction() {
+    local dest_dir="$1"; shift
+    local sources=("$@") hashes=() sizes=() previous=()
+    local name path hash size previous_hash backup_hash index=0 stage='' committed=false touched=0
+    local receipt='[' separator='' original_dir="$dest_dir"
+    [[ ${#sources[@]} -eq ${#_INSTALL_NAMES[@]} && ${#sources[@]} -gt 0 ]] || exit 1
+    for path in "${sources[@]}"; do
+        [[ -f "$path" && ! -L "$path" && -s "$path" ]] || exit 1
+        hash=$(_file_sha256 "$path") || exit 1
+        [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || exit 1
+        size=$(wc -c < "$path" | tr -d '[:space:]') || exit 1
+        [[ "$size" =~ ^[1-9][0-9]*$ ]] || exit 1
+        hashes+=("$hash"); sizes+=("$size")
+    done
     if [[ -L "$dest_dir" ]]; then
         # A symlinked bin dir (dotfile managers) is the user's choice: install
         # into the directory it resolves to rather than through the link.
         # Empty CDPATH: a relative --dir must not be resolved via CDPATH,
         # which also makes cd print the directory into this capture.
         dest_dir=$(CDPATH='' cd -P -- "$dest_dir" 2>/dev/null && pwd -P) || {
-            _log_error "Install directory is a dangling or unusable symlink: $2"; return 1;
+            _log_error "Install directory is a dangling or unusable symlink: $original_dir"; exit 1;
         }
-        dest_binary="$dest_dir/$BINARY_NAME"
     fi
-    mkdir -p -- "$dest_dir" || return 1
-    [[ ! -L "$dest_binary" && ( ! -e "$dest_binary" || -f "$dest_binary" ) ]] || {
-        _log_error "Refusing a linked or non-regular install destination: $dest_binary"; return 1;
-    }
-
-    # Check if binary already exists
-    if [[ -f "$dest_binary" ]]; then
-        if ! $_AUTO_YES; then
+    # Gather every replacement decision before creating files in the prefix.
+    for name in "${_INSTALL_NAMES[@]}"; do
+        path="$dest_dir/$name"
+        [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || {
+            _log_error "Refusing a linked or non-regular install destination: $path"; exit 1;
+        }
+        if [[ -f "$path" ]] && ! $_AUTO_YES; then
             if $_NON_INTERACTIVE; then
-                _log_error "Binary already exists at $dest_binary"
+                _log_error "Binary already exists at $path"
                 _log_info "Use --yes to overwrite or remove it manually"
-                return 1
+                exit 1
             fi
-
-            _log_warn "Binary already exists: $dest_binary"
-            # Under `curl ... | bash` stdin is the script itself; ask on the
-            # terminal, and without one say how to proceed.
+            _log_warn "Binary already exists: $path"
             local response=""
             if ! read -rp "Overwrite? [y/N] " response < /dev/tty 2>/dev/null; then
-                _log_error "No terminal to confirm replacing $dest_binary"
+                _log_error "No terminal to confirm replacing $path"
                 _log_info "Re-run with --yes to replace it"
-                return 1
+                exit 1
             fi
             if [[ ! "$response" =~ ^[yY] ]]; then
                 _log_info "Installation cancelled"
-                return 1
+                exit 1
             fi
         fi
-    fi
-
-    local stage cleanup expected actual
-    expected=$(_file_sha256 "$src_binary") || return $?
-    stage=$(mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || return 1
-    printf -v cleanup 'rm -rf -- %q' "$stage"
-    # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command for this stage
-    trap "$cleanup" EXIT
+    done
+    mkdir -p -- "$dest_dir" || exit 1
+    stage=$(mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || exit 1
+    _finish_family_transaction() {
+        local status=$? restore_index restore_name failed=false
+        trap - EXIT
+        # Finish restoration even if the caller repeats an interrupt while
+        # backups are being moved back into place.
+        trap '' HUP INT TERM
+        if ! $committed; then
+            restore_index=$((touched - 1))
+            while ((restore_index >= 0)); do
+                restore_name="${_INSTALL_NAMES[$restore_index]}"
+                if [[ "${previous[$restore_index]}" == true ]]; then
+                    mv -f -- "$stage/old/$restore_name" "$dest_dir/$restore_name" || failed=true
+                else
+                    rm -f -- "$dest_dir/$restore_name" || failed=true
+                fi
+                restore_index=$((restore_index - 1))
+            done
+        fi
+        if $failed; then
+            _log_error "Could not restore every previous binary; recovery files retained at: $stage"
+            exit 1
+        fi
+        rm -rf -- "$stage"
+        exit "$status"
+    }
+    trap _finish_family_transaction EXIT
     trap 'exit 5' HUP INT TERM
-    cp -- "$src_binary" "$stage/payload" || return 1
-    chmod 755 "$stage/payload" || return 1
-    actual=$(_file_sha256 "$stage/payload") || return $?
-    [[ "$actual" == "$expected" ]] || return 1
-    [[ ! -L "$dest_binary" && ( ! -e "$dest_binary" || -f "$dest_binary" ) ]] || return 1
-    mv -f -- "$stage/payload" "$dest_binary" || return 1
-    [[ -f "$dest_binary" && ! -L "$dest_binary" && -x "$dest_binary" ]] || return 1
-    [[ "$(_file_sha256 "$dest_binary")" == "$expected" ]] || return 1
-
-    _log_ok "Installed to: $dest_binary"
-
-    # Check if in PATH
-    if [[ ":$PATH:" != *":$dest_dir:"* && ":$PATH:" != *":$2:"* ]]; then
+    mkdir -- "$stage/new" "$stage/old" || exit 1
+    for name in "${_INSTALL_NAMES[@]}"; do
+        cp -- "${sources[$index]}" "$stage/new/$name" || exit 1
+        chmod 755 "$stage/new/$name" || exit 1
+        [[ "$(_file_sha256 "$stage/new/$name")" == "${hashes[$index]}" ]] || exit 1
+        path="$dest_dir/$name"
+        if [[ -f "$path" && ! -L "$path" ]]; then
+            cp -p -- "$path" "$stage/old/$name" || exit 1
+            previous_hash=$(_file_sha256 "$path") || exit 1
+            backup_hash=$(_file_sha256 "$stage/old/$name") || exit 1
+            [[ "$previous_hash" == "$backup_hash" ]] || exit 1
+            previous+=(true)
+        elif [[ ! -e "$path" && ! -L "$path" ]]; then
+            previous+=(false)
+        else
+            exit 1
+        fi
+        receipt+="$separator"'{"name":"'"$(_json_escape_str "$name")"'","path":"'"$(_json_escape_str "$original_dir/$name")"'","sha256":"'"${hashes[$index]}"'","size_bytes":'"${sizes[$index]}"'}'
+        separator=,
+        index=$((index + 1))
+    done
+    receipt+=']'
+    index=0
+    for name in "${_INSTALL_NAMES[@]}"; do
+        path="$dest_dir/$name"
+        [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || exit 1
+        touched=$((index + 1))
+        mv -f -- "$stage/new/$name" "$path" || exit 1
+        index=$((index + 1))
+    done
+    index=0
+    for name in "${_INSTALL_NAMES[@]}"; do
+        path="$dest_dir/$name"
+        [[ -f "$path" && ! -L "$path" && -x "$path" ]] || exit 1
+        [[ "$(_file_sha256 "$path")" == "${hashes[$index]}" ]] || exit 1
+        index=$((index + 1))
+    done
+    committed=true
+    for name in "${_INSTALL_NAMES[@]}"; do _log_ok "Installed to: $original_dir/$name"; done
+    if [[ ":$PATH:" != *":$dest_dir:"* && ":$PATH:" != *":$original_dir:"* ]]; then
         _log_warn "$dest_dir is not in your PATH"
         _log_info "Add to your shell config:"
         _log_info "  export PATH=\"\$PATH:$dest_dir\""
     fi
 
-    return 0
-)
+    printf '%s\n' "$receipt"
+    exit $?
+}
+
+_install_binaries() {
+    local receipt receipt_file family_pid='' previous_traps interrupted=false status=0
+    receipt_file=$(mktemp "$_TEMP_DIR/install-family.XXXXXXXX") || return 1
+    previous_traps=$(trap -p HUP INT TERM)
+    # Sending TERM to only this installer PID must also stop its transaction.
+    # Wait for the child's rollback before restoring the caller's handlers.
+    trap 'interrupted=true; if [[ -n "$family_pid" ]]; then kill -TERM "$family_pid" 2>/dev/null || true; fi' HUP INT TERM
+    _install_family_transaction "$_INSTALL_DIR" "${_INSTALL_PATHS[@]}" > "$receipt_file" &
+    family_pid=$!
+    if $interrupted; then kill -TERM "$family_pid" 2>/dev/null || true; fi
+    wait "$family_pid" || status=$?
+    if $interrupted; then
+        trap '' HUP INT TERM
+        wait "$family_pid" 2>/dev/null || true
+        status=5
+    fi
+    trap - HUP INT TERM
+    if [[ -n "$previous_traps" ]]; then eval "$previous_traps"; fi
+    ((status == 0)) || return "$status"
+    receipt=$(cat -- "$receipt_file") || return 1
+    _INSTALLED_BINARIES_JSON="$receipt"
+}
+
+_select_archive_binaries() {
+    local directory="$1" name candidates alternate path other use_alternate
+    _INSTALL_PATHS=()
+    for name in "${_INSTALL_NAMES[@]}"; do
+        alternate="$name.exe"
+        [[ "$name" != *.exe ]] || alternate="${name%.exe}"
+        use_alternate=true
+        # Unix permits two explicitly configured binaries named app and
+        # app.exe. Neither may borrow the other's exact family member.
+        for other in "${_INSTALL_NAMES[@]}"; do
+            [[ "$other" != "$alternate" ]] || use_alternate=false
+        done
+        if [[ "$_INSTALL_PLATFORM" == windows/* ]]; then
+            candidates=$(find "$directory" -type f \( -iname "$name" -o -iname "$alternate" \) -print) || return 1
+        elif $use_alternate; then
+            candidates=$(find "$directory" -type f \( -name "$name" -o -name "$alternate" \) -print) || return 1
+        else
+            candidates=$(find "$directory" -type f -name "$name" -print) || return 1
+        fi
+        if [[ -z "$candidates" || "$candidates" == *$'\n'* ]]; then
+            _log_error "Archive must contain exactly one matching binary for $name"
+            return 1
+        fi
+        [[ -f "$candidates" && ! -L "$candidates" && -s "$candidates" ]] || return 1
+        for path in ${_INSTALL_PATHS[@]+"${_INSTALL_PATHS[@]}"}; do
+            [[ "$path" != "$candidates" ]] || { _log_error "Two executable names select the same archive member"; return 1; }
+        done
+        _INSTALL_PATHS+=("$candidates")
+    done
+}
 
 # ============================================================================
 # SKILL INSTALLATION
@@ -1104,7 +1273,7 @@ _install_skills() {
 # discovery/acquisition failures may call this path; a bad checksum, signature,
 # archive, cache entry, or install must terminate the original release path.
 _install_from_source() {
-    local reason="$1" ref="${_SOURCE_REF:-}" receipt payload actual installed_path
+    local reason="$1" ref="${_SOURCE_REF:-}" receipt payload actual installed_path name expected_names member
     if ! $_ALLOW_SOURCE_BUILD || $_OFFLINE_MODE || $_REQUIRE_SIGNATURES; then
         _log_error "Source fallback requires --allow-source-build (or --from-source), online mode, and no --require-signatures"
         return 4
@@ -1130,34 +1299,50 @@ _install_from_source() {
     local args=(--allow-build --subdir "$SOURCE_SUBDIR" --timeout "$_SOURCE_TIMEOUT")
     [[ -z "$SOURCE_ENTRY" ]] || args+=(--entry "$SOURCE_ENTRY")
     [[ -z "$SOURCE_PACKAGE" ]] || args+=(--package "$SOURCE_PACKAGE")
+    for name in "${_INSTALL_NAMES[@]}"; do args+=(--bin "$name"); done
     _KEEP_SOURCE_LOGS=true
     receipt=$(install_source_build "$REPO" "$ref" "$SOURCE_LANGUAGE" "$BINARY_NAME" \
         "$_TEMP_DIR/source-build" "${args[@]}") || return $?
-    # Consume a single complete receipt and recheck the selected payload. Do
-    # not let compiler stdout become success JSON or a different install path.
-    if ! jq -es --arg repo "$REPO" --arg ref "$ref" --arg language "$SOURCE_LANGUAGE" '
+    # Require exactly the selected family and bind the retained primary fields
+    # to its member. Compiler output cannot select a different installation set.
+    expected_names=$(printf '%s\n' "${_INSTALL_NAMES[@]}" | jq -Rsc 'split("\n")[:-1]') || return 6
+    if ! jq -es --arg repo "$REPO" --arg ref "$ref" --arg language "$SOURCE_LANGUAGE" \
+        --arg primary "$_PRIMARY_INSTALL_NAME" --argjson expected "$expected_names" '
         length == 1 and (.[0] | type == "object" and .schema_version == 1 and
         .method == "source" and .signed_release == false and
         .repository == $repo and .requested_ref == $ref and .language == $language and
         (.source_commit | type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$")) and
         (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
         (.size_bytes | type == "number" and floor == . and . > 0) and
-        (.compiler | type == "string" and length > 0) and (.path | type == "string"))
+        (.compiler | type == "string" and length > 0) and (.path | type == "string") and
+        (.binaries | type == "array" and length == ($expected | length) and
+            (map(.name) | sort) == ($expected | sort) and
+            all(.[]; (.path | type == "string" and length > 0) and
+                (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                (.size_bytes | type == "number" and floor == . and . > 0))) and
+        (. as $receipt | any(.binaries[]; .name == $primary and
+            .path == $receipt.path and .sha256 == $receipt.sha256 and
+            .size_bytes == $receipt.size_bytes)))
     ' <<< "$receipt" >/dev/null 2>&1; then
         _log_error "Invalid source build receipt"
         return 6
     fi
-    payload=$(jq -r '.path' <<< "$receipt") || return 6
-    [[ "$payload" == "$_TEMP_DIR/source-build/output/"* ]] || return 6
-    _isb_path_in_tree "$_TEMP_DIR/source-build/output" "${payload#"$_TEMP_DIR/source-build/output/"}" || return 6
-    actual=$(_file_sha256 "$payload") || return $?
-    [[ "$actual" == "$(jq -r '.sha256' <<< "$receipt")" ]] || return 6
-    [[ "$(wc -c < "$payload" | tr -d '[:space:]')" == "$(jq -r '.size_bytes' <<< "$receipt")" ]] || return 6
-    _install_binary "$payload" "$_INSTALL_DIR" || return $?
-    installed_path="$_INSTALL_DIR/$BINARY_NAME"
-    [[ "$(_file_sha256 "$installed_path")" == "$actual" ]] || return 6
+    _INSTALL_PATHS=()
+    for name in "${_INSTALL_NAMES[@]}"; do
+        member=$(jq -c --arg name "$name" '.binaries[] | select(.name == $name)' <<< "$receipt") || return 6
+        payload=$(jq -r '.path' <<< "$member") || return 6
+        [[ "$payload" == "$_TEMP_DIR/source-build/output/"* ]] || return 6
+        _isb_path_in_tree "$_TEMP_DIR/source-build/output" "${payload#"$_TEMP_DIR/source-build/output/"}" || return 6
+        [[ -f "$payload" && ! -L "$payload" && -s "$payload" && "${payload##*/}" == "$name" ]] || return 6
+        actual=$(_file_sha256 "$payload") || return $?
+        [[ "$actual" == "$(jq -r '.sha256' <<< "$member")" ]] || return 6
+        [[ "$(wc -c < "$payload" | tr -d '[:space:]')" == "$(jq -r '.size_bytes' <<< "$member")" ]] || return 6
+        _INSTALL_PATHS+=("$payload")
+    done
     # The public receipt must not point at a temporary payload removed on exit.
-    _SOURCE_RECEIPT=$(jq -c 'del(.path)' <<< "$receipt") || return 6
+    _SOURCE_RECEIPT=$(jq -c 'del(.path) | .binaries |= map(del(.path))' <<< "$receipt") || return 6
+    _install_binaries || return $?
+    installed_path="$_INSTALL_DIR/$_PRIMARY_INSTALL_NAME"
     _KEEP_SOURCE_LOGS=false
     _install_skills
     _log_ok "Installed local source build at commit $(jq -r '.source_commit' <<< "$receipt")"
@@ -1351,6 +1536,7 @@ main() {
         _log_error "Invalid installer identity"
         return 4
     fi
+    _select_install_family "$platform" || return $?
     if $_FROM_SOURCE; then
         _install_from_source "Explicit --from-source request"
         return $?
@@ -1445,14 +1631,7 @@ main() {
     _log_info "Extracting..."
     _extract_archive "$archive_file" "$extract_dir" "$format" || return $?
 
-    # Find binary
-    local binary_path candidates
-    candidates=$(find "$extract_dir" -type f \( -name "$BINARY_NAME" -o -name "${BINARY_NAME}.exe" \) -print) || return 1
-    if [[ -z "$candidates" || "$candidates" == *$'\n'* ]]; then
-        _log_error "Archive must contain exactly one matching binary"
-        return 1
-    fi
-    binary_path="$candidates"
+    _select_archive_binaries "$extract_dir" || return $?
     # A stale-release policy must NEVER launder a bad artifact into a source
     # build. Check it only after integrity, extraction and binary selection.
     if [[ -n "$_SOURCE_IF_STALE" ]]; then
@@ -1486,13 +1665,13 @@ main() {
     fi
 
     # Install
-    _install_binary "$binary_path" "$_INSTALL_DIR" || return $?
+    _install_binaries || return $?
 
     # Install AI coding agent skills
     _install_skills
 
     # Verify installation
-    local installed_path="$_INSTALL_DIR/$BINARY_NAME"
+    local installed_path="$_INSTALL_DIR/$_PRIMARY_INSTALL_NAME"
     if [[ -f "$installed_path" ]]; then
         local installed_version="unknown" timeout_cmd=""
         if command -v timeout &>/dev/null; then timeout_cmd=timeout
@@ -1641,6 +1820,60 @@ _install_gen_resolve_pubkey() {
     printf '%s\t%s\n' "$source" "$key"
 }
 
+# Emit only validated shell literals. Empty lists select the primary; target
+# overrides replace the global family rather than extending it. Unlike build
+# collection, an installer needs its primary for --version and source receipts.
+_install_gen_workspace_cases() {
+    local config_file="$1" primary="$2" model platform names name
+    [[ "$primary" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$primary" != *..* &&
+       "${primary,,}" != *.sha256 ]] || { log_error "Unsafe primary binary_name"; return 4; }
+    if ! command -v yq &>/dev/null || ! command -v jq &>/dev/null; then
+        if grep -Eq '^[[:space:]]*(workspace_binaries|workspace_binaries_by_target):' "$config_file"; then
+            log_error "yq and jq are required to validate workspace executable families"
+            return 3
+        fi
+        printf '        *) printf '\''%%s\\n'\'' '\''%s'\'' ;;\n' "$primary"
+        return 0
+    fi
+    if ! model=$(yq -o=json -I=0 '.' "$config_file" | jq -ces --arg primary "$primary" '
+        def names: type == "array" and all(.[];
+            type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            (contains("..") | not) and (ascii_downcase | endswith(".sha256") | not));
+        def effective: if length == 0 then [$primary] else . end;
+        def key($platform): if ($platform | startswith("windows/"))
+            then ascii_downcase | sub("\\.exe$"; "") + ".exe" else . end;
+        def family($platform):
+            effective | map(key($platform)) as $keys |
+            ($keys | unique | length) == ($keys | length) and
+            ($keys | index($primary | key($platform))) != null;
+        if length != 1 or (.[0] | type != "object") then error("invalid repo config") else .[0] end |
+        if (has("workspace_binaries") and (.workspace_binaries | names | not)) or
+           (has("workspace_binaries_by_target") and
+            (.workspace_binaries_by_target | type != "object" or
+                (all(to_entries[]; (.key | test("^[a-z0-9]+/[a-z0-9_]+$")) and (.value | names)) | not)))
+        then error("invalid workspace executable family") else . end |
+        (.workspace_binaries // []) as $base |
+        (.workspace_binaries_by_target // {}) as $overrides |
+        if ($base | family("linux/amd64") and family("windows/amd64")) and
+           all($overrides | to_entries[]; .key as $platform | .value | family($platform))
+        then {default:($base | effective), overrides:($overrides | with_entries(.value |= effective))}
+        else error("workspace family duplicates a binary or omits the configured primary") end
+    '); then
+        log_error "Invalid workspace executable family: every nonempty list must contain binary_name; Windows names must also be unique ignoring case and .exe"
+        return 4
+    fi
+    while IFS= read -r platform; do
+        names=$(jq -r --arg platform "$platform" '.overrides[$platform][]' <<< "$model") || return 4
+        printf '        %s) printf '\''%%s\\n'\''' "$platform"
+        while IFS= read -r name; do printf ' '\''%s'\''' "$name"; done <<< "$names"
+        printf ' ;;\n'
+    done < <(jq -r '.overrides | keys[]' <<< "$model")
+    names=$(jq -r '.default[]' <<< "$model") || return 4
+    printf '        *) printf '\''%%s\\n'\'''
+    while IFS= read -r name; do printf ' '\''%s'\''' "$name"; done <<< "$names"
+    printf ' ;;\n'
+}
+
 # Generate install.sh for a single tool
 install_gen_create() {
     local tool_name="${1:-}"
@@ -1659,7 +1892,7 @@ install_gen_create() {
     # Extract values
     local repo binary_name language workflow_path local_path
     local archive_linux archive_darwin archive_windows
-    local artifact_naming linux_libc_fallback=none
+    local artifact_naming linux_libc_fallback=none workspace_binary_cases
     local source_subdir source_entry source_package source_engine field value
 
     tool_name=$(_install_gen_yaml_get "$config_file" "tool_name" "$tool_name")
@@ -1668,6 +1901,7 @@ install_gen_create() {
     language=$(_install_gen_yaml_get "$config_file" "language" "go")
     workflow_path=$(_install_gen_yaml_get "$config_file" "workflow" ".github/workflows/release.yml")
     local_path=$(_install_gen_yaml_get "$config_file" "local_path" "")
+    workspace_binary_cases=$(_install_gen_workspace_cases "$config_file" "$binary_name") || return $?
 
     # Embed the source engine as code, but source-selection fields as validated
     # literals. Failure must precede creation or replacement of any installer.
@@ -1911,6 +2145,7 @@ install_gen_create() {
     template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
     template="${template//__TARGET_TRIPLE_CASES__/$target_triple_cases}"
     template="${template//__ARCH_ALIAS_CASES__/$arch_alias_cases}"
+    template="${template//__WORKSPACE_BINARY_CASES__/"$workspace_binary_cases"}"
     template="${template//__SOURCE_LANGUAGE__/"$language"}"
     template="${template//__SOURCE_SUBDIR__/"$source_subdir"}"
     template="${template//__SOURCE_ENTRY__/"$source_entry"}"

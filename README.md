@@ -628,8 +628,31 @@ dsr installer validate ntm                 # syntax, ShellCheck, safety checks
 The default output directory (`installers/` beside dsr, or
 `DSR_INSTALLER_DIR`, or `--output-dir`) is the one `dsr canary` tests. Commit
 each generated `install.sh` to its tool's repository. Regenerate after
-changing a tool's naming or targets, or the signing key, since the key is
-embedded at generation (see "Installers and Verification").
+changing a tool's naming, targets, workspace executables, or signing key,
+since these are embedded at generation (see "Installers and Verification").
+
+For a workspace release, the installer installs the complete configured
+executable set into the selected `--dir`:
+
+```yaml
+binary_name: tool
+workspace_binaries: [tool, tool-daemon, tool-worker]
+workspace_binaries_by_target:
+  windows/amd64: [tool]
+```
+
+A target override replaces the global list. An empty list (`[]`) selects
+only `binary_name`; every nonempty list must include that primary executable.
+Before replacing any executable, the installer requires exactly one nonempty
+archive member for each selected name and stages the complete set. A failed
+replacement restores the previous executables and leaves unrelated files
+alone. Successful `--json` output includes each installed executable's name,
+path, SHA-256 and byte size in `binaries`, alongside the primary `path`.
+
+Rust source fallback builds the same selected set from one pinned commit,
+including binaries in other workspace packages, and rejects ambiguous Cargo
+output providers. Source installation still requires `--from-source` or
+`--allow-source-build`; Go and Bun source builds support a single executable.
 
 ### `dsr canary`
 

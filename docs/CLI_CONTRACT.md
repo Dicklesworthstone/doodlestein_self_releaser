@@ -671,6 +671,59 @@ concurrent privileged mutation.
 
 ---
 
+### `dsr installer`
+
+Generate and validate standalone installers from registered tool configuration.
+
+```bash
+dsr installer generate <tool>... [--output-dir DIR] [--dry-run]
+dsr installer generate --all [--output-dir DIR] [--dry-run]
+dsr installer validate <tool>... [--output-dir DIR]
+```
+
+Generation writes `<output-dir>/<tool>/install.sh`; the default directory is
+`installers/` beside dsr, overridden by `DSR_INSTALLER_DIR` or `--output-dir`.
+The generated script embeds the tool's artifact naming, targets, verification
+key, source settings and executable selection. Regenerate it after changing
+those settings. Validation checks syntax, ShellCheck and required safety
+elements. Configuration errors exit 4; a failure affecting some tools exits 1.
+
+The generated installer's executable selection follows `workspace_binaries`
+and `workspace_binaries_by_target`. An explicit platform override replaces
+the global list, including an empty override. An empty or absent effective
+list selects only `binary_name`. Each nonempty list must contain that primary
+executable. Names must be safe basenames; Windows names are normalized to one
+`.exe` suffix and cannot collide when compared without case differences.
+Release installation does not require jq to select or install the set.
+
+After checksum and configured signature verification, the installer requires
+exactly one nonempty regular archive member for every selected executable.
+Missing, duplicate or unsafe members fail before any installed executable is
+replaced. All new payloads and backups are staged on the destination filesystem
+before replacement starts. A handled replacement failure restores the touched
+destinations; unrelated files are preserved. This is a sequence of file
+replacements with rollback, not one filesystem transaction over the entire
+directory. If recovery itself fails, the installer reports failure and retains
+its backup directory for recovery.
+
+Successful installer `--json` output retains the primary `path` and adds
+`binaries: [{name, path, sha256, size_bytes}]` for the complete installed set.
+It emits one result object. Failed installation emits an error result and
+does not report a partially installed set as success.
+
+Rust source fallback selects the same executable set with repeated Cargo
+`--bin` arguments in one locked build. Multiple selected binaries use the
+workspace unless `source_package` restricts the build to one package. Each
+selected output must have exactly one Cargo compiler-artifact provider;
+successful Cargo exit status alone does not admit colliding package outputs.
+All members share the verified source commit. Source receipts include every
+member's hash and size while preserving the primary receipt fields. Source
+builds require explicit consent through `--from-source` or
+`--allow-source-build`; Go and Bun source fallback accepts only a singleton
+selection. Integrity or installation failures never trigger source fallback.
+
+---
+
 ### `dsr fallback`
 
 Full fallback pipeline: check -> build -> release.

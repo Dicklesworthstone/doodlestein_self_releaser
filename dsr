@@ -13081,6 +13081,8 @@ DESCRIPTION:
     and libc detection, checksum verification, minisign verification with
     the configured key (or the `dsr signing init` key), staleness-aware
     source fallback, offline caching and agent-skill installation.
+    Installs every configured workspace executable for the selected platform,
+    with complete-set validation and rollback if replacement fails.
     The default output directory is the one `dsr canary` tests:
     installers/ beside dsr (override with --output-dir or DSR_INSTALLER_DIR).
     Commit each generated install.sh to its tool's repository so the

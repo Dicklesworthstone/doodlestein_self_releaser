@@ -71,6 +71,18 @@ reject_family() {
     check "$label" equal "$STATUS" 4
     check "$label before fetch" test ! -e "$WORK/$name"
 }
+reject_windows_family() {
+    local name="$1" label="$2" code=0; shift 2
+    # A platform-policy probe only: no Windows compiler/filesystem execution
+    # is claimed. Refusal must happen before even creating a checkout.
+    (
+        uname() { printf 'MINGW64_NT-policy-probe\n'; }
+        install_source_build example/source-family refs/tags/v1.0.0 rust family \
+            "$WORK/$name" --allow-build "$@"
+    ) > "$WORK/results/$name.json" 2> "$WORK/results/$name.log" || code=$?
+    check "$label (Windows policy only)" equal "$code" 4
+    check "$label before fetch" test ! -e "$WORK/$name"
+}
 
 cat > "$WORK/upstream/Cargo.toml" <<'TOML'
 [package]
@@ -87,9 +99,17 @@ path = "src/main.rs"
 [[bin]]
 name = "family-local"
 path = "src/local.rs"
+[[bin]]
+name = "FAMILY"
+path = "src/upper.rs"
+[[bin]]
+name = "family.exe"
+path = "src/exe.rs"
 TOML
 printf 'fn main() { println!("family-tag-v1"); }\n' > "$WORK/upstream/src/main.rs"
 printf 'fn main() { println!("local-tag-v1"); }\n' > "$WORK/upstream/src/local.rs"
+printf 'fn main() { println!("uppercase-tag-v1"); }\n' > "$WORK/upstream/src/upper.rs"
+printf 'fn main() { println!("literal-exe-tag-v1"); }\n' > "$WORK/upstream/src/exe.rs"
 cat > "$WORK/upstream/helper/Cargo.toml" <<'TOML'
 [package]
 name = "helper-package"
@@ -167,6 +187,37 @@ run_build package refs/tags/v1.0.0 rust family "$WORK/package" --allow-build --t
 check 'explicit package selects all requested binaries within that package' equal "$STATUS" 0
 check 'explicit package receipt includes exactly its declared pair' jq -e \
     '[.binaries[].name] == ["family","family-local"]' "$WORK/results/package.json"
+if [[ "$(uname -s)" == Linux ]]; then
+    run_build literal-names refs/tags/v1.0.0 rust FAMILY "$WORK/literal-names" --allow-build --timeout 60 \
+        --bin family --bin FAMILY
+    check 'Unix Cargo family preserves case-distinct binary names' equal "$STATUS" 0
+    check 'Unix literal binary receipt preserves exact declaration order' jq -e \
+        '[.binaries[].name] == ["family","FAMILY"]' "$WORK/results/literal-names.json"
+    check 'case-distinct primary remains tied to its exact output identity' jq -e \
+        '.binaries[1] as $primary | .path == $primary.path and .sha256 == $primary.sha256 and .size_bytes == $primary.size_bytes' \
+        "$WORK/results/literal-names.json"
+    for member in FAMILY family; do
+        path=$(jq -r --arg name "$member" '.binaries[] | select(.name == $name) | .path' "$WORK/results/literal-names.json")
+        case "$member" in
+            FAMILY) expected=uppercase-tag-v1 ;;
+            *) expected=family-tag-v1 ;;
+        esac
+        check "Unix literal $member executes its own Cargo target" equal "$("$path" 2>/dev/null)" "$expected"
+        check "Unix literal $member receipt binds its actual bytes" equal "$(_isb_sha256 "$path" 2>/dev/null)" \
+            "$(jq -r --arg name "$member" '.binaries[] | select(.name == $name) | .sha256' "$WORK/results/literal-names.json")"
+    done
+    # Cargo passes a literal bin name ending in .exe to rustc, which rejects
+    # the dot in its crate name. Preserve that real compiler failure rather
+    # than silently building the different target named "family".
+    run_build literal-exe refs/tags/v1.0.0 rust family.exe "$WORK/literal-exe" --allow-build --timeout 60 \
+        --bin family --bin family.exe
+    check 'literal Unix .exe target retains genuine Cargo failure' equal "$STATUS" 6
+    check 'literal Unix .exe target is passed intact to the compiler' grep -Fq \
+        'invalid character '\''.'\'' in crate name: `family.exe`' "$WORK/literal-exe/output/build.log"
+    check 'literal Unix .exe failure never attests the differently named binary' test ! -e "$WORK/literal-exe/receipt.json"
+else
+    printf 'SKIP: case-distinct Unix Cargo output fixture requires Linux\n'
+fi
 run_build wrong-package refs/tags/v1.0.0 rust family "$WORK/wrong-package" --allow-build --timeout 60 \
     --package family-package --bin family --bin family-helper
 check 'package restriction cannot silently widen to an unrelated member' equal "$STATUS" 6
@@ -178,8 +229,8 @@ check 'missing binary cannot publish a partial receipt' test ! -e "$WORK/missing
 
 reject_family omit-primary 'explicit family must contain its primary' --bin family-helper
 reject_family duplicate 'duplicate executable is rejected' --bin family --bin family
-reject_family case-collision 'case-folded executable collision is rejected' --bin family --bin FAMILY
-reject_family suffix-collision '.exe alias collision is rejected' --bin family --bin family.exe
+reject_windows_family case-collision 'case-folded executable collision is rejected' --bin family --bin FAMILY
+reject_windows_family suffix-collision '.exe alias collision is rejected' --bin family --bin family.exe
 reject_family unsafe 'path traversal executable name is rejected' --bin family --bin ../family-helper
 reject_family option-name 'option-shaped executable name is rejected' --bin family --bin --workspace
 run_build unsupported refs/tags/v1.0.0 go family "$WORK/unsupported" --allow-build --bin family --bin family-helper
