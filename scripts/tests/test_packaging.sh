@@ -12,7 +12,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_ROOT="${DSR_PACKAGING_TEST_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 SRC_DIR="$PROJECT_ROOT/src"
 
 source "$SRC_DIR/packaging.sh"
@@ -586,6 +586,14 @@ awk '/^    _build_package_archive_for_target\(\) \{/{flag=1} flag{print} flag &&
 # Its in-place completion helper for release-named lane archives (GH#29).
 awk '/^    _build_complete_lane_archive\(\) \{/{flag=1} flag{print} flag && /^    \}$/{exit}' \
     "$PROJECT_ROOT/dsr" >> "$EXTRACTED"
+# Extract the production include validator and raw payload staging helper;
+# both are dependencies of the target packager rather than test substitutes.
+awk '/^    _build_archive_missing_includes\(\) \(/{flag=1} flag{print} flag && /^    \)$/{exit}' \
+    "$PROJECT_ROOT/dsr" >> "$EXTRACTED"
+awk '/^    _build_package_named_binary\(\) \(/{flag=1} flag{print} flag && /^    \)$/{exit}' \
+    "$PROJECT_ROOT/dsr" >> "$EXTRACTED"
+awk '/^_act_is_safe_basename\(\) \{/{flag=1} flag{print} flag && /^\}$/{exit}' \
+    "$SRC_DIR/act_runner.sh" >> "$EXTRACTED"
 
 if ! bash -n "$EXTRACTED" 2>/dev/null || ! grep -q "packaging_repack_archive" "$EXTRACTED"; then
     log_fail "extract _build_package_archive_for_target from dsr"
@@ -629,7 +637,7 @@ else
             # shellcheck disable=SC1090
             source "$EXTRACTED"
             _build_package_archive_for_target "mcp-agent-mail" "0.3.31" "linux/amd64" \
-                "$outdir" "" "mcp-agent-mail" "$override"
+                "$outdir" "$PAYLOAD" "mcp-agent-mail" "$override"
         )
     }
 
@@ -770,9 +778,10 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
     run_build_package_with_repo() {
         # $1 = configured format, $2 = artifact path, $3 = output dir,
         # $4 = versioned name, $5 = repo_path, $6 = warn log file,
-        # $7 = compat name (defaults to the versioned name)
+        # $7 = compat name (defaults to the versioned name),
+        # $8 = additional configured include for rejection cases
         local cfg_format="$1" override="$2" outdir="$3" versioned="$4" repo="$5" warnlog="$6"
-        local compat="${7:-$4}"
+        local compat="${7:-$4}" extra_include="${8:-}"
         (
             set -uo pipefail
             log_info() { :; }
@@ -786,7 +795,10 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
             _build_detect_compat_ext() { echo ""; }
             _build_detect_install_ext() { return 0; }
             _build_find_binary() { return 0; }
-            _build_get_include_files() { printf 'LICENSE\nREADME.md\nCHANGELOG.md\n'; }
+            _build_get_include_files() {
+                printf 'LICENSE\nREADME.md\n'
+                [[ -z "$extra_include" ]] || printf '%s\n' "$extra_include"
+            }
             _build_is_archive_ext() {
                 case "$1" in
                     *.tar.gz|*.tgz|*.tar.xz|*.zip) return 0 ;;
@@ -805,15 +817,16 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
             source "$PROJECT_ROOT/src/packaging.sh"
             # shellcheck disable=SC1090
             source "$EXTRACTED"
+            local rc=0
             _build_package_archive_for_target "rano" "0.2.1" "linux/amd64" \
-                "$outdir" "$repo" "rano" "$override"
+                "$outdir" "$repo" "rano" "$override" || rc=$?
             echo "collect_failed=$collect_failed" >> "$warnlog"
+            return "$rc"
         )
     }
 
     # The rano v0.2.1 shape: lane produced a lone-binary tar.gz, config wants
-    # tar.xz, LICENSE and README.md exist in the checkout, CHANGELOG.md does
-    # not (must warn, not fail).
+    # tar.xz, and LICENSE and README.md exist in the checkout.
     RANO_OUT="$TEMP_DIR/rano-out"
     mkdir -p "$RANO_OUT"
     RANO_GZ="$RANO_OUT/rano-lone.tar.gz"
@@ -826,9 +839,18 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
     [[ "$(sorted_members "$RANO_XZ" tar.xz 2>/dev/null)" == "$EXPECTED_INC_MEMBERS" ]] && \
         log_pass "lone-binary tar.gz -> tar.xz gains LICENSE and README.md" || \
         log_fail "lone-binary tar.gz -> tar.xz gains LICENSE and README.md ('$(sorted_members "$RANO_XZ" tar.xz 2>/dev/null)')"
-    grep -q "Include file not found for rano: CHANGELOG.md" "$RANO_WARN" && \
-        log_pass "missing configured include is warned about" || \
-        log_fail "missing configured include is warned about"
+    RANO_MISSING="$TEMP_DIR/rano-missing-include"
+    mkdir -p "$RANO_MISSING"
+    if run_build_package_with_repo "tar.xz" "$LONE_GZ" "$RANO_MISSING" \
+        "rano.tar.xz" "$INC_DIR" "$RANO_MISSING/warnings.log" "" "CHANGELOG.md"; then
+        log_fail "missing configured include fails packaging"
+    elif [[ ! -e "$RANO_MISSING/rano.tar.xz" ]] && \
+        grep -q "Configured include for rano is missing or unsafe: CHANGELOG.md" "$RANO_MISSING/warnings.log" && \
+        grep -qx "collect_failed=true" "$RANO_MISSING/warnings.log"; then
+        log_pass "missing configured include fails packaging without an incomplete archive"
+    else
+        log_fail "missing configured include fails packaging without an incomplete archive"
+    fi
 
     # Same-format lane archive already occupying the release name without
     # the includes (GH#29): completed in place from its own payload, the new
@@ -899,23 +921,105 @@ if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
         log_pass "same-format lane archive is rebuilt with includes under the release name" || \
         log_fail "same-format lane archive is rebuilt with includes under the release name"
 
-    # Unresolved local_path with configured includes: warn, never silent.
+    # Configured includes require their source directory; absence must fail
+    # instead of silently emitting a payload-only archive.
     RANO_OUT4="$TEMP_DIR/rano-out4"
     mkdir -p "$RANO_OUT4"
     RANO_GZ4="$RANO_OUT4/rano-lone.tar.gz"
     cp "$LONE_GZ" "$RANO_GZ4"
     RANO_WARN4="$RANO_OUT4/warnings.log"
     : > "$RANO_WARN4"
-    run_build_package_with_repo "tar.xz" "$RANO_GZ4" "$RANO_OUT4" \
-        "rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz" "" "$RANO_WARN4" >/dev/null 2>&1
-    grep -q "local_path is unresolved" "$RANO_WARN4" && \
-        log_pass "unresolved local_path with include_files is warned about" || \
-        log_fail "unresolved local_path with include_files is warned about"
-    [[ "$(sorted_members "$RANO_OUT4/rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz" tar.xz 2>/dev/null)" == "rano" ]] && \
-        log_pass "unresolved local_path still produces the payload-only archive" || \
-        log_fail "unresolved local_path still produces the payload-only archive"
+    if run_build_package_with_repo "tar.xz" "$RANO_GZ4" "$RANO_OUT4" \
+        "rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz" "" "$RANO_WARN4" >/dev/null 2>&1; then
+        log_fail "unresolved source root with include_files fails packaging"
+    elif grep -q "Cannot package configured include_files" "$RANO_WARN4" && \
+        grep -qx "collect_failed=true" "$RANO_WARN4"; then
+        log_pass "unresolved source root with include_files fails packaging"
+    else
+        log_fail "unresolved source root with include_files reports its cause"
+    fi
+    [[ ! -e "$RANO_OUT4/rano-0.2.1-x86_64-unknown-linux-gnu.tar.xz" ]] && \
+        log_pass "unresolved source root produces no incomplete archive" || \
+        log_fail "unresolved source root produces no incomplete archive"
 else
     log_skip "dsr include_files packager scenarios (extraction unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
+log_test "dsr raw executable staging preserves names, companions and modes"
+
+if [[ -f "$EXTRACTED" ]] && bash -n "$EXTRACTED" 2>/dev/null; then
+    # shellcheck disable=SC1090
+    source "$EXTRACTED"
+    RAW_ROOT="$TEMP_DIR/raw-staging"
+    mkdir -p "$RAW_ROOT/includes/docs" "$RAW_ROOT/includes/legal"
+    printf 'collected executable payload\n' > "$RAW_ROOT/collected-linux-amd64"
+    chmod 0761 "$RAW_ROOT/collected-linux-amd64"
+    printf 'user documentation notice\n' > "$RAW_ROOT/includes/docs/NOTICE"
+    printf 'third-party license notice\n' > "$RAW_ROOT/includes/legal/NOTICE"
+    chmod 0754 "$RAW_ROOT/includes/docs/NOTICE"
+    chmod 0645 "$RAW_ROOT/includes/legal/NOTICE"
+    cp -p "$RAW_ROOT/collected-linux-amd64" "$RAW_ROOT/includes/rano"
+    for raw_format in tar.gz tgz tar.xz zip; do
+        if [[ "$raw_format" == zip ]] && \
+            { ! command -v zip >/dev/null || ! command -v unzip >/dev/null; }; then
+            log_skip "raw zip staging requires zip and unzip"
+            continue
+        fi
+        raw_archive="$RAW_ROOT/rano.$raw_format"
+        raw_extract="$RAW_ROOT/extracted-$raw_format"
+        mkdir -p "$raw_extract"
+        if _build_package_named_binary "$raw_format" "$raw_archive" \
+            "$RAW_ROOT/collected-linux-amd64" rano "$RAW_ROOT/includes" \
+            docs/NOTICE legal/NOTICE docs/NOTICE; then
+            log_pass "$raw_format stages the configured raw executable name"
+        else
+            log_fail "$raw_format stages the configured raw executable name"
+            continue
+        fi
+        [[ "$(sorted_members "$raw_archive" "$raw_format")" == $'docs/NOTICE\nlegal/NOTICE\nrano' ]] && \
+            log_pass "$raw_format retains duplicate-basename companion hierarchy" || \
+            log_fail "$raw_format retains duplicate-basename companion hierarchy"
+        if packaging_extract_payload "$raw_archive" "$raw_format" "$raw_extract" && \
+            cmp -s "$RAW_ROOT/collected-linux-amd64" "$raw_extract/rano" && \
+            cmp -s "$RAW_ROOT/includes/docs/NOTICE" "$raw_extract/docs/NOTICE" && \
+            cmp -s "$RAW_ROOT/includes/legal/NOTICE" "$raw_extract/legal/NOTICE" && \
+            [[ "$(_pkg_executable_bits "$raw_extract/rano")" == "$((8#761 & 0111))" && \
+               "$(_pkg_executable_bits "$raw_extract/docs/NOTICE")" == "$((8#754 & 0111))" && \
+               "$(_pkg_executable_bits "$raw_extract/legal/NOTICE")" == "$((8#645 & 0111))" ]]; then
+            log_pass "$raw_format preserves every payload byte and executable bit"
+        else
+            log_fail "$raw_format preserves every payload byte and executable bit"
+        fi
+        cp -p "$raw_archive" "$RAW_ROOT/prior-$raw_format"
+        chmod 0761 "$RAW_ROOT/includes/rano"
+        if _build_package_named_binary "$raw_format" "$raw_archive" \
+            "$RAW_ROOT/collected-linux-amd64" rano "$RAW_ROOT/includes" \
+            docs/NOTICE legal/NOTICE rano rano && \
+            cmp -s "$raw_archive" "$RAW_ROOT/prior-$raw_format"; then
+            log_pass "$raw_format identical executable include is idempotent"
+        else
+            log_fail "$raw_format identical executable include is idempotent"
+        fi
+        # Both files remain executable. Equality requires each 0111 bit,
+        # rather than either a byte-only match or the current user's -x.
+        chmod 0760 "$RAW_ROOT/includes/rano"
+        if _build_package_named_binary "$raw_format" "$raw_archive" \
+            "$RAW_ROOT/collected-linux-amd64" rano "$RAW_ROOT/includes" \
+            docs/NOTICE legal/NOTICE rano; then
+            log_fail "$raw_format conflicting executable include mode is refused"
+        else
+            raw_rc=$?
+            [[ $raw_rc -eq 4 ]] && \
+                log_pass "$raw_format conflicting executable include mode is refused" || \
+                log_fail "$raw_format include mode refusal returns invalid payload ($raw_rc)"
+        fi
+        cmp -s "$raw_archive" "$RAW_ROOT/prior-$raw_format" && \
+            log_pass "$raw_format failed raw staging preserves the prior archive" || \
+            log_fail "$raw_format failed raw staging preserves the prior archive"
+    done
+else
+    log_fail "raw staging helpers unavailable"
 fi
 
 # ---------------------------------------------------------------------------

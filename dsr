@@ -3798,13 +3798,13 @@ EOF
         done
     }
 
-    # Collection qualifies native raw payloads by triple. Their public
-    # archives must still contain the configured executable name, with the
-    # same bytes and mode, rather than that transport filename.
+    # All raw build payloads use the same verified, atomic archive gate.
+    # Collection may qualify transport names by target; the archive keeps
+    # the configured executable name and the complete companion hierarchy.
     _build_package_named_binary() (
         local format="$1" archive="$2" source="$3" member="$4" include_root="$5"
         shift 5
-        local workdir include
+        local workdir include source_bits staged_bits
         local -a members=("$member")
         _act_is_safe_basename "$member" || return 4
         [[ -f "$source" && ! -L "$source" ]] || return 4
@@ -3816,15 +3816,27 @@ EOF
             packaging_member_is_safe "$include" || return 4
             [[ -n "$include_root" && -f "$include_root/$include" ]] && \
                 _pkg_path_has_no_links "$include_root" "$include" || return 4
+            _pkg_path_has_no_links "$workdir" "$include" || return 4
             if [[ -e "$workdir/$include" ]]; then
                 cmp -s "$include_root/$include" "$workdir/$include" || return 4
+                source_bits=$(_pkg_executable_bits "$include_root/$include") || return 4
+                staged_bits=$(_pkg_executable_bits "$workdir/$include") || return 4
+                [[ "$source_bits" == "$staged_bits" ]] || return 4
                 continue
             fi
             mkdir -p -- "$workdir/$(dirname "$include")" || return 4
             cp -p -- "$include_root/$include" "$workdir/$include" || return 4
             members+=("$include")
         done
-        packaging_build_archive "$format" "$archive" "$workdir" "${members[@]}"
+        local packaging_exit=0
+        packaging_build_archive "$format" "$archive" "$workdir" "${members[@]}" || packaging_exit=$?
+        if [[ $packaging_exit -eq 3 ]]; then
+            case "$format" in
+                zip) log_error "zip and unzip are required for ZIP archive packaging" ;;
+                *) log_error "tar is required for $format archive packaging" ;;
+            esac
+        fi
+        return "$packaging_exit"
     )
 
     _build_package_archive_for_target() {
@@ -4023,130 +4035,21 @@ EOF
 
         local raw_member="$binary_name"
         [[ "$os" != windows || "$raw_member" == *.exe ]] || raw_member+=.exe
-        if [[ -n "$target_triple" && "${binary_path##*/}" != "$raw_member" ]]; then
-            if ! _build_package_named_binary "$format" "$archive_path" "$binary_path" \
-                "$raw_member" "$repo_path" "${include_files[@]}"; then
-                log_error "Failed to package the named executable for $tool $target $target_triple"
-                collect_failed=true
-                return 1
-            fi
-            _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
-            if [[ -n "$compat_name" && "$compat_name" != "$versioned_name" ]]; then
-                if _build_is_archive_ext "$compat_name"; then
-                    _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
-                else
-                    _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
-                fi
-            fi
-            return 0
+        if ! _build_package_named_binary "$format" "$archive_path" "$binary_path" \
+            "$raw_member" "$repo_path" "${include_files[@]}"; then
+            log_error "Failed to package the named executable and configured includes for $tool $target ${target_triple:-}"
+            collect_failed=true
+            return 1
         fi
-
-        if [[ "$format" == "tar.gz" || "$format" == "tgz" ]]; then
-            if [[ -f "$archive_path" ]]; then
-                log_warn "Overwriting existing archive: $archive_path"
-            fi
-            local -a tar_args=()
-            local binary_dir
-            binary_dir=$(dirname "$binary_path")
-            tar_args=(--no-xattrs -czf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
-            if [[ -n "$repo_path" ]]; then
-                for include in "${include_files[@]}"; do
-                    if [[ -f "$repo_path/$include" ]]; then
-                        tar_args+=(-C "$repo_path" "$include")
-                    else
-                        log_warn "Include file not found for $tool: $include"
-                    fi
-                done
-            fi
-            # COPYFILE_DISABLE suppresses macOS copyfile metadata while
-            # --no-xattrs prevents bsdtar from encoding source-file xattrs as
-            # AppleDouble ._* members that GNU tar exposes on Linux. Both are
-            # required for cross-platform strict installer member allowlists.
-            if COPYFILE_DISABLE=1 tar "${tar_args[@]}"; then
-                _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
-                if [[ -n "$compat_name" ]]; then
-                    if _build_is_archive_ext "$compat_name"; then
-                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
-                    else
-                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
-                    fi
-                fi
+        _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
+        if [[ -n "$compat_name" && "$compat_name" != "$versioned_name" ]]; then
+            if _build_is_archive_ext "$compat_name"; then
+                _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
             else
-                log_error "Failed to create archive: $archive_path"
-                collect_failed=true
-                return 1
-            fi
-            return 0
-        fi
-
-        if [[ "$format" == "tar.xz" ]]; then
-            if [[ -f "$archive_path" ]]; then
-                log_warn "Overwriting existing archive: $archive_path"
-            fi
-            local -a tar_args=()
-            local binary_dir
-            binary_dir=$(dirname "$binary_path")
-            tar_args=(--no-xattrs -cJf "$archive_path" -C "$binary_dir" "$(basename "$binary_path")")
-            # COPYFILE_DISABLE: see tar.gz branch above (AppleDouble sidecars).
-            if [[ -n "$repo_path" ]]; then
-                for include in "${include_files[@]}"; do
-                    if [[ -f "$repo_path/$include" ]]; then
-                        tar_args+=(-C "$repo_path" "$include")
-                    else
-                        log_warn "Include file not found for $tool: $include"
-                    fi
-                done
-            fi
-            if COPYFILE_DISABLE=1 tar "${tar_args[@]}"; then
-                _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
-                if [[ -n "$compat_name" ]]; then
-                    if _build_is_archive_ext "$compat_name"; then
-                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
-                    else
-                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
-                    fi
-                fi
-            else
-                log_error "Failed to create archive: $archive_path"
-                collect_failed=true
-                return 1
-            fi
-            return 0
-        fi
-
-        if [[ "$format" == "zip" ]]; then
-            if ! command -v zip &>/dev/null; then
-                log_warn "zip not available; skipping archive packaging for $tool $target"
-                return 0
-            fi
-            if [[ -f "$archive_path" ]]; then
-                log_warn "Overwriting existing archive: $archive_path"
-            fi
-            local -a zip_inputs=("$binary_path")
-            if [[ -n "$repo_path" ]]; then
-                for include in "${include_files[@]}"; do
-                    if [[ -f "$repo_path/$include" ]]; then
-                        zip_inputs+=("$repo_path/$include")
-                    else
-                        log_warn "Include file not found for $tool: $include"
-                    fi
-                done
-            fi
-            if zip -j -q -FS "$archive_path" "${zip_inputs[@]}"; then
-                _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
-                if [[ -n "$compat_name" ]]; then
-                    if _build_is_archive_ext "$compat_name"; then
-                        _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
-                    else
-                        _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
-                    fi
-                fi
-            else
-                log_error "Failed to create archive: $archive_path"
-                collect_failed=true
-                return 1
+                _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
             fi
         fi
+        return 0
     }
 
     _build_package_archives() {
