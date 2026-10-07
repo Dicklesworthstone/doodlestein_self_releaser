@@ -1172,9 +1172,9 @@ _doctor_summary() {
 # CHECK SUBCOMMAND
 # ============================================================================
 
-# Configured tools as "tool<TAB>owner/repo<TAB>workflow" lines: repos.d files
-# first (flat keys, or the older github.repo/github.workflow layout), then
-# registry-only tools. One line per repository.
+# Configured tools as JSON records: repos.d files first (flat keys, or the
+# older github.repo/github.workflow layout), then registry-only tools. Keep
+# optional tool/workflow fields separate even when they are empty.
 _check_configured_repos() {
     command -v yq &>/dev/null || return 0
     local config_dir="${DSR_CONFIG_DIR:-$HOME/.config/dsr}"
@@ -1182,7 +1182,7 @@ _check_configured_repos() {
     local file line repo
     local -A seen=()
     while IFS= read -r line; do
-        IFS=$'\t' read -r _ repo _ <<< "$line"
+        repo=$(jq -r '.repo // ""' <<< "$line" 2>/dev/null) || continue
         [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || continue
         [[ -z "${seen[${repo,,}]:-}" ]] || continue
         seen["${repo,,}"]=1
@@ -1190,12 +1190,14 @@ _check_configured_repos() {
     done < <(
         for file in "$config_dir"/repos.d/*.yaml; do
             [[ -f "$file" && "${file##*/}" != _* ]] || continue
-            yq -r '[(.tool_name // .name // ""), (.repo // .github.repo // ""),
-                    (.workflow // .github.workflow // "")] | @tsv' "$file" 2>/dev/null
+            yq -o=json -I=0 '{"tool": (.tool_name // .name // ""),
+                "repo": (.repo // .github.repo // ""),
+                "workflow": (.workflow // .github.workflow // "")}' "$file" 2>/dev/null
         done
         if [[ -f "$registry" ]]; then
-            yq -r '.tools // {} | to_entries[] |
-                [.key, (.value.repo // ""), (.value.workflow // "")] | @tsv' "$registry" 2>/dev/null
+            yq -o=json -I=0 '.tools // {} | to_entries[] |
+                {"tool": .key, "repo": (.value.repo // ""),
+                 "workflow": (.value.workflow // "")}' "$registry" 2>/dev/null
         fi
     )
 }
@@ -1313,7 +1315,8 @@ EOF
             [[ -n "$arg" ]] || continue
             found=""
             for line in ${configured_repos[@]+"${configured_repos[@]}"}; do
-                IFS=$'\t' read -r tool repo workflow <<< "$line"
+                tool=$(jq -r '.tool // ""' <<< "$line")
+                repo=$(jq -r '.repo // ""' <<< "$line")
                 if [[ "$arg" == "$tool" || "${arg,,}" == "${repo,,}" ]]; then
                     found="$line"
                     break
@@ -1323,7 +1326,7 @@ EOF
                 # Unconfigured short names keep the historical default owner.
                 repo="$arg"
                 [[ "$repo" == */* ]] || repo="Dicklesworthstone/$repo"
-                found=$'\t'"$repo"$'\t'
+                found=$(jq -nc --arg repo "$repo" '{tool: null, repo: $repo, workflow: null}')
             fi
             targets+=("$found")
         done
@@ -1352,7 +1355,9 @@ EOF
     now=$(date +%s)
 
     for line in "${targets[@]}"; do
-        IFS=$'\t' read -r tool repo workflow <<< "$line"
+        tool=$(jq -r '.tool // ""' <<< "$line")
+        repo=$(jq -r '.repo // ""' <<< "$line")
+        workflow=$(jq -r '.workflow // ""' <<< "$line")
         $all_workflows && workflow=""
         local result
         result=$(_check_repo "$repo" "$threshold" "$now" "${workflow##*/}")
@@ -1753,10 +1758,10 @@ _watch_iteration() {
         _WATCH_CURRENT_BACKOFF=0
     fi
 
-    # Throttled runs: .details.throttled[] (schemas/check-details.json)
+    # Throttled runs: .details.throttled[] (schemas/check-details.json).
+    # JSON records preserve an absent tool independently of the run's ref.
     local throttled_runs
-    throttled_runs=$(jq -r '.details.throttled[]? |
-        [(.run_id | tostring), .repo, (.tool // ""), (.head_branch // "")] | @tsv' \
+    throttled_runs=$(jq -c '.details.throttled[]?' \
         <<< "$check_output" 2>/dev/null)
 
     if [[ -z "$throttled_runs" ]]; then
@@ -1765,9 +1770,13 @@ _watch_iteration() {
     fi
 
     # Process each throttled run
-    local run_id repo tool_name ref
-    while IFS=$'\t' read -r run_id repo tool_name ref; do
+    local run run_id repo tool_name ref
+    while IFS= read -r run; do
+        run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
         [[ -z "$run_id" ]] && continue
+        repo=$(jq -r '.repo // ""' <<< "$run")
+        tool_name=$(jq -r '.tool // ""' <<< "$run")
+        ref=$(jq -r '.head_branch // ""' <<< "$run")
 
         # Check if already triggered
         if _watch_is_triggered "$run_id"; then

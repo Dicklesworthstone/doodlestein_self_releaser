@@ -261,6 +261,137 @@ _queued_release_run() {
         "$(_minutes_ago 15)"
 }
 
+# The same routing regressions can exercise an untouched checkout. Keep the
+# actual CLI and YAML parser; only GitHub transport and child CLI calls vary.
+_routing_dsr() {
+    "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" "$@" 2>/dev/null
+}
+
+_routing_watch() {
+    local check_json="$1"
+    shift
+    printf '%s\n' "$check_json" > "$TEST_TMPDIR/watch-check.json"
+    cat > "$TEST_TMPDIR/child-dsr" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    doctor) exit 0 ;;
+    --json)
+        [[ "$2" == check ]] || exit 99
+        cat "$TEST_TMPDIR/watch-check.json"
+        exit 1
+        ;;
+    --non-interactive)
+        [[ "$2" == fallback ]] || exit 99
+        printf '%s\0' "$@" >> "$TEST_TMPDIR/fallback.args"
+        ;;
+    *) exit 99 ;;
+esac
+EOF
+    chmod +x "$TEST_TMPDIR/child-dsr"
+    # Sourcing preserves the real CLI's BASH_SOURCE/module paths while $0 is
+    # the child boundary above. Wait for the recorded background invocation.
+    bash -c 'trap "wait" EXIT; source "$1" "${@:2}"' \
+        "$TEST_TMPDIR/child-dsr" "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" \
+        --json watch --once --notify none "$@"
+}
+
+@test "nullable routing: check reaches an unregistered owner/repo without inventing a tool" {
+    harness_create_config
+    _mock_gh_runs '{"workflow_runs": []}'
+
+    run _routing_dsr --json check outsider/standalone
+    assert_equal "0" "$status"
+    echo "$output" | jq -e '.details.repos_checked == ["outsider/standalone"] and
+        .details.repos[0].tool == null and .details.repos[0].workflow == null'
+    grep -q 'api repos/outsider/standalone/actions/runs' "$TEST_TMPDIR/gh.calls"
+    jq -e '.repos_checked == ["outsider/standalone"]' "$DSR_STATE_DIR/check/last.json"
+}
+
+@test "nullable routing: check keeps the default owner for an unregistered short name" {
+    harness_create_config
+    _mock_gh_runs '{"workflow_runs": []}'
+
+    run _routing_dsr --json check standalone
+    assert_equal "0" "$status"
+    echo "$output" | jq -e '.details.repos_checked == ["Dicklesworthstone/standalone"] and
+        .details.repos[0].tool == null'
+    grep -q 'api repos/Dicklesworthstone/standalone/actions/runs' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "nullable routing: check preserves a configured workflow when tool identity is absent" {
+    harness_create_config
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    _mock_gh_runs "$(_queued_release_run)"
+
+    local layout
+    for layout in flat legacy; do
+        if [[ "$layout" == flat ]]; then
+            cat > "$DSR_CONFIG_DIR/repos.d/unnamed.yaml" <<'EOF'
+tool_name: null
+repo: Dicklesworthstone/ntm
+workflow: .github/workflows/release.yml
+EOF
+        else
+            cat > "$DSR_CONFIG_DIR/repos.d/unnamed.yaml" <<'EOF'
+github:
+  repo: Dicklesworthstone/ntm
+  workflow: .github/workflows/release.yml
+EOF
+        fi
+        run _routing_dsr --json check Dicklesworthstone/ntm
+        assert_equal "1" "$status"
+        echo "$output" | jq -e '.details.repos_checked == ["Dicklesworthstone/ntm"] and
+            .details.repos[0].tool == null and .details.repos[0].workflow == "release.yml" and
+            (.details.throttled[0] | .tool == null and .head_branch == "v1.2.3")'
+        grep -q 'api repos/Dicklesworthstone/ntm/actions/workflows/release.yml/runs' "$TEST_TMPDIR/gh.calls"
+    done
+}
+
+@test "nullable routing: watch does not use a version tag as a missing tool" {
+    harness_create_config
+    local check_json='{"details":{"throttled":[{"run_id":12345,"repo":"outsider/standalone","tool":null,"head_branch":"v1.2.3"}]}}'
+
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    assert_contains "$output" "No dsr tool is configured for outsider/standalone"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
+    [[ ! -e "$DSR_STATE_DIR/fallback-12345.log" ]]
+    [[ ! -e "$DSR_STATE_DIR/triggered.json" ]]
+}
+
+@test "nullable routing: watch does not use a branch as an omitted tool" {
+    harness_create_config
+    local check_json='{"details":{"throttled":[{"run_id":12345,"repo":"outsider/standalone","head_branch":"release/latest"}]}}'
+
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    assert_contains "$output" "No dsr tool is configured for outsider/standalone"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
+    [[ ! -e "$DSR_STATE_DIR/triggered.json" ]]
+}
+
+@test "nullable routing: watch passes a known tool and its tag as distinct fallback arguments" {
+    harness_create_config
+    local check_json='{"details":{"throttled":[{"run_id":12345,"repo":"Dicklesworthstone/ntm","tool":"ntm","head_branch":"v1.2.3"}]}}'
+
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    jq -Rse 'split("\u0000") ==
+        ["--non-interactive", "fallback", "ntm", "--version", "v1.2.3", ""]' \
+        "$TEST_TMPDIR/fallback.args"
+    jq -e '.runs["12345"] != null' "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "nullable routing: watch keeps a known tool when the branch is null" {
+    harness_create_config
+    local check_json='{"details":{"throttled":[{"run_id":12345,"repo":"Dicklesworthstone/ntm","tool":"ntm","head_branch":null}]}}'
+
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    jq -Rse 'split("\u0000") == ["--non-interactive", "fallback", "ntm", ""]' \
+        "$TEST_TMPDIR/fallback.args"
+}
+
 @test "dsr check defaults to every configured repo's release workflow" {
     harness_create_config
     _setup_repos_d
