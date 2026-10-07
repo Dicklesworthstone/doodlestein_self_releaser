@@ -528,5 +528,94 @@ if command -v setsid >/dev/null; then
     check 'piped install without a terminal points at --yes' grep -q -- 'Re-run with --yes' "$case_dir/err"
 fi
 
+# Archive configuration must survive generation, not just runtime-variable
+# overrides. Use real archives/raw payloads and the generated entry point;
+# only platform detection is replaced for the Windows filename cases.
+if command -v yq >/dev/null && command -v jq >/dev/null; then
+    format_config="$DSR_CONFIG_DIR/repos.d/format-demo.yaml"
+    format_case=0
+    format_installer=''
+    format_host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$(uname -m)" in x86_64|amd64) format_host_arch=amd64 ;; aarch64|arm64) format_host_arch=arm64 ;; *) exit 3 ;; esac
+    format_host="$format_host_os/$format_host_arch"
+    for selection in "scalar:tar.xz:$format_host" "scalar:tgz:$format_host" \
+        "scalar:zip:$format_host" "scalar:binary:$format_host" \
+        'scalar:binary:windows/amd64' "map:binary:$format_host" \
+        'map:binary:windows/amd64' "partial:zip:$format_host"; do
+        shape="${selection%%:*}"
+        rest="${selection#*:}"
+        configured="${rest%%:*}"
+        platform="${rest#*:}"
+        format_case=$((format_case + 1))
+        format_dir="$work/config-format-$format_case"
+        mkdir -p "$format_dir/payload"
+        printf '%s\n' 'tool_name: format-demo' 'repo: example/format-demo' \
+            'binary_name: demo' 'artifact_naming: ${name}-${version}-${os}-${arch}' > "$format_config"
+        case "$shape" in
+            scalar) printf 'archive_format: %s\n' "$configured" >> "$format_config" ;;
+            map) printf 'archive_format:\n  linux: %s\n  darwin: %s\n  windows: %s\n' \
+                "$configured" "$configured" "$configured" >> "$format_config" ;;
+            partial) printf 'archive_format:\n  windows: %s\n' "$configured" >> "$format_config" ;;
+        esac
+        status=0
+        format_installer=$(install_gen_create format-demo 2>> "$work/generate.log") || status=$?
+        check "$selection generates a usable installer" test "$status" -eq 0
+        [[ "$status" -eq 0 ]] || continue
+        format="$configured"
+        [[ "$shape" != partial ]] || format=tar.gz
+        member=demo
+        [[ "$platform" != windows/* ]] || member=demo.exe
+        if [[ "$format" == binary ]]; then
+            format=none
+            [[ "$platform" != windows/* ]] || format=exe
+        fi
+        cp "$work/case-1/bin/demo" "$format_dir/payload/$member"
+        name="format-demo-1.2.3-${platform%/*}-${platform#*/}"
+        [[ "$format" == none ]] || name+=".$format"
+        payload="$format_dir/$name"
+        case "$format" in
+            tar.gz|tgz) tar -czf "$payload" -C "$format_dir/payload" "$member" ;;
+            tar.xz) tar -cJf "$payload" -C "$format_dir/payload" "$member" ;;
+            zip) (cd "$format_dir/payload" && zip -q "$payload" "$member") ;;
+            none|exe) cp "$format_dir/payload/$member" "$payload" ;;
+        esac
+        digest=$(sha256sum < "$payload" | awk '{print $1}')
+        printf '%s  %s\n' "$digest" "$name" > "$payload.sha256"
+        status=0
+        TEST_INSTALL_PLATFORM="$platform" bash -c 'source "$1" --help >/dev/null 2>&1;
+            _detect_platform() { printf "%s\n" "$TEST_INSTALL_PLATFORM"; }
+            main --version v1.2.3 --offline "$2" --dir "$3" --cache-dir "$4" --no-skills --non-interactive --json' \
+            bash "$format_installer" "$payload" "$format_dir/bin" "$format_dir/cache" \
+            > "$format_dir/out" 2> "$format_dir/err" || status=$?
+        check "$selection installs its configured release bytes" \
+            test "$status" -eq 0 -a -x "$format_dir/bin/$member"
+        check "$selection preserves the executable payload" \
+            cmp -s "$format_dir/payload/$member" "$format_dir/bin/$member"
+        check "$selection reports the installed filename and hash" jq -es \
+            --arg member "$member" --arg digest "$(sha256sum < "$format_dir/payload/$member" | awk '{print $1}')" \
+            'length == 1 and .[0].status == "success" and .[0].binaries[0].name == $member and .[0].binaries[0].sha256 == $digest' \
+            "$format_dir/out"
+    done
+
+    # Invalid formats must fail before replacing a previously usable script,
+    # including values that would become executable shell text if embedded.
+    cp "$format_installer" "$work/format-installer.saved"
+    for invalid_format in 'archive_format: [tar.gz]' 'archive_format: true' \
+        'archive_format: rar' 'archive_format: {linux: [tar.gz]}' \
+        'archive_format: {windows: invalid}' 'archive_format: {linuz: tar.xz}' \
+        'archive_format: "$(exit 99)"'; do
+        printf '%s\n' 'tool_name: format-demo' 'repo: example/format-demo' \
+            'binary_name: demo' "$invalid_format" > "$format_config"
+        status=0
+        install_gen_create format-demo > "$work/invalid-format.out" 2> "$work/invalid-format.err" || status=$?
+        check "$invalid_format is refused during generation" test "$status" -eq 4
+        check 'invalid format returns no new installer path' test ! -s "$work/invalid-format.out"
+        check 'invalid format preserves the prior generated installer' cmp -s \
+            "$work/format-installer.saved" "$format_installer"
+    done
+else
+    echo 'note: archive-format generation cases require yq and jq'
+fi
+
 printf 'Generated installer integrity: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]

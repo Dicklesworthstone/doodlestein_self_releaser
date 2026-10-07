@@ -1874,6 +1874,47 @@ _install_gen_workspace_cases() {
     printf ' ;;\n'
 }
 
+# The build contract accepts one archive format for every OS or an OS map.
+# Resolve that shape before embedding shell literals. `binary` describes raw
+# release bytes: Unix asset names have no extension, Windows names use .exe.
+_install_gen_archive_formats() {
+    local config_file="$1" config_json formats
+    if ! command -v yq >/dev/null || ! command -v jq >/dev/null; then
+        if grep -Eq 'archive_format' "$config_file"; then
+            log_error "yq and jq are required to validate configured archive formats"
+            return 3
+        fi
+        printf 'tar.gz\ttar.gz\tzip\n'
+        return 0
+    fi
+    config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || {
+        log_error "Unable to parse archive formats in $config_file"
+        return 4
+    }
+    if ! formats=$(jq -ers '
+        def format:
+            type == "string" and IN("", "tar.gz", "tgz", "tar.xz", "zip", "tar", "binary", "none", "exe");
+        def selected($os):
+            (if type == "object" then .[$os] else . end) |
+            if . == null or . == "" then
+                if $os == "windows" then "zip" else "tar.gz" end
+            elif . == "binary" then
+                if $os == "windows" then "exe" else "none" end
+            else . end;
+        if length == 1 and (.[0] | type == "object") then .[0].archive_format
+        else error("expected one repository configuration") end |
+        if . == null or format or
+           (type == "object" and all(to_entries[];
+                (.key | IN("linux", "darwin", "windows")) and (.value == null or (.value | format))))
+        then [selected("linux"), selected("darwin"), selected("windows")] | @tsv
+        else error("archive_format must be a supported format or OS mapping") end
+    ' <<< "$config_json"); then
+        log_error "Invalid archive_format in $config_file"
+        return 4
+    fi
+    printf '%s\n' "$formats"
+}
+
 # Generate install.sh for a single tool
 install_gen_create() {
     local tool_name="${1:-}"
@@ -1891,7 +1932,7 @@ install_gen_create() {
 
     # Extract values
     local repo binary_name language workflow_path local_path
-    local archive_linux archive_darwin archive_windows
+    local archive_linux archive_darwin archive_windows archive_formats
     local artifact_naming linux_libc_fallback=none workspace_binary_cases
     local source_subdir source_entry source_package source_engine field value
 
@@ -1925,16 +1966,8 @@ install_gen_create() {
     [[ "$language" != rust || -z "$source_entry" ]] || return 4
     [[ "$language" == rust || -z "$source_package" ]] || return 4
 
-    # Archive formats (with yq for nested keys)
-    if command -v yq &>/dev/null; then
-        archive_linux=$(yq -r '.archive_format.linux // "tar.gz"' "$config_file" 2>/dev/null)
-        archive_darwin=$(yq -r '.archive_format.darwin // "tar.gz"' "$config_file" 2>/dev/null)
-        archive_windows=$(yq -r '.archive_format.windows // "zip"' "$config_file" 2>/dev/null)
-    else
-        archive_linux="tar.gz"
-        archive_darwin="tar.gz"
-        archive_windows="zip"
-    fi
+    archive_formats=$(_install_gen_archive_formats "$config_file") || return $?
+    IFS=$'\t' read -r archive_linux archive_darwin archive_windows <<< "$archive_formats"
 
     artifact_naming=$(_install_gen_yaml_get "$config_file" "artifact_naming" "")
     # Strip surrounding quotes if present

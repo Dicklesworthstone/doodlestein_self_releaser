@@ -660,6 +660,13 @@ each generated `install.sh` to its tool's repository. Regenerate after
 changing a tool's naming, targets, workspace executables, or signing key,
 since these are embedded at generation (see "Installers and Verification").
 
+The installer accepts the build's scalar `archive_format: tar.xz` or a mapping
+such as `archive_format: {linux: tar.xz, darwin: tar.gz, windows: zip}`. Omitted
+OS entries keep their defaults (tar.gz on Unix, zip on Windows). A `binary`
+format selects a raw executable with no Unix asset suffix or `.exe` on Windows.
+Configured formats require yq and jq during generation; unsupported formats
+fail before replacing an existing installer.
+
 For a workspace release, the installer installs the complete configured
 executable set into the selected `--dir`:
 
