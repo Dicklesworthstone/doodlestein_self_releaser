@@ -2059,6 +2059,10 @@ EOF
 }
 
 cmd_build() {
+    (
+    # Keep the coordinator's lock and cleanup local to this invocation, even
+    # when a caller sources the CLI or already owns the fallback build lock.
+    trap - EXIT
     local tool_name=""
     local targets=()
     local version=""
@@ -2500,7 +2504,7 @@ EOF
         fi
     fi
 
-    local resume_run_id="" resume_state=""
+    local resume_run_id="" resume_state="" resume_completed=false
     if $resume; then
         if ! build_state_init; then
             log_error "Build state initialization failed"
@@ -2517,7 +2521,6 @@ EOF
             return 4
         fi
         if ! _act_is_uuid "$resume_run_id" || \
-           [[ "$(jq -r '.status // empty' <<< "$resume_state")" == "completed" ]] || \
            [[ "$(jq -r '.status // empty' <<< "$resume_state")" == "cancelled" ]]; then
             log_error "Selected build state is not resumable"
             return 4
@@ -2553,6 +2556,21 @@ EOF
         fi
         build_source_sha="$resume_sha"
         build_source_ref="$resume_ref"
+        if [[ "$(jq -r '.status // empty' <<< "$resume_state")" == completed ]]; then
+            # Completion is persisted before the publication marker changes.
+            # A crash in that interval must remain recoverable from receipts.
+            if [[ ! -f "$output_dir/.dsr-build-purpose.json" || -L "$output_dir/.dsr-build-purpose.json" ]] || \
+               ! jq -es --arg run "$resume_run_id" --arg sha "$build_source_sha" --arg purpose "$build_purpose" '
+                    length == 1 and (.[0] | type == "object" and
+                    .build_purpose == $purpose and .publishable == false and
+                    .publication_schema == 1 and .publication_status == "pending" and
+                    .run_id == $run and .git_sha == $sha)
+                ' "$output_dir/.dsr-build-purpose.json" >/dev/null; then
+                log_error "Completed build has no interrupted publication to resume"
+                return 4
+            fi
+            resume_completed=true
+        fi
         build_source_roots_json=$(jq -cS '.context.source_roots // {}' <<< "$resume_state")
         build_target_hosts_json=$(jq -cS '.context.target_hosts // {}' <<< "$resume_state")
         if $build_release_contract_enabled && \
@@ -2632,6 +2650,38 @@ EOF
         return 0
     fi
 
+    # Reserve the same canonical tool/tag lock as fallback before touching
+    # output directories, and retain it through the final publication commit.
+    # The orchestrator inherits this ownership instead of releasing it when
+    # compilation finishes while collection and packaging are still running.
+    if ! command -v build_state_init &>/dev/null || ! build_state_init; then
+        log_error "Build state initialization failed"
+        return 4
+    fi
+    if ! $sync_only; then
+        if $resume; then
+            build_run_id="$resume_run_id"
+        elif [[ -z "$build_run_id" ]]; then
+            build_run_id=$(_act_generate_uuid) || return 4
+        fi
+        _act_is_uuid "$build_run_id" || return 4
+        if [[ -z "$build_source_sha" ]]; then
+            build_source_sha=$(git -C "$local_path" rev-parse --verify HEAD 2>/dev/null) || return 4
+        fi
+        [[ "$build_source_sha" =~ ^[0-9a-f]{40}$ ]] || return 4
+        if [[ "${DSR_BUILD_LOCK_HELD_BY_CALLER:-0}" != 1 ]]; then
+            local build_lock_exit=0
+            DSR_RUN_ID="$build_run_id" build_lock_acquire "$tool_name" "$tag" || build_lock_exit=$?
+            if [[ $build_lock_exit -ne 0 ]]; then
+                log_error "Build already in progress or its lock is unavailable"
+                return "$build_lock_exit"
+            fi
+            trap 'build_lock_release "$tool_name" "$tag" >/dev/null 2>&1 || true' EXIT
+        fi
+        local DSR_BUILD_LOCK_HELD_BY_CALLER=1
+        export DSR_BUILD_LOCK_HELD_BY_CALLER
+    fi
+
     if $build_release_contract_enabled; then
         local output_parent
         output_dir="${output_dir%/}"
@@ -2684,36 +2734,40 @@ EOF
         fi
     fi
 
-    if [[ "$build_purpose" == "diagnostic-native" ]]; then
-        local purpose_marker="$output_dir/.dsr-build-purpose.json"
-        if $resume; then
+    local purpose_marker="$output_dir/.dsr-build-purpose.json"
+    if ! $sync_only; then
+        if $resume && [[ -e "$purpose_marker" || -L "$purpose_marker" ]]; then
             if [[ ! -f "$purpose_marker" || -L "$purpose_marker" ]] || \
-               ! jq -es --arg run "$resume_run_id" --arg sha "$build_source_sha" '
+               ! jq -es --arg run "$resume_run_id" --arg sha "$build_source_sha" --arg purpose "$build_purpose" '
                     length == 1 and (.[0] | type == "object" and
-                    .build_purpose == "diagnostic-native" and .publishable == false and
+                    .build_purpose == $purpose and .publishable == false and
+                    .publication_status != "completed" and
                     .run_id == $run and .git_sha == $sha)
                 ' "$purpose_marker" >/dev/null; then
-                log_error "Diagnostic output purpose receipt is missing or inconsistent"
+                log_error "Output purpose receipt is inconsistent with the resumed build"
                 return 4
             fi
+        elif $resume && [[ "$build_purpose" == diagnostic-native ]]; then
+            log_error "Diagnostic output purpose receipt is missing"
+            return 4
         elif ! (umask 077; set -o noclobber;
-            jq -nc --arg run "$build_run_id" --arg sha "$build_source_sha" \
-                '{build_purpose: "diagnostic-native", publishable: false,
+            jq -nc --arg run "$build_run_id" --arg sha "$build_source_sha" --arg purpose "$build_purpose" \
+                '{publication_schema: 1, publication_status: "pending", build_purpose: $purpose, publishable: false,
                   run_id: $run, git_sha: $sha}' > "$purpose_marker"); then
-            log_error "Could not persist diagnostic output purpose"
+            log_error "Could not persist non-publishable build output purpose"
             return 4
         fi
-    fi
-
-    # The orchestrator is captured through command substitution below, so any
-    # shell-local initialization it performs cannot propagate back into this
-    # coordinator. Initialize the parent before source sync or build work so
-    # the final targets-complete -> completed transition addresses the same
-    # state root and fails before remote side effects if persistence is
-    # unavailable.
-    if ! command -v build_state_init &>/dev/null || ! build_state_init; then
-        log_error "Build state initialization failed"
-        return 4
+        if $resume_completed; then
+            # Recheck under the coordinator lock before reopening completion.
+            # The orchestrator still verifies every retained target receipt.
+            local locked_resume_state
+            locked_resume_state=$(build_state_get "$tool_name" "$version" "$resume_run_id") || return 4
+            if [[ "$(jq -r '.status' <<< "$locked_resume_state")" != completed ]] || \
+               ! build_state_update_status "$tool_name" "$version" targets-complete "$resume_run_id"; then
+                log_error "Could not resume interrupted build publication"
+                return 4
+            fi
+        fi
     fi
 
     log_info "Building $tool_name $version"
@@ -2859,8 +2913,8 @@ EOF
                     log_error "Staged ordinary sync did not retain its source Git identity"
                     return 4
                 fi
-                if $resume && { [[ "$staged_git_sha" != "$build_source_sha" ]] || \
-                                [[ "$staged_git_ref" != "$build_source_ref" ]]; }; then
+                if [[ "$staged_git_sha" != "$build_source_sha" ]] || \
+                   { $resume && [[ "$staged_git_ref" != "$build_source_ref" ]]; }; then
                     log_error "Source Git identity changed while preparing the resumed build"
                     return 4
                 fi
@@ -2936,6 +2990,7 @@ EOF
     fi
     # shellcheck disable=SC2086
     full_output=$(act_orchestrate_build "$tool_name" "$version" \
+        --run-id "$build_run_id" \
         "${build_source_args[@]}" "${orchestration_resume_args[@]}" "${purpose_args[@]}" \
         --parallel-jobs "$parallel_jobs" --output-dir "$output_dir" -- \
         $target_list 2>&1) || orchestrator_exit=$?
@@ -3253,21 +3308,26 @@ EOF
         local format="$3"
         local target_triple="${4:-}"
 
-        [[ -z "$file" || ! -f "$file" ]] && return 0
-        [[ -z "$target" ]] && return 0
+        if [[ -z "$file" || ! -f "$file" || -L "$file" || -z "$target" ]]; then
+            log_error "Cannot record a missing or invalid packaged artifact: $file"
+            collect_failed=true
+            return 1
+        fi
 
         local name sha size
         name=$(basename "$file")
         sha=$(_build_sha256 "$file" 2>/dev/null || echo "")
         size=$(_build_file_size "$file")
 
-        if [[ -z "$sha" ]]; then
-            log_warn "Unable to compute SHA256 for packaged artifact: $file"
-            return 0
+        if [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+            log_error "Unable to compute SHA256 for packaged artifact: $file"
+            collect_failed=true
+            return 1
         fi
-        if [[ -z "$size" || "$size" -le 0 ]]; then
-            log_warn "Unable to determine size for packaged artifact: $file"
-            return 0
+        if [[ ! "$size" =~ ^[1-9][0-9]*$ ]]; then
+            log_error "Unable to determine size for packaged artifact: $file"
+            collect_failed=true
+            return 1
         fi
 
         local artifact_json
@@ -3286,7 +3346,11 @@ EOF
                 archive_format: $format,
                 signed: false,
                 signature_file: ""
-            } + (if $target_triple == "" then {} else {target_triple: $target_triple} end)')
+            } + (if $target_triple == "" then {} else {target_triple: $target_triple} end)') || {
+                log_error "Could not record packaged artifact metadata: $file"
+                collect_failed=true
+                return 1
+            }
 
         extra_manifest_entries+=("$artifact_json")
     }
@@ -3311,7 +3375,8 @@ EOF
         if [[ -f "$compat_path" ]]; then
             if cmp -s "$compat_path" "$src_path" 2>/dev/null; then
                 log_info "Compat alias already present: $compat_name"
-                return 0
+                _build_manifest_add_entry "$compat_path" "$target" "$format" "$target_triple"
+                return $?
             fi
             log_warn "Compat alias exists with different content: $compat_name"
             return 1
@@ -3348,7 +3413,8 @@ EOF
         if [[ -f "$compat_path" ]]; then
             if cmp -s "$compat_path" "$src_path" 2>/dev/null; then
                 log_info "Binary alias already present: $compat_name"
-                return 0
+                _build_manifest_add_entry "$compat_path" "$target" "binary" "$target_triple"
+                return $?
             fi
             log_warn "Binary alias exists with different content: $compat_name"
             return 1
@@ -4279,16 +4345,25 @@ EOF
         fi
     fi
 
-    # Generate manifest
-    local manifest_file="$output_dir/${tool_name}-${tag}-manifest.json"
+    # Keep generated and rewritten manifests private until the whole build
+    # commits. Each staging directory is itself explicitly non-publishable.
+    local final_manifest_file="$output_dir/${tool_name}-${tag}-manifest.json"
+    local manifest_file="" manifest_work_dir=""
     local manifest_failed=false orchestration_status
     local all_targets_succeeded=false
     orchestration_status=$(jq -r '.status // "unknown"' <<< "$result" 2>/dev/null || true)
     if [[ $orchestrator_exit -eq 0 && "$orchestration_status" == "success" &&
-          $total -gt 0 && $failed -eq 0 && $success -eq $total ]]; then
+          $total -gt 0 && $failed -eq 0 && $success -eq $total &&
+          "$result_run_id" == "$build_run_id" && $collect_failed == false ]]; then
         all_targets_succeeded=true
     fi
     if $all_targets_succeeded; then
+        manifest_work_dir=$(umask 077; mktemp -d "$output_dir/.dsr-manifest.XXXXXXXX") || return 4
+        if ! cp "$purpose_marker" "$manifest_work_dir/.dsr-build-purpose.json"; then
+            log_error "Could not retain non-publishable manifest staging purpose"
+            return 4
+        fi
+        manifest_file="$manifest_work_dir/${tool_name}-${tag}-manifest.json"
         # Generate manifest from orchestration result JSON
         if $build_release_contract_enabled; then
             local post_build_source_status
@@ -4324,6 +4399,14 @@ EOF
                 manifest_failed=true
             fi
         fi
+        if ! $manifest_failed; then
+            if ! jq '.publishable = false | .artifacts |= map(.publishable = false)' \
+                    "$manifest_file" > "$manifest_work_dir/pending.json" || \
+               ! mv -f "$manifest_work_dir/pending.json" "$manifest_file"; then
+                log_error "Could not stage a non-publishable build manifest"
+                manifest_failed=true
+            fi
+        fi
     fi
 
     if $all_targets_succeeded && ! $build_release_contract_enabled && \
@@ -4346,11 +4429,11 @@ EOF
                 if $new != "" then .name = $new else . end
             )
         ' "$manifest_file" 2>/dev/null)
-        if [[ -n "$updated_manifest" ]]; then
-            printf '%s\n' "$updated_manifest" > "$manifest_file"
+        if [[ -n "$updated_manifest" ]] && printf '%s\n' "$updated_manifest" > "$manifest_file"; then
             log_info "Updated manifest for ${#artifact_rename_pairs[@]} renamed artifact(s)"
         else
-            log_warn "Failed to update manifest for renamed artifacts"
+            log_error "Failed to update manifest for renamed artifacts"
+            manifest_failed=true
         fi
     fi
 
@@ -4380,8 +4463,8 @@ EOF
                     then . + {sha256: $latest[.name].sha256, size_bytes: $latest[.name].size_bytes}
                     else . end)) + ($added | map($latest[.])))
             )}' "$manifest_file") && \
-           merged=$(jq '.manifest' <<< "$merge_result"); then
-            printf '%s\n' "$merged" > "$manifest_file"
+           merged=$(jq '.manifest' <<< "$merge_result") && \
+           printf '%s\n' "$merged" > "$manifest_file"; then
             local refreshed_count added_count
             refreshed_count=$(jq -r '.refreshed' <<< "$merge_result")
             added_count=$(jq -r '.added' <<< "$merge_result")
@@ -4401,14 +4484,50 @@ EOF
         final_exit=130
     elif [[ $orchestrator_exit -ne 0 && $orchestrator_exit -ne 1 ]]; then
         final_exit="$orchestrator_exit"
-    elif [[ $failed -eq 0 && $success -gt 0 && $collect_failed == false &&
+    elif [[ $all_targets_succeeded == true && $collect_failed == false &&
             $manifest_failed == false && -f "$manifest_file" ]]; then
-        if ! _act_is_uuid "$result_run_id" ||
+        local sealed_manifest="$manifest_work_dir/complete.json"
+        local sealed_marker="$manifest_work_dir/publishable.json" manifest_digest
+        # Validate the identity again after every packaging rewrite, then
+        # prepare both final documents before changing durable completion.
+        if ! jq -es --arg run "$build_run_id" --arg sha "$build_source_sha" --arg purpose "$build_purpose" '
+                if length == 1 and (.[0] | type == "object" and
+                    .run_id == $run and .source.git_sha == $sha and
+                    .build_purpose == $purpose and .status == "success" and
+                    .summary.total > 0 and .summary.failed == 0 and
+                    .summary.success == .summary.total and
+                    (.artifacts | type == "array" and length > 0))
+                then .[0] | .publishable = ($purpose == "release") |
+                    .artifacts |= map(. + {build_purpose: $purpose, publishable: ($purpose == "release")})
+                else error("manifest does not describe the completed build") end
+            ' "$manifest_file" > "$sealed_manifest" || \
+           ! manifest_digest=$(_build_sha256 "$sealed_manifest") || \
+           ! jq -es --arg run "$build_run_id" --arg sha "$build_source_sha" --arg purpose "$build_purpose" \
+                --arg name "${final_manifest_file##*/}" --arg digest "$manifest_digest" '
+                if length == 1 and (.[0] | type == "object" and
+                    .run_id == $run and .git_sha == $sha and
+                    .build_purpose == $purpose and .publishable == false)
+                then .[0] + {publication_schema: 1, publication_status: "completed", publishable: ($purpose == "release"),
+                             manifest_name: $name, manifest_sha256: $digest}
+                else error("build output purpose changed before publication") end
+            ' "$purpose_marker" > "$sealed_marker"; then
+            log_error "Could not prepare the completed build publication"
+            final_exit=4
+        elif ! _act_is_uuid "$result_run_id" ||
            ! command -v build_state_update_status &>/dev/null ||
            ! build_state_update_status "$tool_name" "$version" "completed" "$result_run_id"; then
             log_error "Could not persist completed build state"
             final_exit=4
+        elif [[ -L "$final_manifest_file" || ( -e "$final_manifest_file" && ! -f "$final_manifest_file" ) ]] || \
+             ! mv -f "$sealed_manifest" "$final_manifest_file" || \
+             ! mv -f "$sealed_marker" "$purpose_marker"; then
+            log_error "Could not publish the completed build; output remains blocked for resume"
+            # A crash or persistence error here is also recoverable through
+            # the completed-state/pending-marker resume path above.
+            build_state_update_status "$tool_name" "$version" targets-complete "$result_run_id" || true
+            final_exit=4
         else
+            manifest_file="$final_manifest_file"
             final_exit=0
             final_status="success"
         fi
@@ -4494,6 +4613,7 @@ EOF
     fi
 
     return "$final_exit"
+    )
 }
 
 # Quality gates command - run pre-release checks
@@ -4874,6 +4994,33 @@ _release_require_publishable_artifacts() {
                 .build_purpose == "release" and .publishable == true)' "$marker" >/dev/null; then
             log_error "Artifact directory carries non-publishable or invalid build purpose"
             return 4
+        fi
+        if jq -e 'has("publication_schema")' "$marker" >/dev/null; then
+            local bound_manifest_name bound_manifest_sha actual_manifest_sha
+            if ! jq -e '
+                    .publication_schema == 1 and .publication_status == "completed" and
+                    (.run_id | type == "string" and test("^[0-9a-fA-F-]{36}$")) and
+                    (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+                    (.manifest_name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*\\.json$")) and
+                    (.manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+                ' "$marker" >/dev/null; then
+                log_error "Build publication receipt is incomplete or invalid"
+                return 4
+            fi
+            bound_manifest_name=$(jq -r '.manifest_name' "$marker") || return 4
+            bound_manifest_sha=$(jq -r '.manifest_sha256' "$marker") || return 4
+            if [[ "$manifest_file" != "$artifacts_dir/$bound_manifest_name" ||
+                  ! -f "$manifest_file" || -L "$manifest_file" ]] || \
+               ! actual_manifest_sha=$(_release_sha256 "$manifest_file") || \
+               [[ "$actual_manifest_sha" != "$bound_manifest_sha" ]] || \
+               ! jq -es --slurpfile receipt "$marker" '
+                    length == 1 and (.[0] | type == "object" and
+                    .run_id == $receipt[0].run_id and
+                    .source.git_sha == $receipt[0].git_sha and .status == "success")
+                ' "$manifest_file" >/dev/null; then
+                log_error "Build manifest is missing, changed, or differs from its publication receipt"
+                return 4
+            fi
         fi
     fi
     if [[ -e "$manifest_file" || -L "$manifest_file" ]]; then

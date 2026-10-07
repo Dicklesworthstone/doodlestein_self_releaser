@@ -447,7 +447,18 @@ dsr build --repo ntm --resume=<run-id>           # Resume a specific run
 
 Parallel builds keep attempt-scoped logs and results per target. A partial run
 preserves verified completed artifacts; resume retries only incomplete targets.
-The authoritative manifest is withheld until every requested target succeeds.
+The authoritative manifest is withheld until every requested target, artifact
+collection, packaging, and completion-state write succeeds. Real builds mark
+their output directory non-publishable before starting work and hold the build
+lock through final publication. Failed or interrupted outputs remain blocked
+by `release` and `release verify`, including when `--no-manifest` is requested.
+Use `--resume` to retry packaging or finish interrupted publication from the
+verified target receipts without rebuilding completed targets.
+
+Keep the completed manifest with its artifact directory: the publication
+receipt binds its exact bytes, run ID, and source commit. Removing or modifying
+the manifest invalidates that receipt. Dry runs and `--sync-only` leave the
+existing publication state untouched.
 
 Ordinary builds retain each host's source-sync result and build from the path
 that was successfully synced. Rsync compares file contents so equal sizes and

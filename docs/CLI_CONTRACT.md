@@ -623,8 +623,20 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--no-manifest` | false | Upload an artifacts directory that has no build manifest, as-is |
 
 An ordinary release publishes the build manifest's artifacts. `dsr build`
-writes the manifest only when every target succeeded, so without one `release`
-exits 4 unless `--no-manifest` is given (no completeness check, no checksums).
+publishes the manifest only after every target, artifact collection, packaging,
+manifest rewrite, and completion-state write succeeds. A run/source-bound
+publication receipt blocks its output directory from the start of a real build
+until that final commit; private manifest staging is also non-publishable.
+Failed or interrupted builds remain blocked even with `--no-manifest`.
+`--resume` revalidates retained target receipts and retries unfinished packaging
+or publication without recompiling verified completed targets. A completed
+build's receipt binds the final manifest name and SHA-256 as well as its run
+and source identity; a missing or changed manifest is refused with exit 4.
+Dry runs and `--sync-only` do not change existing publication state.
+
+For an external artifact directory without a DSR publication receipt, a missing
+manifest causes exit 4 unless `--no-manifest` is given (no completeness check,
+no checksums).
 The manifest's `source.git_sha` must be the commit the local tag names (exit 4
 otherwise), origin must not hold a different commit under that tag, and a tag
 GitHub does not have yet is created at that commit (`target_commitish`), not at

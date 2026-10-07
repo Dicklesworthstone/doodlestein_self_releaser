@@ -198,6 +198,8 @@ source "$ROOT/src/host_selector.sh"
 source "$ROOT/src/git_ops.sh"
 # shellcheck source=../../src/packaging.sh
 source "$ROOT/src/packaging.sh"
+# State queries below run in this harness, independently of the CLI process.
+build_state_init || exit 1
 
 PASS=0 FAIL=0 STATUS=0 REAL_CAPACITY=true
 check() {

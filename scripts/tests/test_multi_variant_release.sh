@@ -172,10 +172,22 @@ MUSL_SHA=$(_gh_asset_sha256 "$WORK/producer/$MUSL_NAME") || exit 1
 act_check() { return 0; }
 act_check_prereqs() { return 0; }
 act_orchestrate_build() {
-    local tool="$1" version="$2" run result
+    local tool="$1" version="$2" run result requested_run="$RUN"
     printf '%s\n' "$*" >> "$ORCHESTRATION_CALLS"
     [[ "$tool" == variantdemo && "$version" == 1.2.3 ]] || return 4
-    run=$(DSR_RUN_ID="$RUN" build_state_create "$tool" "$version" "$PLATFORM") || return 4
+    shift 2
+    while (($#)); do
+        case "$1" in
+            --run-id|--resume-run-id)
+                (($# >= 2)) || return 4
+                [[ -z "$2" ]] || requested_run="$2"
+                shift 2
+                ;;
+            --) break ;;
+            *) shift ;;
+        esac
+    done
+    run=$(DSR_RUN_ID="$requested_run" build_state_create "$tool" "$version" "$PLATFORM") || return 4
     build_state_update_status "$tool" "$version" running "$run" || return 4
     result=$(jq -nc --arg tool "$tool" --arg version "$version" --arg run "$run" \
         --arg platform "$PLATFORM" --arg directory "$WORKFLOW_ARTIFACTS" --arg source "$SOURCE_SHA" '
@@ -264,6 +276,7 @@ if [[ ! -f "$MANIFEST" ]]; then
     printf 'FAIL: build withheld the variant manifest; evidence is in %s\n' "$WORK" >&2
     exit 1
 fi
+RUN=$(jq -er '.details.run_id | select(type == "string" and length > 0)' "$WORK/build.json") || exit 1
 check 'one workflow invocation supplies both variants' test "$(wc -l < "$ORCHESTRATION_CALLS")" -eq 1
 check 'build completion is recorded through the real state writer' jq -e '.status=="completed"' \
     "$DSR_STATE_DIR/builds/variantdemo/1.2.3/$RUN/state.json"
