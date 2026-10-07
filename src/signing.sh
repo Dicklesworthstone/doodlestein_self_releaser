@@ -127,20 +127,23 @@ signing_check() {
 signing_init() {
     local force=false
     local no_password=false
+    local dry_run="${DRY_RUN:-false}"
 
     for arg in "$@"; do
         case "$arg" in
             --force) force=true ;;
             --no-password) no_password=true ;;
+            --dry-run) dry_run=true ;;
             --help|-h)
                 cat << 'EOF'
-Usage: signing_init [--force] [--no-password]
+Usage: signing_init [--force] [--no-password] [--dry-run]
 
 Generate a new minisign keypair for artifact signing.
 
 Options:
-  --force        Overwrite existing keys
+  --force        Replace existing keys (the old pair is kept as *.bak.<time>)
   --no-password  Create unprotected key (NOT RECOMMENDED)
+  --dry-run      Show what would be created or replaced; change nothing
 
 The private key will be stored in:
   ~/.config/dsr/secrets/minisign.key (chmod 600)
@@ -172,6 +175,34 @@ EOF
         return 1
     fi
 
+    local -a existing_keys=()
+    local key_file
+    for key_file in "$SIGNING_PRIVATE_KEY" "$SIGNING_PUBLIC_KEY"; do
+        [[ -f "$key_file" ]] && existing_keys+=("$key_file")
+    done
+
+    if $dry_run; then
+        _sign_log_info "[dry-run] Would generate a minisign keypair:"
+        _sign_log_info "  private key: $SIGNING_PRIVATE_KEY (mode 600)"
+        _sign_log_info "  public key:  $SIGNING_PUBLIC_KEY"
+        for key_file in ${existing_keys[@]+"${existing_keys[@]}"}; do
+            _sign_log_info "[dry-run] Would keep the existing $key_file as $key_file.bak.<time>"
+        done
+        return 0
+    fi
+
+    # --force replaces a key pair; a private key cannot be regenerated, so
+    # the old pair is kept beside the new one rather than destroyed.
+    local backup_suffix
+    backup_suffix=".bak.$(date -u +%Y%m%dT%H%M%SZ)"
+    for key_file in ${existing_keys[@]+"${existing_keys[@]}"}; do
+        if ! cp -p -- "$key_file" "$key_file$backup_suffix"; then
+            _sign_log_error "Could not back up $key_file; keys unchanged"
+            return 1
+        fi
+        _sign_log_info "Kept the existing key as $key_file$backup_suffix"
+    done
+
     # Create secrets directory with restricted permissions
     _sign_log_info "Creating secrets directory: $SIGNING_SECRETS_DIR"
     mkdir -p "$SIGNING_SECRETS_DIR"
@@ -184,6 +215,8 @@ EOF
     echo ""
 
     local minisign_args=(-G -p "$SIGNING_PUBLIC_KEY" -s "$SIGNING_PRIVATE_KEY")
+    # minisign refuses to replace an existing pair without -f.
+    [[ ${#existing_keys[@]} -gt 0 ]] && minisign_args+=(-f)
     if $no_password; then
         _sign_log_warn "WARNING: Creating unprotected key (--no-password)"
         minisign_args+=(-W)

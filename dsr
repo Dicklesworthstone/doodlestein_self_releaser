@@ -12522,6 +12522,8 @@ SUBCOMMANDS:
 
 EXAMPLES:
     dsr signing init              Generate new keypair
+    dsr signing init --force      Replace the keypair (old pair kept as *.bak.<time>)
+    dsr signing init --dry-run    Show what init would create or replace
     dsr signing check             Check if keys are configured
     dsr signing sign artifact.tar.gz
     dsr signing verify artifact.tar.gz

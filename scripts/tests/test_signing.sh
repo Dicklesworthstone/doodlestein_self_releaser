@@ -131,6 +131,43 @@ test_signing_fix_permissions() {
   run_cmd "private key perms fixed" assert_mode "$SIGNING_PRIVATE_KEY" "600"
 }
 
+key_digest() {
+  cat "$SIGNING_PRIVATE_KEY" "$SIGNING_PUBLIC_KEY" | sha256sum | cut -d' ' -f1
+}
+
+test_signing_init_force_and_dry_run() {
+  local before after backups
+  before=$(key_digest)
+
+  run_cmd "signing_init --dry-run --force succeeds" signing_init --dry-run --force --no-password
+  run_cmd "global DRY_RUN signing_init --force succeeds" env DRY_RUN=true bash -c \
+    "source '$PROJECT_ROOT/src/signing.sh' && signing_init --force --no-password"
+  ((TESTS_RUN++))
+  backups=$(find "$DSR_CONFIG_DIR" -name '*.bak.*' | wc -l)
+  if [[ "$(key_digest)" == "$before" && "$backups" -eq 0 ]]; then
+    pass "dry runs leave the key pair untouched"
+  else
+    fail "dry runs changed keys or wrote backups ($backups)"
+  fi
+
+  run_expect_fail "signing_init refuses existing keys without --force" signing_init --no-password
+
+  run_cmd "signing_init --force replaces the key pair" signing_init --force --no-password
+  after=$(key_digest)
+  ((TESTS_RUN++))
+  local old_priv old_pub
+  old_priv=$(find "$SIGNING_SECRETS_DIR" -name 'minisign.key.bak.*' | head -1)
+  old_pub=$(find "$DSR_CONFIG_DIR" -maxdepth 1 -name 'minisign.pub.bak.*' | head -1)
+  if [[ "$after" != "$before" && -n "$old_priv" && -n "$old_pub" ]] &&
+     [[ "$(cat "$old_priv" "$old_pub" | sha256sum | cut -d' ' -f1)" == "$before" ]] &&
+     assert_mode "$old_priv" 600 && assert_mode "$SIGNING_PRIVATE_KEY" 600; then
+    pass "--force keeps the previous pair as mode-preserving backups"
+  else
+    fail "--force should replace keys and back up the old pair (backups: '$old_priv' '$old_pub')"
+  fi
+  run_cmd "replaced key pair passes signing_check" signing_check >/dev/null
+}
+
 test_signing_sign_and_verify() {
   local artifact="$TEMP_DIR/artifact.bin"
   echo "data" > "$artifact"
@@ -357,6 +394,7 @@ test_signing_require_minisign_missing
 test_signing_init_creates_keys
 test_signing_check_valid
 test_signing_fix_permissions
+test_signing_init_force_and_dry_run
 test_signing_sign_and_verify
 test_signing_verify_failure
 test_signing_sign_batch
