@@ -100,11 +100,12 @@ br-v1.2.3-linux_amd64.tar.gz
 dcg-x86_64-unknown-linux-gnu.tar.xz
 ```
 
-### GNU and musl variants from one workflow
+### GNU and musl variants of one platform
 
 An ordinary release may retain both libc variants under the same scheduling
-platform. List their triples in order; the first entry is the primary for native
-builds and for filenames that do not identify a variant:
+platform. List their triples in order; native Rust builds compile each entry,
+and the first entry owns shared aliases and workflow filenames that do not
+identify a variant:
 
 ```yaml
 targets: [linux/amd64]
@@ -125,11 +126,35 @@ it does not attest the executable's ABI. Packaging and release naming use the
 retained triple, so a musl artifact does not become GNU when configuration order
 changes or when both artifacts arrive through one act job.
 
+Native Rust collection takes the triple from the selected build task. The
+worker receipt, build-influence environment, manifest artifact and build
+environment receipt retain that identity. Separate tasks may each produce a
+raw executable named `variantdemo`: the flat output directory qualifies each
+name with its triple, while packaging restores the configured `binary_name`
+inside each archive. A result whose selected triple conflicts with its output
+name or build environment is refused. Exact `artifact_paths` arrays preserve
+paths containing commas and take precedence over the legacy scalar path.
+Before accepting a successful native matrix, manifest generation requires one
+successful result and at least one payload for every configured triple. Release
+also checks the retained native environment inventory, requested platforms and
+payloads before any GitHub mutation. Missing or duplicated native receipts and
+missing variant payloads are refused. Workflow receipts remain
+valid when one act job supplies only some configured variants or supplies
+artifacts for several platforms.
+
 Shared installer aliases remain supported and have one deterministic owner.
 Use a target-qualified pattern when installers must select both variants. The
 generated installer refuses to install a nonprimary variant through an alias
 whose name is also used by the primary, and rejects literal libc markers that
 contradict the selected triple.
+
+When a native matrix uses a versioned naming pattern without the triple, the
+primary keeps that configured name and each colliding secondary archive gains
+its triple before the archive extension. Both native variants therefore get
+their own archive even under the default naming pattern. A shared compatibility
+alias still belongs to the primary; a distinct alias for the secondary is
+retained. Use `${target_triple}` explicitly when those archive names must also
+be selectable by generated installers.
 
 Generated installers inspect the host libc before selecting an artifact. They
 recognize musl even when `ldd --version` writes to stderr and exits nonzero, and
@@ -148,13 +173,22 @@ request, and never retries another libc after checksum, signature, extraction,
 or binary-selection failure. Offline fallback follows the same policy and reads
 only the selected variant's verified cache entry.
 
-Native builds still compile the primary only; workflow-produced artifacts can
-carry the full list. A strict `release_contract` continues to admit one primary
-per platform. These paths do not yet implement a native GNU-plus-musl build
-matrix. `scripts/tests/test_multi_variant_installer.sh` compiles and executes
-real GNU and musl Rust fixtures when both standard libraries are installed, and
-checks selection, isolated offline caches, corruption refusal, and the fallback
-policy using fixture release transports.
+Ordinary native Rust builds run each configured GNU/musl variant as an
+independent task, with separate staging, Cargo homes, outputs and attempt
+receipts. Resume verifies completed variants independently and retries only
+unfinished tasks; it also binds the ordered task list and repository
+configuration, so changing the configured matrix requires a new run. The
+platform remains `linux/amd64` for routing. A strict `release_contract` continues
+to admit one primary per platform.
+
+`scripts/tests/test_native_variants.sh` builds and executes both real Rust libc
+variants through native scheduling, resume and the production build command.
+`scripts/tests/test_multi_variant_release.sh` exercises retained variant
+identity through collection, archive conversion and release byte checks.
+`scripts/tests/test_multi_variant_installer.sh` checks selection, isolated
+offline caches, corruption refusal and fallback policy with real executables
+and fixture release transports. These tests require both Rust standard
+libraries; they do not substitute compilation mocks when a target is absent.
 
 ## Checksum Files
 

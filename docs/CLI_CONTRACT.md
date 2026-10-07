@@ -460,10 +460,20 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--no-sync` | false | Skip ordinary source sync (forbidden by strict release contracts) |
 | `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
 
-Target logs and result receipts are isolated by target and attempt. Aggregation
-is deterministic in requested-target order. Partial artifacts remain available
-for resume, but no authoritative manifest is emitted until the full target set
-succeeds.
+Target logs and result receipts are isolated by task and attempt. Aggregation
+is deterministic in requested-platform order, then configured triple order.
+For ordinary native Rust builds, a `target_triples` list expands one platform
+into independent GNU/musl tasks. Each task records its selected `target_triple`
+and a `task_key` such as `linux/amd64@x86_64-unknown-linux-musl`; singleton and
+workflow tasks retain their platform as the task key. Platform routing and
+`--targets` continue to use `linux/amd64`.
+
+Each native variant has its own staging directory, Cargo home, output directory
+and retained artifact receipts. Resume verifies and reuses completed variants
+independently, and refuses a changed ordered task list or repository
+configuration for a matrix run. Partial artifacts remain available for resume,
+but no authoritative manifest is emitted until all tasks succeed. A strict
+`release_contract` continues to permit one selected triple per platform.
 
 Relocation requires the original controller to have released the build lock,
 the selected target to be failed, and no target to be running. Completed or
@@ -562,11 +572,22 @@ release that already exists and is published exits 7 without uploading
 (dropping `--draft` adds the assets to it).
 
 `dsr build --json` reports `repo`, `run_id` (the build run that `--resume=`
-takes), `manifest_path` (set only when every target succeeded) and one object
-per requested target: `platform`, `host`, `method`, `status`
+takes), `manifest_path` (set only when every task succeeded) and one object
+per build task: `platform`, `host`, `method`, `status`
 (`success`/`failed`/`timeout`, or `skipped` when not attempted), and when known
-`artifact_path`, `error` and `duration_ms`. Native targets build on the host
-their source was synced to.
+`target_triple`, `task_key`, `artifact_path`, `artifact_paths`, `error` and
+`duration_ms`. A native matrix therefore reports multiple rows with the same
+platform, preserving each variant's result; `total`, `success` and `failed`
+count tasks. `artifact_paths` is authoritative when present and nonempty.
+Native targets build on the host their source was synced to. Manifest artifacts
+and build-environment receipts retain the native task's selected triple; flat
+raw payload names are qualified when needed, while archive members keep the
+configured executable name.
+The manifest also retains `requested_targets` when supplied by the orchestrator.
+For native matrices, both generation and release admission reconcile selected
+triples, environment receipts and retained payloads. A missing or duplicate
+variant is refused before any GitHub mutation; explicit act receipts continue
+to support one workflow job producing cross-platform assets.
 
 When a repository opts into `release_contract`, DSR creates a new empty draft,
 uploads only the contracted primaries, their checksum sidecars, the regular

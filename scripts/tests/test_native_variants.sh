@@ -94,6 +94,7 @@ fn main() {
     println!("nativevariants {}", if cfg!(target_env = "musl") { "musl" } else { "gnu" });
 }
 RUST
+printf 'Native variant fixture license\nRedistribution of these test binaries is permitted.\n' > "$WORK/source/LICENSE"
 cat > "$WORK/source/build.rs" <<'RUST'
 use std::{env, fs::OpenOptions, io::Write, path::Path};
 fn main() {
@@ -109,7 +110,7 @@ fn main() {
 RUST
 cargo generate-lockfile --offline --manifest-path "$WORK/source/Cargo.toml" || exit 1
 git -C "$WORK/source" init -q -b main || exit 1
-git -C "$WORK/source" add Cargo.toml Cargo.lock src/main.rs build.rs || exit 1
+git -C "$WORK/source" add Cargo.toml Cargo.lock src/main.rs build.rs LICENSE || exit 1
 git -C "$WORK/source" -c user.name=Fixture -c user.email=fixture@example.invalid \
     commit -qm 'real native variant crate' || exit 1
 cat > "$DSR_HOSTS_FILE" <<YAML
@@ -139,6 +140,7 @@ artifact_naming: '\${name}-\${version}-\${target_triple}'
 install_script_compat: '\${name}-\${target_triple}'
 archive_format:
   linux: tar.gz
+include_files: [LICENSE]
 env:
   PATH: "$PATH"
   CARGO_TARGET_DIR: "$WORK/shared-cargo-target"
@@ -312,8 +314,10 @@ if [[ -f "$MANIFEST" ]]; then
             --arg triple "$triple" --arg archive "$archive" --arg compat "$compat" \
             '[.artifacts[] | select(.name == $archive or .name == $compat)] |
              length == 2 and all(.[]; .target_triple == $triple and .archive_format == "tar.gz")' "$MANIFEST"
-        check "$variant native archive contains the canonical binary name" test \
-            "$(tar -tzf "$OUTPUT/$archive" 2>/dev/null)" = nativevariants
+        check "$variant native archive contains the canonical binary and license" test \
+            "$(tar -tzf "$OUTPUT/$archive" 2>/dev/null | sort)" = $'LICENSE\nnativevariants'
+        check "$variant package preserves the configured license bytes" test \
+            "$(tar -xOzf "$OUTPUT/$archive" LICENSE 2>/dev/null)" = "$(cat "$WORK/source/LICENSE")"
         if tar -xOzf "$OUTPUT/$archive" nativevariants > "$WORK/packaged-$variant"; then
             chmod +x "$WORK/packaged-$variant" || exit 1
             check "$variant packaged executable retains its libc bytes" test \
@@ -326,6 +330,217 @@ if [[ -f "$MANIFEST" ]]; then
         check "$variant manifest digest binds the packaged bytes" jq -e \
             --arg archive "$archive" --arg digest "$archive_sha" \
             'any(.artifacts[]; .name == $archive and .sha256 == $digest)' "$MANIFEST"
+    done
+fi
+
+# A partially completed public build has already collected GNU into its
+# output directory. Resume must preserve the original worker's exact byte and
+# inode receipts while admitting only the newly successful musl attempt.
+COMMAND_RESUME_OUTPUT="$WORK/command-resume-output"
+: > "$WORK/fail-musl"
+STATUS=0
+cmd_build nativevariants --version 1.2.6 --no-sync --jobs 2 --output-dir "$COMMAND_RESUME_OUTPUT" \
+    > "$WORK/command-partial.json" 2> "$WORK/command-partial.log" || STATUS=$?
+check 'public command reports one genuine native variant failure' test "$STATUS" -eq 1
+check 'public partial JSON identifies both variant tasks' jq -e \
+    --arg gnu "$GNU_TRIPLE" --arg musl "$MUSL_TRIPLE" \
+    '.status == "partial" and .details.total == 2 and .details.success == 1 and .details.failed == 1 and
+     ([.details.targets[].target_triple] | sort) == ([$gnu,$musl] | sort)' "$WORK/command-partial.json"
+build_state_get nativevariants 1.2.6 > "$WORK/command-partial-state.json" || exit 1
+COMMAND_RUN=$(jq -r '.run_id' "$WORK/command-partial-state.json")
+GNU_KEY="$PLATFORM@$GNU_TRIPLE"
+MUSL_KEY="$PLATFORM@$MUSL_TRIPLE"
+GNU_ORIGINAL_RECEIPTS=$(jq -c --arg key "$GNU_KEY" \
+    '.target_statuses[$key].result.resume_artifacts' "$WORK/command-partial-state.json")
+GNU_ORIGINAL_PATH=$(jq -r --arg key "$GNU_KEY" \
+    '.target_statuses[$key].result.artifact_path' "$WORK/command-partial-state.json")
+GNU_ORIGINAL_IDENTITY=$(_act_file_identity "$GNU_ORIGINAL_PATH") || exit 1
+GNU_ORIGINAL_SHA=$(_act_sha256 "$GNU_ORIGINAL_PATH") || exit 1
+GNU_BEFORE=$(event_count "$GNU_TRIPLE")
+MUSL_BEFORE=$(event_count "$MUSL_TRIPLE")
+
+STATUS=0
+cmd_build nativevariants --version 1.2.6 --no-sync --jobs 2 --output-dir "$COMMAND_RESUME_OUTPUT" \
+    > "$WORK/command-stale.json" 2> "$WORK/command-stale.log" || STATUS=$?
+check 'fresh public build refuses output left by the partial attempt' test "$STATUS" -eq 1
+check 'stale output refusal does not invoke either compiler task' test \
+    "$(event_count "$GNU_TRIPLE")/$(event_count "$MUSL_TRIPLE")" = "$GNU_BEFORE/$MUSL_BEFORE"
+check 'stale output refusal preserves the completed artifact inode' test \
+    "$(_act_file_identity "$GNU_ORIGINAL_PATH")" = "$GNU_ORIGINAL_IDENTITY"
+mv "$WORK/fail-musl" "$WORK/fail-musl-command.disabled" || exit 1
+STATUS=0
+cmd_build nativevariants --version 1.2.6 --no-sync --jobs 2 --resume="$COMMAND_RUN" \
+    --output-dir "$COMMAND_RESUME_OUTPUT" > "$WORK/command-resumed.json" \
+    2> "$WORK/command-resumed.log" || STATUS=$?
+check 'public resume completes the existing native matrix and output' test "$STATUS" -eq 0
+if [[ $STATUS -ne 0 ]]; then cat "$WORK/command-resumed.log" >&2; fi
+check 'public resume reports both variants successful' jq -e \
+    '.status == "success" and .details.total == 2 and .details.success == 2 and .details.failed == 0' \
+    "$WORK/command-resumed.json"
+check 'public resume leaves GNU compiler invocation count unchanged' test "$(event_count "$GNU_TRIPLE")" -eq "$GNU_BEFORE"
+check 'public resume invokes only one additional musl compilation' test "$(event_count "$MUSL_TRIPLE")" -eq "$((MUSL_BEFORE + 1))"
+build_state_get nativevariants 1.2.6 "$COMMAND_RUN" > "$WORK/command-resumed-state.json" || exit 1
+check 'public resume retains the exact GNU byte and inode receipts' test "$GNU_ORIGINAL_RECEIPTS" = \
+    "$(jq -c --arg key "$GNU_KEY" '.target_statuses[$key].result.resume_artifacts' "$WORK/command-resumed-state.json")"
+check 'public resume retains the exact original GNU artifact path' test "$GNU_ORIGINAL_PATH" = \
+    "$(jq -r --arg key "$GNU_KEY" '.target_statuses[$key].result.artifact_path' "$WORK/command-resumed-state.json")"
+check 'public resume preserves actual GNU inode and bytes' test \
+    "$(_act_file_identity "$GNU_ORIGINAL_PATH")/$(_act_sha256 "$GNU_ORIGINAL_PATH")" = "$GNU_ORIGINAL_IDENTITY/$GNU_ORIGINAL_SHA"
+check 'public resume finalizes the original run only after packaging' jq -e \
+    --arg run "$COMMAND_RUN" --arg gnu "$GNU_KEY" --arg musl "$MUSL_KEY" \
+    '.run_id == $run and .status == "completed" and
+     .target_statuses[$gnu].attempts == 1 and .target_statuses[$musl].attempts == 2' "$WORK/command-resumed-state.json"
+COMMAND_RESUME_MANIFEST="$COMMAND_RESUME_OUTPUT/nativevariants-v1.2.6-manifest.json"
+check 'public resume emits its final manifest' test -f "$COMMAND_RESUME_MANIFEST"
+if [[ -f "$COMMAND_RESUME_MANIFEST" ]]; then
+    for variant in gnu musl; do
+        triple="$TRIPLE_ARCH-unknown-linux-$variant"
+        archive="nativevariants-1.2.6-$triple.tar.gz"
+        compat="nativevariants-$triple.tar.gz"
+        check "resumed $variant has both manifest archive aliases" jq -e \
+            --arg triple "$triple" --arg archive "$archive" --arg compat "$compat" \
+            '[.artifacts[] | select(.name == $archive or .name == $compat)] |
+             length == 2 and all(.[]; .target_triple == $triple)' "$COMMAND_RESUME_MANIFEST"
+        check "resumed $variant archive preserves canonical members" test \
+            "$(tar -tzf "$COMMAND_RESUME_OUTPUT/$archive" | sort)" = $'LICENSE\nnativevariants'
+        check "resumed $variant archive preserves license bytes" test \
+            "$(tar -xOzf "$COMMAND_RESUME_OUTPUT/$archive" LICENSE)" = "$(cat "$WORK/source/LICENSE")"
+        tar -xOzf "$COMMAND_RESUME_OUTPUT/$archive" nativevariants > "$WORK/command-resumed-$variant" || exit 1
+        chmod +x "$WORK/command-resumed-$variant" || exit 1
+        check "resumed $variant archive contains the correct executable" test \
+            "$("$WORK/command-resumed-$variant")" = "nativevariants $variant"
+        check "resumed $variant compatibility alias retains exact archive bytes" \
+            cmp -s "$COMMAND_RESUME_OUTPUT/$archive" "$COMMAND_RESUME_OUTPUT/$compat"
+    done
+fi
+
+# Retry a previously successful direct musl lane with a real compiler failure.
+# Existing collected bytes remain evidence, but a failed fresh attempt must
+# not claim them as a new artifact or report stale success.
+: > "$WORK/fail-musl"
+MUSL_ORIGINAL_IDENTITY=$(_act_file_identity "$MUSL_PATH") || exit 1
+MUSL_ORIGINAL_SHA=$(_act_sha256 "$MUSL_PATH") || exit 1
+run_code 'failed fresh native attempt refuses its prior successful output' 6 "$WORK/direct-stale" \
+    act_run_native_build nativevariants "$PLATFORM" 1.2.3 \
+    11111111-1111-4111-8111-111111111111 '' '' '' localnative "$MUSL_TRIPLE"
+check 'failed fresh attempt returns no publishable artifact path' jq -e \
+    '.status == "failed" and .artifact_path == "" and .artifact_paths == []' "$WORK/direct-stale.json"
+check 'failed fresh attempt leaves earlier musl evidence unchanged' test \
+    "$(_act_file_identity "$MUSL_PATH")/$(_act_sha256 "$MUSL_PATH")" = "$MUSL_ORIGINAL_IDENTITY/$MUSL_ORIGINAL_SHA"
+mv "$WORK/fail-musl" "$WORK/fail-musl-stale.disabled" || exit 1
+
+# Generic legacy names still need one archive for every configured variant.
+# The primary owns shared names; the nonprimary needs an unambiguous triple
+# name rather than being left as an unpackaged raw executable.
+yq -i '.artifact_naming = "${name}-${version}-${os}-${arch}" |
+       .install_script_compat = "${name}-${os}-${arch}"' "$ACT_REPOS_DIR/nativevariants.yaml" || exit 1
+GENERIC_OUTPUT="$WORK/generic-output"
+STATUS=0
+cmd_build nativevariants --version 1.2.7 --no-sync --jobs 2 --output-dir "$GENERIC_OUTPUT" \
+    > "$WORK/generic-build.json" 2> "$WORK/generic-build.log" || STATUS=$?
+check 'generic naming packages the complete native variant matrix' test "$STATUS" -eq 0
+if [[ $STATUS -ne 0 ]]; then cat "$WORK/generic-build.log" >&2; fi
+GENERIC_MANIFEST="$GENERIC_OUTPUT/nativevariants-v1.2.7-manifest.json"
+GENERIC_PRIMARY="nativevariants-1.2.7-${PLATFORM//\//-}.tar.gz"
+GENERIC_COMPAT="nativevariants-${PLATFORM//\//-}.tar.gz"
+check 'generic naming emits its complete variant manifest' test -f "$GENERIC_MANIFEST"
+if [[ -f "$GENERIC_MANIFEST" ]]; then
+    check 'generic naming retains a real archive for each libc variant' jq -e \
+        --arg gnu "$GNU_TRIPLE" --arg musl "$MUSL_TRIPLE" \
+        '([.artifacts[] | select(.archive_format == "tar.gz") | .target_triple] | unique | sort) ==
+         ([$gnu,$musl] | sort)' "$GENERIC_MANIFEST"
+    GNU_GENERIC_SHA=$(_act_sha256 "$GENERIC_OUTPUT/$GENERIC_PRIMARY") || exit 1
+    check 'shared generic compatibility alias belongs to GNU with identical bytes' jq -e \
+        --arg alias "$GENERIC_COMPAT" --arg gnu "$GNU_TRIPLE" --arg digest "$GNU_GENERIC_SHA" \
+        '[.artifacts[] | select(.name == $alias)] |
+         length == 1 and .[0].target_triple == $gnu and .[0].sha256 == $digest' "$GENERIC_MANIFEST"
+    check 'shared generic alias contains the primary archive bytes' cmp -s \
+        "$GENERIC_OUTPUT/$GENERIC_PRIMARY" "$GENERIC_OUTPUT/$GENERIC_COMPAT"
+    MUSL_GENERIC_NAME=$(jq -r --arg musl "$MUSL_TRIPLE" \
+        '[.artifacts[] | select(.target_triple == $musl and .archive_format == "tar.gz")][0].name // empty' "$GENERIC_MANIFEST")
+    check 'nonprimary generic archive has a deterministic full target triple name' test \
+        "$MUSL_GENERIC_NAME" = "nativevariants-1.2.7-${PLATFORM//\//-}-$MUSL_TRIPLE.tar.gz"
+    if [[ -n "$MUSL_GENERIC_NAME" && -f "$GENERIC_OUTPUT/$MUSL_GENERIC_NAME" ]]; then
+        check 'generic musl archive contains canonical binary and license members' test \
+            "$(tar -tzf "$GENERIC_OUTPUT/$MUSL_GENERIC_NAME" | sort)" = $'LICENSE\nnativevariants'
+        tar -xOzf "$GENERIC_OUTPUT/$MUSL_GENERIC_NAME" nativevariants > "$WORK/generic-musl" || exit 1
+        chmod +x "$WORK/generic-musl" || exit 1
+        check 'generic musl archive owns actual musl executable bytes' test "$("$WORK/generic-musl")" = 'nativevariants musl'
+    fi
+fi
+cp "$WORK/reviewed-config.yaml" "$ACT_REPOS_DIR/nativevariants.yaml" || exit 1
+
+# A real Cargo workspace exercises native-side packaging before cmd_build
+# collects anything: both binaries, their libc, the configured include file,
+# and the variant identity must survive that extra archive boundary.
+mkdir -p "$WORK/workspace-source/src" "$WORK/workspace-source/helper/src" || exit 1
+cp "$WORK/source/src/main.rs" "$WORK/workspace-source/src/main.rs" || exit 1
+cp "$WORK/source/build.rs" "$WORK/workspace-source/build.rs" || exit 1
+cp "$WORK/source/LICENSE" "$WORK/workspace-source/LICENSE" || exit 1
+cat > "$WORK/workspace-source/Cargo.toml" <<'TOML'
+[package]
+name = "nativevariants"
+version = "1.2.3"
+edition = "2021"
+[workspace]
+members = ["helper"]
+resolver = "2"
+TOML
+cat > "$WORK/workspace-source/helper/Cargo.toml" <<'TOML'
+[package]
+name = "nativehelper"
+version = "1.2.3"
+edition = "2021"
+TOML
+cat > "$WORK/workspace-source/helper/src/main.rs" <<'RUST'
+fn main() {
+    println!("nativehelper {}", if cfg!(target_env = "musl") { "musl" } else { "gnu" });
+}
+RUST
+cargo generate-lockfile --offline --manifest-path "$WORK/workspace-source/Cargo.toml" || exit 1
+git -C "$WORK/workspace-source" init -q -b main || exit 1
+git -C "$WORK/workspace-source" add Cargo.toml Cargo.lock src/main.rs build.rs LICENSE \
+    helper/Cargo.toml helper/src/main.rs || exit 1
+git -C "$WORK/workspace-source" -c user.name=Fixture -c user.email=fixture@example.invalid \
+    commit -qm 'real two-binary native workspace' || exit 1
+WORKSPACE_SOURCE="$WORK/workspace-source" yq \
+    '.tool_name = "nativeworkspace" | .repo = "example/nativeworkspace" |
+     .local_path = strenv(WORKSPACE_SOURCE) | .workspace_binaries = ["nativevariants","nativehelper"] |
+     .build_cmd = "cargo build --workspace --release --locked --offline"' \
+    "$WORK/reviewed-config.yaml" > "$ACT_REPOS_DIR/nativeworkspace.yaml" || exit 1
+WORKSPACE_OUTPUT="$WORK/workspace-output"
+STATUS=0
+cmd_build nativeworkspace --version 1.2.8 --no-sync --jobs 2 --output-dir "$WORKSPACE_OUTPUT" \
+    > "$WORK/workspace-build.json" 2> "$WORK/workspace-build.log" || STATUS=$?
+check 'real two-binary workspace packages both native libc variants' test "$STATUS" -eq 0
+if [[ $STATUS -ne 0 ]]; then cat "$WORK/workspace-build.log" >&2; fi
+WORKSPACE_MANIFEST="$WORKSPACE_OUTPUT/nativeworkspace-v1.2.8-manifest.json"
+check 'workspace command retains both explicit native results' jq -e \
+    --arg gnu "$GNU_TRIPLE" --arg musl "$MUSL_TRIPLE" \
+    '.status == "success" and .details.total == 2 and
+     ([.details.targets[].target_triple] | sort) == ([$gnu,$musl] | sort)' "$WORK/workspace-build.json"
+check 'workspace produces its final manifest' test -f "$WORKSPACE_MANIFEST"
+if [[ -f "$WORKSPACE_MANIFEST" ]]; then
+    for variant in gnu musl; do
+        triple="$TRIPLE_ARCH-unknown-linux-$variant"
+        archive="nativeworkspace-1.2.8-$triple.tar.gz"
+        compat="nativeworkspace-$triple.tar.gz"
+        check "workspace $variant primary and compatibility retain triple identity" jq -e \
+            --arg triple "$triple" --arg archive "$archive" --arg compat "$compat" \
+            '[.artifacts[] | select(.name == $archive or .name == $compat)] |
+             length == 2 and all(.[]; .target_triple == $triple and .archive_format == "tar.gz")' "$WORKSPACE_MANIFEST"
+        check "workspace $variant archive contains both binaries and configured license" test \
+            "$(tar -tzf "$WORKSPACE_OUTPUT/$archive" | sort)" = $'LICENSE\nnativehelper\nnativevariants'
+        for binary in nativevariants nativehelper; do
+            tar -xOzf "$WORKSPACE_OUTPUT/$archive" "$binary" > "$WORK/workspace-$variant-$binary" || exit 1
+            chmod +x "$WORK/workspace-$variant-$binary" || exit 1
+            check "workspace $variant $binary has the correct compiled libc" test \
+                "$("$WORK/workspace-$variant-$binary")" = "$binary $variant"
+        done
+        check "workspace $variant includes the exact configured license" test \
+            "$(tar -xOzf "$WORKSPACE_OUTPUT/$archive" LICENSE)" = "$(cat "$WORK/workspace-source/LICENSE")"
+        check "workspace $variant compatibility alias preserves all archive bytes" \
+            cmp -s "$WORKSPACE_OUTPUT/$archive" "$WORKSPACE_OUTPUT/$compat"
     done
 fi
 

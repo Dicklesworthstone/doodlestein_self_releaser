@@ -5,7 +5,12 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$PROJECT_ROOT/src/github.sh"
+source "$PROJECT_ROOT/src/config.sh"
 source "$PROJECT_ROOT/src/artifact_naming.sh"
+# cmd_release uses the runner's retained native inventory admission. Keep
+# that production gate available even though lazy module loading is replaced
+# below; only the existing network and configuration boundaries are fixtures.
+source "$PROJECT_ROOT/src/act_runner.sh"
 # Load the real command without dispatching the CLI or contacting build hosts.
 source <(awk '/^cmd_release\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 
@@ -53,8 +58,13 @@ artifact_naming_generate_dual_for_tool() {
 
 setup() {
     CASE="$TEST_ROOT/$1"
-    mkdir -p "$CASE/artifacts" "$CASE/remote" "$CASE/state/releases" "$CASE/tmp"
+    mkdir -p "$CASE/artifacts" "$CASE/remote" "$CASE/state/releases" "$CASE/tmp" "$CASE/config/repos.d"
     export DSR_STATE_DIR="$CASE/state" TMPDIR="$CASE/tmp" NO_COLOR=1
+    export DSR_CONFIG_DIR="$CASE/config" DSR_REPOS_FILE="$CASE/config/repos.yaml"
+    export ACT_REPOS_DIR="$CASE/config/repos.d"
+    # The real retained-inventory gate consults the configured execution
+    # lane. These fixtures describe local native artifacts, not an act job.
+    printf 'targets: [linux/amd64]\n' > "$ACT_REPOS_DIR/tool.yaml"
     CALLS="$CASE/calls"
     : > "$CALLS"
     printf '[]\n' > "$CASE/inventory.json"

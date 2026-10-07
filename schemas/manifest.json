@@ -59,6 +59,15 @@
       "$ref": "#/$defs/summary",
       "description": "Orchestration target counts retained from the build result"
     },
+    "requested_targets": {
+      "type": "array",
+      "description": "Requested build platforms, retained to detect omitted native matrix receipts at release",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"
+      }
+    },
     "build_environments": {
       "type": "array",
       "description": "Effective per-target build environment and isolation receipts",

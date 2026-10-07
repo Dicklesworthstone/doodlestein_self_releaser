@@ -10633,6 +10633,136 @@ _act_native_result_target_triple() {
     printf '%s\n' "$triple"
 }
 
+# A successful native matrix means every configured compiler target produced
+# a usable payload. Validate this again at the manifest boundary: callers may
+# load retained results directly, and a missing/duplicated worker row must not
+# turn a partial build into a publishable release. Workflow jobs retain their
+# existing ability to collect the variants that their workflow produced.
+# The optional artifact array checks the inventory after file collection.
+_act_validate_native_matrix_result_inventory() {
+    local tool="$1" result="$2" artifacts="${3:-null}"
+    local platforms platform configured rows requested complete=false matrix=false
+    [[ "$(jq -r '.status // ""' <<< "$result")" == success ]] && complete=true
+    platforms=$(jq -r '
+        [(.targets // [])[] | select(.method == "native") | .platform] +
+        (.requested_targets // []) | unique | .[]
+    ' <<< "$result") || return 4
+    while IFS= read -r platform; do
+        [[ -n "$platform" ]] || continue
+        configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
+        [[ "$(jq 'length' <<< "$configured")" -gt 1 ]] || continue
+        rows=$(jq -c --arg platform "$platform" '
+            [.targets[]? | select(.platform == $platform and .method == "native")]
+        ' <<< "$result") || return 4
+        if [[ "$(jq 'length' <<< "$rows")" -eq 0 ]]; then
+            requested=$(jq -r --arg platform "$platform" '(.requested_targets // []) | index($platform) != null' <<< "$result") || return 4
+            [[ "$requested" == true ]] || continue
+            act_platform_uses_act "$tool" "$platform" && continue
+        fi
+        matrix=true
+        if ! jq -en --argjson rows "$rows" --argjson configured "$configured" \
+            --arg platform "$platform" --argjson complete "$complete" '
+                ($rows | map(.target_triple) | unique | length) == ($rows | length) and
+                all($rows[];
+                    (.target_triple as $triple | $configured | index($triple) != null) and
+                    (if has("task_key") then .task_key == ($platform + "@" + .target_triple) else true end)) and
+                (if $complete then
+                    ($rows | map(.target_triple) | sort) == ($configured | sort) and
+                    all($rows[]; .status == "success" or .status == "ok" or .status == "passed")
+                 else true end)
+            ' >/dev/null; then
+            _log_error "Native matrix result is incomplete, duplicated, or inconsistent for $tool $platform"
+            return 4
+        fi
+        if [[ "$artifacts" != null ]] && ! jq -en --argjson rows "$rows" \
+            --argjson artifacts "$artifacts" --arg platform "$platform" '
+                all($rows[] | select(.status == "success" or .status == "ok" or .status == "passed");
+                    .target_triple as $triple |
+                    any($artifacts[]; .target == $platform and .target_triple == $triple))
+            ' >/dev/null; then
+            _log_error "Native matrix payload is missing for $tool $platform"
+            return 4
+        fi
+    done <<< "$platforms"
+    if $matrix && $complete && ! jq -e '
+        .summary.total == (.targets | length) and .summary.failed == 0 and
+        .summary.success == .summary.total and
+        all(.targets[]; .status == "success" or .status == "ok" or .status == "passed")
+    ' <<< "$result" >/dev/null; then
+        _log_error "Native matrix summary does not match its successful worker results"
+        return 4
+    fi
+}
+
+# A retained manifest reaches release without its original worker results.
+# Reconcile its saved environment inventory with the same native matrix rules
+# before any remote release mutation. These projected rows describe declared
+# receipts only; they do not manufacture new execution or artifact evidence.
+_act_validate_native_manifest_inventory() {
+    local tool="$1" manifest="$2" inventory artifacts native_rows row
+    if jq -e '.build_environments == null and .requested_targets == null' \
+        <<< "$manifest" >/dev/null; then
+        # Legacy native manifests can still declare their artifact variants.
+        # A configured act job may emit artifacts for other platforms, so do
+        # not infer native execution from artifact platforms in that case.
+        local platforms platform configured configured_targets target
+        platforms=$(jq -r '[.artifacts[]? | .target | strings] | unique | .[]' \
+            <<< "$manifest") || return 4
+        while IFS= read -r platform; do
+            [[ -n "$platform" ]] || continue
+            configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
+            [[ "$(jq 'length' <<< "$configured")" -gt 1 ]] || continue
+            configured_targets=$(act_get_targets "$tool") || return 4
+            for target in $configured_targets; do
+                act_platform_uses_act "$tool" "$target" && return 0
+            done
+            if ! jq -e --arg platform "$platform" --argjson configured "$configured" '
+                [.artifacts[] | select(.target == $platform) | .target_triple] as $actual |
+                all($configured[]; . as $triple | ($actual | index($triple)) != null) and
+                all($actual[]; . as $triple | ($configured | index($triple)) != null)
+            ' <<< "$manifest" >/dev/null; then
+                _log_error "Legacy manifest lacks the configured native variants for $tool $platform; rebuild its manifest"
+                return 4
+            fi
+        done <<< "$platforms"
+        return 0
+    fi
+    if ! inventory=$(jq -ce '
+        (.build_environments // []) as $environments |
+        if ($environments | type != "array") or
+           (all($environments[];
+               type == "object" and (.method | type == "string" and length > 0) and
+               (.target | type == "string" and length > 0)) | not) or
+           (.requested_targets != null and
+               (.requested_targets | type != "array" or
+                   (all(.[]; type == "string" and length > 0) | not)))
+        then error("invalid retained build inventory")
+        else {
+            status: (.status // "success"),
+            summary: .summary,
+            targets: [$environments[] | . + {platform: .target, status: "success"}],
+            requested_targets: (
+                (if .requested_targets != null then .requested_targets
+                 elif any($environments[]; .method != "native") then []
+                 else [.artifacts[]? | .target | strings] end) |
+                unique | map(. as $platform | select(
+                    any($environments[]; .target == $platform and .method != "native") | not))
+            )
+        } end
+    ' <<< "$manifest"); then
+        _log_error "Release manifest has an invalid retained native inventory"
+        return 4
+    fi
+    _act_build_environments_json "$inventory" >/dev/null || return 4
+    native_rows=$(jq -c '.targets[] | select(.method == "native")' <<< "$inventory") || return 4
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        _act_native_result_target_triple "$tool" "$row" >/dev/null || return 4
+    done <<< "$native_rows"
+    artifacts=$(jq -c '.artifacts' <<< "$manifest") || return 4
+    _act_validate_native_matrix_result_inventory "$tool" "$inventory" "$artifacts"
+}
+
 # Flat release directories cannot retain two native payloads named `tool`.
 # Both cmd_build and manifest generation use this deterministic name; the
 # original paths and names remain in the immutable worker receipts.
@@ -11116,6 +11246,7 @@ act_generate_manifest() {
         return $?
     fi
     config_validate_target_triples "$tool" || return 4
+    _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
     if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
         # shellcheck source=./artifact_naming.sh
         source "$manifest_module_dir/artifact_naming.sh" || return 3
@@ -11515,11 +11646,19 @@ act_generate_manifest() {
         fi
     fi
 
-    local build_environments_json
+    _act_validate_native_matrix_result_inventory "$tool" "$result_json" "$artifacts_json" || return 4
+
+    local build_environments_json requested_targets_json
     build_environments_json=$(_act_build_environments_json "$result_json") || {
         _log_error "Failed to serialize build environment receipts"
         return 4
     }
+    requested_targets_json=$(jq -c '
+        .requested_targets // null |
+        if . == null or (type == "array" and all(.[];
+            type == "string" and test("^(linux|darwin|windows)/(amd64|arm64|386)$")))
+        then . else error("invalid requested build platforms") end
+    ' <<< "$result_json") || return 4
 
     local manifest
     manifest=$(jq -nc \
@@ -11533,6 +11672,7 @@ act_generate_manifest() {
         --argjson duration_ms "$duration_ms" \
         --argjson summary "$summary_json" \
         --argjson build_environments "$build_environments_json" \
+        --argjson requested_targets "$requested_targets_json" \
         --argjson artifacts "$artifacts_json" \
         '{
             schema_version: "1.0.0",
@@ -11548,7 +11688,7 @@ act_generate_manifest() {
             summary: $summary,
             build_environments: $build_environments,
             artifacts: ($artifacts | map(. + {build_purpose: "release", publishable: true}))
-        }') || {
+        } + (if $requested_targets == null then {} else {requested_targets: $requested_targets} end)') || {
             _log_error "Failed to serialize manifest"
             return 4
         }

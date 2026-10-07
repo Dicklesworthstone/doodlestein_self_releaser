@@ -8,6 +8,8 @@ COMMAND_FILE="${DSR_TEST_COMMAND_FILE:-$ROOT/dsr}"
 HELPERS_FILE="${DSR_TEST_HELPERS_FILE:-$COMMAND_FILE}"
 source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
 source <(awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$COMMAND_FILE")
+# shellcheck source=/dev/null
+source <(awk '/^_act_build_task_plan\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$ROOT/src/act_runner.sh")
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-fallback-tests.XXXXXXXX") || exit 1
 printf 'Fixtures: %s\n' "$TEST_ROOT"
 PASS=0 FAIL=0
@@ -21,6 +23,9 @@ act_load_repo_config() { return 0; }
 act_get_local_path() { printf '%s\n' "$CASE/source"; }
 act_get_repo() { printf '%s\n' owner/tool; }
 act_get_targets() { printf '%s\n' "$TARGETS"; }
+# These fixtures represent ordinary workflow targets. Completed fallback
+# admission uses the real task planner against their explicit configuration.
+act_platform_uses_act() { return 0; }
 # The throttle check finds one queued release run: the fallback's trigger.
 _check_repo() {
     printf 'THROTTLE %s\n' "$1" >> "$CALLS"
@@ -157,6 +162,9 @@ cmd_build() {
 
 setup() {
     CASE="$TEST_ROOT/$1"; mkdir -p "$CASE/source"
+    ACT_REPOS_DIR="$CASE/repos.d"
+    mkdir -p "$ACT_REPOS_DIR"
+    printf 'language: go\nbinary_name: tool\n' > "$ACT_REPOS_DIR/tool.yaml"
     CALLS="$CASE/calls"; : > "$CALLS"
     export DSR_STATE_DIR="$CASE/state"
     JSON_MODE=true DRY_RUN=false
@@ -293,6 +301,23 @@ test_completed_default_output() {
     cmd_fallback tool --version 1.2.3 --resume > "$CASE/stdout" 2> "$CASE/stderr" || RC=$?
     [[ "$RC" == 0 ]] && one_result && grep -Fq -- "--artifacts $OUT" <(grep '^RELEASE' "$CALLS")
 }
+test_completed_task_plan() {
+    setup "completed-plan-$1"; completed_fixture
+    local tasks
+    tasks=$(_act_build_task_plan tool 1.2.3 '["linux/amd64","darwin/arm64"]' false) || return 1
+    jq --argjson tasks "$tasks" '.context.build_tasks=$tasks' "$CASE/checkpoint.json" > "$CASE/planned-state.json"
+    mv "$CASE/planned-state.json" "$CASE/checkpoint.json"
+    if [[ "$1" == drift ]]; then
+        jq '.context.build_tasks |= reverse' "$CASE/checkpoint.json" > "$CASE/drifted-state.json"
+        mv "$CASE/drifted-state.json" "$CASE/checkpoint.json"
+    fi
+    run_fallback --resume
+    if [[ "$1" == matching ]]; then
+        [[ "$RC" == 0 ]] && one_result && ! grep -q '^BUILD ' "$CALLS" && grep -q '^RELEASE ' "$CALLS"
+    else
+        [[ "$RC" == 4 ]] && one_result && blocked && ! grep -q '^BUILD ' "$CALLS"
+    fi
+}
 test_completed_rejects_drift() {
     setup "drift-$1"; completed_fixture
     case "$1" in
@@ -400,6 +425,8 @@ run_test test_invalid_argument --resume=unsafe
 run_test test_completed_resume true
 run_test test_completed_resume false
 run_test test_completed_default_output
+run_test test_completed_task_plan matching
+run_test test_completed_task_plan drift
 for drift in source targets output run manifest-sha payload quality-source; do run_test test_completed_rejects_drift "$drift"; done
 for mode in missing malformed cancelled diagnostic selected; do run_test test_invalid_checkpoint "$mode"; done
 run_test test_signature_resume

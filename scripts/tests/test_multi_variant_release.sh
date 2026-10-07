@@ -570,5 +570,187 @@ check 'repacked GNU primary and compatibility archive bytes agree' cmp -s \
 check 'every inverted-format receipt and archive retains its own compiled variant' \
     verify_mixed_archives "$INVERTED_OUTPUT" gnu
 
+# Native rows retain the selected ABI even when both raw binaries have the
+# same basename. Exact arrays outrank legacy scalar paths, including commas.
+yq 'del(.act_job_map)' "$WORK/reviewed-config.yaml" > "$WORK/config/repos.d/variantdemo.yaml" || exit 1
+mkdir -p "$WORK/native,gnu" "$WORK/native-musl" || exit 1
+cp -p "$WORK/gnu/variantdemo" "$WORK/native,gnu/variantdemo" || exit 1
+cp -p "$WORK/musl/variantdemo" "$WORK/native-musl/variantdemo" || exit 1
+native_result=$(jq -nc --arg run "$RUN" --arg source "$SOURCE_SHA" \
+    --arg platform "$PLATFORM" --arg gnu "$GNU_TRIPLE" --arg musl "$MUSL_TRIPLE" \
+    --arg gnu_path "$WORK/native,gnu/variantdemo" --arg musl_path "$WORK/native-musl/variantdemo" '
+    {tool:"variantdemo",version:"1.2.3",run_id:$run,status:"success",git_sha:$source,git_ref:"v1.2.3",
+     requested_targets:[$platform],summary:{total:2,success:2,failed:0},targets:[
+        {platform:$platform,method:"native",host:"local",status:"success",target_triple:$gnu,
+         task_key:($platform+"@"+$gnu),artifact_path:"/invalid/legacy-scalar",artifact_paths:[$gnu_path],
+         build_influence_env:{CARGO_BUILD_TARGET:$gnu,DSR_TARGET_TRIPLE:$gnu}},
+        {platform:$platform,method:"native",host:"local",status:"success",target_triple:$musl,
+         task_key:($platform+"@"+$musl),artifact_path:"/invalid/legacy-scalar",artifact_paths:[$musl_path],
+         build_influence_env:{CARGO_BUILD_TARGET:$musl,DSR_TARGET_TRIPLE:$musl}}]}') || exit 1
+run_code 'native manifest retains both same-named raw variants and exact path arrays' 0 \
+    "$WORK/native-manifest-result" act_generate_manifest "$native_result" "$WORK/native-manifest.json"
+check 'native manifest names and hashes bind the actual selected variants' jq -e \
+    --arg gnu "$GNU_TRIPLE" --arg musl "$MUSL_TRIPLE" \
+    --arg gnu_sha "$(_gh_asset_sha256 "$WORK/native,gnu/variantdemo")" \
+    --arg musl_sha "$(_gh_asset_sha256 "$WORK/native-musl/variantdemo")" '
+    (.artifacts|length)==2 and all(.artifacts[];
+        if .target_triple==$gnu then .name==("variantdemo-"+$gnu) and .sha256==$gnu_sha
+        elif .target_triple==$musl then .name==("variantdemo-"+$musl) and .sha256==$musl_sha
+        else false end)' "$WORK/native-manifest.json"
+check 'build environment receipts retain each selected native variant' jq -e \
+    --arg gnu "$GNU_TRIPLE" --arg musl "$MUSL_TRIPLE" '
+    ([.build_environments[].target_triple]|sort)==([$gnu,$musl]|sort) and
+    all(.build_environments[]; .target_triple==.build_influence_env.CARGO_BUILD_TARGET)' \
+    "$WORK/native-manifest.json"
+check 'native manifest retains the requested platform set' jq -e --arg platform "$PLATFORM" \
+    '.requested_targets==[$platform]' "$WORK/native-manifest.json"
+for mutation in \
+    'del(.targets[1])' \
+    '.targets[1]=.targets[0]' \
+    '.targets=[]' \
+    '.targets[1].status="failed"' \
+    '.summary.total=1 | .summary.success=1' \
+    '.targets[1].task_key=.targets[0].task_key' \
+    '.targets[1].artifact_paths=[] | .targets[1].artifact_path=""' \
+    'del(.targets[0].target_triple)' \
+    '.targets[0].target_triple=null' \
+    '.targets[0].target_triple="x86_64-unknown-linux-uclibc"' \
+    '.targets[0].build_influence_env.CARGO_BUILD_TARGET=.targets[1].target_triple' \
+    '.targets[1].artifact_paths=.targets[0].artifact_paths'; do
+    invalid_native=$(jq -c "$mutation" <<< "$native_result") || exit 1
+    run_code "native variant identity refusal: $mutation" 4 \
+        "$WORK/native-refusal-$PASS" act_generate_manifest "$invalid_native" "$WORK/native-refused-$PASS.json"
+done
+partial_native=$(jq -c 'del(.targets[1]) | .status="partial" |
+    .summary={total:2,success:1,failed:1}' <<< "$native_result") || exit 1
+run_code 'partial native matrix retains completed payload without claiming success' 0 \
+    "$WORK/native-partial" act_generate_manifest "$partial_native" "$WORK/native-partial-manifest.json"
+check 'partial native manifest reports the incomplete matrix honestly' jq -e '
+    .status=="partial" and .summary=={total:2,success:1,failed:1} and
+    (.artifacts|length)==1' "$WORK/native-partial-manifest.json"
+cp -p "$WORK/gnu/variantdemo" "$WORK/native,gnu/variantdemo-musl" || exit 1
+invalid_native=$(jq -c --arg path "$WORK/native,gnu/variantdemo-musl" \
+    '.targets[0].artifact_paths=[$path]' <<< "$native_result") || exit 1
+run_code 'native selected triple cannot contradict its artifact filename' 4 \
+    "$WORK/native-name-refusal" act_generate_manifest "$invalid_native" "$WORK/native-name-refused.json"
+
+# Release admission must also validate retained native receipts: a caller can
+# supply a manifest directly without passing through manifest generation again.
+native_release_dir="$WORK/native-release-complete"
+mkdir -p "$native_release_dir" || exit 1
+cp -p "$WORK/native,gnu/variantdemo" "$native_release_dir/variantdemo-$GNU_TRIPLE" || exit 1
+cp -p "$WORK/native-musl/variantdemo" "$native_release_dir/variantdemo-$MUSL_TRIPLE" || exit 1
+cp -p "$WORK/native-manifest.json" "$native_release_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+DRY_RUN=true
+run_code 'retained complete native matrix can plan release' 0 "$WORK/native-release-complete-plan" \
+    cmd_release variantdemo 1.2.3 --artifacts "$native_release_dir"
+legacy_release_dir="$WORK/native-release-legacy"
+mkdir -p "$legacy_release_dir" || exit 1
+cp -p "$native_release_dir/"* "$legacy_release_dir/" || exit 1
+jq 'del(.build_environments,.requested_targets)' "$WORK/native-manifest.json" > \
+    "$legacy_release_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+run_code 'legacy native manifest retains a complete GNU and musl artifact set' 0 \
+    "$WORK/native-release-legacy-plan" cmd_release variantdemo 1.2.3 --artifacts "$legacy_release_dir"
+jq 'del(.build_environments,.requested_targets,.artifacts[1])' "$WORK/native-manifest.json" > \
+    "$legacy_release_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+run_refusal 'legacy native manifest cannot omit musl along with its receipt fields' \
+    "$legacy_release_dir" "$WORK/native-release-legacy-incomplete"
+for mutation in \
+    'del(.artifacts[1])' \
+    'del(.build_environments[1])' \
+    '.build_environments[1]=.build_environments[0]' \
+    '.build_environments=[]' \
+    'del(.build_environments)' \
+    '.build_environments[0].build_influence_env.CARGO_BUILD_TARGET=.build_environments[1].target_triple'; do
+    native_replay_dir="$WORK/native-release-refused-$PASS"
+    mkdir -p "$native_replay_dir" || exit 1
+    cp -p "$native_release_dir/"* "$native_replay_dir/" || exit 1
+    jq "$mutation" "$WORK/native-manifest.json" > \
+        "$native_replay_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+    run_refusal "retained native manifest refuses $mutation" "$native_replay_dir" \
+        "$WORK/native-release-refusal-$PASS"
+done
+
+# One workflow job can deliver assets for another platform. An explicit act
+# receipt keeps that partial-variant workflow valid even without a matching
+# act job mapping for the artifact platform itself.
+DSR_VARIANT_PLATFORM="$PLATFORM" yq 'del(.act_job_map) |
+    .targets=[strenv(DSR_VARIANT_PLATFORM),"windows/amd64"] |
+    .act_job_map."windows/amd64"="release"' "$WORK/reviewed-config.yaml" > \
+    "$WORK/config/repos.d/variantdemo.yaml" || exit 1
+cross_workflow_dir="$WORK/cross-workflow-release"
+mkdir -p "$cross_workflow_dir" || exit 1
+cp -p "$OUTPUT/$GNU_NAME" "$cross_workflow_dir/$GNU_NAME" || exit 1
+jq --arg name "$GNU_NAME" '
+    .artifacts |= map(select(.name==$name)) |
+    .requested_targets=["windows/amd64"] |
+    .build_environments[0].target="windows/amd64"
+    ' "$MANIFEST" > "$cross_workflow_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+: > "$CALLS"
+DRY_RUN=true
+run_code 'one cross-platform act receipt may release its partial variant set' 0 \
+    "$WORK/cross-workflow-plan" cmd_release variantdemo 1.2.3 --artifacts "$cross_workflow_dir"
+check 'cross-platform workflow planning makes no GitHub request' test ! -s "$CALLS"
+
+# A mixed release keeps a small explicit workflow payload when an entire
+# native platform is removed. Its retained requested_targets must expose the
+# missing native matrix rather than letting the nonempty artifact list hide it.
+mixed_native_dir="$WORK/mixed-native-release"
+mkdir -p "$mixed_native_dir" || exit 1
+cp -p "$native_release_dir/"* "$mixed_native_dir/" || exit 1
+workflow_payload=workflow-report-x86_64-pc-windows-msvc
+printf 'workflow metadata fixture; not an executable\n' > "$mixed_native_dir/$workflow_payload"
+jq --arg name "$workflow_payload" --arg sha "$(_gh_asset_sha256 "$mixed_native_dir/$workflow_payload")" \
+    --argjson size "$(wc -c < "$mixed_native_dir/$workflow_payload")" '
+    .requested_targets += ["windows/amd64"] |
+    .summary={total:3,success:3,failed:0} |
+    .build_environments += [{target:"windows/amd64",host:"workflow",method:"act",
+        build_influence_env:{},cargo_isolation:null}] |
+    .artifacts += [{name:$name,target:"windows/amd64",target_triple:"x86_64-pc-windows-msvc",
+        sha256:$sha,size_bytes:$size,archive_format:"binary",signed:false,signature_file:""}]
+    ' "$WORK/native-manifest.json" > "$mixed_native_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+DRY_RUN=true
+run_code 'mixed native and workflow receipts can plan a complete release' 0 \
+    "$WORK/mixed-native-plan" cmd_release variantdemo 1.2.3 --artifacts "$mixed_native_dir"
+jq --arg platform "$PLATFORM" '
+    .artifacts |= map(select(.target!=$platform)) |
+    .build_environments |= map(select(.target!=$platform)) |
+    .summary={total:1,success:1,failed:0}
+    ' "$mixed_native_dir/variantdemo-v1.2.3-manifest.json" > "$WORK/mixed-native-dropped.json" || exit 1
+cp "$WORK/mixed-native-dropped.json" "$mixed_native_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+run_refusal 'requested native platform cannot disappear from a retained mixed release' \
+    "$mixed_native_dir" "$WORK/mixed-native-dropped-result"
+
+# The xwin exporter has its own evidence shape and method name. This checks
+# public release admission of that saved shape, without claiming an xwin build.
+xwin_receipt_dir="$WORK/xwin-exporter-receipt"
+mkdir -p "$xwin_receipt_dir" || exit 1
+xwin_payload=exporter-report-aarch64-pc-windows-msvc
+printf 'saved exporter receipt fixture; no Windows compilation\n' > "$xwin_receipt_dir/$xwin_payload"
+jq --arg name "$xwin_payload" --arg sha "$(_gh_asset_sha256 "$xwin_receipt_dir/$xwin_payload")" \
+    --argjson size "$(wc -c < "$xwin_receipt_dir/$xwin_payload")" '
+    .requested_targets=["windows/arm64"] |
+    .summary={total:1,success:1,failed:0} |
+    .build_environments=[{target:"windows/arm64",method:"pinned-cargo-xwin",
+        build_influence_env:{CARGO_BUILD_TARGET:"aarch64-pc-windows-msvc"},
+        tool_versions:{},toolchain:{},cargo_metadata:{},source_snapshot:{},
+        cargo_cache:null,command:"fixture command not executed"}] |
+    .artifacts=[{name:$name,target:"windows/arm64",target_triple:"aarch64-pc-windows-msvc",
+        sha256:$sha,size_bytes:$size,archive_format:"binary",signed:false,signature_file:""}]
+    ' "$WORK/native-manifest.json" > "$xwin_receipt_dir/variantdemo-v1.2.3-manifest.json" || exit 1
+: > "$CALLS"
+DRY_RUN=true
+run_code 'saved pinned-cargo-xwin exporter receipt can plan public release' 0 \
+    "$WORK/xwin-exporter-plan" cmd_release variantdemo 1.2.3 --artifacts "$xwin_receipt_dir"
+check 'saved xwin receipt planning makes no GitHub request' test ! -s "$CALLS"
+
+DSR_VARIANT_PLATFORM="$PLATFORM" DSR_VARIANT_PRIMARY="$GNU_TRIPLE" \
+    yq '.target_triples[strenv(DSR_VARIANT_PLATFORM)]=strenv(DSR_VARIANT_PRIMARY)' \
+    "$WORK/reviewed-config.yaml" > "$WORK/config/repos.d/variantdemo.yaml" || exit 1
+legacy_native=$(jq -c '.targets=[.targets[0] | .target_triple=null] |
+    .summary={total:1,success:1,failed:0}' <<< "$native_result") || exit 1
+run_code 'singleton legacy native null triple remains supported' 0 \
+    "$WORK/native-legacy" act_generate_manifest "$legacy_native" "$WORK/native-legacy-manifest.json"
+
 printf '\nMulti-variant release: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

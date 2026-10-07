@@ -3587,6 +3587,7 @@ EOF
     _build_emit_variant_aliases() {
         local tool="$1" version="$2" target="$3" format="$4" naming_ext="$5"
         local output_dir="$6" repo_path="$7" primary_versioned="$8"
+        local native_results="${9:-null}" primary_compat="${10:-}"
         local listed triple names_json versioned compat variant_path
         local -a triples=()
         listed=$(config_get_target_triples "$tool" "$target" 2>/dev/null) || return 0
@@ -3601,13 +3602,44 @@ EOF
                 "${target%/*}" "${target#*/}" "$naming_ext" "$repo_path" "$triple" 2>/dev/null) || names_json=""
             versioned=$(jq -r '.versioned // empty' <<< "$names_json" 2>/dev/null) || versioned=""
             compat=$(jq -r '.compat // empty' <<< "$names_json" 2>/dev/null) || compat=""
+            local native_variant=false naming_override=""
+            if jq -e --arg platform "$target" --arg triple "$triple" '
+                any(.targets[]?; .platform == $platform and .method == "native" and
+                    .target_triple == $triple and
+                    (.status == "success" or .status == "ok" or .status == "passed"))
+            ' <<< "$native_results" >/dev/null 2>&1; then
+                native_variant=true
+            fi
             if [[ -z "$versioned" ]]; then
                 log_warn "Unable to name variant $triple of $tool $target"
                 continue
             fi
             if [[ "$versioned" == "$primary_versioned" ]]; then
-                log_warn "artifact_naming for $tool does not distinguish the variants of $target (add \${target_triple}); only ${triples[0]} gets installer names"
-                return 0
+                if $native_variant; then
+                    # Native compilation has produced distinct payloads even
+                    # when an older naming pattern only names the platform.
+                    # Retain its primary name and package every other variant
+                    # under the same qualification used by native collection.
+                    versioned=$(_act_native_variant_artifact_name \
+                        "$tool" "$target" "$triple" "$versioned") || {
+                        collect_failed=true
+                        return 1
+                    }
+                    log_info "Native variant $triple uses its qualified archive name: $versioned"
+                else
+                    log_warn "artifact_naming for $tool does not distinguish the variants of $target (add \${target_triple}); only ${triples[0]} gets installer names"
+                    return 0
+                fi
+            fi
+            if $native_variant; then
+                # A shared public name belongs to the primary. Emitting the
+                # secondary alias first would either steal that name or make
+                # later primary packaging fail with a byte collision.
+                if [[ "$compat" == "$primary_compat" || "$compat" == "$primary_versioned" ]]; then
+                    compat=""
+                fi
+                naming_override=$(jq -nc --arg versioned "$versioned" --arg compat "$compat" \
+                    '{versioned:$versioned, compat:$compat}') || return 1
             fi
             variant_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$triple" 2>/dev/null || true)
             if [[ -z "$variant_path" || -L "$variant_path" ]]; then
@@ -3631,7 +3663,7 @@ EOF
                 # a new extension; copying xz bytes to a .tar.gz alias makes
                 # the release impossible to install.
                 _build_package_archive_for_target "$tool" "$version" "$target" \
-                    "$output_dir" "$repo_path" "$binary_name" "$variant_path" "$triple" || return 1
+                    "$output_dir" "$repo_path" "$binary_name" "$variant_path" "$triple" "$naming_override" || return 1
                 if [[ ! -f "$output_dir/$versioned" ]]; then
                     log_error "Could not package $triple as $requested_format: $versioned"
                     collect_failed=true
@@ -3699,6 +3731,7 @@ EOF
         local binary_name="$6"
         local binary_override="${7:-}"
         local target_triple="${8:-}"
+        local naming_override="${9:-}"
 
         local os arch
         os="${target%/*}"
@@ -3761,7 +3794,9 @@ EOF
         fi
 
         local names_json versioned_name
-        if ! names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" \
+        if [[ -n "$naming_override" ]]; then
+            names_json="$naming_override"
+        elif ! names_json=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "$os" "$arch" \
                 "$naming_ext" "$repo_path" release "$target_triple"); then
             log_error "Unable to resolve archive names for $tool $target ${target_triple:-}"
             collect_failed=true
@@ -4115,7 +4150,7 @@ EOF
 
             if [[ "$format" != "none" ]]; then
                 _build_emit_variant_aliases "$tool" "$version" "$target" "$format" "$naming_ext" \
-                    "$output_dir" "$repo_path" "$versioned_name"
+                    "$output_dir" "$repo_path" "$versioned_name" "$result_json" "$compat_name"
             fi
 
             # The primary's actual container determines whether it needs
@@ -6999,6 +7034,7 @@ EOF
             log_error "Manifest does not describe a successful build of $tool_name $tag"
             return 4
         fi
+        _act_validate_native_manifest_inventory "$tool_name" "$ordinary_manifest" || return 4
         # The binaries must come from the commit the tag names, not whatever
         # the checkout held when they were built.
         local manifest_git_sha
