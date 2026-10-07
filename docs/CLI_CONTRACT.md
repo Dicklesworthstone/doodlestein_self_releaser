@@ -700,7 +700,13 @@ their own identities; arbitrary scripts are not mislabeled as rustup's
 compiler. Proven rustup proxies and Apple `/usr/bin` compiler launchers also
 record their resolved executable. Literal tracked Cargo configuration can
 select the compiler, target and linker; those configuration files are hashed
-into the receipt and require Python 3.11+ to parse.
+into the receipt and require Python 3.11+ to parse. A tracked `[env]` table
+that sets any `RUST*`, `CARGO_*`, `XWIN_*`, `PATH` or C toolchain variable is
+refused, with one exception: `RUST_MIN_STACK` set to a plain positive integer
+string. It only sizes rustc's and test/run threads' stacks, so it is admitted
+and recorded under that file's `env_exemptions` (name and value) in every
+receipt. Any other value form, or any other influencing name, still fails
+closed.
 
 Strict Unix source-closure validation runs locked, offline, all-features Cargo
 metadata with each target's selected toolchain and configured environment.

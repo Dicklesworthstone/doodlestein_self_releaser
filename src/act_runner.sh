@@ -7000,7 +7000,17 @@ def cargo_configuration():
             fail('invalid Cargo configuration: ' + str(error))
         if 'include' in current:
             fail('Cargo configuration includes require an explicitly attested selection')
-        if any(influences(name) for name in current.get('env', {})):
+        environment = current.get('env', {})
+        if not isinstance(environment, dict):
+            fail('invalid Cargo configuration section: env')
+        # RUST_MIN_STACK only sizes rustc's and test/run threads' stacks; it
+        # selects no compiler, target, flag or codegen input. Admit exactly
+        # that name with a plain positive integer, and record it per build.
+        exemptions = [{'name': name, 'value': value} for name, value in sorted(environment.items())
+                      if name == 'RUST_MIN_STACK' and isinstance(value, str)
+                      and re.fullmatch(r'[1-9][0-9]*', value)]
+        exempt = {row['name'] for row in exemptions}
+        if any(influences(name) for name in environment if name not in exempt):
             fail('Cargo configuration changes the compiler environment; use the configured build environment')
         for section in ('build', 'target', 'alias'):
             if section in current and not isinstance(current[section], dict):
@@ -7026,7 +7036,10 @@ def cargo_configuration():
                     values['linker'] = str((path.parent.parent / values['linker']).resolve())
             config['target'].setdefault(target, {}).update(values)
         config['alias'].update(current.get('alias', {}))
-        receipts.append({'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()})
+        receipt = {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
+        if exemptions:
+            receipt['env_exemptions'] = exemptions
+        receipts.append(receipt)
     return config, receipts
 
 

@@ -260,9 +260,30 @@ config_path.write_text(config_path.read_text() + '# changed configuration eviden
 after, _, _ = probe(command, env_config, mode='verify', receipt=receipt)
 check('tracked Cargo configuration drift refuses the final identity check', result.returncode == 0 and after.returncode != 0)
 config_path.rename(work / 'retained-literal-config.toml')
+config_path.write_text('[env]\nRUST_MIN_STACK = "8388608"\nLIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"\n')
+env_stack = dict(environment, CARGO_TARGET_DIR=str(work / 'stack-output'))
+command = 'cargo build --quiet --offline'
+result, data, receipt = probe(command, env_stack)
+compiled = build(command, env_stack)
+check('RUST_MIN_STACK in tracked [env] is admitted and the real build still runs',
+      result.returncode == 0 and compiled.returncode == 0 and
+      require([work / 'stack-output' / host / 'debug/identity-probe']) == '42')
+check('admitted RUST_MIN_STACK is recorded by name and value in the receipt',
+      data.get('selection', {}).get('cargo_config') == [{
+          'path': str(config_path), 'sha256': digest(config_path),
+          'env_exemptions': [{'name': 'RUST_MIN_STACK', 'value': '8388608'}]}])
+after, _, _ = probe(command, env_stack, mode='verify', receipt=receipt)
+check('unchanged RUST_MIN_STACK configuration passes the post-build probe', after.returncode == 0)
+config_path.rename(work / 'retained-stack-config.toml')
 for label, contents in (
     ('cfg linker', '[target.\'cfg(unix)\']\nlinker="cc"\n'),
     ('environment compiler', '[env]\nRUSTC="/bin/true"\n'),
+    ('environment RUSTFLAGS', '[env]\nRUSTFLAGS="-C debuginfo=0"\n'),
+    ('environment RUST_MIN_STACK_X near miss', '[env]\nRUST_MIN_STACK_X="8388608"\n'),
+    ('environment non-numeric RUST_MIN_STACK', '[env]\nRUST_MIN_STACK="abc"\n'),
+    ('environment zero RUST_MIN_STACK', '[env]\nRUST_MIN_STACK="0"\n'),
+    ('environment table RUST_MIN_STACK', '[env]\nRUST_MIN_STACK={value="8388608", force=true}\n'),
+    ('environment RUST_MIN_STACK beside RUSTFLAGS', '[env]\nRUST_MIN_STACK="8388608"\nRUSTFLAGS="-C debuginfo=0"\n'),
     ('included config', 'include=["other.toml"]\n'),
     ('command alias', '[alias]\ncompile="build"\n'),
 ):

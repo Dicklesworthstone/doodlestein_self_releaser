@@ -274,7 +274,18 @@
                 "additionalProperties": false,
                 "properties": {
                   "path": {"type": "string", "pattern": "^/"},
-                  "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                  "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "env_exemptions": {
+                    "type": "array", "minItems": 1,
+                    "items": {
+                      "type": "object", "required": ["name", "value"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "name": {"const": "RUST_MIN_STACK"},
+                        "value": {"type": "string", "pattern": "^[1-9][0-9]*$"}
+                      }
+                    }
+                  }
                 }
               }
             }
