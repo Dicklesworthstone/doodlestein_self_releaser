@@ -548,6 +548,16 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--no-dispatch` | false | Disable repository dispatch for this run |
 | `--dispatch-event` | `dsr_release` | Override dispatch event type |
 | `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
+| `--no-manifest` | false | Upload an artifacts directory that has no build manifest, as-is |
+
+An ordinary release publishes the build manifest's artifacts. `dsr build`
+writes the manifest only when every target succeeded, so without one `release`
+exits 4 unless `--no-manifest` is given (no completeness check, no checksums).
+The manifest's `source.git_sha` must be the commit the local tag names (exit 4
+otherwise), origin must not hold a different commit under that tag, and a tag
+GitHub does not have yet is created at that commit (`target_commitish`), not at
+the default branch head. `dsr build --version` likewise exits 4 when the
+version's tag exists and the checkout is at another commit.
 
 When a repository opts into `release_contract`, DSR creates a new empty draft,
 uploads only the contracted primaries, their checksum sidecars, the regular

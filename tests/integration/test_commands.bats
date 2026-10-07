@@ -887,6 +887,24 @@ fi
     assert_equal "4" "$status"
 }
 
+@test "dsr build refuses a version whose tag is another commit than the checkout" {
+    harness_create_config
+    local src="$TEST_TMPDIR/src"
+    git init -q "$src"
+    git -C "$src" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m tagged
+    git -C "$src" tag v1.2.3
+    git -C "$src" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m later
+    mkdir -p "$DSR_CONFIG_DIR/repos.d"
+    printf 'tool_name: tagged\nrepo: example/tagged\nlocal_path: %s\nlanguage: go\ntargets:\n  - linux/amd64\n' \
+        "$src" > "$DSR_CONFIG_DIR/repos.d/tagged.yaml"
+
+    _dsr_json build tagged --version 1.2.3
+    assert_equal "4" "$status"
+    jq -e --arg head "$(git -C "$src" rev-parse HEAD)" --arg tag "$(git -C "$src" rev-parse v1.2.3)" \
+        '.status == "error" and .details.head_sha == $head and .details.tag_sha == $tag' <<< "$json"
+    [[ ! -e "$DSR_STATE_DIR/artifacts/tagged-v1.2.3" ]]
+}
+
 @test "dsr release finalize explains its usage errors" {
     run harness_run_dsr release finalize --help
     assert_equal "0" "$status"

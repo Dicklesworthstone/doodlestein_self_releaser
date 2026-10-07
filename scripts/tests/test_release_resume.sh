@@ -168,7 +168,12 @@ curl() {
 
 run_release() {
     STATUS=0
-    cmd_release tool 1.2.3 --artifacts "$CASE/artifacts" "$@" > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
+    # Cases without a build manifest exercise the explicit --no-manifest
+    # upload of a directory as-is.
+    local -a manifest_args=()
+    [[ -f "$CASE/artifacts/tool-v1.2.3-manifest.json" ]] || manifest_args=(--no-manifest)
+    cmd_release tool 1.2.3 --artifacts "$CASE/artifacts" ${manifest_args[@]+"${manifest_args[@]}"} "$@" \
+        > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
 }
 
 run_test() {
@@ -532,8 +537,49 @@ test_empty_artifacts_are_not_a_release() {
     setup empty
     mkdir "$CASE/empty"
     STATUS=0
-    cmd_release tool 1.2.3 --artifacts "$CASE/empty" > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
-    [[ $STATUS -eq 4 && ! -s "$CALLS" ]]
+    cmd_release tool 1.2.3 --artifacts "$CASE/empty" --no-manifest > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]] && grep -q 'No release artifacts were selected' "$CASE/stderr"
+}
+
+# dsr build withholds the manifest after a partial build; a directory without
+# one is published only on explicit request.
+test_unmanifested_directory_is_refused() {
+    setup no_manifest
+    STATUS=0
+    cmd_release tool 1.2.3 --artifacts "$CASE/artifacts" > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]] && grep -q 'pass --no-manifest' "$CASE/stderr"
+}
+
+# Artifacts built from another commit than the tag are refused; a tag not yet
+# on GitHub is created at the tagged commit, not the default branch head.
+test_artifacts_must_come_from_the_tagged_commit() {
+    setup tag_binding
+    local tagged head original_create
+    git init -q "$CASE/checkout" &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m tagged &&
+        git -C "$CASE/checkout" tag v1.2.3 &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m later ||
+        return 1
+    tagged=$(git -C "$CASE/checkout" rev-parse 'v1.2.3^{commit}')
+    head=$(git -C "$CASE/checkout" rev-parse HEAD)
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    git_ops_tag_sha() { git -C "$1" rev-parse --verify "$2^{commit}"; }
+    manifest payload.bin
+    local manifest_file="$CASE/artifacts/tool-v1.2.3-manifest.json"
+    jq --arg sha "$head" '. + {source: {git_sha: $sha}}' "$manifest_file" > "$manifest_file.new" &&
+        mv "$manifest_file.new" "$manifest_file"
+    run_release
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]] && grep -q "built from $head, but v1.2.3 is $tagged" "$CASE/stderr" ||
+        return 1
+
+    jq --arg sha "$tagged" '.source.git_sha = $sha' "$manifest_file" > "$manifest_file.new" &&
+        mv "$manifest_file.new" "$manifest_file"
+    original_create=$(declare -f gh_create_release)
+    gh_create_release() { printf 'CREATE %s\n' "$*" >> "$CALLS"; cat "$CASE/release.json"; }
+    run_release
+    eval "$original_create"
+    [[ $STATUS -eq 0 ]] && grep -q -- "^CREATE .*--target-commitish $tagged" "$CALLS"
 }
 
 test_wrong_repository_upload_url_is_rejected() {
@@ -560,6 +606,7 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_checkpoint_symlink_failure_preserves_foreign_file test_checkpoint_receipt_is_bound_and_private \
     test_partial_release_resumes_only_missing_upload test_completed_release_resume_does_not_reupload \
     test_invalid_journal_is_not_upload_authority test_empty_artifacts_are_not_a_release \
+    test_unmanifested_directory_is_refused test_artifacts_must_come_from_the_tagged_commit \
     test_wrong_repository_upload_url_is_rejected; do
     run_test "$test"
 done

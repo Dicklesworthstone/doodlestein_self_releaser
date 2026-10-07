@@ -538,6 +538,15 @@ aliases), the build manifest, the generated `SHA256SUMS` and per-name `.sha256`
 sidecars, and existing signatures/SBOMs; with `--json` the same plan is in
 `details.plan`. It uses the same naming code as the real upload.
 
+A release publishes what the build manifest lists, and only from the commit the
+version's tag names. `dsr build` writes no manifest after a partial build, so
+`release` refuses a directory without one (pass `--no-manifest` to upload a
+hand-assembled directory as-is). It also refuses artifacts built from a
+different commit than the local tag, and a tag that origin holds at another
+commit. A tag not yet on GitHub is created at the tagged commit. `dsr build
+--version X` stops before building when tag X exists and the checkout is
+elsewhere.
+
 Both the dry-run and the real release check the project's own curl|bash
 installer (`install_script_path`, else `install.sh` in the checkout): for each
 non-Windows target dsr computes the asset name the installer downloads,

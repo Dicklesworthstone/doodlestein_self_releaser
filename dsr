@@ -2396,6 +2396,24 @@ EOF
         log_warn "Tag $tag does not exist in $local_path"
         log_info "Creating tag with: dsr version tag $tool_name"
         # For now, proceed anyway - the version might be in version files but not tagged
+    elif [[ "$build_purpose" == release ]]; then
+        # An existing tag names the source of this version. Building another
+        # commit under it would publish binaries that are not the tagged code
+        # (dsr release refuses that manifest; fail here, before building).
+        local ordinary_head_sha ordinary_tag_sha
+        ordinary_head_sha=$(git -C "$local_path" rev-parse --verify HEAD 2>/dev/null) || ordinary_head_sha=""
+        ordinary_tag_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null) || ordinary_tag_sha=""
+        if [[ -n "$ordinary_tag_sha" && "$ordinary_head_sha" != "$ordinary_tag_sha" ]]; then
+            log_error "$tag is $ordinary_tag_sha, but $local_path is at ${ordinary_head_sha:-an unknown commit}"
+            log_info "Check out $tag (git -C '$local_path' checkout $tag) and build again"
+            if $JSON_MODE; then
+                json_envelope "build" "error" 4 "$(jq -nc --arg tool "$tool_name" --arg version "$tag" \
+                    --arg head "$ordinary_head_sha" --arg tag_sha "$ordinary_tag_sha" \
+                    '{tool: $tool, version: $version, error: "checkout is not at the release tag",
+                      head_sha: $head, tag_sha: $tag_sha}')"
+            fi
+            return 4
+        fi
     fi
 
     # Set output directory default (tool-version)
@@ -6568,6 +6586,8 @@ cmd_release() {
     local dispatch_override=""
     local dispatch_event_override=""
     local dispatch_repos_override=""
+    local allow_no_manifest=false
+    local release_tag_sha=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -6598,6 +6618,10 @@ cmd_release() {
                 ;;
             --verify-tag)
                 verify_tag=true
+                shift
+                ;;
+            --no-manifest)
+                allow_no_manifest=true
                 shift
                 ;;
             --resume|-r)
@@ -6646,6 +6670,10 @@ OPTIONS:
     --prerelease             Mark as prerelease
     --generate-notes         Auto-generate release notes
     --verify-tag             Verify tag exists before release
+    --no-manifest            Upload the artifacts directory as-is when it has no
+                             build manifest (dsr build writes one only after
+                             every target succeeded; without it the directory
+                             may hold a partial build, and no checksums are made)
     --verify-upgrade         Run upgrade verification after successful release
     --dispatch               Trigger repository dispatch after release
     --no-dispatch            Disable repository dispatch for this run
@@ -6781,7 +6809,22 @@ EOF
                 log_info "Create with: dsr version tag $tool_name"
                 return 4
             fi
-            log_info "Tag $tag verified locally"
+            release_tag_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null) || release_tag_sha=""
+            log_info "Tag $tag verified locally${release_tag_sha:+ ($release_tag_sha)}"
+            # GitHub creates a missing tag at target_commitish, else at the
+            # default branch head. Origin already holding a different commit
+            # under this tag would publish other source than was tagged here.
+            local origin_tags origin_tag_sha=""
+            if [[ -n "$release_tag_sha" ]] && ! $release_contract_enabled &&
+               origin_tags=$(git -C "$local_path" ls-remote --tags origin \
+                    "refs/tags/$tag" "refs/tags/$tag^{}" 2>/dev/null); then
+                origin_tag_sha=$(awk -v peeled="refs/tags/$tag^{}" -v ref="refs/tags/$tag" '
+                    $2 == peeled { p = $1 } $2 == ref { d = $1 } END { print (p != "" ? p : d) }' <<< "$origin_tags")
+                if [[ -n "$origin_tag_sha" && "$origin_tag_sha" != "$release_tag_sha" ]]; then
+                    log_error "origin's $tag is $origin_tag_sha but the local $tag is $release_tag_sha"
+                    return 4
+                fi
+            fi
         elif $verify_tag; then
             # User explicitly requested verification but no local path available
             log_warn "Cannot verify tag: local_path not configured for $tool_name"
@@ -6818,8 +6861,15 @@ EOF
     elif $release_contract_enabled; then
         log_error "Strict release contract requires manifest: $manifest_file"
         return 4
+    elif ! $allow_no_manifest; then
+        # dsr build withholds the manifest until every target succeeded, so a
+        # directory without one may hold a partial build.
+        log_error "No build manifest for $tool_name $tag in $artifacts_dir"
+        log_info "dsr build writes it only when every target succeeds; re-run 'dsr build $tool_name --version $version'"
+        log_info "To upload this directory as-is (no completeness check, no checksums), pass --no-manifest"
+        return 4
     else
-        log_warn "No manifest found, will upload all files in artifacts directory"
+        log_warn "No manifest (--no-manifest): uploading every file in $artifacts_dir"
     fi
     _release_require_publishable_artifacts "$artifacts_dir" "$manifest_file" \
         "$release_contract_enabled" || return 4
@@ -6853,6 +6903,15 @@ EOF
             (.summary.failed == null or .summary.failed == 0)
         ' <<< "$ordinary_manifest" >/dev/null; then
             log_error "Manifest does not describe a successful build of $tool_name $tag"
+            return 4
+        fi
+        # The binaries must come from the commit the tag names, not whatever
+        # the checkout held when they were built.
+        local manifest_git_sha
+        manifest_git_sha=$(jq -r '.source.git_sha // empty' <<< "$ordinary_manifest")
+        if [[ -n "$release_tag_sha" && -n "$manifest_git_sha" && "$manifest_git_sha" != "$release_tag_sha" ]]; then
+            log_error "Artifacts were built from $manifest_git_sha, but $tag is $release_tag_sha"
+            log_info "Check out $tag and rebuild: dsr build $tool_name --version $version"
             return 4
         fi
         local required_name required_sha actual_sha
@@ -7505,6 +7564,11 @@ EOF
         release_args+=" --draft"
     fi
     $prerelease && release_args+=" --prerelease"
+    # A tag not yet on GitHub is created at the locally tagged commit, not
+    # at the default branch head.
+    if ! $release_contract_enabled && [[ "$release_tag_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        release_args+=" --target-commitish $release_tag_sha"
+    fi
     if $release_contract_enabled; then
         release_args+=" --target-commitish $release_contract_git_sha"
         if ! _release_contract_require_tag_release_absent "$repo" "$tag"; then
