@@ -380,6 +380,8 @@ _target_triple_candidates() {
     case "${os}/${arch}" in
         linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
         linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+        linux/386) echo "i686-unknown-linux-gnu" ;;
+        linux/armv7) echo "armv7-unknown-linux-gnueabihf" ;;
         darwin/amd64) echo "x86_64-apple-darwin" ;;
         darwin/arm64) echo "aarch64-apple-darwin" ;;
         windows/amd64) echo "x86_64-pc-windows-msvc" ;;
@@ -1178,12 +1180,12 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -v|--version)
-                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _log_error "$1 requires a version"; return 4; }
                 _VERSION="$2"
                 shift 2
                 ;;
             -d|--dir)
-                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _log_error "$1 requires a directory"; return 4; }
                 _INSTALL_DIR="$2"
                 shift 2
                 ;;
@@ -1229,7 +1231,7 @@ main() {
                 fi
                 ;;
             --cache-dir)
-                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _log_error "$1 requires a directory"; return 4; }
                 _CACHE_DIR="$2"
                 shift 2
                 ;;
@@ -1251,13 +1253,13 @@ main() {
                 shift
                 ;;
             --stale-threshold)
-                [[ $# -ge 2 && -n "$2" ]] || return 4
+                [[ $# -ge 2 && -n "$2" ]] || { _log_error "$1 requires a number"; return 4; }
                 stale_threshold="$2"
                 stale_threshold_set=true
                 shift 2
                 ;;
             --source-ref|--source-timeout|--build-timeout|--source-if-stale)
-                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || return 4
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { _log_error "$1 requires a value"; return 4; }
                 case "$1" in
                     --source-ref) _SOURCE_REF="$2" ;;
                     --source-timeout|--build-timeout) _SOURCE_TIMEOUT="$2" ;;
@@ -1291,13 +1293,19 @@ main() {
     # Both CLI spellings use the same post-verification freshness path. Never
     # silently resolve conflicting thresholds by whichever flag appeared last.
     if $prefer_stale; then
-        [[ "$stale_threshold" =~ ^(0|[1-9][0-9]{0,5})$ && -z "$_SOURCE_IF_STALE" ]] || return 4
+        [[ "$stale_threshold" =~ ^(0|[1-9][0-9]{0,5})$ && -z "$_SOURCE_IF_STALE" ]] || {
+            _log_error "--stale-threshold must be 0 through 999999, and not combined with --source-if-stale"
+            return 4
+        }
         _SOURCE_IF_STALE="$stale_threshold"
     elif $stale_threshold_set; then
         _log_error "--stale-threshold requires --prefer-source-if-stale"
         return 4
     fi
-    [[ "$_SOURCE_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || return 4
+    [[ "$_SOURCE_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || {
+        _log_error "--source-timeout must be 1 through 99999 seconds"
+        return 4
+    }
     if [[ -n "$_SOURCE_IF_STALE" ]]; then
         if [[ ! "$_SOURCE_IF_STALE" =~ ^(0|[1-9][0-9]{0,5})$ || -n "$_VERSION" ]] ||
            ! $_ALLOW_SOURCE_BUILD || $_FROM_SOURCE; then

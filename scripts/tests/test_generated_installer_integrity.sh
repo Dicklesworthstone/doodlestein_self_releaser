@@ -495,6 +495,23 @@ check '--mode safe refuses source builds' test "$status" -eq 4 -a ! -e "$case_di
 run_install --mode turbo
 check 'an unknown --mode is refused' test "$status" -eq 4
 
+# A 32-bit Linux host (uname -m i686) selects the GNU build of linux/386.
+if [[ "$os" == linux ]]; then
+    mkdir -p "$work/i686"
+    cat > "$work/i686/uname" <<'UNAME'
+#!/usr/bin/env bash
+case "${1:-}" in -m) echo i686 ;; *) echo Linux ;; esac
+UNAME
+    chmod +x "$work/i686/uname"
+    asset386="demo-1.2.3-linux-386.tar.gz"
+    tar -czf "$REMOTE/$asset386" -C "$work/payload" demo || exit 1
+    set_manifest "$(sha256sum < "$REMOTE/$asset386" | awk '{print $1}')  $asset386"
+    PATH="$work/i686:$PATH" run_install --libc gnu
+    check 'a 32-bit Linux host installs the linux/386 build' success
+    check 'the 32-bit build is the GNU target' grep -q 'Target: i686-unknown-linux-gnu' "$case_dir/err"
+    set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"
+fi
+
 # Piped (`curl | bash`): --help still prints the usage, and replacing an
 # existing binary without a terminal says to use --yes instead of failing mute.
 help_out=$(bash -s -- --help < "$installer" 2>&1)
