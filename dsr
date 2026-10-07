@@ -2809,11 +2809,18 @@ EOF
                     '{error: $error, sync: $sync}' 2>/dev/null); then
                     sync_error_json='{"error":"Source sync failed"}'
                 fi
-                json_envelope "build" "failed" 1 "$sync_error_json"
+                json_envelope "build" "error" 1 "$sync_error_json"
             fi
             return 1
         fi
 
+        if ! $build_release_contract_enabled; then
+            # The hosts the source was synced to are where it must build.
+            local ordinary_target_hosts_json
+            if ordinary_target_hosts_json=$(jq -ce '.target_hosts | objects' <<< "$sync_json" 2>/dev/null); then
+                build_source_args+=(--target-hosts-json "$ordinary_target_hosts_json")
+            fi
+        fi
         if $build_release_contract_enabled; then
             build_target_hosts_json=$(jq -ce '.target_hosts | objects' <<< "$sync_json") || return 4
             if ! build_source_roots_json=$(jq -ce '
@@ -4281,7 +4288,7 @@ EOF
     # Resolve the final command status before emitting either JSON or human
     # output. In particular, a failed completion-state write must never be
     # followed by a success envelope, and signal cancellation must retain 130.
-    local final_exit=6 final_status="failed"
+    local final_exit=6 final_status="error"
     if [[ $orchestrator_exit -eq 130 ]]; then
         final_exit=130
     elif [[ $orchestrator_exit -ne 0 && $orchestrator_exit -ne 1 ]]; then
@@ -4309,17 +4316,35 @@ EOF
         local build_details authoritative_manifest=""
         $all_targets_succeeded && [[ $manifest_failed == false && -f "$manifest_file" ]] && \
             authoritative_manifest="$manifest_file"
+        # Per-target results (schemas/build-details.json): which target
+        # failed, where and how it built. A requested target without a
+        # result was not attempted.
+        local target_results_json build_repo
+        build_repo=$(act_get_repo "$tool_name" 2>/dev/null || true)
+        [[ -z "$build_repo" || "$build_repo" == */* ]] || build_repo="Dicklesworthstone/$build_repo"
+        target_results_json=$(jq -c '[.targets[]? | select(type == "object" and (.platform | type == "string")) |
+            {platform, host: (.host // ""), method: (.method // "native"),
+             status: (if (.status // "") | IN("success", "ok", "passed") then "success"
+                      elif .status == "timeout" then "timeout" else "failed" end)}
+            + (if (.artifact_path | type) == "string" then {artifact_path} else {} end)
+            + (if (.error | type) == "string" then {error} else {} end)
+            + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \
+            <<< "$result" 2>/dev/null) || target_results_json='[]'
         build_details=$(jq -n \
-            --arg tool "$tool_name" --arg version "$version" \
+            --arg tool "$tool_name" --arg version "$version" --arg repo "$build_repo" \
             --arg build_purpose "$build_purpose" --arg targets "$target_list" \
+            --argjson results "$target_results_json" --arg run_id "$result_run_id" \
             --argjson total "$total" --argjson success "$success" --argjson failed "$failed" \
             --argjson duration "$duration" --arg output_dir "$output_dir" \
             --arg manifest "$authoritative_manifest" '
-            {tool: $tool, version: $version, build_purpose: $build_purpose,
-             publishable: ($build_purpose == "release"),
-             targets: ($targets | split(" ") | map(select(length > 0))),
+            ($results | map({key: .platform, value: .}) | from_entries) as $by_platform |
+            {tool: $tool, repo: $repo, version: $version, build_purpose: $build_purpose,
+             publishable: ($build_purpose == "release"), run_id: $run_id,
+             targets: [($targets | split(" ") | map(select(length > 0)))[] as $platform |
+                 $by_platform[$platform] // {platform: $platform, host: "", method: "native", status: "skipped"}],
              total: $total, success: $success, failed: $failed,
-             duration_seconds: $duration, output_dir: $output_dir, manifest: $manifest}') || return 4
+             duration_seconds: $duration, total_build_time_ms: ($duration * 1000),
+             output_dir: $output_dir, manifest_path: $manifest}') || return 4
         json_envelope "build" "$final_status" "$final_exit" "$build_details"
     else
         echo ""
@@ -7666,6 +7691,21 @@ EOF
         ' <<< "$release_json" >/dev/null 2>&1; then
             log_error "Release response has the wrong identity or upload destination"
             return 7
+        fi
+        # --draft asks for assets nobody can download yet. An existing release
+        # that is already public (e.g. created by a stalled GitHub Actions
+        # run) cannot honor that, so nothing is uploaded into it.
+        if $requested_draft && [[ "$(jq -r '.draft' <<< "$release_json")" == false ]]; then
+            log_error "--draft was requested, but $tag is already a published release; nothing uploaded"
+            log_info "Release without --draft to add the assets to the published release"
+            if $JSON_MODE; then
+                json_envelope "release" "error" 7 "$(jq -nc --arg tag "$tag" --arg url "$release_url" \
+                    '{error: "release already published; --draft cannot be honored", tag: $tag, release_url: $url}')"
+            fi
+            return 7
+        fi
+        if $prerelease && [[ "$(jq -r '.prerelease' <<< "$release_json")" == false ]]; then
+            log_warn "--prerelease was requested, but the existing $tag release is not a prerelease"
         fi
         # An existing draft does not become public merely because --draft was
         # omitted on retry. Downstream dispatch must use observed state.

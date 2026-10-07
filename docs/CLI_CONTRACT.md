@@ -557,7 +557,16 @@ The manifest's `source.git_sha` must be the commit the local tag names (exit 4
 otherwise), origin must not hold a different commit under that tag, and a tag
 GitHub does not have yet is created at that commit (`target_commitish`), not at
 the default branch head. `dsr build --version` likewise exits 4 when the
-version's tag exists and the checkout is at another commit.
+version's tag exists and the checkout is at another commit. `--draft` against a
+release that already exists and is published exits 7 without uploading
+(dropping `--draft` adds the assets to it).
+
+`dsr build --json` reports `repo`, `run_id` (the build run that `--resume=`
+takes), `manifest_path` (set only when every target succeeded) and one object
+per requested target: `platform`, `host`, `method`, `status`
+(`success`/`failed`/`timeout`, or `skipped` when not attempted), and when known
+`artifact_path`, `error` and `duration_ms`. Native targets build on the host
+their source was synced to.
 
 When a repository opts into `release_contract`, DSR creates a new empty draft,
 uploads only the contracted primaries, their checksum sidecars, the regular

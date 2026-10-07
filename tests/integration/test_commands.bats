@@ -905,6 +905,25 @@ fi
     [[ ! -e "$DSR_STATE_DIR/artifacts/tagged-v1.2.3" ]]
 }
 
+@test "a repo's hosts: map pins its native build host" {
+    mkdir -p "$TEST_TMPDIR/repos.d"
+    cat > "$TEST_TMPDIR/repos.d/pinned.yaml" << 'YAML'
+tool_name: pinned
+hosts:
+  linux/amd64: buildbox
+  darwin/arm64: mini2
+cross_compile:
+  darwin/arm64:
+    host: crossmac
+YAML
+    run bash -c 'source "$1/src/logging.sh"; source "$1/src/config.sh"; source "$1/src/act_runner.sh"
+        ACT_REPOS_DIR="$2"; DSR_DISABLE_HOST_SELECTOR=1
+        act_get_native_host linux/amd64 pinned; act_get_native_host darwin/arm64 pinned
+        act_get_native_host windows/amd64 pinned' _ "$PROJECT_ROOT" "$TEST_TMPDIR/repos.d"
+    assert_equal "0" "$status"
+    assert_equal $'buildbox\ncrossmac\nwlap' "$output"
+}
+
 @test "dsr release finalize explains its usage errors" {
     run harness_run_dsr release finalize --help
     assert_equal "0" "$status"

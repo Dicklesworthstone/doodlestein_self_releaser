@@ -612,6 +612,15 @@ test_build_completes_lane_archive_with_include_files() {
     done < <(jq -r '.artifacts[] | [.name, .sha256, (.size_bytes | tostring)] | @tsv' "$manifest" 2>/dev/null)
     jq -e '[.artifacts[].name] | index("lane-tool-1.2.3-linux-amd64.tar.gz") != null' \
         "$manifest" >/dev/null 2>&1 || problems+=("manifest lacks the release archive")
+    # The envelope reports each target as an object (build-details.json), and
+    # the build run id that --resume takes.
+    exec_stdout | jq -e --arg manifest "$manifest" '
+        .status == "success" and (.details.repo | length > 0) and
+        .details.manifest_path == $manifest and
+        (.details.run_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")) and
+        (.details.targets | length == 1) and
+        (.details.targets[0] | .platform == "linux/amd64" and .method == "act" and .status == "success")
+    ' >/dev/null 2>&1 || problems+=("envelope: $(exec_stdout | jq -c '.details | {repo, run_id, manifest_path, targets}' 2>/dev/null)")
 
     if [[ ${#problems[@]} -eq 0 ]]; then
         pass "build completes a release-named lane archive with configured include_files"

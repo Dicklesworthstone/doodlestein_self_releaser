@@ -2622,8 +2622,12 @@ act_get_native_host() {
     if [[ -n "$tool_name" ]]; then
         local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
         if [[ -f "$config_file" ]]; then
+            # A repo pins its build host per platform with
+            # cross_compile.<platform>.host or the README's `hosts:` map.
             local override_host
-            override_host=$(yq -r ".cross_compile.\"$platform\".host // \"\"" "$config_file" 2>/dev/null || true)
+            override_host=$(DSR_PLATFORM="$platform" yq -r '
+                .cross_compile[strenv(DSR_PLATFORM)].host // .hosts[strenv(DSR_PLATFORM)] // ""
+            ' "$config_file" 2>/dev/null || true)
             if [[ -n "$override_host" && "$override_host" != "null" ]]; then
                 printf '%s\n' "$override_host"
                 return 0
@@ -10107,7 +10111,11 @@ act_orchestrate_build() {
         if $strict_release_contract; then
             host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || return 4
         elif ! act_platform_uses_act "$tool_name" "$target"; then
-            host=$(act_get_native_host "$target" "$tool_name")
+            # Build where the source was synced. Asking the capacity selector
+            # again could pick a busier-now host that was never synced and
+            # would compile whatever stale tree it holds.
+            host=$(jq -r --arg target "$target" '.[$target] // empty' <<< "$target_hosts_json" 2>/dev/null)
+            [[ -n "$host" ]] || host=$(act_get_native_host "$target" "$tool_name")
         fi
 
         # Two concurrent targets on one host whose builds write the same file

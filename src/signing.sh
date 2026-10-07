@@ -809,6 +809,7 @@ signing_apply_config() {
     declare -p DSR_CONFIG &>/dev/null || return 0
     local key_path="${DSR_CONFIG[signing.key_path]:-}"
     [[ -n "$key_path" && "$key_path" != null ]] || return 0
+    # shellcheck disable=SC2088  # matching a literal "~/" from YAML
     [[ "$key_path" == "~/"* ]] && key_path="$HOME/${key_path#\~/}"
     SIGNING_PRIVATE_KEY="$key_path"
 }

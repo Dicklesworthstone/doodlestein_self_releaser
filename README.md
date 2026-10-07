@@ -830,7 +830,8 @@ targets:
 
 workflow: .github/workflows/release.yml
 
-# Override default hosts for this repo
+# Pin this repo's build host per platform (cross_compile.<platform>.host,
+# if set, takes precedence; unlisted platforms use hosts.yaml)
 hosts:
   linux/amd64: trj
   darwin/arm64: mmini

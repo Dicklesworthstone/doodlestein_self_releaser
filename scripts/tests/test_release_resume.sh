@@ -541,6 +541,16 @@ test_empty_artifacts_are_not_a_release() {
     [[ $STATUS -eq 4 && ! -s "$CALLS" ]] && grep -q 'No release artifacts were selected' "$CASE/stderr"
 }
 
+# --draft cannot be honored by a release that is already public: nothing is
+# uploaded into it.
+test_draft_request_refuses_published_release() {
+    setup draft_on_public
+    manifest payload.bin
+    run_release --resume --draft
+    [[ $STATUS -eq 7 ]] && ! grep -q '^POST ' "$CALLS" &&
+        grep -q 'already a published release; nothing uploaded' "$CASE/stderr"
+}
+
 # dsr build withholds the manifest after a partial build; a directory without
 # one is published only on explicit request.
 test_unmanifested_directory_is_refused() {
@@ -607,6 +617,7 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_partial_release_resumes_only_missing_upload test_completed_release_resume_does_not_reupload \
     test_invalid_journal_is_not_upload_authority test_empty_artifacts_are_not_a_release \
     test_unmanifested_directory_is_refused test_artifacts_must_come_from_the_tagged_commit \
+    test_draft_request_refuses_published_release \
     test_wrong_repository_upload_url_is_rejected; do
     run_test "$test"
 done
