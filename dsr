@@ -4516,6 +4516,8 @@ EOF
             + (if (.task_key | type) == "string" then {task_key} else {} end)
             + (if (.stage | type) == "string" then {stage} else {} end)
             + (if (.source_sync | type) == "object" then {source_sync} else {} end)
+            + (if (.build_influence_env | type) == "object" then {build_influence_env} else {} end)
+            + (if (.cargo_isolation | type) == "object" then {cargo_isolation} else {} end)
             + (if (.log_path | type) == "string" then {log_path} else {} end)
             + (if (.error | type) == "string" then {error} else {} end)
             + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \

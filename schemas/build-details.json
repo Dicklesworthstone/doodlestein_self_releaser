@@ -125,6 +125,15 @@
           },
           "description": "Original synchronization receipt for this target's selected host"
         },
+        "build_influence_env": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "description": "Effective configured build environment retained from the target result, with case-insensitive Windows names normalized by the native worker"
+        },
+        "cargo_isolation": {
+          "type": "object",
+          "description": "Complete Cargo isolation and provenance receipt retained from the target result, including available dependency-cache, toolchain-identity, and Windows command-context evidence; the same receipt is retained in manifest build_environments"
+        },
         "retry_count": {
           "type": "integer",
           "minimum": 0,

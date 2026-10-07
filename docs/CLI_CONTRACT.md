@@ -661,6 +661,12 @@ per build task: `platform`, `host`, `method`, `status`
 `duration_ms`. A native matrix therefore reports multiple rows with the same
 platform, preserving each variant's result; `total`, `success` and `failed`
 count tasks. `artifact_paths` is authoritative when present and nonempty.
+Each target also retains its `build_influence_env` and complete `cargo_isolation`
+object when the worker produced them. This includes dependency-cache receipts,
+available toolchain identities, and the strict Windows Cargo context summary.
+The values agree with the durable target result and manifest build-environment
+receipt. Failed attempts retain the evidence available before failure;
+unattempted targets do not receive fabricated provenance.
 Native targets build on the host their source was synced to. Manifest artifacts
 and build-environment receipts retain the native task's selected triple; flat
 raw payload names are qualified when needed, while archive members keep the

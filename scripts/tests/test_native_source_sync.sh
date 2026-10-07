@@ -306,6 +306,41 @@ test_strict_publication() {
         .artifacts[0].name=="syncfixture-x86_64-unknown-linux-gnu" and
         .artifacts[0].target=="linux/amd64" and .artifacts[0].publishable==true and
         .artifacts[0].sha256==$artifact_sha' "$strict_manifest"
+    check 'public strict target retains its real source and compiler influence environment' jq -e \
+        --arg sha "$strict_sha" --slurpfile manifest "$strict_manifest" \
+        --slurpfile state "$WORK/strict-state.json" '
+        .details.targets | length==1 and
+        (.[0] as $target |
+         $manifest[0].build_environments[0] as $environment |
+         $state[0].target_statuses["linux/amd64"].result as $stored |
+         $target.platform=="linux/amd64" and $target.method=="native" and
+         $target.target_triple=="x86_64-unknown-linux-gnu" and
+         ($target.build_influence_env | type)=="object" and
+         $target.build_influence_env.DSR_RELEASE_GIT_SHA==$sha and
+         $target.build_influence_env.DSR_RELEASE_GIT_REF=="v4.0.0" and
+         $target.build_influence_env.CARGO_BUILD_TARGET=="x86_64-unknown-linux-gnu" and
+         $target.build_influence_env==$environment.build_influence_env and
+         $target.build_influence_env==$stored.build_influence_env)' "$WORK/strict-seal.json"
+    check 'public strict target retains the same actual Cargo and rustc executable attestations' jq -e \
+        --slurpfile manifest "$strict_manifest" --slurpfile state "$WORK/strict-state.json" '
+        .details.targets[0].cargo_isolation as $isolation |
+        ($isolation | type)=="object" and $isolation.mode=="strict-release-snapshot" and
+        $isolation.toolchain.schema_version==1 and
+        $isolation.toolchain.target_triple=="x86_64-unknown-linux-gnu" and
+        ($isolation.toolchain.tools as $tools | all(("cargo","rustc");
+            $tools[.] | (.selected_path | type=="string" and startswith("/")) and
+            (.selected_sha256 | type=="string" and test("^[0-9a-f]{64}$")) and
+            (.version | type=="string" and length>0))) and
+        $isolation==$manifest[0].build_environments[0].cargo_isolation and
+        $isolation==$state[0].target_statuses["linux/amd64"].result.cargo_isolation' "$WORK/strict-seal.json"
+    check 'public strict target retains admitted and final private dependency cache evidence' jq -e '
+        .details.targets[0].cargo_isolation as $isolation |
+        $isolation.cache_reuse==[] and $isolation.dependency_cache.mode=="private-copy" and
+        ($isolation.dependency_cache as $cache | all(("seed","final");
+            $cache[.] | .schema_version==1 and
+            (.receipt_sha256 | type=="string" and test("^[0-9a-f]{64}$")) and
+            (.inventory_sha256 | type=="string" and test("^[0-9a-f]{64}$")) and
+            (.cargo_home | type=="string" and startswith("/"))))' "$WORK/strict-seal.json"
     check 'strict publication receipt seals exact manifest bytes and source identity' jq -e \
         --arg sha "$strict_sha" --arg digest "$(_act_sha256 "$strict_manifest")" \
         --slurpfile state "$WORK/strict-state.json" '
