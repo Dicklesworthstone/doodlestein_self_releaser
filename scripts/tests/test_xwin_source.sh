@@ -71,10 +71,17 @@ assert 'restored original snapshot revalidates' xwin_source_verify "$SNAP" "$REC
 # Model Cargo metadata v1 with a root binary and an external resolved crate.
 python3 - "$SNAP" "$WORK/metadata.json" <<'PY'
 import json, sys
+from pathlib import Path
 root, output = sys.argv[1:]
+dependency=Path(output).parent/'cargo-home/registry/src/example-123/lib-2.0.0'
+dependency.mkdir(parents=True)
+(dependency/'Cargo.toml').write_text('[package]\nname="lib"\nversion="2.0.0"\n')
+(dependency/'lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
 a = {"id":"local-demo", "name":"demo", "version":"1.2.3", "source":None,
      "manifest_path":root+"/Cargo.toml", "targets":[{"name":"demo", "kind":["bin"], "src_path":root+"/src/main.rs"}]}
-b = {"id":"registry-lib", "name":"lib", "version":"2.0.0", "source":"registry+https://example.invalid/index", "targets":[]}
+b = {"id":"registry-lib", "name":"lib", "version":"2.0.0", "source":"registry+https://example.invalid/index",
+     "manifest_path":str(dependency/'Cargo.toml'),
+     "targets":[{"name":"lib","kind":["lib"],"src_path":str(dependency/'lib.rs')}]}
 nodes = [{"id":"local-demo", "dependencies":["registry-lib"], "features":["default"], "deps":[{"name":"lib", "pkg":"registry-lib", "dep_kinds":[{"kind":None, "target":None}]}]},
          {"id":"registry-lib", "dependencies":[], "features":[], "deps":[]}]
 graph = {"version":1, "workspace_root":root, "workspace_members":["local-demo"], "workspace_default_members":["local-demo"], "packages":[a,b], "resolve":{"root":"local-demo", "nodes":nodes}, "target_directory":root+"/../target"}
@@ -105,6 +112,60 @@ reject 'multiple metadata documents rejected' 7 xwin_source_metadata "$WORK/bad.
 jq '.packages|=reverse|.resolve.nodes|=reverse' "$META" > "$WORK/reordered.json"
 assert 'equivalent package/node order canonicalizes identically' xwin_source_metadata "$WORK/reordered.json" "$SNAP" demo '' "$WORK/reordered-canonical.json" 1.2.3
 assert 'canonical graph identity is stable' cmp -s "$WORK/reordered-canonical.json" "$WORK/canonical.json"
+
+# Graph equality alone cannot admit unchanged dependency source. Exercise the
+# production metadata boundary, including the full inventory held by the
+# runner's metadata hash and the compact selection exported in the manifest.
+assert 'metadata and selection bind the complete dependency inventory' python3 - "$WORK/canonical.json" "$WORK/selection.json" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+raw=Path(sys.argv[1]).read_bytes()
+graph=json.loads(raw); selection=json.loads(Path(sys.argv[2]).read_bytes())
+sources=graph['dsr_dependency_sources']
+encoded=(json.dumps(sources,sort_keys=True,separators=(',',':'))+'\n').encode()
+assert selection['metadata_sha256']==hashlib.sha256(raw).hexdigest()
+assert selection['dependency_sources']['sha256']==hashlib.sha256(encoded).hexdigest()
+assert selection['dependency_sources']['package_count']==1
+assert {entry['path'] for entry in sources['roots'][0]['files']}=={'Cargo.toml','lib.rs'}
+PY
+DEPENDENCY="$WORK/cargo-home/registry/src/example-123/lib-2.0.0"
+cp "$META" "$WORK/unchanged-raw.json"
+printf 'pub fn value() -> u32 { 43 }\n' > "$DEPENDENCY/lib.rs"
+assert 'changed dependency still has syntactically valid metadata' xwin_source_metadata \
+    "$META" "$SNAP" demo '' "$WORK/changed-sources.json" 1.2.3
+cp "$WORK/assert.out" "$WORK/changed-selection.json"
+assert 'the raw Cargo dependency graph did not change' cmp -s "$META" "$WORK/unchanged-raw.json"
+assert 'committed primary source is unchanged during dependency mutation' xwin_source_verify "$SNAP" "$RECEIPT"
+assert 'metadata comparison refuses unchanged graph with changed dependency bytes' bash -c \
+    '! cmp -s "$1" "$2"' _ "$WORK/canonical.json" "$WORK/changed-sources.json"
+assert 'selection comparison independently refuses dependency source drift' bash -c \
+    '! cmp -s "$1" "$2"' _ "$WORK/selection.json" "$WORK/changed-selection.json"
+printf 'pub fn value() -> u32 { 42 }\n' > "$DEPENDENCY/lib.rs"
+assert 'restored dependency bytes regain their original source identity' xwin_source_metadata \
+    "$META" "$SNAP" demo '' "$WORK/restored-sources.json" 1.2.3
+assert 'source identity is independent of cache timestamps' cmp -s "$WORK/canonical.json" "$WORK/restored-sources.json"
+mkdir -p "$WORK/cargo-home/registry/index"
+printf 'updated index\n' > "$WORK/cargo-home/registry/index/cache"
+assert 'unrelated registry maintenance does not change admitted sources' xwin_source_metadata \
+    "$META" "$SNAP" demo '' "$WORK/index-maintenance.json" 1.2.3
+assert 'unrelated registry changes preserve release metadata identity' cmp -s "$WORK/canonical.json" "$WORK/index-maintenance.json"
+ln -s "$PROJECT/src/main.rs" "$DEPENDENCY/linked-input"
+reject 'linked remote source fails without a successful selection receipt' 7 xwin_source_metadata \
+    "$META" "$SNAP" demo '' "$WORK/linked-dependency.json" 1.2.3
+mv "$DEPENDENCY/linked-input" "$WORK/retained-link"
+mv "$DEPENDENCY/lib.rs" "$WORK/retained-dependency.rs"
+reject 'missing resolved source fails before release admission' 7 xwin_source_metadata \
+    "$META" "$SNAP" demo '' "$WORK/missing-dependency.json" 1.2.3
+mv "$WORK/retained-dependency.rs" "$DEPENDENCY/lib.rs"
+jq '.dsr_dependency_sources={forged:true}' "$META" > "$WORK/forged-metadata.json"
+reject 'raw metadata cannot supply DSR dependency evidence' 7 xwin_source_metadata \
+    "$WORK/forged-metadata.json" "$SNAP" demo '' "$WORK/forged-canonical.json" 1.2.3
+jq '.packages[0].targets += [(.packages[0].targets[0]|.name="companion")]' "$META" > "$WORK/companion-metadata.json"
+assert 'multiple binaries in one package share its dependency inventory' xwin_source_metadata \
+    "$WORK/companion-metadata.json" "$SNAP" demo '' "$WORK/companion-canonical.json" 1.2.3 '' '["demo","companion"]'
+cp "$WORK/assert.out" "$WORK/companion-selection.json"
+assert 'companion selection preserves one resolved package boundary' jq -e \
+    '(.binaries|length)==2 and .dependency_sources.package_count==1' "$WORK/companion-selection.json"
 
 # Independently committed library repositories need not have the primary
 # release tag or a Cargo.lock. These are real Git snapshots; Cargo JSON below

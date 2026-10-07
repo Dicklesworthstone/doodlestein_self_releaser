@@ -93,19 +93,28 @@ def remote_root(package):
     require(manifest.name == "Cargo.toml", "unexpected dependency manifest name")
     source = package["source"]
     require(isinstance(source, str), "invalid dependency source identity")
+    require(source.startswith(("registry+", "sparse+", "git+")), "unsupported remote dependency source")
     # Infer the source boundary from Cargo's cache layout, not from the
     # manifest's immediate parent: a Git package may read workspace siblings.
     if source.startswith(("registry+", "sparse+")):
         root = manifest.parent
-        require(root.parent.parent.name == "src" and root.parent.parent.parent.name == "registry",
-                "registry dependency is outside Cargo's registry/src layout")
-        require(root.name == package["name"] + "-" + package["version"], "registry package directory differs from its identity")
-        return root, "registry"
-    require(source.startswith("git+"), "unsupported remote dependency source")
-    candidates = [base for base in manifest.parents
-                  if base.parent.parent.name == "checkouts" and base.parent.parent.parent.name == "git"]
-    require(len(candidates) == 1, "Git dependency is outside one unambiguous Cargo checkout")
-    return candidates[0], "git"
+        if root.parent.parent.name == "src" and root.parent.parent.parent.name == "registry":
+            require(root.name == package["name"] + "-" + package["version"], "registry package directory differs from its identity")
+            return root, "registry"
+    else:
+        candidates = [base for base in manifest.parents
+                      if base.parent.parent.name == "checkouts" and base.parent.parent.parent.name == "git"]
+        require(len(candidates) <= 1, "ambiguous Cargo Git checkout")
+        if candidates:
+            return candidates[0], "git"
+    # Cargo source replacement keeps registry/Git IDs but puts each package
+    # into a directory source. cargo vendor may omit version suffixes. Its
+    # checksum descriptor establishes this layout, not authenticity: its
+    # bytes are included in our observation just like every other source.
+    descriptor = read_json(manifest.parent / ".cargo-checksum.json")
+    require(isinstance(descriptor, dict) and isinstance(descriptor.get("files"), dict),
+            "remote dependency is not a Cargo cache or directory source")
+    return manifest.parent, "directory"
 
 
 def inventory(root, kind):

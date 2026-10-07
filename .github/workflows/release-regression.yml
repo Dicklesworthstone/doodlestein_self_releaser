@@ -6,6 +6,7 @@ on:
       - dsr
       - src/github.sh
       - src/cargo_cache.sh
+      - src/cargo_sources.sh
       - src/packaging.sh
       - src/config.sh
       - src/host_health.sh
@@ -14,6 +15,7 @@ on:
       - 'scripts/xwin*.sh'
       - 'scripts/tests/test_xwin*.sh'
       - scripts/tests/test_cargo_cache.sh
+      - scripts/tests/test_cargo_sources.sh
       - scripts/tests/test_github.sh
       - scripts/tests/test_host_health.sh
       - scripts/tests/test_host_config_admission.sh
@@ -64,9 +66,16 @@ jobs:
         run: |
           set -euo pipefail
           shellcheck -S warning src/cargo_cache.sh src/xwin_build.sh scripts/tests/test_cargo_cache.sh scripts/tests/test_xwin_build.sh
+          shellcheck -S warning src/cargo_sources.sh src/xwin_source.sh scripts/tests/test_cargo_sources.sh scripts/tests/test_xwin_source.sh
           bash -n src/cargo_cache.sh
           bash -n src/xwin_build.sh
+          bash -n src/cargo_sources.sh
+          bash -n src/xwin_source.sh
+          bash -n scripts/tests/test_cargo_sources.sh
+          bash -n scripts/tests/test_xwin_source.sh
           bash scripts/tests/test_cargo_cache.sh
+          bash scripts/tests/test_cargo_sources.sh
+          bash scripts/tests/test_xwin_source.sh
           bash scripts/tests/test_xwin_build.sh
           bash scripts/tests/test_xwin_release_build.sh
   host-admission:

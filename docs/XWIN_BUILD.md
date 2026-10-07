@@ -121,9 +121,9 @@ bash src/cargo_cache.sh verify /var/tmp/new-cargo-home /var/tmp/cache-receipt.js
 
 Snapshot and inventory destinations must not exist. Verification requires exact
 file/directory membership, bytes and executable bits; it does not rewrite a
-receipt after drift. This integration applies to the pinned runner only.
-The native orchestrator's Unix/Windows cache links remain separate work under
-issue #15; this change does not close that issue.
+receipt after drift. The pinned runner and the native orchestrator have
+separate cache-isolation integrations and acceptance evidence; this section
+describes the pinned runner, not completion of native Windows acceptance.
 
 ## Source-pinned release mode
 
@@ -183,6 +183,65 @@ build. New/deleted source files, byte or executable-mode changes, altered source
 receipts, dependency graphs, control files, toolchain pins or version evidence
 prevent release success. Evidence is producer-controlled local state, not a
 sandbox against malicious build scripts or a privileged concurrent writer.
+
+### Resolved dependency source integrity
+
+Release mode also inventories the remote package sources reachable from every
+selected binary's package in the platform-filtered Cargo resolution. Matching
+package IDs, versions, features and dependency edges is no longer sufficient:
+the same graph with changed dependency bytes fails the existing before/after
+metadata and selection comparisons, before release export. This is always
+enabled in release mode; ordinary mode does not acquire this source-equality
+guarantee.
+
+Registry packages cover their complete extracted crate directory. Git packages
+cover the complete cached checkout, including shared workspace files outside a
+particular member; packages in one checkout share one inventory. Cargo directory
+sources, including unversioned `cargo vendor` registry and Git replacements,
+are recognized by their checksum descriptor and cover the whole package
+directory. The descriptor is itself hashed, not treated as an authenticity
+proof. Local primary and pinned sibling sources keep their existing independent
+committed-source checks.
+
+Each inventory binds source identities and paths, file SHA-256 values, sizes,
+executable bits, directory membership and empty directories. Missing files,
+symlinks (including ancestors), special files and unsafe member names fail
+admission. Files are read through non-following descriptors and checked for
+changes while hashing. File timestamps are not part of the resulting identity.
+Unrelated cached crates, registry indexes and compressed download caches are
+not compared. For a Git checkout, the top-level `.git` directory's presence and
+type are recorded but its administrative contents are excluded: a harmless
+index refresh is not a source change, and Git command output is not attested.
+
+The complete inventories are embedded as `dsr_dependency_sources` in
+`run/metadata-before.json` and `run/metadata-after.json`. These canonical DSR
+metadata documents, unlike the separate raw Cargo output, include the source
+evidence. The runner holds the before-document hash across compilation and
+requires both complete documents to match. This binds the full inventory, not
+just a mutable sidecar. Auxiliary `*.dependency-sources.json` files retain the
+standalone inventories as well. The compact `dependency_sources` summary in
+each selection contains the inventory SHA-256 and package/root/file/byte counts;
+it survives in the release manifest at
+`build_environments[].cargo_metadata.dependency_sources`.
+
+The standalone helper supports capture and independent verification using
+absolute paths and an explicit JSON array of selected Cargo package IDs:
+
+```bash
+bash src/cargo_sources.sh capture /var/tmp/metadata.json \
+  '["selected-package-id-from-metadata"]' /var/tmp/dependency-sources.json
+bash src/cargo_sources.sh verify /var/tmp/metadata.json \
+  '["selected-package-id-from-metadata"]' /var/tmp/dependency-sources.json
+```
+
+Capture refuses an existing receipt; verification never rewrites it. Rejection
+returns exit 7 without a successful summary. Python 3.9+ and a Unix host with
+descriptor-relative filesystem support are required. Inventories describe a
+conservative source boundary, not proof that every recorded file compiled.
+They detect lasting source drift between observations, but do not authenticate
+the initially observed registry/Git bytes, prove their agreement with upstream
+commits, or prevent a malicious process from changing and restoring inputs
+between observations. They are not a sandbox or signed provenance.
 
 ### Pinned sibling repositories
 
@@ -337,13 +396,15 @@ The receipts record the controlled top-level invocation, not every environment
 change performed by cargo-xwin, Cargo configuration or a build script. Metadata
 parity does not attest the plugin's internal compiler environment. Ordinary
 mode observes only source configuration files; release mode additionally pins
-the entire committed snapshot. Neither mode attests every dynamic library,
-standard-library component, remote dependency's bytes, nested tool or
-compiler-generated subprocess. This is not signed provenance. Automatic
+the entire committed snapshot and compares resolved dependency source trees
+as described above. Neither mode attests every dynamic library,
+standard-library component, nested tool or compiler-generated subprocess,
+or establishes remote source authenticity. This is not signed provenance. Automatic
 propagation through strict native build state remains under `bd-10we`.
 
 ```bash
 bash scripts/tests/test_cargo_cache.sh
+bash scripts/tests/test_cargo_sources.sh
 bash scripts/tests/test_xwin_toolchain.sh
 bash scripts/tests/test_xwin_build.sh
 bash scripts/tests/test_xwin_toolchain_scale.sh

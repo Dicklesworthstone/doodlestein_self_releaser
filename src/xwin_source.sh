@@ -269,16 +269,23 @@ PY
 # names; the fourth argument optionally restricts all binaries to one package.
 # Unlisted/absolute path escapes remain errors. All selections share one graph.
 # stdout is a small selection receipt; the full canonical graph stays in a file.
+# Resolved remote source bytes are bound in the selection too. The runner's
+# before/after selection comparison therefore gates changed dependencies even
+# when Cargo reports the same graph, versions, features and source identifiers.
 xwin_source_metadata() {
     [[ $# == 6 || $# == 7 || $# == 8 ]] || return 4
-    command -v python3 >/dev/null || return 3
+    command -v python3 >/dev/null && command -v jq >/dev/null || return 3
+    local selection selected_packages dependency_sources module_dir
+    module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+    # shellcheck source=src/cargo_sources.sh
+    source "$module_dir/cargo_sources.sh" || return 3
     if [[ $# -ge 7 && -n "$7" ]]; then
         local boundary
         [[ -d "$2" && ! -L "$2" ]] || return 7
         boundary=$(cd "$2/.." && pwd -P) || return 7
         xwin_source_verify "$boundary" "$7" || return $?
     fi
-    python3 - "$@" <<'PY'
+    selection=$(python3 - "$@" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -406,6 +413,57 @@ try:
                       "resolved_siblings": resolved_siblings,
                       "resolved_packages": len(nodes)}))
 except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+    print("[xwin-source] " + str(error), file=sys.stderr)
+    sys.exit(7)
+PY
+    ) || return $?
+    selected_packages=$(jq -ce '[.binaries[].package_id]|unique' <<< "$selection") || return 7
+    # Read the admitted canonical graph, not a second observation of mutable
+    # raw metadata. Inventories stay in files (potentially larger than argv).
+    # Their stable summaries omit phase-specific paths so equal sources compare
+    # equally and are retained in build_environments[].cargo_metadata.
+    dependency_sources=$(cargo_sources_capture "$5" "$selected_packages" "$5.dependency-sources.json") || return $?
+    # Embed the full inventory in the already protected canonical metadata:
+    # the runner holds this file's hash across compilation. A sidecar alone
+    # could be changed while the small selection receipt stayed intact.
+    python3 -I - "$5" "$selection" "$dependency_sources" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+try:
+    path = Path(sys.argv[1])
+    selection, summary = map(json.loads, sys.argv[2:])
+    with open(str(path) + ".dependency-sources.json", "rb") as stream:
+        sources = stream.read()
+    if hashlib.sha256(sources).hexdigest() != summary["sha256"]:
+        raise ValueError("dependency source inventory changed before metadata admission")
+    with path.open("rb") as stream:
+        original = stream.read()
+    if hashlib.sha256(original).hexdigest() != selection["metadata_sha256"]:
+        raise ValueError("canonical metadata changed before dependency admission")
+    graph = json.loads(original)
+    if "dsr_dependency_sources" in graph:
+        raise ValueError("Cargo metadata contains reserved DSR evidence")
+    graph["dsr_dependency_sources"] = json.loads(sources)
+    encoded = (json.dumps(graph, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd, temporary = tempfile.mkstemp(prefix=".metadata-sources-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    selection["metadata_sha256"] = hashlib.sha256(encoded).hexdigest()
+    selection["dependency_sources"] = summary
+    print(json.dumps(selection))
+except (OSError, ValueError, KeyError, TypeError) as error:
     print("[xwin-source] " + str(error), file=sys.stderr)
     sys.exit(7)
 PY

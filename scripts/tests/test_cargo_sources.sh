@@ -144,6 +144,22 @@ def root_shared(f):
 check('multiple Git workspace packages share one complete root inventory', root_shared)
 
 
+def directory_source(f, source):
+    vendor=f.root/'vendor/dep'; vendor.parent.mkdir()
+    f.registry.rename(vendor)
+    (vendor/'.cargo-checksum.json').write_text('{"files":{},"package":null}')
+    package=f.graph['packages'][1]
+    package.update(source=source, manifest_path=str(vendor/'Cargo.toml'),
+                   targets=[{'src_path':str(vendor/'lib.rs')}])
+    f.save(); before=f.good()
+    assert any(t['kind']=='directory' for t in json.loads(f.receipt.read_bytes())['roots'])
+    assert f.good('verify')==before
+    (vendor/'lib.rs').write_text('changed vendored source')
+    f.bad('verify')
+check('unversioned Cargo vendor registry sources are bound', lambda f: directory_source(f, 'registry+https://example.invalid'))
+check('Cargo vendor Git replacements are bound as directory sources', lambda f: directory_source(f, 'git+https://example.invalid/repo#'+'a'*40))
+
+
 def unsafe(f, action):
     action(f); f.save(); f.bad(); assert not f.receipt.exists()
 check('symlink dependency files fail before publication', lambda f: unsafe(f, lambda x: (x.registry/'alias').symlink_to(x.root)))
