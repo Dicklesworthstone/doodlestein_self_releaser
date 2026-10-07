@@ -902,9 +902,11 @@ target_triples:
 linux_libc_fallback: none
 ```
 
-The first entry is the primary variant: native builds compile it
-(`CARGO_BUILD_TARGET`), and an artifact whose name identifies no variant is
-named as it. A workflow run through act can build both variants; `dsr build`
+The first entry is the primary variant. Native Rust builds compile every
+configured GNU/musl variant as an independent task, with its own
+`CARGO_BUILD_TARGET`, source stage, Cargo home, output directory and resume
+receipt. A workflow artifact whose name identifies no variant is named as the
+primary. A workflow run through act can also build both variants; `dsr build`
 collects them under the platform, gives each variant it produced its own
 installer-compatible alias and configured `include_files`, and names any
 configured variant the build did not produce. `dsr release` publishes each
@@ -913,8 +915,11 @@ the full triple or by a separate `gnu`/`musl` word). When the naming pattern
 cannot tell variants apart (no `${target_triple}`), a name several variants
 derive goes to the artifact it already names, else to the primary variant,
 and the release says so instead of failing on a same-name collision.
-Workflow manifests retain each artifact's `target_triple`, so packaging and
-release do not infer a different variant later. Contradictory full triples or
+Manifests retain each artifact's `target_triple`, so packaging and release do
+not infer a different variant later. Native results retain the selected triple
+and its build environment, and generic raw executable names are qualified by
+triple during collection; the archives still contain the configured executable
+name. Contradictory full triples or
 libc markers fail collection. This is declared naming metadata, not ABI proof.
 Generated installers detect GNU or musl (including musl `ldd --version` output
 on stderr with a nonzero status), and `--libc gnu|musl` selects an exact variant.
@@ -927,8 +932,11 @@ To install both variants, use target-qualified names: a nonprimary variant
 cannot be downloaded through a shared alias owned by the primary.
 A `release_contract` names one exact primary asset per target, so it admits a
 single triple per platform; `dsr config validate` rejects empty, duplicate or
-malformed lists. Native builds still compile only the primary; native matrix
-expansion remains unimplemented.
+malformed lists. Native matrix expansion is for ordinary Rust GNU/musl builds.
+Resume reuses each completed variant only when its recorded files still match,
+and refuses a changed matrix configuration; a failed variant does not force
+its successful sibling to compile again. All variants must succeed before the
+build produces a publishable manifest.
 
 With `--parallel`, two targets on one host whose build writes the same
 in-tree file (for example `go build -o tool ./cmd/tool`) no longer overwrite

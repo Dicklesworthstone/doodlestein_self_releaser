@@ -695,7 +695,8 @@ build_state_update_target() {
 }
 
 # Bind a run to the inputs required for an honest resume.
-# Args: tool version run_id git_sha git_ref source_roots_json output_dir parallel_jobs target_hosts_json
+# Args: tool version run_id git_sha git_ref source_roots_json output_dir
+#       parallel_jobs target_hosts_json build_purpose build_tasks_json matrix_config_sha256
 build_state_set_context() {
   local tool="$1"
   local version="$2"
@@ -710,11 +711,35 @@ build_state_set_context() {
   [[ -n "$target_hosts_json" ]] || target_hosts_json='{}'
   local build_purpose="${10:-release}"
   [[ "$build_purpose" == "release" || "$build_purpose" == "diagnostic-native" ]] || return 1
+  local build_tasks_json="${11:-}" native_matrix_config_sha256="${12:-}"
 
   local tool_dir state_file now
   tool_dir=$(_build_get_tool_dir "$tool" "$version")
   state_file="$tool_dir/$run_id/state.json"
   [[ -f "$state_file" ]] || return 1
+  if [[ -z "$build_tasks_json" ]]; then
+    build_tasks_json=$(jq -c '[.targets[] | {key:., platform:., target_triple:"", method:"native"}]' \
+      "$state_file") || return 1
+  fi
+  if ! jq -e --argjson tasks "$build_tasks_json" --arg digest "$native_matrix_config_sha256" '
+      .targets as $platforms |
+      ($tasks | type == "array") and
+      ([$tasks[].key] | unique | length) == ($tasks | length) and
+      all($tasks[];
+        (.key | type == "string" and length > 0) and
+        (.platform as $platform | $platforms | index($platform) != null) and
+        (.target_triple | type == "string") and
+        (.method == "act" or .method == "native") and
+        (.key == .platform or (.method == "native" and
+          (.target_triple | test("^[A-Za-z0-9_][A-Za-z0-9_.-]*$")) and
+          .key == (.platform + "@" + .target_triple)))) and
+      ([$tasks[].platform] | unique | sort) == ($platforms | unique | sort) and
+      (if any($tasks[]; .key != .platform) then $digest | test("^[0-9a-f]{64}$")
+       else $digest == "" end)
+    ' "$state_file" >/dev/null 2>&1; then
+    log_error "Invalid build task plan for run $run_id"
+    return 1
+  fi
   jq -e 'type == "object"' <<< "$source_roots_json" &>/dev/null || return 1
   jq -e 'type == "object"' <<< "$target_hosts_json" &>/dev/null || return 1
   [[ "$parallel_jobs" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -725,6 +750,8 @@ build_state_set_context() {
     --argjson source_roots "$source_roots_json" \
     --argjson target_hosts "$target_hosts_json" \
     --arg build_purpose "$build_purpose" \
+    --argjson build_tasks "$build_tasks_json" \
+    --arg native_matrix_config_sha256 "$native_matrix_config_sha256" \
     --arg output_dir "$output_dir" --argjson parallel_jobs "$parallel_jobs" \
     --arg now "$now" '
       .git_sha = $sha |
@@ -734,9 +761,13 @@ build_state_set_context() {
         publishable: ($build_purpose == "release"),
         source_roots: $source_roots,
         target_hosts: $target_hosts,
+        build_tasks: $build_tasks,
+        native_matrix_config_sha256: $native_matrix_config_sha256,
         output_dir: $output_dir,
         parallel_jobs: $parallel_jobs
       } |
+      .target_statuses = (reduce $build_tasks[] as $task ({};
+        .[$task.key] = {status: "pending", attempts: 0})) |
       .updated_at = $now'
 }
 
@@ -887,7 +918,7 @@ build_state_can_resume() {
   status=$(echo "$state" | jq -r '.status')
 
   case "$status" in
-    created|running|failed)
+    created|running|failed|partial|targets-complete)
       return 0  # Can resume
       ;;
     completed|cancelled)
@@ -966,7 +997,7 @@ build_state_pending_targets() {
   state=$(build_state_get "$1" "$2" "${3:-latest}" 2>/dev/null) || return 1
   jq -r '
     . as $state |
-    $state.targets[]? as $target |
+    (($state.context.build_tasks // [$state.targets[]? | {key:.}])[] | .key) as $target |
     ($state.target_statuses[$target] // {status: "pending"}) as $entry |
     select($entry.status != "completed" or ($entry.result | type) != "object" or
       ($entry.result | length) == 0) |
@@ -1291,8 +1322,10 @@ build_state_resume() {
     def valid_status:
       entry_status as $status |
       ["pending", "running", "completed", "failed", "cancelled", "skipped"] | index($status) != null;
+    def tasks: .context.build_tasks // [.targets[] | {key:., platform:.}];
     . as $s |
-    if (.status != "created" and .status != "running" and .status != "failed") or
+    if (.status != "created" and .status != "running" and .status != "failed" and
+        .status != "partial" and .status != "targets-complete") or
        (.targets | type) != "array" or
        (all(.targets[]; type == "string" and length > 0) | not) or
        (.targets | unique | length) != (.targets | length) or
@@ -1301,7 +1334,22 @@ build_state_resume() {
        (.target_statuses != null and (.target_statuses | type) != "object") or
        (all((.target_statuses // {})[];
          type == "object" and valid_status and valid_counter("attempts")) | not) or
-       (all((.target_statuses // {}) | keys[]; . as $t | $s.targets | index($t) != null) | not) or
+       (tasks | type) != "array" or
+       ([tasks[].key] | unique | length) != (tasks | length) or
+       (all(tasks[]; (.key | type == "string" and length > 0) and
+         (.platform as $p | $s.targets | index($p) != null)) | not) or
+       ([tasks[].platform] | unique | sort) != (.targets | unique | sort) or
+       (.context.build_tasks != null and
+         (all(tasks[]; (.target_triple | type == "string") and
+           (.method == "act" or .method == "native") and
+           (.key == .platform or (.method == "native" and
+             (.target_triple | test("^[A-Za-z0-9_][A-Za-z0-9_.-]*$")) and
+             .key == (.platform + "@" + .target_triple)))) | not)) or
+       (.context.build_tasks != null and
+         (if any(tasks[]; .key != .platform)
+          then (.context.native_matrix_config_sha256 // "" | test("^[0-9a-f]{64}$") | not)
+          else (.context.native_matrix_config_sha256 // "") != "" end)) or
+       (all((.target_statuses // {}) | keys[]; . as $t | [$s | tasks[].key] | index($t) != null) | not) or
        (.context != null and (.context | type) != "object") or
        (.context.target_hosts != null and (.context.target_hosts | type) != "object") or
        (all((.context.target_hosts // {})[]; type == "string" and length > 0) | not)
@@ -1319,7 +1367,7 @@ build_state_resume() {
     [$hosts[] | select((.entry | entry_status) == "pending" or
       .entry.status == "running" or .entry.status == "failed") |
       select((.entry | counter("retry_count")) >= $retry_max) | .name] as $exceeded |
-    (reduce .targets[] as $target (
+    (reduce (tasks[].key) as $target (
       {completed: [], retryable: [], exceeded: []};
       ($s.target_statuses[$target] // {}) as $entry |
       if ($entry.status == "completed" and ($entry.result | type) == "object" and

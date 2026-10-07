@@ -555,7 +555,7 @@ yq() {
         *'.linux_glibc_floor'*)
             echo "${MOCK_GLIBC_FLOOR:-}"
             ;;
-        '.derive_cargo_build_target // ""')
+        '.derive_cargo_build_target')
             echo "${MOCK_DERIVE_OPT:-}"
             ;;
         *)

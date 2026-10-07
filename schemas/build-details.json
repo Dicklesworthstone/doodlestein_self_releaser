@@ -52,6 +52,15 @@
           "pattern": "^(linux|darwin|windows)/(amd64|arm64)$",
           "description": "Target platform (os/arch)"
         },
+        "task_key": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Durable build task identity: platform for a singleton or workflow, platform@target_triple for a native variant matrix"
+        },
+        "target_triple": {
+          "type": "string",
+          "description": "Explicit native compiler target triple; platform remains the host-routing identity"
+        },
         "host": {
           "type": "string",
           "description": "Build host (css, mmini, wlap)"
@@ -82,6 +91,11 @@
         "artifact_path": {
           "type": "string",
           "description": "Path to built artifact"
+        },
+        "artifact_paths": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "Authoritative artifact paths for this task, retaining every workspace output"
         },
         "log_path": {
           "type": "string",

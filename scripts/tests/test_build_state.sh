@@ -1069,9 +1069,40 @@ test_retry_record_failure_propagates() {
   ! build_state_record_retry retry-record v1.0.0 trj 1 'failure'
 }
 
+test_native_matrix_resume_tasks() {
+  local run_id plan tasks digest
+  run_id=$(build_state_create matrix-state v1.0.0 linux/amd64) || return 1
+  tasks='[{"key":"linux/amd64@x86_64-unknown-linux-gnu","platform":"linux/amd64","target_triple":"x86_64-unknown-linux-gnu","method":"native"},{"key":"linux/amd64@x86_64-unknown-linux-musl","platform":"linux/amd64","target_triple":"x86_64-unknown-linux-musl","method":"native"}]'
+  digest=$(printf '%064d' 1)
+  build_state_set_context matrix-state v1.0.0 "$run_id" '' '' '{}' '' 2 '{}' release \
+    "$tasks" "$digest" || return 1
+  build_state_update_target matrix-state v1.0.0 linux/amd64@x86_64-unknown-linux-gnu completed \
+    '{"attempts":1,"result":{"status":"success","target_triple":"x86_64-unknown-linux-gnu"}}' "$run_id" || return 1
+  build_state_update_target matrix-state v1.0.0 linux/amd64@x86_64-unknown-linux-musl failed \
+    '{"attempts":1,"result":{"status":"failed"}}' "$run_id" || return 1
+  build_state_update_status matrix-state v1.0.0 partial "$run_id" || return 1
+  build_state_can_resume matrix-state v1.0.0 "$run_id" || return 1
+  plan=$(build_state_resume matrix-state v1.0.0 "$run_id") || return 1
+  jq -e '.completed_targets == ["linux/amd64@x86_64-unknown-linux-gnu"] and
+    .targets_to_process == ["linux/amd64@x86_64-unknown-linux-musl"] and
+    (.context.build_tasks | length) == 2' <<< "$plan" >/dev/null || return 1
+  [[ "$(build_state_pending_targets matrix-state v1.0.0 "$run_id")" == \
+    linux/amd64@x86_64-unknown-linux-musl ]] || return 1
+  build_state_get matrix-state v1.0.0 "$run_id" | jq -e '
+    .targets == ["linux/amd64"] and (.target_statuses | length) == 2' >/dev/null || return 1
+  local state_file
+  state_file="$(_build_get_tool_dir matrix-state v1.0.0)/$run_id/state.json"
+  _build_state_jq_update "$state_file" '.context.build_tasks[1].key = .context.build_tasks[0].key' || return 1
+  ! build_state_resume matrix-state v1.0.0 "$run_id" >/dev/null 2>&1
+}
+
 # Cleanup
 cleanup() {
-  rm -rf "$TEMP_DIR"
+  if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
+    printf 'Retained build-state fixture: %s\n' "$TEMP_DIR" >&2
+  else
+    rm -rf "$TEMP_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -1139,6 +1170,7 @@ run_state_regression "state writes reject invalid supplied host/target evidence"
 run_state_regression "resume uses one checkpoint even when latest moves mid-read" test_resume_single_snapshot_after_latest_moves
 run_state_regression "resume maps real hosts and rejects empty target completion evidence" test_resume_host_routing_and_target_evidence
 run_state_regression "resume rejects malformed target/host inventories and counters" test_resume_rejects_malformed_inventory
+run_state_regression "native variant checkpoints resume only failed tasks and reject duplicate identities" test_native_matrix_resume_tasks
 run_state_regression "generic retry rejects zero or invalid budgets before execution" test_retry_budget_validation
 run_state_regression "exponential retry backoff never exceeds its cap or overflows" test_retry_backoff_is_bounded
 run_state_regression "missing or invalid saved retry budgets cannot launch commands" test_retry_unreadable_budget_blocks_execution

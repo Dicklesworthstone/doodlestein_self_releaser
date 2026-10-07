@@ -2987,12 +2987,20 @@ EOF
     _build_collect_artifact_file() {
         local src="$1"
         local target="${2:-}"
+        local target_triple="${3:-}" native_result="${4:-false}"
         local name dest
         local orig_name=""
 
         [[ -z "$src" || ! -f "$src" ]] && return 0
 
         name=$(basename "$src")
+        if [[ "$native_result" == true ]]; then
+            if ! name=$(_act_native_variant_artifact_name "$tool_name" "$target" "$target_triple" "$name"); then
+                log_error "Native artifact disagrees with its build variant: $src"
+                collect_failed=true
+                return 1
+            fi
+        fi
         orig_name="$name"
         dest="$output_dir/$name"
 
@@ -3016,7 +3024,7 @@ EOF
                 log_warn "Artifact name collision: $name (target=$target); saving as $renamed"
                 name="$renamed"
                 dest="$output_dir/$name"
-                artifact_rename_pairs+=("${target}||${orig_name}"$'\t'"${name}")
+                artifact_rename_pairs+=("${target}||${target_triple}||${orig_name}"$'\t'"${name}")
 
                 if $build_release_contract_enabled && [[ -e "$dest" || -L "$dest" ]]; then
                     log_error "Strict release artifact destination already exists: $name"
@@ -3576,7 +3584,6 @@ EOF
     # musl builds of linux/amd64. The build lane produces each variant's
     # archive; give every non-primary variant it produced its own
     # installer-compatible alias, and name the variants it did not produce.
-    # Native builds compile the primary variant only.
     _build_emit_variant_aliases() {
         local tool="$1" version="$2" target="$3" format="$4" naming_ext="$5"
         local output_dir="$6" repo_path="$7" primary_versioned="$8"
@@ -3653,6 +3660,35 @@ EOF
             fi
         done
     }
+
+    # Collection qualifies native raw payloads by triple. Their public
+    # archives must still contain the configured executable name, with the
+    # same bytes and mode, rather than that transport filename.
+    _build_package_named_binary() (
+        local format="$1" archive="$2" source="$3" member="$4" include_root="$5"
+        shift 5
+        local workdir include
+        local -a members=("$member")
+        _act_is_safe_basename "$member" || return 4
+        [[ -f "$source" && ! -L "$source" ]] || return 4
+        workdir=$(mktemp -d "${archive%/*}/.dsr-payload.XXXXXXXX") || return 4
+        trap 'rm -rf -- "$workdir"' EXIT
+        trap 'exit 5' HUP INT TERM
+        cp -p -- "$source" "$workdir/$member" || return 4
+        for include in "$@"; do
+            packaging_member_is_safe "$include" || return 4
+            [[ -n "$include_root" && -f "$include_root/$include" ]] && \
+                _pkg_path_has_no_links "$include_root" "$include" || return 4
+            if [[ -e "$workdir/$include" ]]; then
+                cmp -s "$include_root/$include" "$workdir/$include" || return 4
+                continue
+            fi
+            mkdir -p -- "$workdir/$(dirname "$include")" || return 4
+            cp -p -- "$include_root/$include" "$workdir/$include" || return 4
+            members+=("$include")
+        done
+        packaging_build_archive "$format" "$archive" "$workdir" "${members[@]}"
+    )
 
     _build_package_archive_for_target() {
         local tool="$1"
@@ -3847,6 +3883,26 @@ EOF
             return 0
         fi
 
+        local raw_member="$binary_name"
+        [[ "$os" != windows || "$raw_member" == *.exe ]] || raw_member+=.exe
+        if [[ -n "$target_triple" && "${binary_path##*/}" != "$raw_member" ]]; then
+            if ! _build_package_named_binary "$format" "$archive_path" "$binary_path" \
+                "$raw_member" "$repo_path" "${include_files[@]}"; then
+                log_error "Failed to package the named executable for $tool $target $target_triple"
+                collect_failed=true
+                return 1
+            fi
+            _build_manifest_add_entry "$archive_path" "$target" "$format" "$target_triple"
+            if [[ -n "$compat_name" && "$compat_name" != "$versioned_name" ]]; then
+                if _build_is_archive_ext "$compat_name"; then
+                    _build_emit_compat_alias "$archive_path" "$compat_name" "$output_dir" "$target" "$format" "$target_triple" || collect_failed=true
+                else
+                    _build_emit_binary_alias "$binary_path" "$compat_name" "$output_dir" "$target" "$target_triple" || collect_failed=true
+                fi
+            fi
+            return 0
+        fi
+
         if [[ "$format" == "tar.gz" || "$format" == "tgz" ]]; then
             if [[ -f "$archive_path" ]]; then
                 log_warn "Overwriting existing archive: $archive_path"
@@ -3974,12 +4030,12 @@ EOF
         local -a targets=()
         while IFS= read -r target; do
             [[ -n "$target" ]] && targets+=("$target")
-        done < <(echo "$result_json" | jq -r '.targets[]? | select(.status == "success" or .status == "ok" or .status == "passed") | .platform // empty' 2>/dev/null)
+        done < <(echo "$result_json" | jq -r '[.targets[]? | select(.status == "success" or .status == "ok" or .status == "passed") | .platform // empty] | unique[]' 2>/dev/null)
 
         if [[ ${#targets[@]} -eq 0 ]]; then
             while IFS= read -r target; do
                 [[ -n "$target" ]] && targets+=("$target")
-            done < <(echo "$result_json" | jq -r '.targets[]? | .platform // empty' 2>/dev/null)
+            done < <(echo "$result_json" | jq -r '[.targets[]? | .platform // empty] | unique[]' 2>/dev/null)
         fi
 
         if [[ ${#targets[@]} -eq 0 ]]; then
@@ -4131,38 +4187,46 @@ EOF
 
     if [[ $success -gt 0 ]]; then
         log_info "Collecting build artifacts into $output_dir..."
-        while IFS=$'\t' read -r target file; do
-            [[ -z "$file" ]] && continue
-            IFS=',' read -r -a paths <<< "$file"
-            for path in "${paths[@]}"; do
-                [[ -z "$path" ]] && continue
-                _build_collect_artifact_file "$path" "$target"
-            done
-        done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.artifact_path // "")] | @tsv' 2>/dev/null)
+        local target_result target_triple native_result array_count
+        while IFS= read -r target_result; do
+            local target method dir file
+            target=$(jq -r '.platform // empty' <<< "$target_result")
+            method=$(jq -r '.method // empty' <<< "$target_result")
+            dir=$(jq -r '.artifact_dir // empty' <<< "$target_result")
+            target_triple=""; native_result=false
+            if [[ "$method" == native ]]; then
+                native_result=true
+                if ! target_triple=$(_act_native_result_target_triple "$tool_name" "$target_result"); then
+                    collect_failed=true
+                    continue
+                fi
+            fi
+            if ! array_count=$(jq -er '(.artifact_paths // []) |
+                if type == "array" and all(.[]; type == "string" and length > 0)
+                then length else error("invalid artifact_paths") end' <<< "$target_result"); then
+                collect_failed=true
+                continue
+            fi
+            # Arrays preserve exact paths, including commas. Only legacy
+            # scalar receipts are split; additional payloads remain explicit.
+            while IFS= read -r -d '' file; do
+                [[ -n "$file" ]] || continue
+                _build_collect_artifact_file "$file" "$target" "$target_triple" "$native_result"
+            done < <(jq -j --argjson count "$array_count" '
+                ((if $count > 0 then .artifact_paths[] else
+                    (.artifact_path // "" | split(",")[]) end),
+                 ((.additional_artifacts // [])[]? | .path // "")) | ., "\u0000"
+            ' <<< "$target_result")
 
-        # Build-produced exact additional assets are not children of the
-        # primary release-contract staging directory.  Collect their explicit
-        # descriptor-bound paths before manifest generation so the output
-        # directory contains every build-manifest row.
-        while IFS=$'\t' read -r target file; do
-            [[ -z "$file" ]] && continue
-            _build_collect_artifact_file "$file" "$target"
-        done < <(echo "$result" | jq -r '
-            .targets[]? as $target |
-            ($target.additional_artifacts // [])[]? |
-            [$target.platform, (.path // "")] | @tsv
-        ' 2>/dev/null)
-
-        while IFS=$'\t' read -r target method dir; do
             [[ -z "$dir" || ! -d "$dir" ]] && continue
             while IFS= read -r -d '' file; do
                 if act_artifact_zip_is_wrapper "$method" "$file"; then
                     _build_collect_artifact_zip "$file" "$tag"
                 else
-                    _build_collect_artifact_file "$file" "$target"
+                    _build_collect_artifact_file "$file" "$target" "$target_triple" "$native_result"
                 fi
             done < <(find "$dir" -type f -print0 2>/dev/null)
-        done < <(echo "$result" | jq -r '.targets[]? | [.platform, (.method // ""), (.artifact_dir // "")] | @tsv' 2>/dev/null)
+        done < <(jq -c '.targets[]?' <<< "$result")
 
         if $collect_failed; then
             log_error "Artifact collection encountered errors"
@@ -4236,7 +4300,8 @@ EOF
             .artifacts = (.artifacts // []) |
             .artifacts |= map(
                 . as $a |
-                ($renames[($a.target // "") + "||" + ($a.name // "")] // "") as $new |
+                ($renames[($a.target // "") + "||" + ($a.target_triple // "") + "||" + ($a.name // "")] //
+                 $renames[($a.target // "") + "||||" + ($a.name // "")] // "") as $new |
                 if $new != "" then .name = $new else . end
             )
         ' "$manifest_file" 2>/dev/null)
@@ -4327,6 +4392,9 @@ EOF
              status: (if (.status // "") | IN("success", "ok", "passed") then "success"
                       elif .status == "timeout" then "timeout" else "failed" end)}
             + (if (.artifact_path | type) == "string" then {artifact_path} else {} end)
+            + (if (.artifact_paths | type) == "array" then {artifact_paths} else {} end)
+            + (if (.target_triple | type) == "string" then {target_triple} else {} end)
+            + (if (.task_key | type) == "string" then {task_key} else {} end)
             + (if (.error | type) == "string" then {error} else {} end)
             + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \
             <<< "$result" 2>/dev/null) || target_results_json='[]'
@@ -4337,11 +4405,12 @@ EOF
             --argjson total "$total" --argjson success "$success" --argjson failed "$failed" \
             --argjson duration "$duration" --arg output_dir "$output_dir" \
             --arg manifest "$authoritative_manifest" '
-            ($results | map({key: .platform, value: .}) | from_entries) as $by_platform |
             {tool: $tool, repo: $repo, version: $version, build_purpose: $build_purpose,
              publishable: ($build_purpose == "release"), run_id: $run_id,
              targets: [($targets | split(" ") | map(select(length > 0)))[] as $platform |
-                 $by_platform[$platform] // {platform: $platform, host: "", method: "native", status: "skipped"}],
+                 ($results | map(select(.platform == $platform))) as $matches |
+                 if ($matches | length) > 0 then $matches[]
+                 else {platform: $platform, host: "", method: "native", status: "skipped"} end],
              total: $total, success: $success, failed: $failed,
              duration_seconds: $duration, total_build_time_ms: ($duration * 1000),
              output_dir: $output_dir, manifest_path: $manifest}') || return 4
@@ -9671,6 +9740,7 @@ EOF
 
     _fallback_verify_completed_source() {
         local current_sha source_status target_list targets_json
+        local tasks_json strict_tasks=false matrix_digest=""
         local -a configured_targets=()
         current_sha=$(git -C "$local_path" rev-parse --verify HEAD) || return 1
         source_status=$(git -C "$local_path" status --porcelain --untracked-files=all) || return 1
@@ -9679,8 +9749,19 @@ EOF
         targets_json=$(printf '%s\n' "${configured_targets[@]}" | jq -Rsc \
             'split("\n") | map(select(length > 0))') || return 1
         [[ -z "$source_status" && -d "$output_dir" && ! -L "$output_dir" ]] || return 1
+        [[ "$contract" == null ]] || strict_tasks=true
+        tasks_json=$(_act_build_task_plan "$tool_name" "$version" "$targets_json" "$strict_tasks") || return 1
+        if jq -e 'any(.[]; .key != .platform)' <<< "$tasks_json" >/dev/null; then
+            matrix_digest=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 1
+        fi
         jq -e --arg sha "$current_sha" --argjson targets "$targets_json" \
-            '.git_sha == $sha and .targets == $targets' <<< "$resume_state" >/dev/null
+            --argjson tasks "$tasks_json" --arg matrix_digest "$matrix_digest" '
+            .git_sha == $sha and .targets == $targets and
+            (if .context.build_tasks == null then all($tasks[]; .key == .platform)
+             else .context.build_tasks == $tasks end) and
+            (if $matrix_digest == "" then true
+             else .context.native_matrix_config_sha256 == $matrix_digest end)
+        ' <<< "$resume_state" >/dev/null
     }
     if $reuse_completed; then
         # A replacement ref must not reinterpret the source named by receipts.
@@ -9784,7 +9865,12 @@ EOF
     if $reuse_completed && ! jq -e --arg run "$resume_run_id" \
         --argjson state "$resume_state" '
             .run_id == $run and .source.git_sha == $state.git_sha and
-            .summary.total == ($state.targets | length)
+            .summary.total == (($state.context.build_tasks // $state.targets) | length) and
+            (. as $manifest | all(($state.context.build_tasks // [])[];
+                if .method == "native" and (.target_triple | type == "string" and length > 0) then
+                    . as $task | any($manifest.artifacts[];
+                        .target == $task.platform and .target_triple == $task.target_triple)
+                else true end))
         ' <<< "$manifest_json" >/dev/null; then
         _fallback_result 6 verification "Manifest does not belong to the completed build run"
         return 6

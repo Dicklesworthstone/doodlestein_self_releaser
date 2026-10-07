@@ -4682,12 +4682,13 @@ _act_validate_strict_cargo_source_closure() {
 # several targets share one immutable source root and download seed.
 _act_validate_strict_target_cargo_source_closure() {
     local tool="$1" platform="$2" version="$3" host="$4" source_root="$5" dependencies="$6"
-    local build_cmd build_env binary_name
+    local build_cmd build_env binary_name target_triple
     build_cmd=$(act_get_build_cmd "$tool" "$platform") || return 4
     build_env=$(act_get_build_env "$tool" "$platform") || return 4
     binary_name=$(yq -r '.binary_name // ""' "$ACT_REPOS_DIR/${tool}.yaml") || return 4
+    target_triple=$(act_get_build_env_value "$build_env" CARGO_BUILD_TARGET 2>/dev/null || true)
     build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool}" \
-        "$version" "${platform%%/*}" "${platform##*/}") || return 4
+        "$version" "${platform%%/*}" "${platform##*/}" "$target_triple") || return 4
     build_env+=$'\n'"CARGO_TARGET_DIR=${source_root%/*}/.cargo-target-${platform//\//-}"
     _act_validate_strict_cargo_source_closure \
         "$host" "$source_root" "$dependencies" "$build_cmd" "$build_env"
@@ -5736,7 +5737,7 @@ _act_token_is_safe() {
 }
 
 # Pre-substitute DSR's documented build tokens into a build_cmd.
-# Usage: act_substitute_build_cmd_tokens <build_cmd> <name> <version> <os> <arch>
+# Usage: act_substitute_build_cmd_tokens <build_cmd> <name> <version> <os> <arch> [target_triple]
 #
 # DSR substitutes ${version}/${name}/${os}/${arch} (and their aliases) into
 # artifact_naming and install_script_compat, but historically NOT into
@@ -5761,6 +5762,7 @@ act_substitute_build_cmd_tokens() {
     local version="$3"
     local os="$4"
     local arch="$5"
+    local target_triple="${6:-}"
 
     # Defense in depth: the substituted command is later executed by a shell
     # (local bash and/or a remote login shell). version/name/os/arch are
@@ -5784,6 +5786,10 @@ act_substitute_build_cmd_tokens() {
         _log_error "act_substitute_build_cmd_tokens: refusing unsafe arch token '$arch' (allowed: A-Za-z0-9 . _ -)"
         return 1
     fi
+    if [[ -n "$target_triple" ]] && ! _act_token_is_safe "$target_triple" target_triple; then
+        _log_error "act_substitute_build_cmd_tokens: refusing unsafe target triple '$target_triple'"
+        return 1
+    fi
 
     local version_stripped="${version#v}"
 
@@ -5805,15 +5811,21 @@ act_substitute_build_cmd_tokens() {
     cmd="${cmd//\$\{goarch\}/$arch}"
     cmd="${cmd//\$\{GOARCH\}/$arch}"
 
+    if [[ -n "$target_triple" ]]; then
+        cmd="${cmd//\$\{target_triple\}/$target_triple}"
+        cmd="${cmd//\$\{TARGET_TRIPLE\}/$target_triple}"
+    fi
+
     printf '%s' "$cmd"
 }
 
 # Get environment variables for a build target
-# Usage: act_get_build_env <tool_name> <platform>
+# Usage: act_get_build_env <tool_name> <platform> [selected_target_triple]
 # Returns: Newline-separated KEY=VALUE pairs (preserves values with spaces)
 act_get_build_env() {
     local tool_name="$1"
     local platform="$2"
+    local selected_triple="${3:-}"
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
 
     if [[ ! -f "$config_file" ]]; then
@@ -5839,6 +5851,43 @@ act_get_build_env() {
         fi
     fi
 
+    # A native matrix worker selects exactly one declared variant. Do not
+    # append a second CARGO_BUILD_TARGET: readers and shell exports must see
+    # the same value, and a fixed operator target cannot be silently changed.
+    if [[ -n "$selected_triple" ]]; then
+        local configured_triples configured_target selected_language selected_derive
+        configured_triples=$(act_get_configured_target_triples "$tool_name" "$platform") || return 4
+        [[ -n "$configured_triples" ]] || configured_triples=$(_act_default_rust_target_triple "$platform") || return 4
+        if ! grep -Fxq -- "$selected_triple" <<< "$configured_triples"; then
+            _log_error "Native variant $selected_triple is not configured for $tool_name $platform"
+            return 4
+        fi
+        selected_language=$(yq -r '.language // ""' "$config_file") || return 4
+        selected_derive=$(yq -r '.derive_cargo_build_target' "$config_file") || return 4
+        if [[ "$selected_language" != rust || "$selected_derive" == false ]]; then
+            _log_error "Native target variants require Rust with derive_cargo_build_target enabled"
+            return 4
+        fi
+        configured_target=$(DSR_ENV_PLATFORM="$platform" yq -r \
+            '.cross_compile[strenv(DSR_ENV_PLATFORM)].env.CARGO_BUILD_TARGET // .env.CARGO_BUILD_TARGET // ""' \
+            "$config_file") || return 4
+        if [[ -n "$configured_target" && "$configured_target" != "$selected_triple" ]]; then
+            _log_error "Configured CARGO_BUILD_TARGET=$configured_target conflicts with native variant $selected_triple; remove the fixed target and use DSR_TARGET_TRIPLE in build_cmd"
+            return 4
+        fi
+        local selected_env="" selected_pair
+        while IFS= read -r selected_pair; do
+            [[ -z "$selected_pair" ]] && continue
+            case "$selected_pair" in
+                CARGO_BUILD_TARGET=*|DSR_TARGET_TRIPLE=*) continue ;;
+            esac
+            [[ -z "$selected_env" ]] || selected_env+=$'\n'
+            selected_env+="$selected_pair"
+        done <<< "$result"
+        [[ -z "$selected_env" ]] || selected_env+=$'\n'
+        result="${selected_env}CARGO_BUILD_TARGET=$selected_triple"
+    fi
+
     # Derived build identity (issue #7). Historically the requested platform
     # reached the build only through artifact naming: a platform without an
     # explicit cross_compile env compiled untargeted, wrote to target/release,
@@ -5857,12 +5906,13 @@ act_get_build_env() {
         derived_pairs+=$'\n'"DSR_TARGET_PLATFORM=$platform"
         local env_language derive_opt
         env_language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
-        derive_opt=$(yq -r '.derive_cargo_build_target // ""' "$config_file" 2>/dev/null)
+        derive_opt=$(yq -r '.derive_cargo_build_target' "$config_file" 2>/dev/null)
         if [[ "$env_language" == "rust" && "$derive_opt" != "false" ]]; then
             local derived_triple
             derived_triple=$(act_get_build_env_value "$result" "CARGO_BUILD_TARGET" 2>/dev/null || true)
             if [[ -z "$derived_triple" ]]; then
-                # A list of variants (bd-cdcz) builds its first, primary entry.
+                # A direct singleton call defaults to the primary. Matrix
+                # workers supplied their exact declared variant above.
                 derived_triple=$(yq -r ".target_triples.\"$platform\" | select(tag == \"!!seq\") // [.] | .[0] // \"\"" \
                     "$config_file" 2>/dev/null)
                 [[ "$derived_triple" == "null" ]] && derived_triple=""
@@ -5884,6 +5934,25 @@ act_get_build_env() {
     fi
 
     echo "$result"
+}
+
+# Read the runner's build authority directly (standalone native callers need
+# not initialize the registry/config module). Keep declaration order: it owns
+# primary aliases and the durable native task plan.
+act_get_configured_target_triples() {
+    local tool_name="$1" platform="$2" document
+    document=$(yq -o=json '.' "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
+    jq -r --arg platform "$platform" '
+        def triple: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("..") | not);
+        .target_triples // {} |
+        if type != "object" then error("target_triples must be a mapping")
+        else .[$platform] |
+            if . == null then empty
+            elif triple then .
+            elif type == "array" and length > 0 and all(.[]; triple) and length == (unique | length)
+            then .[] else error("invalid native target triple list") end
+        end
+    ' <<< "$document" || return 4
 }
 
 # Get a single environment variable value from newline-delimited KEY=VALUE pairs.
@@ -6568,13 +6637,20 @@ PY
 # Args: mode output_json build_cmd extra_tools(space-separated)
 _act_toolchain_identity_script() {
     local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}"
-    local output_q command_q extra_q
-    [[ "$mode" == record || "$mode" == verify || "$mode" == metadata || "$mode" == context ]] || return 4
+    local output_q command_q extra_q python_q=python3
+    [[ "$mode" == record || "$mode" == verify || "$mode" == metadata || "$mode" == context || "$mode" == target ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     printf -v output_q '%q' "$output"
     printf -v command_q '%q' "$build_cmd"
     printf -v extra_q '%q' "$extra_tools"
-    printf 'python3 -I - %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$mode" "$output_q" "$command_q" "$extra_q"
+    # Target-only planning runs on the coordinator without invoking any build
+    # tools or reading its Cargo configuration. The configured PATH may be a
+    # remote host path, so use the coordinator's absolute Python interpreter.
+    if [[ "$mode" == target ]]; then
+        python_q=$(command -v python3) || return 4
+        printf -v python_q '%q' "$python_q"
+    fi
+    printf '%s -I - %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q"
     cat <<'PY'
 import hashlib, json, os, pathlib, re, shlex, shutil, subprocess, sys
 
@@ -6634,7 +6710,7 @@ def shell_word(raw, variables=()):
 
 
 def influences(name):
-    return name == 'PATH' or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
+    return name in ('PATH', 'DSR_TARGET_TRIPLE') or name.startswith(('CARGO_', 'RUST', 'XWIN_')) or bool(re.search(
         r'(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', name))
 
 
@@ -6705,7 +6781,8 @@ def cargo_configuration():
     return config, receipts
 
 
-cargo_config, cargo_config_receipts = cargo_configuration()
+cargo_config, cargo_config_receipts = (({'build': {}, 'target': {}, 'alias': {}}, [])
+                                     if mode == 'target' else cargo_configuration())
 
 
 def joined_shell_lines(text):
@@ -6852,7 +6929,7 @@ def invocation_selection():
             if name in ('CARGO_HOME', 'CARGO_TARGET_DIR'):
                 fail('build_cmd cannot replace the admitted ' + name)
             env[name] = shell_word(raw)
-        argv = [shell_word(raw, ('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR', 'CARGO_HOME'))
+        argv = [shell_word(raw, ('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR', 'CARGO_HOME', 'DSR_TARGET_TRIPLE'))
                 for raw in words[cursor:]]
         toolchain = env.get('RUSTUP_TOOLCHAIN') or None
         explicit_toolchain = False
@@ -6934,6 +7011,19 @@ def invocation_selection():
 
 
 selection, probe_env, explicit_toolchain, cargo_commands, assigned_environment = invocation_selection()
+
+if mode == 'target':
+    # This is a selection check, not executable or binary ABI attestation.
+    # Never run the command: all task variants are checked before the first
+    # worker starts, so a hardcoded primary cannot produce partial releases.
+    expected = os.environ.get('DSR_TARGET_TRIPLE', '')
+    if not expected or selection['target'] != expected:
+        fail('Cargo selects ' + repr(selection['target']) + ' but native task requires ' + repr(expected))
+    if any(probe_env.get(name) != os.environ.get(name)
+           for name in ('CARGO_BUILD_TARGET', 'DSR_TARGET_TRIPLE')):
+        fail('build_cmd cannot override the native task target environment')
+    print(expected)
+    sys.exit(0)
 
 
 def run(argv, required=True, timeout=60):
@@ -7085,6 +7175,23 @@ PY
     printf 'DSR_TOOLCHAIN_IDENTITY_PY\n'
 }
 
+# Validate a matrix command against the exact worker target without executing
+# the command or using the coordinator's ambient Rust/Cargo configuration.
+_act_validate_native_target_command() {
+    local build_cmd="$1" build_env="$2" selected_triple="$3" script pair
+    local -a pairs=()
+    [[ -n "$selected_triple" ]] || return 4
+    while IFS= read -r pair; do
+        [[ -z "$pair" ]] && continue
+        [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || return 4
+        pairs+=("$pair")
+    done <<< "$build_env"
+    script=$(_act_toolchain_identity_script target /dev/null "$build_cmd") || return 4
+    local actual
+    actual=$(env -i "${pairs[@]}" "$BASH" -c "$script") || return 4
+    [[ "$actual" == "$selected_triple" ]] || return 4
+}
+
 # Run native build on remote host via SSH
 # Usage: act_run_native_build <tool_name> <platform> <version> [run_id]
 #        [remote_path_override] [release_git_sha] [release_git_ref] [bound_host]
@@ -7144,6 +7251,7 @@ act_run_native_build() {
     local release_git_sha="${6:-}"
     local release_git_ref="${7:-}"
     local bound_host="${8:-}"
+    local selected_triple="${9:-}"
 
     # A strict identity must never degrade to ordinary staging when a source
     # binding is absent. Check before configuration, SSH, or filesystem work.
@@ -7188,8 +7296,13 @@ act_run_native_build() {
     fi
 
     local_path=$(act_get_local_path "$tool_name")
-    build_cmd=$(act_get_build_cmd "$tool_name" "$platform")
-    build_env=$(act_get_build_env "$tool_name" "$platform")
+    build_cmd=$(act_get_build_cmd "$tool_name" "$platform") || return 4
+    if ! build_env=$(act_get_build_env "$tool_name" "$platform" "$selected_triple"); then
+        jq -nc --arg platform "$platform" --arg triple "$selected_triple" \
+            '{platform: $platform, target_triple: $triple, status: "error", exit_code: 4,
+              error: "Invalid native target environment"}'
+        return 4
+    fi
     binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
     build_profile=$(yq -r '.build_profile // "release"' "$config_file" 2>/dev/null)
 
@@ -7205,6 +7318,11 @@ act_run_native_build() {
     # floor and the enforced floor differ only when the repo's own build_cmd
     # or cross toolchain owns the libc baseline: dsr then applies nothing but
     # still enforces an explicitly configured floor.
+    local native_target_triple="" native_target_slug="${platform//\//-}"
+    if [[ "$language" == rust ]]; then
+        native_target_triple=$(act_get_build_env_value "$build_env" CARGO_BUILD_TARGET 2>/dev/null || true)
+    fi
+    [[ -z "$selected_triple" ]] || native_target_slug+="-$selected_triple"
     local rust_glibc_floor="" rust_glibc_floor_enforced="" rust_zig_target="" rust_floor_triple=""
     if [[ "$language" == "rust" && "$platform" == linux/* ]] && \
        ! _act_is_windows_host "$host"; then
@@ -7275,10 +7393,19 @@ act_run_native_build() {
     # name falls back to the tool name when binary_name is unset.
     local _act_build_os="${platform%%/*}"
     local _act_build_arch="${platform##*/}"
-    if ! build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool_name}" "$version" "$_act_build_os" "$_act_build_arch"); then
+    if ! build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool_name}" "$version" "$_act_build_os" "$_act_build_arch" "$native_target_triple"); then
         _log_error "Refusing to build $tool_name: build_cmd token substitution rejected an unsafe value (version=$version platform=$platform)"
         jq -nc --arg tool "$tool_name" --arg version "$version" --arg platform "$platform" \
             '{status: "error", exit_code: 4, error: ("unsafe build_cmd token value for " + $tool + " " + $version + " " + $platform)}'
+        return 4
+    fi
+
+    if [[ -n "$selected_triple" ]] && \
+       ! _act_validate_native_target_command "$build_cmd" "$build_env" "$selected_triple"; then
+        _log_error "Build command does not select native variant $selected_triple"
+        jq -nc --arg platform "$platform" --arg triple "$selected_triple" \
+            '{platform: $platform, target_triple: $triple, status: "error", exit_code: 4,
+              error: "Build command conflicts with selected native target variant"}'
         return 4
     fi
 
@@ -7560,6 +7687,12 @@ act_run_native_build() {
             jq -nc '{status: "error", exit_code: 4, error: "Invalid Cargo isolation target directory"}'
             return 4
         fi
+        if [[ -n "$selected_triple" ]]; then
+            # Even a configured CARGO_TARGET_DIR is a base directory for a
+            # matrix. Fresh output per attempt prevents a failed/no-op retry
+            # from collecting bytes left by any preceding build.
+            nonstrict_target_dir="${nonstrict_target_dir%/}/dsr-${selected_triple}-${isolation_suffix}"
+        fi
         [[ -n "$nonstrict_env" ]] && nonstrict_env+=$'\n'
         nonstrict_env+="CARGO_TARGET_DIR=$nonstrict_target_dir"
 
@@ -7719,9 +7852,9 @@ act_run_native_build() {
     local log_dir log_file
     log_dir="$ACT_LOGS_DIR"
     mkdir -p "$log_dir"
-    log_file="$log_dir/${tool_name}-${platform//\//-}-${run_id:-$$}.log"
+    log_file="$log_dir/${tool_name}-${native_target_slug}-${run_id:-$$}.log"
 
-    _log_info "Building $tool_name for $platform on $host"
+    _log_info "Building $tool_name for $platform${selected_triple:+ ($selected_triple)} on $host"
     _log_info "Remote path: $remote_path"
     _log_info "Build cmd: $build_cmd"
     _log_info "Log file: $log_file"
@@ -8154,6 +8287,14 @@ act_run_native_build() {
                [[ ! -d "$artifact_dir" || -L "$artifact_dir" ]]; then
                 _log_error "Unable to create a fresh private artifact collection directory for $platform"
                 jq -nc '{status: "error", exit_code: 4, error: "Private strict artifact directory unavailable"}'
+                return 4
+            fi
+        elif [[ -n "$selected_triple" ]]; then
+            local variant_artifact_parent="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name}/${native_target_slug}"
+            if ! mkdir -p "$variant_artifact_parent" || \
+               [[ ! -d "$variant_artifact_parent" || -L "$variant_artifact_parent" ]] || \
+               ! artifact_dir=$(mktemp -d "$variant_artifact_parent/attempt.XXXXXXXX"); then
+                _log_error "Unable to create a fresh artifact directory for native variant $selected_triple"
                 return 4
             fi
         else
@@ -8602,7 +8743,12 @@ act_run_native_build() {
                 local os arch names_json
                 os="${platform%/*}"
                 arch="${platform#*/}"
-                names_json=$(artifact_naming_generate_dual_for_tool "$tool_name" "$version" "$os" "$arch" "$archive_ext" "$local_path" 2>/dev/null || echo "")
+                if [[ -n "$selected_triple" ]]; then
+                    names_json=$(artifact_naming_generate_dual_for_variant "$tool_name" "$version" "$os" "$arch" \
+                        "$archive_ext" "$local_path" "$selected_triple" 2>/dev/null || echo "")
+                else
+                    names_json=$(artifact_naming_generate_dual_for_tool "$tool_name" "$version" "$os" "$arch" "$archive_ext" "$local_path" 2>/dev/null || echo "")
+                fi
                 archive_name=$(echo "$names_json" | jq -r '.versioned // empty' 2>/dev/null)
             fi
 
@@ -8784,10 +8930,10 @@ act_run_native_build() {
     _act_remove_build_stage_root "$host" "$output_stage_root"
 
     # Return JSON result (pointing to LOCAL artifact path)
-    # Build artifact_paths array from comma-separated string
+    # Keep exact paths; the comma-separated scalar is a display surface only.
     local artifact_paths_json="[]"
-    if [[ -n "${local_artifact_path:-}" ]]; then
-        artifact_paths_json=$(echo "$local_artifact_path" | tr ',' '\n' | jq -R . | jq -sc .)
+    if [[ ${#local_artifact_paths[@]} -gt 0 ]]; then
+        artifact_paths_json=$(printf '%s\0' "${local_artifact_paths[@]}" | jq -Rsc 'split("\u0000")[:-1]') || return 4
     fi
     local additional_artifacts_json="[]"
     if [[ ${#additional_artifact_receipts[@]} -gt 0 ]]; then
@@ -8820,6 +8966,7 @@ act_run_native_build() {
         --arg artifact_path "${local_artifact_path:-}" \
         --argjson artifact_paths "$artifact_paths_json" \
         --argjson additional_artifacts "$additional_artifacts_json" \
+        --arg target_triple "$native_target_triple" \
         --arg collected_sha256 "$collected_sha256" \
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
@@ -8831,6 +8978,7 @@ act_run_native_build() {
             platform: $platform,
             host: $host,
             method: "native",
+            target_triple: (if $target_triple == "" then null else $target_triple end),
             status: $status,
             exit_code: $exit_code,
             duration_seconds: $duration,
@@ -8951,6 +9099,61 @@ _act_target_result_available() {
     [[ "$actual" == "$expected" ]]
 }
 
+# Expand only native Rust variants. Platform identity remains the routing and
+# release-contract authority; task identity distinguishes independent attempts.
+# Validate the entire matrix before launching its first compiler.
+_act_build_task_plan() {
+    local tool="$1" version="$2" platforms_json="$3" strict="$4"
+    local platform method triples triple key environment command command_template language binary_name
+    local plan='[]' config_file="$ACT_REPOS_DIR/${tool}.yaml"
+    language=$(yq -r '.language // ""' "$config_file") || return 4
+    binary_name=$(yq -r '.binary_name // ""' "$config_file") || return 4
+    [[ -n "$binary_name" ]] || binary_name="$tool"
+    while IFS= read -r platform; do
+        method=native
+        if act_platform_uses_act "$tool" "$platform"; then
+            method=act
+            triples=""
+        else
+            triples=$(act_get_configured_target_triples "$tool" "$platform") || return 4
+        fi
+        if [[ "$triples" == *$'\n'* ]]; then
+            if [[ "$strict" == true || "$language" != rust ]]; then
+                _log_error "Native target variants require an ordinary Rust build: $platform"
+                return 4
+            fi
+            command_template=$(act_get_build_cmd "$tool" "$platform") || return 4
+            while IFS= read -r triple; do
+                command=$(act_substitute_build_cmd_tokens "$command_template" "$binary_name" "$version" \
+                    "${platform%%/*}" "${platform##*/}" "$triple") || return 4
+                environment=$(act_get_build_env "$tool" "$platform" "$triple") || return 4
+                _act_validate_native_target_command "$command" "$environment" "$triple" || return 4
+                key="$platform@$triple"
+                plan=$(jq -c --arg key "$key" --arg platform "$platform" \
+                    --arg triple "$triple" --arg method "$method" \
+                    '. + [{key:$key, platform:$platform, target_triple:$triple, method:$method}]' \
+                    <<< "$plan") || return 4
+            done <<< "$triples"
+        else
+            plan=$(jq -c --arg key "$platform" --arg platform "$platform" \
+                --arg triple "$triples" --arg method "$method" \
+                '. + [{key:$key, platform:$platform, target_triple:$triple, method:$method}]' \
+                <<< "$plan") || return 4
+        fi
+    done < <(jq -r '.[]' <<< "$platforms_json")
+    printf '%s\n' "$plan"
+}
+
+# Matrix success must originate from the selected native invocation. Never
+# manufacture missing or contradictory execution identity from a scheduler row.
+_act_matrix_result_matches() {
+    local result="$1" platform="$2" triple="$3"
+    [[ -z "$triple" ]] && return 0
+    jq -e --arg platform "$platform" --arg triple "$triple" '
+        .platform == $platform and .target_triple == $triple and .method == "native"
+    ' <<< "$result" >/dev/null 2>&1
+}
+
 # Execute exactly one target and emit one compact JSON result as the final
 # stdout line. Diagnostic/build output is retained on stderr by the worker.
 _act_build_orchestration_target() {
@@ -8964,6 +9167,7 @@ _act_build_orchestration_target() {
     local release_git_sha="${8:-}"
     local release_git_ref="${9:-}"
     local bound_host="${10:-}"
+    local selected_triple="${11:-}"
 
     local host="${bound_host:-act-local}" remote_path_override=""
     if [[ "$strict_release_contract" == "true" ]]; then
@@ -9030,7 +9234,7 @@ _act_build_orchestration_target() {
         _log_info "Method: native (host=$host)"
         full_output=$(act_run_native_build \
             "$tool_name" "$target" "$version" "$run_id" "$remote_path_override" \
-            "$release_git_sha" "$release_git_ref" "$host" 2>&1) || exit_code=$?
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" 2>&1) || exit_code=$?
         [[ -n "$full_output" ]] && printf '%s\n' "$full_output" >&2
         result=$(printf '%s\n' "$full_output" | grep '^{' | tail -1)
         if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
@@ -9045,6 +9249,13 @@ _act_build_orchestration_target() {
 
     local result_status
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
+    if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
+       ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
+        exit_code=4
+        result_status=failed
+        result=$(jq -c '.status = "failed" | .exit_code = 4 |
+            .error = "Native variant result does not match the requested target triple"' <<< "$result") || return 4
+    fi
     if [[ "$exit_code" -ne 0 ]] &&
        [[ "$result_status" == "success" || "$result_status" == "ok" ||
           "$result_status" == "passed" ]]; then
@@ -9133,16 +9344,19 @@ _act_run_target_worker() {
     local release_git_ref="${12:-}"
     local bound_host="${13:-}"
     local build_purpose="${14:-release}"
+    local selected_triple="${15:-}" task_key="${16:-$target}"
 
     local host="${bound_host:-act-local}"
-    local slot_id="${run_id}-${target//\//-}-attempt-${attempt}"
+    local slot_task="${task_key//\//-}"
+    slot_task="${slot_task//@/-}"
+    local slot_id="${run_id}-${slot_task}-attempt-${attempt}"
     local slot_acquired=false
 
     _act_write_worker_result() {
         local body="$1"
         # Never trust build-command stdout to classify an artifact for publication.
-        body=$(jq -c --arg purpose "$build_purpose" \
-            '. + {build_purpose: $purpose, publishable: ($purpose == "release")}' \
+        body=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
+            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
             <<< "$body") || return 4
         (
             umask 077
@@ -9233,7 +9447,7 @@ _act_run_target_worker() {
     _act_build_orchestration_target \
         "$tool_name" "$version" "$run_id" "$target" \
         "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
-        "$release_git_sha" "$release_git_ref" "$host" \
+        "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" \
         >> "$log_path" 2>&1 &
     worker_pid=$!
     # The process group remains distinct after monitor mode is disabled; this
@@ -9250,6 +9464,13 @@ _act_run_target_worker() {
               exit_code: $exit_code, error: "Worker produced no valid result"}')
     fi
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
+    if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
+       ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
+        worker_status=4
+        result_status=failed
+        result=$(jq -c '.status = "failed" | .exit_code = 4 |
+            .error = "Native worker result does not match the requested target triple"' <<< "$result") || return 4
+    fi
     if [[ "$result_status" == "success" || "$result_status" == "ok" ||
           "$result_status" == "passed" ]]; then
         if receipts=$(_act_result_artifact_receipts "$result"); then
@@ -9616,6 +9837,17 @@ act_orchestrate_build() {
         done
     fi
 
+    local build_tasks_json native_matrix_config_sha256=""
+    if ! build_tasks_json=$(_act_build_task_plan "$tool_name" "$version" \
+        "$requested_targets_json" "$strict_release_contract"); then
+        _log_error "Native build task plan is invalid"
+        return 4
+    fi
+    if jq -e 'any(.[]; .key != .platform)' <<< "$build_tasks_json" >/dev/null; then
+        native_matrix_config_sha256=$(_act_sha256 "$ACT_REPOS_DIR/${tool_name}.yaml") || return 4
+        [[ "$native_matrix_config_sha256" =~ ^[0-9a-f]{64}$ ]] || return 4
+    fi
+
     _log_info "Orchestrating build for $tool_name $version"
     _log_info "Targets: $targets"
 
@@ -9830,6 +10062,14 @@ act_orchestrate_build() {
                 _act_release_orchestration_lock
                 return 4
             fi
+            if [[ "$(jq -cS '.context.build_tasks // null' <<< "$resume_state")" != \
+                  "$(jq -cS . <<< "$build_tasks_json")" ]] || \
+               [[ "$(jq -r '.context.native_matrix_config_sha256 // ""' <<< "$resume_state")" != \
+                  "$native_matrix_config_sha256" ]]; then
+                _log_error "Resume build task plan or native matrix configuration changed"
+                _act_release_orchestration_lock
+                return 4
+            fi
             if [[ -n "$git_sha" && "$(jq -r '.git_sha // empty' <<< "$resume_state")" != "$git_sha" ]] || \
                [[ -n "$git_ref" && "$(jq -r '.git_ref // empty' <<< "$resume_state")" != "$git_ref" ]] || \
                { [[ -n "$supplied_output_dir" ]] && \
@@ -9873,7 +10113,8 @@ act_orchestrate_build() {
                 build_state_create "$tool_name" "$version" "${targets// /,}") || \
                [[ "$run_id" != "$requested_run_id" ]] || ! _act_is_uuid "$run_id" || \
                 ! build_state_set_context "$tool_name" "$version" "$run_id" \
-                    "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" "$target_hosts_json" "$build_purpose"; then
+                    "$git_sha" "$git_ref" "$source_roots_json" "$supplied_output_dir" "$parallel_jobs" \
+                    "$target_hosts_json" "$build_purpose" "$build_tasks_json" "$native_matrix_config_sha256"; then
                 _log_error "Build state could not retain the run context"
                 _act_release_orchestration_lock
                 return 4
@@ -9913,7 +10154,8 @@ act_orchestrate_build() {
     local results=() success_count=0 fail_count=0 interrupted=false
     local start_time target_index=0
     start_time=$(date +%s)
-    local -a worker_pids=() worker_targets=() worker_results=() worker_logs=() worker_hosts=() worker_attempts=()
+    local -a worker_pids=() worker_targets=() worker_platforms=() worker_triples=()
+    local -a worker_results=() worker_logs=() worker_hosts=() worker_attempts=()
     local -a worker_output_paths=()
     local active_workers=0
     declare -A final_results=() worker_reaped=()
@@ -9941,26 +10183,32 @@ act_orchestrate_build() {
     _act_record_worker_result() {
         local index="$1" worker_status="$2"
         local finished_target="${worker_targets[$index]}"
+        local finished_platform="${worker_platforms[$index]}" finished_triple="${worker_triples[$index]}"
         local result_path="${worker_results[$index]}" log_path="${worker_logs[$index]}"
         local host="${worker_hosts[$index]}" attempt="${worker_attempts[$index]}"
         local finished_result status extra
         if [[ -s "$result_path" ]] && finished_result=$(jq -ce '.' "$result_path" 2>/dev/null); then
             if ! _act_build_purpose_matches "$finished_result" "$build_purpose" true; then
-                finished_result=$(jq -nc --arg target "$finished_target" --arg host "$host" \
+                finished_result=$(jq -nc --arg target "$finished_platform" --arg host "$host" \
                     '{platform: $target, host: $host, status: "failed", exit_code: 4,
                       error: "Worker result purpose is missing or inconsistent"}')
             fi
         else
-            finished_result=$(jq -nc --arg target "$finished_target" --arg host "$host" \
+            finished_result=$(jq -nc --arg target "$finished_platform" --arg host "$host" \
                 --argjson exit_code "$worker_status" \
                 '{platform: $target, host: $host, status: "failed", exit_code: $exit_code,
                   error: "Worker result receipt missing or invalid"}')
         fi
+        if [[ "$(jq -r '.status // ""' <<< "$finished_result")" == success ]] && \
+           ! _act_matrix_result_matches "$finished_result" "$finished_platform" "$finished_triple"; then
+            finished_result=$(jq -c '.status = "failed" | .exit_code = 4 |
+                .error = "Completed native result has inconsistent variant identity"' <<< "$finished_result") || return 4
+        fi
         finished_result=$(jq -c --arg log_path "$log_path" --arg result_path "$result_path" \
             --argjson attempt "$attempt" \
-            --arg purpose "$build_purpose" \
+            --arg purpose "$build_purpose" --arg task_key "$finished_target" \
             '. + {log_path: $log_path, result_path: $result_path, attempt: $attempt,
-                  build_purpose: $purpose, publishable: ($purpose == "release")}' \
+                  build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
             <<< "$finished_result")
         final_results["$finished_target"]="$finished_result"
         status=$(jq -r '.status // "unknown"' <<< "$finished_result")
@@ -10033,14 +10281,19 @@ act_orchestrate_build() {
     }
     trap _act_cancel_parallel_workers INT TERM
 
-    for target in $targets; do
+    local task_json task_key selected_triple
+    while IFS= read -r task_json; do
+        target=$(jq -r '.platform' <<< "$task_json")
+        task_key=$(jq -r '.key' <<< "$task_json")
+        selected_triple=""
+        [[ "$task_key" == "$target" ]] || selected_triple=$(jq -r '.target_triple' <<< "$task_json")
         $interrupted && break
         target_index=$((target_index + 1))
         local persisted_entry='{}' persisted_result="" persisted_result_path=""
         local prior_attempts=0
         if $state_available; then
             persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                jq -c --arg target "$target" '.target_statuses[$target] // {}')
+                jq -c --arg target "$task_key" '.target_statuses[$target] // {}')
             prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
             persisted_result=$(jq -c '.result // empty' <<< "$persisted_entry")
             persisted_result_path=$(jq -r '.result_path // empty' <<< "$persisted_entry")
@@ -10053,9 +10306,12 @@ act_orchestrate_build() {
                 interrupted=true
                 break
             fi
-            if [[ -n "$persisted_result" ]] && _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                final_results["$target"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
-                _log_info "Resume: reusing completed target $target"
+            if [[ -n "$persisted_result" ]] && \
+               _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
+               [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
+               _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
+                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                _log_info "Resume: reusing completed target $task_key"
                 continue
             fi
             if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
@@ -10067,11 +10323,13 @@ act_orchestrate_build() {
                 fi
             fi
             if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
+               _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
+               [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                final_results["$target"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 if $state_available; then
-                    if ! build_state_update_target "$tool_name" "$version" "$target" "completed" \
-                        "$(jq -nc --argjson result "${final_results[$target]}" \
+                    if ! build_state_update_target "$tool_name" "$version" "$task_key" "completed" \
+                        "$(jq -nc --argjson result "${final_results[$task_key]}" \
                             --argjson attempts "$prior_attempts" \
                             '{result: $result, attempts: $attempts, reconciled_from_sidecar: true}')" \
                         "$run_id"; then
@@ -10079,12 +10337,12 @@ act_orchestrate_build() {
                         break
                     fi
                 fi
-                _log_info "Resume: reconciled completed sidecar for $target"
+                _log_info "Resume: reconciled completed sidecar for $task_key"
                 continue
             fi
             if [[ "$(jq -r '.status // "pending"' <<< "$persisted_entry")" == "failed" && \
                   "$prior_attempts" -ge "${BUILD_RETRY_MAX:-3}" ]]; then
-                final_results["$target"]=$(jq -c \
+                final_results["$task_key"]=$(jq -c \
                     '.result // {platform: "'"$target"'", status: "failed", exit_code: 6,
                      error: "Target retry limit exceeded"}' <<< "$persisted_entry")
                 _log_warn "Resume: retry limit exceeded for $target"
@@ -10093,7 +10351,7 @@ act_orchestrate_build() {
         fi
 
         local attempt=$((prior_attempts + 1)) target_slug index_prefix log_path result_path host
-        target_slug="${target//\//-}"
+        target_slug="${task_key//\//-}"
         printf -v index_prefix '%03d' "$target_index"
         log_path="$workspace/logs/${index_prefix}-${target_slug}.attempt-${attempt}.log"
         result_path="$workspace/results/${index_prefix}-${target_slug}.attempt-${attempt}.json"
@@ -10145,7 +10403,7 @@ act_orchestrate_build() {
         fi
 
         if $state_available; then
-            if ! build_state_update_target "$tool_name" "$version" "$target" "running" \
+            if ! build_state_update_target "$tool_name" "$version" "$task_key" "running" \
                 "$(jq -nc --arg host "$host" --arg log_path "$log_path" \
                     --arg result_path "$result_path" --argjson attempts "$attempt" \
                     '{host: $host, log_path: $log_path, result_path: $result_path,
@@ -10161,10 +10419,13 @@ act_orchestrate_build() {
         DSR_NATIVE_OUTPUT_STAGE="$output_stage" \
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
-            "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" &
+            "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
+            "$selected_triple" "$task_key" &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
-        worker_targets+=("$target")
+        worker_targets+=("$task_key")
+        worker_platforms+=("$target")
+        worker_triples+=("$selected_triple")
         worker_results+=("$result_path")
         worker_logs+=("$log_path")
         worker_hosts+=("$host")
@@ -10175,7 +10436,7 @@ act_orchestrate_build() {
             _act_reap_one_worker || interrupted=true
             $interrupted && break
         fi
-    done
+    done < <(jq -c '.[]' <<< "$build_tasks_json")
 
     while (( active_workers > 0 )); do
         _act_reap_one_worker || interrupted=true
@@ -10184,12 +10445,16 @@ act_orchestrate_build() {
 
     # Deterministic aggregation follows configured target order, never worker
     # completion order.
-    for target in $targets; do
-        local ordered_result="${final_results[$target]:-}"
+    while IFS= read -r task_json; do
+        target=$(jq -r '.platform' <<< "$task_json")
+        task_key=$(jq -r '.key' <<< "$task_json")
+        selected_triple=""
+        [[ "$task_key" == "$target" ]] || selected_triple=$(jq -r '.target_triple' <<< "$task_json")
+        local ordered_result="${final_results[$task_key]:-}"
         if [[ -z "$ordered_result" && $state_available == true ]]; then
             ordered_result=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                jq -c --arg target "$target" \
-                    '.target_statuses[$target].result // {platform: $target, status: "failed",
+                jq -c --arg target "$target" --arg task_key "$task_key" \
+                    '.target_statuses[$task_key].result // {platform: $target, status: "failed",
                      exit_code: 6, error: "No target result"}')
         fi
         if [[ -z "$ordered_result" ]]; then
@@ -10197,12 +10462,13 @@ act_orchestrate_build() {
                 '{platform: $target, status: "failed", exit_code: 6, error: "No target result"}')
         fi
         if [[ "$(jq -r '.status // empty' <<< "$ordered_result")" == "success" ]] && \
-           ! _act_build_purpose_matches "$ordered_result" "$build_purpose" "$strict_release_contract"; then
+           { ! _act_build_purpose_matches "$ordered_result" "$build_purpose" "$strict_release_contract" || \
+             ! _act_matrix_result_matches "$ordered_result" "$target" "$selected_triple"; }; then
             ordered_result=$(jq -c '.status = "failed" | .exit_code = 4 |
                 .error = "Target purpose failed final aggregation"' <<< "$ordered_result") || return 4
         fi
-        ordered_result=$(jq -c --arg purpose "$build_purpose" \
-            '. + {build_purpose: $purpose, publishable: ($purpose == "release")}' \
+        ordered_result=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
+            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
             <<< "$ordered_result") || return 4
         results+=("$ordered_result")
         if [[ "$(jq -r '.status // "unknown"' <<< "$ordered_result")" == "success" ]]; then
@@ -10210,7 +10476,7 @@ act_orchestrate_build() {
         else
             fail_count=$((fail_count + 1))
         fi
-    done
+    done < <(jq -c '.[]' <<< "$build_tasks_json")
 
     local end_time total_duration
     end_time=$(date +%s)
@@ -10323,16 +10589,89 @@ _act_build_environments_json() {
                 method: (.method // ""),
                 build_influence_env: (.build_influence_env // {}),
                 cargo_isolation: (.cargo_isolation // null)
-            }
-        ] | sort_by(.target)
+            } + (if .target_triple == null then {} else {target_triple: .target_triple} end)
+        ] | sort_by(.target, .target_triple)
         | if all(.[];
             (.target | type == "string" and length > 0) and
             (.host | type == "string") and
             (.method | type == "string" and test("^(act|native)$")) and
+            (.target_triple == null or (.target_triple | type == "string" and
+                test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not))) and
             (.build_influence_env | type == "object" and all(.[]; type == "string")) and
             (.cargo_isolation == null or (.cargo_isolation | type == "object"))
           ) then . else error("invalid build environment receipt") end
     ' <<< "$result_json"
+}
+
+# Native workers know the selected variant independently of the output name.
+# Keep that authority at collection and manifest boundaries, including callers
+# which supply retained worker results rather than running the scheduler.
+_act_native_result_target_triple() {
+    local tool="$1" result="$2" platform triple configured
+    platform=$(jq -er '.platform | strings | select(length > 0)' <<< "$result") || return 4
+    triple=$(jq -er 'if .target_triple != null then
+        .target_triple | select(type == "string" and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not))
+        else "" end' <<< "$result") || return 4
+    configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
+    if ! jq -en --arg triple "$triple" --argjson configured "$configured" '
+        if $triple == "" then ($configured | length) <= 1
+        else ($configured | length) == 0 or ($configured | index($triple)) != null end
+    ' >/dev/null; then
+        _log_error "Native result has no configured variant identity: $tool $platform ${triple:-<missing>}"
+        return 4
+    fi
+    if [[ -n "$triple" ]] && ! jq -e --arg triple "$triple" '
+        [.build_influence_env.CARGO_BUILD_TARGET,
+         .build_influence_env.DSR_TARGET_TRIPLE,
+         .cargo_isolation.toolchain.target_triple] |
+        all(.[]; . == null or . == $triple)
+    ' <<< "$result" >/dev/null; then
+        _log_error "Native target triple contradicts its build environment: $tool $platform $triple"
+        return 4
+    fi
+    printf '%s\n' "$triple"
+}
+
+# Flat release directories cannot retain two native payloads named `tool`.
+# Both cmd_build and manifest generation use this deterministic name; the
+# original paths and names remain in the immutable worker receipts.
+_act_native_variant_artifact_name() {
+    local tool="$1" platform="$2" triple="$3" name="$4"
+    local configured variant inferred how base ext="" module_dir
+    _act_is_safe_basename "$name" || return 4
+    [[ -n "$triple" ]] || { printf '%s\n' "$name"; return 0; }
+    if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 4
+        # shellcheck source=./artifact_naming.sh
+        source "$module_dir/artifact_naming.sh" || return 4
+    fi
+    configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
+    variant=$(artifact_naming_artifact_variant "$tool" "${platform%/*}" "${platform#*/}" "$name") || return 4
+    IFS=$'\t' read -r inferred how <<< "$variant"
+    if [[ "$how" == unknown || ( "$how" != primary && "$inferred" != "$triple" ) ]]; then
+        _log_error "Native artifact name contradicts its selected variant: $name ($triple)"
+        return 4
+    fi
+    if [[ "$how" != primary ]] || [[ $(jq 'length' <<< "$configured") -le 1 ]]; then
+        printf '%s\n' "$name"
+        return 0
+    fi
+    base="$name"
+    case "$name" in
+        *.tar.gz) ext=.tar.gz; base="${name%.tar.gz}" ;;
+        *.tar.xz) ext=.tar.xz; base="${name%.tar.xz}" ;;
+        *.tgz) ext=.tgz; base="${name%.tgz}" ;;
+        *.zip) ext=.zip; base="${name%.zip}" ;;
+        *.exe) ext=.exe; base="${name%.exe}" ;;
+        *.minisig|*.sha256|*.sha512|*.sig)
+            ext=".${name##*.}"
+            base=$(_act_native_variant_artifact_name "$tool" "$platform" "$triple" "${name%.*}") || return 4
+            printf '%s%s\n' "$base" "$ext"
+            return 0
+            ;;
+    esac
+    printf '%s-%s%s\n' "$base" "$triple" "$ext"
 }
 
 _act_generate_contract_manifest() {
@@ -10848,6 +11187,7 @@ act_generate_manifest() {
     local artifacts=()
     local seen_paths=()
     local -A seen_names=()
+    local -A seen_native_paths=()
 
     # Map a filename's embedded platform suffix to a canonical "<os>/<arch>"
     # target. Returns empty if no recognizable suffix is present. Used to
@@ -10886,8 +11226,12 @@ act_generate_manifest() {
     _act_manifest_add_file() {
         local file="$1"
         local target="$2"
+        local declared_triple="${3:-}" native_result="${4:-false}"
 
-        [[ -z "$file" || ! -f "$file" ]] && return 0
+        if [[ -z "$file" || ! -f "$file" ]]; then
+            [[ "$native_result" != true ]] || return 4
+            return 0
+        fi
         [[ -z "$target" ]] && return 0
 
         local name
@@ -10898,6 +11242,16 @@ act_generate_manifest() {
                 return 0
                 ;;
         esac
+        if [[ "$native_result" == true ]]; then
+            [[ ! -L "$file" ]] || return 4
+            name=$(_act_native_variant_artifact_name "$tool" "$target" "$declared_triple" "$name") || return 4
+            if [[ -n "${seen_native_paths[$file]:-}" && \
+                  "${seen_native_paths[$file]}" != "$target|$declared_triple" ]]; then
+                _log_error "Native artifact path is shared by distinct variants: $file"
+                return 4
+            fi
+            seen_native_paths["$file"]="$target|$declared_triple"
+        fi
 
         # Skip exact-path duplicates AND name-collision duplicates. Without
         # the name dedup the manifest gets one entry per orchestration target
@@ -10908,7 +11262,7 @@ act_generate_manifest() {
         for seen in "${seen_paths[@]}"; do
             [[ "$seen" == "$file" ]] && return 0
         done
-        if [[ -n "${seen_names[$name]:-}" ]]; then
+        if [[ -n "${seen_names[$name]:-}" && "$native_result" != true ]]; then
             return 0
         fi
 
@@ -10925,6 +11279,13 @@ act_generate_manifest() {
             _log_warn "Unable to determine size for artifact: $file"
             return 0
         fi
+        if [[ -n "${seen_names[$name]:-}" ]]; then
+            if [[ "${seen_names[$name]}" != "$sha" ]]; then
+                _log_error "Native artifacts have the same release name and different bytes: $name"
+                return 4
+            fi
+            return 0
+        fi
 
         # If the filename embeds a recognizable platform suffix, trust it
         # over the orchestration-step target — the latter is unreliable when
@@ -10932,17 +11293,24 @@ act_generate_manifest() {
         # act job.
         local inferred_target
         inferred_target=$(_act_infer_target_from_name "$name")
-        if [[ -n "$inferred_target" ]]; then
+        if [[ "$native_result" == true && -n "$inferred_target" && "$inferred_target" != "$target" ]]; then
+            _log_error "Native artifact platform contradicts its worker result: $name ($target)"
+            return 4
+        elif [[ -n "$inferred_target" ]]; then
             target="$inferred_target"
         fi
         local target_triple
-        target_triple=$(_act_manifest_target_triple "$target" "$name") || return 4
+        if [[ "$native_result" == true && -n "$declared_triple" ]]; then
+            target_triple="$declared_triple"
+        else
+            target_triple=$(_act_manifest_target_triple "$target" "$name") || return 4
+        fi
 
         local sig_file=""
         local signed=false
         if [[ -f "${file}.minisig" ]]; then
             signed=true
-            sig_file=$(basename "${file}.minisig")
+            sig_file="${name}.minisig"
         fi
 
         local artifact_json
@@ -10969,7 +11337,7 @@ act_generate_manifest() {
         artifacts+=("$artifact_json")
         # shellcheck disable=SC2190 # Indexed array; separate functions use an associative array with this name.
         seen_paths+=("$file")
-        seen_names["$name"]=1
+        seen_names["$name"]="$sha"
     }
 
     _act_sha256_zip_entry() {
@@ -11101,29 +11469,39 @@ act_generate_manifest() {
             artifacts+=("$artifact_json")
             # shellcheck disable=SC2190 # Indexed array; separate functions use an associative array with this name.
             seen_paths+=("$seen_key")
-            seen_names["$name"]=1
+            seen_names["$name"]="$sha"
         done
     }
 
     while IFS= read -r target_json; do
         [[ -z "$target_json" ]] && continue
-        local target
+        local target method native_result=false declared_triple="" array_count
         target=$(echo "$target_json" | jq -r '.platform // .target // empty' 2>/dev/null)
+        method=$(jq -r '.method // empty' <<< "$target_json")
+        if [[ "$method" == native ]]; then
+            native_result=true
+            declared_triple=$(_act_native_result_target_triple "$tool" "$target_json") || return 4
+        fi
         local artifact_path
-        artifact_path=$(echo "$target_json" | jq -r '.artifact_path // empty' 2>/dev/null)
         local artifact_dir
         artifact_dir=$(echo "$target_json" | jq -r '.artifact_dir // empty' 2>/dev/null)
-
-        if [[ -n "$artifact_path" && -f "$artifact_path" ]]; then
-            _act_manifest_add_file "$artifact_path" "$target" || return $?
-        fi
+        array_count=$(jq -er '(.artifact_paths // []) |
+            if type == "array" and all(.[]; type == "string" and length > 0)
+            then length else error("invalid artifact_paths") end' <<< "$target_json") || return 4
+        while IFS= read -r -d '' artifact_path; do
+            [[ -n "$artifact_path" ]] || continue
+            _act_manifest_add_file "$artifact_path" "$target" "$declared_triple" "$native_result" || return $?
+        done < <(jq -j --argjson count "$array_count" '
+            (if $count > 0 then .artifact_paths[] else
+                (.artifact_path // "" | split(",")[]) end) | ., "\u0000"
+        ' <<< "$target_json")
 
         if [[ -n "$artifact_dir" && -d "$artifact_dir" ]]; then
             while IFS= read -r -d '' file; do
-                if [[ "$file" == *.zip ]]; then
+                if act_artifact_zip_is_wrapper "$method" "$file"; then
                     _act_manifest_add_zip_entries "$file" "$target" || return $?
                 else
-                    _act_manifest_add_file "$file" "$target" || return $?
+                    _act_manifest_add_file "$file" "$target" "$declared_triple" "$native_result" || return $?
                 fi
             done < <(find "$artifact_dir" -type f -print0 2>/dev/null)
         fi

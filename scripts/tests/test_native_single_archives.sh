@@ -151,7 +151,7 @@ artifact_naming_generate_dual_for_tool() {
 _test_native_packaging() {
     local config_file="$2" local_path="$3" release_git_sha="$4"
     local platform="$5" artifact_dir="$6" compiled="$7"
-    local tool_name=app version=v1.2.3 strict_native_build=true
+    local tool_name=app version=v1.2.3 strict_native_build=true selected_triple=''
     local status=success exit_code=0 log_file="$artifact_dir/build.log"
     local collected_sha256='' collected_size_bytes=0 collected_identity=''
     local workspace_binaries binary_name bin receipt

@@ -3798,7 +3798,7 @@ test_failed_target_relocation() (
         if $scope == "global" then .build_cmd="inherited" | del(.cross_compile[$target].build_cmd) else . end' > "$config"
     good_hash=$(_act_sha256 "$good")
     receipt=$(jq -nc --arg path "$good" --arg hash "$good_hash" \
-        '{status:"success",host:"trj",platform:"linux/amd64",build_purpose:"release",publishable:true,artifact_path:$path,collected_sha256:$hash}')
+        '{status:"success",host:"trj",platform:"linux/amd64",task_key:"linux/amd64",build_purpose:"release",publishable:true,artifact_path:$path,collected_sha256:$hash}')
     printf '%s\n' "$receipt" > "$good_sidecar"
     failure=$(jq -nc --arg sha "$sha" --arg target "$failed_target" \
         '{status:"failed",host:"wlap",platform:$target,build_purpose:"release",publishable:true,
