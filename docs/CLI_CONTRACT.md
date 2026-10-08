@@ -691,11 +691,23 @@ unpublished and suppresses dispatch and upgrade hooks.
 
 Strict native builds trust the configured build host and its installed
 compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and
-records the explicit build-influence environment. Both strict and ordinary
-native Rust builds copy `registry` and `git` into independent Cargo homes.
+records the explicit build-influence environment. Native Rust builds use
+independent Cargo homes. Strict Unix builds copy only downloads selected by the
+committed `Cargo.lock`: checksum-matching archives, corresponding sparse index
+records or matching legacy Git indexes, and Git databases containing pinned
+commits. Cargo recreates extracted registry sources and Git checkouts offline;
+unrelated ambient working copies, links, special files, and archives are not
+opened or copied. A lockfile without Git dependencies does not inspect the Git
+cache. Selection conservatively covers all lockfile packages, not a minimal
+target/feature graph, and selected Git databases/indexes retain their history.
+Strict Windows and ordinary native builds copy the `registry` and `git` caches.
 Metadata and target attempts never compile through ambient cache symlinks or
 Windows junctions. Strict metadata admits a retained seed only after successful
-locked offline resolution; retries verify it before making another private copy.
+locked offline resolution and source authentication; Unix retained seeds contain
+only the selected downloads. Retries verify the retained inventory and original
+lockfile selection before making another private copy. The selection kind,
+lockfile hash, registry-package count and Git revisions are retained in the
+Unix seed summary under `cargo_isolation.dependency_cache.seed.selection`.
 Collection requires the original seed-receipt digest and a valid final inventory,
 retained under `cargo_isolation.dependency_cache` with `cache_reuse: []`.
 Windows uses PowerShell 7 and native NTFS handles, rejects reparses and external

@@ -452,7 +452,9 @@ _act_ssh_exec() {
             '{schema_version:1, mode:$mode, cargo_home:$home, receipt_path:$receipt,
               receipt_sha256:("1" * 64), inventory_sha256:("2" * 64),
               caches:["git","registry"], file_count:6, size_bytes:256}
-             + (if $mode == "private-copy" then {dependency_sources:$sources} else {} end)'
+             + (if $mode == "private-copy" then {dependency_sources:$sources,
+                 selection:{kind:"cargo-lock-downloads",lockfile_sha256:$sources.authentication.lockfile_sha256,
+                     registry_packages:1,git_revisions:[("a" * 40)]}} else {} end)'
         return 0
     fi
     if [[ "$exit_code" -eq 0 && "$cmd" == *"Cargo target source identity mismatch"* && \

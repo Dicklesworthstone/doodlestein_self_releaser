@@ -316,6 +316,10 @@
         "inventory_sha256", "caches", "file_count", "size_bytes"
       ],
       "additionalProperties": false,
+      "allOf": [{
+        "if": {"required": ["selection"]},
+        "then": {"properties": {"mode": {"const": "private-copy"}}}
+      }],
       "properties": {
         "schema_version": {"const": 1},
         "mode": {"enum": ["private-copy", "inventory"]},
@@ -325,7 +329,22 @@
         "inventory_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "caches": {"type": "array", "items": {"enum": ["registry", "git"]}, "uniqueItems": true},
         "file_count": {"type": "integer", "minimum": 0},
-        "size_bytes": {"type": "integer", "minimum": 0}
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "selection": {
+          "type": "object",
+          "description": "Conservative downloads selected from the committed Cargo.lock before offline metadata. Excludes ambient extracted registry sources and Git checkouts; selected Git databases retain their history.",
+          "required": ["kind", "lockfile_sha256", "registry_packages", "git_revisions"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {"const": "cargo-lock-downloads"},
+            "lockfile_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "registry_packages": {"type": "integer", "minimum": 0, "maximum": 10000},
+            "git_revisions": {
+              "type": "array", "maxItems": 10000, "uniqueItems": true,
+              "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+            }
+          }
+        }
       }
     },
     "cargo_dependency_sources": {

@@ -4492,10 +4492,11 @@ _dsr_cargo_sources_hash '$cargo_home/.dsr-cargo-sources.json' '$sources_digest' 
 EOF
 }
 
-# The canonical home is a retained seed: Cargo never writes to it. Metadata
-# and every target attempt receive independent inodes in a fresh home. This
-# lets resume verify its seed even after the ambient cache has been removed,
-# while normal Cargo unpacking cannot race another target's cache inventory.
+# The canonical home retains only downloads selected by the admitted lockfile:
+# Cargo never writes to it. Metadata and every target attempt receive independent
+# inodes and recreate their own authenticated source trees. Resume can verify its
+# seed after the ambient cache disappears, without importing unrelated packages
+# or letting normal unpacking race another target's cache inventory.
 _act_unix_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
     [[ "$source_root" =~ ^/[A-Za-z0-9_./+-]+$ && "$source_root" != *..* &&
@@ -4511,13 +4512,15 @@ dsr_seed_pending=false
 if test -e "\$dsr_seed_home" || test -L "\$dsr_seed_home"; then
     _dsr_cargo_home_guard "\$dsr_seed_home"
     dsr_seed_summary=\$(_cargo_cache_run verify "\$dsr_seed_home" "\$dsr_seed_home/.dsr-cache-seed.json")
-    dsr_private_summary=\$(_cargo_cache_run snapshot "\$dsr_seed_home" "\$strict_home")
+    dsr_private_summary=\$(_cargo_cache_run snapshot "\$dsr_seed_home" "\$strict_home" "\$physical_source_root/Cargo.lock")
     python3 -I - "\$dsr_seed_summary" "\$dsr_private_summary" <<'DSR_PRIVATE_CACHE_COMPARE'
 import json, sys
 seed, private = (json.loads(value) for value in sys.argv[1:])
 if (seed['mode'] != 'private-copy' or private['mode'] != 'private-copy' or
+        seed.get('selection', {}).get('kind') != 'cargo-lock-downloads' or
+        seed.get('selection') != private.get('selection') or
         seed['inventory_sha256'] != private['inventory_sha256']):
-    sys.exit('private Cargo cache seed changed during preparation')
+    sys.exit('private Cargo cache seed or lockfile selection changed during preparation')
 DSR_PRIVATE_CACHE_COMPARE
 else
     # Do not publish an incomplete seed if offline metadata cannot resolve
@@ -4525,7 +4528,7 @@ else
     # replacing an admitted seed or overwriting the failed private attempt.
     ambient_home=\${CARGO_HOME:-\$HOME/.cargo}
     if test ! -e "\$ambient_home" && test ! -L "\$ambient_home"; then ambient_home=; fi
-    dsr_private_summary=\$(_cargo_cache_run snapshot "\$ambient_home" "\$strict_home")
+    dsr_private_summary=\$(_cargo_cache_run snapshot "\$ambient_home" "\$strict_home" "\$physical_source_root/Cargo.lock")
     dsr_seed_pending=true
 fi
 _dsr_cargo_home_guard "\$strict_home"
@@ -4580,7 +4583,7 @@ print(json.dumps(summary, sort_keys=True, separators=(',', ':')))
 DSR_CARGO_SOURCE_SUMMARY
 )
 if $dsr_seed_pending; then
-    _cargo_cache_run snapshot "$strict_home" "$dsr_seed_home" >/dev/null
+    _cargo_cache_run snapshot "$strict_home" "$dsr_seed_home" "$physical_source_root/Cargo.lock" >/dev/null
 fi
 SH
 }
@@ -4610,7 +4613,9 @@ SH
             (.cargo_home | type == "string" and startswith("/")) and
             .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
             (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
-            (.inventory_sha256 | test("^[0-9a-f]{64}$")))
+            (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
+            .selection.kind == "cargo-lock-downloads" and
+            .selection.lockfile_sha256 == .dependency_sources.authentication.lockfile_sha256)
     ' <<< "$summary"
 }
 

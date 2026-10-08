@@ -15,6 +15,7 @@ import sys
 import tempfile
 import tarfile
 import unittest
+from unittest.mock import patch
 
 MODULE = sys.argv.pop(1)
 
@@ -326,6 +327,7 @@ class LockedCacheTests(unittest.TestCase):
         evidence = json.loads(Path(result['receipt_path']).read_bytes())
         self.assertEqual(evidence['selection']['lockfile_sha256'], hashlib.sha256(self.lock.read_bytes()).hexdigest())
         self.assertEqual(evidence['selection']['kind'], 'cargo-lock-downloads')
+        self.assertEqual(result['selection'], evidence['selection'])
         self.assertEqual(self.invoke('verify', self.home, result['receipt_path']), result)
 
     def test_unrelated_symlinks_fifos_and_extracted_poison_are_irrelevant(self):
@@ -483,6 +485,40 @@ class LockedCacheTests(unittest.TestCase):
         self.git('clone', '-q', '--no-hardlinks', self.copied(database), checkout)
         self.git('-C', checkout, 'checkout', '-q', sha)
         self.assertEqual((checkout / 'lib.rs').read_text(), 'pub fn value() -> u32 { 42 }\n')
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_selecting_git_downloads_never_fetches_from_unrelated_partial_clones(self):
+        database, sha = self.make_git_database('selected-123')
+        unrelated = self.source / 'git/db/unrelated-partial'
+        self.git('init', '-q', '--bare', unrelated)
+        for key, value in (('remote.origin.url', 'review::local-only'),
+                           ('remote.origin.promisor', 'true'),
+                           ('extensions.partialClone', 'origin'),
+                           ('protocol.review.allow', 'always')):
+            self.git('--git-dir=' + str(unrelated), 'config', key, value)
+        helpers = self.root / 'helpers'
+        helpers.mkdir()
+        helper = helpers / 'git-remote-review'
+        helper.write_text('#!/bin/sh\nprintf invoked > "$DSR_PROMISOR_MARKER"\nexit 1\n')
+        helper.chmod(0o700)
+        marker = self.root / 'remote-invoked'
+        environment = dict(os.environ, PATH=str(helpers) + os.pathsep + os.environ.get('PATH', ''),
+                           DSR_PROMISOR_MARKER=str(marker), GIT_NO_LAZY_FETCH='0', GIT_ALLOW_PROTOCOL='review')
+        # Real Git demonstrates that a read-only-looking object probe fetches
+        # without DSR's isolation, even if generic protocol policy says never.
+        subprocess.run(['git', '--git-dir=' + str(unrelated), '-c', 'protocol.allow=never',
+                        'cat-file', '--batch-check'], input=sha + '\n',
+                       text=True, capture_output=True, timeout=15, env=environment)
+        self.assertTrue(marker.is_file(), 'promisor control must exercise the real remote helper')
+        marker.rename(self.root / 'retained-control-invocation')
+        self.write_lock([{'name': 'helper', 'version': '1.0.0', 'source': 'git+https://example.invalid/helper#' + sha}])
+        with patch.dict(os.environ, environment):
+            result = self.scoped()
+        self.assertFalse(marker.exists(), 'cache selection must not invoke any remote helper')
+        self.assertEqual(result['caches'], ['git'])
+        self.assertTrue(self.copied(database).is_dir())
+        self.assertFalse(self.copied(unrelated).exists())
         self.invoke('verify', self.home, result['receipt_path'])
 
     @unittest.skipUnless(shutil.which('git'), 'Git not installed')

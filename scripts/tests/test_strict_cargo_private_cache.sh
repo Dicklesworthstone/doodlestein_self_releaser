@@ -3,10 +3,17 @@
 # caches. Git/Cargo/filesystem operations are real; SSH is executed locally.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+MODE=all
+if [[ "${1:-}" == --locked-downloads-only && $# == 1 ]]; then
+    MODE=locked-downloads
+elif (( $# != 0 )); then
+    printf 'Usage: %s [--locked-downloads-only]\n' "$0" >&2
+    exit 4
+fi
 for tool in python3 bash git cargo rustc jq yq; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
 done
-python3 -I - "$ROOT" <<'PY'
+python3 -I - "$ROOT" "$MODE" <<'PY'
 import functools
 import hashlib
 import http.server
@@ -24,6 +31,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 root = Path(sys.argv[1])
+mode = sys.argv[2]
 module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
 os.umask(0o077)
 work = Path(tempfile.mkdtemp(prefix='dsr-strict-cargo-private-')).resolve()
@@ -132,9 +140,11 @@ finally:
     server.shutdown()
     server.server_close()
     server_thread.join()
-registry_file = ambient / 'registry/cache/fixture/payload.crate'
-registry_file.parent.mkdir(parents=True)
-registry_file.write_bytes(b'ambient registry marker\n')
+registry_file = next(ambient.glob('registry/cache/*/registry_dependency-1.0.0.crate'))
+registry_bytes = registry_file.read_bytes()
+unrelated_marker = ambient / 'registry/cache/fixture/payload.crate'
+unrelated_marker.parent.mkdir(parents=True)
+unrelated_marker.write_bytes(b'ambient registry marker\n')
 seed = source.parent / '.cargo-home'
 
 program = r'''
@@ -159,8 +169,87 @@ def shell(function, *args, env=None):
 
 def metadata(label):
     result = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(source))
+    if result.returncode:
+        print(result.stderr.decode(), flush=True)
     check(label, result.returncode == 0)
     return json.loads(result.stdout)
+
+
+def isolated_source(label):
+    destination = work / ('admission-' + label) / 'source'
+    shutil.copytree(source, destination)
+    return destination
+
+
+def admission_build(label, fixture_source, successful=True, expected='42:42', env=None):
+    sentinel = work / (label + '-compiler-started')
+    probe = work / (label + '-private-home')
+    (configs / 'cache-probe.yaml').write_text(json.dumps({
+        'tool_name': 'cache-probe', 'repo': 'fixture/cache-probe', 'local_path': str(fixture_source),
+        'language': 'rust', 'binary_name': 'cache-probe', 'build_profile': 'debug',
+        'linux_glibc_floor': 'native',
+        'build_cmd': ('printf started > "$DSR_SOURCE_SENTINEL"; '
+                      'printf "%s\\n" "$CARGO_HOME" > "$DSR_CACHE_PROBE"; '
+                      'cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET"'),
+        'env': {'CARGO_BUILD_TARGET': triple, 'DSR_SOURCE_SENTINEL': str(sentinel),
+                'DSR_CACHE_PROBE': str(probe)},
+    }))
+    result = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', label,
+                   str(fixture_source), env=env)
+    rows = [line for line in result.stdout.splitlines() if line.startswith(b'{')]
+    report = json.loads(rows[-1]) if rows else {}
+    if (result.returncode == 0) != successful:
+        print(result.stderr.decode(), flush=True)
+    if successful:
+        check(label + ' compiles and collects through the native coordinator',
+              result.returncode == 0 and report.get('status') == 'success' and sentinel.exists())
+        check(label + ' collected executable uses the authentic dependency bytes',
+              require([report['artifact_path']]).strip() == expected)
+        return report, Path(probe.read_text().strip())
+    check(label + ' refuses the native compiler and artifact admission',
+          result.returncode != 0 and not sentinel.exists() and not report.get('artifact_paths') and
+          not report.get('collected_sha256') and not (fixture_source.parent / '.cargo-home').exists())
+    return report, None
+
+
+def refused_download(label, damage):
+    fixture_source = isolated_source(label)
+    fixture_ambient = work / ('ambient-' + label)
+    fixture_archive = fixture_ambient / registry_file.relative_to(ambient)
+    fixture_archive.parent.mkdir(parents=True)
+    shutil.copytree(ambient / 'registry/index', fixture_ambient / 'registry/index')
+    shutil.copytree(registry_source.parent.parent,
+                    fixture_ambient / registry_source.parent.parent.relative_to(ambient))
+    shutil.copytree(git_source.parent.parent,
+                    fixture_ambient / git_source.parent.parent.relative_to(ambient))
+    if damage == 'linked-archive':
+        fixture_archive.symlink_to(registry_file)
+    elif damage != 'missing-archive':
+        fixture_archive.write_bytes(b'not the locked crate archive\n' if damage == 'corrupt-archive' else registry_bytes)
+    if damage != 'missing-git':
+        fixture_database = fixture_ambient / git_database.relative_to(ambient)
+        shutil.copytree(git_database, fixture_database)
+        if damage == 'corrupt-git':
+            object_path = fixture_database / 'objects' / revision[:2] / revision[2:]
+            if not object_path.is_file():
+                object_path = next((fixture_database / 'objects/pack').glob('*.pack'))
+            object_path.chmod(object_path.stat().st_mode | 0o200)
+            object_path.write_bytes(b'not a valid locked Git object\n')
+    fixture_env = dict(environment, CARGO_HOME=str(fixture_ambient))
+    if damage == 'missing-archive':
+        check('the required archive was never populated before metadata', not fixture_archive.exists())
+    if damage == 'missing-git':
+        check('the required Git database was never populated before metadata',
+              not (fixture_ambient / 'git/db').exists())
+    refused = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(fixture_source), env=fixture_env)
+    check(label + ' cannot authorize metadata or admit a retained seed',
+          refused.returncode != 0 and not refused.stdout and not (fixture_source.parent / '.cargo-home').exists())
+    if damage == 'missing-archive':
+        check('the required archive is still absent before native admission', not fixture_archive.exists())
+    if damage == 'missing-git':
+        check('the required Git database is still absent before native admission',
+              not (fixture_ambient / 'git/db').exists())
+    admission_build(label, fixture_source, successful=False, env=fixture_env)
 
 
 ambient.rename(work / 'warmed-ambient')
@@ -183,28 +272,86 @@ def baseline(label):
 check('real locked offline Cargo consumes the original registry and Git dependencies', baseline('original') == '42:42')
 registry_source = next(ambient.glob('registry/src/*/registry_dependency-1.0.0/src/lib.rs'))
 git_source = next((ambient / 'git/checkouts').rglob('src/lib.rs'))
+git_database = next((ambient / 'git/db').iterdir())
+# Issue #32: these objects belong to unrelated historical dependencies. They
+# must neither enter the seed nor prevent the locked workspace from compiling.
+unrelated_checkout = ambient / 'git/checkouts/unrelated-history/deadbeef/k9'
+unrelated_checkout.mkdir(parents=True)
+(unrelated_checkout / 'LICENSE').symlink_to('/missing/unrelated-cache-license')
+unrelated_extraction = ambient / 'registry/src/unrelated-history/unused-99.0.0'
+unrelated_extraction.mkdir(parents=True)
+os.mkfifo(unrelated_extraction / 'unrelated-fifo')
+large_archive = registry_file.parent / 'unused-99.0.0.crate'
+with large_archive.open('wb') as output:
+    output.truncate(1024 * 1024 * 1024)
+scoped_source = isolated_source('unrelated-cache')
+scoped_report, scoped_home = admission_build('unrelated-cache', scoped_source)
+scoped_seed = scoped_source.parent / '.cargo-home'
+scoped_receipt = json.loads((scoped_seed / '.dsr-cache-seed.json').read_bytes())
+check('the admitted retained seed records its committed lockfile selection',
+      scoped_receipt['selection']['kind'] == 'cargo-lock-downloads' and
+      scoped_receipt['selection']['lockfile_sha256'] == digest(scoped_source / 'Cargo.lock'))
+check('retained seeds and initial attempt inventories contain only locked downloads',
+      not (scoped_seed / 'registry/src').exists() and not (scoped_seed / 'git/checkouts').exists() and
+      all(not entry['path'].startswith(('registry/src/', 'git/checkouts/'))
+          for entry in json.loads((scoped_home / '.dsr-cache-seed.json').read_bytes())['inventory']['files']))
+for label, excluded in (('unrelated archive', large_archive), ('unrelated marker', unrelated_marker),
+                        ('unrelated checkout symlink', unrelated_checkout / 'LICENSE'),
+                        ('unrelated extracted FIFO', unrelated_extraction / 'unrelated-fifo')):
+    relative = excluded.relative_to(ambient)
+    check(label + ' never enters the retained or compiling Cargo home',
+          not os.path.lexists(scoped_seed / relative) and not os.path.lexists(scoped_home / relative))
+check('a one-GiB unrelated download leaves the real fixture seed below one MiB',
+      large_archive.stat().st_size == 1024 * 1024 * 1024 and
+      scoped_report['cargo_isolation']['dependency_cache']['seed']['size_bytes'] < 1024 * 1024)
+
+# Registry-only releases commonly run on hosts whose unused Git cache lives on
+# another volume. Resolve the real registry dependency, then keep that Git root
+# as a symlink for both native metadata and compilation.
+registry_only_source = isolated_source('registry-only')
+(registry_only_source / 'Cargo.toml').write_text(
+    '[package]\nname="cache-probe"\nversion="1.0.0"\nedition="2021"\n'
+    '[dependencies]\nregistry_dependency={version="=1.0.0",registry="fixture"}\n')
+(registry_only_source / 'src/main.rs').write_text('fn main() { println!("{}", registry_dependency::value()); }\n')
+registry_only_ambient = work / 'registry-only-ambient'
+registry_only_archive = registry_only_ambient / registry_file.relative_to(ambient)
+registry_only_archive.parent.mkdir(parents=True)
+registry_only_archive.write_bytes(registry_bytes)
+shutil.copytree(ambient / 'registry/index', registry_only_ambient / 'registry/index')
+(registry_only_ambient / 'git').symlink_to(ambient / 'git', target_is_directory=True)
+registry_only_env = dict(environment, CARGO_HOME=str(registry_only_ambient))
+require(['cargo', 'generate-lockfile', '--offline'], env=registry_only_env, cwd=registry_only_source)
+registry_report, registry_home = admission_build('unused-git-root-link', registry_only_source,
+                                               expected='42', env=registry_only_env)
+check('registry-only admission never opens or copies the linked unused Git root',
+      (registry_only_ambient / 'git').is_symlink() and not (registry_home / 'git').exists() and
+      not (registry_only_source.parent / '.cargo-home/git').exists() and
+      registry_report['cargo_isolation']['dependency_sources']['authentication']['locked_git_packages'] == 0)
+
 for kind, cached_source, expected in (
     ('registry', registry_source, '42:43'), ('git', git_source, '43:42'),
 ):
     original = cached_source.read_bytes()
     cached_source.write_text('pub fn value() -> u32 { 43 }\n')
     check(kind + ' cache poison changes a genuine locked offline Cargo executable', baseline(kind + '-poison') == expected)
-    refused = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(source))
-    check(kind + ' poison cannot obtain metadata authority or publish a retained seed',
-          refused.returncode != 0 and not refused.stdout and not seed.exists() and
-          b'locked content' in refused.stderr)
-    sentinel = work / (kind + '-compiler-started')
-    (configs / 'cache-probe.yaml').write_text(json.dumps({
-        'tool_name': 'cache-probe', 'repo': 'fixture/cache-probe', 'local_path': str(source),
-        'language': 'rust', 'binary_name': 'cache-probe', 'build_profile': 'debug',
-        'linux_glibc_floor': 'native',
-        'build_cmd': 'printf started > "$DSR_SOURCE_SENTINEL"; cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET"',
-        'env': {'CARGO_BUILD_TARGET': triple, 'DSR_SOURCE_SENTINEL': str(sentinel)},
-    }))
-    refused_build = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', kind + '-poison', str(source))
-    check(kind + ' poison is refused before the native compiler command begins',
-          refused_build.returncode != 0 and not sentinel.exists() and not seed.exists())
+    report, private_home = admission_build(kind + '-extracted-poison', isolated_source(kind + '-poison'))
+    private_source = private_home / cached_source.relative_to(ambient)
+    check(kind + ' sources are recreated from locked downloads instead of poisoned extraction',
+          private_source.read_bytes() == original and
+          private_source.stat().st_ino != cached_source.stat().st_ino)
     cached_source.write_bytes(original)
+
+# Discarding untrusted extractions must not turn missing or corrupt required
+# downloads into a fallback to those extractions. Every case starts without a
+# retained seed so an earlier successful build cannot mask the unavailable pin.
+for label, damage in (
+    ('corrupt-required-archive', 'corrupt-archive'),
+    ('missing-required-archive', 'missing-archive'),
+    ('linked-required-archive', 'linked-archive'),
+    ('corrupt-required-git-object', 'corrupt-git'),
+    ('missing-required-git-database', 'missing-git'),
+):
+    refused_download(label, damage)
 
 (ambient / 'config.toml').write_text('[build]\nrustc-wrapper="/untrusted/operator-wrapper"\n')
 (ambient / 'credentials.toml').write_text('private credentials must not be copied\n')
@@ -232,12 +379,26 @@ for file in (work / 'retained-ambient/git/checkouts').rglob('src/lib.rs'):
     file.write_text('compile_error!("ambient cache was modified");\n')
 for file in (work / 'retained-ambient/registry/src').rglob('src/lib.rs'):
     file.write_text('compile_error!("ambient registry was modified");\n')
-check('ambient mutation cannot change the retained seed bytes', private_registry.read_bytes() == b'ambient registry marker\n')
+check('ambient mutation cannot change the retained seed bytes', private_registry.read_bytes() == registry_bytes)
 second_metadata = metadata('resume metadata survives missing ambient registry and Git roots')
 check('resume does not replace the seed receipt', digest(seed / '.dsr-cache-seed.json') == seed_receipt_hash)
 second_git_manifest = next(package['manifest_path'] for package in second_metadata['metadata']['packages']
                            if package['name'] == 'cache_dependency')
 check('metadata retries receive distinct private Cargo homes', second_git_manifest != git_manifest)
+check('retained seeds remain download-only after multiple metadata attempts',
+      not (seed / 'registry/src').exists() and not (seed / 'git/checkouts').exists())
+lock_bytes = (source / 'Cargo.lock').read_bytes()
+(source / 'Cargo.lock').write_bytes(lock_bytes + b'\n')
+changed_lock = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(source))
+check('a different lockfile cannot reuse the admitted retained seed',
+      changed_lock.returncode != 0 and not changed_lock.stdout and
+      digest(seed / '.dsr-cache-seed.json') == seed_receipt_hash)
+(source / 'Cargo.lock').write_bytes(lock_bytes)
+metadata('the original lockfile resumes after a refused selection change')
+
+if mode == 'locked-downloads':
+    print(f'Native locked downloads: {checks} assertions passed; real offline compilation and local transport.', flush=True)
+    raise SystemExit(0)
 
 
 def build(label, mutation='', successful=True, preparation='', extra_env=None):
@@ -271,11 +432,11 @@ def build(label, mutation='', successful=True, preparation='', extra_env=None):
 
 report, first_home = build('native offline compilation and collection survive an ambient cache wipe',
     'mkdir -p "$CARGO_HOME/registry/unpacked"; printf unpacked > "$CARGO_HOME/registry/unpacked/new-file"',
-    preparation='mv "$CARGO_HOME/git/checkouts" "$CARGO_HOME/retained-checkouts"; ')
+    preparation='mv "$CARGO_HOME/git/checkouts" "$CARGO_HOME/git/retained-checkouts"; ')
 isolation = report['cargo_isolation']
 cache = isolation['dependency_cache']
 (work / 'native-result.json').write_text(json.dumps(report))
-old_checkout = next((first_home / 'retained-checkouts').rglob('src/lib.rs'))
+old_checkout = next((first_home / 'git/retained-checkouts').rglob('src/lib.rs'))
 new_checkout = next((first_home / 'git/checkouts').rglob('src/lib.rs'))
 check('real Cargo reconstructs its private Git checkout from cached objects offline',
       old_checkout.read_bytes() == new_checkout.read_bytes() and
@@ -355,7 +516,7 @@ retained_marker.rename(work / 'retained-forbidden-config')
 private_registry.write_bytes(b'changed private seed\n')
 blocked = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(source))
 check('changed retained seed bytes block resume', blocked.returncode != 0 and not blocked.stdout)
-private_registry.write_bytes(b'ambient registry marker\n')
+private_registry.write_bytes(registry_bytes)
 metadata('restored seed resumes after a refused mutation')
 
 prepared = shell('_act_prepare_unix_private_cargo_home', 'cache-fixture', str(source), 'collision-check')
@@ -416,12 +577,16 @@ parallel_summaries = [json.loads(result.stdout) for result in parallel]
 parallel_homes = [Path(summary['cargo_home']) for summary in parallel_summaries]
 parallel_files = [home / registry_file.relative_to(ambient) for home in parallel_homes]
 parallel_files[0].write_bytes(b'one target changes its own dependency cache\n')
+parallel_finished = shell('_act_finish_unix_private_cargo_home', 'cache-fixture', str(parallel_homes[1]),
+                          parallel_summaries[1]['receipt_sha256'], str(source),
+                          json.dumps(parallel_summaries[1]['dependency_sources']))
 check('concurrent targets own independent cache inodes and mutations',
       parallel_homes[0] != parallel_homes[1] and
       parallel_files[0].stat().st_ino != parallel_files[1].stat().st_ino and
       parallel_files[1].read_bytes() == private_registry.read_bytes() and
+      parallel_finished.returncode == 0 and
       invoke(['bash', root / 'src/cargo_cache.sh', 'verify', parallel_homes[1],
-              parallel_summaries[1]['receipt_path']]).returncode == 0)
+              json.loads(parallel_finished.stdout)['receipt_path']]).returncode == 0)
 
 # Ordinary (non-strict) native builds stage their source under a fresh root and
 # previously linked the ambient registry into it (issue #15). They now receive

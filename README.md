@@ -234,8 +234,16 @@ useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
-Strict native Rust builds copy the ambient `registry` and `git` download
-caches into private files before Cargo runs. Strict Unix hosts require Python
+Strict native Unix Rust builds seed private Cargo homes with downloads selected
+by the committed `Cargo.lock`: checksum-matching crate archives, their index
+records, and Git databases containing locked commits. Ambient extracted registry
+sources and Git checkouts are never copied; Cargo recreates them offline from
+the selected downloads. Unrelated cached links, special files, and large archives
+do not enter the seed, and an unused Git cache on another volume is not opened.
+Selection covers the complete lockfile, including other targets and features;
+selected Git databases retain their history. It is not a minimal target graph.
+Strict Windows builds copy the ambient `registry` and `git` caches into private
+files before Cargo runs. Strict Unix hosts require Python
 3.11+; strict Windows hosts require PowerShell 7.4+ and a local NTFS Cargo cache. Configuration,
 credentials, symlinks, Windows reparse points, and external Git storage
 pointers are excluded or refused. The first successful locked, offline metadata
@@ -243,7 +251,9 @@ resolution publishes a retained seed alongside the source snapshot. If that
 first resolution lacks dependencies, no seed is published: refill the ambient
 cache and retry. Once admitted, the seed survives deletion or in-place changes
 to the ambient cache, and every metadata invocation and target attempt receives
-a fresh copy. Parallel targets therefore do not share writable dependency files.
+a fresh copy. Unix retained seeds contain downloads only, even after metadata
+has unpacked sources, and retries must match the seed's original lockfile
+selection. Parallel targets therefore do not share writable dependency files.
 
 Before a strict native seed is admitted, DSR authenticates the resolved
 dependency source files against the committed `Cargo.lock`. Registry archives

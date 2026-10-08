@@ -354,8 +354,12 @@ def locked_selection(source, lockfile):
 
     def git_probe(directory, arguments, incoming=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        # Object availability is a local read. A partial clone must not fetch
+        # from its promisor remote while we inspect unrelated database routes.
+        # The empty protocol allowlist also overrides repository-local policy.
         env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
-                   GIT_NO_REPLACE_OBJECTS='1', GIT_OPTIONAL_LOCKS='0', GIT_TERMINAL_PROMPT='0')
+                   GIT_NO_REPLACE_OBJECTS='1', GIT_OPTIONAL_LOCKS='0', GIT_TERMINAL_PROMPT='0',
+                   GIT_NO_LAZY_FETCH='1', GIT_ALLOW_PROTOCOL='')
         try:
             result = subprocess.run(['git', '--git-dir=' + directory, '-c', 'core.fsmonitor=false',
                                      '-c', 'core.hooksPath=' + os.devnull] + arguments,
@@ -434,11 +438,14 @@ def new_receipt(path, value):
 
 def summary(path, receipt, digest):
     entries = receipt['inventory']['files']
-    return {'schema_version': 1, 'mode': receipt['kind'], 'cargo_home': receipt['cargo_home'],
-            'receipt_path': path, 'receipt_sha256': digest,
-            'inventory_sha256': hashlib.sha256(canonical(receipt['inventory'])).hexdigest(),
-            'caches': receipt['inventory']['caches'], 'file_count': len(entries),
-            'size_bytes': sum(entry['size_bytes'] for entry in entries)}
+    result = {'schema_version': 1, 'mode': receipt['kind'], 'cargo_home': receipt['cargo_home'],
+              'receipt_path': path, 'receipt_sha256': digest,
+              'inventory_sha256': hashlib.sha256(canonical(receipt['inventory'])).hexdigest(),
+              'caches': receipt['inventory']['caches'], 'file_count': len(entries),
+              'size_bytes': sum(entry['size_bytes'] for entry in entries)}
+    if 'selection' in receipt:
+        result['selection'] = receipt['selection']
+    return result
 
 
 def main(args):

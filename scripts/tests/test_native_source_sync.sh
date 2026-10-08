@@ -357,6 +357,16 @@ test_strict_publication() {
         $sources.authentication.locked_git_packages==0 and
         $sources.authentication.workspace_snapshot_packages==0 and
         ($isolation.dependency_cache.seed | has("dependency_sources") | not)' "$WORK/strict-seal.json"
+    check 'public strict target preserves its committed lockfile download selection through state and manifest' jq -e \
+        --arg lockfile_sha "$(_act_sha256 "$WORK/source/Cargo.lock")" \
+        --slurpfile manifest "$strict_manifest" --slurpfile state "$WORK/strict-state.json" '
+        .details.targets[0].cargo_isolation.dependency_cache as $cache |
+        $cache.seed.selection as $selection |
+        $selection=={kind:"cargo-lock-downloads",lockfile_sha256:$lockfile_sha,
+            registry_packages:0,git_revisions:[]} and
+        $selection==$manifest[0].build_environments[0].cargo_isolation.dependency_cache.seed.selection and
+        $selection==$state[0].target_statuses["linux/amd64"].result.cargo_isolation.dependency_cache.seed.selection and
+        ($cache.final | has("selection") | not)' "$WORK/strict-seal.json"
     check 'strict publication receipt seals exact manifest bytes and source identity' jq -e \
         --arg sha "$strict_sha" --arg digest "$(_act_sha256 "$strict_manifest")" \
         --slurpfile state "$WORK/strict-state.json" '
