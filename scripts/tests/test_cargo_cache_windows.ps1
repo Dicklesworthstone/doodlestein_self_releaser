@@ -8,7 +8,8 @@ param(
     [switch]$PortableStorageSemantics,
     [string]$BashPath,
     [string]$GeneratedScriptPath,
-    [switch]$InitializeBackendOnly
+    [switch]$InitializeBackendOnly,
+    [switch]$InjectMalformedMetadata
 )
 
 Set-StrictMode -Version Latest
@@ -163,6 +164,20 @@ public sealed class DsrLinuxCacheTestEntry : IDisposable {
 if ($InitializeBackendOnly) { return }
 
 if ($GeneratedScriptPath) {
+    if ($InjectMalformedMetadata) {
+        # Only the metadata result is malformed. Context construction and all
+        # executable identity probes still run the genuine installed tools.
+        $cargoCommandBeforeMetadataFault=(Get-Command Invoke-DsrCargoCommand -CommandType Function).ScriptBlock
+        $metadataFaultCommand={
+            param($Context,[string]$Command,[bool]$CaptureOutput=$false)
+            if ($Context.PSObject.Properties['MetadataCommand'] -and $Command -ceq $Context.MetadataCommand) {
+                [Console]::Error.WriteLine('DSR_TEST_INJECTED_ZERO_EXIT_METADATA')
+                return [pscustomobject]@{ExitCode=0; Stdout='invalid-metadata'; Stderr=''}
+            }
+            return & $cargoCommandBeforeMetadataFault -Context $Context -Command $Command -CaptureOutput $CaptureOutput
+        }.GetNewClosure()
+        Set-Item -LiteralPath Function:Invoke-DsrCargoCommand -Value $metadataFaultCommand
+    }
     & $GeneratedScriptPath
     exit $LASTEXITCODE
 }
@@ -226,7 +241,7 @@ function Invoke-Program {
 
 function Invoke-GeneratedCacheProgram {
     param([ValidateSet('metadata','ordinary','finish')][string]$Operation, [string]$Path,
-        [string]$Argument, [switch]$ExpectFailure)
+        [string]$Argument, [switch]$ExpectFailure, [switch]$InjectMalformedMetadata)
     $generator = @'
 source "$1" || exit $?
 shift
@@ -270,6 +285,7 @@ esac
     $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath,
         '-BackendPath', (Resolve-Path -LiteralPath $BackendPath).Path, '-GeneratedScriptPath', $programPath)
     if ($PortableStorageSemantics) { $arguments += '-PortableStorageSemantics' }
+    if ($InjectMalformedMetadata) { $arguments += '-InjectMalformedMetadata' }
     return Invoke-Program ([Environment]::ProcessPath) $arguments -ExpectFailure:$ExpectFailure
 }
 
@@ -659,27 +675,16 @@ try {
     Assert-Check 'generated strict resume refuses changed retained seed bytes' ($failed.Code -ne 0 -and $failed.Err -match 'inventory|cache')
 
     # A malformed successful command must never admit a seed. This one case
-    # substitutes the cargo command boundary; all compilation cases above and
-    # below continue to execute the actual installed Cargo and Rust compiler.
+    # substitutes only the metadata result after genuine toolchain probes;
+    # every compilation continues to use actual Cargo and the Rust compiler.
     $malformedSource = Join-Path $cargoCase 'malformed-metadata/source'
     Write-FixtureText (Join-Path $malformedSource 'Cargo.toml') ([IO.File]::ReadAllText($manifest))
-    $fakeBin = Join-Path $cargoCase 'malformed-command'
-    if ($script:WindowsHost) {
-        Write-FixtureText (Join-Path $fakeBin 'cargo.cmd') "@echo off`r`necho invalid-metadata`r`nexit /b 0`r`n"
-    } else {
-        $fakeCargo = Join-Path $fakeBin 'cargo'
-        Write-FixtureText $fakeCargo "#!/bin/sh`nprintf '%s\n' 'invalid-metadata'`nexit 0`n"
-        [IO.File]::SetUnixFileMode($fakeCargo, [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute)
-    }
-    $savedPath = $env:PATH
-    try {
-        $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $savedPath
-        $env:CARGO_HOME = $seedHome
-        $failed = Invoke-GeneratedCacheProgram metadata $malformedSource 'metadata-garbage' -ExpectFailure
-        Assert-Check 'command boundary: zero-exit malformed Cargo metadata is refused' ($failed.Code -ne 0 -and $failed.Err -match 'metadata|JSON')
-        Assert-Check 'command boundary: malformed metadata cannot admit a retained seed' (
-            -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $malformedSource) '.cargo-home')))
-    } finally { $env:PATH = $savedPath }
+    $env:CARGO_HOME = $seedHome
+    $failed = Invoke-GeneratedCacheProgram metadata $malformedSource 'metadata-garbage' -ExpectFailure -InjectMalformedMetadata
+    Assert-Check 'command boundary: zero-exit malformed Cargo metadata is refused' (
+        $failed.Code -ne 0 -and $failed.Err -match 'metadata|JSON' -and $failed.Err -match 'DSR_TEST_INJECTED_ZERO_EXIT_METADATA')
+    Assert-Check 'command boundary: malformed metadata cannot admit a retained seed' (
+        -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $malformedSource) '.cargo-home')))
 
     $ordinaryRoot = Join-Path $cargoCase 'ordinary'
     $null = [IO.Directory]::CreateDirectory($ordinaryRoot)
