@@ -492,6 +492,34 @@ function Get-DsrCargoSourceKey {
     return $Name + [char]0 + $Version + [char]0 + $Source
 }
 
+function Assert-DsrCargoSourceBoundary {
+    param([string]$Path, [string]$Root, [switch]$Exact, [switch]$File)
+    $rootGuards = Open-DsrCachePathGuard $Root
+    $pathGuards = $null; $entry = $null
+    try {
+        $directory = if ($File) { ([IO.Path]::GetDirectoryName($Path)).Replace('\','/') } else { $Path }
+        $pathGuards = Open-DsrCachePathGuard $directory
+        $rootId = $rootGuards[$rootGuards.Count-1].FileId
+        $inside = if ($Exact) { $pathGuards[$pathGuards.Count-1].FileId -ceq $rootId }
+            else { @($pathGuards | Where-Object { $_.FileId -ceq $rootId }).Count -gt 0 }
+        if (-not $inside) { throw 'Cargo source path escapes its admitted physical root' }
+        if ($File) {
+            $entry = Open-DsrCacheEntry $Path
+            if ($Exact) {
+                # The workspace's Cargo.lock is the authority. A case-sensitive
+                # NTFS directory can contain a different cargo.lock alongside it.
+                $expected = Open-DsrCacheEntry ($Root.TrimEnd('/') + '/Cargo.lock')
+                try { if ($entry.FileId -cne $expected.FileId) { throw 'Cargo lockfile differs from the admitted physical lockfile' } }
+                finally { $expected.Dispose() }
+            }
+        }
+    } finally {
+        if ($null -ne $entry) { $entry.Dispose() }
+        if ($null -ne $pathGuards) { foreach ($guard in $pathGuards) { $guard.Dispose() } }
+        foreach ($guard in $rootGuards) { $guard.Dispose() }
+    }
+}
+
 function Invoke-DsrCargoSources {
     param([Parameter(Mandatory=$true)][ValidateSet('capture','verify')][string]$Operation,
         [Parameter(Mandatory=$true)][string]$MetadataPath, [Parameter(Mandatory=$true)][string]$ReceiptPath,
@@ -508,6 +536,10 @@ function Invoke-DsrCargoSources {
     if (-not $metadata.PSObject.Properties['workspace_root'] -or
         -not [StringComparer]::OrdinalIgnoreCase.Equals((Get-DsrCacheFullPath $metadata.workspace_root),$source) -or
         -not [StringComparer]::OrdinalIgnoreCase.Equals($lockPath,($source.TrimEnd('/') + '/Cargo.lock'))) { throw 'Cargo metadata workspace or lockfile escapes the admitted source root' }
+    # Path spelling is retained in receipts, but case folding is not ownership:
+    # Windows supports case-sensitive directories containing distinct siblings.
+    Assert-DsrCargoSourceBoundary -Path (Get-DsrCacheFullPath $metadata.workspace_root) -Root $source -Exact
+    Assert-DsrCargoSourceBoundary -Path $lockPath -Root $source -Exact -File
     $rawLock = Get-DsrCargoSourceBytes $lockPath
     $locked = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     foreach ($package in [DsrCargoSourceLock]::Read($rawLock)) {
@@ -539,7 +571,9 @@ function Invoke-DsrCargoSources {
         $package = $byPackage[$id]
         if (-not $package.PSObject.Properties['source'] -or $null -ne $package.source -or
             -not $package.PSObject.Properties['manifest_path']) { throw 'Workspace member is not a local package' }
-        $null = Get-DsrCacheFullPath $package.manifest_path; $pending.Push($id)
+        $localManifest = Get-DsrCacheFullPath $package.manifest_path
+        Assert-DsrCargoSourceBoundary -Path $localManifest -Root $source -File
+        $pending.Push($id)
     }
     $reachable = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
     while ($pending.Count -gt 0) {
@@ -570,9 +604,11 @@ function Invoke-DsrCargoSources {
             $root = $gitPrefix + $relative[0] + '/' + $relative[1]; $kind = 'git'
         } else {
             if (-not (Test-DsrCacheInside $root $source)) { throw 'External directory source needs committed workspace coverage' }
+            Assert-DsrCargoSourceBoundary -Path $root -Root $source
             $descriptor = ConvertFrom-DsrCargoSourceJson (Get-DsrCargoSourceBytes ($root + '/.cargo-checksum.json'))
             if (-not $descriptor.PSObject.Properties['files'] -or $descriptor.files -isnot [pscustomobject]) { throw 'Dependency is not an admitted Cargo directory source' }
         }
+        if ($kind -ne 'directory') { Assert-DsrCargoSourceBoundary -Path $root -Root $homePath }
         if (Test-DsrCacheInside $receiptPathValue $root) { throw 'Receipt cannot be inside dependency sources' }
         if ($roots.ContainsKey($root) -and $roots[$root] -cne $kind) { throw 'Conflicting dependency source root' }
         $roots[$root] = $kind
@@ -584,6 +620,7 @@ function Invoke-DsrCargoSources {
             if (-not $target.PSObject.Properties['src_path']) { throw 'Missing dependency target source' }
             $path = Get-DsrCacheFullPath $target.src_path
             if (-not (Test-DsrCacheInside $path $root) -or $path -ieq $root) { throw 'Dependency target escapes its source tree' }
+            Assert-DsrCargoSourceBoundary -Path $path -Root $root -File
         }
     }
     $trees = [Collections.Generic.List[object]]::new(); $indexed = @{}

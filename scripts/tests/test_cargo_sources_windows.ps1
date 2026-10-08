@@ -348,6 +348,37 @@ try {
     Assert-Check 'genuine workspace without remote dependencies admits an authenticated empty closure' ($simpleSummary.package_count -eq 0 -and
         $simpleSummary.root_count -eq 0 -and $simpleSummary.file_count -eq 0 -and $simpleSummary.authentication.lockfile_sha256 -cmatch '^[0-9a-f]{64}$')
 
+    $caseUpper = $root + '/case-boundary/Project'; $caseLower = $root + '/case-boundary/project'
+    $null = [IO.Directory]::CreateDirectory($caseUpper); $null = [IO.Directory]::CreateDirectory($caseLower)
+    $upperHandle = Open-DsrCacheEntry $caseUpper -Directory $true; $lowerHandle = Open-DsrCacheEntry $caseLower -Directory $true
+    try { $distinctCaseRoots = $upperHandle.FileId -cne $lowerHandle.FileId }
+    finally { $upperHandle.Dispose(); $lowerHandle.Dispose() }
+    if ($distinctCaseRoots) {
+        Assert-Check 'case-sensitive fixture has distinct directories despite case-insensitive path equality' ([StringComparer]::OrdinalIgnoreCase.Equals($caseUpper,$caseLower))
+        foreach ($directory in @($caseUpper,$caseLower)) {
+            Write-FixtureText ($directory + '/Cargo.toml') "[package]`nname=`"case_boundary_app`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
+            Write-FixtureText ($directory + '/src/lib.rs') 'pub fn value() -> u32 { 42 }'
+        }
+        $null = Invoke-Program $cargo @('generate-lockfile','--offline') $caseLower
+        Write-FixtureText ($caseUpper + '/Cargo.lock') ([IO.File]::ReadAllText($caseLower + '/Cargo.lock'))
+        $caseMetadata = $root + '/case-metadata.json'
+        Write-FixtureText $caseMetadata (Invoke-Program $cargo @('metadata','--locked','--offline','--all-features','--format-version','1') $caseLower).Out
+        $caseArguments = @{MetadataPath=$caseMetadata;ReceiptPath=($root + '/case-receipt.json');Lockfile=($caseUpper + '/Cargo.lock');CargoHome=$cargoHomePath;SourceRoot=$caseUpper}
+        Assert-Refused 'distinct case-colliding workspace cannot borrow another physical source root' { Invoke-DsrCargoSources -Operation capture @caseArguments } 'physical root'
+        Assert-Refused 'case-colliding vendor or cache directory cannot borrow physical containment' { Assert-DsrCargoSourceBoundary -Path ($caseLower + '/src') -Root $caseUpper } 'physical root'
+        Assert-Refused 'case-colliding dependency target cannot escape its physical source tree' { Assert-DsrCargoSourceBoundary -Path ($caseLower + '/src/lib.rs') -Root $caseUpper -File } 'physical root'
+        Write-FixtureText ($caseLower + '/cargo.lock') ([IO.File]::ReadAllText($caseLower + '/Cargo.lock'))
+        $canonicalLock = Open-DsrCacheEntry ($caseLower + '/Cargo.lock'); $otherLock = Open-DsrCacheEntry ($caseLower + '/cargo.lock')
+        try { $distinctLocks = $canonicalLock.FileId -cne $otherLock.FileId } finally { $canonicalLock.Dispose(); $otherLock.Dispose() }
+        if ($distinctLocks) {
+            $caseArguments.SourceRoot = $caseLower; $caseArguments.Lockfile = $caseLower + '/cargo.lock'
+            Assert-Refused 'a distinct case-colliding lockfile cannot replace Cargo.lock authority' { Invoke-DsrCargoSources -Operation capture @caseArguments } 'physical lockfile'
+        }
+    } else {
+        Assert-DsrCargoSourceBoundary -Path $caseLower -Root $caseUpper -Exact
+        Assert-Check 'ordinary Windows case aliases retain the same physical source identity' $true
+    }
+
     $generatedParent = $root + '/generated-stage'; $generatedSource = $generatedParent + '/source'
     foreach ($relative in @('Cargo.toml','Cargo.lock','.cargo/config.toml','src/main.rs')) {
         Write-FixtureText ($generatedSource + '/' + $relative) ([IO.File]::ReadAllText($workspace + '/' + $relative))
