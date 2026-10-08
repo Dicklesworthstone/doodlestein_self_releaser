@@ -4,6 +4,7 @@
 
 function Initialize-DsrCargoSourcesNative {
     if ($PSVersionTable.PSVersion -lt [version]'7.4') { throw 'Windows source authentication requires PowerShell 7.4 or newer' }
+    Initialize-DsrCargoCacheNative
     Add-Type -AssemblyName System.Formats.Tar
     if ('DsrCargoSourceObjects' -as [type]) { return }
     Add-Type -TypeDefinition @'
@@ -14,125 +15,6 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
-
-// A deliberately bounded reader of Cargo-generated v3/v4 lockfiles, not a TOML
-// configuration parser. Every token is consumed; unsupported TOML forms fail
-// closed instead of letting comments, multiline strings or duplicate keys
-// manufacture a package checksum. Cargo itself must have accepted --locked.
-public sealed class DsrCargoSourceLock {
-    readonly string input;
-    int position;
-    DsrCargoSourceLock(byte[] bytes) { input = new UTF8Encoding(false, true).GetString(bytes); }
-    void Require(bool value, string message) { if (!value) throw new InvalidDataException(message); }
-    void Space(bool lines) {
-        while (position < input.Length) {
-            char c = input[position];
-            if (c == ' ' || c == '\t' || (lines && (c == '\r' || c == '\n'))) { position++; continue; }
-            if (lines && c == '#') { while (position < input.Length && input[position] != '\n') position++; continue; }
-            break;
-        }
-    }
-    void EndLine() {
-        Space(false);
-        if (position < input.Length && input[position] == '#') {
-            while (position < input.Length && input[position] != '\r' && input[position] != '\n') position++;
-        }
-        if (position < input.Length && input[position] == '\r') position++;
-        Require(position == input.Length || input[position] == '\n', "Unsupported Cargo.lock syntax after a value");
-        if (position < input.Length) position++;
-    }
-    string String() {
-        Require(position < input.Length && input[position++] == '"', "Cargo.lock requires single-line basic strings");
-        StringBuilder text = new StringBuilder();
-        while (position < input.Length) {
-            char c = input[position++];
-            if (c == '"') return text.ToString();
-            Require(c >= 32 && c != 127, "Control character in Cargo.lock string");
-            if (c != '\\') { text.Append(c); continue; }
-            Require(position < input.Length, "Unclosed Cargo.lock string escape");
-            c = input[position++];
-            switch (c) {
-                case '"': text.Append('"'); break;
-                case '\\': text.Append('\\'); break;
-                case 'b': text.Append('\b'); break;
-                case 't': text.Append('\t'); break;
-                case 'n': text.Append('\n'); break;
-                case 'f': text.Append('\f'); break;
-                case 'r': text.Append('\r'); break;
-                case 'u': case 'U':
-                    int length = c == 'u' ? 4 : 8;
-                    Require(position + length <= input.Length, "Truncated Cargo.lock unicode escape");
-                    string hex = input.Substring(position, length);
-                    Require(Regex.IsMatch(hex, "^[0-9a-fA-F]+$"), "Invalid Cargo.lock unicode escape");
-                    uint point = Convert.ToUInt32(hex, 16);
-                    Require(point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff), "Invalid Cargo.lock unicode scalar");
-                    text.Append(char.ConvertFromUtf32((int)point)); position += length; break;
-                default: throw new InvalidDataException("Unsupported Cargo.lock string escape");
-            }
-        }
-        throw new InvalidDataException("Unclosed Cargo.lock string");
-    }
-    string[] Array() {
-        Require(position < input.Length && input[position++] == '[', "Cargo.lock dependencies must be string arrays");
-        List<string> values = new List<string>();
-        Space(true);
-        while (position < input.Length && input[position] != ']') {
-            Require(values.Count < 500000, "Oversized Cargo.lock dependencies");
-            values.Add(String()); Space(true);
-            if (position < input.Length && input[position] == ']') break;
-            Require(position < input.Length && input[position++] == ',', "Missing Cargo.lock array separator");
-            Space(true);
-        }
-        Require(position < input.Length && input[position++] == ']', "Unclosed Cargo.lock dependencies");
-        return values.ToArray();
-    }
-    List<Dictionary<string, object>> Parse() {
-        List<Dictionary<string, object>> packages = new List<Dictionary<string, object>>();
-        List<Dictionary<string, object>> allPackages = new List<Dictionary<string, object>>();
-        Dictionary<string, object> package = null;
-        bool version = false;
-        while (true) {
-            Space(true); if (position == input.Length) break;
-            if (input[position] == '[') {
-                const string activeHeader = "[[package]]", unusedHeader = "[[patch.unused]]";
-                bool active = position + activeHeader.Length <= input.Length && string.CompareOrdinal(input, position, activeHeader, 0, activeHeader.Length) == 0;
-                string header = active ? activeHeader : unusedHeader;
-                Require(position + header.Length <= input.Length && string.CompareOrdinal(input, position, header, 0, header.Length) == 0,
-                    "Unsupported Cargo.lock table");
-                position += header.Length; EndLine();
-                Require(version && allPackages.Count < 500000, "Cargo.lock version must precede its packages");
-                package = new Dictionary<string, object>(StringComparer.Ordinal); allPackages.Add(package);
-                // Cargo emits unused patches with the same package grammar,
-                // but they are never authority for resolved dependencies.
-                if (active) packages.Add(package);
-                continue;
-            }
-            int start = position;
-            while (position < input.Length && ((input[position] >= 'a' && input[position] <= 'z') || input[position] == '_')) position++;
-            string key = input.Substring(start, position - start);
-            Require(key.Length > 0, "Unsupported Cargo.lock key"); Space(false);
-            Require(position < input.Length && input[position++] == '=', "Missing Cargo.lock assignment"); Space(false);
-            if (package == null) {
-                Require(key == "version" && !version, "Duplicate or unsupported Cargo.lock root key");
-                Require(position < input.Length && (input[position] == '3' || input[position] == '4'), "Cargo.lock v3 or v4 required");
-                position++; version = true;
-            } else {
-                Require(!package.ContainsKey(key), "Duplicate Cargo.lock package key");
-                Require(key == "name" || key == "version" || key == "source" || key == "checksum" || key == "dependencies" || key == "replace",
-                    "Unsupported Cargo.lock package key");
-                package.Add(key, key == "dependencies" ? (object)Array() : String());
-            }
-            EndLine();
-        }
-        Require(version && packages.Count > 0, "Cargo.lock has no packages");
-        foreach (var item in allPackages) {
-            Require(item.ContainsKey("name") && item.ContainsKey("version") && ((string)item["name"]).Length > 0 && ((string)item["version"]).Length > 0,
-                "Cargo.lock has an incomplete package identity");
-        }
-        return packages;
-    }
-    public static List<Dictionary<string, object>> Read(byte[] bytes) { return new DsrCargoSourceLock(bytes).Parse(); }
-}
 
 public static class DsrCargoSourceObjects {
     public static void Member(string name) {
@@ -166,6 +48,7 @@ public static class DsrCargoSourceObjects {
             info.Environment["GIT_CONFIG_GLOBAL"] = OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
             info.Environment["GIT_NO_REPLACE_OBJECTS"] = "1";
             info.Environment["GIT_NO_LAZY_FETCH"] = "1";
+            info.Environment["GIT_ALLOW_PROTOCOL"] = "";
             info.Environment["GIT_TERMINAL_PROMPT"] = "0";
             info.Environment["GIT_OPTIONAL_LOCKS"] = "0"; info.Environment["LC_ALL"] = "C";
             info.RedirectStandardInput = true; info.RedirectStandardOutput = true; info.RedirectStandardError = true;
@@ -445,44 +328,14 @@ function Get-DsrCargoGitProof {
     param($Tree, [string]$Source)
     $revision = $Source.Substring($Source.LastIndexOf('#') + 1)
     if ($revision -cnotmatch '^[0-9a-f]{40}$') { throw 'Git source requires a full locked SHA-1 commit' }
-    $admin = $Tree.path + '/.git'; $guards = Open-DsrCachePathGuard $admin
-    $storage = [Collections.Generic.List[object]]::new()
-    $directories = [Collections.Generic.List[object]]::new()
-    function Open-DsrCargoGitStorage {
-        param([string]$Path)
-        if ($storage.Count -ge 500000) { throw 'Oversized Cargo Git administrative storage' }
-        $attributes = [IO.File]::GetAttributes($Path)
-        $directory = ($attributes -band [IO.FileAttributes]::Directory) -ne 0
-        $entry = Open-DsrCacheEntry $Path -Directory $directory
-        $storage.Add($entry)
-        if ($directory) {
-            $children = Get-DsrCacheChildren $Path
-            $directories.Add(@{entry=$entry;identity=$entry.GetIdentity();children=($children -join [char]0)})
-            foreach ($child in $children) { Open-DsrCargoGitStorage $child }
-        }
-    }
+    $admin = $Tree.path + '/.git'; $custody = Open-DsrCargoGitCustody $admin
     try {
-        # cat-file reads its own object storage. Pin every administrative path
-        # while it runs so neither an object-store reparse nor local config or
-        # alternates replacement can redirect those reads outside custody.
-        Open-DsrCargoGitStorage $admin
-        foreach ($name in @('commondir','objects/info/alternates','objects/info/http-alternates')) {
-            if (Get-Item -LiteralPath ($admin + '/' + $name) -Force -ErrorAction SilentlyContinue) { throw 'External Git object storage is not an admitted source' }
-        }
         $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $expected = [DsrCargoSourceObjects]::Git($git.Source,$admin,$revision)
-        foreach ($directory in $directories) {
-            if ($directory.entry.GetIdentity() -cne $directory.identity -or
-                ((Get-DsrCacheChildren $directory.entry.Path) -join [char]0) -cne $directory.children) {
-                throw 'Git object storage changed during authentication'
-            }
-        }
+        Assert-DsrCargoGitCustody $custody
         Assert-DsrCargoSourceTree $Tree $expected.files $expected.directories
         return @{basis='lockfile-git-objects';commit=$revision;tree=$expected.tree}
-    } finally {
-        foreach ($entry in $storage) { $entry.Dispose() }
-        foreach ($guard in $guards) { $guard.Dispose() }
-    }
+    } finally { Close-DsrCargoGitCustody $custody }
 }
 
 function Get-DsrCargoSourceKey {

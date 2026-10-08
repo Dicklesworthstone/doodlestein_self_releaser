@@ -4463,6 +4463,21 @@ _act_validate_cargo_sources_summary() {
     ' <<< "$1"
 }
 
+# Validate host preparation evidence again at compiler admission. The selected
+# downloads must name the same lockfile as the authenticated dependency sources.
+_act_validate_cargo_cache_selection() {
+    jq -ce --argjson sources "$2" '
+        .selection | select(type == "object" and
+            keys == ["git_revisions", "kind", "lockfile_sha256", "registry_packages"] and
+            .kind == "cargo-lock-downloads" and
+            (.lockfile_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            .lockfile_sha256 == $sources.authentication.lockfile_sha256 and
+            (.registry_packages | type == "number" and . >= 0 and . <= 10000 and floor == .) and
+            (.git_revisions | type == "array" and length <= 10000 and
+                all(.[]; type == "string" and test("^[0-9a-f]{40}$")) and . == unique))
+    ' <<< "$1"
+}
+
 # A remote sidecar cannot authorize its own replacement. Check both held file
 # hashes around source verification and compare the verifier's newly observed
 # evidence hash as well. This runs before compilation and in an independent
@@ -4837,6 +4852,9 @@ _act_windows_private_cargo_home_script() {
 \$ErrorActionPreference='Stop'
 \$dsrSourceGuards=Open-DsrCachePathGuard '$source_root'
 \$dsrPhysicalSource=(Get-Item -LiteralPath '$source_root' -Force).FullName.Replace('\\','/')
+\$dsrLockfile=Get-DsrCacheFullPath (Join-Path \$dsrPhysicalSource 'Cargo.lock')
+# Keep the selected lockfile stable through metadata and retained-seed admission.
+\$dsrSourceGuards.Add((Open-DsrCacheEntry \$dsrLockfile))
 \$dsrSourceParent=Split-Path -Parent \$dsrPhysicalSource
 \$dsrSeedHome=Join-Path \$dsrSourceParent '.cargo-home'
 \$dsrStrictHome=Join-Path \$dsrSourceParent '.cargo-home-$suffix'
@@ -4844,14 +4862,17 @@ _act_windows_private_cargo_home_script() {
 if (Get-Item -LiteralPath \$dsrSeedHome -Force -ErrorAction SilentlyContinue) {
     Assert-DsrCargoHome -Path \$dsrSeedHome
     \$dsrSeedSummary=Invoke-DsrCargoCache -Operation verify -First \$dsrSeedHome -Second (Join-Path \$dsrSeedHome '.dsr-cache-seed.json')
-    \$dsrPrivateSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrSeedHome -Second \$dsrStrictHome
-    if (\$dsrSeedSummary.mode -ne 'private-copy' -or \$dsrPrivateSummary.inventory_sha256 -ne \$dsrSeedSummary.inventory_sha256) {
-        throw 'Private Cargo cache seed changed during preparation'
+    \$dsrPrivateSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrSeedHome -Second \$dsrStrictHome -Lockfile \$dsrLockfile
+    if (\$dsrSeedSummary.mode -cne 'private-copy' -or \$dsrPrivateSummary.mode -cne 'private-copy' -or
+        \$dsrSeedSummary.selection.kind -cne 'cargo-lock-downloads' -or
+        (ConvertTo-DsrCacheCanonicalJson \$dsrSeedSummary.selection) -cne (ConvertTo-DsrCacheCanonicalJson \$dsrPrivateSummary.selection) -or
+        \$dsrPrivateSummary.inventory_sha256 -cne \$dsrSeedSummary.inventory_sha256) {
+        throw 'Private Cargo cache seed or lockfile selection changed during preparation'
     }
 } else {
     \$dsrAmbient=if (\$env:CARGO_HOME) { \$env:CARGO_HOME } else { Join-Path \$env:USERPROFILE '.cargo' }
     if (-not (Get-Item -LiteralPath \$dsrAmbient -Force -ErrorAction SilentlyContinue)) { \$dsrAmbient='' }
-    \$dsrPrivateSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second \$dsrStrictHome
+    \$dsrPrivateSummary=Invoke-DsrCargoCache -Operation snapshot -First \$dsrAmbient -Second \$dsrStrictHome -Lockfile \$dsrLockfile
     \$dsrSeedPending=\$true
 }
 Assert-DsrCargoHome -Path \$dsrStrictHome
@@ -4893,9 +4914,13 @@ try {
 Assert-DsrCargoHome -Path $dsrStrictHome
 Assert-DsrCargoSeed -CargoHome $dsrStrictHome -ExpectedSha256 $dsrPrivateSummary.receipt_sha256
 $dsrMetadataDigest=Get-DsrCargoSourceFileHash -Path $dsrMetadataPath
-$dsrDependencySources=Invoke-DsrCargoSources -Operation capture -MetadataPath $dsrMetadataPath -ReceiptPath (Join-Path $dsrStrictHome '.dsr-cargo-sources.json') -Lockfile (Join-Path $dsrPhysicalSource 'Cargo.lock') -CargoHome $dsrStrictHome -SourceRoot $dsrPhysicalSource
+$dsrDependencySources=Invoke-DsrCargoSources -Operation capture -MetadataPath $dsrMetadataPath -ReceiptPath (Join-Path $dsrStrictHome '.dsr-cargo-sources.json') -Lockfile $dsrLockfile -CargoHome $dsrStrictHome -SourceRoot $dsrPhysicalSource
 if ((Get-DsrCargoSourceFileHash -Path $dsrMetadataPath) -cne $dsrMetadataDigest) {
     throw 'Cargo metadata changed during dependency authentication; seed not admitted'
+}
+if ($dsrPrivateSummary.selection.kind -cne 'cargo-lock-downloads' -or
+    $dsrPrivateSummary.selection.lockfile_sha256 -cne $dsrDependencySources.authentication.lockfile_sha256) {
+    throw 'Private Cargo download selection differs from authenticated lockfile; seed not admitted'
 }
 $dsrDependencySources.metadata_sha256=$dsrMetadataDigest
 $dsrPrivateSummary.dependency_sources=$dsrDependencySources
@@ -4903,7 +4928,7 @@ $dsrContextSummary=Write-DsrCargoContextReceipt -Context $dsrContext -Path (Join
 $dsrPrivateSummary.toolchain=$dsrContextSummary.toolchain
 $dsrPrivateSummary.cargo_context=@{schema_version=$dsrContextSummary.schema_version;fingerprint=$dsrContextSummary.fingerprint;receipt_sha256=$dsrContextSummary.receipt_sha256}
 if ($dsrSeedPending) {
-    Invoke-DsrCargoCache -Operation snapshot -First $dsrStrictHome -Second $dsrSeedHome | Out-Null
+    Invoke-DsrCargoCache -Operation snapshot -First $dsrStrictHome -Second $dsrSeedHome -Lockfile $dsrLockfile | Out-Null
 }
 foreach ($dsrSourceGuard in $dsrSourceGuards) { $dsrSourceGuard.Dispose() }
 POWERSHELL
@@ -4918,6 +4943,7 @@ _act_prepare_windows_private_cargo_home() {
     summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
     sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
     _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
+    _act_validate_cargo_cache_selection "$summary" "$sources_json" >/dev/null || return 4
     toolchain_json=$(jq -ce '.toolchain' <<< "$summary") || return 4
     _act_validate_windows_toolchain_summary "$toolchain_json" "$source_root" >/dev/null || return 4
     jq -ce '
@@ -8270,6 +8296,11 @@ act_run_native_build() {
         fi
         strict_cargo_seed_json=$(jq -c 'del(.dependency_sources)' <<< "$strict_cargo_seed_json") || return 4
         if _act_is_windows_host "$host"; then
+            if ! _act_validate_cargo_cache_selection "$strict_cargo_seed_json" "$strict_dependency_sources_json" >/dev/null; then
+                _log_error "Strict Windows Cargo cache lacks matching lockfile download selection"
+                jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo cache selection admission failed"}'
+                return 4
+            fi
             strict_cargo_context_json=$(jq -ce '.cargo_context | select(
                 type == "object" and .schema_version == 1 and
                 (keys | sort) == ["fingerprint", "receipt_sha256", "schema_version"] and

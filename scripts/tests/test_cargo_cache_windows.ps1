@@ -241,7 +241,8 @@ function Invoke-Program {
 
 function Invoke-GeneratedCacheProgram {
     param([ValidateSet('metadata','ordinary','finish')][string]$Operation, [string]$Path,
-        [string]$Argument, [switch]$ExpectFailure, [switch]$InjectMalformedMetadata)
+        [string]$Argument, [switch]$ExpectFailure, [switch]$InjectMalformedMetadata,
+        [string]$SourceRoot, $Admission)
     $generator = @'
 source "$1" || exit $?
 shift
@@ -263,6 +264,8 @@ ordinary|finish)
     _act_windows_cache_command() { printf '%s\n' "$3" >&3; return 75; }
     if [[ "$1" == ordinary ]]; then
         _act_prepare_windows_nonstrict_cargo_home fixture-host "$2" "$2/dsr-build-ordinary" "$2/dsr-build-ordinary/c"
+    elif [[ -n "${4:-}" ]]; then
+        _act_finish_windows_private_cargo_home fixture-host "$2" "$3" "$4" "$5" 'cargo build' '' "$6"
     else
         _act_finish_windows_private_cargo_home fixture-host "$2" "$3"
     fi
@@ -273,12 +276,20 @@ esac
 '@
     $module = (Resolve-Path -LiteralPath (Join-Path (Split-Path -Parent $BackendPath) 'act_runner.sh')).Path.Replace('\','/')
     $generatorPath = if ($script:WindowsHost) { $Path.Replace('\','/') } else { 'C:/dsr-cache-fixture' }
-    $generated = Invoke-Program $script:BashExecutable @('-c', $generator, '_', $module, $Operation, $generatorPath, $Argument)
+    $generatorArguments = @('-c', $generator, '_', $module, $Operation, $generatorPath, $Argument)
+    if ($Operation -eq 'finish' -and $null -ne $Admission) {
+        $generatorSource = if ($script:WindowsHost) { $SourceRoot.Replace('\','/') } else { 'C:/dsr-cache-source' }
+        $generatorArguments += @($generatorSource,
+            ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100),
+            ($Admission.cargo_context | ConvertTo-Json -Compress -Depth 100))
+    }
+    $generated = Invoke-Program $script:BashExecutable $generatorArguments
     $body = $generated.Out
     if (-not $script:WindowsHost) {
         # The generator accepts Windows paths only. Map its one fixture root
         # literal for Linux engine validation; Windows executes its exact text.
         $body = $body.Replace('C:/dsr-cache-fixture', $Path)
+        if ($SourceRoot) { $body = $body.Replace('C:/dsr-cache-source', $SourceRoot) }
     }
     $programPath = Join-Path $script:Work ('generated-' + [Guid]::NewGuid().ToString('N') + '.ps1')
     Write-FixtureText $programPath $body
@@ -337,6 +348,17 @@ $privateEntry = Open-DsrCacheEntry -Path $privateFile -Directory $false
 try {
     Assert-Check 'snapshot files have separate filesystem identities' ($originalEntry.GetIdentity() -ne $privateEntry.GetIdentity())
     Assert-Check 'snapshot files have no shared hardlinks' ($privateEntry.LinkCount -eq 1)
+    # Win32 DuplicateHandle shares the file position. The production bounded
+    # reader must rewind the same held entry; the portable adapter alone cannot
+    # establish this native property because its OpenRead already rewinds.
+    $expectedBytes = [Text.Encoding]::UTF8.GetBytes('pub fn answer() -> u32 { 42 }')
+    $expectedHash = Get-DsrCacheBytesHash $expectedBytes
+    $firstRead = Get-DsrCacheHeldBytes -Entry $originalEntry
+    $secondRead = Get-DsrCacheHeldBytes -Entry $originalEntry
+    Assert-Check 'repeated reads of one held cache entry return complete identical bytes' (
+        $firstRead.Length -eq $expectedBytes.Length -and $secondRead.Length -eq $expectedBytes.Length -and
+        (Get-DsrCacheBytesHash $firstRead) -ceq $expectedHash -and
+        (Get-DsrCacheBytesHash $secondRead) -ceq $expectedHash)
 } finally {
     $originalEntry.Dispose()
     $privateEntry.Dispose()
@@ -548,6 +570,25 @@ Assert-Check 'hardlinks entirely inside private cache trees remain usable' ($fin
 $null = Invoke-DsrCargoCache -Operation verify -First $f.Private -Second $final.receipt_path
 Assert-Check 'private Git-style internal hardlinks verify' $true
 
+# A sparse registry entry may have the same leaf name as a Git control file.
+# These synthetic bytes exercise selected inventory paths, not Cargo parsing.
+$f = New-CacheFixture 'selected-registry-commondir'
+$selectedArchive = Join-Path $f.Ambient 'registry/cache/example/commondir-1.0.0.crate'
+$selectedRecord = 'registry/index/example/.cache/co/mm/commondir'
+Write-FixtureText $selectedArchive 'synthetic checksum-pinned archive'
+Write-FixtureText (Join-Path $f.Ambient $selectedRecord) 'ordinary sparse registry record'
+$selectedLock = Join-Path $f.Root 'source/Cargo.lock'
+Write-FixtureText $selectedLock ("version = 4`n[[package]]`nname = `"commondir`"`nversion = `"1.0.0`"`n" +
+    "source = `"registry+https://example.invalid/index`"`nchecksum = `"$(Get-Digest $selectedArchive)`"`n")
+$selectedSeed = Invoke-DsrCargoCache -Operation snapshot -First $f.Ambient -Second $f.Private -Lockfile $selectedLock
+Assert-Check 'selected sparse registry record named commondir remains ordinary data' (
+    [IO.File]::ReadAllText((Join-Path $f.Private $selectedRecord)) -ceq 'ordinary sparse registry record' -and
+    $selectedSeed.selection.registry_packages -eq 1)
+$null = Invoke-DsrCargoCache -Operation verify -First $f.Private -Second $selectedSeed.receipt_path
+$selectedFinal = Invoke-DsrCargoCache -Operation inventory -First $f.Private -Second (Join-Path $f.Root 'final.json')
+$null = Invoke-DsrCargoCache -Operation verify -First $f.Private -Second $selectedFinal.receipt_path
+Assert-Check 'legitimate sparse registry control-name records survive seed and final verification' $true
+
 # A genuine Git dependency is warmed once, then both upstream and ambient cache
 # paths disappear. Cargo must compile from a fresh private copy while offline.
 $cargo = (Get-Command cargo -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
@@ -658,22 +699,46 @@ try {
     $canonicalHash = Get-Digest $canonicalReceipt
     $null = Invoke-DsrCargoCache -Operation verify -First $canonicalSeed -Second $canonicalReceipt
     Assert-Check 'only successful metadata publishes a fully verifiable canonical seed' $true
+    $canonicalSummary = Get-Content -LiteralPath $canonicalReceipt -Raw | ConvertFrom-Json
+    Assert-Check 'generated strict Git seed binds the actual lock and contains downloads without checkouts' (
+        $preparedSummary.selection.kind -ceq 'cargo-lock-downloads' -and
+        $preparedSummary.selection.lockfile_sha256 -ceq (Get-Digest (Join-Path $source 'Cargo.lock')) -and
+        $preparedSummary.selection.registry_packages -eq 0 -and
+        @($preparedSummary.selection.git_revisions).Count -eq 1 -and
+        $preparedSummary.selection.git_revisions[0] -ceq $revision -and
+        (ConvertTo-DsrCacheCanonicalJson $preparedSummary.selection) -ceq (ConvertTo-DsrCacheCanonicalJson $canonicalSummary.selection) -and
+        (Test-Path -LiteralPath (Join-Path $canonicalSeed 'git/db')) -and
+        -not (Test-Path -LiteralPath (Join-Path $canonicalSeed 'git/checkouts')) -and
+        -not (Test-Path -LiteralPath (Join-Path $canonicalSeed 'registry/src')))
     $env:CARGO_HOME = Join-Path $cargoCase 'missing-ambient'
     $retry = Invoke-GeneratedCacheProgram metadata $source 'metadata-retry'
     $retrySummary = ConvertFrom-Json $retry.Out
     Assert-Check 'generated metadata retries have distinct private homes' ($retrySummary.cargo_home -ne $preparedSummary.cargo_home)
-    Assert-Check 'generated metadata reuses the admitted seed after ambient disappearance' ((Get-Digest $canonicalReceipt) -eq $canonicalHash)
-    $completed = Invoke-GeneratedCacheProgram finish $retrySummary.cargo_home $retrySummary.receipt_sha256
+    Assert-Check 'generated metadata reuses the admitted download selection after ambient disappearance' (
+        (Get-Digest $canonicalReceipt) -eq $canonicalHash -and
+        (ConvertTo-DsrCacheCanonicalJson $retrySummary.selection) -ceq (ConvertTo-DsrCacheCanonicalJson $preparedSummary.selection))
+    $completed = Invoke-GeneratedCacheProgram finish $retrySummary.cargo_home $retrySummary.receipt_sha256 -SourceRoot $source -Admission $retrySummary
     $completedSummary = ConvertFrom-Json $completed.Out
     Assert-Check 'generated finish seals the actual attempt cache' (
         $completedSummary.mode -eq 'inventory' -and $completedSummary.receipt_path -eq ($retrySummary.cargo_home + '.final.json'))
     $null = Invoke-DsrCargoCache -Operation verify -First $retrySummary.cargo_home -Second $completedSummary.receipt_path
     Assert-Check 'generated final receipt independently verifies' $true
+    Assert-Check 'expanded final cache inventory does not claim to be a download-only selection' (
+        $completedSummary.PSObject.Properties.Name -cnotcontains 'selection')
+    $sourceLock = Join-Path $source 'Cargo.lock'
+    $sourceLockText = [IO.File]::ReadAllText($sourceLock)
+    Write-FixtureText $sourceLock ($sourceLockText + "`n# changed lock authority`n")
+    try {
+        $failed = Invoke-GeneratedCacheProgram metadata $source 'metadata-lock-drift' -ExpectFailure
+        Assert-Check 'retained download seed cannot be reused after lock authority changes' (
+            $failed.Code -ne 0 -and $failed.Err -match 'lock|selection' -and
+            (Get-Digest $canonicalReceipt) -eq $canonicalHash)
+    } finally { Write-FixtureText $sourceLock $sourceLockText }
     Write-FixtureText (Join-Path $preparedSummary.cargo_home 'config.toml') '[build]'
-    $failed = Invoke-GeneratedCacheProgram finish $preparedSummary.cargo_home $preparedSummary.receipt_sha256 -ExpectFailure
+    $failed = Invoke-GeneratedCacheProgram finish $preparedSummary.cargo_home $preparedSummary.receipt_sha256 -SourceRoot $source -Admission $preparedSummary -ExpectFailure
     Assert-Check 'generated finish refuses injected Cargo configuration before collection' ($failed.Code -ne 0 -and $failed.Err -match 'configuration|credentials')
-    $canonicalEntry = Get-ChildItem -LiteralPath (Join-Path $canonicalSeed 'git/checkouts') -Filter lib.rs -File -Recurse | Select-Object -First 1
-    Write-FixtureText $canonicalEntry.FullName 'compile_error!("retained seed was changed");'
+    $canonicalEntry = Get-ChildItem -LiteralPath (Join-Path $canonicalSeed 'git/db') -Filter HEAD -File -Recurse | Select-Object -First 1
+    Write-FixtureText $canonicalEntry.FullName 'retained download seed was changed'
     $failed = Invoke-GeneratedCacheProgram metadata $source 'metadata-drift' -ExpectFailure
     Assert-Check 'generated strict resume refuses changed retained seed bytes' ($failed.Code -ne 0 -and $failed.Err -match 'inventory|cache')
 
@@ -682,6 +747,7 @@ try {
     # every compilation continues to use actual Cargo and the Rust compiler.
     $malformedSource = Join-Path $cargoCase 'malformed-metadata/source'
     Write-FixtureText (Join-Path $malformedSource 'Cargo.toml') ([IO.File]::ReadAllText($manifest))
+    Write-FixtureText (Join-Path $malformedSource 'Cargo.lock') ([IO.File]::ReadAllText($sourceLock))
     $env:CARGO_HOME = $seedHome
     $failed = Invoke-GeneratedCacheProgram metadata $malformedSource 'metadata-garbage' -ExpectFailure -InjectMalformedMetadata
     Assert-Check 'command boundary: zero-exit malformed Cargo metadata is refused' (

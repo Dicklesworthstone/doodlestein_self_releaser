@@ -234,26 +234,27 @@ useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
-Strict native Unix Rust builds seed private Cargo homes with downloads selected
+Strict native Rust builds seed private Cargo homes with downloads selected
 by the committed `Cargo.lock`: checksum-matching crate archives, their index
 records, and Git databases containing locked commits. Ambient extracted registry
 sources and Git checkouts are never copied; Cargo recreates them offline from
 the selected downloads. Unrelated cached links, special files, and large archives
 do not enter the seed, and an unused Git cache on another volume is not opened.
 Selection covers the complete lockfile, including other targets and features;
-selected Git databases retain their history. It is not a minimal target graph.
-Strict Windows builds copy the ambient `registry` and `git` caches into private
-files before Cargo runs. Strict Unix hosts require Python
-3.11+; strict Windows hosts require PowerShell 7.4+ and a local NTFS Cargo cache. Configuration,
+selected Git databases and legacy registry Git indexes retain their history.
+It is not a minimal target graph. Strict Unix hosts require Python 3.11+;
+strict Windows hosts require PowerShell 7.4+ and a local NTFS Cargo cache. Configuration,
 credentials, symlinks, Windows reparse points, and external Git storage
 pointers are excluded or refused. The first successful locked, offline metadata
 resolution publishes a retained seed alongside the source snapshot. If that
 first resolution lacks dependencies, no seed is published: refill the ambient
 cache and retry. Once admitted, the seed survives deletion or in-place changes
 to the ambient cache, and every metadata invocation and target attempt receives
-a fresh copy. Unix retained seeds contain downloads only, even after metadata
+a fresh copy. Retained seeds contain downloads only, even after metadata
 has unpacked sources, and retries must match the seed's original lockfile
-selection. Parallel targets therefore do not share writable dependency files.
+selection and inventory. The selected lockfile hash must agree with the lockfile used
+to authenticate dependency sources. Parallel targets therefore do not share
+writable dependency files.
 
 Before a strict native seed is admitted, DSR authenticates the resolved
 dependency source files against the committed `Cargo.lock`. Registry archives
@@ -263,7 +264,7 @@ This covers the all-features graph from every workspace member on both Unix
 and Windows. Vendored sources have a separate trust basis: they must be inside
 the primary workspace's independently verified source snapshot.
 The coordinator holds hashes of metadata and source evidence, verifies them
-before compilation, and independently rechecks the source files before artifact
+before project compilation, and independently rechecks the source files before artifact
 collection. Editing a cached dependency, metadata, or a remote receipt refuses
 publication even when Cargo successfully compiles it. The compact evidence is
 retained as `cargo_isolation.dependency_sources`; full source inventories stay
@@ -279,11 +280,12 @@ compilation. A literal `cargo +nightly build --release`, for example, resolves
 its dependencies with the selected nightly Cargo instead of the host's default.
 Both operations use the system CMD launcher with the same working directory,
 configured environment, compiler/SDK cleanup, and native-build RCH bypass.
-The admitted context includes the actual Cargo, rustc and linker paths, executable
+The admitted context includes the selected Cargo, rustc and linker paths, executable
 SHA-256 hashes, and reported versions. Proven rustup proxies also retain the
 resolved selected-toolchain executables, including copied proxies whose matching
-rustup is absent from PATH. DSR asks the selected rustc to perform
-a small link to identify its default linker, including Visual Studio discovery.
+rustup is absent from PATH. Before dependency metadata, DSR asks the selected
+rustc to perform a small link to identify its default linker, including Visual
+Studio discovery.
 These identities are checked around metadata and compilation and again in the
 independent collection step. Changing a tool, command, relevant environment,
 Cargo configuration, or toolchain selection file prevents artifact collection,
@@ -325,9 +327,10 @@ record `cargo_isolation.dependency_cache.seed` and `.final`, with
 without a final inventory. These are retained local integrity records;
 they do not protect against a build host rewriting all its evidence.
 
-The copies include the complete selected cache trees and remain alongside the
-strict snapshot, so allow disk space for the retained seed and each metadata or
-target attempt.
+The copies retain the selected Git databases and registry index history, and
+each private attempt also stores Cargo's recreated source trees. They remain
+alongside the strict snapshot, so allow disk space for the retained seed and
+each metadata or target attempt.
 
 Ordinary (non-strict) native Rust builds get the same protection. Each
 target's fresh stage root receives a private copy of the ambient `registry` and

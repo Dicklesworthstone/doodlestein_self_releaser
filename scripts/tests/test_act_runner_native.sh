@@ -394,7 +394,9 @@ _act_ssh_exec() {
               receipt_sha256:("3" * 64), inventory_sha256:("4" * 64), caches:["git","registry"],
               file_count:2, size_bytes:10}
              + (if $context then {dependency_sources:$sources,toolchain:$toolchain,cargo_context:{schema_version:1,
-                 fingerprint:("5" * 64),receipt_sha256:("6" * 64)}} else {} end)'
+                 fingerprint:("5" * 64),receipt_sha256:("6" * 64)},
+                 selection:{kind:"cargo-lock-downloads",lockfile_sha256:$sources.authentication.lockfile_sha256,
+                     registry_packages:1,git_revisions:[("a" * 40)]}} else {} end)'
         return 0
     fi
     # These command-construction tests return explicit transport receipts.
@@ -1663,7 +1665,10 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
              ($home | startswith("C:/build/.dsr-release-snapshots/tool-run/.cargo-home-windows-amd64-")) and
              .cargo_isolation.cache_reuse == [] and
              .cargo_isolation.dependency_cache.seed.mode == "private-copy" and
+             .cargo_isolation.dependency_cache.seed.selection.kind == "cargo-lock-downloads" and
+             .cargo_isolation.dependency_cache.seed.selection.lockfile_sha256 == $sources.authentication.lockfile_sha256 and
              .cargo_isolation.dependency_cache.final.mode == "inventory" and
+             (.cargo_isolation.dependency_cache.final | has("selection") | not) and
              .cargo_isolation.cargo_context.fingerprint == ("5" * 64) and
              .cargo_isolation.cargo_context.receipt_sha256 == ("6" * 64) and
              .cargo_isolation.toolchain == $toolchain and
@@ -1830,7 +1835,8 @@ test_unix_strict_dependency_sources_authority() {
 test_windows_strict_dependency_sources_authority() {
     log_test "Strict Windows Rust: copied cache receipts cannot replace authenticated sources"
     local boundary status prepared command
-    for boundary in missing metadata_digest lockfile_digest authentication_counts root_count; do
+    for boundary in missing metadata_digest lockfile_digest authentication_counts root_count \
+            selection_missing selection_kind selection_lock selection_count selection_revision; do
         reset_state
         MOCK_LANGUAGE=rust
         MOCK_BUILD_CMD='cargo build --release'
@@ -1840,16 +1846,24 @@ test_windows_strict_dependency_sources_authority() {
         (
             _act_prepare_windows_private_cargo_home() {
                 printf 'prepared\n' > "$prepared"
-                jq -nc --argjson sources "$(_test_native_dependency_sources)" --arg boundary "$boundary" '
+                jq -nc --argjson sources "$(_test_native_dependency_sources)" \
+                    --argjson toolchain "$(_test_native_windows_toolchain 'C:/run/source')" --arg boundary "$boundary" '
                     {schema_version:1,mode:"private-copy",cargo_home:"C:/run/private-home",
                      receipt_path:"C:/run/private-home/.dsr-cache-seed.json",
                      receipt_sha256:("1"*64),inventory_sha256:("2"*64),
-                     caches:["git","registry"],file_count:6,size_bytes:256,dependency_sources:$sources,
+                     caches:["git","registry"],file_count:6,size_bytes:256,dependency_sources:$sources,toolchain:$toolchain,
+                     selection:{kind:"cargo-lock-downloads",lockfile_sha256:$sources.authentication.lockfile_sha256,
+                         registry_packages:1,git_revisions:[("a"*40)]},
                      cargo_context:{schema_version:1,fingerprint:("5"*64),receipt_sha256:("6"*64)}}
                     | if $boundary == "missing" then del(.dependency_sources)
                       elif $boundary == "metadata_digest" then .dependency_sources.metadata_sha256 = ("7"*63)
                       elif $boundary == "lockfile_digest" then del(.dependency_sources.authentication.lockfile_sha256)
                       elif $boundary == "authentication_counts" then .dependency_sources.authentication.locked_git_packages = 2
+                      elif $boundary == "selection_missing" then del(.selection)
+                      elif $boundary == "selection_kind" then .selection.kind = "whole-cache"
+                      elif $boundary == "selection_lock" then .selection.lockfile_sha256 = ("0"*64)
+                      elif $boundary == "selection_count" then .selection.registry_packages = -1
+                      elif $boundary == "selection_revision" then .selection.git_revisions = ["not-a-commit"]
                       else .dependency_sources.root_count = 3 end'
             }
             act_run_native_build tool windows/amd64 v1.0.0 \
@@ -1885,6 +1899,8 @@ test_windows_strict_toolchain_authority() {
                      receipt_sha256:("1"*64),inventory_sha256:("2"*64),
                      caches:["git","registry"],file_count:6,size_bytes:256,
                      dependency_sources:$sources,toolchain:$toolchain,
+                     selection:{kind:"cargo-lock-downloads",lockfile_sha256:$sources.authentication.lockfile_sha256,
+                         registry_packages:1,git_revisions:[("a"*40)]},
                      cargo_context:{schema_version:1,fingerprint:("5"*64),receipt_sha256:("6"*64)}}
                     | if $boundary == "missing" then del(.toolchain)
                       elif $boundary == "cwd" then .toolchain.cwd = "C:/other/source"
@@ -1950,7 +1966,10 @@ test_windows_strict_dependency_sources_final_gate() {
                 "$command" == *'Invoke-DsrCargoSources -Operation verify'* ]] && \
              jq -e --argjson sources "$expected_sources" '.status == "success" and
                  .cargo_isolation.dependency_sources == $sources and
-                 .cargo_isolation.dependency_cache.final.mode == "inventory"' <<< "$result" >/dev/null; then
+                 .cargo_isolation.dependency_cache.seed.selection.kind == "cargo-lock-downloads" and
+                 .cargo_isolation.dependency_cache.seed.selection.lockfile_sha256 == $sources.authentication.lockfile_sha256 and
+                 .cargo_isolation.dependency_cache.final.mode == "inventory" and
+                 (.cargo_isolation.dependency_cache.final | has("selection") | not)' <<< "$result" >/dev/null; then
             log_pass "Strict Windows source authority reaches pre-build checks, independent finish, and results"
         elif [[ "$boundary" == changed && "$status" -ne 0 && -z "$raw_ssh" ]] && \
              jq -e --argjson sources "$expected_sources" '.status != "success" and
@@ -2068,9 +2087,14 @@ test_windows_strict_validation_failure_stops_build() {
             printf 'prepared\n' > "$prepared"
             # Valid private-cache evidence alone must not authorize a Windows
             # compiler after metadata/build context binding became mandatory.
-            jq -nc '{schema_version:1,mode:"private-copy",cargo_home:"C:/build/private-home",
+            jq -nc --argjson sources "$(_test_native_dependency_sources)" \
+                --argjson toolchain "$(_test_native_windows_toolchain 'C:/build/.dsr-release-snapshots/tool-run/source')" '
+                {schema_version:1,mode:"private-copy",cargo_home:"C:/build/private-home",
                 receipt_path:"C:/build/private-home/.dsr-cache-seed.json",receipt_sha256:("3"*64),
-                inventory_sha256:("4"*64),caches:[],file_count:0,size_bytes:0}'
+                inventory_sha256:("4"*64),caches:["git","registry"],file_count:6,size_bytes:256,
+                dependency_sources:$sources,toolchain:$toolchain,
+                selection:{kind:"cargo-lock-downloads",lockfile_sha256:$sources.authentication.lockfile_sha256,
+                    registry_packages:1,git_revisions:[("a"*40)]}}'
         }
         _act_ssh_exec() {
             printf 'reached\n' > "$sentinel"
@@ -3423,7 +3447,10 @@ test_windows_strict_cargo_metadata_command() {
 
     if [[ $status -eq 0 ]] && \
        grep -Fq 'Invoke-DsrCargoCache -Operation verify -First $dsrSeedHome' "$command_file" && \
-       grep -Fq 'Invoke-DsrCargoCache -Operation snapshot -First $dsrSeedHome -Second $dsrStrictHome' "$command_file" && \
+       grep -Fq 'Invoke-DsrCargoCache -Operation snapshot -First $dsrSeedHome -Second $dsrStrictHome -Lockfile $dsrLockfile' "$command_file" && \
+       grep -Fq 'Invoke-DsrCargoCache -Operation snapshot -First $dsrAmbient -Second $dsrStrictHome -Lockfile $dsrLockfile' "$command_file" && \
+       grep -Fq 'Invoke-DsrCargoCache -Operation snapshot -First $dsrStrictHome -Second $dsrSeedHome -Lockfile $dsrLockfile' "$command_file" && \
+       grep -Fq 'Open-DsrCacheEntry $dsrLockfile' "$command_file" && \
        grep -Fq 'Assert-DsrCargoHome -Path $dsrStrictHome' "$command_file" && \
        grep -Fq 'New-DsrCargoContext -BuildCommand' "$command_file" && \
        grep -Fq "$command_b64" "$command_file" && \
@@ -3540,13 +3567,19 @@ test_windows_private_cache_collection() {
             command=$(get_ssh_cmd)
             if [[ "$boundary" == admitted ]] && [[ "$status" -eq 0 ]] &&
                [[ "$command" != *'New-Item -ItemType Junction'* ]] &&
-               jq -e '.status == "success" and .cargo_isolation.cache_reuse == [] and
+               jq -e --arg mode "$mode" --argjson sources "$(_test_native_dependency_sources)" '
+                   .status == "success" and .cargo_isolation.cache_reuse == [] and
                    .cargo_isolation.dependency_cache.mode == "private-copy" and
                    .cargo_isolation.dependency_cache.seed.mode == "private-copy" and
                    .cargo_isolation.dependency_cache.final.mode == "inventory" and
                    .cargo_isolation.dependency_cache.seed.cargo_home == .cargo_isolation.cargo_home and
                    .cargo_isolation.dependency_cache.final.cargo_home == .cargo_isolation.cargo_home and
-                   .cargo_isolation.dependency_cache.seed.file_count == 2' <<< "$result" >/dev/null; then
+                   .cargo_isolation.dependency_cache.seed.file_count == 2 and
+                   (.cargo_isolation.dependency_cache.final | has("selection") | not) and
+                   (if $mode == "strict" then
+                       .cargo_isolation.dependency_cache.seed.selection.kind == "cargo-lock-downloads" and
+                       .cargo_isolation.dependency_cache.seed.selection.lockfile_sha256 == $sources.authentication.lockfile_sha256
+                    else (.cargo_isolation.dependency_cache.seed | has("selection") | not) end)' <<< "$result" >/dev/null; then
                 log_pass "$mode Windows build preserves private dependency cache authority"
             elif [[ "$boundary" != admitted && "$status" -ne 0 ]] &&
                  jq -e '.status != "success" and ((.artifact_path // "") == "") and
@@ -3573,6 +3606,9 @@ main() {
         test_unix_strict_dependency_sources_final_gate
         test_windows_strict_dependency_sources_final_gate
         test_unix_strict_dependency_source_transport_size
+        test_windows_strict_validation_failure_stops_build
+        test_windows_strict_cargo_metadata_command
+        test_windows_private_cache_collection
         printf 'Native source authority tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
         [[ "$FAIL_COUNT" -eq 0 ]]
         return $?

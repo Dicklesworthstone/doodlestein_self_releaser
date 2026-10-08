@@ -692,22 +692,28 @@ unpublished and suppresses dispatch and upgrade hooks.
 Strict native builds trust the configured build host and its installed
 compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and
 records the explicit build-influence environment. Native Rust builds use
-independent Cargo homes. Strict Unix builds copy only downloads selected by the
-committed `Cargo.lock`: checksum-matching archives, corresponding sparse index
+independent Cargo homes. Strict Unix and Windows builds copy only downloads
+selected by the committed `Cargo.lock`: checksum-matching archives, corresponding sparse index
 records or matching legacy Git indexes, and Git databases containing pinned
 commits. Cargo recreates extracted registry sources and Git checkouts offline;
-unrelated ambient working copies, links, special files, and archives are not
-opened or copied. A lockfile without Git dependencies does not inspect the Git
-cache. Selection conservatively covers all lockfile packages, not a minimal
+ambient `registry/src` and `git/checkouts` trees are not opened or copied, and
+unmatched crate archives do not enter the seed. Candidate Git databases are
+examined for locked revisions, and selected index storage is validated; unsafe
+download candidates can still refuse preparation. A lockfile without Git
+dependencies does not inspect the Git cache. Selection conservatively covers
+all lockfile packages, not a minimal
 target/feature graph, and selected Git databases/indexes retain their history.
-Strict Windows and ordinary native builds copy the `registry` and `git` caches.
+Ordinary native builds copy the `registry` and `git` caches.
 Metadata and target attempts never compile through ambient cache symlinks or
 Windows junctions. Strict metadata admits a retained seed only after successful
-locked offline resolution and source authentication; Unix retained seeds contain
+locked offline resolution and source authentication; retained seeds contain
 only the selected downloads. Retries verify the retained inventory and original
-lockfile selection before making another private copy. The selection kind,
+lockfile selection before making another private copy. Windows holds the physical
+lockfile against replacement or writes through metadata and seed admission.
+The selected lockfile hash must match the authenticated source lockfile hash
+before seed publication and controller admission. The selection kind,
 lockfile hash, registry-package count and Git revisions are retained in the
-Unix seed summary under `cargo_isolation.dependency_cache.seed.selection`.
+seed summary under `cargo_isolation.dependency_cache.seed.selection`.
 Collection requires the original seed-receipt digest and a valid final inventory,
 retained under `cargo_isolation.dependency_cache` with `cache_reuse: []`.
 Windows uses PowerShell 7 and native NTFS handles, rejects reparses and external
@@ -732,12 +738,12 @@ The coordinator retains metadata and source-evidence SHA-256 hashes under
 `cargo_isolation.dependency_sources`, together with the lockfile hash and counts
 of archive, Git, and workspace-snapshot authenticated packages. Full inventories
 remain in each attempt's private Cargo home. Verification checks both held
-hashes and the current authenticated source trees before compilation and in an
+hashes and the current authenticated source trees before project compilation and in an
 independent invocation before artifact collection. Rewriting a remote receipt,
 changing metadata, or modifying a dependency during the build refuses collection,
-independently of the build shell's postamble. Failed first
-admission does not publish a seed; a later attempt can use repaired ambient
-downloads. An already admitted seed is verified and never replaced in place.
+independently of the build shell's postamble. Failed first admission does not
+publish a seed or start project compilation; a later attempt can use repaired
+ambient downloads. An already admitted seed is verified and never replaced in place.
 
 Strict Windows Cargo metadata and compilation share a native system CMD
 launcher (`/d /v:off /s /c`), working directory, and sanitized configured
@@ -781,8 +787,8 @@ retain their resolved executable paths and hashes, including copied proxies
 without a matching rustup on PATH. The full identity is part of
 the retained context receipt and survives public build JSON, completed state
 and manifest projection. Windows paths use drive-qualified `C:/...` spelling.
-An absent or malformed executable identity refuses compilation. The selected
-rustc performs a small link outside the source snapshot to identify its default
+An absent or malformed executable identity refuses project compilation. Before
+dependency metadata, the selected rustc performs a small link outside the source snapshot to identify its default
 linker; a Windows linker that does not resolve to an absolute path requires an
 explicit target linker. These probe files remain beside the private Cargo home.
 
@@ -799,8 +805,9 @@ configuration. PATH entries must be drive-qualified absolute paths; known
 ambiguous compiler lookup locations are refused. Configured
 `RUSTUP_FORCE_ARG0` dispatch overrides are refused. Configure a nondefault
 `RUSTUP_HOME` explicitly instead of relying on an ambient Rust selector.
-Coverage includes the selected Cargo, compiler and linker executables; the
-native host remains trusted for loaded libraries and other subprocesses.
+Evidence consists of selected Cargo, compiler and linker file hashes, versions,
+and probe results. The native host remains trusted for launching those files,
+loaded libraries and other subprocesses.
 These receipts assume the native host honestly executes DSR.
 
 On Unix hosts, strict Rust

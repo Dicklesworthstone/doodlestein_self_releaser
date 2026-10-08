@@ -728,7 +728,10 @@ function Invoke-DsrCargoCommand {
     # Keep slash-normalized paths in receipts, but launch CMD with its native
     # spelling. CMD also scans its own command-line image token for switches;
     # a /cmd.exe component can be interpreted as /c instead of the image name.
-    $psi.FileName = $Context.CmdPath.Replace('/','\'); $psi.WorkingDirectory = $Context.SourceRoot
+    $psi.FileName = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $Context.CmdPath.Replace('/','\')
+    } else { $Context.CmdPath }
+    $psi.WorkingDirectory = $Context.SourceRoot
     $psi.UseShellExecute = $false
     $psi.Arguments = '/d /v:off /s /c "' + $Command + '"'
     $psi.EnvironmentVariables.Clear()

@@ -54,6 +54,17 @@ function Write-FixtureText {
     [IO.File]::WriteAllText($Path,$Value,$script:Utf8)
 }
 
+function New-GeneratedSourceFixture {
+    param([string]$Name)
+    $parent = $root + '/' + $Name; $source = $parent + '/source'
+    foreach ($relative in @('Cargo.toml','Cargo.lock','.cargo/config.toml','src/main.rs')) {
+        Write-FixtureText ($source + '/' + $relative) ([IO.File]::ReadAllText($workspace + '/' + $relative))
+    }
+    $marker = $parent + '/compiler-ran'
+    Write-FixtureText ($source + '/build.rs') ('fn main() { std::fs::write(r#"' + $marker + '"#, b"compiled").unwrap(); }')
+    return @{Parent=$parent; SourceRoot=$source; CompilerMarker=$marker}
+}
+
 function Invoke-Program {
     param([string]$Executable, [string[]]$Arguments, [string]$Directory, [switch]$ExpectFailure)
     $info = [Diagnostics.ProcessStartInfo]::new($Executable)
@@ -96,7 +107,7 @@ Build)
 Finish)
     exec 3>&1
     _act_windows_cache_command() { printf '%s\n' "$3" >&3; return 75; }
-    _act_finish_windows_private_cargo_home fixture-host "$2" "$3" "$4" "$5"
+    _act_finish_windows_private_cargo_home fixture-host "$2" "$3" "$4" "$5" "$6" "$7" "$8"
     result=$?
     [[ "$result" -eq 75 ]] || exit 1
     ;;
@@ -111,7 +122,8 @@ esac
         $Admission.cargo_context.fingerprint,$Admission.cargo_context.receipt_sha256,$Admission.receipt_sha256,
         ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100)) }
     else { $arguments += @($homeArgument,$Admission.receipt_sha256,$sourceArgument,
-        ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100)) }
+        ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100),$BuildCommand,($ConfiguredEnvironment -join "`n"),
+        ($Admission.cargo_context | ConvertTo-Json -Compress -Depth 100)) }
     $body = (Invoke-Program $sourceBashPath $arguments).Out
     if (-not $script:WindowsHost) {
         # Windows executes the generated text verbatim. The explicit Linux
@@ -394,36 +406,70 @@ try {
         Assert-Check 'ordinary Windows case aliases retain the same physical source identity' $true
     }
 
-    $generatedParent = $root + '/generated-stage'; $generatedSource = $generatedParent + '/source'
-    foreach ($relative in @('Cargo.toml','Cargo.lock','.cargo/config.toml','src/main.rs')) {
-        Write-FixtureText ($generatedSource + '/' + $relative) ([IO.File]::ReadAllText($workspace + '/' + $relative))
-    }
+    $generatedFixture = New-GeneratedSourceFixture 'generated-stage'
+    $generatedParent = $generatedFixture.Parent; $generatedSource = $generatedFixture.SourceRoot
     $generatedTarget = $root + '/target-generated'
     $configured = @('CARGO_TARGET_DIR=' + $generatedTarget)
     if ($env:RUSTUP_HOME) { $configured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
     $buildCommand = 'cargo build --locked --offline -j1'
     $generatedArguments = @{SourceRoot=$generatedSource;BuildCommand=$buildCommand;ConfiguredEnvironment=$configured}
     Write-FixtureText $registryLib "pub fn answer() -> u32 { 41 }`n"
-    $null = Invoke-Program $cargo @('build','--locked','--offline','--target-dir',($root + '/target-generated-ungated')) $generatedSource
-    Assert-Check 'ungated Cargo compiles the same poisoned ambient cache used by metadata admission' ((Invoke-Program ($root + '/target-generated-ungated' + $binary) @()).Out.Trim() -ceq '43')
-    $rejectedAdmission = Invoke-GeneratedSourceProgram -Operation Metadata -Suffix poisoned -ExpectFailure @generatedArguments
-    Assert-GeneratedSourceRefusal 'generated metadata refuses poisoned dependency bytes before seed admission' $rejectedAdmission 'differ from locked content'
-    Assert-Check 'failed source authentication publishes neither canonical seed nor source receipt' (-not [IO.Directory]::Exists($generatedParent + '/.cargo-home') -and
-        -not [IO.File]::Exists($generatedParent + '/.cargo-home-poisoned/.dsr-cargo-sources.json'))
-    Write-FixtureText $registryLib $registryOriginal
-    $admission = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Metadata -Suffix repaired @generatedArguments).Out -Depth 100
-    Assert-Check 'repair plus fresh metadata admits authenticated registry and Git source evidence' ($admission.dependency_sources.authentication.locked_archive_packages -eq 1 -and
+    Write-FixtureText $gitLib "pub fn answer() -> u32 { 3 }`n"
+    $null = Invoke-Program $cargo @('build','--locked','--offline','--target-dir',($root + '/target-generated-ungated')) $workspace
+    Assert-Check 'ungated Cargo compiles both poisoned ambient source trees' ((Invoke-Program ($root + '/target-generated-ungated' + $binary) @()).Out.Trim() -ceq '44')
+    $unrelatedArchive = $cargoHomePath + '/registry/cache/unrelated-cache/unrelated-9.9.9.crate'
+    Write-FixtureText $unrelatedArchive 'unrelated download must not enter the admitted seed'
+    $largeArchive = [IO.File]::OpenWrite($unrelatedArchive)
+    try { $largeArchive.SetLength(64MB) } finally { $largeArchive.Dispose() }
+    $unrelatedOutside = $root + '/unrelated-linked-source'; Write-FixtureText ($unrelatedOutside + '/sentinel') 'untouched'
+    $linkKind = if ($script:WindowsHost) { 'Junction' } else { 'SymbolicLink' }
+    foreach ($relative in @('registry/src/unrelated-linked','git/checkouts/unrelated-linked')) {
+        $null = New-Item -ItemType $linkKind -Path ($cargoHomePath + '/' + $relative) -Target $unrelatedOutside
+    }
+    $admission = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Metadata -Suffix reconstructed @generatedArguments).Out -Depth 100
+    Assert-Check 'generated metadata reconstructs authenticated registry and Git sources from locked downloads' ($admission.dependency_sources.authentication.locked_archive_packages -eq 1 -and
         $admission.dependency_sources.authentication.locked_git_packages -eq 1 -and [IO.Directory]::Exists($generatedParent + '/.cargo-home'))
+    $canonicalSeed = $generatedParent + '/.cargo-home'
+    $canonicalReceipt = Read-DsrCargoReceipt ($canonicalSeed + '/.dsr-cache-seed.json')
+    Assert-Check 'retained download selection binds the actual lock and excludes extracted sources and unrelated payloads' (
+        $admission.selection.kind -ceq 'cargo-lock-downloads' -and
+        $admission.selection.lockfile_sha256 -ceq (Get-DsrCargoSourceFileHash ($generatedSource + '/Cargo.lock')) -and
+        $admission.selection.registry_packages -eq 1 -and @($admission.selection.git_revisions).Count -eq 1 -and
+        $admission.selection.git_revisions[0] -ceq $revision -and
+        (ConvertTo-DsrCacheCanonicalJson $admission.selection) -ceq (ConvertTo-DsrCacheCanonicalJson $canonicalReceipt.value.selection) -and
+        -not [IO.Directory]::Exists($canonicalSeed + '/registry/src') -and
+        -not [IO.Directory]::Exists($canonicalSeed + '/git/checkouts') -and
+        -not [IO.File]::Exists($canonicalSeed + '/registry/cache/unrelated-cache/unrelated-9.9.9.crate') -and
+        $admission.size_bytes -lt 64MB -and
+        [IO.File]::ReadAllText($unrelatedOutside + '/sentinel') -ceq 'untouched')
+    Assert-Check 'authenticated metadata and seed admission do not compile the project' (-not [IO.File]::Exists($generatedFixture.CompilerMarker))
     $attemptMetadata = $admission.cargo_home + '/.dsr-cargo-metadata.json'; $attemptReceipt = $admission.cargo_home + '/.dsr-cargo-sources.json'
     Assert-Check 'generated metadata retains both independently held source-evidence digests' ($admission.dependency_sources.metadata_sha256 -ceq (Get-DsrCargoSourceFileHash $attemptMetadata) -and
         $admission.dependency_sources.sha256 -ceq (Get-DsrCargoSourceFileHash $attemptReceipt))
     $admittedSeedDigest = Get-DsrCargoSourceFileHash ($generatedParent + '/.cargo-home/.dsr-cache-seed.json')
     $null = Invoke-GeneratedSourceProgram -Operation Build -Admission $admission @generatedArguments
-    Assert-Check 'generated admitted build performs real locked offline compilation' ((Invoke-Program ($generatedTarget + $binary) @()).Out.Trim() -ceq '42')
+    Assert-Check 'generated admitted build performs authentic compilation despite poisoned ambient extraction' (
+        (Invoke-Program ($generatedTarget + $binary) @()).Out.Trim() -ceq '42' -and [IO.File]::Exists($generatedFixture.CompilerMarker))
+    Write-FixtureText $registryLib $registryOriginal
+    Write-FixtureText $gitLib $gitOriginal
     $final = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Finish -Admission $admission @generatedArguments).Out -Depth 100
     Assert-Check 'independent generated finish accepts the exact coordinator-held evidence' ($final.mode -ceq 'inventory' -and
         $final.cargo_home -ceq $admission.cargo_home -and $final.receipt_sha256 -ceq (Get-DsrCargoSourceFileHash $final.receipt_path))
+    Assert-Check 'final expanded cache inventory does not claim download-only selection' ($final.PSObject.Properties.Name -cnotcontains 'selection')
     Assert-Check 'metadata recovery and actual build preserve the admitted canonical seed' ((Get-DsrCargoSourceFileHash ($generatedParent + '/.cargo-home/.dsr-cache-seed.json')) -ceq $admittedSeedDigest)
+    $retainedAmbient = $root + '/retained-ambient-after-admission'
+    [IO.Directory]::Move($cargoHomePath,$retainedAmbient)
+    try {
+        $retryAdmission = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Metadata -Suffix ambient-gone @generatedArguments).Out -Depth 100
+        Assert-Check 'fresh metadata reconstructs both dependencies from the unchanged retained seed after ambient loss' (
+            $retryAdmission.cargo_home -cne $admission.cargo_home -and
+            $retryAdmission.dependency_sources.authentication.locked_archive_packages -eq 1 -and
+            $retryAdmission.dependency_sources.authentication.locked_git_packages -eq 1 -and
+            (ConvertTo-DsrCacheCanonicalJson $retryAdmission.selection) -ceq (ConvertTo-DsrCacheCanonicalJson $admission.selection) -and
+            (Get-DsrCargoSourceFileHash ($canonicalSeed + '/.dsr-cache-seed.json')) -ceq $admittedSeedDigest -and
+            -not [IO.Directory]::Exists($canonicalSeed + '/registry/src') -and
+            -not [IO.Directory]::Exists($canonicalSeed + '/git/checkouts'))
+    } finally { [IO.Directory]::Move($retainedAmbient,$cargoHomePath) }
     $attemptGraph = ConvertFrom-Json ([IO.File]::ReadAllText($attemptMetadata)) -Depth 100
     $attemptRegistryPackage = $attemptGraph.packages | Where-Object { $_.name -ceq 'source_registry_dep' }
     $attemptRegistryLib = ([IO.Path]::GetDirectoryName($attemptRegistryPackage.manifest_path)).Replace('\','/') + '/src/lib.rs'
@@ -445,6 +491,57 @@ try {
     Assert-GeneratedSourceRefusal 'independent finish rejects changed source receipt against the held digest' $rejectedFinish 'coordinator-held authority'
     Write-FixtureText $attemptReceipt $attemptReceiptText
     Assert-Check 'failed final admissions preserve previously published final receipt bytes' ((Get-DsrCargoSourceFileHash $final.receipt_path) -ceq $final.receipt_sha256)
+
+    # Real locked downloads are damaged independently. Omitted candidates must
+    # fail actual offline resolution; linked selected storage fails even before
+    # metadata. No failure may publish a canonical seed or compile the project.
+    $registryNamespace = [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($registryRoot))
+    foreach ($damage in @('archive-missing','archive-corrupt','git-missing','git-corrupt','archive-linked','git-linked','git-alternates')) {
+        $caseFixture = New-GeneratedSourceFixture ('required-' + $damage)
+        $caseAmbient = $caseFixture.Parent + '/ambient'
+        $null = Invoke-DsrCargoCache -Operation snapshot -First $cargoHomePath -Second $caseAmbient -Lockfile ($caseFixture.SourceRoot + '/Cargo.lock')
+        $caseArchiveDirectory = $caseAmbient + '/registry/cache/' + $registryNamespace
+        $caseArchive = $caseArchiveDirectory + '/source_registry_dep-1.0.0.crate'
+        $caseDatabase = Get-ChildItem -LiteralPath ($caseAmbient + '/git/db') -Directory | Select-Object -First 1
+        switch ($damage) {
+            'archive-missing' { [IO.File]::Move($caseArchive,($caseFixture.Parent + '/retained.crate')) }
+            'archive-corrupt' { [IO.File]::WriteAllBytes($caseArchive,[byte[]]@(0,1,2,3)) }
+            'git-missing' { [IO.Directory]::Move($caseDatabase.FullName,($caseFixture.Parent + '/retained-db')) }
+            'git-corrupt' { Write-FixtureText ($caseDatabase.FullName + '/HEAD') 'not a Git reference' }
+            'archive-linked' {
+                $retained = $caseFixture.Parent + '/retained-archive-directory'
+                [IO.Directory]::Move($caseArchiveDirectory,$retained)
+                $null = New-Item -ItemType $linkKind -Path $caseArchiveDirectory -Target $retained
+            }
+            'git-linked' {
+                $retained = $caseFixture.Parent + '/retained-db'
+                [IO.Directory]::Move($caseDatabase.FullName,$retained)
+                $null = New-Item -ItemType $linkKind -Path $caseDatabase.FullName -Target $retained
+            }
+            'git-alternates' { Write-FixtureText ($caseDatabase.FullName + '/objects/info/alternates') ($root + '/outside-object-store') }
+        }
+        if ($damage -in @('archive-linked','git-linked','git-alternates')) {
+            $refusedHome = $caseFixture.Parent + '/refused-private'
+            Assert-Refused ('selected ' + $damage + ' storage is refused before metadata') {
+                Invoke-DsrCargoCache -Operation snapshot -First $caseAmbient -Second $refusedHome -Lockfile ($caseFixture.SourceRoot + '/Cargo.lock')
+            } 'linked|Linked|reparse|special|Git|storage|reference'
+            Assert-Check ('refused ' + $damage + ' snapshot publishes no seed receipt') (-not [IO.File]::Exists($refusedHome + '/.dsr-cache-seed.json'))
+        } else {
+            $caseConfigured = @('CARGO_TARGET_DIR=' + $caseFixture.Parent + '/target')
+            if ($env:RUSTUP_HOME) { $caseConfigured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
+            [Environment]::SetEnvironmentVariable('CARGO_HOME',$caseAmbient)
+            try {
+                $failed = Invoke-GeneratedSourceProgram -Operation Metadata -SourceRoot $caseFixture.SourceRoot -BuildCommand $buildCommand `
+                    -ConfiguredEnvironment $caseConfigured -Suffix required-input -ExpectFailure
+            } finally { [Environment]::SetEnvironmentVariable('CARGO_HOME',$cargoHomePath) }
+            $failurePattern = if ($damage.StartsWith('archive-')) { 'offline|archive|checksum|download' } else { 'offline|Git|git|object|revision' }
+            Assert-GeneratedSourceRefusal ('required ' + $damage + ' cannot reach authenticated metadata admission') $failed $failurePattern
+        }
+        Assert-Check ('required ' + $damage + ' failure admits no canonical seed, source receipt, or project compilation') (
+            -not [IO.Directory]::Exists($caseFixture.Parent + '/.cargo-home') -and
+            -not [IO.File]::Exists($caseFixture.Parent + '/.cargo-home-required-input/.dsr-cargo-sources.json') -and
+            -not [IO.File]::Exists($caseFixture.CompilerMarker))
+    }
     if ($script:WindowsHost) {
         $nativeInput = Open-DsrCacheEntry $registryLib
         try {
