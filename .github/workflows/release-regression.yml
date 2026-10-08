@@ -16,6 +16,7 @@ on:
       - 'scripts/tests/test_xwin*.sh'
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_cargo_sources.sh
+      - scripts/tests/test_cargo_sources_authentication.sh
       - scripts/tests/test_github.sh
       - scripts/tests/test_host_health.sh
       - scripts/tests/test_host_config_admission.sh
@@ -67,14 +68,17 @@ jobs:
           set -euo pipefail
           shellcheck -S warning src/cargo_cache.sh src/xwin_build.sh scripts/tests/test_cargo_cache.sh scripts/tests/test_xwin_build.sh
           shellcheck -S warning src/cargo_sources.sh src/xwin_source.sh scripts/tests/test_cargo_sources.sh scripts/tests/test_xwin_source.sh
+          shellcheck -S warning scripts/tests/test_cargo_sources_authentication.sh
           bash -n src/cargo_cache.sh
           bash -n src/xwin_build.sh
           bash -n src/cargo_sources.sh
           bash -n src/xwin_source.sh
           bash -n scripts/tests/test_cargo_sources.sh
           bash -n scripts/tests/test_xwin_source.sh
+          bash -n scripts/tests/test_cargo_sources_authentication.sh
           bash scripts/tests/test_cargo_cache.sh
           bash scripts/tests/test_cargo_sources.sh
+          bash scripts/tests/test_cargo_sources_authentication.sh
           bash scripts/tests/test_xwin_source.sh
           bash scripts/tests/test_xwin_build.sh
           bash scripts/tests/test_xwin_release_build.sh

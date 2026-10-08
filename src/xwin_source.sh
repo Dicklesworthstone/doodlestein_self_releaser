@@ -422,7 +422,12 @@ PY
     # raw metadata. Inventories stay in files (potentially larger than argv).
     # Their stable summaries omit phase-specific paths so equal sources compare
     # equally and are retained in build_environments[].cargo_metadata.
-    dependency_sources=$(cargo_sources_capture "$5" "$selected_packages" "$5.dependency-sources.json") || return $?
+    # The committed workspace lock is the authority, not whichever bytes
+    # happened to be cached before the first observation. The release runner
+    # verifies this workspace snapshot before compilation and after it; that
+    # is also the distinct authority for in-workspace vendored sources.
+    dependency_sources=$(cargo_sources_capture "$5" "$selected_packages" \
+        "$5.dependency-sources.json" "$2/Cargo.lock") || return $?
     # Embed the full inventory in the already protected canonical metadata:
     # the runner holds this file's hash across compilation. A sidecar alone
     # could be changed while the small selection receipt stayed intact.

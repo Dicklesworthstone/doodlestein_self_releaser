@@ -152,7 +152,18 @@ def match_tree(tree, files, directories):
             except (ValueError, Rejected):
                 valid = False
         require(valid, "unrecognized Cargo completion marker")
-    require(actual == files, "dependency source files differ from locked content: " + tree["path"])
+    # Cargo/Git extraction respects the owner's umask. A private home may
+    # legitimately have 0700 executables from 0755 inputs. Never admit added
+    # execute bits or a lost owner-executable bit; before/after inventories
+    # still compare every observed execute bit exactly.
+    expected = {}
+    for name, row in files.items():
+        bits = actual.get(name, {}).get("executable_bits", -1)
+        require(bits >= 0 and bits & ~row["executable_bits"] == 0 and
+                bool(bits & 0o100) == bool(row["executable_bits"] & 0o100),
+                "dependency executable mode differs from locked content: " + name)
+        expected[name] = {**row, "executable_bits": bits}
+    require(actual == expected, "dependency source files differ from locked content: " + tree["path"])
     actual_dirs = set(tree["directories"])
     if tree["kind"] == "git":
         actual_dirs.discard(".git")

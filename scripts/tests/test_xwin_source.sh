@@ -24,6 +24,26 @@ git -C "$PROJECT" config user.email test@example.invalid
 git -C "$PROJECT" remote add origin https://github.com/owner/demo.git
 printf '[package]\nname = "demo"\nversion = "1.2.3"\n' > "$PROJECT/Cargo.toml"
 printf 'version = 3\n' > "$PROJECT/Cargo.lock"
+# Create the cache and lock pin BEFORE committing the primary source. A
+# receipt generated from today's cache bytes is not an upstream checksum.
+python3 - "$WORK" "$PROJECT/Cargo.lock" <<'PY'
+import hashlib, sys, tarfile
+from pathlib import Path
+work, lock = map(Path, sys.argv[1:])
+dependency=work/'cargo-home/registry/src/example-123/lib-2.0.0'
+dependency.mkdir(parents=True)
+(dependency/'Cargo.toml').write_text('[package]\nname="lib"\nversion="2.0.0"\n')
+(dependency/'lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
+archive=work/'cargo-home/registry/cache/example-123/lib-2.0.0.crate'
+archive.parent.mkdir(parents=True)
+with tarfile.open(archive,'w:gz') as output:
+    for path in sorted(dependency.iterdir()):
+        output.add(path,arcname='lib-2.0.0/'+path.name)
+digest=hashlib.sha256(archive.read_bytes()).hexdigest()
+lock.write_text('version = 3\n[[package]]\nname="demo"\nversion="1.2.3"\n'
+    '[[package]]\nname="lib"\nversion="2.0.0"\nsource="registry+https://example.invalid/index"\n'
+    'checksum="'+digest+'"\n')
+PY
 printf 'fn main() {}\n' > "$PROJECT/src/main.rs"
 printf 'ignored.txt\n' > "$PROJECT/.gitignore"
 printf 'src/main.rs export-ignore\nCargo.lock export-subst\n' > "$PROJECT/.gitattributes"
@@ -74,9 +94,7 @@ import json, sys
 from pathlib import Path
 root, output = sys.argv[1:]
 dependency=Path(output).parent/'cargo-home/registry/src/example-123/lib-2.0.0'
-dependency.mkdir(parents=True)
-(dependency/'Cargo.toml').write_text('[package]\nname="lib"\nversion="2.0.0"\n')
-(dependency/'lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
+assert dependency.is_dir()
 a = {"id":"local-demo", "name":"demo", "version":"1.2.3", "source":None,
      "manifest_path":root+"/Cargo.toml", "targets":[{"name":"demo", "kind":["bin"], "src_path":root+"/src/main.rs"}]}
 b = {"id":"registry-lib", "name":"lib", "version":"2.0.0", "source":"registry+https://example.invalid/index",
@@ -127,19 +145,19 @@ assert selection['metadata_sha256']==hashlib.sha256(raw).hexdigest()
 assert selection['dependency_sources']['sha256']==hashlib.sha256(encoded).hexdigest()
 assert selection['dependency_sources']['package_count']==1
 assert {entry['path'] for entry in sources['roots'][0]['files']}=={'Cargo.toml','lib.rs'}
+assert selection['dependency_sources']['authentication']['locked_archive_packages']==1
+assert sources['authentication']['packages'][0]['basis']=='lockfile-crate-sha256'
+assert sources['authentication']['lockfile_sha256']==hashlib.sha256(Path(graph['workspace_root'],'Cargo.lock').read_bytes()).hexdigest()
 PY
 DEPENDENCY="$WORK/cargo-home/registry/src/example-123/lib-2.0.0"
 cp "$META" "$WORK/unchanged-raw.json"
 printf 'pub fn value() -> u32 { 43 }\n' > "$DEPENDENCY/lib.rs"
-assert 'changed dependency still has syntactically valid metadata' xwin_source_metadata \
+reject 'changed dependency is refused even on its first metadata observation' 7 xwin_source_metadata \
     "$META" "$SNAP" demo '' "$WORK/changed-sources.json" 1.2.3
-cp "$WORK/assert.out" "$WORK/changed-selection.json"
 assert 'the raw Cargo dependency graph did not change' cmp -s "$META" "$WORK/unchanged-raw.json"
 assert 'committed primary source is unchanged during dependency mutation' xwin_source_verify "$SNAP" "$RECEIPT"
-assert 'metadata comparison refuses unchanged graph with changed dependency bytes' bash -c \
-    '! cmp -s "$1" "$2"' _ "$WORK/canonical.json" "$WORK/changed-sources.json"
-assert 'selection comparison independently refuses dependency source drift' bash -c \
-    '! cmp -s "$1" "$2"' _ "$WORK/selection.json" "$WORK/changed-selection.json"
+assert 'poisoned source has no admitted dependency sidecar' test ! -e "$WORK/changed-sources.json.dependency-sources.json"
+assert 'poisoned source produces no successful selection' test ! -s "$WORK/rejected.out"
 printf 'pub fn value() -> u32 { 42 }\n' > "$DEPENDENCY/lib.rs"
 assert 'restored dependency bytes regain their original source identity' xwin_source_metadata \
     "$META" "$SNAP" demo '' "$WORK/restored-sources.json" 1.2.3

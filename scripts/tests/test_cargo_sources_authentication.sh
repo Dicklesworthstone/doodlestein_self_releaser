@@ -307,6 +307,26 @@ def after_capture(f):
     f.good(); (f.reg/'shared.h').write_text('#define VALUE 43\n'); f.refused(mode='verify')
 check('post-admission changes are still refused by locked verification', after_capture)
 
+
+def executable(f, kind, observed):
+    directory=f.reg if kind=='registry' else f.repo
+    path=directory/'helper.sh'; path.write_text('#!/bin/sh\nexit 0\n'); path.chmod(0o755)
+    if kind=='registry':
+        f.pack()
+    else:
+        git(f.repo,'add','.'); git(f.repo,'commit','-qm','executable helper')
+        f.commit=git(f.repo,'rev-parse','HEAD'); f.source=f.source[:-40]+f.commit
+        f.graph['packages'][2]['source']=f.source; f.save()
+    f.write_lock(); path.chmod(observed)
+    if observed & 0o100:
+        f.good(); path.chmod(0o755); f.refused(mode='verify')
+    else:
+        f.refused('executable mode')
+check('registry executables admit private umask but retain exact observed modes', lambda f: executable(f,'registry',0o700))
+check('Git executables admit private umask but retain exact observed modes', lambda f: executable(f,'git',0o700))
+check('registry owner-executable bits cannot disappear', lambda f: executable(f,'registry',0o644))
+check('Git owner-executable bits cannot disappear', lambda f: executable(f,'git',0o644))
+
 print('\nLocked dependency sources: %d passed, %d failed' % (PASS, FAIL))
 sys.exit(bool(FAIL))
 PY
