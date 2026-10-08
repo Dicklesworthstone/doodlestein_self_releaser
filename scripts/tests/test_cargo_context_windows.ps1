@@ -213,11 +213,36 @@ try {
     if ($script:WindowsHost) {
         $launcherEnvironment=New-DsrCargoContextEnvironment -CargoHome $privateHome -Environment $baseEnvironment
         $launcherContext=[pscustomobject]@{SourceRoot=$source; Environment=$launcherEnvironment.Environment;
-            CmdPath=(Get-DsrCargoCmdPath $launcherEnvironment.Environment)}
+            CmdPath=(Get-DsrCargoCmdPath $launcherEnvironment.Environment); Toolchain='dsr-context-selected'}
         $launcherResult=Invoke-DsrCargoCommand -Context $launcherContext -Command 'echo dsr-native-cmd-launcher' -CaptureOutput $true
         Check 'slash-normalized CMD identity launches its literal command without parsing argv0 as a switch' (
             $launcherContext.CmdPath.Contains('/') -and $launcherResult.ExitCode -eq 0 -and
             $launcherResult.Stdout.Trim() -ceq 'dsr-native-cmd-launcher' -and -not $launcherResult.Stderr.Trim())
+        # Compare actual MSVC invocations before context admission. The native
+        # CI regression originally hid both its exit status and stdout; these
+        # controls isolate image spelling from quoting of the help switch.
+        $nativeProbeRoot=Join-Path $work 'native-linker-launch'
+        $nativeProbeSource=Join-Path $nativeProbeRoot 'main.rs'
+        Write-Text $nativeProbeSource 'fn main() {}'
+        $nativeLinkOutput=Invoke-DsrCargoToolProbe -Context $launcherContext -Program (Join-Path $sysroot 'bin/rustc.exe') `
+            -Arguments @('--crate-name','dsr_native_linker_probe','--edition=2021','--crate-type=bin','--target',$hostTriple,
+                '--print=link-args',$nativeProbeSource,'-o',(Join-Path $nativeProbeRoot 'probe.exe'))
+        $nativePrinted=Get-DsrCargoPrintedLinker -Output $nativeLinkOutput.Stdout -Context $launcherContext
+        if ([IO.Path]::GetFileName($nativePrinted.program) -ieq 'link.exe') {
+            $nativePrinted.context | Add-Member -NotePropertyName ProbeTimeoutMilliseconds -NotePropertyValue 60000
+            foreach ($spelling in @('normalized','native')) {
+                $nativeImage=if ($spelling -eq 'native') { $nativePrinted.program.Replace('/','\') } else { $nativePrinted.program }
+                foreach ($helpSwitch in @('"/?"','/?')) {
+                    $nativeHelp=Invoke-DsrCargoCommand -Context $nativePrinted.context -Command ('"'+$nativeImage+'" '+$helpSwitch) -CaptureOutput $true
+                    $nativeHelpDetail=($nativeHelp.Stdout+$nativeHelp.Stderr).Trim()
+                    if ($nativeHelpDetail.Length -gt 512) { $nativeHelpDetail=$nativeHelpDetail.Substring(0,512) }
+                    Write-Output ('Native LINK control '+$spelling+' '+$helpSwitch+': exit='+$nativeHelp.ExitCode+'; '+$nativeHelpDetail)
+                }
+            }
+            $nativeHelp=Invoke-DsrCargoToolProbe -Context $nativePrinted.context -Program $nativePrinted.program -Arguments @('/?')
+            Check 'the native discovered LINK executable reports its version through the production probe' (
+                $nativeHelp.ExitCode -eq 0 -and ($nativeHelp.Stdout+$nativeHelp.Stderr) -match 'Incremental Linker Version [0-9]+\.')
+        }
     }
     $context = New-DsrCargoContext -BuildCommand $command -SourceRoot $source -CargoHome $privateHome -Environment $baseEnvironment -ExpectedTarget $hostTriple
     if ($script:WindowsHost) {
@@ -232,6 +257,29 @@ try {
     Check 'managed Cargo home and RCH bypass values override differently cased configured selectors' (
         $context.Environment['CARGO_HOME'] -eq (Get-DsrCacheFullPath $privateHome) -and $context.Environment['RCH_DISABLED'] -eq '1' -and $context.Environment['RCH_CARGO_WRAPPER_BYPASS'] -eq '1')
     Check 'unconfigured ambient Rust selectors are removed from both operations' (-not $context.Environment.ContainsKey('RUSTFLAGS') -and -not $context.Environment.ContainsKey('RUSTC_WRAPPER'))
+    # LINK prepends command arguments and _LINK_ appends them. Ambient values
+    # must not enter either operation; explicitly configured values remain
+    # supported and bound by the same context environment digest.
+    $originalEnvironmentDigest=(Get-DsrCargoContextDigests -Context $context -UseRecordedToolchain).environment_sha256
+    foreach ($linkVariable in @('LINK','_LINK_')) {
+        $originalLinkValue=[Environment]::GetEnvironmentVariable($linkVariable,'Process')
+        try {
+            [Environment]::SetEnvironmentVariable($linkVariable,'dsr-unconfigured-missing-link-input.obj','Process')
+            $ambientLinkEnvironment=New-DsrCargoContextEnvironment -CargoHome $context.CargoHome -Environment $baseEnvironment
+            Check ('unconfigured ambient '+$linkVariable+' cannot inject native linker arguments') (-not $ambientLinkEnvironment.Environment.ContainsKey($linkVariable))
+            $explicitLinkEnvironment=New-DsrCargoContextEnvironment -CargoHome $context.CargoHome -Environment ($baseEnvironment+($linkVariable.ToLowerInvariant()+'=/INCREMENTAL:NO'))
+            $explicitLinkContext=$context.PSObject.Copy()
+            $explicitLinkContext.Environment=$explicitLinkEnvironment.Environment
+            $explicitLinkContext.ConfiguredNames=$explicitLinkEnvironment.ConfiguredNames
+            $explicitDigest=(Get-DsrCargoContextDigests -Context $explicitLinkContext -UseRecordedToolchain).environment_sha256
+            Check ('explicit '+$linkVariable+' remains supported and participates in context admission') (
+                $explicitLinkContext.Environment[$linkVariable] -ceq '/INCREMENTAL:NO' -and
+                $explicitLinkContext.ConfiguredNames -contains $linkVariable -and $explicitDigest -cne $originalEnvironmentDigest)
+            $explicitLinkContext.Environment[$linkVariable]='/INCREMENTAL:YES'
+            Check ('changed explicit '+$linkVariable+' cannot retain the admitted environment digest') (
+                (Get-DsrCargoContextDigests -Context $explicitLinkContext -UseRecordedToolchain).environment_sha256 -cne $explicitDigest)
+        } finally { [Environment]::SetEnvironmentVariable($linkVariable,$originalLinkValue,'Process') }
+    }
     $identity=$context.ToolchainIdentity
     $realCargo=Join-Path $sysroot ('bin/cargo' + $extension)
     $realRustc=Join-Path $sysroot ('bin/rustc' + $extension)
@@ -289,6 +337,11 @@ try {
 use std::{env, process::{Command, exit}};
 #[cfg(unix)] use std::os::unix::process::CommandExt;
 fn main() {
+    if env::var_os("DSR_TEST_PROBE_FAILURE").is_some() {
+        println!("cargo 1.90.0\nDSR_TEST_PROBE_STDOUT");
+        eprintln!("DSR_TEST_PROBE_STDERR");
+        exit(23);
+    }
     let mut command = Command::new(env::var_os("DSR_REAL_TOOL").expect("real tool"));
     #[cfg(unix)]
     if env::var_os("DSR_PRESERVE_ARG0").is_some() {
@@ -311,6 +364,14 @@ fn main() {
     $forwarderProbe=[pscustomobject]@{SourceRoot=$source; CmdPath=$context.CmdPath; Environment=$probeEnvironment.Environment}
     $forwardedVersion=Invoke-DsrCargoToolProbe -Context $forwarderProbe -Program $forwarderCargo -Arguments @('--version')
     Check 'the compiled Cargo forwarder genuinely invokes the selected Cargo toolchain' ($forwardedVersion.Stdout -match '^cargo ')
+    $failureEnvironment=New-DsrCargoContextEnvironment -CargoHome $privateHome -Environment ($forwarderEnvironment+'DSR_TEST_PROBE_FAILURE=1')
+    $failureProbe=[pscustomobject]@{SourceRoot=$source; CmdPath=$context.CmdPath; Environment=$failureEnvironment.Environment}
+    $probeFailure=Invoke-DsrCargoToolProbe -Context $failureProbe -Program $forwarderCargo -Arguments @('--version') -AllowFailure
+    Check 'the real native failed-probe fixture emits both diagnostic streams and a nonzero status' (
+        $probeFailure.ExitCode -eq 23 -and $probeFailure.Stdout.Contains('DSR_TEST_PROBE_STDOUT') -and $probeFailure.Stderr.Contains('DSR_TEST_PROBE_STDERR'))
+    Refused 'a reported version cannot authorize a failed executable probe and both diagnostics remain visible' {
+        Get-DsrCargoExecutableIdentity -Context $failureProbe -Program $forwarderCargo -VersionArguments @('--version')
+    } '(?s)Toolchain executable probe failed: .*\(exit 23\).*Stdout: .*DSR_TEST_PROBE_STDOUT.*Stderr: DSR_TEST_PROBE_STDERR'
     foreach ($selector in @('', '+dsr-context-selected ')) {
         Refused ('unrecognized native Cargo cannot claim Rustup resolution with selector ['+$selector.Trim()+']') {
             New-DsrCargoContext -BuildCommand ('"'+$forwarderCargo+'" '+$selector+'build --locked --offline') `

@@ -813,6 +813,11 @@ configuration. PATH entries must be drive-qualified absolute paths; known
 ambiguous compiler lookup locations are refused. Configured
 `RUSTUP_FORCE_ARG0` dispatch overrides are refused. Configure a nondefault
 `RUSTUP_HOME` explicitly instead of relying on an ambient Rust selector.
+Ambient MSVC `LINK` and `_LINK_` argument variables are removed before metadata
+and compilation. Explicit build-environment values remain supported and are
+included in the admitted context digest; changing either value prevents
+collection. Executable probe failures retain their nonzero status and bounded
+stdout/stderr diagnostics, including LINK errors emitted on stdout.
 Evidence consists of selected Cargo, compiler and linker file hashes, versions,
 and probe results, including recognized Rustup dispatch. The native host remains
 trusted for launching those files; native executables remain trusted to honor

@@ -52,6 +52,7 @@ function Test-DsrCargoSanitizedEnvironmentName {
     param([string]$Name)
     return $Name -match '^(CARGO_|RUST|XWIN_)' -or
         $Name -match '^DSR_RELEASE_GIT_(SHA|REF)$' -or
+        $Name -match '^(LINK|_LINK_)$' -or
         $Name -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)' -or
         $Name -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$' -or
         $Name -match '^(OPENSSL_|.+_OPENSSL_|PKG_CONFIG($|_)|(HOST|TARGET)_PKG_CONFIG($|_)|.+_NO_PKG_CONFIG$|LIBCLANG_PATH$)'
@@ -393,17 +394,33 @@ function ConvertTo-DsrCargoProbeArgument {
     # Unlike user-supplied shell text these are single, already resolved probe
     # arguments. Quoted parentheses are needed for Program Files (x86).
     if (-not $Value -or $Value -match '[\x00-\x1f\x7f"%!^&|<>]' -or $Value.EndsWith('\')) { throw 'Unrepresentable executable probe argument' }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and $Value -notmatch '[ ()]') {
+        return $Value
+    }
     return '"' + $Value + '"'
 }
 
 function Invoke-DsrCargoToolProbe {
     param($Context,[string]$Program,[string[]]$Arguments,[switch]$AllowFailure)
-    $words=@((ConvertTo-DsrCargoProbeArgument $Program))
+    # Receipts use slash-normalized paths. Native tools receive Windows image
+    # spelling, just as they do when rustc launches its discovered MSVC linker.
+    $imagePath=if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $Program.Replace('/','\') } else { $Program }
+    $words=@((ConvertTo-DsrCargoProbeArgument $imagePath))
     foreach ($argument in $Arguments) { $words+=ConvertTo-DsrCargoProbeArgument $argument }
     $bounded=[pscustomobject]@{SourceRoot=$Context.SourceRoot; CmdPath=$Context.CmdPath;
         Environment=$Context.Environment; ProbeTimeoutMilliseconds=60000}
     $result=Invoke-DsrCargoCommand -Context $bounded -Command ($words -join ' ') -CaptureOutput $true
-    if ($result.ExitCode -ne 0 -and -not $AllowFailure) { throw ('Toolchain executable probe failed: ' + $Program + ': ' + $result.Stderr.Trim()) }
+    if ($result.ExitCode -ne 0 -and -not $AllowFailure) {
+        # MSVC emits LNK errors on stdout. Keep the status and both streams so
+        # a loader, invocation, or compiler failure cannot become an empty error.
+        $diagnostic='Toolchain executable probe failed: ' + $Program + ' (exit ' + $result.ExitCode + ')'
+        foreach ($name in @('Stdout','Stderr')) {
+            $detail=([string]$result.$name).Trim()
+            if ($detail.Length -gt 4096) { $detail=$detail.Substring(0,4096) + ' [truncated]' }
+            if ($detail) { $diagnostic += "`n" + $name + ': ' + $detail }
+        }
+        throw $diagnostic
+    }
     return $result
 }
 
