@@ -446,9 +446,30 @@ if ($script:WindowsHost) {
         Assert-Refused 'a pinned Windows cache directory cannot be renamed' {
             [IO.Directory]::Move($f.Ambient, (Join-Path $f.Root 'replacement'))
         }
+        Assert-Check 'directory custody permits ordinary cache enumeration' (
+            (Get-DsrCacheChildren $f.Ambient).Count -gt 0)
+        $newChild = Join-Path $f.Ambient 'registry/new-download'
+        Write-FixtureText $newChild 'downloaded while the parent is pinned'
+        Assert-Check 'directory custody permits new Cargo download files' (
+            [IO.File]::ReadAllText($newChild) -ceq 'downloaded while the parent is pinned')
     } finally { $directory.Dispose() }
     Assert-Check 'Windows sharing refusal leaves the original cache intact' (
         Test-Path -LiteralPath (Join-Path $f.Ambient $relative) -PathType Leaf)
+
+    $guards = Open-DsrCachePathGuard (Get-DsrCacheFullPath (Join-Path $f.Ambient 'registry'))
+    try {
+        Assert-Refused 'a guarded Windows cache ancestor cannot be renamed' {
+            [IO.Directory]::Move($f.Ambient, (Join-Path $f.Root 'replacement'))
+        }
+        Assert-Refused 'the guarded Windows cache leaf cannot be renamed' {
+            [IO.Directory]::Move((Join-Path $f.Ambient 'registry'), (Join-Path $f.Ambient 'retained-registry'))
+        }
+    } finally { foreach ($guard in $guards) { $guard.Dispose() } }
+    $releasedDirectory = Join-Path $f.Root 'released-cache'
+    [IO.Directory]::Move($f.Ambient, $releasedDirectory)
+    Assert-Check 'disposing directory custody permits an ordinary rename' (
+        (Test-Path -LiteralPath (Join-Path $releasedDirectory $relative) -PathType Leaf) -and
+        -not (Test-Path -LiteralPath $f.Ambient))
 
     $f = New-CacheFixture 'native-stream-lifetime'
     $lifetimeFile = Join-Path $f.Ambient $relative

@@ -23,7 +23,10 @@ class PrivateCacheTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='dsr-cargo-cache-test.')
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # Darwin's temporary directory may start with the /var symlink.
+        # Selection inputs require physical ancestors; individual tests still
+        # create their own rejected links below this canonical fixture root.
+        self.root = Path(self.temporary.name).resolve()
         self.source = self.root / 'ambient cargo'
         self.home = self.root / 'private cargo'
         self.source.mkdir()
@@ -430,6 +433,17 @@ class LockedCacheTests(unittest.TestCase):
         self.lock.rename(self.root / 'retained-lock')
         self.lock.symlink_to(self.root / 'retained-lock')
         self.scoped(7)
+
+    def test_lockfile_ancestor_symlink_fails_before_copying(self):
+        alias = self.root / 'lockfile-parent-alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        result = subprocess.run(['bash', MODULE, 'snapshot', str(self.source),
+                                 str(self.home), str(alias / 'Cargo.lock')],
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertFalse(result.stdout)
+        self.assertIn('[cargo-cache]', result.stderr)
+        self.assertFalse(self.home.exists())
 
     def test_duplicate_pins_are_not_silently_merged(self):
         self.write_lock([self.pin, self.pin])

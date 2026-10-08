@@ -21,9 +21,11 @@ public sealed class DsrCargoCacheHandle : IDisposable {
         Path = path; IsDirectory = directory;
         string native = path.Replace('/', '\\');
         if (!native.StartsWith(@"\\?\", StringComparison.Ordinal)) native = @"\\?\" + native;
-        // Pin directories against replacement. Files additionally deny writers
-        // for the duration of each read/copy; sharing violations fail closed.
-        uint access = directory ? 0x80u : 0x80000000u;
+        // Metadata-only FILE_READ_ATTRIBUTES handles do not participate in
+        // sharing checks. Include FILE_LIST_DIRECTORY so withholding
+        // FILE_SHARE_DELETE actually pins directories against replacement.
+        // Files additionally deny writers throughout each read/copy.
+        uint access = directory ? 0x81u : 0x80000000u;
         uint sharing = directory ? 3u : 1u;
         handle = DsrCargoCacheNative.CreateFileW(native, access, sharing, IntPtr.Zero,
             3, 0x00200000u | 0x02000000u, IntPtr.Zero);
