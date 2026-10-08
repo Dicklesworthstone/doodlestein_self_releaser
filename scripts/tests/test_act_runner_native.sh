@@ -301,6 +301,17 @@ _act_run_with_timeout() {
     "$@"
 }
 
+# Transport evidence only: the source authentication integration tests run the
+# real registry/Git proof gate. Keep every digest distinct so the coordinator
+# cannot accidentally substitute cache or toolchain authority for this proof.
+_test_native_dependency_sources() {
+    jq -nc '{schema_version:1,kind:"dsr-cargo-dependency-sources",
+        sha256:("8" * 64),metadata_sha256:("7" * 64),
+        package_count:2,root_count:2,file_count:4,size_bytes:128,
+        authentication:{lockfile_sha256:("9" * 64),locked_archive_packages:1,
+            locked_git_packages:1,workspace_snapshot_packages:0}}'
+}
+
 # Mock _act_ssh_exec - captures args to file
 _act_ssh_exec() {
     local host="$1"
@@ -320,6 +331,10 @@ _act_ssh_exec() {
     fi
     local exit_code
     exit_code=$(cat "$SSH_EXIT_CODE_FILE")
+    if [[ "$cmd" == *'dsr_verified_sources='* && "$cmd" != *DSR_PRIVATE_CACHE_SEED* &&
+          -n "${MOCK_SOURCE_VERIFY_EXIT_CODE:-}" ]]; then
+        return "$MOCK_SOURCE_VERIFY_EXIT_CODE"
+    fi
     # Compilation itself is a transport boundary in this shell suite. The
     # PowerShell context suite executes the shared launcher and Cargo for real.
     if [[ "$cmd" == *'$dsrBuildResult=Invoke-DsrCargoContext -Context $dsrContext -Operation Build'* ]]; then
@@ -382,6 +397,10 @@ _act_ssh_exec() {
              tools: {cargo: tool("cargo"), rustc: tool("rustc"), linker: tool("cc")}}'
         return 0
     fi
+    if [[ "$exit_code" -eq 0 && "$cmd" =~ ^cat\ \'/[^\']+\.cache-receipt\.json\'$ ]]; then
+        jq -nc '{namespace:("a"*64),final_output_policy:"fresh-run-target-detached-under-custody"}'
+        return 0
+    fi
     # Ordinary builds prepare a private stage-root cache the same way.
     if [[ "$exit_code" -eq 0 && "$cmd" == *'dsr_seed_summary=$(_cargo_cache_run snapshot "$ambient_home"'* ]]; then
         local nonstrict_home=""
@@ -429,8 +448,11 @@ _act_ssh_exec() {
             fixture_receipt="$fixture_home.final.json"
         fi
         jq -nc --arg home "$fixture_home" --arg mode "$fixture_mode" --arg receipt "$fixture_receipt" \
+            --argjson sources "$(_test_native_dependency_sources)" \
             '{schema_version:1, mode:$mode, cargo_home:$home, receipt_path:$receipt,
-              receipt_sha256:("1" * 64), inventory_sha256:("2" * 64), caches:[], file_count:0, size_bytes:0}'
+              receipt_sha256:("1" * 64), inventory_sha256:("2" * 64),
+              caches:["git","registry"], file_count:6, size_bytes:256}
+             + (if $mode == "private-copy" then {dependency_sources:$sources} else {} end)'
         return 0
     fi
     if [[ "$exit_code" -eq 0 && "$cmd" == *"Cargo target source identity mismatch"* && \
@@ -576,6 +598,9 @@ yq() {
         '.build_profile // "release"')
             echo "${MOCK_BUILD_PROFILE:-release}"
             ;;
+        '.strict_cargo_cache_root // ""')
+            echo "${MOCK_STRICT_CARGO_CACHE_ROOT:-}"
+            ;;
         '.workflow // ".github/workflows/release.yml"')
             echo ".github/workflows/release.yml"
             ;;
@@ -638,6 +663,7 @@ reset_state() {
     unset MOCK_SSH_STREAM_FILE
     unset MOCK_SIBLING_RELATIVE MOCK_SIBLING_LOCAL_PATH
     unset MOCK_ARTIFACT_KIND MOCK_GLIBC_FLOOR MOCK_DERIVE_OPT
+    unset MOCK_SOURCE_VERIFY_EXIT_CODE MOCK_STRICT_CARGO_CACHE_ROOT
 
     # Defaults
     MOCK_LOCAL_PATH="/local/path/tool"
@@ -1425,6 +1451,7 @@ PY
 test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
     log_test "Unix Rust strict build: Cargo output stays outside source snapshot"
     reset_state
+    local SDK_COMMAND_FILE="$MOCK_DIR/source-isolation-build.sh"
     MOCK_LANGUAGE="rust"
     MOCK_BUILD_CMD="cargo build --release"
     MOCK_BINARY_NAME="tool"
@@ -1449,12 +1476,15 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
             "1111111111111111111111111111111111111111" "v1.0.0" "mmini" 2>/dev/null
     )
 
-    local cmd scp_args raw_ssh_args expected_target expected_home
-    cmd=$(get_ssh_cmd)
+    local cmd scp_args raw_ssh_args expected_target expected_home expected_sources environments
+    # Check the actual compiler request, not the concatenated metadata,
+    # verification and cleanup exchange (which may include staged launchers).
+    cmd=$(cat "$SDK_COMMAND_FILE" 2>/dev/null)
     scp_args=$(get_scp_args)
     raw_ssh_args=$(get_raw_ssh_args)
     expected_target="/remote/.dsr-release-snapshots/tool-run/.cargo-target-darwin-arm64"
     expected_home=$(jq -r '.build_influence_env.CARGO_HOME // empty' <<< "$result")
+    expected_sources=$(_test_native_dependency_sources)
     if [[ "$expected_home" == /remote/.dsr-release-snapshots/tool-run/.cargo-home-darwin-arm64-* && \
           "$cmd" == *"export \"CARGO_TARGET_DIR=$expected_target\""* && \
           "$cmd" == *"export \"CARGO_HOME=$expected_home\""* && \
@@ -1472,11 +1502,15 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
           -z "$scp_args" && "$raw_ssh_args" == *"cat --"* ]] && \
        echo "$result" | jq -e \
             --arg home "$expected_home" \
+            --argjson sources "$expected_sources" \
             '.build_influence_env.CARGO_HOME == $home and
              .cargo_isolation.cache_reuse == [] and
              .cargo_isolation.dependency_cache.mode == "private-copy" and
              .cargo_isolation.dependency_cache.seed.cargo_home == $home and
              .cargo_isolation.dependency_cache.final.cargo_home == $home and
+             .cargo_isolation.dependency_sources == $sources and
+             (.cargo_isolation.dependency_cache.seed | has("dependency_sources") | not) and
+             (.cargo_isolation.dependency_cache.final | has("dependency_sources") | not) and
              .build_influence_env.RUSTFLAGS == "-C target-cpu=apple-m4" and
              .build_influence_env.XWIN_CACHE_DIR == "/pinned/xwin-cache" and
              .build_influence_env.XWIN_MSVC_SYSROOT_DOWNLOAD_URL == "https://example.invalid/pinned-sysroot.tar.xz" and
@@ -1490,6 +1524,15 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
         log_pass "Strict Unix build isolates Cargo config and compiler influence env"
     else
         log_fail "Strict Unix Cargo/env isolation was not enforced: cmd=$cmd scp=$scp_args result=$result"
+    fi
+    environments=$(_act_build_environments_json "$(jq -nc --argjson target "$result" '{targets:[$target]}')")
+    if jq -e --argjson sources "$expected_sources" \
+            'length == 1 and .[0].cargo_isolation.dependency_sources == $sources and
+             (.[0].cargo_isolation.dependency_cache.seed | has("dependency_sources") | not)' \
+            <<< "$environments" >/dev/null; then
+        log_pass "Native worker and manifest projection retain the held dependency source authority"
+    else
+        log_fail "Native dependency source evidence was lost or mixed into cache evidence: $environments"
     fi
     unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
     unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER DSR_RELEASE_GIT_SHA DSR_RELEASE_GIT_REF
@@ -1714,6 +1757,131 @@ test_unix_strict_validation_failure_stops_build() {
         log_pass "Unix strict validation failure prevented the build sentinel"
     else
         log_fail "Unix strict validation failure reached the build command"
+    fi
+}
+
+test_unix_strict_dependency_sources_authority() {
+    log_test "Strict Unix Rust: cache copies alone cannot authorize dependency sources"
+    local boundary status prepared launched
+    for boundary in missing metadata_digest lockfile_digest authentication_counts root_count; do
+        reset_state
+        MOCK_LANGUAGE=rust
+        MOCK_BUILD_CMD='cargo build --release'
+        prepared="$MOCK_DIR/sources-$boundary-prepared"
+        launched="$MOCK_DIR/sources-$boundary-launched"
+        status=0
+        (
+            _act_prepare_unix_private_cargo_home() {
+                printf 'prepared\n' > "$prepared"
+                jq -nc --argjson sources "$(_test_native_dependency_sources)" --arg boundary "$boundary" '
+                    {schema_version:1,mode:"private-copy",cargo_home:"/remote/run/private-home",
+                     receipt_path:"/remote/run/private-home/.dsr-cache-seed.json",
+                     receipt_sha256:("1"*64),inventory_sha256:("2"*64),
+                     caches:["git","registry"],file_count:6,size_bytes:256,dependency_sources:$sources}
+                    | if $boundary == "missing" then del(.dependency_sources)
+                      elif $boundary == "metadata_digest" then .dependency_sources.metadata_sha256 = ("7"*63)
+                      elif $boundary == "lockfile_digest" then del(.dependency_sources.authentication.lockfile_sha256)
+                      elif $boundary == "authentication_counts" then .dependency_sources.authentication.locked_git_packages = 2
+                      else .dependency_sources.root_count = 3 end'
+            }
+            _act_ssh_exec() { printf 'launched\n' > "$launched"; return 99; }
+            act_run_native_build tool darwin/arm64 v1.0.0 source-authority \
+                /remote/run/source >/dev/null 2>&1
+        ) || status=$?
+        if [[ "$status" -eq 4 && -s "$prepared" && ! -e "$launched" ]]; then
+            log_pass "Strict Unix $boundary source authority rejected before process launch"
+        else
+            log_fail "Strict Unix $boundary evidence reached a process: status=$status"
+        fi
+    done
+}
+
+test_unix_strict_dependency_sources_final_gate() {
+    log_test "Strict Unix Rust: successful remote execution still requires source verification"
+    local boundary result status finish_args raw_ssh expected_sources source_root SDK_COMMAND_FILE
+    expected_sources=$(_test_native_dependency_sources)
+    source_root=/remote/source-final/source
+    for boundary in admitted pre_changed changed; do
+        reset_state
+        MOCK_LANGUAGE=rust
+        MOCK_BUILD_CMD='cargo build --release'
+        MOCK_SSH_STREAM_FILE="$MOCK_DIR/source-final-$boundary-artifact"
+        write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+        finish_args="$MOCK_DIR/source-final-$boundary-arguments.json"
+        SDK_COMMAND_FILE="$MOCK_DIR/source-final-$boundary-build.sh"
+        [[ "$boundary" != pre_changed ]] || MOCK_SOURCE_VERIFY_EXIT_CODE=7
+        status=0
+        result=$(
+            _act_finish_unix_private_cargo_home() {
+                jq -nc --arg host "$1" --arg home "$2" --arg seed "$3" \
+                    --arg source "${4-}" --argjson sources "${5-null}" \
+                    '{host:$host,home:$home,seed:$seed,source:$source,sources:$sources}' > "$finish_args"
+                # The compiler transport reports success in both cases. The
+                # independent finish request must still be authoritative when
+                # a remote command skips its own verification postlude.
+                [[ "$boundary" != changed ]] || return 7
+                jq -nc --arg home "$2" '{schema_version:1,mode:"inventory",cargo_home:$home,
+                    receipt_path:($home + ".final.json"),receipt_sha256:("1"*64),
+                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}'
+            }
+            act_run_native_build tool darwin/arm64 v1.0.0 source-final "$source_root"
+        ) 2>/dev/null || status=$?
+        raw_ssh=$(get_raw_ssh_args)
+        if [[ "$boundary" == pre_changed ]]; then
+            if [[ "$status" -ne 0 && ! -e "$SDK_COMMAND_FILE" && ! -e "$finish_args" && -z "$raw_ssh" ]] && \
+               jq -e '.status != "success" and ((.artifact_path // "") == "")' <<< "$result" >/dev/null; then
+                log_pass "Precompilation source verification failure prevents compiler and collection requests"
+            else
+                log_fail "Precompilation source refusal reached the compiler or collector: status=$status result=$result"
+            fi
+        elif [[ ! -s "$finish_args" ]] || ! jq -e --arg root "$source_root" --argjson sources "$expected_sources" \
+                '.source == $root and .sources == $sources and .seed == ("1"*64) and
+                 (.home | startswith("/remote/source-final/.cargo-home-darwin-arm64-"))' \
+                "$finish_args" >/dev/null; then
+            log_fail "Strict Unix $boundary finish did not receive held source authority"
+        elif [[ "$boundary" == admitted && "$status" -eq 0 && "$raw_ssh" == *'cat --'* ]] && \
+             jq -e --argjson sources "$expected_sources" '.status == "success" and
+                 .cargo_isolation.dependency_sources == $sources and
+                 .cargo_isolation.dependency_cache.final.mode == "inventory"' <<< "$result" >/dev/null; then
+            log_pass "Strict Unix source authority reaches independent finish and the successful result"
+        elif [[ "$boundary" == changed && "$status" -ne 0 && -z "$raw_ssh" ]] && \
+             jq -e --argjson sources "$expected_sources" '.status != "success" and
+                 ((.artifact_path // "") == "") and .cargo_isolation.dependency_cache.final == null and
+                 .cargo_isolation.dependency_sources == $sources' <<< "$result" >/dev/null; then
+            log_pass "Independent source verification failure blocks artifact collection after remote success"
+        else
+            log_fail "Strict Unix $boundary source finish boundary failed: status=$status result=$result"
+        fi
+    done
+}
+
+test_unix_strict_dependency_source_transport_size() {
+    log_test "Strict Unix Rust: source authentication keeps cached builds below command argument limits"
+    reset_state
+    MOCK_LANGUAGE=rust
+    MOCK_BUILD_CMD='cargo build --release'
+    MOCK_STRICT_CARGO_CACHE_ROOT=/remote/private-build-cache
+    MOCK_SSH_STREAM_FILE="$MOCK_DIR/source-transport-artifact"
+    write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+    local SDK_COMMAND_FILE="$MOCK_DIR/source-transport-build.sh"
+    local result status=0 command bytes
+    result=$(act_run_native_build tool darwin/arm64 v1.0.0 source-transport \
+        /remote/source-transport/source 2>/dev/null) || status=$?
+    command=$(cat "$SDK_COMMAND_FILE" 2>/dev/null)
+    bytes=$(printf '%s' "$command" | wc -c | tr -d ' ')
+    # Linux permits at most 128 KiB in one exec argument. Exercise the actual
+    # generated text at that OS boundary, without pretending the mock compiler
+    # transport executes the Cargo/cache program itself.
+    if [[ "$status" -eq 0 && "$bytes" -gt 0 && "$bytes" -lt 131072 &&
+          "$command" == *'CARGO_BUILD_BUILD_DIR'* && "$command" == *'DSR_TOOLCHAIN_IDENTITY_PY'* &&
+          "$command" != *'dsr_verified_sources='* ]] && \
+       "$BASH" -c 'test -n "$1"' source-transport "$command" && \
+       jq -e '.status == "success" and
+           .cargo_isolation.intermediate_cache.receipt.final_output_policy == "fresh-run-target-detached-under-custody"' \
+           <<< "$result" >/dev/null; then
+        log_pass "Cached compiler request is $bytes bytes and passes the native exec argument boundary"
+    else
+        log_fail "Cached compiler request exceeded or skipped its transport boundary: status=$status bytes=$bytes"
     fi
 }
 
@@ -3229,6 +3397,15 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --dependency-sources-only ]]; then
+        test_unix_strict_rust_forces_out_of_snapshot_target_dir
+        test_unix_strict_dependency_sources_authority
+        test_unix_strict_dependency_sources_final_gate
+        test_unix_strict_dependency_source_transport_size
+        printf 'Native source authority tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --windows-storage-only ]]; then
         test_windows_split_target_and_collection
         test_windows_split_source_budget
@@ -3289,6 +3466,9 @@ main() {
     test_windows_strict_rust_forces_out_of_snapshot_target_dir
     test_strict_native_source_binding
     test_unix_strict_validation_failure_stops_build
+    test_unix_strict_dependency_sources_authority
+    test_unix_strict_dependency_sources_final_gate
+    test_unix_strict_dependency_source_transport_size
     test_windows_strict_validation_failure_stops_build
     test_strict_collector_keeps_symlink_victim_unchanged
     test_strict_collector_rejects_partial_producer_failure

@@ -4399,6 +4399,99 @@ _dsr_cargo_home_guard() {
 SH
 )
 
+# Transport the same lockfile authentication gate used by xwin. Full metadata
+# and source inventories stay on the host; only their hashes cross back to the
+# coordinator. Every evidence read rejects linked files and linked ancestors.
+_act_unix_cargo_sources_runtime() (
+    local module
+    module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cargo_sources.sh"
+    [[ -f "$module" && ! -L "$module" ]] || return 3
+    # shellcheck source=src/cargo_sources.sh
+    source "$module" || return 3
+    declare -f _cargo_sources
+    cat <<'SH'
+_dsr_cargo_sources_hash() {
+    python3 -I - "$@" <<'DSR_CARGO_SOURCE_HASH'
+import hashlib, os, stat, sys
+path = sys.argv[1]
+if not path.startswith('/') or any(part in ('', '.', '..') for part in path[1:].split('/')):
+    sys.exit('noncanonical Cargo dependency evidence path')
+parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+try:
+    parts = path[1:].split('/')
+    for part in parts[:-1]:
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        os.close(parent)
+        parent = child
+    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            sys.exit('Cargo dependency evidence is not a private regular file')
+        digest = hashlib.sha256()
+        for block in iter(lambda: stream.read(1048576), b''):
+            digest.update(block)
+        identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                                 info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+        if (identity(before) != identity(os.fstat(stream.fileno())) or
+                identity(before) != identity(os.stat(parts[-1], dir_fd=parent, follow_symlinks=False))):
+            sys.exit('Cargo dependency evidence changed while reading')
+        value = digest.hexdigest()
+        if len(sys.argv) == 3 and value != sys.argv[2]:
+            sys.exit('Cargo dependency evidence differs from coordinator-held authority')
+        print(value)
+finally:
+    os.close(parent)
+DSR_CARGO_SOURCE_HASH
+}
+SH
+)
+
+_act_validate_unix_cargo_sources_summary() {
+    jq -ce '
+        def count: type == "number" and . >= 0 and floor == .;
+        select(type == "object" and .schema_version == 1 and
+            .kind == "dsr-cargo-dependency-sources" and
+            ([.sha256, .metadata_sha256, .authentication.lockfile_sha256] |
+                all(type == "string" and test("^[0-9a-f]{64}$"))) and
+            ([.package_count, .root_count, .file_count, .size_bytes,
+              .authentication.locked_archive_packages, .authentication.locked_git_packages,
+              .authentication.workspace_snapshot_packages] | all(count)) and
+            .root_count <= .package_count and
+            (.authentication.locked_archive_packages + .authentication.locked_git_packages +
+                .authentication.workspace_snapshot_packages) == .package_count)
+    ' <<< "$1"
+}
+
+# A remote sidecar cannot authorize its own replacement. Check both held file
+# hashes around source verification and compare the verifier's newly observed
+# evidence hash as well. This runs before compilation and in an independent
+# post-build invocation, so a configured command using exit/exec cannot skip it.
+_act_unix_cargo_sources_verify_script() {
+    local source_root="$1" cargo_home="$2" sources_json="$3" metadata_digest sources_digest path
+    for path in "$source_root" "$cargo_home"; do
+        [[ "$path" =~ ^/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
+    done
+    sources_json=$(_act_validate_unix_cargo_sources_summary "$sources_json") || return 4
+    metadata_digest=$(jq -er '.metadata_sha256' <<< "$sources_json") || return 4
+    sources_digest=$(jq -er '.sha256' <<< "$sources_json") || return 4
+    printf 'set -e\n'
+    _act_unix_cargo_sources_runtime || return $?
+    cat <<EOF
+dsr_source_root=\$(cd '$source_root' && pwd -P)
+_dsr_cargo_sources_hash '$cargo_home/.dsr-cargo-metadata.json' '$metadata_digest' >/dev/null
+_dsr_cargo_sources_hash '$cargo_home/.dsr-cargo-sources.json' '$sources_digest' >/dev/null
+dsr_verified_sources=\$(_cargo_sources verify-workspace '$cargo_home/.dsr-cargo-metadata.json' '$cargo_home/.dsr-cargo-sources.json' "\$dsr_source_root/Cargo.lock")
+python3 -I - "\$dsr_verified_sources" '$sources_digest' <<'DSR_CARGO_SOURCE_AUTHORITY'
+import json, sys
+if json.loads(sys.argv[1])['sha256'] != sys.argv[2]:
+    sys.exit('Cargo dependency sources differ from coordinator-held authority')
+DSR_CARGO_SOURCE_AUTHORITY
+_dsr_cargo_sources_hash '$cargo_home/.dsr-cargo-metadata.json' '$metadata_digest' >/dev/null
+_dsr_cargo_sources_hash '$cargo_home/.dsr-cargo-sources.json' '$sources_digest' >/dev/null
+EOF
+}
+
 # The canonical home is a retained seed: Cargo never writes to it. Metadata
 # and every target attempt receive independent inodes in a fresh home. This
 # lets resume verify its seed even after the ambient cache has been removed,
@@ -4441,6 +4534,7 @@ EOF
 
 _act_unix_cargo_metadata_body() {
     local build_cmd="${1-cargo build}" build_env="${2:-}" env_pair env_name
+    _act_unix_cargo_sources_runtime || return $?
     cat <<'SH'
 ancestor=${physical_source_root%/*}
 while test "$ancestor" != / && test -n "$ancestor"; do
@@ -4475,6 +4569,16 @@ SH
 } > "$strict_home/.dsr-cargo-metadata.json"
 )
 _dsr_cargo_home_guard "$strict_home"
+dsr_metadata_sha256=$(_dsr_cargo_sources_hash "$strict_home/.dsr-cargo-metadata.json")
+dsr_dependency_sources=$(_cargo_sources capture-workspace "$strict_home/.dsr-cargo-metadata.json" "$strict_home/.dsr-cargo-sources.json" "$physical_source_root/Cargo.lock")
+_dsr_cargo_sources_hash "$strict_home/.dsr-cargo-metadata.json" "$dsr_metadata_sha256" >/dev/null
+dsr_dependency_sources=$(python3 -I - "$dsr_dependency_sources" "$dsr_metadata_sha256" <<'DSR_CARGO_SOURCE_SUMMARY'
+import json, sys
+summary = json.loads(sys.argv[1])
+summary['metadata_sha256'] = sys.argv[2]
+print(json.dumps(summary, sort_keys=True, separators=(',', ':')))
+DSR_CARGO_SOURCE_SUMMARY
+)
 if $dsr_seed_pending; then
     _cargo_cache_run snapshot "$strict_home" "$dsr_seed_home" >/dev/null
 fi
@@ -4482,15 +4586,25 @@ SH
 }
 
 _act_prepare_unix_private_cargo_home() {
-    local host="$1" source_root="$2" suffix="$3" command summary metadata_body
+    local host="$1" source_root="$2" suffix="$3" command summary metadata_body sources_json
     local build_cmd="${4-cargo build}" build_env="${5:-}"
     command=$(_act_unix_private_cargo_home_script "$source_root" "$suffix") || return $?
     # An admitted download seed is reusable across targets, but its earlier
     # metadata result is not compiler authority for a new target/toolchain.
     metadata_body=$(_act_unix_cargo_metadata_body "$build_cmd" "$build_env") || return $?
     command+=$'\n'"$metadata_body"
-    command+=$'\n''printf '\''%s\n'\'' "$dsr_private_summary"'
+    command+=$'\n'"$(cat <<'SH'
+python3 -I - "$dsr_private_summary" "$dsr_dependency_sources" <<'DSR_NATIVE_CARGO_PREPARED'
+import json, sys
+summary = json.loads(sys.argv[1])
+summary['dependency_sources'] = json.loads(sys.argv[2])
+print(json.dumps(summary, sort_keys=True, separators=(',', ':')))
+DSR_NATIVE_CARGO_PREPARED
+SH
+)"
     summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
+    _act_validate_unix_cargo_sources_summary "$sources_json" >/dev/null || return 4
     jq -ce '
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
             (.cargo_home | type == "string" and startswith("/")) and
@@ -4551,10 +4665,15 @@ EOF
 # the seed is deliberately not required. Linked/special/config-bearing cache
 # state, or a changed seed receipt, prevents artifact collection.
 _act_finish_unix_private_cargo_home() {
-    local host="$1" cargo_home="$2" seed_digest="$3" command summary
+    local host="$1" cargo_home="$2" seed_digest="$3" command summary source_verification=""
+    [[ $# == 3 || $# == 5 ]] || return 4
     [[ "$cargo_home" =~ ^/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
     command=$(_act_unix_cargo_cache_runtime) || return $?
+    if [[ $# == 5 ]]; then
+        source_verification=$(_act_unix_cargo_sources_verify_script "$4" "$cargo_home" "$5") || return $?
+        command+=$'\n'"$source_verification"$'\n'
+    fi
     command+=$'\n'"$(cat <<EOF
 set -e
 _dsr_cargo_home_guard '$cargo_home'
@@ -7925,7 +8044,8 @@ act_run_native_build() {
     [[ -n "$remote_path_override" ]] && strict_native_build=true
     local strict_rust_build=false
     local strict_private_cargo_cache=false strict_cargo_seed_json='null' strict_toolchain_receipt=""
-    local strict_cargo_context_json='null'
+    local strict_cargo_context_json='null' strict_dependency_sources_json='null'
+    local strict_sources_verification=""
     local build_influence_env_json='{}'
     local cargo_isolation_json='null'
     local nonstrict_stage_root="" nonstrict_source_root="" nonstrict_cargo_home=""
@@ -8037,6 +8157,13 @@ act_run_native_build() {
                 (.receipt_sha256 | test("^[0-9a-f]{64}$")))' <<< "$strict_cargo_seed_json") || return 4
             strict_cargo_seed_json=$(jq -c 'del(.cargo_context)' <<< "$strict_cargo_seed_json") || return 4
         else
+            if ! strict_dependency_sources_json=$(jq -ce '.dependency_sources' <<< "$strict_cargo_seed_json") || \
+               ! strict_dependency_sources_json=$(_act_validate_unix_cargo_sources_summary "$strict_dependency_sources_json"); then
+                _log_error "Strict Cargo dependency sources lack lockfile-authenticated authority"
+                jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo dependency authentication failed"}'
+                return 4
+            fi
+            strict_cargo_seed_json=$(jq -c 'del(.dependency_sources)' <<< "$strict_cargo_seed_json") || return 4
             # Per-attempt toolchain identity receipt beside the snapshot; the
             # snapshot itself must stay byte-identical.
             strict_toolchain_receipt="${remote_path%/*}/.dsr-toolchain-${platform//\//-}-${cargo_attempt//-/}.json"
@@ -8096,6 +8223,10 @@ act_run_native_build() {
         if [[ "$strict_cargo_context_json" != null ]]; then
             cargo_isolation_json=$(jq --argjson context "$strict_cargo_context_json" \
                 '.cargo_context = $context' <<< "$cargo_isolation_json") || return 4
+        fi
+        if [[ "$strict_dependency_sources_json" != null ]]; then
+            cargo_isolation_json=$(jq --argjson sources "$strict_dependency_sources_json" \
+                '.dependency_sources = $sources' <<< "$cargo_isolation_json") || return 4
         fi
         if [[ -n "$strict_cache_root" ]]; then
             cargo_isolation_json=$(jq --arg root "$strict_cache_root" \
@@ -8653,6 +8784,14 @@ EOF
             # $(...) dropped each heredoc terminator's newline; restore it.
             effective_build="$toolchain_record"$'\n'"$effective_build"$'\n'"$toolchain_verify"$'\n'
         fi
+        if [[ "$strict_dependency_sources_json" != null ]]; then
+            # Keep the authentication runtime out of the compiler command's
+            # argv: combined with toolchain and intermediate-cache scripts it
+            # can exceed the host's single-argument limit. Explicit paths and
+            # held hashes make the separate pre-build invocation authoritative.
+            strict_sources_verification=$(_act_unix_cargo_sources_verify_script \
+                "$remote_path" "$strict_cargo_home" "$strict_dependency_sources_json") || return 4
+        fi
         remote_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$effective_build"
     fi
 
@@ -8725,6 +8864,11 @@ EOF
         fi
     fi
 
+    if [[ $exit_code -eq 0 && -n "$strict_sources_verification" ]]; then
+        _act_ssh_exec "$host" "$strict_sources_verification" "$_ACT_SYNC_TIMEOUT" 2>&1 | tee "$log_file"
+        exit_code=${PIPESTATUS[0]}
+    fi
+
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     if [[ $exit_code -eq 0 ]]; then
@@ -8751,13 +8895,16 @@ EOF
     if [[ $exit_code -eq 0 ]] && $strict_private_cargo_cache; then
         local strict_cargo_final_json strict_cargo_seed_digest
         strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4
+        local strict_cargo_finish_args=("$host" "$strict_cargo_home" "$strict_cargo_seed_digest")
+        if ! _act_is_windows_host "$host"; then
+            strict_cargo_finish_args+=("$remote_path" "$strict_dependency_sources_json")
+        fi
         if [[ $exit_code -eq 0 ]] && \
-           strict_cargo_final_json=$("$cargo_finish" \
-               "$host" "$strict_cargo_home" "$strict_cargo_seed_digest"); then
+           strict_cargo_final_json=$("$cargo_finish" "${strict_cargo_finish_args[@]}"); then
             cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \
                 '.dependency_cache.final = $final' <<< "$cargo_isolation_json") || exit_code=4
         else
-            _log_error "Strict private Cargo cache failed final verification; refusing artifact collection"
+            _log_error "Strict Cargo cache or dependency sources failed final verification; refusing artifact collection"
             exit_code=4
         fi
     fi

@@ -7,14 +7,20 @@ for tool in python3 bash git cargo rustc jq yq; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
 done
 python3 -I - "$ROOT" <<'PY'
+import functools
 import hashlib
+import http.server
+import io
 import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 root = Path(sys.argv[1])
@@ -78,17 +84,57 @@ require(['git', '-C', dependency, 'add', '.'])
 require(['git', '-C', dependency, '-c', 'user.name=DSR Test', '-c',
          'user.email=dsr@example.invalid', 'commit', '-qm', 'dependency'])
 revision = require(['git', '-C', dependency, 'rev-parse', 'HEAD']).strip()
+# A genuine alternate sparse registry serves one authenticated crate. Only
+# this process's loopback server is used to warm Cargo; it is stopped before
+# any locked/offline admission or compilation, including the poison baselines.
+registry = work / 'registry-origin'
+registry.mkdir()
+crate_bytes = io.BytesIO()
+with tarfile.open(fileobj=crate_bytes, mode='w:gz') as archive:
+    for name, data in {
+        'Cargo.toml': b'[package]\nname="registry_dependency"\nversion="1.0.0"\nedition="2021"\n',
+        'src/lib.rs': b'pub fn value() -> u32 { 42 }\n',
+    }.items():
+        entry = tarfile.TarInfo('registry_dependency-1.0.0/' + name)
+        entry.size, entry.mode = len(data), 0o644
+        archive.addfile(entry, io.BytesIO(data))
+
+
+class RegistryHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 0),
+    functools.partial(RegistryHandler, directory=str(registry)))
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+registry_url = 'http://127.0.0.1:' + str(server.server_port)
+(registry / 'index/re/gi').mkdir(parents=True)
+(registry / 'index/config.json').write_text(json.dumps({
+    'dl': registry_url + '/crates/{crate}/{version}/download'}))
+(registry / 'index/re/gi/registry_dependency').write_text(json.dumps({
+    'name': 'registry_dependency', 'vers': '1.0.0', 'deps': [],
+    'cksum': hashlib.sha256(crate_bytes.getvalue()).hexdigest(),
+    'features': {}, 'yanked': False}) + '\n')
+download = registry / 'crates/registry_dependency/1.0.0/download'
+download.parent.mkdir(parents=True)
+download.write_bytes(crate_bytes.getvalue())
+(source / '.cargo').mkdir()
+(source / '.cargo/config.toml').write_text('[registries.fixture]\nindex="sparse+' + registry_url + '/index/"\n')
 (source / 'Cargo.toml').write_text('[package]\nname="cache-probe"\nversion="1.0.0"\nedition="2021"\n'
-    '[dependencies]\ncache_dependency={git="' + dependency.as_uri() + '",rev="' + revision + '"}\n')
-(source / 'src/main.rs').write_text('fn main() { println!("{}", cache_dependency::value()); }\n')
-# Only the local file:// Git dependency is fetched; this fixture has no registry
-# dependencies or external network service. Subsequent phases are offline.
-require(['cargo', 'metadata', '--format-version', '1', '--manifest-path', source / 'Cargo.toml'], env=environment)
+    '[dependencies]\ncache_dependency={git="' + dependency.as_uri() + '",rev="' + revision + '"}\n'
+    'registry_dependency={version="=1.0.0",registry="fixture"}\n')
+(source / 'src/main.rs').write_text('fn main() { println!("{}:{}", cache_dependency::value(), registry_dependency::value()); }\n')
+try:
+    require(['cargo', 'metadata', '--format-version', '1'], env=environment, cwd=source)
+finally:
+    server.shutdown()
+    server.server_close()
+    server_thread.join()
 registry_file = ambient / 'registry/cache/fixture/payload.crate'
 registry_file.parent.mkdir(parents=True)
 registry_file.write_bytes(b'ambient registry marker\n')
-(ambient / 'config.toml').write_text('[build]\nrustc-wrapper="/untrusted/operator-wrapper"\n')
-(ambient / 'credentials.toml').write_text('private credentials must not be copied\n')
 seed = source.parent / '.cargo-home'
 
 program = r'''
@@ -125,6 +171,43 @@ check('missing offline dependencies do not publish an incomplete retained seed',
       b'offline' in cold.stderr)
 ambient.rename(work / 'retained-empty-ambient')
 (work / 'warmed-ambient').rename(ambient)
+
+
+def baseline(label):
+    target_dir = work / ('baseline-' + label)
+    require(['cargo', 'build', '--quiet', '--locked', '--offline', '--target', triple],
+            env=dict(environment, CARGO_TARGET_DIR=str(target_dir)), cwd=source)
+    return require([target_dir / triple / 'debug/cache-probe']).strip()
+
+
+check('real locked offline Cargo consumes the original registry and Git dependencies', baseline('original') == '42:42')
+registry_source = next(ambient.glob('registry/src/*/registry_dependency-1.0.0/src/lib.rs'))
+git_source = next((ambient / 'git/checkouts').rglob('src/lib.rs'))
+for kind, cached_source, expected in (
+    ('registry', registry_source, '42:43'), ('git', git_source, '43:42'),
+):
+    original = cached_source.read_bytes()
+    cached_source.write_text('pub fn value() -> u32 { 43 }\n')
+    check(kind + ' cache poison changes a genuine locked offline Cargo executable', baseline(kind + '-poison') == expected)
+    refused = shell('_act_strict_cargo_metadata_json', 'cache-fixture', str(source))
+    check(kind + ' poison cannot obtain metadata authority or publish a retained seed',
+          refused.returncode != 0 and not refused.stdout and not seed.exists() and
+          b'locked content' in refused.stderr)
+    sentinel = work / (kind + '-compiler-started')
+    (configs / 'cache-probe.yaml').write_text(json.dumps({
+        'tool_name': 'cache-probe', 'repo': 'fixture/cache-probe', 'local_path': str(source),
+        'language': 'rust', 'binary_name': 'cache-probe', 'build_profile': 'debug',
+        'linux_glibc_floor': 'native',
+        'build_cmd': 'printf started > "$DSR_SOURCE_SENTINEL"; cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET"',
+        'env': {'CARGO_BUILD_TARGET': triple, 'DSR_SOURCE_SENTINEL': str(sentinel)},
+    }))
+    refused_build = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', kind + '-poison', str(source))
+    check(kind + ' poison is refused before the native compiler command begins',
+          refused_build.returncode != 0 and not sentinel.exists() and not seed.exists())
+    cached_source.write_bytes(original)
+
+(ambient / 'config.toml').write_text('[build]\nrustc-wrapper="/untrusted/operator-wrapper"\n')
+(ambient / 'credentials.toml').write_text('private credentials must not be copied\n')
 first_metadata = metadata('refilled ambient cache rescues metadata after an incomplete first attempt')
 check('canonical seed uses plain registry and Git directories',
       seed.is_dir() and not seed.is_symlink() and
@@ -147,6 +230,8 @@ dependency.rename(work / 'retained-dependency')
 (work / 'retained-ambient' / registry_file.relative_to(ambient)).write_bytes(b'operator replacement\n')
 for file in (work / 'retained-ambient/git/checkouts').rglob('src/lib.rs'):
     file.write_text('compile_error!("ambient cache was modified");\n')
+for file in (work / 'retained-ambient/registry/src').rglob('src/lib.rs'):
+    file.write_text('compile_error!("ambient registry was modified");\n')
 check('ambient mutation cannot change the retained seed bytes', private_registry.read_bytes() == b'ambient registry marker\n')
 second_metadata = metadata('resume metadata survives missing ambient registry and Git roots')
 check('resume does not replace the seed receipt', digest(seed / '.dsr-cache-seed.json') == seed_receipt_hash)
@@ -155,28 +240,31 @@ second_git_manifest = next(package['manifest_path'] for package in second_metada
 check('metadata retries receive distinct private Cargo homes', second_git_manifest != git_manifest)
 
 
-def build(label, mutation='', successful=True, preparation=''):
+def build(label, mutation='', successful=True, preparation='', extra_env=None):
     probe = work / ('home-' + str(checks))
+    compiled = work / ('compiled-' + str(checks))
     command = ('printf "%s\\n" "$CARGO_HOME" > "$DSR_CACHE_PROBE"; ' + preparation +
-               'cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET"; ' + mutation)
+               'cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET" && '
+               'printf compiled > "$DSR_CACHE_COMPILED"; ' + mutation)
     configuration = {
         'tool_name': 'cache-probe', 'repo': 'fixture/cache-probe', 'local_path': str(source),
         'language': 'rust', 'binary_name': 'cache-probe', 'build_profile': 'debug',
         'linux_glibc_floor': 'native', 'build_cmd': command,
-        'env': {'CARGO_BUILD_TARGET': triple, 'DSR_CACHE_PROBE': str(probe),
+        'env': {'CARGO_BUILD_TARGET': triple, 'DSR_CACHE_PROBE': str(probe), 'DSR_CACHE_COMPILED': str(compiled),
                 'DSR_AMBIENT_CACHE_FILE': str(work / 'retained-ambient' / registry_file.relative_to(ambient))},
     }
+    configuration['env'].update(extra_env or {})
     (configs / 'cache-probe.yaml').write_text(json.dumps(configuration))
     result = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', 'cache-run', str(source))
     rows = [line for line in result.stdout.splitlines() if line.startswith(b'{')]
     report = json.loads(rows[-1]) if rows else {}
-    if not (result.returncode == 0 if successful else result.returncode != 0):
+    if not compiled.exists() or not (result.returncode == 0 if successful else result.returncode != 0):
         print(result.stderr.decode(), flush=True)
     if successful:
-        check(label, result.returncode == 0 and report.get('status') == 'success')
+        check(label, result.returncode == 0 and report.get('status') == 'success' and compiled.exists())
     else:
         check(label, result.returncode != 0 and report.get('status') != 'success' and
-              not report.get('artifact_paths') and not report.get('collected_sha256'))
+              not report.get('artifact_paths') and not report.get('collected_sha256') and compiled.exists())
         (work / 'refused-result.json').write_text(json.dumps(report))
     return report, Path(probe.read_text().strip()) if probe.exists() else None
 
@@ -196,6 +284,13 @@ check('native result records private ownership and both inventories',
       isolation['cache_reuse'] == [] and cache['mode'] == 'private-copy' and
       cache['seed']['mode'] == 'private-copy' and cache['final']['mode'] == 'inventory' and
       cache['final']['file_count'] > cache['seed']['file_count'])
+sources = isolation['dependency_sources']
+check('native source authority authenticates genuine registry archives and pinned Git objects',
+      sources['authentication']['locked_archive_packages'] == 1 and
+      sources['authentication']['locked_git_packages'] == 1 and
+      sources['authentication']['lockfile_sha256'] == digest(source / 'Cargo.lock') and
+      sources['metadata_sha256'] == digest(first_home / '.dsr-cargo-metadata.json') and
+      sources['sha256'] == digest(first_home / '.dsr-cargo-sources.json'))
 check('native environment and receipt bind the actual attempt home',
       str(first_home) == report['build_influence_env']['CARGO_HOME'] == isolation['cargo_home'] == cache['seed']['cargo_home'])
 # bd-10we: the build's own shell attested the executables it ran.
@@ -218,7 +313,7 @@ check('toolchain receipt lives beside the snapshot, never inside it',
       Path(toolchain['cwd']).resolve() == source.resolve() and
       not any(source.rglob('.dsr-toolchain-*')) and any(source.parent.glob('.dsr-toolchain-*.json')))
 check('collected executable runs with the committed dependency bytes',
-      require([report['artifact_path']]).strip() == '42')
+      require([report['artifact_path']]).strip() == '42:42')
 check('native build preserves the retained source seed receipt', digest(seed / '.dsr-cache-seed.json') == seed_receipt_hash)
 second_report, second_home = build('a native retry compiles successfully with a fresh Cargo home')
 check('native target attempts never reuse a mutable Cargo home',
@@ -233,13 +328,24 @@ for label, mutation in (
     ('ambient hardlink graft', 'ln "$DSR_AMBIENT_CACHE_FILE" "$CARGO_HOME/registry/ambient-hardlink"'),
     ('special cache object', 'mkfifo "$CARGO_HOME/registry/fifo"'),
     ('modified seed receipt', 'printf "\\n" >> "$CARGO_HOME/.dsr-cache-seed.json"'),
-    # A build that swaps the compiler on PATH after compiling cannot have its
-    # artifacts attested by the identities recorded before it ran.
-    ('toolchain change during the build',
-     'mkdir -p "$CARGO_HOME/../swapped-bin"; ln -sf /bin/true "$CARGO_HOME/../swapped-bin/rustc"; '
-     'export PATH="$CARGO_HOME/../swapped-bin:$PATH"'),
+    ('registry source mutation',
+     'printf "\\n// changed after compilation\\n" >> "$CARGO_HOME"/registry/src/*/registry_dependency-1.0.0/src/lib.rs'),
+    ('Git source mutation',
+     'printf "\\n// changed after compilation\\n" >> "$CARGO_HOME"/git/checkouts/*/*/src/lib.rs'),
+    ('metadata receipt mutation', 'printf "\\n" >> "$CARGO_HOME/.dsr-cargo-metadata.json"'),
+    ('dependency source receipt mutation', 'printf "\\n" >> "$CARGO_HOME/.dsr-cargo-sources.json"'),
 ):
     build(label + ' refuses artifact admission after successful compilation', mutation, False)
+
+# Configure this owned compiler wrapper before admission, then change its
+# bytes after real compilation. An in-command export would instead be refused
+# before launch and would not test the post-build toolchain identity gate.
+compiler_wrapper = work / 'owned-rustc'
+compiler_wrapper.write_text('#!/bin/sh\nexec ' + json.dumps(shutil.which('rustc')) + ' "$@"\n')
+compiler_wrapper.chmod(0o700)
+build('toolchain byte changes refuse artifact admission after successful compilation',
+      'printf "\\n# changed after compilation\\n" >> "$RUSTC"', False,
+      extra_env={'RUSTC': str(compiler_wrapper)})
 
 retained_marker = seed / 'config.toml'
 retained_marker.write_text('[net]\noffline=true\n')
@@ -255,6 +361,45 @@ metadata('restored seed resumes after a refused mutation')
 prepared = shell('_act_prepare_unix_private_cargo_home', 'cache-fixture', str(source), 'collision-check')
 check('explicit target copy is created successfully', prepared.returncode == 0)
 prepared_home = Path(json.loads(prepared.stdout)['cargo_home'])
+prepared_sources = json.loads(prepared.stdout)['dependency_sources']
+verification = shell('_act_unix_cargo_sources_verify_script', str(source), str(prepared_home), json.dumps(prepared_sources))
+check('held source authority produces an independently executable verifier', verification.returncode == 0)
+
+
+def verify_prepared():
+    return invoke(['bash', '-c', verification.stdout.decode()], env=environment)
+
+
+check('held source authority verifies the actual private attempt before compilation', verify_prepared().returncode == 0)
+# macOS presents /private/var through /var. Held metadata names physical paths,
+# while the coordinator can legitimately retain a logical ancestor alias.
+logical_parent = work / 'logical-snapshot'
+logical_parent.symlink_to(source.parent, target_is_directory=True)
+logical_verification = shell('_act_unix_cargo_sources_verify_script', str(logical_parent / 'source'),
+                             str(prepared_home), json.dumps(prepared_sources))
+check('logical source ancestor aliases verify against the held physical workspace',
+      logical_verification.returncode == 0 and
+      invoke(['bash', '-c', logical_verification.stdout.decode()], env=environment).returncode == 0)
+alternate_source = work / 'alternate-snapshot/source'
+shutil.copytree(source, alternate_source)
+logical_parent.rename(work / 'retained-original-alias')
+logical_parent.symlink_to(alternate_source.parent, target_is_directory=True)
+check('retargeting a source ancestor alias cannot reuse held workspace authority',
+      invoke(['bash', '-c', logical_verification.stdout.decode()], env=environment).returncode != 0)
+for label, path in (
+    ('registry bytes', next(prepared_home.glob('registry/src/*/registry_dependency-1.0.0/src/lib.rs'))),
+    ('Git bytes', next((prepared_home / 'git/checkouts').rglob('src/lib.rs'))),
+    ('metadata bytes', prepared_home / '.dsr-cargo-metadata.json'),
+    ('source receipt bytes', prepared_home / '.dsr-cargo-sources.json'),
+):
+    original = path.read_bytes()
+    path.write_bytes(original + b'\n')
+    check('controller-held authority refuses altered ' + label, verify_prepared().returncode != 0)
+    finish = shell('_act_finish_unix_private_cargo_home', 'cache-fixture', str(prepared_home),
+                   json.loads(prepared.stdout)['receipt_sha256'], str(source), json.dumps(prepared_sources))
+    check('independent final admission refuses altered ' + label, finish.returncode != 0 and not finish.stdout)
+    path.write_bytes(original)
+check('restored source bytes satisfy the original held authority', verify_prepared().returncode == 0)
 marker = prepared_home / 'operator-evidence'
 marker.write_bytes(b'preserve existing attempt')
 collision = shell('_act_prepare_unix_private_cargo_home', 'cache-fixture', str(source), 'collision-check')
@@ -284,12 +429,19 @@ check('concurrent targets own independent cache inodes and mutations',
 # dependency, then make the dependency's origin disappear.
 ordinary_ambient = work / 'ordinary-ambient'
 ordinary_ambient.mkdir()
+shutil.copytree(seed / 'registry', ordinary_ambient / 'registry')
+check('offline compilation cannot reconstruct usable Git origin sources',
+      not dependency.exists() or not any(path.is_file() or path.is_symlink() for path in dependency.rglob('*')))
+if dependency.exists():
+    # Preserve any empty recreated parents before restoring the local origin
+    # solely for the ordinary-build fixture's fresh Git cache warming.
+    dependency.rename(work / 'retained-recreated-origin-parent')
 (work / 'retained-dependency').rename(dependency)
 ordinary_env = dict(environment, CARGO_HOME=str(ordinary_ambient))
-require(['cargo', 'metadata', '--format-version', '1', '--manifest-path', source / 'Cargo.toml'], env=ordinary_env)
+require(['cargo', 'metadata', '--format-version', '1'], env=ordinary_env, cwd=source)
 dependency.rename(work / 'retained-ordinary-dependency')
 ordinary_registry = ordinary_ambient / 'registry/cache/fixture/payload.crate'
-ordinary_registry.parent.mkdir(parents=True)
+ordinary_registry.parent.mkdir(parents=True, exist_ok=True)
 ordinary_registry.write_bytes(b'ordinary registry marker\n')
 (ordinary_ambient / 'config.toml').write_text('[build]\nrustc-wrapper="/untrusted/operator-wrapper"\n')
 (ordinary_ambient / 'credentials.toml').write_text('private credentials must not be copied\n')
@@ -348,7 +500,7 @@ check('ordinary private registry bytes are copied onto independent inodes',
 check('ordinary private home excludes ambient configuration and credentials',
       not (ordinary_home / 'config.toml').exists() and not (ordinary_home / 'credentials.toml').exists())
 check('ordinary collected executable runs with the committed dependency bytes',
-      require([report['artifact_path']]).strip() == '42')
+      require([report['artifact_path']]).strip() == '42:42')
 ordinary_build('a config-bearing ordinary private home refuses artifact admission',
                'printf config > "$CARGO_HOME/config.toml"', False)
 _, second_ordinary_home = ordinary_build('a second ordinary build compiles with a fresh private home')

@@ -328,6 +328,36 @@
         "size_bytes": {"type": "integer", "minimum": 0}
       }
     },
+    "cargo_dependency_sources": {
+      "type": "object",
+      "description": "The authenticated resolved workspace dependency closure for a strict native Unix build. The coordinator holds both evidence hashes and requires fresh verification before compilation and artifact collection.",
+      "required": [
+        "schema_version", "kind", "sha256", "metadata_sha256", "package_count",
+        "root_count", "file_count", "size_bytes", "authentication"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": 1},
+        "kind": {"const": "dsr-cargo-dependency-sources"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "metadata_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "package_count": {"type": "integer", "minimum": 0},
+        "root_count": {"type": "integer", "minimum": 0},
+        "file_count": {"type": "integer", "minimum": 0},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "authentication": {
+          "type": "object",
+          "required": ["lockfile_sha256", "locked_archive_packages", "locked_git_packages", "workspace_snapshot_packages"],
+          "additionalProperties": false,
+          "properties": {
+            "lockfile_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "locked_archive_packages": {"type": "integer", "minimum": 0},
+            "locked_git_packages": {"type": "integer", "minimum": 0},
+            "workspace_snapshot_packages": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
     "cargo_isolation": {
       "type": "object",
       "required": [
@@ -368,6 +398,7 @@
         },
         "toolchain": {"$ref": "#/$defs/toolchain_identity"},
         "cargo_context": {"$ref": "#/$defs/cargo_context"},
+        "dependency_sources": {"$ref": "#/$defs/cargo_dependency_sources"},
         "dependency_cache": {
           "type": "object",
           "description": "The final inventory is present only after successful Cargo execution and cache admission; failed targets retain their seed evidence.",

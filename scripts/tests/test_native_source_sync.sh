@@ -341,6 +341,22 @@ test_strict_publication() {
             (.receipt_sha256 | type=="string" and test("^[0-9a-f]{64}$")) and
             (.inventory_sha256 | type=="string" and test("^[0-9a-f]{64}$")) and
             (.cargo_home | type=="string" and startswith("/"))))' "$WORK/strict-seal.json"
+    local strict_cargo_home
+    strict_cargo_home=$(jq -er '.details.targets[0].cargo_isolation.cargo_home' "$WORK/strict-seal.json") || return 1
+    check 'public strict target binds authenticated dependency evidence to actual metadata and lockfile bytes' jq -e \
+        --arg metadata_sha "$(_act_sha256 "$strict_cargo_home/.dsr-cargo-metadata.json")" \
+        --arg sources_sha "$(_act_sha256 "$strict_cargo_home/.dsr-cargo-sources.json")" \
+        --arg lockfile_sha "$(_act_sha256 "$WORK/source/Cargo.lock")" '
+        .details.targets[0].cargo_isolation as $isolation |
+        $isolation.dependency_sources as $sources |
+        $sources.schema_version==1 and $sources.kind=="dsr-cargo-dependency-sources" and
+        $sources.metadata_sha256==$metadata_sha and $sources.sha256==$sources_sha and
+        $sources.authentication.lockfile_sha256==$lockfile_sha and
+        $sources.package_count==0 and $sources.root_count==0 and
+        $sources.authentication.locked_archive_packages==0 and
+        $sources.authentication.locked_git_packages==0 and
+        $sources.authentication.workspace_snapshot_packages==0 and
+        ($isolation.dependency_cache.seed | has("dependency_sources") | not)' "$WORK/strict-seal.json"
     check 'strict publication receipt seals exact manifest bytes and source identity' jq -e \
         --arg sha "$strict_sha" --arg digest "$(_act_sha256 "$strict_manifest")" \
         --slurpfile state "$WORK/strict-state.json" '

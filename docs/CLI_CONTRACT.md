@@ -701,6 +701,27 @@ retained under `cargo_isolation.dependency_cache` with `cache_reuse: []`.
 Windows uses PowerShell 7 and native NTFS handles, rejects reparses and external
 private-cache hardlinks, and records drive-qualified forward-slash paths.
 
+Strict native Unix builds also authenticate resolved dependency sources against
+the workspace's committed `Cargo.lock` before admitting a reusable seed. Registry
+archives must match their locked SHA-256 checksums, and their extracted files must
+match the archive. Git checkout files must match the locked commit's Git objects.
+The gate follows the all-features metadata graph from every workspace member,
+including members outside the default selection; unrelated cached packages do
+not become source inputs. Vendored sources must remain inside the primary
+workspace and use its separately verified committed snapshot as their authority.
+This requires Python 3.11 or newer on the Unix build host.
+
+The coordinator retains metadata and source-evidence SHA-256 hashes under
+`cargo_isolation.dependency_sources`, together with the lockfile hash and counts
+of archive, Git, and workspace-snapshot authenticated packages. Full inventories
+remain in each attempt's private Cargo home. Verification checks both held
+hashes and the current authenticated source trees before compilation and in an
+independent invocation before artifact collection. Rewriting a remote receipt,
+changing metadata, or modifying a dependency during the build refuses collection,
+independently of the build shell's postamble. Failed first
+admission does not publish a seed; a later attempt can use repaired ambient
+downloads. An already admitted seed is verified and never replaced in place.
+
 Strict Windows Cargo metadata and compilation share a native system CMD
 launcher (`/d /v:off /s /c`), working directory, and sanitized configured
 environment. Configured names are case-insensitive with last-assignment
