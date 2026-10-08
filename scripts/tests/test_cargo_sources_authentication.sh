@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Locked-cache authenticity: real crate archives and Git object databases;
-# Cargo metadata is an explicit fixture. No network or Rust toolchain required.
+# Archive/Git cases use explicit metadata fixtures. When Cargo is available,
+# also validate genuine large-workspace metadata; no network or Rust compilation.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 for tool in python3 git cc; do
@@ -57,7 +58,7 @@ class Fixture:
         def package(id, source, root):
             return dict(id=id, name=id if id == 'app' else 'dep', version='1.2.3', source=source,
                         manifest_path=str(root/'Cargo.toml'), targets=[dict(src_path=str(root/'lib.rs'))])
-        self.graph = dict(version=1, workspace_root=str(self.app),
+        self.graph = dict(version=1, workspace_root=str(self.app), workspace_members=['app'],
             packages=[package('app', None, self.app), package('registry', REGISTRY, self.reg),
                       package('git', self.source, self.repo)],
             resolve=dict(nodes=[dict(id='app', dependencies=['registry', 'git']),
@@ -83,7 +84,10 @@ class Fixture:
         self.metadata.write_text(json.dumps(self.graph))
 
     def run(self, mode='capture', locked=True, env=None, receipt=None):
-        args = ['bash', MODULE, mode, str(self.metadata), '["app"]', str(receipt or self.receipt)]
+        args = ['bash', MODULE, mode, str(self.metadata)]
+        if not mode.endswith('-workspace'):
+            args.append('["app"]')
+        args.append(str(receipt or self.receipt))
         if locked:
             args.append(str(self.lock))
         return subprocess.run(args, capture_output=True, text=True, timeout=20, env=env)
@@ -123,6 +127,104 @@ def valid(f):
     assert proofs['git']['commit'] == f.commit and proofs['git']['tree'] == git(f.repo, 'rev-parse', 'HEAD^{tree}')
     assert f.good(mode='verify') == summary
 check('crate SHA256 and commit/tree/blob object chains are bound and reverify', valid)
+
+
+def workspace(f):
+    # Only the final member reaches the Git dependency. Traversing the first
+    # member or the explicit-selection limit would miss its authentication.
+    f.graph['resolve']['nodes'][0]['dependencies'] = ['registry']
+    for index in range(32):
+        key = 'member-' + str(index)
+        root = f.app / key
+        root.mkdir()
+        (root / 'Cargo.toml').write_text('[package]\nname="' + key + '"\nversion="1.0.0"\n')
+        f.graph['workspace_members'].append(key)
+        f.graph['packages'].append(dict(id=key, name=key, version='1.0.0', source=None,
+                                      manifest_path=str(root/'Cargo.toml'), targets=[]))
+        f.graph['resolve']['nodes'].append(dict(id=key, dependencies=['git'] if index == 31 else []))
+    f.save()
+    result = f.good(mode='capture-workspace')
+    assert result['package_count'] == 2
+    assert result['authentication']['locked_archive_packages'] == 1
+    assert result['authentication']['locked_git_packages'] == 1
+    assert len(json.loads(f.receipt.read_bytes())['selected_packages']) == 33
+    assert f.good(mode='verify-workspace') == result
+    f.graph['workspace_members'].reverse(); f.save()
+    assert f.good(mode='verify-workspace') == result
+    (f.repo/'shared.h').write_text('#define VALUE 43\n')
+    f.refused('differ from locked content', mode='verify-workspace')
+check('33 workspace members authenticate the complete conservative dependency closure', workspace)
+
+
+def invalid_workspace(f, members, reason='invalid selected release package set'):
+    f.graph['workspace_members'] = members
+    f.save()
+    f.refused(reason, mode='capture-workspace')
+    assert not f.receipt.exists()
+for label, members in [('empty', []), ('null', None), ('string', 'app'),
+                       ('duplicate', ['app','app']), ('unknown', ['missing']), ('nonstring', [1])]:
+    check(label + ' workspace membership is refused', lambda f, members=members: invalid_workspace(f, members))
+check('remote packages cannot be declared local workspace members',
+      lambda f: invalid_workspace(f, ['app','git'], 'workspace member is not a local package'))
+
+
+def incomplete_workspace(f, missing):
+    if missing == 'membership':
+        del f.graph['workspace_members']
+    elif missing == 'source':
+        del f.graph['packages'][0]['source']
+    elif missing == 'manifest':
+        f.graph['packages'][0]['manifest_path'] = 'Cargo.toml'
+    else:
+        f.graph['resolve']['nodes'] = [node for node in f.graph['resolve']['nodes'] if node['id'] != 'app']
+    f.save()
+    f.refused(mode='capture-workspace')
+    assert not f.receipt.exists()
+for missing in ('membership', 'source', 'manifest', 'resolve-node'):
+    check('workspace admission refuses missing or invalid ' + missing,
+          lambda f, missing=missing: incomplete_workspace(f, missing))
+
+
+def required_workspace_lock(f):
+    for mode in ('capture-workspace', 'verify-workspace'):
+        result = f.run(mode=mode, locked=False)
+        assert result.returncode == 4 and not result.stdout and not f.receipt.exists()
+    f.lock.write_text('not a lockfile')
+    f.refused(mode='capture-workspace')
+    assert not f.receipt.exists()
+check('workspace capture cannot fall back to observation without a valid lockfile', required_workspace_lock)
+
+
+def actual_workspace_metadata(f):
+    root = f.root/'real-workspace'; root.mkdir()
+    members = ['member' + str(index) for index in range(33)]
+    (root/'Cargo.toml').write_text('[workspace]\nresolver="2"\nmembers=' + json.dumps(members) + '\n')
+    for name in members:
+        member = root/name; member.mkdir()
+        (member/'Cargo.toml').write_text('[package]\nname="' + name + '"\nversion="1.0.0"\nedition="2021"\n[lib]\npath="lib.rs"\n')
+        (member/'lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
+    subprocess.run(['cargo','generate-lockfile','--offline','--manifest-path',str(root/'Cargo.toml')],
+                   check=True, capture_output=True, timeout=30)
+    metadata = subprocess.run(['cargo','metadata','--locked','--offline','--all-features',
+                              '--format-version=1','--manifest-path',str(root/'Cargo.toml')],
+                             check=True, capture_output=True, timeout=30)
+    f.metadata.write_bytes(metadata.stdout)
+    f.lock = root/'Cargo.lock'
+    result = f.good(mode='capture-workspace')
+    assert result['package_count'] == 0 and result['authentication']['lockfile_sha256'] == hashlib.sha256(f.lock.read_bytes()).hexdigest()
+    assert len(json.loads(f.receipt.read_bytes())['selected_packages']) == 33
+    assert f.good(mode='verify-workspace') == result
+    # Exercise sourceable wrappers as well as the standalone dispatch. Native
+    # hosts embed _cargo_sources itself and therefore share the same algorithm.
+    script = 'source "$1"; cargo_sources_capture_workspace "$2" "$3" "$4"; cargo_sources_verify_workspace "$2" "$3" "$4"'
+    wrapper = subprocess.run(['bash','-e','-c',script,'_',MODULE,str(f.metadata),str(f.root/'wrapper.json'),str(f.lock)],
+                             capture_output=True, text=True, timeout=30)
+    assert wrapper.returncode == 0, wrapper.stderr
+    assert [json.loads(line) for line in wrapper.stdout.splitlines()] == [result, result]
+if shutil.which('cargo'):
+    check('genuine Cargo metadata for a 33-member workspace admits and reverifies', actual_workspace_metadata)
+else:
+    print('SKIP genuine 33-member Cargo workspace metadata: cargo unavailable')
 
 
 def poison(f, root):

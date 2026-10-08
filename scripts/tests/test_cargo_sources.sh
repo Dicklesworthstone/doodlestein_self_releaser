@@ -175,6 +175,19 @@ check('duplicate package IDs fail', lambda f: unsafe(f, lambda x: x.graph['packa
 check('duplicate resolve nodes fail', lambda f: unsafe(f, lambda x: x.graph['resolve']['nodes'].append(x.graph['resolve']['nodes'][0])))
 check('invalid selected package IDs fail', lambda f: f.bad(selected='["missing"]'))
 check('duplicate selected package IDs fail', lambda f: f.bad(selected='["app","app"]'))
+
+
+def explicit_selection_limit(f):
+    selected = ['app']
+    for index in range(32):
+        key = 'local-' + str(index)
+        f.graph['packages'].append(f.package(key, None, f.app))
+        f.graph['resolve']['nodes'].append({'id': key, 'dependencies': []})
+        selected.append(key)
+    f.save()
+    f.bad(selected=json.dumps(selected))
+    assert not f.receipt.exists()
+check('explicit xwin package selection retains its 32-package bound', explicit_selection_limit)
 check('receipt inside a dependency source tree fails', lambda f: f.bad(receipt=f.registry/'receipt.json'))
 
 

@@ -17,6 +17,19 @@ cargo_sources_verify() {
     _cargo_sources verify "$@"
 }
 
+# Native metadata already contains the conservative all-features workspace
+# graph. Derive its local roots here instead of sending an unbounded ID array
+# through a shell command. Workspace admission always authenticates Cargo.lock.
+cargo_sources_capture_workspace() {
+    [[ $# == 3 ]] || return 4
+    _cargo_sources capture-workspace "$@"
+}
+
+cargo_sources_verify_workspace() {
+    [[ $# == 3 ]] || return 4
+    _cargo_sources verify-workspace "$@"
+}
+
 _cargo_sources() {
     command -v python3 >/dev/null || return 3
     python3 -I - "$@" <<'PY'
@@ -456,7 +469,7 @@ def inventory(root, kind):
             "files": sorted(files, key=lambda item: item["path"])}
 
 
-def observe(metadata, selected):
+def observe(metadata, selected, workspace=False):
     require(isinstance(metadata, dict) and metadata.get("version") == 1 and
             isinstance(metadata.get("resolve"), dict), "complete Cargo metadata v1 required")
     packages, nodes = metadata.get("packages"), metadata["resolve"].get("nodes")
@@ -472,9 +485,17 @@ def observe(metadata, selected):
                 isinstance(node.get("dependencies"), list) and
                 all(isinstance(item, str) for item in node["dependencies"]), "invalid resolved node")
         by_node[node["id"]] = node
-    require(isinstance(selected, list) and 1 <= len(selected) <= 32 and
+    if workspace:
+        selected = metadata.get("workspace_members")
+    require(isinstance(selected, list) and len(selected) >= 1 and (workspace or len(selected) <= 32) and
             all(isinstance(item, str) and item in by_node for item in selected) and
             len(set(selected)) == len(selected), "invalid selected release package set")
+    if workspace:
+        for key in selected:
+            package = by_package[key]
+            require("source" in package and package["source"] is None,
+                    "workspace member is not a local package")
+            absolute(package["manifest_path"])
     reachable, pending = set(), list(selected)
     while pending:
         key = pending.pop()
@@ -531,13 +552,22 @@ def publish(destination, evidence):
 
 try:
     require(sys.version_info >= (3, 9), "Python 3.9 or newer is required")
-    require(len(sys.argv) in (5, 6) and sys.argv[1] in ("capture", "verify"), "invalid dependency-source operation")
-    mode, metadata_path, selected_json, receipt_path = sys.argv[1:5]
-    selected = json.loads(selected_json, object_pairs_hook=pairs)
+    require(len(sys.argv) >= 2, "invalid dependency-source operation")
+    workspace = sys.argv[1] in ("capture-workspace", "verify-workspace")
+    if workspace:
+        require(len(sys.argv) == 5, "workspace source authentication requires metadata, receipt, and Cargo.lock")
+        mode, metadata_path, receipt_path, lockfile = sys.argv[1:5]
+        mode = mode.split("-", 1)[0]
+        selected = None
+    else:
+        require(len(sys.argv) in (5, 6) and sys.argv[1] in ("capture", "verify"), "invalid dependency-source operation")
+        mode, metadata_path, selected_json, receipt_path = sys.argv[1:5]
+        selected = json.loads(selected_json, object_pairs_hook=pairs)
+        lockfile = sys.argv[5] if len(sys.argv) == 6 else None
     metadata = read_json(metadata_path)
-    evidence = observe(metadata, selected)
-    if len(sys.argv) == 6:
-        authenticate(evidence, metadata, sys.argv[5])
+    evidence = observe(metadata, selected, workspace=workspace)
+    if lockfile is not None:
+        authenticate(evidence, metadata, lockfile)
     receipt = absolute(receipt_path)
     if mode == "verify":
         require(read_json(receipt) == evidence, "resolved dependency source bytes, modes, or namespace changed")
@@ -566,6 +596,7 @@ PY
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    [[ ( $# == 4 || $# == 5 ) && ( "$1" == capture || "$1" == verify ) ]] || exit 4
+    [[ ( ( $# == 4 || $# == 5 ) && ( "$1" == capture || "$1" == verify ) ) ||
+       ( $# == 4 && ( "$1" == capture-workspace || "$1" == verify-workspace ) ) ]] || exit 4
     _cargo_sources "$@"
 fi
