@@ -262,7 +262,7 @@ ordinary|finish)
     # distinguished return code prevents any host access or simulated summary.
     _act_windows_cache_command() { printf '%s\n' "$3" >&3; return 75; }
     if [[ "$1" == ordinary ]]; then
-        _act_prepare_windows_nonstrict_cargo_home fixture-host "$2" "$2/dsr-build-ordinary" "$2/dsr-build-ordinary/.cargo-home"
+        _act_prepare_windows_nonstrict_cargo_home fixture-host "$2" "$2/dsr-build-ordinary" "$2/dsr-build-ordinary/c"
     else
         _act_finish_windows_private_cargo_home fixture-host "$2" "$3"
     fi
@@ -289,7 +289,10 @@ esac
     return Invoke-Program ([Environment]::ProcessPath) $arguments -ExpectFailure:$ExpectFailure
 }
 
-$script:Work = Join-Path ([IO.Path]::GetTempPath()) ('dsr-windows-cache-' + [Guid]::NewGuid().ToString('N'))
+# libgit2 reserves a pack-lock suffix below each .git root before opening it.
+# Keep the fixture prefix short like production's dsr-build-<12hex>/{s,c}; the
+# profile's Temp path already consumes part of that native Windows path budget.
+$script:Work = Join-Path ([IO.Path]::GetTempPath()) ('dsr-cache-' + [Guid]::NewGuid().ToString('N').Substring(0,12))
 $null = [IO.Directory]::CreateDirectory($script:Work)
 Write-Output "Retained fixtures: $script:Work"
 
@@ -693,7 +696,7 @@ try {
     $ordinary = Invoke-GeneratedCacheProgram ordinary $ordinaryRoot ''
     $ordinarySummary = ConvertFrom-Json $ordinary.Out
     Assert-Check 'generated ordinary preparation creates a private cache in its build stage' (
-        $ordinarySummary.mode -eq 'private-copy' -and $ordinarySummary.cargo_home.EndsWith('/dsr-build-ordinary/.cargo-home'))
+        $ordinarySummary.mode -eq 'private-copy' -and $ordinarySummary.cargo_home.EndsWith('/dsr-build-ordinary/c'))
     Assert-Check 'generated ordinary preparation omits ambient compiler configuration' (
         -not (Test-Path -LiteralPath (Join-Path $ordinarySummary.cargo_home 'config.toml')))
     [IO.Directory]::Move($seedHome, (Join-Path $cargoCase 'retained ordinary ambient'))
