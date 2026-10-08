@@ -33,6 +33,21 @@ function Assert-Refused {
     if ($Pattern -and $failure.Exception.Message -notmatch $Pattern) { throw ('Wrong refusal for ' + $Label + ': ' + $failure.Exception.Message) }
 }
 
+function Assert-GeneratedSourceRefusal {
+    param([string]$Label, $Result, [string]$Pattern)
+    $condition = $Result.Code -ne 0 -and $Result.Err -match $Pattern
+    if (-not $condition) {
+        [Console]::Error.WriteLine('Unexpected generated source result for ' + $Label + ': exit=' + $Result.Code)
+        [Console]::Error.WriteLine('Bash=' + $sourceBashPath + '; PowerShell=' + [Environment]::ProcessPath + '; modules=' + $sourceModuleRoot)
+        foreach ($field in @('Out','Err')) {
+            $message = [string]$Result[$field]
+            if ($message.Length -gt 4096) { $message = $message.Substring(0,4096) + '[truncated]' }
+            [Console]::Error.WriteLine($field + ': ' + $message)
+        }
+    }
+    Assert-Check $Label $condition
+}
+
 function Write-FixtureText {
     param([string]$Path, [string]$Value)
     $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
@@ -392,16 +407,7 @@ try {
     $null = Invoke-Program $cargo @('build','--locked','--offline','--target-dir',($root + '/target-generated-ungated')) $generatedSource
     Assert-Check 'ungated Cargo compiles the same poisoned ambient cache used by metadata admission' ((Invoke-Program ($root + '/target-generated-ungated' + $binary) @()).Out.Trim() -ceq '43')
     $rejectedAdmission = Invoke-GeneratedSourceProgram -Operation Metadata -Suffix poisoned -ExpectFailure @generatedArguments
-    $poisonedMetadataRefused = $rejectedAdmission.Code -ne 0 -and $rejectedAdmission.Err -match 'differ from locked content'
-    if (-not $poisonedMetadataRefused) {
-        [Console]::Error.WriteLine('Generated metadata exit code: ' + $rejectedAdmission.Code)
-        [Console]::Error.WriteLine('Generated metadata stdout follows:')
-        [Console]::Error.Write($rejectedAdmission.Out)
-        [Console]::Error.WriteLine("`nGenerated metadata stderr follows:")
-        [Console]::Error.Write($rejectedAdmission.Err)
-        [Console]::Error.WriteLine()
-    }
-    Assert-Check 'generated metadata refuses poisoned dependency bytes before seed admission' $poisonedMetadataRefused
+    Assert-GeneratedSourceRefusal 'generated metadata refuses poisoned dependency bytes before seed admission' $rejectedAdmission 'differ from locked content'
     Assert-Check 'failed source authentication publishes neither canonical seed nor source receipt' (-not [IO.Directory]::Exists($generatedParent + '/.cargo-home') -and
         -not [IO.File]::Exists($generatedParent + '/.cargo-home-poisoned/.dsr-cargo-sources.json'))
     Write-FixtureText $registryLib $registryOriginal
@@ -424,19 +430,19 @@ try {
     $attemptOriginal = [IO.File]::ReadAllText($attemptRegistryLib)
     Write-FixtureText $attemptRegistryLib "pub fn answer() -> u32 { 99 }`n"
     $rejectedBuild = Invoke-GeneratedSourceProgram -Operation Build -Admission $admission -ExpectFailure @generatedArguments
-    Assert-Check 'generated build rejects altered attempt dependency bytes before compilation' ($rejectedBuild.Code -ne 0 -and $rejectedBuild.Err -match 'differ from locked content')
+    Assert-GeneratedSourceRefusal 'generated build rejects altered attempt dependency bytes before compilation' $rejectedBuild 'differ from locked content'
     $rejectedFinish = Invoke-GeneratedSourceProgram -Operation Finish -Admission $admission -ExpectFailure @generatedArguments
-    Assert-Check 'independent finish rejects altered dependency bytes before artifact collection' ($rejectedFinish.Code -ne 0 -and $rejectedFinish.Err -match 'differ from locked content')
+    Assert-GeneratedSourceRefusal 'independent finish rejects altered dependency bytes before artifact collection' $rejectedFinish 'differ from locked content'
     Write-FixtureText $attemptRegistryLib $attemptOriginal
     $attemptMetadataText = [IO.File]::ReadAllText($attemptMetadata)
     Write-FixtureText $attemptMetadata ($attemptMetadataText + ' ')
     $rejectedFinish = Invoke-GeneratedSourceProgram -Operation Finish -Admission $admission -ExpectFailure @generatedArguments
-    Assert-Check 'independent finish rejects changed metadata against the held digest' ($rejectedFinish.Code -ne 0 -and $rejectedFinish.Err -match 'coordinator-held authority')
+    Assert-GeneratedSourceRefusal 'independent finish rejects changed metadata against the held digest' $rejectedFinish 'coordinator-held authority'
     Write-FixtureText $attemptMetadata $attemptMetadataText
     $attemptReceiptText = [IO.File]::ReadAllText($attemptReceipt)
     Write-FixtureText $attemptReceipt ($attemptReceiptText + ' ')
     $rejectedFinish = Invoke-GeneratedSourceProgram -Operation Finish -Admission $admission -ExpectFailure @generatedArguments
-    Assert-Check 'independent finish rejects changed source receipt against the held digest' ($rejectedFinish.Code -ne 0 -and $rejectedFinish.Err -match 'coordinator-held authority')
+    Assert-GeneratedSourceRefusal 'independent finish rejects changed source receipt against the held digest' $rejectedFinish 'coordinator-held authority'
     Write-FixtureText $attemptReceipt $attemptReceiptText
     Assert-Check 'failed final admissions preserve previously published final receipt bytes' ((Get-DsrCargoSourceFileHash $final.receipt_path) -ceq $final.receipt_sha256)
     if ($script:WindowsHost) {

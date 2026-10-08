@@ -202,7 +202,7 @@ function New-DsrCargoContext {
     $environmentContext = New-DsrCargoContextEnvironment -CargoHome $homePath -Environment $Environment
     $effective = $environmentContext.Environment
     $cmdPath = Get-DsrCargoCmdPath -Environment $effective
-    $effective['COMSPEC'] = $cmdPath
+    $effective['COMSPEC'] = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $cmdPath.Replace('/','\') } else { $cmdPath }
     $selection = Get-DsrCargoContextSelection -BuildCommand $BuildCommand -SourceRoot $source -Environment $effective -ExpectedTarget $ExpectedTarget
     $context = [pscustomobject]@{SourceRoot=$source; CargoHome=$homePath; CmdPath=$cmdPath;
         BuildCommand=$BuildCommand; MetadataCommand=$selection.MetadataCommand; CargoPrefix=$selection.CargoPrefix;
@@ -305,7 +305,10 @@ function Invoke-DsrCargoCommand {
     # Both operations use native CMD lookup, including PATHEXT, current-directory
     # rules and batch selectors. PowerShell command precedence is never involved.
     $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = $Context.CmdPath; $psi.WorkingDirectory = $Context.SourceRoot
+    # Keep slash-normalized paths in receipts, but launch CMD with its native
+    # spelling. CMD also scans its own command-line image token for switches;
+    # a /cmd.exe component can be interpreted as /c instead of the image name.
+    $psi.FileName = $Context.CmdPath.Replace('/','\'); $psi.WorkingDirectory = $Context.SourceRoot
     $psi.UseShellExecute = $false
     $psi.Arguments = '/d /v:off /s /c "' + $Command + '"'
     $psi.EnvironmentVariables.Clear()

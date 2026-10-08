@@ -182,7 +182,22 @@ try {
     $baseEnvironment = @("RUSTUP_HOME=$privateRustup",'RUSTUP_TOOLCHAIN=dsr-context-unavailable',
         "CARGO_TARGET_DIR=$targetDir",'cargo_home=ignored-operator-home','RCH_DISABLED=0','RCH_CARGO_WRAPPER_BYPASS=0')
     $command = '"' + $proxyCargo + '" "+dsr-context-selected" build -j1 --locked --offline --no-default-features --features "selected, selected-two" --target ' + $hostTriple
+    if ($script:WindowsHost) {
+        $launcherEnvironment=New-DsrCargoContextEnvironment -CargoHome $privateHome -Environment $baseEnvironment
+        $launcherContext=[pscustomobject]@{SourceRoot=$source; Environment=$launcherEnvironment.Environment;
+            CmdPath=(Get-DsrCargoCmdPath $launcherEnvironment.Environment)}
+        $launcherResult=Invoke-DsrCargoCommand -Context $launcherContext -Command 'echo dsr-native-cmd-launcher' -CaptureOutput $true
+        Check 'slash-normalized CMD identity launches its literal command without parsing argv0 as a switch' (
+            $launcherContext.CmdPath.Contains('/') -and $launcherResult.ExitCode -eq 0 -and
+            $launcherResult.Stdout.Trim() -ceq 'dsr-native-cmd-launcher' -and -not $launcherResult.Stderr.Trim())
+    }
     $context = New-DsrCargoContext -BuildCommand $command -SourceRoot $source -CargoHome $privateHome -Environment $baseEnvironment -ExpectedTarget $hostTriple
+    if ($script:WindowsHost) {
+        $comspecResult=Invoke-Exe $context.Environment['COMSPEC'] @('/d','/v:off','/s','/c','echo dsr-native-comspec')
+        Check 'the admitted COMSPEC environment launches correctly in downstream native processes' (
+            -not $context.Environment['COMSPEC'].Contains('/') -and $comspecResult.ExitCode -eq 0 -and
+            $comspecResult.Stdout.Trim() -ceq 'dsr-native-comspec' -and -not $comspecResult.Stderr.Trim())
+    }
     Check 'literal quoted executable and toolchain prefix are retained exactly' ($context.CargoPrefix -ceq ('"' + $proxyCargo + '" "+dsr-context-selected"'))
     Check 'metadata selects the same explicit installed toolchain' ($context.MetadataCommand.StartsWith($context.CargoPrefix + ' metadata '))
     Check 'metadata retains conservative all-features source closure' ($context.MetadataCommand -match ' --all-features ' -and $context.MetadataCommand -match ' --filter-platform ')

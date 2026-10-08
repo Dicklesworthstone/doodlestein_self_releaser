@@ -36,6 +36,7 @@ jobs:
           & ./scripts/tests/test_cargo_sources_windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify private caches with native NTFS handles and real Cargo
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -45,6 +46,7 @@ jobs:
           & ./scripts/tests/test_cargo_cache_windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify native CMD selection and admitted Cargo build context
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
