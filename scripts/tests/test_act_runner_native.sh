@@ -1556,7 +1556,8 @@ test_unix_strict_rust_executes_xwin_sanitizer_before_exports() {
     printf '[package]\nname="tool"\nversion="0.1.0"\nedition="2021"\n' > "$strict_root/source/Cargo.toml"
     printf 'fn main() {}\n' > "$strict_root/source/src/main.rs"
     printf 'version = 4\n[[package]]\nname = "tool"\nversion = "0.1.0"\n' > "$strict_root/source/Cargo.lock"
-    bash "$SRC_DIR/cargo_cache.sh" snapshot "$strict_root/ambient" "$strict_root/.cargo-home" >/dev/null || return 1
+    bash "$SRC_DIR/cargo_cache.sh" snapshot "$strict_root/ambient" "$strict_root/.cargo-home" \
+        "$strict_root/source/Cargo.lock" >/dev/null || return 1
     MOCK_BUILD_CMD="cargo metadata --frozen --format-version=1 >/dev/null && printf '%s\\n' \"\${XWIN_CACHE_DIR-<unset>}\" \"\${XWIN_CROSS_COMPILER-<unset>}\" > '$observed_env'"
     MOCK_SSH_STREAM_FILE="$MOCK_DIR/unix-xwin-order/artifact"
     write_mock_artifact "$MOCK_SSH_STREAM_FILE"

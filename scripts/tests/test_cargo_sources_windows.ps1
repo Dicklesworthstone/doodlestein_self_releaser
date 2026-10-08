@@ -392,7 +392,16 @@ try {
     $null = Invoke-Program $cargo @('build','--locked','--offline','--target-dir',($root + '/target-generated-ungated')) $generatedSource
     Assert-Check 'ungated Cargo compiles the same poisoned ambient cache used by metadata admission' ((Invoke-Program ($root + '/target-generated-ungated' + $binary) @()).Out.Trim() -ceq '43')
     $rejectedAdmission = Invoke-GeneratedSourceProgram -Operation Metadata -Suffix poisoned -ExpectFailure @generatedArguments
-    Assert-Check 'generated metadata refuses poisoned dependency bytes before seed admission' ($rejectedAdmission.Code -ne 0 -and $rejectedAdmission.Err -match 'differ from locked content')
+    $poisonedMetadataRefused = $rejectedAdmission.Code -ne 0 -and $rejectedAdmission.Err -match 'differ from locked content'
+    if (-not $poisonedMetadataRefused) {
+        [Console]::Error.WriteLine('Generated metadata exit code: ' + $rejectedAdmission.Code)
+        [Console]::Error.WriteLine('Generated metadata stdout follows:')
+        [Console]::Error.Write($rejectedAdmission.Out)
+        [Console]::Error.WriteLine("`nGenerated metadata stderr follows:")
+        [Console]::Error.Write($rejectedAdmission.Err)
+        [Console]::Error.WriteLine()
+    }
+    Assert-Check 'generated metadata refuses poisoned dependency bytes before seed admission' $poisonedMetadataRefused
     Assert-Check 'failed source authentication publishes neither canonical seed nor source receipt' (-not [IO.Directory]::Exists($generatedParent + '/.cargo-home') -and
         -not [IO.File]::Exists($generatedParent + '/.cargo-home-poisoned/.dsr-cargo-sources.json'))
     Write-FixtureText $registryLib $registryOriginal

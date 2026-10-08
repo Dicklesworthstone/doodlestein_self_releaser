@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Source-pinned release execution through the real runner and manifest validator.
-# Git, LLVM NEON compilation and ARM64 linking are real. Cargo/rustc/cargo-xwin
-# are command-boundary fixtures; no Rust dependency build or Windows execution.
+# Git, locked crate authentication, LLVM NEON compilation and ARM64 linking
+# are real. Cargo/rustc/cargo-xwin and crate extraction are command-boundary
+# fixtures; no Rust dependency build or Windows execution is claimed.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 source "$ROOT/src/xwin_build.sh"
@@ -94,6 +95,29 @@ if mode.startswith('sibling-'):
     graph['resolve']['nodes'][1]['deps'] = [{'name':'types', 'pkg':sibling_ids['types'], 'dep_kinds':[]}]
     if mode == 'sibling-graph-drift' and Path(os.environ['CARGO_TARGET_DIR']).exists():
         graph['resolve']['nodes'][2]['features'] = ['changed']
+if mode.startswith('registry-'):
+    import sys, tarfile
+    home = Path(os.environ['CARGO_HOME'])
+    archive = home / 'registry/cache/fixture-registry/native-dependency-1.0.0.crate'
+    dependency = home / 'registry/src/fixture-registry/native-dependency-1.0.0'
+    if not archive.is_file():
+        print('fixture offline metadata requires the locked private crate download', file=sys.stderr)
+        sys.exit(7)
+    # Only this command boundary is simulated. The production source verifier
+    # independently checks the archive checksum and every extracted file.
+    # Preserve existing sources on the second metadata pass, as Cargo does.
+    if not dependency.exists():
+        dependency.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, 'r:gz') as incoming:
+            incoming.extractall(dependency.parent, filter='data')
+        (dependency / '.cargo-ok').write_text('ok')
+    dependency_id = 'registry+https://fixture.invalid/index#native-dependency@1.0.0'
+    graph['packages'].append({'id':dependency_id, 'name':'native-dependency', 'version':'1.0.0',
+        'source':'registry+https://fixture.invalid/index', 'manifest_path':str(dependency/'Cargo.toml'),
+        'targets':[{'name':'native_dependency', 'kind':['lib'], 'src_path':str(dependency/'src/lib.rs')}]})
+    graph['resolve']['nodes'][0]['dependencies'] = [dependency_id]
+    graph['resolve']['nodes'][0]['deps'] = [{'name':'native_dependency', 'pkg':dependency_id, 'dep_kinds':[]}]
+    graph['resolve']['nodes'].append({'id':dependency_id, 'dependencies':[], 'features':[], 'deps':[]})
 print(json.dumps(graph))
 PY
 CARGO
@@ -120,6 +144,13 @@ if [[ "$mode" == sibling-* ]]; then
     objects+=("$TMPDIR/helper.obj")
     printf 'compiled committed sibling C source with transitive header\n' >&2
 fi
+if [[ "$mode" == registry-* ]]; then
+    compile_flags=(-DDSR_SIBLING=1)
+    dependency="$CARGO_HOME/registry/src/fixture-registry/native-dependency-1.0.0/native.c"
+    clang --target=aarch64-pc-windows-msvc -ffreestanding -c "$dependency" -o "$TMPDIR/dependency.obj" || exit $?
+    objects+=("$TMPDIR/dependency.obj")
+    printf 'compiled lockfile-authenticated private crate C source\n' >&2
+fi
 # Splitting only the controlled whitespace-free compiler flags from the runner.
 # shellcheck disable=SC2086
 clang --target=aarch64-pc-windows-msvc -ffreestanding $CFLAGS "${compile_flags[@]}" -c probe.c -o "$TMPDIR/probe.obj" || exit $?
@@ -133,6 +164,7 @@ case "$mode" in
     sibling-drift) printf '// changed transitive header\n' >> ../types/value.h ;;
     sibling-plan-drift) printf '\n' >> "$HOME/../sibling-crates.json" ;;
     sibling-receipt-drift) printf '\n' >> "$HOME/../release-source.json" ;;
+    registry-drift) printf '// changed after compilation\n' >> "$dependency" ;;
 esac
 python3 - "$mode" "$out" <<'PY'
 import json, os, sys
@@ -183,6 +215,21 @@ dependencies = ["types"]
 [[package]]
 name = "types"
 version = "0.3.0"
+LOCK
+    fi
+    if [[ "$1" == registry-* ]]; then
+        printf '\n[dependencies]\nnative-dependency = "=1.0.0"\n' >> "$directory/Cargo.toml"
+        cat > "$directory/Cargo.lock" <<LOCK
+version = 3
+[[package]]
+name = "probe"
+version = "0.1.0"
+dependencies = ["native-dependency"]
+[[package]]
+name = "native-dependency"
+version = "1.0.0"
+source = "registry+https://fixture.invalid/index"
+checksum = "$REGISTRY_CHECKSUM"
 LOCK
     fi
     if [[ "$1" == normal ]]; then
@@ -244,7 +291,84 @@ assert 'metadata diagnostic is separated from parseable Cargo JSON' grep -Fxq 'm
 assert 'before and after full dependency graphs agree' cmp -s "$WORK/good/metadata-before.json" "$WORK/good/metadata-after.json"
 assert 'release forces the metadata-selected package and JSON artifact messages' jq -e \
     'index("--package")!=null and index("probe")!=null and index("--message-format=json")!=null' "$WORK/good/command.json"
+assert 'even dependency-free releases seed from their admitted staged lockfile' jq -e \
+    '.cargo_cache.seed.selection.kind=="cargo-lock-downloads" and
+     .cargo_cache.seed.selection.lockfile_sha256==.cargo_lock_sha256 and
+     .cargo_cache.seed.selection.registry_packages==0 and .cargo_cache.seed.selection.git_revisions==[]' "$WORK/success.json"
 reject 'occupied run directory never overwrites a successful manifest' 2 "${BUILD[@]}" --project "$WORK/project-normal" --source-sha "$SHA" --run-dir "$WORK/good"
+
+# A source-pinned release consumes authenticated downloads and freshly created
+# private source trees. Ambient extracted sources, unrelated downloads and Git
+# checkouts are deliberately unsafe; they cannot become inputs or veto a build.
+mkdir -p "$WORK/crate/native-dependency-1.0.0/src" "$WORK/registry-ambient/registry/cache/fixture-registry" \
+    "$WORK/registry-ambient/git" "$WORK/poisoned-sources/native-dependency-1.0.0"
+printf '[package]\nname="native-dependency"\nversion="1.0.0"\nedition="2021"\n' > "$WORK/crate/native-dependency-1.0.0/Cargo.toml"
+printf 'pub fn value() -> u32 { 7 }\n' > "$WORK/crate/native-dependency-1.0.0/src/lib.rs"
+printf 'int DsrSiblingValue(void) { return 7; }\n' > "$WORK/crate/native-dependency-1.0.0/native.c"
+tar -czf "$WORK/registry-ambient/registry/cache/fixture-registry/native-dependency-1.0.0.crate" \
+    -C "$WORK/crate" native-dependency-1.0.0 || exit 1
+REGISTRY_CHECKSUM=$(_xwt_hash "$WORK/registry-ambient/registry/cache/fixture-registry/native-dependency-1.0.0.crate") || exit 1
+printf '#error ambient source must never compile\n' > "$WORK/poisoned-sources/native-dependency-1.0.0/native.c"
+ln -s "$WORK/poisoned-sources" "$WORK/registry-ambient/registry/src"
+ln -s "$WORK/poisoned-sources" "$WORK/registry-ambient/git/checkouts"
+ln -s "$WORK/poisoned-sources" "$WORK/registry-ambient/git/db"
+ln -s "$WORK/poisoned-sources" "$WORK/registry-ambient/registry/cache/fixture-registry/unrelated-9.9.9.crate"
+printf 'not a valid archive, and not a locked input\n' > "$WORK/registry-ambient/registry/cache/fixture-registry/unrelated-0.0.1.crate"
+make_project registry-ok || exit 1
+REGISTRY_SHA=$(git -C "$WORK/project-registry-ok" rev-parse HEAD) || exit 1
+assert 'release ignores unsafe unused ambient sources and compiles the locked private download' \
+    "${BUILD[@]}" --project "$WORK/project-registry-ok" --source-sha "$REGISTRY_SHA" \
+    --run-dir "$WORK/registry-good" --cargo-cache "$WORK/registry-ambient"
+assert 'fresh private extraction contains authentic dependency bytes' cmp -s \
+    "$WORK/crate/native-dependency-1.0.0/native.c" "$WORK/registry-good/cargo-home/registry/src/fixture-registry/native-dependency-1.0.0/native.c"
+assert 'seed inventory contains the locked archive and no ambient extracted sources or Git trees' jq -e \
+    '.selection.kind=="cargo-lock-downloads" and .selection.registry_packages==1 and .selection.git_revisions==[] and
+     [.inventory.files[].path]==["registry/cache/fixture-registry/native-dependency-1.0.0.crate"]' \
+    "$WORK/registry-good/cargo-home/.dsr-cache-seed.json"
+assert 'source-pinned cache evidence distinguishes authenticated downloads from later private extraction' jq -e \
+    '.cargo_cache.seed.file_count==1 and .cargo_cache.final.file_count==5 and
+     .cargo_cache.seed.selection.lockfile_sha256==.cargo_lock_sha256 and
+     .cargo_cache.seed.inventory_sha256!=.cargo_cache.final.inventory_sha256' "$WORK/registry-good/release/result.json"
+assert 'real ARM64 compilation consumed the authenticated crate C source' grep -Fxq \
+    'compiled lockfile-authenticated private crate C source' "$WORK/registry-good/build.log"
+assert 'locked dependency contributes to the emitted ARM64 binary' jq -es \
+    'length==2 and all(.[];.artifact.sha256|test("^[0-9a-f]{64}$")) and
+     .[0].artifact.sha256!=.[1].artifact.sha256' "$WORK/success.json" "$WORK/registry-good/release/result.json"
+assert 'release manifest retains source authentication and the exact selected seed evidence' jq -e \
+    --slurpfile result "$WORK/registry-good/release/result.json" \
+    '.build_environments[0] | .cargo_cache==$result[0].cargo_cache and
+     .cargo_metadata.dependency_sources.authentication.locked_archive_packages==1 and
+     .cargo_metadata.dependency_sources.authentication.lockfile_sha256==.cargo_cache.seed.selection.lockfile_sha256' \
+    "$WORK/registry-good/release/build-manifest.json"
+assert 'finished locked-download private cache verifies independently' cargo_cache_verify \
+    "$WORK/registry-good/cargo-home" "$WORK/registry-good/cargo-cache-final.json"
+assert 'original poisoned source remains unmodified and unused' grep -Fxq \
+    '#error ambient source must never compile' "$WORK/poisoned-sources/native-dependency-1.0.0/native.c"
+
+for CACHE_FAILURE in absent checksum linked; do
+    BROKEN_HOME="$WORK/registry-$CACHE_FAILURE-cache"
+    mkdir -p "$BROKEN_HOME/registry/cache/fixture-registry"
+    ln -s "$WORK/poisoned-sources" "$BROKEN_HOME/registry/src"
+    case "$CACHE_FAILURE" in
+        checksum) printf 'wrong locked download bytes\n' > "$BROKEN_HOME/registry/cache/fixture-registry/native-dependency-1.0.0.crate" ;;
+        linked) ln -s "$WORK/registry-ambient/registry/cache/fixture-registry/native-dependency-1.0.0.crate" \
+            "$BROKEN_HOME/registry/cache/fixture-registry/native-dependency-1.0.0.crate" ;;
+    esac
+    reject "$CACHE_FAILURE required download cannot be replaced by an ambient source tree" 7 \
+        "${BUILD[@]}" --project "$WORK/project-registry-ok" --source-sha "$REGISTRY_SHA" \
+        --run-dir "$WORK/registry-$CACHE_FAILURE" --cargo-cache "$BROKEN_HOME"
+    assert "$CACHE_FAILURE required download fails before any ARM64 compiler command" test ! -e "$WORK/registry-$CACHE_FAILURE/build.log"
+    assert "$CACHE_FAILURE required download emits no release manifest" test ! -e "$WORK/registry-$CACHE_FAILURE/release"
+done
+make_project registry-drift || exit 1
+REGISTRY_DRIFT_SHA=$(git -C "$WORK/project-registry-drift" rev-parse HEAD) || exit 1
+reject 'dependency changed after successful ARM64 compilation cannot be published' 7 \
+    "${BUILD[@]}" --project "$WORK/project-registry-drift" --source-sha "$REGISTRY_DRIFT_SHA" \
+    --run-dir "$WORK/registry-drift" --cargo-cache "$WORK/registry-ambient"
+assert 'dependency drift fixture completed real ARM64 linking before refusal' xwin_validate_arm64_pe \
+    "$WORK/registry-drift/target/aarch64-pc-windows-msvc/release/probe.exe"
+assert 'post-build authentication refusal leaves no release manifest' test ! -e "$WORK/registry-drift/release"
+
 for MODE in source-drift receipt-drift environment-drift graph-receipt-drift graph-drift wrong-package wrong-message-source wrong-features test-profile missing-artifact duplicate-artifact failed-message truncate external-source wrong-version fail; do
     make_project "$MODE" || exit 1
     SOURCE_SHA=$(git -C "$WORK/project-$MODE" rev-parse HEAD)

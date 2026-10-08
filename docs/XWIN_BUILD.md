@@ -80,23 +80,33 @@ compiler feature sets must agree; incompatible workspace feature resolution
 still fails admission.
 
 `--offline` requests Cargo's offline behavior. Without it, Cargo may fetch
-locked dependencies. `--cargo-cache` is optional: only its `registry/` and
-`git/` directories are copied into a fresh, independently owned Cargo home
-before any Cargo invocation. These are byte copies, not symlinks or source
+locked dependencies. `--cargo-cache` is optional. Source-pinned releases select
+downloads using the staged, committed `Cargo.lock`: checksum-matching crate
+archives, corresponding registry index records, and Git databases containing
+locked commits. Ambient extracted registry sources and Git checkouts are never
+copied. Cargo recreates them in the private home, and the existing source
+authentication gate verifies them against locked archives and Git objects.
+Unrelated cached links, archives, and working copies cannot become release
+inputs or block preparation; a lockfile without Git dependencies does not open
+the Git cache. Selection covers all packages in the lockfile rather than only
+the chosen target/features; selected Git databases retain their full history.
+Ordinary builds copy the supplied `registry/` and `git/` trees. Both modes create
+a fresh, independently owned Cargo home before any Cargo invocation.
+These are byte copies, not symlinks or source
 hardlinks: deleting the original cache or writing its files in place cannot
 change the prepared copy. Top-level Cargo configuration, credentials, binaries,
 and unrelated files are not inherited. The runner intentionally does not inherit
 proxy variables, registry credentials, or arbitrary environment overrides.
 Projects requiring custom registries must supply reviewed project configuration.
 
-The seed must be a real directory. Linked/special cache entries and Git
+The seed must be a real directory. Linked/special selected entries and Git
 gitdir/commondir/alternate-object storage pointers are rejected rather than
 retaining references outside the private home. Detected changes during copying
 fail preparation; use a quiescent cache or omit `--cargo-cache` to start empty.
 An empty cache normally needs network access, so combining it with `--offline`
 requires dependencies already supplied by reviewed project configuration.
-Preparation copies the entire selected cache trees and needs corresponding
-disk space; it is not a dependency-subset or copy-on-write optimization.
+Preparation needs disk space for the selected downloads in release mode or
+complete cache trees in ordinary mode; it does not use copy-on-write storage.
 `--timeout` also bounds each cache preparation/inventory command separately.
 Cancellation reaches its process group; diagnostics are retained in
 `run/cargo-cache-seed.log` and `run/cargo-cache-final.log`.
@@ -104,7 +114,10 @@ Cancellation reaches its process group; diagnostics are retained in
 Cargo can legitimately download, unpack, or maintain files in its private
 home. The result's `cargo_cache` field therefore retains separate seed and
 final inventory summaries, including receipt SHA-256, inventory SHA-256,
-file count and byte count. The release manifest retains the same field under
+file count and byte count. Source-pinned seed summaries also retain `selection`,
+including the lockfile SHA-256, registry-package count, and Git revisions; final
+inventories describe the expanded private home without claiming that selection.
+The release manifest retains the same field under
 `build_environments`. Full inventories live in
 `run/cargo-home/.dsr-cache-seed.json` and `run/cargo-cache-final.json`;
 changing seed evidence during the build prevents success. Inventories describe

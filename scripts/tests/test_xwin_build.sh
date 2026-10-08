@@ -75,11 +75,14 @@ case "$mode" in
            ! -e "$CARGO_HOME/credentials.toml" ]] || exit 96
         source_file="$CARGO_HOME/registry/src/probe.c"
         cmp -s "$source_file" probe.c || exit 96
-        # Delete only this suite's generated seed, after the runner has
-        # prepared the private home and before the real compiler reads it.
+        # Retire this suite's generated seed paths after the runner prepared
+        # the private home and before the real compiler reads it. Checked
+        # renames retain evidence and guarantee the original paths disappear.
         ambient="${PWD%/project}/ambient-cache"
         [[ -f "$ambient/test-owned" ]] || exit 96
-        rm -rf -- "$ambient/registry" "$ambient/git"
+        mv -- "$ambient/registry" "$ambient/registry.retired" || exit 96
+        mv -- "$ambient/git" "$ambient/git.retired" || exit 96
+        [[ ! -e "$ambient/registry" && ! -e "$ambient/git" ]] || exit 96
         printf 'new dependency bytes\n' > "$CARGO_HOME/registry/new-dependency"
         ;;
 esac
@@ -141,7 +144,8 @@ assert 'LLVM NEON source remains unchanged' cmp -s "$RESOURCE/include/arm_neon.h
 assert 'lowercase pinned sysroot was never renamed' test ! -e "$WORK/input/sdk/lib/aarch64-unknown-windows-msvc/Kernel32.lib"
 assert 'original source archive still matches pinned hash' bash -c '[[ "$(sha256sum "$1"|cut -d" " -f1)" == "$(jq -r .sysroot.sha256 "$2")" ]]' _ "$WORK/sdk.tar.xz" "$MANIFEST"
 assert 'unseeded build records an empty private cache' jq -e \
-    '.cargo_cache.mode=="private-copy" and .cargo_cache.seed.file_count==0 and .cargo_cache.final.file_count==0' "$WORK/success.json"
+    '.cargo_cache.mode=="private-copy" and .cargo_cache.seed.file_count==0 and .cargo_cache.final.file_count==0 and
+     (.cargo_cache.seed|has("selection")|not)' "$WORK/success.json"
 mkdir -p "$WORK/ambient-cache/registry/src" "$WORK/ambient-cache/git/db"
 touch "$WORK/ambient-cache/test-owned"
 cp "$WORK/project/probe.c" "$WORK/ambient-cache/registry/src/probe.c"
@@ -149,10 +153,10 @@ printf 'git cache bytes\n' > "$WORK/ambient-cache/git/db/input"
 printf 'not inherited\n' > "$WORK/ambient-cache/credentials.toml"
 printf 'not inherited\n' > "$WORK/ambient-cache/config.toml"
 printf 'cache-wipe\n' > "$WORK/project/mode"
-assert 'real ARM64 compilation survives original Cargo cache deletion' \
+assert 'real ARM64 compilation survives original Cargo cache paths disappearing' \
     "${BUILD[@]}" --run-dir "$WORK/cache-wipe" --cargo-cache "$WORK/ambient-cache"
-assert 'fixture actually removed the original registry' test ! -e "$WORK/ambient-cache/registry"
-assert 'fixture actually removed the original git cache' test ! -e "$WORK/ambient-cache/git"
+assert 'fixture actually retired the original registry path' test ! -e "$WORK/ambient-cache/registry"
+assert 'fixture actually retired the original git cache path' test ! -e "$WORK/ambient-cache/git"
 assert 'seed and newly resolved dependency inventories retained' jq -e \
     '.cargo_cache.mode=="private-copy" and .cargo_cache.seed.file_count==2 and .cargo_cache.final.file_count==3 and
      (.cargo_cache.seed.inventory_sha256 != .cargo_cache.final.inventory_sha256) and .artifact.machine=="IMAGE_FILE_MACHINE_ARM64"' \

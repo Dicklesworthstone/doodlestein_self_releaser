@@ -495,9 +495,14 @@ _xwb_build() {
     # A private CARGO_HOME with links into an ambient cache is not private:
     # host cache pruning can remove a dependency in the middle of a build.
     # Copy independent inodes before any Cargo command, including metadata.
+    # Source-pinned releases admit downloads selected by the staged lockfile,
+    # then let Cargo recreate sources before the existing authentication gate.
+    # Unrelated ambient checkouts and extracted sources are not release inputs.
+    local -a cargo_seed_args=("$cargo_cache" "$run/cargo-home")
+    [[ "$release" == false ]] || cargo_seed_args+=("$project/Cargo.lock")
     _xwt_log "Preparing private Cargo cache; evidence: $run/cargo-cache-seed.json"
     _xwb_run "$project" "$run/cargo-cache-seed.log" "$seconds" --stdout "$run/cargo-cache-seed.json" \
-        bash "$_XWIN_BUILD_DIR/cargo_cache.sh" snapshot "$cargo_cache" "$run/cargo-home" || return $?
+        bash "$_XWIN_BUILD_DIR/cargo_cache.sh" snapshot "${cargo_seed_args[@]}" || return $?
     cargo_seed_controls=$(sha256sum -- "$run/cargo-cache-seed.json" \
         "$run/cargo-home/.dsr-cache-seed.json") || return 1
     rustc=$(jq -r '.tools.rustc.path' <<< "$plan") || return 1
