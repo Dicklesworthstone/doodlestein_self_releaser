@@ -1,8 +1,9 @@
-# Build with the pinned Windows ARM64 view
+# Build with a pinned Windows x64 or ARM64 view
 
 `scripts/xwin-build.sh` consumes the manifest specified in
 [XWIN_TOOLCHAIN.md](XWIN_TOOLCHAIN.md), runs the pinned cargo-xwin plugin, and
-admits an executable only after toolchain revalidation and ARM64 PE verification.
+admits an executable only after toolchain revalidation and PE verification for
+the selected architecture.
 The opt-in release mode stages an exact Git commit and emits DSR's existing
 successful-build manifest for the verified publication pipeline. Ordinary mode
 still accepts an already-staged project. Neither mode automatically changes
@@ -31,7 +32,9 @@ bash scripts/xwin-build.sh \
 `--run-dir` must be a new absolute directory with an existing parent. No prior
 run is overwritten or implicitly resumed. `--package NAME` selects a workspace
 package; `--bin NAME` is mandatory. The build always uses `--release`,
-`--locked`, and `--target aarch64-pc-windows-msvc`. The project must have a
+`--locked`, and the manifest's exact `--target`, either
+`x86_64-pc-windows-msvc` or `aarch64-pc-windows-msvc`. There is no independent
+CLI target override. The project must have a
 regular `Cargo.toml` and `Cargo.lock`. `--timeout SECONDS` bounds compilation
 (default 3600; range 1..86400). `--cache-dir DIR` selects the prepared-view
 cache. Build execution also requires Python 3.9+, GNU timeout, and util-linux
@@ -159,7 +162,8 @@ bash scripts/xwin-build.sh \
 ```
 
 `--tool` defaults to the binary name. `--asset-name` defaults to
-`<binary>-aarch64-pc-windows-msvc.exe`. These options require the complete release
+`<binary>-<manifest-target>.exe`, for example
+`example-tool-x86_64-pc-windows-msvc.exe` for Windows x64. These options require the complete release
 identity and must produce safe basenames. The artifact directory contains only
 that admitted executable; private evidence and the manifest live outside it.
 
@@ -178,7 +182,7 @@ must also live outside ancestor Cargo configurations. The primary commit's time
 sets `SOURCE_DATE_EPOCH` in the controlled build environment.
 
 Before and after compilation, the pinned Cargo runs complete, locked metadata
-resolution with `--filter-platform aarch64-pc-windows-msvc`, in the same snapshot
+resolution with `--filter-platform <manifest-target>`, in the same snapshot
 and controlled top-level environment. The runner validates workspace membership,
 local manifest/target paths, dependency edges, binary selection, active required
 features, and package version equality with the release tag. Full canonical
@@ -188,7 +192,7 @@ bounds each metadata command as well as the build command, not the entire run.
 The admitted workspace package is passed explicitly to cargo-xwin. Its JSON
 compiler-artifact message must identify the selected package, binary source,
 feature set, non-test profile and exact target-directory executable, followed by
-a successful build-finished result. A pre-existing filename or a valid ARM64 PE
+a successful build-finished result. A pre-existing filename or a valid Windows PE
 header alone cannot satisfy these checks. Workspaces whose metadata and actual
 build feature resolution differ are rejected, not silently treated as equivalent.
 
@@ -399,7 +403,7 @@ tag, lockfile, or installed toolchain is modified by this staging step.
 Successful release mode creates both files through one directory rename:
 
 - `run/release/build-manifest.json`: DSR schema `1.0.0`, one successful
-  `windows/arm64` target and its exact executable name/hash/size.
+  `windows/amd64` or `windows/arm64` target and its exact executable name/hash/size.
 - `run/release/result.json`: the verified build receipt, including the manifest's
   path and SHA-256. Stdout contains this same receipt.
 
@@ -408,6 +412,9 @@ Cargo graph digest and selection, toolchain/header/library evidence, tool versio
 hashes, command and normalized build-influence environment. Full metadata and
 version output remain in the run directory. Large inventories are read through
 files rather than passed as process arguments.
+The selected Rust triple is explicit in each artifact and build environment.
+The manifest schema checks that the platform, triple and pinned toolchain target
+agree, using a distinct `pinned-cargo-xwin` environment profile.
 
 The runner validates its manifest using the same successful-build profile that
 DSR's manifest-bound payload publisher and SLSA mapper consume. The following is
@@ -456,7 +463,8 @@ pair described above. Both retain the artifact SHA-256/size, manifest identity,
 full toolchain evidence, source configuration hashes, command arguments,
 normalized invocation environment, version-output hashes and build-log path.
 The artifact is copied into `run/artifacts/` before verification. It must be a
-PE32+ executable with machine `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`), bounded
+PE32+ executable with the selected machine, `IMAGE_FILE_MACHINE_AMD64`
+(`0x8664`) for x64 or `IMAGE_FILE_MACHINE_ARM64` (`0xAA64`) for ARM64, bounded
 headers and section data, and a file-backed executable entry point. Wrong
 architectures, DLLs, truncated files and symlink outputs are rejected without
 executing them. This validates the container, not every Windows loader semantic.
@@ -490,13 +498,16 @@ bash scripts/tests/test_xwin_build.sh
 bash scripts/tests/test_xwin_toolchain_scale.sh
 bash scripts/tests/test_xwin_source.sh
 bash scripts/tests/test_xwin_release_build.sh
+XWIN_TEST_TARGET=x86_64-pc-windows-msvc bash scripts/tests/test_xwin_release_build.sh
 bash scripts/tests/test_xwin_metadata_workspace.sh
 bash scripts/tests/test_xwin_multibin.sh
 ```
 
 The build tests use command-boundary stand-ins for Cargo, rustc, and cargo-xwin,
-but real Git source snapshots, installed clang headers, NEON compilation, ARM64
-import-library construction and lld-link executable generation. They require
+but real Git source snapshots, installed clang headers, x64 SSE and ARM64 NEON
+compilation, architecture-specific import libraries and lld-link executable
+generation. Each executable must pass its own machine check before the suite
+tests refusal by the opposite architecture. They require
 Linux and LLVM and report a skip when those tools are absent. Sibling integration
 tests additionally compile C from one committed sibling with a header from a
 second, verify that a changed reviewed header pin changes the linked bytes,

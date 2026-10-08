@@ -3,7 +3,7 @@
 #
 # Usage: ./test_json_schemas.sh
 #
-# Requires: ajv-cli (npm install -g ajv-cli) or falls back to jq validation
+# Full validation requires ajv-cli or Python jsonschema; jq checks only basic structure.
 
 set -uo pipefail
 
@@ -34,13 +34,42 @@ log_info() { echo -e "${BLUE}→${NC} $1"; }
 
 # Check if ajv-cli is available
 use_ajv=false
+use_python=false
 if command -v ajv &>/dev/null; then
     use_ajv=true
     log_info "Using ajv-cli for schema validation"
+elif command -v python3 >/dev/null && python3 -c 'from jsonschema import Draft202012Validator, FormatChecker' >/dev/null 2>&1; then
+    use_python=true
+    log_info "Using Python jsonschema Draft 2020-12 for schema validation"
 else
     log_info "ajv-cli not found, using jq for basic validation"
     log_info "Install ajv-cli for full schema validation: npm install -g ajv-cli"
 fi
+
+validate_with_python() {
+    python3 - "$2" "$1" <<'PY'
+import json
+import sys
+from jsonschema import Draft202012Validator, FormatChecker
+with open(sys.argv[1]) as stream:
+    schema = json.load(stream)
+with open(sys.argv[2]) as stream:
+    value = json.load(stream)
+Draft202012Validator.check_schema(schema)
+errors = list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(value))
+for error in errors:
+    print("/".join(map(str, error.absolute_path)) + ": " + error.message, file=sys.stderr)
+sys.exit(1 if errors else 0)
+PY
+}
+
+validate_with_schema() {
+    if $use_ajv; then
+        validate_with_ajv "$@"
+    else
+        validate_with_python "$@"
+    fi
+}
 
 validate_with_ajv() {
     local fixture="$1"
@@ -218,7 +247,12 @@ test_manifest_schema_release_contract_fields() {
         (."$defs".source_dependency.required | index("relative_path")) and
         (."$defs".source_dependency.required | index("git_sha")) and
         (.properties.build_environments.items."$ref" == "#/$defs/build_environment") and
-        (."$defs".build_environment.required | index("cargo_isolation")) and
+        (."$defs".build_environment.oneOf | any(."$ref" == "#/$defs/native_build_environment")) and
+        (."$defs".native_build_environment.required | index("cargo_isolation")) and
+        (."$defs".build_environment.oneOf | any(."$ref" == "#/$defs/xwin_build_environment")) and
+        (."$defs".xwin_build_environment.required | index("toolchain")) and
+        (."$defs".xwin_build_environment.required | index("cargo_metadata")) and
+        (."$defs".xwin_build_environment.additionalProperties == false) and
         (."$defs".cargo_isolation.required | index("ancestor_config_policy")) and
         (."$defs".artifact.required | index("archive_format")) and
         (."$defs".artifact.properties.archive_format.enum | index("binary"))
@@ -226,6 +260,177 @@ test_manifest_schema_release_contract_fields() {
         log_pass "Manifest schema covers source pins, isolation receipts, and strict binary assets"
     else
         log_fail "Manifest schema is missing strict release-contract requirements"
+    fi
+}
+
+test_xwin_manifest_schema() {
+    echo ""
+    log_info "Testing typed native and pinned cargo-xwin manifest evidence..."
+    if ! command -v python3 >/dev/null || ! python3 -c 'from jsonschema import Draft202012Validator, FormatChecker' >/dev/null 2>&1; then
+        log_skip "Typed producer mutation tests require Python jsonschema; jq is not schema validation"
+        return
+    fi
+    # Optional newline-separated paths select actual retained producer outputs.
+    # Without them, these are explicitly structural protocol fixtures, not
+    # claims of compiler execution. The real source-pinned runner tests retain
+    # manifests that can be supplied unchanged through this same validator.
+    if python3 - "$SCHEMAS_DIR/manifest.json" "${DSR_XWIN_SCHEMA_MANIFESTS:-}" "${DSR_XWIN_SCHEMA_PACKAGED_MANIFESTS:-}" <<'PY'
+import copy
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator, FormatChecker
+
+schema = json.loads(Path(sys.argv[1]).read_text())
+Draft202012Validator.check_schema(schema)
+validator = Draft202012Validator(schema, format_checker=FormatChecker())
+checks = 0
+
+def check(label, value, valid=True, selected=validator):
+    global checks
+    errors = list(selected.iter_errors(value))
+    if bool(errors) == valid:
+        details = "; ".join("/".join(map(str, e.absolute_path)) + ": " + e.message for e in errors[:3])
+        raise AssertionError(label + (": " + details if errors else ": invalid producer accepted"))
+    checks += 1
+    print("PASS " + label, flush=True)
+
+digest = "a" * 64
+commit = "b" * 40
+roles = ("cargo", "cargo-xwin", "rustc", "clang", "lld-link", "llvm-ar")
+
+def protocol_fixture(platform, triple):
+    archive = dict(path="/pinned/input.tar.xz", prefix="sdk", sha256=digest, url="https://example.invalid/pinned/input.tar.xz")
+    toolchain = dict(schema_version=1, kind="dsr-xwin-toolchain", manifest_sha256=digest, target=triple,
+        inputs=dict(schema_version=1, target=triple, sysroot=archive, headers=dict(archive, prefix="include"),
+                    aliases={"Kernel32.lib":"kernel32.lib"},
+                    tools={role:dict(path="/pinned/"+role, sha256=digest) for role in roles}),
+        files=[dict(path="include", type="directory", sha256="", size_bytes=0),
+               dict(path="include/header.h", type="file", sha256=digest, size_bytes=1)])
+    source = dict(schema_version=1, kind="dsr-xwin-source", repository="https://github.com/owner/demo",
+        git_sha=commit, git_ref="refs/tags/v1.2.3", git_tree="c"*40, source_date_epoch=1, snapshot_sha256=digest,
+        files=[dict(path="src/main.rs", sha256=digest, size_bytes=1, executable=False)])
+    binary = dict(package_id="path+file:///build/source#demo@1.2.3", package="demo", version="1.2.3", binary="demo",
+                  manifest="Cargo.toml", binary_source="src/main.rs", features=[])
+    dependency_sources = dict(schema_version=1, kind="dsr-cargo-dependency-sources", sha256=digest, metadata_sha256=digest,
+        package_count=0, root_count=0, file_count=0, size_bytes=0,
+        authentication=dict(lockfile_sha256=digest, locked_archive_packages=0, locked_git_packages=0, workspace_snapshot_packages=0))
+    metadata = dict(binary, binaries=[copy.deepcopy(binary)], metadata_sha256=digest, source_dependencies=[],
+                    resolved_siblings=[], resolved_packages=1, dependency_sources=dependency_sources)
+    cache = dict(schema_version=1, cargo_home="/build/cargo-home", receipt_path="/build/receipt.json",
+                 receipt_sha256=digest, inventory_sha256=digest, caches=[], file_count=0, size_bytes=0)
+    environment = dict(target=platform, target_triple=triple, host="local", method="pinned-cargo-xwin", build_influence_env={},
+        tool_versions={role:digest for role in roles}, toolchain=toolchain, cargo_metadata=metadata, source_snapshot=source,
+        cargo_cache=dict(mode="private-copy", seed=dict(cache, mode="private-copy", selection=dict(kind="cargo-lock-downloads",
+            lockfile_sha256=digest, registry_packages=0, git_revisions=[])), final=dict(cache, mode="inventory")),
+        feature_selection=dict(features=[], all_features=False, no_default_features=False),
+        command=["/build/bin/cargo-xwin", "xwin", "build", "--release", "--locked", "--target", triple])
+    return dict(schema_version="1.0.0", tool="demo", version="v1.2.3", run_id="11111111-1111-4111-8111-111111111111",
+        built_at="2026-10-08T00:00:00Z", status="success", summary=dict(total=1,success=1,failed=0),
+        source=dict(git_sha=commit,git_ref="refs/tags/v1.2.3",dependencies=[],repository=source["repository"],
+                    snapshot_sha256=digest,receipt_sha256=digest),
+        requested_targets=[platform], hosts=[dict(host="local",platform=platform,status="success",method="local")],
+        build_environments=[environment], artifacts=[dict(name="demo-"+triple+".exe",target=platform,target_triple=triple,
+            sha256=digest,size_bytes=1,archive_format="binary")])
+
+actual = [Path(p) for p in sys.argv[2].splitlines() if p]
+fixtures = []
+for path in actual:
+    value = json.loads(path.read_text())
+    check("actual source-pinned producer manifest " + str(path), value)
+    fixtures.append(value)
+if not fixtures:
+    fixtures = [protocol_fixture(platform, triple) for platform, triple in (
+        ("windows/amd64","x86_64-pc-windows-msvc"), ("windows/arm64","aarch64-pc-windows-msvc"))]
+    for fixture in fixtures:
+        check("explicit structural producer fixture " + fixture["build_environments"][0]["target"], fixture)
+
+missing = object()
+for fixture in fixtures:
+    environment = fixture["build_environments"][0]
+    platform, triple = environment["target"], environment["target_triple"]
+    opposite = "aarch64-pc-windows-msvc" if triple == "x86_64-pc-windows-msvc" else "x86_64-pc-windows-msvc"
+    other_platform = "windows/arm64" if platform == "windows/amd64" else "windows/amd64"
+    env = ("build_environments",0)
+    # The packager retains the build environment but projects new archive/raw
+    # alias rows from its recipe. The coordinator requires raw producer triples;
+    # the general manifest schema validates declared triples without requiring
+    # a field that this established derived-manifest profile does not emit.
+    derived = copy.deepcopy(fixture)
+    for asset in derived["artifacts"]:
+        asset.pop("target_triple", None)
+    check(platform + " permits derived asset rows while retaining the complete build environment", derived)
+    cases = [
+        ("producer platform",env+("target",),other_platform),
+        ("producer triple",env+("target_triple",),opposite),
+        ("toolchain target",env+("toolchain","target"),opposite),
+        ("pinned input target",env+("toolchain","inputs","target"),opposite),
+        ("artifact target triple",("artifacts",0,"target_triple"),opposite),
+        ("missing producer triple",env+("target_triple",),missing),
+        ("native method cannot hide xwin evidence",env+("method",),"native"),
+        ("unknown producer field",env+("unreviewed",),True),
+        ("toolchain kind",env+("toolchain","kind"),"unverified"),
+        ("missing executable pin",env+("toolchain","inputs","tools","rustc"),missing),
+        ("malformed executable hash",env+("toolchain","inputs","tools","rustc","sha256"),"bad"),
+        ("missing version role",env+("tool_versions","cargo-xwin"),missing),
+        ("version text cannot replace its digest",env+("tool_versions","rustc"),"rustc 1.90.0"),
+        ("unpinned archive URL",env+("toolchain","inputs","sysroot","url"),"http://example.invalid/sdk.tar.xz"),
+        ("missing import library alias",env+("toolchain","inputs","aliases","Kernel32.lib"),missing),
+        ("unsafe toolchain inventory path",env+("toolchain","files",0,"path"),"../outside"),
+        ("missing lock-selected cache seed",env+("cargo_cache","seed","selection"),missing),
+        ("final cache must be inventoried",env+("cargo_cache","final","mode"),"private-copy"),
+        ("malformed cache receipt digest",env+("cargo_cache","seed","receipt_sha256"),"bad"),
+        ("missing Cargo metadata",env+("cargo_metadata",),missing),
+        ("missing binary selection",env+("cargo_metadata","binaries"),[]),
+        ("unknown Cargo metadata field",env+("cargo_metadata","unreviewed"),True),
+        ("missing source metadata binding",env+("cargo_metadata","dependency_sources","metadata_sha256"),missing),
+        ("boolean package count",env+("cargo_metadata","dependency_sources","package_count"),True),
+        ("missing dependency authentication",env+("cargo_metadata","dependency_sources","authentication"),missing),
+        ("source receipt kind",env+("source_snapshot","kind"),"unverified"),
+        ("unsafe source inventory path",env+("source_snapshot","files",0,"path"),"../outside"),
+        ("malformed source inventory digest",env+("source_snapshot","files",0,"sha256"),"bad"),
+        ("source executable bit must be boolean",env+("source_snapshot","files",0,"executable"),1),
+        ("unbound sibling source layout",env+("source_snapshot","primary_path"),"elsewhere"),
+        ("malformed public repository",("source","repository"),"https://example.invalid/owner/demo"),
+        ("malformed public source receipt",("source","receipt_sha256"),"bad"),
+        ("feature switch must be boolean",env+("feature_selection","all_features"),1),
+        ("missing command",env+("command",),[]),
+    ]
+    for label, path, replacement in cases:
+        changed = copy.deepcopy(fixture)
+        selected = changed
+        for key in path[:-1]:
+            selected = selected[key]
+        if replacement is missing:
+            selected.pop(path[-1])
+        else:
+            selected[path[-1]] = replacement
+        check(platform + " refuses " + label, changed, False)
+
+for path in [Path(p) for p in sys.argv[3].splitlines() if p]:
+    packaged = json.loads(path.read_text())
+    check("actual packager manifest " + str(path), packaged)
+    changed = copy.deepcopy(packaged)
+    asset = changed["artifacts"][0]
+    asset["target_triple"] = "aarch64-pc-windows-msvc" if asset["target"] == "windows/amd64" else "x86_64-pc-windows-msvc"
+    check("packaged artifact cannot declare another platform's triple", changed, False)
+
+# Resolve only the environment profile without inheriting top-level required fields.
+native_validator = Draft202012Validator({"$schema":schema["$schema"],"$defs":schema["$defs"],
+                                       "$ref":"#/$defs/build_environment"}, format_checker=FormatChecker())
+native = dict(target="linux/amd64",host="local",method="native",build_influence_env={},cargo_isolation=None)
+check("native profile retains its existing valid shape",native,selected=native_validator)
+for label, mutation in (("missing isolation",lambda v:v.pop("cargo_isolation")),
+                        ("xwin evidence injected",lambda v:v.update(toolchain={})),
+                        ("unknown native method",lambda v:v.update(method="custom"))):
+    changed = copy.deepcopy(native); mutation(changed)
+    check("native profile still refuses "+label,changed,False,native_validator)
+print("Typed producer schema checks: " + str(checks) + " passed",flush=True)
+PY
+    then
+        log_pass "Draft 2020-12 validates typed native/xwin profiles and rejects contradictory evidence"
+    else
+        log_fail "Typed native/xwin manifest schema regression"
     fi
 }
 
@@ -253,9 +458,9 @@ validate_fixture() {
     fi
 
     # Validate against envelope schema
-    if $use_ajv; then
+    if $use_ajv || $use_python; then
         if $is_manifest; then
-            if validate_with_ajv "$fixture" "$SCHEMAS_DIR/manifest.json"; then
+            if validate_with_schema "$fixture" "$SCHEMAS_DIR/manifest.json"; then
                 log_pass "Manifest schema validation"
             else
                 log_fail "Manifest schema validation"
@@ -263,7 +468,7 @@ validate_fixture() {
             return
         fi
 
-        if validate_with_ajv "$fixture" "$SCHEMAS_DIR/envelope.json"; then
+        if validate_with_schema "$fixture" "$SCHEMAS_DIR/envelope.json"; then
             log_pass "Envelope schema validation"
         else
             log_fail "Envelope schema validation"
@@ -275,7 +480,7 @@ validate_fixture() {
             local details_tmp
             details_tmp=$(mktemp)
             jq '.details' "$fixture" > "$details_tmp"
-            if validate_with_ajv "$details_tmp" "$detail_schema"; then
+            if validate_with_schema "$details_tmp" "$detail_schema"; then
                 log_pass "Details schema validation ($command)"
             else
                 log_fail "Details schema validation ($command)"
@@ -462,6 +667,7 @@ main() {
     test_uuid_format
     test_sha256_format
     test_manifest_schema_release_contract_fields
+    test_xwin_manifest_schema
 
     # Summary
     echo ""

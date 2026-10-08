@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepare or revalidate the pinned Windows ARM64 closure described in
+# Prepare or revalidate the pinned Windows x64 or ARM64 closure described in
 # docs/XWIN_TOOLCHAIN.md. No source/toolchain installation is modified.
 set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -12,6 +12,7 @@ main() {
     case "$command" in
         --help|-h|help|'')
             printf '%s\n' 'Usage: xwin-toolchain.sh prepare|verify --manifest FILE [--cache-dir DIR]' \
+                'The manifest selects x86_64-pc-windows-msvc or aarch64-pc-windows-msvc.' \
                 'Inputs are SHA-256-pinned local archives and executable files. stdout is JSON.'
             return 0 ;;
         prepare|verify) ;;

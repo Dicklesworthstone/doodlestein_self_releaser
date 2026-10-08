@@ -172,7 +172,7 @@ metadata_features() {
         > "$directory/environment.nul"
     printf '%s\n' "$selection" > "$directory/features.json"
     _xwb_metadata "$WORK/project" "$directory" before xwin-hidden '' 1.2.3 true 30 '' \
-        '["xwin-hidden","xwin-helper"]' "$selection" \
+        '["xwin-hidden","xwin-helper"]' "$selection" aarch64-pc-windows-msvc \
         > "$directory/metadata.stdout" 2> "$directory/metadata.stderr" || status=$?
     return "$status"
 }
@@ -238,6 +238,62 @@ for invalid in '' ' , ' '../hidden' 'worker//hidden' 'worker/' '/hidden' 'dep:hi
     _xwb_feature_selection false false "$invalid" > "$WORK/invalid-feature.json" \
         2> "$WORK/invalid-feature.log" || STATUS=$?
     check "invalid feature syntax refuses before launch: $(printf '%q' "$invalid")" equal "$STATUS" 4
+done
+
+# The manifest-selected Windows target must affect genuine resolution, not
+# just the text of a command fixture. Separate target-only local dependencies
+# make each filter produce a different admitted graph. Cargo can unify the
+# features of one package across target-specific declarations, so that is not
+# a sound observation of --filter-platform.
+FILTER_PROJECT="$WORK/target-filter"
+mkdir -p "$FILTER_PROJECT/src" || exit 1
+cat > "$FILTER_PROJECT/Cargo.toml" <<'TOML'
+[package]
+name = "xwin-filter"
+version = "1.2.3"
+edition = "2021"
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+target-input-arm64 = { path = "dependency-arm64" }
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+target-input-amd64 = { path = "dependency-amd64" }
+TOML
+for FILTER_ARCH in arm64 amd64; do
+    mkdir -p "$FILTER_PROJECT/dependency-$FILTER_ARCH/src" || exit 1
+    cat > "$FILTER_PROJECT/dependency-$FILTER_ARCH/Cargo.toml" <<TOML
+[package]
+name = "target-input-$FILTER_ARCH"
+version = "1.2.3"
+edition = "2021"
+TOML
+    printf 'pub fn selected_input() {}\n' > "$FILTER_PROJECT/dependency-$FILTER_ARCH/src/lib.rs"
+done
+printf 'fn main() {}\n' > "$FILTER_PROJECT/src/main.rs"
+cargo generate-lockfile --offline --manifest-path "$FILTER_PROJECT/Cargo.toml" \
+    > "$WORK/filter-lock.log" 2>&1 || exit 1
+for FILTER_ARCH in arm64 amd64; do
+    case "$FILTER_ARCH" in
+        arm64) FILTER_TARGET=aarch64-pc-windows-msvc ;;
+        amd64) FILTER_TARGET=x86_64-pc-windows-msvc ;;
+    esac
+    FILTER_RUN="$WORK/filter-$FILTER_ARCH"
+    mkdir -p "$FILTER_RUN/bin" || exit 1
+    ln -s "$(command -v cargo)" "$FILTER_RUN/bin/cargo" || exit 1
+    printf '%s\0' "PATH=$PATH" "HOME=$WORK" "CARGO_HOME=$CARGO_HOME" \
+        "CARGO_TARGET_DIR=$FILTER_RUN/target" "RUSTC=$(command -v rustc)" \
+        "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RCH_DISABLED=1" "RCH_CARGO_WRAPPER_BYPASS=1" \
+        > "$FILTER_RUN/environment.nul"
+    STATUS=0
+    _xwb_metadata "$FILTER_PROJECT" "$FILTER_RUN" before xwin-filter '' 1.2.3 true 30 '' \
+        '["xwin-filter"]' '{"features":[],"all_features":false,"no_default_features":false}' "$FILTER_TARGET" \
+        > "$FILTER_RUN/metadata.stdout" 2> "$FILTER_RUN/metadata.stderr" || STATUS=$?
+    check "$FILTER_ARCH production helper admits genuine Windows-filtered Cargo metadata" equal "$STATUS" 0
+    check "$FILTER_ARCH dependency-source summary binds the actual canonical graph" jq -e \
+        --arg sha "$(_xwt_hash "$FILTER_RUN/metadata-before.json")" '
+        .metadata_sha256==$sha and .dependency_sources.metadata_sha256==$sha' "$FILTER_RUN/selection-before.json"
+    check "$FILTER_ARCH metadata resolves only its architecture dependency" jq -e --arg architecture "$FILTER_ARCH" '
+        . as $metadata |
+        [.resolve.nodes[].id as $id | $metadata.packages[] | select(.id==$id) | .name] | sort |
+        . == (["xwin-filter",("target-input-"+$architecture)] | sort)' "$FILTER_RUN/metadata-before.raw.json"
 done
 
 # Add a second provider outside default-members using real Cargo metadata.

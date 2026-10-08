@@ -9,7 +9,7 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
         '       [--features "NAME,PACKAGE/NAME ..."] [--all-features] [--no-default-features]' \
         '       [--release-repo OWNER/REPO --release-tag vX.Y.Z --source-sha COMMIT]' \
         '       [--tool NAME] [--asset-name NAME.exe] [--sibling-crates PINNED_SIBLINGS.json]' \
-        'Build 1..32 Windows ARM64 executables in one invocation; stdout is a verified JSON receipt.' \
+        'Build 1..32 Windows x64 or ARM64 executables for the pinned manifest target; stdout is verified JSON.' \
         'Release mode stages committed source and emits release/build-manifest.json for DSR publication.' \
         'Multiple binaries require --tool in release mode; --asset-name is only valid for a single binary.' \
         'Use --package to select one workspace package, or resolve each explicit binary across workspace members.' \

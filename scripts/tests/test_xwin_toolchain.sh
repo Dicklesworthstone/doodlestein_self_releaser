@@ -57,11 +57,47 @@ assert 'compiler flags use the prepared headers and library view' jq -e --arg vi
 BEFORE=$(stat -c '%d:%i' "$VIEW/lib/Kernel32.lib")
 assert 'second preparation revalidates and reuses the view' xwin_toolchain_prepare "$MANIFEST" "$CACHE" verify
 assert 'verified reuse preserves the original inode' test "$(stat -c '%d:%i' "$VIEW/lib/Kernel32.lib")" = "$BEFORE"
+# An x64 view uses its own pinned SDK directory and SSE header tree. In
+# particular, it neither requires the ARM NEON header nor falls back to ARM
+# libraries just because an otherwise-valid sysroot includes them.
+mkdir -p "$WORK/x64-input/sdk/include" "$WORK/x64-input/sdk/lib/x86_64-unknown-windows-msvc" \
+    "$WORK/x64-input/llvm/include"
+printf 'x64 SDK header\n' > "$WORK/x64-input/sdk/include/windows.h"
+printf 'pinned x64 kernel32 import library\n' > "$WORK/x64-input/sdk/lib/x86_64-unknown-windows-msvc/kernel32.lib"
+printf 'pinned x64 user32 import library\n' > "$WORK/x64-input/sdk/lib/x86_64-unknown-windows-msvc/user32.lib"
+printf 'pinned x64 SSE header\n' > "$WORK/x64-input/llvm/include/xmmintrin.h"
+tar -cJf "$WORK/x64-sdk.tar.xz" -C "$WORK/x64-input" sdk || exit 1
+tar -czf "$WORK/x64-headers.tar.gz" -C "$WORK/x64-input" llvm || exit 1
+jq --arg root "$WORK" --arg sdk "$(_xwt_hash "$WORK/x64-sdk.tar.xz")" \
+    --arg headers "$(_xwt_hash "$WORK/x64-headers.tar.gz")" '
+    .target="x86_64-pc-windows-msvc" |
+    .sysroot.path=($root+"/x64-sdk.tar.xz") | .sysroot.sha256=$sdk |
+    .headers.path=($root+"/x64-headers.tar.gz") | .headers.sha256=$headers' \
+    "$MANIFEST" > "$WORK/x64.json" || exit 1
+assert 'x64 view prepares without ARM NEON headers' xwin_toolchain_prepare "$WORK/x64.json" "$CACHE"
+X64_VIEW=$(jq -r .view "$WORK/assert.out")
+assert 'x64 aliases contain x64 pinned library bytes' cmp -s "$X64_VIEW/lib/Kernel32.lib" \
+    "$WORK/x64-input/sdk/lib/x86_64-unknown-windows-msvc/kernel32.lib"
+assert 'x64 evidence retains its selected target and SSE headers' jq -e '
+    .target=="x86_64-pc-windows-msvc" and .inputs.target==.target and
+    any(.files[]; .path=="include/xmmintrin.h") and
+    any(.files[]; .path=="sysroot/lib/x86_64-unknown-windows-msvc/kernel32.lib")' "$X64_VIEW/evidence.json"
+assert 'architecture selections occupy different immutable views' test "$X64_VIEW" != "$VIEW"
+assert 'x64 verification reuses the selected pinned view' xwin_toolchain_prepare "$WORK/x64.json" "$CACHE" verify
+jq --slurpfile arm "$MANIFEST" '.sysroot=$arm[0].sysroot' "$WORK/x64.json" > "$WORK/bad.json"
+reject 'x64 cannot substitute an ARM64-only SDK' 4 xwin_toolchain_prepare "$WORK/bad.json" "$CACHE"
+assert 'opposite SDK is rejected at its selected library directory' grep -Fq \
+    'Missing MSVC library directory for x86_64-pc-windows-msvc' "$WORK/rejected.err"
+jq --slurpfile arm "$MANIFEST" '.headers=$arm[0].headers' "$WORK/x64.json" > "$WORK/bad.json"
+reject 'x64 cannot prepare with missing SSE headers' 4 xwin_toolchain_prepare "$WORK/bad.json" "$CACHE"
+assert 'missing x64 header names the required SSE input' grep -Fq 'do not contain xmmintrin.h' "$WORK/rejected.err"
+jq --slurpfile x64 "$WORK/x64.json" '.sysroot=$x64[0].sysroot' "$MANIFEST" > "$WORK/bad.json"
+reject 'ARM64 cannot substitute an x64-only SDK' 4 xwin_toolchain_prepare "$WORK/bad.json" "$CACHE"
 reject 'verify refuses an absent cache' 7 xwin_toolchain_prepare "$MANIFEST" "$WORK/absent" verify
 assert 'verify did not create the absent cache' test ! -e "$WORK/absent"
 reject 'flag-bearing cache paths cannot contain spaces' 4 xwin_toolchain_prepare "$MANIFEST" "$WORK/bad cache"
-jq '.target="x86_64-pc-windows-msvc"' "$MANIFEST" > "$WORK/bad.json"
-reject 'wrong target rejected before preparation' 4 xwin_toolchain_prepare "$WORK/bad.json" "$CACHE"
+jq '.target="i686-pc-windows-msvc"' "$MANIFEST" > "$WORK/bad.json"
+reject 'unsupported target rejected before preparation' 4 xwin_toolchain_prepare "$WORK/bad.json" "$CACHE"
 jq '.aliases["Kernel32.lib"]="user32.lib"' "$MANIFEST" > "$WORK/bad.json"
 reject 'aliases cannot substitute a different library' 4 xwin_toolchain_prepare "$WORK/bad.json" "$CACHE"
 jq '.aliases["../Kernel32.lib"]="kernel32.lib"' "$MANIFEST" > "$WORK/bad.json"
@@ -128,5 +164,5 @@ assert 'CLI accepts the same manifest and rejects damaged cache' bash -c \
     'bash "$1/scripts/xwin-toolchain.sh" verify --manifest "$2" --cache-dir "$3" >/dev/null 2>&1; [[ $? == 7 ]]' _ "$ROOT" "$MANIFEST" "$CACHE"
 reject 'CLI repeated options rejected' 4 bash "$ROOT/scripts/xwin-toolchain.sh" prepare --manifest "$MANIFEST" --manifest "$MANIFEST"
 assert 'temporary preparation directories are cleaned after failures' bash -c '[[ -z $(find "$1" -maxdepth 1 -name ".prepare.*" -print -quit) ]]' _ "$CACHE"
-printf '\nWindows ARM64 toolchain preparation: %s passed, %s failed\n' "$PASS" "$FAIL"
+printf '\nPinned Windows toolchain preparation: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

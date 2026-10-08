@@ -49,9 +49,12 @@ _xwb_feature_arguments() {
 
 # Validate headers AND bounded section data; a .exe suffix or MZ prefix alone
 # cannot establish the target. Never execute the candidate binary.
-xwin_validate_arm64_pe() {
+xwin_validate_pe() {
+    [[ $# == 2 ]] || return 4
     command -v python3 >/dev/null || return 3
-    python3 - "$1" <<'PY'
+    local descriptor
+    descriptor=$(_xwt_target_descriptor "$2") || return 4
+    python3 - "$1" "$descriptor" <<'PY'
 import hashlib
 import json
 import os
@@ -60,6 +63,7 @@ import struct
 import sys
 
 try:
+    expected = json.loads(sys.argv[2])
     fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as image:
         before = os.fstat(image.fileno())
@@ -83,8 +87,8 @@ try:
         if pe < 64 or read(pe, 4) != b"PE\0\0":
             raise ValueError("invalid PE signature/offset")
         machine, count, _, _, _, opt_size, flags = struct.unpack("<HHIIIHH", read(pe + 4, 20))
-        if machine != 0xAA64 or not 1 <= count <= 96 or not flags & 2 or flags & 0x2000:
-            raise ValueError("not an ARM64 executable image")
+        if machine != expected["machine_code"] or not 1 <= count <= 96 or not flags & 2 or flags & 0x2000:
+            raise ValueError("not an executable image for " + expected["target"])
         opt = read(pe + 24, opt_size)
         if opt_size < 112 or struct.unpack_from("<H", opt)[0] != 0x20B:
             raise ValueError("not PE32+")
@@ -121,7 +125,7 @@ try:
         after = os.fstat(image.fileno())
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError("image changed during verification")
-        print(json.dumps({"format": "PE32+", "machine": "IMAGE_FILE_MACHINE_ARM64",
+        print(json.dumps({"format": "PE32+", "machine": expected["machine"],
                           "machine_code": machine, "sha256": digest.hexdigest(), "size_bytes": size}))
 except (OSError, ValueError, struct.error) as error:
     print("[xwin-build] " + str(error), file=sys.stderr)
@@ -244,9 +248,10 @@ _xwb_source_location() {
 _xwb_metadata() {
     local project="$1" run="$2" phase="$3" binary="$4" package="$5" version="$6" offline="$7" seconds="$8" argument
     local source_set_receipt="${9:-}" binaries_json="${10:-}"
-    local feature_selection="${11:-}" feature_arguments
+    local feature_selection="${11:-}" target="${12:-}" feature_arguments
+    _xwt_target_descriptor "$target" >/dev/null || return 4
     local -a environment=() command=("$run/bin/cargo" metadata --locked --format-version 1
-        --filter-platform aarch64-pc-windows-msvc --manifest-path "$project/Cargo.toml")
+        --filter-platform "$target" --manifest-path "$project/Cargo.toml")
     local -a source_args=()
     [[ -z "$source_set_receipt" ]] || source_args=("$source_set_receipt")
     [[ -z "$binaries_json" ]] || source_args=("$source_set_receipt" "$binaries_json")
@@ -288,7 +293,9 @@ _xwb_artifact_messages() {
 # rename. No successful release manifest is left behind by a validation failure.
 _xwb_export_release() {
     local run="$1" repo="$2" tag="$3" tool="$4" source_hash="$5" uuid="$6" started="$7"
-    local finished duration manifest_sha asset sha size rows
+    local finished duration manifest_sha asset sha size rows descriptor platform
+    descriptor=$(_xwt_target_descriptor "$(jq -r '.target' "$run/.result.json")") || return 4
+    platform=$(jq -r '.platform' <<< "$descriptor") || return 4
     # shellcheck source=src/slsa.sh
     source "$_XWIN_BUILD_DIR/slsa.sh" || return 3
     finished=$(date -u +'%Y-%m-%dT%H:%M:%SZ') || return 1
@@ -302,24 +309,24 @@ _xwb_export_release() {
          ($selection[0].source_dependencies | sort_by(.relative_path)))' >/dev/null || return 7
     mkdir "$run/.release-ready" || return 2
     jq -cn --arg tag "$tag" --arg tool "$tool" --arg uuid "$uuid" \
-        --arg finished "$finished" --argjson duration "$duration" --arg source_hash "$source_hash" \
+        --arg finished "$finished" --argjson duration "$duration" --arg source_hash "$source_hash" --arg platform "$platform" \
         --slurpfile result "$run/.result.json" --slurpfile source "$run/release-source.json" \
         --slurpfile selection "$run/selection-after.json" '
         $result[0] as $r | $source[0] as $s |
         {schema_version:"1.0.0",tool:$tool,version:$tag,run_id:$uuid,
-         build_purpose:"release",publishable:true,requested_targets:["windows/arm64"],
+         build_purpose:"release",publishable:true,requested_targets:[$platform],
          source:{git_sha:$s.git_sha,git_ref:$s.git_ref,repository:$s.repository,
              dependencies:($s.dependencies // [] | map({relative_path,git_sha}) | sort_by(.relative_path)),
              snapshot_sha256:$s.snapshot_sha256,receipt_sha256:$source_hash},
          built_at:$finished,duration_ms:($duration*1000),status:"success",
          summary:{total:1,success:1,failed:0},
-         hosts:[{platform:"windows/arm64",status:"success"}],
-         build_environments:[{target:"windows/arm64",method:"pinned-cargo-xwin",
+         hosts:[{host:"local",platform:$platform,status:"success",method:"local"}],
+         build_environments:[{target:$platform,target_triple:$r.target,host:"local",method:"pinned-cargo-xwin",
              build_influence_env:$r.build_influence_env,tool_versions:$r.tool_versions,
              toolchain:$r.toolchain,cargo_metadata:$selection[0],source_snapshot:$s,
              cargo_cache:$r.cargo_cache,feature_selection:$r.feature_selection,
              command:$r.command}],
-         artifacts:[$r.artifacts[] | {name,target:"windows/arm64",sha256,
+         artifacts:[$r.artifacts[] | {name,target:$platform,target_triple:$r.target,sha256,
              size_bytes,archive_format:"binary",signed:false,
              signature_file:"",build_purpose:"release",publishable:true}]}' \
         > "$run/.release-ready/build-manifest.json" || return 1
@@ -397,13 +404,17 @@ _xwb_build() {
        "$seconds" =~ ^[0-9]{1,5}$ ]] || return 4
     seconds=$((10#$seconds))
     ((seconds > 0 && seconds <= 86400)) || return 4
+    _xwt_require || return $?
+    local tool plan view entry name path key rustc target manifest_hash lock_hash child=0 exit_trap
+    plan=$(_xwt_manifest "$manifest") || return $?
+    target=$(jq -r '.target' <<< "$plan") || return 4
     if [[ -n "$release_repo$release_tag$source_sha$release_tool$asset_name$sibling_crates" ]]; then
         [[ -n "$release_repo" && -n "$release_tag" && "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return 4
         release=true
         [[ ${#binaries[@]} == 1 || -n "$release_tool" ]] || return 4
         [[ -n "$release_tool" ]] || release_tool=$binary
         [[ "$release_tool" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$release_tool" != *..* ]] || return 4
-        [[ -n "$asset_name" ]] || asset_name="$binary-aarch64-pc-windows-msvc.exe"
+        [[ -n "$asset_name" ]] || asset_name="$binary-$target.exe"
         [[ "$asset_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.exe$ && "$asset_name" != *..* ]] || return 4
         # shellcheck source=src/xwin_source.sh
         source "$_XWIN_BUILD_DIR/xwin_source.sh" || return 3
@@ -412,16 +423,13 @@ _xwb_build() {
     else
         asset_name="$binary.exe"
     fi
-    _xwt_require || return $?
     binaries_json=$(jq -cn --args '$ARGS.positional' -- "${binaries[@]}") || return 1
-    local tool plan view entry name path key rustc target=aarch64-pc-windows-msvc manifest_hash lock_hash child=0 exit_trap
     local source_hash='' metadata_hash='' selection_hash='' controls='' uuid='' started cargo_seed_controls
     started=$(date +%s) || return 1
     for tool in python3 setsid timeout readlink env; do command -v "$tool" >/dev/null || return 3; done
     project=$(cd "$project" && pwd -P) || return 4
     [[ "$project" != *[[:cntrl:]]* && "$project" != *\\* ]] || return 4
     if [[ "$release" == false ]]; then _xwb_source_location "$project" "$target" || return $?; fi
-    plan=$(_xwt_manifest "$manifest") || return $?
     jq -e '.tools|has("llvm-ar")' <<< "$plan" >/dev/null || {
         _xwt_log 'Build execution additionally requires a pinned llvm-ar'; return 4;
     }
@@ -523,7 +531,7 @@ _xwb_build() {
     _xwb_source_inputs "$project" > "$run/source-before.json" || return $?
     _xwb_versions "$plan" "$project" "$run/versions-before" "$run/environment.nul" > "$run/versions-before.json" || return $?
     if [[ "$release" == true ]]; then
-        _xwb_metadata "$project" "$run" before "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" "$feature_selection" || return $?
+        _xwb_metadata "$project" "$run" before "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" "$feature_selection" "$target" || return $?
         metadata_hash=$(_xwt_hash "$run/metadata-before.json") || return $?
         selection_hash=$(_xwt_hash "$run/selection-before.json") || return $?
         xwin_source_verify "$run/source" "$run/release-source.json" || return $?
@@ -548,7 +556,7 @@ _xwb_build() {
     controls=$(sha256sum -- "$run/environment.nul" "$run/environment.json" "$run/command.json" \
         "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json") || return 1
     [[ "$feature_hash" == "$(_xwt_hash "$run/feature-selection.json")" ]] || return 7
-    _xwt_log "Building ${binaries[*]} for Windows ARM64; log: $run/build.log"
+    _xwt_log "Building ${binaries[*]} for $target; log: $run/build.log"
     local rc=0
     local -a capture=()
     [[ "$release" == false ]] || capture=(--stdout "$run/build.messages.jsonl")
@@ -564,7 +572,7 @@ _xwb_build() {
            "$metadata_hash" == "$(_xwt_hash "$run/metadata-before.json")" &&
            "$selection_hash" == "$(_xwt_hash "$run/selection-before.json")" ]] || return 7
         [[ -z "$sibling_hash" || "$(_xwt_hash "$run/sibling-crates.json")" == "$sibling_hash" ]] || return 7
-        _xwb_metadata "$project" "$run" after "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" "$feature_selection" || return $?
+        _xwb_metadata "$project" "$run" after "$binary" "$package" "${release_tag#v}" "$offline" "$seconds" "$source_set_receipt" "$binaries_json" "$feature_selection" "$target" || return $?
         cmp -s "$run/metadata-before.json" "$run/metadata-after.json" || { _xwt_log 'Cargo dependency graph changed'; return 7; }
         cmp -s "$run/selection-before.json" "$run/selection-after.json" || return 7
         xwin_source_verify "$run/source" "$run/release-source.json" || return $?
@@ -596,18 +604,18 @@ _xwb_build() {
             [[ "$release" == false ]] || asset_name="$selected_binary-$target.exe"
         fi
         cp -- "$path" "$run/artifacts/$asset_name" || return 1
-        xwin_validate_arm64_pe "$run/artifacts/$asset_name" > "$run/artifact.json" || return $?
+        xwin_validate_pe "$run/artifacts/$asset_name" "$target" > "$run/artifact.json" || return $?
         jq -c --arg name "$asset_name" --arg bin "$selected_binary" --arg path "$run/artifacts/$asset_name" \
             '.+{name:$name,binary:$bin,path:$path}' "$run/artifact.json" >> "$run/artifacts.jsonl" || return 1
     done
-    jq -cn --arg run "$run" --arg project "$project" --arg key "$key" \
+    jq -cn --arg run "$run" --arg project "$project" --arg key "$key" --arg target "$target" \
         --arg manifest "$manifest_hash" --arg lock "$lock_hash" --slurpfile artifacts "$run/artifacts.jsonl" \
         --slurpfile environment "$run/environment.json" --slurpfile command "$run/command.json" \
         --slurpfile source "$run/source-after.json" --argjson feature_selection "$feature_selection" \
         --slurpfile cache_seed "$run/cargo-cache-seed.json" --slurpfile cache_final "$run/cargo-cache.json" \
         --slurpfile versions "$run/versions-after.json" --slurpfile toolchain "$run/toolchain-after.json" \
         '{schema_version:1,kind:"dsr-xwin-build",status:"verified",exit_code:0,
-          project:$project,target:"aarch64-pc-windows-msvc",cargo_manifest_sha256:$manifest,cargo_lock_sha256:$lock,
+          project:$project,target:$target,cargo_manifest_sha256:$manifest,cargo_lock_sha256:$lock,
           manifest_sha256:$key,source_inputs:$source[0],artifacts:$artifacts,
           cargo_cache:{mode:"private-copy",seed:$cache_seed[0],final:$cache_final[0]},
           build_influence_env:$environment[0],command:$command[0],feature_selection:$feature_selection,tool_versions:$versions[0],

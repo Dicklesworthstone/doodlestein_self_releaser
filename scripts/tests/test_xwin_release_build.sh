@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Source-pinned release execution through the real runner and manifest validator.
-# Git, locked crate authentication, LLVM NEON compilation and ARM64 linking
+# Git, locked crate authentication, LLVM NEON/SSE compilation and Windows linking
 # are real. Cargo/rustc/cargo-xwin and crate extraction are command-boundary
 # fixtures; no Rust dependency build or Windows execution is claimed.
 set -uo pipefail
@@ -12,8 +12,22 @@ for TOOL in jq git clang lld-link llvm-ar python3 timeout setsid; do
     command -v "$TOOL" >/dev/null || { printf 'SKIP xwin release: requires %s\n' "$TOOL"; exit 0; }
 done
 [[ "$(uname -s)" == Linux ]] || { printf 'SKIP xwin release: requires Linux\n'; exit 0; }
+TEST_TARGET="${XWIN_TEST_TARGET:-aarch64-pc-windows-msvc}"
+case "$TEST_TARGET" in
+    aarch64-pc-windows-msvc)
+        TEST_PLATFORM=windows/arm64 TEST_SYSROOT=aarch64-unknown-windows-msvc
+        TEST_MACHINE=arm64 TEST_MACHINE_CODE=43620 ;;
+    x86_64-pc-windows-msvc)
+        TEST_PLATFORM=windows/amd64 TEST_SYSROOT=x86_64-unknown-windows-msvc
+        TEST_MACHINE=x64 TEST_MACHINE_CODE=34404 ;;
+    *) printf 'Unsupported XWIN_TEST_TARGET: %s\n' "$TEST_TARGET" >&2; exit 4 ;;
+esac
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+if [[ "${DSR_KEEP_TEST_FIXTURES:-0}" == 1 ]]; then
+    printf 'Retained fixtures for %s: %s\n' "$TEST_TARGET" "$WORK"
+else
+    trap 'rm -rf -- "$WORK"' EXIT
+fi
 PASS=0 FAIL=0
 ok() { printf 'PASS %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf 'FAIL %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }
@@ -25,14 +39,14 @@ reject() {
         bad "$label (expected $expected, got $rc)"; cat "$WORK/rejected.err" >&2
     fi
 }
-mkdir -p "$WORK/input/sdk/include" "$WORK/input/sdk/lib/aarch64-unknown-windows-msvc" "$WORK/input/llvm/include" "$WORK/tools" "$WORK/template/src"
+mkdir -p "$WORK/input/sdk/include" "$WORK/input/sdk/lib/$TEST_SYSROOT" "$WORK/input/llvm/include" "$WORK/tools" "$WORK/template/src"
 RESOURCE=$(clang -print-resource-dir) || exit 1
-for HEADER in arm_neon.h arm_bf16.h arm_vector_types.h stdint.h; do
+for HEADER in arm_neon.h arm_bf16.h arm_vector_types.h stdint.h xmmintrin.h emmintrin.h mmintrin.h mm_malloc.h; do
     [[ ! -f "$RESOURCE/include/$HEADER" ]] || cp "$RESOURCE/include/$HEADER" "$WORK/input/llvm/include/" || exit 1
 done
 printf 'int DsrKernelStub(void) { return 42; }\n' > "$WORK/kernel.c"
-clang --target=aarch64-pc-windows-msvc -ffreestanding -c "$WORK/kernel.c" -o "$WORK/kernel.obj" || exit 1
-lld-link /dll /noentry /machine:arm64 /export:DsrKernelStub "/out:$WORK/kernel32.dll" "/implib:$WORK/input/sdk/lib/aarch64-unknown-windows-msvc/kernel32.lib" "$WORK/kernel.obj" || exit 1
+clang --target="$TEST_TARGET" -ffreestanding -c "$WORK/kernel.c" -o "$WORK/kernel.obj" || exit 1
+lld-link /dll /noentry "/machine:$TEST_MACHINE" /export:DsrKernelStub "/out:$WORK/kernel32.dll" "/implib:$WORK/input/sdk/lib/$TEST_SYSROOT/kernel32.lib" "$WORK/kernel.obj" || exit 1
 printf 'SDK fixture\n' > "$WORK/input/sdk/include/windows.h"
 tar -cJf "$WORK/sdk.tar.xz" -C "$WORK/input" sdk || exit 1
 tar -czf "$WORK/headers.tar.gz" -C "$WORK/input" llvm || exit 1
@@ -41,17 +55,30 @@ printf 'version = 3\n' > "$WORK/template/Cargo.lock"
 printf 'fn main() {}\n' > "$WORK/template/src/main.rs"
 printf 'ignored.txt\n' > "$WORK/template/.gitignore"
 cat > "$WORK/template/probe.c" <<'C'
+#if defined(__aarch64__)
 #include <arm_neon.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+int _fltused = 0;
+#else
+#error Unexpected architecture
+#endif
 __declspec(dllimport) int DsrKernelStub(void);
 #ifdef DSR_SIBLING
 int DsrSiblingValue(void);
 #endif
 int mainCRTStartup(void) {
+#if defined(__aarch64__)
     uint8x8_t vector = vdup_n_u8(7);
-#ifdef DSR_SIBLING
-    return DsrKernelStub() + vget_lane_u8(vector, 0) + DsrSiblingValue();
+    int lane = vget_lane_u8(vector, 0);
 #else
-    return DsrKernelStub() + vget_lane_u8(vector, 0);
+    __m128 vector = _mm_set_ss(7.0f);
+    int lane = _mm_cvtss_si32(vector);
+#endif
+#ifdef DSR_SIBLING
+    return DsrKernelStub() + lane + DsrSiblingValue();
+#else
+    return DsrKernelStub() + lane;
 #endif
 }
 C
@@ -59,7 +86,13 @@ cat > "$WORK/tools/cargo" <<'CARGO'
 #!/usr/bin/env bash
 set -uo pipefail
 if [[ "$*" == -vV ]]; then printf 'cargo release fixture 1\nhost: linux\n'; exit 0; fi
-[[ "$1" == metadata && "$*" == *'--locked'* && "$*" == *'--filter-platform aarch64-pc-windows-msvc'* ]] || exit 90
+[[ "$1" == metadata && "$*" == *'--locked'* ]] || exit 90
+target=''
+while (($#)); do
+    if [[ "$1" == --filter-platform && $# -ge 2 && -z "$target" ]]; then target=$2; shift; fi
+    shift
+done
+[[ "$target" == aarch64-pc-windows-msvc || "$target" == x86_64-pc-windows-msvc ]] || exit 90
 [[ -n "${SOURCE_DATE_EPOCH:-}" && -z "${RUSTFLAGS:-}" && -z "${UNRELATED_SECRET:-}" ]] || exit 91
 printf 'metadata diagnostic on stderr\n' >&2
 python3 - <<'PY'
@@ -130,31 +163,41 @@ cat > "$WORK/tools/cargo-xwin" <<'PLUGIN'
 #!/usr/bin/env bash
 set -uo pipefail
 if [[ "$*" == --version ]]; then printf 'cargo-xwin release fixture 1\n'; exit 0; fi
-[[ "$1" == xwin && "$2" == build && "$*" == *'--package probe'* && "$*" == *'--message-format=json'* && "$*" == *'--target aarch64-pc-windows-msvc'* && "$*" == *'--locked'* ]] || exit 90
+[[ "$1" == xwin && "$2" == build && "$*" == *'--package probe'* && "$*" == *'--message-format=json'* && "$*" == *'--locked'* ]] || exit 90
+target=''
+while (($#)); do
+    if [[ "$1" == --target && $# -ge 2 && -z "$target" ]]; then target=$2; shift; fi
+    shift
+done
+case "$target" in
+    aarch64-pc-windows-msvc) machine=arm64 ;;
+    x86_64-pc-windows-msvc) machine=x64 ;;
+    *) exit 90 ;;
+esac
 [[ "$XWIN_CROSS_COMPILER" == clang && -n "${SOURCE_DATE_EPOCH:-}" && -z "${UNRELATED_SECRET:-}" && ! -e .git ]] || exit 91
 mode=$(cat mode)
 case "$mode" in fail) printf 'intentional compiler failure\n' >&2; exit 42 ;; esac
-mkdir -p "$CARGO_TARGET_DIR/aarch64-pc-windows-msvc/release"
-out="$CARGO_TARGET_DIR/aarch64-pc-windows-msvc/release/probe.exe"
+mkdir -p "$CARGO_TARGET_DIR/$target/release"
+out="$CARGO_TARGET_DIR/$target/release/probe.exe"
 compile_flags=() objects=()
 if [[ "$mode" == sibling-* ]]; then
     [[ ! -e ../helper/.git && ! -e ../types/.git && ! -e ../helper/ignored.txt ]] || exit 92
     compile_flags=(-DDSR_SIBLING=1)
-    clang --target=aarch64-pc-windows-msvc -ffreestanding -c ../helper/native.c -o "$TMPDIR/helper.obj" || exit $?
+    clang --target="$target" -ffreestanding -c ../helper/native.c -o "$TMPDIR/helper.obj" || exit $?
     objects+=("$TMPDIR/helper.obj")
     printf 'compiled committed sibling C source with transitive header\n' >&2
 fi
 if [[ "$mode" == registry-* ]]; then
     compile_flags=(-DDSR_SIBLING=1)
     dependency="$CARGO_HOME/registry/src/fixture-registry/native-dependency-1.0.0/native.c"
-    clang --target=aarch64-pc-windows-msvc -ffreestanding -c "$dependency" -o "$TMPDIR/dependency.obj" || exit $?
+    clang --target="$target" -ffreestanding -c "$dependency" -o "$TMPDIR/dependency.obj" || exit $?
     objects+=("$TMPDIR/dependency.obj")
     printf 'compiled lockfile-authenticated private crate C source\n' >&2
 fi
 # Splitting only the controlled whitespace-free compiler flags from the runner.
 # shellcheck disable=SC2086
-clang --target=aarch64-pc-windows-msvc -ffreestanding $CFLAGS "${compile_flags[@]}" -c probe.c -o "$TMPDIR/probe.obj" || exit $?
-lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib /machine:arm64 /timestamp:0 "/out:$out" "$TMPDIR/probe.obj" "${objects[@]}" Kernel32.lib || exit $?
+clang --target="$target" -ffreestanding $CFLAGS "${compile_flags[@]}" -c probe.c -o "$TMPDIR/probe.obj" || exit $?
+lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib "/machine:$machine" /timestamp:0 "/out:$out" "$TMPDIR/probe.obj" "${objects[@]}" Kernel32.lib || exit $?
 case "$mode" in
     source-drift) printf '// source changed\n' >> src/main.rs ;;
     receipt-drift) printf '\n' >> "$HOME/../release-source.json" ;;
@@ -189,8 +232,8 @@ for TOOL in cargo cargo-xwin rustc clang lld-link llvm-ar; do
     TOOLS=$(jq -cn --argjson before "$TOOLS" --arg tool "$TOOL" --arg path "$PATHNAME" --arg sha "$(_xwt_hash "$PATHNAME")" \
         '$before+{($tool):{path:$path,sha256:$sha}}') || exit 1
 done
-jq -cn --arg root "$WORK" --arg sdk "$(_xwt_hash "$WORK/sdk.tar.xz")" --arg headers "$(_xwt_hash "$WORK/headers.tar.gz")" --argjson tools "$TOOLS" \
-    '{schema_version:1,target:"aarch64-pc-windows-msvc",sysroot:{path:($root+"/sdk.tar.xz"),sha256:$sdk,url:"https://example.invalid/pinned/sdk.tar.xz",prefix:"sdk"},
+jq -cn --arg root "$WORK" --arg target "$TEST_TARGET" --arg sdk "$(_xwt_hash "$WORK/sdk.tar.xz")" --arg headers "$(_xwt_hash "$WORK/headers.tar.gz")" --argjson tools "$TOOLS" \
+    '{schema_version:1,target:$target,sysroot:{path:($root+"/sdk.tar.xz"),sha256:$sdk,url:"https://example.invalid/pinned/sdk.tar.xz",prefix:"sdk"},
     headers:{path:($root+"/headers.tar.gz"),sha256:$headers,url:"https://example.invalid/pinned/headers.tar.gz",prefix:"llvm/include"},
     aliases:{"Kernel32.lib":"kernel32.lib"},tools:$tools}' > "$WORK/manifest.json" || exit 1
 MANIFEST="$WORK/manifest.json"
@@ -267,14 +310,27 @@ assert 'source checkout stays clean and ignored bytes are absent from build' bas
 assert 'release manifest binds explicit tag SHA repository and source inventory' jq -e --arg sha "$SHA" \
     '.source.git_sha==$sha and .source.git_ref=="refs/tags/v0.1.0" and .source.repository=="https://github.com/owner/probe" and
      (.source.snapshot_sha256|length)==64 and (.source.receipt_sha256|length)==64 and .source.dependencies==[]' "$RELEASE_MANIFEST"
-assert 'manifest uses existing DSR successful target and artifact profile' jq -e \
+assert 'manifest uses existing DSR successful target and artifact profile' jq -e --arg platform "$TEST_PLATFORM" --arg target "$TEST_TARGET" \
     '.schema_version=="1.0.0" and .tool=="probe-cli" and .status=="success" and .publishable==true and
-     .summary=={total:1,success:1,failed:0} and .artifacts[0].name=="release-probe.exe" and .artifacts[0].target=="windows/arm64"' "$RELEASE_MANIFEST"
+     .summary=={total:1,success:1,failed:0} and .requested_targets==[$platform] and
+     .artifacts[0].name=="release-probe.exe" and .artifacts[0].target==$platform and .artifacts[0].target_triple==$target and
+     .hosts==[{host:"local",platform:$platform,status:"success",method:"local"}]' "$RELEASE_MANIFEST"
+assert 'release result, executable machine and environment retain the selected architecture' jq -en \
+    --arg target "$TEST_TARGET" --arg platform "$TEST_PLATFORM" --argjson machine "$TEST_MACHINE_CODE" \
+    --slurpfile result "$WORK/success.json" --slurpfile manifest "$RELEASE_MANIFEST" '
+    $result[0].target==$target and $result[0].artifact.machine_code==$machine and
+    $result[0].toolchain.target==$target and $manifest[0].build_environments[0].target==$platform and
+    $manifest[0].build_environments[0].target_triple==$target and
+    $manifest[0].build_environments[0].toolchain.target==$target'
 assert 'full evidence is retained in manifest rather than discarded' jq -e \
     '.build_environments[0] | .method=="pinned-cargo-xwin" and (.source_snapshot.files|length)>3 and
      (.toolchain.files|length)>3 and (.toolchain.inputs.tools|has("cargo-xwin")) and
      .cargo_metadata.package=="probe" and (.cargo_metadata.metadata_sha256|length)==64 and
      .build_influence_env.XWIN_CROSS_COMPILER=="clang" and (.build_influence_env|has("UNRELATED_SECRET")|not)' "$RELEASE_MANIFEST"
+assert 'dependency-source summary binds the coordinator-held final metadata graph' jq -e \
+    --arg sha "$(_xwt_hash "$WORK/good/metadata-after.json")" '
+    .build_environments[0].cargo_metadata |
+    .metadata_sha256==$sha and .dependency_sources.metadata_sha256==$sha' "$RELEASE_MANIFEST"
 assert 'source inventory larger than 128 KiB survives manifest serialization' bash -c \
     '[[ $(wc -c < "$1") -gt 131072 ]] && jq -e ".build_environments[0].source_snapshot.files|length>1000" "$2" >/dev/null' \
     _ "$WORK/good/release-source.json" "$RELEASE_MANIFEST"
@@ -329,9 +385,9 @@ assert 'source-pinned cache evidence distinguishes authenticated downloads from 
     '.cargo_cache.seed.file_count==1 and .cargo_cache.final.file_count==5 and
      .cargo_cache.seed.selection.lockfile_sha256==.cargo_lock_sha256 and
      .cargo_cache.seed.inventory_sha256!=.cargo_cache.final.inventory_sha256' "$WORK/registry-good/release/result.json"
-assert 'real ARM64 compilation consumed the authenticated crate C source' grep -Fxq \
+assert "real $TEST_TARGET compilation consumed the authenticated crate C source" grep -Fxq \
     'compiled lockfile-authenticated private crate C source' "$WORK/registry-good/build.log"
-assert 'locked dependency contributes to the emitted ARM64 binary' jq -es \
+assert 'locked dependency contributes to the emitted Windows binary' jq -es \
     'length==2 and all(.[];.artifact.sha256|test("^[0-9a-f]{64}$")) and
      .[0].artifact.sha256!=.[1].artifact.sha256' "$WORK/success.json" "$WORK/registry-good/release/result.json"
 assert 'release manifest retains source authentication and the exact selected seed evidence' jq -e \
@@ -357,16 +413,16 @@ for CACHE_FAILURE in absent checksum linked; do
     reject "$CACHE_FAILURE required download cannot be replaced by an ambient source tree" 7 \
         "${BUILD[@]}" --project "$WORK/project-registry-ok" --source-sha "$REGISTRY_SHA" \
         --run-dir "$WORK/registry-$CACHE_FAILURE" --cargo-cache "$BROKEN_HOME"
-    assert "$CACHE_FAILURE required download fails before any ARM64 compiler command" test ! -e "$WORK/registry-$CACHE_FAILURE/build.log"
+    assert "$CACHE_FAILURE required download fails before any target compiler command" test ! -e "$WORK/registry-$CACHE_FAILURE/build.log"
     assert "$CACHE_FAILURE required download emits no release manifest" test ! -e "$WORK/registry-$CACHE_FAILURE/release"
 done
 make_project registry-drift || exit 1
 REGISTRY_DRIFT_SHA=$(git -C "$WORK/project-registry-drift" rev-parse HEAD) || exit 1
-reject 'dependency changed after successful ARM64 compilation cannot be published' 7 \
+reject 'dependency changed after successful Windows compilation cannot be published' 7 \
     "${BUILD[@]}" --project "$WORK/project-registry-drift" --source-sha "$REGISTRY_DRIFT_SHA" \
     --run-dir "$WORK/registry-drift" --cargo-cache "$WORK/registry-ambient"
-assert 'dependency drift fixture completed real ARM64 linking before refusal' xwin_validate_arm64_pe \
-    "$WORK/registry-drift/target/aarch64-pc-windows-msvc/release/probe.exe"
+assert 'dependency drift fixture completed real selected-target linking before refusal' xwin_validate_pe \
+    "$WORK/registry-drift/target/$TEST_TARGET/release/probe.exe" "$TEST_TARGET"
 assert 'post-build authentication refusal leaves no release manifest' test ! -e "$WORK/registry-drift/release"
 
 for MODE in source-drift receipt-drift environment-drift graph-receipt-drift graph-drift wrong-package wrong-message-source wrong-features test-profile missing-artifact duplicate-artifact failed-message truncate external-source wrong-version fail; do
@@ -430,7 +486,8 @@ assert 'full repository and file evidence survives manifest export' jq -e \
      any(.files[];.path=="helper/native.c") and any(.files[];.path=="types/value.h")' "$SIBLING_MANIFEST"
 assert 'real LLVM compiler consumed the committed transitive sibling input' grep -Fxq \
     'compiled committed sibling C source with transitive header' "$WORK/sibling-good/build.log"
-assert 'admitted sibling output passes ARM64 PE validation' xwin_validate_arm64_pe "$WORK/sibling-good/artifacts/probe-aarch64-pc-windows-msvc.exe"
+assert 'admitted sibling output passes selected-target PE validation with its target-qualified name' xwin_validate_pe \
+    "$WORK/sibling-good/artifacts/probe-$TEST_TARGET.exe" "$TEST_TARGET"
 assert 'dependency Cargo manifests are staged without path rewriting' cmp -s "$WORK/helper/Cargo.toml" "$WORK/sibling-good/source/helper/Cargo.toml"
 assert 'primary Cargo manifest is staged without path rewriting' cmp -s "$WORK/project-sibling-ok/Cargo.toml" "$WORK/sibling-good/source/project/Cargo.toml"
 assert 'source-set verification uses the entire boundary after compilation' xwin_source_verify "$WORK/sibling-good/source" "$WORK/sibling-good/release-source.json"
@@ -481,5 +538,5 @@ assert 'transitive committed header changes actual compiled bytes' jq -en --slur
     --slurpfile after "$WORK/sibling-next.json" '$before[0].artifact.sha256!=$after[0].artifact.sha256'
 assert 'old completed snapshot remains independent of advanced original checkout' xwin_source_verify \
     "$WORK/sibling-good/source" "$WORK/sibling-good/release-source.json"
-printf '\nWindows ARM64 release path: %s passed, %s failed\n' "$PASS" "$FAIL"
+printf '\n%s release path: %s passed, %s failed\n' "$TEST_TARGET" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

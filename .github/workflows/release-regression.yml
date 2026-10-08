@@ -14,6 +14,8 @@ on:
       - 'src/xwin*.sh'
       - 'scripts/xwin*.sh'
       - 'scripts/tests/test_xwin*.sh'
+      - schemas/manifest.json
+      - scripts/tests/test_json_schemas.sh
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_cargo_sources.sh
       - scripts/tests/test_cargo_sources_authentication.sh
@@ -53,7 +55,7 @@ jobs:
           bash scripts/tests/test_github.sh
   private-cargo-cache:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -61,7 +63,7 @@ jobs:
       - name: Install LLVM test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang lld llvm jq shellcheck
+          sudo apt-get install -y --no-install-recommends clang lld llvm jq shellcheck python3-jsonschema
       - name: Check private cache and Windows build regressions
         shell: bash
         run: |
@@ -80,8 +82,11 @@ jobs:
           bash scripts/tests/test_cargo_sources.sh
           bash scripts/tests/test_cargo_sources_authentication.sh
           bash scripts/tests/test_xwin_source.sh
+          bash scripts/tests/test_xwin_toolchain.sh
           bash scripts/tests/test_xwin_build.sh
           bash scripts/tests/test_xwin_release_build.sh
+          XWIN_TEST_TARGET=x86_64-pc-windows-msvc bash scripts/tests/test_xwin_release_build.sh
+          bash scripts/tests/test_json_schemas.sh
   host-admission:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15

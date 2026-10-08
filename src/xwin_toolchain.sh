@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pinned Windows ARM64 compiler/header/library views (dsr-h4y0).
+# Pinned Windows compiler/header/library views (dsr-h4y0).
 # Source archives and installed executables are inputs, never modified.
 # Every cache admission is re-derived from the pinned archives, not trusted
 # merely because a previous receipt or a cargo-xwin DONE marker exists.
@@ -7,6 +7,21 @@
 _XWIN_TOOLCHAIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 _xwt_log() { printf '[xwin-toolchain] %s\n' "$*" >&2; }
+
+# The pinned manifest selects one built-in target. Keep the preparation,
+# compiler invocation and executable admission on the same architecture map;
+# a matching filename or a library directory from another target is not proof.
+_xwt_target_descriptor() {
+    jq -cen --arg target "${1:-}" '
+        {"aarch64-pc-windows-msvc": {
+            platform:"windows/arm64",sysroot_target:"aarch64-unknown-windows-msvc",
+            required_header:"arm_neon.h",machine:"IMAGE_FILE_MACHINE_ARM64",machine_code:43620},
+         "x86_64-pc-windows-msvc": {
+            platform:"windows/amd64",sysroot_target:"x86_64-unknown-windows-msvc",
+            required_header:"xmmintrin.h",machine:"IMAGE_FILE_MACHINE_AMD64",machine_code:34404}}
+        | .[$target] | if . == null then error("unsupported pinned Windows target")
+          else . + {target:$target} end' || return 4
+}
 
 _xwt_hash() {
     local digest
@@ -34,7 +49,8 @@ _xwt_require() {
 # parsers do not share one quoting convention. Archive input paths may contain
 # spaces; they are only ever passed as individual shell arguments.
 _xwt_manifest() {
-    jq -csSe 'def text: type=="string" and length>0 and (test("[\\x00-\\x1f\\x7f]")|not);
+    local plan target
+    plan=$(jq -csSe 'def text: type=="string" and length>0 and (test("[\\x00-\\x1f\\x7f]")|not);
         def hash: type=="string" and test("^[0-9a-f]{64}$");
         def relative: text and (startswith("/")|not) and
             (split("/")|all(.!="" and .!="." and .!=".." and (startswith("-")|not))) and
@@ -44,7 +60,7 @@ _xwt_manifest() {
             (.url|text and test("^https://[^/@?#]+/[^?#]+$") and (test("[[:space:]]")|not));
         (if length==1 then .[0] else error("expected one manifest document") end) |
         if type=="object" and (keys==["aliases","headers","schema_version","sysroot","target","tools"]) and
-            .schema_version==1 and .target=="aarch64-pc-windows-msvc" and
+            .schema_version==1 and (.target|text) and
             (.sysroot|archive) and (.headers|archive) and
             (.aliases|type=="object" and length>0 and has("Kernel32.lib") and
                 all(to_entries[];(.key|test("^[A-Za-z0-9_.+-]+\\.lib$")) and
@@ -55,7 +71,10 @@ _xwt_manifest() {
                     (.key|test("^[A-Za-z0-9][A-Za-z0-9+_.-]*$")) and
                     (.value|type=="object" and (keys==["path","sha256"]) and
                         (.path|text and startswith("/") and (test("[[:space:];\\\\]")|not)) and (.sha256|hash))))
-        then . else error("invalid Windows ARM64 toolchain manifest") end' "$1" || return 4
+        then . else error("invalid pinned Windows toolchain manifest") end' "$1") || return 4
+    target=$(jq -r '.target' <<< "$plan") || return 4
+    _xwt_target_descriptor "$target" >/dev/null || return 4
+    printf '%s\n' "$plan"
 }
 
 _xwt_check_tools() {
@@ -123,18 +142,23 @@ _xwt_unpack() {
 
 _xwt_materialize() {
     local plan="$1" work="$2" view prefix libdir path name lower alias source entries
+    local descriptor target required_header sysroot_target
+    target=$(jq -r '.target' <<< "$plan") || return 4
+    descriptor=$(_xwt_target_descriptor "$target") || return 4
+    required_header=$(jq -r '.required_header' <<< "$descriptor") || return 4
+    sysroot_target=$(jq -r '.sysroot_target' <<< "$descriptor") || return 4
     view="$work/view"
     local -A libraries=()
     mkdir "$view" "$view/include" "$view/lib" "$view/sysroot" || return 1
     prefix=$(jq -r '.headers.prefix' <<< "$plan") || return 1
-    [[ -f "$work/headers/$prefix/arm_neon.h" ]] || {
-        _xwt_log 'Pinned LLVM system headers do not contain arm_neon.h'; return 4;
+    [[ -f "$work/headers/$prefix/$required_header" ]] || {
+        _xwt_log "Pinned LLVM system headers do not contain $required_header for $target"; return 4;
     }
     cp -R -- "$work/headers/$prefix/." "$view/include/" || return 1
     prefix=$(jq -r '.sysroot.prefix' <<< "$plan") || return 1
     [[ -d "$work/sysroot/$prefix/include" ]] || return 4
-    libdir="$work/sysroot/$prefix/lib/aarch64-unknown-windows-msvc"
-    [[ -d "$libdir" ]] || { _xwt_log 'Missing ARM64 MSVC library directory'; return 4; }
+    libdir="$work/sysroot/$prefix/lib/$sysroot_target"
+    [[ -d "$libdir" ]] || { _xwt_log "Missing MSVC library directory for $target: $sysroot_target"; return 4; }
     cp -R -- "$work/sysroot/$prefix/." "$view/sysroot/" || return 1
     # cargo-xwin clang backend recognizes this marker and never needs to
     # resolve a moving latest-release URL for a prepared sysroot.
@@ -226,7 +250,7 @@ xwin_toolchain_prepare() (
         mv -T -- "$work/view" "$view" || return 2
     fi
     _xwt_check_tools "$plan" || return $?
-    _xwt_log "$status Windows ARM64 toolchain: $key"
+    _xwt_log "$status $(jq -r '.target' <<< "$plan") toolchain: $key"
     jq -cn --arg status "$status" --arg view "$view" --arg key "$key" --slurpfile evidence "$view/evidence.json" \
         '{kind:"dsr-xwin-toolchain-result",status:$status,view:$view,manifest_sha256:$key,
           evidence:$evidence[0],environment:{XWIN_CROSS_COMPILER:"clang",

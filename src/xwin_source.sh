@@ -466,6 +466,9 @@ try:
         if os.path.exists(temporary):
             os.unlink(temporary)
     selection["metadata_sha256"] = hashlib.sha256(encoded).hexdigest()
+    # Bind this outer summary to the final graph already held by the runner.
+    # The inventory embedded above remains unchanged, avoiding a hash cycle.
+    summary["metadata_sha256"] = selection["metadata_sha256"]
     selection["dependency_sources"] = summary
     print(json.dumps(selection))
 except (OSError, ValueError, KeyError, TypeError) as error:

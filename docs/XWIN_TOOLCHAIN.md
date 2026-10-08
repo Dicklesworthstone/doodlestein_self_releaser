@@ -1,15 +1,15 @@
-# Pinned Windows ARM64 toolchain views
+# Pinned Windows x64 and ARM64 toolchain views
 
 `bash scripts/xwin-toolchain.sh prepare --manifest /absolute/toolchain.json`
 materializes the LLVM system-header and case-normalized MSVC import-library
-view tracked by `dsr-h4y0`. This is an explicit Linux-host preparation command,
+view for the architecture selected by a pinned manifest. This is an explicit Linux-host preparation command,
 not an automatic change to existing `dsr build` or release configurations.
 It never renames files in an installed sysroot, installs a compiler, downloads
 an unpinned latest release, or changes the source archives.
 
 The prepared view supplies both `kernel32.lib` and `Kernel32.lib` with exactly
 the same pinned bytes. It also supplies the complete selected LLVM header tree,
-including `arm_neon.h` and its dependent headers. The emitted JSON contains
+including the selected architecture's intrinsic headers and their dependencies. The emitted JSON contains
 `CFLAGS`, `CXXFLAGS`, and `LIB` values for the clang backend. This addresses the
 header/library compatibility inputs; it does not assert that a particular
 Rust project has compiled successfully.
@@ -17,7 +17,17 @@ Rust project has compiled successfully.
 ## Input manifest
 
 The manifest must contain exactly one JSON document with `schema_version: 1`
-and target `aarch64-pc-windows-msvc`. For example:
+and one supported target. That target selects the library directory, required
+LLVM header, build platform and executable machine together:
+
+| Manifest target | Build platform | Sysroot library directory | Required LLVM header |
+|---|---|---|---|
+| `x86_64-pc-windows-msvc` | `windows/amd64` | `lib/x86_64-unknown-windows-msvc/` | `xmmintrin.h` |
+| `aarch64-pc-windows-msvc` | `windows/arm64` | `lib/aarch64-unknown-windows-msvc/` | `arm_neon.h` |
+
+For example, this manifest selects ARM64. Set `target` to
+`x86_64-pc-windows-msvc` and pin archives containing the x64 library and header
+inputs to select Windows x64:
 
 ```json
 {
@@ -56,9 +66,11 @@ Use immutable release URLs and preserve the exact pinned archives for later
 verification. Query strings, credentials, and whitespace are not accepted in
 source URLs.
 
-`sysroot.prefix` selects a directory containing `include/` and
-`lib/aarch64-unknown-windows-msvc/`. `headers.prefix` selects a directory
-containing `arm_neon.h`. Both must be safe, nonempty, relative paths. Supported
+`sysroot.prefix` selects a directory containing `include/` and the target's
+library directory from the table above. `headers.prefix` selects the complete
+LLVM resource-header directory, including the required header and its transitive
+dependencies. A sysroot containing only the opposite architecture is refused.
+Both prefixes must be safe, nonempty, relative paths. Supported
 containers are `tar.gz`, `tgz`, `tar.xz`, and `zip`; the existing packaging
 validator rejects links, special files, duplicate members, traversal, and
 mislabeled compression. Inputs must meet that regular-file archive contract;
@@ -94,7 +106,9 @@ the selected format are required. Cache and executable paths must not contain
 whitespace, semicolons, or backslashes because downstream compiler flag
 parsers do not agree on quoting. Archive input paths may contain spaces.
 
-The canonical manifest hash chooses the view directory. Each view retains
+The canonical manifest hash, including the selected target, chooses the view directory.
+The two architectures therefore have distinct views even when their archives
+contain both library trees. Each view retains
 `manifest.json`, `evidence.json`, the untouched selected sysroot payload, the
 LLVM header tree, and the separate library alias view. Evidence binds source
 URLs/archive hashes, all configured executable paths/hashes, and every
