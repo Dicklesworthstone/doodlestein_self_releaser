@@ -4738,6 +4738,37 @@ _act_windows_cargo_sources_runtime() {
     cat "$module"
 }
 
+# Windows attestation is produced by the selected native process context. Keep
+# it separate from the digest-only context receipt and cache inventories, and
+# require all three executables before any compiler command is admitted.
+_act_validate_windows_toolchain_summary() {
+    local summary="$1" source_root="$2"
+    source_root="${source_root//\\//}"
+    jq -ce --arg source "$source_root" '
+        def digest: type == "string" and test("^[0-9a-f]{64}$");
+        def native_path: type == "string" and test("^[A-Za-z]:/");
+        def executable:
+            type == "object" and
+            (.program | type == "string" and length > 0) and
+            (.selected_path | native_path) and (.selected_sha256 | digest) and
+            .selected_kind == "executable" and
+            (.version | type == "string" and length > 0) and
+            (if has("resolved_path") or has("resolved_sha256") or has("resolved_kind") then
+                (.resolved_path | native_path) and (.resolved_sha256 | digest) and
+                .resolved_kind == "executable"
+             else true end);
+        select(type == "object" and .schema_version == 1 and
+            (.cwd | native_path) and (.cwd | ascii_downcase) == ($source | ascii_downcase) and
+            (.target_triple | type == "string" and test("^[A-Za-z0-9_]+(-[A-Za-z0-9_]+){2,}$")) and
+            (.tools | type == "object" and (keys | sort) == ["cargo", "linker", "rustc"] and all(.[]; executable)) and
+            (.selection | type == "object" and
+                (.rustup_toolchain == null or (.rustup_toolchain | type == "string" and length > 0)) and
+                (.cargo_commands | type == "array" and length == 1 and all(.[]; . == "build" or . == "rustc")) and
+                (.cargo_config | type == "array" and all(.[];
+                    type == "object" and (.path | native_path) and (.sha256 | digest)))))
+    ' <<< "$summary"
+}
+
 # Requires the Windows cache and source runtimes. The controller supplies both
 # hashes; a replaced metadata file or source receipt cannot authorize itself.
 # The same body runs before compilation and in independent final admission.
@@ -4869,7 +4900,8 @@ if ((Get-DsrCargoSourceFileHash -Path $dsrMetadataPath) -cne $dsrMetadataDigest)
 $dsrDependencySources.metadata_sha256=$dsrMetadataDigest
 $dsrPrivateSummary.dependency_sources=$dsrDependencySources
 $dsrContextSummary=Write-DsrCargoContextReceipt -Context $dsrContext -Path (Join-Path $dsrStrictHome '.dsr-cargo-context.json')
-$dsrPrivateSummary.cargo_context=$dsrContextSummary
+$dsrPrivateSummary.toolchain=$dsrContextSummary.toolchain
+$dsrPrivateSummary.cargo_context=@{schema_version=$dsrContextSummary.schema_version;fingerprint=$dsrContextSummary.fingerprint;receipt_sha256=$dsrContextSummary.receipt_sha256}
 if ($dsrSeedPending) {
     Invoke-DsrCargoCache -Operation snapshot -First $dsrStrictHome -Second $dsrSeedHome | Out-Null
 }
@@ -4878,7 +4910,7 @@ POWERSHELL
 }
 
 _act_prepare_windows_private_cargo_home() {
-    local host="$1" source_root="$2" suffix="$3" build_cmd="${4-cargo build}" build_env="${5:-}" script command summary sources_json
+    local host="$1" source_root="$2" suffix="$3" build_cmd="${4-cargo build}" build_env="${5:-}" script command summary sources_json toolchain_json
     script=$(_act_windows_private_cargo_home_script "$source_root" "$suffix") || return $?
     script+=$'\n'"$(_act_windows_cargo_metadata_body "$build_cmd" "$build_env")" || return $?
     script+=$'\n''$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
@@ -4886,6 +4918,8 @@ _act_prepare_windows_private_cargo_home() {
     summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
     sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
     _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
+    toolchain_json=$(jq -ce '.toolchain' <<< "$summary") || return 4
+    _act_validate_windows_toolchain_summary "$toolchain_json" "$source_root" >/dev/null || return 4
     jq -ce '
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
             (.cargo_home | type == "string" and test("^[A-Za-z]:/")) and
@@ -4893,6 +4927,7 @@ _act_prepare_windows_private_cargo_home() {
             (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
             (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
             (.cargo_context | type == "object" and .schema_version == 1 and
+                (keys | sort) == ["fingerprint", "receipt_sha256", "schema_version"] and
                 (.fingerprint | test("^[0-9a-f]{64}$")) and
                 (.receipt_sha256 | test("^[0-9a-f]{64}$"))))
     ' <<< "$summary"
@@ -4980,15 +5015,32 @@ EOF
 }
 
 _act_finish_windows_private_cargo_home() {
-    [[ $# == 3 || $# == 5 ]] || return 4
+    [[ $# == 3 || $# == 5 || $# == 8 ]] || return 4
     local host="$1" cargo_home="$2" seed_digest="$3" script command summary source_verification
+    local context_verification="" context_fingerprint context_receipt_digest context_json
     [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
     script=$(_act_windows_cargo_cache_runtime) || return $?
     script+=$'\n'"\$ErrorActionPreference='Stop'"
-    if [[ $# == 5 ]]; then
+    if [[ $# -ge 5 ]]; then
         source_verification=$(_act_windows_cargo_sources_runtime) || return $?
         script+=$'\n'"$source_verification"
+        if [[ $# == 8 ]]; then
+            context_json=$(jq -ce 'select(type == "object" and .schema_version == 1 and
+                (keys | sort) == ["fingerprint", "receipt_sha256", "schema_version"] and
+                (.fingerprint | type == "string" and test("^[0-9a-f]{64}$")) and
+                (.receipt_sha256 | type == "string" and test("^[0-9a-f]{64}$")))' <<< "$8") || return 4
+            context_fingerprint=$(jq -er '.fingerprint' <<< "$context_json") || return 4
+            context_receipt_digest=$(jq -er '.receipt_sha256' <<< "$context_json") || return 4
+            context_verification=$(_act_windows_cargo_context_runtime) || return $?
+            script+=$'\n'"$context_verification"
+            [[ "$4" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$4" != *..* ]] || return 4
+            script+=$'\n'"\$dsrPhysicalSource=(Get-Item -LiteralPath '$4' -Force).FullName.Replace('\\','/'); \$dsrStrictHome='$cargo_home'"
+            context_verification=$(_act_windows_cargo_context_setup "$6" "$7") || return $?
+            script+=$'\n'"$context_verification"
+            context_verification="Assert-DsrCargoContextReceipt -Context \$dsrContext -Path (Join-Path '$cargo_home' '.dsr-cargo-context.json') -Fingerprint '$context_fingerprint' -ReceiptSha256 '$context_receipt_digest'"
+            script+=$'\n'"$context_verification"
+        fi
         source_verification=$(_act_windows_cargo_sources_verify_body "$4" "$cargo_home" "$5") || return $?
         script+=$'\n'"$source_verification"
     fi
@@ -4998,6 +5050,7 @@ Assert-DsrCargoSeed -CargoHome '$cargo_home' -ExpectedSha256 '$seed_digest'
 \$dsrFinal=Invoke-DsrCargoCache -Operation inventory -First '$cargo_home' -Second '$cargo_home.final.json'
 Assert-DsrCargoHome -Path '$cargo_home'
 Assert-DsrCargoSeed -CargoHome '$cargo_home' -ExpectedSha256 '$seed_digest'
+$context_verification
 \$dsrFinal | ConvertTo-Json -Compress -Depth 100
 exit 0
 EOF
@@ -8103,7 +8156,7 @@ act_run_native_build() {
     [[ -n "$remote_path_override" ]] && strict_native_build=true
     local strict_rust_build=false
     local strict_private_cargo_cache=false strict_cargo_seed_json='null' strict_toolchain_receipt=""
-    local strict_cargo_context_json='null' strict_dependency_sources_json='null'
+    local strict_cargo_context_json='null' strict_dependency_sources_json='null' strict_windows_toolchain_json='null'
     local strict_sources_verification=""
     local build_influence_env_json='{}'
     local cargo_isolation_json='null'
@@ -8219,9 +8272,16 @@ act_run_native_build() {
         if _act_is_windows_host "$host"; then
             strict_cargo_context_json=$(jq -ce '.cargo_context | select(
                 type == "object" and .schema_version == 1 and
+                (keys | sort) == ["fingerprint", "receipt_sha256", "schema_version"] and
                 (.fingerprint | test("^[0-9a-f]{64}$")) and
                 (.receipt_sha256 | test("^[0-9a-f]{64}$")))' <<< "$strict_cargo_seed_json") || return 4
-            strict_cargo_seed_json=$(jq -c 'del(.cargo_context)' <<< "$strict_cargo_seed_json") || return 4
+            if ! strict_windows_toolchain_json=$(jq -ce '.toolchain' <<< "$strict_cargo_seed_json") || \
+               ! strict_windows_toolchain_json=$(_act_validate_windows_toolchain_summary "$strict_windows_toolchain_json" "$remote_path"); then
+                _log_error "Strict Windows Cargo toolchain lacks executable identity evidence"
+                jq -nc '{status: "error", exit_code: 4, error: "Strict Windows toolchain attestation failed"}'
+                return 4
+            fi
+            strict_cargo_seed_json=$(jq -c 'del(.cargo_context, .toolchain)' <<< "$strict_cargo_seed_json") || return 4
         else
             # Per-attempt toolchain identity receipt beside the snapshot; the
             # snapshot itself must stay byte-identical.
@@ -8282,6 +8342,10 @@ act_run_native_build() {
         if [[ "$strict_cargo_context_json" != null ]]; then
             cargo_isolation_json=$(jq --argjson context "$strict_cargo_context_json" \
                 '.cargo_context = $context' <<< "$cargo_isolation_json") || return 4
+        fi
+        if [[ "$strict_windows_toolchain_json" != null ]]; then
+            cargo_isolation_json=$(jq --argjson toolchain "$strict_windows_toolchain_json" \
+                '.toolchain = $toolchain' <<< "$cargo_isolation_json") || return 4
         fi
         if [[ "$strict_dependency_sources_json" != null ]]; then
             cargo_isolation_json=$(jq --argjson sources "$strict_dependency_sources_json" \
@@ -8957,6 +9021,9 @@ EOF
         strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4
         local strict_cargo_finish_args=("$host" "$strict_cargo_home" "$strict_cargo_seed_digest")
         strict_cargo_finish_args+=("$remote_path" "$strict_dependency_sources_json")
+        if _act_is_windows_host "$host"; then
+            strict_cargo_finish_args+=("$build_cmd" "$build_env" "$strict_cargo_context_json")
+        fi
         if [[ $exit_code -eq 0 ]] && \
            strict_cargo_final_json=$("$cargo_finish" "${strict_cargo_finish_args[@]}"); then
             cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \

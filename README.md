@@ -271,16 +271,25 @@ in each attempt's private Cargo home. Windows uses native handles and the .NET
 archive reader without extracting another untrusted archive, rejects ambiguous
 Windows paths and case collisions, and accepts Cargo-generated lockfile versions
 3 and 4, including unused patch records without treating them as resolved pins.
+Guarded filesystem identities bind workspace and manifest selection, lockfile,
+cache and vendor boundaries, including on case-sensitive Windows directories.
 
 Strict Windows Rust builds also use one Cargo command context for metadata and
 compilation. A literal `cargo +nightly build --release`, for example, resolves
 its dependencies with the selected nightly Cargo instead of the host's default.
 Both operations use the system CMD launcher with the same working directory,
 configured environment, compiler/SDK cleanup, and native-build RCH bypass.
-The admitted context is checked before and after compilation; changes to the
-command, relevant environment, Cargo configuration, or toolchain selection files
-prevent artifact collection. Results retain its digests under
-`cargo_isolation.cargo_context` without storing environment values in that receipt.
+The admitted context includes the actual Cargo, rustc and linker paths, executable
+SHA-256 hashes, and reported versions. Proven rustup proxies also retain the
+resolved selected-toolchain executables, including copied proxies whose matching
+rustup is absent from PATH. DSR asks the selected rustc to perform
+a small link to identify its default linker, including Visual Studio discovery.
+These identities are checked around metadata and compilation and again in the
+independent collection step. Changing a tool, command, relevant environment,
+Cargo configuration, or toolchain selection file prevents artifact collection,
+even if compilation succeeds. Results, durable state and manifests retain the
+full identities under `cargo_isolation.toolchain` and the context digests under
+`cargo_isolation.cargo_context`. The context receipt omits environment values.
 
 This Windows boundary accepts one literal `cargo build` or `cargo rustc` command,
 an optional first `+toolchain`, and ordinary Cargo build options. Quote whole
@@ -289,8 +298,19 @@ Shell chains, variable expansion, redirection, quote concatenation,
 `--config`/`-C`/`-Z`, alternate manifests, and compiler argument tails after `--`
 are refused before dependency admission. Metadata intentionally retains the
 locked, offline, all-features source-closure policy; it does not claim an exact
-feature graph match. Windows executable and linker identity attestation remains
-separate from this command-context guarantee.
+feature graph match.
+
+Windows executable attestation accepts native executables and proven rustup
+dispatch. Cargo or compiler script wrappers and Cargo plugins are refused.
+Tracked Cargo configuration supports literal build/compiler settings, literal
+target linkers and Rust flags, and ordinary source/registry settings. Dynamic
+selectors, configuration includes, inline tables, general `[env]` injection,
+and Rust flags that change compiler or linker selection are refused. Configure
+an overridden compiler or linker with an absolute path, or a tracked
+configuration path relative to the project. A default Windows linker that
+rustc cannot identify with an absolute path also requires explicit configuration.
+Hosts using a nondefault rustup installation must configure `RUSTUP_HOME`
+explicitly. Toolchain probe files are retained beside the private Cargo home.
 
 Resume verifies the retained seed inventory before copying it. Changes to seed
 bytes or unsafe cache entries are refused; a legacy snapshot whose cache roots

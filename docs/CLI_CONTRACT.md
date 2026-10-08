@@ -766,13 +766,42 @@ Each successful metadata attempt retains `.dsr-cargo-context.json` inside its
 private Cargo home. It binds the original build command, selected metadata
 command, source/home paths, relevant environment (including lookup controls and
 all configured names), Cargo manifests/configuration, toolchain selection files,
-and rustup settings through hashes. Environment values and command text are not
-stored in the context receipt. The coordinator holds the context fingerprint
-and receipt digest; the native build checks them before and after compilation.
+rustup settings, and the measured executable identities through hashes.
+Environment values and command text are not stored in the context receipt.
+The coordinator holds the context fingerprint and receipt digest; the native
+build checks them before and after compilation. An independent final request
+constructs the same context and checks it before and after source/cache admission.
 Drift refuses artifact collection. The three-field summary survives in target
-state and `build_environments[].cargo_isolation.cargo_context`. This evidence
-does not hash the selected Cargo, compiler, or linker executables: Windows still
-uses the documented trusted-host contract for those identities.
+state and `build_environments[].cargo_isolation.cargo_context`.
+
+`cargo_isolation.toolchain` retains the selected Cargo, rustc and linker paths,
+SHA-256 hashes, executable kinds and reported versions, selected target, rustup
+selection and tracked Cargo configuration hashes. Proven rustup proxies also
+retain their resolved executable paths and hashes, including copied proxies
+without a matching rustup on PATH. The full identity is part of
+the retained context receipt and survives public build JSON, completed state
+and manifest projection. Windows paths use drive-qualified `C:/...` spelling.
+An absent or malformed executable identity refuses compilation. The selected
+rustc performs a small link outside the source snapshot to identify its default
+linker; a Windows linker that does not resolve to an absolute path requires an
+explicit target linker. These probe files remain beside the private Cargo home.
+
+Windows attestation requires native executable Cargo/compiler/linker selectors;
+script wrappers and Cargo plugins are outside this boundary. Tracked Cargo
+configuration uses a bounded literal grammar for build/compiler settings,
+literal target settings, ordinary source/registry settings and Rust flags.
+Includes, dotted keys, inline tables, `cfg(...)` targets, general environment
+injection, unstable selector environments and flags that can select another
+linker/compiler/backend are refused before dependency admission. A positive
+literal `RUST_MIN_STACK` is the supported `[env]` exception. Configured compiler
+or linker paths must be absolute, or project-relative paths in tracked Cargo
+configuration. PATH entries must be drive-qualified absolute paths; known
+ambiguous compiler lookup locations are refused. Configured
+`RUSTUP_FORCE_ARG0` dispatch overrides are refused. Configure a nondefault
+`RUSTUP_HOME` explicitly instead of relying on an ambient Rust selector.
+Coverage includes the selected Cargo, compiler and linker executables; the
+native host remains trusted for loaded libraries and other subprocesses.
+These receipts assume the native host honestly executes DSR.
 
 On Unix hosts, strict Rust
 builds also attest their direct Cargo invocations. Inside the build's own

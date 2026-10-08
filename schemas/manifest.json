@@ -233,28 +233,57 @@
     },
     "toolchain_executable": {
       "type": "object",
-      "description": "One executable selected in the strict build shell, with a resolved dispatch target for proven rustup proxies and Apple launchers. Arbitrary scripts retain their own identity.",
+      "description": "One executable selected in the strict native build context, with a resolved dispatch target for proven rustup proxies and Apple launchers. Unix scripts retain their own identity; Windows requires resolved native executables.",
       "required": ["program", "selected_path", "selected_sha256", "selected_kind", "version"],
       "additionalProperties": false,
       "properties": {
         "program": {"type": "string", "minLength": 1},
-        "selected_path": {"type": "string", "pattern": "^/"},
+        "selected_path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
         "selected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "selected_kind": {"enum": ["executable", "script"]},
         "version": {"type": "string"},
-        "resolved_path": {"type": "string", "pattern": "^/"},
+        "resolved_path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
         "resolved_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "resolved_kind": {"enum": ["executable", "script"]}
       }
     },
     "toolchain_identity": {
       "type": "object",
-      "description": "Strict native Unix Rust toolchain attestation, recorded in the build shell before the build and required unchanged after it.",
+      "description": "Strict native Unix or Windows Rust toolchain attestation, recorded in the selected process context and required unchanged after compilation. Windows also binds these identities to metadata admission and independent final collection.",
       "required": ["schema_version", "cwd", "target_triple", "tools"],
       "additionalProperties": false,
+      "allOf": [{
+        "if": {"properties": {"cwd": {"pattern": "^[A-Za-z]:/"}}, "required": ["cwd"]},
+        "then": {
+          "required": ["selection"],
+          "properties": {
+            "target_triple": {"pattern": "^[A-Za-z0-9_]+(-[A-Za-z0-9_]+){2,}$"},
+            "selection": {
+              "properties": {"cargo_config": {"items": {"properties": {"path": {"pattern": "^[A-Za-z]:/"}}}}}
+            },
+            "tools": {
+              "required": ["cargo", "rustc", "linker"],
+              "additionalProperties": {
+                "properties": {
+                  "selected_path": {"pattern": "^[A-Za-z]:/"},
+                  "resolved_path": {"pattern": "^[A-Za-z]:/"},
+                  "selected_kind": {"const": "executable"},
+                  "resolved_kind": {"const": "executable"},
+                  "version": {"minLength": 1}
+                },
+                "dependentRequired": {
+                  "resolved_path": ["resolved_sha256", "resolved_kind"],
+                  "resolved_sha256": ["resolved_path", "resolved_kind"],
+                  "resolved_kind": ["resolved_path", "resolved_sha256"]
+                }
+              }
+            }
+          }
+        }
+      }],
       "properties": {
         "schema_version": {"const": 1},
-        "cwd": {"type": "string", "pattern": "^/"},
+        "cwd": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
         "target_triple": {"type": "string"},
         "linker_variable": {"type": ["string", "null"]},
         "selection": {
@@ -273,7 +302,7 @@
                 "type": "object", "required": ["path", "sha256"],
                 "additionalProperties": false,
                 "properties": {
-                  "path": {"type": "string", "pattern": "^/"},
+                  "path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
                   "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                   "env_exemptions": {
                     "type": "array", "minItems": 1,
@@ -300,7 +329,7 @@
     },
     "cargo_context": {
       "type": "object",
-      "description": "Strict Windows metadata/build command and environment agreement. Digests bind the held context receipt; this is not executable or linker attestation.",
+      "description": "Strict Windows metadata/build command and environment agreement. Digests bind the held context receipt, including its toolchain identity digest; full executable evidence is retained separately under toolchain.",
       "required": ["schema_version", "fingerprint", "receipt_sha256"],
       "additionalProperties": false,
       "properties": {

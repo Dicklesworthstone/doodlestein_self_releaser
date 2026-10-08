@@ -2,7 +2,7 @@
 # Linux mode shares only the cache test's documented OS/process adapters; its
 # real Cargo builds are evidence of context semantics, never native CMD proof.
 [CmdletBinding()]
-param([switch]$PortableStorageSemantics, [string]$BashPath)
+param([switch]$PortableStorageSemantics, [string]$BashPath, [switch]$ToolchainOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -63,6 +63,33 @@ function Invoke-ContextChecked {
     if ($result.ExitCode -ne 0) { throw "Cargo context $Operation failed: $($result.Stderr)" }
     return $result
 }
+function Copy-MutableLinker {
+    param([string]$Original,[string]$Directory)
+    $null=[IO.Directory]::CreateDirectory($Directory)
+    $path=Join-Path $Directory ([IO.Path]::GetFileName($Original))
+    [IO.File]::Copy($Original,$path)
+    $environment=@()
+    if ($script:WindowsHost) {
+        # MSVC's private PDB/runtime DLLs remain unchanged beside the copy.
+        foreach ($dll in [IO.Directory]::EnumerateFiles([IO.Path]::GetDirectoryName($Original),'*.dll')) {
+            [IO.File]::Copy($dll,(Join-Path $Directory ([IO.Path]::GetFileName($dll))))
+        }
+        $pdbServer=Join-Path ([IO.Path]::GetDirectoryName($Original)) 'mspdbsrv.exe'
+        if (Test-Path -LiteralPath $pdbServer -PathType Leaf) {
+            [IO.File]::Copy($pdbServer,(Join-Path $Directory 'mspdbsrv.exe'))
+        }
+    } else {
+        [IO.File]::SetUnixFileMode($path,[IO.File]::GetUnixFileMode($Original))
+        # GCC discovers private executables and plugins relative to argv[0].
+        # Preserve its actual installed support prefix while copying its EXE.
+        $libgcc=(Invoke-Exe $Original @('-print-libgcc-file-name')).Stdout.Trim()
+        if (-not (Test-Path -LiteralPath $libgcc -PathType Leaf)) { throw 'Portable mutation fixture requires the genuine GCC support directory' }
+        $supportDirectory=[IO.Path]::GetDirectoryName($libgcc)
+        $supportPrefix=[IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($supportDirectory))
+        $environment+='GCC_EXEC_PREFIX=' + $supportPrefix + [IO.Path]::DirectorySeparatorChar
+    }
+    return @{Path=$path; Environment=$environment}
+}
 function Invoke-GeneratedContext {
     param([ValidateSet('Metadata','Build','Finish')][string]$Operation,
         [string]$BuildCommand, [string[]]$ConfiguredEnvironment, [string]$Suffix, $Admission,
@@ -85,7 +112,7 @@ Build)
 Finish)
     exec 3>&1
     _act_windows_cache_command() { printf '%s\n' "$3" >&3; return 75; }
-    _act_finish_windows_private_cargo_home fixture-host "$2" "$3" "$4" "$5"
+    _act_finish_windows_private_cargo_home fixture-host "$2" "$3" "$4" "$5" "$6" "$7" "$8"
     result=$?
     [[ "$result" -eq 75 ]] || exit 1
     ;;
@@ -100,7 +127,8 @@ esac
         $Admission.cargo_context.fingerprint,$Admission.cargo_context.receipt_sha256,$Admission.receipt_sha256,
         ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100)) }
     else { $arguments += @($homeArgument,$Admission.receipt_sha256,$sourceArgument,
-        ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100)) }
+        ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100),$BuildCommand,($ConfiguredEnvironment -join "`n"),
+        ($Admission.cargo_context | ConvertTo-Json -Compress -Depth 100)) }
     $generated = Invoke-Exe $bash $arguments
     $body = $generated.Stdout
     if (-not $script:WindowsHost) {
@@ -204,12 +232,65 @@ try {
     Check 'managed Cargo home and RCH bypass values override differently cased configured selectors' (
         $context.Environment['CARGO_HOME'] -eq (Get-DsrCacheFullPath $privateHome) -and $context.Environment['RCH_DISABLED'] -eq '1' -and $context.Environment['RCH_CARGO_WRAPPER_BYPASS'] -eq '1')
     Check 'unconfigured ambient Rust selectors are removed from both operations' (-not $context.Environment.ContainsKey('RUSTFLAGS') -and -not $context.Environment.ContainsKey('RUSTC_WRAPPER'))
+    $identity=$context.ToolchainIdentity
+    $realCargo=Join-Path $sysroot ('bin/cargo' + $extension)
+    $realRustc=Join-Path $sysroot ('bin/rustc' + $extension)
+    Check 'Cargo attestation binds the selected rustup proxy bytes and the actual selected toolchain Cargo' (
+        $identity.tools.cargo.selected_path -ceq (Get-DsrCacheFullPath $proxyCargo) -and
+        $identity.tools.cargo.selected_sha256 -ceq (Get-FileHash -LiteralPath $proxyCargo -Algorithm SHA256).Hash.ToLowerInvariant() -and
+        $identity.tools.cargo.resolved_path -ceq (Resolve-DsrCargoPhysicalToolPath $realCargo) -and
+        $identity.tools.cargo.resolved_sha256 -ceq (Get-FileHash -LiteralPath $realCargo -Algorithm SHA256).Hash.ToLowerInvariant())
+    Check 'compiler attestation resolves the same explicit rustup toolchain and verbose host identity' (
+        $identity.tools.rustc.resolved_path -ceq (Resolve-DsrCargoPhysicalToolPath $realRustc) -and
+        $identity.tools.rustc.resolved_sha256 -ceq (Get-FileHash -LiteralPath $realRustc -Algorithm SHA256).Hash.ToLowerInvariant() -and
+        $identity.tools.rustc.version -match ('(?m)^host: ' + [regex]::Escape($hostTriple)) -and
+        $identity.tools.cargo.version -match '(?m)^release: ' -and $identity.tools.rustc.version -match '(?m)^commit-hash: ')
+    Check 'default linker attestation uses the executable selected by real rustc linking' (
+        $identity.target_triple -ceq $hostTriple -and
+        (Test-Path -LiteralPath $identity.tools.linker.selected_path -PathType Leaf) -and
+        $identity.tools.linker.selected_sha256 -ceq (Get-FileHash -LiteralPath $identity.tools.linker.selected_path -Algorithm SHA256).Hash.ToLowerInvariant() -and
+        $identity.tools.linker.version.Length -gt 0)
+    $isolatedBin=Join-Path $work 'proxies-without-helper'
+    $null=[IO.Directory]::CreateDirectory($isolatedBin)
+    foreach ($tool in @('cargo','rustc')) {
+        $destination=Join-Path $isolatedBin ($tool+$extension)
+        [IO.File]::Copy($rustup,$destination)
+        if (-not $script:WindowsHost) { [IO.File]::SetUnixFileMode($destination,[IO.File]::GetUnixFileMode($rustup)) }
+    }
+    $isolatedPath=@($isolatedBin)
+    foreach ($directory in $env:PATH.Split([IO.Path]::PathSeparator)) {
+        if ($directory -and -not (Test-Path -LiteralPath (Join-Path $directory.Trim('"') ('rustup'+$extension)) -PathType Leaf)) { $isolatedPath+=$directory }
+    }
+    $isolatedEnvironment=@("RUSTUP_HOME=$privateRustup",'RUSTUP_TOOLCHAIN=dsr-context-selected',
+        ('PATH='+($isolatedPath -join [IO.Path]::PathSeparator)),"CARGO_TARGET_DIR=$targetDir")
+    $isolatedCommand='"'+(Join-Path $isolatedBin ('cargo'+$extension))+'" build --locked --offline'
+    $isolatedContext=New-DsrCargoContext -BuildCommand $isolatedCommand -SourceRoot $source -CargoHome $privateHome -Environment $isolatedEnvironment
+    Check 'genuine default Rustup proxies resolve actual executables without any Rustup helper on PATH' (
+        -not (Resolve-DsrCargoTool -Context $isolatedContext -Program rustup -Optional) -and
+        $isolatedContext.ToolchainIdentity.tools.cargo.resolved_sha256 -ceq $identity.tools.cargo.resolved_sha256 -and
+        $isolatedContext.ToolchainIdentity.tools.rustc.resolved_sha256 -ceq $identity.tools.rustc.resolved_sha256)
+    $differentHelper=Join-Path $isolatedBin ('rustup'+$extension)
+    [IO.File]::Copy($realCargo,$differentHelper)
+    if (-not $script:WindowsHost) { [IO.File]::SetUnixFileMode($differentHelper,[IO.File]::GetUnixFileMode($realCargo)) }
+    $isolatedContext=New-DsrCargoContext -BuildCommand $isolatedCommand -SourceRoot $source -CargoHome $privateHome -Environment $isolatedEnvironment
+    Check 'a mismatched executable named Rustup cannot hide actual proxy-dispatched compiler identity' (
+        $isolatedContext.ToolchainIdentity.tools.cargo.resolved_sha256 -ceq $identity.tools.cargo.resolved_sha256 -and
+        $isolatedContext.ToolchainIdentity.tools.rustc.resolved_sha256 -ceq $identity.tools.rustc.resolved_sha256)
+    $directContext=New-DsrCargoContext -BuildCommand ('"'+$realCargo+'" build --locked --offline') -SourceRoot $source -CargoHome $privateHome -Environment ($baseEnvironment+"RUSTC=$realRustc")
+    Check 'genuine direct Cargo and compiler executables remain supported without Rustup dispatch' (
+        $directContext.ToolchainIdentity.tools.cargo.selected_sha256 -ceq $identity.tools.cargo.resolved_sha256 -and
+        $directContext.ToolchainIdentity.tools.rustc.selected_sha256 -ceq $identity.tools.rustc.resolved_sha256)
     $metadata = Invoke-ContextChecked $context Metadata
     $metadataJson = ConvertFrom-Json $metadata.Stdout
     Check 'real selected Cargo metadata includes the optional source dependency' (@($metadataJson.packages | Where-Object name -eq 'closure-dependency').Count -eq 1)
     $receiptPath = Join-Path $work 'context-receipt.json'
     $receipt = Write-DsrCargoContextReceipt -Context $context -Path $receiptPath
     Check 'context receipt binds exact persisted bytes' ((Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant() -eq $receipt.receipt_sha256)
+    $durableContext=Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+    Check 'durable context receipt retains full executable evidence authenticated by its fingerprint' (
+        $durableContext.toolchain_sha256 -ceq (Get-DsrCacheBytesHash ($utf8.GetBytes((ConvertTo-DsrCacheCanonicalJson $identity) + "`n"))) -and
+        (ConvertTo-DsrCacheCanonicalJson $durableContext.toolchain) -ceq (ConvertTo-DsrCacheCanonicalJson $identity) -and
+        (ConvertTo-DsrCacheCanonicalJson $receipt.toolchain) -ceq (ConvertTo-DsrCacheCanonicalJson $identity))
     Assert-DsrCargoContextReceipt -Context $context -Path $receiptPath -Fingerprint $receipt.fingerprint -ReceiptSha256 $receipt.receipt_sha256
     $null = Invoke-ContextChecked $context Build
     $binary = Join-Path $targetDir ($hostTriple + '/debug/dsr-context-probe' + $extension)
@@ -225,7 +306,7 @@ try {
     Refused 'receipt digest substitution is refused' { Assert-DsrCargoContextReceipt -Context $context -Path $receiptPath -Fingerprint $receipt.fingerprint -ReceiptSha256 ('0' * 64) } 'changed'
     Refused 'an existing context receipt is never overwritten' { Write-DsrCargoContextReceipt -Context $context -Path $receiptPath }
     $mutated = New-DsrCargoContext -BuildCommand $command -SourceRoot $source -CargoHome $privateHome -Environment $baseEnvironment
-    $mutated.Environment['PATH'] += [IO.Path]::PathSeparator + 'different-lookup'
+    $mutated.Environment['PATH'] += [IO.Path]::PathSeparator + (Join-Path $work 'different-lookup')
     Refused 'in-memory executable lookup drift is refused before launch' { Invoke-DsrCargoContext -Context $mutated -Operation Build -CaptureOutput } 'changed before launch'
     $configPath = Join-Path $source '.cargo/config.toml'
     Write-Text $configPath "[build]`njobs=1`n"
@@ -236,6 +317,7 @@ try {
     $null = Invoke-ContextChecked $fresh Build
     Check 'fresh admission can build with the new tracked Cargo configuration' $true
 
+    if (-not $ToolchainOnly) {
     $generatedTarget = Join-Path $work 'generated-target'
     $generatedEnvironment = @("RUSTUP_HOME=$privateRustup",'RUSTUP_TOOLCHAIN=dsr-context-unavailable',
         "CARGO_TARGET_DIR=$generatedTarget",'cargo_home=must-not-override-private-home')
@@ -243,6 +325,10 @@ try {
     $admission = ConvertFrom-Json $prepared.Stdout
     Check 'generated metadata admits both cache and Cargo context receipts' (
         $admission.cargo_context.fingerprint -match '^[0-9a-f]{64}$' -and $admission.cargo_context.receipt_sha256 -match '^[0-9a-f]{64}$')
+    Check 'generated metadata returns actual tool identities for durable coordinator retention' (
+        $admission.toolchain.tools.cargo.resolved_sha256 -ceq $identity.tools.cargo.resolved_sha256 -and
+        $admission.toolchain.tools.rustc.resolved_sha256 -ceq $identity.tools.rustc.resolved_sha256 -and
+        $admission.toolchain.tools.linker.selected_sha256 -ceq $identity.tools.linker.selected_sha256)
     $generatedMetadata = Get-Content -LiteralPath (Join-Path $admission.cargo_home '.dsr-cargo-metadata.json') -Raw | ConvertFrom-Json
     Check 'generated selected-toolchain metadata retains optional source closure' (@($generatedMetadata.packages | Where-Object name -eq 'closure-dependency').Count -eq 1)
     $null = Invoke-GeneratedContext Build $command $generatedEnvironment '' $admission
@@ -252,6 +338,27 @@ try {
     $final = ConvertFrom-Json $finished.Stdout
     $null = Invoke-DsrCargoCache -Operation verify -First $admission.cargo_home -Second $final.receipt_path
     Check 'generated metadata build and finish retain a verifiable final cache receipt' ($final.mode -eq 'inventory')
+    $forgedAdmission=$admission | ConvertTo-Json -Depth 100 | ConvertFrom-Json
+    $forgedAdmission.cargo_context.fingerprint='0' * 64
+    $forgedFinish=Invoke-GeneratedContext Finish $command $generatedEnvironment '' $forgedAdmission -ExpectFailure
+    Check 'independent finish refuses a substituted coordinator-held context fingerprint' (
+        $forgedFinish.ExitCode -ne 0 -and $forgedFinish.Stderr -match 'context changed')
+    $finishTool=Copy-MutableLinker -Original $identity.tools.linker.selected_path -Directory (Join-Path $work 'finish-drift-linker')
+    $finishTarget=Join-Path $work 'finish-drift-target'
+    $finishLinkerVariable='CARGO_TARGET_' + ($hostTriple.ToUpperInvariant() -replace '[^A-Z0-9]','_') + '_LINKER'
+    $finishEnvironment=@($generatedEnvironment) + @("CARGO_TARGET_DIR=$finishTarget", "$finishLinkerVariable=$($finishTool.Path)") + $finishTool.Environment
+    $finishPrepared=Invoke-GeneratedContext Metadata $command $finishEnvironment 'metadata-finish-drift' $null
+    $finishAdmission=ConvertFrom-Json $finishPrepared.Stdout
+    $null=Invoke-GeneratedContext Build $command $finishEnvironment '' $finishAdmission
+    Check 'the independent admission fixture completes and runs an actual Cargo build' (
+        (Invoke-Exe (Join-Path $finishTarget ($hostTriple + '/debug/dsr-context-probe' + $extension)) @()).Stdout.Trim() -ceq 'selected')
+    $driftStream=[IO.File]::Open($finishTool.Path,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try { $driftBytes=$utf8.GetBytes('post-build linker drift'); $driftStream.Write($driftBytes,0,$driftBytes.Length) }
+    finally { $driftStream.Dispose() }
+    $driftFinish=Invoke-GeneratedContext Finish $command $finishEnvironment '' $finishAdmission -ExpectFailure
+    Check 'independent finish refuses executable drift after the build postamble has succeeded' (
+        $driftFinish.ExitCode -ne 0 -and $driftFinish.Stderr -match 'context changed' -and
+        -not (Test-Path -LiteralPath ($finishAdmission.cargo_home + '.final.json')))
     $changedBuild = Invoke-GeneratedContext Build ($command + ' --release') $generatedEnvironment '' $admission -ExpectFailure
     Check 'generated build rejects changed arguments before compilation' (
         $changedBuild.ExitCode -ne 0 -and $changedBuild.Stderr -match 'context changed' -and
@@ -269,6 +376,7 @@ try {
     Check 'a real build that changes admitted Cargo inputs cannot report success' (
         $postBuild.ExitCode -ne 0 -and $postBuild.Stderr -match 'context changed' -and
         (Test-Path -LiteralPath (Join-Path $postTarget ($hostTriple + '/debug/dsr-context-probe' + $extension))))
+    }
 
     foreach ($bad in @(
         'cargo build & echo unsafe', 'cargo build | more', 'cargo build > out', 'cargo build < in',
@@ -288,10 +396,117 @@ try {
     Refused 'an explicit compiler target cannot contradict the admitted native variant' {
         New-DsrCargoContext -BuildCommand ('cargo build --target ' + $hostTriple) -SourceRoot $source -CargoHome $privateHome -Environment $baseEnvironment -ExpectedTarget wasm32-unknown-unknown
     } 'disagrees'
-    $targetContext = New-DsrCargoContext -BuildCommand 'cargo build' -SourceRoot $source -CargoHome $privateHome -Environment ($baseEnvironment + "cargo_build_target=$hostTriple")
+    $caseParent=Join-Path $work 'manifest-case'
+    $null=[IO.Directory]::CreateDirectory($caseParent)
+    if ($script:WindowsHost) {
+        $null=Invoke-Exe (Join-Path ([Environment]::SystemDirectory) 'fsutil.exe') @('file','setCaseSensitiveInfo',$caseParent,'enable') -ExpectFailure
+    }
+    $caseSource=Join-Path $caseParent 'Project'; $otherCaseSource=Join-Path $caseParent 'project'
+    foreach ($path in @($caseSource,$otherCaseSource)) { $null=[IO.Directory]::CreateDirectory($path) }
+    $caseEntry=Open-DsrCacheEntry (Get-DsrCacheFullPath $caseSource) -Directory $true
+    $otherCaseEntry=Open-DsrCacheEntry (Get-DsrCacheFullPath $otherCaseSource) -Directory $true
+    try { $caseSensitive=$caseEntry.FileId -cne $otherCaseEntry.FileId }
+    finally { $caseEntry.Dispose(); $otherCaseEntry.Dispose() }
+    if ($caseSensitive) {
+        $caseManifest=Join-Path $caseSource 'Cargo.toml'; $otherManifest=Join-Path $otherCaseSource 'Cargo.toml'
+        Write-Text $caseManifest "[package]`nname='admitted-case'`nversion='1.0.0'`n"
+        Write-Text $otherManifest "[package]`nname='different-case'`nversion='1.0.0'`n"
+        Refused 'case-only different source roots cannot substitute the build manifest' {
+            Get-DsrCargoContextSelection -BuildCommand ('cargo build --manifest-path "'+$otherManifest+'"') -SourceRoot $caseSource -Environment $context.Environment
+        } 'physical source root manifest'
+        $hardlinkSource=Join-Path $caseParent 'pRoJeCt'; $null=[IO.Directory]::CreateDirectory($hardlinkSource)
+        $hardlinkManifest=Join-Path $hardlinkSource 'Cargo.toml'
+        $null=New-Item -ItemType HardLink -Path $hardlinkManifest -Target $caseManifest
+        Refused 'a hardlinked manifest in another case-only source directory cannot redirect relative inputs' {
+            Get-DsrCargoContextSelection -BuildCommand ('cargo build --manifest-path "'+$hardlinkManifest+'"') -SourceRoot $caseSource -Environment $context.Environment
+        } 'physical source root manifest'
+    } else { Write-Output 'LIMITATION: case-sensitive directory manifest probes unavailable on this filesystem.' }
+    $targetContext = New-DsrCargoContext -BuildCommand ('"' + $proxyCargo + '" +dsr-context-selected build') -SourceRoot $source -CargoHome $privateHome -Environment ($baseEnvironment + "cargo_build_target=$hostTriple")
     Check 'case-insensitive configured target selection reaches metadata filtering' ($targetContext.Target -eq $hostTriple -and $targetContext.MetadataCommand.Contains($hostTriple))
 
+    # Copy a genuine linker. Appending an inert overlay preserves its ability
+    # to link while changing the actual executable bytes. The real build script
+    # performs that write between compilation phases; no tool results are mocked.
+    $mutableSource=Join-Path $work 'mutable-source'
+    $mutableHome=Join-Path $work 'mutable-home'
+    $mutableTarget=Join-Path $work 'mutable-target'
+    $mutableBin=Join-Path $work 'mutable-linker'
+    $null=[IO.Directory]::CreateDirectory($mutableHome)
+    $mutableTool=Copy-MutableLinker -Original $identity.tools.linker.selected_path -Directory $mutableBin
+    $mutableLinker=$mutableTool.Path
+    Write-Text (Join-Path $mutableSource 'Cargo.toml') "[package]`nname=`"tool-mutation-probe`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
+    Write-Text (Join-Path $mutableSource 'src/main.rs') 'fn main() { println!("compiled-after-tool-mutation"); }'
+    Write-Text (Join-Path $mutableSource 'build.rs') @'
+use std::io::Write;
+fn main() {
+    let path = std::env::var_os("DSR_MUTATE_TOOL").unwrap();
+    std::fs::OpenOptions::new().append(true).open(path).unwrap().write_all(b"DSR executable identity mutation\n").unwrap();
+}
+'@
+    $null=Invoke-Exe $proxyCargo @('+dsr-context-selected','generate-lockfile','--offline','--manifest-path',(Join-Path $mutableSource 'Cargo.toml'))
+    $linkerVariable='CARGO_TARGET_' + ($hostTriple.ToUpperInvariant() -replace '[^A-Z0-9]','_') + '_LINKER'
+    $mutableEnvironment=@("RUSTUP_HOME=$privateRustup",'RUSTUP_TOOLCHAIN=dsr-context-unavailable',"CARGO_TARGET_DIR=$mutableTarget",
+        "$linkerVariable=$mutableLinker","DSR_MUTATE_TOOL=$mutableLinker") + $mutableTool.Environment
+    $mutableCommand='"' + $proxyCargo + '" +dsr-context-selected build -j1 --locked --offline --target ' + $hostTriple
+    $mutableContext=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $mutableSource -CargoHome $mutableHome -Environment $mutableEnvironment
+    $null=Invoke-ContextChecked $mutableContext Metadata
+    $mutableReceiptPath=Join-Path $work 'mutable-tool-receipt.json'
+    $mutableReceipt=Write-DsrCargoContextReceipt -Context $mutableContext -Path $mutableReceiptPath
+    Refused 'a genuine successful build cannot admit a linker replaced by its build script' {
+        Invoke-ContextChecked $mutableContext Build
+    } 'context changed during execution'
+    $mutatedBinary=Join-Path $mutableTarget ($hostTriple + '/debug/tool-mutation-probe' + $extension)
+    Check 'the tool-mutation fixture really linked and runs before artifact admission rejects it' (
+        (Invoke-Exe $mutatedBinary @()).Stdout.Trim() -ceq 'compiled-after-tool-mutation')
+    Refused 'the coordinator-held receipt continues refusing the changed executable' {
+        Assert-DsrCargoContextReceipt -Context $mutableContext -Path $mutableReceiptPath -Fingerprint $mutableReceipt.fingerprint -ReceiptSha256 $mutableReceipt.receipt_sha256
+    } 'context changed'
+    Check 'refused tool mutation leaves the originally admitted executable hashes intact in the receipt' (
+        (Get-Content -LiteralPath $mutableReceiptPath -Raw | ConvertFrom-Json).toolchain.tools.linker.selected_sha256 -ceq $mutableContext.ToolchainIdentity.tools.linker.selected_sha256 -and
+        (Get-FileHash -LiteralPath $mutableLinker -Algorithm SHA256).Hash.ToLowerInvariant() -cne $mutableContext.ToolchainIdentity.tools.linker.selected_sha256)
+
+    foreach ($environment in @(
+        'RUSTC_WRAPPER=unsupported-compiler-wrapper', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=unsupported-workspace-wrapper',
+        'RUSTFLAGS=-Clinker=unattested-linker', 'CARGO_ENCODED_RUSTFLAGS=@unattested-response-file',
+        'CARGO_UNSTABLE_HOST_CONFIG=true', 'RUSTUP_FORCE_ARG0=rustc'
+    )) {
+        Refused "executable-selecting environment fails closed: $($environment.Split('=')[0])" {
+            New-DsrCargoContext -BuildCommand $command -SourceRoot $source -CargoHome $privateHome -Environment ($baseEnvironment+$environment)
+        }
+    }
+    $configSource=Join-Path $work 'config-source'; $configHome=Join-Path $work 'config-home'
+    $null=[IO.Directory]::CreateDirectory($configHome)
+    Write-Text (Join-Path $configSource 'Cargo.toml') "[package]`nname=`"config-selection-probe`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
+    Write-Text (Join-Path $configSource 'src/main.rs') 'fn main() {}'
+    $null=Invoke-Exe $proxyCargo @('+dsr-context-selected','generate-lockfile','--offline','--manifest-path',(Join-Path $configSource 'Cargo.toml'))
+    $selectionConfig=Join-Path $configSource '.cargo/config.toml'
+    Write-Text $selectionConfig ("[build]`njobs=1`nrustc='" + $realRustc + "'`nrustflags=[`n '-C', # literal array with comment`n 'debuginfo=0',`n]`n[target.'" + $hostTriple + "']`nlinker='" + $identity.tools.linker.selected_path + "'`n")
+    $configuredContext=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
+    Check 'tracked literal configuration selects actual compiler and linker executable identities' (
+        $configuredContext.ToolchainIdentity.tools.rustc.selected_path -ceq (Get-DsrCacheFullPath $realRustc) -and
+        $configuredContext.ToolchainIdentity.tools.linker.selected_path -ceq $identity.tools.linker.selected_path -and
+        $configuredContext.ToolchainIdentity.selection.cargo_config[0].sha256 -ceq (Get-FileHash -LiteralPath $selectionConfig -Algorithm SHA256).Hash.ToLowerInvariant())
+    $null=Invoke-ContextChecked $configuredContext Metadata
+    $null=Invoke-ContextChecked $configuredContext Build
+    Check 'real Cargo consumes the attested literal compiler and linker configuration' $true
+    foreach ($configText in @(
+        'build.rustc="hidden-rustc"', ('[build]'+"`n"+'rustc={value="hidden-rustc"}'),
+        ('[target.''cfg(windows)'']'+"`n"+'linker="hidden-linker"'), ('[env]'+"`n"+'RUSTC="hidden-rustc"'),
+        'include=["hidden.toml"]', ('[build]'+"`n"+'rustflags=["-Clinker=hidden-linker"]'),
+        ('[build]'+"`n"+'rustc-wrapper="hidden-wrapper"')
+    )) {
+        Write-Text $selectionConfig $configText
+        Refused 'unsupported tracked Cargo tool selection cannot receive an executable attestation' {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
+        }
+    }
+
     if ($script:WindowsHost) {
+        foreach ($relativePath in @('C:relative-tools','\relative-tools','/relative-tools')) {
+            Refused 'rooted but drive-relative PATH entries cannot change native executable resolution' {
+                New-DsrCargoContext -BuildCommand $command -SourceRoot $source -CargoHome $privateHome -Environment ($baseEnvironment + "PATH=$relativePath;$env:PATH")
+            } 'literal absolute PATH entries'
+        }
         Refused 'a configured alternate COMSPEC cannot replace the system command interpreter' {
             New-DsrCargoContext -BuildCommand $command -SourceRoot $source -CargoHome $privateHome -Environment ($baseEnvironment + "ComSpec=$proxyCargo")
         } 'system cmd.exe'
@@ -340,16 +555,39 @@ fn main() {
                 "PATH=$lookupBin;$env:PATH","PATHEXT=$($case.Extensions)","CARGO_TARGET_DIR=$output",
                 "DSR_CONTEXT_REAL_CARGO=$proxyCargo","DSR_CONTEXT_LOG=$log")
             if ($case.SkipCwd) { $lookupEnvironment += 'NoDefaultCurrentDirectoryInExePath=0' }
-            $lookup = New-DsrCargoContext -BuildCommand ($case.Selector + ' +dsr-context-selected build --offline --locked') -SourceRoot $lookupSource -CargoHome $privateHome -Environment $lookupEnvironment
-            $null = Invoke-ContextChecked $lookup Metadata
-            $null = Invoke-ContextChecked $lookup Build
+            $lookupCommand=$case.Selector + ' +dsr-context-selected build --offline --locked'
+            $lookupEffective=New-DsrCargoContextEnvironment -CargoHome $privateHome -Environment $lookupEnvironment
+            $lookupSelection=Get-DsrCargoContextSelection -BuildCommand $lookupCommand -SourceRoot $lookupSource -Environment $lookupEffective.Environment
+            $lookup=[pscustomobject]@{SourceRoot=$lookupSource; Environment=$lookupEffective.Environment;
+                CmdPath=(Get-DsrCargoCmdPath $lookupEffective.Environment)}
+            foreach ($operation in @($lookupSelection.MetadataCommand,$lookupCommand)) {
+                $lookupResult=Invoke-DsrCargoCommand -Context $lookup -Command $operation -CaptureOutput $true
+                if ($lookupResult.ExitCode -ne 0) { throw ('Native lookup fixture failed: ' + $lookupResult.Stderr) }
+            }
             $lines = @(Get-Content -LiteralPath $log)
             Check "native CMD $($case.Name) uses the same selected program for metadata and build" (
                 $lines.Count -eq 2 -and @($lines | Where-Object { -not $_.Contains($case.Expected) }).Count -eq 0 -and
                 $lines[0].Contains('metadata') -and $lines[1].Contains('build'))
             Check "native CMD $($case.Name) compiles and runs the real program" (
                 (Invoke-Exe (Join-Path $output 'debug/lookup-probe.exe') @()).Stdout.Trim() -eq 'lookup-ok')
+            Refused "native CMD $($case.Name) opaque Cargo wrapper cannot receive a toolchain attestation" {
+                New-DsrCargoContext -BuildCommand $lookupCommand -SourceRoot $lookupSource -CargoHome $privateHome -Environment $lookupEnvironment
+            } 'wrapper|proven rustup'
         }
+        $shadowCompiler=Join-Path $lookupSource 'rustc.exe'
+        [IO.File]::Copy((Join-Path $lookupBin 'cargo.exe'),$shadowCompiler)
+        $shadowTarget=Join-Path $work 'shadow-compiler-target'
+        $shadowEnvironment=@("RUSTUP_HOME=$privateRustup",'RUSTUP_TOOLCHAIN=dsr-context-unavailable',"CARGO_TARGET_DIR=$shadowTarget")
+        $shadowCommand='"' + $proxyCargo + '" +dsr-context-selected build --locked --offline'
+        Refused 'a differing cwd compiler cannot silently change native Cargo lookup authority' {
+            New-DsrCargoContext -BuildCommand $shadowCommand -SourceRoot $lookupSource -CargoHome $privateHome -Environment $shadowEnvironment
+        } 'Ambiguous native Cargo compiler lookup'
+        Check 'native compiler shadow refusal occurs before the actual Cargo build creates output' (-not (Test-Path -LiteralPath $shadowTarget))
+        $pinnedCompiler=New-DsrCargoContext -BuildCommand $shadowCommand -SourceRoot $lookupSource -CargoHome $privateHome -Environment ($shadowEnvironment + "RUSTC=$realRustc")
+        $null=Invoke-ContextChecked $pinnedCompiler Metadata
+        $null=Invoke-ContextChecked $pinnedCompiler Build
+        Check 'an explicit absolute compiler executes successfully despite a differing cwd executable' (
+            (Invoke-Exe (Join-Path $shadowTarget 'debug/lookup-probe.exe') @()).Stdout.Trim() -ceq 'lookup-ok')
     } else {
         Write-Output 'LIMITATION: native CMD quoting, PATHEXT, current-directory lookup, COMSPEC, and batch dispatch cases were not run.'
     }
