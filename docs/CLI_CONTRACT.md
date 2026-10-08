@@ -701,7 +701,7 @@ retained under `cargo_isolation.dependency_cache` with `cache_reuse: []`.
 Windows uses PowerShell 7 and native NTFS handles, rejects reparses and external
 private-cache hardlinks, and records drive-qualified forward-slash paths.
 
-Strict native Unix builds also authenticate resolved dependency sources against
+Strict native Unix and Windows builds authenticate resolved dependency sources against
 the workspace's committed `Cargo.lock` before admitting a reusable seed. Registry
 archives must match their locked SHA-256 checksums, and their extracted files must
 match the archive. Git checkout files must match the locked commit's Git objects.
@@ -709,7 +709,12 @@ The gate follows the all-features metadata graph from every workspace member,
 including members outside the default selection; unrelated cached packages do
 not become source inputs. Vendored sources must remain inside the primary
 workspace and use its separately verified committed snapshot as their authority.
-This requires Python 3.11 or newer on the Unix build host.
+This requires Python 3.11 or newer on Unix, or PowerShell 7.4 or newer on native
+Windows. Windows uses .NET archive/JSON readers and held NTFS handles, refuses
+reparse points, ambiguous paths and case-colliding archive members, and supports
+Cargo-generated version 3/4 lockfiles. Unused patch records are parsed but never
+contribute resolved-package authority. No Python installation is needed on the
+Windows build host.
 
 The coordinator retains metadata and source-evidence SHA-256 hashes under
 `cargo_isolation.dependency_sources`, together with the lockfile hash and counts

@@ -72,6 +72,7 @@ source "$1" || exit $?
 shift
 _act_windows_cargo_cache_runtime() { :; }
 _act_windows_cargo_context_runtime() { :; }
+_act_windows_cargo_sources_runtime() { :; }
 case "$1" in
 Metadata)
     _act_windows_private_cargo_home_script "$2" "$3" || exit $?
@@ -79,12 +80,12 @@ Metadata)
     printf '%s\n' '$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
     ;;
 Build)
-    _act_windows_strict_cargo_build_script "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+    _act_windows_strict_cargo_build_script "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
     ;;
 Finish)
     exec 3>&1
     _act_windows_cache_command() { printf '%s\n' "$3" >&3; return 75; }
-    _act_finish_windows_private_cargo_home fixture-host "$2" "$3"
+    _act_finish_windows_private_cargo_home fixture-host "$2" "$3" "$4" "$5"
     result=$?
     [[ "$result" -eq 75 ]] || exit 1
     ;;
@@ -96,8 +97,10 @@ esac
     $arguments = @('-c',$generator,'_', (Join-Path $moduleRoot 'act_runner.sh').Replace('\','/'), $Operation)
     if ($Operation -eq 'Metadata') { $arguments += @($sourceArgument,$Suffix,$BuildCommand,($ConfiguredEnvironment -join "`n")) }
     elseif ($Operation -eq 'Build') { $arguments += @($sourceArgument,$homeArgument,$BuildCommand,($ConfiguredEnvironment -join "`n"),
-        $Admission.cargo_context.fingerprint,$Admission.cargo_context.receipt_sha256,$Admission.receipt_sha256) }
-    else { $arguments += @($homeArgument,$Admission.receipt_sha256) }
+        $Admission.cargo_context.fingerprint,$Admission.cargo_context.receipt_sha256,$Admission.receipt_sha256,
+        ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100)) }
+    else { $arguments += @($homeArgument,$Admission.receipt_sha256,$sourceArgument,
+        ($Admission.dependency_sources | ConvertTo-Json -Compress -Depth 100)) }
     $generated = Invoke-Exe $bash $arguments
     $body = $generated.Stdout
     if (-not $script:WindowsHost) {
@@ -151,7 +154,7 @@ selected=[]
 selected-two=[]
 metadata-only=["dep:closure-dependency"]
 [dependencies]
-closure-dependency={path="../closure-dependency",optional=true}
+closure-dependency={path="closure-dependency",optional=true}
 '@
 Write-Text (Join-Path $source 'src/main.rs') @'
 fn main() {
@@ -159,8 +162,8 @@ fn main() {
     #[cfg(any(not(feature="selected"), not(feature="selected-two"), feature="default-mode"))] println!("wrong-features");
 }
 '@
-Write-Text (Join-Path $work 'project/closure-dependency/Cargo.toml') "[package]`nname=`"closure-dependency`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
-Write-Text (Join-Path $work 'project/closure-dependency/src/lib.rs') 'pub fn value() -> u32 { 42 }'
+Write-Text (Join-Path $source 'closure-dependency/Cargo.toml') "[package]`nname=`"closure-dependency`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
+Write-Text (Join-Path $source 'closure-dependency/src/lib.rs') 'pub fn value() -> u32 { 42 }'
 $null = Invoke-Exe $cargo @('generate-lockfile','--offline','--manifest-path',$manifest)
 $saved = @{}
 foreach ($name in @('RUSTUP_HOME','RUSTUP_TOOLCHAIN','CARGO_HOME','RUSTFLAGS','RUSTC_WRAPPER','NoDefaultCurrentDirectoryInExePath')) {

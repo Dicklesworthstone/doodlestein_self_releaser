@@ -235,8 +235,8 @@ stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
 Strict native Rust builds copy the ambient `registry` and `git` download
-caches into private files before Cargo runs. Unix hosts require Python 3.9+;
-Windows hosts require PowerShell 7 and a local NTFS Cargo cache. Configuration,
+caches into private files before Cargo runs. Strict Unix hosts require Python
+3.11+; strict Windows hosts require PowerShell 7.4+ and a local NTFS Cargo cache. Configuration,
 credentials, symlinks, Windows reparse points, and external Git storage
 pointers are excluded or refused. The first successful locked, offline metadata
 resolution publishes a retained seed alongside the source snapshot. If that
@@ -244,6 +244,23 @@ first resolution lacks dependencies, no seed is published: refill the ambient
 cache and retry. Once admitted, the seed survives deletion or in-place changes
 to the ambient cache, and every metadata invocation and target attempt receives
 a fresh copy. Parallel targets therefore do not share writable dependency files.
+
+Before a strict native seed is admitted, DSR authenticates the resolved
+dependency source files against the committed `Cargo.lock`. Registry archives
+must have their locked SHA-256 checksums, and their extracted files must match
+those archives. Git checkouts must match the locked commit's actual objects.
+This covers the all-features graph from every workspace member on both Unix
+and Windows. Vendored sources have a separate trust basis: they must be inside
+the primary workspace's independently verified source snapshot.
+The coordinator holds hashes of metadata and source evidence, verifies them
+before compilation, and independently rechecks the source files before artifact
+collection. Editing a cached dependency, metadata, or a remote receipt refuses
+publication even when Cargo successfully compiles it. The compact evidence is
+retained as `cargo_isolation.dependency_sources`; full source inventories stay
+in each attempt's private Cargo home. Windows uses native handles and the .NET
+archive reader without extracting another untrusted archive, rejects ambiguous
+Windows paths and case collisions, and accepts Cargo-generated lockfile versions
+3 and 4, including unused patch records without treating them as resolved pins.
 
 Strict Windows Rust builds also use one Cargo command context for metadata and
 compilation. A literal `cargo +nightly build --release`, for example, resolves

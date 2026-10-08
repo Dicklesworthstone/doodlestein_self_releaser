@@ -4447,7 +4447,7 @@ DSR_CARGO_SOURCE_HASH
 SH
 )
 
-_act_validate_unix_cargo_sources_summary() {
+_act_validate_cargo_sources_summary() {
     jq -ce '
         def count: type == "number" and . >= 0 and floor == .;
         select(type == "object" and .schema_version == 1 and
@@ -4472,7 +4472,7 @@ _act_unix_cargo_sources_verify_script() {
     for path in "$source_root" "$cargo_home"; do
         [[ "$path" =~ ^/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
     done
-    sources_json=$(_act_validate_unix_cargo_sources_summary "$sources_json") || return 4
+    sources_json=$(_act_validate_cargo_sources_summary "$sources_json") || return 4
     metadata_digest=$(jq -er '.metadata_sha256' <<< "$sources_json") || return 4
     sources_digest=$(jq -er '.sha256' <<< "$sources_json") || return 4
     printf 'set -e\n'
@@ -4604,7 +4604,7 @@ SH
 )"
     summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
     sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
-    _act_validate_unix_cargo_sources_summary "$sources_json" >/dev/null || return 4
+    _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
     jq -ce '
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
             (.cargo_home | type == "string" and startswith("/")) and
@@ -4726,6 +4726,40 @@ _act_windows_cargo_context_runtime() {
     cat "$module"
 }
 
+_act_windows_cargo_sources_runtime() {
+    local module
+    module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cargo_sources_windows.ps1"
+    [[ -f "$module" && ! -L "$module" ]] || return 3
+    cat "$module"
+}
+
+# Requires the Windows cache and source runtimes. The controller supplies both
+# hashes; a replaced metadata file or source receipt cannot authorize itself.
+# The same body runs before compilation and in independent final admission.
+_act_windows_cargo_sources_verify_body() {
+    local source_root="$1" cargo_home="$2" sources_json="$3" path metadata_digest sources_digest
+    for path in "$source_root" "$cargo_home"; do
+        [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
+    done
+    sources_json=$(_act_validate_cargo_sources_summary "$sources_json") || return 4
+    metadata_digest=$(jq -er '.metadata_sha256' <<< "$sources_json") || return 4
+    sources_digest=$(jq -er '.sha256' <<< "$sources_json") || return 4
+    cat <<EOF
+\$dsrMetadataPath=Join-Path '$cargo_home' '.dsr-cargo-metadata.json'
+\$dsrSourcesPath=Join-Path '$cargo_home' '.dsr-cargo-sources.json'
+if ((Get-DsrCargoSourceFileHash -Path \$dsrMetadataPath) -cne '$metadata_digest' -or
+    (Get-DsrCargoSourceFileHash -Path \$dsrSourcesPath) -cne '$sources_digest') {
+    throw 'Cargo dependency evidence differs from coordinator-held authority'
+}
+\$dsrVerifiedSources=Invoke-DsrCargoSources -Operation verify -MetadataPath \$dsrMetadataPath -ReceiptPath \$dsrSourcesPath -Lockfile (Join-Path '$source_root' 'Cargo.lock') -CargoHome '$cargo_home' -SourceRoot '$source_root' -ExpectedSha256 '$sources_digest'
+if (\$dsrVerifiedSources.sha256 -cne '$sources_digest' -or
+    (Get-DsrCargoSourceFileHash -Path \$dsrMetadataPath) -cne '$metadata_digest' -or
+    (Get-DsrCargoSourceFileHash -Path \$dsrSourcesPath) -cne '$sources_digest') {
+    throw 'Cargo dependency sources differ from coordinator-held authority'
+}
+EOF
+}
+
 # Both metadata and compilation construct their context from the same ordered
 # configured environment. The private home is managed by DSR and wins even
 # over a differently cased configured CARGO_HOME on Windows.
@@ -4791,6 +4825,7 @@ EOF
 _act_windows_cargo_metadata_body() {
     local build_cmd="${1-cargo build}" build_env="${2:-}"
     _act_windows_cargo_context_runtime || return $?
+    _act_windows_cargo_sources_runtime || return $?
     cat <<'POWERSHELL'
 $dsrAncestor=(Get-Item -LiteralPath $dsrPhysicalSource -Force).Parent
 while ($null -ne $dsrAncestor) {
@@ -4821,6 +4856,13 @@ try {
 } finally { $dsrMetadataStream.Dispose() }
 Assert-DsrCargoHome -Path $dsrStrictHome
 Assert-DsrCargoSeed -CargoHome $dsrStrictHome -ExpectedSha256 $dsrPrivateSummary.receipt_sha256
+$dsrMetadataDigest=Get-DsrCargoSourceFileHash -Path $dsrMetadataPath
+$dsrDependencySources=Invoke-DsrCargoSources -Operation capture -MetadataPath $dsrMetadataPath -ReceiptPath (Join-Path $dsrStrictHome '.dsr-cargo-sources.json') -Lockfile (Join-Path $dsrPhysicalSource 'Cargo.lock') -CargoHome $dsrStrictHome -SourceRoot $dsrPhysicalSource
+if ((Get-DsrCargoSourceFileHash -Path $dsrMetadataPath) -cne $dsrMetadataDigest) {
+    throw 'Cargo metadata changed during dependency authentication; seed not admitted'
+}
+$dsrDependencySources.metadata_sha256=$dsrMetadataDigest
+$dsrPrivateSummary.dependency_sources=$dsrDependencySources
 $dsrContextSummary=Write-DsrCargoContextReceipt -Context $dsrContext -Path (Join-Path $dsrStrictHome '.dsr-cargo-context.json')
 $dsrPrivateSummary.cargo_context=$dsrContextSummary
 if ($dsrSeedPending) {
@@ -4831,12 +4873,14 @@ POWERSHELL
 }
 
 _act_prepare_windows_private_cargo_home() {
-    local host="$1" source_root="$2" suffix="$3" build_cmd="${4-cargo build}" build_env="${5:-}" script command summary
+    local host="$1" source_root="$2" suffix="$3" build_cmd="${4-cargo build}" build_env="${5:-}" script command summary sources_json
     script=$(_act_windows_private_cargo_home_script "$source_root" "$suffix") || return $?
     script+=$'\n'"$(_act_windows_cargo_metadata_body "$build_cmd" "$build_env")" || return $?
     script+=$'\n''$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
     command=$(_act_windows_cache_command "$host" "$source_root" "$script") || return $?
     summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
+    sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
+    _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
     jq -ce '
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
             (.cargo_home | type == "string" and test("^[A-Za-z]:/")) and
@@ -4853,8 +4897,9 @@ _act_prepare_windows_private_cargo_home() {
 # The coordinator holds both digests, so changing a retained context receipt
 # cannot authorize a different command, configuration, or compiler environment.
 _act_windows_strict_cargo_build_script() {
+    [[ $# == 8 ]] || return 4
     local source_root="$1" cargo_home="$2" build_cmd="$3" build_env="$4"
-    local fingerprint="$5" receipt_digest="$6" seed_digest="$7" path
+    local fingerprint="$5" receipt_digest="$6" seed_digest="$7" sources_json="$8" path
     source_root="${source_root//\\//}" cargo_home="${cargo_home//\\//}"
     for path in "$source_root" "$cargo_home"; do
         [[ "$path" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$path" != *..* ]] || return 4
@@ -4863,6 +4908,7 @@ _act_windows_strict_cargo_build_script() {
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
     _act_windows_cargo_cache_runtime || return $?
     _act_windows_cargo_context_runtime || return $?
+    _act_windows_cargo_sources_runtime || return $?
     cat <<EOF
 \$ErrorActionPreference='Stop'
 \$dsrSourceGuards=Open-DsrCachePathGuard '$source_root'
@@ -4883,6 +4929,7 @@ while (\$null -ne \$dsrAncestor) {
 }
 EOF
     _act_windows_cargo_context_setup "$build_cmd" "$build_env" || return $?
+    _act_windows_cargo_sources_verify_body "$source_root" "$cargo_home" "$sources_json" || return $?
     cat <<EOF
 Assert-DsrCargoContextReceipt -Context \$dsrContext -Path \$dsrContextPath -Fingerprint '$fingerprint' -ReceiptSha256 '$receipt_digest'
 \$dsrBuildResult=Invoke-DsrCargoContext -Context \$dsrContext -Operation Build
@@ -4928,12 +4975,19 @@ EOF
 }
 
 _act_finish_windows_private_cargo_home() {
-    local host="$1" cargo_home="$2" seed_digest="$3" script command summary
+    [[ $# == 3 || $# == 5 ]] || return 4
+    local host="$1" cargo_home="$2" seed_digest="$3" script command summary source_verification
     [[ "$cargo_home" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$cargo_home" != *..* &&
        "$seed_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
     script=$(_act_windows_cargo_cache_runtime) || return $?
+    script+=$'\n'"\$ErrorActionPreference='Stop'"
+    if [[ $# == 5 ]]; then
+        source_verification=$(_act_windows_cargo_sources_runtime) || return $?
+        script+=$'\n'"$source_verification"
+        source_verification=$(_act_windows_cargo_sources_verify_body "$4" "$cargo_home" "$5") || return $?
+        script+=$'\n'"$source_verification"
+    fi
     script+=$'\n'"$(cat <<EOF
-\$ErrorActionPreference='Stop'
 Assert-DsrCargoHome -Path '$cargo_home'
 Assert-DsrCargoSeed -CargoHome '$cargo_home' -ExpectedSha256 '$seed_digest'
 \$dsrFinal=Invoke-DsrCargoCache -Operation inventory -First '$cargo_home' -Second '$cargo_home.final.json'
@@ -8150,6 +8204,13 @@ act_run_native_build() {
             return 4
         fi
         strict_private_cargo_cache=true
+        if ! strict_dependency_sources_json=$(jq -ce '.dependency_sources' <<< "$strict_cargo_seed_json") || \
+           ! strict_dependency_sources_json=$(_act_validate_cargo_sources_summary "$strict_dependency_sources_json"); then
+            _log_error "Strict Cargo dependency sources lack lockfile-authenticated authority"
+            jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo dependency authentication failed"}'
+            return 4
+        fi
+        strict_cargo_seed_json=$(jq -c 'del(.dependency_sources)' <<< "$strict_cargo_seed_json") || return 4
         if _act_is_windows_host "$host"; then
             strict_cargo_context_json=$(jq -ce '.cargo_context | select(
                 type == "object" and .schema_version == 1 and
@@ -8157,13 +8218,6 @@ act_run_native_build() {
                 (.receipt_sha256 | test("^[0-9a-f]{64}$")))' <<< "$strict_cargo_seed_json") || return 4
             strict_cargo_seed_json=$(jq -c 'del(.cargo_context)' <<< "$strict_cargo_seed_json") || return 4
         else
-            if ! strict_dependency_sources_json=$(jq -ce '.dependency_sources' <<< "$strict_cargo_seed_json") || \
-               ! strict_dependency_sources_json=$(_act_validate_unix_cargo_sources_summary "$strict_dependency_sources_json"); then
-                _log_error "Strict Cargo dependency sources lack lockfile-authenticated authority"
-                jq -nc '{status: "error", exit_code: 4, error: "Strict Cargo dependency authentication failed"}'
-                return 4
-            fi
-            strict_cargo_seed_json=$(jq -c 'del(.dependency_sources)' <<< "$strict_cargo_seed_json") || return 4
             # Per-attempt toolchain identity receipt beside the snapshot; the
             # snapshot itself must stay byte-identical.
             strict_toolchain_receipt="${remote_path%/*}/.dsr-toolchain-${platform//\//-}-${cargo_attempt//-/}.json"
@@ -8559,7 +8613,8 @@ act_run_native_build() {
             context_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || return 4
             windows_build_body=$(_act_windows_strict_cargo_build_script \
                 "$remote_path" "$strict_cargo_home" "$build_cmd" "$build_env" \
-                "$context_fingerprint" "$context_receipt_digest" "$context_seed_digest") || return 4
+                "$context_fingerprint" "$context_receipt_digest" "$context_seed_digest" \
+                "$strict_dependency_sources_json") || return 4
         elif $nonstrict_rust_isolate; then
             local win_stage_root win_source_root win_cargo_home
             win_stage_root=$(_act_windows_cmd_path "$nonstrict_stage_root") || return 4
@@ -8896,9 +8951,7 @@ EOF
         local strict_cargo_final_json strict_cargo_seed_digest
         strict_cargo_seed_digest=$(jq -er '.receipt_sha256' <<< "$strict_cargo_seed_json") || exit_code=4
         local strict_cargo_finish_args=("$host" "$strict_cargo_home" "$strict_cargo_seed_digest")
-        if ! _act_is_windows_host "$host"; then
-            strict_cargo_finish_args+=("$remote_path" "$strict_dependency_sources_json")
-        fi
+        strict_cargo_finish_args+=("$remote_path" "$strict_dependency_sources_json")
         if [[ $exit_code -eq 0 ]] && \
            strict_cargo_final_json=$("$cargo_finish" "${strict_cargo_finish_args[@]}"); then
             cargo_isolation_json=$(jq --argjson final "$strict_cargo_final_json" \

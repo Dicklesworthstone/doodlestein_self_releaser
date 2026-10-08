@@ -330,7 +330,7 @@
     },
     "cargo_dependency_sources": {
       "type": "object",
-      "description": "The authenticated resolved workspace dependency closure for a strict native Unix build. The coordinator holds both evidence hashes and requires fresh verification before compilation and artifact collection.",
+      "description": "The authenticated resolved workspace dependency closure for a strict native Unix or Windows build. The coordinator holds both evidence hashes and requires fresh verification before compilation and artifact collection.",
       "required": [
         "schema_version", "kind", "sha256", "metadata_sha256", "package_count",
         "root_count", "file_count", "size_bytes", "authentication"

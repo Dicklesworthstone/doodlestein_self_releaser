@@ -6,9 +6,11 @@ on:
       - src/act_runner.sh
       - src/cargo_cache_windows.ps1
       - src/cargo_context_windows.ps1
+      - src/cargo_sources_windows.ps1
       - schemas/manifest.json
       - scripts/tests/test_cargo_cache_windows.ps1
       - scripts/tests/test_cargo_context_windows.ps1
+      - scripts/tests/test_cargo_sources_windows.ps1
       - .github/workflows/windows-cache-regression.yml
   workflow_dispatch:
 permissions:
@@ -20,10 +22,19 @@ jobs:
   windows-cargo-cache:
     runs-on: windows-2025
     timeout-minutes: 20
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Authenticate locked registry and Git sources with real native Cargo
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./scripts/tests/test_cargo_sources_windows.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify private caches with native NTFS handles and real Cargo
         shell: pwsh
         run: |

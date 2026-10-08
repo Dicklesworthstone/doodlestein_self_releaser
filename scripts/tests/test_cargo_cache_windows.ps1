@@ -25,6 +25,7 @@ if ($script:WindowsHost -and $PortableStorageSemantics) {
 
 . $BackendPath
 . (Join-Path (Split-Path -Parent $BackendPath) 'cargo_context_windows.ps1')
+. (Join-Path (Split-Path -Parent $BackendPath) 'cargo_sources_windows.ps1')
 
 if ($PortableStorageSemantics) {
     if (-not $IsLinux -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'X64') {
@@ -233,6 +234,7 @@ shift
 # its repeated transport embedding, retaining all orchestration code verbatim.
 _act_windows_cargo_cache_runtime() { :; }
 _act_windows_cargo_context_runtime() { :; }
+_act_windows_cargo_sources_runtime() { :; }
 case "$1" in
 metadata)
     _act_windows_private_cargo_home_script "$2" "$3" || exit $?
@@ -618,6 +620,13 @@ try {
     $canonicalSeed = Join-Path $cargoCase '.cargo-home'
     $env:CARGO_HOME = $emptyAmbient
     $failed = Invoke-GeneratedCacheProgram metadata $source 'metadata-cold' -ExpectFailure
+    if ($failed.Code -eq 0 -or $failed.Err -notmatch 'offline') {
+        [Console]::Error.WriteLine('Generated cold metadata exit: ' + $failed.Code)
+        foreach ($field in @('Out','Err')) {
+            $diagnostic = [string]$failed.$field
+            [Console]::Error.WriteLine($field + ': ' + $diagnostic.Substring(0,[Math]::Min(4096,$diagnostic.Length)))
+        }
+    }
     Assert-Check 'generated strict metadata refuses unresolved cold dependencies' ($failed.Code -ne 0 -and $failed.Err -match 'offline')
     Assert-Check 'failed strict metadata never publishes the canonical retained seed' (-not (Test-Path -LiteralPath $canonicalSeed))
     $warmAmbient = Join-Path $cargoCase 'orchestrator-refilled-ambient'

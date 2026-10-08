@@ -376,11 +376,11 @@ _act_ssh_exec() {
         cache_receipt="$cache_home/.dsr-cache-seed.json"
         [[ "$cache_mode" != inventory ]] || cache_receipt="$cache_home.final.json"
         jq -nc --arg home "$cache_home" --arg mode "$cache_mode" --arg receipt "$cache_receipt" \
-            --argjson context "$cache_context" \
+            --argjson context "$cache_context" --argjson sources "$(_test_native_dependency_sources)" \
             '{schema_version:1, mode:$mode, cargo_home:$home, receipt_path:$receipt,
               receipt_sha256:("3" * 64), inventory_sha256:("4" * 64), caches:["git","registry"],
               file_count:2, size_bytes:10}
-             + (if $context then {cargo_context:{schema_version:1,
+             + (if $context then {dependency_sources:$sources,cargo_context:{schema_version:1,
                  fingerprint:("5" * 64),receipt_sha256:("6" * 64)}} else {} end)'
         return 0
     fi
@@ -1501,8 +1501,7 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
           "$cmd" != *"CARGO_HOME=/ambient/cargo-home"* && \
           -z "$scp_args" && "$raw_ssh_args" == *"cat --"* ]] && \
        echo "$result" | jq -e \
-            --arg home "$expected_home" \
-            --argjson sources "$expected_sources" \
+            --arg home "$expected_home" --argjson sources "$expected_sources" \
             '.build_influence_env.CARGO_HOME == $home and
              .cargo_isolation.cache_reuse == [] and
              .cargo_isolation.dependency_cache.mode == "private-copy" and
@@ -1641,7 +1640,7 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
           "$raw_ssh_args" == *"CopyTo"* && \
           "$raw_ssh_args" == *'$output.Dispose()'* ]] && \
        echo "$result" | jq -e \
-            --arg home "$expected_home" \
+            --arg home "$expected_home" --argjson sources "$(_test_native_dependency_sources)" \
             '.build_influence_env.CARGO_HOME == $home and
              ($home | startswith("C:/build/.dsr-release-snapshots/tool-run/.cargo-home-windows-amd64-")) and
              .cargo_isolation.cache_reuse == [] and
@@ -1649,6 +1648,8 @@ test_windows_strict_rust_forces_out_of_snapshot_target_dir() {
              .cargo_isolation.dependency_cache.final.mode == "inventory" and
              .cargo_isolation.cargo_context.fingerprint == ("5" * 64) and
              .cargo_isolation.cargo_context.receipt_sha256 == ("6" * 64) and
+             .cargo_isolation.dependency_sources == $sources and
+             (.cargo_isolation.dependency_cache.seed | has("dependency_sources") | not) and
              (.cargo_isolation.dependency_cache.seed | has("cargo_context") | not) and
              .build_influence_env.RUSTFLAGS == "-C target-feature=+crt-static" and
              .build_influence_env.XWIN_CACHE_DIR == "C:/pinned/xwin-cache-last" and
@@ -1792,6 +1793,95 @@ test_unix_strict_dependency_sources_authority() {
             log_pass "Strict Unix $boundary source authority rejected before process launch"
         else
             log_fail "Strict Unix $boundary evidence reached a process: status=$status"
+        fi
+    done
+}
+
+test_windows_strict_dependency_sources_authority() {
+    log_test "Strict Windows Rust: copied cache receipts cannot replace authenticated sources"
+    local boundary status prepared command
+    for boundary in missing metadata_digest lockfile_digest authentication_counts root_count; do
+        reset_state
+        MOCK_LANGUAGE=rust
+        MOCK_BUILD_CMD='cargo build --release'
+        MOCK_LOCAL_PATH='C:/Users/dsr/projects/tool'
+        prepared="$MOCK_DIR/windows-sources-$boundary-prepared"
+        status=0
+        (
+            _act_prepare_windows_private_cargo_home() {
+                printf 'prepared\n' > "$prepared"
+                jq -nc --argjson sources "$(_test_native_dependency_sources)" --arg boundary "$boundary" '
+                    {schema_version:1,mode:"private-copy",cargo_home:"C:/run/private-home",
+                     receipt_path:"C:/run/private-home/.dsr-cache-seed.json",
+                     receipt_sha256:("1"*64),inventory_sha256:("2"*64),
+                     caches:["git","registry"],file_count:6,size_bytes:256,dependency_sources:$sources,
+                     cargo_context:{schema_version:1,fingerprint:("5"*64),receipt_sha256:("6"*64)}}
+                    | if $boundary == "missing" then del(.dependency_sources)
+                      elif $boundary == "metadata_digest" then .dependency_sources.metadata_sha256 = ("7"*63)
+                      elif $boundary == "lockfile_digest" then del(.dependency_sources.authentication.lockfile_sha256)
+                      elif $boundary == "authentication_counts" then .dependency_sources.authentication.locked_git_packages = 2
+                      else .dependency_sources.root_count = 3 end'
+            }
+            act_run_native_build tool windows/amd64 v1.0.0 \
+                12345678-1234-4234-8234-123456789abc C:/run/source >/dev/null 2>&1
+        ) || status=$?
+        command=$(get_ssh_cmd)
+        if [[ "$status" -eq 4 && -s "$prepared" &&
+              "$command" != *'$dsrBuildResult=Invoke-DsrCargoContext'* ]]; then
+            log_pass "Strict Windows $boundary source authority rejected before compiler launch"
+        else
+            log_fail "Strict Windows $boundary evidence reached a process: status=$status"
+        fi
+    done
+}
+
+test_windows_strict_dependency_sources_final_gate() {
+    log_test "Strict Windows Rust: independent source admission gates artifact collection"
+    local boundary result status finish_args raw_ssh expected_sources source_root command
+    expected_sources=$(_test_native_dependency_sources)
+    source_root=C:/build/windows-source-final/source
+    for boundary in admitted changed; do
+        reset_state
+        MOCK_LANGUAGE=rust
+        MOCK_BUILD_CMD='cargo build --release'
+        MOCK_LOCAL_PATH='C:/Users/dsr/projects/tool'
+        MOCK_SSH_STREAM_FILE="$MOCK_DIR/windows-source-final-$boundary-artifact"
+        MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$MOCK_SSH_STREAM_FILE"
+        finish_args="$MOCK_DIR/windows-source-final-$boundary-arguments.json"
+        status=0
+        result=$(
+            _act_finish_windows_private_cargo_home() {
+                jq -nc --arg host "$1" --arg home "$2" --arg seed "$3" \
+                    --arg source "${4-}" --argjson sources "${5-null}" \
+                    '{host:$host,home:$home,seed:$seed,source:$source,sources:$sources}' > "$finish_args"
+                [[ "$boundary" != changed ]] || return 7
+                jq -nc --arg home "$2" '{schema_version:1,mode:"inventory",cargo_home:$home,
+                    receipt_path:($home + ".final.json"),receipt_sha256:("1"*64),
+                    inventory_sha256:("2"*64),caches:["git","registry"],file_count:6,size_bytes:256}'
+            }
+            act_run_native_build tool windows/amd64 v1.0.0 \
+                12345678-1234-4234-8234-123456789abc "$source_root"
+        ) 2>/dev/null || status=$?
+        raw_ssh=$(get_raw_ssh_args)
+        command=$(get_ssh_cmd)
+        if [[ ! -s "$finish_args" ]] || ! jq -e --arg root "$source_root" --argjson sources "$expected_sources" \
+                '.source == $root and .sources == $sources and .seed == ("3"*64) and
+                 (.home | startswith("C:/build/windows-source-final/.cargo-home-windows-amd64-"))' \
+                "$finish_args" >/dev/null; then
+            log_fail "Strict Windows $boundary finish did not receive held source authority"
+        elif [[ "$boundary" == admitted && "$status" -eq 0 && "$raw_ssh" == *'File]::OpenRead'* &&
+                "$command" == *'Invoke-DsrCargoSources -Operation verify'* ]] && \
+             jq -e --argjson sources "$expected_sources" '.status == "success" and
+                 .cargo_isolation.dependency_sources == $sources and
+                 .cargo_isolation.dependency_cache.final.mode == "inventory"' <<< "$result" >/dev/null; then
+            log_pass "Strict Windows source authority reaches pre-build checks, independent finish, and results"
+        elif [[ "$boundary" == changed && "$status" -ne 0 && -z "$raw_ssh" ]] && \
+             jq -e --argjson sources "$expected_sources" '.status != "success" and
+                 ((.artifact_path // "") == "") and .cargo_isolation.dependency_cache.final == null and
+                 .cargo_isolation.dependency_sources == $sources' <<< "$result" >/dev/null; then
+            log_pass "Independent Windows source refusal prevents collection after remote success"
+        else
+            log_fail "Strict Windows $boundary source finish failed: status=$status result=$result"
         fi
     done
 }
@@ -3399,8 +3489,11 @@ test_windows_private_cache_collection() {
 main() {
     if [[ "${1:-}" == --dependency-sources-only ]]; then
         test_unix_strict_rust_forces_out_of_snapshot_target_dir
+        test_windows_strict_rust_forces_out_of_snapshot_target_dir
         test_unix_strict_dependency_sources_authority
+        test_windows_strict_dependency_sources_authority
         test_unix_strict_dependency_sources_final_gate
+        test_windows_strict_dependency_sources_final_gate
         test_unix_strict_dependency_source_transport_size
         printf 'Native source authority tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
         [[ "$FAIL_COUNT" -eq 0 ]]
@@ -3467,7 +3560,9 @@ main() {
     test_strict_native_source_binding
     test_unix_strict_validation_failure_stops_build
     test_unix_strict_dependency_sources_authority
+    test_windows_strict_dependency_sources_authority
     test_unix_strict_dependency_sources_final_gate
+    test_windows_strict_dependency_sources_final_gate
     test_unix_strict_dependency_source_transport_size
     test_windows_strict_validation_failure_stops_build
     test_strict_collector_keeps_symlink_victim_unchanged
