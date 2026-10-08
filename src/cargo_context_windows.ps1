@@ -407,6 +407,36 @@ function Invoke-DsrCargoToolProbe {
     return $result
 }
 
+function Find-DsrCargoRustupReference {
+    param([string]$SelectedSha256)
+    # These are binary recognition references, never Cargo/rustc lookup or
+    # toolchain selectors. A configured build PATH may hide the installed
+    # manager while its byte-identical proxies remain usable.
+    $native=[Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $name=if ($native) { 'rustup.exe' } else { 'rustup' }
+    $directories=New-Object 'System.Collections.Generic.List[string]'
+    $launcherPath=[Environment]::GetEnvironmentVariable('PATH','Process')
+    if ($launcherPath) {
+        foreach ($directory in $launcherPath.Split([IO.Path]::PathSeparator)) {
+            $directory=$directory.Trim('"')
+            if ($directory -and [IO.Path]::IsPathRooted($directory) -and
+                (-not $native -or $directory -match '^[A-Za-z]:[\\/]')) { $directories.Add($directory) }
+        }
+    }
+    $userProfilePath=[Environment]::GetFolderPath('UserProfile')
+    if ($userProfilePath) { $directories.Add((Join-Path $userProfilePath '.cargo/bin')) }
+    $launcherCargoHome=[Environment]::GetEnvironmentVariable('CARGO_HOME','Process')
+    if ($launcherCargoHome -and [IO.Path]::IsPathRooted($launcherCargoHome) -and
+        (-not $native -or $launcherCargoHome -match '^[A-Za-z]:[\\/]')) { $directories.Add((Join-Path $launcherCargoHome 'bin')) }
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($directory in $directories) {
+        $candidate=Join-Path $directory $name
+        if (-not $seen.Add($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        if ((Get-DsrCargoToolFileHash $candidate) -ceq $SelectedSha256) { return Get-DsrCacheFullPath ([IO.Path]::GetFullPath($candidate)) }
+    }
+    return ''
+}
+
 function Get-DsrCargoExecutableIdentity {
     param($Context,[string]$Program,[string[]]$VersionArguments,[string]$RustupPath='',
         [string]$RustupHash='', [string]$RustupTool='', [switch]$CargoLookup)
@@ -423,28 +453,43 @@ function Get-DsrCargoExecutableIdentity {
     $version=($versionResult.Stdout+$versionResult.Stderr).Trim()
     if (-not $version) { throw ('Executable did not report a version: ' + $selected) }
     $record=@{program=$Program; selected_path=$selected; selected_sha256=$sha; selected_kind='executable'; version=$version}
-    $resolved=$physical; $router=$RustupPath; $routerContext=$Context
+    $resolved=$physical; $router=$RustupPath
     $isRustup=$RustupTool -and $RustupPath -and $sha -ceq $RustupHash
     if ($RustupTool -and -not $isRustup) {
-        # A copied proxy can work without rustup on PATH, or alongside a
-        # different rustup version. Rustup documents FORCE_ARG0 for testing its
-        # multicall dispatch: https://rust-lang.github.io/rustup/dev-guide/tips-and-tricks.html
-        # Use it only in this private identity probe; the
-        # actual version and every build keep the admitted environment.
+        $router=Find-DsrCargoRustupReference -SelectedSha256 $sha
+        $isRustup=[bool]$router
+    }
+    if ($RustupTool -and -not $isRustup) {
+        # FORCE_ARG0 is only a conservative unresolved-dispatch detector.
+        # Native forwarders can relay it, so its output never grants authority.
+        # https://rust-lang.github.io/rustup/dev-guide/tips-and-tricks.html
         $routerEnvironment=New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach ($name in $Context.Environment.Keys) { $routerEnvironment[$name]=$Context.Environment[$name] }
         $routerEnvironment['RUSTUP_FORCE_ARG0']='rustup'
         $routerContext=[pscustomobject]@{SourceRoot=$Context.SourceRoot; CmdPath=$Context.CmdPath;
             Environment=$routerEnvironment; Toolchain=$Context.Toolchain}
         $routerVersion=Invoke-DsrCargoToolProbe -Context $routerContext -Program $selected -Arguments @('--version') -AllowFailure
-        $isRustup=$routerVersion.ExitCode -eq 0 -and $routerVersion.Stdout.Trim() -cmatch '^rustup [0-9]+\.[0-9]+\.[0-9]+(?:[-+ ][^\r\n]*)?$'
-        $router=$selected
+        if ($routerVersion.ExitCode -eq 0 -and $routerVersion.Stdout.Trim() -cmatch '^rustup [0-9]+\.[0-9]+\.[0-9]+(?:[-+ ][^\r\n]*)?$') {
+            throw 'Unresolved Rustup dispatch or opaque native wrapper: no byte-identical manager reference'
+        }
     }
     if ($isRustup) {
         $arguments=@('which')
         if ($Context.Toolchain) { $arguments+=@('--toolchain',$Context.Toolchain) }
         $arguments+=$RustupTool
-        $which=Invoke-DsrCargoToolProbe -Context $routerContext -Program $router -Arguments $arguments
+        $routerPhysical=Resolve-DsrCargoPhysicalToolPath $router
+        if ([IO.Path]::GetFileName($routerPhysical) -inotmatch '^rustup(?:\.exe)?$') { throw 'Rustup manager reference must resolve to a directly named Rustup executable' }
+        $routerGuards=Open-DsrCachePathGuard (([IO.Path]::GetDirectoryName($routerPhysical)).Replace('\','/')); $routerEntry=$null
+        try {
+            $routerEntry=Open-DsrCacheEntry $routerPhysical; $routerBefore=$routerEntry.GetIdentity()
+            if ((Get-DsrCargoToolFileHash $routerPhysical) -cne $sha) { throw 'Rustup manager reference changed before dispatch resolution' }
+            $which=Invoke-DsrCargoToolProbe -Context $Context -Program $routerPhysical -Arguments $arguments
+            if ($routerEntry.GetIdentity() -cne $routerBefore -or (Get-DsrCargoToolFileHash $routerPhysical) -cne $sha) {
+                throw 'Rustup manager reference changed during dispatch resolution'
+            }
+        } finally {
+            if ($null -ne $routerEntry) { $routerEntry.Dispose() }; foreach ($guard in $routerGuards) { $guard.Dispose() }
+        }
         $candidate=$which.Stdout.Trim()
         if (-not [IO.Path]::IsPathRooted($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { throw 'Rustup did not resolve the selected executable' }
         $resolved=Resolve-DsrCargoPhysicalToolPath $candidate

@@ -281,11 +281,15 @@ its dependencies with the selected nightly Cargo instead of the host's default.
 Both operations use the system CMD launcher with the same working directory,
 configured environment, compiler/SDK cleanup, and native-build RCH bypass.
 The admitted context includes the selected Cargo, rustc and linker paths, executable
-SHA-256 hashes, and reported versions. Proven rustup proxies also retain the
-resolved selected-toolchain executables, including copied proxies whose matching
-rustup is absent from PATH. Before dependency metadata, DSR asks the selected
-rustc to perform a small link to identify its default linker, including Visual
-Studio discovery.
+SHA-256 hashes, and reported versions. Rustup proxies also retain the resolved
+selected-toolchain executables. A proxy must match the bytes of a separately
+located Rustup manager; version responses alone cannot establish its identity.
+A matching host installation reference can recognize copied proxies when the
+configured build PATH hides their manager. This reference never replaces the
+Cargo or compiler selected for the build. An unrecognized program cannot claim
+Rustup resolution evidence; explicit `+toolchain` commands require that evidence.
+Before dependency metadata, DSR asks the selected rustc to perform a small link
+to identify its default linker, including Visual Studio discovery.
 These identities are checked around metadata and compilation and again in the
 independent collection step. Changing a tool, command, relevant environment,
 Cargo configuration, or toolchain selection file prevents artifact collection,
@@ -313,6 +317,9 @@ configuration path relative to the project. A default Windows linker that
 rustc cannot identify with an absolute path also requires explicit configuration.
 Hosts using a nondefault rustup installation must configure `RUSTUP_HOME`
 explicitly. Toolchain probe files are retained beside the private Cargo home.
+These measurements cover native executable entry points and recognized Rustup
+dispatch. The host's native executables remain trusted to honor their arguments
+and selectors; DSR does not infer every subprocess inside a custom executable.
 
 Resume verifies the retained seed inventory before copying it. Changes to seed
 bytes or unsafe cache entries are refused; a legacy snapshot whose cache roots

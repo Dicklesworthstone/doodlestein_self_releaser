@@ -280,6 +280,65 @@ try {
     Check 'genuine direct Cargo and compiler executables remain supported without Rustup dispatch' (
         $directContext.ToolchainIdentity.tools.cargo.selected_sha256 -ceq $identity.tools.cargo.resolved_sha256 -and
         $directContext.ToolchainIdentity.tools.rustc.selected_sha256 -ceq $identity.tools.rustc.resolved_sha256)
+    # Compile a real native forwarding entrypoint. Its child can report real
+    # Rustup version/which output, but those observations cannot prove that
+    # the selected bytes themselves are an installed Rustup manager.
+    $forwarderDirectory=Join-Path $work 'unrecognized-native-forwarder'
+    $forwarderSource=Join-Path $forwarderDirectory 'forwarder.rs'
+    Write-Text $forwarderSource @'
+use std::{env, process::{Command, exit}};
+#[cfg(unix)] use std::os::unix::process::CommandExt;
+fn main() {
+    let mut command = Command::new(env::var_os("DSR_REAL_TOOL").expect("real tool"));
+    #[cfg(unix)]
+    if env::var_os("DSR_PRESERVE_ARG0").is_some() {
+        command.arg0(env::args_os().next().expect("argv0"));
+    }
+    let status = command.args(env::args_os().skip(1)).status().expect("child");
+    exit(status.code().unwrap_or(1));
+}
+'@
+    $forwarderCargo=Join-Path $forwarderDirectory ('cargo'+$extension)
+    $null=Invoke-Exe $realRustc @($forwarderSource,'-o',$forwarderCargo)
+    $forwarderRustc=Join-Path $forwarderDirectory ('rustc'+$extension)
+    $forwarderRustup=Join-Path $forwarderDirectory ('rustup'+$extension)
+    foreach ($copy in @($forwarderRustc,$forwarderRustup)) {
+        [IO.File]::Copy($forwarderCargo,$copy)
+        if (-not $script:WindowsHost) { [IO.File]::SetUnixFileMode($copy,[IO.File]::GetUnixFileMode($forwarderCargo)) }
+    }
+    $forwarderEnvironment=$isolatedEnvironment+"DSR_REAL_TOOL=$proxyCargo"
+    $probeEnvironment=New-DsrCargoContextEnvironment -CargoHome $privateHome -Environment $forwarderEnvironment
+    $forwarderProbe=[pscustomobject]@{SourceRoot=$source; CmdPath=$context.CmdPath; Environment=$probeEnvironment.Environment}
+    $forwardedVersion=Invoke-DsrCargoToolProbe -Context $forwarderProbe -Program $forwarderCargo -Arguments @('--version')
+    Check 'the compiled Cargo forwarder genuinely invokes the selected Cargo toolchain' ($forwardedVersion.Stdout -match '^cargo ')
+    foreach ($selector in @('', '+dsr-context-selected ')) {
+        Refused ('unrecognized native Cargo cannot claim Rustup resolution with selector ['+$selector.Trim()+']') {
+            New-DsrCargoContext -BuildCommand ('"'+$forwarderCargo+'" '+$selector+'build --locked --offline') `
+                -SourceRoot $source -CargoHome $privateHome -Environment $forwarderEnvironment
+        } 'Unresolved Rustup dispatch|proven rustup Cargo proxy'
+    }
+    $compilerForwarderEnvironment=$isolatedEnvironment+@("RUSTC=$forwarderRustc",('DSR_REAL_TOOL='+ (Join-Path $isolatedBin ('rustc'+$extension))))
+    Refused 'a native compiler forwarding Rustup cannot receive selected-only compiler evidence' {
+        New-DsrCargoContext -BuildCommand $isolatedCommand -SourceRoot $source -CargoHome $privateHome -Environment $compilerForwarderEnvironment
+    } 'Unresolved Rustup dispatch'
+    if (-not $script:WindowsHost) {
+        $aliasEnvironment=$forwarderEnvironment+'DSR_PRESERVE_ARG0=1'
+        $aliasProbeEnvironment=New-DsrCargoContextEnvironment -CargoHome $privateHome -Environment $aliasEnvironment
+        $aliasProbe=[pscustomobject]@{SourceRoot=$source; CmdPath=$context.CmdPath; Environment=$aliasProbeEnvironment.Environment}
+        $aliasVersion=Invoke-DsrCargoToolProbe -Context $aliasProbe -Program $forwarderRustup -Arguments @('--version')
+        $aliasWhich=Invoke-DsrCargoToolProbe -Context $aliasProbe -Program $forwarderRustup -Arguments @('which','cargo')
+        Check 'a byte-identical forwarding Rustup alias can mimic manager behavior without manager bytes' (
+            $aliasVersion.Stdout -match '^rustup ' -and
+            (Resolve-DsrCargoPhysicalToolPath $aliasWhich.Stdout.Trim()) -ceq (Resolve-DsrCargoPhysicalToolPath $realCargo) -and
+            (Get-DsrCargoToolFileHash $forwarderRustup) -ceq (Get-DsrCargoToolFileHash $forwarderCargo) -and
+            (Get-DsrCargoToolFileHash $forwarderRustup) -cne (Get-DsrCargoToolFileHash $rustup))
+        foreach ($selector in @('', '+dsr-context-selected ')) {
+            Refused ('a matching sibling forwarding Rustup cannot authorize Cargo with selector ['+$selector.Trim()+']') {
+                New-DsrCargoContext -BuildCommand ('"'+$forwarderCargo+'" '+$selector+'build --locked --offline') `
+                    -SourceRoot $source -CargoHome $privateHome -Environment $aliasEnvironment
+            } 'Unresolved Rustup dispatch|proven rustup Cargo proxy'
+        }
+    }
     $metadata = Invoke-ContextChecked $context Metadata
     $metadataJson = ConvertFrom-Json $metadata.Stdout
     Check 'real selected Cargo metadata includes the optional source dependency' (@($metadataJson.packages | Where-Object name -eq 'closure-dependency').Count -eq 1)

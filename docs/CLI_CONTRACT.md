@@ -782,9 +782,17 @@ state and `build_environments[].cargo_isolation.cargo_context`.
 
 `cargo_isolation.toolchain` retains the selected Cargo, rustc and linker paths,
 SHA-256 hashes, executable kinds and reported versions, selected target, rustup
-selection and tracked Cargo configuration hashes. Proven rustup proxies also
-retain their resolved executable paths and hashes, including copied proxies
-without a matching rustup on PATH. The full identity is part of
+selection and tracked Cargo configuration hashes. Rustup proxies also retain
+their resolved executable paths and hashes. A selected proxy must be byte-identical
+to a separately located Rustup manager. A matching host installation reference
+can recognize a copied proxy whose manager is hidden by the configured build
+PATH; reference discovery does not alter executable lookup for the build.
+Version responses or a renamed copy cannot independently prove Rustup identity.
+A sibling copy named `rustup` alone is not a host installation reference.
+The manager's resolved file must also be named `rustup` or `rustup.exe` so its
+own program name selects manager dispatch. An unrecognized program cannot claim
+Rustup resolution evidence, and explicit `+toolchain` commands require that
+evidence before dependency admission. The full identity is part of
 the retained context receipt and survives public build JSON, completed state
 and manifest projection. Windows paths use drive-qualified `C:/...` spelling.
 An absent or malformed executable identity refuses project compilation. Before
@@ -806,8 +814,11 @@ ambiguous compiler lookup locations are refused. Configured
 `RUSTUP_FORCE_ARG0` dispatch overrides are refused. Configure a nondefault
 `RUSTUP_HOME` explicitly instead of relying on an ambient Rust selector.
 Evidence consists of selected Cargo, compiler and linker file hashes, versions,
-and probe results. The native host remains trusted for launching those files,
-loaded libraries and other subprocesses.
+and probe results, including recognized Rustup dispatch. The native host remains
+trusted for launching those files; native executables remain trusted to honor
+their arguments and selectors. Their complete loaded-library and subprocess
+graphs, including forwarding hidden inside custom native executables, are not
+measured.
 These receipts assume the native host honestly executes DSR.
 
 On Unix hosts, strict Rust

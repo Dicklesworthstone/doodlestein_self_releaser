@@ -736,7 +736,18 @@ try {
     } finally { Write-FixtureText $sourceLock $sourceLockText }
     Write-FixtureText (Join-Path $preparedSummary.cargo_home 'config.toml') '[build]'
     $failed = Invoke-GeneratedCacheProgram finish $preparedSummary.cargo_home $preparedSummary.receipt_sha256 -SourceRoot $source -Admission $preparedSummary -ExpectFailure
-    Assert-Check 'generated finish refuses injected Cargo configuration before collection' ($failed.Code -ne 0 -and $failed.Err -match 'configuration|credentials')
+    $configurationRefused = $failed.Code -ne 0 -and $failed.Err -match 'configuration|credentials|Admitted Windows Cargo context changed'
+    if (-not $configurationRefused) {
+        [Console]::Error.WriteLine('Generated configuration refusal exit: ' + $failed.Code)
+        foreach ($field in @('Out','Err')) {
+            $diagnostic = [string]$failed.$field
+            [Console]::Error.WriteLine($field + ': ' + $diagnostic.Substring(0,[Math]::Min(4096,$diagnostic.Length)))
+        }
+    }
+    Assert-Check 'generated finish refuses injected Cargo configuration before collection' $configurationRefused
+    Assert-Check 'configuration refusal preserves the published final receipt and admits no new inventory' (
+        (Get-Digest $completedSummary.receipt_path) -ceq $completedSummary.receipt_sha256 -and
+        -not (Test-Path -LiteralPath ($preparedSummary.cargo_home + '.final.json')))
     $canonicalEntry = Get-ChildItem -LiteralPath (Join-Path $canonicalSeed 'git/db') -Filter HEAD -File -Recurse | Select-Object -First 1
     Write-FixtureText $canonicalEntry.FullName 'retained download seed was changed'
     $failed = Invoke-GeneratedCacheProgram metadata $source 'metadata-drift' -ExpectFailure
