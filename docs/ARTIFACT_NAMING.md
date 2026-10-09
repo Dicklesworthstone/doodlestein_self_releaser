@@ -39,6 +39,31 @@ sidecars, and invalid configuration are errors. A `.tar.xz` name cannot be
 returned for a gzip writer or vice versa. `.tgz` and `.tar.gz` both designate
 gzip; ZIP and raw binary names are handled explicitly.
 
+For a native Rust platform with multiple configured target triples, each exact
+primary is keyed by `platform@triple`, for example:
+
+```yaml
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64@x86_64-unknown-linux-gnu: example-standard.tar.gz
+    linux/amd64@x86_64-unknown-linux-musl: example-static.tar.xz
+```
+
+A singleton retains its physical platform key. The configuration must name
+every variant exactly once and cannot mix qualified and unqualified entries
+for the same platform. A naming request for a multi-variant platform must
+select a configured triple; the resolver never chooses a primary implicitly.
+Exact names keep their literal spelling even when they contain no GNU/musl
+marker. Their selected triple is carried in the manifest, and each exact
+extension controls that variant's writer. The native caller passes its
+selected triple as the eighth argument to
+`artifact_naming_generate_dual_for_tool`, or uses
+`artifact_naming_generate_dual_for_variant`.
+
 A closed release contract does not authorize extra inferred installer aliases.
 The existing dual-name result therefore returns the same exact primary in
 `versioned` and `compat`, with `same: true`. This does not create aliases listed
@@ -173,13 +198,14 @@ request, and never retries another libc after checksum, signature, extraction,
 or binary-selection failure. Offline fallback follows the same policy and reads
 only the selected variant's verified cache entry.
 
-Ordinary native Rust builds run each configured GNU/musl variant as an
+Native Rust builds run each configured GNU/musl variant as an
 independent task, with separate staging, Cargo homes, outputs and attempt
 receipts. Resume verifies completed variants independently and retries only
 unfinished tasks; it also binds the ordered task list and repository
 configuration, so changing the configured matrix requires a new run. The
-platform remains `linux/amd64` for routing. A strict `release_contract` continues
-to admit one primary per platform.
+platform remains `linux/amd64` for routing. A strict `release_contract` uses the
+qualified exact-name keys above and requires the complete variant inventory
+before publication.
 
 `scripts/tests/test_native_variants.sh` builds and executes both real Rust libc
 variants through native scheduling, resume and the production build command.

@@ -3068,7 +3068,7 @@ EOF
         [[ -z "$src" || ! -f "$src" ]] && return 0
 
         name=$(basename "$src")
-        if [[ "$native_result" == true ]]; then
+        if [[ "$native_result" == true ]] && ! $build_release_contract_enabled; then
             if ! name=$(_act_native_variant_artifact_name "$tool_name" "$target" "$target_triple" "$name"); then
                 log_error "Native artifact disagrees with its build variant: $src"
                 collect_failed=true
@@ -5120,6 +5120,8 @@ _release_contract_preflight() {
     }
 
     local expected_count base_additional_json base_additional_count expected_manifest_count
+    local contract_targets_json
+    contract_targets_json=$(_act_contract_target_rows "$tool_name" "$contract_json") || return 4
     expected_count=$(jq -r '.exact_primary_assets | length' <<< "$contract_json")
     base_additional_json=$(jq -c '
         [(.exact_additional_assets // [])[] |
@@ -5144,6 +5146,7 @@ _release_contract_preflight() {
         --argjson expected_manifest_count "$expected_manifest_count" \
         --argjson base_additional "$base_additional_json" \
         --argjson expected_dependencies "$expected_dependencies_json" \
+        --argjson identities "$contract_targets_json" \
         --argjson contract "$contract_json" '
         .tool == $tool and
         .version == $tag and
@@ -5159,8 +5162,10 @@ _release_contract_preflight() {
         (.artifacts | type == "array") and
         (.artifacts | length == $expected_manifest_count) and
         ([.artifacts[].name] | unique | length) == $expected_manifest_count and
-        ([.artifacts[] | select(.target != "additional") |
-          {key: .target, value: .name}] | from_entries) ==
+        ([.artifacts[] | select(.target != "additional") | . as $artifact |
+          $identities[] | select(.platform == $artifact.target and
+            ((.require_triple | not) or .target_triple == $artifact.target_triple)) |
+          {key: .key, value: $artifact.name}] | from_entries) ==
             $contract.exact_primary_assets and
         ([.artifacts[] | select(.target == "additional") | .name] | sort) ==
             $base_additional and
@@ -5174,19 +5179,25 @@ _release_contract_preflight() {
         log_error "Build manifest does not satisfy the exact release contract"
         return 4
     fi
+    local strict_manifest_json
+    strict_manifest_json=$(jq -c '.' "$manifest_file") || return 4
+    _act_validate_contract_variant_inventory "$tool_name" "$strict_manifest_json" "$contract_json" || return 4
 
     local -a primary_targets=()
+    local -a primary_triples=()
     local -a primary_names=()
     local -a primary_paths=()
     local -a primary_shas=()
     local -a primary_sizes=()
-    local target name manifest_sha manifest_size file_path actual_sha actual_size
+    local target target_key target_triple name manifest_sha manifest_size file_path actual_sha actual_size
 
-    while IFS=$'\t' read -r target name; do
-        [[ -n "$target" && -n "$name" ]] || {
+    while IFS=$'\t' read -r target_key name; do
+        [[ -n "$target_key" && -n "$name" ]] || {
             log_error "Release contract contains an empty target or primary asset"
             return 4
         }
+        target=$(jq -er --arg key "$target_key" '.[] | select(.key == $key) | .platform' \
+            <<< "$contract_targets_json") || return 4
 
         file_path="$artifacts_dir/$name"
         if [[ ! -f "$file_path" || -L "$file_path" ]]; then
@@ -5194,10 +5205,14 @@ _release_contract_preflight() {
             return 4
         fi
 
-        manifest_sha=$(jq -r --arg target "$target" --arg name "$name" \
-            '.artifacts[] | select(.target == $target and .name == $name) | .sha256' "$manifest_file")
-        manifest_size=$(jq -r --arg target "$target" --arg name "$name" \
-            '.artifacts[] | select(.target == $target and .name == $name) | .size_bytes' "$manifest_file")
+        # Exact inventory validation above binds this unique name to its
+        # physical platform and selected compiler target.
+        manifest_sha=$(jq -r --arg name "$name" \
+            '.artifacts[] | select(.name == $name) | .sha256' "$manifest_file")
+        manifest_size=$(jq -r --arg name "$name" \
+            '.artifacts[] | select(.name == $name) | .size_bytes' "$manifest_file")
+        target_triple=$(jq -er --arg name "$name" \
+            '.artifacts[] | select(.name == $name) | .target_triple // "" | strings' "$manifest_file") || return 4
         actual_sha=$(_release_sha256 "$file_path") || {
             log_error "Could not compute SHA256 for primary asset: $file_path"
             return 4
@@ -5213,6 +5228,7 @@ _release_contract_preflight() {
         fi
 
         primary_targets+=("$target")
+        primary_triples+=("$target_triple")
         primary_names+=("$name")
         primary_paths+=("$file_path")
         primary_shas+=("$actual_sha")
@@ -5369,6 +5385,7 @@ _release_contract_preflight() {
     for ((idx = 0; idx < ${#primary_names[@]}; idx++)); do
         name="${primary_names[$idx]}"
         target="${primary_targets[$idx]}"
+        target_triple="${primary_triples[$idx]}"
         file_path="${primary_paths[$idx]}"
         actual_sha="${primary_shas[$idx]}"
         actual_size="${primary_sizes[$idx]}"
@@ -5402,19 +5419,23 @@ _release_contract_preflight() {
 
         planned_assets+=("$(jq -nc \
             --arg target "$target" \
+            --arg target_triple "$target_triple" \
             --arg name "$name" \
             --arg path "$file_path" \
             --arg sha256 "$actual_sha" \
             --argjson size_bytes "$actual_size" \
-            '{target: $target, name: $name, path: $path, sha256: $sha256, size_bytes: $size_bytes, kind: "primary"}')")
+            '{target: $target, name: $name, path: $path, sha256: $sha256, size_bytes: $size_bytes, kind: "primary"} +
+             (if $target_triple == "" then {} else {target_triple: $target_triple} end)')")
         planned_assets+=("$(jq -nc \
             --arg target "$target" \
+            --arg target_triple "$target_triple" \
             --arg name "${name}.sha256" \
             --arg path "$sidecar" \
             --arg sha256 "$sidecar_sha" \
             --arg source_sha256 "$actual_sha" \
             --argjson size_bytes "$sidecar_size" \
-            '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, size_bytes: $size_bytes, kind: "checksum"}')")
+            '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, size_bytes: $size_bytes, kind: "checksum"} +
+             (if $target_triple == "" then {} else {target_triple: $target_triple} end)')")
 
         if [[ -n "$minisign_public_key_file" ]]; then
             signature="${file_path}.minisig"
@@ -5449,6 +5470,7 @@ _release_contract_preflight() {
             signature_size=$(_release_file_size "$signature") || return 4
             planned_assets+=("$(jq -nc \
                 --arg target "$target" \
+                --arg target_triple "$target_triple" \
                 --arg name "${name}.minisig" \
                 --arg path "$signature" \
                 --arg sha256 "$signature_sha" \
@@ -5456,7 +5478,8 @@ _release_contract_preflight() {
                 --arg public_key_sha256 "$minisign_public_key_sha256" \
                 --arg public_key_token "$minisign_public_key_token" \
                 --argjson size_bytes "$signature_size" \
-                '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, public_key_sha256: $public_key_sha256, public_key_token: $public_key_token, size_bytes: $size_bytes, kind: "minisign"}')")
+                '{target: $target, name: $name, path: $path, sha256: $sha256, source_sha256: $source_sha256, public_key_sha256: $public_key_sha256, public_key_token: $public_key_token, size_bytes: $size_bytes, kind: "minisign"} +
+                 (if $target_triple == "" then {} else {target_triple: $target_triple} end)')")
         fi
     done
 

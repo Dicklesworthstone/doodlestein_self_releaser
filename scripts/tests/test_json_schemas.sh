@@ -274,7 +274,8 @@ test_xwin_manifest_schema() {
     # Without them, these are explicitly structural protocol fixtures, not
     # claims of compiler execution. The real source-pinned runner tests retain
     # manifests that can be supplied unchanged through this same validator.
-    if python3 - "$SCHEMAS_DIR/manifest.json" "${DSR_XWIN_SCHEMA_MANIFESTS:-}" "${DSR_XWIN_SCHEMA_PACKAGED_MANIFESTS:-}" <<'PY'
+    if python3 - "$SCHEMAS_DIR/manifest.json" "${DSR_XWIN_SCHEMA_MANIFESTS:-}" \
+        "${DSR_XWIN_SCHEMA_PACKAGED_MANIFESTS:-}" "${DSR_NATIVE_SCHEMA_MANIFESTS:-}" <<'PY'
 import copy
 import json
 from pathlib import Path
@@ -414,6 +415,41 @@ for path in [Path(p) for p in sys.argv[3].splitlines() if p]:
     asset = changed["artifacts"][0]
     asset["target_triple"] = "aarch64-pc-windows-msvc" if asset["target"] == "windows/amd64" else "x86_64-pc-windows-msvc"
     check("packaged artifact cannot declare another platform's triple", changed, False)
+
+# Native strict collection has always used an explicit additional-asset role
+# for shared companions. This is an artifact role, never a compiler platform;
+# neither environment targets nor requested_targets gain an escape hatch.
+companion = protocol_fixture("windows/amd64", "x86_64-pc-windows-msvc")
+companion["artifacts"].append(dict(name="release-notes.txt",target="additional",
+    sha256=digest,size_bytes=38,archive_format="binary"))
+companions = [("explicit structural companion fixture", companion)]
+for path in [Path(p) for p in sys.argv[4].splitlines() if p]:
+    value = json.loads(path.read_text())
+    check("actual sealed native producer manifest " + str(path), value)
+    if any(asset["target"] == "additional" for asset in value["artifacts"]):
+        companions.append(("actual shared companion " + str(path), value))
+for label, value in companions:
+    check(label, value)
+    index = next(i for i, asset in enumerate(value["artifacts"]) if asset["target"] == "additional")
+    for problem, field, replacement in (
+        ("misspelled additional target", "target", "additionals"),
+        ("task key in physical target", "target", "linux/amd64@x86_64-unknown-linux-gnu"),
+        ("compiler triple on companion", "target_triple", "x86_64-unknown-linux-gnu"),
+        ("null compiler triple on companion", "target_triple", None),
+        ("missing byte digest", "sha256", ""),
+        ("empty companion", "size_bytes", 0),
+        ("unsafe companion name", "name", "../release-notes.txt"),
+        ("checksum as companion payload", "name", "release-notes.txt.sha256"),
+    ):
+        changed = copy.deepcopy(value)
+        changed["artifacts"][index][field] = replacement
+        check(label + " refuses " + problem, changed, False)
+    changed = copy.deepcopy(value)
+    changed["build_environments"][0]["target"] = "additional"
+    check(label + " cannot make additional a compiler platform", changed, False)
+    changed = copy.deepcopy(value)
+    changed["requested_targets"] = ["additional"]
+    check(label + " cannot request an additional platform", changed, False)
 
 # Resolve only the environment profile without inheriting top-level required fields.
 native_validator = Draft202012Validator({"$schema":schema["$schema"],"$defs":schema["$defs"],

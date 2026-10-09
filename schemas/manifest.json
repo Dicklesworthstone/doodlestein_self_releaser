@@ -748,6 +748,10 @@
         {
           "if": {"required": ["target_triple"], "properties": {"target_triple": {"const": "aarch64-pc-windows-msvc"}}},
           "then": {"properties": {"target": {"const": "windows/arm64"}}}
+        },
+        {
+          "if": {"required": ["target"], "properties": {"target": {"const": "additional"}}},
+          "then": {"not": {"required": ["target_triple"]}}
         }
       ],
       "properties": {
@@ -772,8 +776,11 @@
         },
         "target": {
           "type": "string",
-          "description": "Target platform in os/arch format",
-          "pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"
+          "description": "Physical target platform, or an additional release asset shared across build targets",
+          "oneOf": [
+            {"pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"},
+            {"const": "additional"}
+          ]
         },
         "target_triple": {
           "type": "string",

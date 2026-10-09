@@ -218,12 +218,14 @@ _act_workspace_archive_format() {
     local target_os="${platform%%/*}"
     local format="" config_json
     local purpose="${3:-${build_purpose:-release}}"
+    local selected_triple="${4:-${_ACT_STRICT_TARGET_TRIPLE:-}}"
 
     [[ "$purpose" == release || "$purpose" == diagnostic-native ]] || return 4
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     command -v yq &>/dev/null && command -v jq &>/dev/null || return 3
     config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || return 4
-    format=$(jq -ers --arg os "$target_os" --arg target "$platform" --arg purpose "$purpose" '
+    format=$(jq -ers --arg os "$target_os" --arg target "$platform" --arg purpose "$purpose" \
+        --arg triple "$selected_triple" '
         def compression:
             if endswith(".tar.gz") or endswith(".tgz") then "tar.gz"
             elif endswith(".tar.xz") then "tar.xz"
@@ -237,8 +239,14 @@ _act_workspace_archive_format() {
          else error("archive_format must be a string or OS mapping") end) as $configured |
         (if ($configured | type) != "string" then error("invalid archive format")
          elif $configured == "tgz" then "tar.gz" else $configured end) as $format |
-        (if $purpose == "release" then (.release_contract.exact_primary_assets[$target] // "")
-         else "" end) as $primary |
+        (if $purpose != "release" or .release_contract == null then ""
+         else .release_contract.exact_primary_assets as $assets |
+             if ($assets | type) != "object" then error("invalid release archive contract")
+             elif ($assets | has($target)) then $assets[$target]
+             elif $triple != "" and ($assets | has($target + "@" + $triple))
+             then $assets[$target + "@" + $triple]
+             else error("missing selected exact primary") end
+         end) as $primary |
         (if ($primary | type) == "string" then ($primary | compression)
          else error("invalid exact primary name") end) as $required |
         if $format != "" and $required != "" and $format != $required
@@ -270,10 +278,12 @@ _act_workspace_archive_format() {
 _act_workspace_binaries_for_target() {
     local config_file="$1" target="$2" config_json selected binary normalized
     local purpose="${3:-${build_purpose:-release}}"
+    local selected_triple="${4:-${_ACT_STRICT_TARGET_TRIPLE:-}}"
     [[ "$purpose" == release || "$purpose" == diagnostic-native ]] || return 4
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || return 4
-    selected=$(jq -ces --arg target "$target" --arg purpose "$purpose" '
+    selected=$(jq -ces --arg target "$target" --arg purpose "$purpose" \
+        --arg triple "$selected_triple" '
         def names: type == "array" and all(.[];
             type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$")
             and (contains("\n") | not));
@@ -294,7 +304,10 @@ _act_workspace_binaries_for_target() {
             elif (.release_contract | type) != "object" or
                  (.release_contract.exact_primary_assets | type) != "object"
             then error("invalid release archive contract")
-            else .release_contract.exact_primary_assets[$target] as $primary |
+            else .release_contract.exact_primary_assets as $assets |
+                (if ($assets | has($target)) then $assets[$target]
+                 elif $triple != "" then $assets[$target + "@" + $triple]
+                 else null end) as $primary |
                 if ($primary | type) != "string" then error("missing exact primary for target")
                 elif ($primary | test("\\.(tar\\.gz|tgz|tar\\.xz|zip)$")) then
                     [.binary_name] | if names then . else error("archive requires binary_name") end
@@ -1287,8 +1300,14 @@ _act_stage_contract_primary() {
     local result_json="$5"
     local contract_json="$6"
 
-    local expected_name
-    expected_name=$(jq -r --arg target "$target" '.exact_primary_assets[$target] // empty' <<< "$contract_json")
+    local expected_name contract_key
+    # Archive validators use the same selected variant as the native receipt.
+    # Keep this context local so it cannot escape to another matrix worker.
+    local _ACT_STRICT_TARGET_TRIPLE
+    _ACT_STRICT_TARGET_TRIPLE=$(jq -er '.target_triple // "" | strings' <<< "$result_json") || return 4
+    contract_key=$(config_get_release_contract_target_key \
+        "$tool_name" "$target" "$_ACT_STRICT_TARGET_TRIPLE") || return 4
+    expected_name=$(jq -r --arg target "$contract_key" '.exact_primary_assets[$target] // empty' <<< "$contract_json")
     if ! _act_is_safe_basename "$expected_name"; then
         _log_error "Unsafe or missing release asset basename for $target"
         return 4
@@ -1396,7 +1415,7 @@ _act_stage_contract_primary() {
         return 4
     fi
 
-    local target_slug="${target//\//-}"
+    local target_slug="${contract_key//\//-}"
     local stage_root="$ACT_ARTIFACTS_DIR/${tool_name}-v${version#v}/$run_id/release-contract"
     local stage_dir
     if ! mkdir -p "$stage_root" || [[ ! -d "$stage_root" || -L "$stage_root" ]]; then
@@ -1596,22 +1615,70 @@ _act_build_purpose_matches() {
     ' <<< "$document" >/dev/null 2>&1
 }
 
+# Keep physical platforms distinct from executable variants. Diagnostic
+# contracts contain a projection of these rows; release contracts contain all.
+_act_contract_target_rows() {
+    local tool="$1" contract="$2" identities rows matrix
+    identities=$(config_get_release_contract_targets_json "$tool") || return 4
+    matrix=$(jq -r 'any(.[]; .key != .platform)' <<< "$identities") || return 4
+    rows=$(jq -ce --argjson contract "$contract" '
+        . as $all |
+        ($contract.exact_primary_assets | keys) as $keys |
+        [$all[] | select(.key as $key | $keys | index($key))] |
+        if length > 0 and (map(.key) | sort) == ($keys | sort)
+        then . else error("contract identities differ from configured build targets") end
+    ' <<< "$identities") || return 4
+    if [[ "$matrix" != true ]]; then
+        printf '%s\n' "$rows"
+        return 0
+    fi
+    # A matrix requires exact compiler identity for every physical platform,
+    # including singleton platforms and singleton-only diagnostic projections.
+    # Use the native backend's selection for omitted singleton target_triples;
+    # never let the observed manifest choose its own expected default.
+    local row platform configured selected environment effective resolved='[]'
+    while IFS= read -r row; do
+        platform=$(jq -er '.platform' <<< "$row") || return 4
+        configured=$(jq -er '.target_triple | strings' <<< "$row") || return 4
+        selected=""
+        if [[ "$(jq -r '.key' <<< "$row")" != "$platform" ]]; then
+            selected="$configured"
+        fi
+        environment=$(act_get_build_env "$tool" "$platform" "$selected") || return 4
+        effective=$(act_get_build_env_value "$environment" CARGO_BUILD_TARGET) || return 4
+        if [[ ! "$effective" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$effective" == *..* ||
+              ( -n "$configured" && "$configured" != "$effective" ) ]]; then
+            _log_error "Strict matrix compiler selection conflicts with $tool $platform"
+            return 4
+        fi
+        resolved=$(jq -c --argjson row "$row" --arg triple "$effective" '
+            . + [($row + {target_triple: $triple, require_triple: true})]
+        ' <<< "$resolved") || return 4
+    done < <(jq -c '.[]' <<< "$rows")
+    printf '%s\n' "$resolved"
+}
+
 # Project only the artifact inventory, retaining all other strict validators.
 # Additional assets must have unambiguous configured target ownership; observed
 # outputs can never determine which family members a diagnostic is required to have.
 _act_contract_for_build_purpose() {
     local tool="$1" contract="$2" requested="$3" purpose="$4"
-    if ! jq -en --argjson contract "$contract" --argjson requested "$requested" '
+    local identities platforms
+    identities=$(config_get_release_contract_targets_json "$tool") || return 4
+    platforms=$(jq -c '[.[].platform] | unique' <<< "$identities") || return 4
+    if ! jq -en --argjson contract "$contract" --argjson requested "$requested" \
+        --argjson identities "$identities" --argjson platforms "$platforms" '
         ($requested | type == "array" and length > 0) and
         ($requested | length) == ($requested | unique | length) and
-        (($requested - ($contract.exact_primary_assets | keys)) | length) == 0
+        (($requested - $platforms) | length) == 0 and
+        ($contract.exact_primary_assets | keys | sort) == ($identities | map(.key) | sort)
     ' >/dev/null 2>&1; then
         _log_error "Build targets must be a nonempty unique subset of the strict contract"
         return 4
     fi
     if [[ "$purpose" == "release" ]]; then
-        if ! jq -en --argjson contract "$contract" --argjson requested "$requested" \
-            '($requested | sort) == ($contract.exact_primary_assets | keys | sort)' >/dev/null; then
+        if ! jq -en --argjson platforms "$platforms" --argjson requested "$requested" \
+            '($requested | sort) == ($platforms | sort)' >/dev/null; then
             _log_error "Strict release contract requires the complete configured target set"
             return 4
         fi
@@ -1635,7 +1702,7 @@ _act_contract_for_build_purpose() {
         fi
         ownership=$(jq -nc --argjson owners "$ownership" --arg target "$target" \
             --argjson additional "$additional" '$owners + {($target): $additional}') || return 4
-    done < <(jq -r '.exact_primary_assets | keys[]' <<< "$contract")
+    done < <(jq -r '.[]' <<< "$platforms")
     if ! jq -en --argjson owners "$ownership" --argjson contract "$contract" '
         [$owners[][]] as $owned |
         [($contract.exact_additional_assets // [])[] |
@@ -1648,9 +1715,10 @@ _act_contract_for_build_purpose() {
         return 4
     fi
     jq -nc --argjson contract "$contract" --argjson requested "$requested" \
-        --argjson owners "$ownership" '
+        --argjson owners "$ownership" --argjson identities "$identities" '
+        [$identities[] | select(.platform as $platform | $requested | index($platform)) | .key] as $keys |
         $contract |
-        .exact_primary_assets |= with_entries(select(.key as $key | $requested | index($key))) |
+        .exact_primary_assets |= with_entries(select(.key as $key | $keys | index($key))) |
         .exact_additional_assets = [$requested[] as $target | $owners[$target][]]
     '
 }
@@ -5155,16 +5223,25 @@ _act_validate_strict_cargo_source_closure() {
 # several targets share one immutable source root and download seed.
 _act_validate_strict_target_cargo_source_closure() {
     local tool="$1" platform="$2" version="$3" host="$4" source_root="$5" dependencies="$6"
-    local build_cmd build_env binary_name target_triple
-    build_cmd=$(act_get_build_cmd "$tool" "$platform") || return 4
-    build_env=$(act_get_build_env "$tool" "$platform") || return 4
+    local build_cmd build_env binary_name target_triple command_template configured selected target_slug
+    command_template=$(act_get_build_cmd "$tool" "$platform") || return 4
     binary_name=$(yq -r '.binary_name // ""' "$ACT_REPOS_DIR/${tool}.yaml") || return 4
-    target_triple=$(act_get_build_env_value "$build_env" CARGO_BUILD_TARGET 2>/dev/null || true)
-    build_cmd=$(act_substitute_build_cmd_tokens "$build_cmd" "${binary_name:-$tool}" \
-        "$version" "${platform%%/*}" "${platform##*/}" "$target_triple") || return 4
-    build_env+=$'\n'"CARGO_TARGET_DIR=${source_root%/*}/.cargo-target-${platform//\//-}"
-    _act_validate_strict_cargo_source_closure \
-        "$host" "$source_root" "$dependencies" "$build_cmd" "$build_env"
+    configured=$(act_get_configured_target_triples "$tool" "$platform") || return 4
+    # Preserve singleton environment selection, including existing explicit
+    # compiler overrides. Every matrix variant must be admitted independently:
+    # target-conditional Cargo dependencies can differ between GNU and musl.
+    [[ "$configured" == *$'\n'* ]] || configured=""
+    while IFS= read -r selected; do
+        build_env=$(act_get_build_env "$tool" "$platform" "$selected") || return 4
+        target_triple=$(act_get_build_env_value "$build_env" CARGO_BUILD_TARGET 2>/dev/null || true)
+        build_cmd=$(act_substitute_build_cmd_tokens "$command_template" "${binary_name:-$tool}" \
+            "$version" "${platform%%/*}" "${platform##*/}" "$target_triple") || return 4
+        target_slug="${platform//\//-}"
+        [[ -z "$selected" ]] || target_slug+="-$selected"
+        build_env+=$'\n'"CARGO_TARGET_DIR=${source_root%/*}/.cargo-target-$target_slug"
+        _act_validate_strict_cargo_source_closure \
+            "$host" "$source_root" "$dependencies" "$build_cmd" "$build_env" || return 4
+    done <<< "$configured"
 }
 
 _act_windows_reparse_guard_script() {
@@ -6723,7 +6800,7 @@ _act_is_rust_build_influence_name() {
     sdk_regex=$(_act_rust_sdk_influence_regex)
     [[ "$normalized_name" =~ $sdk_regex ]] && return 0
     case "$normalized_name" in
-        CARGO_*|RUST*|XWIN_*|TEMP|TMP|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|\
+        CARGO_*|RUST*|XWIN_*|TEMP|TMP|DSR_RELEASE_GIT_SHA|DSR_RELEASE_GIT_REF|DSR_TARGET_TRIPLE|\
         DSR_RUST_TARGET|DSR_ZIG_TARGET|DSR_LINUX_GLIBC_FLOOR|\
         FT_ATOMIC_BUILD_IDENTITY|FT_ATOMIC_BUILD_PROFILE|\
         CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|\
@@ -7986,6 +8063,9 @@ act_run_native_build() {
     local bound_host="${8:-}"
     local selected_triple="${9:-}"
     local ordinary_source_root="${10:-}"
+    # Nested archive/receipt validators must resolve the same exact primary.
+    # Bash local scope keeps this selected variant private to this invocation.
+    local _ACT_STRICT_TARGET_TRIPLE="$selected_triple"
 
     if [[ -n "$ordinary_source_root" &&
           ( -n "$remote_path_override" || -n "$release_git_sha" || -n "$release_git_ref" || -z "$bound_host" ) ]]; then
@@ -8200,10 +8280,11 @@ act_run_native_build() {
                 return 4
             fi
         fi
-        local strict_cargo_target_dir="${remote_path%/*}/.cargo-target-${platform//\//-}"
-        if [[ -n "$strict_cache_root" ]]; then
+        local strict_cargo_target_dir="${remote_path%/*}/.cargo-target-${native_target_slug}"
+        if [[ -n "$strict_cache_root" || -n "$selected_triple" ]]; then
             # A retry also gets a fresh final-output destination. The host
-            # wrapper refuses any collision rather than reusing stale output.
+            # cache wrapper refuses collisions; matrix variants and their
+            # retries never share Cargo's host build-script/output directory.
             strict_cargo_target_dir+="-$(date +%s)-$$-$RANDOM"
         fi
         local canonical_cargo_target_dir="$strict_cargo_target_dir"
@@ -9474,6 +9555,15 @@ EOF
         local additional_receipt
         additional_json=$(_act_workspace_additional_artifacts_json \
             "$config_file" "$platform") || download_failed=true
+        if $strict_native_build && [[ -n "$selected_triple" ]]; then
+            local additional_owner_triples
+            additional_owner_triples=$(act_get_configured_target_triples "$tool_name" "$platform") || return 4
+            # Platform-level companions have one producer. Additional assets
+            # from later variants cannot duplicate or replace its receipt.
+            if [[ "$selected_triple" != "${additional_owner_triples%%$'\n'*}" ]]; then
+                additional_json='[]'
+            fi
+        fi
         if ! jq -e 'type == "array" and all(.[]; type == "string")' \
             <<< "$additional_json" >/dev/null 2>&1; then
             _log_error "Invalid workspace_additional_artifacts configuration for $platform"
@@ -9967,8 +10057,8 @@ _act_build_task_plan() {
             triples=$(act_get_configured_target_triples "$tool" "$platform") || return 4
         fi
         if [[ "$triples" == *$'\n'* ]]; then
-            if [[ "$strict" == true || "$language" != rust ]]; then
-                _log_error "Native target variants require an ordinary Rust build: $platform"
+            if [[ "$language" != rust ]]; then
+                _log_error "Native target variants require a Rust build: $platform"
                 return 4
             fi
             command_template=$(act_get_build_cmd "$tool" "$platform") || return 4
@@ -10403,6 +10493,14 @@ _act_relocate_failed_target() {
     local source_inventory dependency_checkouts replacement_path replacement_root
     [[ "$request" == *=* && "$target" =~ ^[a-z]+/[a-z0-9]+$ &&
        "$host" =~ ^[A-Za-z0-9_-]+$ ]] || return 4
+    local relocation_triples
+    relocation_triples=$(act_get_configured_target_triples "$tool" "$target") || return 4
+    if [[ "$relocation_triples" == *$'\n'* ]] || jq -e --arg target "$target" '
+        any(.context.build_tasks[]?; .platform == $target and .key != $target)
+    ' <<< "$before" >/dev/null; then
+        _log_error "Platform-only relocation cannot move a variant matrix; resume its failed variants on the bound host"
+        return 4
+    fi
     old_host=$(jq -er --arg target "$target" '.context.target_hosts[$target] | strings' <<< "$before") || return 4
     [[ "$host" != "$old_host" ]] || return 4
     [[ -f "$approval_file" && ! -L "$approval_file" ]] || return 4
@@ -11794,6 +11892,47 @@ _act_validate_native_manifest_inventory() {
     _act_validate_native_matrix_result_inventory "$tool" "$inventory" "$artifacts"
 }
 
+# New strict variant contracts cannot use the legacy manifest fallback. Each
+# selected compiler target needs its own native execution and source context,
+# and exactly one corresponding primary. Singleton contracts retain their
+# existing manifest compatibility.
+_act_validate_contract_variant_inventory() {
+    local tool="$1" manifest="$2" contract="$3" identities
+    identities=$(_act_contract_target_rows "$tool" "$contract") || return 4
+    if ! jq -e 'any(.[]; .require_triple == true)' <<< "$identities" >/dev/null; then
+        return 0
+    fi
+    if ! jq -e --argjson identities "$identities" '
+        . as $manifest |
+        ($manifest.build_environments // null) as $environments |
+        ($manifest.artifacts // []) as $artifacts |
+        ($manifest.requested_targets | type == "array" and
+            length == (unique | length) and
+            (sort == ($identities | map(.platform) | unique | sort))) and
+        ($environments | type == "array" and length == ($identities | length)) and
+        all($identities[];
+            . as $wanted |
+            [$environments[] | select(.target == $wanted.platform and
+                .target_triple == $wanted.target_triple)] as $matches |
+            [$artifacts[] | select(.target == $wanted.platform and
+                .target_triple == $wanted.target_triple)] as $primaries |
+            ($matches | length) == 1 and ($primaries | length) == 1 and
+            ($matches[0] | .method == "native" and
+                (.host | type == "string" and length > 0) and
+                .target_triple == $wanted.target_triple and
+                .build_influence_env.CARGO_BUILD_TARGET == $wanted.target_triple and
+                .build_influence_env.DSR_TARGET_TRIPLE == $wanted.target_triple and
+                .build_influence_env.DSR_RELEASE_GIT_SHA == $manifest.source.git_sha and
+                .build_influence_env.DSR_RELEASE_GIT_REF == $manifest.source.git_ref and
+                .cargo_isolation.mode == "strict-release-snapshot" and
+                .cargo_isolation.toolchain.target_triple == $wanted.target_triple))
+    ' <<< "$manifest" >/dev/null 2>&1; then
+        _log_error "Strict variant manifest lacks exact native compiler/source receipts"
+        return 4
+    fi
+    _act_validate_native_manifest_inventory "$tool" "$manifest"
+}
+
 # Flat release directories cannot retain two native payloads named `tool`.
 # Both cmd_build and manifest generation use this deterministic name; the
 # original paths and names remain in the immutable worker receipts.
@@ -11870,10 +12009,17 @@ _act_generate_contract_manifest() {
             return 4
         }
     else
-        requested_targets=$(jq -c '.requested_targets // [.targets[].platform]' <<< "$result_json") || return 4
+        requested_targets=$(jq -c '.requested_targets // ([.targets[].platform] | unique)' <<< "$result_json") || return 4
     fi
     contract_json=$(_act_contract_for_build_purpose "$tool" "$contract_json" \
         "$requested_targets" "$build_purpose") || return 4
+    local contract_targets_json
+    contract_targets_json=$(_act_contract_target_rows "$tool" "$contract_json") || return 4
+    if jq -e 'any(.[]; .require_triple == true)' <<< "$contract_targets_json" >/dev/null && \
+       ! jq -e 'has("requested_targets")' <<< "$result_json" >/dev/null; then
+        _log_error "Strict variant results require their original requested platform inventory"
+        return 4
+    fi
 
     local config_file="$ACT_REPOS_DIR/${tool}.yaml"
     local binary_name workspace_binaries
@@ -11914,17 +12060,23 @@ _act_generate_contract_manifest() {
     base_additional_count=$(jq -r 'length' <<< "$base_additional_json") || return 4
     manifest_artifact_count=$((expected_count + base_additional_count))
 
-    if ! jq -e --argjson contract "$contract_json" '
-        ($contract.exact_primary_assets | keys) as $expected_targets |
+    if ! jq -e --argjson expected "$contract_targets_json" '
+        .targets as $results |
         .status == "success" and
         (.summary | type == "object") and
-        .summary.total == ($expected_targets | length) and
-        .summary.success == ($expected_targets | length) and
+        .summary.total == ($expected | length) and
+        .summary.success == ($expected | length) and
         .summary.failed == 0 and
         (.targets | type == "array") and
-        (.targets | length) == ($expected_targets | length) and
-        ([.targets[].platform] | length) == ([.targets[].platform] | unique | length) and
-        ([.targets[].platform] | sort) == ($expected_targets | sort) and
+        (.targets | length) == ($expected | length) and
+        all($expected[];
+            . as $wanted |
+            [$results[] | select(.platform == $wanted.platform and
+                (($wanted.require_triple | not) or .target_triple == $wanted.target_triple))] as $matches |
+            ($matches | length) == 1 and
+            (if $wanted.require_triple then
+                $matches[0].task_key == $wanted.key and $matches[0].method == "native"
+             else true end)) and
         all(.targets[];
             .status == "success" and
             (.staged_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
@@ -11935,6 +12087,7 @@ _act_generate_contract_manifest() {
         _log_error "Release contract requires exact N/N successful target results"
         return 4
     fi
+    _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
 
     if ! jq -e '
         .checksum_sidecar == "sha256" and
@@ -11946,13 +12099,21 @@ _act_generate_contract_manifest() {
     fi
 
     local artifacts=()
-    local target expected_name expected_input_name format
+    local target expected_name expected_input_name format contract_row contract_key contract_triple
+    local _ACT_STRICT_TARGET_TRIPLE=""
     local target_json artifact_path artifact_dir
     local frozen_sha frozen_size frozen_identity
-    while IFS= read -r target; do
+    while IFS= read -r contract_row; do
+        contract_key=$(jq -er '.key' <<< "$contract_row") || return 4
+        target=$(jq -er '.platform' <<< "$contract_row") || return 4
+        contract_triple=$(jq -er '.target_triple // "" | strings' <<< "$contract_row") || return 4
+        target_json=$(jq -c --arg target "$target" --arg key "$contract_key" \
+            --arg triple "$contract_triple" --argjson row "$contract_row" '
+            .targets[] | select(.platform == $target and
+                (($row.require_triple | not) or .target_triple == $triple))' <<< "$result_json") || return 4
+        _ACT_STRICT_TARGET_TRIPLE=$(_act_native_result_target_triple "$tool" "$target_json") || return 4
         workspace_binaries=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
-        [[ -n "$target" ]] || continue
-        expected_name=$(jq -r --arg target "$target" '.exact_primary_assets[$target]' <<< "$contract_json")
+        expected_name=$(jq -r --arg target "$contract_key" '.exact_primary_assets[$target]' <<< "$contract_json")
         if ! _act_is_safe_basename "$expected_name"; then
             _log_error "Unsafe release asset basename for $target: $expected_name"
             return 4
@@ -11961,7 +12122,6 @@ _act_generate_contract_manifest() {
         [[ "$target" == windows/* ]] && expected_input_name="${binary_name%.exe}.exe"
         format=$(_act_archive_format "$expected_name")
 
-        target_json=$(jq -c --arg target "$target" '.targets[] | select(.platform == $target)' <<< "$result_json")
         artifact_path=$(jq -r '.artifact_path // empty' <<< "$target_json")
         artifact_dir=$(jq -r '.artifact_dir // empty' <<< "$target_json")
         frozen_sha=$(jq -r '.staged_sha256 // empty' <<< "$target_json")
@@ -12081,6 +12241,7 @@ _act_generate_contract_manifest() {
         if ! artifact_json=$(jq -nc \
             --arg name "$expected_name" \
             --arg target "$target" \
+            --arg target_triple "$_ACT_STRICT_TARGET_TRIPLE" \
             --arg sha "$sha" \
             --argjson size "$size" \
             --arg format "$format" \
@@ -12092,12 +12253,12 @@ _act_generate_contract_manifest() {
                 archive_format: $format,
                 signed: false,
                 signature_file: ""
-            }'); then
+            } + (if $target_triple == "" then {} else {target_triple: $target_triple} end)'); then
             _log_error "Failed to serialize release artifact metadata for $target"
             return 4
         fi
         artifacts+=("$artifact_json")
-    done < <(jq -r '.exact_primary_assets | keys[]' <<< "$contract_json")
+    done < <(jq -c '.[]' <<< "$contract_targets_json")
 
     local additional_name additional_matches additional_receipt additional_path
     local additional_sha additional_size additional_identity_before additional_identity_after
@@ -12214,12 +12375,14 @@ _act_generate_contract_manifest() {
         return 4
     fi
 
-    if ! jq -e --argjson contract "$contract_json" \
+    if ! jq -e --argjson contract "$contract_json" --argjson identities "$contract_targets_json" \
         --argjson base_additional "$base_additional_json" '
         (.artifacts | length) ==
             (($contract.exact_primary_assets | length) + ($base_additional | length)) and
-        ([.artifacts[] | select(.target != "additional") |
-          {key: .target, value: .name}] | from_entries) ==
+        ([.artifacts[] | select(.target != "additional") | . as $artifact |
+          $identities[] | select(.platform == $artifact.target and
+            ((.require_triple | not) or .target_triple == $artifact.target_triple)) |
+          {key: .key, value: $artifact.name}] | from_entries) ==
             $contract.exact_primary_assets and
         ([.artifacts[] | select(.target == "additional") | .name] | sort) ==
             $base_additional and
@@ -12229,6 +12392,7 @@ _act_generate_contract_manifest() {
         _log_error "Final manifest does not match the release contract"
         return 4
     fi
+    _act_validate_contract_variant_inventory "$tool" "$manifest" "$contract_json" || return 4
 
     if [[ -n "$output_file" ]]; then
         if [[ -e "$output_file" || -L "$output_file" ]] || \

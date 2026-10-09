@@ -471,7 +471,7 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 
 Target logs and result receipts are isolated by task and attempt. Aggregation
 is deterministic in requested-platform order, then configured triple order.
-For ordinary native Rust builds, a `target_triples` list expands one platform
+For native Rust builds, a `target_triples` list expands one platform
 into independent GNU/musl tasks. Each task records its selected `target_triple`
 and a `task_key` such as `linux/amd64@x86_64-unknown-linux-musl`; singleton and
 workflow tasks retain their platform as the task key. Platform routing and
@@ -481,8 +481,23 @@ Each native variant has its own staging directory, Cargo home, output directory
 and retained artifact receipts. Resume verifies and reuses completed variants
 independently, and refuses a changed ordered task list or repository
 configuration for a matrix run. Partial artifacts remain available for resume,
-but no authoritative manifest is emitted until all tasks succeed. A strict
-`release_contract` continues to permit one selected triple per platform.
+but no authoritative manifest is emitted until all tasks succeed.
+
+A strict `release_contract` requires one `exact_primary_assets` entry per
+configured variant. A platform with multiple triples uses qualified keys such
+as `linux/amd64@x86_64-unknown-linux-gnu` and
+`linux/amd64@x86_64-unknown-linux-musl`; a singleton keeps its physical platform
+key. The exact key set must match the configured matrix. Each primary keeps its
+literal contracted filename and archive format, and its manifest row retains
+physical `target` plus `target_triple`. The selected triple reaches strict
+source admission, staging, compiler context, native result, and release
+verification. Complete task and environment inventories are required before
+publication; a successful GNU task cannot stand in for a missing musl task.
+In a mixed matrix, singleton platforms also require the compiler triple
+selected by their configuration and native environment. Diagnostic projections
+retain that requirement even when they select only a singleton platform.
+Platform-owned additional artifacts are collected once by the first configured
+triple, while each variant can retain its own archive companion files.
 
 Ordinary source synchronization returns a complete receipt for the selected
 native targets, including target-to-host bindings, successful source paths,
@@ -548,6 +563,9 @@ requirements, while plain source directories can synchronize without Git.
 Relocation requires the original controller to have released the build lock,
 the selected target to be failed, and no target to be running. Completed or
 cancelled runs and diagnostic builds are refused.
+Platform-level host relocation also requires the selected platform to have one
+configured triple. A multi-variant platform uses the existing same-host resume,
+which retries only failed variants and retains successful sibling receipts.
 The approval file is a regular JSON file with these required fields:
 
 ```json
@@ -589,7 +607,9 @@ dependencies, immutable per-host snapshot, and executable/application family
 checks remain mandatory. Required additional artifacts are selected from the
 configured `workspace_additional_artifacts[target]` ownership, never from the
 outputs that happen to exist. Normal strict release builds still require the
-complete exact target set.
+complete exact target set. Selecting a physical platform for diagnostics
+includes every configured variant of that platform and retains their distinct
+task identities.
 
 Diagnostic output is isolated at
 `$DSR_STATE_DIR/diagnostics/<tool>-<tag>/<run-id>` with a directory-purpose

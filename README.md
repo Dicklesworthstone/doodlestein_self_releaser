@@ -1101,13 +1101,41 @@ explicit `--libc`, or retries after integrity failure. Each configured triple
 gets an independent archive/checksum/signature cache, including offline use.
 To install both variants, use target-qualified names: a nonprimary variant
 cannot be downloaded through a shared alias owned by the primary.
-A `release_contract` names one exact primary asset per target, so it admits a
-single triple per platform; `dsr config validate` rejects empty, duplicate or
-malformed lists. Native matrix expansion is for ordinary Rust GNU/musl builds.
+`dsr config validate` rejects empty, duplicate or malformed triple lists.
+Strict native Rust releases can also build the complete GNU/musl matrix. Their
+contract names one exact primary for each configured triple, using the same
+`platform@triple` identity as the native task:
+
+```yaml
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64@x86_64-unknown-linux-gnu: example-standard.tar.gz
+    linux/amd64@x86_64-unknown-linux-musl: example-static.tar.xz
+```
+
+Each exact name selects its own archive format and remains unchanged through
+collection and publication. Names can be arbitrary; the manifest binds the
+physical platform and selected triple explicitly. Every configured variant
+needs its own primary and checksum sidecar, with signatures when configured.
+A singleton platform keeps its existing unqualified contract key. Missing,
+mixed or unconfigured variant keys fail before compilation.
+
+Platform-level `workspace_additional_artifacts` belong to the first configured
+triple and are collected once. Companion files inside a workspace archive can
+appear in each variant's archive. A diagnostic selection of a physical
+platform includes all its configured variants. Strict releases continue to use
+native execution with authenticated source and compiler contexts.
+
 Resume reuses each completed variant only when its recorded files still match,
 and refuses a changed matrix configuration; a failed variant does not force
 its successful sibling to compile again. All variants must succeed before the
-build produces a publishable manifest.
+build produces a publishable manifest. Same-host selective resume is supported
+for the matrix; platform-level failed-target host relocation requires a
+singleton platform.
 
 With `--parallel`, two targets on one host whose build writes the same
 in-tree file (for example `go build -o tool ./cmd/tool`) no longer overwrite

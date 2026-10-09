@@ -3,6 +3,9 @@
 # resume. Only SSH/SCP transport stays local; a receiver disconnect is real
 # transfer failure. No compiler, source gate, scheduler or receipt is mocked.
 # Use --strict-publication-only for the successful strict build and seal case.
+# Use --strict-variants-only for genuine GNU/musl failure, resume and publication.
+# Use --strict-mixed-protocol-only for mixed-platform receipt/selection controls;
+# this mode never claims a Darwin compiler or artifact execution.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
@@ -107,16 +110,28 @@ cat > "$WORK/source/src/main.rs" <<'RUST'
 fn main() { println!("OLD_SOURCE {}", if cfg!(target_env = "musl") { "musl" } else { "gnu" }); }
 RUST
 cat > "$WORK/source/build.rs" <<'RUST'
-use std::{env, fs::OpenOptions, io::Write};
+use std::{env, fs::{self, OpenOptions}, io::Write, path::Path};
 fn main() {
+    let target = env::var("TARGET").unwrap();
+    if let Ok(selected) = env::var("DSR_TARGET_TRIPLE") {
+        assert_eq!(selected, target, "the configured variant must reach real Cargo");
+    }
     let mut file = OpenOptions::new().create(true).append(true)
         .open(env::var("SYNC_TEST_COMPILERS").unwrap()).unwrap();
-    writeln!(file, "{}", env::var("TARGET").unwrap()).unwrap();
+    writeln!(file, "{target}").unwrap();
+    if target.ends_with("-musl") && env::var("SYNC_TEST_FAIL_MUSL")
+        .is_ok_and(|marker| Path::new(&marker).exists()) {
+        panic!("deliberate genuine musl compilation failure for strict resume");
+    }
+    let out = env::var("OUT_DIR").unwrap();
+    let release = Path::new(&out).ancestors().nth(3).unwrap();
+    fs::write(release.join("release-notes.txt"), "Reviewed strict variant release notes\n").unwrap();
 }
 RUST
+printf 'Reviewed source fixture license\n' > "$WORK/source/LICENSE"
 cargo generate-lockfile --offline --manifest-path "$WORK/source/Cargo.toml" || exit 1
 git -C "$WORK/source" init -q -b main || exit 1
-git -C "$WORK/source" add Cargo.toml Cargo.lock src/main.rs build.rs || exit 1
+git -C "$WORK/source" add Cargo.toml Cargo.lock src/main.rs build.rs LICENSE || exit 1
 git -C "$WORK/source" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm old || exit 1
 for host in bad repair unsynced; do git clone -q "$WORK/source" "$WORK/hosts/$host" || exit 1; done
 cat > "$WORK/source/src/main.rs" <<'RUST'
@@ -385,6 +400,406 @@ test_strict_publication() {
     check 'strict completed output passes real release publication admission' \
         _release_require_publishable_artifacts "$strict_output" "$strict_manifest" true
 }
+
+test_strict_variants() {
+    # All source/metadata/compiler/collection/publication gates are production
+    # code. The external failure marker changes no byte of the tagged source.
+    # shellcheck source=../../src/host_health.sh
+    source "$ROOT/src/host_health.sh" || return 1
+    local output="$WORK/strict-variants-output" manifest config strict_sha run
+    local gnu_key="linux/amd64@$GNU" musl_key="linux/amd64@$MUSL"
+    local gnu_before musl_before gnu_path gnu_identity gnu_sha gnu_receipts
+    config="$ACT_REPOS_DIR/strictvariants.yaml"
+    manifest="$output/strictvariants-v4.1.0-manifest.json"
+    strict_sha=$(git -C "$WORK/source" rev-parse HEAD) || return 1
+    git -C "$WORK/source" tag v4.1.0 || return 1
+    jq --arg work "$WORK" '.tool_name="strictvariants" | .repo="example/strictvariants" |
+        .build_cmd="cargo build --release --locked --offline" |
+        .targets=["linux/amd64"] | .act_job_map={"linux/amd64":null} |
+        .target_triples={"linux/amd64":["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]} |
+        .hosts={"linux/amd64":"healthybox"} |
+        .include_files=["LICENSE"] |
+        .workspace_additional_artifacts={"linux/amd64":["release-notes.txt"]} |
+        .env.SYNC_TEST_FAIL_MUSL=($work+"/strict-fail-musl") |
+        .release_contract={checksum_sidecar:"sha256",exact_primary_assets:{
+            "linux/amd64@x86_64-unknown-linux-gnu":"syncfixture-standard.tar.gz",
+            "linux/amd64@x86_64-unknown-linux-musl":"syncfixture-static"},
+            exact_additional_assets:["release-notes.txt"]} |
+        del(.archive_format,.artifact_naming)' "$ACT_REPOS_DIR/syncmixed.yaml" > "$config" || return 1
+    cp "$config" "$WORK/strict-variants.original.json" || return 1
+    gnu_before=$(count "$WORK/compiler-events" "$GNU")
+    musl_before=$(count "$WORK/compiler-events" "$MUSL")
+    : > "$WORK/strict-fail-musl"
+    run_build strict-variants-partial 1 strictvariants --version 4.1.0 --jobs 2 --output-dir "$output"
+    if [[ $STATUS -ne 1 ]]; then cat "$WORK/strict-variants-partial.log" >&2; return 1; fi
+    check 'strict partial build reports two variant tasks on one physical platform' jq -e \
+        --arg gnu "$GNU" --arg musl "$MUSL" '
+        .status=="partial" and .details.total==2 and .details.success==1 and .details.failed==1 and
+        ([.details.targets[].platform] | unique)==["linux/amd64"] and
+        ([.details.targets[].target_triple] | sort)==([$gnu,$musl] | sort)
+        ' "$WORK/strict-variants-partial.json"
+    check 'strict partial build reaches genuine Cargo once per selected variant' test \
+        "$(count "$WORK/compiler-events" "$GNU")/$(count "$WORK/compiler-events" "$MUSL")" = \
+        "$((gnu_before + 1))/$((musl_before + 1))"
+    check 'failed strict matrix does not expose a completed manifest' test ! -e "$manifest"
+    build_state_get strictvariants 4.1.0 > "$WORK/strict-variants-partial-state.json" || return 1
+    run=$(jq -er '.run_id' "$WORK/strict-variants-partial-state.json") || return 1
+    check 'strict checkpoints retain independently keyed GNU success and musl failure' jq -e \
+        --arg gnu "$gnu_key" --arg musl "$musl_key" '
+        .context.build_tasks | length==2 and [.[].key]==[$gnu,$musl]
+        ' "$WORK/strict-variants-partial-state.json"
+    check 'strict checkpoint status belongs to each selected triple' jq -e \
+        --arg gnu "$gnu_key" --arg musl "$musl_key" '
+        .target_statuses[$gnu].status=="completed" and .target_statuses[$musl].status=="failed" and
+        .target_statuses[$gnu].result.target_triple=="x86_64-unknown-linux-gnu" and
+        .target_statuses[$musl].result.target_triple=="x86_64-unknown-linux-musl"
+        ' "$WORK/strict-variants-partial-state.json"
+    gnu_path=$(jq -er --arg key "$gnu_key" '.target_statuses[$key].result.artifact_path' \
+        "$WORK/strict-variants-partial-state.json") || return 1
+    gnu_identity=$(_act_file_identity "$gnu_path") || return 1
+    gnu_sha=$(_act_sha256 "$gnu_path") || return 1
+    gnu_receipts=$(jq -c --arg key "$gnu_key" '.target_statuses[$key].result.resume_artifacts' \
+        "$WORK/strict-variants-partial-state.json") || return 1
+    gnu_before=$(count "$WORK/compiler-events" "$GNU")
+    musl_before=$(count "$WORK/compiler-events" "$MUSL")
+
+    jq '.target_triples["linux/amd64"] |= reverse' "$WORK/strict-variants.original.json" > "$config" || return 1
+    run_build strict-variants-reordered 4 strictvariants --version 4.1.0 --jobs 2 --resume="$run" --output-dir "$output"
+    check 'changed primary ordering is refused before either compiler runs' test \
+        "$(count "$WORK/compiler-events" "$GNU")/$(count "$WORK/compiler-events" "$MUSL")" = "$gnu_before/$musl_before"
+    jq '.release_contract.exact_primary_assets["linux/amd64@x86_64-unknown-linux-musl"]="different-static-name"' \
+        "$WORK/strict-variants.original.json" > "$config" || return 1
+    run_build strict-variants-renamed 4 strictvariants --version 4.1.0 --jobs 2 --resume="$run" --output-dir "$output"
+    check 'changed exact release name is refused before either compiler runs' test \
+        "$(count "$WORK/compiler-events" "$GNU")/$(count "$WORK/compiler-events" "$MUSL")" = "$gnu_before/$musl_before"
+    cp "$WORK/strict-variants.original.json" "$config" || return 1
+    mv "$WORK/strict-fail-musl" "$WORK/strict-fail-musl.disabled" || return 1
+    run_build strict-variants-resumed 0 strictvariants --version 4.1.0 --jobs 2 --resume="$run" --output-dir "$output"
+    if [[ $STATUS -ne 0 ]]; then cat "$WORK/strict-variants-resumed.log" >&2; return 1; fi
+    build_state_get strictvariants 4.1.0 "$run" > "$WORK/strict-variants-resumed-state.json" || return 1
+    check 'strict resume compiles only the failed musl task' test \
+        "$(count "$WORK/compiler-events" "$GNU")/$(count "$WORK/compiler-events" "$MUSL")" = "$gnu_before/$((musl_before + 1))"
+    check 'strict resume retains the original GNU artifact path' test "$gnu_path" = \
+        "$(jq -r --arg key "$gnu_key" '.target_statuses[$key].result.artifact_path' "$WORK/strict-variants-resumed-state.json")"
+    check 'strict resume preserves the original GNU bytes and inode' test \
+        "$(_act_file_identity "$gnu_path")/$(_act_sha256 "$gnu_path")" = "$gnu_identity/$gnu_sha"
+    check 'strict resume preserves the entire original GNU artifact receipt inventory' test "$gnu_receipts" = \
+        "$(jq -c --arg key "$gnu_key" '.target_statuses[$key].result.resume_artifacts' "$WORK/strict-variants-resumed-state.json")"
+    check 'strict state completes the same run with exactly one musl retry' jq -e \
+        --arg run "$run" --arg gnu "$gnu_key" --arg musl "$musl_key" '
+        .run_id==$run and .status=="completed" and
+        .target_statuses[$gnu].attempts==1 and .target_statuses[$musl].attempts==2
+        ' "$WORK/strict-variants-resumed-state.json"
+    check 'strict manifest keeps physical platform and exact per-triple artifact names and formats' jq -e \
+        --arg sha "$strict_sha" --arg run "$run" '
+        .run_id==$run and .source.git_sha==$sha and .source.git_ref=="v4.1.0" and
+        .status=="success" and .build_purpose=="release" and .publishable==true and
+        .requested_targets==["linux/amd64"] and .summary=={total:2,success:2,failed:0} and
+        ([.artifacts[] | select(.target!="additional") | {name,target,target_triple,archive_format}] | sort_by(.name))==[
+          {name:"syncfixture-standard.tar.gz",target:"linux/amd64",target_triple:"x86_64-unknown-linux-gnu",archive_format:"tar.gz"},
+          {name:"syncfixture-static",target:"linux/amd64",target_triple:"x86_64-unknown-linux-musl",archive_format:"binary"}]
+        ' "$manifest"
+    check 'strict manifest retains two distinct native compiler environments' jq -e \
+        --arg gnu "$GNU" --arg musl "$MUSL" '
+        (.build_environments | length)==2 and
+        ([.build_environments[].target_triple] | sort)==([$gnu,$musl] | sort) and
+        all(.build_environments[]; .target=="linux/amd64" and .method=="native" and
+            .build_influence_env.CARGO_BUILD_TARGET==.target_triple and
+            .cargo_isolation.toolchain.target_triple==.target_triple and
+            .cargo_isolation.mode=="strict-release-snapshot") and
+        ([.build_environments[].cargo_isolation.target_dir] | unique | length)==2 and
+        ([.build_environments[].cargo_isolation.cargo_home] | unique | length)==2
+        ' "$manifest"
+    local triple cargo_home
+    for triple in "$GNU" "$MUSL"; do
+        cargo_home=$(jq -er --arg triple "$triple" \
+            '.build_environments[] | select(.target_triple==$triple) | .cargo_isolation.cargo_home' "$manifest") || return 1
+        check "strict $triple receipt preserves actual metadata, lock and private cache evidence" jq -e \
+            --arg triple "$triple" --arg sha "$strict_sha" \
+            --arg metadata "$(_act_sha256 "$cargo_home/.dsr-cargo-metadata.json")" \
+            --arg sources "$(_act_sha256 "$cargo_home/.dsr-cargo-sources.json")" \
+            --arg lock "$(_act_sha256 "$WORK/source/Cargo.lock")" \
+            --slurpfile state "$WORK/strict-variants-resumed-state.json" \
+            --slurpfile public "$WORK/strict-variants-resumed.json" '
+            .build_environments[] | select(.target_triple==$triple) as $env |
+            $state[0].target_statuses["linux/amd64@"+$triple].result as $stored |
+            ($public[0].details.targets[] | select(.target_triple==$triple)) as $target |
+            $env.cargo_isolation as $isolation |
+            $env.build_influence_env.DSR_RELEASE_GIT_SHA==$sha and
+            $env.build_influence_env==$stored.build_influence_env and
+            $env.build_influence_env==$target.build_influence_env and
+            $isolation==$stored.cargo_isolation and $isolation==$target.cargo_isolation and
+            $isolation.dependency_sources.metadata_sha256==$metadata and
+            $isolation.dependency_sources.sha256==$sources and
+            $isolation.dependency_sources.authentication.lockfile_sha256==$lock and
+            $isolation.dependency_cache.mode=="private-copy" and
+            $isolation.dependency_cache.seed.selection.lockfile_sha256==$lock and
+            all(("seed","final"); $isolation.dependency_cache[.] |
+                (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
+                (.receipt_sha256 | test("^[0-9a-f]{64}$")))
+            ' "$manifest"
+    done
+    check 'GNU exact archive contains its executable and pinned license' test \
+        "$(tar -tzf "$output/syncfixture-standard.tar.gz" | LC_ALL=C sort)" = $'LICENSE\nsyncfixture'
+    check 'GNU exact archive retains pinned license bytes' test \
+        "$(tar -xOzf "$output/syncfixture-standard.tar.gz" LICENSE)" = "$(cat "$WORK/source/LICENSE")"
+    tar -xOzf "$output/syncfixture-standard.tar.gz" syncfixture > "$WORK/strict-variant-gnu" || return 1
+    chmod +x "$WORK/strict-variant-gnu" || return 1
+    check 'GNU exact archive contains an executable from the tagged GNU source' test \
+        "$("$WORK/strict-variant-gnu")" = 'NEW_SOURCE gnu'
+    check 'musl exact raw asset executes the tagged musl source' test \
+        "$("$output/syncfixture-static")" = 'NEW_SOURCE musl'
+    check 'shared additional asset is collected once by the primary GNU task' jq -e \
+        --arg gnu "$gnu_key" --arg musl "$musl_key" --slurpfile manifest "$manifest" '
+        ([.target_statuses[$gnu].result.additional_artifacts[].path | split("/")[-1]])==["release-notes.txt"] and
+        (.target_statuses[$musl].result.additional_artifacts | length)==0 and
+        ([$manifest[0].artifacts[] | select(.target=="additional") | .name])==["release-notes.txt"]
+        ' "$WORK/strict-variants-resumed-state.json"
+    check 'additional release notes retain actual build-produced bytes' test \
+        "$(cat "$output/release-notes.txt")" = 'Reviewed strict variant release notes'
+    check 'strict variant publication seal binds the completed manifest bytes' jq -e \
+        --arg sha "$strict_sha" --arg digest "$(_act_sha256 "$manifest")" --arg run "$run" '
+        .publication_status=="completed" and .publishable==true and .run_id==$run and
+        .git_sha==$sha and .manifest_name=="strictvariants-v4.1.0-manifest.json" and
+        .manifest_sha256==$digest' "$output/.dsr-build-purpose.json"
+    check 'strict variants leave the tagged source tree clean' test \
+        -z "$(git -C "$WORK/source" status --porcelain --untracked-files=all)"
+
+    # Exercise the public release command and the real strict preflight. Only
+    # GitHub authentication/HTTP is a named local fixture; every unexpected
+    # endpoint, including any attempted mutation, fails and is recorded.
+    # shellcheck source=../../src/github.sh
+    source "$ROOT/src/github.sh" || return 1
+    # shellcheck disable=SC1090
+    source <(awk '/^(_release_[A-Za-z0-9_]+|cmd_release)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$ROOT/dsr") || return 1
+    gh_check() { return 0; }
+    gh_check_token() { return 0; }
+    gh_api() {
+        printf '%s\n' "$*" >> "$WORK/strict-variant-http.log"
+        [[ $# -eq 2 && "$1" == repos/example/strictvariants/git/ref/tags/v4.1.0 && "$2" == --no-cache ]] || return 89
+        jq -n --arg sha "$strict_sha" '{object:{type:"commit",sha:$sha}}'
+    }
+    check 'completed strict variant output passes real publication admission' \
+        _release_require_publishable_artifacts "$output" "$manifest" true
+    local contract
+    contract=$(config_get_release_contract_json strictvariants) || return 1
+    STATUS=0
+    _release_contract_preflight strictvariants v4.1.0 example/strictvariants "$WORK/source" \
+        "$output" "$manifest" "$contract" plan > "$WORK/strict-variant-plan.json" \
+        2> "$WORK/strict-variant-plan.log" || STATUS=$?
+    check 'strict preflight admits the actual compiled and sealed variant output' test "$STATUS" -eq 0
+    if [[ $STATUS -ne 0 ]]; then cat "$WORK/strict-variant-plan.log" >&2; return 1; fi
+    check 'strict plan selects exactly both primaries, their sidecars and shared notes' jq -e '
+        ([.assets[].name] | sort)==["release-notes.txt","syncfixture-standard.tar.gz",
+            "syncfixture-standard.tar.gz.sha256","syncfixture-static","syncfixture-static.sha256"] and
+        ([.assets[].name] | length)==([.assets[].name] | unique | length)
+        ' "$WORK/strict-variant-plan.json"
+    check 'strict primary and checksum upload rows retain physical platform and selected triple' jq -e '
+        [.assets[] | select(.kind=="primary" or .kind=="checksum") |
+            {name,target,target_triple}] == [
+          {name:"syncfixture-standard.tar.gz",target:"linux/amd64",target_triple:"x86_64-unknown-linux-gnu"},
+          {name:"syncfixture-standard.tar.gz.sha256",target:"linux/amd64",target_triple:"x86_64-unknown-linux-gnu"},
+          {name:"syncfixture-static",target:"linux/amd64",target_triple:"x86_64-unknown-linux-musl"},
+          {name:"syncfixture-static.sha256",target:"linux/amd64",target_triple:"x86_64-unknown-linux-musl"}]
+        ' "$WORK/strict-variant-plan.json"
+    STATUS=0
+    DRY_RUN=true cmd_release strictvariants 4.1.0 --artifacts "$output" \
+        > "$WORK/strict-variant-release.json" 2> "$WORK/strict-variant-release.log" || STATUS=$?
+    check 'public strict release dry-run admits both real variants' test "$STATUS" -eq 0
+    if [[ $STATUS -ne 0 ]]; then cat "$WORK/strict-variant-release.log" >&2; return 1; fi
+    check 'public dry-run publishes the exact selected names without guessed aliases' jq -e \
+        --slurpfile plan "$WORK/strict-variant-plan.json" '
+        .command=="release" and .exit_code==0 and .details.plan.strict==true and
+        .details.file_count==5 and (.details.plan.assets | sort)==([$plan[0].assets[].name] | sort)
+        ' "$WORK/strict-variant-release.json"
+    check 'strict dry-run leaves its planned checksum sidecars uncreated' test \
+        ! -e "$output/syncfixture-static.sha256"
+    check 'release HTTP fixture saw only read-only resolution of the pinned tag' \
+        test "$(LC_ALL=C sort -u "$WORK/strict-variant-http.log")" = \
+        'repos/example/strictvariants/git/ref/tags/v4.1.0 --no-cache'
+
+    # Mutation controls keep bytes, artifact hashes and publication seals
+    # self-consistent. They must fail the semantic variant checks, not merely
+    # the outer manifest digest gate. The original completed output is intact.
+    local label mutation directory bad_manifest before_requests
+    while IFS=$'\t' read -r label mutation; do
+        directory="$WORK/strict-variant-refuse-$label"
+        cp -a "$output" "$directory" || return 1
+        bad_manifest="$directory/${manifest##*/}"
+        jq "$mutation" "$manifest" > "$bad_manifest" || return 1
+        jq --arg digest "$(_act_sha256 "$bad_manifest")" '.manifest_sha256=$digest' \
+            "$output/.dsr-build-purpose.json" > "$directory/.dsr-build-purpose.json" || return 1
+        check "$label control retains a valid outer publication seal" \
+            _release_require_publishable_artifacts "$directory" "$bad_manifest" true
+        before_requests=$(wc -l < "$WORK/strict-variant-http.log")
+        STATUS=0
+        _release_contract_preflight strictvariants v4.1.0 example/strictvariants "$WORK/source" \
+            "$directory" "$bad_manifest" "$contract" plan > "$WORK/strict-variant-refuse-$label.json" \
+            2> "$WORK/strict-variant-refuse-$label.log" || STATUS=$?
+        check "strict release refuses $label despite consistent bytes and seal" test "$STATUS" -eq 4
+        check "$label refusal emits no upload plan" test ! -s "$WORK/strict-variant-refuse-$label.json"
+        check "$label refusal happens before remote tag resolution" test \
+            "$(wc -l < "$WORK/strict-variant-http.log")" -eq "$before_requests"
+    done <<'CONTROLS'
+missing-artifact-triple	del(.artifacts[] | select(.name=="syncfixture-static") | .target_triple)
+swapped-artifact-triple	(.artifacts[] | select(.name=="syncfixture-static") | .target_triple)="x86_64-unknown-linux-gnu"
+missing-environment	.build_environments |= map(select(.target_triple!="x86_64-unknown-linux-musl"))
+contradictory-environment	(.build_environments[] | select(.target_triple=="x86_64-unknown-linux-musl") | .build_influence_env.CARGO_BUILD_TARGET)="x86_64-unknown-linux-gnu"
+contradictory-toolchain	(.build_environments[] | select(.target_triple=="x86_64-unknown-linux-musl") | .cargo_isolation.toolchain.target_triple)="x86_64-unknown-linux-gnu"
+CONTROLS
+}
+
+test_strict_mixed_protocol() {
+    local config="$ACT_REPOS_DIR/mixedprotocol.yaml" protocol="$WORK/mixed-protocol.json"
+    local contract projected rows sha mutation label status
+    printf 'PROTOCOL: mixed GNU/musl plus Darwin receipts; no Darwin compilation or payload admission\n'
+    sha=$(git -C "$WORK/source" rev-parse HEAD) || return 1
+    git -C "$WORK/source" tag v4.2.0 || return 1
+    jq '.tool_name="mixedprotocol" | .repo="example/mixedprotocol" |
+        .build_cmd="cargo build --release --locked --offline" |
+        .targets=["linux/amd64","darwin/arm64"] |
+        .act_job_map={"linux/amd64":null,"darwin/arm64":null} |
+        .target_triples={"linux/amd64":["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"],
+                         "darwin/arm64":"aarch64-apple-darwin"} |
+        .workspace_additional_artifacts={"linux/amd64":["linux-notes.txt"],"darwin/arm64":["mac-notes.txt"]} |
+        .release_contract={checksum_sidecar:"sha256",exact_primary_assets:{
+            "linux/amd64@x86_64-unknown-linux-gnu":"standard",
+            "linux/amd64@x86_64-unknown-linux-musl":"static",
+            "darwin/arm64":"macos"},exact_additional_assets:["linux-notes.txt","mac-notes.txt"]} |
+        del(.archive_format,.artifact_naming)' "$ACT_REPOS_DIR/syncmixed.yaml" > "$config" || return 1
+    cp "$config" "$WORK/mixed-protocol-config.json" || return 1
+    act_load_repo_config mixedprotocol >/dev/null || return 1
+    contract=$(config_get_release_contract_json mixedprotocol) || return 1
+    jq -n --arg sha "$sha" '
+        [["linux/amd64","x86_64-unknown-linux-gnu","standard"],
+         ["linux/amd64","x86_64-unknown-linux-musl","static"],
+         ["darwin/arm64","aarch64-apple-darwin","macos"]] as $selected |
+        {tool:"mixedprotocol",version:"v4.2.0",status:"success",
+         source:{git_sha:$sha,git_ref:"v4.2.0",dependencies:[]},
+         requested_targets:["linux/amd64","darwin/arm64"],summary:{total:3,success:3,failed:0},
+         build_environments:[$selected[] | {target:.[0],target_triple:.[1],host:"protocol-only",method:"native",
+            build_influence_env:{CARGO_BUILD_TARGET:.[1],DSR_TARGET_TRIPLE:.[1],
+                DSR_RELEASE_GIT_SHA:$sha,DSR_RELEASE_GIT_REF:"v4.2.0"},
+            cargo_isolation:{mode:"strict-release-snapshot",toolchain:{target_triple:.[1]}}}],
+         artifacts:[$selected[] | {target:.[0],target_triple:.[1],name:.[2],
+            sha256:("a"*64),size_bytes:1,archive_format:"binary"}]}
+        ' > "$protocol" || return 1
+    check 'protocol mixed matrix admits three compiler identities on two physical platforms' \
+        _act_validate_contract_variant_inventory mixedprotocol "$(cat "$protocol")" "$contract"
+    rows=$(_act_contract_target_rows mixedprotocol "$contract") || return 1
+    check 'mixed identity rows bind singleton and variants without changing task keys' jq -e '
+        length==3 and all(.[]; .require_triple==true) and
+        [.[] | {key,platform,target_triple}]==[
+          {key:"linux/amd64@x86_64-unknown-linux-gnu",platform:"linux/amd64",target_triple:"x86_64-unknown-linux-gnu"},
+          {key:"linux/amd64@x86_64-unknown-linux-musl",platform:"linux/amd64",target_triple:"x86_64-unknown-linux-musl"},
+          {key:"darwin/arm64",platform:"darwin/arm64",target_triple:"aarch64-apple-darwin"}]
+        ' <<< "$rows"
+    _act_build_task_plan mixedprotocol v4.2.0 '["linux/amd64","darwin/arm64"]' true \
+        > "$WORK/mixed-protocol-tasks.json" || return 1
+    check 'mixed scheduler keeps two qualified variants and one singleton task' jq -e '
+        [.[].key]==["linux/amd64@x86_64-unknown-linux-gnu","linux/amd64@x86_64-unknown-linux-musl","darwin/arm64"] and
+        all(.[]; .method=="native")' "$WORK/mixed-protocol-tasks.json"
+    while IFS=$'\t' read -r label mutation; do
+        jq "$mutation" "$protocol" > "$WORK/mixed-protocol-$label.json" || return 1
+        status=0
+        _act_validate_contract_variant_inventory mixedprotocol \
+            "$(cat "$WORK/mixed-protocol-$label.json")" "$contract" \
+            > "$WORK/mixed-protocol-$label.out" 2> "$WORK/mixed-protocol-$label.log" || status=$?
+        check "mixed protocol refuses $label" test "$status" -eq 4
+    done <<'MIXED_CONTROLS'
+wrong-singleton-artifact	(.artifacts[] | select(.target=="darwin/arm64") | .target_triple)="x86_64-apple-darwin"
+missing-singleton-artifact	del(.artifacts[] | select(.target=="darwin/arm64") | .target_triple)
+wrong-singleton-environment	(.build_environments[] | select(.target=="darwin/arm64") | .target_triple)="x86_64-apple-darwin"
+contradictory-singleton-cargo	(.build_environments[] | select(.target=="darwin/arm64") | .build_influence_env.CARGO_BUILD_TARGET)="x86_64-apple-darwin"
+contradictory-singleton-toolchain	(.build_environments[] | select(.target=="darwin/arm64") | .cargo_isolation.toolchain.target_triple)="x86_64-apple-darwin"
+relabeled-singleton	(.artifacts[] | select(.target=="darwin/arm64") | .target_triple)="x86_64-apple-darwin" | (.build_environments[] | select(.target=="darwin/arm64")) |= (.target_triple="x86_64-apple-darwin" | .build_influence_env.CARGO_BUILD_TARGET="x86_64-apple-darwin" | .build_influence_env.DSR_TARGET_TRIPLE="x86_64-apple-darwin" | .cargo_isolation.toolchain.target_triple="x86_64-apple-darwin")
+collapsed-summary	.summary={total:2,success:2,failed:0}
+MIXED_CONTROLS
+
+    projected=$(_act_contract_for_build_purpose mixedprotocol "$contract" '["linux/amd64"]' diagnostic-native) || return 1
+    check 'Linux diagnostic projection retains both variants and only Linux-owned notes' jq -e '
+        (.exact_primary_assets | keys)==["linux/amd64@x86_64-unknown-linux-gnu","linux/amd64@x86_64-unknown-linux-musl"] and
+        .exact_additional_assets==["linux-notes.txt"]' <<< "$projected"
+    projected=$(_act_contract_for_build_purpose mixedprotocol "$contract" '["darwin/arm64"]' diagnostic-native) || return 1
+    check 'singleton diagnostic projection retains only its exact primary and owned notes' jq -e '
+        .exact_primary_assets=={"darwin/arm64":"macos"} and .exact_additional_assets==["mac-notes.txt"]' <<< "$projected"
+    rows=$(_act_contract_target_rows mixedprotocol "$projected") || return 1
+    check 'singleton projection still binds the parent matrix compiler triple' jq -e '
+        .==[{key:"darwin/arm64",platform:"darwin/arm64",target_triple:"aarch64-apple-darwin",primary:true,require_triple:true}]
+        ' <<< "$rows"
+    jq '.requested_targets=["darwin/arm64"] | .summary={total:1,success:1,failed:0} |
+        .artifacts |= map(select(.target=="darwin/arm64")) |
+        .build_environments |= map(select(.target=="darwin/arm64"))' "$protocol" \
+        > "$WORK/mixed-protocol-diagnostic.json" || return 1
+    check 'correct singleton-only diagnostic receipt passes projected identity checks' \
+        _act_validate_contract_variant_inventory mixedprotocol "$(cat "$WORK/mixed-protocol-diagnostic.json")" "$projected"
+    status=0
+    _act_validate_contract_variant_inventory mixedprotocol \
+        "$(jq 'del(.artifacts[0].target_triple)' "$WORK/mixed-protocol-diagnostic.json")" "$projected" \
+        > "$WORK/mixed-protocol-diagnostic-missing.out" 2> "$WORK/mixed-protocol-diagnostic-missing.log" || status=$?
+    check 'singleton diagnostic cannot discard its triple after physical projection' test "$status" -eq 4
+    status=0
+    _act_contract_for_build_purpose mixedprotocol "$contract" '["darwin/arm64"]' release \
+        > "$WORK/mixed-protocol-partial-release.out" 2> "$WORK/mixed-protocol-partial-release.log" || status=$?
+    check 'release selection still requires the complete physical platform set' test "$status" -eq 4
+
+    jq 'del(.target_triples["darwin/arm64"])' "$WORK/mixed-protocol-config.json" > "$config" || return 1
+    rows=$(_act_contract_target_rows mixedprotocol "$contract") || return 1
+    check 'omitted singleton mapping derives the native backend default' jq -e '
+        .[] | select(.platform=="darwin/arm64") |
+        .target_triple=="aarch64-apple-darwin" and .require_triple==true' <<< "$rows"
+    check 'backend-derived singleton default admits matching protocol receipts' \
+        _act_validate_contract_variant_inventory mixedprotocol "$(cat "$protocol")" "$contract"
+    status=0
+    _act_validate_contract_variant_inventory mixedprotocol \
+        "$(cat "$WORK/mixed-protocol-relabeled-singleton.json")" "$contract" \
+        > "$WORK/mixed-protocol-default-relabel.out" 2> "$WORK/mixed-protocol-default-relabel.log" || status=$?
+    check 'observed singleton receipts cannot choose a different backend default' test "$status" -eq 4
+    jq '.workspace_additional_artifacts["darwin/arm64"] += ["linux-notes.txt"]' \
+        "$WORK/mixed-protocol-config.json" > "$config" || return 1
+    status=0
+    _act_contract_for_build_purpose mixedprotocol "$contract" '["darwin/arm64"]' diagnostic-native \
+        > "$WORK/mixed-protocol-duplicate-owner.out" 2> "$WORK/mixed-protocol-duplicate-owner.log" || status=$?
+    check 'a shared additional asset cannot be claimed by two physical platforms' test "$status" -eq 4
+    cp "$WORK/mixed-protocol-config.json" "$config" || return 1
+
+    # Exercise the real generator selector before artifact I/O. These protocol
+    # rows intentionally have no executable bytes; no artifact gate is replaced.
+    jq --arg sha "$sha" '
+        {tool:"mixedprotocol",version:"v4.2.0",run_id:"11111111-1111-4111-8111-111111111111",
+         git_sha:$sha,git_ref:"v4.2.0",source_dependencies:[],build_purpose:"release",publishable:true,
+         requested_targets:.requested_targets,status:"success",summary:.summary,
+         targets:[.build_environments[] | . + {platform:.target,status:"success",build_purpose:"release",publishable:true,
+            task_key:(if .target=="linux/amd64" then .target+"@"+.target_triple else .target end),
+            staged_sha256:("a"*64),staged_size_bytes:1,staged_identity:"gnu:1:1"} | del(.target)]}
+        ' "$protocol" > "$WORK/mixed-protocol-results.json" || return 1
+    for mutation in \
+        '(.targets[] | select(.platform=="darwin/arm64") | .target_triple)="x86_64-apple-darwin"' \
+        'del(.targets[] | select(.platform=="darwin/arm64") | .target_triple)'; do
+        status=0
+        _act_generate_contract_manifest "$(jq "$mutation" "$WORK/mixed-protocol-results.json")" \
+            "$WORK/mixed-protocol-refused-manifest.json" "$contract" \
+            > "$WORK/mixed-protocol-generator.out" 2> "$WORK/mixed-protocol-generator.log" || status=$?
+        check 'mixed generator refuses an inconsistent singleton result identity' test "$status" -eq 4
+        check 'mixed generator refusal comes from the exact result selector' \
+            grep -q 'requires exact N/N successful target results' "$WORK/mixed-protocol-generator.log"
+        check 'inconsistent singleton never produces a manifest' test ! -e "$WORK/mixed-protocol-refused-manifest.json"
+    done
+}
+
+if [[ "${1:-}" == --strict-mixed-protocol-only ]]; then
+    test_strict_mixed_protocol || exit 1
+    printf 'Results: %s passed, %s failed; evidence %s\n' "$PASS" "$FAIL" "$WORK"
+    [[ "$FAIL" -eq 0 ]]
+    exit $?
+fi
+
+if [[ "${1:-}" == --strict-variants-only ]]; then
+    test_strict_variants || exit 1
+    printf 'Results: %s passed, %s failed; evidence %s\n' "$PASS" "$FAIL" "$WORK"
+    [[ "$FAIL" -eq 0 ]]
+    exit $?
+fi
 
 if [[ "${1:-}" == --strict-publication-only ]]; then
     test_strict_publication || exit 1
@@ -772,6 +1187,8 @@ check 'Git recovery still preserves controller state and original host checkout'
     "$(snapshot_git_tree "$WORK/controller-linked" .git src/message.txt config.txt untracked.txt Cargo.toml)/$(snapshot_git_tree "$WORK/hosts/git-stale" src/message.txt private.txt Cargo.toml)"
 
 test_strict_publication || exit 1
+test_strict_variants || exit 1
+test_strict_mixed_protocol || exit 1
 
 printf 'Results: %s passed, %s failed; evidence %s\n' "$PASS" "$FAIL" "$WORK"
 [[ "$FAIL" -eq 0 ]]
