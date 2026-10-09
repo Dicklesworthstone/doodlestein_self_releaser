@@ -107,6 +107,218 @@ fi
 success() { [[ $status -eq 0 && -x "$case_dir/bin/demo" ]] && jq -es 'length == 1 and .[0].status == "success"' "$case_dir/out" >/dev/null; }
 blocked() { [[ $status -ne 0 && ! -e "$case_dir/bin/demo" && ! -e "$case_dir/cache/demo/v1.2.3/$os-$arch.tar.gz" ]]; }
 set_manifest() { printf '%s\n' "$1" > "$REMOTE/checksums.sha256"; }
+
+# Exact contracts can give GNU/musl unrelated names and different formats.
+# Exercise the emitted installer, real archive/raw bytes and checksum/cache
+# paths. DSR_TEST_STRICT_RELEASE_DIR optionally supplies the genuine compiled
+# outputs of test_native_source_sync.sh --strict-variants-only; otherwise these
+# are executable protocol fixtures, not claimed compiler or ABI evidence.
+test_strict_contract_installers() {
+    local os arch
+    os=$(uname -s | tr '[:upper:]' '[:lower:]') || return 1
+    if [[ "$os" != linux ]] || ! command -v yq >/dev/null || ! command -v jq >/dev/null; then
+        printf 'note: strict contract installer cases require Linux, yq and jq\n'
+        [[ -z "${DSR_TEST_STRICT_RELEASE_DIR:-}" ]] || return 1
+        return 0
+    fi
+    local strict_root="$work/strict-contract" strict_config="$DSR_CONFIG_DIR/repos.d/strict-demo.yaml"
+    local cpu strict_installer libc expected cache_base before generation_status label mutation
+    local strict_case=0 strict_status=0 strict_case_dir strict_cache="$work/strict-contract/cache"
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64; cpu=x86_64 ;;
+        aarch64|arm64) arch=arm64; cpu=aarch64 ;;
+        *)
+            printf 'note: strict contract installer fixture requires amd64 or arm64\n'
+            [[ -z "${DSR_TEST_STRICT_RELEASE_DIR:-}" ]] || return 1
+            return 0 ;;
+    esac
+    mkdir -p "$strict_root/gnu" "$strict_root/musl" || return 1
+    if [[ -n "${DSR_TEST_STRICT_RELEASE_DIR:-}" ]]; then
+        cp "$DSR_TEST_STRICT_RELEASE_DIR/syncfixture-standard.tar.gz" "$REMOTE/Full.tar.gz" || return 1
+        cp "$DSR_TEST_STRICT_RELEASE_DIR/syncfixture-static" "$REMOTE/Lite" || return 1
+        tar -xzf "$REMOTE/Full.tar.gz" -C "$strict_root/gnu" syncfixture || return 1
+        cp "$REMOTE/Lite" "$strict_root/musl/syncfixture" || return 1
+        printf 'strict installer payloads: retained genuine GNU/musl release at %s\n' "$DSR_TEST_STRICT_RELEASE_DIR"
+    else
+        for libc in gnu musl; do
+            printf '#!/usr/bin/env bash\nprintf "strict %s\\n"\n' "$libc" > "$strict_root/$libc/syncfixture"
+            chmod +x "$strict_root/$libc/syncfixture" || return 1
+        done
+        tar -czf "$REMOTE/Full.tar.gz" -C "$strict_root/gnu" syncfixture || return 1
+        cp "$strict_root/musl/syncfixture" "$REMOTE/Lite" || return 1
+        printf 'strict installer payloads: executable protocol fixtures\n'
+    fi
+    for expected in Full.tar.gz Lite; do
+        printf '%s  %s\n' "$(sha256sum < "$REMOTE/$expected" | awk '{print $1}')" "$expected" > "$REMOTE/$expected.sha256"
+    done
+    jq -n --arg platform "linux/$arch" --arg cpu "$cpu" '{
+        tool_name:"strict-demo",repo:"example/strict-demo",binary_name:"syncfixture",language:"rust",
+        targets:[$platform],target_triples:{($platform):[($cpu+"-unknown-linux-gnu"),($cpu+"-unknown-linux-musl")]},
+        artifact_naming:"not-published-${name}-${target_triple}.${ext}",archive_format:"tar.gz",linux_libc_fallback:"musl",
+        release_contract:{checksum_sidecar:"sha256",exact_primary_assets:{
+            ($platform+"@"+$cpu+"-unknown-linux-gnu"):"Full.tar.gz",
+            ($platform+"@"+$cpu+"-unknown-linux-musl"):"Lite"}}}
+    ' > "$strict_config" || return 1
+    cp "$strict_config" "$strict_root/original.json" || return 1
+    strict_installer=$(install_gen_create strict-demo 2>> "$work/generate.log") || return 1
+    check 'exact contract installer parses' bash -n "$strict_installer"
+    strict_install() {
+        strict_case=$((strict_case + 1)); strict_case_dir="$strict_root/case-$strict_case"
+        mkdir -p "$strict_case_dir" || return 1
+        strict_status=0
+        bash "$strict_installer" --version v1.2.3 --dir "$strict_case_dir/bin" \
+            --cache-dir "$strict_cache" --non-interactive --json --no-skills "$@" \
+            > "$strict_case_dir/out" 2> "$strict_case_dir/err" || strict_status=$?
+    }
+    : > "$CALLS"
+    for libc in gnu musl; do
+        strict_install --libc "$libc"
+        check "strict $libc installs its exact archive/raw payload" test "$strict_status" -eq 0 -a -x "$strict_case_dir/bin/syncfixture"
+        check "strict $libc preserves the actual executable bytes" cmp -s "$strict_root/$libc/syncfixture" "$strict_case_dir/bin/syncfixture"
+        if [[ "$strict_status" -eq 0 ]]; then
+            check "strict $libc executable runs with the source payload result" test \
+                "$("$strict_case_dir/bin/syncfixture")" = "$("$strict_root/$libc/syncfixture")"
+        fi
+        check "strict $libc receipt names the canonical binary and actual hash" jq -es \
+            --arg hash "$(sha256sum < "$strict_root/$libc/syncfixture" | awk '{print $1}')" '
+            length==1 and .[0].status=="success" and .[0].binaries[0].name=="syncfixture" and
+            .[0].binaries[0].sha256==$hash' "$strict_case_dir/out"
+    done
+    check 'strict downloads use only exact names and their sidecars' \
+        test "$(sed -E 's#^curl .*/##; s/^gh //' "$CALLS" | LC_ALL=C sort -u)" = \
+        $'Full.tar.gz\nFull.tar.gz.sha256\nLite\nLite.sha256'
+    cache_base="$strict_cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux"
+    check 'GNU cache stores the real exact-name archive' cmp -s "$REMOTE/Full.tar.gz" "$cache_base-gnu.tar.gz"
+    check 'musl cache stores raw bytes in its own target and format' cmp -s "$REMOTE/Lite" "$cache_base-musl.none"
+    before=$(wc -l < "$CALLS")
+    for libc in gnu musl; do
+        strict_install --libc "$libc" --offline
+        check "strict $libc reinstalls from its own verified offline cache" test "$strict_status" -eq 0
+        check "offline $libc retains its exact executable bytes" cmp -s "$strict_root/$libc/syncfixture" "$strict_case_dir/bin/syncfixture"
+    done
+    check 'strict offline cache makes no transport calls' test "$(wc -l < "$CALLS")" -eq "$before"
+    local shared_cache="$strict_cache" gnu_only
+    strict_cache="$strict_root/gnu-only-cache"
+    gnu_only="$strict_cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-gnu.tar.gz"
+    mkdir -p "${gnu_only%/*}" || return 1
+    cp "$cache_base-gnu.tar.gz" "$gnu_only" || return 1
+    cp "$cache_base-gnu.tar.gz.sha256" "$gnu_only.sha256" || return 1
+    strict_install --libc musl --offline
+    check 'an explicit musl request cannot borrow a verified GNU cache entry' test "$strict_status" -ne 0 -a ! -e "$strict_case_dir/bin/syncfixture"
+    check 'missing offline variant makes no transport request' test "$(wc -l < "$CALLS")" -eq "$before"
+    strict_cache="$shared_cache"
+
+    # Automatic GNU-to-musl fallback is explicitly configured. Only the host
+    # libc detector is fixed here; all acquisition/integrity/install code runs.
+    strict_auto_install() {
+        strict_case=$((strict_case + 1)); strict_case_dir="$strict_root/case-$strict_case"
+        mkdir -p "$strict_case_dir" || return 1
+        strict_status=0
+        bash -c 'source "$1" --help >/dev/null 2>&1; _detect_linux_libc() { echo gnu; }
+            main --version v1.2.3 --dir "$2/bin" --cache-dir "$2/cache" --non-interactive --json --no-skills' \
+            bash "$strict_installer" "$strict_case_dir" > "$strict_case_dir/out" 2> "$strict_case_dir/err" || strict_status=$?
+    }
+    cp "$REMOTE/Full.tar.gz.sha256" "$strict_root/good.sha256" || return 1
+    printf '%064d  Full.tar.gz\n' 0 > "$REMOTE/Full.tar.gz.sha256"
+    : > "$CALLS"
+    strict_auto_install
+    check 'strict checksum failure blocks installation despite available fallback' test "$strict_status" -ne 0 -a ! -e "$strict_case_dir/bin/syncfixture"
+    check 'strict integrity failure never requests the other variant' test "$(grep -c Lite "$CALLS" || true)" -eq 0
+    check 'strict integrity failure publishes no reusable cache payload' test ! -e "$strict_case_dir/cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-gnu.tar.gz"
+    cp "$strict_root/good.sha256" "$REMOTE/Full.tar.gz.sha256" || return 1
+
+    jq '.minisign_pubkey="RWTRzlfQB0VAo0r4gvzjiptFkA9w/VNamRJSxtMaclvkt88+QlEMjQmw"' \
+        "$strict_root/original.json" > "$strict_config" || return 1
+    strict_installer=$(install_gen_create strict-demo 2>> "$work/generate.log") || return 1
+    printf 'invalid signature\n' > "$REMOTE/Full.tar.gz.minisig"
+    cat > "$work/transports/minisign" <<'STRICT_SIGNER'
+#!/usr/bin/env bash
+printf 'minisign\n' >> "$CALLS"
+exit 1
+STRICT_SIGNER
+    chmod +x "$work/transports/minisign" || return 1
+    : > "$CALLS"
+    strict_auto_install
+    check 'strict signature failure is terminal after a valid checksum' test "$strict_status" -ne 0 -a ! -e "$strict_case_dir/bin/syncfixture"
+    check 'strict signature uses the exact contract asset name' grep -q '/Full.tar.gz.minisig$' "$CALLS"
+    check 'strict signature reaches the configured verifier' grep -q '^minisign$' "$CALLS"
+    check 'strict signature failure never requests the other variant' test "$(grep -c Lite "$CALLS" || true)" -eq 0
+    cp "$strict_root/original.json" "$strict_config" || return 1
+    strict_installer=$(install_gen_create strict-demo 2>> "$work/generate.log") || return 1
+    mv "$REMOTE/Full.tar.gz" "$strict_root/unavailable.tar.gz" || return 1
+    strict_auto_install
+    check 'strict acquisition fallback changes from GNU archive to raw musl format' test "$strict_status" -eq 0
+    check 'strict fallback installs exactly the musl executable' cmp -s "$strict_root/musl/syncfixture" "$strict_case_dir/bin/syncfixture"
+    check 'strict fallback cache retains the selected raw musl bytes' cmp -s "$REMOTE/Lite" \
+        "$strict_case_dir/cache/strict-demo/v1.2.3/linux-$arch-$cpu-unknown-linux-musl.none"
+    mv "$strict_root/unavailable.tar.gz" "$REMOTE/Full.tar.gz" || return 1
+
+    # Generation failures leave the previous usable script intact.
+    cp "$strict_installer" "$strict_root/installer.saved" || return 1
+    while IFS=$'\t' read -r label mutation; do
+        jq "$mutation" "$strict_root/original.json" > "$strict_config" || return 1
+        generation_status=0
+        install_gen_create strict-demo > "$strict_root/refused.out" 2> "$strict_root/refused.err" || generation_status=$?
+        check "strict generator refuses $label" test "$generation_status" -eq 4
+        check "$label preserves the previously generated installer" cmp -s "$strict_root/installer.saved" "$strict_installer"
+    done <<'STRICT_INVALID'
+missing variant primary	.release_contract.exact_primary_assets |= with_entries(select(.key | endswith("musl") | not))
+duplicate exact primary	.release_contract.exact_primary_assets |= with_entries(.value="Lite")
+unsafe exact primary	.release_contract.exact_primary_assets |= with_entries(.value="../Lite")
+raw multi-binary family	.workspace_binaries=["syncfixture","worker"]
+conflicting archive format	.archive_format="zip"
+fixed target conflicting with variants	.env.CARGO_BUILD_TARGET="x86_64-unknown-linux-gnu"
+STRICT_INVALID
+    cp "$strict_root/original.json" "$strict_config" || return 1
+    jq --arg platform "linux/$arch" '.tool_name="strict-single" | .repo="example/strict-single" |
+        del(.target_triples) | .release_contract.exact_primary_assets={($platform):"Full.tar.gz"}' \
+        "$strict_root/original.json" > "$DSR_CONFIG_DIR/repos.d/strict-single.yaml" || return 1
+    local single_config="$DSR_CONFIG_DIR/repos.d/strict-single.yaml" single_installer
+    single_installer=$(install_gen_create strict-single 2>> "$work/generate.log") || return 1
+    check 'singleton exact contract uses the standard native compiler default' bash -c \
+        'source "$1" --help >/dev/null; _TARGET_TRIPLE="$2"; [[ $(_contract_asset_plan "$3") == $'\''Full.tar.gz\ttar.gz'\'' ]]' \
+        bash "$single_installer" "$cpu-unknown-linux-gnu" "linux/$arch"
+    jq --arg triple "$cpu-unknown-linux-musl" '.env.CARGO_BUILD_TARGET=$triple' "$single_config" > "$strict_root/single-override.json" || return 1
+    cp "$strict_root/single-override.json" "$single_config" || return 1
+    generation_status=0
+    install_gen_create strict-single > "$strict_root/refused.out" 2> "$strict_root/refused.err" || generation_status=$?
+    check 'undeclared singleton compiler override refuses instead of guessing an ABI' test "$generation_status" -eq 4
+    jq --arg platform "linux/$arch" --arg triple "$cpu-unknown-linux-musl" '.target_triples={($platform):$triple}' \
+        "$strict_root/single-override.json" > "$single_config" || return 1
+    single_installer=$(install_gen_create strict-single 2>> "$work/generate.log") || return 1
+    check 'explicit singleton triple agrees with its configured compiler override' bash -c \
+        'source "$1" --help >/dev/null; _TARGET_TRIPLE="$2"; [[ $(_contract_asset_plan "$3") == $'\''Full.tar.gz\ttar.gz'\'' ]]' \
+        bash "$single_installer" "$cpu-unknown-linux-musl" "linux/$arch"
+    check 'strict installer refuses an unconfigured platform without a guessed name' bash -c \
+        'source "$1" --help >/dev/null; _TARGET_TRIPLE=aarch64-apple-darwin; status=0;
+         value=$(_contract_asset_plan darwin/arm64 2>/dev/null) || status=$?; [[ $status == 4 && -z $value ]]' bash "$strict_installer"
+
+    # Dependency absence must not turn a quoted YAML or JSON strict contract
+    # into an ordinary inferred-name installer. This PATH has real grep and
+    # dirname but deliberately no YAML/JSON parser.
+    mkdir -p "$strict_root/no-parser" || return 1
+    local utility parser_case
+    for utility in dirname grep; do
+        ln -s "$(command -v "$utility")" "$strict_root/no-parser/$utility" || return 1
+    done
+    printf '%s\n' 'tool_name: strict-demo' 'repo: example/strict-demo' \
+        '"release_contract": {checksum_sidecar: sha256}' > "$strict_root/quoted.yaml"
+    for parser_case in "$strict_root/quoted.yaml" "$strict_root/original.json"; do
+        generation_status=0
+        PATH="$strict_root/no-parser" /bin/bash -c 'source "$3/src/logging.sh"; source "$1"; _install_gen_contract_model "$2"' \
+            bash "${DSR_INSTALL_GEN_MODULE:-$ROOT/src/install_gen.sh}" "$parser_case" "$ROOT" \
+            > "$strict_root/no-parser.out" 2> "$strict_root/no-parser.err" || generation_status=$?
+        check "parser absence refuses strict ${parser_case##*/} configuration" test "$generation_status" -eq 3
+        check 'strict parser failure emits no ordinary fallback model' test ! -s "$strict_root/no-parser.out"
+    done
+}
+
+if [[ "${1:-}" == --strict-contracts-only ]]; then
+    test_strict_contract_installers || exit 1
+    printf 'Strict contract installer: %s passed, %s failed\n' "$passed" "$failed"
+    [[ $failed -eq 0 ]]
+    exit $?
+fi
 set_manifest "$hash  $asset"
 run_install
 check 'default install verifies release name, not temporary archive name' success
@@ -617,5 +829,6 @@ else
     echo 'note: archive-format generation cases require yq and jq'
 fi
 
+test_strict_contract_installers || exit 1
 printf 'Generated installer integrity: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]

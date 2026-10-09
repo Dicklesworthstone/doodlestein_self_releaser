@@ -111,6 +111,7 @@ ARCHIVE_FORMAT_WINDOWS="__ARCHIVE_FORMAT_WINDOWS__"
 # The template is data, not shell code. Expand its variables only in the renderer.
 ARTIFACT_NAMING='__ARTIFACT_NAMING__'
 LINUX_LIBC_FALLBACK='__LINUX_LIBC_FALLBACK__'
+STRICT_RELEASE_CONTRACT=__STRICT_RELEASE_CONTRACT__
 
 # Minisign public key for signature verification (embedded from dsr config)
 # If empty, signature verification is skipped
@@ -535,6 +536,17 @@ _resolve_target_triple() {
     echo "${candidates%% *}"
 }
 
+# Strict releases own literal asset names and formats for each compiler target.
+# Keep this table separate from generic naming: even an arbitrary Full/Lite
+# name must select the exact variant, without aliases or extension guesses.
+_contract_asset_plan() {
+    case "$1@$_TARGET_TRIPLE" in
+__CONTRACT_ASSET_CASES__
+    esac
+    _log_error "No exact release asset is configured for $1 ($_TARGET_TRIPLE)"
+    return 4
+}
+
 _apply_artifact_pattern() {
     local pattern="$1"
     local os="$2"
@@ -584,6 +596,12 @@ _apply_artifact_pattern() {
 # even with separate cache entries and a valid checksum.
 _variant_asset_name() {
     local os="$1" arch="$2" version="$3" format="$4" name candidates primary primary_name
+    if $STRICT_RELEASE_CONTRACT; then
+        local plan
+        plan=$(_contract_asset_plan "$os/$arch") || return $?
+        printf '%s\n' "${plan%%$'\t'*}"
+        return 0
+    fi
     name=$(_apply_artifact_pattern "$ARTIFACT_NAMING" "$os" "$arch" "$version" "$format") || return $?
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && "$name" != *..* ]] || {
         _log_error "Unresolved or unsafe release asset name: $name"; return 4;
@@ -1574,11 +1592,7 @@ main() {
     fi
     _log_info "Version: $_VERSION"
 
-    # Get archive format
-    local format
-    format=$(_get_archive_format "$platform")
-    case "$format" in tar.gz|tgz|tar.xz|zip|tar|none|exe) ;; *) return 4 ;; esac
-    local asset_name
+    local format asset_name asset_plan
 
     # Create temp directory. _TEMP_DIR is a script-scope global so the
     # EXIT trap can still see it after main() returns and locals are
@@ -1596,7 +1610,14 @@ main() {
     while IFS= read -r _TARGET_TRIPLE; do
         [[ -n "$_TARGET_TRIPLE" ]] || continue
         _log_info "Target: $_TARGET_TRIPLE"
-        asset_name=$(_variant_asset_name "${platform%/*}" "${platform#*/}" "${_VERSION#v}" "$format") || return $?
+        if $STRICT_RELEASE_CONTRACT; then
+            asset_plan=$(_contract_asset_plan "$platform") || return $?
+            IFS=$'\t' read -r asset_name format <<< "$asset_plan"
+        else
+            format=$(_get_archive_format "$platform") || return $?
+            asset_name=$(_variant_asset_name "${platform%/*}" "${platform#*/}" "${_VERSION#v}" "$format") || return $?
+        fi
+        case "$format" in tar.gz|tgz|tar.xz|zip|tar|none|exe) ;; *) return 4 ;; esac
         cache_platform=$(_target_cache_platform "$platform") || return $?
         archive_file="$temp_dir/${_TARGET_TRIPLE}-${TOOL_NAME}.${format}"
         if [[ -n "$_OFFLINE_ARCHIVE" ]]; then
@@ -1915,6 +1936,96 @@ _install_gen_archive_formats() {
     printf '%s\n' "$formats"
 }
 
+# Resolve the exact file selected by the generator, rather than a same-named
+# registry entry. A strict installer carries a closed compiler-target table;
+# unconfigured singleton targets use the same standard naming defaults as the
+# native backend. An ambient build-target override must be declared explicitly
+# in target_triples so the installer cannot guess a different ABI.
+_install_gen_contract_model() (
+    local config_file="$1" config_tool config_dir contract rows document row
+    local platform triple name format selected_env model='[]'
+    if ! command -v yq >/dev/null || ! command -v jq >/dev/null; then
+        if grep -Eq "(^|[[:space:]{,])['\"]?release_contract['\"]?[[:space:]]*:" "$config_file"; then
+            log_error "yq and jq are required to validate exact release assets"
+            return 3
+        fi
+        printf 'null\n'
+        return 0
+    fi
+    config_tool="${config_file##*/}"
+    config_tool="${config_tool%.yaml}"
+    config_dir=$(cd "$(dirname "$config_file")/.." && pwd) || return 3
+    local DSR_CONFIG_DIR="$config_dir" DSR_REPOS_FILE=''
+    if ! declare -F config_get_release_contract_targets_json >/dev/null; then
+        # shellcheck source=./config.sh
+        source "$_IG_SCRIPT_DIR/config.sh" || return 3
+    fi
+    export DSR_REPOS_FILE=''
+    contract=$(config_get_release_contract_json "$config_tool") || return $?
+    if [[ "$contract" == null ]]; then
+        printf 'null\n'
+        return 0
+    fi
+    config_validate_release_contract "$config_tool" || return 4
+    rows=$(config_get_release_contract_targets_json "$config_tool") || return 4
+    document=$(yq -o=json -I=0 '.' "$config_file") || return 4
+    if ! declare -F _an_default_target_triple >/dev/null; then
+        # shellcheck source=./artifact_naming.sh
+        source "$_IG_SCRIPT_DIR/artifact_naming.sh" || return 3
+    fi
+    while IFS= read -r row; do
+        platform=$(jq -er '.platform' <<< "$row") || return 4
+        triple=$(jq -er '.target_triple | strings' <<< "$row") || return 4
+        if [[ -z "$triple" ]]; then
+            case "$platform" in
+                linux/amd64|linux/arm64|darwin/amd64|darwin/arm64|windows/amd64|windows/arm64)
+                    triple=$(_an_default_target_triple "${platform%/*}" "${platform#*/}") || return 4 ;;
+                *) log_error "Declare target_triples for strict installer platform $platform"; return 4 ;;
+            esac
+        fi
+        # Native matrix workers already reject fixed conflicting targets. Do
+        # the same for installers, including singleton defaults: a configured
+        # compiler override is never permission to select another asset.
+        if ! selected_env=$(jq -ce --arg platform "$platform" --arg triple "$triple" '
+            if .language == "rust" then
+                [.env.CARGO_BUILD_TARGET, .cross_compile[$platform].env.CARGO_BUILD_TARGET] |
+                all(.[]; . == null or . == "" or . == $triple)
+            else true end
+        ' <<< "$document") || [[ "$selected_env" != true ]]; then
+            log_error "Strict installer target $platform ($triple) conflicts with CARGO_BUILD_TARGET; declare matching target_triples and remove conflicting overrides"
+            return 4
+        fi
+        name=$(jq -er --arg key "$(jq -r '.key' <<< "$row")" '.exact_primary_assets[$key]' <<< "$contract") || return 4
+        # Match strict native packaging, whose exact basename owns the format.
+        case "$name" in
+            *.tar.gz|*.tgz) format=tar.gz ;;
+            *.tar.xz) format=tar.xz ;;
+            *.zip) format=zip ;;
+            *) format=none ;;
+        esac
+        if [[ "$format" != none ]] && ! jq -e --arg os "${platform%/*}" --arg required "$format" '
+            (if .archive_format == null then ""
+             elif (.archive_format | type) == "object" then .archive_format[$os] // ""
+             else .archive_format end) |
+            if . == "tgz" then "tar.gz" else . end |
+            . == "" or . == $required
+        ' <<< "$document" >/dev/null; then
+            log_error "Configured archive format conflicts with exact strict asset $name"
+            return 4
+        fi
+        if [[ "$format" == none ]] && ! jq -e --arg platform "$platform" '
+            (.workspace_binaries_by_target[$platform] // .workspace_binaries // []) | length <= 1
+        ' <<< "$document" >/dev/null; then
+            log_error "Raw strict asset $name cannot install multiple workspace executables"
+            return 4
+        fi
+        model=$(jq -c --argjson row "$row" --arg triple "$triple" --arg name "$name" --arg format "$format" '
+            . + [($row + {target_triple:$triple, name:$name, format:$format})]
+        ' <<< "$model") || return 4
+    done < <(jq -c '.[]' <<< "$rows")
+    printf '%s\n' "$model"
+)
+
 # Generate install.sh for a single tool
 install_gen_create() {
     local tool_name="${1:-}"
@@ -1934,6 +2045,7 @@ install_gen_create() {
     local repo binary_name language workflow_path local_path
     local archive_linux archive_darwin archive_windows archive_formats
     local artifact_naming linux_libc_fallback=none workspace_binary_cases
+    local contract_model strict_release_contract=false contract_asset_cases=''
     local source_subdir source_entry source_package source_engine field value
 
     tool_name=$(_install_gen_yaml_get "$config_file" "tool_name" "$tool_name")
@@ -1943,6 +2055,8 @@ install_gen_create() {
     workflow_path=$(_install_gen_yaml_get "$config_file" "workflow" ".github/workflows/release.yml")
     local_path=$(_install_gen_yaml_get "$config_file" "local_path" "")
     workspace_binary_cases=$(_install_gen_workspace_cases "$config_file" "$binary_name") || return $?
+    contract_model=$(_install_gen_contract_model "$config_file") || return $?
+    [[ "$contract_model" == null ]] || strict_release_contract=true
 
     # Embed the source engine as code, but source-selection fields as validated
     # literals. Failure must precede creation or replacement of any installer.
@@ -2075,6 +2189,24 @@ install_gen_create() {
         return 3
     fi
 
+    if $strict_release_contract; then
+        # These values passed closed contract/name validation. Emit only plain
+        # case labels and quoted literals; no policy text becomes shell code.
+        local contract_platform contract_triple contract_name contract_format contract_case
+        target_triple_cases=''
+        while IFS= read -r contract_platform; do
+            contract_triple=$(jq -r --arg platform "$contract_platform" '
+                [.[] | select(.platform == $platform) | .target_triple] | join(" ")
+            ' <<< "$contract_model") || return 4
+            target_triple_cases+=$'        '"$contract_platform"$') echo "'"$contract_triple"'"; return 0 ;;'$'\n'
+        done < <(jq -r 'map(.platform) | unique[]' <<< "$contract_model")
+        while IFS=$'\t' read -r contract_platform contract_triple contract_name contract_format; do
+            printf -v contract_case '        %s@%s) printf '\''%%s\\t%%s\\n'\'' '\''%s'\'' '\''%s'\''; return 0 ;;\n' \
+                "$contract_platform" "$contract_triple" "$contract_name" "$contract_format"
+            contract_asset_cases+="$contract_case"
+        done < <(jq -r '.[] | [.platform,.target_triple,.name,.format] | @tsv' <<< "$contract_model")
+    fi
+
     # The minisign public key the installer verifies against. Releases signed
     # by dsr ship .minisig files; an installer generated without the key
     # would skip that verification without saying so.
@@ -2175,6 +2307,8 @@ install_gen_create() {
     template="${template//__ARCHIVE_FORMAT_WINDOWS__/$archive_windows}"
     template="${template//__ARTIFACT_NAMING__/$artifact_naming}"
     template="${template//__LINUX_LIBC_FALLBACK__/$linux_libc_fallback}"
+    template="${template//__STRICT_RELEASE_CONTRACT__/$strict_release_contract}"
+    template="${template//__CONTRACT_ASSET_CASES__/"$contract_asset_cases"}"
     template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
     template="${template//__TARGET_TRIPLE_CASES__/$target_triple_cases}"
     template="${template//__ARCH_ALIAS_CASES__/$arch_alias_cases}"

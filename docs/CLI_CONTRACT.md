@@ -937,6 +937,22 @@ key, source settings and executable selection. Regenerate it after changing
 those settings. Validation checks syntax, ShellCheck and required safety
 elements. Configuration errors exit 4; a failure affecting some tools exits 1.
 
+When `release_contract` is present, generation validates and embeds the exact
+platform/triple asset inventory. A selected variant resolves its literal
+`exact_primary_assets` name before any cache lookup or download. The exact
+extension selects gzip (`.tar.gz` or `.tgz`), xz (`.tar.xz`), ZIP (`.zip`), or
+otherwise a raw executable. This selection is repeated for each permitted
+libc fallback candidate, so an archive and a raw executable can coexist in one
+matrix. Ordinary naming templates and compatibility aliases do not replace
+these exact names. Checksums and configured signatures verify the selected
+asset, and variant cache entries remain separate. Integrity failures never
+trigger another candidate.
+
+An omitted singleton target triple uses the standard platform default.
+Singleton Rust compiler-target overrides must have a matching explicit
+`target_triples` entry; conflicting overrides fail generation. The generated
+runtime table requires no jq or yq on the installing machine.
+
 The generated installer's executable selection follows `workspace_binaries`
 and `workspace_binaries_by_target`. An explicit platform override replaces
 the global list, including an empty override. An empty or absent effective

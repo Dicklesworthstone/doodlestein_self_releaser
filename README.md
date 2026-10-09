@@ -779,6 +779,20 @@ format selects a raw executable with no Unix asset suffix or `.exe` on Windows.
 Configured formats require yq and jq during generation; unsupported formats
 fail before replacing an existing installer.
 
+For a `release_contract`, the installer embeds the validated
+`exact_primary_assets` mapping and resolves the literal asset name for the
+selected platform and compiler triple. GNU and musl can have arbitrary names
+and different formats, including an archive for one and a raw executable for
+the other. Each candidate's exact name selects its download, checksum,
+signature, extraction format and separate variant cache. The installer does
+not infer libc from a contracted filename or invent compatibility aliases.
+Configured libc selection and explicit fallback policy still apply; an
+integrity failure never triggers a different variant.
+
+Declare `target_triples` explicitly when a singleton Rust build overrides
+`CARGO_BUILD_TARGET`. Generation refuses a conflicting compiler identity
+instead of emitting an installer for a different ABI.
+
 For a workspace release, the installer installs the complete configured
 executable set into the selected `--dir`:
 

@@ -167,19 +167,27 @@ missing variant payloads are refused. Workflow receipts remain
 valid when one act job supplies only some configured variants or supplies
 artifacts for several platforms.
 
-Shared installer aliases remain supported and have one deterministic owner.
+Ordinary builds can expose shared installer aliases with one deterministic owner.
 Use a target-qualified pattern when installers must select both variants. The
 generated installer refuses to install a nonprimary variant through an alias
 whose name is also used by the primary, and rejects literal libc markers that
 contradict the selected triple.
 
-When a native matrix uses a versioned naming pattern without the triple, the
+When an ordinary native matrix uses a versioned naming pattern without the triple, the
 primary keeps that configured name and each colliding secondary archive gains
 its triple before the archive extension. Both native variants therefore get
 their own archive even under the default naming pattern. A shared compatibility
 alias still belongs to the primary; a distinct alias for the secondary is
 retained. Use `${target_triple}` explicitly when those archive names must also
 be selectable by generated installers.
+
+Strict generated installers instead embed the validated exact contract. They
+resolve the selected platform and triple directly to its literal primary name
+and actual format, without parsing GNU/musl markers or applying ordinary naming
+templates. An arbitrary gzip primary and a differently named raw executable
+can therefore serve the two libc variants. Download, checksum, signature,
+extraction and cache selection all use the same resolved candidate; a permitted
+libc fallback resolves the new candidate's name and format again.
 
 Generated installers inspect the host libc before selecting an artifact. They
 recognize musl even when `ldd --version` writes to stderr and exits nonzero, and
