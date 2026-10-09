@@ -645,6 +645,23 @@ Unlisted targets retain the default list. Invalid lists and colliding Windows
 executable names fail before collection; native binaries do not belong in
 `workspace_archive_files`, which is reserved for companion files.
 
+### Pinned Windows builds from Linux
+
+Linux release coordinators can build Windows x64 and ARM64 through
+`scripts/xwin-build.sh`. A pinned toolchain manifest selects
+`x86_64-pc-windows-msvc` or `aarch64-pc-windows-msvc`, including the matching
+MSVC libraries, LLVM headers and executable machine check. Source-pinned release
+mode authenticates the committed workspace and locked dependencies and emits
+the existing DSR build manifest with explicit target-triple evidence.
+
+Select this backend with the [pinned build command](docs/XWIN_BUILD.md) or an
+`xwin` job in a [release build plan](docs/RELEASE_BUILDS.md). Each job selects one
+Windows architecture; a plan can build both concurrently, retain a successful
+architecture when the other fails, and collect the complete matrix before
+packaging or publication. Toolchain manifests and selected outputs must agree
+with the job's architecture. See [toolchain preparation](docs/XWIN_TOOLCHAIN.md)
+for the required archive and executable pins.
+
 ### `dsr release`
 
 Upload artifacts to GitHub Release.

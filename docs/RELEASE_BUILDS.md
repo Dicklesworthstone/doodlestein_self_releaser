@@ -10,7 +10,7 @@ Three drivers are supported:
 - `dsr`: run the existing `dsr --json --non-interactive build` command with a
   frozen configuration and private state/output directories; optionally resume
   the exact native run after a partial failure.
-- `xwin`: run the source-pinned Windows ARM64 runner, including its toolchain,
+- `xwin`: run the source-pinned Windows x64 or ARM64 runner, including its toolchain,
   Cargo metadata, committed source, optional siblings, and PE admission gates.
 - `import`: accept an already-produced manifest selected by its explicit SHA-256.
 
@@ -22,7 +22,7 @@ its own weaker successful-build profile.
 
 ## Plan and execution
 
-The following example combines native Linux/macOS builds and Windows ARM64.
+The following example combines native Linux/macOS builds with both Windows architectures.
 Replace the deliberately invalid pin placeholders with reviewed SHA-256 values.
 The native configuration must already define the requested targets and source;
 this command does not rewrite a repository's release contract to admit a subset.
@@ -34,7 +34,7 @@ this command does not rewrite a repository's release contract to admit a subset.
   "tool": "demo",
   "tag": "v1.2.3",
   "source_sha": "<reviewed full 40-character source commit>",
-  "required_targets": ["linux/amd64", "darwin/arm64", "windows/arm64"],
+  "required_targets": ["linux/amd64", "darwin/arm64", "windows/amd64", "windows/arm64"],
   "builds": [
     {
       "id": "native",
@@ -60,6 +60,20 @@ this command does not rewrite a repository's release contract to admit a subset.
       "binary": "demo",
       "package": "demo",
       "asset_name": "demo-aarch64-pc-windows-msvc.exe",
+      "offline": true,
+      "cargo_cache": "/home/builder/.cargo",
+      "cache_dir": "/srv/cache/xwin",
+      "timeout": 7200
+    },
+    {
+      "id": "windows-x64",
+      "driver": "xwin",
+      "targets": ["windows/amd64"],
+      "project": "/srv/projects/demo",
+      "toolchain_manifest": "/srv/pinned/windows-x64.json",
+      "toolchain_sha256": "<actual SHA-256 of the x64 toolchain manifest>",
+      "binary": "demo",
+      "package": "demo",
       "offline": true,
       "cargo_cache": "/home/builder/.cargo",
       "cache_dir": "/srv/cache/xwin",
@@ -101,6 +115,14 @@ follow the existing builder. No `--allow-dirty`, `--no-sync`, diagnostic mode,
 publication flag, or arbitrary shell command is synthesized.
 
 The xwin driver requires a project, toolchain-manifest path/hash and binary.
+Each job selects exactly one of `windows/amd64` and `windows/arm64`. The frozen
+toolchain manifest must respectively select `x86_64-pc-windows-msvc` or
+`aarch64-pc-windows-msvc`; a mismatch is refused before launching the compiler.
+Default asset names are `<binary>-<selected-triple>.exe`. Separate jobs can
+build both architectures from the same committed project and shared prepared-view
+cache, with independent attempt directories and architecture-specific view keys.
+The compiler result, producer environment, pinned toolchain and each artifact's
+target triple must all agree with the job before its output is admitted.
 `package`, `asset_name`, `cargo_cache`, `cache_dir`, and `offline` are optional.
 Repository/tag/source SHA/tool come from the plan. To include pinned sibling
 repositories, add `"siblings": {"path": "/srv/pinned/siblings.json",
@@ -131,7 +153,7 @@ Feature selections belong to the frozen build plan and exact command receipt.
 Retries and recovery cannot change a feature name or switch while reusing a
 completed compiler attempt. When a plan selects features, bundle admission
 also requires the producer manifest to retain that exact `feature_selection`
-under its Windows ARM64 build environment. Missing or contradictory evidence
+under its selected Windows build environment. Missing or contradictory evidence
 keeps the job incomplete. An explicitly recorded selection must also agree
 when the plan requests default features; a producer cannot silently disable
 defaults or add features to that plan. Multiple requested binaries must all pass the
@@ -230,7 +252,7 @@ state/configuration drift and failure-boundary tests. Native compilation/SSH
 is an explicit command-boundary fixture; the
 coordinator and full bundle/SLSA modules run unchanged apart from this feature.
 
-### Recover completed native and Windows ARM64 compilation
+### Recover completed native and Windows cross-compilation
 
 Post-compilation import recovery also applies to `xwin` jobs and native jobs
 without `resume: true`. A zero compiler exit and valid completion envelope can
@@ -241,9 +263,11 @@ it does not start a second compiler or select newer output to replace it.
 Re-run the same build-plan or combined finalization command. Recovery checks
 the original plan-bound `inputs.json`, reconstructs the exact command from the
 selected job, validates its completion envelope, and rehashes the selected
-manifest. Native jobs recheck their frozen configuration. Windows ARM64 jobs
+manifest. Native jobs recheck their frozen configuration. Windows xwin jobs
 recheck the frozen toolchain and sibling-plan files and the complete selected
-binary inventory, including companions. The full collector still enforces
+binary inventory, including companions and the selected architecture. A retry
+cannot switch an x64 job to ARM64 or adopt an opposite-architecture completion
+receipt. The full collector still enforces
 source, release purpose, target coverage and every payload's size and hash.
 
 Missing or changed payloads keep the job incomplete. Restore or transfer the
@@ -263,7 +287,7 @@ success. Ordinary `import` jobs continue to use their independently selected
 manifest pins and existing retry behavior; they never run a compiler.
 
 Run `bash scripts/tests/test_release_builds_recovery.sh`. The coordinator,
-collector, hashes and filesystem operations are real; native and Windows ARM64
+collector, hashes and filesystem operations are real; native and Windows xwin
 compiler commands are explicit fixtures, not live toolchain acceptance.
 
 Successful checkpoints no longer depend on original compiler-output paths.

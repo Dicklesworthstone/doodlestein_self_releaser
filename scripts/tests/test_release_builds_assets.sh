@@ -73,7 +73,7 @@ for binary in selected:
     name = arg('--asset-name') if '--asset-name' in args else binary+'-aarch64-pc-windows-msvc.exe'
     data = (binary+' producer fixture\n').encode()
     (root/'artifacts'/name).write_bytes(data)
-    artifacts.append({'name':name,'target':'windows/arm64','archive_format':'binary',
+    artifacts.append({'name':name,'target':'windows/arm64','target_triple':spec['target'],'archive_format':'binary',
                       'sha256':hashlib.sha256(data).hexdigest(),'size_bytes':len(data)})
 if mode == 'omit': artifacts.pop()
 if mode == 'extra': artifacts.append(dict(artifacts[0],name='extra.exe'))
@@ -84,15 +84,17 @@ manifest = root/'release/build-manifest.json'; manifest.parent.mkdir()
 manifest.write_text(json.dumps({'schema_version':'1.0.0','tool':arg('--tool'),'version':arg('--release-tag'),
     'run_id':'11111111-1111-4111-8111-111111111111','built_at':'2026-09-24T00:00:00Z','status':'success',
     'source':{'git_sha':arg('--source-sha'),'git_ref':'refs/tags/'+arg('--release-tag'),'dependencies':[]},
-    'summary':{'total':1,'success':1,'failed':0},'artifacts':artifacts}))
-print(json.dumps({'kind':'dsr-xwin-build','status':'verified','exit_code':0,
+    'summary':{'total':1,'success':1,'failed':0},'artifacts':artifacts,
+    'build_environments':[{'target':'windows/arm64','target_triple':spec['target'],
+                           'method':'pinned-cargo-xwin','toolchain':{'target':spec['target'],'inputs':{'target':spec['target']}}}]}))
+print(json.dumps({'kind':'dsr-xwin-build','status':'verified','exit_code':0,'target':spec['target'],
                   'release_manifest':{'path':str(manifest),'sha256':hashlib.sha256(manifest.read_bytes()).hexdigest()}}))
 ''')
 control = work / "control"
 control.write_text("good")
 trace = work / "calls.jsonl"
 toolchain = work / "toolchain.json"
-save(toolchain, {"control": str(control), "trace": str(trace)})
+save(toolchain, {"control": str(control), "trace": str(trace), "target": "aarch64-pc-windows-msvc"})
 linux = work / "linux"
 (linux / "artifacts").mkdir(parents=True)
 (linux / "artifacts/app-linux").write_bytes(b"linux producer fixture\n")

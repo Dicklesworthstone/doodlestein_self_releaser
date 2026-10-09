@@ -67,6 +67,30 @@ run_code 'complete multi-binary xwin recipe can be planned without installed com
 assert 'xwin preview preserves every selected executable' jq -e \
     '([.packaging.inputs[]|select(.target=="windows/arm64")]|length)==2' "$CASE/result.json"
 
+cp "$CASE/plan.json" "$CASE/arm64-plan.json"
+cp "$CASE/recipe.json" "$CASE/arm64-recipe.json"
+jq '.required_targets += ["windows/amd64"] |
+    .builds += [(.builds[1] | .id="windows-x64" | .targets=["windows/amd64"])]' \
+    "$CASE/arm64-plan.json" > "$CASE/plan.json"
+jq '.artifacts += [{name:"tool-windows-x64.zip",target:"windows/amd64",archive_format:"zip",
+    members:[{source:"tool-x86_64-pc-windows-msvc.exe",path:"tool.exe"},
+             {source:"companion-x86_64-pc-windows-msvc.exe",path:"companion.exe"}]}]' \
+    "$CASE/arm64-recipe.json" > "$CASE/recipe.json"
+run_code 'both xwin architectures retain complete independent packaging contracts' 0 plan_flow --dry-run
+assert 'dual Windows preview keeps each companion with its own architecture' jq -e \
+    '([.packaging.inputs[]|select(.target=="windows/amd64")]|map(.name)|sort)==
+        ["companion-x86_64-pc-windows-msvc.exe","tool-x86_64-pc-windows-msvc.exe"] and
+     ([.packaging.inputs[]|select(.target=="windows/arm64")]|map(.name)|sort)==
+        ["companion-aarch64-pc-windows-msvc.exe","tool-aarch64-pc-windows-msvc.exe"]' "$CASE/result.json"
+cp "$CASE/recipe.json" "$CASE/dual-recipe.json"
+for mutation in '.artifacts[2].members|=.[0:1]' \
+    '.artifacts[2].members[1].source="companion-aarch64-pc-windows-msvc.exe"'; do
+    jq "$mutation" "$CASE/dual-recipe.json" > "$CASE/recipe.json"
+    run_code 'x64 companion omission or ARM64 substitution is refused before compilation' 4 plan_flow
+    assert 'invalid x64 packaging creates neither build state nor release calls' test ! -e "$CASE/builds"
+    assert 'invalid x64 packaging never reaches publication' test ! -s "$CASE/calls"
+done
+
 plan_case recovery
 mv "$CASE/windows/artifacts/tool-windows.exe" "$CASE/held.exe"
 run_code 'one failed import keeps the plan incomplete before packaging' 1 plan_flow

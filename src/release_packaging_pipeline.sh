@@ -68,6 +68,10 @@ _rf_packaging_contract() {
     jq -en --slurpfile plan "$plan" --slurpfile preview "$preview" '
         $plan[0] as $p | $preview[0] as $r |
         def raw: .=="binary" or .=="none";
+        def xwin_triple($target):
+            if $target=="windows/amd64" then "x86_64-pc-windows-msvc"
+            elif $target=="windows/arm64" then "aarch64-pc-windows-msvc"
+            else error("unsupported xwin packaging target") end;
         ([$r.required_assets[].target]|unique|sort)==($p.required_targets|sort) and
         (if $p|has("required_assets") then
             ($p.required_assets|map({name,target})|sort_by(.name,.target))==($r.inputs|sort_by(.name,.target)) and
@@ -81,10 +85,11 @@ _rf_packaging_contract() {
         # global asset contract. Do not start a compiler for an impossible
         # recipe that drops a selected companion or asks for another binary.
         all($p.builds[] | select(.driver?=="xwin"); . as $job |
+            $job.targets[0] as $target | xwin_triple($target) as $triple |
             [($job.binaries // [$job.binary])[] |
-                {name:($job.asset_name // (. + "-aarch64-pc-windows-msvc.exe")),target:"windows/arm64"}] as $expected |
-            ([$r.inputs[]|select(.target=="windows/arm64")]|sort_by(.name))==($expected|sort_by(.name)) and
-            all($r.recipe.artifacts[]|select(.target=="windows/arm64");
+                {name:($job.asset_name // (. + "-" + $triple + ".exe")),target:$target}] as $expected |
+            ([$r.inputs[]|select(.target==$target)]|sort_by(.name))==($expected|sort_by(.name)) and
+            all($r.recipe.artifacts[]|select(.target==$target);
                 has("members") or (.archive_format|raw)))' >/dev/null || {
         _rf_log 'Packaging recipe differs from the producer target/asset contract'; return 4;
     }

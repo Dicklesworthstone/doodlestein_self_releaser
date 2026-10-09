@@ -71,7 +71,7 @@ else:
     spec = json.loads(Path(arg('--manifest')).read_text())
     output = Path(arg('--run-dir'))/'artifacts'
     manifest = output.parent/'release/build-manifest.json'
-    targets = ['windows/arm64']
+    targets = [{'aarch64-pc-windows-msvc':'windows/arm64', 'x86_64-pc-windows-msvc':'windows/amd64'}[spec['target']]]
     tool, tag, source = arg('--tool'), arg('--release-tag'), arg('--source-sha')
     assert arg('--release-repo') == 'owner/demo' and arg('--bin') == 'demo'
     assert arg('--package') == 'demo-package' and '--offline' in args
@@ -99,15 +99,19 @@ output.mkdir(parents=True)
 artifacts = []
 for target in targets:
     name = 'demo-'+target.replace('/', '-')+'.bin'
-    if kind == 'xwin': name = arg('--asset-name')
+    if kind == 'xwin': name = arg('--asset-name') if '--asset-name' in args else arg('--bin')+'-'+spec['target']+'.exe'
     data = ('built '+target+'\n').encode()
-    (output/name).write_bytes(data)
+    if mode != 'missing-payload': (output/name).write_bytes(data)
     artifacts.append({'name':name, 'target':target, 'sha256':hashlib.sha256(data).hexdigest(), 'size_bytes':len(data), 'archive_format':'binary'})
+    if kind == 'xwin': artifacts[-1]['target_triple'] = spec['target']
 value = {'schema_version':'1.0.0', 'tool':tool, 'version':tag, 'run_id':'12345678-1234-4123-8123-123456789abc',
          'source':{'git_sha':source, 'git_ref':'refs/tags/'+tag, 'dependencies':[]}, 'built_at':'2026-09-22T00:00:00Z',
          'status':'success', 'summary':{'total':len(targets), 'success':len(targets), 'failed':0}, 'artifacts':artifacts,
          'build_environments':[{'target':target, 'method':kind, 'retained_evidence':'x'*150000} for target in targets]}
 if kind == 'xwin':
+    environment = value['build_environments'][0]
+    environment.update(method='pinned-cargo-xwin', target_triple=spec['target'],
+                       toolchain={'target':spec['target'],'inputs':{'target':spec['target']}})
     value['build_environments'][0]['feature_selection'] = {
         'features':arg('--features').split(',') if '--features' in args else [], 'all_features':'--all-features' in args,
         'no_default_features':'--no-default-features' in args}
@@ -115,6 +119,17 @@ if kind == 'xwin':
     if mode == 'feature-missing': del value['build_environments'][0]['feature_selection']
     if mode == 'feature-boolean': value['build_environments'][0]['feature_selection']['all_features'] = 1
     if mode == 'feature-reverse': value['build_environments'][0]['feature_selection']['no_default_features'] = True
+    other_target = 'aarch64-pc-windows-msvc' if spec['target'] == 'x86_64-pc-windows-msvc' else 'x86_64-pc-windows-msvc'
+    other_platform = 'windows/arm64' if targets == ['windows/amd64'] else 'windows/amd64'
+    if mode == 'producer-platform': environment['target'] = other_platform
+    if mode == 'producer-triple': environment['target_triple'] = other_target
+    if mode == 'producer-toolchain': environment['toolchain']['target'] = other_target
+    if mode == 'producer-toolchain-input': environment['toolchain']['inputs']['target'] = other_target
+    if mode == 'producer-triple-missing': del environment['target_triple']
+    if mode == 'producer-environment-missing': value['build_environments'] = []
+    if mode == 'producer-artifact-target': value['artifacts'][0]['target'] = other_platform
+    if mode == 'producer-artifact-triple': value['artifacts'][0]['target_triple'] = other_target
+    if mode == 'producer-artifact-triple-missing': del value['artifacts'][0]['target_triple']
 if mode == 'wrong-source': value['source']['git_sha'] = 'b'*40
 if mode == 'bad-hash': value['artifacts'][0]['sha256'] = '0'*64
 if mode == 'diagnostic': value['publishable'] = False
@@ -127,8 +142,10 @@ if mode == 'silent': sys.exit(0)
 if kind == 'dsr':
     response = {'command':'build', 'status':'success', 'exit_code':0, 'details':{'manifest':str(manifest)}}
 else:
-    response = {'kind':'dsr-xwin-build', 'status':'verified', 'exit_code':0,
+    response = {'kind':'dsr-xwin-build', 'status':'verified', 'exit_code':0, 'target':spec['target'],
                 'release_manifest':{'path':str(manifest), 'sha256':hashlib.sha256(manifest.read_bytes()).hexdigest()}}
+    if mode == 'receipt-target': response['target'] = other_target
+    if mode == 'receipt-target-missing': del response['target']
 if mode == 'wrong-receipt': response['exit_code'] = 7
 if mode == 'null-details': response['details'] = None
 if mode == 'array-details': response['details'] = []
@@ -150,7 +167,7 @@ print(json.dumps(response))
     a, b = native('linux', 'linux/amd64'), native('darwin', 'darwin/arm64')
     control = work/'control-windows'; control.write_text('good'); controls['windows']=control
     toolchain, siblings = work/'toolchain.json', work/'siblings.json'
-    encode(toolchain, {'id':'windows','trace':str(trace),'control':str(control)})
+    encode(toolchain, {'id':'windows','trace':str(trace),'control':str(control),'target':'aarch64-pc-windows-msvc'})
     encode(siblings, [])
     windows = {'id':'windows', 'driver':'xwin', 'targets':['windows/arm64'], 'project':str(work/'project'),
                'toolchain_manifest':str(toolchain), 'toolchain_sha256':sha(toolchain), 'binary':'demo',
@@ -164,6 +181,7 @@ print(json.dumps(response))
     def run(output, expected=0, selected=planfile, extra=(), env=None):
         proc = subprocess.run(['bash',str(script),'--plan',str(selected),'--output-dir',str(output)] + list(extra),
                               env=env, stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45)
+        run.stderr = proc.stderr.decode()
         if proc.returncode != expected:
             print(proc.stderr.decode(), file=sys.stderr)
             raise AssertionError(f'expected {expected}, got {proc.returncode}: {proc.stdout.decode()}')
@@ -282,8 +300,142 @@ print(json.dumps(response))
         folder=work/('invalid-'+label); before_trace=trace.read_bytes()
         run(folder,4,work/'invalid-features.json')
         check(label+' fails before starting a builder or creating state', not folder.exists() and trace.read_bytes()==before_trace)
-    if os.environ.get('RELEASE_BUILDS_TEST_FEATURES_ONLY') == '1':
-        print(f'Cargo feature plan/recovery/admission checks: {passes} passed, 0 failed; process lifecycle cases not selected', flush=True)
+    # Both Windows platforms use the same coordinator and complete collector;
+    # only the compiler protocol is substituted, just as in the ARM64 cases.
+    architecture_jobs = []
+    for platform, triple in (('windows/amd64','x86_64-pc-windows-msvc'), ('windows/arm64','aarch64-pc-windows-msvc')):
+        identity = platform.replace('/', '-')
+        controls[identity] = work/('control-'+identity)
+        controls[identity].write_text('good')
+        toolchain_file = work/('toolchain-'+identity+'.json')
+        encode(toolchain_file, {'id':identity,'trace':str(trace),'control':str(controls[identity]),'target':triple})
+        job = json.loads(json.dumps(windows))
+        job.update(id=identity, targets=[platform], toolchain_manifest=str(toolchain_file), toolchain_sha256=sha(toolchain_file))
+        del job['asset_name']
+        architecture_jobs.append(job)
+    architecture_plan = dict(plan, required_targets=['windows/amd64','windows/arm64'], builds=architecture_jobs,
+        required_assets=[{'name':'demo-'+triple+'.exe','target':platform,'archive_format':'binary'} for platform, triple in
+                         (('windows/amd64','x86_64-pc-windows-msvc'), ('windows/arm64','aarch64-pc-windows-msvc'))])
+    architecture_file = work/'architectures.json'; encode(architecture_file, architecture_plan)
+    architecture_output = work/'architectures'
+    before_trace = trace.read_bytes()
+    result = run(architecture_output, selected=architecture_file, extra=('--dry-run','--jobs','2'))
+    check('AMD64 and ARM64 jobs partition a single Windows plan without starting compilers',
+          result['plan']['required_targets']==['windows/amd64','windows/arm64'] and
+          not architecture_output.exists() and trace.read_bytes()==before_trace)
+    controls['windows-amd64'].write_text('fail')
+    result = run(architecture_output, 1, architecture_file, extra=('--jobs','2'))
+    arm_manifest = architecture_output/'completed/windows-arm64/build-manifest.json'
+    arm_hash = sha(arm_manifest)
+    check('one failed Windows architecture preserves the other completed architecture',
+          result['failed_builds']==['windows-amd64'] and result['completed_builds']==1 and
+          not (architecture_output/'bundle').exists())
+    controls['windows-amd64'].write_text('good')
+    before_events = len(trace.read_text().splitlines())
+    result = run(architecture_output, selected=architecture_file, extra=('--jobs','2'))
+    new_events = [json.loads(line) for line in trace.read_text().splitlines()[before_events:]]
+    check('retry compiles only AMD64 and preserves the ARM64 checkpoint',
+          {e['job'] for e in new_events}=={'windows-amd64'} and sha(arm_manifest)==arm_hash)
+    aggregate = read(Path(result['bundle']['manifest']))
+    check('both target-specific default asset names survive the complete collector',
+          result['bundle']['targets']==['windows/amd64','windows/arm64'] and
+          sorted([{k:a[k] for k in ('name','target','archive_format')} for a in aggregate['artifacts']], key=lambda a:a['name']) ==
+          sorted(architecture_plan['required_assets'], key=lambda a:a['name']))
+    check('aggregated platform, Rust triple, toolchain and feature evidence agree separately for both architectures',
+          len(aggregate['build_environments'])==2 and all(
+              e['target_triple']=={'windows/amd64':'x86_64-pc-windows-msvc','windows/arm64':'aarch64-pc-windows-msvc'}[e['target']] and
+              e['toolchain']['target']==e['target_triple'] and e['feature_selection']==
+              {'features':['demo-package/cli','demo-package/tls'],'all_features':True,'no_default_features':True}
+              for e in aggregate['build_environments']))
+    swapped = json.loads(json.dumps(architecture_plan))
+    for job, selected_job in zip(swapped['builds'], reversed(architecture_jobs)):
+        for key in ('targets','toolchain_manifest','toolchain_sha256'):
+            job[key] = selected_job[key]
+    encode(work/'swapped-architectures.json', swapped)
+    before_trace = trace.read_bytes(); before_state = (architecture_output/'state.json').read_bytes()
+    run(architecture_output, 2, work/'swapped-architectures.json')
+    check('changing architecture ownership cannot reuse a completed plan even when the matrix still partitions correctly',
+          trace.read_bytes()==before_trace and (architecture_output/'state.json').read_bytes()==before_state)
+
+    amd64_plan = json.loads(json.dumps(architecture_plan))
+    amd64_plan['builds'] = [amd64_plan['builds'][0]]
+    amd64_plan['required_targets'] = ['windows/amd64']
+    amd64_plan['required_assets'] = [a for a in amd64_plan['required_assets'] if a['target']=='windows/amd64']
+    amd64_file = work/'amd64-only.json'; encode(amd64_file, amd64_plan)
+    mismatched = json.loads(json.dumps(amd64_plan))
+    for key in ('toolchain_manifest','toolchain_sha256'):
+        mismatched['builds'][0][key] = architecture_jobs[1][key]
+    encode(work/'mismatched-toolchain.json', mismatched)
+    before_trace = trace.read_bytes(); mismatch_output = work/'mismatched-toolchain'
+    run(mismatch_output, 1, work/'mismatched-toolchain.json')
+    check('a correctly hashed ARM64 toolchain cannot start the selected AMD64 compiler job',
+          trace.read_bytes()==before_trace and 'xwin toolchain target differs from the selected platform' in run.stderr and
+          not (mismatch_output/'attempts/windows-amd64/000001/command.json').exists() and
+          read(mismatch_output/'state.json')['jobs']['windows-amd64']['candidate'] is None)
+    for mode, message in (
+        ('producer-platform','xwin producer platform or toolchain target differs'),
+        ('producer-triple','xwin producer platform or toolchain target differs'),
+        ('producer-toolchain','xwin producer platform or toolchain target differs'),
+        ('producer-toolchain-input','xwin producer platform or toolchain target differs'),
+        ('producer-triple-missing','xwin producer platform or toolchain target differs'),
+        ('producer-environment-missing','xwin manifest must retain one selected build environment'),
+        ('producer-artifact-target','xwin output omits or changes selected executables'),
+        ('producer-artifact-triple','xwin artifact target triple differs from the build plan'),
+        ('producer-artifact-triple-missing','xwin artifact target triple differs from the build plan'),
+        ('receipt-target','xwin completion receipt does not bind its manifest'),
+        ('receipt-target-missing','xwin completion receipt does not bind its manifest'),
+    ):
+        controls['windows-amd64'].write_text(mode)
+        folder = work/('reject-'+mode)
+        run(folder, 1, amd64_file)
+        record = read(folder/'state.json')['jobs']['windows-amd64']
+        check(mode+' refuses contradictory architecture before selecting a compiler candidate',
+              message in run.stderr and record['candidate'] is None and record['complete'] is None and
+              not (folder/'completed/windows-amd64').exists() and not (folder/'bundle').exists())
+
+    controls['windows-amd64'].write_text('missing-payload')
+    pending = work/'amd64-pending-import'
+    run(pending, 1, amd64_file)
+    pending_record = read(pending/'state.json')['jobs']['windows-amd64']
+    candidate = pending_record['candidate']
+    check('successful AMD64 compilation retains its selected manifest when payload transfer is incomplete',
+          candidate is not None and pending_record['complete'] is None and len(pending_record['attempts'])==1)
+    before_trace = trace.read_bytes(); before_state = (pending/'state.json').read_bytes()
+    changed_target = json.loads(json.dumps(amd64_plan))
+    changed_target['required_targets'] = ['windows/arm64']
+    changed_target['required_assets'] = [a for a in architecture_plan['required_assets'] if a['target']=='windows/arm64']
+    for key in ('targets','toolchain_manifest','toolchain_sha256'):
+        changed_target['builds'][0][key] = architecture_jobs[1][key]
+    encode(work/'changed-selected-target.json', changed_target)
+    run(pending, 2, work/'changed-selected-target.json')
+    check('a selected AMD64 compiler candidate cannot be repinned to ARM64 during retry',
+          trace.read_bytes()==before_trace and (pending/'state.json').read_bytes()==before_state)
+    receipt_path = pending/'attempts/windows-amd64/000001/stdout.json'
+    original_receipt = receipt_path.read_bytes()
+    receipt = read(receipt_path); receipt['target'] = 'aarch64-pc-windows-msvc'; encode(receipt_path, receipt)
+    run(pending, 1, amd64_file)
+    check('admission recovery rechecks the selected target in the original completion receipt',
+          'completed xwin envelope changed' in run.stderr and trace.read_bytes()==before_trace and
+          read(pending/'state.json')['jobs']['windows-amd64']['candidate']==candidate)
+    receipt_path.write_bytes(original_receipt)
+    (Path(candidate['artifacts_dir'])/'demo-x86_64-pc-windows-msvc.exe').write_bytes(b'built windows/amd64\n')
+    result = run(pending, selected=amd64_file)
+    check('restoring the exact selected AMD64 payload recovers import without recompilation or changing its pin',
+          trace.read_bytes()==before_trace and result['bundle']['targets']==['windows/amd64'] and
+          read(pending/'state.json')['jobs']['windows-amd64']['complete']==candidate and
+          len(read(pending/'state.json')['jobs']['windows-amd64']['attempts'])==1)
+    controls['windows-amd64'].write_text('good')
+    for label, selected_targets in (('combined',['windows/amd64','windows/arm64']), ('unsupported',['windows/386'])):
+        invalid = json.loads(json.dumps(amd64_plan)); invalid['builds'][0]['targets'] = selected_targets
+        invalid.pop('required_assets'); invalid['required_targets'] = selected_targets
+        encode(work/'invalid-xwin-target.json', invalid)
+        folder = work/('invalid-xwin-'+label); before_trace = trace.read_bytes()
+        run(folder, 4, work/'invalid-xwin-target.json')
+        check(label+' xwin target selection fails before state or compiler creation',
+              'xwin requires exactly one Windows AMD64 or ARM64 target' in run.stderr and
+              not folder.exists() and trace.read_bytes()==before_trace)
+    if os.environ.get('RELEASE_BUILDS_TEST_FEATURES_ONLY') == '1' or os.environ.get('RELEASE_BUILDS_TEST_TARGETS_ONLY') == '1':
+        print(f'Cargo feature/target plan/recovery/admission checks: {passes} passed, 0 failed; process lifecycle cases not selected', flush=True)
         sys.exit(0)
     # Missing reviewed file/hash fails before any child starts.
     changed=json.loads(json.dumps(single)); changed['builds'][0]['config_files']['config.yaml']='0'*64; encode(work/'badpin.json',changed)

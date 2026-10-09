@@ -139,10 +139,15 @@ def asset_contract(value, matrix):
             sorted({a["target"] for a in value}) == matrix, "required assets must uniquely cover every target", 4)
     return sorted(value, key=lambda a: a["name"])
 
+XWIN_TARGETS = {"windows/amd64": "x86_64-pc-windows-msvc", "windows/arm64": "aarch64-pc-windows-msvc"}
+
+def xwin_target(job):
+    return XWIN_TARGETS[job["targets"][0]]
+
 def xwin_assets(job):
     binaries = job["binaries"] if "binaries" in job else [job["binary"]]
-    return sorted([{"name": job.get("asset_name", binary + "-aarch64-pc-windows-msvc.exe"),
-                    "target": "windows/arm64", "archive_format": "binary"} for binary in binaries],
+    return sorted([{"name": job.get("asset_name", binary + "-" + xwin_target(job) + ".exe"),
+                    "target": job["targets"][0], "archive_format": "binary"} for binary in binaries],
                   key=lambda a: a["name"])
 
 def validate(value):
@@ -183,7 +188,8 @@ def validate(value):
                     len({b.casefold() for b in binaries}) == len(binaries), "invalid toolchain pin or binary set", 4)
             if "binaries" in job:
                 job["binaries"] = sorted(binaries)
-            require(job["targets"] == ["windows/arm64"], "xwin supports one Windows ARM64 target", 4)
+            require(job["targets"] in (["windows/amd64"], ["windows/arm64"]),
+                    "xwin requires exactly one Windows AMD64 or ARM64 target", 4)
             for key in ("cargo_cache", "cache_dir"):
                 if key in job:
                     path(job[key])
@@ -204,7 +210,7 @@ def validate(value):
                 require(len(binaries) == 1 and name(job["asset_name"]) and job["asset_name"].endswith(".exe"),
                         "asset_name can rename only one executable", 4)
             if "required_assets" in value:
-                require([a for a in value["required_assets"] if a["target"] == "windows/arm64"] == xwin_assets(job),
+                require([a for a in value["required_assets"] if a["target"] == job["targets"][0]] == xwin_assets(job),
                         "required assets disagree with the xwin executable selection", 4)
             if "siblings" in job:
                 sibling = job["siblings"]
@@ -282,6 +288,14 @@ def save_state():
     write(root / "state.json", state, replace=True)
     state_hash = digest(root / "state.json")
 
+def require_xwin_toolchain(job, attempt):
+    manifest = attempt / "toolchain.json"
+    require(digest(manifest) == job["toolchain_sha256"], "toolchain plan changed")
+    value = load(manifest)
+    require(isinstance(value, dict) and value.get("target") == xwin_target(job),
+            "xwin toolchain target differs from the selected platform")
+    require(digest(manifest) == job["toolchain_sha256"], "toolchain plan changed while reading")
+
 def require_xwin_inventory(job, manifest, pin):
     require(digest(manifest) == pin, "xwin manifest identity changed")
     value = load(manifest)
@@ -291,16 +305,23 @@ def require_xwin_inventory(job, manifest, pin):
     actual = sorted([{k: a.get(k) for k in ("name", "target", "archive_format")} for a in value["artifacts"]],
                     key=lambda a: a["name"])
     require(actual == xwin_assets(job), "xwin output omits or changes selected executables")
+    require(all(a.get("target_triple") == xwin_target(job) for a in value["artifacts"]),
+            "xwin artifact target triple differs from the build plan")
     environments = value.get("build_environments", [])
-    has_selection = isinstance(environments, list) and any(isinstance(e, dict) and
-        e.get("target") == "windows/arm64" and "feature_selection" in e for e in environments)
+    require(isinstance(environments, list) and len(environments) == 1 and isinstance(environments[0], dict),
+            "xwin manifest must retain one selected build environment")
+    environment = environments[0]
+    toolchain = environment.get("toolchain")
+    require(environment.get("target") == job["targets"][0] and environment.get("target_triple") == xwin_target(job) and
+            environment.get("method") == "pinned-cargo-xwin" and isinstance(toolchain, dict) and
+            toolchain.get("target") == xwin_target(job) and isinstance(toolchain.get("inputs"), dict) and
+            toolchain["inputs"].get("target") == xwin_target(job),
+            "xwin producer platform or toolchain target differs from the build plan")
+    has_selection = "feature_selection" in environment
     if has_selection or job.get("features") or job.get("all_features") or job.get("no_default_features"):
         expected = {"features": job.get("features", []), "all_features": job.get("all_features", False),
                     "no_default_features": job.get("no_default_features", False)}
-        require(isinstance(environments, list) and all(isinstance(e, dict) for e in environments),
-                "invalid xwin build environments")
-        selected = [e for e in environments if e.get("target") == "windows/arm64"]
-        observed = selected[0].get("feature_selection") if len(selected) == 1 else None
+        observed = environment.get("feature_selection")
         require(isinstance(observed, dict) and
                 all(type(observed.get(key)) is bool for key in ("all_features", "no_default_features")) and
                 observed == expected,
@@ -485,6 +506,7 @@ def start_job(job):
             artifacts = session / "output"
         else:
             copy_pin(Path(job["toolchain_manifest"]), attempt / "toolchain.json", job["toolchain_sha256"])
+            require_xwin_toolchain(job, attempt)
             if "siblings" in job:
                 copy_pin(Path(job["siblings"]["path"]), attempt / "siblings.json", job["siblings"]["sha256"])
             command = xwin_command(job, attempt)
@@ -602,9 +624,10 @@ def recover_compiled_import(job, record):
                 "completed native envelope changed")
     else:
         require(response.get("kind") == "dsr-xwin-build" and response.get("status") == "verified" and
+                response.get("target") == xwin_target(job) and
                 response.get("release_manifest") == {"path": str(manifest), "sha256": candidate["manifest_sha256"]},
                 "completed xwin envelope changed")
-        require(digest(attempt / "toolchain.json") == job["toolchain_sha256"], "toolchain plan changed")
+        require_xwin_toolchain(job, attempt)
         if "siblings" in job:
             require(digest(attempt / "siblings.json") == job["siblings"]["sha256"], "sibling plan changed")
     recovery = Path(tempfile.mkdtemp(prefix="admission-recovery-", dir=attempt))
@@ -648,8 +671,9 @@ def finish_job(item):
             native_config(job, session if job.get("resume", False) else attempt)
         else:
             require(response.get("kind") == "dsr-xwin-build" and response.get("status") == "verified" and response.get("exit_code") == 0 and
+                    response.get("target") == xwin_target(job) and
                     response.get("release_manifest") == {"path": str(manifest), "sha256": digest(manifest)}, "xwin completion receipt does not bind its manifest")
-            require(digest(attempt / "toolchain.json") == job["toolchain_sha256"], "toolchain plan changed")
+            require_xwin_toolchain(job, attempt)
             if "siblings" in job:
                 require(digest(attempt / "siblings.json") == job["siblings"]["sha256"], "sibling plan changed")
         accept(job, attempt, selected(job, manifest, artifacts))

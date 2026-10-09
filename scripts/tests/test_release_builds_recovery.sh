@@ -87,11 +87,15 @@ for name in names:
         (out / name).chmod(0o755)
     artifacts.append(dict(name=name, target=target, archive_format="binary", size_bytes=len(data),
                           sha256=hashlib.sha256(data).hexdigest()))
+    if kind == "xwin": artifacts[-1]["target_triple"] = spec["target"]
 uuid = "11111111-1111-4111-8111-111111111111"
 value = dict(schema_version="1.0.0", tool="demo", version="v1.2.3", run_id=uuid, built_at="2026-09-24T00:00:00Z",
              source=dict(git_sha="a"*40, git_ref="refs/tags/v1.2.3", dependencies=[]),
              requested_targets=[target], status="success", publishable=True, build_purpose="release",
              summary=dict(total=1, success=1, failed=0), artifacts=artifacts)
+if kind == "xwin":
+    value["build_environments"] = [dict(target=target, target_triple=spec["target"],
+                                      method="pinned-cargo-xwin", toolchain=dict(target=spec["target"], inputs=dict(target=spec["target"])))]
 if mode == "wrong-source": value["source"]["git_sha"] = "b"*40
 manifest.parent.mkdir(parents=True, exist_ok=True)
 manifest.write_text(json.dumps(value) + "\n")
@@ -103,7 +107,7 @@ if kind == "dsr":
             targets=[target], status="completed", context=dict(output_dir=str(out), build_purpose="release", publishable=True))))
     envelope = dict(command="build", status="success", exit_code=0, details=dict(manifest=str(manifest)))
 else:
-    envelope = dict(kind="dsr-xwin-build", status="verified", exit_code=0,
+    envelope = dict(kind="dsr-xwin-build", status="verified", exit_code=0, target=spec["target"],
                     release_manifest=dict(path=str(manifest), sha256=hashlib.sha256(manifest.read_bytes()).hexdigest()))
 print(json.dumps(envelope))
 sys.exit(23 if mode == "nonzero" else 0)
@@ -117,6 +121,7 @@ def fixture(label, driver="xwin", resume=False):
     target = "windows/arm64" if driver == "xwin" else "linux/amd64"
     spec = dict(case=str(case), resume=resume)
     if driver == "xwin":
+        spec["target"] = "aarch64-pc-windows-msvc"
         save(case / "toolchain.json", spec)
         save(case / "siblings.json", [])
         job = dict(id="compiled", driver=driver, targets=[target], project=str(case / "project"),

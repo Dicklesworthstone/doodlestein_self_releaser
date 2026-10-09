@@ -21,7 +21,7 @@ apply. The ordinary artifact-directory finalizer is unchanged.
 
 ## Execute a build plan and package its outputs
 
-The same option works with the existing native, Windows ARM64 and import jobs:
+The same option works with native, Windows x64/ARM64 and import jobs:
 
 ```bash
 bash src/release_finalize.sh \
@@ -34,9 +34,11 @@ bash src/release_finalize.sh \
 
 The recipe is normalized and frozen into the invocation's private workspace
 before any compiler starts. Its target matrix and declared producer asset
-requirements must match the build plan. Windows ARM64 jobs additionally expose
+requirements must match the build plan. Windows xwin jobs additionally expose
 their exact binary selection: a recipe missing a selected companion is rejected
-even without a global `required_assets` list. These failures occur before build
+even without a global `required_assets` list. In a two-architecture plan, each
+recipe consumes its own platform's triple-qualified executable names; an ARM64
+companion cannot substitute for an x64 companion. These failures occur before build
 state, compiler/toolchain access or release API calls. Live packaging still
 verifies the actual completed producer inventory and every payload hash.
 
