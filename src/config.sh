@@ -1067,27 +1067,84 @@ _config_get_tool_targets_json() {
     printf '%s\n' "$raw_json" | jq -c . 2>/dev/null
 }
 
+# Exact release identities follow native task identities. A singleton retains
+# its physical platform key; multiple configured triples each own a qualified
+# key. Keep the original platform/triple order for scheduling and ownership.
+# An empty singleton triple means the existing backend default is selected.
+# Usage: config_get_release_contract_targets_json <toolname>
+config_get_release_contract_targets_json() {
+    local toolname="${1:-}" targets mapping rows
+    targets=$(_config_get_tool_targets_json "$toolname") || return 4
+    mapping=$(_config_target_triples_json "$toolname") || return 4
+    if ! rows=$(jq -cen --argjson targets "$targets" --argjson mapping "$mapping" '
+        def platform: type == "string" and test("^[a-z0-9]+/[a-z0-9_]+$");
+        def triple: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and
+            (contains("..") | not);
+        def variants:
+            if . == null then [""]
+            elif triple then [.]
+            elif type == "array" and length > 0 and all(.[]; triple) and
+                length == (unique | length) then .
+            else error("invalid configured target variants") end;
+        if ($targets | type != "array" or length == 0 or
+            (all(.[]; platform) | not) or length != (unique | length))
+        then error("invalid configured release platforms") else . end |
+        (if $mapping == null then {} else $mapping end) as $m |
+        if ($m | type != "object") then error("invalid target triple mapping") else . end |
+        [$targets[] as $platform | ($m[$platform] | variants) as $triples |
+         $triples | to_entries[] |
+         {key:(if ($triples | length) == 1 then $platform else $platform + "@" + .value end),
+          platform:$platform, target_triple:.value, primary:(.key == 0)}]
+    ' 2>/dev/null); then
+        _cfg_log_error "Invalid release target identities for $toolname"
+        return 4
+    fi
+    printf '%s\n' "$rows"
+}
+
+# Never infer which variant a strict naming or staging request intended.
+# Usage: config_get_release_contract_target_key <toolname> <platform> [target_triple]
+config_get_release_contract_target_key() {
+    local toolname="${1:-}" platform="${2:-}" selected="${3:-}" rows key
+    rows=$(config_get_release_contract_targets_json "$toolname") || return 4
+    if ! key=$(jq -er --arg platform "$platform" --arg selected "$selected" '
+        [.[] | select(.platform == $platform)] |
+        if length == 1 then
+            .[0] | if $selected == "" or .target_triple == "" or .target_triple == $selected
+                then .key else error("selected triple differs from configuration") end
+        elif length > 1 and $selected != "" then
+            [.[] | select(.target_triple == $selected)] |
+            if length == 1 then .[0].key else error("unconfigured selected triple") end
+        else error("missing platform or ambiguous selected triple") end
+    ' <<< "$rows" 2>/dev/null); then
+        _cfg_log_error "Missing or conflicting release target selection for $toolname $platform"
+        return 4
+    fi
+    printf '%s\n' "$key"
+}
+
 # Validate an opt-in exact release asset contract.
 # Usage: config_validate_release_contract <toolname>
 # Returns: 0 for a valid contract or no contract, 4 for an invalid contract.
 config_validate_release_contract() {
     local toolname="${1:-}"
-    local contract_json targets_json
+    local contract_json targets_json identities_json
 
     contract_json=$(config_get_release_contract_json "$toolname") || return $?
     # Target triples decide release asset names with or without a contract;
     # every build, release and `config validate` passes through here.
-    config_validate_target_triples "$toolname" "$contract_json" || return 4
+    config_validate_target_triples "$toolname" || return 4
     [[ "$contract_json" == "null" ]] && return 0
 
     if ! targets_json=$(_config_get_tool_targets_json "$toolname"); then
         _cfg_log_error "Could not parse configured targets for $toolname"
         return 4
     fi
+    identities_json=$(config_get_release_contract_targets_json "$toolname") || return 4
 
     if jq -en \
         --argjson contract "$contract_json" \
-        --argjson targets "$targets_json" '
+        --argjson targets "$targets_json" --argjson identities "$identities_json" '
         def safe_name:
             if type != "string" then false
             else
@@ -1170,7 +1227,7 @@ config_validate_release_contract() {
                 end) as $signatures |
             ($primaries + ($primaries | map(. + ".sha256")) + $signatures + $additional +
                 ($contract.build_manifest_assets // [])) as $all_assets |
-            (($contract.exact_primary_assets | keys | sort) == ($targets | sort)) and
+            (($contract.exact_primary_assets | keys | sort) == ($identities | map(.key) | sort)) and
             ([$contract.exact_primary_assets[] | safe_primary] | all) and
             ([$additional[] | safe_name] | all) and
             (($contract.exact_primary_assets | [.[]] | unique | length) ==
@@ -1239,8 +1296,9 @@ _config_target_triples_json() {
 # A platform maps to one triple or to a list of variants (bd-cdcz):
 #   target_triples:
 #     linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
-# The first entry is the primary variant: native builds compile it, and an
-# artifact whose name identifies no variant is named as it. Prints one triple
+# The first entry owns shared platform assets; native builds compile every
+# entry. An ordinary artifact whose name identifies no variant is named as
+# the primary. Prints one triple
 # per line, or nothing when the platform is not configured.
 # Usage: config_get_target_triples <toolname> <platform>
 # Exit: 0 on success, 4 on an invalid mapping
@@ -1313,11 +1371,11 @@ config_get_target_triple() {
     printf '%s\n' "${triples%%$'\n'*}"
 }
 
-# Validate every target_triples entry of a tool. A strict release contract
-# names exactly one primary asset per target, so it admits one variant only.
-# Usage: config_validate_target_triples <toolname> <contract_json|null>
+# Validate every target_triples entry of a tool. Strict release validation
+# separately requires an exact primary for every canonical platform/triple key.
+# Usage: config_validate_target_triples <toolname>
 config_validate_target_triples() {
-    local toolname="$1" contract_json="${2:-null}"
+    local toolname="$1"
     local mapping_json platform triples
     config_get_linux_libc_fallback "$toolname" >/dev/null || return 4
     mapping_json=$(_config_target_triples_json "$toolname") || {
@@ -1335,10 +1393,6 @@ config_validate_target_triples() {
             return 4
         fi
         triples=$(config_get_target_triples "$toolname" "$platform") || return 4
-        if [[ "$contract_json" != "null" && "$triples" == *$'\n'* ]]; then
-            _cfg_log_error "release_contract for $toolname admits one target triple per platform; $platform lists several variants"
-            return 4
-        fi
     done < <(jq -r 'keys[]' <<< "$mapping_json")
 }
 
@@ -1480,4 +1534,5 @@ export -f config_get_artifact_naming config_get_target_triple config_get_arch_al
 export -f _config_target_triples_json config_get_target_triples config_get_target_triples_json config_validate_target_triples
 export -f config_get_linux_libc_fallback
 export -f config_get_release_contract_json config_validate_release_contract
+export -f config_get_release_contract_targets_json config_get_release_contract_target_key
 export -f config_get_release_source_dependencies_json

@@ -274,5 +274,59 @@ expect 'variant override renders that triple' 'app-1-x86_64-unknown-linux-musl.t
 reject 'unsafe variant triple' \
     artifact_naming_generate_dual_for_variant app v1 linux amd64 tar.gz '' '../x86_64'
 
+# Exact contracts select a task, not a filename convention. These arbitrary
+# names intentionally contain neither a Rust triple nor a libc token.
+strict_variants='{"checksum_sidecar":"sha256","exact_primary_assets":{"linux/amd64@x86_64-unknown-linux-gnu":"app-standard.tar.gz","linux/amd64@x86_64-unknown-linux-musl":"app-static"}}'
+strict_plan() {
+    local result
+    result=$(_an_contract_primary_plan "$@") || return $?
+    jq -ce '[.versioned,.compat,.same]' <<< "$result"
+}
+expect 'exact GNU variant preserves its archive name with no alias' \
+    '["app-standard.tar.gz","app-standard.tar.gz",true]' \
+    strict_plan "$strict_variants" linux/amd64 tar.gz x86_64-unknown-linux-gnu
+expect 'exact musl variant preserves its arbitrary raw name' \
+    '["app-static","app-static",true]' \
+    strict_plan "$strict_variants" linux/amd64 none x86_64-unknown-linux-musl
+expect 'canonical task key selects the same exact primary' \
+    '["app-static","app-static",true]' \
+    strict_plan "$strict_variants" linux/amd64@x86_64-unknown-linux-musl binary
+reject 'multi-variant contract has no implicit primary selection' \
+    strict_plan "$strict_variants" linux/amd64 none
+reject 'unconfigured selected triple has no release name' \
+    strict_plan "$strict_variants" linux/amd64 none x86_64-unknown-linux-gnux32
+reject 'canonical task and explicit triple must agree' \
+    strict_plan "$strict_variants" linux/amd64@x86_64-unknown-linux-musl none x86_64-unknown-linux-gnu
+reject 'variant-specific archive format cannot drift' \
+    strict_plan "$strict_variants" linux/amd64 zip x86_64-unknown-linux-gnu
+reject 'raw variant cannot inherit the other variant archive format' \
+    strict_plan "$strict_variants" linux/amd64 tar.gz x86_64-unknown-linux-musl
+
+# Only canonical config identity is a boundary fixture in this dependency-free
+# suite; test_config and the real native integration use actual YAML helpers.
+strict_public_names() (
+    local selected="${1:-}" format="${2:-none}" result
+    _an_release_contract_for_tool() { printf '%s\n' "$strict_variants"; }
+    config_get_release_contract_target_key() {
+        [[ "$1" == strict-app && "$2" == linux/amd64 ]] || return 4
+        case "${3:-}" in
+            x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl) printf '%s@%s\n' "$2" "$3" ;;
+            *) return 4 ;;
+        esac
+    }
+    result=$(artifact_naming_generate_dual_for_tool strict-app v1 linux amd64 \
+        "$format" '' release "$selected") || return $?
+    jq -ce '[.versioned,.compat,.same]' <<< "$result"
+)
+expect 'public naming passes the selected GNU identity to the exact plan' \
+    '["app-standard.tar.gz","app-standard.tar.gz",true]' \
+    strict_public_names x86_64-unknown-linux-gnu tar.gz
+expect 'public naming passes the selected musl identity to the exact plan' \
+    '["app-static","app-static",true]' \
+    strict_public_names x86_64-unknown-linux-musl none
+reject 'public naming refuses an absent multi-variant selection' strict_public_names
+reject 'public naming refuses an unknown configured selection' \
+    strict_public_names x86_64-unknown-linux-gnux32
+
 printf 'Artifact naming contract: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]

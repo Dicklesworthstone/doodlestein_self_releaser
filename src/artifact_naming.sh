@@ -931,9 +931,9 @@ artifact_naming_get_compat_pattern() {
 # Consume canonical JSON from the configuration layer, not an inferred pattern.
 # Return no plan on malformed/missing target names or a compression mismatch.
 _an_contract_primary_plan() {
-    local contract="$1" target="$2" ext="$3" primary format
+    local contract="$1" target="$2" ext="$3" selected_triple="${4:-}" primary format
     command -v jq &>/dev/null || return 3
-    if ! primary=$(jq -ers --arg target "$target" '
+    if ! primary=$(jq -ers --arg target "$target" --arg triple "$selected_triple" '
         def name:
             type == "string" and length > 0 and length <= 255 and
             test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
@@ -954,7 +954,16 @@ _an_contract_primary_plan() {
             (.exact_additional_assets // []) + (.build_manifest_assets // [])) as $names |
         if ($names | map(ascii_downcase) | unique | length) != ($names | length)
         then error("colliding release asset names") else . end |
-        .exact_primary_assets[$target] | if primary then . else error("missing primary target") end
+        .exact_primary_assets as $assets |
+        (if ($target | contains("@")) then
+            if $triple == "" or ($target | endswith("@" + $triple)) then $target
+            else error("canonical target contradicts selected triple") end
+         elif ([$assets | keys[] | select(startswith($target + "@"))] | length) > 0 then
+            if $triple == "" or ($assets | has($target)) then
+                error("ambiguous exact release target")
+            else $target + "@" + $triple end
+         else $target end) as $key |
+        $assets[$key] | if primary then . else error("missing primary target") end
     ' <<< "$contract" 2>/dev/null); then
         _an_log_error "Invalid or missing exact release primary for $target"
         return 4
@@ -1035,10 +1044,18 @@ artifact_naming_generate_dual_for_tool() {
         return 4
     fi
     if [[ "$purpose" == release ]]; then
-        local contract
+        local contract target_key
         contract=$(_an_release_contract_for_tool "$tool") || return $?
         if [[ "$contract" != null ]]; then
-            _an_contract_primary_plan "$contract" "$os/$arch" "$ext"
+            if ! declare -F config_get_release_contract_target_key &>/dev/null; then
+                local config_module_dir
+                config_module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+                # shellcheck source=./config.sh
+                source "$config_module_dir/config.sh" || return 3
+            fi
+            target_key=$(config_get_release_contract_target_key "$tool" "$os/$arch" \
+                "$_AN_TARGET_TRIPLE_OVERRIDE") || return $?
+            _an_contract_primary_plan "$contract" "$target_key" "$ext" "$_AN_TARGET_TRIPLE_OVERRIDE"
             return $?
         fi
     fi

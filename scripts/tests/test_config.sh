@@ -13,7 +13,7 @@ SRC_DIR="$(cd "$SCRIPT_DIR/../../src" && pwd)"
 # shellcheck source=../../src/logging.sh
 source "$SRC_DIR/logging.sh"
 # shellcheck source=../../src/config.sh
-source "$SRC_DIR/config.sh"
+source "${DSR_CONFIG_MODULE:-$SRC_DIR/config.sh}"
 
 # Test state
 TEMP_DIR=""
@@ -1323,7 +1323,7 @@ YAML
   ! config_validate_release_contract contract-tool
 }
 
-test_target_triples_variants_rejected_by_release_contract() {
+test_target_triples_contract_requires_exact_variants() {
   release_contract_test_deps_available || return 0
   write_contract_tool_config << 'YAML'
 tool_name: contract-tool
@@ -1349,6 +1349,75 @@ release_contract:
     linux/amd64: contract-tool-x86_64-unknown-linux-musl
 YAML
   config_validate_release_contract contract-tool
+}
+
+test_target_triples_contract_preserves_variant_identity() {
+  release_contract_test_deps_available || return 0
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64, darwin/arm64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-musl, x86_64-unknown-linux-gnu]
+  darwin/arm64: aarch64-apple-darwin
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64@x86_64-unknown-linux-musl: app-static
+    linux/amd64@x86_64-unknown-linux-gnu: app-standard.tar.gz
+    darwin/arm64: app-macos.zip
+YAML
+  config_validate_release_contract contract-tool || return 1
+  local identities
+  identities=$(config_get_release_contract_targets_json contract-tool) || return 1
+  jq -e '. == [
+    {key:"linux/amd64@x86_64-unknown-linux-musl",platform:"linux/amd64",
+     target_triple:"x86_64-unknown-linux-musl",primary:true},
+    {key:"linux/amd64@x86_64-unknown-linux-gnu",platform:"linux/amd64",
+     target_triple:"x86_64-unknown-linux-gnu",primary:false},
+    {key:"darwin/arm64",platform:"darwin/arm64",target_triple:"aarch64-apple-darwin",primary:true}
+  ]' <<< "$identities" >/dev/null || return 1
+  [[ $(config_get_release_contract_target_key contract-tool linux/amd64 x86_64-unknown-linux-gnu) == \
+      linux/amd64@x86_64-unknown-linux-gnu ]] || return 1
+  [[ $(config_get_release_contract_target_key contract-tool linux/amd64 x86_64-unknown-linux-musl) == \
+      linux/amd64@x86_64-unknown-linux-musl ]] || return 1
+  [[ $(config_get_release_contract_target_key contract-tool darwin/arm64) == darwin/arm64 ]] || return 1
+  ! config_get_release_contract_target_key contract-tool linux/amd64 >/dev/null || return 1
+  ! config_get_release_contract_target_key contract-tool linux/amd64 x86_64-unknown-linux-gnux32 >/dev/null || return 1
+  ! config_get_release_contract_target_key contract-tool darwin/arm64 x86_64-apple-darwin >/dev/null
+}
+
+test_target_triples_contract_rejects_mixed_missing_or_extra_keys() {
+  release_contract_test_deps_available || return 0
+  local assets
+  for assets in \
+    '{"linux/amd64@x86_64-unknown-linux-gnu":"app-standard"}' \
+    '{"linux/amd64":"app-standard","linux/amd64@x86_64-unknown-linux-musl":"app-static"}' \
+    '{"linux/amd64@x86_64-unknown-linux-gnu":"app-standard","linux/amd64@x86_64-unknown-linux-musl":"app-static","linux/amd64":"app-ambiguous"}' \
+    '{"linux/amd64@x86_64-unknown-linux-gnu":"app-standard","linux/amd64@x86_64-unknown-linux-musl":"app-static","linux/amd64@x86_64-unknown-linux-gnux32":"app-unknown"}' \
+    '{"linux/amd64@x86_64-unknown-linux-gnu":"app-standard","linux/arm64@aarch64-unknown-linux-musl":"app-other-platform"}'; do
+    write_contract_tool_config << YAML
+tool_name: contract-tool
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets: $assets
+YAML
+    ! config_validate_release_contract contract-tool || return 1
+  done
+  # A singleton keeps its physical key even when its triple was an array.
+  write_contract_tool_config << 'YAML'
+tool_name: contract-tool
+targets: [linux/amd64]
+target_triples:
+  linux/amd64: [x86_64-unknown-linux-musl]
+release_contract:
+  checksum_sidecar: sha256
+  exact_primary_assets:
+    linux/amd64@x86_64-unknown-linux-musl: app-static
+YAML
+  ! config_validate_release_contract contract-tool
 }
 
 test_config_validate_rejects_invalid_target_triples() {
@@ -1539,7 +1608,9 @@ main() {
   run_test "target_triples_list_keeps_order_and_primary" test_target_triples_list_keeps_order_and_primary
   run_test "target_triples_registry_list" test_target_triples_registry_list
   run_test "target_triples_rejects_invalid_entries" test_target_triples_rejects_invalid_entries
-  run_test "target_triples_variants_rejected_by_release_contract" test_target_triples_variants_rejected_by_release_contract
+  run_test "target_triples_contract_requires_exact_variants" test_target_triples_contract_requires_exact_variants
+  run_test "target_triples_contract_preserves_variant_identity" test_target_triples_contract_preserves_variant_identity
+  run_test "target_triples_contract_rejects_mixed_missing_or_extra_keys" test_target_triples_contract_rejects_mixed_missing_or_extra_keys
   run_test "config_validate_rejects_invalid_target_triples" test_config_validate_rejects_invalid_target_triples
 
   echo ""
