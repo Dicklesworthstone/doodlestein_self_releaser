@@ -149,7 +149,7 @@ _xwt_materialize() {
     sysroot_target=$(jq -r '.sysroot_target' <<< "$descriptor") || return 4
     view="$work/view"
     local -A libraries=()
-    mkdir "$view" "$view/include" "$view/lib" "$view/sysroot" || return 1
+    mkdir "$view" "$view/include" "$view/lib" || return 1
     prefix=$(jq -r '.headers.prefix' <<< "$plan") || return 1
     [[ -f "$work/headers/$prefix/$required_header" ]] || {
         _xwt_log "Pinned LLVM system headers do not contain $required_header for $target"; return 4;
@@ -159,7 +159,11 @@ _xwt_materialize() {
     [[ -d "$work/sysroot/$prefix/include" ]] || return 4
     libdir="$work/sysroot/$prefix/lib/$sysroot_target"
     [[ -d "$libdir" ]] || { _xwt_log "Missing MSVC library directory for $target: $sysroot_target"; return 4; }
-    cp -R -- "$work/sysroot/$prefix/." "$view/sysroot/" || return 1
+    # The validated extraction belongs to this preparation on the same
+    # filesystem. Transfer it into the private view instead of duplicating
+    # every SDK byte; pinned archives and installed SDK inputs stay untouched.
+    mv -T -- "$work/sysroot/$prefix" "$view/sysroot" || return 1
+    libdir="$view/sysroot/lib/$sysroot_target"
     # cargo-xwin clang backend recognizes this marker and never needs to
     # resolve a moving latest-release URL for a prepared sysroot.
     [[ ! -e "$view/sysroot/DONE" ]] || { _xwt_log 'Unexpected input DONE marker'; return 4; }
@@ -251,10 +255,13 @@ xwin_toolchain_prepare() (
     fi
     _xwt_check_tools "$plan" || return $?
     _xwt_log "$status $(jq -r '.target' <<< "$plan") toolchain: $key"
+    # cc-rs applies these global flags before cargo-xwin's target-specific
+    # SDK -I paths. LLVM must also use -I: -isystem is searched after every
+    # SDK -I path and would select MSVC's incompatible arm_neon.h instead.
     jq -cn --arg status "$status" --arg view "$view" --arg key "$key" --slurpfile evidence "$view/evidence.json" \
         '{kind:"dsr-xwin-toolchain-result",status:$status,view:$view,manifest_sha256:$key,
           evidence:$evidence[0],environment:{XWIN_CROSS_COMPILER:"clang",
             XWIN_MSVC_SYSROOT_DOWNLOAD_URL:$evidence[0].inputs.sysroot.url,
-            CFLAGS:("-nobuiltininc -isystem "+$view+"/include"),
-            CXXFLAGS:("-nobuiltininc -isystem "+$view+"/include"),LIB:($view+"/lib")}}'
+            CFLAGS:("-nobuiltininc -I "+$view+"/include"),
+            CXXFLAGS:("-nobuiltininc -I "+$view+"/include"),LIB:($view+"/lib")}}'
 )

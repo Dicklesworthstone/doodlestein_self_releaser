@@ -39,6 +39,13 @@ lld-link /dll /noentry /machine:arm64 /export:DsrKernelStub "/out:$WORK/kernel32
 clang --target=x86_64-pc-windows-msvc -ffreestanding -c "$WORK/kernel.c" -o "$WORK/kernel-x64.obj" || exit 1
 lld-link /dll /noentry /machine:x64 /export:DsrKernelStub "/out:$WORK/kernel32-x64.dll" "/implib:$WORK/input/sdk/lib/x86_64-unknown-windows-msvc/kernel32.lib" "$WORK/kernel-x64.obj" || exit 1
 printf 'SDK fixture\n' > "$WORK/input/sdk/include/windows.h"
+# The genuine cargo-xwin clang backend adds this competing MSVC -I path.
+# A marker header makes wrong include precedence observable with real clang;
+# the LLVM headers and intrinsic compilation remain genuine.
+mkdir -p "$WORK/input/sdk/include/__msvc_vcruntime_intrinsics"
+for HEADER in arm_neon.h xmmintrin.h; do
+    printf '#error DSR_MSVC_INTRINSIC_SHADOW\n' > "$WORK/input/sdk/include/__msvc_vcruntime_intrinsics/$HEADER"
+done
 tar -cJf "$WORK/sdk.tar.xz" -C "$WORK/input" sdk || exit 1
 tar -czf "$WORK/headers.tar.gz" -C "$WORK/input" llvm || exit 1
 printf '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n' > "$WORK/project/Cargo.toml"
@@ -124,9 +131,13 @@ if [[ "$mode" == wrong-arch ]]; then
     lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib "/machine:$other_machine" "/out:$out" "$TMPDIR/probe.obj" || exit $?
 else
     # Intentional splitting: these are the exact whitespace-free flags emitted
-    # by DSR, not arbitrary user-supplied shell input.
+    # by DSR. Match cc-rs/cargo-xwin ordering: global CFLAGS, target SDK -I
+    # paths, then the global flags appended to target CFLAGS by cargo-xwin.
+    sysroot="$XWIN_CACHE_DIR/windows-msvc-sysroot"
     # shellcheck disable=SC2086
-    clang --target="$target" -ffreestanding $CFLAGS -c "$source_file" -o "$TMPDIR/probe.obj" || exit $?
+    clang --target="$target" -ffreestanding $CFLAGS -I"$sysroot/include" \
+        -I"$sysroot/include/c++/stl" -I"$sysroot/include/__msvc_vcruntime_intrinsics" \
+        $CFLAGS -c "$source_file" -o "$TMPDIR/probe.obj" || exit $?
     # lld-link must discover Kernel32.lib from the emitted LIB environment,
     # not a release-local /libpath override or renamed source library.
     lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib "/machine:$machine" "/out:$out" "$TMPDIR/probe.obj" Kernel32.lib || exit $?
@@ -201,6 +212,35 @@ assert 'selected x64 view does not alias the ARM64 import library' bash -c \
     "$WORK/input/sdk/lib/aarch64-unknown-windows-msvc/kernel32.lib"
 assert 'x64 executable independently passes expected-machine admission' xwin_validate_pe \
     "$WORK/good-x64/artifacts/probe.exe" x86_64-pc-windows-msvc
+# Each positive above already compiled through a competing SDK intrinsic
+# directory. Keep the old -isystem behavior live in this invocation too, and
+# require the specific competing-header diagnostic instead of any failure.
+for HEADER_RUN in good good-x64; do
+    HEADER_TARGET=$(jq -r .target "$WORK/$HEADER_RUN/result.json")
+    HEADER_VIEW=$(jq -r .view "$WORK/$HEADER_RUN/toolchain.json")
+    assert "$HEADER_TARGET prepared and executed C/C++ header flags agree" jq -e \
+        --slurpfile prepared "$WORK/$HEADER_RUN/toolchain.json" \
+        '.build_influence_env.CFLAGS==$prepared[0].environment.CFLAGS and
+         .build_influence_env.CXXFLAGS==$prepared[0].environment.CXXFLAGS' "$WORK/$HEADER_RUN/result.json"
+    if clang --target="$HEADER_TARGET" -ffreestanding -nobuiltininc -isystem "$HEADER_VIEW/include" \
+        -I"$HEADER_VIEW/sysroot/include" -I"$HEADER_VIEW/sysroot/include/c++/stl" \
+        -I"$HEADER_VIEW/sysroot/include/__msvc_vcruntime_intrinsics" \
+        -c "$WORK/project/probe.c" -o "$WORK/$HEADER_RUN-shadowed.o" \
+        > "$WORK/$HEADER_RUN-shadowed.stdout" 2> "$WORK/$HEADER_RUN-shadowed.stderr"; then
+        bad "$HEADER_TARGET old system-header classification selected the wrong SDK header"
+    else
+        assert "$HEADER_TARGET old system-header classification reaches competing MSVC intrinsic header" \
+            grep -Fq 'DSR_MSVC_INTRINSIC_SHADOW' "$WORK/$HEADER_RUN-shadowed.stderr"
+    fi
+    # The runner emits only controlled whitespace-free flag paths. Exercise
+    # C++ as well so its selected header class cannot drift from CFLAGS.
+    read -r -a HEADER_CXXFLAGS <<< "$(jq -r .build_influence_env.CXXFLAGS "$WORK/$HEADER_RUN/result.json")"
+    assert "$HEADER_TARGET CXXFLAGS select real LLVM intrinsics before competing SDK headers" \
+        clang --target="$HEADER_TARGET" -x c++ -ffreestanding "${HEADER_CXXFLAGS[@]}" \
+        -I"$HEADER_VIEW/sysroot/include" -I"$HEADER_VIEW/sysroot/include/c++/stl" \
+        -I"$HEADER_VIEW/sysroot/include/__msvc_vcruntime_intrinsics" "${HEADER_CXXFLAGS[@]}" \
+        -c "$WORK/project/probe.c" -o "$WORK/$HEADER_RUN-cxx.o"
+done
 reject 'ARM64 executable cannot satisfy x64 admission' 7 xwin_validate_pe \
     "$WORK/good/artifacts/probe.exe" x86_64-pc-windows-msvc
 reject 'x64 executable cannot satisfy ARM64 admission' 7 xwin_validate_pe \

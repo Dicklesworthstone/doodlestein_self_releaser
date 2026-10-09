@@ -514,12 +514,14 @@ _xwb_build() {
     cargo_seed_controls=$(sha256sum -- "$run/cargo-cache-seed.json" \
         "$run/cargo-home/.dsr-cache-seed.json") || return 1
     rustc=$(jq -r '.tools.rustc.path' <<< "$plan") || return 1
+    # Match the prepared view's -I header class. A global -isystem path loses
+    # to cargo-xwin's target-specific MSVC intrinsic -I directories in cc-rs.
     local -a environment=("HOME=$run/home" "PATH=$run/bin:/usr/bin:/bin" "TMPDIR=$run/tmp" "LC_ALL=C" "TZ=UTC"
         "CARGO_HOME=$run/cargo-home" "CARGO_TARGET_DIR=$run/target" "CARGO_INCREMENTAL=0" "RUSTC=$rustc"
         "CARGO=$run/bin/cargo" "RUSTC_WRAPPER=" "RUSTC_WORKSPACE_WRAPPER="
         "XWIN_CACHE_DIR=$run/xwin" "XWIN_CROSS_COMPILER=clang"
         "XWIN_MSVC_SYSROOT_DOWNLOAD_URL=$(jq -r '.sysroot.url' <<< "$plan")"
-        "CFLAGS=-nobuiltininc -isystem $view/include" "CXXFLAGS=-nobuiltininc -isystem $view/include" "LIB=$view/lib")
+        "CFLAGS=-nobuiltininc -I $view/include" "CXXFLAGS=-nobuiltininc -I $view/include" "LIB=$view/lib")
     if [[ "$release" == true ]]; then
         environment+=("SOURCE_DATE_EPOCH=$(jq -r '.source_date_epoch' "$run/release-source.json")")
     fi

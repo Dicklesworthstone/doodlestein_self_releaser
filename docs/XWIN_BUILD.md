@@ -442,6 +442,10 @@ working cache. The latter selects the verified sysroot using the clang
 backend's `windows-msvc-sysroot/DONE` layout. Generated CMake files and helper
 links live in the run directory, never in the immutable input archives.
 LLVM header flags and the separate `LIB` alias directory are set explicitly.
+`CFLAGS` and `CXXFLAGS` use `-nobuiltininc -I <view>/include`, retaining ordinary
+include-directory priority ahead of cargo-xwin's SDK intrinsic headers. Using
+`-isystem` here permits the SDK's `-I` directories to shadow LLVM intrinsics;
+the competing-header regression covers that real BLAKE3 NEON failure.
 Ambient `RUSTFLAGS`, compiler overrides, Rust compiler wrappers, and unrelated
 secrets are not inherited. The pinned plugin is invoked directly so a Cargo
 alias called `xwin` cannot substitute a different command.

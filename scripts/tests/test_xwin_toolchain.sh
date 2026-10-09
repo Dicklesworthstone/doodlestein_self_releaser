@@ -53,7 +53,29 @@ assert 'cargo-xwin DONE marker is pinned URL, not latest discovery' grep -Fxq 'h
 assert 'evidence binds archive, tool and relevant file hashes' jq -e --argjson tools "$TOOLS" \
     '.inputs.tools==$tools and (.inputs.sysroot.sha256|length)==64 and any(.files[];.path=="lib/Kernel32.lib") and any(.files[];.path=="include/arm_neon.h")' "$VIEW/evidence.json"
 assert 'compiler flags use the prepared headers and library view' jq -e --arg view "$VIEW" \
-    '.environment.CFLAGS==("-nobuiltininc -isystem "+$view+"/include") and .environment.LIB==($view+"/lib") and .environment.XWIN_CROSS_COMPILER=="clang"' "$WORK/first.json"
+    '.environment.CFLAGS==("-nobuiltininc -I "+$view+"/include") and .environment.CXXFLAGS==.environment.CFLAGS and
+     .environment.LIB==($view+"/lib") and .environment.XWIN_CROSS_COMPILER=="clang"' "$WORK/first.json"
+# A real SDK occupies gigabytes. Its already-owned, validated extraction must
+# become the view without a second SDK copy, while retaining identical bytes
+# and independent alias files. Compare actual inventories, not elapsed time.
+_xwt_require || exit $?
+PLAN=$(_xwt_manifest "$MANIFEST") || exit 1
+mkdir "$WORK/materialize" || exit 1
+_xwt_unpack "$PLAN" sysroot "$WORK/materialize" || exit 1
+_xwt_unpack "$PLAN" headers "$WORK/materialize" || exit 1
+EXTRACTED_INODE=$(stat -c '%d:%i' "$WORK/materialize/sysroot/sdk/lib/aarch64-unknown-windows-msvc/kernel32.lib")
+_xwt_materialize "$PLAN" "$WORK/materialize" || exit 1
+assert 'owned SDK extraction transfers into the view without duplicating its files' test \
+    "$(stat -c '%d:%i' "$WORK/materialize/view/sysroot/lib/aarch64-unknown-windows-msvc/kernel32.lib")" = "$EXTRACTED_INODE"
+assert 'materialization consumes only its private extracted SDK prefix' test ! -e "$WORK/materialize/sysroot/sdk"
+assert 'library aliases remain independent copies of the relocated SDK files' test \
+    ! "$WORK/materialize/view/lib/kernel32.lib" -ef "$WORK/materialize/view/sysroot/lib/aarch64-unknown-windows-msvc/kernel32.lib"
+_xwt_inventory "$WORK/materialize/view" "$WORK/materialize-index" > "$WORK/materialize-inventory.json" || exit 1
+_xwt_inventory "$VIEW" "$WORK/published-index" > "$WORK/published-inventory.json" || exit 1
+assert 'relocated SDK produces exactly the independently prepared inventory' cmp -s \
+    "$WORK/materialize-inventory.json" "$WORK/published-inventory.json"
+assert 'SDK relocation leaves the pinned source archive unchanged' test "$(_xwt_hash "$WORK/sdk.tar.xz")" = \
+    "$(jq -r '.sysroot.sha256' "$MANIFEST")"
 BEFORE=$(stat -c '%d:%i' "$VIEW/lib/Kernel32.lib")
 assert 'second preparation revalidates and reuses the view' xwin_toolchain_prepare "$MANIFEST" "$CACHE" verify
 assert 'verified reuse preserves the original inode' test "$(stat -c '%d:%i' "$VIEW/lib/Kernel32.lib")" = "$BEFORE"

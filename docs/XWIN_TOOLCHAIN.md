@@ -14,6 +14,13 @@ including the selected architecture's intrinsic headers and their dependencies. 
 header/library compatibility inputs; it does not assert that a particular
 Rust project has compiled successfully.
 
+Both compiler flag sets select the pinned LLVM resource tree with
+`-nobuiltininc -I <view>/include`. Its ordinary include-directory priority is
+necessary: cargo-xwin supplies an MSVC intrinsic directory through `-I`, which
+would take precedence over an LLVM directory classified with `-isystem`.
+Keeping the LLVM directory first in the emitted compiler arguments selects
+the LLVM intrinsics while preserving the original SDK headers and libraries.
+
 ## Input manifest
 
 The manifest must contain exactly one JSON document with `schema_version: 1`
@@ -116,6 +123,12 @@ materialized file's path/hash/size. Cache reuse is checked against a fresh
 reconstruction from pinned archive snapshots, not just a local receipt that
 could have been edited alongside the files. Verification requires those
 archives to remain available.
+
+Preparation transfers its validated private SDK extraction into the staged
+view instead of copying the entire SDK again. The source archive and installed
+inputs remain unchanged, and the library alias view still owns independent
+file copies. A warm verification still reconstructs and checks the complete
+expected inventory; the storage reduction does not change cache admission.
 
 Publication is staged and serialized per manifest. A corrupt existing view is
 refused, never silently repaired. Successful verification preserves its files

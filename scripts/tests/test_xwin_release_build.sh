@@ -48,6 +48,12 @@ printf 'int DsrKernelStub(void) { return 42; }\n' > "$WORK/kernel.c"
 clang --target="$TEST_TARGET" -ffreestanding -c "$WORK/kernel.c" -o "$WORK/kernel.obj" || exit 1
 lld-link /dll /noentry "/machine:$TEST_MACHINE" /export:DsrKernelStub "/out:$WORK/kernel32.dll" "/implib:$WORK/input/sdk/lib/$TEST_SYSROOT/kernel32.lib" "$WORK/kernel.obj" || exit 1
 printf 'SDK fixture\n' > "$WORK/input/sdk/include/windows.h"
+# Exercise the real cargo-xwin include-order conflict: its MSVC intrinsic
+# directory must not shadow the complete selected LLVM resource headers.
+mkdir -p "$WORK/input/sdk/include/__msvc_vcruntime_intrinsics"
+for HEADER in arm_neon.h xmmintrin.h; do
+    printf '#error DSR_MSVC_INTRINSIC_SHADOW\n' > "$WORK/input/sdk/include/__msvc_vcruntime_intrinsics/$HEADER"
+done
 tar -cJf "$WORK/sdk.tar.xz" -C "$WORK/input" sdk || exit 1
 tar -czf "$WORK/headers.tar.gz" -C "$WORK/input" llvm || exit 1
 printf '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n' > "$WORK/template/Cargo.toml"
@@ -194,9 +200,13 @@ if [[ "$mode" == registry-* ]]; then
     objects+=("$TMPDIR/dependency.obj")
     printf 'compiled lockfile-authenticated private crate C source\n' >&2
 fi
-# Splitting only the controlled whitespace-free compiler flags from the runner.
+# Match the observed cc-rs/cargo-xwin order, including the competing MSVC
+# intrinsic -I path. Split only the runner's controlled whitespace-free flags.
+sysroot="$XWIN_CACHE_DIR/windows-msvc-sysroot"
 # shellcheck disable=SC2086
-clang --target="$target" -ffreestanding $CFLAGS "${compile_flags[@]}" -c probe.c -o "$TMPDIR/probe.obj" || exit $?
+clang --target="$target" -ffreestanding $CFLAGS -I"$sysroot/include" \
+    -I"$sysroot/include/c++/stl" -I"$sysroot/include/__msvc_vcruntime_intrinsics" \
+    $CFLAGS "${compile_flags[@]}" -c probe.c -o "$TMPDIR/probe.obj" || exit $?
 lld-link /entry:mainCRTStartup /subsystem:console /nodefaultlib "/machine:$machine" /timestamp:0 "/out:$out" "$TMPDIR/probe.obj" "${objects[@]}" Kernel32.lib || exit $?
 case "$mode" in
     source-drift) printf '// source changed\n' >> src/main.rs ;;
