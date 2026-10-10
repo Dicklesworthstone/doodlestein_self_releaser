@@ -336,6 +336,8 @@ _slsa_manifest_statement() {
         def commit: type == "string" and length == 40 and test("^[0-9a-f]{40}$") and . != ("0" * 40);
         def count: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
         def target: text and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
+        def triple: text and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$") and (contains("..") | not);
+        def optional_triple: . == null or triple;
         def release_eligible:
             (if has("build_purpose") then .build_purpose == "release" else true end) and
             (if has("publishable") then .publishable == true else true end);
@@ -362,7 +364,7 @@ _slsa_manifest_statement() {
         if (.artifacts | type != "array" or length == 0 or
             (all(.[]; type == "object" and (.name | name) and (.sha256 | sha) and
                 release_eligible and
-                (.target | target) and (.size_bytes | count and . > 0) and
+                (.target | target) and (.target_triple | optional_triple) and (.size_bytes | count and . > 0) and
                 (.archive_format | . == "tar.gz" or . == "tar.xz" or . == "zip" or . == "binary" or . == "none")) | not))
         then error("invalid artifact records") else . end |
         (.artifacts | map(.target) | unique) as $targets |
@@ -379,22 +381,73 @@ _slsa_manifest_statement() {
                ((map(.name | ascii_downcase) | unique | length) != length) or
                ((sort_by(.name)) != ($artifacts | map({name,target,archive_format}) | sort_by(.name))))
         then error("release does not cover its exact required asset contract") else . end |
+        # A platform is a routing identity, not a compiler task. Native GNU
+        # and musl tasks share a platform; aliases share a task. Do not infer
+        # additional successful builds from filenames or summary counts.
+        (.build_environments // []) as $environments |
+        .source as $source |
+        if has("build_environments") and (.build_environments | type != "array" or
+            (all(.[]; type == "object" and (.target | target) and
+                (.target_triple | optional_triple) and
+                (.target as $t | $targets | index($t) != null)) | not) or
+            ((map([.target,.target_triple // ""]) | unique | length) != length))
+        then error("invalid build environment coverage") else . end |
+        # Retain the existing optional legacy environment contract. When a
+        # receipt does declare compiler/source selectors, they cannot disagree
+        # with the manifest or its selected variant. Private values stay out
+        # of the public statement; the manifest digest binds the full receipt.
+        if any($environments[];
+            . as $e |
+            (.build_influence_env != null and (.build_influence_env | type != "object")) or
+            (.cargo_isolation != null and (.cargo_isolation | type != "object")) or
+            ([.build_influence_env.DSR_RELEASE_GIT_SHA] | any(.[]; . != null and . != $source.git_sha)) or
+            ([.build_influence_env.DSR_RELEASE_GIT_REF] | any(.[]; . != null and . != $source.git_ref)) or
+            ($e.target_triple != null and
+                ([.build_influence_env.CARGO_BUILD_TARGET, .build_influence_env.DSR_TARGET_TRIPLE,
+                  .cargo_isolation.toolchain.target_triple] |
+                 any(.[]; . != null and . != $e.target_triple))))
+        then error("build environment contradicts source or compiler identity") else . end |
+        (.artifacts | group_by(.target) | map(
+            .[0].target as $platform |
+            (map(.target_triple // "") | unique) as $triples |
+            [$environments[] | select(.target == $platform)] as $receipts |
+            if ($triples | length) > 1 then
+                if ($triples | index("")) != null then
+                    error("variant artifact lacks an explicit compiler identity")
+                elif ($receipts | length) == 1 and $receipts[0].method == "act" and
+                     $receipts[0].target_triple == null then
+                    # One workflow may produce several ABIs. This is one act
+                    # task, not invented native compiler execution evidence.
+                    [{target:$platform}]
+                elif ($receipts | length) == ($triples | length) and
+                     all($receipts[]; .method == "native" and (.target_triple | triple)) and
+                     ($receipts | map(.target_triple) | sort) == $triples then
+                    $triples | map({target:$platform,target_triple:.})
+                else error("native variants lack exact build environment coverage") end
+            elif ($receipts | length) > 1 or
+                 any($receipts[]; .target_triple != null and
+                     $triples[0] != "" and .target_triple != $triples[0]) then
+                error("build environment differs from artifact variant")
+            else [{target:$platform}] end
+        ) | add | sort_by(.target,.target_triple)) as $tasks |
         if (.summary | type != "object" or (.total | count | not) or (.success | count | not) or
-            .failed != 0 or .total != .success or .total != ($targets | length)) or
+            .failed != 0 or .total != .success or .total != ($tasks | length)) or
            ((.artifacts | map(.name) | unique | length) != (.artifacts | length)) or
            ((.source.dependencies | map(.relative_path) | unique | length) != (.source.dependencies | length))
         then error("incomplete or duplicate release coverage") else . end |
         if has("hosts") and (.hosts | type != "array" or
             (all(.[]; type == "object" and .status == "success" and (.platform | target)) | not) or
-            (map(.platform) | sort) != $targets)
+            (map(.platform) | sort) != ($tasks | map(.target) | sort) or
+            (all(.[]; . as $host | (.target_triple | optional_triple) and
+                ([$tasks[] | select(.target == $host.platform)] as $expected |
+                 if ($expected | length) > 1 then
+                     any($expected[]; .target_triple == $host.target_triple)
+                 else ($host.target_triple == null or
+                     any($artifacts[]; .target == $host.platform and .target_triple == $host.target_triple)) end)) | not) or
+            ((map([.platform,.target_triple // ""]) | unique | length) != length))
         then error("host results disagree with successful targets") else . end |
         if has("builder") and (.builder | type != "object" or .tool != "dsr" or (.version | text | not))
         then error("invalid recorded builder") else . end |
-        if has("build_environments") and (.build_environments | type != "array" or
-            (all(.[]; type == "object" and (.target | target) and
-                (.target as $t | $targets | index($t) != null)) | not) or
-            ((map(.target) | unique | length) != length))
-        then error("invalid build environment coverage") else . end |
         . as $m |
         {_type:"https://in-toto.io/Statement/v1",predicateType:"https://slsa.dev/provenance/v1",
          subject:($m.artifacts | sort_by(.name) | map({name:.name,digest:{sha256:.sha256}})),
@@ -409,9 +462,13 @@ _slsa_manifest_statement() {
                  (if $m.builder == null then {} else {version:{dsr:$m.builder.version}} end)),
                  metadata:{invocationId:$m.run_id,finishedOn:$m.built_at},
                  byproducts:[{name:"dsr-build-manifest",digest:{sha256:$digest}}]}},
-         dsr_evidence:{kind:"build-manifest",manifest_sha256:$digest,
+         dsr_evidence:({kind:"build-manifest",manifest_sha256:$digest,
              repository_binding:"caller-supplied",build_environment_count:(($m.build_environments // []) | length),
-             artifacts:($m.artifacts | sort_by(.name) | map({name,target,size_bytes,archive_format}))}}
+             artifacts:($m.artifacts | sort_by(.name) | map(
+                 {name,target,size_bytes,archive_format} +
+                 (if any($tasks[]; .target_triple != null) and .target_triple != null
+                  then {target_triple:.target_triple} else {} end)))} +
+             (if any($tasks[]; .target_triple != null) then {build_tasks:$tasks} else {} end))}
     ' "$manifest" 2>/dev/null) || { _slsa_log 'Invalid or incomplete DSR build manifest'; return 4; }
     [[ "$(_slsa_sha256 "$manifest")" == "$digest" ]] || return 1
     printf '%s\n' "$statement"
