@@ -3,7 +3,7 @@
 # boundaries are fixtures; payloads, files, hashes and JSON admission are real.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-for tool in python3 jq bash; do
+for tool in python3 jq bash git; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
 done
 python3 - "$ROOT" <<'PY'
@@ -294,6 +294,155 @@ try:
         stopped=True
     check('cancellation reaps the owned download process',stopped)
     check('interrupted acquisition cannot export verified checksums',not (directory/'audit/checksums.normalized').exists())
+finally:
+    if proc.poll() is None:
+        proc.terminate(); proc.communicate(timeout=15)
+
+# Audited downstream sync uses the real sync command and real Git operations.
+# Explicit URL mappings point its HTTPS clone URLs at owned local repositories;
+# neither GitHub releases nor actual downstream repositories are mutated.
+git_home=work/'git-home'; git_home.mkdir()
+git_config=git_home/'config'
+git_env=dict(os.environ,GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL=str(git_config),
+             GIT_AUTHOR_NAME='Checksum test',GIT_AUTHOR_EMAIL='checksum-test@example.invalid',
+             GIT_COMMITTER_NAME='Checksum test',GIT_COMMITTER_EMAIL='checksum-test@example.invalid')
+def git(*args,env=None):
+    return subprocess.run(['git',*map(str,args)],env=env or git_env,check=True,capture_output=True).stdout
+seed=work/'seed'; seed.mkdir()
+git('init','--initial-branch=main',seed)
+(seed/'SHA256SUMS.txt').write_text('0'*64+'  previous\n')
+(seed/'README').write_text('Unrelated retained downstream file\n')
+git('-C',seed,'add','SHA256SUMS.txt','README')
+git('-C',seed,'commit','-m','Owned checksum test baseline')
+remote=work/'downstream.git'
+git('clone','--bare',seed,remote)
+git('config','--file',git_config,'url.'+remote.as_uri()+'.insteadOf','https://github.com/downstream/one.git')
+git('config','--file',git_config,'protocol.file.allow','always')
+git('config','--file',git_config,'user.name','Checksum test')
+git('config','--file',git_config,'user.email','checksum-test@example.invalid')
+initial=git('--git-dir',remote,'rev-parse','main').decode().strip()
+
+def sync_case(label,expected=0,*,mode='ok',mutate=None,extra=(),audited=True):
+    global sequence
+    sequence+=1
+    directory=work/('sync-%03d'%sequence)
+    spec=fixture(directory)
+    spec['mode']=mode
+    spec['aggregate_id']=6
+    if mutate:mutate(directory,spec)
+    save(directory/'fixture.json',spec)
+    state=directory/'state/releases/app/v1.2.3'
+    state.mkdir(parents=True)
+    (state/'local-cache-must-not-win').write_text('Unrelated local payload\n')
+    env=dict(git_env,PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],DSR_AUDIT_FIXTURE=str(directory),
+             GH_TOKEN='owned_test_token',GITHUB_TOKEN='',GH_HOST='untrusted.example',
+             DSR_STATE_DIR=str(directory/'state'),TMPDIR=str(directory))
+    command=['bash',str(root/'src/checksum_sync.sh'),'sync','app','1.2.3','--repo','owner/app',
+             '--target-repo','downstream/one','--json']
+    if audited:command.append('--verify-release')
+    proc=subprocess.run(command+list(extra),env=env,capture_output=True,timeout=180)
+    (directory/'stdout').write_bytes(proc.stdout); (directory/'stderr').write_bytes(proc.stderr)
+    check(label+': exit',proc.returncode==expected)
+    result=json.loads(proc.stdout)
+    check(label+': truthful single sync envelope',result['exit_code']==expected and result['status']==('success' if expected==0 else 'error'))
+    check(label+': local cache left untouched',(state/'local-cache-must-not-win').read_text()=='Unrelated local payload\n')
+    return directory,result,env
+
+d,result,env=sync_case('audited dry run',extra=('--dry-run',))
+check('dry-run audit checks five real payload files before planning downstream work',
+      result['planned']==1 and result['synced']==0 and result['release_verification']['verified_count']==5 and
+      result['source']['kind']=='verified_release_assets')
+check('dry-run exports only audited names instead of trusting auto-discovered local cache',
+      result['source']['manifest_sha256']==result['release_verification']['normalized_manifest_sha256'] and
+      'local-cache-must-not-win' not in (Path(result['workspace'])/'manifest').read_text())
+check('dry-run neither clones nor changes the downstream branch',not (Path(result['workspace'])/'target-1').exists() and
+      git('--git-dir',remote,'rev-parse','main').decode().strip()==initial)
+
+d,result,env=sync_case('audited local downstream commit')
+checkout=Path(result['results'][0]['checkout'])
+committed=result['results'][0]['commit']
+check('audited sync makes a genuine commit containing only the selected checksum file',
+      result['synced']==1 and committed!=initial and
+      git('-C',checkout,'diff-tree','--no-commit-id','--name-only','-r',committed).decode().splitlines()==['SHA256SUMS.txt'])
+check('committed checksum bytes exactly equal the audit-bound export',
+      git('-C',checkout,'show',committed+':SHA256SUMS.txt')==Path(result['release_verification']['normalized_manifest']).read_bytes())
+check('local commit does not imply remote publication or signer authentication',result['results'][0]['pushed'] is False and
+      result['release_verification']['authenticated'] is False and git('--git-dir',remote,'rev-parse','main').decode().strip()==initial)
+check('unrelated downstream content and original seed are preserved',git('-C',checkout,'show','HEAD:README')==(seed/'README').read_bytes() and
+      git('-C',seed,'rev-parse','HEAD').decode().strip()==initial)
+
+d,result,env=sync_case('explicit audited downstream push',extra=('--push',))
+published=git('--git-dir',remote,'rev-parse','main').decode().strip()
+check('explicit push updates only the owned test remote with verified checksums',published==result['results'][0]['commit'] and
+      published!=initial and result['results'][0]['pushed'] is True)
+d,result,env=sync_case('unchanged audited push retry',extra=('--push',))
+check('unchanged retry preserves the existing commit and still checks the live release',
+      result['results'][0]['commit']==published and result['results'][0]['changed'] is False and
+      result['release_verification']['verified_count']==5)
+
+for label,kwargs,code in (
+    ('missing remote aggregate',dict(mutate=lambda d,s:s['assets'].__setitem__(slice(None),[a for a in s['assets'] if a['name']!='SHA256SUMS'])),1),
+    ('malformed remote aggregate',dict(mutate=lambda d,s:body(d,s,b'<html>not checksums</html>')),4),
+    ('missing remote checksum row',dict(mutate=lambda d,s:body(d,s,(d/'bodies'/'6').read_bytes().split(b'\n',1)[1])),1),
+    ('remote fifth payload mismatch',dict(mutate=corrupt_last_payload),1),
+    ('remote fifth payload acquisition failed',dict(mode='asset-failure'),8),
+    ('remote inventory changed',dict(mode='inventory-drift'),1),
+):
+    d,result,env=sync_case(label,code,extra=('--push',),**kwargs)
+    check(label+': no downstream clone, commit or push was attempted',result['synced']==0 and result['results']==[] and
+          not (Path(result['workspace'])/'target-1').exists() and git('--git-dir',remote,'rev-parse','main').decode().strip()==published)
+    check(label+': failure evidence survives in the sync result',result['release_verification']['status']=='error' and
+          result['release_verification']['exit_code']==code and result['source']['kind']=='release_audit')
+
+d,result,env=sync_case('metadata-aware audited sync',mutate=extra_metadata,extra=('--include-metadata','--dry-run'))
+check('explicit metadata policy audits and propagates eight verified records',
+      result['release_verification']['verified_count']==8 and len((Path(result['workspace'])/'manifest').read_text().splitlines())==8)
+d,result,env=sync_case('audited explicit aggregate and bounds',extra=('--checksum-asset','SHA256SUMS','--audit-timeout','10',
+     '--audit-max-asset-bytes','1000','--audit-max-total-bytes','100000','--dry-run'))
+check('audit selections reach the auditor before downstream planning',result['planned']==1 and
+      [a['name'] for a in result['release_verification']['checksum_assets']]==['SHA256SUMS'])
+local_manifest=work/'provided-checksums'
+local_manifest.write_text('a'*64+'  locally-selected\n')
+sync_case('audited mode refuses local checksum substitution',4,extra=('--manifest',str(local_manifest),'--dry-run'))
+sync_case('audited mode refuses local artifact substitution',4,extra=('--artifacts-dir',str(seed),'--dry-run'))
+sync_case('audit-only options cannot silently become ordinary sync',4,audited=False,extra=('--audit-timeout','10','--dry-run'))
+d,result,env=sync_case('existing explicit-manifest sync remains distinct',audited=False,extra=('--manifest',str(local_manifest),'--dry-run'))
+check('syntax-only local sync does not claim remote verification',result['source']['kind']=='provided_manifest' and
+      result['release_verification'] is None and result['planned']==1 and not (d/'trace.jsonl').exists())
+
+# The existing checksum module exposes the new full audit as a direct command,
+# while the separate legacy dsr release-verify implementation remains untouched.
+route=work/'audit-route'; spec=fixture(route); save(route/'fixture.json',spec)
+env=dict(os.environ,PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],DSR_AUDIT_FIXTURE=str(route),GH_TOKEN='owned_test_token')
+proc=subprocess.run(['bash',str(root/'src/checksum_sync.sh'),'verify-release','--repo','owner/app','--tag','v1.2.3',
+                     '--output-dir',str(route/'audit')],env=env,capture_output=True,timeout=180)
+check('checksum module CLI routes to complete auditing',proc.returncode==0 and json.loads(proc.stdout)['verified_count']==5)
+
+# A SIGTERM to the public sync PID must prevent later clone/push work as well
+# as terminate its active audit. Verify against the actual owned local remote.
+cancel=work/'sync-cancel'; spec=fixture(cancel); spec['mode']='cancel'; save(cancel/'fixture.json',spec)
+env=dict(git_env,PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],DSR_AUDIT_FIXTURE=str(cancel),GH_TOKEN='owned_test_token',TMPDIR=str(cancel))
+proc=subprocess.Popen(['bash',str(root/'src/checksum_sync.sh'),'sync','app','1.2.3','--repo','owner/app',
+                       '--target-repo','downstream/one','--verify-release','--push','--json'],
+                       stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+try:
+    deadline=time.monotonic()+15
+    while not (cancel/'blocked-pid').exists() and time.monotonic()<deadline and proc.poll() is None:
+        time.sleep(.05)
+    check('sync cancellation reaches an active real auditor', (cancel/'blocked-pid').exists())
+    proc.send_signal(signal.SIGTERM)
+    stdout,stderr=proc.communicate(timeout=15)
+    (cancel/'stdout').write_bytes(stdout); (cancel/'stderr').write_bytes(stderr)
+    result=json.loads(stdout)
+    check('public sync cancellation emits exactly one interrupted result',proc.returncode==5 and result['exit_code']==5 and
+          result['status']=='error' and result['results']==[])
+    check('cancelled sync never mutates the downstream branch',git('--git-dir',remote,'rev-parse','main').decode().strip()==published and
+          not (Path(result['workspace'])/'target-1').exists())
+    try:
+        os.kill(int((cancel/'blocked-pid').read_text()),0); stopped=False
+    except ProcessLookupError:
+        stopped=True
+    check('sync cancellation reaps the audit transport',stopped)
 finally:
     if proc.poll() is None:
         proc.terminate(); proc.communicate(timeout=15)

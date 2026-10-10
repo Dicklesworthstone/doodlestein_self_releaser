@@ -13,8 +13,8 @@ The output directory must be new, absolute, and have an existing parent. Omit
 its downloaded evidence and JSON result, including failed attempts. Repeat an
 audit in a new directory; the auditor never repairs or overwrites prior evidence.
 
-This command is also sourceable as `release_verify_checksums`. Bash, Python 3,
-jq, and curl 8.4.0 or newer are required. The curl minimum ensures that the
+This command is also sourceable as `release_verify_checksums`. A Unix host with
+Bash 4+, Python 3, jq, and curl 8.4.0 or newer is required. The curl minimum ensures that the
 maximum download size applies during a transfer even without Content-Length.
 It is not a claim that arbitrary old curl installations are security-qualified.
 
@@ -109,10 +109,63 @@ The older `dsr release verify --checksums` path has not yet been routed through
 this auditor. Do not infer that its historical spot-check result now provides
 these full-coverage guarantees. This entry point is the explicit full audit.
 
+## Audit before downstream checksum sync
+
+The existing checksum module exposes the full audit directly:
+
+```bash
+bash src/checksum_sync.sh verify-release --repo owner/tool --tag v1.2.3
+```
+
+For downstream updates, select `--verify-release` on the existing sync command:
+
+```bash
+bash src/checksum_sync.sh sync tool v1.2.3 --repo owner/tool \
+  --target-repo owner/installers --verify-release --dry-run --json
+
+bash src/checksum_sync.sh sync tool v1.2.3 --repo owner/tool \
+  --target-repo owner/installers --verify-release --push --json
+```
+
+Audited sync downloads and verifies the complete eligible release **before any
+downstream clone, commit, push or review issue**. Missing or malformed aggregates,
+missing checksum rows, bad payload bytes and failed acquisitions stop sync;
+another checksum source is not silently substituted. Existing local artifact
+caches are deliberately bypassed. `--manifest` and `--artifacts-dir` cannot be
+combined with `--verify-release`.
+
+The sync handoff checks the exact repository/tag, coverage policy and positive
+counts, the persisted audit receipt, the normalized export hash and its exact
+verified names, and the retained payload hashes. Only that audited export is
+committed downstream. Each downstream mutation rechecks the held receipt and
+export identity. Unrelated repository files and earlier commits remain intact.
+No push occurs unless `--push` was requested; ordinary local checksum commits
+remain available in the retained sync workspace.
+
+`--dry-run --verify-release` performs the read-only remote audit and retains its
+evidence, but does not clone or mutate downstream repositories. `--external`
+also requires successful auditing before opening its review issue.
+`--include-metadata` extends the audited set and propagated checksum records.
+
+Use `--checksum-asset NAME`, `--audit-timeout SECONDS`,
+`--audit-max-asset-bytes N` and `--audit-max-total-bytes N` to pass explicit
+selection/limits to the auditor. These options require `--verify-release`.
+Credentials are resolved by the auditor; `--prefer-gh` only controls the older
+download-only sync path, not this asset-ID audit path.
+
+The JSON sync envelope includes the complete `release_verification` result and
+the audited normalized-manifest hash under `source`. A failed audit preserves
+its failure result and returns nonzero without any downstream result entries.
+Cancellation during audit stops the owned transport before downstream work.
+Neither sync nor the audit asserts publisher-signature or source authentication.
+Without `--verify-release`, established local/syntax-only sync semantics remain
+unchanged and `release_verification` is null.
+
 ## Regression tests
 
 ```bash
 bash scripts/tests/test_release_checksums.sh
+bash scripts/tests/test_release_checksums_transport.sh
 ```
 
 The suite runs the real command, aggregate parser, file hashing and receipt
@@ -120,4 +173,18 @@ persistence against explicitly substituted curl/gh transport boundaries. It
 covers more than three payloads, later asset-list pages, credentials, malformed
 and missing evidence, payload corruption, inventory drift, byte/time limits,
 metadata policy and preservation of prior evidence. Those fixture runs are not
-live GitHub, TLS/redirect or cryptographic signing qualification.
+live GitHub or cryptographic signing qualification.
+The same suite exercises genuine downstream clone/commit/push operations using
+explicit Git URL mappings to private local test repositories. It checks the
+exact committed file/bytes, explicit push policy, unchanged retries, audit
+refusals before mutation, local-cache bypass, metadata coverage and cancellation.
+No actual downstream GitHub repository is changed by those tests.
+
+The transport suite additionally requires OpenSSL and loopback sockets. It runs
+the installed curl against an explicitly trusted local TLS/proxy fixture, with
+no public network calls. It checks real cross-origin authorization stripping,
+normal and chunked downloads, streamed byte limits, HTTP failures, HTTPS-only
+redirects, redirect loops, response timeouts and refusal of an untrusted
+certificate. Its generated certificate is trusted only by the test subprocess,
+not installed in the system trust store. This is local transport integration,
+not qualification against actual private GitHub assets or other native platforms.

@@ -522,6 +522,8 @@ checksum_sync() (
     local tool_name='' version='' repo='' artifacts_dir='' manifest='' checksums_file=SHA256SUMS.txt
     local push_changes=false review=false dry_run=false json=false metadata=false prefer=false
     local workspace='' tag='' source_kind='' source_asset='' manifest_sha='' error='' arg option
+    local verify_release=false audit_receipt='' audit_worker='' audit_pin=''
+    local -a audit_args=()
     local start_time=$SECONDS synced=0 failed=0 planned=0 issues_opened=0
     local -a target_repos=() results=()
     for arg in "$@"; do [[ "$arg" != --json ]] || json=true; done
@@ -532,6 +534,7 @@ checksum_sync() (
     }
     _cs_sync_finish() {
         local code=$? overall=success entries
+        local -a audit_json=(--argjson audit '[null]')
         trap - EXIT
         if ((code != 0)); then
             overall=error
@@ -539,6 +542,7 @@ checksum_sync() (
             [[ -n "$error" ]] || error="Checksum sync failed (exit $code)"
         fi
         entries=$(printf '%s\n' "${results[@]}" | jq -s '.') || exit 1
+        [[ -z "$audit_receipt" ]] || audit_json=(--slurpfile audit "$audit_receipt")
         if $json; then
             jq -nc --arg status "$overall" --argjson code "$code" --arg tool "$tool_name" \
                 --arg version "$tag" --arg repo "$repo" --arg workspace "$workspace" --arg error "$error" \
@@ -546,17 +550,28 @@ checksum_sync() (
                 --argjson duration "$((SECONDS - start_time))" --argjson results "$entries" \
                 --argjson synced "$synced" --argjson failed "$failed" --argjson planned "$planned" \
                 --argjson issues "$issues_opened" --argjson dry_run "$dry_run" \
+                "${audit_json[@]}" \
                 '{status:$status,exit_code:$code,tool:$tool,version:$version,repository:$repo,
                   workspace:(if $workspace == "" then null else $workspace end),dry_run:$dry_run,
                   source:{kind:$source,asset:$asset,manifest_sha256:$digest},
+                  release_verification:$audit[0],
                   error:(if $error == "" then null else $error end),duration_seconds:$duration,
                   synced:$synced,failed:$failed,planned:$planned,issues_opened:$issues,results:$results}' || exit 1
         fi
         [[ -z "$workspace" ]] || _cs_log_info "Checksum sync workspace retained: $workspace"
         exit "$code"
     }
+    _cs_sync_cancel() {
+        trap '' HUP INT TERM
+        error='Sync interrupted'
+        if [[ -n "$audit_worker" ]]; then
+            kill -TERM "$audit_worker" 2>/dev/null || true
+            wait "$audit_worker" 2>/dev/null || true
+        fi
+        exit 5
+    }
     trap _cs_sync_finish EXIT
-    trap 'error="Sync interrupted"; exit 5' HUP INT TERM
+    trap _cs_sync_cancel HUP INT TERM
     while (($#)); do
         case "$1" in
             --tool|-t|--version|-V|--repo|--artifacts-dir|-a|--manifest|--target-repo|-r|--checksums-file)
@@ -578,6 +593,11 @@ checksum_sync() (
             --json) shift ;;
             --include-metadata) metadata=true; shift ;;
             --prefer-gh) prefer=true; shift ;;
+            --verify-release) verify_release=true; shift ;;
+            --checksum-asset|--audit-timeout|--audit-max-asset-bytes|--audit-max-total-bytes)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { error="Missing value for $1"; return 4; }
+                option="${1/--audit-/--}"
+                audit_args+=("$option" "$2"); shift 2 ;;
             --help|-h)
                 cat >&2 <<'EOF'
 checksum_sync - Sync validated release checksums to downstream repositories
@@ -591,12 +611,19 @@ OPTIONS:
     --checksums-file PATH    Repository-relative output (default: SHA256SUMS.txt)
     --include-metadata       Include text, SBOM and provenance in local generation
     --prefer-gh              Prefer authenticated GitHub CLI release downloads
+    --verify-release         Audit every eligible remote payload before downstream mutation
+    --checksum-asset NAME    Exact aggregate for --verify-release (default: conventional aggregates)
+    --audit-timeout SECONDS  Per-operation audit limit; requires --verify-release
+    --audit-max-asset-bytes N Per-payload audit byte limit; requires --verify-release
+    --audit-max-total-bytes N Total selected audit byte limit; requires --verify-release
     --push                   Push the checksum commit to the current branch; never force
     --external, --open-issue Open a security review issue instead of committing
     --dry-run                Validate and plan without cloning or writing remote repositories
     --json                   One result with per-target outcomes and retained checkout paths
 Local commits and failed checkouts are retained in the reported private workspace.
 Download-only manifests are syntax-validated, not proof of artifact authenticity.
+--verify-release cannot use --manifest or --artifacts-dir, bypasses local cached
+artifacts, and retains its full audit. --dry-run audits but never changes downstream repos.
 EOF
                 return 0 ;;
             -*) error="Unknown option: $1"; return 4 ;;
@@ -615,6 +642,11 @@ EOF
     [[ -z "$manifest" || -z "$artifacts_dir" ]] || return 4
     [[ -z "$manifest" || ( -f "$manifest" && ! -L "$manifest" ) ]] || return 4
     [[ -z "$artifacts_dir" || ( -d "$artifacts_dir" && ! -L "$artifacts_dir" ) ]] || return 4
+    if $verify_release; then
+        [[ -z "$manifest$artifacts_dir" ]] || { error='Release audit cannot use local manifest/artifact inputs'; return 4; }
+    else
+        ((${#audit_args[@]} == 0)) || { error='Audit options require --verify-release'; return 4; }
+    fi
     if [[ -z "$repo" ]]; then
         if declare -F act_get_repo >/dev/null; then
             repo=$(act_get_repo "$tool_name") || return 4
@@ -639,13 +671,62 @@ EOF
     workspace=$(mktemp -d "$root/dsr-checksum-sync.XXXXXXXX") || return 1
     workspace=$(cd "$workspace" && pwd -P) || return 1
     local content='' candidate state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
-    if [[ -z "$artifacts_dir" && -z "$manifest" ]]; then
+    if ! $verify_release && [[ -z "$artifacts_dir" && -z "$manifest" ]]; then
         for candidate in "$state_dir/releases/$tool_name/$tag" "$state_dir/artifacts/$tool_name/$tag" "/tmp/dsr-release-$tool_name-$tag"; do
             [[ -d "$candidate" && ! -L "$candidate" ]] || continue
             artifacts_dir="$candidate"; break
         done
     fi
-    if [[ -n "$artifacts_dir" ]]; then
+    if $verify_release; then
+        source_kind=release_audit
+        local module_dir audit_status=0 audited_manifest_sha
+        module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+        $metadata && audit_args+=(--include-metadata)
+        # The child owns its network process group. Keep the PID only in this
+        # invocation so cancellation never signals anything restored from disk.
+        bash "$module_dir/release_checksums.sh" --repo "$repo" --tag "$tag" \
+            --output-dir "$workspace/audit" "${audit_args[@]}" \
+            > "$workspace/audit-result.json" 2> "$workspace/audit.log" &
+        audit_worker=$!
+        wait "$audit_worker" || audit_status=$?
+        audit_worker=''
+        if ! jq -es --argjson code "$audit_status" '
+            length==1 and (.[0]|type=="object" and .kind=="dsr-release-checksum-verification" and
+                .exit_code==$code and .status==(if $code==0 then "verified" else "error" end))
+        ' "$workspace/audit-result.json" >/dev/null 2>&1; then
+            error='Release audit did not return a consistent completion receipt'; return 7
+        fi
+        audit_receipt="$workspace/audit-result.json"
+        ((audit_status == 0)) || { error='Release checksum audit failed; no downstream mutation attempted'; return "$audit_status"; }
+        if ! jq -es --arg repo "$repo" --arg tag "$tag" --arg root "$workspace/audit" --argjson metadata "$metadata" '
+            length==1 and (.[0]|.repository==$repo and .tag==$tag and .output_dir==$root and
+                .verification_policy=="sha256-all-eligible-release-assets" and .include_metadata==$metadata and
+                .authenticated==false and .source_verified==false and .inventory_stable==true and
+                (.eligible_count|type=="number" and floor==. and .>0) and
+                .eligible_count==.verified_count and .eligible_count==(.verified_checksums|length) and
+                (.verified_checksums|unique|length)==.eligible_count and .eligible_assets==.verified_checksums and
+                .checksum_errors==[] and .coverage_errors==[] and
+                .normalized_manifest==($root+"/checksums.normalized") and
+                (.normalized_manifest_sha256|type=="string" and test("^[0-9a-f]{64}$")))
+        ' "$audit_receipt" >/dev/null || ! cmp -s "$audit_receipt" "$workspace/audit/result.json"; then
+            error='Release audit does not prove the selected complete checksum coverage'; return 7
+        fi
+        audited_manifest_sha=$(jq -r '.normalized_manifest_sha256' "$audit_receipt") || return 7
+        audit_pin=$(_cs_sha256 "$audit_receipt") || return 7
+        [[ "$(_cs_sha256 "$workspace/audit/checksums.normalized")" == "$audited_manifest_sha" ]] || {
+            error='Audited checksum export changed'; return 7;
+        }
+        checksum_manifest_normalize "$workspace/audit/checksums.normalized" > "$workspace/manifest" || return 7
+        if [[ "$(_cs_sha256 "$workspace/manifest")" != "$audited_manifest_sha" ]] || \
+           ! jq -Rse --slurpfile audit "$audit_receipt" '
+                (split("\n")|map(select(length>0)|.[66:]))==$audit[0].verified_checksums
+            ' "$workspace/manifest" >/dev/null || \
+           ! checksum_verify "$workspace/manifest" "$workspace/audit/artifacts"; then
+            error='Audited checksum handoff differs from its verified payloads'; return 7
+        fi
+        source_asset=$(jq -r '.checksum_assets|map(.name)|join(",")' "$audit_receipt") || return 7
+        source_kind=verified_release_assets
+    elif [[ -n "$artifacts_dir" ]]; then
         source_kind=local_artifacts
         _cs_log_info "Generating checksums from: $artifacts_dir"
         local -a generate_args=()
@@ -665,9 +746,16 @@ EOF
     fi
     content=$(cat "$workspace/manifest") || return 1
     manifest_sha=$(_cs_sha256 "$workspace/manifest") || return $?
+    if $verify_release && [[ "$manifest_sha" != "$audited_manifest_sha" ]]; then
+        error='Audited checksum manifest changed during selection'; return 7
+    fi
     local index=0 checkout receipt rc action entry issue_url body
     for target in "${unique_targets[@]}"; do
         index=$((index + 1)); rc=0; receipt='{}'; checkout=''; action=update
+        if $verify_release && { [[ "$(_cs_sha256 "$audit_receipt")" != "$audit_pin" ]] ||
+                               [[ "$(_cs_sha256 "$workspace/manifest")" != "$manifest_sha" ]]; }; then
+            error='Audited checksum selection changed before downstream update'; return 7
+        fi
         if $dry_run; then
             action=planned; planned=$((planned + 1))
             _cs_log_info "[dry-run] Would update $checksums_file in $target"
@@ -739,8 +827,21 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         generate) checksum_generate "$@" ;;
         verify) checksum_verify "$@" ;;
         normalize) checksum_manifest_normalize "$@" ;;
-        sync) checksum_sync "$@" ;;
-        *) printf 'Usage: checksum_sync.sh {generate|verify|normalize|sync} [arguments]\n' >&2; exit 4 ;;
+        verify-release)
+            module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || exit 3
+            exec bash "$module_dir/release_checksums.sh" "$@" ;;
+        sync)
+            # Forward cancellation from the public CLI PID to its sourceable
+            # worker group, including Bash's function-subshell layer. The
+            # worker in turn reaps the separately owned audit transport.
+            set -m
+            checksum_sync "$@" & sync_worker=$!
+            trap 'trap "" HUP INT TERM; kill -TERM -- "-$sync_worker" 2>/dev/null || true; wait "$sync_worker" 2>/dev/null || true; exit 5' HUP INT TERM
+            sync_status=0
+            wait "$sync_worker" || sync_status=$?
+            trap - HUP INT TERM
+            exit "$sync_status" ;;
+        *) printf 'Usage: checksum_sync.sh {generate|verify|verify-release|normalize|sync} [arguments]\n' >&2; exit 4 ;;
     esac
     exit $?
 fi
