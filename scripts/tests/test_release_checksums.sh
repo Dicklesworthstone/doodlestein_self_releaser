@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -95,6 +96,9 @@ if mode in ('timeout', 'cancel'):
 if '/assets/' in url.path:
     assert 'application/octet-stream' in config
     identity = int(url.path.rsplit('/', 1)[1])
+    if mode == 'cancel-sidecar' and identity == spec['aggregate_id']:
+        (base / 'blocked-pid').write_text(str(os.getpid()))
+        time.sleep(30)
     if mode == 'asset-failure' and identity == 5: sys.exit(22)
     if mode == 'aggregate-failure' and identity == spec['aggregate_id']: sys.exit(22)
     data = (base / 'bodies' / str(identity)).read_bytes()
@@ -567,6 +571,134 @@ check('spaced payload has its exact sidecar rather than a tokenized name',
           a['name'] == 'payload with spaces + plus.tar.gz.sha256' for a in result['checksum_assets']))
 special('sidecar byte budgets include every proof', sidecar_fixture, 4,
         extra=(*sidecar_args, '--max-total-bytes', '100'))
+
+# The complete sidecar selection must survive the real downstream workflow.
+# Make one legitimate payload change so an explicit push exercises a real new
+# commit, not just a no-op with the aggregate-mode checksums used above.
+def sidecar_sync_fixture(d,s):
+    row = s['assets'][0]
+    data = b'New owned payload for sidecar-only release\n'
+    (d/'bodies'/str(row['id'])).write_bytes(data)
+    row.update(size=len(data), digest='sha256:' + sha(data))
+    sidecar_fixture(d,s,style='bare')
+
+d,result,env=sync_case('sidecar-aware downstream dry run',mutate=sidecar_sync_fixture,extra=(*sidecar_args,'--dry-run'))
+check('sidecar dry run binds the selected mode and all payload proofs',
+      result['release_verification']['checksum_mode']=='sidecars' and result['planned']==1 and result['synced']==0 and
+      len(result['release_verification']['checksum_assets'])==5 and
+      not (Path(result['workspace'])/'target-1').exists())
+held_sidecar=result['release_verification']
+held_root=Path(held_sidecar['output_dir'])
+d,result,env=sync_case('sidecar audit produces a retained downstream commit',mutate=sidecar_sync_fixture,extra=sidecar_args)
+checkout=Path(result['results'][0]['checkout'])
+check('sidecar-only release commits exactly the verified checksum file without pushing',
+      result['synced']==1 and result['results'][0]['pushed'] is False and
+      git('-C',checkout,'diff-tree','--no-commit-id','--name-only','-r','HEAD').decode().splitlines()==['SHA256SUMS.txt'] and
+      git('-C',checkout,'show','HEAD:SHA256SUMS.txt')==Path(result['release_verification']['normalized_manifest']).read_bytes() and
+      git('--git-dir',remote,'rev-parse','main').decode().strip()==published)
+d,result,env=sync_case('explicit sidecar-only downstream push',mutate=sidecar_sync_fixture,extra=(*sidecar_args,'--push'))
+sidecar_published=git('--git-dir',remote,'rev-parse','main').decode().strip()
+check('sidecar push advances only the owned branch after complete auditing',
+      sidecar_published!=published and sidecar_published==result['results'][0]['commit'] and
+      result['release_verification']['verified_count']==5)
+d,result,env=sync_case('unchanged sidecar-only push retry',mutate=sidecar_sync_fixture,extra=(*sidecar_args,'--push'))
+check('sidecar retry reaudits but does not fabricate a new commit',result['results'][0]['changed'] is False and
+      result['results'][0]['commit']==sidecar_published and result['release_verification']['verified_count']==5)
+
+for label,mutate,code in (
+    ('missing downstream sidecar',absent_sidecar,1),
+    ('malformed downstream sidecar',lambda d,s:change_sidecar(d,s,b'<html>error</html>'),4),
+    ('wrong downstream sidecar payload',lambda d,s:change_sidecar(d,s,b'a'*64+b'  foreign\n'),4),
+    ('sidecar payload corruption before sync',sidecar_corrupt_payload,1),
+    ('sidecar acquisition failure before sync',fail_sidecar_download,8),
+    ('sidecar aggregate contradiction before sync',lambda d,s:sidecars_and_aggregate(d,s,True),1),
+):
+    d,result,env=sync_case(label,code,mutate=mutate,extra=(*sidecar_args,'--push'))
+    check(label+': no downstream mutation or unchecked fallback',result['results']==[] and result['synced']==0 and
+          not (Path(result['workspace'])/'target-1').exists() and
+          git('--git-dir',remote,'rev-parse','main').decode().strip()==sidecar_published)
+sync_case('sidecar policy cannot be used without remote auditing',4,audited=False,extra=(*sidecar_args,'--dry-run'))
+sync_case('conflicting sidecar and aggregate authority is refused before sync',4,mutate=sidecar_fixture,
+          extra=(*sidecar_args,'--checksum-asset','SHA256SUMS','--push'))
+sync_case('repeated sidecar policies cannot silently choose the last one',4,mutate=sidecar_fixture,
+          extra=(*sidecar_args,'--checksum-mode','aggregate','--push'))
+
+# Validate the production handoff function with real retained audit evidence.
+# Contradictory receipt copies must fail independently of the transport. Never
+# mutate the original audit, payloads, or publisher/source assertions.
+def admit_receipt(label,path,audit_root,expected=7,mode='sidecars',aggregate=''):
+    proc=subprocess.run(['bash','-c','source "$1"; shift; _cs_admit_release_audit "$@"','_',
+        str(root/'src/checksum_sync.sh'),str(path),str(audit_root),'owner/app','v1.2.3','false',mode,aggregate],capture_output=True)
+    check(label,proc.returncode==expected)
+admit_receipt('genuine complete sidecar receipt is admitted',held_root/'result.json',held_root,0)
+mutations=(
+    ('missing policy',lambda r:r.pop('checksum_mode')),
+    ('downgraded aggregate policy',lambda r:r.update(checksum_mode='aggregate')),
+    ('sample count',lambda r:r.update(verified_count=3)),
+    ('missing sidecar scope',lambda r:r['checksum_assets'][0].pop('scope')),
+    ('foreign proof scope',lambda r:r['checksum_assets'][0].update(scope='unchecked')),
+    ('missing proof',lambda r:r['checksum_assets'].pop()),
+    ('duplicate proof',lambda r:r['checksum_assets'].append(copy.deepcopy(r['checksum_assets'][0]))),
+    ('wrong proof payload',lambda r:r['checksum_assets'][0].update(payload='foreign')),
+    ('unbound evidence path',lambda r:r['checksum_assets'][0].update(path='/tmp/foreign-proof')),
+    ('unsafe evidence name',lambda r:r['checksum_assets'][0].update(name='../proof',path=str(held_root/'evidence/../proof'))),
+    ('false proof digest',lambda r:r['checksum_assets'][0].update(sha256='0'*64)),
+    ('newline proof digest',lambda r:r['checksum_assets'][0].update(sha256=r['checksum_assets'][0]['sha256']+'\n')),
+    ('duplicate proof ID',lambda r:r['checksum_assets'][1].update(id=r['checksum_assets'][0]['id'])),
+)
+for index,(label,mutate) in enumerate(mutations):
+    altered=copy.deepcopy(held_sidecar); mutate(altered)
+    path=work/('contradictory-receipt-%02d.json'%index); save(path,altered)
+    admit_receipt('handoff refuses '+label,path,held_root)
+admit_receipt('aggregate selection cannot consume a sidecar-mode receipt',held_root/'result.json',held_root,mode='aggregate')
+aggregate_root=work/'case-001/audit'
+admit_receipt('explicit aggregate name remains bound at handoff',aggregate_root/'result.json',aggregate_root,
+              mode='aggregate',aggregate='other-checksums.txt')
+admit_receipt('correct explicit aggregate still succeeds',aggregate_root/'result.json',aggregate_root,0,
+              mode='aggregate',aggregate='SHA256SUMS')
+copy_root=work/'changed-proof-copy'
+shutil.copytree(held_root,copy_root)
+altered=copy.deepcopy(held_sidecar)
+altered.update(output_dir=str(copy_root),normalized_manifest=str(copy_root/'checksums.normalized'))
+for row in altered['checksum_assets']: row['path']=str(copy_root/'evidence'/row['name'])
+save(copy_root/'result.json',altered)
+proof=copy_root/'evidence'/altered['checksum_assets'][0]['name']
+proof.rename(work/'original-proof-retained')
+proof.write_bytes(b'Changed proof after audit completion\n')
+admit_receipt('changed retained proof bytes cannot reach downstream sync',copy_root/'result.json',copy_root)
+check('handoff negative cases preserve the original audit proof files',
+      all(sha(Path(row['path']).read_bytes())==row['sha256'] for row in held_sidecar['checksum_assets']))
+
+# Cancel while the final required sidecar is actually being acquired, after
+# earlier proof downloads have succeeded. No aggregate fallback or Git write.
+cancel=work/'sidecar-sync-cancel'; spec=fixture(cancel); sidecar_fixture(cancel,spec)
+spec['mode']='cancel-sidecar'
+spec['aggregate_id']=next(a['id'] for a in spec['assets'] if a['name']=='app-004.tar.gz.sha256')
+save(cancel/'fixture.json',spec)
+env=dict(git_env,PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],DSR_AUDIT_FIXTURE=str(cancel),GH_TOKEN='owned_test_token',TMPDIR=str(cancel))
+proc=subprocess.Popen(['bash',str(root/'src/checksum_sync.sh'),'sync','app','1.2.3','--repo','owner/app',
+    '--target-repo','downstream/one','--verify-release',*sidecar_args,'--push','--json'],
+    stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+try:
+    deadline=time.monotonic()+20
+    while not (cancel/'blocked-pid').exists() and time.monotonic()<deadline and proc.poll() is None:
+        time.sleep(.05)
+    check('sidecar cancellation reaches an active final proof download',(cancel/'blocked-pid').exists())
+    proc.send_signal(signal.SIGTERM)
+    stdout,stderr=proc.communicate(timeout=15)
+    (cancel/'stdout').write_bytes(stdout); (cancel/'stderr').write_bytes(stderr)
+    result=json.loads(stdout)
+    check('interrupted sidecar sync returns failure without downstream results',proc.returncode==5 and
+          result['exit_code']==5 and result['results']==[] and
+          git('--git-dir',remote,'rev-parse','main').decode().strip()==sidecar_published)
+    try:
+        os.kill(int((cancel/'blocked-pid').read_text()),0); stopped=False
+    except ProcessLookupError:
+        stopped=True
+    check('sidecar sync cancellation reaps its owned transport',stopped)
+finally:
+    if proc.poll() is None:
+        proc.terminate(); proc.communicate(timeout=15)
 
 print('Results: %d passed, 0 failed\nEvidence: %s' % (passed,work),flush=True)
 PY

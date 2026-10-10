@@ -186,6 +186,23 @@ evidence, but does not clone or mutate downstream repositories. `--external`
 also requires successful auditing before opening its review issue.
 `--include-metadata` extends the audited set and propagated checksum records.
 
+Use `--checksum-mode sidecars` for audited downstream sync of a complete
+sidecar-only release:
+
+```bash
+bash src/checksum_sync.sh sync tool v1.2.3 --repo owner/tool \
+  --target-repo owner/installers --verify-release --checksum-mode sidecars \
+  --dry-run --json
+```
+
+The handoff binds the requested mode, explicit aggregate selection when used,
+and every sidecar's payload/name correspondence. It rehashes the retained
+checksum proof files as well as the audited payloads before any downstream
+operation. Missing, duplicate, mis-scoped, renamed or changed proofs cannot be
+accepted through a successful count alone. The default remains aggregate mode;
+neither mode is an automatic fallback for failed evidence in the other mode.
+Cancellation during a later sidecar download stops the audit before Git writes.
+
 Use `--checksum-asset NAME`, `--audit-timeout SECONDS`,
 `--audit-max-asset-bytes N` and `--audit-max-total-bytes N` to pass explicit
 selection/limits to the auditor. These options require `--verify-release`.

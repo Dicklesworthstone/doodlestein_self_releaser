@@ -509,6 +509,51 @@ _cs_fetch_manifest() {
 # Main Sync Command
 # ============================================================================
 
+# Admit the selected audit policy and its retained proof bytes, not merely a
+# green count. All filesystem reads stay in the caller-owned audit directory;
+# downloaded JSON cannot redirect them to a path of its choosing.
+_cs_admit_release_audit() {
+    local receipt="$1" root="$2" repo="$3" tag="$4" metadata="$5" mode="$6" aggregate="$7"
+    local before records row name hash
+    before=$(_cs_sha256 "$receipt") || return 7
+    jq -es --arg repo "$repo" --arg tag "$tag" --arg root "$root" --argjson metadata "$metadata" \
+        --arg mode "$mode" --arg aggregate "$aggregate" '
+        def hash: type=="string" and length==64 and test("^[0-9a-f]{64}$");
+        def name: type=="string" and length>0 and .!="." and .!=".." and
+            (startswith("-")|not) and (test("[/\\\\:\u0000-\u001f\u007f]")|not);
+        length==1 and (.[0]|.kind=="dsr-release-checksum-verification" and .status=="verified" and .exit_code==0 and
+            .repository==$repo and .tag==$tag and .output_dir==$root and .checksum_mode==$mode and
+            .verification_policy=="sha256-all-eligible-release-assets" and .include_metadata==$metadata and
+            .authenticated==false and .source_verified==false and .inventory_stable==true and
+            (.eligible_count|type=="number" and floor==. and .>0) and
+            .eligible_count==.verified_count and .eligible_count==(.verified_checksums|length) and
+            (.verified_checksums|type=="array" and all(.[];name) and (unique|length)==length) and
+            .eligible_assets==.verified_checksums and .checksum_errors==[] and .coverage_errors==[] and
+            .normalized_manifest==($root+"/checksums.normalized") and (.normalized_manifest_sha256|hash) and
+            (.checksum_assets|type=="array" and length>0 and all(.[];
+                type=="object" and (.name|name) and (.sha256|hash) and
+                (.id|type=="number" and floor==. and .>0) and .path==($root+"/evidence/"+.name) and
+                (.scope=="aggregate" or .scope=="sidecar")) and
+                (map(.name)|unique|length)==length and (map(.id)|unique|length)==length) and
+            (if $mode=="sidecars" then
+                $aggregate=="" and
+                ([.checksum_assets[]|select(.scope=="sidecar")|.payload]|sort)==(.verified_checksums|sort) and
+                all(.checksum_assets[]|select(.scope=="sidecar"); .name==(.payload+".sha256"))
+             elif $mode=="aggregate" then
+                all(.checksum_assets[];.scope=="aggregate") and
+                ($aggregate=="" or [.checksum_assets[].name]==[$aggregate])
+             else false end))
+    ' "$receipt" >/dev/null || return 7
+    [[ ! -L "$root" && ! -L "$root/evidence" ]] || return 7
+    records=$(jq -c '.checksum_assets[]' "$receipt") || return 7
+    while IFS= read -r row; do
+        name=$(jq -r '.name' <<< "$row") || return 7
+        hash=$(jq -r '.sha256' <<< "$row") || return 7
+        [[ "$(_cs_sha256 "$root/evidence/$name")" == "$hash" ]] || return 7
+    done <<< "$records"
+    [[ "$(_cs_sha256 "$receipt")" == "$before" ]] || return 7
+}
+
 # Sync checksums to downstream repos after release
 # Usage: checksum_sync <tool> <version> [options]
 # Options:
@@ -523,6 +568,7 @@ checksum_sync() (
     local push_changes=false review=false dry_run=false json=false metadata=false prefer=false
     local workspace='' tag='' source_kind='' source_asset='' manifest_sha='' error='' arg option
     local verify_release=false audit_receipt='' audit_worker='' audit_pin=''
+    local audit_mode='aggregate' audit_asset=''
     local -a audit_args=()
     local start_time=$SECONDS synced=0 failed=0 planned=0 issues_opened=0
     local -a target_repos=() results=()
@@ -594,8 +640,9 @@ checksum_sync() (
             --include-metadata) metadata=true; shift ;;
             --prefer-gh) prefer=true; shift ;;
             --verify-release) verify_release=true; shift ;;
-            --checksum-asset|--audit-timeout|--audit-max-asset-bytes|--audit-max-total-bytes)
+            --checksum-mode|--checksum-asset|--audit-timeout|--audit-max-asset-bytes|--audit-max-total-bytes)
                 [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { error="Missing value for $1"; return 4; }
+                case "$1" in --checksum-mode) audit_mode="$2" ;; --checksum-asset) audit_asset="$2" ;; esac
                 option="${1/--audit-/--}"
                 audit_args+=("$option" "$2"); shift 2 ;;
             --help|-h)
@@ -613,6 +660,7 @@ OPTIONS:
     --prefer-gh              Prefer authenticated GitHub CLI release downloads
     --verify-release         Audit every eligible remote payload before downstream mutation
     --checksum-asset NAME    Exact aggregate for --verify-release (default: conventional aggregates)
+    --checksum-mode MODE     aggregate (default) or complete sidecars; requires --verify-release
     --audit-timeout SECONDS  Per-operation audit limit; requires --verify-release
     --audit-max-asset-bytes N Per-payload audit byte limit; requires --verify-release
     --audit-max-total-bytes N Total selected audit byte limit; requires --verify-release
@@ -698,17 +746,8 @@ EOF
         fi
         audit_receipt="$workspace/audit-result.json"
         ((audit_status == 0)) || { error='Release checksum audit failed; no downstream mutation attempted'; return "$audit_status"; }
-        if ! jq -es --arg repo "$repo" --arg tag "$tag" --arg root "$workspace/audit" --argjson metadata "$metadata" '
-            length==1 and (.[0]|.repository==$repo and .tag==$tag and .output_dir==$root and
-                .verification_policy=="sha256-all-eligible-release-assets" and .include_metadata==$metadata and
-                .authenticated==false and .source_verified==false and .inventory_stable==true and
-                (.eligible_count|type=="number" and floor==. and .>0) and
-                .eligible_count==.verified_count and .eligible_count==(.verified_checksums|length) and
-                (.verified_checksums|unique|length)==.eligible_count and .eligible_assets==.verified_checksums and
-                .checksum_errors==[] and .coverage_errors==[] and
-                .normalized_manifest==($root+"/checksums.normalized") and
-                (.normalized_manifest_sha256|type=="string" and test("^[0-9a-f]{64}$")))
-        ' "$audit_receipt" >/dev/null || ! cmp -s "$audit_receipt" "$workspace/audit/result.json"; then
+        if ! _cs_admit_release_audit "$audit_receipt" "$workspace/audit" "$repo" "$tag" \
+            "$metadata" "$audit_mode" "$audit_asset" || ! cmp -s "$audit_receipt" "$workspace/audit/result.json"; then
             error='Release audit does not prove the selected complete checksum coverage'; return 7
         fi
         audited_manifest_sha=$(jq -r '.normalized_manifest_sha256' "$audit_receipt") || return 7
