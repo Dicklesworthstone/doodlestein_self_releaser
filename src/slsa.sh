@@ -486,7 +486,10 @@ _slsa_manifest_statement() {
              repository_binding:"caller-supplied",build_environment_count:(($m.build_environments // []) | length),
              artifacts:($m.artifacts | sort_by(.name) | map(
                  {name,target,size_bytes,archive_format} +
-                 (if any($tasks[]; .target_triple != null) and .target_triple != null
+                 # An explicitly selected singleton variant is still a
+                 # compiler identity that downstream installation must see.
+                 # Legacy platform-only statements keep their original shape.
+                 (if (any($tasks[]; .target_triple != null) or ($m | has("required_variants"))) and .target_triple != null
                   then {target_triple:.target_triple} else {} end)))} +
              (if any($tasks[]; .target_triple != null) then {build_tasks:$tasks} else {} end))}
     ' "$manifest" 2>/dev/null) || { _slsa_log 'Invalid or incomplete DSR build manifest'; return 4; }

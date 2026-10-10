@@ -116,10 +116,13 @@ def member(value):
 
 
 def recipe(value):
-    need(isinstance(value, dict) and set(value) == {"schema_version", "target", "executables"} and
+    fields = {"schema_version", "target", "executables"}
+    need(isinstance(value, dict) and fields <= set(value) <= fields | {"target_triple"} and
          type(value["schema_version"]) is int and value["schema_version"] == 1 and
          isinstance(value["target"], str) and re.fullmatch(r"(linux|darwin)/(amd64|arm64|386)", value["target"]) and
          isinstance(value["executables"], list) and 1 <= len(value["executables"]) <= 64, "invalid installation recipe", 4)
+    if "target_triple" in value:
+        need(name(value["target_triple"]), "invalid installation compiler target", 4)
     for item in value["executables"]:
         need(isinstance(item, dict) and {"name", "artifact"} <= set(item) <= {"name", "artifact", "member"} and
              name(item["name"]) and name(item["artifact"]) and
@@ -223,7 +226,9 @@ try:
         print(canonical(dict(kind="dsr-install-recipe", recipe=selected, authenticated=False)).decode(), end="")
         sys.exit(0)
     parser = Parser(description="Authenticate and install a complete executable set; never execute payloads.",
-                    epilog="Generate a standalone pinned installer with: generate-installer --policy FILE --public-key FILE --output FILE",
+                    epilog="Recipe target_triple selects one signed compiler variant for every executable. "
+                           "It is required when a platform has multiple or mixed compiler identities. "
+                           "Generate a standalone pinned installer with: generate-installer --policy FILE --public-key FILE --output FILE",
                     allow_abbrev=False)
     origin = parser.add_mutually_exclusive_group(required=True)
     origin.add_argument("--snapshot", help="Use a complete local snapshot without network access")
@@ -291,6 +296,7 @@ try:
                          "--public-key", str(work / "trusted.pub"), *policy], work)
         verified = json.loads(output, object_pairs_hook=pairs)
         need(isinstance(verified, dict) and verified.get("kind") == "dsr-slsa-snapshot-verification" and
+             verified.get("status") == "verified" and
              verified.get("authenticated") is True and verified.get("remote_current") is False and
              verified.get("snapshot") == str(snapshot), "invalid snapshot verification handoff")
         if fetched is not None:
@@ -300,8 +306,22 @@ try:
                  observation.get("build_manifest_sha256") == verified["build_manifest_sha256"] and
                  observation.get("invocation_id") == verified["invocation_id"], "download and local authentication disagree")
         records = {a["name"]: a for a in verified["artifacts"]}
+        # The physical platform is not a compiler/ABI selection. Authenticate
+        # first, then compare the recipe to the signed records themselves.
+        # An alias or a filename that looks like "musl" cannot supply evidence
+        # missing from the statement. All selected workspace executables must
+        # come from the same explicitly selected variant.
+        platform_records = [a for a in records.values() if a["target"] == selected["target"]]
+        need(all("target_triple" not in a or name(a["target_triple"]) for a in platform_records),
+             "signed payload has an invalid compiler identity", 4)
+        variants = {a.get("target_triple") for a in platform_records}
+        need(len(variants) <= 1 or "target_triple" in selected,
+             "multiple or mixed signed compiler identities require recipe target_triple", 4)
         for item in selected["executables"]:
             need(item["artifact"] in records and records[item["artifact"]]["target"] == selected["target"], "executable artifact is not a signed payload for this target", 4)
+            if "target_triple" in selected:
+                need(records[item["artifact"]].get("target_triple") == selected["target_triple"],
+                     "executable artifact differs from the selected compiler variant: " + item["artifact"], 4)
             need((records[item["artifact"]]["archive_format"] in ("binary", "none")) == ("member" not in item),
                  "raw artifacts forbid member; archives require member", 4)
         staged = work / "generation"
@@ -333,12 +353,16 @@ try:
             dest = staged / "bin" / item["name"]
             copy_pinned(source, dest, pin, 0o755)
             installed.append(dict(item, sha256=pin, size_bytes=dest.stat().st_size, mode=0o755))
+            if "target_triple" in selected:
+                installed[-1]["target_triple"] = selected["target_triple"]
         receipt = dict(schema_version=1, kind="dsr-authenticated-install-generation", repository=args.repo, tag=args.tag,
                        source_sha=args.sha, builder=args.builder, target=selected["target"], recipe=selected,
                        public_key=(work / "trusted.pub").read_text().splitlines()[1], remote_current=False,
                        snapshot_sha256=verified["snapshot_sha256"], statement_sha256=verified["statement_sha256"],
                        signature_sha256=verified["signature_sha256"], build_manifest_sha256=verified["build_manifest_sha256"],
                        invocation_id=verified["invocation_id"], executables=installed)
+        if "target_triple" in selected:
+            receipt["target_triple"] = selected["target_triple"]
         identity = hashlib.sha256(canonical(receipt)).hexdigest()
         write(staged / "receipt.json", receipt)
         verify_generation(staged, receipt)
@@ -348,6 +372,8 @@ try:
                       bin_dir=str(prefix / "current/bin"), generation_bin_dir=str(prefix / "generations" / identity / "bin"),
                       executables=installed, snapshot_sha256=verified["snapshot_sha256"],
                       dry_run=args.dry_run)
+        if "target_triple" in selected:
+            result["target_triple"] = selected["target_triple"]
         if fetched is not None:
             # The observation describes the just-completed fetch, not ongoing
             # freshness. Exclude it from generation identity so offline reuse
