@@ -56,12 +56,89 @@ JSON keys, null lists, invalid pins, duplicate targets and unsafe or colliding
 executable selections fail generation.
 
 `targets` is the **complete signed release matrix**, including platforms that
-will not be installed on this machine. Supply exactly one installation recipe
-for every declared POSIX target. Windows payloads are authenticated as part of
+will not be installed on this machine. Supply at least one installation recipe
+for every declared POSIX target, with at most 64 recipes overall. A platform
+with several recipes must give each a distinct explicit `target_triple`; an
+untyped recipe cannot serve as a fallback beside typed recipes. Windows payloads are authenticated as part of
 the snapshot but this generator does not provide Windows installation. At least
 one supported POSIX recipe is required. Each recipe uses the exact same
 normalizer as [authenticated installation](RELEASE_INSTALLATION.md); raw/archive
 compatibility and actual signed artifact membership are checked during install.
+
+## Select an authenticated compiler variant
+
+GNU and musl are different compiler variants of the same `linux/amd64` routing
+platform. The physical host check alone cannot choose between them. Add
+`target_triple` at recipe level to bind **every executable** in that recipe to
+one identity in the signed artifact records, including raw aliases and all
+archives supplying workspace companions.
+
+For a release containing both variants, replace the Linux recipe in the policy
+above with two entries such as these. Retain the other recipes and the complete
+release `targets` list; these are recipe fragments, not a complete policy:
+
+```json
+[
+  {
+    "schema_version": 1,
+    "target": "linux/amd64",
+    "target_triple": "x86_64-unknown-linux-gnu",
+    "executables": [
+      {"name": "demo", "artifact": "demo-gnu.tar.gz", "member": "demo"},
+      {"name": "helper", "artifact": "demo-gnu.tar.gz", "member": "helper"}
+    ]
+  },
+  {
+    "schema_version": 1,
+    "target": "linux/amd64",
+    "target_triple": "x86_64-unknown-linux-musl",
+    "executables": [
+      {"name": "demo", "artifact": "demo-musl.tar.xz", "member": "demo"},
+      {"name": "helper", "artifact": "demo-musl.tar.xz", "member": "helper"}
+    ]
+  }
+]
+```
+
+On a host with several embedded recipes, the consumer must select one:
+
+```bash
+bash demo-v1.2.3.sh --prefix /home/alice/.local/demo \
+  --target-triple x86_64-unknown-linux-musl
+```
+
+This option only chooses an already embedded recipe for the actual host. It
+cannot rewrite the recipe, invent a compiler identity for an untyped recipe,
+change its artifact names, or relax the embedded signer/source/build policy.
+There is no filename-based guessing, first-entry default, or automatic libc
+fallback. An omitted ambiguous selection or an unknown variant fails before
+installation staging or network acquisition. A sole typed recipe selects its
+fixed variant by default; an untyped singleton preserves legacy behavior.
+ARM64 uses `linux/arm64` and the corresponding `aarch64-unknown-linux-*` triples.
+
+The same optional recipe field works directly with `src/release_install.sh`.
+After authenticating the **complete snapshot**, the engine requires an explicit
+selection whenever the installed platform contains several signed compiler
+identities, including mixed typed/untyped records. Every chosen artifact must
+match the recipe's exact triple. Missing signed identities, invalid explicit
+triples, or a GNU executable mixed into a musl workspace are refused before
+activation. Selecting GNU does not excuse corruption in an unselected musl
+payload: whole-release snapshot verification still runs.
+
+Explicit compiler selections are retained on executable results, the generation
+receipt and the top-level installation result. Switching between variants is a
+new complete generation and requires runtime `--replace`; old generations stay
+available for explicit, reauthenticated rollback. Equivalent recipe ordering
+preserves canonical generation and installer identities.
+
+For new manifest-backed statements, a producer's explicit `required_variants`
+also preserves compiler identities for a singleton matrix. Older singleton
+statements without that declaration keep their existing shape. An existing
+statement lacking a signed triple cannot satisfy a typed installation recipe;
+no local manifest, alias name or download receipt supplies the missing proof.
+This binds the **producer's signed compiler claim** to the selected bytes. It
+does not inspect the binary ABI, establish host libc compatibility, or prove
+that the claimed compiler was executed. Select a compatible variant deliberately.
 
 ## Generate and inspect
 
@@ -107,17 +184,18 @@ bash demo-v1.2.3.sh --prefix /home/alice/.local/demo
 It also supports streamed execution, such as `cat demo-v1.2.3.sh | bash -s --
 --prefix /home/alice/.local/demo`, or the equivalent trusted HTTPS download
 pipeline. The selected prefix's parent must already exist. The generated script
-selects the local host recipe automatically and installs all its selected
-companions. Its runtime options are deliberately limited to:
+selects the physical host automatically and installs all companions from its
+sole recipe or the explicit `--target-triple` choice. Its runtime options are deliberately limited to:
 
-- `--prefix DIR`, `--snapshot DIR`, and `--timeout SECONDS`.
+- `--prefix DIR`, `--snapshot DIR`, `--target-triple TRIPLE`, and `--timeout SECONDS`.
 - `--replace`, `--allow-draft`, `--dry-run`, `--inspect`, and `--help`.
 
 The default is online `--fetch` behavior from the existing engine: authenticate
 and download the complete selected release, reauthenticate the same snapshot
 locally, extract the selected payloads, and activate one complete generation.
 There is no runtime override for repository, version, source commit, builder,
-key, target matrix, recipe, or build pins. A failed download or signature check
+key, target matrix, recipe contents, or build pins. Compiler selection only
+chooses among fixed embedded recipes. A failed download or signature check
 cannot fall back to unsigned binaries, a different release or source execution.
 
 Use `--snapshot /absolute/snapshot` for offline operation. This option is exclusive
@@ -176,3 +254,24 @@ installed payloads; they compile small C fixtures when `cc` is available.
 The generator, complete SLSA/snapshot verifiers, archive helpers and installation
 engine are real. GitHub transport and Minisign are explicit file/hash fixtures;
 this is not live HTTP, native Ed25519, Rust release, Windows or macOS acceptance.
+
+The compiler-variant path has a separate focused regression:
+
+```bash
+bash scripts/tests/test_release_install_variants.sh
+```
+
+It uses real manifest projection, full snapshot verification, archive
+construction/extraction, standalone generation, and installation pointer
+switches. It checks GNU/musl selection, mixed-workspace refusal, stable retry,
+explicit replacement, rollback, canonical regeneration, malformed selectors,
+and operation without the original engine/key paths. Payloads are owned text
+fixtures, not compiled GNU/musl binaries, and are never executed.
+
+The focused suite requires real Minisign by default. An explicit
+`DSR_TEST_MINISIGN_FIXTURE=1` opts into a deterministic test-only key/hash CLI
+boundary; that mode is not cryptographic qualification. A partial validation
+checkout may additionally use `DSR_TEST_OFFLINE_ENGINE_STUBS=1` for missing,
+uninvoked online module bodies, which are then fail-if-sourced sentinels in
+its private test runtime. That mode exercises offline installation only and
+makes no online-engine claim. Full checkouts embed their real source modules.

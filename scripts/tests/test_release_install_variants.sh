@@ -292,8 +292,173 @@ if first.get("status") == "installed":
     result, _ = install("retained-generation-drift", snapshot, recipe_for(0, gnu), prefix, 7)
     check("changed installed generation is not silently repaired", (prefix / "current/bin/helper").read_bytes() == b"modified installed helper")
 
+# The distributable installer embeds this exact production installation engine.
+# A partial validation checkout can explicitly omit only unused ONLINE module
+# bodies; fail-if-sourced sentinels prove those paths are not an offline shortcut.
+shutil.copy2(os.environ.get("INSTALL_GEN_RELEASE_TEST_MODULE", root / "src/install_gen_release.sh"),
+             runtime / "install_gen_release.sh")
+offline_stubs = []
+for module_name in ("sbom_release.sh", "sbom.sh", "github.sh"):
+    original = root / "src" / module_name
+    if original.is_file():
+        shutil.copy2(original, runtime / module_name)
+    elif os.environ.get("DSR_TEST_OFFLINE_ENGINE_STUBS") == "1":
+        offline_stubs.append(module_name)
+        (runtime / module_name).write_text('#!/usr/bin/env bash\n# EXPLICIT TEST-ONLY: unused online module.\n'
+            'printf "unexpected online engine invocation\\n" >&2\nreturn 99 2>/dev/null || exit 99\n')
+    else:
+        raise RuntimeError("Missing " + module_name + "; full checkout required, or explicitly set DSR_TEST_OFFLINE_ENGINE_STUBS=1 for offline-only tests")
+if offline_stubs:
+    print("Embedded online inventory: EXPLICIT unused fail-if-sourced sentinels: " + ", ".join(offline_stubs), flush=True)
+
+
+def policy_for(recipes):
+    return dict(schema_version=1, repo=repo, tag=tag, source_sha=pin, builder=builder,
+                targets=[target], recipes=recipes)
+
+
+def generate(label, policy, output=None, expected=0):
+    policy_path = save(work / (label + "-policy.json"), policy)
+    output = output or work / (label + "-install.sh")
+    result = invoke(["bash", runtime / "install_gen_release.sh", "--policy", policy_path,
+                     "--public-key", public, "--output", output], expected, label + " generation")
+    value = json.loads(result.stdout)
+    check(label + " generation envelope agrees with exit", value.get("kind") == "dsr-release-installer-generation" and
+          value.get("exit_code") == result.returncode)
+    if expected:
+        check(label + " invalid policy produces no installer", not output.exists())
+    else:
+        check(label + " generation makes no authentication claim", value.get("authenticated") is False)
+    return value, output
+
+
+def generated_install(label, script, selected_snapshot, prefix, extra=(), expected=0, streamed=False):
+    command = ["bash", str(script), "--snapshot", str(selected_snapshot), "--prefix", str(prefix), *extra]
+    if streamed:
+        command = ["bash", "-c", 'cat -- "$1" | bash -s -- "${@:2}"', "_", *command[1:]]
+    result = invoke(command, expected, label)
+    value = json.loads(result.stdout)
+    check(label + " standalone result agrees with process", value.get("kind") == "dsr-release-install" and value.get("exit_code") == result.returncode)
+    if expected:
+        check(label + " standalone failure never claims activation", value.get("status") == "error" and value.get("activated") is False)
+    else:
+        check(label + " standalone result preserves offline authentication scope", value.get("authenticated") is True and value.get("remote_current") is False)
+    return value
+
+
+matrix_policy = policy_for([recipe_for(1, musl), recipe_for(0, gnu)])
+generated, standalone = generate("both-compilers", matrix_policy)
+if generated.get("status") == "generated":
+    inspected = json.loads(invoke(["bash", standalone, "--inspect"], label="inspect dual compiler installer").stdout)
+    check("inspection retains both exact compiler recipes without authentication", inspected.get("authenticated") is False and
+          [r.get("target_triple") for r in inspected["policy"]["recipes"]] == [gnu, musl])
+    check("inspection identifies the actual embedded installation engine", inspected["engines"]["release_install.sh"] == digest(runtime / "release_install.sh"))
+    script_identity = (digest(standalone), standalone.stat().st_ino)
+    reordered_policy = copy.deepcopy(matrix_policy)
+    reordered_policy["recipes"].reverse()
+    for r in reordered_policy["recipes"]:
+        r["executables"].reverse()
+    regenerated, _ = generate("canonical-variants", reordered_policy, output=standalone)
+    check("recipe and executable ordering reuse the identical generated script", regenerated.get("reused") is True and
+          (digest(standalone), standalone.stat().st_ino) == script_identity)
+    selected_prefix = work / "standalone-prefix"
+    generated_install("standalone-ambiguous", standalone, snapshot, selected_prefix, expected=4)
+    check("ambiguous compiler selection creates no persistent installation state", not selected_prefix.exists() and not Path(str(selected_prefix) + ".lock").exists())
+    for label, selector in (("unknown", cpu + "-unknown-linux-other"), ("empty", ""), ("unsafe", "../gnu"), ("control", "gnu\n")):
+        generated_install("standalone-" + label, standalone, snapshot, selected_prefix, ("--target-triple", selector), 4)
+        check("unavailable/malformed " + label + " does not choose a fallback", not selected_prefix.exists())
+    planned = generated_install("standalone-plan", standalone, snapshot, selected_prefix, ("--target-triple", musl, "--dry-run"))
+    check("standalone plan selects musl and activates nothing", planned.get("target_triple") == musl and planned.get("status") == "planned" and not selected_prefix.exists())
+    active = generated_install("standalone-gnu", standalone, snapshot, selected_prefix, ("--target-triple", gnu), streamed=True)
+    active_id = active.get("generation")
+    frozen_state = state(selected_prefix)
+    check("streamed installer activates the complete GNU executable set", active.get("target_triple") == gnu and
+          {p.name for p in (selected_prefix / "current/bin").iterdir()} == {"app", "alias", "helper"} and
+          (selected_prefix / "current/bin/app").read_bytes() == (snapshot / "artifacts/alias-0").read_bytes())
+    generated_install("standalone-no-consent", standalone, snapshot, selected_prefix, ("--target-triple", musl), 2)
+    check("generated selector cannot bypass replacement consent", state(selected_prefix) == frozen_state)
+    switched = generated_install("standalone-musl", standalone, snapshot, selected_prefix, ("--target-triple", musl, "--replace"))
+    check("generated installer switches all commands to musl together", switched.get("previous_generation") == active_id and
+          all(e.get("target_triple") == musl for e in switched["executables"]) and
+          (selected_prefix / "current/bin/app").read_bytes() == (snapshot / "artifacts/alias-1").read_bytes())
+    switched_state = state(selected_prefix)
+    retry = generated_install("standalone-musl-retry", standalone, snapshot, selected_prefix, ("--target-triple", musl))
+    check("identical standalone retry keeps generation and pointer inodes", retry.get("activated") is False and state(selected_prefix) == switched_state)
+    rolled = generated_install("standalone-rollback", standalone, snapshot, selected_prefix, ("--target-triple", gnu, "--replace"))
+    check("generated rollback reuses retained GNU generation", rolled.get("generation") == active_id and
+          (selected_prefix / "generations" / active_id / "bin/helper").stat().st_ino == frozen_state["generations/" + active_id + "/bin/helper"][0])
+    # The artifact names deliberately do not encode an ABI. Selected names
+    # must still agree with the signed compiler record for every executable.
+    contradiction = copy.deepcopy(matrix_policy)
+    contradiction["recipes"][1]["executables"][2]["artifact"] = "alias-1"
+    bad_result, contradictory_script = generate("mixed-signed-workspace", contradiction)
+    if bad_result.get("status") == "generated":
+        before = state(selected_prefix)
+        generated_install("standalone-mixed-signed", contradictory_script, snapshot, selected_prefix, ("--target-triple", gnu, "--replace"), 4)
+        check("valid embedded selector does not authorize differently signed bytes", state(selected_prefix) == before)
+    before = state(selected_prefix)
+    generated_install("standalone-unselected-corrupt", standalone, broken, selected_prefix, ("--target-triple", gnu, "--replace"), 1)
+    check("generated selector cannot narrow complete snapshot authentication", state(selected_prefix) == before)
+    for flag in ("--repo", "--sha", "--builder", "--public-key", "--recipe"):
+        generated_install("standalone-trust-override-" + flag[2:], standalone, snapshot, selected_prefix,
+                          ("--target-triple", gnu, flag, "override"), 4)
+    check("runtime compiler selection leaves all fixed trust fields immutable", state(selected_prefix) == before)
+    # The actual source/key/policy files are not runtime dependencies. Rename
+    # this owned engine directory and key, then run from embedded bytes only.
+    runtime.rename(work / "engines-offline")
+    public.rename(work / "key-offline.pub")
+    try:
+        detached = generated_install("standalone-detached", standalone, snapshot, selected_prefix, ("--target-triple", gnu))
+        check("standalone offline retry needs no original engine or key file", detached.get("generation") == active_id and state(selected_prefix) == before)
+    finally:
+        (work / "engines-offline").rename(runtime)
+        (work / "key-offline.pub").rename(public)
+else:
+    print("Dependent dual-compiler installer checks not reached because generation failed", flush=True)
+
+for label, selected_snapshot, selected_recipe in (("legacy-generated", legacy, recipe_for(0)),
+                                                 ("singleton-generated", singleton, recipe_for(0, gnu))):
+    generated, script = generate(label, policy_for([selected_recipe]))
+    if generated.get("status") != "generated":
+        continue
+    selected_prefix = work / (label + "-prefix")
+    installed = generated_install(label + "-default", script, selected_snapshot, selected_prefix)
+    check(label + " preserves its fixed singleton policy", installed.get("target_triple") == selected_recipe.get("target_triple"))
+    before = state(selected_prefix)
+    if "target_triple" not in selected_recipe:
+        generated_install("legacy-cannot-invent-compiler", script, selected_snapshot, selected_prefix, ("--target-triple", gnu), 4)
+    else:
+        generated_install("singleton-cannot-override-compiler", script, selected_snapshot, selected_prefix, ("--target-triple", musl), 4)
+    check(label + " rejects overrides without changing active bytes", state(selected_prefix) == before)
+
+for mutation in ("duplicate-compiler", "implicit-and-explicit", "duplicate-implicit", "missing-platform", "foreign-platform",
+                 "null-compiler", "unsafe-compiler", "empty-recipes", "too-many-recipes"):
+    bad = copy.deepcopy(matrix_policy)
+    if mutation == "duplicate-compiler":
+        bad["recipes"].append(copy.deepcopy(bad["recipes"][0]))
+        bad["recipes"][-1]["executables"][0]["name"] = "another-command"
+    elif mutation == "implicit-and-explicit":
+        del bad["recipes"][0]["target_triple"]
+    elif mutation == "duplicate-implicit":
+        bad["recipes"] = [recipe_for(0), recipe_for(1)]
+    elif mutation == "missing-platform":
+        bad["targets"].append("darwin/arm64")
+    elif mutation == "foreign-platform":
+        bad["recipes"][0]["target"] = "darwin/arm64"
+    elif mutation == "null-compiler":
+        bad["recipes"][0]["target_triple"] = None
+    elif mutation == "unsafe-compiler":
+        bad["recipes"][0]["target_triple"] = "../compiler"
+    elif mutation == "empty-recipes":
+        bad["recipes"] = []
+    else:
+        bad["recipes"] = [recipe_for(0, "compiler-%d" % i) for i in range(65)]
+    generate("bad-generated-" + mutation, bad, expected=4)
+    check(mutation + " leaves no persistent generator lock", not (work / ("bad-generated-" + mutation + "-install.sh.lock")).exists())
+
+
 save(work / "summary.json", dict(passed=passed, failed=failed, signer="fixture" if fixture else "minisign",
-                                  native_compilation=False, host=target, root=str(root)))
+                                  native_compilation=False, offline_engine_stubs=offline_stubs, host=target, root=str(root)))
 # Never export a real test signing key along with public validation evidence.
 if secret.exists():
     secret.unlink()

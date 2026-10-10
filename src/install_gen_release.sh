@@ -145,6 +145,7 @@ try:
     parser = Parser(description="Install the fixed signed release embedded in this installer.", allow_abbrev=False)
     parser.add_argument("--prefix", help="Managed installation prefix with an existing parent")
     parser.add_argument("--snapshot", help="Use a complete local snapshot, without any network access")
+    parser.add_argument("--target-triple", help="Choose an exact embedded compiler variant; required when this host has several recipes")
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--allow-draft", action="store_true", help="Explicitly permit a draft when fetching")
     parser.add_argument("--dry-run", action="store_true", help="Authenticate and stage only; online by default")
@@ -154,6 +155,9 @@ try:
     need(len(flags) == len(set(flags)), "duplicate installer option")
     args = parser.parse_args()
     need(not interrupted, "installation interrupted", 5)
+    if args.target_triple is not None:
+        need(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", args.target_triple) is not None and
+             ".." not in args.target_triple, "invalid compiler variant")
     need(1 <= args.timeout <= 86400, "timeout must be 1..86400")
     need(not args.allow_draft or args.snapshot is None, "--allow-draft is online-only")
     blob = base64.b64decode(BUNDLE, validate=True)
@@ -184,7 +188,16 @@ try:
     need(os_name is not None and arch is not None, "unsupported installation host", 3)
     target = os_name + "/" + arch
     selected = [r for r in policy["recipes"] if r["target"] == target]
-    need(len(selected) == 1, "this installer has no recipe for this host", 3)
+    need(selected, "this installer has no recipe for this host", 3)
+    if args.target_triple is not None:
+        # A selection can only choose a policy embedded at generation time.
+        # It cannot rewrite an untyped recipe, override a pinned compiler or
+        # fall back to whichever file happens to be present in the release.
+        selected = [r for r in selected if r.get("target_triple") == args.target_triple]
+        need(len(selected) == 1, "compiler variant is not embedded for this host")
+    elif len(selected) != 1:
+        raise Failure("this host requires --target-triple; choose one of: " +
+                      ", ".join(r["target_triple"] for r in selected))
     os.umask(0o077)
     need(not interrupted, "installation interrupted", 5)
     with tempfile.TemporaryDirectory(prefix=".dsr-installer-", dir=prefix.parent) as temporary:
@@ -279,7 +292,7 @@ try:
     value["targets"].sort()
     for key in optional & set(value):
         need(text(value[key]) if key == "invocation_id" else matches(value[key], r"[0-9a-f]{64}"), "invalid independent build pin")
-    need(isinstance(value["recipes"], list) and 1 <= len(value["recipes"]) <= 6, "expected 1..6 installation recipes")
+    need(isinstance(value["recipes"], list) and 1 <= len(value["recipes"]) <= 64, "expected 1..64 installation recipes")
     key_bytes = read(key_file, 8192)
     lines = key_bytes.decode("utf-8").splitlines()
     need(len(lines) == 2 and lines[0].startswith("untrusted comment:") and matches(lines[1], r"[A-Za-z0-9+/]{56}"), "invalid Minisign public key file")
@@ -305,8 +318,14 @@ try:
             normalized.append(record["recipe"])
             child = None
         wanted = [t for t in value["targets"] if not t.startswith("windows/")]
-        need(sorted(r["target"] for r in normalized) == wanted, "recipes must cover every declared POSIX target exactly once")
-        value["recipes"] = sorted(normalized, key=lambda r: r["target"])
+        need(sorted({r["target"] for r in normalized}) == wanted, "recipes must cover every declared POSIX target")
+        for target in wanted:
+            variants = [r for r in normalized if r["target"] == target]
+            need(len(variants) == 1 or all("target_triple" in r for r in variants),
+                 "same-platform recipes require explicit compiler variants")
+            need(len({r.get("target_triple") for r in variants}) == len(variants),
+                 "duplicate installation compiler variant")
+        value["recipes"] = sorted(normalized, key=lambda r: (r["target"], r.get("target_triple", "")))
         inventory = {name: dict(content=base64.b64encode(data).decode(), sha256=hashlib.sha256(data).hexdigest()) for name, data in sources.items()}
         bundle = canonical(dict(policy=value, public_key=lines[1], modules=inventory))
         script = BOOTSTRAP.replace("__DSR_RELEASE_BUNDLE__", base64.b64encode(bundle).decode()).replace("__DSR_RELEASE_BUNDLE_SHA256__", hashlib.sha256(bundle).hexdigest())
