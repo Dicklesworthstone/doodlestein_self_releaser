@@ -5,6 +5,27 @@ _RELEASE_FINALIZE_ENTRY_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/release_finalize_core.sh
 source "$_RELEASE_FINALIZE_ENTRY_DIR/release_finalize_core.sh" || { return 3 2>/dev/null || exit 3; }
 
+# Reconcile the coordinator's canonical build set with the reviewed execution
+# plan. Paths/hashes are supplied by completed jobs; platform, ABI and public
+# name selections must not change at that handoff. Neither side proves builds
+# happened: the coordinator and collector admit the original evidence.
+_rf_build_plan_selection_matches() {
+    jq -en --slurpfile expected "$1" --argjson actual "$2" '
+        ($expected|length)==1 and ($expected[0] as $p |
+        all(["repo","tool","tag","source_sha","required_targets"][];
+            . as $key | $actual[$key]==$p[$key]) and
+        all(["required_assets","required_variants"][]; . as $key |
+            (($actual|has($key))==($p|has($key))) and
+            (if $p|has($key) then $actual[$key]==$p[$key] else true end)) and
+        ($actual.builds|map({id,targets} +
+            (if has("variants") then {variants:.variants} else {} end)))==
+        ($p.builds|map({id,targets} +
+            (if has("variants") then {variants:.variants} else {} end))))
+    ' >/dev/null || {
+        _rf_log 'Completed build set differs from the reviewed execution selection'; return 7;
+    }
+}
+
 # Build-plan/set mode owns repo/tag/SHA/tool and the aggregate manifest. Publication
 # policy remains explicit and is still checked by the existing engine.
 _rf_build_set_execute() {
@@ -202,12 +223,7 @@ _rf_build_set_execute() {
         [[ "$(_slsa_sha256 "$build_dir/build-set.json")" == "$build_set_pin" ]] || return 7
         canonical=$(_rb_plan "$build_dir/build-set.json") || return $?
         [[ "$(_slsa_sha256 "$build_dir/build-set.json")" == "$build_set_pin" ]] || return 7
-        jq -en --slurpfile expected "$work/execution-plan.json" --argjson actual "$canonical" '
-            $expected[0] as $p | all(["repo","tool","tag","source_sha","required_targets"][];
-                . as $key | $actual[$key]==$p[$key]) and
-            (($actual|has("required_assets"))==($p|has("required_assets"))) and
-            (if $p|has("required_assets") then $actual.required_assets==$p.required_assets else true end) and
-            ($actual.builds|map({id,targets}))==($p.builds|map({id,targets}))' >/dev/null || return 7
+        _rf_build_plan_selection_matches "$work/execution-plan.json" "$canonical" || return $?
     else
         canonical=$(_rb_plan "$plan") || return $?
     fi

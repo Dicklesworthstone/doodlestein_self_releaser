@@ -376,13 +376,17 @@ def helper(operation, entry, destination, directory):
     plain(directory, "dir")
     job = next(j for j in plan["builds"] if j["id"] == entry["id"])
     if job["driver"] == "xwin":
-        manifest = Path(entry["manifest"]) if operation == "_rb_import" else destination / "build-manifest.json"
+        manifest = destination / "build-manifest.json" if operation == "_rb_verify_shard" else Path(entry["manifest"])
         require_xwin_inventory(job, manifest, entry["manifest_sha256"])
     command = 'source "$1/release_bundle.sh" || exit 3; _rb_require || exit $?; "$2" "$3" "$4" "$5" "$6"'
     if operation == "_rb_import":
         args = [json.dumps(entry), str(root / "plan.json"), str(destination), str(directory)]
-    else:
+    elif operation == "_rb_shard_manifest":
+        args = [entry["manifest"], json.dumps(entry), str(root / "plan.json"), str(directory / "candidate-proof.json")]
+    elif operation == "_rb_verify_shard":
         args = [str(destination), json.dumps(entry), str(root / "plan.json"), str(directory)]
+    else:
+        raise Failure("unknown artifact admission operation", 4)
     with open(directory / "admission.log", "ab") as log:
         code = run_admission(["bash", "-c", command, "_", str(module), operation] + args, log, log)
     require(code == 0, "manifest/payload admission failed; see " + str(directory / "admission.log"), 7)
@@ -587,11 +591,17 @@ def accept(job, attempt, entry, admission_dir=None):
     # compiles again, instead of re-importing the same bad bytes forever.
     if job["driver"] == "xwin":
         require_xwin_inventory(job, Path(entry["manifest"]), entry["manifest_sha256"])
+    destination = root / "completed" / job["id"]
+    # Validate source, purpose and exact target/asset selection BEFORE pinning
+    # a candidate. A zero-exit driver with an invalid manifest is a failed
+    # attempt, not an eternally recoverable import. Use the collector's actual
+    # parser; payload acquisition still happens only after the durable pin.
+    # This preserves candidates with valid manifests but missing payload bytes.
+    helper("_rb_shard_manifest", entry, destination, admission_dir or attempt)
     # Persist the selected manifest BEFORE importing. A crash between import
     # and the completion update can only reuse that exact pinned selection.
     record["candidate"] = entry
     save_state()
-    destination = root / "completed" / job["id"]
     helper("_rb_import", entry, destination, admission_dir or attempt)
     record["complete"] = entry
     record["candidate"] = None

@@ -16,7 +16,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import zipfile
 
 root = Path(sys.argv[1])
 work = Path(tempfile.mkdtemp(prefix='dsr-build-variants-'))
@@ -273,5 +275,221 @@ result=run(legacy,legacy_base/'builds')
 check('legacy platform-partitioned build sets keep the old shape',
       'required_variants' not in read(Path(result['build_set'])) and
       all('variants' not in b for b in read(Path(result['build_set']))['builds']))
+
+# A zero driver exit is not evidence that its output belongs to this plan.
+# Invalid manifests must fail the attempt BEFORE pinning an import candidate;
+# otherwise every subsequent invocation retries an impossible import forever.
+for mode in ('wrong-variant', 'wrong-source', 'wrong-method'):
+    base = work / ('invalid-success-' + mode)
+    plan = fixture(base, 'amd64', drivers=True)
+    output = base / 'builds'
+    (base / 'gnu-control').write_text(mode + '\n')
+    run(plan, output, 1)
+    failed = read(output / 'state.json')['jobs']['gnu']
+    check(mode + ' does not become a durable import candidate after zero exit',
+          failed['candidate'] is None and failed['complete'] is None and
+          failed['attempts'][0]['status'] == 'failed')
+    original_manifest = output / 'attempts/gnu/000001/output/app-v1.2.3-manifest.json'
+    original_hash = sha(original_manifest)
+    (base / 'gnu-control').write_text('ready\n')
+    recovered = run(plan, output)
+    trace = [json.loads(line) for line in (base / 'trace.jsonl').read_text().splitlines()]
+    check(mode + ' retries the rejected driver normally without repeating completed jobs',
+          {n: sum(t['job'] == n for t in trace) for n in ('gnu','musl','win')} == dict(gnu=2,musl=1,win=1))
+    check(mode + ' retains rejected source evidence unchanged after successful retry',
+          sha(original_manifest) == original_hash and
+          read(output / 'state.json')['jobs']['gnu']['candidate'] is None)
+
+# A valid manifest whose bytes could not be imported is fundamentally different.
+# Hold the selected compiler output through missing payloads; never silently
+# recompile, regenerate a receipt, or edit its recorded manifest to recover.
+base = work / 'payload-recovery'
+plan = fixture(base, 'arm64', drivers=True)
+output = base / 'builds'
+(base / 'gnu-control').write_text('missing-payload\n')
+run(plan, output, 1)
+before = read(output / 'state.json')['jobs']['gnu']
+check('missing payload retains the semantically admitted candidate',
+      before['candidate'] is not None and before['complete'] is None and len(before['attempts']) == 1)
+selected_output = Path(before['candidate']['artifacts_dir'])
+selected_manifest = Path(before['candidate']['manifest'])
+manifest_hash = sha(selected_manifest)
+trace_before = (base / 'trace.jsonl').read_bytes()
+(base / 'gnu-control').write_text('ready\n')
+run(plan, output, 1)
+after = read(output / 'state.json')['jobs']['gnu']
+check('unavailable candidate payload never triggers another compiler invocation',
+      before['candidate'] == after['candidate'] and len(after['attempts']) == 1 and
+      (base / 'trace.jsonl').read_bytes() == trace_before)
+for artifact in read(selected_manifest)['artifacts']:
+    # Restore only the fixture-produced bytes the selected manifest already
+    # identifies, simulating successful transfer; no receipt or state is edited.
+    shutil.copy2(base / 'gnu' / artifact['name'], selected_output / artifact['name'])
+run(plan, output)
+check('original admitted candidate completes after payload transfer with no rebuild',
+      sha(selected_manifest) == manifest_hash and (base / 'trace.jsonl').read_bytes() == trace_before and
+      read(output / 'state.json')['jobs']['gnu']['complete'] == before['candidate'] and
+      read(output / 'state.json')['jobs']['gnu']['candidate'] is None)
+
+# The public finalizer executes the same coordinator and then the real
+# collector, packager and SLSA profile. Only the remote signing/publication
+# engine is replaced; successful local receipts do not claim authentication.
+for tool in ('tar','xz','zip','unzip'):
+    if shutil.which(tool) is None:
+        raise RuntimeError('packaged finalizer tests require ' + tool)
+for filename in ('release_finalize.sh','release_packaging.sh','release_packaging_pipeline.sh','packaging.sh'):
+    shutil.copy2(root / 'src' / filename, runtime / 'src' / filename)
+(runtime / 'src/release_finalize_core.sh').write_text(r'''#!/usr/bin/env bash
+_rf_log() { printf '[engine-fixture] %s\n' "$*" >&2; }
+release_finalize() {
+    local root=$1 manifest='' repo=''
+    local evidence="${DSR_VARIANT_FINALIZER_EVIDENCE:?}"
+    jq -cn --args '$ARGS.positional' -- "$@" > "$evidence/engine-args.json" || return 99
+    shift
+    while (($#)); do
+        case "$1" in
+            --build-manifest) manifest=$2; shift 2 ;;
+            --repo) repo=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    _slsa_manifest_statement "$manifest" "$repo" dsr/fixture > "$evidence/proof.json" || return 99
+    _slsa_release_assets "$evidence/proof.json" "$root" || return 99
+    jq -e '.summary=={total:3,success:3,failed:0} and
+        .packaging_evidence.kind=="manifest-bound-packaging" and
+        (.required_variants|length)==3 and all(.artifacts[]; has("target_triple"))' "$manifest" >/dev/null || return 99
+    printf 'call\n' >> "$evidence/engine-calls"
+    if [[ "${DSR_VARIANT_FINALIZER_MODE:-ready}" == fail ]]; then
+        printf '{"kind":"dsr-release-finalization-result","status":"error","exit_code":7,"error":"explicit engine fixture failure","fixture":true}\n'
+        return 7
+    fi
+    printf '{"kind":"dsr-release-finalization-result","status":"ready","exit_code":0,"fixture":true,"authenticated":false}\n'
+}
+''')
+
+# Call the production handoff gate with actual completed execution data. No
+# test copy of its predicate: keep exactly the fields omitted by the old gate
+# under adversarial changes while leaving counts/platforms/source untouched.
+handoff_plan = output / 'plan.json'
+handoff_set = read(output / 'build-set.json')
+def match_handoff(selection, expected_code):
+    candidate = write(work / 'handoff.json', selection)
+    p = subprocess.run(['bash','-c', 'source "$1" && _rf_build_plan_selection_matches "$2" "$(cat "$3")"',
+        '_', str(runtime/'src/release_finalize.sh'), str(handoff_plan), str(candidate)], capture_output=True)
+    check('production handoff gate returns expected status ' + str(expected_code), p.returncode == expected_code)
+    check('handoff admission emits no success-shaped stdout', p.stdout == b'')
+match_handoff(handoff_set, 0)
+for mutation in ('lost-matrix','null-matrix','changed-matrix','lost-job','null-job','swapped-jobs','lost-asset-binding'):
+    bad = copy.deepcopy(handoff_set)
+    if mutation == 'lost-matrix': bad.pop('required_variants')
+    elif mutation == 'null-matrix': bad['required_variants'] = None
+    elif mutation == 'changed-matrix': bad['required_variants'][0]['target_triple'] = 'unselected-compiler'
+    elif mutation == 'lost-job': bad['builds'][0].pop('variants')
+    elif mutation == 'null-job': bad['builds'][0]['variants'] = None
+    elif mutation == 'swapped-jobs':
+        bad['builds'][0]['variants'], bad['builds'][1]['variants'] = bad['builds'][1]['variants'], bad['builds'][0]['variants']
+    else: bad['required_assets'][0].pop('target_triple')
+    match_handoff(bad, 7)
+
+base = work / 'finalization'
+plan = fixture(base, 'amd64', drivers=True)
+expected_plan = read(plan)
+recipe_rows = []
+for asset in expected_plan['required_assets']:
+    raw_alias = asset['name'] == 'app-primary-alias'
+    fmt = 'binary' if raw_alias else 'zip' if asset['target'].startswith('windows/') else \
+        'tar.xz' if asset['target_triple'].endswith('-musl') else 'tar.gz'
+    row = dict(name=asset['name'] if raw_alias else asset['name']+'.'+fmt,
+               target=asset['target'],target_triple=asset['target_triple'],archive_format=fmt)
+    if raw_alias: row['source'] = asset['name']
+    else: row['members'] = [dict(source=asset['name'],path='app.exe' if fmt == 'zip' else 'app')]
+    recipe_rows.append(row)
+recipe = write(base / 'recipe.json', dict(schema_version=1, artifacts=recipe_rows))
+output = base / 'builds'
+env = dict(os.environ, DSR_VARIANT_FINALIZER_EVIDENCE=str(base))
+def finalize(expected=0, options=(), selected_recipe=recipe, selected_output=output):
+    global calls
+    calls += 1
+    cmd = ['bash',str(runtime/'src/release_finalize.sh'),'--build-plan',str(plan),
+           '--build-dir',str(selected_output),'--build-jobs','3','--packaging-recipe',str(selected_recipe),*options]
+    p = subprocess.run(cmd, env=env, capture_output=True, timeout=90)
+    (work/('finalizer-%03d.stdout' % calls)).write_bytes(p.stdout)
+    (work/('finalizer-%03d.stderr' % calls)).write_bytes(p.stderr)
+    if p.returncode != expected:
+        raise AssertionError(f'finalizer expected {expected}, got {p.returncode}: {p.stdout!r}\n{p.stderr.decode()}')
+    value = json.loads(p.stdout)
+    check('public finalizer emits one envelope with the real exit status', value['exit_code'] == expected)
+    return value
+
+preview = finalize(options=('--dry-run',))
+check('execution-plan finalization preview claims neither builds nor signing verification',
+      preview['status']=='planned' and preview['policy_verified'] is False and
+      not output.exists() and not (base/'trace.jsonl').exists() and not (base/'engine-calls').exists())
+bad_recipe = read(recipe)
+bad_recipe['artifacts'][0].pop('target_triple')
+bad_file = write(base/'untyped-recipe.json',bad_recipe)
+finalize(4,selected_recipe=bad_file,selected_output=base/'refused')
+check('an impossible packaging variant selection fails before any driver starts',
+      not (base/'trace.jsonl').exists() and not (base/'refused').exists())
+(base/'musl-control').write_text('fail\n')
+pending = finalize(1,options=('--create-draft',))
+check('one-command pipeline retains independent builds without reaching publication after failure',
+      pending['status']=='builds_incomplete' and pending['builds']['failed_builds']==['musl'] and
+      pending['builds']['completed_builds']==2 and not (base/'engine-calls').exists() and
+      not (output/'bundle/release').exists())
+(base/'musl-control').write_text('ready\n')
+ready = finalize(options=('--create-draft',))
+check('actual execution-to-collection-to-archive pipeline reaches the finalization boundary',
+      ready['status']=='ready' and ready['fixture'] is True and ready['authenticated'] is False and
+      ready['builds']['completed_builds']==3 and ready['bundle']['status']=='verified' and
+      ready['packaging']['status']=='verified')
+final_manifest = Path(ready['packaging']['manifest'])
+final_dist = Path(ready['packaging']['artifacts_dir'])
+exported = read(final_manifest)
+check('packaged handoff preserves all three compiler identities and four typed public assets',
+      exported['required_variants']==read(output/'plan.json')['required_variants'] and
+      len(exported['artifacts'])==4 and all('target_triple' in a for a in exported['artifacts']))
+for row in recipe_rows:
+    if 'members' not in row: continue
+    selected_member = row['members'][0]
+    owner = 'win' if row['target'].startswith('windows/') else 'musl' if row['target_triple'].endswith('-musl') else 'gnu'
+    if row['archive_format'] == 'zip':
+        with zipfile.ZipFile(final_dist/row['name']) as archive:
+            names, payload = archive.namelist(), archive.read(selected_member['path'])
+    else:
+        with tarfile.open(final_dist/row['name']) as archive:
+            names, payload = archive.getnames(), archive.extractfile(selected_member['path']).read()
+    check('final '+row['archive_format']+' contains exactly the selected producer bytes',
+          names==[selected_member['path']] and payload==(base/owner/selected_member['source']).read_bytes())
+trace = [json.loads(line) for line in (base/'trace.jsonl').read_text().splitlines()]
+check('end-to-end finalizer retry does not rebuild completed native or xwin variants',
+      {n:sum(t['job']==n for t in trace) for n in ('gnu','musl','win')}==dict(gnu=1,musl=2,win=1))
+arguments = read(base/'engine-args.json')
+check('finalizer receives packaged paths and never silently enables signatures or promotion',
+      arguments[0]==str(final_dist) and arguments[arguments.index('--build-manifest')+1]==str(final_manifest) and
+      '--require-signatures' not in arguments and '--promote' not in arguments)
+final_hash = sha(final_manifest)
+trace_before = (base/'trace.jsonl').read_bytes()
+env['DSR_VARIANT_FINALIZER_MODE'] = 'fail'
+failed = finalize(7,options=('--create-draft',))
+check('engine failure retains successful build, collection and packaging evidence',
+      failed['error']=='explicit engine fixture failure' and failed['packaging']['status']=='verified')
+env['DSR_VARIANT_FINALIZER_MODE'] = 'ready'
+public = base/'fixture.pub'
+public.write_text('argument-boundary fixture; not a cryptographic key\n')
+finalize(options=('--require-signatures','--public-key',str(public),'--require-provenance','--provenance-builder','dsr/test'))
+arguments = read(base/'engine-args.json')
+check('explicit signing and provenance policies survive the full execution-plan handoff',
+      '--require-signatures' in arguments and '--require-provenance' in arguments and
+      arguments[arguments.index('--public-key')+1]==str(public) and '--promote' not in arguments)
+check('publication retries preserve packaged manifest bytes and do not invoke any driver',
+      sha(final_manifest)==final_hash and (base/'trace.jsonl').read_bytes()==trace_before)
+engine_calls = (base/'engine-calls').read_bytes()
+payload = output/'completed/musl/artifacts/app-musl'
+shutil.copy2(payload,base/'original-musl-retained')
+with payload.open('ab') as stream: stream.write(b'corrupt\n')
+finalize(7)
+check('changed completed compiler payload blocks finalization before signing or another build',
+      (base/'engine-calls').read_bytes()==engine_calls and (base/'trace.jsonl').read_bytes()==trace_before)
 print(f'Results: {passed} passed, 0 failed\nEvidence: {work}',flush=True)
 PY

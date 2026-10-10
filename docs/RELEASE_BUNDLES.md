@@ -93,12 +93,18 @@ arrays must partition `required_variants` exactly, without overlaps or missing
 pairs; every platform array must agree with its variants. Empty, malformed,
 duplicate and mixed implicit/explicit selections fail before collection.
 
-This mode requires exactly one original `method: native` build environment
-per selected `(target, target_triple)` pair and exact artifact coverage of those
-pairs. A missing environment or a workflow-only receipt cannot be relabeled as
-native execution. Declared source and compiler selectors must still pass the
-existing SLSA manifest profile. Compiler triples are recorded identities, not
-an independent ABI inspection or proof that these builds were executed here.
+This mode requires exactly one original compiled build environment per selected
+`(target, target_triple)` pair and exact artifact coverage of those pairs.
+Native jobs retain `method: native`. A pinned xwin producer retains
+`method: pinned-cargo-xwin`, with matching target fields in its environment,
+toolchain and toolchain inputs. It must be the sole selected variant on its
+Windows platform: `x86_64-pc-windows-msvc` for `windows/amd64`, or
+`aarch64-pc-windows-msvc` for `windows/arm64`. Mixing native GNU/musl jobs with
+those independently produced Windows outputs does not relabel xwin execution.
+A missing environment or a workflow-only receipt cannot be relabeled as native
+execution. Declared source and compiler selectors must still pass the existing
+SLSA manifest profile. Compiler triples are recorded identities, not an
+independent ABI inspection or proof that these builds were executed here.
 
 Optional `required_assets` remains a closed set of `{name, target,
 archive_format}` records. Add `target_triple` to an individual record to bind
@@ -147,6 +153,95 @@ with only the network/signing engine replaced by an explicit fixture: incomplete
 variant collection cannot reach that boundary, and completed typed selections
 retain their manifest identity and explicit signing/provenance options on retry.
 This is handoff coverage, not live publication or cryptographic qualification.
+
+## Execute the variant jobs before collection
+
+The same compiler matrix is supported by the execution coordinator in
+`src/release_builds.sh`, not just by the collector of already completed inputs.
+An execution plan uses the same release identity, `required_targets`, optional
+typed `required_assets`, and complete `required_variants`. Each job declares its
+exact `variants` alongside the existing driver-specific inputs documented in
+`RELEASE_BUILDS.md`.
+
+For example, a native GNU job has this shape:
+
+```json
+{
+  "id": "linux-gnu",
+  "driver": "dsr",
+  "targets": ["linux/amd64"],
+  "variants": [
+    {"target": "linux/amd64", "target_triple": "x86_64-unknown-linux-gnu"}
+  ],
+  "config_dir": "/srv/release-config/gnu",
+  "config_files": {
+    "config.yaml": "<reviewed SHA-256 of config.yaml>",
+    "repos.yaml": "<reviewed SHA-256 of repos.yaml>",
+    "hosts.yaml": "<reviewed SHA-256 of hosts.yaml>",
+    "repos.d/app.yaml": "<reviewed SHA-256 of repos.d/app.yaml>"
+  },
+  "jobs": 1,
+  "timeout": 3600
+}
+```
+
+This is a job fragment with deliberately invalid placeholder hashes, not an
+executable plan. A separate musl job selects the musl triple and a separately
+pinned configuration directory. **The native configuration must actually build
+the selected variants.** The coordinator does not rewrite recipes, inject an
+extra target selector, change compiler routing, or bypass build admission.
+It invokes the ordinary DSR command with the job's immutable configuration and
+checks the resulting manifest against the planned variants. Native resume
+retains the existing source/configuration/run checks and terminal-state rules.
+
+Existing `driver: import` jobs may declare variants with their pinned manifests.
+`driver: xwin` jobs may join the matrix only with their exact sole MSVC variant
+on the selected Windows platform. The full original xwin binary inventory and
+toolchain/feature checks remain in force. A plan cannot substitute a Windows
+compiler target merely by changing its routing platform or public filename.
+
+Run the coordinator, or drive it through packaging and finalization:
+
+```bash
+bash src/release_builds.sh --plan /srv/execution-plan.json \
+  --output-dir /srv/executed-release --jobs 3 --dry-run
+
+bash src/release_finalize.sh --build-plan /srv/execution-plan.json \
+  --build-dir /srv/executed-release --build-jobs 3 \
+  --packaging-recipe /srv/packaging.json --create-draft \
+  --require-signatures --public-key /srv/keys/release.pub \
+  --secret-key /srv/keys/release.key
+```
+
+Signing and promotion remain explicit. Packaging recipes must select a
+`target_triple` for every output in a variant matrix; every member must belong
+to that compiler identity. The finalizer rejects a changed global matrix,
+per-job variant selection, or public-asset binding at the coordinator handoff.
+The completed build set carries the original selections rather than collapsing
+them back to platform counts.
+
+Failures remain resumable without discarding useful work. A missing import or
+failed job leaves independently completed variants in immutable checkpoints;
+retrying the same plan revalidates those checkpoints instead of rerunning their
+builders. Failed attempt files remain separate. Recovery distinguishes two
+important cases:
+
+* A zero-exit driver whose manifest violates the selected source, purpose,
+  compiler matrix or asset contract fails **before** acquiring a durable import
+  candidate. A normal retry can start another attempt, subject to the native
+  driver's existing resume/terminal-state policy.
+* A valid selected manifest whose payload could not be imported stays pinned.
+  Retry reattempts that exact import and never rebuilds to hide unavailable or
+  damaged bytes. Restoring the original selected payload permits completion;
+  changing the manifest or invocation does not.
+
+The additional manifest preflight uses the collector's actual admission parser,
+not a second predicate. Previously retained candidates are not silently
+ discarded or reinterpreted. Run
+`bash scripts/tests/test_release_build_plan_variants.sh` for coordinator,
+recovery, archive packaging and public-finalizer handoff coverage. It exercises
+real scheduling, hashes and archive operations with explicit compiler-driver
+and remote-engine fixtures; it does not qualify native execution or signing.
 
 ## Collect and retry
 
