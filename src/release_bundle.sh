@@ -161,13 +161,17 @@ _rb_aggregate_manifest() {
         $state[0] as $s | $s.plan as $p | . as $builds |
         ($builds|map(.source.dependencies|sort_by(.relative_path))|unique) as $deps |
         ($builds|map(.artifacts[])|sort_by(.name)) as $artifacts |
+        # Shards are already validated against their exact task receipts.
+        # Two native ABIs on one routing platform are two successful builds,
+        # not one; compatibility aliases are never additional builds.
+        ($builds|map(.summary.total)|add) as $task_count |
         if ($deps|length)!=1 or ($artifacts|map(.name)|unique|length)!=($artifacts|length)
         then error("different dependency commits or colliding release asset names") else
         {schema_version:"1.0.0",build_purpose:"release",publishable:true,
          tool:$p.tool,version:$p.tag,run_id:$s.run_id,built_at:($builds|map(.built_at)|max),
          source:{git_sha:$p.source_sha,git_ref:("refs/tags/"+$p.tag),dependencies:$deps[0]},
          requested_targets:$p.required_targets,status:"success",
-         summary:{total:($p.required_targets|length),success:($p.required_targets|length),failed:0},
+         summary:{total:$task_count,success:$task_count,failed:0},
          artifacts:$artifacts,build_environments:[$builds[]|.build_environments[]?],
          component_builds:[$p.builds|to_entries[]|. as $e |
              {id:$e.value.id,targets:$e.value.targets,manifest_sha256:$e.value.manifest_sha256,

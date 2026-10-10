@@ -338,6 +338,10 @@ _slsa_manifest_statement() {
         def target: text and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
         def triple: text and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$") and (contains("..") | not);
         def optional_triple: . == null or triple;
+        # The bundle producer qualifies tag refs; native receipts can retain
+        # the equivalent short spelling. Do not rewrite the original receipt
+        # or equate refs/heads/* with tags. The source commit still must match.
+        def tag_ref: if type == "string" then ltrimstr("refs/tags/") else . end;
         def release_eligible:
             (if has("build_purpose") then .build_purpose == "release" else true end) and
             (if has("publishable") then .publishable == true else true end);
@@ -401,7 +405,8 @@ _slsa_manifest_statement() {
             (.build_influence_env != null and (.build_influence_env | type != "object")) or
             (.cargo_isolation != null and (.cargo_isolation | type != "object")) or
             ([.build_influence_env.DSR_RELEASE_GIT_SHA] | any(.[]; . != null and . != $source.git_sha)) or
-            ([.build_influence_env.DSR_RELEASE_GIT_REF] | any(.[]; . != null and . != $source.git_ref)) or
+            ([.build_influence_env.DSR_RELEASE_GIT_REF] |
+                any(.[]; . != null and (tag_ref != ($source.git_ref | tag_ref)))) or
             ($e.target_triple != null and
                 ([.build_influence_env.CARGO_BUILD_TARGET, .build_influence_env.DSR_TARGET_TRIPLE,
                   .cargo_isolation.toolchain.target_triple] |
