@@ -18,6 +18,83 @@ _slr_require() {
     command -v jq >/dev/null && command -v minisign >/dev/null || return 3
 }
 
+# Independently selected release contents, not policy copied from a statement.
+# Canonicalize before any network operation and retain both the selected bytes
+# and semantic identity. Duplicate JSON keys and linked/special files fail.
+_slr_read_contract() {
+    command -v python3 >/dev/null || return 3
+    _slr_path "$1" || return 4
+    python3 - "$1" "$2" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+def need(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+def pairs(items):
+    result = {}
+    for key, value in items:
+        need(key not in result, "duplicate contract key: " + key)
+        result[key] = value
+    return result
+
+def name(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", value) is not None and ".." not in value
+
+try:
+    targets = sys.argv[2].split(",")
+    need(targets and len(set(targets)) == len(targets) and all(
+        re.fullmatch(r"(linux|darwin|windows)/(amd64|arm64|386)", t) for t in targets), "invalid expected targets")
+    with os.fdopen(os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_size <= 1048576, "invalid or oversized contract file")
+        raw = stream.read(1048577)
+        after = os.fstat(stream.fileno())
+    need(len(raw) <= 1048576 and (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+         (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), "contract changed while reading")
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
+                       parse_constant=lambda s: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
+    required = {"schema_version", "required_assets"}
+    need(isinstance(value, dict) and required <= set(value) <= required | {"required_variants"} and
+         type(value["schema_version"]) is int and value["schema_version"] == 1, "invalid release contract")
+    assets = value["required_assets"]
+    need(isinstance(assets, list) and 1 <= len(assets) <= 256, "expected 1..256 required assets")
+    for asset in assets:
+        fields = {"name", "target", "archive_format"}
+        need(isinstance(asset, dict) and fields <= set(asset) <= fields | {"target_triple"} and name(asset["name"]) and
+             isinstance(asset["target"], str) and asset["target"] in targets and
+             isinstance(asset["archive_format"], str) and asset["archive_format"] in ("tar.gz", "tar.xz", "zip", "binary", "none"),
+             "invalid required asset")
+        need("target_triple" not in asset or name(asset["target_triple"]), "invalid required compiler identity")
+    need(len({a["name"].lower() for a in assets}) == len(assets), "colliding required asset names")
+    need({a["target"] for a in assets} == set(targets), "asset contract must cover the complete target matrix")
+    if "required_variants" in value:
+        variants = value["required_variants"]
+        need(isinstance(variants, list) and 1 <= len(variants) <= 256, "expected 1..256 required variants")
+        for variant in variants:
+            need(isinstance(variant, dict) and set(variant) == {"target", "target_triple"} and
+                 isinstance(variant["target"], str) and variant["target"] in targets and name(variant["target_triple"]),
+                 "invalid required variant")
+        identities = {(v["target"], v["target_triple"]) for v in variants}
+        need(len(identities) == len(variants) and all("target_triple" in a for a in assets) and
+             identities == {(a["target"], a["target_triple"]) for a in assets}, "assets must cover each required variant exactly")
+        variants.sort(key=lambda v: (v["target"], v["target_triple"]))
+    assets.sort(key=lambda a: a["name"])
+    encoded = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    print(json.dumps(dict(kind="dsr-slsa-release-contract", authenticated=False, contract=value,
+                         contract_sha256=hashlib.sha256(encoded).hexdigest(), input_sha256=hashlib.sha256(raw).hexdigest()),
+                     sort_keys=True, separators=(",", ":")))
+except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+    print("[slsa] Invalid release contract: " + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
 # Authentication precedes consumption of any statement-selected payload name.
 # Require the caller's target matrix as well as signer/builder/source identity:
 # a correctly signed subset must not redefine a complete multi-platform release.
@@ -49,7 +126,20 @@ _slr_policy() {
             (.name|name) and (.target|type=="string") and
             (.size_bytes|type=="number" and .>0 and .<=9007199254740991 and .==floor)) and
             (map(.name)|sort)==($s.subject|map(.name)|sort) and
-            (map(.target)|unique|sort)==$p.targets))
+            (map(.target)|unique|sort)==$p.targets) and
+        (if $p|has("release_contract") then
+            $p.release_contract as $c |
+            # A valid signature and complete platforms cannot authorize a
+            # missing companion, a swapped ABI filename or a changed format.
+            (.dsr_evidence.artifacts|map({name,target,archive_format})|sort_by(.name))==
+                ($c.required_assets|map({name,target,archive_format})|sort_by(.name)) and
+            all($c.required_assets[]; . as $a |
+                (has("target_triple")|not) or any($s.dsr_evidence.artifacts[];
+                    .name==$a.name and .target_triple==$a.target_triple)) and
+            (if $c|has("required_variants") then
+                ([.dsr_evidence.artifacts[]|{target,target_triple}]|unique|sort_by(.target,.target_triple))==$c.required_variants
+             else true end)
+         else true end))
     ' "$proof" >/dev/null 2>&1 || { _slsa_log 'Signed statement differs from the selected release policy'; return 7; }
 }
 
@@ -154,7 +244,9 @@ _slr_verify_remote() {
          build_manifest_sha256:$proof[0].dsr_evidence.manifest_sha256,
          invocation_id:$proof[0].predicate.runDetails.metadata.invocationId,
          artifact_count:($proof[0].subject|length),asset_inventory_sha256:$inventory_hash,
-         verification_policy:"trusted-minisign-slsa-v1-all-payload-bytes"}'
+         verification_policy:"trusted-minisign-slsa-v1-all-payload-bytes"} +
+         (if $policy[0]|has("release_contract") then
+             {release_contract_sha256:$policy[0].release_contract_sha256} else {} end)'
 }
 
 # Canonical local selections cannot redirect snapshot reads or publication.
@@ -358,6 +450,7 @@ _slr_execute() (
     fi
     local repo='' tag='' sha='' builder='' public='' targets='' name=release.intoto.jsonl
     local expected='' manifest_hash='' invocation='' option work cleanup key_hash matrix
+    local contract='' contract_record=null
     local -A seen=()
     while (($#)); do
         option=$1
@@ -369,12 +462,21 @@ _slr_execute() (
             --repo) repo=$2 ;; --tag) tag=$2 ;; --sha) sha=$2 ;; --builder) builder=$2 ;;
             --public-key) public=$2 ;; --targets) targets=$2 ;; --statement-name) name=$2 ;;
             --statement-sha256) expected=$2 ;; --manifest-sha256) manifest_hash=$2 ;; --invocation-id) invocation=$2 ;;
+            --release-contract) contract=$2 ;;
             --signature) [[ "$action" == publish ]] || return 4; local_signature=$2 ;;
             --output-dir) [[ "$action" == fetch ]] || return 4; output=$2 ;;
             *) return 4 ;;
         esac
         shift 2
     done
+    if [[ "$action" == contract ]]; then
+        for option in "${!seen[@]}"; do
+            case "$option" in --release-contract|--targets) ;; *) return 4 ;; esac
+        done
+        [[ -n "$contract" && -n "$targets" ]] || return 4
+        _slr_read_contract "$contract" "$targets"
+        return $?
+    fi
     [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$repo" != *..* &&
        "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.+-]+)?$ &&
        "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 &&
@@ -387,6 +489,9 @@ _slr_execute() (
     matrix=$(jq -cne --arg targets "$targets" '$targets|split(",")|
         if length>0 and all(.[];test("^(linux|darwin|windows)/(amd64|arm64|386)$")) and (unique|length)==length
         then sort else error("invalid expected targets") end') || return 4
+    if [[ -n "$contract" ]]; then
+        contract_record=$(_slr_read_contract "$contract" "$targets") || return $?
+    fi
     if [[ "$action" == snapshot ]]; then _slr_require local || return $?; else _slr_require || return $?; fi
     if [[ "$action" == fetch ]]; then
         command -v flock >/dev/null && command -v python3 >/dev/null || return 3
@@ -403,6 +508,7 @@ _slr_execute() (
     # shellcheck disable=SC2064
     trap "$cleanup" EXIT
     trap 'exit 5' HUP INT TERM
+    printf '%s\n' "$contract_record" > "$work/contract.json" || return 1
     [[ $(wc -c < "$public") -le 8192 ]] || return 4
     key_hash=$(_slsa_sha256 "$public") || return $?
     cp -- "$public" "$work/trusted.pub" || return 1
@@ -427,9 +533,14 @@ _slr_execute() (
     fi
     jq -cnS --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" --arg builder "$builder" \
         --argjson targets "$matrix" --arg name "$name" --arg expected "$expected" \
-        --arg manifest "$manifest_hash" --arg invocation "$invocation" \
+        --arg manifest "$manifest_hash" --arg invocation "$invocation" --slurpfile contract "$work/contract.json" \
         '{repo:$repo,tag:$tag,source_sha:$sha,builder:$builder,targets:$targets,statement_name:$name,
-          statement_sha256:$expected,manifest_sha256:$manifest,invocation_id:$invocation}' > "$work/policy.json" || return 1
+          statement_sha256:$expected,manifest_sha256:$manifest,invocation_id:$invocation} +
+          (if $contract[0]==null then {} else {release_contract:$contract[0].contract,
+              release_contract_sha256:$contract[0].contract_sha256} end)' > "$work/policy.json" || return 1
+    if [[ -n "$contract" ]]; then
+        [[ "$(_slsa_sha256 "$contract")" == "$(jq -r .input_sha256 "$work/contract.json")" ]] || return 7
+    fi
     if [[ "$action" == publish ]]; then
         _slr_policy "$work/statement" "$work/signature" "$work/trusted.pub" "$work/policy.json" || return $?
         _slsa_release_assets "$work/statement" "$root" || return $?
@@ -459,6 +570,10 @@ _slr_execute() (
         _slr_verify_remote "$work/policy.json" "$work/trusted.pub" "$work" > "$work/result.json" || return $?
     fi
     [[ "$(_slsa_sha256 "$public")" == "$key_hash" && "$(_slsa_sha256 "$work/trusted.pub")" == "$key_hash" ]] || return 7
+    if [[ -n "$contract" ]]; then
+        _slr_path "$contract" &&
+            [[ "$(_slsa_sha256 "$contract")" == "$(jq -r .input_sha256 "$work/contract.json")" ]] || return 7
+    fi
     if [[ "$action" == fetch ]]; then
         _slr_path "$output" && _slr_path "$output.lock" || return 2
         # The cooperating-writer lock and same-filesystem staging protect the
@@ -480,6 +595,7 @@ slsa_verify_remote() { _slr_execute verify "$@"; }
 slsa_publish_release() { _slr_execute publish "$@"; }
 slsa_fetch_release() { _slr_execute fetch "$@"; }
 slsa_verify_snapshot() { _slr_execute snapshot "$@"; }
+slsa_describe_contract() { _slr_execute contract "$@"; }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-help}" in
@@ -487,15 +603,18 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         publish-release) shift; slsa_publish_release "$@"; exit $? ;;
         fetch-release) shift; slsa_fetch_release "$@"; exit $? ;;
         verify-snapshot) shift; slsa_verify_snapshot "$@"; exit $? ;;
+        describe-contract) shift; slsa_describe_contract "$@"; exit $? ;;
         help|--help|-h)
             printf '%s\n' 'Usage: bash src/slsa_remote.sh verify-release --repo OWNER/REPO --tag vVERSION --sha COMMIT' \
                 '       --builder ID --public-key FILE --targets linux/amd64,windows/arm64' \
                 '       [--statement-name release.intoto.jsonl] [--statement-sha256 SHA256]' \
                 '       [--manifest-sha256 SHA256] [--invocation-id ID]' \
+                '       [--release-contract FILE] (exact independently selected assets and compiler variants)' \
                 'Publish: publish-release STATEMENT ARTIFACTS (same required policy options)' \
                 '         [--signature FILE] [--dry-run]' \
                 'Fetch: fetch-release --output-dir NEW_DIR (same required policy options)' \
                 'Offline: verify-snapshot DIR (same required policy options; no network)' \
+                'Describe: describe-contract --release-contract FILE --targets PLATFORM,... (no authentication or writes)' \
                 'Verify performs no writes. Publish adds only a signed statement pair to an existing draft.' ;;
         *) exit 4 ;;
     esac
