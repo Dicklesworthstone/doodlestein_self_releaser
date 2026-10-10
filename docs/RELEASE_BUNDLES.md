@@ -101,11 +101,35 @@ existing SLSA manifest profile. Compiler triples are recorded identities, not
 an independent ABI inspection or proof that these builds were executed here.
 
 Optional `required_assets` remains a closed set of `{name, target,
-archive_format}` records. A same-platform shard may own only a subset of that
-set, but each imported name must be allowed and the final combined set must
-match exactly. An alias belongs to one producer; publishing it from two shards
-is a collision even if its bytes match. No filename guessing decides variant
-ownership, and aliases never add compiler tasks to the summary.
+archive_format}` records. Add `target_triple` to an individual record to bind
+that public filename to its exact compiler variant, rather than merely to the
+platform. For example:
+
+```json
+{
+  "name": "app-linux-musl.tar.gz",
+  "target": "linux/amd64",
+  "target_triple": "x86_64-unknown-linux-musl",
+  "archive_format": "tar.gz"
+}
+```
+
+A same-platform shard may own only a subset of the global asset set, but every
+imported name must be allowed and the final combined set must match exactly.
+Explicitly typed names are required from the shard owning that compiler pair;
+a GNU payload cannot satisfy a musl filename even when both variants exist
+elsewhere in the release. Missing owned names fail before checkpoint admission.
+Typed names also work in ordinary platform-partitioned plans, and untyped
+records keep their previous contract. An explicit null, empty, unsafe, or
+unknown-to-the-selected-matrix triple is an error, not an untyped fallback.
+Removing a binding changes the frozen plan and cannot alter an existing bundle.
+
+An alias belongs to one producer; publishing it from two shards is a collision
+even if its bytes match. No filename guessing decides variant ownership, and
+aliases never add compiler tasks to the summary. The shared SLSA profile checks
+the exact filename/format/platform/compiler correspondence before provenance or
+payload publication. The binding is to producer-recorded identity; it is not an
+independent compiler invocation or inspection of the executable ABI.
 
 When one variant has not arrived, other complete variant checkpoints are kept,
 but no `release/` directory is exposed. Retrying the same pinned plan can finish
@@ -118,6 +142,11 @@ selection alongside its manifest hash. The shared SLSA/payload-publication
 profile enforces the required variant matrix downstream, so a successful
 summary alone cannot authorize a subset. Run the collector/provenance/recovery
 regressions with `bash scripts/tests/test_release_bundle_variants.sh`.
+The same test exercises the unmodified public build-set finalizer entry point,
+with only the network/signing engine replaced by an explicit fixture: incomplete
+variant collection cannot reach that boundary, and completed typed selections
+retain their manifest identity and explicit signing/provenance options on retry.
+This is handoff coverage, not live publication or cryptographic qualification.
 
 ## Collect and retry
 

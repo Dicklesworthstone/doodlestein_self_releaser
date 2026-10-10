@@ -26,14 +26,15 @@ _rb_plan() {
         def path: text and startswith("/") and (contains("\\")|not);
         def target: type=="string" and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
         def targets: type=="array" and length>0 and all(.[];target) and (unique|length)==length;
+        def triple: text and length<=128 and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..")|not);
         def variant: type=="object" and keys==["target","target_triple"] and
-            (.target|target) and (.target_triple|text and length<=128 and
-                test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..")|not));
+            (.target|target) and (.target_triple|triple);
         def variants: type=="array" and length>0 and length<=256 and
             all(.[];variant) and (unique|length)==length;
         def assets: type=="array" and length>0 and length<=256 and all(.[];
-            type=="object" and keys==["archive_format","name","target"] and
+            type=="object" and (del(.target_triple)|keys)==["archive_format","name","target"] and
             (.name|name and length<=128) and (.target|target) and
+            (if has("target_triple") then (.target_triple|triple) else true end) and
             (.archive_format|.=="tar.gz" or .=="tar.xz" or .=="zip" or .=="binary" or .=="none")) and
             (map(.name|ascii_downcase)|unique|length)==length;
         if length==1 then .[0] else error("expected one build-set plan") end |
@@ -57,7 +58,10 @@ _rb_plan() {
                 all(.builds[]; (.variants|variants) and
                     ([.variants[].target]|unique|sort)==(.targets|sort)) and
                 ([.builds[].variants[]]|sort_by(.target,.target_triple))==
-                    (.required_variants|sort_by(.target,.target_triple))
+                    (.required_variants|sort_by(.target,.target_triple)) and
+                (.required_variants as $variants |
+                    all(.required_assets[]? | select(has("target_triple"));
+                        {target,target_triple} as $identity | any($variants[]; .==$identity)))
              else
                 all(.builds[]; has("variants")|not) and
                 (([.builds[].targets[]]|sort)==(.required_targets|sort))
@@ -113,6 +117,9 @@ _rb_shard_manifest() {
     _slsa_manifest_statement "$manifest" "$repo" dsr:release-bundle > "$proof" || return $?
     jq -e --slurpfile plan "$plan" --argjson input "$entry" '
         . as $m | $plan[0] as $p |
+        def matches_asset($required; $actual):
+            ($required|{name,target,archive_format})==($actual|{name,target,archive_format}) and
+            (if $required|has("target_triple") then $required.target_triple==$actual.target_triple else true end);
         .tool==$p.tool and ("v"+(.version|ltrimstr("v")))==$p.tag and .source.git_sha==$p.source_sha and
         (.source.repository==null or .source.repository==$p.repo or .source.repository==("https://github.com/"+$p.repo)) and
         (if has("build_purpose") then .build_purpose=="release" else true end) and
@@ -132,11 +139,19 @@ _rb_shard_manifest() {
             if $p|has("required_variants") then
                 # Same-platform shards own disjoint variants. Their combined
                 # exact asset contract is enforced again before publication.
-                all(.artifacts[]; {name,target,archive_format} as $asset |
-                    any($p.required_assets[]; .==$asset))
+                # A typed public name belongs to its selected compiler, never
+                # another shard with the same scheduling platform.
+                all(.artifacts[]; . as $asset |
+                    any($p.required_assets[]; matches_asset(.; $asset))) and
+                all($p.required_assets[] | select(has("target_triple")) |
+                    select({target,target_triple} as $identity | any($input.variants[]; .==$identity));
+                    . as $required | any($m.artifacts[]; matches_asset($required; .)))
             else
                 (.artifacts|map({name,target,archive_format})|sort_by(.name))==
-                ([$p.required_assets[]|select(.target as $t|$input.targets|index($t)!=null)]|sort_by(.name))
+                ([$p.required_assets[]|select(.target as $t|$input.targets|index($t)!=null)|
+                    {name,target,archive_format}]|sort_by(.name)) and
+                all(.artifacts[]; . as $asset |
+                    any($p.required_assets[]; matches_asset(.; $asset)))
             end
          else true end) and
         all(.artifacts[];

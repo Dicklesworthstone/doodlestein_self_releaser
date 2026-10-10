@@ -390,11 +390,15 @@ _slsa_manifest_statement() {
         .artifacts as $artifacts |
         if has("required_assets") and
            (.required_assets | type != "array" or length == 0 or length > 256 or
-               (all(.[]; type == "object" and keys == ["archive_format","name","target"] and
+               (all(.[]; type == "object" and (del(.target_triple) | keys) == ["archive_format","name","target"] and
                    (.name | name and length <= 128) and (.target | target) and
+                   (if has("target_triple") then (.target_triple | triple and length <= 128) else true end) and
                    (.archive_format | . == "tar.gz" or . == "tar.xz" or . == "zip" or . == "binary" or . == "none")) | not) or
                ((map(.name | ascii_downcase) | unique | length) != length) or
-               ((sort_by(.name)) != ($artifacts | map({name,target,archive_format}) | sort_by(.name))))
+               ((map({name,target,archive_format}) | sort_by(.name)) !=
+                    ($artifacts | map({name,target,archive_format}) | sort_by(.name))) or
+               any(.[] | select(has("target_triple")); . as $required |
+                   (any($artifacts[]; .name == $required.name and .target_triple == $required.target_triple) | not)))
         then error("release does not cover its exact required asset contract") else . end |
         # A platform is a routing identity, not a compiler task. Native GNU
         # and musl tasks share a platform; aliases share a task. Do not infer

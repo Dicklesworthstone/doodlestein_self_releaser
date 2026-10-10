@@ -336,5 +336,223 @@ for mutation in wrong-compiler no-native-receipt wrong-method foreign-payload mi
     check "split $mutation exposes no complete release or successful receipt" bash -c \
         'test ! -e "$1/release" && test ! -s "$2"' _ "$directory/bundle" "$WORK/stdout"
 done
+# A platform/variant set does not bind a public basename to its compiler.
+# Add typed required assets without altering producer bytes or receipts. The
+# same API also supports typed names within a legacy platform-partitioned plan.
+typed_asset_plan() {
+    python3 - "$1" "$2" <<'PY'
+import json
+import pathlib
+import sys
+
+plan = json.loads(pathlib.Path(sys.argv[1]).read_text())
+actual = {}
+for build in plan["builds"]:
+    manifest = json.loads(pathlib.Path(build["manifest"]).read_text())
+    for artifact in manifest["artifacts"]:
+        assert artifact["name"] not in actual
+        actual[artifact["name"]] = artifact["target_triple"]
+for asset in plan["required_assets"]:
+    asset["target_triple"] = actual[asset["name"]]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(plan, sort_keys=True) + "\n")
+PY
+}
+for arch in amd64 arm64; do
+    for shape in split legacy; do
+        directory="$WORK/typed-$shape-$arch"
+        if [[ "$shape" == split ]]; then
+            split_fixture "$directory" "$arch" || exit 1
+            plan="$directory/split-plan.json"
+        else
+            fixture "$directory" "$arch" || exit 1
+            plan="$directory/plan.json"
+        fi
+        typed_asset_plan "$plan" "$directory/typed-plan.json" || exit 1
+        plan="$directory/typed-plan.json"
+        output="$directory/bundle"
+        run bundle --plan "$plan" --output-dir "$output" --dry-run
+        check "$shape $arch admits typed public asset names without guessing a compiler" test "$status" -eq 0
+        run bundle --plan "$plan" --output-dir "$output"
+        check "$shape $arch collects every correctly bound public asset" test "$status" -eq 0
+        if [[ "$status" -ne 0 ]]; then cat "$WORK/stderr" >&2; continue; fi
+        manifest="$output/release/build-manifest.json"
+        check "$shape $arch retains the exact operator-selected asset/compiler binding" jq -e --slurpfile plan "$plan" \
+            '.required_assets == ($plan[0].required_assets|sort_by(.name)) and
+             .summary == {total:3,success:3,failed:0} and (.artifacts|length)==4' "$manifest"
+        original=$(hash "$manifest")
+        run bundle --plan "$plan" --output-dir "$output"
+        check "$shape $arch typed-asset retry preserves aggregate identity" bash -c \
+            'test "$1" = 0 && test "$(sha256sum < "$2" | cut -d " " -f 1)" = "$3"' _ "$status" "$manifest" "$original"
+        proof="$directory/typed.intoto.jsonl"
+        run bash "$SLSA" generate-manifest "$manifest" "$output/release/artifacts" \
+            --repository example/app --builder dsr/test --output "$proof"
+        check "$shape $arch typed asset set reaches the public provenance API" test "$status" -eq 0
+        run bash "$SLSA" verify-release "$proof" "$output/release/artifacts" --manifest "$manifest" \
+            --repository example/app --builder dsr/test
+        check "$shape $arch typed public provenance verifies every payload" test "$status" -eq 0
+        # The output bytes, task counts, environment inventory and names stay
+        # fixed; only the claimed required ABI for two names is exchanged.
+        jq --arg gnu "app-$arch-gnu" --arg musl "app-$arch-musl" '
+            (.required_assets[]|select(.name==$gnu)|.target_triple) as $g |
+            (.required_assets[]|select(.name==$musl)|.target_triple) as $m |
+            .required_assets |= map(if .name==$gnu then .target_triple=$m
+                                    elif .name==$musl then .target_triple=$g else . end)' \
+            "$manifest" > "$directory/swapped-manifest.json" || exit 1
+        run bash "$SLSA" generate-manifest "$directory/swapped-manifest.json" "$output/release/artifacts" \
+            --repository example/app --output "$directory/swapped-proof"
+        check "$shape $arch swapped filename/ABI binding fails despite complete variant coverage" test "$status" -eq 4
+        check "$shape $arch swapped binding publishes no proof" test ! -e "$directory/swapped-proof"
+        # Optional means each individual name can retain the old 3-field
+        # contract. Omitting one binding never disables another name binding.
+        jq --arg alias "app-$arch-alias" '.required_assets |= map(if .name==$alias then del(.target_triple) else . end)' \
+            "$plan" > "$directory/mixed-plan.json" || exit 1
+        run bundle --plan "$directory/mixed-plan.json" --output-dir "$directory/mixed"
+        check "$shape $arch mixed typed and legacy names keep their respective contracts" test "$status" -eq 0
+        run bundle --plan "$directory/mixed-plan.json" --output-dir "$output"
+        check "$shape $arch dropping a binding cannot change an existing frozen plan" test "$status" -eq 2
+        check "$shape $arch rejected policy change preserves the published manifest" test "$(hash "$manifest")" = "$original"
+    done
+done
+
+# With no compiler binding the exchanged selection is indistinguishable; the
+# explicit contract must reject it before admitting even the first checkpoint.
+directory="$WORK/typed-admission"
+split_fixture "$directory" amd64 || exit 1
+typed_asset_plan "$directory/split-plan.json" "$directory/typed-plan.json" || exit 1
+for mutation in swapped-name missing-owned-asset wrong-format; do
+    case "$mutation" in
+        swapped-name) filter='.required_assets |= map(
+            if .name=="app-amd64-gnu" then .target_triple="x86_64-unknown-linux-musl"
+            elif .name=="app-amd64-musl" then .target_triple="x86_64-unknown-linux-gnu" else . end)' ;;
+        missing-owned-asset) filter='.required_assets += [{name:"missing-gnu",target:"linux/amd64",
+            target_triple:"x86_64-unknown-linux-gnu",archive_format:"binary"}]' ;;
+        wrong-format) filter='.required_assets[0].archive_format="zip"' ;;
+    esac
+    jq "$filter" "$directory/typed-plan.json" > "$directory/$mutation.json" || exit 1
+    run bundle --plan "$directory/$mutation.json" --output-dir "$directory/$mutation"
+    check "typed admission refuses $mutation as an evidence mismatch" test "$status" -eq 7
+    check "typed $mutation cannot admit a completed GNU checkpoint or publish a release" bash -c \
+        'test ! -e "$1/inputs/linux-gnu" && test ! -e "$1/release" && test ! -s "$2"' \
+        _ "$directory/$mutation" "$WORK/stdout"
+done
+for mutation in null empty number control unsafe too-long foreign extra-field; do
+    case "$mutation" in
+        null) filter='.required_assets[0].target_triple=null' ;;
+        empty) filter='.required_assets[0].target_triple=""' ;;
+        number) filter='.required_assets[0].target_triple=7' ;;
+        control) filter='.required_assets[0].target_triple="gnu\n"' ;;
+        unsafe) filter='.required_assets[0].target_triple="../gnu"' ;;
+        too-long) filter='.required_assets[0].target_triple="x"*129' ;;
+        foreign) filter='.required_assets[0].target_triple="aarch64-unknown-linux-gnu"' ;;
+        extra-field) filter='.required_assets[0].compiler="unbound"' ;;
+    esac
+    jq "$filter" "$directory/typed-plan.json" > "$directory/bad-$mutation.json" || exit 1
+    run bundle --plan "$directory/bad-$mutation.json" --output-dir "$directory/bad-$mutation" --dry-run
+    check "invalid typed asset $mutation fails preflight" test "$status" -eq 4
+    check "invalid typed asset $mutation creates no output or successful preview" bash -c \
+        'test ! -e "$1" && test ! -s "$2"' _ "$directory/bad-$mutation" "$WORK/stdout"
+done
+# Exercise the untouched public CLI router and real collection/verification.
+# As in test_release_bundle_finalize.sh, substitute only the network engine
+# file in an owned runtime; never call GitHub or pretend to authenticate keys.
+FINALIZER="${RELEASE_FINALIZE_TEST_MODULE:-$ROOT/src/release_finalize.sh}"
+[[ -f "$FINALIZER" ]] || { printf 'Missing finalizer entry point: %s\n' "$FINALIZER" >&2; exit 3; }
+directory="$WORK/typed-finalizer"
+split_fixture "$directory" amd64 || exit 1
+typed_asset_plan "$directory/split-plan.json" "$directory/typed-plan.json" || exit 1
+mkdir "$directory/cli" || exit 1
+cp "$FINALIZER" "$directory/cli/release_finalize.sh" || exit 1
+cp "$BUNDLE" "$directory/cli/release_bundle.sh" || exit 1
+cp "$SLSA" "$directory/cli/slsa.sh" || exit 1
+export DSR_FINALIZE_FIXTURE_ROOT="$directory"
+cat > "$directory/cli/release_finalize_core.sh" <<'SH'
+#!/usr/bin/env bash
+# Explicit network-engine boundary fixture, not a production signer/uploader.
+_rf_log() { printf '[finalizer-fixture] %s\n' "$*" >&2; }
+release_finalize() {
+    local root=$1 manifest='' repo='' tag='' sha=''
+    local evidence="${DSR_FINALIZE_FIXTURE_ROOT:?}"
+    printf 'call\n' >> "$evidence/calls"
+    jq -cn --args '$ARGS.positional' -- "$@" > "$evidence/engine-args.json" || return 99
+    shift
+    while (($#)); do
+        case "$1" in
+            --build-manifest) manifest=$2; shift 2 ;;
+            --repo) repo=$2; shift 2 ;;
+            --tag) tag=$2; shift 2 ;;
+            --sha) sha=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [[ "$repo" == example/app && "$tag" == v1.2.3 && "$sha" == "$(printf '1%.0s' {1..40})" ]] || return 99
+    _slsa_manifest_statement "$manifest" "$repo" dsr/fixture > "$evidence/handoff-proof.json" || return 99
+    _slsa_release_assets "$evidence/handoff-proof.json" "$root" || return 99
+    jq -e '.summary=={total:3,success:3,failed:0} and (.required_assets|length)==4 and
+        all(.required_assets[]; has("target_triple")) and (.required_variants|length)==3' "$manifest" >/dev/null || return 99
+    case "${DSR_FINALIZE_FIXTURE_MODE:-ready}" in
+        fail) printf '{"kind":"dsr-release-finalization-result","status":"error","exit_code":7,"fixture":true,"error":"injected engine failure"}\n'; return 7 ;;
+        malformed) printf '{}\n'; return 0 ;;
+    esac
+    printf '{"kind":"dsr-release-finalization-result","status":"ready","exit_code":0,"fixture":true,"authenticated":false}\n'
+}
+SH
+finalize() {
+    bash "$directory/cli/release_finalize.sh" --build-set "$directory/typed-plan.json" \
+        --bundle-dir "$directory/bundle" "$@"
+}
+run finalize --dry-run
+check 'typed finalizer dry-run emits one explicitly unverified planning envelope' jq -es \
+    'length==1 and (.[0]|.status=="planned" and .policy_verified==false and .bundle.publishable==false)' "$WORK/stdout"
+check 'typed finalizer dry-run never reaches the engine or creates a bundle' bash -c \
+    'test ! -e "$1/calls" && test ! -e "$1/bundle"' _ "$directory"
+mv "$directory/linux-musl" "$directory/musl-pending" || exit 1
+run finalize --create-draft
+check 'public finalizer waits for a missing independent ABI' test "$status" -eq 1
+check 'public finalizer exposes the actual missing job without a successful release claim' jq -es \
+    'length==1 and (.[0]|.status=="waiting_for_builds" and .bundle.missing_builds==["linux-musl"] and .bundle.publishable==false)' "$WORK/stdout"
+check 'incomplete ABI inventory cannot reach the publication engine' test ! -e "$directory/calls"
+mv "$directory/linux-gnu" "$directory/gnu-offline" || exit 1
+mv "$directory/windows" "$directory/windows-offline" || exit 1
+mv "$directory/musl-pending" "$directory/linux-musl" || exit 1
+run finalize --create-draft
+check 'public finalizer resumes retained variants and reaches the engine with a complete typed set' test "$status" -eq 0
+check 'completed handoff has one envelope and distinguishes fixture evidence from authentication' jq -es \
+    'length==1 and (.[0]|.status=="ready" and .fixture==true and .authenticated==false and .bundle.status=="verified")' "$WORK/stdout"
+check 'engine receives exact plan-owned identity and immutable manifest paths' jq -e --arg root "$directory/bundle" \
+    '.[0]==($root+"/release/artifacts") and .[index("--repo")+1]=="example/app" and
+     .[index("--tag")+1]=="v1.2.3" and .[index("--build-manifest")+1]==($root+"/release/build-manifest.json") and
+     index("--upload-payloads")!=null and index("--promote")==null and index("--require-signatures")==null' "$directory/engine-args.json"
+original=$(hash "$directory/bundle/release/build-manifest.json")
+export DSR_FINALIZE_FIXTURE_MODE=fail
+run finalize --create-draft
+check 'engine failure is retained as failure, not a successful collection result' test "$status" -eq 7
+check 'engine error preserves completed bundle evidence for retry' jq -e \
+    '.status=="error" and .error=="injected engine failure" and .bundle.status=="verified"' "$WORK/stdout"
+export DSR_FINALIZE_FIXTURE_MODE=ready
+run finalize --create-draft
+check 'typed finalization retries without rebuilding or changing the aggregate' bash -c \
+    'test "$1" = 0 && test "$(sha256sum < "$2" | cut -d " " -f 1)" = "$3"' \
+    _ "$status" "$directory/bundle/release/build-manifest.json" "$original"
+printf 'not a real public key; argument-boundary fixture only\n' > "$directory/key.pub"
+run finalize --require-signatures --public-key "$directory/key.pub" --require-provenance --provenance-builder dsr/test
+check 'explicit signature and provenance policy reaches the unchanged engine boundary' test "$status" -eq 0
+check 'typed collection neither strips signing policy nor implies promotion' jq -e --arg key "$directory/key.pub" \
+    'index("--require-signatures")!=null and index("--require-provenance")!=null and
+     .[index("--public-key")+1]==$key and .[index("--provenance-builder")+1]=="dsr/test" and index("--promote")==null' \
+    "$directory/engine-args.json"
+export DSR_FINALIZE_FIXTURE_MODE=malformed
+run finalize
+check 'malformed engine success cannot authorize typed finalization' test "$status" -eq 7
+export DSR_FINALIZE_FIXTURE_MODE=ready
+calls=$(wc -l < "$directory/calls")
+run finalize --output-dir "$directory/bundle/release/artifacts"
+check 'typed finalization still protects its immutable payload namespace' test "$status" -eq 4
+check 'invalid output policy never reaches the engine' test "$calls" = "$(wc -l < "$directory/calls")"
+cp "$directory/bundle/release/artifacts/app-amd64-musl" "$directory/original-musl-retained" || exit 1
+printf corrupt >> "$directory/bundle/release/artifacts/app-amd64-musl"
+run finalize
+check 'corrupt completed musl payload blocks finalization on retry' test "$status" -eq 7
+check 'corrupt typed set cannot reach the engine again' test "$calls" = "$(wc -l < "$directory/calls")"
+unset DSR_FINALIZE_FIXTURE_ROOT DSR_FINALIZE_FIXTURE_MODE
 printf 'Results: %s passed, %s failed\nEvidence: %s\n' "$passed" "$failed" "$WORK"
 [[ "$failed" -eq 0 ]]
