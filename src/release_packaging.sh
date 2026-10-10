@@ -100,21 +100,26 @@ def recipe(value):
     need(isinstance(value, dict) and set(value) == {"schema_version", "artifacts"} and
          type(value["schema_version"]) is int and value["schema_version"] == 1 and
          isinstance(value["artifacts"], list) and 1 <= len(value["artifacts"]) <= 256, "invalid packaging recipe", 4)
-    outputs, sources = [], set()
+    outputs, sources, source_triples = [], set(), {}
     for item in value["artifacts"]:
         need(isinstance(item, dict), "invalid packaging artifact", 4)
         base = {"name", "target", "archive_format"}
-        need(base <= set(item) <= base | {"source", "members", "aliases", "source_files"} and
+        need(base <= set(item) <= base | {"source", "members", "aliases", "source_files", "target_triple"} and
              ("source" in item) != ("members" in item), "select source or members, not both", 4)
         need(name(item["name"]) and match(item["target"], r"(linux|darwin|windows)/(amd64|arm64|386)") and
              isinstance(item["archive_format"], str) and item["archive_format"] in ARCHIVES | RAW,
              "invalid packaging name, target or format", 4)
+        if "target_triple" in item:
+            need(name(item["target_triple"]), "invalid packaging compiler target", 4)
         item.setdefault("aliases", [])
         need(isinstance(item["aliases"], list) and all(name(n) for n in item["aliases"]), "invalid aliases", 4)
         for n in [item["name"], *item["aliases"]]:
             need(file_format(n) == (item["archive_format"] if item["archive_format"] in ARCHIVES else "none"),
                  "output suffix disagrees with format: " + n, 4)
-            outputs.append({"name": n, "target": item["target"], "archive_format": item["archive_format"]})
+            output = {"name": n, "target": item["target"], "archive_format": item["archive_format"]}
+            if "target_triple" in item:
+                output["target_triple"] = item["target_triple"]
+            outputs.append(output)
         item["aliases"].sort()
         if "source" in item:
             need(name(item["source"]), "invalid source name", 4)
@@ -130,6 +135,16 @@ def recipe(value):
                 sources.add((member["source"], item["target"]))
             need(len(set(paths)) == len(paths), "colliding archive member names", 4)
             item["members"].sort(key=lambda m: m["path"])
+        # One producer name cannot satisfy contradictory compiler selections.
+        # A repeated source with an untyped legacy output does not erase a
+        # typed output's input requirement from the finalizer preview.
+        if "target_triple" in item:
+            for selected_source in ([item["source"]] if "source" in item else
+                                    [m["source"] for m in item["members"]]):
+                key = (selected_source, item["target"])
+                need(key not in source_triples or source_triples[key] == item["target_triple"],
+                     "conflicting compiler targets for one packaging source", 4)
+                source_triples[key] = item["target_triple"]
         if "source_files" in item:
             need(item["archive_format"] in ARCHIVES and isinstance(item["source_files"], list) and
                  1 <= len(item["source_files"]) <= 256, "source_files requires a nonempty archive companion list", 4)
@@ -147,7 +162,9 @@ def recipe(value):
     need(len(outputs) <= 256 and len({a["name"].lower() for a in outputs}) == len(outputs),
          "colliding or excessive output/alias names", 4)
     value["artifacts"].sort(key=lambda a: a["name"])
-    return value, sorted(outputs, key=lambda a: a["name"]), [dict(name=n, target=t) for n, t in sorted(sources)]
+    inputs = [dict(name=n, target=t, **({"target_triple": source_triples[(n, t)]}
+              if (n, t) in source_triples else {})) for n, t in sorted(sources)]
+    return value, sorted(outputs, key=lambda a: a["name"]), inputs
 
 module = Path(sys.argv[1])
 child = None
@@ -200,7 +217,20 @@ def source_contract(value):
     need(len(records) <= 256 and len({n.lower() for n in records}) == len(records), "invalid source asset namespace", 4)
     need({(a["name"], a["target"]) for a in inputs} == {(a["name"], a["target"]) for a in records.values()},
          "recipe must consume every producer asset and no unlisted asset", 4)
+    variant_platforms = {}
+    for record in records.values():
+        variant_platforms.setdefault(record["target"], set()).add(record.get("target_triple"))
     for item in selected["artifacts"]:
+        # A recipe is a selection, never evidence of compilation. Check its
+        # declared compiler against every original input before copying or
+        # compressing anything. Do not erase a multi-variant source matrix.
+        required = "required_variants" in value or len(variant_platforms[item["target"]]) > 1
+        need(not required or "target_triple" in item,
+             "variant packaging requires an explicit target_triple for every output", 4)
+        if "target_triple" in item:
+            names = [item["source"]] if "source" in item else [m["source"] for m in item["members"]]
+            need(all(records[n].get("target_triple") == item["target_triple"] for n in names),
+                 "packaging compiler target differs from a producer input", 4)
         if "members" in item:
             need(all(records[m["source"]]["archive_format"] in RAW and file_format(m["source"]) == "none"
                      for m in item["members"]), "archives cannot be nested as raw members", 4)
@@ -450,7 +480,10 @@ try:
     class Parser(argparse.ArgumentParser):
         def error(self, message):
             raise Failure(message, 4)
-    parser = Parser(description="Package a pinned producer manifest; no signing or network writes.", allow_abbrev=False)
+    parser = Parser(description="Package a pinned producer manifest; no signing or network writes.",
+        epilog="Recipe artifacts may declare target_triple, inherited by every alias. "
+               "Variant matrices require it on every output; all source members must match that compiler identity.",
+        allow_abbrev=False)
     parser.add_argument("--recipe", required=True)
     parser.add_argument("--describe", action="store_true")
     parser.add_argument("--check-source", action="store_true",

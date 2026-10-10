@@ -73,8 +73,18 @@ _rf_packaging_contract() {
             elif $target=="windows/arm64" then "aarch64-pc-windows-msvc"
             else error("unsupported xwin packaging target") end;
         ([$r.required_assets[].target]|unique|sort)==($p.required_targets|sort) and
+        (if $p|has("required_variants") then
+            all($r.required_assets[]; has("target_triple")) and
+            ([$r.required_assets[]|{target,target_triple}]|unique|sort_by(.target,.target_triple))==
+                ($p.required_variants|sort_by(.target,.target_triple))
+         else true end) and
         (if $p|has("required_assets") then
-            ($p.required_assets|map({name,target})|sort_by(.name,.target))==($r.inputs|sort_by(.name,.target)) and
+            ($p.required_assets|map({name,target})|sort_by(.name,.target))==
+                ($r.inputs|map({name,target})|sort_by(.name,.target)) and
+            all($r.inputs[]; . as $input |
+                any($p.required_assets[]; .name==$input.name and .target==$input.target and
+                    (if has("target_triple") and ($input|has("target_triple")) then
+                        .target_triple==$input.target_triple else true end))) and
             all($r.recipe.artifacts[]; . as $a |
                 if has("members") then all(.members[]; .source as $n |
                     any($p.required_assets[]; .name==$n and (.archive_format|raw)))
@@ -88,7 +98,8 @@ _rf_packaging_contract() {
             $job.targets[0] as $target | xwin_triple($target) as $triple |
             [($job.binaries // [$job.binary])[] |
                 {name:($job.asset_name // (. + "-" + $triple + ".exe")),target:$target}] as $expected |
-            ([$r.inputs[]|select(.target==$target)]|sort_by(.name))==($expected|sort_by(.name)) and
+            ([$r.inputs[]|select(.target==$target)|{name,target}]|sort_by(.name))==($expected|sort_by(.name)) and
+            all($r.inputs[]|select(.target==$target); (has("target_triple")|not) or .target_triple==$triple) and
             all($r.recipe.artifacts[]|select(.target==$target);
                 has("members") or (.archive_format|raw)))' >/dev/null || {
         _rf_log 'Packaging recipe differs from the producer target/asset contract'; return 4;
