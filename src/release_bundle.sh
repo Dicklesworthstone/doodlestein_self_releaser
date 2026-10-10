@@ -120,6 +120,13 @@ _rb_shard_manifest() {
         def matches_asset($required; $actual):
             ($required|{name,target,archive_format})==($actual|{name,target,archive_format}) and
             (if $required|has("target_triple") then $required.target_triple==$actual.target_triple else true end);
+        def compiled_environment:
+            .method=="native" or
+            (.method=="pinned-cargo-xwin" and
+             ((.target=="windows/amd64" and .target_triple=="x86_64-pc-windows-msvc") or
+              (.target=="windows/arm64" and .target_triple=="aarch64-pc-windows-msvc")) and
+             .toolchain.target==.target_triple and .toolchain.inputs.target==.target_triple and
+             (.target as $t | [$p.required_variants[]|select(.target==$t)]|length)==1);
         .tool==$p.tool and ("v"+(.version|ltrimstr("v")))==$p.tag and .source.git_sha==$p.source_sha and
         (.source.repository==null or .source.repository==$p.repo or .source.repository==("https://github.com/"+$p.repo)) and
         (if has("build_purpose") then .build_purpose=="release" else true end) and
@@ -131,7 +138,7 @@ _rb_shard_manifest() {
         # artifact names and success counts cannot invent missing receipts.
         (if $p|has("required_variants") then
             ([.artifacts[]|{target,target_triple}]|unique|sort_by(.target,.target_triple))==$input.variants and
-            (.build_environments|type=="array" and all(.[];.method=="native")) and
+            (.build_environments|type=="array" and all(.[];compiled_environment)) and
             ([.build_environments[]|{target,target_triple}]|sort_by(.target,.target_triple))==$input.variants and
             .summary.total==($input.variants|length)
          else true end) and

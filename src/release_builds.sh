@@ -129,12 +129,28 @@ def targets(value):
             and len(set(value)) == len(value), "invalid or duplicate targets", 4)
     return sorted(value)
 
+def variants(value, matrix):
+    require(isinstance(value, list) and 1 <= len(value) <= 256,
+            "expected 1..256 compiler variants", 4)
+    for item in value:
+        require(isinstance(item, dict) and set(item) == {"target", "target_triple"} and
+                isinstance(item["target"], str) and item["target"] in matrix and
+                name(item["target_triple"]) and len(item["target_triple"]) <= 128,
+                "invalid compiler variant", 4)
+    identities = {(v["target"], v["target_triple"]) for v in value}
+    require(len(identities) == len(value) and sorted({v["target"] for v in value}) == matrix,
+            "compiler variants must uniquely cover their routing platforms", 4)
+    return sorted(value, key=lambda v: (v["target"], v["target_triple"]))
+
 def asset_contract(value, matrix):
     require(isinstance(value, list) and 1 <= len(value) <= 256, "expected 1..256 required assets", 4)
     for asset in value:
-        require(isinstance(asset, dict) and set(asset) == {"name", "target", "archive_format"} and
+        require(isinstance(asset, dict) and set(asset) - {"target_triple"} == {"name", "target", "archive_format"} and
                 name(asset["name"]) and len(asset["name"]) <= 128 and asset["target"] in matrix and
                 asset["archive_format"] in ("tar.gz", "tar.xz", "zip", "binary", "none"), "invalid required asset", 4)
+        if "target_triple" in asset:
+            require(name(asset["target_triple"]) and len(asset["target_triple"]) <= 128,
+                    "invalid required asset compiler target", 4)
     require(len({a["name"].casefold() for a in value}) == len(value) and
             sorted({a["target"] for a in value}) == matrix, "required assets must uniquely cover every target", 4)
     return sorted(value, key=lambda a: a["name"])
@@ -152,19 +168,34 @@ def xwin_assets(job):
 
 def validate(value):
     required = {"schema_version", "repo", "tool", "tag", "source_sha", "required_targets", "builds"}
-    require(isinstance(value, dict) and required <= set(value) <= required | {"required_assets"} and type(value["schema_version"]) is int and
+    require(isinstance(value, dict) and required <= set(value) <= required | {"required_assets", "required_variants"} and type(value["schema_version"]) is int and
             value["schema_version"] == 1, "invalid build-plan schema", 4)
     require(name(value["tool"]) and matches(value["repo"], r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and
             ".." not in value["repo"] and matches(value["tag"], r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
             matches(value["source_sha"], r"[0-9a-f]{40}") and value["source_sha"] != "0" * 40, "invalid release identity", 4)
     value["required_targets"] = targets(value["required_targets"])
+    explicit_variants = "required_variants" in value
+    if explicit_variants:
+        value["required_variants"] = variants(value["required_variants"], value["required_targets"])
     if "required_assets" in value:
         value["required_assets"] = asset_contract(value["required_assets"], value["required_targets"])
+        if explicit_variants:
+            require(all({"target": a["target"], "target_triple": a["target_triple"]} in value["required_variants"]
+                        for a in value["required_assets"] if "target_triple" in a),
+                    "required asset compiler is outside the selected variant matrix", 4)
     require(isinstance(value["builds"], list) and 1 <= len(value["builds"]) <= 32, "expected 1..32 build jobs", 4)
-    ids, matrix = [], []
+    ids, matrix, compiler_matrix = [], [], []
     for job in value["builds"]:
         require(isinstance(job, dict) and {"id", "driver", "targets"} <= set(job) and name(job["id"]), "invalid job identity", 4)
         base = {"id", "driver", "targets", "timeout"}
+        job["targets"] = targets(job["targets"])
+        if explicit_variants:
+            require("variants" in job, "every job needs variants in an explicit compiler matrix", 4)
+            job["variants"] = variants(job["variants"], job["targets"])
+            compiler_matrix += job["variants"]
+            base.add("variants")
+        else:
+            require("variants" not in job, "job variants require required_variants", 4)
         kind = job["driver"]
         if kind == "dsr":
             require({"config_dir", "config_files"} <= set(job) and set(job) <= base | {"config_dir", "config_files", "jobs", "resume"}, "invalid native job", 4)
@@ -190,6 +221,11 @@ def validate(value):
                 job["binaries"] = sorted(binaries)
             require(job["targets"] in (["windows/amd64"], ["windows/arm64"]),
                     "xwin requires exactly one Windows AMD64 or ARM64 target", 4)
+            if explicit_variants:
+                expected_variant = [{"target": job["targets"][0], "target_triple": xwin_target(job)}]
+                require(job["variants"] == expected_variant and
+                        [v for v in value["required_variants"] if v["target"] == job["targets"][0]] == expected_variant,
+                        "pinned xwin requires its sole MSVC variant on the selected platform", 4)
             for key in ("cargo_cache", "cache_dir"):
                 if key in job:
                     path(job[key])
@@ -210,7 +246,9 @@ def validate(value):
                 require(len(binaries) == 1 and name(job["asset_name"]) and job["asset_name"].endswith(".exe"),
                         "asset_name can rename only one executable", 4)
             if "required_assets" in value:
-                require([a for a in value["required_assets"] if a["target"] == job["targets"][0]] == xwin_assets(job),
+                expected_assets = [a for a in value["required_assets"] if a["target"] == job["targets"][0]]
+                require([{k: a[k] for k in ("name", "target", "archive_format")} for a in expected_assets] == xwin_assets(job) and
+                        all(a.get("target_triple", xwin_target(job)) == xwin_target(job) for a in expected_assets),
                         "required assets disagree with the xwin executable selection", 4)
             if "siblings" in job:
                 sibling = job["siblings"]
@@ -219,7 +257,7 @@ def validate(value):
             job.setdefault("offline", False)
             require(type(job["offline"]) is bool, "offline must be boolean", 4)
         elif kind == "import":
-            require(set(job) == {"id", "driver", "targets", "manifest", "manifest_sha256", "artifacts_dir"} and sha(job["manifest_sha256"]), "invalid imported job", 4)
+            require(set(job) == (base - {"timeout"}) | {"manifest", "manifest_sha256", "artifacts_dir"} and sha(job["manifest_sha256"]), "invalid imported job", 4)
             path(job["manifest"]); path(job["artifacts_dir"])
         else:
             raise Failure("unknown build driver", 4)
@@ -228,7 +266,12 @@ def validate(value):
             require(integer(job["timeout"], 1, 86400), "timeout must be 1..86400 seconds", 4)
         job["targets"] = targets(job["targets"])
         ids.append(job["id"].casefold()); matrix += job["targets"]
-    require(len(set(ids)) == len(ids) and sorted(matrix) == value["required_targets"], "jobs must partition the entire required target matrix", 4)
+    require(len(set(ids)) == len(ids), "duplicate build job identity", 4)
+    if explicit_variants:
+        require(sorted(compiler_matrix, key=lambda v: (v["target"], v["target_triple"])) == value["required_variants"],
+                "jobs must partition the entire required compiler matrix", 4)
+    else:
+        require(sorted(matrix) == value["required_targets"], "jobs must partition the entire required target matrix", 4)
     value["builds"].sort(key=lambda j: j["id"])
     return value
 
@@ -345,8 +388,11 @@ def helper(operation, entry, destination, directory):
     require(code == 0, "manifest/payload admission failed; see " + str(directory / "admission.log"), 7)
 
 def selected(job, manifest, artifacts, pin=None):
-    return {"id": job["id"], "targets": job["targets"], "manifest": str(manifest),
-            "manifest_sha256": pin or digest(manifest), "artifacts_dir": str(artifacts)}
+    entry = {"id": job["id"], "targets": job["targets"], "manifest": str(manifest),
+             "manifest_sha256": pin or digest(manifest), "artifacts_dir": str(artifacts)}
+    if "variants" in job:
+        entry["variants"] = job["variants"]
+    return entry
 
 def copy_pin(source, target, pin):
     require(digest(source) == pin, "configured build input hash mismatch: " + str(source))
@@ -774,6 +820,8 @@ try:
         if destination.exists() or destination.is_symlink():
             require(isinstance(entry, dict) and record["attempts"] and entry.get("id") == job["id"] and entry.get("targets") == job["targets"] and
                     sha(entry.get("manifest_sha256")), "unbound completed build", 2)
+            require(("variants" in entry) == ("variants" in job) and entry.get("variants") == job.get("variants"),
+                    "completed build compiler selection changed", 2)
             with tempfile.TemporaryDirectory(prefix=".verify-", dir=root) as temporary:
                 helper("_rb_verify_shard", entry, destination, Path(temporary))
             record["complete"], record["candidate"] = entry, None
@@ -823,6 +871,8 @@ try:
         collection = {key: plan[key] for key in ("schema_version", "repo", "tool", "tag", "source_sha", "required_targets")}
         if "required_assets" in plan:
             collection["required_assets"] = plan["required_assets"]
+        if "required_variants" in plan:
+            collection["required_variants"] = plan["required_variants"]
         collection["builds"] = [selected(j, root / "completed" / j["id"] / "build-manifest.json", root / "completed" / j["id"] / "artifacts",
                                           state["jobs"][j["id"]]["complete"]["manifest_sha256"]) for j in plan["builds"]]
         if (root / "build-set.json").exists():
