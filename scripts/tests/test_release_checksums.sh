@@ -190,11 +190,11 @@ run('invalid authentication header encoding', {}, 3, env_changes={'GH_TOKEN':'ba
 
 # Mutate only owned fake server inputs, rebind API size/digest, and then run
 # the unchanged real CLI. Thus parser negatives cannot hide behind API hashes.
-def special(label, mutate, expected=4, extra=()):
+def special(label, mutate, expected=4, extra=(), count=5):
     global sequence
     sequence += 1
     directory = work / ('special-%03d' % sequence)
-    spec = fixture(directory)
+    spec = fixture(directory, count=count)
     mutate(directory, spec)
     save(directory / 'fixture.json', spec)
     env = dict(os.environ, PATH=str(bin_dir)+os.pathsep+os.environ['PATH'], DSR_AUDIT_FIXTURE=str(directory), GH_TOKEN='owned_test_token')
@@ -204,6 +204,13 @@ def special(label, mutate, expected=4, extra=()):
     check(label + ': exit', proc.returncode == expected)
     result = json.loads(proc.stdout)
     check(label + ': truthful status', result['exit_code'] == expected and result['status'] == ('verified' if expected == 0 else 'error'))
+    if expected == 0:
+        check(label + ': exact complete export', result['verified_count'] == result['eligible_count'] > 0 and
+              result['eligible_assets'] == result['verified_checksums'] and
+              len(Path(result['normalized_manifest']).read_text().splitlines()) == result['verified_count'])
+    else:
+        check(label + ': no successful export', 'normalized_manifest' not in result and
+              not (directory / 'audit/checksums.normalized').exists())
     return directory, result
 
 def body(directory, spec, data):
@@ -446,5 +453,120 @@ try:
 finally:
     if proc.poll() is None:
         proc.terminate(); proc.communicate(timeout=15)
+# Explicit complete sidecar policy. The server fixture retains its original
+# body files when an inventory entry is withheld; no release bytes are deleted.
+def sidecar_fixture(d, s, *, aggregate=False, style='named', metadata=False):
+    payloads = [a for a in s['assets'] if a['name'].endswith('.tar.gz')]
+    if metadata:
+        payloads += [a for a in s['assets'] if a['name'].endswith(('.intoto.jsonl', '.spdx.json', '-manifest.json'))]
+    for index, row in enumerate(payloads):
+        checksum = sha((d / 'bodies' / str(row['id'])).read_bytes())
+        name = row['name'] + '.sha256'
+        existing = next((a for a in s['assets'] if a['name'] == name), None)
+        identity = existing['id'] if existing else max(a['id'] for a in s['assets']) + 1
+        if style == 'bare':
+            data = checksum.upper().encode() + (b'\r\n' if index % 2 else b'')
+        elif style == 'portable':
+            data = ('# SHA256 for this payload\r\n' + checksum.upper() + ' *./' + row['name']).encode()
+        else:
+            data = (checksum + '  ' + row['name'] + '\n').encode()
+        (d / 'bodies' / str(identity)).write_bytes(data)
+        record = dict(id=identity, name=name, size=len(data), state='uploaded', digest='sha256:' + sha(data))
+        if existing:
+            existing.update(record)
+        else:
+            s['assets'].append(record)
+    if not aggregate:
+        s['assets'] = [a for a in s['assets'] if a['name'] != 'SHA256SUMS']
+
+sidecar_args = ('--checksum-mode', 'sidecars')
+for style in ('named', 'bare', 'portable'):
+    d, result = special('complete ' + style + ' sidecars', lambda d,s:sidecar_fixture(d,s,style=style),
+                        0, extra=sidecar_args)
+    evidence = result['checksum_assets']
+    check(style + ': each verified payload owns one exact sidecar', result['checksum_mode'] == 'sidecars' and
+          len(evidence) == result['verified_count'] == 5 and
+          sorted(a['payload'] for a in evidence) == result['verified_checksums'] and
+          all(a['scope'] == 'sidecar' and a['name'] == a['payload'] + '.sha256' for a in evidence))
+    check(style + ': original sidecar evidence is retained and hash-pinned',
+          all(sha(Path(a['path']).read_bytes()) == a['sha256'] for a in evidence))
+
+special('sidecars do not silently replace the default aggregate policy', sidecar_fixture, 1)
+special('explicit sidecar mode cannot select an aggregate override', sidecar_fixture, 4,
+        extra=(*sidecar_args, '--checksum-asset', 'app-000.tar.gz.sha256'))
+special('unknown checksum mode is refused', sidecar_fixture, 4, extra=('--checksum-mode', 'auto'))
+d, result = special('sidecar inventory spans more than one hundred records', sidecar_fixture, 0,
+                    extra=sidecar_args, count=101)
+check('all 101 payloads and 101 sidecars are actually acquired', result['verified_count'] == 101 and
+      len(result['checksum_assets']) == 101 and
+      sum(json.loads(line)['binary'] for line in (d / 'trace.jsonl').read_text().splitlines()) == 202)
+
+def change_sidecar(d, s, data):
+    sidecar_fixture(d, s)
+    row = next(a for a in s['assets'] if a['name'] == 'app-004.tar.gz.sha256')
+    (d / 'bodies' / str(row['id'])).write_bytes(data)
+    row.update(size=len(data), digest='sha256:' + sha(data))
+
+for label, data in (
+    ('empty sidecar', b''), ('HTML sidecar', b'<html>not evidence</html>'),
+    ('NUL sidecar', b'a' * 64 + b'\0'), ('wrong named sibling', b'a' * 64 + b'  app-003.tar.gz\n'),
+    ('ambiguous multi-member sidecar', b'a' * 64 + b'  app-004.tar.gz\n' + b'b' * 64 + b'  app-003.tar.gz\n'),
+    ('duplicate sidecar record', (b'a' * 64 + b'  app-004.tar.gz\n') * 2),
+    ('unsafe sidecar member', b'a' * 64 + b'  ../app-004.tar.gz\n'),
+    ('digest-only trailing data', b'a' * 64 + b'\nextra\n'),
+):
+    special(label, lambda d,s,data=data:change_sidecar(d,s,data), 4, extra=sidecar_args)
+
+def absent_sidecar(d,s):
+    sidecar_fixture(d,s)
+    s['assets'] = [a for a in s['assets'] if a['name'] != 'app-004.tar.gz.sha256']
+d, result = special('one missing sidecar forbids partial coverage', absent_sidecar, 1, extra=sidecar_args)
+check('missing sidecar reports exact uncovered payload without downloading a partial set', result['verified_count'] == 0 and
+      result['coverage_errors'] == [dict(kind='missing-sidecar', assets=[dict(name='app-004.tar.gz', sidecar='app-004.tar.gz.sha256')])] and
+      not any(json.loads(line)['binary'] for line in (d / 'trace.jsonl').read_text().splitlines()))
+
+def sidecar_corrupt_payload(d,s):
+    sidecar_fixture(d,s)
+    corrupt_last_payload(d,s)
+d, result = special('fifth payload contradicts sidecar despite matching API digest', sidecar_corrupt_payload, 1, extra=sidecar_args)
+check('sidecar mode never stops after a three-file spot check', result['verified_count'] == 4 and
+      result['checksum_errors'][0]['name'] == 'app-004.tar.gz')
+
+def fail_sidecar_download(d,s):
+    sidecar_fixture(d,s)
+    s['aggregate_id'] = next(a['id'] for a in s['assets'] if a['name'] == 'app-004.tar.gz.sha256')
+    s['mode'] = 'aggregate-failure'
+special('failed sidecar acquisition is terminal', fail_sidecar_download, 8, extra=sidecar_args)
+
+def sidecars_and_aggregate(d,s,invalid=False):
+    sidecar_fixture(d,s,aggregate=True)
+    if invalid:
+        body(d,s,b'0' * 64 + (d/'bodies'/'6').read_bytes()[64:])
+d, result = special('sidecars and present aggregate must both verify', sidecars_and_aggregate, 0, extra=sidecar_args)
+check('receipt distinguishes per-payload and aggregate evidence',
+      len([a for a in result['checksum_assets'] if a['scope'] == 'sidecar']) == 5 and
+      len([a for a in result['checksum_assets'] if a['scope'] == 'aggregate']) == 1)
+special('sidecar mode rejects a conflicting conventional aggregate',
+        lambda d,s:sidecars_and_aggregate(d,s,True), 1, extra=sidecar_args)
+def malformed_present_aggregate(d,s):
+    sidecar_fixture(d,s,aggregate=True)
+    body(d,s,b'<html>error</html>')
+special('sidecar mode cannot fall back after malformed aggregate', malformed_present_aggregate, 4, extra=sidecar_args)
+special('metadata policy also requires every metadata sidecar', sidecar_fixture, 1,
+        extra=(*sidecar_args, '--include-metadata'))
+d, result = special('metadata sidecars extend actual verified coverage', lambda d,s:sidecar_fixture(d,s,metadata=True),
+                    0, extra=(*sidecar_args, '--include-metadata'))
+check('eight metadata-aware payloads have eight independent sidecar bindings', result['verified_count'] == 8 and
+      len(result['checksum_assets']) == 8)
+def spaced_sidecars(d,s):
+    spaced_member(d,s)
+    sidecar_fixture(d,s)
+d, result = special('sidecar binding preserves spaces and plus signs', spaced_sidecars, 0, extra=sidecar_args)
+check('spaced payload has its exact sidecar rather than a tokenized name',
+      any(a.get('payload') == 'payload with spaces + plus.tar.gz' and
+          a['name'] == 'payload with spaces + plus.tar.gz.sha256' for a in result['checksum_assets']))
+special('sidecar byte budgets include every proof', sidecar_fixture, 4,
+        extra=(*sidecar_args, '--max-total-bytes', '100'))
+
 print('Results: %d passed, 0 failed\nEvidence: %s' % (passed,work),flush=True)
 PY

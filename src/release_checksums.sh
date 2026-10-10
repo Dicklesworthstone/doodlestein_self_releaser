@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only, complete SHA256 coverage for GitHub release payloads. Checksums
 # downloaded from a release are integrity evidence, NOT authenticated provenance.
-# Reuses checksum_sync.sh's strict aggregate parser; never executes an asset.
+# Reuses checksum_sync.sh's strict record parser; never executes an asset.
 _RELEASE_CHECKSUMS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 _release_checksums_execute() {
@@ -208,10 +208,16 @@ def download_asset(row, directory, maximum):
             'Downloaded digest differs from release metadata: ' + row['name'])
     return destination, value
 
-def normalized_checksums(path, index):
-    code, stdout, _ = run(['bash', '-c', 'source "$1/checksum_sync.sh" || exit $?; checksum_manifest_normalize "$2"',
-                           '_', str(module), str(path)], limit=args.timeout)
-    require(code == 0, 'Checksum aggregate is empty, malformed, unsafe, or ambiguous', 4)
+def normalized_checksums(path, index, member=None):
+    # A digest-only sidecar has no embedded name: its exact inventory basename
+    # binds it to the selected payload. Never allow that grammar for aggregates.
+    raw = path.read_bytes() if member is not None else b''
+    if member is not None and re.fullmatch(rb'[0-9a-fA-F]{64}(?:\r?\n)?', raw):
+        stdout = raw[:64].lower() + b'  ' + member.encode('utf-8') + b'\n'
+    else:
+        code, stdout, _ = run(['bash', '-c', 'source "$1/checksum_sync.sh" || exit $?; checksum_manifest_normalize "$2"',
+                               '_', str(module), str(path)], limit=args.timeout)
+        require(code == 0, 'Checksum evidence is empty, malformed, unsafe, or ambiguous', 4)
     normalized = work / 'evidence' / ('checksums-%03d.normalized' % index)
     with normalized.open('xb') as stream:
         stream.write(stdout)
@@ -220,7 +226,9 @@ def normalized_checksums(path, index):
         name, checksum = line[66:], line[:64]
         require(safe_name(name), 'Release checksum entries must use flat asset names', 4)
         rows[name] = checksum
-    require(rows, 'Checksum aggregate has no records', 4)
+    require(rows, 'Checksum evidence has no records', 4)
+    require(member is None or set(rows) == {member},
+            'Checksum sidecar must contain exactly its own payload record', 4)
     return rows
 
 def owned_output(selected):
@@ -241,12 +249,14 @@ try:
     class Parser(argparse.ArgumentParser):
         def error(self, message):
             raise Failure(message, 4)
-    parser = Parser(description='Verify every eligible GitHub release asset against a complete SHA256 aggregate. No writes to GitHub.',
+    parser = Parser(description='Verify every eligible GitHub release asset against complete SHA256 evidence. No writes to GitHub.',
         epilog='Downloaded checksums do not authenticate the publisher or source. Signature/provenance verification is separate.',
         allow_abbrev=False)
     parser.add_argument('--repo', required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--checksum-asset', help='Exact aggregate name; default: a conventional aggregate, never a payload sidecar')
+    parser.add_argument('--checksum-mode', choices=('aggregate', 'sidecars'), default='aggregate',
+                        help='aggregate (default), or require an exact .sha256 sidecar for every payload; present conventional aggregates must also agree')
     parser.add_argument('--output-dir', help='New directory for retained downloads and the audit receipt')
     parser.add_argument('--include-metadata', action='store_true', help='Also require checksums for SBOM/provenance/build metadata (not signatures or checksums)')
     parser.add_argument('--timeout', type=int, default=120, help='Seconds per bounded network/parser operation (default: 120)')
@@ -260,6 +270,8 @@ try:
     require(re.fullmatch(r'v?[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?', args.tag) is not None,
             'Select an explicit version tag, not latest or a branch', 4)
     require(args.checksum_asset is None or safe_name(args.checksum_asset), 'Unsafe checksum aggregate name', 4)
+    require(args.checksum_mode == 'aggregate' or args.checksum_asset is None,
+            '--checksum-asset cannot override the complete sidecar selection', 4)
     require(integer(args.timeout, 1, 3600) and integer(args.max_asset_bytes, 1) and integer(args.max_total_bytes, 1),
             'Invalid acquisition limit', 4)
     require(shutil.which('curl') and shutil.which('bash'), 'curl and Bash are required', 3)
@@ -269,7 +281,8 @@ try:
     os.umask(0o077)
     work = owned_output(args.output_dir)
     (work / 'requests').mkdir(); (work / 'artifacts').mkdir(); (work / 'evidence').mkdir()
-    report.update(repository=args.repo, tag=args.tag, output_dir=str(work), include_metadata=args.include_metadata)
+    report.update(repository=args.repo, tag=args.tag, output_dir=str(work), include_metadata=args.include_metadata,
+                  checksum_mode=args.checksum_mode)
     context = release_context()
     report['release'] = context
     assets = inventory(context['id'])
@@ -287,16 +300,42 @@ try:
     report['eligible_assets'] = [row['name'] for row in eligible]
     report['eligible_count'] = len(eligible)
     require(eligible, 'Release has no eligible payloads; no checksum coverage can be claimed')
-    require(checksum_name in by_name, 'No unambiguous checksum aggregate is available')
-    require(sum(row['size'] for row in eligible) + sum(by_name[name]['size'] for name in checksum_names) <= args.max_total_bytes,
+    # Explicit sidecar mode is a complete, filename-bound policy, not fallback
+    # after a failed aggregate. Retain every conventional aggregate as an
+    # additional constraint when present, including malformed/conflicting ones.
+    sidecars = []
+    if args.checksum_mode == 'sidecars':
+        missing_sidecars = []
+        for row in eligible:
+            name = row['name'] + '.sha256'
+            require(safe_name(name), 'Payload name cannot have a safe .sha256 sidecar: ' + row['name'], 4)
+            if name not in by_name:
+                missing_sidecars.append(dict(name=row['name'], sidecar=name))
+            else:
+                sidecars.append((name, row['name']))
+        if missing_sidecars:
+            report['coverage_errors'].append(dict(kind='missing-sidecar', assets=missing_sidecars))
+        require(not missing_sidecars, 'Release lacks a SHA256 sidecar for every eligible payload')
+    else:
+        require(checksum_name in by_name, 'No unambiguous checksum aggregate is available')
+    selected_evidence = sidecars + [(name, None) for name in checksum_names]
+    require(len({name for name, _ in selected_evidence}) == len(selected_evidence),
+            'Checksum evidence cannot act as both an aggregate and a payload sidecar', 4)
+    require(sum(row['size'] for row in eligible) + sum(by_name[name]['size'] for name, _ in selected_evidence) <= args.max_total_bytes,
             'Release audit exceeds the configured total download limit', 4)
     expected, checksum_evidence = {}, []
-    for index, name in enumerate(checksum_names, 1):
+    for index, (name, member) in enumerate(selected_evidence, 1):
         checksum_path, checksum_digest = download_asset(by_name[name], work / 'evidence', MAX_METADATA)
-        evidence = dict(name=name, id=by_name[name]['id'], sha256=checksum_digest, path=str(checksum_path))
+        evidence = dict(name=name, id=by_name[name]['id'], sha256=checksum_digest, path=str(checksum_path),
+                        scope='sidecar' if member is not None else 'aggregate')
+        if member is not None:
+            evidence['payload'] = member
         checksum_evidence.append(evidence)
         report['checksum_assets'] = checksum_evidence
-        rows = normalized_checksums(checksum_path, index)
+        rows = normalized_checksums(checksum_path, index, member)
+        if member is not None:
+            expected[member] = rows[member]
+            continue
         missing = [row['name'] for row in eligible if row['name'] not in rows]
         foreign = sorted(set(rows) - set(by_name))
         if missing:
@@ -307,7 +346,8 @@ try:
         if expected and selected != expected:
             report['coverage_errors'].append(dict(kind='conflicting-aggregate', aggregate=name))
         expected = selected
-    require(not report['coverage_errors'], 'Checksum aggregate does not cover the selected release inventory')
+    require(not report['coverage_errors'] and set(expected) == set(report['eligible_assets']),
+            'Checksum evidence does not cover the selected release inventory')
     for row in eligible:
         try:
             _, actual = download_asset(row, work / 'artifacts', args.max_asset_bytes)

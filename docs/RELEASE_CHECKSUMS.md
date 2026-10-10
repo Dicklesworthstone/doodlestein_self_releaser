@@ -109,6 +109,45 @@ The older `dsr release verify --checksums` path has not yet been routed through
 this auditor. Do not infer that its historical spot-check result now provides
 these full-coverage guarantees. This entry point is the explicit full audit.
 
+## Releases with per-payload SHA256 sidecars
+
+Select sidecar coverage explicitly for releases that publish `NAME.sha256`
+beside each payload rather than a global checksum aggregate:
+
+```bash
+bash src/release_checksums.sh --repo owner/tool --tag v1.2.3 \
+  --checksum-mode sidecars --output-dir /srv/audits/tool-v1.2.3-sidecars
+```
+
+Every eligible payload must have its own exact, case-sensitive
+`<payload-name>.sha256` asset. Missing even one sidecar fails the complete audit;
+the presence of some sidecars does not authorize partial coverage. Asset IDs,
+advertised sizes, available API digests, actual payload hashes, pagination,
+inventory stability and retained-byte rechecks are enforced as in aggregate
+mode. Sidecar bytes count against the total download budget.
+
+A sidecar may contain exactly one standard SHA256 record naming its payload, or
+one bare 64-digit hexadecimal digest with an optional LF/CRLF terminator. The
+bare form is bound by the exact sidecar filename, not guessed from a digest or
+the order of records. Named records use the existing strict parser, including
+its duplicate/path checks. A different payload name, multiple records, NULs,
+HTML, or malformed content is an error. Bare hashes are never accepted as
+global aggregates. Aliases need their own sidecars even when their bytes match.
+
+This mode is not an automatic fallback: the default remains `aggregate`, and
+`--checksum-asset` cannot be combined with `--checksum-mode sidecars`. When a
+sidecar-mode release also contains conventional aggregates, each must be valid,
+complete and consistent with the sidecars. A failed or contradictory aggregate
+cannot be bypassed by choosing sidecar mode. `--include-metadata` requires
+sidecars for the added metadata payloads too; signatures and checksum files do
+not acquire recursive checksum requirements.
+
+Receipts include `checksum_mode` and mark each selected checksum asset's `scope`
+as `sidecar` or `aggregate`. Sidecar evidence additionally names its exact
+`payload`. The exported normalized manifest contains only actually verified
+payloads; sidecar bytes and unchecked metadata are not exported as payload
+checksums. This remains byte-integrity evidence, not publisher authentication.
+
 ## Audit before downstream checksum sync
 
 The existing checksum module exposes the full audit directly:
