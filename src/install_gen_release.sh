@@ -212,6 +212,12 @@ try:
                    "--sha", policy["source_sha"], "--builder", policy["builder"], "--targets", ",".join(policy["targets"]),
                    "--timeout", str(args.timeout)]
         command += ["--snapshot", args.snapshot] if args.snapshot is not None else ["--fetch"]
+        if "release_contract" in policy:
+            # This is fixed publisher-selected policy, never read from the
+            # downloaded snapshot and never overridable by a runtime option.
+            contract = work / "release-contract.json"
+            contract.write_text(json.dumps(policy["release_contract"], sort_keys=True) + "\n")
+            command += ["--release-contract", str(contract)]
         for key in ("statement_sha256", "manifest_sha256", "invocation_id"):
             if key in policy:
                 command += ["--" + key.replace("_", "-"), policy[key]]
@@ -280,7 +286,7 @@ try:
                       parse_constant=lambda s: (_ for _ in ()).throw(Failure("non-finite JSON number")))
     required = {"schema_version", "repo", "tag", "source_sha", "builder", "targets", "recipes"}
     optional = {"statement_sha256", "manifest_sha256", "invocation_id"}
-    need(isinstance(value, dict) and required <= set(value) <= required | optional and
+    need(isinstance(value, dict) and required <= set(value) <= required | optional | {"release_contract"} and
          type(value["schema_version"]) is int and value["schema_version"] == 1, "invalid installer policy")
     need(matches(value["repo"], r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and ".." not in value["repo"] and
          matches(value["tag"], r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
@@ -306,10 +312,28 @@ try:
             (work / name).chmod(0o400)
         normalized = []
         env = {k: v for k, v in os.environ.items() if not k.startswith("BASH_FUNC_") and k not in ("BASH_ENV", "ENV")}
+        contract_args = []
+        if "release_contract" in value:
+            contract = work / "release-contract.json"
+            contract.write_bytes(canonical(value["release_contract"]))
+            child = subprocess.Popen(["bash", str(work / "slsa_remote.sh"), "describe-contract",
+                "--release-contract", str(contract), "--targets", ",".join(value["targets"])],
+                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            response, diagnostics = child.communicate(timeout=30)
+            need(child.returncode == 0, "invalid independent release contract", child.returncode if 0 < child.returncode < 256 else 7)
+            record = json.loads(response, object_pairs_hook=pairs)
+            need(record.get("kind") == "dsr-slsa-release-contract" and record.get("authenticated") is False and
+                 isinstance(record.get("contract"), dict) and
+                 record.get("input_sha256") == hashlib.sha256(contract.read_bytes()).hexdigest() and
+                 record.get("contract_sha256") == hashlib.sha256(canonical(record["contract"])).hexdigest(),
+                 "invalid content contract validation result", 7)
+            child = None
+            value["release_contract"] = record["contract"]
+            contract_args = ["--release-contract", str(contract), "--targets", ",".join(value["targets"])]
         for i, item in enumerate(value["recipes"]):
             file = work / ("recipe-%d.json" % i)
             file.write_bytes(canonical(item))
-            child = subprocess.Popen(["bash", str(work / "release_install.sh"), "describe-recipe", "--recipe", str(file)],
+            child = subprocess.Popen(["bash", str(work / "release_install.sh"), "describe-recipe", "--recipe", str(file), *contract_args],
                                      env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             response, diagnostics = child.communicate(timeout=30)
             need(child.returncode == 0, "invalid installation recipe", child.returncode if 0 < child.returncode < 256 else 7)

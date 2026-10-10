@@ -83,7 +83,7 @@ if fixture:
     script = bin_dir / "minisign"
     script.write_text('''#!/usr/bin/env python3
 # Explicit TEST-ONLY stand-in, not an implementation of Minisign cryptography.
-import hashlib, pathlib, sys
+import hashlib, os, pathlib, sys
 args = sys.argv[1:]
 try:
     assert "-V" in args
@@ -92,6 +92,8 @@ try:
     sig = pathlib.Path(args[args.index("-x") + 1])
     expected = "TEST-ONLY:" + token + ":" + hashlib.sha256(proof.read_bytes()).hexdigest() + "\\n"
     assert sig.read_text() == expected
+    if os.environ.get("DSR_INSTALL_CONTRACT_MUTATE"):
+        pathlib.Path(os.environ["DSR_INSTALL_CONTRACT_MUTATE"]).write_text('{"changed":true}\\n')
 except (AssertionError, ValueError, IndexError, OSError):
     sys.exit(1)
 ''')
@@ -455,6 +457,206 @@ for mutation in ("duplicate-compiler", "implicit-and-explicit", "duplicate-impli
         bad["recipes"] = [recipe_for(0, "compiler-%d" % i) for i in range(65)]
     generate("bad-generated-" + mutation, bad, expected=4)
     check(mutation + " leaves no persistent generator lock", not (work / ("bad-generated-" + mutation + "-install.sh.lock")).exists())
+
+
+# Independent content policy must survive installation, not just a standalone
+# verifier call. All recipe-selected GNU files can exist in a signed release
+# that silently omitted the musl half. A platform/recipe check alone accepts it.
+contract = dict(schema_version=1,
+    required_assets=[{k: a[k] for k in ("name", "target", "target_triple", "archive_format")}
+                     for a in load(producer)["artifacts"]],
+    required_variants=load(producer)["required_variants"])
+contract_file = save(work / "install-contract.json", contract)
+descriptor = json.loads(invoke(["bash", runtime / "slsa_remote.sh", "describe-contract", "--release-contract", contract_file,
+                               "--targets", target], label="installation content contract").stdout)
+contract_hash = descriptor["contract_sha256"]
+contract_flags = ("--release-contract", str(contract_file))
+planned, selected_prefix = install("contract-plan", snapshot, recipe_for(0, gnu), extra=(*contract_flags, "--dry-run"))
+check("content-bound plan authenticates without persistent installation state", planned.get("release_contract_sha256") == contract_hash and
+      not selected_prefix.exists() and not Path(str(selected_prefix) + ".lock").exists())
+active, selected_prefix = install("contract-active", snapshot, recipe_for(0, gnu), extra=contract_flags)
+if active.get("status") == "installed":
+    contract_id = active["generation"]
+    current_state = state(selected_prefix)
+    receipt = load(selected_prefix / "generations" / contract_id / "receipt.json")
+    check("generation retains the complete independent contract, not the downloaded receipt",
+          receipt.get("release_contract") == descriptor["contract"] and receipt.get("release_contract_sha256") == contract_hash)
+    check("content policy contributes to generation identity even for identical executable bytes", contract_id != first.get("generation"))
+    reordered_contract = copy.deepcopy(contract)
+    reordered_contract["required_assets"].reverse()
+    reordered_contract["required_variants"].reverse()
+    reordered_file = save(work / "contract-reordered.json", reordered_contract)
+    again, _ = install("contract-retry", snapshot, recipe_for(0, gnu), selected_prefix,
+                       extra=("--release-contract", str(reordered_file)))
+    check("semantically identical contract preserves all installation inodes", again.get("generation") == contract_id and state(selected_prefix) == current_state)
+    install("contract-drop-no-consent", snapshot, recipe_for(0, gnu), selected_prefix, expected=2)
+    check("dropping independent requirements is not an implicit policy update", state(selected_prefix) == current_state)
+    weaker = copy.deepcopy(contract)
+    weaker.pop("required_variants")
+    for asset in weaker["required_assets"]:
+        asset.pop("target_triple")
+    weaker_file = save(work / "contract-weaker.json", weaker)
+    install("contract-change-no-consent", snapshot, recipe_for(0, gnu), selected_prefix, expected=2,
+            extra=("--release-contract", str(weaker_file)))
+    check("changed contract requires explicit replacement", state(selected_prefix) == current_state)
+    replaced, _ = install("contract-change-consented", snapshot, recipe_for(0, gnu), selected_prefix,
+                          extra=("--release-contract", str(weaker_file), "--replace"))
+    check("explicit policy change selects a new generation and retains the old one",
+          replaced.get("generation") != contract_id and replaced.get("previous_generation") == contract_id and
+          (selected_prefix / "generations" / contract_id / "receipt.json").is_file())
+    rolled, _ = install("contract-policy-rollback", snapshot, recipe_for(0, gnu), selected_prefix, extra=(*contract_flags, "--replace"))
+    check("original contract rollback reuses retained generation", rolled.get("generation") == contract_id)
+
+subset = work / "signed-gnu-only"
+shutil.copytree(snapshot, subset)
+statement = load(subset / "release.intoto.jsonl")
+omitted = {a["name"] for a in statement["dsr_evidence"]["artifacts"] if a.get("target_triple") == musl}
+statement["subject"] = [s for s in statement["subject"] if s["name"] not in omitted]
+statement["dsr_evidence"]["artifacts"] = [a for a in statement["dsr_evidence"]["artifacts"] if a["name"] not in omitted]
+retained = work / "omitted-musl-retained"
+retained.mkdir()
+for name in omitted:
+    (subset / "artifacts" / name).rename(retained / name)
+save(subset / "release.intoto.jsonl", statement)
+sign(subset / "release.intoto.jsonl")
+without_contract, _ = install("signed-subset-platform-only", subset, recipe_for(0, gnu))
+check("paired platform-only control actually installs the signed GNU subset", without_contract.get("status") == "installed")
+rejected, rejected_prefix = install("signed-subset-content-bound", subset, recipe_for(0, gnu), expected=7, extra=contract_flags)
+check("missing unselected variant prevents content-bound activation", not rejected_prefix.exists() and not Path(str(rejected_prefix) + ".lock").exists())
+
+for mutation in ("null-contract", "missing-recipe-asset", "recipe-format", "recipe-compiler", "duplicate-json"):
+    bad = copy.deepcopy(contract)
+    if mutation == "null-contract":
+        bad = None
+    elif mutation == "missing-recipe-asset":
+        bad["required_assets"] = [a for a in bad["required_assets"] if a["name"] != "alias-0"]
+    elif mutation == "recipe-format":
+        next(a for a in bad["required_assets"] if a["name"] == "alias-0")["archive_format"] = "zip"
+    elif mutation == "recipe-compiler":
+        next(a for a in bad["required_assets"] if a["name"] == "alias-0")["target_triple"] = musl
+    bad_file = save(work / (mutation + ".json"), bad)
+    if mutation == "duplicate-json":
+        bad_file.write_text('{"schema_version":1,"schema_version":1,"required_assets":[]}\n')
+    rejected, p = install("contract-refuses-" + mutation, snapshot, recipe_for(0, gnu), expected=4,
+                          extra=("--release-contract", str(bad_file)))
+    check(mutation + " stops before installation state", not p.exists())
+
+if fixture:
+    mutable = save(work / "install-mutable-contract.json", contract)
+    env["DSR_INSTALL_CONTRACT_MUTATE"] = str(mutable)
+    try:
+        rejected, p = install("contract-input-drift", snapshot, recipe_for(0, gnu), expected=7,
+                              extra=("--release-contract", str(mutable)))
+        check("original contract drift cannot change the frozen policy or activate", not p.exists())
+    finally:
+        env.pop("DSR_INSTALL_CONTRACT_MUTATE")
+
+contract_policy = dict(copy.deepcopy(matrix_policy), release_contract=contract)
+generation, contract_script = generate("content-bound-generated", contract_policy)
+if generation.get("status") == "generated":
+    inspected = json.loads(invoke(["bash", contract_script, "--inspect"], label="inspect content-bound installer").stdout)
+    check("generated policy embeds the complete normalized independent contract",
+          inspected["policy"].get("release_contract") == descriptor["contract"] and inspected.get("authenticated") is False)
+    script_identity = (digest(contract_script), contract_script.stat().st_ino)
+    canonical_policy = copy.deepcopy(contract_policy)
+    canonical_policy["release_contract"]["required_assets"].reverse()
+    canonical_policy["release_contract"]["required_variants"].reverse()
+    regeneration, _ = generate("contract-order-reuse", canonical_policy, output=contract_script)
+    check("contract ordering preserves exact standalone bytes and inode", regeneration.get("reused") is True and
+          (digest(contract_script), contract_script.stat().st_ino) == script_identity)
+    p = work / "contract-generated-prefix"
+    generated_install("generated-contract-subset-refusal", contract_script, subset, p, ("--target-triple", gnu), 7)
+    check("generated contract rejects signed missing musl despite selecting GNU", not p.exists())
+    installed = generated_install("generated-contract-complete", contract_script, snapshot, p, ("--target-triple", gnu), streamed=True)
+    check("direct and streamed generated installation share the same content-bound identity",
+          installed.get("generation") == active.get("generation") and installed.get("release_contract_sha256") == contract_hash)
+    original = state(p)
+    generated_install("generated-contract-override", contract_script, snapshot, p,
+                      ("--target-triple", gnu, "--release-contract", str(weaker_file)), 4)
+    check("embedded contract is not a runtime override", state(p) == original)
+    runtime.rename(work / "contract-engines-offline")
+    public.rename(work / "contract-key-offline.pub")
+    contract_file.rename(work / "contract-input-offline.json")
+    try:
+        detached = generated_install("generated-contract-detached", contract_script, snapshot, p, ("--target-triple", gnu))
+        check("standalone content policy needs no original contract, key or engine path", detached.get("generation") == installed.get("generation") and state(p) == original)
+    finally:
+        (work / "contract-engines-offline").rename(runtime)
+        (work / "contract-key-offline.pub").rename(public)
+        (work / "contract-input-offline.json").rename(contract_file)
+    generated_install("generated-contract-byte-refusal", contract_script, broken, p, ("--target-triple", gnu, "--replace"), 1)
+    check("content selection retains full payload verification", state(p) == original)
+
+# Exercise online installation with the real fetch/local reauthentication
+# pipeline. Only API observation/acquisition use local-file callbacks; every
+# document/policy/payload/snapshot operation in slsa_remote remains production.
+online_runtime = work / "online-runtime"
+shutil.copytree(runtime, online_runtime)
+(online_runtime / "sbom_release.sh").write_text('''#!/usr/bin/env bash
+# Explicit TEST-ONLY API/transport boundary; not a production online module.
+_sbr_require() { :; }
+_sbr_run() { "$@"; }
+_sbr_context() { cat "$DSR_INSTALL_REMOTE_CASE/context.json"; }
+_sbr_inventory() { cat "$DSR_INSTALL_REMOTE_CASE/inventory.json"; }
+_sbr_named_asset() { jq -ce --arg n "$2" '[.[]|select(.name==$n)]|if length==1 then .[0] else error("ambiguous asset") end' <<< "$1"; }
+_sbr_payload_names() { jq -c '[.[]|select(.name!="release.intoto.jsonl" and .name!="release.intoto.jsonl.minisig")|.name]|sort' <<< "$1"; }
+_sbr_asset_digest() { [[ "$(jq -r .digest <<< "$1")" == "sha256:$2" ]]; }
+gh_download_release_asset() {
+    [[ "$1" == example/app ]] || return 99
+    printf 'download:%s\\n' "$2" >> "$DSR_INSTALL_REMOTE_CASE/events"
+    cp -- "$DSR_INSTALL_REMOTE_CASE/assets/$2" "$3"
+}
+_sbr_download() {
+    local file="$4/owned-$(jq -r .id <<< "$2")"
+    gh_download_release_asset "$1" "$(jq -r .id <<< "$2")" "$file" || return 8
+    [[ "$(_slsa_sha256 "$file")" == "$3" ]] || return 7
+    printf '%s\\n' "$file"
+}
+_sbr_inventory_sha256() { printf '%s' "$1" | sha256sum | cut -d ' ' -f 1; }
+''')
+for label, source_snapshot, expected in (("complete", snapshot, 0), ("subset", subset, 7)):
+    remote = work / ("online-" + label)
+    (remote / "assets").mkdir(parents=True)
+    inventory = []
+    sources = [source_snapshot / "release.intoto.jsonl", source_snapshot / "release.intoto.jsonl.minisig",
+               *sorted((source_snapshot / "artifacts").iterdir())]
+    for asset_id, source in enumerate(sources, 1):
+        shutil.copy2(source, remote / "assets" / str(asset_id))
+        inventory.append(dict(id=asset_id, name=source.name, size=source.stat().st_size, state="uploaded", digest="sha256:" + digest(source)))
+    save(remote / "inventory.json", inventory)
+    save(remote / "context.json", dict(repository=dict(id=12, full_name=repo), release=dict(id=34, tag_name=tag, draft=False), tag_commit=pin))
+    recipe_file = save(remote / "recipe.json", recipe_for(0, gnu))
+    env["DSR_INSTALL_REMOTE_CASE"] = str(remote)
+    online_prefix = remote / "prefix"
+    response = invoke(["bash", online_runtime / "release_install.sh", "--fetch", "--recipe", recipe_file, "--prefix", online_prefix,
+                       "--repo", repo, "--tag", tag, "--sha", pin, "--builder", builder, "--targets", target,
+                       "--public-key", public, *contract_flags], expected, "online content-bound " + label)
+    result = json.loads(response.stdout)
+    if expected == 0:
+        check("online fetch and local reauthentication retain the same contract and installation identity",
+              result.get("release_contract_sha256") == contract_hash and result.get("generation") == active.get("generation") and
+              result.get("download", {}).get("verification", {}).get("release_contract_sha256") == contract_hash)
+        check("online content-bound installation acquires every release payload",
+              all("download:" + str(i) in (remote / "events").read_text() for i in range(3, len(sources) + 1)))
+    else:
+        check("online signed subset never acquires payloads or creates installation state",
+              not online_prefix.exists() and result.get("activated") is False and
+              not any("download:" + str(i) in (remote / "events").read_text() for i in range(3, len(sources) + 1)))
+env.pop("DSR_INSTALL_REMOTE_CASE")
+
+for mutation in ("null", "missing-recipe-asset", "wrong-format", "wrong-compiler", "missing-platform"):
+    bad = copy.deepcopy(contract_policy)
+    if mutation == "null":
+        bad["release_contract"] = None
+    elif mutation == "missing-recipe-asset":
+        bad["release_contract"]["required_assets"] = [a for a in bad["release_contract"]["required_assets"] if a["name"] != "alias-0"]
+    elif mutation == "wrong-format":
+        next(a for a in bad["release_contract"]["required_assets"] if a["name"] == "alias-0")["archive_format"] = "zip"
+    elif mutation == "wrong-compiler":
+        next(a for a in bad["release_contract"]["required_assets"] if a["name"] == "alias-0")["target_triple"] = musl
+    else:
+        bad["targets"].append("darwin/arm64")
+    generate("bad-content-policy-" + mutation, bad, expected=4)
 
 
 save(work / "summary.json", dict(passed=passed, failed=failed, signer="fixture" if fixture else "minisign",

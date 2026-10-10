@@ -115,7 +115,7 @@ def member(value):
     return isinstance(value, str) and len(value) <= 1024 and all(name(p) for p in value.split("/"))
 
 
-def recipe(value):
+def recipe(value, contract=None):
     fields = {"schema_version", "target", "executables"}
     need(isinstance(value, dict) and fields <= set(value) <= fields | {"target_triple"} and
          type(value["schema_version"]) is int and value["schema_version"] == 1 and
@@ -128,6 +128,21 @@ def recipe(value):
              name(item["name"]) and name(item["artifact"]) and
              ("member" not in item or member(item["member"])), "invalid executable selection", 4)
     need(len({e["name"].lower() for e in value["executables"]}) == len(value["executables"]), "colliding executable names", 4)
+    if contract is not None:
+        # Independent output policy is checked before network acquisition. It
+        # cannot authenticate bytes; the complete signed snapshot still must.
+        assets = {a["name"]: a for a in contract["required_assets"]}
+        variants = {a.get("target_triple") for a in assets.values() if a["target"] == value["target"]}
+        need(len(variants) <= 1 or "target_triple" in value,
+             "contract compiler matrix requires an explicit recipe target_triple", 4)
+        for item in value["executables"]:
+            asset = assets.get(item["artifact"])
+            need(asset is not None and asset["target"] == value["target"] and
+                 ((asset["archive_format"] in ("binary", "none")) == ("member" not in item)),
+                 "recipe executable differs from the independent asset contract", 4)
+            need("target_triple" not in value or "target_triple" not in asset or
+                 value["target_triple"] == asset["target_triple"],
+                 "recipe compiler differs from the independent asset contract", 4)
     value["executables"].sort(key=lambda e: e["name"])
     return value
 
@@ -158,7 +173,7 @@ def helper(command, work, network=False):
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=error,
                                 env=environment, start_new_session=True, pass_fds=(() if lockfd is None else (lockfd,)))
         try:
-            output, _ = proc.communicate(timeout=args.timeout)
+            output, _ = proc.communicate(timeout=getattr(args, "timeout", 30))
             need(proc.returncode == 0, "verification/archive helper failed (exit %s)" % proc.returncode,
                  proc.returncode if 0 < proc.returncode < 256 else 5)
             return output
@@ -179,6 +194,18 @@ def helper(command, work, network=False):
             except ProcessLookupError:
                 pass
             proc.wait()
+
+
+def describe_contract(file, targets, work):
+    response = helper(["bash", str(module / "slsa_remote.sh"), "describe-contract",
+                       "--release-contract", str(file), "--targets", targets], work)
+    record = json.loads(response, object_pairs_hook=pairs)
+    need(isinstance(record, dict) and record.get("kind") == "dsr-slsa-release-contract" and
+         record.get("authenticated") is False and isinstance(record.get("contract"), dict) and
+         record.get("input_sha256") == digest(file) and
+         record.get("contract_sha256") == hashlib.sha256(canonical(record["contract"])).hexdigest(),
+         "invalid release contract normalization result")
+    return record
 
 
 def verify_generation(directory, expected):
@@ -219,10 +246,18 @@ try:
     if sys.argv[2:3] == ["describe-recipe"]:
         parser = Parser(description="Validate and normalize an installation recipe; no authentication or writes.", allow_abbrev=False)
         parser.add_argument("--recipe", required=True)
+        parser.add_argument("--release-contract")
+        parser.add_argument("--targets")
         flags = [a.split("=", 1)[0] for a in sys.argv[3:] if a.startswith("--")]
         need(len(flags) == len(set(flags)), "duplicate recipe option", 4)
         args = parser.parse_args(sys.argv[3:])
         selected = recipe(load(plain(args.recipe, "file"), 1048576))
+        need((args.release_contract is None) == (args.targets is None),
+             "recipe contract validation requires both --release-contract and --targets", 4)
+        if args.release_contract is not None:
+            with tempfile.TemporaryDirectory(prefix="dsr-install-recipe-") as temporary:
+                record = describe_contract(plain(args.release_contract, "file"), args.targets, Path(temporary))
+                selected = recipe(selected, record["contract"])
         print(canonical(dict(kind="dsr-install-recipe", recipe=selected, authenticated=False)).decode(), end="")
         sys.exit(0)
     parser = Parser(description="Authenticate and install a complete executable set; never execute payloads.",
@@ -238,6 +273,7 @@ try:
         parser.add_argument("--" + flag, required=True)
     for flag in ("statement-sha256", "manifest-sha256", "invocation-id"):
         parser.add_argument("--" + flag)
+    parser.add_argument("--release-contract", help="Independent exact asset/variant policy for the complete signed release")
     parser.add_argument("--replace", action="store_true", help="Permit switching an existing managed installation")
     parser.add_argument("--dry-run", action="store_true", help="Authenticate and extract without changing installation state")
     parser.add_argument("--timeout", type=int, default=900, help="Per verification/extraction helper timeout, 1..86400 seconds")
@@ -249,14 +285,20 @@ try:
     snapshot = None if args.fetch else plain(args.snapshot, "dir")
     recipe_file = plain(args.recipe, "file")
     public = plain(args.public_key, "file")
+    contract_file = None if args.release_contract is None else plain(args.release_contract, "file")
     prefix = plain(args.prefix)
     plain(prefix.parent, "dir")
-    for input_path in (recipe_file, public, *(() if snapshot is None else (snapshot,))):
+    for input_path in (recipe_file, public, *(() if snapshot is None else (snapshot,)),
+                       *(() if contract_file is None else (contract_file,))):
         need(prefix != input_path and prefix not in input_path.parents and input_path not in prefix.parents,
              "installation prefix overlaps selected inputs", 4)
     selected = recipe(load(recipe_file, 1048576))
     recipe_pin = digest(recipe_file)
     key_pin = digest(public)
+    contract_pin = None
+    if contract_file is not None:
+        need(contract_file.stat().st_size <= 1048576, "release contract exceeds size limit", 4)
+        contract_pin = digest(contract_file)
     need(public.stat().st_size <= 8192, "public key exceeds size limit", 4)
     operating_system = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
     architecture = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386"}.get(platform.machine().lower())
@@ -273,6 +315,13 @@ try:
             value = getattr(args, flag.replace("-", "_"))
             if value is not None:
                 policy += ["--" + flag, value]
+        contract = None
+        if contract_file is not None:
+            held_contract = work / "selected-contract.json"
+            copy_pinned(contract_file, held_contract, contract_pin)
+            contract = describe_contract(held_contract, args.targets, work)
+            selected = recipe(selected, contract["contract"])
+            policy += ["--release-contract", str(held_contract)]
         fetched = None
         if args.fetch:
             snapshot = work / "snapshot"
@@ -290,6 +339,9 @@ try:
                  isinstance(observation.get("release"), dict) and observation["release"].get("tag_name") == args.tag and
                  type(observation["release"].get("draft")) is bool, "download observation differs from selected release")
             need(not observation["release"]["draft"] or args.allow_draft, "draft installation requires --allow-draft", 4)
+            if contract is not None:
+                need(observation.get("release_contract_sha256") == contract["contract_sha256"],
+                     "download did not verify the selected content contract")
         # Reauthenticate the exact downloaded bytes, not a remote success field.
         # From here onward no helper receives GitHub credentials or uses HTTP.
         output = helper(["bash", str(module / "slsa_remote.sh"), "verify-snapshot", str(snapshot),
@@ -299,6 +351,11 @@ try:
              verified.get("status") == "verified" and
              verified.get("authenticated") is True and verified.get("remote_current") is False and
              verified.get("snapshot") == str(snapshot), "invalid snapshot verification handoff")
+        if contract is not None:
+            need(isinstance(verified.get("policy"), dict) and
+                 verified["policy"].get("release_contract") == contract["contract"] and
+                 verified["policy"].get("release_contract_sha256") == contract["contract_sha256"],
+                 "snapshot did not verify the selected content contract")
         if fetched is not None:
             need(fetched.get("snapshot_sha256") == verified["snapshot_sha256"] and
                  observation.get("statement", {}).get("sha256") == verified["statement_sha256"] and
@@ -363,10 +420,14 @@ try:
                        invocation_id=verified["invocation_id"], executables=installed)
         if "target_triple" in selected:
             receipt["target_triple"] = selected["target_triple"]
+        if contract is not None:
+            receipt["release_contract"] = contract["contract"]
+            receipt["release_contract_sha256"] = contract["contract_sha256"]
         identity = hashlib.sha256(canonical(receipt)).hexdigest()
         write(staged / "receipt.json", receipt)
         verify_generation(staged, receipt)
         need(digest(public) == key_pin and digest(recipe_file) == recipe_pin, "selected key or recipe changed")
+        need(contract_file is None or digest(contract_file) == contract_pin, "selected release contract changed")
         result = dict(kind="dsr-release-install", status="planned" if args.dry_run else "installed", exit_code=0,
                       authenticated=True, remote_current=False, prefix=str(prefix), generation=identity,
                       bin_dir=str(prefix / "current/bin"), generation_bin_dir=str(prefix / "generations" / identity / "bin"),
@@ -374,6 +435,8 @@ try:
                       dry_run=args.dry_run)
         if "target_triple" in selected:
             result["target_triple"] = selected["target_triple"]
+        if contract is not None:
+            result["release_contract_sha256"] = contract["contract_sha256"]
         if fetched is not None:
             # The observation describes the just-completed fetch, not ongoing
             # freshness. Exclude it from generation identity so offline reuse
@@ -412,6 +475,7 @@ try:
                 staged.rename(final)
                 verify_generation(final, receipt)
             need(digest(public) == key_pin and digest(recipe_file) == recipe_pin, "selected key or recipe changed before activation")
+            need(contract_file is None or digest(contract_file) == contract_pin, "selected release contract changed before activation")
             named = plain(lock_path, "file").stat()
             need((held.st_dev, held.st_ino) == (named.st_dev, named.st_ino) and load(marker) == root_identity and
                  current_selection(prefix) == before, "installation state changed before activation", 2)
