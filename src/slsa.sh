@@ -376,6 +376,17 @@ _slsa_manifest_statement() {
            (.requested_targets | type != "array" or length == 0 or
                (all(.[]; target) | not) or (sort != $targets))
         then error("release does not cover its exact requested target matrix") else . end |
+        # Variant-sharded build sets pin the complete ABI matrix separately
+        # from routing platforms. Keep that selection enforceable by every
+        # downstream publisher using this profile, not just the collector.
+        ([.artifacts[] | {target,target_triple}] | unique | sort_by(.target,.target_triple)) as $variants |
+        if has("required_variants") and
+           (.required_variants | type != "array" or length == 0 or length > 256 or
+               (all(.[]; type == "object" and keys == ["target","target_triple"] and
+                   (.target | target) and (.target_triple | triple and length <= 128)) | not) or
+               (length != (unique | length)) or
+               (sort_by(.target,.target_triple) != $variants))
+        then error("release does not cover its exact required variant matrix") else . end |
         .artifacts as $artifacts |
         if has("required_assets") and
            (.required_assets | type != "array" or length == 0 or length > 256 or

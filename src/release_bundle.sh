@@ -26,6 +26,11 @@ _rb_plan() {
         def path: text and startswith("/") and (contains("\\")|not);
         def target: type=="string" and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
         def targets: type=="array" and length>0 and all(.[];target) and (unique|length)==length;
+        def variant: type=="object" and keys==["target","target_triple"] and
+            (.target|target) and (.target_triple|text and length<=128 and
+                test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..")|not));
+        def variants: type=="array" and length>0 and length<=256 and
+            all(.[];variant) and (unique|length)==length;
         def assets: type=="array" and length>0 and length<=256 and all(.[];
             type=="object" and keys==["archive_format","name","target"] and
             (.name|name and length<=128) and (.target|target) and
@@ -33,7 +38,7 @@ _rb_plan() {
             (map(.name|ascii_downcase)|unique|length)==length;
         if length==1 then .[0] else error("expected one build-set plan") end |
         if type=="object" and
-            (del(.required_assets)|keys)==["builds","repo","required_targets","schema_version","source_sha","tag","tool"] and
+            (del(.required_assets,.required_variants)|keys)==["builds","repo","required_targets","schema_version","source_sha","tag","tool"] and
             .schema_version==1 and (.tool|name) and
             (.repo|text and test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$") and (contains("..")|not)) and
             (.tag|text and test("^v[0-9]+\\.[0-9]+\\.[0-9]+([+-][A-Za-z0-9.+-]+)?$")) and
@@ -42,12 +47,26 @@ _rb_plan() {
             (if has("required_assets") then (.required_assets|assets) and
                 ([.required_assets[].target]|unique|sort)==(.required_targets|sort) else true end) and
             (.builds|type=="array" and length>0 and length<=100 and all(.[];
-                type=="object" and keys==["artifacts_dir","id","manifest","manifest_sha256","targets"] and
+                type=="object" and (del(.variants)|keys)==["artifacts_dir","id","manifest","manifest_sha256","targets"] and
                 (.id|name) and (.manifest|path) and (.artifacts_dir|path) and
                 (.manifest_sha256|hash) and (.targets|targets))) and
             ((.builds|map(.id)|unique|length)==(.builds|length)) and
-            (([.builds[].targets[]]|sort)==(.required_targets|sort))
+            (if has("required_variants") then
+                (.required_variants|variants) and
+                ([.required_variants[].target]|unique|sort)==(.required_targets|sort) and
+                all(.builds[]; (.variants|variants) and
+                    ([.variants[].target]|unique|sort)==(.targets|sort)) and
+                ([.builds[].variants[]]|sort_by(.target,.target_triple))==
+                    (.required_variants|sort_by(.target,.target_triple))
+             else
+                all(.builds[]; has("variants")|not) and
+                (([.builds[].targets[]]|sort)==(.required_targets|sort))
+             end)
         then .required_targets|=sort | .builds|= (map(.targets|=sort)|sort_by(.id)) |
+            (if has("required_variants") then
+                .required_variants|=sort_by(.target,.target_triple) |
+                .builds|=map(.variants|=sort_by(.target,.target_triple))
+             else . end) |
             if has("required_assets") then .required_assets|=sort_by(.name) else . end
         else error("invalid or incomplete build-set plan") end
     ' "$1" || return 4
@@ -100,9 +119,25 @@ _rb_shard_manifest() {
         (if has("publishable") then .publishable==true else true end) and
         ([.artifacts[].target]|unique|sort)==$input.targets and
         (if has("requested_targets") then (.requested_targets|sort)==$input.targets else true end) and
+        # Explicit variant plans partition compiler identities, not platform
+        # labels. Every shard must carry its real native environment rows;
+        # artifact names and success counts cannot invent missing receipts.
+        (if $p|has("required_variants") then
+            ([.artifacts[]|{target,target_triple}]|unique|sort_by(.target,.target_triple))==$input.variants and
+            (.build_environments|type=="array" and all(.[];.method=="native")) and
+            ([.build_environments[]|{target,target_triple}]|sort_by(.target,.target_triple))==$input.variants and
+            .summary.total==($input.variants|length)
+         else true end) and
         (if $p|has("required_assets") then
-            (.artifacts|map({name,target,archive_format})|sort_by(.name))==
-            ([$p.required_assets[]|select(.target as $t|$input.targets|index($t)!=null)]|sort_by(.name))
+            if $p|has("required_variants") then
+                # Same-platform shards own disjoint variants. Their combined
+                # exact asset contract is enforced again before publication.
+                all(.artifacts[]; {name,target,archive_format} as $asset |
+                    any($p.required_assets[]; .==$asset))
+            else
+                (.artifacts|map({name,target,archive_format})|sort_by(.name))==
+                ([$p.required_assets[]|select(.target as $t|$input.targets|index($t)!=null)]|sort_by(.name))
+            end
          else true end) and
         all(.artifacts[];
             (if has("build_purpose") then .build_purpose=="release" else true end) and
@@ -165,7 +200,7 @@ _rb_aggregate_manifest() {
         # Two native ABIs on one routing platform are two successful builds,
         # not one; compatibility aliases are never additional builds.
         ($builds|map(.summary.total)|add) as $task_count |
-        if ($deps|length)!=1 or ($artifacts|map(.name)|unique|length)!=($artifacts|length)
+        if ($deps|length)!=1 or ($artifacts|map(.name|ascii_downcase)|unique|length)!=($artifacts|length)
         then error("different dependency commits or colliding release asset names") else
         {schema_version:"1.0.0",build_purpose:"release",publishable:true,
          tool:$p.tool,version:$p.tag,run_id:$s.run_id,built_at:($builds|map(.built_at)|max),
@@ -175,10 +210,12 @@ _rb_aggregate_manifest() {
          artifacts:$artifacts,build_environments:[$builds[]|.build_environments[]?],
          component_builds:[$p.builds|to_entries[]|. as $e |
              {id:$e.value.id,targets:$e.value.targets,manifest_sha256:$e.value.manifest_sha256,
-              run_id:$builds[$e.key].run_id}],
+              run_id:$builds[$e.key].run_id} +
+             (if $p|has("required_variants") then {variants:$e.value.variants} else {} end)],
          bundle_evidence:{kind:"manifest-bound-build-set",repo:$p.repo,plan_sha256:$s.plan_sha256,
              authenticated:false,repository_binding:"operator-selected"}} |
-        if $p|has("required_assets") then .required_assets=$p.required_assets else . end
+        (if $p|has("required_assets") then .required_assets=$p.required_assets else . end) |
+        if $p|has("required_variants") then .required_variants=$p.required_variants else . end
         end' "$work/manifests.jsonl" > "$work/build-manifest.json" || return 7
 }
 

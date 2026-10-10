@@ -9,8 +9,10 @@ The operator selects the required target matrix and pins each input manifest's
 SHA-256. An individual successful build cannot silently redefine the complete
 release as its own subset of platforms. The selected manifests must agree on
 tool, version, source commit and sibling dependency revisions. Every required
-target must appear exactly once across the input manifests; aliases within one
-manifest remain separate assets. Conflicting release filenames are rejected.
+target must appear exactly once across the input manifests unless the plan
+explicitly partitions native compiler variants as described below. Aliases
+within one manifest remain separate assets. Conflicting release filenames,
+including case-only collisions, are rejected.
 
 ## Build-set plan
 
@@ -51,6 +53,71 @@ an input path during a retry. Hashes must be known before the first collection;
 an unavailable input can represent a build whose manifest identity is already
 known but whose files have not yet been transferred locally. A genuinely new
 or rebuilt manifest requires a new plan and output directory.
+
+## Independently built native variants
+
+A GNU job and a musl job can now be collected independently even though both
+use the canonical `linux/amd64` platform. Opt in by adding a complete
+`required_variants` array to the plan and a `variants` array to **every** build
+entry. Keep the existing source, manifest hashes, paths and platform fields.
+For two Linux AMD64 inputs, the additional selection is:
+
+```json
+{
+  "required_targets": ["linux/amd64"],
+  "required_variants": [
+    {"target": "linux/amd64", "target_triple": "x86_64-unknown-linux-gnu"},
+    {"target": "linux/amd64", "target_triple": "x86_64-unknown-linux-musl"}
+  ]
+}
+```
+
+The GNU build entry contains:
+
+```json
+{
+  "id": "linux-gnu",
+  "targets": ["linux/amd64"],
+  "variants": [
+    {"target": "linux/amd64", "target_triple": "x86_64-unknown-linux-gnu"}
+  ]
+}
+```
+
+The musl entry similarly selects `x86_64-unknown-linux-musl`. These are plan
+fragments, not complete plans: both entries still require their original
+`manifest`, `manifest_sha256` and `artifacts_dir`. ARM64 uses the same shape
+with `linux/arm64` and the corresponding `aarch64-unknown-linux-*` triples.
+A shard can include several variants or platforms. The complete input variant
+arrays must partition `required_variants` exactly, without overlaps or missing
+pairs; every platform array must agree with its variants. Empty, malformed,
+duplicate and mixed implicit/explicit selections fail before collection.
+
+This mode requires exactly one original `method: native` build environment
+per selected `(target, target_triple)` pair and exact artifact coverage of those
+pairs. A missing environment or a workflow-only receipt cannot be relabeled as
+native execution. Declared source and compiler selectors must still pass the
+existing SLSA manifest profile. Compiler triples are recorded identities, not
+an independent ABI inspection or proof that these builds were executed here.
+
+Optional `required_assets` remains a closed set of `{name, target,
+archive_format}` records. A same-platform shard may own only a subset of that
+set, but each imported name must be allowed and the final combined set must
+match exactly. An alias belongs to one producer; publishing it from two shards
+is a collision even if its bytes match. No filename guessing decides variant
+ownership, and aliases never add compiler tasks to the summary.
+
+When one variant has not arrived, other complete variant checkpoints are kept,
+but no `release/` directory is exposed. Retrying the same pinned plan can finish
+after the original producer directories have gone offline. Reordering variant
+arrays does not change the plan identity. Changing any selected pair or input
+hash requires a new plan/output directory, not a rewrite of retained evidence.
+
+The aggregate retains `required_variants` and each component's exact variant
+selection alongside its manifest hash. The shared SLSA/payload-publication
+profile enforces the required variant matrix downstream, so a successful
+summary alone cannot authorize a subset. Run the collector/provenance/recovery
+regressions with `bash scripts/tests/test_release_bundle_variants.sh`.
 
 ## Collect and retry
 
@@ -192,8 +259,8 @@ build admission and finalizer signature policies are not weakened or bypassed.
 
 Build shards must already pass DSR's complete successful-manifest profile.
 Explicit debug/nonpublishable results are not accepted. The collector does not
-merge multiple variants of the same `os/arch` target, additional-target metadata
-assets, or incompatible sibling dependency graphs. Partial compiler execution
+merge same-platform shards without an explicit native variant partition,
+additional-target metadata assets, or incompatible sibling dependency graphs. Partial compiler execution
 and native-host scheduling/resume remain responsibilities of the build runner.
 
 Storage is trusted, private local filesystem state. Atomic renames and flock
