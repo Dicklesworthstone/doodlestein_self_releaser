@@ -12,6 +12,89 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
 
+# Actual native entry-point refusals only: no compiler, SSH, substituted
+# backend, cleanup or fake successful RCH receipt. This is not native-build
+# qualification. Run only after the release wave's external admission gates.
+if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
+    source "$SRC_DIR/act_runner.sh"
+    ACT_REPOS_DIR="$PROJECT_ROOT/.__rch_policy_no_configuration"
+    [[ ! -e "$ACT_REPOS_DIR" && ! -L "$ACT_REPOS_DIR" ]] || exit 1
+    # "act" is this native function's local-host alias; these calls stop
+    # before compilation and do not invoke a workflow runner.
+    for policy in 1 true TRUE yes YeS on enabled EnAbLeD $' \ttrue\r\n'; do
+        for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            policy_status=0
+            policy_result=$(RCH_REQUIRE_REMOTE="$policy" act_run_native_build \
+                no-config-policy-case "$platform" v0.0.0 unused "" "" "" act) || policy_status=$?
+            printf '%s\n' "$policy_result" >&2
+            [[ "$policy_status" -eq 4 ]] || exit 1
+            printf '%s\n' "$policy_result" | jq -se --arg platform "$platform" '
+                length == 1 and .[0].status == "error" and .[0].exit_code == 4 and
+                .[0].platform == $platform and
+                .[0].reason_code == "RCH_REQUIRED_NATIVE_UNAVAILABLE" and
+                .[0].error == "RCH-required native execution is unavailable; no build dispatched"
+            ' >/dev/null || exit 1
+        done
+    done
+    for policy in definitely-not-a-boolean $'\xc2\xa01\xc2\xa0'; do
+        policy_status=0
+        policy_result=$(RCH_REQUIRE_REMOTE="$policy" act_run_native_build \
+            no-config-policy-case linux/amd64 v0.0.0 unused "" "" "" act) || policy_status=$?
+        printf '%s\n' "$policy_result" >&2
+        [[ "$policy_status" -eq 4 ]] || exit 1
+        # Locale-dependent trimming may recognize Unicode whitespace; either
+        # refusal must still precede configuration and direct compilation.
+        printf '%s\n' "$policy_result" | jq -se --arg policy "$policy" '
+            length == 1 and .[0].status == "error" and .[0].exit_code == 4 and
+            .[0].platform == "linux/amd64" and
+            (if $policy == "definitely-not-a-boolean" then
+                .[0].reason_code == "INVALID_RCH_REQUIRE_REMOTE"
+             else
+                (.[0].reason_code == "INVALID_RCH_REQUIRE_REMOTE" or
+                 .[0].reason_code == "RCH_REQUIRED_NATIVE_UNAVAILABLE")
+             end)
+        ' >/dev/null || exit 1
+    done
+    for policy in '' 0 false FaLsE no OFF disabled $' \tfalse\r\n'; do
+        policy_status=0
+        policy_result=$(RCH_REQUIRE_REMOTE="$policy" act_run_native_build \
+            no-config-policy-case linux/amd64 v0.0.0 unused "" "" "" act) || policy_status=$?
+        printf '%s\n' "$policy_result" >&2
+        [[ "$policy_status" -eq 4 ]] || exit 1
+        printf '%s\n' "$policy_result" | jq -se '
+            length == 1 and .[0].status == "error" and .[0].exit_code == 4 and
+            .[0].reason_code == null and (.[0].error | startswith("Config not found:"))
+        ' >/dev/null || exit 1
+    done
+    # Parsed recipe-environment tests, not YAML/CLI/native-release proof.
+    for policy_environment in \
+        'RCH_REQUIRE_REMOTE=1' \
+        $'RCH_REQUIRE_REMOTE=0\nRCH_REQUIRE_REMOTE=true' \
+        $'RCH_REQUIRE_REMOTE=true\nRCH_REQUIRE_REMOTE=0' \
+        $'OTHER=value\nRCH_REQUIRE_REMOTE= EnAbLeD \nRCH_DISABLED=1'; do
+        policy_status=0
+        policy_result=$(RCH_REQUIRE_REMOTE=0 _act_native_rch_environment_policy \
+            linux/amd64 "$policy_environment") || policy_status=$?
+        printf '%s\n' "$policy_result" >&2
+        [[ "$policy_status" -eq 4 ]] || exit 1
+        printf '%s\n' "$policy_result" | jq -se '
+            length == 1 and .[0].status == "error" and .[0].exit_code == 4 and
+            .[0].platform == "linux/amd64" and
+            .[0].reason_code == "RCH_REQUIRED_NATIVE_UNAVAILABLE"
+        ' >/dev/null || exit 1
+    done
+    for policy_environment in '' 'OTHER=value' \
+        $'RCH_REQUIRE_REMOTE=0\nOTHER=value\nRCH_REQUIRE_REMOTE=disabled'; do
+        policy_status=0
+        policy_result=$(_act_native_rch_environment_policy \
+            linux/amd64 "$policy_environment") || policy_status=$?
+        [[ "$policy_status" -eq 0 && -z "$policy_result" ]] || exit 1
+    done
+    [[ ! -e "$ACT_REPOS_DIR" && ! -L "$ACT_REPOS_DIR" ]] || exit 1
+    printf 'Native RCH-policy refusal cases completed; no build or source namespace created\n'
+    exit 0
+fi
+
 # Retained, non-destructive cache tests. The compilation lane must be invoked
 # through RCH/DSR; the ordinary lane runs no compiler or build command.
 if [[ "${1:-}" == --strict-cargo-cache-tests || "${1:-}" == --strict-cargo-cache-cargo-tests ]]; then

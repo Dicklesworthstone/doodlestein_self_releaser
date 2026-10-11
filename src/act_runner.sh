@@ -8060,6 +8060,45 @@ _act_stage_cleanup_on_signal() {
     exit "$signal_status"
 }
 
+_act_native_rch_policy() {
+    local platform="$1" remote_policy="${2:-}"
+    remote_policy="${remote_policy#"${remote_policy%%[![:space:]]*}"}"
+    remote_policy="${remote_policy%"${remote_policy##*[![:space:]]}"}"
+    case "${remote_policy,,}" in
+        ""|0|false|no|off|disabled) return 0 ;;
+        1|true|yes|on|enabled)
+            _log_error "RCH-required native execution is unavailable; refusing direct native compilation"
+            jq -nc --arg platform "$platform" \
+                '{status: "error", exit_code: 4, platform: $platform,
+                  reason_code: "RCH_REQUIRED_NATIVE_UNAVAILABLE",
+                  error: "RCH-required native execution is unavailable; no build dispatched"}'
+            return 4
+            ;;
+        *)
+            _log_error "RCH_REQUIRE_REMOTE must select an explicit enabled or disabled policy"
+            jq -nc --arg platform "$platform" \
+                '{status: "error", exit_code: 4, platform: $platform,
+                  reason_code: "INVALID_RCH_REQUIRE_REMOTE",
+                  error: "RCH_REQUIRE_REMOTE must select an explicit enabled or disabled policy"}'
+            return 4
+            ;;
+    esac
+}
+
+_act_native_rch_environment_policy() {
+    local platform="$1" build_env="$2" policy_assignment
+    # Inspect every declaration, rather than accepting the first match or
+    # allowing a later disabled value to obscure a declared RCH requirement.
+    while IFS= read -r policy_assignment; do
+        case "$policy_assignment" in
+            RCH_REQUIRE_REMOTE=*)
+                _act_native_rch_policy "$platform" "${policy_assignment#*=}" || return 4
+                ;;
+        esac
+    done <<< "$build_env"
+    return 0
+}
+
 act_run_native_build() {
     local tool_name="$1"
     local platform="$2"
@@ -8074,6 +8113,11 @@ act_run_native_build() {
     # Nested archive/receipt validators must resolve the same exact primary.
     # Bash local scope keeps this selected variant private to this invocation.
     local _ACT_STRICT_TARGET_TRIPLE="$selected_triple"
+
+    # This backend compiles directly on a native host. Until an RCH-backed
+    # route exists, an explicit remote-only policy must stop before host
+    # selection, source preparation or the later Cargo bypass exports (#17).
+    _act_native_rch_policy "$platform" "${RCH_REQUIRE_REMOTE:-}" || return 4
 
     if [[ -n "$ordinary_source_root" &&
           ( -n "$remote_path_override" || -n "$release_git_sha" || -n "$release_git_ref" || -z "$bound_host" ) ]]; then
@@ -8131,6 +8175,9 @@ act_run_native_build() {
               error: "Invalid native target environment"}'
         return 4
     fi
+    # Recipe policy cannot be defeated by the unconditional bypass exports
+    # later in this backend. This remains a refusal, not RCH execution proof.
+    _act_native_rch_environment_policy "$platform" "$build_env" || return 4
     binary_name=$(yq -r '.binary_name // ""' "$config_file" 2>/dev/null)
     build_profile=$(yq -r '.build_profile // "release"' "$config_file" 2>/dev/null)
 
