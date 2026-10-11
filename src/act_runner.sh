@@ -7212,7 +7212,9 @@ _act_strict_cargo_cache_script() {
     printf -v command_q '%q' "$command"
     selection_script=$(_act_toolchain_identity_script context /dev/null "$command") || return $?
     printf 'dsr_cache_context=$(\n%s\n) || exit $?\n' "$selection_script"
-    printf 'DSR_CARGO_TOOLCHAIN_CONTEXT="$dsr_cache_context" python3 -I - %s %s %s <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
+    # tomllib needs Python 3.11+; see _act_toolchain_identity_script.
+    printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
+    printf 'DSR_CARGO_TOOLCHAIN_CONTEXT="$dsr_cache_context" "$dsr_tool_python" -I - %s %s %s <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
     cat <<'PY'
 import fcntl, hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys, tempfile, tomllib
 
@@ -7445,6 +7447,12 @@ _act_toolchain_identity_script() {
     if [[ "$mode" == target ]]; then
         python_q=$(command -v python3) || return 4
         printf -v python_q '%q' "$python_q"
+    else
+        # Attesting a Cargo configuration needs tomllib (Python 3.11+), but a
+        # login shell can put an older python3 first (macOS path_helper puts
+        # /usr/bin/python3 3.9 ahead of Homebrew). Prefer a new enough one.
+        printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
+        python_q='"$dsr_tool_python"'
     fi
     printf '%s -I - %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q"
     cat <<'PY'

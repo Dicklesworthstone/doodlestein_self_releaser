@@ -31,8 +31,24 @@ cargo_sources_verify_workspace() {
 }
 
 _cargo_sources() {
-    command -v python3 >/dev/null || return 3
-    python3 -I - "$@" <<'PY'
+    # Authenticating against Cargo.lock needs tomllib (Python 3.11+), but a login
+    # shell can put an older python3 first (macOS path_helper puts /usr/bin/python3
+    # 3.9 ahead of Homebrew). Prefer a new enough interpreter; this function is
+    # shipped to remote hosts on its own, so the selection lives inside it.
+    local dsr_python dsr_candidate
+    dsr_python=
+    for dsr_candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+        command -v "$dsr_candidate" >/dev/null 2>&1 || continue
+        if "$dsr_candidate" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+            dsr_python=$dsr_candidate
+            break
+        fi
+    done
+    if [ -z "$dsr_python" ]; then
+        command -v python3 >/dev/null || return 3
+        dsr_python=python3
+    fi
+    "$dsr_python" -I - "$@" <<'PY'
 import contextlib
 import hashlib
 import json
@@ -524,6 +540,12 @@ def observe(metadata, selected, workspace=False):
     for package in admitted:
         require(package["manifest"] in indexed[package["root"]], "missing dependency manifest")
         for target in by_package[package["package_id"]].get("targets", []):
+            # Cargo never builds a dependency's tests, benches, examples or bins, and
+            # crates.io archives often omit those files while the published manifest
+            # still declares them (nom 7.1.3 examples, crc32c 0.6.8 benches).
+            if not {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro",
+                    "custom-build"}.intersection(target.get("kind", [])):
+                continue
             relative = absolute(target["src_path"]).relative_to(Path(package["root"])).as_posix()
             require(relative in indexed[package["root"]], "missing dependency target source")
     return {"schema_version": 1, "kind": "dsr-cargo-dependency-sources",

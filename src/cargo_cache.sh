@@ -3,8 +3,24 @@
 # credentials, symlinks, or source hardlinks. Sourceable and directly runnable.
 
 _cargo_cache_run() {
-    command -v python3 >/dev/null || { printf '%s\n' '[cargo-cache] Python 3.9+ is required' >&2; return 3; }
-    python3 -I - "$@" <<'PY'
+    # Lockfile-scoped seeding needs tomllib (Python 3.11+), but a login shell can put
+    # an older python3 first: macOS path_helper puts /usr/bin/python3 (3.9) ahead of
+    # Homebrew. Prefer the first interpreter that is new enough. The selection lives
+    # inside this function because only this function is shipped to remote hosts.
+    local dsr_python dsr_candidate
+    dsr_python=
+    for dsr_candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+        command -v "$dsr_candidate" >/dev/null 2>&1 || continue
+        if "$dsr_candidate" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+            dsr_python=$dsr_candidate
+            break
+        fi
+    done
+    if [ -z "$dsr_python" ]; then
+        command -v python3 >/dev/null || { printf '%s\n' '[cargo-cache] Python 3.9+ is required' >&2; return 3; }
+        dsr_python=python3
+    fi
+    "$dsr_python" -I - "$@" <<'PY'
 import hashlib
 import json
 import os
