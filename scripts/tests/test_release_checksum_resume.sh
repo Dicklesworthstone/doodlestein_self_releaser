@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import time
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,7 @@ def save(path, value):
 bin_dir = work / 'bin'
 bin_dir.mkdir()
 (bin_dir / 'curl').write_text('#!' + sys.executable + ' -S\n' + r'''
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 args = sys.argv[1:]
@@ -55,6 +57,9 @@ with (base / 'calls.jsonl').open('a') as f:
     f.write(json.dumps(url.path + '?' + url.query) + '\n')
 if '/assets/' in url.path:
     identity = int(url.path.rsplit('/', 1)[1])
+    if identity == spec.get('pause_id'):
+        (base / 'paused.pid').write_text(str(os.getpid()))
+        time.sleep(30)
     if identity == spec.get('fail_id'): sys.exit(22)
     data = (base / 'bodies' / str(identity)).read_bytes()
 elif '/tags/' in url.path:
@@ -227,6 +232,148 @@ check('downstream preview uses the complete resumed audit', value['planned'] == 
 check('downstream preview clones nothing', not list(Path(value['workspace']).glob('target-*')))
 invoke('unaudited-sync-refused', [*sync, '--audit-resume-from', old], 4)
 check('both handoffs leave earlier evidence unchanged', frozen(old) == original)
+
+
+# Kill the real audit supervisor while its fifth owned download is pending.
+# Unlike graceful TERM, SIGKILL cannot write result.json. The test reaps the
+# supervisor and explicitly kills only the PID/group recorded by its own fake
+# transport; it does not manufacture a terminal success or edit the attempt.
+base, spec = fixture('crash-handoff')
+env['RESUME_FIXTURE'] = str(base)
+spec['fail_id'] = None
+spec['pause_id'] = 5
+save(base / 'spec.json', spec)
+crashed = base / 'crashed'
+command = ['bash', str(root / 'src/release_checksums.sh'), '--repo', 'owner/app', '--tag', 'v1.2.3',
+           '--output-dir', str(crashed)]
+with (base / 'killed.stdout').open('wb') as out, (base / 'killed.stderr').open('wb') as err:
+    worker = subprocess.Popen(command, env=env, stdout=out, stderr=err, start_new_session=True)
+    try:
+        deadline = time.monotonic() + 20
+        while not (base / 'paused.pid').exists() and worker.poll() is None and time.monotonic() < deadline:
+            time.sleep(.025)
+        check('fifth download begins under real audit supervisor', (base / 'paused.pid').exists() and worker.poll() is None)
+        os.kill(worker.pid, signal.SIGKILL)
+        check('forced termination has no handled completion status', worker.wait(timeout=5) == -signal.SIGKILL)
+    finally:
+        if worker.poll() is None:
+            os.killpg(worker.pid, signal.SIGKILL)
+            worker.wait()
+        if (base / 'paused.pid').exists():
+            download_pid = int((base / 'paused.pid').read_text())
+            try:
+                os.killpg(download_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+check('crash leaves no terminal audit or normalized success export',
+      not (crashed / 'result.json').exists() and not (crashed / 'checksums.normalized').exists())
+rows = [json.loads(line) for line in (crashed / 'verified.jsonl').read_bytes().splitlines()]
+check('each completed payload has one append-only checkpoint', len(rows) == 5 and
+      [r['name'] for r in rows[1:]] == ['payload-%03d' % i for i in range(4)])
+check('checkpoint header is bound to the exact retained inventory',
+      rows[0]['selection_sha256'] == sha((crashed / 'selection.json').read_bytes()))
+original = frozen(crashed)
+spec.pop('pause_id')
+save(base / 'spec.json', spec)
+start = len((base / 'calls.jsonl').read_text().splitlines())
+_, value = audit(base, 'after-crash', 0, ['--resume-from', crashed])
+check('crash recovery verifies all six and reuses four', value['verified_count'] == 6 and value['resume']['reused_count'] == 4)
+check('journal recovery makes no invented terminal-outcome claim', value['resume']['source_kind'] == 'progress-journal' and
+      value['resume']['source_terminal_outcome'] == 'unknown' and value['resume']['source_result_sha256'] is None)
+check('journal and selection hashes identify original process evidence',
+      value['resume']['source_progress_sha256'] == sha((crashed / 'verified.jsonl').read_bytes()) and
+      value['resume']['source_selection_sha256'] == sha((crashed / 'selection.json').read_bytes()))
+check('crash recovery reacquires checksum evidence, not completed payloads',
+      any('/assets/7?' in c for c in calls(base, start)) and
+      not any('/assets/%d?' % n in c for n in range(1,5) for c in calls(base,start)))
+check('crash recovery preserves the original interrupted attempt', frozen(crashed) == original)
+
+# The committed CLI/sync integration needs no special-case trust shortcut.
+cli_crash = ['bash', runtime / 'dsr', '--json', 'release', 'verify', 'app', '1.2.3', '--checksums',
+             '--checksum-resume-from', crashed, '--checksum-output-dir', base / 'crash-cli']
+value = invoke('crash-cli', cli_crash)
+check('CLI reports checkpoint recovery without masking unknown earlier outcome',
+      value['details']['checksums']['verified_count'] == 6 and
+      value['details']['checksums']['resume']['source_terminal_outcome'] == 'unknown')
+value = invoke('crash-sync', [*sync, '--verify-release', '--audit-resume-from', crashed])
+check('downstream dry-run admits a fully rechecked checkpoint recovery', value['planned'] == 1 and value['synced'] == 0 and
+      value['release_verification']['resume']['reused_count'] == 4)
+check('all wrapper recovery work stays outside the prior attempt', frozen(crashed) == original)
+
+# A missing newline is an uncommitted tail, even if its JSON happens to parse.
+# Earlier complete lines are still usable and no prior file is rewritten.
+for label, tail in (('partial-json', b'{"name":'), ('complete-without-newline', json.dumps(rows[-1]).encode())):
+    prior = base / label
+    shutil.copytree(crashed, prior)
+    with (prior / 'verified.jsonl').open('ab') as out:
+        out.write(tail)
+    prior_state = frozen(prior)
+    _, value = audit(base, label + '-recovered', 0, ['--resume-from', prior])
+    check(label + ' ignores only the uncommitted tail', value['resume']['reused_count'] == 4 and
+          value['resume']['discarded_tail_bytes'] == len(tail))
+    check(label + ' leaves journal and payloads untouched', frozen(prior) == prior_state)
+
+# Complete malformed records are never silently dropped, and a present bad
+# terminal receipt is never bypassed by a usable progress journal.
+for label in ('nonobject-header', 'wrong-selection', 'boolean-schema', 'duplicate', 'out-of-order',
+              'wrong-id', 'wrong-size', 'wrong-digest', 'unknown-name', 'excluded', 'complete-garbage',
+              'duplicate-json-key', 'oversized-tail', 'invalid-terminal', 'linked-journal', 'corrupt-payload'):
+    prior = base / ('bad-' + label)
+    shutil.copytree(crashed, prior)
+    records = copy.deepcopy(rows)
+    journal = prior / 'verified.jsonl'
+    if label == 'nonobject-header': records[0] = []
+    elif label == 'wrong-selection': records[0]['selection_sha256'] = 'a' * 64
+    elif label == 'boolean-schema': records[0]['schema_version'] = True
+    elif label == 'duplicate': records.append(records[-1])
+    elif label == 'out-of-order': records[1], records[2] = records[2], records[1]
+    elif label == 'wrong-id': records[1]['id'] = 999
+    elif label == 'wrong-size': records[1]['size'] += 1
+    elif label == 'wrong-digest': records[1]['sha256'] = 'a' * 64
+    elif label == 'unknown-name': records[1]['name'] = 'unselected'
+    elif label == 'excluded':
+        checksum = spec['assets'][-1]
+        records[1] = dict(name='SHA256SUMS', id=checksum['id'], size=checksum['size'], sha256=checksum['digest'][7:])
+    journal.write_bytes(b''.join(json.dumps(r).encode() + b'\n' for r in records))
+    if label == 'complete-garbage':
+        with journal.open('ab') as out: out.write(b'{\n')
+    elif label == 'duplicate-json-key':
+        with journal.open('ab') as out: out.write(b'{"name":"a","name":"b"}\n')
+    elif label == 'oversized-tail':
+        with journal.open('ab') as out: out.write(b'x' * 4097)
+    elif label == 'invalid-terminal': save(prior / 'result.json', {})
+    elif label == 'linked-journal':
+        journal.rename(prior / 'original-journal')
+        journal.symlink_to('original-journal')
+    elif label == 'corrupt-payload': (prior / 'artifacts/payload-000').write_bytes(b'corrupted cache')
+    state = frozen(prior)
+    _, refusal = audit(base, label + '-refused', 1 if label == 'corrupt-payload' else 4, ['--resume-from', prior])
+    check(label + ' preserves rejected evidence', frozen(prior) == state)
+    check(label + ' cannot export a verified audit', not (base / (label + '-refused') / 'checksums.normalized').exists())
+
+# Even with absent API digests, fresh checksum evidence and every reused file
+# must agree. A mere journal success marker cannot authorize different bytes.
+base, spec = fixture('no-api-digest')
+env['RESUME_FIXTURE'] = str(base)
+for asset in spec['assets']: asset['digest'] = None
+spec['fail_id'] = None
+save(base / 'spec.json', spec)
+# Preserve the producer's release bytes; construct an interrupted checkpoint
+# from the earlier owned attempt with an independently bound no-digest inventory.
+prior = base / 'retained'
+shutil.copytree(crashed, prior)
+selection = json.loads((prior / 'selection.json').read_text())
+selection['assets'] = sorted([{k: r[k] for k in ('id','name','size','digest')} for r in spec['assets']], key=lambda r:r['name'])
+save(prior / 'selection.json', selection)
+records = copy.deepcopy(rows)
+records[0]['selection_sha256'] = sha((prior / 'selection.json').read_bytes())
+(prior / 'verified.jsonl').write_bytes(b''.join(json.dumps(r).encode() + b'\n' for r in records))
+_, value = audit(base, 'no-digest-recovery', 0, ['--resume-from', prior])
+check('checksum evidence alone still verifies all reused bytes', value['verified_count'] == 6 and value['resume']['reused_count'] == 4)
+bad = base / 'corrupt'
+shutil.copytree(prior, bad)
+(bad / 'artifacts/payload-000').write_bytes(b'not the checksum-bound payload')
+audit(base, 'no-digest-corrupt', 1, ['--resume-from', bad])
 
 print('Results: %d passed, 0 failed\nEvidence: %s' % (passed, work), flush=True)
 PY

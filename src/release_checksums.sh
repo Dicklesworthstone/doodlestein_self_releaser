@@ -219,10 +219,73 @@ def retained_directory(value):
         require(not part.is_symlink() and part.is_dir(), 'Resume source contains a linked or missing directory', 4)
     return path
 
+def checkpoint_header(selection_pin):
+    return dict(kind='dsr-release-checksum-progress', schema_version=1, selection_sha256=selection_pin)
+
+def checkpoint_append(value, initial=False):
+    # Append one bounded record, not an ever-growing full report. A killed
+    # writer may leave one incomplete final line; it never marks a partial
+    # payload as reusable. This is process-crash recovery, not a power-loss
+    # durability promise or publisher authentication.
+    path = work / 'verified.jsonl'
+    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= os.O_CREAT | os.O_EXCL if initial else os.O_APPEND
+    data = canonical(value)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, 'wb', buffering=0) as stream:
+        require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), 'Invalid checkpoint destination')
+        require(stream.write(data) == len(data), 'Could not append complete verification checkpoint')
+
+def checkpoint_prior(root, selection, selection_pin):
+    # Only used when result.json is absent. A present invalid terminal receipt
+    # must still fail; a journal cannot excuse contradictory completed state.
+    path = root / 'verified.jsonl'
+    require(regular(path).st_size <= 64 * 1024 * 1024, 'Excessive verification checkpoint', 4)
+    pin = digest(path)
+    raw = path.read_bytes()
+    require(digest(path) == pin, 'Verification checkpoint changed while reading')
+    lines = raw.split(b'\n')
+    tail = lines.pop()
+    require(len(tail) <= 4096, 'Excessive incomplete checkpoint record', 4)
+    require(lines and len(lines) <= 10001, 'Missing or excessive verification checkpoint records', 4)
+    def decode(line):
+        require(len(line) <= 4096, 'Excessive checkpoint record', 4)
+        try:
+            return json.loads(line, object_pairs_hook=pairs,
+                              parse_constant=lambda _: (_ for _ in ()).throw(Failure('Non-finite checkpoint', 4)))
+        except (ValueError, UnicodeError) as error:
+            raise Failure('Malformed complete verification checkpoint record', 4) from error
+    header = decode(lines[0])
+    require(isinstance(header, dict) and type(header.get('schema_version')) is int and
+            header == checkpoint_header(selection_pin),
+            'Checkpoint is not bound to the retained selection', 4)
+    inventory = selection.get('assets')
+    require(isinstance(inventory, list) and all(isinstance(r, dict) and safe_name(r.get('name')) for r in inventory),
+            'Invalid checkpoint source inventory', 4)
+    by_name = {r['name']: r for r in inventory}
+    names = []
+    for line in lines[1:]:
+        row = decode(line)
+        require(isinstance(row, dict) and set(row) == {'name', 'id', 'size', 'sha256'} and
+                safe_name(row['name']) and integer(row['id'], 1) and integer(row['size']) and
+                isinstance(row['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', row['sha256']),
+                'Invalid verified-payload checkpoint', 4)
+        expected = by_name.get(row['name'])
+        require(expected is not None and row['id'] == expected.get('id') and row['size'] == expected.get('size') and
+                (expected.get('digest') is None or str(expected['digest']).lower() == 'sha256:' + row['sha256']),
+                'Checkpoint differs from retained asset identity', 4)
+        kind = metadata_kind(row['name'], args.checksum_asset)
+        require(kind is None or args.include_metadata and kind in ('provenance-or-sbom', 'release-metadata'),
+                'Checkpoint names an excluded asset', 4)
+        require(not names or names[-1] < row['name'], 'Duplicate or out-of-order checkpoint', 4)
+        names.append(row['name'])
+    return names, pin, len(tail)
+
 def read_resume(selected):
     root = retained_directory(selected)
     values, pins = {}, {}
-    for name in ('result.json', 'selection.json'):
+    terminal = (root / 'result.json').exists() or (root / 'result.json').is_symlink()
+    for name in (('selection.json', 'result.json') if terminal else ('selection.json',)):
         file = root / name
         # A retained receipt combines many bounded API pages plus coverage and
         # proof records. Use the CLI handoff limit, not the one-page HTTP cap.
@@ -230,28 +293,38 @@ def read_resume(selected):
         pins[name] = digest(file)
         values[name] = read_json(file)
         require(digest(file) == pins[name], 'Retained audit metadata changed while reading')
-    prior, selection = values['result.json'], values['selection.json']
-    require(isinstance(prior, dict) and isinstance(selection, dict) and
-            prior.get('kind') == report['kind'] and prior.get('verification_policy') == report['verification_policy'] and
-            type(prior.get('exit_code')) is int and 0 <= prior['exit_code'] <= 8 and
-            prior.get('status') == ('verified' if prior['exit_code'] == 0 else 'error') and
-            type(selection.get('schema_version')) is int and selection['schema_version'] == 1 and
-            selection.get('kind') == 'dsr-release-checksum-selection' and
-            selection.get('repository') == prior.get('repository') == args.repo and
-            selection.get('tag') == prior.get('tag') == args.tag and
-            selection.get('release') == prior.get('release') and
+    selection = values['selection.json']
+    require(isinstance(selection, dict) and type(selection.get('schema_version')) is int and
+            selection['schema_version'] == 1 and selection.get('kind') == 'dsr-release-checksum-selection' and
+            selection.get('repository') == args.repo and selection.get('tag') == args.tag and
             isinstance(selection.get('release'), dict) and integer(selection['release'].get('id'), 1) and
-            prior.get('selection_sha256') == pins['selection.json'],
-            'Resume source lacks a consistent pinned audit selection', 4)
-    require(selection.get('checksum_mode') == prior.get('checksum_mode') == args.checksum_mode and
+            isinstance(selection.get('assets'), list), 'Resume source lacks a valid pinned selection', 4)
+    require(selection.get('checksum_mode') == args.checksum_mode and
             selection.get('checksum_asset') == args.checksum_asset and
-            selection.get('include_metadata') is prior.get('include_metadata') is args.include_metadata and
+            selection.get('include_metadata') is args.include_metadata and
             (args.release_id is None or args.release_id == selection['release']['id']),
             'Resume source differs from selected release or checksum policy', 4)
-    names = prior.get('verified_checksums')
-    require(isinstance(names, list) and all(safe_name(n) for n in names) and
-            names == sorted(set(names)) and type(prior.get('verified_count')) is int and
-            prior['verified_count'] == len(names) and isinstance(selection.get('assets'), list),
+    discarded_tail = 0
+    if terminal:
+        prior = values['result.json']
+        require(isinstance(prior, dict) and prior.get('kind') == report['kind'] and
+                prior.get('verification_policy') == report['verification_policy'] and
+                type(prior.get('exit_code')) is int and 0 <= prior['exit_code'] <= 8 and
+                prior.get('status') == ('verified' if prior['exit_code'] == 0 else 'error') and
+                all(prior.get(key) == selection.get(key) for key in
+                    ('repository', 'tag', 'release', 'checksum_mode')) and
+                prior.get('include_metadata') is args.include_metadata and
+                prior.get('selection_sha256') == pins['selection.json'],
+                'Resume source lacks a consistent terminal audit receipt', 4)
+        names = prior.get('verified_checksums')
+        require(isinstance(names, list) and type(prior.get('verified_count')) is int and
+                prior['verified_count'] == len(names), 'Invalid retained verified-payload count', 4)
+    else:
+        # A missing terminal receipt means the previous outcome is unknown.
+        # Recover only complete progress records; never invent a result.json or
+        # relabel a killed process as a successful or handled failed attempt.
+        names, pins['verified.jsonl'], discarded_tail = checkpoint_prior(root, selection, pins['selection.json'])
+    require(all(safe_name(n) for n in names) and names == sorted(set(names)),
             'Invalid retained verified-payload inventory', 4)
     records = selection['assets']
     require(all(isinstance(r, dict) and safe_name(r.get('name')) and integer(r.get('id'), 1) and
@@ -269,7 +342,8 @@ def read_resume(selected):
         temporary = Path(tempfile.gettempdir()).resolve()
         require(root != temporary and root not in temporary.parents,
                 'Temporary output directory must not be inside retained audit evidence', 4)
-    return dict(root=root, selection=selection, pins=pins, names=set(names))
+    return dict(root=root, selection=selection, pins=pins, names=set(names), terminal=terminal,
+                discarded_tail_bytes=discarded_tail)
 
 def resume_unchanged():
     if resume is not None:
@@ -415,12 +489,17 @@ try:
                      include_metadata=args.include_metadata)
     if resume is not None:
         require(selection == resume['selection'], 'Release identity, asset inventory or policy changed since retained audit')
-        report['resume'] = dict(source=str(resume['root']), source_result_sha256=resume['pins']['result.json'],
+        report['resume'] = dict(source=str(resume['root']), source_result_sha256=resume['pins'].get('result.json'),
                                 source_selection_sha256=resume['pins']['selection.json'],
                                 reused_checksums=[], reused_count=0, reused_bytes=0)
+        if not resume['terminal']:
+            report['resume'].update(source_kind='progress-journal', source_terminal_outcome='unknown',
+                                    source_progress_sha256=resume['pins']['verified.jsonl'],
+                                    discarded_tail_bytes=resume['discarded_tail_bytes'])
     with (work / 'selection.json').open('xb') as out:
         out.write(canonical(selection))
     report['selection_sha256'] = digest(work / 'selection.json')
+    checkpoint_append(checkpoint_header(report['selection_sha256']), initial=True)
     by_name = {row['name']: row for row in assets}
     checksum_names = ([args.checksum_asset] if args.checksum_asset else
                       [name for name in AGGREGATES if name in by_name])
@@ -496,6 +575,7 @@ try:
         except Failure as error:
             report['checksum_errors'].append(dict(name=row['name'], error=str(error), exit_code=error.code))
             raise
+        checkpoint_append(dict(name=row['name'], id=row['id'], size=row['size'], sha256=actual))
         report['verified_checksums'].append(row['name'])
         report['verified_count'] += 1
         if reused:
