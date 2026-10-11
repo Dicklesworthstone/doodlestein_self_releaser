@@ -6637,12 +6637,12 @@ act_get_build_env() {
 
     # Get global env vars
     local global_env
-    global_env=$(yq -r '.env // {} | to_entries | map(.key + "=" + .value) | .[]' "$config_file" 2>/dev/null)
+    global_env=$(yq -r '.env // {} | to_entries | map(.key + "=" + .value) | .[]' "$config_file") || return 4
     [[ -n "$global_env" ]] && result="$global_env"
 
     # Get platform-specific cross_compile env vars (join with newline to preserve spaces in values)
     local platform_env
-    platform_env=$(yq -r ".cross_compile.\"$platform\".env // {} | to_entries | map(.key + \"=\" + .value) | .[]" "$config_file" 2>/dev/null)
+    platform_env=$(yq -r ".cross_compile.\"$platform\".env // {} | to_entries | map(.key + \"=\" + .value) | .[]" "$config_file") || return 4
     if [[ -n "$platform_env" ]]; then
         if [[ -n "$result" ]]; then
             result="$result"$'\n'"$platform_env"
@@ -6705,8 +6705,8 @@ act_get_build_env() {
         derived_pairs+=$'\n'"DSR_TARGET_ARCH=${platform##*/}"
         derived_pairs+=$'\n'"DSR_TARGET_PLATFORM=$platform"
         local env_language derive_opt
-        env_language=$(yq -r '.language // ""' "$config_file" 2>/dev/null)
-        derive_opt=$(yq -r '.derive_cargo_build_target' "$config_file" 2>/dev/null)
+        env_language=$(yq -r '.language // ""' "$config_file") || return 4
+        derive_opt=$(yq -r '.derive_cargo_build_target' "$config_file") || return 4
         if [[ "$env_language" == "rust" && "$derive_opt" != "false" ]]; then
             local derived_triple
             derived_triple=$(act_get_build_env_value "$result" "CARGO_BUILD_TARGET" 2>/dev/null || true)
@@ -6714,7 +6714,7 @@ act_get_build_env() {
                 # A direct singleton call defaults to the primary. Matrix
                 # workers supplied their exact declared variant above.
                 derived_triple=$(yq -r ".target_triples.\"$platform\" | select(tag == \"!!seq\") // [.] | .[0] // \"\"" \
-                    "$config_file" 2>/dev/null)
+                    "$config_file") || return 4
                 [[ "$derived_triple" == "null" ]] && derived_triple=""
                 [[ -n "$derived_triple" ]] || \
                     derived_triple=$(_act_default_rust_target_triple "$platform" 2>/dev/null || true)

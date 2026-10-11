@@ -95,6 +95,44 @@ if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
     exit 0
 fi
 
+# Real recipe parsing, not substituted yq/native/compiler output. Supply an
+# existing admitted retention root; this mode never cleans up or builds.
+if [[ "${1:-}" == --rch-env-validation-tests ]]; then
+    command -v yq >/dev/null || exit 3
+    command -v jq >/dev/null || exit 3
+    recipe_test_root="${DSR_RCH_ENV_TEST_ROOT:-}"
+    [[ "$recipe_test_root" == /* && -d "$recipe_test_root" && ! -L "$recipe_test_root" ]] || exit 4
+    source "$SRC_DIR/act_runner.sh" || exit 3
+    ACT_REPOS_DIR=$(mktemp -d "$recipe_test_root/dsr-recipe-policy.XXXXXXXX") || exit 1
+    printf 'Retained recipe fixtures: %s\n' "$ACT_REPOS_DIR"
+    printf '%s\n' 'language: rust' 'derive_cargo_build_target: false' \
+        'env: {RCH_REQUIRE_REMOTE: "1"}' \
+        'cross_compile: {"linux/amd64": {env: {RCH_REQUIRE_REMOTE: "0"}}}' > "$ACT_REPOS_DIR/required.yaml"
+    recipe_result=$(act_get_build_env required linux/amd64) || exit 1
+    printf '%s\n' "$recipe_result" >&2
+    [[ "$recipe_result" == RCH_REQUIRE_REMOTE=1$'\n'RCH_REQUIRE_REMOTE=0$'\n'* ]] || exit 1
+    recipe_status=0
+    recipe_policy=$(dsr_native_rch_environment_policy linux/amd64 "$recipe_result") || recipe_status=$?
+    printf '%s\n' "$recipe_policy" >&2
+    [[ "$recipe_status" -eq 4 ]] || exit 1
+    jq -se 'length==1 and .[0].reason_code=="RCH_REQUIRED_NATIVE_UNAVAILABLE"' <<< "$recipe_policy" >/dev/null || exit 1
+    printf '%s\n' 'language: rust' 'derive_cargo_build_target: false' 'env: {}' > "$ACT_REPOS_DIR/empty.yaml"
+    recipe_result=$(act_get_build_env empty linux/amd64) || exit 1
+    dsr_native_rch_environment_policy linux/amd64 "$recipe_result" || exit 1
+    printf '%s\n' 'env: [' > "$ACT_REPOS_DIR/broken-yaml.yaml"
+    printf '%s\n' 'env: {BROKEN: {nested: value}}' > "$ACT_REPOS_DIR/broken-global.yaml"
+    printf '%s\n' 'env: {RCH_REQUIRE_REMOTE: "1"}' \
+        'cross_compile: {"linux/amd64": {env: {BROKEN: {nested: value}}}}' > "$ACT_REPOS_DIR/broken-platform.yaml"
+    for recipe in broken-yaml broken-global broken-platform; do
+        recipe_status=0
+        recipe_result=$(act_get_build_env "$recipe" linux/amd64) || recipe_status=$?
+        printf '%s\n' "$recipe_result" >&2
+        [[ "$recipe_status" -eq 4 && -z "$recipe_result" ]] || exit 1
+    done
+    printf 'Recipe policy/parser cases completed; no native build qualified\n'
+    exit 0
+fi
+
 # Retained, non-destructive cache tests. The compilation lane must be invoked
 # through RCH/DSR; the ordinary lane runs no compiler or build command.
 if [[ "${1:-}" == --strict-cargo-cache-tests || "${1:-}" == --strict-cargo-cache-cargo-tests ]]; then
