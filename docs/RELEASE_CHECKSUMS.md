@@ -78,7 +78,8 @@ payloads were successfully checked before the failure.
 
 ## Authentication, limits and trust
 
-Set `GH_TOKEN` or `GITHUB_TOKEN`, or authenticate the GitHub CLI. Token lookup is
+Set `DSR_GH_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` (in that precedence order), or
+authenticate the GitHub CLI. Token lookup is
 explicitly for `github.com`, regardless of `GH_HOST`. Without a token the auditor
 can still read public releases. API credentials are not signing credentials:
 `authenticated: false` means no trusted publisher signature was checked.
@@ -105,9 +106,71 @@ provenance**. Use the existing trusted-key integrity/provenance verification for
 those independent policies. Local storage and installed executables are trusted;
 this is not an adversarial-filesystem sandbox or a power-loss durability claim.
 
-The older `dsr release verify --checksums` path has not yet been routed through
-this auditor. Do not infer that its historical spot-check result now provides
-these full-coverage guarantees. This entry point is the explicit full audit.
+## Full auditing through `dsr release verify`
+
+The main CLI now routes `--verify-checksums`, `--checksums`, and `-c` through
+the full auditor instead of the historical three-file sampler:
+
+```bash
+dsr --json release verify tool 1.2.3 --verify-checksums
+dsr --json release verify tool 1.2.3 --checksums --checksum-mode sidecars
+```
+
+Without a checksum flag, the existing metadata/manifest verification behavior
+is unchanged. Checksum-only options require an enabling flag. The complete
+CLI audit adds Python 3.7+ and the auditor's bounded curl requirement; it does
+not silently degrade to sampling when those dependencies are unavailable.
+
+The release command module registers a checksum-aware handler after the root
+CLI has defined its original handler and before dispatch. It preserves that
+original function as the authority for manifest checks and strict repair.
+Checksum options never reach the old sampling branch. The adapter invokes
+the original command without checksum options before and after auditing, so
+successful checksums cannot override a missing asset, digest mismatch, or
+failed strict source/tag/ruleset check. The root file's original declaration
+remains intact; this is an explicit lazy command registration, not a second
+implementation of its strict-release gates.
+
+The audit pins the release ID selected by metadata verification. A replacement
+release reusing the same tag is refused before inventory or payload downloads.
+After the audit, the metadata report must still identify that release and the
+same complete asset namespace. The adapter verifies the retained checksum
+proofs, canonical export, and every downloaded payload at both handoffs.
+
+Use `--checksum-asset NAME` to select one aggregate, or
+`--checksum-include-metadata` to extend coverage to known release documents.
+`--checksum-output-dir DIR` selects a new canonical absolute audit directory;
+its parent must already exist. Download limits use `--checksum-timeout`,
+`--checksum-max-asset-bytes`, and `--checksum-max-total-bytes`. They have the
+same defaults and meaning as the standalone auditor's corresponding options.
+
+`--fix` retains the original repair rules and is invoked at most once. Local
+audit-option, dependency, and output-path preflight happens before repair.
+The final read-only audit examines the repaired release rather than reusing
+pre-repair checksum results. A failed audit is never permission to delete,
+clobber, or retry a release asset. `--dry-run --fix --verify-checksums` prevents
+repair writes but still performs the requested read-only downloads and hashes;
+missing payloads therefore still produce a nonzero verification result.
+
+The root JSON envelope retains its metadata fields and adds truthful checksum
+status, eligible/verified counts, verified names, exclusions, coverage errors,
+and the audit evidence directory under `details.checksums`. An audit which
+completed but failed retained-evidence admission is `not-admitted`, never
+`verified`. The adapter retains phase stdout/stderr and its terminal result
+in `details.verification_evidence_dir`; it does not merge diagnostic logs into
+JSON. Checksum authentication/source fields stay false, independently of any
+separate strict-release verification result.
+
+Cancellation is forwarded to the owned auditor or metadata process group and
+waits for its termination before completing. An interrupted repair whose
+response was not received reports `repair.outcome: unknown`, not a claim that
+nothing changed. Partial checksum counts are retained when available. Evidence
+is not automatically removed; operators must budget and manage its storage.
+
+For other callers of the standalone auditor, `--release-id ID` provides the
+same identity pin. `--preflight` validates options, output-path readiness and
+local dependencies without authentication, HTTP, or creating an audit output.
+Its `status: planned` and zero counts are not completed checksum coverage.
 
 ## Releases with per-payload SHA256 sidecars
 
@@ -222,6 +285,7 @@ unchanged and `release_verification` is null.
 ```bash
 bash scripts/tests/test_release_checksums.sh
 bash scripts/tests/test_release_checksums_transport.sh
+bash scripts/tests/test_release_verify_cli.sh
 ```
 
 The suite runs the real command, aggregate parser, file hashing and receipt
@@ -244,3 +308,12 @@ redirects, redirect loops, response timeouts and refusal of an untrusted
 certificate. Its generated certificate is trusted only by the test subprocess,
 not installed in the system trust store. This is local transport integration,
 not qualification against actual private GitHub assets or other native platforms.
+
+The CLI integration suite runs the actual lazy registration, adapter, auditor,
+checksum parser, receipt admission, and signal supervision. Its metadata/repair
+CLI and HTTP service are explicit boundary fixtures, not qualification of the
+complete root startup, strict native release, or live GitHub repair. It covers
+more than one inventory page, fifth-payload corruption, missing/malformed
+evidence, sidecar selection, repair-once behavior, dry-run, dependency refusal,
+strict-failure preservation, release/proof/payload drift, human/JSON output,
+and cancellation of downloads and delayed repair descendants.

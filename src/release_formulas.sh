@@ -604,3 +604,48 @@ HELP
 )
 
 export -f cmd_release_formulas
+
+# This release-command module is loaded after dsr defines its handlers and
+# before main dispatches them. Preserve the authoritative metadata/strict
+# repair implementation, but never forward checksum options to its old sampler.
+_RELEASE_COMMAND_MODULE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+
+_release_verify_dispatch() {
+    local option complete=false
+    for option in "$@"; do
+        case "$option" in
+            --verify-checksums|--checksums|-c|--checksum-*|--help|-h) complete=true ;;
+        esac
+    done
+    if ! $complete; then
+        _release_verify_metadata_command "$@"
+        return $?
+    fi
+    # Missing new code is a dependency failure, never permission to fall back
+    # to spot-checking. The child metadata invocations contain no checksum flag.
+    if [[ ! -f "$_RELEASE_COMMAND_MODULE_DIR/release_verify.sh" ]] ||
+       ! source "$_RELEASE_COMMAND_MODULE_DIR/release_verify.sh"; then
+        log_error 'Complete release checksum verifier is unavailable'
+        if ${JSON_MODE:-false}; then
+            json_envelope release-verify error 3 \
+                '{"error":"Complete checksum verifier is unavailable","checksums":{"requested":true,"verified":[],"verified_count":0}}'
+        fi
+        return 3
+    fi
+    release_verify_cli "$@"
+}
+
+_release_verify_register() {
+    local original dispatch
+    original=$(declare -f cmd_release_verify) || return 0
+    dispatch=$(declare -f _release_verify_dispatch) || return 3
+    dispatch="cmd_release_verify${dispatch#_release_verify_dispatch}"
+    if [[ "$original" != "$dispatch" ]]; then
+        # Both definitions come from the trusted, already-parsed DSR source.
+        # Only the function name changes; no argument/config/release data is
+        # evaluated. Comparing complete definitions makes re-sourcing idempotent.
+        eval "_release_verify_metadata_command${original#cmd_release_verify}" || return 3
+    fi
+    eval "$dispatch"
+}
+_release_verify_register
