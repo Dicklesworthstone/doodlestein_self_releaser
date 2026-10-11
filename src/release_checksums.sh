@@ -27,6 +27,7 @@ module = Path(sys.argv[1])
 work = None
 child = None
 requests = 0
+resume = None
 report = dict(kind='dsr-release-checksum-verification', status='error', exit_code=1,
               authenticated=False, source_verified=False,
               verification_policy='sha256-all-eligible-release-assets',
@@ -208,6 +209,101 @@ def download_asset(row, directory, maximum):
             'Downloaded digest differs from release metadata: ' + row['name'])
     return destination, value
 
+def retained_directory(value):
+    path = Path(value)
+    require(path.is_absolute() and str(path) == value and value != '/' and
+            not any(part in ('.', '..') for part in path.parts) and
+            not any(ord(c) < 32 or ord(c) == 127 or c == '\\' for c in value),
+            'Resume source must be a canonical absolute directory', 4)
+    for part in [*reversed(path.parents), path]:
+        require(not part.is_symlink() and part.is_dir(), 'Resume source contains a linked or missing directory', 4)
+    return path
+
+def read_resume(selected):
+    root = retained_directory(selected)
+    values, pins = {}, {}
+    for name in ('result.json', 'selection.json'):
+        file = root / name
+        # A retained receipt combines many bounded API pages plus coverage and
+        # proof records. Use the CLI handoff limit, not the one-page HTTP cap.
+        require(regular(file).st_size <= 64 * 1024 * 1024, 'Excessive retained audit metadata', 4)
+        pins[name] = digest(file)
+        values[name] = read_json(file)
+        require(digest(file) == pins[name], 'Retained audit metadata changed while reading')
+    prior, selection = values['result.json'], values['selection.json']
+    require(isinstance(prior, dict) and isinstance(selection, dict) and
+            prior.get('kind') == report['kind'] and prior.get('verification_policy') == report['verification_policy'] and
+            type(prior.get('exit_code')) is int and 0 <= prior['exit_code'] <= 8 and
+            prior.get('status') == ('verified' if prior['exit_code'] == 0 else 'error') and
+            type(selection.get('schema_version')) is int and selection['schema_version'] == 1 and
+            selection.get('kind') == 'dsr-release-checksum-selection' and
+            selection.get('repository') == prior.get('repository') == args.repo and
+            selection.get('tag') == prior.get('tag') == args.tag and
+            selection.get('release') == prior.get('release') and
+            isinstance(selection.get('release'), dict) and integer(selection['release'].get('id'), 1) and
+            prior.get('selection_sha256') == pins['selection.json'],
+            'Resume source lacks a consistent pinned audit selection', 4)
+    require(selection.get('checksum_mode') == prior.get('checksum_mode') == args.checksum_mode and
+            selection.get('checksum_asset') == args.checksum_asset and
+            selection.get('include_metadata') is prior.get('include_metadata') is args.include_metadata and
+            (args.release_id is None or args.release_id == selection['release']['id']),
+            'Resume source differs from selected release or checksum policy', 4)
+    names = prior.get('verified_checksums')
+    require(isinstance(names, list) and all(safe_name(n) for n in names) and
+            names == sorted(set(names)) and type(prior.get('verified_count')) is int and
+            prior['verified_count'] == len(names) and isinstance(selection.get('assets'), list),
+            'Invalid retained verified-payload inventory', 4)
+    records = selection['assets']
+    require(all(isinstance(r, dict) and safe_name(r.get('name')) and integer(r.get('id'), 1) and
+                integer(r.get('size')) and (r.get('digest') is None or
+                isinstance(r['digest'], str) and re.fullmatch(r'sha256:[0-9a-fA-F]{64}', r['digest'])) for r in records) and
+            len({r['name'].casefold() for r in records}) == len(records) and
+            len({r['id'] for r in records}) == len(records) and
+            set(names) <= {r['name'] for r in records}, 'Invalid retained release asset identities', 4)
+    retained_directory(str(root / 'artifacts'))
+    if args.output_dir is not None:
+        output = Path(args.output_dir)
+        require(output != root and root not in output.parents and output not in root.parents,
+                'Resume output must not overlap retained audit evidence', 4)
+    else:
+        temporary = Path(tempfile.gettempdir()).resolve()
+        require(root != temporary and root not in temporary.parents,
+                'Temporary output directory must not be inside retained audit evidence', 4)
+    return dict(root=root, selection=selection, pins=pins, names=set(names))
+
+def resume_unchanged():
+    if resume is not None:
+        retained_directory(str(resume['root']))
+        require(all(digest(resume['root'] / name) == pin for name, pin in resume['pins'].items()),
+                'Retained audit selection or result changed during resume')
+
+def reuse_asset(row, expected):
+    # Reuse is a new byte check, not trust in an earlier success counter. The
+    # complete remote inventory must match first and ALL checksum evidence is
+    # freshly downloaded and parsed. Partial/unverified files are never used.
+    retained_directory(str(resume['root'] / 'artifacts'))
+    source = resume['root'] / 'artifacts' / row['name']
+    require(regular(source).st_size == row['size'] and digest(source) == expected,
+            'Retained verified payload changed: ' + row['name'])
+    require(row['digest'] is None or row['digest'][7:].lower() == expected,
+            'Retained payload contradicts the current API digest: ' + row['name'])
+    target = work / 'artifacts' / row['name']
+    # No hardlinks to mutable producer evidence. Preserve the failed attempt
+    # and its receipt exactly, including incomplete downloads and diagnostics.
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as incoming, target.open('xb') as outgoing:
+        require(stat.S_ISREG(os.fstat(incoming.fileno()).st_mode), 'Retained payload is not a regular file')
+        remaining = row['size']
+        while remaining:
+            block = incoming.read(min(1048576, remaining))
+            require(block, 'Retained payload shortened during resume')
+            outgoing.write(block)
+            remaining -= len(block)
+        require(not incoming.read(1), 'Retained payload grew during resume')
+    require(digest(source) == expected and digest(target) == expected,
+            'Retained payload changed while copying: ' + row['name'])
+    return target, expected
+
 def normalized_checksums(path, index, member=None):
     # A digest-only sidecar has no embedded name: its exact inventory basename
     # binds it to the selected payload. Never allow that grammar for aggregates.
@@ -266,6 +362,7 @@ try:
     parser.add_argument('--checksum-mode', choices=('aggregate', 'sidecars'), default='aggregate',
                         help='aggregate (default), or require an exact .sha256 sidecar for every payload; present conventional aggregates must also agree')
     parser.add_argument('--output-dir', help='New directory for retained downloads and the audit receipt')
+    parser.add_argument('--resume-from', help='Reuse rehashed verified payloads from an unchanged prior audit; writes only a new output directory and reacquires all checksum evidence')
     parser.add_argument('--include-metadata', action='store_true', help='Also require checksums for SBOM/provenance/build metadata (not signatures or checksums)')
     parser.add_argument('--timeout', type=int, default=120, help='Seconds per bounded network/parser operation (default: 120)')
     parser.add_argument('--max-asset-bytes', type=int, default=2 * 1024**3)
@@ -286,6 +383,8 @@ try:
     require(shutil.which('curl') and shutil.which('bash'), 'curl and Bash are required', 3)
     require(shutil.which('jq'), 'jq is required for the shared checksum parser', 3)
     require_curl()
+    if args.resume_from is not None:
+        resume = read_resume(args.resume_from)
     if args.preflight:
         # A repair caller can reject impossible policy/dependencies before its
         # first remote mutation. This is not release or credential validation.
@@ -295,6 +394,8 @@ try:
                       include_metadata=args.include_metadata, expected_release_id=args.release_id,
                       output_dir=args.output_dir, timeout=args.timeout, max_asset_bytes=args.max_asset_bytes,
                       max_total_bytes=args.max_total_bytes, inventory_stable=False)
+        if resume is not None:
+            report['resume_from'] = str(resume['root'])
         sys.exit(0)
     token = token_for_request()
     os.umask(0o077)
@@ -308,6 +409,18 @@ try:
         report['expected_release_id'] = args.release_id
         require(context['id'] == args.release_id, 'Release identity differs from the selected release ID')
     assets = inventory(context['id'])
+    selection = dict(kind='dsr-release-checksum-selection', schema_version=1,
+                     repository=args.repo, tag=args.tag, release=context, assets=assets,
+                     checksum_mode=args.checksum_mode, checksum_asset=args.checksum_asset,
+                     include_metadata=args.include_metadata)
+    if resume is not None:
+        require(selection == resume['selection'], 'Release identity, asset inventory or policy changed since retained audit')
+        report['resume'] = dict(source=str(resume['root']), source_result_sha256=resume['pins']['result.json'],
+                                source_selection_sha256=resume['pins']['selection.json'],
+                                reused_checksums=[], reused_count=0, reused_bytes=0)
+    with (work / 'selection.json').open('xb') as out:
+        out.write(canonical(selection))
+    report['selection_sha256'] = digest(work / 'selection.json')
     by_name = {row['name']: row for row in assets}
     checksum_names = ([args.checksum_asset] if args.checksum_asset else
                       [name for name in AGGREGATES if name in by_name])
@@ -345,6 +458,8 @@ try:
             'Checksum evidence cannot act as both an aggregate and a payload sidecar', 4)
     require(sum(row['size'] for row in eligible) + sum(by_name[name]['size'] for name, _ in selected_evidence) <= args.max_total_bytes,
             'Release audit exceeds the configured total download limit', 4)
+    require(all(row['size'] <= args.max_asset_bytes for row in eligible),
+            'Release asset exceeds the configured byte limit', 4)
     expected, checksum_evidence = {}, []
     for index, (name, member) in enumerate(selected_evidence, 1):
         checksum_path, checksum_digest = download_asset(by_name[name], work / 'evidence', MAX_METADATA)
@@ -372,13 +487,21 @@ try:
             'Checksum evidence does not cover the selected release inventory')
     for row in eligible:
         try:
-            _, actual = download_asset(row, work / 'artifacts', args.max_asset_bytes)
+            reused = resume is not None and row['name'] in resume['names']
+            if reused:
+                _, actual = reuse_asset(row, expected[row['name']])
+            else:
+                _, actual = download_asset(row, work / 'artifacts', args.max_asset_bytes)
             require(actual == expected[row['name']], 'Payload checksum mismatch: ' + row['name'])
         except Failure as error:
             report['checksum_errors'].append(dict(name=row['name'], error=str(error), exit_code=error.code))
             raise
         report['verified_checksums'].append(row['name'])
         report['verified_count'] += 1
+        if reused:
+            report['resume']['reused_checksums'].append(row['name'])
+            report['resume']['reused_count'] += 1
+            report['resume']['reused_bytes'] += row['size']
     require(inventory(context['id']) == assets and release_context() == context,
             'Release identity or asset inventory changed during verification')
     require(all(digest(Path(row['path'])) == row['sha256'] for row in checksum_evidence),
@@ -387,6 +510,8 @@ try:
     # full-coverage receipt. The private output directory is trusted storage.
     require(all(digest(work / 'artifacts' / row['name']) == expected[row['name']] for row in eligible),
             'Downloaded payload changed before audit completion')
+    require(digest(work / 'selection.json') == report['selection_sha256'], 'Pinned audit selection changed')
+    resume_unchanged()
     # Export ONLY actually verified records. Excluded metadata can occur in an
     # aggregate, but its unchecked digest must never propagate as audited data.
     with (work / 'checksums.normalized').open('xb') as stream:
