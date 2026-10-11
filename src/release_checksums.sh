@@ -111,7 +111,7 @@ def run(command, *, incoming=None, limit=60):
         child = None
 
 def token_for_request():
-    token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN') or ''
+    token = os.environ.get('DSR_GH_TOKEN') or os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN') or ''
     if not token and shutil.which('gh'):
         code, stdout, _ = run(['gh', 'auth', 'token', '--hostname', 'github.com'], limit=15)
         if code == 0:
@@ -231,9 +231,9 @@ def normalized_checksums(path, index, member=None):
             'Checksum sidecar must contain exactly its own payload record', 4)
     return rows
 
-def owned_output(selected):
+def output_path(selected):
     if selected is None:
-        return Path(tempfile.mkdtemp(prefix='dsr-release-checksums-')).resolve()
+        return None
     path = Path(selected)
     require(path.is_absolute() and str(path) == selected and not any(p in ('.', '..') for p in path.parts),
             'Audit output must be a canonical absolute path', 4)
@@ -242,6 +242,12 @@ def owned_output(selected):
     for part in [*reversed(path.parents), path]:
         require(not part.is_symlink(), 'Audit output may not contain symlinks', 4)
     require(path.parent.is_dir() and not path.exists(), 'Audit output must be a new directory with an existing parent', 4)
+    return path
+
+def owned_output(selected):
+    path = output_path(selected)
+    if path is None:
+        return Path(tempfile.mkdtemp(prefix='dsr-release-checksums-')).resolve()
     path.mkdir(mode=0o700)
     return path
 
@@ -254,6 +260,8 @@ try:
         allow_abbrev=False)
     parser.add_argument('--repo', required=True)
     parser.add_argument('--tag', required=True)
+    parser.add_argument('--release-id', type=int, help='Require the release ID already selected by the caller; refuse a replacement release before downloading assets')
+    parser.add_argument('--preflight', action='store_true', help='Validate options, output path and local dependencies only; no authentication, network or audit output')
     parser.add_argument('--checksum-asset', help='Exact aggregate name; default: a conventional aggregate, never a payload sidecar')
     parser.add_argument('--checksum-mode', choices=('aggregate', 'sidecars'), default='aggregate',
                         help='aggregate (default), or require an exact .sha256 sidecar for every payload; present conventional aggregates must also agree')
@@ -274,9 +282,20 @@ try:
             '--checksum-asset cannot override the complete sidecar selection', 4)
     require(integer(args.timeout, 1, 3600) and integer(args.max_asset_bytes, 1) and integer(args.max_total_bytes, 1),
             'Invalid acquisition limit', 4)
+    require(args.release_id is None or integer(args.release_id, 1), 'Invalid expected release ID', 4)
     require(shutil.which('curl') and shutil.which('bash'), 'curl and Bash are required', 3)
     require(shutil.which('jq'), 'jq is required for the shared checksum parser', 3)
     require_curl()
+    if args.preflight:
+        # A repair caller can reject impossible policy/dependencies before its
+        # first remote mutation. This is not release or credential validation.
+        output_path(args.output_dir)
+        report.update(status='planned', exit_code=0, preflight=True, repository=args.repo, tag=args.tag,
+                      checksum_mode=args.checksum_mode, checksum_asset=args.checksum_asset,
+                      include_metadata=args.include_metadata, expected_release_id=args.release_id,
+                      output_dir=args.output_dir, timeout=args.timeout, max_asset_bytes=args.max_asset_bytes,
+                      max_total_bytes=args.max_total_bytes, inventory_stable=False)
+        sys.exit(0)
     token = token_for_request()
     os.umask(0o077)
     work = owned_output(args.output_dir)
@@ -285,6 +304,9 @@ try:
                   checksum_mode=args.checksum_mode)
     context = release_context()
     report['release'] = context
+    if args.release_id is not None:
+        report['expected_release_id'] = args.release_id
+        require(context['id'] == args.release_id, 'Release identity differs from the selected release ID')
     assets = inventory(context['id'])
     by_name = {row['name']: row for row in assets}
     checksum_names = ([args.checksum_asset] if args.checksum_asset else
