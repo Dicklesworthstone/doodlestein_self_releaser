@@ -259,17 +259,48 @@
     },
     "xwin_absolute_path": {
       "type": "string", "minLength": 2,
-      "pattern": "^/[^\\u0000-\\u001f\\u007f]+$"
+      "pattern": "^/[^\\u0000-\\u001f\\u007f]+$",
+      "not": {"pattern": "[\\u0000-\\u001f\\u007f]"}
+    },
+    "xwin_sdk_selection": {
+      "type": "object",
+      "description": "Observed pinned-xwin SDK path and base-environment selection, required equal before/after compilation and before artifact admission. SDK contents remain separately authenticated by the full toolchain inventory; this is not an RCH worker receipt.",
+      "required": ["schema_version", "kind", "manifest_sha256", "target", "view", "cache_dir", "sysroot_link", "sysroot", "environment"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "kind": {"const": "dsr-xwin-sdk-selection"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "target": {"$ref": "#/$defs/xwin_target"},
+        "view": {"$ref": "#/$defs/xwin_absolute_path"},
+        "cache_dir": {"$ref": "#/$defs/xwin_absolute_path"},
+        "sysroot_link": {"$ref": "#/$defs/xwin_absolute_path"},
+        "sysroot": {"$ref": "#/$defs/xwin_absolute_path"},
+        "environment": {
+          "type": "object",
+          "required": ["XWIN_CACHE_DIR", "XWIN_CROSS_COMPILER", "XWIN_MSVC_SYSROOT_DOWNLOAD_URL", "CFLAGS", "CXXFLAGS", "LIB"],
+          "additionalProperties": false,
+          "properties": {
+            "XWIN_CACHE_DIR": {"$ref": "#/$defs/xwin_absolute_path"},
+            "XWIN_CROSS_COMPILER": {"const": "clang"},
+            "XWIN_MSVC_SYSROOT_DOWNLOAD_URL": {"type": "string", "pattern": "^https://[^/@?#\\s]+/[^?#\\s]+$", "not": {"pattern": "[\\u0000-\\u001f\\u007f]"}},
+            "CFLAGS": {"type": "string", "pattern": "^-nobuiltininc -I /[^\\u0000-\\u001f\\u007f]+$", "not": {"pattern": "[\\u0000-\\u001f\\u007f]"}},
+            "CXXFLAGS": {"type": "string", "pattern": "^-nobuiltininc -I /[^\\u0000-\\u001f\\u007f]+$", "not": {"pattern": "[\\u0000-\\u001f\\u007f]"}},
+            "LIB": {"$ref": "#/$defs/xwin_absolute_path"}
+          }
+        }
+      }
     },
     "xwin_build_environment": {
       "type": "object",
       "description": "Source-pinned cargo-xwin execution on the local Linux host, retaining the selected Windows target and verified toolchain, source, Cargo graph and private-cache evidence.",
-      "required": ["target", "target_triple", "host", "method", "build_influence_env", "tool_versions", "toolchain", "cargo_metadata", "source_snapshot", "cargo_cache", "feature_selection", "command"],
+      "required": ["target", "target_triple", "host", "method", "build_influence_env", "tool_versions", "toolchain", "selected_sdk", "cargo_metadata", "source_snapshot", "cargo_cache", "feature_selection", "command"],
       "additionalProperties": false,
       "allOf": [{
         "if": {"properties": {"target": {"const": "windows/amd64"}}, "required": ["target"]},
         "then": {"properties": {
           "target_triple": {"const": "x86_64-pc-windows-msvc"},
+          "selected_sdk": {"properties": {"target": {"const": "x86_64-pc-windows-msvc"}}},
           "toolchain": {"properties": {
             "target": {"const": "x86_64-pc-windows-msvc"},
             "inputs": {"properties": {"target": {"const": "x86_64-pc-windows-msvc"}}}
@@ -277,6 +308,7 @@
         }},
         "else": {"properties": {
           "target_triple": {"const": "aarch64-pc-windows-msvc"},
+          "selected_sdk": {"properties": {"target": {"const": "aarch64-pc-windows-msvc"}}},
           "toolchain": {"properties": {
             "target": {"const": "aarch64-pc-windows-msvc"},
             "inputs": {"properties": {"target": {"const": "aarch64-pc-windows-msvc"}}}
@@ -301,6 +333,7 @@
           }
         },
         "toolchain": {"$ref": "#/$defs/xwin_toolchain"},
+        "selected_sdk": {"$ref": "#/$defs/xwin_sdk_selection"},
         "cargo_metadata": {"$ref": "#/$defs/xwin_cargo_metadata"},
         "source_snapshot": {"$ref": "#/$defs/xwin_source_snapshot"},
         "cargo_cache": {

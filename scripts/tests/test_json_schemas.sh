@@ -320,7 +320,15 @@ def protocol_fixture(platform, triple):
                     resolved_siblings=[], resolved_packages=1, dependency_sources=dependency_sources)
     cache = dict(schema_version=1, cargo_home="/build/cargo-home", receipt_path="/build/receipt.json",
                  receipt_sha256=digest, inventory_sha256=digest, caches=[], file_count=0, size_bytes=0)
-    environment = dict(target=platform, target_triple=triple, host="local", method="pinned-cargo-xwin", build_influence_env={},
+    # Explicit structural selector fixture, not an observation of SDK use.
+    sdk_view, sdk_cache = "/fixture-sdk/"+digest, "/build/xwin"
+    sdk_env = dict(XWIN_CACHE_DIR=sdk_cache,XWIN_CROSS_COMPILER="clang",XWIN_MSVC_SYSROOT_DOWNLOAD_URL=archive["url"],
+                   CFLAGS="-nobuiltininc -I "+sdk_view+"/include",CXXFLAGS="-nobuiltininc -I "+sdk_view+"/include",LIB=sdk_view+"/lib")
+    sdk_selection = dict(schema_version=1,kind="dsr-xwin-sdk-selection",manifest_sha256=digest,target=triple,
+                        view=sdk_view,cache_dir=sdk_cache,sysroot_link=sdk_cache+"/windows-msvc-sysroot",
+                        sysroot=sdk_view+"/sysroot",environment=sdk_env.copy())
+    environment = dict(target=platform, target_triple=triple, host="local", method="pinned-cargo-xwin", build_influence_env=sdk_env,
+        selected_sdk=sdk_selection,
         tool_versions={role:digest for role in roles}, toolchain=toolchain, cargo_metadata=metadata, source_snapshot=source,
         cargo_cache=dict(mode="private-copy", seed=dict(cache, mode="private-copy", selection=dict(kind="cargo-lock-downloads",
             lockfile_sha256=digest, registry_packages=0, git_revisions=[])), final=dict(cache, mode="inventory")),
@@ -366,6 +374,20 @@ for fixture in fixtures:
         ("producer triple",env+("target_triple",),opposite),
         ("toolchain target",env+("toolchain","target"),opposite),
         ("pinned input target",env+("toolchain","inputs","target"),opposite),
+        ("missing SDK selection",env+("selected_sdk",),missing),
+        ("SDK selection target",env+("selected_sdk","target"),opposite),
+        ("SDK selection kind",env+("selected_sdk","kind"),"unverified"),
+        ("boolean SDK schema version",env+("selected_sdk","schema_version"),True),
+        ("SDK manifest digest",env+("selected_sdk","manifest_sha256"),"bad"),
+        ("relative SDK cache",env+("selected_sdk","cache_dir"),"relative/cache"),
+        ("unknown SDK observation field",env+("selected_sdk","unreviewed"),True),
+        ("SDK backend",env+("selected_sdk","environment","XWIN_CROSS_COMPILER"),"cl"),
+        ("unknown SDK environment selector",env+("selected_sdk","environment","RUSTFLAGS"),"unreviewed"),
+        ("SDK flags control character",env+("selected_sdk","environment","CFLAGS"),"-nobuiltininc -I /headers\nother"),
+        ("SDK flags final newline",env+("selected_sdk","environment","CFLAGS"),"-nobuiltininc -I /headers\n"),
+        ("SDK C++ flags final newline",env+("selected_sdk","environment","CXXFLAGS"),"-nobuiltininc -I /headers\n"),
+        ("SDK path final newline",env+("selected_sdk","cache_dir"),"/build/xwin\n"),
+        ("SDK URL final newline",env+("selected_sdk","environment","XWIN_MSVC_SYSROOT_DOWNLOAD_URL"),"https://example.invalid/sdk.tar.xz\n"),
         ("artifact target triple",("artifacts",0,"target_triple"),opposite),
         ("missing producer triple",env+("target_triple",),missing),
         ("native method cannot hide xwin evidence",env+("method",),"native"),

@@ -338,6 +338,34 @@ _slsa_manifest_statement() {
         def target: text and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
         def triple: text and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$") and (contains("..") | not);
         def optional_triple: . == null or triple;
+        # This is a selector-consistency check on producer observations. The
+        # pinned builder must still verify the complete SDK inventory and tool
+        # bytes; a path record alone does not qualify compiler execution.
+        def pinned_xwin_sdk_selection:
+            . as $e | .selected_sdk as $s |
+            ($s | type == "object") and $s.schema_version == 1 and
+            $s.kind == "dsr-xwin-sdk-selection" and
+            ($s.manifest_sha256 | sha) and
+            $s.manifest_sha256 == $e.toolchain.manifest_sha256 and
+            $s.target == $e.target_triple and $s.target == $e.toolchain.target and
+            $s.target == $e.toolchain.inputs.target and
+            (if $s.target == "x86_64-pc-windows-msvc" then $e.target == "windows/amd64"
+             elif $s.target == "aarch64-pc-windows-msvc" then $e.target == "windows/arm64"
+             else false end) and
+            ($s.view | text and startswith("/") and endswith("/" + $s.manifest_sha256)) and
+            ($s.cache_dir | text and startswith("/")) and
+            $s.sysroot == ($s.view + "/sysroot") and
+            $s.sysroot_link == ($s.cache_dir + "/windows-msvc-sysroot") and
+            $s.environment == ($e.build_influence_env | {
+                XWIN_CACHE_DIR,XWIN_CROSS_COMPILER,XWIN_MSVC_SYSROOT_DOWNLOAD_URL,CFLAGS,CXXFLAGS,LIB}) and
+            $s.environment.XWIN_CACHE_DIR == $s.cache_dir and
+            $s.environment.XWIN_CROSS_COMPILER == "clang" and
+            ($s.environment.XWIN_MSVC_SYSROOT_DOWNLOAD_URL | text) and
+            $s.environment.XWIN_MSVC_SYSROOT_DOWNLOAD_URL == $e.toolchain.inputs.sysroot.url and
+            $s.environment.CFLAGS == ("-nobuiltininc -I " + $s.view + "/include") and
+            $s.environment.CXXFLAGS == $s.environment.CFLAGS and
+            $s.environment.LIB == ($s.view + "/lib") and
+            ($e.toolchain.files | type == "array" and length > 0);
         # The bundle producer qualifies tag refs; native receipts can retain
         # the equivalent short spelling. Do not rewrite the original receipt
         # or equate refs/heads/* with tags. The source commit still must match.
@@ -427,6 +455,9 @@ _slsa_manifest_statement() {
                   .cargo_isolation.toolchain.target_triple] |
                  any(.[]; . != null and . != $e.target_triple))))
         then error("build environment contradicts source or compiler identity") else . end |
+        if any($environments[] | select(.method == "pinned-cargo-xwin");
+            (pinned_xwin_sdk_selection | not))
+        then error("pinned xwin environment lacks matching compiler-selected SDK observations") else . end |
         (.artifacts | group_by(.target) | map(
             .[0].target as $platform |
             (map(.target_triple // "") | unique) as $triples |
@@ -492,7 +523,7 @@ _slsa_manifest_statement() {
                  (if (any($tasks[]; .target_triple != null) or ($m | has("required_variants"))) and .target_triple != null
                   then {target_triple:.target_triple} else {} end)))} +
              (if any($tasks[]; .target_triple != null) then {build_tasks:$tasks} else {} end))}
-    ' "$manifest" 2>/dev/null) || { _slsa_log 'Invalid or incomplete DSR build manifest'; return 4; }
+    ' "$manifest") || { _slsa_log 'Invalid or incomplete DSR build manifest'; return 4; }
     [[ "$(_slsa_sha256 "$manifest")" == "$digest" ]] || return 1
     printf '%s\n' "$statement"
 }

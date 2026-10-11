@@ -742,11 +742,22 @@ xwin_payload=exporter-report-aarch64-pc-windows-msvc
 printf 'saved exporter receipt fixture; no Windows compilation\n' > "$xwin_receipt_dir/$xwin_payload"
 jq --arg name "$xwin_payload" --arg sha "$(_gh_asset_sha256 "$xwin_receipt_dir/$xwin_payload")" \
     --argjson size "$(wc -c < "$xwin_receipt_dir/$xwin_payload")" '
+    # Synthetic saved-receipt selectors for planning; no SDK observation.
+    ("d"*64) as $sdk_key | ("/fixture-sdk/"+$sdk_key) as $sdk_view |
+    {XWIN_CACHE_DIR:"/fixture-run/xwin",XWIN_CROSS_COMPILER:"clang",
+     XWIN_MSVC_SYSROOT_DOWNLOAD_URL:"https://example.invalid/fixture/sdk.tar.xz",
+     CFLAGS:("-nobuiltininc -I "+$sdk_view+"/include"),
+     CXXFLAGS:("-nobuiltininc -I "+$sdk_view+"/include"),LIB:($sdk_view+"/lib")} as $sdk_env |
     .requested_targets=["windows/arm64"] |
     .summary={total:1,success:1,failed:0} |
-    .build_environments=[{target:"windows/arm64",method:"pinned-cargo-xwin",
-        build_influence_env:{CARGO_BUILD_TARGET:"aarch64-pc-windows-msvc"},
-        tool_versions:{},toolchain:{},cargo_metadata:{},source_snapshot:{},
+    .build_environments=[{target:"windows/arm64",target_triple:"aarch64-pc-windows-msvc",method:"pinned-cargo-xwin",
+        build_influence_env:($sdk_env+{CARGO_BUILD_TARGET:"aarch64-pc-windows-msvc"}),
+        selected_sdk:{schema_version:1,kind:"dsr-xwin-sdk-selection",manifest_sha256:$sdk_key,
+            target:"aarch64-pc-windows-msvc",view:$sdk_view,cache_dir:$sdk_env.XWIN_CACHE_DIR,
+            sysroot_link:($sdk_env.XWIN_CACHE_DIR+"/windows-msvc-sysroot"),sysroot:($sdk_view+"/sysroot"),environment:$sdk_env},
+        tool_versions:{},toolchain:{target:"aarch64-pc-windows-msvc",manifest_sha256:$sdk_key,
+            inputs:{target:"aarch64-pc-windows-msvc",sysroot:{url:$sdk_env.XWIN_MSVC_SYSROOT_DOWNLOAD_URL}},
+            files:[{path:"sysroot",type:"directory",sha256:"",size_bytes:0}]},cargo_metadata:{},source_snapshot:{},
         cargo_cache:null,command:"fixture command not executed"}] |
     .artifacts=[{name:$name,target:"windows/arm64",target_triple:"aarch64-pc-windows-msvc",
         sha256:$sha,size_bytes:$size,archive_format:"binary",signed:false,signature_file:""}]

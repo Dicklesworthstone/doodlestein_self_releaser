@@ -337,6 +337,11 @@ assert 'full evidence is retained in manifest rather than discarded' jq -e \
      (.toolchain.files|length)>3 and (.toolchain.inputs.tools|has("cargo-xwin")) and
      .cargo_metadata.package=="probe" and (.cargo_metadata.metadata_sha256|length)==64 and
      .build_influence_env.XWIN_CROSS_COMPILER=="clang" and (.build_influence_env|has("UNRELATED_SECRET")|not)' "$RELEASE_MANIFEST"
+assert 'release manifest retains the compiler-selected SDK observation' jq -en \
+    --slurpfile result "$WORK/success.json" --slurpfile manifest "$RELEASE_MANIFEST" '
+    $manifest[0].build_environments[0].selected_sdk==$result[0].selected_sdk and
+    $manifest[0].build_environments[0].selected_sdk.kind=="dsr-xwin-sdk-selection" and
+    $manifest[0].build_environments[0].selected_sdk.target==$manifest[0].build_environments[0].target_triple'
 assert 'dependency-source summary binds the coordinator-held final metadata graph' jq -e \
     --arg sha "$(_xwt_hash "$WORK/good/metadata-after.json")" '
     .build_environments[0].cargo_metadata |
@@ -351,6 +356,32 @@ assert 'artifact hash and size match the verified PE bytes' bash -c \
     _ "$WORK/good/artifacts/release-probe.exe" "$RELEASE_MANIFEST"
 assert 'existing publication/SLSA profile accepts runner manifest' _slsa_manifest_statement "$RELEASE_MANIFEST" owner/probe dsr:pinned-cargo-xwin
 cp "$WORK/assert.out" "$WORK/statement.json"
+# These use the actual publication parser on retained altered manifests. They
+# do not stand in for a real Cargo build, SDK inventory or RCH worker receipt.
+SDK_MANIFEST_BEFORE=$(_xwt_hash "$RELEASE_MANIFEST") || exit 1
+for SDK_MUTATION in missing wrong-target wrong-manifest wrong-view wrong-sysroot wrong-link wrong-cache \
+    wrong-flags wrong-backend wrong-url missing-inventory; do
+    case "$SDK_MUTATION" in
+        missing) SDK_FILTER='del(.build_environments[0].selected_sdk)' ;;
+        wrong-target) SDK_FILTER='.build_environments[0].selected_sdk.target="other-pc-windows-msvc"' ;;
+        wrong-manifest) SDK_FILTER='.build_environments[0].selected_sdk.manifest_sha256=("0"*64)' ;;
+        wrong-view) SDK_FILTER='.build_environments[0].selected_sdk.view="/other/sdk-view"' ;;
+        wrong-sysroot) SDK_FILTER='.build_environments[0].selected_sdk.sysroot="/other/sysroot"' ;;
+        wrong-link) SDK_FILTER='.build_environments[0].selected_sdk.sysroot_link="/other/sysroot-link"' ;;
+        wrong-cache) SDK_FILTER='.build_environments[0].selected_sdk.cache_dir="/other/xwin"' ;;
+        wrong-flags) SDK_FILTER='.build_environments[0].selected_sdk.environment.CFLAGS="-I /other/headers" |
+            .build_environments[0].build_influence_env.CFLAGS="-I /other/headers"' ;;
+        wrong-backend) SDK_FILTER='.build_environments[0].selected_sdk.environment.XWIN_CROSS_COMPILER="cl" |
+            .build_environments[0].build_influence_env.XWIN_CROSS_COMPILER="cl"' ;;
+        wrong-url) SDK_FILTER='.build_environments[0].selected_sdk.environment.XWIN_MSVC_SYSROOT_DOWNLOAD_URL="https://example.invalid/other.tar.xz" |
+            .build_environments[0].build_influence_env.XWIN_MSVC_SYSROOT_DOWNLOAD_URL="https://example.invalid/other.tar.xz"' ;;
+        missing-inventory) SDK_FILTER='.build_environments[0].toolchain.files=[]' ;;
+    esac
+    jq "$SDK_FILTER" "$RELEASE_MANIFEST" > "$WORK/sdk-manifest-$SDK_MUTATION.json" || exit 1
+    reject "publication refuses $SDK_MUTATION SDK selection" 4 \
+        _slsa_manifest_statement "$WORK/sdk-manifest-$SDK_MUTATION.json" owner/probe dsr:pinned-cargo-xwin
+done
+assert 'SDK profile negatives preserve the original manifest bytes' test "$SDK_MANIFEST_BEFORE" = "$(_xwt_hash "$RELEASE_MANIFEST")"
 assert 'existing SLSA mapping binds source commit and release asset' jq -e --arg sha "$SHA" \
     '.subject[0].name=="release-probe.exe" and .predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit==$sha' "$WORK/statement.json"
 assert 'metadata diagnostic is separated from parseable Cargo JSON' grep -Fxq 'metadata diagnostic on stderr' "$WORK/good/metadata-before.log"

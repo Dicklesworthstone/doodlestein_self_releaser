@@ -110,8 +110,18 @@ value = {'schema_version':'1.0.0', 'tool':tool, 'version':tag, 'run_id':'1234567
          'build_environments':[{'target':target, 'method':kind, 'retained_evidence':'x'*150000} for target in targets]}
 if kind == 'xwin':
     environment = value['build_environments'][0]
+    # Synthetic selector shape for coordinator tests, not an observed SDK.
+    sdk_key, sdk_url = 'd'*64, 'https://example.invalid/fixture/sdk.tar.xz'
+    sdk_view, sdk_cache = '/fixture-sdk/'+sdk_key, '/fixture-run/xwin'
+    sdk_env = dict(XWIN_CACHE_DIR=sdk_cache, XWIN_CROSS_COMPILER='clang',
+                   XWIN_MSVC_SYSROOT_DOWNLOAD_URL=sdk_url, CFLAGS='-nobuiltininc -I '+sdk_view+'/include',
+                   CXXFLAGS='-nobuiltininc -I '+sdk_view+'/include', LIB=sdk_view+'/lib')
     environment.update(method='pinned-cargo-xwin', target_triple=spec['target'],
-                       toolchain={'target':spec['target'],'inputs':{'target':spec['target']}})
+        build_influence_env=sdk_env, selected_sdk=dict(schema_version=1,kind='dsr-xwin-sdk-selection',
+            manifest_sha256=sdk_key,target=spec['target'],view=sdk_view,cache_dir=sdk_cache,
+            sysroot_link=sdk_cache+'/windows-msvc-sysroot',sysroot=sdk_view+'/sysroot',environment=sdk_env),
+        toolchain=dict(target=spec['target'],manifest_sha256=sdk_key,inputs=dict(target=spec['target'],sysroot=dict(url=sdk_url)),
+                       files=[dict(path='sysroot',type='directory',sha256='',size_bytes=0)]))
     value['build_environments'][0]['feature_selection'] = {
         'features':arg('--features').split(',') if '--features' in args else [], 'all_features':'--all-features' in args,
         'no_default_features':'--no-default-features' in args}

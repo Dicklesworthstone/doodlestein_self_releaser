@@ -94,8 +94,17 @@ value = dict(schema_version="1.0.0", tool="demo", version="v1.2.3", run_id=uuid,
              requested_targets=[target], status="success", publishable=True, build_purpose="release",
              summary=dict(total=1, success=1, failed=0), artifacts=artifacts)
 if kind == "xwin":
+    # Synthetic SDK selector data preserves this filesystem-recovery fixture.
+    sdk_key, sdk_url = "d"*64, "https://example.invalid/fixture/sdk.tar.xz"
+    sdk_view, sdk_cache = "/fixture-sdk/"+sdk_key, "/fixture-run/xwin"
+    sdk_env = dict(XWIN_CACHE_DIR=sdk_cache,XWIN_CROSS_COMPILER="clang",XWIN_MSVC_SYSROOT_DOWNLOAD_URL=sdk_url,
+                   CFLAGS="-nobuiltininc -I "+sdk_view+"/include",CXXFLAGS="-nobuiltininc -I "+sdk_view+"/include",LIB=sdk_view+"/lib")
     value["build_environments"] = [dict(target=target, target_triple=spec["target"],
-                                      method="pinned-cargo-xwin", toolchain=dict(target=spec["target"], inputs=dict(target=spec["target"])))]
+        method="pinned-cargo-xwin",build_influence_env=sdk_env,
+        selected_sdk=dict(schema_version=1,kind="dsr-xwin-sdk-selection",manifest_sha256=sdk_key,target=spec["target"],
+            view=sdk_view,cache_dir=sdk_cache,sysroot_link=sdk_cache+"/windows-msvc-sysroot",sysroot=sdk_view+"/sysroot",environment=sdk_env),
+        toolchain=dict(target=spec["target"],manifest_sha256=sdk_key,inputs=dict(target=spec["target"],sysroot=dict(url=sdk_url)),
+                       files=[dict(path="sysroot",type="directory",sha256="",size_bytes=0)]))]
 if mode == "wrong-source": value["source"]["git_sha"] = "b"*40
 manifest.parent.mkdir(parents=True, exist_ok=True)
 manifest.write_text(json.dumps(value) + "\n")

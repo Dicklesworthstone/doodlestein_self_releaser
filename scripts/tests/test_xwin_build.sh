@@ -5,6 +5,123 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 source "$ROOT/src/xwin_build.sh"
+# Actual filesystem/selector regression tests, without substituting a compiler
+# or an SDK verifier. This mode proves path binding only; it does not build,
+# inventory a real SDK, exercise RCH, or qualify a release. All inputs/logs are
+# retained, and external release-wave admission is required before execution.
+if [[ "${1:-}" == --selected-sdk-path-tests ]]; then
+    for TOOL in jq python3 sha256sum; do command -v "$TOOL" >/dev/null || exit 3; done
+    SDK_TEST_BASE="${DSR_TEST_TMPDIR:-${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}}"
+    [[ -d "$SDK_TEST_BASE" ]] || exit 3
+    SDK_TEST_WORK=$(mktemp -d "$SDK_TEST_BASE/dsr-xwin-sdk-selection.XXXXXXXX") || exit 1
+    SDK_TEST_WORK=$(cd "$SDK_TEST_WORK" && pwd -P) || exit 1
+    printf 'Retained selected-SDK path inputs and diagnostics: %s\n' "$SDK_TEST_WORK" >&2
+    sdk_path_case() {
+        local label=$1 target=$2 mutation=$3 expected=$4 directory run view key plan chosen output name rc=0
+        local observation="" observed_input=""
+        local -a environment=()
+        directory="$SDK_TEST_WORK/$label" run="$SDK_TEST_WORK/$label/run"
+        mkdir -p "$run/xwin" "$directory/cache" "$directory/other" || return 1
+        plan=$(jq -cnS --arg target "$target" \
+            '{target:$target,sysroot:{url:"https://example.invalid/pinned/sdk.tar.xz"}}') || return 1
+        printf '%s\n' "$plan" > "$run/manifest.json" || return 1
+        key=$(_xwt_hash "$run/manifest.json") || return 1
+        [[ "$mutation" != wrong-view-key ]] || key=$(printf '%064d' 0)
+        view="$directory/cache/$key"
+        mkdir "$view" || return 1
+        for name in sysroot include lib; do
+            if [[ "$mutation" == "linked-$name" ]]; then
+                ln -s "$directory/other" "$view/$name" || return 1
+            else
+                mkdir "$view/$name" || return 1
+            fi
+        done
+        chosen="$view/sysroot"
+        case "$mutation" in
+            wrong-link) chosen="$directory/other" ;;
+            broken-link) chosen="$directory/missing" ;;
+            nested-root) mkdir "$view/sysroot/windows-msvc-sysroot" || return 1 ;;
+            nested-file) printf 'ordinary pinned file, not a selected SDK directory\n' > "$view/sysroot/windows-msvc-sysroot" || return 1 ;;
+            nested-link) ln -s "$directory/other" "$view/sysroot/windows-msvc-sysroot" || return 1 ;;
+            broken-nested-link) ln -s "$directory/missing" "$view/sysroot/windows-msvc-sysroot" || return 1 ;;
+        esac
+        if [[ "$mutation" == regular-root ]]; then
+            mkdir "$run/xwin/windows-msvc-sysroot" || return 1
+        elif [[ "$mutation" != missing-link ]]; then
+            ln -s "$chosen" "$run/xwin/windows-msvc-sysroot" || return 1
+        fi
+        environment=("XWIN_CACHE_DIR=$run/xwin" "XWIN_CROSS_COMPILER=clang"
+            "XWIN_MSVC_SYSROOT_DOWNLOAD_URL=https://example.invalid/pinned/sdk.tar.xz"
+            "CFLAGS=-nobuiltininc -I $view/include" "CXXFLAGS=-nobuiltininc -I $view/include" "LIB=$view/lib")
+        case "$mutation" in
+            wrong-cache) environment[0]="XWIN_CACHE_DIR=$directory/other" ;;
+            wrong-backend) environment[1]="XWIN_CROSS_COMPILER=cl" ;;
+            wrong-url) environment[2]="XWIN_MSVC_SYSROOT_DOWNLOAD_URL=https://example.invalid/other.tar.xz" ;;
+            wrong-cflags) environment[3]="CFLAGS=-I $directory/other" ;;
+            wrong-cxxflags) environment[4]="CXXFLAGS=-I $directory/other" ;;
+            wrong-lib) environment[5]="LIB=$directory/other" ;;
+            duplicate-cache) environment+=("XWIN_CACHE_DIR=$directory/other") ;;
+        esac
+        output="$run/environment.nul"
+        [[ "$mutation" != linked-environment ]] || output="$directory/environment.nul"
+        if [[ "$mutation" == truncated-environment ]]; then
+            printf '%s' "${environment[0]}" > "$output" || return 1
+        else
+            printf '%s\0' "${environment[@]}" > "$output" || return 1
+        fi
+        [[ "$mutation" != linked-environment ]] || ln -s "$output" "$run/environment.nul" || return 1
+        [[ "$mutation" != wrong-plan ]] || plan=$(jq -c '.target="other-pc-windows-msvc"' <<< "$plan") || return 1
+        if [[ "$mutation" == existing-output || "$mutation" == linked-output ]]; then
+            printf 'preserve existing SDK receipt destination\n' > "$directory/sentinel" || return 1
+            observation="$run/sdk-after-build.json"
+            if [[ "$mutation" == linked-output ]]; then
+                ln -s "$directory/sentinel" "$observation" || return 1
+            else
+                cp "$directory/sentinel" "$observation" || return 1
+            fi
+        fi
+        [[ "$mutation" != exclusive-output ]] || observation="$run/sdk-after-build.json"
+        _xwb_check_sdk_selection "$plan" "$run" "$view" "$observation" \
+            > "$directory/observed.json" 2> "$directory/diagnostics.log" || rc=$?
+        cat "$directory/diagnostics.log" >&2
+        [[ "$rc" == "$expected" ]] || return 1
+        if ((expected == 0)); then
+            observed_input="$directory/observed.json"
+            if [[ -n "$observation" ]]; then
+                [[ -f "$observation" && ! -L "$observation" && ! -s "$directory/observed.json" ]] || return 1
+                observed_input="$observation"
+            fi
+            jq -es --arg run "$run" --arg view "$view" --arg key "$key" --arg target "$target" '
+                length==1 and .[0].kind=="dsr-xwin-sdk-selection" and
+                .[0].manifest_sha256==$key and .[0].target==$target and
+                .[0].sysroot_link==($run+"/xwin/windows-msvc-sysroot") and
+                .[0].sysroot==($view+"/sysroot") and .[0].view==$view and
+                .[0].cache_dir==($run+"/xwin") and
+                .[0].environment.CFLAGS==("-nobuiltininc -I "+$view+"/include")
+            ' "$observed_input" >/dev/null || return 1
+        else
+            [[ ! -s "$directory/observed.json" ]] || return 1
+            if [[ -n "$observation" ]]; then
+                cmp -s "$directory/sentinel" "$observation" || return 1
+                [[ "$mutation" != linked-output || -L "$observation" ]] || return 1
+            fi
+        fi
+        printf 'Selected SDK path case completed: %s (expected status %s)\n' "$label" "$expected"
+    }
+    for target in aarch64-pc-windows-msvc x86_64-pc-windows-msvc; do
+        sdk_path_case "$target-valid" "$target" valid 0 || exit 1
+        sdk_path_case "$target-exclusive-output" "$target" exclusive-output 0 || exit 1
+        sdk_path_case "$target-nested-file" "$target" nested-file 0 || exit 1
+        for mutation in wrong-link broken-link missing-link regular-root linked-sysroot linked-include linked-lib \
+            nested-root nested-link broken-nested-link wrong-cache wrong-backend wrong-url wrong-cflags \
+            wrong-cxxflags wrong-lib duplicate-cache truncated-environment linked-environment wrong-view-key wrong-plan \
+            existing-output linked-output; do
+            sdk_path_case "$target-$mutation" "$target" "$mutation" 7 || exit 1
+        done
+    done
+    printf 'Selected SDK path cases completed; no compiler, SDK-inventory or native qualification\n'
+    exit 0
+fi
 # Actual policy boundaries only, with no SDK, compiler, worker, cleanup or
 # substituted backend. Run this mode only after external release-wave admission.
 # Help is planning evidence; none of these cases qualifies a native build.
@@ -238,6 +355,15 @@ assert 'exact build command and normalized influence environment retained' jq -e
     (.build_influence_env|has("RUSTFLAGS")|not) and .build_influence_env.RUSTC_WRAPPER==""' "$WORK/success.json"
 assert 'tool identities and before/after version hashes retained' jq -e '.toolchain.inputs.tools|has("rustc") and has("cargo-xwin") and has("llvm-ar")' "$WORK/success.json"
 assert 'before/after version maps agree' cmp -s "$WORK/good/versions-before.json" "$WORK/good/versions-after.json"
+assert 'compiler SDK selection agrees before/after build and artifact admission' bash -c \
+    'cmp -s "$1/sdk-before-build.json" "$1/sdk-after-build.json" && cmp -s "$1/sdk-before-build.json" "$1/sdk-before-admission.json"' _ "$WORK/good"
+assert 'result retains the selected SDK and environment binding' jq -e '
+    . as $r | .selected_sdk.kind=="dsr-xwin-sdk-selection" and
+    .selected_sdk.manifest_sha256==$r.manifest_sha256 and .selected_sdk.target==$r.target and
+    .selected_sdk.cache_dir==$r.build_influence_env.XWIN_CACHE_DIR and
+    .selected_sdk.environment.CFLAGS==$r.build_influence_env.CFLAGS and
+    .selected_sdk.sysroot==(.selected_sdk.view+"/sysroot")
+' "$WORK/success.json"
 assert 'LLVM NEON source remains unchanged' cmp -s "$RESOURCE/include/arm_neon.h" "$WORK/input/llvm/include/arm_neon.h"
 assert 'lowercase pinned sysroot was never renamed' test ! -e "$WORK/input/sdk/lib/aarch64-unknown-windows-msvc/Kernel32.lib"
 assert 'original source archive still matches pinned hash' bash -c '[[ "$(sha256sum "$1"|cut -d" " -f1)" == "$(jq -r .sysroot.sha256 "$2")" ]]' _ "$WORK/sdk.tar.xz" "$MANIFEST"

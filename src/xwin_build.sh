@@ -190,6 +190,132 @@ _xwb_check_shims() {
     done <<< "$entries"
 }
 
+# Bind the SDK selectors the compiler will actually follow, not just the
+# original pinned view. Inventory verification remains a separate required
+# check: this observation proves selection, not the SDK contents by itself.
+_xwb_check_sdk_selection() {
+    local plan="$1" run="$2" view="$3" output="${4:-}"
+    python3 -I - "$run" "$view" "$plan" "$output" <<'PY'
+import hashlib, json, os, pathlib, re, stat, sys
+
+def fail(message):
+    sys.stderr.write('[dsr] selected xwin SDK: ' + message + '\n')
+    sys.exit(7)
+
+def physical_directory(path):
+    if not path.is_absolute():
+        fail('SDK/run paths must be absolute')
+    for component in (path, *path.parents):
+        if component.is_symlink() or not component.is_dir():
+            fail('SDK/run directory changed or contains a link: ' + str(component))
+    if path.resolve(strict=True) != path:
+        fail('SDK/run directory is not the selected physical path: ' + str(path))
+
+def same_directory(fd, path):
+    held, named = os.fstat(fd), os.stat(path, follow_symlinks=False)
+    if not stat.S_ISDIR(named.st_mode) or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+        fail('selected directory identity changed: ' + str(path))
+
+def read_run_input(fd, name):
+    leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    with os.fdopen(leaf, 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            fail('selection input is not a regular file: ' + name)
+        raw = stream.read(1048577)
+    if len(raw) > 1048576:
+        fail('selection input exceeds the bounded manifest/environment size: ' + name)
+    return raw
+
+run_fd = cache_fd = None
+try:
+    run, view = map(pathlib.Path, sys.argv[1:3])
+    plan = json.loads(sys.argv[3])
+    physical_directory(run)
+    physical_directory(view)
+    run_fd = os.open(run, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    same_directory(run_fd, run)
+    manifest_bytes = read_run_input(run_fd, 'manifest.json')
+    key = hashlib.sha256(manifest_bytes).hexdigest()
+    if not re.fullmatch(r'[0-9a-f]{64}', view.name) or key != view.name or \
+            json.loads(manifest_bytes) != plan:
+        fail('selected SDK view differs from the frozen manifest')
+    raw = read_run_input(run_fd, 'environment.nul')
+    if not raw.endswith(b'\0'):
+        fail('incomplete build environment')
+    environment = {}
+    for entry in raw[:-1].split(b'\0'):
+        name, separator, value = entry.decode('utf-8').partition('=')
+        if not separator or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name) or name in environment:
+            fail('invalid or duplicate build environment entry')
+        environment[name] = value
+    expected = {
+        'XWIN_CACHE_DIR': str(run / 'xwin'),
+        'XWIN_CROSS_COMPILER': 'clang',
+        'XWIN_MSVC_SYSROOT_DOWNLOAD_URL': plan['sysroot']['url'],
+        'CFLAGS': '-nobuiltininc -I ' + str(view / 'include'),
+        'CXXFLAGS': '-nobuiltininc -I ' + str(view / 'include'),
+        'LIB': str(view / 'lib'),
+    }
+    if any(environment.get(name) != value for name, value in expected.items()):
+        fail('build environment no longer selects the pinned SDK')
+    physical_directory(run / 'xwin')
+    cache_fd = os.open('xwin', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=run_fd)
+    same_directory(cache_fd, run / 'xwin')
+    for name in ('sysroot', 'include', 'lib'):
+        physical_directory(view / name)
+    selected = run / 'xwin/windows-msvc-sysroot'
+    wanted = view / 'sysroot'
+    selected_stat = os.stat('windows-msvc-sysroot', dir_fd=cache_fd, follow_symlinks=False)
+    if not stat.S_ISLNK(selected_stat.st_mode):
+        fail('compiler-selected sysroot is not the required pinned-view link')
+    selected_link = os.readlink('windows-msvc-sysroot', dir_fd=cache_fd)
+    selected_root = selected.resolve(strict=True)
+    if selected_link != str(wanted) or selected_root != wanted:
+        fail('compiler-selected sysroot link does not select the pinned view')
+    # cargo-xwin prefers a nested windows-msvc-sysroot directory when present.
+    # The prepared view binds the top-level root; do not attest a different one.
+    nested = selected / 'windows-msvc-sysroot'
+    if nested.is_dir() or nested.is_symlink():
+        fail('nested sysroot would change cargo-xwin SDK selection')
+    observed_environment = {name: environment[name] for name in expected}
+    result = {'schema_version': 1, 'kind': 'dsr-xwin-sdk-selection',
+              'manifest_sha256': key, 'target': plan['target'], 'view': str(view),
+              'cache_dir': observed_environment['XWIN_CACHE_DIR'], 'sysroot_link': str(selected),
+              'sysroot': str(selected_root), 'environment': observed_environment}
+    text = json.dumps(result, sort_keys=True) + '\n'
+    physical_directory(run)
+    same_directory(run_fd, run)
+    same_directory(cache_fd, run / 'xwin')
+    if sys.argv[4]:
+        output = pathlib.Path(sys.argv[4])
+        if not output.is_absolute() or output.parent != run or output.name not in (
+                'sdk-before-build.json', 'sdk-after-build.json', 'sdk-before-admission.json'):
+            fail('SDK observation output must be a dedicated run-owned receipt')
+        # Compilation can create a hostile link or preexisting destination.
+        # Never overwrite either one while trying to retain the observation.
+        fd = os.open(output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=run_fd)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(text)
+            held = os.fstat(stream.fileno())
+        named = os.stat(output.name, dir_fd=run_fd, follow_symlinks=False)
+        if not stat.S_ISREG(named.st_mode) or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+            fail('SDK observation receipt identity changed before admission')
+        physical_directory(run)
+        same_directory(run_fd, run)
+        same_directory(cache_fd, run / 'xwin')
+    else:
+        sys.stdout.write(text)
+except (OSError, ValueError, UnicodeError, KeyError, TypeError, RuntimeError) as error:
+    fail('cannot observe selected SDK: ' + str(error))
+finally:
+    if cache_fd is not None:
+        os.close(cache_fd)
+    if run_fd is not None:
+        os.close(run_fd)
+PY
+}
+
 _xwb_source_inputs() {
     local project="$1" name hash entries='{}'
     for name in Cargo.toml Cargo.lock .cargo/config .cargo/config.toml; do
@@ -325,7 +451,7 @@ _xwb_export_release() {
          hosts:[{host:"local",platform:$platform,status:"success",method:"local"}],
          build_environments:[{target:$platform,target_triple:$r.target,host:"local",method:"pinned-cargo-xwin",
              build_influence_env:$r.build_influence_env,tool_versions:$r.tool_versions,
-             toolchain:$r.toolchain,cargo_metadata:$selection[0],source_snapshot:$s,
+             toolchain:$r.toolchain,selected_sdk:$r.selected_sdk,cargo_metadata:$selection[0],source_snapshot:$s,
              cargo_cache:$r.cargo_cache,feature_selection:$r.feature_selection,
              command:$r.command}],
          artifacts:[$r.artifacts[] | {name,target:$platform,target_triple:$r.target,sha256,
@@ -558,8 +684,10 @@ _xwb_build() {
     command+=("${feature_args[@]}")
     [[ "$release" == false ]] || command+=(--message-format=json)
     jq -cn --args '$ARGS.positional' -- "${command[@]}" > "$run/command.json" || return 1
+    _xwb_check_sdk_selection "$plan" "$run" "$view" "$run/sdk-before-build.json" || return $?
     controls=$(sha256sum -- "$run/environment.nul" "$run/environment.json" "$run/command.json" \
-        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json") || return 1
+        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json" \
+        "$run/sdk-before-build.json") || return 1
     [[ "$feature_hash" == "$(_xwt_hash "$run/feature-selection.json")" ]] || return 7
     _xwt_log "Building ${binaries[*]} for $target; log: $run/build.log"
     local rc=0
@@ -571,7 +699,10 @@ _xwb_build() {
     child=0
     ((rc == 0)) || { _xwt_log "Build exited $rc; retained $run/build.log"; return "$rc"; }
     [[ "$controls" == "$(sha256sum -- "$run/environment.nul" "$run/environment.json" "$run/command.json" \
-        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json")" ]] || return 7
+        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json" \
+        "$run/sdk-before-build.json")" ]] || return 7
+    _xwb_check_sdk_selection "$plan" "$run" "$view" "$run/sdk-after-build.json" || return $?
+    cmp -s "$run/sdk-before-build.json" "$run/sdk-after-build.json" || return 7
     if [[ "$release" == true ]]; then
         [[ "$source_hash" == "$(_xwt_hash "$run/release-source.json")" &&
            "$metadata_hash" == "$(_xwt_hash "$run/metadata-before.json")" &&
@@ -613,18 +744,24 @@ _xwb_build() {
         jq -c --arg name "$asset_name" --arg bin "$selected_binary" --arg path "$run/artifacts/$asset_name" \
             '.+{name:$name,binary:$bin,path:$path}' "$run/artifact.json" >> "$run/artifacts.jsonl" || return 1
     done
+    [[ "$controls" == "$(sha256sum -- "$run/environment.nul" "$run/environment.json" "$run/command.json" \
+        "$run/source-before.json" "$run/versions-before.json" "$run/manifest.json" "$run/feature-selection.json" \
+        "$run/sdk-before-build.json")" ]] || return 7
+    _xwb_check_sdk_selection "$plan" "$run" "$view" "$run/sdk-before-admission.json" || return $?
+    cmp -s "$run/sdk-before-build.json" "$run/sdk-before-admission.json" || return 7
     jq -cn --arg run "$run" --arg project "$project" --arg key "$key" --arg target "$target" \
         --arg manifest "$manifest_hash" --arg lock "$lock_hash" --slurpfile artifacts "$run/artifacts.jsonl" \
         --slurpfile environment "$run/environment.json" --slurpfile command "$run/command.json" \
         --slurpfile source "$run/source-after.json" --argjson feature_selection "$feature_selection" \
         --slurpfile cache_seed "$run/cargo-cache-seed.json" --slurpfile cache_final "$run/cargo-cache.json" \
         --slurpfile versions "$run/versions-after.json" --slurpfile toolchain "$run/toolchain-after.json" \
+        --slurpfile selected_sdk "$run/sdk-before-admission.json" \
         '{schema_version:1,kind:"dsr-xwin-build",status:"verified",exit_code:0,
           project:$project,target:$target,cargo_manifest_sha256:$manifest,cargo_lock_sha256:$lock,
           manifest_sha256:$key,source_inputs:$source[0],artifacts:$artifacts,
           cargo_cache:{mode:"private-copy",seed:$cache_seed[0],final:$cache_final[0]},
           build_influence_env:$environment[0],command:$command[0],feature_selection:$feature_selection,tool_versions:$versions[0],
-          toolchain:$toolchain[0].evidence,build_log:($run+"/build.log")} |
+          toolchain:$toolchain[0].evidence,selected_sdk:$selected_sdk[0],build_log:($run+"/build.log")} |
           if ($artifacts|length)==1 then .artifact=$artifacts[0] else . end' > "$run/.result.json" || return 1
     if [[ "$release" == true ]]; then
         [[ -z "$sibling_hash" || "$(_xwt_hash "$run/sibling-crates.json")" == "$sibling_hash" ]] || return 7

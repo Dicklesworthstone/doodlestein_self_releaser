@@ -81,12 +81,22 @@ if mode == 'rename': artifacts[-1]['name'] = 'substitute.exe'
 if mode == 'format': artifacts[-1]['archive_format'] = 'none'
 if mode == 'corrupt': (root/'artifacts'/artifacts[-1]['name']).write_bytes(b'changed payload')
 manifest = root/'release/build-manifest.json'; manifest.parent.mkdir()
+# Synthetic SDK selection for an explicit producer-boundary fixture only.
+sdk_key, sdk_url = 'd'*64, 'https://example.invalid/fixture/sdk.tar.xz'
+sdk_view, sdk_cache = '/fixture-sdk/'+sdk_key, '/fixture-run/xwin'
+sdk_env = dict(XWIN_CACHE_DIR=sdk_cache,XWIN_CROSS_COMPILER='clang',XWIN_MSVC_SYSROOT_DOWNLOAD_URL=sdk_url,
+               CFLAGS='-nobuiltininc -I '+sdk_view+'/include',CXXFLAGS='-nobuiltininc -I '+sdk_view+'/include',LIB=sdk_view+'/lib')
+sdk_selection = dict(schema_version=1,kind='dsr-xwin-sdk-selection',manifest_sha256=sdk_key,target=spec['target'],
+                     view=sdk_view,cache_dir=sdk_cache,sysroot_link=sdk_cache+'/windows-msvc-sysroot',sysroot=sdk_view+'/sysroot',environment=sdk_env)
 manifest.write_text(json.dumps({'schema_version':'1.0.0','tool':arg('--tool'),'version':arg('--release-tag'),
     'run_id':'11111111-1111-4111-8111-111111111111','built_at':'2026-09-24T00:00:00Z','status':'success',
     'source':{'git_sha':arg('--source-sha'),'git_ref':'refs/tags/'+arg('--release-tag'),'dependencies':[]},
     'summary':{'total':1,'success':1,'failed':0},'artifacts':artifacts,
     'build_environments':[{'target':'windows/arm64','target_triple':spec['target'],
-                           'method':'pinned-cargo-xwin','toolchain':{'target':spec['target'],'inputs':{'target':spec['target']}}}]}))
+                           'method':'pinned-cargo-xwin','build_influence_env':sdk_env,'selected_sdk':sdk_selection,
+                           'toolchain':{'target':spec['target'],'manifest_sha256':sdk_key,
+                               'inputs':{'target':spec['target'],'sysroot':{'url':sdk_url}},
+                               'files':[dict(path='sysroot',type='directory',sha256='',size_bytes=0)]}}]}))
 print(json.dumps({'kind':'dsr-xwin-build','status':'verified','exit_code':0,'target':spec['target'],
                   'release_manifest':{'path':str(manifest),'sha256':hashlib.sha256(manifest.read_bytes()).hexdigest()}}))
 ''')

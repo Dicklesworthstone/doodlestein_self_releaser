@@ -143,8 +143,17 @@ def fixture(base, arch, drivers=False):
                    build_influence_env={'CARGO_BUILD_TARGET':triple,'DSR_TARGET_TRIPLE':triple,
                                         'DSR_RELEASE_GIT_SHA':pin,'DSR_RELEASE_GIT_REF':'v1.2.3'})
         if identity == 'win':
+            # Explicit synthetic selector shape; no SDK/Windows build proof.
+            sdk_key, sdk_url = 'd'*64, 'https://example.invalid/fixture/sdk.tar.xz'
+            sdk_view, sdk_cache = '/fixture-sdk/'+sdk_key, '/fixture-run/xwin'
+            sdk_env = dict(XWIN_CACHE_DIR=sdk_cache,XWIN_CROSS_COMPILER='clang',XWIN_MSVC_SYSROOT_DOWNLOAD_URL=sdk_url,
+                           CFLAGS='-nobuiltininc -I '+sdk_view+'/include',CXXFLAGS='-nobuiltininc -I '+sdk_view+'/include',LIB=sdk_view+'/lib')
             env = dict(target=target,target_triple=triple,method='pinned-cargo-xwin',
-                       toolchain=dict(target=triple,inputs=dict(target=triple)))
+                build_influence_env=sdk_env,selected_sdk=dict(schema_version=1,kind='dsr-xwin-sdk-selection',
+                    manifest_sha256=sdk_key,target=triple,view=sdk_view,cache_dir=sdk_cache,
+                    sysroot_link=sdk_cache+'/windows-msvc-sysroot',sysroot=sdk_view+'/sysroot',environment=sdk_env),
+                toolchain=dict(target=triple,manifest_sha256=sdk_key,inputs=dict(target=triple,sysroot=dict(url=sdk_url)),
+                               files=[dict(path='sysroot',type='directory',sha256='',size_bytes=0)]))
         value = dict(schema_version='1.0.0',tool='app',version='v1.2.3',run_id='12345678-1234-4123-8123-123456789abc',
                      source=dict(git_sha=pin,git_ref='v1.2.3',dependencies=[]),status='success',
                      built_at='2026-10-09T01:02:03Z',summary=dict(total=1,success=1,failed=0),
