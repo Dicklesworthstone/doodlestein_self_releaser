@@ -161,6 +161,8 @@ def audit_command(details, output):
         command += ['--checksum-asset', args.checksum_asset]
     if args.checksum_include_metadata:
         command.append('--include-metadata')
+    if args.checksum_resume_from is not None:
+        command += ['--resume-from', args.checksum_resume_from]
     return command
 
 def admit_audit(path, output, details, phase):
@@ -198,7 +200,7 @@ def checksum_details():
     status = audit.get('status', 'error')
     if status == 'verified' and not audit_admitted:
         status = 'not-admitted'
-    return dict(requested=True, status=status,
+    details = dict(requested=True, status=status,
                 policy=audit.get('verification_policy'), mode=audit.get('checksum_mode'),
                 include_metadata=audit.get('include_metadata'), eligible_count=audit.get('eligible_count', 0),
                 verified_count=audit.get('verified_count', 0), verified=audit.get('verified_checksums', []),
@@ -207,6 +209,9 @@ def checksum_details():
                 errors=[r.get('name', r.get('error', 'unverified')) for r in audit.get('checksum_errors', [])],
                 coverage_errors=audit.get('coverage_errors', []), audit_exit_code=audit.get('exit_code'),
                 authenticated=False, source_verified=False, evidence_dir=audit.get('output_dir'))
+    if 'resume' in audit:
+        details['resume'] = audit['resume']
+    return details
 
 try:
     class Parser(argparse.ArgumentParser):
@@ -224,6 +229,7 @@ try:
     parser.add_argument('--checksum-asset')
     parser.add_argument('--checksum-include-metadata', action='store_true')
     parser.add_argument('--checksum-output-dir')
+    parser.add_argument('--checksum-resume-from', help='Recheck verified payloads from a previous audit in a new output directory; cannot be combined with --fix')
     parser.add_argument('--checksum-timeout', type=int, default=120)
     parser.add_argument('--checksum-max-asset-bytes', type=int, default=2*1024**3)
     parser.add_argument('--checksum-max-total-bytes', type=int, default=8*1024**3)
@@ -239,6 +245,8 @@ try:
         else:
             raise Failure('Unexpected positional argument', 4)
     need(args.verify_checksums, 'Checksum options require --verify-checksums (or --checksums)', 4)
+    need(args.checksum_resume_from is None or not args.fix,
+         'Checksum resume requires an unchanged release; perform --fix separately and start a fresh audit', 4)
     need(isinstance(args.tool, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', args.tool) and '..' not in args.tool,
          'A safe tool name is required', 4)
     need(isinstance(args.version, str) and re.fullmatch(r'v?[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?', args.version),
@@ -246,6 +254,11 @@ try:
     need(cli.is_absolute() and cli.is_file(), 'The original dsr CLI is unavailable', 3)
     for dependency in ('release_checksums.sh', 'checksum_sync.sh'):
         need((module / dependency).is_file(), 'Required checksum module is unavailable: ' + dependency, 3)
+    if args.checksum_resume_from is not None:
+        retained = Path(args.checksum_resume_from).resolve()
+        temporary = Path(tempfile.gettempdir()).resolve()
+        need(retained != temporary and retained not in temporary.parents,
+             'Verification workspace must be outside retained audit evidence', 4)
     os.umask(0o077)
     work = Path(tempfile.mkdtemp(prefix='dsr-release-verify-')).resolve()
     base_code, details = metadata('manifest-before')

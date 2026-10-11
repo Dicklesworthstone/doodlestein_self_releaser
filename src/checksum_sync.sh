@@ -568,7 +568,7 @@ checksum_sync() (
     local push_changes=false review=false dry_run=false json=false metadata=false prefer=false
     local workspace='' tag='' source_kind='' source_asset='' manifest_sha='' error='' arg option
     local verify_release=false audit_receipt='' audit_worker='' audit_pin=''
-    local audit_mode='aggregate' audit_asset=''
+    local audit_mode='aggregate' audit_asset='' audit_resume=''
     local -a audit_args=()
     local start_time=$SECONDS synced=0 failed=0 planned=0 issues_opened=0
     local -a target_repos=() results=()
@@ -640,9 +640,13 @@ checksum_sync() (
             --include-metadata) metadata=true; shift ;;
             --prefer-gh) prefer=true; shift ;;
             --verify-release) verify_release=true; shift ;;
-            --checksum-mode|--checksum-asset|--audit-timeout|--audit-max-asset-bytes|--audit-max-total-bytes)
+            --checksum-mode|--checksum-asset|--audit-timeout|--audit-max-asset-bytes|--audit-max-total-bytes|--audit-resume-from)
                 [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { error="Missing value for $1"; return 4; }
-                case "$1" in --checksum-mode) audit_mode="$2" ;; --checksum-asset) audit_asset="$2" ;; esac
+                case "$1" in
+                    --checksum-mode) audit_mode="$2" ;;
+                    --checksum-asset) audit_asset="$2" ;;
+                    --audit-resume-from) audit_resume="$2" ;;
+                esac
                 option="${1/--audit-/--}"
                 audit_args+=("$option" "$2"); shift 2 ;;
             --help|-h)
@@ -664,6 +668,7 @@ OPTIONS:
     --audit-timeout SECONDS  Per-operation audit limit; requires --verify-release
     --audit-max-asset-bytes N Per-payload audit byte limit; requires --verify-release
     --audit-max-total-bytes N Total selected audit byte limit; requires --verify-release
+    --audit-resume-from DIR  Recheck retained payloads from an unchanged audit; requires --verify-release
     --push                   Push the checksum commit to the current branch; never force
     --external, --open-issue Open a security review issue instead of committing
     --dry-run                Validate and plan without cloning or writing remote repositories
@@ -672,6 +677,8 @@ Local commits and failed checkouts are retained in the reported private workspac
 Download-only manifests are syntax-validated, not proof of artifact authenticity.
 --verify-release cannot use --manifest or --artifacts-dir, bypasses local cached
 artifacts, and retains its full audit. --dry-run audits but never changes downstream repos.
+--audit-resume-from always creates a new audit and reacquires checksum evidence;
+changed release identities or retained verified bytes fail before downstream writes.
 EOF
                 return 0 ;;
             -*) error="Unknown option: $1"; return 4 ;;
@@ -716,6 +723,13 @@ EOF
     local root="${TMPDIR:-/tmp}"
     root=$(cd "$root" && pwd -P) || return 4
     _cs_is_safe_path "$root" || { error='Protected temporary root'; return 4; }
+    if [[ -n "$audit_resume" ]]; then
+        local resume_root
+        resume_root=$(cd "$audit_resume" && pwd -P) || { error='Resume audit directory is unavailable'; return 4; }
+        [[ "$root" != "$resume_root" && "$root" != "$resume_root/"* ]] || {
+            error='Sync workspace must be outside retained audit evidence'; return 4;
+        }
+    fi
     workspace=$(mktemp -d "$root/dsr-checksum-sync.XXXXXXXX") || return 1
     workspace=$(cd "$workspace" && pwd -P) || return 1
     local content='' candidate state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
