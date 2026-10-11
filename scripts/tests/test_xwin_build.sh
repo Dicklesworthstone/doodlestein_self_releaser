@@ -5,6 +5,63 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 source "$ROOT/src/xwin_build.sh"
+# Actual policy boundaries only, with no SDK, compiler, worker, cleanup or
+# substituted backend. Run this mode only after external release-wave admission.
+# Help is planning evidence; none of these cases qualifies a native build.
+if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
+    command -v jq >/dev/null || exit 3
+    export DRY_RUN=false
+    # Re-importing policy must preserve an already selected deletion allowlist.
+    # This is only array-state validation; no delete helper is invoked.
+    _SAFE_DELETE_ROOTS=(/operator-selected-retained-root)
+    source "$ROOT/src/release_builds.sh" || exit 3
+    [[ "${#_SAFE_DELETE_ROOTS[@]}" -eq 1 && "${_SAFE_DELETE_ROOTS[0]}" == /operator-selected-retained-root ]] || exit 1
+    policy_refusal() {
+        local expected_reason=$1 expected_platform=$2 expected_kind=$3 result status=0
+        shift 3
+        result=$("$@") || status=$?
+        printf '%s\n' "$result" >&2
+        [[ "$status" -eq 4 ]] || return 1
+        printf '%s\n' "$result" | jq -se --arg reason "$expected_reason" \
+            --arg platform "$expected_platform" --arg kind "$expected_kind" '
+            length == 1 and .[0].status == "error" and .[0].exit_code == 4 and
+            .[0].platform == $platform and .[0].reason_code == $reason and
+            (if $kind == "" then true else
+                .[0].kind == $kind and .[0].publishable == false end)
+        ' >/dev/null
+    }
+    for policy in 1 true TRUE yes YeS on enabled EnAbLeD $' \ttrue\r\n' invalid-policy; do
+        reason=RCH_REQUIRED_NATIVE_UNAVAILABLE
+        [[ "$policy" != invalid-policy ]] || reason=INVALID_RCH_REQUIRE_REMOTE
+        export RCH_REQUIRE_REMOTE="$policy"
+        # No arguments also keep a regressed guard away from source/build work:
+        # xwin requires its inputs; the coordinator requires a reviewed plan.
+        policy_refusal "$reason" windows/pinned-xwin "" \
+            "$BASH" "$ROOT/scripts/xwin-build.sh" || exit 1
+        policy_refusal "$reason" windows/pinned-xwin "" _xwb_build || exit 1
+        policy_refusal "$reason" release-build-plan dsr-release-builds \
+            "$BASH" "$ROOT/src/release_builds.sh" || exit 1
+        policy_refusal "$reason" release-build-plan dsr-release-builds release_build_plan || exit 1
+    done
+    export RCH_REQUIRE_REMOTE=1
+    # This stale inherited policy is a negative loader input, not a fake build
+    # backend or a successful remote receipt. Actual modules must replace it.
+    for module in xwin_build release_builds; do
+        entry=_xwb_build platform=windows/pinned-xwin kind=""
+        if [[ "$module" == release_builds ]]; then
+            entry=release_build_plan platform=release-build-plan kind=dsr-release-builds
+        fi
+        policy_refusal RCH_REQUIRED_NATIVE_UNAVAILABLE "$platform" "$kind" \
+            "$BASH" -c 'dsr_native_rch_policy() { return 0; }; export -f dsr_native_rch_policy;
+                source "$1" || exit $?; "$2"' policy-loader "$ROOT/src/$module.sh" "$entry" || exit 1
+    done
+    help_result=$("$BASH" "$ROOT/scripts/xwin-build.sh" --help) || exit 1
+    [[ "$help_result" == *'Usage:'* ]] || exit 1
+    help_result=$("$BASH" "$ROOT/src/release_builds.sh" --help) || exit 1
+    [[ "$help_result" == *'usage:'* ]] || exit 1
+    printf 'Pinned-xwin/coordinator refusal and help cases completed; no build dispatched\n'
+    exit 0
+fi
 for TOOL in jq clang lld-link llvm-ar python3 timeout setsid; do
     command -v "$TOOL" >/dev/null || { printf 'SKIP xwin build: requires %s\n' "$TOOL"; exit 0; }
 done

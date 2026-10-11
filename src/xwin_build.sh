@@ -2,6 +2,8 @@
 # Execute a release-profile cargo-xwin binary set with the prepared
 # dsr-h4y0 inputs. This is not a replacement for DSR's source/release gates.
 _XWIN_BUILD_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/guardrails.sh
+source "$_XWIN_BUILD_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 # shellcheck source=src/xwin_toolchain.sh
 source "$_XWIN_BUILD_DIR/xwin_toolchain.sh"
 # shellcheck source=src/cargo_cache.sh
@@ -354,6 +356,7 @@ _xwb_export_release() {
 # with the signal trap, not an intermediate asynchronous function wrapper.
 _xwb_build() {
     set -uo pipefail
+    dsr_native_rch_policy "windows/pinned-xwin" "${RCH_REQUIRE_REMOTE:-}" || return 4
     umask 077
     local manifest='' project='' run='' binary='' package='' cache='' cargo_cache='' seconds=3600 offline=false
     local release_repo='' release_tag='' release_tool='' source_sha='' asset_name='' release=false

@@ -39,7 +39,7 @@ def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 try:
     repo = work/'repo'
     (repo/'src').mkdir(parents=True)
-    for name in ('release_builds.sh','release_bundle.sh','release_finalize.sh','slsa.sh'):
+    for name in ('release_builds.sh','release_bundle.sh','release_finalize.sh','slsa.sh','guardrails.sh'):
         shutil.copyfile(root/'src'/name,repo/'src'/name)
     (repo/'dsr').write_text(r'''#!/usr/bin/env bash
 set -uo pipefail
@@ -120,6 +120,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then printf 'Original finalizer help\n'; f
     def run(arguments=(), expected=0, directory=output, selected=planfile, custom=None):
         proc=subprocess.run((custom or command(directory,selected))+list(arguments),env=env,
                             stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45)
+        run.stderr = proc.stderr.decode()
         if proc.returncode!=expected:
             print(proc.stderr.decode(),file=sys.stderr)
             raise AssertionError(f'expected {expected}, got {proc.returncode}: {proc.stdout.decode()}')
@@ -138,6 +139,25 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then printf 'Original finalizer help\n'; f
     ):
         run(options,4)
         check('invalid policy never starts a build or creates state',not output.exists() and not calls.exists())
+    # This exercises the production entry/coordinator envelope contract only;
+    # the publication driver remains an explicit fixture, not release proof.
+    prior_policy = env.get('RCH_REQUIRE_REMOTE')
+    prior_dry_run = env.get('DRY_RUN')
+    env['RCH_REQUIRE_REMOTE'] = '1'
+    env['DRY_RUN'] = 'false'
+    try:
+        refused = run(['--create-draft'], 4)
+        print(run.stderr, file=sys.stderr, end='')
+        check('finalizer preserves strict coordinator refusal instead of envelope error7',
+              refused['stage']=='build' and refused['builds']['kind']=='dsr-release-builds' and
+              refused['builds']['reason_code']=='RCH_REQUIRED_NATIVE_UNAVAILABLE' and
+              not refused['builds']['publishable'] and not output.exists() and
+              not calls.exists() and not finalcalls.exists())
+    finally:
+        if prior_policy is None: env.pop('RCH_REQUIRE_REMOTE')
+        else: env['RCH_REQUIRE_REMOTE'] = prior_policy
+        if prior_dry_run is None: env.pop('DRY_RUN')
+        else: env['DRY_RUN'] = prior_dry_run
     controls['darwin'].write_text('fail')
     result=run(['--build-jobs','2','--create-draft'],1)
     check('failed build prevents all release API entry',result['status']=='builds_incomplete' and not finalcalls.exists())

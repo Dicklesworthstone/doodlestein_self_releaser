@@ -31,7 +31,9 @@ if [[ -z "${MIN_BASH_MAJOR:-}" ]]; then
 fi
 
 # Safe deletion allowlist (directories under which deletion is permitted)
-_SAFE_DELETE_ROOTS=()
+if ! declare -p _SAFE_DELETE_ROOTS >/dev/null 2>&1; then
+    _SAFE_DELETE_ROOTS=()
+fi
 
 # Initialize safe delete roots from XDG directories
 _guardrails_init_safe_roots() {
@@ -428,11 +430,54 @@ confirm() {
 # Exports
 # ============================================================================
 
+# Direct native and pinned-xwin backends do not establish RCH admission.
+# Keep their policy parsing and refusal identical until the real backend exists.
+dsr_native_rch_policy() {
+    local platform="$1" remote_policy="${2:-}" response_kind="${3:-}"
+    remote_policy="${remote_policy#"${remote_policy%%[![:space:]]*}"}"
+    remote_policy="${remote_policy%"${remote_policy##*[![:space:]]}"}"
+    case "${remote_policy,,}" in
+        ""|0|false|no|off|disabled) return 0 ;;
+        1|true|yes|on|enabled)
+            printf '%s\n' '[dsr-policy] RCH-required native execution is unavailable; refusing direct native compilation' >&2
+            jq -nc --arg platform "$platform" --arg kind "$response_kind" \
+                '{status: "error", exit_code: 4, platform: $platform,
+                  reason_code: "RCH_REQUIRED_NATIVE_UNAVAILABLE",
+                  error: "RCH-required native execution is unavailable; no build dispatched"} |
+                 if $kind == "" then . else . + {kind: $kind, publishable: false} end'
+            return 4
+            ;;
+        *)
+            printf '%s\n' '[dsr-policy] RCH_REQUIRE_REMOTE must select an explicit enabled or disabled policy' >&2
+            jq -nc --arg platform "$platform" --arg kind "$response_kind" \
+                '{status: "error", exit_code: 4, platform: $platform,
+                  reason_code: "INVALID_RCH_REQUIRE_REMOTE",
+                  error: "RCH_REQUIRE_REMOTE must select an explicit enabled or disabled policy"} |
+                 if $kind == "" then . else . + {kind: $kind, publishable: false} end'
+            return 4
+            ;;
+    esac
+}
+
+dsr_native_rch_environment_policy() {
+    local platform="$1" build_env="$2" policy_assignment
+    # A later disabled assignment cannot obscure an earlier RCH requirement.
+    while IFS= read -r policy_assignment; do
+        case "$policy_assignment" in
+            RCH_REQUIRE_REMOTE=*)
+                dsr_native_rch_policy "$platform" "${policy_assignment#*=}" || return 4
+                ;;
+        esac
+    done <<< "$build_env"
+    return 0
+}
+
 export -f require_bash_4
 export -f resolve_path resolve_path_or_default
 export -f safe_rm safe_rm_allow _is_safe_path
 export -f safe_tmpdir
 export -f is_color_disabled color
 export -f is_non_interactive confirm
+export -f dsr_native_rch_policy dsr_native_rch_environment_policy
 
 export EXIT_SUCCESS EXIT_DEPENDENCY_ERROR EXIT_INVALID_ARGS

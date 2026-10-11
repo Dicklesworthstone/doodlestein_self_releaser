@@ -2,11 +2,23 @@
 # Execute reviewed native/xwin jobs before pinning their successful manifests.
 # The existing release-bundle validator remains the only artifact admission path.
 _RELEASE_BUILDS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/guardrails.sh
+source "$_RELEASE_BUILDS_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
 
 _rbuild_execute() {
     set -uo pipefail
+    local planning_only=false option
+    [[ "${DRY_RUN:-false}" != true ]] || planning_only=true
+    for option in "$@"; do
+        case "$option" in --help|-h|--dry-run) planning_only=true ;; esac
+    done
+    if ! $planning_only; then
+        dsr_native_rch_policy "release-build-plan" "${RCH_REQUIRE_REMOTE:-}" "dsr-release-builds" || return 4
+    fi
     command -v python3 >/dev/null || return 3
-    exec python3 - "$_RELEASE_BUILDS_DIR" "$@" <<'PY'
+    # The shell may hold DRY_RUN without exporting it. The interpreter must
+    # receive the same value that justified bypassing the execution refusal.
+    exec env DRY_RUN="${DRY_RUN:-false}" python3 - "$_RELEASE_BUILDS_DIR" "$@" <<'PY'
 import argparse
 import fcntl
 import hashlib

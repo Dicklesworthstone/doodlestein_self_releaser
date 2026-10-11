@@ -48,7 +48,7 @@ def digest(file):
 
 install = work / "install"
 (install / "src").mkdir(parents=True)
-for name in ("release_builds", "release_bundle", "slsa"):
+for name in ("release_builds", "release_bundle", "slsa", "guardrails"):
     selected = Path(os.environ["DSR_TEST_COORDINATOR"]) if name == "release_builds" and "DSR_TEST_COORDINATOR" in os.environ else root / "src" / (name + ".sh")
     shutil.copyfile(selected, install / "src" / (name + ".sh"))
 commands = {name: shutil.which(name) for name in ("cp", "sha256sum")}

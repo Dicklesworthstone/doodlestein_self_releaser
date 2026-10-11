@@ -49,7 +49,7 @@ def sha(p):
 try:
     repo = work / 'repo'
     (repo / 'src').mkdir(parents=True)
-    for name in ('release_builds.sh', 'release_bundle.sh', 'slsa.sh'):
+    for name in ('release_builds.sh', 'release_bundle.sh', 'slsa.sh', 'guardrails.sh'):
         shutil.copyfile(root / 'src' / name, repo / 'src' / name)
     (repo / 'dsr').write_text('#!/usr/bin/env bash\nexec python3 "$(dirname "$0")/native.py" "$@"\n')
     (repo / 'native.py').write_text(r'''

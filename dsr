@@ -2461,9 +2461,34 @@ EOF
         fi
     fi
 
+    if ! $dry_run && ! $sync_only; then
+        local policy_result policy_environment policy_status=0
+        policy_result=$(dsr_native_rch_policy "build" "${RCH_REQUIRE_REMOTE:-}") || policy_status=$?
+        if [[ "$policy_status" -ne 0 ]]; then
+            if $JSON_MODE; then json_envelope "build" "error" "$policy_status" "$policy_result"; fi
+            return "$policy_status"
+        fi
+        # Inspect native recipe declarations before resume initialization,
+        # output receipts or source staging. Workers repeat the check with
+        # their exact selected target variant immediately before execution.
+        for target in $target_list; do
+            if ! act_platform_uses_act "$tool_name" "$target"; then
+                policy_environment=$(act_get_build_env "$tool_name" "$target") || return 4
+                policy_result=$(dsr_native_rch_environment_policy "$target" "$policy_environment") || policy_status=$?
+                if [[ "$policy_status" -ne 0 ]]; then
+                    if $JSON_MODE; then json_envelope "build" "error" "$policy_status" "$policy_result"; fi
+                    return "$policy_status"
+                fi
+            fi
+        done
+    fi
+
     local resume_run_id="" resume_state="" resume_completed=false
     if $resume; then
-        if ! build_state_init; then
+        if $dry_run; then
+            # Checkpoint reads need a path, not the initializer's mkdir calls.
+            local _BUILD_STATE_DIR="$state_dir/builds"
+        elif ! build_state_init; then
             log_error "Build state initialization failed"
             return 4
         fi

@@ -73,7 +73,7 @@ if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
         $'RCH_REQUIRE_REMOTE=true\nRCH_REQUIRE_REMOTE=0' \
         $'OTHER=value\nRCH_REQUIRE_REMOTE= EnAbLeD \nRCH_DISABLED=1'; do
         policy_status=0
-        policy_result=$(RCH_REQUIRE_REMOTE=0 _act_native_rch_environment_policy \
+        policy_result=$(RCH_REQUIRE_REMOTE=0 dsr_native_rch_environment_policy \
             linux/amd64 "$policy_environment") || policy_status=$?
         printf '%s\n' "$policy_result" >&2
         [[ "$policy_status" -eq 4 ]] || exit 1
@@ -86,7 +86,7 @@ if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
     for policy_environment in '' 'OTHER=value' \
         $'RCH_REQUIRE_REMOTE=0\nOTHER=value\nRCH_REQUIRE_REMOTE=disabled'; do
         policy_status=0
-        policy_result=$(_act_native_rch_environment_policy \
+        policy_result=$(dsr_native_rch_environment_policy \
             linux/amd64 "$policy_environment") || policy_status=$?
         [[ "$policy_status" -eq 0 && -z "$policy_result" ]] || exit 1
     done

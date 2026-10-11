@@ -48,7 +48,7 @@ def digest(p):
 install = work / "install"
 (install / "src").mkdir(parents=True)
 (install / "scripts").mkdir()
-for module in ("release_builds", "release_bundle", "slsa"):
+for module in ("release_builds", "release_bundle", "slsa", "guardrails"):
     shutil.copyfile(source / "src" / (module + ".sh"), install / "src" / (module + ".sh"))
 # These two production command paths are the only substituted implementation.
 (install / "dsr").write_text('#!/usr/bin/env bash\nexec python3 "$(dirname "$0")/driver.py" dsr "$@"\n')

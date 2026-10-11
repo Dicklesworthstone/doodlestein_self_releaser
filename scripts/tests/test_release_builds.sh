@@ -44,7 +44,7 @@ try:
     repo = work / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "scripts").mkdir()
-    for file in ("release_builds.sh", "release_bundle.sh", "slsa.sh"):
+    for file in ("release_builds.sh", "release_bundle.sh", "slsa.sh", "guardrails.sh"):
         shutil.copyfile(root / "src" / file, repo / "src" / file)
     # The production dispatcher has no test hooks. Execute unmodified code in
     # a temporary installation with test doubles only at its driver paths.
@@ -191,6 +191,23 @@ print(json.dumps(response))
     output = work/'builds'
     result = run(output, extra=('--dry-run','--jobs','2'))
     check('planning starts no builders and creates no state', result['status']=='planned' and not output.exists() and not trace.exists())
+    # The real coordinator must transfer an unexported shell planning flag to
+    # its Python interpreter. This case exercises planning, never a builder.
+    planning = subprocess.run(['bash', '-c',
+        'unset DRY_RUN; DRY_RUN=true; export RCH_REQUIRE_REMOTE=1; '
+        'source "$1" || exit $?; release_build_plan "${@:2}"',
+        'unexported-dry-run', str(script), '--plan', str(planfile), '--output-dir', str(output)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+    print(planning.stderr.decode(), file=sys.stderr, end='')
+    check('unexported DRY_RUN reaches the interpreter', planning.returncode == 0)
+    planned = json.loads(planning.stdout)
+    check('unexported DRY_RUN cannot dispatch or create coordinator state',
+          planned['kind']=='dsr-release-builds' and planned['status']=='planned' and
+          planned['dry_run'] and not planned['publishable'] and not output.exists() and not trace.exists())
+    refused = run(output, 4, env=dict(os.environ, DRY_RUN='false', RCH_REQUIRE_REMOTE='1'))
+    check('coordinator policy refusal retains the finalizer envelope before mutation',
+          refused['kind']=='dsr-release-builds' and refused['reason_code']=='RCH_REQUIRED_NATIVE_UNAVAILABLE' and
+          not refused['publishable'] and not output.exists() and not trace.exists())
     controls['windows'].write_text('fail')
     env = dict(os.environ, DSR_CONFIG_FILE='/wrong', DSR_REPOS_FILE='/wrong', DSR_HOSTS_FILE='/wrong')
     result = run(output,1,extra=('--jobs','2'),env=env)

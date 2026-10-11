@@ -17,6 +17,7 @@ if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
         'Sibling crates require release mode and explicit repository/commit pins; see docs/XWIN_BUILD.md.'
     exit 0
 fi
+dsr_native_rch_policy "windows/pinned-xwin" "${RCH_REQUIRE_REMOTE:-}" || exit 4
 _xwb_build "$@" &
 worker=$!
 cancel() {

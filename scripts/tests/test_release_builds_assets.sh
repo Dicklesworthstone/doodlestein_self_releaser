@@ -23,7 +23,7 @@ work = Path(tempfile.mkdtemp(prefix="dsr-build-assets-"))
 repo = work / "repo"
 (repo / "src").mkdir(parents=True)
 (repo / "scripts").mkdir()
-for name in ("release_builds.sh", "release_bundle.sh", "slsa.sh", "release_finalize.sh", "release_finalize_core.sh"):
+for name in ("release_builds.sh", "release_bundle.sh", "slsa.sh", "guardrails.sh", "release_finalize.sh", "release_finalize_core.sh"):
     shutil.copyfile(source / "src" / name, repo / "src" / name)
 checks = 0
 print("Fixtures: " + str(work), flush=True)
