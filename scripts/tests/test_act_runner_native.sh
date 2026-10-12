@@ -523,14 +523,31 @@ _act_ssh_exec() {
     # These command-construction tests return explicit transport receipts.
     # test_strict_cargo_private_cache.sh executes the real preparation, Cargo
     # mutation, final inventory and refusal paths on actual private inodes.
-    # Strict Unix builds read back the toolchain identity their own shell
-    # recorded; test_strict_cargo_private_cache.sh probes real executables.
-    if [[ "$exit_code" -eq 0 && "$cmd" =~ ^cat\ \'/[^\']*/\.dsr-toolchain-[^\']+\.json\'$ ]]; then
-        jq -nc '
+    # These remain synthetic command-construction receipts. The real
+    # test_toolchain_identity.sh observes executables and private file inodes.
+    if [[ "$exit_code" -eq 0 && "$cmd" == *DSR_TOOLCHAIN_IDENTITY_PY* &&
+          ( "$cmd" == *'-I - record '* || "$cmd" == *'-I - read '* ) ]]; then
+        local identity_cwd="" identity_target="x86_64-unknown-linux-gnu" identity_json
+        if [[ "$cmd" == *'-I - record '* ]]; then
+            [[ "$cmd" =~ cd\ \'([^\']+)\'\; ]] || return 99
+            identity_cwd="${BASH_REMATCH[1]}"
+            if [[ "$cmd" =~ CARGO_BUILD_TARGET=([^\"\;[:space:]]+) ]]; then
+                identity_target="${BASH_REMATCH[1]}"
+            fi
+        else
+            # The real consumer requires the coordinator's exact original
+            # observation; this fixture preserves the last record response.
+            cat "$MOCK_DIR/toolchain-observation.json"
+            return 0
+        fi
+        identity_json=$(jq -nc --arg cwd "$identity_cwd" --arg target "$identity_target" '
             def tool($name): {program: $name, selected_path: ("/fixture/bin/" + $name),
                 selected_sha256: ("5" * 64), selected_kind: "executable", version: ($name + " 1.0.0")};
-            {schema_version: 1, cwd: "/remote/fixture", target_triple: "", linker_variable: null,
-             tools: {cargo: tool("cargo"), rustc: tool("rustc"), linker: tool("cc")}}'
+            {schema_version: 1, cwd: $cwd, target_triple: $target, linker_variable: null,
+             tools: {cargo: tool("cargo"), rustc: tool("rustc"), linker: tool("cc")}}') || return 99
+        printf '%s\n' "$identity_json" > "$MOCK_DIR/toolchain-observation.json"
+        jq -nc --argjson identity "$identity_json" \
+            '{identity:$identity,pin:{sha256:("5"*64),identity:"1:2:33152:1:1000:1000:100:123:123"}}'
         return 0
     fi
     if [[ "$exit_code" -eq 0 && "$cmd" =~ ^cat\ \'/[^\']+\.cache-receipt\.json\'$ ]]; then
