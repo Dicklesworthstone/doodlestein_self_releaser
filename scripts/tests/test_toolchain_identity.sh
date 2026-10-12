@@ -4,7 +4,7 @@
 # or modified. The second toolchain has its own real executable copies.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-for tool in python3 bash cargo rustc rustup cc; do
+for tool in python3 bash cargo rustc rustup cc jq; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
 done
 python3 -I - "$ROOT" <<'PY'
@@ -83,6 +83,33 @@ environment['CARGO_BUILD_TARGET'] = host
 program = '''source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "$5" "$6" | bash'''
 counter = 0
 receipt_pins = {}
+
+binding_program = '''source "$1" || exit $?;
+IFS= read -r isolation || exit 1; IFS= read -r original || exit 1; IFS= read -r current || exit 1;
+_act_bind_toolchain_identity "$isolation" "$original" "$current"'''
+
+
+def bind_observation(isolation, original, current):
+    # Large JSON travels on stdin, including across this test's subprocess
+    # boundary. The production helper must not turn it into one exec argument.
+    documents = '\n'.join(json.dumps(item) for item in (isolation, original, current)) + '\n'
+    return run(['bash', '-o', 'pipefail', '-c', binding_program, '_', module], input=documents)
+
+
+large_identity = {'schema_version': 1, 'cwd': str(project), 'target_triple': host,
+                  'tools': {'cargo': {'version': 'cargo ' + 'x' * 262144}}}
+large_bound = bind_observation({'cargo_home': str(work / 'cargo')}, large_identity, large_identity)
+check('accepted large observation binds through stdin without an exec argument overflow',
+      large_bound.returncode == 0 and json.loads(large_bound.stdout) == {
+          'cargo_home': str(work / 'cargo'), 'toolchain': large_identity})
+contradiction = dict(large_identity, target_triple='different-target')
+contradicted = bind_observation({}, large_identity, contradiction)
+check('large observation disagreement refuses without returning an isolation receipt',
+      contradicted.returncode != 0 and not contradicted.stdout)
+for label, original, current in (('non-object original', [], []),
+                                ('non-object returned', large_identity, [])):
+    refused = bind_observation({}, original, current)
+    check(label + ' cannot be inserted as compiler evidence', refused.returncode != 0 and not refused.stdout)
 
 
 def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, expected_cwd=None, timeout=120):

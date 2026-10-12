@@ -7942,6 +7942,14 @@ def is_script(path):
 rustup = shutil.which('rustup', path=probe_env.get('PATH'))
 rustup_digest = digest(pathlib.Path(rustup).resolve()) if rustup else None
 
+# Same exact reviewed v4 shim/v3 toolchain-wrapper bytes used by the strict
+# cache resolver. v6 was additionally source-reviewed against RCH's shim.rs
+# template: its unselected local path prefers rustc's sysroot/cargo-rch-real.
+# A header/version response never admits a changed or unknown wrapper.
+rch_shim_hash = '015f36047d1b732ada59b8644f7fde5e327803a11e56d571d2603af25c970ed7'
+rch_toolchain_hash = 'd5966567e177ce968f272848ab8e249da3d9bfca40f90237480e1fbe6bd9d2d0'
+rch_shim_v6_hash = '171e35f834fb8f900f85bd9ee22a659b3e710973dc3922d9579d055d560982e5'
+
 def identity(name, program, version_args, rustup_tool=None, required=True):
     selected = shutil.which(program, path=probe_env.get('PATH'))
     if not selected:
@@ -7959,11 +7967,59 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
               'version': version}
     actual = None
     proxy = rustup_digest is not None and record['selected_sha256'] == rustup_digest
-    if rustup_tool and rustup and proxy:
+    managed_cargo = rustup_tool == 'cargo' and record['selected_kind'] == 'script' and \
+        record['selected_sha256'] in (rch_shim_hash, rch_toolchain_hash, rch_shim_v6_hash)
+    if managed_cargo:
+        if (probe_env.get('RCH_CARGO_WRAPPER_BYPASS') != '1' or
+                probe_env.get('RCH_REAL_CARGO') or probe_env.get('RCH_SHIM_REAL_CARGO')):
+            fail('managed RCH Cargo resolution requires explicit bypass without executable overrides')
+        if record['selected_sha256'] == rch_toolchain_hash and not explicit_toolchain:
+            actual = resolved_selected.parent / 'cargo-rch-real'
+        elif record['selected_sha256'] == rch_shim_v6_hash and not explicit_toolchain:
+            # Bind the actual dispatch dependency too. RUSTC may name a
+            # different explicit compiler; this shim asks PATH's bare rustc.
+            record['sysroot_resolver'] = identity('rustc', 'rustc', ['-vV'], 'rustc')
+            sysroot = run(['rustc', '--print', 'sysroot'])
+            candidate = pathlib.Path(sysroot) / 'bin' / 'cargo-rch-real'
+            actual = candidate if candidate.is_file() and os.access(candidate, os.X_OK) else \
+                pathlib.Path(probe_env.get('HOME', '')) / '.cargo' / 'bin' / 'cargo'
+    if rustup_tool and (proxy or managed_cargo and actual is None):
+        if not rustup or is_script(pathlib.Path(rustup).resolve()):
+            fail('selected compiler requires an executable rustup resolver')
+        record['rustup_resolver'] = {'path': str(pathlib.Path(rustup).resolve()),
+                                     'sha256': rustup_digest}
         which = run([rustup, 'which', rustup_tool])
         if not which or not pathlib.Path(which).is_file():
             fail('rustup did not resolve the selected ' + rustup_tool)
         actual = pathlib.Path(which).resolve()
+    if actual is not None and rustup_tool:
+        try:
+            actual = actual.resolve(strict=True)
+            # The v6 fallback can itself be the stock rustup Cargo proxy.
+            if managed_cargo and not is_script(actual) and digest(actual) == rustup_digest:
+                if not rustup or is_script(pathlib.Path(rustup).resolve()):
+                    fail('managed Cargo fallback requires an executable rustup resolver')
+                record['rustup_resolver'] = {'path': str(pathlib.Path(rustup).resolve()),
+                                             'sha256': rustup_digest}
+                actual = pathlib.Path(run([rustup, 'which', rustup_tool])).resolve(strict=True)
+            if is_script(actual):
+                if (rustup_tool != 'cargo' or digest(actual) != rch_toolchain_hash or
+                        probe_env.get('RCH_CARGO_WRAPPER_BYPASS') != '1' or
+                        probe_env.get('RCH_REAL_CARGO') or probe_env.get('RCH_SHIM_REAL_CARGO')):
+                    fail('unresolved compiler launcher: ' + str(actual))
+                record['toolchain_launcher'] = {'path': str(actual), 'sha256': digest(actual)}
+                actual = (actual.parent / 'cargo-rch-real').resolve(strict=True)
+            if (not actual.is_file() or not os.access(actual, os.X_OK) or is_script(actual) or
+                    digest(actual) == rustup_digest):
+                fail('compiler delegation did not resolve a real executable: ' + str(actual))
+            native_args = version_args[1:] if version_args and version_args[0].startswith('+') else version_args
+            native_version = run([str(actual), *native_args]) if native_args else ''
+            if native_args and native_args[-1] != '-vV':
+                native_version = native_version.splitlines()[0] if native_version else ''
+            if native_version != version:
+                fail('selected launcher and resolved executable version disagree: ' + program)
+        except (OSError, RuntimeError) as error:
+            fail('cannot resolve actual compiler executable: ' + str(error))
     if sys.platform == 'darwin' and str(resolved_selected) in (
             '/usr/bin/cc', '/usr/bin/c++', '/usr/bin/clang', '/usr/bin/clang++', '/usr/bin/ld'):
         tool = {'/usr/bin/c++': 'clang++', '/usr/bin/clang++': 'clang++', '/usr/bin/ld': 'ld'}.get(
@@ -8070,6 +8126,15 @@ else:
     read_receipt()  # Retain the same bytes/inode throughout executable probing.
 PY
     printf 'DSR_TOOLCHAIN_IDENTITY_PY\n'
+}
+
+# Keep accepted 1 MiB observations off exec argv. Bash's builtin printf feeds
+# the original and returned documents directly to one fixed jq program.
+_act_bind_toolchain_identity() {
+    printf '%s\n' "$1" "$2" "$3" | jq -sce '
+        select(length == 3 and (.[0] | type == "object") and
+            (.[1] | type == "object") and .[1] == .[2]) |
+        .[0].toolchain = .[2] | .[0]'
 }
 
 # Validate a matrix command against the exact worker target without executing
@@ -9286,10 +9351,8 @@ EOF
         if toolchain_read=$(_act_toolchain_identity_script read "$strict_toolchain_receipt" \
                 "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path") && \
            toolchain_identity_json=$(_act_ssh_exec "$host" "$toolchain_read"$'\n' 30) && \
-           toolchain_identity_json=$(jq -ce --argjson original "$strict_toolchain_identity_json" \
-                'select(. == $original)' <<< "$toolchain_identity_json") && \
-           cargo_isolation_json=$(jq --argjson toolchain "$toolchain_identity_json" \
-               '.toolchain = $toolchain' <<< "$cargo_isolation_json"); then
+           cargo_isolation_json=$(_act_bind_toolchain_identity "$cargo_isolation_json" \
+                "$strict_toolchain_identity_json" "$toolchain_identity_json"); then
             :
         else
             _log_error "Strict toolchain identity receipt missing or invalid; refusing artifact collection"
@@ -10038,9 +10101,8 @@ EOF
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
         --argjson build_influence_env "$build_influence_env_json" \
-        --argjson cargo_isolation "$cargo_isolation_json" \
         --arg log_file "$log_file" \
-        '{
+        'input as $cargo_isolation | {
             tool: $tool,
             platform: $platform,
             host: $host,
@@ -10058,7 +10120,7 @@ EOF
             build_influence_env: $build_influence_env,
             cargo_isolation: $cargo_isolation,
             log_file: $log_file
-        }'
+        }' <<< "$cargo_isolation_json" || return 4
 
     return "$exit_code"
 }
@@ -12478,11 +12540,10 @@ _act_generate_contract_manifest() {
         --argjson duration_ms "$duration_ms" \
         --arg status "$status" \
         --argjson summary "$summary_json" \
-        --argjson build_environments "$build_environments_json" \
         --argjson artifacts "$artifacts_json" \
         --arg purpose "$build_purpose" \
         --argjson requested_targets "$requested_targets" \
-        '{
+        'input as $build_environments | {
             schema_version: "1.0.0",
             build_purpose: $purpose,
             publishable: ($purpose == "release"),
@@ -12498,7 +12559,7 @@ _act_generate_contract_manifest() {
             build_environments: $build_environments,
             artifacts: ($artifacts | map(. + {build_purpose: $purpose,
                          publishable: ($purpose == "release")}))
-        }'); then
+        }' <<< "$build_environments_json"); then
         _log_error "Failed to serialize release manifest"
         return 4
     fi
@@ -12994,10 +13055,9 @@ act_generate_manifest() {
         --arg status "$status" \
         --argjson duration_ms "$duration_ms" \
         --argjson summary "$summary_json" \
-        --argjson build_environments "$build_environments_json" \
         --argjson requested_targets "$requested_targets_json" \
         --argjson artifacts "$artifacts_json" \
-        '{
+        'input as $build_environments | {
             schema_version: "1.0.0",
             tool: $tool,
             version: $version,
@@ -13011,7 +13071,8 @@ act_generate_manifest() {
             summary: $summary,
             build_environments: $build_environments,
             artifacts: ($artifacts | map(. + {build_purpose: "release", publishable: true}))
-        } + (if $requested_targets == null then {} else {requested_targets: $requested_targets} end)') || {
+        } + (if $requested_targets == null then {} else {requested_targets: $requested_targets} end)' \
+            <<< "$build_environments_json") || {
             _log_error "Failed to serialize manifest"
             return 4
         }
