@@ -20,7 +20,8 @@ import tempfile
 
 root = Path(sys.argv[1])
 module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
-work = Path(tempfile.mkdtemp(prefix='dsr-toolchain-identity-')).resolve()
+fixture_base = os.environ.get('RCH_TARGET_BASE') or os.environ.get('TMPDIR')
+work = Path(tempfile.mkdtemp(prefix='dsr-toolchain-identity-', dir=fixture_base)).resolve()
 print('Retained fixtures: ' + str(work), flush=True)
 passed = failed = 0
 
@@ -410,6 +411,54 @@ check('changed real executable plus a rewritten matching receipt cannot rebase t
       rebased.returncode == 0 and new_observation != json.loads(original_bytes) and
       after_rebase.returncode != 0 and collected_rebase.returncode != 0 and
       receipt_pins[str(receipt)] == original_pin and retained.read_bytes() == original_bytes)
+
+# Execute an exact source-reviewed managed shim with genuine private
+# Cargo/rustc. This proves delegation in the fixture, not remote admission,
+# live RCH worker execution, native SDK selection or release qualification.
+managed_input = Path(os.environ.get('DSR_TEST_RCH_CARGO_SHIM', str(Path.home() / '.rch/shims/cargo')))
+managed_hash = '171e35f834fb8f900f85bd9ee22a659b3e710973dc3922d9579d055d560982e5'
+if not managed_input.is_file() or digest(managed_input) != managed_hash:
+    check('a byte-exact reviewed RCH v6 shim input is required (DSR_TEST_RCH_CARGO_SHIM)', False)
+else:
+    managed_bin = work / 'managed-rch-bin'
+    managed_bin.mkdir()
+    managed_shim = managed_bin / 'cargo'
+    shutil.copy2(managed_input, managed_shim)
+    managed_shim.chmod(0o755)
+    (selected / 'bin/cargo-rch-real').symlink_to('cargo')
+    managed_env = dict(environment, PATH=str(managed_bin) + os.pathsep + environment['PATH'],
+                       RUSTUP_TOOLCHAIN='fixture-selected',
+                       CARGO_TARGET_DIR=str(work / 'managed-rch-output'))
+    for variable in ('RCH_REAL_CARGO', 'RCH_SHIM_REAL_CARGO'):
+        managed_env.pop(variable, None)
+    command = 'cargo +fixture-selected build --quiet --offline --jobs 2'
+    recorded, observed, managed_receipt = probe(command, managed_env)
+    compiled = build(command, managed_env)
+    verified, _, _ = probe(command, managed_env, mode='verify', receipt=managed_receipt)
+    cargo_record = observed.get('tools', {}).get('cargo', {})
+    check('reviewed managed shim builds with explicit selection and binds delegated Cargo bytes',
+          recorded.returncode == 0 and compiled.returncode == 0 and verified.returncode == 0 and
+          require([work / 'managed-rch-output' / host / 'debug/identity-probe']) == '42' and
+          cargo_record.get('selected_kind') == 'script' and
+          cargo_record.get('selected_sha256') == managed_hash and
+          cargo_record.get('resolved_kind') == 'executable' and
+          expected_tool(observed, 'cargo', selected / 'bin/cargo'))
+    command = 'cargo build --quiet --offline --jobs 2'
+    plain_recorded, plain_observed, plain_receipt = probe(command, managed_env)
+    check('unselected managed shim binds its actual rustc sysroot dispatch',
+          plain_recorded.returncode == 0 and expected_tool(plain_observed, 'cargo', selected / 'bin/cargo') and
+          expected_tool({'tools': {'rustc': plain_observed.get('tools', {}).get('cargo', {}).get(
+              'sysroot_resolver', {})}}, 'rustc', selected / 'bin/rustc'))
+    overridden = dict(managed_env, RCH_REAL_CARGO=str(real_cargo))
+    refused, _, refused_receipt = probe(command, overridden)
+    check('managed executable override cannot borrow the reviewed shim delegation authority',
+          refused.returncode != 0 and not refused_receipt.exists())
+    shim_before = digest(managed_shim)
+    with (selected / 'bin/cargo').open('ab') as stream:
+        stream.write(b'retained delegated Cargo byte drift\n')
+    drifted, _, _ = probe(command, managed_env, mode='verify', receipt=plain_receipt)
+    check('unchanged wrapper plus changed delegated executable refuses the original pin',
+          plain_recorded.returncode == 0 and drifted.returncode != 0 and digest(managed_shim) == shim_before)
 
 print(f'Toolchain identity: {passed} passed, {failed} failed; fixtures retained at {work}', flush=True)
 raise SystemExit(1 if failed else 0)
