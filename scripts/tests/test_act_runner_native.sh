@@ -1386,7 +1386,7 @@ test_unix_rust_sdk_environment() {
         launch=$(printf '%s\n' "$launch" | awk '
             skip && /^DSR_TOOLCHAIN_IDENTITY_PY$/ { skip = 0; next }
             skip { next }
-            match($0, /python3 -I - (record|verify) /) { print substr($0, 1, RSTART - 1); skip = 1; next }
+            match($0, /["][$]dsr_tool_python["] -I - (record|verify) /) { print substr($0, 1, RSTART - 1); skip = 1; next }
             { print }')
         observed=$(OPENSSL_DIR=/ambient/openssl OPENSSL_NO_VENDOR=1 \
             X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR=/ambient/target-openssl \

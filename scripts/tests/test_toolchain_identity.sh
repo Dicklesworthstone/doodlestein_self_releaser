@@ -80,12 +80,12 @@ require(['rustup', 'default', 'fixture-default'], env=environment)
 environment['RUSTUP_TOOLCHAIN'] = 'fixture-default'
 environment['CARGO_BUILD_TARGET'] = host
 
-program = '''source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "$5" | bash'''
+program = '''source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "$5" "$6" | bash'''
 counter = 0
 receipt_pins = {}
 
 
-def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, timeout=120):
+def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, expected_cwd=None, timeout=120):
     global counter
     counter += 1
     if receipt is None:
@@ -94,7 +94,8 @@ def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, ti
     # that held value, never rebase it from a compiler-writable pathname.
     held_pin = receipt_pins.get(str(receipt), {}) if pin is None else pin
     result = run(['bash', '-o', 'pipefail', '-c', program, '_', module, mode, receipt, command,
-                  json.dumps(held_pin)], cwd=cwd or project, env=env or environment, timeout=timeout)
+                  json.dumps(held_pin), expected_cwd or project], cwd=cwd or project,
+                 env=env or environment, timeout=timeout)
     data = {}
     if result.returncode == 0 and mode == 'record':
         observation = json.loads(result.stdout)
@@ -323,6 +324,16 @@ shutil.copy2(project / 'Cargo.toml', other_project / 'Cargo.toml')
 shutil.copy2(project / 'src/main.rs', other_project / 'src/main.rs')
 different_cwd, _, _ = probe(command, mode='verify', receipt=receipt, cwd=other_project)
 check('actual different execution cwd refuses the held observation', different_cwd.returncode != 0)
+aliased_root = work / 'requested-parent-alias'
+aliased_root.symlink_to(project, target_is_directory=True)
+alias_record, alias_identity, alias_receipt = probe(command, cwd=aliased_root, expected_cwd=aliased_root)
+alias_verify, _, _ = probe(command, mode='verify', receipt=alias_receipt,
+                         cwd=aliased_root, expected_cwd=aliased_root)
+alias_read, alias_collected, _ = probe(command, mode='read', receipt=alias_receipt,
+                                     expected_cwd=aliased_root)
+check('requested root aliases bind the actual physical cwd without rejecting the unchanged build',
+      alias_record.returncode == 0 and alias_verify.returncode == 0 and alias_read.returncode == 0 and
+      alias_identity.get('cwd') == str(project) and alias_collected == alias_identity)
 
 for mutation in ('truncate', 'replacement', 'symlink', 'fifo', 'hardlink', 'permissions', 'oversize'):
     result, original, receipt = probe(command)

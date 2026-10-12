@@ -7436,16 +7436,18 @@ PY
 # Apple /usr/bin compiler launchers, its dispatch target and content digest.
 # Internal metadata mode runs locked/offline metadata with the same selection;
 # context mode passes selected executable authority to the intermediate cache.
-# Args: mode output_json build_cmd extra_tools(space-separated)
+# Args: mode output_json build_cmd extra_tools(space-separated) receipt_pin expected_cwd
 _act_toolchain_identity_script() {
-    local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}"
-    local output_q command_q extra_q pin_q python_q=python3
+    local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}" expected_cwd="${6:-}"
+    local output_q command_q extra_q pin_q cwd_q python_q=python3
     [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
+    [[ -z "$expected_cwd" || ( "$expected_cwd" == /* && "$expected_cwd" != *..* ) ]] || return 4
     printf -v output_q '%q' "$output"
     printf -v command_q '%q' "$build_cmd"
     printf -v extra_q '%q' "$extra_tools"
     printf -v pin_q '%q' "$receipt_pin"
+    printf -v cwd_q '%q' "$expected_cwd"
     # Target-only planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
@@ -7459,15 +7461,27 @@ _act_toolchain_identity_script() {
         printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
         python_q='"$dsr_tool_python"'
     fi
-    printf '%s -I - %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q"
+    printf '%s -I - %s %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q" "$cwd_q"
     cat <<'PY'
 import hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys
 
-mode, output, command, extra, receipt_pin = sys.argv[1:6]
+mode, output, command, extra, receipt_pin, expected_cwd = sys.argv[1:7]
 
 def fail(message):
     sys.stderr.write('[dsr] toolchain identity: ' + message + '\n')
     sys.exit(86)
+
+if expected_cwd:
+    try:
+        physical_cwd = str(pathlib.Path(expected_cwd).resolve(strict=True))
+        if not pathlib.Path(physical_cwd).is_dir():
+            fail('requested build cwd is not a directory')
+    except (OSError, RuntimeError) as error:
+        fail('cannot resolve requested build cwd: ' + str(error))
+    if mode in ('record', 'verify') and os.getcwd() != physical_cwd:
+        fail('toolchain observation does not run in the requested build cwd')
+else:
+    physical_cwd = None
 
 def digest(path):
     h = hashlib.sha256()
@@ -7514,6 +7528,8 @@ def read_receipt():
         recorded = json.loads(data)
         if not isinstance(recorded, dict):
             fail('identity receipt is not an object')
+        if physical_cwd is not None and recorded.get('cwd') != physical_cwd:
+            fail('pinned observation does not bind the requested physical build cwd')
         return recorded
     except (OSError, ValueError, TypeError) as error:
         fail('cannot read pinned identity receipt ' + output + ': ' + str(error))
@@ -9097,7 +9113,7 @@ EOF
             local toolchain_record
             [[ -n "$rust_zig_target" ]] && strict_toolchain_extra="cargo-zigbuild zig"
             toolchain_record=$(_act_toolchain_identity_script record \
-                "$strict_toolchain_receipt" "$build_cmd" "$strict_toolchain_extra") || return 4
+                "$strict_toolchain_receipt" "$build_cmd" "$strict_toolchain_extra" "" "$remote_path") || return 4
             strict_toolchain_record_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$toolchain_record"$'\n'
             strict_toolchain_run_prefix="set -e; $cd_cmd; $env_exports"
             strict_toolchain_effective_build="$effective_build"
@@ -9194,12 +9210,13 @@ EOF
         # a new login-shell selection must match the coordinator-held baseline.
         if toolchain_observation_json=$(_act_ssh_exec "$host" "$strict_toolchain_record_cmd" \
                 "$_ACT_SYNC_TIMEOUT" 2> >(tee -a "$log_file" >&2)) && \
-           toolchain_observation_json=$(jq -ce --arg cwd "$remote_path" --arg target "$selected_triple" '
+           toolchain_observation_json=$(jq -ce --arg target "$selected_triple" '
                 select(type == "object" and
                     (.pin | type == "object" and (keys | sort) == ["identity", "sha256"] and
                         (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
                         (.identity | type == "string" and test("^[0-9]+(:[0-9]+){8}$"))) and
-                    (.identity | type == "object" and .schema_version == 1 and .cwd == $cwd and
+                    (.identity | type == "object" and .schema_version == 1 and
+                        (.cwd | type == "string" and startswith("/")) and
                         (.target_triple | type == "string" and length > 0) and
                         ($target == "" or .target_triple == $target) and
                         (.tools | type == "object") and
@@ -9212,7 +9229,7 @@ EOF
            strict_toolchain_pin_json=$(jq -c '.pin' <<< "$toolchain_observation_json") && \
            strict_toolchain_identity_json=$(jq -c '.identity' <<< "$toolchain_observation_json") && \
            toolchain_verify=$(_act_toolchain_identity_script verify "$strict_toolchain_receipt" \
-                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json"); then
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path"); then
             # Restore heredoc terminator newlines dropped by command substitution.
             remote_cmd="$strict_toolchain_run_prefix$toolchain_verify"$'\n'"$strict_toolchain_effective_build"$'\n'"$toolchain_verify"$'\n'
         else
@@ -9267,7 +9284,7 @@ EOF
         # exact original observation, including cwd and selected target.
         local toolchain_identity_json="" toolchain_read
         if toolchain_read=$(_act_toolchain_identity_script read "$strict_toolchain_receipt" \
-                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json") && \
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json" "$remote_path") && \
            toolchain_identity_json=$(_act_ssh_exec "$host" "$toolchain_read"$'\n' 30) && \
            toolchain_identity_json=$(jq -ce --argjson original "$strict_toolchain_identity_json" \
                 'select(. == $original)' <<< "$toolchain_identity_json") && \
