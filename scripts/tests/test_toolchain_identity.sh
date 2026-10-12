@@ -36,7 +36,8 @@ def check(label, condition):
 
 
 def run(argv, **kwargs):
-    return subprocess.run(list(map(str, argv)), capture_output=True, text=True, timeout=120, **kwargs)
+    timeout = kwargs.pop('timeout', 120)
+    return subprocess.run(list(map(str, argv)), capture_output=True, text=True, timeout=timeout, **kwargs)
 
 
 def require(argv, **kwargs):
@@ -79,19 +80,29 @@ require(['rustup', 'default', 'fixture-default'], env=environment)
 environment['RUSTUP_TOOLCHAIN'] = 'fixture-default'
 environment['CARGO_BUILD_TARGET'] = host
 
-program = '''source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" | bash'''
+program = '''source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "$5" | bash'''
 counter = 0
+receipt_pins = {}
 
 
-def probe(command, env=None, mode='record', receipt=None):
+def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, timeout=120):
     global counter
     counter += 1
     if receipt is None:
         receipt = work / ('receipt-' + str(counter) + '.json')
-    result = run(['bash', '-o', 'pipefail', '-c', program, '_', module, mode, receipt, command],
-                 cwd=project, env=env or environment)
-    data = json.loads(receipt.read_text()) if receipt.exists() else {}
-    if result.returncode and mode == 'record':
+    # Only record mode may establish a pin. Verification/collection must use
+    # that held value, never rebase it from a compiler-writable pathname.
+    held_pin = receipt_pins.get(str(receipt), {}) if pin is None else pin
+    result = run(['bash', '-o', 'pipefail', '-c', program, '_', module, mode, receipt, command,
+                  json.dumps(held_pin)], cwd=cwd or project, env=env or environment, timeout=timeout)
+    data = {}
+    if result.returncode == 0 and mode == 'record':
+        observation = json.loads(result.stdout)
+        data = observation['identity']
+        receipt_pins[str(receipt)] = observation['pin']
+    elif result.returncode == 0 and mode == 'read':
+        data = json.loads(result.stdout)
+    if result.returncode:
         (work / ('refusal-' + str(counter) + '.log')).write_text(result.stderr)
     return result, data, receipt
 
@@ -293,11 +304,74 @@ for label, contents in (
     config_path.rename(work / ('retained-' + label.replace(' ', '-') + '.toml'))
 
 command = 'cargo +fixture-selected build --offline'
+result, original, receipt = probe(command)
+original_bytes = receipt.read_bytes()
+held_pin = dict(receipt_pins[str(receipt)])
+collected, collected_data, _ = probe(command, mode='read', receipt=receipt)
+check('secure collection returns the unchanged genuine pre-build observation',
+      result.returncode == 0 and collected.returncode == 0 and collected_data == original and
+      digest(receipt) == held_pin['sha256'] and receipt.read_bytes() == original_bytes)
+missing_pin, _, _ = probe(command, mode='verify', receipt=receipt, pin={})
+check('verification cannot establish a new baseline without the original pin', missing_pin.returncode != 0)
+wrong_target = dict(environment, CARGO_BUILD_TARGET='aarch64-unknown-linux-gnu' if host !=
+                    'aarch64-unknown-linux-gnu' else 'x86_64-unknown-linux-gnu')
+different_target, _, _ = probe(command, wrong_target, mode='verify', receipt=receipt)
+check('actual selection of a different target refuses the held observation', different_target.returncode != 0)
+other_project = work / 'other-project'
+(other_project / 'src').mkdir(parents=True)
+shutil.copy2(project / 'Cargo.toml', other_project / 'Cargo.toml')
+shutil.copy2(project / 'src/main.rs', other_project / 'src/main.rs')
+different_cwd, _, _ = probe(command, mode='verify', receipt=receipt, cwd=other_project)
+check('actual different execution cwd refuses the held observation', different_cwd.returncode != 0)
+
+for mutation in ('truncate', 'replacement', 'symlink', 'fifo', 'hardlink', 'permissions', 'oversize'):
+    result, original, receipt = probe(command)
+    original_bytes = receipt.read_bytes()
+    original_pin = dict(receipt_pins[str(receipt)])
+    retained = work / ('retained-' + mutation + '-baseline.json')
+    if mutation in ('replacement', 'symlink', 'fifo'):
+        receipt.rename(retained)
+        if mutation == 'replacement':
+            receipt.write_bytes(original_bytes)
+            receipt.chmod(0o600)
+        elif mutation == 'symlink':
+            receipt.symlink_to(retained)
+        else:
+            os.mkfifo(receipt, 0o600)
+    elif mutation == 'hardlink':
+        os.link(receipt, retained)
+    elif mutation == 'permissions':
+        retained.write_bytes(original_bytes)
+        receipt.chmod(0o644)
+    else:
+        retained.write_bytes(original_bytes)
+        receipt.write_bytes(b'' if mutation == 'truncate' else b'x' * 1048577)
+    # The FIFO bound catches a blocking read; no reader follows a symlink or
+    # substitutes fixture JSON for an actual compiler/service observation.
+    verified, _, _ = probe(command, mode='verify', receipt=receipt, timeout=5)
+    collected, _, _ = probe(command, mode='read', receipt=receipt, timeout=5)
+    check(mutation + ' refuses verification and artifact consumption without losing baseline bytes',
+          result.returncode == 0 and verified.returncode != 0 and collected.returncode != 0 and
+          retained.read_bytes() == original_bytes and receipt_pins[str(receipt)] == original_pin)
+
+command = 'cargo +fixture-selected build --offline'
 result, _, receipt = probe(command)
+original_bytes = receipt.read_bytes()
+original_pin = dict(receipt_pins[str(receipt)])
 with (selected / 'bin/rustc').open('ab') as stream:
     stream.write(b'changed fixture executable bytes\n')
 after, _, _ = probe(command, mode='verify', receipt=receipt)
 check('selected executable byte drift refuses the post-build probe', result.returncode == 0 and after.returncode != 0)
+rebased, new_observation, new_receipt = probe(command)
+retained = work / 'retained-before-rebased-receipt.json'
+retained.write_bytes(original_bytes)
+receipt.write_bytes(new_receipt.read_bytes())
+after_rebase, _, _ = probe(command, mode='verify', receipt=receipt)
+collected_rebase, _, _ = probe(command, mode='read', receipt=receipt)
+check('changed real executable plus a rewritten matching receipt cannot rebase the original observation',
+      rebased.returncode == 0 and new_observation != json.loads(original_bytes) and
+      after_rebase.returncode != 0 and collected_rebase.returncode != 0 and
+      receipt_pins[str(receipt)] == original_pin and retained.read_bytes() == original_bytes)
 
 print(f'Toolchain identity: {passed} passed, {failed} failed; fixtures retained at {work}', flush=True)
 raise SystemExit(1 if failed else 0)
