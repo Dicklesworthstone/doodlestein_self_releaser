@@ -7438,13 +7438,14 @@ PY
 # context mode passes selected executable authority to the intermediate cache.
 # Args: mode output_json build_cmd extra_tools(space-separated)
 _act_toolchain_identity_script() {
-    local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}"
-    local output_q command_q extra_q python_q=python3
-    [[ "$mode" == record || "$mode" == verify || "$mode" == metadata || "$mode" == context || "$mode" == target ]] || return 4
+    local mode="$1" output="$2" build_cmd="$3" extra_tools="${4:-}" receipt_pin="${5:-}"
+    local output_q command_q extra_q pin_q python_q=python3
+    [[ "$mode" == record || "$mode" == verify || "$mode" == read || "$mode" == metadata || "$mode" == context || "$mode" == target ]] || return 4
     [[ "$output" == /* && "$output" != *..* ]] || return 4
     printf -v output_q '%q' "$output"
     printf -v command_q '%q' "$build_cmd"
     printf -v extra_q '%q' "$extra_tools"
+    printf -v pin_q '%q' "$receipt_pin"
     # Target-only planning runs on the coordinator without invoking any build
     # tools or reading its Cargo configuration. The configured PATH may be a
     # remote host path, so use the coordinator's absolute Python interpreter.
@@ -7458,11 +7459,11 @@ _act_toolchain_identity_script() {
         printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
         python_q='"$dsr_tool_python"'
     fi
-    printf '%s -I - %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q"
+    printf '%s -I - %s %s %s %s %s <<\x27DSR_TOOLCHAIN_IDENTITY_PY\x27\n' "$python_q" "$mode" "$output_q" "$command_q" "$extra_q" "$pin_q"
     cat <<'PY'
-import hashlib, json, os, pathlib, re, shlex, shutil, subprocess, sys
+import hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys
 
-mode, output, command, extra = sys.argv[1:5]
+mode, output, command, extra, receipt_pin = sys.argv[1:6]
 
 def fail(message):
     sys.stderr.write('[dsr] toolchain identity: ' + message + '\n')
@@ -7474,6 +7475,56 @@ def digest(path):
         for block in iter(lambda: stream.read(1048576), b''):
             h.update(block)
     return h.hexdigest()
+
+def receipt_identity(info):
+    # Strings preserve nanosecond/inode precision through jq and SSH argv.
+    return ':'.join(str(value) for value in (
+        info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+        info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+
+def receipt_info(info):
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+            info.st_uid != os.geteuid() or info.st_mode & 0o077 or
+            not 0 < info.st_size <= 1048576):
+        fail('identity receipt is not a bounded private regular file')
+
+def read_receipt():
+    try:
+        pin = json.loads(receipt_pin)
+        if (not isinstance(pin, dict) or set(pin) != {'sha256', 'identity'} or
+                not isinstance(pin['sha256'], str) or
+                not re.fullmatch(r'[0-9a-f]{64}', pin['sha256']) or
+                not isinstance(pin['identity'], str) or
+                not re.fullmatch(r'[0-9]+(?::[0-9]+){8}', pin['identity'])):
+            fail('missing or invalid coordinator-held identity receipt pin')
+        fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            receipt_info(before)
+            if receipt_identity(before) != pin['identity']:
+                fail('identity receipt replaced or modified since recording')
+            data = stream.read(1048577)
+            after = os.fstat(stream.fileno())
+            named = os.stat(output, follow_symlinks=False)
+            if (len(data) != before.st_size or
+                    receipt_identity(after) != pin['identity'] or
+                    receipt_identity(named) != pin['identity'] or
+                    hashlib.sha256(data).hexdigest() != pin['sha256']):
+                fail('identity receipt bytes or named inode changed during verification')
+        recorded = json.loads(data)
+        if not isinstance(recorded, dict):
+            fail('identity receipt is not an object')
+        return recorded
+    except (OSError, ValueError, TypeError) as error:
+        fail('cannot read pinned identity receipt ' + output + ': ' + str(error))
+
+recorded = read_receipt() if mode in ('verify', 'read') else None
+if mode == 'read':
+    # Collection reads exactly the observation pinned before the compiler,
+    # without probing a different login-shell toolchain after the build.
+    json.dump(recorded, sys.stdout, sort_keys=True)
+    sys.stdout.write('\n')
+    sys.exit(0)
 
 def shell_word(raw, variables=()):
     # Read a bounded shell word without evaluating code. Quotes and ordinary
@@ -7974,19 +8025,27 @@ if mode == 'context':
     sys.exit(0)
 
 if mode == 'record':
+    data = (json.dumps(result, sort_keys=True) + '\n').encode()
+    if len(data) > 1048576:
+        fail('identity observation exceeds the receipt size bound')
     try:
         fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            held = os.fstat(stream.fileno())
+            receipt_info(held)
+            if receipt_identity(held) != receipt_identity(os.stat(output, follow_symlinks=False)):
+                fail('identity receipt replaced while recording')
     except OSError as error:
         fail('cannot create identity receipt ' + output + ': ' + str(error))
-    with os.fdopen(fd, 'w') as stream:
-        json.dump(result, stream, sort_keys=True)
-        stream.write('\n')
+    # This value is returned to the coordinator before compilation. Never
+    # recompute the pin from the writable receipt after the build.
+    json.dump({'identity': result, 'pin': {
+        'sha256': hashlib.sha256(data).hexdigest(), 'identity': receipt_identity(held)}},
+        sys.stdout, sort_keys=True)
+    sys.stdout.write('\n')
 else:
-    try:
-        with open(output) as stream:
-            recorded = json.load(stream)
-    except (OSError, ValueError) as error:
-        fail('cannot read identity receipt ' + output + ': ' + str(error))
     if recorded != result:
         changed = sorted(name for name in set(recorded.get('tools', {})) | set(tools)
                          if recorded.get('tools', {}).get(name) != tools.get(name))
