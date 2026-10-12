@@ -8051,6 +8051,7 @@ else:
                          if recorded.get('tools', {}).get(name) != tools.get(name))
         fail('build toolchain changed during the build (' + (', '.join(changed) or 'context') +
              '); refusing to collect its artifacts')
+    read_receipt()  # Retain the same bytes/inode throughout executable probing.
 PY
     printf 'DSR_TOOLCHAIN_IDENTITY_PY\n'
 }
@@ -8341,6 +8342,8 @@ act_run_native_build() {
     [[ -n "$remote_path_override" ]] && strict_native_build=true
     local strict_rust_build=false
     local strict_private_cargo_cache=false strict_cargo_seed_json='null' strict_toolchain_receipt=""
+    local strict_toolchain_record_cmd="" strict_toolchain_run_prefix="" strict_toolchain_effective_build=""
+    local strict_toolchain_extra="" strict_toolchain_pin_json="" strict_toolchain_identity_json=""
     local strict_cargo_context_json='null' strict_dependency_sources_json='null' strict_windows_toolchain_json='null'
     local strict_sources_verification=""
     local build_influence_env_json='{}'
@@ -9088,16 +9091,16 @@ EOF
             effective_build=$(_act_strict_cargo_cache_script "$strict_cache_root" "$strict_cache_contract" "$build_cmd") || return 4
         fi
         if [[ -n "$strict_toolchain_receipt" ]]; then
-            # Attest the toolchain in the build's own shell, then require the
-            # same identities once the build has finished (bd-10we).
-            local toolchain_extra="" toolchain_record toolchain_verify
-            [[ -n "$rust_zig_target" ]] && toolchain_extra="cargo-zigbuild zig"
+            # Keep the original observation at the coordinator, outside the
+            # compiler's writable filesystem. Preparation runs exactly once;
+            # replaying it could replace the Cargo shim or a fresh source stage.
+            local toolchain_record
+            [[ -n "$rust_zig_target" ]] && strict_toolchain_extra="cargo-zigbuild zig"
             toolchain_record=$(_act_toolchain_identity_script record \
-                "$strict_toolchain_receipt" "$build_cmd" "$toolchain_extra") || return 4
-            toolchain_verify=$(_act_toolchain_identity_script verify \
-                "$strict_toolchain_receipt" "$build_cmd" "$toolchain_extra") || return 4
-            # $(...) dropped each heredoc terminator's newline; restore it.
-            effective_build="$toolchain_record"$'\n'"$effective_build"$'\n'"$toolchain_verify"$'\n'
+                "$strict_toolchain_receipt" "$build_cmd" "$strict_toolchain_extra") || return 4
+            strict_toolchain_record_cmd="set -e; $cargo_home_prefix$cd_cmd; $env_exports$toolchain_record"$'\n'
+            strict_toolchain_run_prefix="set -e; $cd_cmd; $env_exports"
+            strict_toolchain_effective_build="$effective_build"
         fi
         if [[ "$strict_dependency_sources_json" != null ]]; then
             # Keep the authentication runtime out of the compiler command's
@@ -9184,10 +9187,44 @@ EOF
         exit_code=${PIPESTATUS[0]}
     fi
 
+    if [[ $exit_code -eq 0 && -n "$strict_toolchain_record_cmd" ]]; then
+        local toolchain_observation_json toolchain_verify
+        # Source authentication precedes this actual observation. The build
+        # re-probes in its own execution shell before AND after the compiler;
+        # a new login-shell selection must match the coordinator-held baseline.
+        if toolchain_observation_json=$(_act_ssh_exec "$host" "$strict_toolchain_record_cmd" \
+                "$_ACT_SYNC_TIMEOUT" 2> >(tee -a "$log_file" >&2)) && \
+           toolchain_observation_json=$(jq -ce --arg cwd "$remote_path" --arg target "$selected_triple" '
+                select(type == "object" and
+                    (.pin | type == "object" and (keys | sort) == ["identity", "sha256"] and
+                        (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                        (.identity | type == "string" and test("^[0-9]+(:[0-9]+){8}$"))) and
+                    (.identity | type == "object" and .schema_version == 1 and .cwd == $cwd and
+                        (.target_triple | type == "string" and length > 0) and
+                        ($target == "" or .target_triple == $target) and
+                        (.tools | type == "object") and
+                        (.tools as $tools | all(("cargo", "rustc");
+                            $tools[.] | type == "object" and
+                            (.selected_path | type == "string" and startswith("/")) and
+                            (.selected_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                            (.version | type == "string" and length > 0)))))
+            ' <<< "$toolchain_observation_json") && \
+           strict_toolchain_pin_json=$(jq -c '.pin' <<< "$toolchain_observation_json") && \
+           strict_toolchain_identity_json=$(jq -c '.identity' <<< "$toolchain_observation_json") && \
+           toolchain_verify=$(_act_toolchain_identity_script verify "$strict_toolchain_receipt" \
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json"); then
+            # Restore heredoc terminator newlines dropped by command substitution.
+            remote_cmd="$strict_toolchain_run_prefix$toolchain_verify"$'\n'"$strict_toolchain_effective_build"$'\n'"$toolchain_verify"$'\n'
+        else
+            _log_error "Original toolchain observation or receipt pin invalid; refusing compiler launch"
+            exit_code=4
+        fi
+    fi
+
     # Execute on remote host
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     if [[ $exit_code -eq 0 ]]; then
-        if $nonstrict_private_cargo_cache; then
+        if $nonstrict_private_cargo_cache || [[ -n "$strict_toolchain_record_cmd" ]]; then
             _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee -a "$log_file"
         else
             _act_ssh_exec "$host" "$remote_cmd" "$build_transport_timeout" 2>&1 | tee "$log_file"
@@ -9225,20 +9262,15 @@ EOF
         fi
     fi
     if [[ $exit_code -eq 0 && -n "$strict_toolchain_receipt" ]]; then
-        # The build command already re-probed and compared every identity;
-        # bind the attested executables into the target's isolation receipt.
-        local toolchain_identity_json=""
-        if toolchain_identity_json=$(_act_ssh_exec "$host" "cat '$strict_toolchain_receipt'" 30) && \
-           toolchain_identity_json=$(jq -ce '
-                select(type == "object" and .schema_version == 1 and
-                    (.cwd | type == "string" and startswith("/")) and
-                    (.tools | type == "object") and
-                    (.tools as $tools | all(("cargo", "rustc");
-                        $tools[.] | type == "object" and
-                        (.selected_path | type == "string" and startswith("/")) and
-                        (.selected_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
-                        (.version | type == "string" and length > 0))))
-            ' <<< "$toolchain_identity_json") && \
+        # Never let a post-build pathname read redefine the pre-build baseline.
+        # Secure collection requires the original held byte/inode pin and the
+        # exact original observation, including cwd and selected target.
+        local toolchain_identity_json="" toolchain_read
+        if toolchain_read=$(_act_toolchain_identity_script read "$strict_toolchain_receipt" \
+                "$build_cmd" "$strict_toolchain_extra" "$strict_toolchain_pin_json") && \
+           toolchain_identity_json=$(_act_ssh_exec "$host" "$toolchain_read"$'\n' 30) && \
+           toolchain_identity_json=$(jq -ce --argjson original "$strict_toolchain_identity_json" \
+                'select(. == $original)' <<< "$toolchain_identity_json") && \
            cargo_isolation_json=$(jq --argjson toolchain "$toolchain_identity_json" \
                '.toolchain = $toolchain' <<< "$cargo_isolation_json"); then
             :
