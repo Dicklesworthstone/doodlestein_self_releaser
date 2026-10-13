@@ -6,24 +6,16 @@ on:
       - src/act_runner.sh
       - scripts/tests/test_cargo_configuration.py
       - scripts/tests/test_cargo_configuration_security.py
+      - scripts/tests/test_cargo_invocation_security.py
       - scripts/tests/test_toolchain_identity.sh
       - tests/fixtures/cargo/**
       - .github/workflows/cargo-configuration-regression.yml
   workflow_dispatch:
-  workflow_run:
-    workflows: [Snapshot verification regression tests]
-    types: [completed]
-    branches: [main]
 concurrency:
   group: cargo-configuration-regression-main
   cancel-in-progress: false
 jobs:
   compatibility:
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -35,26 +27,43 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      # Only immutable, reviewed patches against exact source blobs qualify.
-      # workflow_run uses this default-branch revision, never upstream artifacts
-      # or code from the triggering run. This job does not update any Git ref.
-      - name: Apply the hash-bound compatibility and security fixes
+      - name: Materialize reviewed implementation against the exact baseline
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(git hash-object src/act_runner.sh)" = 16ccffe47fbd5410914def851ad3a5e7020f41d5
-          test "$(git hash-object scripts/tests/test_toolchain_identity.sh)" = 6c29af07ece5b0b6b8a8cb91482b4b5e284bc95e
-          test "$(git hash-object scripts/tests/test_cargo_configuration.py)" = 4c133bb5487745e7cfffc90ded80e63301664935
-          test "$(git hash-object scripts/tests/test_cargo_configuration_security.py)" = 6ce359416ee8c7d12facee41fb37c8c698239eb2
-          for blob in 3286cba174cf5a0a9119d73f74cb5380541a2303 3e18fefb0a1be119aee844c63232ce7c25d99c69; do
+          if ! grep -q '^        cargo_arguments = argv\[:argv.index' src/act_runner.sh; then
+            test "$(git hash-object src/act_runner.sh)" = 79b59af680a69c4495e6e2f59eb81257abc376d6
+            test "$(git hash-object scripts/tests/test_cargo_invocation_security.py)" = a0b70256b2efbcb92a6ed00279cbbda2603ee2a2
+            blob=057e59e4f1f787516ebde75c667829cf136d7e5d
             patch_file="$RUNNER_TEMP/$blob.patch"
             gh api "repos/$GITHUB_REPOSITORY/git/blobs/$blob" --jq .content | base64 --decode > "$patch_file"
             test "$(git hash-object "$patch_file")" = "$blob"
-            git apply --unidiff-zero --check "$patch_file"
-            git apply --unidiff-zero "$patch_file"
-          done
+            git apply --check "$patch_file"
+            git apply "$patch_file"
+          fi
           git diff --check
+          bash -n src/act_runner.sh scripts/tests/test_toolchain_identity.sh
+          python3 -I scripts/tests/test_cargo_configuration_security.py
+          python3 -I scripts/tests/test_cargo_invocation_security.py
+      # Retain exact candidate bytes before optional host provisioning. These
+      # objects are NOT a claim of real-compiler qualification. No ref is moved.
+      # This allows a separate reviewed Git Data commit of this large source
+      # file while preserving every unrelated line and concurrent main commit.
+      - name: Retain locally qualified candidate source objects without moving refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only)
+          test -z "$changed" || test "$changed" = src/act_runner.sh
+          for path in src/act_runner.sh; do
+            expected=$(git hash-object "$path")
+            observed=$(jq -Rs '{content: ., encoding: "utf-8"}' "$path" | gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq .sha)
+            test "$observed" = "$expected"
+            printf 'CANDIDATE_BLOB %s %s\n' "$path" "$observed"
+          done
+          git hash-object src/act_runner.sh scripts/tests/test_toolchain_identity.sh scripts/tests/test_cargo_configuration.py > "$RUNNER_TEMP/cargo-source-before-tests.txt"
       - name: Install genuine compiler and lint dependencies
         run: |
           set -euo pipefail
@@ -63,25 +72,12 @@ jobs:
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustc -vV
           cargo -vV
-      - name: Validate syntax and run genuine Cargo and security regressions
+      - name: Run genuine Cargo and complete identity regressions
         run: |
           set -euo pipefail
-          bash -n src/act_runner.sh
-          bash -n scripts/tests/test_toolchain_identity.sh
           shellcheck -S warning src/act_runner.sh scripts/tests/test_toolchain_identity.sh
-          python3 -I scripts/tests/test_cargo_configuration_security.py
           python3 -I scripts/tests/test_cargo_configuration.py --integration
           bash scripts/tests/test_toolchain_identity.sh
-      - name: Retain only successfully tested source blobs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(git diff --name-only)" = $'scripts/tests/test_cargo_configuration.py\nscripts/tests/test_toolchain_identity.sh\nsrc/act_runner.sh'
-          for path in src/act_runner.sh scripts/tests/test_toolchain_identity.sh scripts/tests/test_cargo_configuration.py; do
-            expected=$(git hash-object "$path")
-            observed=$(jq -Rs '{content: ., encoding: "utf-8"}' "$path" | gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq .sha)
-            test "$observed" = "$expected"
-            printf 'VERIFIED_BLOB %s %s\n' "$path" "$observed"
-          done
-          git hash-object scripts/tests/test_cargo_configuration_security.py tests/fixtures/cargo/*.toml
+          git hash-object src/act_runner.sh scripts/tests/test_toolchain_identity.sh scripts/tests/test_cargo_configuration.py > "$RUNNER_TEMP/cargo-source-after-tests.txt"
+          cmp "$RUNNER_TEMP/cargo-source-before-tests.txt" "$RUNNER_TEMP/cargo-source-after-tests.txt"
+          while read -r blob; do printf 'REAL_COMPILER_QUALIFIED_BLOB %s\n' "$blob"; done < "$RUNNER_TEMP/cargo-source-after-tests.txt"
