@@ -261,6 +261,61 @@ def read_path(path, maximum=16 * 1024 * 1024):
         os.close(parent)
 
 
+def unscoped_selection(source):
+    """Keep registry caches and Git databases, not redundant Git checkouts.
+
+    Ordinary callers may not supply a lockfile. Cargo recreates git/checkouts
+    from git/db; the host's unrelated working copies can contain legitimate
+    symlinks and need not be read or copied (#39). Preserve the existing full
+    registry policy, including source-only caches and retained private sources.
+    Lockfile-scoped callers keep their stricter download-only selection. This
+    is not project-specific minimization or proof of complete offline closure.
+    """
+    selected, anchors = {}, {}
+    if source is None:
+        return selected, anchors
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    stable = lambda info: (info.st_dev, info.st_ino, info.st_mode)
+    home = os.open(source, flags)
+    try:
+        anchors[''] = stable(os.fstat(home))
+        for root, categories in (('registry', None), ('git', ('db',))):
+            try:
+                before = os.stat(root, dir_fd=home, follow_symlinks=False)
+            except FileNotFoundError:
+                anchors[root] = None
+                continue
+            if not stat.S_ISDIR(before.st_mode):
+                raise Failure('cache root is not a real directory: ' + root)
+            parent = os.open(root, flags, dir_fd=home)
+            try:
+                anchors[root] = stable(before)
+                if stable(os.fstat(parent)) != anchors[root]:
+                    raise Failure('cache root replaced during seed selection: ' + root)
+                selected[root] = None if categories is None else {}
+                for name in categories or ():
+                    relative = root + '/' + name
+                    try:
+                        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    except FileNotFoundError:
+                        anchors[relative] = None
+                        continue
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise Failure('Git database cache is not a real directory: ' + relative)
+                    selected[root][name] = None
+                    anchors[relative] = stable(info)
+                if (stable(os.fstat(parent)) != anchors[root] or
+                        stable(os.stat(root, dir_fd=home, follow_symlinks=False)) != anchors[root]):
+                    raise Failure('cache root changed during seed selection: ' + root)
+            finally:
+                os.close(parent)
+        if stable(os.stat(source, follow_symlinks=False)) != anchors['']:
+            raise Failure('Cargo home changed during seed selection')
+    finally:
+        os.close(home)
+    return selected, anchors
+
+
 def locked_selection(source, lockfile):
     """Select download inputs, not the host's unrelated unpacked sources.
 
@@ -474,6 +529,8 @@ def main(args):
         paths, checksums, scope = None, {}, None
         if len(args) == 4:
             paths, checksums, scope = locked_selection(source, args[3])
+        else:
+            paths, seed_anchors = unscoped_selection(source)
         destination = absolute(second)
         parent = os.path.realpath(os.path.dirname(destination))
         destination = os.path.join(parent, os.path.basename(destination))
@@ -489,6 +546,8 @@ def main(args):
                 raise Failure('selected archive changed after lockfile admission')
             if inventory(destination, require_private_links=True) != selected:
                 raise Failure('private cache copy does not match its seed')
+            if scope is None and unscoped_selection(source) != (paths, seed_anchors):
+                raise Failure('cache selection changed during preparation')
             receipt = {'schema_version': 1, 'kind': 'private-copy', 'cargo_home': destination,
                        'seed_source': source, 'inventory': selected}
             if scope is not None:
