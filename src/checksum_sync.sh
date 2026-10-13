@@ -419,6 +419,7 @@ _cs_update_repo_checksums() (
     local publish_stage=''
     local committed=false pushed=false push_attempted=false push_status=not-attempted push_code=null
     local commit_attempted=false commit_status=not-attempted commit_code=null previous_head=''
+    local commit_candidate='' commit_parents=''
     local update_phase=admission guard_failed=false blocked_phase=''
     # A nonzero Git exit does not erase a completed local write/commit. In
     # particular, a transport failure is not proof the server rejected a push.
@@ -508,6 +509,9 @@ _cs_update_repo_checksums() (
     fi
     if $commit && $changed; then
         _cs_update_gate before-commit || return $?
+        update_phase=commit-preflight
+        [[ "$(_cs_git -C "$repo_path" rev-parse --verify HEAD)" == "$previous_head" &&
+           "$(_cs_git -C "$repo_path" symbolic-ref -q HEAD)" == "$branch" ]] || return 2
         update_phase=stage
         _cs_git -C "$repo_path" add -- "$member" || return 1
         # --only explicitly excludes unrelated staged changes. Do not suppress
@@ -519,9 +523,32 @@ _cs_update_repo_checksums() (
         else
             commit_code=$?; return 1
         fi
+        # --only selects Git's temporary index, but a pre-commit hook can add
+        # other paths to it. A post-commit hook or another writer can also move
+        # HEAD before Git returns. Exit zero alone does not identify our commit.
+        # Admit only the exact parent, branch and single literal changed path;
+        # preserve unexpected local history rather than pushing or resetting it.
+        update_phase=commit-scope
+        commit_candidate=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 1
+        commit_parents=$(_cs_git -C "$repo_path" rev-list --parents -n 1 "$commit_candidate") || return 1
+        if [[ "$commit_parents" != "$commit_candidate $previous_head" ||
+              "$(_cs_git -C "$repo_path" symbolic-ref -q HEAD)" != "$branch" ]]; then
+            _cs_log_error 'Git commit ancestry or branch changed; local history retained, no push attempted'
+            return 2
+        fi
+        if ! _cs_git -C "$repo_path" diff-tree --no-commit-id --name-only --no-renames -r -z \
+                "$previous_head" "$commit_candidate" -- | (
+            changed_path='' trailing_path=''
+            IFS= read -r -d '' changed_path && [[ "$changed_path" == "$member" ]] || exit 1
+            if IFS= read -r -d '' trailing_path; then exit 1; fi
+            [[ -z "$trailing_path" ]]
+        ); then
+            _cs_log_error 'Git commit changes more than the selected checksum file; local history retained, no push attempted'
+            return 2
+        fi
+        head="$commit_candidate"
         committed=true
         commit_status=acknowledged
-        head=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 1
     fi
     if $commit; then
         update_phase=verify-commit
