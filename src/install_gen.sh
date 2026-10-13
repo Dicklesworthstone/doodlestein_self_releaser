@@ -1752,6 +1752,247 @@ _install_gen_repo() {
        "$1" != *..* && ! "$1" =~ __[A-Z][A-Z0-9_]*__ ]]
 }
 
+# Inspect without writes, then publish only against that original observation.
+# Template bytes travel on fd 3, never through exec argv. Directory-relative
+# operations cannot redirect a write through a substituted symlink. Storage
+# and other same-user writers remain trusted, not sandboxed by this helper.
+_install_gen_output() (
+    command -v python3 >/dev/null || {
+        log_error 'Python 3 is required for safe installer publication'; return 3;
+    }
+    exec python3 -I - "$BASH" "$@" 3<&0 <<'DSR_INSTALLER_OUTPUT_PY'
+import hashlib
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import uuid
+
+LIMIT = 64 * 1024 * 1024
+descriptors = []
+child = None
+history = None
+activated = False
+
+class Failure(Exception):
+    def __init__(self, message, code=4):
+        super().__init__(message)
+        self.code = code
+
+def need(condition, message, code=4):
+    if not condition:
+        raise Failure(message, code)
+
+def stop(signum, frame):
+    raise Failure('Installer generation interrupted', 5)
+
+def fingerprint(info):
+    return [info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+def directory_identity(info):
+    return [info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid]
+
+def held(fd):
+    descriptors.append(fd)
+    return fd
+
+def directories(path, create=False):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current = held(os.open('/', flags))
+    chain = [(None, '/', current)]
+    for name in path[1:].split('/'):
+        try:
+            nxt = os.open(name, flags, dir_fd=current)
+        except FileNotFoundError:
+            if not create:
+                return chain, False
+            try:
+                os.mkdir(name, 0o755, dir_fd=current)
+            except FileExistsError:
+                pass
+            nxt = os.open(name, flags, dir_fd=current)
+        chain.append((current, name, held(nxt)))
+        current = nxt
+    return chain, True
+
+def directory_records(chain):
+    records = []
+    for parent, name, fd in chain:
+        info = os.fstat(fd)
+        named = os.stat('/', follow_symlinks=False) if parent is None else os.stat(
+            name, dir_fd=parent, follow_symlinks=False)
+        need(stat.S_ISDIR(named.st_mode) and directory_identity(info) == directory_identity(named),
+             'Installer output directory changed', 2)
+        records.append(directory_identity(info))
+    return records
+
+def read_destination(fd, name='install.sh'):
+    try:
+        opened = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError:
+        return None, None
+    with os.fdopen(opened, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= LIMIT,
+             'Installer destination must be a bounded, single-link regular file')
+        data = stream.read(LIMIT + 1)
+        after = os.fstat(stream.fileno())
+        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    need(len(data) == before.st_size and fingerprint(before) == fingerprint(after) == fingerprint(named),
+         'Installer destination changed while reading', 2)
+    return dict(identity=fingerprint(before), sha256=hashlib.sha256(data).hexdigest()), data
+
+def observe(path):
+    mark = len(descriptors)
+    try:
+        chain, complete = directories(path)
+        target, _ = read_destination(chain[-1][2]) if complete else (None, None)
+        return dict(schema_version=1, path=path, directories=directory_records(chain), target=target)
+    finally:
+        while len(descriptors) > mark:
+            os.close(descriptors.pop())
+
+def parse_token(text):
+    def pairs(rows):
+        result = {}
+        for key, value in rows:
+            need(key not in result, 'Duplicate output observation field')
+            result[key] = value
+        return result
+    return json.loads(text, object_pairs_hook=pairs)
+
+def check_observation(expected, chain):
+    records = directory_records(chain)
+    need(records[:len(expected['directories'])] == expected['directories'],
+         'Installer output ancestry changed since generation began', 2)
+    current, data = read_destination(chain[-1][2])
+    need(current == expected['target'], 'Installer changed since generation began; regenerate from current state', 2)
+    return current, data
+
+def validate_script(data, bash):
+    global child
+    need(0 < len(data) <= LIMIT and data.startswith(b'#!/usr/bin/env bash\n') and b'\0' not in data,
+         'Generated installer is empty, excessive, or not a Bash script', 6)
+    env = {k:v for k,v in os.environ.items() if not k.startswith('BASH_FUNC_') and k not in
+           ('BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS')}
+    child = subprocess.Popen([bash, '--noprofile', '--norc', '-n'], stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             env=env, start_new_session=True)
+    try:
+        child.communicate(data, timeout=30)
+        need(child.returncode == 0, 'Generated installer failed Bash syntax validation; old installer retained', 6)
+    except subprocess.TimeoutExpired as error:
+        raise Failure('Installer syntax validation exceeded its time limit', 5) from error
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait()
+        child = None
+
+def write_new(fd, name, data, mode=0o600):
+    out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=fd)
+    with os.fdopen(out, 'wb') as stream:
+        need(stream.write(data) == len(data), 'Incomplete installer staging write', 1)
+        stream.flush()
+        os.fchmod(stream.fileno(), mode)
+        os.fsync(stream.fileno())
+
+try:
+    import fcntl
+    need(os.name == 'posix' and hasattr(os, 'O_NOFOLLOW') and os.open in os.supports_dir_fd,
+         'Safe installer publication requires POSIX directory descriptors', 3)
+    bash, mode, root, tool = sys.argv[1:5]
+    need(mode in ('inspect', 'publish') and len(sys.argv) == (5 if mode == 'inspect' else 6),
+         'Invalid installer output operation')
+    need(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', tool) and '..' not in tool,
+         'Invalid installer output identity')
+    need(root and not any(ord(c) < 32 or ord(c) == 127 or c == '\\' for c in root),
+         'Invalid installer output root')
+    need('..' not in root.split('/'), 'Installer output root may not contain parent traversal')
+    path = os.path.abspath(os.path.join(root, tool))
+    need(len(path.split('/')) <= 128, 'Excessive installer output depth')
+    display = root.rstrip('/') + '/' + tool + '/install.sh'
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
+    if mode == 'inspect':
+        print(json.dumps(observe(path), sort_keys=True, separators=(',', ':')))
+    else:
+        expected = parse_token(sys.argv[5])
+        need(isinstance(expected, dict) and set(expected) == {'schema_version', 'path', 'directories', 'target'} and
+             type(expected['schema_version']) is int and expected['schema_version'] == 1 and expected['path'] == path and
+             isinstance(expected['directories'], list) and 0 < len(expected['directories']) <= 128 and
+             all(isinstance(row, list) and len(row) == 5 and all(type(n) is int and n >= 0 for n in row)
+                 for row in expected['directories']), 'Invalid installer output observation')
+        with os.fdopen(3, 'rb') as incoming:
+            data = incoming.read(LIMIT + 1)
+        validate_script(data, bash)
+        # Inspect before creating even a missing ancestor. Existing ancestors
+        # must match the original selection; absent directories may be created.
+        observed = observe(path)
+        need(observed['directories'][:len(expected['directories'])] == expected['directories'] and
+             observed['target'] == expected['target'], 'Installer output changed during generation', 2)
+        chain, _ = directories(path, create=True)
+        output_fd = chain[-1][2]
+        lock = held(os.open('.install-gen.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            0o600, dir_fd=output_fd))
+        lock_info = os.fstat(lock)
+        need(stat.S_ISREG(lock_info.st_mode) and lock_info.st_nlink == 1 and
+             lock_info.st_uid == os.geteuid() and not lock_info.st_mode & 0o077,
+             'Unsafe installer publication lock', 2)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise Failure('Another installer publisher is active; regenerate after it completes', 2) from error
+        current, previous = check_observation(expected, chain)
+        if previous == data and stat.S_IMODE(current['identity'][2]) == 0o755:
+            print(display)
+        else:
+            stage = '.install-gen.' + uuid.uuid4().hex
+            os.mkdir(stage, 0o700, dir_fd=output_fd)
+            stage_fd = held(os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=output_fd))
+            history = path + '/' + stage
+            selected = dict(expected=expected, sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
+            write_new(stage_fd, 'selection.json', (json.dumps(selected, sort_keys=True) + '\n').encode())
+            if previous is not None:
+                write_new(stage_fd, 'previous.sh', previous)
+            write_new(stage_fd, 'candidate.sh', data, 0o755)
+            candidate, candidate_bytes = read_destination(stage_fd, 'candidate.sh')
+            need(candidate_bytes == data and stat.S_IMODE(candidate['identity'][2]) == 0o755,
+                 'Staged installer changed before publication', 2)
+            check_observation(expected, chain)
+            need(directory_identity(os.stat(stage, dir_fd=output_fd, follow_symlinks=False)) ==
+                 directory_identity(os.fstat(stage_fd)), 'Installer staging directory changed', 2)
+            need(fingerprint(os.stat('.install-gen.lock', dir_fd=output_fd, follow_symlinks=False)) ==
+                 fingerprint(os.fstat(lock)), 'Installer publication lock changed', 2)
+            # A last-component symlink appearing after the check is replaced,
+            # never followed. Only cooperating writers share the lock; this is
+            # not an atomic compare-and-swap against arbitrary same-user edits.
+            os.replace('candidate.sh', 'install.sh', src_dir_fd=stage_fd, dst_dir_fd=output_fd)
+            activated = True
+            directory_records(chain)
+            published, actual = read_destination(output_fd)
+            need(actual == data and stat.S_IMODE(published['identity'][2]) == 0o755,
+                 'Published installer changed before completion', 2)
+            write_new(stage_fd, 'completed.json', (json.dumps(dict(sha256=selected['sha256'],
+                size_bytes=len(data), status='published'), sort_keys=True) + '\n').encode())
+            print(display)
+except (Failure, OSError, ValueError, TypeError, KeyError, IndexError, ImportError) as error:
+    print('[installer-output] ' + str(error), file=sys.stderr)
+    if activated:
+        print('[installer-output] Installer was replaced before the later failure; it was not rolled back', file=sys.stderr)
+    sys.exit(getattr(error, 'code', 1))
+finally:
+    if history is not None:
+        print('[installer-output] Generation history retained: ' + history, file=sys.stderr)
+    for fd in reversed(descriptors):
+        os.close(fd)
+DSR_INSTALLER_OUTPUT_PY
+)
+
 # Emit one validated tool/repository/binary tuple. The full parser preserves
 # types and control bytes until validation; command substitution cannot hide
 # a trailing newline in an identity. Missing/null/empty optional names retain
@@ -2152,11 +2393,12 @@ install_gen_create() {
     local archive_linux archive_darwin archive_windows archive_formats
     local artifact_naming linux_libc_fallback=none workspace_binary_cases
     local contract_model strict_release_contract=false contract_asset_cases=''
-    local source_subdir source_entry source_package source_engine field value
+    local source_subdir source_entry source_package source_engine field value output_observation
 
     local identities
     identities=$(_install_gen_identities "$config_file" "$tool_name") || return $?
     IFS=$'\t' read -r tool_name repo binary_name <<< "$identities" || return 4
+    output_observation=$(_install_gen_output inspect "$_IG_OUTPUT_DIR" "$tool_name") || return $?
     language=$(_install_gen_yaml_get "$config_file" "language" "go")
     workflow_path=$(_install_gen_yaml_get "$config_file" "workflow" ".github/workflows/release.yml")
     local_path=$(_install_gen_yaml_get "$config_file" "local_path" "")
@@ -2380,12 +2622,8 @@ install_gen_create() {
     log_info "  Binary: $binary_name"
     log_info "  Language: $language"
 
-    # Create output directory
-    local output_dir="$_IG_OUTPUT_DIR/$tool_name"
-    mkdir -p "$output_dir"
-
-    # Generate script
-    local output_file="$output_dir/install.sh"
+    # Render completely before any destination directory or file is created.
+    local output_file
     local template
     template=$(_install_gen_template \
         "$tool_name" \
@@ -2395,13 +2633,13 @@ install_gen_create() {
         "$archive_darwin" \
         "$archive_windows" \
         "$artifact_naming" \
-        "$language")
+        "$language") || return $?
 
     # --help prints the script's header comment; embed it so it also works
     # when the script is piped into bash. Substituted first, so the help
     # text's own placeholders are filled in below.
     local help_text
-    help_text=$(awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' <<< "$template")
+    help_text=$(awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' <<< "$template") || return 1
     template="${template//__HELP_TEXT__/"$help_text"}"
 
     # Replace placeholders
@@ -2436,15 +2674,14 @@ install_gen_create() {
         if [[ -n "$skill_root" ]]; then
             archive_root="$skill_root"
         else
-            skill_stage="$(mktemp -d 2>/dev/null || true)"
-            if [[ -n "$skill_stage" && -d "$skill_stage" ]]; then
-                cp "$skill_file" "$skill_stage/SKILL.md"
-                archive_root="$skill_stage"
-            fi
+            skill_stage=$(mktemp -d) || return 1
+            cp -- "$skill_file" "$skill_stage/SKILL.md" || return 1
+            archive_root="$skill_stage"
         fi
 
         if [[ -n "$archive_root" ]]; then
-            skill_archive_b64="$(tar -czf - -C "$archive_root" . | base64 | tr -d '\n')"
+            skill_archive_b64=$(tar -czf - -C "$archive_root" . | base64 | tr -d '\n') || return 1
+            [[ -n "$skill_archive_b64" ]] || return 1
         fi
         if [[ -n "$skill_stage" && -d "$skill_stage" ]]; then
             rm -rf "$skill_stage" 2>/dev/null || true
@@ -2454,8 +2691,8 @@ install_gen_create() {
         fi
     fi
 
-    echo "$template" > "$output_file"
-    chmod +x "$output_file"
+    output_file=$(printf '%s\n' "$template" | _install_gen_output publish \
+        "$_IG_OUTPUT_DIR" "$tool_name" "$output_observation") || return $?
 
     log_ok "Generated: $output_file"
 

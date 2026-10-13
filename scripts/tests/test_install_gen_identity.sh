@@ -23,7 +23,7 @@ print('Identity regression evidence retained:', work, flush=True)
 bin_dir = work / 'bin'
 bin_dir.mkdir()
 for name in ('bash', 'grep', 'sed', 'cat', 'awk', 'dirname', 'basename', 'mkdir', 'chmod',
-             'tr', 'cmp', 'sha256sum', 'shasum', 'wc', 'sort', 'head', 'tar', 'base64'):
+             'tr', 'cmp', 'sha256sum', 'shasum', 'wc', 'sort', 'head', 'tar', 'base64', 'python3'):
     executable = shutil.which(name)
     if executable:
         (bin_dir / name).symlink_to(executable)
