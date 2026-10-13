@@ -674,7 +674,90 @@ _hh_check_disk_space() {
         status="ok"
     fi
 
+    if [[ "$platform" != windows/* ]] && declare -F config_unix_storage_json >/dev/null; then
+        local unix_storage unix_status=0
+        unix_storage=$(config_unix_storage_json "$hostname") || unix_status=$?
+        if [[ $unix_status -eq 0 ]]; then
+            _hh_unix_split_storage_admission "$hostname" "$connection" "$ssh_host" "$unix_storage" \
+                "$usage_percent" "$available_kb" "$status"
+            return $?
+        elif [[ $unix_status -ne 1 ]]; then
+            echo '{"path": "/", "usage_percent": null, "available_gb": null, "status": "error", "error": "Invalid Unix split-storage contract"}'
+            return 1
+        fi
+    fi
+
     echo "{\"path\": \"/\", \"usage_percent\": $usage_percent, \"available_gb\": $available_gb, \"status\": \"$status\"}"
+}
+
+# Unix split storage (#38): the build root is admitted by the usual
+# percentages. The root filesystem keeps its own verdict, except that above
+# the error percentage it is admitted as a warning while its free space meets
+# the contract's floor. Root pressure is reported, never hidden.
+_hh_unix_split_storage_admission() {
+    local hostname="$1" connection="$2" ssh_host="$3" storage="$4"
+    local root_usage="$5" root_available_kb="$6" root_status="$7"
+    local build_root min_free_bytes df_output df_status=0
+    build_root=$(jq -r '.build_root' <<< "$storage") || return 1
+    min_free_bytes=$(jq -r '.root_min_free_bytes' <<< "$storage") || return 1
+
+    # build_root matches ^/[A-Za-z0-9._/-]+$ (config_unix_storage_json), so it is
+    # safe inside single quotes on the remote shell.
+    df_output=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
+        "LC_ALL=C df -Pk '$build_root'") || df_status=$?
+
+    local build_usage="" build_available_kb="" extra=""
+    if [[ $df_status -eq 0 && -n "$df_output" ]]; then
+        read -r build_usage build_available_kb extra <<< "$(printf '%s\n' "$df_output" | awk 'END {print $5, $4}')"
+        build_usage="${build_usage%\%}"
+    fi
+    if [[ $df_status -ne 0 || -n "$extra" || ! "$build_usage" =~ ^[0-9]{1,3}$ ||
+          ! "$build_available_kb" =~ ^[0-9]+$ || $((10#$build_usage)) -gt 100 ]]; then
+        jq -nc --arg build_root "$build_root" \
+            '{path: "/", usage_percent: null, available_gb: null, status: "error",
+              admission: "unix-split-storage-v1",
+              error: ("Failed to get disk info for build root " + $build_root)}'
+        return 1
+    fi
+    build_usage=$((10#$build_usage))
+
+    local build_status="ok"
+    if [[ $build_usage -gt $_HH_DISK_ERROR_THRESHOLD ]]; then
+        build_status="error"
+    elif [[ $build_usage -gt $_HH_DISK_WARN_THRESHOLD ]]; then
+        build_status="warning"
+    fi
+
+    local root_admitted="$root_status"
+    if [[ "$root_status" == "error" ]] && (( root_available_kb * 1024 >= min_free_bytes )); then
+        root_admitted="warning"
+    fi
+
+    local overall="ok"
+    if [[ "$root_admitted" == "error" || "$build_status" == "error" ]]; then
+        overall="error"
+    elif [[ "$root_admitted" == "warning" || "$build_status" == "warning" ]]; then
+        overall="warning"
+    fi
+
+    jq -nc \
+        --argjson root_usage "$root_usage" \
+        --argjson root_kb "$root_available_kb" \
+        --arg root_status "$root_status" \
+        --arg root_admitted "$root_admitted" \
+        --argjson min_free "$min_free_bytes" \
+        --arg build_root "$build_root" \
+        --argjson build_usage "$build_usage" \
+        --argjson build_kb "$build_available_kb" \
+        --arg build_status "$build_status" \
+        --arg overall "$overall" \
+        'def gb: (. / 1048576 * 100 | floor) / 100;
+         {path: "/", usage_percent: $root_usage, available_gb: ($root_kb | gb), status: $overall,
+          admission: "unix-split-storage-v1",
+          root: {path: "/", usage_percent: $root_usage, available_gb: ($root_kb | gb),
+                 status: $root_status, admitted_as: $root_admitted, min_free_bytes: $min_free},
+          build_root: {path: $build_root, usage_percent: $build_usage,
+                       available_gb: ($build_kb | gb), status: $build_status}}'
 }
 
 # Check toolchain availability

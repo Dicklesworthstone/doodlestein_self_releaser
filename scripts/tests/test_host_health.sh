@@ -1258,6 +1258,154 @@ test_windows_storage_optional_config() {
     done
 }
 
+# ============================================================================
+# Unix split storage (#38)
+# ============================================================================
+
+test_unix_storage_config_contract() {
+    local fixture="$TEMP_DIR/unix-storage.yaml" status
+    cat > "$fixture" << 'EOF'
+hosts:
+  plain:
+    platform: linux/amd64
+  good:
+    platform: linux/amd64
+    unix_storage:
+      build_root: /data
+      root_min_free_bytes: 21474836480
+  relative:
+    unix_storage: {build_root: data, root_min_free_bytes: 21474836480}
+  dotdot:
+    unix_storage: {build_root: /data/../etc, root_min_free_bytes: 21474836480}
+  slash:
+    unix_storage: {build_root: /, root_min_free_bytes: 21474836480}
+  quote:
+    unix_storage: {build_root: "/data'x", root_min_free_bytes: 21474836480}
+  tiny:
+    unix_storage: {build_root: /data, root_min_free_bytes: 1024}
+  missing:
+    unix_storage: {build_root: /data}
+  extra:
+    unix_storage: {build_root: /data, root_min_free_bytes: 21474836480, other: 1}
+  falsy:
+    unix_storage: false
+EOF
+    local host expected
+    for host in plain:1 good:0 relative:4 dotdot:4 slash:4 quote:4 tiny:4 missing:4 extra:4 falsy:4; do
+        expected="${host#*:}"; host="${host%%:*}"
+        ((TESTS_RUN++))
+        status=0
+        (export DSR_HOSTS_FILE="$fixture"; config_unix_storage_json "$host" >/dev/null) || status=$?
+        if [[ $status -eq $expected ]]; then pass "Unix storage contract '$host' returns $expected";
+        else fail "Unix storage contract '$host' returned $status, expected $expected"; fi
+    done
+    ((TESTS_RUN++))
+    status=0
+    (
+        export DSR_HOSTS_FILE="$fixture"
+        command() {
+            if [[ "${1:-}" == -v && "${2:-}" == yq ]]; then return 1; fi
+            builtin command "$@"
+        }
+        config_unix_storage_json good >/dev/null
+    ) || status=$?
+    if [[ $status -eq 4 ]]; then pass "Yq-less Unix storage opt-in fails closed";
+    else fail "Yq-less Unix storage opt-in returned $status"; fi
+}
+
+# $1 root df line fields "usage avail_kb", $2 build df "usage avail_kb" or "FAIL"
+_test_unix_split_disk() {
+    local root="$1" build="$2" fixture="$TEMP_DIR/unix-storage-admission.yaml"
+    printf 'hosts:\n  splithost:\n    platform: linux/amd64\n    connection: local\n    unix_storage:\n      build_root: /data\n      root_min_free_bytes: 21474836480\n' > "$fixture"
+    (
+        export DSR_HOSTS_FILE="$fixture"
+        _hh_exec_on_host() {
+            local fields
+            if [[ "$4" == *"df -Pk '/data'"* ]]; then
+                [[ "$build" == FAIL ]] && return 7
+                fields="$build"
+            elif [[ "$4" == *"df -Pk /"* ]]; then
+                fields="$root"
+            else
+                return 9
+            fi
+            printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+            printf '/dev/test 1000000000 1 %s %s%% /x\n' "${fields#* }" "${fields%% *}"
+        }
+        _hh_check_disk_space "splithost" "local" "" "linux/amd64"
+    )
+}
+
+test_unix_split_storage_admission() {
+    local result status
+    # trj on 2026-10-13: / 97% with ~33 GiB free, /data 69%.
+    ((TESTS_RUN++))
+    result=$(_test_unix_split_disk "97 34664140" "69 1700000000")
+    if jq -e '.status == "warning" and .admission == "unix-split-storage-v1" and
+              .root.status == "error" and .root.admitted_as == "warning" and
+              .build_root.status == "ok" and .build_root.path == "/data" and .usage_percent == 97' <<< "$result" >/dev/null; then
+        pass "Full root above its free floor is admitted as a warning beside a healthy build root"
+    else
+        fail "Split admission (root over floor) got: $result"
+    fi
+
+    ((TESTS_RUN++))
+    result=$(_test_unix_split_disk "97 5000000" "69 1700000000")
+    if jq -e '.status == "error" and .root.admitted_as == "error"' <<< "$result" >/dev/null; then
+        pass "Full root below its free floor stays an error"
+    else
+        fail "Split admission (root under floor) got: $result"
+    fi
+
+    ((TESTS_RUN++))
+    result=$(_test_unix_split_disk "50 400000000" "96 1000000")
+    if jq -e '.status == "error" and .root.status == "ok" and .build_root.status == "error"' <<< "$result" >/dev/null; then
+        pass "Full build root is an error even with a healthy root"
+    else
+        fail "Split admission (full build root) got: $result"
+    fi
+
+    ((TESTS_RUN++))
+    result=$(_test_unix_split_disk "50 400000000" "92 80000000")
+    if jq -e '.status == "warning" and .build_root.status == "warning" and .root.admitted_as == "ok"' <<< "$result" >/dev/null; then
+        pass "Build-root warning surfaces as the overall warning"
+    else
+        fail "Split admission (build-root warning) got: $result"
+    fi
+
+    ((TESTS_RUN++))
+    status=0
+    result=$(_test_unix_split_disk "50 400000000" FAIL) || status=$?
+    if [[ $status -ne 0 ]] && jq -e '.status == "error" and (.error | test("build root /data"))' <<< "$result" >/dev/null; then
+        pass "Build-root probe failure fails closed"
+    else
+        fail "Split admission (probe failure) status=$status got: $result"
+    fi
+
+    ((TESTS_RUN++))
+    local fixture="$TEMP_DIR/unix-storage-bad.yaml"
+    printf 'hosts:\n  badhost:\n    platform: linux/amd64\n    connection: local\n    unix_storage: {build_root: data, root_min_free_bytes: 21474836480}\n' > "$fixture"
+    status=0
+    result=$(
+        export DSR_HOSTS_FILE="$fixture"
+        _hh_exec_on_host() { printf 'F 1 2 3 4 5\n/dev/test 1000 1 400000000 50%% /\n'; }
+        _hh_check_disk_space "badhost" "local" "" "linux/amd64"
+    ) || status=$?
+    if [[ $status -ne 0 ]] && jq -e '.status == "error" and .error == "Invalid Unix split-storage contract"' <<< "$result" >/dev/null; then
+        pass "Malformed Unix storage contract makes the host unhealthy"
+    else
+        fail "Malformed contract status=$status got: $result"
+    fi
+}
+
+if [[ "${1:-}" == --unix-storage-only ]]; then
+    test_unix_storage_config_contract
+    test_unix_split_storage_admission
+    echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+    [[ $TESTS_FAILED -eq 0 ]]
+    exit $?
+fi
+
 if [[ "${1:-}" == --windows-storage-only ]]; then
     test_windows_storage_optional_config
     test_windows_split_storage_admission
@@ -1294,6 +1442,8 @@ test_windows_storage_optional_config
 test_windows_split_storage_admission
 test_windows_storage_transport
 test_windows_cargo_lock_range
+test_unix_storage_config_contract
+test_unix_split_storage_admission
 test_human_disk_error_reports_probe_failure
 test_local_toolchains_check
 test_local_clock_drift
