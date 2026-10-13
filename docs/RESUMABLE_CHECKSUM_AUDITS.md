@@ -125,3 +125,92 @@ resume partially downloaded byte ranges, or relax the trusted private-storage
 boundary. The regression kills the real audit supervisor during the fifth
 owned fixture download, then verifies both direct and wrapper recovery with
 four reused payloads and no invented terminal receipt.
+
+## Inventory freshness at the CLI handoff
+
+A completed checksum audit proves equality for its observed release inventory.
+A later names-only manifest check cannot establish that those same assets still
+exist: an asset may have been replaced while retaining its filename. The regular
+`dsr release verify ... --checksums` command now holds the completed audit's
+SHA256 and rechecks its exact remote selection **after** the final read-only
+manifest check, before reporting success. No extra opt-in flag is required.
+
+This applies to fresh and resumed audits, aggregate and sidecar policies, and
+verification following an explicitly requested repair. Repair is still invoked
+at most once. A checksum or freshness success cannot override a failed original
+manifest, source, strict-inventory, or repair gate.
+
+The check compares every asset's numeric ID, name, size and advertised digest,
+including excluded checksum/signature/provenance metadata. It also compares the
+release ID, tag, draft/prerelease mode and target declaration. It reads the entire
+paginated inventory twice, bracketed by release-context observations, using the
+same bounded HTTPS/authentication path as the checksum auditor. An API failure,
+malformed/truncated page, replacement, or inconsistent observation fails closed.
+It does **not** redownload payloads or checksum proofs. With one inventory page,
+this adds four metadata requests, not a second binary download pass.
+
+The CLI then rechecks the retained checksum proofs, normalized records, and all
+local payload hashes. Changing a local file or replacing the original audit
+receipt during the handoff cannot be repaired by a matching remote filename.
+The original audit remains untouched; the separate inventory observation is
+retained under the outer verification workspace's `inventory-after/` directory.
+
+`details.checksums.inventory_check` contains the separate freshness receipt.
+`audit_inventory_stable` preserves the original auditor's observation, while
+`inventory_stable` is true only after current inventory and local-evidence
+admission both finish. If the original audit passed but current freshness fails
+or remains unknown, checksum status is `stale-or-unconfirmed` (or `not-admitted`
+when local admission fails), and the process returns nonzero. Historical verified
+counts remain available for diagnosis; they do not make the current result green.
+
+### Standalone inventory-only observation
+
+A caller already holding and admitting a completed audit can request only the
+metadata freshness observation:
+
+```bash
+bash src/release_checksums.sh --repo owner/tool --tag v1.2.3 \
+  --release-id 42 --checksum-mode sidecars \
+  --recheck-from /srv/audits/completed \
+  --audit-sha256 "$PREVIOUSLY_HELD_RESULT_SHA256" \
+  --output-dir /srv/audits/inventory-recheck
+```
+
+The pin is the independently retained SHA256 of the original `result.json`, not
+its `selection_sha256`. Select the original checksum mode, exact aggregate when
+applicable, and metadata-inclusion policy. `--recheck-from` and `--audit-sha256`
+are required together and cannot be combined with `--resume-from`. The output
+must be a new directory outside the prior audit. `--preflight` checks the local
+selection and options without network access or persistent output.
+
+A successful result has kind `dsr-release-checksum-inventory-check`, status
+`unchanged`, and `payloads_reverified: false`. It is intentionally **not** a
+`dsr-release-checksum-verification` receipt and cannot substitute for original
+payload/evidence admission. It requires a pinned complete successful terminal
+audit; a partial result or an unfinished progress journal is not eligible.
+Original files are not changed, and a failure to persist the new result returns
+nonzero. Cancellation terminates the owned acquisition process.
+
+These are observations, not a transaction with GitHub: a later external writer
+can still change a release after the last check. The original trusted-local-
+storage boundary applies. Neither inventory equality nor downloaded checksums
+authenticate a publisher, resolve source provenance, or certify a native build.
+The automatic final-handoff gate is specific to release verification; it does
+not silently change downstream synchronization or publication policies.
+
+Run both paths of the focused regression:
+
+```bash
+bash scripts/tests/test_release_checksum_freshness.sh
+bash scripts/tests/test_release_checksum_freshness.sh --cli
+```
+
+The first exercises the production auditor with actual payload/proof bytes,
+retained state, two-page inventories and owned process cancellation. The second
+also exercises the production CLI supervisor and shared checksum-admission
+functions, including same-name changes after the first audit, failed manifest
+gates, repair ordering, resume, local corruption and cancellation. HTTP and the
+legacy manifest/repair command are explicit file-backed fixtures; these tests do
+not establish live GitHub/curl behavior or full original `dsr` startup. Set
+`DSR_TEST_VERIFY_MODULE` to an unchanged supervisor to run the same counterexamples
+against the incumbent rather than weakening the corrected expectations.

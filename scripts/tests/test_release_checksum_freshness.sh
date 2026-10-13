@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Production checksum auditor; real files, hashes, pagination and subprocesses.
-# Only curl's HTTP/auth boundary is a file-backed fixture. No live GitHub,
-# native compilation or publisher authentication is claimed. Retain all evidence.
+# Default: only curl's HTTP/auth boundary is a file-backed fixture. --cli adds
+# the production CLI supervisor and evidence gates with an explicit legacy
+# manifest/repair command fixture. No full dsr/native/live GitHub claim.
+# Retain all evidence. DSR_TEST_VERIFY_MODULE selects an incumbent supervisor.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 exec python3 - "$ROOT" "$@" <<'PY'
@@ -63,6 +65,8 @@ assert 'fixture-token' not in ' '.join(args)
 with (case / 'calls.jsonl').open('a') as stream:
     stream.write(json.dumps({'path':url.path,'query':url.query})+'\n')
 mode = os.environ.get('FRESH_MODE', '')
+if (case/'final-metadata').exists() and os.environ.get('CLI_MODE') in ('network-failure','hang'):
+    mode = os.environ['CLI_MODE']
 if mode == 'network-failure':
     raise SystemExit(22)
 if mode == 'hang':
@@ -166,6 +170,173 @@ def requests(directory):
 def snapshot(directory):
     return {str(p.relative_to(directory)):(p.stat().st_ino,p.stat().st_mtime_ns,hash_file(p))
             for p in directory.rglob('*') if p.is_file()}
+
+if sys.argv[2:] == ['--cli']:
+    program = work/'program'
+    (program/'src').mkdir(parents=True)
+    for name in ('release_checksums.sh','checksum_sync.sh'):
+        shutil.copy2(root/'src'/name,program/'src'/name)
+    verifier = Path(os.environ.get('DSR_TEST_VERIFY_MODULE',str(root/'src/release_verify.sh')))
+    shutil.copy2(verifier,program/'src/release_verify.sh')
+    # The legacy manifest checks are a separate subsystem. This boundary
+    # fixture reports their existing names-only result, but deliberately
+    # replaces simulated remote assets after the real checksum audit. The
+    # actual supervisor/auditor/admission functions must reject that drift.
+    (program/'dsr').write_text(r'''#!/usr/bin/env bash
+exec python3 - "$@" <<'LEGACY'
+import hashlib,json,os,pathlib,sys
+case=pathlib.Path(os.environ['FRESH_CASE'])
+args=sys.argv[1:]
+assert '--json' in args and 'release' in args and 'verify' in args
+assert not any(a.startswith('--checksum') for a in args)
+fix='--fix' in args
+log=case/'metadata.jsonl'
+history=[json.loads(r) for r in log.read_text().splitlines()] if log.exists() else []
+final=not fix and any(not r['fix'] for r in history)
+with log.open('a') as stream:
+    stream.write(json.dumps({'fix':fix,'final':final,'dry_run':'--dry-run' in args})+'\n')
+rows=json.loads((case/'assets.json').read_text())
+context=json.loads((case/'release.json').read_text())
+mode=os.environ.get('CLI_MODE','')
+audit_root=case/'output'
+if final:
+    (case/'final-metadata').write_text('observed\n')
+    if mode=='payload-id': rows[0]['id']+=10000
+    elif mode=='payload-digest': rows[0]['digest']='sha256:'+'0'*64
+    elif mode=='payload-size': rows[0]['size']+=1
+    elif mode=='sidecar-id': rows[1]['id']+=10000
+    elif mode=='signature-id': rows[-1]['id']+=10000
+    elif mode=='release-mode': context['draft']=not context['draft']
+    elif mode=='release-target': context['target_commitish']='another-target'
+    elif mode=='local-payload':
+        with (audit_root/'artifacts/tool-0.tar.gz').open('ab') as stream: stream.write(b'changed')
+    elif mode=='local-audit':
+        with (audit_root/'result.json').open('a') as stream: stream.write(' ')
+    elif mode=='local-selection':
+        with (audit_root/'selection.json').open('a') as stream: stream.write(' ')
+    (case/'assets.json').write_text(json.dumps(rows))
+    (case/'release.json').write_text(json.dumps(context))
+    (case/'held-audit.json').write_bytes((audit_root/'result.json').read_bytes())
+    (case/'calls-at-final.txt').write_text(str(len((case/'calls.jsonl').read_text().splitlines())))
+code=7 if (mode=='manifest-final-failure' and final or mode=='manifest-initial-failure' and not final) else 0
+details={'repo':'owner/tool','tag':'v1.2.3','release_id':42,
+         'assets':{'present':sorted(r['name'] for r in rows),'extra':[],
+                   'size_mismatches':[],'digest_mismatches':[]},
+         'repair':{'requested':fix,'dry_run':'--dry-run' in args,'attempted':fix}}
+print(json.dumps({'command':'release-verify','status':'success' if code==0 else 'error',
+                  'exit_code':code,'details':details}))
+sys.exit(code)
+LEGACY
+''')
+    invocation = r'''source "$1/src/release_verify.sh" || exit 3
+SCRIPT_DIR=$1; JSON_MODE=true; DRY_RUN=${CLI_DRY:-false}; DSR_VERSION=fixture
+log_error() { printf '%s\n' "$*" >&2; }
+shift; release_verify_cli "$@"'''
+
+    def cli_case(label, mode='', extra=(), dry=False, selected_program=program):
+        directory=case('cli-'+label)
+        # Keep one excluded asset here; the standalone tests already exercise
+        # both full pages. Four payloads still exceed the legacy sample size.
+        write_json(directory/'assets.json',assets[:9])
+        env=environment(directory)
+        env.update(CLI_MODE=mode,CLI_DRY=str(dry).lower())
+        command=['bash','-c',invocation,'_',str(selected_program),'tool','v1.2.3',
+                 '--checksums','--checksum-mode','sidecars','--checksum-output-dir',str(directory/'output'),
+                 *map(str,extra)]
+        proc=subprocess.run(command,capture_output=True,env=env,timeout=45)
+        (directory/'stdout').write_bytes(proc.stdout); (directory/'stderr').write_bytes(proc.stderr)
+        try: result=json.loads(proc.stdout)
+        except ValueError: result={}
+        return directory,proc,result
+
+    directory,proc,data=cli_case('unchanged')
+    checksums=data.get('details',{}).get('checksums',{})
+    check('CLI accepts complete unchanged coverage with a bound fresh inventory receipt',
+          proc.returncode==0 and data.get('status')=='success' and checksums.get('verified_count')==4 and
+          checksums.get('status')=='verified' and checksums.get('inventory_stable') is True and
+          checksums.get('inventory_check',{}).get('status')=='unchanged')
+    if not (directory/'final-metadata').exists():
+        print(proc.stderr.decode(),flush=True)
+        raise SystemExit(1)
+    prior_root=directory/'output'; prior_snapshot=snapshot(prior_root)
+    audited_bytes=hash_file(prior_root/'result.json')
+    freshness=checksums.get('inventory_check') or {}
+    check('CLI pins the original audit and retains a separate inventory-only observation',
+          freshness.get('audit_sha256')==audited_bytes and freshness.get('payloads_reverified') is False and
+          freshness.get('selection_sha256')==json.loads((prior_root/'result.json').read_text())['selection_sha256'])
+    boundary=int((directory/'calls-at-final.txt').read_text())
+    check('CLI freshness makes four bounded metadata reads and zero additional payload acquisitions',
+          len(requests(directory)[boundary:])==4 and
+          all('/releases/assets/' not in row['path'] for row in requests(directory)[boundary:]))
+    check('CLI preserves completed audit bytes while checking freshness',
+          (directory/'held-audit.json').read_bytes()==(prior_root/'result.json').read_bytes())
+
+    for mode in ('payload-id','payload-digest','payload-size','sidecar-id','signature-id','release-mode','release-target','network-failure'):
+        directory,proc,data=cli_case(mode,mode)
+        c=data.get('details',{}).get('checksums',{})
+        expected=8 if mode=='network-failure' else 1
+        check('CLI refuses late '+mode+' despite unchanged names in manifest response',
+              proc.returncode==expected and data.get('exit_code')==expected and data.get('status')!='success' and
+              c.get('verified_count')==4 and c.get('status')=='stale-or-unconfirmed' and
+              c.get('inventory_stable') is False and c.get('audit_inventory_stable') is True)
+        check('late '+mode+' preserves the original audit and never reacquires binaries',
+              (directory/'held-audit.json').read_bytes()==(directory/'output/result.json').read_bytes() and
+              not any('/releases/assets/' in row['path'] for row in requests(directory)[
+                  int((directory/'calls-at-final.txt').read_text()):]))
+
+    for mode in ('local-payload','local-audit','local-selection'):
+        directory,proc,data=cli_case(mode,mode)
+        c=data.get('details',{}).get('checksums',{})
+        check('CLI refuses '+mode+' corruption instead of replacing the selected evidence',
+              proc.returncode!=0 and data.get('exit_code')==proc.returncode and
+              data.get('status')!='success' and c.get('status')!='verified' and c.get('inventory_stable') is False)
+
+    for mode in ('manifest-final-failure','manifest-initial-failure'):
+        directory,proc,data=cli_case(mode,mode)
+        check('successful checksum freshness cannot override '+mode,
+              proc.returncode==7 and data.get('exit_code')==7 and data.get('status')!='success')
+
+    for dry in (False,True):
+        directory,proc,data=cli_case('repair-'+str(dry),extra=['--fix'],dry=dry)
+        history=[json.loads(r) for r in (directory/'metadata.jsonl').read_text().splitlines()]
+        check('CLI repair stays exactly once; original dry-run policy '+str(dry)+' is preserved',
+              proc.returncode==0 and [r['fix'] for r in history]==[False,True,False] and
+              all(r['dry_run']==dry for r in history) and
+              data.get('details',{}).get('repair',{}).get('requested') is True)
+
+    directory,proc,data=cli_case('resume',extra=['--checksum-resume-from',prior_root])
+    c=data.get('details',{}).get('checksums',{})
+    check('resumed CLI audit rechecks its new receipt without replaying the previous resume source',
+          proc.returncode==0 and c.get('resume',{}).get('reused_count')==4 and
+          (c.get('inventory_check') or {}).get('audited_output_dir')==str(directory/'output'))
+    check('resumed CLI reacquires only sidecars and leaves the original audit unchanged',
+          len([r for r in requests(directory) if '/releases/assets/' in r['path']])==4 and snapshot(prior_root)==prior_snapshot)
+
+    cancelled=case('cli-cancelled')
+    write_json(cancelled/'assets.json',assets[:9])
+    command=['bash','-c',invocation,'_',str(program),'tool','v1.2.3','--checksums',
+             '--checksum-mode','sidecars','--checksum-output-dir',str(cancelled/'output')]
+    env=environment(cancelled);env['CLI_MODE']='hang'
+    with (cancelled/'stdout').open('wb') as out,(cancelled/'stderr').open('wb') as err:
+        proc=subprocess.Popen(command,stdout=out,stderr=err,env=env)
+        deadline=time.monotonic()+30
+        while not (cancelled/'worker.pid').exists() and proc.poll() is None and time.monotonic()<deadline:
+            time.sleep(.02)
+        if proc.poll() is None: proc.send_signal(signal.SIGTERM)
+        code=proc.wait(timeout=15)
+    try: data=json.loads((cancelled/'stdout').read_text())
+    except ValueError: data={}
+    worker_alive=False
+    if (cancelled/'worker.pid').exists():
+        try: os.kill(int((cancelled/'worker.pid').read_text()),0);worker_alive=True
+        except ProcessLookupError: pass
+    check('cancelling CLI freshness returns one nonzero result and stops the actual owned transport',
+          code==5 and data.get('exit_code')==5 and not worker_alive and
+          data.get('details',{}).get('checksums',{}).get('status')!='verified')
+    print('%d passed, %d failed; CLI fixtures retained at %s' % (passed,failed,work),flush=True)
+    raise SystemExit(1 if failed else 0)
+elif sys.argv[2:]:
+    raise SystemExit('Usage: test_release_checksum_freshness.sh [--cli]')
 
 initial = case('initial')
 proc, audit = run(initial)

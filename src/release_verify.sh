@@ -64,6 +64,8 @@ work = None
 child = None
 audit = None
 audit_admitted = False
+inventory_check = None
+inventory_admitted = False
 repair_started = False
 repair_completed = False
 
@@ -83,11 +85,24 @@ def pairs(items):
         value[key] = item
     return value
 
-def read_json(path):
+def read_document(path):
     info = path.lstat()
     need(stat.S_ISREG(info.st_mode) and info.st_size <= 67108864, 'Invalid or excessive verification response')
-    return json.loads(path.read_bytes(), object_pairs_hook=pairs,
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        need(identity(os.fstat(stream.fileno())) == identity(info), 'Verification response replaced before reading')
+        data = stream.read(67108865)
+        need(len(data) == info.st_size and identity(os.fstat(stream.fileno())) == identity(info) == identity(path.lstat()),
+             'Verification response changed while reading')
+    return data
+
+def read_json(path):
+    return json.loads(read_document(path), object_pairs_hook=pairs,
         parse_constant=lambda _: (_ for _ in ()).throw(Failure('Non-finite verification response')))
+
+def document_digest(path):
+    return hashlib.sha256(read_document(path)).hexdigest()
 
 def stop(signum, frame):
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -152,7 +167,7 @@ def metadata(phase, fix=False):
 def identity(details):
     return details['repo'], details['tag'], details['release_id']
 
-def audit_command(details, output):
+def audit_command(details, output, resume=True):
     command = ['bash', module / 'release_checksums.sh', '--repo', details['repo'], '--tag', details['tag'],
                '--release-id', str(details['release_id']), '--output-dir', str(output),
                '--checksum-mode', args.checksum_mode, '--timeout', str(args.checksum_timeout),
@@ -161,7 +176,7 @@ def audit_command(details, output):
         command += ['--checksum-asset', args.checksum_asset]
     if args.checksum_include_metadata:
         command.append('--include-metadata')
-    if args.checksum_resume_from is not None:
+    if resume and args.checksum_resume_from is not None:
         command += ['--resume-from', args.checksum_resume_from]
     return command
 
@@ -193,6 +208,37 @@ checksum_verify "$root/checksums.normalized" "$root/artifacts" >/dev/null || exi
          audit.get('expected_release_id') == details['release_id'], 'Checksum audit belongs to a different release ID')
     audit_admitted = True
 
+def recheck_audit(path, output, details, pin):
+    global inventory_check
+    need(document_digest(path) == pin, 'Selected checksum audit changed before inventory recheck')
+    destination = work / 'inventory-after'
+    # Resume sources belong to the original download operation. This check
+    # pins the newly completed audit, not an earlier interrupted attempt.
+    command = audit_command(details, destination, resume=False)
+    command += ['--recheck-from', output, '--audit-sha256', pin]
+    code, response = run(command, 'inventory-check')
+    inventory_check = read_json(response)
+    need(isinstance(inventory_check, dict) and
+         inventory_check.get('kind') == 'dsr-release-checksum-inventory-check' and
+         type(inventory_check.get('exit_code')) is int and inventory_check['exit_code'] == code,
+         'Invalid checksum inventory recheck result', code or 7)
+    need(code == 0, str(inventory_check.get('error', 'Checksum inventory freshness could not be confirmed')), code)
+    need(inventory_check.get('status') == 'unchanged' and inventory_check.get('inventory_stable') is True and
+         inventory_check.get('verification_policy') == 'unchanged-audited-release-inventory' and
+         inventory_check.get('payloads_reverified') is False and
+         inventory_check.get('audit_sha256') == pin and
+         inventory_check.get('selection_sha256') == audit.get('selection_sha256') and
+         inventory_check.get('audited_output_dir') == output and inventory_check.get('output_dir') == str(destination) and
+         inventory_check.get('repository') == details['repo'] and inventory_check.get('tag') == details['tag'] and
+         inventory_check.get('expected_release_id') == details['release_id'] and
+         inventory_check.get('release') == audit.get('release') and
+         inventory_check.get('checksum_mode') == args.checksum_mode and
+         inventory_check.get('include_metadata') is args.checksum_include_metadata,
+         'Inventory recheck does not bind the selected checksum audit')
+    need(document_digest(response) == document_digest(destination / 'result.json'),
+         'Inventory recheck receipt was not retained consistently')
+    need(document_digest(path) == pin, 'Selected checksum audit changed during inventory recheck')
+
 def checksum_details():
     if not isinstance(audit, dict):
         return dict(requested=True, status='not-verified', eligible_count=0, verified_count=0,
@@ -200,12 +246,16 @@ def checksum_details():
     status = audit.get('status', 'error')
     if status == 'verified' and not audit_admitted:
         status = 'not-admitted'
+    elif status == 'verified' and not inventory_admitted:
+        status = 'stale-or-unconfirmed'
     details = dict(requested=True, status=status,
                 policy=audit.get('verification_policy'), mode=audit.get('checksum_mode'),
                 include_metadata=audit.get('include_metadata'), eligible_count=audit.get('eligible_count', 0),
                 verified_count=audit.get('verified_count', 0), verified=audit.get('verified_checksums', []),
                 eligible_assets=audit.get('eligible_assets', []), excluded_assets=audit.get('excluded_assets', []),
-                inventory_stable=audit.get('inventory_stable', False), release_id=audit.get('release', {}).get('id'),
+                inventory_stable=audit.get('inventory_stable', False) and inventory_admitted,
+                audit_inventory_stable=audit.get('inventory_stable', False), inventory_check=inventory_check,
+                release_id=audit.get('release', {}).get('id'),
                 errors=[r.get('name', r.get('error', 'unverified')) for r in audit.get('checksum_errors', [])],
                 coverage_errors=audit.get('coverage_errors', []), audit_exit_code=audit.get('exit_code'),
                 authenticated=False, source_verified=False, evidence_dir=audit.get('output_dir'))
@@ -280,12 +330,15 @@ try:
         result['details'] = details
         need(identity(details) == selected, 'Release identity changed during repair')
     audit_code, audit_path = run(command, 'checksum-audit')
+    audit_pin = document_digest(audit_path)
     audit = read_json(audit_path)
+    need(document_digest(audit_path) == audit_pin, 'Checksum audit response changed during selection')
     need(isinstance(audit, dict) and audit.get('kind') == 'dsr-release-checksum-verification' and
          type(audit.get('exit_code')) is int and audit['exit_code'] == audit_code and
          audit.get('status') == ('verified' if audit_code == 0 else 'error'), 'Inconsistent checksum audit result')
     need(audit_code == 0, str(audit.get('error', 'Checksum coverage failed')), audit_code)
     admit_audit(audit_path, audit_output, details, 'handoff-before')
+    need(document_digest(audit_path) == audit_pin, 'Checksum audit changed during initial admission')
     # The audit is not permission to relax a strict source/tag/ruleset gate.
     # Re-run the original read-only checks after downloads, never repeat --fix.
     final_code, final_details = metadata('manifest-after')
@@ -294,7 +347,12 @@ try:
                         final_details.get('assets', {}).get('size_mismatches', []) + final_details.get('assets', {}).get('digest_mismatches', [])))
     audited = sorted(audit['eligible_assets'] + [r['name'] for r in audit['excluded_assets']])
     need(actual == audited, 'Manifest verification and checksum audit observed different asset inventories')
+    # Names alone cannot bind the checksum observation: replacement assets
+    # can keep their names while changing IDs, sizes, digests or release mode.
+    recheck_audit(audit_path, audit_output, final_details, audit_pin)
     admit_audit(audit_path, audit_output, final_details, 'handoff-after')
+    need(document_digest(audit_path) == audit_pin, 'Checksum audit changed during final admission')
+    inventory_admitted = True
     repair = details.get('repair')
     result['details'] = final_details
     result['details']['repair'] = repair
