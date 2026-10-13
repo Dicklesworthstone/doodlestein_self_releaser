@@ -1376,7 +1376,8 @@ config_get_target_triple() {
 # Usage: config_validate_target_triples <toolname>
 config_validate_target_triples() {
     local toolname="$1"
-    local mapping_json platform triples
+    local mapping_json platform triples triple
+    config_validate_gnu_target_suffixes "$toolname" || return $?
     config_get_linux_libc_fallback "$toolname" >/dev/null || return 4
     mapping_json=$(_config_target_triples_json "$toolname") || {
         _cfg_log_error "Could not read target_triples for $toolname"
@@ -1393,7 +1394,154 @@ config_validate_target_triples() {
             return 4
         fi
         triples=$(config_get_target_triples "$toolname" "$platform") || return 4
+        # The effective mapping may fall back to the registry even when the
+        # per-tool file owns build_cmd. Validate that selected mapping too.
+        while IFS= read -r triple; do
+            _config_reject_gnu_target_suffix "$toolname" "target_triples[$platform]" "$triple" || return 4
+        done <<< "$triples"
     done < <(jq -r 'keys[]' <<< "$mapping_json")
+}
+
+# A Zig glibc floor is not a Rust target identity (GH #37). A literal selector
+# such as --target x86_64-unknown-linux-gnu.2.28 compiles, but cannot agree with
+# the plain triple pinned by the native worker and its collection receipt.
+# Refuse that configuration before source staging, metadata or compilation;
+# never strip the suffix from a retained receipt to make collection pass.
+# This is a literal-selector check, not shell evaluation. Dynamically assembled
+# selectors remain subject to the existing native command/receipt validators.
+_config_gnu_target_selector_rows_json() {
+    jq -ceS '
+        def identities($path):
+            if type == "string" then {path:$path,value:.,kind:"identity"}
+            elif type == "array" then to_entries[] | . as $entry |
+                $entry.value | identities($path+"["+($entry.key|tostring)+"]")
+            else empty end;
+        def scope($path):
+            . as $scope |
+            (if .build_cmd | type == "string" then
+                {path:($path+"build_cmd"),value:.build_cmd,kind:"command"}
+             else empty end),
+            (if $scope.env | type == "object" then
+                $scope.env | to_entries[] |
+                select(.key=="CARGO_BUILD_TARGET" or .key=="DSR_TARGET_TRIPLE") |
+                . as $entry | .value | identities($path+"env."+$entry.key)
+             else empty end),
+            (if $path != "" then .target | identities($path+"target") else empty end);
+        if type != "object" then error("expected tool configuration object") else
+            [scope(""),
+             (if .cross_compile | type == "object" then
+                 .cross_compile | to_entries[] | select(.value|type=="object") |
+                 . as $entry | .value | scope("cross_compile["+($entry.key|tojson)+"].")
+              else empty end),
+             (if .target_triples | type == "object" then
+                 .target_triples | to_entries[] | . as $entry |
+                 .value | identities("target_triples["+($entry.key|tojson)+"]")
+              else empty end)] | unique
+        end
+    '
+}
+
+# Read literal shell words without executing expansions or sourcing a command.
+# Quotes concatenate word fragments; a quoted diagnostic is one word, not an
+# embedded --target invocation. Control operators keep adjacent commands apart.
+# This intentionally does not interpret variables, substitutions or shell scripts
+# passed as a single argument to another interpreter.
+_config_literal_target_words() {
+    local LC_ALL=C
+    local text="$1" word='' quote='' ch next i started=false
+    for ((i=0; i<${#text}; i++)); do
+        ch=${text:i:1}
+        if [[ "$quote" == "'" ]]; then
+            if [[ "$ch" == "'" ]]; then quote=''; else word+="$ch"; fi
+        elif [[ "$ch" == '\' ]]; then
+            next=${text:i+1:1}
+            if [[ "$quote" == '"' && "$next" != [\$\`\"\\] && "$next" != $'\n' ]]; then
+                word+="$ch"
+            else
+                [[ -n "$next" ]] || return 4
+                [[ "$next" == $'\n' ]] || { word+="$next"; started=true; }
+                i=$((i+1))
+            fi
+        elif [[ -n "$quote" ]]; then
+            if [[ "$ch" == "$quote" ]]; then quote=''; else word+="$ch"; fi
+        else
+            case "$ch" in
+                "'"|'"') quote="$ch"; started=true ;;
+                ' '|$'\t'|$'\r')
+                    if [[ "$started" == true ]]; then printf '%s\0' "$word"; fi
+                    word=''; started=false ;;
+                $'\n'|';'|'&'|'|'|'('|')'|'<'|'>')
+                    if [[ "$started" == true ]]; then printf '%s\0' "$word"; fi
+                    printf '%s\0' ';'
+                    word=''; started=false ;;
+                '#')
+                    if [[ "$started" == false ]]; then
+                        while ((i+1<${#text})) && [[ "${text:i+1:1}" != $'\n' ]]; do i=$((i+1)); done
+                    else word+="$ch"; fi ;;
+                *) word+="$ch"; started=true ;;
+            esac
+        fi
+    done
+    [[ -z "$quote" ]] || return 4
+    if [[ "$started" == true ]]; then printf '%s\0' "$word"; fi
+}
+
+_config_reject_gnu_target_suffix() {
+    local tool="$1" path="$2" value="$3" triple floor
+    if [[ "$value" =~ ^([A-Za-z0-9_+-]+(-[A-Za-z0-9_+-]+)*-linux-gnu[a-z0-9_]*)\.([0-9]+\.[0-9]+)$ ]]; then
+        triple=${BASH_REMATCH[1]}; floor=${BASH_REMATCH[3]}
+        _cfg_log_error "$tool $path: unsupported glibc-qualified target $triple.$floor; use plain $triple and linux_glibc_floor: \"$floor\" with cargo build (not an explicit cargo zigbuild target suffix)"
+        return 4
+    fi
+}
+
+# repos.d is the native build authority. Only registry-only tools are read from
+# repos.yaml here; unrelated tools and non-build strings are not selectors.
+config_validate_gnu_target_suffixes() {
+    local toolname="${1:-}" config_file document rows row path value kind tokens word target_next
+    [[ -n "$toolname" ]] || return 4
+    config_file="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/$toolname.yaml"
+    if [[ -f "$config_file" ]]; then
+        document=$(_config_read_single_mapping_json "$config_file") || return $?
+    elif [[ -f "${DSR_REPOS_FILE:-}" ]]; then
+        document=$(_config_read_single_mapping_json "$DSR_REPOS_FILE") || return $?
+        document=$(jq -ce --arg tool "$toolname" '
+            if (.tools|type) != "object" then error("invalid registry")
+            else .tools | if has($tool) then .[$tool] else {} end |
+                if type=="object" then . else error("invalid tool") end end
+        ' <<< "$document") || return 4
+    else
+        return 0
+    fi
+    rows=$(_config_gnu_target_selector_rows_json <<< "$document") || return 4
+    rows=$(jq -c '.[]' <<< "$rows") || return 4
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        path=$(jq -r '.path' <<< "$row") || return 4
+        value=$(jq -r '.value' <<< "$row") || return 4
+        kind=$(jq -r '.kind' <<< "$row") || return 4
+        if [[ "$kind" == identity ]]; then
+            _config_reject_gnu_target_suffix "$toolname" "$path" "$value" || return 4
+        elif [[ "$value" == *-linux-gnu* ]]; then
+            # Capture the lexer status before checking tokens: a process
+            # substitution alone would hide an unterminated quote failure.
+            tokens=$(_config_literal_target_words "$value" | jq -Rs 'split("\u0000")[:-1]') || {
+                _cfg_log_error "$toolname $path: malformed literal target command"; return 4;
+            }
+            target_next=false
+            jq -j '.[] + "\u0000"' <<< "$tokens" | while IFS= read -r -d '' word; do
+                if [[ "$target_next" == true ]]; then
+                    _config_reject_gnu_target_suffix "$toolname" "$path" "$word" || return 4
+                fi
+                target_next=false
+                case "$word" in
+                    --target) target_next=true ;;
+                    --target=*|CARGO_BUILD_TARGET=*|DSR_TARGET_TRIPLE=*)
+                        _config_reject_gnu_target_suffix "$toolname" "$path" "${word#*=}" || return 4 ;;
+                esac
+            done || return 4
+        fi
+    done <<< "$rows"
 }
 
 # Get arch alias override for a tool/arch
@@ -1532,6 +1680,8 @@ export -f config_get_host_for_platform
 export -f config_get_tool_field config_get_install_script_compat config_get_install_script_path
 export -f config_get_artifact_naming config_get_target_triple config_get_arch_alias
 export -f _config_target_triples_json config_get_target_triples config_get_target_triples_json config_validate_target_triples
+export -f _config_gnu_target_selector_rows_json config_validate_gnu_target_suffixes
+export -f _config_literal_target_words _config_reject_gnu_target_suffix
 export -f config_get_linux_libc_fallback
 export -f config_get_release_contract_json config_validate_release_contract
 export -f config_get_release_contract_targets_json config_get_release_contract_target_key
