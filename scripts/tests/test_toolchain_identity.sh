@@ -52,16 +52,35 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-real_cargo = Path(require(['rustup', 'which', 'cargo'])).resolve()
-real_rustc = Path(require(['rustup', 'which', 'rustc'])).resolve()
+def real_toolchain_executable(name, candidate):
+    candidate = Path(candidate).resolve()
+    with candidate.open('rb') as stream:
+        scripted = stream.read(2) == b'#!'
+    if scripted:
+        # Rustup's selected Cargo may itself be the exact managed toolchain
+        # wrapper. Copy its actual executable, never a wrapper missing its
+        # sibling or a made-up tool/version response.
+        if name != 'cargo' or digest(candidate) != 'd5966567e177ce968f272848ab8e249da3d9bfca40f90237480e1fbe6bd9d2d0':
+            raise AssertionError('Unreviewed selected toolchain launcher: ' + str(candidate))
+        candidate = (candidate.parent / 'cargo-rch-real').resolve()
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise AssertionError('Actual toolchain executable unavailable: ' + str(candidate))
+    with candidate.open('rb') as stream:
+        if stream.read(2) == b'#!':
+            raise AssertionError('Actual toolchain executable unavailable: ' + str(candidate))
+    return candidate
+
+
+real_cargo = real_toolchain_executable('cargo', require(['rustup', 'which', 'cargo']))
+real_rustc = real_toolchain_executable('rustc', require(['rustup', 'which', 'rustc']))
 real_sysroot = Path(require([real_rustc, '--print', 'sysroot'])).resolve()
 host = next(line.split(': ', 1)[1] for line in require([real_rustc, '-vV']).splitlines()
             if line.startswith('host: '))
 selected = work / 'selected-toolchain'
 (selected / 'bin').mkdir(parents=True)
 alternate_sysroot = Path(os.environ.get('DSR_TEST_ALTERNATE_SYSROOT', str(real_sysroot))).resolve()
-for name, source in (('cargo', alternate_sysroot / 'bin/cargo'), ('rustc', alternate_sysroot / 'bin/rustc')):
-    shutil.copy2(source, selected / 'bin' / name)
+for name in ('cargo', 'rustc'):
+    shutil.copy2(real_toolchain_executable(name, alternate_sysroot / 'bin' / name), selected / 'bin' / name)
 # Both compilers use real installed standard libraries, but their executable
 # paths/inodes differ. This proves +toolchain routing without network access.
 (selected / 'lib').symlink_to(alternate_sysroot / 'lib', target_is_directory=True)
@@ -111,6 +130,45 @@ for label, original, current in (('non-object original', [], []),
                                 ('non-object returned', large_identity, [])):
     refused = bind_observation({}, original, current)
     check(label + ' cannot be inserted as compiler evidence', refused.returncode != 0 and not refused.stdout)
+
+aggregation_program = '''source "$1" || exit $?;
+IFS= read -r summary || exit 1; IFS= read -r targets || exit 1;
+_act_bind_orchestration_targets "$summary" "$targets"'''
+large_target = {'platform': 'linux/amd64', 'status': 'success',
+                'cargo_isolation': {'toolchain': large_identity}}
+summary = {'status': 'success', 'exit_code': 0, 'summary': {'total': 1, 'success': 1, 'failed': 0}}
+aggregated = run(['bash', '-o', 'pipefail', '-c', aggregation_program, '_', module],
+                 input=json.dumps(summary) + '\n' + json.dumps([large_target]) + '\n')
+check('production target aggregator preserves a complete large compiler receipt',
+      aggregated.returncode == 0 and json.loads(aggregated.stdout) == dict(summary, targets=[large_target]))
+
+field_program = '''source "$1" || exit $?;
+IFS= read -r isolation || exit 1; IFS= read -r observation || exit 1;
+_act_bind_cargo_isolation_field "$2" "$isolation" "$observation"'''
+for field in ('cargo_context', 'toolchain', 'dependency_sources'):
+    bound_field = run(['bash', '-o', 'pipefail', '-c', field_program, '_', module, field],
+                      input='{}\n' + json.dumps(large_identity) + '\n')
+    check('large already-observed ' + field + ' is transported without becoming an exec argument',
+          bound_field.returncode == 0 and json.loads(bound_field.stdout) == {field: large_identity})
+
+# Exercise the production checkpoint writer too, rather than reproducing its
+# jq filter. This is JSON transport evidence, not a worker/native build.
+# Its existing production transaction cleanup also requires retained-mode or
+# exact fixture lifecycle authorization before this test is admitted to run.
+state_root = work / 'large-receipt-state'
+state_file = state_root / 'identity-probe' / '1.0.0' / 'retained-run' / 'state.json'
+state_file.parent.mkdir(parents=True)
+state_file.write_text(json.dumps({'tool': 'identity-probe', 'version': '1.0.0',
+                                 'run_id': 'retained-run', 'created_at': 'fixture'}))
+state_program = '''log_error() { printf '%s\\n' "$*" >&2; }; log_debug() { :; };
+source "$1" || exit $?; _BUILD_STATE_DIR="$2";
+IFS= read -r extra || exit 1;
+build_state_update_target identity-probe 1.0.0 linux/amd64 completed "$extra" retained-run'''
+persisted = run(['bash', '-o', 'pipefail', '-c', state_program, '_', root / 'src/build_state.sh', state_root],
+                input=json.dumps({'result': large_target, 'attempts': 1}) + '\n')
+check('production target checkpoint retains the large receipt without exec argv transport',
+      persisted.returncode == 0 and json.loads(state_file.read_text()).get(
+          'target_statuses', {}).get('linux/amd64', {}).get('result') == large_target)
 
 
 def probe(command, env=None, mode='record', receipt=None, pin=None, cwd=None, expected_cwd=None, timeout=120):
@@ -420,6 +478,15 @@ managed_hash = '171e35f834fb8f900f85bd9ee22a659b3e710973dc3922d9579d055d560982e5
 if not managed_input.is_file() or digest(managed_input) != managed_hash:
     check('a byte-exact reviewed RCH v6 shim input is required (DSR_TEST_RCH_CARGO_SHIM)', False)
 else:
+    # Prior refusal cases deliberately changed the first toolchain's bytes.
+    # Preserve it and start this positive suite with a fresh real copy: a
+    # modified signed Mach-O executable cannot be reused as a working fixture.
+    selected = work / 'managed-selected-toolchain'
+    (selected / 'bin').mkdir(parents=True)
+    for name in ('cargo', 'rustc'):
+        shutil.copy2(real_toolchain_executable(name, alternate_sysroot / 'bin' / name), selected / 'bin' / name)
+    (selected / 'lib').symlink_to(alternate_sysroot / 'lib', target_is_directory=True)
+    require(['rustup', 'toolchain', 'link', 'fixture-managed', selected], env=environment)
     managed_bin = work / 'managed-rch-bin'
     managed_bin.mkdir()
     managed_shim = managed_bin / 'cargo'
@@ -427,11 +494,11 @@ else:
     managed_shim.chmod(0o755)
     (selected / 'bin/cargo-rch-real').symlink_to('cargo')
     managed_env = dict(environment, PATH=str(managed_bin) + os.pathsep + environment['PATH'],
-                       RUSTUP_TOOLCHAIN='fixture-selected',
+                       RUSTUP_TOOLCHAIN='fixture-managed',
                        CARGO_TARGET_DIR=str(work / 'managed-rch-output'))
     for variable in ('RCH_REAL_CARGO', 'RCH_SHIM_REAL_CARGO'):
         managed_env.pop(variable, None)
-    command = 'cargo +fixture-selected build --quiet --offline --jobs 2'
+    command = 'cargo +fixture-managed build --quiet --offline --jobs 2'
     recorded, observed, managed_receipt = probe(command, managed_env)
     compiled = build(command, managed_env)
     verified, _, _ = probe(command, managed_env, mode='verify', receipt=managed_receipt)
@@ -449,6 +516,114 @@ else:
           plain_recorded.returncode == 0 and expected_tool(plain_observed, 'cargo', selected / 'bin/cargo') and
           expected_tool({'tools': {'rustc': plain_observed.get('tools', {}).get('cargo', {}).get(
               'sysroot_resolver', {})}}, 'rustc', selected / 'bin/rustc'))
+
+    # The shim permits absent bare-PATH rustc. Use an actual HOME Cargo and
+    # explicit actual RUSTC, with a private PATH containing no rustc entry.
+    # No fake compiler or hand-authored backend response supplies this case.
+    fallback_home = work / 'managed-fallback-home'
+    (fallback_home / '.cargo/bin').mkdir(parents=True)
+    (fallback_home / '.cargo/bin/cargo').symlink_to(selected / 'bin/cargo')
+    fallback_bin = work / 'managed-fallback-bin'
+    fallback_bin.mkdir()
+    (fallback_bin / 'cargo').symlink_to(managed_shim)
+    for name in ('bash', 'python3', 'dirname', 'date', 'jq', 'cc', 'c++', 'xcrun', 'xcodebuild', 'ld', 'ar'):
+        executable = shutil.which(name)
+        if executable:
+            (fallback_bin / name).symlink_to(executable)
+    fallback_env = dict(managed_env, HOME=str(fallback_home), PATH=str(fallback_bin),
+                        RUSTC=str(selected / 'bin/rustc'),
+                        CARGO_TARGET_DIR=str(work / 'managed-fallback-output'))
+    fallback_recorded, fallback_observed, fallback_receipt = probe(command, fallback_env)
+    fallback_compiled = build(command, fallback_env)
+    fallback_verified, _, _ = probe(command, fallback_env, mode='verify', receipt=fallback_receipt)
+    check('absent bare rustc still binds and builds through the actual HOME Cargo fallback',
+          fallback_recorded.returncode == 0 and fallback_compiled.returncode == 0 and
+          fallback_verified.returncode == 0 and
+          expected_tool(fallback_observed, 'cargo', selected / 'bin/cargo') and
+          fallback_observed.get('tools', {}).get('cargo', {}).get('sysroot_resolver') is None and
+          require([work / 'managed-fallback-output' / host / 'debug/identity-probe']) == '42')
+
+    failing_bin = work / 'managed-failing-sysroot-bin'
+    failing_bin.mkdir()
+    for entry in fallback_bin.iterdir():
+        (failing_bin / entry.name).symlink_to(entry)
+    # A real Rustup proxy cannot resolve this deliberately absent private
+    # toolchain. The explicit actual RUSTC and HOME Cargo still work.
+    (failing_bin / 'rustc').symlink_to(Path(shutil.which('rustup')).resolve())
+    failing_env = dict(fallback_env, PATH=str(failing_bin), RUSTUP_TOOLCHAIN='fixture-absent',
+                       CARGO_TARGET_DIR=str(work / 'managed-failed-sysroot-output'))
+    failed_sysroot_recorded, failed_sysroot_observed, failed_sysroot_receipt = probe(command, failing_env)
+    failed_sysroot_compiled = build(command, failing_env)
+    failed_sysroot_verified, _, _ = probe(command, failing_env, mode='verify', receipt=failed_sysroot_receipt)
+    resolver_failure = failed_sysroot_observed.get('tools', {}).get('cargo', {}).get('sysroot_resolver') or {}
+    check('failed real bare-rustc resolver falls back while binding explicit actual RUSTC',
+          failed_sysroot_recorded.returncode == 0 and failed_sysroot_compiled.returncode == 0 and
+          failed_sysroot_verified.returncode == 0 and resolver_failure.get('sysroot_probe_exit_code', 0) != 0 and
+          expected_tool(failed_sysroot_observed, 'cargo', selected / 'bin/cargo') and
+          expected_tool(failed_sysroot_observed, 'rustc', selected / 'bin/rustc') and
+          require([work / 'managed-failed-sysroot-output' / host / 'debug/identity-probe']) == '42')
+
+    # Stock Rustup proxies are real executable copies/hardlinks, not scripts.
+    # PATH still has neither rustc nor rustup; HOME contains their dispatcher.
+    proxy_home = work / 'managed-proxy-home'
+    (proxy_home / '.cargo/bin').mkdir(parents=True)
+    for name in ('cargo', 'rustup'):
+        shutil.copy2(Path(shutil.which('rustup')).resolve(), proxy_home / '.cargo/bin' / name)
+    proxy_env = dict(fallback_env, HOME=str(proxy_home),
+                     CARGO_TARGET_DIR=str(work / 'managed-proxy-output'))
+    proxy_recorded, proxy_observed, proxy_receipt = probe(command, proxy_env)
+    proxy_compiled = build(command, proxy_env)
+    proxy_verified, _, _ = probe(command, proxy_env, mode='verify', receipt=proxy_receipt)
+    check('stock HOME Cargo proxy without PATH rustup binds the actual delegated compiler',
+          proxy_recorded.returncode == 0 and proxy_compiled.returncode == 0 and
+          proxy_verified.returncode == 0 and expected_tool(proxy_observed, 'cargo', selected / 'bin/cargo') and
+          proxy_observed.get('tools', {}).get('cargo', {}).get('rustup_resolver', {}).get('sha256') ==
+          digest(proxy_home / '.cargo/bin/rustup') and
+          require([work / 'managed-proxy-output' / host / 'debug/identity-probe']) == '42')
+
+    # Exercise the actual strict-cache emitter with the same genuine selected
+    # tools. This closes dispatcher disagreement in the compiler consumer;
+    # these local fixture builds still do not prove RCH admission/native SDK.
+    cache_root = work / 'managed-cargo-cache'
+    cache_root.mkdir(mode=0o700)
+    cache_program = '''source "$1" || exit $?;
+_act_strict_cargo_cache_script "$2" '{}' "$3" | bash'''
+
+    def cached_build(label, cache_command, cache_environment):
+        output = work / ('managed-cache-output-' + label)
+        cache_environment = dict(cache_environment, CARGO_TARGET_DIR=str(output))
+        before_cache, before_identity, cache_receipt = probe(cache_command, cache_environment)
+        result = run(['bash', '-o', 'pipefail', '-c', cache_program, '_', module, cache_root, cache_command],
+                     cwd=project, env=cache_environment, timeout=300)
+        after_cache, _, _ = probe(cache_command, cache_environment, mode='verify', receipt=cache_receipt)
+        executable = output / host / 'debug/identity-probe'
+        check(label + ' strict cache uses the original actual delegated Cargo/Rustc observation',
+              before_cache.returncode == 0 and result.returncode == 0 and after_cache.returncode == 0 and
+              expected_tool(before_identity, 'cargo', selected / 'bin/cargo') and
+              expected_tool(before_identity, 'rustc', selected / 'bin/rustc') and
+              executable.is_file() and require([executable]) == '42')
+
+    cached_build('explicit-v6', 'cargo +fixture-managed build --quiet --offline --jobs 2', managed_env)
+    cached_build('explicit-v6-exported', 'cargo +fixture-managed build --quiet --offline --jobs 2',
+                 dict(managed_env, dsr_cache_context='', DSR_CARGO_TOOLCHAIN_CONTEXT=''))
+    cached_build('sysroot-v6', command, managed_env)
+    cached_build('HOME-direct', command, fallback_env)
+    cached_build('HOME-proxy', command, proxy_env)
+    unknown_bin = work / 'unreviewed-cache-shim'
+    unknown_bin.mkdir()
+    unknown_shim = unknown_bin / 'cargo'
+    # Keep the byte-exact original. Changed launcher bytes are a new owned
+    # file with the same real dispatch, header and version, never a fake tool.
+    unknown_shim.write_bytes(managed_shim.read_bytes() + b'\n# changed unreviewed launcher bytes\n')
+    unknown_shim.chmod(0o755)
+    refused_output = work / 'unreviewed-cache-output'
+    unknown_env = dict(managed_env, PATH=str(unknown_bin) + os.pathsep + managed_env['PATH'],
+                       CARGO_TARGET_DIR=str(refused_output))
+    refused_cache = run(['bash', '-o', 'pipefail', '-c', cache_program, '_', module, cache_root, command],
+                        cwd=project, env=unknown_env)
+    check('unchanged real version/header cannot admit an unreviewed cache compiler launcher',
+          refused_cache.returncode != 0 and not refused_output.exists())
+
     overridden = dict(managed_env, RCH_REAL_CARGO=str(real_cargo))
     refused, _, refused_receipt = probe(command, overridden)
     check('managed executable override cannot borrow the reviewed shim delegation authority',
@@ -459,6 +634,9 @@ else:
     drifted, _, _ = probe(command, managed_env, mode='verify', receipt=plain_receipt)
     check('unchanged wrapper plus changed delegated executable refuses the original pin',
           plain_recorded.returncode == 0 and drifted.returncode != 0 and digest(managed_shim) == shim_before)
+    proxy_drifted, _, _ = probe(command, proxy_env, mode='verify', receipt=proxy_receipt)
+    check('stock HOME proxy cannot hide changed delegated Cargo bytes behind an unchanged Rustup binary',
+          proxy_recorded.returncode == 0 and proxy_drifted.returncode != 0)
 
 print(f'Toolchain identity: {passed} passed, {failed} failed; fixtures retained at {work}', flush=True)
 raise SystemExit(1 if failed else 0)

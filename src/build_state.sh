@@ -638,8 +638,10 @@ build_state_update_host() {
   # transition.
   if ! _build_state_jq_update "$state_file" \
       --arg host "$host" --arg status "$host_status" --arg now "$now" \
-      --argjson extra "$extra_json" \
-      '.hosts[$host] = ((.hosts[$host] // {}) + $extra + {status: $status, updated_at: $now}) | .updated_at = $now'; then
+      --slurpfile extra /dev/stdin \
+      '($extra | select(length == 1 and (.[0] | type == "object")) | .[0]) as $extra |
+       .hosts[$host] = ((.hosts[$host] // {}) + $extra + {status: $status, updated_at: $now}) |
+       .updated_at = $now' <<< "$extra_json"; then
     return 1
   fi
 
@@ -682,7 +684,8 @@ build_state_update_target() {
 
   if ! _build_state_jq_update "$state_file" \
       --arg target "$target" --arg status "$target_status" --arg now "$now" \
-      --argjson extra "$extra_json" '
+      --slurpfile extra /dev/stdin '
+        ($extra | select(length == 1) | .[0]) as $extra |
         .target_statuses = (.target_statuses // {}) |
         (.target_statuses[$target] // {attempts: 0}) as $prior |
         .target_statuses[$target] =
@@ -697,7 +700,7 @@ build_state_update_target() {
         then .target_statuses[$target].source_sync_failures =
           (($prior.source_sync_failures // 0) + 1)
         else . end |
-        .updated_at = $now'; then
+        .updated_at = $now' <<< "$extra_json"; then
     return 1
   fi
 

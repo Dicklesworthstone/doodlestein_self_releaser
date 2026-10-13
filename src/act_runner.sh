@@ -7215,10 +7215,16 @@ _act_strict_cargo_cache_script() {
     printf -v contract_q '%q' "$cache_contract"
     printf -v command_q '%q' "$command"
     selection_script=$(_act_toolchain_identity_script context /dev/null "$command") || return $?
+    # Assignment preserves an inherited export attribute. Clear it before
+    # collecting the potentially large observation, so only fd3 carries it.
+    printf 'unset dsr_cache_context || exit $?\n'
     printf 'dsr_cache_context=$(\n%s\n) || exit $?\n' "$selection_script"
     # tomllib needs Python 3.11+; see _act_toolchain_identity_script.
     printf '%s\n' 'dsr_tool_python=python3; for dsr_tool_candidate in python3 python3.14 python3.13 python3.12 python3.11; do if command -v "$dsr_tool_candidate" >/dev/null 2>&1 && "$dsr_tool_candidate" -I -c '\''import sys; sys.exit(sys.version_info < (3, 11))'\'' 2>/dev/null; then dsr_tool_python=$dsr_tool_candidate; break; fi; done'
-    printf 'DSR_CARGO_TOOLCHAIN_CONTEXT="$dsr_cache_context" "$dsr_tool_python" -I - %s %s %s <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
+    # Environment entries have the same single-argument limit as exec argv on
+    # Linux. Keep the observation on an inherited input descriptor instead.
+    printf 'unset DSR_CARGO_TOOLCHAIN_CONTEXT || exit $?\n'
+    printf '"$dsr_tool_python" -I - %s %s %s 3<<< "$dsr_cache_context" <<\x27DSR_CARGO_CACHE_PY\x27\n' "$root_q" "$contract_q" "$command_q"
     cat <<'PY'
 import fcntl, hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys, tempfile, tomllib
 
@@ -7236,7 +7242,8 @@ def digest(path):
 def probe(argv):
     return subprocess.check_output(argv, text=True, timeout=30, env=probe_env).strip()
 
-context = json.loads(os.environ.pop('DSR_CARGO_TOOLCHAIN_CONTEXT'))
+with os.fdopen(3) as context_input:
+    context = json.load(context_input)
 probe_env = dict(os.environ, **context['environment'])
 cargo_argv = context['cargo_argv']
 compiler = context['compiler']
@@ -7266,48 +7273,44 @@ cargo = probe(cargo_argv + ['-V'])
 version = re.match(r'cargo (\d+)\.(\d+)\.(\d+)', cargo)
 require(version and tuple(map(int, version.groups())) >= (1, 91, 1), 'Cargo >=1.91.1 with build.build-dir support required')
 rustc = probe([compiler, '-vV'])
-# Reviewed managed RCH shim v4 and toolchain wrapper v3, identical on the
-# native Mac and Linux proof host. A changed script requires renewed review;
-# matching a comment or a version response is not executable authority.
-rch_shim_hash = '015f36047d1b732ada59b8644f7fde5e327803a11e56d571d2603af25c970ed7'
-rch_toolchain_hash = 'd5966567e177ce968f272848ab8e249da3d9bfca40f90237480e1fbe6bd9d2d0'
+# The actual context observer already resolved the reviewed launcher and its
+# selected compiler in this command's effective environment. Reuse those
+# facts and recheck bytes; a second stale dispatcher must not choose a
+# different Cargo (or reject a valid v6/HOME fallback) for the cache key.
 def compiler_identity(program, tool, version_args, observed):
     selected = shutil.which(program, path=probe_env.get('PATH'))
     require(selected, 'compiler executable missing: ' + tool)
     selected = pathlib.Path(selected).resolve()
-    with selected.open('rb') as stream:
-        is_wrapper = stream.read(2) == b'#!'
-    if is_wrapper:
-        require(tool == 'cargo' and digest(selected) in (rch_shim_hash, rch_toolchain_hash),
-                'unrecognized selected compiler script: ' + tool)
-        require(probe_env.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
-                not probe_env.get('RCH_REAL_CARGO') and not probe_env.get('RCH_SHIM_REAL_CARGO'),
-                'RCH cache resolution requires local bypass without executable overrides')
-    actual = selected
-    if is_wrapper or selected.name == 'rustup':
-        rustup = shutil.which('rustup', path=probe_env.get('PATH'))
-        require(rustup, 'rustup executable missing')
-        rustup = pathlib.Path(rustup).resolve()
-        with rustup.open('rb') as stream:
-            require(stream.read(2) != b'#!', 'rustup resolver cannot be a script')
-        require(is_wrapper or selected == rustup, 'unrecognized rustup launcher')
-        actual = pathlib.Path(probe(['rustup', 'which', tool])).resolve()
-        require(probe([str(actual), *version_args]) == observed, 'wrapper/toolchain version disagreement: ' + tool)
-    toolchain_launcher = {'path': str(actual), 'sha256': digest(actual)}
-    with actual.open('rb') as stream:
-        is_toolchain_wrapper = stream.read(2) == b'#!'
-    if is_toolchain_wrapper and tool == 'cargo':
-        # RCH's managed toolchain wrapper has a documented local bypass used
-        # by this runner. Bind that wrapper too, then hash its real executable.
-        require(probe_env.get('RCH_CARGO_WRAPPER_BYPASS') == '1' and
-                digest(actual) == rch_toolchain_hash, 'unsupported toolchain Cargo wrapper')
-        actual = (actual.parent / 'cargo-rch-real').resolve()
-        require(probe([str(actual), *version_args]) == observed, 'RCH real Cargo version disagreement')
+    record = selected_identity['tools'].get(tool)
+    require(isinstance(record, dict), 'missing observed compiler identity: ' + tool)
+    require(pathlib.Path(record['selected_path']).resolve() == selected and
+            digest(selected) == record['selected_sha256'],
+            'selected compiler changed after context observation: ' + tool)
+    actual = pathlib.Path(record.get('resolved_path', record['selected_path'])).resolve()
+    actual_digest = record.get('resolved_sha256', record['selected_sha256'])
+    require(record.get('resolved_kind', record['selected_kind']) == 'executable' and
+            digest(actual) == actual_digest, 'unresolved or changed compiler executable: ' + tool)
     with actual.open('rb') as stream:
         require(stream.read(2) != b'#!' and actual.name != 'rustup', 'unresolved compiler wrapper: ' + tool)
-    return {'selected_path': str(selected), 'selected_sha256': digest(selected),
+    recorded_version = record['version'].splitlines()[0] if tool == 'cargo' else record['version']
+    require(recorded_version == observed and probe([str(actual), *version_args]) == observed,
+            'observed/selected/native compiler version disagreement: ' + tool)
+    # Dispatch dependencies belong to the same original observation too.
+    # A stable version or native executable cannot hide a changed launcher.
+    for name in ('rustup_resolver', 'toolchain_launcher', 'sysroot_resolver'):
+        dependency = record.get(name)
+        if dependency is None:
+            continue
+        require(isinstance(dependency, dict), 'invalid compiler dispatch observation: ' + name)
+        for path_key, hash_key in (('path', 'sha256'), ('selected_path', 'selected_sha256'),
+                                   ('resolved_path', 'resolved_sha256')):
+            if path_key in dependency:
+                require(digest(pathlib.Path(dependency[path_key]).resolve()) == dependency.get(hash_key),
+                        'compiler dispatch dependency changed: ' + name)
+    toolchain_launcher = record.get('toolchain_launcher', {'path': str(actual), 'sha256': actual_digest})
+    return {'selected_path': str(selected), 'selected_sha256': record['selected_sha256'],
             'toolchain_launcher': toolchain_launcher,
-            'executable_path': str(actual), 'executable_sha256': digest(actual)}
+            'executable_path': str(actual), 'executable_sha256': actual_digest}
 compilers = {'cargo': compiler_identity('cargo', 'cargo', ['-V'], cargo),
              'rustc': compiler_identity(compiler, 'rustc', ['-vV'], rustc)}
 require('-nightly' in cargo and '-nightly' in rustc,
@@ -7940,6 +7943,13 @@ def is_script(path):
         return stream.read(2) == b'#!'
 
 rustup = shutil.which('rustup', path=probe_env.get('PATH'))
+if not rustup:
+    # The managed HOME Cargo fallback may be the stock Rustup proxy even
+    # when neither rustc nor rustup is on PATH. Bind its actual HOME dispatcher
+    # before deciding whether those Cargo bytes are the compiler or a proxy.
+    home_rustup = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/rustup')
+    if home_rustup.is_file() and os.access(home_rustup, os.X_OK) and not is_script(home_rustup):
+        rustup = str(home_rustup)
 rustup_digest = digest(pathlib.Path(rustup).resolve()) if rustup else None
 
 # Same exact reviewed v4 shim/v3 toolchain-wrapper bytes used by the strict
@@ -7978,11 +7988,36 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
         elif record['selected_sha256'] == rch_shim_v6_hash and not explicit_toolchain:
             # Bind the actual dispatch dependency too. RUSTC may name a
             # different explicit compiler; this shim asks PATH's bare rustc.
-            record['sysroot_resolver'] = identity('rustc', 'rustc', ['-vV'], 'rustc')
-            sysroot = run(['rustc', '--print', 'sysroot'])
-            candidate = pathlib.Path(sysroot) / 'bin' / 'cargo-rch-real'
-            actual = candidate if candidate.is_file() and os.access(candidate, os.X_OK) else \
-                pathlib.Path(probe_env.get('HOME', '')) / '.cargo' / 'bin' / 'cargo'
+            # Missing/failed bare rustc is a real HOME-Cargo fallback in v6;
+            # an explicit RUSTC can still be the build's working compiler.
+            bare_rustc = shutil.which('rustc', path=probe_env.get('PATH'))
+            sysroot = ''
+            record['sysroot_resolver'] = None
+            if bare_rustc:
+                resolver = pathlib.Path(bare_rustc).absolute()
+                resolved_resolver = resolver.resolve()
+                dependency = {'program': 'rustc', 'selected_path': str(resolver),
+                              'selected_sha256': digest(resolved_resolver),
+                              'selected_kind': 'script' if is_script(resolved_resolver) else 'executable'}
+                try:
+                    outcome = subprocess.run([str(resolver), '--print', 'sysroot'],
+                                             capture_output=True, text=True, timeout=60, env=probe_env)
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    fail('cannot observe managed Cargo sysroot dispatch: ' + str(error))
+                # The reviewed shell shim uses stdout even on a nonzero exit;
+                # it never treats stderr as a sysroot path.
+                sysroot = outcome.stdout.rstrip('\n')
+                dependency['sysroot_probe_exit_code'] = outcome.returncode
+                dependency['sysroot'] = sysroot
+                record['sysroot_resolver'] = dependency
+            candidate = pathlib.Path(sysroot) / 'bin' / 'cargo-rch-real' if sysroot else None
+            if candidate is not None and os.access(candidate, os.X_OK):
+                # A successful dispatch through a rustup proxy must bind the
+                # delegated rustc bytes too, even when RUSTC is different.
+                dependency.update(identity('rustc', 'rustc', [], 'rustc'))
+                actual = candidate
+            else:
+                actual = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/cargo')
     if rustup_tool and (proxy or managed_cargo and actual is None):
         if not rustup or is_script(pathlib.Path(rustup).resolve()):
             fail('selected compiler requires an executable rustup resolver')
@@ -8135,6 +8170,24 @@ _act_bind_toolchain_identity() {
         select(length == 3 and (.[0] | type == "object") and
             (.[1] | type == "object") and .[1] == .[2]) |
         .[0].toolchain = .[2] | .[0]'
+}
+
+# The summary is small; its targets can carry complete compiler receipts.
+# Keep both documents on stdin rather than forwarding a target as exec argv.
+_act_bind_orchestration_targets() {
+    printf '%s\n' "$1" "$2" | jq -sce '
+        select(length == 2 and (.[0] | type == "object") and
+          (.[1] | type == "array")) | .[0] + {targets: .[1]}'
+}
+
+# Insert one already observed field. This transports bytes and does not
+# perform the separate original-pin/pre-/post-build identity verification.
+_act_bind_cargo_isolation_field() {
+    local field="$1"
+    case "$field" in cargo_context|toolchain|dependency_sources) ;; *) return 4 ;; esac
+    printf '%s\n' "$2" "$3" | jq -sce --arg field "$field" '
+        select(length == 2 and (.[0] | type == "object")) |
+        .[0][$field] = .[1] | .[0]'
 }
 
 # Validate a matrix command against the exact worker target without executing
@@ -8610,21 +8663,21 @@ act_run_native_build() {
                 }
             ') || return 4
         if $strict_private_cargo_cache; then
-            cargo_isolation_json=$(jq --argjson seed "$strict_cargo_seed_json" \
-                '.cache_reuse = [] | .dependency_cache = {mode: "private-copy", seed: $seed}' \
-                <<< "$cargo_isolation_json") || return 4
+            cargo_isolation_json=$(printf '%s\n' "$cargo_isolation_json" "$strict_cargo_seed_json" | \
+                jq -sce 'select(length == 2 and (.[0] | type == "object")) |
+                .[0].cache_reuse = [] | .[0].dependency_cache = {mode: "private-copy", seed: .[1]} | .[0]') || return 4
         fi
         if [[ "$strict_cargo_context_json" != null ]]; then
-            cargo_isolation_json=$(jq --argjson context "$strict_cargo_context_json" \
-                '.cargo_context = $context' <<< "$cargo_isolation_json") || return 4
+            cargo_isolation_json=$(_act_bind_cargo_isolation_field cargo_context \
+                "$cargo_isolation_json" "$strict_cargo_context_json") || return 4
         fi
         if [[ "$strict_windows_toolchain_json" != null ]]; then
-            cargo_isolation_json=$(jq --argjson toolchain "$strict_windows_toolchain_json" \
-                '.toolchain = $toolchain' <<< "$cargo_isolation_json") || return 4
+            cargo_isolation_json=$(_act_bind_cargo_isolation_field toolchain \
+                "$cargo_isolation_json" "$strict_windows_toolchain_json") || return 4
         fi
         if [[ "$strict_dependency_sources_json" != null ]]; then
-            cargo_isolation_json=$(jq --argjson sources "$strict_dependency_sources_json" \
-                '.dependency_sources = $sources' <<< "$cargo_isolation_json") || return 4
+            cargo_isolation_json=$(_act_bind_cargo_isolation_field dependency_sources \
+                "$cargo_isolation_json" "$strict_dependency_sources_json") || return 4
         fi
         if [[ -n "$strict_cache_root" ]]; then
             cargo_isolation_json=$(jq --arg root "$strict_cache_root" \
@@ -11516,11 +11569,11 @@ act_orchestrate_build() {
         status=$(jq -r '.status // "unknown"' <<< "$finished_result")
 
         if $state_available; then
-            extra=$(jq -nc --argjson result "$finished_result" --arg host "$host" \
+            extra=$(jq -nc --arg host "$host" \
                 --arg log_path "$log_path" --arg result_path "$result_path" \
                 --argjson attempts "$attempt" \
-                '{result: $result, host: $host, log_path: $log_path,
-                  result_path: $result_path, attempts: $attempts}')
+                'input as $result | {result: $result, host: $host, log_path: $log_path,
+                  result_path: $result_path, attempts: $attempts}' <<< "$finished_result") || return 4
             if [[ "$status" == "success" ]]; then
                 build_state_update_target "$tool_name" "$version" "$finished_target" \
                     "completed" "$extra" "$run_id" || return 4
@@ -11639,10 +11692,12 @@ act_orchestrate_build() {
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
                 final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 if $state_available; then
-                    if ! build_state_update_target "$tool_name" "$version" "$task_key" "completed" \
-                        "$(jq -nc --argjson result "${final_results[$task_key]}" \
-                            --argjson attempts "$prior_attempts" \
-                            '{result: $result, attempts: $attempts, reconciled_from_sidecar: true}')" \
+                    local reconciled_extra
+                    if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
+                            'input as $result | {result: $result, attempts: $attempts,
+                             reconciled_from_sidecar: true}' <<< "${final_results[$task_key]}") || \
+                       ! build_state_update_target "$tool_name" "$version" "$task_key" "completed" \
+                        "$reconciled_extra" \
                         "$run_id"; then
                         interrupted=true
                         break
@@ -11850,10 +11905,11 @@ act_orchestrate_build() {
     if [[ ${#results[@]} -eq 0 ]]; then
         results_json="[]"
     else
-        results_json=$(printf '%s\n' "${results[@]}" | jq -s '.' 2>/dev/null || echo '[]')
+        results_json=$(printf '%s\n' "${results[@]}" | jq -s '.') || return 4
     fi
 
-    jq -nc \
+    local summary_json
+    summary_json=$(jq -nc \
         --arg tool "$tool_name" \
         --arg version "$version" \
         --arg run_id "$run_id" \
@@ -11866,7 +11922,6 @@ act_orchestrate_build() {
         --argjson total "$((success_count + fail_count))" \
         --argjson success "$success_count" \
         --argjson failed "$fail_count" \
-        --argjson targets "$results_json" \
         --arg purpose "$build_purpose" \
         --argjson requested_targets "$requested_targets_json" \
         --argjson source_sync "${source_sync_json:-null}" \
@@ -11888,9 +11943,9 @@ act_orchestrate_build() {
                 total: $total,
                 success: $success,
                 failed: $failed
-            },
-            targets: $targets
-        }'
+            }
+        }') || return 4
+    _act_bind_orchestration_targets "$summary_json" "$results_json" || return 4
 
     return "$overall_exit_code"
 }
