@@ -392,16 +392,20 @@ _cs_clone_repo() {
 # the current branch when requested (also on an unchanged retry). No force.
 # Reject user edits to the target; unrelated staged work is never committed.
 # Args: repo_path checksums_content [--commit] [--push] [--checksums-file path]
+#       [--release-guard function] (internal audited-sync handoff)
 # stdout: one update receipt on success; failures retain checkout diagnostics.
 _cs_update_repo_checksums() (
     [[ $# -ge 2 ]] || return 4
-    local repo_path="$1" content="$2" commit=false push=false member=SHA256SUMS.txt
+    local repo_path="$1" content="$2" commit=false push=false member=SHA256SUMS.txt guard=''
     shift 2
     while (($#)); do
         case "$1" in
             --commit) commit=true; shift ;;
             --push) push=true; shift ;;
             --checksums-file) [[ $# -ge 2 && -n "$2" ]] || return 4; member="$2"; shift 2 ;;
+            --release-guard)
+                [[ $# -ge 2 && "$2" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 4
+                guard="$2"; declare -F "$guard" >/dev/null || return 4; shift 2 ;;
             *) return 4 ;;
         esac
     done
@@ -413,6 +417,20 @@ _cs_update_repo_checksums() (
     member=$(_cs_repo_member "$member") || return 4
     local top branch='' head='' stage cleanup normalized full_path parent cursor rest part tracked=false changed=false
     local publish_stage='' publish_cleanup
+    local committed=false pushed=false
+    # A failed gate after a local commit must retain its identity in the
+    # caller's result. An unpushed commit is not an empty/rolled-back outcome.
+    _cs_update_gate() {
+        local phase="$1" gate_rc=0
+        [[ -z "$guard" ]] || "$guard" "$phase" "$stage/manifest" || gate_rc=$?
+        ((gate_rc != 0)) || return 0
+        jq -nc --arg path "$repo_path" --arg file "$member" --arg sha "$head" --arg branch "$branch" \
+            --arg phase "$phase" --argjson changed "$changed" --argjson committed "$committed" \
+            --argjson pushed "$pushed" \
+            '{checkout:$path,checksums_file:$file,changed:$changed,committed:$committed,pushed:$pushed,
+              commit:(if $sha=="" then null else $sha end),branch:$branch,guard_failed:true,blocked_phase:$phase}' || return 1
+        return "$gate_rc"
+    }
     top=$(_cs_git -C "$repo_path" rev-parse --show-toplevel) || return 4
     [[ "$top" == "$repo_path" ]] || return 4
     if $commit; then
@@ -457,26 +475,31 @@ _cs_update_repo_checksums() (
         cp -- "$stage/manifest" "$publish_stage/manifest" || return 1
         cmp -s "$stage/manifest" "$publish_stage/manifest" || return 1
         chmod 644 "$publish_stage/manifest" || return 1
+        _cs_update_gate before-write || return $?
         mv -f -- "$publish_stage/manifest" "$full_path" || return 1
         changed=true
     fi
     if $commit && $changed; then
+        _cs_update_gate before-commit || return $?
         _cs_git -C "$repo_path" add -- "$member" || return 1
         # --only explicitly excludes unrelated staged changes. Do not suppress
         # commit failures (missing identity, rejected hooks, signing failures).
         _cs_git -C "$repo_path" commit --only -m "Update checksums" -- "$member" >&2 || return 1
         head=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 1
+        committed=true
     fi
     if $commit; then
         normalized=$(checksum_manifest_normalize "$stage/input") || return 1
         [[ "$(_cs_git -C "$repo_path" show "HEAD:$member")" == "$normalized" ]] || return 1
     fi
     if $push; then
+        _cs_update_gate before-push || return $?
         _cs_git -C "$repo_path" push --porcelain origin "HEAD:$branch" >&2 || return 8
+        pushed=true
     fi
     jq -nc --arg path "$repo_path" --arg file "$member" --arg sha "$head" --arg branch "$branch" \
-        --argjson changed "$changed" --argjson pushed "$push" \
-        '{checkout:$path,checksums_file:$file,changed:$changed,pushed:$pushed,
+        --argjson changed "$changed" --argjson pushed "$pushed" --argjson committed "$committed" \
+        '{checkout:$path,checksums_file:$file,changed:$changed,pushed:$pushed,committed:$committed,
           commit:(if $sha == "" then null else $sha end),branch:$branch}'
 )
 
@@ -554,6 +577,69 @@ _cs_admit_release_audit() {
     [[ "$(_cs_sha256 "$receipt")" == "$before" ]] || return 7
 }
 
+# Scoped only by checksum_sync, never supplied by environment or inferred from
+# downloaded paths. Inventory reads cannot be atomic with a later Git/HTTP write;
+# recheck at each effect and after delivery, stopping fan-out on any uncertainty.
+# The original audit already checked payload bytes. This gate rehashes its small
+# proof/selection/export files, not every binary once per downstream effect.
+_cs_sync_release_gate() (
+    local phase="$1" candidate="${2:-}" check_dir worker='' rc=0
+    [[ -n "${_CS_SYNC_AUDIT_PIN:-}" && -d "${_CS_SYNC_WORK:-}/freshness" ]] || return 7
+    check_dir=$(mktemp -d "$_CS_SYNC_WORK/freshness/check.XXXXXXXX") || return 1
+    _cs_gate_finish() {
+        local code=$?
+        trap - EXIT
+        [[ ! -L "$_CS_SYNC_WORK/freshness.jsonl" &&
+           ( ! -e "$_CS_SYNC_WORK/freshness.jsonl" || -f "$_CS_SYNC_WORK/freshness.jsonl" ) ]] || exit 1
+        jq -nc --arg phase "$phase" --arg repo "$_CS_SYNC_TARGET" --arg dir "$check_dir" --argjson code "$code" \
+            '{phase:$phase,destination:$repo,exit_code:$code,inventory_stable:($code==0),evidence_dir:$dir,
+              payloads_reverified:false}' >> "$_CS_SYNC_WORK/freshness.jsonl" || exit 1
+        exit "$code"
+    }
+    _cs_gate_cancel() {
+        trap '' HUP INT TERM
+        if [[ -n "$worker" ]]; then
+            kill -TERM "$worker" 2>/dev/null || true
+            wait "$worker" 2>/dev/null || true
+        fi
+        exit 5
+    }
+    trap _cs_gate_finish EXIT
+    trap _cs_gate_cancel HUP INT TERM
+    _cs_gate_local() {
+        [[ -z "$candidate" ]] || [[ "$(_cs_sha256 "$candidate")" == "$_CS_SYNC_MANIFEST_PIN" ]] || return 7
+        [[ "$(_cs_sha256 "$_CS_SYNC_AUDIT")" == "$_CS_SYNC_AUDIT_PIN" &&
+           "$(_cs_sha256 "$_CS_SYNC_WORK/audit/result.json")" == "$_CS_SYNC_AUDIT_PIN" &&
+           "$(_cs_sha256 "$_CS_SYNC_WORK/manifest")" == "$_CS_SYNC_MANIFEST_PIN" &&
+           "$(_cs_sha256 "$_CS_SYNC_WORK/audit/checksums.normalized")" == "$_CS_SYNC_MANIFEST_PIN" ]] || return 7
+        _cs_admit_release_audit "$_CS_SYNC_AUDIT" "$_CS_SYNC_WORK/audit" \
+            "$_CS_SYNC_REPO" "$_CS_SYNC_TAG" "$_CS_SYNC_METADATA" "$_CS_SYNC_MODE" "$_CS_SYNC_ASSET" || return 7
+    }
+    _cs_gate_local || return $?
+    bash "$_CS_SYNC_MODULE/release_checksums.sh" --repo "$_CS_SYNC_REPO" --tag "$_CS_SYNC_TAG" \
+        --release-id "$_CS_SYNC_RELEASE_ID" --recheck-from "$_CS_SYNC_WORK/audit" \
+        --audit-sha256 "$_CS_SYNC_AUDIT_PIN" --output-dir "$check_dir/evidence" \
+        "${_CS_SYNC_RECHECK_ARGS[@]}" > "$check_dir/result.json" 2> "$check_dir/diagnostics" &
+    worker=$!
+    wait "$worker" || rc=$?
+    worker=''
+    ((rc == 0)) || return "$rc"
+    [[ ! -L "$check_dir/result.json" && ! -L "$check_dir/evidence/result.json" ]] || return 7
+    cmp -s "$check_dir/result.json" "$check_dir/evidence/result.json" || return 7
+    jq -es --slurpfile audit "$_CS_SYNC_AUDIT" --arg pin "$_CS_SYNC_AUDIT_PIN" \
+        --arg root "$_CS_SYNC_WORK/audit" --arg output "$check_dir/evidence" '
+        length==1 and ($audit|length)==1 and (.[0]|
+          .kind=="dsr-release-checksum-inventory-check" and .status=="unchanged" and .exit_code==0 and
+          .verification_policy=="unchanged-audited-release-inventory" and .inventory_stable==true and
+          .payloads_reverified==false and .authenticated==false and .source_verified==false and
+          .audit_sha256==$pin and .audited_output_dir==$root and .output_dir==$output and
+          .selection_sha256==$audit[0].selection_sha256 and .repository==$audit[0].repository and
+          .tag==$audit[0].tag and .release==$audit[0].release and .expected_release_id==$audit[0].release.id and
+          .checksum_mode==$audit[0].checksum_mode and .include_metadata==$audit[0].include_metadata)
+    ' "$check_dir/result.json" >/dev/null || return 7
+    _cs_gate_local
+)
+
 # Sync checksums to downstream repos after release
 # Usage: checksum_sync <tool> <version> [options]
 # Options:
@@ -570,6 +656,10 @@ checksum_sync() (
     local verify_release=false audit_receipt='' audit_worker='' audit_pin=''
     local audit_mode='aggregate' audit_asset='' audit_resume=''
     local -a audit_args=()
+    local _CS_SYNC_AUDIT_PIN='' _CS_SYNC_MANIFEST_PIN='' _CS_SYNC_WORK='' _CS_SYNC_AUDIT=''
+    local _CS_SYNC_REPO='' _CS_SYNC_TAG='' _CS_SYNC_METADATA='' _CS_SYNC_MODE='' _CS_SYNC_ASSET=''
+    local _CS_SYNC_MODULE='' _CS_SYNC_RELEASE_ID='' _CS_SYNC_TARGET=''
+    local -a _CS_SYNC_RECHECK_ARGS=()
     local start_time=$SECONDS synced=0 failed=0 planned=0 issues_opened=0
     local -a target_repos=() results=()
     for arg in "$@"; do [[ "$arg" != --json ]] || json=true; done
@@ -581,6 +671,7 @@ checksum_sync() (
     _cs_sync_finish() {
         local code=$? overall=success entries
         local -a audit_json=(--argjson audit '[null]')
+        local -a freshness_json=(--argjson freshness '[]')
         trap - EXIT
         if ((code != 0)); then
             overall=error
@@ -588,7 +679,15 @@ checksum_sync() (
             [[ -n "$error" ]] || error="Checksum sync failed (exit $code)"
         fi
         entries=$(printf '%s\n' "${results[@]}" | jq -s '.') || exit 1
-        [[ -z "$audit_receipt" ]] || audit_json=(--slurpfile audit "$audit_receipt")
+        if ((code != 0)) && jq -e 'any(.[];.changed==true or .pushed==true or .committed==true)' <<< "$entries" >/dev/null; then
+            overall=partial
+        fi
+        if [[ -n "$audit_receipt" && -f "$audit_receipt" && ! -L "$audit_receipt" ]] &&
+           { [[ -z "$audit_pin" ]] || [[ "$(_cs_sha256 "$audit_receipt")" == "$audit_pin" ]]; } &&
+           jq -es 'length==1 and (.[0]|type=="object")' "$audit_receipt" >/dev/null 2>&1; then
+            audit_json=(--slurpfile audit "$audit_receipt")
+        fi
+        [[ -z "$workspace" || ! -f "$workspace/freshness.jsonl" ]] || freshness_json=(--slurpfile freshness "$workspace/freshness.jsonl")
         if $json; then
             jq -nc --arg status "$overall" --argjson code "$code" --arg tool "$tool_name" \
                 --arg version "$tag" --arg repo "$repo" --arg workspace "$workspace" --arg error "$error" \
@@ -596,11 +695,19 @@ checksum_sync() (
                 --argjson duration "$((SECONDS - start_time))" --argjson results "$entries" \
                 --argjson synced "$synced" --argjson failed "$failed" --argjson planned "$planned" \
                 --argjson issues "$issues_opened" --argjson dry_run "$dry_run" \
-                "${audit_json[@]}" \
+                --argjson verified_release "$verify_release" --arg audit_pin "$audit_pin" \
+                "${audit_json[@]}" "${freshness_json[@]}" \
                 '{status:$status,exit_code:$code,tool:$tool,version:$version,repository:$repo,
                   workspace:(if $workspace == "" then null else $workspace end),dry_run:$dry_run,
                   source:{kind:$source,asset:$asset,manifest_sha256:$digest},
                   release_verification:$audit[0],
+                  release_verification_sha256:(if $audit_pin=="" then null else $audit_pin end),
+                  release_freshness:{requested:$verified_release,
+                    status:(if ($verified_release|not) then "not-requested"
+                      elif $code==0 and ($freshness|length)>0 and all($freshness[];.exit_code==0)
+                      then "unchanged" else "stale-or-unconfirmed" end),
+                    inventory_stable:($verified_release and $code==0 and ($freshness|length)>0 and all($freshness[];.exit_code==0)),
+                    payloads_reverified:false,checks:$freshness},
                   error:(if $error == "" then null else $error end),duration_seconds:$duration,
                   synced:$synced,failed:$failed,planned:$planned,issues_opened:$issues,results:$results}' || exit 1
         fi
@@ -648,6 +755,7 @@ checksum_sync() (
                     --audit-resume-from) audit_resume="$2" ;;
                 esac
                 option="${1/--audit-/--}"
+                [[ "$option" == --resume-from ]] || _CS_SYNC_RECHECK_ARGS+=("$option" "$2")
                 audit_args+=("$option" "$2"); shift 2 ;;
             --help|-h)
                 cat >&2 <<'EOF'
@@ -744,6 +852,7 @@ EOF
         local module_dir audit_status=0 audited_manifest_sha
         module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
         $metadata && audit_args+=(--include-metadata)
+        $metadata && _CS_SYNC_RECHECK_ARGS+=(--include-metadata)
         # The child owns its network process group. Keep the PID only in this
         # invocation so cancellation never signals anything restored from disk.
         bash "$module_dir/release_checksums.sh" --repo "$repo" --tag "$tag" \
@@ -802,12 +911,27 @@ EOF
     if $verify_release && [[ "$manifest_sha" != "$audited_manifest_sha" ]]; then
         error='Audited checksum manifest changed during selection'; return 7
     fi
+    if $verify_release; then
+        _CS_SYNC_AUDIT_PIN="$audit_pin"; _CS_SYNC_MANIFEST_PIN="$manifest_sha"
+        _CS_SYNC_WORK="$workspace"; _CS_SYNC_AUDIT="$audit_receipt"
+        _CS_SYNC_REPO="$repo"; _CS_SYNC_TAG="$tag"; _CS_SYNC_METADATA="$metadata"
+        _CS_SYNC_MODE="$audit_mode"; _CS_SYNC_ASSET="$audit_asset"; _CS_SYNC_MODULE="$module_dir"
+        _CS_SYNC_RELEASE_ID=$(jq -er '.release.id' "$audit_receipt") || return 7
+        mkdir "$workspace/freshness" || return 1
+    fi
     local index=0 checkout receipt rc action entry issue_url body
     for target in "${unique_targets[@]}"; do
         index=$((index + 1)); rc=0; receipt='{}'; checkout=''; action=update
-        if $verify_release && { [[ "$(_cs_sha256 "$audit_receipt")" != "$audit_pin" ]] ||
-                               [[ "$(_cs_sha256 "$workspace/manifest")" != "$manifest_sha" ]]; }; then
-            error='Audited checksum selection changed before downstream update'; return 7
+        _CS_SYNC_TARGET="$target"
+        if $verify_release; then
+            _cs_sync_release_gate before-target || rc=$?
+            if ((rc != 0)); then
+                error='Release freshness could not be confirmed before downstream update'
+                entry=$(jq -nc --arg repo "$target" --argjson code "$rc" \
+                    '{repo:$repo,action:"blocked",status:"error",exit_code:$code,checkout:null,blocked_phase:"before-target"}') || return 1
+                results+=("$entry"); failed=$((failed + 1))
+                return "$rc"
+            fi
         fi
         if $dry_run; then
             action=planned; planned=$((planned + 1))
@@ -817,11 +941,16 @@ EOF
             body=$(printf '## Checksum review: %s %s\n\nManifest SHA256: `%s`\n\nSource: %s\n\nValidate against the official release before accepting.\n\n```text\n%s\n```\n' \
                 "$tool_name" "$tag" "$manifest_sha" "$source_kind" "$content") || return 1
             if ! command -v gh >/dev/null; then rc=3
-            elif issue_url=$(GH_HOST=github.com gh issue create --repo "$target" \
-                --title "Security Review: Update checksums for $tool_name $tag" --body "$body" 2> "$workspace/target-$index.log"); then
-                receipt=$(jq -nc --arg url "$issue_url" '{issue_url:$url}') || return 1
-                issues_opened=$((issues_opened + 1))
-            else rc=$?; fi
+            else
+                if $verify_release; then _cs_sync_release_gate before-issue || rc=$?; fi
+                if ((rc == 0)); then
+                    if issue_url=$(GH_HOST=github.com gh issue create --repo "$target" \
+                        --title "Security Review: Update checksums for $tool_name $tag" --body "$body" 2> "$workspace/target-$index.log"); then
+                        receipt=$(jq -nc --arg url "$issue_url" '{issue_url:$url}') || return 1
+                        issues_opened=$((issues_opened + 1))
+                    else rc=$?; fi
+                fi
+            fi
         else
             checkout="$workspace/target-$index"
             if ! _cs_clone_repo "$target" "$checkout" > "$workspace/target-$index.path" 2> "$workspace/target-$index.log"; then
@@ -829,12 +958,17 @@ EOF
             else
                 local -a update_args=(--commit --checksums-file "$checksums_file")
                 $push_changes && update_args+=(--push)
+                $verify_release && update_args+=(--release-guard _cs_sync_release_gate)
                 receipt=$(_cs_update_repo_checksums "$checkout" "$content" "${update_args[@]}" 2>> "$workspace/target-$index.log") || rc=$?
                 ((rc != 0)) || synced=$((synced + 1))
             fi
         fi
+        if $verify_release && ((rc == 0)); then
+            _cs_sync_release_gate after-target || rc=$?
+        fi
         if ((rc != 0)); then
-            failed=$((failed + 1)); receipt='{}'
+            failed=$((failed + 1))
+            jq -es 'length==1 and (.[0]|type=="object")' <<< "$receipt" >/dev/null 2>&1 || receipt='{}'
             _cs_log_error "$action failed for $target (exit $rc); checkout/logs retained"
         fi
         entry=$(jq -nc --arg repo "$target" --arg action "$action" --arg path "$checkout" \
@@ -842,6 +976,10 @@ EOF
             '{repo:$repo,action:$action,status:(if $code == 0 then "success" else "error" end),
               exit_code:$code,checkout:(if $path == "" then null else $path end)} + $receipt') || return 1
         results+=("$entry")
+        if $verify_release && ((rc != 0)); then
+            error='Audited downstream update failed; later destinations were not attempted'
+            return "$rc"
+        fi
     done
     _cs_log_info "Checksum sync: $synced updated, $issues_opened review issues, $planned planned, $failed failed"
     ((failed == 0)) || { error='One or more downstream updates failed'; return 1; }

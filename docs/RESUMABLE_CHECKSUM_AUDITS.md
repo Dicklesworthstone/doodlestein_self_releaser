@@ -214,3 +214,70 @@ legacy manifest/repair command are explicit file-backed fixtures; these tests do
 not establish live GitHub/curl behavior or full original `dsr` startup. Set
 `DSR_TEST_VERIFY_MODULE` to an unchanged supervisor to run the same counterexamples
 against the incumbent rather than weakening the corrected expectations.
+
+## Guard audited downstream writes
+
+`checksum_sync ... --verify-release` now applies the same pinned inventory
+recheck to downstream synchronization, not just the release verification CLI.
+No extra opt-in is needed:
+
+```bash
+bash src/checksum_sync.sh sync tool 1.2.3 --repo owner/tool \
+  --verify-release --checksum-mode sidecars \
+  --target-repo owner/installers --target-repo owner/checksums --push --json
+```
+
+After the full audit and local payload handoff, synchronization checks the exact
+release context and complete remote asset inventory before each destination,
+immediately before replacing its checksum file, before committing, before
+pushing, and after that destination completes. Review-issue delivery is checked
+before its request and afterward. An unchanged local-commit retry still checks
+before pushing. All rechecks pin the newly completed audit, including when that
+audit reused payloads from `--audit-resume-from`; the old resume source is never
+mistaken for the current audit.
+
+Same-name payload replacement, changed sidecar/signature IDs, size/digest drift,
+changed release mode, failed reads, and changed retained checksum proofs or
+exports stop the audited fan-out. A failure during clone or another downstream
+operation also stops later audited destinations. The unaudited local-manifest
+and local-artifact routes retain their previous behavior and do not acquire a
+remote freshness guarantee.
+
+These checks do not download payloads or checksum files again, or rehash all
+large local payloads once per Git operation. The initial full audit already did
+that work. Each later gate hashes the selected audit, checksum proofs and export,
+binds the actual staged checksum manifest when writing a repository, and uses
+the auditor's inventory-only mode. A one-page inventory requires four metadata
+reads per gate; more pages add inventory requests. The configured audit time
+limits still apply to each acquisition. This is additional network work, not a
+performance-speedup claim.
+
+The original `release_verification` remains the historical full-audit receipt.
+`release_verification_sha256` pins that receipt, while `release_freshness`
+separately reports the current handoff result, `inventory_stable`, and the ordered
+per-boundary checks with their retained evidence directories. A failed or
+interrupted handoff is `stale-or-unconfirmed`, never a fresh success merely
+because the historical audit was green. If the historical receipt itself was
+changed, it is not embedded as trusted evidence in the final result.
+
+A block after a successful local commit retains the checkout, commit SHA,
+`committed: true`, `pushed: false`, and `blocked_phase: before-push`. A change
+observed after a completed push or review issue returns nonzero **partial**
+status while retaining the already-completed effect in the per-target result.
+No commit is discarded, no branch is reset, no push is forced, and no release,
+asset or issue is removed. Inspect retained partial work before retrying; this
+is not an outbox or exactly-once delivery facility, and an ordinary new invocation
+may repeat an earlier successful issue request.
+
+Remote reads and a subsequent Git/HTTP write cannot form an atomic transaction.
+A change inside a Git hook or during transport may be detected only by the next
+gate; already-completed writes are not rolled back. The trusted private-storage
+and unauthenticated-checksum boundaries remain unchanged. Cancellation of the
+public sync process is forwarded to its owned inventory-recheck transport.
+
+Run `bash scripts/tests/test_checksum_sync_freshness.sh` for the complete sync
+module and auditor regression. It uses genuine Git cloning, commits and pushes
+to new, retained local bare repositories. Git hooks change a file-backed release
+inventory during actual Git stages. Only GitHub HTTP/authentication and issue
+creation are transport fixtures. It is not live GitHub, full root-CLI startup,
+native build, or publisher-signature qualification.
