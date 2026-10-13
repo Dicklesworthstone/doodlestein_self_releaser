@@ -8140,6 +8140,15 @@ if mode == 'record':
         with os.fdopen(fd, 'wb') as stream:
             stream.write(data)
             stream.flush()
+            # Do not authorize the compiler with an observation that exists
+            # only in userspace/kernel writeback. Keep the receipt fd held
+            # through file and directory sync, then recheck its named inode.
+            os.fsync(stream.fileno())
+            parent_fd = os.open(str(pathlib.Path(output).parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
             held = os.fstat(stream.fileno())
             receipt_info(held)
             if receipt_identity(held) != receipt_identity(os.stat(output, follow_symlinks=False)):

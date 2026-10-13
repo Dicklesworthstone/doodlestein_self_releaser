@@ -206,6 +206,29 @@ def expected_tool(data, name, expected):
 
 command = 'cargo +fixture-selected build --quiet --offline --target ' + shlex.quote(host)
 before, identity, receipt = probe(command)
+if before.returncode == 0:
+    held = receipt.stat(follow_symlinks=False)
+    held_bytes = receipt.read_bytes()
+    held_identity = ':'.join(str(value) for value in (
+        held.st_dev, held.st_ino, held.st_mode, held.st_nlink, held.st_uid,
+        held.st_gid, held.st_size, held.st_mtime_ns, held.st_ctime_ns))
+    check('published pre-build pin binds exact retained receipt bytes and inode',
+          receipt_pins[str(receipt)] == {
+              'sha256': hashlib.sha256(held_bytes).hexdigest(), 'identity': held_identity})
+    duplicate, _, _ = probe(command, receipt=receipt)
+    current = receipt.stat(follow_symlinks=False)
+    current_identity = ':'.join(str(value) for value in (
+        current.st_dev, current.st_ino, current.st_mode, current.st_nlink,
+        current.st_uid, current.st_gid, current.st_size, current.st_mtime_ns,
+        current.st_ctime_ns))
+    check('repeated recording refuses without replacing the original receipt or pin',
+          duplicate.returncode != 0 and not duplicate.stdout and
+          receipt.read_bytes() == held_bytes and
+          current_identity == held_identity and
+          receipt_pins[str(receipt)]['identity'] == held_identity)
+else:
+    check('published pre-build pin binds exact retained receipt bytes and inode', False)
+    check('repeated recording refuses without replacing the original receipt or pin', False)
 compiled = build(command)
 check('explicit +toolchain builds and runs with genuine Cargo/rustc',
       compiled.returncode == 0 and require([project / 'target' / host / 'debug/identity-probe']) == '42')
