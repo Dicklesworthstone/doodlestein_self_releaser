@@ -39,6 +39,9 @@ class Failure(Exception):
         super().__init__(message)
         self.code = code
 
+class InventoryChecked(Exception):
+    """Finish the inventory-only path through the shared receipt publisher."""
+
 def require(condition, message, code=1):
     if not condition:
         raise Failure(message, code)
@@ -307,8 +310,8 @@ def read_resume(selected):
     discarded_tail = 0
     if terminal:
         prior = values['result.json']
-        require(isinstance(prior, dict) and prior.get('kind') == report['kind'] and
-                prior.get('verification_policy') == report['verification_policy'] and
+        require(isinstance(prior, dict) and prior.get('kind') == 'dsr-release-checksum-verification' and
+                prior.get('verification_policy') == 'sha256-all-eligible-release-assets' and
                 type(prior.get('exit_code')) is int and 0 <= prior['exit_code'] <= 8 and
                 prior.get('status') == ('verified' if prior['exit_code'] == 0 else 'error') and
                 all(prior.get(key) == selection.get(key) for key in
@@ -437,6 +440,8 @@ try:
                         help='aggregate (default), or require an exact .sha256 sidecar for every payload; present conventional aggregates must also agree')
     parser.add_argument('--output-dir', help='New directory for retained downloads and the audit receipt')
     parser.add_argument('--resume-from', help='Reuse rehashed verified payloads from an unchanged prior audit; writes only a new output directory and reacquires all checksum evidence')
+    parser.add_argument('--recheck-from', help='Recheck only the remote inventory of a completed audit; requires --audit-sha256 and never claims a new payload verification')
+    parser.add_argument('--audit-sha256', help='Independently held SHA256 of the completed result.json selected by --recheck-from')
     parser.add_argument('--include-metadata', action='store_true', help='Also require checksums for SBOM/provenance/build metadata (not signatures or checksums)')
     parser.add_argument('--timeout', type=int, default=120, help='Seconds per bounded network/parser operation (default: 120)')
     parser.add_argument('--max-asset-bytes', type=int, default=2 * 1024**3)
@@ -444,6 +449,18 @@ try:
     flags = [value.split('=', 1)[0] for value in sys.argv[2:] if value.startswith('--')]
     require(len(flags) == len(set(flags)), 'Duplicate audit option', 4)
     args = parser.parse_args(sys.argv[2:])
+    recheck = args.recheck_from is not None
+    if recheck or args.audit_sha256 is not None:
+        # This result is deliberately NOT a checksum-verification receipt.
+        # Consumers must retain and admit the original payload evidence too.
+        report = dict(kind='dsr-release-checksum-inventory-check', status='error', exit_code=1,
+                      authenticated=False, source_verified=False, inventory_stable=False,
+                      verification_policy='unchanged-audited-release-inventory',
+                      payloads_reverified=False, checksum_errors=[], coverage_errors=[])
+    require(recheck == (args.audit_sha256 is not None), '--recheck-from and --audit-sha256 are required together', 4)
+    require(not recheck or args.resume_from is None, 'Inventory recheck cannot also resume an audit', 4)
+    require(not recheck or re.fullmatch(r'[0-9a-f]{64}', args.audit_sha256) is not None,
+            'Invalid completed audit SHA256', 4)
     require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', args.repo) is not None and '..' not in args.repo,
             'Invalid repository name', 4)
     require(re.fullmatch(r'v?[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?', args.tag) is not None,
@@ -459,6 +476,24 @@ try:
     require_curl()
     if args.resume_from is not None:
         resume = read_resume(args.resume_from)
+    if recheck:
+        resume = read_resume(args.recheck_from)
+        require(resume['terminal'] and resume['pins'].get('result.json') == args.audit_sha256,
+                'Inventory recheck requires the exact pinned completed audit', 4)
+        prior = read_json(resume['root'] / 'result.json')
+        require(digest(resume['root'] / 'result.json') == args.audit_sha256,
+                'Completed audit changed while selecting inventory', 4)
+        eligible_names = [row['name'] for row in resume['selection']['assets']
+                          if metadata_kind(row['name'], args.checksum_asset) is None or
+                          args.include_metadata and metadata_kind(row['name'], args.checksum_asset)
+                          in ('provenance-or-sbom', 'release-metadata')]
+        require(prior['exit_code'] == 0 and prior['status'] == 'verified' and
+                prior.get('inventory_stable') is True and integer(prior.get('eligible_count'), 1) and
+                prior['eligible_count'] == prior['verified_count'] == len(eligible_names) and
+                prior.get('eligible_assets') == prior['verified_checksums'] == eligible_names and
+                prior.get('checksum_errors') == [] and prior.get('coverage_errors') == [],
+                'Inventory recheck requires complete successful checksum coverage', 4)
+        report.update(audit_sha256=args.audit_sha256, audited_output_dir=str(resume['root']))
     if args.preflight:
         # A repair caller can reject impossible policy/dependencies before its
         # first remote mutation. This is not release or credential validation.
@@ -474,7 +509,9 @@ try:
     token = token_for_request()
     os.umask(0o077)
     work = owned_output(args.output_dir)
-    (work / 'requests').mkdir(); (work / 'artifacts').mkdir(); (work / 'evidence').mkdir()
+    (work / 'requests').mkdir()
+    if not recheck:
+        (work / 'artifacts').mkdir(); (work / 'evidence').mkdir()
     report.update(repository=args.repo, tag=args.tag, output_dir=str(work), include_metadata=args.include_metadata,
                   checksum_mode=args.checksum_mode)
     context = release_context()
@@ -489,6 +526,7 @@ try:
                      include_metadata=args.include_metadata)
     if resume is not None:
         require(selection == resume['selection'], 'Release identity, asset inventory or policy changed since retained audit')
+    if resume is not None and not recheck:
         report['resume'] = dict(source=str(resume['root']), source_result_sha256=resume['pins'].get('result.json'),
                                 source_selection_sha256=resume['pins']['selection.json'],
                                 reused_checksums=[], reused_count=0, reused_bytes=0)
@@ -499,6 +537,19 @@ try:
     with (work / 'selection.json').open('xb') as out:
         out.write(canonical(selection))
     report['selection_sha256'] = digest(work / 'selection.json')
+    if recheck:
+        # Reuse the exact same bounded, authenticated, paginated transport as
+        # the audit. Check every asset, including excluded signatures/metadata,
+        # without downloading/copying payloads or trusting their names alone.
+        require(inventory(context['id']) == assets and release_context() == context,
+                'Release identity or asset inventory changed during inventory recheck')
+        require(digest(work / 'selection.json') == report['selection_sha256'] == resume['pins']['selection.json'],
+                'Inventory recheck selection differs from the pinned audit')
+        resume_unchanged()
+        report.update(status='unchanged', exit_code=0, inventory_stable=True)
+        # Do not sys.exit here: a failure to publish result.json must still
+        # change the process exit below, rather than escape via SystemExit(0).
+        raise InventoryChecked()
     checkpoint_append(checkpoint_header(report['selection_sha256']), initial=True)
     by_name = {row['name']: row for row in assets}
     checksum_names = ([args.checksum_asset] if args.checksum_asset else
@@ -599,6 +650,8 @@ try:
     report.update(status='verified', exit_code=0, inventory_stable=True,
                   normalized_manifest=str(work / 'checksums.normalized'),
                   normalized_manifest_sha256=digest(work / 'checksums.normalized'))
+except InventoryChecked:
+    pass
 except (Failure, OSError, ValueError, UnicodeError, TypeError, KeyError) as error:
     report.update(status='error', exit_code=getattr(error, 'code', 1), error=str(error), inventory_stable=False)
     if not report['checksum_errors'] and not report['coverage_errors']:
