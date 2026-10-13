@@ -17,6 +17,16 @@ binary_name: example-tool
 build_cmd: cargo build --release
 build_profile: release
 
+# GNU Rust targets keep a plain target identity; the glibc floor is separate.
+# For example: cargo build --release --target x86_64-unknown-linux-gnu
+# with linux_glibc_floor: "2.28" lets DSR apply its cargo-zigbuild floor.
+# Do NOT write --target x86_64-unknown-linux-gnu.2.28 in build_cmd, or put
+# that suffixed spelling in target_triples, cross_compile.target or target env
+# variables. Configuration admission refuses these before native compilation
+# (GH #37); it does not rewrite saved compiler receipts to admit them later.
+# The same floor option can be set under cross_compile.<platform>.
+# linux_glibc_floor: "2.28"
+
 # Target platforms
 targets:
   - linux/amd64
