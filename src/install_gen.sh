@@ -3,7 +3,7 @@
 #
 # Usage:
 #   source install_gen.sh
-#   install_gen_create <tool>           # Generate install.sh for a tool
+#   install_gen_create <tool> [--config-dir DIR] # Generate from selected config
 #   install_gen_all                     # Generate for all tools in repos.d
 #   install_gen_validate <tool>         # Validate generated script
 #
@@ -102,9 +102,9 @@ _install_gen_template() {
 set -uo pipefail
 
 # Configuration
-TOOL_NAME="__TOOL_NAME__"
-REPO="__REPO__"
-BINARY_NAME="__BINARY_NAME__"
+TOOL_NAME='__TOOL_NAME__'
+REPO='__REPO__'
+BINARY_NAME='__BINARY_NAME__'
 ARCHIVE_FORMAT_LINUX="__ARCHIVE_FORMAT_LINUX__"
 ARCHIVE_FORMAT_DARWIN="__ARCHIVE_FORMAT_DARWIN__"
 ARCHIVE_FORMAT_WINDOWS="__ARCHIVE_FORMAT_WINDOWS__"
@@ -1197,7 +1197,6 @@ _install_skill_archive_to_dir() {
         _log_warn "Embedded skill archive is missing SKILL.md"
         return 1
     fi
-
     mkdir -p "$skill_dir"
     if ! cp -R "$stage_dir/." "$skill_dir/" 2>/dev/null; then
         rm -rf "$stage_dir" 2>/dev/null || true
@@ -1737,13 +1736,115 @@ TEMPLATE_START
 # GENERATOR FUNCTIONS
 # ============================================================================
 
-# Load tool config from repos.d
+# Identities become path components and shell literals. Admit them before any
+# configuration lookup or rendering (GH #35), not in the generated main().
+# Reserve template markers too: a later replacement must not reinterpret an
+# otherwise safe name such as app__SOURCE_BUILD_ENGINE__ as another placeholder.
+_install_gen_name() {
+    local LC_ALL=C
+    [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$ && "$1" != *..* &&
+       ! "$1" =~ __[A-Z][A-Z0-9_]*__ ]]
+}
+
+_install_gen_repo() {
+    local LC_ALL=C
+    [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ &&
+       "$1" != *..* && ! "$1" =~ __[A-Z][A-Z0-9_]*__ ]]
+}
+
+# Emit one validated tool/repository/binary tuple. The full parser preserves
+# types and control bytes until validation; command substitution cannot hide
+# a trailing newline in an identity. Missing/null/empty optional names retain
+# their established defaults. Invalid parser output never selects a default.
+_install_gen_identities() {
+    local file="$1" requested="$2" identities
+    _install_gen_name "$requested" || return 4
+    if command -v yq >/dev/null; then
+        command -v jq >/dev/null || { log_error 'jq is required to validate installer identities'; return 3; }
+        # Entries preserve duplicate top-level YAML keys for rejection instead
+        # of allowing a JSON object's last key to silently decide the identity.
+        if ! identities=$(yq -o=json -I=0 'to_entries' "$file" 2>/dev/null | jq -ers --arg requested "$requested" '
+            def marker: test("__[A-Z][A-Z0-9_]*__");
+            def name: type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$") and
+                (test("[^A-Za-z0-9._+-]")|not) and (contains("..")|not) and (marker|not);
+            def repo: type=="string" and
+                test("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$") and
+                (test("[^A-Za-z0-9_./-]")|not) and (contains("..")|not) and (marker|not);
+            def default($value): if .==null or .=="" then $value else . end;
+            if length!=1 or (.[0]|type!="array" or
+                (all(.[];type=="object" and (.key|type=="string"))|not) or
+                (map(.key)|unique|length)!=length)
+            then error("expected one unambiguous configuration mapping") else .[0]|from_entries end |
+            (.tool_name|default($requested)) as $tool |
+            (.binary_name|default($tool)) as $binary |
+            if ($tool|name) and (.repo|repo) and ($binary|name)
+            then [$tool,.repo,$binary]|@tsv else error("invalid installer identity") end
+        ' 2>/dev/null); then
+            log_error 'Invalid installer identities or ambiguous repository configuration'
+            return 4
+        fi
+        printf '%s\n' "$identities"
+        return 0
+    fi
+
+    # Dependency-free support is deliberately limited to simple block YAML:
+    # plain or quoted one-line scalar identities, not aliases/flow documents.
+    # Complex syntax requires yq; never guess identities from unparsed YAML.
+    local line key value quoted tool="$requested" repo='' binary=''
+    local seen_tool=false seen_repo=false seen_binary=false content=false ended=false
+    LC_ALL=C tr -d '\000' < "$file" | cmp -s - "$file" || return 4
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -n "$line" && "$line" != \#* ]] || continue
+        [[ "$line" == *[![:blank:]]* ]] || continue
+        if [[ "$line" == '---' && "$content" == false && "$ended" == false ]]; then
+            content=true; continue
+        fi
+        if [[ "$line" == '...' && "$ended" == false ]]; then ended=true; continue; fi
+        if $ended || [[ ! "$line" =~ ^[[:blank:]] && ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*: ]]; then
+            log_error 'yq is required for complex installer identity configuration'; return 3
+        fi
+        content=true
+        [[ ! "$line" =~ ^[[:blank:]] ]] || continue
+        key="${line%%:*}"
+        case "$key" in tool_name|repo|binary_name) ;; *) continue ;; esac
+        value="${line#*:}"
+        value="${value#"${value%%[!$' \t']*}"}"
+        value="${value%%[[:blank:]]\#*}"
+        value="${value%"${value##*[!$' \t']}"}"
+        quoted=false
+        case "$value" in
+            \"*\") value="${value:1:${#value}-2}"; quoted=true ;;
+            \'*\') value="${value:1:${#value}-2}"; quoted=true ;;
+        esac
+        if ! $quoted; then
+            case "$value" in null|~) value='' ;; true|false|True|False|TRUE|FALSE) return 4 ;; esac
+            [[ ! "$value" =~ ^[0-9]+$ ]] || return 4
+        fi
+        case "$key" in
+            tool_name) $seen_tool && { log_error 'Duplicate tool_name'; return 4; }; seen_tool=true; tool="$value" ;;
+            repo) $seen_repo && { log_error 'Duplicate repo'; return 4; }; seen_repo=true; repo="$value" ;;
+            binary_name) $seen_binary && { log_error 'Duplicate binary_name'; return 4; }; seen_binary=true; binary="$value" ;;
+        esac
+    done < "$file"
+    tool="${tool:-$requested}"; binary="${binary:-$tool}"
+    _install_gen_name "$tool" && _install_gen_repo "$repo" && _install_gen_name "$binary" || {
+        log_error 'Invalid installer identities (tool_name, repo or binary_name)'; return 4;
+    }
+    printf '%s\t%s\t%s\n' "$tool" "$repo" "$binary"
+}
+
+# Load tool config from repos.d. An explicit root never falls back to PWD or
+# the user's registry. The selected pathname is logged by the caller.
 _install_gen_load_config() {
     local tool_name="$1"
-    local config_file=""
+    local config_file="" selected_root="${2:-}"
+    _install_gen_name "$tool_name" || { log_error 'Invalid installer tool identifier'; return 4; }
 
     # Check local config first, then user config
-    if [[ -f "./config/repos.d/${tool_name}.yaml" ]]; then
+    if [[ -n "$selected_root" ]]; then
+        config_file="$selected_root/repos.d/${tool_name}.yaml"
+    elif [[ -f "./config/repos.d/${tool_name}.yaml" ]]; then
         config_file="./config/repos.d/${tool_name}.yaml"
     elif [[ -f "$_IG_REPOS_D/${tool_name}.yaml" ]]; then
         config_file="$_IG_REPOS_D/${tool_name}.yaml"
@@ -2030,15 +2131,20 @@ _install_gen_contract_model() (
 install_gen_create() {
     local tool_name="${1:-}"
 
-    if [[ -z "$tool_name" ]]; then
-        log_error "Tool name required"
-        log_info "Usage: install_gen_create <tool>"
+    if ! _install_gen_name "$tool_name"; then
+        log_error 'Invalid installer tool identifier'
+        log_info 'Usage: install_gen_create <tool> [--config-dir DIR]'
         return 4
+    fi
+    local selected_root=''
+    if [[ $# -ne 1 ]]; then
+        [[ $# -eq 3 && "$2" == --config-dir && -n "$3" && -d "$3" && "$3" != *[[:cntrl:]]* ]] || return 4
+        selected_root=$(CDPATH='' cd -- "$3" && pwd -P) || return 4
     fi
 
     # Load config
     local config_file
-    config_file=$(_install_gen_load_config "$tool_name") || return $?
+    config_file=$(_install_gen_load_config "$tool_name" "$selected_root") || return $?
     log_info "Loading config from: $config_file"
 
     # Extract values
@@ -2048,9 +2154,9 @@ install_gen_create() {
     local contract_model strict_release_contract=false contract_asset_cases=''
     local source_subdir source_entry source_package source_engine field value
 
-    tool_name=$(_install_gen_yaml_get "$config_file" "tool_name" "$tool_name")
-    repo=$(_install_gen_yaml_get "$config_file" "repo" "")
-    binary_name=$(_install_gen_yaml_get "$config_file" "binary_name" "$tool_name")
+    local identities
+    identities=$(_install_gen_identities "$config_file" "$tool_name") || return $?
+    IFS=$'\t' read -r tool_name repo binary_name <<< "$identities" || return 4
     language=$(_install_gen_yaml_get "$config_file" "language" "go")
     workflow_path=$(_install_gen_yaml_get "$config_file" "workflow" ".github/workflows/release.yml")
     local_path=$(_install_gen_yaml_get "$config_file" "local_path" "")
@@ -2407,8 +2513,8 @@ install_gen_all() {
 install_gen_validate() {
     local tool_name="${1:-}"
 
-    if [[ -z "$tool_name" ]]; then
-        log_error "Tool name required"
+    if ! _install_gen_name "$tool_name"; then
+        log_error 'Invalid installer tool identifier'
         return 4
     fi
 
