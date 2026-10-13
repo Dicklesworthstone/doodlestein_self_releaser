@@ -4712,12 +4712,16 @@ SH
 # on the build host cannot reach a running build (issue #15). Cargo may still
 # download missing dependencies into the private home. Prints the seed summary.
 _act_prepare_unix_nonstrict_cargo_home() {
-    local host="$1" isolation_root="$2" stage_root="$3" cargo_home="$4" command summary path
+    local host="$1" isolation_root="$2" stage_root="$3" cargo_home="$4" source_root="${5:-}" command summary path
     # Paths are embedded in single quotes below; build roots may contain spaces.
     for path in "$isolation_root" "$stage_root" "$cargo_home"; do
         [[ "$path" == /* && "$path" != *"'"* && "$path" != *..* &&
            "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 4
     done
+    if [[ -n "$source_root" ]]; then
+        [[ "$source_root" == /* && "$source_root" != *"'"* && "$source_root" != *..* &&
+           "$source_root" != *$'\n'* && "$source_root" != *$'\r'* ]] || return 4
+    fi
     [[ "$stage_root" == "${isolation_root%/}/dsr-build-"* &&
        "$cargo_home" == "$stage_root/"* ]] || return 4
     command=$'set -e\numask 077\n'
@@ -4736,7 +4740,19 @@ test ! -e '$stage_root'; test ! -L '$stage_root'
 mkdir '$stage_root'; test -d '$stage_root'; test ! -L '$stage_root'
 ambient_home=\${CARGO_HOME:-\$HOME/.cargo}
 if test ! -e "\$ambient_home" && test ! -L "\$ambient_home"; then ambient_home=; fi
-dsr_seed_summary=\$(_cargo_cache_run snapshot "\$ambient_home" '$cargo_home')
+dsr_lockfile=
+if test -n '$source_root'; then
+    test -d '$source_root'; test ! -L '$source_root'
+    if test -e '$source_root/Cargo.lock' || test -L '$source_root/Cargo.lock'; then
+        test -f '$source_root/Cargo.lock'; test ! -L '$source_root/Cargo.lock'
+        dsr_lockfile='$source_root/Cargo.lock'
+    fi
+fi
+if test -n "\$dsr_lockfile"; then
+    dsr_seed_summary=\$(_cargo_cache_run snapshot "\$ambient_home" '$cargo_home' "\$dsr_lockfile")
+else
+    dsr_seed_summary=\$(_cargo_cache_run snapshot "\$ambient_home" '$cargo_home')
+fi
 _dsr_cargo_home_guard '$cargo_home'
 printf '%s\\n' "\$dsr_seed_summary"
 EOF
@@ -9311,9 +9327,15 @@ EOF
             nonstrict_prepare=_act_prepare_windows_nonstrict_cargo_home
             nonstrict_prepare_root="$remote_path"
         fi
-        nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
-            "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>"$log_file") || \
-            nonstrict_prepare_status=$?
+        if _act_is_windows_host "$host"; then
+            nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
+                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" 2>"$log_file") || \
+                nonstrict_prepare_status=$?
+        else
+            nonstrict_cargo_seed_json=$("$nonstrict_prepare" "$host" \
+                "$nonstrict_prepare_root" "$nonstrict_stage_root" "$nonstrict_cargo_home" "$remote_path" 2>"$log_file") || \
+                nonstrict_prepare_status=$?
+        fi
         [[ -s "$log_file" ]] && cat "$log_file" >&2
         if [[ $nonstrict_prepare_status -eq 0 ]] && \
            nonstrict_seed_home=$(jq -er '.cargo_home' <<< "$nonstrict_cargo_seed_json") && \
