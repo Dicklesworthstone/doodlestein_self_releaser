@@ -33,11 +33,14 @@ DSR_SCHEMA_VERSION="1.0.0"
 # Loaded config values (associative array)
 declare -gA DSR_CONFIG
 
-# Optional Unix split-storage contract (#38). Strict snapshots and targets
-# live under build_root on its own filesystem; the root filesystem (system,
-# Cargo home) stays visible and, above the error percentage, is admitted only
-# as a warning while its free space meets root_min_free_bytes. Return 1 when
-# absent, 4 for any malformed contract.
+# Optional Unix split-storage contract (#38). The host's own `build_root` is
+# where every snapshot, isolated target and output stage lands (act_runner
+# defaults them to /var/tmp without it), so it is the volume the contract
+# admits; the contract itself carries only the root floor, never a second path.
+# The root filesystem (system, Cargo home) stays visible and, above the error
+# percentage, is admitted only as a warning while its free space meets
+# root_min_free_bytes. Emits {build_root, root_min_free_bytes}. Return 1 when
+# absent, 4 for any malformed contract, including a missing host build_root.
 config_unix_storage_json() {
     local host="$1" value hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
     [[ "$host" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || return 4
@@ -53,16 +56,16 @@ config_unix_storage_json() {
         esac
     fi
     value=$(DSR_STORAGE_HOST="$host" yq -o=json -I=0 \
-        '.hosts[strenv(DSR_STORAGE_HOST)].unix_storage' "$hosts_file") || return 4
-    [[ "$value" != null ]] || return 1
+        '.hosts[strenv(DSR_STORAGE_HOST)] | {"unix_storage": .unix_storage, "build_root": .build_root}' \
+        "$hosts_file") || return 4
+    [[ "$(jq -c '.unix_storage' <<< "$value" 2>/dev/null)" != null ]] || return 1
     jq -e '
-        type == "object" and
-        (keys | sort) == ["build_root", "root_min_free_bytes"] and
+        (.unix_storage | type == "object" and keys == ["root_min_free_bytes"] and
+            (.root_min_free_bytes | type == "number" and . == floor and . >= 1073741824)) and
         (.build_root | type == "string" and test("^/[A-Za-z0-9._/-]+$") and
-            (test("(^|/)\\.\\.?(/|$)") | not) and . != "/") and
-        (.root_min_free_bytes | type == "number" and . == floor and . >= 1073741824)
+            (test("(^|/)\\.\\.?(/|$)") | not) and (rtrimstr("/") != ""))
     ' <<< "$value" >/dev/null || return 4
-    jq -c . <<< "$value"
+    jq -c '{build_root: (.build_root | rtrimstr("/")), root_min_free_bytes: .unix_storage.root_min_free_bytes}' <<< "$value"
 }
 
 # Optional Windows split-storage contract. The source and private Cargo home

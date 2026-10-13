@@ -1268,30 +1268,43 @@ test_unix_storage_config_contract() {
 hosts:
   plain:
     platform: linux/amd64
+  rootonly:
+    platform: linux/amd64
+    build_root: /data/tmp
   good:
     platform: linux/amd64
+    build_root: /data/tmp
     unix_storage:
-      build_root: /data
       root_min_free_bytes: 21474836480
+  trailing:
+    build_root: /data/tmp/
+    unix_storage: {root_min_free_bytes: 21474836480}
+  nobuildroot:
+    unix_storage: {root_min_free_bytes: 21474836480}
   relative:
-    unix_storage: {build_root: data, root_min_free_bytes: 21474836480}
+    build_root: data
+    unix_storage: {root_min_free_bytes: 21474836480}
   dotdot:
-    unix_storage: {build_root: /data/../etc, root_min_free_bytes: 21474836480}
+    build_root: /data/../etc
+    unix_storage: {root_min_free_bytes: 21474836480}
   slash:
-    unix_storage: {build_root: /, root_min_free_bytes: 21474836480}
+    build_root: /
+    unix_storage: {root_min_free_bytes: 21474836480}
   quote:
-    unix_storage: {build_root: "/data'x", root_min_free_bytes: 21474836480}
+    build_root: "/data'x"
+    unix_storage: {root_min_free_bytes: 21474836480}
   tiny:
-    unix_storage: {build_root: /data, root_min_free_bytes: 1024}
-  missing:
-    unix_storage: {build_root: /data}
-  extra:
-    unix_storage: {build_root: /data, root_min_free_bytes: 21474836480, other: 1}
+    build_root: /data/tmp
+    unix_storage: {root_min_free_bytes: 1024}
+  secondpath:
+    build_root: /data/tmp
+    unix_storage: {build_root: /data, root_min_free_bytes: 21474836480}
   falsy:
+    build_root: /data/tmp
     unix_storage: false
 EOF
     local host expected
-    for host in plain:1 good:0 relative:4 dotdot:4 slash:4 quote:4 tiny:4 missing:4 extra:4 falsy:4; do
+    for host in plain:1 rootonly:1 good:0 trailing:0 nobuildroot:4 relative:4 dotdot:4 slash:4 quote:4 tiny:4 secondpath:4 falsy:4; do
         expected="${host#*:}"; host="${host%%:*}"
         ((TESTS_RUN++))
         status=0
@@ -1311,12 +1324,20 @@ EOF
     ) || status=$?
     if [[ $status -eq 4 ]]; then pass "Yq-less Unix storage opt-in fails closed";
     else fail "Yq-less Unix storage opt-in returned $status"; fi
+    ((TESTS_RUN++))
+    local emitted
+    emitted=$(export DSR_HOSTS_FILE="$fixture"; config_unix_storage_json trailing)
+    if jq -e '. == {build_root: "/data/tmp", root_min_free_bytes: 21474836480}' <<< "$emitted" >/dev/null; then
+        pass "Unix storage contract emits the host build_root (trailing slash trimmed) and the floor"
+    else
+        fail "Unix storage contract emitted: $emitted"
+    fi
 }
 
 # $1 root df line fields "usage avail_kb", $2 build df "usage avail_kb" or "FAIL"
 _test_unix_split_disk() {
     local root="$1" build="$2" fixture="$TEMP_DIR/unix-storage-admission.yaml"
-    printf 'hosts:\n  splithost:\n    platform: linux/amd64\n    connection: local\n    unix_storage:\n      build_root: /data\n      root_min_free_bytes: 21474836480\n' > "$fixture"
+    printf 'hosts:\n  splithost:\n    platform: linux/amd64\n    connection: local\n    build_root: /data\n    unix_storage:\n      root_min_free_bytes: 21474836480\n' > "$fixture"
     (
         export DSR_HOSTS_FILE="$fixture"
         _hh_exec_on_host() {
@@ -1384,7 +1405,7 @@ test_unix_split_storage_admission() {
 
     ((TESTS_RUN++))
     local fixture="$TEMP_DIR/unix-storage-bad.yaml"
-    printf 'hosts:\n  badhost:\n    platform: linux/amd64\n    connection: local\n    unix_storage: {build_root: data, root_min_free_bytes: 21474836480}\n' > "$fixture"
+    printf 'hosts:\n  badhost:\n    platform: linux/amd64\n    connection: local\n    unix_storage: {root_min_free_bytes: 21474836480}\n' > "$fixture"
     status=0
     result=$(
         export DSR_HOSTS_FILE="$fixture"
