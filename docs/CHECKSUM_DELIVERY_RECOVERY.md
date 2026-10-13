@@ -7,23 +7,25 @@ repair a checkout, or replay a review issue. It is useful when a push failed,
 its acknowledgement was lost, or the original operation deliberately retained
 local commits without pushing them.
 
-Select the original `checksum_sync --json` result and its independently held
-SHA256, not a later recovery receipt. For example, save the original invocation's
-JSON to `sync-result.json`, then inspect it and record its digest:
+Every handled sync completion now retains `WORKSPACE/result.json`, including
+non-JSON invocations and failures. The path and SHA256 are printed to stderr;
+JSON also identifies `result_file`. Select that original result and its
+independently held digest, not a later recovery receipt. Captured older sync JSON
+with complete acknowledged-commit and audit evidence is also accepted.
 
 ```bash
-sha256sum < /srv/results/sync-result.json
+sha256sum < "$SYNC_WORKSPACE/result.json"
 
 # Reconcile only: network reads, local logs and a local lock, no remote writes.
-bash src/checksum_sync_recover.sh \
-  --result /srv/results/sync-result.json \
+bash src/checksum_sync.sh recover \
+  --result "$SYNC_WORKSPACE/result.json" \
   --result-sha256 "$REVIEWED_RESULT_SHA256" \
   --target-repo owner/installers \
   --output-dir /srv/recovery/check-1
 
 # Explicitly permit one push of the already-validated checksum commit.
-bash src/checksum_sync_recover.sh \
-  --result /srv/results/sync-result.json \
+bash src/checksum_sync.sh recover \
+  --result "$SYNC_WORKSPACE/result.json" \
   --result-sha256 "$REVIEWED_RESULT_SHA256" \
   --target-repo owner/installers \
   --output-dir /srv/recovery/push-1 \
@@ -38,6 +40,16 @@ project roots retain the checksum-sync prohibition. Generation/build hosts and
 release assets are not modified. Python 3 on POSIX, Bash, Git, jq and the existing
 bounded auditor transport are required. `--timeout` bounds each subprocess;
 it does not change release policy or grant a retry.
+
+Sync itself now requires Python 3 before any downstream effects, including
+unaudited sync, to retain complete recovery results. The persistence helper
+writes a private candidate and atomically creates the final name with a hardlink;
+it never replaces an existing result. Candidates remain for diagnosis. Each
+completed destination also retains `target-N.result.json` before the next one
+starts. Failed persistence returns nonzero and stops later destinations; losing
+stdout no longer discards an otherwise saved terminal result. These receipts
+are bounded to 64 MiB. Per-target receipts without a terminal sync result are
+diagnostics, not sufficient authorization for automatic recovery.
 
 ## What qualifies for recovery
 
@@ -54,6 +66,9 @@ commit must have exactly the recorded parent and change **only** that checksum
 file. Recovery accepts the existing HTTPS GitHub origin created by sync, with
 one URL and no separate push URL. Existing operator credential helpers and URL
 rewrites remain policy; effective URL changes observed during recovery fail.
+HTTPS, SSH and local/file URL rewrites are supported; option-like strings and
+arbitrary remote-helper transports are refused. Safe nested checksum paths,
+including spaces, preserve the original sync path grammar.
 URLs potentially containing credentials are not included in public result JSON.
 
 The complete original audit, its selection and checksum evidence are verified
@@ -116,6 +131,7 @@ stop recovery without pretending to undo an acknowledged external effect.
 
 ```bash
 bash scripts/tests/test_checksum_sync_recovery.sh
+bash scripts/tests/test_checksum_sync_result.sh
 ```
 
 The regression obtains its original result from the complete production audited

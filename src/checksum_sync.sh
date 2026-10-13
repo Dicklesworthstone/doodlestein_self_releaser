@@ -684,6 +684,50 @@ _cs_sync_release_gate() (
     _cs_gate_local
 )
 
+# Publish complete JSON once without replacing any existing evidence. A private
+# candidate remains on failure; only a complete candidate gains the final name.
+# stdin carries the document, avoiding exec argument limits. This is retained
+# process recovery evidence, not a claim of power-loss durability for Git/HTTP.
+_cs_retain_sync_json() {
+    python3 -I -S -c '
+import json, os, re, sys, uuid
+root, name = sys.argv[1:]
+directory = None
+try:
+    if (not os.path.isabs(root) or os.path.realpath(root) != root or
+            not re.fullmatch(r"(?:result|target-[1-9][0-9]*\.result)\.json", name)):
+        raise ValueError("invalid receipt location")
+    data = sys.stdin.buffer.read(64 * 1024 * 1024 + 1)
+    if not data or len(data) > 64 * 1024 * 1024:
+        raise ValueError("receipt size limit")
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result: raise ValueError("duplicate JSON member")
+            result[key] = value
+        return result
+    def invalid(value):
+        raise ValueError("nonfinite JSON value")
+    value = json.loads(data, object_pairs_hook=pairs, parse_constant=invalid)
+    if not isinstance(value, dict): raise ValueError("receipt is not an object")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    candidate = ".sync-result." + uuid.uuid4().hex + ".json"
+    descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    os.link(candidate, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+    os.fsync(directory)
+except (OSError, ValueError, TypeError) as error:
+    print("[checksum-sync] Could not retain complete result: " + str(error), file=sys.stderr)
+    sys.exit(1)
+finally:
+    if directory is not None: os.close(directory)
+' "$1" "$2"
+}
+
 # Sync checksums to downstream repos after release
 # Usage: checksum_sync <tool> <version> [options]
 # Options:
@@ -712,8 +756,13 @@ checksum_sync() (
         if $json; then printf '%s\n' '{"status":"error","exit_code":3,"error":"jq is required"}'; fi
         return 3
     }
+    command -v python3 >/dev/null || {
+        _cs_log_error 'Python 3 is required to retain recoverable checksum sync results'
+        if $json; then printf '%s\n' '{"status":"error","exit_code":3,"error":"Python 3 is required"}'; fi
+        return 3
+    }
     _cs_sync_finish() {
-        local code=$? overall=success entries
+        local code=$? overall=success entries completion result_pin
         local -a audit_json=(--argjson audit '[null]')
         local -a freshness_json=(--argjson freshness '[]')
         trap - EXIT
@@ -732,8 +781,7 @@ checksum_sync() (
             audit_json=(--slurpfile audit "$audit_receipt")
         fi
         [[ -z "$workspace" || ! -f "$workspace/freshness.jsonl" ]] || freshness_json=(--slurpfile freshness "$workspace/freshness.jsonl")
-        if $json; then
-            jq -nc --arg status "$overall" --argjson code "$code" --arg tool "$tool_name" \
+        completion=$(jq -nc --arg status "$overall" --argjson code "$code" --arg tool "$tool_name" \
                 --arg version "$tag" --arg repo "$repo" --arg workspace "$workspace" --arg error "$error" \
                 --arg source "$source_kind" --arg asset "$source_asset" --arg digest "$manifest_sha" \
                 --argjson duration "$((SECONDS - start_time))" --argjson results "$entries" \
@@ -741,8 +789,10 @@ checksum_sync() (
                 --argjson issues "$issues_opened" --argjson dry_run "$dry_run" \
                 --argjson verified_release "$verify_release" --arg audit_pin "$audit_pin" \
                 "${audit_json[@]}" "${freshness_json[@]}" \
-                '{status:$status,exit_code:$code,tool:$tool,version:$version,repository:$repo,
+                '{kind:"dsr-checksum-sync-result",schema_version:1,
+                  status:$status,exit_code:$code,tool:$tool,version:$version,repository:$repo,
                   workspace:(if $workspace == "" then null else $workspace end),dry_run:$dry_run,
+                  result_file:(if $workspace == "" then null else $workspace+"/result.json" end),
                   source:{kind:$source,asset:$asset,manifest_sha256:$digest},
                   release_verification:$audit[0],
                   release_verification_sha256:(if $audit_pin=="" then null else $audit_pin end),
@@ -753,8 +803,21 @@ checksum_sync() (
                     inventory_stable:($verified_release and $code==0 and ($freshness|length)>0 and all($freshness[];.exit_code==0)),
                     payloads_reverified:false,checks:$freshness},
                   error:(if $error == "" then null else $error end),duration_seconds:$duration,
-                  synced:$synced,failed:$failed,planned:$planned,issues_opened:$issues,results:$results}' || exit 1
+                  synced:$synced,failed:$failed,planned:$planned,issues_opened:$issues,results:$results}') || exit 1
+        if [[ -n "$workspace" ]]; then
+            if printf '%s\n' "$completion" | _cs_retain_sync_json "$workspace" result.json; then
+                result_pin=$(_cs_sha256 "$workspace/result.json") || exit 1
+                _cs_log_info "Sync result: $workspace/result.json (SHA256 $result_pin)"
+            else
+                ((code != 0)) || code=1
+                completion=$(printf '%s\n' "$completion" | jq -c --argjson code "$code" '
+                    .exit_code=$code | .status=(if .status=="partial" then "partial" else "error" end) |
+                    .result_file=null | .error="Could not retain final sync result; inspect preserved target receipts and checkouts" |
+                    .release_freshness.inventory_stable=false |
+                    if .release_freshness.requested then .release_freshness.status="stale-or-unconfirmed" else . end') || exit 1
+            fi
         fi
+        if $json; then printf '%s\n' "$completion" || exit 1; fi
         [[ -z "$workspace" ]] || _cs_log_info "Checksum sync workspace retained: $workspace"
         exit "$code"
     }
@@ -826,6 +889,8 @@ OPTIONS:
     --dry-run                Validate and plan without cloning or writing remote repositories
     --json                   One result with per-target outcomes and retained checkout paths
 Local commits and failed checkouts are retained in the reported private workspace.
+Every handled completion also retains result.json, even without --json. Keep its
+reported SHA256 for checksum_sync.sh recover; recovery never creates a new commit.
 Download-only manifests are syntax-validated, not proof of artifact authenticity.
 --verify-release cannot use --manifest or --artifacts-dir, bypasses local cached
 artifacts, and retains its full audit. --dry-run audits but never changes downstream repos.
@@ -1020,6 +1085,10 @@ EOF
             '$receipt + {repo:$repo,action:$action,status:(if $code == 0 then "success" else "error" end),
               exit_code:$code,checkout:(if $path == "" then null else $path end)}') || return 1
         results+=("$entry")
+        if ! printf '%s\n' "$entry" | _cs_retain_sync_json "$workspace" "target-$index.result.json"; then
+            error='Could not retain downstream outcome; later destinations were not attempted'
+            return 1
+        fi
         if $verify_release && ((rc != 0)); then
             error='Audited downstream update failed; later destinations were not attempted'
             return "$rc"
@@ -1065,6 +1134,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         verify-release)
             module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || exit 3
             exec bash "$module_dir/release_checksums.sh" "$@" ;;
+        recover)
+            module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || exit 3
+            exec bash "$module_dir/checksum_sync_recover.sh" "$@" ;;
         sync)
             # Forward cancellation from the public CLI PID to its sourceable
             # worker group, including Bash's function-subshell layer. The
@@ -1076,7 +1148,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             wait "$sync_worker" || sync_status=$?
             trap - HUP INT TERM
             exit "$sync_status" ;;
-        *) printf 'Usage: checksum_sync.sh {generate|verify|verify-release|normalize|sync} [arguments]\n' >&2; exit 4 ;;
+        *) printf 'Usage: checksum_sync.sh {generate|verify|verify-release|normalize|sync|recover} [arguments]\n' >&2; exit 4 ;;
     esac
     exit $?
 fi

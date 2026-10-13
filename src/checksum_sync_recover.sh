@@ -146,6 +146,10 @@ def git(argv, phase, accepted=(0,)):
     return code, data
 
 def local_evidence(payloads=False):
+    held = os.fstat(lock)
+    named = lock_path.lstat()
+    need(held.st_nlink == 1 and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino),
+         'Recovery lock was replaced; stop instead of using an unlinked lease', 2)
     need(sha(stable_bytes(result_path, 64 * 1024 * 1024)) == args.result_sha256,
          'Original sync result changed', 2)
     path_checked(str(workspace), directory=True)
@@ -194,7 +198,8 @@ def local_commit():
     need(code == 1 and not push_urls, 'An independent push URL is not admitted for recovery', 2)
     _, resolved = git(['-C', checkout, 'remote', 'get-url', '--push', '--all', 'origin'], 'effective-origin')
     urls = resolved.decode().splitlines()
-    need(len(urls) == 1 and urls[0] and not any(ord(c) < 32 for c in urls[0]), 'Ambiguous effective origin', 2)
+    need(len(urls) == 1 and re.match(r'^(https://|ssh://|git@|file:///|/)', urls[0]) and
+         not any(ord(c) < 32 or ord(c) == 127 for c in urls[0]), 'Ambiguous or unsupported effective origin', 2)
     # Existing operator URL rewrites (including local test remotes) are preserved.
     # Never expose a resolved URL, possibly containing credentials, in public JSON.
     return urls[0]
@@ -284,9 +289,10 @@ try:
     commit, previous, branch, member = (row.get(k) for k in ('commit', 'previous_commit', 'branch', 'checksums_file'))
     need(hex_digest(commit, (40, 64)) and hex_digest(previous, (40, 64)) and commit != previous and
          isinstance(branch, str) and branch.startswith('refs/heads/') and
-         isinstance(member, str) and len(member) <= 1024 and
-         all(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9._+-]*', p) and p not in ('.', '..') and p.lower() != '.git'
-             for p in member.split('/')), 'Invalid recorded commit, branch, or checksum path', 4)
+         isinstance(member, str) and 0 < len(member) <= 1024 and not member.startswith(('/', '-')) and
+         not any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in member) and
+         all(p not in ('', '.', '..') and p.lower() != '.git' for p in member.split('/')),
+         'Invalid recorded commit, branch, or checksum path', 4)
     checkout = path_checked(row.get('checkout'), directory=True)
     need(checkout.parent == workspace and re.fullmatch(r'target-[1-9][0-9]*', checkout.name),
          'Recorded checkout is outside the original synchronization workspace', 4)
@@ -318,7 +324,7 @@ try:
     report.update(output_dir=str(output), result_file=str(result_path), result_sha256=args.result_sha256,
                   repository=target_repo, source_repository=origin_repo, tag=tag, commit=commit,
                   previous_commit=previous, branch=branch, checksums_file=member, checkout=str(checkout),
-                  historical_push_outcome=row.get('push_outcome'), recovered_commit=True)
+                  historical_push_outcome=row.get('push_outcome'), selected_commit_verified=False)
     (output / 'input-result.json').write_bytes(raw_result)
     lock_path = workspace / ('.recovery-' + checkout.name + '.lock')
     lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -332,6 +338,7 @@ try:
     git(['check-ref-format', branch], 'branch-format')
     local_evidence(payloads=True)
     endpoint = local_commit()
+    report['selected_commit_verified'] = True
     fresh('freshness-before')
     need(local_commit() == endpoint, 'Effective origin changed before recovery', 2)
     observed = remote_tip()

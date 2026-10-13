@@ -76,7 +76,7 @@ else:
 assert len(body)<=int(args[args.index('--max-filesize')+1])
 pathlib.Path(args[args.index('--output')+1]).write_bytes(body)
 ''')
-(bins / 'git').write_text('#!' + sys.executable + '\n' + r'''
+(bins / 'git').write_text(r'''#!/usr/bin/env -S python3 -I -S
 import json,os,pathlib,subprocess,sys
 args=sys.argv[1:]; case=pathlib.Path(os.environ['CASE'])
 with (case/'git.jsonl').open('a') as out: out.write(json.dumps(args)+'\n')
@@ -88,7 +88,7 @@ raise SystemExit(code)
 ''')
 for p in bins.iterdir(): p.chmod(0o755)
 
-def setup(label):
+def setup(label, member='SHA256SUMS.txt'):
     global cases
     cases += 1
     case = work / ('%02d-' % cases + label); case.mkdir()
@@ -106,6 +106,9 @@ def setup(label):
     git(env, 'init', '-b', 'main', seed)
     (seed / 'README').write_text('unchanged source\n')
     (seed / 'SHA256SUMS.txt').write_text('prior checksum file\n')
+    if member != 'SHA256SUMS.txt':
+        (seed / member).parent.mkdir(parents=True)
+        (seed / member).write_text('prior selected checksum file\n')
     git(env, '-C', seed, 'add', '.'); git(env, '-C', seed, 'commit', '-m', 'seed')
     remote = case / 'remotes/a.git'
     git(env, 'clone', '--bare', seed, remote)
@@ -121,7 +124,7 @@ def setup(label):
     write_json(case / 'assets.json', assets)
     write_json(case / 'release.json', dict(id=42, tag_name='v1.2.3', draft=False, prerelease=False, target_commitish='main'))
     proc = subprocess.run(['bash', root / 'src/checksum_sync.sh', 'sync', 'tool', '1.2.3', '--repo', 'owner/tool',
-        '--target-repo', 'owner/a', '--verify-release', '--checksum-mode', 'sidecars', '--json'],
+        '--target-repo', 'owner/a', '--verify-release', '--checksum-mode', 'sidecars', '--checksums-file', member, '--json'],
         env=env, capture_output=True, timeout=60)
     (case / 'original.json').write_bytes(proc.stdout); (case / 'sync.stderr').write_bytes(proc.stderr)
     need = json.loads(proc.stdout)
@@ -131,9 +134,10 @@ def setup(label):
     return case, env, need
 
 def command(case, *, push=False, result=None, pin=None, output=None, target='owner/a', timeout=15):
-    source = result or case / 'original.json'
+    original = json.loads((case / 'original.json').read_bytes())
+    source = result or Path(original['result_file'])
     target_dir = output or case / ('recovery-%02d' % len(list(case.glob('recovery-*'))))
-    cmd = ['bash', root / 'src/checksum_sync_recover.sh', '--result', source, '--result-sha256', pin or hashed(source),
+    cmd = ['bash', root / 'src/checksum_sync.sh', 'recover', '--result', source, '--result-sha256', pin or hashed(source),
            '--target-repo', target, '--output-dir', target_dir, '--timeout', str(timeout)]
     if push: cmd.append('--push')
     return cmd
@@ -160,6 +164,9 @@ def binaries(case):
 
 case, env, original = setup('pending-and-idempotent')
 row = original['results'][0]; checkout = Path(row['checkout']); ws = Path(original['workspace'])
+check('actual sync retains the complete result and target receipt used by public recovery',
+      Path(original['result_file']).read_bytes() == (case / 'original.json').read_bytes() and
+      json.loads((ws / 'target-1.result.json').read_bytes()) == row)
 held = {p: hashed(p) for p in (case / 'original.json', ws / 'audit-result.json', ws / 'manifest', ws / 'audit/result.json')}
 proc, result = recover(case, env)
 check('default recovery checks without pushing', proc.returncode == 0 and result.get('status') == 'ready' and
@@ -180,6 +187,12 @@ check('repeated explicit recovery reconciles without another push', proc.returnc
 check('original audit/export/result bytes remain unchanged', all(hashed(p) == v for p, v in held.items()))
 check('recovery evidence and final JSON agree', Path(result['output_dir'], 'result.json').read_bytes() == proc.stdout)
 check('all recovery attempts use metadata only on the network', binaries(case) == 2)
+
+case, env, original = setup('spaced-checksum-path', 'release notes/checksums.txt')
+proc, result = recover(case, env, push=True)
+check('safe nested checksum paths with spaces retain the original sync contract', proc.returncode == 0 and
+      result.get('status') == 'pushed' and result.get('selected_commit_verified') is True and
+      tip(case, env) == original['results'][0]['commit'])
 
 case, env, original = setup('lost-acknowledgement')
 env['RECOVERY_MODE'] = 'lost-ack'
