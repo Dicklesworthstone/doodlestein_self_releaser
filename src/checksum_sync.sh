@@ -393,7 +393,7 @@ _cs_clone_repo() {
 # Reject user edits to the target; unrelated staged work is never committed.
 # Args: repo_path checksums_content [--commit] [--push] [--checksums-file path]
 #       [--release-guard function] (internal audited-sync handoff)
-# stdout: one update receipt on success; failures retain checkout diagnostics.
+# stdout: one update receipt, including known effects after an admitted failure.
 _cs_update_repo_checksums() (
     [[ $# -ge 2 ]] || return 4
     local repo_path="$1" content="$2" commit=false push=false member=SHA256SUMS.txt guard=''
@@ -415,26 +415,58 @@ _cs_update_repo_checksums() (
     repo_path=$(cd "$repo_path" && pwd -P) || return 4
     _cs_is_safe_path "$repo_path" || return 4
     member=$(_cs_repo_member "$member") || return 4
-    local top branch='' head='' stage cleanup normalized full_path parent cursor rest part tracked=false changed=false
-    local publish_stage='' publish_cleanup
-    local committed=false pushed=false
-    # A failed gate after a local commit must retain its identity in the
-    # caller's result. An unpushed commit is not an empty/rolled-back outcome.
+    local top branch='' head='' stage='' normalized full_path parent cursor rest part tracked=false changed=false
+    local publish_stage=''
+    local committed=false pushed=false push_attempted=false push_status=not-attempted push_code=null
+    local commit_attempted=false commit_status=not-attempted commit_code=null previous_head=''
+    local update_phase=admission guard_failed=false blocked_phase=''
+    # A nonzero Git exit does not erase a completed local write/commit. In
+    # particular, a transport failure is not proof the server rejected a push.
+    # Report acknowledged effects and uncertain delivery separately; never
+    # retry, reset a branch or infer success from a failed transport.
+    _cs_update_finish() {
+        local code=$?
+        trap - EXIT
+        trap '' HUP INT TERM
+        if [[ -n "$publish_stage" ]]; then
+            rm -f -- "$publish_stage/manifest"
+            rmdir -- "$publish_stage" 2>/dev/null || true
+        fi
+        if [[ -n "$stage" ]]; then
+            rm -f -- "$stage/input" "$stage/manifest"
+            rmdir -- "$stage" 2>/dev/null || true
+        fi
+        jq -nc --arg path "$repo_path" --arg file "$member" --arg sha "$head" --arg branch "$branch" \
+            --arg phase "$update_phase" --arg blocked "$blocked_phase" --arg push_status "$push_status" \
+            --arg previous "$previous_head" --arg commit_status "$commit_status" \
+            --argjson commit_attempted "$commit_attempted" --argjson commit_code "$commit_code" \
+            --argjson code "$code" --argjson changed "$changed" --argjson committed "$committed" \
+            --argjson pushed "$pushed" --argjson attempted "$push_attempted" --argjson push_code "$push_code" \
+            --argjson guarded "$guard_failed" '
+            {checkout:$path,checksums_file:$file,changed:$changed,committed:$committed,pushed:$pushed,
+             commit:(if $sha=="" then null else $sha end),branch:$branch,exit_code:$code,
+             previous_commit:(if $previous=="" then null else $previous end),
+             commit_attempted:$commit_attempted,commit_outcome:$commit_status,commit_exit_code:$commit_code,
+             push_attempted:$attempted,push_outcome:$push_status,push_exit_code:$push_code} +
+            (if $code==0 then {} else {failed_phase:$phase} end) +
+            (if $guarded then {guard_failed:true,blocked_phase:$blocked} else {} end)' || exit 1
+        exit "$code"
+    }
+    trap _cs_update_finish EXIT
+    trap 'exit 5' HUP INT TERM
     _cs_update_gate() {
         local phase="$1" gate_rc=0
+        update_phase="$phase"
         [[ -z "$guard" ]] || "$guard" "$phase" "$stage/manifest" || gate_rc=$?
         ((gate_rc != 0)) || return 0
-        jq -nc --arg path "$repo_path" --arg file "$member" --arg sha "$head" --arg branch "$branch" \
-            --arg phase "$phase" --argjson changed "$changed" --argjson committed "$committed" \
-            --argjson pushed "$pushed" \
-            '{checkout:$path,checksums_file:$file,changed:$changed,committed:$committed,pushed:$pushed,
-              commit:(if $sha=="" then null else $sha end),branch:$branch,guard_failed:true,blocked_phase:$phase}' || return 1
+        guard_failed=true; blocked_phase="$phase"
         return "$gate_rc"
     }
     top=$(_cs_git -C "$repo_path" rev-parse --show-toplevel) || return 4
     [[ "$top" == "$repo_path" ]] || return 4
     if $commit; then
         head=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 4
+        previous_head="$head"
         branch=$(_cs_git -C "$repo_path" symbolic-ref -q HEAD) || return 4
     fi
     # Resolve only directory components, refusing links before creating/writing
@@ -456,11 +488,8 @@ _cs_update_repo_checksums() (
         _cs_log_error "Refusing to replace an untracked checksum file: $member"; return 2
     fi
     # Syntax is checked before even creating missing target directories.
+    update_phase=prepare
     stage=$(mktemp -d "$repo_path/.dsr-checksum-update.XXXXXXXX") || return 1
-    printf -v cleanup 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' "$stage/input" "$stage/manifest" "$stage"
-    # shellcheck disable=SC2064 # expand now: $cleanup is a %q-quoted command
-    trap "$cleanup" EXIT
-    trap 'exit 5' HUP INT TERM
     printf '%s\n' "$content" > "$stage/input" || return 1
     checksum_manifest_normalize "$stage/input" > "$stage/manifest" || return $?
     if [[ ! -f "$full_path" ]] || ! cmp -s "$stage/manifest" "$full_path"; then
@@ -469,38 +498,53 @@ _cs_update_repo_checksums() (
         # The target subdirectory can be a different mounted filesystem. Stage
         # beside the final path so mv is a rename, not a cross-device copy.
         publish_stage=$(mktemp -d "$parent/.dsr-checksum-output.XXXXXXXX") || return 1
-        printf -v publish_cleanup 'rm -f -- %q; rmdir -- %q 2>/dev/null || true' "$publish_stage/manifest" "$publish_stage"
-        # shellcheck disable=SC2064 # expand now: both are %q-quoted commands
-        trap "$cleanup; $publish_cleanup" EXIT
         cp -- "$stage/manifest" "$publish_stage/manifest" || return 1
         cmp -s "$stage/manifest" "$publish_stage/manifest" || return 1
         chmod 644 "$publish_stage/manifest" || return 1
         _cs_update_gate before-write || return $?
+        update_phase=write
         mv -f -- "$publish_stage/manifest" "$full_path" || return 1
         changed=true
     fi
     if $commit && $changed; then
         _cs_update_gate before-commit || return $?
+        update_phase=stage
         _cs_git -C "$repo_path" add -- "$member" || return 1
         # --only explicitly excludes unrelated staged changes. Do not suppress
         # commit failures (missing identity, rejected hooks, signing failures).
-        _cs_git -C "$repo_path" commit --only -m "Update checksums" -- "$member" >&2 || return 1
-        head=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 1
+        update_phase=commit
+        commit_attempted=true; committed=null; commit_status=uncertain; head=''
+        if _cs_git -C "$repo_path" commit --only -m "Update checksums" -- "$member" >&2; then
+            commit_code=0
+        else
+            commit_code=$?; return 1
+        fi
         committed=true
+        commit_status=acknowledged
+        head=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 1
     fi
     if $commit; then
+        update_phase=verify-commit
         normalized=$(checksum_manifest_normalize "$stage/input") || return 1
-        [[ "$(_cs_git -C "$repo_path" show "HEAD:$member")" == "$normalized" ]] || return 1
+        [[ "$(_cs_git -C "$repo_path" show "$head:$member")" == "$normalized" ]] || return 1
     fi
     if $push; then
         _cs_update_gate before-push || return $?
-        _cs_git -C "$repo_path" push --porcelain origin "HEAD:$branch" >&2 || return 8
+        update_phase=push-preflight
+        [[ "$(_cs_git -C "$repo_path" rev-parse --verify HEAD)" == "$head" &&
+           "$(_cs_git -C "$repo_path" symbolic-ref -q HEAD)" == "$branch" ]] || return 2
+        # Pin the source commit even if an unrelated local writer moves HEAD
+        # during transport. Do not let push.followTags add unselected refs.
+        update_phase=push; push_attempted=true; pushed=null; push_status=uncertain
+        if _cs_git -C "$repo_path" push --porcelain --no-follow-tags origin "$head:$branch" >&2; then
+            push_code=0
+        else
+            push_code=$?; return 8
+        fi
         pushed=true
+        push_status=acknowledged
     fi
-    jq -nc --arg path "$repo_path" --arg file "$member" --arg sha "$head" --arg branch "$branch" \
-        --argjson changed "$changed" --argjson pushed "$pushed" --argjson committed "$committed" \
-        '{checkout:$path,checksums_file:$file,changed:$changed,pushed:$pushed,committed:$committed,
-          commit:(if $sha == "" then null else $sha end),branch:$branch}'
+    return 0
 )
 
 # Only transport failures try another source. A downloaded but malformed
@@ -973,8 +1017,8 @@ EOF
         fi
         entry=$(jq -nc --arg repo "$target" --arg action "$action" --arg path "$checkout" \
             --argjson code "$rc" --argjson receipt "$receipt" \
-            '{repo:$repo,action:$action,status:(if $code == 0 then "success" else "error" end),
-              exit_code:$code,checkout:(if $path == "" then null else $path end)} + $receipt') || return 1
+            '$receipt + {repo:$repo,action:$action,status:(if $code == 0 then "success" else "error" end),
+              exit_code:$code,checkout:(if $path == "" then null else $path end)}') || return 1
         results+=("$entry")
         if $verify_release && ((rc != 0)); then
             error='Audited downstream update failed; later destinations were not attempted'

@@ -198,6 +198,8 @@ for phase in ('post-checkout','pre-commit','post-commit','post-receive'):
     else:
         row=(result.get('results') or [{}])[0]
         check('post-push drift preserves and reports the already completed remote write',current['a']!=heads['a'] and row.get('pushed') is True and result.get('status')=='partial' and result.get('synced')==1)
+        check('post-push freshness failure cannot inherit the helper success exit code',
+              row.get('status')=='error' and row.get('exit_code')==proc.returncode and proc.returncode!=0)
 
 for mode in ('local-receipt','local-export','local-proof'):
     case,env,heads=new_case(mode,mode,'post-checkout')
@@ -230,6 +232,108 @@ prior_pin=hashlib.sha256((seed/'result.json').read_bytes()).hexdigest()
 before=payload_requests(case)
 proc,result=invoke(case,env,('--push','--audit-resume-from',str(seed)))
 check('resumed sync checks the new audit rather than passing the old resume source to freshness',seed_proc.returncode==0 and proc.returncode==0 and result.get('release_verification',{}).get('resume',{}).get('reused_count')==4 and payload_requests(case)-before==4 and hashlib.sha256((seed/'result.json').read_bytes()).hexdigest()==prior_pin)
+
+# Actual Git rejection must not throw away the acknowledged local commit.
+# Nonzero push status is conservatively unknown, not proof of remote rollback.
+case,env,heads=new_case('rejected-push')
+(case/'hooks/pre-receive').write_text('#!/bin/sh\n[ "${SYNC_REJECT_PUSH:-0}" != 1 ]\n')
+(case/'hooks/pre-receive').chmod(0o755)
+env['SYNC_REJECT_PUSH']='1'
+proc,result=invoke(case,env)
+row=(result.get('results') or [{}])[0]
+folder=sync_folder(case)
+held=run_git(['-C',folder/'target-1','rev-parse','HEAD'],env)
+check('server-side rejection retains the exact completed local checksum commit',
+      proc.returncode==8 and result.get('status')=='partial' and row.get('committed') is True and
+      row.get('commit')==held and held!=heads['a'] and row.get('previous_commit')==heads['a'])
+check('failed push distinguishes attempted but unacknowledged transport',
+      row.get('push_attempted') is True and 'pushed' in row and row['pushed'] is None and
+      row.get('push_outcome')=='uncertain' and row.get('push_exit_code',0)!=0 and row.get('failed_phase')=='push')
+check('rejected first push leaves both remotes intact and later audited destinations untouched',
+      remote_heads(case,env)==heads and not (folder/'target-2').exists())
+env['SYNC_REJECT_PUSH']='0'
+retry=subprocess.run(['bash','-c','source "$1"; _cs_update_repo_checksums "$2" "$(cat "$3")" --commit --push',
+    '_',str(program/'checksum_sync.sh'),str(folder/'target-1'),str(folder/'manifest')],
+    env=env,capture_output=True,timeout=30)
+try: retry_row=json.loads(retry.stdout)
+except ValueError: retry_row={}
+check('explicit helper retry pushes the retained commit without creating another commit',
+      retry.returncode==0 and retry_row.get('commit')==held and retry_row.get('committed') is False and
+      retry_row.get('push_outcome')=='acknowledged' and retry_row.get('push_exit_code')==0 and
+      remote_heads(case,env)['a']==held and run_git(['-C',folder/'target-1','rev-parse','HEAD'],env)==held)
+
+case,env,heads=new_case('commit-rejected')
+with (case/'hooks/pre-commit').open('a') as hook: hook.write('\nraise SystemExit(17)\n')
+proc,result=invoke(case,env)
+row=(result.get('results') or [{}])[0]
+folder=sync_folder(case)
+check('failed commit retains changed working file and reports partial work',
+      proc.returncode==1 and row.get('changed') is True and result.get('status')=='partial' and
+      (folder/'target-1/SHA256SUMS.txt').read_bytes()==(folder/'manifest').read_bytes() and
+      remote_heads(case,env)==heads and run_git(['-C',folder/'target-1','rev-parse','HEAD'],env)==heads['a'])
+check('unacknowledged commit is not misreported as a completed new or rolled-back commit',
+      row.get('commit_attempted') is True and row.get('commit_outcome')=='uncertain' and
+      row.get('commit_exit_code',0)!=0 and row.get('commit') is None and
+      row.get('previous_commit')==heads['a'] and row.get('failed_phase')=='commit' and
+      row.get('push_attempted') is False and row.get('pushed') is False)
+
+# Execute an actual successful local Git push, then fault only its reported
+# process status. This models lost acknowledgement, not a live Git protocol test.
+case,env,heads=new_case('lost-push-ack')
+fault_bin=case/'fault-bin';fault_bin.mkdir()
+actual_git=shutil.which('git')
+(fault_bin/'git').write_text('#!/usr/bin/env -S python3 -I -S\n'+
+    'import subprocess,sys\nargs=sys.argv[1:]\n'+
+    'code=subprocess.call(['+repr(actual_git)+',*args])\n'+
+    'sys.exit(128 if "push" in args and code==0 else code)\n')
+(fault_bin/'git').chmod(0o755)
+env['PATH']=str(fault_bin)+os.pathsep+env['PATH']
+proc,result=invoke(case,env)
+row=(result.get('results') or [{}])[0]
+current=remote_heads(case,env)
+check('lost push acknowledgement is nonzero even after an actual successful remote update',
+      proc.returncode==8 and current['a']!=heads['a'] and current['b']==heads['b'] and
+      row.get('commit')==current['a'] and row.get('committed') is True and result.get('status')=='partial')
+check('lost acknowledgement reports unknown rather than claiming push rejection or success',
+      row.get('push_attempted') is True and 'pushed' in row and row['pushed'] is None and
+      row.get('push_outcome')=='uncertain' and row.get('push_exit_code')==128 and
+      not (sync_folder(case)/'target-2').exists())
+
+case,env,heads=new_case('no-unselected-tags')
+with (case/'gitconfig').open('a') as config: config.write('[push]\n followTags = true\n')
+with (case/'hooks/post-commit').open('a') as hook:
+    hook.write('\nsubprocess.run(["git","tag","-am","unselected tag","not-selected"],check=True)\n')
+proc,result=invoke(case,env)
+check('branch-only checksum pushes never inherit automatic annotated-tag publication',
+      proc.returncode==0 and all(remote_heads(case,env)[name]!=heads[name] for name in heads) and
+      all(not run_git(['--git-dir',case/'remotes'/(name+'.git'),'for-each-ref','--format=%(refname)','refs/tags'],env)
+          for name in heads))
+
+# A guard can race with another local writer. Use actual commits to prove the
+# updater does not replace its checked commit by whatever HEAD becomes later.
+case,env,heads=new_case('head-moved-during-guard')
+checkout=case/'direct-checkout'
+run_git(['clone','https://github.com/owner/a.git',checkout],env)
+manifest=case/'input-manifest'
+manifest.write_text(hashlib.sha256(b'payload').hexdigest()+'  tool.tar.gz\n')
+script=r'''
+source "$1" || exit $?
+change_head() {
+    [[ "$1" == before-push ]] || return 0
+    printf 'unrelated writer\n' > "$repo_path/OTHER" || return 1
+    git -C "$repo_path" add -- OTHER || return 1
+    git -C "$repo_path" commit --only -m 'concurrent writer' -- OTHER >&2
+}
+_cs_update_repo_checksums "$2" "$(cat "$3")" --commit --push --release-guard change_head
+'''
+proc=subprocess.run(['bash','-c',script,'_',str(program/'checksum_sync.sh'),str(checkout),str(manifest)],
+                    env=env,capture_output=True,timeout=30)
+try: row=json.loads(proc.stdout)
+except ValueError: row={}
+check('changed HEAD at pre-push admission is refused without discarding either local commit',
+      proc.returncode==2 and row.get('failed_phase')=='push-preflight' and row.get('push_attempted') is False and
+      row.get('commit')==run_git(['-C',checkout,'rev-parse','HEAD^'],env) and remote_heads(case,env)==heads and
+      (checkout/'OTHER').is_file())
 
 case,env,heads=new_case('cancel','cancel')
 command=['bash',str(program/'checksum_sync.sh'),'sync','tool','1.2.3','--repo','owner/tool','--target-repo','owner/a','--verify-release','--checksum-mode','sidecars','--push','--json']

@@ -281,3 +281,43 @@ to new, retained local bare repositories. Git hooks change a file-backed release
 inventory during actual Git stages. Only GitHub HTTP/authentication and issue
 creation are transport fixtures. It is not live GitHub, full root-CLI startup,
 native build, or publisher-signature qualification.
+
+### Preserve outcomes after Git failures
+
+Each admitted repository update now reports its known local effects even when
+file preparation, commit, push, or a release guard fails. A failed Git command
+does not discard the checkout or turn an already-created commit into an empty
+result. The outer sync reports `partial` when a checksum file was changed or a
+commit/push was acknowledged, and stops later audited destinations.
+
+The per-target receipt includes `previous_commit`, the selected `commit`,
+`commit_attempted`, `commit_outcome`, `commit_exit_code`, `push_attempted`,
+`push_outcome`, and `push_exit_code`. Outcomes are `not-attempted`, `acknowledged`,
+or `uncertain`. `committed` and `pushed` are true for acknowledged commands,
+false when the command was not attempted, and null for an unacknowledged attempt.
+On an unsuccessful commit command, `commit` is null rather than presenting the
+old HEAD as the newly created commit. `previous_commit` still identifies the
+original checkout. An unchanged retry can report `committed: false` while naming
+and pushing a commit retained from an earlier invocation.
+
+A nonzero push, including a rejected push, is conservatively `uncertain`: its
+exit status alone does not prove that no configured destination was updated.
+There is no automatic retry or rollback. Inspect the retained checkout/logs and
+remote refs before deciding whether to retry. A failed push retains the exact
+acknowledged local commit SHA. Loss of the process itself before it writes a
+receipt is not covered by this reporting contract; this is not a durable outbox.
+
+Before pushing, the updater rechecks that HEAD and the branch still match the
+commit it validated. It sends that explicit commit SHA rather than a moving
+HEAD ref, and disables automatic `push.followTags` publication so the checksum
+update cannot implicitly send unselected annotated tags. A concurrent local
+change is a conflict, not permission to discard either commit. A later
+freshness failure keeps the downstream effect but owns the final per-target
+nonzero exit code; a helper's earlier successful receipt cannot overwrite it.
+
+The freshness regression includes real server-side Git rejection, a failing
+commit hook, an explicit unchanged-checkout retry, concurrent local commits,
+and annotated-tag policy. Its lost-acknowledgement case performs a genuine
+push to a local bare repository, then injects a nonzero process response. That
+is an explicit process-status fault adapter, not a live Git protocol/network
+qualification. No production Git predicate is replaced in these checks.
