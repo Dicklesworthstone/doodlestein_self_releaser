@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(ROOT / 'src/act_runner.sh')))
@@ -26,10 +28,13 @@ def refuse(message):
 
 source = MODULE.read_text()
 start = source.index('def cargo_env_exemption(')
-end = source.find('\ndef cargo_configuration(', start)
+end = source.index('\ncargo_config, cargo_config_receipts', start)
 namespace = dict(re=re, os=os, pathlib=__import__('pathlib'), hashlib=hashlib,
                  subprocess=subprocess, fail=refuse)
-exec(compile(source[start:end if end >= 0 else None], str(MODULE), 'exec'), namespace)
+exec(compile(source[start:end], str(MODULE), 'exec'), namespace)
+influence_start = source.index('def influences(name):')
+influence_end = source.index('\n\n', influence_start)
+exec(compile(source[influence_start:influence_end], str(MODULE), 'exec'), namespace)
 
 TRIPLE = 'x86_64-unknown-linux-gnu'
 FACTS = {('unix', None), ('target_arch', 'x86_64'), ('target_os', 'linux'),
@@ -41,6 +46,35 @@ SELECTORS = [('-C', 'linker=unattested'), ('--codegen', 'linker=unattested'),
 
 def selected(config, environment=None):
     return namespace['cargo_target_settings'](config, TRIPLE, environment or {}, FACTS)[1]
+
+
+
+FIXTURES = (
+    ('pi_agent_rust-v0.8.0.toml', 'dbd046e2b5abdf74d88e12c3deff5cdcea679092', '16777216'),
+    ('franken_whisper-4261f62.toml', '4261f62b941756aa4a422ae83013c51cf2ec983a', '67108864'),
+)
+
+
+def fixture_configuration(name, suffix=''):
+    # Never rewrite the immutable fixtures to accommodate the attestation.
+    # Malicious test additions go into retained temporary copies instead.
+    raw = (ROOT / 'tests/fixtures/cargo' / name).read_bytes()
+    expected = next(row[1] for row in FIXTURES if row[0] == name)
+    observed = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+    if observed != expected:
+        raise AssertionError('upstream fixture changed: ' + name)
+    work = Path(tempfile.mkdtemp(prefix='dsr-release-config-security-')).resolve()
+    (work / '.cargo').mkdir()
+    config_path = work / '.cargo/config.toml'
+    config_path.write_bytes(raw + suffix.encode())
+    previous = Path.cwd()
+    try:
+        os.chdir(work)
+        with patch.dict(os.environ, {'CARGO_HOME': str(work / 'private-cargo')}, clear=True):
+            config, receipts = namespace['cargo_configuration']()
+        return config, receipts, config_path
+    finally:
+        os.chdir(previous)
 
 
 class CargoConfigurationSecurityTests(unittest.TestCase):
@@ -147,6 +181,78 @@ class CargoConfigurationSecurityTests(unittest.TestCase):
                            'cfg(any(unix, not(windows,)))'):
             with self.subTest(expression=expression), self.assertRaises(Refused):
                 namespace['cargo_parse_cfg'](expression)
+
+
+    def test_original_release_receipts_record_operator_stack_overrides(self):
+        for name, _, configured in FIXTURES:
+            for ambient in (None, '33554432'):
+                with self.subTest(fixture=name, ambient=ambient):
+                    config, receipts, path = fixture_configuration(name)
+                    environment = {} if ambient is None else {'RUST_MIN_STACK': ambient}
+                    namespace['cargo_effective_environment'](config, receipts, environment)
+                    self.assertEqual(receipts, [{
+                        'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        'env_exemptions': [{'name': 'RUST_MIN_STACK', 'value': configured,
+                            'force': False, 'effective_value': ambient or configured,
+                            'effective_force': False,
+                            'effective_source': 'environment' if ambient else 'configuration'}],
+                    }])
+                    self.assertEqual(environment['RUST_MIN_STACK'], ambient or configured)
+            config, receipts, _ = fixture_configuration(name)
+            with self.subTest(fixture=name), self.assertRaisesRegex(Refused, 'effective Cargo numeric'):
+                namespace['cargo_effective_environment'](config, receipts, {'RUST_MIN_STACK': 'invalid'})
+
+    def test_real_release_configs_reject_added_compiler_environment_tables(self):
+        names = ('RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS',
+                 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'CARGO_BUILD_RUSTC',
+                 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER', 'PATH', 'CC',
+                 'RUST_MIN_STACK_X', 'RUST_TEST_THREADS_X')
+        for fixture, _, _ in FIXTURES:
+            # Establish that any refusal is caused by the appended table, not
+            # by one of the original compatibility blockers or bad fixture TOML.
+            fixture_configuration(fixture)
+            for name in names:
+                for force in ('false', 'true'):
+                    suffix = '\n[env.' + name + ']\nvalue="1"\nforce=' + force + '\n'
+                    with self.subTest(fixture=fixture, name=name, force=force), self.assertRaisesRegex(
+                            Refused, 'Cargo configuration changes the compiler environment'):
+                        fixture_configuration(fixture, suffix)
+
+    def test_real_release_configs_reject_hidden_selectors_in_all_cfg_branches(self):
+        attacks = ('["@hidden.args"]', '["--codegen", "linker=unattested"]',
+                   '["-Z", "codegen_backend=unattested"]', '["-vClinker=unattested"]')
+        for fixture, _, _ in FIXTURES:
+            for family in ('unix', 'windows'):
+                for flags in attacks:
+                    suffix = "\n[target.'cfg(all(" + family + ", all()))']\nrustflags=" + flags + '\n'
+                    config, _, _ = fixture_configuration(fixture, suffix)
+                    # Validation must refuse before querying a compiler, even
+                    # when the added table would not match this Linux target.
+                    with self.subTest(fixture=fixture, family=family, flags=flags), self.assertRaisesRegex(
+                            Refused, 'response files|compiler/linker overrides|clustered rustflags'):
+                        namespace['cargo_observe_target'](config, TRIPLE, {}, {})
+
+    def test_real_cfg_receipts_preserve_broad_matching_and_override_provenance(self):
+        # A synthetic unlisted target proves selection uses supplied target
+        # facts, not a hard-coded release-triple allowlist. No compiler claim.
+        triple = 'unlisted-vendor-operating-system'
+        facts = {(key, 'riscv64' if key == 'target_arch' else value) for key, value in FACTS}
+        for fixture, _, _ in FIXTURES:
+            config, _, _ = fixture_configuration(fixture)
+            _, base = namespace['cargo_target_settings'](config, triple, {}, facts)
+            expected = (['-Z', 'threads=4', '-Cllvm-args=-enable-machine-outliner=always']
+                        if fixture.startswith('pi_') else ['-Z', 'threads=4'])
+            self.assertEqual(base['rustflags'], expected)
+            self.assertEqual(len(base['matched_cfg']), int(fixture.startswith('pi_')))
+            for env, flags, source in (({'RUSTFLAGS': ''}, [], 'RUSTFLAGS'),
+                    ({'CARGO_ENCODED_RUSTFLAGS': '-C\x1fopt-level=1'}, ['-C', 'opt-level=1'],
+                     'CARGO_ENCODED_RUSTFLAGS')):
+                with self.subTest(fixture=fixture, environment=source):
+                    _, row = namespace['cargo_target_settings'](config, triple, env, facts)
+                    self.assertEqual(row['rustflags'], flags)
+                    self.assertEqual(row['rustflags_source'], source)
+                    self.assertEqual(row['cfg_tables'], base['cfg_tables'])
+                    self.assertEqual(row['matched_cfg'], base['matched_cfg'])
 
 
 if __name__ == '__main__':
