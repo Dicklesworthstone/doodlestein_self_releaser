@@ -269,7 +269,7 @@ function Get-DsrCargoToolConfiguration {
                 net { @('offline','retry','git-fetch-with-cli') }
                 term { @('color','verbose','quiet') }
                 registry { @('default') }
-                env { @('RUST_MIN_STACK') }
+                env { @('RUST_MIN_STACK','RUST_TEST_THREADS') }
             }
             if ($key -cnotin $allowed) { throw ('Unsupported Cargo configuration selector: ' + $section + '.' + $key) }
             $value=$null

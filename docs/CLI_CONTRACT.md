@@ -826,8 +826,9 @@ configuration uses a bounded literal grammar for build/compiler settings,
 literal target settings, ordinary source/registry settings and Rust flags.
 Includes, dotted keys, inline tables, `cfg(...)` targets, general environment
 injection, unstable selector environments and flags that can select another
-linker/compiler/backend are refused before dependency admission. A positive
-literal `RUST_MIN_STACK` is the supported `[env]` exception. Configured compiler
+linker/compiler/backend are refused before dependency admission. Positive
+literal `RUST_MIN_STACK` and `RUST_TEST_THREADS` are the supported `[env]`
+exceptions. Configured compiler
 or linker paths must be absolute, or project-relative paths in tracked Cargo
 configuration. PATH entries must be drive-qualified absolute paths; known
 ambiguous compiler lookup locations are refused. Configured
@@ -863,10 +864,11 @@ record their resolved executable. Literal tracked Cargo configuration can
 select the compiler, target and linker; those configuration files are hashed
 into the receipt and require Python 3.11+ to parse. A tracked `[env]` table
 that sets any `RUST*`, `CARGO_*`, `XWIN_*`, `PATH` or C toolchain variable is
-refused, with one exception: `RUST_MIN_STACK` set to a plain positive integer
-string. It only sizes rustc's and test/run threads' stacks, so it is admitted
-and recorded under that file's `env_exemptions` (name and value) in every
-receipt. Any other value form, or any other influencing name, still fails
+refused, with two exceptions, each set to a plain positive integer string:
+`RUST_MIN_STACK`, which only sizes rustc's and test/run threads' stacks, and
+`RUST_TEST_THREADS`, which only sets libtest's default thread count. They are
+admitted and recorded under that file's `env_exemptions` (name and value) in
+every receipt. Any other value form, or any other influencing name, still fails
 closed.
 
 Strict Unix source-closure validation runs locked, offline, all-features Cargo

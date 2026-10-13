@@ -566,7 +566,7 @@
                       "type": "object", "required": ["name", "value"],
                       "additionalProperties": false,
                       "properties": {
-                        "name": {"const": "RUST_MIN_STACK"},
+                        "name": {"enum": ["RUST_MIN_STACK", "RUST_TEST_THREADS"]},
                         "value": {"type": "string", "pattern": "^[1-9][0-9]*$"}
                       }
                     }

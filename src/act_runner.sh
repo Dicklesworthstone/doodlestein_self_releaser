@@ -7632,11 +7632,12 @@ def cargo_configuration():
         environment = current.get('env', {})
         if not isinstance(environment, dict):
             fail('invalid Cargo configuration section: env')
-        # RUST_MIN_STACK only sizes rustc's and test/run threads' stacks; it
-        # selects no compiler, target, flag or codegen input. Admit exactly
-        # that name with a plain positive integer, and record it per build.
+        # RUST_MIN_STACK only sizes rustc's and test/run threads' stacks, and
+        # RUST_TEST_THREADS only sets libtest's default thread count; neither
+        # selects a compiler, target, flag or codegen input. Admit exactly
+        # those names with a plain positive integer, and record them per build.
         exemptions = [{'name': name, 'value': value} for name, value in sorted(environment.items())
-                      if name == 'RUST_MIN_STACK' and isinstance(value, str)
+                      if name in ('RUST_MIN_STACK', 'RUST_TEST_THREADS') and isinstance(value, str)
                       and re.fullmatch(r'[1-9][0-9]*', value)]
         exempt = {row['name'] for row in exemptions}
         if any(influences(name) for name in environment if name not in exempt):
