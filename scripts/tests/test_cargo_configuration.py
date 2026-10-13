@@ -136,7 +136,7 @@ class ConfigurationTests(unittest.TestCase):
     def test_cfg_grammar_and_boolean_semantics(self):
         for text, expected in [('cfg(unix)', True), ('cfg(windows)', False),
                                ('cfg(all())', True), ('cfg(any())', False),
-                               ('cfg(not(windows,))', True),
+                               ('cfg(not(windows))', True),
                                ('cfg(all(unix, any(windows, target_arch = "x86_64"),))', True),
                                ('cfg(not(target_os="linux"))', False)]:
             self.assertEqual(cargo_match_cfg(cargo_parse_cfg(text), facts()), expected)

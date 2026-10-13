@@ -392,26 +392,47 @@ check('RUST_MIN_STACK and RUST_TEST_THREADS in tracked [env] are admitted and th
 check('admitted RUST_MIN_STACK and RUST_TEST_THREADS are recorded by name and value in the receipt',
       data.get('selection', {}).get('cargo_config') == [{
           'path': str(config_path), 'sha256': digest(config_path),
-          'env_exemptions': [{'name': 'RUST_MIN_STACK', 'value': '8388608'},
-                             {'name': 'RUST_TEST_THREADS', 'value': '1'}]}])
+          'env_exemptions': [{'name': 'RUST_MIN_STACK', 'value': '8388608', 'force': False,
+                              'effective_value': '8388608', 'effective_force': False,
+                              'effective_source': 'configuration'},
+                             {'name': 'RUST_TEST_THREADS', 'value': '1', 'force': False,
+                              'effective_value': '1', 'effective_force': False,
+                              'effective_source': 'configuration'}]}])
 after, _, _ = probe(command, env_stack, mode='verify', receipt=receipt)
 check('unchanged RUST_MIN_STACK configuration passes the post-build probe', after.returncode == 0)
 config_path.rename(work / 'retained-stack-config.toml')
+# Legitimate cfg linkers and numeric tables are now positive cases, not
+# silently dropped refusal checks. Each runs genuine Cargo and final verify.
 for label, contents in (
-    ('cfg linker', '[target.\'cfg(unix)\']\nlinker="cc"\n'),
+    ('cfg-linker', '[target.\'cfg(unix)\']\nlinker="cc"\n'),
+    ('stack-table-default', '[env]\nRUST_MIN_STACK={value="16777216", force=false}\n'),
+    ('stack-table-force', '[env]\nRUST_MIN_STACK={value="16777216", force=true}\n'),
+    ('threads-table', '[env]\nRUST_TEST_THREADS={value="2", relative=false}\n'),
+):
+    config_path.write_text(contents)
+    case_env = dict(environment, CARGO_TARGET_DIR=str(work / (label + '-output')))
+    recorded, data, receipt = probe('cargo build --quiet --offline', case_env)
+    compiled = build('cargo build --quiet --offline', case_env)
+    verified, _, _ = probe('cargo build --quiet --offline', case_env, mode='verify', receipt=receipt)
+    check(label + ' admits, genuinely builds, and verifies the unchanged observation',
+          recorded.returncode == 0 and compiled.returncode == 0 and verified.returncode == 0 and
+          require([work / (label + '-output') / host / 'debug/identity-probe']) == '42')
+    config_path.rename(work / ('retained-' + label + '.toml'))
+for label, contents in (
+    ('unsupported cfg linker', '[target.\'cfg(feature="hidden")\']\nlinker="cc"\n'),
     ('environment compiler', '[env]\nRUSTC="/bin/true"\n'),
     ('environment RUSTFLAGS', '[env]\nRUSTFLAGS="-C debuginfo=0"\n'),
     ('environment RUST_MIN_STACK_X near miss', '[env]\nRUST_MIN_STACK_X="8388608"\n'),
     ('environment non-numeric RUST_MIN_STACK', '[env]\nRUST_MIN_STACK="abc"\n'),
     ('environment zero RUST_MIN_STACK', '[env]\nRUST_MIN_STACK="0"\n'),
-    ('environment table RUST_MIN_STACK', '[env]\nRUST_MIN_STACK={value="8388608", force=true}\n'),
+    ('environment relative RUST_MIN_STACK', '[env]\nRUST_MIN_STACK={value="8388608", relative=true}\n'),
     ('environment RUST_MIN_STACK beside RUSTFLAGS', '[env]\nRUST_MIN_STACK="8388608"\nRUSTFLAGS="-C debuginfo=0"\n'),
     ('environment RUST_TEST_THREADS_X near miss', '[env]\nRUST_TEST_THREADS_X="1"\n'),
     ('environment non-numeric RUST_TEST_THREADS', '[env]\nRUST_TEST_THREADS="auto"\n'),
     ('environment zero RUST_TEST_THREADS', '[env]\nRUST_TEST_THREADS="0"\n'),
     ('environment negative RUST_TEST_THREADS', '[env]\nRUST_TEST_THREADS="-1"\n'),
     ('environment integer-typed RUST_TEST_THREADS', '[env]\nRUST_TEST_THREADS=1\n'),
-    ('environment table RUST_TEST_THREADS', '[env]\nRUST_TEST_THREADS={value="1", force=true}\n'),
+    ('environment unknown RUST_TEST_THREADS attribute', '[env]\nRUST_TEST_THREADS={value="1", unknown=true}\n'),
     ('environment RUST_TEST_THREADS beside RUSTFLAGS', '[env]\nRUST_TEST_THREADS="1"\nRUSTFLAGS="-C debuginfo=0"\n'),
     ('included config', 'include=["other.toml"]\n'),
     ('command alias', '[alias]\ncompile="build"\n'),

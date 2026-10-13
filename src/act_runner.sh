@@ -7608,13 +7608,315 @@ def influences(name):
         r'(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)($|_)', name))
 
 
+def cargo_env_exemption(name, entry):
+    if name not in ('RUST_MIN_STACK', 'RUST_TEST_THREADS'):
+        return None
+    force = False
+    value = entry
+    if isinstance(entry, dict):
+        if set(entry) - {'value', 'force', 'relative'}:
+            fail('unsupported Cargo environment attributes for ' + name)
+        value = entry.get('value')
+        force = entry.get('force', False)
+        relative = entry.get('relative', False)
+        if type(force) is not bool or type(relative) is not bool or relative:
+            fail('Cargo numeric environment requires boolean force and relative=false: ' + name)
+    if not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value):
+        fail('Cargo environment requires a positive-integer string: ' + name)
+    return {'name': name, 'value': value, 'force': force}
+
+
+def cargo_effective_environment(config, receipts, environment):
+    # Cargo applies [env] to its children, not to this observer. Apply the same
+    # restricted values when probing those children, after inline assignments
+    # have been parsed. Inherited table attributes were merged before defaults.
+    effective = {}
+    for name, entry in sorted(config.get('env', {}).items()):
+        row = cargo_env_exemption(name, entry)
+        ambient = name in environment and not row['force']
+        value = environment[name] if ambient else row['value']
+        if not re.fullmatch(r'[1-9][0-9]*', value):
+            fail('effective Cargo numeric environment is invalid: ' + name)
+        effective[name] = (value, row['force'], 'environment' if ambient else 'configuration')
+    for receipt in receipts:
+        for row in receipt.get('env_exemptions', []):
+            value, force, source = effective[row['name']]
+            row.update(effective_value=value, effective_force=force, effective_source=source)
+    for name, (value, _, _) in effective.items():
+        environment[name] = value
+
+
+def cargo_flag_words(value):
+    if isinstance(value, str):
+        if '\x00' in value:
+            fail('Cargo rustflags contain a NUL byte')
+        return value.split()
+    if isinstance(value, list) and all(isinstance(word, str) for word in value):
+        if any('\x00' in word for word in value):
+            fail('Cargo rustflags contain a NUL byte')
+        return list(value)
+    fail('Cargo rustflags must be a string or an array of strings')
+
+
+def cargo_environment_flags(name, value):
+    # Cargo's RUSTFLAGS parser splits on literal spaces, then trims each
+    # argument. It does not split internal tabs/newlines or interpret quotes.
+    # Encoded flags preserve empty arguments, except that the empty variable
+    # itself means no flags. Do not silently rewrite the compiler invocation.
+    if name == 'CARGO_ENCODED_RUSTFLAGS':
+        return value.split('\x1f') if value else []
+    if name == 'RUSTFLAGS':
+        if any(character in value for character in '\x1c\x1d\x1e\x1f'):
+            fail('unsupported control separator in Cargo RUSTFLAGS')
+        return [word.strip() for word in value.split(' ') if word.strip()]
+    return cargo_flag_words(value)
+
+
+def cargo_merge_flags(previous, current):
+    cargo_flag_words(current)
+    if previous is None:
+        return current
+    if isinstance(previous, list) and isinstance(current, list):
+        return previous + current
+    if isinstance(previous, str) and isinstance(current, str):
+        return current
+    fail('Cargo rustflags change type across configuration files')
+
+
+def cargo_validate_flags(words, cfg_scoped=False):
+    # Inspect actual argument boundaries, including rustc's long option form.
+    # Response files would hide compiler/linker selectors from this observer.
+    for index, word in enumerate(words):
+        if '\x00' in word or word.startswith('@'):
+            fail('rustflags response files and NUL bytes are not statically attested')
+        if re.match(r'^-[gOvVh]+[CZ]', word):
+            fail('clustered rustflags compiler selectors are not statically attested')
+        for short, long, forbidden in (('-C', '--codegen', 'linker'),
+                                        ('-Z', '--unstable-options', 'codegen-backend')):
+            option = None
+            if word in (short, long):
+                option = words[index + 1] if index + 1 < len(words) else ''
+            elif word.startswith(short) and len(word) > len(short):
+                option = word[len(short):]
+            elif word.startswith(long + '='):
+                option = word[len(long) + 1:]
+            if option is not None:
+                key = re.split(r'[=\s]', option.strip().lstrip('='), maxsplit=1)[0]
+                # rustc accepts underscores as well as hyphens in -C/-Z keys.
+                if key.replace('_', '-') == forbidden:
+                    fail('rustflags compiler/linker overrides require explicit attested configuration')
+        if cfg_scoped and (word in ('--cfg', '--target') or word.startswith(('--cfg=', '--target='))):
+            fail('cfg-scoped Cargo selection cannot be combined with rustflags --cfg or --target')
+
+
+def cargo_parse_cfg(text):
+    # A deliberately bounded, non-evaluating subset of cargo-platform's grammar.
+    # Only target invariants are supported: feature/panic/profile/custom cfgs
+    # depend on flags or build scripts and cannot be inferred from a bare probe.
+    keys = {'target_arch', 'target_os', 'target_env', 'target_vendor',
+            'target_family', 'target_endian', 'target_pointer_width', 'target_abi'}
+    if (not isinstance(text, str) or len(text) > 4096 or
+            not text.startswith('cfg(') or not text.endswith(')')):
+        fail('unsupported Cargo cfg expression')
+    tokens, offset = [], 0
+    # cargo-platform skips only ASCII spaces, not arbitrary whitespace.
+    pattern = re.compile(r' *([A-Za-z_][A-Za-z0-9_]*|"[^"\\\x00-\x1f]*"|[(),=])')
+    while offset < len(text):
+        match = pattern.match(text, offset)
+        if not match:
+            fail('unsupported token in Cargo cfg expression: ' + text)
+        tokens.append(match.group(1))
+        offset = match.end()
+        if len(tokens) > 512:
+            fail('Cargo cfg expression exceeds the token bound')
+    position = 0
+
+    def take(expected=None):
+        nonlocal position
+        if position == len(tokens) or expected is not None and tokens[position] != expected:
+            fail('malformed Cargo cfg expression: ' + text)
+        token = tokens[position]
+        position += 1
+        return token
+
+    def expression(depth=0):
+        if depth > 32:
+            fail('Cargo cfg expression exceeds the nesting bound')
+        name = take()
+        if name in ('all', 'any', 'not'):
+            take('(')
+            children = []
+            if position < len(tokens) and tokens[position] != ')':
+                while True:
+                    children.append(expression(depth + 1))
+                    if position < len(tokens) and tokens[position] == ',':
+                        # Unlike all()/any(), Cargo's not() has no comma form.
+                        if name == 'not':
+                            fail('Cargo cfg not() does not accept a comma')
+                        take(',')
+                        if position < len(tokens) and tokens[position] == ')':
+                            break
+                    else:
+                        break
+            take(')')
+            if name == 'not' and len(children) != 1:
+                fail('Cargo cfg not() requires exactly one predicate')
+            return (name, children)
+        if position < len(tokens) and tokens[position] == '=':
+            take('=')
+            value = take()
+            if name not in keys or len(value) < 2 or not value.startswith('"') or not value.endswith('"'):
+                fail('unsupported Cargo cfg key/value predicate: ' + text)
+            return ('atom', (name, value[1:-1]))
+        if name not in ('unix', 'windows'):
+            fail('unsupported Cargo cfg name: ' + name)
+        return ('atom', (name, None))
+
+    take('cfg')
+    take('(')
+    result = expression()
+    take(')')
+    if position != len(tokens):
+        fail('trailing input in Cargo cfg expression: ' + text)
+    return result
+
+
+def cargo_match_cfg(expression, facts):
+    name, value = expression
+    if name == 'atom':
+        return value in facts
+    # Parsing/validation always visits every branch before boolean evaluation.
+    values = [cargo_match_cfg(child, facts) for child in value]
+    if name == 'not':
+        return not values[0]
+    return all(values) if name == 'all' else any(values)
+
+
+def cargo_parse_target_cfg(text):
+    if not text or len(text.encode('utf-8')) > 65536:
+        fail('rustc target cfg output is missing or exceeds the size bound')
+    facts = set()
+    for line in text.splitlines():
+        match = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_]*)(?:="([^"\\\x00-\x1f]*)")?', line)
+        if not match:
+            fail('malformed rustc target cfg output')
+        fact = (match.group(1), match.group(2))
+        if fact in facts:
+            fail('duplicate rustc target cfg output')
+        facts.add(fact)
+    for key in ('target_arch', 'target_os', 'target_env', 'target_vendor',
+                'target_endian', 'target_pointer_width'):
+        if len([value for name, value in facts if name == key and value is not None]) != 1:
+            fail('missing or ambiguous rustc target cfg: ' + key)
+    return facts
+
+
+def cargo_target_settings(config, triple, environment, facts):
+    exact = config['target'].get(triple, {})
+    matches, decisions, cfg_flags, cfg_linkers = [], [], [], []
+    for selector, values in sorted(config['target'].items()):
+        if not selector.startswith('cfg('):
+            continue
+        matched = cargo_match_cfg(cargo_parse_cfg(selector), facts)
+        row = {'expression': selector, 'matched': matched}
+        if 'rustflags' in values:
+            row['rustflags'] = cargo_flag_words(values['rustflags'])
+        if 'linker' in values:
+            row['linker'] = values['linker']
+        decisions.append(row)
+        if not matched:
+            continue
+        matches.append(selector)
+        cfg_flags.extend(row.get('rustflags', []))
+        if 'linker' in row:
+            cfg_linkers.append((selector, row['linker']))
+    variable = 'CARGO_TARGET_' + re.sub(r'[^A-Za-z0-9]', '_', triple).upper() + '_LINKER'
+    if variable in environment and not environment[variable]:
+        fail('an empty Cargo target linker is not statically attested')
+    linker = environment.get(variable) or exact.get('linker', '')
+    linker_source = variable if environment.get(variable) else ('target.' + triple if linker else None)
+    if not linker:
+        if len(cfg_linkers) > 1:
+            fail('multiple Cargo cfg linkers match the build target')
+        if cfg_linkers:
+            linker_source, linker = cfg_linkers[0]
+    # Keep the configured contributions separate from environment overrides.
+    # Cargo's target-specific environment flags append to the exact table.
+    target_flags = cargo_flag_words(exact.get('rustflags', []))
+    target_variable = variable.removesuffix('LINKER') + 'RUSTFLAGS'
+    target_flags.extend(cargo_flag_words(environment.get(target_variable, '')))
+    target_flags.extend(cfg_flags)
+    if 'CARGO_ENCODED_RUSTFLAGS' in environment:
+        flags = cargo_environment_flags('CARGO_ENCODED_RUSTFLAGS', environment['CARGO_ENCODED_RUSTFLAGS'])
+        source = 'CARGO_ENCODED_RUSTFLAGS'
+    elif 'RUSTFLAGS' in environment:
+        flags, source = cargo_environment_flags('RUSTFLAGS', environment['RUSTFLAGS']), 'RUSTFLAGS'
+    elif target_flags:
+        flags, source = target_flags, 'target'
+    else:
+        flags = cargo_flag_words(config['build'].get('rustflags', []))
+        flags.extend(cargo_flag_words(environment.get('CARGO_BUILD_RUSTFLAGS', '')))
+        source = 'build'
+    # A selector can straddle independently safe sources: exact ['-C'] plus
+    # matching cfg ['linker=...']. Validate the final ordered argv as well.
+    cargo_validate_flags(flags, bool(decisions))
+    return linker, {'cfg_tables': decisions, 'matched_cfg': matches,
+                    'linker': linker or None, 'linker_source': linker_source,
+                    'rustflags': flags, 'rustflags_source': source}
+
+
+def cargo_observe_target(config, triple, environment, compiler):
+    cfg_scoped = any(selector.startswith('cfg(') for selector in config['target'])
+    # Retain the pre-existing broad environment check, including unselected
+    # target variables, and validate every potential cfg contribution. Nothing
+    # can smuggle selectors through a currently false branch or a response file.
+    for name, value in environment.items():
+        if name.endswith('RUSTFLAGS'):
+            words = cargo_environment_flags(name, value)
+            cargo_validate_flags(words, cfg_scoped)
+    cargo_validate_flags(cargo_flag_words(config['build'].get('rustflags', [])), cfg_scoped)
+    for selector, values in config['target'].items():
+        if selector == triple or selector.startswith('cfg('):
+            cargo_validate_flags(cargo_flag_words(values.get('rustflags', [])), cfg_scoped)
+    facts, cfg_output = set(), ''
+    if cfg_scoped:
+        if config.get('unsupported_cfg_context') or any(
+                name.startswith('CARGO_UNSTABLE_') for name in environment):
+            fail('unstable Cargo host/profile configuration is outside cfg attestation')
+        wrappers = ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
+                    'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER')
+        if any(environment.get(name) for name in wrappers) or any(
+                config['build'].get(key) for key in ('rustc-wrapper', 'rustc-workspace-wrapper')):
+            fail('cfg-scoped Cargo selection through compiler wrappers is not statically attested')
+        path = compiler.get('resolved_path', compiler['selected_path'])
+        expected = compiler.get('resolved_sha256', compiler['selected_sha256'])
+        if is_script(path) or digest(pathlib.Path(path)) != expected:
+            fail('cfg probing requires the attested native rustc executable')
+        try:
+            outcome = subprocess.run([path, '--print=cfg', '--target', triple],
+                                     capture_output=True, text=True, timeout=60, env=environment)
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+            fail('cannot observe rustc target cfg: ' + str(error))
+        if outcome.returncode:
+            fail('rustc target cfg probe failed: ' + outcome.stderr.strip())
+        cfg_output = outcome.stdout
+        facts = cargo_parse_target_cfg(cfg_output)
+        if digest(pathlib.Path(path)) != expected:
+            fail('rustc executable changed while probing target cfg')
+    linker, receipt = cargo_target_settings(config, triple, environment, facts)
+    if cfg_scoped:
+        receipt['cfg_probe'] = {'compiler_path': path, 'compiler_sha256': expected,
+                                'target_triple': triple,
+                                'sha256': hashlib.sha256(cfg_output.encode()).hexdigest(),
+                                'values': sorted(cfg_output.splitlines())}
+    return linker, receipt
+
+
 def cargo_configuration():
     # Cargo searches from cwd towards the filesystem root (and CARGO_HOME).
-    # Strict staging has already excluded inherited/private-home config, but
-    # tracked .cargo/config{,.toml} remains a legitimate source of selection.
-    # Read only the literal selectors we can attest, preserving Cargo's nearer
-    # file precedence and config-relative executable paths. Do not approximate
-    # cfg expressions, aliases, includes, or configuration-driven env changes.
+    # Keep its file precedence, array concatenation and config-relative paths.
+    # Cfg predicates are parsed here, then evaluated with the selected native
+    # compiler's target facts once the actual invocation has been resolved.
     paths = []
     for directory in reversed([pathlib.Path.cwd(), *pathlib.Path.cwd().parents]):
         legacy, modern = directory / '.cargo/config', directory / '.cargo/config.toml'
@@ -7628,7 +7930,7 @@ def cargo_configuration():
         if path.exists() or path.is_symlink():
             if path not in paths:
                 fail('strict toolchain attestation forbids private-home Cargo configuration')
-    config, receipts = {'build': {}, 'target': {}, 'alias': {}}, []
+    config, receipts = {'build': {}, 'target': {}, 'alias': {}, 'env': {}}, []
     if not paths:
         return config, receipts
     try:
@@ -7645,19 +7947,28 @@ def cargo_configuration():
             fail('invalid Cargo configuration: ' + str(error))
         if 'include' in current:
             fail('Cargo configuration includes require an explicitly attested selection')
+        # These opt-in Cargo features can add flags or change host selection.
+        # Do not silently treat them as the supported target configuration.
+        if any(key in current for key in ('unstable', 'host', 'target-applies-to-host')):
+            config['unsupported_cfg_context'] = True
         environment = current.get('env', {})
         if not isinstance(environment, dict):
             fail('invalid Cargo configuration section: env')
-        # RUST_MIN_STACK only sizes rustc's and test/run threads' stacks, and
-        # RUST_TEST_THREADS only sets libtest's default thread count; neither
-        # selects a compiler, target, flag or codegen input. Admit exactly
-        # those names with a plain positive integer, and record them per build.
-        exemptions = [{'name': name, 'value': value} for name, value in sorted(environment.items())
-                      if name in ('RUST_MIN_STACK', 'RUST_TEST_THREADS') and isinstance(value, str)
-                      and re.fullmatch(r'[1-9][0-9]*', value)]
-        exempt = {row['name'] for row in exemptions}
-        if any(influences(name) for name in environment if name not in exempt):
-            fail('Cargo configuration changes the compiler environment; use the configured build environment')
+        exemptions = []
+        for name, entry in sorted(environment.items()):
+            row = cargo_env_exemption(name, entry)
+            if row is None:
+                if influences(name):
+                    fail('Cargo configuration changes the compiler environment; use the configured build environment')
+                continue
+            exemptions.append(row)
+            previous = config['env'].get(name)
+            if previous is not None:
+                if isinstance(previous, dict) and isinstance(entry, dict):
+                    entry = dict(previous, **entry)
+                elif not isinstance(previous, str) or not isinstance(entry, str):
+                    fail('Cargo numeric environment changes type across configuration files: ' + name)
+            config['env'][name] = entry
         for section in ('build', 'target', 'alias'):
             if section in current and not isinstance(current[section], dict):
                 fail('invalid Cargo configuration section: ' + section)
@@ -7668,19 +7979,24 @@ def cargo_configuration():
                     fail('Cargo build.' + key + ' must be a literal executable path')
                 if '/' in build[key] and not pathlib.Path(build[key]).is_absolute():
                     build[key] = str((path.parent.parent / build[key]).resolve())
+        if 'rustflags' in build:
+            build['rustflags'] = cargo_merge_flags(config['build'].get('rustflags'), build['rustflags'])
         config['build'].update(build)
         for target, values in current.get('target', {}).items():
             if not isinstance(values, dict):
                 fail('invalid Cargo target configuration')
             values = dict(values)
-            if target.startswith('cfg(') and ('linker' in values or 'rustflags' in values):
-                fail('Cargo cfg-based compiler selection is not statically attested; use an exact target table')
+            if target.lstrip().startswith('cfg'):
+                cargo_parse_cfg(target)
             if 'linker' in values:
-                if not isinstance(values['linker'], str):
+                if not isinstance(values['linker'], str) or not values['linker'] or '\x00' in values['linker']:
                     fail('Cargo target linker must be a literal executable path')
                 if '/' in values['linker'] and not pathlib.Path(values['linker']).is_absolute():
                     values['linker'] = str((path.parent.parent / values['linker']).resolve())
-            config['target'].setdefault(target, {}).update(values)
+            previous = config['target'].setdefault(target, {})
+            if 'rustflags' in values:
+                values['rustflags'] = cargo_merge_flags(previous.get('rustflags'), values['rustflags'])
+            previous.update(values)
         config['alias'].update(current.get('alias', {}))
         receipt = {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
         if exemptions:
@@ -7854,6 +8170,8 @@ def invocation_selection():
         cursor = 0
         while cursor < len(argv) and argv[cursor].startswith('-'):
             option = argv[cursor]
+            if option.startswith('-Z') and any(key.startswith('cfg(') for key in cargo_config['target']):
+                fail('unstable Cargo options are outside cfg target attestation')
             if option in ('-Z', '--color'):
                 cursor += 2
             elif option in ('-v', '-vv', '--verbose', '-q', '--quiet', '--locked', '--offline', '--frozen') or \
@@ -7866,6 +8184,9 @@ def invocation_selection():
         subcommand = argv[cursor]
         if subcommand in cargo_config['alias']:
             fail('Cargo alias cannot be attested as a direct compiler invocation: ' + subcommand)
+        if subcommand == 'rustc' and '--' in argv:
+            cargo_validate_flags(argv[argv.index('--') + 1:],
+                                 any(key.startswith('cfg(') for key in cargo_config['target']))
         if re.search(r'(?:^|\s)-C\s*linker(?:[=\s]|$)', ' '.join(argv)) or \
                 (subcommand == 'rustc' and '--' in argv and
                  any(arg == '--target' or arg.startswith('--target=') for arg in argv[argv.index('--') + 1:])):
@@ -7934,6 +8255,9 @@ if mode == 'target':
     sys.exit(0)
 
 
+cargo_effective_environment(cargo_config, cargo_config_receipts, probe_env)
+
+
 def run(argv, required=True, timeout=60):
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=probe_env)
@@ -7944,16 +8268,6 @@ def run(argv, required=True, timeout=60):
     return (result.stdout or result.stderr).strip()
 
 cargo_argv = ['cargo'] + (['+' + selection['toolchain']] if explicit_toolchain else [])
-if mode == 'metadata':
-    try:
-        metadata = json.loads(run(cargo_argv + ['metadata', '--locked', '--offline', '--all-features',
-                                   '--format-version=1', '--manifest-path', str(pathlib.Path.cwd() / 'Cargo.toml')],
-                                  timeout=300))
-    except ValueError as error:
-        fail('invalid selected Cargo metadata: ' + str(error))
-    json.dump(metadata, sys.stdout, sort_keys=True)
-    sys.stdout.write('\n')
-    sys.exit(0)
 
 def is_script(path):
     with open(path, 'rb') as stream:
@@ -8096,15 +8410,7 @@ if not triple:
     if not triple:
         fail('rustc did not report its default host target')
 linker_variable = 'CARGO_TARGET_' + re.sub(r'[^A-Za-z0-9]', '_', triple).upper() + '_LINKER'
-configured_linker = cargo_config['target'].get(triple, {}).get('linker', '')
-linker = probe_env.get(linker_variable) or configured_linker
-rustflags = [value for name, value in probe_env.items() if name.endswith('RUSTFLAGS')]
-rustflags += [cargo_config['build'].get('rustflags', []),
-              cargo_config['target'].get(triple, {}).get('rustflags', [])]
-for flags in rustflags:
-    text = ' '.join(flags) if isinstance(flags, list) else flags
-    if not isinstance(text, str) or re.search(r'(?:^|\s|\x1f)-C\s*linker(?:[=\s]|$)', text):
-        fail('rustflags linker overrides require an explicit target linker configuration')
+linker, cargo_target_receipt = cargo_observe_target(cargo_config, triple, probe_env, tools['rustc'])
 for wrapper in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER',
                 'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER'):
     if probe_env.get(wrapper):
@@ -8135,7 +8441,20 @@ result = {'schema_version': 1, 'cwd': os.getcwd(), 'target_triple': triple,
           'linker_variable': linker_variable if probe_env.get(linker_variable) else None, 'tools': tools,
           'selection': {'rustup_toolchain': selection['toolchain'],
                         'cargo_commands': cargo_commands,
-                        'cargo_config': cargo_config_receipts}}
+                        'cargo_config': cargo_config_receipts,
+                        'cargo_target': cargo_target_receipt}}
+
+# Metadata admission uses the same cfg/compiler validation as the build.
+if mode == 'metadata':
+    try:
+        metadata = json.loads(run(cargo_argv + ['metadata', '--locked', '--offline', '--all-features',
+                                   '--format-version=1', '--manifest-path', str(pathlib.Path.cwd() / 'Cargo.toml')],
+                                  timeout=300))
+    except ValueError as error:
+        fail('invalid selected Cargo metadata: ' + str(error))
+    json.dump(metadata, sys.stdout, sort_keys=True)
+    sys.stdout.write('\n')
+    sys.exit(0)
 
 if mode == 'context':
     # Transfer only selection-induced changes; the cache process already has
