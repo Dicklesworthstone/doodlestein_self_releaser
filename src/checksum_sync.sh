@@ -722,7 +722,7 @@ root, name = sys.argv[1:]
 directory = None
 try:
     if (not os.path.isabs(root) or os.path.realpath(root) != root or
-            not re.fullmatch(r"(?:result|target-[1-9][0-9]*\.result)\.json", name)):
+            not re.fullmatch(r"(?:result|sync-plan|continuation|target-[1-9][0-9]*\.(?:intent|result))\.json", name)):
         raise ValueError("invalid receipt location")
     data = sys.stdin.buffer.read(64 * 1024 * 1024 + 1)
     if not data or len(data) > 64 * 1024 * 1024:
@@ -755,6 +755,29 @@ finally:
 ' "$1" "$2"
 }
 
+# The parent shell keeps this open-file-description lock for the whole sync,
+# including its terminal receipt. Children inherit custody: a killed parent
+# cannot authorize a concurrent resumer while an owned Git operation survives.
+# Python acquires the lock on the inherited descriptor, not a separately opened
+# file whose lock would disappear when the helper exits.
+_cs_sync_lease() {
+    python3 -I -S -c '
+import fcntl, os, stat, sys
+try:
+    fd = int(sys.argv[1])
+    held, named = os.fstat(fd), os.lstat(sys.argv[2])
+    if (not stat.S_ISREG(held.st_mode) or held.st_nlink != 1 or
+            held.st_uid != os.geteuid() or
+            (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)):
+        raise ValueError("unsafe synchronization lease")
+    os.fchmod(fd, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (OSError, ValueError) as error:
+    print("[checksum-sync] Cannot hold synchronization lease: " + str(error), file=sys.stderr)
+    sys.exit(2)
+' "$1" "$2"
+}
+
 # Sync checksums to downstream repos after release
 # Usage: checksum_sync <tool> <version> [options]
 # Options:
@@ -770,6 +793,7 @@ checksum_sync() (
     local workspace='' tag='' source_kind='' source_asset='' manifest_sha='' error='' arg option
     local verify_release=false audit_receipt='' audit_worker='' audit_pin=''
     local audit_mode='aggregate' audit_asset='' audit_resume=''
+    local sync_plan_pin='' sync_lease=9 plan_options
     local -a audit_args=()
     local _CS_SYNC_AUDIT_PIN='' _CS_SYNC_MANIFEST_PIN='' _CS_SYNC_WORK='' _CS_SYNC_AUDIT=''
     local _CS_SYNC_REPO='' _CS_SYNC_TAG='' _CS_SYNC_METADATA='' _CS_SYNC_MODE='' _CS_SYNC_ASSET=''
@@ -815,11 +839,14 @@ checksum_sync() (
                 --argjson synced "$synced" --argjson failed "$failed" --argjson planned "$planned" \
                 --argjson issues "$issues_opened" --argjson dry_run "$dry_run" \
                 --argjson verified_release "$verify_release" --arg audit_pin "$audit_pin" \
+                --arg plan_pin "$sync_plan_pin" \
                 "${audit_json[@]}" "${freshness_json[@]}" \
                 '{kind:"dsr-checksum-sync-result",schema_version:1,
                   status:$status,exit_code:$code,tool:$tool,version:$version,repository:$repo,
                   workspace:(if $workspace == "" then null else $workspace end),dry_run:$dry_run,
                   result_file:(if $workspace == "" then null else $workspace+"/result.json" end),
+                  sync_plan:(if $plan_pin=="" then null else
+                    {path:($workspace+"/sync-plan.json"),sha256:$plan_pin} end),
                   source:{kind:$source,asset:$asset,manifest_sha256:$digest},
                   release_verification:$audit[0],
                   release_verification_sha256:(if $audit_pin=="" then null else $audit_pin end),
@@ -918,6 +945,9 @@ OPTIONS:
 Local commits and failed checkouts are retained in the reported private workspace.
 Every handled completion also retains result.json, even without --json. Keep its
 reported SHA256 for checksum_sync.sh recover; recovery never creates a new commit.
+Audited sync also retains a pinned sync-plan.json before any destination starts.
+recover --plan FILE --plan-sha256 HASH reconciles the entire fan-out; --execute
+can continue its safely unattempted destinations with a new audited sync.
 Download-only manifests are syntax-validated, not proof of artifact authenticity.
 --verify-release cannot use --manifest or --artifacts-dir, bypasses local cached
 artifacts, and retains its full audit. --dry-run audits but never changes downstream repos.
@@ -976,6 +1006,13 @@ EOF
     fi
     workspace=$(mktemp -d "$root/dsr-checksum-sync.XXXXXXXX") || return 1
     workspace=$(cd "$workspace" && pwd -P) || return 1
+    if $verify_release; then
+        # The function already owns a subshell, so this descriptor cannot
+        # replace the source caller's fd. Fixed allocation also supports Bash
+        # 4.0, before the exec {variable} descriptor-allocation syntax.
+        exec 9> "$workspace/.sync.lock" || return 1
+        _cs_sync_lease "$sync_lease" "$workspace/.sync.lock" || return $?
+    fi
     local content='' candidate state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     if ! $verify_release && [[ -z "$artifacts_dir" && -z "$manifest" ]]; then
         for candidate in "$state_dir/releases/$tool_name/$tag" "$state_dir/artifacts/$tool_name/$tag" "/tmp/dsr-release-$tool_name-$tag"; do
@@ -1054,18 +1091,46 @@ EOF
         _CS_SYNC_MODE="$audit_mode"; _CS_SYNC_ASSET="$audit_asset"; _CS_SYNC_MODULE="$module_dir"
         _CS_SYNC_RELEASE_ID=$(jq -er '.release.id' "$audit_receipt") || return 7
         mkdir "$workspace/freshness" || return 1
+        # Freeze the complete fan-out before its first effect. A terminal
+        # result may never be written after SIGKILL; absent target intent is
+        # now distinguishable from an interrupted, potentially delivered one.
+        plan_options=$(printf '%s\n' "${_CS_SYNC_RECHECK_ARGS[@]}" | jq -Rsc 'split("\n")|map(select(length>0))') || return 1
+        if ! printf '%s\n' "${unique_targets[@]}" | jq -Rsc \
+            --arg root "$workspace" --arg tool "$tool_name" --arg repo "$repo" --arg tag "$tag" \
+            --arg member "$checksums_file" --arg audit "$audit_pin" --arg manifest "$manifest_sha" \
+            --argjson push "$push_changes" --argjson review "$review" --argjson dry "$dry_run" \
+            --argjson options "$plan_options" '
+            {kind:"dsr-checksum-sync-plan",schema_version:1,workspace:$root,tool:$tool,
+             repository:$repo,tag:$tag,checksums_file:$member,push:$push,review:$review,dry_run:$dry,
+             audit_sha256:$audit,manifest_sha256:$manifest,audit_options:$options,
+             targets:(split("\n")|map(select(length>0)))}' |
+            _cs_retain_sync_json "$workspace" sync-plan.json; then
+            error='Could not retain complete sync plan; no downstream destination was attempted'; return 1
+        fi
+        sync_plan_pin=$(_cs_sha256 "$workspace/sync-plan.json") || return 1
+        _cs_log_info "Sync plan retained: $workspace/sync-plan.json (SHA256 $sync_plan_pin)"
     fi
     local index=0 checkout receipt rc action entry issue_url body
     for target in "${unique_targets[@]}"; do
         index=$((index + 1)); rc=0; receipt='{}'; checkout=''; action=update
         _CS_SYNC_TARGET="$target"
         if $verify_release; then
+            [[ "$(_cs_sha256 "$workspace/sync-plan.json")" == "$sync_plan_pin" ]] || {
+                error='Sync plan changed before downstream intent'; return 7;
+            }
+            if ! jq -nc --arg pin "$sync_plan_pin" --arg repo "$target" --argjson index "$index" \
+                '{kind:"dsr-checksum-sync-target-intent",schema_version:1,plan_sha256:$pin,index:$index,repo:$repo}' |
+                _cs_retain_sync_json "$workspace" "target-$index.intent.json"; then
+                error='Could not retain downstream intent; destination was not attempted'; return 1
+            fi
             _cs_sync_release_gate before-target || rc=$?
             if ((rc != 0)); then
                 error='Release freshness could not be confirmed before downstream update'
-                entry=$(jq -nc --arg repo "$target" --argjson code "$rc" \
-                    '{repo:$repo,action:"blocked",status:"error",exit_code:$code,checkout:null,blocked_phase:"before-target"}') || return 1
+                entry=$(jq -nc --arg repo "$target" --argjson code "$rc" --arg pin "$sync_plan_pin" --argjson index "$index" \
+                    '{repo:$repo,action:"blocked",status:"error",exit_code:$code,checkout:null,blocked_phase:"before-target",
+                      plan_sha256:$pin,index:$index}') || return 1
                 results+=("$entry"); failed=$((failed + 1))
+                printf '%s\n' "$entry" | _cs_retain_sync_json "$workspace" "target-$index.result.json" || return 1
                 return "$rc"
             fi
         fi
@@ -1108,9 +1173,10 @@ EOF
             _cs_log_error "$action failed for $target (exit $rc); checkout/logs retained"
         fi
         entry=$(jq -nc --arg repo "$target" --arg action "$action" --arg path "$checkout" \
-            --argjson code "$rc" --argjson receipt "$receipt" \
+            --argjson code "$rc" --argjson receipt "$receipt" --arg pin "$sync_plan_pin" --argjson index "$index" \
             '$receipt + {repo:$repo,action:$action,status:(if $code == 0 then "success" else "error" end),
-              exit_code:$code,checkout:(if $path == "" then null else $path end)}') || return 1
+              exit_code:$code,checkout:(if $path == "" then null else $path end)} +
+              (if $pin=="" then {} else {plan_sha256:$pin,index:$index} end)') || return 1
         results+=("$entry")
         if ! printf '%s\n' "$entry" | _cs_retain_sync_json "$workspace" "target-$index.result.json"; then
             error='Could not retain downstream outcome; later destinations were not attempted'

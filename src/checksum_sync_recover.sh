@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Reconcile one acknowledged checksum commit against its actual remote branch.
 # Consumes the original checksum_sync JSON with an independently selected digest.
-# Never clones, commits, resets, creates a branch, retries a push, or opens issues.
+# Single-result mode never clones, commits, resets, creates a branch or opens
+# issues. Explicit --plan recovery routes to the separately scoped continuation.
 set -uo pipefail
 MODULE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || exit 3
+for argument in "$@"; do
+    case "$argument" in
+        --plan|--plan=*) exec bash "$MODULE/checksum_sync_resume.sh" "$@" ;;
+    esac
+done
 command -v python3 >/dev/null || { printf '%s\n' 'Python 3 is required for checksum delivery recovery' >&2; exit 3; }
 exec python3 -I - "$MODULE" "$@" <<'PY'
 import argparse
@@ -24,7 +30,10 @@ started = time.monotonic()
 output = None
 worker = None
 lock = None
+sync_lock = None
 step = 0
+checkpoint_files = {}
+checkpoint_terminal_absent = False
 report = dict(kind='dsr-checksum-delivery-recovery', schema_version=1, status='error', exit_code=7,
               push_requested=False, push_attempted=False, push_outcome='not-attempted',
               push_exit_code=None, remote_state='unconfirmed', delivery_confirmed=False,
@@ -111,7 +120,8 @@ def run(argv, phase, maximum=8 * 1024 * 1024):
     environment.update(GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', GIT_NO_LAZY_FETCH='1')
     with prefix.with_suffix('.stdout').open('xb') as out, prefix.with_suffix('.stderr').open('xb') as err:
         worker = subprocess.Popen([str(x) for x in argv], stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                  env=environment, start_new_session=True)
+                                  env=environment, start_new_session=True,
+                                  pass_fds=(() if sync_lock is None else (sync_lock,)))
         try:
             code = worker.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired as error:
@@ -146,12 +156,22 @@ def git(argv, phase, accepted=(0,)):
     return code, data
 
 def local_evidence(payloads=False):
+    if sync_lock is not None:
+        held_sync, named_sync = os.fstat(sync_lock), (workspace / '.sync.lock').lstat()
+        need(held_sync.st_nlink == 1 and (held_sync.st_dev, held_sync.st_ino) ==
+             (named_sync.st_dev, named_sync.st_ino), 'Synchronization lease changed', 2)
     held = os.fstat(lock)
     named = lock_path.lstat()
     need(held.st_nlink == 1 and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino),
          'Recovery lock was replaced; stop instead of using an unlinked lease', 2)
     need(sha(stable_bytes(result_path, 64 * 1024 * 1024)) == args.result_sha256,
          'Original sync result changed', 2)
+    for path, pin in checkpoint_files.items():
+        need(sha(stable_bytes(path_checked(str(path)), 64 * 1024 * 1024)) == pin,
+             'Plan-bound checkpoint evidence changed', 2)
+    if checkpoint_terminal_absent:
+        need(not (workspace / 'result.json').exists() and not (workspace / 'result.json').is_symlink(),
+             'A terminal sync result appeared after checkpoint selection', 2)
     path_checked(str(workspace), directory=True)
     for name in ('audit-result.json', 'audit/result.json'):
         path = path_checked(str(workspace / name))
@@ -179,11 +199,12 @@ def local_commit():
                     ['diff', '--cached', '--quiet', '--no-ext-diff', '--no-textconv', '--']):
         code, _ = git(['-C', checkout, *options], 'tracked-state', accepted=(0, 1))
         need(code == 0, 'Retained checkout has tracked edits; no recovery write attempted', 2)
-    _, parents = git(['-C', checkout, 'rev-list', '--parents', '-n', '1', commit], 'commit-parent')
-    need(parents.decode().strip().split() == [commit, previous], 'Acknowledged commit has unexpected ancestry', 2)
-    _, changed = git(['-C', checkout, 'diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-z',
-                      '-r', previous, commit, '--'], 'commit-paths')
-    need(changed == member.encode() + b'\0', 'Recovery commit changes more than its checksum file', 2)
+    if not unchanged:
+        _, parents = git(['-C', checkout, 'rev-list', '--parents', '-n', '1', commit], 'commit-parent')
+        need(parents.decode().strip().split() == [commit, previous], 'Acknowledged commit has unexpected ancestry', 2)
+        _, changed = git(['-C', checkout, 'diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-z',
+                          '-r', previous, commit, '--'], 'commit-paths')
+        need(changed == member.encode() + b'\0', 'Recovery commit changes more than its checksum file', 2)
     _, tree = git(['-C', checkout, 'ls-tree', '-z', commit, '--', member], 'checksum-mode')
     need(re.fullmatch(rb'100644 blob [0-9a-f]{40}(?:[0-9a-f]{24})?\t' + re.escape(member.encode()) + b'\x00', tree),
          'Checksum commit does not contain a regular checksum blob', 2)
@@ -260,6 +281,7 @@ try:
     parser.add_argument('--output-dir', required=True, help='New, separate directory for recovery evidence')
     parser.add_argument('--push', action='store_true', help='Permit one push only when the remote still equals the original parent')
     parser.add_argument('--timeout', type=int, default=120)
+    parser.add_argument('--sync-lease-fd', type=int, help=argparse.SUPPRESS)
     flags = [x.split('=', 1)[0] for x in sys.argv[2:] if x.startswith('--')]
     need(len(flags) == len(set(flags)), 'Duplicate recovery option', 4)
     args = parser.parse_args(sys.argv[2:])
@@ -270,11 +292,71 @@ try:
     raw_result = stable_bytes(result_path, 64 * 1024 * 1024)
     need(sha(raw_result) == args.result_sha256, 'Original sync result differs from the selected SHA256', 4)
     result = document(raw_result)
+    checkpoint = isinstance(result, dict) and result.get('kind') == 'dsr-checksum-sync-checkpoint-selection'
     need(isinstance(result, dict) and result.get('dry_run') is False and
-         type(result.get('exit_code')) is int and result.get('status') in ('success', 'partial', 'error') and
+         ((not checkpoint and type(result.get('exit_code')) is int and result.get('status') in ('success', 'partial', 'error')) or
+          (checkpoint and result.get('exit_code') is None and result.get('status') == 'checkpointed')) and
          result.get('source', {}).get('kind') == 'verified_release_assets' and isinstance(result.get('results'), list),
          'Recovery needs an actual audited synchronization result', 4)
     workspace = path_checked(result.get('workspace'), directory=True)
+    sync_lock_path = workspace / '.sync.lock'
+    if checkpoint or sync_lock_path.exists() or sync_lock_path.is_symlink() or args.sync_lease_fd is not None:
+        # A plan-based parent can hand down the same already-held open-file
+        # description. Validate and acquire it anyway: a numeric descriptor
+        # by itself is not permission to overlap the original sync.
+        path_checked(str(sync_lock_path))
+        sync_lock = (os.dup(args.sync_lease_fd) if args.sync_lease_fd is not None else
+                     os.open(sync_lock_path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK))
+        held_sync, named_sync = os.fstat(sync_lock), sync_lock_path.lstat()
+        need(stat.S_ISREG(held_sync.st_mode) and held_sync.st_nlink == 1 and
+             held_sync.st_uid == os.geteuid() and not held_sync.st_mode & 0o077 and
+             (held_sync.st_dev, held_sync.st_ino) == (named_sync.st_dev, named_sync.st_ino),
+             'Unsafe synchronization lease', 4)
+        try:
+            fcntl.flock(sync_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise Failure('An active sync or continuation owns this workspace', 2) from error
+    if checkpoint:
+        # A checkpoint selection is a derived, independently pinned handoff,
+        # NOT a fabricated terminal outcome for an interrupted original sync.
+        plan_path = path_checked(str(workspace / 'sync-plan.json'))
+        plan_bytes = stable_bytes(plan_path, 64 * 1024 * 1024)
+        plan_pin = result.get('checkpoint_plan_sha256')
+        need(hex_digest(plan_pin) and sha(plan_bytes) == plan_pin, 'Checkpoint plan pin differs', 4)
+        plan = document(plan_bytes)
+        need(isinstance(plan, dict) and plan.get('kind') == 'dsr-checksum-sync-plan' and
+             type(plan.get('schema_version')) is int and plan['schema_version'] == 1 and
+             plan.get('workspace') == str(workspace) and plan.get('review') is False and plan.get('dry_run') is False and
+             plan.get('repository') == result.get('repository') and plan.get('tag') == result.get('version') and
+             plan.get('audit_sha256') == result.get('release_verification_sha256') and
+             plan.get('manifest_sha256') == result['source'].get('manifest_sha256') and
+             isinstance(plan.get('targets'), list), 'Checkpoint differs from the original plan', 4)
+        checkpoint_files[plan_path] = plan_pin
+        for recorded_row in result['results']:
+            need(isinstance(recorded_row, dict), 'Malformed target checkpoint', 4)
+            index = recorded_row.get('index')
+            need(type(index) is int and 1 <= index <= len(plan['targets']) and
+                 recorded_row.get('repo') == plan['targets'][index-1] and
+                 recorded_row.get('plan_sha256') == plan_pin and
+                 recorded_row.get('checksums_file') == plan.get('checksums_file'),
+                 'Checkpoint target differs from the selected plan', 4)
+            for suffix, expected in (('result', recorded_row), ('intent', dict(
+                    kind='dsr-checksum-sync-target-intent', schema_version=1, plan_sha256=plan_pin,
+                    index=index, repo=recorded_row['repo']))):
+                path = path_checked(str(workspace / ('target-%d.%s.json' % (index, suffix))))
+                data = stable_bytes(path, 64 * 1024 * 1024)
+                need(document(data) == expected, 'Original target checkpoint differs', 4)
+                checkpoint_files[path] = sha(data)
+        terminal_pin = result.get('checkpoint_terminal_sha256')
+        if terminal_pin is None:
+            checkpoint_terminal_absent = True
+            need(not (workspace / 'result.json').exists() and not (workspace / 'result.json').is_symlink(),
+                 'Unbound terminal result exists', 4)
+        else:
+            terminal = path_checked(str(workspace / 'result.json'))
+            need(hex_digest(terminal_pin) and sha(stable_bytes(terminal, 64 * 1024 * 1024)) == terminal_pin,
+                 'Original terminal result differs', 4)
+            checkpoint_files[terminal] = terminal_pin
     targets = result['results']
     need(all(isinstance(r, dict) and repository(r.get('repo')) for r in targets) and
          len({r['repo'].lower() for r in targets}) == len(targets), 'Ambiguous downstream target records', 4)
@@ -282,12 +364,15 @@ try:
     need(len(selected) == 1, 'No unique recorded downstream target', 4)
     row = selected[0]
     target_repo = row['repo']
-    need(row.get('action') == 'update' and row.get('committed') is True and
+    unchanged = (row.get('changed') is False and row.get('committed') is False and
+                 row.get('commit_attempted') is False and row.get('commit_outcome') == 'not-attempted' and
+                 row.get('commit_exit_code') is None and row.get('commit') == row.get('previous_commit'))
+    need(row.get('action') == 'update' and (unchanged or (row.get('committed') is True and
          row.get('commit_outcome') == 'acknowledged' and row.get('commit_attempted') is True and
-         type(row.get('commit_exit_code')) is int and row['commit_exit_code'] == 0,
+         type(row.get('commit_exit_code')) is int and row['commit_exit_code'] == 0)),
          'Recovery requires an acknowledged local checksum commit; uncertain commits and issues are not replayed', 4)
     commit, previous, branch, member = (row.get(k) for k in ('commit', 'previous_commit', 'branch', 'checksums_file'))
-    need(hex_digest(commit, (40, 64)) and hex_digest(previous, (40, 64)) and commit != previous and
+    need(hex_digest(commit, (40, 64)) and hex_digest(previous, (40, 64)) and (unchanged or commit != previous) and
          isinstance(branch, str) and branch.startswith('refs/heads/') and
          isinstance(member, str) and 0 < len(member) <= 1024 and not member.startswith(('/', '-')) and
          not any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in member) and
@@ -324,7 +409,8 @@ try:
     report.update(output_dir=str(output), result_file=str(result_path), result_sha256=args.result_sha256,
                   repository=target_repo, source_repository=origin_repo, tag=tag, commit=commit,
                   previous_commit=previous, branch=branch, checksums_file=member, checkout=str(checkout),
-                  historical_push_outcome=row.get('push_outcome'), selected_commit_verified=False)
+                  historical_push_outcome=row.get('push_outcome'), selected_commit_verified=False,
+                  unchanged_checksum_commit=unchanged, checkpoint_selection=checkpoint)
     (output / 'input-result.json').write_bytes(raw_result)
     lock_path = workspace / ('.recovery-' + checkout.name + '.lock')
     lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -342,7 +428,7 @@ try:
     fresh('freshness-before')
     need(local_commit() == endpoint, 'Effective origin changed before recovery', 2)
     observed = remote_tip()
-    if observed == previous and args.push:
+    if observed == previous and args.push and not unchanged:
         # A repeated explicit recovery gets another intent, never overwrites a
         # prior attempt, and first checks whether the previous push arrived.
         (output / 'push-intent.json').write_bytes(canonical(dict(result_sha256=args.result_sha256,
@@ -370,8 +456,6 @@ except (Failure, OSError, ValueError, TypeError, KeyError, IndexError) as error:
     report['release_freshness']['status'] = 'unconfirmed'
     print('[checksum-recovery] ' + str(error), file=sys.stderr)
 finally:
-    if lock is not None:
-        os.close(lock)
     report['duration_ms'] = int((time.monotonic() - started) * 1000)
     if output is not None:
         try:
@@ -385,5 +469,9 @@ finally:
         print('[checksum-recovery] Evidence retained: ' + str(output), file=sys.stderr)
     if 'args' in globals() or sys.exc_info()[0] is not SystemExit:
         print(canonical(report).decode(), end='')
+    if lock is not None:
+        os.close(lock)
+    if sync_lock is not None:
+        os.close(sync_lock)
 sys.exit(report['exit_code'])
 PY
