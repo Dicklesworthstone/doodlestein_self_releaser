@@ -1,0 +1,63 @@
+# Platform-specific build configuration.
+#
+# FreeBSD installs third-party libraries (clang, openssl, sqlite, …) under
+# /usr/local via pkg(8). Rustc and pkg-config do not search there by default,
+# so we add the prefix to the native-library and pkg-config search paths.
+# These settings are inert on Linux/macOS/Windows.
+
+# Release binaries are held to a <48 MiB budget (raised for the v0.3.0
+# capability wave).
+#
+# The parallel rustc front-end (-Z threads) and the LLVM machine outliner
+# are both scoped away from Windows: on *-msvc targets each breaks SEH
+# directive emission (".seh_ directive must appear within an active
+# frame" — the outliner does not support SEH frames, and the parallel
+# front-end miscompiles their emission), so Windows builds use the
+# default single-threaded front-end without outlining.
+[target.'cfg(all(not(target_os = "windows"), not(target_os = "freebsd")))']
+rustflags = ["-Z", "threads=4", "-Cllvm-args=-enable-machine-outliner=always"]
+
+[target.'cfg(target_os = "freebsd")']
+rustflags = ["-L", "/usr/local/lib"]
+
+[env]
+PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
+
+# Minimum stack for every thread a cargo-launched process spawns, which for
+# `cargo test` means each libtest test thread.
+#
+# This used to be the only thing standing between `cargo test --lib` and an
+# abort: every `sdk::tests` case that builds a session overflows the 2 MiB
+# default in a debug build, and a stack overflow kills the process, so the run
+# ended with no pass/fail tally for any of its ~9900 tests. That is the same
+# failure mode bd-79qxb found in `sdk_unit` and `sdk_integration`; its fix
+# (`thread_stack_size` on the shared runtime builder, tests/common/mod.rs) could
+# not reach these, because they drive a `current_thread` runtime that polls on
+# the libtest thread itself, and several of their futures hold an
+# `asupersync::sync::MutexGuard` across an await so cannot be moved to a
+# reserved thread either.
+#
+# The lib suite no longer depends on it. `sdk::tests::run_async` and
+# `sdk::extension_bootstrap_tests::run_async` box their futures, and the whole
+# lib test binary now runs to a full tally on an unmodified 2 MiB stack. That
+# distinction matters because `[env]` reaches only processes cargo launches: a
+# built test binary invoked directly, as one does to skip a relink, gets none
+# of it, and used to abort with no output but an exit code.
+#
+# 16 MiB matches the project's other long-frame reservations,
+# `SQLITE_THREAD_STACK_BYTES` (src/session_sqlite.rs) and `DRIVER_STACK_BYTES`
+# (src/interactive_ftui.rs). It stays as headroom for the other test binaries
+# and for any future deep frame. The reservation is virtual and committed
+# lazily, so threads that never need it pay nothing. `force = false` leaves an
+# operator free to raise it further from the environment.
+#
+# This reaches only processes cargo launches; a shipped `pi` binary is
+# unaffected.
+RUST_MIN_STACK = { value = "16777216", force = false }
+
+# Windows MSVC linking must not depend on PATH resolution of link.exe:
+# build hosts with Git-for-Windows expose GNU coreutils `link` first, which
+# rustc then invokes as the linker and fails ("extra operand ... .rcgu.o").
+# rust-lld ships with the pinned toolchain and drives MSVC links natively.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

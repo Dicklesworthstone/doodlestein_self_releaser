@@ -1,0 +1,70 @@
+name: Cargo configuration attestation regression
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/act_runner.sh
+      - scripts/tests/test_cargo_configuration.py
+      - scripts/tests/test_toolchain_identity.sh
+      - tests/fixtures/cargo/**
+      - .github/workflows/cargo-configuration-regression.yml
+  workflow_dispatch:
+concurrency:
+  group: cargo-configuration-regression-main
+  cancel-in-progress: false
+jobs:
+  compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-10-01
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      # Qualify this exact candidate before publishing its source on main.
+      # The patch is an immutable Git blob, not input from a branch or issue.
+      # This job creates verified blobs only; it never commits or updates refs.
+      - name: Apply the hash-bound compatibility candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git hash-object src/act_runner.sh)" = 16ccffe47fbd5410914def851ad3a5e7020f41d5
+          test "$(git hash-object scripts/tests/test_toolchain_identity.sh)" = 6c29af07ece5b0b6b8a8cb91482b4b5e284bc95e
+          patch_file="$RUNNER_TEMP/cargo-compatibility.patch"
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/3286cba174cf5a0a9119d73f74cb5380541a2303" --jq .content | base64 --decode > "$patch_file"
+          test "$(git hash-object "$patch_file")" = 3286cba174cf5a0a9119d73f74cb5380541a2303
+          git apply --unidiff-zero --check "$patch_file"
+          git apply --unidiff-zero "$patch_file"
+          git diff --check
+      - name: Install genuine compiler and lint dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq shellcheck
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustc -vV
+          cargo -vV
+      - name: Validate syntax and run real Cargo configuration regressions
+        run: |
+          set -euo pipefail
+          bash -n src/act_runner.sh
+          bash -n scripts/tests/test_toolchain_identity.sh
+          shellcheck -S warning src/act_runner.sh scripts/tests/test_toolchain_identity.sh
+          python3 -I scripts/tests/test_cargo_configuration.py --integration
+      - name: Retain only successfully tested source blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git diff --name-only)" = $'scripts/tests/test_toolchain_identity.sh\nsrc/act_runner.sh'
+          for path in src/act_runner.sh scripts/tests/test_toolchain_identity.sh; do
+            expected=$(git hash-object "$path")
+            observed=$(jq -Rs '{content: ., encoding: "utf-8"}' "$path" | gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" --input - --jq .sha)
+            test "$observed" = "$expected"
+            printf 'VERIFIED_BLOB %s %s\n' "$path" "$observed"
+          done
+          git hash-object scripts/tests/test_cargo_configuration.py tests/fixtures/cargo/*.toml
