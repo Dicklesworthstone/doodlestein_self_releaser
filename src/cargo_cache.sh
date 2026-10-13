@@ -261,13 +261,90 @@ def read_path(path, maximum=16 * 1024 * 1024):
         os.close(parent)
 
 
+def unscoped_registry_selection(parent, anchors):
+    """Omit materialized registry sources backed by a same-registry archive.
+
+    An ordinary seed has no lockfile authority. Keep source-only packages, but
+    never walk the expanded copy when the download is already being retained.
+    This is cache selection, not archive authentication or offline admission.
+    The copied download and every retained source still pass full inventory.
+    """
+    from contextlib import contextmanager
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    stable = lambda info: (info.st_dev, info.st_ino, info.st_mode)
+
+    @contextmanager
+    def directory(owner, name, relative):
+        before = os.stat(name, dir_fd=owner, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode):
+            raise Failure('registry routing entry is not a real directory: ' + relative)
+        descriptor = os.open(name, flags, dir_fd=owner)
+        try:
+            anchors[relative] = stable(before)
+            if stable(os.fstat(descriptor)) != anchors[relative]:
+                raise Failure('registry directory replaced during selection: ' + relative)
+            yield descriptor
+            if (stable(os.fstat(descriptor)) != anchors[relative] or
+                    stable(os.stat(name, dir_fd=owner, follow_symlinks=False)) != anchors[relative]):
+                raise Failure('registry directory changed during selection: ' + relative)
+        finally:
+            os.close(descriptor)
+
+    selected = {name: None for name in os.listdir(parent)}
+    if 'src' not in selected or 'cache' not in selected:
+        return selected  # No duplicate representation to omit.
+    with directory(parent, 'src', 'registry/src') as sources, \
+            directory(parent, 'cache', 'registry/cache') as downloads:
+        source_paths = {}
+        for registry in sorted(os.listdir(sources), key=os.fsencode):
+            try:
+                cached = os.stat(registry, dir_fd=downloads, follow_symlinks=False)
+            except FileNotFoundError:
+                source_paths[registry] = None  # Preserve this whole source-only registry.
+                continue
+            # Links/special entries in selected cache routing are still errors;
+            # do not follow them to decide that a source package is redundant.
+            if not stat.S_ISDIR(cached.st_mode):
+                raise Failure('registry archive route is not a real directory: ' + registry)
+            prefix = 'registry/src/' + registry
+            cache_prefix = 'registry/cache/' + registry
+            with directory(sources, registry, prefix) as packages, \
+                    directory(downloads, registry, cache_prefix) as archives:
+                retained = {}
+                for package in sorted(os.listdir(packages), key=os.fsencode):
+                    # Cargo archive basenames mirror the extracted directory.
+                    # Unrecognized metadata/long names retain their old policy.
+                    if (len(os.fsencode(package)) > 240 or not re.fullmatch(
+                            r'[A-Za-z0-9_-]+-[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?', package)):
+                        retained[package] = None
+                        continue
+                    archive = package + '.crate'
+                    try:
+                        info = os.stat(archive, dir_fd=archives, follow_symlinks=False)
+                    except FileNotFoundError:
+                        retained[package] = None
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        raise Failure('registry download is linked or special: ' + cache_prefix + '/' + archive)
+                    if info.st_size == 0:
+                        retained[package] = None
+                        continue
+                    # Bind the exact download which permits this omission,
+                    # including identity after the independent destination read.
+                    anchors[cache_prefix + '/' + archive] = identity(info)
+                source_paths[registry] = retained
+        selected['src'] = source_paths
+    return selected
+
+
 def unscoped_selection(source):
-    """Keep registry caches and Git databases, not redundant Git checkouts.
+    """Keep registry downloads/source-only packages and Git databases.
 
     Ordinary callers may not supply a lockfile. Cargo recreates git/checkouts
     from git/db; the host's unrelated working copies can contain legitimate
-    symlinks and need not be read or copied (#39). Preserve the existing full
-    registry policy, including source-only caches and retained private sources.
+    symlinks and need not be read or copied (#39). Registry archives similarly
+    supersede their redundant extracted trees; source-only packages are retained.
     Lockfile-scoped callers keep their stricter download-only selection. This
     is not project-specific minimization or proof of complete offline closure.
     """
@@ -279,6 +356,15 @@ def unscoped_selection(source):
     home = os.open(source, flags)
     try:
         anchors[''] = stable(os.fstat(home))
+        # A prepared DSR home may carry source-authentication receipts whose
+        # paths refer to its materialized registry trees. Do not change that
+        # copy contract. Marker presence is only a conservative optimization
+        # opt-out: it is never followed, copied, or accepted as a trust proof.
+        try:
+            marker = os.stat('.dsr-cache-seed.json', dir_fd=home, follow_symlinks=False)
+        except FileNotFoundError:
+            marker = None
+        anchors['.dsr-cache-seed.json'] = None if marker is None else identity(marker)
         for root, categories in (('registry', None), ('git', ('db',))):
             try:
                 before = os.stat(root, dir_fd=home, follow_symlinks=False)
@@ -292,7 +378,10 @@ def unscoped_selection(source):
                 anchors[root] = stable(before)
                 if stable(os.fstat(parent)) != anchors[root]:
                     raise Failure('cache root replaced during seed selection: ' + root)
-                selected[root] = None if categories is None else {}
+                if categories is None:
+                    selected[root] = None if marker is not None else unscoped_registry_selection(parent, anchors)
+                else:
+                    selected[root] = {}
                 for name in categories or ():
                     relative = root + '/' + name
                     try:

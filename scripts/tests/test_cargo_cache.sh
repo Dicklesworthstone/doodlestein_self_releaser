@@ -31,7 +31,9 @@ class PrivateCacheTests(unittest.TestCase):
         self.source = self.root / 'ambient cargo'
         self.home = self.root / 'private cargo'
         self.source.mkdir()
-        self.crate = self.source / 'registry/src/example/probe-1.0.0/src/lib.rs'
+        # Keep these custody tests on a selected source-only package. The
+        # distinct archive-backed cases below exercise deliberate omission.
+        self.crate = self.source / 'registry/src/example/source-only-1.0.0/src/lib.rs'
         self.crate.parent.mkdir(parents=True)
         self.crate.write_bytes(b'pub fn answer() -> u32 { 42 }\n')
         self.archive = self.source / 'registry/cache/example/probe-1.0.0.crate'
@@ -723,6 +725,339 @@ class UnscopedGitSeedTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stdout.strip(), b'42')
         final = self.invoke('inventory', home, self.root / 'cargo-final.json')
+        self.invoke('verify', home, final['receipt_path'])
+        self.assertEqual(json.loads(Path(seed['receipt_path']).read_bytes())['kind'], 'private-copy')
+
+
+class UnscopedRegistrySeedTests(unittest.TestCase):
+    setUp = PrivateCacheTests.setUp
+    invoke = PrivateCacheTests.invoke
+    snapshot = PrivateCacheTests.snapshot
+    copied = PrivateCacheTests.copied
+
+    def package(self, name='probe-1.0.0', registry='example'):
+        tree = self.source / 'registry/src' / registry / name
+        (tree / 'src').mkdir(parents=True)
+        files = {'Cargo.toml': b'[package]\nname="probe"\nversion="1.0.0"\nedition="2021"\n',
+                 'src/lib.rs': b'pub fn answer() -> u32 { 42 }\n'}
+        for path, content in files.items():
+            (tree / path).write_bytes(content)
+        archive = self.source / 'registry/cache' / registry / (name + '.crate')
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, 'w:gz') as packed:
+            for path, content in files.items():
+                info = tarfile.TarInfo(name + '/' + path)
+                info.size = len(content)
+                info.mode = 0o644
+                packed.addfile(info, io.BytesIO(content))
+        return tree, archive, files
+
+    def test_archive_backed_expansion_is_not_copied(self):
+        tree, archive, _ = self.package()
+        result = self.snapshot()
+        self.assertFalse(self.copied(tree).exists())
+        self.assertEqual(self.copied(archive).read_bytes(), archive.read_bytes())
+        self.assertEqual(self.copied(self.crate).read_bytes(), self.crate.read_bytes())
+        self.assertEqual(result['file_count'], 3)
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_large_redundant_sources_do_not_inflate_seed(self):
+        tree, archive, _ = self.package()
+        with (tree / 'expanded-source').open('wb') as data:
+            data.truncate(64 * 1024 * 1024)
+        result = self.snapshot()
+        self.assertEqual(result['size_bytes'], sum(p.stat().st_size for p in
+                                                   (self.crate, archive, self.script)))
+        self.assertFalse(self.copied(tree).exists())
+        self.assertEqual((tree / 'expanded-source').stat().st_size, 64 * 1024 * 1024)
+
+    def test_redundant_sources_are_not_traversed_for_links_or_special_files(self):
+        tree, _, _ = self.package()
+        (tree / 'LICENSE').symlink_to(self.source / 'credentials.toml')
+        os.mkfifo(tree / 'blocked-pipe')
+        result = self.snapshot()
+        self.assertFalse(self.copied(tree).exists())
+        self.assertTrue((tree / 'LICENSE').is_symlink())
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_redundant_source_root_link_and_fifo_are_not_opened(self):
+        tree, _, _ = self.package()
+        tree.rename(self.root / 'retained-expanded')
+        for kind in ('link', 'fifo'):
+            if kind == 'link': tree.symlink_to(self.root / 'retained-expanded')
+            else: os.mkfifo(tree)
+            try:
+                with self.subTest(kind=kind):
+                    home = self.root / ('private-' + kind)
+                    result = self.invoke('snapshot', self.source, home)
+                    self.assertFalse((home / tree.relative_to(self.source)).exists())
+                    self.invoke('verify', home, result['receipt_path'])
+            finally:
+                tree.rename(self.root / ('retained-source-' + kind))
+
+    def test_copied_archive_reconstructs_original_not_modified_working_sources(self):
+        tree, archive, files = self.package()
+        (tree / 'src/lib.rs').write_bytes(b'pub fn answer() -> u32 { 666 }\n')
+        result = self.snapshot()
+        self.source.rename(self.root / 'retained-ambient')
+        with tarfile.open(self.copied(archive), 'r:gz') as packed:
+            for path, content in files.items():
+                self.assertEqual(packed.extractfile('probe-1.0.0/' + path).read(), content)
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_source_only_registry_and_package_are_preserved(self):
+        tree, archive, files = self.package()
+        archive.rename(self.root / 'retained-archive')
+        second = self.source / 'registry/src/source-only-registry/helper-1.0.0/src/lib.rs'
+        second.parent.mkdir(parents=True)
+        second.write_bytes(b'source-only registry bytes\n')
+        result = self.snapshot()
+        for path, content in files.items(): self.assertEqual(self.copied(tree / path).read_bytes(), content)
+        self.assertEqual(self.copied(second).read_bytes(), second.read_bytes())
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_other_registry_archive_never_discards_same_named_source(self):
+        tree, archive, files = self.package()
+        other = self.source / 'registry/cache/other'
+        other.mkdir()
+        archive.rename(other / archive.name)
+        result = self.snapshot()
+        self.assertEqual(self.copied(tree / 'src/lib.rs').read_bytes(), files['src/lib.rs'])
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_empty_archive_keeps_the_only_materialized_source(self):
+        tree, archive, files = self.package()
+        archive.write_bytes(b'')
+        result = self.snapshot()
+        self.assertEqual(self.copied(tree / 'src/lib.rs').read_bytes(), files['src/lib.rs'])
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_absent_archive_root_keeps_source_cache(self):
+        tree, _, files = self.package()
+        (self.source / 'registry/cache').rename(self.root / 'retained-downloads')
+        result = self.snapshot()
+        self.assertEqual(self.copied(tree / 'src/lib.rs').read_bytes(), files['src/lib.rs'])
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_package_versions_and_build_metadata_select_only_exact_archive(self):
+        first, _, _ = self.package('probe-1.0.0-rc.1+build.5')
+        other, archive, files = self.package('probe-2.0.0')
+        archive.rename(self.root / 'retained-other-archive')
+        result = self.snapshot()
+        self.assertFalse(self.copied(first).exists())
+        self.assertEqual(self.copied(other / 'src/lib.rs').read_bytes(), files['src/lib.rs'])
+        self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_selected_source_only_links_are_still_refused(self):
+        (self.crate.parent / 'unsafe').symlink_to(self.source / 'credentials.toml')
+        self.invoke('snapshot', self.source, self.home, 7)
+        self.assertFalse(self.home.exists())
+
+    def test_selected_archive_links_and_special_files_are_still_refused(self):
+        _, archive, _ = self.package()
+        archive.rename(self.root / 'retained-archive')
+        for kind in ('link', 'fifo'):
+            with self.subTest(kind=kind):
+                if kind == 'link': archive.symlink_to(self.root / 'retained-archive')
+                else: os.mkfifo(archive)
+                self.invoke('snapshot', self.source, self.root / ('private-' + kind), 7)
+                self.assertFalse((self.root / ('private-' + kind)).exists())
+                archive.rename(self.root / ('retained-archive-' + kind))
+
+    def test_registry_route_links_are_still_refused(self):
+        self.package()
+        for relative in ('registry/cache', 'registry/cache/example', 'registry/src', 'registry/src/example'):
+            with self.subTest(relative=relative):
+                route = self.source / relative
+                held = self.root / ('held-' + relative.replace('/', '-'))
+                route.rename(held)
+                route.symlink_to(held, target_is_directory=True)
+                self.invoke('snapshot', self.source, self.home, 7)
+                self.assertFalse(self.home.exists())
+                route.rename(self.root / ('link-' + relative.replace('/', '-')))
+                held.rename(route)
+
+    def test_full_inventory_checks_recreated_registry_sources(self):
+        tree, archive, files = self.package()
+        seed = self.snapshot()
+        self.assertFalse(self.copied(tree).exists())
+        for path, content in files.items():
+            output = self.copied(tree / path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(content)
+        self.invoke('verify', self.home, seed['receipt_path'], 7)
+        final = self.invoke('inventory', self.home, self.root / 'final.json')
+        self.invoke('verify', self.home, final['receipt_path'])
+        self.copied(tree / 'src/lib.rs').write_bytes(b'modified after final inventory')
+        self.invoke('verify', self.home, final['receipt_path'], 7)
+        self.copied(tree / 'LICENSE').symlink_to(archive)
+        self.invoke('inventory', self.home, self.root / 'unsafe.json', 7)
+        self.assertFalse((self.root / 'unsafe.json').exists())
+
+    def test_preexisting_full_receipt_is_not_rewritten_by_verification(self):
+        self.package()
+        retained = self.invoke('inventory', self.source, self.root / 'retained.json')
+        original = Path(retained['receipt_path']).read_bytes()
+        self.invoke('verify', self.source, retained['receipt_path'])
+        self.assertEqual(Path(retained['receipt_path']).read_bytes(), original)
+
+    def test_prepared_private_source_receipt_keeps_its_materialized_paths(self):
+        tree, _, files = self.package()
+        seed = self.snapshot()
+        for path, content in files.items():
+            output = self.copied(tree / path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(content)
+        before = Path(seed['receipt_path']).read_bytes()
+        destination = self.root / 'prepared-copy'
+        result = self.invoke('snapshot', self.home, destination)
+        for path, content in files.items():
+            self.assertEqual((destination / tree.relative_to(self.source) / path).read_bytes(), content)
+        self.assertEqual(Path(seed['receipt_path']).read_bytes(), before)
+        self.invoke('verify', destination, result['receipt_path'])
+
+    def test_marker_presence_never_authenticates_or_follows_a_source_link(self):
+        tree, _, _ = self.package()
+        (self.source / '.dsr-cache-seed.json').symlink_to(self.source / 'credentials.toml')
+        (tree / 'LICENSE').symlink_to(self.source / 'credentials.toml')
+        self.invoke('snapshot', self.source, self.home, 7)
+        self.assertFalse(self.home.exists())
+        self.assertEqual((self.source / 'credentials.toml').read_bytes(), b'DO-NOT-COPY\n')
+
+    def changed_after_copy(self, change, refused=True):
+        # Deterministic mutation at a real inventory-return boundary. The full
+        # production copy/read/verification runs; only timing is controlled.
+        import ast
+        code = Path(MODULE).read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY\n', 1)[0]
+        definitions = ast.parse(code)
+        definitions.body = [node for node in definitions.body if isinstance(
+            node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef))]
+        namespace = {}
+        exec(compile(definitions, MODULE, 'exec'), namespace)
+        original = namespace['inventory']
+
+        def after_copy(root, destination=None, **kwargs):
+            result = original(root, destination, **kwargs)
+            if root == str(self.source) and destination is not None: change()
+            return result
+
+        namespace['inventory'] = after_copy
+        if refused:
+            with self.assertRaises(namespace['Failure']):
+                namespace['main'](['snapshot', str(self.source), str(self.home)])
+            self.assertFalse(self.home.exists())
+        else:
+            result = namespace['main'](['snapshot', str(self.source), str(self.home)])
+            self.invoke('verify', self.home, result['receipt_path'])
+
+    def test_archive_replacement_after_copy_is_refused(self):
+        _, archive, _ = self.package()
+
+        def change():
+            original = archive.read_bytes()
+            archive.rename(self.root / 'old-archive')
+            archive.write_bytes(original)
+
+        self.changed_after_copy(change)
+
+    def test_archive_removal_after_copy_is_refused(self):
+        _, archive, _ = self.package()
+        self.changed_after_copy(lambda: archive.rename(self.root / 'removed-archive'))
+
+    def test_archive_byte_change_after_copy_is_refused(self):
+        _, archive, _ = self.package()
+        self.changed_after_copy(lambda: archive.write_bytes(b'changed download'))
+
+    def test_new_source_only_package_after_copy_is_refused(self):
+        self.package()
+
+        def change():
+            extra = self.source / 'registry/src/example/new-source-1.0.0'
+            extra.mkdir()
+            (extra / 'lib.rs').write_bytes(b'new required private selection')
+
+        self.changed_after_copy(change)
+
+    def test_changes_inside_omitted_expansion_do_not_invalidate_private_bytes(self):
+        tree, _, _ = self.package()
+        self.changed_after_copy(lambda: (tree / 'new-working-file').write_bytes(b'ignored expansion'), refused=False)
+        self.assertFalse(self.copied(tree).exists())
+
+    @unittest.skipUnless(shutil.which('cargo') and shutil.which('rustc'),
+                         'real Cargo/rustc unavailable; registry consumption requires genuine tools')
+    def test_real_cargo_reextracts_registry_sources_offline(self):
+        # Real Cargo fetches a tiny registry served on loopback, then the server
+        # and ambient cache disappear. No public network, compiler adapter or
+        # toolchain installation is involved. The package has no dependencies.
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        _, archive, _ = self.package()
+        raw = archive.read_bytes()
+        index = dict(name='probe', vers='1.0.0', deps=[], cksum=hashlib.sha256(raw).hexdigest(),
+                     features={}, yanked=False)
+        objects = {'/pr/ob/probe': json.dumps(index).encode() + b'\n',
+                   '/crate/probe/1.0.0/download': raw}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = objects.get(self.path)
+                if payload is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        address = 'http://127.0.0.1:' + str(server.server_address[1])
+        objects['/config.json'] = json.dumps({'dl': address + '/crate/{crate}/{version}/download'}).encode()
+        serving = threading.Thread(target=server.serve_forever)
+        project = self.root / 'registry-project'
+        (project / 'src').mkdir(parents=True)
+        (project / '.cargo').mkdir()
+        (project / '.cargo/config.toml').write_text(
+            '[source.crates-io]\nreplace-with="fixture"\n[source.fixture]\nregistry=' +
+            json.dumps('sparse+' + address + '/') + '\n')
+        (project / 'Cargo.toml').write_text(
+            '[package]\nname="registry-consumer"\nversion="1.0.0"\nedition="2021"\n'
+            '[dependencies]\nprobe="=1.0.0"\n')
+        (project / 'src/main.rs').write_text('fn main() { println!("{}", probe::answer()); }\n')
+        ambient = self.root / 'real-registry-home'
+        ambient.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'RUST', 'GIT_'))}
+        env.update(CARGO_HOME=str(ambient), CARGO_TARGET_DIR=str(self.root / 'registry-target'),
+                   RUSTUP_AUTO_INSTALL='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                   HTTP_PROXY='', HTTPS_PROXY='', ALL_PROXY='', NO_PROXY='127.0.0.1')
+        for name in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN'):
+            if name in os.environ: env[name] = os.environ[name]
+        serving.start()
+        try:
+            fetched = subprocess.run(['cargo', 'fetch'], cwd=project, env=env,
+                                     capture_output=True, timeout=90)
+        finally:
+            server.shutdown()
+            server.server_close()
+            serving.join(timeout=10)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr.decode())
+        expanded = list((ambient / 'registry/src').glob('*/probe-1.0.0/src/lib.rs'))
+        self.assertEqual(len(expanded), 1)
+        expanded[0].write_bytes(b'pub fn answer() -> u32 { 666 }\n')
+        (expanded[0].parents[1] / 'LICENSE').symlink_to('/missing/redundant-source')
+        home = self.root / 'real-registry-private'
+        seed = self.invoke('snapshot', ambient, home)
+        self.assertFalse(list((home / 'registry/src').glob('*/probe-1.0.0')))
+        ambient.rename(self.root / 'retained-registry-home')
+        env['CARGO_HOME'] = str(home)
+        built = subprocess.run(['cargo', 'run', '--offline', '--locked', '--quiet'],
+                               cwd=project, env=env, capture_output=True, timeout=90)
+        self.assertEqual(built.returncode, 0, built.stderr.decode())
+        self.assertEqual(built.stdout.strip(), b'42')
+        final = self.invoke('inventory', home, self.root / 'registry-final.json')
         self.invoke('verify', home, final['receipt_path'])
         self.assertEqual(json.loads(Path(seed['receipt_path']).read_bytes())['kind'], 'private-copy')
 
