@@ -1302,9 +1302,20 @@ hosts:
   falsy:
     build_root: /data/tmp
     unix_storage: false
+  dotted.host:
+    build_root: /data/tmp
+    unix_storage: {root_min_free_bytes: 21474836480}
+  doubleslash:
+    build_root: //
+    unix_storage: {root_min_free_bytes: 21474836480}
+  innerslash:
+    build_root: /data//tmp
+    unix_storage: {root_min_free_bytes: 21474836480}
 EOF
     local host expected
-    for host in plain:1 rootonly:1 good:0 trailing:0 nobuildroot:4 relative:4 dotdot:4 slash:4 quote:4 tiny:4 secondpath:4 falsy:4; do
+    # A key outside the name pattern (here "-odd") keeps the legacy root-only check
+    # (absent, 1); it must never turn an ordinary Unix host unhealthy.
+    for host in plain:1 rootonly:1 good:0 trailing:0 nobuildroot:4 relative:4 dotdot:4 slash:4 quote:4 tiny:4 secondpath:4 falsy:4 dotted.host:0 doubleslash:4 innerslash:4 -odd:1; do
         expected="${host#*:}"; host="${host%%:*}"
         ((TESTS_RUN++))
         status=0
@@ -1419,9 +1430,31 @@ test_unix_split_storage_admission() {
     fi
 }
 
+test_unix_split_storage_human_report() {
+    local warn_result err_result output
+    warn_result='{"hostname":"trj","platform":"linux/amd64","status":"warning","healthy":true,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"warning","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"error","admitted_as":"warning","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":70,"available_gb":1494.49,"status":"ok"}},"toolchains":{},"docker":{},"clock_drift":{}}}'
+    err_result='{"hostname":"trj","platform":"linux/amd64","status":"error","healthy":false,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":50,"available_gb":400,"status":"error","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":50,"available_gb":400,"status":"ok","admitted_as":"ok","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":96,"available_gb":3.1,"status":"error"}},"toolchains":{}}}'
+    ((TESTS_RUN++))
+    output=$(_hh_print_result "trj" "$warn_result" 2>&1)
+    if [[ "$output" == *"root / 97% used, 33.02 GB free: warning (above its 20 GiB free floor)"* &&
+          "$output" == *"build root /data/dsr-build-root 70% used"*": ok"* && "$output" != *"Disk usage >"* ]]; then
+        pass "Split-storage warning report names each volume and the floor"
+    else
+        fail "Split-storage warning report: $output"
+    fi
+    ((TESTS_RUN++))
+    output=$(_hh_print_result "trj" "$err_result" 2>&1)
+    if [[ "$output" == *"build root /data/dsr-build-root 96% used, 3.1 GB free: error"* && "$output" != *"Disk usage >"* ]]; then
+        pass "Split-storage error report names the full build root, not the healthy root"
+    else
+        fail "Split-storage error report: $output"
+    fi
+}
+
 if [[ "${1:-}" == --unix-storage-only ]]; then
     test_unix_storage_config_contract
     test_unix_split_storage_admission
+    test_unix_split_storage_human_report
     echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
     [[ $TESTS_FAILED -eq 0 ]]
     exit $?
@@ -1465,6 +1498,7 @@ test_windows_storage_transport
 test_windows_cargo_lock_range
 test_unix_storage_config_contract
 test_unix_split_storage_admission
+test_unix_split_storage_human_report
 test_human_disk_error_reports_probe_failure
 test_local_toolchains_check
 test_local_clock_drift

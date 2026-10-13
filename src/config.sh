@@ -43,7 +43,10 @@ declare -gA DSR_CONFIG
 # absent, 4 for any malformed contract, including a missing host build_root.
 config_unix_storage_json() {
     local host="$1" value hosts_file="${DSR_HOSTS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/hosts.yaml}"
-    [[ "$host" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || return 4
+    # Unlike the Windows contract, this runs for every Unix host, so an unusual
+    # host key must keep the legacy root-only check (absent), never become
+    # unhealthy. strenv() below keeps the key out of the yq program anyway.
+    [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
     [[ -f "$hosts_file" ]] || return 1
     if ! command -v yq >/dev/null 2>&1; then
         # Any opt-in spells the key literally, so its absence proves absence;
@@ -63,7 +66,7 @@ config_unix_storage_json() {
         (.unix_storage | type == "object" and keys == ["root_min_free_bytes"] and
             (.root_min_free_bytes | type == "number" and . == floor and . >= 1073741824)) and
         (.build_root | type == "string" and test("^/[A-Za-z0-9._/-]+$") and
-            (test("(^|/)\\.\\.?(/|$)") | not) and (rtrimstr("/") != ""))
+            (test("(^|/)\\.\\.?(/|$)") | not) and (test("//") | not) and (rtrimstr("/") != ""))
     ' <<< "$value" >/dev/null || return 4
     jq -c '{build_root: (.build_root | rtrimstr("/")), root_min_free_bytes: .unix_storage.root_min_free_bytes}' <<< "$value"
 }

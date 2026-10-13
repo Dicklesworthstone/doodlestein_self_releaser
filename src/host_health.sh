@@ -690,6 +690,16 @@ _hh_check_disk_space() {
     echo "{\"path\": \"/\", \"usage_percent\": $usage_percent, \"available_gb\": $available_gb, \"status\": \"$status\"}"
 }
 
+# One line per volume for a unix-split-storage-v1 disk verdict (#38), so the
+# human report names the volume that is tight; empty for any other verdict.
+_hh_split_storage_lines() {
+    jq -r '.checks.disk_space | select(.admission == "unix-split-storage-v1") |
+        ("root / \(.root.usage_percent)% used, \(.root.available_gb) GB free: \(.root.admitted_as)" +
+            (if .root.status != .root.admitted_as then " (above its \(.root.min_free_bytes / 1073741824 | floor) GiB free floor)" else "" end)),
+        "build root \(.build_root.path) \(.build_root.usage_percent)% used, \(.build_root.available_gb) GB free: \(.build_root.status)"' \
+        <<< "$1" 2>/dev/null || true
+}
+
 # Unix split storage (#38): the build root is admitted by the usual
 # percentages. The root filesystem keeps its own verdict, except that above
 # the error percentage it is admitted as a warning while its free space meets
@@ -1133,8 +1143,15 @@ _hh_print_result() {
             docker_running=$(echo "$result" | jq -r '.checks.docker.running')
             clock_status=$(echo "$result" | jq -r '.checks.clock_drift.status')
 
-            [[ "$disk_status" == "warning" ]] && \
-                _hh_log_warn "  - Disk usage > ${_HH_DISK_WARN_THRESHOLD}%"
+            if [[ "$disk_status" == "warning" ]]; then
+                local split_lines split_line
+                split_lines=$(_hh_split_storage_lines "$result")
+                if [[ -n "$split_lines" ]]; then
+                    while IFS= read -r split_line; do _hh_log_warn "  - $split_line"; done <<< "$split_lines"
+                else
+                    _hh_log_warn "  - Disk usage > ${_HH_DISK_WARN_THRESHOLD}%"
+                fi
+            fi
             [[ "$docker_running" == "false" ]] && \
                 _hh_log_warn "  - Docker daemon not running"
             [[ "$clock_status" == "warning" ]] && \
@@ -1157,7 +1174,13 @@ _hh_print_result() {
                     disk_error=$(echo "$result" | jq -r '.checks.disk_space.error // "Disk check failed"')
                     _hh_log_error "  - $disk_error"
                 else
-                    _hh_log_error "  - Disk usage > ${_HH_DISK_ERROR_THRESHOLD}%"
+                    local split_lines split_line
+                    split_lines=$(_hh_split_storage_lines "$result")
+                    if [[ -n "$split_lines" ]]; then
+                        while IFS= read -r split_line; do _hh_log_error "  - $split_line"; done <<< "$split_lines"
+                    else
+                        _hh_log_error "  - Disk usage > ${_HH_DISK_ERROR_THRESHOLD}%"
+                    fi
                 fi
             fi
             ;;
