@@ -10,11 +10,12 @@ bash src/release_checksums.sh --repo owner/tool --tag v1.2.3 \
 ```
 
 The auditor reads the current complete release inventory and reacquires every
-selected checksum aggregate or sidecar. Only previously verified payloads are
-eligible for reuse. Each retained file is checked against the fresh checksum,
-size, and available API digest, copied without hardlinks, and checked again.
-Unverified partial files are downloaded anew. Altered previously verified files
-are errors, not permission to silently replace earlier evidence.
+selected checksum aggregate or sidecar. Previously verified files and complete
+downloads that never reached a checkpoint are checked against fresh checksums,
+size, and available API digests, copied without hardlinks, and checked again.
+Partial downloads can continue from their retained byte offset as described
+below. Altered complete files are errors, not permission to silently replace
+earlier evidence. No retained bytes are trusted merely because they exist.
 
 The same release ID, complete inventory, and checksum policy must still match.
 Replacing an asset, changing the selected aggregate, switching aggregate/sidecar
@@ -27,6 +28,49 @@ Results distinguish `verified_count` from `resume.reused_count` and retain
 whole-release byte limits, final inventory check, or final proof/payload hashes.
 A completed audit can also be reused, but checksum evidence is still fetched
 again. Neither cached nor downloaded checksums authenticate the publisher.
+
+## Recover interrupted payload transfers
+
+The same `--resume-from` option handles three distinct cases. Previously verified
+payloads contribute to `resume.reused_count`; complete but uncheckpointed files
+contribute to `resume.recovered_count`, `recovered_checksums`, and
+`recovered_bytes` only after a fresh full-file check. This recovers a transfer
+whose bytes finished arriving before a connection error or a killed supervisor
+could record success, without downloading that payload again.
+
+A nonempty shorter file is copied to the new audit directory, then continued
+with an HTTP byte range. The prior audit is never opened for writing. A valid
+continuation requires HTTP 206 and exactly one `Content-Range` naming the
+expected start, final byte, and complete size. Encoded, ambiguous, incorrect,
+or excessive responses are refused. The received suffix has its own remaining-
+byte limit; the full reconstructed file must still match the freshly acquired
+checksum, exact size, and any API digest before it enters `verified.jsonl`.
+
+When a server ignores the range and curl refuses before changing the copied
+prefix, the auditor preserves that prefix under `requests/` and restarts once
+into a new payload file. This is not fallback after a checksum or range-identity
+failure. Missing or empty retained files use the normal full download. Linked,
+special, oversized, or changing retained candidates are refused.
+
+`resume.partial_transfers` records the payload name, selected offset, prefix
+SHA256, transfer outcome (`pending`, `continued`, or `restarted`), and whether
+the completed bytes passed verification. `continued_count` counts completed
+range continuations, and `continued_bytes` counts their reused prefix bytes,
+not downloaded suffix bytes. `restarted_count` counts verified full restarts.
+These counters do not override a later final inventory or evidence failure.
+
+A second connection failure or forced termination leaves the growing payload
+in the new attempt's `artifacts/` directory. Resume from that newer directory
+to continue from its larger offset; retain the earlier directories as evidence.
+No new completion is recorded until the entire reconstructed payload passes.
+Malformed terminal receipts still fail rather than falling back to journals.
+
+Run `bash scripts/tests/test_release_checksum_download_recovery.sh` for the
+download recovery regression. It uses genuine curl, OpenSSL TLS, actual files,
+and process signals against a loopback GitHub/CDN service fixture, including
+cross-origin credential stripping, ignored ranges, corrupt prefixes/suffixes,
+invalid ranges, repeated interruption, and final inventory drift. It does not
+qualify live GitHub releases, native builds, or publisher signatures.
 
 `--preflight` validates local options, paths, dependencies, and retained selection
 metadata without downloading or claiming that cached payloads have been checked.
@@ -106,8 +150,9 @@ The wrapper commands preserve the same distinction.
 
 A final line lacking its terminating newline is an uncommitted tail, even if
 its JSON is otherwise complete. The auditor ignores only that bounded tail and
-reports `discarded_tail_bytes`; it does not rewrite the original journal. Any
-payload without a complete progress record is downloaded again. Malformed
+reports `discarded_tail_bytes`; it does not rewrite the original journal. A
+payload without a complete progress record remains unverified: a complete file
+can be freshly checked, or a partial file continued as described above. Malformed
 complete lines, duplicate/out-of-order names, wrong asset IDs or sizes, excluded
 metadata, and a header bound to another inventory are errors. A present but
 invalid `result.json` is never bypassed in favor of the journal.
@@ -120,9 +165,9 @@ records still have to match the actual payload bytes.
 
 This covers process termination such as SIGKILL. It is **not a power-loss
 filesystem durability guarantee**: incomplete or lost progress records may
-reduce reuse or require a fresh audit. It does not authenticate a publisher,
-resume partially downloaded byte ranges, or relax the trusted private-storage
-boundary. The regression kills the real audit supervisor during the fifth
+reduce reuse or require a fresh audit. It does not authenticate a publisher or
+relax the trusted private-storage boundary. The original journal regression
+kills the real audit supervisor during the fifth
 owned fixture download, then verifies both direct and wrapper recovery with
 four reused payloads and no invented terminal receipt.
 

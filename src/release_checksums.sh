@@ -136,25 +136,82 @@ def require_curl():
             tuple(map(int, version.groups())) >= (8, 4, 0),
             'curl 8.4.0 or newer is required for bounded downloads', 3)
 
-def acquire(endpoint, destination, maximum, binary=False):
+def range_response(path, reported):
+    # Inspect only the last complete response, never a proxy CONNECT or CDN
+    # redirect block. Keep headers as lists so duplicates cannot hide a range.
+    require(regular(path).st_size <= 262144, 'Excessive resumed-download headers', 8)
+    status, fields, complete = None, {}, False
+    for line in path.read_bytes().splitlines():
+        if line.startswith(b'HTTP/'):
+            match = re.fullmatch(rb'HTTP/(?:1\.[01]|2|3) ([1-5][0-9]{2})(?: [\t\x20-\x7e]*)?', line)
+            require(match is not None, 'Malformed resumed-download status', 8)
+            status, fields, complete = match[1].decode('ascii'), {}, False
+        elif not line:
+            complete = status is not None
+        else:
+            require(status is not None and not complete and b':' in line,
+                    'Malformed resumed-download header block', 8)
+            key, value = line.split(b':', 1)
+            require(re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key) is not None and
+                    not any(c < 32 and c != 9 or c == 127 for c in value),
+                    'Malformed resumed-download header', 8)
+            fields.setdefault(key.lower(), []).append(value.strip())
+    require(complete and reported == status.encode('ascii'), 'Incomplete resumed-download response', 8)
+    return status, fields
+
+def acquire(endpoint, destination, maximum, binary=False, offset=0, prefix_sha256=None):
     global requests
-    require(not destination.exists() and not destination.is_symlink(), 'Refusing to overwrite audit evidence', 4)
+    if offset:
+        require(binary and integer(offset, 1, maximum - 1) and prefix_sha256 is not None and
+                regular(destination).st_size == offset and digest(destination) == prefix_sha256,
+                'Resumed download does not match its private prefix', 4)
+    else:
+        require(not destination.exists() and not destination.is_symlink(), 'Refusing to overwrite audit evidence', 4)
     requests += 1
+    request_id = requests
     # Authorization goes through stdin, not argv or a retained configuration.
     # curl strips it on cross-host redirects; never use --location-trusted.
     config = 'header = "Accept: %s"\n' % ('application/octet-stream' if binary else 'application/vnd.github+json')
     config += 'header = "X-GitHub-Api-Version: 2022-11-28"\nheader = "Cache-Control: no-cache"\n'
+    if offset:
+        config += 'header = "Accept-Encoding: identity"\n'
     if token:
         config += 'header = "Authorization: Bearer %s"\n' % token
     command = ['curl', '--disable', '--silent', '--show-error', '--fail', '--location',
                '--max-redirs', '5', '--proto', '=https', '--proto-redir', '=https',
                '--connect-timeout', '10', '--max-time', str(args.timeout),
-               '--max-filesize', str(max(1, maximum)), '--request', 'GET', '--config', '-',
-               '--output', str(destination), 'https://api.github.com/' + endpoint]
-    code, _, _ = run(command, incoming=config.encode('ascii'), limit=args.timeout + 10)
+               '--max-filesize', str(max(1, maximum - offset)), '--request', 'GET', '--config', '-',
+               '--output', str(destination)]
+    if offset:
+        headers = work / 'requests' / ('%04d.range-headers' % request_id)
+        require(not headers.exists() and not headers.is_symlink(), 'Range evidence already exists', 4)
+        command += ['--continue-at', str(offset), '--dump-header', str(headers), '--write-out', '%{http_code}']
+    command += ['https://api.github.com/' + endpoint]
+    code, stdout, _ = run(command, incoming=config.encode('ascii'), limit=args.timeout + 10)
+    if offset:
+        status, fields = range_response(headers, stdout)
+        if status == '200' and code in (33, 63) and b'content-range' not in fields:
+            # A server may legitimately ignore Range. Restart ONCE into a new
+            # file only when curl refused before changing the private prefix.
+            # Never retry an integrity failure or erase the retained attempt.
+            require(regular(destination).st_size == offset and digest(destination) == prefix_sha256,
+                    'Non-range response changed the retained prefix')
+            preserved = work / 'requests' / ('%04d.unused-prefix' % request_id)
+            require(not preserved.exists() and not preserved.is_symlink(), 'Prefix evidence already exists', 4)
+            destination.rename(preserved)
+            acquire(endpoint, destination, maximum, binary)
+            return 'restarted'
+        require(status == '206' and fields.get(b'content-range') ==
+                [('bytes %d-%d/%d' % (offset, maximum - 1, maximum)).encode('ascii')] and
+                fields.get(b'content-encoding', [b'identity']) == [b'identity'],
+                'Resumed download does not cover the exact remaining bytes', 8)
+        require(b'content-length' not in fields or
+                (fields[b'content-length'] == [str(maximum - offset).encode('ascii')] and
+                 b'transfer-encoding' not in fields), 'Ambiguous resumed-download length', 8)
     require(code == 0, 'Release asset or metadata download failed (curl exit %d)' % code, 8)
     info = regular(destination)
     require(info.st_size <= maximum, 'Downloaded response exceeds its byte limit', 8)
+    return 'continued' if offset else 'downloaded'
 
 def api(endpoint):
     destination = work / 'requests' / ('%04d.json' % (requests + 1))
@@ -368,33 +425,53 @@ def retained_download_size(row):
     require(info.st_size <= row['size'], 'Retained download exceeds the selected asset size: ' + row['name'])
     return info.st_size
 
-def reuse_asset(row, expected):
-    # Reuse is a new byte check, not trust in an earlier success counter. The
-    # complete remote inventory must match first and ALL checksum evidence is
-    # freshly downloaded and parsed. An uncheckpointed complete download must
-    # satisfy the very same full-byte predicate before it can become evidence.
+def copy_retained_download(row, size):
+    # Copy into this attempt, never append to or hardlink the previous audit.
+    # Even an untrusted prefix must remain stable while its bytes are selected.
     retained_directory(str(resume['root'] / 'artifacts'))
     source = resume['root'] / 'artifacts' / row['name']
-    require(regular(source).st_size == row['size'] and digest(source) == expected,
-            'Retained verified payload changed: ' + row['name'])
-    require(row['digest'] is None or row['digest'][7:].lower() == expected,
-            'Retained payload contradicts the current API digest: ' + row['name'])
+    before = regular(source)
+    require(before.st_size == size, 'Retained download size changed: ' + row['name'])
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
     target = work / 'artifacts' / row['name']
-    # No hardlinks to mutable producer evidence. Preserve the failed attempt
-    # and its receipt exactly, including incomplete downloads and diagnostics.
     fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as incoming, target.open('xb') as outgoing:
-        require(stat.S_ISREG(os.fstat(incoming.fileno()).st_mode), 'Retained payload is not a regular file')
-        remaining = row['size']
+        require(identity(os.fstat(incoming.fileno())) == identity(before), 'Retained download replaced before copying')
+        remaining, checksum = size, hashlib.sha256()
         while remaining:
             block = incoming.read(min(1048576, remaining))
             require(block, 'Retained payload shortened during resume')
             outgoing.write(block)
+            checksum.update(block)
             remaining -= len(block)
         require(not incoming.read(1), 'Retained payload grew during resume')
-    require(digest(source) == expected and digest(target) == expected,
+        require(identity(os.fstat(incoming.fileno())) == identity(before), 'Retained download changed during copying')
+    pin = checksum.hexdigest()
+    require(identity(regular(source)) == identity(before) and digest(source) == pin and digest(target) == pin,
             'Retained payload changed while copying: ' + row['name'])
+    return target, pin
+
+def reuse_asset(row, expected):
+    # No earlier success counter grants authority: freshly acquired checksums
+    # and the exact current inventory qualify both checkpointed and orphaned
+    # complete downloads under the same full-byte predicate.
+    target, actual = copy_retained_download(row, row['size'])
+    require(actual == expected, 'Retained verified payload changed: ' + row['name'])
+    require(row['digest'] is None or row['digest'][7:].lower() == expected,
+            'Retained payload contradicts the current API digest: ' + row['name'])
     return target, expected
+
+def continue_asset(row, offset):
+    target, pin = copy_retained_download(row, offset)
+    transfer = dict(name=row['name'], offset=offset, prefix_sha256=pin, outcome='pending', verified=False)
+    report['resume']['partial_transfers'].append(transfer)
+    transfer['outcome'] = acquire('repos/%s/releases/assets/%d' % (args.repo, row['id']),
+                                  target, row['size'], True, offset, pin)
+    require(regular(target).st_size == row['size'], 'Continued download has an incomplete size: ' + row['name'])
+    actual = digest(target)
+    require(row['digest'] is None or actual == row['digest'][7:].lower(),
+            'Continued download differs from release API digest: ' + row['name'])
+    return actual, transfer
 
 def normalized_checksums(path, index, member=None):
     # A digest-only sidecar has no embedded name: its exact inventory basename
@@ -454,7 +531,7 @@ try:
     parser.add_argument('--checksum-mode', choices=('aggregate', 'sidecars'), default='aggregate',
                         help='aggregate (default), or require an exact .sha256 sidecar for every payload; present conventional aggregates must also agree')
     parser.add_argument('--output-dir', help='New directory for retained downloads and the audit receipt')
-    parser.add_argument('--resume-from', help='Reverify retained payloads, including complete uncheckpointed downloads, against fresh checksums; writes only a new output directory')
+    parser.add_argument('--resume-from', help='Reverify retained downloads against fresh checksums and continue partial payloads with bounded HTTP ranges; writes only a new output directory')
     parser.add_argument('--recheck-from', help='Recheck only the remote inventory of a completed audit; requires --audit-sha256 and never claims a new payload verification')
     parser.add_argument('--audit-sha256', help='Independently held SHA256 of the completed result.json selected by --recheck-from')
     parser.add_argument('--include-metadata', action='store_true', help='Also require checksums for SBOM/provenance/build metadata (not signatures or checksums)')
@@ -545,7 +622,8 @@ try:
         report['resume'] = dict(source=str(resume['root']), source_result_sha256=resume['pins'].get('result.json'),
                                 source_selection_sha256=resume['pins']['selection.json'],
                                 reused_checksums=[], reused_count=0, reused_bytes=0,
-                                recovered_checksums=[], recovered_count=0, recovered_bytes=0)
+                                recovered_checksums=[], recovered_count=0, recovered_bytes=0,
+                                partial_transfers=[], continued_count=0, continued_bytes=0, restarted_count=0)
         if not resume['terminal']:
             report['resume'].update(source_kind='progress-journal', source_terminal_outcome='unknown',
                                     source_progress_sha256=resume['pins']['verified.jsonl'],
@@ -634,9 +712,13 @@ try:
     for row in eligible:
         try:
             reused = resume is not None and row['name'] in resume['names']
-            recovered = resume is not None and not reused and retained_download_size(row) == row['size']
+            retained_size = retained_download_size(row) if resume is not None and not reused else None
+            recovered = retained_size == row['size']
+            transfer = None
             if reused or recovered:
                 _, actual = reuse_asset(row, expected[row['name']])
+            elif retained_size:
+                actual, transfer = continue_asset(row, retained_size)
             else:
                 _, actual = download_asset(row, work / 'artifacts', args.max_asset_bytes)
             require(actual == expected[row['name']], 'Payload checksum mismatch: ' + row['name'])
@@ -654,6 +736,13 @@ try:
             report['resume']['recovered_checksums'].append(row['name'])
             report['resume']['recovered_count'] += 1
             report['resume']['recovered_bytes'] += row['size']
+        elif transfer is not None:
+            transfer['verified'] = True
+            if transfer['outcome'] == 'continued':
+                report['resume']['continued_count'] += 1
+                report['resume']['continued_bytes'] += transfer['offset']
+            else:
+                report['resume']['restarted_count'] += 1
     require(inventory(context['id']) == assets and release_context() == context,
             'Release identity or asset inventory changed during verification')
     require(all(digest(Path(row['path'])) == row['sha256'] for row in checksum_evidence),

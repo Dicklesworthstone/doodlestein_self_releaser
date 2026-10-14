@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import socketserver
@@ -93,6 +94,50 @@ class Endpoint(BaseHTTPRequestHandler):
         behavior = state.behaviors.get(identifier)
         if behavior == 'blocked':
             return self.response(503)
+        requested_range = self.headers.get('Range')
+        if behavior == 'require-range' and not requested_range:
+            return self.response(503)
+        if requested_range and behavior != 'ignore-range':
+            match = re.fullmatch(r'bytes=([0-9]+)-', requested_range)
+            if match is None or int(match[1]) >= len(data):
+                return self.response(416)
+            offset = int(match[1])
+            suffix = data[offset:]
+            content_range = 'bytes %d-%d/%d' % (offset, len(data) - 1, len(data))
+            if behavior == 'wrong-range':
+                content_range = 'bytes %d-%d/%d' % (offset, len(data) - 1, len(data) + 1)
+            if behavior == 'wrong-start':
+                content_range = 'bytes %d-%d/%d' % (offset + 1, len(data) - 1, len(data))
+            if behavior == 'corrupt-suffix':
+                suffix = b'x' * len(suffix)
+            self.send_response(206)
+            if behavior != 'missing-range':
+                self.send_header('Content-Range', content_range)
+            if behavior == 'duplicate-range':
+                self.send_header('Content-Range', content_range)
+            if behavior == 'encoded-range':
+                self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Connection', 'close')
+            chunked = behavior in ('partial-disconnect', 'hold-range', 'excessive-range')
+            self.send_header('Transfer-Encoding' if chunked else 'Content-Length',
+                             'chunked' if chunked else str(len(suffix)))
+            self.end_headers()
+            if chunked:
+                suffix = suffix + b'x' * 65536 if behavior == 'excessive-range' else suffix[:len(suffix) // 2]
+                for start in range(0, len(suffix), 32768):
+                    block = suffix[start:start + 32768]
+                    self.wfile.write(('%x\r\n' % len(block)).encode() + block + b'\r\n')
+                    self.wfile.flush()
+                if behavior == 'excessive-range':
+                    self.wfile.write(b'0\r\n\r\n')
+                elif behavior == 'hold-range':
+                    state.holding.set()
+                    state.release.wait(timeout=15)
+            else:
+                self.wfile.write(suffix)
+            self.wfile.flush()
+            self.close_connection = True
+            return
         if behavior in ('complete-disconnect', 'partial-disconnect', 'hold-complete'):
             self.send_response(200)
             self.send_header('Transfer-Encoding', 'chunked')
@@ -347,6 +392,135 @@ class Recovery(unittest.TestCase):
         code, result, output = self.invoke('resumed', '--resume-from', old)
         self.assert_complete(code, result, output)
         self.assertEqual(result['resume'].get('recovered_count', 0), 0)
+        self.assertEqual(result['resume']['continued_count'], 1)
+        self.assertEqual(result['resume']['continued_bytes'], len(self.service.payloads['a.bin']) // 2)
+        self.assertEqual(snapshot(old), before)
+
+    def failed_partial(self):
+        self.service.behaviors[100] = 'partial-disconnect'
+        code, result, old = self.invoke('original')
+        self.assertEqual(code, 8, result)
+        self.assertEqual((old / 'artifacts/a.bin').stat().st_size, len(self.service.payloads['a.bin']) // 2)
+        self.service.behaviors.clear()
+        self.service.requests.clear()
+        return old
+
+    def test_range_fetches_only_suffix_through_authenticated_redirect(self):
+        old = self.failed_partial()
+        before = snapshot(old)
+        self.service.behaviors[100] = 'require-range'
+        code, result, output = self.invoke('resumed', '--resume-from', old)
+        self.assert_complete(code, result, output)
+        transfers = result['resume']['partial_transfers']
+        self.assertEqual(transfers, [dict(name='a.bin', offset=262144, outcome='continued', verified=True,
+                                        prefix_sha256=sha(self.service.payloads['a.bin'][:262144]))])
+        requests = [r for r in self.service.requests if r['path'].endswith('/100')]
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(r['range'] == 'bytes=262144-' for r in requests))
+        self.assert_fresh_evidence()
+        self.assertEqual(snapshot(old), before)
+
+    def test_server_ignoring_range_restarts_once_without_overwriting_prefix(self):
+        old = self.failed_partial()
+        before = snapshot(old)
+        self.service.behaviors[100] = 'ignore-range'
+        code, result, output = self.invoke('resumed', '--resume-from', old)
+        self.assert_complete(code, result, output)
+        self.assertEqual(result['resume']['continued_count'], 0)
+        self.assertEqual(result['resume']['continued_bytes'], 0)
+        self.assertEqual(result['resume']['restarted_count'], 1)
+        requested = [r['range'] for r in self.service.requests if r['path'] == '/asset/100']
+        self.assertEqual(requested, ['bytes=262144-', None])
+        retained = list((output / 'requests').glob('*.unused-prefix'))
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].read_bytes(), self.service.payloads['a.bin'][:262144])
+        self.assertEqual(snapshot(old), before)
+
+    def test_repeated_transfer_failure_continues_from_new_longer_prefix(self):
+        old = self.failed_partial()
+        before = snapshot(old)
+        self.service.behaviors[100] = 'partial-disconnect'
+        code, result, middle = self.invoke('interrupted-again', '--resume-from', old)
+        self.assertEqual(code, 8, result)
+        self.assertEqual(result['verified_count'], 0)
+        self.assertEqual(result['resume']['continued_count'], 0)
+        self.assertFalse((middle / 'checksums.normalized').exists())
+        self.assertEqual((middle / 'artifacts/a.bin').stat().st_size, 393216)
+        self.assertEqual(snapshot(old), before)
+        middle_before = snapshot(middle)
+        self.service.behaviors.clear()
+        self.service.requests.clear()
+        code, result, output = self.invoke('complete', '--resume-from', middle)
+        self.assert_complete(code, result, output)
+        self.assertEqual(result['resume']['continued_bytes'], 393216)
+        requested = [r['range'] for r in self.service.requests if r['path'] == '/asset/100']
+        self.assertEqual(requested, ['bytes=393216-'])
+        self.assertEqual(snapshot(middle), middle_before)
+
+    def test_invalid_range_responses_never_fall_back_or_claim_coverage(self):
+        old = self.failed_partial()
+        before = snapshot(old)
+        for behavior in ('wrong-range', 'wrong-start', 'missing-range', 'duplicate-range',
+                         'encoded-range', 'corrupt-suffix', 'excessive-range'):
+            with self.subTest(behavior=behavior):
+                self.service.behaviors[100] = behavior
+                self.service.requests.clear()
+                code, result, output = self.invoke(behavior, '--resume-from', old)
+                self.assertNotEqual(code, 0, result)
+                self.assertEqual(result['verified_count'], 0)
+                self.assertEqual(result['resume']['continued_count'], 0)
+                self.assertFalse((output / 'checksums.normalized').exists())
+                requests = [r for r in self.service.requests if r['path'] == '/asset/100']
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]['range'], 'bytes=262144-')
+                self.assertEqual(snapshot(old), before)
+                if (output / 'artifacts/a.bin').exists():
+                    self.assertLessEqual((output / 'artifacts/a.bin').stat().st_size, 524288)
+
+    def test_killed_range_continuation_retains_growing_prefix_for_next_resume(self):
+        old = self.failed_partial()
+        before = snapshot(old)
+        middle = self.work / 'killed-range'
+        self.service.behaviors[100] = 'hold-range'
+        process = subprocess.Popen(self.command(middle, '--resume-from', old), env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertTrue(self.service.holding.wait(timeout=10))
+            os.kill(process.pid, signal.SIGSTOP)
+            self.service.release.set()
+            deadline = time.monotonic() + 5
+            payload = middle / 'artifacts/a.bin'
+            while time.monotonic() < deadline and (not payload.exists() or payload.stat().st_size != 393216):
+                time.sleep(0.01)
+            self.assertEqual(payload.stat().st_size, 393216)
+            process.kill()
+            process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+            self.service.release.set()
+        self.assertFalse((middle / 'result.json').exists())
+        middle_before = snapshot(middle)
+        self.service.behaviors.clear()
+        self.service.requests.clear()
+        code, result, output = self.invoke('completed', '--resume-from', middle)
+        self.assert_complete(code, result, output)
+        self.assertEqual(result['resume']['continued_bytes'], 393216)
+        self.assertEqual(result['resume']['source_terminal_outcome'], 'unknown')
+        self.assertEqual(snapshot(middle), middle_before)
+        self.assertEqual(snapshot(old), before)
+
+    def test_modified_partial_prefix_is_never_admitted_by_valid_suffix(self):
+        old = self.failed_partial()
+        payload = old / 'artifacts/a.bin'
+        payload.write_bytes(b'x' * payload.stat().st_size)
+        before = snapshot(old)
+        code, result, output = self.invoke('refused', '--resume-from', old)
+        self.assertNotEqual(code, 0, result)
+        self.assertIn('checksum mismatch', result['error'])
+        self.assertEqual(result['verified_count'], 0)
+        self.assertFalse((output / 'checksums.normalized').exists())
         self.assertEqual(snapshot(old), before)
 
     def test_verified_resume_still_rehashes_without_payload_requests(self):
