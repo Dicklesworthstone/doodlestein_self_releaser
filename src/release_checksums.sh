@@ -354,10 +354,25 @@ def resume_unchanged():
         require(all(digest(resume['root'] / name) == pin for name, pin in resume['pins'].items()),
                 'Retained audit selection or result changed during resume')
 
+def retained_download_size(row):
+    # A transfer can finish writing all bytes before curl reports success or
+    # the verifier appends its checkpoint. Its absence from the journal means
+    # unverified, not unusable: fresh checksum evidence can qualify it now.
+    # Do not follow links or hash an oversized/unbounded candidate.
+    retained_directory(str(resume['root'] / 'artifacts'))
+    source = resume['root'] / 'artifacts' / row['name']
+    try:
+        info = regular(source)
+    except FileNotFoundError:
+        return None
+    require(info.st_size <= row['size'], 'Retained download exceeds the selected asset size: ' + row['name'])
+    return info.st_size
+
 def reuse_asset(row, expected):
     # Reuse is a new byte check, not trust in an earlier success counter. The
     # complete remote inventory must match first and ALL checksum evidence is
-    # freshly downloaded and parsed. Partial/unverified files are never used.
+    # freshly downloaded and parsed. An uncheckpointed complete download must
+    # satisfy the very same full-byte predicate before it can become evidence.
     retained_directory(str(resume['root'] / 'artifacts'))
     source = resume['root'] / 'artifacts' / row['name']
     require(regular(source).st_size == row['size'] and digest(source) == expected,
@@ -439,7 +454,7 @@ try:
     parser.add_argument('--checksum-mode', choices=('aggregate', 'sidecars'), default='aggregate',
                         help='aggregate (default), or require an exact .sha256 sidecar for every payload; present conventional aggregates must also agree')
     parser.add_argument('--output-dir', help='New directory for retained downloads and the audit receipt')
-    parser.add_argument('--resume-from', help='Reuse rehashed verified payloads from an unchanged prior audit; writes only a new output directory and reacquires all checksum evidence')
+    parser.add_argument('--resume-from', help='Reverify retained payloads, including complete uncheckpointed downloads, against fresh checksums; writes only a new output directory')
     parser.add_argument('--recheck-from', help='Recheck only the remote inventory of a completed audit; requires --audit-sha256 and never claims a new payload verification')
     parser.add_argument('--audit-sha256', help='Independently held SHA256 of the completed result.json selected by --recheck-from')
     parser.add_argument('--include-metadata', action='store_true', help='Also require checksums for SBOM/provenance/build metadata (not signatures or checksums)')
@@ -529,7 +544,8 @@ try:
     if resume is not None and not recheck:
         report['resume'] = dict(source=str(resume['root']), source_result_sha256=resume['pins'].get('result.json'),
                                 source_selection_sha256=resume['pins']['selection.json'],
-                                reused_checksums=[], reused_count=0, reused_bytes=0)
+                                reused_checksums=[], reused_count=0, reused_bytes=0,
+                                recovered_checksums=[], recovered_count=0, recovered_bytes=0)
         if not resume['terminal']:
             report['resume'].update(source_kind='progress-journal', source_terminal_outcome='unknown',
                                     source_progress_sha256=resume['pins']['verified.jsonl'],
@@ -618,7 +634,8 @@ try:
     for row in eligible:
         try:
             reused = resume is not None and row['name'] in resume['names']
-            if reused:
+            recovered = resume is not None and not reused and retained_download_size(row) == row['size']
+            if reused or recovered:
                 _, actual = reuse_asset(row, expected[row['name']])
             else:
                 _, actual = download_asset(row, work / 'artifacts', args.max_asset_bytes)
@@ -633,6 +650,10 @@ try:
             report['resume']['reused_checksums'].append(row['name'])
             report['resume']['reused_count'] += 1
             report['resume']['reused_bytes'] += row['size']
+        elif recovered:
+            report['resume']['recovered_checksums'].append(row['name'])
+            report['resume']['recovered_count'] += 1
+            report['resume']['recovered_bytes'] += row['size']
     require(inventory(context['id']) == assets and release_context() == context,
             'Release identity or asset inventory changed during verification')
     require(all(digest(Path(row['path'])) == row['sha256'] for row in checksum_evidence),
