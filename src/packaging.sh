@@ -95,28 +95,237 @@ _pkg_archive_matches_format() {
     esac
 }
 
-# List archive members, one per line.
-packaging_list_members() {
-    local archive="$1"
-    local format="$2"
+# A single binary-metadata admission policy for tar and ZIP. Do not infer
+# entry types or sizes from human-readable command output. All limits apply
+# before extraction, including implicit directories and sparse-file sizes.
+# Python 3.8+ is now required for archive admission, not only reproducibility.
+_pkg_archive_inspect() {
+    command -v python3 &>/dev/null || {
+        _pkg_log_error 'Archive admission requires Python 3.8 or newer'
+        return 3
+    }
+    python3 -I - "$@" <<'PY'
+import contextlib
+import gzip
+import os
+import re
+import stat
+import struct
+import sys
+import tarfile
+import zipfile
 
-    _pkg_archive_matches_format "$archive" "$format" || return $?
-    case "$format" in
-        tar.gz|tgz)
-            command -v tar &>/dev/null || return 3
-            tar -tzf "$archive" 2>/dev/null
-            ;;
-        tar.xz)
-            command -v tar &>/dev/null || return 3
-            tar -tJf "$archive" 2>/dev/null
-            ;;
-        zip)
-            command -v unzip &>/dev/null || return 3
-            unzip -Z1 "$archive" 2>/dev/null
-            ;;
-        *) return 4 ;;
-    esac
+if sys.version_info < (3, 8):
+    print('ERROR: Archive admission requires Python 3.8 or newer', file=sys.stderr)
+    sys.exit(3)
+
+try:
+    import lzma
+except ImportError:
+    lzma = None
+
+archive_errors = (OSError, ValueError, EOFError, UnicodeError, RuntimeError,
+                  tarfile.TarError, zipfile.BadZipFile, NotImplementedError)
+if lzma is not None:
+    archive_errors += (lzma.LZMAError,)
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def limit(name, default, maximum=9007199254740991):
+    text = os.environ.get(name, str(default))
+    require(re.fullmatch(r'[1-9][0-9]{0,15}', text) is not None and int(text) <= maximum,
+            name + ' must be a bounded positive decimal integer')
+    return int(text)
+
+
+def identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+class TarStream:
+    # tarfile's seekable reader parses extension headers directly through
+    # this wrapper. Refuse huge metadata reads before allocating their bytes;
+    # skip payload/padding forward in bounded chunks, never seek/reinflate.
+    def __init__(self, stream, budget):
+        self.stream, self.position, self.budget = stream, 0, budget
+
+    def tell(self):
+        return self.position
+
+    def read(self, size):
+        require(0 <= size <= max(metadata_limit, 1048576), 'excessive tar metadata read')
+        require(self.position + size <= self.budget, 'expanded tar stream exceeds archive budget')
+        data = self.stream.read(size)
+        self.position += len(data)
+        return data
+
+    def seek(self, offset, whence=0):
+        require(whence == 0 and offset >= self.position, 'non-forward tar member layout')
+        while self.position < offset:
+            require(self.read(min(1048576, offset - self.position)), 'truncated tar payload')
+        return self.position
+
+
+def zip_directory_budget(source, length):
+    # Bound central-directory allocation before ZipFile reads it. Classic
+    # ZIP and single-disk ZIP64 are supported; spanning and ambiguous trailers
+    # are refused. Payload decoding still verifies local headers and CRCs.
+    source.seek(max(0, length - 65557))
+    tail = source.read(65557)
+    end = tail.rfind(b'PK\x05\x06')
+    require(end >= 0 and len(tail) - end >= 22, 'missing ZIP end record')
+    fields = struct.unpack('<4s4H2LH', tail[end:end + 22])
+    _, disk, directory_disk, disk_count, count, size, offset, comment = fields
+    require(end + 22 + comment == len(tail), 'ambiguous ZIP trailer')
+    require(disk == directory_disk == 0 and disk_count == count, 'multi-disk ZIP is unsupported')
+    end_offset = length - len(tail) + end
+    locator = b''
+    if end_offset >= 20:
+        source.seek(end_offset - 20)
+        locator = source.read(20)
+    if locator.startswith(b'PK\x06\x07'):
+        signature, disk, record_offset, disks = struct.unpack('<4sLQL', locator)
+        require(signature == b'PK\x06\x07' and disk == 0 and disks == 1 and
+                record_offset + 56 <= end_offset - 20, 'invalid ZIP64 locator')
+        source.seek(record_offset)
+        raw = source.read(56)
+        require(len(raw) == 56, 'truncated ZIP64 end record')
+        classic = (count, size, offset)
+        signature, record_size, _, _, disk, directory_disk, disk_count, count, size, offset = struct.unpack('<4sQ2H2L4Q', raw)
+        require(signature == b'PK\x06\x06' and 44 <= record_size <= metadata_limit and
+                record_offset + 12 + record_size == end_offset - 20 and
+                disk == directory_disk == 0 and disk_count == count, 'invalid ZIP64 end record')
+        require(all(old == new or old == sentinel for old, new, sentinel in
+                    zip(classic, (count, size, offset), (65535, 0xffffffff, 0xffffffff))),
+                'ZIP and ZIP64 directories disagree')
+        end_offset = record_offset
+    else:
+        # Exactly 65535 entries are legal in classic ZIP. Larger directory
+        # sizes/offsets, in contrast, need an actual ZIP64 locator.
+        require(size != 0xffffffff and offset != 0xffffffff, 'missing ZIP64 locator')
+    require(count <= member_limit and size <= metadata_limit, 'ZIP directory exceeds archive budget')
+    require(offset + size == end_offset, 'ambiguous ZIP central-directory location')
+    source.seek(0)
+
+
+def admit(records, paths, name, directory, size, mode):
+    require(isinstance(name, str) and name and not name.startswith(('/', '-')) and
+            not any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in name), 'unsafe archive member')
+    require(len(name.encode('utf-8')) <= 4096, 'archive member path is too long')
+    if directory and name.endswith('/'):
+        name = name[:-1]
+    parts = name.split('/')
+    require(len(parts) <= depth_limit and all(part not in ('', '.', '..') and
+            len(part.encode('utf-8')) <= 255 for part in parts), 'unsafe or excessive archive path')
+    require(name not in records, 'duplicate archive member: ' + name)
+    require(len(records) < member_limit, 'archive member count exceeds budget')
+    require(mode & 0o7000 == 0, 'privileged archive mode is forbidden: ' + name)
+    require(0 <= size <= file_limit and (not directory or size == 0), 'archive member size exceeds budget')
+    for index in range(1, len(parts)):
+        parent = '/'.join(parts[:index])
+        require(paths.get(parent, True), 'file/directory prefix conflict: ' + parent)
+        paths[parent] = True
+    require(name not in paths or paths[name] == directory, 'file/directory conflict: ' + name)
+    paths[name] = directory
+    require(len(paths) <= member_limit, 'archive filesystem entry count exceeds budget')
+    row = dict(name=name, directory=directory, size=size, mode=mode & 0o777)
+    records[name] = row
+    return row
+
+
+def consume(incoming, size):
+    remaining = size
+    while remaining:
+        block = incoming.read(min(1048576, remaining))
+        require(block and len(block) <= remaining, 'truncated archive member')
+        remaining -= len(block)
+    require(not incoming.read(1), 'archive member exceeds declared size')
+
+
+def inspect(source, fmt, check_content):
+    records, paths, total = {}, {}, 0
+    if fmt == 'zip':
+        zip_directory_budget(source, os.fstat(source.fileno()).st_size)
+        with zipfile.ZipFile(source) as archive:
+            for entry in archive.infolist():
+                require(entry.orig_filename == entry.filename, 'NUL in ZIP member name')
+                require(not entry.flag_bits & 1, 'encrypted ZIP members are unsupported')
+                directory = entry.is_dir()
+                mode = entry.external_attr >> 16 if entry.create_system == 3 else 0
+                kind = stat.S_IFMT(mode)
+                require(kind in (0, stat.S_IFDIR if directory else stat.S_IFREG), 'linked or special ZIP member')
+                require(not (entry.external_attr & 0x10) or directory, 'ZIP directory attributes disagree')
+                row = admit(records, paths, entry.filename, directory, entry.file_size, mode)
+                total += row['size']
+                require(total <= total_limit, 'expanded archive bytes exceed budget')
+            if check_content:
+                for entry in archive.infolist():
+                    with archive.open(entry) as incoming:
+                        consume(incoming, entry.file_size)
+    else:
+        require(fmt in ('tar.gz', 'tgz', 'tar.xz'), 'unsupported archive format')
+        require(fmt != 'tar.xz' or lzma is not None, 'Python XZ support is required')
+        compressed = gzip.GzipFile(fileobj=source) if fmt != 'tar.xz' else lzma.LZMAFile(source)
+        with compressed:
+            reader = TarStream(compressed, total_limit + metadata_limit + member_limit * 1024 + 10240)
+            with tarfile.open(fileobj=reader, mode='r:') as archive:
+                for entry in archive:
+                    require((entry.isfile() or entry.isdir()) and not entry.issparse(), 'linked, sparse or special tar member')
+                    row = admit(records, paths, entry.name, entry.isdir(), entry.size, entry.mode)
+                    total += row['size']
+                    require(total <= total_limit, 'expanded archive bytes exceed budget')
+                    if check_content and not entry.isdir():
+                        with archive.extractfile(entry) as incoming:
+                            consume(incoming, entry.size)
+            # Force the compressor's trailer/CRC check too. Tar's end markers
+            # alone do not prove that its compressed container is complete.
+            while reader.read(min(1048576, reader.budget - reader.position)):
+                require(reader.position < reader.budget, 'expanded tar stream exceeds archive budget')
+    require(records, 'archive has no members')
+    return list(records.values())
+
+
+try:
+    action, path, fmt = sys.argv[1:]
+    require(action in ('list', 'validate'), 'invalid archive operation')
+    if fmt == 'tar.xz' and lzma is None:
+        print('ERROR: Archive admission requires Python XZ support', file=sys.stderr)
+        sys.exit(3)
+    total_limit = limit('DSR_ARCHIVE_MAX_BYTES', 8 * 1024**3)
+    file_limit = limit('DSR_ARCHIVE_MAX_FILE_BYTES', 2 * 1024**3)
+    member_limit = limit('DSR_ARCHIVE_MAX_MEMBERS', 100000, 1000000)
+    depth_limit = limit('DSR_ARCHIVE_MAX_PATH_DEPTH', 64, 256)
+    metadata_limit = limit('DSR_ARCHIVE_MAX_METADATA_BYTES', 16 * 1024**2)
+    before = os.stat(path, follow_symlinks=False)
+    require(stat.S_ISREG(before.st_mode), 'archive is not a regular file')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as source:
+        require(identity(before) == identity(os.fstat(source.fileno())), 'archive changed before admission')
+        magic = source.read(6)
+        require((fmt in ('tar.gz', 'tgz') and magic.startswith(b'\x1f\x8b')) or
+                (fmt == 'tar.xz' and magic == b'\xfd7zXZ\x00') or
+                (fmt == 'zip' and magic[:4] in (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')),
+                'archive bytes differ from declared format')
+        source.seek(0)
+        rows = inspect(source, fmt, action == 'validate')
+        require(identity(before) == identity(os.fstat(source.fileno())) ==
+                identity(os.stat(path, follow_symlinks=False)), 'archive changed during admission')
+    if action == 'list':
+        for row in rows:
+            print(row['name'] + ('/' if row['directory'] else ''))
+except archive_errors as error:
+    print('ERROR: Archive admission failed: ' + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
 }
+
+# No partial listing is emitted when admission fails.
+packaging_list_members() { _pkg_archive_inspect list "$1" "$2"; }
 
 # List archive members excluding pure directory entries, sorted with a stable
 # collation, so two archives can be compared for payload parity.
@@ -129,52 +338,8 @@ packaging_payload_members() {
     printf '%s\n' "$members" | { grep -v '/$' || true; } | LC_ALL=C sort
 }
 
-# Release payloads contain regular files and directories, not links, devices
-# or FIFOs. Names alone cannot establish that invariant. Inspect the type
-# column as well, never parse names from the human-readable verbose listing.
-# Reject unknown listing formats rather than silently omitting a record.
-packaging_validate_archive() {
-    local archive="$1" format="$2" members member listing line
-    local count=0 type_count=0
-    local -A seen=()
-    members=$(packaging_list_members "$archive" "$format") || return $?
-    [[ -n "$members" ]] || return 4
-    while IFS= read -r member; do
-        if ! packaging_member_is_safe "$member"; then
-            _pkg_log_error "Refusing unsafe archive member: $member"
-            return 4
-        fi
-        member="${member%/}"
-        if [[ -n "${seen[$member]:-}" ]]; then
-            _pkg_log_error "Refusing duplicate archive member: $member"
-            return 4
-        fi
-        seen["$member"]=1
-        count=$((count + 1))
-    done <<< "$members"
-    case "$format" in
-        tar.gz|tgz) listing=$(LC_ALL=C tar -tvzf "$archive" 2>/dev/null) || return 4 ;;
-        tar.xz) listing=$(LC_ALL=C tar -tvJf "$archive" 2>/dev/null) || return 4 ;;
-        zip) listing=$(LC_ALL=C unzip -Z -l "$archive" 2>/dev/null) || return 4 ;;
-        *) return 4 ;;
-    esac
-    while IFS= read -r line; do
-        if [[ "$format" == "zip" ]]; then
-            case "$line" in
-                'Archive: '*|'Zip file size: '*) continue ;;
-            esac
-            [[ "$line" =~ ^[0-9]+[[:space:]]files?, ]] && continue
-        fi
-        case "${line:0:1}" in
-            -|d) type_count=$((type_count + 1)) ;;
-            *)
-                _pkg_log_error "Refusing non-regular or unrecognized archive entry in $archive"
-                return 4
-                ;;
-        esac
-    done <<< "$listing"
-    [[ "$count" -eq "$type_count" ]] || return 4
-}
+# Full member reads validate ZIP CRC/local headers and compressed tar trailers.
+packaging_validate_archive() { _pkg_archive_inspect validate "$1" "$2"; }
 
 # Extract every member of an archive into an existing destination directory,
 # refusing unsafe members and conflicting destination files first. In
@@ -284,7 +449,7 @@ _pkg_validate_epoch() {
 # Canonical metadata and streaming compression without GNU/BSD tar flag
 # differences. This writes only private staging; the normal extraction/parity
 # gate and atomic publication below still admit the result. No source chmod,
-# chown or touch is performed. Python is required only for an explicit epoch.
+# chown or touch is performed. Archive admission also uses Python below.
 _pkg_reproducible_archive() {
     command -v python3 &>/dev/null || {
         _pkg_log_error 'Reproducible packaging requires Python 3.8 or newer'
@@ -406,8 +571,8 @@ PY
 
 # Build one archive of the requested format from a payload directory and an
 # explicit member list. This is the only sanctioned way to produce an archive
-# from bytes that may have lived in another archive: the compression never
-# sees the source archive, only the extracted payload files.
+# from bytes that may have lived in another archive.
+# The compression never sees the source archive, only the extracted payload files.
 packaging_build_archive() (
     local format="$1"
     local archive_path="$2"
