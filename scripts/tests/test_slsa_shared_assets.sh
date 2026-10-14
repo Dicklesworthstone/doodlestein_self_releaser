@@ -629,6 +629,218 @@ _slr_payloads example/shared-assets "$(cat "$4")" "$5" "$6"
         self.assertEqual([p.name for p in (work / 'payloads').iterdir()], ['app-linux-amd64.tar.gz'])
 
 
+class SharedBundleTests(unittest.TestCase):
+    """Complete bundle CLI with real copies/checkpoints and producer fixtures.
+
+    No build, signer, network or production function is substituted. The
+    manifest's native-environment records are synthetic, not compiler evidence.
+    """
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix='dsr-shared-bundle-')).resolve()
+        self.bundle = str(Path(os.environ.get('DSR_TEST_RELEASE_BUNDLE_MODULE',
+                                              str(Path(MODULE).with_name('release_bundle.sh')))).resolve())
+        self.plan_file = self.work / 'plan.json'
+        self.output = self.work / 'bundle'
+        self.serial = 0
+        self.make_fixture()
+
+    def make_fixture(self, variants=False, contract=True, shared=True):
+        self.manifests, self.roots, self.entries = [], [], []
+        triples = ('x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl')
+        for index, key in enumerate(('a', 'b')):
+            root = self.work / key
+            (root / 'artifacts').mkdir(parents=True, exist_ok=True)
+            target = 'linux/amd64' if variants or index == 0 else 'darwin/arm64'
+            name = 'app-' + key
+            payload = ('owned bundle payload ' + key + '\n').encode()
+            (root / 'artifacts' / name).write_bytes(payload)
+            artifact = dict(name=name, target=target, archive_format='binary',
+                            sha256=hashlib.sha256(payload).hexdigest(), size_bytes=len(payload))
+            environment = dict(target=target, method='native', host='fixture-' + key)
+            if variants:
+                artifact['target_triple'] = environment['target_triple'] = triples[index]
+            manifest = dict(schema_version='1.0.0', tool='fixture', version='v1.0.0',
+                            run_id='owned-component-' + key, built_at='2026-10-14T12:00:00Z',
+                            status='success', build_purpose='release', publishable=True,
+                            source=dict(repository=REPO, git_sha=SHA, git_ref='refs/tags/v1.0.0', dependencies=[]),
+                            requested_targets=[target], summary=dict(total=1, success=1, failed=0),
+                            artifacts=[artifact], build_environments=[environment])
+            entry = dict(id=key, targets=[target], manifest=str(root / 'manifest.json'),
+                         artifacts_dir=str(root / 'artifacts'))
+            if variants:
+                entry['variants'] = [dict(target=target, target_triple=triples[index])]
+            self.manifests.append(manifest)
+            self.roots.append(root)
+            self.entries.append(entry)
+        if shared:
+            self.add_shared(0, 'LICENSE', b'owned shared license and rider\n')
+        self.plan = dict(schema_version=1, tool='fixture', repo=REPO, tag='v1.0.0', source_sha=SHA,
+                         required_targets=sorted({e['targets'][0] for e in self.entries}), builds=self.entries)
+        if variants:
+            self.plan['required_variants'] = [v for e in self.entries for v in e['variants']]
+        if contract:
+            self.plan['required_assets'] = [{k: v for k, v in a.items() if k in
+                                            ('name', 'target', 'archive_format', 'target_triple')}
+                                           for m in self.manifests for a in m['artifacts']]
+        self.save_plan()
+
+    def add_shared(self, index, name, payload):
+        (self.roots[index] / 'artifacts' / name).write_bytes(payload)
+        self.manifests[index]['artifacts'].append(dict(name=name, target='additional',
+            archive_format='binary', sha256=hashlib.sha256(payload).hexdigest(), size_bytes=len(payload)))
+
+    def save_plan(self):
+        for entry, manifest in zip(self.entries, self.manifests):
+            path = Path(entry['manifest'])
+            path.write_text(json.dumps(manifest))
+            entry['manifest_sha256'] = digest(path)
+        self.plan_file.write_text(json.dumps(self.plan))
+
+    def collect(self, expected=0, output=None, extra=()):
+        environment = {k: v for k, v in os.environ.items() if k not in ('BASH_ENV', 'ENV', 'DRY_RUN')
+                       and not k.startswith('BASH_FUNC_')}
+        result = subprocess.run(['bash', self.bundle, '--plan', str(self.plan_file),
+                                 '--output-dir', str(output or self.output), *extra],
+                                capture_output=True, text=True, env=environment, timeout=45)
+        self.assertEqual(result.returncode, expected, result.stderr)
+        if expected not in (0, 1):
+            self.assertEqual(result.stdout, '')
+            return result
+        return json.loads(result.stdout)
+
+    def assert_complete(self):
+        result = self.collect()
+        self.assertEqual(result['status'], 'verified')
+        self.assertTrue(result['publishable'])
+        self.assertFalse(result['authenticated'])
+        self.assertEqual(result['targets'], self.plan['required_targets'])
+        manifest = Path(result['manifest'])
+        self.assertEqual(digest(manifest), result['manifest_sha256'])
+        data = json.loads(manifest.read_bytes())
+        self.assertEqual(data['summary'], dict(total=2, success=2, failed=0))
+        expected = {a['name']: a['sha256'] for m in self.manifests for a in m['artifacts']}
+        self.assertEqual({a['name']: a['sha256'] for a in data['artifacts']}, expected)
+        for name, pin in expected.items():
+            self.assertEqual(digest(Path(result['artifacts_dir']) / name), pin)
+        self.assertEqual(len(data['component_builds']), 2)
+        for row in data['component_builds']:
+            entry = next(e for e in self.entries if e['id'] == row['id'])
+            self.assertEqual(row['manifest_sha256'], entry['manifest_sha256'])
+        return result, data
+
+    def test_bundle_assembles_shared_assets_with_physical_target_shards(self):
+        dry = self.collect(extra=('--dry-run',))
+        self.assertEqual(dry['status'], 'planned')
+        self.assertFalse(dry['publishable'])
+        self.assertFalse(self.output.exists())
+        result, data = self.assert_complete()
+        self.assertEqual(len(data['artifacts']), 3)
+        original = self.roots[0] / 'artifacts/LICENSE'
+        checkpoint = self.output / 'inputs/a/artifacts/LICENSE'
+        exported = Path(result['artifacts_dir']) / 'LICENSE'
+        self.assertFalse(os.path.samefile(original, checkpoint))
+        self.assertFalse(os.path.samefile(checkpoint, exported))
+        before = Path(result['manifest']).read_bytes()
+        self.assertEqual(self.collect(), result)
+        self.assertEqual(Path(result['manifest']).read_bytes(), before)
+
+    def test_bundle_assembles_shared_assets_with_gnu_musl_shards(self):
+        self.make_fixture(variants=True)
+        _, data = self.assert_complete()
+        self.assertEqual(data['required_variants'], self.plan['required_variants'])
+        self.assertEqual(len(data['build_environments']), 2)
+        shared = next(a for a in data['artifacts'] if a['name'] == 'LICENSE')
+        self.assertNotIn('target_triple', shared)
+
+    def test_pinned_manifests_can_select_shared_assets_without_asset_contract(self):
+        self.make_fixture(contract=False)
+        _, data = self.assert_complete()
+        self.assertNotIn('required_assets', data)
+        self.assertEqual(len(data['artifacts']), 3)
+
+    def test_existing_platform_only_bundles_keep_their_behavior(self):
+        self.make_fixture(shared=False)
+        _, data = self.assert_complete()
+        self.assertEqual(len(data['artifacts']), 2)
+
+    def test_shared_checkpoint_survives_missing_shard_and_offline_original(self):
+        withheld = self.work / 'withheld-manifest.json'
+        Path(self.entries[1]['manifest']).rename(withheld)
+        incomplete = self.collect(expected=1)
+        self.assertEqual(incomplete['imported_builds'], 1)
+        self.assertEqual(incomplete['missing_builds'], ['b'])
+        self.assertFalse(incomplete['publishable'])
+        self.assertFalse((self.output / 'release').exists())
+        checkpoint = self.output / 'inputs/a/artifacts/LICENSE'
+        held = checkpoint.read_bytes()
+        state = (self.output / 'state.json').read_bytes()
+        self.roots[0].rename(self.work / 'offline-original')
+        withheld.rename(self.entries[1]['manifest'])
+        self.assert_complete()
+        self.assertEqual(checkpoint.read_bytes(), held)
+        self.assertEqual((self.output / 'release/artifacts/LICENSE').read_bytes(), held)
+        self.assertEqual((self.output / 'state.json').read_bytes(), state)
+
+    def test_missing_required_shared_asset_blocks_final_publication(self):
+        self.manifests[0]['artifacts'] = self.manifests[0]['artifacts'][:1]
+        self.save_plan()
+        result = self.collect(expected=4)
+        self.assertIn('exact required asset contract', result.stderr)
+        self.assertFalse((self.output / 'release').exists())
+        self.assertTrue((self.output / 'inputs/a/build-manifest.json').is_file())
+
+    def test_unselected_shared_asset_is_not_imported_under_exact_contract(self):
+        self.add_shared(0, 'unexpected.json', b'{"unexpected":true}\n')
+        self.save_plan()
+        self.collect(expected=7)
+        self.assertFalse((self.output / 'release').exists())
+        self.assertFalse((self.output / 'inputs/a').exists())
+
+    def test_shared_namespace_collisions_are_never_silently_deduplicated(self):
+        for index, payload in enumerate((b'owned shared license and rider\n', b'contradictory license\n')):
+            with self.subTest(identical=index == 0):
+                self.make_fixture()
+                self.add_shared(1, 'LICENSE', payload)
+                self.save_plan()
+                output = self.work / ('collision-' + str(index))
+                result = self.collect(expected=7, output=output)
+                self.assertIn('colliding release asset names', result.stderr)
+                self.assertFalse((output / 'release').exists())
+                self.assertTrue((output / 'inputs/a/artifacts/LICENSE').is_file())
+                self.assertTrue((output / 'inputs/b/artifacts/LICENSE').is_file())
+
+    def test_shared_plan_cannot_forge_platform_or_compiler_coverage(self):
+        base = copy.deepcopy(self.plan)
+        changes = [lambda p: p['required_assets'][-1].update(target_triple=None),
+                   lambda p: p['required_assets'][-1].update(target_triple='x86_64-unknown-linux-gnu'),
+                   lambda p: p['required_targets'].append('additional'),
+                   lambda p: p['builds'][0]['targets'].append('additional'),
+                   lambda p: p['required_assets'][0].update(target='additional'),
+                   lambda p: p['required_assets'][-1].update(target='shared')]
+        # The shared row is located by identity rather than incidental ordering.
+        base['required_assets'].sort(key=lambda a: a['target'] == 'additional')
+        for index, change in enumerate(changes):
+            with self.subTest(case=index):
+                self.plan = copy.deepcopy(base)
+                change(self.plan)
+                self.plan_file.write_text(json.dumps(self.plan))
+                output = self.work / ('invalid-' + str(index))
+                self.collect(expected=4, output=output, extra=('--dry-run',))
+                self.assertFalse(output.exists())
+
+    def test_shared_checkpoint_and_export_drift_cannot_reuse_success(self):
+        result, _ = self.assert_complete()
+        original_manifest = Path(result['manifest']).read_bytes()
+        for relative in ('inputs/a/artifacts/LICENSE', 'release/artifacts/LICENSE'):
+            path = self.output / relative
+            original = path.read_bytes()
+            path.write_bytes(b'x' * len(original))
+            self.collect(expected=7)
+            self.assertEqual(Path(result['manifest']).read_bytes(), original_manifest)
+            path.write_bytes(original)
+        self.assertEqual(self.collect(), result)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
 PY

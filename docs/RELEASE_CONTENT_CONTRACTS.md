@@ -92,7 +92,33 @@ release content merely by being present.
 
 This uses the existing manifest schema and SLSA subject format. It does not
 create new native compiler evidence, broaden installation executable recipes,
-or qualify unrelated build, bundle, scanner or release-command entry points.
+or qualify unrelated build, scanner or release-command entry points.
+
+### Assembly from independent build shards
+
+`release_bundle.sh` accepts the same `target: "additional"` entries in its
+optional `required_assets` contract. Every shared file belongs to exactly one
+of the selected, SHA256-pinned component manifests. Its shard imports and hashes
+the file normally; the aggregate enforces the complete required asset set before
+the final release directory is published. Shared files never enter shard
+`targets`, the plan's `required_targets`, or any compiler `variants` array.
+
+Platform-partitioned and same-platform GNU/musl shards both retain their exact
+platform/variant admission checks. Each shard must supply its required platform
+assets and may only supply shared names allowed by the exact asset contract.
+Shared assets need not be repeated by every shard. Two shards declaring the
+same shared name are a conflict, even with identical bytes; there is no implicit
+first-writer selection or deduplication. Without `required_assets`, the selected
+manifest hashes still bind every imported name and its sole owner.
+
+Incomplete collection retains verified shared-file checkpoints along with the
+other completed shard data. Resume can use them after the original build
+directory disappears, but rechecks all retained bytes before assembly. Missing
+required shared assets, changed checkpoint/export bytes, and ambiguous owners
+block a successful result without rewriting the earlier evidence. This is
+local build-set assembly, not compiler or signature authentication. Run the
+`SharedBundleTests` class in `scripts/tests/test_slsa_shared_assets.sh` for the
+complete local collector lifecycle and unchanged-baseline counterexamples.
 
 ## Inspect, verify and fetch
 

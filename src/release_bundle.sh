@@ -33,7 +33,8 @@ _rb_plan() {
             all(.[];variant) and (unique|length)==length;
         def assets: type=="array" and length>0 and length<=256 and all(.[];
             type=="object" and (del(.target_triple)|keys)==["archive_format","name","target"] and
-            (.name|name and length<=128) and (.target|target) and
+            (.name|name and length<=128) and
+            (if .target=="additional" then (has("target_triple")|not) else (.target|target) end) and
             (if has("target_triple") then (.target_triple|triple) else true end) and
             (.archive_format|.=="tar.gz" or .=="tar.xz" or .=="zip" or .=="binary" or .=="none")) and
             (map(.name|ascii_downcase)|unique|length)==length;
@@ -46,7 +47,7 @@ _rb_plan() {
             (.source_sha|type=="string" and test("^[0-9a-f]{40}$") and .!=("0"*40)) and
             (.required_targets|targets) and
             (if has("required_assets") then (.required_assets|assets) and
-                ([.required_assets[].target]|unique|sort)==(.required_targets|sort) else true end) and
+                ([.required_assets[]|select(.target!="additional")|.target]|unique|sort)==(.required_targets|sort) else true end) and
             (.builds|type=="array" and length>0 and length<=100 and all(.[];
                 type=="object" and (del(.variants)|keys)==["artifacts_dir","id","manifest","manifest_sha256","targets"] and
                 (.id|name) and (.manifest|path) and (.artifacts_dir|path) and
@@ -131,13 +132,13 @@ _rb_shard_manifest() {
         (.source.repository==null or .source.repository==$p.repo or .source.repository==("https://github.com/"+$p.repo)) and
         (if has("build_purpose") then .build_purpose=="release" else true end) and
         (if has("publishable") then .publishable==true else true end) and
-        ([.artifacts[].target]|unique|sort)==$input.targets and
+        ([.artifacts[]|select(.target!="additional")|.target]|unique|sort)==$input.targets and
         (if has("requested_targets") then (.requested_targets|sort)==$input.targets else true end) and
         # Explicit variant plans partition compiler identities, not platform
         # labels. Every shard must carry its real native environment rows;
         # artifact names and success counts cannot invent missing receipts.
         (if $p|has("required_variants") then
-            ([.artifacts[]|{target,target_triple}]|unique|sort_by(.target,.target_triple))==$input.variants and
+            ([.artifacts[]|select(.target!="additional")|{target,target_triple}]|unique|sort_by(.target,.target_triple))==$input.variants and
             (.build_environments|type=="array" and all(.[];compiled_environment)) and
             ([.build_environments[]|{target,target_triple}]|sort_by(.target,.target_triple))==$input.variants and
             .summary.total==($input.variants|length)
@@ -154,7 +155,12 @@ _rb_shard_manifest() {
                     select({target,target_triple} as $identity | any($input.variants[]; .==$identity));
                     . as $required | any($m.artifacts[]; matches_asset($required; .)))
             else
-                (.artifacts|map({name,target,archive_format})|sort_by(.name))==
+                # Shared ownership is already pinned by the input manifest
+                # hashes. Require the exact platform assets for this shard,
+                # then the complete shared set once in the aggregate. Never
+                # require every shard to repeat a shared file or silently
+                # choose between colliding owners, even for identical bytes.
+                (.artifacts|map(select(.target!="additional")|{name,target,archive_format})|sort_by(.name))==
                 ([$p.required_assets[]|select(.target as $t|$input.targets|index($t)!=null)|
                     {name,target,archive_format}]|sort_by(.name)) and
                 all(.artifacts[]; . as $asset |
