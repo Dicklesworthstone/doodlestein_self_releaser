@@ -655,7 +655,13 @@ slsa_verify_release() {
     if [[ -n "$manifest" ]]; then
         manifest_digest=$(_slsa_sha256 "$manifest") || return $?
         expected=$(_slsa_manifest_statement "$manifest" "$repository" "$builder") || return $?
-        jq -e --argjson expected "$expected" '. == $expected' "$proof" >/dev/null 2>&1 || {
+        # Statements grow with the complete asset/dependency inventory. Do not
+        # put that JSON in argv: a valid release can exceed the OS per-argument
+        # limit and otherwise be reported as a manifest mismatch. Compare the
+        # same JSON values through stdin and an explicitly selected proof file.
+        jq -e --slurpfile observed "$proof" \
+            '($observed | length) == 1 and . == $observed[0]' \
+            <<< "$expected" >/dev/null 2>&1 || {
             _slsa_log 'Statement differs from the expected build manifest'; return 1;
         }
     fi
