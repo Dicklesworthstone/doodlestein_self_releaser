@@ -35,13 +35,30 @@ _rup_manifest() {
     [[ -n "$statement" ]] || return 4
 }
 
-_rup_check_files() {
-    local root="$1" manifest="$2" plan="$3" work="$4" selected expected entries entry name hash size
-    [[ "$(_slsa_sha256 "$manifest")" == "$(jq -r '.manifest_sha256' <<< "$plan")" ]] || return 2
+# A manifest-selected license/data file is a payload even when the scanner's
+# default discovery policy treats its name as metadata. Reject unselected
+# binaries, then require EVERY selected path to be a regular unlinked file.
+# Unselected metadata stays private; this does not change SBOM discovery.
+_rup_check_namespace() {
+    local root="$1" plan="$2" work="$3" selected names name
+    [[ -d "$root" && ! -L "$root" ]] || return 4
     selected=$(_sbom_select_artifacts "$root" "$work/list") || return $?
-    selected=$(jq -nc --arg names "$selected" '$names|split("\n")|sort') || return 1
-    expected=$(jq -c '[.artifacts[].name]|sort' <<< "$plan") || return 1
-    [[ "$selected" == "$expected" ]] || { _rup_log 'Local payload set differs from build manifest'; return 4; }
+    printf '%s\n' "$selected" > "$work/payload-names" || return 1
+    jq -e --rawfile names "$work/payload-names" '
+        (($names|split("\n")|map(select(length>0)))-[.artifacts[].name]|length)==0
+    ' <<< "$plan" >/dev/null || { _rup_log 'Unselected local release payload'; return 4; }
+    names=$(jq -r '.artifacts[].name' <<< "$plan") || return 1
+    while IFS= read -r name; do
+        _slsa_name "$name" && [[ -f "$root/$name" && ! -L "$root/$name" ]] || {
+            _rup_log "Selected payload is missing, linked, or not a regular file: $name"; return 4;
+        }
+    done <<< "$names"
+}
+
+_rup_check_files() {
+    local root="$1" manifest="$2" plan="$3" work="$4" entries entry name hash size
+    [[ "$(_slsa_sha256 "$manifest")" == "$(jq -r '.manifest_sha256' <<< "$plan")" ]] || return 2
+    _rup_check_namespace "$root" "$plan" "$work" || return $?
     entries=$(jq -c '.artifacts[]' <<< "$plan") || return 1
     while IFS= read -r entry; do
         name=$(jq -r '.name' <<< "$entry") || return 1
