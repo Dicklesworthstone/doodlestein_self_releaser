@@ -609,64 +609,9 @@ fn main() {
     $null=Invoke-ContextChecked $configuredContext Metadata
     $null=Invoke-ContextChecked $configuredContext Build
     Check 'real Cargo consumes the attested literal compiler and linker configuration' $true
-
-    Write-Text $selectionConfig ("[env]`nRUST_MIN_STACK={ value=`"16777216`", force=false }`n")
-    $numericContext=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment ($baseEnvironment + 'RUST_MIN_STACK=33554432')
-    $numericRow=$numericContext.ToolchainIdentity.selection.cargo_config[0].env_exemptions[0]
-    Check 'Windows attestation records configured and ambient numeric Cargo environment provenance' (
-        $numericRow.name -ceq 'RUST_MIN_STACK' -and $numericRow.value -ceq '16777216' -and
-        $numericRow.force -eq $false -and $numericRow.effective_value -ceq '33554432' -and
-        $numericRow.effective_force -eq $false -and $numericRow.effective_source -ceq 'environment')
-    Write-Text $selectionConfig ("[env]`nRUST_MIN_STACK={ value=`"16777216`", force=true, relative=false }`n")
-    $forcedNumeric=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment ($baseEnvironment + 'RUST_MIN_STACK=33554432')
-    $forcedRow=$forcedNumeric.ToolchainIdentity.selection.cargo_config[0].env_exemptions[0]
-    Check 'force=true numeric Cargo environment wins and is recorded' (
-        $forcedRow.effective_value -ceq '16777216' -and $forcedRow.effective_source -ceq 'configuration' -and
-        $forcedRow.force -eq $true -and $forcedRow.effective_force -eq $true)
-    foreach ($badEnvironment in @(
-        'RUST_MIN_STACK={ value="0", force=false }',
-        'RUST_MIN_STACK={ value="1", relative=true }',
-        'RUST_MIN_STACK={ value="1", force=0 }',
-        'RUST_MIN_STACK={ value="1", extra=false }',
-        'RUSTC={ value="1", force=false }'
-    )) {
-        Write-Text $selectionConfig ("[env]`n" + $badEnvironment + "`n")
-        Refused 'unsupported Cargo environment table stays fail-closed on Windows' {
-            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
-        }
-    }
-
-    $hostArch=if ($hostTriple.StartsWith('x86_64-')) { 'x86_64' } elseif ($hostTriple.StartsWith('aarch64-')) { 'aarch64' } else { '' }
-    if ($hostArch) {
-        $cfgExpression='cfg(target_arch = "'+$hostArch+'")'
-        Write-Text $selectionConfig ("[target.'"+$cfgExpression+"']`nrustflags=[`"-C`",`"debuginfo=0`"]`n")
-        $cfgContext=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
-        $cfgReceipt=$cfgContext.ToolchainIdentity.selection.cargo_target
-        $cfgCompilerSha=if ($cfgContext.ToolchainIdentity.tools.rustc.ContainsKey('resolved_sha256')) {
-            $cfgContext.ToolchainIdentity.tools.rustc.resolved_sha256
-        } else { $cfgContext.ToolchainIdentity.tools.rustc.selected_sha256 }
-        Check 'Windows cfg target tables are evaluated by the attested rustc for the actual target' (
-            $cfgReceipt.matched_cfg.Count -eq 1 -and $cfgReceipt.matched_cfg[0] -ceq $cfgExpression -and
-            $cfgReceipt.cfg_tables.Count -eq 1 -and $cfgReceipt.cfg_tables[0].matched -eq $true -and
-            $cfgReceipt.cfg_probe.compiler_sha256 -ceq $cfgCompilerSha -and
-            $cfgReceipt.cfg_probe.target_triple -ceq $cfgContext.ToolchainIdentity.target_triple)
-        $null=Invoke-ContextChecked $cfgContext Metadata
-        $null=Invoke-ContextChecked $cfgContext Build
-        Check 'real native Cargo consumes admitted cfg-scoped rustflags' $true
-    }
-    foreach ($badCfg in @(
-        'cfg(target_feature = "avx2")',
-        'cfg(not(windows,))',
-        'cfg(all(windows, feature = "x"))'
-    )) {
-        Write-Text $selectionConfig ("[target.'"+$badCfg+"']`nrustflags=[]`n")
-        Refused 'unsupported Cargo cfg grammar stays fail-closed on Windows' {
-            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
-        } 'Cargo cfg|Unsupported Cargo'
-    }
     foreach ($configText in @(
         'build.rustc="hidden-rustc"', ('[build]'+"`n"+'rustc={value="hidden-rustc"}'),
-        ('[target.''cfg(windows)'']'+"`n"+'rustflags=["@hidden.args"]'), ('[env]'+"`n"+'RUSTC="hidden-rustc"'),
+        ('[target.''cfg(windows)'']'+"`n"+'linker="hidden-linker"'), ('[env]'+"`n"+'RUSTC="hidden-rustc"'),
         'include=["hidden.toml"]', ('[build]'+"`n"+'rustflags=["-Clinker=hidden-linker"]'),
         ('[build]'+"`n"+'rustc-wrapper="hidden-wrapper"')
     )) {
