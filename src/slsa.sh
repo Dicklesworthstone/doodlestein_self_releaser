@@ -535,23 +535,28 @@ _slsa_release_assets() {
     local proof="$1" root="$2" rows name digest actual size expected
     [[ -d "$root" && ! -L "$root" ]] || return 4
     _slsa_validate "$proof" || return 1
-    if [[ "$(jq -r '.dsr_evidence.kind // ""' "$proof")" == build-manifest ]]; then
-        jq -e '
-            . as $s | .dsr_evidence.artifacts |
-            type == "array" and (map(.name) | sort) == ($s.subject | map(.name) | sort) and
-            all(.[]; (.size_bytes | type == "number" and floor == . and . > 0 and . <= 9007199254740991))
-        ' "$proof" >/dev/null 2>&1 || return 1
-    fi
-    rows=$(jq -r '.subject[] | [.name,.digest.sha256] | @tsv' "$proof") || return 1
+    # Parse and join the complete inventory once, not once per asset per pass.
+    # Exact name coverage is checked before indexing, so duplicate/missing size
+    # records cannot disappear through object-key replacement. The validated
+    # subject grammar excludes TSV escapes and record separators in filenames.
+    rows=$(jq -er '
+        . as $statement |
+        (if .dsr_evidence.kind == "build-manifest" then
+            .dsr_evidence.artifacts |
+            if type == "array" and
+               (map(.name) | sort) == ($statement.subject | map(.name) | sort) and
+               all(.[]; (.size_bytes | type == "number" and floor == . and
+                          . > 0 and . <= 9007199254740991)) then
+                reduce .[] as $artifact ({}; .[$artifact.name] = $artifact.size_bytes)
+            else error("invalid manifest-backed release asset inventory") end
+         else {} end) as $sizes |
+        $statement.subject[] | [.name, .digest.sha256, ($sizes[.name] // "")] | @tsv
+    ' "$proof") || return 1
     for _ in 1 2; do
-        while IFS=$'\t' read -r name digest; do
+        while IFS=$'\t' read -r name digest expected; do
             _slsa_name "$name" || return 4
             actual=$(_slsa_sha256 "$root/$name") || return $?
             [[ "$actual" == "$digest" ]] || { _slsa_log "Release digest mismatch: $name"; return 1; }
-            expected=$(jq -r --arg name "$name" '
-                if .dsr_evidence.kind == "build-manifest" then
-                    .dsr_evidence.artifacts[] | select(.name == $name) | .size_bytes
-                else empty end' "$proof") || return 1
             if [[ -n "$expected" ]]; then
                 size=$(wc -c < "$root/$name") || return 1
                 [[ "${size//[[:space:]]/}" == "$expected" ]] || return 1

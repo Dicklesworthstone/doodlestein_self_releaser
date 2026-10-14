@@ -10,11 +10,12 @@ for dependency in python3 jq; do
         exit 0
     fi
 done
-python3 -I - "${DSR_TEST_SLSA_MODULE:-$PROJECT_ROOT/src/slsa.sh}" <<'PY'
+python3 -I - "$@" "${DSR_TEST_SLSA_MODULE:-$PROJECT_ROOT/src/slsa.sh}" <<'PY'
 import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,7 @@ class ReleaseScaleTests(unittest.TestCase):
         rows = []
         for number in range(8):
             name = 'package-%04d-' % number + 'x' * 167 + '.tar.gz'
-            payload = ('owned regression payload %d\n' % number).encode()
+            payload = ('owned regression payload %d\n' % number).encode() + b'x' * number
             (cls.assets / name).write_bytes(payload)
             rows.append(dict(name=name, sha256=hashlib.sha256(payload).hexdigest(),
                              target='linux/amd64', size_bytes=len(payload),
@@ -145,6 +146,99 @@ class ReleaseScaleTests(unittest.TestCase):
                              '--output', self.proof)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.proof.read_bytes(), self.original)
+
+    def test_manifest_size_inventory_is_complete_and_typed(self):
+        def altered_inventory():
+            return copy.deepcopy(self.document)
+
+        cases = []
+        missing = altered_inventory()
+        missing['dsr_evidence']['artifacts'].pop()
+        cases.append(('missing-record', missing))
+        duplicate = altered_inventory()
+        duplicate['dsr_evidence']['artifacts'][-1] = copy.deepcopy(
+            duplicate['dsr_evidence']['artifacts'][0])
+        cases.append(('duplicate-record', duplicate))
+        foreign = altered_inventory()
+        foreign['dsr_evidence']['artifacts'][-1]['name'] = 'foreign-asset'
+        cases.append(('foreign-record', foreign))
+        absent = altered_inventory()
+        del absent['dsr_evidence']['artifacts']
+        cases.append(('absent-inventory', absent))
+        for index, value in enumerate((None, 0, -1, 1.5, '27', True, 2**53)):
+            altered = altered_inventory()
+            altered['dsr_evidence']['artifacts'][-1]['size_bytes'] = value
+            cases.append(('invalid-size-%d' % index, altered))
+        wrong = altered_inventory()
+        wrong['dsr_evidence']['artifacts'][-1]['size_bytes'] += 1
+        cases.append(('wrong-size', wrong))
+        for name, document in cases:
+            with self.subTest(name=name):
+                proof = self.write_json(name + '.intoto.jsonl', document)
+                before = proof.read_bytes()
+                # Exercise the inventory verifier itself, rather than having
+                # --manifest reject the edited statement before size checks.
+                result = self.invoke('verify-release', proof, self.assets,
+                                     '--builder', BUILDER)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(proof.read_bytes(), before)
+
+    def test_size_records_join_by_name_not_position(self):
+        document = copy.deepcopy(self.document)
+        document['dsr_evidence']['artifacts'].reverse()
+        proof = self.write_json('reordered-sizes.intoto.jsonl', document)
+        result = self.invoke('verify-release', proof, self.assets, '--builder', BUILDER)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_observations_without_sizes_preserve_literal_names_and_empty_files(self):
+        for index, (name, payload) in enumerate((('space name.bin', b'spaces'),
+                                               ('unicode-\u03a9.bin', b'unicode'),
+                                               ('empty.bin', b''))):
+            with self.subTest(name=name):
+                artifact = self.assets / name
+                artifact.write_bytes(payload)
+                proof = self.root / ('observation-%d.intoto.jsonl' % index)
+                generated = self.invoke('generate', artifact, '--output', proof)
+                self.assertEqual(generated.returncode, 0, generated.stderr)
+                result = self.invoke('verify-release', proof, self.assets)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_inventory_parsing_does_not_launch_jq_for_each_asset(self):
+        result = subprocess.run(
+            ['bash', '-x', MODULE, 'verify-release', str(self.proof), str(self.assets)],
+            text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        # Trace actual jq processes: do not replace jq or mirror its predicates.
+        calls = re.findall(r'^\++ jq(?: |$)', result.stderr, flags=re.MULTILINE)
+        self.assertLessEqual(len(calls), 10, 'per-asset jq execution returned')
+
+    def test_many_asset_release_round_trip(self):
+        root = self.root / 'asset-heavy'
+        root.mkdir()
+        rows = []
+        for number in range(64):
+            name = 'asset-%04d-' % number + 'a' * 167 + '.tar.gz'
+            payload = b'owned asset-heavy fixture\n' + b'x' * number
+            (root / name).write_bytes(payload)
+            rows.append(dict(name=name, sha256=hashlib.sha256(payload).hexdigest(),
+                             target='linux/amd64', size_bytes=len(payload),
+                             archive_format='tar.gz'))
+        manifest_data = copy.deepcopy(self.manifest_data)
+        manifest_data['artifacts'] = rows
+        manifest = self.write_json('asset-heavy-manifest.json', manifest_data)
+        proof = self.root / 'asset-heavy.intoto.jsonl'
+        generated = self.invoke('generate-manifest', manifest, root,
+                                '--repository', REPOSITORY, '--builder', BUILDER,
+                                '--output', proof)
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        before = proof.read_bytes()
+        self.assertGreater(len(before), 131072)
+        verified = self.invoke('verify-release', proof, root, '--manifest', manifest,
+                               '--repository', REPOSITORY, '--builder', BUILDER)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        document = json.loads(before)
+        self.assertEqual(len(document['subject']), 64)
+        self.assertEqual(proof.read_bytes(), before)
 
 
 if __name__ == '__main__':
