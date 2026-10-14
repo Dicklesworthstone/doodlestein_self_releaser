@@ -207,8 +207,196 @@ function ConvertFrom-DsrCargoConfigString {
     return ConvertFrom-Json -InputObject $Value -ErrorAction Stop
 }
 
-function Get-DsrCargoToolConfiguration {
-    param($Context)
+
+function Test-DsrCargoConfigCompilerEnvironmentName {
+    param([string]$Name)
+    if ($Name -in @('PATH','DSR_TARGET_TRIPLE') -or $Name.StartsWith('CARGO_') -or
+        $Name.StartsWith('RUST') -or $Name.StartsWith('XWIN_')) { return $true }
+    return $Name -match '(^|_)(CC|CXX|CPP|AR|RANLIB|LD|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET)(_|$)'
+}
+
+function ConvertFrom-DsrCargoEnvironmentEntry {
+    param([string]$Text)
+    if (-not $Text.StartsWith('{')) {
+        return [pscustomobject]@{value=(ConvertFrom-DsrCargoConfigString $Text); force=$false; relative=$false}
+    }
+    if (-not $Text.EndsWith('}')) { throw 'Cargo environment inline tables must be single-line and closed' }
+    $rest=$Text.Substring(1,$Text.Length-2).Trim()
+    $entry=@{}; $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    while ($rest) {
+        if ($rest -cnotmatch '^([A-Za-z][A-Za-z0-9_-]*)\s*=\s*("(?:[^"\\\x00-\x1f]|\\["\\bfnrt]|\\u[0-9A-Fa-f]{4})*"|''[^''\x00-\x1f]*''|true|false)\s*(,\s*|$)') {
+            throw 'Cargo environment inline tables allow only literal value/force/relative fields'
+        }
+        $matched=$Matches[0]; $name=$Matches[1]; $token=$Matches[2]
+        if ($name -cnotin @('value','force','relative') -or -not $seen.Add($name)) {
+            throw 'Cargo environment inline table has an unsupported or repeated attribute'
+        }
+        if ($token -cin @('true','false')) { $entry[$name]=($token -ceq 'true') }
+        else { $entry[$name]=ConvertFrom-DsrCargoConfigString $token }
+        $rest=$rest.Substring($matched.Length)
+    }
+    if (-not $entry.ContainsKey('value') -or $entry.value -isnot [string]) {
+        throw 'Cargo environment inline table requires a literal string value'
+    }
+    foreach ($name in @('force','relative')) {
+        if ($entry.ContainsKey($name) -and $entry[$name] -isnot [bool]) {
+            throw ('Cargo environment ' + $name + ' must be boolean')
+        }
+    }
+    $force=if ($entry.ContainsKey('force')) { [bool]$entry.force } else { $false }
+    $relative=if ($entry.ContainsKey('relative')) { [bool]$entry.relative } else { $false }
+    if ($relative) { throw 'Cargo environment relative=true is outside strict attestation' }
+    return [pscustomobject]@{value=[string]$entry.value; force=$force; relative=$false}
+}
+
+function ConvertFrom-DsrCargoTargetCfg {
+    param([string]$Expression)
+    if (-not $Expression -or $Expression.Length -gt 4096 -or
+        -not $Expression.StartsWith('cfg(') -or -not $Expression.EndsWith(')')) {
+        throw 'Unsupported Cargo cfg expression'
+    }
+    $tokens=New-Object 'System.Collections.Generic.List[string]'
+    $pattern=[regex]' *([A-Za-z_][A-Za-z0-9_]*|"[^"\\\x00-\x1f]*"|[(),=])'
+    $offset=0
+    while ($offset -lt $Expression.Length) {
+        $match=$pattern.Match($Expression,$offset)
+        if (-not $match.Success -or $match.Index -ne $offset) {
+            throw ('Unsupported token in Cargo cfg expression: ' + $Expression)
+        }
+        $tokens.Add($match.Groups[1].Value)
+        $offset += $match.Length
+        if ($tokens.Count -gt 512) { throw 'Cargo cfg expression exceeds the token bound' }
+    }
+    $state=@{Position=0}
+    $take = {
+        param([string]$Expected='')
+        if ($state.Position -ge $tokens.Count) { throw ('Malformed Cargo cfg expression: ' + $Expression) }
+        $token=$tokens[$state.Position]; $state.Position++
+        if ($Expected -and $token -cne $Expected) { throw ('Malformed Cargo cfg expression: ' + $Expression) }
+        return $token
+    }
+    $allowed=@('target_arch','target_os','target_env','target_vendor','target_family','target_endian','target_pointer_width','target_abi')
+    $parse=$null
+    $parse = {
+        param([int]$Depth=0)
+        if ($Depth -gt 32) { throw 'Cargo cfg expression exceeds the nesting bound' }
+        $name=& $take
+        if ($name -in @('all','any','not')) {
+            $null=& $take '('
+            $children=New-Object 'System.Collections.Generic.List[object]'
+            if ($state.Position -lt $tokens.Count -and $tokens[$state.Position] -cne ')') {
+                while ($true) {
+                    $children.Add((& $parse ($Depth+1)))
+                    if ($state.Position -lt $tokens.Count -and $tokens[$state.Position] -ceq ',') {
+                        if ($name -ceq 'not') { throw 'Cargo cfg not() does not accept a comma' }
+                        $null=& $take ','
+                        if ($state.Position -lt $tokens.Count -and $tokens[$state.Position] -ceq ')') { break }
+                    } else { break }
+                }
+            }
+            $null=& $take ')'
+            if ($name -ceq 'not' -and $children.Count -ne 1) { throw 'Cargo cfg not() requires exactly one predicate' }
+            return [pscustomobject]@{kind=$name; children=@($children)}
+        }
+        if ($state.Position -lt $tokens.Count -and $tokens[$state.Position] -ceq '=') {
+            $null=& $take '='; $value=& $take
+            if ($name -cnotin $allowed -or $value.Length -lt 2 -or
+                -not $value.StartsWith('"') -or -not $value.EndsWith('"')) {
+                throw ('Unsupported Cargo cfg key/value predicate: ' + $Expression)
+            }
+            return [pscustomobject]@{kind='atom'; name=$name; value=$value.Substring(1,$value.Length-2)}
+        }
+        if ($name -cnotin @('unix','windows')) { throw ('Unsupported Cargo cfg name: ' + $name) }
+        return [pscustomobject]@{kind='atom'; name=$name; value=$null}
+    }
+    $null=& $take 'cfg'; $null=& $take '('
+    $node=& $parse 0
+    $null=& $take ')'
+    if ($state.Position -ne $tokens.Count) { throw ('Trailing input in Cargo cfg expression: ' + $Expression) }
+    return $node
+}
+
+function Test-DsrCargoTargetCfg {
+    param($Node,$Facts)
+    switch ($Node.kind) {
+        atom {
+            $fact=if ($null -eq $Node.value) { [string]$Node.name } else { [string]$Node.name + '=' + [string]$Node.value }
+            return $Facts.Contains($fact)
+        }
+        not { return -not (Test-DsrCargoTargetCfg $Node.children[0] $Facts) }
+        all {
+            foreach ($child in @($Node.children)) { if (-not (Test-DsrCargoTargetCfg $child $Facts)) { return $false } }
+            return $true
+        }
+        any {
+            foreach ($child in @($Node.children)) { if (Test-DsrCargoTargetCfg $child $Facts) { return $true } }
+            return $false
+        }
+        default { throw 'Unsupported Cargo cfg node' }
+    }
+}
+
+function ConvertFrom-DsrCargoRustFlags {
+    param([string]$Name,$Value)
+    if ($Value -is [array]) { return @($Value | ForEach-Object { [string]$_ }) }
+    if ($Value -isnot [string]) { throw 'Cargo rustflags must be a literal string or string array' }
+    if ($Value.IndexOf([char]0) -ge 0) { throw 'Cargo rustflags contain a NUL byte' }
+    if ($Name -ceq 'CARGO_ENCODED_RUSTFLAGS') {
+        if (-not $Value) { return @() }
+        return @($Value.Split([char]0x1f))
+    }
+    if ($Name -ceq 'RUSTFLAGS') {
+        return @($Value.Split([char]' ') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    return @($Value -split '\s+' | Where-Object { $_ })
+}
+
+function Assert-DsrCargoRustFlagsSafe {
+    param([string[]]$Words,[switch]$CfgScoped)
+    for ($i=0; $i -lt $Words.Count; $i++) {
+        $word=[string]$Words[$i]
+        if ($word.IndexOf([char]0) -ge 0 -or $word.StartsWith('@')) {
+            throw 'Rustflags response files and NUL bytes are not statically attested'
+        }
+        if ($word -cmatch '^-[gOvVh]+[CZ]') { throw 'Clustered rustflags compiler selectors are not statically attested' }
+        foreach ($selector in @(@('-C','--codegen','linker'),@('-Z','--unstable-options','codegen-backend'))) {
+            $short=$selector[0]; $long=$selector[1]; $forbidden=$selector[2]; $option=$null
+            if ($word -ceq $short -or $word -ceq $long) {
+                $option=if ($i+1 -lt $Words.Count) { [string]$Words[$i+1] } else { '' }
+            } elseif ($word.StartsWith($short) -and $word.Length -gt $short.Length) {
+                $option=$word.Substring($short.Length)
+            } elseif ($word.StartsWith($long+'=')) {
+                $option=$word.Substring($long.Length+1)
+            }
+            if ($null -ne $option) {
+                $key=(($option.Trim()).TrimStart('=')) -split '[=\s]',2 | Select-Object -First 1
+                if (($key -replace '_','-') -ceq $forbidden) {
+                    throw 'Rustflags compiler/linker overrides require explicit attested configuration'
+                }
+            }
+        }
+        if ($CfgScoped -and ($word -ceq '--cfg' -or $word.StartsWith('--cfg=') -or
+            $word -ceq '--target' -or $word.StartsWith('--target='))) {
+            throw 'Cfg-scoped Cargo selection cannot be combined with rustflags --cfg or --target'
+        }
+    }
+    if (($Words -join ' ') -match '(?i)(link-self-contained|gcc-ld|sysroot)') {
+        throw 'Rustflags can change executable selection; configure an explicit Cargo target linker and compiler'
+    }
+}
+
+function Get-DsrCargoTargetCfgFacts {
+    param($Context,$Rustc,[string]$Triple)
+    $program=if ($Rustc.ContainsKey('resolved_path')) { $Rustc.resolved_path } else { $Rustc.selected_path }
+    $expected=if ($Rustc.ContainsKey('resolved_sha256')) { $Rustc.resolved_sha256 } else { $Rustc.selected_sha256 }
+    if ((Get-DsrCargoToolFileHash $program) -cne $expected) { throw 'Rustc executable changed before target cfg probing' }
+    $result=Invoke-DsrCargoToolProbe -Context $Context -Program $program -Arguments @('--print=cfg','--target',$Triple)
+    if ((Get-DsrCargoToolFileHash $program) -cne $expected) { throw 'Rustc executable changed while probing target cfg' }
+    $facts=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $values=New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in ($result.Stdout -split '\r?\n')) {
+        if (-not $line) { continue }
+        if ($line -cnotmatch '^([A-Za-z_][A-Za-z0-9_]*)(?:="([^"\\\x00-\x1f]*)")?    param($Context)
     # This is an admission grammar, not a general TOML parser. Every byte of
     # every admitted statement is consumed. Unsupported syntax fails before
     # Cargo runs, so dotted keys, inline tables, cfg selectors, includes and
@@ -300,6 +488,706 @@ function Get-DsrCargoToolConfiguration {
         $configDigest=Get-DsrCacheBytesHash $rawBytes
         if ((Get-DsrCargoToolFileHash $path) -cne $configDigest) { throw 'Cargo configuration changed while parsing executable selection' }
         $config.receipts += @{path=$path; sha256=$configDigest}
+    }
+    return $config
+}
+
+function Resolve-DsrCargoPhysicalToolPath {
+    param([string]$Path)
+    # Tool installations legitimately contain rustup aliases and file links.
+    # Resolve them explicitly; the cache handle guards then pin only the final
+    # physical path while its bytes are read.
+    $full=[IO.Path]::GetFullPath($Path); $root=[IO.Path]::GetPathRoot($full); $current=$root
+    foreach ($part in $full.Substring($root.Length).Split([char[]]@('/','\'),[StringSplitOptions]::RemoveEmptyEntries)) {
+        $current=Join-Path $current $part
+        $item=Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            $resolved=$item.ResolveLinkTarget($true)
+            if ($null -eq $resolved) { throw 'Unable to resolve selected executable link' }
+            $current=$resolved.FullName
+        }
+    }
+    return Get-DsrCacheFullPath $current
+}
+
+function Get-DsrCargoToolFileHash {
+    param([string]$Path)
+    $physical=Resolve-DsrCargoPhysicalToolPath $Path
+    $guards=Open-DsrCachePathGuard (([IO.Path]::GetDirectoryName($physical)).Replace('\','/')); $entry=$null; $stream=$null; $sha=$null
+    try {
+        $entry=Open-DsrCacheEntry $physical; $before=$entry.GetIdentity(); $stream=$entry.OpenRead(); $sha=[Security.Cryptography.SHA256]::Create()
+        $digest=([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+        if ($entry.GetIdentity() -cne $before -or (Resolve-DsrCargoPhysicalToolPath $Path) -cne $physical) { throw 'Selected executable changed while hashing' }
+        return $digest
+    } finally {
+        if ($null -ne $sha) { $sha.Dispose() }; if ($null -ne $stream) { $stream.Dispose() }; if ($null -ne $entry) { $entry.Dispose() }
+        foreach ($guard in $guards) { $guard.Dispose() }
+    }
+}
+
+function Resolve-DsrCargoTool {
+    param($Context,[string]$Program,[switch]$CargoLookup,[switch]$Optional)
+    if (-not $Program -or $Program -match '[\x00-\x1f"%!*?<>|]' -or
+        ($Program.Contains(':') -and $Program -notmatch '^[A-Za-z]:[\\/][^:]+$') -or $Program.StartsWith('\\')) {
+        throw 'Ambiguous executable selector in Windows Cargo context'
+    }
+    $native=[Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    if ($native -and [IO.Path]::IsPathRooted($Program) -and $Program -notmatch '^[A-Za-z]:[\\/]') { throw 'Rooted executable selectors must include their drive' }
+    $hasPath=$Program -match '[\\/]' -or [IO.Path]::IsPathRooted($Program)
+    $directories=New-Object 'System.Collections.Generic.List[string]'
+    if ($hasPath) { $directories.Add($Context.SourceRoot) }
+    else {
+        # CMD respects NoDefaultCurrentDirectoryInExePath by presence, even
+        # when its value is zero. Rust does not use CMD's implicit cwd lookup.
+        if ($CargoLookup -and $native -and -not $Context.Environment.ContainsKey('NoDefaultCurrentDirectoryInExePath')) { $directories.Add($Context.SourceRoot) }
+        if ($Context.Environment.ContainsKey('PATH')) {
+            foreach ($directory in $Context.Environment['PATH'].Split([IO.Path]::PathSeparator)) {
+                if (-not $directory) {
+                    if ($CargoLookup -and $native -and $Context.Environment.ContainsKey('NoDefaultCurrentDirectoryInExePath')) { throw 'Empty PATH entries with disabled CMD cwd lookup are ambiguous' }
+                    continue
+                }
+                if ($directory.StartsWith('"') -and $directory.EndsWith('"')) { $directory=$directory.Substring(1,$directory.Length-2) }
+                if ($directory.Contains('"') -or -not [IO.Path]::IsPathRooted($directory) -or
+                    ($native -and $directory -notmatch '^[A-Za-z]:[\\/]')) {
+                    throw 'Executable attestation requires literal absolute PATH entries'
+                }
+                $directories.Add($directory)
+            }
+        }
+    }
+    $extensions=@('')
+    if ($native -and -not [IO.Path]::GetExtension($Program)) {
+        if ($CargoLookup) {
+            $pathExt=if ($Context.Environment.ContainsKey('PATHEXT')) { $Context.Environment['PATHEXT'] } else { '.COM;.EXE;.BAT;.CMD' }
+            $extensions=@($pathExt.Split(';'))
+            if ($extensions.Count -eq 0 -or @($extensions | Where-Object { $_ -notmatch '^\.[A-Za-z0-9]+$' }).Count) { throw 'Ambiguous PATHEXT in Windows Cargo context' }
+        } else { $extensions=@('.exe') }
+    }
+    foreach ($directory in $directories) {
+        foreach ($extension in $extensions) {
+            $path=if ([IO.Path]::IsPathRooted($Program)) { $Program+$extension } else { Join-Path $directory ($Program+$extension) }
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $path=Get-DsrCacheFullPath ([IO.Path]::GetFullPath($path))
+            if ([IO.Path]::GetExtension($path) -in @('.cmd','.bat','.ps1')) { throw 'Cargo and compiler script wrappers are outside executable attestation' }
+            if ($native -and [IO.Path]::GetExtension($path) -notin @('.exe','.com')) { throw 'Windows file-association wrappers are outside executable attestation' }
+            return $path
+        }
+    }
+    if ($Optional) { return '' }
+    throw ('Required toolchain executable was not found: ' + $Program)
+}
+
+function ConvertTo-DsrCargoProbeArgument {
+    param([string]$Value)
+    # Unlike user-supplied shell text these are single, already resolved probe
+    # arguments. Quoted parentheses are needed for Program Files (x86).
+    if (-not $Value -or $Value -match '[\x00-\x1f\x7f"%!^&|<>]' -or $Value.EndsWith('\')) { throw 'Unrepresentable executable probe argument' }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and $Value -notmatch '[ ()]') {
+        return $Value
+    }
+    return '"' + $Value + '"'
+}
+
+function Invoke-DsrCargoToolProbe {
+    param($Context,[string]$Program,[string[]]$Arguments,[switch]$AllowFailure)
+    # Receipts use slash-normalized paths. Native tools receive Windows image
+    # spelling, just as they do when rustc launches its discovered MSVC linker.
+    $imagePath=if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $Program.Replace('/','\') } else { $Program }
+    $words=@((ConvertTo-DsrCargoProbeArgument $imagePath))
+    foreach ($argument in $Arguments) { $words+=ConvertTo-DsrCargoProbeArgument $argument }
+    $bounded=[pscustomobject]@{SourceRoot=$Context.SourceRoot; CmdPath=$Context.CmdPath;
+        Environment=$Context.Environment; ProbeTimeoutMilliseconds=60000}
+    $result=Invoke-DsrCargoCommand -Context $bounded -Command ($words -join ' ') -CaptureOutput $true
+    if ($result.ExitCode -ne 0 -and -not $AllowFailure) {
+        # MSVC emits LNK errors on stdout. Keep the status and both streams so
+        # a loader, invocation, or compiler failure cannot become an empty error.
+        $diagnostic='Toolchain executable probe failed: ' + $Program + ' (exit ' + $result.ExitCode + ')'
+        foreach ($name in @('Stdout','Stderr')) {
+            $detail=([string]$result.$name).Trim()
+            if ($detail.Length -gt 4096) { $detail=$detail.Substring(0,4096) + ' [truncated]' }
+            if ($detail) { $diagnostic += "`n" + $name + ': ' + $detail }
+        }
+        throw $diagnostic
+    }
+    return $result
+}
+
+function Find-DsrCargoRustupReference {
+    param([string]$SelectedSha256)
+    # These are binary recognition references, never Cargo/rustc lookup or
+    # toolchain selectors. A configured build PATH may hide the installed
+    # manager while its byte-identical proxies remain usable.
+    $native=[Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $name=if ($native) { 'rustup.exe' } else { 'rustup' }
+    $directories=New-Object 'System.Collections.Generic.List[string]'
+    $launcherPath=[Environment]::GetEnvironmentVariable('PATH','Process')
+    if ($launcherPath) {
+        foreach ($directory in $launcherPath.Split([IO.Path]::PathSeparator)) {
+            $directory=$directory.Trim('"')
+            if ($directory -and [IO.Path]::IsPathRooted($directory) -and
+                (-not $native -or $directory -match '^[A-Za-z]:[\\/]')) { $directories.Add($directory) }
+        }
+    }
+    $userProfilePath=[Environment]::GetFolderPath('UserProfile')
+    if ($userProfilePath) { $directories.Add((Join-Path $userProfilePath '.cargo/bin')) }
+    $launcherCargoHome=[Environment]::GetEnvironmentVariable('CARGO_HOME','Process')
+    if ($launcherCargoHome -and [IO.Path]::IsPathRooted($launcherCargoHome) -and
+        (-not $native -or $launcherCargoHome -match '^[A-Za-z]:[\\/]')) { $directories.Add((Join-Path $launcherCargoHome 'bin')) }
+    $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($directory in $directories) {
+        $candidate=Join-Path $directory $name
+        if (-not $seen.Add($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        if ((Get-DsrCargoToolFileHash $candidate) -ceq $SelectedSha256) { return Get-DsrCacheFullPath ([IO.Path]::GetFullPath($candidate)) }
+    }
+    return ''
+}
+
+function Get-DsrCargoExecutableIdentity {
+    param($Context,[string]$Program,[string[]]$VersionArguments,[string]$RustupPath='',
+        [string]$RustupHash='', [string]$RustupTool='', [switch]$CargoLookup)
+    $selected=Resolve-DsrCargoTool -Context $Context -Program $Program -CargoLookup:$CargoLookup
+    $physical=Resolve-DsrCargoPhysicalToolPath $selected
+    $sha=Get-DsrCargoToolFileHash $selected
+    $magic=[IO.File]::OpenRead($physical)
+    try {
+        $first=$magic.ReadByte(); $second=$magic.ReadByte()
+        if ($first -eq 35 -and $second -eq 33) { throw 'Unresolved executable script wrappers are not attested' }
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and ($first -ne 77 -or $second -ne 90)) { throw 'Selected Windows tool is not a native executable' }
+    } finally { $magic.Dispose() }
+    $versionResult=Invoke-DsrCargoToolProbe -Context $Context -Program $selected -Arguments $VersionArguments
+    $version=($versionResult.Stdout+$versionResult.Stderr).Trim()
+    if (-not $version) { throw ('Executable did not report a version: ' + $selected) }
+    $record=@{program=$Program; selected_path=$selected; selected_sha256=$sha; selected_kind='executable'; version=$version}
+    $resolved=$physical; $router=$RustupPath
+    $isRustup=$RustupTool -and $RustupPath -and $sha -ceq $RustupHash
+    if ($RustupTool -and -not $isRustup) {
+        $router=Find-DsrCargoRustupReference -SelectedSha256 $sha
+        $isRustup=[bool]$router
+    }
+    if ($RustupTool -and -not $isRustup) {
+        # FORCE_ARG0 is only a conservative unresolved-dispatch detector.
+        # Native forwarders can relay it, so its output never grants authority.
+        # https://rust-lang.github.io/rustup/dev-guide/tips-and-tricks.html
+        $routerEnvironment=New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($name in $Context.Environment.Keys) { $routerEnvironment[$name]=$Context.Environment[$name] }
+        $routerEnvironment['RUSTUP_FORCE_ARG0']='rustup'
+        $routerContext=[pscustomobject]@{SourceRoot=$Context.SourceRoot; CmdPath=$Context.CmdPath;
+            Environment=$routerEnvironment; Toolchain=$Context.Toolchain}
+        $routerVersion=Invoke-DsrCargoToolProbe -Context $routerContext -Program $selected -Arguments @('--version') -AllowFailure
+        if ($routerVersion.ExitCode -eq 0 -and $routerVersion.Stdout.Trim() -cmatch '^rustup [0-9]+\.[0-9]+\.[0-9]+(?:[-+ ][^\r\n]*)?$') {
+            throw 'Unresolved Rustup dispatch or opaque native wrapper: no byte-identical manager reference'
+        }
+    }
+    if ($isRustup) {
+        $arguments=@('which')
+        if ($Context.Toolchain) { $arguments+=@('--toolchain',$Context.Toolchain) }
+        $arguments+=$RustupTool
+        $routerPhysical=Resolve-DsrCargoPhysicalToolPath $router
+        if ([IO.Path]::GetFileName($routerPhysical) -inotmatch '^rustup(?:\.exe)?$') { throw 'Rustup manager reference must resolve to a directly named Rustup executable' }
+        $routerGuards=Open-DsrCachePathGuard (([IO.Path]::GetDirectoryName($routerPhysical)).Replace('\','/')); $routerEntry=$null
+        try {
+            $routerEntry=Open-DsrCacheEntry $routerPhysical; $routerBefore=$routerEntry.GetIdentity()
+            if ((Get-DsrCargoToolFileHash $routerPhysical) -cne $sha) { throw 'Rustup manager reference changed before dispatch resolution' }
+            $which=Invoke-DsrCargoToolProbe -Context $Context -Program $routerPhysical -Arguments $arguments
+            if ($routerEntry.GetIdentity() -cne $routerBefore -or (Get-DsrCargoToolFileHash $routerPhysical) -cne $sha) {
+                throw 'Rustup manager reference changed during dispatch resolution'
+            }
+        } finally {
+            if ($null -ne $routerEntry) { $routerEntry.Dispose() }; foreach ($guard in $routerGuards) { $guard.Dispose() }
+        }
+        $candidate=$which.Stdout.Trim()
+        if (-not [IO.Path]::IsPathRooted($candidate) -or -not (Test-Path -LiteralPath $candidate -PathType Leaf)) { throw 'Rustup did not resolve the selected executable' }
+        $resolved=Resolve-DsrCargoPhysicalToolPath $candidate
+        if ($resolved -ceq $physical) { throw 'Rustup proxy resolved back to itself' }
+    } elseif ($CargoLookup -and $Context.Toolchain) {
+        throw 'An explicit +toolchain requires a proven rustup Cargo proxy'
+    }
+    if ($resolved -cne $selected) {
+        $magic=[IO.File]::OpenRead($resolved)
+        try {
+            $first=$magic.ReadByte(); $second=$magic.ReadByte()
+            if (($first -eq 35 -and $second -eq 33) -or
+                ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and ($first -ne 77 -or $second -ne 90))) {
+                throw 'Rustup resolved an unsupported executable wrapper'
+            }
+        } finally { $magic.Dispose() }
+        $record.resolved_path=$resolved; $record.resolved_sha256=Get-DsrCargoToolFileHash $resolved; $record.resolved_kind='executable'
+    }
+    if ((Get-DsrCargoToolFileHash $selected) -cne $sha) { throw 'Toolchain executable changed during its version probe' }
+    return $record
+}
+
+function Get-DsrCargoPrintedLinker {
+    param([string]$Output,$Context)
+    # rustc --print link-args prints Rust's quoted Command representation.
+    # Consume environment assignments, then exactly the program token. Never
+    # evaluate this diagnostic text as CMD or PowerShell source.
+    $remaining=$Output.Trim(); $quoted='"(?:[^"\\\x00-\x1f]|\\["\\bfnrt]|\\u[0-9A-Fa-f]{4})*"'
+    $linkEnvironment=New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $Context.Environment.Keys) { $linkEnvironment[$name]=$Context.Environment[$name] }
+    while ($remaining -cmatch ('^([A-Za-z_][A-Za-z0-9_]*)=('+$quoted+')\s+')) {
+        $matchText=$Matches[0]; $linkEnvironment[$Matches[1]]=ConvertFrom-Json $Matches[2]; $remaining=$remaining.Substring($matchText.Length)
+    }
+    if ($remaining -cnotmatch ('^('+$quoted+')\s+')) { throw 'Unable to attest rustc default linker command; configure an absolute target linker' }
+    $program=ConvertFrom-Json $Matches[1]
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and -not [IO.Path]::IsPathRooted($program)) {
+        # Windows' Rust Command formatter does not include its child PATH.
+        # An absolute MSVC discovery result is authoritative; a bare GNU/LLD
+        # driver needs an explicit absolute target-linker configuration.
+        throw 'Rustc did not report an absolute Windows linker; configure an absolute target linker'
+    }
+    $lookup=[pscustomobject]@{SourceRoot=$Context.SourceRoot; Environment=$linkEnvironment; CmdPath=$Context.CmdPath; Toolchain=$Context.Toolchain}
+    return @{program=(Resolve-DsrCargoTool -Context $lookup -Program $program); context=$lookup}
+}
+
+function Get-DsrCargoToolchainIdentity {
+    param($Context)
+    $config=Get-DsrCargoToolConfiguration $Context
+    if ($Context.Environment.ContainsKey('RUSTUP_FORCE_ARG0')) { throw 'Configured Rustup dispatch overrides are outside executable attestation' }
+    foreach ($key in @('RUSTC_WRAPPER','RUSTC_WORKSPACE_WRAPPER','CARGO_BUILD_RUSTC_WRAPPER','CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER')) {
+        if ($Context.Environment.ContainsKey($key) -and $Context.Environment[$key]) { throw ('Unresolved compiler wrapper cannot be attested: ' + $key) }
+    }
+    foreach ($key in @('rustc-wrapper','rustc-workspace-wrapper')) {
+        if ($config.build.ContainsKey($key) -and $config.build[$key]) { throw ('Unresolved Cargo compiler wrapper cannot be attested: ' + $key) }
+    }
+    foreach ($name in $Context.Environment.Keys) {
+        if ($name -match '^CARGO_UNSTABLE_' -and $Context.Environment[$name]) { throw 'Unstable Cargo selector environments are outside Windows toolchain attestation' }
+    }
+    $effective=New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $Context.Environment.Keys) { $effective[$name]=$Context.Environment[$name] }
+    if ($Context.Toolchain) { $effective['RUSTUP_TOOLCHAIN']=$Context.Toolchain }
+    foreach ($name in @($config.env.Keys | Sort-Object)) {
+        $entry=$config.env[$name]; $source='configuration'
+        if ($effective.ContainsKey($name) -and -not [bool]$entry.force) { $value=$effective[$name]; $source='environment' }
+        else { $value=[string]$entry.value; $effective[$name]=$value }
+        if ($value -cnotmatch '^[1-9][0-9]*$') { throw ('Effective Cargo numeric environment is invalid: ' + $name) }
+        foreach ($receipt in $config.receipts) {
+            foreach ($row in @($receipt.env_exemptions)) {
+                if ($row.name -ceq $name) {
+                    $row.effective_value=$value; $row.effective_force=[bool]$entry.force; $row.effective_source=$source
+                }
+            }
+        }
+    }
+    $probe=[pscustomobject]@{SourceRoot=$Context.SourceRoot; CargoHome=$Context.CargoHome; CmdPath=$Context.CmdPath; Environment=$effective; Toolchain=$Context.Toolchain}
+    $rustupPath=Resolve-DsrCargoTool -Context $probe -Program rustup -Optional
+    $rustupHash=if ($rustupPath) { Get-DsrCargoToolFileHash $rustupPath } else { '' }
+    $cargoArgs=@(); if ($Context.Toolchain) { $cargoArgs+='+'+$Context.Toolchain }; $cargoArgs+='-vV'
+    $cargo=Get-DsrCargoExecutableIdentity -Context $probe -Program $Context.CargoProgram -VersionArguments $cargoArgs -RustupPath $rustupPath -RustupHash $rustupHash -RustupTool cargo -CargoLookup
+    if ($cargo.version -cnotmatch '^cargo [0-9]+\.') { throw 'Selected executable does not report a Cargo version' }
+    $compiler='rustc'; $compilerConfigured=$false
+    if ($config.build.ContainsKey('rustc')) { $compiler=$config.build.rustc; $compilerConfigured=$true }
+    foreach ($name in @('CARGO_BUILD_RUSTC','RUSTC')) { if ($effective.ContainsKey($name) -and $effective[$name]) { $compiler=$effective[$name]; $compilerConfigured=$true } }
+    if ($compilerConfigured -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and -not [IO.Path]::IsPathRooted($compiler)) { throw 'Configured Windows rustc must use an absolute or config-relative executable path' }
+    $rustc=Get-DsrCargoExecutableIdentity -Context $probe -Program $compiler -VersionArguments @('-vV') -RustupPath $rustupPath -RustupHash $rustupHash -RustupTool rustc
+    if (-not $compilerConfigured -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $cargoPhysical=if ($cargo.ContainsKey('resolved_path')) { $cargo.resolved_path } else { Resolve-DsrCargoPhysicalToolPath $cargo.selected_path }
+        $rustcPhysical=if ($rustc.ContainsKey('resolved_path')) { $rustc.resolved_path } else { Resolve-DsrCargoPhysicalToolPath $rustc.selected_path }
+        $rustcHash=Get-DsrCargoToolFileHash $rustcPhysical
+        foreach ($directory in @($Context.SourceRoot,[IO.Path]::GetDirectoryName($cargoPhysical),[Environment]::SystemDirectory,[Environment]::GetFolderPath('Windows'))) {
+            if (-not $directory) { continue }
+            $candidate=Join-Path $directory 'rustc.exe'
+            if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and (Get-DsrCargoToolFileHash $candidate) -cne $rustcHash) { throw 'Ambiguous native Cargo compiler lookup; configure an absolute RUSTC executable' }
+        }
+    }
+    if ($rustc.version -cnotmatch '(?m)^host: ([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,})\r?$') { throw 'Selected compiler did not report its host target' }
+    $hostTriple=$Matches[1]; $triple=$Context.Target
+    if (-not $triple -and $config.build.ContainsKey('target')) { $triple=$config.build.target }
+    if (-not $triple) { $triple=$hostTriple }
+    if ($triple -isnot [string] -or $triple -cnotmatch '^[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}$') { throw 'Cargo target must be a literal target triple' }
+
+    $cfgSelectors=@($config.target.Keys | Where-Object { $_.StartsWith('cfg(') } | Sort-Object)
+    $cfgRows=New-Object 'System.Collections.Generic.List[object]'
+    $matchedCfg=New-Object 'System.Collections.Generic.List[string]'
+    $cfgFlags=New-Object 'System.Collections.Generic.List[string]'
+    $cfgLinkers=New-Object 'System.Collections.Generic.List[object]'
+    $cfgProbe=$null
+    if ($cfgSelectors.Count) {
+        $cfgProbe=Get-DsrCargoTargetCfgFacts -Context $probe -Rustc $rustc -Triple $triple
+        foreach ($selector in $cfgSelectors) {
+            $values=$config.target[$selector]
+            $matched=Test-DsrCargoTargetCfg (ConvertFrom-DsrCargoTargetCfg $selector) $cfgProbe.facts
+            $row=@{expression=$selector; matched=[bool]$matched}
+            if ($values.ContainsKey('rustflags')) { $row.rustflags=@($values.rustflags) }
+            if ($values.ContainsKey('linker')) { $row.linker=[string]$values.linker }
+            $cfgRows.Add($row)
+            if (-not $matched) { continue }
+            $matchedCfg.Add($selector)
+            if ($values.ContainsKey('rustflags')) { foreach ($word in @($values.rustflags)) { $cfgFlags.Add([string]$word) } }
+            if ($values.ContainsKey('linker')) { $cfgLinkers.Add([pscustomobject]@{selector=$selector; linker=[string]$values.linker}) }
+        }
+    }
+
+    $linkerVariable='CARGO_TARGET_' + ($triple.ToUpperInvariant() -replace '[^A-Z0-9]','_') + '_LINKER'
+    $linker=''; $linkerSource=$null
+    if ($config.target.ContainsKey($triple) -and $config.target[$triple].ContainsKey('linker')) { $linker=[string]$config.target[$triple].linker; $linkerSource='target.'+$triple }
+    if ($effective.ContainsKey($linkerVariable) -and $effective[$linkerVariable]) { $linker=$effective[$linkerVariable]; $linkerSource=$linkerVariable }
+    if (-not $linker) {
+        if ($cfgLinkers.Count -gt 1) { throw 'Multiple Cargo cfg linkers match the build target' }
+        if ($cfgLinkers.Count -eq 1) { $linker=$cfgLinkers[0].linker; $linkerSource=$cfgLinkers[0].selector }
+    }
+    if ($linker -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and -not [IO.Path]::IsPathRooted($linker)) { throw 'Configured Windows linker must use an absolute or config-relative executable path' }
+
+    $cfgScoped=$cfgSelectors.Count -gt 0
+    foreach ($name in $effective.Keys) {
+        if ($name -match 'RUSTFLAGS$') { Assert-DsrCargoRustFlagsSafe -Words @(ConvertFrom-DsrCargoRustFlags $name $effective[$name]) -CfgScoped:$cfgScoped }
+    }
+    if ($config.build.ContainsKey('rustflags')) { Assert-DsrCargoRustFlagsSafe -Words @(ConvertFrom-DsrCargoRustFlags config $config.build.rustflags) -CfgScoped:$cfgScoped }
+    foreach ($targetConfig in $config.target.Values) {
+        if ($targetConfig.ContainsKey('rustflags')) { Assert-DsrCargoRustFlagsSafe -Words @(ConvertFrom-DsrCargoRustFlags config $targetConfig.rustflags) -CfgScoped:$cfgScoped }
+    }
+
+    $targetFlags=New-Object 'System.Collections.Generic.List[string]'
+    if ($config.target.ContainsKey($triple) -and $config.target[$triple].ContainsKey('rustflags')) {
+        foreach ($word in @(ConvertFrom-DsrCargoRustFlags config $config.target[$triple].rustflags)) { $targetFlags.Add($word) }
+    }
+    $targetRustflags=$linkerVariable.Substring(0,$linkerVariable.Length-'LINKER'.Length)+'RUSTFLAGS'
+    if ($effective.ContainsKey($targetRustflags)) {
+        foreach ($word in @(ConvertFrom-DsrCargoRustFlags config $effective[$targetRustflags])) { $targetFlags.Add($word) }
+    }
+    foreach ($word in $cfgFlags) { $targetFlags.Add($word) }
+
+    $effectiveFlags=@(); $rustflagsSource='build'
+    if ($effective.ContainsKey('CARGO_ENCODED_RUSTFLAGS')) {
+        $effectiveFlags=@(ConvertFrom-DsrCargoRustFlags CARGO_ENCODED_RUSTFLAGS $effective['CARGO_ENCODED_RUSTFLAGS']); $rustflagsSource='CARGO_ENCODED_RUSTFLAGS'
+    } elseif ($effective.ContainsKey('RUSTFLAGS')) {
+        $effectiveFlags=@(ConvertFrom-DsrCargoRustFlags RUSTFLAGS $effective['RUSTFLAGS']); $rustflagsSource='RUSTFLAGS'
+    } elseif ($targetFlags.Count) {
+        $effectiveFlags=@($targetFlags); $rustflagsSource='target'
+    } else {
+        if ($config.build.ContainsKey('rustflags')) { $effectiveFlags=@(ConvertFrom-DsrCargoRustFlags config $config.build.rustflags) }
+        if ($effective.ContainsKey('CARGO_BUILD_RUSTFLAGS')) { $effectiveFlags += @(ConvertFrom-DsrCargoRustFlags config $effective['CARGO_BUILD_RUSTFLAGS']) }
+    }
+    Assert-DsrCargoRustFlagsSafe -Words @($effectiveFlags) -CfgScoped:$cfgScoped
+
+    $cargoTarget=@{cfg_tables=@($cfgRows); matched_cfg=@($matchedCfg);
+        linker=$(if ($linker) { $linker } else { $null }); linker_source=$linkerSource;
+        rustflags=@($effectiveFlags); rustflags_source=$rustflagsSource}
+    if ($null -ne $cfgProbe) {
+        $cargoTarget.cfg_probe=@{compiler_path=$cfgProbe.compiler_path; compiler_sha256=$cfgProbe.compiler_sha256;
+            target_triple=$triple; sha256=$cfgProbe.sha256; values=@($cfgProbe.values)}
+    }
+
+    $tools=@{cargo=$cargo; rustc=$rustc}
+    $linkerContext=$probe
+    if (-not $linker) {
+        $parent=[IO.Path]::GetDirectoryName($Context.CargoHome)
+        $probeRoot=Join-Path $parent ('.dsr-toolchain-probe-' + [Guid]::NewGuid().ToString('N'))
+        if (Test-DsrCacheInside $probeRoot $Context.SourceRoot) { throw 'Toolchain probe storage must be outside the source snapshot' }
+        $null=[IO.Directory]::CreateDirectory($probeRoot)
+        $probeSource=Join-Path $probeRoot 'main.rs'
+        [IO.File]::WriteAllText($probeSource,'fn main() {}',[Text.UTF8Encoding]::new($false))
+        $arguments=@('--crate-name','dsr_toolchain_probe','--edition=2021','--crate-type=bin','--target',$triple,'--print=link-args',$probeSource,'-o',(Join-Path $probeRoot 'probe.exe'))
+        $result=Invoke-DsrCargoToolProbe -Context $probe -Program $rustc.selected_path -Arguments $arguments
+        $printed=Get-DsrCargoPrintedLinker -Output $result.Stdout -Context $probe
+        $linker=$printed.program; $linkerContext=$printed.context
+        $cargoTarget.linker=$linker
+    }
+    $linkerPath=Resolve-DsrCargoTool -Context $linkerContext -Program $linker
+    $versionArgs=if ([IO.Path]::GetFileName($linkerPath) -ieq 'link.exe') { @('/?') } else { @('--version') }
+    $tools.linker=Get-DsrCargoExecutableIdentity -Context $linkerContext -Program $linkerPath -VersionArguments $versionArgs
+    $tools.linker.version=($tools.linker.version -split '\r?\n')[0]
+    return @{schema_version=1; cwd=$Context.SourceRoot; target_triple=$triple;
+        linker_variable=$(if ($effective.ContainsKey($linkerVariable)) { $linkerVariable } else { $null }); tools=$tools;
+        selection=@{rustup_toolchain=$(if ($Context.Toolchain) { $Context.Toolchain } elseif ($effective.ContainsKey('RUSTUP_TOOLCHAIN')) { $effective['RUSTUP_TOOLCHAIN'] } else { $null });
+            cargo_commands=@((@((Split-DsrCargoLiteralCommand $Context.BuildCommand) | Where-Object { $_.Value -cin @('build','rustc') })[0].Value));
+            cargo_config=$config.receipts; cargo_target=$cargoTarget}}
+}
+
+function New-DsrCargoContextEnvironment {
+    param(
+        [Parameter(Mandatory=$true)][string]$CargoHome,
+        [AllowEmptyCollection()][string[]]$Environment=@())
+    $effective = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        if (-not (Test-DsrCargoSanitizedEnvironmentName $entry.Key)) { $effective[$entry.Key] = [string]$entry.Value }
+    }
+    $configured = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($assignment in $Environment) {
+        if ($assignment -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=([^\x00\r\n]*)$') { throw 'Invalid configured Windows Cargo environment assignment' }
+        $name = $Matches[1]; $value = $Matches[2]
+        # Managed values win and are not additional configured influences.
+        if ($name -in @('CARGO_HOME','RCH_DISABLED','RCH_CARGO_WRAPPER_BYPASS')) { continue }
+        $effective[$name] = $value; $null = $configured.Add($name.ToUpperInvariant())
+    }
+    $effective['CARGO_HOME'] = $CargoHome
+    $effective['RCH_DISABLED'] = '1'; $effective['RCH_CARGO_WRAPPER_BYPASS'] = '1'
+    return @{Environment=$effective; ConfiguredNames=@($configured)}
+}
+
+function New-DsrCargoContext {
+    param([Parameter(Mandatory=$true)][string]$BuildCommand,
+        [Parameter(Mandatory=$true)][string]$SourceRoot,
+        [Parameter(Mandatory=$true)][string]$CargoHome,
+        [AllowEmptyCollection()][string[]]$Environment=@(), [string]$ExpectedTarget='')
+    $source = Get-DsrCacheFullPath $SourceRoot
+    $homePath = Get-DsrCacheFullPath $CargoHome
+    $environmentContext = New-DsrCargoContextEnvironment -CargoHome $homePath -Environment $Environment
+    $effective = $environmentContext.Environment
+    $cmdPath = Get-DsrCargoCmdPath -Environment $effective
+    $effective['COMSPEC'] = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $cmdPath.Replace('/','\') } else { $cmdPath }
+    $selection = Get-DsrCargoContextSelection -BuildCommand $BuildCommand -SourceRoot $source -Environment $effective -ExpectedTarget $ExpectedTarget
+    $context = [pscustomobject]@{SourceRoot=$source; CargoHome=$homePath; CmdPath=$cmdPath;
+        BuildCommand=$BuildCommand; MetadataCommand=$selection.MetadataCommand; CargoPrefix=$selection.CargoPrefix;
+        CargoProgram=$selection.CargoProgram; Toolchain=$selection.Toolchain; Target=$selection.Target; Environment=$effective;
+        ConfiguredNames=$environmentContext.ConfiguredNames; ToolchainIdentity=$null; Fingerprint=''}
+    $context.ToolchainIdentity = Get-DsrCargoToolchainIdentity $context
+    if ($ExpectedTarget -and $context.ToolchainIdentity.target_triple -cne $ExpectedTarget) { throw 'Cargo configuration target disagrees with the selected native variant' }
+    $context.Fingerprint = Get-DsrCargoContextFingerprint $context -UseRecordedToolchain
+    return $context
+}
+
+function Get-DsrCargoContextInputs {
+    param($Context)
+    $paths = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
+    $null = $paths.Add((Join-Path $Context.SourceRoot 'Cargo.toml'))
+    $null = $paths.Add((Join-Path $Context.SourceRoot 'Cargo.lock'))
+    $current = [IO.DirectoryInfo]::new($Context.SourceRoot)
+    while ($null -ne $current) {
+        foreach ($name in @('.cargo/config','.cargo/config.toml','rust-toolchain','rust-toolchain.toml')) {
+            $null = $paths.Add((Join-Path $current.FullName $name))
+        }
+        $current = $current.Parent
+    }
+    foreach ($name in @('config','config.toml')) { $null = $paths.Add((Join-Path $Context.CargoHome $name)) }
+    $rustupHome = if ($Context.Environment.ContainsKey('RUSTUP_HOME')) { $Context.Environment['RUSTUP_HOME'] }
+        elseif ($Context.Environment.ContainsKey('USERPROFILE')) { Join-Path $Context.Environment['USERPROFILE'] '.rustup' }
+        else { '' }
+    if ($rustupHome) { $null = $paths.Add((Join-Path $rustupHome 'settings.toml')) }
+    $inputs = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($path in $paths) {
+        $normalized = Get-DsrCacheFullPath $path
+        if (-not (Get-Item -LiteralPath $normalized -Force -ErrorAction SilentlyContinue)) {
+            $inputs.Add(@{path=$normalized; sha256=$null}); continue
+        }
+        $guards = Open-DsrCachePathGuard (([IO.Path]::GetDirectoryName($normalized)).Replace('\','/'))
+        $entry = $null; $stream = $null; $sha = $null
+        try {
+            $entry = Open-DsrCacheEntry $normalized
+            $before = $entry.GetIdentity(); $stream = $entry.OpenRead()
+            $sha = [Security.Cryptography.SHA256]::Create()
+            $digest = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+            if ($entry.GetIdentity() -cne $before) { throw 'Cargo context input changed while hashing' }
+            $inputs.Add(@{path=$normalized; sha256=$digest})
+        } finally {
+            if ($null -ne $sha) { $sha.Dispose() }
+            if ($null -ne $stream) { $stream.Dispose() }
+            if ($null -ne $entry) { $entry.Dispose() }
+            foreach ($guard in $guards) { $guard.Dispose() }
+        }
+    }
+    return ,$inputs.ToArray()
+}
+
+function Get-DsrCargoContextDigests {
+    param($Context,[switch]$UseRecordedToolchain)
+    $influences = @{}
+    foreach ($name in $Context.Environment.Keys) {
+        if ((Test-DsrCargoContextEnvironmentName $name) -or $name -in $Context.ConfiguredNames) {
+            $influences[$name.ToUpperInvariant()] = $Context.Environment[$name]
+        }
+    }
+    $selection = @{source_root=$Context.SourceRoot; cargo_home=$Context.CargoHome; cmd_path=$Context.CmdPath;
+        build_command=$Context.BuildCommand; metadata_command=$Context.MetadataCommand;
+        cargo_prefix=$Context.CargoPrefix; toolchain=$Context.Toolchain; target=$Context.Target}
+    $digests = @{}
+    foreach ($item in @(@('selection',$selection), @('environment',$influences), @('inputs',(Get-DsrCargoContextInputs $Context)))) {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-DsrCacheCanonicalJson $item[1]) + "`n")
+        $digests[$item[0] + '_sha256'] = Get-DsrCacheBytesHash $bytes
+    }
+    $identity=if ($UseRecordedToolchain) { $Context.ToolchainIdentity } else { Get-DsrCargoToolchainIdentity $Context }
+    $digests.toolchain_sha256=Get-DsrCacheBytesHash ([Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-DsrCacheCanonicalJson $identity) + "`n"))
+    return $digests
+}
+
+function Get-DsrCargoContextFingerprint {
+    param([Parameter(Mandatory=$true)]$Context,[switch]$UseRecordedToolchain)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-DsrCacheCanonicalJson (Get-DsrCargoContextDigests $Context -UseRecordedToolchain:$UseRecordedToolchain)) + "`n")
+    return Get-DsrCacheBytesHash $bytes
+}
+
+function Write-DsrCargoContextReceipt {
+    param([Parameter(Mandatory=$true)]$Context, [Parameter(Mandatory=$true)][string]$Path)
+    $digests = Get-DsrCargoContextDigests $Context
+    $fingerprint = Get-DsrCacheBytesHash ([Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-DsrCacheCanonicalJson $digests) + "`n"))
+    $recordedToolchainHash=Get-DsrCacheBytesHash ([Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-DsrCacheCanonicalJson $Context.ToolchainIdentity) + "`n"))
+    if ($fingerprint -cne $Context.Fingerprint -or $recordedToolchainHash -cne $digests.toolchain_sha256) { throw 'Cargo context changed during metadata preparation' }
+    $receipt = @{schema_version=1; fingerprint=$fingerprint; selection_sha256=$digests.selection_sha256;
+        environment_sha256=$digests.environment_sha256; inputs_sha256=$digests.inputs_sha256;
+        toolchain_sha256=$digests.toolchain_sha256; toolchain=$Context.ToolchainIdentity}
+    $digest = New-DsrCargoReceipt -Path (Get-DsrCacheFullPath $Path) -Value $receipt
+    return @{schema_version=1; fingerprint=$fingerprint; receipt_sha256=$digest; toolchain=$Context.ToolchainIdentity}
+}
+
+function Assert-DsrCargoContextReceipt {
+    param([Parameter(Mandatory=$true)]$Context, [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Fingerprint, [Parameter(Mandatory=$true)][string]$ReceiptSha256)
+    if ($Fingerprint -cnotmatch '^[0-9a-f]{64}$' -or $ReceiptSha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid Cargo context admission digest' }
+    $receipt = Read-DsrCargoReceipt -Path (Get-DsrCacheFullPath $Path)
+    if ($receipt.sha256 -cne $ReceiptSha256 -or $receipt.value.schema_version -ne 1 -or
+        $receipt.value.fingerprint -cne $Fingerprint -or $Context.Fingerprint -cne $Fingerprint -or
+        (ConvertTo-DsrCacheCanonicalJson $receipt.value.toolchain) -cne (ConvertTo-DsrCacheCanonicalJson $Context.ToolchainIdentity) -or
+        (Get-DsrCargoContextFingerprint $Context) -cne $Fingerprint) { throw 'Admitted Windows Cargo context changed' }
+}
+
+function Invoke-DsrCargoCommand {
+    param([Parameter(Mandatory=$true)]$Context, [Parameter(Mandatory=$true)][string]$Command, [bool]$CaptureOutput=$false)
+    # Both operations use native CMD lookup, including PATHEXT, current-directory
+    # rules and batch selectors. PowerShell command precedence is never involved.
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    # Keep slash-normalized paths in receipts, but launch CMD with its native
+    # spelling. CMD also scans its own command-line image token for switches;
+    # a /cmd.exe component can be interpreted as /c instead of the image name.
+    $psi.FileName = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $Context.CmdPath.Replace('/','\')
+    } else { $Context.CmdPath }
+    $psi.WorkingDirectory = $Context.SourceRoot
+    $psi.UseShellExecute = $false
+    $psi.Arguments = '/d /v:off /s /c "' + $Command + '"'
+    $psi.EnvironmentVariables.Clear()
+    foreach ($name in $Context.Environment.Keys) { $psi.EnvironmentVariables[$name] = $Context.Environment[$name] }
+    $psi.RedirectStandardOutput = $CaptureOutput; $psi.RedirectStandardError = $CaptureOutput
+    if ($CaptureOutput) {
+        $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+        $psi.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    }
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $psi
+    try {
+        if (-not $process.Start()) { throw 'Failed to start native Cargo CMD launcher' }
+        if ($CaptureOutput) {
+            # Drain concurrently: Cargo can fill stderr while metadata fills stdout.
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync(); $stderrTask = $process.StandardError.ReadToEndAsync()
+        }
+        if ($Context.PSObject.Properties['ProbeTimeoutMilliseconds']) {
+            if (-not $process.WaitForExit($Context.ProbeTimeoutMilliseconds)) {
+                $process.Kill($true)
+                throw 'Toolchain executable probe exceeded its bounded runtime'
+            }
+        } else { $process.WaitForExit() }
+        $stdout = ''; $stderr = ''
+        if ($CaptureOutput) { $stdout = $stdoutTask.GetAwaiter().GetResult(); $stderr = $stderrTask.GetAwaiter().GetResult() }
+        return [pscustomobject]@{ExitCode=$process.ExitCode; Stdout=$stdout; Stderr=$stderr}
+    } finally { $process.Dispose() }
+}
+
+function Invoke-DsrCargoContext {
+    param([Parameter(Mandatory=$true)]$Context,
+        [Parameter(Mandatory=$true)][ValidateSet('Metadata','Build')][string]$Operation, [switch]$CaptureOutput)
+    if ((Get-DsrCargoContextFingerprint $Context) -cne $Context.Fingerprint) { throw 'Windows Cargo context changed before launch' }
+    $command = if ($Operation -eq 'Metadata') { $Context.MetadataCommand } else { $Context.BuildCommand }
+    $result=Invoke-DsrCargoCommand -Context $Context -Command $command -CaptureOutput ($CaptureOutput.IsPresent -or $Operation -eq 'Metadata')
+    if ((Get-DsrCargoContextFingerprint $Context) -cne $Context.Fingerprint) { throw 'Windows Cargo context changed during execution; refusing artifact collection' }
+    return $result
+}
+) { throw 'Malformed rustc target cfg output' }
+        $fact=if ($line.Contains('=')) { $Matches[1] + '=' + $Matches[2] } else { $Matches[1] }
+        if (-not $facts.Add($fact)) { throw 'Duplicate rustc target cfg output' }
+        $values.Add($line)
+    }
+    foreach ($key in @('target_arch','target_os','target_env','target_vendor','target_endian','target_pointer_width')) {
+        if (@($facts | Where-Object { $_.StartsWith($key+'=') }).Count -ne 1) { throw ('Missing or ambiguous rustc target cfg: ' + $key) }
+    }
+    $raw=[Text.UTF8Encoding]::new($false).GetBytes($result.Stdout)
+    return [pscustomobject]@{facts=$facts; values=@($values | Sort-Object -Unique);
+        compiler_path=$program; compiler_sha256=$expected; sha256=(Get-DsrCacheBytesHash $raw)}
+}
+
+function Get-DsrCargoToolConfiguration {
+    param($Context)
+    $config = @{build=@{}; env=@{}; target=(New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)); receipts=@()}
+    $directories = New-Object 'System.Collections.Generic.List[string]'
+    $current = [IO.DirectoryInfo]::new($Context.SourceRoot)
+    while ($null -ne $current) { $directories.Insert(0,(Get-DsrCacheFullPath $current.FullName)); $current=$current.Parent }
+    foreach ($directory in $directories) {
+        $path = Join-Path $directory '.cargo/config'
+        if (-not (Test-Path -LiteralPath $path)) { $path = Join-Path $directory '.cargo/config.toml' }
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $path = Get-DsrCacheFullPath $path
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($directory,$Context.SourceRoot)) { throw 'Untracked ancestor Cargo config is forbidden' }
+        $rawBytes = [IO.File]::ReadAllBytes($path)
+        $raw = [Text.UTF8Encoding]::new($false,$true).GetString($rawBytes)
+        if ($raw.Length -gt 1048576) { throw 'Cargo configuration exceeds the bounded attestation limit' }
+        $section=''; $target=''; $pending=''
+        $keys=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $envExemptions=New-Object 'System.Collections.Generic.List[object]'
+        foreach ($line in ($raw -split '\r?\n')) {
+            $quote=[char]0; $escape=$false; $end=$line.Length
+            for ($i=0; $i -lt $line.Length; $i++) {
+                $character=$line[$i]
+                if ($escape) { $escape=$false; continue }
+                if ($quote -eq '"' -and $character -eq '\') { $escape=$true; continue }
+                if ($quote -ne [char]0) { if ($character -eq $quote) { $quote=[char]0 }; continue }
+                if ($character -eq '"' -or $character -eq "'") { $quote=$character }
+                elseif ($character -eq '#') { $end=$i; break }
+            }
+            if ($quote -ne [char]0) { throw 'Multiline Cargo configuration strings are not attested' }
+            $statement=$line.Substring(0,$end).Trim()
+            if (-not $statement) { continue }
+            if ($pending) { $statement=$pending + ' ' + $statement; $pending='' }
+            if ($statement -cmatch '^([A-Za-z0-9_-]+)\s*=\s*\[' -and -not $statement.EndsWith(']')) { $pending=$statement; continue }
+            if ($statement -cmatch '^\[\s*(build|net|term|registry|env)\s*\]$') { $section=$Matches[1]; $target=''; continue }
+            if ($statement -cmatch '^\[\s*(target|source|registries)\s*\.\s*("(?:[^"\\]|\\.)*"|''[^'']*''|[A-Za-z0-9_-]+)\s*\]$') {
+                $section=$Matches[1]; $target=$Matches[2]
+                if ($target.StartsWith('"') -or $target.StartsWith("'")) { $target=ConvertFrom-DsrCargoConfigString $target }
+                if ($section -eq 'target') {
+                    if ($target.StartsWith('cfg(')) { $null=ConvertFrom-DsrCargoTargetCfg $target }
+                    elseif ($target -cnotmatch '^[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}$') { throw 'Cargo target configuration must use a literal triple or supported cfg expression' }
+                    if (-not $config.target.ContainsKey($target)) { $config.target[$target]=@{} }
+                } elseif ($target -cnotmatch '^[A-Za-z0-9_-]+$') { throw 'Dynamic Cargo source/registry configuration is not attested' }
+                continue
+            }
+            if ($statement -cnotmatch '^([A-Za-z0-9_-]+)\s*=\s*(.+)$' -or -not $section) { throw 'Unsupported Cargo configuration syntax in strict Windows toolchain attestation' }
+            $key=$Matches[1]; $text=$Matches[2].Trim()
+            if (-not $keys.Add($section + '.' + $target + '.' + $key)) { throw 'Repeated Cargo configuration key' }
+            $allowed = switch ($section) {
+                build { @('jobs','target','target-dir','incremental','rustc','rustc-wrapper','rustc-workspace-wrapper','rustflags') }
+                target { @('linker','rustflags','runner') }
+                source { @('registry','local-registry','directory','git','branch','tag','rev','replace-with') }
+                registries { @('index','protocol') }
+                net { @('offline','retry','git-fetch-with-cli') }
+                term { @('color','verbose','quiet') }
+                registry { @('default') }
+                env { @() }
+            }
+            if ($section -eq 'env') {
+                $entry=ConvertFrom-DsrCargoEnvironmentEntry $text
+                if ($key -in @('RUST_MIN_STACK','RUST_TEST_THREADS')) {
+                    if ($entry.value -cnotmatch '^[1-9][0-9]*$') { throw ('Cargo numeric environment requires a positive-integer string: ' + $key) }
+                    $config.env[$key]=@{value=[string]$entry.value; force=[bool]$entry.force}
+                    $envExemptions.Add(@{name=$key; value=[string]$entry.value; force=[bool]$entry.force})
+                } elseif (Test-DsrCargoConfigCompilerEnvironmentName $key) {
+                    throw 'Cargo configuration changes the compiler environment; use the configured build environment'
+                }
+                continue
+            }
+            if ($key -cnotin $allowed) { throw ('Unsupported Cargo configuration selector: ' + $section + '.' + $key) }
+            $value=$null
+            if ($text.StartsWith('[')) {
+                if ($key -cnotin @('rustflags','runner') -or -not $text.EndsWith(']')) { throw 'Unsupported Cargo configuration array' }
+                $values=New-Object 'System.Collections.Generic.List[string]'; $rest=$text.Substring(1,$text.Length-2).Trim()
+                while ($rest) {
+                    if ($rest -cnotmatch '^("(?:[^"\\\x00-\x1f]|\\["\\bfnrt]|\\u[0-9A-Fa-f]{4})*"|''[^''\x00-\x1f]*'')\s*(,\s*|$)') { throw 'Cargo configuration arrays must contain literal strings only' }
+                    $matched=$Matches[0]; $values.Add((ConvertFrom-DsrCargoConfigString $Matches[1])); $rest=$rest.Substring($matched.Length)
+                }
+                $value=$values.ToArray()
+            } elseif ($text -cmatch '^-?[0-9]+$' -or $text -cin @('true','false')) {
+                if ($key -cnotin @('jobs','incremental','offline','retry','git-fetch-with-cli','verbose','quiet')) { throw 'Cargo executable selectors require literal strings' }
+                $value=$text
+            } else { $value=ConvertFrom-DsrCargoConfigString $text }
+            if (($section -eq 'build' -and $key -in @('rustc','rustc-wrapper','rustc-workspace-wrapper')) -or ($section -eq 'target' -and $key -eq 'linker')) {
+                if ($value -isnot [string] -or -not $value) { throw 'Cargo executable selectors require nonempty literal strings' }
+                if ($value -match '[\\/]' -and -not [IO.Path]::IsPathRooted($value)) { $value=[IO.Path]::GetFullPath((Join-Path $directory $value)) }
+            }
+            if ($section -eq 'build') { $config.build[$key]=$value }
+            elseif ($section -eq 'target') { $config.target[$target][$key]=$value }
+        }
+        if ($pending) { throw 'Unfinished Cargo configuration array' }
+        $configDigest=Get-DsrCacheBytesHash $rawBytes
+        if ((Get-DsrCargoToolFileHash $path) -cne $configDigest) { throw 'Cargo configuration changed while parsing executable selection' }
+        $receipt=@{path=$path; sha256=$configDigest}
+        if ($envExemptions.Count) { $receipt.env_exemptions=@($envExemptions) }
+        $config.receipts += $receipt
     }
     return $config
 }
