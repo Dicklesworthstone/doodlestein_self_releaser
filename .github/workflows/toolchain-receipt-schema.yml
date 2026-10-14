@@ -1,0 +1,30 @@
+name: Toolchain receipt manifest contract
+on:
+  push:
+    branches: [main]
+    paths:
+      - schemas/manifest.json
+      - src/act_runner.sh
+      - scripts/tests/test_toolchain_receipt_schema.py
+      - .github/workflows/toolchain-receipt-schema.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  schema-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install schema validator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-jsonschema
+      - name: Validate actual checked-out observer definitions against the manifest schema
+        run: |
+          # Shape/contract evidence only. No candidate patch is applied, no
+          # compiler is mocked, and this job cannot write repository objects.
+          /usr/bin/python3 -I scripts/tests/test_toolchain_receipt_schema.py

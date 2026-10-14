@@ -487,11 +487,128 @@
         }
       }
     },
+    "toolchain_file_pin": {
+      "type": "object",
+      "description": "Measured dispatch dependency; this shape does not authenticate the referenced bytes.",
+      "required": ["path", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "toolchain_sysroot_resolver": {
+      "description": "Bare-rustc dispatch observation for the reviewed RCH launcher. A missing executable is null; a failed sysroot probe still retains its selected executable and exit status.",
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["program", "selected_path", "selected_sha256", "selected_kind", "sysroot_probe_exit_code", "sysroot"],
+          "additionalProperties": false,
+          "dependentRequired": {
+            "resolved_path": ["resolved_sha256", "resolved_kind"],
+            "resolved_sha256": ["resolved_path", "resolved_kind"],
+            "resolved_kind": ["resolved_path", "resolved_sha256"]
+          },
+          "properties": {
+            "program": {"const": "rustc"},
+            "selected_path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
+            "selected_sha256": {"$ref": "#/$defs/sha256"},
+            "selected_kind": {"enum": ["executable", "script"]},
+            "sysroot_probe_exit_code": {"type": "integer"},
+            "sysroot": {"type": "string"},
+            "version": {"type": "string"},
+            "resolved_path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
+            "resolved_sha256": {"$ref": "#/$defs/sha256"},
+            "resolved_kind": {"enum": ["executable", "script"]},
+            "rustup_resolver": {"$ref": "#/$defs/toolchain_file_pin"}
+          }
+        }
+      ]
+    },
+    "cargo_numeric_value": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$",
+      "not": {"pattern": "[^0-9]"}
+    },
+    "cargo_environment_exemption": {
+      "type": "object",
+      "description": "Legacy literal values or complete configured/effective numeric environment observations. Force and effective provenance must be retained together.",
+      "required": ["name", "value"],
+      "additionalProperties": false,
+      "dependentRequired": {
+        "force": ["effective_value", "effective_force", "effective_source"],
+        "effective_value": ["force", "effective_force", "effective_source"],
+        "effective_force": ["force", "effective_value", "effective_source"],
+        "effective_source": ["force", "effective_value", "effective_force"]
+      },
+      "properties": {
+        "name": {"enum": ["RUST_MIN_STACK", "RUST_TEST_THREADS"]},
+        "value": {"$ref": "#/$defs/cargo_numeric_value"},
+        "force": {"type": "boolean"},
+        "effective_value": {"$ref": "#/$defs/cargo_numeric_value"},
+        "effective_force": {"type": "boolean"},
+        "effective_source": {"enum": ["configuration", "environment"]}
+      }
+    },
+    "cargo_cfg_expression": {
+      "type": "string", "minLength": 6, "maxLength": 4096,
+      "pattern": "^cfg\\(.*\\)$",
+      "not": {"pattern": "[\\u0000-\\u001f\\u007f]"}
+    },
+    "cargo_target_observation": {
+      "type": "object",
+      "description": "Actual observer output: configured cfg contributions, matching decisions and final ordered rustflags. Runtime attestation, not this schema, validates predicates, precedence and executable hashes.",
+      "required": ["cfg_tables", "matched_cfg", "linker", "linker_source", "rustflags", "rustflags_source"],
+      "additionalProperties": false,
+      "allOf": [{
+        "if": {"properties": {"cfg_tables": {"minItems": 1}}, "required": ["cfg_tables"]},
+        "then": {"required": ["cfg_probe"]},
+        "else": {"not": {"required": ["cfg_probe"]}}
+      }],
+      "properties": {
+        "cfg_tables": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["expression", "matched"],
+            "additionalProperties": false,
+            "properties": {
+              "expression": {"$ref": "#/$defs/cargo_cfg_expression"},
+              "matched": {"type": "boolean"},
+              "rustflags": {"type": "array", "items": {"type": "string"}},
+              "linker": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "matched_cfg": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/cargo_cfg_expression"}},
+        "linker": {"type": ["string", "null"], "minLength": 1},
+        "linker_source": {"type": ["string", "null"], "minLength": 1},
+        "rustflags": {"type": "array", "items": {"type": "string"}},
+        "rustflags_source": {"enum": ["CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS", "target", "build"]},
+        "cfg_probe": {
+          "type": "object",
+          "required": ["compiler_path", "compiler_sha256", "target_triple", "sha256", "values"],
+          "additionalProperties": false,
+          "properties": {
+            "compiler_path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
+            "compiler_sha256": {"$ref": "#/$defs/sha256"},
+            "target_triple": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "values": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+          }
+        }
+      }
+    },
     "toolchain_executable": {
       "type": "object",
       "description": "One executable selected in the strict native build context, with a resolved dispatch target for proven rustup proxies and Apple launchers. Unix scripts retain their own identity; Windows requires resolved native executables.",
       "required": ["program", "selected_path", "selected_sha256", "selected_kind", "version"],
       "additionalProperties": false,
+      "dependentRequired": {
+        "resolved_path": ["resolved_sha256", "resolved_kind"],
+        "resolved_sha256": ["resolved_path", "resolved_kind"],
+        "resolved_kind": ["resolved_path", "resolved_sha256"]
+      },
       "properties": {
         "program": {"type": "string", "minLength": 1},
         "selected_path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
@@ -500,7 +617,10 @@
         "version": {"type": "string"},
         "resolved_path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
         "resolved_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "resolved_kind": {"enum": ["executable", "script"]}
+        "resolved_kind": {"enum": ["executable", "script"]},
+        "rustup_resolver": {"$ref": "#/$defs/toolchain_file_pin"},
+        "toolchain_launcher": {"$ref": "#/$defs/toolchain_file_pin"},
+        "sysroot_resolver": {"$ref": "#/$defs/toolchain_sysroot_resolver"}
       }
     },
     "toolchain_identity": {
@@ -552,6 +672,7 @@
               "type": "array", "minItems": 1, "uniqueItems": true,
               "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
             },
+            "cargo_target": {"$ref": "#/$defs/cargo_target_observation"},
             "cargo_config": {
               "type": "array",
               "items": {
@@ -562,14 +683,7 @@
                   "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
                   "env_exemptions": {
                     "type": "array", "minItems": 1,
-                    "items": {
-                      "type": "object", "required": ["name", "value"],
-                      "additionalProperties": false,
-                      "properties": {
-                        "name": {"enum": ["RUST_MIN_STACK", "RUST_TEST_THREADS"]},
-                        "value": {"type": "string", "pattern": "^[1-9][0-9]*$"}
-                      }
-                    }
+                    "items": {"$ref": "#/$defs/cargo_environment_exemption"}
                   }
                 }
               }
