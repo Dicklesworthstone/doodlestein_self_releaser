@@ -338,6 +338,12 @@ _slsa_manifest_statement() {
         def target: text and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
         def triple: text and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$") and (contains("..") | not);
         def optional_triple: . == null or triple;
+        # Native manifests use this exact non-platform identity for shared
+        # payloads. They remain full subjects, never synthetic compiler tasks.
+        # Match the manifest schema: even a null target_triple is forbidden.
+        def artifact_target:
+            if .target == "additional" then (has("target_triple") | not)
+            else (.target | target) and (.target_triple | optional_triple) end;
         # This is a selector-consistency check on producer observations. The
         # pinned builder must still verify the complete SDK inventory and tool
         # bytes; a path record alone does not qualify compiler execution.
@@ -396,10 +402,13 @@ _slsa_manifest_statement() {
         if (.artifacts | type != "array" or length == 0 or
             (all(.[]; type == "object" and (.name | name) and (.sha256 | sha) and
                 release_eligible and
-                (.target | target) and (.target_triple | optional_triple) and (.size_bytes | count and . > 0) and
+                artifact_target and (.size_bytes | count and . > 0) and
                 (.archive_format | . == "tar.gz" or . == "tar.xz" or . == "zip" or . == "binary" or . == "none")) | not))
         then error("invalid artifact records") else . end |
-        (.artifacts | map(.target) | unique) as $targets |
+        (.artifacts | map(select(.target != "additional"))) as $platform_artifacts |
+        if ($platform_artifacts | length) == 0
+        then error("release has no platform payloads") else . end |
+        ($platform_artifacts | map(.target) | unique) as $targets |
         if has("requested_targets") and
            (.requested_targets | type != "array" or length == 0 or
                (all(.[]; target) | not) or (sort != $targets))
@@ -407,7 +416,7 @@ _slsa_manifest_statement() {
         # Variant-sharded build sets pin the complete ABI matrix separately
         # from routing platforms. Keep that selection enforceable by every
         # downstream publisher using this profile, not just the collector.
-        ([.artifacts[] | {target,target_triple}] | unique | sort_by(.target,.target_triple)) as $variants |
+        ([$platform_artifacts[] | {target,target_triple}] | unique | sort_by(.target,.target_triple)) as $variants |
         if has("required_variants") and
            (.required_variants | type != "array" or length == 0 or length > 256 or
                (all(.[]; type == "object" and keys == ["target","target_triple"] and
@@ -419,7 +428,7 @@ _slsa_manifest_statement() {
         if has("required_assets") and
            (.required_assets | type != "array" or length == 0 or length > 256 or
                (all(.[]; type == "object" and (del(.target_triple) | keys) == ["archive_format","name","target"] and
-                   (.name | name and length <= 128) and (.target | target) and
+                   (.name | name and length <= 128) and artifact_target and
                    (if has("target_triple") then (.target_triple | triple and length <= 128) else true end) and
                    (.archive_format | . == "tar.gz" or . == "tar.xz" or . == "zip" or . == "binary" or . == "none")) | not) or
                ((map(.name | ascii_downcase) | unique | length) != length) or
@@ -458,7 +467,7 @@ _slsa_manifest_statement() {
         if any($environments[] | select(.method == "pinned-cargo-xwin");
             (pinned_xwin_sdk_selection | not))
         then error("pinned xwin environment lacks matching compiler-selected SDK observations") else . end |
-        (.artifacts | group_by(.target) | map(
+        ($platform_artifacts | group_by(.target) | map(
             .[0].target as $platform |
             (map(.target_triple // "") | unique) as $triples |
             [$environments[] | select(.target == $platform)] as $receipts |

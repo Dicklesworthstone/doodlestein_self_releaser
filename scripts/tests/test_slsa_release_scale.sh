@@ -241,6 +241,187 @@ class ReleaseScaleTests(unittest.TestCase):
         self.assertEqual(proof.read_bytes(), before)
 
 
+class SharedAssetTests(unittest.TestCase):
+    """Real payload/proof IO with synthetic native-producer metadata."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='dsr-slsa-shared-')).resolve()
+        self.assets = self.root / 'assets'
+        self.assets.mkdir()
+        self.serial = 0
+        self.data = dict(schema_version='1.0.0', status='success', tool='demo',
+                         version='v1.0.0', run_id='shared-fixture-run',
+                         built_at='2026-10-14T00:00:00Z', build_purpose='release', publishable=True,
+                         source=dict(git_sha='1' * 40, git_ref='refs/tags/v1.0.0', dependencies=[]),
+                         requested_targets=['linux/amd64'], summary=dict(total=1, success=1, failed=0),
+                         artifacts=[], build_environments=[dict(target='linux/amd64', method='native', host='fixture')],
+                         hosts=[dict(platform='linux/amd64', status='success')])
+        self.add_asset('demo-linux', b'owned primary payload', 'linux/amd64')
+        self.add_asset('release-notes.txt', b'owned shared notes', 'additional')
+        self.add_asset('companion.json', b'{"fixture":true}\n', 'additional')
+
+    def add_asset(self, name, payload, target, triple=None):
+        (self.assets / name).write_bytes(payload)
+        row = dict(name=name, target=target, archive_format='binary',
+                   sha256=hashlib.sha256(payload).hexdigest(), size_bytes=len(payload))
+        if triple is not None:
+            row['target_triple'] = triple
+        self.data['artifacts'].append(row)
+        return row
+
+    def required_assets(self):
+        self.data['required_assets'] = [{k: row[k] for k in ('name', 'target', 'archive_format', 'target_triple') if k in row}
+                                        for row in self.data['artifacts']]
+
+    def generate(self, data=None):
+        self.serial += 1
+        manifest = self.root / ('manifest-%d.json' % self.serial)
+        proof = self.root / ('proof-%d.intoto.jsonl' % self.serial)
+        manifest.write_text(json.dumps(self.data if data is None else data), encoding='utf-8')
+        result = ReleaseScaleTests.invoke('generate-manifest', manifest, self.assets,
+                                         '--repository', REPOSITORY, '--builder', BUILDER, '--output', proof)
+        return result, manifest, proof
+
+    def accepted(self):
+        result, manifest, proof = self.generate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(proof.read_bytes())
+        self.assertEqual({row['name']: row['digest']['sha256'] for row in document['subject']},
+                         {row['name']: row['sha256'] for row in self.data['artifacts']})
+        self.assertEqual(document['dsr_evidence']['manifest_sha256'],
+                         hashlib.sha256(manifest.read_bytes()).hexdigest())
+        self.assertEqual(document['predicate']['buildDefinition']['externalParameters']['targets'],
+                         sorted(self.data['requested_targets']))
+        result = ReleaseScaleTests.invoke('verify-release', proof, self.assets, '--manifest', manifest,
+                                         '--repository', REPOSITORY, '--builder', BUILDER)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return manifest, proof, document
+
+    def refused(self, data):
+        before = {p.name: p.read_bytes() for p in self.assets.iterdir()}
+        result, _, proof = self.generate(data)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertFalse(proof.exists())
+        self.assertEqual({p.name: p.read_bytes() for p in self.assets.iterdir()}, before)
+
+    def test_shared_payloads_do_not_create_a_build_task(self):
+        self.required_assets()
+        _, _, doc = self.accepted()
+        self.assertEqual(doc['dsr_evidence']['build_environment_count'], 1)
+        self.assertNotIn('build_tasks', doc['dsr_evidence'])
+        shared = [a for a in doc['dsr_evidence']['artifacts'] if a['target'] == 'additional']
+        self.assertEqual(len(shared), 2)
+        self.assertTrue(all('target_triple' not in a for a in shared))
+
+    def test_multiple_platforms_keep_exact_coverage(self):
+        self.add_asset('demo-darwin', b'owned darwin fixture', 'darwin/arm64')
+        self.data['requested_targets'].append('darwin/arm64')
+        self.data['build_environments'].append(dict(target='darwin/arm64', method='native', host='other-fixture'))
+        self.data['hosts'].append(dict(platform='darwin/arm64', status='success'))
+        self.data['summary'].update(total=2, success=2)
+        self.required_assets()
+        self.accepted()
+
+    def test_shared_payloads_with_native_gnu_musl_variants(self):
+        gnu, musl = 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl'
+        self.data['artifacts'][0]['target_triple'] = gnu
+        self.add_asset('demo-musl', b'owned musl fixture', 'linux/amd64', musl)
+        variants = [dict(target='linux/amd64', target_triple=t) for t in (gnu, musl)]
+        self.data['required_variants'] = variants
+        self.data['build_environments'] = [dict(v, method='native', host='fixture',
+                                               build_influence_env=dict(CARGO_BUILD_TARGET=v['target_triple'])) for v in variants]
+        self.data['hosts'] = [dict(platform=v['target'], target_triple=v['target_triple'], status='success') for v in variants]
+        self.data['summary'].update(total=2, success=2)
+        self.required_assets()
+        _, _, doc = self.accepted()
+        self.assertEqual(doc['dsr_evidence']['build_tasks'], variants)
+        self.assertEqual([a['target_triple'] for a in doc['dsr_evidence']['artifacts'] if a['target'] != 'additional'],
+                         [gnu, musl])
+        for label, mutation in [('missing-environment', lambda d: d['build_environments'].pop()),
+                                ('missing-variant', lambda d: d['required_variants'].pop()),
+                                ('shared-variant', lambda d: d['required_variants'].append(dict(target='additional', target_triple=gnu)))]:
+            with self.subTest(label=label):
+                bad = copy.deepcopy(self.data)
+                mutation(bad)
+                self.refused(bad)
+
+    def test_shared_only_is_not_a_platform_release(self):
+        bad = copy.deepcopy(self.data)
+        bad['artifacts'] = bad['artifacts'][1:]
+        bad.pop('requested_targets')
+        bad.pop('build_environments')
+        bad.pop('hosts')
+        bad['summary'].update(total=0, success=0)
+        self.refused(bad)
+
+    def test_shared_identity_cannot_claim_a_compiler(self):
+        for value in (None, '', 'x86_64-unknown-linux-gnu'):
+            with self.subTest(value=value):
+                bad = copy.deepcopy(self.data)
+                bad['artifacts'][1]['target_triple'] = value
+                self.refused(bad)
+        self.required_assets()
+        bad = copy.deepcopy(self.data)
+        bad['required_assets'][1]['target_triple'] = None
+        self.refused(bad)
+
+    def test_shared_assets_cannot_satisfy_or_inflate_platform_coverage(self):
+        mutations = [lambda d: d['requested_targets'].append('additional'),
+                     lambda d: d['requested_targets'].append('darwin/arm64'),
+                     lambda d: d['summary'].update(total=3, success=3),
+                     lambda d: d['hosts'].append(dict(platform='additional', status='success')),
+                     lambda d: d['build_environments'].append(dict(target='additional', method='native'))]
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index):
+                bad = copy.deepcopy(self.data)
+                mutation(bad)
+                self.refused(bad)
+
+    def test_shared_payload_contract_remains_exact(self):
+        self.required_assets()
+        mutations = [lambda d: d['required_assets'].pop(),
+                     lambda d: d['artifacts'].pop(),
+                     lambda d: d['required_assets'][1].update(archive_format='zip'),
+                     lambda d: d['required_assets'][1].update(target='linux/amd64'),
+                     lambda d: d['artifacts'][1].update(name=d['artifacts'][0]['name']),
+                     lambda d: d['artifacts'][1].update(target='shared'),
+                     lambda d: d['artifacts'][1].update(publishable=False),
+                     lambda d: d['artifacts'][1].update(build_purpose='diagnostic')]
+        for index, mutation in enumerate(mutations):
+            with self.subTest(index=index):
+                bad = copy.deepcopy(self.data)
+                mutation(bad)
+                self.refused(bad)
+
+    def test_every_shared_payload_is_reverified_and_old_proof_preserved(self):
+        manifest, proof, _ = self.accepted()
+        original = proof.read_bytes()
+        path = self.assets / 'release-notes.txt'
+        path.rename(self.root / 'preserved-notes')
+        for kind in ('missing', 'link', 'changed'):
+            with self.subTest(kind=kind):
+                if kind == 'link':
+                    path.symlink_to(self.root / 'preserved-notes')
+                elif kind == 'changed':
+                    path.write_bytes(b'wrong shared notes')
+                result = ReleaseScaleTests.invoke('verify-release', proof, self.assets, '--manifest', manifest,
+                                                 '--repository', REPOSITORY, '--builder', BUILDER)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(proof.read_bytes(), original)
+                if path.exists() or path.is_symlink():
+                    path.rename(self.root / ('preserved-' + kind))
+
+    def test_removed_shared_subject_cannot_match_the_manifest(self):
+        manifest, proof, document = self.accepted()
+        document['subject'] = [row for row in document['subject'] if row['name'] != 'companion.json']
+        reduced = self.root / 'reduced.intoto.jsonl'
+        reduced.write_text(json.dumps(document), encoding='utf-8')
+        result = ReleaseScaleTests.invoke('verify-release', reduced, self.assets, '--manifest', manifest,
+                                         '--repository', REPOSITORY, '--builder', BUILDER)
+        self.assertNotEqual(result.returncode, 0)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
 PY
