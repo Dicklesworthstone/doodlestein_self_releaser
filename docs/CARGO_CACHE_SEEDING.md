@@ -59,18 +59,52 @@ bash src/cargo_cache.sh snapshot /home/builder/.cargo /srv/build/cargo-home \
   /srv/source/Cargo.lock
 ```
 
-This existing path is unchanged. It selects matching registry archives and
-indexes plus Git databases containing locked revisions. It excludes extracted
-registry and Git sources and binds the lockfile digest in the selection receipt.
+Lockfile-scoped selection retains matching registry archives and indexes plus
+Git databases containing locked revisions. It excludes extracted registry and
+Git sources and binds the lockfile digest in the selection receipt.
 A missing or incorrect download is not silently replaced with untrusted
 extracted source bytes. The caller's locked/offline metadata gate determines
 whether the resulting seed is complete before release compilation.
 
+## Relocated ambient cache roots
+
+An operator may store `$CARGO_HOME/registry` or `$CARGO_HOME/git` on another
+volume using an absolute or relative directory symlink. Snapshot preparation
+now supports these two layout links for both ordinary and lockfile-scoped
+seeds. The source Cargo home itself must remain a real directory; pass its
+physical path when the home is relocated. No extra opt-in flag is required.
+
+Only the two top-level cache roots receive this exception. Selected routing
+directories, archives, source files and Git storage below them still use
+no-follow reads. Broken links, links to files, overlapping physical cache
+roots, and destinations inside a relocated source root are refused. An unused
+root is not opened: a registry-only lockfile can ignore an unrelated broken
+`git` alias, and a Git-only lockfile can ignore an unrelated `registry` alias.
+
+The copier holds each selected physical root descriptor across selection and
+copying. It checks the logical link, physical directory, source home and
+preparation-marker identities before publishing a receipt and again afterward.
+A retargeted link or replaced directory is a refusal, even if the new location
+contains identical bytes. Ordinary unrelated cache-directory activity does not
+invalidate a stable selected root. These checks detect persistent concurrent
+changes; they are not a filesystem transaction against a privileged adversary.
+
+**The destination contains real directories and fresh, independent file
+inodes, never the source aliases.** Removing or writing the ambient cache after
+successful preparation cannot change its private copy. The receipt format,
+lockfile selection policy and later source authentication are unchanged.
+
+A source containing `.dsr-cache-seed.json` is an already-prepared private home:
+its roots may not become aliases. The marker is an optimization/alias opt-out,
+not a source authentication proof. `inventory` and `verify` never enable the
+ambient-layout exception, including for a previously successful private copy.
+
 ## Integrity and later materialization
 
-All selected cache roots and entries still refuse symlinks, special files and
-external Git storage pointers. Ordinary selection holds root/database identities
-through the copy and rechecks them before publishing a seed receipt. It also
+Apart from the two ambient root aliases described above, selected cache entries
+still refuse symlinks, special files and external Git storage pointers.
+Ordinary selection holds root/database identities through the copy and rechecks
+them before publishing a seed receipt. It also
 binds every archive that authorizes omission of an extracted registry package,
 refusing archive replacement, removal, or byte changes detected after copying.
 Newly selected source-only packages similarly stop receipt publication. Selected
@@ -89,6 +123,13 @@ The [Cargo home documentation](https://doc.rust-lang.org/cargo/guide/cargo-home.
 describes `git/db`, `git/checkouts`, and reconstruction from cached inputs.
 
 ## Regression and limits
+
+Run `bash scripts/tests/test_cargo_cache_roots.sh` for the relocated-root
+regressions. They execute the complete cache CLI and the actual sourceable
+function carried to native hosts, with real archives, local Git databases and
+independent copies. Separate direct tests of the production descriptor guard
+change actual links/directories to exercise held-root refusal. These are Unix
+filesystem and cache tests, not native macOS or compiler qualification.
 
 Run `bash scripts/tests/test_cargo_cache.sh`. The suite exercises the complete
 cache module with real filesystem operations, Git databases, copies, object

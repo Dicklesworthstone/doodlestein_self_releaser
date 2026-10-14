@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Private Cargo download caches. Copy bytes, never ambient configuration,
 # credentials, symlinks, or source hardlinks. Sourceable and directly runnable.
+# Ambient registry/git roots may be relocated links; private copies may not.
 
 _cargo_cache_run() {
     # Lockfile-scoped seeding needs tomllib (Python 3.11+), but a login shell can put
@@ -69,6 +70,144 @@ def inside(path, root):
     return os.path.commonpath((path, root)) == root
 
 
+def directory_identity(info):
+    # Unrelated cache maintenance changes directory times and link counts.
+    return info.st_dev, info.st_ino, info.st_mode
+
+
+class CacheSourceRoots:
+    """Hold ambient layout aliases, never follow links inside selected trees.
+
+    Only snapshot input gets this view. inventory/verify still require wholly
+    private real directories. Opening is lazy: a registry-only lockfile must
+    not even inspect an unrelated git alias. No alias is copied to the output.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def __init__(self, home, destination):
+        self.home, self.destination, self.roots = home, destination, {}
+        self.fd = os.open(home, self.flags) if home is not None else None
+        self.home_identity = directory_identity(os.fstat(self.fd)) if self.fd is not None else None
+        self.marker = self.entry('.dsr-cache-seed.json')
+
+    def entry(self, name):
+        if self.fd is None:
+            return None
+        try:
+            return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def root(self, name):
+        if name not in ('registry', 'git') or self.fd is None:
+            raise FileNotFoundError('no selected ambient cache root: ' + name)
+        if name not in self.roots:
+            before = self.entry(name)
+            if before is None:
+                self.roots[name] = None
+            else:
+                if stat.S_ISLNK(before.st_mode):
+                    if self.marker is not None:
+                        raise Failure('prepared private cache root must not be a symlink: ' + name)
+                elif not stat.S_ISDIR(before.st_mode):
+                    raise Failure('cache root is not a directory or relocation link: ' + name)
+                logical = os.path.join(self.home, name)
+                physical = os.path.realpath(logical)
+                if (inside(self.home, physical) or inside(self.destination, physical) or
+                        inside(physical, self.destination)):
+                    raise Failure('relocated cache root overlaps Cargo home or destination: ' + name, 4)
+                for other in self.roots.values():
+                    if other is not None and (inside(physical, other[1]) or inside(other[1], physical)):
+                        raise Failure('ambient cache roots overlap')
+                try:
+                    descriptor = os.open(physical, self.flags)
+                except OSError as error:
+                    # An existing but broken alias is not an absent cold cache.
+                    raise Failure('cannot open relocated cache root: ' + name) from error
+                self.roots[name] = before, physical, descriptor, directory_identity(os.fstat(descriptor))
+                self.verify()
+        root = self.roots[name]
+        if root is None:
+            raise FileNotFoundError('missing ambient cache root: ' + name)
+        return root
+
+    def open(self, relative):
+        parts = relative.split('/')
+        if any(part in ('', '.', '..') for part in parts):
+            raise Failure('invalid cache-relative directory', 4)
+        parent = os.dup(self.root(parts[0])[2])
+        try:
+            for part in parts[1:]:
+                child = os.open(part, self.flags, dir_fd=parent)
+                os.close(parent)
+                parent = child
+            result, parent = parent, None
+            return result
+        finally:
+            if parent is not None:
+                os.close(parent)
+
+    def location(self, relative):
+        # Git's read-only subprocess needs a pathname. Validate every inner
+        # component first, and recheck the root binding around its observation.
+        self.verify()
+        descriptor = self.open(relative)
+        os.close(descriptor)
+        root, *parts = relative.split('/')
+        return os.path.join(self.root(root)[1], *parts)
+
+    def verify(self):
+        if self.fd is None:
+            return
+        if (directory_identity(os.fstat(self.fd)) != self.home_identity or
+                directory_identity(os.stat(self.home, follow_symlinks=False)) != self.home_identity):
+            raise Failure('ambient Cargo home changed during preparation')
+        marker = self.entry('.dsr-cache-seed.json')
+        if (identity(marker) if marker is not None else None) != \
+                (identity(self.marker) if self.marker is not None else None):
+            raise Failure('ambient cache preparation marker changed')
+        for name, record in self.roots.items():
+            named = self.entry(name)
+            if record is None:
+                if named is not None:
+                    raise Failure('missing ambient cache root appeared: ' + name)
+                continue
+            before, physical, descriptor, held = record
+            compare = identity if stat.S_ISLNK(before.st_mode) else directory_identity
+            logical = os.path.join(self.home, name)
+            if (named is None or compare(named) != compare(before) or
+                    os.path.realpath(logical) != physical or
+                    directory_identity(os.fstat(descriptor)) != held or
+                    directory_identity(os.stat(physical, follow_symlinks=False)) != held or
+                    directory_identity(os.stat(logical)) != held):
+                raise Failure('ambient cache root changed during preparation: ' + name)
+
+    def close(self):
+        for record in self.roots.values():
+            if record is not None:
+                os.close(record[2])
+        self.roots.clear()
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def source_directory(source, relative, roots=None):
+    if roots is not None:
+        return roots.open(relative)
+    parent = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in relative.split('/'):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        result, parent = parent, None
+        return result
+    finally:
+        if parent is not None:
+            os.close(parent)
+
+
 def unique_pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -114,7 +253,7 @@ def external_git_reference(path, size):
              ('.git' in parts[:-1] or (len(parts) == 4 and parts[1] == 'db'))))
 
 
-def inventory(root, destination=None, require_private_links=False, selected_paths=None):
+def inventory(root, destination=None, require_private_links=False, selected_paths=None, source_roots=None):
     files, directories, caches = [], [], []
     inodes = {}
     private_entries = {}
@@ -196,12 +335,19 @@ def inventory(root, destination=None, require_private_links=False, selected_path
             finally:
                 os.close(fd)
 
+    if source_roots is not None and (require_private_links or destination is None):
+        raise Failure('ambient aliases are only allowed while seeding a new private home', 4)
     fd = os.open(root, flags)
+    handles = {}
     try:
         selected = {}
         for name in (selected_paths if selected_paths is not None else ('registry', 'git')):
             try:
-                selected[name] = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if source_roots is not None:
+                    handles[name] = source_roots.open(name)
+                    selected[name] = os.fstat(handles[name])
+                else:
+                    selected[name] = os.stat(name, dir_fd=fd, follow_symlinks=False)
             except FileNotFoundError:
                 selected[name] = None
         for name, before in selected.items():
@@ -212,22 +358,27 @@ def inventory(root, destination=None, require_private_links=False, selected_path
             if not stat.S_ISDIR(before.st_mode):
                 raise Failure('cache root is not a real directory: ' + name)
             caches.append(name)
-            walk(fd, name, name, None if selected_paths is None else selected_paths[name])
+            walk(handles.get(name, fd), '.' if name in handles else name, name,
+                 None if selected_paths is None else selected_paths[name])
         # Ignore unrelated ambient Cargo-home activity, but not replacement of
         # a selected cache root or creation of a previously missing one.
         for name, before in selected.items():
             try:
-                after = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                after = os.fstat(handles[name]) if name in handles else os.stat(name, dir_fd=fd, follow_symlinks=False)
             except FileNotFoundError:
                 after = None
             same = identity if selected_paths is None else lambda s: (s.st_dev, s.st_ino, s.st_mode)
             if (before is None) != (after is None) or (before is not None and same(before) != same(after)):
                 raise Failure('cache root changed while reading: ' + name)
+        if source_roots is not None:
+            source_roots.verify()
         if require_private_links:
             for name, before in selected.items():
                 if before is not None:
                     recheck_private_links(fd, name, name)
     finally:
+        for descriptor in handles.values():
+            os.close(descriptor)
         os.close(fd)
     for expected, count, first in inodes.values():
         if expected != count:
@@ -338,7 +489,7 @@ def unscoped_registry_selection(parent, anchors):
     return selected
 
 
-def unscoped_selection(source):
+def unscoped_selection(source, roots=None):
     """Keep registry downloads/source-only packages and Git databases.
 
     Ordinary callers may not supply a lockfile. Cargo recreates git/checkouts
@@ -367,14 +518,12 @@ def unscoped_selection(source):
         anchors['.dsr-cache-seed.json'] = None if marker is None else identity(marker)
         for root, categories in (('registry', None), ('git', ('db',))):
             try:
-                before = os.stat(root, dir_fd=home, follow_symlinks=False)
+                parent = source_directory(source, root, roots)
             except FileNotFoundError:
                 anchors[root] = None
                 continue
-            if not stat.S_ISDIR(before.st_mode):
-                raise Failure('cache root is not a real directory: ' + root)
-            parent = os.open(root, flags, dir_fd=home)
             try:
+                before = os.fstat(parent)
                 anchors[root] = stable(before)
                 if stable(os.fstat(parent)) != anchors[root]:
                     raise Failure('cache root replaced during seed selection: ' + root)
@@ -394,18 +543,20 @@ def unscoped_selection(source):
                     selected[root][name] = None
                     anchors[relative] = stable(info)
                 if (stable(os.fstat(parent)) != anchors[root] or
-                        stable(os.stat(root, dir_fd=home, follow_symlinks=False)) != anchors[root]):
+                        (roots is None and stable(os.stat(root, dir_fd=home, follow_symlinks=False)) != anchors[root])):
                     raise Failure('cache root changed during seed selection: ' + root)
             finally:
                 os.close(parent)
         if stable(os.stat(source, follow_symlinks=False)) != anchors['']:
             raise Failure('Cargo home changed during seed selection')
+        if roots is not None:
+            roots.verify()
     finally:
         os.close(home)
     return selected, anchors
 
 
-def locked_selection(source, lockfile):
+def locked_selection(source, lockfile, roots=None):
     """Select download inputs, not the host's unrelated unpacked sources.
 
     Cargo has not resolved metadata in its private home yet. Cargo.lock is a
@@ -465,16 +616,12 @@ def locked_selection(source, lockfile):
 
     def children(relative):
         # List only routing directories. An unused registry/src or Git
-        # checkout is never even opened. Relevant root links still fail.
-        parent = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        # checkout is never even opened. Only held ambient root aliases pass.
         try:
-            for part in relative.split('/'):
-                try:
-                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-                except FileNotFoundError:
-                    return []
-                os.close(parent)
-                parent = child
+            parent = source_directory(source, relative, roots)
+        except FileNotFoundError:
+            return []
+        try:
             result = []
             for name in os.listdir(parent):
                 if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]*', name):
@@ -492,16 +639,12 @@ def locked_selection(source, lockfile):
     def available(relative):
         # Validate selected ancestors through descriptors. Absence is an
         # incomplete seed, not permission to substitute a different version.
-        parent = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parts = relative.split('/')
         try:
-            parts = relative.split('/')
-            for part in parts[:-1]:
-                try:
-                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-                except FileNotFoundError:
-                    return False
-                os.close(parent)
-                parent = child
+            parent = source_directory(source, '/'.join(parts[:-1]), roots)
+        except FileNotFoundError:
+            return False
+        try:
             try:
                 value = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
@@ -541,7 +684,7 @@ def locked_selection(source, lockfile):
                     # Never admit a checksum from the wrong source. Skip it as
                     # unavailable; the private offline resolver decides whether
                     # all of its required downloads are actually present.
-                    parent = os.open(os.path.join(source, 'registry/cache', registry), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    parent = source_directory(source, 'registry/cache/' + registry, roots)
                     try:
                         before = os.stat(archive, dir_fd=parent, follow_symlinks=False)
                         digest, _ = read_regular(parent, archive, before)
@@ -564,6 +707,8 @@ def locked_selection(source, lockfile):
             # only a registry named in the lockfile, not other registry history.
             gitdir = os.path.join(source, prefix, '.git')
             if os.path.isdir(gitdir) and not os.path.islink(gitdir):
+                if roots is not None:
+                    gitdir = roots.location(prefix + '.git')
                 origin = git_probe(gitdir, ['config', '--local', '--get', 'remote.origin.url']).decode('utf-8', 'replace').strip().rstrip('/')
                 if origin in registries:
                     add(prefix + '.git')
@@ -571,12 +716,15 @@ def locked_selection(source, lockfile):
         request = ''.join(revision + '\n' for revision in sorted(revisions)).encode('ascii')
         for database in children('git/db'):
             relative = 'git/db/' + database
-            rows = git_probe(os.path.join(source, relative), ['cat-file', '--batch-check'], request).splitlines()
+            directory = roots.location(relative) if roots is not None else os.path.join(source, relative)
+            rows = git_probe(directory, ['cat-file', '--batch-check'], request).splitlines()
             if any(len(row.split()) == 3 and row.split()[0].decode('ascii', 'replace') in revisions and
                    row.split()[1] == b'commit' for row in rows):
                 add(relative)
     scope = {'kind': 'cargo-lock-downloads', 'lockfile_sha256': hashlib.sha256(raw).hexdigest(),
              'registry_packages': len(archives), 'git_revisions': sorted(revisions)}
+    if roots is not None:
+        roots.verify()
     return selected, expected, scope
 
 
@@ -615,43 +763,50 @@ def main(args):
     command, first, second = args[:3]
     if command == 'snapshot':
         source = root_path(first) if first else None
-        paths, checksums, scope = None, {}, None
-        if len(args) == 4:
-            paths, checksums, scope = locked_selection(source, args[3])
-        else:
-            paths, seed_anchors = unscoped_selection(source)
         destination = absolute(second)
         parent = os.path.realpath(os.path.dirname(destination))
         destination = os.path.join(parent, os.path.basename(destination))
         if source is not None and (inside(destination, source) or inside(source, destination)):
             raise Failure('source and private Cargo home must not overlap', 4)
-        os.mkdir(destination, 0o700)
-        created = os.lstat(destination)
-        complete = False
+        roots = CacheSourceRoots(source, destination)
         try:
-            selected = inventory(source, destination, selected_paths=paths) if source else {'caches': [], 'directories': [], 'files': []}
-            if any(entry['path'] in checksums and entry['sha256'] != checksums[entry['path']]
-                   for entry in selected['files']):
-                raise Failure('selected archive changed after lockfile admission')
-            if inventory(destination, require_private_links=True) != selected:
-                raise Failure('private cache copy does not match its seed')
-            if scope is None and unscoped_selection(source) != (paths, seed_anchors):
-                raise Failure('cache selection changed during preparation')
-            receipt = {'schema_version': 1, 'kind': 'private-copy', 'cargo_home': destination,
-                       'seed_source': source, 'inventory': selected}
-            if scope is not None:
-                if hashlib.sha256(read_path(args[3])).hexdigest() != scope['lockfile_sha256']:
-                    raise Failure('Cargo.lock changed during cache preparation')
-                receipt['selection'] = scope
-            path = os.path.join(destination, '.dsr-cache-seed.json')
-            digest = new_receipt(path, receipt)
-            complete = True
-            return summary(path, receipt, digest)
+            paths, checksums, scope = None, {}, None
+            if len(args) == 4:
+                paths, checksums, scope = locked_selection(source, args[3], roots)
+            else:
+                paths, seed_anchors = unscoped_selection(source, roots)
+            roots.verify()
+            os.mkdir(destination, 0o700)
+            created = os.lstat(destination)
+            complete = False
+            try:
+                selected = inventory(source, destination, selected_paths=paths, source_roots=roots) if source else {'caches': [], 'directories': [], 'files': []}
+                if any(entry['path'] in checksums and entry['sha256'] != checksums[entry['path']]
+                       for entry in selected['files']):
+                    raise Failure('selected archive changed after lockfile admission')
+                if inventory(destination, require_private_links=True) != selected:
+                    raise Failure('private cache copy does not match its seed')
+                if scope is None and unscoped_selection(source, roots) != (paths, seed_anchors):
+                    raise Failure('cache selection changed during preparation')
+                receipt = {'schema_version': 1, 'kind': 'private-copy', 'cargo_home': destination,
+                           'seed_source': source, 'inventory': selected}
+                if scope is not None:
+                    if hashlib.sha256(read_path(args[3])).hexdigest() != scope['lockfile_sha256']:
+                        raise Failure('Cargo.lock changed during cache preparation')
+                    receipt['selection'] = scope
+                roots.verify()
+                path = os.path.join(destination, '.dsr-cache-seed.json')
+                digest = new_receipt(path, receipt)
+                roots.verify()
+                complete = True
+                return summary(path, receipt, digest)
+            finally:
+                if not complete and os.path.lexists(destination):
+                    current = os.lstat(destination)
+                    if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                        shutil.rmtree(destination)
         finally:
-            if not complete and os.path.lexists(destination):
-                current = os.lstat(destination)
-                if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
-                    shutil.rmtree(destination)
+            roots.close()
     home = root_path(first)
     path = absolute(second)
     if command == 'inventory':
