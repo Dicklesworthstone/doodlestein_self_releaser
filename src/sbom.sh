@@ -313,17 +313,92 @@ _sbom_select_artifacts() (
     done < "$listing" | LC_ALL=C sort
 )
 
+# An explicit release selection can include LICENSE or runtime.json without
+# changing the scanner's default discovery policy. This is caller-selected byte
+# identity, not authentication or evidence of compilation. Never read embedded
+# paths, URLs, or a selection from a previously generated SBOM.
+_sbom_read_selection() {
+    command -v python3 >/dev/null || return 3
+    python3 -I -S - "$1" <<'PY'
+import json, os, re, stat, sys
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+def pairs(rows):
+    result = {}
+    for key, value in rows:
+        require(key not in result, 'duplicate selection key: ' + key)
+        result[key] = value
+    return result
+
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        require(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 1048576,
+                'selection must be a bounded regular file')
+        raw = stream.read(1048577)
+        after = os.fstat(stream.fileno())
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    require(len(raw) == before.st_size and identity(before) == identity(after) and
+            identity(after) == identity(os.stat(sys.argv[1], follow_symlinks=False)),
+            'selection changed while reading')
+    value = json.loads(raw, object_pairs_hook=pairs,
+                       parse_constant=lambda s: (_ for _ in ()).throw(ValueError('non-finite selection value')))
+    require(isinstance(value, dict) and set(value) == {'schema_version', 'artifacts'} and
+            type(value['schema_version']) is int and value['schema_version'] == 1,
+            'invalid selection envelope')
+    rows = value['artifacts']
+    require(isinstance(rows, list) and 1 <= len(rows) <= 256, 'expected 1..256 selected artifacts')
+    for row in rows:
+        require(isinstance(row, dict) and set(row) == {'name', 'sha256'} and
+                isinstance(row['name'], str) and
+                re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,127}', row['name']) and '..' not in row['name'] and
+                isinstance(row['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', row['sha256']),
+                'invalid selected name or SHA256')
+    require(len({row['name'].lower() for row in rows}) == len(rows), 'colliding selected names')
+    print(json.dumps([{'name': row['name'], 'sha256': row['sha256']}
+                      for row in sorted(rows, key=lambda row: row['name'])], separators=(',', ':')))
+except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+    print('[sbom] Invalid artifact selection: ' + str(error), file=sys.stderr)
+    sys.exit(4)
+PY
+}
+
+_sbom_selection_gate() {
+    [[ -z "$1" ]] || [[ "$(_sbom_hash "$1")" == "$2" ]] || {
+        _sbom_log error 'Artifact selection changed during SBOM operation'; return 2;
+    }
+}
+
 # Freeze the selected release namespace AND every artifact digest. Hardlink
 # aliases remain separate named assets. Enumeration and hashing errors propagate.
 _sbom_snapshot_artifacts() (
     set -o pipefail
-    local root="$1" scratch="$2" selected name digest
+    local root="$1" scratch="$2" wanted="${3:-}" selected name digest observed
     selected=$(_sbom_select_artifacts "$root" "$scratch") || return $?
+    if [[ -n "$wanted" ]]; then
+        # Selection may add metadata-like names, never hide an unselected
+        # binary. Missing/linked/special selected files fail in _sbom_hash.
+        printf '%s\n' "$selected" > "$scratch.names" || return 1
+        jq -e --rawfile names "$scratch.names" '
+            (($names|split("\n")|map(select(length>0)))-[.[].name]|length)==0
+        ' <<< "$wanted" >/dev/null || {
+            _sbom_log error 'Unselected payload in explicit SBOM release set'; return 4;
+        }
+        selected=$(jq -r '.[].name' <<< "$wanted") || return 4
+    fi
     [[ -n "$selected" ]] || { _sbom_log error "No release artifacts selected"; return 4; }
-    while IFS= read -r name; do
+    observed=$(while IFS= read -r name; do
         digest=$(_sbom_hash "$root/$name") || return $?
         jq -nc --arg name "$name" --arg sha256 "$digest" '{name:$name,sha256:$sha256}' || return 1
-    done <<< "$selected" | jq -sc 'sort_by(.name)'
+    done <<< "$selected" | jq -sc 'sort_by(.name)') || return $?
+    [[ -z "$wanted" || "$observed" == "$wanted" ]] || {
+        _sbom_log error 'Payload bytes differ from explicit SBOM selection'; return 2;
+    }
+    printf '%s\n' "$observed"
 )
 
 # A receipt is an unauthenticated local scan observation binding one named
@@ -344,9 +419,17 @@ _sbom_receipt_shape() {
             if $kind == "artifact" then entry
             else type == "object" and .schema_version == 1 and
                 .kind == "dsr-sbom-release" and .status == "complete" and .format == $format and
-                .selection_policy == "top-level-artifacts-v1" and
+                (.selection_policy == "top-level-artifacts-v1" or .selection_policy == "explicit-artifacts-v1") and
                 (.artifacts | type == "array" and length > 0 and all(.[]; entry)) and
-                ((.artifacts | map(.artifact.name) | unique | length) == (.artifacts | length))
+                ((.artifacts | map(.artifact.name) | unique | length) == (.artifacts | length)) and
+                (if .selection_policy == "explicit-artifacts-v1" then
+                    (.artifacts|length<=256 and all(.[];
+                        (.artifact.name|length<=128 and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+                            (contains("..")|not)) and (.artifact.sha256|length==64))) and
+                    ([.artifacts[].artifact.name,.artifacts[].sbom.name,
+                      (.artifacts[].sbom.name+".dsr.json"),"sbom-manifest."+$ext,"sbom-plan."+$ext] as $names |
+                     ($names|map(ascii_downcase)|unique|length)==($names|length))
+                 else true end)
             end)
     ' "$file" >/dev/null 2>&1
 }
@@ -410,13 +493,18 @@ _sbom_verify_manifest() {
 _sbom_artifacts() (
     set -o pipefail
     local action="$1" root="${2:-}" format="${SBOM_DEFAULT_FORMAT:-spdx}" output_dir="${SBOM_OUTPUT_DIR:-}"
+    local selection='' selection_hash='' selection_inputs='' selection_policy=top-level-artifacts-v1
     shift
     [[ $# -gt 0 ]] && shift
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --format|-f|--output-dir)
+            --format|-f|--output-dir|--selection)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
-                case "$1" in --format|-f) format="$2" ;; *) output_dir="$2" ;; esac
+                case "$1" in
+                    --format|-f) format="$2" ;;
+                    --selection) [[ -z "$selection" ]] || return 4; selection="$2" ;;
+                    *) output_dir="$2" ;;
+                esac
                 shift 2 ;;
             *) _sbom_log error "Unknown SBOM batch option: $1"; return 4 ;;
         esac
@@ -427,6 +515,12 @@ _sbom_artifacts() (
     [[ -n "$output_dir" ]] || output_dir="$root"
     [[ ! -L "$output_dir" && "$output_dir" != *[[:cntrl:]]* && "$output_dir" != *\\* ]] || return 4
     command -v jq >/dev/null || return 3
+    if [[ -n "$selection" ]]; then
+        selection_hash=$(_sbom_hash "$selection") || return $?
+        selection_inputs=$(_sbom_read_selection "$selection") || return $?
+        _sbom_selection_gate "$selection" "$selection_hash" || return $?
+        selection_policy=explicit-artifacts-v1
+    fi
     if [[ "$action" == generate ]]; then
         mkdir -p -- "$output_dir" || return 1
     fi
@@ -444,15 +538,28 @@ _sbom_artifacts() (
     fi
     trap 'rm -rf -- "$workdir"' EXIT
     trap 'exit 5' HUP INT TERM
-    inputs=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+    inputs=$(_sbom_snapshot_artifacts "$root" "$workdir/list" "$selection_inputs") || return $?
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
+    # All payloads and public/local SBOM records share an output namespace.
+    # Refuse collisions before scanning, even when output is a separate folder.
+    if [[ -n "$selection" ]] && ! jq -e --arg ext "$extension" '
+        [.[].name] as $names |
+        ($names + ($names|map(.+".sbom."+$ext)) + ($names|map(.+".sbom."+$ext+".dsr.json")) +
+         ["sbom-manifest."+$ext,"sbom-plan."+$ext]) as $all |
+        ($all|map(ascii_downcase)|unique|length)==($all|length)
+    ' <<< "$inputs" >/dev/null; then
+        _sbom_log error 'Selected payload collides with SBOM output'; return 4
+    fi
     prior=$(_sbom_output_state "$manifest") || return $?
     if [[ "$prior" != absent ]]; then
+        [[ "$(jq -r .selection_policy "$manifest")" == "$selection_policy" ]] || return 2
         _sbom_receipt_shape "$manifest" "$format" "$extension" release &&
             _sbom_verify_manifest "$manifest" "$root" "$output_dir" "$format" "$inputs" || {
                 _sbom_log error "Invalid or stale complete SBOM manifest: $manifest"; return 2;
             }
-        after=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+        after=$(_sbom_snapshot_artifacts "$root" "$workdir/list" "$selection_inputs") || return $?
         [[ "$inputs" == "$after" && "$(_sbom_hash "$manifest")" == "$prior" ]] || return 2
+        _sbom_selection_gate "$selection" "$selection_hash" || return $?
         _sbom_log ok "Verified complete SBOM release set without rescanning: $manifest"
         printf '%s\n' "$manifest"
         return 0
@@ -463,10 +570,10 @@ _sbom_artifacts() (
     # retry cannot silently drop an unfinished target or accept changed bytes.
     plan_hash=$(_sbom_output_state "$plan") || return $?
     if [[ "$plan_hash" != absent ]]; then
-        jq -e -s --arg format "$format" --argjson inputs "$inputs" '
+        jq -e -s --arg format "$format" --arg policy "$selection_policy" --argjson inputs "$inputs" '
             length == 1 and (.[0] | type == "object" and .schema_version == 1 and
                 .kind == "dsr-sbom-plan" and .format == $format and
-                .selection_policy == "top-level-artifacts-v1" and .artifacts == $inputs)
+                .selection_policy == $policy and .artifacts == $inputs)
         ' "$plan" >/dev/null 2>&1 || {
             _sbom_log error "SBOM retry differs from the frozen release plan"; return 2;
         }
@@ -502,14 +609,15 @@ _sbom_artifacts() (
         fi
     done <<< "$recorded"
     if [[ "$plan_hash" == absent ]]; then
-        jq -nc --arg format "$format" --argjson inputs "$inputs" '
+        jq -nc --arg format "$format" --arg policy "$selection_policy" --argjson inputs "$inputs" '
             {schema_version:1,kind:"dsr-sbom-plan",format:$format,
-             selection_policy:"top-level-artifacts-v1",artifacts:$inputs}' \
+             selection_policy:$policy,artifacts:$inputs}' \
             > "$workdir/plan.json" || return 1
         _sbom_publish_record "$workdir/plan.json" "$plan" || return $?
         plan_hash=$(_sbom_hash "$plan") || return $?
     fi
     while IFS= read -r name; do
+        _sbom_selection_gate "$selection" "$selection_hash" || return $?
         doc="$output_dir/$name.sbom.$extension"
         receipt="$doc.dsr.json"
         digest=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .sha256' <<< "$inputs") || return 1
@@ -547,12 +655,13 @@ _sbom_artifacts() (
         [[ "$(_sbom_hash "$receipt")" == "$hash" ]] || return 2
         printf '%s\n' "$entry" >> "$workdir/entries.jsonl" || return 1
     done <<< "$recorded"
-    jq -sc --arg format "$format" '
+    jq -sc --arg format "$format" --arg policy "$selection_policy" '
         {schema_version:1,kind:"dsr-sbom-release",status:"complete",format:$format,
-         selection_policy:"top-level-artifacts-v1",artifacts:sort_by(.artifact.name)}' \
+         selection_policy:$policy,artifacts:sort_by(.artifact.name)}' \
         "$workdir/entries.jsonl" > "$workdir/manifest.json" || return 1
     _sbom_receipt_shape "$workdir/manifest.json" "$format" "$extension" release || return 1
-    after=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+    after=$(_sbom_snapshot_artifacts "$root" "$workdir/list" "$selection_inputs") || return $?
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     [[ "$inputs" == "$after" && "$(_sbom_hash "$plan")" == "$plan_hash" ]] || {
         _sbom_log error "Release set or frozen plan changed during SBOM generation"; return 2;
     }
@@ -561,7 +670,8 @@ _sbom_artifacts() (
     # Recheck final public files, not only private staging, before success.
     hash=$(_sbom_hash "$manifest") || return $?
     _sbom_verify_manifest "$manifest" "$root" "$output_dir" "$format" "$inputs" || return $?
-    after=$(_sbom_snapshot_artifacts "$root" "$workdir/list") || return $?
+    after=$(_sbom_snapshot_artifacts "$root" "$workdir/list" "$selection_inputs") || return $?
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     [[ "$inputs" == "$after" && "$(_sbom_hash "$manifest")" == "$hash" ]] || return 2
     _sbom_log ok "Complete SBOM release set: $generated generated, $reused reused"
     printf '%s\n' "$manifest"
@@ -610,6 +720,7 @@ export -f _sbom_log _sbom_format _sbom_extension _sbom_hash _sbom_validate
 export -f _sbom_glob_literal _sbom_has_signature _sbom_output_state
 export -f _sbom_is_metadata _sbom_select_artifacts
 export -f _sbom_snapshot_artifacts _sbom_receipt_shape _sbom_verify_entry
+export -f _sbom_read_selection _sbom_selection_gate
 export -f _sbom_publish_record _sbom_verify_manifest _sbom_artifacts sbom_verify_artifacts
 
 # Standalone module entry points expose complete release-set operations without
@@ -641,7 +752,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 'Remote: publish-artifacts DIR --repo OWNER/REPO --tag vVERSION [--dry-run]' \
                 '        verify-release --repo OWNER/REPO --tag vVERSION --manifest-sha256 SHA256' \
                 'Single scan: --format spdx|cyclonedx --output FILE --quiet' \
-                'Release set: --format spdx|cyclonedx --output-dir DIRECTORY' \
+                'Release set: --format spdx|cyclonedx --output-dir DIRECTORY [--selection FILE]' \
                 'Verification checks local integrity, not signatures or build provenance.' ;;
         *) _sbom_log error "Unknown SBOM command: $_sbom_command"; exit 4 ;;
     esac
