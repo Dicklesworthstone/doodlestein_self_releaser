@@ -8165,13 +8165,19 @@ def invocation_selection():
         for arg in argv:
             if arg == '--config' or arg.startswith('--config=') or arg == '-C' or arg.startswith('-C'):
                 fail('Cargo --config/-C changes selection outside the attested invocation; use the configured build environment/cwd')
+        # Cargo accepts -Z after the subcommand too. Host/profile switches
+        # change which flags rustc sees, so the cfg guard must cover the whole
+        # Cargo argument region, not only the global-options prefix. Stop at
+        # --: those words belong to rustc or the executed test/application.
+        cargo_arguments = argv[:argv.index('--')] if '--' in argv else argv
+        if any(key.startswith('cfg(') for key in cargo_config['target']) and any(
+                re.match(r'^-[vqkrw]*Z', arg) for arg in cargo_arguments):
+            fail('unstable Cargo options are outside cfg target attestation')
         # Only reviewed Cargo global options can precede the subcommand. Cargo
         # aliases and opaque shell drivers cannot prove which compiler ran.
         cursor = 0
         while cursor < len(argv) and argv[cursor].startswith('-'):
             option = argv[cursor]
-            if option.startswith('-Z') and any(key.startswith('cfg(') for key in cargo_config['target']):
-                fail('unstable Cargo options are outside cfg target attestation')
             if option in ('-Z', '--color'):
                 cursor += 2
             elif option in ('-v', '-vv', '--verbose', '-q', '--quiet', '--locked', '--offline', '--frozen') or \
@@ -8195,6 +8201,8 @@ def invocation_selection():
         targets, manifests = [], []
         while cursor < len(argv):
             arg = argv[cursor]
+            if arg == '--':
+                break
             if arg == '--target':
                 cursor += 1
                 if cursor >= len(argv):
