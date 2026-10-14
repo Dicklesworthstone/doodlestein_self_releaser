@@ -7,7 +7,7 @@ _RELEASE_INTEGRITY_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 _ri_log() { printf '[release-integrity] %s\n' "$*" >&2; }
 
 _ri_require() {
-    if ! declare -F _rup_manifest >/dev/null; then
+    if ! declare -F _rup_manifest >/dev/null || ! declare -F _rup_check_namespace >/dev/null; then
         # shellcheck source=src/release_payloads.sh
         source "$_RELEASE_INTEGRITY_DIR/release_payloads.sh" || return 3
     fi
@@ -46,8 +46,21 @@ _ri_shape() {
             (.checksums|signed_record and .name=="checksums.sha256") and
             ([.artifacts[].name,.artifacts[].signature.name,.checksums.name,.checksums.signature.name,
               "release-integrity.json","release-integrity.json.minisig"] as $names |
-             ($names|unique|length)==($names|length)))
+             ($names|map(ascii_downcase)|unique|length)==($names|length)))
     ' "$1" >/dev/null 2>&1
+}
+
+# Payloads and generated proofs share a flat release namespace. Reject a
+# reserved name or any payload/sidecar collision before creating signatures,
+# including collisions on case-insensitive installation filesystems.
+_ri_selection_names_valid() {
+    jq -e '
+        [.artifacts[].name] as $payloads |
+        ($payloads + ($payloads|map(.+".minisig")) +
+         ["checksums.sha256","checksums.sha256.minisig",
+          "release-integrity.json","release-integrity.json.minisig"]) as $names |
+        ($names|map(ascii_downcase)|unique|length)==($names|length)
+    ' <<< "$1" >/dev/null || { _ri_log 'Payload names collide with integrity proofs'; return 4; }
 }
 
 _ri_checksums() {
@@ -82,8 +95,8 @@ _ri_verify_set() {
         name=$(jq -r '.name' <<< "$row") || return 1
         if [[ "$name" == checksums.sha256 ]]; then path="$proofs/$name"
         else
-            # Same payload selection policy as build uploads and SBOM inventory.
-            _sbom_is_metadata "$name" && return 7
+            # The authenticated inventory, not scanner filename discovery,
+            # selects licenses and shared data. Every byte/signature is checked.
             path="$root/$name"
         fi
         _ri_check_record "$path" "$row" || return $?
@@ -109,6 +122,7 @@ _ri_publish_file() {
 _ri_prepare() (
     local root="$1" manifest="$2" selection="$3" repo="$4" tag="$5" sha="$6"
     local token="$7" private="$8" output="$9" work cleanup name names path sig hash record rows
+    _ri_selection_names_valid "$selection" || return $?
     # A misconfigured secret-key path must not also be treated as a release
     # payload. Compare file identity (including hardlinks) before copying inputs,
     # publishing proofs or handing the selected set to the binary uploader.
@@ -231,14 +245,24 @@ _ri_selected_assets() {
     jq -cS --argjson names "$2" '[.[]|select(.name as $n|$names|index($n)!=null)]|sort_by(.name)' <<< "$1"
 }
 
+# Include selected metadata names only when they are actually present in the
+# remote inventory. This cannot fabricate a missing license from its expected
+# name, and ordinary unexpected binaries remain visible to the equality gate.
+_ri_payload_names() {
+    local inventory="$1" names="$2" ordinary
+    ordinary=$(_sbr_payload_names "$inventory") || return $?
+    printf '%s\n' "$inventory" "$names" "$ordinary" | jq -cse '
+        select(length==3) | .[1] as $names |
+        (.[2]+[.[0][]|.name|select(. as $name|$names|index($name)!=null)])|unique
+    '
+}
+
 # Signatures were checked against frozen bytes. Rehashing those exact inputs is
 # sufficient at intermediate publication gates; do not repeat public-key crypto
 # and full remote downloads for every unchanged sidecar in an N-file release.
 _ri_local_unchanged() {
-    local root="$1" proofs="$2" selection="$3" documents="$4" work="$5" names rows row name
-    names=$(_sbom_select_artifacts "$root" "$work/local-list") || return $?
-    [[ "$(jq -nc --arg names "$names" '$names|split("\n")|sort')" == \
-       "$(jq -c '[.artifacts[].name]|sort' <<< "$selection")" ]] || return 7
+    local root="$1" proofs="$2" selection="$3" documents="$4" work="$5" rows row name
+    _rup_check_namespace "$root" "$selection" "$work" || return $?
     rows=$(jq -c '.artifacts[]' <<< "$selection") || return 1
     while IFS= read -r row; do
         name=$(jq -r '.name' <<< "$row") || return 1
@@ -271,7 +295,7 @@ _ri_remote_verify() (
     signing_verify_exact "$manifest" "$manifest.minisig" "$token" || return 7
     _ri_shape "$manifest" "$repo" "$tag" "$sha" "$token" || return 7
     names=$(jq -c '[.artifacts[].name]|sort' "$manifest") || return 1
-    [[ "$(_sbr_payload_names "$inventory")" == "$names" ]] || return 7
+    [[ "$(_ri_payload_names "$inventory" "$names")" == "$names" ]] || return 7
     documents=$(_ri_documents "$work/proofs") || return $?
     entries=$(jq -c --argjson docs "$documents" '[.artifacts[]|del(.signature)]+$docs|.[]' "$manifest") || return 1
     while IFS= read -r row; do
@@ -321,7 +345,7 @@ _ri_remote_preflight() {
 _ri_remote_publish() (
     local root="$1" proofs="$2" selection="$3" repo="$4" tag="$5" sha="$6" token="$7" work="$8"
     local manifest="$proofs/release-integrity.json" hash context inventory current names documents row name asset missing id
-    local receipt observed verify_work upload_receipt before entries staged verified
+    local receipt observed verify_work upload_receipt before entries staged verified payload_names
     hash=$(_slsa_sha256 "$manifest") || return $?
     documents=$(_ri_documents "$proofs") || return $?
     entries=$(jq -c '.[]' <<< "$documents") || return 1
@@ -340,7 +364,8 @@ _ri_remote_publish() (
     id=$(jq -r '.release.id' <<< "$context") || return 7
     inventory=$(_sbr_inventory "$repo" "$id" "$work") || return $?
     _rup_preflight "$repo" "$inventory" "$selection" '[]' "$work" || return $?
-    [[ "$(_sbr_payload_names "$inventory")" == "$(jq -c '[.artifacts[].name]|sort' <<< "$selection")" ]] || return 7
+    payload_names=$(jq -c '[.artifacts[].name]|sort' <<< "$selection") || return 1
+    [[ "$(_ri_payload_names "$inventory" "$payload_names")" == "$payload_names" ]] || return 7
     _ri_remote_preflight "$repo" "$inventory" "$documents" "$work" || return $?
     verified="$inventory"
     missing=$(jq -nc --argjson names "$names" --argjson inventory "$inventory" '$names-[$inventory[].name]') || return 1
@@ -433,6 +458,7 @@ _ri_execute() (
         [[ ! -L "$output" && "$output" != *[[:cntrl:]]* && "$output" != *\\* ]] || return 4
         selection=$(_rup_manifest "$manifest" "$repo" "$tag" "$sha") || return $?
         _rup_check_files "$root" "$manifest" "$selection" "$work" || return $?
+        _ri_selection_names_valid "$selection" || return $?
         if [[ "$dry" == true ]]; then
             jq -nc --arg action "$action" --arg repo "$repo" --arg token "$token" --argjson selection "$selection" \
                 '{kind:"dsr-release-integrity-plan",status:"planned",dry_run:true,action:$action,repo:$repo,public_key:$token,selection:$selection}'
