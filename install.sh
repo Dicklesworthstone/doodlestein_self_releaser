@@ -319,7 +319,8 @@ resolve_version() {
   # 2. GitHub API (latest release tag, if releases exist)
   VERSION=$(curl -fsSL --connect-timeout 5 "${PROXY_ARGS[@]}" \
     "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
-    | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
+    | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"v?([^"]*)"$/\1/' || true)
+  [[ "$VERSION" =~ ^[0-9] ]] || VERSION=""
   [[ -n "$VERSION" ]] && return 0
 
   # 3. Redirect URL parsing (fallback when API rate-limited)
