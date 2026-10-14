@@ -18,7 +18,9 @@ archive format.
 The file is one JSON object with `schema_version: 1` and a nonempty
 `required_assets` array. Each asset has `name`, `target`, and `archive_format`;
 `target_triple` is optional. The names are a closed set, not minimum coverage.
-The asset platforms must cover exactly the `--targets` selection.
+The platform-owned assets must cover exactly the `--targets` selection. Shared
+assets use the existing native-manifest `target: "additional"` label, omit
+`target_triple`, and do not count as a platform or compiler variant.
 
 ```json
 {
@@ -35,6 +37,11 @@ The asset platforms must cover exactly the `--targets` selection.
       "target": "linux/amd64",
       "target_triple": "x86_64-unknown-linux-musl",
       "archive_format": "tar.xz"
+    },
+    {
+      "name": "LICENSE",
+      "target": "additional",
+      "archive_format": "binary"
     }
   ],
   "required_variants": [
@@ -44,7 +51,7 @@ The asset platforms must cover exactly the `--targets` selection.
 }
 ```
 
-When `required_variants` is present, every asset must declare its compiler
+When `required_variants` is present, every platform-owned asset must declare its compiler
 identity and the complete set of pairs must match that matrix. Several names
 may belong to one pair; aliases are assets, not additional compiler tasks.
 Without this field, individual names can still pin their `target_triple`.
@@ -58,6 +65,34 @@ unknown fields, explicit null selectors, case-colliding names, duplicate
 variants, non-finite numbers, incomplete matrices and linked/special files are
 rejected. Contract paths must be canonical absolute paths without symlinks.
 Canonical array ordering gives equivalent selections the same contract hash.
+
+## Shared release assets
+
+The SLSA manifest producer, signed-release policy, contract normalizer and
+snapshot verifier all retain `target: "additional"` assets as full signed
+subjects. Licenses, notices and shared data need not be mislabeled as Linux or
+assigned a fabricated compiler target to pass provenance generation. Both hash
+passes and the complete byte budget include these assets. Their sizes, formats,
+names and hashes remain bound to the manifest and signed statement.
+
+Shared assets do not enter `requested_targets`, `required_variants`, native task
+counts, host results or build-environment coverage. A shared-only manifest is
+not a successful platform build. Missing platforms or GNU/musl variants still
+fail, and even a null `target_triple` is invalid on a shared asset. A contract
+that lists a shared asset requires that exact name, target and format; a valid
+signature on a statement omitting it cannot satisfy that independent contract.
+
+Remote SLSA payload admission includes explicitly signed shared names even when
+the separate SBOM scanner classifies them as metadata, such as `LICENSE`,
+`NOTICE.txt`, or `runtime.json`. Those names must exist in the actual inventory,
+pass numeric-ID/size/digest checks, and be downloaded and hashed normally.
+This does not globally reclassify SBOM metadata or permit unexpected binaries.
+Unselected metadata keeps its existing policy; it does not become verified
+release content merely by being present.
+
+This uses the existing manifest schema and SLSA subject format. It does not
+create new native compiler evidence, broaden installation executable recipes,
+or qualify unrelated build, bundle, scanner or release-command entry points.
 
 ## Inspect, verify and fetch
 
@@ -145,6 +180,16 @@ execution need neither the original policy/contract file nor the generator
 checkout, and produce the same content-bound generation as direct installation.
 
 ## Regression
+
+`bash scripts/tests/test_slsa_shared_assets.sh` tests shared-asset production,
+exact contracts, snapshot policy, hashing, and post-authentication payload
+acquisition. Build metadata is synthetic; archives and shared file bytes are
+real. Remote tests read the actual SBOM taxonomy and download functions, with
+only the HTTP acquisition boundary replaced by local files. Snapshot tests use
+real Minisign when installed; without it they explicitly skip. Selecting
+`DSR_TEST_MINISIGN_FIXTURE=1` runs their policy/bytes checks with an external
+signer fixture and is not cryptographic qualification. Individual unittest
+classes or method names may be supplied for bounded runs.
 
 Run `bash scripts/tests/test_slsa_release_contract.sh`. It exercises the actual
 mapper, SLSA policy, payload hashing and snapshot publication with owned files.

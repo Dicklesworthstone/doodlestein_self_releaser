@@ -67,12 +67,15 @@ try:
     for asset in assets:
         fields = {"name", "target", "archive_format"}
         need(isinstance(asset, dict) and fields <= set(asset) <= fields | {"target_triple"} and name(asset["name"]) and
-             isinstance(asset["target"], str) and asset["target"] in targets and
+             isinstance(asset["target"], str) and (asset["target"] in targets or asset["target"] == "additional") and
              isinstance(asset["archive_format"], str) and asset["archive_format"] in ("tar.gz", "tar.xz", "zip", "binary", "none"),
              "invalid required asset")
         need("target_triple" not in asset or name(asset["target_triple"]), "invalid required compiler identity")
+        need(asset["target"] != "additional" or "target_triple" not in asset,
+             "shared assets cannot carry a compiler identity")
     need(len({a["name"].lower() for a in assets}) == len(assets), "colliding required asset names")
-    need({a["target"] for a in assets} == set(targets), "asset contract must cover the complete target matrix")
+    platform_assets = [a for a in assets if a["target"] != "additional"]
+    need({a["target"] for a in platform_assets} == set(targets), "asset contract must cover the complete target matrix")
     if "required_variants" in value:
         variants = value["required_variants"]
         need(isinstance(variants, list) and 1 <= len(variants) <= 256, "expected 1..256 required variants")
@@ -81,8 +84,8 @@ try:
                  isinstance(variant["target"], str) and variant["target"] in targets and name(variant["target_triple"]),
                  "invalid required variant")
         identities = {(v["target"], v["target_triple"]) for v in variants}
-        need(len(identities) == len(variants) and all("target_triple" in a for a in assets) and
-             identities == {(a["target"], a["target_triple"]) for a in assets}, "assets must cover each required variant exactly")
+        need(len(identities) == len(variants) and all("target_triple" in a for a in platform_assets) and
+             identities == {(a["target"], a["target_triple"]) for a in platform_assets}, "assets must cover each required variant exactly")
         variants.sort(key=lambda v: (v["target"], v["target_triple"]))
     assets.sort(key=lambda a: a["name"])
     encoded = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
@@ -124,9 +127,11 @@ _slr_policy() {
             length==1 and .[0].digest.sha256==$s.dsr_evidence.manifest_sha256) and
         (.dsr_evidence.artifacts|type=="array" and length>0 and all(.[];
             (.name|name) and (.target|type=="string") and
+            (if .target=="additional" then (has("target_triple")|not)
+             else (.target as $t | $p.targets | index($t)!=null) end) and
             (.size_bytes|type=="number" and .>0 and .<=9007199254740991 and .==floor)) and
             (map(.name)|sort)==($s.subject|map(.name)|sort) and
-            (map(.target)|unique|sort)==$p.targets) and
+            (map(select(.target!="additional")|.target)|unique|sort)==$p.targets) and
         (if $p|has("release_contract") then
             $p.release_contract as $c |
             # A valid signature and complete platforms cannot authorize a
@@ -137,7 +142,7 @@ _slr_policy() {
                 (has("target_triple")|not) or any($s.dsr_evidence.artifacts[];
                     .name==$a.name and .target_triple==$a.target_triple)) and
             (if $c|has("required_variants") then
-                ([.dsr_evidence.artifacts[]|{target,target_triple}]|unique|sort_by(.target,.target_triple))==$c.required_variants
+                ([.dsr_evidence.artifacts[]|select(.target!="additional")|{target,target_triple}]|unique|sort_by(.target,.target_triple))==$c.required_variants
              else true end)
          else true end))
     ' "$proof" >/dev/null 2>&1 || { _slsa_log 'Signed statement differs from the selected release policy'; return 7; }
@@ -171,6 +176,15 @@ _slr_payloads() {
     local repo="$1" inventory="$2" proof="$3" work="$4" names actual rows row name asset hash body
     names=$(jq -c '[.subject[].name]|sort' "$proof") || return 7
     actual=$(_sbr_payload_names "$inventory") || return $?
+    # The SBOM scanner deliberately excludes LICENSE/text/JSON metadata.
+    # Authenticated shared subjects are nevertheless mandatory payloads for
+    # this release. Add only their PRESENT inventory names; missing shared
+    # files and unlisted non-metadata payloads must still fail the exact set.
+    actual=$(printf '%s\n' "$actual" "$inventory" | jq -cse --slurpfile proof "$proof" '
+        select(length==2) | .[1] as $inventory |
+        .[0] + [$proof[0].dsr_evidence.artifacts[] | select(.target=="additional") |
+                .name as $name | select(any($inventory[]; .name==$name)) | .name] |
+        unique | sort') || return 7
     [[ "$names" == "$actual" ]] || { _slsa_log 'Remote payload namespace differs from signed subjects'; return 7; }
     local limit="${SLSA_REMOTE_MAX_PAYLOAD_BYTES:-8589934592}"
     [[ "$limit" =~ ^[1-9][0-9]{0,15}$ ]] || return 4
