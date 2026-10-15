@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Production collector + manifest + final-byte gate. Compiler/host metadata is
 # a fixture; these payloads test custody/naming, not native execution or ABI.
+# shellcheck disable=SC1090,SC2034 # Extracted production functions consume fixture variables through Bash dynamic scope.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 WORK=$(mktemp -d) || exit 1
@@ -27,6 +28,8 @@ artifact_naming_artifact_variant() {
     esac
 }
 tool_name=sbh
+version=1.2.3
+local_path="$WORK"
 build_release_contract_enabled=false
 resume=false
 collect_failed=false
@@ -117,6 +120,12 @@ artifacts_dir="$output_dir"
 manifest_file="$manifest"
 manifest_exists=true
 ordinary_manifest=$(cat "$manifest")
+artifact_naming_generate_dual_for_variant() {
+    printf '%s\n' '{"versioned":"bundle_linux_arm64.tar.xz","compat":"unlisted.tar.xz"}'
+}
+test "$(_release_artifact_candidate_names bundle_linux_arm64.tar.xz linux/arm64 tar.xz)" = \
+    bundle_linux_arm64.tar.xz || exit 1
+echo 'PASS: archive publication also refuses names absent from the signed inventory'
 declare -A ordinary_upload_names=()
 while IFS= read -r name; do ordinary_upload_names["$name"]="$name"; done < <(jq -r '.artifacts[].name' "$manifest")
 log_ok() { :; }
@@ -151,3 +160,11 @@ for name, digest in signed.items():
     assert (output / (name+".sha256")).read_text() == f"{digest}  {name}\n"
 print("PASS: final payload namespace, SHA256SUMS and authenticated manifest match exactly")
 PY
+status=$?
+[[ "$status" == 0 ]] || exit "$status"
+printf 'post-collection mutation\n' >> "$output_dir/sbh_linux_amd64"
+if _act_verify_collected_manifest "$manifest" "$output_dir"; then exit 1; fi
+echo 'PASS: actual collected-byte mutation refuses final sealing'
+printf 'post-worker mutation\n' >> "$WORK/linux_amd64/sbh"
+if act_generate_manifest "$result" "$WORK/source-mutation.json" "$renames"; then exit 1; fi
+echo 'PASS: source mutation cannot silently replace frozen worker bytes'
