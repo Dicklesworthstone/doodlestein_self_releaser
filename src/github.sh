@@ -198,13 +198,14 @@ _gh_get_etag() {
 }
 
 # Make GitHub API request
-# Usage: gh_api <endpoint> [--method GET|POST|PATCH|DELETE] [--data <json>] [--no-cache]
+# Usage: gh_api <endpoint> [--method GET|POST|PATCH|DELETE] [--data <json>] [--no-cache] [--retain-response]
 # Returns: JSON response on stdout, sets exit code
 gh_api() (
     local endpoint=""
     local method="GET"
     local data=""
     local no_cache=false
+    local retain_response=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -226,6 +227,10 @@ gh_api() (
                 ;;
             --no-cache)
                 no_cache=true
+                shift
+                ;;
+            --retain-response)
+                retain_response=true
                 shift
                 ;;
             -*)
@@ -252,6 +257,45 @@ gh_api() (
     if ! command -v jq &>/dev/null; then
         _gh_log_error "jq is required for GitHub JSON responses"
         return 3
+    fi
+
+    # Strict draft finalization needs the original POST bytes, not a later
+    # GET or reserialized stdout. Only this explicit draft-create operation
+    # may retain its response, and its caller must supply an owner-only TMPDIR.
+    if $retain_response; then
+        if [[ "$method" != POST || ! "$endpoint" =~ ^repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases$ ]] ||
+           ! jq -e 'type == "object" and .draft == true and
+               (.tag_name | type == "string" and length > 0) and
+               (.name | type == "string") and (.body | type == "string") and
+               (.prerelease | type == "boolean")' <<< "$data" >/dev/null; then
+            _gh_log_error "Response retention requires a draft release POST"
+            return 4
+        fi
+        command -v python3 >/dev/null 2>&1 || return 3
+        if ! python3 -I - "${TMPDIR:-/tmp}" <<'PY'
+import os
+import stat
+import sys
+
+if not __debug__:
+    raise SystemExit(4)
+directory = os.path.abspath(sys.argv[1])
+try:
+    assert os.path.realpath(directory) == directory
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(fd)
+        assert stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.geteuid()
+        assert stat.S_IMODE(parent.st_mode) & 0o777 == 0o700
+    finally:
+        os.close(fd)
+except (OSError, AssertionError):
+    raise SystemExit(4)
+PY
+        then
+            _gh_log_error "Response retention requires an owner-only, unlinked TMPDIR"
+            return 4
+        fi
     fi
 
     # Reset last response metadata (set by curl path)
@@ -325,13 +369,26 @@ gh_api() (
             if [[ "$method" == "GET" ]] && ! $no_cache; then
                 echo "$response" | _gh_set_cache "$endpoint" "${_GH_LAST_ETAG:-}"
             fi
+            if $retain_response; then
+                if ! jq -es --argjson request "$data" 'length == 1 and (.[0] | type == "object" and
+                    (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+                    .draft == true and .assets == [] and
+                    .tag_name == $request.tag_name and .name == $request.name and
+                    .body == $request.body and .prerelease == $request.prerelease and
+                    ($request.target_commitish == null or .target_commitish == $request.target_commitish))' "$response_file" >/dev/null; then
+                    _gh_log_error "Draft POST did not return a valid original creation response"
+                    return 8
+                fi
+                # Keep the exact mktemp file and its private descriptor identity.
+                trap - EXIT
+            fi
             echo "$response"
             return 0
         elif _gh_is_rate_limited "$response" ||
              { [[ "$method" == "GET" ]] &&
                { [[ "${_GH_LAST_HTTP_CODE:-}" =~ ^(408|429|5[0-9][0-9])$ ]] ||
                  { $using_curl && [[ -z "${_GH_LAST_HTTP_CODE:-}" && $exit_code -ne 3 ]]; }; }; }; then
-            ((retries++))
+            retries=$((retries + 1))
             if [[ $retries -lt $max_attempts ]]; then
                 local rate_limited=false
                 if [[ "${_GH_LAST_HTTP_CODE:-}" == "429" ]] || _gh_is_rate_limited "$response"; then
@@ -996,7 +1053,7 @@ gh_latest_release() {
 }
 
 # Create a release
-# Usage: gh_create_release <owner/repo> <tag> [--name <name>] [--body <body>] [--draft] [--prerelease]
+# Usage: gh_create_release <owner/repo> <tag> [--name <name>] [--body <body>] [--draft] [--prerelease] [--retain-response]
 gh_create_release() {
     local repo=""
     local tag=""
@@ -1005,6 +1062,7 @@ gh_create_release() {
     local draft=false
     local prerelease=false
     local target_commitish=""
+    local retain_response=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1027,6 +1085,10 @@ gh_create_release() {
             --target-commitish)
                 target_commitish="$2"
                 shift 2
+                ;;
+            --retain-response)
+                retain_response=true
+                shift
                 ;;
             *)
                 if [[ -z "$repo" ]]; then
@@ -1057,7 +1119,11 @@ gh_create_release() {
         '{tag_name: $tag, name: $name, body: $body, draft: $draft, prerelease: $prerelease}
          + if $target_commitish == "" then {} else {target_commitish: $target_commitish} end')
 
-    gh_api "repos/$repo/releases" --post "$data"
+    if $retain_response; then
+        gh_api "repos/$repo/releases" --post "$data" --retain-response
+    else
+        gh_api "repos/$repo/releases" --post "$data"
+    fi
 }
 
 # Upload under the local filename. Named and unnamed uploads share the same

@@ -13,6 +13,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+try:
+    from jsonschema import Draft202012Validator, FormatChecker
+except ImportError:
+    raise SystemExit('Strict release contract tests require Python jsonschema')
 
 root = Path(sys.argv[1])
 os.umask(0o077)
@@ -21,7 +26,7 @@ source = Path(os.environ.get('DSR_TEST_COMMAND_FILE', str(root / 'dsr'))).read_t
 names = re.findall(r'^(_release_[A-Za-z0-9_]+)\(\) \{', source, re.M)
 names += ['_source_release_read_private_receipt', '_source_release_metadata_matches',
           '_source_release_restore_draft', '_source_release_identity',
-          '_source_release_inputs_match', 'cmd_release_finalize']
+          '_source_release_inputs_match', 'cmd_release_finalize', 'cmd_release']
 functions = work / 'functions.sh'
 functions.write_text('\n'.join(re.search(r'^' + re.escape(n) + r'\(\) \{\n.*?^\}', source, re.M | re.S).group(0) for n in names))
 print('Fixtures: ' + str(work), flush=True)
@@ -47,15 +52,26 @@ contract = {'checksum_sidecar':'sha256','minisign_public_key_file':'minisign.pub
             'exact_additional_assets':['SHA256SUMS','SHA256SUMS.minisig']}
 
 api = r'''
-import json, os
+import hashlib, json, os
 from pathlib import Path
 import sys
 c=Path(os.environ['CASE']); args=sys.argv[1:]; endpoint=args[0]
 control=json.loads((c/'control.json').read_text())
 with (c/'requests.jsonl').open('a') as f:f.write(json.dumps(args)+'\n')
 r=json.loads((c/'remote.json').read_text())
-if endpoint.startswith('repos/owner/app/releases?'):
-    print(json.dumps([] if 'page=2' in endpoint else [dict(r,id=99) if control.get('wrong_scan_id') else r]))
+if endpoint=='upload-boundary':
+    source=Path(args[1]);name=args[2];data=source.read_bytes();aid=100+len(r['assets'])
+    (c/'bytes'/str(aid)).write_bytes(data)
+    asset={'id':aid,'name':name,'state':'uploaded','size':len(data),'digest':'sha256:'+hashlib.sha256(data).hexdigest()}
+    r['assets'].append(asset);(c/'remote.json').write_text(json.dumps(r));print(json.dumps(asset))
+elif endpoint=='repos/owner/app/releases' and '--post' in args:
+    request=json.loads(args[args.index('--post')+1])
+    r=dict(request,id=9,assets=[],upload_url='https://uploads.github.com/repos/owner/app/releases/9/assets{?name,label}',
+           html_url='https://github.com/owner/app/releases/tag/untagged-fixture')
+    control['absent']=False;(c/'control.json').write_text(json.dumps(control))
+    (c/'remote.json').write_text(json.dumps(r));print(json.dumps(r))
+elif endpoint.startswith('repos/owner/app/releases?'):
+    print(json.dumps([] if control.get('absent') or 'page=2' in endpoint else [dict(r,id=99) if control.get('wrong_scan_id') else r]))
 elif endpoint=='repos/owner/app/git/ref/tags/v1.2.3':
     moved=control.get('tag_drift_after_publish') and not r['draft']
     print(json.dumps({'object':{'type':'commit','sha':'f'*40 if moved else os.environ['SOURCE_SHA']}}))
@@ -89,11 +105,18 @@ source "$ROOT/src/config.sh"
 source "$ROOT/src/git_ops.sh"
 source "$ROOT/src/act_runner.sh"
 source "${DSR_TEST_SIGNING_MODULE:-$ROOT/src/signing.sh}"
+source "$ROOT/src/artifact_naming.sh"
 source "$FUNCTIONS"
 log_error() { printf 'ERROR %s\n' "$*" >&2; }
 log_info() { printf 'INFO %s\n' "$*" >&2; }
 log_ok() { log_info "$@"; }
 log_warn() { log_info "$@"; }
+log_debug() { :; }
+log_set_tool() { :; }
+_dsr_require() { :; }
+_dispatch_load_config() { printf 'false|||\n'; }
+_dispatch_is_true() { [[ "$1" == true ]]; }
+json_envelope() { jq -nc --arg command "$1" --arg status "$2" --argjson exit_code "$3" --argjson details "$4" '{command:$command,status:$status,exit_code:$exit_code,details:$details}'; }
 gh_check() { return 0; }
 gh_check_token() { return 0; }
 gh_api() { python3 "$CASE/api.py" "$@"; }
@@ -105,7 +128,24 @@ mktemp() {
 }
 DRY_RUN=false
 JSON_MODE=false
-if [[ "$1" == prepare ]]; then
+if [[ "$1" == create ]]; then
+    # Retain the real API adapter and creation producer. Only HTTP transport
+    # and upload delivery are fixtures; receipt files are never synthesized.
+    source "$ROOT/src/github.sh"
+    gh_check() { return 0; }
+    gh_check_token() { return 0; }
+    gh_download_release_asset() { test ! -e "$3" && cp "$CASE/bytes/$2" "$3"; }
+    _gh_api_with_gh() {
+        case "$2" in
+            POST) python3 "$CASE/api.py" "$1" --post "$3" ;;
+            PATCH) python3 "$CASE/api.py" "$1" --method PATCH --data "$3" ;;
+            *) python3 "$CASE/api.py" "$1" ;;
+        esac
+    }
+    gh_upload_asset_named() { python3 "$CASE/api.py" upload-boundary "$2" "$3"; }
+    JSON_MODE=true
+    cmd_release app 1.2.3 --draft --no-dispatch
+elif [[ "$1" == prepare ]]; then
     act_load_repo_config app || exit
     contract=$(config_get_release_contract_json app) || exit
     _release_contract_preflight app v1.2.3 owner/app "$CASE/repo" "$CASE/state/artifacts/app-v1.2.3" "$CASE/state/artifacts/app-v1.2.3/app-v1.2.3-manifest.json" "$contract" create > "$CASE/plan.json"
@@ -157,8 +197,54 @@ def invoke(c,env,response,dry=False,flags=None):
     patches=[q for q in requests if '--method' in q]
     return r,patches
 
-for label,controls in [('success',{}),('lost-patch',{'lost_patch':True}),('already-public',{}),('dry-run',{})]:
-    c,env,response,_=setup(label,controls)
+def prepare_cases(cases):
+    # Each case has its own repository, signing key copy, state and transport
+    # logs. Execute every real preflight; only independent preparation overlaps.
+    # Keep mutations/assertions in their original order, and propagate every
+    # preparation error before the case can be counted as passing.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        prepared=list(pool.map(lambda case: setup(*case),cases))
+    return zip(cases,prepared)
+
+# Execute the complete producer-to-consumer handoff. The response's name,
+# bytes, permissions and directory come from production creation, not setup().
+c,env,_,_=setup('creation-handoff',{'absent':True})
+r=subprocess.run(['bash','-c',script,'fixture','create'],env=env,capture_output=True,text=True)
+(c/'create.log').write_text(r.stdout+r.stderr)
+check('strict draft creation terminal0',r.returncode==0)
+result=json.loads(r.stdout)
+# Validate the real producer's complete details against the existing public
+# schema, including its required asset download URLs and new custody fields.
+schema=json.loads((root/'schemas/release-details.json').read_text())
+Draft202012Validator.check_schema(schema)
+validator=Draft202012Validator(schema,format_checker=FormatChecker())
+check('creation result satisfies public release-details schema',not list(validator.iter_errors(result['details'])))
+for field in ('create_response','finalization_tmpdir'):
+    for invalid in (7,''):
+        wrong=dict(result['details'],**{field:invalid})
+        check(field+' schema refuses '+repr(invalid),bool(list(validator.iter_errors(wrong))))
+wrong=json.loads(json.dumps(result['details']))
+del wrong['assets_uploaded'][0]['download_url']
+check('asset schema still requires download URL',bool(list(validator.iter_errors(wrong))))
+response=Path(result['details']['create_response'])
+private=Path(result['details']['finalization_tmpdir'])
+check('creation exposes original response in owner-only storage',response.parent==private and
+      private.stat().st_mode & 0o777==0o700 and response.stat().st_mode & 0o777==0o600)
+raw=response.read_bytes();before=response.stat()
+original=json.loads(raw)
+check('creation retains actual empty nonce-bound POST bytes',original['assets']==[] and
+      original['draft'] is True and original['target_commitish']==sha and
+      re.search(r'<!-- dsr-create-nonce:[0-9a-f]{64} -->$',original['body']) is not None)
+requests=[json.loads(line) for line in (c/'requests.jsonl').read_text().splitlines()]
+check('creation makes exactly one POST',sum('--post' in q for q in requests)==1)
+env['TMPDIR']=str(private)
+r,patches=invoke(c,env,response)
+check('captured creation response feeds unchanged finalizer',r.returncode==0)
+check('handoff retains original descriptor identity',response.read_bytes()==raw and response.stat().st_ino==before.st_ino)
+check('handoff publishes only its owned signed draft',json.loads((c/'remote.json').read_text())['draft'] is False and
+      all(q[0]=='repos/owner/app/releases/9' for q in patches))
+
+for (label,controls),(c,env,response,_) in prepare_cases([('success',{}),('lost-patch',{'lost_patch':True}),('already-public',{}),('dry-run',{})]):
     raw=response.read_bytes();before=response.stat()
     if label=='already-public':
         remote=json.loads((c/'remote.json').read_text());remote['draft']=False;(c/'remote.json').write_text(json.dumps(remote))
@@ -169,8 +255,7 @@ for label,controls in [('success',{}),('lost-patch',{'lost_patch':True}),('alrea
     check(label+' no creation POST',not any('--post' in q for q in map(json.loads,(c/'requests.jsonl').read_text().splitlines())))
     if label!='dry-run':check(label+' public exact source',json.loads((c/'remote.json').read_text())['draft'] is False)
 
-for label in ['wrong-id','wrong-tag','wrong-target','wrong-nonce','wrong-url','initial-assets','permissions','hardlink','symlink','outside','duplicate-key','no-contract','source-only-mode','conflicting-registry','local-bytes','local-signature','remote-bytes','metadata','extra-asset','missing-asset','no-dispatch','extra-argument','optimized-python','pending-write-failure']:
-    c,env,response,original=setup(label)
+for (label,_),(c,env,response,original) in prepare_cases([(label,None) for label in ['wrong-id','wrong-tag','wrong-target','wrong-nonce','wrong-url','initial-assets','permissions','hardlink','symlink','outside','duplicate-key','no-contract','source-only-mode','conflicting-registry','local-bytes','local-signature','remote-bytes','metadata','extra-asset','missing-asset','no-dispatch','extra-argument','optimized-python','pending-write-failure']]):
     flags=None
     if label.startswith('wrong-') or label=='initial-assets':
         field,value={'wrong-id':('id',99),'wrong-tag':('tag_name','v9.9.9'),'wrong-target':('target_commitish','f'*40),'wrong-nonce':('body','no nonce'),'wrong-url':('upload_url','https://example.invalid/'),'initial-assets':('assets',[{'id':1}])}[label]
@@ -204,12 +289,11 @@ for label in ['wrong-id','wrong-tag','wrong-target','wrong-nonce','wrong-url','i
     check(label+' refused',r.returncode!=0)
     check(label+' no publication',not patches)
 
-for label,controls in [('same-bytes-replacement',{'receipt_replace':'regular'}),('symlink-replacement',{'receipt_replace':'symlink'}),('config-drift',{'config_drift':True}),('registry-appears',{'registry_appears':True}),('wrong-scan-id',{'wrong_scan_id':True}),('hidden-asset',{'hidden_asset':True})]:
-    c,env,response,_=setup(label,controls);r,patches=invoke(c,env,response)
+for (label,controls),(c,env,response,_) in prepare_cases([('same-bytes-replacement',{'receipt_replace':'regular'}),('symlink-replacement',{'receipt_replace':'symlink'}),('config-drift',{'config_drift':True}),('registry-appears',{'registry_appears':True}),('wrong-scan-id',{'wrong_scan_id':True}),('hidden-asset',{'hidden_asset':True})]):
+    r,patches=invoke(c,env,response)
     check(label+' refused',r.returncode!=0);check(label+' no publication',not patches)
 
-for label,controls in [('post-metadata-drift',{'metadata_drift_after_publish':True}),('post-tag-drift',{'tag_drift_after_publish':True}),('post-hidden-asset',{'post_hidden_asset':True}),('final-write-failure',{})]:
-    c,env,response,_=setup(label,controls)
+for (label,controls),(c,env,response,_) in prepare_cases([('post-metadata-drift',{'metadata_drift_after_publish':True}),('post-tag-drift',{'tag_drift_after_publish':True}),('post-hidden-asset',{'post_hidden_asset':True}),('final-write-failure',{})]):
     if label=='final-write-failure':env['FAIL_FINAL']='true'
     r,patches=invoke(c,env,response)
     check(label+' terminal failure',r.returncode!=0)

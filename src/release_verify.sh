@@ -16,6 +16,37 @@ release_verify_cli() {
         return 3
     fi
     old_int=$(trap -p INT); old_term=$(trap -p TERM); old_hup=$(trap -p HUP)
+    local trap_command
+    local -a old_commands=()
+    # Decode Bash's quoted trap records as data before changing any handler.
+    # NUL framing preserves empty ignored handlers and trailing newlines;
+    # stdin keeps handler bodies out of process arguments and diagnostics.
+    while IFS= read -r -d '' trap_command; do
+        old_commands+=("$trap_command")
+    done < <(printf '%s\0' "$old_int" "$old_term" "$old_hup" | python3 -I -c '
+import os, shlex, sys
+try:
+    records = sys.stdin.buffer.read().split(b"\0")
+    if len(records) != 4 or records[-1] != b"":
+        raise ValueError()
+    commands = []
+    for record, signal_name in zip(records[:3], ("SIGINT", "SIGTERM", "SIGHUP")):
+        fields = shlex.split(os.fsdecode(record)) if record else []
+        if record and (len(fields) != 4 or fields[:2] != ["trap", "--"] or fields[3] != signal_name):
+            raise ValueError()
+        commands.append(fields[2] if fields else "")
+    for command in commands:
+        sys.stdout.buffer.write(os.fsencode(command) + b"\0")
+except (ValueError, OSError):
+    raise SystemExit(3)
+')
+    if [[ ${#old_commands[@]} -ne 3 ]]; then
+        log_error 'Cannot preserve prior signal handlers for release verification'
+        if ${JSON_MODE:-false}; then
+            json_envelope release-verify error 3 '{"error":"Cannot preserve prior signal handlers","checksums":{"requested":true,"verified":[],"verified_count":0}}'
+        fi
+        return 3
+    fi
     trap 'signals=$((signals+1)); [[ -z "$worker" ]] || kill -TERM "$worker" 2>/dev/null || true' INT TERM HUP
     bash "$module" "$SCRIPT_DIR/dsr" "${JSON_MODE:-false}" "${DRY_RUN:-false}" "$DSR_VERSION" "$@" &
     worker=$!
@@ -29,9 +60,9 @@ release_verify_cli() {
     done
     worker=''
     trap - INT TERM HUP
-    [[ -z "$old_int" ]] || eval "$old_int"
-    [[ -z "$old_term" ]] || eval "$old_term"
-    [[ -z "$old_hup" ]] || eval "$old_hup"
+    [[ -z "$old_int" ]] || trap -- "${old_commands[0]}" INT
+    [[ -z "$old_term" ]] || trap -- "${old_commands[1]}" TERM
+    [[ -z "$old_hup" ]] || trap -- "${old_commands[2]}" HUP
     return "$rc"
 }
 
@@ -264,10 +295,14 @@ def checksum_details():
     return details
 
 try:
+    class HelpFormatter(argparse.HelpFormatter):
+        def _format_usage(self, usage, actions, groups, prefix=None):
+            return super()._format_usage(usage, actions, groups,
+                                         prefix='USAGE: ' if prefix is None else prefix)
     class Parser(argparse.ArgumentParser):
         def error(self, message):
             raise Failure(message, 4)
-    parser = Parser(prog='dsr release verify', description='Check the existing manifest/strict release gates and every eligible payload checksum.',
+    parser = Parser(prog='dsr release verify', formatter_class=HelpFormatter, description='Check the existing manifest/strict release gates and every eligible payload checksum.',
         epilog='--fix retains the existing repair rules. --dry-run prevents repair writes, not requested checksum downloads. '
                'Checksums are integrity evidence, not publisher signatures. Audit evidence is retained.', allow_abbrev=False)
     parser.add_argument('selection', nargs='*', metavar='TOOL VERSION')

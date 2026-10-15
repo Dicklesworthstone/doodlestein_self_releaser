@@ -219,6 +219,12 @@ source tree plus Cargo target will exhaust. Set `build_root` on a host to stage 
 overrides it for strict release snapshots. Either way dsr refuses to stage onto a tmpfs/ramfs
 root and tells you to set `build_root`.
 
+Every new Unix strict snapshot has a `.sbh-protect` marker in its private run
+directory before source extraction. The marker protects the source archives,
+private Cargo caches, and compiler outputs from SBH cleanup, including emergency
+cleanup. It sits outside the authenticated source tree and remains with the
+retained snapshot.
+
 Strict snapshots must also live on a filesystem that preserves POSIX file modes. ExFAT, FAT
 and some FUSE/SMB mounts report every file as executable, so a tracked `100644` file can no
 longer be distinguished from a `100755` one. dsr verifies each extracted snapshot (bytes,
@@ -733,15 +739,19 @@ and records a separate recovery receipt. Ordinary `--resume` remains a binary
 publication option and is refused in source-only mode.
 
 If strict binary creation succeeded but its controller stopped before
-publication, preserve the original private `dsr-api-response.*` POST response.
-Recovery requires a response that actually survived or was preserved; it cannot
-reconstruct creation custody from public release metadata.
+publication, use the original private `dsr-api-response.*` POST response.
+Strict creation retains that file in an owner-only directory. With `--json`,
+the draft result supplies `details.create_response` and
+`details.finalization_tmpdir`; human output prints the complete finalization
+command. Recovery cannot reconstruct creation custody from public release
+metadata. A lost or unsuccessful POST response may leave an observable draft,
+but does not supply finalization custody.
 Use `dsr release verify TOOL VERSION --fix` to repair missing draft assets
 (add `--dry-run` to list the uploads without performing them). Once
 all signed assets verify, finalize through DSR:
 
 ```bash
-dsr release finalize TOOL VERSION --create-response /private/scratch/dsr-api-response.ABCDEF12 --no-dispatch
+TMPDIR=/private/scratch dsr release finalize TOOL VERSION --create-response /private/scratch/dsr-api-response.ABCDEF12 --no-dispatch
 ```
 
 The response must remain a single-link, owner-only regular file in the same

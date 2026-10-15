@@ -698,7 +698,7 @@ EOF
         _add_check "git" "error" ", \"message\": \"not found\""
         log_error "  git: not found"
         fixes+=("Install git: apt install git OR brew install git")
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check gh
@@ -714,13 +714,13 @@ EOF
             _add_check "gh" "error" ", \"version\": \"$gh_ver\", \"authenticated\": false"
             log_error "  gh: not authenticated"
             fixes+=("Authenticate GitHub CLI: gh auth login")
-            ((errors++))
+            errors=$((errors + 1))
         fi
     else
         _add_check "gh" "error" ", \"message\": \"not found\""
         log_error "  gh: not found"
         fixes+=("Install GitHub CLI: brew install gh OR apt install gh")
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check jq
@@ -733,7 +733,7 @@ EOF
         _add_check "jq" "error" ", \"message\": \"not found\""
         log_error "  jq: not found"
         fixes+=("Install jq: brew install jq OR apt install jq")
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check curl
@@ -746,7 +746,7 @@ EOF
         _add_check "curl" "error" ", \"message\": \"not found\""
         log_error "  curl: not found"
         fixes+=("Install curl: apt install curl")
-        ((errors++))
+        errors=$((errors + 1))
     fi
 
     # Check yq (needed for config operations)
@@ -759,7 +759,7 @@ EOF
         _add_check "yq" "warning" ", \"message\": \"not found\""
         log_warn "  yq: not found (needed for config operations)"
         fixes+=("Install yq: brew install yq OR snap install yq")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # Quick mode stops here
@@ -784,13 +784,13 @@ EOF
             _add_check "docker" "warning" ", \"running\": false"
             log_warn "  docker: installed but not running"
             fixes+=("Start Docker: systemctl start docker OR open Docker Desktop")
-            ((warnings++))
+            warnings=$((warnings + 1))
         fi
     else
         _add_check "docker" "warning" ", \"message\": \"not found\""
         log_warn "  docker: not found (needed for act)"
         fixes+=("Install Docker: https://docs.docker.com/get-docker/")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # Check act
@@ -808,13 +808,13 @@ EOF
             _add_check "act" "warning" ", \"version\": \"$(_json_escape "$act_ver")\", \"minimum_version\": \"$act_min_json\", \"message\": \"unsupported or vulnerable act version\""
             log_warn "  act: $act_ver (upgrade required; minimum supported is v$ACT_MIN_VERSION)"
             fixes+=("Install act v$ACT_MIN_VERSION or newer: https://github.com/nektos/act/releases")
-            ((warnings++))
+            warnings=$((warnings + 1))
         fi
     else
         _add_check "act" "warning" ", \"message\": \"not found\""
         log_warn "  act: not found (needed for local builds)"
         fixes+=("Install act: brew install act OR https://github.com/nektos/act/releases")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # Check actrc configuration (CRITICAL: prevents UID mismatch)
@@ -845,7 +845,7 @@ EOF
             log_error "         This WILL break file access for other processes!"
             fixes+=("Fix actrc: Run 'id' to get your UID:GID, then add to ~/.actrc: --container-options --user=UID:GID")
             fixes+=("Quick fix: echo '--container-options --user=$(id -u):$(id -g)' >> ~/.actrc")
-            ((errors++))
+            errors=$((errors + 1))
         elif $has_bind && $has_user; then
             _add_check "actrc" "ok" ", \"file\": \"$actrc_file\", \"bind\": true, \"user_mapping\": true"
             log_ok "  actrc: configured correctly (--bind with --user)"
@@ -862,7 +862,7 @@ EOF
         log_warn "  actrc: ~/.actrc not found"
         fixes+=("Create actrc: cp $SCRIPT_DIR/config/actrc.example ~/.actrc")
         fixes+=("See docs/ACT_SETUP.md for configuration guide")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # Check SSH
@@ -872,7 +872,7 @@ EOF
     else
         _add_check "ssh" "warning" ", \"message\": \"not found\""
         log_warn "  ssh: not found (needed for remote builds)"
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # ========== SSH TO BUILD HOSTS ==========
@@ -929,7 +929,7 @@ EOF
                         _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\", \"ssh_host\": \"$(_json_escape "$ssh_host")\""
                         log_warn "  $host: unreachable ($ssh_host)"
                         fixes+=("Check SSH config for $host: ssh $ssh_host")
-                        ((warnings++))
+                        warnings=$((warnings + 1))
                     fi
                 else
                     if ssh -o ConnectTimeout="$ssh_timeout" -o BatchMode=yes "$ssh_host" "echo ok" &>/dev/null 2>&1; then
@@ -939,14 +939,14 @@ EOF
                         _add_check "ssh-$host" "warning" ", \"message\": \"unreachable\", \"ssh_host\": \"$(_json_escape "$ssh_host")\""
                         log_warn "  $host: unreachable ($ssh_host)"
                         fixes+=("Check SSH config for $host: ssh $ssh_host")
-                        ((warnings++))
+                        warnings=$((warnings + 1))
                     fi
                 fi
                 ;;
             *)
                 _add_check "host-$host" "warning" ", \"message\": \"unsupported connection\", \"connection\": \"$(_json_escape "$connection")\""
                 log_warn "  $host: unsupported connection '$connection'"
-                ((warnings++))
+                warnings=$((warnings + 1))
                 ;;
         esac
     done <<< "$enabled_hosts"
@@ -970,13 +970,13 @@ EOF
             _add_check "minisign-key" "warning" ", \"message\": \"not configured\""
             log_warn "  minisign key: not configured"
             fixes+=("Generate signing key: dsr signing init")
-            ((warnings++))
+            warnings=$((warnings + 1))
         fi
     else
         _add_check "minisign" "warning" ", \"message\": \"not found\""
         log_warn "  minisign: not found (needed for signing)"
         fixes+=("Install minisign: brew install minisign")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # Check syft (SBOM generation)
@@ -989,7 +989,7 @@ EOF
         _add_check "syft" "warning" ", \"message\": \"not found\""
         log_warn "  syft: not found (needed for SBOM generation)"
         fixes+=("Install syft: brew install syft OR https://github.com/anchore/syft/releases")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # ========== NETWORK CONNECTIVITY ==========
@@ -1004,7 +1004,7 @@ EOF
         _add_check "network-api.github.com" "warning" ", \"message\": \"unreachable\""
         log_warn "  api.github.com: unreachable"
         fixes+=("Check network connectivity to GitHub")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # Check github.com
@@ -1014,7 +1014,7 @@ EOF
     else
         _add_check "network-github.com" "warning" ", \"message\": \"unreachable\""
         log_warn "  github.com: unreachable"
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # ========== DISK SPACE ==========
@@ -1029,7 +1029,7 @@ EOF
             _add_check "disk-local" "warning" ", \"available_gb\": $disk_avail_gb"
             log_warn "  local: ${disk_avail_gb}GB available (low)"
             fixes+=("Free up disk space (< 5GB available)")
-            ((warnings++))
+            warnings=$((warnings + 1))
         else
             _add_check "disk-local" "ok" ", \"available_gb\": $disk_avail_gb"
             log_ok "  local: ${disk_avail_gb}GB available"
@@ -1055,7 +1055,7 @@ EOF
         _add_check "config" "warning" ", \"message\": \"invalid or missing\""
         log_warn "  config: invalid or missing"
         fixes+=("Initialize config: dsr config init")
-        ((warnings++))
+        warnings=$((warnings + 1))
     fi
 
     # Artifact naming consistency (bd-1tv.5): catch config / install.sh /
@@ -1082,12 +1082,12 @@ EOF
                 _add_check "artifact_naming" "error" ", \"message\": \"$naming_err repo(s) with naming errors\", \"repos\": $naming_repos"
                 log_error "  artifact naming: $naming_err repo(s) with errors (run 'dsr repos validate --naming')"
                 fixes+=("Align artifact naming: dsr repos validate --naming")
-                ((warnings++))
+                warnings=$((warnings + 1))
             elif [[ "$naming_warn" -gt 0 ]]; then
                 _add_check "artifact_naming" "warning" ", \"message\": \"$naming_warn repo(s) with naming mismatches\", \"repos\": $naming_repos"
                 log_warn "  artifact naming: $naming_warn repo(s) with mismatches (run 'dsr repos validate --naming')"
                 fixes+=("Align artifact naming: dsr repos validate --naming")
-                ((warnings++))
+                warnings=$((warnings + 1))
             else
                 _add_check "artifact_naming" "ok" ""
                 log_ok "  artifact naming: all registered repos consistent"
@@ -1095,7 +1095,7 @@ EOF
         else
             _add_check "artifact_naming" "warning" ", \"message\": \"could not run naming validation\""
             log_warn "  artifact naming: could not validate (no repos registered, or validation failed)"
-            ((warnings++))
+            warnings=$((warnings + 1))
         fi
     fi
 
@@ -1550,7 +1550,7 @@ _watch_acquire_lock() {
     local attempt=0
 
     while [[ $attempt -lt $max_attempts ]]; do
-        ((attempt++))
+        attempt=$((attempt + 1))
 
         # Check for existing lock
         if [[ -f "$_WATCH_LOCK_FILE" ]]; then
@@ -1762,7 +1762,7 @@ _watch_iteration() {
             log_warn "No dsr tool is configured for $repo; not triggering a fallback"
         elif $dry_run; then
             log_info "[DRY RUN] Would trigger fallback for $tool_name${fallback_args[*]:+ ${fallback_args[*]}} (run $run_id)"
-            ((triggered_count++))
+            triggered_count=$((triggered_count + 1))
         else
             log_info "Triggering fallback for $tool_name..."
 
@@ -1783,7 +1783,7 @@ _watch_iteration() {
                     "Repo $repo run $run_id fallback started (PID: $fallback_pid)" \
                     "$run_id" || true
             fi
-            ((triggered_count++))
+            triggered_count=$((triggered_count + 1))
         fi
     done <<< "$throttled_runs"
 
@@ -1977,7 +1977,7 @@ EOF
     local iteration=0
 
     while $_WATCH_RUNNING; do
-        ((iteration++))
+        iteration=$((iteration + 1))
         log_info "--- Iteration $iteration ---"
 
         # Run check
@@ -7878,7 +7878,12 @@ EOF
         fi
     fi
 
-    local create_status=0
+    local create_status=0 create_response="" create_response_dir=""
+    if $release_contract_enabled; then
+        create_response_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-create-custody.XXXXXXXX") || return 4
+        create_response_dir=$(cd "$create_response_dir" && pwd -P) || return 4
+        release_args+=" --retain-response"
+    fi
     if $resume && ! $release_contract_enabled; then
         # Authenticated collection reads include drafts. A failed lookup is
         # unknown, not permission to create another release or trust a journal.
@@ -7895,7 +7900,26 @@ EOF
         log_info "Resuming $tag by verifying remote asset contents"
     else
         # shellcheck disable=SC2086
-        release_json=$(gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
+        if $release_contract_enabled; then
+            release_json=$(TMPDIR="$create_response_dir" gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
+        else
+            release_json=$(gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
+        fi
+    fi
+
+    if $release_contract_enabled && [[ $create_status -eq 0 ]]; then
+        local -a create_responses=("$create_response_dir"/dsr-api-response.????????)
+        local creation_fingerprint
+        if [[ ${#create_responses[@]} -ne 1 || ! -f "${create_responses[0]}" ]] ||
+           ! creation_fingerprint=$(_source_release_read_private_receipt \
+                "${create_responses[0]}" "$create_response_dir" "" "" "dsr-api-response.") ||
+           ! jq -en --argjson original "$creation_fingerprint" --argjson reply "$release_json" \
+                '$original.record == $reply' >/dev/null; then
+            log_error "Strict draft creation did not preserve its original private POST response"
+            return 7
+        fi
+        create_response="${create_responses[0]}"
+        log_info "Preserved strict draft creation response: $create_response"
     fi
 
     if [[ $create_status -ne 0 ]]; then
@@ -8197,8 +8221,11 @@ EOF
             --argjson size "$size_bytes" \
             --arg content_type "$content_type" \
             --arg status "$status" \
+            --arg repo "$repo" --arg tag "$tag" \
             --arg sha256 "$sha" --argjson receipt "$receipt" \
-            '{name: $name, size_bytes: $size, content_type: $content_type, status: $status}
+            '{name: $name, size_bytes: $size, content_type: $content_type, status: $status,
+              download_url: ("https://github.com/" + $repo + "/releases/download/" +
+                  ($tag | @uri) + "/" + ($name | @uri))}
              + (if $sha256 == "" then {} else {sha256:$sha256,remote_id:$receipt.id} end)'); then
             _release_record_failed "$name" "Could not encode verified upload receipt"
             return 1
@@ -8716,6 +8743,8 @@ EOF
             --argjson release_id "$release_id" \
             --arg release_url "$release_url" \
             --arg upload_url "$upload_url" \
+            --arg create_response "$create_response" \
+            --arg create_response_dir "$create_response_dir" \
             --argjson draft "$draft" \
             --argjson prerelease "$prerelease" \
             --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
@@ -8739,6 +8768,8 @@ EOF
                 release_id: $release_id,
                 release_url: $release_url,
                 upload_url: $upload_url,
+                create_response: (if $create_response == "" then null else $create_response end),
+                finalization_tmpdir: (if $create_response == "" then null else $create_response_dir end),
                 draft: $draft,
                 prerelease: $prerelease,
                 assets_uploaded: $uploaded,
@@ -8768,6 +8799,12 @@ EOF
         fi
         log_info "Release URL: $release_url"
         log_info "Duration: ${duration}s"
+        if $draft && [[ -n "$create_response" ]]; then
+            local finalize_command
+            printf -v finalize_command 'TMPDIR=%q dsr release finalize %q %q --create-response %q --no-dispatch' \
+                "$create_response_dir" "$tool_name" "$version" "$create_response"
+            log_info "Finalize: $finalize_command"
+        fi
 
         if [[ ${#missing_assets[@]} -gt 0 ]]; then
             log_warn "Missing from manifest: ${missing_assets[*]}"
@@ -9217,7 +9254,7 @@ EOF
                             log_warn "    Failed to download for verification"
                         fi
 
-                        ((verify_count++))
+                        verify_count=$((verify_count + 1))
                     fi
                 done
             else
@@ -11077,7 +11114,7 @@ EOF
             if [[ -z "$repo" && -z "$local_path" ]]; then
                 status="error"
                 messages+=("Missing both 'repo' and 'local_path' - need at least one")
-                ((errors++))
+                errors=$((errors + 1))
             fi
         fi
 
@@ -11089,14 +11126,14 @@ EOF
                 if [[ "$naming_only" != "true" ]]; then
                     status="error"
                     messages+=("Invalid local_path: $local_path")
-                    ((errors++))
+                    errors=$((errors + 1))
                 fi
             }
             if [[ -n "$resolved_path" && ! -d "$resolved_path" ]]; then
                 if [[ "$naming_only" != "true" ]]; then
                     status="warn"
                     messages+=("local_path does not exist: $resolved_path")
-                    ((warnings++))
+                    warnings=$((warnings + 1))
                 fi
             fi
         fi
@@ -11115,7 +11152,7 @@ EOF
                         status="warn"
                     fi
                     messages+=("Workflow file not found: $workflow")
-                    ((warnings++))
+                    warnings=$((warnings + 1))
                 fi
             fi
 
@@ -11129,11 +11166,11 @@ EOF
                     status="warn"
                 fi
                 messages+=("$gr_message")
-                ((warnings++))
+                warnings=$((warnings + 1))
             elif [[ "$gr_status" == "error" && -n "$gr_message" ]]; then
                 status="error"
                 messages+=("$gr_message")
-                ((errors++))
+                errors=$((errors + 1))
             fi
         fi
 
@@ -11154,13 +11191,13 @@ EOF
                 while IFS= read -r msg; do
                     [[ -n "$msg" ]] && messages+=("Naming: $msg")
                 done <<< "$naming_messages"
-                ((warnings++))
+                warnings=$((warnings + 1))
             elif [[ "$naming_status" == "error" ]]; then
                 status="error"
                 while IFS= read -r msg; do
                     [[ -n "$msg" ]] && messages+=("Naming: $msg")
                 done <<< "$naming_messages"
-                ((errors++))
+                errors=$((errors + 1))
             fi
             naming_info="$naming_json"
         fi
@@ -11176,7 +11213,7 @@ EOF
             if [[ $div_rc -ne 0 || -z "$div_json" ]]; then
                 status="error"
                 messages+=("Could not compare repos.yaml with repos.d/${name}.yaml (unparseable config)")
-                ((errors++))
+                errors=$((errors + 1))
             else
                 local div_repo_config div_tool_name div_mismatched div_registry_only
                 div_repo_config=$(jq -r '.repo_config' <<< "$div_json")
@@ -11188,22 +11225,22 @@ EOF
                         status="warn"
                     fi
                     messages+=("No repos.d/${name}.yaml — dsr build/release read only repos.d, so this tool is registry-only and cannot build")
-                    ((warnings++))
+                    warnings=$((warnings + 1))
                 else
                     if [[ -n "$div_tool_name" && "$div_tool_name" != "$name" ]]; then
                         status="error"
                         messages+=("repos.d/${name}.yaml declares tool_name '${div_tool_name}' — the build runner loads repos.d/<tool_name>.yaml by filename, so this file can never be loaded as '${div_tool_name}'; rename the file or fix tool_name")
-                        ((errors++))
+                        errors=$((errors + 1))
                     fi
                     if [[ -n "$div_mismatched" ]]; then
                         status="error"
                         messages+=("repos.yaml and repos.d/${name}.yaml disagree on: ${div_mismatched} (repos.d wins for builds; align the two files)")
-                        ((errors++))
+                        errors=$((errors + 1))
                     fi
                     if [[ -n "$div_registry_only" ]]; then
                         status="error"
                         messages+=("build keys set only in repos.yaml are ignored by the build runner: ${div_registry_only} (copy them into repos.d/${name}.yaml)")
-                        ((errors++))
+                        errors=$((errors + 1))
                     fi
                 fi
             fi
@@ -11215,7 +11252,7 @@ EOF
                 [[ -n "$windows_path_problem" ]] || continue
                 status="error"
                 messages+=("$windows_path_problem")
-                ((errors++))
+                errors=$((errors + 1))
             done < <(config_windows_host_path_problems "$name" 2>/dev/null)
         fi
 
@@ -11261,7 +11298,7 @@ EOF
                 fi
                 results+=("$(jq -nc --arg repo "$orphan_name" --arg message "$orphan_msg" \
                     '{repo: $repo, status: "error", message: $message, naming: {}}')")
-                ((errors++))
+                errors=$((errors + 1))
                 if ! $JSON_MODE; then
                     log_error "$orphan_name: $orphan_msg"
                 fi
@@ -11754,7 +11791,7 @@ EOF
            ! default_branch=$(jq -er '.default_branch | select(type == "string" and length > 0)' <<< "$repo_info" 2>/dev/null); then
             log_warn "$name: failed to fetch repo info"
             errors+=("$(jq -nc --arg repo "$name" '{code: "E003", message: "failed to fetch repository metadata", repo: $repo}')")
-            ((failed++))
+            failed=$((failed + 1))
             continue
         fi
 
@@ -11764,12 +11801,12 @@ EOF
                 yq -i '.tools[strenv(DSR_SYNC_NAME)].default_branch = strenv(DSR_SYNC_BRANCH)' "$DSR_REPOS_FILE"; then
             log_warn "$name: could not write $DSR_REPOS_FILE"
             errors+=("$(jq -nc --arg repo "$name" '{code: "E052", message: "registry write failed", repo: $repo}')")
-            ((failed++))
+            failed=$((failed + 1))
             continue
         else
             log_ok "$name: synced (default_branch: $default_branch)"
         fi
-        ((synced++))
+        synced=$((synced + 1))
 
     done < <(echo "$tools_json" | jq -r 'keys[]')
 
@@ -13315,7 +13352,7 @@ EOF
             path=$(install_gen_create "$tool") || status=$?
         fi
         if [[ $status -eq 0 ]]; then
-            ((ok++))
+            ok=$((ok + 1))
         else
             last_status=$status
             log_error "$subcmd failed for $tool (exit $status)"

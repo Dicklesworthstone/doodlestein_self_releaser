@@ -158,6 +158,31 @@ Path(value('--output')).write_bytes(data)
 (bin_dir/'gh').write_text('#!/bin/sh\n[ "$*" = "auth token --hostname github.com" ] || exit 99\nprintf owned_test_token\n')
 (bin_dir/'gh').chmod(0o755)
 
+trap_probe=r'''
+set -uo pipefail
+SCRIPT_DIR="$1"; DSR_VERSION=fixture; JSON_MODE=false; DRY_RUN=false
+log_error() { printf '%s\n' "$*" >&2; }
+source "$SCRIPT_DIR/src/release_verify.sh"
+trap 'printf "%s" "$(printf deferred-command)" >> "$DSR_TRAP_MARKER"' INT
+trap $'printf "%s" "apostrophe\047 and quotes" >> "$DSR_TRAP_MARKER"\n\n' TERM
+trap '' HUP
+before=$(trap -p INT TERM HUP)
+release_verify_cli --help > "$2/help-custom" || exit $?
+[[ "$(trap -p INT TERM HUP)" == "$before" && ! -e "$DSR_TRAP_MARKER" ]] || exit 97
+trap - INT TERM HUP
+before=$(trap -p INT TERM HUP)
+release_verify_cli --help > "$2/help-default" || exit $?
+[[ "$(trap -p INT TERM HUP)" == "$before" && ! -e "$DSR_TRAP_MARKER" ]] || exit 98
+'''
+probe=work/'signal-handlers';probe.mkdir()
+p=subprocess.run(['bash','-c',trap_probe,'fixture',str(runtime),str(probe)],
+                 env=dict(os.environ,DSR_TRAP_MARKER=str(probe/'unexpected-handler')),
+                 capture_output=True,timeout=20)
+(probe/'stdout').write_bytes(p.stdout);(probe/'stderr').write_bytes(p.stderr)
+check('real verifier wrapper preserves custom, ignored and default traps without evaluating bodies',p.returncode==0)
+check('real verifier help retains the public USAGE contract',
+      (probe/'help-custom').read_text().startswith('USAGE: dsr release verify'))
+
 def fixture(label, mode=None, count=5):
     global sequence
     sequence+=1

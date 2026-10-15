@@ -213,13 +213,28 @@ The `details` field contains command-specific data:
     "version": "v1.2.3",
     "tag": "v1.2.3",
     "release_url": "https://github.com/owner/ntm/releases/tag/v1.2.3",
-    "assets_uploaded": 6,
-    "checksums_published": true,
-    "signature_published": true,
-    "sbom_published": true
+    "draft": true,
+    "create_response": "/private/scratch/dsr-create-custody.ABCDEF12/dsr-api-response.GHIJKLMN",
+    "finalization_tmpdir": "/private/scratch/dsr-create-custody.ABCDEF12",
+    "assets_uploaded": [
+      {
+        "name": "ntm-linux-amd64.tar.gz",
+        "size_bytes": 12345,
+        "content_type": "application/gzip",
+        "status": "uploaded",
+        "download_url": "https://github.com/owner/ntm/releases/download/v1.2.3/ntm-linux-amd64.tar.gz"
+      }
+    ]
   }
 }
 ```
+
+Strict draft creation preserves the original successful POST response. Pass
+`details.create_response` to `dsr release finalize` and set `TMPDIR` to
+`details.finalization_tmpdir`. Both fields are null when this invocation has no
+original creation custody; a later GET cannot replace that response. Asset
+download URLs use the release tag and percent-encoded filenames; draft assets
+remain subject to GitHub's draft access rules until publication.
 
 #### `dsr fallback` details
 Success:

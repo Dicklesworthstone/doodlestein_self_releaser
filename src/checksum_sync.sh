@@ -503,13 +503,13 @@ _cs_update_repo_checksums() (
         cmp -s "$stage/manifest" "$publish_stage/manifest" || return 1
         chmod 644 "$publish_stage/manifest" || return 1
         _cs_update_gate before-write || return $?
-        update_phase=write
+        update_phase='write'
         mv -f -- "$publish_stage/manifest" "$full_path" || return 1
         changed=true
     fi
     if $commit && $changed; then
         _cs_update_gate before-commit || return $?
-        update_phase=commit-preflight
+        update_phase='commit-preflight'
         [[ "$(_cs_git -C "$repo_path" rev-parse --verify HEAD)" == "$previous_head" &&
            "$(_cs_git -C "$repo_path" symbolic-ref -q HEAD)" == "$branch" ]] || return 2
         update_phase=stage
@@ -528,7 +528,7 @@ _cs_update_repo_checksums() (
         # HEAD before Git returns. Exit zero alone does not identify our commit.
         # Admit only the exact parent, branch and single literal changed path;
         # preserve unexpected local history rather than pushing or resetting it.
-        update_phase=commit-scope
+        update_phase='commit-scope'
         commit_candidate=$(_cs_git -C "$repo_path" rev-parse --verify HEAD) || return 1
         commit_parents=$(_cs_git -C "$repo_path" rev-list --parents -n 1 "$commit_candidate") || return 1
         if [[ "$commit_parents" != "$commit_candidate $previous_head" ||
@@ -557,7 +557,7 @@ _cs_update_repo_checksums() (
     fi
     if $push; then
         _cs_update_gate before-push || return $?
-        update_phase=push-preflight
+        update_phase='push-preflight'
         [[ "$(_cs_git -C "$repo_path" rev-parse --verify HEAD)" == "$head" &&
            "$(_cs_git -C "$repo_path" symbolic-ref -q HEAD)" == "$branch" ]] || return 2
         # Pin the source commit even if an unrelated local writer moves HEAD

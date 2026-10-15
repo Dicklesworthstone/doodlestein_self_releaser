@@ -64,44 +64,22 @@ assert_equals() {
   return 0
 }
 
-assert_true() {
-  local condition="$1"
-  local msg="${2:-expected true}"
-
-  if ! eval "$condition"; then
-    echo "  FAIL: $msg"
-    return 1
-  fi
-  return 0
-}
-
-assert_false() {
-  local condition="$1"
-  local msg="${2:-expected false}"
-
-  if eval "$condition"; then
-    echo "  FAIL: $msg"
-    return 1
-  fi
-  return 0
-}
-
 run_test() {
   local test_name="$1"
   local test_func="$2"
   shift 2
 
-  ((TESTS_RUN++))
+  TESTS_RUN=$((TESTS_RUN + 1))
   echo -n "  $test_name... "
 
   setup
 
   if "$test_func" "$@" 2>/dev/null; then
     echo "OK"
-    ((TESTS_PASSED++))
+    TESTS_PASSED=$((TESTS_PASSED + 1))
   else
     echo "FAILED"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
   fi
 
   teardown
@@ -111,8 +89,8 @@ skip_test() {
   local test_name="$1"
   local reason="$2"
 
-  ((TESTS_RUN++))
-  ((TESTS_SKIPPED++))
+  TESTS_RUN=$((TESTS_RUN + 1))
+  TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
   echo "  $test_name... SKIP ($reason)"
 }
 
@@ -314,6 +292,75 @@ test_api_rejects_empty_endpoint() {
 test_api_rejects_unknown_option() {
   ! gh_api "test" --invalid-option 2>/dev/null
 }
+
+test_api_retains_original_draft_response() (
+  local private="$TEMP_DIR/private" result
+  local wire_response=$'{\n  "id": 9, "tag_name": "v1.2.3", "name": "v1.2.3",\n  "body": "owned", "draft": true, "prerelease": false, "assets": []\n}\n\n'
+  mkdir -m 700 "$private" || return 1
+  export TMPDIR="$private"
+  gh_check() { return 0; }
+  _gh_api_with_gh() {
+    printf '%s' "$wire_response"
+  }
+  result=$(gh_create_release owner/app v1.2.3 --body owned --draft --retain-response) || return 1
+  local -a receipts=("$private"/dsr-api-response.????????)
+  [[ ${#receipts[@]} -eq 1 && -f "${receipts[0]}" ]] || return 1
+  [[ "$(cat "${receipts[0]}")" == "$result" ]] || return 1
+  python3 - "${receipts[0]}" "$wire_response" <<'PY'
+import os
+import stat
+import sys
+value = os.lstat(sys.argv[1])
+assert stat.S_ISREG(value.st_mode) and stat.S_IMODE(value.st_mode) == 0o600
+assert value.st_uid == os.geteuid() and value.st_nlink == 1
+with open(sys.argv[1], "rb") as response:
+    assert response.read() == sys.argv[2].encode()
+PY
+)
+
+test_api_retention_rejects_unsafe_directories_and_operations() (
+  local private="$TEMP_DIR/private" linked="$TEMP_DIR/linked" shared="$TEMP_DIR/shared"
+  local data='{"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false}'
+  mkdir -m 700 "$private" "$shared" || return 1
+  chmod 775 "$shared" || return 1
+  ln -s "$private" "$linked" || return 1
+  gh_check() { return 0; }
+  _gh_api_with_gh() { printf 'unexpected transport\n' >> "$TEMP_DIR/transport"; return 99; }
+  local directory
+  for directory in "$linked" "$shared"; do
+    if TMPDIR="$directory" gh_api repos/owner/app/releases --post "$data" --retain-response; then return 1; fi
+  done
+  if TMPDIR="$private" gh_api repos/owner/app/releases --retain-response; then return 1; fi
+  if TMPDIR="$private" gh_api repos/owner/app/issues --post "$data" --retain-response; then return 1; fi
+  if TMPDIR="$private" gh_create_release owner/app v1.2.3 --retain-response; then return 1; fi
+  [[ ! -e "$TEMP_DIR/transport" ]]
+)
+
+test_api_retention_rejects_malformed_or_unrelated_responses() (
+  local data='{"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false}'
+  local response index=0 private
+  gh_check() { return 0; }
+  _gh_api_with_gh() { printf '%s\n' "$response"; }
+  for response in 'not JSON' '[]' \
+      '{"id":9,"tag_name":"wrong","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[]}' \
+      '{"id":9,"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[{}]}'; do
+    index=$((index + 1))
+    private="$TEMP_DIR/private-$index"
+    mkdir -m 700 "$private" || return 1
+    if TMPDIR="$private" gh_api repos/owner/app/releases --post "$data" --retain-response; then return 1; fi
+    local -a receipts=("$private"/dsr-api-response.????????)
+    [[ ! -e "${receipts[0]}" ]] || return 1
+  done
+  # Even valid-looking bytes do not establish custody after a failed POST.
+  private="$TEMP_DIR/failed-post"
+  mkdir -m 700 "$private" || return 1
+  response='{"id":9,"tag_name":"v1.2.3","name":"v1.2.3","body":"owned","draft":true,"prerelease":false,"assets":[]}'
+  _gh_api_with_gh() { printf '%s\n' "$response"; return 22; }
+  local status=0
+  TMPDIR="$private" gh_api repos/owner/app/releases --post "$data" --retain-response >/dev/null || status=$?
+  local -a receipts=("$private"/dsr-api-response.????????)
+  [[ $status -eq 22 && ! -e "${receipts[0]}" ]]
+)
 
 test_api_no_cache_omits_stale_etag_on_curl_fallback() {
   local endpoint="repos/owner/repo/releases/123"
@@ -761,7 +808,8 @@ test_release_upload_scenario() (
   size=$(wc -c < "$expected"); size="${size//[[:space:]]/}"
   printf '0\n' > "$posts"; printf '0\n' > "$downloads"; : > "$calls"
   printf '[]\n' > "$remote"
-  local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_UPLOAD_TIMEOUT=15 GH_MAX_RETRY_WAIT=300
+  local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=3 GH_RETRY_DELAY=0
+  local -x GH_UPLOAD_TIMEOUT=15 GH_MAX_RETRY_WAIT=300
   unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
   unset -f secrets_get_gh_token artifact_naming_generate_dual_for_tool 2>/dev/null || true
   sleep() { printf 'SLEEP %s\n' "$1" >> "$calls"; }
@@ -1039,8 +1087,9 @@ run_immutable_tag_ruleset_scenario() {
   export IMMUTABLE_RULESET_SCENARIO IMMUTABLE_RULESET_CALL_LOG
   export IMMUTABLE_RULESET_GET_COUNT_FILE
 
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+  IMMUTABLE_RULESET_OUTPUT=""
+  IMMUTABLE_RULESET_STATUS=0
+  IMMUTABLE_RULESET_OUTPUT=$(
   gh_api() {
     local endpoint="${1:-}" live_json history_state get_count=0
     printf '%s\n' "$*" >> "$IMMUTABLE_RULESET_CALL_LOG"
@@ -1132,11 +1181,8 @@ run_immutable_tag_ruleset_scenario() {
     esac
   }
 
-  IMMUTABLE_RULESET_OUTPUT=""
-  IMMUTABLE_RULESET_STATUS=0
-  IMMUTABLE_RULESET_OUTPUT=$(gh_get_immutable_tag_ruleset_receipt \
-    owner/repo 99 42 v1.2.3 2>/dev/null) || IMMUTABLE_RULESET_STATUS=$?
-  eval "$gh_api_def"
+  gh_get_immutable_tag_ruleset_receipt owner/repo 99 42 v1.2.3 2>/dev/null
+  ) || IMMUTABLE_RULESET_STATUS=$?
 }
 
 test_immutable_tag_ruleset_receipt_binds_live_history() {
@@ -1181,21 +1227,18 @@ test_immutable_tag_ruleset_receipt_rejects_uncovered_tag() {
   [[ $status -eq 4 ]]
 }
 
-test_immutable_tag_ruleset_receipt_rejects_identity_mismatch() {
+test_immutable_tag_ruleset_receipt_rejects_identity_mismatch() (
   run_immutable_tag_ruleset_scenario valid
   [[ $IMMUTABLE_RULESET_STATUS -eq 0 ]] || return 1
 
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
   gh_api() {
     printf '{"id":100,"node_id":"R_other","full_name":"owner/repo"}\n'
   }
   local status=0
   gh_get_immutable_tag_ruleset_receipt owner/repo 99 42 v1.2.3 \
     >/dev/null 2>&1 || status=$?
-  eval "$gh_api_def"
   [[ $status -ne 0 ]]
-}
+)
 
 # ============================================================================
 # Tests: Dispatch Helpers
@@ -1206,9 +1249,7 @@ test_resolve_tag_sha_rejects_missing_args() {
   ! gh_resolve_tag_sha "owner/repo" "" 2>/dev/null
 }
 
-test_resolve_tag_sha_commit() {
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+test_resolve_tag_sha_commit() (
 
   gh_api() {
     if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.3" ]]; then
@@ -1223,14 +1264,10 @@ test_resolve_tag_sha_commit() {
   sha=$(gh_resolve_tag_sha "owner/repo" "v1.2.3")
   status=$?
 
-  eval "$gh_api_def"
-
   [[ $status -eq 0 && "$sha" == "0123456789abcdef0123456789abcdef01234567" ]]
-}
+)
 
-test_resolve_tag_sha_annotated() {
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+test_resolve_tag_sha_annotated() (
 
   gh_api() {
     if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.4" ]]; then
@@ -1249,14 +1286,10 @@ test_resolve_tag_sha_annotated() {
   sha=$(gh_resolve_tag_sha "owner/repo" "v1.2.4")
   status=$?
 
-  eval "$gh_api_def"
-
   [[ $status -eq 0 && "$sha" == "2222222222222222222222222222222222222222" ]]
-}
+)
 
-test_resolve_tag_sha_nested_annotated() {
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+test_resolve_tag_sha_nested_annotated() (
 
   gh_api() {
     case "$1" in
@@ -1277,14 +1310,10 @@ test_resolve_tag_sha_nested_annotated() {
   sha=$(gh_resolve_tag_sha "owner/repo" "v1.2.5")
   status=$?
 
-  eval "$gh_api_def"
-
   [[ $status -eq 0 && "$sha" == "3333333333333333333333333333333333333333" ]]
-}
+)
 
-test_resolve_tag_sha_rejects_short_sha() {
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+test_resolve_tag_sha_rejects_short_sha() (
 
   gh_api() {
     echo '{"object":{"sha":"abc123","type":"commit"}}'
@@ -1293,13 +1322,10 @@ test_resolve_tag_sha_rejects_short_sha() {
   ! gh_resolve_tag_sha "owner/repo" "v1.2.6" >/dev/null
   local status=$?
 
-  eval "$gh_api_def"
   [[ $status -eq 0 ]]
-}
+)
 
-test_resolve_tag_sha_rejects_non_commit_target() {
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+test_resolve_tag_sha_rejects_non_commit_target() (
 
   gh_api() {
     if [[ "$1" == "repos/owner/repo/git/ref/tags/v1.2.7" ]]; then
@@ -1312,18 +1338,15 @@ test_resolve_tag_sha_rejects_non_commit_target() {
   ! gh_resolve_tag_sha "owner/repo" "v1.2.7" >/dev/null
   local status=$?
 
-  eval "$gh_api_def"
   [[ $status -eq 0 ]]
-}
+)
 
 test_dispatch_rejects_missing_args() {
   ! gh_repository_dispatch "" "event" 2>/dev/null
   ! gh_repository_dispatch "owner/repo" "" 2>/dev/null
 }
 
-test_dispatch_accepts_valid_payload() {
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+test_dispatch_accepts_valid_payload() (
 
   gh_api() {
     # Stub success for dispatch
@@ -1334,14 +1357,10 @@ test_dispatch_accepts_valid_payload() {
   result=$(gh_repository_dispatch "owner/repo" "dsr_release" '{"tool":"ntm"}' 2>/dev/null)
   status=$?
 
-  eval "$gh_api_def"
-
   [[ $status -eq 0 ]]
-}
+)
 
-test_dispatch_fails_on_error_response() {
-  local gh_api_def
-  gh_api_def=$(declare -f gh_api)
+test_dispatch_fails_on_error_response() (
 
   gh_api() {
     echo '{"message":"Not Found"}'
@@ -1351,10 +1370,8 @@ test_dispatch_fails_on_error_response() {
   local status=0
   gh_repository_dispatch "owner/repo" "dsr_release" '{"tool":"ntm"}' 2>/dev/null || status=$?
 
-  eval "$gh_api_def"
-
   [[ $status -ne 0 ]]
-}
+)
 
 # ============================================================================
 # Main Test Runner
@@ -1407,6 +1424,9 @@ main() {
   echo "API Argument Parsing:"
   run_test "api_rejects_empty_endpoint" test_api_rejects_empty_endpoint
   run_test "api_rejects_unknown_option" test_api_rejects_unknown_option
+  run_test "api_retains_original_draft_response" test_api_retains_original_draft_response
+  run_test "api_retention_rejects_unsafe_directories_and_operations" test_api_retention_rejects_unsafe_directories_and_operations
+  run_test "api_retention_rejects_malformed_or_unrelated_responses" test_api_retention_rejects_malformed_or_unrelated_responses
   run_test "api_no_cache_omits_stale_etag_on_curl_fallback" test_api_no_cache_omits_stale_etag_on_curl_fallback
   run_test "api_no_cache_sends_headers_on_gh_cli" test_api_no_cache_sends_headers_on_gh_cli
   run_test "api_rejects_missing_option_values" test_api_rejects_missing_option_values

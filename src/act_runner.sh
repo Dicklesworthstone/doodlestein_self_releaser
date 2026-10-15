@@ -807,7 +807,7 @@ _act_validate_workspace_archive_collection_receipts() {
         [[ "$target" == windows/* ]] && expected_member="${binary%.exe}.exe"
         [[ -z "${receipt_expected_members[$expected_member]:-}" ]] || return 4
         receipt_expected_members["$expected_member"]=1
-        ((expected_count++))
+        expected_count=$((expected_count + 1))
     done <<< "$configured"
     [[ $expected_count -gt 0 && $# -eq $expected_count ]] || return 4
 
@@ -2418,10 +2418,10 @@ act_collect_artifacts() {
         basename=$(basename "$artifact")
         if cp "$artifact" "$output_dir/$basename"; then
             _log_info "Collected: $basename"
-            ((count++))
+            count=$((count + 1))
         else
             _log_error "Failed to copy artifact: $artifact"
-            ((failed++))
+            failed=$((failed + 1))
         fi
     done < <(find "$artifact_dir" -type f -print0)
 
@@ -5361,6 +5361,13 @@ _act_sync_strict_checkout() {
                 _log_error "Strict release snapshot parent already exists for $label"
                 return 4
             fi
+            # This fresh run directory also holds private Cargo caches. SBH
+            # honors ancestor markers even in emergency cleanup; protect it
+            # before extracting source or populating any compiler inputs.
+            if ! (umask 077; set -C; printf '%s\n' 'DSR strict release snapshot' > "$snapshot_parent/.sbh-protect"); then
+                _log_error "Unable to protect strict release snapshot for $label"
+                return 4
+            fi
         elif [[ ! -d "$snapshot_parent" || -L "$snapshot_parent" ]]; then
             _log_error "Strict release snapshot parent is unavailable for $label"
             return 4
@@ -5419,7 +5426,7 @@ _act_sync_strict_checkout() {
     else
         local remote_cmd parent_setup
         if $creates_snapshot_parent; then
-            parent_setup="mkdir -p '$snapshot_grandparent'; $(_act_ram_backed_guard_sh "$snapshot_grandparent")test ! -e '$snapshot_parent'; test ! -L '$snapshot_parent'; mkdir '$snapshot_parent'"
+            parent_setup="mkdir -p '$snapshot_grandparent'; $(_act_ram_backed_guard_sh "$snapshot_grandparent")test ! -e '$snapshot_parent'; test ! -L '$snapshot_parent'; mkdir '$snapshot_parent'; printf '%s\\n' 'DSR strict release snapshot' > '$snapshot_parent/.sbh-protect'"
         else
             parent_setup="test -d '$snapshot_parent'; test ! -L '$snapshot_parent'"
         fi
