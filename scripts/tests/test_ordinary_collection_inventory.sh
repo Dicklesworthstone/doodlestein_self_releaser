@@ -10,7 +10,7 @@ source "$ROOT/src/act_runner.sh"
 # Load the actual nested collector and publisher naming functions without
 # invoking CLI startup, authentication, compilers or any network mutation.
 source <(awk '
-    /^    (_build_target_suffix_name|_build_collect_artifact_file|_release_artifact_candidate_names)\(\)/ {copy=1}
+    /^    (_build_target_suffix_name|_build_collect_artifact_file|_build_verify_collected_manifest_coverage|_release_artifact_candidate_names)\(\)/ {copy=1}
     copy {print}
     copy && /^    }/ {copy=0}
 ' "$ROOT/dsr")
@@ -70,6 +70,17 @@ result=$(jq -nc --argjson targets "$targets" '{tool:"sbh",version:"1.2.3",
 manifest="$WORK/manifest.json"
 act_generate_manifest "$result" "$manifest" "$renames" || exit 1
 _act_verify_collected_manifest "$manifest" "$output_dir" || exit 1
+_build_verify_collected_manifest_coverage "$manifest" || exit 1
+omitted_manifest="$WORK/omitted-collected.json"
+jq 'del(.artifacts[] | select(.name == "sbh_linux_arm64"))' "$manifest" > "$omitted_manifest" || exit 1
+# Row-only verification cannot notice an omitted collected payload; the
+# independent collection-coverage gate must reject it before sealing.
+_act_verify_collected_manifest "$omitted_manifest" "$output_dir" || exit 1
+if _build_verify_collected_manifest_coverage "$omitted_manifest"; then
+    echo 'FAIL: collected payload omitted from manifest was accepted' >&2
+    exit 1
+fi
+echo 'PASS: final sealing refuses a collected payload omitted from the manifest'
 jq -e '.artifacts | length == 12 and
     ([.[]|select(.archive_format=="none")]|length==8) and
     ([.[].target]|unique|length==4)' "$manifest" >/dev/null || exit 1

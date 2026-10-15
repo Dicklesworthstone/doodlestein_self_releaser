@@ -3273,6 +3273,29 @@ EOF
         done
     }
 
+    # Final manifest validation must prove both directions: every manifest row
+    # has matching bytes, and every payload actually collected from successful
+    # workers is represented by a manifest row. Without this second check a
+    # collector/manifest naming bug can silently drop one target while the
+    # remaining manifest still verifies perfectly.
+    _build_verify_collected_manifest_coverage() {
+        local manifest="$1" name
+        [[ -f "$manifest" && ! -L "$manifest" ]] || return 4
+        for name in "${!collected_names[@]}"; do
+            case "$name" in
+                *.minisig|*.sig|*.sha256|*.sha512|SHA256SUMS*|*.sbom.*|*.intoto.jsonl)
+                    continue
+                    ;;
+            esac
+            if ! jq -e --arg name "$name" 'any(.artifacts[]?; .name == $name)' \
+                    "$manifest" >/dev/null 2>&1; then
+                log_error "Collected artifact is absent from final manifest: $name"
+                return 4
+            fi
+        done
+        return 0
+    }
+
     local -a extra_manifest_entries=()
     local -A existing_archive_formats=()
 
@@ -4459,6 +4482,9 @@ EOF
     # inventory after those replacements, before granting publication authority.
     if [[ -f "$manifest_file" ]] && ! $manifest_failed; then
         _act_verify_collected_manifest "$manifest_file" "$output_dir" || manifest_failed=true
+        if ! $manifest_failed; then
+            _build_verify_collected_manifest_coverage "$manifest_file" || manifest_failed=true
+        fi
     fi
 
     # Resolve the final command status before emitting either JSON or human
