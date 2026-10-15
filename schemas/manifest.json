@@ -481,7 +481,23 @@
             "type": "object", "required": ["path", "sha256", "size_bytes", "executable"], "additionalProperties": false,
             "properties": {
               "path": {"$ref": "#/$defs/xwin_relative_path"}, "sha256": {"$ref": "#/$defs/sha256"},
-              "size_bytes": {"type": "integer", "minimum": 0}, "executable": {"type": "boolean"}
+              "size_bytes": {"type": "integer", "minimum": 0}, "executable": {"type": "boolean"},
+              "symlink": {
+                "type": "object",
+                "description": "Committed relative file link materialized as regular bytes. resolved_path is relative to this file's own repository, including in a source set. Runtime verification authenticates both Git blobs and the resolution chain.",
+                "required": ["target", "git_blob", "resolved_path", "resolved_git_blob"],
+                "additionalProperties": false,
+                "properties": {
+                  "target": {
+                    "type": "string", "minLength": 1, "maxLength": 4096,
+                    "pattern": "^(?!/)[^\\\\:\\u0000-\\u001f\\u007f]+$",
+                    "not": {"pattern": "//|/$|[\\u0000-\\u001f\\u007f]"}
+                  },
+                  "git_blob": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"},
+                  "resolved_path": {"$ref": "#/$defs/xwin_relative_path"},
+                  "resolved_git_blob": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"}
+                }
+              }
             }
           }
         }
@@ -494,7 +510,7 @@
       "additionalProperties": false,
       "properties": {
         "path": {"type": "string", "pattern": "^(?:/|[A-Za-z]:/)"},
-        "sha256": {"$ref": "#/$defs/sha256"}
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
     },
     "toolchain_sysroot_resolver": {

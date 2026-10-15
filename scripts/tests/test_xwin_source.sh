@@ -290,20 +290,20 @@ mkdir "$SET/unplanned"
 reject 'even an empty unplanned sibling root is refused' 7 xwin_source_verify "$SET" "$SET_RECEIPT"
 mv "$SET/unplanned" "$WORK/unplanned-empty"
 assert 'restored complete source set revalidates' xwin_source_verify "$SET" "$SET_RECEIPT"
-ln -s src/lib.rs "$WORK/helper/link"
+ln -s ../outside.rs "$WORK/helper/link"
 git -C "$WORK/helper" add link && git -C "$WORK/helper" commit -qm unsafe || exit 1
 UNSAFE_SHA=$(git -C "$WORK/helper" rev-parse HEAD)
 jq --arg sha "$UNSAFE_SHA" 'map(if .relative_path=="helper" then .revision=$sha else . end)' "$WORK/siblings.json" > "$WORK/linked-siblings.json"
-reject 'committed sibling symlinks are refused before staging' 4 xwin_source_snapshot_set "$PROJECT" "$SHA" v1.2.3 owner/demo \
+reject 'escaping committed sibling symlinks are refused before staging' 4 xwin_source_snapshot_set "$PROJECT" "$SHA" v1.2.3 owner/demo \
     "$WORK/unsafe-sibling-set" "$WORK/unsafe-sibling-set.json" "$WORK/linked-siblings.json"
 assert 'unsafe sibling prevents creating the entire source set' test ! -e "$WORK/unsafe-sibling-set"
 
 # The input Git tree itself must not contain an unbound symlink/submodule.
-ln -s src/main.rs "$PROJECT/linked-source"
+ln -s ../outside.rs "$PROJECT/linked-source"
 git -C "$PROJECT" add linked-source && git -C "$PROJECT" commit -qm linked || exit 1
 LINK_SHA=$(git -C "$PROJECT" rev-parse HEAD)
 git -C "$PROJECT" tag v1.2.4
-reject 'committed symlinks are rejected before source creation' 4 xwin_source_snapshot "$PROJECT" "$LINK_SHA" v1.2.4 owner/demo "$WORK/linked" "$WORK/linked.json"
+reject 'escaping committed symlinks are rejected before source creation' 4 xwin_source_snapshot "$PROJECT" "$LINK_SHA" v1.2.4 owner/demo "$WORK/linked" "$WORK/linked.json"
 assert 'unsafe Git tree left no release snapshot' test ! -e "$WORK/linked"
 printf '\nWindows ARM64 source admission: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

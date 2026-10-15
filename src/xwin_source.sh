@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Committed-source admission for manifest-backed Windows ARM64 builds.
+# Committed-source admission for manifest-backed Windows x64/ARM64 builds.
 # No checkout mutation, archive export filters, network access, or tag writes.
 
 xwin_source_snapshot() {
@@ -25,7 +25,9 @@ xwin_source_verify() {
 
 _xws_source() {
     python3 - "$@" <<'PY'
+from contextlib import contextmanager
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -49,7 +51,7 @@ def safe_name(name):
     require(isinstance(name, str) and name and not any(ord(c) < 32 or ord(c) == 127 for c in name), "unsafe source path")
     require(not any(c in name for c in "\\:") and all(p not in ("", ".", "..") and p.lower() != ".git" and not p.startswith("-") for p in name.split("/")), "unsafe source path: " + name)
 
-def inventory(root):
+def inventory(root, git_blobs=None):
     require(root.is_dir() and not root.is_symlink(), "missing or linked source snapshot")
     files = []
     for directory, dirs, names in os.walk(root, followlinks=False):
@@ -66,13 +68,18 @@ def inventory(root):
                 before = os.fstat(stream.fileno())
                 require(stat.S_ISREG(before.st_mode), "special source file: " + relative)
                 digest = hashlib.sha256()
+                blob = hashlib.sha1(("blob " + str(before.st_size) + "\0").encode()) if git_blobs is not None else None
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(block)
+                    if blob is not None:
+                        blob.update(block)
                 after = os.fstat(stream.fileno())
                 require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_size, after.st_mtime_ns, after.st_ctime_ns), "source changed while reading")
                 bits = before.st_mode & 0o111
                 require(bits in (0, 0o111), "noncanonical source executable mode")
                 files.append({"path": relative, "sha256": digest.hexdigest(), "size_bytes": before.st_size, "executable": bool(bits)})
+                if blob is not None:
+                    git_blobs[relative] = blob.hexdigest()
     return sorted(files, key=lambda item: item["path"])
 
 def read_json(path):
@@ -104,6 +111,115 @@ def digest_files(files):
 def sibling_name(name):
     require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name)
             and ".." not in name and name.lower() != "project", "invalid or reserved sibling name")
+
+@contextmanager
+def blob_reader(selection):
+    process = subprocess.Popen(selection["command"] + ["cat-file", "--batch"], env=selection["environment"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        yield process
+        process.stdin.close()
+        require(process.wait() == 0, "Git source reader failed")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait()
+        process.stdin.close()
+        process.stdout.close()
+
+def copy_blob(process, oid, output, limit=1024 ** 3):
+    process.stdin.write((oid + "\n").encode("ascii"))
+    process.stdin.flush()
+    header = process.stdout.readline(256).decode("ascii").split()
+    require(len(header) == 3 and header[:2] == [oid, "blob"] and header[2].isdigit(), "invalid Git blob response")
+    remaining = int(header[2])
+    require(remaining <= limit, "source blob exceeds size limit: " + oid)
+    digest = hashlib.sha1(("blob " + str(remaining) + "\0").encode())
+    while remaining:
+        block = process.stdout.read(min(remaining, 1024 * 1024))
+        require(block, "truncated Git blob")
+        output.write(block)
+        digest.update(block)
+        remaining -= len(block)
+    require(process.stdout.read(1) == b"\n" and digest.hexdigest() == oid, "Git source object hash mismatch")
+
+def resolve_links(paths, targets):
+    # Resolve against the selected Git namespace, never Path.resolve() on a
+    # checkout. Directory links are deliberately unsupported: each accepted
+    # link becomes exactly one regular file, not an expanded subtree.
+    directories = {name.rsplit("/", 1)[0] for name in paths if "/" in name}
+    for name in list(directories):
+        while "/" in name:
+            name = name.rsplit("/", 1)[0]
+            directories.add(name)
+    resolved = {}
+    for origin in sorted(targets):
+        current, seen = origin, set()
+        while current in targets:
+            require(current not in seen and len(seen) < 40, "cyclic or excessive source symlink chain: " + origin)
+            seen.add(current)
+            target = targets[current]
+            require(isinstance(target, str) and 0 < len(target.encode("utf-8")) <= 4096
+                    and not target.startswith("/") and not any(c in target for c in "\\:")
+                    and not any(ord(c) < 32 or ord(c) == 127 for c in target), "unsafe source symlink target: " + current)
+            parts = current.split("/")[:-1]
+            components = target.split("/")
+            for index, component in enumerate(components):
+                require(component != "", "empty source symlink path component: " + current)
+                if component == "..":
+                    require(parts, "source symlink escapes its repository: " + current)
+                    parts.pop()
+                elif component != ".":
+                    safe_name(component)
+                    parts.append(component)
+                candidate = "/".join(parts)
+                if index < len(components) - 1:
+                    require(candidate == "" or candidate in directories, "source symlink traverses a non-directory: " + current)
+            current = "/".join(parts)
+            require(current in paths, "source symlink does not resolve to a committed file: " + origin)
+        resolved[origin] = current
+    return resolved
+
+def source_links(selection):
+    entries = {name: (mode, oid) for name, mode, oid in selection["entries"]}
+    links = {}
+    if any(mode == "120000" for mode, oid in entries.values()):
+        with blob_reader(selection) as process:
+            for name, (mode, oid) in entries.items():
+                if mode == "120000":
+                    output = io.BytesIO()
+                    copy_blob(process, oid, output, limit=4096)
+                    links[name] = {"target": output.getvalue().decode("utf-8"), "git_blob": oid}
+    resolved = resolve_links(entries, {name: link["target"] for name, link in links.items()})
+    for name, target in resolved.items():
+        links[name].update(resolved_path=target, resolved_git_blob=entries[target][1])
+    return links
+
+def verify_links(files, expected, git_blobs):
+    # Keep the existing file-inventory digest contract. Transformation facts
+    # live on the corresponding file row and therefore enter both the whole
+    # snapshot digest and each repository's independent digest in a source set.
+    require(isinstance(expected, list), "invalid source file evidence")
+    require(files == [{key: value for key, value in entry.items() if key != "symlink"}
+                      for entry in expected], "source snapshot changed during the build")
+    by_path = {entry["path"]: entry for entry in files}
+    links = {}
+    for entry in expected:
+        if "symlink" not in entry:
+            continue
+        name, link = entry["path"], entry["symlink"]
+        require(isinstance(link, dict) and set(link) == {"target", "git_blob", "resolved_path", "resolved_git_blob"}, "invalid source symlink evidence: " + name)
+        safe_name(link["resolved_path"])
+        require(isinstance(link["target"], str), "invalid source symlink target: " + name)
+        raw = link["target"].encode("utf-8")
+        require(hashlib.sha1(("blob " + str(len(raw)) + "\0").encode() + raw).hexdigest() == link["git_blob"], "source symlink object mismatch: " + name)
+        links[name] = link
+    resolved = resolve_links(by_path, {name: link["target"] for name, link in links.items()})
+    for name, target in resolved.items():
+        link = links[name]
+        require(target == link["resolved_path"] and git_blobs[target] == link["resolved_git_blob"], "source symlink resolution changed: " + name)
+        require(all(by_path[name][key] == by_path[target][key] for key in ("sha256", "size_bytes", "executable")), "materialized source symlink differs from its target: " + name)
+        by_path[name]["symlink"] = link
+    return files
 
 def inspect_project(project, commit, tag, repo):
     require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40, "expected an explicit SHA-1 source commit")
@@ -139,58 +255,49 @@ def inspect_project(project, commit, tag, repo):
         file_mode, kind, oid = header.decode("ascii").split(" ")
         name = raw_name.decode("utf-8")
         safe_name(name)
-        require(kind == "blob" and file_mode in ("100644", "100755"), "release snapshot refuses links and submodules: " + name)
+        require(kind == "blob" and file_mode in ("100644", "100755", "120000"), "release snapshot refuses unsupported entries and submodules: " + name)
         require(re.fullmatch(r"[0-9a-f]{40}", oid), "invalid Git object identity")
         entries.append((name, file_mode, oid))
     require(entries and len(entries) <= 100000, "empty or oversized source tree")
     required = {"Cargo.toml", "Cargo.lock"} if tag is not None else {"Cargo.toml"}
     require(required.issubset({item[0] for item in entries}), "required Cargo manifests/lockfile must be committed")
-    return {"project": str(project), "command": command, "environment": environment, "entries": entries,
+    selection = {"project": str(project), "command": command, "environment": environment, "entries": entries,
             "identity": {"repository": "https://github.com/" + repo, "git_sha": commit,
                          "git_ref": "refs/tags/" + tag if tag is not None else commit,
                          "git_tree": tree, "source_date_epoch": int(epoch)}}
+    # Admit every link before creating any destination, including all siblings.
+    selection["links"] = source_links(selection)
+    return selection
 
 def write_snapshot(selection, root):
     root.mkdir(mode=0o700)
     # Read raw Git objects, not a working tree or git archive: attributes such
     # as export-ignore/export-subst must not silently change release inputs.
-    process = subprocess.Popen(selection["command"] + ["cat-file", "--batch"], env=selection["environment"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try:
+    entries = {name: (mode, oid) for name, mode, oid in selection["entries"]}
+    with blob_reader(selection) as process:
         for name, file_mode, oid in selection["entries"]:
-            process.stdin.write((oid + "\n").encode("ascii"))
-            process.stdin.flush()
-            object_header = process.stdout.readline().decode("ascii").split()
-            require(len(object_header) == 3 and object_header[:2] == [oid, "blob"] and object_header[2].isdigit(), "invalid Git blob response")
-            remaining = int(object_header[2])
-            require(remaining <= 1024 ** 3, "source blob exceeds 1 GiB")
-            digest = hashlib.sha1(("blob " + str(remaining) + "\0").encode())
+            if name in selection["links"]:
+                file_mode, oid = entries[selection["links"][name]["resolved_path"]]
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("xb") as stream:
-                while remaining:
-                    block = process.stdout.read(min(remaining, 1024 * 1024))
-                    require(block, "truncated Git blob")
-                    stream.write(block)
-                    digest.update(block)
-                    remaining -= len(block)
-            require(process.stdout.read(1) == b"\n" and digest.hexdigest() == oid, "Git source object hash mismatch")
+                copy_blob(process, oid, stream)
             path.chmod(0o755 if file_mode == "100755" else 0o644)
-        process.stdin.close()
-        require(process.wait() == 0, "Git source reader failed")
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            process.wait()
-        process.stdout.close()
     files = inventory(root)
+    for entry in files:
+        if entry["path"] in selection["links"]:
+            entry["symlink"] = selection["links"][entry["path"]]
     return {"schema_version": 1, "kind": "dsr-xwin-source", **selection["identity"],
             "files": files, "snapshot_sha256": digest_files(files)}
 
 def verify(root, evidence):
-    require(evidence.get("schema_version") == 1 and evidence.get("kind") == "dsr-xwin-source", "invalid source receipt")
-    files = inventory(root)
-    require(files == evidence.get("files"), "source snapshot changed during the build")
-    require(digest_files(files) == evidence.get("snapshot_sha256"), "source inventory digest mismatch")
+    require(isinstance(evidence, dict) and evidence.get("schema_version") == 1 and evidence.get("kind") == "dsr-xwin-source", "invalid source receipt")
+    git_blobs = {}
+    files = inventory(root, git_blobs)
+    expected = evidence.get("files")
+    require(isinstance(expected, list) and all(isinstance(entry, dict) for entry in expected), "invalid source file evidence")
+    for entry in expected:
+        safe_name(entry.get("path"))
     if "primary_path" in evidence:
         require(evidence["primary_path"] == "project", "invalid primary source layout")
         dependencies = evidence.get("dependencies")
@@ -202,13 +309,26 @@ def verify(root, evidence):
             names.append(name)
             require(re.fullmatch(r"[0-9a-f]{40}", dependency["git_sha"]) and dependency["git_sha"] != "0" * 40, "invalid sibling revision")
             subset = [{**entry, "path": entry["path"][len(name) + 1:]} for entry in files if entry["path"].startswith(name + "/")]
+            selected = [{**entry, "path": entry["path"][len(name) + 1:]} for entry in expected if entry["path"].startswith(name + "/")]
+            hashes = {path[len(name) + 1:]: digest for path, digest in git_blobs.items() if path.startswith(name + "/")}
+            subset = verify_links(subset, selected, hashes)
             require(subset and digest_files(subset) == dependency["snapshot_sha256"], "sibling source inventory differs from its pin")
         require(len({name.lower() for name in names}) == len(names), "ambiguous sibling names")
         require({p.name for p in root.iterdir()} == {"project", *names}, "source-set namespace differs from plan")
         primary = [{**entry, "path": entry["path"][8:]} for entry in files if entry["path"].startswith("project/")]
+        selected = [{**entry, "path": entry["path"][8:]} for entry in expected if entry["path"].startswith("project/")]
+        hashes = {path[8:]: digest for path, digest in git_blobs.items() if path.startswith("project/")}
+        primary = verify_links(primary, selected, hashes)
         require(primary and digest_files(primary) == evidence.get("primary_snapshot_sha256"), "primary source inventory differs from its pin")
+        # Per-repository verification above prevents a link escaping its own
+        # pin even when a different admitted sibling occupies that destination.
+        require(files == [{key: value for key, value in entry.items() if key != "symlink"}
+                          for entry in expected], "source snapshot changed during the build")
+        files = expected
     else:
         require(not evidence.get("dependencies"), "sibling evidence requires a source-set layout")
+        files = verify_links(files, expected, git_blobs)
+    require(digest_files(files) == evidence.get("snapshot_sha256"), "source inventory digest mismatch")
 
 try:
     mode = sys.argv[1]
@@ -246,11 +366,13 @@ try:
         evidence["primary_snapshot_sha256"] = evidence["snapshot_sha256"]
         evidence["primary_path"] = "project"
         evidence["dependencies"] = []
+        files = [{**entry, "path": "project/" + entry["path"]} for entry in evidence["files"]]
         for name, selected in sorted(siblings):
             sibling = write_snapshot(selected, root / name)
+            files.extend({**entry, "path": name + "/" + entry["path"]} for entry in sibling["files"])
             evidence["dependencies"].append({"relative_path": name, **selected["identity"],
                                               "snapshot_sha256": sibling["snapshot_sha256"]})
-        evidence["files"] = inventory(root)
+        evidence["files"] = sorted(files, key=lambda entry: entry["path"])
         evidence["snapshot_sha256"] = digest_files(evidence["files"])
     else:
         evidence = write_snapshot(primary, root)
