@@ -1,0 +1,252 @@
+diff --git a/src/signing.sh b/src/signing.sh
+--- a/src/signing.sh
++++ b/src/signing.sh
+@@ -507,11 +507,16 @@
+ # Generic signature verification remains usable with a downloaded manifest alone.
+ _signing_manifest_preflight() {
+     local manifest="$1" directory name path sha size actual before rows listing line
+-    [[ "${manifest##*/}" == *-manifest.json ]] || return 0
++    # An explicit root is publication admission, not filename discovery. The
++    # selected manifest may live outside the assets directory or use another
++    # basename; neither case is permission to skip its inventory.
++    [[ $# -eq 1 || $# -eq 2 ]] || return 4
++    [[ $# -eq 2 || "${manifest##*/}" == *-manifest.json ]] || return 0
+     [[ -f "$manifest" && ! -L "$manifest" ]] || return 4
+     command -v jq >/dev/null || return 3
+     directory="${manifest%/*}"
+     [[ "$directory" != "$manifest" ]] || directory=.
++    [[ $# -eq 1 ]] || directory="$2"
+     [[ -d "$directory" && ! -L "$directory" ]] || return 4
+     before=$(_signing_sha256 "$manifest") || return $?
+     # Slurp avoids accepting concatenated JSON documents; validate before TSV.
+@@ -615,6 +620,21 @@
+     [[ "$(_signing_sha256 "$manifest")" == "$before" ]] || return 4
+ }
+ 
++# Read-only ordinary publication admission, independent of whether signing is
++# enabled or every payload already has a retained signature. Callers may bind
++# this check to their frozen manifest digest. No private key is needed.
++signing_validate_release_inventory() {
++    [[ $# -ge 2 && $# -le 3 ]] || return 4
++    local manifest="$1" directory="$2" expected="${3:-}" before
++    before=$(_signing_sha256 "$manifest") || return $?
++    [[ -z "$expected" || "$expected" == "$before" ]] || {
++        _sign_log_error "Release manifest changed after inventory selection"
++        return 4
++    }
++    _signing_manifest_preflight "$manifest" "$directory" || return $?
++    [[ "$(_signing_sha256 "$manifest")" == "$before" ]] || return 4
++}
++
+ # Ordinary fallback signs payloads, not necessarily the manifest itself. Check
+ # adjacent manifests too, once per directory, before any batch signature exists.
+ _signing_release_preflight() (
+diff --git a/dsr b/dsr
+--- a/dsr
++++ b/dsr
+@@ -5060,3 +5060,78 @@
++# Generate checksums from the final manifest before any GitHub mutation.
++# Retain already-valid checksum bytes exactly: sorting or normalizing a signed
++# SHA256SUMS would invalidate its detached signature. Missing files are staged
++# and published without clobbering; a failed retry never truncates evidence.
++_release_prepare_ordinary_checksums() (
++    local manifest="$1" directory="$2" expected="$3"
++    local rows name sha path suffix stage current
++    local -a names=(SHA256SUMS)
++    local -A retained=()
++    signing_validate_release_inventory "$manifest" "$directory" "$expected" || return $?
++    rows=$(jq -er '.artifacts | sort_by(.name)[] | [.name,.sha256] | @tsv' "$manifest") || return 4
++    # Payloads cannot occupy generated checksum names, even by case folding.
++    jq -e '[.artifacts[].name] as $p |
++        ($p + ($p | map(. + ".sha256")) + ["SHA256SUMS"]) as $all |
++        ($all | map(ascii_downcase) | unique | length) == ($all | length)
++    ' "$manifest" >/dev/null || {
++        log_error "Payload names collide with generated release checksums"
++        return 4
++    }
++    while IFS=$'\t' read -r name sha; do names+=("$name.sha256"); done <<< "$rows"
++    # Check the entire retained set before exposing any new checksum file.
++    for name in "${names[@]}"; do
++        path="$directory/$name"
++        if [[ -e "$path" || -L "$path" ]]; then
++            retained["$name"]=$(_signing_sha256 "$path") || return 4
++        else
++            for suffix in minisig sig asc; do
++                if [[ -e "$path.$suffix" || -L "$path.$suffix" ]]; then
++                    log_error "Refusing to regenerate checksum with orphan signature: $name.$suffix"
++                    return 4
++                fi
++            done
++        fi
++    done
++    # A completed retry does not create staging or rewrite any inode.
++    if [[ ${#retained[@]} -eq ${#names[@]} ]]; then
++        signing_validate_release_inventory "$manifest" "$directory" "$expected" || return $?
++        for name in "${!retained[@]}"; do
++            [[ "$(_signing_sha256 "$directory/$name")" == "${retained[$name]}" ]] || return 4
++        done
++        return 0
++    fi
++    umask 077
++    stage=$(mktemp -d "$directory/.dsr-checksums.XXXXXXXX") || return 4
++    # Retain private staging on errors, just like failed build collection.
++    : > "$stage/SHA256SUMS" || return 4
++    while IFS=$'\t' read -r name sha; do
++        printf '%s  %s\n' "$sha" "$name" >> "$stage/SHA256SUMS" || return 4
++        printf '%s  %s\n' "$sha" "$name" > "$stage/$name.sha256" || return 4
++    done <<< "$rows"
++    signing_validate_release_inventory "$manifest" "$directory" "$expected" || return $?
++    # Keep retained GNU binary-marker/order/newline conventions unchanged.
++    # Exclusive link publication also refuses a competing pathname or symlink.
++    for name in "${names[@]}"; do
++        path="$directory/$name"
++        if [[ -n "${retained[$name]:-}" ]]; then
++            current=$(_signing_sha256 "$path") || return 4
++            [[ "$current" == "${retained[$name]}" ]] || return 4
++        else
++            for suffix in minisig sig asc; do
++                [[ ! -e "$path.$suffix" && ! -L "$path.$suffix" ]] || return 4
++            done
++            if ! ln -- "$stage/$name" "$path"; then
++                log_error "Checksum publication conflict: $name"
++                return 4
++            fi
++            [[ -f "$path" && ! -L "$path" && "$path" -ef "$stage/$name" ]] || return 4
++        fi
++    done
++    signing_validate_release_inventory "$manifest" "$directory" "$expected" || return $?
++    for name in "${!retained[@]}"; do
++        [[ "$(_signing_sha256 "$directory/$name")" == "${retained[$name]}" ]] || return 4
++    done
++)
++
+ # Validate an opt-in release contract and return the closed upload plan as JSON.
+ # No GitHub mutation is allowed before this succeeds. sidecar_mode is create,
+ # verify, or plan. Creation uses noclobber; an existing sidecar is always
+@@ -7280,3 +7355,7 @@
+         ordinary_expected_sha["${manifest_file##*/}"]=$(_gh_asset_sha256 "$manifest_file") || return 4
++        # Signing may be disabled or entirely reused. Publication still needs
++        # the complete local inventory, not just byte-correct surviving rows.
++        signing_validate_release_inventory "$manifest_file" "$artifacts_dir" \
++            "${ordinary_expected_sha[${manifest_file##*/}]}" || return 4
+     elif ! $release_contract_enabled; then
+         local ordinary_file ordinary_name
+@@ -7880,3 +7959,17 @@
++    if ! $release_contract_enabled && $manifest_exists; then
++        _release_prepare_ordinary_checksums "$manifest_file" "$artifacts_dir" \
++            "${ordinary_expected_sha[${manifest_file##*/}]}" || return 4
++        # The normal upload loop already rechecks this digest map. Include
++        # generated metadata too, rather than blessing its bytes at upload time.
++        local checksum_name
++        for checksum_name in "${!ordinary_generated_names[@]}"; do
++            ordinary_expected_sha["$checksum_name"]=$(_gh_asset_sha256 \
++                "$artifacts_dir/$checksum_name") || return 4
++        done
++        signing_validate_release_inventory "$manifest_file" "$artifacts_dir" \
++            "${ordinary_expected_sha[${manifest_file##*/}]}" || return 4
++    fi
++
+     log_info "Creating GitHub release for $tag..."
+ 
+     local release_args=""
+@@ -8127,47 +8220,8 @@
+     if $manifest_exists && [[ -f "$manifest_file" ]]; then
+-        local sha256sums_file="$artifacts_dir/SHA256SUMS"
+-        log_info "Generating SHA256SUMS + per-asset .sha256 sidecars for installer verification..."
+-        : > "$sha256sums_file"
+-
+-        # Emit one `<sha>  <name>` line into SHA256SUMS AND a single-line
+-        # `<name>.sha256` sidecar with the same content. Keep the two shapes
+-        # in lock-step so a future installer that prefers one over the other
+-        # can never disagree with the other.
+-        _emit_sha_entry() {
+-            local sha="$1" name="$2"
+-            printf '%s  %s\n' "$sha" "$name" >> "$sha256sums_file"
+-            printf '%s  %s\n' "$sha" "$name" > "$artifacts_dir/${name}.sha256"
+-        }
+-
+-        # Cross-artifact dedup: each filename is emitted at most once. Hoisted
+-        # outside the per-artifact loop because previously the dedup table was
+-        # scoped to one manifest row, so two artifacts whose alias-sets shared
+-        # the same compat/arch-alias filename each emitted a different SHA for
+-        # the same name — which produced a SHA256SUMS that always failed
+-        # `sha256sum --check` for the colliding name.
+-        local -A sha_seen=()
+-
+-        while IFS=$'\t' read -r a_name a_sha256; do
+-            [[ -z "$a_name" || -z "$a_sha256" ]] && continue
+-
+-            # Every name this artifact is uploaded as (primary, versioned,
+-            # compat, arch aliases); a name a prior row already wrote is skipped.
+-            local alias_name=""
+-            while IFS= read -r alias_name; do
+-                [[ -z "$alias_name" || -n "${sha_seen[$alias_name]:-}" ]] && continue
+-                _emit_sha_entry "$a_sha256" "$alias_name"
+-                sha_seen["$alias_name"]=1
+-            done <<< "${ordinary_upload_names[$a_name]}"
+-        done < <(jq -r '.artifacts[] | [.name // .filename, .sha256] | @tsv' <<< "$ordinary_manifest")
+-
+-        if [[ -s "$sha256sums_file" ]]; then
+-            local line_count
+-            line_count=$(wc -l < "$sha256sums_file")
+-            log_ok "Generated SHA256SUMS with $line_count entries (+ matching per-asset .sha256 sidecars)"
+-        else
+-            rm -f "$sha256sums_file"
+-            log_warn "No checksum data available; SHA256SUMS not generated"
+-        fi
++        # Prepared before release creation. This idempotent recheck also admits
++        # direct callers of the checksum block without truncating signed data.
++        _release_prepare_ordinary_checksums "$manifest_file" "$artifacts_dir" \
++            "${ordinary_expected_sha[${manifest_file##*/}]}" || return 4
+     fi
+ 
+     # Build upload list from manifest when available to avoid stale artifacts
+@@ -10178,3 +10232,10 @@
++    # Ordinary inventory admission is independent of signing and resume.
++    if [[ "$contract" == null ]] &&
++       ! signing_validate_release_inventory "$manifest_file" "$output_dir" "$manifest_sha"; then
++        verification_status="failed"; release_status="blocked"
++        _fallback_result 6 verification "Release inventory is incomplete or inconsistent"
++        return 6
++    fi
+     verification_status="passed"
+ 
+     # The release command owns checksums and aliases. Never generate a second
+@@ -10198,32 +10259,18 @@
+         log_warn "Signing is enabled but no keypair exists: releasing UNSIGNED (run 'dsr signing init', or set signing.enabled: false)"
+     elif signing_is_enabled; then
+         signing_status="running"
+-        local -a unsigned_paths=()
+         local payload
+-        for payload in "${payload_paths[@]}"; do
+-            if [[ -e "${payload}.minisig" || -L "${payload}.minisig" ]]; then
+-                if [[ ! -f "${payload}.minisig" || -L "${payload}.minisig" ]] ||
+-                   ! signing_verify "$payload" >&2; then
+-                    signing_status="failed"; release_status="blocked"
+-                    _fallback_result 7 signing "Existing signature is invalid: ${payload##*/}"
+-                    return 7
+-                fi
+-            else
+-                unsigned_paths+=("$payload")
+-            fi
+-        done
+-        # Re-signing a completed asset changes its remote signature bytes and
+-        # defeats content-verified resume. Retain verified sidecars exactly.
+-        if [[ ${#unsigned_paths[@]} -gt 0 ]]; then
+-            signing_sign_batch "${unsigned_paths[@]}" >&2 || rc=$?
+-        fi
++        # Batch resume verifies retained signatures without rewriting them.
++        # Always include the manifest: signed binaries alone do not authenticate
++        # their final filenames or the completeness of the published inventory.
++        signing_sign_batch "${payload_paths[@]}" "$manifest_file" >&2 || rc=$?
+         if [[ $rc -ne 0 ]]; then
+             signing_status="failed"; release_status="blocked"
+             case "$rc" in 5|130|143) ;; *) rc=7 ;; esac
+             _fallback_result "$rc" signing "Artifact signing failed; release blocked"
+             return "$rc"
+         fi
+-        for payload in "${payload_paths[@]}"; do
++        for payload in "${payload_paths[@]}" "$manifest_file"; do
+             if [[ ! -f "${payload}.minisig" || -L "${payload}.minisig" ]] ||
+                ! signing_verify "$payload" >&2; then
+                 signing_status="failed"; release_status="blocked"

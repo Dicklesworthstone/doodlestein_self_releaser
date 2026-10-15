@@ -1,0 +1,22 @@
+diff --git a/scripts/tests/test_ordinary_collection_inventory.sh b/scripts/tests/test_ordinary_collection_inventory.sh
+--- a/scripts/tests/test_ordinary_collection_inventory.sh
++++ b/scripts/tests/test_ordinary_collection_inventory.sh
+@@ -9,2 +9,10 @@
+ source "$ROOT/src/act_runner.sh"
++source "$ROOT/src/signing.sh"
++# The checksum writer is now an explicit pre-publication helper; the normal
++# command and this caller-block regression both execute its production body.
++source <(awk '
++    /^_release_prepare_ordinary_checksums\(\) \(/ {copy=1}
++    copy {print}
++    copy && /^\)/ {exit}
++' "$ROOT/dsr")
+ # Load the actual nested collector and publisher naming functions without
+@@ -148,2 +156,4 @@
+ ordinary_manifest=$(cat "$manifest")
++declare -A ordinary_expected_sha=()
++ordinary_expected_sha["${manifest_file##*/}"]=$(_act_sha256 "$manifest_file") || exit 1
+ artifact_naming_generate_dual_for_variant() {
+@@ -187,1 +197,1 @@
+-actual = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in output.iterdir() if p.name != "SHA256SUMS" and not p.name.endswith(".sha256")}
++actual = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in output.iterdir() if p.is_file() and p.name != "SHA256SUMS" and not p.name.endswith(".sha256")}

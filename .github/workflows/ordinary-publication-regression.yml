@@ -1,0 +1,88 @@
+# Temporary object preparation: never updates a branch, tag, or release.
+# The tested source objects are activated separately through a reviewed commit.
+name: Ordinary publication inventory qualification
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ordinary-publication-regression.yml
+      - scripts/patches/ordinary-publication-core.patch
+      - scripts/patches/ordinary-publication-tests.patch
+      - scripts/tests/candidates/ordinary_publication_inventory.py
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ordinary-publication-inventory-main
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Retain exact source and validate patch preimages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/publication-evidence"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/publication-evidence/source.tar"
+          git rev-parse HEAD > "$RUNNER_TEMP/publication-evidence/head.txt"
+          test -z "$(git status --porcelain)"
+          test "$(git hash-object dsr)" = 801a65c75c6adbcccee3dc6aa0df378ff9a40827
+          test "$(git hash-object src/signing.sh)" = b5c6dedb5f37a192d51e2630324ee89c60f58e73
+          test "$(git hash-object scripts/tests/test_ordinary_collection_inventory.sh)" = ca7478ea81a01524a9f6fb1e8e25215ef4c4b21d
+          echo '5a00234e9a06551a59f37e508070b28eaeee6d59ef0399c112f9d6c43866e996  scripts/patches/ordinary-publication-core.patch' | sha256sum --check
+          git apply --check scripts/patches/ordinary-publication-core.patch
+          git apply scripts/patches/ordinary-publication-core.patch
+          git apply --check scripts/patches/ordinary-publication-tests.patch
+          git apply scripts/patches/ordinary-publication-tests.patch
+          git diff --check
+          git diff > "$RUNNER_TEMP/publication-evidence/applied.patch"
+      - name: Install real verification dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq minisign xz-utils python3-cryptography
+          go version
+          minisign -v
+      - name: Validate actual command source and real signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n dsr
+          bash -n src/signing.sh
+          bash -n scripts/tests/test_ordinary_collection_inventory.sh
+          DSR_TEST_SOURCE_ROOT="$GITHUB_WORKSPACE" /usr/bin/python3 scripts/tests/candidates/ordinary_publication_inventory.py 2>&1 | tee "$RUNNER_TEMP/publication-evidence/publication.log"
+          /usr/bin/python3 scripts/tests/test_signing_inventory.py 2>&1 | tee "$RUNNER_TEMP/publication-evidence/signing-inventory.log"
+          PATH="/usr/bin:$PATH" bash scripts/tests/test_ordinary_collection_inventory.sh 2>&1 | tee "$RUNNER_TEMP/publication-evidence/collection.log"
+          bash scripts/tests/test_signing.sh 2>&1 | tee "$RUNNER_TEMP/publication-evidence/signing.log"
+      - name: Store tested source blobs without moving refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git diff --name-only | sort)" = "$(printf 'dsr\nscripts/tests/test_ordinary_collection_inventory.sh\nsrc/signing.sh')"
+          test -z "$(git ls-files --others --exclude-standard)"
+          : > "$RUNNER_TEMP/publication-evidence/objects.jsonl"
+          for path in dsr src/signing.sh scripts/tests/test_ordinary_collection_inventory.sh; do
+            blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F "content=@$path" --jq .sha)
+            test "$blob" = "$(git hash-object "$path")"
+            jq -nc --arg path "$path" --arg sha "$blob" '{path:$path,sha:$sha}' >> "$RUNNER_TEMP/publication-evidence/objects.jsonl"
+          done
+          jq -s --arg parent "$(git rev-parse HEAD)" '{parent:$parent,objects:.}' "$RUNNER_TEMP/publication-evidence/objects.jsonl" | tee "$RUNNER_TEMP/publication-evidence/verified-objects.json"
+      - name: Retain source and validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ordinary-publication-evidence
+          path: ${{ runner.temp }}/publication-evidence
+          retention-days: 7
+          if-no-files-found: error
