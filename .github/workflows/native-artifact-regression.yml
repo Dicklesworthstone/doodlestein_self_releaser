@@ -1,0 +1,107 @@
+# Creates tested source objects, never branches/tags or release assets. Replace
+# this preparation job with read-only regression CI when the source lands.
+name: Native artifact integration
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/native-artifact-regression.yml
+      - scripts/tests/test_native_artifact_build.sh
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-artifact-integration-main
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Retain source and enforce reviewed preimages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/collector-evidence"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/collector-evidence/source.tar"
+          git rev-parse HEAD > "$RUNNER_TEMP/collector-evidence/head.txt"
+          test "$(git hash-object src/act_runner.sh)" = 0c3b7674303aa3cae22284e1bac87ca813f55673
+          test "$(git hash-object dsr)" = d68d4ac23aa2722212ef3eb068b5d63aabaeef6d
+          test -z "$(git status --porcelain)"
+      - name: Install compiler, YAML and archive dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in jq xz go; do
+            command -v "$tool" >/dev/null || brew install "$tool"
+          done
+          if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/dsr-test-bin"
+          GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
+          echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Check genuine builds and reproduce incumbent inventory omission
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/test_native_artifact_build.sh --expect-inventory-gap 2>&1 | tee "$RUNNER_TEMP/collector-evidence/incumbent.log"
+      - name: Apply only the reviewed content-addressed patch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/16ac6b9d9c8e4fd96feb51bac1660ee9b72452c0" --jq .content | base64 -d > "$RUNNER_TEMP/collector.patch"
+          test "$(git hash-object "$RUNNER_TEMP/collector.patch")" = 16ac6b9d9c8e4fd96feb51bac1660ee9b72452c0
+          echo "0bce4c19d1da4532901e69f0656ba83e98cff1ba9371bd6f770149ab6feab16f  $RUNNER_TEMP/collector.patch" | shasum -a 256 --check
+          git apply --check "$RUNNER_TEMP/collector.patch"
+          git apply "$RUNNER_TEMP/collector.patch"
+          git diff --check
+          git diff > "$RUNNER_TEMP/collector-evidence/applied.patch"
+      - name: Validate native compilation, packaging and complete final manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n dsr
+          bash -n src/act_runner.sh
+          bash -n scripts/tests/test_native_artifact_build.sh
+          bash scripts/tests/test_native_artifact_build.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/candidate.log"
+      - name: Store tested source objects without updating refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git diff --check
+          test "$(git diff --name-only | sort)" = "$(printf 'dsr\nsrc/act_runner.sh')"
+          test -z "$(git ls-files --others --exclude-standard)"
+          source_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@src/act_runner.sh --jq .sha)
+          cli_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@dsr --jq .sha)
+          test "$source_blob" = "$(git hash-object src/act_runner.sh)"
+          test "$cli_blob" = "$(git hash-object dsr)"
+          jq -n --arg parent "$(git rev-parse HEAD)" --arg source "$source_blob" --arg cli "$cli_blob" \
+            '{parent:$parent,source_blob:$source,cli_blob:$cli}' | tee "$RUNNER_TEMP/collector-evidence/verified-objects.json"
+      - name: Retain native diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for fixture in "${TMPDIR:-/tmp}"/dsr-native-artifacts.*; do
+            [[ -d "$fixture" ]] || continue
+            tar --exclude=go-cache --exclude=output --exclude=artifacts -czf \
+              "$RUNNER_TEMP/collector-evidence/$(basename "$fixture").tar.gz" -C "$fixture" .
+          done
+      - name: Retain source and validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-artifact-evidence
+          path: ${{ runner.temp }}/collector-evidence
+          retention-days: 7
+          if-no-files-found: error
