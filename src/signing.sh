@@ -330,7 +330,8 @@ EOF
         return 4
     fi
 
-    _signing_release_preflight "$file" || return $?
+    local inventory_snapshot
+    inventory_snapshot=$(_signing_release_manifest_snapshot "$file") || return $?
     signing_require_minisign || return 3
 
     # Freeze the configured trust key before invoking the signer. A successful
@@ -341,7 +342,7 @@ EOF
     if [[ -e "$signature" || -L "$signature" ]]; then
         _signing_reuse "$file" "$signature" "$token" "$digest" \
             "$trusted_comment" "$untrusted_comment" || return $?
-        _signing_release_preflight "$file" || return $?
+        _signing_release_snapshot_matches "$inventory_snapshot" "$file" || return $?
         _sign_log_ok "Retained verified signature: $signature"
         return 0
     fi
@@ -349,7 +350,7 @@ EOF
     _sign_log_info "Signing and verifying: $file"
     signing_sign_exact "$file" "$signature" "$SIGNING_PRIVATE_KEY" "$token" \
         "$trusted_comment" "$digest" "$untrusted_comment" || return $?
-    _signing_release_preflight "$file" || return $?
+    _signing_release_snapshot_matches "$inventory_snapshot" "$file" || return $?
     _sign_log_ok "Verified signature created: $signature"
     return 0
 }
@@ -507,11 +508,14 @@ _signing_sha256() {
 # Generic signature verification remains usable with a downloaded manifest alone.
 _signing_manifest_preflight() {
     local manifest="$1" directory name path sha size actual before rows listing line
-    [[ "${manifest##*/}" == *-manifest.json ]] || return 0
+    # An explicit root is publication admission, not filename discovery.
+    [[ $# -eq 1 || $# -eq 2 ]] || return 4
+    [[ $# -eq 2 || "${manifest##*/}" == *-manifest.json ]] || return 0
     [[ -f "$manifest" && ! -L "$manifest" ]] || return 4
     command -v jq >/dev/null || return 3
     directory="${manifest%/*}"
     [[ "$directory" != "$manifest" ]] || directory=.
+    [[ $# -eq 1 ]] || directory="$2"
     [[ -d "$directory" && ! -L "$directory" ]] || return 4
     before=$(_signing_sha256 "$manifest") || return $?
     # Slurp avoids accepting concatenated JSON documents; validate before TSV.
@@ -615,27 +619,81 @@ _signing_manifest_preflight() {
     [[ "$(_signing_sha256 "$manifest")" == "$before" ]] || return 4
 }
 
-# Ordinary fallback signs payloads, not necessarily the manifest itself. Check
-# adjacent manifests too, once per directory, before any batch signature exists.
-_signing_release_preflight() (
-    local file directory manifest
+# Read-only publication admission also works for unsigned/reused signatures and
+# manifests stored separately from their payloads. A supplied digest is the
+# caller's frozen selection, not a request to bless whatever JSON exists now.
+signing_validate_release_inventory() {
+    [[ $# -ge 2 && $# -le 3 ]] || return 4
+    local manifest="$1" directory="$2" expected="${3:-}" before
+    before=$(_signing_sha256 "$manifest") || return $?
+    [[ -z "$expected" || "$expected" == "$before" ]] || {
+        _sign_log_error "Release manifest changed after inventory selection"
+        return 4
+    }
+    _signing_manifest_preflight "$manifest" "$directory" || return $?
+    [[ "$(_signing_sha256 "$manifest")" == "$before" ]] || return 4
+}
+
+# Freeze the entire adjacent manifest set, not just the selected payloads.
+# Re-running a predicate alone can accept two different, internally consistent
+# manifests, or accept no manifest after the original one disappears. Retain
+# exact names and bytes so source/target identity cannot drift during signing.
+# Generic non-release signing retains an empty snapshot and needs no jq.
+_signing_release_manifest_snapshot() (
+    [[ $# -gt 0 ]] || return 4
+    local file directory manifest before after work cleanup
     local -A checked=()
-    unset GLOBIGNORE
-    set +f
-    shopt -s nullglob
-    shopt -u failglob dotglob
+    umask 077
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-sign-context.XXXXXXXX") || return 4
+    printf -v cleanup 'rm -f -- %q %q; rmdir -- %q 2>/dev/null || true' \
+        "$work/list" "$work/rows" "$work"
+    # shellcheck disable=SC2064 # Freeze only our safely quoted private paths.
+    trap "$cleanup" EXIT
+    trap 'exit 5' HUP INT TERM
+    : > "$work/rows" || return 4
     for file in "$@"; do
+        [[ -f "$file" && ! -L "$file" && "$file" != *[[:cntrl:]]* ]] || return 4
         directory="${file%/*}"
         [[ "$directory" != "$file" ]] || directory=.
-        [[ -d "$directory" ]] || return 4
         directory=$(cd "$directory" && pwd -P) || return 4
         [[ -z "${checked[$directory]:-}" ]] || continue
         checked["$directory"]=1
-        for manifest in "$directory"/*-manifest.json; do
-            _signing_manifest_preflight "$manifest" || return $?
-        done
+        # Do not drop traversal errors through a process substitution or hide
+        # manifests behind inherited GLOBIGNORE/noglob/failglob settings.
+        find "$directory" -mindepth 1 -maxdepth 1 ! -name '.*' \
+            -name '*-manifest.json' -print0 > "$work/list" || return 4
+        while IFS= read -r -d '' manifest; do
+            before=$(_signing_sha256 "$manifest") || return $?
+            signing_validate_release_inventory "$manifest" "$directory" "$before" || return $?
+            after=$(_signing_sha256 "$manifest") || return $?
+            [[ "$before" == "$after" ]] || return 4
+            jq -nc --arg manifest "$manifest" --arg sha256 "$before" \
+                '{manifest:$manifest,sha256:$sha256}' >> "$work/rows" || return 4
+        done < "$work/list"
     done
+    if [[ -s "$work/rows" ]]; then
+        jq -sc 'sort_by(.manifest)' "$work/rows" || return 4
+    else
+        printf '[]\n'
+    fi
 )
+
+_signing_release_snapshot_matches() {
+    [[ $# -gt 1 ]] || return 4
+    local expected="$1" current
+    shift
+    current=$(_signing_release_manifest_snapshot "$@") || return $?
+    [[ "$current" == "$expected" ]] || {
+        _sign_log_error "Release manifest set or bytes changed during signing"
+        return 4
+    }
+}
+
+# Compatibility predicate for read-only callers; signing entry points retain
+# the returned snapshot themselves instead of independently reselecting it.
+_signing_release_preflight() {
+    _signing_release_manifest_snapshot "$@" >/dev/null
+}
 
 # Resume is verification, never re-signing. Preserve existing bytes even on a
 # conflict: changing a timestamp/comment breaks content-verified upload resume.
@@ -808,7 +866,8 @@ signing_sign_batch() (
         return 4
     fi
 
-    _signing_release_preflight "$@" || return $?
+    local inventory_snapshot
+    inventory_snapshot=$(_signing_release_manifest_snapshot "$@") || return $?
     signing_require_minisign || return 3
 
     local token private_key="$SIGNING_PRIVATE_KEY" file parent name canonical prior duplicate
@@ -887,7 +946,7 @@ signing_sign_batch() (
         _signing_reuse "$file" "$signature" "$token" "${digests[i]}" || return $?
         [[ "$(_signing_sha256 "$signature")" == "${signature_digests[i]}" ]] || return 4
     done
-    _signing_release_preflight "${files[@]}" || return $?
+    _signing_release_snapshot_matches "$inventory_snapshot" "${files[@]}" || return $?
     for ((i=0; i<${#files[@]}; i++)); do
         [[ -n "${staged[i]}" ]] || continue
         signature="${files[i]}.minisig"
@@ -904,7 +963,7 @@ signing_sign_batch() (
         _signing_reuse "$file" "$signature" "$token" "${digests[i]}" || return $?
         [[ "$(_signing_sha256 "$signature")" == "${signature_digests[i]}" ]] || return 4
     done
-    _signing_release_preflight "${files[@]}" || return $?
+    _signing_release_snapshot_matches "$inventory_snapshot" "${files[@]}" || return $?
     _sign_log_ok "Verified complete signing batch: ${#files[@]} artifact(s)"
     return 0
 )
@@ -1006,3 +1065,4 @@ export -f signing_require_minisign signing_check signing_init signing_fix_permis
 export -f signing_sign signing_verify signing_get_public_key signing_sign_batch
 export -f signing_public_key_token signing_verify_exact signing_sign_exact
 export -f signing_is_enabled signing_wanted signing_apply_config signing_sign_files
+export -f signing_validate_release_inventory

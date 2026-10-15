@@ -1,5 +1,5 @@
 # Temporary object preparation: never updates a branch, tag, or release.
-# The tested source objects are activated separately through a reviewed commit.
+# The tested command objects are activated separately through a reviewed commit.
 name: Ordinary publication inventory qualification
 on:
   push:
@@ -9,6 +9,8 @@ on:
       - scripts/patches/ordinary-publication-core.patch
       - scripts/patches/ordinary-publication-tests.patch
       - scripts/tests/candidates/ordinary_publication_inventory.py
+      - scripts/tests/test_signing_context.py
+      - src/signing.sh
   workflow_dispatch:
 permissions:
   contents: read
@@ -35,9 +37,9 @@ jobs:
           git rev-parse HEAD > "$RUNNER_TEMP/publication-evidence/head.txt"
           test -z "$(git status --porcelain)"
           test "$(git hash-object dsr)" = 801a65c75c6adbcccee3dc6aa0df378ff9a40827
-          test "$(git hash-object src/signing.sh)" = b5c6dedb5f37a192d51e2630324ee89c60f58e73
+          test "$(git hash-object src/signing.sh)" = b1e99dc805d0a6ee74b1566797dd78e2759729e9
           test "$(git hash-object scripts/tests/test_ordinary_collection_inventory.sh)" = ca7478ea81a01524a9f6fb1e8e25215ef4c4b21d
-          echo '5a00234e9a06551a59f37e508070b28eaeee6d59ef0399c112f9d6c43866e996  scripts/patches/ordinary-publication-core.patch' | sha256sum --check
+          echo 'aeaaf84aac8877f13ed8def1899238b1e1c122f6d21ed256df957c936ebf1932  scripts/patches/ordinary-publication-core.patch' | sha256sum --check
           git apply --check scripts/patches/ordinary-publication-core.patch
           git apply scripts/patches/ordinary-publication-core.patch
           git apply --check scripts/patches/ordinary-publication-tests.patch
@@ -59,6 +61,7 @@ jobs:
           bash -n dsr
           bash -n src/signing.sh
           bash -n scripts/tests/test_ordinary_collection_inventory.sh
+          /usr/bin/python3 scripts/tests/test_signing_context.py 2>&1 | tee "$RUNNER_TEMP/publication-evidence/signing-context.log"
           DSR_TEST_SOURCE_ROOT="$GITHUB_WORKSPACE" /usr/bin/python3 scripts/tests/candidates/ordinary_publication_inventory.py 2>&1 | tee "$RUNNER_TEMP/publication-evidence/publication.log"
           /usr/bin/python3 scripts/tests/test_signing_inventory.py 2>&1 | tee "$RUNNER_TEMP/publication-evidence/signing-inventory.log"
           PATH="/usr/bin:$PATH" bash scripts/tests/test_ordinary_collection_inventory.sh 2>&1 | tee "$RUNNER_TEMP/publication-evidence/collection.log"
@@ -69,7 +72,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(git diff --name-only | sort)" = "$(printf 'dsr\nscripts/tests/test_ordinary_collection_inventory.sh\nsrc/signing.sh')"
+          test "$(git diff --name-only | sort)" = "$(printf 'dsr\nscripts/tests/test_ordinary_collection_inventory.sh')"
           test -z "$(git ls-files --others --exclude-standard)"
           : > "$RUNNER_TEMP/publication-evidence/objects.jsonl"
           for path in dsr src/signing.sh scripts/tests/test_ordinary_collection_inventory.sh; do
