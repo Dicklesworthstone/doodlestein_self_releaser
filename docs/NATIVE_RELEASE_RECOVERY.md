@@ -8,10 +8,10 @@ create a Git tag, sign anything, upload assets or dispatch workflows.
 This is a recovery path for issues #31 and #45, **not a replacement for the normal
 build command's collector**. The normal collector's rename/manifest mismatch still
 needs its own repair. Recovery requires all requested native targets to have
-completed and exactly one primary payload per task: a raw executable or a
-`tar.gz`, `tgz`, `tar.xz`, or ZIP workspace archive. Additional release assets,
-mixed act/native runs and strict-contract builds are refused, not reduced to a
-smaller release.
+completed, with one or more primary payloads per task: raw executables or
+`tar.gz`, `tgz`, `tar.xz`, or ZIP workspace archives. Explicitly recorded companion
+assets are also preserved. Mixed act/native runs, directory-discovered inventories
+and strict-contract builds are refused, not reduced to a smaller release.
 
 ## Select the saved build
 
@@ -46,7 +46,9 @@ selected commit. The checkout need not be at that tag and is not modified.
 ## Output and evidence
 
 Successful stdout is one JSON result with `manifest`, `manifest_sha256`,
-`artifacts_dir`, `state_sha256` and `recovered_targets`. The new `release/` directory
+`artifacts_dir`, `state_sha256`, `recovered_targets`, `recovered_artifacts` and
+`companion_artifacts`. Target counts describe worker tasks; artifact counts describe
+unique output files, not repeated references to a shared companion. The new `release/` directory
 contains `build-manifest.json`, `artifacts/`, the original `inputs/state.json`, and
 `result.json`. Only an entirely validated set is renamed into `release/`.
 Interrupted or failed copies may retain private `.recovery-*` evidence; use a new
@@ -80,6 +82,51 @@ The returned manifest and artifact root are inputs to the existing
 archive member named `demo`/`demo.exe`, or rename a raw output to a project's
 published name. The packaging and finalization commands retain their own source,
 coverage, checksum and signing gates. No automatic publication occurs here.
+
+## Multiple primary outputs and shared companions
+
+The worker's `artifact_paths` array is authoritative. A task can retain multiple
+raw executables, multiple archives, or both; each primary is qualified by its own
+worker platform/triple before entering the flat output directory. Parent directory
+names containing commas are supported because recovery never splits that array's
+paths. The legacy display scalar must still equal the array's comma-joined form.
+
+The complete union of primary paths and `additional_artifacts` must match the
+worker's frozen `resume_artifacts` exactly. Every additional descriptor must agree
+with its corresponding resume receipt, including the original inode, digest and
+size. Duplicate paths, missing receipts, contradictory descriptors and primary/
+companion role overlaps refuse the entire operation. Per task, at most 256 primary
+and 256 additional paths are admitted. No unlisted file is discovered or imported.
+
+Additional assets retain their safe original basenames. Same-named companions
+from different workers can share one output only when spelling, bytes, size and
+executable bits agree; their original source receipts remain individually listed
+in `recovery_evidence.artifacts`. Both separately copied inputs and one shared
+physical companion are supported, without hardlinking the recovered output.
+Case collisions and unequal content or modes fail rather than choosing a winner.
+Executable bits are retained exactly. Empty standalone companions are refused
+because the release manifest requires nonzero asset sizes; empty files inside
+primary archives remain supported.
+
+Companions are opaque bytes, not verified native executables or authenticated
+source files. They receive `target: "additional"`, `archive_format: "none"`, and no
+compiler triple. Even when their filename is an archive, no extraction or archive
+member claim is made for an opaque companion; the archive admission rules below
+apply to primary outputs. Recognized native executable bytes and `.exe` companions
+are refused: declare them as primary outputs to retain their target checks.
+
+Conventional filename-bearing checksums, signatures, SBOMs, provenance files and
+manifests are refused as companions because primary names change during recovery.
+Recovery neither signs new metadata nor copies those known stale attestations as
+valid ones. Generate fresh metadata through the downstream release pipeline.
+
+After independent copying, recovery re-reads every staged output against its held
+digest, size, inode and metadata. It verifies the exact staging namespace and the
+held bytes/identities of the saved state, manifest and result. Persistent copy
+corruption, replacement, mode changes, document edits or added output files fail
+before the final directory rename. This extends the existing original-input and
+Git rechecks; it is not a claim of tamper resistance against arbitrary concurrent
+same-user writes after the final observation or of strict build authentication.
 
 ## Workspace archives
 
@@ -130,7 +177,18 @@ claim native macOS or Windows runtime execution. Git objects, executable files,
 archive parsers, inode checks and digest checks are genuine. Test evidence is
 retained in the printed temporary directory.
 
+The multi-file cases retain fourteen primary payloads and three shared companions
+across seven workers, including mode-sensitive scripts and refusal of empty
+standalone assets that cannot satisfy the release manifest. The
+staging tests forward to the genuine Git executable, then deliberately mutate a
+private recovery output after the final tag query; an explicit marker is required
+so an unrelated early failure cannot count as a successful refusal. No Git identity
+response or source verifier is mocked by that fault injector.
+
 For a controlled comparison, `DSR_RECOVERY_BASELINE` may name the unchanged
 incumbent script: the same test invocation demonstrates its refusal of the exact
 workspace archive input. `DSR_RECOVERY_TEST_GOCACHE` optionally selects a shared Go
 compilation cache; output binaries and release evidence remain unique to each run.
+`DSR_RECOVERY_MULTI_BASELINE` may name the unchanged archive-only implementation to
+reproduce both its multi-file refusal and its publication of an altered staged
+copy, using the same real inputs and fault injector in the same test invocation.

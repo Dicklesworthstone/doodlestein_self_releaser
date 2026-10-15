@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -103,7 +104,7 @@ for platform in platforms:
 counter = 0
 
 
-def invoke(value=None, arguments=None, raw=None, output=None, expected_hash=None, module_override=None):
+def invoke(value=None, arguments=None, raw=None, output=None, expected_hash=None, module_override=None, env=None):
     global counter
     counter += 1
     selected_state = states / ('state-%d.json' % counter)
@@ -114,7 +115,7 @@ def invoke(value=None, arguments=None, raw=None, output=None, expected_hash=None
                '--source-repo', str(source), '--repo', 'owner/demo', '--tag', 'v1.2.3', '--sha', commit,
                '--artifacts-root', str(assets), '--output-dir', str(output)]
     command += arguments or []
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=env)
     (work / ('run-%d.stdout' % counter)).write_bytes(result.stdout)
     (work / ('run-%d.stderr' % counter)).write_bytes(result.stderr)
     try:
@@ -354,6 +355,225 @@ with tarfile.open(filename, 'w:gz', format=tarfile.PAX_FORMAT) as archive:
     archive.addfile(item, io.BytesIO(b''))
 refuse('PAX metadata size is bounded before parser allocation', bind_primary(copy.deepcopy(state), 'linux/amd64', filename), code=4)
 check('archive validation never extracted unsafe members', not (work / 'outside').exists() and not (assets / 'outside').exists())
+
+# Each worker can have several exact primary paths plus independently frozen
+# companions. Keep the complete inventory; do not split display paths at commas.
+multi = copy.deepcopy(packaged)
+extra_dir = assets / 'additional,with-comma'
+extra_dir.mkdir()
+shared = extra_dir / 'LICENSE'
+shared.write_bytes(b'reviewed shared license\n')
+notice = extra_dir / 'NOTICE'
+notice.write_bytes(b'reviewed shared notice\n')
+helper = extra_dir / 'install-helper.sh'
+helper.write_bytes(b'#!/bin/sh\nexit 0\n')
+helper.chmod(0o654)
+
+
+def file_receipt(filename):
+    info = filename.stat()
+    return dict(path=str(filename), sha256=sha(filename.read_bytes()), size_bytes=info.st_size,
+                identity='gnu:%d:%d' % (info.st_dev, info.st_ino))
+
+
+def add_primary(value, platform, filename):
+    record = value['target_statuses'][platform]['result']
+    record['artifact_paths'].append(str(filename))
+    record['artifact_path'] = ','.join(record['artifact_paths'])
+    record['resume_artifacts'].append(file_receipt(filename))
+
+
+def add_companion(value, platform, filename):
+    record = value['target_statuses'][platform]['result']
+    receipt = file_receipt(filename)
+    record['additional_artifacts'].append(receipt)
+    record['resume_artifacts'].append(copy.deepcopy(receipt))
+
+
+for platform in platforms:
+    add_primary(multi, platform, Path(state['target_statuses'][platform]['result']['artifact_path']))
+    add_companion(multi, platform, shared)
+    add_companion(multi, platform, notice)
+    add_companion(multi, platform, helper)
+status, response, multi_output, multi_state_path = invoke(multi)
+check('multiple native outputs and complete companion inventory recover together',
+      status == 0 and response.get('recovered_targets') == 7 and response.get('recovered_artifacts') == 17 and
+      response.get('companion_artifacts') == 3)
+if status == 0:
+    multi_release = multi_output / 'release'
+    multi_manifest = json.loads((multi_release / 'build-manifest.json').read_bytes())
+    check('task summaries count workers rather than files', multi_manifest['summary'] == dict(total=7, success=7, failed=0) and
+          len(multi_manifest['build_environments']) == 7)
+    check('all fourteen primary payloads remain separately attributed',
+          all(len([a for a in multi_manifest['artifacts'] if a['target'] == p]) == 2 for p in platforms))
+    check('shared companions have one explicit additional row without an invented compiler target',
+          {a['name'] for a in multi_manifest['artifacts'] if a['target'] == 'additional'} ==
+          {'LICENSE', 'NOTICE', 'install-helper.sh'} and
+          all('target_triple' not in a and a['archive_format'] == 'none' for a in multi_manifest['artifacts'] if a['target'] == 'additional'))
+    check('shared custody retains every original worker reference',
+          len(multi_manifest['recovery_evidence']['artifacts']) == 35 and
+          {r['task_key'] for r in multi_manifest['recovery_evidence']['artifacts'] if r['name'] == 'LICENSE'} == set(platforms))
+    check('companion bytes and exact executable bits survive copying',
+          (multi_release / 'artifacts/NOTICE').read_bytes() == notice.read_bytes() and
+          (multi_release / 'artifacts/install-helper.sh').stat().st_mode & 0o111 == helper.stat().st_mode & 0o111)
+    check('complete multi-file source state is retained unchanged',
+          (multi_release / 'inputs/state.json').read_bytes() == multi_state_path.read_bytes())
+    check('both raw and archived Linux outputs remain independently usable',
+          run([str(multi_release / 'artifacts/demo-linux_amd64')]).decode().strip() == 'linux/amd64' and
+          any(a['target'] == 'linux/amd64' and a['archive_format'] == 'tar.gz' for a in multi_manifest['artifacts']))
+else:
+    print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)
+reordered = copy.deepcopy(multi)
+reordered['context']['build_tasks'].reverse()
+for saved in reordered['target_statuses'].values():
+    record = saved['result']
+    for field in ('artifact_paths', 'resume_artifacts', 'additional_artifacts'):
+        record[field].reverse()
+    record['artifact_path'] = ','.join(record['artifact_paths'])
+status, response, reordered_output, _ = invoke(reordered)
+check('worker and path ordering cannot change the published artifact identities', status == 0 and
+      json.loads((reordered_output / 'release/build-manifest.json').read_bytes())['artifacts'] ==
+      json.loads((multi_output / 'release/build-manifest.json').read_bytes())['artifacts'])
+status, response, destination, _ = invoke(multi, arguments=['--dry-run'])
+check('multi-file dry-run reports exact unique assets and every sharing task', status == 0 and not destination.exists() and
+      len(response.get('artifacts', [])) == 17 and
+      next((a.get('task_keys') for a in response.get('artifacts', []) if a['name'] == 'LICENSE'), []) == sorted(platforms))
+multi_baseline = os.environ.get('DSR_RECOVERY_MULTI_BASELINE')
+if multi_baseline:
+    status, response, destination, _ = invoke(multi, module_override=multi_baseline)
+    check('unchanged archive-only incumbent reproduces multi-file refusal', status == 4 and not destination.exists() and
+          'exactly one primary payload receipt' in response.get('error', ''))
+
+separate_shared = copy.deepcopy(multi)
+second_dir = extra_dir / 'second'
+second_dir.mkdir()
+separate_license = second_dir / 'LICENSE'
+separate_license.write_bytes(shared.read_bytes())
+record = separate_shared['target_statuses']['linux/arm64']['result']
+for field in ('resume_artifacts', 'additional_artifacts'):
+    record[field] = [file_receipt(separate_license) if r['path'] == str(shared) else r for r in record[field]]
+status, response, _, _ = invoke(separate_shared)
+check('byte-identical independent companions deduplicate without dropping source custody',
+      status == 0 and response.get('companion_artifacts') == 3)
+separate_license.chmod(0o755)
+refuse('equal companion bytes with conflicting executable modes refuse', separate_shared, code=4)
+separate_license.chmod(0o644)
+separate_license.write_bytes(b'conflicting shared license\n')
+for field in ('resume_artifacts', 'additional_artifacts'):
+    record[field] = [file_receipt(separate_license) if r['path'] == str(separate_license) else r for r in record[field]]
+refuse('different companions cannot silently claim the same published name', separate_shared, code=4)
+
+for field in ('artifact_paths', 'resume_artifacts', 'additional_artifacts'):
+    candidate = copy.deepcopy(multi)
+    record = candidate['target_statuses']['linux/amd64']['result']
+    record[field].pop()
+    refuse('missing inventory entry refuses: ' + field, candidate, code=4)
+    candidate = copy.deepcopy(multi)
+    record = candidate['target_statuses']['linux/amd64']['result']
+    record[field].append(copy.deepcopy(record[field][0]))
+    refuse('duplicate inventory entry refuses: ' + field, candidate, code=4)
+candidate = copy.deepcopy(multi)
+candidate['target_statuses']['linux/amd64']['result']['additional_artifacts'][0]['sha256'] = '0' * 64
+refuse('additional descriptor must equal its separately frozen resume receipt', candidate, code=4)
+candidate = copy.deepcopy(multi)
+record = candidate['target_statuses']['linux/amd64']['result']
+record['additional_artifacts'].append(file_receipt(Path(record['artifact_paths'][0])))
+record['resume_artifacts'].append(copy.deepcopy(record['additional_artifacts'][-1]))
+refuse('one asset cannot claim both primary and companion roles', candidate, code=4)
+candidate = copy.deepcopy(state)
+native_companion = extra_dir / 'unclassified-native'
+native_companion.write_bytes(native_bytes['darwin/amd64'])
+add_companion(candidate, 'linux/amd64', native_companion)
+refuse('native executable cannot bypass target identity as a shared companion', candidate, code=4)
+empty = extra_dir / 'EMPTY'
+empty.write_bytes(b'')
+candidate = copy.deepcopy(state)
+add_companion(candidate, 'linux/amd64', empty)
+refuse('empty standalone companions refuse rather than violate the release manifest contract', candidate, code=4)
+for filename in ('SHA256SUMS', 'checksums.txt', 'demo.minisig', 'demo.sha256', 'demo.sbom.spdx.json',
+                 'demo.intoto.jsonl', 'build-manifest.json', 'demo.sig'):
+    companion = extra_dir / filename
+    companion.write_bytes(b'old filename-bearing attestation\n')
+    candidate = copy.deepcopy(state)
+    add_companion(candidate, 'linux/amd64', companion)
+    refuse('stale attestation cannot be copied after primary rename: ' + filename, candidate, code=4)
+
+candidate = copy.deepcopy(state)
+comma_primary = extra_dir / 'extra-tool'
+comma_primary.write_bytes(native_bytes['linux/amd64'])
+comma_primary.chmod(0o755)
+add_primary(candidate, 'linux/amd64', comma_primary)
+status, response, _, _ = invoke(candidate)
+check('authoritative primary array preserves commas in parent paths', status == 0 and response.get('recovered_artifacts') == 8)
+
+# This is a fault injector around a GENUINE Git invocation, not a substitute
+# source verifier. It mutates only the private output after all bytes have been
+# copied, preserving every real Git response and requiring an explicit marker.
+fault_dir = work / 'fault-tools'
+fault_dir.mkdir()
+real_git = shutil.which('git')
+fault_tool = fault_dir / 'git'
+fault_tool.write_text('#!' + sys.executable + '\n' + r'''
+import os
+from pathlib import Path
+import subprocess
+import sys
+result = subprocess.run([os.environ['RECOVERY_REAL_GIT'], *sys.argv[1:]])
+output = Path(os.environ['RECOVERY_FAULT_OUTPUT'])
+marker = Path(os.environ['RECOVERY_FAULT_MARKER'])
+stages = list(output.glob('.recovery-*')) if output.exists() else []
+if result.returncode == 0 and not marker.exists() and len(stages) == 1 and 'refs/tags/v1.2.3^{commit}' in sys.argv:
+    stage = stages[0]
+    kind = os.environ['RECOVERY_FAULT_KIND']
+    if kind == 'extra':
+        (stage / 'artifacts/unlisted-asset').write_bytes(b'unlisted bytes')
+    elif kind == 'mode':
+        next((stage / 'artifacts').iterdir()).chmod(0o600)
+    elif kind == 'replacement':
+        victim = next((stage / 'artifacts').iterdir())
+        data = victim.read_bytes()
+        victim.rename(output / 'retained-original-copy')
+        victim.write_bytes(data)
+    elif kind == 'bytes':
+        victim = next((stage / 'artifacts').iterdir())
+        with victim.open('r+b') as stream:
+            stream.seek(-1, os.SEEK_END)
+            value = stream.read(1)
+            stream.seek(-1, os.SEEK_END)
+            stream.write(bytes([value[0] ^ 1]))
+    else:
+        victim = stage / {'manifest': 'build-manifest.json', 'result': 'result.json', 'state': 'inputs/state.json'}[kind]
+        victim.write_bytes(victim.read_bytes() + b' ')
+    marker.write_text(kind)
+raise SystemExit(result.returncode)
+''')
+fault_tool.chmod(0o755)
+
+
+def inject(kind, selected_module=None):
+    destination = work / ('fault-%s-%d' % (kind, counter))
+    marker = work / ('fault-%s-%d.marker' % (kind, counter))
+    environment = dict(os.environ, PATH=str(fault_dir) + os.pathsep + os.environ['PATH'],
+        RECOVERY_REAL_GIT=real_git, RECOVERY_FAULT_OUTPUT=str(destination), RECOVERY_FAULT_MARKER=str(marker),
+        RECOVERY_FAULT_KIND=kind)
+    status, response, destination, _ = invoke(state, output=destination, env=environment, module_override=selected_module)
+    return status, response, destination, marker
+
+
+for kind in ('bytes', 'replacement', 'mode', 'extra', 'manifest', 'result', 'state'):
+    status, response, destination, marker = inject(kind)
+    check('staged ' + kind + ' tampering refuses before publication after genuine Git verification',
+          marker.exists() and marker.read_text() == kind and status != 0 and response.get('status') == 'error' and
+          not (destination / 'release').exists())
+if multi_baseline:
+    status, response, destination, marker = inject('bytes', multi_baseline)
+    inconsistent = False
+    if status == 0:
+        evidence = json.loads((destination / 'release/build-manifest.json').read_bytes())
+        inconsistent = any(sha((destination / 'release/artifacts' / a['name']).read_bytes()) != a['sha256']
+                           for a in evidence['artifacts'])
+    check('unchanged incumbent actually publishes the staged-byte counterexample',
+          marker.exists() and status == 0 and inconsistent)
 
 original = Path(state['target_statuses']['linux/amd64']['result']['artifact_path'])
 backup = original.read_bytes()

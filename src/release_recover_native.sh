@@ -151,6 +151,22 @@ def archive_format(filename):
     return "", "binary"
 
 
+def valid_receipt(receipt):
+    return (isinstance(receipt, dict) and set(receipt) == {"path", "sha256", "size_bytes", "identity"} and
+            isinstance(receipt["path"], str) and match(receipt["sha256"], r"[0-9a-f]{64}") and
+            type(receipt["size_bytes"]) is int and 0 < receipt["size_bytes"] <= args.max_artifact_bytes and
+            match(receipt["identity"], r"(?:gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)"))
+
+
+def companion_name(filename):
+    # Renaming a payload invalidates filename-bearing checksum/provenance
+    # metadata. Do not copy it unchanged or manufacture a fresh attestation.
+    lower = filename.lower()
+    return (name(filename) and not lower.startswith("sha256sums") and lower != "checksums.txt" and
+            not lower.endswith((".sha256", ".sha512", ".minisig", ".sig", ".asc", ".intoto.jsonl")) and
+            ".sbom." not in lower and not lower.endswith("manifest.json"))
+
+
 def inspect_archive(selected, admitted_info, format_name, platform):
     """Inspect authenticated archive bytes without extracting any member."""
     nodes, files, executables = {}, [], []
@@ -368,7 +384,7 @@ def select_workers(state):
         need(len(variants) == 1 or all(t["target_triple"] and
              t["key"] == platform + "@" + t["target_triple"] for t in variants),
              "same-platform variants require explicit compiler task identities", 4)
-    selected, names, originals = [], set(), set()
+    selected, names, originals = [], {}, {}
     for task in sorted(tasks, key=lambda t: t["key"]):
         saved = statuses[task["key"]]
         result = saved["result"]
@@ -402,45 +418,78 @@ def select_workers(state):
                  (not isolation or isolation.get("toolchain", {}).get("target_triple", triple) == triple),
                  "compiler target contradicts retained build evidence", 4)
         receipts = result.get("resume_artifacts")
-        need(isinstance(receipts, list) and len(receipts) == 1 and isinstance(receipts[0], dict),
-             "each task must retain exactly one primary payload receipt", 4)
-        receipt = receipts[0]
-        need(set(receipt) == {"path", "sha256", "size_bytes", "identity"} and
-             match(receipt["sha256"], r"[0-9a-f]{64}") and type(receipt["size_bytes"]) is int and
-             0 < receipt["size_bytes"] <= args.max_artifact_bytes and
-             match(receipt["identity"], r"(?:gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)"), "invalid worker receipt", 4)
-        original = path(receipt["path"])
-        need(original.is_relative_to(artifacts_root) and original != artifacts_root and original not in originals,
-             "worker artifact escapes the selected root or is shared by tasks", 4)
-        need(result.get("artifact_path") == str(original) and result.get("artifact_paths") == [str(original)] and
-             result.get("additional_artifacts", []) == [] and not result.get("artifact_dir"),
-             "worker artifact inventory differs from its single primary receipt", 4)
-        originals.add(original)
-        extension, format_name = archive_format(original.name)
-        stem = original.name[:-len(extension)] if extension else (
-            original.name[:-4] if original.name.lower().endswith(".exe") else original.name)
-        suffix = triple if triple else task["platform"].replace("/", "_")
-        published = stem + "-" + suffix + (extension or (".exe" if task["platform"].startswith("windows/") else ""))
-        need(name(published) and published.casefold() not in names, "unsafe or colliding recovered asset name", 4)
-        names.add(published.casefold())
-        selected.append(dict(task=task, result=result, receipt=receipt, path=original, name=published,
-                             completed_at=completed_at, format=format_name))
+        primaries, additional = result.get("artifact_paths"), result.get("additional_artifacts", [])
+        need(isinstance(primaries, list) and 1 <= len(primaries) <= 256 and
+             all(isinstance(p, str) and p for p in primaries) and len(set(primaries)) == len(primaries) and
+             result.get("artifact_path") == ",".join(primaries) and not result.get("artifact_dir"),
+             "worker primary array is missing, duplicated or inconsistent", 4)
+        need(isinstance(additional, list) and len(additional) <= 256 and all(valid_receipt(r) for r in additional),
+             "invalid additional-artifact receipt inventory", 4)
+        extra_paths = [r["path"] for r in additional]
+        need(len(set(extra_paths)) == len(extra_paths) and not set(extra_paths) & set(primaries),
+             "additional assets duplicate primaries or each other", 4)
+        need(isinstance(receipts, list) and len(receipts) == len(primaries) + len(additional) and
+             all(valid_receipt(r) for r in receipts) and len({r["path"] for r in receipts}) == len(receipts),
+             "invalid or incomplete worker receipt inventory", 4)
+        by_path = {r["path"]: r for r in receipts}
+        need(set(by_path) == set(primaries) | set(extra_paths) and
+             all(by_path[r["path"]] == r for r in additional),
+             "worker artifact inventory differs from its frozen receipts", 4)
+        for selected_path in sorted(by_path):
+            receipt = by_path[selected_path]
+            original = path(selected_path)
+            role = "primary" if selected_path in primaries else "additional"
+            need(original.is_relative_to(artifacts_root) and original != artifacts_root,
+                 "worker artifact escapes the selected root", 4)
+            previous = originals.get(original)
+            need(previous is None or (role == "additional" and previous == (role, receipt)),
+                 "worker artifact is shared by distinct primary tasks or roles", 4)
+            originals[original] = (role, receipt)
+            if role == "primary":
+                extension, format_name = archive_format(original.name)
+                stem = original.name[:-len(extension)] if extension else (
+                    original.name[:-4] if original.name.lower().endswith(".exe") else original.name)
+                suffix = triple if triple else task["platform"].replace("/", "_")
+                published = stem + "-" + suffix + (extension or (".exe" if task["platform"].startswith("windows/") else ""))
+            else:
+                published, format_name = original.name, "none"
+                need(companion_name(published), "additional attestation or unsafe name cannot be recovered unchanged", 4)
+            need(name(published), "unsafe recovered asset name", 4)
+            descriptor = (published, role, receipt["sha256"], receipt["size_bytes"])
+            previous = names.get(published.casefold())
+            need(previous is None or (role == "additional" and previous == descriptor),
+                 "colliding recovered asset name or conflicting companion content", 4)
+            names[published.casefold()] = descriptor
+            selected.append(dict(task=task, result=result, receipt=receipt, path=original, name=published,
+                                 completed_at=completed_at, format=format_name, role=role))
     return selected
 
 
 def check_artifact(worker, destination=None):
     data, _, info = read_file(worker["path"], worker["receipt"], destination, args.max_artifact_bytes)
+    observed = identity(info)
+    need(worker.get("admitted_identity", observed) == observed, "artifact metadata changed during recovery")
+    worker["admitted_identity"] = observed
     if worker["format"] == "binary":
         need(binary_platform(data) == worker["task"]["platform"], "executable architecture differs from its worker target: " + worker["name"])
         executable = bool(info.st_mode & 0o111)
         need(executable or worker["task"]["platform"].startswith("windows/"), "Unix payload is not executable")
+    elif worker["format"] == "none":
+        # Companions are copied as opaque assets, never executed or asserted
+        # to be a native build for every platform sharing their name.
+        need(not data.startswith((b"\x7fELF", b"MZ", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe")) and
+             not worker["name"].lower().endswith(".exe"),
+             "native executables must be declared as primary outputs", 4)
+        executable = bool(info.st_mode & 0o111)
     else:
         evidence = inspect_archive(worker["path"], info, worker["format"], worker["task"]["platform"])
         need(worker.get("archive_inventory", evidence) == evidence, "archive inventory changed during recovery")
         worker["archive_inventory"] = evidence
         executable = False
+    mode = (0o644 | (info.st_mode & 0o111)) if executable else 0o644
     if destination is not None:
-        destination.chmod(0o755 if executable else 0o644)
+        destination.chmod(mode)
+    return mode
 
 
 def save(destination, data):
@@ -448,6 +497,28 @@ def save(destination, data):
         stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
+        saved_identity = identity(os.fstat(stream.fileno()))
+    need(identity(destination.lstat()) == saved_identity, "recovery document replaced while writing")
+    return saved_identity
+
+
+def verify_stage(stage, directories, outputs, documents):
+    # Re-admit the COPIES, not just their original worker paths. This also
+    # catches an altered manifest or an extra uploadable file before rename.
+    for directory, expected in directories.items():
+        observed = path(str(directory)).lstat()
+        need(stat.S_ISDIR(observed.st_mode) and (observed.st_dev, observed.st_ino) == expected,
+             "recovery staging directory changed", 2)
+    need({p.name for p in stage.iterdir()} == {"artifacts", "inputs", "build-manifest.json", "result.json"} and
+         {p.name for p in (stage / "inputs").iterdir()} == {"state.json"} and
+         {p.name for p in (stage / "artifacts").iterdir()} == set(outputs),
+         "recovery staging inventory changed", 2)
+    for filename, (receipt, expected_info) in outputs.items():
+        _, _, info = read_file(stage / "artifacts" / filename, receipt, limit=args.max_artifact_bytes)
+        need(identity(info) == expected_info, "recovered artifact metadata changed")
+    for selected, (data, expected_info) in documents.items():
+        current, _, info = read_file(selected)
+        need(current == data and identity(info) == expected_info, "recovery document changed before publication")
 
 
 def interrupted(signum, frame):
@@ -490,13 +561,22 @@ try:
     state = document(state_bytes)
     workers = select_workers(state)
     source_identity()
+    output_workers = {}
     for worker in workers:
-        check_artifact(worker)
+        worker["output_mode"] = check_artifact(worker)
+        previous = output_workers.get(worker["name"])
+        need(previous is None or previous["output_mode"] == worker["output_mode"],
+             "shared companion executable modes differ", 4)
+        output_workers[worker["name"]] = worker
+    task_count = len(state["context"]["build_tasks"])
     if args.dry_run or os.environ.get("DRY_RUN") == "true":
         print(canonical(dict(kind="dsr-native-recovery", status="planned", exit_code=0, dry_run=True,
-            state_sha256=state_hash, artifacts=[dict(task_key=w["task"]["key"], name=w["name"],
-                target=w["task"]["platform"], sha256=w["receipt"]["sha256"], archive_format=w["format"])
-                for w in workers])).decode(), end="")
+            state_sha256=state_hash, recovered_targets=task_count,
+            artifacts=[dict(name=w["name"], role=w["role"],
+                target=w["task"]["platform"] if w["role"] == "primary" else "additional",
+                task_keys=sorted({v["task"]["key"] for v in workers if v["name"] == w["name"]}),
+                sha256=w["receipt"]["sha256"], archive_format=w["format"])
+                for w in sorted(output_workers.values(), key=lambda row: row["name"])])).decode(), end="")
         sys.exit(0)
     # Admission above performs no writes. Failure below leaves private evidence
     # but never a release/ directory or a successful receipt.
@@ -506,21 +586,32 @@ try:
     stage = Path(tempfile.mkdtemp(prefix=".recovery-", dir=root))
     (stage / "artifacts").mkdir()
     (stage / "inputs").mkdir()
-    save(stage / "inputs/state.json", state_bytes)
-    artifacts, environments, mapping = [], [], []
+    directories = {p: (p.stat().st_dev, p.stat().st_ino) for p in (stage, stage / "artifacts", stage / "inputs")}
+    documents = {stage / "inputs/state.json": (state_bytes, save(stage / "inputs/state.json", state_bytes))}
+    artifacts, environments, mapping, copies = [], {}, [], {}
     for worker in workers:
-        check_artifact(worker, stage / "artifacts" / worker["name"])
         task, result, receipt = worker["task"], worker["result"], worker["receipt"]
-        artifact = dict(name=worker["name"], target=task["platform"], sha256=receipt["sha256"],
-            size_bytes=receipt["size_bytes"], archive_format=worker["format"], signed=False, signature_file="")
+        if worker["name"] not in copies:
+            destination = stage / "artifacts" / worker["name"]
+            check_artifact(worker, destination)
+            info = destination.lstat()
+            copied_receipt = dict(receipt, path=str(destination), identity="gnu:%d:%d" % (info.st_dev, info.st_ino))
+            _, _, copied_info = read_file(destination, copied_receipt, limit=args.max_artifact_bytes)
+            copies[worker["name"]] = (copied_receipt, identity(copied_info))
+            artifact = dict(name=worker["name"], target=task["platform"] if worker["role"] == "primary" else "additional",
+                sha256=receipt["sha256"], size_bytes=receipt["size_bytes"], archive_format=worker["format"],
+                signed=False, signature_file="")
+            if task["target_triple"] and worker["role"] == "primary":
+                artifact["target_triple"] = task["target_triple"]
+            artifacts.append(artifact)
         environment = dict(target=task["platform"], host=result["host"], method="native",
             build_influence_env=result.get("build_influence_env", {}), cargo_isolation=result.get("cargo_isolation"))
         if task["target_triple"]:
-            artifact["target_triple"] = environment["target_triple"] = task["target_triple"]
-        artifacts.append(artifact)
-        environments.append(environment)
+            environment["target_triple"] = task["target_triple"]
+        environments[task["key"]] = environment
         mapping.append(dict(task_key=task["key"], source_path=str(worker["path"]), name=worker["name"],
-            sha256=receipt["sha256"], size_bytes=receipt["size_bytes"], worker_identity=receipt["identity"]))
+            sha256=receipt["sha256"], size_bytes=receipt["size_bytes"], worker_identity=receipt["identity"],
+            role=worker["role"], executable_bits=worker["output_mode"] & 0o111))
         if "archive_inventory" in worker:
             mapping[-1]["archive_inventory"] = worker["archive_inventory"]
     manifest = dict(schema_version="1.0.0", tool=state["tool"], version=args.tag, run_id=state["run_id"],
@@ -528,20 +619,23 @@ try:
                     dependencies=[]),
         built_at=max(w["completed_at"] for w in workers),
         status="success", build_purpose="release", publishable=True,
-        summary=dict(total=len(workers), success=len(workers), failed=0), requested_targets=sorted(state["targets"]),
-        artifacts=sorted(artifacts, key=lambda a: a["name"]), build_environments=environments,
+        summary=dict(total=task_count, success=task_count, failed=0), requested_targets=sorted(state["targets"]),
+        artifacts=sorted(artifacts, key=lambda a: a["name"]),
+        build_environments=[environments[key] for key in sorted(environments)],
         recovery_evidence=dict(kind="ordinary-native-worker-recovery", schema_version=1,
             state_sha256=state_hash, source_verification="tag-identity-only", dependency_pins_verified=False,
             built_at_basis="latest-completed-target-checkpoint",
             recovered_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             original_status=state["status"], artifacts=mapping))
     manifest_bytes = canonical(manifest)
-    save(stage / "build-manifest.json", manifest_bytes)
+    documents[stage / "build-manifest.json"] = (manifest_bytes, save(stage / "build-manifest.json", manifest_bytes))
     result = dict(kind="dsr-native-recovery", status="verified", exit_code=0,
         manifest=str(root / "release/build-manifest.json"), manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
-        artifacts_dir=str(root / "release/artifacts"), state_sha256=state_hash, recovered_targets=len(workers),
+        artifacts_dir=str(root / "release/artifacts"), state_sha256=state_hash, recovered_targets=task_count,
+        recovered_artifacts=len(artifacts), companion_artifacts=sum(a["target"] == "additional" for a in artifacts),
         strict_source_verified=False, dependency_pins_verified=False)
-    save(stage / "result.json", canonical(result))
+    result_bytes = canonical(result)
+    documents[stage / "result.json"] = (result_bytes, save(stage / "result.json", result_bytes))
     # Recheck original custody and repository identity after copying. Never
     # repair a failed checkpoint by rehashing changed files into a new claim.
     for worker in workers:
@@ -550,6 +644,7 @@ try:
     need(final_bytes == state_bytes and final_hash == state_hash and identity(final_info) == identity(state_info),
          "build state changed during recovery", 2)
     source_identity()
+    verify_stage(stage, directories, copies, documents)
     need(not root.is_symlink() and (root.stat().st_dev, root.stat().st_ino) == root_identity and
          not (root / "release").exists() and not (root / "release").is_symlink(), "recovery destination changed", 2)
     os.rename(stage, root / "release")
