@@ -163,6 +163,56 @@ def refuse(label, value=None, code=None, **kwargs):
           response.get('exit_code') == status and response.get('status') == 'error' and not (destination / 'release').exists())
 
 
+# This is the actual terminal worker checkpoint emitted by
+# act_orchestrate_build before cmd_build's collection/packaging phase. It must
+# not need a manual state edit to "failed" before recovery will accept it.
+checkpoint = copy.deepcopy(state)
+checkpoint['status'] = 'targets-complete'
+checkpoint_baseline = os.environ.get('DSR_RECOVERY_CHECKPOINT_BASELINE')
+if checkpoint_baseline:
+    status, response, destination, selected_state = invoke(checkpoint, module_override=checkpoint_baseline)
+    check('unchanged incumbent rejects the production targets-complete checkpoint',
+          status == 2 and response.get('status') == 'error' and not destination.exists() and
+          response.get('error') == 'active, pending or cancelled builds cannot be recovered')
+status, response, destination, selected_state = invoke(checkpoint)
+check('production targets-complete checkpoint recovers all seven native workers',
+      status == 0 and response.get('recovered_targets') == 7 and response.get('recovered_artifacts') == 7)
+if status == 0:
+    recovered = destination / 'release'
+    recovered_manifest = json.loads((recovered / 'build-manifest.json').read_bytes())
+    check('recovery leaves the original targets-complete state byte-identical',
+          selected_state.read_bytes() == encoded(checkpoint) == (recovered / 'inputs/state.json').read_bytes())
+    check('recovery records incomplete coordinator status without claiming strict verification',
+          recovered_manifest['recovery_evidence']['original_status'] == 'targets-complete' and
+          response['strict_source_verified'] is False and response['dependency_pins_verified'] is False)
+    check('recovered checkpoint retains complete target and raw artifact identity',
+          {a['target'] for a in recovered_manifest['artifacts']} == set(platforms) and
+          all((recovered / 'artifacts' / a['name']).read_bytes() ==
+              Path(checkpoint['target_statuses'][a['target']]['result']['artifact_path']).read_bytes()
+              for a in recovered_manifest['artifacts']))
+    check('recovered checkpoint executable runs without rebuilding',
+          run([str(recovered / 'artifacts/demo-linux_amd64')]).decode().strip() == 'linux/amd64')
+else:
+    print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)
+status, response, destination, _ = invoke(checkpoint, arguments=['--dry-run'])
+check('targets-complete dry-run validates the entire worker set without writes',
+      status == 0 and response.get('status') == 'planned' and response.get('recovered_targets') == 7 and
+      not destination.exists())
+for worker_status in ('running', 'pending', 'failed'):
+    candidate = copy.deepcopy(checkpoint)
+    candidate['target_statuses']['darwin/arm64']['status'] = worker_status
+    refuse('targets-complete cannot hide a ' + worker_status + ' worker', candidate, code=4)
+candidate = copy.deepcopy(checkpoint)
+candidate['target_statuses'].pop('darwin/arm64')
+refuse('targets-complete cannot omit the Apple Silicon checkpoint', candidate, code=4)
+candidate = copy.deepcopy(checkpoint)
+candidate['target_statuses']['linux/amd64']['result']['resume_artifacts'][0]['sha256'] = '0' * 64
+refuse('targets-complete cannot rebless a changed worker artifact', candidate, code=7)
+candidate = copy.deepcopy(checkpoint)
+candidate['context']['build_purpose'] = 'diagnostic-native'
+refuse('targets-complete cannot promote diagnostic workers', candidate, code=4)
+
+
 refuse('wrong state digest refuses before output', expected_hash='0' * 64, code=7)
 for build_status in ('running', 'pending', 'cancelled'):
     candidate = copy.deepcopy(state)
@@ -307,6 +357,11 @@ else:
 status, response, destination, _ = invoke(packaged, arguments=['--dry-run'])
 check('archive dry-run performs real admission without writing output',
       status == 0 and response.get('status') == 'planned' and not destination.exists())
+packaged_checkpoint = copy.deepcopy(packaged)
+packaged_checkpoint['status'] = 'targets-complete'
+status, response, destination, _ = invoke(packaged_checkpoint)
+check('targets-complete checkpoint recovers the complete native workspace archive matrix',
+      status == 0 and response.get('recovered_targets') == 7 and response.get('recovered_artifacts') == 7)
 
 # Optional controlled comparison runs this exact new input through the
 # unchanged incumbent in the same invocation, not a weakened local replica.

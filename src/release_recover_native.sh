@@ -361,7 +361,13 @@ def select_workers(state):
     need(isinstance(state, dict) and match(state.get("tool"), r"[a-z][a-z0-9_-]*") and
          state.get("version") in (args.tag, args.tag[1:]) and state.get("git_sha") == args.sha and
          state.get("git_ref") in (args.tag, "refs/tags/" + args.tag), "state does not match selected release", 4)
-    need(state.get("status") in ("failed", "partial", "completed"), "active, pending or cancelled builds cannot be recovered", 2)
+    # The scheduler seals successful workers as targets-complete and releases
+    # its orchestration lock BEFORE cmd_build collects/packages their output.
+    # A failure in that handoff leaves this exact checkpoint, not "failed".
+    # Admit it only through the same complete-worker and frozen-byte checks
+    # below; never rewrite the original checkpoint to claim a completed build.
+    need(state.get("status") in ("failed", "partial", "targets-complete", "completed"),
+         "active, pending or cancelled builds cannot be recovered", 2)
     need(str(uuid.UUID(state["run_id"])) == state["run_id"], "invalid build run UUID", 4)
     context, statuses, targets = state["context"], state["target_statuses"], state["targets"]
     need(context.get("build_purpose") == "release" and context.get("publishable") is True,
