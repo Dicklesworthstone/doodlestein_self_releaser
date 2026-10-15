@@ -19,6 +19,10 @@ import subprocess
 import sys
 import tempfile
 import time
+try:
+    from jsonschema import Draft202012Validator, FormatChecker
+except ImportError:
+    raise SystemExit('Verifier contract tests require Python jsonschema')
 
 root = Path(sys.argv[1])
 work = Path(tempfile.mkdtemp(prefix='dsr-verify-cli-tests-'))
@@ -230,6 +234,14 @@ def execute(label, expected=0, extra=(), mutate=None, dry=False, mode=None, chec
     return base,spec,env,value
 
 base,spec,env,value=execute('full-five')
+envelope_schema=json.loads((root/'schemas/envelope.json').read_text())
+Draft202012Validator.check_schema(envelope_schema)
+envelope_validator=Draft202012Validator(envelope_schema,format_checker=FormatChecker())
+check('real verifier result satisfies the public envelope schema',not list(envelope_validator.iter_errors(value)))
+check('public envelope still rejects unknown command identifiers',
+      bool(list(envelope_validator.iter_errors(dict(value,command='unsupported-command')))))
+check('public envelope still rejects Boolean exit codes',
+      bool(list(envelope_validator.iter_errors(dict(value,exit_code=True)))))
 check('all five payloads reach root checksum report',value['details']['checksums']['verified_count']==5)
 check('checksum report identifies all deliberate exclusions',
       {r['reason'] for r in value['details']['checksums']['excluded_assets']}=={'checksum-aggregate','provenance-or-sbom'})

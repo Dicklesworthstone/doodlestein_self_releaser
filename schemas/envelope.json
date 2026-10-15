@@ -25,6 +25,7 @@
         "report",
         "build",
         "release",
+        "release-verify",
         "fallback",
         "repos",
         "prune",
