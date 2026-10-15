@@ -3090,7 +3090,11 @@ EOF
         local name dest
         local orig_name=""
 
-        [[ -z "$src" || ! -f "$src" ]] && return 0
+        if [[ -z "$src" || ! -f "$src" || -L "$src" ]]; then
+            log_error "Missing or linked build artifact: $src"
+            collect_failed=true
+            return 1
+        fi
 
         name=$(basename "$src")
         if [[ "$native_result" == true ]] && ! $build_release_contract_enabled; then
@@ -3101,7 +3105,16 @@ EOF
             fi
         fi
         orig_name="$name"
+        # Qualify raw native outputs before flattening, including the first
+        # arrival. Completion order must never decide which target owns `sbh`.
+        if [[ "$native_result" == true ]] && ! $build_release_contract_enabled &&
+           [[ "$(_act_archive_format "$name")" == none &&
+              "$name" != *linux* && "$name" != *darwin* && "$name" != *windows* ]] &&
+           [[ -z "$target_triple" || "$name" != *"$target_triple"* ]]; then
+            name=$(_build_target_suffix_name "$name" "$target")
+        fi
         dest="$output_dir/$name"
+        artifact_rename_pairs+=("${target}||${target_triple}||${orig_name}"$'\t'"${name}")
 
         if [[ -n "${collected_names[$name]:-}" ]]; then
             local prior="${collected_names[$name]}"
@@ -4282,6 +4295,12 @@ EOF
             target=$(jq -r '.platform // empty' <<< "$target_result")
             method=$(jq -r '.method // empty' <<< "$target_result")
             dir=$(jq -r '.artifact_dir // empty' <<< "$target_result")
+            if jq -e 'has("resume_artifacts")' <<< "$target_result" >/dev/null &&
+               ! _act_target_result_available "$target_result"; then
+                log_error "Worker artifact inventory changed before collection: $target"
+                collect_failed=true
+                continue
+            fi
             target_triple=""; native_result=false
             if [[ "$method" == native ]]; then
                 native_result=true
@@ -4376,7 +4395,13 @@ EOF
                 fi
             done < <(jq -r '.artifacts[] | [.name, .sha256, (.size_bytes | tostring)] | @tsv' "$manifest_file")
         else
-            if ! act_generate_manifest "$result" "$manifest_file"; then
+            local collection_names
+            collection_names=$(printf '%s\n' "${artifact_rename_pairs[@]}" | jq -Rn '
+                reduce inputs as $line ({};
+                    if $line == "" then . else
+                        ($line | split("\t")) as $pair | .[$pair[0]] = $pair[1]
+                    end)') || return 4
+            if ! act_generate_manifest "$result" "$manifest_file" "$collection_names"; then
                 log_error "Build manifest generation failed"
                 manifest_failed=true
             fi
@@ -4388,34 +4413,6 @@ EOF
                 log_error "Could not stage a non-publishable build manifest"
                 manifest_failed=true
             fi
-        fi
-    fi
-
-    if $all_targets_succeeded && ! $build_release_contract_enabled && \
-       [[ -f "$manifest_file" && ${#artifact_rename_pairs[@]} -gt 0 ]]; then
-        local renames_json updated_manifest
-        renames_json=$(printf '%s\n' "${artifact_rename_pairs[@]}" | jq -Rn '
-            reduce inputs as $line ({}; 
-                if ($line | length) == 0 then . else
-                    ($line | split("\t") | { (.[0]): .[1] }) as $pair
-                    | . + $pair
-                end
-            )
-        ')
-        updated_manifest=$(jq --argjson renames "$renames_json" '
-            .artifacts = (.artifacts // []) |
-            .artifacts |= map(
-                . as $a |
-                ($renames[($a.target // "") + "||" + ($a.target_triple // "") + "||" + ($a.name // "")] //
-                 $renames[($a.target // "") + "||||" + ($a.name // "")] // "") as $new |
-                if $new != "" then .name = $new else . end
-            )
-        ' "$manifest_file" 2>/dev/null)
-        if [[ -n "$updated_manifest" ]] && printf '%s\n' "$updated_manifest" > "$manifest_file"; then
-            log_info "Updated manifest for ${#artifact_rename_pairs[@]} renamed artifact(s)"
-        else
-            log_error "Failed to update manifest for renamed artifacts"
-            manifest_failed=true
         fi
     fi
 
@@ -4456,6 +4453,12 @@ EOF
             log_error "Failed to merge packaged artifacts into the build manifest"
             manifest_failed=true
         fi
+    fi
+
+    # Packaging may deliberately replace archive bytes. Validate the final
+    # inventory after those replacements, before granting publication authority.
+    if [[ -f "$manifest_file" ]] && ! $manifest_failed; then
+        _act_verify_collected_manifest "$manifest_file" "$output_dir" || manifest_failed=true
     fi
 
     # Resolve the final command status before emitting either JSON or human
@@ -7308,6 +7311,13 @@ EOF
     _release_artifact_candidate_names() {
         local filename="$1" target="$2" format="$3" triple="${4:-}"
         local -a names=("$filename")
+        # Raw aliases are materialized by build packaging and must have their
+        # own manifest rows before signing. Publication cannot invent names
+        # that the signed manifest never enumerated (especially for multi-bin).
+        if [[ "$format" == none || "$format" == binary ]]; then
+            printf '%s\n' "$filename"
+            return 0
+        fi
         local os arch ext names_json versioned compat alias candidate existing duplicate
         if [[ "$target" == */* ]]; then
             os="${target%/*}"
@@ -7349,6 +7359,10 @@ EOF
                 esac
                 for candidate in "$versioned" "$compat" "$alias"; do
                     [[ -n "$candidate" ]] || continue
+                    # Archives obey the same signed inventory boundary as raw
+                    # binaries. Build packaging owns creation of every alias.
+                    jq -e --arg name "$candidate" 'any(.artifacts[];
+                        (.name // .filename) == $name)' <<< "$ordinary_manifest" >/dev/null || continue
                     duplicate=false
                     for existing in "${names[@]}"; do
                         if [[ "$existing" == "$candidate" ]]; then

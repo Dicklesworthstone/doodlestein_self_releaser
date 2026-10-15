@@ -6,8 +6,10 @@ or packaging. It does not rerun the compilers, touch the original state or outpu
 create a Git tag, sign anything, upload assets or dispatch workflows.
 
 This is a recovery path for issues #31 and #45, **not a replacement for the normal
-build command's collector**. The normal collector's rename/manifest mismatch still
-needs its own repair. Recovery requires all requested native targets to have
+build command's collector**. The ordinary collector now passes its resolved names
+into manifest generation before basename deduplication and checks every final
+payload against that manifest before sealing a publishable build. Recovery
+remains useful for older retained runs. Recovery requires all requested native targets to have
 completed, with one or more primary payloads per task: raw executables or
 `tar.gz`, `tgz`, `tar.xz`, or ZIP workspace archives. Explicitly recorded companion
 assets are also preserved. Mixed act/native runs, directory-discovered inventories

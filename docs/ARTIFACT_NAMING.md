@@ -258,6 +258,23 @@ ntm-v1.2.3-checksums.sha256.minisig
 
 ## Build Manifest
 
+Ordinary native raw outputs are qualified before flat collection (for example,
+`sbh_linux_arm64`), including the first target to complete. Configured multi-variant
+triple names remain intact. Collection passes its final name decisions into
+manifest construction before duplicate-name handling; conflicting bytes are an
+error, never a reason to silently omit another worker's artifact. Declared missing
+payloads fail collection and manifest generation. After packaging and alias
+creation, every final manifest name, size and digest is checked against the
+collected file before publication authority is granted.
+
+Publication uses raw names exactly as listed in the manifest. Archive aliases
+are also restricted to names already enumerated there. Build packaging must
+materialize compatibility aliases before the manifest is signed; publication
+does not synthesize unsigned payload names or rewrite an existing signature.
+`SHA256SUMS` and per-asset checksum sidecars use that same resolved inventory.
+The regression is `scripts/tests/test_ordinary_collection_inventory.sh`; its
+four-platform payloads and host metadata are fixtures, not native build claims.
+
 Every build produces a manifest JSON file:
 ```
 {tool}-{version}-manifest.json

@@ -13019,9 +13019,29 @@ _act_generate_contract_manifest() {
 
 # Generate build manifest from orchestration results
 # Usage: act_generate_manifest <orchestration_result_json> <output_file>
+_act_verify_collected_manifest() {
+    local manifest="$1" directory="$2" name sha size path
+    jq -e '.artifacts | length > 0 and
+        (map(.name) | length == (unique | length)) and
+        all(.[]; (.name | type == "string" and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$")))' "$manifest" >/dev/null || return 4
+    while IFS=$'\t' read -r name sha size; do
+        path="$directory/$name"
+        if [[ ! -f "$path" || -L "$path" ]] ||
+           [[ "$(_act_sha256 "$path")" != "$sha" || "$(_act_file_size "$path")" != "$size" ]]; then
+            _log_error "Final collected artifact disagrees with manifest: $name"
+            return 4
+        fi
+    done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' "$manifest")
+    return 0
+}
+
 act_generate_manifest() {
     local result_json="$1"
     local output_file="$2"
+    local collection_names="${3-}"
+    [[ -n "$collection_names" ]] || collection_names='{}'
+    jq -e 'type == "object" and all(.[]; type == "string")' <<< "$collection_names" >/dev/null || return 4
 
     if ! jq -e 'type == "object"' <<< "$result_json" >/dev/null 2>&1; then
         _log_error "Cannot generate manifest from invalid orchestration JSON"
@@ -13165,8 +13185,8 @@ act_generate_manifest() {
         local declared_triple="${3:-}" native_result="${4:-false}"
 
         if [[ -z "$file" || ! -f "$file" ]]; then
-            [[ "$native_result" != true ]] || return 4
-            return 0
+            _log_error "Declared artifact is missing: $file"
+            return 4
         fi
         [[ -z "$target" ]] && return 0
 
@@ -13188,6 +13208,12 @@ act_generate_manifest() {
             fi
             seen_native_paths["$file"]="$target|$declared_triple"
         fi
+        local collected_name
+        collected_name=$(jq -r --arg key "$target||$declared_triple||$name" '.[$key] // empty' <<< "$collection_names") || return 4
+        if [[ -n "$collected_name" ]]; then
+            _act_is_safe_basename "$collected_name" || return 4
+            name="$collected_name"
+        fi
 
         # Skip exact-path duplicates AND name-collision duplicates. Without
         # the name dedup the manifest gets one entry per orchestration target
@@ -13198,9 +13224,6 @@ act_generate_manifest() {
         for seen in "${seen_paths[@]}"; do
             [[ "$seen" == "$file" ]] && return 0
         done
-        if [[ -n "${seen_names[$name]:-}" && "$native_result" != true ]]; then
-            return 0
-        fi
 
         local sha size format
         sha=$(_act_sha256 "$file" 2>/dev/null || echo "")
@@ -13209,15 +13232,15 @@ act_generate_manifest() {
 
         if [[ -z "$sha" ]]; then
             _log_warn "Unable to compute SHA256 for artifact: $file"
-            return 0
+            return 4
         fi
         if [[ -z "$size" || "$size" -le 0 ]]; then
             _log_warn "Unable to determine size for artifact: $file"
-            return 0
+            return 4
         fi
         if [[ -n "${seen_names[$name]:-}" ]]; then
             if [[ "${seen_names[$name]}" != "$sha" ]]; then
-                _log_error "Native artifacts have the same release name and different bytes: $name"
+                _log_error "Artifacts have the same release name and different bytes: $name"
                 return 4
             fi
             return 0
@@ -13411,6 +13434,11 @@ act_generate_manifest() {
 
     while IFS= read -r target_json; do
         [[ -z "$target_json" ]] && continue
+        if jq -e 'has("resume_artifacts")' <<< "$target_json" >/dev/null &&
+           ! _act_target_result_available "$target_json"; then
+            _log_error "Worker artifact inventory changed before manifest generation"
+            return 4
+        fi
         local target method native_result=false declared_triple="" array_count
         target=$(echo "$target_json" | jq -r '.platform // .target // empty' 2>/dev/null)
         method=$(jq -r '.method // empty' <<< "$target_json")
@@ -13428,8 +13456,9 @@ act_generate_manifest() {
             [[ -n "$artifact_path" ]] || continue
             _act_manifest_add_file "$artifact_path" "$target" "$declared_triple" "$native_result" || return $?
         done < <(jq -j --argjson count "$array_count" '
-            (if $count > 0 then .artifact_paths[] else
-                (.artifact_path // "" | split(",")[]) end) | ., "\u0000"
+            ((if $count > 0 then .artifact_paths[] else
+                (.artifact_path // "" | split(",")[]) end),
+             ((.additional_artifacts // [])[]? | .path // "")) | ., "\u0000"
         ' <<< "$target_json")
 
         if [[ -n "$artifact_dir" && -d "$artifact_dir" ]]; then
