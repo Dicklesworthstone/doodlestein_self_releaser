@@ -171,7 +171,6 @@ EOF
 
     if [[ -f "$SIGNING_PUBLIC_KEY" ]] && ! $force; then
         _sign_log_error "Public key already exists: $SIGNING_PUBLIC_KEY"
-        _sign_log_info "Use --force to overwrite"
         return 1
     fi
 
@@ -331,6 +330,7 @@ EOF
         return 4
     fi
 
+    _signing_release_preflight "$file" || return $?
     signing_require_minisign || return 3
 
     # Freeze the configured trust key before invoking the signer. A successful
@@ -341,6 +341,7 @@ EOF
     if [[ -e "$signature" || -L "$signature" ]]; then
         _signing_reuse "$file" "$signature" "$token" "$digest" \
             "$trusted_comment" "$untrusted_comment" || return $?
+        _signing_release_preflight "$file" || return $?
         _sign_log_ok "Retained verified signature: $signature"
         return 0
     fi
@@ -348,6 +349,7 @@ EOF
     _sign_log_info "Signing and verifying: $file"
     signing_sign_exact "$file" "$signature" "$SIGNING_PRIVATE_KEY" "$token" \
         "$trusted_comment" "$digest" "$untrusted_comment" || return $?
+    _signing_release_preflight "$file" || return $?
     _sign_log_ok "Verified signature created: $signature"
     return 0
 }
@@ -499,6 +501,142 @@ _signing_sha256() {
     printf '%s\n' "$digest"
 }
 
+# A signature authenticates JSON bytes, not the truth of their inventory. DSR's
+# reserved *-manifest.json signing inputs must describe the adjacent final
+# release set. No names, checksums, or existing signatures are rewritten here.
+# Generic signature verification remains usable with a downloaded manifest alone.
+_signing_manifest_preflight() {
+    local manifest="$1" directory name path sha size actual before rows listing line
+    [[ "${manifest##*/}" == *-manifest.json ]] || return 0
+    [[ -f "$manifest" && ! -L "$manifest" ]] || return 4
+    command -v jq >/dev/null || return 3
+    directory="${manifest%/*}"
+    [[ "$directory" != "$manifest" ]] || directory=.
+    [[ -d "$directory" && ! -L "$directory" ]] || return 4
+    before=$(_signing_sha256 "$manifest") || return $?
+    # Slurp avoids accepting concatenated JSON documents; validate before TSV.
+    rows=$(jq -cers '
+        def name: type == "string" and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            (test("[\\x00-\\x20\\x7f]") | not);
+        def hash: type == "string" and length == 64 and test("^[0-9a-f]{64}$");
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("expected one manifest") end |
+        if (.status == null or .status == "success") and
+           (.publishable == null or .publishable == true) and
+           (.build_purpose == null or .build_purpose == "release") and
+           (.summary.failed == null or .summary.failed == 0) and
+           (.artifacts | type == "array" and length > 0 and all(.[];
+               type == "object" and (.name | name) and (.sha256 | hash) and
+               (.size_bytes | type == "number" and . > 0 and
+                   . <= 9007199254740991 and . == floor))) and
+           ((.artifacts | map(.name | ascii_downcase) | unique | length) ==
+            (.artifacts | length))
+        then .artifacts[] | [.name, .sha256, (.size_bytes | tostring)] | @tsv
+        else error("invalid release inventory") end
+    ' "$manifest") || { _sign_log_error "Invalid release manifest: $manifest"; return 4; }
+    local -A expected=() checksums=()
+    while IFS=$'\t' read -r name sha size; do
+        [[ "$name" != "${manifest##*/}" && "$name" != SHA256SUMS ]] || return 4
+        path="$directory/$name"
+        [[ -f "$path" && ! -L "$path" ]] || {
+            _sign_log_error "Manifest artifact is missing or linked: $name"; return 4;
+        }
+        actual=$(_signing_sha256 "$path") || return $?
+        [[ "$actual" == "$sha" ]] || {
+            _sign_log_error "Manifest artifact checksum mismatch: $name"; return 4;
+        }
+        actual=$(wc -c < "$path") || return 4
+        [[ "${actual//[[:space:]]/}" == "$size" ]] || {
+            _sign_log_error "Manifest artifact size mismatch: $name"; return 4;
+        }
+        expected["$name"]="$sha"
+    done <<< "$rows"
+
+    # Enumerate successfully before consuming the list: process substitution
+    # would discard find's failure and could authenticate a partial namespace.
+    listing=$(mktemp "${TMPDIR:-/tmp}/dsr-sign-inventory.XXXXXXXX") || return 4
+    if ! find "$directory" -mindepth 1 -maxdepth 1 -print0 > "$listing"; then
+        rm -f -- "$listing"
+        return 4
+    fi
+    local invalid=false
+    while IFS= read -r -d '' path; do
+        name="${path##*/}"
+        [[ "$path" != "$manifest" ]] || continue
+        [[ -z "${expected[$name]:-}" ]] || continue
+        # Directories are private staging, never flat release assets. Linked
+        # directories and special files are not accepted as private staging.
+        [[ ! -d "$path" || -L "$path" ]] || continue
+        if [[ ! -f "$path" || -L "$path" ]]; then
+            _sign_log_error "Unsafe release inventory entry: $name"
+            invalid=true; break
+        fi
+        case "$name" in
+            .dsr-*.json|*-manifest.json|*.minisig|*.sig|*.asc|\
+            *.sha256|*.sha512|SHA256SUMS|SHA512SUMS|\
+            *.sbom.*|*.intoto.jsonl) ;;
+            *) _sign_log_error "Release payload is absent from manifest: $name"
+               invalid=true; break ;;
+        esac
+    done < "$listing"
+    rm -f -- "$listing"
+    $invalid && return 4
+
+    # SHA256SUMS is optional before checksum generation. Once present it must
+    # enumerate exactly the same final names/hashes, not a subset or aliases
+    # synthesized after signing. Per-name checksums, when present, agree too.
+    if [[ -e "$directory/SHA256SUMS" || -L "$directory/SHA256SUMS" ]]; then
+        [[ -f "$directory/SHA256SUMS" && ! -L "$directory/SHA256SUMS" ]] || return 4
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ ! "$line" =~ ^([0-9a-f]{64})[\ ][\ *]([A-Za-z0-9][A-Za-z0-9._+-]*)$ ]]; then
+                _sign_log_error "Malformed SHA256SUMS entry"; return 4
+            fi
+            sha="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}"
+            if [[ -n "${checksums[$name]:-}" || "${expected[$name]:-}" != "$sha" ]]; then
+                _sign_log_error "SHA256SUMS disagrees with manifest: $name"; return 4
+            fi
+            checksums["$name"]="$sha"
+        done < "$directory/SHA256SUMS"
+        [[ ${#checksums[@]} -eq ${#expected[@]} ]] || {
+            _sign_log_error "SHA256SUMS omits manifest artifacts"; return 4;
+        }
+    fi
+    for name in "${!expected[@]}"; do
+        path="$directory/$name.sha256"
+        if [[ -e "$path" || -L "$path" ]]; then
+            [[ -f "$path" && ! -L "$path" ]] || return 4
+            # cmp checks the complete file, including extra lines/terminator.
+            printf '%s  %s\n' "${expected[$name]}" "$name" | cmp -s - "$path" || {
+                _sign_log_error "Per-asset checksum disagrees with manifest: $name"; return 4;
+            }
+        fi
+    done
+    [[ "$(_signing_sha256 "$manifest")" == "$before" ]] || return 4
+}
+
+# Ordinary fallback signs payloads, not necessarily the manifest itself. Check
+# adjacent manifests too, once per directory, before any batch signature exists.
+_signing_release_preflight() (
+    local file directory manifest
+    local -A checked=()
+    unset GLOBIGNORE
+    set +f
+    shopt -s nullglob
+    shopt -u failglob dotglob
+    for file in "$@"; do
+        directory="${file%/*}"
+        [[ "$directory" != "$file" ]] || directory=.
+        [[ -d "$directory" ]] || return 4
+        directory=$(cd "$directory" && pwd -P) || return 4
+        [[ -z "${checked[$directory]:-}" ]] || continue
+        checked["$directory"]=1
+        for manifest in "$directory"/*-manifest.json; do
+            _signing_manifest_preflight "$manifest" || return $?
+        done
+    done
+)
+
 # Resume is verification, never re-signing. Preserve existing bytes even on a
 # conflict: changing a timestamp/comment breaks content-verified upload resume.
 _signing_reuse() {
@@ -533,6 +671,7 @@ signing_sign_exact() (
     local file_sha256_before="" file_sha256_after=""
     local status=0
 
+    _signing_manifest_preflight "$file" || return $?
     signing_require_minisign || return 3
     if [[ ! -f "$file" || -L "$file" ]]; then
         _sign_log_error "Signed input must be a regular non-symlink file: $file"
@@ -609,6 +748,9 @@ signing_sign_exact() (
     elif ! signing_verify_exact "$file" "$staged_signature" "$public_key_token"; then
         _sign_log_error "Staged signature does not verify against the original artifact"
         status=4
+    elif ! _signing_manifest_preflight "$file"; then
+        _sign_log_error "Release inventory changed while its signature was staged"
+        status=4
     elif ! ln -- "$staged_signature" "$signature"; then
         _sign_log_error "Could not atomically publish signature without clobbering: $signature"
         status=4
@@ -629,6 +771,9 @@ signing_sign_exact() (
         status=4
     fi
 
+    if [[ "$status" == 0 ]]; then
+        _signing_manifest_preflight "$file" || status=$?
+    fi
     return "$status"
 )
 
@@ -663,6 +808,7 @@ signing_sign_batch() (
         return 4
     fi
 
+    _signing_release_preflight "$@" || return $?
     signing_require_minisign || return 3
 
     local token private_key="$SIGNING_PRIVATE_KEY" file parent name canonical prior duplicate
@@ -741,6 +887,7 @@ signing_sign_batch() (
         _signing_reuse "$file" "$signature" "$token" "${digests[i]}" || return $?
         [[ "$(_signing_sha256 "$signature")" == "${signature_digests[i]}" ]] || return 4
     done
+    _signing_release_preflight "${files[@]}" || return $?
     for ((i=0; i<${#files[@]}; i++)); do
         [[ -n "${staged[i]}" ]] || continue
         signature="${files[i]}.minisig"
@@ -757,6 +904,7 @@ signing_sign_batch() (
         _signing_reuse "$file" "$signature" "$token" "${digests[i]}" || return $?
         [[ "$(_signing_sha256 "$signature")" == "${signature_digests[i]}" ]] || return 4
     done
+    _signing_release_preflight "${files[@]}" || return $?
     _sign_log_ok "Verified complete signing batch: ${#files[@]} artifact(s)"
     return 0
 )
