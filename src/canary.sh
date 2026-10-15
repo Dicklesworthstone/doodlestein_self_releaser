@@ -344,7 +344,7 @@ if [ -f "/install.sh" ]; then
     fi
 else
     # Remote installer
-    if ! curl -A "OpenAI File Downloader, XaiImageApiFetch/1.0" -fsSL "$installer_source" |
+    if ! curl -A "dsr-canary (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)" -fsSL "$installer_source" |
         $shell -s --$installer_args_shell 2>&1; then
         echo "Installer failed" >&2
         exit 1
