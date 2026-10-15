@@ -1,4 +1,4 @@
-# Recover completed native raw builds
+# Recover completed native builds
 
 `src/release_recover_native.sh` imports a complete ordinary native build whose
 compilers succeeded but whose coordinator failed during flat artifact collection
@@ -8,9 +8,10 @@ create a Git tag, sign anything, upload assets or dispatch workflows.
 This is a recovery path for issues #31 and #45, **not a replacement for the normal
 build command's collector**. The normal collector's rename/manifest mismatch still
 needs its own repair. Recovery requires all requested native targets to have
-completed and exactly one raw executable per task. Workspace archives, additional
-assets, mixed act/native runs and strict-contract builds are refused, not reduced
-to a smaller release.
+completed and exactly one primary payload per task: a raw executable or a
+`tar.gz`, `tgz`, `tar.xz`, or ZIP workspace archive. Additional release assets,
+mixed act/native runs and strict-contract builds are refused, not reduced to a
+smaller release.
 
 ## Select the saved build
 
@@ -55,7 +56,9 @@ Raw names are deterministic, independent of completion order: `demo-linux_amd64`
 `demo-darwin_arm64`, `demo-windows_amd64.exe`. A recorded compiler triple replaces
 the platform suffix, for example `demo-x86_64-unknown-linux-musl`. Original filenames
 and paths remain in the recovery evidence. Each new manifest row uses the actual
-published name and that target's retained SHA-256 and size.
+published name and that target's retained SHA-256 and size. Archive suffixes stay
+intact: `demo.tar.xz` becomes `demo-linux_arm64.tar.xz`, not an executable or a
+mislabeled gzip file.
 
 Recovery checks the complete planned task set, release purpose, completed worker
 status, host and compiler identity, the authoritative `artifact_paths` array and
@@ -78,6 +81,40 @@ archive member named `demo`/`demo.exe`, or rename a raw output to a project's
 published name. The packaging and finalization commands retain their own source,
 coverage, checksum and signing gates. No automatic publication occurs here.
 
+## Workspace archives
+
+Recovery preserves the original compressed bytes, including every bundled binary,
+nested document, executable mode and empty companion file. It never extracts an
+archive to disk or repackages it. The compressed digest and filesystem identity
+must match the frozen worker receipt before inspection and copying. Each archive
+also retains a sorted member inventory under its `recovery_evidence.artifacts[]`
+entry, including member hashes, sizes, executable bits, native executable names
+and an inventory SHA-256.
+
+At least one native executable must be present. Every recognized ELF, Mach-O or PE
+executable (and every `.exe` member) must match the worker platform. Unix native
+executables must retain executable bits. This is not a complete executable-format
+validator or an ABI attestation; in particular, the ELF header check does not
+distinguish every shared-library form from an executable. Scripts-only packages,
+universal Mach-O payloads, sparse tar members, links, special files,
+privileged modes, encrypted ZIPs and ZIP64/split ZIPs are unsupported and refused.
+ZIP supports stored and deflated members. PAX and GNU long-name tar metadata are
+supported within a 64 KiB per-header budget.
+
+Member traversal, absolute or drive-qualified paths, case collisions, duplicate
+members, file/parent conflicts, nonzero data after a tar terminator, corrupt
+compression trailers and invalid ZIP directory metadata are refused. Directory
+records and a conventional `./` tar root are allowed. Member contents are streamed;
+inspection does not load entire executables into memory.
+
+`--max-artifact-bytes` bounds each stored payload (default 4 GiB).
+`--max-unpacked-bytes` bounds each archive's total regular-file content (default
+4 GiB), and `--max-archive-members` bounds its member count (default 10,000).
+Tar padding and extended metadata have an additional bounded stream allowance;
+ZIP central-directory metadata is capped at 16 MiB before its member list is read.
+Exceeding a limit refuses the complete recovery instead of omitting members.
+These budgets are per archive, not a claim of a global memory or CPU bound.
+
 ## Regression test
 
 ```bash
@@ -86,7 +123,14 @@ bash scripts/tests/test_native_release_recovery.sh
 
 This compiles real Go executables for seven Linux/macOS/Windows targets, wraps
 those bytes in explicit native-state fixtures using DSR's producer field names,
-and tests complete recovery and refusal cases. It executes the host-compatible
-Linux binary; it does not claim native macOS or Windows runtime execution. Git
-objects, executable files, inode checks and digest checks are genuine. Test evidence
-is retained in the printed temporary directory.
+and tests complete recovery and refusal cases. It also constructs actual gzip,
+xz and ZIP archives containing multiple executables and nested companions, verifies
+byte-for-byte recovery and executes a recovered Linux archive member. It does not
+claim native macOS or Windows runtime execution. Git objects, executable files,
+archive parsers, inode checks and digest checks are genuine. Test evidence is
+retained in the printed temporary directory.
+
+For a controlled comparison, `DSR_RECOVERY_BASELINE` may name the unchanged
+incumbent script: the same test invocation demonstrates its refusal of the exact
+workspace archive input. `DSR_RECOVERY_TEST_GOCACHE` optionally selects a shared Go
+compilation cache; output binaries and release evidence remain unique to each run.

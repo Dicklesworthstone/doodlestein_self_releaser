@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Recover ordinary, completed native binaries after coordinator packaging fails.
+# Recover ordinary, completed native payloads after coordinator packaging fails.
 # This is an explicit local import, not a strict-build attestation or a release
 # upload. Original state, worker receipts and artifacts are never modified.
 
@@ -8,8 +8,10 @@ _native_recovery_execute() {
     exec env DRY_RUN="${DRY_RUN:-false}" python3 -I - "$@" <<'PY'
 import argparse
 import datetime
+import gzip
 import hashlib
 import json
+import lzma
 import os
 from pathlib import Path
 import re
@@ -18,8 +20,11 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import uuid
+import zipfile
+import zlib
 
 
 class Failure(Exception):
@@ -138,6 +143,160 @@ def binary_platform(data):
     raise Failure("raw native recovery requires ELF, Mach-O or PE executables; archives and scripts are not imported", 4)
 
 
+def archive_format(filename):
+    for extension, format_name in ((".tar.gz", "tar.gz"), (".tgz", "tar.gz"),
+                                   (".tar.xz", "tar.xz"), (".zip", "zip")):
+        if filename.endswith(extension):
+            return extension, format_name
+    return "", "binary"
+
+
+def inspect_archive(selected, admitted_info, format_name, platform):
+    """Inspect authenticated archive bytes without extracting any member."""
+    nodes, files, executables = {}, [], []
+    expanded = records = 0
+
+    def member_path(value, directory):
+        need(isinstance(value, str) and 0 < len(value) <= 4096 and
+             not any(ord(c) < 32 or ord(c) == 127 or c in "\\:" for c in value),
+             "unsafe archive member path", 4)
+        if directory and value in (".", "./"):
+            return None
+        need(not value.startswith("/"), "absolute archive member: " + value, 4)
+        if value.startswith("./"):
+            value = value[2:]
+        if directory and value.endswith("/"):
+            value = value[:-1]
+        parts = value.split("/")
+        need(all(p not in ("", ".", "..") and not p.startswith("-") and
+                 p.lower() != ".git" and not p.endswith((".", " ")) for p in parts),
+             "unsafe archive member: " + value, 4)
+        for index in range(1, len(parts)):
+            parent = "/".join(parts[:index])
+            key = parent.casefold()
+            previous = nodes.get(key)
+            need(previous is None or previous[:2] == (parent, "directory"),
+                 "archive member collides with a parent: " + value, 4)
+            if previous is None:
+                nodes[key] = (parent, "directory", False)
+        kind = "directory" if directory else "file"
+        previous = nodes.get(value.casefold())
+        need(previous is None or (directory and previous == (value, kind, False)),
+             "duplicate or case-colliding archive member: " + value, 4)
+        nodes[value.casefold()] = (value, kind, True)
+        return value
+
+    def consume(filename, size, mode, directory, opener):
+        nonlocal expanded, records
+        records += 1
+        need(records <= args.max_archive_members, "archive member limit exceeded", 4)
+        relative = member_path(filename, directory)
+        need(not mode & 0o7000, "privileged archive member mode: " + filename, 4)
+        if directory:
+            need(size == 0, "archive directory has a payload", 4)
+            return
+        need(relative is not None and 0 <= size <= args.max_unpacked_bytes - expanded,
+             "archive expanded-byte limit exceeded", 4)
+        digest, prefix, actual = hashlib.sha256(), bytearray(), 0
+        with opener() as stream:
+            while True:
+                block = stream.read(min(1024 * 1024, size - actual + 1))
+                if not block:
+                    break
+                actual += len(block)
+                need(actual <= size, "archive member grew beyond its declared size", 4)
+                digest.update(block)
+                if len(prefix) < 4096:
+                    prefix.extend(block[:4096 - len(prefix)])
+        need(actual == size, "truncated archive member: " + relative, 4)
+        expanded += actual
+        data = bytes(prefix)
+        if (data.startswith((b"\x7fELF", b"MZ", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe")) or
+                relative.lower().endswith(".exe")):
+            need(binary_platform(data) == platform,
+                 "archive executable architecture differs from its worker target: " + relative, 4)
+            need(platform.startswith("windows/") or mode & 0o111,
+                 "Unix archive executable has no executable bits: " + relative, 4)
+            executables.append(relative)
+        files.append(dict(path=relative, sha256=digest.hexdigest(), size_bytes=size,
+                          executable_bits=mode & 0o111))
+
+    class BoundedReader:
+        # Bound tar padding and extended metadata too, not just regular files.
+        def __init__(self, stream):
+            self.stream = stream
+            self.remaining = args.max_unpacked_bytes + args.max_archive_members * 2048 + 1024 * 1024
+
+        def read(self, size):
+            data = self.stream.read(min(size, self.remaining + 1, 1024 * 1024))
+            self.remaining -= len(data)
+            need(self.remaining >= 0, "expanded tar stream exceeds its byte budget", 4)
+            return data
+
+    class BoundedTarInfo(tarfile.TarInfo):
+        @classmethod
+        def frombuf(cls, buf, encoding, errors):
+            item = super().frombuf(buf, encoding, errors)
+            # frombuf runs before tarfile reads PAX/GNU extension payloads.
+            need(item.type != tarfile.GNUTYPE_SPARSE, "sparse archive members are unsupported", 4)
+            if item.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK):
+                need(0 <= item.size <= 65536, "excessive archive extended header", 4)
+            return item
+
+    selected = path(str(selected))
+    fd = os.open(selected, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        need(identity(os.fstat(stream.fileno())) == identity(admitted_info) == identity(selected.lstat()),
+             "archive changed before inspection")
+        if format_name == "zip":
+            # Bound the central directory BEFORE ZipFile allocates its list.
+            # ZIP64 and split archives are deliberately not admitted here.
+            size = admitted_info.st_size
+            stream.seek(max(0, size - 65557))
+            tail = stream.read(65557)
+            end = tail.rfind(b"PK\x05\x06")
+            need(end >= 0 and len(tail) - end >= 22, "missing ZIP end record", 4)
+            _, disk, start_disk, count, total, directory_size, offset, comment = struct.unpack_from("<4s4H2IH", tail, end)
+            need(disk == start_disk == 0 and count == total and 0 < total <= args.max_archive_members and
+                 total != 65535 and directory_size <= 16 * 1024 * 1024 and offset != 0xffffffff and
+                 len(tail) - end == 22 + comment and offset + directory_size == size - len(tail) + end,
+                 "unsupported or excessive ZIP directory", 4)
+            stream.seek(0)
+            with zipfile.ZipFile(stream) as archive:
+                need(len(archive.infolist()) == total, "ZIP member count differs from directory", 4)
+                for item in archive.infolist():
+                    mode = item.external_attr >> 16
+                    directory = item.is_dir()
+                    need(not item.flag_bits & 1 and item.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) and
+                         stat.S_IFMT(mode) in (0, stat.S_IFDIR if directory else stat.S_IFREG),
+                         "linked, encrypted or unsupported ZIP member: " + item.filename, 4)
+                    need(item.orig_filename == item.filename, "NUL in ZIP member name", 4)
+                    consume(item.filename, item.file_size, mode, directory, lambda: archive.open(item))
+        else:
+            decompressor = gzip.GzipFile(fileobj=stream) if format_name == "tar.gz" else lzma.LZMAFile(stream)
+            with decompressor:
+                with tarfile.open(fileobj=BoundedReader(decompressor), mode="r|", tarinfo=BoundedTarInfo) as archive:
+                    for item in archive:
+                        need((item.isfile() or item.isdir()) and not item.issparse() and
+                             not any(k.startswith("GNU.sparse") for k in item.pax_headers),
+                             "linked, sparse or special tar member: " + item.name, 4)
+                        consume(item.name, item.size, item.mode, item.isdir(), lambda: archive.extractfile(item))
+                    # Drain through tarfile's buffered reader, including the
+                    # compressor trailer/CRC, and refuse hidden appended data.
+                    while True:
+                        tail = archive.fileobj.read(1024 * 1024)
+                        if not tail:
+                            break
+                        need(not any(tail), "nonzero data after tar end marker", 4)
+        need(identity(os.fstat(stream.fileno())) == identity(admitted_info) == identity(selected.lstat()),
+             "archive changed during inspection")
+    need(files and executables, "archive contains no native executable for its target", 4)
+    files.sort(key=lambda row: row["path"])
+    return dict(kind="dsr-native-archive-inventory", archive_format=format_name, files=files,
+                executable_members=sorted(executables), unpacked_bytes=expanded,
+                inventory_sha256=hashlib.sha256(canonical(files)).hexdigest())
+
+
 def git_read(repository, *arguments):
     environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     environment.update(GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="",
@@ -244,34 +403,42 @@ def select_workers(state):
                  "compiler target contradicts retained build evidence", 4)
         receipts = result.get("resume_artifacts")
         need(isinstance(receipts, list) and len(receipts) == 1 and isinstance(receipts[0], dict),
-             "each task must retain exactly one raw executable receipt", 4)
+             "each task must retain exactly one primary payload receipt", 4)
         receipt = receipts[0]
         need(set(receipt) == {"path", "sha256", "size_bytes", "identity"} and
              match(receipt["sha256"], r"[0-9a-f]{64}") and type(receipt["size_bytes"]) is int and
              0 < receipt["size_bytes"] <= args.max_artifact_bytes and
-             match(receipt["identity"], r"(?:gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)"), "invalid raw worker receipt", 4)
+             match(receipt["identity"], r"(?:gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)"), "invalid worker receipt", 4)
         original = path(receipt["path"])
         need(original.is_relative_to(artifacts_root) and original != artifacts_root and original not in originals,
              "worker artifact escapes the selected root or is shared by tasks", 4)
         need(result.get("artifact_path") == str(original) and result.get("artifact_paths") == [str(original)] and
              result.get("additional_artifacts", []) == [] and not result.get("artifact_dir"),
-             "worker artifact inventory differs from its single raw receipt", 4)
+             "worker artifact inventory differs from its single primary receipt", 4)
         originals.add(original)
-        stem = original.name[:-4] if original.name.lower().endswith(".exe") else original.name
+        extension, format_name = archive_format(original.name)
+        stem = original.name[:-len(extension)] if extension else (
+            original.name[:-4] if original.name.lower().endswith(".exe") else original.name)
         suffix = triple if triple else task["platform"].replace("/", "_")
-        published = stem + "-" + suffix + (".exe" if task["platform"].startswith("windows/") else "")
+        published = stem + "-" + suffix + (extension or (".exe" if task["platform"].startswith("windows/") else ""))
         need(name(published) and published.casefold() not in names, "unsafe or colliding recovered asset name", 4)
         names.add(published.casefold())
         selected.append(dict(task=task, result=result, receipt=receipt, path=original, name=published,
-                             completed_at=completed_at))
+                             completed_at=completed_at, format=format_name))
     return selected
 
 
 def check_artifact(worker, destination=None):
     data, _, info = read_file(worker["path"], worker["receipt"], destination, args.max_artifact_bytes)
-    need(binary_platform(data) == worker["task"]["platform"], "executable architecture differs from its worker target: " + worker["name"])
-    executable = bool(info.st_mode & 0o111)
-    need(executable or worker["task"]["platform"].startswith("windows/"), "Unix payload is not executable")
+    if worker["format"] == "binary":
+        need(binary_platform(data) == worker["task"]["platform"], "executable architecture differs from its worker target: " + worker["name"])
+        executable = bool(info.st_mode & 0o111)
+        need(executable or worker["task"]["platform"].startswith("windows/"), "Unix payload is not executable")
+    else:
+        evidence = inspect_archive(worker["path"], info, worker["format"], worker["task"]["platform"])
+        need(worker.get("archive_inventory", evidence) == evidence, "archive inventory changed during recovery")
+        worker["archive_inventory"] = evidence
+        executable = False
     if destination is not None:
         destination.chmod(0o755 if executable else 0o644)
 
@@ -294,20 +461,23 @@ try:
     class Parser(argparse.ArgumentParser):
         def error(self, message):
             raise Failure(message, 4)
-    parser = Parser(description="Recover complete ordinary native raw builds into a new manifest-bound release input.",
+    parser = Parser(description="Recover complete ordinary native builds into a new manifest-bound release input.",
         epilog="No build, upload, signing or original-state mutation occurs. This preserves ordinary worker custody, "
                "not strict source/toolchain authentication. Feed the returned manifest to release package/finalize.", allow_abbrev=False)
     for option in ("state", "state-sha256", "source-repo", "repo", "tag", "sha", "artifacts-root", "output-dir"):
         parser.add_argument("--" + option, required=True)
     parser.add_argument("--max-artifact-bytes", type=int, default=4 * 1024 ** 3)
-    parser.add_argument("--dry-run", action="store_true", help="validate all inputs and print planned raw names without writing")
+    parser.add_argument("--max-unpacked-bytes", type=int, default=4 * 1024 ** 3)
+    parser.add_argument("--max-archive-members", type=int, default=10000)
+    parser.add_argument("--dry-run", action="store_true", help="validate all inputs and print planned names without writing")
     flags = [a.split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate recovery option", 4)
     args = parser.parse_args(sys.argv[1:])
     need(match(args.repo, r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and ".." not in args.repo and
          match(args.tag, r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
          match(args.sha, r"[0-9a-f]{40}") and args.sha != "0" * 40 and
-         match(args.state_sha256, r"[0-9a-f]{64}") and 1 <= args.max_artifact_bytes <= 64 * 1024 ** 3,
+         match(args.state_sha256, r"[0-9a-f]{64}") and 1 <= args.max_artifact_bytes <= 64 * 1024 ** 3 and
+         1 <= args.max_unpacked_bytes <= 64 * 1024 ** 3 and 1 <= args.max_archive_members <= 100000,
          "invalid release identity or byte limit", 4)
     state_path, source_repo, artifacts_root, root = map(path,
         (args.state, args.source_repo, args.artifacts_root, args.output_dir))
@@ -325,7 +495,8 @@ try:
     if args.dry_run or os.environ.get("DRY_RUN") == "true":
         print(canonical(dict(kind="dsr-native-recovery", status="planned", exit_code=0, dry_run=True,
             state_sha256=state_hash, artifacts=[dict(task_key=w["task"]["key"], name=w["name"],
-                target=w["task"]["platform"], sha256=w["receipt"]["sha256"]) for w in workers])).decode(), end="")
+                target=w["task"]["platform"], sha256=w["receipt"]["sha256"], archive_format=w["format"])
+                for w in workers])).decode(), end="")
         sys.exit(0)
     # Admission above performs no writes. Failure below leaves private evidence
     # but never a release/ directory or a successful receipt.
@@ -341,7 +512,7 @@ try:
         check_artifact(worker, stage / "artifacts" / worker["name"])
         task, result, receipt = worker["task"], worker["result"], worker["receipt"]
         artifact = dict(name=worker["name"], target=task["platform"], sha256=receipt["sha256"],
-            size_bytes=receipt["size_bytes"], archive_format="binary", signed=False, signature_file="")
+            size_bytes=receipt["size_bytes"], archive_format=worker["format"], signed=False, signature_file="")
         environment = dict(target=task["platform"], host=result["host"], method="native",
             build_influence_env=result.get("build_influence_env", {}), cargo_isolation=result.get("cargo_isolation"))
         if task["target_triple"]:
@@ -350,6 +521,8 @@ try:
         environments.append(environment)
         mapping.append(dict(task_key=task["key"], source_path=str(worker["path"]), name=worker["name"],
             sha256=receipt["sha256"], size_bytes=receipt["size_bytes"], worker_identity=receipt["identity"]))
+        if "archive_inventory" in worker:
+            mapping[-1]["archive_inventory"] = worker["archive_inventory"]
     manifest = dict(schema_version="1.0.0", tool=state["tool"], version=args.tag, run_id=state["run_id"],
         source=dict(git_sha=args.sha, git_ref="refs/tags/" + args.tag, repository="https://github.com/" + args.repo,
                     dependencies=[]),
@@ -386,7 +559,8 @@ try:
     finally:
         os.close(fd)
     print(canonical(result).decode(), end="")
-except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError, EOFError,
+        tarfile.TarError, zipfile.BadZipFile, lzma.LZMAError, zlib.error, struct.error, RecursionError) as error:
     code = error.code if isinstance(error, Failure) else 4
     print("[native-recovery] " + str(error), file=sys.stderr)
     print(canonical(dict(kind="dsr-native-recovery", status="error", exit_code=code, error=str(error))).decode(), end="")

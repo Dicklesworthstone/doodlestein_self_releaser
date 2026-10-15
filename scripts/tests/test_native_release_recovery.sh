@@ -11,13 +11,17 @@ python3 -I - "$ROOT" <<'PY'
 import copy
 import datetime
 import hashlib
+import gzip
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import uuid
+import zipfile
 
 root = Path(sys.argv[1])
 module = root / 'src/release_recover_native.sh'
@@ -73,7 +77,8 @@ state = dict(tool='demo', version='1.2.3', run_id=str(uuid.uuid4()), status='fai
                           target_hosts={p: 'cross-host' for p in platforms}))
 environment = os.environ.copy()
 environment.update(CGO_ENABLED='0', GOENV='off', GOTOOLCHAIN='local', GOPROXY='off',
-                   GOSUMDB='off', GO111MODULE='off', GOCACHE=str(work / 'go-cache'))
+                   GOSUMDB='off', GO111MODULE='off',
+                   GOCACHE=os.environ.get('DSR_RECOVERY_TEST_GOCACHE', str(work / 'go-cache')))
 for platform in platforms:
     operating_system, architecture = platform.split('/')
     directory = assets / platform.replace('/', '-')
@@ -98,14 +103,14 @@ for platform in platforms:
 counter = 0
 
 
-def invoke(value=None, arguments=None, raw=None, output=None, expected_hash=None):
+def invoke(value=None, arguments=None, raw=None, output=None, expected_hash=None, module_override=None):
     global counter
     counter += 1
     selected_state = states / ('state-%d.json' % counter)
     data = encoded(state if value is None else value) if raw is None else raw
     selected_state.write_bytes(data)
     output = work / ('recovered-%d' % counter) if output is None else output
-    command = ['bash', str(module), '--state', str(selected_state), '--state-sha256', expected_hash or sha(data),
+    command = ['bash', str(module_override or module), '--state', str(selected_state), '--state-sha256', expected_hash or sha(data),
                '--source-repo', str(source), '--repo', 'owner/demo', '--tag', 'v1.2.3', '--sha', commit,
                '--artifacts-root', str(assets), '--output-dir', str(output)]
     command += arguments or []
@@ -206,6 +211,150 @@ git('remote', 'set-url', 'origin', 'https://github.com/owner/demo.git')
 candidate = copy.deepcopy(state)
 candidate['git_sha'] = '1' * 40
 refuse('source commit substitution refuses', candidate, code=4)
+
+# Archives contain genuine target executables, not synthetic header fixtures.
+# Only the saved worker/state envelopes are fixtures. Admission, compression,
+# hashing, filesystem custody and original Git identity checks are production.
+archive_dir = assets / 'archives'
+archive_dir.mkdir()
+archive_number = 0
+native_bytes = {p: Path(state['target_statuses'][p]['result']['artifact_path']).read_bytes() for p in platforms}
+
+
+def write_archive(format_name, members):
+    global archive_number
+    archive_number += 1
+    filename = archive_dir / ('payload-%d.' % archive_number + format_name)
+    if format_name == 'zip':
+        with zipfile.ZipFile(filename, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for member, data, mode, kind in members:
+                item = zipfile.ZipInfo(member)
+                item.create_system = 3
+                item.external_attr = (mode | {'file': 0o100000, 'directory': 0o040000, 'symlink': 0o120000}[kind]) << 16
+                item.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(item, data)
+    else:
+        with tarfile.open(filename, 'w:gz' if format_name == 'tar.gz' else 'w:xz', format=tarfile.PAX_FORMAT) as archive:
+            for member, data, mode, kind in members:
+                item = tarfile.TarInfo(member)
+                item.mode = mode
+                item.type = {'file': tarfile.REGTYPE, 'directory': tarfile.DIRTYPE,
+                             'symlink': tarfile.SYMTYPE, 'hardlink': tarfile.LNKTYPE,
+                             'fifo': tarfile.FIFOTYPE}[kind]
+                item.size = len(data) if kind == 'file' else 0
+                if kind in ('symlink', 'hardlink'):
+                    item.linkname = '../../outside'
+                archive.addfile(item, io.BytesIO(data) if kind == 'file' else None)
+    return filename
+
+
+def bind_primary(value, platform, filename):
+    record = value['target_statuses'][platform]['result']
+    info = filename.stat()
+    record['artifact_path'] = str(filename)
+    record['artifact_paths'] = [str(filename)]
+    record['resume_artifacts'] = [dict(path=str(filename), sha256=sha(filename.read_bytes()),
+        size_bytes=info.st_size, identity='gnu:%d:%d' % (info.st_dev, info.st_ino))]
+    return value
+
+
+def members_for(platform):
+    extension = '.exe' if platform.startswith('windows/') else ''
+    return [('bin/demo' + extension, native_bytes[platform], 0o755, 'file'),
+            ('bin/companion' + extension, native_bytes[platform], 0o755, 'file'),
+            ('docs/' + 'long-' * 24 + 'guide.md', b'reviewed nested guide\n', 0o644, 'file'),
+            ('LICENSE', b'', 0o644, 'file')]
+
+
+packaged = copy.deepcopy(state)
+formats = {}
+for platform in platforms:
+    format_name = 'zip' if platform.startswith('windows/') else 'tar.xz' if platform.endswith('/arm64') else 'tar.gz'
+    formats[platform] = format_name
+    members = members_for(platform)
+    if format_name != 'zip':
+        members.insert(0, ('./', b'', 0o755, 'directory'))
+    filename = write_archive(format_name, members)
+    bind_primary(packaged, platform, filename)
+status, response, packaged_output, _ = invoke(packaged)
+check('seven workspace archives recover without recompiling', status == 0 and response.get('recovered_targets') == 7)
+if status == 0:
+    packaged_manifest = json.loads((packaged_output / 'release/build-manifest.json').read_bytes())
+    check('every archive retains its actual compression format',
+          {a['target']: a['archive_format'] for a in packaged_manifest['artifacts']} == formats)
+    exact, complete, inventories = True, True, True
+    for artifact in packaged_manifest['artifacts']:
+        original_archive = Path(packaged['target_statuses'][artifact['target']]['result']['artifact_path'])
+        copied = packaged_output / 'release/artifacts' / artifact['name']
+        exact &= copied.read_bytes() == original_archive.read_bytes() and copied.stat().st_ino != original_archive.stat().st_ino
+        exact &= artifact['sha256'] == sha(copied.read_bytes())
+    for item in packaged_manifest['recovery_evidence']['artifacts']:
+        inventory = item['archive_inventory']
+        complete &= len(inventory['files']) == 4 and len(inventory['executable_members']) == 2
+        inventories &= inventory['inventory_sha256'] == sha(encoded(inventory['files']))
+    check('compressed bytes and worker hashes are preserved exactly without hardlinks', exact)
+    check('all workspace executables and nested or empty companions are retained', complete)
+    check('archive inventories carry independent member digests', inventories)
+    linux = next(a for a in packaged_manifest['artifacts'] if a['target'] == 'linux/amd64')
+    with tarfile.open(packaged_output / 'release/artifacts' / linux['name']) as archive:
+        executable = work / 'recovered-workspace-demo'
+        executable.write_bytes(archive.extractfile('bin/demo').read())
+    executable.chmod(0o700)
+    check('recovered workspace executable actually runs', run([str(executable)]).decode().strip() == 'linux/amd64')
+else:
+    print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)
+status, response, destination, _ = invoke(packaged, arguments=['--dry-run'])
+check('archive dry-run performs real admission without writing output',
+      status == 0 and response.get('status') == 'planned' and not destination.exists())
+
+# Optional controlled comparison runs this exact new input through the
+# unchanged incumbent in the same invocation, not a weakened local replica.
+baseline = os.environ.get('DSR_RECOVERY_BASELINE')
+if baseline:
+    status, response, destination, _ = invoke(packaged, module_override=baseline)
+    check('unchanged incumbent reproduces the workspace-archive recovery blocker',
+          status != 0 and not destination.exists() and 'raw native recovery requires' in response.get('error', ''))
+
+for format_name in ('tar.gz', 'tar.xz', 'zip'):
+    platform = 'windows/amd64' if format_name == 'zip' else 'linux/amd64'
+    for member in ('../outside', '/absolute', 'nested/../../outside', 'C:/escape', 'dir\\escape', 'dup/./entry'):
+        filename = write_archive(format_name, members_for(platform) + [(member, b'escape', 0o644, 'file')])
+        refuse(format_name + ' rejects unsafe member ' + member,
+               bind_primary(copy.deepcopy(state), platform, filename), code=4)
+    for kind in ('symlink',) if format_name == 'zip' else ('symlink', 'hardlink', 'fifo'):
+        filename = write_archive(format_name, members_for(platform) + [('linked', b'outside', 0o644, kind)])
+        refuse(format_name + ' rejects ' + kind, bind_primary(copy.deepcopy(state), platform, filename), code=4)
+    for label, extras in (
+        ('case collision', [('guide', b'1', 0o644, 'file'), ('GUIDE', b'2', 0o644, 'file')]),
+        ('file-parent collision', [('guide', b'1', 0o644, 'file'), ('guide/child', b'2', 0o644, 'file')]),
+        ('privileged member', [('privileged', b'1', 0o4755, 'file')]),
+        ('foreign executable', [('other.exe', native_bytes['windows/arm64'], 0o755, 'file')]),
+    ):
+        filename = write_archive(format_name, members_for(platform) + extras)
+        refuse(format_name + ' rejects ' + label, bind_primary(copy.deepcopy(state), platform, filename), code=4)
+    filename = write_archive(format_name, [('only-docs', b'no executable', 0o644, 'file')])
+    refuse(format_name + ' refuses archives without native executables', bind_primary(copy.deepcopy(state), platform, filename), code=4)
+
+refuse('archive member budget refuses instead of truncating inventory', packaged,
+       arguments=['--max-archive-members', '1'], code=4)
+refuse('archive expansion budget refuses before any output', packaged,
+       arguments=['--max-unpacked-bytes', '64'], code=4)
+filename = write_archive('tar.gz', members_for('linux/amd64'))
+data = bytearray(filename.read_bytes())
+data[-5] ^= 1
+filename.write_bytes(data)
+refuse('authenticated but corrupt gzip trailer refuses', bind_primary(copy.deepcopy(state), 'linux/amd64', filename), code=4)
+filename = write_archive('tar.gz', members_for('linux/amd64'))
+filename.write_bytes(gzip.compress(gzip.decompress(filename.read_bytes()) + b'hidden appended data'))
+refuse('data after tar end marker cannot hide from archive admission', bind_primary(copy.deepcopy(state), 'linux/amd64', filename), code=4)
+filename = write_archive('tar.gz', members_for('linux/amd64'))
+with tarfile.open(filename, 'w:gz', format=tarfile.PAX_FORMAT) as archive:
+    item = tarfile.TarInfo('oversized-pax')
+    item.pax_headers = {'comment': 'x' * 70000}
+    archive.addfile(item, io.BytesIO(b''))
+refuse('PAX metadata size is bounded before parser allocation', bind_primary(copy.deepcopy(state), 'linux/amd64', filename), code=4)
+check('archive validation never extracted unsafe members', not (work / 'outside').exists() and not (assets / 'outside').exists())
+
 original = Path(state['target_statuses']['linux/amd64']['result']['artifact_path'])
 backup = original.read_bytes()
 with original.open('r+b') as stream:
@@ -222,6 +371,6 @@ original.write_bytes(backup)
 original.chmod(0o700)
 refuse('byte-identical replacement cannot satisfy the frozen inode', code=7)
 
-print('Native raw recovery: %d passed, %d failed; evidence: %s' % (passed, failed, work), flush=True)
+print('Native recovery: %d passed, %d failed; evidence: %s' % (passed, failed, work), flush=True)
 raise SystemExit(1 if failed else 0)
 PY
