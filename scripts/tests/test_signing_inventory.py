@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import tarfile
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / 'src/signing.sh'
+BASH = os.environ.get('DSR_TEST_BASH', 'bash')
 PLATFORMS = ('linux/amd64', 'linux/arm64', 'darwin/amd64', 'darwin/arm64')
 TRIPLES = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
            'x86_64-apple-darwin', 'aarch64-apple-darwin')
@@ -36,6 +38,10 @@ class SigningInventory(unittest.TestCase):
         for tool in ('go', 'bash', 'jq', 'find', 'cmp', 'wc'):
             if not shutil.which(tool):
                 raise unittest.SkipTest(f'{tool} is required; no fake compiler/signer')
+        version = subprocess.run([BASH, '-c', '(( BASH_VERSINFO[0] >= 4 ))'],
+                                 capture_output=True, timeout=5)
+        if version.returncode != 0:
+            raise unittest.SkipTest('Bash 4+ is required (use the repository shell wrapper)')
         cls.compiled = tempfile.TemporaryDirectory(prefix='dsr-signing-compiled-')
         cls.addClassCleanup(cls.compiled.cleanup)
         cls.fixtures = Path(cls.compiled.name)
@@ -53,6 +59,15 @@ class SigningInventory(unittest.TestCase):
                 expected_magic = b'\x7fELF' if goos == 'linux' else b'\xcf\xfa\xed\xfe'
                 if output.read_bytes()[:4] != expected_magic:
                     raise AssertionError(f'compiler did not emit expected format: {output}')
+                header = output.read_bytes()[:32]
+                if goos == 'linux':
+                    machine = struct.unpack_from('<H', header, 18)[0]
+                    expected = 62 if goarch == 'amd64' else 183
+                else:
+                    machine = struct.unpack_from('<I', header, 4)[0]
+                    expected = 0x01000007 if goarch == 'amd64' else 0x0100000C
+                if machine != expected:
+                    raise AssertionError(f'compiler emitted the wrong machine type: {output}')
 
     def setUp(self) -> None:
         self.work = tempfile.TemporaryDirectory(prefix='dsr-signing-inventory-')
@@ -104,7 +119,7 @@ class SigningInventory(unittest.TestCase):
 
     def call(self, function: str, *args: object) -> subprocess.CompletedProcess:
         # Function and module are trusted test constants; paths are argv data.
-        return subprocess.run(['bash', '-c', 'source "$1"; shift; "$@"',
+        return subprocess.run([BASH, '-c', 'source "$1"; shift; "$@"',
                                '_', str(MODULE), function, *map(str, args)],
                               text=True, capture_output=True, timeout=30)
 
@@ -263,6 +278,39 @@ class SigningInventory(unittest.TestCase):
         result = self.call('_signing_release_preflight', unrelated)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_checksum_generation_can_follow_payload_signing(self) -> None:
+        self.sums.unlink()
+        self.admitted()
+
+    def test_integrity_metadata_and_private_staging_are_not_payloads(self) -> None:
+        for name in ('.dsr-build-purpose.json', 'bundle.sbom.spdx.json',
+                     'bundle.intoto.jsonl', 'SHA256SUMS.minisig'):
+            (self.output / name).write_text('separate evidence fixture\n')
+        staging = self.output / '.sbh.dsr-batch.fixture'
+        staging.mkdir()
+        (staging / 'signature').write_text('private staged bytes')
+        self.admitted()
+
+    def test_shell_glob_options_cannot_hide_release_manifest(self) -> None:
+        (self.output / 'helper_darwin_arm64').unlink()
+        result = subprocess.run([BASH, '-c',
+            'source "$1"; GLOBIGNORE="*"; set -f; shopt -s failglob; '
+            '_signing_release_preflight "$2"', '_', str(MODULE),
+            str(self.output / 'sbh_linux_amd64')], text=True,
+            capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn('missing or linked', result.stderr)
+
+    def test_checksum_symlink_is_not_followed(self) -> None:
+        retained = self.root / 'retained-checksums'
+        self.sums.rename(retained)
+        self.sums.symlink_to(retained)
+        self.refused()
+
+    def test_checksum_without_final_newline(self) -> None:
+        self.sums.write_text(self.sums.read_text().rstrip('\n'))
+        self.admitted()
+
     @unittest.skipUnless(shutil.which('minisign'), 'real Minisign executable is unavailable')
     def test_real_minisign_complete_manifest_and_payload_only_batch(self) -> None:
         key, public = self.root / 'key', self.root / 'key.pub'
@@ -271,7 +319,7 @@ class SigningInventory(unittest.TestCase):
         env = dict(os.environ, DSR_CONFIG_DIR=str(self.root), DSR_MINISIGN_KEY=str(key))
         shutil.copy2(public, self.root / 'minisign.pub')
         inputs = [self.output / r['name'] for r in self.rows] + [self.manifest]
-        command = ['bash', '-c', 'source "$1"; shift; signing_sign_batch "$@"',
+        command = [BASH, '-c', 'source "$1"; shift; signing_sign_batch "$@"',
                    '_', str(MODULE), *map(str, inputs)]
         result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -285,6 +333,51 @@ class SigningInventory(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(before, {p.name: digest(p) for p in self.output.glob('*.minisig')})
         self.admitted()
+
+
+    @unittest.skipUnless(shutil.which('minisign'), 'real Minisign executable is unavailable')
+    def test_real_signer_cannot_publish_manifest_after_payload_mutation(self) -> None:
+        key, public = self.root / 'key', self.root / 'key.pub'
+        subprocess.run(['minisign', '-G', '-W', '-s', str(key), '-p', str(public)],
+                       check=True, capture_output=True, timeout=30)
+        # This boundary fault still invokes the genuine Minisign executable.
+        # Only an adjacent payload (not the signed JSON) changes after signing.
+        script = r'''source "$1"
+minisign() {
+    command minisign "$@" || return $?
+    if [[ "${1:-}" == -S ]]; then printf changed > "$VICTIM"; fi
+}
+signing_sign_exact "$2" "$2.minisig" "$3" "$(signing_public_key_token "$4")" fixture
+'''
+        result = subprocess.run([BASH, '-c', script, '_', str(MODULE),
+                                 str(self.manifest), str(key), str(public)],
+                                env=dict(os.environ, VICTIM=str(self.output / 'sbh_darwin_arm64')),
+                                text=True, capture_output=True, timeout=120)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn('inventory changed', result.stderr)
+        self.assertFalse(list(self.output.glob('*.minisig')))
+
+    @unittest.skipUnless(shutil.which('minisign'), 'real Minisign executable is unavailable')
+    def test_real_payload_only_batch_rechecks_unlisted_late_arrival(self) -> None:
+        key, public = self.root / 'key', self.root / 'minisign.pub'
+        subprocess.run(['minisign', '-G', '-W', '-s', str(key), '-p', str(public)],
+                       check=True, capture_output=True, timeout=30)
+        script = r'''source "$1"
+minisign() {
+    command minisign "$@" || return $?
+    if [[ "${1:-}" == -S ]]; then printf unlisted > "$LATE_PAYLOAD"; fi
+}
+signing_sign_batch "$2"
+'''
+        result = subprocess.run([BASH, '-c', script, '_', str(MODULE),
+                                 str(self.output / 'sbh_linux_amd64')],
+                                env=dict(os.environ, DSR_CONFIG_DIR=str(self.root),
+                                         DSR_MINISIGN_KEY=str(key),
+                                         LATE_PAYLOAD=str(self.output / 'unlisted_arm64')),
+                                text=True, capture_output=True, timeout=120)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn('absent from manifest', result.stderr)
+        self.assertFalse(list(self.output.glob('*.minisig')))
 
 
 if __name__ == '__main__':
