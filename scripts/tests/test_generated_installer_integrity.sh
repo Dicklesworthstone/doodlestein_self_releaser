@@ -661,10 +661,19 @@ CONFIG
     check 'selected target triple is reported' grep -q "Target: $cpu-unknown-linux-musl" "$case_dir/err"
     run_variant "$vinstaller" --libc gnu
     check '--libc gnu installs the gnu build' installed_as vdemo gnu
-    host_libc=gnu
-    if compgen -G '/lib/ld-musl-*.so.1' >/dev/null || compgen -G '/usr/lib/ld-musl-*.so.1' >/dev/null ||
-       { command -v ldd >/dev/null && ldd --version 2>&1 | grep -qi musl; }; then
-        host_libc=musl
+    # Observe the running system independently of the generated detector. A
+    # dormant alternate loader is not evidence of which libc hosts our shell.
+    # Keep an unrecognized runtime as a failing expectation, never assume GNU.
+    host_libc=unrecognized
+    host_libc_version=$(getconf GNU_LIBC_VERSION 2>/dev/null) || host_libc_version=''
+    if [[ "$host_libc_version" == glibc\ * ]]; then
+        host_libc=gnu
+    else
+        host_ldd_version=$(ldd --version 2>&1) || true
+        case "${host_ldd_version,,}" in
+            *musl*) host_libc=musl ;;
+            *"gnu libc"*|*"gnu c library"*|*glibc*) host_libc=gnu ;;
+        esac
     fi
     run_variant "$vinstaller"
     check "default selection follows this system's C library ($host_libc)" installed_as vdemo "$host_libc"
