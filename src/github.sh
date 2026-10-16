@@ -1231,6 +1231,57 @@ _gh_verify_uploaded_asset() {
     jq -c '.' <<< "$asset"
 }
 
+# Ordinary release publication must not depend on a signing invocation having
+# run. The shared upload path enforces the adjacent manifest even for unsigned
+# releases, existing remote assets and ambiguous-POST reconciliation. This is
+# local admission, not a replacement for a strict caller's frozen upload plan.
+_gh_require_upload_inventory() {
+    if ! declare -F _signing_release_manifest_snapshot >/dev/null ||
+       ! declare -F _signing_release_snapshot_matches >/dev/null; then
+        local module_dir
+        module_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+        # shellcheck source=src/signing.sh
+        source "$module_dir/signing.sh" || return 3
+    fi
+}
+
+# Metadata cannot provide an alternate name for an executable. An evidence
+# sidecar is admitted only under its own local name and for a named payload,
+# selected manifest, or the aggregate checksums. Its cryptographic validity is
+# separate from membership; the signing/verification APIs remain authoritative.
+_gh_manifest_has_upload_name() {
+    local manifest="$1" upload_name="$2" file="$3" sha="$4" named
+    named=$(jq -c --arg name "$upload_name" '[.artifacts[] | select(.name == $name)]' "$manifest") || return 4
+    if [[ "$named" != '[]' ]]; then
+        jq -e --arg sha "$sha" 'length == 1 and .[0].sha256 == $sha' <<< "$named" >/dev/null || return 4
+        return 0
+    fi
+    [[ "${file##*/}" == "$upload_name" ]] || return 4
+    local base="$upload_name"
+    case "$base" in *.minisig|*.sig|*.asc) base="${base%.*}" ;; esac
+    if [[ "$base" == SHA256SUMS || "$base" == "${manifest##*/}" ]]; then
+        return 0
+    fi
+    case "$base" in
+        *.sha256) base="${base%.sha256}" ;;
+        *.sbom.*|*.intoto.jsonl) return 0 ;;
+    esac
+    jq -e --arg name "$base" 'any(.artifacts[]; .name == $name)' "$manifest" >/dev/null
+}
+
+_gh_validate_upload_inventory() {
+    local snapshot="$1" file="$2" upload_name="$3" sha="$4" manifest rows
+    _signing_release_snapshot_matches "$snapshot" "$file" || return $?
+    [[ "$snapshot" != '[]' ]] || return 0
+    rows=$(jq -r '.[].manifest' <<< "$snapshot") || return 4
+    while IFS= read -r manifest; do
+        if ! _gh_manifest_has_upload_name "$manifest" "$upload_name" "$file" "$sha"; then
+            _gh_log_error "Upload name is not bound to the release manifest: $upload_name"
+            return 4
+        fi
+    done <<< "$rows"
+}
+
 # Upload a frozen file snapshot, or reuse an identical complete remote asset.
 # On an ambiguous POST failure, reconcile by name AND content before retrying.
 # No remote assets are deleted or replaced, including incomplete starter assets.
@@ -1268,11 +1319,15 @@ gh_upload_asset_named() (
         _gh_log_error "curl and jq are required for verified asset uploads"
         return 3
     fi
+    _gh_require_upload_inventory || return $?
+    local upload_inventory
+    upload_inventory=$(_signing_release_manifest_snapshot "$file_path") || return $?
+    sha=$(_gh_asset_sha256 "$file_path") || return $?
+    _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
     token=$(_gh_resolve_token) || {
         _gh_log_error "No GitHub token available for asset upload"
         return 3
     }
-    sha=$(_gh_asset_sha256 "$file_path") || return $?
     umask 077
     workdir=$(mktemp -d "${TMPDIR:-/tmp}/dsr-asset-upload.XXXXXXXX") || return 4
     # A direct function return can pop locals before the subshell EXIT trap.
@@ -1300,8 +1355,10 @@ gh_upload_asset_named() (
         asset=$(_gh_find_release_asset "$repo" "$release_id" "$upload_name") || status=$?
         if ((status == 0)); then
             _gh_log_info "Verifying existing release asset: $upload_name"
-            _gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir"
-            return $?
+            asset=$(_gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir") || return $?
+            _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+            printf '%s\n' "$asset"
+            return 0
         elif ((status != 1)); then
             return "$status"
         fi
@@ -1310,6 +1367,9 @@ gh_upload_asset_named() (
         curl_status=0
         : > "$workdir/response" || return 4
         : > "$workdir/headers" || return 4
+        # A successful lookup is not permission to upload after the source
+        # manifest changes. Recheck immediately before every network write.
+        _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
         http_code=$(curl -sS --connect-timeout 15 --max-time "$timeout" \
             -X POST \
             -H "Accept: application/vnd.github+json" \
@@ -1325,8 +1385,10 @@ gh_upload_asset_named() (
         _GH_LAST_RATE_REMAINING=$(_gh_response_header x-ratelimit-remaining "$headers")
         _GH_LAST_RATE_RESET=$(_gh_response_header x-ratelimit-reset "$headers")
         if ((curl_status == 0)) && [[ "$http_code" == "201" ]]; then
-            _gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$response" "$workdir"
-            return $?
+            asset=$(_gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$response" "$workdir") || return $?
+            _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+            printf '%s\n' "$asset"
+            return 0
         fi
 
         retryable=false paused=false rate_limited=false
@@ -1360,8 +1422,10 @@ gh_upload_asset_named() (
         asset=$(_gh_find_release_asset "$repo" "$release_id" "$upload_name") || status=$?
         if ((status == 0)); then
             _gh_log_info "Reconciling upload response failure: $upload_name"
-            _gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir"
-            return $?
+            asset=$(_gh_verify_uploaded_asset "$repo" "$upload_name" "$size" "$sha" "$asset" "$workdir") || return $?
+            _gh_validate_upload_inventory "$upload_inventory" "$file_path" "$upload_name" "$sha" || return $?
+            printf '%s\n' "$asset"
+            return 0
         elif ((status != 1)); then
             return "$status"
         fi
