@@ -7,6 +7,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 WORK=$(mktemp -d) || exit 1
 printf 'Fixtures retained: %s\n' "$WORK"
 source "$ROOT/src/act_runner.sh"
+source "$ROOT/src/signing.sh"
+# The checksum writer is now an explicit pre-publication helper; the normal
+# command and this caller-block regression both execute its production body.
+source <(awk '
+    /^_release_prepare_ordinary_checksums\(\) \(/ {copy=1}
+    copy {print}
+    copy && /^\)/ {exit}
+' "$ROOT/dsr")
 # Load the actual nested collector and publisher naming functions without
 # invoking CLI startup, authentication, compilers or any network mutation.
 source <(awk '
@@ -131,6 +139,8 @@ artifacts_dir="$output_dir"
 manifest_file="$manifest"
 manifest_exists=true
 ordinary_manifest=$(cat "$manifest")
+declare -A ordinary_expected_sha=()
+ordinary_expected_sha["${manifest_file##*/}"]=$(_act_sha256 "$manifest_file") || exit 1
 artifact_naming_generate_dual_for_variant() {
     printf '%s\n' '{"versioned":"bundle_linux_arm64.tar.xz","compat":"unlisted.tar.xz"}'
 }
@@ -165,7 +175,7 @@ key.public_key().verify(signature, manifest.read_bytes())
 checksums = output / "SHA256SUMS"
 signed = {r["name"]:r["sha256"] for r in rows}
 unsigned = dict((line.split("  ",1)[1],line.split("  ",1)[0]) for line in checksums.read_text().splitlines())
-actual = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in output.iterdir() if p.name != "SHA256SUMS" and not p.name.endswith(".sha256")}
+actual = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in output.iterdir() if p.is_file() and p.name != "SHA256SUMS" and not p.name.endswith(".sha256")}
 assert actual == unsigned == signed
 for name, digest in signed.items():
     assert (output / (name+".sha256")).read_text() == f"{digest}  {name}\n"
