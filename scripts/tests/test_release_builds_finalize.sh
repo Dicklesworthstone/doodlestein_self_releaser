@@ -112,7 +112,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then printf 'Original finalizer help\n'; f
           'required_targets':['linux/amd64','darwin/arm64'],'builds':builds}
     planfile=work/'build-plan.json'; write(planfile,plan)
     calls=work/'build.calls'; finalcalls=work/'finalize.calls'; mode=work/'finalize.mode'; mode.write_text('good')
-    env=dict(os.environ,FIXTURE_BUILD_CALLS=str(calls),FIXTURE_FINALIZE_CALLS=str(finalcalls),
+    # The copied build path above is a process fixture. Keep its ambient policy
+    # explicit; the production required-remote refusal is exercised below.
+    env=dict(os.environ,RCH_REQUIRE_REMOTE='0',FIXTURE_BUILD_CALLS=str(calls),FIXTURE_FINALIZE_CALLS=str(finalcalls),
              FIXTURE_FINALIZE_MODE=str(mode),FIXTURE_PROOF=str(work/'proof.json'))
     entry=repo/'src/release_finalize.sh'; output=work/'execution'
     def command(directory=output, selected=planfile):

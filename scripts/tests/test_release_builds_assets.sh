@@ -12,6 +12,7 @@ python3 - "$ROOT" <<'PY'
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,6 +20,8 @@ import sys
 import tempfile
 
 source = Path(sys.argv[1])
+# Only the copied xwin-build.sh fixture executes; no real compiler is admitted.
+fixture_env = dict(os.environ, RCH_REQUIRE_REMOTE="0")
 work = Path(tempfile.mkdtemp(prefix="dsr-build-assets-"))
 repo = work / "repo"
 (repo / "src").mkdir(parents=True)
@@ -134,7 +137,7 @@ save(planfile, plan)
 
 def run(out, expected=0, selected=planfile, extra=()):
     result = subprocess.run(["bash", str(repo / "src/release_builds.sh"), "--plan", str(selected),
-                             "--output-dir", str(out), *extra], capture_output=True, timeout=45)
+                             "--output-dir", str(out), *extra], env=fixture_env, capture_output=True, timeout=45)
     if result.returncode != expected:
         raise AssertionError(f"wanted {expected}, got {result.returncode}: {result.stderr.decode()} {result.stdout.decode()}")
     value = json.loads(result.stdout)
@@ -166,10 +169,9 @@ release_finalize_build_plan "$@"
 
 
 def pipeline(label, selected, expected=0, mutation=""):
-    import os
     result = subprocess.run(["bash", str(bridge), str(repo), "--build-plan", str(selected),
                              "--build-dir", str(work / label)],
-                            env=dict(os.environ, TEST_ENGINE_CALLS=str(work / "engine-calls"), TEST_SET_MUTATION=mutation),
+                            env=dict(fixture_env, TEST_ENGINE_CALLS=str(work / "engine-calls"), TEST_SET_MUTATION=mutation),
                             capture_output=True, timeout=45)
     if result.returncode != expected:
         raise AssertionError(f"pipeline wanted {expected}, got {result.returncode}: {result.stdout.decode()} {result.stderr.decode()}")

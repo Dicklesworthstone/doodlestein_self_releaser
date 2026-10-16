@@ -20,6 +20,9 @@ import tempfile
 import time
 
 root = Path(sys.argv[1])
+# The native entry point is replaced below by native.py; this policy applies
+# only to that installation's process fixtures, never to an actual compiler.
+fixture_env = dict(os.environ, RCH_REQUIRE_REMOTE='0')
 work = Path(tempfile.mkdtemp(prefix='dsr-native-resume-test-'))
 passes = 0
 
@@ -161,7 +164,7 @@ print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details
         return case
     def invoke(case, expected=0):
         proc = subprocess.run(['bash', str(script), '--plan', str(case / 'plan.json'), '--output-dir', str(case / 'run')],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                              env=fixture_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         if proc.returncode != expected:
             print(proc.stderr.decode(), file=sys.stderr)
             raise AssertionError(f'{case.name}: expected {expected}, got {proc.returncode}: {proc.stdout.decode()}')
@@ -317,7 +320,8 @@ print(json.dumps({'command':'build', 'status':'success', 'exit_code':0, 'details
     # target. Resume must preserve that target and terminate its sleeper first.
     case=fixture('signal-resume', mode='slow')
     out=open(case/'cancel.stdout','wb'); err=open(case/'cancel.stderr','wb')
-    process=subprocess.Popen(['bash',str(script),'--plan',str(case/'plan.json'),'--output-dir',str(case/'run')],stdout=out,stderr=err)
+    process=subprocess.Popen(['bash',str(script),'--plan',str(case/'plan.json'),'--output-dir',str(case/'run')],
+                             env=fixture_env,stdout=out,stderr=err)
     try:
         until=time.monotonic()+15
         while time.monotonic()<until and not (case/'control.pid').exists(): time.sleep(.03)

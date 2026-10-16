@@ -101,53 +101,31 @@ _log_result() {
 _discover_shell_tests() {
     local tests_dir="$PROJECT_ROOT/scripts/tests"
     local tests=()
+    local selection=(-name "${_FILTER:-*}")
+    if [[ -n "$_EXCLUDE" ]]; then selection+=('!' -name "$_EXCLUDE"); fi
 
     if [[ -d "$tests_dir" ]]; then
         while IFS= read -r -d '' file; do
-            local name
-            name=$(basename "$file")
-
-            # Apply filter (quoted to prevent glob matching)
-            if [[ -n "$_FILTER" && ! "$name" == "$_FILTER" ]]; then
-                continue
-            fi
-
-            # Apply exclude (quoted to prevent glob matching)
-            if [[ -n "$_EXCLUDE" && "$name" == "$_EXCLUDE" ]]; then
-                continue
-            fi
-
             tests+=("$file")
-        done < <(find "$tests_dir" -maxdepth 1 -name "test_*.sh" -type f -print0 | sort -z)
+        done < <(find "$tests_dir" -maxdepth 1 -name "test_*.sh" "${selection[@]}" -type f -print0 | sort -z)
     fi
 
-    printf '%s\n' "${tests[@]}"
+    if ((${#tests[@]})); then printf '%s\n' "${tests[@]}"; fi
 }
 
 _discover_bats_tests() {
     local tests_dir="$PROJECT_ROOT/tests"
     local tests=()
+    local selection=(-name "${_FILTER:-*}")
+    if [[ -n "$_EXCLUDE" ]]; then selection+=('!' -name "$_EXCLUDE"); fi
 
     if [[ -d "$tests_dir" ]]; then
         while IFS= read -r -d '' file; do
-            local name
-            name=$(basename "$file")
-
-            # Apply filter (quoted to prevent glob matching)
-            if [[ -n "$_FILTER" && ! "$name" == "$_FILTER" ]]; then
-                continue
-            fi
-
-            # Apply exclude (quoted to prevent glob matching)
-            if [[ -n "$_EXCLUDE" && "$name" == "$_EXCLUDE" ]]; then
-                continue
-            fi
-
             tests+=("$file")
-        done < <(find "$tests_dir" -name "*.bats" -type f -print0 | sort -z)
+        done < <(find "$tests_dir" -name "*.bats" "${selection[@]}" -type f -print0 | sort -z)
     fi
 
-    printf '%s\n' "${tests[@]}"
+    if ((${#tests[@]})); then printf '%s\n' "${tests[@]}"; fi
 }
 
 _discover_all_tests() {
@@ -186,7 +164,7 @@ _run_shell_test() {
     duration=$(printf "%.1fs" "$duration")
 
     # Check for skip marker in output
-    if grep -q "^SKIP:" "$log_file" 2>/dev/null; then
+    if [[ $exit_code -eq 0 ]] && grep -Eq '^SKIP([[:space:]]|:)' "$log_file" 2>/dev/null; then
         echo "skip|$name|$duration|0"
         return
     fi
@@ -194,7 +172,8 @@ _run_shell_test() {
     if [[ $exit_code -eq 0 ]]; then
         # Count passed tests from output if available
         local test_count
-        test_count=$(grep -c "^ok " "$log_file" 2>/dev/null || echo "")
+        test_count=$(grep -Ec '^(ok |PASS[[:space:]])' "$log_file" 2>/dev/null || true)
+        [[ "$test_count" != 0 ]] || test_count=''
         echo "pass|$name|$duration|$test_count"
     elif [[ $exit_code -eq 124 ]]; then
         echo "fail|$name|timeout|0"
@@ -259,6 +238,28 @@ _run_test() {
     fi
 }
 
+_record_test_result() {
+    local test_file="$1" result="$2" expected status name duration test_count
+    expected=$(basename "$test_file")
+    IFS='|' read -r status name duration test_count <<< "$result"
+    if [[ "$name" != "$expected" || ! "$status" =~ ^(pass|fail|skip)$ || -z "$duration" ]]; then
+        _log_error "Missing or invalid worker result: $expected"
+        status=fail name="$expected" duration=unavailable test_count=0
+        result="fail|$name|$duration|0"
+    fi
+    _log_result "$name" "$status" "$duration" "$test_count"
+    _TEST_RESULTS+=("$result")
+    _TESTS_RUN=$((_TESTS_RUN + 1))
+    case "$status" in
+        pass) _TESTS_PASSED=$((_TESTS_PASSED + 1)) ;;
+        fail)
+            _TESTS_FAILED=$((_TESTS_FAILED + 1))
+            _FAILED_TESTS+=("$name")
+            ;;
+        skip) _TESTS_SKIPPED=$((_TESTS_SKIPPED + 1)) ;;
+    esac
+}
+
 _run_tests_sequential() {
     local tests=("$@")
 
@@ -268,21 +269,7 @@ _run_tests_sequential() {
         local result
         result=$(_run_test "$test_file")
 
-        IFS='|' read -r status name duration test_count <<< "$result"
-
-        _log_result "$name" "$status" "$duration" "$test_count"
-
-        _TEST_RESULTS+=("$result")
-        ((_TESTS_RUN++))
-
-        case "$status" in
-            pass) ((_TESTS_PASSED++)) ;;
-            fail)
-                ((_TESTS_FAILED++))
-                _FAILED_TESTS+=("$name")
-                ;;
-            skip) ((_TESTS_SKIPPED++)) ;;
-        esac
+        _record_test_result "$test_file" "$result"
     done
 }
 
@@ -307,7 +294,7 @@ _run_tests_parallel() {
         ) &
         pids+=($!)
 
-        ((i++))
+        i=$((i + 1))
 
         # Wait if we've hit max parallel jobs
         if [[ ${#pids[@]} -ge $max_jobs ]]; then
@@ -320,27 +307,14 @@ _run_tests_parallel() {
     wait
 
     # Collect results
+    i=0
     for result_file in "${result_files[@]}"; do
+        local result=''
         if [[ -f "$result_file" ]]; then
-            local result
             result=$(cat "$result_file")
-
-            IFS='|' read -r status name duration test_count <<< "$result"
-
-            _log_result "$name" "$status" "$duration" "$test_count"
-
-            _TEST_RESULTS+=("$result")
-            ((_TESTS_RUN++))
-
-            case "$status" in
-                pass) ((_TESTS_PASSED++)) ;;
-                fail)
-                    ((_TESTS_FAILED++))
-                    _FAILED_TESTS+=("$name")
-                    ;;
-                skip) ((_TESTS_SKIPPED++)) ;;
-            esac
         fi
+        _record_test_result "${tests[$i]}" "$result"
+        i=$((i + 1))
     done
 
     rm -rf "$tmpdir"
@@ -370,9 +344,12 @@ _print_summary() {
 }
 
 _print_json_summary() {
-    local end_time total_duration
+    local end_time total_duration failed_names=''
     end_time=$(date +%s)
     total_duration=$((end_time - _START_TIME))
+    if ((${#_FAILED_TESTS[@]})); then
+        failed_names=$(printf '"%s",' "${_FAILED_TESTS[@]}" | sed 's/,$//')
+    fi
 
     cat << EOF
 {
@@ -381,7 +358,7 @@ _print_json_summary() {
   "tests_failed": $_TESTS_FAILED,
   "tests_skipped": $_TESTS_SKIPPED,
   "duration_seconds": $total_duration,
-  "failed_tests": [$(printf '"%s",' "${_FAILED_TESTS[@]}" | sed 's/,$//')]
+  "failed_tests": [$failed_names]
 }
 EOF
 }
@@ -439,7 +416,7 @@ _print_tap() {
             fail) echo "not ok $i - $name # $duration" ;;
             skip) echo "ok $i - $name # SKIP" ;;
         esac
-        ((i++))
+        i=$((i + 1))
     done
 }
 
@@ -547,8 +524,8 @@ main() {
     mapfile -t tests < <(_discover_all_tests)
 
     if [[ ${#tests[@]} -eq 0 ]]; then
-        _log_warn "No tests found"
-        return 0
+        _log_error "No tests found; refusing to report a successful empty run"
+        return 1
     fi
 
     # List mode
@@ -592,7 +569,7 @@ main() {
     _print_json_summary
 
     # Exit code
-    if [[ $_TESTS_FAILED -gt 0 ]]; then
+    if [[ $_TESTS_FAILED -gt 0 || $_TESTS_RUN -ne ${#tests[@]} ]]; then
         return 1
     fi
     return 0

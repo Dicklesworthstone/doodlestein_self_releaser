@@ -49,7 +49,8 @@ install = work / "install"
 (install / "src").mkdir(parents=True)
 (install / "scripts").mkdir()
 for module in ("release_builds", "release_bundle", "slsa", "guardrails"):
-    shutil.copyfile(source / "src" / (module + ".sh"), install / "src" / (module + ".sh"))
+    selected = Path(os.environ["DSR_TEST_RECOVERY_COORDINATOR"]) if module == "release_builds" and "DSR_TEST_RECOVERY_COORDINATOR" in os.environ else source / "src" / (module + ".sh")
+    shutil.copyfile(selected, install / "src" / (module + ".sh"))
 # These two production command paths are the only substituted implementation.
 (install / "dsr").write_text('#!/usr/bin/env bash\nexec python3 "$(dirname "$0")/driver.py" dsr "$@"\n')
 (install / "scripts/xwin-build.sh").write_text('#!/usr/bin/env bash\nexec python3 "$(dirname "$0")/../driver.py" xwin "$@"\n')
@@ -153,8 +154,11 @@ def fixture(label, driver="xwin", resume=False):
 
 
 def run(case, expected=0):
+    # Both command paths in this copied installation are the Python fixtures
+    # above. Native admission itself has dedicated required-policy controls.
     p = subprocess.run(["bash", str(install / "src/release_builds.sh"), "--plan", str(case / "plan.json"),
-                        "--output-dir", str(case / "builds"), "--jobs", "2"], capture_output=True, timeout=40)
+                        "--output-dir", str(case / "builds"), "--jobs", "2"],
+                       env=dict(os.environ, RCH_REQUIRE_REMOTE="0"), capture_output=True, timeout=40)
     (case / "last.stdout").write_bytes(p.stdout)
     (case / "last.stderr").write_bytes(p.stderr)
     check("coordinator returns expected exit " + str(expected), p.returncode == expected)
@@ -280,12 +284,27 @@ try:
 
     case = fixture("wrong-source")
     (case / "mode").write_text("wrong-source")
-    run(case, 1)
-    pin = copy.deepcopy(job_state(case)["candidate"])
+    result = run(case, 1)
+    first = copy.deepcopy(job_state(case))
+    check("wrong-source output fails before becoming a recoverable candidate",
+          first["candidate"] is None and first["complete"] is None and
+          not result["publishable"] and not (case / "builds/bundle").exists())
+    check("invalid source does not automatically dispatch replacement compilation",
+          len((case / "calls").read_text().splitlines()) == 1 and
+          len(first["attempts"]) == 1 and first["attempts"][0]["status"] == "failed")
+    evidence = retained(case)
     (case / "mode").write_text("good")
-    run(case, 1)
-    check("shared source admission is not weakened by import recovery", job_state(case)["candidate"] == pin and not (case / "builds/bundle").exists())
-    check("wrong-source receipt cannot trigger automatic replacement compilation", len((case / "calls").read_text().splitlines()) == 1)
+    # This is an explicit new coordinator invocation after failed admission,
+    # not recovery of a validated missing-payload candidate. Pre-pin admission
+    # has rejected the invalid manifest since 9fb4bdcd; never relax that gate.
+    result = run(case)
+    manifest = read(Path(result["bundle"]["manifest"]))
+    check("explicit retry builds and admits only the reviewed source",
+          len((case / "calls").read_text().splitlines()) == 2 and
+          manifest["source"]["git_sha"] == "a"*40 and
+          [a["status"] for a in job_state(case)["attempts"]] == ["failed", "completed"])
+    check("rejected source evidence remains unchanged after explicit retry",
+          all(retained(case).get(p) == identity for p, identity in evidence.items()))
 
     # A bad candidate does not prevent independently pinned jobs from finishing.
     case = fixture("independent", "dsr")

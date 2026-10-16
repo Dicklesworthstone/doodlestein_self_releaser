@@ -188,9 +188,14 @@ print(json.dumps(response))
     plan = {'schema_version':1,'repo':'owner/demo','tool':'demo','tag':'v1.2.3','source_sha':'a'*40,
             'required_targets':['linux/amd64','darwin/arm64','windows/arm64'],'builds':[a,b,windows]}
     planfile = work/'plan.json'; encode(planfile, plan)
+    # Only the copied compiler entry points above execute in this installation;
+    # they are Python fixtures, not native or RCH builds. Keep that fixture policy
+    # explicit; the real coordinator's required-remote refusal is tested below.
+    fixture_env = dict(os.environ, RCH_REQUIRE_REMOTE='0')
     def run(output, expected=0, selected=planfile, extra=(), env=None):
         proc = subprocess.run(['bash',str(script),'--plan',str(selected),'--output-dir',str(output)] + list(extra),
-                              env=env, stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45)
+                              env=fixture_env if env is None else env,
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45)
         run.stderr = proc.stderr.decode()
         if proc.returncode != expected:
             print(proc.stderr.decode(), file=sys.stderr)
@@ -218,8 +223,27 @@ print(json.dumps(response))
     check('coordinator policy refusal retains the finalizer envelope before mutation',
           refused['kind']=='dsr-release-builds' and refused['reason_code']=='RCH_REQUIRED_NATIVE_UNAVAILABLE' and
           not refused['publishable'] and not output.exists() and not trace.exists())
+    local_policy = subprocess.run(['bash', '-c',
+        'unset RCH_REQUIRE_REMOTE DRY_RUN; RCH_REQUIRE_REMOTE=1; '
+        'source "$1" || exit $?; release_build_plan "${@:2}"',
+        'unexported-remote-policy', str(script), '--plan', str(planfile), '--output-dir', str(output)],
+        env=fixture_env, capture_output=True, timeout=45)
+    check('unexported required-remote shell policy cannot dispatch or create state',
+          local_policy.returncode == 4 and
+          json.loads(local_policy.stdout)['reason_code']=='RCH_REQUIRED_NATIVE_UNAVAILABLE' and
+          not output.exists() and not trace.exists())
+    for driver in ('dsr', 'xwin'):
+        compilation_plan = dict(plan, builds=[next(job for job in plan['builds'] if job['driver'] == driver)])
+        compilation_plan['required_targets'] = compilation_plan['builds'][0]['targets']
+        selected = work / (driver + '-policy-plan.json')
+        encode(selected, compilation_plan)
+        refusal = run(output, 4, selected=selected,
+                      env=dict(fixture_env, RCH_REQUIRE_REMOTE='1'))
+        check(driver + '-only required-remote plan refuses before state or driver dispatch',
+              refusal['reason_code']=='RCH_REQUIRED_NATIVE_UNAVAILABLE' and
+              not refusal['publishable'] and not output.exists() and not trace.exists())
     controls['windows'].write_text('fail')
-    env = dict(os.environ, DSR_CONFIG_FILE='/wrong', DSR_REPOS_FILE='/wrong', DSR_HOSTS_FILE='/wrong')
+    env = dict(fixture_env, DSR_CONFIG_FILE='/wrong', DSR_REPOS_FILE='/wrong', DSR_HOSTS_FILE='/wrong')
     result = run(output,1,extra=('--jobs','2'),env=env)
     check('independent successes survive a failed builder', result['completed_builds']==2 and result['failed_builds']==['windows'])
     check('incomplete matrix has no publishable bundle', not (output/'bundle').exists() and not result['publishable'])
@@ -495,7 +519,8 @@ print(json.dumps(response))
     # A longer deadline lets the test address the CLI PID rather than its group.
     slow['builds'][0]['timeout']=20; encode(work/'slow.json',slow)
     out=open(work/'cancel.stdout','wb'); err=open(work/'cancel.stderr','wb')
-    proc=subprocess.Popen(['bash',str(script),'--plan',str(work/'slow.json'),'--output-dir',str(work/'cancel')],stdout=out,stderr=err)
+    proc=subprocess.Popen(['bash',str(script),'--plan',str(work/'slow.json'),'--output-dir',str(work/'cancel')],
+                          env=fixture_env,stdout=out,stderr=err)
     prior=trace.read_text().count('start')
     deadline=time.monotonic()+10
     while time.monotonic()<deadline and trace.read_text().count('start')==prior: time.sleep(.03)
@@ -511,7 +536,8 @@ print(json.dumps(response))
     controls['linux'].write_text('slow')
     prior=trace.read_text().count('start')
     out=open(work/'crash.stdout','wb'); err=open(work/'crash.stderr','wb')
-    proc=subprocess.Popen(['bash',str(script),'--plan',str(work/'slow.json'),'--output-dir',str(work/'crash')],stdout=out,stderr=err)
+    proc=subprocess.Popen(['bash',str(script),'--plan',str(work/'slow.json'),'--output-dir',str(work/'crash')],
+                          env=fixture_env,stdout=out,stderr=err)
     group=None
     try:
         deadline=time.monotonic()+10

@@ -7,18 +7,11 @@ source "$_RELEASE_BUILDS_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3;
 
 _rbuild_execute() {
     set -uo pipefail
-    local planning_only=false option
-    [[ "${DRY_RUN:-false}" != true ]] || planning_only=true
-    for option in "$@"; do
-        case "$option" in --help|-h|--dry-run) planning_only=true ;; esac
-    done
-    if ! $planning_only; then
-        dsr_native_rch_policy "release-build-plan" "${RCH_REQUIRE_REMOTE:-}" "dsr-release-builds" || return 4
-    fi
     command -v python3 >/dev/null || return 3
     # The shell may hold DRY_RUN without exporting it. The interpreter must
     # receive the same value that justified bypassing the execution refusal.
-    exec env DRY_RUN="${DRY_RUN:-false}" python3 - "$_RELEASE_BUILDS_DIR" "$@" <<'PY'
+    exec env DRY_RUN="${DRY_RUN:-false}" RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-}" \
+        python3 - "$_RELEASE_BUILDS_DIR" "$@" <<'PY'
 import argparse
 import fcntl
 import hashlib
@@ -779,6 +772,22 @@ try:
     require(sys.platform.startswith("linux"), "build-plan execution requires Linux", 3)
     for tool in ("bash", "jq", "flock", "timeout", "sha256sum"):
         require(shutil.which(tool), "missing dependency: " + tool, 3)
+    # Evaluate the canonical native policy only after validating every driver.
+    # Importing completed artifacts starts no compiler. A mixed plan still
+    # refuses before making state, rather than partially executing its imports.
+    policy = subprocess.run(["bash", "-c",
+        'source "$1/guardrails.sh" || exit $?; '
+        'dsr_native_rch_policy release-build-plan "${RCH_REQUIRE_REMOTE:-}" dsr-release-builds',
+        "release-build-policy", sys.argv[1]], capture_output=True)
+    if policy.returncode:
+        require(bool(policy.stdout), "native policy evaluation failed", policy.returncode)
+        refusal = json.loads(policy.stdout, object_pairs_hook=pairs)
+        if not (policy.returncode == 4 and
+                refusal.get("reason_code") == "RCH_REQUIRED_NATIVE_UNAVAILABLE" and
+                all(job["driver"] == "import" for job in plan["builds"])):
+            sys.stderr.buffer.write(policy.stderr)
+            sys.stdout.buffer.write(policy.stdout)
+            sys.exit(policy.returncode)
     plain(root.parent, "dir")
     root.mkdir(mode=0o700, exist_ok=True)
     plain(root, "dir")

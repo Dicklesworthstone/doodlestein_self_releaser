@@ -108,7 +108,10 @@ def command(case, *extra):
 
 
 def env(case):
-    return dict(os.environ, DSR_ADMISSION_CASE=str(case), PATH=str(install / "bin") + ":" + os.environ["PATH"])
+    # These are real imports, not compiler fixtures: required-remote policy must
+    # remain enabled throughout storage admission, cancellation and recovery.
+    return dict(os.environ, RCH_REQUIRE_REMOTE="1", DSR_ADMISSION_CASE=str(case),
+                PATH=str(install / "bin") + ":" + os.environ["PATH"])
 
 
 def run(case, expected=0, *extra):
@@ -173,6 +176,21 @@ def completed_identity(case):
 
 
 try:
+    case = fixture("required-remote-import")
+    value = run(case)
+    check("required-remote policy admits completed artifacts without compilation",
+          value["status"] == "verified" and value["exit_code"] == 0)
+    case = fixture("invalid-remote-policy")
+    proc = subprocess.run(command(case), env=dict(env(case), RCH_REQUIRE_REMOTE="invalid"),
+                          capture_output=True, timeout=35)
+    check("import-only plans still reject invalid remote policies before state",
+          proc.returncode == 4 and json.loads(proc.stdout)["reason_code"] == "INVALID_RCH_REQUIRE_REMOTE"
+          and not (case / "builds").exists())
+    case = fixture("tampered-required-import")
+    (case / "artifacts/demo").write_bytes(b"different artifact\n")
+    value = run(case, 1)
+    check("required-remote import still rejects mismatched artifact bytes",
+          not value["publishable"] and not (case / "builds/bundle").exists())
     # First probe requires no new option, so the unchanged baseline demonstrates
     # the cancellation bug rather than merely rejecting an unfamiliar flag.
     case = fixture("cancel-import")
