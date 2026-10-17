@@ -227,7 +227,9 @@ for limit in 01 -1 '1+1' 1000000; do
     check "invalid freshness threshold rejected: $limit" equal "$STATUS" 4
 done
 # More than ten real commits, despite a one-entry API page.
-for unused in {1..11}; do "$REAL_GIT" -C "$TEMP/upstream" commit --allow-empty -qm history; done
+for ((history_index=0; history_index<11; history_index++)); do
+    "$REAL_GIT" -C "$TEMP/upstream" commit --allow-empty -qm history
+done
 TEST_HEAD_PIN=$("$REAL_GIT" -C "$TEMP/upstream" rev-parse HEAD)
 run_install paged --prefer-source-if-stale --allow-build --build-timeout 60
 check 'default ten-commit threshold detects stale history' equal "$STATUS" 0
@@ -267,18 +269,28 @@ cat > "$TEMP/bin/cargo" <<'BIN'
 #!/usr/bin/env bash
 printf 'cargo=%s\n' "${RUSTUP_AUTO_INSTALL:-unset}" >> "$TEST_RUST_ENV"
 [[ "${RUSTUP_AUTO_INSTALL:-}" == 0 ]] || exit 23
-output='' target='' binary=''
+output='' target='' binary='' message_format=''
 while (($#)); do
     case "$1" in
         --target-dir) output="$2"; shift 2 ;;
         --target) target="$2"; shift 2 ;;
         --bin) binary="$2"; shift 2 ;;
+        --message-format=*) message_format="${1#*=}"; shift ;;
         *) shift ;;
     esac
 done
 [[ -n "$output" && -n "$target" && -n "$binary" ]] || exit 23
+[[ "$message_format" == json-render-diagnostics ]] || exit 23
 mkdir -p "$output/$target/release"
 printf '#!/bin/sh\necho fixture-rust-payload\n' > "$output/$target/release/$binary"
+jq -cn --arg name "$binary" --arg path "$output/$target/release/$binary" '
+    {reason:"compiler-artifact",target:{name:$name,kind:["bin"]},
+     executable:$path,package_id:"path+file:///owned-fixture#demo@1.0.0"}'
+if [[ "${TEST_RUST_DUPLICATE_PROVIDER:-}" == 1 ]]; then
+    jq -cn --arg name "$binary" --arg path "$output/$target/release/$binary" '
+        {reason:"compiler-artifact",target:{name:$name,kind:["bin"]},
+         executable:$path,package_id:"path+file:///owned-fixture#other@1.0.0"}'
+fi
 BIN
 chmod +x "$TEMP/bin/rustc" "$TEMP/bin/cargo"
 cat > "$TEMP/config/repos.d/rust-demo.yaml" <<'YAML'
@@ -293,5 +305,9 @@ check 'generated Rust installer reaches compiler boundary' equal "$STATUS" 0
 check 'rustc proxy cannot implicitly install a toolchain' grep -qx 'rustc=0' "$TEST_RUST_ENV"
 check 'cargo proxy cannot implicitly install a toolchain' grep -qx 'cargo=0' "$TEST_RUST_ENV"
 check 'Rust fixture still uses nested source provenance' jq -e '.method == "source" and .source.language == "rust" and .signed_release == false' "$TEMP/results/rust-env.json"
+TEST_RUST_DUPLICATE_PROVIDER=1 run_install rust-duplicate --from-source --allow-build --build-timeout 60
+check 'generated Rust installer rejects colliding executable providers' test "$STATUS" -ne 0
+check 'duplicate provider refusal retains its exact diagnostic' grep -q 'Cargo did not identify exactly one executable provider' "$TEMP/results/rust-duplicate.log"
+check 'duplicate providers never install the ambiguous executable' test ! -e "$TEMP/out-rust-duplicate/demo"
 printf 'Generated installer freshness: %s passed, %s failed\n' "$passed" "$failed"
 [[ "$failed" -eq 0 ]]

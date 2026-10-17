@@ -639,7 +639,7 @@ slsa_generate_manifest() (
 # --public-key requires the expected builder, never trusts a key inside JSON.
 slsa_verify_release() {
     local proof="${1:-}" root="${2:-}" manifest='' repository='' builder='' key='' signature=''
-    local -a policy=()
+    local -a verification_args=()
     [[ $# -ge 2 ]] || return 4
     shift 2
     while (($#)); do
@@ -647,10 +647,10 @@ slsa_verify_release() {
         case "$1" in
             --manifest) manifest="$2" ;;
             --repository) repository="$2" ;;
-            --builder) builder="$2"; policy+=("$1" "$2") ;;
+            --builder) builder="$2"; verification_args+=("$1" "$2") ;;
             --public-key) key="$2" ;;
             --signature) signature="$2" ;;
-            --build-type|--source-repository|--source-commit|--invocation-id) policy+=("$1" "$2") ;;
+            --build-type|--source-repository|--source-commit|--invocation-id) verification_args+=("$1" "$2") ;;
             *) return 4 ;;
         esac
         shift 2
@@ -681,7 +681,7 @@ slsa_verify_release() {
     fi
     _slsa_release_assets "$proof" "$root" || return $?
     first=$(jq -r '.subject[0].name' "$proof") || return 1
-    slsa_verify "$root/$first" "$proof" "${policy[@]}" 2>/dev/null || return $?
+    slsa_verify "$root/$first" "$proof" "${verification_args[@]}" 2>/dev/null || return $?
     [[ "$(_slsa_sha256 "$proof")" == "$digest" ]] || return 1
     [[ -z "$manifest" || "$(_slsa_sha256 "$manifest")" == "$manifest_digest" ]] || return 1
     if [[ -n "$key" ]]; then
