@@ -7,6 +7,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P) || exit 1
 for tool in python3 jq flock; do
     command -v "$tool" >/dev/null || { printf 'SKIP: missing %s\n' "$tool"; exit 0; }
 done
+run_shared_publication_tests() {
 python3 -I - "$ROOT" "$@" <<'PY'
 import copy
 import hashlib
@@ -431,3 +432,21 @@ class SharedIntegrityTests(unittest.TestCase):
 if __name__=='__main__':
     unittest.main(verbosity=2)
 PY
+}
+
+if (($#)); then
+    run_shared_publication_tests "$@"
+else
+    # Each class already creates private per-test fixtures. Isolate their
+    # processes too, retaining every case and genuine signer under the same
+    # whole-file deadline instead of serializing unrelated publication flows.
+    # shellcheck source=scripts/test_groups.sh
+    source "$ROOT/scripts/test_groups.sh" || exit 1
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-shared-publication.XXXXXXXX") || exit 1
+    trap 'rm -rf -- "$WORK"' EXIT
+    checks=0 failures=0
+    shared_payload_cases() { checks=1; run_shared_publication_tests SharedPublicationTests; }
+    shared_integrity_cases() { checks=1; run_shared_publication_tests SharedIntegrityTests; }
+    dsr_test_groups shared_payload_cases shared_integrity_cases || exit 1
+    [[ "$checks" -eq 2 && "$failures" -eq 0 ]]
+fi

@@ -3,7 +3,9 @@
 # Only native compilation and signing/scanning/network boundaries are fixtures.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-DSR_PACKAGING_FIXTURES_ONLY=true source "$HERE/test_release_packaging_pipeline.sh"
+# shellcheck source=scripts/tests/test_release_packaging_pipeline.sh
+DSR_PACKAGING_FIXTURES_ONLY=true source "$HERE/test_release_packaging_pipeline.sh" || exit 1
+: "${checks:?Shared fixture checks must be initialized}" "${failures:?Shared fixture failures must be initialized}"
 
 plan_case() {
     package_case "$1"
@@ -137,7 +139,7 @@ assert 'runtime packaging failure never invokes remote policy' test ! -s "$CASE/
 # coordinating/admission/packaging module is copied byte-for-byte from source.
 INSTALL="$WORK/install"
 mkdir -p "$INSTALL/src"
-for module in release_finalize release_finalize_core release_packaging_pipeline release_packaging release_builds release_bundle slsa packaging; do
+for module in release_finalize release_finalize_core release_packaging_pipeline release_packaging release_builds release_bundle slsa packaging guardrails; do
     cp "$ROOT/src/$module.sh" "$INSTALL/src/" || exit 1
 done
 cat > "$INSTALL/dsr" <<'DRIVER'
@@ -167,6 +169,10 @@ file.write_text(json.dumps(manifest) + "\n")
 print(json.dumps(dict(command="build", status="success", exit_code=0, details=dict(manifest=str(file)))))
 PY
 DRIVER
+# These jobs execute only the Python driver fixture above. Keep their disabled
+# compiler policy local to that explicit boundary; verify required-remote
+# admission separately before permitting any fixture execution.
+fixture_plan_flow() { RCH_REQUIRE_REMOTE=0 plan_flow "$@"; }
 native_case() {
     plan_case "$1"
     export PACKAGE_PIPELINE_CASE="$CASE"
@@ -183,21 +189,25 @@ native_case() {
 native_case snapshot
 printf 'mutate\n' > "$CASE/driver-mode"
 cp "$CASE/recipe.json" "$CASE/reviewed-recipe.json"
-run_code 'native build consumes the recipe frozen before compilation' 0 plan_flow
+RCH_REQUIRE_REMOTE=1 run_code 'required-remote policy refuses the simulated native driver' 4 plan_flow
+assert 'required-remote refusal retains its explicit policy identity' jq -e \
+    '.exit_code==4 and (.builds.reason_code=="RCH_REQUIRED_NATIVE_UNAVAILABLE")' "$CASE/result.json"
+assert 'required-remote refusal never executes the fixture driver' test ! -e "$CASE/driver-calls"
+run_code 'native build consumes the recipe frozen before compilation' 0 fixture_plan_flow
 assert 'fixture changed the external recipe during the actual build command' jq -e '.changed' "$CASE/recipe.json"
 assert 'derived manifest retains the original reviewed output names' jq -e \
     '(.required_assets|map(.name))==["tool-linux-alias.tar.gz","tool-linux.tar.gz","tool-windows.zip"]' "$BUILD"
 assert 'native execution occurred once through the production coordinator' test "$(wc -l < "$CASE/driver-calls")" = 1
 cp "$CASE/reviewed-recipe.json" "$CASE/recipe.json"
-run_code 'retry never repeats the completed native build' 0 plan_flow
+run_code 'retry never repeats the completed native build' 0 fixture_plan_flow
 assert 'native compiler boundary is not rerun on publication retry' test "$(wc -l < "$CASE/driver-calls")" = 1
 
 native_case cancellation
 printf 'wait\n' > "$CASE/driver-mode"
 # Signal the public CLI itself, not an extra test-function subshell. No remote
-# policy is reached before this compiler marker; the actual coordinator owns
+# publication is reached before this compiler marker; the actual coordinator owns
 # and cancels the compiler group.
-bash "$INSTALL/src/release_finalize.sh" --build-plan "$CASE/plan.json" --build-dir "$CASE/builds" \
+RCH_REQUIRE_REMOTE=0 bash "$INSTALL/src/release_finalize.sh" --build-plan "$CASE/plan.json" --build-dir "$CASE/builds" \
     --packaging-recipe "$CASE/recipe.json" > "$CASE/cancel-result.json" 2> "$CASE/cancel-error.log" &
 OWNER=$!
 READY=false
@@ -223,10 +233,10 @@ status = pathlib.Path(f"/proc/{pid}/stat")
 assert not status.exists() or status.read_text().split()[2] == "Z"
 PY
 printf 'success\n' > "$CASE/driver-mode"
-run_code 'interrupted native plan restarts safely and completes packaged finalization' 0 plan_flow
+run_code 'interrupted native plan restarts safely and completes packaged finalization' 0 fixture_plan_flow
 assert 'retry retains the interrupted attempt and one successful replacement' jq -e \
     '(.jobs.native.attempts|length)==2 and .jobs.native.attempts[0].status=="interrupted" and
      .jobs.native.attempts[1].status=="completed"' "$CASE/builds/state.json"
 
-printf '\nPackaged build-plan finalization: %s passed, %s failed\n' "$PASS" "$FAIL"
-[[ "$FAIL" == 0 ]]
+printf '\nPackaged build-plan finalization: %s passed, %s failed\n' "$((checks-failures))" "$failures"
+[[ "$failures" == 0 ]]

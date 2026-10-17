@@ -4,7 +4,9 @@
 # from the provenance suite, not native cryptographic/network acceptance.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-DSR_PROVENANCE_FIXTURES_ONLY=true source "$HERE/test_release_provenance_finalize.sh"
+# shellcheck source=scripts/tests/test_release_provenance_finalize.sh
+DSR_PROVENANCE_FIXTURES_ONLY=true source "$HERE/test_release_provenance_finalize.sh" || exit 1
+: "${checks:?Shared fixture checks must be initialized}" "${failures:?Shared fixture failures must be initialized}"
 source "$ROOT/src/release_finalize.sh"
 
 # The fixture scanner selects the exact admitted manifest namespace, including
@@ -164,5 +166,5 @@ run_code 'retained alias drift is rejected instead of silently repaired' 7 packa
 assert 'corrupt bytes remain untouched for diagnosis' test "$CORRUPT" = "$(_rf_hash "$CASE/bundle/packaged/release/artifacts/tool-linux-alias.tar.gz")"
 assert 'retained drift blocks all further remote effects' test "$(wc -l < "$CASE/calls")" = "$BEFORE_CALLS"
 
-printf '\nPackaged build-set finalization: %s passed, %s failed\n' "$PASS" "$FAIL"
-[[ "$FAIL" == 0 ]]
+printf '\nPackaged build-set finalization: %s passed, %s failed\n' "$((checks-failures))" "$failures"
+[[ "$failures" == 0 ]]
