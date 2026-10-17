@@ -38,14 +38,42 @@ _an_timestamp() {
     fi
 }
 
-_an_log_debug() {
-    [[ "${ARTIFACT_NAMING_DEBUG:-0}" == "1" ]] && \
-        echo "[$(_an_timestamp)] ${_AN_BLUE}[artifact_naming]${_AN_NC} DEBUG: $*" >&2
+_an_verbose() {
+    [[ "${QUIET:-false}" != true && "${QUIET:-0}" != 1 ]] &&
+        [[ "${ARTIFACT_NAMING_DEBUG:-0}" == 1 ||
+           "${VERBOSE:-false}" =~ ^(true|1|2)$ ||
+           "${LOG_LEVEL:-${DSR_LOG_LEVEL:-info}}" == debug ]]
 }
-_an_log_info()  { echo "[$(_an_timestamp)] ${_AN_BLUE}[artifact_naming]${_AN_NC} $*" >&2; }
-_an_log_ok()    { echo "[$(_an_timestamp)] ${_AN_GREEN}[artifact_naming]${_AN_NC} $*" >&2; }
-_an_log_warn()  { echo "[$(_an_timestamp)] ${_AN_YELLOW}[artifact_naming]${_AN_NC} $*" >&2; }
-_an_log_error() { echo "[$(_an_timestamp)] ${_AN_RED}[artifact_naming]${_AN_NC} $*" >&2; }
+
+# Keep diagnostic decisions separate from naming results, including with set -e.
+# Use the CLI's structured logger when loaded; standalone library callers retain
+# timestamped stderr diagnostics without initializing files or global logging.
+_an_log() {
+    local level="$1" logger color="$_AN_BLUE"
+    shift
+    case "$level" in
+        debug) _an_verbose || return 0 ;;
+        info) _an_verbose || return 0; color=$_AN_GREEN ;;
+        warn)
+            [[ "${QUIET:-false}" != true && "${QUIET:-0}" != 1 ]] || return 0
+            color=$_AN_YELLOW ;;
+        error) color=$_AN_RED ;;
+    esac
+    logger="log_$level"
+    if declare -F "$logger" >/dev/null; then
+        "$logger" "[artifact_naming] $*" >&2 || return 0
+    else
+        printf '[%s] %s[artifact_naming]%s %s: %s\n' \
+            "$(_an_timestamp)" "$color" "$_AN_NC" "${level^^}" "$*" >&2 || return 0
+    fi
+    return 0
+}
+
+_an_log_debug() { _an_log debug "$@"; }
+_an_log_info()  { _an_log info "$@"; }
+_an_log_ok()    { _an_log info "$@"; }
+_an_log_warn()  { _an_log warn "$@"; }
+_an_log_error() { _an_log error "$@"; }
 
 # Known archive extensions
 _an_has_known_ext() {
