@@ -13,6 +13,7 @@ TEMP=$(mktemp -d) || exit 1
 trap 'rm -rf -- "$TEMP"' EXIT
 export DSR_CONFIG_DIR="$TEMP/config" DSR_REPOS_FILE="$TEMP/config/repos.yaml"
 mkdir -p "$DSR_CONFIG_DIR/repos.d" "$TEMP/checkout" || exit 1
+# shellcheck source=src/artifact_naming.sh
 source "$MODULE"
 PASSED=0 FAILED=0 SKIPPED=0
 
@@ -20,6 +21,7 @@ fixture() {
     cat > "$DSR_CONFIG_DIR/repos.d/search.yaml" <<'JSON'
 {
   "tool_name": "fsfs", "binary_name": "fsfs",
+  "targets": ["darwin/arm64", "darwin/amd64", "linux/amd64", "linux/arm64", "windows/amd64", "windows/arm64"],
   "artifact_naming": "${name}-${version}-${target_triple}.${ext}",
   "install_script_compat": "${name}-${target_triple}.${ext}",
   "release_contract": {
@@ -155,6 +157,13 @@ parser_failure() {
     refuse "$code" artifact_naming_generate_dual_for_tool search v1.12.1 darwin amd64 tar.xz
 }
 
+target_selection_required() {
+    local filter="$1"
+    jq "$filter" "$DSR_CONFIG_DIR/repos.d/search.yaml" > "$TEMP/target-change.json" || return 1
+    cp "$TEMP/target-change.json" "$DSR_CONFIG_DIR/repos.d/search.yaml" || return 1
+    refuse 4 artifact_naming_generate_dual_for_tool search v1.12.1 linux amd64 tar.xz
+}
+
 bad_contract() {
     refuse 4 _an_contract_primary_plan "$1" linux/amd64 tar.xz
 }
@@ -207,6 +216,8 @@ run_test 'diagnostic purpose retains old names; explicit release overrides it' d
 run_test 'explicit diagnostic purpose overrides a release caller' explicit_diagnostic
 run_test 'null contract preserves configured legacy dual naming' legacy
 run_test 'absent configuration does not add a YAML dependency' absent_config
+run_test 'exact names still require configured release targets' target_selection_required 'del(.targets)'
+run_test 'exact names do not authorize an unconfigured platform' target_selection_required '.targets=["darwin/amd64"]'
 run_test 'unavailable configured parser propagates dependency error without a name' parser_failure 3
 run_test 'invalid configured parser result never falls back to inferred names' parser_failure 4
 run_test 'invalid purpose refuses output' refuse 4 artifact_naming_generate_dual_for_tool search v1.12.1 linux amd64 tar.xz '' invalid
@@ -243,6 +254,7 @@ if command -v yq >/dev/null && [[ -f "$ROOT/src/config.sh" ]]; then
             source "$1/src/config.sh" || exit 1
             source "$2" || exit 1
             cat > "$DSR_CONFIG_DIR/repos.d/search.yaml" <<YAML
+targets: [linux/amd64]
 common: &primaries
   linux/amd64: fsfs-lite-linux.tar.xz
 release_contract:

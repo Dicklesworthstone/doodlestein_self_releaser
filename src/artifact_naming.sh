@@ -12,6 +12,8 @@
 # - Validating consistency across all naming sources
 # - Generating both versioned and install.sh-compatible names
 
+# Model the same module-relative config imports used at runtime.
+# shellcheck source-path=SCRIPTDIR
 set -uo pipefail
 
 # Colors for output (if not disabled)
