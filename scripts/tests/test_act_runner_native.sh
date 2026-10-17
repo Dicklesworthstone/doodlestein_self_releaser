@@ -331,8 +331,8 @@ fi
 PASS_COUNT=0
 FAIL_COUNT=0
 
-log_pass() { echo -e "${GREEN}PASS${NC} $1"; ((PASS_COUNT++)); }
-log_fail() { echo -e "${RED}FAIL${NC} $1"; ((FAIL_COUNT++)); }
+log_pass() { echo -e "${GREEN}PASS${NC} $1"; ((PASS_COUNT+=1)); }
+log_fail() { echo -e "${RED}FAIL${NC} $1"; ((FAIL_COUNT+=1)); }
 log_test() { echo -e "\n${YELLOW}===${NC} $1 ${YELLOW}===${NC}"; }
 
 # Create mock directories
@@ -2909,8 +2909,8 @@ test_host_detection_unknown() {
 # act_get_native_host discovers with `declare -F`. Define them locally so these
 # tests exercise the real resolution order without a live health cache.
 _stub_host_resolution() {
-    local mapped="$1"
-    local selected="$2"
+    _STUB_MAPPED_HOST="$1"
+    _STUB_SELECTED_HOST="$2"
 
     # Same reason as the SSH/SCP capture files above: act_get_native_host is
     # usually called through $( ), so a stub recording to a variable would lose
@@ -2918,21 +2918,38 @@ _stub_host_resolution() {
     _STUB_SELECTOR_ARGS_FILE="$MOCK_DIR/selector_args.txt"
     : > "$_STUB_SELECTOR_ARGS_FILE"
 
-    eval "config_get_host_for_platform() { printf '%s\n' '$mapped'; }"
-    if [[ -n "$selected" ]]; then
-        eval "selector_choose_host() { printf '%s' \"\$*\" > '$_STUB_SELECTOR_ARGS_FILE'; printf '%s\n' '$selected'; }"
-    else
-        eval "selector_choose_host() { printf '%s' \"\$*\" > '$_STUB_SELECTOR_ARGS_FILE'; return 1; }"
-    fi
+    config_get_host_for_platform() { printf '%s\n' "$_STUB_MAPPED_HOST"; }
+    selector_choose_host() {
+        printf '%s' "$*" > "$_STUB_SELECTOR_ARGS_FILE"
+        [[ -n "$_STUB_SELECTED_HOST" ]] || return 1
+        printf '%s\n' "$_STUB_SELECTED_HOST"
+    }
 }
 
 _unstub_host_resolution() {
     unset -f config_get_host_for_platform selector_choose_host 2>/dev/null || true
     unset DSR_DISABLE_HOST_SELECTOR
-    unset _STUB_SELECTOR_ARGS_FILE
+    unset _STUB_SELECTOR_ARGS_FILE _STUB_MAPPED_HOST _STUB_SELECTED_HOST
     # Unconditional success: a bare `[[ ]] && ...` tail would return non-zero
     # whenever the guard is false, and callers here run under `set -o pipefail`.
     return 0
+}
+
+test_host_resolution_literal_values() {
+    log_test "Host resolution fixture treats configured values as literal data"
+    local marker="$MOCK_DIR/selector-injection-marker" mapped selected result mapped_result
+    mapped="mapped'; printf INJECTED > '$marker'; : '"
+    selected="selected'; printf INJECTED > '$marker'; : '"
+    _stub_host_resolution "$mapped" "$selected"
+    mapped_result=$(config_get_host_for_platform)
+    result=$(selector_choose_host 'argument with spaces')
+    if [[ "$mapped_result" == "$mapped" && "$result" == "$selected" && ! -e "$marker" ]] &&
+        [[ "$(cat "$_STUB_SELECTOR_ARGS_FILE")" == 'argument with spaces' ]]; then
+        log_pass "Host mapping and selector values preserve quotes without executing them"
+    else
+        log_fail "Host resolution fixture executed or changed literal input"
+    fi
+    _unstub_host_resolution
 }
 
 test_host_selection_selector_wins() {
@@ -3642,7 +3659,7 @@ test_windows_split_target_and_collection() {
 
 test_windows_split_source_budget() {
     log_test "Windows source admission charges retained archives and sibling allocations"
-    local mode result status script expected
+    local mode result status script expected program
     if ! command -v pwsh >/dev/null; then log_fail "PowerShell required for source admission tests"; return; fi
     script=$(
         _act_windows_storage_config() {
@@ -3654,7 +3671,7 @@ test_windows_split_source_budget() {
         status=0
         expected=ADMITTED
         [[ "$mode" == valid ]] || expected='Source archives and sibling allocation exceed split-storage admission'
-        result=$(
+        program=$(
             {
                 printf "\$ErrorActionPreference='Stop'; \$mode='%s';\n" "$mode"
                 cat <<'POWERSHELL'
@@ -3665,8 +3682,9 @@ try {
 POWERSHELL
                 printf '%s\n' "$script"
                 printf '%s\n\n' 'Write-Output ADMITTED } catch { Write-Output $_.Exception.Message }'
-            } | pwsh -NoLogo -NoProfile -NonInteractive -Command -
-        ) || status=$?
+            }
+        ) || return 1
+        result=$(pwsh -NoLogo -NoProfile -NonInteractive -Command "$program") || status=$?
         result=$(printf '%s' "$result" | tr -d '\r')
         if [[ $status -eq 0 && "$result" == "$expected" ]]; then
             log_pass "Source allocation $mode causal branch"
@@ -3859,6 +3877,7 @@ main() {
     test_host_detection_unknown
 
     # Host selection (health/capacity-aware)
+    test_host_resolution_literal_values
     test_host_selection_selector_wins
     test_host_selection_prefers_mapped_host
     test_host_selection_falls_back_to_mapping

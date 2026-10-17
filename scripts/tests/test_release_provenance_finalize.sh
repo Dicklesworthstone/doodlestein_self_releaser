@@ -66,9 +66,15 @@ signing_sign_exact() {
 _sbom_select_artifacts() { find "$1" -maxdepth 1 -type f \( -name 'tool-linux*' -o -name 'tool-windows.exe' \) -printf '%f\n' | sort; }
 _rup_require() { :; }
 fixture_payloads() {
-    local root=$1 selection=$2 records
-    records=$(jq -ceS '{payloads:.artifacts,proofs:[]}' <<< "$selection") || return 1
-    _ri_check_records "$root" "$root" "$records"
+    local root=$1 selection=$2 rows row name
+    rows=$(jq -ce '.artifacts[]' <<< "$selection") || return 1
+    # Use the existing record contract at this transport boundary. A fixture
+    # must also run against the real prior implementation, which has no new
+    # whole-set helper; neither implementation gets a copied hash oracle.
+    while IFS= read -r row; do
+        name=$(jq -r .name <<< "$row") || return 1
+        _ri_check_record "$root/$name" "$row" || return $?
+    done <<< "$rows"
 }
 release_prepare_integrity() {
     local root=$1; shift

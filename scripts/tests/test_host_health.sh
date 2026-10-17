@@ -18,8 +18,8 @@ RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 NC=$'\033[0m'
 
-pass() { ((TESTS_PASSED++)); echo "${GREEN}PASS${NC}: $1"; }
-fail() { ((TESTS_FAILED++)); echo "${RED}FAIL${NC}: $1"; }
+pass() { ((TESTS_PASSED+=1)); echo "${GREEN}PASS${NC}: $1"; }
+fail() { ((TESTS_FAILED+=1)); echo "${RED}FAIL${NC}: $1"; }
 
 # Setup test environment
 TEMP_DIR=$(mktemp -d)
@@ -117,7 +117,7 @@ _test_health_result_json() {
 }
 
 test_cache_init() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
 
@@ -129,7 +129,7 @@ test_cache_init() {
 }
 
 test_cache_write_and_read() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
     local test_data='{"hostname": "test", "healthy": true}'
@@ -146,7 +146,7 @@ test_cache_write_and_read() {
 }
 
 test_cache_validity() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
     _hh_cache_write "freshhost" "$(_test_health_result_json "freshhost" "ok" "true")"
@@ -159,7 +159,7 @@ test_cache_validity() {
 }
 
 test_cache_rejects_wrong_shape_or_hostname() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
     _hh_cache_write "wrongshape" '{"hostname": "wrongshape", "healthy": true}'
@@ -173,7 +173,7 @@ test_cache_rejects_wrong_shape_or_hostname() {
 }
 
 test_cached_unhealthy_result_returns_nonzero() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
     _hh_cache_write "cachedunhealthy" "$(_test_health_result_json "cachedunhealthy" "error" "false")"
@@ -189,7 +189,7 @@ test_cached_unhealthy_result_returns_nonzero() {
 }
 
 test_cache_rejects_invalid_json() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
     printf 'x' > "$(_hh_cache_file "invalidhost")"
@@ -202,7 +202,7 @@ test_cache_rejects_invalid_json() {
 }
 
 test_cache_clear() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
     _hh_cache_write "clearme" '{"test": true}'
@@ -217,7 +217,7 @@ test_cache_clear() {
 }
 
 test_cache_clear_all() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     _hh_init_cache
     _hh_cache_write "host1" '{"test": 1}'
@@ -237,7 +237,7 @@ test_cache_clear_all() {
 # ============================================================================
 
 test_standalone_source_ignores_caller_script_dir() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result status=0
     result=$(
@@ -256,7 +256,7 @@ test_standalone_source_ignores_caller_script_dir() {
 }
 
 test_local_connectivity() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_check_connectivity "testlocal" "local" "")
@@ -269,7 +269,7 @@ test_local_connectivity() {
 }
 
 test_remote_connectivity_handles_bsd_date_literal_nanoseconds() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(
@@ -296,7 +296,7 @@ test_remote_connectivity_handles_bsd_date_literal_nanoseconds() {
 }
 
 test_local_disk_space() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_check_disk_space "testlocal" "local" "")
@@ -309,7 +309,7 @@ test_local_disk_space() {
 }
 
 test_local_disk_space_has_status() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_check_disk_space "testlocal" "local" "")
@@ -324,7 +324,7 @@ test_local_disk_space_has_status() {
 }
 
 test_disk_space_forces_kilobytes_with_512_byte_default() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(
@@ -350,7 +350,7 @@ test_disk_space_forces_kilobytes_with_512_byte_default() {
 }
 
 test_windows_disk_probe_survives_bash_default_shell() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result status=0
     result=$(
@@ -382,7 +382,7 @@ test_windows_disk_probe_survives_bash_default_shell() {
 }
 
 test_disk_space_rejects_non_numeric_fields() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result status=0
     result=$(
@@ -403,7 +403,7 @@ test_disk_space_rejects_non_numeric_fields() {
 }
 
 test_disk_space_rejects_numeric_output_from_failed_command() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result status=0
     result=$(
@@ -425,7 +425,7 @@ test_disk_space_rejects_numeric_output_from_failed_command() {
 }
 
 test_human_disk_error_reports_probe_failure() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result output
     result='{"hostname":"testlocal","platform":"linux/amd64","status":"error","healthy":false,"checks":{"connectivity":{"reachable":true},"disk_space":{"status":"error","usage_percent":null,"error":"Disk probe timed out"},"toolchains":{}}}'
@@ -439,7 +439,7 @@ test_human_disk_error_reports_probe_failure() {
 }
 
 test_local_toolchains_check() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_check_toolchains "testlocal" "local" "" "rust go docker")
@@ -453,7 +453,7 @@ test_local_toolchains_check() {
 }
 
 test_local_clock_drift() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_check_clock_drift "testlocal" "local" "")
@@ -470,7 +470,7 @@ test_local_clock_drift() {
 # ============================================================================
 
 test_health_check_local_host() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     # Clear any cached result first
     host_health_clear_cache "testlocal"
@@ -486,7 +486,7 @@ test_health_check_local_host() {
 }
 
 test_health_check_returns_healthy_for_local() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     host_health_clear_cache "testlocal"
 
@@ -501,7 +501,7 @@ test_health_check_returns_healthy_for_local() {
 }
 
 test_health_check_has_all_checks() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     host_health_clear_cache "testlocal"
 
@@ -522,7 +522,7 @@ test_health_check_has_all_checks() {
 }
 
 test_health_check_unknown_host() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(host_health_check "nonexistent_host_xyz" --json 2>/dev/null)
@@ -535,7 +535,7 @@ test_health_check_unknown_host() {
 }
 
 test_health_check_unreachable_host() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     # testremote is configured with a nonexistent SSH host
     host_health_clear_cache "testremote"
@@ -556,7 +556,7 @@ test_health_check_unreachable_host() {
 # ============================================================================
 
 test_health_check_all_returns_summary() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(host_health_check_all --json 2>/dev/null)
@@ -569,7 +569,7 @@ test_health_check_all_returns_summary() {
 }
 
 test_health_check_all_has_hosts_array() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(host_health_check_all --json 2>/dev/null)
@@ -586,7 +586,7 @@ test_health_check_all_has_hosts_array() {
 # ============================================================================
 
 test_get_healthy_hosts() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(host_health_get_healthy_hosts --json 2>/dev/null)
@@ -600,7 +600,7 @@ test_get_healthy_hosts() {
 }
 
 test_get_healthy_hosts_includes_local() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     host_health_clear_cache "testlocal"
 
@@ -619,7 +619,7 @@ test_get_healthy_hosts_includes_local() {
 # ============================================================================
 
 test_host_is_ready_local() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     host_health_clear_cache "testlocal"
 
@@ -631,7 +631,7 @@ test_host_is_ready_local() {
 }
 
 test_host_is_ready_unreachable() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     host_health_clear_cache "testremote"
 
@@ -643,7 +643,7 @@ test_host_is_ready_unreachable() {
 }
 
 test_host_is_ready_unknown() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     if ! host_health_is_ready "completely_unknown_host"; then
         pass "Unknown host is not ready"
@@ -657,7 +657,7 @@ test_host_is_ready_unknown() {
 # ============================================================================
 
 test_fallback_parser_basic() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_parse_host_fallback "testlocal")
@@ -670,7 +670,7 @@ test_fallback_parser_basic() {
 }
 
 test_fallback_parser_connection() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_parse_host_fallback "testlocal")
@@ -683,7 +683,7 @@ test_fallback_parser_connection() {
 }
 
 test_fallback_parser_capabilities() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local result
     result=$(_hh_parse_host_fallback "testlocal")
@@ -698,7 +698,7 @@ test_fallback_parser_capabilities() {
 }
 
 test_fallback_parser_unknown_host() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     if ! _hh_parse_host_fallback "this_host_does_not_exist" &>/dev/null; then
         pass "Fallback parser returns error for unknown host"
@@ -708,7 +708,7 @@ test_fallback_parser_unknown_host() {
 }
 
 test_fallback_list_hosts() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     local hosts
     hosts=$(_hh_list_hosts_fallback | tr '\n' ' ')
@@ -725,7 +725,7 @@ test_fallback_list_hosts() {
 # ============================================================================
 
 test_disk_threshold_values() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     # Verify thresholds are set
     if [[ $_HH_DISK_WARN_THRESHOLD -eq 90 ]] && [[ $_HH_DISK_ERROR_THRESHOLD -eq 95 ]]; then
@@ -736,7 +736,7 @@ test_disk_threshold_values() {
 }
 
 test_ssh_timeout_value() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     if [[ $_HH_SSH_TIMEOUT -eq 10 ]]; then
         pass "SSH timeout has expected default (10s)"
@@ -746,7 +746,7 @@ test_ssh_timeout_value() {
 }
 
 test_cache_ttl_value() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     if [[ $_HH_CACHE_TTL -eq 300 ]]; then
         pass "Cache TTL has expected default (300s)"
@@ -763,7 +763,7 @@ test_cache_ttl_value() {
 source "$PROJECT_ROOT/src/build_state.sh"
 
 test_retry_backoff_calculation() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     # shellcheck disable=SC2034  # Variable used by sourced module
     BUILD_RETRY_BASE_DELAY=1
@@ -784,7 +784,7 @@ test_retry_backoff_calculation() {
 }
 
 test_retry_max_delay_cap() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     BUILD_RETRY_BASE_DELAY=100
     BUILD_RETRY_MAX_DELAY=200
@@ -802,11 +802,11 @@ test_retry_max_delay_cap() {
 }
 
 test_retry_with_success() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     BUILD_RETRY_BASE_DELAY=0
     local attempt=0
-    succeed_after_two() { ((attempt++)); [[ $attempt -ge 2 ]]; }
+    succeed_after_two() { ((attempt+=1)); [[ $attempt -ge 2 ]]; }
 
     if build_retry_with_backoff 3 succeed_after_two 2>/dev/null; then
         pass "Retry succeeds after transient failure"
@@ -819,7 +819,7 @@ test_retry_with_success() {
 }
 
 test_retry_state_recording() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     build_state_init
     # shellcheck disable=SC2034  # run_id captured for debugging
@@ -839,7 +839,7 @@ test_retry_state_recording() {
 }
 
 test_retry_limit_enforcement() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     build_state_init
     DSR_RUN_ID="test-limit-$$" build_state_create "limit-test" "v1.0.0" "trj" >/dev/null 2>&1
@@ -860,7 +860,7 @@ test_retry_limit_enforcement() {
 }
 
 test_resume_plan_generation() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     build_state_init
     DSR_RUN_ID="test-resume-$$" build_state_create "resume-test" "v1.0.0" "trj,mmini" >/dev/null 2>&1
@@ -885,7 +885,7 @@ test_resume_plan_generation() {
 }
 
 test_health_check_with_retry_context() {
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
 
     # Test that health check results can be used in retry context
     build_state_init
@@ -919,10 +919,40 @@ test_health_check_with_retry_context() {
 # Run All Tests
 # ============================================================================
 
+run_powershell_program() {
+    local program
+    program=$(cat) || return 1
+    # -Command - reads through the stdin host, which emits terminal controls
+    # and can resume after a terminating error. Pass one complete program.
+    pwsh -NoLogo -NoProfile -NonInteractive -Command "$program"
+}
+
+test_powershell_program_failure() {
+    local result status=0
+    ((TESTS_RUN+=1))
+    if ! command -v pwsh >/dev/null; then
+        fail "PowerShell is required to verify terminating-error propagation"
+        return
+    fi
+    result=$(run_powershell_program 2> "$TEMP_DIR/powershell-program-error" <<'POWERSHELL'
+Write-Output 'BEFORE_ERROR'
+throw 'DSR_TEST_TERMINATING_ERROR'
+Write-Output 'UNREACHABLE'
+POWERSHELL
+    ) || status=$?
+    result=$(printf '%s' "$result" | tr -d '\r')
+    if [[ $status -ne 0 && "$result" == BEFORE_ERROR ]] &&
+        grep -q 'DSR_TEST_TERMINATING_ERROR' "$TEMP_DIR/powershell-program-error"; then
+        pass "Complete PowerShell program preserves terminating errors and exact output"
+    else
+        fail "PowerShell terminating error: status=$status result=$result"
+    fi
+}
+
 test_windows_split_storage_admission() {
     local mode script result expected status
     if ! command -v pwsh >/dev/null; then
-        ((TESTS_RUN++))
+        ((TESTS_RUN+=1))
         fail "PowerShell is required to execute Windows storage admission tests"
         return
     fi
@@ -933,7 +963,7 @@ test_windows_split_storage_admission() {
         config_windows_storage_session_script fixture
     )
     for mode in valid wrong_mapping low_source low_target unavailable; do
-        ((TESTS_RUN++))
+        ((TESTS_RUN+=1))
         case "$mode" in
             valid) expected='ADMITTED:0' ;;
             wrong_mapping) expected='DSR NFS mapping identity mismatch:0' ;;
@@ -969,7 +999,7 @@ POWERSHELL
                 printf '%s\n' "$script"
                 printf '%s\n' 'Write-Output ("ADMITTED:"+$global:mountCalls)' '} catch { Write-Output ($_.Exception.Message+":"+$global:mountCalls) }'
                 printf '\n'
-            } | pwsh -NoLogo -NoProfile -NonInteractive -Command -
+            } | run_powershell_program
         ) || status=$?
         result=$(printf '%s' "$result" | tr -d '\r')
         if [[ $status -eq 0 && "$result" == "$expected" ]]; then
@@ -989,7 +1019,7 @@ Write-Output 'literal $HOME ` " ; & Write-Output EXTRA_COMMAND'
 POWERSHELL
     ) || status=$?
     expected=$'DSR-界-é\nliteral $HOME ` " ; & Write-Output EXTRA_COMMAND'
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     result=$(
         powershell() {
             [[ $# -eq 4 && "$1 $2 $3" == '-NoProfile -NonInteractive -Command' ]] || return 91
@@ -1006,12 +1036,12 @@ POWERSHELL
     else
         fail "Storage transport status=$status result=$result"
     fi
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     status=0
     result=$(printf 'Write-Output "row-%s"\n' {1..6000} | _hh_windows_storage_command) || status=$?
     if [[ $status -eq 4 && -z "$result" ]]; then pass "Overlong storage command refuses before transport";
     else fail "Overlong storage command status=$status output_bytes=${#result}"; fi
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     status=0
     result=$(
         config_windows_storage_json() {
@@ -1053,18 +1083,18 @@ YAML
         .checks.disk_space.storage_contract=$contract |
         .checks.disk_space.admission="split-storage-role-budgets-v1"')
     _hh_cache_write lockcontract "$result"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then fail "Legacy one-byte cached admission must be reprobed";
     else pass "Legacy one-byte cached admission is refused"; fi
     _hh_cache_write lockcontract "$(jq '.checks.disk_space.lock_range="cargo-win32-whole-u64-v1"' <<< "$result")"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then pass "Whole-u64 cached admission retains normal TTL";
     else fail "Whole-u64 cached admission unexpectedly refused"; fi
     local current_result ordinary_result changed_contract
     current_result=$(_hh_cache_read lockcontract)
     ordinary_result=$(_test_health_result_json "lockcontract" "ok" "true" | jq '.platform="windows/amd64"')
     _hh_cache_write lockcontract "$ordinary_result"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then fail "Local cached health must not admit new split storage";
     else pass "Local-to-split storage change invalidates cached health"; fi
     for changed_contract in \
@@ -1072,33 +1102,33 @@ YAML
         "$(jq '.target_min_free_bytes=42949672960' <<< "$contract")"; do
         _hh_cache_write lockcontract "$(jq --argjson contract "$changed_contract" \
             '.checks.disk_space.storage_contract=$contract' <<< "$current_result")"
-        ((TESTS_RUN++))
+        ((TESTS_RUN+=1))
         if _hh_cache_valid lockcontract; then fail "Changed storage identity/budget must be reprobed";
         else pass "Changed storage identity/budget invalidates cached health"; fi
     done
     _hh_cache_write lockcontract "$current_result"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     if (DSR_HOSTS_FILE="$TEMP_DIR/absent-storage.yaml"; _hh_cache_valid lockcontract); then
         fail "Split cached health must not survive storage removal"
     else pass "Split-to-local storage change invalidates cached health"; fi
     _hh_cache_write lockcontract "$(jq '.healthy=false | .status="error" |
         .checks.disk_space={path:"split-storage",status:"error"}' <<< "$current_result")"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     if (DSR_HOSTS_FILE="$TEMP_DIR/absent-storage.yaml"; _hh_cache_valid lockcontract); then
         fail "Historical split failure must not survive storage removal"
     else pass "Split-to-local storage change invalidates cached failure"; fi
     _hh_cache_write lockcontract "$ordinary_result"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     if (DSR_HOSTS_FILE="$TEMP_DIR/absent-storage.yaml"; _hh_cache_valid lockcontract); then
         pass "Unchanged local storage retains normal cache TTL"
     else fail "Unchanged local storage cache unexpectedly refused"; fi
     printf 'hosts:\n  lockcontract:\n    windows_storage: false\n' > "$TEMP_DIR/invalid-lock-storage.yaml"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     if (DSR_HOSTS_FILE="$TEMP_DIR/invalid-lock-storage.yaml"; _hh_cache_valid lockcontract); then
         fail "Invalid current storage contract must not reuse cached health"
     else pass "Invalid current storage contract invalidates cached health"; fi
     if ! command -v pwsh >/dev/null; then
-        ((TESTS_RUN++)); fail "PowerShell is required for Cargo lock admission controls"; return
+        ((TESTS_RUN+=1)); fail "PowerShell is required for Cargo lock admission controls"; return
     fi
     script=$(
         config_windows_storage_json() { printf '%s' '{"drive":"R"}'; }
@@ -1148,7 +1178,7 @@ function Invoke-LockChild {
 }
 POWERSHELL
     for mode in valid one_byte_only wrong_exclusion no_exclusion no_exclusion_unlock_failure unlock_failure reacquire_failure; do
-        ((TESTS_RUN++))
+        ((TESTS_RUN+=1))
         case "$mode" in
             valid) expected='ADMITTED' ;;
             one_byte_only) expected='ONE_BYTE_ADMITTED;DSR Cargo whole-u64 initial lock failed: 33' ;;
@@ -1184,7 +1214,7 @@ POWERSHELL
                 printf '%s\n' 'Write-Output ($prefix+"ADMITTED")' '} catch { Write-Output ($prefix+$_.Exception.Message) }'
                 printf '\n'
             } | DSR_LOCK_MODEL="$model" DSR_LOCK_MODE="$mode" DSR_LOCK_ROOT="$TEMP_DIR" \
-                DSR_LOCK_PWSH="$(command -v pwsh)" pwsh -NoLogo -NoProfile -NonInteractive -Command -
+                DSR_LOCK_PWSH="$(command -v pwsh)" run_powershell_program
         ) || status=$?
         result=$(printf '%s' "$result" | tr -d '\r')
         if [[ $status -eq 0 && "$result" == "$expected" ]]; then
@@ -1199,7 +1229,7 @@ test_windows_storage_optional_config() {
     local result status=0 fixture="$TEMP_DIR/windows-storage-optional.yaml" ordinary_fixture="$TEMP_DIR/windows-storage-ordinary.yaml"
     printf 'hosts:\n  ordinary:\n    platform: windows/amd64\n  opted:\n    windows_storage: false\n' > "$fixture"
     printf 'hosts:\n  ordinary:\n    platform: windows/amd64\n' > "$ordinary_fixture"
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     result=$(
         export DSR_HOSTS_FILE="$ordinary_fixture"
         command() {
@@ -1217,7 +1247,7 @@ test_windows_storage_optional_config() {
     else
         fail "Missing-yq config behavior: status=$status result=$result"
     fi
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     status=0
     (
         export DSR_HOSTS_FILE="$ordinary_fixture"
@@ -1230,14 +1260,14 @@ test_windows_storage_optional_config() {
     ) || status=$?
     if [[ $status -eq 4 ]]; then pass "Unreadable yq-less configuration fails closed";
     else fail "Unreadable yq-less configuration returned $status"; fi
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     status=0
     (export DSR_HOSTS_FILE="$fixture"; config_windows_storage_json opted >/dev/null) || status=$?
     if [[ $status -eq 4 ]]; then pass "False split-storage contract is malformed, not absent";
     else fail "False split-storage contract returned $status"; fi
     local syntax complex_fixture
     for syntax in flow quoted; do
-        ((TESTS_RUN++))
+        ((TESTS_RUN+=1))
         complex_fixture="$TEMP_DIR/windows-storage-$syntax.yaml"
         if [[ "$syntax" == flow ]]; then
             printf 'hosts: {ordinary: {windows_storage: false}}\n' > "$complex_fixture"
@@ -1317,13 +1347,13 @@ EOF
     # (absent, 1); it must never turn an ordinary Unix host unhealthy.
     for host in plain:1 rootonly:1 good:0 trailing:0 nobuildroot:4 relative:4 dotdot:4 slash:4 quote:4 tiny:4 secondpath:4 falsy:4 dotted.host:0 doubleslash:4 innerslash:4 -odd:1; do
         expected="${host#*:}"; host="${host%%:*}"
-        ((TESTS_RUN++))
+        ((TESTS_RUN+=1))
         status=0
         (export DSR_HOSTS_FILE="$fixture"; config_unix_storage_json "$host" >/dev/null) || status=$?
         if [[ $status -eq $expected ]]; then pass "Unix storage contract '$host' returns $expected";
         else fail "Unix storage contract '$host' returned $status, expected $expected"; fi
     done
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     status=0
     (
         export DSR_HOSTS_FILE="$fixture"
@@ -1335,7 +1365,7 @@ EOF
     ) || status=$?
     if [[ $status -eq 4 ]]; then pass "Yq-less Unix storage opt-in fails closed";
     else fail "Yq-less Unix storage opt-in returned $status"; fi
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     local emitted
     emitted=$(export DSR_HOSTS_FILE="$fixture"; config_unix_storage_json trailing)
     if jq -e '. == {build_root: "/data/tmp", root_min_free_bytes: 21474836480}' <<< "$emitted" >/dev/null; then
@@ -1371,7 +1401,7 @@ _test_unix_split_disk() {
 test_unix_split_storage_admission() {
     local result status
     # trj on 2026-10-13: / 97% with ~33 GiB free, /data 69%.
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     result=$(_test_unix_split_disk "97 34664140" "69 1700000000")
     if jq -e '.status == "warning" and .admission == "unix-split-storage-v1" and
               .root.status == "error" and .root.admitted_as == "warning" and
@@ -1381,7 +1411,7 @@ test_unix_split_storage_admission() {
         fail "Split admission (root over floor) got: $result"
     fi
 
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     result=$(_test_unix_split_disk "97 5000000" "69 1700000000")
     if jq -e '.status == "error" and .root.admitted_as == "error"' <<< "$result" >/dev/null; then
         pass "Full root below its free floor stays an error"
@@ -1389,7 +1419,7 @@ test_unix_split_storage_admission() {
         fail "Split admission (root under floor) got: $result"
     fi
 
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     result=$(_test_unix_split_disk "50 400000000" "96 1000000")
     if jq -e '.status == "error" and .root.status == "ok" and .build_root.status == "error"' <<< "$result" >/dev/null; then
         pass "Full build root is an error even with a healthy root"
@@ -1397,7 +1427,7 @@ test_unix_split_storage_admission() {
         fail "Split admission (full build root) got: $result"
     fi
 
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     result=$(_test_unix_split_disk "50 400000000" "92 80000000")
     if jq -e '.status == "warning" and .build_root.status == "warning" and .root.admitted_as == "ok"' <<< "$result" >/dev/null; then
         pass "Build-root warning surfaces as the overall warning"
@@ -1405,7 +1435,7 @@ test_unix_split_storage_admission() {
         fail "Split admission (build-root warning) got: $result"
     fi
 
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     status=0
     result=$(_test_unix_split_disk "50 400000000" FAIL) || status=$?
     if [[ $status -ne 0 ]] && jq -e '.status == "error" and (.error | test("build root /data"))' <<< "$result" >/dev/null; then
@@ -1414,7 +1444,7 @@ test_unix_split_storage_admission() {
         fail "Split admission (probe failure) status=$status got: $result"
     fi
 
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     local fixture="$TEMP_DIR/unix-storage-bad.yaml"
     printf 'hosts:\n  badhost:\n    platform: linux/amd64\n    connection: local\n    unix_storage: {root_min_free_bytes: 21474836480}\n' > "$fixture"
     status=0
@@ -1434,7 +1464,7 @@ test_unix_split_storage_human_report() {
     local warn_result err_result output
     warn_result='{"hostname":"trj","platform":"linux/amd64","status":"warning","healthy":true,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"warning","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"error","admitted_as":"warning","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":70,"available_gb":1494.49,"status":"ok"}},"toolchains":{},"docker":{},"clock_drift":{}}}'
     err_result='{"hostname":"trj","platform":"linux/amd64","status":"error","healthy":false,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":50,"available_gb":400,"status":"error","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":50,"available_gb":400,"status":"ok","admitted_as":"ok","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":96,"available_gb":3.1,"status":"error"}},"toolchains":{}}}'
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     output=$(_hh_print_result "trj" "$warn_result" 2>&1)
     if [[ "$output" == *"root / 97% used, 33.02 GB free: warning (above its 20 GiB free floor)"* &&
           "$output" == *"build root /data/dsr-build-root 70% used"*": ok"* && "$output" != *"Disk usage >"* ]]; then
@@ -1442,7 +1472,7 @@ test_unix_split_storage_human_report() {
     else
         fail "Split-storage warning report: $output"
     fi
-    ((TESTS_RUN++))
+    ((TESTS_RUN+=1))
     output=$(_hh_print_result "trj" "$err_result" 2>&1)
     if [[ "$output" == *"build root /data/dsr-build-root 96% used, 3.1 GB free: error"* && "$output" != *"Disk usage >"* ]]; then
         pass "Split-storage error report names the full build root, not the healthy root"
@@ -1493,6 +1523,7 @@ test_disk_space_rejects_non_numeric_fields
 test_disk_space_rejects_numeric_output_from_failed_command
 test_windows_disk_probe_survives_bash_default_shell
 test_windows_storage_optional_config
+test_powershell_program_failure
 test_windows_split_storage_admission
 test_windows_storage_transport
 test_windows_cargo_lock_range
