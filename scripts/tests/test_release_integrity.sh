@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Real JSON, files, SHA256, Ed25519/Blake2b signatures, locks and publication.
-# The Minisign CLI adapter is a Python reference fixture, not native Minisign;
-# native interoperability runs additionally when the actual executable exists.
+# Signing and verification use native Minisign when available, with a real
+# Python reference fallback. Both implementations are checked directly below.
 # GitHub is an explicit file-backed transport fixture. No production keys used.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 NATIVE_MINISIGN=$(command -v minisign || true)
+export RI_NATIVE_MINISIGN="$NATIVE_MINISIGN"
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
 trap 'exit 5' HUP INT TERM
@@ -28,7 +29,15 @@ def value(flag):
 def encoded(data):
     return base64.b64encode(data).decode()
 try:
-    if '-G' in sys.argv:
+    if sys.argv[1:2] == ['corrupt-signature']:
+        path = Path(sys.argv[2])
+        lines = path.read_text().splitlines()
+        packet = bytearray(base64.b64decode(lines[1], validate=True))
+        assert len(packet) == 74
+        packet[10] ^= 1  # Corrupt a signature byte, preserving algorithm/key ID.
+        lines[1] = encoded(packet)
+        path.write_text('\n'.join(lines) + '\n')
+    elif '-G' in sys.argv:
         key=Ed25519PrivateKey.generate()
         seed=key.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption())
         public=key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
@@ -69,19 +78,64 @@ try:
 except Exception:
     sys.exit(1)
 PY
-cat > "$WORK/bin/minisign" <<'SHIM'
-#!/usr/bin/env bash
-# Avoid unrelated site-startup hooks in the isolated reference process.
-exec python3 -S "${BASH_SOURCE[0]}.py" "$@"
-SHIM
+export RI_REFERENCE_MINISIGN="$WORK/bin/minisign.py"
+# Keep failure injection identical for the real native signer. Native keys are
+# isolated unencrypted development keys; no production credentials are used.
+minisign() {
+    if [[ -z "${RI_NATIVE_MINISIGN:-}" ]]; then
+        python3 -S "$RI_REFERENCE_MINISIGN" "$@"
+        return $?
+    fi
+    case "${1:-}" in
+        -G) "$RI_NATIVE_MINISIGN" "$@" -W -q ;;
+        -V) "$RI_NATIVE_MINISIGN" "$@" ;;
+        -S)
+            local comment='' signature='' option argument fail="${RI_SIGN_FAIL:-}"
+            local -a args=("$@")
+            local i
+            for ((i=1; i<${#args[@]}; i++)); do
+                option=${args[i]}
+                case "$option" in
+                    -m|-s|-x|-t|-c)
+                        ((i+1 < ${#args[@]})) || return 4
+                        i=$((i+1)); argument=${args[i]}
+                        case "$option" in -t) comment=$argument ;; -x) signature=$argument ;; esac ;;
+                esac
+            done
+            if [[ -n "${RI_SIGN_LOG:-}" ]]; then printf '%s\n' "$comment" >> "$RI_SIGN_LOG" || return 1; fi
+            if [[ -n "$fail" && "$comment" == *"$fail"* ]]; then
+                case "${RI_SIGN_MODE:-fail}" in
+                    empty) return 0 ;;
+                    corrupt) printf 'invalid signature\n' > "$signature"; return $? ;;
+                    *) return 19 ;;
+                esac
+            fi
+            "$RI_NATIVE_MINISIGN" "$@" -q || return $?
+            [[ -z "${RI_SIGN_DRIFT:-}" ]] || printf changed >> "$RI_SIGN_DRIFT" || return 1
+            ;;
+        *) return 4 ;;
+    esac
+}
+# Subprocess consumers execute the same dispatcher; sourced tests avoid a new
+# Bash process and reparsing exported functions for each signature operation.
+{
+    printf '#!/usr/bin/env bash\n'
+    declare -f minisign
+    printf 'minisign "$@"\n'
+} > "$WORK/bin/minisign"
 chmod +x "$WORK/bin/minisign"
 export PATH="$WORK/bin:$PATH"
 minisign -G -s "$WORK/private" -p "$WORK/public" || exit 1
 minisign -G -s "$WORK/wrong-private" -p "$WORK/wrong-public" || exit 1
 chmod 600 "$WORK/private" "$WORK/wrong-private"
 for module in sbom slsa signing sbom_release release_payloads release_integrity; do
-    # shellcheck source=/dev/null
-    source "$ROOT/src/$module.sh"
+    if [[ "$module" == release_integrity ]]; then
+        # shellcheck source=src/release_integrity.sh
+        source "${RI_TEST_MODULE:-$ROOT/src/release_integrity.sh}"
+    else
+        # shellcheck source=/dev/null
+        source "$ROOT/src/$module.sh"
+    fi
 done
 _sbr_require() { return 0; }
 _sbr_run() { "$@"; }
@@ -190,6 +244,71 @@ fixture_private_payload() {
 # Reuse the explicit transport/cryptographic fixtures in orchestration tests.
 if [[ "${RI_HARNESS_ONLY:-false}" == true && "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 
+# Independent scenarios own separate fixture trees and shell state. Preserve
+# every case and the runner's single unchanged deadline for this whole file.
+# shellcheck source=scripts/test_groups.sh
+source "$ROOT/scripts/test_groups.sh"
+ri_record_and_completion_cases() {
+new_case record-contract
+record=$(_ri_file_record "$ART/a.tar.gz" a.tar.gz) || exit 1
+capture _ri_check_record "$ART/a.tar.gz" "$record"
+check 'record check accepts exact bytes and numeric size' test "$status" -eq 0
+capture _ri_check_record "$ART/a.tar.gz" "$(jq '.signature={ignored:true}' <<< "$record")"
+check 'record projection preserves independent signature fields' test "$status" -eq 0
+for mutation in '.sha256=("0"*64)' '.size+=1' '.size|=tostring' '.size=5.5' \
+    '.name=null' '.name=123' '.name=["a.tar.gz"]' '.name+="\n"' '.name+="\u0000"'; do
+    capture _ri_check_record "$ART/a.tar.gz" "$(jq "$mutation" <<< "$record")"
+    check "record check rejects changed/invalid fields: $mutation" test "$status" -eq 7
+done
+capture _ri_check_record "$ART/a.tar.gz" "$record"$'\n'"$record"
+check 'record check rejects multiple JSON documents' test "$status" -eq 7
+capture _ri_check_record "$ART/a.tar.gz" ''
+check 'record check rejects an empty JSON input' test "$status" -eq 7
+capture _ri_check_record "$ART/a.tar.gz" '{'
+check 'record check rejects malformed JSON' test "$status" -eq 7
+ln -s a.tar.gz "$ART/linked" || exit 1
+capture _ri_check_record "$ART/linked" "$record"
+check 'record check rejects a linked payload' test "$status" -eq 4
+capture _ri_check_record "$ART/missing" "$record"
+check 'record check rejects a missing payload' test "$status" -eq 4
+printf changed >> "$ART/a.tar.gz"
+capture _ri_check_record "$ART/a.tar.gz" "$record"
+check 'record check rejects byte drift' test "$status" -eq 7
+
+new_case record-set-contract
+mkdir "$CASE/checks"
+printf proof > "$PROOFS/proof.json"
+cp "$PROOFS/proof.json" "$PROOFS/123"
+selection=$(jq -c '{artifacts:[.artifacts[]|{name,sha256,size:.size_bytes}]}' "$MANIFEST") || exit 1
+proof_record=$(_ri_file_record "$PROOFS/proof.json" proof.json) || exit 1
+documents=$(jq -cs . <<< "$proof_record") || exit 1
+check_record_set() { _ri_local_unchanged "$ART" "$PROOFS" "$selection" "$documents" "$CASE/checks"; }
+capture check_record_set
+check 'record-set gate checks all selected payloads and proofs' test "$status" -eq 0
+documents=$(jq -cs '.[0].name="123"' <<< "$proof_record") || exit 1
+capture check_record_set
+check 'record-set gate accepts an actual string numeric filename' test "$status" -eq 0
+for mutation in '.[0].sha256=("0"*64)' '.[0].size+=1' '.[0].size|=tostring' '.[0].size=5.5' \
+    '.[0].name=123' '.[0].name=null' '.[0].name=["proof.json"]' '.[0].sha256=123'; do
+    documents=$(jq -cs "$mutation" <<< "$proof_record") || exit 1
+    capture check_record_set
+    check "record-set gate rejects proof record drift: $mutation" test "$status" -eq 7
+done
+for name in linked.json pipe.json directory.json missing.json; do
+    case "$name" in
+        linked.json) ln -s proof.json "$PROOFS/$name" || exit 1 ;;
+        pipe.json) mkfifo "$PROOFS/$name" || exit 1 ;;
+        directory.json) mkdir "$PROOFS/$name" || exit 1 ;;
+    esac
+    documents=$(jq -cs --arg name "$name" '.[0].name=$name' <<< "$proof_record") || exit 1
+    capture check_record_set
+    check "record-set gate rejects nonregular/missing proof: $name" test "$status" -eq 4
+done
+documents=$(jq -cs . <<< "$proof_record") || exit 1
+printf changed >> "$PROOFS/proof.json"
+capture check_record_set
+check 'record-set gate rehashes the actual proof bytes' test "$status" -eq 7
+
 new_case complete
 capture prepare
 check 'all payloads and aliases produce a signed bundle' test "$status" -eq 0
@@ -221,7 +340,9 @@ jq '.release.draft=false' "$CASE/context.json" > "$CASE/ctx"; mv "$CASE/ctx" "$C
 capture call publish
 check 'complete public retry is read-only' test "$status" -eq 0
 check 'complete public retry does not upload anything' test "$(wc -l < "$CASE/uploads")" -eq 7
+}
 
+ri_local_failure_cases() {
 new_case dry
 capture call prepare --dry-run
 check 'dry-run is an explicit plan' jq -e '.status=="planned" and .dry_run' "$CASE/out"
@@ -272,14 +393,22 @@ check 'resumed signature is byte-stable' cmp -s "$CASE/sidecar.before" "$PROOFS/
 
 for file in a.tar.gz.minisig checksums.sha256 checksums.sha256.minisig release-integrity.json release-integrity.json.minisig; do
     new_case "tamper-$file"; prepare >/dev/null 2>&1
-    printf changed >> "$PROOFS/$file"
+    if [[ "$file" == *.minisig ]]; then
+        # Native Minisign ignores a fifth line after its complete packet. Flip
+        # an actual signature byte so this is a cryptographic tamper control.
+        python3 -S "$RI_REFERENCE_MINISIGN" corrupt-signature "$PROOFS/$file" || exit 1
+    else
+        printf changed >> "$PROOFS/$file"
+    fi
     capture call verify
     check "tampered $file fails local verification" nonzero "$status"
     add_payloads
     capture call publish
     check "tampered $file cannot reach remote upload" test ! -s "$CASE/uploads"
 done
+}
 
+ri_remote_recovery_cases() {
 new_case wrong-public
 prepare >/dev/null 2>&1; add_payloads; call publish >/dev/null 2>&1
 capture release_verify_remote_integrity --repo acme/tool --tag v1.0.0 --sha "$PIN" --public-key "$WORK/wrong-public"
@@ -351,7 +480,9 @@ prepare >/dev/null 2>&1; add_payloads; call publish >/dev/null 2>&1
 jq 'map(.digest=null)' "$CASE/remote/inventory.json" > "$CASE/next"; mv "$CASE/next" "$CASE/remote/inventory.json"
 capture verify_remote
 check 'missing API digests use verified immutable-ID downloads' test "$status" -eq 0
+}
 
+ri_selection_and_interoperability_cases() {
 new_case manifest-errors
 for filter in '.status="failed"' '.summary.success=1' '.artifacts+= [.artifacts[0]]' '.source.git_sha=("2"*40)' '.version="v9.0.0"'; do
     cp "$MANIFEST" "$CASE/valid.json"
@@ -373,14 +504,39 @@ done
 capture verify_remote "$ART"
 check 'remote-only verification rejects a stray artifact directory' test "$status" -eq 4
 
+new_case verifier-interoperability
+prepare >/dev/null 2>&1
+token=$(signing_public_key_token "$WORK/public")
+capture python3 -S "$WORK/bin/minisign.py" -V -H -P "$token" \
+    -m "$PROOFS/release-integrity.json" -x "$PROOFS/release-integrity.json.minisig"
+check 'reference verifier authenticates the generated signature format' test "$status" -eq 0
+cp "$PROOFS/release-integrity.json" "$CASE/changed-manifest"
+printf changed >> "$CASE/changed-manifest"
+capture python3 -S "$WORK/bin/minisign.py" -V -H -P "$token" \
+    -m "$CASE/changed-manifest" -x "$PROOFS/release-integrity.json.minisig"
+check 'reference verifier rejects changed signed bytes' nonzero "$status"
+cp "$PROOFS/release-integrity.json.minisig" "$CASE/changed-signature"
+python3 -S "$RI_REFERENCE_MINISIGN" corrupt-signature "$CASE/changed-signature" || exit 1
+capture python3 -S "$RI_REFERENCE_MINISIGN" -V -H -P "$token" \
+    -m "$PROOFS/release-integrity.json" -x "$CASE/changed-signature"
+check 'reference verifier rejects a corrupted signature packet' nonzero "$status"
 if [[ -n "$NATIVE_MINISIGN" ]]; then
-    new_case native-interoperability
-    prepare >/dev/null 2>&1
-    token=$(signing_public_key_token "$WORK/public")
     capture "$NATIVE_MINISIGN" -V -H -P "$token" -m "$PROOFS/release-integrity.json" -x "$PROOFS/release-integrity.json.minisig"
-    check 'native Minisign verifies reference-generated signature format' test "$status" -eq 0
+    check 'native Minisign verifies the generated release signature' test "$status" -eq 0
+    capture "$NATIVE_MINISIGN" -V -H -P "$token" -m "$PROOFS/release-integrity.json" -x "$CASE/changed-signature"
+    check 'native Minisign rejects the same corrupted signature packet' nonzero "$status"
+    python3 -S "$RI_REFERENCE_MINISIGN" -G -s "$CASE/reference-private" -p "$CASE/reference-public" || exit 1
+    python3 -S "$RI_REFERENCE_MINISIGN" -S -s "$CASE/reference-private" \
+        -m "$PROOFS/release-integrity.json" -x "$CASE/reference-signature" -t interoperability || exit 1
+    reference_token=$(signing_public_key_token "$CASE/reference-public") || exit 1
+    capture "$NATIVE_MINISIGN" -V -H -P "$reference_token" \
+        -m "$PROOFS/release-integrity.json" -x "$CASE/reference-signature"
+    check 'native Minisign verifies a separately reference-generated signature' test "$status" -eq 0
 else
     printf 'SKIP: native Minisign interoperability (binary unavailable)\n'
 fi
+}
+dsr_test_groups ri_record_and_completion_cases ri_local_failure_cases \
+    ri_remote_recovery_cases ri_selection_and_interoperability_cases || exit 1
 printf '\nRelease integrity checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]

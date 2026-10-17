@@ -6,7 +6,11 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 NATIVE_MINISIGN=$(command -v minisign || true)
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+trap 'if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
+    printf "Signed-finalization fixtures retained at %s\n" "$WORK" >&2
+else
+    rm -rf -- "$WORK"
+fi' EXIT
 trap 'exit 5' HUP INT TERM
 mkdir -p "$WORK/bin" "$WORK/cases"
 if ! python3 -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey' >/dev/null 2>&1; then
@@ -83,13 +87,18 @@ SH
     printf 'Native Minisign unavailable; real Ed25519 verification uses a Python format adapter\n'
 fi
 export PATH="$WORK/bin:$PATH"
-for module in signing slsa sbom sbom_release release_integrity release_finalize; do
-    # shellcheck source=/dev/null
-    source "$ROOT/src/$module.sh"
+for module in signing slsa sbom sbom_release release_payloads release_integrity release_finalize; do
+    if [[ "$module" == release_integrity ]]; then
+        # shellcheck source=src/release_integrity.sh
+        source "${RI_TEST_MODULE:-$ROOT/src/release_integrity.sh}"
+    else
+        # shellcheck source=/dev/null
+        source "$ROOT/src/$module.sh"
+    fi
 done
-# Dependency resolution and external service boundaries are fixtures. Local
-# bundle parsing, cryptographic verification and finalization gates are real.
-_ri_require() { command -v jq >/dev/null; }
+# Only external service boundaries are fixtures. Keep real dependency loading:
+# the integrity verifier also needs the payload module's namespace checks.
+# Local bundle parsing, cryptographic verification and finalization are real.
 _sbr_require() { :; }
 _sbr_run() { "$@"; }
 _sbr_context() { printf 'read\n' >> "$CASE/reads"; cat "$CASE/context.json"; }
@@ -380,7 +389,7 @@ check 'replacement conflict is detected before further publication' test "$(coun
 check 'replacement proof ID cannot promote' test ! -s "$CASE/promotions"
 
 new_case proof-during-sbom
-MODE=proof-during-sbom
+MODE='proof-during-sbom'
 capture finalize --promote
 check 'signature replacement during SBOM publication is rejected' test "$status" -ne 0
 check 'cross-stage signature replacement causes zero promotions' test ! -s "$CASE/promotions"
@@ -444,7 +453,7 @@ for mode in proof-between-dispatches key-between-dispatches; do
 done
 
 new_case after-promotion
-MODE=after-promotion; capture finalize --promote
+MODE='after-promotion'; capture finalize --promote
 check 'post-promotion local mutation cannot report completion' test "$status" -ne 0
 check 'post-promotion failure never rolls back the public release' jq -e '.release.draft==false' "$CASE/context.json"
 

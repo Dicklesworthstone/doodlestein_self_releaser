@@ -4,35 +4,46 @@
 # file-backed fixtures. Minisign routing is a hash fixture, NOT a crypto test.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+# shellcheck source=scripts/test_groups.sh
+source "$ROOT/scripts/test_groups.sh"
 source "$ROOT/src/slsa.sh"
 source "$ROOT/src/release_payloads.sh"
+# Use the real local record routines; these are not a remote service boundary.
+# shellcheck source=src/release_integrity.sh
+source "${RI_TEST_MODULE:-$ROOT/src/release_integrity.sh}"
+# shellcheck source=src/release_finalize_core.sh
 source "${PROVENANCE_FINALIZE_TEST_MODULE:-$ROOT/src/release_finalize_core.sh}"
 WORK=$(mktemp -d)
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir "$WORK/bin"
 export PATH="$WORK/bin:$PATH"
-cat > "$WORK/bin/minisign" <<'SH'
-#!/usr/bin/env bash
-set -uo pipefail
-file='' sig='' token=''
-while (($#)); do
-    case "$1" in
-        -m) file=$2; shift 2 ;; -x) sig=$2; shift 2 ;; -P) token=$2; shift 2 ;;
-        -V|-H|-q) shift ;; *) exit 99 ;;
-    esac
-done
-hash=$(sha256sum < "$file") || exit 1
-[[ $(cat "$sig") == "$token:${hash%% *}" ]]
-SH
+minisign() {
+    local file='' sig='' token='' hash
+    while (($#)); do
+        case "$1" in
+            -m) file=$2; shift 2 ;; -x) sig=$2; shift 2 ;; -P) token=$2; shift 2 ;;
+            -V|-H|-q) shift ;; *) return 99 ;;
+        esac
+    done
+    hash=$(sha256sum < "$file") || return 1
+    [[ $(cat "$sig") == "$token:${hash%% *}" ]]
+}
+# Same explicit hash fixture for subprocess consumers, without reparsing all
+# exported module definitions on every in-process verification.
+{
+    printf '#!/usr/bin/env bash\nset -uo pipefail\n'
+    declare -f minisign
+    printf 'minisign "$@"\n'
+} > "$WORK/bin/minisign"
 chmod 755 "$WORK/bin/minisign"
 TOKEN=$(printf 'A%.0s' {1..56})
 SOURCE_SHA=$(printf '1%.0s' {1..40})
 BUILDER='dsr:test-production'
-PASS=0 FAIL=0 CASE='' BUILD='' MODE='' STATUS=0
+checks=0 failures=0 CASE='' BUILD='' MODE='' STATUS=0
 trace() { printf '%s\n' "$*" >> "$CASE/calls"; }
-assert() { local label=$1; shift; if "$@" > "$WORK/assert.out" 2>&1; then
-    PASS=$((PASS+1)); printf 'PASS %s\n' "$label"
-    else FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$label"; cat "$WORK/assert.out"; fi; }
+assert() { local label=$1; shift; checks=$((checks+1)); if "$@" > "$WORK/assert.out" 2>&1; then
+    printf 'PASS %s\n' "$label"
+    else failures=$((failures+1)); printf 'FAIL %s\n' "$label"; cat "$WORK/assert.out"; fi; }
 run_code() {
     local label=$1 expected=$2; shift 2; STATUS=0
     "$@" > "$CASE/result.json" 2> "$CASE/error.log" || STATUS=$?
@@ -52,23 +63,12 @@ signing_sign_exact() {
     [[ -f "$3" && "$(_slsa_sha256 "$1")" == "$6" ]] || return 7
     (set -o noclobber; printf '%s:%s\n' "$4" "$6" > "$2") || return 2
 }
-_ri_require() { :; }
-_ri_file_record() {
-    local hash size
-    hash=$(_slsa_sha256 "$1") || return $?
-    size=$(wc -c < "$1") || return 1
-    jq -cn --arg name "$2" --arg hash "$hash" --argjson size "$size" '{name:$name,sha256:$hash,size:$size}'
-}
-_ri_check_record() {
-    [[ "$(_ri_file_record "$1" "$(jq -r .name <<< "$2")" | jq -cS .)" == \
-       "$(jq -cS '{name,sha256,size}' <<< "$2")" ]] || return 7
-}
 _sbom_select_artifacts() { find "$1" -maxdepth 1 -type f \( -name 'tool-linux*' -o -name 'tool-windows.exe' \) -printf '%f\n' | sort; }
 _rup_require() { :; }
 fixture_payloads() {
-    local root=$1 selection=$2 row
-    while IFS= read -r row; do _ri_check_record "$root/$(jq -r .name <<< "$row")" "$row" || return $?
-    done < <(jq -c '.artifacts[]' <<< "$selection")
+    local root=$1 selection=$2 records
+    records=$(jq -ceS '{payloads:.artifacts,proofs:[]}' <<< "$selection") || return 1
+    _ri_check_records "$root" "$root" "$records"
 }
 release_prepare_integrity() {
     local root=$1; shift
@@ -90,12 +90,6 @@ release_prepare_integrity() {
 _ri_documents() { _ri_file_record "$1/release-integrity.json" release-integrity.json | jq -cs .; }
 _ri_verify_set() { fixture_payloads "$1" "$(cat "$2/release-integrity.json")"; }
 _ri_matches_selection() { [[ $(jq -cS 'del(.build_manifest_sha256)' "$1") == "$(jq -cS . <<< "$2")" ]]; }
-_ri_local_unchanged() {
-    local row
-    fixture_payloads "$1" "$3" || return $?
-    while IFS= read -r row; do _ri_check_record "$2/$(jq -r .name <<< "$row")" "$row" || return $?
-    done < <(jq -c '.[]' <<< "$4")
-}
 _sbr_require() { trace auth; }
 _sbr_context() { trace context; cat "$CASE/context.json"; }
 _sbr_inventory() { cat "$CASE/inventory.json"; }
@@ -278,6 +272,7 @@ base() { release_finalize "$CASE/artifacts" --repo owner/tool --tag v1.0.0 --sha
     --require-signatures --public-key "$CASE/key.pub" --secret-key "$CASE/key.key" --integrity-dir "$CASE/proofs" "$@"; }
 finalize() { base --require-provenance --provenance-builder "$BUILDER" "$@"; }
 [[ "${DSR_PROVENANCE_FIXTURES_ONLY:-false}" != true ]] || return 0
+provenance_completion_cases() {
 new_case plan
 run_code 'dry run pins provenance without signing or remote access' 0 finalize --dry-run
 assert 'dry policy binds exact build and full target matrix' jq -e --arg hash "$(_rf_hash "$BUILD")" \
@@ -320,6 +315,8 @@ new_case legacy
 run_code 'existing signed finalization remains available without provenance' 0 base --promote
 assert 'legacy path never calls provenance publication' test "$(count provenance-publish)" = 0
 assert 'legacy success does not imply provenance authentication' jq -e 'has("provenance")|not' "$CASE/result.json"
+}
+provenance_failure_cases() {
 for mode in sign-fail provenance-publish-fail malformed-publication pre-verify-fail wrong-inventory remote-late-drift local-late-drift; do
     new_case "$mode"; MODE=$mode; expected=7
     case "$mode" in sign-fail) expected=42 ;; provenance-publish-fail) expected=8 ;; esac
@@ -335,6 +332,8 @@ for mode in lost-statement lost-signature; do
     assert 'signature is uploaded only once' test "$(count 'upload release.intoto.jsonl.minisig')" = 1
     assert 'upload retry does not re-sign' test "$(count sign-provenance)" = 1
  done
+}
+provenance_receipt_cases() {
 INDEX=0
 for mutation in '.authenticated=false' '.builder="other"' '.targets=["linux/amd64"]' \
     '.build_manifest_sha256=("0"*64)' '.invocation_id="other"' '.artifact_count=1' \
@@ -344,6 +343,8 @@ for mutation in '.authenticated=false' '.builder="other"' '.targets=["linux/amd6
     run_code 'mismatched publication evidence cannot satisfy provenance policy' 7 finalize --promote
     assert 'bad receipt did not reach SBOM publication or promotion' test "$(count sbom-publish):$(count promote)" = 0:0
  done
+}
+provenance_recovery_cases() {
 new_case post-failure; MODE=post-verify-fail
 run_code 'post-promotion authentication failure blocks dispatch' 7 finalize --promote --tool tool --dispatch-repos owner/checksums
 assert 'post-promotion failure does not pretend draft was restored' jq -e '.release.draft==false' "$CASE/context.json"
@@ -358,6 +359,14 @@ BEFORE=$(count provenance-publish)
 run_code 'missing retained proof is not silently regenerated' 7 finalize --promote
 assert 'missing-proof retry does not sign again' test "$(count sign-provenance)" = 1
 assert 'missing-proof retry never calls publisher' test "$BEFORE" = "$(count provenance-publish)"
+new_case linked-local
+run_code 'prepare verified draft before local signature replacement' 0 finalize
+mv "$CASE/proofs/release.intoto.jsonl.minisig" "$CASE/held-signature"
+ln -s ../held-signature "$CASE/proofs/release.intoto.jsonl.minisig"
+BEFORE=$(count provenance-publish)
+run_code 'linked retained proof is an integrity failure' 7 finalize --promote
+assert 'linked-proof retry does not sign again' test "$(count sign-provenance)" = 1
+assert 'linked-proof retry never calls publisher' test "$BEFORE" = "$(count provenance-publish)"
 new_case forged-state
 run_code 'prepare verified draft before checkpoint mutation' 0 finalize
 STATE=$(state_file)
@@ -397,5 +406,7 @@ run_code 'prepared signing policy publishes without a private key' 0 prepared --
 assert 'prepared flow never calls a signer' test "$(count sign-provenance)" = 0
 assert 'prepared proof identity is retained exactly' jq -e --slurpfile docs "$CASE/prepared-documents.json" \
     '.integrity_policy.mode=="prepared" and .provenance_documents==$docs[0] and .phase=="published"' "$(state_file)"
-printf '\nProvenance-gated finalization: %s passed, %s failed\n' "$PASS" "$FAIL"
-[[ "$FAIL" == 0 ]]
+}
+dsr_test_groups provenance_completion_cases provenance_failure_cases provenance_receipt_cases provenance_recovery_cases || exit 1
+printf '\nProvenance-gated finalization: %s passed, %s failed\n' "$((checks-failures))" "$failures"
+[[ "$failures" == 0 ]]

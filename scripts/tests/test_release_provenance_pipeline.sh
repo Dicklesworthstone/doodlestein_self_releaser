@@ -184,5 +184,5 @@ assert 'lost acknowledgement performs one promotion, not a replay' test "$(count
 
 bash "$INSTALL/src/release_finalize.sh" --help > "$WORK/help.txt" || exit 1
 assert 'public help exposes provenance alongside existing routes' grep -q -- '--require-provenance --provenance-builder' "$WORK/help.txt"
-printf '\nBuild-plan/set provenance integration: %s passed, %s failed\n' "$PASS" "$FAIL"
-[[ "$FAIL" == 0 ]]
+printf '\nBuild-plan/set provenance integration: %s passed, %s failed\n' "$((checks-failures))" "$failures"
+[[ "$failures" == 0 ]]

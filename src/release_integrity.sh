@@ -16,7 +16,7 @@ _ri_require() {
         # shellcheck source=src/signing.sh
         source "$_RELEASE_INTEGRITY_DIR/signing.sh" || return 3
     fi
-    command -v jq >/dev/null || return 3
+    command -v jq >/dev/null && command -v python3 >/dev/null || return 3
 }
 
 _ri_file_record() {
@@ -76,9 +76,114 @@ _ri_matches_selection() {
 }
 
 _ri_check_record() {
-    local file="$1" record="$2" actual
-    actual=$(_ri_file_record "$file" "$(jq -r '.name' <<< "$record")") || return $?
-    [[ "$(jq -cS . <<< "$actual")" == "$(jq -cS '{name,sha256,size}' <<< "$record")" ]] || return 7
+    local file="$1" record="$2" hash size
+    hash=$(_slsa_sha256 "$file") || return $?
+    size=$(wc -c < "$file") || return 1
+    size="${size//[[:space:]]/}"
+    # Preserve the original canonical-JSON comparison (including numeric
+    # spelling), without serializing and reparsing an intermediate record.
+    # jq -r followed by Bash substitution could not preserve NULs or terminal
+    # newlines in a name; those records must still fail equality here.
+    jq -es --arg hash "$hash" --argjson size "$size" '
+        length==1 and (.[0] | type=="object" and
+            (.name|type=="string" and index("\u0000")==null and (endswith("\n")|not)) and
+            (({name,sha256,size}|tojson)==({name,sha256:$hash,size:$size}|tojson)))
+    ' <<< "$record" >/dev/null || return 7
+}
+
+# Repeated publication gates check the whole frozen set. One process hashes
+# every selected file, retaining the same SHA256/size/name checks without a
+# separate jq process for every field of every sidecar. Input JSON stays off
+# argv, and descriptor/path identity is checked around each complete read.
+_ri_check_records() {
+    python3 -I -S - "$1" "$2" 3<<< "$3" <<'PY'
+import contextlib
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+class Number:
+    # Preserve numeric spelling without making JSON numbers into strings.
+    def __init__(self, spelling):
+        self.spelling = spelling
+
+def invalid(message):
+    raise ValueError(message)
+
+def fingerprint(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+try:
+    with os.fdopen(3) as stream:
+        records = json.load(stream, parse_int=Number, parse_float=Number, parse_constant=invalid)
+    if not isinstance(records, dict) or set(records) != {"payloads", "proofs"}:
+        invalid("Invalid integrity record groups")
+    with contextlib.ExitStack() as stack:
+        roots = []
+        for path, group in zip(sys.argv[1:], ("payloads", "proofs")):
+            root = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stack.callback(os.close, root)
+            identity = os.fstat(root)
+            roots.append((path, identity))
+            if not isinstance(records[group], list):
+                invalid("Invalid integrity record list")
+            for record in records[group]:
+                if not isinstance(record, dict):
+                    invalid("Invalid integrity record")
+                name = record.get("name")
+                if (not isinstance(name, str) or ".." in name or
+                        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name) is None):
+                    invalid("Invalid integrity record name")
+                if not isinstance(record.get("size"), Number):
+                    invalid("Invalid integrity record size")
+                if not isinstance(record.get("sha256"), str):
+                    invalid("Invalid integrity record hash")
+                named = os.stat(name, dir_fd=root, follow_symlinks=False)
+                if not stat.S_ISREG(named.st_mode):
+                    sys.exit(4)
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                     dir_fd=root)
+                with os.fdopen(descriptor, "rb") as payload:
+                    before = os.fstat(payload.fileno())
+                    if not stat.S_ISREG(before.st_mode) or fingerprint(before) != fingerprint(named):
+                        sys.exit(4)
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: payload.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                    after = os.fstat(payload.fileno())
+                    named = os.stat(name, dir_fd=root, follow_symlinks=False)
+                    if (fingerprint(before) != fingerprint(after) or
+                            fingerprint(after) != fingerprint(named) or
+                            not stat.S_ISREG(named.st_mode) or
+                            str(after.st_size) != record["size"].spelling or
+                            digest.hexdigest() != record["sha256"]):
+                        invalid("Integrity input changed or differs from its record: " + name)
+        for path, identity in roots:
+            current = os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISDIR(current.st_mode) or
+                    (identity.st_dev, identity.st_ino) != (current.st_dev, current.st_ino)):
+                invalid("Integrity input directory changed")
+except PermissionError as error:
+    print("Cannot read integrity input: " + str(error), file=sys.stderr)
+    sys.exit(1)
+except OSError as error:
+    print("Cannot open integrity input: " + str(error), file=sys.stderr)
+    sys.exit(4)
+except (ValueError, TypeError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(7)
+PY
+}
+
+_ri_check_bytes() {
+    local file="$1" expected_hash="$2" expected_size="$3" hash size
+    hash=$(_slsa_sha256 "$file") || return $?
+    size=$(wc -c < "$file") || return 1
+    size="${size//[[:space:]]/}"
+    [[ "$hash" == "$expected_hash" && "$size" == "$expected_size" ]] || return 7
 }
 
 # The complete signed set is checked twice at the public API boundaries. The
@@ -86,22 +191,25 @@ _ri_check_record() {
 # every individual payload/checksum signature is also cryptographically checked.
 _ri_verify_set() {
     local root="$1" proofs="$2" repo="$3" tag="$4" sha="$5" token="$6" work="$7"
-    local manifest="$proofs/release-integrity.json" before rows row name path signature
+    local manifest="$proofs/release-integrity.json" before rows name path hash size signature_hash signature_size
     before=$(_slsa_sha256 "$manifest") || return $?
     signing_verify_exact "$manifest" "$manifest.minisig" "$token" || return 7
     _ri_shape "$manifest" "$repo" "$tag" "$sha" "$token" || return 7
-    rows=$(jq -c '.artifacts[],.checksums' "$manifest") || return 1
-    while IFS= read -r row; do
-        name=$(jq -r '.name' <<< "$row") || return 1
+    # Shape validation above admits only flat ASCII names and hex hashes.
+    # Extract once; keep each byte/size check immediately before its signature
+    # check, in the original order. tojson preserves canonical numeric spelling.
+    rows=$(jq -r '.artifacts[],.checksums |
+        [.name,.sha256,(.size|tojson),.signature.sha256,(.signature.size|tojson)] | @tsv
+    ' "$manifest") || return 1
+    while IFS=$'\t' read -r name hash size signature_hash signature_size; do
         if [[ "$name" == checksums.sha256 ]]; then path="$proofs/$name"
         else
             # The authenticated inventory, not scanner filename discovery,
             # selects licenses and shared data. Every byte/signature is checked.
             path="$root/$name"
         fi
-        _ri_check_record "$path" "$row" || return $?
-        signature=$(jq -c '.signature' <<< "$row") || return 1
-        _ri_check_record "$proofs/$name.minisig" "$signature" || return $?
+        _ri_check_bytes "$path" "$hash" "$size" || return $?
+        _ri_check_bytes "$proofs/$name.minisig" "$signature_hash" "$signature_size" || return $?
         signing_verify_exact "$path" "$proofs/$name.minisig" "$token" || return 7
     done <<< "$rows"
     _ri_checksums "$manifest" > "$work/expected-checksums" || return 1
@@ -261,18 +369,12 @@ _ri_payload_names() {
 # sufficient at intermediate publication gates; do not repeat public-key crypto
 # and full remote downloads for every unchanged sidecar in an N-file release.
 _ri_local_unchanged() {
-    local root="$1" proofs="$2" selection="$3" documents="$4" work="$5" rows row name
+    local root="$1" proofs="$2" selection="$3" documents="$4" work="$5" records
     _rup_check_namespace "$root" "$selection" "$work" || return $?
-    rows=$(jq -c '.artifacts[]' <<< "$selection") || return 1
-    while IFS= read -r row; do
-        name=$(jq -r '.name' <<< "$row") || return 1
-        _ri_check_record "$root/$name" "$row" || return $?
-    done <<< "$rows"
-    rows=$(jq -c '.[]' <<< "$documents") || return 1
-    while IFS= read -r row; do
-        name=$(jq -r '.name' <<< "$row") || return 1
-        _ri_check_record "$proofs/$name" "$row" || return $?
-    done <<< "$rows"
+    records=$(printf '%s\n%s\n' "$selection" "$documents" | jq -cesS '
+        select(length==2) | {payloads:.[0].artifacts,proofs:.[1]}
+    ') || return 1
+    _ri_check_records "$root" "$proofs" "$records"
 }
 
 _ri_remote_verify() (

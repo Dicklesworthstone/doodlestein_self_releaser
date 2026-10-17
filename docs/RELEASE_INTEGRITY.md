@@ -6,6 +6,12 @@ successful-build manifest validator, exact Minisign signer/verifier and GitHub
 transport. It does not create releases or tags, build binaries, publish private
 build manifests, or choose a trust key from a downloaded release.
 
+These operations require `python3` alongside Bash, jq and Minisign. Complete-set
+publication checks use only Python's standard library to stream every selected
+file through a no-follow descriptor, compare its SHA256 and size, and recheck
+file and directory identities. Symlinks, special files and changes during a
+read are rejected before the next publication stage.
+
 ## Prepare a complete signed set
 
 ```bash

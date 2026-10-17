@@ -122,17 +122,26 @@ _rf_provenance_key() {
         else error("missing or mismatched provenance verification") end' <<< "$receipt" 2>/dev/null
 }
 
+_rf_provenance_records_gate() {
+    local records rc
+    records=$(jq -ceS '{payloads:[],proofs:[.statement,.signature]}' <<< "$2") || return 1
+    if _ri_check_records "$1" "$1" "$records"; then return 0; else rc=$?; fi
+    # These paths were already admitted and frozen. Their disappearance or
+    # replacement is integrity drift, not a new invalid operator argument.
+    if ((rc == 4)); then
+        _rf_log 'Retained provenance proof is missing, linked or not a regular file'
+        return 7
+    fi
+    return "$rc"
+}
+
 _rf_provenance_inputs_gate() {
     [[ -n "${_RF_PROVENANCE_POLICY:-}" ]] || return 0
-    local field record
     [[ "$(signing_public_key_token "$_RF_PROVENANCE_PUBLIC")" == \
        "$(jq -r .public_key <<< "$_RF_PROVENANCE_POLICY")" ]] || return 7
     [[ "$(_rf_hash "$_RF_INTEGRITY_BUILD")" == \
        "$(jq -r .build_manifest_sha256 <<< "$_RF_PROVENANCE_POLICY")" ]] || return 7
-    for field in statement signature; do
-        record=$(jq -c --arg field "$field" '.[$field]' <<< "$_RF_PROVENANCE_DOCUMENTS") || return 1
-        _ri_check_record "$_RF_PROVENANCE_OUTPUT/$(jq -r .name <<< "$record")" "$record" || return $?
-    done
+    _rf_provenance_records_gate "$_RF_PROVENANCE_OUTPUT" "$_RF_PROVENANCE_DOCUMENTS"
 }
 
 _rf_provenance_assets_gate() {
@@ -848,10 +857,7 @@ _rf_execute() (
         # signature and silently choose new evidence after an interrupted upload.
         saved=$(jq -cS '.provenance_documents // null' <<< "$state") || return 1
         if [[ "$saved" != null ]]; then
-            local provenance_record
-            while IFS= read -r provenance_record; do
-                _ri_check_record "$integrity_dir/$(jq -r .name <<< "$provenance_record")" "$provenance_record" || return $?
-            done < <(jq -c '.statement,.signature' <<< "$saved")
+            _rf_provenance_records_gate "$integrity_dir" "$saved" || return $?
         fi
         provenance_documents=$(_rf_provenance_prepare "$root" "$build_snapshot" "$repo" "$public_snapshot" \
             "$secret_key" "$integrity_dir" "$provenance_policy" "$prepared_signatures") || return $?

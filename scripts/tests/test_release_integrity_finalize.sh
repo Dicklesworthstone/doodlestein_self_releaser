@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Production finalizer + integrity pipeline, real reference Ed25519 signatures,
+# Production finalizer + integrity pipeline, real native/reference Ed25519 signatures,
 # files, hashes and locks. SBOM scanning, payload uploader and dispatch are
 # explicit orchestration fixtures; GitHub transport is file-backed.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RI_HARNESS_ONLY=true source "$HERE/test_release_integrity.sh"
+# shellcheck source=scripts/test_groups.sh
+source "${DSR_TEST_GROUPS_MODULE:-$ROOT/scripts/test_groups.sh}"
 # shellcheck source=src/release_finalize.sh
 source "${RF_TEST_MODULE:-$ROOT/src/release_finalize.sh}"
 FI_MODE='' FI_PUBLIC="$WORK/public" FI_SECRET="$WORK/private"
@@ -195,6 +197,24 @@ never_promoted() { [[ ! -s "$CASE/promotions" ]]; }
 
 if [[ "${RF_HARNESS_ONLY:-false}" == true && "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 
+fi_worker_pass() { check 'worker assertion passes' true; }
+fi_worker_failure() { check 'worker assertion fails' false; }
+fi_worker_abort() { exit 17; }
+fi_worker_nonzero() { check 'worker assertion before failing exit' true; return 17; }
+fi_worker_empty() { :; }
+fi_worker_bad_counts() { checks=1 failures=2; }
+fi_worker_later() { sleep 1; check 'later worker completes' true; printf done > "$FI_REAP_MARKER"; }
+fi_expect_group_status() {
+    local expected=$1 observed=0; shift
+    (checks=0 failures=0; dsr_test_groups "$@") || observed=$?
+    [[ "$observed" -eq "$expected" ]]
+}
+fi_expect_all_reaped() {
+    local FI_REAP_MARKER="$WORK/later-worker-finished"
+    fi_expect_group_status 1 fi_worker_bad_counts fi_worker_later && [[ -s "$FI_REAP_MARKER" ]]
+}
+
+fi_completion_cases() {
 new_fi_case complete
 capture signed --upload-payloads
 check 'one invocation signs before payload upload and finalizes a draft' test "$status" -eq 0
@@ -246,7 +266,9 @@ capture signed --promote
 check 'signed finalization accepts existing payloads without upload flag' test "$status" -eq 0
 check 'existing-payload flow never invokes binary uploader' bash -c '! grep -q payload-upload "$1"' bash "$CASE/events"
 check 'signed checksums are present before publication' jq -e 'any(.[];.name=="checksums.sha256.minisig")' "$CASE/remote/inventory.json"
+}
 
+fi_local_failure_cases() {
 new_fi_case bad-signer
 export RI_SIGN_FAIL=b.tar.xz RI_SIGN_MODE=empty
 capture signed --upload-payloads --promote
@@ -281,7 +303,9 @@ capture signed --promote
 check 'partial pipeline resumes with retained local signatures' test "$status" -eq 0
 check 'partial retry reuses first uploaded signature' test "$(grep -c '^a.tar.gz.minisig$' "$CASE/uploads")" -eq 1
 check 'partial retry uses no private key' test "$(wc -l < "$CASE/signs")" -eq 5
+}
 
+fi_remote_drift_cases() {
 for mode in local-signature replaced-signature-id sbom-other; do
     new_fi_case "$mode"; add_payloads; FI_MODE="$mode"
     capture signed --promote
@@ -298,7 +322,11 @@ for mode in remote-after-promote local-after-promote; do
     check "$mode leaves already published release intact rather than rolling back" jq -e '.release.draft==false' "$CASE/context.json"
     check "$mode blocks downstream events" test ! -s "$CASE/dispatches"
 done
+}
 
+fi_dispatch_and_policy_cases() {
+local -a pids=()
+local i pid succeeded
 new_fi_case dispatch
 add_payloads
 capture signed --promote --tool tool --dispatch-repos owner/a,owner/b --dispatch-state-dir "$CASE/outbox"
@@ -383,6 +411,16 @@ check 'one competing signed finalizer completes' test "$succeeded" -ge 1
 check 'competing finalizers publish one signature set' test "$(wc -l < "$CASE/signs")" -eq 5
 check 'competing finalizers promote once' test "$(wc -l < "$CASE/promotions")" -eq 1
 check 'competing finalizers do not duplicate proof uploads' test "$(wc -l < "$CASE/uploads")" -eq 7
+}
+
+check 'group runner accepts a completed positive assertion' fi_expect_group_status 0 fi_worker_pass
+check 'group runner retains failed assertions' fi_expect_group_status 1 fi_worker_failure
+check 'group runner rejects an early worker exit with missing counts' fi_expect_group_status 1 fi_worker_abort
+check 'group runner rejects a failing process despite positive assertions' fi_expect_group_status 1 fi_worker_nonzero
+check 'group runner rejects a worker with no assertions' fi_expect_group_status 1 fi_worker_empty
+check 'group runner rejects empty discovery' fi_expect_group_status 1
+check 'group runner reaps later workers after invalid counts' fi_expect_all_reaped
+dsr_test_groups fi_completion_cases fi_local_failure_cases fi_remote_drift_cases fi_dispatch_and_policy_cases || exit 1
 
 printf '\nSigned finalization checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]
