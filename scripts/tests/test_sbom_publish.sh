@@ -3,10 +3,13 @@
 # Files/hashes/process races are real; GitHub and Syft are explicit fixtures.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/tests/test_sbom_remote.sh
 source "$HERE/test_sbom_remote.sh"
+# shellcheck source=scripts/test_groups.sh
+source "$ROOT/scripts/test_groups.sh"
 UPLOAD_MODE='' PUBLISH_OUTPUT=''
 gh_upload_asset_named() (
-    local url="$1" file="$2" name="$3" type="$4" attempts=0 existing id
+    local url="$1" file="$2" name="$3" type="$4" attempts=0 existing
     [[ "$url" == 'https://uploads.github.com/repos/acme/tool/releases/42/assets{?name,label}' &&
        "$file" == */proofs/* && "$type" == application/json && -f "$file" && ! -L "$file" ]] || return 99
     while ! mkdir "$REMOTE/upload-lock" 2>/dev/null; do
@@ -65,6 +68,7 @@ complete_documents() {
     jq -e '[.[] | select(.name | contains(".sbom."))] | length == 2' "$REMOTE/inventory.json" >/dev/null
 }
 
+publication_resumption_cases() {
 for format in spdx cyclonedx; do
     new_publication "publish-$format" "$format"
     capture publish
@@ -120,7 +124,7 @@ check 'retry reconciles persisted bytes after lost acknowledgement' test "$statu
 check 'lost-ack retry never clobbers or reuploads matching first SBOM' test "$(grep -c '^a.tar.gz.sbom.' "$CASE/uploads.log")" -eq 1
 
 new_publication aggregate-failure
-UPLOAD_MODE=manifest-fail
+UPLOAD_MODE='manifest-fail'
 capture publish
 check 'aggregate failure propagates' test "$status" -eq 8
 check 'aggregate failure preserves complete individual documents' complete_documents
@@ -140,7 +144,9 @@ UPLOAD_MODE=bad-receipt
 capture publish
 check 'malformed successful upload receipt fails closed' test "$status" -eq 7
 check 'invalid receipt cannot publish aggregate' no_aggregate
+}
 
+publication_mutation_cases() {
 for mutation in local-payload local-proof remote-payload remote-extra tag; do
     new_publication "mutation-$mutation"
     UPLOAD_MODE="$mutation"
@@ -221,7 +227,9 @@ check 'publisher does not change public release mode' jq -e '.draft == false' "$
 capture publish
 check 'completed public release has a read-only retry without override' test "$status" -eq 0
 check 'public retry performs no additional uploads' test "$(wc -l < "$CASE/uploads.log")" -eq 3
+}
 
+publication_completion_cases() {
 new_publication separate-output
 PUBLISH_OUTPUT="$CASE/evidence"
 mkdir "$PUBLISH_OUTPUT"
@@ -263,7 +271,8 @@ check 'CLI propagates invalid publication options' test "$status" -eq 4
 new_publication concurrent
 pids=()
 for i in 1 2 3; do
-    publish > "$CASE/worker-$i.out" 2> "$CASE/worker-$i.err" &
+    sbom_publish_artifacts "$ART" --repo acme/tool --tag v1.2.3 --format "$FORMAT" \
+        > "$CASE/worker-$i.out" 2> "$CASE/worker-$i.err" &
     pids+=("$!")
 done
 succeeded=0
@@ -274,6 +283,9 @@ check 'concurrent publication leaves one independently verifiable complete set' 
 check 'concurrent publishers leave unique named metadata assets' jq -e 'length == 5 and (map(.name)|unique|length) == 5' "$REMOTE/inventory.json"
 capture publish
 check 'verified retry converges after concurrent publishers' test "$status" -eq 0
+}
+
+dsr_test_groups publication_resumption_cases publication_mutation_cases publication_completion_cases || exit 1
 
 printf '\nSBOM publication checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]
