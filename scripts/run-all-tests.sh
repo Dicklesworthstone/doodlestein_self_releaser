@@ -387,7 +387,12 @@ EOF
             log_file="${log_file%.bats}.log"
             local error_msg=""
             if [[ -f "$log_file" ]]; then
-                error_msg=$(tail -20 "$log_file" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                # Keep the raw log intact. Terminal CSI sequences and XML's
+                # forbidden C0 bytes belong in that log, not in XML text.
+                error_msg=$(tail -20 "$log_file" |
+                    LC_ALL=C sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' |
+                    LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
+                    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
             fi
             printf '      <failure message="Test failed">%s</failure>\n' "$error_msg" >> "$output_file"
         elif [[ "$status" == "skip" ]]; then

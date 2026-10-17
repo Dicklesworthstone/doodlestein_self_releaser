@@ -24,7 +24,7 @@ shutil.copyfile(source / "scripts/run-all-tests.sh", scripts / "run-all-tests.sh
 for name, code in (("test_selected_pass.sh", 0), ("test_selected_fail.sh", 19), ("test_other.sh", 0)):
     (tests / name).write_text("#!/usr/bin/env bash\nexit " + str(code) + "\n")
 (tests / "test_selected_fail.sh").write_text(
-    '#!/usr/bin/env bash\nprintf "FAIL retained diagnostic <source> & detail\\n"\nexit 19\n')
+    '#!/usr/bin/env bash\nprintf "\\033[31mFAIL retained diagnostic <source> & detail\\033[0m\\n"\nexit 19\n')
 (tests / "test_skip_failure.sh").write_text('#!/usr/bin/env bash\nprintf "SKIP: marker before failure\\n"\nexit 19\n')
 for label, message in (("colon", "SKIP: optional runtime unavailable"), ("space", "SKIP requires optional runtime")):
     (tests / ("test_skip_" + label + ".sh")).write_text('#!/usr/bin/env bash\nprintf "' + message + '\\n"\nexit 0\n')
@@ -149,8 +149,11 @@ run("junit-failure", ["--shell-only", "--filter", "test_selected_fail.sh", "--ci
 fresh_reports = set((work / "logs/tests").rglob("junit.xml")) - before
 failure_text = ""
 if len(fresh_reports) == 1:
-    failure_text = "".join(ET.parse(fresh_reports.pop()).getroot().itertext())
-check("failed-test JUnit reads its own retained log with XML escaping",
+    try:
+        failure_text = "".join(ET.parse(fresh_reports.pop()).getroot().itertext())
+    except (ET.ParseError, OSError) as error:
+        print("Failed-test JUnit parse failure: " + str(error), flush=True)
+check("failed-test JUnit preserves colored diagnostics as valid XML text",
       "FAIL retained diagnostic <source> & detail" in failure_text)
 
 # Create a real unwritable result directory at the mktemp boundary. This leaves
