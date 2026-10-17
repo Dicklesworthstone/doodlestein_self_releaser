@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import time
@@ -29,6 +30,11 @@ def check(label, condition):
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+def preview_checkouts(workspace):
+    # Clone destinations are exactly target-N. The separately retained
+    # target-N.intent.json/result.json files are recovery evidence, not clones.
+    return [p for p in workspace.iterdir() if re.fullmatch(r'target-[0-9]+', p.name)]
 
 def save(path, value):
     path.write_text(json.dumps(value, sort_keys=True) + '\n')
@@ -229,7 +235,23 @@ sync = ['bash', root / 'src/checksum_sync.sh', 'sync', 'app', '1.2.3', '--repo',
 value = invoke('sync-resume', [*sync, '--verify-release', '--audit-resume-from', old])
 check('downstream preview uses the complete resumed audit', value['planned'] == 1 and value['synced'] == 0 and
       value['release_verification']['verified_count'] == 6 and value['release_verification']['resume']['reused_count'] == 4)
-check('downstream preview clones nothing', not list(Path(value['workspace']).glob('target-*')))
+workspace = Path(value['workspace'])
+check('downstream preview clones nothing', not preview_checkouts(workspace))
+intent = json.loads((workspace / 'target-1.intent.json').read_text())
+outcome = json.loads((workspace / 'target-1.result.json').read_text())
+check('preview retains the bound intent and planned outcome',
+      intent['kind'] == 'dsr-checksum-sync-target-intent' and intent['repo'] == 'owner/installers' and
+      intent['index'] == 1 and intent['plan_sha256'] == value['sync_plan']['sha256'] and
+      outcome['plan_sha256'] == intent['plan_sha256'] and outcome['index'] == 1 and
+      outcome['repo'] == intent['repo'] and outcome['action'] == 'planned' and
+      outcome['checkout'] is None and outcome['exit_code'] == 0)
+control = work / 'preview-checkout-control'
+control.mkdir()
+(control / 'target-1.intent.json').write_text('{}\n')
+(control / 'target-1.result.json').write_text('{}\n')
+check('checkout detection permits separate receipt files', not preview_checkouts(control))
+(control / 'target-1').mkdir()
+check('checkout detection rejects a planted clone destination', bool(preview_checkouts(control)))
 invoke('unaudited-sync-refused', [*sync, '--audit-resume-from', old], 4)
 check('both handoffs leave earlier evidence unchanged', frozen(old) == original)
 
