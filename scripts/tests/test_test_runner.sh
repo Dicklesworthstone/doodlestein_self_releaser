@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import xml.etree.ElementTree as ET
 
 source = Path(os.environ.get("DSR_TEST_RUNNER_SOURCE", sys.argv[1]))
 work = Path(tempfile.mkdtemp(prefix="dsr-runner-regressions-"))
@@ -21,6 +23,8 @@ tests.mkdir(parents=True)
 shutil.copyfile(source / "scripts/run-all-tests.sh", scripts / "run-all-tests.sh")
 for name, code in (("test_selected_pass.sh", 0), ("test_selected_fail.sh", 19), ("test_other.sh", 0)):
     (tests / name).write_text("#!/usr/bin/env bash\nexit " + str(code) + "\n")
+(tests / "test_selected_fail.sh").write_text(
+    '#!/usr/bin/env bash\nprintf "FAIL retained diagnostic <source> & detail\\n"\nexit 19\n')
 (tests / "test_skip_failure.sh").write_text('#!/usr/bin/env bash\nprintf "SKIP: marker before failure\\n"\nexit 19\n')
 for label, message in (("colon", "SKIP: optional runtime unavailable"), ("space", "SKIP requires optional runtime")):
     (tests / ("test_skip_" + label + ".sh")).write_text('#!/usr/bin/env bash\nprintf "' + message + '\\n"\nexit 0\n')
@@ -83,6 +87,71 @@ if shutil.which("bats"):
           summary["tests_run"] == 2 and summary["tests_passed"] == 1 and summary["tests_failed"] == 1)
 else:
     print("NOTE: Bats execution unavailable; discovery was checked, runtime not qualified", flush=True)
+
+# Both processes execute the same file in the same checkout. Synchronization
+# makes the second writer replace the first writer's daily log on the old
+# runner before either process classifies its output.
+(tests / "test_concurrent.sh").write_text('''#!/usr/bin/env bash
+printf '%s\\n' "$DSR_RUNNER_ROW"
+: > "$DSR_RUNNER_READY"
+for attempt in {1..400}; do
+    [[ ! -e "$DSR_RUNNER_RELEASE" ]] || exit 0
+    sleep 0.025
+done
+exit 18
+''')
+release = work / "concurrent-release"
+children = []
+ready = True
+try:
+    for label, row in (("pass", "PASS independent assertion"), ("skip", "SKIP: optional dependency")):
+        marker = work / ("concurrent-" + label + ".ready")
+        child = subprocess.Popen(
+            ["bash", str(scripts / "run-all-tests.sh"), "--shell-only", "--filter", "test_concurrent.sh", "--ci"],
+            env=dict(os.environ, DSR_RUNNER_ROW=row, DSR_RUNNER_READY=str(marker),
+                     DSR_RUNNER_RELEASE=str(release)), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        children.append((label, child))
+        deadline = time.monotonic() + 10
+        while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not marker.exists():
+            ready = False
+            break
+finally:
+    release.write_text("continue\n")
+    concurrent = {}
+    for label, child in children:
+        out, err = child.communicate(timeout=15)
+        (work / ("concurrent-" + label + ".stdout")).write_bytes(out)
+        (work / ("concurrent-" + label + ".stderr")).write_bytes(err)
+        concurrent[label] = (child.returncode, json.loads(out))
+check("both concurrent runner processes execute and finish",
+      ready and len(concurrent) == 2 and all(code == 0 for code, _ in concurrent.values()))
+check("a concurrent dependency skip cannot replace an executed pass",
+      concurrent.get("pass", (None, {}))[1].get("tests_passed") == 1 and
+      concurrent["pass"][1]["tests_skipped"] == 0)
+check("the concurrent dependency skip keeps its own result",
+      concurrent.get("skip", (None, {}))[1].get("tests_skipped") == 1 and
+      concurrent["skip"][1]["tests_passed"] == 0)
+reports = list((work / "logs/tests").rglob("junit.xml"))
+check("default concurrent JUnit reports have distinct retained paths", len(reports) == 2)
+try:
+    report_roots = [ET.parse(path).getroot() for path in reports]
+    outcomes = sorted((int(node.attrib["tests"]), int(node.attrib["failures"]),
+                       len(node.findall(".//skipped"))) for node in report_roots)
+except (ET.ParseError, OSError, KeyError, ValueError) as error:
+    print("JUnit parse failure: " + str(error), flush=True)
+    outcomes = []
+check("retained JUnit reports preserve the independent pass and skip",
+      outcomes == [(1, 0, 0), (1, 0, 1)])
+before = set(reports)
+run("junit-failure", ["--shell-only", "--filter", "test_selected_fail.sh", "--ci"], 1)
+fresh_reports = set((work / "logs/tests").rglob("junit.xml")) - before
+failure_text = ""
+if len(fresh_reports) == 1:
+    failure_text = "".join(ET.parse(fresh_reports.pop()).getroot().itertext())
+check("failed-test JUnit reads its own retained log with XML escaping",
+      "FAIL retained diagnostic <source> & detail" in failure_text)
 
 # Create a real unwritable result directory at the mktemp boundary. This leaves
 # worker execution intact and makes the OS reject result writes. Run unprivileged

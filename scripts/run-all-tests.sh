@@ -42,6 +42,7 @@ _JUNIT_FILE=""
 _TAP_MODE=false
 _BATS_ONLY=false
 _SHELL_ONLY=false
+_RUN_LOG_DIR=""
 
 # Results
 _TESTS_RUN=0
@@ -223,8 +224,7 @@ _run_bats_test() {
 
 _run_test() {
     local test_file="$1"
-    local log_dir="$LOG_DIR/$DATE_DIR"
-    mkdir -p "$log_dir"
+    local log_dir="$_RUN_LOG_DIR"
 
     local name log_file
     name=$(basename "$test_file")
@@ -383,13 +383,13 @@ EOF
         echo "    <testcase name=\"$name\" time=\"$time_val\">" >> "$output_file"
 
         if [[ "$status" == "fail" ]]; then
-            local log_file="$LOG_DIR/$DATE_DIR/${name%.sh}.log"
+            local log_file="$_RUN_LOG_DIR/${name%.sh}.log"
             log_file="${log_file%.bats}.log"
             local error_msg=""
             if [[ -f "$log_file" ]]; then
                 error_msg=$(tail -20 "$log_file" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
             fi
-            echo "      <failure message=\"Test failed\"><![CDATA[$error_msg]]></failure>" >> "$output_file"
+            printf '      <failure message="Test failed">%s</failure>\n' "$error_msg" >> "$output_file"
         elif [[ "$status" == "skip" ]]; then
             echo "      <skipped/>" >> "$output_file"
         fi
@@ -481,7 +481,6 @@ main() {
                 ;;
             --ci)
                 _CI_MODE=true
-                _JUNIT_FILE="$LOG_DIR/$DATE_DIR/junit.xml"
                 shift
                 ;;
             --junit)
@@ -544,7 +543,14 @@ main() {
     echo "Running ${#tests[@]} test files..." >&2
     echo "" >&2
 
-    mkdir -p "$LOG_DIR/$DATE_DIR"
+    mkdir -p "$LOG_DIR/$DATE_DIR" || return 1
+    # Classification and JUnit rendering read these files after each child
+    # exits. A daily basename would let another invocation replace that proof.
+    _RUN_LOG_DIR=$(mktemp -d "$LOG_DIR/$DATE_DIR/run.XXXXXXXX") || return 1
+    _log_info "Test logs: $_RUN_LOG_DIR"
+    if $_CI_MODE && [[ -z "$_JUNIT_FILE" ]]; then
+        _JUNIT_FILE="$_RUN_LOG_DIR/junit.xml"
+    fi
 
     if [[ $_PARALLEL -gt 1 ]]; then
         _run_tests_parallel "${tests[@]}"
