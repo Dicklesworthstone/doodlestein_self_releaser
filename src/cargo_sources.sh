@@ -543,8 +543,12 @@ def observe(metadata, selected, workspace=False):
             # Cargo never builds a dependency's tests, benches, examples or bins, and
             # crates.io archives often omit those files while the published manifest
             # still declares them (nom 7.1.3 examples, crc32c 0.6.8 benches).
-            if not {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro",
-                    "custom-build"}.intersection(target.get("kind", [])):
+            # Missing or unknown kind metadata proves no exemption. Require
+            # its bytes conservatively instead of silently admitting a hole.
+            kinds = target.get("kind")
+            if (isinstance(kinds, list) and kinds and
+                    all(isinstance(kind, str) and kind in {"bin", "test", "bench", "example"}
+                        for kind in kinds)):
                 continue
             relative = absolute(target["src_path"]).relative_to(Path(package["root"])).as_posix()
             require(relative in indexed[package["root"]], "missing dependency target source")

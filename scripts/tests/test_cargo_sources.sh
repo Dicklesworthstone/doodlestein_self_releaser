@@ -4,7 +4,7 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 command -v python3 >/dev/null || { printf 'SKIP: Python 3.9+ required\n'; exit 0; }
-python3 - "$ROOT/src/cargo_sources.sh" <<'PY'
+python3 - "${DSR_CARGO_SOURCES_TEST_MODULE:-$ROOT/src/cargo_sources.sh}" <<'PY'
 import hashlib
 import json
 import os
@@ -170,6 +170,22 @@ check('unknown remote source types fail closed', lambda f: unsafe(f, lambda x: x
 check('registry identity cannot point at a differently named crate', lambda f: unsafe(f, lambda x: x.graph['packages'][1].update(name='other')))
 check('target source cannot escape a dependency boundary', lambda f: unsafe(f, lambda x: x.graph['packages'][1].update(targets=[{'src_path':str(x.app/'lib.rs')}])) )
 check('missing dependency target sources fail', lambda f: unsafe(f, lambda x: x.graph['packages'][1].update(targets=[{'src_path':str(x.registry/'missing.rs')}])) )
+for kinds in ([], None, 'lib', ['lib'], ['custom-build'], ['future-kind'], ['bin', 'lib'], [None]):
+    check('unproven target exemption requires source bytes: '+repr(kinds),
+          lambda f, kinds=kinds: unsafe(f, lambda x: x.graph['packages'][1].update(
+              targets=[{'src_path':str(x.registry/'missing.rs'), 'kind':kinds}])))
+
+
+def omitted_nonbuilt_target(f, kinds):
+    f.graph['packages'][1]['targets'].append({'src_path':str(f.registry/'omitted.rs'), 'kind':kinds})
+    f.save()
+    before = f.good()
+    assert f.good('verify') == before
+
+
+for kinds in (['bin'], ['test'], ['bench'], ['example'], ['test', 'bench']):
+    check('known nonbuilt dependency targets may be omitted: '+repr(kinds),
+          lambda f, kinds=kinds: omitted_nonbuilt_target(f, kinds))
 check('missing resolved nodes fail', lambda f: unsafe(f, lambda x: x.graph['resolve']['nodes'][0]['dependencies'].append('missing')))
 check('duplicate package IDs fail', lambda f: unsafe(f, lambda x: x.graph['packages'].append(x.graph['packages'][0])))
 check('duplicate resolve nodes fail', lambda f: unsafe(f, lambda x: x.graph['resolve']['nodes'].append(x.graph['resolve']['nodes'][0])))
