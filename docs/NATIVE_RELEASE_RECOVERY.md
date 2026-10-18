@@ -34,8 +34,9 @@ bash src/release_recover_native.sh \
 ```
 
 All supplied paths must be absolute, existing ancestors must be directories and
-symlink-free, and the output directory must be new and outside the original source,
-state and artifact trees. On macOS, `shasum -a 256` can select the state digest.
+symlink-free, and the output directory must be outside (and not contain) the original
+source, state and artifact trees. It must be new unless `--resume` explicitly selects
+an existing recovery. On macOS, `shasum -a 256` can select the state digest.
 `--dry-run` validates inputs and prints the planned names without writing output.
 The command also honors `DRY_RUN=true`. Run this module as a command, not as a
 sourceable library: its process becomes the recovery supervisor so signals go
@@ -53,8 +54,55 @@ Successful stdout is one JSON result with `manifest`, `manifest_sha256`,
 unique output files, not repeated references to a shared companion. The new `release/` directory
 contains `build-manifest.json`, `artifacts/`, the original `inputs/state.json`, and
 `result.json`. Only an entirely validated set is renamed into `release/`.
-Interrupted or failed copies may retain private `.recovery-*` evidence; use a new
-output directory for another attempt. An existing output is never overwritten.
+The output root also holds an immutable `plan.json` and a private `.partial/`
+directory. An interrupted operation retains its selected `.recovery-*` stage;
+`--resume` can continue that same generation. An existing file is never overwritten.
+
+## Retry completed or interrupted recovery
+
+Repeat the same selected command with `--resume`. No compiler, archive repackaging,
+signer, upload or original build-state mutation is involved. Every retry checks the
+independently selected state SHA-256, local repository/tag, full worker matrix,
+original inode/hash/size receipts and archive inventories again. The original
+checkout, checkpoint and worker artifacts must still be available; the saved
+success receipt is not a substitute for these inputs.
+
+For a completed `release/`, resume reconstructs the expected manifest and result,
+revalidates every copied payload and the exact output namespace, then returns the
+original JSON receipt. It preserves the manifest digest, historical recovery time,
+file/directory identities, modes and modification times. Missing, linked, changed,
+extra or incorrectly permissioned outputs are refused, never repaired. A manifest
+that consistently omits a target still fails because expected inventory comes from
+the selected worker checkpoint. Legacy completed outputs with only `release/` are
+supported without adding a plan or rewriting their files.
+
+For an interrupted managed output, resume requires its exact pinned `plan.json`;
+it never selects a different stage by recency. All existing committed payloads and
+documents are checked before any missing file is copied. Valid completed copies
+retain their bytes, inodes and modes. Only missing files are copied from their
+original frozen worker paths. Existing but corrupt files cause refusal rather than
+automatic replacement, even if another missing file could otherwise make progress.
+
+Each new payload or document is written, flushed and checked under a fresh random
+name in `.partial/`, then renamed into its committed staging name. File-size
+exhaustion or cancellation cannot leave a truncated file masquerading as a completed
+payload. A retry restarts an interrupted individual file; it does not continue from
+a byte offset. Prior incomplete files remain private evidence and never enter
+`release/artifacts/`. The complete staged namespace, input state, manifest, result
+and payloads are rechecked before the final directory rename.
+
+An exclusive, nonblocking lock on the recovery directory serializes cooperating
+writers, including dry-run verification. An active recovery makes a competing
+invocation fail rather than race or wait indefinitely. No persistent PID file is
+trusted and no stored PID is signalled. A crash before the first plan is committed,
+or an older interrupted output without a managed plan, still requires a new output
+directory; such unbound directories are not adopted.
+
+`--resume --dry-run` checks completed output or the retained partial subset without
+creating missing files, changing checkpoints or publishing a release. The recovery
+observation time is retained from local evidence, not asserted as an authenticated
+build timestamp. This remains cooperating-writer recovery, not protection against
+arbitrary same-user changes after the final observation or strict build provenance.
 
 Raw names are deterministic, independent of completion order: `demo-linux_amd64`,
 `demo-darwin_arm64`, `demo-windows_amd64.exe`. A recorded compiler triple replaces
@@ -168,6 +216,7 @@ These budgets are per archive, not a claim of a global memory or CPU bound.
 
 ```bash
 bash scripts/tests/test_native_release_recovery.sh
+bash scripts/tests/test_native_recovery_resume.sh
 ```
 
 This compiles real Go executables for seven Linux/macOS/Windows targets, wraps
@@ -194,3 +243,16 @@ compilation cache; output binaries and release evidence remain unique to each ru
 `DSR_RECOVERY_MULTI_BASELINE` may name the unchanged archive-only implementation to
 reproduce both its multi-file refusal and its publication of an altered staged
 copy, using the same real inputs and fault injector in the same test invocation.
+
+The resume suite uses a genuine Go executable, a real compressed archive, an OS
+file-size limit that interrupts a copy, a real directory lock and SIGTERM delivered
+to the recovery supervisor after a genuine Git tag query. It checks that completed
+copies and private failure evidence survive retries unchanged, that all missing
+payloads are recovered, and that conflicting or corrupt retained state is refused
+without repair. Saved worker envelopes are explicit fixtures, not a full scheduler
+invocation. The interruption suite currently requires Linux. Set
+`DSR_RECOVERY_PARTIAL_BASELINE` to the unchanged completed-only implementation for
+an in-process comparison of partial refusal and legacy completed-output reuse.
+`DSR_RECOVERY_RESUME_BASELINE` selects the older non-resumable module for the main
+recovery suite's completed-retry counterexample. Neither suite claims native
+macOS/Windows execution, signing or live release publication.

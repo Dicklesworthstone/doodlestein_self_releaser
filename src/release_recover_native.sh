@@ -8,6 +8,7 @@ _native_recovery_execute() {
     exec env DRY_RUN="${DRY_RUN:-false}" python3 -I - "$@" <<'PY'
 import argparse
 import datetime
+import fcntl
 import gzip
 import hashlib
 import json
@@ -498,22 +499,73 @@ def check_artifact(worker, destination=None):
     return mode
 
 
-def save(destination, data):
-    with destination.open("xb") as stream:
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def commit_copy(temporary, destination):
+    # The held directory lock serializes cooperating recovery writers. Never
+    # overwrite an existing committed name, even when its bytes look equal.
+    need(not destination.exists() and not destination.is_symlink(), "recovery destination already exists", 2)
+    os.rename(temporary, destination)
+    sync_directory(destination.parent)
+
+
+def save(destination, data, pending=None):
+    temporary = pending / uuid.uuid4().hex if pending is not None else destination
+    with temporary.open("xb") as stream:
         stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
         saved_identity = identity(os.fstat(stream.fileno()))
-    need(identity(destination.lstat()) == saved_identity, "recovery document replaced while writing")
+    need(identity(temporary.lstat()) == saved_identity, "recovery document replaced while writing")
+    if temporary != destination:
+        commit_copy(temporary, destination)
+        saved_identity = identity(destination.lstat())
     return saved_identity
 
 
-def retain_document(destination, data, reuse):
+def retain_document(destination, data, reuse, pending=None):
     if not reuse:
-        return save(destination, data)
+        return save(destination, data, pending)
     retained, _, info = read_file(destination)
     need(retained == data, "completed recovery document differs from selected inputs: " + destination.name, 2)
     return identity(info)
+
+
+def inspect_pending(directory):
+    # Interrupted writes are never reused as completed payloads or uploaded.
+    # Retain them as bounded private evidence rather than deleting or trusting
+    # them. A new retry copies into a fresh random name.
+    need(path(str(directory)).is_dir(), "missing private recovery directory", 2)
+    count = 0
+    for item in directory.iterdir():
+        count += 1
+        info = item.lstat()
+        need(count <= 10000 and match(item.name, r"[0-9a-f]{32}") and
+             stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and not info.st_mode & 0o7000 and
+             info.st_size <= max(args.max_artifact_bytes, 64 * 1024 * 1024),
+             "unexpected private recovery entry", 2)
+
+
+def lock_workspace():
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        info = os.fstat(fd)
+        need((info.st_dev, info.st_ino) == (root.stat().st_dev, root.stat().st_ino),
+             "recovery directory changed before locking", 2)
+        return fd, (info.st_dev, info.st_ino)
+    except BlockingIOError:
+        os.close(fd)
+        raise Failure("recovery output is already in use", 2)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def verify_stage(stage, directories, outputs, documents):
@@ -542,6 +594,7 @@ def interrupted(signum, frame):
 for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(sig, interrupted)
 
+lockfd = None
 try:
     class Parser(argparse.ArgumentParser):
         def error(self, message):
@@ -556,7 +609,7 @@ try:
     parser.add_argument("--max-archive-members", type=int, default=10000)
     parser.add_argument("--dry-run", action="store_true", help="validate all inputs and print planned names without writing")
     parser.add_argument("--resume", action="store_true",
-        help="revalidate and reuse a complete recovery without changing any retained file")
+        help="resume a pinned interrupted recovery or revalidate completed output without rewriting it")
     flags = [a.split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate recovery option", 4)
     args = parser.parse_args(sys.argv[1:])
@@ -569,11 +622,11 @@ try:
     state_path, source_repo, artifacts_root, root = map(path,
         (args.state, args.source_repo, args.artifacts_root, args.output_dir))
     need(source_repo.is_dir() and artifacts_root.is_dir(), "source-repo and artifacts-root must be directories", 4)
-    reuse = root.exists()
-    need(not reuse or args.resume, "recovery output already exists; use --resume to revalidate it", 2)
-    if reuse:
-        need(root.is_dir() and {p.name for p in root.iterdir()} == {"release"} and
-             path(str(root / "release")).is_dir(), "output is not a complete recovery", 2)
+    existing = root.exists()
+    need(not existing or args.resume, "recovery output already exists; use --resume to revalidate it", 2)
+    if existing:
+        need(root.is_dir(), "recovery output is not a directory", 2)
+        lockfd, root_identity = lock_workspace()
     need(not any(root.is_relative_to(p) or p.is_relative_to(root)
                  for p in (source_repo, artifacts_root, state_path.parent)),
          "recovery output must be outside the original source, artifact and state directories", 4)
@@ -581,6 +634,39 @@ try:
     need(state_hash == args.state_sha256, "state does not match the independently selected SHA-256")
     state = document(state_bytes)
     workers = select_workers(state)
+    reuse = existing and (root / "release").exists()
+    managed = not existing or (root / "plan.json").exists()
+    pending = root / ".partial" if managed else None
+    plan = dict(schema_version=1, kind="dsr-native-recovery-plan", repo=args.repo,
+                tag=args.tag, source_sha=args.sha, state_sha256=state_hash)
+    plan_document = None
+    if existing:
+        if managed:
+            plan_bytes, _, plan_info = read_file(root / "plan.json", limit=65536)
+            retained_plan = document(plan_bytes)
+            need(isinstance(retained_plan, dict) and type(retained_plan.get("schema_version")) is int and
+                 set(retained_plan) == set(plan) | {"stage", "recovered_at"} and
+                 all(retained_plan[k] == v for k, v in plan.items()) and
+                 match(retained_plan["stage"], r"\.recovery-[0-9a-f]{32}") and
+                 canonical(retained_plan) == plan_bytes, "recovery checkpoint differs from selected inputs", 2)
+            timestamp(retained_plan["recovered_at"])
+            plan = retained_plan
+            plan_document = (plan_bytes, identity(plan_info))
+            inspect_pending(pending)
+            pending_identity = (pending.stat().st_dev, pending.stat().st_ino)
+        else:
+            need(reuse and {p.name for p in root.iterdir()} == {"release"},
+                 "output has no pinned recovery checkpoint", 2)
+    else:
+        plan.update(stage=".recovery-" + uuid.uuid4().hex,
+                    recovered_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    stage = root / ("release" if reuse else plan["stage"])
+    if existing:
+        allowed = {"plan.json", ".partial"} if managed else set()
+        if stage.exists():
+            allowed.add(stage.name)
+            need(path(str(stage)).is_dir(), "invalid retained recovery stage", 2)
+        need({p.name for p in root.iterdir()} == allowed, "unexpected recovery workspace entry", 2)
     source_identity()
     output_workers = {}
     for worker in workers:
@@ -598,36 +684,16 @@ try:
                 task_keys=sorted({v["task"]["key"] for v in workers if v["name"] == w["name"]}),
                 sha256=w["receipt"]["sha256"], archive_format=w["format"])
                 for w in sorted(output_workers.values(), key=lambda row: row["name"])])
-    if dry and not reuse:
+    if dry and not existing:
         print(canonical(planned).decode(), end="")
         sys.exit(0)
-    # Admission above performs no writes. Failure below leaves private evidence
-    # but never a release/ directory or a successful receipt.
-    os.umask(0o077)
-    if not reuse:
-        root.mkdir(mode=0o700)
-    root_identity = (root.stat().st_dev, root.stat().st_ino)
-    stage = root / "release" if reuse else Path(tempfile.mkdtemp(prefix=".recovery-", dir=root))
-    if not reuse:
-        (stage / "artifacts").mkdir()
-        (stage / "inputs").mkdir()
-    for directory in (stage, stage / "artifacts", stage / "inputs"):
-        need(path(str(directory)).is_dir(), "missing recovery directory", 2)
-    directories = {p: (p.stat().st_dev, p.stat().st_ino) for p in (stage, stage / "artifacts", stage / "inputs")}
-    documents = {stage / "inputs/state.json":
-        (state_bytes, retain_document(stage / "inputs/state.json", state_bytes, reuse))}
-    artifacts, environments, mapping, copies = [], {}, [], {}
+    # Build the complete expected documents independently of retained output.
+    # A partial checkpoint may contribute only its historical observation time.
+    artifacts, environments, mapping, artifact_names = [], {}, [], set()
     for worker in workers:
         task, result, receipt = worker["task"], worker["result"], worker["receipt"]
-        if worker["name"] not in copies:
-            destination = stage / "artifacts" / worker["name"]
-            if not reuse:
-                check_artifact(worker, destination)
-            info = destination.lstat()
-            need(stat.S_IMODE(info.st_mode) == worker["output_mode"], "recovered artifact mode changed", 2)
-            copied_receipt = dict(receipt, path=str(destination), identity="gnu:%d:%d" % (info.st_dev, info.st_ino))
-            _, _, copied_info = read_file(destination, copied_receipt, limit=args.max_artifact_bytes)
-            copies[worker["name"]] = (copied_receipt, identity(copied_info))
+        if worker["name"] not in artifact_names:
+            artifact_names.add(worker["name"])
             artifact = dict(name=worker["name"], target=task["platform"] if worker["role"] == "primary" else "additional",
                 sha256=receipt["sha256"], size_bytes=receipt["size_bytes"], archive_format=worker["format"],
                 signed=False, signature_file="")
@@ -644,8 +710,8 @@ try:
             role=worker["role"], executable_bits=worker["output_mode"] & 0o111))
         if "archive_inventory" in worker:
             mapping[-1]["archive_inventory"] = worker["archive_inventory"]
-    recovered_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if reuse:
+    recovered_at = plan.get("recovered_at")
+    if not managed:
         # Only the historical observation time comes from retained output.
         # Reconstruct every identity, artifact and evidence field from the
         # independently selected state and newly revalidated original inputs.
@@ -665,15 +731,83 @@ try:
             recovered_at=recovered_at,
             original_status=state["status"], artifacts=mapping))
     manifest_bytes = canonical(manifest)
-    documents[stage / "build-manifest.json"] = (
-        manifest_bytes, retain_document(stage / "build-manifest.json", manifest_bytes, reuse))
     result = dict(kind="dsr-native-recovery", status="verified", exit_code=0,
         manifest=str(root / "release/build-manifest.json"), manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         artifacts_dir=str(root / "release/artifacts"), state_sha256=state_hash, recovered_targets=task_count,
         recovered_artifacts=len(artifacts), companion_artifacts=sum(a["target"] == "additional" for a in artifacts),
         strict_source_verified=False, dependency_pins_verified=False)
     result_bytes = canonical(result)
-    documents[stage / "result.json"] = (result_bytes, retain_document(stage / "result.json", result_bytes, reuse))
+    expected_documents = {stage / "inputs/state.json": state_bytes,
+                          stage / "build-manifest.json": manifest_bytes, stage / "result.json": result_bytes}
+    copies, documents, directories = {}, {}, {}
+
+    def admit_copy(worker, selected):
+        info = path(str(selected)).lstat()
+        need(stat.S_IMODE(info.st_mode) == worker["output_mode"], "recovered artifact mode changed", 2)
+        receipt = dict(worker["receipt"], path=str(selected), identity="gnu:%d:%d" % (info.st_dev, info.st_ino))
+        _, _, observed = read_file(selected, receipt, limit=args.max_artifact_bytes)
+        return receipt, identity(observed)
+
+    # Validate ALL existing state before copying even one missing payload. An
+    # incomplete manifest/result is not permission to repair another file.
+    if existing and stage.exists():
+        need({p.name for p in stage.iterdir()} <= {"artifacts", "inputs", "build-manifest.json", "result.json"},
+             "unexpected retained stage entry", 2)
+        for directory in (stage, stage / "artifacts", stage / "inputs"):
+            if directory.exists():
+                info = path(str(directory)).lstat()
+                need(stat.S_ISDIR(info.st_mode), "invalid retained stage directory", 2)
+                directories[directory] = (info.st_dev, info.st_ino)
+            else:
+                need(not reuse and not directory.is_symlink(), "missing completed recovery directory", 2)
+        if (stage / "inputs").exists():
+            need({p.name for p in (stage / "inputs").iterdir()} <= {"state.json"}, "unexpected retained input", 2)
+        if (stage / "artifacts").exists():
+            for selected in (stage / "artifacts").iterdir():
+                need(selected.name in output_workers, "unselected retained artifact", 2)
+                copies[selected.name] = admit_copy(output_workers[selected.name], selected)
+        for selected, data in expected_documents.items():
+            if selected.exists() or selected.is_symlink():
+                documents[selected] = (data, retain_document(selected, data, True))
+        if reuse:
+            need(set(copies) == set(output_workers) and set(documents) == set(expected_documents),
+                 "completed recovery is missing selected files", 2)
+    retained_entries = {directory: {p.name for p in directory.iterdir()} for directory in directories}
+
+    if not dry and not reuse:
+        os.umask(0o077)
+        if not existing:
+            root.mkdir(mode=0o700)
+            lockfd, root_identity = lock_workspace()
+            pending.mkdir(mode=0o700)
+            pending_identity = (pending.stat().st_dev, pending.stat().st_ino)
+            plan_bytes = canonical(plan)
+            plan_document = (plan_bytes, save(root / "plan.json", plan_bytes, pending))
+            sync_directory(root)
+        for directory in (stage, stage / "artifacts", stage / "inputs"):
+            if directory not in directories:
+                directory.mkdir(mode=0o700)
+                sync_directory(directory.parent)
+                info = directory.stat()
+                directories[directory] = (info.st_dev, info.st_ino)
+        # Freeze original state before any payload. Data and documents are
+        # copied to private random names, then committed by rename. A killed
+        # writer leaves no truncated file under a completed payload name.
+        saved_state = stage / "inputs/state.json"
+        if saved_state not in documents:
+            documents[saved_state] = (state_bytes, save(saved_state, state_bytes, pending))
+        for worker in output_workers.values():
+            if worker["name"] in copies:
+                continue
+            temporary = pending / uuid.uuid4().hex
+            check_artifact(worker, temporary)
+            admit_copy(worker, temporary)
+            destination = stage / "artifacts" / worker["name"]
+            commit_copy(temporary, destination)
+            copies[worker["name"]] = admit_copy(worker, destination)
+        for selected, data in expected_documents.items():
+            if selected not in documents:
+                documents[selected] = (data, save(selected, data, pending))
     # Recheck original custody and repository identity after copying. Never
     # repair a failed checkpoint by rehashing changed files into a new claim.
     for worker in workers:
@@ -682,21 +816,42 @@ try:
     need(final_bytes == state_bytes and final_hash == state_hash and identity(final_info) == identity(state_info),
          "build state changed during recovery", 2)
     source_identity()
+    need(not root.is_symlink() and (root.stat().st_dev, root.stat().st_ino) == root_identity,
+         "recovery directory changed", 2)
+    expected_root = {"plan.json", ".partial"} if managed else set()
+    if stage.exists():
+        expected_root.add(stage.name)
+    need({p.name for p in root.iterdir()} == expected_root, "recovery workspace inventory changed", 2)
+    if managed:
+        current, _, info = read_file(root / "plan.json", limit=65536)
+        need((current, identity(info)) == plan_document, "recovery plan changed", 2)
+        inspect_pending(pending)
+        need((pending.stat().st_dev, pending.stat().st_ino) == pending_identity,
+             "private recovery directory changed", 2)
+    if dry and not reuse:
+        # Recheck the admitted subset without requiring the missing files that
+        # a real resume would copy. A dry run never creates persistent state.
+        for directory, observed in directories.items():
+            info = path(str(directory)).stat()
+            need((info.st_dev, info.st_ino) == observed and
+                 {p.name for p in directory.iterdir()} == retained_entries[directory],
+                 "retained directory changed", 2)
+        for filename, observed in copies.items():
+            need(admit_copy(output_workers[filename], stage / "artifacts" / filename) == observed,
+                 "retained copy changed during dry run", 2)
+        for selected, (data, observed) in documents.items():
+            need(retain_document(selected, data, True) == observed, "retained document changed during dry run", 2)
+        print(canonical(planned).decode(), end="")
+        sys.exit(0)
     verify_stage(stage, directories, copies, documents)
     if reuse:
-        need(not root.is_symlink() and (root.stat().st_dev, root.stat().st_ino) == root_identity and
-             {p.name for p in root.iterdir()} == {"release"}, "completed recovery directory changed", 2)
         print("[native-recovery] Revalidated completed recovery without rewriting retained files", file=sys.stderr)
         print(canonical(planned if dry else result).decode(), end="")
         sys.exit(0)
     need(not root.is_symlink() and (root.stat().st_dev, root.stat().st_ino) == root_identity and
          not (root / "release").exists() and not (root / "release").is_symlink(), "recovery destination changed", 2)
     os.rename(stage, root / "release")
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    sync_directory(root)
     print(canonical(result).decode(), end="")
 except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError, EOFError,
         tarfile.TarError, zipfile.BadZipFile, lzma.LZMAError, zlib.error, struct.error, RecursionError) as error:
@@ -704,6 +859,9 @@ except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError, EOFEr
     print("[native-recovery] " + str(error), file=sys.stderr)
     print(canonical(dict(kind="dsr-native-recovery", status="error", exit_code=code, error=str(error))).decode(), end="")
     sys.exit(code)
+finally:
+    if lockfd is not None:
+        os.close(lockfd)
 PY
 }
 
