@@ -157,6 +157,87 @@ check('dry-run validates every target without creating output', status == 0 and 
       len(response.get('artifacts', [])) == 7 and not planned.exists())
 
 
+def snapshot_tree(directory):
+    snapshot = {}
+    for item in [directory, *sorted(directory.rglob('*'))]:
+        info = item.lstat()
+        snapshot[str(item.relative_to(directory))] = (
+            info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+            sha(item.read_bytes()) if item.is_file() and not item.is_symlink() else None)
+    return snapshot
+
+
+first_result = json.loads((release / 'result.json').read_bytes())
+before_resume = snapshot_tree(output)
+resume_baseline = os.environ.get('DSR_RECOVERY_RESUME_BASELINE')
+if resume_baseline:
+    status, _, _, _ = invoke(output=output, arguments=['--resume'], module_override=resume_baseline)
+    check('unchanged incumbent cannot resume a complete recovery', status != 0 and
+          snapshot_tree(output) == before_resume)
+for retry in range(2):
+    status, response, _, _ = invoke(output=output, arguments=['--resume'])
+    check('complete recovery retry returns the original receipt ' + str(retry),
+          status == 0 and response == first_result and snapshot_tree(output) == before_resume)
+status, response, _, _ = invoke(output=output, arguments=['--resume', '--dry-run'])
+check('resume dry-run authenticates the retained generation without writes',
+      status == 0 and response.get('status') == 'planned' and snapshot_tree(output) == before_resume)
+
+
+def refuse_resume(label, value=None, arguments=None):
+    before = snapshot_tree(output)
+    status, response, _, _ = invoke(value, output=output, arguments=['--resume', *(arguments or [])])
+    check(label, status != 0 and response.get('status') == 'error' and snapshot_tree(output) == before)
+
+
+candidate = copy.deepcopy(state)
+candidate['status'] = 'partial'
+refuse_resume('resume cannot bind an existing release to another selected state', candidate)
+victim = release / 'artifacts/demo-linux_amd64'
+original_bytes, original_mode = victim.read_bytes(), victim.stat().st_mode & 0o777
+with victim.open('r+b') as stream:
+    stream.seek(-1, os.SEEK_END)
+    stream.write(bytes([original_bytes[-1] ^ 1]))
+refuse_resume('resume refuses changed retained binary bytes without repairing them')
+refuse_resume('resume dry-run also rejects corrupted retained binaries', arguments=['--dry-run'])
+victim.write_bytes(original_bytes)
+victim.chmod(0o600)
+refuse_resume('resume refuses changed retained executable mode')
+victim.chmod(original_mode)
+for document_name in ('build-manifest.json', 'result.json', 'inputs/state.json'):
+    selected = release / document_name
+    retained = selected.read_bytes()
+    selected.write_bytes(retained + b' ')
+    refuse_resume('resume refuses changed retained document ' + document_name)
+    selected.write_bytes(retained)
+# A self-consistent but incomplete local manifest/result pair is not authority.
+manifest_path, result_path = release / 'build-manifest.json', release / 'result.json'
+manifest_bytes, result_bytes = manifest_path.read_bytes(), result_path.read_bytes()
+subset = json.loads(manifest_bytes)
+subset['artifacts'] = [a for a in subset['artifacts'] if a['target'] != 'darwin/arm64']
+manifest_path.write_bytes(encoded(subset))
+forged = json.loads(result_bytes)
+forged['manifest_sha256'] = sha(manifest_path.read_bytes())
+result_path.write_bytes(encoded(forged))
+refuse_resume('resume reconstructs the full inventory instead of trusting a self-consistent subset')
+manifest_path.write_bytes(manifest_bytes)
+result_path.write_bytes(result_bytes)
+unlisted = release / 'artifacts/unlisted'
+unlisted.write_bytes(b'not selected by the worker inventory')
+refuse_resume('resume rejects extra uploadable files')
+unlisted.rename(work / 'retained-unlisted-resume-file')
+victim.rename(work / 'retained-resume-binary')
+refuse_resume('resume rejects missing retained payloads without copying a replacement')
+victim.symlink_to(work / 'retained-resume-binary')
+refuse_resume('resume rejects linked retained payloads')
+victim.rename(work / 'retained-resume-symlink')
+(work / 'retained-resume-binary').rename(victim)
+before_resume = snapshot_tree(output)
+status, response, _, _ = invoke(output=output, arguments=['--resume'])
+check('restored complete output can be revalidated without a new manifest timestamp',
+      status == 0 and response == first_result and snapshot_tree(output) == before_resume)
+
+
 def refuse(label, value=None, code=None, **kwargs):
     status, response, destination, _ = invoke(value, **kwargs)
     check(label, status != 0 and (code is None or status == code) and

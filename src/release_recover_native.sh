@@ -508,6 +508,14 @@ def save(destination, data):
     return saved_identity
 
 
+def retain_document(destination, data, reuse):
+    if not reuse:
+        return save(destination, data)
+    retained, _, info = read_file(destination)
+    need(retained == data, "completed recovery document differs from selected inputs: " + destination.name, 2)
+    return identity(info)
+
+
 def verify_stage(stage, directories, outputs, documents):
     # Re-admit the COPIES, not just their original worker paths. This also
     # catches an altered manifest or an extra uploadable file before rename.
@@ -547,6 +555,8 @@ try:
     parser.add_argument("--max-unpacked-bytes", type=int, default=4 * 1024 ** 3)
     parser.add_argument("--max-archive-members", type=int, default=10000)
     parser.add_argument("--dry-run", action="store_true", help="validate all inputs and print planned names without writing")
+    parser.add_argument("--resume", action="store_true",
+        help="revalidate and reuse a complete recovery without changing any retained file")
     flags = [a.split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate recovery option", 4)
     args = parser.parse_args(sys.argv[1:])
@@ -559,8 +569,13 @@ try:
     state_path, source_repo, artifacts_root, root = map(path,
         (args.state, args.source_repo, args.artifacts_root, args.output_dir))
     need(source_repo.is_dir() and artifacts_root.is_dir(), "source-repo and artifacts-root must be directories", 4)
-    need(not root.exists(), "recovery output already exists; select a new output directory", 2)
-    need(not any(root.is_relative_to(p) for p in (source_repo, artifacts_root, state_path.parent)),
+    reuse = root.exists()
+    need(not reuse or args.resume, "recovery output already exists; use --resume to revalidate it", 2)
+    if reuse:
+        need(root.is_dir() and {p.name for p in root.iterdir()} == {"release"} and
+             path(str(root / "release")).is_dir(), "output is not a complete recovery", 2)
+    need(not any(root.is_relative_to(p) or p.is_relative_to(root)
+                 for p in (source_repo, artifacts_root, state_path.parent)),
          "recovery output must be outside the original source, artifact and state directories", 4)
     state_bytes, state_hash, state_info = read_file(state_path)
     need(state_hash == args.state_sha256, "state does not match the independently selected SHA-256")
@@ -575,32 +590,41 @@ try:
              "shared companion executable modes differ", 4)
         output_workers[worker["name"]] = worker
     task_count = len(state["context"]["build_tasks"])
-    if args.dry_run or os.environ.get("DRY_RUN") == "true":
-        print(canonical(dict(kind="dsr-native-recovery", status="planned", exit_code=0, dry_run=True,
+    dry = args.dry_run or os.environ.get("DRY_RUN") == "true"
+    planned = dict(kind="dsr-native-recovery", status="planned", exit_code=0, dry_run=True,
             state_sha256=state_hash, recovered_targets=task_count,
             artifacts=[dict(name=w["name"], role=w["role"],
                 target=w["task"]["platform"] if w["role"] == "primary" else "additional",
                 task_keys=sorted({v["task"]["key"] for v in workers if v["name"] == w["name"]}),
                 sha256=w["receipt"]["sha256"], archive_format=w["format"])
-                for w in sorted(output_workers.values(), key=lambda row: row["name"])])).decode(), end="")
+                for w in sorted(output_workers.values(), key=lambda row: row["name"])])
+    if dry and not reuse:
+        print(canonical(planned).decode(), end="")
         sys.exit(0)
     # Admission above performs no writes. Failure below leaves private evidence
     # but never a release/ directory or a successful receipt.
     os.umask(0o077)
-    root.mkdir(mode=0o700)
+    if not reuse:
+        root.mkdir(mode=0o700)
     root_identity = (root.stat().st_dev, root.stat().st_ino)
-    stage = Path(tempfile.mkdtemp(prefix=".recovery-", dir=root))
-    (stage / "artifacts").mkdir()
-    (stage / "inputs").mkdir()
+    stage = root / "release" if reuse else Path(tempfile.mkdtemp(prefix=".recovery-", dir=root))
+    if not reuse:
+        (stage / "artifacts").mkdir()
+        (stage / "inputs").mkdir()
+    for directory in (stage, stage / "artifacts", stage / "inputs"):
+        need(path(str(directory)).is_dir(), "missing recovery directory", 2)
     directories = {p: (p.stat().st_dev, p.stat().st_ino) for p in (stage, stage / "artifacts", stage / "inputs")}
-    documents = {stage / "inputs/state.json": (state_bytes, save(stage / "inputs/state.json", state_bytes))}
+    documents = {stage / "inputs/state.json":
+        (state_bytes, retain_document(stage / "inputs/state.json", state_bytes, reuse))}
     artifacts, environments, mapping, copies = [], {}, [], {}
     for worker in workers:
         task, result, receipt = worker["task"], worker["result"], worker["receipt"]
         if worker["name"] not in copies:
             destination = stage / "artifacts" / worker["name"]
-            check_artifact(worker, destination)
+            if not reuse:
+                check_artifact(worker, destination)
             info = destination.lstat()
+            need(stat.S_IMODE(info.st_mode) == worker["output_mode"], "recovered artifact mode changed", 2)
             copied_receipt = dict(receipt, path=str(destination), identity="gnu:%d:%d" % (info.st_dev, info.st_ino))
             _, _, copied_info = read_file(destination, copied_receipt, limit=args.max_artifact_bytes)
             copies[worker["name"]] = (copied_receipt, identity(copied_info))
@@ -620,6 +644,13 @@ try:
             role=worker["role"], executable_bits=worker["output_mode"] & 0o111))
         if "archive_inventory" in worker:
             mapping[-1]["archive_inventory"] = worker["archive_inventory"]
+    recovered_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if reuse:
+        # Only the historical observation time comes from retained output.
+        # Reconstruct every identity, artifact and evidence field from the
+        # independently selected state and newly revalidated original inputs.
+        retained_manifest, _, _ = read_file(stage / "build-manifest.json")
+        recovered_at = timestamp(document(retained_manifest)["recovery_evidence"]["recovered_at"])
     manifest = dict(schema_version="1.0.0", tool=state["tool"], version=args.tag, run_id=state["run_id"],
         source=dict(git_sha=args.sha, git_ref="refs/tags/" + args.tag, repository="https://github.com/" + args.repo,
                     dependencies=[]),
@@ -631,17 +662,18 @@ try:
         recovery_evidence=dict(kind="ordinary-native-worker-recovery", schema_version=1,
             state_sha256=state_hash, source_verification="tag-identity-only", dependency_pins_verified=False,
             built_at_basis="latest-completed-target-checkpoint",
-            recovered_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            recovered_at=recovered_at,
             original_status=state["status"], artifacts=mapping))
     manifest_bytes = canonical(manifest)
-    documents[stage / "build-manifest.json"] = (manifest_bytes, save(stage / "build-manifest.json", manifest_bytes))
+    documents[stage / "build-manifest.json"] = (
+        manifest_bytes, retain_document(stage / "build-manifest.json", manifest_bytes, reuse))
     result = dict(kind="dsr-native-recovery", status="verified", exit_code=0,
         manifest=str(root / "release/build-manifest.json"), manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         artifacts_dir=str(root / "release/artifacts"), state_sha256=state_hash, recovered_targets=task_count,
         recovered_artifacts=len(artifacts), companion_artifacts=sum(a["target"] == "additional" for a in artifacts),
         strict_source_verified=False, dependency_pins_verified=False)
     result_bytes = canonical(result)
-    documents[stage / "result.json"] = (result_bytes, save(stage / "result.json", result_bytes))
+    documents[stage / "result.json"] = (result_bytes, retain_document(stage / "result.json", result_bytes, reuse))
     # Recheck original custody and repository identity after copying. Never
     # repair a failed checkpoint by rehashing changed files into a new claim.
     for worker in workers:
@@ -651,6 +683,12 @@ try:
          "build state changed during recovery", 2)
     source_identity()
     verify_stage(stage, directories, copies, documents)
+    if reuse:
+        need(not root.is_symlink() and (root.stat().st_dev, root.stat().st_ino) == root_identity and
+             {p.name for p in root.iterdir()} == {"release"}, "completed recovery directory changed", 2)
+        print("[native-recovery] Revalidated completed recovery without rewriting retained files", file=sys.stderr)
+        print(canonical(planned if dry else result).decode(), end="")
+        sys.exit(0)
     need(not root.is_symlink() and (root.stat().st_dev, root.stat().st_ino) == root_identity and
          not (root / "release").exists() and not (root / "release").is_symlink(), "recovery destination changed", 2)
     os.rename(stage, root / "release")
