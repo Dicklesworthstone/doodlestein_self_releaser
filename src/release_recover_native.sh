@@ -7,6 +7,7 @@ _native_recovery_execute() {
     command -v python3 >/dev/null || return 3
     exec env DRY_RUN="${DRY_RUN:-false}" python3 -I - "$@" <<'PY'
 import argparse
+import concurrent.futures
 import datetime
 import fcntl
 import gzip
@@ -32,6 +33,67 @@ class Failure(Exception):
     def __init__(self, message, code=7):
         super().__init__(message)
         self.code = code
+
+
+cancel_requested = False
+
+
+def checkpoint():
+    if cancel_requested:
+        raise Failure("native recovery interrupted", 5)
+
+
+def run_jobs(operation, items, accept=None):
+    """Bound in-flight work; only the supervisor may accept a completed result.
+
+    Do not use Executor.map: older Python versions eagerly submit the entire
+    inventory. A failed operation or signal stops admission and drains owned
+    readers before the caller can release the workspace lock.
+    """
+    global cancel_requested
+    if args.jobs == 1:
+        for item in items:
+            checkpoint()
+            value = operation(item)
+            if accept is not None:
+                accept(item, value)
+        return
+    iterator, active = iter(items), {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs,
+                                                 thread_name_prefix="dsr-recovery")
+    try:
+        def submit():
+            checkpoint()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            active[pool.submit(operation, item)] = item
+
+        for _ in range(args.jobs):
+            submit()
+        while active:
+            checkpoint()
+            ready, _ = concurrent.futures.wait(active, timeout=0.1,
+                                               return_when=concurrent.futures.FIRST_COMPLETED)
+            # Observe every ready failure before accepting results or starting
+            # further work. Already committed copies remain reusable on retry.
+            completed = [(future, future.result()) for future in ready]
+            for future, value in completed:
+                checkpoint()
+                item = active.pop(future)
+                if accept is not None:
+                    accept(item, value)
+                submit()
+    except BaseException:
+        cancel_requested = True
+        for future in active:
+            future.cancel()
+        raise
+    finally:
+        # Running operations cooperatively check cancellation between bounded
+        # reads. Never leave a writer alive after releasing the directory lock.
+        pool.shutdown(wait=True)
 
 
 def need(ok, message, code=7):
@@ -82,6 +144,7 @@ def identity(info):
 
 
 def read_file(selected, expected=None, destination=None, limit=64 * 1024 * 1024):
+    checkpoint()
     selected = path(str(selected))
     before = selected.lstat()
     need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and 0 < before.st_size <= limit,
@@ -99,6 +162,7 @@ def read_file(selected, expected=None, destination=None, limit=64 * 1024 * 1024)
         outgoing = destination.open("xb") if destination is not None else None
         try:
             for block in iter(lambda: incoming.read(1024 * 1024), b""):
+                checkpoint()
                 size += len(block)
                 need(size <= limit, "input grew beyond its size limit")
                 digest.update(block)
@@ -217,6 +281,7 @@ def inspect_archive(selected, admitted_info, format_name, platform):
         digest, prefix, actual = hashlib.sha256(), bytearray(), 0
         with opener() as stream:
             while True:
+                checkpoint()
                 block = stream.read(min(1024 * 1024, size - actual + 1))
                 if not block:
                     break
@@ -245,6 +310,7 @@ def inspect_archive(selected, admitted_info, format_name, platform):
             self.remaining = args.max_unpacked_bytes + args.max_archive_members * 2048 + 1024 * 1024
 
         def read(self, size):
+            checkpoint()
             data = self.stream.read(min(size, self.remaining + 1, 1024 * 1024))
             self.remaining -= len(data)
             need(self.remaining >= 0, "expanded tar stream exceeds its byte budget", 4)
@@ -282,6 +348,7 @@ def inspect_archive(selected, admitted_info, format_name, platform):
             with zipfile.ZipFile(stream) as archive:
                 need(len(archive.infolist()) == total, "ZIP member count differs from directory", 4)
                 for item in archive.infolist():
+                    checkpoint()
                     mode = item.external_attr >> 16
                     directory = item.is_dir()
                     need(not item.flag_bits & 1 and item.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) and
@@ -499,6 +566,33 @@ def check_artifact(worker, destination=None):
     return mode
 
 
+def check_workers(workers):
+    # select_workers has already authenticated every logical attribution and
+    # permits sharing one physical path only for identical companion receipts.
+    # Read that path once per phase, never once per task using the same data.
+    # Distinct paths are still checked independently, even with equal hashes.
+    groups = {}
+    for worker in workers:
+        group = groups.setdefault(worker["path"], [])
+        need(not group or (worker["role"] == group[0]["role"] == "additional" and
+             worker["format"] == group[0]["format"] == "none" and
+             worker["receipt"] == group[0]["receipt"]), "conflicting shared source receipt", 4)
+        group.append(worker)
+
+    def inspect(group):
+        return check_artifact(group[0])
+
+    def accept(group, mode):
+        observed = group[0]["admitted_identity"]
+        for worker in group:
+            need(worker.get("admitted_identity", observed) == observed,
+                 "shared artifact metadata changed during recovery")
+            worker["admitted_identity"] = observed
+            worker["output_mode"] = mode
+
+    run_jobs(inspect, groups.values(), accept)
+
+
 def sync_directory(directory):
     fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -579,15 +673,25 @@ def verify_stage(stage, directories, outputs, documents):
          {p.name for p in (stage / "inputs").iterdir()} == {"state.json"} and
          {p.name for p in (stage / "artifacts").iterdir()} == set(outputs),
          "recovery staging inventory changed", 2)
-    for filename, (receipt, expected_info) in outputs.items():
+    def verify_output(item):
+        filename, (receipt, expected_info) = item
         _, _, info = read_file(stage / "artifacts" / filename, receipt, limit=args.max_artifact_bytes)
         need(identity(info) == expected_info, "recovered artifact metadata changed")
+    run_jobs(verify_output, outputs.items())
     for selected, (data, expected_info) in documents.items():
         current, _, info = read_file(selected)
         need(current == data and identity(info) == expected_info, "recovery document changed before publication")
 
 
 def interrupted(signum, frame):
+    # Repeated signals must not interrupt worker draining and release the
+    # workspace lock while an owned thread still has a file open.
+    global cancel_requested
+    if cancel_requested:
+        return
+    # A Python signal handler must not acquire a synchronization lock: it can
+    # interrupt the supervisor while that same lock is already held.
+    cancel_requested = True
     raise Failure("native recovery interrupted", 5)
 
 
@@ -607,12 +711,14 @@ try:
     parser.add_argument("--max-artifact-bytes", type=int, default=4 * 1024 ** 3)
     parser.add_argument("--max-unpacked-bytes", type=int, default=4 * 1024 ** 3)
     parser.add_argument("--max-archive-members", type=int, default=10000)
+    parser.add_argument("--jobs", type=int, default=1, help="Concurrent artifact operations (1..32; default 1)")
     parser.add_argument("--dry-run", action="store_true", help="validate all inputs and print planned names without writing")
     parser.add_argument("--resume", action="store_true",
         help="resume a pinned interrupted recovery or revalidate completed output without rewriting it")
     flags = [a.split("=", 1)[0] for a in sys.argv[1:] if a.startswith("--")]
     need(len(flags) == len(set(flags)), "duplicate recovery option", 4)
     args = parser.parse_args(sys.argv[1:])
+    need(1 <= args.jobs <= 32, "jobs must be 1..32", 4)
     need(match(args.repo, r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and ".." not in args.repo and
          match(args.tag, r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
          match(args.sha, r"[0-9a-f]{40}") and args.sha != "0" * 40 and
@@ -668,9 +774,9 @@ try:
             need(path(str(stage)).is_dir(), "invalid retained recovery stage", 2)
         need({p.name for p in root.iterdir()} == allowed, "unexpected recovery workspace entry", 2)
     source_identity()
+    check_workers(workers)
     output_workers = {}
     for worker in workers:
-        worker["output_mode"] = check_artifact(worker)
         previous = output_workers.get(worker["name"])
         need(previous is None or previous["output_mode"] == worker["output_mode"],
              "shared companion executable modes differ", 4)
@@ -810,8 +916,7 @@ try:
                 documents[selected] = (data, save(selected, data, pending))
     # Recheck original custody and repository identity after copying. Never
     # repair a failed checkpoint by rehashing changed files into a new claim.
-    for worker in workers:
-        check_artifact(worker)
+    check_workers(workers)
     final_bytes, final_hash, final_info = read_file(state_path)
     need(final_bytes == state_bytes and final_hash == state_hash and identity(final_info) == identity(state_info),
          "build state changed during recovery", 2)
@@ -853,7 +958,7 @@ try:
     os.rename(stage, root / "release")
     sync_directory(root)
     print(canonical(result).decode(), end="")
-except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError, EOFError,
+except (Failure, OSError, ValueError, KeyError, TypeError, AttributeError, EOFError, RuntimeError,
         tarfile.TarError, zipfile.BadZipFile, lzma.LZMAError, zlib.error, struct.error, RecursionError) as error:
     code = error.code if isinstance(error, Failure) else 4
     print("[native-recovery] " + str(error), file=sys.stderr)
