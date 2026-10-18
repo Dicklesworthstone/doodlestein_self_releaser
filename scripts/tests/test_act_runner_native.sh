@@ -2180,7 +2180,7 @@ test_unix_strict_dependency_sources_final_gate() {
 }
 
 test_unix_strict_dependency_source_transport_size() {
-    log_test "Strict Unix Rust: source authentication keeps cached builds below command argument limits"
+    log_test "Strict Unix Rust: cached build commands stay within their transport limits"
     reset_state
     MOCK_LANGUAGE=rust
     MOCK_BUILD_CMD='cargo build --release'
@@ -2193,19 +2193,27 @@ test_unix_strict_dependency_source_transport_size() {
         /remote/source-transport/source 2>/dev/null) || status=$?
     command=$(cat "$SDK_COMMAND_FILE" 2>/dev/null)
     bytes=$(printf '%s' "$command" | wc -c | tr -d ' ')
-    # Linux permits at most 128 KiB in one exec argument. Exercise the actual
-    # generated text at that OS boundary, without pretending the mock compiler
+    # Linux permits at most 128 KiB in one exec argument. _act_ssh_exec sends
+    # programs above its argv bound on stdin (dsr-00n2; the transport itself is
+    # exercised by test_ssh_exec_large_program.sh). Check the actual generated
+    # text against the route it takes, without pretending the mock compiler
     # transport executes the Cargo/cache program itself.
-    if [[ "$status" -eq 0 && "$bytes" -gt 0 && "$bytes" -lt 131072 &&
+    local transport=argv transport_ok=false
+    if _act_unix_program_needs_stdin "$command"; then
+        transport=stdin
+        "$BASH" -n -s <<< $'{\n'"$command"$'\n} </dev/null' && transport_ok=true
+    elif [[ "$bytes" -lt 131072 ]] && "$BASH" -c 'test -n "$1"' source-transport "$command"; then
+        transport_ok=true
+    fi
+    if [[ "$status" -eq 0 && "$bytes" -gt 0 && "$transport_ok" == true &&
           "$command" == *'CARGO_BUILD_BUILD_DIR'* && "$command" == *'DSR_TOOLCHAIN_IDENTITY_PY'* &&
           "$command" != *'dsr_verified_sources='* ]] && \
-       "$BASH" -c 'test -n "$1"' source-transport "$command" && \
        jq -e '.status == "success" and
            .cargo_isolation.intermediate_cache.receipt.final_output_policy == "fresh-run-target-detached-under-custody"' \
            <<< "$result" >/dev/null; then
-        log_pass "Cached compiler request is $bytes bytes and passes the native exec argument boundary"
+        log_pass "Cached compiler request is $bytes bytes and reaches the host intact via $transport"
     else
-        log_fail "Cached compiler request exceeded or skipped its transport boundary: status=$status bytes=$bytes"
+        log_fail "Cached compiler request exceeded or skipped its transport boundary: status=$status bytes=$bytes transport=$transport"
     fi
 }
 

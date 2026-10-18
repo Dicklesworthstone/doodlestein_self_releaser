@@ -7212,6 +7212,9 @@ _act_ssh_exec() {
 
     if _act_is_windows_host "$host"; then
         cmd=$(_act_windows_storage_command "$host" "$cmd") || return 4
+    elif _act_unix_program_needs_stdin "$cmd"; then
+        _act_ssh_exec_unix_program "$host" "$cmd" "$timeout_sec"
+        return
     fi
 
     if _act_is_local_host "$host"; then
@@ -7225,6 +7228,44 @@ _act_ssh_exec() {
             -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new \
             "$ssh_destination" "$cmd"
+    fi
+}
+
+# Linux refuses any single exec argument of 128 KiB or more (MAX_ARG_STRLEN),
+# whatever ARG_MAX allows. Generated strict Cargo programs exceed that
+# (dsr-00n2), and the login shell's `-c` argument is one such string. Programs
+# of 64 KiB and up therefore travel on stdin; smaller commands keep argv.
+_ACT_UNIX_ARGV_PROGRAM_MAX_BYTES=65535
+
+_act_unix_program_needs_stdin() {
+    # Byte length without a subshell; the caller's locale returns on exit.
+    local LC_ALL=C
+    (( ${#1} > _ACT_UNIX_ARGV_PROGRAM_MAX_BYTES ))
+}
+
+# Run a Unix program read from stdin by the same interpreter that would have
+# run it from argv: the remote login shell (sshd runs `$SHELL -c`), or a local
+# login bash. The brace group makes the shell parse the whole program before
+# running any of it, so no command can consume program text, and the program
+# still sees /dev/null on stdin, as with `ssh -n`.
+_act_ssh_exec_unix_program() {
+    local host="$1" program="$2" timeout_sec="$3" wrapped
+    # The here-strings below supply the final newline.
+    printf -v wrapped '{\n%s\n} </dev/null' "$program"
+    if _act_is_local_host "$host"; then
+        _act_run_with_timeout "$timeout_sec" bash -l -s <<< "$wrapped"
+    else
+        local ssh_destination
+        ssh_destination=$(_act_get_ssh_destination "$host") || return 4
+        # Single-quoted on purpose: $SHELL expands on the remote host. -T keeps
+        # a configured RequestTTY from putting the program through a pty.
+        # shellcheck disable=SC2016
+        _act_run_with_timeout "$timeout_sec" ssh \
+            -T \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new \
+            "$ssh_destination" 'exec "$SHELL" -s' <<< "$wrapped"
     fi
 }
 
