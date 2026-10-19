@@ -10,8 +10,10 @@ done
 export DSR_TEST_DISK_BASH="$BASH"
 python3 - "$ROOT" "$@" <<'PY'
 import json
+import copy
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -237,7 +239,7 @@ class DiskFloor(unittest.TestCase):
     def test_default_writable_roles_are_complete_and_grouped_without_summing(self):
         result, value = self.default_probe()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(value['admission'], 'unix-writable-roles-v1')
+        self.assertEqual(value['admission'], 'unix-writable-roles-v2')
         self.assertEqual({r['role'] for r in value['roles']},
                          {'root', 'home', 'cargo_home', 'temp', 'build_root'})
         for role in value['roles']:
@@ -352,6 +354,248 @@ class DiskFloor(unittest.TestCase):
         self.assertEqual(old['status'], 'ok')
         self.assertEqual(new['status'], 'error')
         print('CONTROL: same 84% / 2427860 KiB root counts and genuine build-root df: incumbent ok, candidate error')
+
+
+class ApfsCapacity(unittest.TestCase):
+    """Real production parser/policy; diskutil observations are explicit data.
+
+    No fake macOS host, diskutil executable, subprocess response, or production
+    function is installed. The existing class covers actual Unix host probes.
+    """
+    @classmethod
+    def setUpClass(cls):
+        emit = subprocess.run([BASH, '-c',
+            'declare -A DSR_CONFIG=(); source "$1/src/logging.sh"; source "$2"; '
+            '_hh_unix_writable_probe_script', '_', str(ROOT), str(MODULE)],
+            capture_output=True, text=True, check=True, timeout=10)
+        cls.probe = {'__name__': 'dsr_probe_parser_test'}
+        exec(compile(emit.stdout, str(MODULE) + ':writable-probe', 'exec'), cls.probe)
+        (WORK / 'tested-probe.py').write_text(emit.stdout)
+
+    def setUp(self):
+        self.work = WORK / self.id().rsplit('.', 1)[-1]
+        self.work.mkdir()
+        self.document = {'Containers': [{
+            'ContainerReference': 'disk3',
+            'APFSContainerUUID': '11111111-2222-4333-8444-555555555555',
+            'CapacityCeiling': 500 * GIB, 'CapacityFree': 100 * GIB,
+            'Volumes': [dict(DeviceIdentifier='disk3s1', CapacityInUse=10 * GIB,
+                             CapacityQuota=0, CapacityReserve=0),
+                        dict(DeviceIdentifier='disk3s5', CapacityInUse=30 * GIB,
+                             CapacityQuota=0, CapacityReserve=0)]}]}
+        self.infos = {'10': dict(FilesystemType='apfs', DeviceIdentifier='disk3s1',
+                                APFSContainerReference='disk3'),
+                      '20': dict(FilesystemType='apfs', DeviceIdentifier='disk3s5',
+                                APFSContainerReference='disk3')}
+        self.rows = [dict(role=role, path='/fixture/' + role, probe_path='/fixture/' + role,
+                         filesystem_id=fs, usage_percent=80,
+                         available_bytes=100 * GIB, total_bytes=500 * GIB)
+                     for role, fs in [('root', '10'), ('home', '10'), ('cargo_home', '10'),
+                                      ('temp', '20'), ('build_root', '20')]]
+        self.sequence = 0
+
+    def bind(self, fmt=plistlib.FMT_XML):
+        data = plistlib.dumps(self.document, fmt=fmt)
+        inventory = self.probe['apfs_inventory'](data)
+        return self.probe['bind_apfs'](self.rows, self.infos, inventory)
+
+    def verdict(self, rows):
+        result = subprocess.run([BASH, '-c',
+            'declare -A DSR_CONFIG=(); source "$1/src/logging.sh"; source "$2"; '
+            '_hh_writable_storage_verdict', '_', str(ROOT), str(MODULE)],
+            input=json.dumps(dict(roles=rows)), text=True, capture_output=True, timeout=10)
+        self.sequence += 1
+        (self.work / f'{self.sequence}.stdout').write_text(result.stdout)
+        (self.work / f'{self.sequence}.stderr').write_text(result.stderr)
+        return result
+
+    def accepted(self, rows):
+        result = self.verdict(rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_apfs_distinct_volumes_share_one_pool_without_losing_roles(self):
+        value = self.accepted(self.bind())
+        self.assertEqual(value['status'], 'ok')
+        self.assertEqual(len(value['filesystems']), 2)
+        self.assertEqual(len(value['capacity_groups']), 1)
+        pool = value['capacity_groups'][0]
+        self.assertEqual(pool['filesystem_ids'], ['10', '20'])
+        self.assertEqual(sorted(pool['roles']), sorted(r['role'] for r in self.rows))
+        self.assertEqual(pool['available_bytes'], 100 * GIB)
+        self.assertEqual(pool['apfs_container']['available_bytes'], 100 * GIB)
+
+    def test_binary_and_xml_plists_produce_identical_evidence(self):
+        self.assertEqual(self.bind(plistlib.FMT_BINARY), self.bind())
+
+    def test_distinct_containers_never_share_capacity(self):
+        second = copy.deepcopy(self.document['Containers'][0])
+        second.update(ContainerReference='disk8', APFSContainerUUID='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+        second['Volumes'] = [dict(second['Volumes'][1], DeviceIdentifier='disk8s1')]
+        self.document['Containers'].append(second)
+        self.infos['20'].update(DeviceIdentifier='disk8s1', APFSContainerReference='disk8')
+        value = self.accepted(self.bind())
+        self.assertEqual(len(value['capacity_groups']), 2)
+
+    def test_reported_232_gib_container_cannot_be_offset_by_volume_counts(self):
+        self.document['Containers'][0]['CapacityFree'] = 2427860 * 1024
+        value = self.accepted(self.bind())
+        self.assertEqual(value['status'], 'error')
+        self.assertTrue(all(r['available_bytes'] == 2427860 * 1024 for r in value['roles']))
+        self.assertTrue(all(r['status'] == 'error' for r in value['roles']))
+
+    def test_volume_quota_is_independent_of_spacious_container(self):
+        self.document['Containers'][0]['Volumes'][1]['CapacityQuota'] = 31 * GIB
+        value = self.accepted(self.bind())
+        self.assertEqual(value['status'], 'error')
+        roles = {r['role']: r for r in value['roles']}
+        self.assertEqual(roles['home']['status'], 'ok')
+        self.assertEqual(roles['build_root']['available_bytes'], GIB)
+        self.assertEqual(roles['build_root']['apfs']['available_bytes'], 100 * GIB)
+
+    def test_exhausted_quota_reports_zero_not_negative_or_unlimited(self):
+        self.document['Containers'][0]['Volumes'][1]['CapacityQuota'] = 29 * GIB
+        value = self.accepted(self.bind())
+        self.assertEqual(next(r['available_bytes'] for r in value['roles'] if r['role'] == 'temp'), 0)
+
+    def test_smaller_statvfs_availability_is_preserved(self):
+        self.rows[1]['available_bytes'] = 2 * GIB
+        value = self.accepted(self.bind())
+        home = next(r for r in value['roles'] if r['role'] == 'home')
+        self.assertEqual(home['available_bytes'], 2 * GIB)
+        self.assertEqual(home['status'], 'error')
+
+    def test_container_percentage_cannot_be_hidden_by_volume_percentage(self):
+        self.document['Containers'][0].update(CapacityCeiling=1000 * GIB, CapacityFree=30 * GIB)
+        value = self.accepted(self.bind())
+        self.assertEqual(value['status'], 'error')
+        self.assertTrue(all(r['usage_percent'] == 97 for r in value['roles']))
+
+    def test_reserve_is_evidence_not_additional_free_space(self):
+        self.document['Containers'][0]['Volumes'][1]['CapacityReserve'] = 60 * GIB
+        rows = self.bind()
+        self.assertTrue(all(r['available_bytes'] == 100 * GIB for r in rows))
+        self.assertEqual(next(r['apfs']['reserve_bytes'] for r in rows if r['role'] == 'temp'), 60 * GIB)
+
+    def test_missing_selected_volume_or_container_refuses(self):
+        for key, value in [('DeviceIdentifier', 'disk3s99'), ('APFSContainerReference', 'disk9')]:
+            with self.subTest(key=key):
+                saved = copy.deepcopy(self.infos)
+                self.infos['20'][key] = value
+                with self.assertRaises(ValueError):
+                    self.bind()
+                self.infos = saved
+
+    def test_volume_in_wrong_container_refuses(self):
+        other = copy.deepcopy(self.document['Containers'][0])
+        other.update(ContainerReference='disk9', APFSContainerUUID='99999999-2222-4333-8444-555555555555', Volumes=[])
+        self.document['Containers'].append(other)
+        self.infos['20']['APFSContainerReference'] = 'disk9'
+        with self.assertRaises(ValueError):
+            self.bind()
+
+    def test_duplicate_container_reference_uuid_or_volume_refuses(self):
+        original = copy.deepcopy(self.document)
+        for duplicate in ('reference', 'uuid', 'volume'):
+            with self.subTest(duplicate=duplicate):
+                self.document = copy.deepcopy(original)
+                other = copy.deepcopy(self.document['Containers'][0])
+                if duplicate != 'reference':
+                    other['ContainerReference'] = 'disk8'
+                if duplicate != 'uuid':
+                    other['APFSContainerUUID'] = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+                if duplicate != 'volume':
+                    other['Volumes'] = []
+                self.document['Containers'].append(other)
+                with self.assertRaises(ValueError):
+                    self.bind()
+
+    def test_invalid_capacity_counts_fail_closed(self):
+        for field in ('CapacityCeiling', 'CapacityFree'):
+            for value in (True, -1, 2.5, '100', 9007199254740992):
+                with self.subTest(field=field, value=value):
+                    saved = self.document['Containers'][0][field]
+                    self.document['Containers'][0][field] = value
+                    with self.assertRaises(ValueError):
+                        self.bind()
+                    self.document['Containers'][0][field] = saved
+        self.document['Containers'][0]['CapacityCeiling'] = 0
+        with self.assertRaises(ValueError):
+            self.bind()
+
+    def test_missing_quota_metadata_is_not_an_unlimited_quota(self):
+        self.document['Containers'][0]['Volumes'][1].pop('CapacityQuota')
+        with self.assertRaises(KeyError):
+            self.bind()
+
+    def test_duplicate_plist_keys_refuse(self):
+        data = b'<?xml version="1.0"?><plist version="1.0"><dict><key>Containers</key><array/>' \
+               b'<key>Containers</key><array/></dict></plist>'
+        with self.assertRaises(ValueError):
+            self.probe['apfs_inventory'](data)
+
+    def test_malformed_or_missing_inventory_refuses(self):
+        for data in (b'', b'not a plist', plistlib.dumps({}), plistlib.dumps([])):
+            with self.subTest(data=data[:30]), self.assertRaises((ValueError, plistlib.InvalidFileException)):
+                self.probe['apfs_inventory'](data)
+
+    def test_parent_verifier_rejects_conflicting_pool_or_inflated_capacity(self):
+        for mutation in ('group', 'container', 'available', 'percent'):
+            with self.subTest(mutation=mutation):
+                rows = self.bind()
+                if mutation == 'group':
+                    rows[0]['capacity_group'] = 'filesystem:10'
+                elif mutation == 'container':
+                    rows[0]['apfs']['total_bytes'] += GIB
+                elif mutation == 'available':
+                    rows[0]['available_bytes'] += GIB
+                else:
+                    rows[0]['usage_percent'] = 0
+                result = self.verdict(rows)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+
+    def test_parent_verifier_refuses_partial_role_inventory(self):
+        result = self.verdict(self.bind()[:-1])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+    def test_non_apfs_filesystem_capacity_is_unchanged(self):
+        rows = self.probe['bind_apfs'](self.rows, {'10': dict(FilesystemType='hfs')}, ({}, {}))
+        for old, new in zip(self.rows, rows):
+            self.assertEqual({k: new[k] for k in old}, old)
+            self.assertNotIn('apfs', new)
+        self.assertEqual(len(self.accepted(rows)['capacity_groups']), 2)
+
+    @unittest.skipUnless(os.environ.get('DSR_TEST_APFS_BASELINE'), 'set DSR_TEST_APFS_BASELINE for actual prior policy')
+    def test_incumbent_has_no_quota_or_container_admission(self):
+        # Execute the unchanged prior pure jq verdict, extracted verbatim from
+        # its containing transport function; no OS probe is mocked. Both arms
+        # see the same explicit statvfs/volume/container observation fixture.
+        old = Path(os.environ['DSR_TEST_APFS_BASELINE']).read_text()
+        start = old.index('    if ! jq -ces --argjson minimum "$_HH_DISK_MIN_FREE_BYTES"')
+        end = old.index("    ' <<< \"$result\"; then", start)
+        expression = old[start + len('    if ! '):end] + "    '"
+        run = subprocess.run([BASH, '-c',
+            '_HH_DISK_MIN_FREE_BYTES=21474836480; _HH_DISK_WARN_THRESHOLD=90; '
+            '_HH_DISK_ERROR_THRESHOLD=95; ' + expression], input=json.dumps(dict(roles=self.rows)),
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)['status'], 'ok')
+        self.document['Containers'][0]['Volumes'][1]['CapacityQuota'] = 31 * GIB
+        current = self.accepted(self.bind())
+        self.assertEqual(current['status'], 'error')
+        self.assertEqual(len(json.loads(run.stdout)['filesystems']), 2)
+        self.assertEqual(len(current['capacity_groups']), 1)
+        (self.work / 'incumbent.stdout').write_text(run.stdout)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'native diskutil/APFS observation requires macOS')
+    def test_native_macos_probe(self):
+        row = self.probe['observe']('home', os.environ['HOME'])
+        rows = self.probe['macos_capacities']([row])
+        self.assertEqual(len(rows), 1)
+        self.assertLessEqual(rows[0]['available_bytes'], row['available_bytes'])
+        self.assertIn('capacity_group', rows[0])
 
 
 unittest.main(verbosity=2)

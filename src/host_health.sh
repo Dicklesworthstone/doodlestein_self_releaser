@@ -394,7 +394,7 @@ _hh_admission_fingerprint() {
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v3",host:$host,policy:{
+        '{schema:"dsr-host-admission-v4",host:$host,policy:{
             disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -627,7 +627,145 @@ _hh_unix_writable_probe_script() {
     cat <<'DSR_WRITABLE_PROBE'
 import json
 import os
+import plistlib
+import re
+import subprocess
 import sys
+import time
+import uuid
+
+MAX_BYTES = 9007199254740991
+
+def whole(value, positive=False):
+    if type(value) is not int or not int(positive) <= value <= MAX_BYTES:
+        raise ValueError('invalid APFS byte count')
+    return value
+
+def device(value):
+    if not isinstance(value, str) or not re.fullmatch(r'disk[0-9]+(?:s[0-9]+)*', value):
+        raise ValueError('invalid APFS device identity')
+    return value
+
+def identifier(value):
+    if not isinstance(value, str):
+        raise ValueError('invalid APFS container UUID')
+    parsed = uuid.UUID(value)
+    if parsed.int == 0 or str(parsed) != value.lower():
+        raise ValueError('invalid APFS container UUID')
+    return str(parsed)
+
+class UniqueDict(dict):
+    def __setitem__(self, key, value):
+        if key in self:
+            raise ValueError('duplicate diskutil plist key')
+        super().__setitem__(key, value)
+
+def plist(data):
+    if not 0 < len(data) <= 16 * 1024 * 1024:
+        raise ValueError('missing or excessive diskutil plist')
+    result = plistlib.loads(data, dict_type=UniqueDict)
+    if not isinstance(result, dict):
+        raise ValueError('diskutil plist must be a dictionary')
+    return result
+
+def apfs_inventory(data):
+    """Read one authoritative container observation, never sum volume free space."""
+    values = plist(data).get('Containers')
+    if not isinstance(values, list):
+        raise ValueError('missing APFS container inventory')
+    containers, volumes, uuids = {}, {}, set()
+    for value in values:
+        ref = device(value['ContainerReference'])
+        uid = identifier(value['APFSContainerUUID'])
+        total, available = whole(value['CapacityCeiling'], True), whole(value['CapacityFree'])
+        if ref in containers or uid in uuids or available > total:
+            raise ValueError('duplicate or inconsistent APFS container')
+        containers[ref] = dict(container_id=ref, container_uuid=uid,
+                               available_bytes=available, total_bytes=total)
+        uuids.add(uid)
+        if not isinstance(value['Volumes'], list):
+            raise ValueError('missing APFS volume inventory')
+        for volume in value['Volumes']:
+            volume_id = device(volume['DeviceIdentifier'])
+            used = whole(volume['CapacityInUse'])
+            quota = whole(volume['CapacityQuota'])
+            reserve = whole(volume['CapacityReserve'])
+            if volume_id in volumes or used > total or reserve > total or (quota and reserve > quota):
+                raise ValueError('duplicate or inconsistent APFS volume')
+            volumes[volume_id] = dict(container_id=ref, used_bytes=used,
+                                      quota_bytes=quota, reserve_bytes=reserve)
+    return containers, volumes
+
+def bind_apfs(rows, infos, inventory):
+    containers, volumes = inventory
+    result = []
+    for original in rows:
+        row = dict(original)
+        row['capacity_group'] = 'filesystem:' + row['filesystem_id']
+        info = infos.get(row['filesystem_id'])
+        if info is not None:
+            if not isinstance(info, dict) or not isinstance(info.get('FilesystemType'), str):
+                raise ValueError('missing disk filesystem identity')
+            if info['FilesystemType'].lower() == 'apfs':
+                volume_id = device(info['DeviceIdentifier'])
+                ref = device(info['APFSContainerReference'])
+                volume, container = volumes.get(volume_id), containers.get(ref)
+                if volume is None or container is None or volume['container_id'] != ref:
+                    raise ValueError('APFS volume is absent from its selected container')
+                available = min(row['available_bytes'], container['available_bytes'])
+                total = min(row['total_bytes'], container['total_bytes'])
+                quota = volume['quota_bytes']
+                if quota:
+                    available = min(available, max(0, quota - volume['used_bytes']))
+                    total = min(total, quota)
+                row['filesystem_available_bytes'] = row['available_bytes']
+                row['filesystem_total_bytes'] = row['total_bytes']
+                row['available_bytes'], row['total_bytes'] = available, total
+                row['usage_percent'] = max(row['usage_percent'],
+                    ((total - available) * 100 + total - 1) // total,
+                    ((container['total_bytes'] - container['available_bytes']) * 100 +
+                     container['total_bytes'] - 1) // container['total_bytes'])
+                row['capacity_group'] = 'apfs:' + container['container_uuid']
+                row['apfs'] = dict(container, volume_id=volume_id, **{
+                    key: volume[key] for key in ('used_bytes', 'quota_bytes', 'reserve_bytes')})
+        result.append(row)
+    return result
+
+def macos_capacities(rows):
+    # The host's native diskutil is read-only here. Bound the whole metadata
+    # phase, not one full timeout per role. No shell parsing or PATH-selected
+    # replacement tool participates in selecting devices or containers.
+    deadline = time.monotonic() + 20
+    def read(*arguments):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError('APFS metadata deadline exceeded')
+        return subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              check=True, timeout=remaining, env=dict(os.environ, LC_ALL='C')).stdout
+    infos = {}
+    for row in rows:
+        fsid = row['filesystem_id']
+        if fsid in infos:
+            continue
+        # df identifies the mounted device even for Data-volume firmlinks
+        # (e.g. /Users); diskutil takes that device, not an arbitrary subfolder.
+        lines = read('/bin/df', '-Pk', row['probe_path']).decode('utf-8').splitlines()
+        if len(lines) != 2 or len(lines[1].split()) < 6:
+            raise ValueError('ambiguous macOS filesystem observation')
+        mounted = lines[1].split()[0]
+        if not mounted.startswith('/dev/'):
+            infos[fsid] = None  # Network filesystems retain their statvfs limit.
+            continue
+        selected = device(mounted[5:])
+        info = plist(read('/usr/sbin/diskutil', 'info', '-plist', mounted))
+        if info.get('DeviceIdentifier') != selected:
+            raise ValueError('mounted device changed during diskutil observation')
+        infos[fsid] = info
+    inventory = ({}, {})
+    if any(info is not None and str(info.get('FilesystemType', '')).lower() == 'apfs'
+           for info in infos.values()):
+        inventory = apfs_inventory(read('/usr/sbin/diskutil', 'apfs', 'list', '-plist'))
+    return bind_apfs(rows, infos, inventory)
 
 def safe_path(value):
     if not isinstance(value, str) or not value.startswith('/') or any(ord(c) < 32 or ord(c) == 127 for c in value):
@@ -656,7 +794,7 @@ def observe(role, selected, allow_missing=False):
                 filesystem_id=str(os.stat(actual).st_dev), usage_percent=used,
                 available_bytes=available, total_bytes=total)
 
-try:
+def main():
     home = safe_path(os.environ.get('HOME'))
     cargo = os.environ.get('CARGO_HOME')
     temp = os.environ.get('TMPDIR') or '/tmp'
@@ -668,10 +806,19 @@ try:
     target = os.environ.get('CARGO_TARGET_DIR')
     if target:
         rows.append(observe('cargo_target', target))
+    rows = macos_capacities(rows) if sys.platform == 'darwin' else bind_apfs(rows, {}, ({}, {}))
+    for row in rows:
+        if str(os.stat(row['probe_path']).st_dev) != row['filesystem_id']:
+            raise ValueError('writable filesystem changed during capacity observation')
     print(json.dumps(dict(roles=rows), sort_keys=True, separators=(',', ':')))
-except (OSError, ValueError, TypeError, IndexError) as error:
-    print('writable storage probe: ' + str(error), file=sys.stderr)
-    sys.exit(1)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, TypeError, IndexError, KeyError, AttributeError,
+            plistlib.InvalidFileException, subprocess.SubprocessError) as error:
+        print('writable storage probe: ' + str(error), file=sys.stderr)
+        sys.exit(1)
 DSR_WRITABLE_PROBE
 }
 
@@ -696,41 +843,76 @@ _hh_default_unix_storage_admission() {
     script="python3 -I - '$build_root' <<'DSR_UNIX_WRITABLE_PY'"$'\n'
     script+="$(_hh_unix_writable_probe_script)"$'\nDSR_UNIX_WRITABLE_PY'
     if ! result=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" "$script"); then
-        echo '{"path":"writable-storage","status":"error","error":"Required writable storage probe failed (Python 3, directory, or filesystem unavailable)"}'
+        echo '{"path":"writable-storage","status":"error","error":"Required writable storage probe failed (Python 3, native diskutil, directory, or filesystem unavailable)"}'
         return 1
     fi
-    if ! jq -ces --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
+    if ! _hh_writable_storage_verdict <<< "$result"; then
+        echo '{"path":"writable-storage","status":"error","error":"Invalid writable storage inventory or free-space policy"}'
+        return 1
+    fi
+}
+
+# Pure admission of the complete probe result. Capacity groups preserve the
+# distinction between filesystem IDs and APFS containers shared by volumes.
+_hh_writable_storage_verdict() {
+    jq -ces --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
             --argjson warning "$_HH_DISK_WARN_THRESHOLD" --argjson critical "$_HH_DISK_ERROR_THRESHOLD" '
         def whole: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
         def path: type == "string" and startswith("/") and (test("[\\x00-\\x1f\\x7f]")|not);
-        if length != 1 or ($minimum|whole|not) or $minimum == 0 then error("invalid probe/policy") else .[0] end |
+        def apfs:
+            (.container_id|type == "string" and test("^disk[0-9]+$")) and
+            (.container_uuid|type == "string" and test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")) and
+            (.volume_id|type == "string" and test("^disk[0-9]+(s[0-9]+)+$")) and
+            (.available_bytes|whole) and (.total_bytes|whole) and
+            .total_bytes > 0 and .available_bytes <= .total_bytes and
+            (.used_bytes|whole) and (.quota_bytes|whole) and (.reserve_bytes|whole);
+        if length != 1 or ($minimum|whole|not) or $minimum == 0 or
+           ($warning|whole|not) or ($critical|whole|not) or
+           $warning > $critical or $critical > 100
+        then error("invalid probe/policy") else .[0] end |
         if (.roles|type != "array") or
            ((.roles|map(.role)|sort) != ["build_root","cargo_home","home","root","temp"] and
             (.roles|map(.role)|sort) != ["build_root","cargo_home","cargo_target","home","root","temp"]) or
            (all(.roles[]; (.path|path) and (.probe_path|path) and
                 (.filesystem_id|type == "string" and test("^[0-9]+$")) and
+                (if has("apfs") then (.apfs|apfs) and
+                     .capacity_group == ("apfs:" + .apfs.container_uuid) and
+                     .available_bytes <= .apfs.available_bytes and
+                     (.filesystem_available_bytes|whole) and (.filesystem_total_bytes|whole) and
+                     .available_bytes <= .filesystem_available_bytes and
+                     .usage_percent >= (((.apfs.total_bytes - .apfs.available_bytes) * 100 / .apfs.total_bytes)|ceil) and
+                     (if .apfs.quota_bytes > 0 then
+                        .available_bytes <= ([0, .apfs.quota_bytes - .apfs.used_bytes]|max)
+                      else true end)
+                 else .capacity_group == ("filesystem:" + .filesystem_id) end) and
                 (.usage_percent|whole) and .usage_percent <= 100 and
                 (.available_bytes|whole) and (.total_bytes|whole) and
                 .total_bytes > 0 and .available_bytes <= .total_bytes)|not)
         then error("incomplete writable role inventory") else . end |
+        if (all(.roles|group_by(.capacity_group)[];
+                (map(.apfs | if . == null then null else
+                    {container_id,container_uuid,available_bytes,total_bytes} end)|unique|length) == 1)|not)
+        then error("conflicting shared capacity observations") else . end |
         .roles |= map(. + {min_free_bytes:$minimum,
             available_gb:((.available_bytes/1073741824*100|floor)/100),
             status:(if .available_bytes < $minimum or .usage_percent > $critical then "error"
                     elif .usage_percent > $warning then "warning" else "ok" end)}) |
         .roles as $roles | ($roles|map(select(.role == "root"))[0]) as $root |
         {path:$root.path,usage_percent:$root.usage_percent,available_bytes:$root.available_bytes,
-         available_gb:$root.available_gb,min_free_bytes:$minimum,admission:"unix-writable-roles-v1",roles:$roles,
+         available_gb:$root.available_gb,min_free_bytes:$minimum,admission:"unix-writable-roles-v2",roles:$roles,
          filesystems:($roles|group_by(.filesystem_id)|map({filesystem_id:.[0].filesystem_id,
              roles:map(.role),paths:map(.probe_path)|unique,available_bytes:(map(.available_bytes)|min)})),
+         capacity_groups:($roles|group_by(.capacity_group)|map({id:.[0].capacity_group,
+             filesystem_ids:map(.filesystem_id)|unique,roles:map(.role),paths:map(.probe_path)|unique,
+             available_bytes:(map(.available_bytes)|min),
+             apfs_container:(if .[0].apfs != null then .[0].apfs |
+                 {container_id,container_uuid,available_bytes,total_bytes} else null end)})),
          status:(if any($roles[];.status == "error") then "error"
                  elif any($roles[];.status == "warning") then "warning" else "ok" end)} |
         if .status == "error" then . + {error:("Writable storage pressure: " +
             ($roles|map(select(.status == "error")|(.role + " " + .path + " (" +
                 (.available_gb|tostring) + " GiB free, " + (.usage_percent|tostring) + "% used)"))|join("; ")))} else . end
-    ' <<< "$result"; then
-        echo '{"path":"writable-storage","status":"error","error":"Invalid writable storage inventory or free-space policy"}'
-        return 1
-    fi
+    '
 }
 
 _hh_check_disk_space() {
@@ -850,7 +1032,7 @@ _hh_check_disk_space() {
 # same filesystem. The explicit split contract retains its original report.
 _hh_split_storage_lines() {
     jq -r '.checks.disk_space |
-        if .admission == "unix-writable-roles-v1" then
+        if .admission == "unix-writable-roles-v1" or .admission == "unix-writable-roles-v2" then
             .roles[] | "\(.role) \(.path) \(.usage_percent)% used, \(.available_gb) GiB free: \(.status)"
         elif .admission == "unix-split-storage-v1" then
         ("root / \(.root.usage_percent)% used, \(.root.available_gb) GB free: \(.root.admitted_as)" +

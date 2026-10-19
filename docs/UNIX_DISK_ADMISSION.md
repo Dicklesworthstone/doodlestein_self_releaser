@@ -40,8 +40,9 @@ and total byte counts, effective usage, free-byte floor, and verdict. Every role
 must pass. Tight internal Cargo or temporary storage cannot hide behind a healthy
 external build root, and a tight external build root cannot hide behind `/`.
 Shared filesystem identifiers are grouped without summing their free bytes;
-role attribution remains complete. Warnings name all observed roles, and errors
-identify the failing locations.
+role attribution remains complete. Separate `capacity_groups` additionally
+group APFS volumes by container UUID, even when their filesystem identifiers
+differ. Warnings name all observed roles, and errors identify failing locations.
 
 The remote probe uses isolated Python 3 and `statvfs` in the receiving host's
 environment. Available bytes use `f_bavail`, not privileged/reserved free space.
@@ -64,10 +65,10 @@ reader when available. Prior root-only cached admissions are invalidated.
 Default locations are host-level observations, not per-project command-environment
 resolution. An explicit `unix_storage` contract retains its existing root and
 build-root role policy with the corrected floors; it does not gain automatic
-ambient-role discovery in this increment. Distinct APFS volumes sharing one
-container are not yet grouped by container identity. Their capacities are never
-summed, but full APFS-container inventory and a fresh native macOS acceptance run
-remain follow-up work under issue #46. Do not treat a cached health observation as a disk reservation,
+ambient-role discovery in this increment. Default macOS probes now bind selected
+APFS volumes to their container identities and capacity/volume-quota observations
+as described below. A fresh native macOS acceptance run remains required under
+issue #46. Do not treat a cached health observation as a disk reservation,
 per-build capacity estimate, or a substitute for the independent SBH/native
 release gates. No storage is cleaned, reconfigured, or automatically expanded.
 
@@ -91,3 +92,51 @@ Set `DSR_TEST_DISK_BASELINE` to the unchanged prior `host_health.sh` to compare 
 same supplied root counts and real build-root `df` in one invocation. The prior
 split checker admits the 2.32 GiB root; the new checker refuses it. No network,
 compiler, signing, or release upload is required. Tests retain their evidence.
+
+## APFS shared containers and volume limits
+
+On macOS, the default writable-role probe uses `/bin/df -Pk` to identify each
+selected path's mounted device, including paths reached through Data-volume
+firmlinks. It calls the system `/usr/sbin/diskutil info -plist` once per observed
+filesystem and obtains one `diskutil apfs list -plist` container inventory when
+any selected volume is APFS. These are read-only commands; no volume is created,
+mounted, resized, cleaned or reserved. The metadata phase has a shared 20-second
+deadline inside the existing host-probe timeout.
+
+Each selected APFS volume must occur in its claimed container. The result retains
+the container reference and UUID, volume device, raw container capacity, volume
+usage, quota, and reservation. Effective available bytes are the **minimum** of
+the original `statvfs` availability, container free capacity, and remaining volume
+quota when nonzero. Reservations are evidence, not extra free bytes. Neither
+purgeable space nor another volume's reservation is added to available capacity.
+The effective usage percentage is at least the filesystem, container and
+quota-limited percentage. This can strengthen admission, never make a tighter
+filesystem limit disappear.
+
+`filesystems` retains the individual filesystem observations. `capacity_groups`
+groups shared containers without summing capacity; `apfs_container` records the
+raw shared pool, while the group's `available_bytes` is the minimum effective
+availability of its selected roles. A volume quota may therefore make that
+group's effective availability lower than the container's raw free space. All
+original role paths and filesystem identifiers remain visible. Non-APFS and
+network filesystems retain their `statvfs` limits and filesystem-based groups.
+
+Missing, duplicate, contradictory or malformed required plist fields refuse
+admission. Invalid counts, absent selected volumes and unresolvable disk devices
+cannot fall back to a percentage-only result. A selected read-only APFS snapshot
+not present in the volume inventory is unsupported and refused. Receipt profile
+`unix-writable-roles-v2` and the new host-admission fingerprint prevent reuse of
+the older, container-unaware admission result.
+
+The existing test script now includes production plist parsing and full verdict
+tests using explicit XML/binary plist observations, shared-container and quota
+counterexamples, and Linux filesystem controls. `DSR_TEST_APFS_BASELINE` selects
+the unchanged prior module for a same-invocation comparison of its actual jq
+admission policy. Those fixture tests are **not native APFS proof**. The native
+`diskutil` observation test runs only on macOS and skips elsewhere; no fake
+`diskutil` or replaced production function is used.
+
+The capacity model follows [Apple's APFS space-sharing and size-limit
+documentation](https://support.apple.com/guide/disk-utility/dskua9e6a110/mac).
+The plist container/volume vocabulary is also used by the
+[Asahi installer diskutil integration](https://github.com/AsahiLinux/asahi-installer/blob/main/src/diskutil.py).
