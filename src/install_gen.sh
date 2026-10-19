@@ -22,7 +22,7 @@ _IG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if ! declare -f log_info &>/dev/null; then
     # Try to source logging from dsr's src directory
     if [[ -f "$_IG_SCRIPT_DIR/logging.sh" ]]; then
-        # shellcheck source=/dev/null
+        # shellcheck source=SCRIPTDIR/logging.sh
         source "$_IG_SCRIPT_DIR/logging.sh"
     else
         # Fallback minimal logging
@@ -2299,7 +2299,7 @@ _install_gen_contract_model() (
     config_dir=$(cd "$(dirname "$config_file")/.." && pwd) || return 3
     local DSR_CONFIG_DIR="$config_dir" DSR_REPOS_FILE=''
     if ! declare -F config_get_release_contract_targets_json >/dev/null; then
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$_IG_SCRIPT_DIR/config.sh" || return 3
     fi
     export DSR_REPOS_FILE=''
@@ -2312,7 +2312,7 @@ _install_gen_contract_model() (
     rows=$(config_get_release_contract_targets_json "$config_tool") || return 4
     document=$(yq -o=json -I=0 '.' "$config_file") || return 4
     if ! declare -F _an_default_target_triple >/dev/null; then
-        # shellcheck source=./artifact_naming.sh
+        # shellcheck source=SCRIPTDIR/artifact_naming.sh
         source "$_IG_SCRIPT_DIR/artifact_naming.sh" || return 3
     fi
     while IFS= read -r row; do
@@ -2409,7 +2409,7 @@ install_gen_create() {
     # Embed the source engine as code, but source-selection fields as validated
     # literals. Failure must precede creation or replacement of any installer.
     [[ -f "$_IG_SCRIPT_DIR/install_source.sh" && ! -L "$_IG_SCRIPT_DIR/install_source.sh" ]] || return 3
-    # shellcheck source=./install_source.sh
+    # shellcheck source=SCRIPTDIR/install_source.sh
     source "$_IG_SCRIPT_DIR/install_source.sh" || return 3
     source_engine=$(cat "$_IG_SCRIPT_DIR/install_source.sh") || return 3
     [[ -n "$source_engine" && "$language" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] || return 4
@@ -2442,7 +2442,7 @@ install_gen_create() {
     if [[ -z "$artifact_naming" && -n "$local_path" && -n "$workflow_path" ]]; then
         if ! declare -F artifact_naming_parse_workflow &>/dev/null; then
             if [[ -f "$_IG_SCRIPT_DIR/artifact_naming.sh" ]]; then
-                # shellcheck source=/dev/null
+                # shellcheck source=SCRIPTDIR/artifact_naming.sh
                 source "$_IG_SCRIPT_DIR/artifact_naming.sh" 2>/dev/null || true
             fi
         fi
@@ -2460,7 +2460,7 @@ install_gen_create() {
     # Fallback: GoReleaser config if workflow doesn't yield a pattern
     if [[ -z "$artifact_naming" && -n "$local_path" && -f "$_IG_SCRIPT_DIR/artifact_naming.sh" ]]; then
         if ! declare -F artifact_naming_parse_goreleaser &>/dev/null; then
-            # shellcheck source=/dev/null
+            # shellcheck source=SCRIPTDIR/artifact_naming.sh
             source "$_IG_SCRIPT_DIR/artifact_naming.sh" 2>/dev/null || true
         fi
 
@@ -2491,7 +2491,7 @@ install_gen_create() {
     local arch_alias_cases=""
     if command -v yq &>/dev/null; then
         if ! declare -F config_validate_target_triples &>/dev/null; then
-            # shellcheck source=./config.sh
+            # shellcheck source=SCRIPTDIR/config.sh
             source "$_IG_SCRIPT_DIR/config.sh" || return 3
         fi
         # The generator may prefer a repository-local config. Validate that

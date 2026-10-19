@@ -502,7 +502,7 @@ _upgrade_tool_binary_name() {
     if ! declare -F config_get_tool_field &>/dev/null; then
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$script_dir/config.sh" 2>/dev/null || true
     fi
 

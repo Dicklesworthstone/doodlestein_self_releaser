@@ -2912,6 +2912,7 @@ _act_get_host_field() {
 
 _act_windows_storage_config() {
     if ! declare -F config_windows_storage_json >/dev/null; then
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh"
     fi
     config_windows_storage_json "$1"
@@ -2924,6 +2925,7 @@ _act_windows_storage_command() {
     [[ $status -eq 0 ]] || return 4
     # A command substitution cannot import functions into its parent shell.
     if ! declare -F config_windows_storage_session_script >/dev/null; then
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh"
     fi
     initializer=$(config_windows_storage_session_script "$host") || return 4
@@ -9661,6 +9663,7 @@ EOF
         [[ $windows_storage_status -eq 0 || $windows_storage_status -eq 1 ]] || return 4
         if [[ $windows_storage_status -eq 0 ]]; then
             if ! declare -F config_windows_storage_lock_script >/dev/null; then
+                # shellcheck source=SCRIPTDIR/config.sh
                 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh"
             fi
             windows_lock_script=$(config_windows_storage_lock_script "$host") || return 4
@@ -10324,7 +10327,7 @@ EOF
             if ! declare -F artifact_naming_generate_dual_for_tool &>/dev/null; then
                 local script_dir
                 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-                # shellcheck source=/dev/null
+                # shellcheck source=SCRIPTDIR/artifact_naming.sh
                 source "$script_dir/artifact_naming.sh" 2>/dev/null || true
             fi
 
@@ -12595,7 +12598,7 @@ _act_native_variant_artifact_name() {
     [[ -n "$triple" ]] || { printf '%s\n' "$name"; return 0; }
     if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
         module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 4
-        # shellcheck source=./artifact_naming.sh
+        # shellcheck source=SCRIPTDIR/artifact_naming.sh
         source "$module_dir/artifact_naming.sh" || return 4
     fi
     configured=$(config_get_target_triples_json "$tool" "$platform") || return 4
@@ -13100,7 +13103,7 @@ act_generate_manifest() {
     local manifest_module_dir
     manifest_module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 3
     if ! declare -F config_get_release_contract_json &>/dev/null; then
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$manifest_module_dir/config.sh" || return 3
     fi
     local release_contract_json="null"
@@ -13114,7 +13117,7 @@ act_generate_manifest() {
     config_validate_target_triples "$tool" || return 4
     _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
     if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
-        # shellcheck source=./artifact_naming.sh
+        # shellcheck source=SCRIPTDIR/artifact_naming.sh
         source "$manifest_module_dir/artifact_naming.sh" || return 3
     fi
     if ! _act_build_purpose_matches "$result_json" release false || \
