@@ -311,6 +311,7 @@ _HH_CACHE_TTL=300  # 5 minutes
 # Thresholds
 _HH_DISK_WARN_THRESHOLD=90   # Warn if disk usage > 90%
 _HH_DISK_ERROR_THRESHOLD=95  # Error if disk usage > 95%
+_HH_DISK_MIN_FREE_BYTES=21474836480  # 20 GiB, independently of usage percent
 _HH_CLOCK_DRIFT_WARN=30      # Warn if clock drift > 30 seconds
 _HH_SSH_TIMEOUT=10           # SSH connect timeout (seconds)
 _HH_CMD_TIMEOUT=30           # Command execution timeout (seconds)
@@ -382,11 +383,13 @@ _hh_admission_fingerprint() {
     contract=$(jq -ncS --argjson host "$host_config" \
         --arg disk_warn "$_HH_DISK_WARN_THRESHOLD" \
         --arg disk_error "$_HH_DISK_ERROR_THRESHOLD" \
+        --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v1",host:$host,policy:{
+        '{schema:"dsr-host-admission-v2",host:$host,policy:{
             disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
+            disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
     if command -v sha256sum >/dev/null 2>&1; then
         digest=$(printf '%s\n' "$contract" | sha256sum) || return 3
@@ -586,6 +589,29 @@ _hh_windows_storage_command() {
 
 # Check disk space
 # Returns: JSON object { "path": str, "usage_percent": int, "available_gb": float, "status": str }
+# Classify raw counts, never rounded GiB. APFS can report a modest usage
+# percentage for the sealed System volume while its shared container is full.
+# Bound decimal input before Bash arithmetic so malformed probes cannot wrap
+# integers or be interpreted as shell arithmetic expressions.
+_hh_disk_status() {
+    local usage="${1:-}" available_kb="${2:-}" minimum_bytes="${3:-}"
+    [[ "$usage" =~ ^[0-9]{1,3}$ && "$available_kb" =~ ^[0-9]{1,13}$ &&
+       "$minimum_bytes" =~ ^[0-9]{1,16}$ ]] || return 4
+    usage=$((10#$usage))
+    available_kb=$((10#$available_kb))
+    minimum_bytes=$((10#$minimum_bytes))
+    [[ $usage -le 100 && $available_kb -le 8796093022207 &&
+       $minimum_bytes -gt 0 && $minimum_bytes -le 9007199254740991 ]] || return 4
+    if (( available_kb < (minimum_bytes + 1023) / 1024 ||
+          usage > _HH_DISK_ERROR_THRESHOLD )); then
+        printf 'error\n'
+    elif (( usage > _HH_DISK_WARN_THRESHOLD )); then
+        printf 'warning\n'
+    else
+        printf 'ok\n'
+    fi
+}
+
 _hh_check_disk_space() {
     local hostname="$1"
     local connection="$2"
@@ -652,13 +678,15 @@ _hh_check_disk_space() {
     read -r usage_token available_kb extra <<< "$df_output"
     usage_percent="${usage_token%\%}"
 
-    if [[ -n "${extra:-}" || ! "$usage_percent" =~ ^[0-9]{1,3}$ || ! "$available_kb" =~ ^[0-9]+$ ]]; then
+    if [[ -n "${extra:-}" || ! "$usage_percent" =~ ^[0-9]{1,3}$ ||
+          ! "$available_kb" =~ ^[0-9]{1,13}$ ]]; then
         echo '{"path": "/", "usage_percent": null, "available_gb": null, "status": "error", "error": "Invalid disk info"}'
         return 1
     fi
 
     usage_percent=$((10#$usage_percent))
-    if [[ $usage_percent -gt 100 ]]; then
+    available_kb=$((10#$available_kb))
+    if [[ $usage_percent -gt 100 || $available_kb -gt 8796093022207 ]]; then
         echo '{"path": "/", "usage_percent": null, "available_gb": null, "status": "error", "error": "Invalid disk info"}'
         return 1
     fi
@@ -687,7 +715,17 @@ _hh_check_disk_space() {
         fi
     fi
 
-    echo "{\"path\": \"/\", \"usage_percent\": $usage_percent, \"available_gb\": $available_gb, \"status\": \"$status\"}"
+    if [[ "$platform" != windows/* ]]; then
+        status=$(_hh_disk_status "$usage_percent" "$available_kb" "$_HH_DISK_MIN_FREE_BYTES") || return 1
+        jq -nc --argjson usage "$usage_percent" --argjson kb "$available_kb" \
+            --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" --arg status "$status" \
+            '{path:"/",usage_percent:$usage,available_bytes:($kb*1024),
+              available_gb:(($kb/1048576*100|floor)/100),min_free_bytes:$minimum,status:$status} +
+             (if $kb*1024 < $minimum then
+                {error:"Available disk space is below the required 20 GiB floor"} else {} end)'
+    else
+        echo "{\"path\": \"/\", \"usage_percent\": $usage_percent, \"available_gb\": $available_gb, \"status\": \"$status\"}"
+    fi
 }
 
 # One line per volume for a unix-split-storage-v1 disk verdict (#38), so the
@@ -695,13 +733,17 @@ _hh_check_disk_space() {
 _hh_split_storage_lines() {
     jq -r '.checks.disk_space | select(.admission == "unix-split-storage-v1") |
         ("root / \(.root.usage_percent)% used, \(.root.available_gb) GB free: \(.root.admitted_as)" +
-            (if .root.status != .root.admitted_as then " (above its \(.root.min_free_bytes / 1073741824 | floor) GiB free floor)" else "" end)),
-        "build root \(.build_root.path) \(.build_root.usage_percent)% used, \(.build_root.available_gb) GB free: \(.build_root.status)"' \
+            (if .root.admitted_as == "warning" and .root.status == "error" then " (above its \(.root.min_free_bytes / 1073741824 | floor) GiB free floor)"
+             elif (.root.available_bytes // (.root.available_gb * 1073741824)) < .root.min_free_bytes then " (below its free-space floor)" else "" end)),
+        ("build root \(.build_root.path) \(.build_root.usage_percent)% used, \(.build_root.available_gb) GB free: \(.build_root.status)" +
+            (if .build_root.available_bytes != null and .build_root.available_bytes < .build_root.min_free_bytes
+             then " (below its free-space floor)" else "" end))' \
         <<< "$1" 2>/dev/null || true
 }
 
-# Unix split storage (#38): the build root is admitted by the usual
-# percentages. The root filesystem keeps its own verdict, except that above
+# Unix split storage (#38): the build root requires both the usual
+# percentages and the default absolute floor. Root requires its configured
+# absolute floor regardless of percentage. It keeps its own verdict, except that above
 # the error percentage it is admitted as a warning while its free space meets
 # the contract's floor. Root pressure is reported, never hidden.
 _hh_unix_split_storage_admission() {
@@ -722,7 +764,7 @@ _hh_unix_split_storage_admission() {
         build_usage="${build_usage%\%}"
     fi
     if [[ $df_status -ne 0 || -n "$extra" || ! "$build_usage" =~ ^[0-9]{1,3}$ ||
-          ! "$build_available_kb" =~ ^[0-9]+$ || $((10#$build_usage)) -gt 100 ]]; then
+          ! "$build_available_kb" =~ ^[0-9]{1,13}$ || $((10#$build_usage)) -gt 100 ]]; then
         jq -nc --arg build_root "$build_root" \
             '{path: "/", usage_percent: null, available_gb: null, status: "error",
               admission: "unix-split-storage-v1",
@@ -730,16 +772,21 @@ _hh_unix_split_storage_admission() {
         return 1
     fi
     build_usage=$((10#$build_usage))
+    build_available_kb=$((10#$build_available_kb))
 
-    local build_status="ok"
-    if [[ $build_usage -gt $_HH_DISK_ERROR_THRESHOLD ]]; then
-        build_status="error"
-    elif [[ $build_usage -gt $_HH_DISK_WARN_THRESHOLD ]]; then
-        build_status="warning"
-    fi
+    local build_status
+    build_status=$(_hh_disk_status "$build_usage" "$build_available_kb" "$_HH_DISK_MIN_FREE_BYTES") || {
+        echo '{"path":"/","status":"error","error":"Invalid build-root disk metrics"}'
+        return 1
+    }
 
-    local root_admitted="$root_status"
-    if [[ "$root_status" == "error" ]] && (( root_available_kb * 1024 >= min_free_bytes )); then
+    local root_admitted
+    root_admitted=$(_hh_disk_status "$root_usage" "$root_available_kb" "$min_free_bytes") || {
+        echo '{"path":"/","status":"error","error":"Invalid root disk metrics or free-space floor"}'
+        return 1
+    }
+    min_free_bytes=$((10#$min_free_bytes))
+    if [[ "$root_admitted" == "error" ]] && (( 10#$root_available_kb * 1024 >= min_free_bytes )); then
         root_admitted="warning"
     fi
 
@@ -760,14 +807,17 @@ _hh_unix_split_storage_admission() {
         --argjson build_usage "$build_usage" \
         --argjson build_kb "$build_available_kb" \
         --arg build_status "$build_status" \
+        --argjson build_min_free "$_HH_DISK_MIN_FREE_BYTES" \
         --arg overall "$overall" \
         'def gb: (. / 1048576 * 100 | floor) / 100;
          {path: "/", usage_percent: $root_usage, available_gb: ($root_kb | gb), status: $overall,
           admission: "unix-split-storage-v1",
           root: {path: "/", usage_percent: $root_usage, available_gb: ($root_kb | gb),
+                 available_bytes: ($root_kb*1024),
                  status: $root_status, admitted_as: $root_admitted, min_free_bytes: $min_free},
           build_root: {path: $build_root, usage_percent: $build_usage,
-                       available_gb: ($build_kb | gb), status: $build_status}}'
+                       available_gb: ($build_kb | gb), available_bytes: ($build_kb*1024),
+                       min_free_bytes: $build_min_free, status: $build_status}}'
 }
 
 # Check toolchain availability
@@ -1026,9 +1076,17 @@ host_health_check() {
     # Only continue with other checks if host is reachable
     if echo "$connectivity" | jq -e '.reachable' &>/dev/null; then
         # 2. Check disk space (pass platform for Windows compatibility)
-        disk_space=$(_hh_check_disk_space "$hostname" "$connection" "$ssh_host" "$platform")
-        local disk_status
-        disk_status=$(echo "$disk_space" | jq -r '.status')
+        local disk_status disk_exit=0
+        disk_space=$(_hh_check_disk_space "$hostname" "$connection" "$ssh_host" "$platform") || disk_exit=$?
+        if ! disk_status=$(jq -ers 'if length == 1 and (.[0] | type == "object" and
+                (.status == "ok" or .status == "warning" or .status == "error"))
+            then .[0].status else error("invalid disk result") end' <<< "$disk_space" 2>/dev/null); then
+            disk_space='{"status":"error","error":"Disk probe returned no valid verdict"}'
+            disk_status=error
+        elif [[ $disk_exit -ne 0 && "$disk_status" != error ]]; then
+            disk_space='{"status":"error","error":"Disk probe failed without an error verdict"}'
+            disk_status=error
+        fi
         [[ "$disk_status" == "error" ]] && overall_status="error" && ((errors++))
         [[ "$disk_status" == "warning" ]] && [[ "$overall_status" != "error" ]] && overall_status="warning" && ((warnings++))
 
@@ -1170,7 +1228,10 @@ _hh_print_result() {
             [[ "$reachable" == "false" ]] && \
                 _hh_log_error "  - Host unreachable"
             if [[ "$disk_status" == "error" ]]; then
-                if [[ "$disk_usage" == "null" ]]; then
+                disk_error=$(echo "$result" | jq -r '.checks.disk_space.error // empty')
+                if [[ -n "$disk_error" ]]; then
+                    _hh_log_error "  - $disk_error"
+                elif [[ "$disk_usage" == "null" ]]; then
                     disk_error=$(echo "$result" | jq -r '.checks.disk_space.error // "Disk check failed"')
                     _hh_log_error "  - $disk_error"
                 else
