@@ -1,0 +1,103 @@
+# Validate the reviewed transport patch without changing branches or releases.
+name: Windows rsync receiver prefix regression
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/windows-rsync-prefix-regression.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: windows-rsync-prefix-regression
+  cancel-in-progress: false
+jobs:
+  validate:
+    if: github.repository == 'Dicklesworthstone/doodlestein_self_releaser'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Require reviewed native runner and documentation preimages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object src/act_runner.sh)" = 91edae7e523e3b812b333447df1ec308f5e0e151
+          test "$(git hash-object docs/ACT_SETUP.md)" = 33db189c1e5fb4603db9fc356d960f0b191c988f
+          test ! -e scripts/tests/test_windows_rsync_paths.sh
+          cp src/act_runner.sh "$RUNNER_TEMP/act_runner.incumbent.sh"
+      - name: Install real configuration and lint dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3-yaml shellcheck
+          mkdir -p "$RUNNER_TEMP/rsync-test-bin"
+          curl --fail --location --retry 2 --max-time 120 \
+            https://github.com/mikefarah/yq/releases/download/v4.50.1/yq_linux_amd64 \
+            -o "$RUNNER_TEMP/rsync-test-bin/yq"
+          echo "c7a1278e6bbc4924f41b56db838086c39d13ee25dcb22089e7fbf16ac901f0d4  $RUNNER_TEMP/rsync-test-bin/yq" | sha256sum --check
+          chmod 755 "$RUNNER_TEMP/rsync-test-bin/yq"
+          echo "$RUNNER_TEMP/rsync-test-bin" >> "$GITHUB_PATH"
+      - name: Apply exact reviewed implementation and regression patch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/windows-rsync.patch.gz"
+          for blob in 699c3b4ec2f15b4f36301f5ea9fc8e46cfe0236c 3c7e241cb7c2881d0289b5bf7384c62ad69fe660 97014c675ea88ae27dd3dfae8a81f3d0b5d03152 e712671f9dfba6110cb4a6edf5f54aad56948e37; do
+            gh api "repos/$GITHUB_REPOSITORY/git/blobs/$blob" --jq .content | base64 --decode > "$RUNNER_TEMP/patch-part"
+            test "$(git hash-object "$RUNNER_TEMP/patch-part")" = "$blob"
+            cat "$RUNNER_TEMP/patch-part" >> "$RUNNER_TEMP/windows-rsync.patch.gz"
+          done
+          gzip --decompress --stdout "$RUNNER_TEMP/windows-rsync.patch.gz" > "$RUNNER_TEMP/windows-rsync.patch"
+          echo "e4a1340ec887f2166051c7a48cc80d23b5cf403d21b07462f8b6b7e31a004190  $RUNNER_TEMP/windows-rsync.patch" | sha256sum --check
+          test "$(wc -c < "$RUNNER_TEMP/windows-rsync.patch")" -eq 21355
+          git apply --check "$RUNNER_TEMP/windows-rsync.patch"
+          git apply "$RUNNER_TEMP/windows-rsync.patch"
+          git diff --check
+      - name: Exercise production path conversion and real YAML admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          yq --version
+          bash -n src/act_runner.sh
+          bash -n scripts/tests/test_windows_rsync_paths.sh
+          bash -c 'source src/act_runner.sh'
+          shellcheck -S warning scripts/tests/test_windows_rsync_paths.sh
+          DSR_TEST_RSYNC_BASELINE="$RUNNER_TEMP/act_runner.incumbent.sh" \
+            bash scripts/tests/test_windows_rsync_paths.sh 2>&1 | tee "$RUNNER_TEMP/windows-rsync-tests.log"
+      - name: Prepare tested source objects without changing a branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git diff --check
+          test "$(git diff --name-only)" = "$(printf '%s\n' docs/ACT_SETUP.md src/act_runner.sh)"
+          test "$(git ls-files --others --exclude-standard)" = scripts/tests/test_windows_rsync_paths.sh
+          source_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@src/act_runner.sh --jq .sha)
+          test_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@scripts/tests/test_windows_rsync_paths.sh --jq .sha)
+          docs_blob=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/blobs" -f encoding=utf-8 -F content=@docs/ACT_SETUP.md --jq .sha)
+          test "$source_blob" = "$(git hash-object src/act_runner.sh)"
+          test "$test_blob" = "$(git hash-object scripts/tests/test_windows_rsync_paths.sh)"
+          test "$docs_blob" = "$(git hash-object docs/ACT_SETUP.md)"
+          printf 'DSR_RSYNC_TESTED_PARENT %s\n' "$(git rev-parse HEAD)"
+          printf 'DSR_RSYNC_TESTED_SOURCE %s\n' "$source_blob"
+          printf 'DSR_RSYNC_TESTED_TESTS %s\n' "$test_blob"
+          printf 'DSR_RSYNC_TESTED_DOCS %s\n' "$docs_blob"
+      - name: Retain exact checkout and test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-rsync-prefix-evidence
+          include-hidden-files: true
+          path: |
+            src/
+            dsr
+            docs/ACT_SETUP.md
+            scripts/tests/test_windows_rsync_paths.sh
+            ${{ runner.temp }}/windows-rsync-tests.log
+            ${{ runner.temp }}/windows-rsync.patch
