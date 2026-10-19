@@ -64,8 +64,8 @@ reader when available. Prior root-only cached admissions are invalidated.
 
 Default locations are host-level observations, not per-project command-environment
 resolution. An explicit `unix_storage` contract retains its existing root and
-build-root role policy with the corrected floors; it does not gain automatic
-ambient-role discovery in this increment. Default macOS probes now bind selected
+build-root checks and also requires the complete writable-role inspection
+described below. Default and split-storage macOS probes now bind selected
 APFS volumes to their container identities and capacity/volume-quota observations
 as described below. A fresh native macOS acceptance run remains required under
 issue #46. Do not treat a cached health observation as a disk reservation,
@@ -140,3 +140,48 @@ The capacity model follows [Apple's APFS space-sharing and size-limit
 documentation](https://support.apple.com/guide/disk-utility/dskua9e6a110/mac).
 The plist container/volume vocabulary is also used by the
 [Asahi installer diskutil integration](https://github.com/AsahiLinux/asahi-installer/blob/main/src/diskutil.py).
+
+## Complete admission for explicit split storage
+
+Configuring `unix_storage` no longer bypasses the Cargo-home, temporary-directory,
+home, Cargo-target or APFS-container/volume-quota checks. The split path retains
+its original root and build-root `df` decisions, then requires the same complete
+receiving-host inspection used by default admission. The overall status is the
+most restrictive of the original decisions and the complete role verdict.
+Failure of the additional probe refuses admission, not a fallback to two paths.
+
+The contract's `root_min_free_bytes` and high-percentage warning allowance apply
+to root and ambient roles sharing its observed capacity group. This means the
+same filesystem on ordinary Unix storage, or the same independently identified
+APFS container on macOS. Every such role must still satisfy the configured byte
+floor using its own effective availability, including its volume quota. A root
+allowance never rescues an exhausted quota or applies to another capacity pool.
+
+**Build-root and explicit Cargo-target roles always require the normal 20 GiB
+floor and 90/95-percent policy**, even if they share root's storage. Ambient roles
+on another pool use that normal policy too. This preserves usable split layouts
+with a spacious external build drive and an explicitly admitted internal root,
+without letting an unrelated tight temporary or Cargo filesystem disappear.
+
+The `unix-split-storage-v2` result retains the original `df` observations under
+`root` and `build_root`; `roles` contains the subsequent complete observations
+and APFS-effective metrics. `filesystems` and `capacity_groups` retain their
+individual identities. `unix_storage_contract` records the selected contract.
+Each role records `capacity_policy`, `min_free_bytes`, `pressure_status` before
+the explicit percentage allowance, and final `status`. Human diagnostics show
+both original observations and every role, including probe-failure reasons.
+The new host-admission fingerprint invalidates earlier two-path cached verdicts.
+
+Explicit split probing now needs Python 3 and the same native macOS metadata
+tools as the default path. All probes remain read-only, with the existing helper
+deadlines. They are sequential observations, not an atomic capacity reservation.
+No directory is created, storage cleaned, gate disabled or limit reduced.
+
+The existing test script includes actual low-capacity `/dev/shm` observations
+for split temp/Cargo/target roles and production policy tests with explicit APFS
+plist observations. Set `DSR_TEST_SPLIT_BASELINE` to the unchanged pre-change
+`host_health.sh`: in the same invocation the old split checker admits each
+low-capacity ambient role while the candidate refuses it. Healthy split controls,
+same-pool allowances, independent build limits and per-volume quotas remain
+covered. Sourceable helper testing does not by itself qualify the complete
+configuration/yq, monolithic CLI, live SSH or native macOS paths.

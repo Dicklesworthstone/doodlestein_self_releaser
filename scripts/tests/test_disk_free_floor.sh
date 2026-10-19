@@ -355,6 +355,98 @@ class DiskFloor(unittest.TestCase):
         self.assertEqual(new['status'], 'error')
         print('CONTROL: same 84% / 2427860 KiB root counts and genuine build-root df: incumbent ok, candidate error')
 
+    def test_split_inspects_all_ambient_roles_on_actual_small_filesystem(self):
+        self.require_room()
+        small = self.small_filesystem()
+        baseline = os.environ.get('DSR_TEST_SPLIT_BASELINE')
+        for variable, role in [('TMPDIR', 'temp'), ('CARGO_HOME', 'cargo_home'),
+                               ('CARGO_TARGET_DIR', 'cargo_target')]:
+            with self.subTest(role=role):
+                self.env[variable] = str(small)
+                if baseline:
+                    prior = self.split(10, FLOOR_KB * 3, 'ok', module=Path(baseline))
+                    self.assertEqual(prior['status'], 'ok')
+                value = self.split(10, FLOOR_KB * 3, 'ok')
+                self.assertEqual(value['status'], 'error')
+                self.assertEqual(value['admission'], 'unix-split-storage-v2')
+                self.assertEqual(value['root']['admitted_as'], 'ok')
+                self.assertEqual(value['build_root']['status'], 'ok')
+                selected = next(r for r in value['roles'] if r['role'] == role)
+                self.assertEqual(selected['status'], 'error')
+                self.assertEqual(selected['path'], str(small))
+                self.assertEqual(selected['capacity_policy'], 'build-default')
+                self.assertEqual(selected['min_free_bytes'], MINIMUM)
+                self.env.pop(variable)
+        if baseline:
+            print('CONTROL: unchanged split checker admits real low-capacity temp/Cargo/target; current refuses each')
+
+    def test_split_retains_full_inventory_and_original_disk_observations(self):
+        value = self.split(10, FLOOR_KB * 3, 'ok')
+        self.assertEqual(value['admission'], 'unix-split-storage-v2')
+        self.assertEqual({r['role'] for r in value['roles']},
+                         {'root', 'home', 'cargo_home', 'temp', 'build_root'})
+        self.assertEqual(value['root']['available_bytes'], FLOOR_KB * 3 * 1024)
+        self.assertEqual(value['unix_storage_contract']['build_root'], str(self.work))
+        self.assertTrue(value['capacity_groups'])
+        self.assertTrue(value['filesystems'])
+
+    def test_split_missing_ambient_role_fails_without_creating_it(self):
+        missing = self.work / 'not-created'
+        self.env['CARGO_HOME'] = str(missing)
+        storage = json.dumps(dict(build_root=str(self.work), root_min_free_bytes=MINIMUM))
+        result = self.call('_hh_unix_split_storage_admission', 'localtest', 'local', '',
+                           storage, 10, FLOOR_KB * 3, 'ok', setup=':')
+        self.assertEqual(result.returncode, 1)
+        value = json.loads(result.stdout)
+        self.assertEqual(value['status'], 'error')
+        self.assertEqual(value['admission'], 'unix-split-storage-v2')
+        self.assertIn('probe_error', value)
+        self.assertFalse(missing.exists())
+
+    def test_split_invalid_contract_cannot_interpolate_a_command(self):
+        marker = self.work / 'must-not-exist'
+        for storage in [dict(build_root=f"/tmp'; touch {marker}; #", root_min_free_bytes=MINIMUM),
+                        dict(build_root=str(self.work), root_min_free_bytes=True),
+                        dict(build_root=str(self.work), root_min_free_bytes=0),
+                        dict(build_root=str(self.work), root_min_free_bytes=MINIMUM, unexpected=True)]:
+            with self.subTest(storage=storage):
+                result = self.call('_hh_unix_split_storage_admission', 'localtest', 'local', '',
+                                   json.dumps(storage), 10, FLOOR_KB * 3, 'ok', setup=':')
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(json.loads(result.stdout)['status'], 'error')
+        self.assertFalse(marker.exists())
+
+    def test_split_human_report_names_ambient_failure_and_original_pressure(self):
+        self.env['TMPDIR'] = str(self.small_filesystem())
+        value = self.split(10, FLOOR_KB * 3, 'ok')
+        report = dict(status='error', healthy=False, platform='linux/amd64', checks=dict(
+            connectivity=dict(reachable=True), disk_space=value, toolchains={}))
+        result = self.call('_hh_print_result', 'localtest', json.dumps(report), setup=':')
+        for text in ['initial root', 'initial build root', 'temp /dev/shm', 'cargo_home', 'error']:
+            self.assertIn(text, result.stderr)
+
+    def test_split_failure_human_report_preserves_missing_probe_reason(self):
+        self.env['CARGO_HOME'] = str(self.work / 'missing')
+        storage = json.dumps(dict(build_root=str(self.work), root_min_free_bytes=MINIMUM))
+        result = self.call('_hh_unix_split_storage_admission', 'localtest', 'local', '',
+                           storage, 10, FLOOR_KB * 3, 'ok', setup=':')
+        self.assertEqual(result.returncode, 1)
+        report = dict(status='error', healthy=False, platform='linux/amd64', checks=dict(
+            connectivity=dict(reachable=True), disk_space=json.loads(result.stdout), toolchains={}))
+        human = self.call('_hh_print_result', 'localtest', json.dumps(report), setup=':')
+        self.assertIn('Required complete writable-storage inspection failed', human.stderr)
+
+    @unittest.skipUnless(os.environ.get('DSR_TEST_SPLIT_BASELINE'), 'set DSR_TEST_SPLIT_BASELINE for prior cache policy')
+    def test_split_role_policy_invalidates_the_previous_cache_fingerprint(self):
+        config = json.dumps(dict(platform='linux/amd64', connection='local', build_root=str(self.work),
+                                 unix_storage=dict(root_min_free_bytes=MINIMUM)))
+        old = self.call('_hh_admission_fingerprint', config,
+                        module=Path(os.environ['DSR_TEST_SPLIT_BASELINE']), setup=':')
+        current = self.call('_hh_admission_fingerprint', config, setup=':')
+        self.assertEqual(old.returncode, 0)
+        self.assertEqual(current.returncode, 0)
+        self.assertNotEqual(old.stdout, current.stdout)
+
 
 class ApfsCapacity(unittest.TestCase):
     """Real production parser/policy; diskutil observations are explicit data.
@@ -399,18 +491,18 @@ class ApfsCapacity(unittest.TestCase):
         inventory = self.probe['apfs_inventory'](data)
         return self.probe['bind_apfs'](self.rows, self.infos, inventory)
 
-    def verdict(self, rows):
+    def verdict(self, rows, storage=None):
         result = subprocess.run([BASH, '-c',
             'declare -A DSR_CONFIG=(); source "$1/src/logging.sh"; source "$2"; '
-            '_hh_writable_storage_verdict', '_', str(ROOT), str(MODULE)],
+            '_hh_writable_storage_verdict "$3"', '_', str(ROOT), str(MODULE), json.dumps(storage)],
             input=json.dumps(dict(roles=rows)), text=True, capture_output=True, timeout=10)
         self.sequence += 1
         (self.work / f'{self.sequence}.stdout').write_text(result.stdout)
         (self.work / f'{self.sequence}.stderr').write_text(result.stderr)
         return result
 
-    def accepted(self, rows):
-        result = self.verdict(rows)
+    def accepted(self, rows, storage=None):
+        result = self.verdict(rows, storage)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
@@ -566,6 +658,79 @@ class ApfsCapacity(unittest.TestCase):
             self.assertEqual({k: new[k] for k in old}, old)
             self.assertNotIn('apfs', new)
         self.assertEqual(len(self.accepted(rows)['capacity_groups']), 2)
+
+    def split_policy(self):
+        return dict(build_root='/fixture/build_root', root_min_free_bytes=10 * GIB)
+
+    def test_split_root_pool_allowance_keeps_healthy_external_builds_usable(self):
+        self.rows[-1]['filesystem_id'] = '30'  # Independently spacious build storage.
+        self.document['Containers'][0]['CapacityFree'] = 15 * GIB
+        rows = self.bind()
+        self.assertEqual(self.accepted(rows)['status'], 'error')  # No implicit relaxation.
+        value = self.accepted(rows, self.split_policy())
+        self.assertEqual(value['status'], 'warning')
+        self.assertEqual(len(value['capacity_groups']), 2)
+        for role in value['roles']:
+            if role['role'] == 'build_root':
+                self.assertEqual(role['status'], 'ok')
+                self.assertEqual(role['min_free_bytes'], MINIMUM)
+            else:
+                self.assertEqual(role['capacity_policy'], 'split-root')
+                self.assertEqual(role['status'], 'warning')
+                self.assertEqual(role['pressure_status'], 'error')
+                self.assertEqual(role['min_free_bytes'], 10 * GIB)
+
+    def test_split_external_temp_cannot_borrow_the_root_allowance(self):
+        self.rows[-1]['filesystem_id'] = '30'
+        self.rows[-2].update(filesystem_id='40', available_bytes=15 * GIB, usage_percent=97)
+        value = self.accepted(self.bind(), self.split_policy())
+        role = next(r for r in value['roles'] if r['role'] == 'temp')
+        self.assertEqual(role['capacity_policy'], 'build-default')
+        self.assertEqual(role['status'], 'error')
+        self.assertEqual(role['min_free_bytes'], MINIMUM)
+        self.assertEqual(value['status'], 'error')
+
+    def test_split_build_and_target_never_inherit_the_root_allowance(self):
+        self.document['Containers'][0]['CapacityFree'] = 15 * GIB
+        self.rows.append(dict(self.rows[0], role='cargo_target', path='/fixture/target'))
+        value = self.accepted(self.bind(), self.split_policy())
+        for role in value['roles']:
+            if role['role'] in ('build_root', 'cargo_target'):
+                self.assertEqual(role['capacity_policy'], 'build-default')
+                self.assertEqual(role['status'], 'error')
+                self.assertEqual(role['min_free_bytes'], MINIMUM)
+        self.assertEqual(value['status'], 'error')
+
+    def test_split_volume_quota_still_limits_same_container_ambient_roles(self):
+        self.document['Containers'][0]['Volumes'][1]['CapacityQuota'] = 31 * GIB
+        value = self.accepted(self.bind(), self.split_policy())
+        role = next(r for r in value['roles'] if r['role'] == 'temp')
+        self.assertEqual(role['capacity_policy'], 'split-root')
+        self.assertEqual(role['available_bytes'], GIB)
+        self.assertEqual(role['status'], 'error')
+        self.assertEqual(value['status'], 'error')
+
+    def test_split_root_floor_refuses_low_capacity_despite_percentage_exception(self):
+        self.rows[-1]['filesystem_id'] = '30'
+        self.document['Containers'][0]['CapacityFree'] = 9 * GIB
+        value = self.accepted(self.bind(), self.split_policy())
+        self.assertEqual(value['status'], 'error')
+        self.assertTrue(all(r['status'] == 'error' for r in value['roles'] if r['role'] != 'build_root'))
+
+    def test_split_contract_must_match_exact_observed_build_root(self):
+        result = self.verdict(self.bind(), dict(self.split_policy(), build_root='/another/location'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+    def test_split_malformed_policy_cannot_disable_role_admission(self):
+        for value in [False, {}, [], dict(self.split_policy(), root_min_free_bytes=True),
+                      dict(self.split_policy(), root_min_free_bytes=0),
+                      dict(self.split_policy(), root_min_free_bytes=9007199254740992),
+                      dict(self.split_policy(), unexpected=True)]:
+            with self.subTest(value=value):
+                result = self.verdict(self.bind(), value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
 
     @unittest.skipUnless(os.environ.get('DSR_TEST_APFS_BASELINE'), 'set DSR_TEST_APFS_BASELINE for actual prior policy')
     def test_incumbent_has_no_quota_or_container_admission(self):

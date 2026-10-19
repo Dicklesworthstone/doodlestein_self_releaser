@@ -394,7 +394,7 @@ _hh_admission_fingerprint() {
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v4",host:$host,policy:{
+        '{schema:"dsr-host-admission-v5",host:$host,policy:{
             disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -824,6 +824,7 @@ DSR_WRITABLE_PROBE
 
 _hh_default_unix_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" host_config="${4:-}"
+    local split_storage="${5-null}"
     local config_status=0 build_root script result
     if [[ -z "$host_config" ]]; then
         host_config=$(_hh_get_host_config "$hostname") || config_status=$?
@@ -846,7 +847,7 @@ _hh_default_unix_storage_admission() {
         echo '{"path":"writable-storage","status":"error","error":"Required writable storage probe failed (Python 3, native diskutil, directory, or filesystem unavailable)"}'
         return 1
     fi
-    if ! _hh_writable_storage_verdict <<< "$result"; then
+    if ! _hh_writable_storage_verdict "$split_storage" <<< "$result"; then
         echo '{"path":"writable-storage","status":"error","error":"Invalid writable storage inventory or free-space policy"}'
         return 1
     fi
@@ -855,7 +856,8 @@ _hh_default_unix_storage_admission() {
 # Pure admission of the complete probe result. Capacity groups preserve the
 # distinction between filesystem IDs and APFS containers shared by volumes.
 _hh_writable_storage_verdict() {
-    jq -ces --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
+    local split_storage="${1-null}"
+    jq -ces --argjson split "$split_storage" --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
             --argjson warning "$_HH_DISK_WARN_THRESHOLD" --argjson critical "$_HH_DISK_ERROR_THRESHOLD" '
         def whole: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
         def path: type == "string" and startswith("/") and (test("[\\x00-\\x1f\\x7f]")|not);
@@ -893,13 +895,30 @@ _hh_writable_storage_verdict() {
                 (map(.apfs | if . == null then null else
                     {container_id,container_uuid,available_bytes,total_bytes} end)|unique|length) == 1)|not)
         then error("conflicting shared capacity observations") else . end |
-        .roles |= map(. + {min_free_bytes:$minimum,
+        if $split != null and (($split | type) != "object" or
+             ($split | keys | sort) != ["build_root","root_min_free_bytes"] or
+             ($split.root_min_free_bytes | whole | not) or $split.root_min_free_bytes < 1073741824 or
+             ($split.build_root | path | not) or
+             ([.roles[] | select(.role == "build_root") | .path] != [$split.build_root]))
+        then error("invalid or mismatched split-storage contract") else . end |
+        (.roles | map(select(.role == "root"))[0].capacity_group) as $root_group |
+        .roles |= map(
+            ($split != null and .capacity_group == $root_group and
+             .role != "build_root" and .role != "cargo_target") as $root_policy |
+            (if $root_policy then $split.root_min_free_bytes else $minimum end) as $floor |
+            . + {min_free_bytes:$floor,
             available_gb:((.available_bytes/1073741824*100|floor)/100),
-            status:(if .available_bytes < $minimum or .usage_percent > $critical then "error"
-                    elif .usage_percent > $warning then "warning" else "ok" end)}) |
+            status:(if .available_bytes < $floor or .usage_percent > $critical then "error"
+                    elif .usage_percent > $warning then "warning" else "ok" end)} |
+            if $split == null then . else
+                . + {pressure_status:.status,
+                     capacity_policy:(if $root_policy then "split-root" else "build-default" end)} |
+                if $root_policy and .status == "error" and .available_bytes >= $floor
+                then .status = "warning" else . end
+            end) |
         .roles as $roles | ($roles|map(select(.role == "root"))[0]) as $root |
         {path:$root.path,usage_percent:$root.usage_percent,available_bytes:$root.available_bytes,
-         available_gb:$root.available_gb,min_free_bytes:$minimum,admission:"unix-writable-roles-v2",roles:$roles,
+         available_gb:$root.available_gb,min_free_bytes:$root.min_free_bytes,admission:"unix-writable-roles-v2",roles:$roles,
          filesystems:($roles|group_by(.filesystem_id)|map({filesystem_id:.[0].filesystem_id,
              roles:map(.role),paths:map(.probe_path)|unique,available_bytes:(map(.available_bytes)|min)})),
          capacity_groups:($roles|group_by(.capacity_group)|map({id:.[0].capacity_group,
@@ -1032,7 +1051,13 @@ _hh_check_disk_space() {
 # same filesystem. The explicit split contract retains its original report.
 _hh_split_storage_lines() {
     jq -r '.checks.disk_space |
-        if .admission == "unix-writable-roles-v1" or .admission == "unix-writable-roles-v2" then
+        if .admission == "unix-split-storage-v2" then
+            "initial root \(.root.path) \(.root.usage_percent)% used, \(.root.available_gb) GiB free: \(.root.admitted_as)",
+            "initial build root \(.build_root.path) \(.build_root.usage_percent)% used, \(.build_root.available_gb) GiB free: \(.build_root.status)",
+            (.roles[] | "\(.role) \(.path) \(.usage_percent)% used, \(.available_gb) GiB free: \(.status)" +
+                (if .pressure_status != .status then " (split-root free-space allowance)" else "" end)),
+            (if .probe_error != null then "writable storage: \(.probe_error)" else empty end)
+        elif .admission == "unix-writable-roles-v1" or .admission == "unix-writable-roles-v2" then
             .roles[] | "\(.role) \(.path) \(.usage_percent)% used, \(.available_gb) GiB free: \(.status)"
         elif .admission == "unix-split-storage-v1" then
         ("root / \(.root.usage_percent)% used, \(.root.available_gb) GB free: \(.root.admitted_as)" +
@@ -1054,6 +1079,20 @@ _hh_unix_split_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" storage="$4"
     local root_usage="$5" root_available_kb="$6" root_status="$7"
     local build_root min_free_bytes df_output df_status=0
+    # Validate before either remote command. Sourceable callers must not be
+    # able to interpolate an unchecked build path into the retained df probe.
+    storage=$(jq -ces '
+        if length == 1 then .[0] else error("expected one storage contract") end |
+        if type == "object" and (keys | sort) == ["build_root","root_min_free_bytes"] and
+            (.build_root | type == "string" and test("^/[A-Za-z0-9._/-]+$") and
+                (test("(^|/)\\.\\.?(/|$)|//") | not) and . != "/") and
+            (.root_min_free_bytes | type == "number" and . == floor and
+                . >= 1073741824 and . <= 9007199254740991)
+        then . else error("invalid split-storage contract") end
+    ' <<< "$storage" 2>/dev/null) || {
+        echo '{"path":"/","status":"error","error":"Invalid Unix split-storage contract"}'
+        return 1
+    }
     build_root=$(jq -r '.build_root' <<< "$storage") || return 1
     min_free_bytes=$(jq -r '.root_min_free_bytes' <<< "$storage") || return 1
 
@@ -1101,7 +1140,8 @@ _hh_unix_split_storage_admission() {
         overall="warning"
     fi
 
-    jq -nc \
+    local summary role_config writable writable_status=0
+    summary=$(jq -nc \
         --argjson root_usage "$root_usage" \
         --argjson root_kb "$root_available_kb" \
         --arg root_status "$root_status" \
@@ -1121,7 +1161,31 @@ _hh_unix_split_storage_admission() {
                  status: $root_status, admitted_as: $root_admitted, min_free_bytes: $min_free},
           build_root: {path: $build_root, usage_percent: $build_usage,
                        available_gb: ($build_kb | gb), available_bytes: ($build_kb*1024),
-                       min_free_bytes: $build_min_free, status: $build_status}}'
+                       min_free_bytes: $build_min_free, status: $build_status}}') || return 1
+
+    # A split contract is not permission to omit ambient Cargo/temp storage or
+    # APFS quotas. Keep BOTH original df decisions, then strengthen them with
+    # the complete receiving-host observation used by the default path.
+    role_config=$(jq -c '{build_root}' <<< "$storage") || return 1
+    writable=$(_hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" \
+        "$role_config" "$storage") || writable_status=$?
+    if [[ $writable_status -ne 0 ]]; then
+        jq -nc --argjson summary "$summary" \
+            '$summary + {admission:"unix-split-storage-v2",status:"error",roles:[],
+             probe_error:"Required complete writable-storage inspection failed",
+             error:"Required complete writable-storage inspection failed"}'
+        return 1
+    fi
+    jq -ce --argjson summary "$summary" --argjson storage "$storage" '
+        . + {admission:"unix-split-storage-v2",unix_storage_contract:$storage,
+             root:$summary.root,build_root:$summary.build_root} |
+        .status = (if .status == "error" or $summary.status == "error" then "error"
+                   elif .status == "warning" or $summary.status == "warning" then "warning"
+                   else "ok" end) |
+        if .status == "error" and .error == null
+        then .error = "Initial split-storage root/build-root capacity admission failed"
+        else . end
+    ' <<< "$writable"
 }
 
 # Check toolchain availability
@@ -1533,19 +1597,18 @@ _hh_print_result() {
                 _hh_log_error "  - Host unreachable"
             if [[ "$disk_status" == "error" ]]; then
                 disk_error=$(echo "$result" | jq -r '.checks.disk_space.error // empty')
-                if [[ -n "$disk_error" ]]; then
+                local split_lines split_line
+                split_lines=$(_hh_split_storage_lines "$result")
+                if [[ -n "$split_lines" ]]; then
+                    [[ -z "$disk_error" ]] || _hh_log_error "  - $disk_error"
+                    while IFS= read -r split_line; do _hh_log_error "  - $split_line"; done <<< "$split_lines"
+                elif [[ -n "$disk_error" ]]; then
                     _hh_log_error "  - $disk_error"
                 elif [[ "$disk_usage" == "null" ]]; then
                     disk_error=$(echo "$result" | jq -r '.checks.disk_space.error // "Disk check failed"')
                     _hh_log_error "  - $disk_error"
                 else
-                    local split_lines split_line
-                    split_lines=$(_hh_split_storage_lines "$result")
-                    if [[ -n "$split_lines" ]]; then
-                        while IFS= read -r split_line; do _hh_log_error "  - $split_line"; done <<< "$split_lines"
-                    else
-                        _hh_log_error "  - Disk usage > ${_HH_DISK_ERROR_THRESHOLD}%"
-                    fi
+                    _hh_log_error "  - Disk usage > ${_HH_DISK_ERROR_THRESHOLD}%"
                 fi
             fi
             ;;
