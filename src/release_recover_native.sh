@@ -902,15 +902,27 @@ try:
         saved_state = stage / "inputs/state.json"
         if saved_state not in documents:
             documents[saved_state] = (state_bytes, save(saved_state, state_bytes, pending))
-        for worker in output_workers.values():
-            if worker["name"] in copies:
-                continue
+        def prepare_copy(worker):
+            # Threads only write private random names. The supervisor owns
+            # committed names and receipts, so cancellation cannot leave a
+            # partial file masquerading as a completed, resumable payload.
+            checkpoint()
             temporary = pending / uuid.uuid4().hex
             check_artifact(worker, temporary)
             admit_copy(worker, temporary)
+            return temporary
+
+        def accept_copy(worker, temporary):
+            # Keep the existing post-rename byte/mode admission. A completed
+            # preparation occupies its job slot until this acceptance ends;
+            # run_jobs starts no replacement while the supervisor reads it.
             destination = stage / "artifacts" / worker["name"]
             commit_copy(temporary, destination)
             copies[worker["name"]] = admit_copy(worker, destination)
+
+        run_jobs(prepare_copy,
+                 (worker for worker in output_workers.values() if worker["name"] not in copies),
+                 accept_copy)
         for selected, data in expected_documents.items():
             if selected not in documents:
                 documents[selected] = (data, save(selected, data, pending))

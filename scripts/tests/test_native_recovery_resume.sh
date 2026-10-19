@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 
 module = Path(sys.argv[1]) / 'src/release_recover_native.sh'
@@ -297,6 +298,159 @@ if partial_baseline:
     code, value = invoke(legacy, '--resume')
     check('new resumable implementation revalidates legacy completed output unchanged',
           code == 0 and value == original_receipt and snapshot(legacy) == held)
+# Observe genuine writable descriptors, not timing, to prove that --jobs
+# controls copying as well as the existing parallel verification phases.
+# Use separate worker inputs so the original fixture's custody is unchanged.
+parallel_assets = work / 'parallel-artifacts'
+shutil.copytree(assets, parallel_assets)
+parallel_state = copy.deepcopy(state)
+parallel_result = parallel_state['target_statuses'][target]['result']
+parallel_result['artifact_paths'] = [str(parallel_assets / Path(p).name) for p in primary]
+parallel_result['artifact_path'] = ','.join(parallel_result['artifact_paths'])
+parallel_companions = [parallel_assets / 'NOTICE']
+for index in range(4):
+    data = parallel_assets / ('data%d.bin' % index)
+    with data.open('xb') as stream:
+        for _ in range(32):
+            stream.write(bytes([65 + index]) * (1024 * 1024))
+    parallel_companions.append(data)
+parallel_result['additional_artifacts'] = [receipt(p) for p in parallel_companions]
+parallel_result['resume_artifacts'] = [receipt(Path(p)) for p in parallel_result['artifact_paths']] + parallel_result['additional_artifacts']
+parallel_state_file = states / 'parallel-state.json'
+parallel_state_file.write_bytes(encoded(parallel_state))
+parallel_inputs = snapshot(parallel_assets)
+
+
+def observe_copy(output, jobs=4, resume=False, cancel=False, selected_module=None, limit=None):
+    global sequence
+    sequence += 1
+    command = ['bash', str(selected_module or module), '--state', str(parallel_state_file),
+               '--state-sha256', digest(parallel_state_file.read_bytes()), '--source-repo', str(source),
+               '--repo', 'owner/demo', '--tag', 'v1.2.3', '--sha', commit,
+               '--artifacts-root', str(parallel_assets), '--output-dir', str(output), '--jobs', str(jobs)]
+    if resume:
+        command.append('--resume')
+    def bounded_write():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True, preexec_fn=bounded_write if limit is not None else None)
+    peak = 0
+    sent = False
+    start = time.monotonic()
+    try:
+        while process.poll() is None:
+            if time.monotonic() - start > 90:
+                raise TimeoutError('copy observation deadline')
+            writable = set()
+            descriptors = Path('/proc') / str(process.pid) / 'fd'
+            try:
+                for descriptor in descriptors.iterdir():
+                    try:
+                        selected = Path(os.readlink(descriptor))
+                        if selected.parent != output / '.partial':
+                            continue
+                        metadata = (descriptors.parent / 'fdinfo' / descriptor.name).read_text()
+                        flags = next(int(line.split()[1], 8) for line in metadata.splitlines()
+                                     if line.startswith('flags:'))
+                        if flags & os.O_ACCMODE in (os.O_WRONLY, os.O_RDWR):
+                            writable.add(str(selected))
+                    except (OSError, ValueError, StopIteration):
+                        pass
+            except FileNotFoundError:
+                pass
+            peak = max(peak, len(writable))
+            if cancel and len(writable) >= 2 and not sent:
+                process.send_signal(signal.SIGTERM)
+                sent = True
+                time.sleep(0.001)
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+            time.sleep(0.0005)
+        stdout, stderr = process.communicate(timeout=10)
+    except BaseException:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise
+    (work / ('run-%d.stdout' % sequence)).write_bytes(stdout)
+    (work / ('run-%d.stderr' % sequence)).write_bytes(stderr)
+    return process.returncode, json.loads(stdout), dict(peak_writers=peak, interrupted=sent,
+                                                       seconds=time.monotonic() - start)
+
+
+copy_baseline = os.environ.get('DSR_RECOVERY_COPY_BASELINE')
+serial_output, parallel_output = work / 'serial-copy', work / 'parallel-copy'
+code, serial_receipt, serial_observation = observe_copy(serial_output,
+    jobs=4 if copy_baseline else 1, selected_module=copy_baseline)
+check('serial copy control has exactly one real writable payload descriptor',
+      code == 0 and serial_observation['peak_writers'] == 1)
+code, parallel_receipt, parallel_observation = observe_copy(parallel_output)
+check('parallel copying opens multiple actual output files within --jobs',
+      code == 0 and 2 <= parallel_observation['peak_writers'] <= 4)
+serial_manifest = json.loads((serial_output / 'release/build-manifest.json').read_bytes())
+parallel_manifest = json.loads((parallel_output / 'release/build-manifest.json').read_bytes())
+# Only the observation timestamp differs between independently created plans;
+# source custody, target coverage, archive evidence and payload rows must agree.
+serial_manifest['recovery_evidence'].pop('recovered_at')
+parallel_manifest['recovery_evidence'].pop('recovered_at')
+check('parallel copies preserve every manifest identity and source attribution',
+      serial_manifest == parallel_manifest and parallel_receipt['recovered_artifacts'] == 8)
+check('all parallel raw archive and companion copies retain expected bytes and modes',
+      all(digest((parallel_output / 'release/artifacts' / row['name']).read_bytes()) == row['sha256']
+          for row in parallel_manifest['artifacts']) and
+      snapshot(serial_output / 'release/artifacts', files_only=True).keys() ==
+      snapshot(parallel_output / 'release/artifacts', files_only=True).keys() and
+      all((serial_output / 'release/artifacts' / row['name']).stat().st_mode ==
+          (parallel_output / 'release/artifacts' / row['name']).stat().st_mode
+          for row in parallel_manifest['artifacts']))
+held_parallel = snapshot(parallel_output)
+for jobs in (1, 2, 32):
+    code, retry, observed = observe_copy(parallel_output, jobs=jobs, resume=True)
+    check('completed retry never starts a copier or changes receipt with jobs=' + str(jobs),
+          code == 0 and retry == parallel_receipt and observed['peak_writers'] == 0 and
+          snapshot(parallel_output) == held_parallel)
+
+copy_cancelled = work / 'copy-cancelled'
+code, failure, cancellation = observe_copy(copy_cancelled, cancel=True)
+check('repeated signals during real parallel writes refuse publication and report interruption',
+      cancellation['interrupted'] and code == 5 and failure['exit_code'] == 5 and
+      not (copy_cancelled / 'release').exists())
+cancel_stage = copy_cancelled / json.loads((copy_cancelled / 'plan.json').read_bytes())['stage']
+retained_copies = snapshot(cancel_stage / 'artifacts', files_only=True)
+retained_private = snapshot(copy_cancelled / '.partial', files_only=True)
+check('cancelled threads retain their scratch evidence outside the committed namespace',
+      bool(retained_private) and all(len(n) == 32 for n in retained_private))
+lock = os.open(copy_cancelled, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    check('all copy threads drain before releasing the recovery lock', True)
+finally:
+    os.close(lock)
+code, retry, _ = observe_copy(copy_cancelled, resume=True)
+check('resume completes the full payload set after parallel write cancellation',
+      code == 0 and retry['recovered_artifacts'] == 8)
+check('resume preserves already committed files and private cancellation evidence',
+      all(snapshot(copy_cancelled / 'release/artifacts', files_only=True)[k] == v
+          for k, v in retained_copies.items()) and
+      all(snapshot(copy_cancelled / '.partial', files_only=True)[k] == v
+          for k, v in retained_private.items()))
+
+copy_exhausted = work / 'parallel-write-exhausted'
+code, failure, _ = observe_copy(copy_exhausted, limit=len(binary) + 65536)
+check('one parallel file-size failure prevents a successful subset release',
+      code == 4 and 'File too large' in failure.get('error', '') and
+      not (copy_exhausted / 'release').exists())
+exhausted_stage = copy_exhausted / json.loads((copy_exhausted / 'plan.json').read_bytes())['stage']
+retained = snapshot(exhausted_stage / 'artifacts', files_only=True)
+code, retry, _ = observe_copy(copy_exhausted, jobs=2, resume=True)
+check('failed parallel copy resumes with another budget without replacing completed files',
+      code == 0 and retry['recovered_artifacts'] == 8 and
+      all(snapshot(copy_exhausted / 'release/artifacts', files_only=True)[k] == v for k, v in retained.items()))
+check('parallel copying leaves original input identities and selected state unchanged',
+      snapshot(parallel_assets) == parallel_inputs and parallel_state_file.read_bytes() == encoded(parallel_state))
+(work / 'copy-observations.json').write_bytes(encoded(dict(incumbent=copy_baseline,
+    serial=serial_observation, parallel=parallel_observation, cancellation=cancellation)))
+
 check('all original worker inputs and source state remain unchanged',
       snapshot(assets) == source_before and state_file.read_bytes() == state_before and not git('status', '--porcelain'))
 print('Interrupted recovery: %d passed, 0 failed; evidence: %s' % (passed, work), flush=True)

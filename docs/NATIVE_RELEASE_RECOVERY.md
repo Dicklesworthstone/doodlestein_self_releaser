@@ -133,6 +133,42 @@ archive member named `demo`/`demo.exe`, or rename a raw output to a project's
 published name. The packaging and finalization commands retain their own source,
 coverage, checksum and signing gates. No automatic publication occurs here.
 
+## Bounded parallel verification and copying
+
+Use `--jobs 4` to allow up to four concurrent artifact operations. The accepted
+range is 1–32; omission keeps serial execution. The same budget now covers
+initial input verification, preparation of missing payload copies, final input
+verification, and final staged-byte verification. Shared companion paths with
+identical frozen receipts are read once per verification phase while retaining
+every worker attribution. Distinct physical paths are verified independently.
+
+Copy workers write only private, randomly named scratch files. They validate the
+original receipt and copied bytes before handing the file to the supervisor.
+Only the supervisor renames a prepared file into its committed staging name,
+revalidates its final bytes and mode, and records the copy. A preparation retains
+its job slot through that acceptance; the supervisor's verification does not
+create an extra operation above the selected budget. Documents and final release
+publication remain serialized.
+
+A copy failure stops further admission and drains the owned workers before the
+workspace lock is released. Repeated signals cannot skip draining. Completed
+files remain reusable; incomplete or unaccepted files remain private evidence,
+never a smaller release. Retry with the same selection and `--resume --jobs 4`.
+Changing the budget on retry does not change the frozen plan, manifest, receipt,
+or previously completed files. Completed recovery retries start no copy workers.
+
+Concurrency is an I/O scheduling control, not a guarantee of higher throughput:
+storage contention may make a smaller budget faster. There is no new disk-space
+reservation or protection against uninterruptible kernel I/O. The existing
+hash, inode, mode, archive, full-inventory and source/tag checks still apply.
+
+`test_native_recovery_resume.sh` observes real writable file descriptors on
+Linux, exercises cancellation during simultaneous writes and a kernel-enforced
+file-size failure, then resumes without replacing completed files. Set
+`DSR_RECOVERY_COPY_BASELINE` to the unchanged serial-copy module to compare both
+implementations in the same invocation. Reported timings are observations for
+that fixture, not a general performance claim.
+
 ## Multiple primary outputs and shared companions
 
 The worker's `artifact_paths` array is authoritative. A task can retain multiple
