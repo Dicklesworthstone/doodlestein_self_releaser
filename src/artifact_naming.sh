@@ -807,7 +807,7 @@ artifact_naming_substitute() {
     if ! declare -F config_get_arch_alias &>/dev/null; then
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$script_dir/config.sh" 2>/dev/null || true
     fi
 
@@ -896,7 +896,7 @@ artifact_naming_get_compat_pattern() {
     if ! declare -F config_get_install_script_compat &>/dev/null; then
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$script_dir/config.sh" 2>/dev/null || true
     fi
 
@@ -1043,7 +1043,7 @@ _an_release_contract_for_tool() {
     if ! declare -F config_get_release_contract_json &>/dev/null; then
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 3
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$script_dir/config.sh" || return 3
     fi
     config_get_release_contract_json "$tool"
@@ -1080,7 +1080,7 @@ artifact_naming_generate_dual_for_tool() {
             if ! declare -F config_get_release_contract_target_key &>/dev/null; then
                 local config_module_dir
                 config_module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
-                # shellcheck source=./config.sh
+                # shellcheck source=SCRIPTDIR/config.sh
                 source "$config_module_dir/config.sh" || return 3
             fi
             target_key=$(config_get_release_contract_target_key "$tool" "$os/$arch" \
@@ -1094,7 +1094,7 @@ artifact_naming_generate_dual_for_tool() {
     if ! declare -F config_get_tool_field &>/dev/null; then
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$script_dir/config.sh" 2>/dev/null || true
     fi
 
@@ -1219,7 +1219,7 @@ artifact_naming_installer_expected_name() {
     if ! declare -F config_get_install_script_path &>/dev/null; then
         local script_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        # shellcheck source=./config.sh
+        # shellcheck source=SCRIPTDIR/config.sh
         source "$script_dir/config.sh" 2>/dev/null || true
     fi
     local install_path=""
