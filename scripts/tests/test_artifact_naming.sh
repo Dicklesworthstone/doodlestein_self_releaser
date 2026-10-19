@@ -15,6 +15,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FIXTURE_DIR="$SCRIPT_DIR/fixtures/artifact_naming"
 
+# These cases assert the default naming rules. A developer's real tool
+# registry may intentionally override aliases (for example rch amd64 to
+# x86_64), so give the real config loader an empty private registry.
+NAMING_TEST_CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/dsr-naming-test-config.XXXXXXXX") || exit 1
+export DSR_CONFIG_DIR="$NAMING_TEST_CONFIG"
+export DSR_CONFIG_FILE="$NAMING_TEST_CONFIG/config.yaml"
+export DSR_REPOS_FILE="$NAMING_TEST_CONFIG/repos.yaml"
+export DSR_HOSTS_FILE="$NAMING_TEST_CONFIG/hosts.yaml"
+
 # Source the module under test
 source "$PROJECT_ROOT/src/artifact_naming.sh"
 
@@ -34,13 +43,13 @@ assert_eq() {
     local expected="$1"
     local actual="$2"
     local msg="${3:-assertion}"
-    ((TEST_COUNT++))
+    ((++TEST_COUNT))
     if [[ "$expected" == "$actual" ]]; then
-        ((PASS_COUNT++))
+        ((++PASS_COUNT))
         log_pass "$msg"
         return 0
     else
-        ((FAIL_COUNT++))
+        ((++FAIL_COUNT))
         log_fail "$msg"
         log_fail "  expected: '$expected'"
         log_fail "  actual:   '$actual'"
@@ -52,13 +61,13 @@ assert_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-contains assertion}"
-    ((TEST_COUNT++))
+    ((++TEST_COUNT))
     if [[ "$haystack" == *"$needle"* ]]; then
-        ((PASS_COUNT++))
+        ((++PASS_COUNT))
         log_pass "$msg"
         return 0
     else
-        ((FAIL_COUNT++))
+        ((++FAIL_COUNT))
         log_fail "$msg"
         log_fail "  haystack: '$haystack'"
         log_fail "  needle:   '$needle'"
@@ -69,13 +78,13 @@ assert_contains() {
 assert_not_empty() {
     local value="$1"
     local msg="${2:-not empty assertion}"
-    ((TEST_COUNT++))
+    ((++TEST_COUNT))
     if [[ -n "$value" ]]; then
-        ((PASS_COUNT++))
+        ((++PASS_COUNT))
         log_pass "$msg"
         return 0
     else
-        ((FAIL_COUNT++))
+        ((++FAIL_COUNT))
         log_fail "$msg: value was empty"
         return 1
     fi
@@ -84,13 +93,13 @@ assert_not_empty() {
 assert_empty() {
     local value="$1"
     local msg="${2:-empty assertion}"
-    ((TEST_COUNT++))
+    ((++TEST_COUNT))
     if [[ -z "$value" ]]; then
-        ((PASS_COUNT++))
+        ((++PASS_COUNT))
         log_pass "$msg"
         return 0
     else
-        ((FAIL_COUNT++))
+        ((++FAIL_COUNT))
         log_fail "$msg: expected empty, got '$value'"
         return 1
     fi
@@ -139,15 +148,17 @@ test_parse_install_versioned() {
 
 test_parse_install_no_pattern() {
     log_test "Parse install.sh with no recognizable pattern"
-    local result
-    result=$(artifact_naming_parse_install_script "$FIXTURE_DIR/no_pattern.sh")
+    local result status=0
+    result=$(artifact_naming_parse_install_script "$FIXTURE_DIR/no_pattern.sh") || status=$?
+    assert_eq 1 "$status" "No pattern returns non-success status"
     assert_empty "$result" "No pattern returns empty"
 }
 
 test_parse_install_nonexistent() {
     log_test "Parse nonexistent install.sh"
-    local result
-    result=$(artifact_naming_parse_install_script "/nonexistent/install.sh")
+    local result status=0
+    result=$(artifact_naming_parse_install_script "/nonexistent/install.sh") || status=$?
+    assert_eq 1 "$status" "Nonexistent install file returns non-success status"
     assert_empty "$result" "Nonexistent file returns empty"
 }
 
@@ -232,8 +243,9 @@ test_validate_consistent() {
 
 test_validate_version_mismatch() {
     log_test "Validate - version mismatch detected"
-    local result
-    result=$(artifact_naming_validate "mytool" '${name}-${version}-${os}-${arch}' '${name}-${os}-${arch}' '[]')
+    local result status=0
+    result=$(artifact_naming_validate "mytool" '${name}-${version}-${os}-${arch}' '${name}-${os}-${arch}' '[]') || status=$?
+    assert_eq 1 "$status" "Version mismatch returns warning status"
     log_info "Result: $result"
 
     assert_contains "$result" '"status":"warning"' "Status is warning for version mismatch"
@@ -295,8 +307,8 @@ test_parse_workflow() {
     log_test "Parse workflow YAML"
     if ! command -v yq &>/dev/null; then
         log_info "SKIP: yq not installed"
-        ((TEST_COUNT++))
-        ((PASS_COUNT++))
+        ((++TEST_COUNT))
+        ((++PASS_COUNT))
         return 0
     fi
 
@@ -311,8 +323,9 @@ test_parse_workflow() {
 
 test_parse_workflow_nonexistent() {
     log_test "Parse nonexistent workflow"
-    local result
-    result=$(artifact_naming_parse_workflow "/nonexistent/workflow.yml")
+    local result status=0
+    result=$(artifact_naming_parse_workflow "/nonexistent/workflow.yml") || status=$?
+    assert_eq 1 "$status" "Nonexistent workflow returns non-success status"
     assert_eq "[]" "$result" "Nonexistent workflow returns empty array"
 }
 
