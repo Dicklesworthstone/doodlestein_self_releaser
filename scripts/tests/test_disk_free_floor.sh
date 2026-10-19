@@ -12,6 +12,7 @@ python3 - "$ROOT" "$@" <<'PY'
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,19 +34,28 @@ class DiskFloor(unittest.TestCase):
         self.work = WORK / self.id().rsplit('.', 1)[-1]
         self.work.mkdir()
         self.env = dict(os.environ, DSR_CACHE_DIR=str(self.work / 'cache'),
+                        DSR_CONFIG_DIR=str(self.work / 'config'),
+                        DSR_CONFIG_FILE=str(self.work / 'config.yaml'),
+                        DSR_REPOS_FILE=str(self.work / 'repos.yaml'),
+                        DSR_STATE_DIR=str(self.work / 'state'),
                         DSR_HOSTS_FILE=str(self.work / 'hosts.yaml'), NO_COLOR='1')
+        self.env.pop('CARGO_HOME', None)
+        self.env.pop('CARGO_TARGET_DIR', None)
+        self.env.pop('TMPDIR', None)
         Path(self.env['DSR_HOSTS_FILE']).write_text(
             'hosts:\n  localtest:\n    platform: linux/amd64\n    connection: local\n'
             '    enabled: true\n    capabilities:\n')
         self.sequence = 0
 
     def call(self, function, *arguments, module=MODULE, setup=''):
-        # Initialize the config cache as a sourceable consumer. Host selection
-        # uses the real fallback reader (or installed real yq); no configured
-        # storage/helper behavior is replaced. Config initialization and the
-        # monolithic CLI remain outside this standalone admission test.
-        program = ('declare -A DSR_CONFIG=(); source "$1/src/logging.sh"; '
-                   'source "$2"; shift 2; ' + setup + '; "$@"')
+        # A complete checkout loads its actual config module, including the
+        # YAML parser helpers. The retained partial-workspace mode only supports
+        # the existing no-yq reader; no function or executable is replaced.
+        if shutil.which('yq') and not (ROOT / 'src/config.sh').is_file():
+            self.skipTest('real yq requires the complete production config module')
+        program = ('if [[ -f "$1/src/config.sh" ]]; then source "$1/src/config.sh" || exit $?; '
+                   'else declare -A DSR_CONFIG=(); fi; source "$1/src/logging.sh" || exit $?; '
+                   'source "$2" || exit $?; shift 2; ' + setup + '; "$@"')
         result = subprocess.run([BASH, '-c', program, '_', str(ROOT), str(module),
                                  function, *map(str, arguments)], env=self.env,
                                 text=True, capture_output=True, timeout=20)
@@ -212,6 +222,127 @@ class DiskFloor(unittest.TestCase):
             old = self.call('_hh_admission_fingerprint', config, module=BASELINE, setup=':')
             self.assertEqual(old.returncode, 0)
             self.assertNotEqual(first.stdout, old.stdout)
+
+    def default_probe(self, **changes):
+        self.env.update(changes)
+        result = self.call('_hh_check_disk_space', 'localtest', 'local', '', 'linux/amd64', setup=':')
+        return result, json.loads(result.stdout)
+
+    def small_filesystem(self):
+        selected = Path('/dev/shm')
+        if not selected.is_dir() or os.statvfs(selected).f_bavail * os.statvfs(selected).f_frsize >= MINIMUM:
+            self.skipTest('requires an existing filesystem below 20 GiB; no disk is filled')
+        return selected
+
+    def test_default_writable_roles_are_complete_and_grouped_without_summing(self):
+        result, value = self.default_probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(value['admission'], 'unix-writable-roles-v1')
+        self.assertEqual({r['role'] for r in value['roles']},
+                         {'root', 'home', 'cargo_home', 'temp', 'build_root'})
+        for role in value['roles']:
+            stats = os.statvfs(role['probe_path'])
+            self.assertEqual(role['filesystem_id'], str(os.stat(role['probe_path']).st_dev))
+            self.assertEqual(role['min_free_bytes'], MINIMUM)
+            self.assertEqual(role['total_bytes'], stats.f_blocks * (stats.f_frsize or stats.f_bsize))
+        self.assertEqual(len(value['filesystems']), len({r['filesystem_id'] for r in value['roles']}))
+        for filesystem in value['filesystems']:
+            rows = [r for r in value['roles'] if r['filesystem_id'] == filesystem['filesystem_id']]
+            self.assertEqual(filesystem['available_bytes'], min(r['available_bytes'] for r in rows))
+            self.assertEqual(set(filesystem['roles']), {r['role'] for r in rows})
+
+    def test_configured_build_root_is_checked_without_split_opt_in(self):
+        small = self.small_filesystem()
+        with Path(self.env['DSR_HOSTS_FILE']).open('a') as output:
+            output.write(f'    build_root: "{small}"\n')
+        result, value = self.default_probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build = next(r for r in value['roles'] if r['role'] == 'build_root')
+        self.assertEqual(build['path'], str(small))
+        self.assertEqual(build['status'], 'error')
+        self.assertEqual(value['status'], 'error')
+        public = self.call('host_health_check', 'localtest', '--no-cache', '--json', setup=':')
+        self.assertEqual(public.returncode, 1, public.stderr)
+        self.assertFalse(json.loads(public.stdout)['healthy'])
+
+    def test_tight_temp_cannot_hide_behind_healthy_build_root(self):
+        result, value = self.default_probe(TMPDIR=str(self.small_filesystem()))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(value['status'], 'error')
+        self.assertEqual(next(r['status'] for r in value['roles'] if r['role'] == 'temp'), 'error')
+        self.assertIn('temp /dev/shm', value['error'])
+
+    def test_tight_cargo_home_and_target_are_each_required(self):
+        small = str(self.small_filesystem())
+        for field, role in [('CARGO_HOME', 'cargo_home'), ('CARGO_TARGET_DIR', 'cargo_target')]:
+            with self.subTest(field=field):
+                result, value = self.default_probe(**{field: small})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(value['status'], 'error')
+                self.assertEqual(next(r['status'] for r in value['roles'] if r['role'] == role), 'error')
+                self.env.pop(field)
+
+    def test_missing_configured_build_root_refuses(self):
+        with Path(self.env['DSR_HOSTS_FILE']).open('a') as output:
+            output.write(f'    build_root: {self.work}/missing\n')
+        result, value = self.default_probe()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(value['status'], 'error')
+
+    def test_missing_or_relative_environment_roles_refuse(self):
+        for field in ('HOME', 'CARGO_HOME', 'TMPDIR', 'CARGO_TARGET_DIR'):
+            before = dict(self.env)
+            for chosen in (str(self.work / 'absent'), 'relative-path'):
+                with self.subTest(field=field, path=chosen):
+                    result, value = self.default_probe(**{field: chosen})
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(value['status'], 'error')
+                    self.env = dict(before)
+
+    def test_absent_implicit_cargo_home_probes_its_actual_parent(self):
+        result, value = self.default_probe(HOME=str(self.work))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cargo = next(r for r in value['roles'] if r['role'] == 'cargo_home')
+        self.assertEqual(cargo['path'], str(self.work / '.cargo'))
+        self.assertEqual(cargo['probe_path'], str(self.work.resolve()))
+        self.assertFalse((self.work / '.cargo').exists())
+
+    def test_environment_path_metacharacters_are_literal_data(self):
+        cargo = self.work / 'cargo $(touch not-executed); quote\'s'
+        cargo.mkdir()
+        result, value = self.default_probe(CARGO_HOME=str(cargo))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(next(r['path'] for r in value['roles'] if r['role'] == 'cargo_home'), str(cargo))
+        self.assertFalse((self.work / 'not-executed').exists())
+
+    def test_configured_path_cannot_inject_a_remote_command(self):
+        marker = self.work / 'injected'
+        body = dict(build_root=f'/tmp/$(touch {marker})', platform='linux/amd64')
+        result = self.call('_hh_default_unix_storage_admission', 'localtest', 'local', '',
+                           json.dumps(body), setup=':')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)['status'], 'error')
+        self.assertFalse(marker.exists())
+
+    def test_human_role_report_retains_every_writable_location(self):
+        result, value = self.default_probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.call('_hh_split_storage_lines', json.dumps(dict(checks=dict(disk_space=value))), setup=':')
+        self.assertEqual(len(lines.stdout.splitlines()), len(value['roles']))
+        for row in value['roles']:
+            self.assertIn(row['role'] + ' ' + row['path'], lines.stdout)
+
+    @unittest.skipUnless(BASELINE, 'set DSR_TEST_DISK_BASELINE for the unchanged default root-only probe')
+    def test_incumbent_ignores_the_same_real_low_capacity_temp(self):
+        self.require_room()
+        self.env['TMPDIR'] = str(self.small_filesystem())
+        old = self.call('host_health_check', 'localtest', '--no-cache', '--json', module=BASELINE, setup=':')
+        new = self.call('host_health_check', 'localtest', '--no-cache', '--json', setup=':')
+        self.assertEqual(old.returncode, 0, old.stderr)
+        self.assertTrue(json.loads(old.stdout)['healthy'])
+        self.assertEqual(new.returncode, 1, new.stderr)
+        self.assertFalse(json.loads(new.stdout)['healthy'])
+        self.assertIn('temp /dev/shm', json.loads(new.stdout)['checks']['disk_space']['error'])
 
     @unittest.skipUnless(BASELINE, 'set DSR_TEST_DISK_BASELINE to run the unchanged incumbent')
     def test_incumbent_accepts_the_same_false_green_split_input(self):

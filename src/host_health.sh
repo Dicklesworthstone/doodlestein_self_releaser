@@ -72,7 +72,7 @@ _hh_parse_host_fallback() {
     local in_target=false
     local in_capabilities=false
     local platform="" connection="" ssh_host="" description="" concurrency="1"
-    local enabled="true"
+    local enabled="true" build_root=""
     local capabilities=""
     local line
 
@@ -148,6 +148,12 @@ _hh_parse_host_fallback() {
             elif [[ "$line" =~ ^[[:space:]]+enabled: ]]; then
                 [[ "$line" =~ ^[[:space:]]+enabled:[[:space:]]*(true|false)[[:space:]]*$ ]] || return 4
                 enabled="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^[[:space:]]+build_root: ]]; then
+                [[ "$line" =~ ^[[:space:]]+build_root:[[:space:]]*(.+)$ ]] || return 4
+                build_root="${BASH_REMATCH[1]}"
+                build_root="${build_root%\"}"; build_root="${build_root#\"}"
+                build_root="${build_root%\'}"; build_root="${build_root#\'}"
+                [[ -n "$build_root" ]] || return 4
             fi
         fi
     done < "$hosts_file"
@@ -163,6 +169,7 @@ _hh_parse_host_fallback() {
             --argjson concurrency "$concurrency" \
             --argjson enabled "$enabled" \
             --arg capabilities "$capabilities" \
+            --arg build_root "$build_root" \
             '{
                 platform: $platform,
                 connection: $connection,
@@ -171,7 +178,7 @@ _hh_parse_host_fallback() {
                 concurrency: $concurrency,
                 capabilities: ($capabilities | split(" ") | map(select(length > 0))),
                 enabled: $enabled
-            }' || return 4
+            } + (if $build_root == "" then {} else {build_root:$build_root} end)' || return 4
         return 0
     fi
 
@@ -387,7 +394,7 @@ _hh_admission_fingerprint() {
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v2",host:$host,policy:{
+        '{schema:"dsr-host-admission-v3",host:$host,policy:{
             disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -612,11 +619,140 @@ _hh_disk_status() {
     fi
 }
 
+# Probe default writable roles in the actual host process environment. Only
+# the selected build root travels from the controller; HOME/CARGO_HOME/TMPDIR
+# belong to the receiving host. Paths are data, not shell programs. This is a
+# read-only capacity observation, not a reservation or a compiler attestation.
+_hh_unix_writable_probe_script() {
+    cat <<'DSR_WRITABLE_PROBE'
+import json
+import os
+import sys
+
+def safe_path(value):
+    if not isinstance(value, str) or not value.startswith('/') or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError('writable role requires an absolute path without controls')
+    return value
+
+def observe(role, selected, allow_missing=False):
+    selected = safe_path(selected)
+    actual = os.path.realpath(selected)
+    while allow_missing and not os.path.exists(actual):
+        parent = os.path.dirname(actual)
+        if parent == actual:
+            break
+        actual = parent
+    if not os.path.isdir(actual):
+        raise ValueError('required writable role is not an existing directory: ' + role + ': ' + selected)
+    info = os.statvfs(actual)
+    block = info.f_frsize or info.f_bsize
+    available, total = info.f_bavail * block, info.f_blocks * block
+    if block <= 0 or not 0 <= available <= total <= 9007199254740991 or total == 0:
+        raise ValueError('invalid filesystem capacity: ' + role)
+    # APFS System used-block counts exclude other volumes in the container.
+    # Use actual available/total counts, not System used/(used+available).
+    used = ((total - available) * 100 + total - 1) // total
+    return dict(role=role, path=selected, probe_path=actual,
+                filesystem_id=str(os.stat(actual).st_dev), usage_percent=used,
+                available_bytes=available, total_bytes=total)
+
+try:
+    home = safe_path(os.environ.get('HOME'))
+    cargo = os.environ.get('CARGO_HOME')
+    temp = os.environ.get('TMPDIR') or '/tmp'
+    root = '/System/Volumes/Data' if sys.platform == 'darwin' and os.path.isdir('/System/Volumes/Data') else '/'
+    rows = [observe('root', root), observe('home', home),
+            observe('build_root', sys.argv[1]),
+            observe('cargo_home', cargo or os.path.join(home, '.cargo'), allow_missing=not cargo),
+            observe('temp', temp)]
+    target = os.environ.get('CARGO_TARGET_DIR')
+    if target:
+        rows.append(observe('cargo_target', target))
+    print(json.dumps(dict(roles=rows), sort_keys=True, separators=(',', ':')))
+except (OSError, ValueError, TypeError, IndexError) as error:
+    print('writable storage probe: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+DSR_WRITABLE_PROBE
+}
+
+_hh_default_unix_storage_admission() {
+    local hostname="$1" connection="$2" ssh_host="$3" host_config="${4:-}"
+    local config_status=0 build_root script result
+    if [[ -z "$host_config" ]]; then
+        host_config=$(_hh_get_host_config "$hostname") || config_status=$?
+        if [[ $config_status -ne 0 ]]; then
+            echo '{"path":"writable-storage","status":"error","error":"Cannot select configured writable storage"}'
+            return 1
+        fi
+    fi
+    build_root=$(jq -ers 'if length == 1 and (.[0]|type == "object") then .[0] else error("invalid host") end |
+        if .build_root == null then "/var/tmp"
+        elif (.build_root|type == "string" and test("^/[A-Za-z0-9_./:+-]+$") and
+             (test("(^|/)\\.\\.?(/|$)|//")|not)) then .build_root
+        else error("invalid build root") end' <<< "$host_config" 2>/dev/null) || {
+        echo '{"path":"writable-storage","status":"error","error":"Invalid Unix build root"}'
+        return 1
+    }
+    script="python3 -I - '$build_root' <<'DSR_UNIX_WRITABLE_PY'"$'\n'
+    script+="$(_hh_unix_writable_probe_script)"$'\nDSR_UNIX_WRITABLE_PY'
+    if ! result=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" "$script"); then
+        echo '{"path":"writable-storage","status":"error","error":"Required writable storage probe failed (Python 3, directory, or filesystem unavailable)"}'
+        return 1
+    fi
+    if ! jq -ces --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
+            --argjson warning "$_HH_DISK_WARN_THRESHOLD" --argjson critical "$_HH_DISK_ERROR_THRESHOLD" '
+        def whole: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
+        def path: type == "string" and startswith("/") and (test("[\\x00-\\x1f\\x7f]")|not);
+        if length != 1 or ($minimum|whole|not) or $minimum == 0 then error("invalid probe/policy") else .[0] end |
+        if (.roles|type != "array") or
+           ((.roles|map(.role)|sort) != ["build_root","cargo_home","home","root","temp"] and
+            (.roles|map(.role)|sort) != ["build_root","cargo_home","cargo_target","home","root","temp"]) or
+           (all(.roles[]; (.path|path) and (.probe_path|path) and
+                (.filesystem_id|type == "string" and test("^[0-9]+$")) and
+                (.usage_percent|whole) and .usage_percent <= 100 and
+                (.available_bytes|whole) and (.total_bytes|whole) and
+                .total_bytes > 0 and .available_bytes <= .total_bytes)|not)
+        then error("incomplete writable role inventory") else . end |
+        .roles |= map(. + {min_free_bytes:$minimum,
+            available_gb:((.available_bytes/1073741824*100|floor)/100),
+            status:(if .available_bytes < $minimum or .usage_percent > $critical then "error"
+                    elif .usage_percent > $warning then "warning" else "ok" end)}) |
+        .roles as $roles | ($roles|map(select(.role == "root"))[0]) as $root |
+        {path:$root.path,usage_percent:$root.usage_percent,available_bytes:$root.available_bytes,
+         available_gb:$root.available_gb,min_free_bytes:$minimum,admission:"unix-writable-roles-v1",roles:$roles,
+         filesystems:($roles|group_by(.filesystem_id)|map({filesystem_id:.[0].filesystem_id,
+             roles:map(.role),paths:map(.probe_path)|unique,available_bytes:(map(.available_bytes)|min)})),
+         status:(if any($roles[];.status == "error") then "error"
+                 elif any($roles[];.status == "warning") then "warning" else "ok" end)} |
+        if .status == "error" then . + {error:("Writable storage pressure: " +
+            ($roles|map(select(.status == "error")|(.role + " " + .path + " (" +
+                (.available_gb|tostring) + " GiB free, " + (.usage_percent|tostring) + "% used)"))|join("; ")))} else . end
+    ' <<< "$result"; then
+        echo '{"path":"writable-storage","status":"error","error":"Invalid writable storage inventory or free-space policy"}'
+        return 1
+    fi
+}
+
 _hh_check_disk_space() {
     local hostname="$1"
     local connection="$2"
     local ssh_host="$3"
     local platform="${4:-}"
+    local unix_storage="" unix_status=1
+
+    if [[ "$platform" != windows/* ]]; then
+        if declare -F config_unix_storage_json >/dev/null; then
+            unix_status=0
+            unix_storage=$(config_unix_storage_json "$hostname") || unix_status=$?
+        fi
+        if [[ $unix_status -eq 1 ]]; then
+            _hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" "${5:-}"
+            return $?
+        elif [[ $unix_status -ne 0 ]]; then
+            echo '{"path":"/","status":"error","error":"Invalid Unix split-storage contract"}'
+            return 1
+        fi
+    fi
 
     if [[ "$platform" == windows/* ]]; then
         local storage storage_status=0 storage_script storage_probe storage_result
@@ -702,42 +838,28 @@ _hh_check_disk_space() {
         status="ok"
     fi
 
-    if [[ "$platform" != windows/* ]] && declare -F config_unix_storage_json >/dev/null; then
-        local unix_storage unix_status=0
-        unix_storage=$(config_unix_storage_json "$hostname") || unix_status=$?
-        if [[ $unix_status -eq 0 ]]; then
-            _hh_unix_split_storage_admission "$hostname" "$connection" "$ssh_host" "$unix_storage" \
-                "$usage_percent" "$available_kb" "$status"
-            return $?
-        elif [[ $unix_status -ne 1 ]]; then
-            echo '{"path": "/", "usage_percent": null, "available_gb": null, "status": "error", "error": "Invalid Unix split-storage contract"}'
-            return 1
-        fi
-    fi
-
     if [[ "$platform" != windows/* ]]; then
-        status=$(_hh_disk_status "$usage_percent" "$available_kb" "$_HH_DISK_MIN_FREE_BYTES") || return 1
-        jq -nc --argjson usage "$usage_percent" --argjson kb "$available_kb" \
-            --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" --arg status "$status" \
-            '{path:"/",usage_percent:$usage,available_bytes:($kb*1024),
-              available_gb:(($kb/1048576*100|floor)/100),min_free_bytes:$minimum,status:$status} +
-             (if $kb*1024 < $minimum then
-                {error:"Available disk space is below the required 20 GiB floor"} else {} end)'
+        _hh_unix_split_storage_admission "$hostname" "$connection" "$ssh_host" "$unix_storage" \
+            "$usage_percent" "$available_kb" "$status"
     else
         echo "{\"path\": \"/\", \"usage_percent\": $usage_percent, \"available_gb\": $available_gb, \"status\": \"$status\"}"
     fi
 }
 
-# One line per volume for a unix-split-storage-v1 disk verdict (#38), so the
-# human report names the volume that is tight; empty for any other verdict.
+# Keep every writable role visible in warnings, including roles sharing the
+# same filesystem. The explicit split contract retains its original report.
 _hh_split_storage_lines() {
-    jq -r '.checks.disk_space | select(.admission == "unix-split-storage-v1") |
+    jq -r '.checks.disk_space |
+        if .admission == "unix-writable-roles-v1" then
+            .roles[] | "\(.role) \(.path) \(.usage_percent)% used, \(.available_gb) GiB free: \(.status)"
+        elif .admission == "unix-split-storage-v1" then
         ("root / \(.root.usage_percent)% used, \(.root.available_gb) GB free: \(.root.admitted_as)" +
             (if .root.admitted_as == "warning" and .root.status == "error" then " (above its \(.root.min_free_bytes / 1073741824 | floor) GiB free floor)"
              elif (.root.available_bytes // (.root.available_gb * 1073741824)) < .root.min_free_bytes then " (below its free-space floor)" else "" end)),
         ("build root \(.build_root.path) \(.build_root.usage_percent)% used, \(.build_root.available_gb) GB free: \(.build_root.status)" +
             (if .build_root.available_bytes != null and .build_root.available_bytes < .build_root.min_free_bytes
-             then " (below its free-space floor)" else "" end))' \
+             then " (below its free-space floor)" else "" end))
+        else empty end' \
         <<< "$1" 2>/dev/null || true
 }
 
@@ -1077,7 +1199,7 @@ host_health_check() {
     if echo "$connectivity" | jq -e '.reachable' &>/dev/null; then
         # 2. Check disk space (pass platform for Windows compatibility)
         local disk_status disk_exit=0
-        disk_space=$(_hh_check_disk_space "$hostname" "$connection" "$ssh_host" "$platform") || disk_exit=$?
+        disk_space=$(_hh_check_disk_space "$hostname" "$connection" "$ssh_host" "$platform" "$host_config") || disk_exit=$?
         if ! disk_status=$(jq -ers 'if length == 1 and (.[0] | type == "object" and
                 (.status == "ok" or .status == "warning" or .status == "error"))
             then .[0].status else error("invalid disk result") end' <<< "$disk_space" 2>/dev/null); then
