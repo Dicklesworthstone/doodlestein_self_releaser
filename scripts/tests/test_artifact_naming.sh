@@ -43,13 +43,13 @@ assert_eq() {
     local expected="$1"
     local actual="$2"
     local msg="${3:-assertion}"
-    ((++TEST_COUNT))
+    TEST_COUNT=$((TEST_COUNT + 1))
     if [[ "$expected" == "$actual" ]]; then
-        ((++PASS_COUNT))
+        PASS_COUNT=$((PASS_COUNT + 1))
         log_pass "$msg"
         return 0
     else
-        ((++FAIL_COUNT))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
         log_fail "$msg"
         log_fail "  expected: '$expected'"
         log_fail "  actual:   '$actual'"
@@ -61,13 +61,13 @@ assert_contains() {
     local haystack="$1"
     local needle="$2"
     local msg="${3:-contains assertion}"
-    ((++TEST_COUNT))
+    TEST_COUNT=$((TEST_COUNT + 1))
     if [[ "$haystack" == *"$needle"* ]]; then
-        ((++PASS_COUNT))
+        PASS_COUNT=$((PASS_COUNT + 1))
         log_pass "$msg"
         return 0
     else
-        ((++FAIL_COUNT))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
         log_fail "$msg"
         log_fail "  haystack: '$haystack'"
         log_fail "  needle:   '$needle'"
@@ -78,13 +78,13 @@ assert_contains() {
 assert_not_empty() {
     local value="$1"
     local msg="${2:-not empty assertion}"
-    ((++TEST_COUNT))
+    TEST_COUNT=$((TEST_COUNT + 1))
     if [[ -n "$value" ]]; then
-        ((++PASS_COUNT))
+        PASS_COUNT=$((PASS_COUNT + 1))
         log_pass "$msg"
         return 0
     else
-        ((++FAIL_COUNT))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
         log_fail "$msg: value was empty"
         return 1
     fi
@@ -93,13 +93,13 @@ assert_not_empty() {
 assert_empty() {
     local value="$1"
     local msg="${2:-empty assertion}"
-    ((++TEST_COUNT))
+    TEST_COUNT=$((TEST_COUNT + 1))
     if [[ -z "$value" ]]; then
-        ((++PASS_COUNT))
+        PASS_COUNT=$((PASS_COUNT + 1))
         log_pass "$msg"
         return 0
     else
-        ((++FAIL_COUNT))
+        FAIL_COUNT=$((FAIL_COUNT + 1))
         log_fail "$msg: expected empty, got '$value'"
         return 1
     fi
@@ -307,8 +307,8 @@ test_parse_workflow() {
     log_test "Parse workflow YAML"
     if ! command -v yq &>/dev/null; then
         log_info "SKIP: yq not installed"
-        ((++TEST_COUNT))
-        ((++PASS_COUNT))
+        TEST_COUNT=$((TEST_COUNT + 1))
+        PASS_COUNT=$((PASS_COUNT + 1))
         return 0
     fi
 
