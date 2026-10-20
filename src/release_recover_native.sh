@@ -662,6 +662,53 @@ def lock_workspace():
         raise
 
 
+def allocation_budget(sizes, new_directories, block_size):
+    # A private scratch file becomes its final name through a same-filesystem
+    # rename, not another copy. Count each UNIQUE missing payload/document once.
+    # Source sparseness and compression cannot reduce this ordinary byte-copy
+    # requirement. Allow one allocation block per new directory plus one for
+    # namespace growth; this is an estimate, not a filesystem reservation.
+    need(type(block_size) is int and block_size > 0 and
+         type(new_directories) is int and new_directories >= 0,
+         "invalid recovery allocation observation", 4)
+    sizes = list(sizes)
+    need(all(type(size) is int and size >= 0 for size in sizes),
+         "invalid recovery allocation size", 4)
+    blocks = sum((size + block_size - 1) // block_size for size in sizes)
+    return (blocks + new_directories + 1) * block_size, len(sizes) + new_directories
+
+
+def check_capacity(directory, sizes, new_directories, reserve):
+    """Admit an actual destination filesystem before creating any new file."""
+    checkpoint()
+    # The output itself cannot be '/', but its existing parent can be.
+    selected = Path('/') if str(directory) == '/' else path(str(directory))
+    fd = os.open(selected, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        observed = os.fstatvfs(fd)
+        after = selected.stat()
+        need((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino),
+             "recovery capacity directory changed", 2)
+        need(observed.f_frsize > 0 and 0 <= observed.f_bavail <= observed.f_blocks,
+             "invalid recovery filesystem capacity", 4)
+        need(not observed.f_flag & os.ST_RDONLY, "recovery filesystem is read-only", 4)
+        additional, inodes = allocation_budget(sizes, new_directories, observed.f_frsize)
+        available = observed.f_bavail * observed.f_frsize
+        need(available >= additional + reserve,
+             "insufficient recovery storage: available_bytes=%d, additional_bytes=%d, "
+             "reserve_free_bytes=%d, path=%s" % (available, additional, reserve, selected), 4)
+        # Some filesystems do not report finite inode capacity. When they do,
+        # zero available inodes must not be mistaken for an unknown limit.
+        if observed.f_files > 0:
+            need(0 <= observed.f_favail <= observed.f_files and observed.f_favail >= inodes,
+                 "insufficient recovery filesystem entries: available=%d, required=%d" %
+                 (observed.f_favail, inodes), 4)
+        return before.st_dev
+    finally:
+        os.close(fd)
+
+
 def verify_stage(stage, directories, outputs, documents):
     # Re-admit the COPIES, not just their original worker paths. This also
     # catches an altered manifest or an extra uploadable file before rename.
@@ -712,6 +759,8 @@ try:
     parser.add_argument("--max-unpacked-bytes", type=int, default=4 * 1024 ** 3)
     parser.add_argument("--max-archive-members", type=int, default=10000)
     parser.add_argument("--jobs", type=int, default=1, help="Concurrent artifact operations (1..32; default 1)")
+    parser.add_argument("--reserve-free-bytes", type=int, default=0,
+        help="Additional free bytes to leave after missing copies (default 0; not a reservation)")
     parser.add_argument("--dry-run", action="store_true", help="validate all inputs and print planned names without writing")
     parser.add_argument("--resume", action="store_true",
         help="resume a pinned interrupted recovery or revalidate completed output without rewriting it")
@@ -719,6 +768,8 @@ try:
     need(len(flags) == len(set(flags)), "duplicate recovery option", 4)
     args = parser.parse_args(sys.argv[1:])
     need(1 <= args.jobs <= 32, "jobs must be 1..32", 4)
+    need(0 <= args.reserve_free_bytes <= 9007199254740991,
+         "reserve-free-bytes must be 0..9007199254740991", 4)
     need(match(args.repo, r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*") and ".." not in args.repo and
          match(args.tag, r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
          match(args.sha, r"[0-9a-f]{40}") and args.sha != "0" * 40 and
@@ -790,9 +841,6 @@ try:
                 task_keys=sorted({v["task"]["key"] for v in workers if v["name"] == w["name"]}),
                 sha256=w["receipt"]["sha256"], archive_format=w["format"])
                 for w in sorted(output_workers.values(), key=lambda row: row["name"])])
-    if dry and not existing:
-        print(canonical(planned).decode(), end="")
-        sys.exit(0)
     # Build the complete expected documents independently of retained output.
     # A partial checkpoint may contribute only its historical observation time.
     artifacts, environments, mapping, artifact_names = [], {}, [], set()
@@ -880,6 +928,32 @@ try:
                  "completed recovery is missing selected files", 2)
     retained_entries = {directory: {p.name for p in directory.iterdir()} for directory in directories}
 
+    def admit_remaining_capacity():
+        selected = root if root.exists() else root.parent
+        storage_directories = (root, pending, stage, stage / "artifacts", stage / "inputs")
+        sizes = [worker["receipt"]["size_bytes"] for worker in output_workers.values()
+                 if worker["name"] not in copies]
+        sizes.extend(len(data) for destination, data in expected_documents.items() if destination not in documents)
+        if plan_document is None:
+            sizes.append(len(canonical(plan)))
+        device = check_capacity(selected, sizes, sum(not d.exists() for d in storage_directories),
+                                args.reserve_free_bytes)
+        # The estimate and atomic scratch-to-stage renames must refer to the
+        # same filesystem. Do not spend a spacious parent's budget on a nested
+        # mount with a different limit. Previously retained bytes already
+        # reduce f_bavail, so neither completed copies nor scratch evidence are
+        # charged a second time as future allocations.
+        for directory in storage_directories:
+            if directory.exists():
+                need(path(str(directory)).stat().st_dev == device,
+                     "recovery staging spans multiple filesystems", 2)
+
+    if not reuse:
+        admit_remaining_capacity()
+    if dry and not existing:
+        print(canonical(planned).decode(), end="")
+        sys.exit(0)
+
     if not dry and not reuse:
         os.umask(0o077)
         if not existing:
@@ -902,6 +976,10 @@ try:
         saved_state = stage / "inputs/state.json"
         if saved_state not in documents:
             documents[saved_state] = (state_bytes, save(saved_state, state_bytes, pending))
+        # Re-observe after initialization, immediately before admitting the
+        # copy batch. Competing disk users can still cause later ENOSPC; the
+        # existing cancellation/draining and resume rules handle that failure.
+        admit_remaining_capacity()
         def prepare_copy(worker):
             # Threads only write private random names. The supervisor owns
             # committed names and receipts, so cancellation cannot leave a

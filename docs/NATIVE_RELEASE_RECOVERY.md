@@ -135,6 +135,40 @@ coverage, checksum and signing gates. No automatic publication occurs here.
 
 ## Bounded parallel verification and copying
 
+### Destination capacity before copying
+
+Fresh recovery and interrupted `--resume` now check the destination's actual
+available bytes before writing. The estimate includes every unique missing
+payload, missing state/manifest/result/plan document, allocation-block rounding,
+and a small directory-metadata allowance. Copy scratch files become their final
+names by same-filesystem rename, so the estimate does not charge a second full
+copy. Already completed files and retained failed scratch bytes are not counted
+as future allocations: their existing consumption is already reflected in the
+filesystem's available space. Finite reported inode capacity is checked too.
+
+`--dry-run` performs the same capacity check without creating output. An
+insufficient-capacity error reports available bytes, estimated additional bytes,
+and the requested free-space reserve. An interrupted retry checks its existing
+evidence first and refuses without changing it when capacity is insufficient.
+Completed `--resume` is still a read-only verification and needs no copy budget.
+
+Add `--reserve-free-bytes 21474836480` to require another 20 GiB free beyond the
+estimated new allocations. The default is zero additional reserve, not a change
+to the separate native-host 20 GiB admission floor or SBH policy. This option is
+an execution constraint like `--jobs`; changing it on retry does not change the
+frozen source selection, recovery plan, artifact manifest or success receipt.
+No existing build, ownership or release gate is bypassed by this option.
+
+The capacity observation is bound to an open directory descriptor. Managed
+scratch and staging directories must share that filesystem; a spacious parent
+cannot authorize copies onto a separate nested mount. Capacity is checked again
+after workspace initialization, immediately before launching copy workers.
+This is **not a reservation**: quotas, filesystem metadata overhead and competing
+writers may still cause a later write failure. Existing cancellation, complete
+inventory verification and retained-evidence resume rules still apply. Recovery
+does not delete files, fill a disk to test it, reclaim space or lower other
+storage policies. Original worker artifacts remain untouched.
+
 Use `--jobs 4` to allow up to four concurrent artifact operations. The accepted
 range is 1–32; omission keeps serial execution. The same budget now covers
 initial input verification, preparation of missing payload copies, final input

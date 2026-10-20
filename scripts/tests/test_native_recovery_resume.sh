@@ -6,6 +6,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P) || exit 1
 command -v python3 >/dev/null && command -v go >/dev/null && command -v git >/dev/null || exit 77
 [[ $(uname -s) == Linux ]] || { echo 'SKIP: interruption integration requires Linux' >&2; exit 77; }
 python3 -I - "$ROOT" <<'PY'
+import ast
 import copy
 import fcntl
 import hashlib
@@ -14,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import resource
 import shutil
 import signal
@@ -147,6 +149,62 @@ def invoke(output, *flags, limit=None, environment=None, selected_module=None, s
     return p.returncode, value
 
 
+# Exercise the exact allocation functions as well as the complete command.
+# OS observations below are genuine fstatvfs calls; no free-space response,
+# storage device or production function is substituted.
+program = module.read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY\n', 1)[0]
+helpers = {'Failure', 'need', 'match', 'path', 'checkpoint', 'allocation_budget', 'check_capacity'}
+definitions = [node for node in ast.parse(program).body
+               if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in helpers]
+capacity = dict(os=os, Path=Path, re=re, cancel_requested=False)
+exec(compile(ast.Module(body=definitions, type_ignores=[]), str(module), 'exec'), capacity)
+budget, inspect_capacity = capacity['allocation_budget'], capacity['check_capacity']
+check('allocation rounds each missing file independently and includes new namespace blocks',
+      budget([1, 4096, 4097], 5, 4096) == (10 * 4096, 8))
+check('same-filesystem scratch renaming does not require a second complete copy',
+      budget([1024 * 1024], 0, 4096) == (1024 * 1024 + 4096, 1))
+check('zero-length documents still require inode capacity', budget([0], 0, 4096) == (4096, 1))
+check('the filesystem root can be observed as an output parent without creating a directory',
+      inspect_capacity(Path('/'), [], 0, 0) == Path('/').stat().st_dev)
+for invalid in (([-1], 0, 4096), ([True], 0, 4096), ([1], -1, 4096), ([1], 0, 0)):
+    try:
+        budget(*invalid)
+        rejected = False
+    except capacity['Failure'] as error:
+        rejected = error.code == 4
+    check('invalid allocation inputs cannot silently change the estimate: ' + repr(invalid), rejected)
+
+observed = os.statvfs(work)
+available = observed.f_bavail * observed.f_frsize
+capacity_workspace = work / 'capacity-observation'
+capacity_workspace.mkdir()
+capacity_before = snapshot(capacity_workspace)
+try:
+    inspect_capacity(capacity_workspace, [available + observed.f_frsize], 0, 0)
+    rejected = False
+except capacity['Failure'] as error:
+    rejected = error.code == 4 and 'insufficient recovery storage' in str(error)
+check('a genuine destination observation refuses a payload larger than its available capacity without writes',
+      rejected and snapshot(capacity_workspace) == capacity_before)
+
+for flags in (('--dry-run',), (), ('--jobs', '4')):
+    output = work / ('capacity-refusal-' + str(sequence))
+    code, value = invoke(output, *flags, '--reserve-free-bytes', '9007199254740991')
+    check('insufficient capacity refuses before any workspace is created: ' + repr(flags),
+          code == 4 and 'insufficient recovery storage' in value.get('error', '') and not output.exists())
+for invalid in ('-1', '9007199254740992', 'bad', '1.5', ''):
+    output = work / ('bad-reserve-' + str(sequence))
+    code, value = invoke(output, '--reserve-free-bytes', invalid)
+    check('invalid reserve is a configuration error before output creation: ' + repr(invalid),
+          code == 4 and value['status'] == 'error' and not output.exists())
+output = work / 'duplicate-reserve'
+code, _ = invoke(output, '--reserve-free-bytes', '0', '--reserve-free-bytes', '1')
+check('duplicate reserve options cannot redefine the storage policy', code == 4 and not output.exists())
+output = work / 'admitted-capacity-dry-run'
+code, value = invoke(output, '--dry-run', '--reserve-free-bytes', '1048576')
+check('sufficient actual capacity retains the complete dry-run plan without creating output',
+      code == 0 and value['status'] == 'planned' and len(value['artifacts']) == 4 and not output.exists())
+
 interrupted = work / 'interrupted'
 code, value = invoke(interrupted, limit=len(binary) + 65536)
 check('real file-size exhaustion cannot publish a partial release', code == 4 and
@@ -161,6 +219,12 @@ check('completed first payload survives the failed second copy',
 check('truncated bytes remain private instead of taking a completed asset name',
       any(0 < p.stat().st_size < second.stat().st_size for p in (interrupted / '.partial').iterdir()))
 before = snapshot(interrupted)
+partial_additional_bytes = None
+for flags in (('--resume',), ('--resume', '--dry-run')):
+    code, value = invoke(interrupted, *flags, '--reserve-free-bytes', '9007199254740991')
+    check('partial capacity refusal preserves completed copies and all private evidence: ' + repr(flags),
+          code == 4 and 'insufficient recovery storage' in value.get('error', '') and snapshot(interrupted) == before)
+    partial_additional_bytes = int(re.search(r'additional_bytes=([0-9]+)', value['error'])[1])
 code, value = invoke(interrupted, '--resume', '--dry-run')
 check('partial dry-run validates existing bytes without filling missing files',
       code == 0 and value['status'] == 'planned' and len(value['artifacts']) == 4 and snapshot(interrupted) == before)
@@ -247,6 +311,10 @@ check('retry retains partial bytes as private evidence, never release payloads',
       {k: v for k, v in snapshot(interrupted / '.partial').items() if k != '.'} ==
       {k: v for k, v in private_before.items() if k != '.'})
 manifest = json.loads((release / 'build-manifest.json').read_bytes())
+remaining_sizes = [second.stat().st_size, archive.stat().st_size,
+                   (release / 'build-manifest.json').stat().st_size, (release / 'result.json').stat().st_size]
+check('resume budget charges only the missing payloads and documents, not retained copies or scratch bytes',
+      partial_additional_bytes == budget(remaining_sizes, 0, os.statvfs(release).f_frsize)[0])
 check('final metadata retains the original checkpoint observation time and archive evidence',
       manifest['recovery_evidence']['recovered_at'] == plan['recovered_at'] and
       any('archive_inventory' in row for row in manifest['recovery_evidence']['artifacts']))
@@ -257,6 +325,9 @@ held = snapshot(interrupted)
 code, repeated = invoke(interrupted, '--resume')
 check('completed managed recovery returns its exact receipt without writes',
       code == 0 and repeated == value and snapshot(interrupted) == held)
+code, retained_result = invoke(interrupted, '--resume', '--reserve-free-bytes', '9007199254740991')
+check('completed read-only retry needs no new allocation even under an unsatisfiable reserve',
+      code == 0 and retained_result == repeated and snapshot(interrupted) == held)
 
 # Real Git responses are forwarded unchanged. Signal the actual supervisor
 # after its final source query, when all staged documents and bytes exist.
