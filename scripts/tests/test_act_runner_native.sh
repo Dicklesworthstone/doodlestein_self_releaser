@@ -12,6 +12,171 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
 
+# Controlled admission boundaries through the complete production modules and
+# real configuration parsers. Healthy cases stop at transport resolution or
+# context export, never at a compiler. Receipts and fixtures are retained.
+test_native_host_health_admission() (
+    command -v python3 >/dev/null && command -v yq >/dev/null && command -v jq >/dev/null || return 3
+    # Pass literal programs as arguments: even a small here-document blocked
+    # in heredoc_write on the native macOS Bash used for these tests.
+    local boundary_program='
+source "$1/src/config.sh" || exit $?
+source "$2" || exit $?
+shift 2
+host_health_is_ready() {
+    printf "health:%s\n" "$1" >> "$ADMISSION_EVENTS"
+    [[ "$1" != "$ADMISSION_UNHEALTHY" ]]
+}
+[[ "$ADMISSION_HEALTH" != missing ]] || unset -f host_health_is_ready
+selector_choose_host() { printf "selector\n" >> "$ADMISSION_EVENTS"; return 1; }
+_act_get_ssh_destination() { printf "destination:%s\n" "$1" >> "$ADMISSION_EVENTS"; return 97; }
+_act_ssh_exec() { printf "UNEXPECTED-SSH\n" >> "$ADMISSION_EVENTS"; return 98; }
+git_ops_export_build_context() { return 99; }
+_act_export_ordinary_git_contexts() { printf "contexts\n" >> "$ADMISSION_EVENTS"; return 99; }
+_act_prepare_ordinary_source_root() { printf "UNEXPECTED-STAGING\n" >> "$ADMISSION_EVENTS"; return 98; }
+"$@"
+'
+    python3 -c "
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+root, module = map(Path, sys.argv[1:3])
+program = sys.argv[3]
+work = Path(tempfile.mkdtemp(prefix='dsr-native-admission-',
+                           dir=os.environ.get('DSR_NATIVE_ADMISSION_TEST_ROOT')))
+print('Retained native admission evidence:', work, flush=True)
+# Fixed before execution: 24 cases, each with status, actual event-sequence,
+# and output/namespace checks. A passing boundary is not a successful build.
+cases = [
+    ('bound-healthy', 'bound', 'healthy'), ('bound-unhealthy', 'bound', 'unhealthy'),
+    ('bound-missing', 'bound', 'missing'), ('pin-healthy', 'pin', 'healthy'),
+    ('pin-unhealthy', 'pin', 'unhealthy'), ('fallback-healthy', 'fallback', 'healthy'),
+    ('fallback-unhealthy', 'fallback', 'unhealthy'), ('disabled-unhealthy', 'disabled', 'unhealthy'),
+    ('strict-healthy', 'strict', 'healthy'), ('strict-unhealthy', 'strict', 'unhealthy'),
+    ('strict-missing', 'strict', 'missing'), ('strict-missing-root', 'missing-root', 'healthy'),
+    ('strict-missing-host', 'missing-host', 'healthy'), ('required-remote', 'required', 'healthy'),
+    ('invalid-remote-policy', 'invalid', 'healthy'), ('sync-healthy', 'sync', 'healthy'),
+    ('sync-unhealthy', 'sync', 'unhealthy'), ('sync-missing', 'sync', 'missing'),
+    ('sync-late-unhealthy', 'late', 'unhealthy'), ('sync-deduplicated', 'duplicate', 'healthy'),
+    ('native-act-alias-healthy', 'local-alias', 'healthy'),
+    ('native-act-alias-unhealthy', 'local-alias', 'unhealthy'),
+    ('native-act-alias-missing', 'local-alias', 'missing'),
+    ('act-only-sync', 'act', 'missing'),
+]
+checks = failures = 0
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+watched = [module, root / 'src/config.sh', root / 'src/guardrails.sh',
+           root / 'scripts/tests/test_act_runner_native.sh']
+def hashes():
+    return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in watched}
+before = hashes()
+(work / 'pre.sha256.json').write_text(json.dumps(before, indent=2) + '\n')
+for label, route, health in cases:
+    directory = work / label
+    config = directory / 'config'
+    recipes = config / 'repos.d'
+    recipes.mkdir(parents=True)
+    source = directory / 'source'
+    source.mkdir()
+    events = directory / 'events'
+    env = dict(os.environ, DSR_CONFIG_DIR=str(config), ACT_CONFIG_DIR=str(config),
+               ACT_REPOS_DIR=str(recipes), DSR_HOSTS_FILE=str(config / 'hosts.yaml'),
+               DSR_REPOS_FILE=str(config / 'repos.yaml'), DSR_CONFIG_FILE=str(config / 'config.yaml'),
+               DSR_STATE_DIR=str(directory / 'state'), DSR_CACHE_DIR=str(directory / 'cache'),
+               ADMISSION_EVENTS=str(events), ADMISSION_HEALTH=health,
+               ADMISSION_UNHEALTHY=('second' if route == 'late' else 'act' if route == 'local-alias' else 'first') if health == 'unhealthy' else '',
+               DSR_DISABLE_HOST_SELECTOR='1' if route == 'disabled' else '0',
+               RCH_REQUIRE_REMOTE='1' if route == 'required' else 'bad-policy' if route == 'invalid' else '0',
+               NO_COLOR='1')
+    hosts = {name: dict(platform='darwin/arm64', connection='ssh', ssh_host=name, enabled=True)
+             for name in ['first', 'second', 'act']}
+    (config / 'hosts.yaml').write_text(json.dumps(dict(hosts=hosts,
+        platform_mapping={'darwin/arm64': 'first'})))
+    recipe = dict(local_path=str(source), language='go', targets=['darwin/arm64'],
+                  act_job_map={'darwin/arm64': None})
+    if route not in ('fallback', 'disabled'):
+        recipe['hosts'] = {'darwin/arm64': 'first'}
+    if route in ('late', 'duplicate'):
+        recipe['targets'].append('darwin/amd64')
+        recipe['hosts']['darwin/amd64'] = 'second' if route == 'late' else 'first'
+    if route == 'local-alias': recipe['hosts']['darwin/arm64'] = 'act'
+    if route == 'act':
+        recipe['act_job_map']['darwin/arm64'] = 'fixture-act-job'
+    if route not in ('bound', 'strict', 'missing-root', 'missing-host', 'required', 'invalid'):
+        (recipes / 'tool.yaml').write_text(json.dumps(recipe))
+    if route in ('sync', 'late', 'duplicate', 'local-alias', 'act'):
+        arguments = ['act_sync_sources', 'tool', '--stage-ordinary']
+        expected = ([] if health == 'missing' else
+                    ['health:first', 'health:second'] if route == 'late' else
+                    ['health:act'] if route == 'local-alias' else ['health:first'])
+        if route == 'act': expected = []
+        elif health == 'healthy': expected.append('contexts')
+    else:
+        arguments = ['act_run_native_build', 'tool', 'darwin/arm64', 'v0.0.0', 'fixture']
+        if route in ('strict', 'missing-root', 'missing-host'):
+            arguments += ['' if route == 'missing-root' else '/remote/source', '1' * 40,
+                          'v0.0.0', '' if route == 'missing-host' else 'first']
+        elif route not in ('pin', 'fallback', 'disabled'):
+            arguments += ['', '', '', 'first']
+        expected = ['selector'] if route == 'fallback' else []
+        if route not in ('missing-root', 'missing-host', 'required', 'invalid'):
+            if health != 'missing': expected.append('health:first')
+            if health == 'healthy': expected.append('destination:first')
+    command = [os.environ.get('BASH', 'bash'), '-c', program, '_', str(root), str(module), *arguments]
+    (directory / 'command.json').write_text(json.dumps(command, indent=2) + '\n')
+    result = subprocess.run(command, env=env, text=True, capture_output=True,
+                            stdin=subprocess.DEVNULL, timeout=20)
+    (directory / 'stdout').write_text(result.stdout)
+    (directory / 'stderr').write_text(result.stderr)
+    (directory / 'exit').write_text(str(result.returncode) + '\n')
+    observed = events.read_text().splitlines() if events.exists() else []
+    check(label + ' actual exit', result.returncode == (0 if route == 'act' else 4))
+    check(label + ' actual ordered admission/boundary calls', observed == expected)
+    context_path = directory / 'state/source-contexts'
+    try:
+        value = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        value = None
+    if route == 'act':
+        valid = isinstance(value, dict) and value.get('status') == 'skipped' and not context_path.exists()
+    elif route in ('required', 'invalid'):
+        valid = isinstance(value, dict) and value.get('reason_code') == (
+            'RCH_REQUIRED_NATIVE_UNAVAILABLE' if route == 'required'
+            else 'INVALID_RCH_REQUIRE_REMOTE') and not context_path.exists()
+    elif route in ('missing-root', 'missing-host'):
+        valid = isinstance(value, dict) and value.get('error') == 'Missing strict native source binding' and not context_path.exists()
+    elif route in ('sync', 'late', 'duplicate', 'local-alias'):
+        valid = isinstance(value, dict) and (value.get('error') == 'Cannot capture ordinary source Git contexts' and context_path.is_dir()
+                 if health == 'healthy' else
+                 isinstance(value, dict) and value.get('error') == 'Native source host is not ready' and not context_path.exists())
+    elif health == 'healthy':
+        valid = not result.stdout and not context_path.exists()
+    else:
+        valid = isinstance(value, dict) and value.get('error') == 'Native build host is not ready' and value.get('host') == 'first' and not context_path.exists()
+    check(label + ' structured result and source namespace', valid)
+after = hashes()
+(work / 'post.sha256.json').write_text(json.dumps(after, indent=2) + '\n')
+check('all exact source and test hashes unchanged', before == after)
+print(f'Native admission: cases={len(cases)} checks={checks} failures={failures}', flush=True)
+sys.exit(bool(failures))
+" "$PROJECT_ROOT" "${DSR_TEST_NATIVE_ADMISSION_MODULE:-$SRC_DIR/act_runner.sh}" "$boundary_program"
+)
+
+if [[ "${1:-}" == --host-health-admission-tests ]]; then
+    test_native_host_health_admission
+    exit $?
+fi
+
 # Actual native entry-point refusals only: no compiler, SSH, substituted
 # backend, cleanup or fake successful RCH receipt. This is not native-build
 # qualification. Run only after the release wave's external admission gates.
@@ -19,6 +184,10 @@ if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
     source "$SRC_DIR/act_runner.sh"
     ACT_REPOS_DIR="$PROJECT_ROOT/.__rch_policy_no_configuration"
     [[ ! -e "$ACT_REPOS_DIR" && ! -L "$ACT_REPOS_DIR" ]] || exit 1
+    policy_health_root=$(mktemp -d) || exit 1
+    policy_health_trace="$policy_health_root/health-calls"
+    printf 'Retained policy admission trace: %s\n' "$policy_health_root"
+    host_health_is_ready() { printf '%s\n' "$1" >> "$policy_health_trace"; }
     # "act" is this native function's local-host alias; these calls stop
     # before compilation and do not invoke a workflow runner.
     for policy in 1 true TRUE yes YeS on enabled EnAbLeD $' \ttrue\r\n'; do
@@ -36,6 +205,7 @@ if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
             ' >/dev/null || exit 1
         done
     done
+    [[ ! -e "$policy_health_trace" ]] || exit 1
     for policy in definitely-not-a-boolean $'\xc2\xa01\xc2\xa0'; do
         policy_status=0
         policy_result=$(RCH_REQUIRE_REMOTE="$policy" act_run_native_build \
@@ -55,6 +225,8 @@ if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
              end)
         ' >/dev/null || exit 1
     done
+    [[ ! -e "$policy_health_trace" ]] || exit 1
+    policy_expected_health_calls=0
     for policy in '' 0 false FaLsE no OFF disabled $' \tfalse\r\n'; do
         policy_status=0
         policy_result=$(RCH_REQUIRE_REMOTE="$policy" act_run_native_build \
@@ -65,6 +237,8 @@ if [[ "${1:-}" == --rch-required-refusal-tests ]]; then
             length == 1 and .[0].status == "error" and .[0].exit_code == 4 and
             .[0].reason_code == null and (.[0].error | startswith("Config not found:"))
         ' >/dev/null || exit 1
+        ((policy_expected_health_calls+=1))
+        [[ $(wc -l < "$policy_health_trace") -eq "$policy_expected_health_calls" ]] || exit 1
     done
     # Parsed recipe-environment tests, not YAML/CLI/native-release proof.
     for policy_environment in \
@@ -362,6 +536,10 @@ echo "0" > "$RSYNC_EXIT_CODE_FILE"
 
 # Source the module under test
 source "$SRC_DIR/act_runner.sh"
+# This suite controls host state and SSH command construction. Real host-health
+# qualification belongs to its integration suite; admission regressions above
+# explicitly exercise healthy, unhealthy, and missing implementations.
+host_health_is_ready() { return 0; }
 # act_runner.sh derives ACT_CONFIG_DIR/ACT_REPOS_DIR from DSR_CONFIG_DIR at
 # source time, which silently pointed this suite's `touch`/`rm -f` of
 # tool.yaml and frankenterm.yaml at the operator's real ~/.config/dsr/repos.d.
@@ -3761,6 +3939,13 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ $# -eq 0 ]]; then
+        if test_native_host_health_admission; then
+            log_pass "Native host admission preserves healthy boundaries and refuses before source writes"
+        else
+            log_fail "Native host admission regression cases failed"
+        fi
+    fi
     if [[ "${1:-}" == --dependency-sources-only ]]; then
         test_unix_strict_rust_forces_out_of_snapshot_target_dir
         test_windows_strict_rust_forces_out_of_snapshot_target_dir

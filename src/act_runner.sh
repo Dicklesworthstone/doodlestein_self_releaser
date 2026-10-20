@@ -2722,8 +2722,8 @@ act_get_native_host() {
     # named in platform_mapping. The selector drops hosts that are disabled or
     # failing health checks (5-minute cache) and scores the rest by free build
     # slots, so a second same-platform box absorbs overflow and covers the first
-    # one being asleep. Any failure here falls through to the static mapping —
-    # a stale health cache must never be able to block a build.
+    # one being asleep. Selection may fall back to the static mapping, but the
+    # source-staging and native-build consumers still require host admission.
     if [[ "${DSR_DISABLE_HOST_SELECTOR:-0}" != "1" ]] && declare -F selector_choose_host &>/dev/null; then
         local selector_args=(--target "$platform")
         [[ -n "$configured_host" ]] && selector_args+=(--prefer "$configured_host")
@@ -6243,6 +6243,15 @@ act_sync_sources() {
             fi
         done
         $already_added && continue
+        # Resolve every host before exporting contexts or staging any source.
+        # Repo pins and selector fallback choose a location, not permission to
+        # write there; the same health gate must admit those paths as well.
+        if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "$host"; then
+            _log_error "Native source host is not ready: $host"
+            jq -nc --arg host "$host" \
+                '{status:"error",exit_code:4,host:$host,error:"Native source host is not ready"}'
+            return 4
+        fi
         local configured_remote_path="$remote_path"
         if $stage_ordinary; then
             ordinary_stage_id=$(_act_generate_uuid) || return 4
@@ -8695,15 +8704,6 @@ act_run_native_build() {
         jq -nc '{status: "error", exit_code: 4, error: "Missing strict native source binding"}'
         return 4
     fi
-    if [[ -n "$release_git_sha" || -n "$release_git_ref" ]]; then
-        if ! declare -F host_health_is_ready &>/dev/null || \
-           ! host_health_is_ready "$bound_host"; then
-            _log_error "Pinned strict build host is not ready: $bound_host"
-            jq -nc '{status: "error", exit_code: 4, error: "Pinned strict build host is not ready"}'
-            return 4
-        fi
-    fi
-
     local host
     host="$bound_host"
     [[ -n "$host" ]] || host=$(act_get_native_host "$platform" "$tool_name")
@@ -8711,6 +8711,14 @@ act_run_native_build() {
         _log_error "No native host configured for platform: $platform"
         jq -nc --arg platform "$platform" \
             '{status: "error", exit_code: 4, error: ("No native host for " + $platform)}'
+        return 4
+    fi
+    # Native callers may supply a host directly, use a repo pin, or fall back
+    # after selector failure. All routes consume the same readiness decision.
+    if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "$host"; then
+        _log_error "Native build host is not ready: $host"
+        jq -nc --arg host "$host" \
+            '{status:"error",exit_code:4,host:$host,error:"Native build host is not ready"}'
         return 4
     fi
     local ssh_destination="$host"

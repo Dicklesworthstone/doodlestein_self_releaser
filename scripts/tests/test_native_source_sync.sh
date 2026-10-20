@@ -210,6 +210,10 @@ source "$ROOT/src/act_runner.sh"
 source "$ROOT/src/artifact_naming.sh"
 # shellcheck source=../../src/host_selector.sh
 source "$ROOT/src/host_selector.sh"
+# Both ordinary and strict extracted consumers use real health admission over
+# the fixture's local SSH transport before staging source or compiling.
+# shellcheck source=../../src/host_health.sh
+source "$ROOT/src/host_health.sh"
 # shellcheck source=../../src/git_ops.sh
 source "$ROOT/src/git_ops.sh"
 # shellcheck source=../../src/packaging.sh
@@ -283,10 +287,6 @@ run_build() {
 }
 
 test_strict_publication() {
-    # The ordinary extraction path has no host-health dependency. Strict
-    # workers must run the real readiness checks over the same local transport.
-    # shellcheck source=../../src/host_health.sh
-    source "$ROOT/src/host_health.sh" || return 1
     local strict_output="$WORK/strict-output" strict_manifest strict_sha compilers_before
     strict_manifest="$strict_output/strictseal-v4.0.0-manifest.json"
     strict_sha=$(git -C "$WORK/source" rev-parse HEAD) || return 1

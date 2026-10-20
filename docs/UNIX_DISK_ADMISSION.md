@@ -26,6 +26,14 @@ host verdict. The admission fingerprint changed, so cached results created by
 the old percentage-only policy cannot authorize a build under the new policy.
 Windows storage policy is unchanged.
 
+Both native source staging and native compilation require host-health admission,
+including ordinary builds, explicit repository host pins, and static mapping
+fallback after selector failure. Source planning checks every distinct native
+host before exporting source contexts or staging on any host. The native runner
+checks its final resolved host again before resolving transport or preparing a
+build. Missing health support is an error. Act-only source handling is unchanged;
+the earlier required-remote and strict source-binding checks still apply.
+
 ## Default writable locations
 
 Without a `unix_storage` opt-in, the host now checks all of these roles in its
