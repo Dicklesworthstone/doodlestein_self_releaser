@@ -4407,7 +4407,7 @@ _act_validate_cargo_metadata_source_closure() {
 
         if [[ "$package_root" == "$canonical_source_root" || \
               "$package_root" == "$canonical_source_root/"* ]]; then
-            ((main_package_count++))
+            main_package_count=$((main_package_count + 1))
             continue
         fi
 
@@ -6445,7 +6445,7 @@ act_sync_sources() {
             fi
 
             if $sync_ok; then
-                ((synced++))
+                synced=$((synced + 1))
                 results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     --arg configured_path "${configured_host_paths[$i]}" --argjson staged "$stage_ordinary" \
                     --argjson context "$restored_primary" --argjson siblings "$restored_siblings" \
@@ -6455,13 +6455,13 @@ act_sync_sources() {
                 source_root_entries+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     '{key: $host, value: $path}')")
             else
-                ((failed++))
+                failed=$((failed + 1))
                 results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                     --arg error "$(_act_sync_error_summary "$host_sync_output")" \
                     '{host: $host, path: $path, status: "failed", error: $error}')")
             fi
         else
-            ((failed++))
+            failed=$((failed + 1))
             results+=("$(jq -nc --arg host "$host" --arg path "$remote_path" \
                 --arg error "$(_act_sync_error_summary "$host_sync_output")" \
                 '{host: $host, path: $path, status: "failed", error: $error}')")
@@ -7173,10 +7173,10 @@ act_ensure_repos_ready() {
 
         if act_ensure_remote_repo_ready "$host" "$remote_path" "$repo_url" "$version"; then
             results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"ready\"}")
-            ((ready++))
+            ready=$((ready + 1))
         else
             results+=("{\"host\":\"$host\",\"path\":\"$remote_path\",\"status\":\"failed\"}")
-            ((failed++))
+            failed=$((failed + 1))
         fi
     done
 
@@ -12839,9 +12839,9 @@ _act_generate_contract_manifest() {
             candidate_name=$(basename "$candidate")
             if [[ "$candidate_name" == "$expected_name" ]]; then
                 primary_path="$candidate"
-                ((primary_count++))
+                primary_count=$((primary_count + 1))
             elif [[ "$candidate_name" == "${expected_name}.sha256" ]]; then
-                ((sidecar_count++))
+                sidecar_count=$((sidecar_count + 1))
             else
                 configured_target=$(jq -r --arg name "$candidate_name" '
                     .exact_primary_assets | to_entries[] | select(.value == $name) | .key
