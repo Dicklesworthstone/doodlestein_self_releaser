@@ -11,10 +11,18 @@ source "$PROJECT_ROOT/src/artifact_naming.sh"
 # that production gate available even though lazy module loading is replaced
 # below; only the existing network and configuration boundaries are fixtures.
 source "$PROJECT_ROOT/src/act_runner.sh"
+source "$PROJECT_ROOT/src/signing.sh"
 # Load the real command without dispatching the CLI or contacting build hosts.
+# shellcheck source=/dev/null
 source <(awk '/^cmd_release\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+# shellcheck source=/dev/null
+source <(awk '/^_source_release_read_private_receipt\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+# shellcheck source=/dev/null
+source <(awk '/^_release_prepare_ordinary_checksums\(\) \(/{copy=1} copy{print} copy && /^\)/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+# shellcheck source=/dev/null
+source <(awk '/^_release_file_size\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 
-TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-resume-tests.XXXXXXXX")
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-resume-tests.XXXXXXXX") || exit 4
 # Retain the isolated fixtures and request logs for failure diagnosis.
 printf 'Fixtures: %s\n' "$TEST_ROOT"
 PASS=0 FAIL=0
@@ -42,8 +50,30 @@ _release_contract_create_nonce() { printf '%064d\n' 1; }
 _release_contract_preflight() { printf 'STRICT-PREFLIGHT\n' >> "$CALLS"; return 4; }
 _dispatch_load_config() { printf 'true|release-ready|owner/downstream\n'; }
 _dispatch_is_true() { [[ "$1" == true ]]; }
-_dispatch_send_all() { printf 'DISPATCH\n' >> "$CALLS"; printf '[]\n'; }
-gh_resolve_tag_sha() { printf '%040d\n' 1; }
+_dispatch_send_all() {
+    printf 'DISPATCH\nDISPATCH-URL %s\n' "$6" >> "$CALLS"
+    printf '[]\n'
+}
+gh_resolve_tag_sha() {
+    if [[ -n "${STAGED_SOURCE_SHA:-}" ]]; then
+        case "$STAGED_REMOTE_MODE" in
+            unavailable) return 8 ;;
+            moved) printf '%040d\n' 1; return 0 ;;
+            after-publish)
+                if [[ "$(jq -r '.draft' "$CASE/release.json")" == false ]]; then
+                    printf '%040d\n' 1; return 0
+                fi ;;
+            absent-*)
+                [[ "$(jq -r '.draft' "$CASE/release.json")" == false ]] || return 8
+                if [[ "$STAGED_REMOTE_MODE" == absent-wrong-created ]]; then
+                    printf '%040d\n' 1; return 0
+                fi ;;
+        esac
+        printf '%s\n' "$STAGED_SOURCE_SHA"
+    else
+        printf '%040d\n' 1
+    fi
+}
 upgrade_verify_tool() { printf 'UPGRADE\n' >> "$CALLS"; }
 json_envelope() {
     jq -nc --arg command "$1" --arg status "$2" --argjson exit_code "$3" \
@@ -72,10 +102,17 @@ setup() {
       upload_url:"https://uploads.github.com/repos/owner/repo/releases/9/assets{?name,label}",
       html_url:"https://github.com/owner/repo/releases/tag/v1.2.3",assets:[]}' > "$CASE/release.json"
     printf 'real payload\n' > "$CASE/artifacts/payload.bin"
-    JSON_MODE=true DRY_RUN=false STRICT_CONTRACT=null COLLIDE_NAMES=false
+    export JSON_MODE=true DRY_RUN=false
+    STRICT_CONTRACT=null COLLIDE_NAMES=false
     LOOKUP_FAIL=false INVENTORY_FAIL=false UPLOAD_FAIL=false LOST_RESPONSE=false
     CREATE_FAIL=true FINAL_DRIFT=false VISIBILITY_DRIFT=false FAIL_NAME=""
-    GH_MAX_RETRIES=2 GH_RETRY_DELAY=0
+    LOST_CREATE_RESPONSE=false PUBLISH_FAIL=false LOST_PUBLISH_RESPONSE=false
+    PUBLISH_ASSET_DRIFT=false PUBLISH_METADATA_DRIFT=false UPLOAD_METADATA_DRIFT=false
+    UPLOAD_DESTINATION_DRIFT=false PUBLISH_DESTINATION_DRIFT=false
+    EXTRA_ASSET=false DROP_SIDECAR="" CREATE_INTENT_DRIFT=false
+    CONCURRENT_PUBLISH=false STAGED_SOURCE_SHA="" STAGED_REMOTE_MODE=valid
+    export DSR_RELEASE_STATE_RETRY_DELAY_SECONDS=0
+    export GH_MAX_RETRIES=2 GH_RETRY_DELAY=0
 }
 
 remote_put() {
@@ -98,12 +135,25 @@ journal() {
 }
 
 manifest() {
-    local name="$1" target="${2:-}" format="${3:-none}" sha
+    local name="$1" target="${2:-}" format="${3:-none}" sha size
     sha=$(_gh_asset_sha256 "$CASE/artifacts/$name") || return 1
+    size=$(wc -c < "$CASE/artifacts/$name") || return 1
     jq -nc --arg name "$name" --arg sha "$sha" --arg target "$target" --arg format "$format" \
+        --argjson size "$size" \
         '{tool:"tool",version:"v1.2.3",status:"success",
-          artifacts:[{name:$name,sha256:$sha,target:$target,archive_format:$format}]}' > \
+          artifacts:[{name:$name,sha256:$sha,size_bytes:$size,target:$target,archive_format:$format}]}' > \
         "$CASE/artifacts/tool-v1.2.3-manifest.json"
+}
+
+# Build packaging materializes every final alias before the manifest is
+# frozen. Preserve the owning artifact's bytes, size and target identity.
+manifest_alias() {
+    local original="$1" alias="$2" manifest_file="$CASE/artifacts/tool-v1.2.3-manifest.json"
+    cp "$CASE/artifacts/$original" "$CASE/artifacts/$alias" || return 1
+    jq --arg original "$original" --arg alias "$alias" \
+        '.artifacts += [.artifacts[] | select(.name == $original) | .name=$alias]' \
+        "$manifest_file" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$manifest_file"
 }
 
 _release_contract_scan_release_by_tag() {
@@ -112,18 +162,99 @@ _release_contract_scan_release_by_tag() {
     jq -nc --slurpfile release "$CASE/release.json" '{count:1,release:$release[0]}'
 }
 
-gh_create_release() {
-    printf 'CREATE\n' >> "$CALLS"
+gh_create_release() (
+    { printf 'CREATE'; printf ' %q' "$@"; printf '\n'; } >> "$CALLS"
     $CREATE_FAIL && return 22
-    cat "$CASE/release.json"
-}
+    # Exercise the real POST builder, transport response file and private
+    # retention validator. Only GitHub's actual network boundary is replaced.
+    source "$PROJECT_ROOT/src/github.sh"
+    gh_check() { return 0; }
+    _gh_api_with_gh() {
+        [[ "$1" == repos/owner/repo/releases && "$2" == POST ]] || return 8
+        printf '%s\n' "$3" > "$CASE/create-request.json"
+        jq --argjson request "$3" '. + $request | .assets=[] |
+            .html_url="https://github.com/owner/repo/releases/tag/untagged-0123456789abcdef0123"' \
+            "$CASE/release.json" > "$CASE/release.next" || return 8
+        mv "$CASE/release.next" "$CASE/release.json" || return 8
+        if [[ -n "$DROP_SIDECAR" ]]; then
+            mv "$CASE/artifacts/$DROP_SIDECAR" "$CASE/dropped-sidecar" || return 8
+        fi
+        if $CREATE_INTENT_DRIFT; then
+            jq '.publish=(.publish|not)' "$TMPDIR/intent.json" > "$TMPDIR/intent.next" || return 8
+            chmod 600 "$TMPDIR/intent.next" || return 8
+            mv "$TMPDIR/intent.next" "$TMPDIR/intent.json" || return 8
+        fi
+        $LOST_CREATE_RESPONSE && return 8
+        cat "$CASE/release.json"
+    }
+    gh_create_release "$@"
+)
 
 gh_api() {
     printf 'API %s\n' "$*" >> "$CALLS"
-    case "$1" in
+    local endpoint="$1" method=GET data=""
+    shift
+    while (($#)); do
+        case "$1" in
+            --method) method="$2"; shift 2 ;;
+            --data) data="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [[ "$method" == PATCH ]]; then
+        [[ "$endpoint" == repos/owner/repo/releases/9 ]] || return 8
+        if [[ "$data" == '{"draft":false}' ]]; then
+            printf 'PUBLISH\n' >> "$CALLS"
+            $PUBLISH_FAIL && return 8
+        else
+            [[ "$data" == '{"draft":true}' ]] || return 8
+            printf 'RESTORE-DRAFT\n' >> "$CALLS"
+        fi
+        jq --argjson patch "$data" '. + $patch |
+            .html_url=(if .draft then "https://github.com/owner/repo/releases/tag/untagged-fedcba9876543210"
+                       else "https://github.com/owner/repo/releases/tag/v1.2.3" end)' \
+            "$CASE/release.json" > "$CASE/release.next" &&
+            mv "$CASE/release.next" "$CASE/release.json" || return 8
+        if [[ "$data" == '{"draft":false}' ]]; then
+            if $PUBLISH_ASSET_DRIFT; then
+                jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next" &&
+                    mv "$CASE/inventory.next" "$CASE/inventory.json" || return 8
+            fi
+            if $PUBLISH_METADATA_DRIFT; then
+                jq '.body="Another publisher changed these notes"' "$CASE/release.json" > "$CASE/release.next" &&
+                    mv "$CASE/release.next" "$CASE/release.json" || return 8
+            fi
+            if $PUBLISH_DESTINATION_DRIFT; then
+                jq '.html_url="https://github.com/another/repo/releases/tag/v1.2.3"' \
+                    "$CASE/release.json" > "$CASE/release.next" &&
+                    mv "$CASE/release.next" "$CASE/release.json" || return 8
+            fi
+            $LOST_PUBLISH_RESPONSE && return 8
+        fi
+        cat "$CASE/release.json"
+        return 0
+    fi
+    case "$endpoint" in
+        repos/owner/repo/git/matching-refs/tags/v1.2.3)
+            printf 'TAG-ABSENCE\n' >> "$CALLS"
+            case "$STAGED_REMOTE_MODE" in
+                absent-unavailable) return 8 ;;
+                absent-malformed) printf '[{"ref":"refs/tags/v1.2.3-rc.1","object":{"sha":"short"}}]\n' ;;
+                absent-nonarray) printf '{}\n' ;;
+                absent-prefix|absent-exact|absent-wrong-realm)
+                    local suffix='-rc.1' remote_repo='owner/repo'
+                    [[ "$STAGED_REMOTE_MODE" != absent-exact ]] || suffix=''
+                    [[ "$STAGED_REMOTE_MODE" != absent-wrong-realm ]] || remote_repo='another/repo'
+                    jq -nc --arg ref "refs/tags/v1.2.3$suffix" --arg repo "$remote_repo" --arg sha "$STAGED_SOURCE_SHA" \
+                        '[{ref:$ref,url:("https://api.github.com/repos/"+$repo+"/git/"+$ref),
+                           object:{type:"commit",sha:$sha,url:("https://api.github.com/repos/"+$repo+"/git/commits/"+$sha)}}]' ;;
+                absent-empty|absent-wrong-created) printf '[]\n' ;;
+                *) return 8 ;;
+            esac
+            ;;
         repos/owner/repo/releases/9/assets\?per_page=100\&page=*)
             $INVENTORY_FAIL && return 8
-            local page="${1##*page=}"
+            local page="${endpoint##*page=}"
             if $FINAL_DRIFT && [[ -f "$CASE/post-complete" ]]; then
                 jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next"
                 mv "$CASE/inventory.next" "$CASE/inventory.json"
@@ -139,7 +270,7 @@ gh_api() {
             ;;
         repos/owner/repo/releases/assets/*)
             # Negative-control behavior: old cmd_release deletes valid assets.
-            local id="${1##*/}"
+            local id="${endpoint##*/}"
             jq --argjson id "$id" '[.[] | select(.id != $id)]' "$CASE/inventory.json" > "$CASE/inventory.next" &&
                 mv "$CASE/inventory.next" "$CASE/inventory.json"
             ;;
@@ -167,10 +298,28 @@ curl() {
     name="${url##*?name=}"
     name="${name//%2B/+}"
     printf 'POST %s\n' "$name" >> "$CALLS"
+    printf 'UPLOAD-VISIBILITY %s %s\n' "$name" "$(jq -r '.draft' "$CASE/release.json")" >> "$CALLS"
     printf 'HTTP/1.1 201 Created\r\n\r\n' > "$headers"
     if $UPLOAD_FAIL || [[ "$name" == "$FAIL_NAME" ]]; then printf '503'; return 0; fi
     remote_put "$name" "$payload" || return 4
     jq -c '.[-1]' "$CASE/inventory.json" > "$response"
+    if $EXTRA_ASSET && ! jq -e 'any(.[]; .name=="unexpected.bin")' "$CASE/inventory.json" >/dev/null; then
+        remote_put unexpected.bin "$payload" || return 4
+    fi
+    if $UPLOAD_METADATA_DRIFT; then
+        jq '.body="Another publisher changed these notes"' "$CASE/release.json" > "$CASE/release.next" &&
+            mv "$CASE/release.next" "$CASE/release.json" || return 4
+    fi
+    if $UPLOAD_DESTINATION_DRIFT; then
+        jq '.html_url="https://github.com/another/repo/releases/tag/v1.2.3"' \
+            "$CASE/release.json" > "$CASE/release.next" &&
+            mv "$CASE/release.next" "$CASE/release.json" || return 4
+    fi
+    if $CONCURRENT_PUBLISH; then
+        jq '.draft=false | .html_url="https://github.com/owner/repo/releases/tag/v1.2.3"' \
+            "$CASE/release.json" > "$CASE/release.next" &&
+            mv "$CASE/release.next" "$CASE/release.json" || return 4
+    fi
     : > "$CASE/post-complete"
     if $LOST_RESPONSE; then printf '000'; return 28; fi
     printf '201'
@@ -259,8 +408,10 @@ test_draft_resume_does_not_dispatch_or_verify_upgrade() {
 
 test_named_upload_emits_one_json_envelope() {
     setup aliases
-    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
+    mv "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
     manifest tool-linux-amd64.tar.gz linux/amd64 tar.gz
+    manifest_alias tool-linux-amd64.tar.gz tool-1.2.3-linux-amd64.tar.gz || return 1
+    manifest_alias tool-linux-amd64.tar.gz tool-linux-x86_64.tar.gz || return 1
     run_release --resume
     [[ $STATUS -eq 0 ]] && jq -es 'length==1 and .[0].command=="release"' "$CASE/stdout" >/dev/null &&
         grep -Fxq 'POST tool-1.2.3-linux-amd64.tar.gz' "$CALLS" &&
@@ -320,8 +471,10 @@ test_dry_run_has_no_network_or_checkpoint_writes() {
 # the same list the upload loop uses, without touching GitHub or the disk.
 test_dry_run_plans_every_upload_name() {
     setup dryrun_plan
-    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
+    mv "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
     manifest tool-linux-amd64.tar.gz linux/amd64 tar.gz
+    manifest_alias tool-linux-amd64.tar.gz tool-1.2.3-linux-amd64.tar.gz || return 1
+    manifest_alias tool-linux-amd64.tar.gz tool-linux-x86_64.tar.gz || return 1
     DRY_RUN=true
     run_release --resume
     [[ $STATUS -eq 0 && ! -s "$CALLS" && ! -e "$CASE/artifacts/SHA256SUMS" ]] &&
@@ -349,8 +502,10 @@ installer_fixture() {
         jq -nc --arg name "$INSTALLER_EXPECTS" \
             '{script:"install.sh",pattern:"x",name:$name,ext:"tar.gz",ext_mismatch:false}'
     }
-    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
+    mv "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz"
     manifest tool-linux-amd64.tar.gz linux/amd64 tar.gz
+    manifest_alias tool-linux-amd64.tar.gz tool-1.2.3-linux-amd64.tar.gz || return 1
+    manifest_alias tool-linux-amd64.tar.gz tool-linux-x86_64.tar.gz || return 1
 }
 
 test_dry_run_reports_installer_mismatch() {
@@ -409,18 +564,30 @@ variant_fixture() {
         jq -nc --arg versioned "tool-${2#v}-$platform.$5" --arg compat "tool-$platform.$5" \
             '{versioned:$versioned,compat:$compat,same:($versioned==$compat)}'
     }
-    local name rows='[]' sha triple
+    local name rows='[]' sha size triple primary=""
+    mv "$CASE/artifacts/payload.bin" "$CASE/unselected-payload.bin" || return 1
     for name in "$@"; do
         printf '%s payload\n' "$name" > "$CASE/artifacts/$name"
         sha=$(_gh_asset_sha256 "$CASE/artifacts/$name") || return 1
+        size=$(wc -c < "$CASE/artifacts/$name") || return 1
         triple=$(artifact_naming_artifact_variant tool linux amd64 "$name") || return 1
         triple="${triple%%$'\t'*}"
-        rows=$(jq -c --arg name "$name" --arg sha "$sha" --arg triple "$triple" \
-            '. + [{name:$name,sha256:$sha,target:"linux/amd64",target_triple:$triple,
+        [[ "$triple" != x86_64-unknown-linux-gnu ]] || primary="$name"
+        rows=$(jq -c --arg name "$name" --arg sha "$sha" --arg triple "$triple" --argjson size "$size" \
+            '. + [{name:$name,sha256:$sha,size_bytes:$size,target:"linux/amd64",target_triple:$triple,
                    archive_format:"tar.gz"}]' <<< "$rows")
     done
     jq -nc --argjson rows "$rows" '{tool:"tool",version:"v1.2.3",status:"success",artifacts:$rows}' > \
-        "$CASE/artifacts/tool-v1.2.3-manifest.json"
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    if [[ "$TRIPLE_NAMING" == true ]]; then
+        for name in "$@"; do
+            manifest_alias "$name" "${name/tool-1.2.3-/tool-}" || return 1
+        done
+    else
+        [[ -n "$primary" ]] || return 1
+        manifest_alias "$primary" tool-linux-amd64.tar.gz || return 1
+        manifest_alias "$primary" tool-linux-x86_64.tar.gz || return 1
+    fi
 }
 
 planned_names() {
@@ -447,11 +614,25 @@ test_shared_variant_names_go_to_the_primary_build() {
     variant_fixture tool-1.2.3-linux-amd64-musl.tar.gz tool-1.2.3-linux-amd64.tar.gz
     DRY_RUN=true
     run_release --resume
+    local gnu_sha musl_sha alias
+    gnu_sha=$(_gh_asset_sha256 "$CASE/artifacts/tool-1.2.3-linux-amd64.tar.gz") || return 1
+    musl_sha=$(_gh_asset_sha256 "$CASE/artifacts/tool-1.2.3-linux-amd64-musl.tar.gz") || return 1
     [[ $STATUS -eq 0 ]] &&
-        [[ "$(planned_names tool-1.2.3-linux-amd64-musl.tar.gz)" == '["tool-1.2.3-linux-amd64-musl.tar.gz"]' ]] &&
-        [[ "$(planned_names tool-1.2.3-linux-amd64.tar.gz)" == \
-            '["tool-1.2.3-linux-amd64.tar.gz","tool-linux-amd64.tar.gz","tool-linux-x86_64.tar.gz"]' ]] &&
-        grep -q 'Upload name tool-linux-amd64.tar.gz is derived by several variants; publishing it as tool-1.2.3-linux-amd64.tar.gz' "$CASE/stderr"
+        [[ "$gnu_sha" != "$musl_sha" ]] &&
+        [[ "$(planned_names tool-1.2.3-linux-amd64-musl.tar.gz)" == '["tool-1.2.3-linux-amd64-musl.tar.gz"]' ]] || return 1
+    # A frozen manifest has a real row for each final alias. The exact name
+    # therefore owns itself; byte and target ownership must still be GNU,
+    # irrespective of manifest order or which primary row derived the name.
+    for alias in tool-linux-amd64.tar.gz tool-linux-x86_64.tar.gz; do
+        [[ "$(_gh_asset_sha256 "$CASE/artifacts/$alias")" == "$gnu_sha" ]] || return 1
+        jq -e --arg alias "$alias" --arg sha "$gnu_sha" --arg musl "$musl_sha" '
+            [.details.plan.artifacts[] | select(.upload_names | index($alias))] as $owners |
+            ($owners | length) == 1 and
+            ($owners[0] | .name == $alias and .sha256 == $sha and .sha256 != $musl and
+                .target_triple == "x86_64-unknown-linux-gnu" and
+                ([.upload_names[] | select(. == $alias)] | length) == 1)
+        ' "$CASE/stdout" >/dev/null || return 1
+    done
 }
 
 test_shared_variant_names_upload_without_collision() {
@@ -459,14 +640,29 @@ test_shared_variant_names_upload_without_collision() {
     TRIPLE_NAMING=false
     variant_fixture tool-1.2.3-linux-amd64-musl.tar.gz tool-1.2.3-linux-amd64.tar.gz
     run_release --resume
-    local gnu_sha compat_sha
+    local gnu_sha compat_sha alias remote_id
     gnu_sha=$(_gh_asset_sha256 "$CASE/artifacts/tool-1.2.3-linux-amd64.tar.gz")
     compat_sha=$(jq -r '.[] | select(.name == "tool-linux-amd64.tar.gz") | .digest' "$CASE/inventory.json")
     [[ $STATUS -eq 0 && "$compat_sha" == "sha256:$gnu_sha" ]] &&
         [[ "$(grep -c '^POST tool-linux-amd64.tar.gz$' "$CALLS")" == 1 ]] &&
         grep -Fxq 'POST tool-1.2.3-linux-amd64-musl.tar.gz' "$CALLS" &&
         grep -q "^$gnu_sha  tool-linux-amd64.tar.gz\$" "$CASE/artifacts/SHA256SUMS" &&
-        ! grep -q 'Different artifact contents' "$CASE/stderr"
+        ! grep -q 'Different artifact contents' "$CASE/stderr" || return 1
+    for alias in tool-linux-amd64.tar.gz tool-linux-x86_64.tar.gz; do
+        remote_id=$(jq -er --arg alias "$alias" '.[] | select(.name == $alias) | .id' "$CASE/inventory.json") || return 1
+        [[ "$(grep -Fxc "POST $alias" "$CALLS")" == 1 ]] &&
+            cmp -s "$CASE/remote/$remote_id" "$CASE/artifacts/tool-1.2.3-linux-amd64.tar.gz" &&
+            ! cmp -s "$CASE/remote/$remote_id" "$CASE/artifacts/tool-1.2.3-linux-amd64-musl.tar.gz" || return 1
+    done
+    # An alias mentioned in the manifest but no longer materialized cannot be
+    # claimed as verified GNU on retry. Retain the successful request evidence.
+    mv "$CALLS" "$CASE/verified-upload.calls" &&
+        mv "$CASE/stdout" "$CASE/verified-upload.stdout" &&
+        mv "$CASE/stderr" "$CASE/verified-upload.stderr" &&
+        mv "$CASE/artifacts/tool-linux-amd64.tar.gz" "$CASE/retained-gnu-alias.tar.gz" || return 1
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]]
 }
 
 test_remote_drift_after_upload_prevents_success() {
@@ -574,7 +770,7 @@ test_unmanifested_directory_is_refused() {
 # on GitHub is created at the tagged commit, not the default branch head.
 test_artifacts_must_come_from_the_tagged_commit() {
     setup tag_binding
-    local tagged head original_create
+    local tagged head
     git init -q "$CASE/checkout" &&
         git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m tagged &&
         git -C "$CASE/checkout" tag v1.2.3 &&
@@ -595,10 +791,9 @@ test_artifacts_must_come_from_the_tagged_commit() {
 
     jq --arg sha "$tagged" '.source.git_sha = $sha' "$manifest_file" > "$manifest_file.new" &&
         mv "$manifest_file.new" "$manifest_file"
-    original_create=$(declare -f gh_create_release)
-    gh_create_release() { printf 'CREATE %s\n' "$*" >> "$CALLS"; cat "$CASE/release.json"; }
+    CREATE_FAIL=false
+    gh_resolve_tag_sha() { printf '%s\n' "$tagged"; }
     run_release
-    eval "$original_create"
     [[ $STATUS -eq 0 ]] && grep -q -- "^CREATE .*--target-commitish $tagged" "$CALLS"
 }
 
@@ -610,6 +805,371 @@ test_wrong_repository_upload_url_is_rejected() {
     run_release --resume
     [[ $STATUS -eq 7 ]] && ! grep -q '^POST\|^DISPATCH' "$CALLS"
 }
+
+staged_manifest() {
+    local name sha size rows='[]'
+    for name in "$@"; do
+        sha=$(_gh_asset_sha256 "$CASE/artifacts/$name") || return 1
+        size=$(wc -c < "$CASE/artifacts/$name") || return 1
+        rows=$(jq -c --arg name "$name" --arg sha "$sha" --argjson size "$size" \
+            '. + [{name:$name,sha256:$sha,size_bytes:$size,target:"",archive_format:"none"}]' <<< "$rows") || return 1
+    done
+    jq -nc --argjson rows "$rows" '{tool:"tool",version:"v1.2.3",status:"success",artifacts:$rows}' > \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json"
+}
+
+test_staged_creation_publishes_only_after_private_uploads() {
+    setup staged_success
+    CREATE_FAIL=false
+    run_release --verify-upgrade
+    [[ $STATUS -eq 0 ]] && jq -e '.draft==true' "$CASE/create-request.json" >/dev/null &&
+        grep -Fxq 'UPLOAD-VISIBILITY payload.bin true' "$CALLS" &&
+        [[ $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] && grep -Fxq DISPATCH "$CALLS" &&
+        grep -Fxq UPGRADE "$CALLS" &&
+        grep -Fxq 'DISPATCH-URL https://github.com/owner/repo/releases/tag/v1.2.3' "$CALLS" &&
+        jq -e '.details.draft==false and (.details.staging_receipt|length>0) and
+            .details.release_url=="https://github.com/owner/repo/releases/tag/v1.2.3"' "$CASE/stdout" >/dev/null &&
+        [[ $(stat -c %a "$(jq -r '.details.staging_receipt' "$CASE/stdout")") == 600 ]]
+}
+
+test_staged_dry_run_creates_no_custody() {
+    setup staged_dry_run
+    CREATE_FAIL=false DRY_RUN=true
+    staged_manifest payload.bin || return 1
+    run_release
+    [[ $STATUS -eq 0 && ! -s "$CALLS" && ! -e "$CASE/artifacts/SHA256SUMS" ]] &&
+        ! compgen -G "$CASE/state/releases/dsr-publication.*" >/dev/null &&
+        jq -e '.status=="dry_run" and .details.dry_run' "$CASE/stdout" >/dev/null
+}
+
+test_staged_interrupted_upload_resumes_and_publishes() {
+    setup staged_retry
+    CREATE_FAIL=false FAIL_NAME=second.bin
+    printf 'second payload\n' > "$CASE/artifacts/second.bin"
+    run_release
+    [[ $STATUS -eq 1 ]] && jq -e '.draft==true' "$CASE/release.json" >/dev/null &&
+        jq -e '.details.verification=="incomplete"' "$CASE/stdout" >/dev/null &&
+        ! grep -q '^PUBLISH\|^DISPATCH' "$CALLS" || return 1
+    FAIL_NAME=""
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE\|^POST payload.bin$' "$CALLS" &&
+        grep -Fxq 'POST second.bin' "$CALLS" && grep -Fxq PUBLISH "$CALLS" &&
+        jq -e '.details.draft==false and .details.success==2' "$CASE/stdout" >/dev/null
+}
+
+test_staged_generated_checksums_remain_bound_across_retry() {
+    setup staged_checksums
+    CREATE_FAIL=false FAIL_NAME=payload.bin
+    staged_manifest payload.bin || return 1
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    local intent before
+    intent=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+    before=$(_gh_asset_sha256 "$intent") || return 1
+    FAIL_NAME=""
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 0 && "$(_gh_asset_sha256 "$intent")" == "$before" ]] &&
+        [[ $(grep -c '^POST ' "$CALLS") -eq 1 ]] && grep -Fxq 'POST payload.bin' "$CALLS" &&
+        jq -e '.assets | map(.name) == ["SHA256SUMS","payload.bin","payload.bin.sha256","tool-v1.2.3-manifest.json"]' "$intent" >/dev/null
+}
+
+test_staged_manifest_aliases_are_all_verified() {
+    setup staged_aliases
+    CREATE_FAIL=false
+    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-1.2.3-linux-amd64.tar.gz" &&
+        cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-amd64.tar.gz" &&
+        cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/tool-linux-x86_64.tar.gz" &&
+        mv "$CASE/artifacts/payload.bin" "$CASE/fixture-payload.bin" || return 1
+    staged_manifest tool-linux-amd64.tar.gz tool-1.2.3-linux-amd64.tar.gz tool-linux-x86_64.tar.gz || return 1
+    jq '.artifacts |= map(.target="linux/amd64" | .archive_format="tar.gz")' \
+        "$CASE/artifacts/tool-v1.2.3-manifest.json" > "$CASE/manifest.next" &&
+        mv "$CASE/manifest.next" "$CASE/artifacts/tool-v1.2.3-manifest.json" || return 1
+    run_release
+    [[ $STATUS -eq 0 ]] && grep -Fxq PUBLISH "$CALLS" &&
+        jq -e '.details.success==8 and .details.draft==false' "$CASE/stdout" >/dev/null &&
+        [[ $(grep -c '^POST tool-linux-x86_64.tar.gz$' "$CALLS") -eq 1 ]]
+}
+
+test_staged_explicit_draft_stays_private_on_resume() {
+    setup staged_explicit_draft
+    CREATE_FAIL=false
+    run_release --draft
+    [[ $STATUS -eq 0 ]] && ! grep -q '^PUBLISH\|^DISPATCH' "$CALLS" || return 1
+    : > "$CALLS"
+    run_release --resume --verify-upgrade
+    [[ $STATUS -eq 0 ]] && ! grep -q '^PUBLISH\|^DISPATCH\|^UPGRADE\|^CREATE\|^POST ' "$CALLS" &&
+        jq -e '.details.draft==true' "$CASE/stdout" >/dev/null
+}
+
+staged_publish_explicit_draft() {
+    setup "$1"
+    CREATE_FAIL=false
+    run_release --draft
+    [[ $STATUS -eq 0 ]] || return 1
+    jq '.draft=false | .html_url="https://github.com/owner/repo/releases/tag/v1.2.3"' \
+        "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    : > "$CALLS"
+}
+
+test_staged_explicit_draft_published_manually_resumes() {
+    staged_publish_explicit_draft staged_manual_public || return 1
+    run_release --resume --verify-upgrade
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT' "$CALLS" &&
+        grep -Fxq DISPATCH "$CALLS" && grep -Fxq UPGRADE "$CALLS" &&
+        jq -e '.details.draft==false and .details.release_url=="https://github.com/owner/repo/releases/tag/v1.2.3"' \
+            "$CASE/stdout" >/dev/null
+}
+
+test_staged_manual_publication_drift_is_not_redrafted() {
+    staged_publish_explicit_draft staged_manual_public_drift || return 1
+    jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next" &&
+        mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
+    run_release --resume
+    [[ $STATUS -eq 1 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==false' "$CASE/release.json" >/dev/null
+}
+
+test_staged_manual_publication_rejects_draft_request() {
+    staged_publish_explicit_draft staged_manual_public_draft_request || return 1
+    run_release --resume --draft
+    [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==false' "$CASE/release.json" >/dev/null
+}
+
+test_staged_lost_publish_response_requires_public_proof() {
+    setup staged_lost_publish
+    CREATE_FAIL=false LOST_PUBLISH_RESPONSE=true
+    run_release
+    [[ $STATUS -eq 0 ]] && [[ $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] &&
+        [[ $(grep -c '^DISPATCH$' "$CALLS") -eq 1 ]] && ! grep -q '^RESTORE-DRAFT' "$CALLS" &&
+        grep -Fxq 'DISPATCH-URL https://github.com/owner/repo/releases/tag/v1.2.3' "$CALLS" &&
+        jq -e '.details.draft==false and .details.release_url=="https://github.com/owner/repo/releases/tag/v1.2.3"' \
+            "$CASE/stdout" >/dev/null
+}
+
+test_staged_failed_publish_retries_without_reupload() {
+    setup staged_publish_retry
+    CREATE_FAIL=false PUBLISH_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] && jq -e '.draft==true' "$CASE/release.json" >/dev/null &&
+        ! grep -q '^DISPATCH' "$CALLS" || return 1
+    PUBLISH_FAIL=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE\|^POST ' "$CALLS" && grep -Fxq PUBLISH "$CALLS"
+}
+
+test_staged_already_public_retry_verifies_original_plan() {
+    setup staged_public_retry
+    CREATE_FAIL=false PUBLISH_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    # Model a PATCH committed just before the old controller stopped.
+    jq '.draft=false | .html_url="https://github.com/owner/repo/releases/tag/v1.2.3"' \
+        "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    PUBLISH_FAIL=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT' "$CALLS" &&
+        grep -Fxq 'DISPATCH-URL https://github.com/owner/repo/releases/tag/v1.2.3' "$CALLS" &&
+        jq -e '.details.staging_receipt!=null and .details.release_url=="https://github.com/owner/repo/releases/tag/v1.2.3"' \
+            "$CASE/stdout" >/dev/null
+}
+
+test_staged_already_public_retry_refuses_extra_asset() {
+    setup staged_public_extra
+    CREATE_FAIL=false PUBLISH_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    jq '.draft=false | .html_url="https://github.com/owner/repo/releases/tag/v1.2.3"' \
+        "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    remote_put unexpected.bin "$CASE/artifacts/payload.bin" || return 1
+    PUBLISH_FAIL=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^DISPATCH' "$CALLS" &&
+        grep -Fxq RESTORE-DRAFT "$CALLS" && jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_staged_extra_asset_blocks_first_publication() {
+    setup staged_extra
+    CREATE_FAIL=false EXTRA_ASSET=true
+    run_release
+    [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_staged_missing_selected_sidecar_blocks_publication() {
+    setup staged_missing_sidecar
+    CREATE_FAIL=false DROP_SIDECAR=payload.bin.sbom.json
+    staged_manifest payload.bin || return 1
+    printf '{"name":"payload"}\n' > "$CASE/artifacts/payload.bin.sbom.json"
+    run_release
+    [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_staged_changed_notes_are_not_published_or_overwritten() {
+    setup staged_notes
+    CREATE_FAIL=false UPLOAD_METADATA_DRIFT=true
+    run_release
+    [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.body=="Another publisher changed these notes"' "$CASE/release.json" >/dev/null
+}
+
+test_staged_changed_destination_is_not_published() {
+    setup staged_wrong_destination
+    CREATE_FAIL=false UPLOAD_DESTINATION_DRIFT=true
+    run_release
+    [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_staged_postpublish_destination_drift_is_not_overwritten() {
+    setup staged_postpublish_destination
+    CREATE_FAIL=false PUBLISH_DESTINATION_DRIFT=true
+    run_release
+    [[ $STATUS -eq 1 ]] && grep -Fxq PUBLISH "$CALLS" &&
+        ! grep -q '^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==false and .html_url=="https://github.com/another/repo/releases/tag/v1.2.3"' \
+            "$CASE/release.json" >/dev/null
+}
+
+test_staged_postpublish_asset_drift_restores_owned_draft() {
+    setup staged_postpublish_asset
+    CREATE_FAIL=false PUBLISH_ASSET_DRIFT=true
+    run_release
+    [[ $STATUS -eq 1 ]] && grep -Fxq PUBLISH "$CALLS" && grep -Fxq RESTORE-DRAFT "$CALLS" &&
+        ! grep -q '^DISPATCH' "$CALLS" && jq -e '.draft==true' "$CASE/release.json" >/dev/null &&
+        jq -e '.details.draft==true and
+            .details.release_url=="https://github.com/owner/repo/releases/tag/untagged-fedcba9876543210"' \
+            "$CASE/stdout" >/dev/null
+}
+
+test_staged_postpublish_metadata_drift_is_not_overwritten() {
+    setup staged_postpublish_metadata
+    CREATE_FAIL=false PUBLISH_METADATA_DRIFT=true
+    run_release
+    [[ $STATUS -eq 1 ]] && grep -Fxq PUBLISH "$CALLS" &&
+        ! grep -q '^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==false and .body=="Another publisher changed these notes"' "$CASE/release.json" >/dev/null
+}
+
+test_staged_lost_original_post_is_never_adopted() {
+    setup staged_lost_creation
+    CREATE_FAIL=false LOST_CREATE_RESPONSE=true
+    run_release
+    [[ $STATUS -eq 7 ]] && ! grep -q '^POST \|^PUBLISH' "$CALLS" || return 1
+    LOST_CREATE_RESPONSE=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_staged_changed_inputs_are_not_adopted_on_resume() {
+    setup staged_changed_inputs
+    CREATE_FAIL=false UPLOAD_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    printf 'different bytes\n' > "$CASE/artifacts/payload.bin"
+    UPLOAD_FAIL=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 7 ]] && ! grep -q '^POST \|^PUBLISH\|^DISPATCH' "$CALLS"
+}
+
+test_staged_nonprivate_receipt_cannot_authorize_resume() {
+    setup staged_nonprivate
+    CREATE_FAIL=false UPLOAD_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    chmod 644 "$(jq -r '.details.staging_receipt' "$CASE/stdout")" || return 1
+    UPLOAD_FAIL=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 7 ]] && ! grep -q '^POST \|^PUBLISH\|^DISPATCH' "$CALLS"
+}
+
+test_staged_ambiguous_receipts_cannot_authorize_resume() {
+    setup staged_ambiguous
+    CREATE_FAIL=false UPLOAD_FAIL=true
+    run_release
+    [[ $STATUS -eq 1 ]] || return 1
+    local intent directory duplicate
+    intent=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+    directory="${intent%/*}"
+    duplicate="${directory%.*}.duplicate"
+    mkdir -m 700 "$duplicate" && cp "$directory/intent.json" "$directory"/dsr-api-response.???????? "$duplicate/" || return 1
+    UPLOAD_FAIL=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 7 ]] && ! grep -q '^POST \|^PUBLISH\|^DISPATCH' "$CALLS"
+}
+
+test_staged_intent_drift_during_create_blocks_upload() {
+    setup staged_intent_drift
+    CREATE_FAIL=false CREATE_INTENT_DRIFT=true
+    run_release
+    [[ $STATUS -eq 7 ]] && ! grep -q '^POST \|^PUBLISH\|^DISPATCH' "$CALLS"
+}
+
+test_staged_storage_refusal_precedes_creation() {
+    setup staged_storage
+    CREATE_FAIL=false
+    mv "$CASE/state/releases" "$CASE/original-releases" &&
+        ln -s "$CASE/original-releases" "$CASE/state/releases" || return 1
+    run_release
+    [[ $STATUS -eq 4 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH' "$CALLS"
+}
+
+test_staged_concurrent_complete_publication_is_preserved() {
+    setup staged_concurrent_publication
+    CREATE_FAIL=false CONCURRENT_PUBLISH=true
+    run_release
+    [[ $STATUS -eq 0 ]] && ! grep -q '^PUBLISH\|^RESTORE-DRAFT' "$CALLS" &&
+        grep -Fxq DISPATCH "$CALLS" && jq -e '.details.draft==false' "$CASE/stdout" >/dev/null
+}
+
+staged_tag_case() {
+    setup "staged_tag_$1"
+    CREATE_FAIL=false STAGED_REMOTE_MODE="$1"
+    git init -q "$CASE/checkout" &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m tagged &&
+        git -C "$CASE/checkout" tag v1.2.3 || return 1
+    STAGED_SOURCE_SHA=$(git -C "$CASE/checkout" rev-parse HEAD) || return 1
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    git_ops_tag_sha() { git -C "$1" rev-parse --verify "$2^{commit}"; }
+    run_release
+    if [[ "$1" == valid || "$1" == absent-empty || "$1" == absent-prefix ]]; then
+        [[ $STATUS -eq 0 ]] && grep -Fxq PUBLISH "$CALLS" && grep -Fxq DISPATCH "$CALLS" || return 1
+    elif [[ "$1" == after-publish || "$1" == absent-wrong-created ]]; then
+        [[ $STATUS -eq 1 ]] && grep -Fxq PUBLISH "$CALLS" && grep -Fxq RESTORE-DRAFT "$CALLS" &&
+            ! grep -q '^DISPATCH' "$CALLS" && jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+    else
+        [[ $STATUS -eq 1 ]] && ! grep -q '^PUBLISH\|^DISPATCH' "$CALLS" &&
+            jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+    fi
+    [[ "$1" != absent-* ]] || grep -Fxq TAG-ABSENCE "$CALLS"
+}
+test_staged_pinned_tag_is_verified() { staged_tag_case valid; }
+test_staged_moved_tag_blocks_publication() { staged_tag_case moved; }
+test_staged_unavailable_tag_blocks_publication() { staged_tag_case unavailable; }
+test_staged_postpublish_tag_drift_restores_draft() { staged_tag_case after-publish; }
+test_staged_absent_tag_is_created_at_pinned_commit() { staged_tag_case absent-empty; }
+test_staged_absent_tag_with_prefix_sibling_can_publish() { staged_tag_case absent-prefix; }
+test_staged_absent_tag_probe_unavailable_is_refused() { staged_tag_case absent-unavailable; }
+test_staged_absent_tag_probe_malformed_is_refused() { staged_tag_case absent-malformed; }
+test_staged_absent_tag_probe_nonarray_is_refused() { staged_tag_case absent-nonarray; }
+test_staged_absent_tag_probe_exact_ref_is_refused() { staged_tag_case absent-exact; }
+test_staged_absent_tag_probe_wrong_repository_is_refused() { staged_tag_case absent-wrong-realm; }
+test_staged_absent_tag_created_at_wrong_commit_is_redrafted() { staged_tag_case absent-wrong-created; }
 
 for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_is_reused_without_deletion \
     test_saved_name_with_changed_remote_fails_closed test_legacy_digestless_assets_are_hashed \
@@ -627,8 +1187,28 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_partial_release_resumes_only_missing_upload test_completed_release_resume_does_not_reupload \
     test_invalid_journal_is_not_upload_authority test_empty_artifacts_are_not_a_release \
     test_unmanifested_directory_is_refused test_artifacts_must_come_from_the_tagged_commit \
-    test_draft_request_refuses_published_release \
-    test_wrong_repository_upload_url_is_rejected; do
+    test_draft_request_refuses_published_release test_wrong_repository_upload_url_is_rejected \
+    test_staged_creation_publishes_only_after_private_uploads test_staged_dry_run_creates_no_custody \
+    test_staged_interrupted_upload_resumes_and_publishes test_staged_generated_checksums_remain_bound_across_retry \
+    test_staged_manifest_aliases_are_all_verified test_staged_explicit_draft_stays_private_on_resume \
+    test_staged_explicit_draft_published_manually_resumes test_staged_manual_publication_drift_is_not_redrafted \
+    test_staged_manual_publication_rejects_draft_request \
+    test_staged_lost_publish_response_requires_public_proof test_staged_failed_publish_retries_without_reupload \
+    test_staged_already_public_retry_verifies_original_plan test_staged_already_public_retry_refuses_extra_asset \
+    test_staged_extra_asset_blocks_first_publication test_staged_missing_selected_sidecar_blocks_publication \
+    test_staged_changed_notes_are_not_published_or_overwritten test_staged_postpublish_asset_drift_restores_owned_draft \
+    test_staged_changed_destination_is_not_published test_staged_postpublish_destination_drift_is_not_overwritten \
+    test_staged_postpublish_metadata_drift_is_not_overwritten test_staged_lost_original_post_is_never_adopted \
+    test_staged_changed_inputs_are_not_adopted_on_resume test_staged_nonprivate_receipt_cannot_authorize_resume \
+    test_staged_ambiguous_receipts_cannot_authorize_resume test_staged_intent_drift_during_create_blocks_upload \
+    test_staged_storage_refusal_precedes_creation test_staged_concurrent_complete_publication_is_preserved \
+    test_staged_pinned_tag_is_verified test_staged_moved_tag_blocks_publication \
+    test_staged_unavailable_tag_blocks_publication test_staged_postpublish_tag_drift_restores_draft \
+    test_staged_absent_tag_is_created_at_pinned_commit test_staged_absent_tag_with_prefix_sibling_can_publish \
+    test_staged_absent_tag_probe_unavailable_is_refused test_staged_absent_tag_probe_malformed_is_refused \
+    test_staged_absent_tag_probe_nonarray_is_refused test_staged_absent_tag_probe_exact_ref_is_refused \
+    test_staged_absent_tag_probe_wrong_repository_is_refused test_staged_absent_tag_created_at_wrong_commit_is_redrafted; do
+    [[ -z "${DSR_RELEASE_RESUME_TEST_FILTER:-}" || "$test" =~ $DSR_RELEASE_RESUME_TEST_FILTER ]] || continue
     run_test "$test"
 done
 printf 'Results: %s passed, %s failed\n' "$PASS" "$FAIL"

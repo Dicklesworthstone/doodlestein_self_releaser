@@ -41,6 +41,16 @@
       "minLength": 1,
       "description": "Owner-only TMPDIR to use when finalizing with create_response; null when creation custody is unavailable"
     },
+    "staging_receipt": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "Private ordinary-release creation intent used to resume the exact staged publication; null for unowned existing releases or strict contracts"
+    },
+    "artifacts_dir": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical directory containing the selected release artifacts"
+    },
     "draft": {
       "type": "boolean",
       "description": "Whether release is a draft"

@@ -698,10 +698,32 @@ Upload artifacts to GitHub Release.
 
 ```bash
 dsr release --repo ntm --version v1.2.3         # Upload to release
-dsr release --repo ntm --version v1.2.3 --draft # Create draft release
+dsr release --repo ntm --version v1.2.3 --draft # Keep the verified release private
 dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
 dsr --dry-run release --repo ntm --version v1.2.3   # Show the exact upload plan, change nothing
 ```
+
+New ordinary releases stay private until every selected artifact, checksum,
+and metadata sidecar matches the complete remote inventory. DSR then publishes
+the original release ID and verifies it again before running post-release
+hooks. Existing source tags must match the pinned commit. A tag proved absent
+on GitHub is created at that commit when publishing and verified afterward.
+
+Retry interrupted uploads or publication with the same artifact directory:
+
+```bash
+dsr release ntm v1.2.3 --artifacts /path/to/artifacts --resume
+```
+
+Keep `$DSR_STATE_DIR/releases` between attempts: DSR uses its private original
+POST response and frozen publication intent to recheck existing uploads and
+complete its own interrupted draft. Changed inputs or missing creation custody
+block recovery. DSR keeps explicitly requested drafts and unrelated existing
+drafts private. If you publish an explicit draft on GitHub yourself, resume
+verifies its contents without changing its visibility. Automated fallback
+reports a retained draft as blocked, so watch
+cannot mistake successful uploads for a completed public release. Ordinary
+creation and recovery require Python 3.
 
 The dry-run plan lists every name each artifact will be published under (its
 manifest name, versioned name, installer-compatible name and `x86_64`/`aarch64`
@@ -765,8 +787,8 @@ publication option and is refused in source-only mode.
 If strict binary creation succeeded but its controller stopped before
 publication, use the original private `dsr-api-response.*` POST response.
 Strict creation retains that file in an owner-only directory. With `--json`,
-the draft result supplies `details.create_response` and
-`details.finalization_tmpdir`; human output prints the complete finalization
+the draft result supplies `details.create_response`,
+`details.finalization_tmpdir`, and the physical `details.artifacts_dir`; human output prints the complete finalization
 command. Recovery cannot reconstruct creation custody from public release
 metadata. A lost or unsuccessful POST response may leave an observable draft,
 but does not supply finalization custody.
@@ -777,6 +799,12 @@ all signed assets verify, finalize through DSR:
 ```bash
 TMPDIR=/private/scratch dsr release finalize TOOL VERSION --create-response /private/scratch/dsr-api-response.ABCDEF12 --no-dispatch
 ```
+
+For custom build output, add `--artifacts "/path/to/signed artifacts"` using
+the creation result's `details.artifacts_dir`. Without this option, finalization
+uses `$DSR_STATE_DIR/artifacts/<tool>-<tag>`. The selected directory must already
+exist; directory symlinks resolve to their physical path before the same signed
+asset, source, and custody checks run.
 
 The response must remain a single-link, owner-only regular file in the same
 canonical private `TMPDIR` used by the GitHub adapter. Finalization verifies its

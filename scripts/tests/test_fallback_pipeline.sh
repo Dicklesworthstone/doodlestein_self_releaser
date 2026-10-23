@@ -153,7 +153,18 @@ signing_verify() {
 signing_sign_files() { signing_sign_batch "$@"; }
 cmd_release() {
     printf 'RELEASE %s\n' "$*" >> "$CALLS"
-    printf '{"child":"release"}\n'
+    if [[ "$RELEASE_RESULT_MODE" == malformed ]]; then
+        printf '{invalid\n'
+    else
+        jq -nc --arg mode "$RELEASE_RESULT_MODE" --argjson rc "$RELEASE_RC" '
+            {command:"release",status:(if $rc==0 then "success" else "error" end),exit_code:$rc,
+             details:{repo:"owner/tool",tag:"v1.2.3",release_id:9,draft:false}} |
+            if $mode=="draft" then .details.draft=true
+            elif $mode=="missing-visibility" then del(.details.draft)
+            elif $mode=="wrong-tag" then .details.tag="v9.9.9"
+            elif $mode=="wrong-repo" then .details.repo="owner/other"
+            else . end'
+    fi
     if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == tool ]]; then
         act_load_repo_config tool || return 4
         local source
@@ -245,7 +256,7 @@ setup() {
     export SIGNING_PRIVATE_KEY="$CASE/keys/minisign.key" SIGNING_PUBLIC_KEY="$CASE/keys/minisign.pub"
     SIGN_MODE=valid SCAN_RC=0 RELEASE_EXISTS=false QUALITY_MUTATES_SOURCE=false BUILD_MUTATES_SOURCE=false
     QUALITY_MUTATES_SIBLING=false
-    OTHER_SHA="" REMOTE_TAG_MODE=valid
+    OTHER_SHA="" REMOTE_TAG_MODE=valid RELEASE_RESULT_MODE=public
     RUN=11111111-1111-4111-8111-111111111111 SOURCE_SHA=0000000000000000000000000000000000000000
     TARGETS='linux/amd64 darwin/arm64'
     OUT="$CASE/artifacts"
@@ -339,6 +350,24 @@ test_release_failure() {
     [[ "$RC" == "$1" && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^NOTIFY fallback.success' "$CALLS" &&
         jq -e --argjson rc "$1" '[.details.steps[] | [.command, .exit_code]] ==
             [["check", 1], ["build", 0], ["release", $rc]]' "$CASE/stdout" >/dev/null
+}
+test_release_requires_public_confirmation() {
+    setup "release-confirmation-$1"
+    RELEASE_RESULT_MODE="$1" RELEASE_EXISTS=true
+    checkpoint failed
+    run_fallback --resume
+    [[ "$RC" == 7 && ! -e "$CASE/lock" ]] && one_result &&
+        grep -q '^RELEASE .*--resume' "$CALLS" && ! grep -q '^NOTIFY fallback.success' "$CALLS" &&
+        jq -e '.details.phase=="release" and .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null
+}
+test_release_public_confirmation_completes() {
+    setup release-public-confirmation
+    RELEASE_EXISTS=true
+    checkpoint failed
+    run_fallback --resume
+    [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result &&
+        grep -q '^RELEASE .*--resume' "$CALLS" &&
+        jq -e '.details.phases.release=="success"' "$CASE/stdout" >/dev/null
 }
 test_resume_reaches_build() {
     setup resume; checkpoint failed; run_fallback --resume
@@ -912,6 +941,8 @@ run_test test_lock_failure 8
 run_test test_quality_failure
 run_test test_build_only
 for rc in 1 7 8 130; do run_test test_release_failure "$rc"; done
+for mode in draft missing-visibility wrong-tag wrong-repo malformed; do run_test test_release_requires_public_confirmation "$mode"; done
+run_test test_release_public_confirmation_completes
 run_test test_resume_reaches_build
 run_test test_preserves_caller_state
 run_test test_signal_releases_lock checks

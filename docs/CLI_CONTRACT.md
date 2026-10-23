@@ -216,6 +216,7 @@ The `details` field contains command-specific data:
     "draft": true,
     "create_response": "/private/scratch/dsr-create-custody.ABCDEF12/dsr-api-response.GHIJKLMN",
     "finalization_tmpdir": "/private/scratch/dsr-create-custody.ABCDEF12",
+    "artifacts_dir": "/srv/releases/ntm-v1.2.3",
     "assets_uploaded": [
       {
         "name": "ntm-linux-amd64.tar.gz",
@@ -231,7 +232,12 @@ The `details` field contains command-specific data:
 
 Strict draft creation preserves the original successful POST response. Pass
 `details.create_response` to `dsr release finalize` and set `TMPDIR` to
-`details.finalization_tmpdir`. Both fields are null when this invocation has no
+`details.finalization_tmpdir`. Pass `--artifacts` with `details.artifacts_dir`
+when the producer used a custom output directory. Finalization resolves that
+existing directory to its physical path once, then repeats the same signed
+artifact, source, contract, tag, and creation-custody checks against it. Without
+`--artifacts`, it uses `$DSR_STATE_DIR/artifacts/<tool>-<tag>`.
+`create_response` and `finalization_tmpdir` are null when this invocation has no
 original creation custody; a later GET cannot replace that response. Asset
 download URLs use the release tag and percent-encoded filenames; draft assets
 remain subject to GitHub's draft access rules until publication.
@@ -709,7 +715,7 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 |------|---------|-------------|
 | `--repo` | (required) | Repository name |
 | `--version` | (required) | Release version/tag |
-| `--draft` | false | Create as draft release |
+| `--draft` | false | Keep the verified release as a draft |
 | `--prerelease` | false | Mark as prerelease |
 | `--artifacts` | auto | Artifact directory |
 | `--dispatch` | false | Trigger repository dispatch hooks after release |
@@ -717,6 +723,43 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--dispatch-event` | `dsr_release` | Override dispatch event type |
 | `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
 | `--no-manifest` | false | Upload an artifacts directory that has no build manifest, as-is |
+| `--resume` | false | Reverify retained uploads and complete an owned interrupted publication |
+
+New ordinary releases are created as private drafts. DSR freezes every selected
+asset name, size, and SHA-256, including the manifest, generated checksums, and
+selected metadata sidecars. It verifies the complete remote inventory and
+release metadata before publishing the original release ID, then repeats the
+verification against the public release. When creation pinned a source commit,
+an existing remote tag must resolve to it. A missing tag is allowed before
+publication only after an uncached, validated Git reference collection proves
+that the exact tag is absent, including when similarly named tags exist.
+Publishing creates the tag at the pinned commit; the public release must then
+resolve to that exact commit. An unavailable or malformed absence check fails
+closed.
+An upload, inventory, source, or publication failure suppresses dispatch and
+upgrade hooks. A failed publication can be returned to draft only while its
+current nonce and metadata still prove ownership.
+
+Ordinary creation requires Python 3 to preserve its original POST response and
+immutable publication intent in a private directory under
+`$DSR_STATE_DIR/releases`. `details.staging_receipt` identifies that intent;
+`details.artifacts_dir` records the canonical artifact directory. Keep this
+state directory when retrying with `dsr release TOOL VERSION --resume` and the
+same `--artifacts` directory. Recovery rechecks the original response, the
+complete frozen input plan, and actual GitHub bytes. It uploads only missing
+assets and publishes an owned draft whose original intent was public, including
+after an interrupted publish response. It refuses ambiguous, changed, or lost
+creation custody. Upload journals alone never authorize publication.
+
+An explicitly requested draft remains private when a later `--resume` omits
+`--draft`; an unrelated existing draft also remains private. Existing public
+releases without staged creation custody retain ordinary upload behavior.
+If a user subsequently publishes an explicitly requested draft on GitHub,
+`--resume` verifies its original complete artifact plan without changing its
+visibility, including on verification failure. Requesting `--draft` for an
+already-public release still refuses before upload.
+`--draft` on a retry can keep an owned public-intent draft private for that
+invocation without changing its retained publication intent.
 
 An ordinary release publishes the build manifest's artifacts. `dsr build`
 publishes the manifest only after every target, artifact collection, packaging,
@@ -1110,6 +1153,14 @@ asked for, since `dsr check` itself exits 1 exactly when throttled. Its step
 carries `throttled` and the check's own exit code. The build step covers the
 quality gate, build, artifact verification and signing; `--build-only` runs
 the build step alone. `details.steps[]` lists the steps that ran.
+
+The release step succeeds only when `dsr release` confirms the requested
+repository and tag as public. An upload that correctly leaves an unrelated
+or explicitly requested draft private returns fallback exit `7`, so an
+automatic watch attempt cannot be marked complete while its downloads remain
+unavailable. Retrying an ordinary publication with `--resume` uses its retained
+creation intent to finish an owned interrupted draft; it cannot publish an
+unrelated draft.
 
 `--expected-sha <full-commit>` binds a fallback to an observed workflow run.
 It requires an explicit `--version` and a nonzero 40-character commit SHA.

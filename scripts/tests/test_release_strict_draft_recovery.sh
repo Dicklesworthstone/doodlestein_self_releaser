@@ -129,6 +129,7 @@ mktemp() {
 DRY_RUN=false
 JSON_MODE=false
 if [[ "$1" == create ]]; then
+    shift
     # Retain the real API adapter and creation producer. Only HTTP transport
     # and upload delivery are fixtures; receipt files are never synthesized.
     source "$ROOT/src/github.sh"
@@ -144,7 +145,7 @@ if [[ "$1" == create ]]; then
     }
     gh_upload_asset_named() { python3 "$CASE/api.py" upload-boundary "$2" "$3"; }
     JSON_MODE=true
-    cmd_release app 1.2.3 --draft --no-dispatch
+    cmd_release app 1.2.3 --draft --no-dispatch "$@"
 elif [[ "$1" == prepare ]]; then
     act_load_repo_config app || exit
     contract=$(config_get_release_contract_json app) || exit
@@ -243,6 +244,62 @@ check('captured creation response feeds unchanged finalizer',r.returncode==0)
 check('handoff retains original descriptor identity',response.read_bytes()==raw and response.stat().st_ino==before.st_ino)
 check('handoff publishes only its owned signed draft',json.loads((c/'remote.json').read_text())['draft'] is False and
       all(q[0]=='repos/owner/app/releases/9' for q in patches))
+
+# Custom build outputs must flow through the real producer and consumer with
+# the same signed preflight. A symlink alias is supported by canonicalizing its
+# existing directory, just as creation does; the physical path contains spaces.
+c,env,_,_=setup('custom-creation-handoff',{'absent':True})
+custom=c/'custom signed artifacts'
+(c/'state/artifacts/app-v1.2.3').rename(custom)
+selected=c/'selected artifacts'
+selected.symlink_to(custom,target_is_directory=True)
+r=subprocess.run(['bash','-c',script,'fixture','create','--artifacts',str(selected)],
+                 env=env,capture_output=True,text=True)
+(c/'create.log').write_text(r.stdout+r.stderr)
+check('custom strict draft creation terminal0',r.returncode==0)
+result=json.loads(r.stdout)
+check('custom producer reports canonical directory with spaces',
+      result['details']['artifacts_dir']==str(custom.resolve()))
+response=Path(result['details']['create_response'])
+env['TMPDIR']=result['details']['finalization_tmpdir']
+raw=response.read_bytes();before=response.stat()
+base_flags=['app','1.2.3','--create-response',str(response),'--no-dispatch']
+wrong=c/'wrong artifacts';wrong.mkdir()
+for label,extra in [
+    ('custom needs explicit path',[]),
+    ('missing artifacts argument',['--artifacts']),
+    ('empty artifacts argument',['--artifacts','']),
+    ('option is not artifacts argument',['--artifacts','--no-dispatch']),
+    ('nonexistent artifacts directory',['--artifacts',str(c/'missing artifacts')]),
+    ('wrong existing artifacts directory',['--artifacts',str(wrong)])]:
+    r,patches=invoke(c,env,response,flags=base_flags+extra)
+    check(label+' refused',r.returncode==4)
+    check(label+' before publication',not patches and
+          json.loads((c/'remote.json').read_text())['draft'] is True)
+r,patches=invoke(c,env,response,flags=base_flags+['--artifacts',str(selected)])
+check('custom producer response feeds canonicalizing finalizer',r.returncode==0)
+check('custom handoff publishes only its owned draft',len(patches)==1 and
+      patches[0][0]=='repos/owner/app/releases/9' and
+      json.loads((c/'remote.json').read_text())['draft'] is False)
+check('custom handoff retains original creation response',
+      response.read_bytes()==raw and response.stat().st_ino==before.st_ino)
+finalized=list((c/'state/releases').glob('*-finalized.*'))
+check('custom finalization receipt binds canonical manifest and asset paths',
+      len(finalized)==1 and
+      json.loads(finalized[0].read_text())['plan']['manifest_file']==str(custom/'app-v1.2.3-manifest.json') and
+      all(Path(a['path']).parent==custom for a in json.loads(finalized[0].read_text())['plan']['assets']))
+
+for label,filename in [('custom-payload-tamper','payload.tar.gz'),
+                       ('custom-signature-tamper','payload.tar.gz.minisig')]:
+    c,env,response,_=setup(label)
+    custom=c/'custom signed artifacts'
+    (c/'state/artifacts/app-v1.2.3').rename(custom)
+    (custom/filename).write_bytes(b'changed custom input\n')
+    r,patches=invoke(c,env,response,flags=['app','1.2.3','--create-response',str(response),
+                                        '--artifacts',str(custom),'--no-dispatch'])
+    check(label+' refused by real signed preflight',r.returncode==4)
+    check(label+' before publication',not patches and
+          json.loads((c/'remote.json').read_text())['draft'] is True)
 
 for (label,controls),(c,env,response,_) in prepare_cases([('success',{}),('lost-patch',{'lost_patch':True}),('already-public',{}),('dry-run',{})]):
     raw=response.read_bytes();before=response.stat()

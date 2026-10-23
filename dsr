@@ -6774,25 +6774,32 @@ _release_finalize_observe() {
 }
 
 cmd_release_finalize() {
-    local tool="" version="" response="" no_dispatch=false
-    local usage="Usage: dsr release finalize <tool> <version> --create-response /abs/path/dsr-api-response.XXXXXXXX --no-dispatch"
+    local tool="" version="" response="" artifacts="" no_dispatch=false
+    local usage="Usage: dsr release finalize <tool> <version> [--artifacts <dir>] --create-response /abs/path/dsr-api-response.XXXXXXXX --no-dispatch"
     while (($#)); do
         case "$1" in
             --create-response)
                 [[ $# -ge 2 ]] || { log_error "--create-response requires a path"; return 4; }
                 response="$2"; shift 2 ;;
+            --artifacts)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || {
+                    log_error "--artifacts requires an artifact directory"; return 4;
+                }
+                artifacts="$2"; shift 2 ;;
             --no-dispatch) no_dispatch=true; shift ;;
             --help|-h)
                 cat << 'EOF'
 dsr release finalize - Publish a verified strict draft from its creation response
 
 USAGE:
-    dsr release finalize <tool> <version> --create-response <path> --no-dispatch
+    dsr release finalize <tool> <version> [--artifacts <dir>] --create-response <path> --no-dispatch
 
 OPTIONS:
     --create-response <path>  Absolute path of the preserved private
                               dsr-api-response.XXXXXXXX POST response that
                               created the draft (creation custody)
+    --artifacts <dir>         Artifact directory used to create the draft;
+                              defaults to $DSR_STATE_DIR/artifacts/<tool>-<tag>
     --no-dispatch             Required: finalization does not dispatch
 
 Finalization re-verifies every signed asset, the source tag and the release
@@ -6855,9 +6862,13 @@ EOF
     tag=$(git_ops_version_to_tag "$version") || return 4
     contract=$(jq -c '.release_contract' <<< "$config_json") || return 4
     [[ "$contract" != null ]] || { log_error "Finalization requires a strict binary release contract"; return 4; }
-    local state_dir artifacts manifest
+    local state_dir manifest
     state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
-    artifacts="$state_dir/artifacts/$tool-$tag"
+    [[ -n "$artifacts" ]] || artifacts="$state_dir/artifacts/$tool-$tag"
+    if [[ ! -d "$artifacts" ]] || ! artifacts=$(cd -- "$artifacts" && pwd -P); then
+        log_error "Strict finalization requires an existing artifact directory"
+        return 4
+    fi
     manifest="$artifacts/$tool-$tag-manifest.json"
     local frozen plan saved metadata release_id receipt_sha receipt_dir scan observed
     # Recovery authority is the original private POST response retained by the
@@ -7289,7 +7300,7 @@ OPTIONS:
         --repo <name>        Alias for --tool
     -V, --version <ver>      Version to release (or second positional arg)
     -a, --artifacts <dir>    Directory containing build artifacts
-    --draft                  Create as draft release
+    --draft                  Keep the verified release as a draft
     --prerelease             Mark as prerelease
     --generate-notes         Auto-generate release notes
     --verify-tag             Verify tag exists before release
@@ -8210,12 +8221,160 @@ EOF
             "${ordinary_expected_sha[${manifest_file##*/}]}" || return 4
     fi
 
+    # New ordinary releases stay private until the complete selected upload
+    # inventory has been verified. Keep creation authority outside artifacts:
+    # an upload journal, tag lookup, or matching name cannot authorize publish.
+    local ordinary_plan='[]' ordinary_custody_prefix="" ordinary_custody_dir=""
+    local ordinary_intent="" ordinary_response="" ordinary_intent_proof="" ordinary_response_proof=""
+    local ordinary_owned=false ordinary_publish=false ordinary_external_publication=false
+    if ! $release_contract_enabled; then
+        local ordinary_name ordinary_path ordinary_size ordinary_row
+        local -a ordinary_rows=()
+        for ordinary_name in "${!ordinary_expected_sha[@]}"; do
+            ordinary_path="$artifacts_dir/$ordinary_name"
+            [[ "$ordinary_name" != "${manifest_file##*/}" ]] || ordinary_path="$manifest_file"
+            if [[ ! -f "$ordinary_path" || -L "$ordinary_path" || ! -s "$ordinary_path" ]] ||
+               [[ "$(_gh_asset_sha256 "$ordinary_path")" != "${ordinary_expected_sha[$ordinary_name]}" ]]; then
+                log_error "Release input changed before draft creation: $ordinary_name"
+                return 4
+            fi
+            ordinary_size=$(wc -c < "$ordinary_path") || return 4
+            ordinary_row=$(jq -nc --arg name "$ordinary_name" --arg sha "${ordinary_expected_sha[$ordinary_name]}" \
+                --argjson size "$ordinary_size" '{name:$name,size_bytes:$size,sha256:$sha}') || return 4
+            ordinary_rows+=("$ordinary_row")
+        done
+        for ordinary_name in "${!ordinary_alias_sha[@]}"; do
+            [[ -z "${ordinary_expected_sha[$ordinary_name]:-}" ]] || continue
+            ordinary_path="$artifacts_dir/${ordinary_alias_owner[$ordinary_name]}"
+            ordinary_size=$(wc -c < "$ordinary_path") || return 4
+            ordinary_row=$(jq -nc --arg name "$ordinary_name" --arg sha "${ordinary_alias_sha[$ordinary_name]}" \
+                --argjson size "$ordinary_size" '{name:$name,size_bytes:$size,sha256:$sha}') || return 4
+            ordinary_rows+=("$ordinary_row")
+        done
+        ordinary_plan=$(printf '%s\n' "${ordinary_rows[@]}" | jq -sc 'sort_by(.name)') || return 4
+    fi
+
+    _release_ordinary_custody_unchanged() {
+        local intent_now response_now
+        intent_now=$(_source_release_read_private_receipt "$ordinary_intent" "$ordinary_custody_dir" "" "" "intent.") || return 1
+        response_now=$(_source_release_read_private_receipt "$ordinary_response" "$ordinary_custody_dir" "" "" "dsr-api-response.") || return 1
+        jq -en --argjson before "$ordinary_intent_proof" --argjson after "$intent_now" \
+            --argjson original "$ordinary_response_proof" --argjson response "$response_now" \
+            '$before == $after and $original == $response' >/dev/null
+    }
+
+    _release_ordinary_metadata_matches() {
+        local observed="$1" expected_draft="$2"
+        jq -en --argjson original "$ordinary_response_proof" --argjson observed "$observed" \
+            --argjson expected_draft "$expected_draft" --arg repo "$repo" '
+            def identity: {id,tag_name,name,body,target_commitish,prerelease,upload_url};
+            ($observed | type == "object") and $observed.draft == $expected_draft and
+            ($observed.html_url | type == "string" and
+                startswith("https://github.com/" + $repo + "/releases/")) and
+            (($observed | identity) == ($original.record | identity))
+        ' >/dev/null 2>&1
+    }
+
+    _release_ordinary_restore_draft() {
+        local observed attempt retry_delay="${DSR_RELEASE_STATE_RETRY_DELAY_SECONDS:-1}"
+        [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=1
+        for ((attempt=0; attempt<=3; attempt++)); do
+            _release_ordinary_custody_unchanged || return 1
+            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+            if _release_ordinary_metadata_matches "$observed" true; then
+                release_url=$(jq -er '.html_url' <<< "$observed") || return 1
+                return 0
+            fi
+            # An original POST does not authorize overwriting a release whose
+            # current nonce, notes, target or destination no longer match it.
+            _release_ordinary_metadata_matches "$observed" false || return 1
+            [[ $attempt -lt 3 ]] || return 1
+            gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":true}' \
+                --no-cache >/dev/null 2>&1 || true
+            ((retry_delay == 0)) || sleep "$retry_delay"
+        done
+        return 1
+    }
+
+    _release_ordinary_recover_custody() {
+        local candidate intent_proof response_proof matching=0
+        local original_intent_proof="$ordinary_intent_proof"
+        local -a responses=()
+        for candidate in "$state_dir/releases/dsr-publication.$ordinary_custody_prefix."*; do
+            [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+            candidate=$(cd "$candidate" && pwd -P) || return 1
+            intent_proof=$(_source_release_read_private_receipt "$candidate/intent.json" "$candidate" "" "" "intent." 2>/dev/null) || continue
+            responses=("$candidate"/dsr-api-response.????????)
+            [[ ${#responses[@]} -eq 1 && -f "${responses[0]}" ]] || continue
+            response_proof=$(_source_release_read_private_receipt "${responses[0]}" "$candidate" "" "" "dsr-api-response." 2>/dev/null) || continue
+            # Both original files must agree about creation. The response
+            # must be the empty draft POST, never a later GET or upload receipt.
+            if ! jq -en --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
+                --argjson id "$release_id" --argjson intent "$intent_proof" --argjson response "$response_proof" '
+                $intent.record as $i | $response.record as $r |
+                $i.schema == "dsr.ordinary_release_intent.v1" and
+                $i.repo == $repo and $i.tool == $tool and $i.tag == $tag and
+                ($i.publish | type == "boolean") and
+                ($i.nonce | type == "string" and test("^[0-9a-f]{64}$")) and
+                ($i.request.body | endswith("<!-- dsr-publication-nonce:" + $i.nonce + " -->")) and
+                $r.id == $id and $r.draft == true and $r.assets == [] and
+                $r.tag_name == $tag and $r.tag_name == $i.request.tag_name and
+                $r.name == $i.request.name and $r.body == $i.request.body and
+                $r.prerelease == $i.request.prerelease and
+                ($i.request.target_commitish == null or $r.target_commitish == $i.request.target_commitish)
+            ' >/dev/null 2>&1; then
+                continue
+            fi
+            matching=$((matching + 1))
+            ordinary_custody_dir="$candidate"
+            ordinary_intent="$candidate/intent.json"
+            ordinary_response="${responses[0]}"
+            ordinary_intent_proof="$intent_proof"
+            ordinary_response_proof="$response_proof"
+        done
+        if [[ $matching -eq 0 ]]; then
+            # A draft from an interrupted POST whose original response was
+            # lost is deliberately not adopted from its public metadata.
+            if jq -e '(.body // "") | contains("<!-- dsr-publication-nonce:")' <<< "$release_json" >/dev/null; then
+                log_error "Staged release has no valid original private creation custody; publication refused"
+                return 1
+            fi
+            return 0
+        fi
+        if [[ $matching -ne 1 ]] ||
+           ! jq -en --argjson intent "$ordinary_intent_proof" --argjson plan "$ordinary_plan" \
+                --arg artifacts "$(cd "$artifacts_dir" && pwd -P)" --arg sha "$release_tag_sha" '
+                $intent.record.assets == $plan and $intent.record.artifacts_dir == $artifacts and
+                ($sha == "" or $intent.record.request.target_commitish == $sha)
+           ' >/dev/null; then
+            log_error "Staged release creation custody is ambiguous or its frozen inputs changed"
+            return 1
+        fi
+        if ! _release_ordinary_metadata_matches "$release_json" "$draft"; then
+            log_error "Staged release metadata differs from its original creation response"
+            return 1
+        fi
+        if ! $resume && [[ $create_status -eq 0 ]] &&
+           ! jq -en --argjson before "$original_intent_proof" --argjson after "$ordinary_intent_proof" \
+                --argjson response "$ordinary_response_proof" --argjson reply "$release_json" \
+                '$before == $after and $response.record == $reply' >/dev/null; then
+            log_error "Private creation intent or original draft POST response changed during creation"
+            return 1
+        fi
+        ordinary_owned=true
+        ordinary_publish=$(jq -r '.record.publish' <<< "$ordinary_intent_proof") || return 1
+        if ! $ordinary_publish && ! $draft; then
+            # A user may publish an explicitly requested draft on GitHub.
+            # Resume verifies that public release but cannot undo the user's
+            # visibility decision, even when later asset verification fails.
+            ordinary_external_publication=true
+        fi
+        log_info "Recovered private staged-release creation custody: $ordinary_intent"
+    }
+
     log_info "Creating GitHub release for $tag..."
 
-    local release_args=""
-    if $release_contract_enabled || $requested_draft; then
-        release_args+=" --draft"
-    fi
+    local release_args=" --draft"
     $prerelease && release_args+=" --prerelease"
     # A tag not yet on GitHub is created at the locally tagged commit, not
     # at the default branch head.
@@ -8239,6 +8398,33 @@ EOF
         create_response_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-create-custody.XXXXXXXX") || return 4
         create_response_dir=$(cd "$create_response_dir" && pwd -P) || return 4
         release_args+=" --retain-response"
+    else
+        command -v python3 >/dev/null 2>&1 || { log_error "Private release creation custody requires python3"; return 3; }
+        ordinary_custody_prefix=$(python3 -I -c 'import hashlib,sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest())' \
+            "$repo" "$tool_name" "$tag") || return 4
+        if ! $resume; then
+            local ordinary_nonce ordinary_request ordinary_intent_json
+            ordinary_nonce=$(_release_contract_create_nonce) || return 4
+            release_body+=$'\n\n'"<!-- dsr-publication-nonce:$ordinary_nonce -->"
+            ordinary_request=$(jq -nc --arg tag "$tag" --arg body "$release_body" --arg sha "$release_tag_sha" \
+                --argjson prerelease "$prerelease" '{tag_name:$tag,name:$tag,body:$body,prerelease:$prerelease} +
+                (if $sha == "" then {} else {target_commitish:$sha} end)') || return 4
+            ordinary_intent_json=$(jq -nc --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
+                --arg artifacts "$(cd "$artifacts_dir" && pwd -P)" --arg nonce "$ordinary_nonce" \
+                --argjson request "$ordinary_request" --argjson assets "$ordinary_plan" --argjson draft "$requested_draft" \
+                '{schema:"dsr.ordinary_release_intent.v1",repo:$repo,tool:$tool,tag:$tag,
+                  artifacts_dir:$artifacts,nonce:$nonce,request:$request,assets:$assets,publish:($draft|not)}') || return 4
+            if ! mkdir -p "$state_dir/releases" || [[ -L "$state_dir/releases" ]] ||
+               ! ordinary_custody_dir=$(umask 077; mktemp -d "$state_dir/releases/dsr-publication.$ordinary_custody_prefix.XXXXXXXX") ||
+               ! ordinary_custody_dir=$(cd "$ordinary_custody_dir" && pwd -P); then
+                log_error "Cannot preserve private release creation custody before POST"
+                return 4
+            fi
+            ordinary_intent="$ordinary_custody_dir/intent.json"
+            (umask 077; set -C; printf '%s\n' "$ordinary_intent_json" > "$ordinary_intent") || return 4
+            ordinary_intent_proof=$(_source_release_read_private_receipt "$ordinary_intent" "$ordinary_custody_dir" "" "" "intent.") || return 4
+            release_args+=" --retain-response"
+        fi
     fi
     if $resume && ! $release_contract_enabled; then
         # Authenticated collection reads include drafts. A failed lookup is
@@ -8259,7 +8445,7 @@ EOF
         if $release_contract_enabled; then
             release_json=$(TMPDIR="$create_response_dir" gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
         else
-            release_json=$(gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
+            release_json=$(TMPDIR="$ordinary_custody_dir" gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
         fi
     fi
 
@@ -8363,6 +8549,17 @@ EOF
         # omitted on retry. Downstream dispatch must use observed state.
         draft=$(jq -r '.draft' <<< "$release_json")
         prerelease=$(jq -r '.prerelease' <<< "$release_json")
+        _release_ordinary_recover_custody || return 7
+        if ! $resume && [[ $create_status -eq 0 ]]; then
+            if ! $ordinary_owned; then
+                log_error "Ordinary draft creation did not preserve its original private POST response"
+                return 7
+            fi
+            if ! $draft; then
+                log_error "New ordinary release was unexpectedly published before its assets were verified"
+                return 7
+            fi
+        fi
     fi
 
     if $release_contract_enabled; then
@@ -8939,23 +9136,139 @@ EOF
             trap 'exit 5' INT TERM
             _gh_verify_uploaded_asset "$repo" "$name" "$size" "$sha" "$observed" "$workdir" >/dev/null
         )
+
+        _release_ordinary_observe_owned() {
+            local expected_draft="$1" observed records inventory='[]' page_json page count record expected_sha remote_sha
+            local matching_refs encoded_tag
+            _release_ordinary_custody_unchanged || return 1
+            records=$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc 'sort_by(.name)') || return 1
+            # Include every frozen metadata sidecar, even if it disappeared
+            # before the upload list was collected. Payload-only verification
+            # cannot make a new release safe for checksum/signature consumers.
+            jq -en --argjson records "$records" --argjson plan "$ordinary_plan" \
+                '($records | map({name,size_bytes,sha256})) == $plan' >/dev/null || return 1
+            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+            _release_ordinary_metadata_matches "$observed" "$expected_draft" || return 1
+            for ((page=1; page<=100; page++)); do
+                page_json=$(gh_api "repos/$repo/releases/$release_id/assets?per_page=100&page=$page" --no-cache) || return 1
+                jq -es 'length == 1 and (.[0] | type == "array" and length <= 100 and
+                    all(.[]; type == "object"))' <<< "$page_json" >/dev/null || return 1
+                inventory=$(jq -nc --argjson previous "$inventory" --argjson page "$page_json" '$previous + $page') || return 1
+                count=$(jq 'length' <<< "$page_json") || return 1
+                [[ $count -eq 100 ]] || break
+            done
+            [[ $page -le 100 ]] || return 1
+            # A complete ID-bound collection read catches unexpected assets,
+            # duplicate names and replaced IDs, including assets on later pages.
+            jq -en --argjson inventory "$inventory" --argjson records "$records" '
+                ($inventory | map({name,size_bytes:.size,remote_id:.id}) | sort_by(.name)) ==
+                ($records | map({name,size_bytes,remote_id}))
+            ' >/dev/null || return 1
+            for record in "${uploaded_assets[@]}"; do
+                _release_recheck_uploaded "$record" || return 1
+            done
+            observed=$(gh_api "repos/$repo/releases/$release_id" --no-cache) || return 1
+            _release_ordinary_metadata_matches "$observed" "$expected_draft" || return 1
+            expected_sha=$(jq -r '.record.request.target_commitish // empty' <<< "$ordinary_intent_proof") || return 1
+            if [[ -n "$expected_sha" ]]; then
+                [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+                if remote_sha=$(gh_resolve_tag_sha "$repo" "$tag"); then
+                    [[ "$remote_sha" == "$expected_sha" ]] || {
+                        log_error "Remote tag moved away from the staged release's pinned commit"
+                        return 1
+                    }
+                elif [[ "$expected_draft" == true ]]; then
+                    # GitHub creates a missing tag at target_commitish only
+                    # when publishing. A failed lookup is not absence: require
+                    # a successful, complete matching-refs collection. This
+                    # endpoint is not paginated and also returns prefix siblings.
+                    encoded_tag=$(jq -rn --arg tag "$tag" '$tag | @uri') || return 1
+                    matching_refs=$(gh_api "repos/$repo/git/matching-refs/tags/$encoded_tag" --no-cache) || return 1
+                    if ! jq -es --arg ref "refs/tags/$tag" --arg api "https://api.github.com/repos/$repo/git/" '
+                        length == 1 and (.[0] | type == "array" and length <= 1000 and
+                            (map(.ref) | length == (unique | length)) and
+                            all(.[]; type == "object" and
+                                (.ref | type == "string" and startswith($ref) and . != $ref) and
+                                (.url == ($api + .ref) or
+                                 .url == ($api + (.ref | split("/") | map(@uri) | join("/")))) and
+                                (.object | type == "object" and
+                                    (.sha | type == "string" and test("^[0-9a-f]{40}$") and . != ("0" * 40)) and
+                                    (.type == "commit" or .type == "tag" or .type == "tree" or .type == "blob") and
+                                    .url == ($api + ({commit:"commits",tag:"tags",tree:"trees",blob:"blobs"}[.type]) + "/" + .sha))))
+                    ' <<< "$matching_refs" >/dev/null; then
+                        log_error "Remote tag absence could not be proved before staged publication"
+                        return 1
+                    fi
+                else
+                    return 1
+                fi
+            fi
+            _release_ordinary_custody_unchanged || return 1
+            printf '%s\n' "$observed"
+        }
+
         local verified_record observed_release
         [[ "$verification_status" == "skipped" ]] && verification_status="ok"
-        for verified_record in "${uploaded_assets[@]}"; do
-            if ! _release_recheck_uploaded "$verified_record"; then
-                _release_record_failed "$(jq -r '.name' <<< "$verified_record")" \
-                    "Remote artifact changed or could not be reverified after upload"
+        if $ordinary_owned; then
+            [[ ${#failed_assets[@]} -eq 0 ]] || verification_status="incomplete"
+            if [[ ${#failed_assets[@]} -eq 0 ]] &&
+               ! observed_release=$(_release_ordinary_observe_owned "$draft"); then
+                if $draft && $ordinary_publish && ! $requested_draft &&
+                   observed_release=$(_release_ordinary_observe_owned false); then
+                    # A concurrent controller may have finished the same
+                    # owned intent. Complete public proof is required before
+                    # accepting its publication instead of restoring draft.
+                    draft=false
+                    log_info "Verified that the owned staged release is already completely published"
+                else
+                    _release_record_failed "release-verification" \
+                        "Staged release custody, metadata, or complete asset inventory changed after upload"
+                    verification_status="incomplete"
+                fi
+            fi
+            if [[ ${#failed_assets[@]} -eq 0 ]] && $ordinary_publish && $draft && ! $requested_draft; then
+                local ordinary_patch_status=0
+                # Only the original private POST can authorize this ID-bound
+                # mutation. Re-read it immediately before changing visibility.
+                if ! _release_ordinary_custody_unchanged; then
+                    _release_record_failed "publish" "Private staged-release creation custody changed before publication"
+                    verification_status="incomplete"
+                else
+                    gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' \
+                        --no-cache >/dev/null 2>&1 || ordinary_patch_status=$?
+                    if observed_release=$(_release_ordinary_observe_owned false); then
+                        draft=false
+                        [[ $ordinary_patch_status -eq 0 ]] || log_warn "Publish response failed; fresh verification confirmed the complete public release"
+                    else
+                        _release_record_failed "publish" "Publication did not produce the verified complete public release"
+                        verification_status="incomplete"
+                    fi
+                fi
+            fi
+            if [[ ${#failed_assets[@]} -eq 0 ]]; then
+                # GitHub replaces an untagged draft display URL when it is
+                # published (and may replace it again when restored to draft).
+                # Hooks and output must use the freshly verified destination.
+                release_url=$(jq -er '.html_url' <<< "$observed_release") || return 4
+                $draft || log_ok "Verified complete public release: $release_url"
+            fi
+        else
+            for verified_record in "${uploaded_assets[@]}"; do
+                if ! _release_recheck_uploaded "$verified_record"; then
+                    _release_record_failed "$(jq -r '.name' <<< "$verified_record")" \
+                        "Remote artifact changed or could not be reverified after upload"
+                    verification_status="incomplete"
+                fi
+            done
+            if ! observed_release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) ||
+               ! jq -ens --argjson expected "$release_json" --argjson observed "$observed_release" '
+                   def identity: {id,tag_name,upload_url,draft,prerelease};
+                   ($observed | type == "object") and
+                   (($observed | identity) == ($expected | identity))
+               ' >/dev/null 2>&1; then
+                _release_record_failed "release-verification" "Release identity or visibility changed after upload"
                 verification_status="incomplete"
             fi
-        done
-        if ! observed_release=$(gh_api "repos/$repo/releases/$release_id" --no-cache) ||
-           ! jq -ens --argjson expected "$release_json" --argjson observed "$observed_release" '
-               def identity: {id,tag_name,upload_url,draft,prerelease};
-               ($observed | type == "object") and
-               (($observed | identity) == ($expected | identity))
-           ' >/dev/null 2>&1; then
-            _release_record_failed "release-verification" "Release identity or visibility changed after upload"
-            verification_status="incomplete"
         fi
     fi
 
@@ -9005,6 +9318,13 @@ EOF
         else
             draft=false
             log_error "Strict release failure could not confirm a bound draft state"
+        fi
+    elif $ordinary_owned && ! $ordinary_external_publication && [[ $exit_code -ne 0 ]]; then
+        if _release_ordinary_restore_draft; then
+            draft=true
+        else
+            draft=false
+            log_error "Staged release failure could not confirm its original ID/tag as a draft"
         fi
     fi
 
@@ -9062,6 +9382,9 @@ EOF
             --arg upload_url "$upload_url" \
             --arg create_response "$create_response" \
             --arg create_response_dir "$create_response_dir" \
+            --arg staging_receipt "$ordinary_intent" \
+            --argjson staged "$ordinary_owned" \
+            --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" \
             --argjson draft "$draft" \
             --argjson prerelease "$prerelease" \
             --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
@@ -9087,6 +9410,8 @@ EOF
                 upload_url: $upload_url,
                 create_response: (if $create_response == "" then null else $create_response end),
                 finalization_tmpdir: (if $create_response == "" then null else $create_response_dir end),
+                staging_receipt: (if $staged then $staging_receipt else null end),
+                artifacts_dir: $artifacts_dir,
                 draft: $draft,
                 prerelease: $prerelease,
                 assets_uploaded: $uploaded,
@@ -9118,9 +9443,14 @@ EOF
         log_info "Duration: ${duration}s"
         if $draft && [[ -n "$create_response" ]]; then
             local finalize_command
-            printf -v finalize_command 'TMPDIR=%q dsr release finalize %q %q --create-response %q --no-dispatch' \
-                "$create_response_dir" "$tool_name" "$version" "$create_response"
+            printf -v finalize_command 'TMPDIR=%q dsr release finalize %q %q --artifacts %q --create-response %q --no-dispatch' \
+                "$create_response_dir" "$tool_name" "$version" "$(cd "$artifacts_dir" && pwd -P)" "$create_response"
             log_info "Finalize: $finalize_command"
+        elif $draft && $ordinary_owned && $ordinary_publish; then
+            local resume_command
+            printf -v resume_command 'dsr release %q %q --artifacts %q --resume' \
+                "$tool_name" "$version" "$(cd "$artifacts_dir" && pwd -P)"
+            log_info "Staged publication is retained privately; resume with: $resume_command"
         fi
 
         if [[ ${#missing_assets[@]} -gt 0 ]]; then
@@ -10786,12 +11116,26 @@ EOF
                 return 7
             fi
         fi
-        cmd_release "${release_args[@]}" >&2 || rc=$?
+        local release_result
+        release_result=$(JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
         if [[ $rc -ne 0 ]]; then
             release_status="failed"
             [[ $rc -eq 1 ]] && release_status="partial"
             _fallback_result "$rc" release "Release did not complete"
             return "$rc"
+        fi
+        # A manual upload can successfully leave an unrelated draft private.
+        # Automated fallback must not call that a completed publication or
+        # retire its durable watch attempt while downloads remain unavailable.
+        if ! jq -es --arg repo "$repo" --arg tag "$tag" '
+            length == 1 and (.[0] | .command == "release" and .status == "success" and
+            .exit_code == 0 and .details.repo == $repo and .details.tag == $tag and
+            .details.draft == false and
+            (.details.release_id | type == "number" and floor == . and . > 0))
+        ' <<< "$release_result" >/dev/null 2>&1; then
+            release_status="blocked"
+            _fallback_result 7 release "Release was not confirmed public; it may still be a draft"
+            return 7
         fi
         release_status="success"
     fi
