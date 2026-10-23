@@ -84,12 +84,38 @@
     },
     "sbom": {
       "type": "object",
+      "required": ["enabled", "status", "published"],
       "properties": {
+        "enabled": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["disabled", "planned", "verified"] },
         "published": { "type": "boolean" },
         "format": { "type": "string", "enum": ["spdx", "cyclonedx"] },
-        "filename": { "type": "string" }
+        "filename": { "type": "string" },
+        "artifact_count": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "files": {
+          "type": "array", "minItems": 2, "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "manifest_sha256": {
+          "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the complete public SBOM inventory; null for a dry-run plan"
+        }
       },
-      "description": "SBOM details"
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } } },
+          "then": { "required": ["format", "filename", "artifact_count", "files", "manifest_sha256"] }
+        },
+        {
+          "if": { "properties": { "status": { "const": "verified" } } },
+          "then": { "properties": { "enabled": { "const": true }, "manifest_sha256": { "type": "string" } } }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["disabled", "planned"] } } },
+          "then": { "properties": { "published": { "const": false } } }
+        }
+      ],
+      "description": "Automatic SBOM coverage from the frozen ordinary build manifest; verified means complete local coverage, published requires successful public-release verification"
     },
     "provenance": {
       "type": "object",

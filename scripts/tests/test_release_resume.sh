@@ -12,6 +12,7 @@ source "$PROJECT_ROOT/src/artifact_naming.sh"
 # below; only the existing network and configuration boundaries are fixtures.
 source "$PROJECT_ROOT/src/act_runner.sh"
 source "$PROJECT_ROOT/src/signing.sh"
+source "$PROJECT_ROOT/src/sbom.sh"
 # Load the real command without dispatching the CLI or contacting build hosts.
 # shellcheck source=/dev/null
 source <(awk '/^cmd_release\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
@@ -19,6 +20,10 @@ source <(awk '/^cmd_release\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${
 source <(awk '/^_source_release_read_private_receipt\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 # shellcheck source=/dev/null
 source <(awk '/^_release_prepare_ordinary_checksums\(\) \(/{copy=1} copy{print} copy && /^\)/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+# shellcheck source=/dev/null
+source <(awk '/^_release_prepare_ordinary_sbom\(\) \(/{copy=1} copy{print} copy && /^\)/{exit}' "${DSR_TEST_HELPERS_FILE:-$PROJECT_ROOT/dsr}")
+# shellcheck source=/dev/null
+source <(awk '/^_release_sbom_policy\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_HELPERS_FILE:-$PROJECT_ROOT/dsr}")
 # shellcheck source=/dev/null
 source <(awk '/^_release_file_size\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 
@@ -91,6 +96,7 @@ setup() {
     mkdir -p "$CASE/artifacts" "$CASE/remote" "$CASE/state/releases" "$CASE/tmp" "$CASE/config/repos.d"
     export DSR_STATE_DIR="$CASE/state" TMPDIR="$CASE/tmp" NO_COLOR=1
     export DSR_CONFIG_DIR="$CASE/config" DSR_REPOS_FILE="$CASE/config/repos.yaml"
+    export DSR_CONFIG_FILE="$CASE/config/config.yaml"
     export ACT_REPOS_DIR="$CASE/config/repos.d"
     # The real retained-inventory gate consults the configured execution
     # lane. These fixtures describe local native artifacts, not an act job.
@@ -103,6 +109,7 @@ setup() {
       html_url:"https://github.com/owner/repo/releases/tag/v1.2.3",assets:[]}' > "$CASE/release.json"
     printf 'real payload\n' > "$CASE/artifacts/payload.bin"
     export JSON_MODE=true DRY_RUN=false
+    DSR_CONFIG=()
     STRICT_CONTRACT=null COLLIDE_NAMES=false
     LOOKUP_FAIL=false INVENTORY_FAIL=false UPLOAD_FAIL=false LOST_RESPONSE=false
     CREATE_FAIL=true FINAL_DRIFT=false VISIBILITY_DRIFT=false FAIL_NAME=""
@@ -1171,6 +1178,324 @@ test_staged_absent_tag_probe_exact_ref_is_refused() { staged_tag_case absent-exa
 test_staged_absent_tag_probe_wrong_repository_is_refused() { staged_tag_case absent-wrong-realm; }
 test_staged_absent_tag_created_at_wrong_commit_is_redrafted() { staged_tag_case absent-wrong-created; }
 
+sbom_setup() {
+    setup "$1"
+    CREATE_FAIL=false
+    staged_manifest payload.bin || return 1
+    mkdir -p "$CASE/bin"
+    export PATH="$CASE/bin:$PATH" SBOM_TEST_LOG="$CASE/scans" SBOM_TEST_CALLS="$CALLS"
+    export SBOM_TEST_FAIL="" SBOM_TEST_CHANGE_SOURCE="" SBOM_TEST_CHANGE_MANIFEST=""
+    : > "$SBOM_TEST_LOG"
+    cat > "$CASE/bin/syft" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+source_path="" format=spdx
+for arg in "$@"; do
+    case "$arg" in file:*) source_path="${arg#file:}" ;; cyclonedx-json) format=cyclonedx ;; esac
+done
+[[ -f "$source_path" ]] || exit 4
+name="${source_path##*/}"
+printf '%s\n' "$name" >> "$SBOM_TEST_LOG"
+printf 'SCAN-SBOM %s\n' "$name" >> "$SBOM_TEST_CALLS"
+if [[ "$name" == "$SBOM_TEST_FAIL" ]]; then
+    printf '{"incomplete":'; exit 17
+fi
+[[ -z "$SBOM_TEST_CHANGE_SOURCE" ]] || printf 'changed by scanner\n' >> "$SBOM_TEST_CHANGE_SOURCE"
+[[ -z "$SBOM_TEST_CHANGE_MANIFEST" ]] || printf ' ' >> "$SBOM_TEST_CHANGE_MANIFEST"
+digest=$(sha256sum "$source_path"); digest="${digest%% *}"
+if [[ "$format" == spdx ]]; then
+    jq -nc --arg name "$name" --arg digest "$digest" '
+      {spdxVersion:"SPDX-2.3",dataLicense:"CC0-1.0",SPDXID:"SPDXRef-DOCUMENT",name:$name,
+       documentNamespace:("https://example.test/"+$digest),
+       creationInfo:{creators:["Tool: controlled-syft"],created:"2026-10-23T00:00:00Z"},packages:[]}'
+else
+    jq -nc --arg name "$name" '{bomFormat:"CycloneDX",specVersion:"1.6",version:1,
+      components:[{type:"application",name:$name}]}'
+fi
+SH
+    chmod +x "$CASE/bin/syft"
+}
+
+sbom_remote_matches() {
+    local name="$1" id
+    id=$(jq -er --arg name "$name" '.[] | select(.name==$name) | .id' "$CASE/inventory.json") || return 1
+    cmp -s "$CASE/artifacts/$name" "$CASE/remote/$id"
+}
+
+sbom_no_publication() {
+    ! grep -Eq '^(CREATE|POST|PUBLISH|DISPATCH)' "$CALLS"
+}
+
+test_sbom_complete_release_publishes_exact_documents() {
+    sbom_setup sbom_complete || return 1
+    run_release --sbom
+    [[ $STATUS -eq 0 && $(wc -l < "$SBOM_TEST_LOG") -eq 1 ]] &&
+        sbom_remote_matches payload.bin.sbom.spdx.json && sbom_remote_matches sbom-manifest.spdx.json &&
+        jq -e --arg sha "$(_gh_asset_sha256 "$CASE/artifacts/sbom-manifest.spdx.json")" '
+          .details.sbom | .enabled and .published and .status=="verified" and .format=="spdx" and
+          .artifact_count==1 and .manifest_sha256==$sha and
+          .files==["payload.bin.sbom.spdx.json","sbom-manifest.spdx.json"] and
+          keys==["artifact_count","enabled","filename","files","format","manifest_sha256","published","status"]' \
+            "$CASE/stdout" >/dev/null &&
+        jq -e 'length==6 and all(.[]; (.name | endswith(".dsr.json") or startswith("sbom-plan.") | not))' \
+            "$CASE/inventory.json" >/dev/null
+}
+
+test_sbom_manifest_selects_aliases_and_runtime_metadata() {
+    sbom_setup sbom_selection || return 1
+    cp "$CASE/artifacts/payload.bin" "$CASE/artifacts/payload-compat.bin"
+    printf 'license bytes\n' > "$CASE/artifacts/LICENSE"
+    printf '{"runtime":"required"}\n' > "$CASE/artifacts/runtime.json"
+    staged_manifest payload.bin payload-compat.bin LICENSE runtime.json || return 1
+    run_release --sbom
+    [[ $STATUS -eq 0 && $(wc -l < "$SBOM_TEST_LOG") -eq 4 ]] &&
+        jq -e '[.artifacts[].artifact.name]==["LICENSE","payload-compat.bin","payload.bin","runtime.json"]' \
+            "$CASE/artifacts/sbom-manifest.spdx.json" >/dev/null &&
+        sbom_remote_matches runtime.json.sbom.spdx.json && sbom_remote_matches LICENSE.sbom.spdx.json
+}
+
+test_sbom_cyclonedx_format_implies_generation() {
+    sbom_setup sbom_cyclonedx || return 1
+    run_release --sbom-format cyclonedx-json
+    [[ $STATUS -eq 0 ]] && sbom_remote_matches sbom-manifest.cdx.json &&
+        jq -e '.bomFormat=="CycloneDX"' "$CASE/artifacts/payload.bin.sbom.cdx.json" >/dev/null &&
+        jq -e '.details.sbom.format=="cyclonedx" and .details.sbom.published' "$CASE/stdout" >/dev/null
+}
+
+test_sbom_configured_policy_generates_coverage() {
+    sbom_setup sbom_configured || return 1
+    printf 'sbom:\n  enabled: true\n  format: spdx-json\n' > "$DSR_CONFIG_FILE"
+    run_release
+    [[ $STATUS -eq 0 ]] && sbom_remote_matches sbom-manifest.spdx.json
+}
+
+test_sbom_explicit_disable_overrides_configuration() {
+    sbom_setup sbom_disabled || return 1
+    printf 'sbom:\n  enabled: true\n' > "$DSR_CONFIG_FILE"
+    run_release --no-sbom
+    [[ $STATUS -eq 0 && ! -s "$SBOM_TEST_LOG" && ! -e "$CASE/artifacts/sbom-manifest.spdx.json" ]] &&
+        jq -e '.details.sbom=={enabled:false,status:"disabled",published:false}' "$CASE/stdout" >/dev/null
+}
+
+test_sbom_scan_failure_resumes_completed_pairs() {
+    sbom_setup sbom_failed_scan || return 1
+    printf 'second payload\n' > "$CASE/artifacts/z.bin"
+    staged_manifest payload.bin z.bin || return 1
+    SBOM_TEST_FAIL=z.bin
+    run_release --sbom
+    [[ $STATUS -ne 0 && ! -e "$CASE/artifacts/sbom-manifest.spdx.json" ]] &&
+        sbom_no_publication && [[ $(wc -l < "$SBOM_TEST_LOG") -eq 2 ]] || return 1
+    cp "$CASE/artifacts/payload.bin.sbom.spdx.json" "$CASE/completed.before"
+    SBOM_TEST_FAIL=""
+    run_release --sbom
+    [[ $STATUS -eq 0 && $(wc -l < "$SBOM_TEST_LOG") -eq 3 ]] &&
+        cmp -s "$CASE/completed.before" "$CASE/artifacts/payload.bin.sbom.spdx.json" &&
+        sbom_remote_matches z.bin.sbom.spdx.json
+}
+
+test_sbom_missing_scanner_blocks_release() {
+    sbom_setup sbom_missing_scanner || return 1
+    command() {
+        [[ "${1:-}" != -v || "${2:-}" != syft ]] || return 1
+        builtin command "$@"
+    }
+    run_release --sbom
+    [[ $STATUS -eq 3 && ! -s "$SBOM_TEST_LOG" ]] && sbom_no_publication
+}
+
+test_sbom_changed_payload_blocks_release() {
+    sbom_setup sbom_payload_drift || return 1
+    SBOM_TEST_CHANGE_SOURCE="$CASE/artifacts/payload.bin"
+    run_release --sbom
+    [[ $STATUS -ne 0 ]] && sbom_no_publication
+}
+
+test_sbom_changed_manifest_blocks_release() {
+    sbom_setup sbom_manifest_drift || return 1
+    SBOM_TEST_CHANGE_MANIFEST="$CASE/artifacts/tool-v1.2.3-manifest.json"
+    run_release --sbom
+    [[ $STATUS -ne 0 ]] && sbom_no_publication
+}
+
+# Mutate only after the real generation/verification helper has succeeded.
+# Publication must retain its complete verified names and digests instead of
+# blessing whatever a later directory discovery happens to find.
+sbom_handoff_drift_case() {
+    local sbom_handoff_name="$1" sbom_handoff_action="$2"
+    sbom_setup "sbom_handoff_${sbom_handoff_action}_${sbom_handoff_name//./_}" || return 1
+    # shellcheck source=/dev/null
+    source <(
+        printf 'sbom_prepare_before_handoff_drift() (\n'
+        awk '/^_release_prepare_ordinary_sbom\(\) \(/{copy=1; next}
+            copy{print} copy && /^\)/{exit}' "${DSR_TEST_HELPERS_FILE:-$PROJECT_ROOT/dsr}"
+    ) || return 1
+    _release_prepare_ordinary_sbom() {
+        local sbom_handoff_report sbom_handoff_path="$CASE/artifacts/$sbom_handoff_name"
+        sbom_handoff_report=$(sbom_prepare_before_handoff_drift "$@") || return $?
+        case "$sbom_handoff_action" in
+            changed)
+                cp "$sbom_handoff_path" "$CASE/verified.before" || return 1
+                printf ' ' >> "$sbom_handoff_path" || return 1 ;;
+            missing)
+                mv "$sbom_handoff_path" "$CASE/verified.before" || return 1 ;;
+            *) return 1 ;;
+        esac
+        printf 'SBOM-HANDOFF-MUTATION\n' >> "$CALLS"
+        printf '%s\n' "$sbom_handoff_report"
+    }
+    run_release --sbom
+    [[ $STATUS -ne 0 && -s "$CASE/verified.before" && $(wc -l < "$SBOM_TEST_LOG") -eq 1 ]] &&
+        grep -Fxq SBOM-HANDOFF-MUTATION "$CALLS" && sbom_no_publication
+}
+
+test_sbom_changed_document_at_handoff_blocks_creation() {
+    sbom_handoff_drift_case payload.bin.sbom.spdx.json changed
+}
+
+test_sbom_missing_document_at_handoff_blocks_creation() {
+    sbom_handoff_drift_case payload.bin.sbom.spdx.json missing
+}
+
+test_sbom_changed_aggregate_at_handoff_blocks_creation() {
+    sbom_handoff_drift_case sbom-manifest.spdx.json changed
+}
+
+test_sbom_missing_aggregate_at_handoff_blocks_creation() {
+    sbom_handoff_drift_case sbom-manifest.spdx.json missing
+}
+
+test_sbom_aggregate_changes_after_verification_blocks_creation() {
+    sbom_setup sbom_aggregate_after_verification || return 1
+    # Preserve the loaded production verifier body; do not replace validation.
+    # shellcheck source=/dev/null
+    source <(
+        printf 'sbom_verify_before_aggregate_drift()\n'
+        declare -f sbom_verify_artifacts | awk 'NR > 1 {print}'
+    ) || return 1
+    sbom_verify_artifacts() {
+        local sbom_verified_output
+        sbom_verified_output=$(sbom_verify_before_aggregate_drift "$@") || return $?
+        [[ "$sbom_verified_output" == "$CASE/artifacts/sbom-manifest.spdx.json" ]] || return 1
+        cp "$sbom_verified_output" "$CASE/verified.before" || return 1
+        printf ' ' >> "$sbom_verified_output" || return 1
+        printf 'SBOM-VERIFIER-MUTATION\n' >> "$CALLS"
+        printf '%s\n' "$sbom_verified_output"
+    }
+    run_release --sbom
+    [[ $STATUS -ne 0 && -s "$CASE/verified.before" && $(wc -l < "$SBOM_TEST_LOG") -eq 1 ]] &&
+        grep -Fxq SBOM-VERIFIER-MUTATION "$CALLS" && sbom_no_publication
+}
+
+test_sbom_changed_document_cannot_be_regenerated_on_resume() {
+    sbom_setup sbom_document_drift || return 1
+    run_release --sbom
+    [[ $STATUS -eq 0 ]] || return 1
+    printf ' ' >> "$CASE/artifacts/payload.bin.sbom.spdx.json"
+    cp "$CASE/artifacts/payload.bin.sbom.spdx.json" "$CASE/changed.before"
+    : > "$CALLS"
+    run_release --resume --sbom
+    [[ $STATUS -ne 0 && $(wc -l < "$SBOM_TEST_LOG") -eq 1 ]] && sbom_no_publication &&
+        cmp -s "$CASE/changed.before" "$CASE/artifacts/payload.bin.sbom.spdx.json"
+}
+
+test_sbom_publication_resume_reuses_verified_scans() {
+    sbom_setup sbom_resume || return 1
+    PUBLISH_FAIL=true
+    run_release --sbom
+    [[ $STATUS -ne 0 ]] && jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+    cp "$CASE/artifacts/sbom-manifest.spdx.json" "$CASE/aggregate.before"
+    mv "$CASE/bin/syft" "$CASE/syft.retained"
+    PUBLISH_FAIL=false
+    : > "$CALLS"
+    run_release --resume --sbom
+    [[ $STATUS -eq 0 && $(wc -l < "$SBOM_TEST_LOG") -eq 1 ]] &&
+        ! grep -Eq '^POST |^CREATE|^SCAN-SBOM' "$CALLS" && grep -Fxq PUBLISH "$CALLS" &&
+        cmp -s "$CASE/aggregate.before" "$CASE/artifacts/sbom-manifest.spdx.json" &&
+        jq -e '.details.sbom.published and .details.sbom.status=="verified"' "$CASE/stdout" >/dev/null
+}
+
+test_sbom_retained_public_inventory_survives_disabled_generation() {
+    sbom_setup sbom_disabled_retry || return 1
+    PUBLISH_FAIL=true
+    run_release --sbom
+    [[ $STATUS -ne 0 ]] || return 1
+    PUBLISH_FAIL=false
+    : > "$CALLS"
+    run_release --resume --no-sbom
+    [[ $STATUS -eq 0 && $(wc -l < "$SBOM_TEST_LOG") -eq 1 ]] &&
+        ! grep -Eq '^POST |^CREATE|^SCAN-SBOM' "$CALLS" && grep -Fxq PUBLISH "$CALLS" &&
+        sbom_remote_matches sbom-manifest.spdx.json && sbom_remote_matches payload.bin.sbom.spdx.json
+}
+
+test_sbom_dry_run_has_complete_plan_without_scanning() {
+    sbom_setup sbom_dry_run || return 1
+    DRY_RUN=true
+    run_release --sbom
+    [[ $STATUS -eq 0 && ! -s "$CALLS" && ! -s "$SBOM_TEST_LOG" &&
+       ! -e "$CASE/artifacts/sbom-plan.spdx.json" && ! -e "$CASE/artifacts/SHA256SUMS" ]] &&
+        jq -e '.details | .file_count==6 and .sbom.enabled and (.sbom.published|not) and
+          .sbom.status=="planned" and .sbom.manifest_sha256==null and
+          (.sbom | keys==["artifact_count","enabled","filename","files","format","manifest_sha256","published","status"]) and
+          (.plan.additional_files | index("sbom-manifest.spdx.json")!=null and
+              index("payload.bin.sbom.spdx.json")!=null)' "$CASE/stdout" >/dev/null
+}
+
+test_sbom_strict_contract_rejects_automatic_extra_assets() {
+    sbom_setup sbom_strict || return 1
+    STRICT_CONTRACT='{}'
+    run_release --sbom
+    [[ $STATUS -eq 4 && ! -s "$CALLS" && ! -s "$SBOM_TEST_LOG" ]]
+}
+
+test_sbom_requires_manifested_release() {
+    sbom_setup sbom_no_manifest || return 1
+    mv "$CASE/artifacts/tool-v1.2.3-manifest.json" "$CASE/manifest.saved"
+    run_release --sbom
+    [[ $STATUS -eq 4 ]] && sbom_no_publication
+}
+
+test_sbom_invalid_options_fail_before_scanning() {
+    sbom_setup sbom_bad_options || return 1
+    local option
+    for option in missing invalid contradictory; do
+        case "$option" in
+            missing) run_release --sbom-format ;;
+            invalid) run_release --sbom-format unknown ;;
+            contradictory) run_release --no-sbom --sbom-format spdx ;;
+        esac
+        [[ $STATUS -eq 4 && ! -s "$CALLS" && ! -s "$SBOM_TEST_LOG" ]] || return 1
+    done
+    printf 'sbom:\n  enabled: sometimes\n' > "$DSR_CONFIG_FILE"
+    run_release
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]]
+}
+
+test_sbom_derived_name_collision_refuses_before_scanning() {
+    sbom_setup sbom_name_collision || return 1
+    printf 'payload occupying a metadata name\n' > "$CASE/artifacts/sbom-manifest.spdx.json"
+    staged_manifest payload.bin sbom-manifest.spdx.json || return 1
+    run_release --sbom
+    [[ $STATUS -eq 4 && ! -s "$CALLS" && ! -s "$SBOM_TEST_LOG" ]]
+}
+
+test_sbom_linked_document_preserves_external_target() {
+    sbom_setup sbom_linked_document || return 1
+    printf 'unrelated file\n' > "$CASE/external"
+    cp "$CASE/external" "$CASE/external.before"
+    ln -s "$CASE/external" "$CASE/artifacts/payload.bin.sbom.spdx.json"
+    run_release --sbom
+    [[ $STATUS -ne 0 && ! -s "$SBOM_TEST_LOG" ]] && sbom_no_publication &&
+        cmp -s "$CASE/external" "$CASE/external.before"
+}
+
+test_sbom_missing_aggregate_blocks_publication() {
+    sbom_setup sbom_missing_aggregate || return 1
+    DROP_SIDECAR=sbom-manifest.spdx.json
+    run_release --sbom
+    [[ $STATUS -ne 0 ]] && ! grep -Eq '^PUBLISH|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
 for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_is_reused_without_deletion \
     test_saved_name_with_changed_remote_fails_closed test_legacy_digestless_assets_are_hashed \
     test_unavailable_inventory_is_not_success test_failed_resume_lookup_never_creates \
@@ -1207,7 +1532,20 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_staged_absent_tag_is_created_at_pinned_commit test_staged_absent_tag_with_prefix_sibling_can_publish \
     test_staged_absent_tag_probe_unavailable_is_refused test_staged_absent_tag_probe_malformed_is_refused \
     test_staged_absent_tag_probe_nonarray_is_refused test_staged_absent_tag_probe_exact_ref_is_refused \
-    test_staged_absent_tag_probe_wrong_repository_is_refused test_staged_absent_tag_created_at_wrong_commit_is_redrafted; do
+    test_staged_absent_tag_probe_wrong_repository_is_refused test_staged_absent_tag_created_at_wrong_commit_is_redrafted \
+    test_sbom_complete_release_publishes_exact_documents test_sbom_manifest_selects_aliases_and_runtime_metadata \
+    test_sbom_cyclonedx_format_implies_generation test_sbom_configured_policy_generates_coverage \
+    test_sbom_explicit_disable_overrides_configuration test_sbom_scan_failure_resumes_completed_pairs \
+    test_sbom_missing_scanner_blocks_release test_sbom_changed_payload_blocks_release \
+    test_sbom_changed_manifest_blocks_release test_sbom_changed_document_cannot_be_regenerated_on_resume \
+    test_sbom_changed_document_at_handoff_blocks_creation test_sbom_missing_document_at_handoff_blocks_creation \
+    test_sbom_changed_aggregate_at_handoff_blocks_creation test_sbom_missing_aggregate_at_handoff_blocks_creation \
+    test_sbom_aggregate_changes_after_verification_blocks_creation \
+    test_sbom_publication_resume_reuses_verified_scans test_sbom_retained_public_inventory_survives_disabled_generation \
+    test_sbom_dry_run_has_complete_plan_without_scanning test_sbom_strict_contract_rejects_automatic_extra_assets \
+    test_sbom_requires_manifested_release test_sbom_invalid_options_fail_before_scanning \
+    test_sbom_derived_name_collision_refuses_before_scanning test_sbom_linked_document_preserves_external_target \
+    test_sbom_missing_aggregate_blocks_publication; do
     [[ -z "${DSR_RELEASE_RESUME_TEST_FILTER:-}" || "$test" =~ $DSR_RELEASE_RESUME_TEST_FILTER ]] || continue
     run_test "$test"
 done

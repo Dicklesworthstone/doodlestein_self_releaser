@@ -724,6 +724,9 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
 | `--no-manifest` | false | Upload an artifacts directory that has no build manifest, as-is |
 | `--resume` | false | Reverify retained uploads and complete an owned interrupted publication |
+| `--sbom` | `sbom.enabled`, default false | Generate and verify complete SBOM coverage before ordinary publication |
+| `--no-sbom` | false | Disable automatic generation without discarding retained public metadata |
+| `--sbom-format` | `sbom.format`, default `spdx` | Select `spdx` or `cyclonedx` and enable generation |
 
 New ordinary releases are created as private drafts. DSR freezes every selected
 asset name, size, and SHA-256, including the manifest, generated checksums, and
@@ -760,6 +763,24 @@ visibility, including on verification failure. Requesting `--draft` for an
 already-public release still refuses before upload.
 `--draft` on a retry can keep an owned public-intent draft private for that
 invocation without changing its retained publication intent.
+
+Automatic SBOM generation selects every payload from the exact build manifest,
+including aliases and runtime metadata explicitly listed as artifacts. It
+verifies all payload/document pairs before any remote mutation and publishes
+the individual documents plus `sbom-manifest.spdx.json` or
+`sbom-manifest.cdx.json`. Per-document `.dsr.json` receipts and the private
+`sbom-plan` remain local. Completed verified scans survive interruption; changed
+payloads, documents, or coverage block publication. A dry run reports the full
+planned upload set without scanning or writing files.
+
+`details.sbom` reports `enabled`, `status` (`disabled`, `planned`, or `verified`),
+and `published`. Enabled reports include `format`, aggregate `filename`,
+`artifact_count`, the complete public `files` list, and `manifest_sha256` (null
+for a plan). Verified describes local coverage; `published` becomes true only
+after a successful public-release verification. `--no-sbom` overrides configured
+generation but cannot remove metadata frozen into a previous publication plan.
+A format combined with `--no-sbom`, generation without a manifest, or generation
+for a strict closed contract returns `4`. See [SBOM generation](SBOM.md).
 
 An ordinary release publishes the build manifest's artifacts. `dsr build`
 publishes the manifest only after every target, artifact collection, packaging,
@@ -1144,6 +1165,16 @@ builds require explicit consent through `--from-source` or
 `--allow-source-build`; Go and Bun source fallback accepts only a singleton
 selection. Integrity or installation failures never trigger source fallback.
 
+`--install-toolchain` separately authorizes provisioning a missing compiler for
+the selected source build. It requires `--from-source` or
+`--allow-source-build`; `--yes` alone does not enable it. Rust, Go and Bun use
+private toolchain directories and verified official distributions on Linux or
+macOS, x64 or ARM64. Existing usable compilers remain in use. Windows source
+builds require a preinstalled compiler. Safe, offline, and required-signature
+source restrictions still apply. The source receipt records the selected
+toolchain and distribution evidence when provisioning occurs. See
+[installer generation](INSTALLER_GENERATION.md) for pinning and verification.
+
 ---
 
 ### `dsr fallback`
@@ -1173,6 +1204,26 @@ automatic watch attempt cannot be marked complete while its downloads remain
 unavailable. Retrying an ordinary publication with `--resume` uses its retained
 creation intent to finish an owned interrupted draft; it cannot publish an
 unrelated draft.
+
+Strict fallback retains a private, build-bound publication handoff before draft
+creation. `--resume=RUN_UUID` reuses its completed build, original creation
+response, signed asset plan, and canonical output directory. It verifies fresh
+release metadata and every existing asset before uploading only missing assets,
+then invokes `release finalize --no-dispatch` and verifies its success receipt.
+Already-public retries require complete verification. Changed or ambiguous
+custody, changed source/configuration/artifacts, unexpected assets, or missing
+original POST responses block recovery; no remote asset is replaced or deleted.
+
+`details.publication_recovery` exposes the `build_run_id`, private `intent`,
+creation custody when available, release ID, and finalization receipt. Its
+status is `prepared`, `ready`, `blocked`, or `finalized`; `ready` identifies
+recoverable custody and does not claim publication. Preserve the complete state
+and original output directory. Automatic strict recovery inherits the
+finalizer's configuration restrictions, documented in the
+[recovery guide](NATIVE_RELEASE_RECOVERY.md#resume-an-interrupted-strict-fallback-publication).
+
+Fallback accepts the same `--sbom`, `--no-sbom`, and `--sbom-format` policy as
+ordinary release and forwards it to publication. Build-only runs do not scan.
 
 `--expected-sha <full-commit>` binds a fallback to an observed workflow run.
 It requires an explicit `--version` and a nonzero 40-character commit SHA.

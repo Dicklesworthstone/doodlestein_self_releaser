@@ -10,10 +10,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 source "$ROOT/src/signing.sh"
 # shellcheck source=src/git_ops.sh
 source "$ROOT/src/git_ops.sh"
+# shellcheck source=src/sbom.sh
+source "$ROOT/src/sbom.sh"
 COMMAND_FILE="${DSR_TEST_COMMAND_FILE:-$ROOT/dsr}"
 HELPERS_FILE="${DSR_TEST_HELPERS_FILE:-$COMMAND_FILE}"
 # shellcheck source=/dev/null
-source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
+source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
 # shellcheck source=/dev/null
 source <(awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$COMMAND_FILE")
 # shellcheck source=/dev/null
@@ -31,6 +33,9 @@ _log_info() { log_info "$@"; }
 _log_error() { log_error "$@"; }
 _log_ok() { log_ok "$@"; }
 _cfg_log_error() { log_error "$@"; }
+_dsr_require() { :; }
+config_load() { :; }
+config_get() { printf '%s\n' "${2:-}"; }
 act_load_repo_config() { return 0; }
 act_get_local_path() { printf '%s\n' "$CASE/source"; }
 act_get_repo() { printf '%s\n' owner/tool; }
@@ -318,8 +323,19 @@ test_signing_failure() {
     [[ "$RC" == 7 && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^RELEASE ' "$CALLS"
 }
 test_strict_fresh_output() {
-    setup strict; CONTRACT='{"checksum_sidecar":"sha256"}'; run_fallback
+    # Strict publication custody uses the real producer/finalizer in the
+    # strict recovery suite. Here verify fresh build output and signer ownership.
+    setup strict; CONTRACT='{"checksum_sidecar":"sha256"}'; run_fallback --build-only
     [[ "$RC" == 0 && ! -e "$CASE/lock" ]] && one_result && ! grep -q '^SIGN ' "$CALLS"
+}
+test_sbom_forwarding() {
+    setup sbom; run_fallback --sbom --sbom-format spdx-json
+    [[ "$RC" == 0 ]] && one_result &&
+        grep -Fq -- '--sbom --sbom-format spdx-json' "$CALLS"
+}
+test_strict_sbom_refusal() {
+    setup strict-sbom; CONTRACT='{"checksum_sidecar":"sha256"}'; run_fallback --sbom
+    [[ "$RC" == 4 && ! -e "$OUT" && ! -e "$DSR_STATE_DIR" && ! -s "$CALLS" ]]
 }
 test_dry_run() {
     setup "dry-$1"
@@ -933,6 +949,8 @@ for mode in missing malformed multiple empty partial wrong-tool wrong-version du
 done
 run_test test_signing_failure
 run_test test_strict_fresh_output
+run_test test_sbom_forwarding
+run_test test_strict_sbom_refusal
 run_test test_dry_run global
 run_test test_dry_run command
 run_test test_state_failure

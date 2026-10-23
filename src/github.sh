@@ -1346,7 +1346,7 @@ _gh_manifest_has_upload_name() {
     fi
     case "$base" in
         *.sha256) base="${base%.sha256}" ;;
-        *.sbom.*|*.intoto.jsonl) return 0 ;;
+        *.sbom.*|*.intoto.jsonl|sbom-manifest.spdx.json|sbom-manifest.cdx.json) return 0 ;;
     esac
     jq -e --arg name "$base" 'any(.artifacts[]; .name == $name)' "$manifest" >/dev/null
 }

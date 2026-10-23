@@ -5353,6 +5353,98 @@ _release_prepare_ordinary_checksums() (
     done
 )
 
+_release_sbom_policy() {
+    local override="${1:-}" requested_format="${2:-}" enabled format=""
+    if [[ -n "$requested_format" && "$override" == false ]]; then
+        log_error "--sbom-format cannot be combined with --no-sbom"
+        return 4
+    fi
+    enabled="${override:-$(config_get sbom.enabled false)}"
+    [[ -z "$requested_format" ]] || enabled=true
+    case "$enabled" in
+        true|false) ;;
+        *) log_error "sbom.enabled must be true or false"; return 4 ;;
+    esac
+    if $enabled; then
+        _dsr_require sbom || return $?
+        format="${requested_format:-$(config_get sbom.format spdx)}"
+        format=$(_sbom_format "$format") || return $?
+    fi
+    jq -nc --argjson enabled "$enabled" --arg format "$format" \
+        '{enabled:$enabled,format:(if $enabled then $format else null end)}'
+}
+
+# Bind complete SBOM coverage to the same final payload inventory used by
+# signing and publication. The scanner's directory heuristics cannot replace
+# this selection: releases may deliberately include licenses or runtime JSON.
+# Planning is read-only; generation retains the SBOM engine's resumable pairs.
+_release_prepare_ordinary_sbom() (
+    local manifest="$1" directory="$2" expected="$3" format="$4" action="${5:-generate}"
+    local extension selection_json files report selection output actual sbom_expected
+    case "$action" in plan|generate) ;; *) return 4 ;; esac
+    _dsr_require sbom || return $?
+    format=$(_sbom_format "$format") || return $?
+    extension=$(_sbom_extension "$format") || return $?
+    [[ -f "$manifest" && ! -L "$manifest" &&
+       "$(_gh_asset_sha256 "$manifest")" == "$expected" ]] || return 4
+    directory=$(cd "$directory" && pwd -P) || return 4
+    selection_json=$(jq -ce '{schema_version:1,
+        artifacts:[.artifacts[] | {name:(.name // .filename),sha256}] | sort_by(.name)}' \
+        "$manifest") || return 4
+    if ! jq -e --arg ext "$extension" '
+        .artifacts | length >= 1 and length <= 256 and
+        all(.[]; (.name | type == "string" and length <= 128 and
+            test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..") | not)) and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+        ([.[].name] as $names |
+         ($names + ($names | map(.+".sbom."+$ext)) +
+          ($names | map(.+".sbom."+$ext+".dsr.json")) +
+          ["sbom-manifest."+$ext,"sbom-plan."+$ext]) as $all |
+         ($all | map(ascii_downcase) | unique | length) == ($all | length))
+    ' <<< "$selection_json" >/dev/null; then
+        log_error "Release payload names cannot form an unambiguous SBOM inventory"
+        return 4
+    fi
+    files=$(jq -c --arg ext "$extension" \
+        '[.artifacts[].name + ".sbom." + $ext] + ["sbom-manifest." + $ext] | sort' \
+        <<< "$selection_json") || return 4
+    report=$(jq -nc --arg format "$format" --arg filename "sbom-manifest.$extension" \
+        --argjson files "$files" --argjson count "$(jq '.artifacts | length' <<< "$selection_json")" \
+        '{enabled:true,status:"planned",published:false,format:$format,filename:$filename,
+          artifact_count:$count,files:$files,manifest_sha256:null}') || return 4
+    if [[ "$action" == plan ]]; then
+        printf '%s\n' "$report"
+        return 0
+    fi
+    umask 077
+    selection=$(mktemp "${TMPDIR:-/tmp}/dsr-release-sbom.XXXXXXXX") || return 4
+    trap 'rm -f -- "$selection"' EXIT
+    trap 'exit 5' HUP INT TERM
+    printf '%s\n' "$selection_json" > "$selection" || return 4
+    output=$(sbom_generate_artifacts "$directory" --format "$format" \
+        --output-dir "$directory" --selection "$selection") || return $?
+    [[ "$output" == "$directory/sbom-manifest.$extension" ]] || return 4
+    actual=$(_gh_asset_sha256 "$output") || return 4
+    # Re-read the complete final files, including retained scans, rather than
+    # treating a successful scanner exit or an existing manifest as coverage.
+    sbom_verify_artifacts "$directory" --format "$format" --output-dir "$directory" \
+        --selection "$selection" >/dev/null || return $?
+    [[ "$(_gh_asset_sha256 "$output")" == "$actual" ]] || return 4
+    # Carry the verified names AND digests into publication. Discovering the
+    # directory again must not bless changed bytes or omit a missing document.
+    sbom_expected=$(jq -ce --arg name "sbom-manifest.$extension" --arg sha "$actual" '
+        [.artifacts[].sbom | {key:.name,value:.sha256}] | from_entries | .[$name]=$sha
+    ' "$output") || return 4
+    [[ "$(_gh_asset_sha256 "$output")" == "$actual" ]] || return 4
+    jq -e --argjson files "$files" '
+        keys == ($files | sort) and all(.[]; type == "string" and test("^[0-9a-f]{64}$"))
+    ' <<< "$sbom_expected" >/dev/null || return 4
+    signing_validate_release_inventory "$manifest" "$directory" "$expected" || return $?
+    jq -c --arg digest "$actual" --argjson expected "$sbom_expected" '
+        .status="verified" | .manifest_sha256=$digest | ._expected_sha256=$expected
+    ' <<< "$report"
+)
+
 # Validate an opt-in release contract and return the closed upload plan as JSON.
 # No GitHub mutation is allowed before this succeeds. sidecar_mode is create,
 # verify, or plan. Creation uses noclobber; an existing sidecar is always
@@ -6857,7 +6949,7 @@ EOF
     act_load_repo_config "$tool" || return 4
     config_validate_release_contract "$tool" || return 4
     repo=$(jq -r '.repo' <<< "$config_json") || return 4
-    path=$(jq -r '.local_path' <<< "$config_json") || return 4
+    path=$(act_get_local_path "$tool") || return 4
     [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 4
     tag=$(git_ops_version_to_tag "$version") || return 4
     contract=$(jq -c '.release_contract' <<< "$config_json") || return 4
@@ -7222,6 +7314,9 @@ cmd_release() {
     local dispatch_repos_override=""
     local allow_no_manifest=false
     local release_tag_sha=""
+    local sbom_override="" sbom_format_override="" sbom_enabled=false sbom_format=""
+    local ordinary_sbom_report='{"enabled":false,"status":"disabled","published":false}'
+    local ordinary_sbom_hashes='{}'
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -7266,6 +7361,13 @@ cmd_release() {
                 verify_upgrade=true
                 shift
                 ;;
+            --sbom) sbom_override=true; shift ;;
+            --no-sbom) sbom_override=false; shift ;;
+            --sbom-format)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || {
+                    log_error "--sbom-format requires a format"; return 4;
+                }
+                sbom_format_override="$2"; shift 2 ;;
             --dispatch)
                 dispatch_override="true"
                 shift
@@ -7309,6 +7411,9 @@ OPTIONS:
                              every target succeeded; without it the directory
                              may hold a partial build, and no checksums are made)
     --verify-upgrade         Run upgrade verification after successful release
+    --sbom                   Generate and verify SBOMs for every manifest payload
+    --no-sbom                Disable automatic SBOM generation for this run
+    --sbom-format <format>   SPDX or CycloneDX (implies --sbom)
     --dispatch               Trigger repository dispatch after release
     --no-dispatch            Disable repository dispatch for this run
     --dispatch-event <name>  Override dispatch event type
@@ -7330,6 +7435,7 @@ EXAMPLES:
     dsr release ntm 1.2.3 --draft           Create as draft
     dsr release ntm 1.2.3 --verify-upgrade  Release + verify upgrade works
     dsr release ntm 1.2.3 --dispatch        Release + dispatch downstream workflows
+    dsr release ntm 1.2.3 --sbom            Release + complete verified SBOM coverage
     dsr release ntm 1.2.3 --resume          Resume interrupted upload
     dsr release verify ntm 1.2.3            Verify release assets
     dsr release --tool bv --version 2.0.0   Full flag syntax
@@ -7373,6 +7479,12 @@ EOF
         log_info "Run 'dsr release --help' for usage"
         return 4
     fi
+
+    config_load || return $?
+    local sbom_policy
+    sbom_policy=$(_release_sbom_policy "$sbom_override" "$sbom_format_override") || return $?
+    sbom_enabled=$(jq -r '.enabled' <<< "$sbom_policy") || return 4
+    sbom_format=$(jq -r '.format // empty' <<< "$sbom_policy") || return 4
 
     # Check GitHub authentication
     if ! gh_check 2>/dev/null; then
@@ -7430,6 +7542,11 @@ EOF
         if [[ "$release_contract_json" != "null" ]]; then
             release_contract_enabled=true
         fi
+    fi
+
+    if $sbom_enabled && $release_contract_enabled; then
+        log_error "Automatic SBOM generation requires an ordinary release; strict contracts must declare their SBOM assets explicitly (use --no-sbom)"
+        return 4
     fi
 
     log_info "Releasing $tool_name $version to $repo"
@@ -7507,6 +7624,10 @@ EOF
     fi
     _release_require_publishable_artifacts "$artifacts_dir" "$manifest_file" \
         "$release_contract_enabled" || return 4
+    if $sbom_enabled && ! $manifest_exists; then
+        log_error "Automatic SBOM coverage requires a complete build manifest"
+        return 4
+    fi
 
     # Saved upload names are not evidence that GitHub still serves these bytes.
     # Freeze the ordinary manifest and verify every required local artifact
@@ -7850,12 +7971,24 @@ EOF
         _release_plan_upload_names || return 4
     fi
 
+    if $sbom_enabled; then
+        local sbom_action=generate
+        $DRY_RUN && sbom_action=plan
+        ordinary_sbom_report=$(_release_prepare_ordinary_sbom "$manifest_file" "$artifacts_dir" \
+            "${ordinary_expected_sha[${manifest_file##*/}]}" "$sbom_format" "$sbom_action") || return $?
+        if ! $DRY_RUN; then
+            ordinary_sbom_hashes=$(jq -ce '._expected_sha256' <<< "$ordinary_sbom_report") || return 4
+            ordinary_sbom_report=$(jq -c 'del(._expected_sha256)' <<< "$ordinary_sbom_report") || return 4
+        fi
+    fi
+
     # Check the resolved ownership plan before any GitHub mutation. Shared
     # aliases keep their configured primary owner, but explicit artifact
     # bytes cannot collide with metadata or generated checksum names. Freeze
     # this inventory for the dry-run, checksums and actual upload loop.
     local -A ordinary_upload_names=() ordinary_alias_sha=() ordinary_alias_owner=()
     local -A ordinary_generated_names=()
+    local -A ordinary_sbom_expected_sha=()
     local -a ordinary_extra_files=()
     if ! $release_contract_enabled && $manifest_exists; then
         local row_name resolved_names alias_name alias_sha
@@ -7893,8 +8026,34 @@ EOF
         done
         ordinary_extra_files+=("$manifest_file")
         local extra_file extra_name extra_sha
+        if $sbom_enabled && ! $DRY_RUN; then
+            while IFS=$'\t' read -r extra_name extra_sha; do
+                extra_file="$artifacts_dir/$extra_name"
+                if [[ ! -s "$extra_file" || ! -f "$extra_file" || -L "$extra_file" ||
+                      "$(_gh_asset_sha256 "$extra_file")" != "$extra_sha" ]]; then
+                    log_error "Verified SBOM file is missing or changed: $extra_name"
+                    return 4
+                fi
+                if [[ -n "${ordinary_generated_names[$extra_name]:-}" ||
+                      ( -n "${ordinary_expected_sha[$extra_name]:-}" &&
+                        "${ordinary_expected_sha[$extra_name]}" != "$extra_sha" ) ||
+                      ( -n "${ordinary_alias_sha[$extra_name]:-}" &&
+                        "${ordinary_alias_sha[$extra_name]}" != "$extra_sha" ) ]]; then
+                    log_error "Verified SBOM name collides with release contents: $extra_name"
+                    return 4
+                fi
+                ordinary_sbom_expected_sha["$extra_name"]="$extra_sha"
+                ordinary_expected_sha["$extra_name"]="$extra_sha"
+                ordinary_extra_files+=("$extra_file")
+            done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' <<< "$ordinary_sbom_hashes")
+        fi
         while IFS= read -r -d '' extra_file; do
             extra_name="${extra_file##*/}"
+            # Per-scan receipts and the frozen retry plan are local controls.
+            # Publish the standards documents and complete public inventory.
+            case "$extra_name" in
+                *.sbom.spdx.json.dsr.json|*.sbom.cdx.json.dsr.json) continue ;;
+            esac
             [[ -z "${ordinary_generated_names[$extra_name]:-}" ]] || continue
             [[ "$extra_file" != "$manifest_file" ]] || continue
             if [[ ! "$extra_name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ||
@@ -7903,6 +8062,13 @@ EOF
                 log_error "Invalid release sidecar: $extra_name"
                 return 4
             fi
+            if [[ -n "${ordinary_sbom_expected_sha[$extra_name]:-}" ]]; then
+                if [[ "$extra_sha" != "${ordinary_sbom_expected_sha[$extra_name]}" ]]; then
+                    log_error "Verified SBOM file changed during release planning: $extra_name"
+                    return 4
+                fi
+                continue
+            fi
             if [[ -n "${ordinary_alias_sha[$extra_name]:-}" && "${ordinary_alias_sha[$extra_name]}" != "$extra_sha" ]]; then
                 log_error "Upload name $extra_name collides with an existing release sidecar"
                 return 4
@@ -7910,7 +8076,9 @@ EOF
             ordinary_expected_sha["$extra_name"]="$extra_sha"
             ordinary_extra_files+=("$extra_file")
         done < <(find "$artifacts_dir" -maxdepth 1 -type f \
-            \( -name 'SHA256SUMS*' -o -name '*.sha256' -o -name '*.minisig' -o -name '*.sbom.*' -o -name '*.intoto.jsonl' \) -print0)
+            \( -name 'SHA256SUMS*' -o -name '*.sha256' -o -name '*.minisig' -o -name '*.sbom.*' \
+               -o -name 'sbom-manifest.spdx.json' -o -name 'sbom-manifest.cdx.json' \
+               -o -name '*.intoto.jsonl' \) -print0)
     fi
 
     # Check the names a project's own curl|bash installer downloads against the
@@ -8059,6 +8227,12 @@ EOF
                 log_info "  Would upload: ${extra_file##*/} (existing sidecar)"
                 plan_extra+=("${extra_file##*/}")
             done
+            if $sbom_enabled; then
+                while IFS= read -r name; do
+                    log_info "  Would generate or verify and upload: $name"
+                    plan_extra+=("$name")
+                done < <(jq -r '.files[]' <<< "$ordinary_sbom_report")
+            fi
             plan_all_names+=("${plan_extra[@]}" SHA256SUMS)
             file_count=$(printf '%s\n' "${plan_all_names[@]}" | sort -u | grep -c . || true)
             file_count=$((file_count + unique_names))
@@ -8085,7 +8259,7 @@ EOF
                 plan_artifacts_json=$(printf '%s\n' "${plan_artifacts[@]}" | jq -sc '.') || return 4
             fi
             if [[ ${#plan_extra[@]} -gt 0 ]]; then
-                plan_extra_json=$(printf '%s\n' "${plan_extra[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 4
+                plan_extra_json=$(printf '%s\n' "${plan_extra[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique') || return 4
             fi
             json_envelope "release" "dry_run" 0 "$(jq -nc \
                 --arg tool "$tool_name" \
@@ -8099,6 +8273,7 @@ EOF
                 --argjson extra "$plan_extra_json" \
                 --argjson strict "$release_contract_enabled" \
                 --argjson installer "$installer_report" \
+                --argjson sbom "$ordinary_sbom_report" \
                 --argjson contract_assets "$(if $release_contract_enabled; then jq -c '[.assets[].name]' <<< "$release_contract_plan"; else echo '[]'; fi)" \
                 '{tool: $tool, version: $version, tag: $version, repo: $repo,
                   artifacts_dir: $artifacts_dir, draft: $draft, prerelease: $prerelease,
@@ -8106,7 +8281,7 @@ EOF
                   plan: (if $strict then {strict: true, assets: $contract_assets}
                          else {strict: false, artifacts: $artifacts, additional_files: $extra,
                                generated: ["SHA256SUMS", "<name>.sha256 per uploaded name"]} end),
-                  installer_check: $installer}')"
+                  installer_check: $installer, sbom:$sbom}')"
         fi
         return 0
     fi
@@ -8394,9 +8569,20 @@ EOF
     fi
 
     local create_status=0 create_response="" create_response_dir=""
+    local strict_creation_intent="" strict_creation_proof=""
     if $release_contract_enabled; then
         create_response_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/dsr-create-custody.XXXXXXXX") || return 4
         create_response_dir=$(cd "$create_response_dir" && pwd -P) || return 4
+        strict_creation_intent=$(jq -nc --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
+            --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" --argjson plan "$release_contract_plan" \
+            '{schema_version:"dsr.strict_creation_intent.v1",repo:$repo,tool:$tool,tag:$tag,
+              artifacts_dir:$artifacts_dir,plan:$plan}') || return 4
+        (umask 077; set -C; printf '%s\n' "$strict_creation_intent" > \
+            "$create_response_dir/creation-intent.json") || return 4
+        strict_creation_proof=$(_source_release_read_private_receipt \
+            "$create_response_dir/creation-intent.json" "$create_response_dir" "" "" "creation-intent.") || return 4
+        jq -en --argjson proof "$strict_creation_proof" --argjson intent "$strict_creation_intent" \
+            '$proof.record == $intent' >/dev/null || return 4
         release_args+=" --retain-response"
     else
         command -v python3 >/dev/null 2>&1 || { log_error "Private release creation custody requires python3"; return 3; }
@@ -8441,10 +8627,15 @@ EOF
         fi
         log_info "Resuming $tag by verifying remote asset contents"
     else
-        # shellcheck disable=SC2086
         if $release_contract_enabled; then
+            local current_creation_proof
+            current_creation_proof=$(_source_release_read_private_receipt \
+                "$create_response_dir/creation-intent.json" "$create_response_dir" "" "" "creation-intent.") || return 4
+            [[ "$current_creation_proof" == "$strict_creation_proof" ]] || return 4
+            # shellcheck disable=SC2086
             release_json=$(TMPDIR="$create_response_dir" gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
         else
+            # shellcheck disable=SC2086
             release_json=$(TMPDIR="$ordinary_custody_dir" gh_create_release "$repo" "$tag" --name "$tag" --body "$release_body" $release_args) || create_status=$?
         fi
     fi
@@ -8452,7 +8643,10 @@ EOF
     if $release_contract_enabled && [[ $create_status -eq 0 ]]; then
         local -a create_responses=("$create_response_dir"/dsr-api-response.????????)
         local creation_fingerprint
-        if [[ ${#create_responses[@]} -ne 1 || ! -f "${create_responses[0]}" ]] ||
+        if ! current_creation_proof=$(_source_release_read_private_receipt \
+                "$create_response_dir/creation-intent.json" "$create_response_dir" "" "" "creation-intent.") ||
+           [[ "$current_creation_proof" != "$strict_creation_proof" ]] ||
+           [[ ${#create_responses[@]} -ne 1 || ! -f "${create_responses[0]}" ]] ||
            ! creation_fingerprint=$(_source_release_read_private_receipt \
                 "${create_responses[0]}" "$create_response_dir" "" "" "dsr-api-response.") ||
            ! jq -en --argjson original "$creation_fingerprint" --argjson reply "$release_json" \
@@ -9401,6 +9595,8 @@ EOF
             --arg dispatch_repos "$dispatch_repos" \
             --argjson dispatch_results "$dispatch_results_json" \
             --argjson installer_check "$installer_report" \
+            --argjson sbom "$ordinary_sbom_report" \
+            --argjson completed "$([[ $exit_code -eq 0 ]] && ! $draft && echo true || echo false)" \
             '{
                 repo: $repo,
                 version: $version,
@@ -9418,6 +9614,7 @@ EOF
                 assets_failed: $failed,
                 verification: $verification,
                 installer_check: $installer_check,
+                sbom: ($sbom + {published:($sbom.enabled and $completed)}),
                 tag_ruleset_receipt: $tag_ruleset_receipt,
                 total: $total,
                 success: $success,
@@ -9450,6 +9647,9 @@ EOF
             local resume_command
             printf -v resume_command 'dsr release %q %q --artifacts %q --resume' \
                 "$tool_name" "$version" "$(cd "$artifacts_dir" && pwd -P)"
+            if $sbom_enabled; then
+                printf -v resume_command '%s --sbom-format %q' "$resume_command" "$sbom_format"
+            fi
             log_info "Staged publication is retained privately; resume with: $resume_command"
         fi
 
@@ -10354,6 +10554,7 @@ cmd_fallback() {
     local build_only=false skip_checks=false resume=false
     local dry_run="$DRY_RUN" output_dir_explicit=false
     local resume_selector="latest" resume_run_id="" resume_state="" reuse_completed=false
+    local sbom_override="" sbom_format="" sbom_policy
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -10380,6 +10581,13 @@ cmd_fallback() {
                 ;;
             --build-only) build_only=true; shift ;;
             --isolate-source) isolate_source=true; shift ;;
+            --sbom) sbom_override=true; shift ;;
+            --no-sbom) sbom_override=false; shift ;;
+            --sbom-format)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || {
+                    log_error "--sbom-format requires a format"; return 4;
+                }
+                sbom_format="$2"; shift 2 ;;
             --skip-checks) skip_checks=true; shift ;;
             --resume|-r) resume=true; shift ;;
             --resume=*) resume=true; resume_selector="${1#*=}"; shift ;;
@@ -10396,6 +10604,8 @@ OPTIONS:
     -V, --version <ver>    Version to release (default: detect from source)
     --expected-sha <sha>   Require this full source commit and an explicit version
     --isolate-source       Materialize that commit without changing your checkout
+    --sbom / --no-sbom     Enable or disable SBOMs for ordinary publication
+    --sbom-format <format> Select an SBOM format and enable its generation
     --build-only           Build and verify artifacts without publishing
     --skip-checks          Skip ordinary quality checks; required checks still run
     -r, --resume[=RUN_ID]  Resume a build or reuse its verified completed outputs
@@ -10410,7 +10620,10 @@ DESCRIPTION:
     a separate fallback filename scan. Strict contracts own their exact assets.
     Resume rechecks quality, source identity, and every artifact. For ordinary
     releases it reconciles an existing release or creates one when absent.
-    Existing strict releases still require the strict release repair workflow.
+    Strict retries recover only this build's preserved original draft creation
+    custody. Missing assets are added without replacement, then the existing
+    signed finalizer verifies and publishes the owned draft without dispatch.
+    Missing original POST responses, changed inputs, and unrelated drafts block.
     --expected-sha binds an automatic fallback to its observed workflow run:
     the clean checkout, local version tag and build manifest must name that
     commit. Source identity is rechecked after quality checks and signing.
@@ -10556,12 +10769,20 @@ EOF
         $dry_run || _fallback_notify 4 config "configuration could not be resolved"
         return 4
     fi
+    _dsr_require sbom || return 3
+    config_load || return 4
+    sbom_policy=$(_release_sbom_policy "$sbom_override" "$sbom_format") || return 4
+    if [[ "$contract" != null ]] && jq -e '.enabled' <<< "$sbom_policy" >/dev/null; then
+        log_error "Automatic SBOM generation is not allowed with a strict closed release contract"
+        return 4
+    fi
     state_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
     [[ -n "$output_dir" ]] || output_dir="$state_dir/artifacts/${tool_name}-${tag}"
     # Do not create this directory here: strict cmd_build requires it absent.
     # The dry-run path must also remain entirely free of filesystem writes.
     local checks_status="pending" build_status="pending" verification_status="pending"
     local signing_status="skipped" release_status="pending" artifacts_count=0
+    local publication_recovery=null
     # steps[] (schemas/fallback-details.json): the throttle check, then build
     # (quality gate, build, verification, signing), then release. Each step's
     # outcome follows from the phase that ended the run.
@@ -10585,6 +10806,7 @@ EOF
                 --arg run_id "$run_id" --arg output_dir "$output_dir" \
                 --arg expected_sha "$expected_sha" \
                 --argjson isolate_source "$isolate_source" --argjson materialization "$source_materialization" \
+                --argjson publication_recovery "$publication_recovery" \
                 --arg checks "$checks_status" --arg build "$build_status" \
                 --arg verification "$verification_status" --arg signing "$signing_status" \
                 --arg release "$release_status" --arg phase "$phase" --arg error "$error" \
@@ -10621,7 +10843,8 @@ EOF
                   resume_run_id:$resume_run_id}
                 + (if $trigger == "" then {} else {trigger: $trigger} end)
                 + (if $expected_sha == "" then {} else {expected_sha: $expected_sha} end)
-                + (if $isolate_source then {isolated_source:true,source_materialization:$materialization} else {} end)') || return 4
+                + (if $isolate_source then {isolated_source:true,source_materialization:$materialization} else {} end)
+                + (if $publication_recovery == null then {} else {publication_recovery:$publication_recovery} end)') || return 4
             json_envelope fallback "$status" "$rc" "$details"
         else
             log_info "Fallback $status: $tool_name $tag (phase: $phase; artifacts: $artifacts_count)"
@@ -11081,11 +11304,301 @@ EOF
         return 6
     fi
 
+    local strict_handoff="" strict_artifacts="" strict_manifest="" strict_build_run=""
+    local strict_intent_proof="" strict_creation_proof="" strict_response_proof="" strict_custody_proof=""
+    local strict_creation="" strict_response="" strict_custody="" strict_plan="" strict_metadata=""
+    local strict_config="" strict_registry="" strict_config_sha="" strict_registry_sha=""
+    local strict_release_id="" strict_custody_ready=false strict_observed=""
+    local strict_bytes_dir="" strict_seen_assets='[]'
+
+    _fallback_strict_prepare() {
+        local expected candidate proof count=0
+        jq -e '(.exact_primary_assets | length) as $primaries |
+            ($primaries * 2 + (if has("minisign_public_key_file") then $primaries else 0 end) +
+             ((.exact_additional_assets // []) | length) + ((.build_manifest_assets // []) | length)) < 100' \
+            <<< "$contract" >/dev/null || {
+            log_error "Automatic strict recovery requires fewer than 100 contracted assets"
+            return 4
+        }
+        strict_build_run=$(jq -er '.run_id | select(type == "string" and
+            test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"))' <<< "$manifest_json") || return 4
+        _source_release_identity "$repo" "$local_path" "$tag" \
+            "$(jq -r '.source.git_sha' <<< "$manifest_json")" || return 4
+        strict_artifacts=$(cd -- "$output_dir" && pwd -P) || return 4
+        strict_manifest="$strict_artifacts/${manifest_file##*/}"
+        strict_config="$ACT_REPOS_DIR/$tool_name.yaml"
+        [[ -f "$strict_config" && ! -L "$strict_config" ]] || return 4
+        strict_config="$(cd "${strict_config%/*}" && pwd -P)/${strict_config##*/}" || return 4
+        strict_config_sha=$(_gh_asset_sha256 "$strict_config") || return 4
+        strict_registry="${DSR_REPOS_FILE:-${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.yaml}"
+        strict_registry_sha=absent
+        if [[ -e "$strict_registry" || -L "$strict_registry" ]]; then
+            [[ -f "$strict_registry" && ! -L "$strict_registry" ]] || return 4
+            strict_registry_sha=$(_gh_asset_sha256 "$strict_registry") || return 4
+        fi
+        expected=$(jq -nc --arg repo "$repo" --arg tool "$tool_name" --arg tag "$tag" \
+            --arg run "$strict_build_run" --arg artifacts "$strict_artifacts" \
+            --arg sha "$(jq -r '.source.git_sha' <<< "$manifest_json")" --arg manifest "$manifest_sha" \
+            --arg config "$strict_config" --arg config_sha "$strict_config_sha" \
+            --arg registry "$strict_registry" --arg registry_sha "$strict_registry_sha" '
+            {schema_version:"dsr.strict_fallback_intent.v1",repo:$repo,tool:$tool,tag:$tag,
+             build_run_id:$run,artifacts_dir:$artifacts,git_sha:$sha,manifest_sha256:$manifest,
+             config:{path:$config,sha256:$config_sha},registry:{path:$registry,sha256:$registry_sha},
+             publish:true}') || return 4
+        mkdir -p "$state_dir/releases" || return 4
+        [[ -d "$state_dir/releases" && ! -L "$state_dir/releases" ]] || return 4
+        for candidate in "$state_dir/releases/dsr-fallback.$strict_build_run."*; do
+            [[ -e "$candidate" || -L "$candidate" ]] || continue
+            [[ -d "$candidate" && ! -L "$candidate" ]] || return 4
+            candidate=$(cd "$candidate" && pwd -P) || return 4
+            proof=$(_source_release_read_private_receipt "$candidate/intent.json" "$candidate" "" "" "intent.") || return 4
+            jq -en --argjson proof "$proof" --argjson expected "$expected" \
+                '$proof.record == $expected' >/dev/null || {
+                log_error "Strict publication inputs differ from this build's retained intent"
+                return 4
+            }
+            strict_handoff="$candidate"; strict_intent_proof="$proof"; count=$((count + 1))
+        done
+        [[ $count -le 1 ]] || { log_error "Strict publication custody is ambiguous"; return 4; }
+        if [[ $count -eq 0 ]]; then
+            strict_handoff=$(umask 077; mktemp -d "$state_dir/releases/dsr-fallback.$strict_build_run.XXXXXXXX") || return 4
+            strict_handoff=$(cd "$strict_handoff" && pwd -P) || return 4
+            (umask 077; set -C; printf '%s\n' "$expected" > "$strict_handoff/intent.json") || return 4
+            strict_intent_proof=$(_source_release_read_private_receipt "$strict_handoff/intent.json" \
+                "$strict_handoff" "" "" "intent.") || return 4
+        elif ! $resume; then
+            log_error "This build already has a strict publication attempt; use fallback --resume=$strict_build_run"
+            return 4
+        fi
+        publication_recovery=$(jq -nc --arg intent "$strict_handoff/intent.json" --arg run "$strict_build_run" \
+            '{schema_version:"dsr.strict_fallback_recovery.v1",intent:$intent,build_run_id:$run,status:"prepared"}') || return 4
+    }
+
+    _fallback_strict_inputs_match() {
+        local proof plan
+        proof=$(_source_release_read_private_receipt "$strict_handoff/intent.json" \
+            "$strict_handoff" "" "" "intent.") || return 4
+        [[ "$proof" == "$strict_intent_proof" ]] || return 4
+        _source_release_inputs_match "$strict_config" "$strict_config_sha" \
+            "$strict_manifest" "$manifest_sha" "$strict_registry" "$strict_registry_sha" || return 4
+        _fallback_verify_expected_source || return 4
+        if $strict_custody_ready; then
+            proof=$(_source_release_read_private_receipt "$strict_creation" "$strict_custody" "" "" "creation-intent.") || return 4
+            [[ "$proof" == "$strict_creation_proof" ]] || return 4
+            proof=$(_source_release_read_private_receipt "$strict_response" "$strict_custody" "" "" "dsr-api-response.") || return 4
+            [[ "$proof" == "$strict_response_proof" ]] || return 4
+            proof=$(_source_release_read_private_receipt "$strict_handoff/custody.json" "$strict_handoff" "" "" "custody.") || return 4
+            [[ "$proof" == "$strict_custody_proof" ]] || return 4
+            plan=$(_release_contract_preflight "$tool_name" "$tag" "$repo" "$local_path" \
+                "$strict_artifacts" "$strict_manifest" "$contract" verify) || return 4
+            jq -en --argjson plan "$plan" --argjson expected "$strict_plan" \
+                '$plan == $expected' >/dev/null || return 4
+            _source_release_identity "$repo" "$local_path" "$tag" "$(jq -r '.git_sha' <<< "$strict_plan")" || return 4
+        fi
+    }
+
+    _fallback_strict_capture() {
+        local candidate count=0 saved creation binding
+        local -a responses=()
+        for candidate in "$strict_handoff"/dsr-create-custody.*; do
+            [[ -e "$candidate" || -L "$candidate" ]] || continue
+            [[ -d "$candidate" && ! -L "$candidate" &&
+               "${candidate##*/}" =~ ^dsr-create-custody\.[A-Za-z0-9]{8}$ ]] || return 4
+            strict_custody=$(cd "$candidate" && pwd -P) || return 4
+            count=$((count + 1))
+        done
+        if [[ $count -eq 0 ]]; then
+            # Creation allocates its child before POST. An intent alone is
+            # resumable only while there is still no remote release.
+            [[ ! -e "$strict_handoff/custody.json" && ! -L "$strict_handoff/custody.json" ]] || return 4
+            return 0
+        fi
+        [[ $count -eq 1 ]] || return 4
+        strict_creation="$strict_custody/creation-intent.json"
+        strict_creation_proof=$(_source_release_read_private_receipt "$strict_creation" \
+            "$strict_custody" "" "" "creation-intent.") || return 4
+        responses=("$strict_custody"/dsr-api-response.????????)
+        [[ ${#responses[@]} -eq 1 && -f "${responses[0]}" ]] || {
+            log_error "Strict draft has no unique original POST response; automatic recovery is blocked"
+            return 4
+        }
+        strict_response="${responses[0]}"
+        strict_response_proof=$(_source_release_read_private_receipt "$strict_response" \
+            "$strict_custody" "" "" "dsr-api-response.") || return 4
+        creation=$(jq -c '.record' <<< "$strict_creation_proof") || return 4
+        saved=$(jq -c '.record' <<< "$strict_response_proof") || return 4
+        if ! jq -en --argjson creation "$creation" --argjson response "$saved" \
+            --argjson intent "$(jq -c '.record' <<< "$strict_intent_proof")" '
+            $creation.plan as $p | $p.release as $m |
+            $creation.schema_version == "dsr.strict_creation_intent.v1" and
+            $creation.repo == $intent.repo and $creation.tool == $intent.tool and
+            $creation.tag == $intent.tag and $creation.artifacts_dir == $intent.artifacts_dir and
+            $p.repo == $intent.repo and $p.tool == $intent.tool and $p.tag == $intent.tag and
+            $p.git_sha == $intent.git_sha and $p.manifest_sha256 == $intent.manifest_sha256 and
+            ($p.assets | type == "array" and length > 0 and length < 100) and
+            $m.requested_draft == false and $m.tag_name == $intent.tag and $m.name == $intent.tag and
+            $m.target_commitish == $intent.git_sha and ($m.prerelease | type == "boolean") and
+            ($m.body | type == "string" and test("<!-- dsr-create-nonce:[0-9a-f]{64} -->$")) and
+            ($response.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+            $response.draft == true and $response.assets == [] and
+            $response.tag_name == $m.tag_name and $response.name == $m.name and
+            $response.body == $m.body and $response.prerelease == $m.prerelease and
+            $response.target_commitish == $m.target_commitish and
+            $response.upload_url == ("https://uploads.github.com/repos/" + $intent.repo +
+                "/releases/" + ($response.id|tostring) + "/assets{?name,label}") and
+            ($response.html_url | type == "string" and startswith("https://github.com/" + $intent.repo + "/releases/"))
+        ' >/dev/null; then
+            log_error "Strict creation custody does not match this build's frozen publication intent"
+            return 4
+        fi
+        strict_plan=$(jq -c '.plan | del(.release)' <<< "$creation") || return 4
+        strict_metadata=$(jq -c '.plan.release | del(.requested_draft)' <<< "$creation") || return 4
+        strict_release_id=$(jq -r '.id' <<< "$saved") || return 4
+        binding=$(jq -nc --argjson intent "$strict_intent_proof" --argjson creation "$strict_creation_proof" \
+            --argjson response "$strict_response_proof" --arg path "$strict_response" \
+            --arg creation_path "$strict_creation" --argjson id "$strict_release_id" '
+            {schema_version:"dsr.strict_fallback_custody.v1",release_id:$id,create_response:$path,
+             creation_intent:$creation_path,
+             intent:($intent|del(.record)),creation:($creation|del(.record)),response:($response|del(.record))}') || return 4
+        if [[ ! -e "$strict_handoff/custody.json" && ! -L "$strict_handoff/custody.json" ]]; then
+            (umask 077; set -C; printf '%s\n' "$binding" > "$strict_handoff/custody.json") || return 4
+        fi
+        strict_custody_proof=$(_source_release_read_private_receipt "$strict_handoff/custody.json" \
+            "$strict_handoff" "" "" "custody.") || return 4
+        jq -en --argjson proof "$strict_custody_proof" --argjson binding "$binding" \
+            '$proof.record == $binding' >/dev/null || return 4
+        strict_custody_ready=true
+        _fallback_strict_inputs_match || return 4
+        publication_recovery=$(jq -c --arg response "$strict_response" --arg directory "$strict_custody" \
+            --argjson id "$strict_release_id" '. + {status:"ready",create_response:$response,
+            finalization_tmpdir:$directory,release_id:$id}' <<< "$publication_recovery") || return 4
+    }
+
+    _fallback_strict_observe() {
+        local observed inventory scan after asset file size sha identity cached_identity
+        _fallback_strict_inputs_match || return 4
+        scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
+        jq -e --argjson id "$strict_release_id" '.count == 1 and .release.id == $id' <<< "$scan" >/dev/null || return 7
+        observed=$(gh_api "repos/$repo/releases/$strict_release_id" --no-cache) || return 7
+        _source_release_metadata_matches "$observed" "$strict_metadata" "$strict_release_id" any || return 7
+        inventory=$(gh_api "repos/$repo/releases/$strict_release_id/assets?per_page=100&page=1" --no-cache) || return 7
+        if ! jq -en --argjson observed "$observed" --argjson inventory "$inventory" \
+            --argjson plan "$strict_plan" --argjson seen "$strict_seen_assets" \
+            --arg repo "$repo" --argjson id "$strict_release_id" '
+            def records: map({id,name,state,size,digest}) | sort_by(.id);
+            $observed.upload_url == ("https://uploads.github.com/repos/" + $repo +
+                "/releases/" + ($id|tostring) + "/assets{?name,label}") and
+            ($inventory | type == "array" and length < 100) and
+            ($inventory | records) == ($observed.assets | records) and
+            ([$inventory[].id] | unique | length) == ($inventory|length) and
+            ([$inventory[].name] | unique | length) == ($inventory|length) and
+            all($seen[]; . as $previous |
+                any($inventory[]; {id,name,state,size,digest} == ($previous|{id,name,state,size,digest}))) and
+            all($inventory[]; . as $asset |
+                (.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+                .state == "uploaded" and
+                ([$plan.assets[] | select(.name == $asset.name and .size_bytes == $asset.size and
+                    ("sha256:" + .sha256) == $asset.digest)] | length) == 1)
+        ' >/dev/null; then
+            log_error "Owned strict draft has extra, incomplete, duplicate, or changed remote assets"
+            return 7
+        fi
+        # One immutable asset ID is downloaded once per attempt, then its
+        # retained bytes are rehashed against every fresh inventory. A removed
+        # or replaced observed ID fails above. This keeps partial-draft repair
+        # linear in artifact storage; the finalizer independently downloads
+        # complete signed pairs again before and after publication.
+        if [[ -z "$strict_bytes_dir" ]]; then
+            strict_bytes_dir=$(umask 077; mktemp -d "$strict_handoff/verify.XXXXXXXX") || return 7
+        fi
+        while IFS= read -r asset; do
+            file="$strict_bytes_dir/$(jq -r '.id' <<< "$asset")"
+            identity=$(jq -c '{id,name,state,size,digest}' <<< "$asset") || return 7
+            if [[ ! -e "$file" && ! -L "$file" && ! -e "$file.json" && ! -L "$file.json" ]]; then
+                gh_download_release_asset "$repo" "$(jq -r '.id' <<< "$asset")" "$file" || return 7
+                (umask 077; set -C; printf '%s\n' "$identity" > "$file.json") || return 7
+            fi
+            [[ -f "$file" && ! -L "$file" && -f "$file.json" && ! -L "$file.json" ]] || return 7
+            cached_identity=$(jq -cse 'select(length == 1) | .[0]' "$file.json") || return 7
+            [[ "$cached_identity" == "$identity" ]] || return 7
+            size=$(_release_file_size "$file") || return 7
+            sha=$(_release_sha256 "$file") || return 7
+            jq -e --arg sha "sha256:$sha" --argjson size "$size" \
+                '.digest == $sha and .size == $size' <<< "$asset" >/dev/null || return 7
+        done < <(jq -c '.[]' <<< "$inventory")
+        after=$(gh_api "repos/$repo/releases/$strict_release_id" --no-cache) || return 7
+        _source_release_metadata_matches "$after" "$strict_metadata" "$strict_release_id" any || return 7
+        jq -en --argjson before "$observed" --argjson after "$after" '
+            def identity: {id,tag_name,name,body,prerelease,target_commitish,draft,upload_url,
+                assets:([.assets[]|{id,name,state,size,digest}]|sort_by(.id))};
+            ($before|identity) == ($after|identity)' >/dev/null || return 7
+        strict_observed="$after"
+        strict_seen_assets="$inventory"
+    }
+
+    _fallback_strict_recover() {
+        local asset name file content_type upload_rc final_result final_receipt final_proof
+        _fallback_strict_observe || return $?
+        while IFS= read -r asset; do
+            name=$(jq -r '.name' <<< "$asset") || return 4
+            if jq -e --arg name "$name" 'any(.assets[]; .name == $name)' <<< "$strict_observed" >/dev/null; then
+                continue
+            fi
+            # Never repair a public release, overwrite a retained asset, or
+            # use a name-only lookup to adopt another publisher's draft.
+            jq -e '.draft == true' <<< "$strict_observed" >/dev/null || return 7
+            _fallback_strict_observe || return $?
+            if jq -e --arg name "$name" 'any(.assets[]; .name == $name)' <<< "$strict_observed" >/dev/null; then
+                continue
+            fi
+            jq -e '.draft == true' <<< "$strict_observed" >/dev/null || return 7
+            _fallback_strict_inputs_match || return 4
+            file=$(jq -r '.path' <<< "$asset") || return 4
+            _release_contract_verify_local_asset "$file" "$name" \
+                "$(jq -r '.size_bytes' <<< "$asset")" "$(jq -r '.sha256' <<< "$asset")" || return 4
+            content_type=application/octet-stream
+            [[ "$name" != *.sha256 && "$name" != *.minisig ]] || content_type=text/plain
+            upload_rc=0
+            gh_upload_asset "$(jq -r '.upload_url' <<< "$strict_observed")" "$file" "$content_type" >&2 || upload_rc=$?
+            # A lost response is success only after a fresh complete inventory
+            # and downloaded bytes prove that this exact asset was accepted.
+            _fallback_strict_observe || return $?
+            if ! jq -e --arg name "$name" 'any(.assets[]; .name == $name)' <<< "$strict_observed" >/dev/null; then
+                log_error "Strict repair did not produce the selected asset: $name (upload exit $upload_rc)"
+                return 7
+            fi
+        done < <(jq -c '.assets[]' <<< "$strict_plan")
+        _fallback_strict_inputs_match || return 4
+        final_result=$(TMPDIR="$strict_custody" JSON_MODE=true cmd_release_finalize "$tool_name" "$version" \
+            --artifacts "$strict_artifacts" --create-response "$strict_response" --no-dispatch) || return $?
+        jq -es --argjson id "$strict_release_id" 'length == 1 and (.[0] |
+            .command == "release-finalize" and .status == "success" and .exit_code == 0 and
+            .details.release_id == $id and (.details.receipt | type == "string" and startswith("/")))' \
+            <<< "$final_result" >/dev/null || return 7
+        final_receipt=$(jq -r '.details.receipt' <<< "$final_result") || return 7
+        final_proof=$(_source_release_read_private_receipt "$final_receipt" "$state_dir/releases" \
+            "$tool_name" "$tag" "$tool_name-$tag-finalized.") || return 7
+        jq -en --argjson proof "$final_proof" --argjson plan "$strict_plan" \
+            --arg repo "$repo" --arg tag "$tag" --argjson id "$strict_release_id" \
+            --arg response "$strict_response" --arg sha "$(jq -r '.sha256' <<< "$strict_response_proof")" '
+            $proof.record | .schema == "dsr.strict_finalization_receipt.v1" and .status == "success" and
+            .repo == $repo and .tag == $tag and .release_id == $id and
+            .create_response == $response and .create_response_sha256 == $sha and
+            .plan == $plan and .release.id == $id and .release.draft == false' >/dev/null || return 7
+        _fallback_strict_inputs_match || return 4
+        publication_recovery=$(jq -c --arg receipt "$final_receipt" \
+            '. + {status:"finalized",finalization_receipt:$receipt}' <<< "$publication_recovery") || return 4
+        release_result=$(jq -nc --arg repo "$repo" --arg tag "$tag" --argjson id "$strict_release_id" \
+            '{command:"release",status:"success",exit_code:0,details:{repo:$repo,tag:$tag,release_id:$id,draft:false}}') || return 4
+    }
+
     if $build_only; then
         release_status="skipped"
     else
         fallback_release_started_ms=$(_fallback_now_ms)
         local -a release_args=("$tool_name" "$version" --artifacts "$output_dir")
+        case "$sbom_override" in true) release_args+=(--sbom) ;; false) release_args+=(--no-sbom) ;; esac
+        [[ -z "$sbom_format" ]] || release_args+=(--sbom-format "$sbom_format")
         if $resume && [[ "$contract" == null ]]; then
             local scan
             if ! scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") ||
@@ -11116,8 +11629,35 @@ EOF
                 return 7
             fi
         fi
-        local release_result
-        release_result=$(JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
+        local release_result="" custody_rc=0
+        if [[ "$contract" != null ]]; then
+            if ! _fallback_strict_prepare || ! _fallback_strict_capture; then
+                release_status="blocked"
+                [[ "$publication_recovery" == null ]] || publication_recovery=$(jq -c '.status="blocked"' <<< "$publication_recovery")
+                _fallback_result 4 release "Strict publication custody or frozen inputs could not be verified"
+                return 4
+            fi
+            if $strict_custody_ready; then
+                _fallback_strict_recover || rc=$?
+            else
+                if ! _fallback_strict_inputs_match; then
+                    release_status="blocked"
+                    _fallback_result 4 release "Strict publication inputs changed before creation"
+                    return 4
+                fi
+                # Canonicalize the existing --artifacts value, preserving the
+                # explicitly selected publication options after that pair.
+                release_args[3]="$strict_artifacts"
+                release_result=$(TMPDIR="$strict_handoff" JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
+                _fallback_strict_capture || custody_rc=$?
+                if [[ $custody_rc -ne 0 ]] || { [[ $rc -eq 0 ]] && ! $strict_custody_ready; }; then
+                    publication_recovery=$(jq -c '.status="blocked"' <<< "$publication_recovery")
+                    [[ $rc -ne 0 ]] || rc=7
+                fi
+            fi
+        else
+            release_result=$(JSON_MODE=true cmd_release "${release_args[@]}") || rc=$?
+        fi
         if [[ $rc -ne 0 ]]; then
             release_status="failed"
             [[ $rc -eq 1 ]] && release_status="partial"
@@ -11135,6 +11675,12 @@ EOF
         ' <<< "$release_result" >/dev/null 2>&1; then
             release_status="blocked"
             _fallback_result 7 release "Release was not confirmed public; it may still be a draft"
+            return 7
+        fi
+        if [[ "$contract" != null ]] && ! jq -e --argjson id "$strict_release_id" \
+            '.details.release_id == $id' <<< "$release_result" >/dev/null; then
+            release_status="blocked"
+            _fallback_result 7 release "Published release differs from the original strict creation custody"
             return 7
         fi
         release_status="success"

@@ -51,6 +51,21 @@
       "type": "string",
       "description": "Reason the fallback was triggered"
     },
+    "publication_recovery": {
+      "type": "object",
+      "required": ["schema_version", "intent", "build_run_id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": "dsr.strict_fallback_recovery.v1" },
+        "intent": { "type": "string", "pattern": "^/" },
+        "build_run_id": { "type": "string", "format": "uuid" },
+        "status": { "enum": ["prepared", "ready", "blocked", "finalized"] },
+        "create_response": { "type": "string", "pattern": "^/" },
+        "finalization_tmpdir": { "type": "string", "pattern": "^/" },
+        "release_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "finalization_receipt": { "type": "string", "pattern": "^/" }
+      }
+    },
     "steps": {
       "type": "array",
       "items": { "$ref": "#/$defs/fallback_step" },

@@ -38,10 +38,51 @@ object on failure and returns the failing process status. Single scans accept
 `--output FILE` and `--quiet`. Batch calls accept `--output-dir DIRECTORY`;
 `SBOM_OUTPUT_DIR` is the fallback when that option is omitted.
 
-These new batch commands are not automatically invoked by `dsr release`, and the
-monolithic CLI does not yet dispatch these batch or remote subcommands. Use the
-`bash src/sbom.sh` module entry points shown above; they now include
-`publish-artifacts` and `verify-release`.
+Ordinary `dsr release` and `dsr fallback` invoke complete-set generation when
+requested with `--sbom`, `--sbom-format FORMAT`, or `sbom.enabled: true` in
+configuration. The standalone batch and remote commands remain available through
+the `bash src/sbom.sh` entry points shown above.
+
+## Generate complete coverage during publication
+
+```bash
+dsr release tool v1.2.3 --artifacts dist/v1.2.3 --sbom
+dsr release tool v1.2.3 --artifacts dist/v1.2.3 --sbom-format cyclonedx
+dsr --json --dry-run release tool v1.2.3 --artifacts dist/v1.2.3 --sbom
+dsr fallback tool --version v1.2.3 --sbom
+```
+
+The release command uses the frozen build manifest's exact payload names and
+SHA-256 digests as its explicit scan selection. Aliases remain separate assets;
+manifested licenses and runtime JSON are covered too. Directory filename
+heuristics cannot silently omit a payload. A complete build manifest is required;
+automatic coverage is unavailable for a hand-assembled `--no-manifest` release.
+
+Generation and complete local verification happen before release creation or
+upload. The normal frozen upload plan then includes every selected standards
+document and the aggregate `sbom-manifest.spdx.json` or `sbom-manifest.cdx.json`.
+Private scan receipts and `sbom-plan.*.json` stay local. All public metadata bytes
+participate in the same staged-release inventory checks as the executable
+payloads; a missing aggregate or changed document prevents publication and hooks.
+
+`--sbom-format` implies generation and accepts the module's SPDX/CycloneDX aliases.
+The default format is SPDX; configuration can set `sbom.format`. `--no-sbom`
+overrides configured generation for one invocation. It does not remove retained
+public SBOM documents from the upload plan: an interrupted release must keep its
+original complete asset set when resumed. A strict closed release contract must
+declare its metadata explicitly; automatic SBOM generation with such a contract
+is refused before publication. Use `--no-sbom` when a global policy is enabled
+and the strict contract already owns its SBOM assets.
+
+Retry with the same directory and SBOM format. Completed scan/receipt pairs are
+verified and reused; only missing scans need Syft. A complete inventory can be
+retried without the scanner. Changed payloads, manifests, bound documents, or
+ambiguous output names stop the retry rather than replacing retained evidence.
+`--dry-run` resolves the complete public filename plan without scanning or
+writing metadata. JSON `details.sbom` reports `disabled`, `planned`, or `verified`,
+the format, payload count, public filenames, and aggregate digest when verified.
+Its `published` flag becomes true only after successful public-release verification;
+local coverage and a retained draft alone do not imply publication.
 
 ## Output identity and coverage
 
@@ -127,6 +168,7 @@ possible transient change on an adversarial filesystem.
 ```bash
 bash scripts/tests/test_sbom_release.sh
 bash scripts/tests/test_sbom_batch.sh
+bash scripts/tests/test_release_resume.sh
 bats tests/unit/test_sbom.bats
 ```
 

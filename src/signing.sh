@@ -580,6 +580,7 @@ _signing_manifest_preflight() {
             .dsr-*.json|*-manifest.json|*.minisig|*.sig|*.asc|\
             *.sha256|*.sha512|SHA256SUMS|SHA512SUMS|\
             *.sbom.*|*.intoto.jsonl) ;;
+            sbom-manifest.spdx.json|sbom-manifest.cdx.json|sbom-plan.spdx.json|sbom-plan.cdx.json) ;;
             *) _sign_log_error "Release payload is absent from manifest: $name"
                invalid=true; break ;;
         esac

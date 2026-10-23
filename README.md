@@ -733,6 +733,22 @@ reports a retained draft as blocked, so watch
 cannot mistake successful uploads for a completed public release. Ordinary
 creation and recovery require Python 3.
 
+Generate SBOMs for every payload selected by the build manifest before release:
+
+```bash
+dsr release ntm v1.2.3 --sbom
+dsr fallback ntm --version v1.2.3 --sbom-format cyclonedx
+```
+
+`--sbom-format` enables generation; configuration can also set `sbom.enabled`
+and `sbom.format`. DSR verifies complete coverage before creating or changing a
+release, publishes the individual documents and their aggregate inventory, and
+keeps scanner receipts private. Interrupted scans reuse verified completed
+documents. `--no-sbom` disables generation while preserving metadata already
+bound to a retained publication plan. Automatic SBOMs require a build manifest
+and are refused for strict contracts, which own their exact asset set. See
+[SBOM generation](docs/SBOM.md) for formats, retry behavior, and evidence limits.
+
 The dry-run plan lists every name each artifact will be published under (its
 manifest name, versioned name, installer-compatible name and `x86_64`/`aarch64`
 aliases), the build manifest, the generated `SHA256SUMS` and per-name `.sha256`
@@ -886,6 +902,15 @@ including binaries in other workspace packages, and rejects ambiguous Cargo
 output providers. Source installation still requires `--from-source` or
 `--allow-source-build`; Go and Bun source builds support a single executable.
 
+Add `--install-toolchain` to either source option when the required Rust, Go,
+or Bun compiler is missing. The installer verifies the upstream distribution
+and prepares a private toolchain for that source build without changing shell
+profiles or the global compiler installation. Existing usable compilers are
+preserved. This opt-in path supports Linux and macOS on x64 and ARM64 and keeps
+the existing safe/offline policy checks. See
+[source installer options](docs/INSTALLER_GENERATION.md) for version selection
+and download verification.
+
 ### `dsr canary`
 
 Run a repository's installer in a clean Linux container, then require its
@@ -924,6 +949,15 @@ must all match; changes during checks, compilation or signing block publication.
 The GitHub tag is checked again immediately before release. An explicit version
 is required, and dsr leaves checkout selection to you; `--build-only` needs no
 remote tag lookup.
+
+Retry an interrupted strict publication with `--resume=RUN_UUID`, the original
+version, and the same `--output-dir`. Fallback retains private creation custody,
+verifies existing remote bytes, uploads only missing assets, and invokes the
+strict finalizer before reporting public success. It refuses changed inputs,
+unrelated drafts, or a lost original creation response. Preserve
+`$DSR_STATE_DIR/releases` and the artifacts. The
+[strict recovery guide](docs/NATIVE_RELEASE_RECOVERY.md#resume-an-interrupted-strict-fallback-publication)
+describes the supported configuration and recovery evidence.
 
 ### `dsr watch`
 

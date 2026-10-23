@@ -326,3 +326,90 @@ an in-process comparison of partial refusal and legacy completed-output reuse.
 `DSR_RECOVERY_RESUME_BASELINE` selects the older non-resumable module for the main
 recovery suite's completed-retry counterexample. Neither suite claims native
 macOS/Windows execution, signing or live release publication.
+
+## Resume an interrupted strict fallback publication
+
+`dsr fallback --resume=RUN_UUID` now continues its own interrupted strict release
+after the build has completed. Select the original build UUID, version, source
+commit and output directory:
+
+```bash
+dsr --json fallback demo --version 1.2.3 \
+  --expected-sha FULL_TAG_COMMIT --resume=RUN_UUID \
+  --output-dir '/absolute/build outputs/demo-v1.2.3'
+```
+
+The usual fallback checks still run: source identity, quality checks, the complete
+build manifest, every artifact and its original checkpoint. A completed build is
+reused without compilation. Add `--isolate-source` when the configured checkout
+has advanced or contains user changes; the finalizer uses that same verified
+private source copy and leaves the original checkout untouched.
+
+Automatic recovery inherits the strict finalizer's configuration admission:
+the tool needs an explicit regular `repos.d/<tool>.yaml` under `DSR_CONFIG_DIR`,
+with an absolute source path and release contract, without `extends` or
+`publication_mode`, and without a same-tool entry in `repos.yaml`. The tool name
+may contain letters, digits, `_` and `-`, and the version must be semantic.
+Arrange that configuration before the original attempt; changing frozen
+configuration after an interruption invalidates its recovery intent. Fresh
+fallback publication continues to support its existing configuration surface,
+but an interrupted attempt outside these finalizer restrictions requires
+operator recovery.
+
+Before creating a strict draft, fallback writes an owner-only publication intent
+under `$DSR_STATE_DIR/releases/dsr-fallback.RUN_UUID.XXXXXXXX/`. It binds the exact
+build UUID, repository, tag, source SHA, canonical artifact directory, manifest
+digest, and repository/registry configuration bytes. The strict producer keeps
+its complete signed asset plan and nonce-bound request in a private child
+directory, alongside the original empty-draft POST response. Fallback retains
+descriptor identities and digests for that original custody; neither a later
+tag lookup nor a successful upload journal can replace it.
+
+On retry, recovery accepts only one matching private handoff. It verifies the
+original creation response, fresh nonce-bound release metadata, and the complete
+ID-bound asset inventory. Every existing asset must have the planned name, size
+and SHA-256, and its downloaded bytes must agree. Missing assets are uploaded
+additively. Existing assets with wrong bytes, incomplete uploads, duplicate names,
+unexpected assets, changed ownership metadata, or changed local inputs cause
+refusal. Recovery never deletes or replaces a remote asset and never repairs a
+public release. An already-public release can succeed only after full verification.
+
+Repair retains one downloaded copy per immutable asset ID for the current
+attempt. Each subsequent inventory check rehashes those bytes and requires the
+same ID/name/size/digest; an observed asset disappearing or changing identity
+stops the attempt. The existing strict finalizer independently downloads and
+cryptographically verifies complete signed pairs again before and after
+publication. This automatic route requires fewer than 100 contracted assets,
+including signatures and checksum sidecars, matching the finalizer's bounded
+inventory proof.
+
+Publication happens only through `release finalize --no-dispatch` using the
+original POST response and canonical artifact directory. Fallback validates the
+retained finalization success receipt before reporting a completed release. A
+lost upload or publication response is accepted only when fresh observations
+prove the exact resulting state. Recovery does not dispatch downstream workflows
+again: the interrupted original invocation may already have dispatched them.
+
+JSON results expose `details.publication_recovery`, including `build_run_id` for
+the exact `--resume` selector, the private intent,
+proven creation response and custody directory when available, release ID, and
+the finalization receipt after recovery. Its status is `prepared`, `ready`,
+`blocked`, or `finalized`; `ready` means custody is available for retry, not that
+publication succeeded. Preserve the complete directory and the original artifacts.
+
+A process interruption after the original POST was retained but before fallback
+recorded its final handoff remains recoverable from the two pre-POST intents and
+that original response. If GitHub accepted a creation request but the original
+response was never retained, automatic recovery is blocked. It also refuses
+ambiguous custody or a draft created by another publisher. Those cases require
+operator inspection; they are not permission to create another release or adopt
+a matching tag. Watch's separate unknown-process-outcome protection still applies:
+a killed attempt that it marks blocked requires an explicit recovery decision.
+
+The focused integration coverage uses real Git repositories, private descriptor
+checks, Minisign signatures, complete manifest/asset validation, and the actual
+strict producer/finalizer. Quality/build execution and GitHub's HTTP/download
+boundary are controlled fixtures. It covers partial uploads, lost responses,
+failed publication, already-public idempotence, a killed process group after
+creation, custom output directories, isolated source, and custody/input/remote
+drift. It does not claim live GitHub publication or native compilation.
