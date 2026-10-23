@@ -525,6 +525,15 @@ dsr build --repo <name> [--targets <list>] [--version <tag>]
 | `--sync-only` | false | Sync selected build hosts without compiling; exit 1 if any host fails |
 | `--diagnostic-native` | false | Build explicit native targets under strict source/family checks, with non-publishable diagnostic provenance |
 
+Native Go builds derive `GOOS` and `GOARCH` from the requested platform;
+the `armv7` alias resolves to `GOARCH=arm` and `GOARM=7`.
+Platform-specific `cross_compile.<platform>.env` values override global `env`
+values; the effective selectors must match the requested target or dispatch
+stops with exit 4. Each launcher clears inherited selectors before exporting
+the resolved pair. `CGO_ENABLED` remains under the repository's control, so
+cross-compilation that requires C libraries still needs the configured C
+toolchain.
+
 Target logs and result receipts are isolated by task and attempt. Aggregation
 is deterministic in requested-platform order, then configured triple order.
 For native Rust builds, a `target_triples` list expands one platform

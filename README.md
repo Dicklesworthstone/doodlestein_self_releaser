@@ -1071,6 +1071,14 @@ Tool configuration lives in two places with distinct roles:
 
 ### Build target derivation and the Linux glibc floor
 
+Native Go builds derive `GOOS` and `GOARCH` from the requested platform, so a
+generic `go build` recipe produces the requested architecture. The `armv7`
+alias resolves to `GOARCH=arm`, `GOARM=7`. Platform env values override global
+env values; effective selectors that conflict with the
+requested platform stop dispatch with exit 4. Launchers clear inherited target
+selectors before applying the resolved pair. The repository still controls
+`CGO_ENABLED` and any C cross-compilation toolchain.
+
 For Rust tools the runner derives `CARGO_BUILD_TARGET` from
 `target_triples.<platform>` (or the standard triple for the platform) whenever
 the platform's `cross_compile` env does not set one, so every build is

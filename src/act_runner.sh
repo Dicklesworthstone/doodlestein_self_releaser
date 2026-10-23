@@ -6741,6 +6741,57 @@ act_get_build_env() {
         local env_language derive_opt
         env_language=$(yq -r '.language // ""' "$config_file") || return 4
         derive_opt=$(yq -r '.derive_cargo_build_target' "$config_file") || return 4
+        if [[ "$env_language" == go ]]; then
+            # Go otherwise silently builds the host platform (or the
+            # operator's GOOS/GOARCH), even when this worker was scheduled for
+            # another target. Resolve global then platform configuration just
+            # as the launcher does, and export one unambiguous target pair.
+            # Cross-compilation policy such as CGO_ENABLED stays configured by
+            # the repository; deriving a target must not disable cgo for it.
+            local go_os="${platform%%/*}" go_arch="${platform##*/}" go_arm=""
+            local configured_go_os="" configured_go_arch="" configured_go_arm=""
+            local go_environment="" go_pair
+            local go_os_set=false go_arch_set=false go_arm_set=false
+            if [[ ! "$platform" =~ ^[a-z][a-z0-9]*/[a-z0-9]+$ ]]; then
+                _log_error "Invalid Go target platform: $platform"
+                return 4
+            fi
+            # DSR's armv7 routing name selects Go's 32-bit ARM target with
+            # an explicit ISA level. Preserve ordinary configured ARMv7
+            # recipes without changing GOARM policy for other platforms.
+            if [[ "$go_arch" == armv7 ]]; then
+                go_arch=arm
+                go_arm=7
+            fi
+            while IFS= read -r go_pair; do
+                [[ -n "$go_pair" ]] || continue
+                case "$go_pair" in
+                    GOOS=*) configured_go_os="${go_pair#*=}"; go_os_set=true; continue ;;
+                    GOARCH=*) configured_go_arch="${go_pair#*=}"; go_arch_set=true; continue ;;
+                    GOARM=*)
+                        if [[ -n "$go_arm" ]]; then
+                            configured_go_arm="${go_pair#*=}"
+                            go_arm_set=true
+                            continue
+                        fi
+                        ;;
+                esac
+                [[ -z "$go_environment" ]] || go_environment+=$'\n'
+                go_environment+="$go_pair"
+            done <<< "$result"
+            if { $go_os_set && [[ "$configured_go_os" != "$go_os" ]]; } ||
+               { $go_arch_set && [[ "$configured_go_arch" != "$go_arch" ]]; }; then
+                _log_error "Configured Go target GOOS=${configured_go_os:-unset} GOARCH=${configured_go_arch:-unset} conflicts with requested platform $platform"
+                return 4
+            fi
+            if [[ -n "$go_arm" ]] && $go_arm_set && [[ "$configured_go_arm" != "$go_arm" ]]; then
+                _log_error "Configured GOARM=${configured_go_arm:-unset} conflicts with requested platform $platform (requires GOARM=$go_arm)"
+                return 4
+            fi
+            result="$go_environment"
+            derived_pairs+=$'\n'"GOOS=$go_os"$'\n'"GOARCH=$go_arch"
+            [[ -z "$go_arm" ]] || derived_pairs+=$'\n'"GOARM=$go_arm"
+        fi
         if [[ "$env_language" == "rust" && "$derive_opt" != "false" ]]; then
             local derived_triple
             derived_triple=$(act_get_build_env_value "$result" "CARGO_BUILD_TARGET" 2>/dev/null || true)
@@ -9379,6 +9430,14 @@ act_run_native_build() {
                 "${rust_target_upper}_${influence_prefix}"
             )
         done
+    elif [[ "$language" == go ]]; then
+        # act_get_build_env binds these to the requested platform. Clear the
+        # host's inherited selectors before exporting that effective pair on
+        # both Unix and Windows; persistent `go env -w` values lose to it too.
+        cargo_env_to_unset=(GOOS GOARCH)
+        if [[ "${platform##*/}" == armv7 ]]; then
+            cargo_env_to_unset+=(GOARM)
+        fi
     fi
 
     # Ordinary Rust builds must not inherit the operator's *global* Cargo

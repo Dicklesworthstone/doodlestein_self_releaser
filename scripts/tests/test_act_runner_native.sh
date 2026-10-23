@@ -3417,6 +3417,178 @@ test_result_json_success_has_artifact() {
     fi
 }
 
+test_go_derives_build_target() {
+    log_test "Go: every requested platform supplies one explicit GOOS/GOARCH pair"
+    local platform result expected_os expected_arch
+    for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 windows/386; do
+        reset_state
+        MOCK_LANGUAGE=go
+        MOCK_GLOBAL_ENV='CGO_ENABLED=1'
+        result=$(act_get_build_env tool "$platform") || { log_fail "Go environment failed for $platform"; continue; }
+        expected_os="${platform%%/*}"; expected_arch="${platform##*/}"
+        if [[ "$(act_get_build_env_value "$result" GOOS)" == "$expected_os" &&
+              "$(act_get_build_env_value "$result" GOARCH)" == "$expected_arch" &&
+              "$(grep -c '^GOOS=' <<< "$result")" == 1 &&
+              "$(grep -c '^GOARCH=' <<< "$result")" == 1 &&
+              "$(act_get_build_env_value "$result" CGO_ENABLED)" == 1 ]]; then
+            log_pass "Go $platform is explicit without changing configured cgo policy"
+        else
+            log_fail "Incorrect Go target environment for $platform: $result"
+        fi
+    done
+}
+
+test_go_target_platform_override() {
+    log_test "Go: platform selectors override global defaults and normalize duplicates"
+    reset_state
+    MOCK_LANGUAGE=go
+    MOCK_GLOBAL_ENV=$'GOOS=linux\nGOARCH=amd64'
+    MOCK_PLATFORM_ENV=$'GOOS=darwin\nGOARCH=arm64'
+    local result
+    result=$(act_get_build_env tool darwin/arm64) || { log_fail 'Go platform override failed'; return; }
+    if [[ "$(act_get_build_env_value "$result" GOOS)" == darwin &&
+          "$(act_get_build_env_value "$result" GOARCH)" == arm64 &&
+          "$(grep -c '^GOOS=' <<< "$result")" == 1 &&
+          "$(grep -c '^GOARCH=' <<< "$result")" == 1 ]]; then
+        log_pass "Only effective Go platform selectors reach the launcher"
+    else
+        log_fail "Global target survived platform override: $result"
+    fi
+}
+
+test_go_armv7_target_alias() {
+    log_test "Go: configured ARMv7 targets resolve to arm with ISA level 7"
+    local mode result
+    for mode in derived explicit platform_override; do
+        reset_state
+        MOCK_LANGUAGE=go
+        MOCK_GLOBAL_ENV='CGO_ENABLED=1'
+        case "$mode" in
+            explicit) MOCK_GLOBAL_ENV+=$'\nGOARCH=arm\nGOARM=7' ;;
+            platform_override)
+                MOCK_GLOBAL_ENV+=$'\nGOARCH=amd64\nGOARM=6'
+                MOCK_PLATFORM_ENV=$'GOARCH=arm\nGOARM=7'
+                ;;
+        esac
+        result=$(act_get_build_env tool linux/armv7) || { log_fail "ARMv7 $mode environment failed"; continue; }
+        if [[ "$(act_get_build_env_value "$result" GOOS)" == linux &&
+              "$(act_get_build_env_value "$result" GOARCH)" == arm &&
+              "$(act_get_build_env_value "$result" GOARM)" == 7 &&
+              "$(act_get_build_env_value "$result" DSR_TARGET_ARCH)" == armv7 &&
+              "$(act_get_build_env_value "$result" CGO_ENABLED)" == 1 &&
+              "$(grep -c '^GOARCH=' <<< "$result")" == 1 &&
+              "$(grep -c '^GOARM=' <<< "$result")" == 1 ]]; then
+            log_pass "ARMv7 $mode retains its routing identity and resolves one Go ISA selector"
+        else
+            log_fail "Incorrect ARMv7 $mode environment: $result"
+        fi
+    done
+
+    local assignment status
+    for assignment in 'GOARM=6' 'GOARM=5' 'GOARM=' 'GOARCH=armv7'; do
+        reset_state
+        MOCK_LANGUAGE=go
+        MOCK_GLOBAL_ENV=$'GOARCH=arm\nGOARM=7'
+        MOCK_PLATFORM_ENV="$assignment"
+        status=0
+        result=$(act_run_native_build tool linux/armv7 v1.0.0 armv7-conflict "" "" "" trj 2>/dev/null) || status=$?
+        if [[ "$status" == 4 && -z "$(get_ssh_capture)" ]] &&
+           jq -e '.status == "error" and .error == "Invalid native target environment"' <<< "$result" >/dev/null; then
+            log_pass "ARMv7 conflicting $assignment was refused before dispatch"
+        else
+            log_fail "ARMv7 conflicting $assignment reached native dispatch: status=$status result=$result"
+        fi
+    done
+}
+
+test_go_armv7_native_launch() {
+    log_test "Go: ARMv7 launchers reset ambient ISA selection without changing other targets"
+    reset_state
+    MOCK_LANGUAGE=go
+    GOARM=6 act_run_native_build tool linux/armv7 v1.0.0 armv7-unix "" "" "" trj >/dev/null 2>&1
+    local command
+    command=$(get_ssh_capture)
+    if [[ "$command" == *'unset GOOS; unset GOARCH; unset GOARM;'* &&
+          "$command" == *'export "GOARCH=arm"'* && "$command" == *'export "GOARM=7"'* ]]; then
+        log_pass "Unix ARMv7 launcher replaces ambient GOARM with the requested ISA"
+    else
+        log_fail "Unix ARMv7 ISA selection missing: $command"
+    fi
+    reset_state
+    MOCK_LANGUAGE=go
+    MOCK_HOST_PATH_WLAP='C:/source/tool'
+    GOARM=6 act_run_native_build tool linux/armv7 v1.0.0 armv7-windows "" "" "" wlap >/dev/null 2>&1
+    command=$(get_ssh_capture)
+    if [[ "$command" == *'set "GOARM="'* && "$command" == *'set "GOARCH=arm"'* &&
+          "$command" == *'set "GOARM=7"'* ]]; then
+        log_pass "Windows ARMv7 launcher replaces ambient GOARM with the requested ISA"
+    else
+        log_fail "Windows ARMv7 ISA selection missing: $command"
+    fi
+
+    local platform result
+    for platform in linux/arm linux/arm64; do
+        reset_state
+        MOCK_LANGUAGE=go
+        MOCK_GLOBAL_ENV='GOARM=6'
+        MOCK_PLATFORM_ENV='GOARM=5'
+        result=$(act_get_build_env tool "$platform") || { log_fail "$platform GOARM policy failed"; continue; }
+        GOARM=7 act_run_native_build tool "$platform" v1.0.0 preserve-goarm "" "" "" trj >/dev/null 2>&1
+        command=$(get_ssh_capture)
+        if [[ "$(grep '^GOARM=' <<< "$result")" == $'GOARM=6\nGOARM=5' &&
+              "$command" != *'unset GOARM;'* && "$command" == *'export "GOARM=6"; export "GOARM=5";'* ]]; then
+            log_pass "$platform preserves configured GOARM precedence without an ISA reset"
+        else
+            log_fail "$platform GOARM policy changed: $result command=$command"
+        fi
+    done
+}
+
+test_go_rejects_conflicting_targets() {
+    log_test "Go: contradictory configured selectors stop before native execution"
+    local assignment result status
+    for assignment in 'GOOS=linux' 'GOARCH=amd64' 'GOOS=' 'GOARCH='; do
+        reset_state
+        MOCK_LANGUAGE=go
+        MOCK_GLOBAL_ENV=$'GOOS=darwin\nGOARCH=arm64'
+        MOCK_PLATFORM_ENV="$assignment"
+        status=0
+        result=$(act_run_native_build tool darwin/arm64 v1.0.0 conflict 2>/dev/null) || status=$?
+        if [[ "$status" == 4 && -z "$(get_ssh_capture)" ]] &&
+           jq -e '.status == "error" and .error == "Invalid native target environment"' <<< "$result" >/dev/null; then
+            log_pass "Conflicting $assignment was refused before dispatch"
+        else
+            log_fail "Configured $assignment did not stop native dispatch: status=$status result=$result"
+        fi
+    done
+}
+
+test_go_native_launch_overrides_ambient_target() {
+    log_test "Go: Unix and Windows launchers reset inherited target selectors"
+    reset_state
+    MOCK_LANGUAGE=go
+    GOOS=plan9 GOARCH=386 act_run_native_build tool darwin/arm64 v1.0.0 go-unix >/dev/null 2>&1
+    local command
+    command=$(get_ssh_capture)
+    if [[ "$command" == *'unset GOOS; unset GOARCH;'* &&
+          "$command" == *'export "GOOS=darwin"'* && "$command" == *'export "GOARCH=arm64"'* ]]; then
+        log_pass "Unix launcher supplies the requested Go target after resetting ambient selectors"
+    else
+        log_fail "Unix Go target exports missing: $command"
+    fi
+    reset_state
+    MOCK_LANGUAGE=go
+    MOCK_HOST_PATH_WLAP='C:/source/tool'
+    GOOS=plan9 GOARCH=386 act_run_native_build tool windows/amd64 v1.0.0 go-windows >/dev/null 2>&1
+    command=$(get_ssh_capture)
+    if [[ "$command" == *'set "GOOS="'* && "$command" == *'set "GOARCH="'* &&
+          "$command" == *'set "GOOS=windows"'* && "$command" == *'set "GOARCH=amd64"'* ]]; then
+        log_pass "Windows launcher supplies the requested Go target after resetting ambient selectors"
+    else
+        log_fail "Windows Go target exports missing: $command"
+    fi
+}
+
 test_rust_derives_build_target_and_dsr_env() {
     log_test "Rust: CARGO_BUILD_TARGET and DSR_TARGET_* derived from the platform"
     reset_state
@@ -3946,6 +4118,17 @@ main() {
             log_fail "Native host admission regression cases failed"
         fi
     fi
+    if [[ "${1:-}" == --go-targets-only ]]; then
+        test_go_derives_build_target
+        test_go_target_platform_override
+        test_go_armv7_target_alias
+        test_go_armv7_native_launch
+        test_go_rejects_conflicting_targets
+        test_go_native_launch_overrides_ambient_target
+        printf 'Go target tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --dependency-sources-only ]]; then
         test_unix_strict_rust_forces_out_of_snapshot_target_dir
         test_windows_strict_rust_forces_out_of_snapshot_target_dir
@@ -4097,6 +4280,12 @@ main() {
     test_windows_private_cache_collection
 
     # Derived build identity, Windows path guard, glibc floor (issues #7/#8/#9)
+    test_go_derives_build_target
+    test_go_target_platform_override
+    test_go_armv7_target_alias
+    test_go_armv7_native_launch
+    test_go_rejects_conflicting_targets
+    test_go_native_launch_overrides_ambient_target
     test_rust_derives_build_target_and_dsr_env
     test_rust_derive_build_target_opt_out
     test_windows_rejects_posix_source_root

@@ -5,8 +5,12 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P) || exit 1
 EXPECT_INVENTORY_GAP=false
+GO_ENVIRONMENT_ONLY=false
+TARGETS_JSON='["linux/amd64","linux/arm64","darwin/amd64","darwin/arm64","windows/amd64","windows/arm64","windows/386"]'
 case "${1:-}" in
     --expect-inventory-gap) EXPECT_INVENTORY_GAP=true ;;
+    --go-targets-only) TARGETS_JSON='["linux/amd64","linux/arm64"]' ;;
+    --go-environment-only) GO_ENVIRONMENT_ONLY=true; TARGETS_JSON='["linux/amd64","linux/arm64"]' ;;
     '') ;;
     *) printf 'Unknown test option: %s\n' "$1" >&2; exit 4 ;;
 esac
@@ -31,6 +35,9 @@ case "$(uname -s)/$(uname -m)" in
     Darwin/arm64) HOST_PLATFORM=darwin/arm64 ;;
     *) printf 'Unsupported execution host\n' >&2; exit 3 ;;
 esac
+if ! $GO_ENVIRONMENT_ONLY && ! jq -e --arg host "$HOST_PLATFORM" 'index($host) != null' <<< "$TARGETS_JSON" >/dev/null; then
+    printf 'The selected fixture targets must include the execution host\n' >&2; exit 3
+fi
 cat > "$WORK/source/go.mod" <<'GO'
 module example.invalid/nativeartifacts
 
@@ -86,7 +93,7 @@ local_path: $WORK/source
 language: go
 binary_name: nativeartifacts
 build_cmd: bash build.sh
-targets: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, windows/arm64, windows/386]
+targets: $TARGETS_JSON
 act_job_map:
   linux/amd64: null
   linux/arm64: null
@@ -109,6 +116,7 @@ env:
   GOTOOLCHAIN: local
   GOPROXY: "off"
   GOSUMDB: "off"
+  GOMAXPROCS: "2"
   GOCACHE: "$WORK/go-cache"
   DSR_TEST_EVENTS: "$WORK/build-events"
   DSR_TEST_FAIL: "$WORK/fail-target"
@@ -117,7 +125,7 @@ YAML
 # Same definition-loading boundary as test_native_variants.sh. This preserves
 # every line of the real build command and the real native scheduler; it avoids
 # CLI-wide loading of unrelated network/signing/capacity modules.
-for module in logging config build_state act_runner artifact_naming git_ops packaging; do
+for module in logging config build_state act_runner artifact_naming git_ops packaging host_health; do
     # shellcheck disable=SC1090
     source "$ROOT/src/$module.sh" || exit 1
 done
@@ -128,6 +136,63 @@ source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\
 # shellcheck disable=SC1090
 source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$ROOT/dsr") || exit 1
 export JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+# The requested target must override both the host default and selectors from
+# the caller. The recipe intentionally has no GOOS/GOARCH or cross_compile map.
+export GOOS=plan9 GOARCH=386
+if $GO_ENVIRONMENT_ONLY; then
+    # Exercise the actual resolver and compiler without starting a native worker.
+    # This focused mode is also usable when host disk admission prevents the full
+    # scheduler fixture; it does not replace that admission or artifact coverage.
+    mkdir -p "$WORK/go-tmp" "$WORK/go-binaries" || exit 1
+    cat > "$WORK/go-target.go" <<'GO'
+package main
+import "runtime"
+func main() { println(runtime.GOOS + "/" + runtime.GOARCH) }
+GO
+    for target in linux/amd64 linux/arm64; do
+        target_key="${target//\//-}"
+        build_env=$(act_get_build_env nativeartifacts "$target") || exit 1
+        printf '%s\n' "$build_env" > "$WORK/go-binaries/$target_key.env" || exit 1
+        (
+            cd "$WORK/source" || exit 1
+            while IFS= read -r env_pair; do
+                [[ -z "$env_pair" ]] || export "${env_pair?}" || exit 1
+            done <<< "$build_env"
+            export GOTMPDIR="$WORK/go-tmp"
+            go build -trimpath -o "$WORK/go-binaries/$target_key" "$WORK/go-target.go"
+        ) || exit 1
+    done
+    python3 - "$WORK/go-binaries" <<'PY'
+import struct, subprocess, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+checks = 0
+
+def check(label, ok):
+    global checks
+    if not ok:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+for arch, machine in [('amd64', 62), ('arm64', 183)]:
+    binary = root / ('linux-' + arch)
+    pairs = binary.with_suffix('.env').read_text().splitlines()
+    selectors = [p for p in pairs if p.startswith(('GOOS=', 'GOARCH='))]
+    check(arch + ' canonical target selectors from production config resolver',
+          sorted(selectors) == sorted(['GOOS=linux', 'GOARCH=' + arch]))
+    header = binary.read_bytes()[:20]
+    check(arch + ' real compiled ELF architecture',
+          header[:4] == b'\x7fELF' and header[4:6] == b'\x02\x01'
+          and struct.unpack('<H', header[18:20])[0] == machine)
+    metadata = subprocess.check_output(['go', 'version', '-m', str(binary)], text=True)
+    check(arch + ' embedded Go operating system', '\tbuild\tGOOS=linux\n' in metadata)
+    check(arch + ' embedded Go architecture', '\tbuild\tGOARCH=' + arch + '\n' in metadata)
+
+print(f'Go environment/compiler checks: {checks} passed')
+PY
+    exit $?
+fi
 OUTPUT="$WORK/output"
 STATUS=0
 cmd_build nativeartifacts --version 1.2.3 --no-sync --jobs 1 --output-dir "$OUTPUT" \
@@ -138,7 +203,7 @@ if [[ "$STATUS" -ne 0 ]]; then
     exit 1
 fi
 build_state_get nativeartifacts 1.2.3 > "$WORK/checkpoint.json" || exit 1
-python3 - "$WORK" "$HOST_PLATFORM" "$SOURCE_SHA" "$EXPECT_INVENTORY_GAP" <<'PY'
+python3 - "$WORK" "$HOST_PLATFORM" "$SOURCE_SHA" "$EXPECT_INVENTORY_GAP" "$TARGETS_JSON" <<'PY'
 import hashlib, json, os, subprocess, sys, tarfile, zipfile
 from pathlib import Path
 work, host, source = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
@@ -147,7 +212,7 @@ output = work / 'output'
 response = json.loads((work/'build.json').read_bytes())
 state = json.loads((work/'checkpoint.json').read_bytes())
 manifest = json.loads((output/'nativeartifacts-v1.2.3-manifest.json').read_bytes())
-platforms = ['linux/amd64','linux/arm64','darwin/amd64','darwin/arm64','windows/amd64','windows/arm64','windows/386']
+platforms = json.loads(sys.argv[5])
 checks = 0
 
 def check(label, ok):
@@ -161,13 +226,13 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 check('one successful build envelope', response['command']=='build' and response['status']=='success' and response['exit_code']==0)
-check('seven independent successful native workers', response['details']['total']==7 and response['details']['success']==7 and response['details']['failed']==0)
-check('all seven native compilations actually ran', sorted((work/'build-events').read_text().splitlines())==sorted(platforms))
+check('every requested native worker succeeds', response['details']['total']==len(platforms) and response['details']['success']==len(platforms) and response['details']['failed']==0)
+check('real Go compilation overrides ambient target selectors for every requested platform', sorted((work/'build-events').read_text().splitlines())==sorted(platforms))
 check('source identity survives final manifest', manifest['source']['git_sha']==source)
 check('final manifest and durable checkpoint completed together', manifest['publishable'] is True and state['status']=='completed')
 rows = manifest['artifacts']
 check('every published name unique', len({a['name'].casefold() for a in rows})==len(rows))
-check('exact raw/archive/compatibility inventory', len(rows)==21)
+check('exact raw/archive/compatibility inventory', len(rows)==3*len(platforms))
 check('all targets survive signed-manifest input', {a['target'] for a in rows}==set(platforms))
 for platform in platforms:
     osname, arch = platform.split('/')
@@ -210,8 +275,9 @@ def gate(value):
     (work/('gate-%d.stderr'%checks)).write_bytes(p.stderr)
     return p.returncode
 check('actual complete collected manifest passes final admission',gate(manifest)==0)
+omitted_name = 'nativeartifacts_darwin_arm64' if 'darwin/arm64' in platforms else 'nativeartifacts_linux_arm64'
 for label, change in [
-    ('omitted Apple Silicon row',lambda m:m['artifacts'].__setitem__(slice(None),[a for a in m['artifacts'] if a['name']!='nativeartifacts_darwin_arm64'])),
+    ('omitted target row',lambda m:m['artifacts'].__setitem__(slice(None),[a for a in m['artifacts'] if a['name']!=omitted_name])),
     ('pre-rename raw name',lambda m:m['artifacts'][0].__setitem__('name','old-uncollected-name')),
     ('duplicate manifest name',lambda m:m['artifacts'].append(dict(m['artifacts'][0]))),
     ('changed recorded hash',lambda m:m['artifacts'][0].__setitem__('sha256','0'*64)),
@@ -220,7 +286,7 @@ for label, change in [
 ]:
     candidate=json.loads(json.dumps(manifest))
     change(candidate)
-    if expect_gap and label == 'omitted Apple Silicon row':
+    if expect_gap and label == 'omitted target row':
         check('unchanged incumbent accepts an omitted collected Apple Silicon payload',gate(candidate)==0)
     else:
         check('final admission refuses '+label,gate(candidate)==4)
