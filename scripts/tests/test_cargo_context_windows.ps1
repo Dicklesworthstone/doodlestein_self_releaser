@@ -609,9 +609,87 @@ fn main() {
     $null=Invoke-ContextChecked $configuredContext Metadata
     $null=Invoke-ContextChecked $configuredContext Build
     Check 'real Cargo consumes the attested literal compiler and linker configuration' $true
+
+    # Cargo must apply the admitted numeric settings to both build scripts
+    # and rustc. Executing the real result distinguishes actual precedence
+    # from a parser that merely produces a plausible receipt.
+    Write-Text (Join-Path $configSource 'src/main.rs') @'
+fn main() {
+    println!("{}:{}|{}", env!("RUST_MIN_STACK"), env!("RUST_TEST_THREADS"), env!("DSR_NUMERIC_ENV_PROBE"));
+}
+'@
+    Write-Text (Join-Path $configSource 'build.rs') @'
+fn main() {
+    println!("cargo:rerun-if-env-changed=RUST_MIN_STACK");
+    println!("cargo:rerun-if-env-changed=RUST_TEST_THREADS");
+    println!("cargo:rustc-env=DSR_NUMERIC_ENV_PROBE={}:{}",
+        std::env::var("RUST_MIN_STACK").unwrap(), std::env::var("RUST_TEST_THREADS").unwrap());
+}
+'@
+    $numericCases=@(
+        @{Name='literal-default'; Config="RUST_MIN_STACK='16777216'`nRUST_TEST_THREADS=`"4`"";
+            Environment=@(); Minimum='16777216'; Threads='4'; Force=$false; Origin='configuration'},
+        @{Name='table-default'; Config="RUST_MIN_STACK={relative=false,value='16777216'}`nRUST_TEST_THREADS={value=`"4`",force=false}";
+            Environment=@(); Minimum='16777216'; Threads='4'; Force=$false; Origin='configuration'},
+        @{Name='table-inherited'; Config="RUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={relative=false,value='4'}";
+            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2'); Minimum='8388608'; Threads='2'; Force=$false; Origin='environment'},
+        @{Name='table-forced'; Config="RUST_MIN_STACK={value='16777216',force=true,relative=false}`nRUST_TEST_THREADS={force=true,value='4'}";
+            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2'); Minimum='16777216'; Threads='4'; Force=$true; Origin='configuration'}
+    )
+    foreach ($case in $numericCases) {
+        Write-Text $selectionConfig ("[env]`n" + $case.Config + "`n")
+        $numericTarget=Join-Path $work ('numeric-env-' + $case.Name)
+        $numericEnvironment=$baseEnvironment + $case.Environment + @("CARGO_TARGET_DIR=$numericTarget")
+        $numericContext=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $numericEnvironment
+        $rows=@($numericContext.ToolchainIdentity.selection.cargo_config[0].env_exemptions)
+        $minimumRow=@($rows | Where-Object name -ceq 'RUST_MIN_STACK')
+        $threadsRow=@($rows | Where-Object name -ceq 'RUST_TEST_THREADS')
+        Check ("numeric $($case.Name) retains configured values and effective precedence") (
+            $rows.Count -eq 2 -and $minimumRow.Count -eq 1 -and $threadsRow.Count -eq 1 -and
+            $minimumRow[0].value -ceq '16777216' -and $threadsRow[0].value -ceq '4' -and
+            $minimumRow[0].effective_value -ceq $case.Minimum -and $threadsRow[0].effective_value -ceq $case.Threads -and
+            $minimumRow[0].force -eq $case.Force -and $threadsRow[0].force -eq $case.Force -and
+            $minimumRow[0].effective_force -eq $case.Force -and $threadsRow[0].effective_force -eq $case.Force -and
+            $minimumRow[0].effective_source -ceq $case.Origin -and $threadsRow[0].effective_source -ceq $case.Origin)
+        $null=Invoke-ContextChecked $numericContext Metadata
+        $numericReceiptPath=Join-Path $work ('numeric-env-' + $case.Name + '-receipt.json')
+        $numericReceipt=Write-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath
+        $null=Invoke-ContextChecked $numericContext Build
+        $numericBinary=Join-Path $numericTarget ($hostTriple + '/debug/config-selection-probe' + $extension)
+        $expectedNumeric=$case.Minimum + ':' + $case.Threads
+        Check ("real Cargo $($case.Name) supplies the admitted values to build scripts and rustc") (
+            (Invoke-Exe $numericBinary @()).Stdout.Trim() -ceq ($expectedNumeric + '|' + $expectedNumeric))
+        Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
+            -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
+        Check ("numeric $($case.Name) retains metadata authority after genuine compilation") $true
+    }
+    Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={value='4',force=false}`n"
+    Refused 'changing numeric force semantics invalidates the held metadata receipt' {
+        Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
+            -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
+    } 'context changed'
+    Refused 'invalid effective numeric settings cannot reach a compiler probe or build' {
+        New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome `
+            -Environment ($baseEnvironment + @('RUST_MIN_STACK=invalid','RUST_TEST_THREADS=2'))
+    } 'Effective Cargo numeric environment is invalid'
+    foreach ($entry in @(
+        '{}', '{force=true}', '{value=4}', '{value="0"}', '{value="-1"}', '{value=" 4"}',
+        '{value="4\n"}', '{value="4\u000a"}', '"4\n"',
+        '{value="4",force="true"}', '{value="4",relative="false"}', '{value="4",relative=true}',
+        '{value="4",unknown=false}', '{value="4",value="8"}', '{value="4",force=true,force=false}',
+        '{value="4",}', '{value="4"} extra', '{value="4"', '{value={value="4"}}',
+        '{value="4",force=true} RUSTC="hidden-rustc"'
+    )) {
+        Write-Text $selectionConfig ("[env]`nRUST_MIN_STACK=" + $entry + "`n")
+        Refused ('unsupported numeric environment value cannot receive an attestation: ' + $entry) {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
+        }
+    }
     foreach ($configText in @(
         'build.rustc="hidden-rustc"', ('[build]'+"`n"+'rustc={value="hidden-rustc"}'),
         ('[target.''cfg(windows)'']'+"`n"+'linker="hidden-linker"'), ('[env]'+"`n"+'RUSTC="hidden-rustc"'),
+        ('[env]'+"`n"+'RUSTC={value="hidden-rustc",force=true}'),
+        ('[env]'+"`n"+'RUST_MIN_STACK={value="16777216"}'+"`n"+'RUST_MIN_STACK={value="8388608"}'),
         'include=["hidden.toml"]', ('[build]'+"`n"+'rustflags=["-Clinker=hidden-linker"]'),
         ('[build]'+"`n"+'rustc-wrapper="hidden-wrapper"')
     )) {

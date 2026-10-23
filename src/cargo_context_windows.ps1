@@ -207,13 +207,48 @@ function ConvertFrom-DsrCargoConfigString {
     return ConvertFrom-Json -InputObject $Value -ErrorAction Stop
 }
 
+function ConvertFrom-DsrCargoNumericEnvironment {
+    param([string]$Name, [string]$Text)
+    # Only these numeric runtime settings are exempt from the compiler-input
+    # prohibition. Consume the whole inline table; never evaluate TOML values
+    # or allow an unknown attribute to hide environment/path indirection.
+    if ($Name -cnotin @('RUST_MIN_STACK','RUST_TEST_THREADS')) { throw 'Unsupported Cargo configuration environment name' }
+    $value=$null; $force=$false
+    if ($Text.StartsWith('{')) {
+        if (-not $Text.EndsWith('}')) { throw 'Unfinished Cargo numeric environment table' }
+        $rest=$Text.Substring(1,$Text.Length-2).Trim()
+        $attributes=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        while ($rest) {
+            if ($rest -cnotmatch '^(value|force|relative)\s*=\s*("(?:[^"\\\x00-\x1f]|\\["\\bfnrt]|\\u[0-9A-Fa-f]{4})*"|''[^''\x00-\x1f]*''|true|false)\s*(,|$)') {
+                throw 'Unsupported Cargo numeric environment table attribute or value'
+            }
+            $matched=$Matches[0]; $key=$Matches[1]; $literal=$Matches[2]; $separator=$Matches[3]
+            if (-not $attributes.Add($key)) { throw 'Repeated Cargo numeric environment table attribute' }
+            $rest=$rest.Substring($matched.Length).Trim()
+            if ($separator -eq ',' -and -not $rest) { throw 'Trailing comma in Cargo numeric environment table' }
+            if ($key -ceq 'value') {
+                $value=ConvertFrom-DsrCargoConfigString $literal
+            } else {
+                if ($literal -cnotin @('true','false')) { throw 'Cargo numeric environment flags must be boolean' }
+                if ($key -ceq 'force') { $force=$literal -ceq 'true' }
+                elseif ($literal -ceq 'true') { throw 'Cargo numeric environment requires relative=false' }
+            }
+        }
+    } else { $value=ConvertFrom-DsrCargoConfigString $Text }
+    if ($value -isnot [string] -or $value -cnotmatch '^[1-9][0-9]*\z') {
+        throw 'Cargo numeric environment requires a positive-integer string'
+    }
+    return @{name=$Name; value=$value; force=$force}
+}
+
 function Get-DsrCargoToolConfiguration {
     param($Context)
     # This is an admission grammar, not a general TOML parser. Every byte of
     # every admitted statement is consumed. Unsupported syntax fails before
-    # Cargo runs, so dotted keys, inline tables, cfg selectors, includes and
-    # environment indirection cannot hide a compiler or linker override.
-    $config = @{build=@{}; target=(New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)); receipts=@()}
+    # Cargo runs, so dotted keys, cfg selectors, includes and environment
+    # indirection cannot hide a compiler or linker override. Numeric [env]
+    # tables are the one bounded inline-table exception.
+    $config = @{build=@{}; env=@{}; target=(New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)); receipts=@()}
     $directories = New-Object 'System.Collections.Generic.List[string]'
     $current = [IO.DirectoryInfo]::new($Context.SourceRoot)
     while ($null -ne $current) { $directories.Insert(0,(Get-DsrCacheFullPath $current.FullName)); $current=$current.Parent }
@@ -229,6 +264,7 @@ function Get-DsrCargoToolConfiguration {
         $raw = [Text.UTF8Encoding]::new($false,$true).GetString($rawBytes)
         if ($raw.Length -gt 1048576) { throw 'Cargo configuration exceeds the bounded attestation limit' }
         $section=''; $target=''; $pending=''; $keys=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $envExemptions=New-Object 'System.Collections.Generic.List[object]'
         foreach ($line in ($raw -split '\r?\n')) {
             $quote=[char]0; $escape=$false; $end=$line.Length
             for ($i=0; $i -lt $line.Length; $i++) {
@@ -272,6 +308,11 @@ function Get-DsrCargoToolConfiguration {
                 env { @('RUST_MIN_STACK','RUST_TEST_THREADS') }
             }
             if ($key -cnotin $allowed) { throw ('Unsupported Cargo configuration selector: ' + $section + '.' + $key) }
+            if ($section -ceq 'env') {
+                $row=ConvertFrom-DsrCargoNumericEnvironment -Name $key -Text $text
+                $config.env[$key]=$row; $envExemptions.Add($row)
+                continue
+            }
             $value=$null
             if ($text.StartsWith('[')) {
                 if ($key -cnotin @('rustflags','runner') -or -not $text.EndsWith(']')) { throw 'Unsupported Cargo configuration array' }
@@ -285,9 +326,6 @@ function Get-DsrCargoToolConfiguration {
                 if ($key -cnotin @('jobs','incremental','offline','retry','git-fetch-with-cli','verbose','quiet')) { throw 'Cargo executable selectors require literal strings' }
                 $value=$text
             } else { $value=ConvertFrom-DsrCargoConfigString $text }
-            if ($section -eq 'env' -and ($value -isnot [string] -or $value -cnotmatch '^[1-9][0-9]*$')) {
-                throw 'Cargo configuration environment changes are not attested'
-            }
             if (($section -eq 'build' -and $key -in @('rustc','rustc-wrapper','rustc-workspace-wrapper')) -or
                 ($section -eq 'target' -and $key -eq 'linker')) {
                 if ($value -isnot [string] -or -not $value) { throw 'Cargo executable selectors require nonempty literal strings' }
@@ -299,7 +337,9 @@ function Get-DsrCargoToolConfiguration {
         if ($pending) { throw 'Unfinished Cargo configuration array' }
         $configDigest=Get-DsrCacheBytesHash $rawBytes
         if ((Get-DsrCargoToolFileHash $path) -cne $configDigest) { throw 'Cargo configuration changed while parsing executable selection' }
-        $config.receipts += @{path=$path; sha256=$configDigest}
+        $receipt=@{path=$path; sha256=$configDigest}
+        if ($envExemptions.Count -gt 0) { $receipt.env_exemptions=$envExemptions.ToArray() }
+        $config.receipts += $receipt
     }
     return $config
 }
@@ -567,6 +607,18 @@ function Get-DsrCargoToolchainIdentity {
     }
     $effective=New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($name in $Context.Environment.Keys) { $effective[$name]=$Context.Environment[$name] }
+    foreach ($name in $config.env.Keys) {
+        $row=$config.env[$name]
+        $inherited=$effective.ContainsKey($name) -and -not $row.force
+        $value=if ($inherited) { $effective[$name] } else { $row.value }
+        if ($value -cnotmatch '^[1-9][0-9]*\z') { throw ('Effective Cargo numeric environment is invalid: ' + $name) }
+        $row.effective_value=$value; $row.effective_force=$row.force
+        $row.effective_source=if ($inherited) { 'environment' } else { 'configuration' }
+        # Cargo applies [env] to its children. Probe those children with the
+        # same effective values, while retaining the original context so Cargo
+        # itself still applies its normal force/default precedence at launch.
+        $effective[$name]=$value
+    }
     if ($Context.Toolchain) { $effective['RUSTUP_TOOLCHAIN']=$Context.Toolchain }
     $probe=[pscustomobject]@{SourceRoot=$Context.SourceRoot; CargoHome=$Context.CargoHome; CmdPath=$Context.CmdPath; Environment=$effective; Toolchain=$Context.Toolchain}
     $rustupPath=Resolve-DsrCargoTool -Context $probe -Program rustup -Optional
