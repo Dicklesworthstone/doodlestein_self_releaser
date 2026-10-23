@@ -1016,6 +1016,8 @@ gh_workflow_active_runs() {
 # Read every job in one observed workflow attempt. A running workflow may be
 # doing useful work for hours; its duration alone is not queue evidence.
 # Pin the attempt when available so a rerun cannot mix old and new job pages.
+# A latest-only response can supply that pin, but paginating without an
+# unambiguous attempt identity must never combine two workflow attempts.
 # Usage: gh_workflow_jobs <owner/repo> <run_id> [attempt_number]
 gh_workflow_jobs() {
     local repo="${1:-}" run_id="${2:-}" attempt="${3:-}"
@@ -1031,7 +1033,7 @@ gh_workflow_jobs() {
         query=''
     fi
     endpoint+='/jobs'
-    local jobs='[]' response page page_jobs count expected=0 total unique
+    local jobs='[]' response page page_jobs count expected=0 total unique inferred_attempt
     for ((page = 1; page <= 10; page++)); do
         response=$(gh_api "$endpoint?${query}per_page=100&page=$page" --no-cache) || {
             _gh_log_error "Cannot read workflow jobs for $repo run $run_id (page $page)"
@@ -1043,6 +1045,7 @@ gh_workflow_jobs() {
                 (.total_count | type == "number" and . >= 0 and floor == . and . <= 1000) and
                 (.jobs | type == "array" and length <= 100) and
                 .total_count >= (.jobs | length) and
+                ([.jobs[].run_attempt | select(. != null)] | unique | length) <= 1 and
                 all(.jobs[]; type == "object" and (.id | identifier) and
                     (.run_id | identifier and tostring == $run) and
                     (.status | IN("queued","in_progress","completed","waiting","pending","requested")) and
@@ -1068,6 +1071,22 @@ gh_workflow_jobs() {
         if ((count < 100)); then
             _gh_log_error "Incomplete workflow-job listing for $repo run $run_id: found $unique of $expected"
             return 8
+        fi
+        if [[ -z "$attempt" ]]; then
+            # The latest attempt may change between requests. Require the
+            # first complete page to identify its attempt before requesting
+            # another, then use the stable attempt endpoint for every page.
+            if ! inferred_attempt=$(jq -er '
+                [.jobs[].run_attempt] |
+                select(length > 0 and all(.[]; . != null)) | unique |
+                select(length == 1) | .[0]
+            ' <<< "$response"); then
+                _gh_log_error "Cannot paginate workflow jobs without an unambiguous attempt for $repo run $run_id"
+                return 8
+            fi
+            attempt="$inferred_attempt"
+            endpoint="repos/$repo/actions/runs/$run_id/attempts/$attempt/jobs"
+            query=''
         fi
     done
     _gh_log_error "Workflow-job listing for $repo run $run_id exceeded the 1,000-job safety limit"

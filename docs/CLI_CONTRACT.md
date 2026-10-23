@@ -439,6 +439,9 @@ precedence over the unreadable repository.
 An in-progress run is not throttled solely because it has run for a long
 time. DSR reads the complete job inventory for that observed run attempt
 (or explicitly requests the latest jobs if the attempt is unavailable).
+Latest-job pagination requires every first-page job to identify the same
+attempt; subsequent pages are pinned to it. Ambiguous attempts or missing
+attempt evidence block pagination instead of combining separate reruns.
 At least one job must be queued, every other job must be completed, and
 the latest available run/job timestamp must exceed the threshold. Executing
 jobs and approval-pending jobs suppress this automatic fallback decision.
@@ -1110,7 +1113,7 @@ the build step alone. `details.steps[]` lists the steps that ran.
 
 `--expected-sha <full-commit>` binds a fallback to an observed workflow run.
 It requires an explicit `--version` and a nonzero 40-character commit SHA.
-Before creating build state, the checkout's HEAD and the exact local version
+By default, before creating build state, the checkout's HEAD and the exact local version
 tag must both resolve to that commit, with no tracked or untracked changes.
 The same source check runs after quality checks, after the build and before
 publication; the successful build manifest must also name that commit.
@@ -1122,6 +1125,55 @@ publication and is reported with `details.expected_sha` in JSON output.
 This option verifies an existing checkout; it does not switch branches or
 discard local changes. Manual fallback retains source-version detection when
 the option is omitted.
+
+Add `--isolate-source` to recover a queued release even when the configured
+checkout has advanced or contains work in progress:
+
+```bash
+dsr fallback tool --version v1.2.3 --expected-sha <full-commit> --isolate-source
+```
+
+The watcher can use this behavior without additional flags when the tool's
+`repos.d/<tool>.yaml` contains:
+
+```yaml
+fallback:
+  isolate_source: true
+```
+
+Isolation requires the explicit version and expected SHA. It creates a private
+detached Git repository under `fallback-sources/` in the state directory,
+copies the exact committed objects and annotated release tag when available
+locally, and otherwise fetches that exact tag from the configured GitHub
+repository into private storage. The fetched tag must peel to the expected
+commit. Credentials, Git hooks, custom filters, and repository configuration
+are not copied. The configured checkout's branch, refs, index, tracked edits,
+and untracked files remain unchanged.
+
+Quality checks, build workers, archive includes, and release verification all
+use the private source. Configured sibling crates must have exact `revision`
+pins and distinct `relative_path` names; their committed sources are copied
+beside the main source and checked again at every fallback boundary. Unpinned
+siblings and Git submodules are refused. Existing strict source and artifact
+admission rules still apply.
+Cargo manifests and configuration must use relative dependency/workspace
+paths. Isolation parses committed TOML with yq before quality checks and
+refuses absolute paths, including escaped and multiline spellings, rather
+than rewriting files covered by the pinned commit. A yq version with TOML
+input support is required when these files are present.
+
+Each retry creates a fresh controller source copy while resuming the selected
+build UUID and its original output directory. Source copies and partial failed
+materializations are retained for inspection; `details.source_materialization`
+records the private root, source/tag identities, transfer method, and pinned
+dependencies. `--dry-run` plans isolation without creating directories or
+fetching. `--build-only` remains offline when the pinned source objects are
+available locally; otherwise source materialization itself requires GitHub.
+For an ordinary build with pinned siblings, resume also requires matching
+original synchronization evidence and successful target receipts, including
+retained history and sidecars. Changed dependency pins or older checkpoints
+without that evidence require a new build; existing artifacts cannot be
+relabeled with a newly materialized dependency revision.
 
 ---
 

@@ -19,6 +19,34 @@
       "pattern": "^(?!0{40}$)[0-9a-f]{40}$",
       "description": "Explicit workflow source commit required of the checkout, version tag, and build manifest"
     },
+    "isolated_source": {
+      "type": "boolean",
+      "description": "Pinned source is materialized privately without changing the configured checkout"
+    },
+    "source_materialization": {
+      "type": ["object", "null"],
+      "description": "Retained private source identity; null before materialization or in a dry-run plan",
+      "required": ["source_root", "git_sha", "git_ref", "tag_object", "transport"],
+      "properties": {
+        "source_root": { "type": "string", "pattern": "^/" },
+        "git_sha": { "type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$" },
+        "git_ref": { "type": "string" },
+        "tag_object": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "transport": { "enum": ["local-objects", "github"] },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["relative_path", "local_path", "git_sha"],
+            "properties": {
+              "relative_path": { "type": "string" },
+              "local_path": { "type": "string", "pattern": "^/" },
+              "git_sha": { "type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$" }
+            }
+          }
+        }
+      }
+    },
     "trigger": {
       "type": "string",
       "description": "Reason the fallback was triggered"

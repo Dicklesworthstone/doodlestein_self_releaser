@@ -4371,7 +4371,7 @@ EOF
         _dsr_require packaging
 
         local repo_path binary_name
-        repo_path=$(config_get_tool_field "$tool" "local_path" "" 2>/dev/null || echo "")
+        repo_path=$(act_get_local_path "$tool" 2>/dev/null) || return 4
         binary_name=$(config_get_tool_field "$tool" "binary_name" "" 2>/dev/null || echo "")
         [[ -z "$binary_name" ]] && binary_name="$tool"
 
@@ -10016,6 +10016,11 @@ cmd_fallback() {
     (
     local tool_name="" version="" output_dir="" expected_sha=""
     local expected_sha_set=false
+    local isolate_source=false isolated_dependencies='[]' source_materialization=null
+    local configured_dependencies='[]'
+    # Runtime-only source paths stay inside this fallback invocation. They do
+    # not rewrite configuration or change the hashes frozen in build receipts.
+    local _ACT_ISOLATED_SOURCE_TOOL="" _ACT_ISOLATED_SOURCE_PATHS='{}'
     local build_only=false skip_checks=false resume=false
     local dry_run="$DRY_RUN" output_dir_explicit=false
     local resume_selector="latest" resume_run_id="" resume_state="" reuse_completed=false
@@ -10044,6 +10049,7 @@ cmd_fallback() {
                 shift
                 ;;
             --build-only) build_only=true; shift ;;
+            --isolate-source) isolate_source=true; shift ;;
             --skip-checks) skip_checks=true; shift ;;
             --resume|-r) resume=true; shift ;;
             --resume=*) resume=true; resume_selector="${1#*=}"; shift ;;
@@ -10059,6 +10065,7 @@ OPTIONS:
     -t, --tool <name>      Tool to build/release (--repo is an alias)
     -V, --version <ver>    Version to release (default: detect from source)
     --expected-sha <sha>   Require this full source commit and an explicit version
+    --isolate-source       Materialize that commit without changing your checkout
     --build-only           Build and verify artifacts without publishing
     --skip-checks          Skip ordinary quality checks; required checks still run
     -r, --resume[=RUN_ID]  Resume a build or reuse its verified completed outputs
@@ -10077,6 +10084,12 @@ DESCRIPTION:
     --expected-sha binds an automatic fallback to its observed workflow run:
     the clean checkout, local version tag and build manifest must name that
     commit. Source identity is rechecked after quality checks and signing.
+    --isolate-source (or fallback.isolate_source: true in the tool config)
+    builds that pinned commit in a private detached repository. It copies local
+    Git objects or fetches the exact GitHub tag into that private repository.
+    Pinned sibling crates are materialized beside it at their exact revisions.
+    Existing checkouts, branches, index, and uncommitted files are preserved.
+    Retries retain their build UUID and outputs but get a fresh source copy.
 
 EXIT CODES:
     0  - Pipeline completed successfully
@@ -10160,7 +10173,29 @@ EOF
         fi
         local_path=$(act_get_local_path "$tool_name") || return 4
         repo=$(act_get_repo "$tool_name") || return 4
-        [[ -d "$local_path" && -n "$repo" ]] || {
+        local configured_isolation
+        configured_isolation=$(config_get_tool_field "$tool_name" fallback.isolate_source false) || return 4
+        case "${configured_isolation:-false}" in
+            true) isolate_source=true ;;
+            false) ;;
+            *) log_error "fallback.isolate_source must be true or false"; return 4 ;;
+        esac
+        if $isolate_source; then
+            if [[ -z "$expected_sha" ]]; then
+                log_error "Source isolation requires --expected-sha and an explicit --version"
+                return 4
+            fi
+            configured_dependencies=$(_config_get_release_source_dependency_checkouts_json "$tool_name") || return 4
+            if ! jq -e --arg main "$local_path" '
+                type == "array" and
+                ([.[].local_path] | unique | length) == length and
+                all(.[]; .local_path != $main and (.relative_path | ascii_downcase) != "source")
+            ' <<< "$configured_dependencies" >/dev/null; then
+                log_error "Isolated sibling sources require distinct pinned paths and cannot be named source"
+                return 4
+            fi
+        fi
+        [[ -n "$repo" ]] && { $isolate_source || [[ -d "$local_path" ]]; } || {
             log_error "A local source directory and GitHub repository are required"
             return 4
         }
@@ -10219,6 +10254,7 @@ EOF
                 --arg tool "$tool_name" --arg version "$tag" --arg repo "$repo" \
                 --arg run_id "$run_id" --arg output_dir "$output_dir" \
                 --arg expected_sha "$expected_sha" \
+                --argjson isolate_source "$isolate_source" --argjson materialization "$source_materialization" \
                 --arg checks "$checks_status" --arg build "$build_status" \
                 --arg verification "$verification_status" --arg signing "$signing_status" \
                 --arg release "$release_status" --arg phase "$phase" --arg error "$error" \
@@ -10254,7 +10290,8 @@ EOF
                   build_only:$build_only,skip_checks:$skip_checks,resume:$resume,
                   resume_run_id:$resume_run_id}
                 + (if $trigger == "" then {} else {trigger: $trigger} end)
-                + (if $expected_sha == "" then {} else {expected_sha: $expected_sha} end)') || return 4
+                + (if $expected_sha == "" then {} else {expected_sha: $expected_sha} end)
+                + (if $isolate_source then {isolated_source:true,source_materialization:$materialization} else {} end)') || return 4
             json_envelope fallback "$status" "$rc" "$details"
         else
             log_info "Fallback $status: $tool_name $tag (phase: $phase; artifacts: $artifacts_count)"
@@ -10266,6 +10303,16 @@ EOF
 
     _fallback_verify_expected_source() {
         [[ -n "$expected_sha" ]] || return 0
+        if $isolate_source; then
+            git_ops_verify_materialized_source "$local_path" "$expected_sha" "$tag" || return 4
+            local dependency dependency_path dependency_sha
+            while IFS= read -r dependency; do
+                dependency_path=$(jq -r .local_path <<< "$dependency") || return 4
+                dependency_sha=$(jq -r .git_sha <<< "$dependency") || return 4
+                git_ops_verify_materialized_source "$dependency_path" "$dependency_sha" || return 4
+            done < <(jq -c '.[]' <<< "$isolated_dependencies")
+            return 0
+        fi
         local current_sha tag_sha untracked
         if ! current_sha=$(git -C "$local_path" rev-parse --verify 'HEAD^{commit}') ||
            ! tag_sha=$(git -C "$local_path" rev-parse --verify "refs/tags/$tag^{commit}"); then
@@ -10284,13 +10331,14 @@ EOF
             return 4
         fi
     }
-    if ! _fallback_verify_expected_source; then
+    if ! $isolate_source && ! _fallback_verify_expected_source; then
         build_status="blocked"; release_status="blocked"
         _fallback_result 4 source "Checkout and version tag must match the expected workflow commit"
         return 4
     fi
 
     if $dry_run; then
+        $isolate_source && log_info "[dry-run] Would materialize $tag ($expected_sha) and its pinned dependencies in private source repositories"
         log_info "[dry-run] Would check, build, verify, and release $tool_name $tag in $output_dir"
         _fallback_result 0 plan
         return $?
@@ -10344,6 +10392,120 @@ EOF
         fi
         output_dir="$resume_output"
         [[ "$(jq -r '.status' <<< "$resume_state")" == completed ]] && reuse_completed=true
+    fi
+
+    if $isolate_source && $resume && [[ "$contract" == null ]]; then
+        local dependency_identity resume_identity_filter saved_result saved_path resume_identity_ok=true
+        dependency_identity=$(jq -c 'map({relative_path,git_sha})' <<< "$configured_dependencies") || return 4
+        resume_identity_filter='
+            def same_source:
+                if . == null or (.git_context == null and .sibling_git_contexts == null)
+                then ($dependencies | length) == 0
+                else .git_context.git_sha == $sha and
+                    (.sibling_git_contexts | type) == "object" and
+                    ([.sibling_git_contexts | to_entries[] |
+                        {relative_path:.key,git_sha:.value.git_sha}] | sort_by(.relative_path)) == $dependencies
+                end;
+        '
+        # Context can be refreshed while old successful target receipts remain.
+        # Check every retained identity before cmd_build can reuse any of them.
+        if ! jq -e --arg sha "$expected_sha" --argjson dependencies "$dependency_identity" \
+            "$resume_identity_filter"'
+                (.context.source_sync | same_source) and
+                all((.source_sync_history // [])[]; .receipt | same_source) and
+                all((.target_statuses // {})[];
+                    if .status == "completed" or (.result.status == "success" or .result.status == "ok" or .result.status == "passed")
+                    then .result.source_sync | same_source else true end) and
+                (if .status == "completed" and ($dependencies | length) > 0
+                 then . as $state |
+                    all((.context.build_tasks // [.targets[] | {key:.}])[];
+                        $state.target_statuses[.key].result.source_sync | same_source)
+                 else true end)
+            ' <<< "$resume_state" >/dev/null; then
+            resume_identity_ok=false
+        fi
+        while IFS= read -r saved_path; do
+            [[ -n "$saved_path" ]] || continue
+            # Dispatch records the planned path before a worker has produced
+            # its immutable result. Missing sidecars cannot authorize reuse;
+            # the scheduler must rebuild or use verified embedded evidence.
+            [[ -e "$saved_path" || -L "$saved_path" ]] || continue
+            if [[ ! -f "$saved_path" || -L "$saved_path" ]] ||
+               ! saved_result=$(jq -sce 'select(length == 1 and (.[0] | type) == "object") | .[0]' "$saved_path") ||
+               ! jq -e --arg sha "$expected_sha" --argjson dependencies "$dependency_identity" \
+                    "$resume_identity_filter"'
+                        if .status == "success" or .status == "ok" or .status == "passed"
+                        then .source_sync | same_source else true end
+                    ' <<< "$saved_result" >/dev/null; then
+                resume_identity_ok=false
+            fi
+        done < <(jq -r '(.target_statuses // {})[] | .result_path // empty' <<< "$resume_state")
+        if ! $resume_identity_ok; then
+            _fallback_result 4 resume "Isolated source dependencies differ from the checkpoint or lack original target evidence; start a new build"
+            return 4
+        fi
+    fi
+
+    if $isolate_source; then
+        local source_parent source_directory original_source="$local_path" source_rc=0
+        local dependency dependency_path dependency_sha dependency_name dependency_receipt source_paths
+        source_parent="$state_dir/fallback-sources"
+        if ! mkdir -p -- "$source_parent" || [[ -L "$source_parent" ]] ||
+           ! source_parent=$(cd "$source_parent" && pwd -P) ||
+           ! source_directory=$(mktemp -d "$source_parent/$tool_name-$expected_sha.XXXXXXXX") ||
+           ! mkdir -- "$source_directory/.dsr"; then
+            _fallback_result 4 source "Could not create private source storage"
+            return 4
+        fi
+        source_materialization=$(git_ops_materialize_source "$original_source" "$expected_sha" \
+            "$source_directory/source" "$tag" "$repo") || source_rc=$?
+        if [[ "$source_rc" != 0 ]]; then
+            source_materialization=null
+            _fallback_result "$source_rc" source "Could not materialize the expected release commit; retained partial source: $source_directory"
+            return "$source_rc"
+        fi
+        local_path=$(jq -r .source_root <<< "$source_materialization") || return 4
+        source_paths=$(jq -nc --arg old "$original_source" --arg new "$local_path" '{($old):$new}') || return 4
+        while IFS= read -r dependency; do
+            dependency_path=$(jq -r .local_path <<< "$dependency") || return 4
+            dependency_sha=$(jq -r .git_sha <<< "$dependency") || return 4
+            dependency_name=$(jq -r .relative_path <<< "$dependency") || return 4
+            source_rc=0
+            dependency_receipt=$(git_ops_materialize_source "$dependency_path" "$dependency_sha" \
+                "$source_directory/$dependency_name") || source_rc=$?
+            if [[ "$source_rc" != 0 ]]; then
+                _fallback_result "$source_rc" source "Could not materialize pinned sibling $dependency_name"
+                return "$source_rc"
+            fi
+            local materialized_path
+            materialized_path=$(jq -r .source_root <<< "$dependency_receipt") || return 4
+            source_paths=$(jq -c --arg old "$dependency_path" --arg new "$materialized_path" \
+                '.[$old]=$new' <<< "$source_paths") || return 4
+            isolated_dependencies=$(jq -c --argjson dependency "$dependency" --arg path "$materialized_path" \
+                '. + [$dependency + {local_path:$path}]' <<< "$isolated_dependencies") || return 4
+        done < <(jq -c '.[]' <<< "$configured_dependencies")
+        source_materialization=$(jq -c --argjson dependencies "$isolated_dependencies" \
+            '. + {dependencies:$dependencies}' <<< "$source_materialization") || return 4
+        printf '%s\n' "$source_materialization" > "$source_directory/.dsr/source.json" || return 4
+        _ACT_ISOLATED_SOURCE_TOOL="$tool_name"
+        _ACT_ISOLATED_SOURCE_PATHS="$source_paths"
+        export ACT_REPO_LOCAL_PATH="$local_path"
+        if ! _fallback_verify_expected_source; then
+            _fallback_result 4 source "Materialized source differs from its pinned identity"
+            return 4
+        fi
+        if ! _act_validate_isolated_cargo_paths "$local_path"; then
+            _fallback_result 4 source "Private source contains unsupported absolute Cargo paths"
+            return 4
+        fi
+        while IFS= read -r dependency; do
+            dependency_path=$(jq -r .local_path <<< "$dependency") || return 4
+            if ! _act_validate_isolated_cargo_paths "$dependency_path"; then
+                _fallback_result 4 source "Pinned sibling contains unsupported absolute Cargo paths"
+                return 4
+            fi
+        done < <(jq -c '.[]' <<< "$isolated_dependencies")
+        log_info "Using isolated release source: $local_path"
     fi
 
     _fallback_verify_completed_source() {

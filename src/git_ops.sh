@@ -545,6 +545,114 @@ git_ops_remove_build_worktree() {
   return 1
 }
 
+# Materialize committed bytes into a new, independent repository. No worktree
+# registration, index refresh, fetch, checkout, or ref update touches SOURCE.
+# A missing local tag/object may be fetched from the explicitly named GitHub
+# repository, but only into DESTINATION and only at the expected tagged commit.
+# Args: SOURCE EXPECTED_SHA NEW_DESTINATION [TAG] [GITHUB_OWNER/REPO]
+# Returns: JSON identity on stdout; 4 invalid source, 8 remote transfer failure.
+git_ops_materialize_source() (
+  [[ $# -ge 3 && $# -le 5 ]] || return 4
+  local source="$1" sha="$2" destination="$3" tag="${4:-}" repo="${5:-}"
+  local object="" local_source=false transport=local-objects observed="" token="" submodules
+  [[ "$sha" =~ ^[0-9a-f]{40}$ && "$sha" != 0000000000000000000000000000000000000000 &&
+     "$destination" == /* && ! -e "$destination" && ! -L "$destination" ]] || return 4
+  [[ -z "$repo" || "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 4
+  if [[ -n "$tag" ]]; then
+    [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] &&
+      _git_ops_build_git check-ref-format "refs/tags/$tag" || return 4
+  fi
+
+  if [[ -d "$source" ]] &&
+     [[ "$(_git_ops_build_git -C "$source" rev-parse --is-shallow-repository 2>/dev/null)" == false ]] &&
+     observed=$(_git_ops_build_git -C "$source" rev-parse --verify "$sha^{commit}" 2>/dev/null) &&
+     [[ "$observed" == "$sha" ]]; then
+    local_source=true
+    if [[ -n "$tag" ]]; then
+      if ! object=$(_git_ops_build_git -C "$source" rev-parse --verify "refs/tags/$tag" 2>/dev/null) ||
+         ! observed=$(_git_ops_build_git -C "$source" rev-parse --verify "refs/tags/$tag^{commit}" 2>/dev/null) ||
+         [[ "$observed" != "$sha" ]]; then
+        local_source=false
+      fi
+    fi
+  fi
+  if ! $local_source && [[ -z "$tag" || -z "$repo" ]]; then
+    log_error "Pinned source commit is not locally available: $source ($sha)"
+    return 4
+  fi
+
+  umask 077
+  mkdir -- "$destination" || return 4
+  destination=$(cd "$destination" && pwd -P) || return 4
+  mkdir -p -- "$destination/.git/dsr-empty-template" || return 4
+  _git_ops_build_git -C "$destination" init -q --template="$destination/.git/dsr-empty-template" || return 4
+  _git_ops_build_git -C "$destination" config --local core.autocrlf false || return 4
+  _git_ops_build_git -C "$destination" config --local core.eol lf || return 4
+  if $local_source; then
+    # A pack copies immutable objects, including annotated tags and complete
+    # ancestry, without sharing alternates, hardlinks, hooks, or configuration.
+    printf '%s\n' "$sha" "${object:-$sha}" |
+      _git_ops_build_git -C "$source" pack-objects --stdout --revs |
+      _git_ops_build_git -C "$destination" index-pack --stdin --strict >/dev/null || return 4
+    if [[ -n "$tag" ]]; then
+      _git_ops_build_git -C "$destination" update-ref "refs/tags/$tag" "$object" || return 4
+    fi
+  else
+    transport=github
+    if declare -F _gh_resolve_token >/dev/null; then
+      token=$(_gh_resolve_token 2>/dev/null) || token=""
+      [[ -z "$token" ]] || export GH_TOKEN="$token"
+    fi
+    # Credentials live only in this process. Do not copy the user's Git config
+    # or persist a token in a remote URL, config file, command line, or receipt.
+    if ! _git_ops_build_git -C "$destination" -c protocol.allow=never -c protocol.https.allow=always \
+        -c 'http.userAgent=doodlestein_self_releaser (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)' \
+        -c credential.helper= -c 'credential.https://github.com.helper=!gh auth git-credential' \
+        -c http.followRedirects=false -c fetch.fsckObjects=true \
+        fetch -q --no-tags --no-write-fetch-head --recurse-submodules=no \
+        "https://github.com/$repo.git" "refs/tags/$tag:refs/tags/$tag"; then
+      log_error "Could not fetch the pinned release tag into its isolated source directory"
+      return 8
+    fi
+    object=$(_git_ops_build_git -C "$destination" rev-parse --verify "refs/tags/$tag") || return 4
+    observed=$(_git_ops_build_git -C "$destination" rev-parse --verify "refs/tags/$tag^{commit}") || return 4
+    if [[ "$observed" != "$sha" ]]; then
+      log_error "Fetched tag $tag differs from the expected workflow commit"
+      return 4
+    fi
+  fi
+  submodules=$(_git_ops_build_git -C "$destination" ls-tree -r "$sha" | awk '$1 == "160000" {print}') || return 4
+  if [[ -n "$submodules" ]]; then
+    log_error "Isolated source currently requires a repository without Git submodules"
+    return 4
+  fi
+  _git_ops_build_git -C "$destination" update-ref --no-deref HEAD "$sha" || return 4
+  _git_ops_build_git -C "$destination" read-tree --reset -u HEAD || return 4
+  if [[ -n "$repo" ]]; then
+    _git_ops_build_git -C "$destination" config --local remote.origin.url "https://github.com/$repo.git" || return 4
+  fi
+  _git_ops_build_git -C "$destination" fsck --connectivity-only --no-reflogs --no-dangling || return 4
+  git_ops_verify_materialized_source "$destination" "$sha" "$tag" || return 4
+  jq -nc --arg root "$destination" --arg sha "$sha" --arg tag "$tag" \
+    --arg object "$object" --arg transport "$transport" \
+    '{source_root:$root,git_sha:$sha,git_ref:$tag,tag_object:$object,transport:$transport}'
+)
+
+git_ops_verify_materialized_source() {
+  local source="$1" sha="$2" tag="${3:-}" untracked
+  [[ -d "$source" && ! -L "$source" && -d "$source/.git" && ! -L "$source/.git" ]] || return 4
+  source=$(cd "$source" && pwd -P) || return 4
+  _git_ops_validate_build_context_source "$source" || return 4
+  [[ "$(_git_ops_build_git -C "$source" rev-parse --verify 'HEAD^{commit}')" == "$sha" ]] || return 4
+  if [[ -n "$tag" ]]; then
+    [[ "$(_git_ops_build_git -C "$source" rev-parse --verify "refs/tags/$tag^{commit}")" == "$sha" ]] || return 4
+  fi
+  _git_ops_build_git -C "$source" diff-index --quiet HEAD -- &&
+    _git_ops_build_git -C "$source" diff-files --quiet -- || return 4
+  untracked=$(_git_ops_build_git -C "$source" ls-files --others --exclude-standard) || return 4
+  [[ -z "$untracked" ]] || return 4
+}
+
 # Export a portable Git context without copying hooks, configuration, credentials
 # or linked-worktree pointers. Only top-level, complete SHA-1 worktrees are
 # supported. Working files are transported separately by the caller. Restore
@@ -554,7 +662,7 @@ _git_ops_build_git() (
   local name
   for name in ${!GIT_@}; do unset "$name"; done
   export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-  export GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 GIT_NO_LAZY_FETCH=1
+  export GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0
   git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
 )
 
@@ -845,6 +953,7 @@ export -f git_ops_tag_exists git_ops_tag_sha git_ops_list_tags
 export -f git_ops_current_branch git_ops_head_sha
 export -f git_ops_get_build_info git_ops_validate_for_build
 export -f git_ops_create_build_worktree git_ops_remove_build_worktree
+export -f git_ops_materialize_source git_ops_verify_materialized_source
 export -f _git_ops_build_git _git_ops_build_sha256 _git_ops_build_refs
 export -f git_ops_export_build_context git_ops_restore_build_context git_ops_build_context_powershell
 export -f git_ops_verify_build_context

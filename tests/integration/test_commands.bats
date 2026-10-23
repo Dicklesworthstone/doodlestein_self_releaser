@@ -429,9 +429,15 @@ _mock_job_inventory() {
             [job(1;"completed") + {completed_at:$fresh},job(2;"queued")]
         elif $mode == "recent-queue" then [job(1;"queued") + {created_at:$fresh}]
         elif $mode == "empty" then []
-        elif $mode == "later-running" or $mode == "later-queued" or $mode == "later-error" or $mode == "duplicate" then
+        elif $mode == "later-running" or $mode == "later-queued" or $mode == "later-error" or $mode == "duplicate" or
+             $mode == "latest-paged" or $mode == "latest-mixed-pages" or $mode == "latest-unpinned-pages" then
             [range(1;101) | job(.;"completed") + {completed_at:$old}] +
-            [job(101;(if $mode == "later-running" then "in_progress" else "queued" end))]
+            [job(101;(if $mode == "later-running" then "in_progress" else "queued" end))] |
+            if $mode == "latest-mixed-pages" then .[-1].run_attempt=3
+            elif $mode == "latest-unpinned-pages" then map(.run_attempt=null)
+            else . end
+        elif $mode == "latest-mixed-page" then [job(1;"queued"),job(2;"queued") + {run_attempt:3}]
+        elif $mode == "latest-unpinned" then [job(1;"queued") | del(.run_attempt)]
         elif $mode == "wrong-source" then [job(1;"queued") | .head_sha=("2"*40)]
         elif $mode == "wrong-run" then [job(1;"queued") | .run_id=556]
         elif $mode == "wrong-attempt" then [job(1;"queued") | .run_attempt=1]
@@ -440,7 +446,7 @@ _mock_job_inventory() {
     ' > "$TEST_TMPDIR/job-history.json"
     jq -n --arg old "$(_minutes_ago 60)" --arg mode "$1" '
         {total_count:1,workflow_runs:[{id:555,status:"in_progress",created_at:$old,run_started_at:$old,
-         run_attempt:(if $mode == "latest" then null else 2 end),name:"Release",workflow_id:17,
+         run_attempt:(if $mode | startswith("latest") then null else 2 end),name:"Release",workflow_id:17,
          path:".github/workflows/release.yml",head_branch:"v1.2.3",
          head_sha:"1111111111111111111111111111111111111111",event:"push",
          html_url:"https://github.com/Dicklesworthstone/ntm/actions/runs/555"}]}
@@ -535,10 +541,49 @@ PY
 @test "job scan: missing attempt metadata explicitly selects only the latest jobs" {
     harness_create_config
     _setup_repos_d
-    _mock_job_inventory latest
+    local mode
+    for mode in latest latest-unpinned; do
+        _mock_job_inventory "$mode"
+        run _routing_dsr --json check ntm
+        assert_equal "1" "$status"
+    done
+    grep -q 'runs/555/jobs?filter=latest&per_page=100&page=1' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "job scan: latest pagination pins the attempt observed on its first page" {
+    harness_create_config
+    _setup_repos_d
+    _mock_job_inventory latest-paged
     run _routing_dsr --json check ntm
     assert_equal "1" "$status"
+    echo "$output" | jq -e '.details.throttled[0].queued_job_ids == [101]'
     grep -q 'runs/555/jobs?filter=latest&per_page=100&page=1' "$TEST_TMPDIR/gh.calls"
+    grep -q 'runs/555/attempts/2/jobs?per_page=100&page=2' "$TEST_TMPDIR/gh.calls"
+    ! grep -q 'runs/555/jobs?filter=latest&per_page=100&page=2' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "job scan: latest inventories never combine different workflow attempts" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in latest-mixed-page latest-mixed-pages; do
+        _mock_job_inventory "$mode"
+        run _routing_dsr --json check ntm
+        assert_equal "8" "$status"
+        echo "$output" | jq -e '.details.healthy == [] and .details.throttled == [] and
+            .details.skipped[0].reason == "failed to inspect workflow jobs"'
+    done
+}
+
+@test "job scan: latest pagination refuses missing attempt identity before another request" {
+    harness_create_config
+    _setup_repos_d
+    _mock_job_inventory latest-unpinned-pages
+    run _routing_dsr --json check ntm
+    assert_equal "8" "$status"
+    echo "$output" | jq -e '.details.healthy == [] and .details.throttled == [] and
+        .details.skipped[0].reason == "failed to inspect workflow jobs"'
+    ! grep -q '/jobs?.*page=2' "$TEST_TMPDIR/gh.calls"
 }
 
 @test "job scan: incomplete malformed or mismatched inventories cannot authorize fallback" {

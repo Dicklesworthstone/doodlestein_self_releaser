@@ -1762,6 +1762,13 @@ _act_release_source_dependency_checkouts_json() {
         _log_error "Unable to read pinned release source checkouts for $tool_name"
         return 4
     fi
+    if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" == "$tool_name" ]]; then
+        checkouts=$(jq -ce --argjson paths "$_ACT_ISOLATED_SOURCE_PATHS" '
+            map(.local_path as $original |
+                if $paths | has($original) then .local_path = $paths[$original]
+                else error("missing isolated sibling source") end)
+        ' <<< "$checkouts") || return 4
+    fi
     if ! jq -en --argjson checkouts "$checkouts" --argjson dependencies "$dependencies" '
         ($checkouts | type) == "array" and
         $checkouts == ($checkouts | sort_by(.relative_path)) and
@@ -2542,7 +2549,7 @@ act_load_repo_config() {
     # Load config into variables
     ACT_REPO_NAME=$(yq -r '.tool_name // ""' "$config_file")
     ACT_REPO_GITHUB=$(yq -r '.repo // ""' "$config_file")
-    ACT_REPO_LOCAL_PATH=$(yq -r '.local_path // ""' "$config_file")
+    ACT_REPO_LOCAL_PATH=$(act_get_local_path "$tool_name") || return 4
     ACT_REPO_LANGUAGE=$(yq -r '.language // ""' "$config_file")
     ACT_REPO_WORKFLOW=$(yq -r '.workflow // ".github/workflows/release.yml"' "$config_file")
     ACT_REPO_PUBLICATION_MODE=$(yq -r '.publication_mode // ""' "$config_file")
@@ -4301,6 +4308,32 @@ _act_validate_no_absolute_cargo_paths() {
     fi
 }
 
+# A private controller checkout must not let Cargo resolve a configured
+# absolute dependency back into the developer's original checkout. Parse
+# committed manifests, including ignored/hidden ones, so quoted keys and
+# escaped or multiline TOML strings have the same meaning as they do to Cargo.
+_act_validate_isolated_cargo_paths() {
+    local source="$1" manifest document
+    while IFS= read -r -d '' manifest; do
+        case "$manifest" in
+            Cargo.toml|*/Cargo.toml|.cargo/config|*/.cargo/config|.cargo/config.toml|*/.cargo/config.toml) ;;
+            *) continue ;;
+        esac
+        if [[ -L "$source/$manifest" ]] ||
+           ! document=$(yq -p=toml -o=json -I=0 '.' "$source/$manifest" 2>/dev/null) ||
+           ! jq -es '
+                length == 1 and
+                all(.[0] | .. | objects | to_entries[] |
+                    select(.key == "path" or .key == "paths" or .key == "members" or .key == "default-members") |
+                    .value | .. | strings;
+                    (test("^([/\\\\]|[A-Za-z]:)") | not))
+            ' <<< "$document" >/dev/null; then
+            _log_error "Isolated Cargo source requires relative paths and TOML-capable yq: $manifest"
+            return 4
+        fi
+    done < <(_git_ops_build_git -C "$source" ls-files -z)
+}
+
 _act_normalize_cargo_path() {
     local raw_path="$1"
 
@@ -5842,12 +5875,15 @@ _act_verify_strict_source_roots() {
 _act_export_ordinary_git_contexts() {
     local config_file="$1" local_path="$2" context_parent="$3"
     local sources='[]' contexts='[]' item relative source context count index
+    local tool_name="${config_file##*/}"
+    tool_name="${tool_name%.yaml}"
     local sibling_names_seen=' source cargo-home '
     sources=$(jq -nc --arg path "$local_path" '[{relative_path:"source",local_path:$path}]') || return 4
     count=$(yq -r '.sibling_crates // [] | length' "$config_file") || return 4
     [[ "$count" =~ ^[0-9]+$ ]] || return 4
     for ((index=0; index<count; index++)); do
         source=$(yq -r ".sibling_crates[$index].local_path // \"\"" "$config_file") || return 4
+        source=$(_act_materialized_source_path "$tool_name" "$source") || return 4
         relative=$(yq -r ".sibling_crates[$index].relative_path // \"\"" "$config_file") || return 4
         [[ -n "$relative" ]] || relative="${source##*/}"
         if [[ ! -d "$source" || -L "$source" ||
@@ -5990,6 +6026,8 @@ _act_sync_sibling_crates() {
     local config_file="$3"
     local sibling_count="$4"
     local sync_failed=false
+    local tool_name="${config_file##*/}"
+    tool_name="${tool_name%.yaml}"
 
     local remote_parent
     # Compute the parent directory of the remote project path
@@ -6002,8 +6040,9 @@ _act_sync_sibling_crates() {
 
     local idx
     for idx in $(seq 0 $((sibling_count - 1))); do
-        local sib_local sib_relative
-        sib_local=$(yq -r ".sibling_crates[$idx].local_path" "$config_file" 2>/dev/null)
+        local sib_local sib_configured sib_relative
+        sib_configured=$(yq -r ".sibling_crates[$idx].local_path" "$config_file" 2>/dev/null)
+        sib_local=$(_act_materialized_source_path "$tool_name" "$sib_configured") || return 4
         sib_relative=$(yq -r ".sibling_crates[$idx].relative_path // \"\"" "$config_file" 2>/dev/null)
         [[ -z "$sib_relative" ]] && sib_relative=$(basename "$sib_local")
 
@@ -6055,8 +6094,8 @@ _act_sync_sibling_crates() {
             local win_path="${remote_path//\//\\}"
             local toml_path="${win_path}\\Cargo.toml"
             local patch_output
-            if patch_output=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_local}','${relative_ref}'))")" 30 2>&1); then
-                _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref"
+            if patch_output=$(_act_ssh_exec "$host" "$(_act_windows_encoded_powershell "[System.IO.File]::WriteAllText('${toml_path}', [System.IO.File]::ReadAllText('${toml_path}').Replace('${sib_configured}','${relative_ref}'))")" 30 2>&1); then
+                _log_ok "Patched Cargo.toml on $host: $sib_configured → $relative_ref"
             else
                 _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
                 [[ -n "$patch_output" ]] && printf '%s\n' "$patch_output" >&2
@@ -6066,8 +6105,8 @@ _act_sync_sibling_crates() {
             # macOS sed requires '' after -i; Linux sed requires no arg after -i
             # Use perl for portable in-place replacement
             local patch_output
-            if patch_output=$(_act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_local}\\E|${relative_ref}|g' Cargo.toml" 30 2>&1); then
-                _log_ok "Patched Cargo.toml on $host: $sib_local → $relative_ref"
+            if patch_output=$(_act_ssh_exec "$host" "cd '${remote_path}' && perl -pi -e 's|\\Q${sib_configured}\\E|${relative_ref}|g' Cargo.toml" 30 2>&1); then
+                _log_ok "Patched Cargo.toml on $host: $sib_configured → $relative_ref"
             else
                 _log_error "Failed to patch Cargo.toml on $host for sibling $sib_relative"
                 [[ -n "$patch_output" ]] && printf '%s\n' "$patch_output" >&2
@@ -7043,6 +7082,19 @@ act_get_repo() {
 
 # Get local path for a tool
 # Usage: act_get_local_path <tool_name>
+_act_materialized_source_path() {
+    local tool_name="$1" configured_path="$2" materialized paths="${_ACT_ISOLATED_SOURCE_PATHS:-}"
+    if [[ "${_ACT_ISOLATED_SOURCE_TOOL:-}" != "$tool_name" ]]; then
+        printf '%s\n' "$configured_path"
+        return 0
+    fi
+    [[ -n "$paths" ]] || return 4
+    materialized=$(jq -er --arg path "$configured_path" \
+        '.[$path] | strings | select(startswith("/"))' <<< "$paths") || return 4
+    [[ -d "$materialized" && ! -L "$materialized" ]] || return 4
+    printf '%s\n' "$materialized"
+}
+
 act_get_local_path() {
     local tool_name="$1"
     local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
@@ -7051,7 +7103,9 @@ act_get_local_path() {
         return 4
     fi
 
-    yq -r '.local_path // ""' "$config_file" 2>/dev/null
+    local configured_path
+    configured_path=$(yq -r '.local_path // ""' "$config_file" 2>/dev/null) || return 4
+    _act_materialized_source_path "$tool_name" "$configured_path"
 }
 
 # Ensure remote repo is in a valid git state for builds (bd-1tv.9)
@@ -13656,6 +13710,7 @@ export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
 export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
+export -f _act_materialized_source_path
 export -f act_get_build_env_value act_get_remote_artifact_path
 export -f act_run_native_build act_orchestrate_build act_generate_manifest
 export -f _act_result_artifact_receipts _act_target_result_available
