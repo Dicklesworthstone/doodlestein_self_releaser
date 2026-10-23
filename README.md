@@ -517,13 +517,19 @@ dsr check --json                    # JSON output for scripting
 A configured tool's `workflow` is its release workflow; without `--all` only
 that workflow's runs count. Queued and in-progress runs are queried separately
 and paginated, so completed history cannot hide an older throttled release.
+For an older in-progress workflow, DSR also reads every job in the observed
+attempt. It reports throttling only when jobs are queued, none are executing
+or awaiting approval, and the latest available run/job activity is older
+than the threshold. A long compile alone does not trigger fallback.
 The default threshold is `threshold_seconds` from the config (or
 `DSR_THRESHOLD`), else 600s. Exit 0 means no throttling, 1
 throttling (`.details.throttled[]` names repo, tool, workflow, run and its
 tag), and 8 an API or incomplete-listing error when no other repository is
-throttled. Failed pages, invalid active-run timestamps, and GitHub's filtered
-result limit cannot produce a healthy result; inspect `.details.skipped` for
-the affected repository.
+throttled. Failed pages, invalid timestamps, mismatched job source/attempts,
+and incomplete inventories cannot produce a healthy result; inspect
+`.details.skipped` for the affected repository. Throttled rows include
+`queue_reason` (`workflow_queue` or `job_queue`); job queues also include
+`queued_job_ids` so automation can explain the decision.
 
 ### `dsr build`
 

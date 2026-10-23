@@ -411,6 +411,149 @@ SCRIPT
     ! grep -q 'status=queued&page=10' "$TEST_TMPDIR/gh.calls"
 }
 
+# A long-running workflow can still be compiling normally, waiting for a
+# human approval, or starved of runners after an earlier job completed. Keep
+# the public CLI and complete GitHub pagination path in each observation.
+_mock_job_inventory() {
+    export JOB_FIXTURE_CASE="$1" GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+    jq -n --arg mode "$1" --arg old "$(_minutes_ago 60)" --arg fresh "$(_minutes_ago 1)" '
+        def job($id;$status):
+            {id:$id,run_id:555,run_attempt:2,status:$status,
+             head_sha:"1111111111111111111111111111111111111111",
+             started_at:(if $status == "queued" then null else $old end),completed_at:null};
+        if $mode == "running" then [job(1;"in_progress")]
+        elif $mode == "mixed" then [job(1;"in_progress"),job(2;"queued")]
+        elif $mode == "approval" then [job(1;"waiting"),job(2;"queued")]
+        elif $mode == "pending" then [job(1;"pending"),job(2;"queued")]
+        elif $mode == "recent-completion" then
+            [job(1;"completed") + {completed_at:$fresh},job(2;"queued")]
+        elif $mode == "recent-queue" then [job(1;"queued") + {created_at:$fresh}]
+        elif $mode == "empty" then []
+        elif $mode == "later-running" or $mode == "later-queued" or $mode == "later-error" or $mode == "duplicate" then
+            [range(1;101) | job(.;"completed") + {completed_at:$old}] +
+            [job(101;(if $mode == "later-running" then "in_progress" else "queued" end))]
+        elif $mode == "wrong-source" then [job(1;"queued") | .head_sha=("2"*40)]
+        elif $mode == "wrong-run" then [job(1;"queued") | .run_id=556]
+        elif $mode == "wrong-attempt" then [job(1;"queued") | .run_attempt=1]
+        elif $mode == "invalid-time" then [job(1;"queued") | .created_at="not-a-time"]
+        else [job(1;"queued")] end
+    ' > "$TEST_TMPDIR/job-history.json"
+    jq -n --arg old "$(_minutes_ago 60)" --arg mode "$1" '
+        {total_count:1,workflow_runs:[{id:555,status:"in_progress",created_at:$old,run_started_at:$old,
+         run_attempt:(if $mode == "latest" then null else 2 end),name:"Release",workflow_id:17,
+         path:".github/workflows/release.yml",head_branch:"v1.2.3",
+         head_sha:"1111111111111111111111111111111111111111",event:"push",
+         html_url:"https://github.com/Dicklesworthstone/ntm/actions/runs/555"}]}
+    ' > "$TEST_TMPDIR/job-workflow.json"
+    mock_command_script "gh" "$(cat <<'SCRIPT'
+printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
+[[ "$1" == auth ]] && exit 0
+[[ "$1" == api ]] || exit 99
+endpoint=""
+for arg in "$@"; do [[ "$arg" == repos/*/actions/* ]] && endpoint="$arg"; done
+if [[ "$endpoint" == *'/jobs?'* ]]; then
+    page=$(sed -nE 's/.*[?&]page=([0-9]+).*/\1/p' <<< "$endpoint")
+    [[ -n "$page" ]] || exit 99
+    if [[ "$JOB_FIXTURE_CASE" == later-error && "$page" == 2 ]]; then
+        echo 'gh: Bad gateway (HTTP 502)' >&2
+        exit 1
+    fi
+    jq --arg mode "$JOB_FIXTURE_CASE" --argjson page "$page" '
+        {total_count:length,jobs:.[(($page-1)*100):($page*100)]} |
+        if $mode == "cap" then .total_count=1001
+        elif $mode == "malformed" then .jobs={}
+        elif $mode == "short-page" then .total_count=2
+        elif $mode == "duplicate" and $page == 2 then .jobs[0].id=1
+        else . end' "$TEST_TMPDIR/job-history.json"
+elif [[ "$endpoint" == *status=in_progress* ]]; then
+    cat "$TEST_TMPDIR/job-workflow.json"
+elif [[ "$endpoint" == *status=queued* ]]; then
+    printf '%s\n' '{"total_count":0,"workflow_runs":[]}'
+else exit 99; fi
+SCRIPT
+)"
+}
+
+@test "job scan: long executing or approval-pending workflows do not trigger fallback" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in running mixed approval pending empty; do
+        _mock_job_inventory "$mode"
+        run _routing_dsr --json check ntm
+        assert_equal "0" "$status"
+        echo "$output" | jq -e '.details.throttled == [] and .details.healthy == ["Dicklesworthstone/ntm"]'
+    done
+    grep -q 'runs/555/attempts/2/jobs?per_page=100&page=1' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "job scan: stalled runner dispatch retains job IDs and workflow source" {
+    harness_create_config
+    _setup_repos_d
+    _mock_job_inventory queued
+    run _routing_dsr --json check ntm
+    assert_equal "1" "$status"
+    echo "$output" | jq -e '.details.throttled | length == 1 and
+        .[0].run_id == 555 and .[0].status == "in_progress" and
+        .[0].head_sha == ("1"*40) and .[0].queue_reason == "job_queue" and
+        .[0].queued_job_ids == [1] and .[0].queue_time_seconds > 3000'
+    echo "$output" > "$TEST_TMPDIR/job-result.json"
+    if python3 -c 'import jsonschema' 2>/dev/null; then
+        python3 -I - "$DSR_PROJECT_ROOT/schemas/check-details.json" "$TEST_TMPDIR/job-result.json" <<'PY'
+import json,sys,jsonschema
+jsonschema.validate(json.load(open(sys.argv[2]))['details'],json.load(open(sys.argv[1])))
+PY
+    fi
+}
+
+@test "job scan: recent queue creation or completed work restarts the queue clock" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in recent-completion recent-queue; do
+        _mock_job_inventory "$mode"
+        run _routing_dsr --json check ntm
+        assert_equal "0" "$status"
+        echo "$output" | jq -e '.details.throttled == []'
+    done
+}
+
+@test "job scan: later pages distinguish running work from runner starvation" {
+    harness_create_config
+    _setup_repos_d
+    _mock_job_inventory later-running
+    run _routing_dsr --json check ntm
+    assert_equal "0" "$status"
+    echo "$output" | jq -e '.details.throttled == []'
+    _mock_job_inventory later-queued
+    run _routing_dsr --json check ntm
+    assert_equal "1" "$status"
+    echo "$output" | jq -e '.details.throttled[0].queued_job_ids == [101]'
+    grep -q 'runs/555/attempts/2/jobs?per_page=100&page=2' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "job scan: missing attempt metadata explicitly selects only the latest jobs" {
+    harness_create_config
+    _setup_repos_d
+    _mock_job_inventory latest
+    run _routing_dsr --json check ntm
+    assert_equal "1" "$status"
+    grep -q 'runs/555/jobs?filter=latest&per_page=100&page=1' "$TEST_TMPDIR/gh.calls"
+}
+
+@test "job scan: incomplete malformed or mismatched inventories cannot authorize fallback" {
+    harness_create_config
+    _setup_repos_d
+    local mode
+    for mode in cap malformed short-page duplicate later-error wrong-source wrong-run wrong-attempt invalid-time; do
+        _mock_job_inventory "$mode"
+        run _routing_dsr --json check ntm
+        assert_equal "8" "$status"
+        echo "$output" | jq -e '.details.healthy == [] and .details.throttled == [] and
+            .details.skipped[0].reason == "failed to inspect workflow jobs"'
+    done
+}
+
 _routing_watch() {
     local check_json="$1"
     shift

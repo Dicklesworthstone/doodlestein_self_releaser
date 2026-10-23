@@ -436,6 +436,21 @@ makes that repository unreadable (`details.skipped`), never healthy. A known
 throttled run in another successfully checked repository still takes exit-code
 precedence over the unreadable repository.
 
+An in-progress run is not throttled solely because it has run for a long
+time. DSR reads the complete job inventory for that observed run attempt
+(or explicitly requests the latest jobs if the attempt is unavailable).
+At least one job must be queued, every other job must be completed, and
+the latest available run/job timestamp must exceed the threshold. Executing
+jobs and approval-pending jobs suppress this automatic fallback decision.
+Recent job creation or completion restarts the queue clock. Job inventories
+that cannot be fully read within the 1,000-job safety bound, contain invalid
+metadata, or disagree with the observed run/source/attempt are unreadable.
+
+Each throttled row includes `queue_reason: "workflow_queue"` for a queued
+workflow or `queue_reason: "job_queue"` for stalled job dispatch. The latter
+also includes the nonempty `queued_job_ids` array and measures
+`queue_time_seconds` from the latest available activity.
+
 **Exit codes:**
 - `0`: No throttling detected
 - `1`: Throttling detected (triggers fallback recommendation)

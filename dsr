@@ -1408,7 +1408,8 @@ EOF
                       run_id: .id, status: .status, queue_time_seconds: .age_seconds,
                       threshold_seconds: $threshold, created_at: .created_at,
                       started_at: .run_started_at, head_branch: .head_branch,
-                      head_sha: .head_sha, html_url: .html_url} |
+                      head_sha: .head_sha, html_url: .html_url,
+                      queue_reason: .queue_reason, queued_job_ids: .queued_job_ids} |
                      with_entries(select(.value != null))],
                  healthy: [$repos[] | select(.status == "ok") | .repo],
                  skipped: [$repos[] | select(.status == "error") |
@@ -1417,6 +1418,28 @@ EOF
     fi
 
     return "$summary_exit"
+}
+
+# Return the run with evidence of stalled job dispatch, or null while work is
+# executing/awaiting approval. Job timestamps are optional in GitHub responses;
+# the latest observed run/job activity provides a conservative queue baseline.
+_check_waiting_jobs() {
+    local repo="$1" run="$2" threshold="$3" now="$4" jobs run_id attempt
+    run_id=$(jq -r '.id' <<< "$run") || return 8
+    attempt=$(jq -r '.run_attempt // empty' <<< "$run") || return 8
+    jobs=$(gh_workflow_jobs "$repo" "$run_id" "$attempt") || return 8
+    printf '%s\n' "$run" "$jobs" | jq -sc --argjson now "$now" --argjson threshold "$threshold" '
+        .[0] as $run | .[1].jobs as $jobs |
+        if any($jobs[]; (.head_sha | ascii_downcase) != ($run.head_sha | ascii_downcase))
+        then error("job source differs from observed workflow") else . end |
+        ([($run.run_started_at // $run.created_at | fromdateiso8601)] +
+            [$jobs[] | .created_at,.started_at,.completed_at | select(. != null) | fromdateiso8601]) | max as $activity |
+        [$jobs[] | select(.status == "queued") | .id] as $queued |
+        if ($queued | length) > 0 and all($jobs[]; .status == "queued" or .status == "completed") and
+            $now - $activity > $threshold
+        then $run + {age_seconds:($now - $activity),queue_reason:"job_queue",queued_job_ids:$queued}
+        else null end
+    '
 }
 
 # Check a single repo for throttling
@@ -1462,8 +1485,8 @@ _check_repo() {
             {id: .id, status: .status, created_at: .created_at,
              workflow_id: .workflow_id, workflow_name: .name, path: .path,
              head_branch: .head_branch, head_sha: .head_sha,
-             event: .event, html_url: .html_url,
-             age_seconds: $age} +
+             run_attempt: .run_attempt, event: .event, html_url: .html_url,
+             age_seconds: $age, queue_reason:"workflow_queue"} +
             (if .status == "in_progress" then {run_started_at: .run_started_at} else {} end)
         ) |
         {queued_runs: map(select(.status == "queued")),
@@ -1480,6 +1503,27 @@ _check_repo() {
               workflow: (if $workflow == "" then null else $workflow end)}'
         return 8
     fi
+
+    # An elapsed workflow duration cannot distinguish runner starvation from
+    # a legitimate long compile. Only a complete job inventory showing queued
+    # jobs, no executing/approval-pending jobs, and no recent activity can do so.
+    local run checked
+    local -a waiting_runs=()
+    while IFS= read -r run; do
+        if ! checked=$(_check_waiting_jobs "$repo" "$run" "$threshold" "$now"); then
+            jq -nc --arg repo "$repo" --arg workflow "$workflow" \
+                '{repo:$repo,status:"error",error:"failed to inspect workflow jobs",
+                  workflow:(if $workflow == "" then null else $workflow end)}'
+            return 8
+        fi
+        [[ "$checked" == null ]] || waiting_runs+=("$checked")
+    done < <(jq -c '.stuck_runs[]' <<< "$result")
+    result=$({
+        printf '%s\n' "$result"
+        if ((${#waiting_runs[@]})); then printf '%s\n' "${waiting_runs[@]}"; fi
+    } | jq -sc '.[0] + {stuck_runs:.[1:]} |
+        .stuck_in_progress_count = (.stuck_runs | length) |
+        .status = (if .queued_count > 0 or .stuck_in_progress_count > 0 then "throttled" else "ok" end)') || return 8
 
     printf '%s\n' "$result"
     [[ "$(jq -r '.status' <<< "$result")" == "throttled" ]] && return 1 || return 0

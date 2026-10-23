@@ -971,6 +971,8 @@ gh_workflow_active_runs() {
                     (.run_started_at | type == "null" or type == "string") and
                     all([.name, .path, .head_branch, .event, .html_url][];
                         type == "null" or type == "string") and
+                    (.run_attempt | type == "null" or
+                        (type == "number" and . >= 1 and floor == . and . <= 9007199254740991)) and
                     (.workflow_id | type == "null" or
                         (type == "number" and . > 0 and floor == . and . <= 9007199254740991))))' \
                     <<< "$response" >/dev/null 2>&1; then
@@ -1009,6 +1011,67 @@ gh_workflow_active_runs() {
             add | reduce .[] as $run ({}; .[$run.id | tostring] = $run) | [.[]]') || return 8
     done
     printf '%s\n' "$runs" | jq -c '{total_count: length, workflow_runs: .}'
+}
+
+# Read every job in one observed workflow attempt. A running workflow may be
+# doing useful work for hours; its duration alone is not queue evidence.
+# Pin the attempt when available so a rerun cannot mix old and new job pages.
+# Usage: gh_workflow_jobs <owner/repo> <run_id> [attempt_number]
+gh_workflow_jobs() {
+    local repo="${1:-}" run_id="${2:-}" attempt="${3:-}"
+    if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
+          ! "$run_id" =~ ^[1-9][0-9]{0,15}$ ]] ||
+       { [[ -n "$attempt" ]] && [[ ! "$attempt" =~ ^[1-9][0-9]{0,15}$ ]]; }; then
+        _gh_log_error "Invalid repository, run or attempt for workflow-job listing"
+        return 4
+    fi
+    local endpoint="repos/$repo/actions/runs/$run_id" query='filter=latest&'
+    if [[ -n "$attempt" ]]; then
+        endpoint+="/attempts/$attempt"
+        query=''
+    fi
+    endpoint+='/jobs'
+    local jobs='[]' response page page_jobs count expected=0 total unique
+    for ((page = 1; page <= 10; page++)); do
+        response=$(gh_api "$endpoint?${query}per_page=100&page=$page" --no-cache) || {
+            _gh_log_error "Cannot read workflow jobs for $repo run $run_id (page $page)"
+            return 8
+        }
+        if ! jq -es --arg run "$run_id" --arg attempt "$attempt" '
+            def identifier: type == "number" and . > 0 and floor == . and . <= 9007199254740991;
+            length == 1 and (.[0] | type == "object" and
+                (.total_count | type == "number" and . >= 0 and floor == . and . <= 1000) and
+                (.jobs | type == "array" and length <= 100) and
+                .total_count >= (.jobs | length) and
+                all(.jobs[]; type == "object" and (.id | identifier) and
+                    (.run_id | identifier and tostring == $run) and
+                    (.status | IN("queued","in_progress","completed","waiting","pending","requested")) and
+                    (.head_sha | type == "string" and test("^[0-9a-fA-F]{40}$")) and
+                    (.run_attempt == null or (.run_attempt | identifier and
+                        ($attempt == "" or tostring == $attempt))) and
+                    all([.created_at,.started_at,.completed_at][]; type == "null" or type == "string")))
+            ' <<< "$response" >/dev/null 2>&1; then
+            _gh_log_error "Invalid or oversized workflow-job listing for $repo run $run_id (page $page)"
+            return 8
+        fi
+        total=$(jq -r '.total_count' <<< "$response") || return 8
+        ((total > expected)) && expected=$total
+        page_jobs=$(jq -c '.jobs' <<< "$response") || return 8
+        count=$(jq -r 'length' <<< "$page_jobs") || return 8
+        jobs=$(printf '%s\n' "$jobs" "$page_jobs" | jq -sc '
+            add | reduce .[] as $job ({}; .[$job.id | tostring] = $job) | [.[]]') || return 8
+        unique=$(jq -r 'length' <<< "$jobs") || return 8
+        if ((unique >= expected)); then
+            printf '%s\n' "$jobs" | jq -c '{total_count:length,jobs:.}'
+            return $?
+        fi
+        if ((count < 100)); then
+            _gh_log_error "Incomplete workflow-job listing for $repo run $run_id: found $unique of $expected"
+            return 8
+        fi
+    done
+    _gh_log_error "Workflow-job listing for $repo run $run_id exceeded the 1,000-job safety limit"
+    return 8
 }
 
 # Get a specific workflow run

@@ -65,6 +65,18 @@
           "minimum": 0,
           "description": "Time spent in queue"
         },
+        "queue_reason": {
+          "type": "string",
+          "enum": ["workflow_queue", "job_queue"],
+          "description": "Whether the workflow itself or its jobs are waiting for execution"
+        },
+        "queued_job_ids": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Queued jobs observed when an in-progress workflow has no executing or approval-pending jobs"
+        },
         "status": {
           "type": "string",
           "enum": ["queued", "in_progress", "completed"],
