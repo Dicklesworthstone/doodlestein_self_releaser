@@ -1037,6 +1037,21 @@ Singleton Rust compiler-target overrides must have a matching explicit
 `target_triples` entry; conflicting overrides fail generation. The generated
 runtime table requires no jq or yq on the installing machine.
 
+For a generic native Go release, an effective `CGO_ENABLED` value of `"0"` or numeric
+`0` declares a build without C-library dependencies. Generation merges global
+`env` with `cross_compile.<platform>.env`, with the platform value taking
+precedence. Only targets routed to native builds qualify: their `act_job_map`
+entry must be absent, empty, or null. Mapped act jobs control their own workflow
+environment and cannot inherit this declaration from native build settings;
+a `cross_compile.<platform>.method` hint does not override that routing.
+When there is no explicit target triple or strict release
+contract, automatic installation can select that platform's release on GNU,
+musl, or a host with unknown libc. An explicit `--libc` remains exact.
+Inline CGO/GOFLAGS overrides and shared build modes disable this inference.
+The archive, checksum and signature cache uses a separate `cgo-disabled`
+platform suffix; existing generic cache entries are not adopted under the
+new policy. Release integrity checks and source-build consent are unchanged.
+
 The generated installer's executable selection follows `workspace_binaries`
 and `workspace_binaries_by_target`. An explicit platform override replaces
 the global list, including an empty override. An empty or absent effective

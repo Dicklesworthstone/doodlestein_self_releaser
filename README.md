@@ -1151,6 +1151,20 @@ gets an independent archive/checksum/signature cache, including offline use.
 To install both variants, use target-qualified names: a nonprimary variant
 cannot be downloaded through a shared alias owned by the primary.
 `dsr config validate` rejects empty, duplicate or malformed triple lists.
+
+Generic native Go releases configured with `env.CGO_ENABLED: "0"` also install on
+musl systems and systems where libc detection is unavailable. The installer
+uses the effective setting after applying `cross_compile.<platform>.env`, so a
+platform can enable or disable this behavior independently. This requires native
+routing: an absent, empty, or null `act_job_map.<platform>` entry. An act workflow
+controls its own environment, so its mapped targets retain libc selection even
+when the native configuration disables CGO. Explicit target triples, strict release
+contracts, `--libc`, and build commands or Go flags that override the declared
+CGO policy retain their existing variant selection. These Go releases use
+separate verified cache entries, so an older platform cache cannot supply a
+potentially libc-dependent executable. Checksums and configured signatures
+remain required on every installation path.
+
 Strict native Rust releases can also build the complete GNU/musl matrix. Their
 contract names one exact primary for each configured triple, using the same
 `platform@triple` identity as the native task:

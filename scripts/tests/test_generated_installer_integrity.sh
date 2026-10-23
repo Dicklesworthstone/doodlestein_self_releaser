@@ -2,6 +2,10 @@
 # Exercise the generated installer, not copies of its verification functions.
 # Real tar archives and SHA256; only remote transports/minisign failure are fixtures.
 set -uo pipefail
+case "$#:${1:-}" in
+    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only) ;;
+    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only]\n' "$0" >&2; exit 4 ;;
+esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-install-integrity.XXXXXXXX") || exit 1
 trap 'rm -rf -- "$work"' EXIT
@@ -107,6 +111,259 @@ fi
 success() { [[ $status -eq 0 && -x "$case_dir/bin/demo" ]] && jq -es 'length == 1 and .[0].status == "success"' "$case_dir/out" >/dev/null; }
 blocked() { [[ $status -ne 0 && ! -e "$case_dir/bin/demo" && ! -e "$case_dir/cache/demo/v1.2.3/$os-$arch.tar.gz" ]]; }
 set_manifest() { printf '%s\n' "$1" > "$REMOTE/checksums.sha256"; }
+
+# Bounded routing coverage uses the executable protocol fixture above. The
+# separate compiler fixture below proves the genuine static Go installation;
+# these cases only establish which build strategy may declare that policy.
+test_static_go_routing() {
+    [[ "$os" == linux ]] || { printf 'note: Go routing cases require a Linux host\n'; return 0; }
+    local routing_root="$work/go-routing" routing_config="$DSR_CONFIG_DIR/repos.d/go-routing.yaml"
+    local routing_asset="go-routing-1.2.3-linux-$arch.tar.gz" routing_installer
+    local label mutation routing_case routing_status
+    local CALLS="$work/go-routing/calls" CURL_FAIL=0 GH_FAIL=0
+    export CALLS CURL_FAIL GH_FAIL
+    mkdir -p "$routing_root/detection" || return 1
+    tar -czf "$REMOTE/$routing_asset" -C "$work/payload" demo || return 1
+    printf '%s  %s\n' "$(sha256sum < "$REMOTE/$routing_asset" | awk '{print $1}')" "$routing_asset" \
+        > "$REMOTE/$routing_asset.sha256"
+    cat > "$routing_root/detection/ldd" <<'SH'
+#!/usr/bin/env bash
+printf 'musl libc\nVersion 1.2.5\n' >&2
+exit 1
+SH
+    chmod +x "$routing_root/detection/ldd" || return 1
+    local PATH="$routing_root/detection:$PATH"
+    export PATH
+    jq -n --arg platform "linux/$arch" '{
+        tool_name:"go-routing", repo:"example/go-routing", binary_name:"demo", language:"go",
+        targets:[$platform], build_cmd:"go build -o demo .", env:{CGO_ENABLED:"0"},
+        act_job_map:{($platform):null}, artifact_naming:"${name}-${version}-${os}-${arch}"
+    }' > "$routing_root/base.json" || return 1
+    for label in native-null native-absent native-empty other-platform-act act act-native-hint; do
+        case "$label" in
+            native-null) mutation='.' ;;
+            native-absent) mutation='del(.act_job_map)' ;;
+            native-empty) mutation='.act_job_map[$platform]=""' ;;
+            other-platform-act) mutation='.act_job_map["darwin/arm64"]="build-macos"' ;;
+            act) mutation='.act_job_map[$platform]="build-linux"' ;;
+            act-native-hint) mutation='.act_job_map[$platform]="build-linux" | .cross_compile={($platform):{method:"native"}}' ;;
+        esac
+        jq --arg platform "linux/$arch" "$mutation" "$routing_root/base.json" > "$routing_config" || return 1
+        routing_installer=$(install_gen_create go-routing 2>> "$routing_root/generate.log") || return 1
+        routing_case="$routing_root/$label"
+        mkdir -p "$routing_case" || return 1
+        : > "$CALLS"
+        routing_status=0
+        bash "$routing_installer" --version v1.2.3 --dir "$routing_case/bin" \
+            --cache-dir "$routing_case/cache" --non-interactive --json --no-skills \
+            > "$routing_case/out" 2> "$routing_case/err" || routing_status=$?
+        case "$label" in
+            act*)
+                check "$label cannot declare libc independence from native CGO settings" test "$routing_status" -eq 4
+                check "$label refuses before any release transport or installation" \
+                    bash -c '[[ ! -s "$1" && ! -e "$2" ]]' _ "$CALLS" "$routing_case/bin/demo"
+                ;;
+            *)
+                check "$label selects the configured portable routing path on musl" test "$routing_status" -eq 0
+                check "$label installs only the checksum-verified protocol fixture" \
+                    cmp -s "$work/payload/demo" "$routing_case/bin/demo"
+                check "$label uses the portable cache namespace" cmp -s "$REMOTE/$routing_asset" \
+                    "$routing_case/cache/go-routing/v1.2.3/linux-$arch-cgo-disabled.tar.gz"
+                ;;
+        esac
+    done
+}
+
+if [[ "${1:-}" == --static-go-routing-only ]]; then
+    test_static_go_routing || exit 1
+    printf 'Static Go routing: %s passed, %s failed\n' "$passed" "$failed"
+    [[ $failed -eq 0 ]]
+    exit $?
+fi
+
+# Compile a genuine no-CGO executable and install its real archive through
+# the generated public entry point. Only host-libc discovery and release
+# transport are substituted; hashes, signatures, cache and writes are real.
+test_static_go_installers() {
+    if [[ "$os" != linux ]]; then
+        printf 'note: static Go installer cases require a Linux host\n'
+        [[ "${1:-}" != required ]]; return
+    fi
+    local dependency
+    for dependency in go readelf yq jq minisign; do
+        if ! command -v "$dependency" >/dev/null; then
+            printf 'note: static Go installer cases require %s\n' "$dependency"
+            [[ "${1:-}" != required ]]; return
+        fi
+    done
+    local static_root="$work/static-go" static_config="$DSR_CONFIG_DIR/repos.d/portable-go.yaml"
+    local static_installer static_asset="portable-go-1.2.3-linux-$arch.tar.gz" static_hash
+    local static_cache static_case=0 static_case_dir static_status=0 mutation label
+    local static_key static_before
+    local CALLS="$work/static-go/calls" CURL_FAIL=0 GH_FAIL=0 MOCK_GO_LIBC=musl
+    export CALLS CURL_FAIL GH_FAIL MOCK_GO_LIBC
+    mkdir -p "$static_root/payload" "$static_root/detection" || return 1
+    cat > "$static_root/main.go" <<'GO'
+package main
+import "fmt"
+func main() { fmt.Println("static-go-release-v1") }
+GO
+    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" GOFLAGS='' GOENV=off GOWORK=off \
+        GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off \
+        GOCACHE="${DSR_TEST_GO_CACHE:-/tmp/dsr-test-go-cache}" \
+        go build -trimpath -o "$static_root/payload/demo" "$static_root/main.go" \
+        > "$static_root/build.out" 2> "$static_root/build.err" || {
+            cat "$static_root/build.err" >&2; return 1;
+        }
+    readelf -lW "$static_root/payload/demo" > "$static_root/program-headers" || return 1
+    readelf -dW "$static_root/payload/demo" > "$static_root/dynamic-section" || return 1
+    check 'real Go fixture has no ELF interpreter' bash -c '! grep -q INTERP "$1"' _ "$static_root/program-headers"
+    check 'real Go fixture has no shared-library dependencies' bash -c '! grep -q NEEDED "$1"' _ "$static_root/dynamic-section"
+    check 'real Go fixture executes' test "$("$static_root/payload/demo")" = static-go-release-v1
+    static_hash=$(sha256sum < "$static_root/payload/demo"); static_hash="${static_hash%% *}"
+    tar -czf "$REMOTE/$static_asset" -C "$static_root/payload" demo || return 1
+    printf '%s  %s\n' "$(sha256sum < "$REMOTE/$static_asset" | awk '{print $1}')" "$static_asset" \
+        > "$REMOTE/$static_asset.sha256"
+    cp "$REMOTE/$static_asset.sha256" "$static_root/good.sha256" || return 1
+    jq -n --arg platform "linux/$arch" '{
+        tool_name:"portable-go", repo:"example/portable-go", binary_name:"demo", language:"go",
+        targets:[$platform], build_cmd:"go build -trimpath -o demo .", env:{CGO_ENABLED:"0"},
+        act_job_map:{($platform):null},
+        artifact_naming:"${name}-${version}-${os}-${arch}", archive_format:"tar.gz"
+    }' > "$static_root/config.json" || return 1
+    cat > "$static_root/detection/ldd" <<'SH'
+#!/usr/bin/env bash
+printf 'libc ldd\n' >> "$CALLS"
+case "$MOCK_GO_LIBC" in
+    musl) printf 'musl libc\nVersion 1.2.5\n' >&2; exit 1 ;;
+    gnu) printf 'ldd (GNU libc) 2.36\n' ;;
+    *) printf 'unknown libc\n' >&2; exit 1 ;;
+esac
+SH
+    cat > "$static_root/detection/getconf" <<'SH'
+#!/usr/bin/env bash
+printf 'libc getconf\n' >> "$CALLS"
+exit 1
+SH
+    cat > "$static_root/detection/go" <<'SH'
+#!/usr/bin/env bash
+printf 'unexpected compiler invocation\n' >> "$CALLS"
+exit 99
+SH
+    chmod +x "$static_root/detection/ldd" "$static_root/detection/getconf" "$static_root/detection/go" || return 1
+    local PATH="$static_root/detection:$PATH"
+    export PATH
+    static_generate() {
+        jq --arg platform "linux/$arch" --arg asset "$static_asset" --arg key "${static_key:-}" \
+            "$1" "$static_root/config.json" > "$static_config" || return 1
+        static_installer=$(install_gen_create portable-go 2>> "$static_root/generate.log")
+    }
+    static_install() {
+        static_case=$((static_case + 1)); static_case_dir="$static_root/case-$static_case"
+        mkdir -p "$static_case_dir" || return 1
+        : > "$CALLS"
+        static_status=0
+        bash "$static_installer" --version v1.2.3 --dir "$static_case_dir/bin" \
+            --cache-dir "$static_cache" --non-interactive --json --no-skills "$@" \
+            > "$static_case_dir/out" 2> "$static_case_dir/err" || static_status=$?
+    }
+    static_success() {
+        [[ "$static_status" == 0 && -x "$static_case_dir/bin/demo" ]] &&
+            cmp -s "$static_root/payload/demo" "$static_case_dir/bin/demo" &&
+            [[ $("$static_case_dir/bin/demo") == static-go-release-v1 ]] &&
+            jq -es --arg sha "$static_hash" 'length == 1 and .[0].status == "success" and
+                .[0].binaries[0].sha256 == $sha' "$static_case_dir/out" >/dev/null
+    }
+    static_blocked() {
+        [[ "$static_status" == "$1" && ! -e "$static_case_dir/bin/demo" ]] &&
+            jq -es 'length == 1 and .[0].status == "error"' "$static_case_dir/out" >/dev/null
+    }
+    static_generate '.' || return 1
+    static_cache="$static_root/cache"
+    static_install
+    check 'CGO-disabled Go release installs on a musl host' static_success
+    check 'static Go selection needs no libc probe or compiler' bash -c '! grep -q "^libc \|compiler" "$1"' _ "$CALLS"
+    check 'static Go archive uses a cache separate from generic GNU artifacts' \
+        cmp -s "$REMOTE/$static_asset" "$static_cache/portable-go/v1.2.3/linux-$arch-cgo-disabled.tar.gz"
+    for MOCK_GO_LIBC in gnu unknown musl; do
+        static_install --offline
+        check "verified static Go cache installs with $MOCK_GO_LIBC libc" static_success
+        check "offline static Go install with $MOCK_GO_LIBC libc starts no transport or compiler" test ! -s "$CALLS"
+    done
+    # A pre-policy platform cache may contain a different, libc-dependent
+    # build. Its valid checksum is not evidence that it used CGO_ENABLED=0.
+    static_cache="$static_root/legacy-cache"
+    mkdir -p "$static_cache/portable-go/v1.2.3" || return 1
+    tar -czf "$static_cache/portable-go/v1.2.3/linux-$arch.tar.gz" -C "$work/payload" demo || return 1
+    static_before=$(sha256sum < "$static_cache/portable-go/v1.2.3/linux-$arch.tar.gz"); static_before="${static_before%% *}"
+    printf '%s  %s\n' "$static_before" "$static_asset" > "$static_cache/portable-go/v1.2.3/linux-$arch.tar.gz.sha256"
+    static_install
+    check 'musl install acquires the configured Go release instead of adopting an old generic cache' static_success
+    check 'legacy cache selection cannot suppress release acquisition' grep -q "$static_asset" "$CALLS"
+    printf 'corruption\n' >> "$static_cache/portable-go/v1.2.3/linux-$arch-cgo-disabled.tar.gz"
+    static_install --offline
+    check 'corrupted portable Go cache still fails integrity verification' static_blocked 1
+    check 'corrupted offline Go cache starts no fallback transport' test ! -s "$CALLS"
+    static_cache="$static_root/bad-checksum-cache"
+    printf '%064d  %s\n' 0 "$static_asset" > "$REMOTE/$static_asset.sha256"
+    static_install
+    check 'portable Go selection never bypasses checksum verification' static_blocked 1
+    cp "$static_root/good.sha256" "$REMOTE/$static_asset.sha256" || return 1
+
+    minisign -G -W -p "$static_root/key.pub" -s "$static_root/key.secret" >/dev/null 2>&1 || return 1
+    minisign -S -s "$static_root/key.secret" -m "$REMOTE/$static_asset" \
+        -x "$REMOTE/$static_asset.minisig" >/dev/null 2>&1 || return 1
+    static_key=$(tail -n 1 "$static_root/key.pub")
+    static_generate '.minisign_pubkey=$key' || return 1
+    static_cache="$static_root/signed-cache"
+    static_install --require-signatures
+    check 'static Go release installs with a genuine minisign signature' static_success
+    printf 'invalid signature\n' > "$REMOTE/$static_asset.minisig"
+    static_cache="$static_root/bad-signature-cache"
+    static_install --require-signatures
+    check 'portable Go selection refuses a corrupt signature' static_blocked 1
+
+    static_generate '.env.CGO_ENABLED="1" | .cross_compile={($platform):{env:{CGO_ENABLED:"0"}}}' || return 1
+    static_cache="$static_root/platform-zero-cache"
+    static_install
+    check 'platform CGO=0 overrides the global CGO=1 for installer selection' static_success
+    static_generate '.env.CGO_ENABLED=0' || return 1
+    static_cache="$static_root/numeric-zero-cache"
+    static_install
+    check 'numeric zero retains the build environment CGO=0 meaning' static_success
+
+    for label in enabled missing expression target-enabled target-null inline shared-flags act act-native-hint explicit-gnu strict; do
+        case "$label" in
+            enabled) mutation='.env.CGO_ENABLED="1"' ;;
+            missing) mutation='del(.env.CGO_ENABLED)' ;;
+            expression) mutation='.env.CGO_ENABLED="${DISABLE_CGO}"' ;;
+            target-enabled) mutation='.cross_compile={($platform):{env:{CGO_ENABLED:"1"}}}' ;;
+            target-null) mutation='.cross_compile={($platform):{env:{CGO_ENABLED:null}}}' ;;
+            inline) mutation='.build_cmd="CGO_ENABLED=1 go build -o demo ."' ;;
+            shared-flags) mutation='.env.GOFLAGS="-linkshared"' ;;
+            act) mutation='.act_job_map={($platform):"build-release"}' ;;
+            act-native-hint) mutation='.act_job_map={($platform):"build-release"} | .cross_compile={($platform):{method:"native"}}' ;;
+            explicit-gnu) mutation='.target_triples={($platform):((if $platform=="linux/amd64" then "x86_64" else "aarch64" end)+"-unknown-linux-gnu")}' ;;
+            strict) mutation='.release_contract={checksum_sidecar:"sha256",exact_primary_assets:{($platform):$asset}}' ;;
+        esac
+        static_generate "$mutation" || return 1
+        static_cache="$static_root/refused-$label-cache"
+        static_install
+        check "$label does not infer a libc-independent Go release" static_blocked 4
+        check "$label refusal precedes release acquisition" bash -c '! grep -q "^curl \|^gh " "$1"' _ "$CALLS"
+    done
+    static_generate '.' || return 1
+    static_cache="$static_root/explicit-libc-cache"
+    static_install --libc musl
+    check 'explicit --libc remains exact for a generic CGO-disabled Go release' static_blocked 4
+}
+
+if [[ "${1:-}" == --static-go-only ]]; then
+    test_static_go_installers required || exit 1
+    printf 'Static Go installer: %s passed, %s failed\n' "$passed" "$failed"
+    [[ $failed -eq 0 ]]
+    exit $?
+fi
 
 # Exact contracts can give GNU/musl unrelated names and different formats.
 # Exercise the emitted installer, real archive/raw bytes and checksum/cache
@@ -839,5 +1096,7 @@ else
 fi
 
 test_strict_contract_installers || exit 1
+test_static_go_routing || exit 1
+test_static_go_installers || exit 1
 printf 'Generated installer integrity: %s passed, %s failed\n' "$passed" "$failed"
 [[ $failed -eq 0 ]]

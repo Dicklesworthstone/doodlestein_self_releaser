@@ -428,6 +428,16 @@ __TARGET_TRIPLE_CASES__
     return 1
 }
 
+# Generic Go releases built with CGO disabled do not select a C-library ABI.
+# This table comes from the effective build configuration, never client env.
+# Explicit compiler targets and strict release contracts are not included.
+_libc_independent_go_platform() {
+    case "$1" in
+__LIBC_INDEPENDENT_GO_CASES__
+    esac
+    return 1
+}
+
 # Target triples released for a platform, primary first.
 _target_triple_candidates() {
     local os="$1" arch="$2"
@@ -482,6 +492,11 @@ _select_target_triple() {
         echo "${candidates%% *}"
         return 0
     fi
+    if [[ -z "$libc" ]] && _libc_independent_go_platform "$os/$arch"; then
+        _log_info "Using the Go release built with CGO disabled for $os/$arch"
+        echo "${candidates%% *}"
+        return 0
+    fi
     if [[ -z "$libc" ]] && ! libc=$(_detect_linux_libc); then
         _log_error "Cannot identify Linux libc; use --libc gnu or --libc musl to select a known variant"
         return 4
@@ -519,7 +534,11 @@ _fallback_target_triple() {
 
 _target_cache_platform() {
     local platform="$1"
-    if _configured_target_triples "${platform%/*}" "${platform#*/}" >/dev/null || [[ -n "$_LIBC" ]]; then
+    if [[ -z "$_LIBC" ]] && _libc_independent_go_platform "$platform"; then
+        # Do not adopt a generic cache made before the no-CGO build policy was
+        # embedded: those bytes may have required the original host's libc.
+        printf '%s/cgo-disabled\n' "$platform"
+    elif _configured_target_triples "${platform%/*}" "${platform#*/}" >/dev/null || [[ -n "$_LIBC" ]]; then
         printf '%s/%s\n' "$platform" "$_TARGET_TRIPLE"
     else
         printf '%s\n' "$platform"
@@ -2237,6 +2256,46 @@ _install_gen_workspace_cases() {
     printf ' ;;\n'
 }
 
+# A native Go build's global environment is followed by its platform environment.
+# Only an exact CGO_ENABLED=0 enables a generic, libc-independent installer.
+# An inline environment override or shared build mode makes that inference
+# ambiguous; explicit triples and strict asset inventories retain their ABI.
+# act workflows own their environment independently of these native settings.
+_install_gen_libc_independent_go_cases() {
+    local config_file="$1" language="$2" strict_contract="$3" platforms platform
+    [[ "$language" == go && "$strict_contract" == false ]] || return 0
+    # The scalar-only generator cannot safely infer nested environment policy.
+    command -v yq >/dev/null && command -v jq >/dev/null || return 0
+    if ! platforms=$(yq -o=json -I=0 '.' "$config_file" | jq -crs '
+        if length != 1 or (.[0] | type != "object") then error("invalid repo config") else .[0] end |
+        . as $config |
+        select((.env // {} | type) == "object" and
+               (.cross_compile // {} | type) == "object" and
+               (.act_job_map // {} | type) == "object") |
+        ["linux/amd64", "linux/arm64", "linux/386", "linux/armv7"][] as $platform |
+        ($config.act_job_map[$platform] // "") as $act_job |
+        select($act_job == "" or $act_job == "null") |
+        ($config.cross_compile[$platform] // {}) as $target |
+        select(($target | type) == "object" and ($target.env // {} | type) == "object") |
+        (($config.env // {}) + ($target.env // {})) as $env |
+        ($target.build_cmd // $config.build_cmd // "") as $command |
+        ($env.GOFLAGS // "") as $flags |
+        select(($env.CGO_ENABLED == "0" or $env.CGO_ENABLED == 0) and
+               ($config.target_triples // {} | has($platform) | not) and
+               ($command | type) == "string" and ($flags | type) == "string") |
+        select(($command | test("CGO_ENABLED|GOFLAGS|-linkshared|-buildmode") | not) and
+               ($flags | test("-linkshared|-buildmode") | not)) |
+        $platform
+    '); then
+        log_error "Cannot resolve the Go installer's effective CGO configuration"
+        return 4
+    fi
+    while IFS= read -r platform; do
+        [[ -n "$platform" ]] || continue
+        printf '        %s) return 0 ;;\n' "$platform"
+    done <<< "$platforms"
+}
+
 # The build contract accepts one archive format for every OS or an OS map.
 # Resolve that shape before embedding shell literals. `binary` describes raw
 # release bytes: Unix asset names have no extension, Windows names use .exe.
@@ -2391,7 +2450,7 @@ install_gen_create() {
     # Extract values
     local repo binary_name language workflow_path local_path
     local archive_linux archive_darwin archive_windows archive_formats
-    local artifact_naming linux_libc_fallback=none workspace_binary_cases
+    local artifact_naming linux_libc_fallback=none workspace_binary_cases libc_independent_go_cases
     local contract_model strict_release_contract=false contract_asset_cases=''
     local source_subdir source_entry source_package source_engine field value output_observation
 
@@ -2555,6 +2614,9 @@ install_gen_create() {
         done < <(jq -r '.[] | [.platform,.target_triple,.name,.format] | @tsv' <<< "$contract_model")
     fi
 
+    libc_independent_go_cases=$(_install_gen_libc_independent_go_cases \
+        "$config_file" "$language" "$strict_release_contract") || return $?
+
     # The minisign public key the installer verifies against. Releases signed
     # by dsr ship .minisig files; an installer generated without the key
     # would skip that verification without saying so.
@@ -2655,6 +2717,7 @@ install_gen_create() {
     template="${template//__CONTRACT_ASSET_CASES__/"$contract_asset_cases"}"
     template="${template//__MINISIGN_PUBKEY__/$minisign_pubkey}"
     template="${template//__TARGET_TRIPLE_CASES__/$target_triple_cases}"
+    template="${template//__LIBC_INDEPENDENT_GO_CASES__/"$libc_independent_go_cases"}"
     template="${template//__ARCH_ALIAS_CASES__/$arch_alias_cases}"
     template="${template//__WORKSPACE_BINARY_CASES__/"$workspace_binary_cases"}"
     template="${template//__SOURCE_LANGUAGE__/"$language"}"
@@ -2732,9 +2795,9 @@ install_gen_all() {
             log_info "Processing: $tool_name"
 
             if install_gen_create "$tool_name" >/dev/null 2>&1; then
-                ((count++))
+                count=$((count + 1))
             else
-                ((errors++))
+                errors=$((errors + 1))
                 log_warn "Failed: $tool_name"
             fi
         done
