@@ -16,6 +16,78 @@ sourcing the module to select an output root; the default is `./installers`.
 Success prints only the generated installer path to stdout. Diagnostics and
 retained-history paths go to stderr.
 
+## Optional source toolchain bootstrap
+
+Generated installers can build a pinned source revision with `--from-source`,
+or fall back to source when release discovery/download is unavailable with
+`--allow-source-build`. Both options explicitly authorize execution of repository
+and dependency build code. A failed release checksum or signature remains fatal;
+source fallback cannot bypass artifact verification.
+
+When a required compiler is missing, add **`--install-toolchain`** to prepare one
+inside that source attempt's private build directory:
+
+```bash
+# Build this release tag, preparing a compiler only if required.
+bash install.sh --from-source --version v1.2.3 --install-toolchain
+
+# Prefer a verified release; permit source fallback and a missing compiler.
+bash install.sh --allow-source-build --install-toolchain
+```
+
+`--install-toolchain` requires one of those source-consent options. `--yes` alone
+does not authorize source execution or compiler setup. The option does not force
+source compilation when a verified release is usable, and cannot be combined
+with source modes that require offline operation or signed release artifacts.
+
+Bootstrap supports Linux and macOS on amd64 and arm64. Source builds require
+Bash 4+, Git, jq, ps and SHA-256 tooling; compiler acquisition additionally needs
+curl, Go extraction needs tar, and Bun extraction needs unzip. System linkers and
+project-specific native dependencies must already be available. The installer
+does not install operating-system packages.
+
+Compiler selection comes from the selected source tree:
+
+| Language | Selection |
+|----------|-----------|
+| Go | An exact numeric `toolchain goX.Y.Z` takes precedence. Otherwise the `go` directive is used: an exact patch stays exact, while `X.Y` selects the newest stable patch in that minor. Unsupported or unavailable requirements fail. |
+| Rust | Rustup reads the repository's `rust-toolchain.toml` or legacy `rust-toolchain` file. Without one, the private installation selects stable. Ambient parent overrides are not adopted as project requirements. |
+| Bun / TypeScript | An exact numeric `packageManager: bun@X.Y.Z` is honored; otherwise an exact numeric `engines.bun` can pin the version. Unpinned recipes use the latest stable Bun release and must satisfy any declared engine range. Unsupported pins or incompatible ranges fail. |
+
+A working compiler already on PATH is preserved, including an older compiler
+that may subsequently fail the project's build requirements. Rustup proxies can
+exist without the selected compiler: with bootstrap consent, a bounded probe
+checks availability with automatic Rustup installation disabled. A missing
+selected compiler permits a private bootstrap; a probe timeout or interruption
+fails before downloading anything. Compiler upgrades are not implicit.
+
+Downloads use official HTTPS endpoints and verified SHA-256 metadata before
+execution. Go also verifies the advertised archive size and admits only regular
+files/directories under its expected archive root. Rust verifies rustup-init and
+then uses Rustup's official distribution handling. Bun verifies the selected
+archive against the official release checksum inventory; its optional PGP
+signature is not verified by this bootstrap. These checks trust the official
+HTTPS metadata source and do not turn a local source build into a signed release.
+
+The compiler, downloads and language homes stay under the new private build
+directory. Profiles, global compiler homes and system installation prefixes are
+not modified. Bootstrap uses the same per-command timeout and process-group
+supervision as source compilation. Failures retain diagnostics and cannot replace
+an installed application; successful temporary state follows the installer's
+existing cleanup policy. Source code execution is not sandboxed.
+
+Successful source receipts include a `toolchain` object when bootstrap was used,
+recording the compiler version, platform, distribution URL and verified hash.
+Temporary compiler paths are excluded from the public source receipt.
+
+The shared sourced API uses a separate explicit consent argument:
+
+```bash
+source src/install_source.sh
+install_source_build owner/repo refs/tags/v1.2.3 go app ./new-build \
+  --allow-build --install-toolchain --timeout 3600
+```
+
 ## Publication, failure and concurrent generation
 
 Generation validates the tool identifier before constructing configuration

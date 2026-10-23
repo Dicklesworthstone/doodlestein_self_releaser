@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Exercise the generated installer and embedded source engine together.
 # Git checkout/tag peeling and Go compilation are real. Only release HTTP
-# transports and selected command failures are fixtures; no network is used.
+# transports, compiler distribution delivery and selected command failures are
+# fixtures; no network is used. Bootstrap activation delegates to real Go below.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 for dependency in git jq go tar; do
@@ -134,6 +135,16 @@ while (($#)); do
 done
 printf 'curl %s\n' "$url" >> "$CALLS"
 case "$url" in
+    'https://go.dev/dl/?mode=json&include=all')
+        [[ "${BOOTSTRAP_MODE:-good}" != unavailable ]] || exit 22
+        [[ "${BOOTSTRAP_MODE:-good}" != timeout ]] || sleep 20
+        if [[ "${BOOTSTRAP_MODE:-good}" == bad-hash ]]; then
+            jq '.[0].files[0].sha256 = ("0" * 64)' "$BOOTSTRAP_METADATA" > "$dest"
+        else cp "$BOOTSTRAP_METADATA" "$dest"; fi
+        ;;
+    https://go.dev/dl/*.tar.gz)
+        cp "$BOOTSTRAP_ARCHIVE" "$dest"
+        ;;
     https://api.github.com/*/commits*|https://api.github.com/*/compare/*)
         [[ "$FRESHNESS_MODE" != private ]] || exit 22
         freshness-response "$url" > "$dest"
@@ -404,6 +415,88 @@ run_case freshness-racing-head good --allow-source-build --source-if-stale 0 --s
 check 'moving default branch does not change the selected source revision' equal "$status" 0
 check 'head race builds the original observed pin' source_json "$HEAD_PIN"
 check 'race fixture really advanced the branch' test "$("$GIT_REAL" -C "$SOURCE_UPSTREAM" rev-parse HEAD)" != "$HEAD_PIN"
+
+# Exercise the public missing-compiler route without using a live distribution.
+# The downloaded executable is an explicit boundary adapter: it verifies that
+# private activation occurred, then uses the real host Go installation/cache.
+# Source checkout, compilation, installed bytes and receipt validation are real.
+export BOOT_GO_ROOT BOOT_GO_CACHE="$GOCACHE" BOOT_GO_VERSION
+BOOT_GO_ROOT=$("$GO_REAL" env GOROOT)
+BOOT_GO_VERSION=$("$GO_REAL" env GOVERSION)
+[[ "$BOOT_GO_VERSION" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'A released Go compiler is required for bootstrap controls' >&2; exit 1; }
+printf '\ntoolchain %s\n' "$BOOT_GO_VERSION" >> "$TEMP/upstream/project/go.mod"
+"$GIT_REAL" -C "$TEMP/upstream" commit -qam 'pin bootstrap fixture compiler'
+"$GIT_REAL" -C "$TEMP/upstream" tag v2.0.0
+BOOT_PIN=$("$GIT_REAL" -C "$TEMP/upstream" rev-parse HEAD)
+mkdir -p "$TEMP/bootstrap/go/bin" "$TEMP/no-go"
+cat > "$TEMP/bootstrap/go/bin/go" <<'BOOT_GO'
+#!/usr/bin/env bash
+set -uo pipefail
+root="${0%/go/bin/go}"
+[[ "$0" == */toolchain/go/bin/go && "$GOROOT" == "$root/go" ]] || exit 91
+if [[ "$1" != version ]]; then
+    [[ "$GOPATH" == "$root/go-work" && "$GOCACHE" == "$root/go-cache" ]] || exit 92
+fi
+printf 'bootstrapped-go %s %s\n' "$0" "$*" >> "$CALLS"
+exec env GOROOT="$BOOT_GO_ROOT" GOCACHE="$BOOT_GO_CACHE" "$GO_REAL" "$@"
+BOOT_GO
+chmod +x "$TEMP/bootstrap/go/bin/go"
+export BOOTSTRAP_ARCHIVE="$TEMP/bootstrap/distribution.tar.gz" BOOTSTRAP_METADATA="$TEMP/bootstrap/releases.json"
+tar -czf "$BOOTSTRAP_ARCHIVE" -C "$TEMP/bootstrap" go || exit 1
+BOOT_DIGEST=$(_isb_sha256 "$BOOTSTRAP_ARCHIVE") || exit 1
+jq -nc --arg version "$BOOT_GO_VERSION" --arg os "$os" --arg arch "$arch" \
+    --arg sha "$BOOT_DIGEST" --argjson size "$(wc -c < "$BOOTSTRAP_ARCHIVE")" \
+    '[{version:$version,stable:true,files:[{os:$os,arch:$arch,kind:"archive",sha256:$sha,size:$size,
+      filename:($version + "." + $os + "-" + $arch + ".tar.gz")}]}]' > "$BOOTSTRAP_METADATA"
+for command in bash env git curl gh jq tar gzip sha256sum shasum uname getconf ldd awk sed grep tr cut \
+    head tail wc sort uniq dirname basename readlink realpath mkdir chmod mktemp cat cp mv rm date \
+    ps sleep find stat touch ln install; do
+    resolved=$(command -v "$command") || continue
+    ln -s "$resolved" "$TEMP/no-go/$command" || exit 1
+done
+check 'bootstrap fixture genuinely has no compiler on PATH' env PATH="$TEMP/no-go" bash -c '! command -v go'
+run_case bootstrap-no-source good --install-toolchain --yes
+check 'compiler consent alone does not authorize source code' equal "$status" 4
+check 'invalid compiler-only invocation makes no network calls' no_http
+PATH="$TEMP/no-go" run_case bootstrap-prefer-release good --allow-source-build --install-toolchain --version v1.0.0
+check 'compiler consent preserves verified release preference' equal "$status" 0
+check 'verified release needs neither Git nor a compiler' no_source
+run_case bootstrap-existing discovery-fail --from-source --version v1.0.0 --install-toolchain --source-timeout 60
+check 'available compiler is preserved with bootstrap consent' equal "$status" 0
+check 'available compiler causes no distribution download' no_http
+check 'existing compiler receipt does not claim bootstrap' jq -e '.source | has("toolchain") | not' "$CASE/out.json"
+PATH="$TEMP/no-go" run_case bootstrap-no-consent discovery-fail --from-source --version v2.0.0
+check 'missing compiler without separate consent fails' equal "$status" 3
+check 'missing compiler is not silently downloaded' no_http
+PATH="$TEMP/no-go" run_case bootstrap-go discovery-fail --from-source --version v2.0.0 --install-toolchain --source-timeout 60
+check 'authorized bootstrap completes a public source installation' equal "$status" 0
+check 'bootstrap source receipt retains the exact tag commit' source_json "$BOOT_PIN"
+check 'bootstrapped source executable really runs' equal "$("$CASE/install/app")" default-source-v2
+check 'source receipt binds verified compiler distribution without private paths' jq -e \
+    --arg sha "$BOOT_DIGEST" --arg version "$BOOT_GO_VERSION" --arg platform "$os/$arch" '
+    .source.toolchain | .method == "isolated-bootstrap" and .language == "go" and
+    .platform == $platform and .version == ("go version " + $version + " " + $platform) and
+    .distribution_sha256 == $sha and (.distribution_url | startswith("https://go.dev/dl/")) and
+    (has("root") | not) and (has("bin_dir") | not)' "$CASE/out.json"
+check 'selected private compiler actually executes the build' grep -Eq '^bootstrapped-go .*/toolchain/go/bin/go build ' "$CALLS"
+check 'bootstrap does not create a global compiler home' test ! -e "$HOME/go"
+mkdir -p "$TEMP/results/bootstrap-corrupt/install"
+printf 'preserved installation\n' > "$TEMP/results/bootstrap-corrupt/install/app"
+prior=$(_isb_sha256 "$TEMP/results/bootstrap-corrupt/install/app")
+BOOTSTRAP_MODE=bad-hash PATH="$TEMP/no-go" run_case bootstrap-corrupt discovery-fail \
+    --from-source --version v2.0.0 --install-toolchain --yes --source-timeout 60
+check 'bad compiler checksum is refused by the public installer' equal "$status" 7
+check 'failed compiler verification preserves an installed application' equal "$prior" "$(_isb_sha256 "$CASE/install/app")"
+check 'unverified compiler is never executed' bash -c '! grep -q "^bootstrapped-go " "$1"' _ "$CALLS"
+BOOTSTRAP_MODE=unavailable PATH="$TEMP/no-go" run_case bootstrap-unavailable discovery-fail \
+    --from-source --version v2.0.0 --install-toolchain --source-timeout 60
+check 'unavailable compiler distribution fails clearly' equal "$status" 8
+check 'unavailable compiler installs no partial application' test ! -e "$CASE/install/app"
+BOOTSTRAP_MODE=timeout PATH="$TEMP/no-go" run_case bootstrap-timeout discovery-fail \
+    --from-source --version v2.0.0 --install-toolchain --source-timeout 1
+check 'compiler bootstrap obeys source command timeout' equal "$status" 5
+check 'timed-out compiler installs no partial application' test ! -e "$CASE/install/app"
+check 'bootstrap timeout retains diagnostics' test -n "$(find "$CASE/tmp" -name toolchain.log.timeout -print)"
 
 # Invalid embedded source config must not clobber an existing generated file.
 original=$(_isb_sha256 "$INSTALLER")

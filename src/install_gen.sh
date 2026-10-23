@@ -75,6 +75,7 @@ _install_gen_template() {
 #   --prefer-gh              Prefer gh release download for private repos
 #   --from-source            Build source instead of downloading (explicit code-execution consent)
 #   --allow-source-build     Allow source fallback when discovery/download is unavailable
+#   --install-toolchain      With source consent: bootstrap a missing compiler for this build
 #   --source-ref REF         With --from-source: HEAD, full SHA, refs/heads/* or refs/tags/*
 #   --source-timeout SECONDS  Per-command source-build limit (default: 3600)
 #   --source-if-stale N       With --allow-source-build: build head if latest is >N commits behind
@@ -142,6 +143,7 @@ _PREFER_GH=false
 _SKIP_SKILLS=false
 _FROM_SOURCE=false
 _ALLOW_SOURCE_BUILD=false
+_INSTALL_TOOLCHAIN=false
 _SOURCE_REF=""
 _SOURCE_TIMEOUT=3600
 _SOURCE_RECEIPT=null
@@ -1333,6 +1335,7 @@ _install_from_source() {
         trap _cleanup_temp_dir EXIT
     fi
     local args=(--allow-build --subdir "$SOURCE_SUBDIR" --timeout "$_SOURCE_TIMEOUT")
+    $_INSTALL_TOOLCHAIN && args+=(--install-toolchain)
     [[ -z "$SOURCE_ENTRY" ]] || args+=(--entry "$SOURCE_ENTRY")
     [[ -z "$SOURCE_PACKAGE" ]] || args+=(--package "$SOURCE_PACKAGE")
     for name in "${_INSTALL_NAMES[@]}"; do args+=(--bin "$name"); done
@@ -1469,6 +1472,10 @@ main() {
                 _ALLOW_SOURCE_BUILD=true
                 shift
                 ;;
+            --install-toolchain)
+                _INSTALL_TOOLCHAIN=true
+                shift
+                ;;
             --prefer-source-if-stale)
                 prefer_stale=true
                 shift
@@ -1541,6 +1548,10 @@ main() {
     fi
     if $_ALLOW_SOURCE_BUILD && { $_OFFLINE_MODE || $_REQUIRE_SIGNATURES; }; then
         _log_error "Source builds cannot satisfy --offline or --require-signatures"
+        return 4
+    fi
+    if $_INSTALL_TOOLCHAIN && ! $_ALLOW_SOURCE_BUILD; then
+        _log_error "--install-toolchain requires --from-source or --allow-source-build"
         return 4
     fi
     if [[ -n "$_VERSION" ]] && ! _valid_release_version "$_VERSION"; then
@@ -2452,7 +2463,7 @@ install_gen_create() {
     local archive_linux archive_darwin archive_windows archive_formats
     local artifact_naming linux_libc_fallback=none workspace_binary_cases libc_independent_go_cases
     local contract_model strict_release_contract=false contract_asset_cases=''
-    local source_subdir source_entry source_package source_engine field value output_observation
+    local source_subdir source_entry source_package source_engine toolchain_engine field value output_observation
 
     local identities
     identities=$(_install_gen_identities "$config_file" "$tool_name") || return $?
@@ -2471,6 +2482,9 @@ install_gen_create() {
     # shellcheck source=SCRIPTDIR/install_source.sh
     source "$_IG_SCRIPT_DIR/install_source.sh" || return 3
     source_engine=$(cat "$_IG_SCRIPT_DIR/install_source.sh") || return 3
+    [[ -f "$_IG_SCRIPT_DIR/toolchain_detect.sh" && ! -L "$_IG_SCRIPT_DIR/toolchain_detect.sh" ]] || return 3
+    toolchain_engine=$(cat "$_IG_SCRIPT_DIR/toolchain_detect.sh") || return 3
+    source_engine="$toolchain_engine"$'\n'"$source_engine"
     [[ -n "$source_engine" && "$language" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] || return 4
     for field in source_subdir source_entry source_package; do
         value=$(_install_gen_yaml_get "$config_file" "$field" "") || return 4

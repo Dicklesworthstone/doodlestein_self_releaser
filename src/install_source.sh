@@ -2,15 +2,17 @@
 # install_source.sh - pinned, opt-in source builds for standalone installers.
 # Embedded by install_gen.sh; no DSR installation is needed on the client.
 # Source builds execute repository/dependency build code. They are NOT signed
-# release artifacts, and this module never installs or upgrades a toolchain.
+# release artifacts. A missing compiler is installed only with separate
+# --install-toolchain consent, inside this source attempt's private directory.
 #
 # install_source_build owner/repo ref language binary new_directory --allow-build
 #   [--subdir relative/path] [--entry relative/path] [--package cargo_package]
-#   [--bin name ...] [--timeout seconds]
+#   [--bin name ...] [--timeout seconds] [--install-toolchain]
 # Timeout applies to each fetch/compiler command, including its children.
 # stdout: one receipt JSON after a successful build; stderr: progress/errors.
 # Exit: 3 missing dependency, 4 invalid input, 5 timeout/interruption,
-#       6 build failure, 8 source retrieval failure, 1 local I/O failure.
+#       6 build failure, 7 distribution verification, 8 retrieval failure,
+#       1 local I/O failure.
 
 _isb_log() { printf '[source-build] %s\n' "$*" >&2; }
 
@@ -287,6 +289,77 @@ install_source_freshness() (
     printf '%s\n' "$decision"
 )
 
+# A rustup proxy can exist without its selected compiler. Probe that compiler
+# without granting rustup permission to install into the user's existing home.
+_isb_probe_rust() (
+    export RUSTUP_AUTO_INSTALL=0
+    cd "$1" || return 4
+    rustc -vV && cargo --version
+)
+
+# Activate an explicitly requested bootstrap only when a compiler is missing.
+# This runs inside _isb_compile's subshell, so PATH and language homes never
+# escape the source attempt or replace the caller's installed toolchain.
+_isb_prepare_toolchain() {
+    local language="$1" tree="$2" output="$3" limit="$4" command root bin source_dir status=0
+    case "$language" in rust) command=cargo ;; go) command=go ;; *) command=bun ;; esac
+    if command -v "$command" >/dev/null 2>&1 &&
+       { [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1; }; then
+        if [[ "$language" != rust || "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ]]; then
+            return 0
+        fi
+        # A working installed compiler is preserved even if it is too old for
+        # the project. An unavailable rustup-selected compiler is a missing
+        # toolchain; bootstrap it privately instead of changing that rustup home.
+        _isb_run "$limit" "$output/toolchain-probe.log" _isb_probe_rust "$tree" || status=$?
+        ((status != 0)) || return 0
+        [[ "$status" != 5 ]] || return 5
+        _isb_log 'The existing Rust commands do not provide the selected compiler; preparing an isolated toolchain'
+    fi
+    if [[ "${_ISB_INSTALL_TOOLCHAIN:-false}" != true ]]; then
+        _isb_log "Missing $command; --install-toolchain permits an isolated compiler for this build"
+        return 3
+    fi
+    if ! declare -F toolchain_bootstrap >/dev/null 2>&1; then
+        source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+        [[ -f "$source_dir/toolchain_detect.sh" && ! -L "$source_dir/toolchain_detect.sh" ]] || return 3
+        # shellcheck source=SCRIPTDIR/toolchain_detect.sh
+        source "$source_dir/toolchain_detect.sh" || return 3
+    fi
+    root="$output/toolchain"
+    _isb_log "Preparing a private $language toolchain; existing installations and profiles are preserved"
+    _isb_run "$limit" "$output/toolchain.log" toolchain_bootstrap \
+        "$language" "$tree" "$root" --allow-install || return $?
+    [[ "$language" != typescript ]] || language=bun
+    case "$language" in rust) bin="$root/cargo/bin" ;; go) bin="$root/go/bin" ;; bun) bin="$root/bun/bin" ;; esac
+    [[ -f "$root/receipt.json" && ! -L "$root/receipt.json" && -d "$bin" && ! -L "$bin" ]] || return 7
+    jq -es --arg root "$root" --arg bin "$bin" --arg language "$language" '
+        length == 1 and (.[0] | .schema_version == 1 and .method == "isolated-bootstrap" and
+        .root == $root and .bin_dir == $bin and .language == $language and
+        (.version | type == "string" and length > 0) and
+        (.distribution_url | type == "string" and startswith("https://")) and
+        (.distribution_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        ((.rustup_toolchain // "") == "" or .rustup_toolchain == "stable"))
+    ' "$root/receipt.json" >/dev/null || return 7
+    export PATH="$bin:$PATH"
+    hash -r
+    case "$language" in
+        rust)
+            export CARGO_HOME="$root/cargo" RUSTUP_HOME="$root/rustup" RUSTUP_AUTO_INSTALL=0
+            unset RUSTUP_TOOLCHAIN
+            if [[ "$(jq -r '.rustup_toolchain // ""' "$root/receipt.json")" == stable ]]; then
+                export RUSTUP_TOOLCHAIN=stable
+            fi
+            ;;
+        go)
+            export GOROOT="$root/go" GOPATH="$root/go-work" GOCACHE="$root/go-cache"
+            ;;
+        bun)
+            export BUN_INSTALL="$root/bun" BUN_INSTALL_CACHE_DIR="$root/bun/cache"
+            ;;
+    esac
+}
+
 # Build only the requested executable family, into a new private output directory.
 # Never run arbitrary command strings from installer configuration.
 _isb_compile() (
@@ -297,12 +370,14 @@ _isb_compile() (
     [[ "$language" == rust || ${#binaries[@]} -eq 1 ]] || return 4
     local status=0 host target name mod=readonly
     cd "$tree" || return 4
+    _isb_prepare_toolchain "$language" "$tree" "$output" "$limit" || return $?
     binary=$(_isb_binary_name "$binary") || return 4
     case "$language" in
         rust)
             [[ -f Cargo.toml && ! -L Cargo.toml ]] || return 4
             # rustup proxies may auto-install a missing repository-selected
-            # toolchain. Source consent never grants toolchain installation.
+            # toolchain. Any separately authorized bootstrap is already active;
+            # never let a proxy modify an existing global installation.
             # https://rust-lang.github.io/rustup/environment-variables.html
             export RUSTUP_AUTO_INSTALL=0
             _isb_run "$limit" "$output/compiler.log" rustc -vV || { status=$?; [[ $status == 5 ]] && return 5; return 6; }
@@ -416,11 +491,12 @@ install_source_build() (
     local repo="${1:-}" ref="${2:-}" language="${3:-}" binary="${4:-}" destination="${5:-}"
     [[ $# -ge 5 ]] || return 4
     shift 5
-    local allow=false subdir=. entry='' package='' limit=3600
+    local allow=false subdir=. entry='' package='' limit=3600 _ISB_INSTALL_TOOLCHAIN=false
     local -a binaries=()
     while (($#)); do
         case "$1" in
             --allow-build) allow=true; shift ;;
+            --install-toolchain) _ISB_INSTALL_TOOLCHAIN=true; shift ;;
             --subdir|--entry|--package|--timeout|--bin)
                 [[ $# -ge 2 && -n "$2" ]] || return 4
                 case "$1" in
@@ -485,8 +561,10 @@ install_source_build() (
         command -v "$tool" >/dev/null 2>&1 || { _isb_log "Required source-build dependency missing: $tool"; return 3; }
     done
     case "$language" in rust) tool=cargo ;; go) tool=go ;; *) tool=bun ;; esac
-    command -v "$tool" >/dev/null 2>&1 || { _isb_log "Install $tool before building from source; existing toolchains are never modified"; return 3; }
-    [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1 || return 3
+    if ! $_ISB_INSTALL_TOOLCHAIN; then
+        command -v "$tool" >/dev/null 2>&1 || { _isb_log "Install $tool first, or opt in with --install-toolchain"; return 3; }
+        [[ "$language" != rust ]] || command -v rustc >/dev/null 2>&1 || return 3
+    fi
     if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then return 3; fi
     _isb_ref "$ref" || { _isb_log 'Use HEAD, a full commit SHA, refs/heads/<branch>, or refs/tags/<tag>'; return 4; }
     [[ -n "$destination" && ! -e "$destination" && ! -L "$destination" && "$destination" != */ ]] || return 4
@@ -541,13 +619,19 @@ install_source_build() (
     [[ $index -eq ${#binary_names[@]} && -n "$primary_payload" ]] || return 6
     payload="$primary_payload"; sha="$primary_sha"; size="$primary_size"
     binaries_json=$(printf '%s\n' "${binary_receipts[@]}" | jq -sc '.') || return 1
+    local toolchain_receipt=null
+    if [[ -f "$output/toolchain/receipt.json" ]]; then
+        toolchain_receipt=$(jq -ce 'del(.root,.bin_dir)' "$output/toolchain/receipt.json") || return 7
+    fi
     receipt=$(jq -nc --arg repo "$repo" --arg ref "$ref" --arg commit "$commit" \
         --arg language "$language" --arg path "$payload" --arg sha "$sha" --argjson size "$size" \
         --argjson binaries "$binaries_json" \
+        --argjson toolchain "$toolchain_receipt" \
         --arg compiler "$(cat "$output/compiler.log")" \
         '{schema_version:1,method:"source",repository:$repo,requested_ref:$ref,source_commit:$commit,
           language:$language,path:$path,sha256:$sha,size_bytes:$size,compiler:$compiler,
-          binaries:$binaries,signed_release:false}') || return 1
+          binaries:$binaries,signed_release:false} +
+          (if $toolchain == null then {} else {toolchain:$toolchain} end)') || return 1
     (set -C; printf '%s\n' "$receipt" > "$destination/receipt.json") || return 1
     _isb_log "Built $binary; SHA256 $sha (locally built, not a signed release)"
     printf '%s\n' "$receipt"

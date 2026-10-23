@@ -113,6 +113,8 @@ run_test() {
   local test_name="$1"
   local test_func="$2"
 
+  [[ -z "${DSR_TOOLCHAIN_TEST_FILTER:-}" || "$test_name" == *"$DSR_TOOLCHAIN_TEST_FILTER"* ]] || return 0
+
   ((TESTS_RUN++))
   echo -n "  $test_name... "
 
@@ -555,6 +557,306 @@ test_install_urls_https() {
 }
 
 # ============================================================================
+# Isolated Source-Toolchain Bootstrap
+# ============================================================================
+
+# Distribution HTTP is a declared boundary fixture. Checksums, JSON selection,
+# tar/zip admission, private activation and timeout handling use real code/tools.
+bootstrap_fixture() {
+  BOOT_CASE=$(mktemp -d "$TEMP_DIR/bootstrap.XXXXXXXX") || return 1
+  export BOOT_CASE BOOT_ROOT="$BOOT_CASE/output" BOOT_CALLS="$BOOT_CASE/calls"
+  export BOOT_PLATFORM=linux/amd64 BOOT_LIBC=gnu
+  mkdir -p "$BOOT_CASE/tree" "$BOOT_CASE/go/bin" "$BOOT_CASE/rust" "$BOOT_CASE/bun-linux-x64-baseline"
+  printf 'module example.invalid/bootstrap\ngo 1.22\n' > "$BOOT_CASE/tree/go.mod"
+  printf '{"packageManager":"bun@1.2.3","engines":{"bun":"^1.2.0"}}\n' > "$BOOT_CASE/tree/package.json"
+  cat > "$BOOT_CASE/go/bin/go" <<'GO'
+#!/usr/bin/env bash
+printf 'go %s\n' "$*" >> "$BOOT_CALLS"
+touch "$BOOT_CASE/executed"
+[[ "$1" == version && "$GOROOT" == "$BOOT_ROOT/go" && "$GOENV" == off && "$GOTOOLCHAIN" == local ]] || exit 70
+printf 'go version go1.22.2 %s\n' "$BOOT_PLATFORM"
+GO
+  chmod +x "$BOOT_CASE/go/bin/go"
+  tar -czf "$BOOT_CASE/go.tar.gz" -C "$BOOT_CASE" go || return 1
+  bootstrap_go_metadata || return 1
+  cat > "$BOOT_CASE/rustup-init" <<'RUSTUP'
+#!/usr/bin/env bash
+printf 'rustup-init %s\n' "$*" >> "$BOOT_CALLS"
+printf 'Rustup installer informational stdout\n'
+touch "$BOOT_CASE/executed"
+[[ "$*" == '-y --no-modify-path --profile minimal --default-toolchain none --default-host x86_64-unknown-linux-gnu' ]] || exit 71
+[[ "$CARGO_HOME" == "$BOOT_ROOT/cargo" && "$RUSTUP_HOME" == "$BOOT_ROOT/rustup" && "$RUSTUP_AUTO_INSTALL" == 0 ]] || exit 72
+[[ "$RUSTUP_DIST_SERVER" == https://static.rust-lang.org && "$RUSTUP_UPDATE_ROOT" == https://static.rust-lang.org/rustup ]] || exit 73
+mkdir -p "$CARGO_HOME/bin" "$RUSTUP_HOME" || exit 74
+cp "$BOOT_CASE/rust/"* "$CARGO_HOME/bin/" || exit 74
+RUSTUP
+  cat > "$BOOT_CASE/rust/rustup" <<'RUSTUP'
+#!/usr/bin/env bash
+printf 'rustup %s %s\n' "$PWD" "$*" >> "$BOOT_CALLS"
+printf 'Selected toolchain installation summary\n'
+case "$*" in
+    'toolchain install --profile minimal') [[ -z "${RUSTUP_TOOLCHAIN:-}" ]] ;;
+    'default stable') [[ "${RUSTUP_TOOLCHAIN:-}" == stable ]] ;;
+    *) exit 75 ;;
+esac
+RUSTUP
+  cat > "$BOOT_CASE/rust/rustc" <<'RUSTC'
+#!/usr/bin/env bash
+printf 'rustc %s\n' "${RUSTUP_TOOLCHAIN:-repository}" >> "$BOOT_CALLS"
+printf 'rustc 1.82.0 (fixture)\n'
+RUSTC
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$BOOT_CASE/rust/cargo"
+  chmod +x "$BOOT_CASE/rustup-init" "$BOOT_CASE/rust/"*
+  printf '%s  rustup-init\n' "$(_tc_bootstrap_sha256 "$BOOT_CASE/rustup-init")" > "$BOOT_CASE/rustup-init.sha256"
+  cat > "$BOOT_CASE/bun-linux-x64-baseline/bun" <<'BUN'
+#!/usr/bin/env bash
+printf 'bun %s\n' "$*" >> "$BOOT_CALLS"
+touch "$BOOT_CASE/executed"
+case "$1" in
+    --version) printf '1.2.3\n' ;;
+    --eval) [[ "${DSR_BOOTSTRAP_BUN_RANGE:-}" == '^1.2.0' && "${BOOT_ENGINE_FAIL:-false}" != true ]] ;;
+    *) exit 76 ;;
+esac
+BUN
+  chmod +x "$BOOT_CASE/bun-linux-x64-baseline/bun"
+  (cd "$BOOT_CASE" && zip -q -r bun.zip bun-linux-x64-baseline) || return 1
+  printf '%s  bun-linux-x64-baseline.zip\n' "$(_tc_bootstrap_sha256 "$BOOT_CASE/bun.zip")" > "$BOOT_CASE/SHASUMS256.txt"
+  _tc_detect_platform() { printf '%s\n' "$BOOT_PLATFORM"; }
+  _tc_bootstrap_linux_libc() { printf '%s\n' "$BOOT_LIBC"; }
+  curl() {
+    local url='' output='' proto=false redirects=false
+    while (($#)); do
+      case "$1" in
+        -o) output="$2"; shift 2 ;;
+        --proto) [[ "$2" == '=https' ]] || return 90; proto=true; shift 2 ;;
+        --proto-redir) [[ "$2" == '=https' ]] || return 90; redirects=true; shift 2 ;;
+        https://*) url="$1"; shift ;;
+        *) shift ;;
+      esac
+    done
+    $proto && $redirects && [[ "$output" == "$BOOT_ROOT/"* ]] || return 91
+    printf '%s\n' "$url" >> "$BOOT_CASE/requests"
+    [[ "${BOOT_TRANSPORT_FAIL:-false}" != true ]] || return 22
+    case "$url" in
+      'https://go.dev/dl/?mode=json&include=all') cp "$BOOT_CASE/go.json" "$output" ;;
+      https://go.dev/dl/go1.22.2.*.tar.gz) cp "$BOOT_CASE/go.tar.gz" "$output" ;;
+      https://static.rust-lang.org/rustup/dist/*/rustup-init.sha256) cp "$BOOT_CASE/rustup-init.sha256" "$output" ;;
+      https://static.rust-lang.org/rustup/dist/*/rustup-init) cp "$BOOT_CASE/rustup-init" "$output" ;;
+      https://github.com/oven-sh/bun/releases/download/bun-v1.2.3/SHASUMS256.txt) cp "$BOOT_CASE/SHASUMS256.txt" "$output" ;;
+      https://github.com/oven-sh/bun/releases/download/bun-v1.2.3/bun-linux-x64-baseline.zip) cp "$BOOT_CASE/bun.zip" "$output" ;;
+      *) return 22 ;;
+    esac
+  }
+}
+
+bootstrap_go_metadata() {
+  local digest size
+  digest=$(_tc_bootstrap_sha256 "$BOOT_CASE/go.tar.gz") || return 1
+  size=$(wc -c < "$BOOT_CASE/go.tar.gz") || return 1
+  jq -n --arg sha "$digest" --argjson size "$size" --arg platform "$BOOT_PLATFORM" '
+    ["go1.21.9","go1.22.1","go1.22.2","go1.23.0"] | map(. as $version |
+      {version:$version,stable:true,files:[{os:($platform|split("/")[0]),
+       arch:($platform|split("/")[1]),kind:"archive",sha256:$sha,size:$size,
+       filename:($version + "." + ($platform|gsub("/";"-")) + ".tar.gz")}]})
+  ' > "$BOOT_CASE/go.json"
+}
+
+bootstrap_run() {
+  BOOT_STATUS=0
+  toolchain_bootstrap "$1" "$BOOT_CASE/tree" "$BOOT_CASE/output" --allow-install \
+    > "$BOOT_CASE/result.json" 2> "$BOOT_CASE/result.log" || BOOT_STATUS=$?
+}
+
+test_bootstrap_requires_consent() (
+  bootstrap_fixture || return 1
+  local status=0
+  toolchain_bootstrap go "$BOOT_CASE/tree" "$BOOT_CASE/output" > "$BOOT_CASE/refused" || status=$?
+  [[ "$status" == 4 && ! -e "$BOOT_CASE/output" && ! -e "$BOOT_CASE/requests" ]]
+)
+
+test_bootstrap_go_minor_selection() (
+  bootstrap_fixture || return 1
+  local prior_path="$PATH" prior_home="$HOME"
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 0 && "$PATH" == "$prior_path" && "$HOME" == "$prior_home" ]] || return 1
+  jq -e --arg root "$BOOT_CASE/output" '.method == "isolated-bootstrap" and .root == $root and
+    .version == "go version go1.22.2 linux/amd64" and
+    .distribution_url == "https://go.dev/dl/go1.22.2.linux-amd64.tar.gz"' "$BOOT_CASE/result.json" >/dev/null &&
+    cmp -s "$BOOT_CASE/result.json" "$BOOT_CASE/output/receipt.json"
+)
+
+test_bootstrap_go_exact_pin() (
+  bootstrap_fixture || return 1
+  printf 'module example.invalid/bootstrap\ngo 1.21.0\ntoolchain go1.22.2\n' > "$BOOT_CASE/tree/go.mod"
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 0 ]] && grep -q 'go1.22.2.linux-amd64.tar.gz' "$BOOT_CASE/requests"
+)
+
+test_bootstrap_go_macos_arm() (
+  bootstrap_fixture || return 1
+  BOOT_PLATFORM=darwin/arm64
+  bootstrap_go_metadata || return 1
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 0 ]] && jq -e '.platform == "darwin/arm64" and
+    .distribution_url == "https://go.dev/dl/go1.22.2.darwin-arm64.tar.gz"' "$BOOT_CASE/result.json" >/dev/null
+)
+
+test_bootstrap_go_bad_integrity() (
+  bootstrap_fixture || return 1
+  case "$1" in
+    hash) jq 'map(.files[0].sha256 = ("0" * 64))' "$BOOT_CASE/go.json" > "$BOOT_CASE/changed.json" ;;
+    size) jq 'map(.files[0].size += 1)' "$BOOT_CASE/go.json" > "$BOOT_CASE/changed.json" ;;
+    duplicate) jq '. + [.[2]]' "$BOOT_CASE/go.json" > "$BOOT_CASE/changed.json" ;;
+    malformed) printf '{}\n' > "$BOOT_CASE/changed.json" ;;
+  esac
+  cp "$BOOT_CASE/changed.json" "$BOOT_CASE/go.json"
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 7 && ! -e "$BOOT_CASE/executed" && ! -e "$BOOT_CASE/output/receipt.json" ]]
+)
+
+test_bootstrap_go_hash() { test_bootstrap_go_bad_integrity hash; }
+test_bootstrap_go_size() { test_bootstrap_go_bad_integrity size; }
+test_bootstrap_go_duplicates() { test_bootstrap_go_bad_integrity duplicate; }
+test_bootstrap_go_malformed() { test_bootstrap_go_bad_integrity malformed; }
+
+test_bootstrap_go_link_refused() (
+  bootstrap_fixture || return 1
+  mkdir -p "$BOOT_CASE/linked/go/bin"
+  ln -s /bin/true "$BOOT_CASE/linked/go/bin/go"
+  tar -czf "$BOOT_CASE/go.tar.gz" -C "$BOOT_CASE/linked" go || return 1
+  bootstrap_go_metadata || return 1
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 7 && ! -e "$BOOT_CASE/output/go" && ! -e "$BOOT_CASE/output/receipt.json" ]]
+)
+
+test_bootstrap_transport_refused() (
+  bootstrap_fixture || return 1
+  export BOOT_TRANSPORT_FAIL=true
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 8 && ! -e "$BOOT_CASE/executed" && ! -e "$BOOT_CASE/output/receipt.json" ]]
+)
+
+test_bootstrap_existing_directory_refused() (
+  bootstrap_fixture || return 1
+  mkdir "$BOOT_CASE/output"
+  printf 'keep\n' > "$BOOT_CASE/output/sentinel"
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 4 && "$(cat "$BOOT_CASE/output/sentinel")" == keep && ! -e "$BOOT_CASE/requests" ]]
+)
+
+test_bootstrap_unsupported_host() (
+  bootstrap_fixture || return 1
+  BOOT_PLATFORM=windows/amd64
+  bootstrap_run go
+  [[ "$BOOT_STATUS" == 3 && ! -e "$BOOT_CASE/output" && ! -e "$BOOT_CASE/requests" ]]
+)
+
+test_bootstrap_rust_pinned() (
+  bootstrap_fixture || return 1
+  printf '[toolchain]\nchannel = "1.82.0"\n' > "$BOOT_CASE/tree/rust-toolchain.toml"
+  RUSTUP_TOOLCHAIN=ambient CARGO_HOME="$BOOT_CASE/untouched-cargo" RUSTUP_HOME="$BOOT_CASE/untouched-rustup" bootstrap_run rust
+  [[ "$BOOT_STATUS" == 0 && ! -e "$BOOT_CASE/untouched-cargo" && ! -e "$BOOT_CASE/untouched-rustup" ]] || return 1
+  grep -q '^rustup-init .*--no-modify-path .*--default-toolchain none' "$BOOT_CALLS" &&
+    grep -q "^rustup $BOOT_CASE/tree toolchain install --profile minimal$" "$BOOT_CALLS" &&
+    grep -q '^rustc repository$' "$BOOT_CALLS" &&
+    jq -es 'length == 1 and .[0].method == "isolated-bootstrap"' "$BOOT_CASE/result.json" >/dev/null &&
+    grep -q 'Rustup installer informational stdout' "$BOOT_CASE/result.log"
+)
+
+test_bootstrap_rust_unpinned() (
+  bootstrap_fixture || return 1
+  printf '[toolchain]\nchannel = "nightly"\n' > "$BOOT_CASE/rust-toolchain.toml"
+  bootstrap_run rust
+  [[ "$BOOT_STATUS" == 0 ]] && grep -q '^rustc stable$' "$BOOT_CALLS" &&
+    jq -e '.rustup_toolchain == "stable"' "$BOOT_CASE/result.json" >/dev/null
+)
+
+test_bootstrap_rust_bad_hash() (
+  bootstrap_fixture || return 1
+  printf '%064d  rustup-init\n' 0 > "$BOOT_CASE/rustup-init.sha256"
+  bootstrap_run rust
+  [[ "$BOOT_STATUS" == 7 && ! -e "$BOOT_CASE/executed" && ! -e "$BOOT_CASE/output/cargo" ]]
+)
+
+bootstrap_rust_proxies() {
+  bootstrap_fixture || return 1
+  # shellcheck source=../../src/install_source.sh
+  source "$SRC_DIR/install_source.sh" || return 1
+  mkdir "$BOOT_CASE/proxies" "$BOOT_CASE/build"
+  export BOOT_ROOT="$BOOT_CASE/build/toolchain" BOOT_PROXY_MODE="$1"
+  cat > "$BOOT_CASE/proxies/rustc" <<'PROXY'
+#!/usr/bin/env bash
+[[ "${RUSTUP_AUTO_INSTALL:-}" == 0 ]] || exit 90
+printf '%s %s\n' "${0##*/}" "$*" >> "$BOOT_CASE/probe-calls"
+case "$BOOT_PROXY_MODE" in
+    missing) printf 'selected toolchain is not installed\n' >&2; exit 1 ;;
+    working) printf '%s 1.40.0 (existing compiler)\n' "${0##*/}" ;;
+    timeout) sleep 20 ;;
+    *) exit 91 ;;
+esac
+PROXY
+  cp "$BOOT_CASE/proxies/rustc" "$BOOT_CASE/proxies/cargo"
+  chmod +x "$BOOT_CASE/proxies/"*
+  export PATH="$BOOT_CASE/proxies:$PATH"
+  export CARGO_HOME="$BOOT_CASE/existing-cargo" RUSTUP_HOME="$BOOT_CASE/existing-rustup"
+  _ISB_INSTALL_TOOLCHAIN=true
+}
+
+test_bootstrap_rust_missing_proxy_toolchain() (
+  bootstrap_rust_proxies missing || return 1
+  local original
+  original=$(_tc_bootstrap_sha256 "$BOOT_CASE/proxies/rustc") || return 1
+  _isb_prepare_toolchain rust "$BOOT_CASE/tree" "$BOOT_CASE/build" 10 \
+    > "$BOOT_CASE/activation.out" 2> "$BOOT_CASE/activation.log" || return 1
+  [[ "$(command -v rustc)" == "$BOOT_ROOT/cargo/bin/rustc" &&
+     "$CARGO_HOME" == "$BOOT_ROOT/cargo" && "$RUSTUP_HOME" == "$BOOT_ROOT/rustup" &&
+     ! -e "$BOOT_CASE/existing-cargo" && ! -e "$BOOT_CASE/existing-rustup" &&
+     "$(_tc_bootstrap_sha256 "$BOOT_CASE/proxies/rustc")" == "$original" ]] || return 1
+  [[ "$(rustc --version)" == 'rustc 1.82.0 (fixture)' && -f "$BOOT_ROOT/receipt.json" ]]
+)
+
+test_bootstrap_rust_working_proxy_preserved() (
+  bootstrap_rust_proxies working || return 1
+  local original_path="$PATH"
+  _isb_prepare_toolchain rust "$BOOT_CASE/tree" "$BOOT_CASE/build" 10 \
+    > "$BOOT_CASE/activation.out" 2> "$BOOT_CASE/activation.log" || return 1
+  [[ "$PATH" == "$original_path" && "$CARGO_HOME" == "$BOOT_CASE/existing-cargo" &&
+     ! -e "$BOOT_ROOT" && ! -e "$BOOT_CASE/requests" ]] &&
+    grep -q '^rustc -vV$' "$BOOT_CASE/probe-calls" && grep -q '^cargo --version$' "$BOOT_CASE/probe-calls"
+)
+
+test_bootstrap_rust_probe_timeout_refused() (
+  bootstrap_rust_proxies timeout || return 1
+  local status=0
+  _isb_prepare_toolchain rust "$BOOT_CASE/tree" "$BOOT_CASE/build" 1 \
+    > "$BOOT_CASE/activation.out" 2> "$BOOT_CASE/activation.log" || status=$?
+  [[ "$status" == 5 && ! -e "$BOOT_ROOT" && ! -e "$BOOT_CASE/requests" &&
+     -f "$BOOT_CASE/build/toolchain-probe.log.timeout" ]]
+)
+
+test_bootstrap_bun_pinned() (
+  bootstrap_fixture || return 1
+  bootstrap_run bun
+  [[ "$BOOT_STATUS" == 0 ]] && jq -e '.version == "1.2.3" and
+    .distribution_url == "https://github.com/oven-sh/bun/releases/download/bun-v1.2.3/bun-linux-x64-baseline.zip"' "$BOOT_CASE/result.json" >/dev/null &&
+    ! grep -q '/releases/latest' "$BOOT_CASE/requests"
+)
+
+test_bootstrap_bun_bad_hash() (
+  bootstrap_fixture || return 1
+  printf '%064d  bun-linux-x64-baseline.zip\n' 0 > "$BOOT_CASE/SHASUMS256.txt"
+  bootstrap_run bun
+  [[ "$BOOT_STATUS" == 7 && ! -e "$BOOT_CASE/executed" && ! -e "$BOOT_CASE/output/receipt.json" ]]
+)
+
+test_bootstrap_bun_incompatible_engine() (
+  bootstrap_fixture || return 1
+  export BOOT_ENGINE_FAIL=true
+  bootstrap_run bun
+  [[ "$BOOT_STATUS" == 7 && ! -e "$BOOT_CASE/output/receipt.json" ]]
+)
+
+# ============================================================================
 # Main Test Runner
 # ============================================================================
 
@@ -655,6 +957,30 @@ main() {
   run_test "min_versions_defined" test_min_versions_defined
   run_test "install_urls_defined" test_install_urls_defined
   run_test "install_urls_https" test_install_urls_https
+
+  echo ""
+  echo "Isolated source-toolchain bootstrap:"
+  run_test "bootstrap_requires_consent" test_bootstrap_requires_consent
+  run_test "bootstrap_go_minor_selection" test_bootstrap_go_minor_selection
+  run_test "bootstrap_go_exact_pin" test_bootstrap_go_exact_pin
+  run_test "bootstrap_go_macos_arm" test_bootstrap_go_macos_arm
+  run_test "bootstrap_go_hash" test_bootstrap_go_hash
+  run_test "bootstrap_go_size" test_bootstrap_go_size
+  run_test "bootstrap_go_duplicates" test_bootstrap_go_duplicates
+  run_test "bootstrap_go_malformed" test_bootstrap_go_malformed
+  run_test "bootstrap_go_link_refused" test_bootstrap_go_link_refused
+  run_test "bootstrap_transport_refused" test_bootstrap_transport_refused
+  run_test "bootstrap_existing_directory_refused" test_bootstrap_existing_directory_refused
+  run_test "bootstrap_unsupported_host" test_bootstrap_unsupported_host
+  run_test "bootstrap_rust_pinned" test_bootstrap_rust_pinned
+  run_test "bootstrap_rust_unpinned" test_bootstrap_rust_unpinned
+  run_test "bootstrap_rust_bad_hash" test_bootstrap_rust_bad_hash
+  run_test "bootstrap_rust_missing_proxy_toolchain" test_bootstrap_rust_missing_proxy_toolchain
+  run_test "bootstrap_rust_working_proxy_preserved" test_bootstrap_rust_working_proxy_preserved
+  run_test "bootstrap_rust_probe_timeout_refused" test_bootstrap_rust_probe_timeout_refused
+  run_test "bootstrap_bun_pinned" test_bootstrap_bun_pinned
+  run_test "bootstrap_bun_bad_hash" test_bootstrap_bun_bad_hash
+  run_test "bootstrap_bun_incompatible_engine" test_bootstrap_bun_incompatible_engine
 
   teardown
 
