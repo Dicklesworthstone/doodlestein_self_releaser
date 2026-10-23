@@ -212,6 +212,13 @@ hosts:
 
 Ensure hosts have required toolchains for your repos (rust/go/bun) and that `trj` has Docker + act for Linux builds.
 
+Native host selection checks the toolchain used by a plain `cargo`, `go`, `bun`,
+or `node` build command. Rust readiness requires both Cargo and rustc to run
+successfully. The same requirement applies before source transfer and again
+before compilation, including explicitly pinned hosts. Recipes that select an
+executable path, wrapper, or nondefault toolchain keep their existing build
+context checks instead of being judged against an unrelated ambient compiler.
+
 Release snapshots and isolated Rust builds are staged under `/var/tmp` on Linux hosts and
 `/private/tmp` on macOS — never `/tmp`, which is frequently a RAM-backed tmpfs that a multi-GB
 source tree plus Cargo target will exhaust. Set `build_root` on a host to stage somewhere else
@@ -239,6 +246,13 @@ directories after a native build, including failed or cancelled builds. This is
 useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
+
+Ordinary native Rust builds also give every attempt a fresh final output
+directory. A configured absolute `CARGO_TARGET_DIR` names the base directory;
+DSR builds and collects from a unique child beneath it. This applies to single
+targets as well as target matrices, so a successful command that produces no
+new binary cannot publish an older binary from a shared target directory.
+Dependency-cache reuse is unchanged, and prior attempt outputs are retained.
 
 Strict native Rust builds seed private Cargo homes with downloads selected
 by the committed `Cargo.lock`: checksum-matching crate archives, their index

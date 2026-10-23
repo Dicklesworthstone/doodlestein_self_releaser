@@ -2691,12 +2691,70 @@ act_get_targets() {
     yq -r '.targets[]' "$config_file" 2>/dev/null | tr '\n' ' '
 }
 
+# Infer only a plain, ambient toolchain invocation. A configured executable,
+# wrapper or Cargo toolchain selector is checked by its build context instead:
+# probing an unrelated default compiler can reject an otherwise valid recipe.
+_act_native_host_capability() {
+    local tool_name="${1:-}" platform="${2:-}" config_file command program remainder document overrides source_root
+    [[ -n "$tool_name" ]] || return 0
+    config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
+    [[ -f "$config_file" ]] || return 0
+    command=$(act_get_build_cmd "$tool_name" "$platform") || return 4
+    [[ "$command" =~ ^[[:space:]]*(cargo|go|bun|node)([[:space:]]|$) ]] || return 0
+    program="${BASH_REMATCH[1]}"
+    remainder="${command#"${command%%[![:space:]]*}"}"
+    remainder="${remainder#"$program"}"
+    remainder="${remainder#"${remainder%%[![:space:]]*}"}"
+    if [[ "$program" == cargo ]]; then
+        case "$remainder" in +*|\"+*|\'+*) return 0 ;; esac
+    fi
+    document=$(yq -o=json -I=0 '.' "$config_file") || return 4
+    if ! overrides=$(jq -rs --arg platform "$platform" --arg program "$program" '
+        if length == 1 and (.[0] | type == "object") then .[0]
+        else error("expected one repository configuration mapping") end |
+        [(if .env == null then {} else .env end),
+         (if .cross_compile[$platform].env == null then {} else .cross_compile[$platform].env end)] |
+        if all(.[]; type == "object") then . else error("env must be a mapping") end |
+        any(.[] | keys[] | ascii_upcase;
+            . == "PATH" or . == "PATHEXT" or
+            ($program == "cargo" and
+                (. == "RUSTUP_TOOLCHAIN" or . == "RUSTUP_HOME" or . == "CARGO_HOME" or
+                 . == "RUSTC" or . == "RUSTC_WRAPPER" or . == "RUSTC_WORKSPACE_WRAPPER" or
+                 . == "CARGO_BUILD_RUSTC" or . == "CARGO_BUILD_RUSTC_WRAPPER" or
+                 . == "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")))
+    ' <<< "$document"); then
+        _log_error "Cannot resolve native toolchain requirements from invalid environment configuration: $tool_name/$platform"
+        return 4
+    fi
+    [[ "$overrides" != true ]] || return 0
+    if [[ "$program" == cargo ]]; then
+        source_root=$(act_get_local_path "$tool_name") || return 4
+        if [[ -d "$source_root" ]]; then
+            source_root=$(cd "$source_root" && pwd -P) || return 4
+            while :; do
+                if [[ -e "$source_root/rust-toolchain" || -e "$source_root/rust-toolchain.toml" ||
+                      -e "$source_root/.cargo/config" || -e "$source_root/.cargo/config.toml" ]]; then
+                    return 0
+                fi
+                [[ "$source_root" != / ]] || break
+                source_root="${source_root%/*}"
+                [[ -n "$source_root" ]] || source_root=/
+            done
+        fi
+        printf 'rust\n'
+    else
+        printf '%s\n' "$program"
+    fi
+}
+
 # Get native host for a platform
 # Usage: act_get_native_host <platform> [tool_name]
 # Returns: Host name (trj, mmini, wlap) or empty
 act_get_native_host() {
     local platform="$1"
     local tool_name="${2:-}"
+    local capability
+    capability=$(_act_native_host_capability "$tool_name" "$platform") || return 4
 
     if [[ -n "$tool_name" ]]; then
         local config_file="$ACT_REPOS_DIR/${tool_name}.yaml"
@@ -2733,6 +2791,7 @@ act_get_native_host() {
     # source-staging and native-build consumers still require host admission.
     if [[ "${DSR_DISABLE_HOST_SELECTOR:-0}" != "1" ]] && declare -F selector_choose_host &>/dev/null; then
         local selector_args=(--target "$platform")
+        [[ -z "$capability" ]] || selector_args+=(--capability "$capability")
         [[ -n "$configured_host" ]] && selector_args+=(--prefer "$configured_host")
 
         local selected_host
@@ -6252,6 +6311,7 @@ act_sync_sources() {
     local hosts_to_sync=()
     local host_paths=()
     local configured_host_paths=()
+    local admitted_host_capabilities=()
     local target_hosts_json='{}'
     for target in $targets; do
         local host remote_path
@@ -6281,16 +6341,27 @@ act_sync_sources() {
                 break
             fi
         done
-        $already_added && continue
         # Resolve every host before exporting contexts or staging any source.
         # Repo pins and selector fallback choose a location, not permission to
         # write there; the same health gate must admit those paths as well.
-        if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "$host"; then
-            _log_error "Native source host is not ready: $host"
-            jq -nc --arg host "$host" \
-                '{status:"error",exit_code:4,host:$host,error:"Native source host is not ready"}'
-            return 4
+        local capability admission_key admitted already_admitted=false
+        capability=$(_act_native_host_capability "$tool_name" "$target") || return 4
+        admission_key="$host:$capability"
+        for admitted in "${admitted_host_capabilities[@]}"; do
+            [[ "$admitted" != "$admission_key" ]] || already_admitted=true
+        done
+        if ! $already_admitted; then
+            local readiness_args=("$host")
+            [[ -z "$capability" ]] || readiness_args+=(--require "$capability")
+            if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "${readiness_args[@]}"; then
+                _log_error "Native source host is not ready: $host${capability:+ (requires $capability)}"
+                jq -nc --arg host "$host" \
+                    '{status:"error",exit_code:4,host:$host,error:"Native source host is not ready"}'
+                return 4
+            fi
+            admitted_host_capabilities+=("$admission_key")
         fi
+        $already_added && continue
         local configured_remote_path="$remote_path"
         if $stage_ordinary; then
             ordinary_stage_id=$(_act_generate_uuid) || return 4
@@ -8820,8 +8891,11 @@ act_run_native_build() {
     fi
     # Native callers may supply a host directly, use a repo pin, or fall back
     # after selector failure. All routes consume the same readiness decision.
-    if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "$host"; then
-        _log_error "Native build host is not ready: $host"
+    local capability readiness_args=("$host")
+    capability=$(_act_native_host_capability "$tool_name" "$platform") || return 4
+    [[ -z "$capability" ]] || readiness_args+=(--require "$capability")
+    if ! declare -F host_health_is_ready &>/dev/null || ! host_health_is_ready "${readiness_args[@]}"; then
+        _log_error "Native build host is not ready: $host${capability:+ (requires $capability)}"
         jq -nc --arg host "$host" \
             '{status:"error",exit_code:4,host:$host,error:"Native build host is not ready"}'
         return 4
@@ -9280,12 +9354,11 @@ act_run_native_build() {
             jq -nc '{status: "error", exit_code: 4, error: "Invalid Cargo isolation target directory"}'
             return 4
         fi
-        if [[ -n "$selected_triple" ]]; then
-            # Even a configured CARGO_TARGET_DIR is a base directory for a
-            # matrix. Fresh output per attempt prevents a failed/no-op retry
-            # from collecting bytes left by any preceding build.
-            nonstrict_target_dir="${nonstrict_target_dir%/}/dsr-${selected_triple}-${isolation_suffix}"
-        fi
+        # Every ordinary Rust attempt owns its final outputs, including a
+        # singleton build with a configured absolute CARGO_TARGET_DIR. Treat
+        # that setting as a base: a successful no-op command must not collect
+        # a previous attempt's binary. Keep the existing matrix target names.
+        nonstrict_target_dir="${nonstrict_target_dir%/}/dsr-${selected_triple:-${platform//\//-}}-${isolation_suffix}"
         [[ -n "$nonstrict_env" ]] && nonstrict_env+=$'\n'
         nonstrict_env+="CARGO_TARGET_DIR=$nonstrict_target_dir"
 
@@ -13708,6 +13781,7 @@ export -f act_check_prereqs act_check act_version_is_supported act_list_jobs act
 export -f act_run_workflow act_collect_artifacts act_analyze_workflow act_cleanup
 export -f act_load_repo_config act_get_job_for_target act_platform_uses_act
 export -f act_get_flags act_get_targets act_get_native_host act_get_build_strategy
+export -f _act_native_host_capability
 export -f act_list_tools act_build_matrix
 export -f act_get_build_cmd act_substitute_build_cmd_tokens act_get_build_env act_get_repo act_get_local_path
 export -f _act_materialized_source_path

@@ -394,7 +394,7 @@ _hh_admission_fingerprint() {
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v5",host:$host,policy:{
+        '{schema:"dsr-host-admission-v6",host:$host,policy:{
             disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -1209,7 +1209,7 @@ _hh_check_toolchains() {
         if $is_windows; then
             # Windows commands (no Unix shell redirection/pipes)
             case "$capability" in
-                rust)   check_cmd="rustc --version" ;;
+                rust)   check_cmd='cmd /d /s /c "cargo --version >nul 2>&1 && rustc --version"' ;;
                 go)     check_cmd="go version" ;;
                 bun)    check_cmd="bun --version" ;;
                 node)   check_cmd="node --version" ;;
@@ -1220,20 +1220,21 @@ _hh_check_toolchains() {
         else
             # Unix commands
             case "$capability" in
-                rust)   check_cmd="rustc --version 2>/dev/null | head -1" ;;
-                go)     check_cmd="go version 2>/dev/null | head -1" ;;
-                bun)    check_cmd="bun --version 2>/dev/null | head -1" ;;
-                node)   check_cmd="node --version 2>/dev/null | head -1" ;;
-                docker) check_cmd="docker --version 2>/dev/null | head -1" ;;
-                act)    check_cmd="act --version 2>/dev/null | head -1" ;;
+                rust)   check_cmd="cargo --version >/dev/null 2>&1 && rustc --version 2>/dev/null" ;;
+                go)     check_cmd="go version 2>/dev/null" ;;
+                bun)    check_cmd="bun --version 2>/dev/null" ;;
+                node)   check_cmd="node --version 2>/dev/null" ;;
+                docker) check_cmd="docker --version 2>/dev/null" ;;
+                act)    check_cmd="act --version 2>/dev/null" ;;
                 *)      continue ;;
             esac
         fi
 
-        version=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" "$check_cmd")
-
-        if [[ -n "$version" ]]; then
+        # A diagnostic written before a failed probe is not compiler health.
+        # Rust recipes also need Cargo; rustc alone cannot run a Cargo build.
+        if version=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" "$check_cmd") && [[ -n "$version" ]]; then
             status="ok"
+            version="${version%%$'\n'*}"
             # Clean version output (remove CRLF/newlines, escape quotes)
             version=$(echo "$version" | tr -d '\r\n' | sed 's/"/\\"/g')
         else

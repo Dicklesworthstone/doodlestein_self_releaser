@@ -177,6 +177,180 @@ if [[ "${1:-}" == --host-health-admission-tests ]]; then
     exit $?
 fi
 
+# Real selector and health-cache readers over explicitly controlled machine
+# observations. Transport boundaries stop before staging or compilation; these
+# checks do not assert that the fixture hosts or their disks actually exist.
+test_native_host_capability_admission() (
+    unset -f yq ssh scp rsync config_get_host_for_platform selector_choose_host host_health_is_ready
+    command -v yq >/dev/null && command -v jq >/dev/null || return 3
+    local work
+    work=$(mktemp -d "${DSR_NATIVE_ADMISSION_TEST_ROOT:-${TMPDIR:-/tmp}}/dsr-native-capabilities.XXXXXXXX") || return 1
+    printf 'Retained native capability evidence: %s\n' "$work"
+    export DSR_CONFIG_DIR="$work/config" DSR_CACHE_DIR="$work/cache" DSR_STATE_DIR="$work/state"
+    export DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml" DSR_CONFIG_FILE="$DSR_CONFIG_DIR/config.yaml"
+    export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml" ACT_CONFIG_DIR="$DSR_CONFIG_DIR"
+    export ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d" RCH_REQUIRE_REMOTE=0 DSR_DISABLE_HOST_SELECTOR=0
+    mkdir -p "$ACT_REPOS_DIR" "$DSR_CACHE_DIR" "$work/source" || return 1
+    source "$SRC_DIR/config.sh" || return 1
+    source "$SRC_DIR/host_health.sh" || return 1
+    source "$SRC_DIR/host_selector.sh" || return 1
+    source "$SRC_DIR/act_runner.sh" || return 1
+    local checks=0 failures=0 result status capability program
+    _cap_check() {
+        local label="$1"; shift
+        checks=$((checks + 1))
+        if "$@"; then printf 'PASS: %s\n' "$label"
+        else failures=$((failures + 1)); printf 'FAIL: %s\n' "$label"; fi
+    }
+    _cap_recipe() {
+        jq -nc --arg command "$1" --arg host "${2:-}" --arg source "$work/source" '
+            {language:"go",local_path:$source,build_cmd:$command,binary_name:"tool",
+             targets:["linux/amd64"],act_job_map:{"linux/amd64":null}} +
+            (if $host == "" then {} else {hosts:{"linux/amd64":$host}} end)
+        ' > "$ACT_REPOS_DIR/tool.yaml"
+    }
+    printf '%s\n' '{"hosts":{
+        "incapable":{"platform":"linux/amd64","connection":"ssh","ssh_host":"incapable.invalid","concurrency":8,"capabilities":["rust","go","bun","node"]},
+        "capable":{"platform":"linux/amd64","connection":"ssh","ssh_host":"capable.invalid","concurrency":1,"capabilities":["rust","go","bun","node"]}},
+        "platform_mapping":{"linux/amd64":"incapable"}}' > "$DSR_HOSTS_FILE" || return 1
+    _cap_seed() {
+        local hostname="$1" supported="$2" host fingerprint receipt
+        host=$(_hh_get_host_config "$hostname") || return 1
+        fingerprint=$(_hh_admission_fingerprint "$host") || return 1
+        receipt=$(jq -nc --arg hostname "$hostname" --arg fingerprint "$fingerprint" --argjson supported "$supported" '
+            {hostname:$hostname,platform:"linux/amd64",description:"Controlled scheduling fixture",
+             connection:"ssh",status:"ok",healthy:true,errors:0,warnings:0,
+             admission_fingerprint:$fingerprint,checked_at:"fixture",
+             checks:{connectivity:{reachable:true},disk_space:{status:"ok"},docker:{},clock_drift:{},
+                toolchains:(["rust","go","bun","node"] | map(. as $cap |
+                    {key:$cap,value:{status:(if $supported | index($cap) then "ok" else "missing" end),version:"fixture"}}) | from_entries)}}
+        ') || return 1
+        _hh_init_cache && _hh_cache_write "$hostname" "$receipt"
+    }
+    _cap_seed incapable '[]' && _cap_seed capable '["rust","go","bun","node"]' || return 1
+    _hh_check_connectivity() { printf 'UNEXPECTED-PROBE\n' >> "$work/events"; return 98; }
+    _act_get_ssh_destination() { printf 'destination:%s\n' "$1" >> "$work/events"; return 97; }
+    _act_ssh_exec() { printf 'UNEXPECTED-TRANSPORT\n' >> "$work/events"; return 98; }
+    _act_export_ordinary_git_contexts() { printf 'UNEXPECTED-CONTEXT\n' >> "$work/events"; return 98; }
+    _act_prepare_ordinary_source_root() { printf 'UNEXPECTED-STAGING\n' >> "$work/events"; return 98; }
+    result=$(selector_choose_host --target linux/amd64) || return 1
+    _cap_check 'unfiltered scheduling would prefer the incapable host' test "$result" = incapable
+    for program in cargo go bun node; do
+        _cap_recipe "$program build" || return 1
+        capability="$program"; [[ "$program" != cargo ]] || capability=rust
+        result=$(_act_native_host_capability tool linux/amd64) || return 1
+        _cap_check "$program uses its actual command capability" test "$result" = "$capability"
+        result=$(act_get_native_host linux/amd64 tool) || return 1
+        _cap_check "$program selects the capable host over the preferred incapable host" test "$result" = capable
+    done
+    for program in 'cargo +nightly build' '/opt/toolchain/cargo build' 'bash build.sh' 'rustc main.rs'; do
+        _cap_recipe "$program" || return 1
+        result=$(_act_native_host_capability tool linux/amd64) || return 1
+        _cap_check "$program retains its own toolchain admission" test -z "$result"
+    done
+    for capability in PATH RUSTUP_TOOLCHAIN; do
+        jq -nc --arg key "$capability" --arg source "$work/source" '
+            {language:"rust",local_path:$source,build_cmd:"cargo build",env:{($key):"selected"}}
+        ' > "$ACT_REPOS_DIR/tool.yaml" || return 1
+        result=$(_act_native_host_capability tool linux/amd64) || return 1
+        _cap_check "$capability selection does not require an unrelated ambient compiler" test -z "$result"
+    done
+    for capability in global platform; do
+        jq -nc --arg scope "$capability" '
+            {build_cmd:"go build"} +
+            (if $scope == "global" then {env:false}
+             else {cross_compile:{"linux/amd64":{env:[]}}} end)
+        ' > "$ACT_REPOS_DIR/tool.yaml" || return 1
+        status=0
+        result=$(_act_native_host_capability tool linux/amd64 2> "$work/invalid-env.stderr") || status=$?
+        _cap_check "$capability malformed env refuses capability selection" test "$status" -eq 4
+        _cap_check "$capability malformed env has an actionable diagnostic" grep -q 'invalid environment configuration' "$work/invalid-env.stderr"
+    done
+    _cap_recipe 'go build' incapable || return 1
+    result=$(act_get_native_host linux/amd64 tool) || return 1
+    _cap_check 'an explicit host pin is never silently retargeted' test "$result" = incapable
+    status=0
+    result=$(act_run_native_build tool linux/amd64 v1.0.0 fixture) || status=$?
+    _cap_check 'pinned missing compiler refuses native build before transport' test "$status" -eq 4
+    _cap_check 'native compiler refusal identifies the pinned host' jq -e '.host == "incapable" and .error == "Native build host is not ready"' <<< "$result"
+    status=0
+    result=$(act_sync_sources tool --stage-ordinary) || status=$?
+    _cap_check 'pinned missing compiler refuses source staging' test "$status" -eq 4
+    _cap_check 'source compiler refusal precedes context namespace creation' test ! -e "$DSR_STATE_DIR/source-contexts"
+    _cap_recipe 'go build' || return 1
+    status=0
+    result=$(DSR_DISABLE_HOST_SELECTOR=1 act_run_native_build tool linux/amd64 v1.0.0 fixture) || status=$?
+    _cap_check 'static fallback cannot bypass required compiler admission' test "$status" -eq 4
+    status=0
+    result=$(act_run_native_build tool linux/amd64 v1.0.0 fixture '' '' '' incapable) || status=$?
+    _cap_check 'a bound host cannot bypass required compiler admission' test "$status" -eq 4
+    _cap_seed capable '["go"]' || return 1
+    jq -nc --arg source "$work/source" '
+        {language:"go",local_path:$source,build_cmd:"go build",targets:["linux/amd64","linux/arm64"],
+         act_job_map:{"linux/amd64":null,"linux/arm64":null},hosts:{"linux/amd64":"capable","linux/arm64":"capable"},
+         cross_compile:{"linux/arm64":{build_cmd:"bun build"}}}
+    ' > "$ACT_REPOS_DIR/tool.yaml" || return 1
+    status=0
+    result=$(act_sync_sources tool --stage-ordinary) || status=$?
+    _cap_check 'shared staging checks each target toolchain on the same host' test "$status" -eq 4
+    _cap_check 'all incapable native paths stop before probes or transport' test ! -e "$work/events"
+    jq -nc --arg source "$work/source" '
+        {language:"go",local_path:$source,build_cmd:"go build",targets:["linux/amd64"],act_job_map:{"linux/amd64":"workflow"}}
+    ' > "$ACT_REPOS_DIR/tool.yaml" || return 1
+    result=$(unset -f host_health_is_ready; act_sync_sources tool --stage-ordinary) || return 1
+    _cap_check 'act-only source routing does not require native compilers' jq -e '.status == "skipped"' <<< "$result"
+    _cap_recipe 'go build' || return 1
+    status=0
+    result=$(act_run_native_build tool linux/amd64 v1.0.0 fixture) || status=$?
+    _cap_check 'capable native host reaches the existing transport boundary' test "$(cat "$work/events")" = destination:capable
+    _cap_recipe 'cargo build' || return 1
+    printf 'nightly\n' > "$work/source/rust-toolchain" || return 1
+    result=$(_act_native_host_capability tool linux/amd64) || return 1
+    _cap_check 'project-selected Rust toolchain avoids ambient default admission' test -z "$result"
+    # This negative supplies output together with failure. No toolchain success
+    # or Windows execution is inferred from the controlled process boundary.
+    result=$(
+        _hh_exec_on_host() { printf 'diagnostic before failure\n'; return 9; }
+        _hh_check_toolchains fixture local '' 'rust go' linux/amd64
+    ) || return 1
+    _cap_check 'failed compiler probes cannot become healthy from stdout' jq -e '.rust.status == "missing" and .go.status == "missing"' <<< "$result"
+    result=$(
+        _hh_exec_on_host() {
+            bash -c 'cargo() { return 127; }; rustc() { printf "rustc fixture\n"; }; eval "$1"' _ "$4"
+        }
+        _hh_check_toolchains fixture local '' rust linux/amd64
+    ) || return 1
+    _cap_check 'rustc without Cargo cannot admit a Cargo build host' jq -e '.rust.status == "missing"' <<< "$result"
+    local host fingerprint old_receipt old_contract old_fingerprint
+    host=$(_hh_get_host_config incapable) || return 1
+    fingerprint=$(_hh_admission_fingerprint "$host") || return 1
+    old_receipt=$(_hh_cache_read incapable) || return 1
+    old_contract=$(jq -ncS --argjson host "$host" --arg disk_warn "$_HH_DISK_WARN_THRESHOLD" \
+        --arg disk_error "$_HH_DISK_ERROR_THRESHOLD" --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
+        --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
+        --arg command_timeout "$_HH_CMD_TIMEOUT" '
+        {schema:"dsr-host-admission-v5",host:$host,policy:{disk_warn:$disk_warn,disk_error:$disk_error,
+         clock_warn:$clock_warn,disk_min_free_bytes:$disk_min_free,ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}'
+    ) || return 1
+    if command -v sha256sum >/dev/null; then
+        old_fingerprint=$(printf '%s\n' "$old_contract" | sha256sum) || return 1
+    else
+        old_fingerprint=$(printf '%s\n' "$old_contract" | shasum -a 256) || return 1
+    fi
+    old_receipt=$(jq --arg fingerprint "${old_fingerprint%% *}" '.admission_fingerprint=$fingerprint' <<< "$old_receipt") || return 1
+    _hh_cache_write incapable "$old_receipt" || return 1
+    status=0
+    _hh_cache_get incapable "$fingerprint" >/dev/null || status=$?
+    _cap_check 'prior rustc-only v5 evidence is refused by the real cache reader' test "$status" -ne 0
+    printf 'Native capability checks: %s passed, %s failed\n' "$((checks-failures))" "$failures"
+    [[ "$failures" == 0 ]]
+)
+
+if [[ "${1:-}" == --host-capability-admission-tests ]]; then
+    test_native_host_capability_admission
+    exit $?
+fi
+
 # Actual native entry-point refusals only: no compiler, SSH, substituted
 # backend, cleanup or fake successful RCH receipt. This is not native-build
 # qualification. Run only after the release wave's external admission gates.
@@ -1193,7 +1367,7 @@ test_unix_rust_isolation_rejects_invalid_host_build_root() {
 }
 
 test_unix_rust_keeps_configured_cargo_path_env() {
-    log_test "Unix Rust: configured absolute target is restored after sanitization"
+    log_test "Unix Rust: configured absolute target is a private attempt's base"
     reset_state
     MOCK_LANGUAGE="rust"
     MOCK_BUILD_CMD="cargo build --release"
@@ -1202,21 +1376,105 @@ test_unix_rust_keeps_configured_cargo_path_env() {
     local result
     result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null)
 
-    local cmd
+    local cmd target
     cmd=$(get_ssh_cmd)
+    target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
 
     if [[ "$cmd" == *"unset CARGO_HOME; unset CARGO_TARGET_DIR;"* ]] && \
-       [[ "$cmd" == *'export "CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"'* ]] && \
+       [[ "$target" == /Users/jemanuel/tmp/rch-target-dsr/dsr-darwin-arm64-* ]] && \
+       [[ "$cmd" == *"export \"CARGO_TARGET_DIR=$target\""* ]] && \
        [[ "$cmd" == *'export "CARGO_HOME=/private/tmp/dsr-build-tool-darwin-arm64-'* ]] && \
        [[ "$cmd" != *'/Users/jemanuel/.cargo-operator'* ]] && \
-       jq -e \
-          '.cargo_isolation.target_dir == "/Users/jemanuel/tmp/rch-target-dsr" and
+       jq -e --arg target "$target" \
+          '.cargo_isolation.target_dir == $target and
+           .build_influence_env.CARGO_TARGET_DIR == $target and
            .cargo_isolation.cargo_home == .build_influence_env.CARGO_HOME and
            (.cargo_isolation.source_root | startswith("/private/tmp/dsr-build-tool-darwin-arm64-"))' \
           <<< "$result" >/dev/null; then
-        log_pass "Configured target survives while operator CARGO_HOME is replaced"
+        log_pass "Configured target base survives with fresh outputs and a private CARGO_HOME"
     else
         log_fail "Expected sanitize-then-restore Cargo isolation command: $cmd result=$result"
+    fi
+}
+
+test_unix_rust_singleton_rejects_stale_outputs() {
+    log_test "Unix Rust: singleton no-op builds cannot reuse stable or previous attempt outputs"
+    reset_state
+
+    local case_root="$MOCK_DIR/ordinary-rust-outputs"
+    local source_root="$case_root/source" target_base="$case_root/shared-target"
+    local relative_binary="x86_64-unknown-linux-gnu/release-interactive/tool"
+    local MOCK_HOST_BUILD_ROOT="$case_root/stages" DSR_HOSTS_FILE="$MOCK_DIR/hosts.yaml"
+    mkdir -p "$source_root" "$target_base/${relative_binary%/*}"
+    touch "$DSR_HOSTS_FILE"
+    MOCK_LANGUAGE=rust
+    MOCK_ARTIFACT_KIND=elf-amd64
+    MOCK_LOCAL_PATH="$source_root"
+    MOCK_BUILD_PROFILE=release-interactive
+    MOCK_GLIBC_FLOOR=native
+    MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=$target_base"
+    write_mock_artifact "$target_base/$relative_binary"
+    printf 'old-release\n' >> "$target_base/$relative_binary"
+    cp "$target_base/$relative_binary" "$case_root/original-binary"
+    write_mock_artifact "$source_root/fresh-binary"
+    printf 'current-release\n' >> "$source_root/fresh-binary"
+
+    local mode result status target artifact
+    local targets=() fresh_target=""
+    for mode in stale-base fresh-output no-op-retry; do
+        MOCK_BUILD_CMD=:
+        if [[ "$mode" == fresh-output ]]; then
+            MOCK_BUILD_CMD='mkdir -p "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release-interactive" && cp fresh-binary "$CARGO_TARGET_DIR/$CARGO_BUILD_TARGET/release-interactive/tool"'
+        fi
+        status=0
+        # Run the actual source/cache preparation, generated Unix command,
+        # and local artifact collection. No compiler is needed: the producer
+        # copies a format-valid fixture, while the two no-op producers emit
+        # nothing. Keep all stages and exclude the operator's dependency cache.
+        result=$(
+            _act_ssh_exec() { bash -c "$2"; }
+            _act_is_local_host() { return 0; }
+            CARGO_HOME="$case_root/no-ambient-cache" DSR_KEEP_BUILD_STAGES=1 \
+                act_run_native_build tool linux/amd64 v1.0.0 ordinary-output-retry "" "" "" trj
+        ) 2>"$case_root/$mode.stderr" || status=$?
+        printf '%s\n' "$result" > "$case_root/$mode.json"
+        target=$(jq -r '.cargo_isolation.target_dir // ""' <<< "$result")
+        targets+=("$target")
+        if [[ "$mode" == fresh-output ]]; then
+            fresh_target="$target"
+            artifact=$(jq -r '.artifact_path // ""' <<< "$result")
+            if [[ "$status" -eq 0 && -f "$artifact" ]] && \
+               cmp -s "$source_root/fresh-binary" "$artifact" && \
+               jq -e '.status == "success" and
+                   .build_influence_env.CARGO_BUILD_TARGET == "x86_64-unknown-linux-gnu" and
+                   .build_influence_env.CARGO_TARGET_DIR == .cargo_isolation.target_dir' \
+                   <<< "$result" >/dev/null; then
+                log_pass "Fresh singleton output is collected with its requested compiler target and profile"
+            else
+                log_fail "Fresh singleton output failed: status=$status result=$result"
+            fi
+        elif [[ "$status" -eq 7 ]] && \
+             jq -e '.status == "failed" and .artifact_path == "" and
+                 (.artifact_paths | length) == 0' <<< "$result" >/dev/null; then
+            log_pass "$mode cannot claim a previously produced binary after a successful no-op"
+        else
+            log_fail "$mode admitted stale output or failed before collection: status=$status result=$result"
+        fi
+    done
+    if [[ "${targets[0]}" == "$target_base"/dsr-linux-amd64-* && \
+          "${targets[1]}" == "$target_base"/dsr-linux-amd64-* && \
+          "${targets[2]}" == "$target_base"/dsr-linux-amd64-* && \
+          "${targets[0]}" != "${targets[1]}" && "${targets[0]}" != "${targets[2]}" && \
+          "${targets[1]}" != "${targets[2]}" ]]; then
+        log_pass "Repeated singleton attempts retain the configured base and use distinct target directories"
+    else
+        log_fail "Singleton target directories were reused or escaped the configured base: ${targets[*]}"
+    fi
+    if cmp -s "$case_root/original-binary" "$target_base/$relative_binary" && \
+       cmp -s "$source_root/fresh-binary" "$fresh_target/$relative_binary"; then
+        log_pass "Stale base and earlier successful output bytes remain untouched"
+    else
+        log_fail "A singleton retry changed bytes belonging to another attempt or the configured base"
     fi
 }
 
@@ -1295,14 +1553,14 @@ DSR_PROBE_OUTPUT=$probe_output"
             .cargo_isolation.original_source_root == $original and
             .cargo_isolation.source_root == $source and
             .cargo_isolation.cargo_home == $home and
-            .cargo_isolation.target_dir == $target and
+            (.cargo_isolation.target_dir | startswith($target + "/dsr-linux-amd64-")) and
             .cargo_isolation.sibling_roots == [{
               relative_path: "operator-dep",
               original_source_root: ($original | sub("/remote-rust-source$"; "/operator-dep")),
               source_root: $sibling
             }] and
             .build_influence_env.CARGO_HOME == $home and
-            .build_influence_env.CARGO_TARGET_DIR == $target and
+            .build_influence_env.CARGO_TARGET_DIR == .cargo_isolation.target_dir and
             (.cargo_isolation.excluded_cargo_home_entries | sort) ==
               (["config", "config.toml", "credentials", "credentials.toml"] | sort)' \
           <<< "$result" >/dev/null && \
@@ -1340,7 +1598,7 @@ test_windows_rust_isolation_receipt_matches_command() {
           .cargo_isolation.cargo_home == .build_influence_env.CARGO_HOME and
           .cargo_isolation.target_dir == .build_influence_env.CARGO_TARGET_DIR' \
          <<< "$result" >/dev/null && \
-       [[ "$target" == "C:/Users/jeffr/projects/.dsr-cargo-target-tool-windows-amd64" ]] && \
+       [[ "$target" == C:/Users/jeffr/projects/.dsr-cargo-target-tool-windows-amd64/dsr-windows-amd64-* ]] && \
        [[ "$cmd" == *"WorkingDirectory='$win_source'"* ]] && \
        [[ "$cmd" == *"EnvironmentVariables['CARGO_HOME']='$win_home'"* ]] && \
        [[ "$cmd" != *'C:\Users\jeffr\.cargo-operator'* ]]; then
@@ -1348,6 +1606,35 @@ test_windows_rust_isolation_receipt_matches_command() {
     else
         log_fail "Windows command diverged from its isolation receipt: cmd=$cmd result=$result"
     fi
+}
+
+test_windows_rust_absolute_target_is_private() {
+    log_test "Windows Rust: configured absolute output base is private to each attempt"
+    reset_state
+    MOCK_LOCAL_PATH="C:/Users/jeffr/projects/tool"
+    MOCK_LANGUAGE=rust
+    MOCK_BUILD_CMD="cargo build --release --locked"
+    MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=D:/dsr-targets"
+
+    local result cmd target target_b64 previous="" attempt
+    for attempt in 1 2; do
+        result=$(act_run_native_build tool windows/amd64 v1.0.0 windows-output-retry 2>/dev/null)
+        cmd=$(get_ssh_cmd)
+        target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
+        target_b64=$(printf '%s' "$target" | base64 | tr -d '\r\n')
+        if [[ "$target" == D:/dsr-targets/dsr-windows-amd64-* && "$target" != "$previous" && \
+              "$cmd" == *"FromBase64String('$target_b64')"* ]] && \
+           jq -e '.status == "success" and
+               .cargo_isolation.target_dir == .build_influence_env.CARGO_TARGET_DIR and
+               .build_influence_env.CARGO_BUILD_TARGET == "x86_64-pc-windows-msvc"' \
+               <<< "$result" >/dev/null && \
+           [[ "$(get_scp_args)" == *"wlap:$target/x86_64-pc-windows-msvc/release/tool.exe "* ]]; then
+            log_pass "Windows attempt $attempt launches and collects from its fresh configured target child"
+        else
+            log_fail "Windows output isolation disagrees with launch/collection: result=$result"
+        fi
+        previous="$target"
+    done
 }
 
 test_frankenterm_profile_override_rejection() {
@@ -2894,33 +3181,39 @@ test_scp_rust_artifact_path() {
     MOCK_BINARY_NAME="mytool"
     MOCK_LOCAL_PATH="/local/path/mytool"
 
-    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+    local result target
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null)
+    target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
 
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/aarch64-apple-darwin/release/mytool "* ]]; then
-        log_pass "Rust artifact path is stable outside the ephemeral source copy"
+    if [[ "$target" == /local/path/.dsr-cargo-target-tool-darwin-arm64/dsr-darwin-arm64-* && \
+          "$scp_args" == *"mmini:$target/aarch64-apple-darwin/release/mytool "* ]]; then
+        log_pass "Rust artifact path follows its private attempt outside the ephemeral source copy"
     else
         log_fail "Expected Rust artifact path in: $scp_args"
     fi
 }
 
 test_scp_rust_artifact_path_with_absolute_cargo_target_dir() {
-    log_test "SCP Unix: Rust honors absolute CARGO_TARGET_DIR"
+    log_test "SCP Unix: Rust honors absolute CARGO_TARGET_DIR as an output base"
     reset_state
     MOCK_LANGUAGE="rust"
     MOCK_BINARY_NAME="mytool"
     MOCK_LOCAL_PATH="/local/path/mytool"
     MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr"
 
-    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+    local result target
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null)
+    target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
 
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/aarch64-apple-darwin/release/mytool "* ]]; then
-        log_pass "Rust artifact path honors absolute CARGO_TARGET_DIR"
+    if [[ "$target" == /Users/jemanuel/tmp/rch-target-dsr/dsr-darwin-arm64-* && \
+          "$scp_args" == *"mmini:$target/aarch64-apple-darwin/release/mytool "* ]]; then
+        log_pass "Rust artifact path honors the configured base and fresh attempt directory"
     else
         log_fail "Expected absolute CARGO_TARGET_DIR artifact path in: $scp_args"
     fi
@@ -2934,12 +3227,15 @@ test_scp_rust_artifact_path_with_relative_cargo_target_dir() {
     MOCK_LOCAL_PATH="/local/path/mytool"
     MOCK_PLATFORM_ENV="CARGO_TARGET_DIR=custom-target"
 
-    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+    local result target
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null)
+    target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
 
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/local/path/.dsr-cargo-target-tool-darwin-arm64/aarch64-apple-darwin/release/mytool "* ]]; then
+    if [[ "$target" == /local/path/.dsr-cargo-target-tool-darwin-arm64/dsr-darwin-arm64-* && \
+          "$scp_args" == *"mmini:$target/aarch64-apple-darwin/release/mytool "* ]]; then
         log_pass "Relative CARGO_TARGET_DIR cannot follow the ephemeral source cwd"
     else
         log_fail "Expected derived absolute CARGO_TARGET_DIR artifact path in: $scp_args"
@@ -2954,12 +3250,15 @@ test_scp_rust_artifact_path_with_cargo_build_target() {
     MOCK_LOCAL_PATH="/local/path/mytool"
     MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr\nCARGO_BUILD_TARGET=x86_64-apple-darwin'
 
-    act_run_native_build "tool" "darwin/amd64" "v1.0.0" "run1" >/dev/null 2>&1
+    local result target
+    result=$(act_run_native_build "tool" "darwin/amd64" "v1.0.0" "run1" 2>/dev/null)
+    target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
 
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/x86_64-apple-darwin/release/mytool "* ]]; then
+    if [[ "$target" == /Users/jemanuel/tmp/rch-target-dsr/dsr-darwin-amd64-* && \
+          "$scp_args" == *"mmini:$target/x86_64-apple-darwin/release/mytool "* ]]; then
         log_pass "Rust artifact path honors CARGO_BUILD_TARGET subdirectory"
     else
         log_fail "Expected CARGO_BUILD_TARGET artifact path in: $scp_args"
@@ -2975,12 +3274,15 @@ test_scp_rust_artifact_path_with_custom_profile() {
     MOCK_BUILD_PROFILE="release-interactive"
     MOCK_PLATFORM_ENV=$'CARGO_TARGET_DIR=/Users/jemanuel/tmp/rch-target-dsr\nCARGO_BUILD_TARGET=aarch64-apple-darwin'
 
-    act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" >/dev/null 2>&1
+    local result target
+    result=$(act_run_native_build "tool" "darwin/arm64" "v1.0.0" "run1" 2>/dev/null)
+    target=$(jq -r '.cargo_isolation.target_dir' <<< "$result")
 
     local scp_args
     scp_args=$(get_scp_args)
 
-    if [[ "$scp_args" == *"mmini:/Users/jemanuel/tmp/rch-target-dsr/aarch64-apple-darwin/release-interactive/mytool "* ]]; then
+    if [[ "$target" == /Users/jemanuel/tmp/rch-target-dsr/dsr-darwin-arm64-* && \
+          "$scp_args" == *"mmini:$target/aarch64-apple-darwin/release-interactive/mytool "* ]]; then
         log_pass "Rust artifact path honors configured Cargo profile directory"
     else
         log_fail "Expected custom-profile artifact path in: $scp_args"
@@ -4117,6 +4419,11 @@ main() {
         else
             log_fail "Native host admission regression cases failed"
         fi
+        if test_native_host_capability_admission; then
+            log_pass "Native capability routing admits the required toolchain before transport"
+        else
+            log_fail "Native capability routing regression cases failed"
+        fi
     fi
     if [[ "${1:-}" == --go-targets-only ]]; then
         test_go_derives_build_target
@@ -4126,6 +4433,20 @@ main() {
         test_go_rejects_conflicting_targets
         test_go_native_launch_overrides_ambient_target
         printf 'Go target tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
+    if [[ "${1:-}" == --ordinary-rust-outputs-only ]]; then
+        test_unix_rust_singleton_rejects_stale_outputs
+        test_unix_rust_keeps_configured_cargo_path_env
+        test_windows_rust_isolation_receipt_matches_command
+        test_windows_rust_absolute_target_is_private
+        test_scp_rust_artifact_path
+        test_scp_rust_artifact_path_with_absolute_cargo_target_dir
+        test_scp_rust_artifact_path_with_relative_cargo_target_dir
+        test_scp_rust_artifact_path_with_cargo_build_target
+        test_scp_rust_artifact_path_with_custom_profile
+        printf 'Ordinary Rust output tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
         [[ "$FAIL_COUNT" -eq 0 ]]
         return $?
     fi
@@ -4192,8 +4513,10 @@ main() {
     test_unix_rust_isolation_honors_host_build_root
     test_unix_rust_isolation_rejects_invalid_host_build_root
     test_unix_rust_keeps_configured_cargo_path_env
+    test_unix_rust_singleton_rejects_stale_outputs
     test_unix_rust_isolation_executes_outside_operator_config
     test_windows_rust_isolation_receipt_matches_command
+    test_windows_rust_absolute_target_is_private
     test_frankenterm_profile_override_rejection
     test_profile_overrides_preserve_ordinary_and_other_tools
     test_rust_build_influence_name_xwin_boundaries
