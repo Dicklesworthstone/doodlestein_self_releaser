@@ -301,7 +301,11 @@ independent collection step. Changing a tool, command, relevant environment,
 Cargo configuration, or toolchain selection file prevents artifact collection,
 even if compilation succeeds. Results, durable state and manifests retain the
 full identities under `cargo_isolation.toolchain` and the context digests under
-`cargo_isolation.cargo_context`. The context receipt omits environment values.
+`cargo_isolation.cargo_context`. General environment values remain digest-only;
+the safe numeric Cargo `[env]` settings `RUST_MIN_STACK` and `RUST_TEST_THREADS`
+retain their configured and effective values in toolchain evidence. These
+settings support literal strings and inline tables with Boolean `force` and
+absent or false `relative`, preserving Cargo's configured-environment precedence.
 
 This Windows boundary accepts one literal `cargo build` or `cargo rustc` command,
 an optional first `+toolchain`, and ordinary Cargo build options. Quote whole
@@ -857,6 +861,13 @@ Full pipeline: check → build → release.
 ```bash
 dsr fallback --repo ntm --version v1.2.3        # One command does it all
 ```
+
+Automation can add `--expected-sha <full-commit>` to bind the operation to the
+workflow run's source. The clean checkout, local version tag and build manifest
+must all match; changes during checks, compilation or signing block publication.
+The GitHub tag is checked again immediately before release. An explicit version
+is required, and dsr leaves checkout selection to you; `--build-only` needs no
+remote tag lookup.
 
 ### `dsr watch`
 

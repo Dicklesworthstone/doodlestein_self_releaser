@@ -257,7 +257,7 @@ _minutes_ago() {
 
 # A queued run of release.yml, 15 minutes old, started by tag v1.2.3.
 _queued_release_run() {
-    printf '{"workflow_runs":[{"id":12345,"status":"queued","created_at":"%s","name":"Release","path":".github/workflows/release.yml","head_branch":"v1.2.3","html_url":"https://github.com/Dicklesworthstone/ntm/actions/runs/12345"}]}' \
+    printf '{"workflow_runs":[{"id":12345,"status":"queued","created_at":"%s","name":"Release","path":".github/workflows/release.yml","head_branch":"v1.2.3","head_sha":"1111111111111111111111111111111111111111","html_url":"https://github.com/Dicklesworthstone/ntm/actions/runs/12345"}]}' \
         "$(_minutes_ago 15)"
 }
 
@@ -275,7 +275,7 @@ _mock_active_inventory() {
         def run($id; $status; $time):
             {id:$id,status:$status,created_at:$time,run_started_at:$time,
              name:"Release",workflow_id:17,path:".github/workflows/release.yml",
-             head_branch:"v1.2.3",event:"push",
+             head_branch:"v1.2.3",head_sha:"1111111111111111111111111111111111111111",event:"push",
              html_url:("https://github.com/Dicklesworthstone/ntm/actions/runs/"+($id|tostring))};
         [range(1;21) | run(.;"completed";$fresh)] as $completed |
         if $mode == "big" then
@@ -421,12 +421,25 @@ case "$1" in
     doctor) exit 0 ;;
     --json)
         [[ "$2" == check ]] || exit 99
+        : > "$TEST_TMPDIR/watch-check.started"
+        deadline=$((SECONDS + 60))
+        while [[ -n "${DSR_WATCH_FIXTURE_CHECK_WAIT:-}" && ! -e "$DSR_WATCH_FIXTURE_CHECK_WAIT" ]]; do
+            ((SECONDS < deadline)) || exit 98
+            sleep 0.05
+        done
         cat "$TEST_TMPDIR/watch-check.json"
         exit 1
         ;;
     --non-interactive)
-        [[ "$2" == fallback ]] || exit 99
+        [[ "$2" == --json && "$3" == fallback ]] || exit 99
         printf '%s\0' "$@" >> "$TEST_TMPDIR/fallback.args"
+        printf 'started\n' >> "$TEST_TMPDIR/fallback.starts"
+        deadline=$((SECONDS + 60))
+        while [[ -n "${DSR_WATCH_FIXTURE_WAIT:-}" && ! -e "$DSR_WATCH_FIXTURE_WAIT" ]]; do
+            ((SECONDS < deadline)) || exit 98
+            sleep 0.05
+        done
+        exit "${DSR_WATCH_FIXTURE_STATUS:-0}"
         ;;
     *) exit 99 ;;
 esac
@@ -434,9 +447,34 @@ EOF
     chmod +x "$TEST_TMPDIR/child-dsr"
     # Sourcing preserves the real CLI's BASH_SOURCE/module paths while $0 is
     # the child boundary above. Wait for the recorded background invocation.
-    bash -c 'trap "wait" EXIT; source "$1" "${@:2}"' \
+    bash -c '
+        if [[ "${DSR_WATCH_FIXTURE_PYTHON:-0}" == 1 ]]; then
+            command() {
+                [[ "${1:-} ${2:-}" != "-v flock" ]] || return 1
+                builtin command "$@"
+            }
+        fi
+        trap "wait" EXIT
+        source "$1" "${@:2}"' \
         "$TEST_TMPDIR/child-dsr" "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/dsr" \
         --json watch --once --notify none "$@"
+}
+
+_watch_completed() {
+    local run_id="${1:-12345}" directory attempt deadline=$((SECONDS + 15))
+    while ((SECONDS < deadline)); do
+        attempt=$(jq -r --arg id "$run_id" '.attempts[$id].attempt_id // empty' "$DSR_STATE_DIR/triggered.json" 2>/dev/null) || attempt=""
+        directory="$DSR_STATE_DIR/watch-attempts/$attempt"
+        [[ -n "$attempt" && -f "$directory/completion.json" ]] && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
+_watch_run_json() {
+    jq -nc --arg sha "${1:-1111111111111111111111111111111111111111}" '
+        {details:{throttled:[{run_id:12345,repo:"Dicklesworthstone/ntm",tool:"ntm",
+            head_branch:"v1.2.3",head_sha:$sha}]}}'
 }
 
 @test "nullable routing: check reaches an unregistered owner/repo without inventing a tool" {
@@ -516,24 +554,205 @@ EOF
 
 @test "nullable routing: watch passes a known tool and its tag as distinct fallback arguments" {
     harness_create_config
-    local check_json='{"details":{"throttled":[{"run_id":12345,"repo":"Dicklesworthstone/ntm","tool":"ntm","head_branch":"v1.2.3"}]}}'
+    local check_json
+    check_json=$(_watch_run_json)
 
     run _routing_watch "$check_json" --auto-fallback
     assert_equal "0" "$status"
-    jq -Rse 'split("\u0000") ==
-        ["--non-interactive", "fallback", "ntm", "--version", "v1.2.3", ""]' \
+    _watch_completed
+    jq -Rse --arg output "$DSR_STATE_DIR/watch-artifacts/12345" 'split("\u0000") ==
+        ["--non-interactive", "--json", "fallback", "ntm", "--version", "v1.2.3",
+         "--expected-sha", "1111111111111111111111111111111111111111", "--output-dir", $output, ""]' \
         "$TEST_TMPDIR/fallback.args"
     jq -e '.runs["12345"] != null' "$DSR_STATE_DIR/triggered.json"
 }
 
-@test "nullable routing: watch keeps a known tool when the branch is null" {
+@test "nullable routing: watch refuses automatic publication without a version tag" {
     harness_create_config
     local check_json='{"details":{"throttled":[{"run_id":12345,"repo":"Dicklesworthstone/ntm","tool":"ntm","head_branch":null}]}}'
 
     run _routing_watch "$check_json" --auto-fallback
     assert_equal "0" "$status"
-    jq -Rse 'split("\u0000") == ["--non-interactive", "fallback", "ntm", ""]' \
-        "$TEST_TMPDIR/fallback.args"
+    assert_contains "$output" "automatic fallback blocked"
+    [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
+    [[ ! -e "$DSR_STATE_DIR/triggered.json" ]]
+}
+
+@test "watch recovery retains a successful child across once invocations" {
+    harness_create_config
+    local check_json
+    check_json=$(_watch_run_json)
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    _watch_completed
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "succeeded" and .attempt == 1 and .exit_code == 0' \
+        "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch recovery uses real Python descriptor locks when flock is absent" {
+    harness_create_config
+    local check_json
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_PYTHON=1 run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    _watch_completed
+    DSR_WATCH_FIXTURE_PYTHON=1 run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "succeeded" and .attempt == 1' "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch recovery retries failed children with a bounded attempt budget" {
+    harness_create_config
+    local check_json
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    _watch_completed
+    sleep 1
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    _watch_completed
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1 --max-attempts 2
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "failed" and .attempt == 2 and .exit_code == 8' \
+        "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 2 ]]
+}
+
+@test "watch recovery preserves cooldown and does not hold the watcher lock in its child" {
+    harness_create_config
+    local check_json
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_WAIT="$TEST_TMPDIR/finish-child" DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "running" and .attempt == 1' "$DSR_STATE_DIR/triggered.json"
+    touch "$TEST_TMPDIR/finish-child"
+    _watch_completed
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "failed" and .attempt == 1 and .next_retry_at > .finished_epoch' \
+        "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch recovery refuses source identity changes and legacy unknown outcomes" {
+    harness_create_config
+    local check_json
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=8 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    sleep 1
+    run _routing_watch "$(_watch_run_json 2222222222222222222222222222222222222222)" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    assert_contains "$output" "Observed identity changed"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+    printf '%s\n' '{"runs":{"12345":"2000-01-01T00:00:00Z"},"last_check":null}' > "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+    jq -e '.runs["12345"] == "2000-01-01T00:00:00Z"' "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "watch recovery refuses corrupt state instead of losing deduplication" {
+    harness_create_config
+    printf 'broken journal\n' > "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch "$(_watch_run_json)" --auto-fallback
+    assert_equal "4" "$status"
+    [[ "$(cat "$DSR_STATE_DIR/triggered.json")" == "broken journal" ]]
+    [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
+}
+
+@test "watch recovery uses the exact private-output checkpoint instead of latest" {
+    harness_create_config
+    local check_json checkpoint=12345678-1234-1234-1234-123456789abc state_dir
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    state_dir="$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint"
+    mkdir -p "$state_dir" "$DSR_STATE_DIR/watch-artifacts/12345"
+    jq -nc --arg run "$checkpoint" --arg output "$DSR_STATE_DIR/watch-artifacts/12345" '
+        {tool:"ntm",version:"v1.2.3",run_id:$run,status:"failed",
+         git_sha:"1111111111111111111111111111111111111111",context:{output_dir:$output}}' > "$state_dir/state.json"
+    ln -s "$checkpoint" "$DSR_STATE_DIR/builds/ntm/v1.2.3/latest"
+    sleep 1
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") | index($resume) != null' "$TEST_TMPDIR/fallback.args"
+    jq -e --arg run "$checkpoint" '.attempts["12345"] | .attempt == 2 and .resume_run_id == $run' "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "watch recovery blocks an artifact directory with no matching source checkpoint" {
+    harness_create_config
+    local check_json
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_STATUS=6 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    mkdir -p "$DSR_STATE_DIR/watch-artifacts/12345"
+    sleep 1
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "blocked" and .attempt == 1' "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch recovery blocks a lost completion rather than replaying publication" {
+    harness_create_config
+    local check_json attempt
+    check_json=$(_watch_run_json)
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "0" "$status"
+    _watch_completed
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+    mv "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json" "$TEST_TMPDIR/retained-completion.json"
+    jq '.attempts["12345"].started_epoch = 0' "$DSR_STATE_DIR/triggered.json" > "$TEST_TMPDIR/old-attempt.json"
+    mv "$TEST_TMPDIR/old-attempt.json" "$DSR_STATE_DIR/triggered.json"
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "blocked" and .next_retry_at == null' "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch recovery serializes overlapping once invocations" {
+    harness_create_config
+    local check_json first deadline=$((SECONDS + 10))
+    check_json=$(_watch_run_json)
+    DSR_WATCH_FIXTURE_CHECK_WAIT="$TEST_TMPDIR/finish-check" _routing_watch "$check_json" --auto-fallback > "$TEST_TMPDIR/first-watch.log" 2>&1 &
+    first=$!
+    while [[ ! -f "$TEST_TMPDIR/watch-check.started" ]] && ((SECONDS < deadline)); do sleep 0.05; done
+    [[ -f "$TEST_TMPDIR/watch-check.started" ]]
+    run _routing_watch "$check_json" --auto-fallback
+    assert_equal "2" "$status"
+    touch "$TEST_TMPDIR/finish-check"
+    wait "$first"
+    _watch_completed
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch recovery validates retry options and never launches unresolved identities" {
+    harness_create_config
+    local check_json field value
+    check_json=$(_watch_run_json)
+    for field in head_sha head_branch; do
+        for value in null '"main"' '""' '"1.2.3"'; do
+            run _routing_watch "$(jq --arg field "$field" --argjson value "$value" '.details.throttled[0][$field]=$value' <<< "$check_json")" --auto-fallback
+            assert_equal "0" "$status"
+            [[ ! -e "$TEST_TMPDIR/fallback.args" ]]
+        done
+    done
+    run _routing_watch "$check_json" --auto-fallback --max-attempts 11
+    assert_equal "4" "$status"
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 0
+    assert_equal "4" "$status"
 }
 
 @test "dsr check defaults to every configured repo's release workflow" {
@@ -575,7 +794,8 @@ EOF
         (.details.throttled | length) == 1 and
         (.details.throttled[0] | .repo == "Dicklesworthstone/ntm" and .tool == "ntm" and
             .workflow == "release.yml" and .run_id == 12345 and .status == "queued" and
-            .head_branch == "v1.2.3" and .queue_time_seconds >= 600 and .threshold_seconds == 600) and
+            .head_branch == "v1.2.3" and .head_sha == "1111111111111111111111111111111111111111" and
+            .queue_time_seconds >= 600 and .threshold_seconds == 600) and
         .details.healthy == []'
 
     # The envelope and details satisfy the published schemas.
@@ -662,23 +882,47 @@ PY
     harness_create_config
     _setup_repos_d
     _mock_gh_runs "$(_queued_release_run)"
-    # The agent_mail hook records every delivered event payload.
-    printf '#!/usr/bin/env bash\ncat >> "%s/hook.log"; echo >> "%s/hook.log"\n' \
-        "$TEST_TMPDIR" "$TEST_TMPDIR" > "$TEST_TMPDIR/hook.sh"
+    # Record events and check that a terminal event never outruns its durable
+    # completion receipt, even when the fallback fails during configuration.
+    cat > "$TEST_TMPDIR/hook.sh" <<'EOF'
+#!/usr/bin/env bash
+payload=$(cat)
+event=$(jq -r '.event' <<< "$payload")
+if [[ "$event" == watch.fallback_started || "$event" == fallback.* ]]; then
+    attempt=$(jq -r '.attempts["12345"].attempt_id' "$DSR_STATE_DIR/triggered.json")
+fi
+if [[ "$event" == watch.fallback_started ]]; then
+    source "$DSR_PROJECT_ROOT/src/build_state.sh"
+    exec {attempt_fd}>> "$DSR_STATE_DIR/watch-attempts/$attempt/active.lock"
+    lock_status=0
+    _build_state_wait_lock "$attempt_fd" 0 || lock_status=$?
+    if [[ "$lock_status" == 1 && ! -e "$DSR_STATE_DIR/watch-attempts/$attempt/result.json" ]]; then
+        : > "$TEST_TMPDIR/launch-lock-before-worker"
+    fi
+elif [[ "$event" == fallback.* ]]; then
+    if jq -e '.run_id == "12345" and .attempt == 1 and .exit_code == 4' \
+        "$DSR_STATE_DIR/watch-attempts/$attempt/completion.json" >/dev/null; then
+        : > "$TEST_TMPDIR/terminal-after-completion"
+    fi
+fi
+printf '%s\n' "$payload" >> "$TEST_TMPDIR/hook.log"
+EOF
     chmod +x "$TEST_TMPDIR/hook.sh"
 
     DSR_AGENT_MAIL_HOOK="$TEST_TMPDIR/hook.sh" run harness_run_dsr watch --once --auto-fallback --notify agent_mail
     assert_equal "0" "$status"
 
     # The fallback child runs detached; ntm's local_path does not exist here,
-    # so it stops at configuration and must say so through the same channel.
+    # so it stops at configuration and must report failure on the same channel.
     local i
     for i in $(seq 1 60); do
         grep -q '"event":"fallback\.' "$TEST_TMPDIR/hook.log" 2>/dev/null && break
         sleep 1
     done
     jq -se '[.[].event] == ["watch.throttled", "watch.fallback_started", "fallback.failed"] and
-        (.[2].message | contains("ntm v1.2.3 fallback stopped in config"))' "$TEST_TMPDIR/hook.log"
+        (.[2].message | contains("ntm v1.2.3 fallback stopped") and contains("exit 4"))' "$TEST_TMPDIR/hook.log"
+    [[ -f "$TEST_TMPDIR/launch-lock-before-worker" ]]
+    [[ -f "$TEST_TMPDIR/terminal-after-completion" ]]
 }
 
 @test "dsr watch honors the global --dry-run" {

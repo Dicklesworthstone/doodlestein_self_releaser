@@ -456,7 +456,33 @@ dsr watch [--interval <seconds>] [--auto-fallback] [--notify <method>]
 |------|---------|-------------|
 | `--interval` | 60 | Check interval in seconds |
 | `--auto-fallback` | false | Auto-trigger fallback on throttle |
+| `--max-attempts` | 3 | Maximum attempts per observed run, from 1 through 10 |
+| `--retry-delay` | 60 | Initial retry cooldown in seconds, from 1 through 3600 |
+| `--once` | false | Check once using the same exclusive lock and recovery journal |
 | `--notify` | none | Notification: slack\|discord\|desktop\|none |
+
+Automatic fallback requires an explicit `v`-prefixed version tag and the
+workflow run's full source SHA. The watcher passes both to `fallback`; missing
+or ambiguous source identity never falls back to detecting a version from the
+current checkout.
+
+Each attempt retains its output and terminal exit status under
+`watch-attempts/`, and its build outputs under `watch-artifacts/<run-id>/`.
+`triggered.json` records running, succeeded, failed, or blocked outcomes across
+watcher restarts. Failed attempts can retry while the same source run remains
+throttled, with an exponential cooldown capped at one hour. A retry resumes
+only a unique build UUID matching the exact tool, tag, source SHA, and private
+output directory. Successful runs are never replayed. Legacy timestamp-only
+history and workers lost without a completion receipt require manual recovery;
+their publication outcome cannot safely be inferred.
+Terminal fallback notifications are sent only after the worker has saved its
+completion receipt; detailed phase output remains in the attempt's `result.json`
+and the run's `fallback-<run-id>.log`.
+
+Stopping the watcher leaves its already started fallback workers running.
+Their separate descriptor locks prevent overlapping attempts without holding
+the watcher lock. Both continuous mode and `--once` require `flock` or Python 3
+with `fcntl`; dry-run does not create locks, attempts, or recovery state.
 
 ---
 
@@ -839,11 +865,28 @@ Windows attestation requires native executable Cargo/compiler/linker selectors;
 script wrappers and Cargo plugins are outside this boundary. Tracked Cargo
 configuration uses a bounded literal grammar for build/compiler settings,
 literal target settings, ordinary source/registry settings and Rust flags.
-Includes, dotted keys, inline tables, `cfg(...)` targets, general environment
+Includes, dotted keys, general inline tables, `cfg(...)` targets, general environment
 injection, unstable selector environments and flags that can select another
 linker/compiler/backend are refused before dependency admission. Positive
-literal `RUST_MIN_STACK` and `RUST_TEST_THREADS` are the supported `[env]`
-exceptions. Configured compiler
+integer strings for `RUST_MIN_STACK` and `RUST_TEST_THREADS` are the supported
+`[env]` exceptions. These accept a literal string or a single-line inline table
+with `value`, optional Boolean `force`, and absent or false `relative`:
+
+```toml
+[env]
+RUST_MIN_STACK = { value = "16777216", force = true }
+RUST_TEST_THREADS = { value = "4", force = false, relative = false }
+```
+
+Existing configured environment values take precedence unless `force=true`.
+The resulting value must also be a positive-integer string. The observer uses
+the same effective settings as Cargo's children and retains the configured
+value, force flag, effective value and origin in
+`toolchain.selection.cargo_config[].env_exemptions`. Metadata, compilation and
+independent collection bind this evidence. Unknown or duplicate attributes,
+relative-path expansion, non-Boolean flags, multiline tables and trailing
+commas are refused; this exception does not admit compiler environment changes.
+Configured compiler
 or linker paths must be absolute, or project-relative paths in tracked Cargo
 configuration. PATH entries must be drive-qualified absolute paths; known
 ambiguous compiler lookup locations are refused. Configured
@@ -1025,6 +1068,21 @@ asked for, since `dsr check` itself exits 1 exactly when throttled. Its step
 carries `throttled` and the check's own exit code. The build step covers the
 quality gate, build, artifact verification and signing; `--build-only` runs
 the build step alone. `details.steps[]` lists the steps that ran.
+
+`--expected-sha <full-commit>` binds a fallback to an observed workflow run.
+It requires an explicit `--version` and a nonzero 40-character commit SHA.
+Before creating build state, the checkout's HEAD and the exact local version
+tag must both resolve to that commit, with no tracked or untracked changes.
+The same source check runs after quality checks, after the build and before
+publication; the successful build manifest must also name that commit.
+Immediately before publication the GitHub tag must still resolve to the same
+commit. An unavailable remote lookup returns `8`; a changed tag returns `7`.
+Build-only runs omit this remote lookup and remain usable without GitHub access.
+Replacement Git objects cannot change this identity. A mismatch prevents
+publication and is reported with `details.expected_sha` in JSON output.
+This option verifies an existing checkout; it does not switch branches or
+discard local changes. Manual fallback retains source-version detection when
+the option is omitted.
 
 ---
 

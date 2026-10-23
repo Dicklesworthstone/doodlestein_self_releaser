@@ -1407,7 +1407,8 @@ EOF
                       workflow: (if $file != "" then $file else (.workflow_name // "unknown") end),
                       run_id: .id, status: .status, queue_time_seconds: .age_seconds,
                       threshold_seconds: $threshold, created_at: .created_at,
-                      started_at: .run_started_at, head_branch: .head_branch, html_url: .html_url} |
+                      started_at: .run_started_at, head_branch: .head_branch,
+                      head_sha: .head_sha, html_url: .html_url} |
                      with_entries(select(.value != null))],
                  healthy: [$repos[] | select(.status == "ok") | .repo],
                  skipped: [$repos[] | select(.status == "error") |
@@ -1460,7 +1461,8 @@ _check_repo() {
             ($now - $start) as $age | select($age > $threshold) |
             {id: .id, status: .status, created_at: .created_at,
              workflow_id: .workflow_id, workflow_name: .name, path: .path,
-             head_branch: .head_branch, event: .event, html_url: .html_url,
+             head_branch: .head_branch, head_sha: .head_sha,
+             event: .event, html_url: .html_url,
              age_seconds: $age} +
             (if .status == "in_progress" then {run_started_at: .run_started_at} else {} end)
         ) |
@@ -1518,142 +1520,266 @@ _check_print_result() {
 _WATCH_STATE_DIR="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}"
 _WATCH_TRIGGERED_FILE="$_WATCH_STATE_DIR/triggered.json"
 _WATCH_LOCK_FILE="$_WATCH_STATE_DIR/watch.lock"
+_WATCH_LOCK_FD=""
 
 # Default settings
 _WATCH_DEFAULT_INTERVAL=60   # 1 minute (docs/CLI_CONTRACT.md)
 _WATCH_JITTER_PERCENT=20     # ±20% jitter
-_WATCH_DEBOUNCE_WINDOW=180   # 3 minutes
 _WATCH_BACKOFF_INITIAL=60    # 1 minute initial backoff
 _WATCH_BACKOFF_MAX=3600      # 1 hour max backoff
+_WATCH_MAX_ATTEMPTS=3
+_WATCH_RETRY_DELAY=60
 
 # Internal state
 _WATCH_RUNNING=false
 _WATCH_CURRENT_BACKOFF=0
 
-# Watch signal handlers
-_watch_cleanup() {
-    log_info "Shutting down watcher..."
-    _watch_release_lock
-    _WATCH_RUNNING=false
-}
-
-# Acquire lock to prevent multiple watcher instances
-# Uses atomic mv -n to prevent race conditions (TOCTOU)
+# A stable inode serializes continuous watchers and timer-driven --once calls.
+# Do not unlink it on release: another process may already have it open.
 _watch_acquire_lock() {
-    if ! mkdir -p "$_WATCH_STATE_DIR"; then
-        log_error "Failed to create watch state directory: $_WATCH_STATE_DIR"
-        return 1
+    if ! command -v flock >/dev/null; then
+        if ! command -v python3 >/dev/null || ! python3 -c 'import fcntl' >/dev/null 2>&1; then
+            log_error "Watch recovery requires flock or Python 3 with fcntl"
+            return 3
+        fi
     fi
-
-    local temp_lock="${_WATCH_LOCK_FILE}.$$"
-    local max_attempts=3
-    local attempt=0
-
-    while [[ $attempt -lt $max_attempts ]]; do
-        attempt=$((attempt + 1))
-
-        # Check for existing lock
-        if [[ -f "$_WATCH_LOCK_FILE" ]]; then
-            local lock_pid
-            # Read PID (format: "PID:TIMESTAMP" - timestamp for future stale detection)
-            IFS=':' read -r lock_pid _ < "$_WATCH_LOCK_FILE" 2>/dev/null || true
-
-            # Validate PID is numeric
-            if [[ ! "$lock_pid" =~ ^[0-9]+$ ]]; then
-                log_warn "Corrupted lock file, removing"
-                rm -f "$_WATCH_LOCK_FILE"
-            elif kill -0 "$lock_pid" 2>/dev/null; then
-                log_error "Another watcher is running (PID $lock_pid)"
-                return 2
-            else
-                # Stale lock - remove it
-                log_warn "Removing stale lock file (PID $lock_pid no longer running)"
-                rm -f "$_WATCH_LOCK_FILE"
-            fi
-        fi
-
-        # Create temp lock with PID:TIMESTAMP
-        echo "$$:$(date +%s)" > "$temp_lock" || {
-            log_error "Failed to create temp lock file"
-            return 1
-        }
-
-        # Atomic rename - mv -n fails if target exists (race-safe)
-        # Note: mv -n is POSIX and atomic on same filesystem
-        if mv -n "$temp_lock" "$_WATCH_LOCK_FILE" 2>/dev/null; then
-            # Verify we own the lock (another process might have won)
-            local final_pid
-            IFS=':' read -r final_pid _ < "$_WATCH_LOCK_FILE" 2>/dev/null || true
-            if [[ "$final_pid" == "$$" ]]; then
-                return 0
-            fi
-            # Lost race, loop and retry
-            log_debug "Lost lock race, retrying..."
-        fi
-
-        # Clean up temp file if mv failed
-        rm -f "$temp_lock" 2>/dev/null
-        sleep 0.1
-    done
-
-    log_error "Failed to acquire lock after $max_attempts attempts"
-    return 2
+    mkdir -p -- "$_WATCH_STATE_DIR" || return 4
+    [[ ! -L "$_WATCH_LOCK_FILE" && ( ! -e "$_WATCH_LOCK_FILE" || -f "$_WATCH_LOCK_FILE" ) ]] || return 4
+    exec {_WATCH_LOCK_FD}>> "$_WATCH_LOCK_FILE" || return 4
+    if ! _build_state_wait_lock "$_WATCH_LOCK_FD" 0; then
+        _watch_release_lock
+        log_error "Another watcher is running"
+        return 2
+    fi
 }
 
 _watch_release_lock() {
-    rm -f "$_WATCH_LOCK_FILE" 2>/dev/null
+    if [[ -n "$_WATCH_LOCK_FD" ]]; then
+        exec {_WATCH_LOCK_FD}>&-
+        _WATCH_LOCK_FD=""
+    fi
 }
 
-# Load triggered runs state
+# Legacy timestamp-only entries remain deduplicated. They say nothing about
+# the result of the old child, so migrating them must never replay a release.
 _watch_load_triggered() {
-    if [[ -f "$_WATCH_TRIGGERED_FILE" ]]; then
-        cat "$_WATCH_TRIGGERED_FILE"
-    else
-        echo '{"runs": {}, "last_check": null}'
+    if [[ ! -e "$_WATCH_TRIGGERED_FILE" && ! -L "$_WATCH_TRIGGERED_FILE" ]]; then
+        printf '%s\n' '{"schema_version":2,"runs":{},"attempts":{},"last_check":null}'
+        return 0
     fi
+    [[ -f "$_WATCH_TRIGGERED_FILE" && ! -L "$_WATCH_TRIGGERED_FILE" ]] || return 4
+    jq -ces '
+        def integer: type == "number" and floor == .;
+        if length == 1 and (.[0] | type == "object" and
+            (.runs | type == "object" and all(.[]; type == "string")) and
+            ((.attempts // {}) | type == "object" and all(to_entries[];
+                (.key | test("^[1-9][0-9]{0,15}$")) and
+                (.value | type == "object" and
+                    (.attempt | integer and . >= 1 and . <= 10) and
+                    (.attempt_id | type == "string" and test("^[1-9][0-9]{0,15}\\.[A-Za-z0-9]{8}$")) and
+                    (.tool | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+                    (.repo | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+                    (.version | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$")) and
+                    (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+                    (.status | IN("starting", "running", "succeeded", "failed", "blocked")) and
+                    (.started_epoch | integer and . >= 0) and
+                    (.next_retry_at == null or (.next_retry_at | integer and . >= 0)) and
+                    (.resume_run_id | type == "string" and
+                        (. == "" or test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")))
+                )
+            )))
+        then .[0] + {schema_version:2, attempts:(.[0].attempts // {})}
+        else error("invalid watcher state; refusing to lose deduplication") end
+    ' "$_WATCH_TRIGGERED_FILE" 2>/dev/null
 }
 
-# Save triggered runs state
+# Only the watcher holding watch.lock writes this journal. Child workers write
+# their own immutable completion files, never a concurrent read/modify/write.
 _watch_save_triggered() {
-    local state="$1"
-    echo "$state" > "$_WATCH_TRIGGERED_FILE"
+    local state="$1" temporary
+    [[ -n "$_WATCH_LOCK_FD" && ! -L "$_WATCH_TRIGGERED_FILE" ]] || return 4
+    temporary=$(mktemp "$_WATCH_STATE_DIR/.triggered.XXXXXXXX") || return 4
+    printf '%s\n' "$state" > "$temporary" || return 4
+    mv -- "$temporary" "$_WATCH_TRIGGERED_FILE"
 }
 
-# Check if a run was already triggered
-_watch_is_triggered() {
-    local run_id="$1"
-    local state
-    state=$(_watch_load_triggered)
+# Return 0 while a worker or its descendants hold the attempt, 1 when free.
+# The descriptor lock avoids PID reuse and also works after watcher restarts.
+_watch_attempt_active() (
+    local directory="$1" fd status=0
+    [[ -d "$directory" && ! -L "$directory" && -f "$directory/active.lock" &&
+       ! -L "$directory/active.lock" ]] || return 4
+    exec {fd}>> "$directory/active.lock" || return 4
+    _build_state_wait_lock "$fd" 0 || status=$?
+    case "$status" in 0) return 1 ;; 1) return 0 ;; *) return 4 ;; esac
+)
 
-    echo "$state" | jq -e --arg id "$run_id" '.runs[$id] != null' &>/dev/null
-}
-
-# Mark a run as triggered
-_watch_mark_triggered() {
-    local run_id="$1"
-    local state now
-    state=$(_watch_load_triggered)
-    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-    state=$(echo "$state" | jq --arg id "$run_id" --arg ts "$now" \
-        '.runs[$id] = $ts | .last_check = $ts')
-
-    _watch_save_triggered "$state"
-}
-
-# Clean old triggered entries (older than 24 hours)
-_watch_cleanup_triggered() {
-    local state cutoff
-    state=$(_watch_load_triggered)
-    cutoff=$(date -u -d "-24 hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
-             date -u -v-24H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
-
-    if [[ -n "$cutoff" ]]; then
-        state=$(echo "$state" | jq --arg cutoff "$cutoff" \
-            '.runs |= with_entries(select(.value >= $cutoff))')
-        _watch_save_triggered "$state"
+_watch_reconcile_attempts() {
+    local state record run_id directory receipt rc now status updated=false delay attempt
+    state=$(_watch_load_triggered) || { log_error "Cannot read watcher recovery state"; return 4; }
+    now=$(date +%s) || return 4
+    while IFS= read -r run_id; do
+        record=$(jq -c --arg id "$run_id" '.attempts[$id]' <<< "$state") || return 4
+        directory="$_WATCH_STATE_DIR/watch-attempts/$(jq -r '.attempt_id' <<< "$record")"
+        status=0
+        _watch_attempt_active "$directory" || status=$?
+        [[ "$status" == 0 ]] && continue
+        [[ "$status" == 1 ]] || { log_error "Cannot inspect watcher attempt: $directory"; return 4; }
+        if [[ -f "$directory/completion.json" && ! -L "$directory/completion.json" ]]; then
+            if ! receipt=$(jq -ces --arg run "$run_id" --argjson record "$record" '
+                if length == 1 and (.[0] | type == "object" and
+                    .run_id == $run and .attempt_id == $record.attempt_id and
+                    .attempt == $record.attempt and
+                    (.exit_code | type == "number" and floor == . and . >= 0 and . <= 255) and
+                    (.finished_epoch | type == "number" and floor == . and . >= $record.started_epoch))
+                then .[0] else error("invalid completion") end' "$directory/completion.json"); then
+                log_error "Invalid watcher completion: $directory/completion.json"
+                return 4
+            fi
+            rc=$(jq -r '.exit_code' <<< "$receipt")
+            attempt=$(jq -r '.attempt' <<< "$record")
+            delay=$((_WATCH_RETRY_DELAY * (1 << (attempt - 1))))
+            ((delay > _WATCH_BACKOFF_MAX)) && delay=$_WATCH_BACKOFF_MAX
+            state=$(jq -c --arg id "$run_id" --argjson receipt "$receipt" --argjson delay "$delay" '
+                .attempts[$id] += {status:(if $receipt.exit_code == 0 then "succeeded" else "failed" end),
+                    exit_code:$receipt.exit_code, finished_epoch:$receipt.finished_epoch,
+                    next_retry_at:(if $receipt.exit_code == 0 then null else $receipt.finished_epoch + $delay end)}
+            ' <<< "$state") || return 4
+            updated=true
+            if [[ "$rc" == 0 ]]; then
+                log_ok "Fallback for run $run_id completed (attempt $attempt)"
+            else
+                log_warn "Fallback for run $run_id failed (exit $rc, attempt $attempt/$_WATCH_MAX_ATTEMPTS)"
+            fi
+        elif ((now >= $(jq -r '.started_epoch' <<< "$record") + 10)); then
+            # A killed worker may have published before losing its response.
+            # Never turn absence of evidence into permission to publish again.
+            state=$(jq -c --arg id "$run_id" '.attempts[$id] += {status:"blocked",next_retry_at:null,
+                error:"Worker stopped without a completion receipt; inspect the attempt log before manual recovery"}' <<< "$state") || return 4
+            updated=true
+            log_error "Fallback for run $run_id has an unknown outcome; automatic retry blocked"
+        fi
+    done < <(jq -r '.attempts | to_entries[] | select(.value.status == "starting" or .value.status == "running") | .key' <<< "$state")
+    if $updated; then
+        _watch_save_triggered "$state" || return 4
     fi
+    return 0
 }
+
+# Resolve a checkpoint once, bound to this observed run's private output tree.
+# Do not follow `latest`: another build may have changed it between polls.
+_watch_resume_checkpoint() {
+    local tool="$1" version="$2" sha="$3" output="$4" path state run found="" count=0
+    local _BUILD_STATE_DIR="$_WATCH_STATE_DIR/builds"
+    for path in "$_BUILD_STATE_DIR/$tool/$version/"*/state.json; do
+        # `latest/state.json` aliases a UUID directory in every real build.
+        # Count concrete run directories once, never this mutable alias.
+        [[ -f "$path" && ! -L "$path" && ! -L "${path%/state.json}" ]] || continue
+        state=$(cat -- "$path") || return 4
+        jq -e --arg output "$output" '.context.output_dir == $output' <<< "$state" >/dev/null 2>&1 || continue
+        run="${path%/state.json}"; run="${run##*/}"
+        [[ "$run" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || return 4
+        state=$(build_state_get "$tool" "$version" "$run") || return 4
+        jq -e --arg sha "$sha" --arg output "$output" '
+            .git_sha == $sha and .context.output_dir == $output and
+            (.status | IN("created","running","failed","targets-complete","completed"))
+        ' <<< "$state" >/dev/null || return 4
+        found="$run"; count=$((count + 1))
+    done
+    ((count <= 1)) || { log_error "Ambiguous watcher build checkpoints for $tool $version"; return 4; }
+    if ((count == 0)) && [[ -e "$output" || -L "$output" ]]; then
+        log_error "Watcher output exists without its matching build checkpoint: $output"
+        return 4
+    fi
+    printf '%s\n' "$found"
+}
+
+_watch_run_attempt() (
+    local run_id="$1" attempt="$2" directory="$3" tool="$4" version="$5" sha="$6" output="$7" resume="$8"
+    # The launcher acquired this descriptor before publishing the journal.
+    # Keep it inherited by fallback and its descendants until they all exit.
+    local attempt_fd="$9" rc=0 temporary finished
+    # The worker must outlive --once without keeping the watcher mutex held.
+    _watch_release_lock
+    trap - EXIT
+    trap 'exit 5' HUP INT TERM
+    [[ "$attempt_fd" =~ ^[0-9]+$ ]] || return 4
+    local -a args=(--non-interactive --json fallback "$tool" --version "$version"
+        --expected-sha "$sha" --output-dir "$output")
+    [[ -z "$resume" ]] || args+=("--resume=$resume")
+    export DSR_RUN_ID="watch-$run_id-$attempt"
+    # The worker reports the terminal event only after its completion receipt
+    # is durable. Suppress the fallback command's earlier terminal event.
+    DSR_NOTIFY_ENABLED=false DSR_NOTIFY_METHODS=none "$0" "${args[@]}" > "$directory/result.json" || rc=$?
+    finished=$(date +%s) || return 4
+    temporary=$(mktemp "$directory/.completion.XXXXXXXX") || return 4
+    jq -nc --arg run "$run_id" --arg id "${directory##*/}" --argjson attempt "$attempt" \
+        --argjson rc "$rc" --argjson finished "$finished" \
+        '{run_id:$run,attempt_id:$id,attempt:$attempt,exit_code:$rc,finished_epoch:$finished}' > "$temporary" || return 4
+    mv -- "$temporary" "$directory/completion.json" || return 4
+    if [[ "${DSR_NOTIFY_ENABLED:-false}" == true ]]; then
+        local phase event level title message
+        phase=$(jq -ers 'select(length == 1) | .[0].details.phase | strings | select(length > 0)' \
+            "$directory/result.json" 2>/dev/null) || phase=fallback
+        if [[ "$rc" == 0 ]]; then
+            event=fallback.success level=success title="Release Complete"
+            message="$tool $version released successfully"
+        else
+            level=error
+            case "$phase" in
+                checks|build|verification|signing)
+                    event=fallback.build_failed title="Build Failed"
+                    message="$tool $version did not build (phase $phase, exit $rc); release blocked" ;;
+                release)
+                    event=fallback.release_failed title="Release Failed"
+                    message="$tool $version was built but its release did not complete (exit $rc)" ;;
+                *)
+                    event=fallback.failed title="Fallback Failed"
+                    message="$tool $version fallback stopped in $phase (exit $rc)" ;;
+            esac
+            message+="; details: $_WATCH_STATE_DIR/fallback-$run_id.log"
+        fi
+        notify_event "$event" "$level" "$title" "$message" "$DSR_RUN_ID:$tool:$version" >&2 || true
+    fi
+    return "$rc"
+)
+
+_watch_launch_attempt() (
+    local run_id="$1" tool="$2" repo="$3" version="$4" sha="$5" attempt="$6" resume="$7"
+    local state directory now timestamp attempt_fd output="$_WATCH_STATE_DIR/watch-artifacts/$run_id"
+    mkdir -p -- "$_WATCH_STATE_DIR/watch-attempts" "$_WATCH_STATE_DIR/watch-artifacts" || return 4
+    [[ ! -L "$_WATCH_STATE_DIR/watch-attempts" && ! -L "$_WATCH_STATE_DIR/watch-artifacts" ]] || return 4
+    directory=$(mktemp -d "$_WATCH_STATE_DIR/watch-attempts/$run_id.XXXXXXXX") || return 4
+    exec {attempt_fd}>> "$directory/active.lock" || return 4
+    _build_state_wait_lock "$attempt_fd" 0 || return 4
+    now=$(date +%s) || return 4
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") || return 4
+    state=$(_watch_load_triggered) || return 4
+    state=$(jq -c --arg id "$run_id" --arg tool "$tool" --arg repo "$repo" --arg version "$version" \
+        --arg sha "$sha" --arg directory "${directory##*/}" --arg resume "$resume" --arg timestamp "$timestamp" \
+        --argjson attempt "$attempt" --argjson now "$now" '
+        .runs[$id] = $timestamp | .last_check = $timestamp |
+        .attempts[$id] = {attempt:$attempt,attempt_id:$directory,tool:$tool,repo:$repo,version:$version,
+            head_sha:$sha,status:"running",started_epoch:$now,next_retry_at:null,resume_run_id:$resume}
+    ' <<< "$state") || return 4
+    _watch_save_triggered "$state" || return 4
+    local fallback_log="$_WATCH_STATE_DIR/fallback-${run_id}.log"
+    [[ ! -L "$fallback_log" ]] || return 4
+    printf '\n--- Watch attempt %s: %s %s (%s) ---\n' "$attempt" "$tool" "$version" "$sha" >> "$fallback_log" || return 4
+    if [[ "${DSR_NOTIFY_ENABLED:-false}" == true ]]; then
+        notify_event "watch.fallback_started" "info" \
+            "Fallback started" \
+            "Repo $repo run $run_id fallback started (attempt $attempt)" \
+            "$run_id:$attempt" || true
+    fi
+    (
+        # Close in the background supervisor too, before invoking the worker
+        # subshell; otherwise that waiting supervisor would retain the mutex.
+        _watch_release_lock
+        _watch_run_attempt "$run_id" "$attempt" "$directory" "$tool" "$version" "$sha" "$output" "$resume" "$attempt_fd"
+    ) >> "$fallback_log" 2>&1 &
+    log_info "Fallback started (PID: $!, attempt: $attempt, log: $fallback_log)"
+)
 
 # Calculate jittered sleep interval
 _watch_jittered_sleep() {
@@ -1676,6 +1802,12 @@ _watch_iteration() {
     local dry_run="$1"
     local auto_fallback="${2:-false}"
     local triggered_count=0
+    local state now
+    if ! $dry_run; then
+        _watch_reconcile_attempts || return $?
+    fi
+    state=$(_watch_load_triggered) || { log_error "Cannot read watcher recovery state"; return 4; }
+    now=$(date +%s) || return 4
 
     log_info "Running throttle check..."
 
@@ -1709,8 +1841,11 @@ _watch_iteration() {
     # Throttled runs: .details.throttled[] (schemas/check-details.json).
     # JSON records preserve an absent tool independently of the run's ref.
     local throttled_runs
-    throttled_runs=$(jq -c '.details.throttled[]?' \
-        <<< "$check_output" 2>/dev/null)
+    if ! jq -e '.details.throttled | type == "array"' <<< "$check_output" >/dev/null 2>&1 ||
+       ! throttled_runs=$(jq -c '.details.throttled[]' <<< "$check_output"); then
+        log_error "Throttle check returned an invalid run inventory"
+        return 8
+    fi
 
     if [[ -z "$throttled_runs" ]]; then
         log_ok "No throttled runs detected"
@@ -1718,17 +1853,33 @@ _watch_iteration() {
     fi
 
     # Process each throttled run
-    local run run_id repo tool_name ref
+    local run run_id repo tool_name ref sha record attempt resume outcome next_retry
     while IFS= read -r run; do
         run_id=$(jq -r '.run_id // empty | tostring' <<< "$run")
-        [[ -z "$run_id" ]] && continue
+        [[ "$run_id" =~ ^[1-9][0-9]{0,15}$ ]] || { log_error "Invalid throttled run ID"; return 8; }
         repo=$(jq -r '.repo // ""' <<< "$run")
         tool_name=$(jq -r '.tool // ""' <<< "$run")
         ref=$(jq -r '.head_branch // ""' <<< "$run")
+        sha=$(jq -r '.head_sha // ""' <<< "$run")
 
-        # Check if already triggered
-        if _watch_is_triggered "$run_id"; then
-            log_debug "Run $run_id already triggered, skipping"
+        record=$(jq -c --arg id "$run_id" '.attempts[$id] // null' <<< "$state") || return 4
+        attempt=1; resume=""
+        if [[ "$record" != null ]]; then
+            if ! jq -e --arg tool "$tool_name" --arg repo "$repo" --arg version "$ref" --arg sha "$sha" '
+                .tool == $tool and .repo == $repo and .version == $version and .head_sha == $sha
+            ' <<< "$record" >/dev/null; then
+                log_error "Observed identity changed for run $run_id; automatic retry blocked"
+                continue
+            fi
+            outcome=$(jq -r '.status' <<< "$record")
+            attempt=$(jq -r '.attempt' <<< "$record")
+            [[ "$outcome" == failed ]] || continue
+            ((attempt < _WATCH_MAX_ATTEMPTS)) || continue
+            next_retry=$(jq -r '.next_retry_at // 0' <<< "$record")
+            ((now >= next_retry)) || continue
+            attempt=$((attempt + 1))
+        elif jq -e --arg id "$run_id" '.runs[$id] != null' <<< "$state" >/dev/null; then
+            log_debug "Run $run_id has legacy trigger history; automatic replay blocked"
             continue
         fi
         if ! $auto_fallback && [[ -n "${_WATCH_REPORTED[$run_id]:-}" ]]; then
@@ -1746,7 +1897,7 @@ _watch_iteration() {
         # The dsr tool configured for this repository, and the release
         # version when the run was started by a version tag.
         local -a fallback_args=()
-        if [[ "$ref" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$ ]]; then
+        if [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]*)?$ ]]; then
             fallback_args=(--version "$ref")
         fi
 
@@ -1760,29 +1911,31 @@ _watch_iteration() {
         elif [[ -z "$tool_name" ]]; then
             _WATCH_REPORTED["$run_id"]=1
             log_warn "No dsr tool is configured for $repo; not triggering a fallback"
+        elif [[ ! "$tool_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ||
+                ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ||
+                ${#fallback_args[@]} -eq 0 || ! "$sha" =~ ^[0-9a-f]{40}$ ||
+                "$sha" == 0000000000000000000000000000000000000000 ]]; then
+            log_warn "Run $run_id has no unambiguous version tag and source commit; automatic fallback blocked"
         elif $dry_run; then
             log_info "[DRY RUN] Would trigger fallback for $tool_name${fallback_args[*]:+ ${fallback_args[*]}} (run $run_id)"
             triggered_count=$((triggered_count + 1))
         else
-            log_info "Triggering fallback for $tool_name..."
-
-            # Mark as triggered before attempting (to prevent repeated attempts on failure)
-            _watch_mark_triggered "$run_id"
-
-            # Trigger fallback as a background subprocess
-            # Note: --non-interactive is a global flag and must come before the subcommand
-            local fallback_log="$_WATCH_STATE_DIR/fallback-${run_id}.log"
-            log_info "Starting fallback for $tool_name (run $run_id)..."
-            "$0" --non-interactive fallback "$tool_name" ${fallback_args[@]+"${fallback_args[@]}"} \
-                >> "$fallback_log" 2>&1 &
-            local fallback_pid=$!
-            log_info "Fallback started (PID: $fallback_pid, log: $fallback_log)"
-            if [[ "${DSR_NOTIFY_ENABLED:-false}" == "true" ]]; then
-                notify_event "watch.fallback_started" "info" \
-                    "Fallback started" \
-                    "Repo $repo run $run_id fallback started (PID: $fallback_pid)" \
-                    "$run_id" || true
+            local output="$_WATCH_STATE_DIR/watch-artifacts/$run_id"
+            if ((attempt > 1)); then
+                if ! resume=$(_watch_resume_checkpoint "$tool_name" "$ref" "$sha" "$output"); then
+                    state=$(jq -c --arg id "$run_id" '.attempts[$id] += {status:"blocked",next_retry_at:null,
+                        error:"Build checkpoint does not uniquely match the watched source and output"}' <<< "$state") || return 4
+                    _watch_save_triggered "$state" || return 4
+                    log_error "Cannot safely resume fallback for run $run_id; automatic retry blocked"
+                    continue
+                fi
+            elif [[ -e "$output" || -L "$output" ]]; then
+                log_error "Unclaimed watcher artifact directory already exists: $output"
+                return 4
             fi
+            log_info "Starting fallback for $tool_name (run $run_id, attempt $attempt)..."
+            _watch_launch_attempt "$run_id" "$tool_name" "$repo" "$ref" "$sha" "$attempt" "$resume" || return $?
+            state=$(_watch_load_triggered) || return 4
             triggered_count=$((triggered_count + 1))
         fi
     done <<< "$throttled_runs"
@@ -1799,6 +1952,11 @@ _watch_iteration() {
 }
 
 cmd_watch() {
+    (
+    # Keep signal handlers and descriptors private when the CLI is sourced.
+    trap - EXIT
+    local _WATCH_LOCK_FD="" _WATCH_RUNNING=false
+    local _WATCH_MAX_ATTEMPTS=3 _WATCH_RETRY_DELAY=60
     local interval=$_WATCH_DEFAULT_INTERVAL
     local daemon_mode=false
     # The global --dry-run (dsr -n watch) never starts a fallback either.
@@ -1818,6 +1976,14 @@ cmd_watch() {
             --auto-fallback)
                 auto_fallback=true
                 shift
+                ;;
+            --max-attempts|--retry-delay)
+                [[ $# -ge 2 ]] || { log_error "$1 requires a value"; return 4; }
+                case "$1" in
+                    --max-attempts) _WATCH_MAX_ATTEMPTS="$2" ;;
+                    --retry-delay) _WATCH_RETRY_DELAY="$2" ;;
+                esac
+                shift 2
                 ;;
             --notify)
                 [[ $# -ge 2 && "$2" != -* ]] || { log_error "--notify requires a method list"; return 4; }
@@ -1850,6 +2016,8 @@ USAGE:
 OPTIONS:
     --interval, -i <sec>   Poll interval in seconds (default: 60)
     --auto-fallback        Start `dsr fallback` for each throttled release run
+    --max-attempts <N>     Maximum fallback attempts per run (1-10, default: 3)
+    --retry-delay <sec>    Initial retry cooldown (1-3600, default: 60)
     --daemon, -d           Run in background (daemon mode)
     --dry-run, -n          Check but don't trigger fallbacks (also the global -n)
     --once, -1             Single check and exit
@@ -1859,9 +2027,12 @@ OPTIONS:
 BEHAVIOR:
     - Polls every configured repo's release workflow for throttled runs
       (dsr check), at the configured threshold_seconds
-    - Reports each throttled run once; with --auto-fallback, starts one
-      fallback per run for the repo's dsr tool, at the run's version tag
-    - Deduplicates by run ID (won't re-trigger same run)
+    - Automatic fallbacks require an explicit v-prefixed version tag and SHA
+    - Retains running/completed/failed attempts across watcher restarts
+    - Retries failed attempts with exponential cooldown, up to the limit;
+      resumes only a checkpoint matching this run's exact source and output
+    - Never replays a successful run or an attempt with an unknown outcome
+    - --once uses the same lock and recovery state as continuous mode
     - Uses jittered intervals to avoid thundering herd
     - Exponential backoff on API errors (up to 1 hour)
     - Stores state in ~/.local/state/dsr/triggered.json
@@ -1869,6 +2040,8 @@ BEHAVIOR:
 STATE FILES:
     ~/.local/state/dsr/triggered.json  - Triggered run history
     ~/.local/state/dsr/watch.lock      - Lock file (single instance)
+    ~/.local/state/dsr/watch-attempts/ - Retained child results and completion
+    ~/.local/state/dsr/watch-artifacts/ - Per-run build and resume outputs
 
 EXAMPLES:
     dsr watch                         Report throttled runs (foreground)
@@ -1899,6 +2072,12 @@ EOF
         log_error "Invalid interval: $interval (must be >= 10 seconds)"
         return 4
     fi
+    if [[ ! "$_WATCH_MAX_ATTEMPTS" =~ ^([1-9]|10)$ ||
+          ! "$_WATCH_RETRY_DELAY" =~ ^[1-9][0-9]{0,3}$ ]] ||
+       ((_WATCH_RETRY_DELAY > 3600)); then
+        log_error "Watch requires 1-10 attempts and a retry delay of 1-3600 seconds"
+        return 4
+    fi
 
     local bad_method
     if ! bad_method=$(notify_validate_methods "$notify_methods"); then
@@ -1927,6 +2106,16 @@ EOF
     fi
     log_ok "Preflight check passed"
 
+    # Read-only planning creates neither a lock nor recovery state. Every real
+    # invocation, including --once, serializes launches and journal updates.
+    if ! $dry_run; then
+        local lock_status=0
+        _watch_acquire_lock || lock_status=$?
+        [[ "$lock_status" == 0 ]] || return "$lock_status"
+    fi
+    trap _watch_release_lock EXIT
+    trap 'exit 5' HUP INT TERM
+
     # Single check mode
     if $once_mode; then
         log_info "Running single check..."
@@ -1935,7 +2124,7 @@ EOF
 
         if $JSON_MODE; then
             local state
-            state=$(_watch_load_triggered)
+            state=$(_watch_load_triggered) || state=null
             json_envelope "watch" "$([[ $result -eq 0 ]] && echo success || echo error)" "$result" "$(jq -nc \
                 --arg mode "once" \
                 --argjson state "$state" \
@@ -1946,14 +2135,6 @@ EOF
 
         return $result
     fi
-
-    # Acquire lock for continuous mode
-    if ! _watch_acquire_lock; then
-        return 2
-    fi
-
-    # Set up signal handlers
-    trap _watch_cleanup SIGTERM SIGINT
 
     # Daemon mode
     if $daemon_mode; then
@@ -1969,9 +2150,6 @@ EOF
     elif ! $auto_fallback; then
         log_info "(report-only mode - pass --auto-fallback to start fallbacks)"
     fi
-
-    # Clean old triggered entries on startup
-    _watch_cleanup_triggered
 
     _WATCH_RUNNING=true
     local iteration=0
@@ -2005,7 +2183,7 @@ EOF
 
     if $JSON_MODE; then
         local state
-        state=$(_watch_load_triggered)
+        state=$(_watch_load_triggered) || state=null
         json_envelope "watch" "success" 0 "$(jq -nc \
             --argjson iterations "$iteration" \
             --argjson state "$state" \
@@ -2013,6 +2191,7 @@ EOF
     fi
 
     return 0
+    )
 }
 
 cmd_build() {
@@ -9791,14 +9970,15 @@ cmd_fallback() {
     # Isolate lock cleanup, child flags, and signal handlers from the caller.
     # In particular, do not leave an EXIT trap referring to expired locals.
     (
-    local tool_name="" version="" output_dir=""
+    local tool_name="" version="" output_dir="" expected_sha=""
+    local expected_sha_set=false
     local build_only=false skip_checks=false resume=false
     local dry_run="$DRY_RUN" output_dir_explicit=false
     local resume_selector="latest" resume_run_id="" resume_state="" reuse_completed=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --tool|-t|--repo|--version|-V|--output-dir|-o)
+            --tool|-t|--repo|--version|-V|--output-dir|-o|--expected-sha)
                 if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
                     log_error "$1 requires a value"
                     return 4
@@ -9807,8 +9987,17 @@ cmd_fallback() {
                     --tool|-t|--repo) tool_name="$2" ;;
                     --version|-V) version="$2" ;;
                     --output-dir|-o) output_dir="$2"; output_dir_explicit=true ;;
+                    --expected-sha)
+                        $expected_sha_set && { log_error "--expected-sha may only be specified once"; return 4; }
+                        expected_sha="${2,,}"; expected_sha_set=true
+                        ;;
                 esac
                 shift 2
+                ;;
+            --expected-sha=*)
+                $expected_sha_set && { log_error "--expected-sha may only be specified once"; return 4; }
+                expected_sha="${1#*=}"; expected_sha="${expected_sha,,}"; expected_sha_set=true
+                shift
                 ;;
             --build-only) build_only=true; shift ;;
             --skip-checks) skip_checks=true; shift ;;
@@ -9825,6 +10014,7 @@ USAGE:
 OPTIONS:
     -t, --tool <name>      Tool to build/release (--repo is an alias)
     -V, --version <ver>    Version to release (default: detect from source)
+    --expected-sha <sha>   Require this full source commit and an explicit version
     --build-only           Build and verify artifacts without publishing
     --skip-checks          Skip ordinary quality checks; required checks still run
     -r, --resume[=RUN_ID]  Resume a build or reuse its verified completed outputs
@@ -9840,6 +10030,9 @@ DESCRIPTION:
     Resume rechecks quality, source identity, and every artifact. For ordinary
     releases it reconciles an existing release or creates one when absent.
     Existing strict releases still require the strict release repair workflow.
+    --expected-sha binds an automatic fallback to its observed workflow run:
+    the clean checkout, local version tag and build manifest must name that
+    commit. Source identity is rechecked after quality checks and signing.
 
 EXIT CODES:
     0  - Pipeline completed successfully
@@ -9864,6 +10057,15 @@ EOF
     if [[ ! "$tool_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
         log_error "A safe tool name is required"
         return 4
+    fi
+    if $expected_sha_set; then
+        if [[ ! "$expected_sha" =~ ^[0-9a-f]{40}$ || "$expected_sha" == 0000000000000000000000000000000000000000 ||
+              -z "$version" ]]; then
+            log_error "--expected-sha requires a nonzero full commit SHA and an explicit --version"
+            return 4
+        fi
+        # Replacement objects must not reinterpret the observed workflow SHA.
+        export GIT_NO_REPLACE_OBJECTS=1
     fi
     if $resume && [[ "$resume_selector" != latest &&
           ! "$resume_selector" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
@@ -9972,6 +10174,7 @@ EOF
             details=$(jq -nc \
                 --arg tool "$tool_name" --arg version "$tag" --arg repo "$repo" \
                 --arg run_id "$run_id" --arg output_dir "$output_dir" \
+                --arg expected_sha "$expected_sha" \
                 --arg checks "$checks_status" --arg build "$build_status" \
                 --arg verification "$verification_status" --arg signing "$signing_status" \
                 --arg release "$release_status" --arg phase "$phase" --arg error "$error" \
@@ -10006,7 +10209,8 @@ EOF
                   artifacts_count:$artifacts,duration_seconds:$duration,
                   build_only:$build_only,skip_checks:$skip_checks,resume:$resume,
                   resume_run_id:$resume_run_id}
-                + (if $trigger == "" then {} else {trigger: $trigger} end)') || return 4
+                + (if $trigger == "" then {} else {trigger: $trigger} end)
+                + (if $expected_sha == "" then {} else {expected_sha: $expected_sha} end)') || return 4
             json_envelope fallback "$status" "$rc" "$details"
         else
             log_info "Fallback $status: $tool_name $tag (phase: $phase; artifacts: $artifacts_count)"
@@ -10015,6 +10219,32 @@ EOF
         [[ "$phase" == plan ]] || _fallback_notify "$rc" "$phase" "$error"
         return "$rc"
     }
+
+    _fallback_verify_expected_source() {
+        [[ -n "$expected_sha" ]] || return 0
+        local current_sha tag_sha untracked
+        if ! current_sha=$(git -C "$local_path" rev-parse --verify 'HEAD^{commit}') ||
+           ! tag_sha=$(git -C "$local_path" rev-parse --verify "refs/tags/$tag^{commit}"); then
+            log_error "Expected workflow source requires a checkout and the exact local tag $tag"
+            return 4
+        fi
+        if [[ "$current_sha" != "$expected_sha" || "$tag_sha" != "$expected_sha" ]]; then
+            log_error "Workflow source mismatch: expected $expected_sha; HEAD=$current_sha; $tag=$tag_sha"
+            return 4
+        fi
+        if ! git -C "$local_path" diff-index --quiet HEAD -- ||
+           ! git -C "$local_path" diff-files --quiet -- ||
+           ! untracked=$(git -C "$local_path" ls-files --others --exclude-standard) ||
+           [[ -n "$untracked" ]]; then
+            log_error "Expected workflow source requires a clean checkout, including untracked files"
+            return 4
+        fi
+    }
+    if ! _fallback_verify_expected_source; then
+        build_status="blocked"; release_status="blocked"
+        _fallback_result 4 source "Checkout and version tag must match the expected workflow commit"
+        return 4
+    fi
 
     if $dry_run; then
         log_info "[dry-run] Would check, build, verify, and release $tool_name $tag in $output_dir"
@@ -10153,6 +10383,12 @@ EOF
         checks_status="passed"
     fi
 
+    if ! _fallback_verify_expected_source; then
+        build_status="blocked"; release_status="blocked"
+        _fallback_result 4 build "Source changed after quality checks; expected workflow commit is no longer available"
+        return 4
+    fi
+
     local -a build_args=("$tool_name" --version "$version" --output-dir "$output_dir")
     $resume && build_args+=("--resume=$resume_run_id")
     if $reuse_completed; then
@@ -10196,6 +10432,17 @@ EOF
         return 6
     fi
     manifest_sha=$(_release_sha256 "$manifest_file") || return 6
+    if [[ -n "$expected_sha" ]] &&
+       ! jq -e --arg sha "$expected_sha" '.source.git_sha == $sha' <<< "$manifest_json" >/dev/null; then
+        verification_status="failed"; release_status="blocked"
+        _fallback_result 6 verification "Build manifest differs from the expected workflow commit"
+        return 6
+    fi
+    if ! _fallback_verify_expected_source; then
+        verification_status="failed"; release_status="blocked"
+        _fallback_result 6 verification "Source changed during the build; expected workflow commit is no longer available"
+        return 6
+    fi
     if $reuse_completed && ! jq -e --arg run "$resume_run_id" \
         --argjson state "$resume_state" '
             .run_id == $run and .source.git_sha == $state.git_sha and
@@ -10291,7 +10538,9 @@ EOF
         fi
     done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' <<< "$manifest_json")
     if [[ "$(_release_sha256 "$manifest_file")" != "$manifest_sha" ]] ||
-       { $reuse_completed && ! _fallback_verify_completed_source; }; then
+       { $reuse_completed && ! _fallback_verify_completed_source; } ||
+       ! _fallback_verify_expected_source; then
+        verification_status="failed"; release_status="blocked"
         _fallback_result 6 verification "Manifest or completed source changed before release"
         return 6
     fi
@@ -10312,6 +10561,24 @@ EOF
                 return 8
             fi
             [[ "$(jq -r '.count' <<< "$scan")" == 1 ]] && release_args+=(--resume)
+        fi
+        if [[ -n "$expected_sha" ]]; then
+            local observed_tag_sha
+            if ! observed_tag_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null); then
+                release_status="blocked"
+                _fallback_result 8 release "Could not verify the remote tag against the expected workflow commit"
+                return 8
+            fi
+            if [[ "$observed_tag_sha" != "$expected_sha" ]]; then
+                release_status="blocked"
+                _fallback_result 7 release "Remote tag differs from the expected workflow commit"
+                return 7
+            fi
+            if ! _fallback_verify_expected_source; then
+                release_status="blocked"
+                _fallback_result 7 release "Source changed while verifying the remote workflow tag"
+                return 7
+            fi
         fi
         cmd_release "${release_args[@]}" >&2 || rc=$?
         if [[ $rc -ne 0 ]]; then

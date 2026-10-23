@@ -14,6 +14,11 @@
       "type": "string",
       "description": "Version/tag used for the fallback"
     },
+    "expected_sha": {
+      "type": "string",
+      "pattern": "^(?!0{40}$)[0-9a-f]{40}$",
+      "description": "Explicit workflow source commit required of the checkout, version tag, and build manifest"
+    },
     "trigger": {
       "type": "string",
       "description": "Reason the fallback was triggered"

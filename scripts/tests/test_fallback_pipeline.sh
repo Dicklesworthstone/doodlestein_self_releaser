@@ -4,9 +4,15 @@
 # controllable boundaries; this suite does not execute external releases.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# Keep inventory admission real even though cryptographic signing is a
+# controlled boundary below. Sourcing the module does not generate any key.
+# shellcheck source=src/signing.sh
+source "$ROOT/src/signing.sh"
 COMMAND_FILE="${DSR_TEST_COMMAND_FILE:-$ROOT/dsr}"
 HELPERS_FILE="${DSR_TEST_HELPERS_FILE:-$COMMAND_FILE}"
+# shellcheck source=/dev/null
 source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
+# shellcheck source=/dev/null
 source <(awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$COMMAND_FILE")
 # shellcheck source=/dev/null
 source <(awk '/^_act_build_task_plan\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$ROOT/src/act_runner.sh")
@@ -61,6 +67,16 @@ _release_contract_scan_release_by_tag() {
         printf '{"count":0,"release":null}\n'
     fi
 }
+gh_resolve_tag_sha() {
+    printf 'REMOTE_TAG %s\n' "$*" >> "$CALLS"
+    case "$REMOTE_TAG_MODE" in
+        unavailable) return 1 ;;
+        mismatch) printf '%s\n' ffffffffffffffffffffffffffffffffffffffff; return 0 ;;
+        source) printf 'mutated during tag lookup\n' >> "$CASE/source/src.txt" ;;
+        tag) git -C "$CASE/source" tag -f v1.2.3 "$OTHER_SHA" >/dev/null || return 1 ;;
+    esac
+    printf '%s\n' "$SOURCE_SHA"
+}
 build_lock_acquire() {
     printf 'LOCK %s %s\n' "$1" "$2" >> "$CALLS"
     [[ "$LOCK_RC" == 0 ]] || return "$LOCK_RC"
@@ -83,9 +99,18 @@ signing_is_enabled() { [[ "$SIGN_ENABLED" == true ]]; }
 signing_wanted() { [[ "$SIGN_WANTED" == true ]]; }
 signing_check() { printf 'KEYCHECK\n' >> "$CALLS"; return 3; }
 signing_sign_batch() {
+    local payload all_retained=true
+    for payload in "$@"; do
+        if [[ -e "${payload}.minisig" || -L "${payload}.minisig" ]]; then
+            [[ -f "${payload}.minisig" && ! -L "${payload}.minisig" ]] &&
+                signing_verify "$payload" || return 1
+        else
+            all_retained=false
+        fi
+    done
+    $all_retained && return 0
     printf 'SIGN %s\n' "$*" >> "$CALLS"
     printf 'signature output\n'
-    local payload
     if [[ "$SIGN_RC" == 0 && "$SIGN_MODE" != missing ]]; then
         for payload in "$@"; do
             printf 'fixture-signature:%s\n' "$(_release_sha256 "$payload")" > "${payload}.minisig"
@@ -93,6 +118,8 @@ signing_sign_batch() {
         if [[ "$SIGN_MODE" == corrupt ]]; then printf 'invalid\n' > "${1}.minisig"; fi
         if [[ "$SIGN_MODE" == mutate ]]; then printf 'mutated\n' >> "$1"; fi
         if [[ "$SIGN_MODE" == manifest ]]; then printf '\n' >> "$OUT/tool-v1.2.3-manifest.json"; fi
+        if [[ "$SIGN_MODE" == source ]]; then printf 'mutated by signer\n' >> "$CASE/source/src.txt"; fi
+        if [[ "$SIGN_MODE" == tag ]]; then git -C "$CASE/source" tag -f v1.2.3 "$OTHER_SHA" >/dev/null; fi
     fi
     return "$SIGN_RC"
 }
@@ -119,7 +146,8 @@ cmd_build() {
     mkdir -p "$out" || return 4
     printf 'daemon bytes\n' > "$out/daemon"
     printf 'worker bytes\n' > "$out/worker"
-    printf 'unrelated\n' > "$out/tool-obsolete"
+    mkdir -p "$out/diagnostics" || return 4
+    printf 'unrelated\n' > "$out/diagnostics/tool-obsolete"
     local manifest="$out/tool-v1.2.3-manifest.json" body
     body=$(jq -nc --arg run "$RUN" --arg source "$SOURCE_SHA" \
         --arg sha "$(_release_sha256 "$out/daemon")" \
@@ -141,6 +169,7 @@ cmd_build() {
                 partial) body=$(jq '.summary.success=1 | .summary.failed=1' <<< "$body") ;;
                 wrong-tool) body=$(jq '.tool="other"' <<< "$body") ;;
                 wrong-version) body=$(jq '.version="v9.0.0"' <<< "$body") ;;
+                wrong-source) body=$(jq '.source.git_sha=("f"*40)' <<< "$body") ;;
                 duplicate) body=$(jq '.artifacts[1]=.artifacts[0]' <<< "$body") ;;
                 unsafe) body=$(jq '.artifacts[0].name="../foreign"' <<< "$body") ;;
                 diagnostic) body=$(jq '.publishable=false' <<< "$body") ;;
@@ -152,9 +181,11 @@ cmd_build() {
                 symlink) mv "$out/worker" "$CASE/saved-worker"; ln -s "$CASE/saved-worker" "$out/worker" ;;
                 manifest-link) mv "$manifest" "$CASE/saved-manifest"; ln -s "$CASE/saved-manifest" "$manifest" ;;
                 hash-failure) _release_sha256() { return 3; } ;;
+                extra-payload) printf 'undeclared payload\n' > "$out/tool-obsolete" ;;
             esac
             ;;
     esac
+    if [[ "$BUILD_MUTATES_SOURCE" == true ]]; then printf 'mutated by build\n' >> "$CASE/source/src.txt"; fi
     printf '{"child":"build"}\n'
     if [[ "$SIGNAL_PHASE" == build ]]; then kill -TERM "$BASHPID"; fi
     return "$BUILD_RC"
@@ -167,11 +198,12 @@ setup() {
     printf 'language: go\nbinary_name: tool\n' > "$ACT_REPOS_DIR/tool.yaml"
     CALLS="$CASE/calls"; : > "$CALLS"
     export DSR_STATE_DIR="$CASE/state"
-    JSON_MODE=true DRY_RUN=false
+    export JSON_MODE=true DRY_RUN=false
     INIT_RC=0 LOCK_RC=0 UNLOCK_RC=0 QUALITY_RC=0 BUILD_RC=0 SIGN_RC=0 RELEASE_RC=0 CONFIG_RC=0
     CONTRACT=null SIGN_ENABLED=true SIGN_WANTED=true MANIFEST_MODE=valid SIGNAL_PHASE=""
-    SIGNING_PRIVATE_KEY="$CASE/keys/minisign.key" SIGNING_PUBLIC_KEY="$CASE/keys/minisign.pub"
-    SIGN_MODE=valid SCAN_RC=0 RELEASE_EXISTS=false QUALITY_MUTATES_SOURCE=false
+    export SIGNING_PRIVATE_KEY="$CASE/keys/minisign.key" SIGNING_PUBLIC_KEY="$CASE/keys/minisign.pub"
+    SIGN_MODE=valid SCAN_RC=0 RELEASE_EXISTS=false QUALITY_MUTATES_SOURCE=false BUILD_MUTATES_SOURCE=false
+    OTHER_SHA="" REMOTE_TAG_MODE=valid
     RUN=11111111-1111-4111-8111-111111111111 SOURCE_SHA=0000000000000000000000000000000000000000
     TARGETS='linux/amd64 darwin/arm64'
     OUT="$CASE/artifacts"
@@ -401,9 +433,111 @@ test_signing_disabled_by_config_is_quiet() {
         jq -e '.details.phases.signing == "skipped"' "$CASE/stdout" >/dev/null
 }
 
+# A watcher may run after the checkout has advanced, or while quality/build
+# commands mutate it. The public fallback's expected source must survive every
+# boundary, including completed-build reuse and build-only operation.
+test_expected_source_success() {
+    setup "expected-success-$1"; completed_fixture
+    git -C "$CASE/source" -c user.name=Fixture -c user.email=fixture@example.invalid \
+        tag -am source v1.2.3 || return 1
+    if [[ "$1" == resume ]]; then
+        run_fallback --expected-sha "$SOURCE_SHA" --resume
+    elif [[ "$1" == build-only ]]; then
+        run_fallback "--expected-sha=$SOURCE_SHA" --build-only
+    else
+        run_fallback --expected-sha "${SOURCE_SHA^^}"
+    fi
+    [[ "$RC" == 0 ]] && one_result &&
+        jq -e --arg sha "$SOURCE_SHA" '.details.expected_sha==$sha and .details.phases.verification=="passed"' \
+            "$CASE/stdout" >/dev/null || return 1
+    if [[ "$1" == build-only ]]; then ! grep -q '^RELEASE \|^REMOTE_TAG ' "$CALLS"
+    else
+        grep -q '^REMOTE_TAG owner/tool v1.2.3$' "$CALLS" && grep -q '^RELEASE ' "$CALLS"
+    fi
+}
+test_expected_source_initial_refusal() {
+    setup "expected-refuse-$1"; completed_fixture
+    local expected="$SOURCE_SHA"
+    case "$1" in
+        branch-only) git -C "$CASE/source" branch v1.2.3 ;;
+        missing-tag) ;;
+        *) git -C "$CASE/source" tag v1.2.3 || return 1 ;;
+    esac
+    case "$1" in
+        wrong-sha) expected=ffffffffffffffffffffffffffffffffffffffff ;;
+        head-moved)
+            git -C "$CASE/source" -c user.name=Fixture -c user.email=fixture@example.invalid \
+                commit --allow-empty -qm later || return 1 ;;
+        dirty) printf 'dirty\n' >> "$CASE/source/src.txt" ;;
+        staged)
+            printf 'staged\n' >> "$CASE/source/src.txt"
+            git -C "$CASE/source" add src.txt || return 1 ;;
+        untracked) printf 'untracked\n' > "$CASE/source/untracked.txt" ;;
+    esac
+    run_fallback --expected-sha "$expected"
+    [[ "$RC" == 4 ]] && one_result && blocked &&
+        ! grep -q '^INIT\|^LOCK\|^CHECK\|^BUILD ' "$CALLS" &&
+        jq -e '.details.phase=="source" and .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null
+}
+test_expected_source_drift() {
+    setup "expected-drift-$1"; completed_fixture
+    git -C "$CASE/source" tag v1.2.3 || return 1
+    case "$1" in
+        quality) QUALITY_MUTATES_SOURCE=true ;;
+        build) BUILD_MUTATES_SOURCE=true ;;
+        manifest) MANIFEST_MODE=wrong-source ;;
+        signing) SIGN_MODE=source ;;
+        tag)
+            # Make another real commit without changing the expected checkout.
+            OTHER_SHA=$(printf 'other commit\n' | git -C "$CASE/source" \
+                -c user.name=Fixture -c user.email=fixture@example.invalid \
+                commit-tree "HEAD^{tree}" -p HEAD) || return 1
+            SIGN_MODE=tag ;;
+    esac
+    run_fallback --expected-sha "$SOURCE_SHA"
+    local expected_rc=6
+    [[ "$1" == quality ]] && expected_rc=4
+    [[ "$RC" == "$expected_rc" && ! -e "$CASE/lock" ]] && one_result &&
+        ! grep -q '^RELEASE ' "$CALLS" || return 1
+    if [[ "$1" == quality ]]; then ! grep -q '^BUILD\|^SIGN ' "$CALLS"
+    elif [[ "$1" == build || "$1" == manifest ]]; then ! grep -q '^SIGN ' "$CALLS"; fi
+}
+test_expected_remote_tag_refusal() {
+    setup "expected-remote-$1"; completed_fixture
+    git -C "$CASE/source" tag v1.2.3 || return 1
+    REMOTE_TAG_MODE="$1"
+    local expected_rc=7
+    [[ "$1" == unavailable ]] && expected_rc=8
+    if [[ "$1" == tag ]]; then
+        OTHER_SHA=$(printf 'other remote-boundary commit\n' | git -C "$CASE/source" \
+            -c user.name=Fixture -c user.email=fixture@example.invalid \
+            commit-tree "HEAD^{tree}" -p HEAD) || return 1
+    fi
+    run_fallback --expected-sha "$SOURCE_SHA"
+    [[ "$RC" == "$expected_rc" && ! -e "$CASE/lock" ]] && one_result &&
+        grep -q '^REMOTE_TAG owner/tool v1.2.3$' "$CALLS" &&
+        ! grep -q '^RELEASE ' "$CALLS" &&
+        jq -e '.details.phase=="release" and .details.phases.release=="blocked"' "$CASE/stdout" >/dev/null
+}
+test_expected_source_argument_refusal() {
+    setup "expected-argument-$1"
+    case "$1" in
+        missing) run_fallback --expected-sha ;;
+        empty) run_fallback --expected-sha= ;;
+        short) run_fallback --expected-sha abcdef0 ;;
+        zero) run_fallback --expected-sha 0000000000000000000000000000000000000000 ;;
+        duplicate) run_fallback --expected-sha ffffffffffffffffffffffffffffffffffffffff --expected-sha ffffffffffffffffffffffffffffffffffffffff ;;
+        version)
+            RC=0
+            cmd_fallback tool --expected-sha ffffffffffffffffffffffffffffffffffffffff \
+                > "$CASE/stdout" 2> "$CASE/stderr" || RC=$? ;;
+    esac
+    [[ "$RC" == 4 && ! -s "$CALLS" ]]
+}
+
 run_test test_success
 for rc in 1 2 3 4 5 6 8 130 143; do run_test test_build_failure "$rc"; done
-for mode in missing malformed multiple empty partial wrong-tool wrong-version duplicate unsafe diagnostic corrupt absent symlink manifest-link hash-failure; do
+for mode in missing malformed multiple empty partial wrong-tool wrong-version duplicate unsafe diagnostic corrupt absent symlink manifest-link hash-failure extra-payload; do
     run_test test_manifest_failure "$mode"
 done
 run_test test_signing_failure
@@ -436,5 +570,12 @@ for rc in 5 130 143; do run_test test_signing_interruption "$rc"; done
 run_test test_unusable_signing_key_blocks_release
 run_test test_missing_signing_key_releases_unsigned_loudly
 run_test test_signing_disabled_by_config_is_quiet
+for mode in fresh resume build-only; do run_test test_expected_source_success "$mode"; done
+for mode in branch-only missing-tag wrong-sha head-moved dirty staged untracked; do
+    run_test test_expected_source_initial_refusal "$mode"
+done
+for mode in quality build manifest signing tag; do run_test test_expected_source_drift "$mode"; done
+for mode in mismatch unavailable source tag; do run_test test_expected_remote_tag_refusal "$mode"; done
+for mode in missing empty short zero duplicate version; do run_test test_expected_source_argument_refusal "$mode"; done
 printf 'Results: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
