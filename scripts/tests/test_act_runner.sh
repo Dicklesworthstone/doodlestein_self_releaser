@@ -1087,8 +1087,180 @@ PY
     fi
 }
 
+test_unix_native_build_guard() {
+    log_test "Real host-side Unix build supervision"
+    if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+module = sys.argv[1]
+bash = shutil.which('bash')
+root = Path(tempfile.mkdtemp(prefix='dsr-unix-build-guard-'))
+print('Retained native supervisor fixture:', root, flush=True)
+checks = 0
+
+def check(label, valid):
+    global checks
+    checks += 1
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+    if not valid:
+        raise AssertionError(label)
+
+def generate(name, body, deadline=20, selected_shell=None):
+    source = root / (name + '.build.sh')
+    source.write_text(body)
+    result = subprocess.run([bash, '-c',
+        'source "$1"; _act_unix_build_guard_script "$2" "$(cat "$3")" "$4"',
+        '_', module, str(deadline), str(source), selected_shell or bash],
+        capture_output=True, check=True)
+    guard = root / (name + '.guard.sh')
+    guard.write_bytes(result.stdout)
+    return result.stdout
+
+def launch(script, environment=None):
+    process = subprocess.Popen([bash, '-s'], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        env=environment)
+    process.stdin.write(script)
+    process.stdin.close()
+    process.stdin = None
+    return process
+
+def retain(name, process, stdout, stderr):
+    (root / (name + '.stdout')).write_bytes(stdout)
+    (root / (name + '.stderr')).write_bytes(stderr)
+    (root / (name + '.exit')).write_text(str(process.returncode) + '\n')
+
+def wait_marker(path):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if path.exists() and path.stat().st_size:
+            return
+        time.sleep(0.02)
+    raise AssertionError('build process did not start: ' + str(path))
+
+body = "printf 'out \\000 日本語 $()\\n'; printf 'err exact\\n' >&2; " \
+       "if IFS= read -r unexpected; then exit 99; fi; exit 37"
+process = launch(generate('exit-and-stdio', body))
+stdout, stderr = process.communicate(timeout=8)
+retain('exit-and-stdio', process, stdout, stderr)
+check('ordinary nonzero exit and stdin EOF survive supervision', process.returncode == 37)
+check('binary Unicode stdout and stderr are exact, without heartbeat bytes',
+      stdout == 'out \0 日本語 $()\n'.encode() and stderr == b'err exact\n')
+
+body = '#' + ('large-command ' * 14000) + '\nprintf "large-ok\\n"\n'
+process = launch(generate('large-program', body))
+stdout, stderr = process.communicate(timeout=8)
+retain('large-program', process, stdout, stderr)
+check('programs beyond the Unix single-argument limit execute unchanged',
+      process.returncode == 0 and stdout == b'large-ok\n' and not stderr)
+
+missing_environment = dict(os.environ, PATH=str(root / 'absent-runtime'))
+process = launch(generate('missing-python', 'exit 99'), missing_environment)
+stdout, stderr = process.communicate(timeout=5)
+retain('missing-python', process, stdout, stderr)
+check('missing host Python refuses before executing build work',
+      process.returncode == 3 and b'requires Python 3.9+' in stderr and not stdout)
+
+for value in ('0', '-1', '2147484', 'invalid', '1;exit 99'):
+    result = subprocess.run([bash, '-c',
+        'source "$1"; _act_unix_build_guard_script "$2" "exit 99"',
+        '_', module, value], capture_output=True)
+    check('invalid host deadline refuses: ' + value, result.returncode == 4 and not result.stdout)
+
+heartbeat_program = '''import os,signal,sys,time
+from pathlib import Path
+if sys.argv[3] == 'stubborn': signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text('%d %d %d\\n' % (os.getpid(),os.getpgrp(),os.getppid()))
+with open(sys.argv[2], 'ab', buffering=0) as output:
+    while True:
+        output.write(b'.')
+        time.sleep(0.02)
+'''
+sentinel_marker, sentinel_beat = root / 'unrelated.pid', root / 'unrelated.beat'
+sentinel = subprocess.Popen([sys.executable, '-c', heartbeat_program,
+    str(sentinel_marker), str(sentinel_beat), 'ordinary'], start_new_session=True,
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    wait_marker(sentinel_marker)
+    for case in ('completion', 'deadline', 'term', 'interrupt', 'hangup', 'supervisor-kill',
+                 'supervisor-stop', 'stdout-loss', 'stderr-loss'):
+        marker, beat = root / (case + '.pid'), root / (case + '.beat')
+        command = ' '.join(shlex.quote(value) for value in (
+            sys.executable, '-c', heartbeat_program, str(marker), str(beat), 'stubborn'))
+        body = command + ' &\nwhile ! test -s ' + shlex.quote(str(marker)) + '; do sleep 0.02; done\n'
+        body += 'exit 0\n' if case == 'completion' else 'wait\n'
+        process = launch(generate(case, body, 1 if case in ('deadline', 'supervisor-stop') else 20))
+        try:
+            wait_marker(marker)
+            pid, group, _parent = map(int, marker.read_text().split())
+            check(case + ': build has a separate, owned process group',
+                  group != process.pid and group != os.getpgrp() and group != sentinel.pid)
+            if case in ('term', 'interrupt', 'hangup', 'supervisor-kill'):
+                process.send_signal({'term': signal.SIGTERM, 'interrupt': signal.SIGINT,
+                                     'hangup': signal.SIGHUP, 'supervisor-kill': signal.SIGKILL}[case])
+            elif case == 'supervisor-stop':
+                process.send_signal(signal.SIGSTOP)
+                time.sleep(3.5)
+                retired_size = beat.stat().st_size
+                time.sleep(0.15)
+                check('anchor enforces deadline while the supervisor is stopped',
+                      beat.stat().st_size == retired_size)
+                process.send_signal(signal.SIGCONT)
+            elif case == 'stdout-loss':
+                process.stdout.close()
+                process.stdout = None
+            elif case == 'stderr-loss':
+                process.stderr.close()
+                process.stderr = None
+            stdout, stderr = process.communicate(timeout=7)
+            stdout, stderr = stdout or b'', stderr or b''
+            retain(case, process, stdout, stderr)
+            expected = {'completion': 0, 'deadline': 124, 'term': 143, 'interrupt': 130,
+                        'hangup': 129, 'supervisor-kill': -signal.SIGKILL, 'supervisor-stop': 124,
+                        'stdout-loss': 129, 'stderr-loss': 129}[case]
+            check(case + ': supervisor preserves the intended result', process.returncode == expected)
+            retired_size = beat.stat().st_size
+            sentinel_size = sentinel_beat.stat().st_size
+            time.sleep(0.15)
+            check(case + ': cleanup retires the TERM-resistant descendant',
+                  beat.stat().st_size == retired_size)
+            check(case + ': unrelated job keeps running',
+                  sentinel.poll() is None and sentinel_beat.stat().st_size > sentinel_size)
+        finally:
+            if process.poll() is None:
+                process.send_signal(signal.SIGCONT)
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=5)
+finally:
+    sentinel.terminate()
+    sentinel.wait(timeout=5)
+
+(root / 'summary.json').write_text(json.dumps({'checks': checks, 'failures': 0}) + '\n')
+print('Unix native supervisor: %d/%d checks passed' % (checks, checks), flush=True)
+PY
+    then
+        log_pass "Host deadline, cancellation and transport loss retire only the owned build group"
+    else
+        log_fail "host-side Unix native build supervisor regression"
+    fi
+}
+
 # Main
 main() {
+    if [[ "${1:-}" == "--native-guard-only" ]]; then
+        test_unix_native_build_guard
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     if [[ "${1:-}" == "--timeout-only" ]]; then
         test_timeout_descendant_cancellation
         [[ "$FAIL_COUNT" -eq 0 ]]
@@ -1120,6 +1292,7 @@ main() {
     test_act_run_workflow_isolates_parent_write_workflows
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
+    test_unix_native_build_guard
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════"

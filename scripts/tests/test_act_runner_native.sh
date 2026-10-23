@@ -727,6 +727,14 @@ export ACT_CONFIG_DIR="$MOCK_DIR" ACT_REPOS_DIR="$MOCK_DIR/repos.d"
 # _act_windows_cmd_via_powershell is unwrapped to the cmd line itself.
 _test_decode_remote_command() {
     local command="$1" decoded inner
+    if [[ "$command" == '# DSR_UNIX_BUILD_GUARD'* ]]; then
+        # Command-construction fixtures inspect the original build program;
+        # test_act_runner.sh executes the supervisor and its processes for real.
+        inner="${command#*dsr_build_program = \"}"
+        inner="${inner%%\"*}"
+        printf '%s' "$inner" | base64 -d
+        return
+    fi
     if [[ "$command" == powershell\ -NoProfile\ -NonInteractive\ * ||
           "$command" == pwsh\ -NoProfile\ -NonInteractive\ * ]]; then
         decoded=$(_act_windows_command_script "$command") || return 1
@@ -801,6 +809,9 @@ _test_native_windows_toolchain() {
 _act_ssh_exec() {
     local host="$1"
     local cmd
+    if [[ "$2" == '# DSR_UNIX_BUILD_GUARD'* ]]; then
+        printf 'UNIX_GUARD_TIMEOUT:%s\n' "${3:-0}" >> "$SSH_ARGS_FILE"
+    fi
     cmd=$(_test_decode_remote_command "$2")
     # Append for subshell-safe capture: a build now issues follow-up exec
     # calls (stage-root cleanup) and the build command must stay recorded.
@@ -1255,6 +1266,11 @@ test_unix_cd_command() {
         log_pass "cd uses single quotes: cd '/local/path/tool'"
     else
         log_fail "Expected cd '/local/path/tool' but got: $cmd"
+    fi
+    if [[ "$(grep '^UNIX_GUARD_TIMEOUT:' "$SSH_ARGS_FILE")" == "UNIX_GUARD_TIMEOUT:$((_ACT_BUILD_TIMEOUT + 10))" ]]; then
+        log_pass "Ordinary native compiler is supervised once with transport cleanup grace"
+    else
+        log_fail "Ordinary native compiler lacks its Unix host guard"
     fi
 }
 
@@ -2152,6 +2168,12 @@ test_unix_strict_rust_forces_out_of_snapshot_target_dir() {
         log_pass "Native worker and manifest projection retain the held dependency source authority"
     else
         log_fail "Native dependency source evidence was lost or mixed into cache evidence: $environments"
+    fi
+    if [[ "$(grep '^UNIX_GUARD_TIMEOUT:' "$SSH_ARGS_FILE")" == "UNIX_GUARD_TIMEOUT:$((_ACT_BUILD_TIMEOUT + 10))" ]] &&
+       [[ "$cmd" == *DSR_TOOLCHAIN_IDENTITY_PY* && "$cmd" == *'cargo build --release'* ]]; then
+        log_pass "Strict reconstructed compiler and toolchain checks share the Unix host guard"
+    else
+        log_fail "Strict compiler reconstruction bypassed the Unix host guard"
     fi
     unset RUSTC_WRAPPER RUSTFLAGS CARGO_PROFILE_RELEASE_OPT_LEVEL
     unset XWIN_CACHE_DIR XWIN_CROSS_COMPILER DSR_RELEASE_GIT_SHA DSR_RELEASE_GIT_REF
@@ -4413,6 +4435,14 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --native-guard-integration-only ]]; then
+        test_unix_cd_command
+        test_unix_strict_rust_forces_out_of_snapshot_target_dir
+        test_windows_build_guard_transport_and_timeout_validation
+        printf 'Native guard integration tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ $# -eq 0 ]]; then
         if test_native_host_health_admission; then
             log_pass "Native host admission preserves healthy boundaries and refuses before source writes"

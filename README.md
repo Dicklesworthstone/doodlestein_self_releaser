@@ -247,6 +247,14 @@ useful for inspecting a build or when automatic deletion is prohibited. Retained
 stages consume disk space; the build log records their paths. Source isolation,
 artifact collection, and verification run normally.
 
+Native Unix builds require Python 3.9+ on the build host. A host-side supervisor
+owns a separate process group and enforces the build deadline, including when
+the SSH connection closes or the supervisor is killed or stopped. Completion
+also retires lingering children, with a short graceful shutdown before forced
+termination. Build output passes through unchanged. This contains normal child
+processes; trusted build commands that deliberately create a separate session
+can escape the group. Strict Rust builds retain their Python 3.11+ requirement.
+
 Ordinary native Rust builds also give every attempt a fresh final output
 directory. A configured absolute `CARGO_TARGET_DIR` names the base directory;
 DSR builds and collects from a unique child beneath it. This applies to single

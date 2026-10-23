@@ -802,6 +802,18 @@ Native targets build on the host their source was synced to. Manifest artifacts
 and build-environment receipts retain the native task's selected triple; flat
 raw payload names are qualified when needed, while archive members keep the
 configured executable name.
+
+Every native Unix compiler program runs inside a host-side process supervisor
+requiring Python 3.9+ with POSIX process-group support. Its private group is
+retired on completion, timeout, cancellation, or output-transport loss; an
+independent anchor also enforces the deadline or notices a killed supervisor.
+The normal build exit status and stdout/stderr are preserved. Timeout returns
+124 from the host guard. The outer transport receives ten extra seconds for
+cleanup, while the host deadline remains the configured build timeout. Builds
+receive EOF on stdin. A missing host runtime returns dependency error 3 before
+the compiler runs. Commands that deliberately detach into a new session are
+outside this process-group boundary. Strict Rust still requires Python 3.11+.
+
 The manifest also retains `requested_targets` when supplied by the orchestrator.
 For native matrices, both generation and release admission reconcile selected
 triples, environment receipts and retained payloads. A missing or duplicate

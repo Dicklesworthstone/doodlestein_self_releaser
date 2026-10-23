@@ -3459,6 +3459,214 @@ _act_windows_cmd_via_powershell() {
     _act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; \$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')); \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.FileName=\$env:ComSpec; \$psi.Arguments='/d /s /c \"' + \$c + '\"'; \$psi.UseShellExecute=\$false; \$p=[System.Diagnostics.Process]::Start(\$psi); \$p.WaitForExit(); exit \$p.ExitCode"
 }
 
+# A Unix build needs a deadline on its host: terminating an SSH client alone
+# does not retire the remote compiler process group. Keep an anchor alive in a
+# new session until the supervisor has sent its final group signal, so a reaped
+# group leader's PID can never be reused for an unrelated job during cleanup.
+# Output-pipe hangup detects transport loss without heartbeat bytes. stdin is
+# deliberately /dev/null for builds, as with the existing ssh -n transport.
+# This portable process-group guard assumes trusted build programs: a process
+# deliberately starting a separate session can escape the owned group.
+_act_unix_build_guard_script() {
+    local timeout_sec="${1:-$_ACT_BUILD_TIMEOUT}" script="${2:?Unix build script required}"
+    local shell="${3:-}" encoded shell_encoded
+    if [[ ! "$timeout_sec" =~ ^[1-9][0-9]{0,6}$ ]] || (( timeout_sec > 2147483 )); then
+        _log_error "Unix build timeout must be 1..2147483 seconds"
+        return 4
+    fi
+    if ! command -v base64 >/dev/null 2>&1; then
+        _log_error "base64 is required to transport a guarded Unix build"
+        return 3
+    fi
+    encoded=$(printf '%s' "$script" | base64 | tr -d '\r\n') || return 4
+    shell_encoded=$(printf '%s' "$shell" | base64 | tr -d '\r\n') || return 4
+    cat <<'SH'
+# DSR_UNIX_BUILD_GUARD
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '[dsr] Native Unix build supervision requires Python 3.9+ on the build host\n' >&2
+    exit 3
+fi
+exec python3 -I - <<'DSR_UNIX_BUILD_GUARD_PY'
+import base64
+import os
+import select
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+SH
+    printf 'dsr_build_program = "%s"\n' "$encoded"
+    printf 'dsr_build_shell = "%s"\n' "$shell_encoded"
+    printf 'dsr_build_timeout = %s\n' "$timeout_sec"
+    cat <<'PY'
+
+def diagnostic(message):
+    try:
+        os.write(2, ('[dsr] ' + message + '\n').encode())
+    except OSError:
+        pass  # The SSH reader may already have disappeared.
+
+if (sys.version_info < (3, 9) or not hasattr(os, 'fork') or
+        not hasattr(os, 'setsid') or not hasattr(select, 'poll')):
+    diagnostic('Native Unix build supervision requires Python 3.9+ with POSIX fork, setsid and poll')
+    sys.exit(3)
+
+program = base64.b64decode(dsr_build_program, validate=True)
+shell = os.fsdecode(base64.b64decode(dsr_build_shell, validate=True))
+shell = shell or os.environ.get('SHELL') or '/bin/sh'
+# Parse the complete program before execution; no command may read the rest
+# of its own script. A pipe also avoids the host's single-argv size limit.
+program = b'{\n' + program + b'\n} </dev/null\n'
+cancelled = 0
+
+def cancel(signum, _frame):
+    global cancelled
+    if not cancelled:
+        cancelled = 128 + signum
+
+for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(signum, cancel)
+# Preserve the anchor as a waitable child until the final signal, even when
+# the invoking login shell inherited SIGCHLD=SIG_IGN.
+signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+events = select.poll()
+for fd in (1, 2):
+    mode = os.fstat(fd).st_mode
+    if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or os.isatty(fd):
+        events.register(fd, 0)  # ERR/HUP/NVAL are returned without POLLOUT.
+status_read, status_write = os.pipe()
+permit_read, permit_write = os.pipe()
+deadline = time.monotonic() + dsr_build_timeout
+anchor = os.fork()
+if anchor == 0:
+    os.close(status_read)
+    os.close(permit_write)
+    group_owned = False
+
+    def retire_owned_group():
+        # This anchor is still the live session/group leader. Signalling our
+        # own group cannot race another job's PID allocation, even after the
+        # outer supervisor was killed and can no longer reap us.
+        os.killpg(os.getpid(), signal.SIGTERM)
+        grace = time.monotonic() + 2
+        while time.monotonic() < grace:
+            time.sleep(0.05)
+        os.killpg(os.getpid(), signal.SIGKILL)
+
+    try:
+        os.setsid()
+        group_owned = True
+        # Caught dispositions reset at exec; the build's shell receives the
+        # normal signals while this group anchor survives the TERM grace.
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, lambda _signum, _frame: None)
+        os.write(status_write, b'R\n')
+        if os.read(permit_read, 1) != b'1':
+            os._exit(3)
+        child = subprocess.Popen([shell, '-s'], stdin=subprocess.PIPE, close_fds=True)
+
+        def run_build():
+            try:
+                child.communicate(program)
+                code = child.returncode if child.returncode >= 0 else 128 - child.returncode
+            except BaseException as error:
+                diagnostic('Unable to run supervised Unix build: ' + str(error))
+                code = 3
+            try:
+                os.write(status_write, ('E%d\n' % code).encode())
+            except OSError:
+                pass  # The lease loop below handles a lost supervisor.
+
+        # Launch before starting a thread: there is no fork from a multithreaded
+        # Python process. Feeding a large script must not block the watchdog.
+        threading.Thread(target=run_build, daemon=True).start()
+        lease = select.poll()
+        lease.register(permit_read, select.POLLIN)
+        # The parent keeps its writer until cleanup is done. EOF retires this
+        # group even after SIGKILL/OOM of the outer supervisor; a stopped or
+        # otherwise stuck supervisor cannot prevent the host-local deadline.
+        while True:
+            if lease.poll(100) or time.monotonic() >= deadline:
+                retire_owned_group()
+    except BaseException as error:
+        diagnostic('Unable to launch supervised Unix build: ' + str(error))
+        if group_owned:
+            retire_owned_group()
+        os._exit(3)
+
+os.close(status_write)
+os.close(permit_read)
+os.set_blocking(status_read, False)
+events.register(status_read, select.POLLIN)
+ready = False
+started = False
+buffer = b''
+result = 3
+try:
+    while True:
+        observed = events.poll(100)
+        if cancelled:
+            result = cancelled
+            break
+        if any(fd in (1, 2) and mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL)
+               for fd, mask in observed):
+            diagnostic('Build transport closed; retiring the native build process group')
+            result = 128 + signal.SIGHUP
+            break
+        if time.monotonic() >= deadline:
+            diagnostic('Native build exceeded its host-side deadline')
+            result = 124
+            break
+        finished = False
+        for fd, _mask in observed:
+            if fd != status_read:
+                continue
+            data = os.read(status_read, 128)
+            if not data:
+                diagnostic('Native build supervisor anchor exited unexpectedly')
+                finished = True
+                break
+            buffer += data
+            while b'\n' in buffer:
+                line, buffer = buffer.split(b'\n', 1)
+                if line == b'R' and not ready:
+                    ready = True
+                elif line.startswith(b'E') and ready:
+                    result = int(line[1:])
+                    finished = True
+                else:
+                    raise RuntimeError('Invalid native build supervisor status')
+        if finished:
+            break
+        if ready and not started:
+            # Readiness and channel admission precede any build execution.
+            os.write(permit_write, b'1')
+            started = True
+finally:
+    # The anchor has not been waited on, so neither its PID nor its process
+    # group can have been recycled. Before R, no build child can exist.
+    signal_target = (lambda sig: os.killpg(anchor, sig)) if ready else (lambda sig: os.kill(anchor, sig))
+    try:
+        signal_target(signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    grace = time.monotonic() + 2
+    while time.monotonic() < grace:
+        time.sleep(0.05)
+    try:
+        signal_target(signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(anchor, 0)
+    os.close(status_read)
+    os.close(permit_write)
+sys.exit(result)
+DSR_UNIX_BUILD_GUARD_PY
+PY
+}
+
 # The supervisor stays outside its unnamed kill-on-close job. Create the build
 # suspended, assign it before any code can spawn children, and only then resume
 # it. Closing the supervisor's non-inheritable handle retires all descendants
@@ -7410,6 +7618,7 @@ _act_ssh_exec() {
         local ssh_destination
         ssh_destination=$(_act_get_ssh_destination "$host") || return 4
         _act_run_with_timeout "$timeout_sec" ssh \
+            -T \
             -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
             -o BatchMode=yes \
@@ -9957,6 +10166,21 @@ EOF
         else
             _log_error "Original toolchain observation or receipt pin invalid; refusing compiler launch"
             exit_code=4
+        fi
+    fi
+
+    # Wrap the final effective Unix program after strict toolchain checks have
+    # reconstructed it. Its host-side process group is retired after the build
+    # or transport ends; the outer deadline allows only the cleanup grace.
+    if [[ $exit_code -eq 0 ]] && ! _act_is_windows_host "$host"; then
+        local build_shell="" guarded_build_status=0
+        _act_is_local_host "$host" && build_shell="$BASH"
+        remote_cmd=$(_act_unix_build_guard_script "$_ACT_BUILD_TIMEOUT" "$remote_cmd" "$build_shell") || \
+            guarded_build_status=$?
+        if [[ $guarded_build_status -ne 0 ]]; then
+            exit_code=$guarded_build_status
+        else
+            build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 10))
         fi
     fi
 
