@@ -55,9 +55,9 @@ Checking cass... ok ✓
 # Build locally when throttled
 $ dsr build --repo ntm --version v1.2.3
 Building ntm v1.2.3 for linux/amd64, darwin/arm64, windows/amd64...
-  linux/amd64   [act on trj]     ✓ 45s
-  darwin/arm64  [native on mmini] ✓ 32s
-  windows/amd64 [native on wlap]  ✓ 51s
+  linux/amd64   [act on linux-builder]     ✓ 45s
+  darwin/arm64  [native on mac-builder] ✓ 32s
+  windows/amd64 [native on win-builder]  ✓ 51s
 Artifacts: /tmp/dsr/artifacts/ntm-v1.2.3/
 
 # Upload to GitHub Release
@@ -192,25 +192,25 @@ Edit `~/.config/dsr/hosts.yaml`:
 
 ```yaml
 hosts:
-  trj:
+  linux-builder:
     platform: linux/amd64
     connection: local
-  mmini:
+  mac-builder:
     platform: darwin/arm64
     connection: ssh
-    ssh_host: mmini
-  ts1:
+    ssh_host: mac-builder
+  linux-builder-2:
     platform: linux/amd64
     connection: ssh
-    ssh_host: ts1
+    ssh_host: linux-builder-2
     build_root: /var/tmp/dsr-builds   # optional: disk-backed staging root
-  wlap:
+  win-builder:
     platform: windows/amd64
     connection: ssh
-    ssh_host: wlap
+    ssh_host: win-builder
 ```
 
-Ensure hosts have required toolchains for your repos (rust/go/bun) and that `trj` has Docker + act for Linux builds.
+Ensure hosts have required toolchains for your repos (rust/go/bun) and that `linux-builder` has Docker + act for Linux builds.
 
 Native host selection checks the toolchain used by a plain `cargo`, `go`, `bun`,
 or `node` build command. Rust readiness requires both Cargo and rustc to run
@@ -1129,9 +1129,9 @@ workflow: .github/workflows/release.yml
 # Pin this repo's build host per platform (cross_compile.<platform>.host,
 # if set, takes precedence; unlisted platforms use hosts.yaml)
 hosts:
-  linux/amd64: trj
-  darwin/arm64: mmini
-  windows/amd64: wlap
+  linux/amd64: linux-builder
+  darwin/arm64: mac-builder
+  windows/amd64: win-builder
 ```
 
 ### Config precedence: `repos.yaml` vs `repos.d/`
@@ -1338,7 +1338,7 @@ When a command fails, start with the latest `run.log`, then per-build logs under
         ┌───────────────────┼───────────────────┐
         ▼                   ▼                   ▼
 ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│ trj (Linux)      │ │ mmini (macOS)    │ │ wlap (Windows)   │
+│ linux-builder (Linux)      │ │ mac-builder (macOS)    │ │ win-builder (Windows)   │
 │ - Docker + act   │ │ - Native build   │ │ - Native build   │
 │ - x86_64         │ │ - arm64          │ │ - x86_64         │
 └──────────────────┘ └──────────────────┘ └──────────────────┘
@@ -1383,9 +1383,9 @@ chsh -s /opt/homebrew/bin/bash
 /opt/homebrew/bin/bash dsr check
 ```
 
-### "SSH connection to mmini failed"
+### "SSH connection to mac-builder failed"
 
-1. Verify SSH access: `ssh mmini echo ok`
+1. Verify SSH access: `ssh mac-builder echo ok`
 2. Check Tailscale is running: `tailscale status`
 3. Verify host is in `~/.config/dsr/hosts.yaml`
 
