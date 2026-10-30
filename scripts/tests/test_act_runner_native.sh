@@ -1076,9 +1076,10 @@ yq() {
             .) printf '{}\n'; return 0 ;;
             '.hosts[strenv(DSR_STORAGE_HOST)].windows_storage')
                 printf 'null\n'; return 0 ;;
-            '.workspace_archive_files[strenv(DSR_TARGET_PLATFORM)] // []'|\
+            '.workspace_archive_files[strenv(DSR_TARGET_PLATFORM)] // []')
+                printf '%s\n' "${MOCK_WORKSPACE_ARCHIVE_FILES:-[]}"; return 0 ;;
             '.workspace_additional_artifacts[strenv(DSR_TARGET_PLATFORM)] // []')
-                printf '[]\n'; return 0 ;;
+                printf '%s\n' "${MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS:-[]}"; return 0 ;;
         esac
     fi
 
@@ -1182,6 +1183,7 @@ reset_state() {
     unset MOCK_SIBLING_RELATIVE MOCK_SIBLING_LOCAL_PATH
     unset MOCK_ARTIFACT_KIND MOCK_GLIBC_FLOOR MOCK_DERIVE_OPT
     unset MOCK_SOURCE_VERIFY_EXIT_CODE MOCK_STRICT_CARGO_CACHE_ROOT
+    unset MOCK_WORKSPACE_ARCHIVE_FILES MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS
 
     # Defaults
     MOCK_LOCAL_PATH="/local/path/tool"
@@ -3196,6 +3198,166 @@ test_go_artifact_path_honors_gobin() {
     fi
 }
 
+test_windows_literal_artifact_paths() {
+    log_test "Windows companion paths preserve literal names and binary suffix rules"
+    local name actual expected status
+    for name in ui-1.6.0-x86_64.msi bundle.zip manifest.json verify-components.sh NOTICE cli.EXE; do
+        actual=$(act_get_remote_artifact_path rust 'C:\source' \
+            $'CARGO_TARGET_DIR=D:/build-output\nCARGO_BUILD_TARGET=x86_64-pc-windows-msvc' \
+            "$name" windows/amd64 release-interactive file)
+        expected="D:/build-output/x86_64-pc-windows-msvc/release-interactive/$name"
+        if [[ "$actual" == "$expected" ]]; then
+            log_pass "Literal companion preserved: $name"
+        else
+            log_fail "Literal companion $name resolved to $actual (expected $expected)"
+        fi
+    done
+    for name in tool tool.exe tool.EXE tool.debug; do
+        actual=$(act_get_remote_artifact_path go C:/source 'GOBIN=D:/go-output' \
+            "$name" windows/amd64)
+        case "$name" in
+            tool.debug) expected=D:/go-output/tool.debug.exe ;;
+            *) expected=D:/go-output/tool.exe ;;
+        esac
+        if [[ "$actual" == "$expected" ]]; then
+            log_pass "Executable suffix preserved: $name"
+        else
+            log_fail "Executable suffix changed for $name: $actual"
+        fi
+    done
+    actual=$(act_get_remote_artifact_path rust /source 'CARGO_TARGET_DIR=out' \
+        NOTICE linux/amd64 debug file)
+    if [[ "$actual" == /source/out/debug/NOTICE ]]; then
+        log_pass "Unix literal file keeps configured output root and profile"
+    else
+        log_fail "Unix literal output path changed: $actual"
+    fi
+    status=0
+    actual=$(act_get_remote_artifact_path go C:/source '' tool windows/amd64 release unknown) || status=$?
+    if [[ "$status" -eq 4 && -z "$actual" ]]; then
+        log_pass "Unknown artifact kind refuses before resolving a path"
+    else
+        log_fail "Unknown artifact kind was accepted: status=$status path=$actual"
+    fi
+}
+
+test_windows_literal_companion_collection() {
+    log_test "Windows companions: actual ordinary and strict collection retain exact bytes and names"
+    reset_state
+    MOCK_LANGUAGE=go
+    MOCK_LOCAL_PATH=C:/literal/source
+    MOCK_WORKSPACE_ARCHIVE_FILES='[{"name":"verify-components.sh","executable":true},{"name":"manifest.json","executable":false}]'
+    MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS='["ui-1.6.0-x86_64.msi","bundle.zip","NOTICE"]'
+    local inputs
+    inputs=$(mktemp -d "$MOCK_DIR/literal-input.XXXXXXXX") || { log_fail "Cannot create companion inputs"; return; }
+    MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$inputs/tool.exe"
+    printf '#!/bin/sh\nprintf verified\\n\n' > "$inputs/verify-components.sh"
+    printf '{"version":"1.6.0","fixture":true}\n' > "$inputs/manifest.json"
+    # Format is intentionally outside this collection test. Distinct bytes and
+    # the original basename must survive transport and receipt generation.
+    printf '\320\317\021\340\241\261\032\341retained MSI payload\n' > "$inputs/ui-1.6.0-x86_64.msi"
+    printf 'retained archive payload\n' > "$inputs/bundle.zip"
+    printf 'retained extensionless notice\n' > "$inputs/NOTICE"
+    printf 'wrong suffix decoy\n' > "$inputs/ui-1.6.0-x86_64.msi.exe"
+    local mode outcome case_dir result status override name path digest size identity
+    for mode in ordinary strict; do
+        for outcome in complete missing; do
+            case_dir=$(mktemp -d "$MOCK_DIR/literal-${mode}-${outcome}.XXXXXXXX") || return
+            status=0
+            result=$(
+                exec 2> "$case_dir/stderr"
+                # Keep the compilation/SSH protocol fixture used by this
+                # suite. The collector, paths, modes, hashes and held-inode
+                # receipts all run unchanged against real fixture files.
+                _log_error() { printf '%s\n' "$*" >&2; }
+                _literal_remote_file() {
+                    local remote="$1" selected
+                    printf '%s\n' "$remote" >> "$case_dir/requests"
+                    [[ "$remote" == C:/literal/source/* ]] || return 7
+                    selected="${remote#C:/literal/source/}"
+                    [[ "$selected" != */* ]] || return 7
+                    [[ "$outcome" != missing || "$selected" != ui-1.6.0-x86_64.msi ]] || return 7
+                    [[ -f "$inputs/$selected" ]] || return 7
+                    printf '%s\n' "$inputs/$selected"
+                }
+                scp() {
+                    local source="${*: -2:1}" destination="${!#}" selected
+                    if [[ "$destination" == wlap:*/build.ps1 ]]; then
+                        cp "$source" "$MOCK_DIR/staged-command.ps1"
+                        return $?
+                    fi
+                    [[ "$source" == wlap:* ]] || return 7
+                    selected=$(_literal_remote_file "${source#wlap:}") || return 7
+                    cp "$selected" "$destination"
+                }
+                ssh() {
+                    local program remote selected
+                    program=$(_test_decode_remote_command "${!#}") || return 7
+                    [[ "$program" == *"[IO.File]::OpenRead('"* ]] || return 7
+                    remote="${program#*OpenRead(\'}"
+                    remote="${remote%%\'*}"
+                    selected=$(_literal_remote_file "$remote") || return 7
+                    cat "$selected"
+                }
+                override=""
+                [[ "$mode" != strict ]] || override="$MOCK_LOCAL_PATH"
+                ACT_ARTIFACTS_DIR="$case_dir/artifacts" \
+                    act_run_native_build tool windows/amd64 v1.6.0 \
+                        44444444-4444-4444-8444-444444444444 "$override"
+            ) || status=$?
+            printf '%s\n' "$result" > "$case_dir/result.json"
+            if [[ "$outcome" == missing ]]; then
+                if jq -e '.status != "success" and
+                    all(.additional_artifacts[]; (.path | endswith("/ui-1.6.0-x86_64.msi")) | not)' \
+                    <<< "$result" >/dev/null 2>&1 &&
+                   grep -Fq 'C:/literal/source/ui-1.6.0-x86_64.msi' "$case_dir/stderr" &&
+                   ! grep -Fq 'ui-1.6.0-x86_64.msi.exe' "$case_dir/requests" &&
+                   { [[ "$mode" == ordinary ]] || [[ "$status" -eq 7 ]]; }; then
+                    log_pass "$mode missing MSI refuses its receipt, reports exact path and never uses the .exe decoy"
+                else
+                    log_fail "$mode missing MSI was accepted or lost its path diagnostic: status=$status result=$result"
+                fi
+                continue
+            fi
+            if [[ "$status" -eq 0 ]] && jq -e '.status == "success" and
+                (.artifact_paths | length) == 3 and (.additional_artifacts | length) == 3' \
+                <<< "$result" >/dev/null 2>&1; then
+                log_pass "$mode full native collector admits all configured companion names"
+            else
+                log_fail "$mode native collection failed: status=$status result=$result"
+                continue
+            fi
+            for name in verify-components.sh manifest.json ui-1.6.0-x86_64.msi bundle.zip NOTICE; do
+                path=$(jq -r --arg name "$name" \
+                    '[.artifact_paths[], .additional_artifacts[].path][] |
+                     select(endswith("/" + $name))' <<< "$result")
+                if [[ -f "$path" ]] && cmp -s "$inputs/$name" "$path" &&
+                   { [[ "$name" == verify-components.sh && -x "$path" ]] ||
+                     [[ "$name" != verify-components.sh && ! -x "$path" ]]; }; then
+                    log_pass "$mode retains bytes and declared permissions for $name"
+                else
+                    log_fail "$mode companion bytes, name or mode changed: $name ($path)"
+                fi
+            done
+            for name in ui-1.6.0-x86_64.msi bundle.zip NOTICE; do
+                path=$(jq -r --arg name "$name" '.additional_artifacts[] |
+                    select(.path | endswith("/" + $name)) | .path' <<< "$result")
+                digest=$(_act_sha256 "$inputs/$name")
+                size=$(_act_file_size "$inputs/$name")
+                identity=$(_act_file_identity "$path")
+                if jq -e --arg path "$path" --arg digest "$digest" --arg identity "$identity" \
+                    --argjson size "$size" '.additional_artifacts[] |
+                    select(.path == $path) | .sha256 == $digest and .size_bytes == $size and .identity == $identity' \
+                    <<< "$result" >/dev/null 2>&1; then
+                    log_pass "$mode binds actual $name bytes and destination identity into its receipt"
+                else
+                    log_fail "$mode retained an invalid $name receipt"
+                fi
+            done
+        done
+    done
+}
+
 test_scp_rust_artifact_path() {
     log_test "SCP Unix: Rust default target is derived outside staged source"
     reset_state
@@ -4435,6 +4597,13 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --literal-companions-only ]]; then
+        test_windows_literal_artifact_paths
+        test_windows_literal_companion_collection
+        printf 'Literal companion tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --native-guard-integration-only ]]; then
         test_unix_cd_command
         test_unix_strict_rust_forces_out_of_snapshot_target_dir
@@ -4591,6 +4760,8 @@ main() {
     # SCP commands
     test_scp_unix_artifact_path
     test_go_artifact_path_honors_gobin
+    test_windows_literal_artifact_paths
+    test_windows_literal_companion_collection
     test_scp_rust_artifact_path
     test_scp_rust_artifact_path_with_absolute_cargo_target_dir
     test_scp_rust_artifact_path_with_relative_cargo_target_dir

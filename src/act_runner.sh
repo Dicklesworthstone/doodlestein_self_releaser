@@ -7351,8 +7351,10 @@ _act_finalize_frankenterm_windows_family() {
         --manifest "$root/ft-windows-amd64.component-manifest.json" >/dev/null
 }
 
-# Resolve the remote path to a built binary for SCP retrieval.
-# Usage: act_get_remote_artifact_path <language> <remote_path> <build_env> <binary_name> <platform> [build_profile]
+# Resolve a built output inside the language's effective output directory.
+# Usage: act_get_remote_artifact_path <language> <remote_path> <build_env> <name> <platform> [build_profile] [binary|file]
+# Only native binaries receive the Windows .exe suffix. Configured companion
+# files have literal basenames, even when executable or extensionless.
 act_get_remote_artifact_path() {
     local language="$1"
     local remote_path="${2%/}"
@@ -7360,7 +7362,16 @@ act_get_remote_artifact_path() {
     local binary_name="$4"
     local platform="$5"
     local build_profile="${6:-release}"
+    local artifact_kind="${7:-binary}"
     local artifact_base=""
+
+    case "$artifact_kind" in
+        binary|file) ;;
+        *)
+            _log_error "Unknown native artifact kind: $artifact_kind"
+            return 4
+            ;;
+    esac
 
     case "$language" in
         rust)
@@ -7414,9 +7425,11 @@ act_get_remote_artifact_path() {
     local remote_artifact_path="$artifact_base/$binary_name"
     if [[ "$platform" == windows/* ]]; then
         remote_artifact_path="${remote_artifact_path//\\//}"
-        # The archive inventory already normalizes an explicit .exe suffix.
-        # Collection must not turn that selected executable into app.exe.exe.
-        remote_artifact_path="${remote_artifact_path%.[eE][xX][eE]}.exe"
+        if [[ "$artifact_kind" == binary ]]; then
+            # The archive inventory already normalizes an explicit .exe suffix.
+            # Collection must not turn that selected executable into app.exe.exe.
+            remote_artifact_path="${remote_artifact_path%.[eE][xX][eE]}.exe"
+        fi
     fi
 
     printf '%s\n' "$remote_artifact_path"
@@ -10649,7 +10662,11 @@ EOF
             fi
             archive_file_remote=$(act_get_remote_artifact_path \
                 "$language" "$artifact_source_root" "$build_env" "$archive_file" \
-                "$platform" "$build_profile")
+                "$platform" "$build_profile" file) || {
+                _log_error "Cannot resolve workspace archive member: $archive_file"
+                download_failed=true
+                continue
+            }
             archive_file_local="$artifact_dir/$archive_file"
             archive_file_mode=600
             [[ "$archive_file_executable" == "true" ]] && archive_file_mode=700
@@ -10673,7 +10690,7 @@ EOF
                 if [[ -n "$archive_file_receipt" ]]; then
                     local_artifact_paths+=("$archive_file_local")
                 else
-                    _log_error "Failed to collect workspace archive member $archive_file from $host"
+                    _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
                 fi
             elif _act_is_local_host "$host"; then
@@ -10682,6 +10699,7 @@ EOF
                    chmod "$archive_file_mode" "$archive_file_local"; then
                     local_artifact_paths+=("$archive_file_local")
                 else
+                    _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                     download_failed=true
                 fi
             elif scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
@@ -10691,12 +10709,13 @@ EOF
                  chmod "$archive_file_mode" "$archive_file_local"; then
                 local_artifact_paths+=("$archive_file_local")
             else
+                _log_error "Failed to collect workspace archive member $archive_file from $host:$archive_file_remote"
                 download_failed=true
             fi
         done < <(jq -c '.[]' <<< "$workspace_archive_files_json")
 
-        # Build-produced release assets (currently the manifest-bound macOS app
-        # archive) are collected and receipted but never folded into the process
+        # Build-produced release assets (installers, archives and other files)
+        # are collected by literal name but never folded into the process
         # archive.  The receipt is carried in the target result so strict
         # manifest generation can require its exact name, bytes, and identity.
         local additional_json="[]" additional_name additional_remote additional_local
@@ -10728,7 +10747,11 @@ EOF
             fi
             additional_remote=$(act_get_remote_artifact_path \
                 "$language" "$artifact_source_root" "$build_env" "$additional_name" \
-                "$platform" "$build_profile")
+                "$platform" "$build_profile" file) || {
+                _log_error "Cannot resolve additional release artifact: $additional_name"
+                download_failed=true
+                continue
+            }
             additional_local="$artifact_dir/$additional_name"
             additional_receipt=""
             if $strict_native_build; then
@@ -10749,7 +10772,7 @@ EOF
                     local_additional_artifact_paths+=("$additional_local")
                     additional_artifact_receipts+=("$additional_receipt")
                 else
-                    _log_error "Failed to collect additional release artifact $additional_name from $host"
+                    _log_error "Failed to collect additional release artifact $additional_name from $host:$additional_remote"
                     download_failed=true
                 fi
             else
@@ -10766,6 +10789,7 @@ EOF
                      chmod 600 "$additional_local"; then
                     local_additional_artifact_paths+=("$additional_local")
                 else
+                    _log_error "Failed to collect additional release artifact $additional_name from $host:$additional_remote"
                     download_failed=true
                 fi
             fi

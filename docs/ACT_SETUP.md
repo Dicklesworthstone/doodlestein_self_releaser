@@ -141,6 +141,26 @@ gate; those cases skip explicitly when yq is unavailable. The path-policy tests
 use genuine Bash and jq. They do not simulate a Windows host or claim a native
 Windows SSH/rsync acceptance run.
 
+## Native companion artifact paths
+
+`workspace_archive_files` and `workspace_additional_artifacts` name literal
+files in the same effective output directory as the native binaries. For Rust,
+this follows `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET`, and the build profile;
+for Go it follows `GOBIN` when configured. The default Rust directory is
+`<source>/target/<profile>`.
+
+On Windows, a companion named `ui-1.6.0-x86_64.msi`, `manifest.json`,
+`verify-components.sh`, or `NOTICE` is read from exactly that basename.
+DSR does not append `.exe` or fall back to a differently named executable.
+Actual workspace binaries retain their usual Windows `.exe` handling.
+For an archive companion, `executable: true` sets its executable permissions;
+it does not change its filename. Missing companions fail collection with the
+host and exact attempted source path in the diagnostic.
+
+The existing collection receipts bind the transferred bytes, SHA-256, size,
+and destination identity. Literal filenames do not add format-specific MSI
+or archive validation.
+
 ## Common act Commands
 
 ### List workflows and jobs
