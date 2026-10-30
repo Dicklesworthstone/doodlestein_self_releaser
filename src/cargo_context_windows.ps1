@@ -241,12 +241,268 @@ function ConvertFrom-DsrCargoNumericEnvironment {
     return @{name=$Name; value=$value; force=$force}
 }
 
+function Read-DsrCargoCfgToken {
+    param($State, [string]$Expected='')
+    if ($State.Position -ge $State.Tokens.Count -or
+        ($Expected -and $State.Tokens[$State.Position] -cne $Expected)) {
+        throw ('Malformed Cargo cfg expression: ' + $State.Text)
+    }
+    $token=$State.Tokens[$State.Position]; $State.Position++
+    return $token
+}
+
+function Read-DsrCargoCfgNode {
+    param($State, [int]$Depth=0)
+    if ($Depth -gt 32) { throw 'Cargo cfg expression exceeds the nesting bound' }
+    $name=Read-DsrCargoCfgToken $State
+    if ($name -cin @('all','any','not')) {
+        $null=Read-DsrCargoCfgToken $State '('
+        $children=New-Object 'System.Collections.Generic.List[object]'
+        if ($State.Position -lt $State.Tokens.Count -and $State.Tokens[$State.Position] -cne ')') {
+            while ($true) {
+                $children.Add((Read-DsrCargoCfgNode $State ($Depth+1)))
+                if ($State.Position -ge $State.Tokens.Count -or $State.Tokens[$State.Position] -cne ',') { break }
+                if ($name -ceq 'not') { throw 'Cargo cfg not() does not accept a comma' }
+                $null=Read-DsrCargoCfgToken $State ','
+                if ($State.Position -lt $State.Tokens.Count -and $State.Tokens[$State.Position] -ceq ')') { break }
+            }
+        }
+        $null=Read-DsrCargoCfgToken $State ')'
+        if ($name -ceq 'not' -and $children.Count -ne 1) { throw 'Cargo cfg not() requires exactly one predicate' }
+        return @{kind=$name; children=$children.ToArray()}
+    }
+    if ($State.Position -lt $State.Tokens.Count -and $State.Tokens[$State.Position] -ceq '=') {
+        $null=Read-DsrCargoCfgToken $State '='
+        $value=Read-DsrCargoCfgToken $State
+        if ($name -cnotin @('target_arch','target_os','target_env','target_vendor','target_family',
+                'target_endian','target_pointer_width','target_abi') -or
+            $value.Length -lt 2 -or -not $value.StartsWith('"') -or -not $value.EndsWith('"')) {
+            throw ('Unsupported Cargo cfg key/value predicate: ' + $State.Text)
+        }
+        return @{kind='atom'; name=$name; value=$value.Substring(1,$value.Length-2)}
+    }
+    if ($name -cnotin @('unix','windows')) { throw ('Unsupported Cargo cfg name: ' + $name) }
+    return @{kind='atom'; name=$name; value=$null}
+}
+
+function ConvertFrom-DsrCargoCfgExpression {
+    param([string]$Text)
+    # Match the Unix observer's bounded cargo-platform grammar. Parsing visits
+    # every branch before evaluation; inactive predicates cannot hide selectors
+    # whose meaning depends on features, custom flags, profiles or build scripts.
+    if ($Text.Length -gt 4096 -or -not $Text.StartsWith('cfg(') -or -not $Text.EndsWith(')')) {
+        throw 'Unsupported Cargo cfg expression'
+    }
+    $tokens=New-Object 'System.Collections.Generic.List[string]'; $offset=0
+    $pattern=[regex]::new('\G *([A-Za-z_][A-Za-z0-9_]*|"[^"\\\x00-\x1f]*"|[(),=])')
+    while ($offset -lt $Text.Length) {
+        $match=$pattern.Match($Text,$offset)
+        if (-not $match.Success) { throw ('Unsupported token in Cargo cfg expression: ' + $Text) }
+        $tokens.Add($match.Groups[1].Value); $offset+=$match.Length
+        if ($tokens.Count -gt 512) { throw 'Cargo cfg expression exceeds the token bound' }
+    }
+    $state=[pscustomobject]@{Tokens=$tokens; Position=0; Text=$Text}
+    $null=Read-DsrCargoCfgToken $state 'cfg'; $null=Read-DsrCargoCfgToken $state '('
+    $expression=Read-DsrCargoCfgNode $state
+    $null=Read-DsrCargoCfgToken $state ')'
+    if ($state.Position -ne $tokens.Count) { throw ('Trailing input in Cargo cfg expression: ' + $Text) }
+    return $expression
+}
+
+function Test-DsrCargoCfgExpression {
+    param($Expression, $Facts)
+    if ($Expression.kind -ceq 'atom') {
+        $fact=$Expression.name
+        if ($null -ne $Expression.value) { $fact+='="' + $Expression.value + '"' }
+        return $Facts.Contains($fact)
+    }
+    $values=@(foreach ($child in $Expression.children) { Test-DsrCargoCfgExpression $child $Facts })
+    if ($Expression.kind -ceq 'not') { return -not $values[0] }
+    if ($Expression.kind -ceq 'all') { return $values -notcontains $false }
+    return $values -contains $true
+}
+
+function ConvertFrom-DsrCargoTargetCfg {
+    param([string]$Text)
+    if (-not $Text -or [Text.Encoding]::UTF8.GetByteCount($Text) -gt 65536) {
+        throw 'Rustc target cfg output is missing or exceeds the size bound'
+    }
+    $facts=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $reader=[IO.StringReader]::new($Text)
+    try {
+        while ($null -ne ($line=$reader.ReadLine())) {
+            if ($line -cnotmatch '\A[A-Za-z_][A-Za-z0-9_]*(?:="[^"\\\x00-\x1f]*")?\z') {
+                throw 'Malformed rustc target cfg output'
+            }
+            if (-not $facts.Add($line)) { throw 'Duplicate rustc target cfg output' }
+        }
+    } finally { $reader.Dispose() }
+    foreach ($key in @('target_arch','target_os','target_env','target_vendor','target_endian','target_pointer_width')) {
+        $count=0
+        foreach ($fact in $facts) { if ($fact.StartsWith($key+'=',[StringComparison]::Ordinal)) { $count++ } }
+        if ($count -ne 1) { throw ('Missing or ambiguous rustc target cfg: ' + $key) }
+    }
+    return ,$facts
+}
+
+function ConvertTo-DsrCargoFlagWords {
+    param([AllowNull()][object]$Value)
+    $words=New-Object 'System.Collections.Generic.List[string]'
+    if ($Value -is [string]) {
+        if ($Value.Contains([char]0)) { throw 'Cargo rustflags contain a NUL byte' }
+        if ($Value.Trim()) { foreach ($word in [regex]::Split($Value.Trim(),'\s+')) { $words.Add($word) } }
+    } elseif ($Value -is [array]) {
+        foreach ($word in $Value) {
+            if ($word -isnot [string] -or $word.Contains([char]0)) { throw 'Cargo rustflags must be strings without NUL bytes' }
+            $words.Add($word)
+        }
+    } else { throw 'Cargo rustflags must be a string or an array of strings' }
+    return ,$words.ToArray()
+}
+
+function ConvertFrom-DsrCargoEnvironmentFlags {
+    param([string]$Name, [string]$Value)
+    if ($Name -ieq 'CARGO_ENCODED_RUSTFLAGS') {
+        if (-not $Value) { return ,[string[]]@() }
+        return ,$Value.Split([char]31,[StringSplitOptions]::None)
+    }
+    if ($Name -ieq 'RUSTFLAGS') {
+        if ($Value -match '[\x1c-\x1f]') { throw 'Unsupported control separator in Cargo RUSTFLAGS' }
+        $words=New-Object 'System.Collections.Generic.List[string]'
+        foreach ($word in $Value.Split(' ')) { if ($word.Trim()) { $words.Add($word.Trim()) } }
+        return ,$words.ToArray()
+    }
+    return ,(ConvertTo-DsrCargoFlagWords $Value)
+}
+
+function Assert-DsrCargoRustFlags {
+    param([AllowEmptyCollection()][string[]]$Words, [switch]$CfgScoped)
+    # Keep the existing Windows executable-selection boundary, then validate
+    # actual argument boundaries as well as the final concatenated cfg argv.
+    if (($Words -join ' ') -match '(?i)(linker|link-self-contained|codegen-backend|gcc-ld|sysroot|--target|@)') {
+        throw 'Rustflags can change executable selection; configure an explicit Cargo target linker and compiler'
+    }
+    for ($index=0; $index -lt $Words.Count; $index++) {
+        $word=$Words[$index]
+        if ($word.Contains([char]0) -or $word.StartsWith('@') -or $word -cmatch '^-[gOvVh]+[CZ]') {
+            throw 'Rustflags response files, NUL bytes and clustered compiler selectors are not statically attested'
+        }
+        foreach ($selector in @(@{Short='-C'; Long='--codegen'; Forbidden='linker'},
+                @{Short='-Z'; Long='--unstable-options'; Forbidden='codegen-backend'})) {
+            $option=$null
+            if ($word -ceq $selector.Short -or $word -ceq $selector.Long) {
+                $option=if ($index+1 -lt $Words.Count) { $Words[$index+1] } else { '' }
+            } elseif ($word.StartsWith($selector.Short,[StringComparison]::Ordinal) -and $word.Length -gt $selector.Short.Length) {
+                $option=$word.Substring($selector.Short.Length)
+            } elseif ($word.StartsWith($selector.Long+'=',[StringComparison]::Ordinal)) {
+                $option=$word.Substring($selector.Long.Length+1)
+            }
+            if ($null -ne $option) {
+                $key=([regex]::Split($option.Trim().TrimStart('='),'[=\s]'))[0]
+                if ($key.Replace('_','-') -ceq $selector.Forbidden) {
+                    throw 'Rustflags compiler/linker overrides require explicit attested configuration'
+                }
+            }
+        }
+        if ($CfgScoped -and ($word -cin @('--cfg','--target') -or $word.StartsWith('--cfg=') -or $word.StartsWith('--target='))) {
+            throw 'Cfg-scoped Cargo selection cannot be combined with rustflags --cfg or --target'
+        }
+    }
+}
+
+function Get-DsrCargoTargetSettings {
+    param($Config, [string]$Triple, $Environment, $Facts)
+    $exact=if ($Config.target.ContainsKey($Triple)) { $Config.target[$Triple] } else { @{} }
+    $selectors=New-Object 'System.Collections.Generic.List[string]'
+    foreach ($selector in $Config.target.Keys) { $selectors.Add($selector) }
+    $selectors.Sort([StringComparer]::Ordinal)
+    $decisions=New-Object 'System.Collections.Generic.List[object]'
+    $matchingSelectors=New-Object 'System.Collections.Generic.List[string]'
+    $cfgFlags=New-Object 'System.Collections.Generic.List[string]'
+    $cfgLinkers=New-Object 'System.Collections.Generic.List[object]'
+    foreach ($selector in $selectors) {
+        if (-not $selector.StartsWith('cfg(',[StringComparison]::Ordinal)) { continue }
+        $values=$Config.target[$selector]
+        $matched=Test-DsrCargoCfgExpression (ConvertFrom-DsrCargoCfgExpression $selector) $Facts
+        $row=@{expression=$selector; matched=$matched}
+        if ($values.ContainsKey('rustflags')) { $row.rustflags=ConvertTo-DsrCargoFlagWords $values.rustflags }
+        if ($values.ContainsKey('linker')) { $row.linker=$values.linker }
+        $decisions.Add($row)
+        if (-not $matched) { continue }
+        $matchingSelectors.Add($selector)
+        if ($row.ContainsKey('rustflags')) { $cfgFlags.AddRange([string[]]$row.rustflags) }
+        if ($row.ContainsKey('linker')) { $cfgLinkers.Add(@{expression=$selector; linker=$row.linker}) }
+    }
+    $variable='CARGO_TARGET_' + ($Triple.ToUpperInvariant() -replace '[^A-Z0-9]','_') + '_LINKER'
+    if ($Environment.ContainsKey($variable) -and -not $Environment[$variable]) { throw 'An empty Cargo target linker is not statically attested' }
+    $linker=''; $linkerSource=$null
+    if ($Environment.ContainsKey($variable)) { $linker=$Environment[$variable]; $linkerSource=$variable }
+    elseif ($exact.ContainsKey('linker')) { $linker=$exact.linker; $linkerSource='target.'+$Triple }
+    if (-not $linker) {
+        if ($cfgLinkers.Count -gt 1) { throw 'Multiple Cargo cfg linkers match the build target' }
+        if ($cfgLinkers.Count -eq 1) { $linker=$cfgLinkers[0].linker; $linkerSource=$cfgLinkers[0].expression }
+    }
+    $targetFlags=New-Object 'System.Collections.Generic.List[string]'
+    if ($exact.ContainsKey('rustflags')) { $targetFlags.AddRange([string[]](ConvertTo-DsrCargoFlagWords $exact.rustflags)) }
+    $targetVariable=$variable.Substring(0,$variable.Length-6)+'RUSTFLAGS'
+    if ($Environment.ContainsKey($targetVariable)) { $targetFlags.AddRange([string[]](ConvertTo-DsrCargoFlagWords $Environment[$targetVariable])) }
+    $targetFlags.AddRange($cfgFlags)
+    if ($Environment.ContainsKey('CARGO_ENCODED_RUSTFLAGS')) {
+        $flags=ConvertFrom-DsrCargoEnvironmentFlags 'CARGO_ENCODED_RUSTFLAGS' $Environment['CARGO_ENCODED_RUSTFLAGS']; $source='CARGO_ENCODED_RUSTFLAGS'
+    } elseif ($Environment.ContainsKey('RUSTFLAGS')) {
+        $flags=ConvertFrom-DsrCargoEnvironmentFlags 'RUSTFLAGS' $Environment['RUSTFLAGS']; $source='RUSTFLAGS'
+    } elseif ($targetFlags.Count -gt 0) { $flags=$targetFlags.ToArray(); $source='target' }
+    else {
+        $buildFlags=New-Object 'System.Collections.Generic.List[string]'
+        if ($Config.build.ContainsKey('rustflags')) { $buildFlags.AddRange([string[]](ConvertTo-DsrCargoFlagWords $Config.build.rustflags)) }
+        if ($Environment.ContainsKey('CARGO_BUILD_RUSTFLAGS')) { $buildFlags.AddRange([string[]](ConvertTo-DsrCargoFlagWords $Environment['CARGO_BUILD_RUSTFLAGS'])) }
+        $flags=$buildFlags.ToArray(); $source='build'
+    }
+    Assert-DsrCargoRustFlags -Words $flags -CfgScoped:($decisions.Count -gt 0)
+    return @{Linker=$linker; Receipt=@{cfg_tables=$decisions.ToArray(); matched_cfg=$matchingSelectors.ToArray();
+        linker=$(if ($linker) { $linker } else { $null }); linker_source=$linkerSource;
+        rustflags=[string[]]$flags; rustflags_source=$source}}
+}
+
+function Get-DsrCargoTargetObservation {
+    param($Config, [string]$Triple, $Environment, $Compiler, $Context)
+    $cfgScoped=$false
+    foreach ($selector in $Config.target.Keys) { if ($selector.StartsWith('cfg(',[StringComparison]::Ordinal)) { $cfgScoped=$true } }
+    foreach ($name in $Environment.Keys) {
+        if ($name.EndsWith('RUSTFLAGS',[StringComparison]::OrdinalIgnoreCase)) {
+            Assert-DsrCargoRustFlags -Words (ConvertFrom-DsrCargoEnvironmentFlags $name $Environment[$name]) -CfgScoped:$cfgScoped
+        }
+        if ($cfgScoped -and $name -match '^CARGO_UNSTABLE_') { throw 'Unstable Cargo selector environments are outside cfg attestation' }
+    }
+    if ($Config.build.ContainsKey('rustflags')) { Assert-DsrCargoRustFlags -Words (ConvertTo-DsrCargoFlagWords $Config.build.rustflags) -CfgScoped:$cfgScoped }
+    foreach ($targetConfig in $Config.target.Values) {
+        if ($targetConfig.ContainsKey('rustflags')) { Assert-DsrCargoRustFlags -Words (ConvertTo-DsrCargoFlagWords $targetConfig.rustflags) -CfgScoped:$cfgScoped }
+    }
+    $facts=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    if ($cfgScoped) {
+        $path=if ($Compiler.ContainsKey('resolved_path')) { $Compiler.resolved_path } else { $Compiler.selected_path }
+        $expected=if ($Compiler.ContainsKey('resolved_sha256')) { $Compiler.resolved_sha256 } else { $Compiler.selected_sha256 }
+        if ((Get-DsrCargoToolFileHash $path) -cne $expected) { throw 'Rustc executable changed before probing target cfg' }
+        $result=Invoke-DsrCargoToolProbe -Context $Context -Program $path -Arguments @('--print=cfg','--target',$Triple)
+        $facts=ConvertFrom-DsrCargoTargetCfg $result.Stdout
+        if ((Get-DsrCargoToolFileHash $path) -cne $expected) { throw 'Rustc executable changed while probing target cfg' }
+    }
+    $observation=Get-DsrCargoTargetSettings $Config $Triple $Environment $facts
+    if ($cfgScoped) {
+        $values=New-Object 'System.Collections.Generic.List[string]'
+        foreach ($fact in $facts) { $values.Add($fact) }; $values.Sort([StringComparer]::Ordinal)
+        $observation.Receipt.cfg_probe=@{compiler_path=$path; compiler_sha256=$expected; target_triple=$Triple;
+            sha256=(Get-DsrCacheBytesHash ([Text.Encoding]::UTF8.GetBytes($result.Stdout))); values=$values.ToArray()}
+    }
+    return $observation
+}
+
 function Get-DsrCargoToolConfiguration {
     param($Context)
     # This is an admission grammar, not a general TOML parser. Every byte of
     # every admitted statement is consumed. Unsupported syntax fails before
-    # Cargo runs, so dotted keys, cfg selectors, includes and environment
-    # indirection cannot hide a compiler or linker override. Numeric [env]
+    # Cargo runs, so dotted keys, unsupported cfg predicates, includes and
+    # environment indirection cannot hide a compiler or linker override. Numeric [env]
     # tables are the one bounded inline-table exception.
     $config = @{build=@{}; env=@{}; target=(New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)); receipts=@()}
     $directories = New-Object 'System.Collections.Generic.List[string]'
@@ -288,7 +544,9 @@ function Get-DsrCargoToolConfiguration {
             if ($statement -cmatch '^\[\s*(target|source|registries)\s*\.\s*("(?:[^"\\]|\\.)*"|''[^'']*''|[A-Za-z0-9_-]+)\s*\]$') {
                 $section=$Matches[1]; $target=$Matches[2]
                 if ($target.StartsWith('"') -or $target.StartsWith("'")) { $target=ConvertFrom-DsrCargoConfigString $target }
-                if ($target -cnotmatch '^[A-Za-z0-9_-]+$') { throw 'Cargo cfg and dynamic target configuration are not attested' }
+                if ($section -ceq 'target' -and $target.StartsWith('cfg(',[StringComparison]::Ordinal)) {
+                    $null=ConvertFrom-DsrCargoCfgExpression $target
+                } elseif ($target -cnotmatch '^[A-Za-z0-9_-]+$') { throw 'Dynamic Cargo configuration selectors are not attested' }
                 if ($section -eq 'target' -and -not $config.target.ContainsKey($target)) { $config.target[$target]=@{} }
                 continue
             }
@@ -654,20 +912,10 @@ function Get-DsrCargoToolchainIdentity {
     if (-not $triple) { $triple=$hostTriple }
     if ($triple -isnot [string] -or $triple -cnotmatch '^[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,}$') { throw 'Cargo target must be a literal target triple' }
     $linkerVariable='CARGO_TARGET_' + ($triple.ToUpperInvariant() -replace '[^A-Z0-9]','_') + '_LINKER'
-    $linker=''
-    if ($config.target.ContainsKey($triple) -and $config.target[$triple].ContainsKey('linker')) { $linker=$config.target[$triple].linker }
-    if ($effective.ContainsKey($linkerVariable) -and $effective[$linkerVariable]) { $linker=$effective[$linkerVariable] }
+    $targetObservation=Get-DsrCargoTargetObservation -Config $config -Triple $triple -Environment $effective -Compiler $rustc -Context $probe
+    $linker=$targetObservation.Linker
     if ($linker -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and -not [IO.Path]::IsPathRooted($linker)) {
         throw 'Configured Windows linker must use an absolute or config-relative executable path'
-    }
-    $flags=New-Object 'System.Collections.Generic.List[string]'
-    foreach ($name in $effective.Keys) { if ($name -match 'RUSTFLAGS$') { $flags.Add($effective[$name]) } }
-    if ($config.build.ContainsKey('rustflags')) { $flags.Add(($config.build.rustflags -join ' ')) }
-    foreach ($targetConfig in $config.target.Values) { if ($targetConfig.ContainsKey('rustflags')) { $flags.Add(($targetConfig.rustflags -join ' ')) } }
-    foreach ($text in $flags) {
-        if ($text -match '(?i)(linker|link-self-contained|codegen-backend|gcc-ld|sysroot|--target|@)') {
-            throw 'Rustflags can change executable selection; configure an explicit Cargo target linker and compiler'
-        }
     }
     $tools=@{cargo=$cargo; rustc=$rustc}
     $linkerContext=$probe
@@ -695,7 +943,8 @@ function Get-DsrCargoToolchainIdentity {
     return @{schema_version=1; cwd=$Context.SourceRoot; target_triple=$triple;
         linker_variable=$(if ($effective.ContainsKey($linkerVariable)) { $linkerVariable } else { $null }); tools=$tools;
         selection=@{rustup_toolchain=$(if ($Context.Toolchain) { $Context.Toolchain } elseif ($effective.ContainsKey('RUSTUP_TOOLCHAIN')) { $effective['RUSTUP_TOOLCHAIN'] } else { $null });
-            cargo_commands=@((@((Split-DsrCargoLiteralCommand $Context.BuildCommand) | Where-Object { $_.Value -cin @('build','rustc') })[0].Value)); cargo_config=$config.receipts}}
+            cargo_commands=@((@((Split-DsrCargoLiteralCommand $Context.BuildCommand) | Where-Object { $_.Value -cin @('build','rustc') })[0].Value));
+            cargo_config=$config.receipts; cargo_target=$targetObservation.Receipt}}
 }
 
 function New-DsrCargoContextEnvironment {

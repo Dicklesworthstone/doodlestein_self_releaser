@@ -968,7 +968,7 @@ Windows attestation requires native executable Cargo/compiler/linker selectors;
 script wrappers and Cargo plugins are outside this boundary. Tracked Cargo
 configuration uses a bounded literal grammar for build/compiler settings,
 literal target settings, ordinary source/registry settings and Rust flags.
-Includes, dotted keys, general inline tables, `cfg(...)` targets, general environment
+Includes, dotted keys, general inline tables, unsupported `cfg(...)` predicates, general environment
 injection, unstable selector environments and flags that can select another
 linker/compiler/backend are refused before dependency admission. Positive
 integer strings for `RUST_MIN_STACK` and `RUST_TEST_THREADS` are the supported
@@ -989,6 +989,30 @@ value, force flag, effective value and origin in
 independent collection bind this evidence. Unknown or duplicate attributes,
 relative-path expansion, non-Boolean flags, multiline tables and trailing
 commas are refused; this exception does not admit compiler environment changes.
+
+Tracked target tables can use bounded `cfg(...)` expressions on Windows as well
+as Unix. Supported predicates are `unix`, `windows`, and literal values for
+`target_arch`, `target_os`, `target_env`, `target_vendor`, `target_family`,
+`target_endian`, `target_pointer_width` and `target_abi`, combined with `all`,
+`any` and `not`. DSR queries the selected, hashed native compiler with
+`rustc --print=cfg --target <triple>` and records the compiler identity, target
+facts, matching and nonmatching tables, and effective flags in
+`toolchain.selection.cargo_target`. Tables for another platform are valid and
+do not contribute flags. Custom, feature, profile and build-script predicates
+remain outside this boundary; every expression and flag contribution is
+validated, including inactive branches.
+
+Cargo's effective flags retain their normal precedence: an existing
+`CARGO_ENCODED_RUSTFLAGS` overrides `RUSTFLAGS`, which overrides target flags,
+which override build flags. An explicitly empty encoded or ordinary flag
+variable still overrides configuration. Target flags combine the exact target
+table, its `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` value, and matching cfg tables in
+Cargo's ordinal order. Build flags combine the build table and
+`CARGO_BUILD_RUSTFLAGS`. A target linker environment value overrides the exact
+target table, which overrides a matching cfg linker; multiple matching cfg
+linkers without a higher-priority selection are refused. Changing the cfg
+configuration or selected compiler invalidates the held metadata receipt.
+
 Configured compiler
 or linker paths must be absolute, or project-relative paths in tracked Cargo
 configuration. PATH entries must be drive-qualified absolute paths; known
@@ -1515,10 +1539,23 @@ Structured error codes for programmatic handling:
 | `DSR_JSON` | false | Force JSON output |
 | `DSR_THRESHOLD` | 600 | Default queue threshold |
 | `DSR_MINISIGN_KEY` | | Path to minisign private key |
-| `GITHUB_TOKEN` | | GitHub API token |
+| `DSR_GH_TOKEN` | | Highest-priority GitHub API token for DSR |
+| `GITHUB_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` |
+| `GH_TOKEN` | | GitHub API token, after `DSR_GH_TOKEN` and `GITHUB_TOKEN` |
 | `DSR_SLACK_WEBHOOK` | config `notifications.slack_webhook` | Slack incoming webhook for `--notify slack` |
 | `DSR_DISCORD_WEBHOOK` | config `notifications.discord_webhook` | Discord webhook for `--notify discord` |
 | `DSR_NOTIFY_TIMEOUT` | 20 | Seconds allowed per webhook delivery |
+
+DSR's GitHub adapter, release publisher, release repair and authentication
+diagnostics use `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then
+the stored `gh` credential for `github.com`. API requests, release asset
+downloads and uploads, repairs, and authentication diagnostics use that same
+selection. The selected token and `github.com` host are bound to each child
+command; an ambient `GH_HOST` or another logged-in Enterprise account cannot
+redirect these public-GitHub operations. The caller's environment and saved
+logins are unchanged. A rejected explicit token is not replaced with another
+account's credential. The sourceable `gh_api` adapter accepts relative API
+paths rather than absolute URLs that could change the request's host.
 
 A webhook delivery that fails (an HTTP error such as a revoked webhook's 404, or
 a timeout) is reported and is not recorded as sent, so the next occurrence of

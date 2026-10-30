@@ -2,7 +2,7 @@
 # Linux mode shares only the cache test's documented OS/process adapters; its
 # real Cargo builds are evidence of context semantics, never native CMD proof.
 [CmdletBinding()]
-param([switch]$PortableStorageSemantics, [string]$BashPath, [switch]$ToolchainOnly)
+param([switch]$PortableStorageSemantics, [string]$BashPath, [switch]$ToolchainOnly, [switch]$CfgOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -144,6 +144,168 @@ esac
     if ($PortableStorageSemantics) { $childArguments += '-PortableStorageSemantics' }
     return Invoke-Exe ([Environment]::ProcessPath) $childArguments -ExpectFailure:$ExpectFailure
 }
+
+function Invoke-DsrCargoCfgChecks {
+    $selectedCompiler=(Get-Command rustc -CommandType Application | Select-Object -First 1).Source
+    $selectedSysroot=(Invoke-Exe $selectedCompiler @('--print','sysroot')).Stdout.Trim()
+    $toolExtension=if ($script:WindowsHost) { '.exe' } else { '' }
+    # This focused fixture uses the genuine selected installation directly;
+    # the full suite below independently exercises Rustup proxy resolution.
+    $compilerPath=Resolve-DsrCargoPhysicalToolPath (Join-Path $selectedSysroot ('bin/rustc'+$toolExtension))
+    $cargoPath=Join-Path $selectedSysroot ('bin/cargo'+$toolExtension)
+    $hostVersion=(Invoke-Exe $compilerPath @('-vV')).Stdout
+    if ($hostVersion -cnotmatch '(?m)^host: ([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,})\r?$') { throw 'Fixture rustc did not report a target' }
+    $triple=$Matches[1]
+    $cfgSource=Join-Path $work 'cfg-project'; $cfgHome=Join-Path $work 'cfg-cargo-home'
+    $null=[IO.Directory]::CreateDirectory($cfgHome)
+    Write-Text (Join-Path $cfgSource 'Cargo.toml') "[package]`nname='cfg-selection-probe'`nversion='1.0.0'`nedition='2021'`n"
+    Write-Text (Join-Path $cfgSource 'src/main.rs') 'fn main() { println!("{}", cfg!(debug_assertions)); }'
+    $cfgPath=Join-Path $cfgSource '.cargo/config.toml'
+    Write-Text $cfgPath "[build]`njobs=1`n"
+    $command=(ConvertTo-DsrCargoLiteralArgument $cargoPath) + ' build --release --locked --offline --target ' + $triple
+    $baseEnvironment=@("RUSTC=$compilerPath",('CARGO_TARGET_DIR='+(Join-Path $work 'cfg-baseline-target')))
+    $baseline=New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment $baseEnvironment -ExpectedTarget $triple
+    $lockCommand=(ConvertTo-DsrCargoLiteralArgument $cargoPath) + ' generate-lockfile --offline --manifest-path ' + (ConvertTo-DsrCargoLiteralArgument (Join-Path $cfgSource 'Cargo.toml'))
+    $lockResult=Invoke-DsrCargoCommand -Context $baseline -Command $lockCommand -CaptureOutput $true
+    Check 'cfg fixture has a real offline Cargo lockfile' ($lockResult.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $cfgSource 'Cargo.lock')))
+    $linker=$baseline.ToolchainIdentity.tools.linker.selected_path
+    $linkerVariable='CARGO_TARGET_'+($triple.ToUpperInvariant() -replace '[^A-Z0-9]','_')+'_LINKER'
+    $targetFlagsVariable=$linkerVariable.Substring(0,$linkerVariable.Length-6)+'RUSTFLAGS'
+    $cfgOutput=(Invoke-Exe $compilerPath @('--print=cfg','--target',$triple)).Stdout
+    $facts=ConvertFrom-DsrCargoTargetCfg $cfgOutput
+    $platform=if ($facts.Contains('windows')) { 'windows' } else { 'unix' }
+    $otherPlatform=if ($platform -ceq 'windows') { 'unix' } else { 'windows' }
+    foreach ($case in @(
+        @{Text=('cfg('+ $platform +')'); Expected=$true},
+        @{Text=('cfg('+ $otherPlatform +')'); Expected=$false},
+        @{Text='cfg(all())'; Expected=$true}, @{Text='cfg(any())'; Expected=$false},
+        @{Text=('cfg(not('+ $otherPlatform +'))'); Expected=$true},
+        @{Text=('cfg(all('+ $platform +',not('+ $otherPlatform +'),))'); Expected=$true},
+        @{Text='cfg(all(not(target_os="windows"),not(target_os="freebsd")))'; Expected=(-not $facts.Contains('target_os="windows"') -and -not $facts.Contains('target_os="freebsd"'))},
+        @{Text='cfg(target_arch="x86_64")'; Expected=$facts.Contains('target_arch="x86_64"')}
+    )) {
+        Check ('bounded cfg semantics: '+$case.Text) ((Test-DsrCargoCfgExpression (ConvertFrom-DsrCargoCfgExpression $case.Text) $facts) -eq $case.Expected)
+    }
+    foreach ($expression in @('cfg(feature="hidden")','cfg(any(all(),feature="hidden"))',
+        'cfg(panic="abort")','cfg(debug_assertions)','cfg(target_feature="sse2")',
+        'cfg(not(unix,))','cfg(not())','cfg(not(unix,windows))','cfg(all(unix)) trailing',
+        'cfg(target_os="win\\dows")',"cfg(`tunix)",'cfg(unix,windows)',
+        ('cfg('+('not('*34)+'unix'+(')'*34)+')'), ('cfg(any('+('unix,'*300)+'unix))'))) {
+        Refused ('unsupported cfg grammar: '+$expression.Substring(0,[Math]::Min(70,$expression.Length))) { ConvertFrom-DsrCargoCfgExpression $expression }
+    }
+    foreach ($malformed in @('',($cfgOutput+"unix`nunix`n"),($cfgOutput+"target_os=`"ambiguous`"`n"),
+        ($cfgOutput+"bad token`n"),($cfgOutput -replace '(?m)^target_arch=.*\r?\n',''))) {
+        Refused 'malformed, duplicate or incomplete compiler cfg facts are refused' { ConvertFrom-DsrCargoTargetCfg $malformed }
+    }
+
+    $matched="[target.'cfg($platform)']`nrustflags=['-C','debug-assertions=yes']`n"
+    $unmatched="[target.'cfg($otherPlatform)']`nrustflags=['-C','debug-assertions=yes']`n"
+    $cases=@(
+        @{Name='matching'; Config=$matched; Environment=@(); Expected='true'; Flags=@('-C','debug-assertions=yes'); Source='target'; MatchCount=1},
+        @{Name='nonmatching'; Config=("[build]`nrustflags=['-C','debug-assertions=no']`n"+$unmatched); Environment=@(); Expected='false'; Flags=@('-C','debug-assertions=no'); Source='build'; MatchCount=0},
+        @{Name='exact-and-cfg'; Config=("[target.'$triple']`nrustflags=['-C','debug-assertions=no']`n"+$matched); Environment=@("$targetFlagsVariable=-Cdebuginfo=0"); Expected='true'; Flags=@('-C','debug-assertions=no','-Cdebuginfo=0','-C','debug-assertions=yes'); Source='target'; MatchCount=1},
+        @{Name='environment'; Config=$matched; Environment=@('RUSTFLAGS=-C debug-assertions=no'); Expected='false'; Flags=@('-C','debug-assertions=no'); Source='RUSTFLAGS'; MatchCount=1},
+        @{Name='environment-empty'; Config=$matched; Environment=@('RUSTFLAGS='); Expected='false'; Flags=@(); Source='RUSTFLAGS'; MatchCount=1},
+        @{Name='encoded-empty'; Config=$matched; Environment=@('CARGO_ENCODED_RUSTFLAGS=','RUSTFLAGS=-C debug-assertions=yes'); Expected='false'; Flags=@(); Source='CARGO_ENCODED_RUSTFLAGS'; MatchCount=1},
+        @{Name='encoded'; Config=$matched; Environment=@("CARGO_ENCODED_RUSTFLAGS=-C$([char]31)debug-assertions=yes",'RUSTFLAGS=-C debug-assertions=no'); Expected='true'; Flags=@('-C','debug-assertions=yes'); Source='CARGO_ENCODED_RUSTFLAGS'; MatchCount=1},
+        @{Name='build-environment'; Config=("[build]`nrustflags=['-C','debuginfo=0']`n"+$unmatched); Environment=@('CARGO_BUILD_RUSTFLAGS=-C debug-assertions=yes'); Expected='true'; Flags=@('-C','debuginfo=0','-C','debug-assertions=yes'); Source='build'; MatchCount=0},
+        @{Name='ordinal-cfg'; Config=("[target.'cfg(all($platform))']`nrustflags=['-C','debug-assertions=no']`n"+$matched); Environment=@(); Expected='true'; Flags=@('-C','debug-assertions=no','-C','debug-assertions=yes'); Source='target'; MatchCount=2},
+        @{Name='cfg-linker'; Config=($matched+"linker='$linker'`n"); Environment=@(); Expected='true'; Flags=@('-C','debug-assertions=yes'); Source='target'; MatchCount=1}
+    )
+    foreach ($case in $cases) {
+        Write-Text $cfgPath $case.Config
+        $target=Join-Path $work ('cfg-target-'+$case.Name)
+        $environment=@("RUSTC=$compilerPath", "CARGO_TARGET_DIR=$target")+$case.Environment
+        if ($case.Name -cne 'cfg-linker') { $environment+="$linkerVariable=$linker" }
+        $context=New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment $environment -ExpectedTarget $triple
+        $row=$context.ToolchainIdentity.selection.cargo_target
+        Check ("cfg $($case.Name) retains typed effective flags and precedence") (
+            $row.rustflags -is [array] -and $row.cfg_tables -is [array] -and $row.matched_cfg -is [array] -and
+            ($row.rustflags | ConvertTo-Json -AsArray -Compress) -ceq ($case.Flags | ConvertTo-Json -AsArray -Compress) -and
+            $row.rustflags_source -ceq $case.Source -and $row.matched_cfg.Count -eq $case.MatchCount)
+        Check ("cfg $($case.Name) binds genuine selected compiler facts") (
+            $row.cfg_probe.compiler_path -ceq $compilerPath -and
+            $row.cfg_probe.compiler_sha256 -ceq (Get-DsrCargoToolFileHash $compilerPath) -and
+            $row.cfg_probe.target_triple -ceq $triple -and $row.cfg_probe.sha256 -ceq (Get-DsrCacheBytesHash ($utf8.GetBytes($cfgOutput))) -and
+            $row.cfg_probe.values -is [array] -and $row.cfg_probe.values.Count -eq $facts.Count)
+        if ($case.Name -ceq 'cfg-linker') {
+            Check 'matching cfg selects the actual attested linker' ($row.linker_source -ceq "cfg($platform)" -and $context.ToolchainIdentity.tools.linker.selected_path -ceq $linker)
+        }
+        $null=Invoke-ContextChecked $context Metadata
+        $receiptPath=Join-Path $work ('cfg-'+$case.Name+'-receipt.json')
+        $receipt=Write-DsrCargoContextReceipt -Context $context -Path $receiptPath
+        $null=Invoke-ContextChecked $context Build
+        $binary=Join-Path $target ($triple+'/release/cfg-selection-probe'+$(if ($script:WindowsHost) { '.exe' } else { '' }))
+        Check ("real Cargo $($case.Name) executes with the recorded cfg flags") ((Invoke-Exe $binary @()).Stdout.Trim() -ceq $case.Expected)
+        Assert-DsrCargoContextReceipt -Context $context -Path $receiptPath -Fingerprint $receipt.fingerprint -ReceiptSha256 $receipt.receipt_sha256
+        Check ("cfg $($case.Name) keeps its held metadata receipt after compilation") $true
+    }
+    Write-Text $cfgPath ($matched -replace 'debug-assertions=yes','debug-assertions=no')
+    Refused 'changing tracked cfg selection invalidates the held metadata receipt' {
+        Assert-DsrCargoContextReceipt -Context $context -Path $receiptPath -Fingerprint $receipt.fingerprint -ReceiptSha256 $receipt.receipt_sha256
+    }
+    $conflicting="[target.'cfg(all($platform))']`nlinker='$linker'`n[target.'cfg($platform)']`nlinker='$linker'`n"
+    Write-Text $cfgPath $conflicting
+    Refused 'two matching cfg linkers are refused without an authoritative override' {
+        New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment $baseEnvironment
+    } 'Multiple Cargo cfg linkers'
+    $override=New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment ($baseEnvironment+"$linkerVariable=$linker")
+    Check 'an explicit target linker overrides matching cfg linker ambiguity' ($override.ToolchainIdentity.selection.cargo_target.linker_source -ceq $linkerVariable)
+    $missingLinker=Join-Path $work 'unselected-linker-does-not-exist'
+    Write-Text $cfgPath (($conflicting.Replace($linker,$missingLinker))+"[target.'$triple']`nlinker='$linker'`n")
+    $exactOverride=New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment $baseEnvironment
+    Check 'exact target linker overrides unusable ambiguous cfg linkers' (
+        $exactOverride.ToolchainIdentity.selection.cargo_target.linker_source -ceq ('target.'+$triple) -and
+        $exactOverride.ToolchainIdentity.tools.linker.selected_path -ceq $linker)
+    Write-Text $cfgPath (($conflicting.Replace($linker,$missingLinker))+"[target.'$triple']`nlinker='$missingLinker'`n")
+    $environmentOverride=New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment ($baseEnvironment+"$linkerVariable=$linker")
+    Check 'target environment linker overrides an unusable exact linker and cfg linkers' (
+        $environmentOverride.ToolchainIdentity.selection.cargo_target.linker_source -ceq $linkerVariable -and
+        $environmentOverride.ToolchainIdentity.tools.linker.selected_path -ceq $linker)
+    foreach ($text in @(
+        "[target.'cfg(any($platform,feature=`"hidden`"))']`nrustflags=[]`n",
+        "[target.'cfg($otherPlatform)']`nrustflags=['@hidden.args']`n",
+        "[target.'cfg($otherPlatform)']`nrustflags=['--cfg','hidden']`n",
+        "[target.'cfg($otherPlatform)']`nrustflags=['--codegen','linker=hidden']`n",
+        "[target.'cfg($otherPlatform)']`nrustflags=['-Z','codegen_backend=hidden']`n",
+        "[target.'$triple']`nrustflags=['-C']`n[target.'cfg($platform)']`nrustflags=['linker=hidden']`n")) {
+        Write-Text $cfgPath $text
+        Refused 'inactive cfg branches and concatenated executable selectors cannot receive attestation' {
+            New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment $baseEnvironment
+        }
+    }
+    Write-Text $cfgPath $matched
+    foreach ($entry in @('CARGO_UNSTABLE_HOST_CONFIG=','RUSTFLAGS=--cfg hidden',"$linkerVariable=")) {
+        Refused ('ambiguous cfg environment is refused: '+$entry) {
+            New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment ($baseEnvironment+$entry)
+        }
+    }
+    Write-Text $cfgPath @'
+[target.'cfg(all(not(target_os="windows"),not(target_os="freebsd")))']
+rustflags=['-Copt-level=2']
+[target.'cfg(target_arch="x86_64")']
+rustflags=['-Ctarget-cpu=x86-64-v3']
+[target.'cfg(target_os="freebsd")']
+rustflags=['-L/usr/local/lib']
+'@
+    $crossConfig=Get-DsrCargoToolConfiguration $baseline
+    foreach ($cross in @(
+        @{Triple='x86_64-pc-windows-msvc'; Arch='x86_64'; Os='windows'; Matched=1},
+        @{Triple='aarch64-pc-windows-msvc'; Arch='aarch64'; Os='windows'; Matched=0},
+        @{Triple='x86_64-unknown-freebsd'; Arch='x86_64'; Os='freebsd'; Matched=2})) {
+        $observed=Get-DsrCargoTargetObservation -Config $crossConfig -Triple $cross.Triple -Environment $baseline.Environment -Compiler $baseline.ToolchainIdentity.tools.rustc -Context $baseline
+        Check ('real compiler cfg probe selects pi/franken predicates for '+$cross.Triple) (
+            $observed.Receipt.matched_cfg.Count -eq $cross.Matched -and
+            $observed.Receipt.cfg_probe.target_triple -ceq $cross.Triple -and
+            $observed.Receipt.cfg_probe.values -ccontains ('target_os="'+$cross.Os+'"') -and
+            $observed.Receipt.cfg_probe.values -ccontains ('target_arch="'+$cross.Arch+'"') -and
+            ($observed.Receipt.rustflags -ccontains '-Ctarget-cpu=x86-64-v3') -eq ($cross.Arch -ceq 'x86_64') -and
+            $observed.Receipt.rustflags -cnotcontains '-Copt-level=2')
+    }
+}
+
+Invoke-DsrCargoCfgChecks
+if ($CfgOnly) { Write-Output "Cargo cfg context checks: $script:ContextChecks passed"; return }
 
 $cargo = (Get-Command cargo -CommandType Application | Select-Object -First 1).Source
 $rustc = (Get-Command rustc -CommandType Application | Select-Object -First 1).Source
@@ -687,7 +849,7 @@ fn main() {
     }
     foreach ($configText in @(
         'build.rustc="hidden-rustc"', ('[build]'+"`n"+'rustc={value="hidden-rustc"}'),
-        ('[target.''cfg(windows)'']'+"`n"+'linker="hidden-linker"'), ('[env]'+"`n"+'RUSTC="hidden-rustc"'),
+        ('[target.''cfg(any(windows,feature="hidden"))'']'+"`n"+'linker="hidden-linker"'), ('[env]'+"`n"+'RUSTC="hidden-rustc"'),
         ('[env]'+"`n"+'RUSTC={value="hidden-rustc",force=true}'),
         ('[env]'+"`n"+'RUST_MIN_STACK={value="16777216"}'+"`n"+'RUST_MIN_STACK={value="8388608"}'),
         'include=["hidden.toml"]', ('[build]'+"`n"+'rustflags=["-Clinker=hidden-linker"]'),
