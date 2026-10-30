@@ -3901,24 +3901,98 @@ _act_windows_cmd_path() {
     printf '%s\n' "$path"
 }
 
+# Parse the host-specific receiver mount convention without conflating an
+# absent setting with MSYS2's deliberately empty drive prefix. Keep the host
+# name as jq data, never as part of an executable filter expression.
+_act_windows_rsync_prefix_from_json() {
+    local host="${1:-}" configuration="${2:-}"
+    [[ -n "$host" ]] || return 4
+    jq -ers --arg host "$host" '
+        if length != 1 or (.[0] | type) != "object" then
+            error("expected one hosts configuration object")
+        else .[0] end |
+        if (.hosts | type) != "object" then
+            error("hosts must be an object")
+        else .hosts[$host] end |
+        if . == null then "/cygdrive"
+        elif type != "object" then error("host configuration must be an object")
+        elif has("windows_rsync_drive_prefix") then
+            .windows_rsync_drive_prefix |
+            if type == "string" then .
+            else error("windows_rsync_drive_prefix must be a string") end
+        else "/cygdrive" end |
+        if . == "" then .
+        elif test("^/[A-Za-z0-9_.+-]+(/[A-Za-z0-9_.+-]+)*$") and
+             (split("/") | all(.[]; . != "." and . != "..")) then .
+        else error("windows_rsync_drive_prefix must be empty or a canonical absolute POSIX prefix") end
+    ' <<< "$configuration" || return 4
+}
+
+# Pure conversion. /cygdrive remains the default for existing Cygwin hosts;
+# an explicitly empty second argument selects /c/... as used by MSYS2.
 _act_windows_rsync_path() {
-    local path="${1:-}"
+    local path="${1:-}" prefix="${2-/cygdrive}"
+    # Validate direct callers as well as hosts.yaml-derived values. Never put
+    # a configured shell fragment or traversal component into an rsync path.
+    if [[ -n "$prefix" ]]; then
+        if [[ ! "$prefix" =~ ^/[A-Za-z0-9_.+-]+(/[A-Za-z0-9_.+-]+)*$ ]]; then
+            return 4
+        fi
+        case "$prefix/" in */./*|*/../*) return 4 ;; esac
+    fi
+    [[ -n "$path" && "$path" != *[[:cntrl:]]* ]] || return 4
     path="${path//\\//}"
 
     if [[ "$path" =~ ^([A-Za-z]):/(.*)$ ]]; then
         local drive="${BASH_REMATCH[1],,}"
         local rest="${BASH_REMATCH[2]}"
-        printf '/cygdrive/%s/%s\n' "$drive" "$rest"
+        printf '%s/%s/%s\n' "$prefix" "$drive" "$rest"
         return 0
     fi
 
     if [[ "$path" =~ ^([A-Za-z]):$ ]]; then
         local drive="${BASH_REMATCH[1],,}"
-        printf '/cygdrive/%s\n' "$drive"
+        printf '%s/%s\n' "$prefix" "$drive"
         return 0
     fi
 
+    # Already-POSIX paths are not prefixed again. A remaining drive-relative
+    # spelling is ambiguous (C:foo is not C:/foo), so refuse it explicitly.
+    [[ ! "$path" =~ ^[A-Za-z]: ]] || return 4
     printf '%s\n' "$path"
+}
+
+# Resolve once for each source transfer, before its bounded rsync retry loop.
+# Use the shared single-document/duplicate-key YAML gate. We do not
+# persist a cache that could outlive a hosts.yaml change or another host's
+# runtime selection. Unconfigured hosts retain the historical Cygwin default.
+_act_windows_rsync_host_path() {
+    local host="${1:-}" path="${2:-}" prefix=/cygdrive configuration
+    [[ -n "$host" ]] || return 4
+    if [[ -n "${DSR_HOSTS_FILE:-}" &&
+          ( -e "$DSR_HOSTS_FILE" || -L "$DSR_HOSTS_FILE" ) ]]; then
+        if [[ ! -f "$DSR_HOSTS_FILE" || -L "$DSR_HOSTS_FILE" ]]; then
+            _log_error "Windows rsync requires a regular hosts configuration: $DSR_HOSTS_FILE"
+            return 4
+        fi
+        if ! command -v yq >/dev/null || ! command -v jq >/dev/null; then
+            _log_error "Windows rsync host configuration requires yq and jq"
+            return 3
+        fi
+        if ! declare -F _config_read_single_mapping_json >/dev/null; then
+            # shellcheck source=src/config.sh
+            source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh" || return 3
+        fi
+        if ! configuration=$(_config_read_single_mapping_json "$DSR_HOSTS_FILE") ||
+           ! prefix=$(_act_windows_rsync_prefix_from_json "$host" "$configuration"); then
+            _log_error "Invalid windows_rsync_drive_prefix configuration for host: $host"
+            return 4
+        fi
+    fi
+    if ! _act_windows_rsync_path "$path" "$prefix"; then
+        _log_error "Invalid Windows rsync receiver path for host: $host"
+        return 4
+    fi
 }
 
 # Ensure a remote directory (and all of its parent components) exists before we
@@ -4097,6 +4171,21 @@ _act_sync_source() {
 
     # Check for rsync on remote
     if _act_has_rsync "$host"; then
+        local rsync_remote_path="$remote_path"
+        local -a rsync_io_opts=()
+        local rsync_transport="ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new"
+        if _act_is_windows_host "$host"; then
+            # Resolve the receiver's configured mount convention before
+            # creating directories or transferring any source bytes.
+            rsync_remote_path=$(_act_windows_rsync_host_path "$host" "$remote_path") || return $?
+            # Windows OpenSSH plus rsync's non-blocking socket writes fail with
+            # "safe_write ... Resource temporarily unavailable (11)" (exit 12)
+            # when the transport is a multiplexed ControlMaster channel. Use
+            # blocking I/O on a dedicated connection for Windows receivers.
+            rsync_io_opts=(--blocking-io)
+            rsync_transport+=" -o ControlMaster=no -o ControlPath=none"
+        fi
+
         # rsync does not create the destination's parent directories, so make
         # sure the full remote path exists first (mirrors the local-host and
         # tar-fallback branches). Without this, a missing per-version parent dir
@@ -4104,19 +4193,6 @@ _act_sync_source() {
         if ! _act_remote_mkdir "$host" "$remote_path"; then
             _log_error "failed to create remote directory $remote_path on $host"
             return 1
-        fi
-
-        local rsync_remote_path="$remote_path"
-        local -a rsync_io_opts=()
-        local rsync_transport="ssh -o ConnectTimeout=$_ACT_SSH_TIMEOUT -o StrictHostKeyChecking=accept-new"
-        if _act_is_windows_host "$host"; then
-            rsync_remote_path=$(_act_windows_rsync_path "$remote_path")
-            # Windows OpenSSH plus rsync's non-blocking socket writes fail with
-            # "safe_write ... Resource temporarily unavailable (11)" (exit 12)
-            # when the transport is a multiplexed ControlMaster channel. Use
-            # blocking I/O on a dedicated connection for Windows receivers.
-            rsync_io_opts=(--blocking-io)
-            rsync_transport+=" -o ControlMaster=no -o ControlPath=none"
         fi
 
         # Use rsync for efficient sync. Windows receivers still drop the

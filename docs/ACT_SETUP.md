@@ -105,6 +105,42 @@ dsr doctor
 | `windows-*` | Native SSH to wlap |
 | `self-hosted` | Check labels, route accordingly |
 
+## Windows native source synchronization
+
+Windows jobs run natively over SSH, not inside act's Linux containers. Configure
+`windows_rsync_drive_prefix` for the Windows host in `hosts.yaml` when its rsync
+uses a mount convention other than Cygwin's default:
+
+```yaml
+hosts:
+  wlap:
+    platform: windows/amd64
+    connection: ssh
+    ssh_host: wlap
+    windows_rsync_drive_prefix: ""  # MSYS2: C:/d/app becomes /c/d/app
+```
+
+Omitting the setting preserves `/cygdrive`, so existing Cygwin hosts need no
+change. An explicit `/cygdrive` has the same effect. A custom absolute prefix
+such as `/drives` maps `C:/d/app` to `/drives/c/d/app`. Prefixes must have no
+trailing slash, empty path components, `.`/`..` components or shell syntax.
+The empty string is intentional and is distinct from null or a missing field;
+booleans, numbers, collections and invalid strings fail rather than silently
+selecting another runtime's path convention.
+
+The setting is per host and is reread for each source transfer, including
+sibling sources that use the same transfer path. It is resolved before remote
+directory creation and reused for that transfer's bounded retries. It does not
+change native `C:/...` paths passed to PowerShell/CMD, artifact streaming, or tar
+fallback. Runtime autodetection is not performed: choose the prefix belonging
+to the actual remote rsync installation.
+
+Run `bash scripts/tests/test_windows_rsync_paths.sh`. Its YAML integration uses
+real Mike Farah yq and the shared single-document/duplicate-key configuration
+gate; those cases skip explicitly when yq is unavailable. The path-policy tests
+use genuine Bash and jq. They do not simulate a Windows host or claim a native
+Windows SSH/rsync acceptance run.
+
 ## Common act Commands
 
 ### List workflows and jobs
