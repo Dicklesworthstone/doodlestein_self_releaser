@@ -6,9 +6,172 @@
 # Use --strict-variants-only for genuine GNU/musl failure, resume and publication.
 # Use --strict-mixed-protocol-only for mixed-platform receipt/selection controls;
 # this mode never claims a Darwin compiler or artifact execution.
+# Use --git-selection-only for genuine Git/rsync selection without a compiler.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_git_source_selection() (
+    local dependency work source_root destination mode output status
+    local selection_passes=0 selection_failures=0
+    for dependency in bash git rsync tar; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: Git source selection requires %s\n' "$dependency"
+            return 77
+        }
+    done
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-git-source-selection.XXXXXXXX") || return 1
+    printf 'Git source-selection evidence: %s\n' "$work"
+    source_root="$work/source"
+    mkdir -p "$source_root" "$work/transports" || return 1
+    export DSR_CONFIG_DIR="$work/config" DSR_HOSTS_FILE="$work/no-hosts.yaml"
+    export DSR_STATE_DIR="$work/state" DSR_CACHE_DIR="$work/cache" NO_COLOR=1
+    # Only transport is local: the remote branch still runs the real rsync
+    # server, and the no-rsync receiver still runs the real tar extractor.
+    cat > "$work/transports/ssh" <<'SSH'
+#!/usr/bin/env bash
+set -uo pipefail
+while (($#)); do
+    case "$1" in -o|-p|-l) shift 2 ;; -n|-q|-T|-t) shift ;; *) break ;; esac
+done
+host="${1:-}"; shift
+case "$host" in fixture-source-rsync|fixture-source-tar) ;; *) exit 255 ;; esac
+if [[ "$host" == fixture-source-tar && "$*" == 'command -v rsync >/dev/null 2>&1' ]]; then
+    exit 1
+fi
+exec bash -c "$*"
+SSH
+    chmod 755 "$work/transports/ssh" || return 1
+    export PATH="$work/transports:$PATH"
+    # Selecting the unchanged incumbent permits an honest before/after replay
+    # of exactly these assertions, without replacing a production predicate.
+    # shellcheck source=src/act_runner.sh
+    source "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" || return 1
+    git -c init.defaultBranch=main init -q "$source_root" || return 1
+    mkdir -p "$source_root/internal/webui/dist" "$source_root/dist" \
+        "$source_root/ignored" "$source_root/nested" "$source_root/src" || return 1
+    cat > "$source_root/.gitignore" <<'IGNORE'
+dist/
+!internal/webui/dist/
+ignored/
+*.cache
+literal\*.bin
+literal\?.bin
+literal\[x\].bin
+slash\\name.bin
+slash\\literal\*.bin
+IGNORE
+    printf 'drop.txt\n' > "$source_root/nested/.gitignore"
+    printf 'embedded web assets\n' > "$source_root/internal/webui/dist/index.html"
+    printf 'tracked despite ignored parent\n' > "$source_root/ignored/tracked-input.txt"
+    printf 'source bytes\n' > "$source_root/src/main.go"
+    printf 'explicitly excluded\n' > "$source_root/omit-me.txt"
+    git -C "$source_root" add -f -- .gitignore nested/.gitignore \
+        internal/webui/dist/index.html ignored/tracked-input.txt src/main.go omit-me.txt || return 1
+    printf 'untracked build input\n' > "$source_root/new-input.txt"
+    printf 'nested selected input\n' > "$source_root/nested/keep.txt"
+    printf 'nested ignored input\n' > "$source_root/nested/drop.txt"
+    printf 'ignored output\n' > "$source_root/dist/output.txt"
+    printf 'ignored sibling\n' > "$source_root/ignored/drop.txt"
+    printf 'local-only.txt\n' > "$source_root/.git/info/exclude"
+    printf 'machine-only.txt\n' > "$work/global-ignore"
+    git -C "$source_root" config core.excludesFile "$work/global-ignore" || return 1
+    printf 'local ignored\n' > "$source_root/local-only.txt"
+    printf 'global ignored\n' > "$source_root/machine-only.txt"
+    printf 'secret\n' > "$source_root/.env"
+    local name
+    for name in 'literal*.bin' 'literal?.bin' 'literal[x].bin' $'line\nbreak.cache' \
+        'slash\name.bin' 'slash\literal*.bin' 'slashname.bin' 'slash\literalZ.bin' \
+        'literalZ.bin' 'literalx.bin' 'file with spaces.txt'; do
+        printf 'literal filename\n' > "$source_root/$name"
+    done
+
+    selection_check() {
+        local description="$1"; shift
+        if "$@"; then
+            printf 'PASS: %s\n' "$description"
+            selection_passes=$((selection_passes + 1))
+        else
+            printf 'FAIL: %s\n' "$description" >&2
+            selection_failures=$((selection_failures + 1))
+        fi
+    }
+
+    for mode in act fixture-source-rsync fixture-source-tar; do
+        destination="$work/$mode"
+        mkdir -p "$destination/src" || return 1
+        printf 'wrong! bytes\n' > "$destination/src/main.go"
+        touch -r "$source_root/src/main.go" "$destination/src/main.go" || return 1
+        printf 'stale receiver input\n' > "$destination/stale-input.txt"
+        status=0
+        output=$(_act_sync_source "$mode" "$source_root" "$destination" omit-me.txt 2>&1) || status=$?
+        printf '%s\n' "$output" > "$work/$mode.log"
+        selection_check "$mode completes source transfer" test "$status" -eq 0
+        selection_check "$mode retains tracked gitignore-negated embedded content" \
+            cmp -s "$source_root/internal/webui/dist/index.html" "$destination/internal/webui/dist/index.html"
+        selection_check "$mode retains tracked files under an ignored parent" \
+            cmp -s "$source_root/ignored/tracked-input.txt" "$destination/ignored/tracked-input.txt"
+        for name in new-input.txt nested/keep.txt 'literalZ.bin' 'literalx.bin' \
+            'slashname.bin' 'slash\literalZ.bin' 'file with spaces.txt'; do
+            selection_check "$mode retains selected $name" cmp -s "$source_root/$name" "$destination/$name"
+        done
+        for name in dist/output.txt ignored/drop.txt nested/drop.txt local-only.txt machine-only.txt \
+            'literal*.bin' 'literal?.bin' 'literal[x].bin' 'slash\name.bin' 'slash\literal*.bin' \
+            $'line\nbreak.cache' .env .git omit-me.txt; do
+            selection_check "$mode excludes $name" test ! -e "$destination/$name"
+        done
+        selection_check "$mode replaces same-size/same-time stale source bytes" \
+            cmp -s "$source_root/src/main.go" "$destination/src/main.go"
+        if [[ "$mode" != fixture-source-tar ]]; then
+            # Tar's existing fallback does not prune; retain rsync's deletion
+            # behavior instead of hiding a regression behind fresh stages.
+            selection_check "$mode deletes stale receiver-only input" test ! -e "$destination/stale-input.txt"
+        fi
+    done
+
+    destination="$work/ignore-opt-out"
+    status=0
+    _act_sync_source act "$source_root" "$destination" --no-gitignore-excludes > "$work/opt-out.log" 2>&1 || status=$?
+    selection_check 'explicit ignore opt-out succeeds' test "$status" -eq 0
+    for name in dist/output.txt ignored/drop.txt nested/drop.txt local-only.txt machine-only.txt; do
+        selection_check "ignore opt-out retains $name" cmp -s "$source_root/$name" "$destination/$name"
+    done
+    selection_check 'ignore opt-out still excludes secrets' test ! -e "$destination/.env"
+    selection_check 'ignore opt-out still excludes Git administration' test ! -e "$destination/.git"
+
+    destination="$work/nested-source"
+    status=0
+    _act_sync_source act "$source_root/nested" "$destination" > "$work/nested.log" 2>&1 || status=$?
+    selection_check 'source subdirectory selection succeeds' test "$status" -eq 0
+    selection_check 'source subdirectory retains relative selected paths' \
+        cmp -s "$source_root/nested/keep.txt" "$destination/keep.txt"
+    selection_check 'source subdirectory honors its nested ignore file' test ! -e "$destination/drop.txt"
+
+    destination="$work/refused-index"
+    mkdir -p "$destination" || return 1
+    printf 'preserved receiver bytes\n' > "$destination/sentinel"
+    printf 'not a Git index\n' > "$work/bad-index"
+    status=0
+    GIT_INDEX_FILE="$work/bad-index" _act_sync_source act "$source_root" "$destination" \
+        > "$work/bad-index.log" 2>&1 || status=$?
+    selection_check 'unreadable Git inventory refuses transfer' test "$status" -ne 0
+    selection_check 'inventory refusal preserves prior receiver bytes' \
+        grep -qx 'preserved receiver bytes' "$destination/sentinel"
+    selection_check 'inventory refusal creates no source payload' test ! -e "$destination/src"
+    printf 'Git source selection: %s passed, %s failed\n' "$selection_passes" "$selection_failures"
+    [[ "$selection_failures" -eq 0 ]]
+)
+
+if [[ "${1:-}" == --git-selection-only ]]; then
+    test_git_source_selection
+    exit $?
+fi
+if [[ $# -eq 0 ]]; then
+    git_selection_status=0
+    test_git_source_selection || git_selection_status=$?
+    [[ "$git_selection_status" == 0 || "$git_selection_status" == 77 ]] || exit "$git_selection_status"
+fi
+
 for dependency in bash rustc cargo git jq yq rsync python3 tar; do
     command -v "$dependency" >/dev/null 2>&1 || {
         printf 'SKIP: source-sync integration requires %s\n' "$dependency"

@@ -4075,16 +4075,41 @@ _act_sync_error_summary() {
         | paste -sd' ' -
 }
 
+# Git's ignore language is not rsync's filter language. Ask Git which
+# untracked paths it actually ignores, then emit anchored literal rsync
+# exclusions. Tracked inputs remain transferable even inside ignored parents;
+# nested/global/info excludes and negations are evaluated by Git itself.
+_act_git_sync_excludes() {
+    local ignored_path
+    git -C "$1" ls-files --others --ignored --exclude-standard --directory -z |
+        while IFS= read -r -d '' ignored_path; do
+            # rsync interprets backslash escapes only in wildcard patterns.
+            # Escape it only when a literal glob character enables that mode.
+            case "$ignored_path" in *\**|*\?*|*\[*)
+                ignored_path="${ignored_path//\\/\\\\}"
+                ignored_path="${ignored_path//\*/\\*}"
+                ignored_path="${ignored_path//\?/\\?}"
+                ignored_path="${ignored_path//\[/\\[}"
+                ;;
+            esac
+            printf '/%s\0' "$ignored_path" || return 1
+        done
+}
+
 # Sync source code to remote host via rsync
 # Usage: _act_sync_source <host> <local_path> <remote_path> [extra_excludes...]
 # Returns: 0 on success, non-zero on failure
-_act_sync_source() {
+_act_sync_source() (
     local host="$1"
     local local_path="$2"
     local remote_path="$3"
     shift 3
     local respect_gitignore_excludes=true
     local extra_excludes=()
+    local git_excludes=""
+    # The subshell confines cleanup to this transfer, including early returns
+    # and retries, without replacing the caller's traps or changing its cwd.
+    trap '[[ -z "$git_excludes" ]] || rm -f -- "$git_excludes"' EXIT
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -4112,27 +4137,35 @@ _act_sync_source() {
         exclude_args+=("--exclude=$pattern")
     done
 
-    # Respect .gitignore by default for faster remote sync, but allow callers
-    # to disable that behavior when ignored files are still required inputs.
-    # The global git excludes file participates in ignore decisions exactly
-    # like the repo .gitignore, so honor it too — machine-wide build dirs
-    # (e.g. .codex-target) are often ignored only there, and missing them
-    # means shipping tens of GB of build artifacts to every host.
+    # Preserve ordinary rsync traversal/deletion semantics. A --files-from
+    # inventory changes recursion and receiver cleanup; literal ignored-path
+    # exclusions retain both while avoiding gitignore/rsync syntax confusion.
     if $respect_gitignore_excludes; then
-        if [[ -f "$local_path/.gitignore" ]]; then
-            exclude_args+=("--exclude-from=$local_path/.gitignore")
-        fi
-        local global_excludes_file
-        global_excludes_file=$(git config --path --get core.excludesFile 2>/dev/null || true)
-        if [[ -z "$global_excludes_file" ]]; then
-            global_excludes_file="${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore"
-        fi
-        # gitignore negations don't translate to rsync excludes (a bare "!"
-        # even resets rsync's rule list), so skip the global file entirely if
-        # it uses them rather than mis-applying its patterns.
-        if [[ -f "$global_excludes_file" ]] && \
-           ! grep -q '^!' "$global_excludes_file" 2>/dev/null; then
-            exclude_args+=("--exclude-from=$global_excludes_file")
+        if [[ "$(git -C "$local_path" rev-parse --is-inside-work-tree 2>/dev/null)" == true ]]; then
+            git_excludes=$(mktemp "${TMPDIR:-/tmp}/dsr-source-excludes.XXXXXXXX") || {
+                _log_error "Could not reserve Git source selection for $local_path"
+                return 4
+            }
+            if ! _act_git_sync_excludes "$local_path" > "$git_excludes"; then
+                _log_error "Could not enumerate Git source exclusions for $local_path"
+                return 4
+            fi
+            exclude_args+=(--from0 "--exclude-from=$git_excludes")
+        else
+            # Plain source directories have no Git index to distinguish
+            # tracked inputs. Preserve their existing exclusion behavior.
+            if [[ -f "$local_path/.gitignore" ]]; then
+                exclude_args+=("--exclude-from=$local_path/.gitignore")
+            fi
+            local global_excludes_file
+            global_excludes_file=$(git config --path --get core.excludesFile 2>/dev/null || true)
+            if [[ -z "$global_excludes_file" ]]; then
+                global_excludes_file="${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore"
+            fi
+            if [[ -f "$global_excludes_file" ]] && \
+               ! grep -q '^!' "$global_excludes_file" 2>/dev/null; then
+                exclude_args+=("--exclude-from=$global_excludes_file")
+            fi
         fi
     fi
 
@@ -4293,7 +4326,7 @@ _act_sync_source() {
             return 1
         fi
     fi
-}
+)
 
 # Fresh source root for a strict release snapshot. Precedence for the root:
 # DSR_STRICT_BUILD_ROOT (operator/CI override) > hosts.yaml build_root for the

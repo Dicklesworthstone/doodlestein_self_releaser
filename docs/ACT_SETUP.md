@@ -161,6 +161,24 @@ The existing collection receipts bind the transferred bytes, SHA-256, size,
 and destination identity. Literal filenames do not add format-specific MSI
 or archive validation.
 
+## Git-aware ordinary source synchronization
+
+For ordinary source directories inside a Git worktree, rsync exclusions come
+from Git's actual ignored, untracked paths. Tracked inputs remain available
+even when an ignore pattern matches a parent directory. For example, a tracked
+`internal/webui/dist/index.html` needed by `go:embed` is transferred when the
+root `.gitignore` contains `dist/` and `!internal/webui/dist/`.
+
+Git evaluates nested ignore files, `.git/info/exclude`, global excludes, and
+negations. DSR passes the resulting literal paths to rsync with NUL delimiters,
+so spaces, newlines, backslashes, and wildcard characters in filenames retain
+their meaning. Existing build-cache/secret exclusions, explicit extra
+exclusions, checksum-based replacement, and stale-file deletion still apply.
+An unreadable Git inventory stops the transfer before destination writes.
+
+Run `bash scripts/tests/test_native_source_sync.sh --git-selection-only` for
+the focused Git, rsync, and tar regression without Rust compiler prerequisites.
+
 ## Common act Commands
 
 ### List workflows and jobs
