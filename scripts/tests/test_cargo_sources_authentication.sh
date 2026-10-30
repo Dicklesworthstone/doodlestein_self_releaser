@@ -429,6 +429,74 @@ check('Git executables admit private umask but retain exact observed modes', lam
 check('registry owner-executable bits cannot disappear', lambda f: executable(f,'registry',0o644))
 check('Git owner-executable bits cannot disappear', lambda f: executable(f,'git',0o644))
 
+def submodule_fixture(f):
+    child = f.repo / 'deps/child'
+    grandchild = child / 'deps/grandchild'
+    for path in (grandchild, child):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / 'value.h').write_text('#define VALUE 42\n')
+        git(path, 'init', '-q', '-b', 'main')
+        git(path, 'config', 'user.name', 'DSR Test')
+        git(path, 'config', 'user.email', 'dsr@example.invalid')
+        git(path, 'add', '.')
+        git(path, 'commit', '-qm', 'pinned nested content')
+    git(f.repo, 'add', 'deps')
+    git(f.repo, 'commit', '-qm', 'pin submodule commit')
+    f.commit = git(f.repo, 'rev-parse', 'HEAD')
+    f.source = 'git+https://example.invalid/repo#' + f.commit
+    f.graph['packages'][2]['source'] = f.source
+    f.write_lock(); f.save()
+    return child, grandchild
+
+
+def recursive_submodules(f, failure=None):
+    child, nested = submodule_fixture(f)
+    summary = f.good()
+    proof = next(p for p in json.loads(f.receipt.read_bytes())['authentication']['packages']
+                 if p['package_id'] == 'git')
+    assert proof['submodules'][0]['commit'] == git(child, 'rev-parse', 'HEAD')
+    assert proof['submodules'][0]['submodules'][0]['commit'] == git(nested, 'rev-parse', 'HEAD')
+    assert f.good(mode='verify') == summary
+    if failure == 'bytes':
+        (nested / 'value.h').write_text('#define VALUE 99\n')
+    elif failure == 'commit':
+        (child / 'value.h').write_text('#define VALUE 99\n')
+        git(child, 'add', 'value.h'); git(child, 'commit', '-qm', 'unpinned replacement')
+    elif failure == 'objects':
+        (nested / '.git/objects').rename(nested / '.git/retained-objects')
+        (nested / '.git/objects').mkdir()
+    elif failure == 'pointer':
+        (nested / '.git').rename(f.root / 'retained-git')
+        (nested / '.git').write_text('gitdir: ' + str(f.root / 'retained-git') + '\n')
+    elif failure == 'extra-admin':
+        (f.repo / 'untracked/.git').mkdir(parents=True)
+    if failure:
+        # Fresh capture must refuse too; a stale receipt is not the only guard.
+        f.refused(receipt=f.root / 'tampered.json')
+
+
+check('nested Git submodules authenticate each pinned commit tree and blob', recursive_submodules)
+for failure in ('bytes', 'commit', 'objects', 'pointer', 'extra-admin'):
+    check('recursive submodule refusal: ' + failure, lambda f, failure=failure: recursive_submodules(f, failure))
+
+
+def submodule_seed(f):
+    child, nested = submodule_fixture(f)
+    home = f.repo.parents[3]
+    database = home / 'git/db/repo-123'
+    database.parent.mkdir(parents=True)
+    subprocess.run(['git', 'clone', '--bare', '--no-hardlinks', str(f.repo), str(database)],
+                   check=True, capture_output=True)
+    destination = f.root / 'private-home'
+    cache = str(Path(MODULE).with_name('cargo_cache.sh'))
+    result = subprocess.run(['bash', cache, 'snapshot', str(home), str(destination), str(f.lock)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    copied = destination / f.repo.relative_to(home)
+    assert (copied / 'deps/child/deps/grandchild/.git/objects').is_dir()
+    assert (copied / 'deps/child/deps/grandchild/value.h').read_bytes() == (nested / 'value.h').read_bytes()
+check('lock-scoped cache preserves only required submodule-bearing checkout', submodule_seed)
+
 print('\nLocked dependency sources: %d passed, %d failed' % (PASS, FAIL))
 sys.exit(bool(FAIL))
 PY

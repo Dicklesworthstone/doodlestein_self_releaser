@@ -562,7 +562,11 @@ def locked_selection(source, lockfile, roots=None):
     Cargo has not resolved metadata in its private home yet. Cargo.lock is a
     conservative all-workspace/all-target selection, not a target-graph claim.
     Sparse indexes are narrowed to locked crate names. Git dependencies use
-    only bare databases containing a locked commit; Cargo recreates checkouts.
+    bare databases containing a locked commit; Cargo recreates plain checkouts.
+    Submodule-bearing commits also retain their exact checkout: Cargo's offline
+    resolver cannot recreate nested object databases from the parent's store.
+    These are cache inputs, never source authority; recursive object verification
+    must authenticate them before any compilation.
     A selected Git database/index retains its history, not just one tree.
     """
     try:
@@ -721,6 +725,19 @@ def locked_selection(source, lockfile, roots=None):
             if any(len(row.split()) == 3 and row.split()[0].decode('ascii', 'replace') in revisions and
                    row.split()[1] == b'commit' for row in rows):
                 add(relative)
+                for revision in sorted(revisions):
+                    tree = git_probe(directory, ['ls-tree', '-rz', revision])
+                    if not any(row.startswith(b'160000 commit ') for row in tree.split(b'\0')):
+                        continue
+                    for checkout in children('git/checkouts/' + database):
+                        checkout_path = 'git/checkouts/' + database + '/' + checkout
+                        admin = (roots.location(checkout_path + '/.git') if roots is not None else
+                                 os.path.join(source, checkout_path, '.git'))
+                        if os.path.islink(admin) or not os.path.isdir(admin):
+                            continue
+                        head = git_probe(admin, ['rev-parse', '--verify', 'HEAD']).strip()
+                        if head == revision.encode('ascii'):
+                            add(checkout_path)
     scope = {'kind': 'cargo-lock-downloads', 'lockfile_sha256': hashlib.sha256(raw).hexdigest(),
              'registry_packages': len(archives), 'git_revisions': sorted(revisions)}
     if roots is not None:

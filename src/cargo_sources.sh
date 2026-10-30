@@ -237,7 +237,8 @@ def registry_authentication(package, tree, checksum):
     return {"basis": "lockfile-crate-sha256", "archive_sha256": checksum}
 
 
-def git_authentication(tree, source):
+def git_authentication(tree, source, depth=0):
+    require(depth <= 16, "Git submodule nesting exceeds verification limit")
     revision = source.rsplit("#", 1)[-1]
     require(re.fullmatch(r"[0-9a-f]{40}", revision), "Git source requires a full locked SHA-1 commit")
     root = Path(tree["path"])
@@ -287,7 +288,7 @@ def git_authentication(tree, source):
         require(read(1) == b"\n" and git_hash.hexdigest() == oid, "locked Git object's bytes do not match its ID")
         return bytes(data), file_hash.hexdigest(), size
 
-    files, directories = {}, set()
+    files, directories, submodules = {}, set(), []
     try:
         commit, _, _ = object_bytes(revision, "commit")
         first = commit.split(b"\n", 1)[0]
@@ -316,6 +317,23 @@ def git_authentication(tree, source):
                 if mode == b"40000":
                     directories.add(name)
                     pending.append((name + "/", child_oid))
+                elif mode == b"160000":
+                    # The parent's authenticated tree pins the child commit;
+                    # neither a mutable HEAD nor .gitmodules URL is authority.
+                    # Cargo/libgit2 uses self-contained .git directories. Keep
+                    # external gitdir pointers and alternate stores forbidden.
+                    prefix_child = name + "/"
+                    child_tree = {"kind": "git", "path": str(root / name),
+                                  "files": [{**row, "path": row["path"][len(prefix_child):]}
+                                            for row in tree["files"] if row["path"].startswith(prefix_child)],
+                                  "directories": [path[len(prefix_child):] for path in tree["directories"]
+                                                  if path.startswith(prefix_child)]}
+                    proof = git_authentication(child_tree, "git+submodule#" + child_oid, depth + 1)
+                    submodules.append({"path": name, **proof})
+                    directories.add(name)
+                    directories.update(prefix_child + path for path in child_tree["directories"])
+                    files.update((prefix_child + row["path"], {**row, "path": prefix_child + row["path"]})
+                                 for row in child_tree["files"])
                 else:
                     require(mode in (b"100644", b"100755"), "locked Git sources contain a link or submodule")
                     _, digest, size = object_bytes(child_oid, "blob")
@@ -331,7 +349,10 @@ def git_authentication(tree, source):
         if not process.stdin.closed:
             process.stdin.close()
     match_tree(tree, files, directories)
-    return {"basis": "lockfile-git-objects", "commit": revision, "tree": tree_oid}
+    proof = {"basis": "lockfile-git-objects", "commit": revision, "tree": tree_oid}
+    if submodules:
+        proof["submodules"] = sorted(submodules, key=lambda item: item["path"])
+    return proof
 
 
 def authenticate(evidence, metadata, lockfile):
@@ -441,7 +462,7 @@ def inventory(root, kind):
             # its index without changing source. Bind the directory's
             # presence/type, but not its contents; this is source evidence,
             # not an attestation of Git command output or object storage.
-            if kind == "git" and relative == ".git":
+            if kind == "git" and name == ".git":
                 require(stat.S_ISDIR(info.st_mode), "linked or external Git administrative directory")
                 directories.append(relative)
                 continue
