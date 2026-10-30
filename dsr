@@ -703,11 +703,12 @@ EOF
 
     # Check gh
     if command -v gh &>/dev/null; then
+        _dsr_require secrets
         local gh_ver
         gh_ver=$(gh --version 2>/dev/null | head -1 | awk '{print $3}')
-        if gh auth status &>/dev/null 2>&1; then
+        if secrets_run_gh auth status --hostname github.com &>/dev/null; then
             local gh_user
-            gh_user=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
+            gh_user=$(secrets_run_gh api user --hostname github.com --jq '.login' 2>/dev/null || echo "unknown")
             _add_check "gh" "ok" ", \"version\": \"$gh_ver\", \"authenticated\": true, \"user\": \"$gh_user\""
             log_ok "  gh: $gh_ver (authenticated as $gh_user)"
         else
@@ -10369,7 +10370,8 @@ EOF
                 local file_path="$artifacts_dir/$missing"
                 if [[ -f "$file_path" ]]; then
                     log_info "  Uploading: $missing"
-                    if gh release upload "$tag" "$file_path" --repo "$repo" --clobber 2>/dev/null; then
+                    if secrets_run_gh release upload "$tag" "$file_path" \
+                        --repo "github.com/$repo" --clobber >/dev/null 2>&1; then
                         log_ok "    Uploaded"
                         present_assets+=("$missing")
                     else

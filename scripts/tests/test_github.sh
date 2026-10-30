@@ -45,6 +45,7 @@ setup() {
 }
 
 teardown() {
+  [[ "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]] || return 0
   if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
     rm -rf "$TEMP_DIR"
   fi
@@ -293,6 +294,140 @@ test_api_rejects_unknown_option() {
   ! gh_api "test" --invalid-option 2>/dev/null
 }
 
+# Observe the real credential resolver, public JSON API, and binary downloader
+# at their external CLI/HTTP boundary. All credentials are explicit fixtures;
+# no real login, network request, or account setting is inspected or changed.
+test_credential_transport_routing() (
+  local selected="$1" transport="$2" expected status=0 result before after
+  local calls="$TEMP_DIR/credential-calls" destination="$TEMP_DIR/credential-asset"
+  local GH_MAX_RETRIES=1 GH_RETRY_DELAY=0
+  source "$SRC_DIR/secrets.sh"
+  unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+  export GH_HOST=enterprise.fixture.invalid GH_REPO=enterprise.fixture.invalid/other/repo
+  case "$selected" in
+    dsr)
+      export DSR_GH_TOKEN=fixture-dsr GITHUB_TOKEN=fixture-github GH_TOKEN=fixture-gh
+      expected='fixture-dsr' ;;
+    github)
+      export GITHUB_TOKEN=fixture-github GH_TOKEN=fixture-gh
+      expected='fixture-github' ;;
+    gh) export GH_TOKEN=fixture-gh; expected='fixture-gh' ;;
+    saved) expected='fixture-saved-github' ;;
+    none) expected='' ;;
+    invalid) export DSR_GH_TOKEN=fixture-invalid GH_TOKEN=fixture-gh; expected='fixture-invalid' ;;
+    standalone)
+      unset -f secrets_get_gh_token secrets_run_gh
+      source "$SRC_DIR/github.sh"
+      export DSR_GH_TOKEN=fixture-dsr
+      expected='fixture-dsr' ;;
+    *) return 4 ;;
+  esac
+  before="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
+  : > "$calls"
+  gh() {
+    local host="${GH_HOST:-github.com}" token="${GH_TOKEN:-${GITHUB_TOKEN:-fixture-saved-github}}" argument previous=''
+    for argument in "$@"; do
+      [[ "$previous" != --hostname ]] || host="$argument"
+      previous="$argument"
+    done
+    case "$1 ${2:-}" in
+      'auth token')
+        printf 'TOKEN %s\n' "$host" >> "$calls"
+        [[ "$selected" != none ]] || return 1
+        if [[ "$host" == github.com ]]; then printf 'fixture-saved-github\n'
+        else printf 'fixture-saved-enterprise\n'; fi
+        return 0 ;;
+      'auth status')
+        printf 'STATUS %s %s\n' "$host" "$token" >> "$calls"
+        [[ "$selected" != none && "$transport" != curl && "$token" != fixture-invalid ]] ;;
+      api\ *)
+        printf 'GH %s %s\n' "$host" "$token" >> "$calls"
+        if [[ "$2" == */releases/assets/* ]]; then printf 'credential-payload\000\001'
+        else printf '{"authenticated":true}\n'; fi ;;
+      *) return 4 ;;
+    esac
+  }
+  curl() {
+    local token='' output='' argument previous='' url=''
+    for argument in "$@"; do
+      [[ "$previous" != -o ]] || output="$argument"
+      if [[ "$argument" == 'Authorization: Bearer '* ]]; then token="${argument#Authorization: Bearer }"; fi
+      [[ "$argument" != https://* ]] || url="$argument"
+      previous="$argument"
+    done
+    printf 'CURL %s %s\n' "$url" "$token" >> "$calls"
+    if [[ "$token" == fixture-invalid ]]; then
+      printf 'HTTP/2 401\r\n\r\n{"message":"Bad credentials"}'
+    elif [[ -n "$output" ]]; then
+      printf 'credential-payload\000\001' > "$output"
+    else
+      printf 'HTTP/2 200\r\n\r\n{"authenticated":true}'
+    fi
+  }
+  result=$(gh_api repos/owner/repo/releases/9 --no-cache) || status=$?
+  after="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
+  [[ "$before" == "$after" ]] || return 1
+  if [[ "$selected" == none || "$selected" == invalid ]]; then
+    if [[ "$selected" == none ]]; then [[ $status -eq 3 ]] || return 1
+    else [[ $status -eq 22 ]] || return 1; fi
+    ! grep -Eq '^GH |^CURL .*fixture-gh$|^CURL .*fixture-saved-' "$calls" || return 1
+    [[ "$selected" != none ]] || ! grep -q '^CURL ' "$calls" || return 1
+    return 0
+  fi
+  [[ $status -eq 0 && "$result" == '{"authenticated":true}' ]] || return 1
+  gh_download_release_asset owner/repo 42 "$destination" || return 1
+  cmp "$destination" <(printf 'credential-payload\000\001') || return 1
+  after="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
+  [[ "$before" == "$after" ]] || return 1
+  if [[ "$transport" == gh ]]; then
+    [[ $(grep -Fc "GH github.com $expected" "$calls") -eq 2 ]] || return 1
+    ! grep -q '^CURL ' "$calls" || return 1
+  else
+    grep -Fxq "CURL https://api.github.com/repos/owner/repo/releases/9 $expected" "$calls" &&
+      grep -Fxq "CURL https://api.github.com/repos/owner/repo/releases/assets/42 $expected" "$calls" || return 1
+    ! grep -q '^GH ' "$calls" || return 1
+  fi
+  ! grep -Eq '^(TOKEN|STATUS) enterprise\.' "$calls" || return 1
+  ! grep '^STATUS ' "$calls" | grep -Fv "STATUS github.com $expected" || return 1
+)
+
+test_api_rejects_external_endpoints() (
+  local endpoint status
+  gh() { printf 'unexpected CLI\n' >> "$TEMP_DIR/external-request"; return 1; }
+  curl() { printf 'unexpected HTTP\n' >> "$TEMP_DIR/external-request"; return 1; }
+  for endpoint in 'https://enterprise.fixture.invalid/api/v3/user' '//enterprise.fixture.invalid/user'; do
+    status=0
+    gh_api "$endpoint" --no-cache >/dev/null 2>&1 || status=$?
+    [[ $status -eq 4 && ! -e "$TEMP_DIR/external-request" ]] || return 1
+  done
+)
+
+test_exported_credential_helpers() (
+  local result
+  source "$SRC_DIR/github.sh"
+  export DSR_GH_TOKEN=fixture-dsr GITHUB_TOKEN=fixture-github GH_TOKEN=fixture-gh
+  export GH_HOST=enterprise.fixture.invalid
+  gh() { printf '%s|%s\n' "$GH_HOST" "$GH_TOKEN"; }
+  export -f gh
+  result=$(bash -c '_gh_resolve_token') || return 1
+  [[ "$result" == fixture-dsr ]] || return 1
+  result=$(bash -c 'secrets_run_gh api user --hostname github.com') || return 1
+  [[ "$result" == 'github.com|fixture-dsr' && "$GH_HOST" == enterprise.fixture.invalid && "$GH_TOKEN" == fixture-gh ]]
+)
+
+run_credential_routing_tests() {
+  local selected transport
+  for selected in dsr github gh saved standalone; do
+    for transport in gh curl; do
+      run_test "credential_${selected}_${transport}" test_credential_transport_routing "$selected" "$transport"
+    done
+  done
+  run_test credential_missing test_credential_transport_routing none gh
+  run_test credential_invalid_does_not_change_account test_credential_transport_routing invalid gh
+  run_test api_rejects_external_endpoints test_api_rejects_external_endpoints
+  run_test exported_credential_helpers test_exported_credential_helpers
+}
+
 test_api_retains_original_draft_response() (
   local private="$TEMP_DIR/private" result
   local wire_response=$'{\n  "id": 9, "tag_name": "v1.2.3", "name": "v1.2.3",\n  "body": "owned", "draft": true, "prerelease": false, "assets": []\n}\n\n'
@@ -420,7 +555,6 @@ test_api_transport_scenario() (
   local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=3 GH_RETRY_DELAY=0 GH_MAX_RETRY_WAIT=300
   local GITHUB_TOKEN='fixture-token'
   unset DSR_GH_TOKEN GH_TOKEN
-  unset -f secrets_get_gh_token 2>/dev/null || true
   gh() { return 1; }
   sleep() { printf 'SLEEP %s\n' "$1" >> "$calls"; }
   key=$(_gh_cache_key "$endpoint")
@@ -811,7 +945,7 @@ test_release_upload_scenario() (
   local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=3 GH_RETRY_DELAY=0
   local -x GH_UPLOAD_TIMEOUT=15 GH_MAX_RETRY_WAIT=300
   unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
-  unset -f secrets_get_gh_token artifact_naming_generate_dual_for_tool 2>/dev/null || true
+  unset -f artifact_naming_generate_dual_for_tool 2>/dev/null || true
   sleep() { printf 'SLEEP %s\n' "$1" >> "$calls"; }
 
   fixture_asset() {
@@ -1381,6 +1515,13 @@ main() {
   echo "=== github.sh Tests ==="
   echo ""
 
+  if [[ "${1:-}" == --credential-routing-only ]]; then
+    run_credential_routing_tests
+    printf 'Credential routing: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
+
   echo "Cache Key Generation:"
   run_test "cache_key_simple" test_cache_key_simple
   run_test "cache_key_with_query" test_cache_key_with_query
@@ -1412,6 +1553,7 @@ main() {
 
   echo ""
   echo "Token Validation:"
+  run_credential_routing_tests
   run_test "check_token_fails_when_unset" test_check_token_fails_when_unset
   run_test "check_token_passes_when_set" test_check_token_passes_when_set
   run_test "check_token_returns_code_3" test_check_token_returns_code_3

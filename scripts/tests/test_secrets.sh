@@ -211,6 +211,88 @@ test_gh_source_detection() {
     fi
 }
 
+# Exercise the exported command helper and diagnostics together. A fake gh
+# observes child environment and arguments; all credentials are dummy values.
+test_gh_credential_fixture() (
+    local scenario="$1" expected=fixture-dsr expected_source=DSR_GH_TOKEN
+    local evidence before after result status=0
+    evidence=$(mktemp -d "${TMPDIR:-/tmp}/dsr-secret-routing.XXXXXXXX") || return 1
+    export DSR_GH_TOKEN=fixture-dsr GITHUB_TOKEN=fixture-github GH_TOKEN=fixture-gh
+    export GH_HOST=enterprise.fixture.invalid GH_REPO=enterprise.fixture.invalid/other/repo
+    case "$scenario" in
+        github) unset DSR_GH_TOKEN; expected=fixture-github; expected_source=GITHUB_TOKEN ;;
+        gh) unset DSR_GH_TOKEN GITHUB_TOKEN; expected=fixture-gh; expected_source=GH_TOKEN ;;
+        saved) unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN; expected=fixture-saved; expected_source=gh_auth ;;
+        missing) unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN; expected_source=none ;;
+        invalid) export DSR_GH_TOKEN=fixture-invalid; expected=fixture-invalid ;;
+        dsr|scope-api) ;;
+        *) return 4 ;;
+    esac
+    before="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
+    gh() {
+        local host="${GH_HOST:-github.com}" token="${GH_TOKEN:-${GITHUB_TOKEN:-fixture-saved}}" argument previous=''
+        for argument in "$@"; do
+            [[ "$previous" != --hostname ]] || host="$argument"
+            previous="$argument"
+        done
+        if [[ "$1 ${2:-}" == 'auth token' ]]; then
+            printf 'TOKEN %s\n' "$host" >> "$evidence/calls"
+            [[ "$scenario" != missing ]] || return 1
+            [[ "$host" == github.com ]] || { printf 'fixture-enterprise\n'; return 0; }
+            printf 'fixture-saved\n'; return 0
+        fi
+        printf 'COMMAND %s %s %s\n' "$host" "$token" "$*" >> "$evidence/calls"
+        [[ "$host" == github.com && "$token" == "$expected" ]] || return 91
+        [[ "$scenario" != invalid ]] || return 23
+        case "$1 ${2:-}" in
+            'auth status')
+                if [[ "$scenario" != scope-api ]]; then printf "Token scopes: 'repo', 'workflow'\n"; fi ;;
+            'api user') printf 'fixture-release-account\n' ;;
+            'api failure') return 19 ;;
+            *) return 4 ;;
+        esac
+    }
+    [[ "$(secrets_get_gh_source)" == "$expected_source" ]] || return 1
+    if [[ "$scenario" == missing ]]; then
+        secrets_run_gh api user --hostname github.com > "$evidence/stdout" 2> "$evidence/stderr" || status=$?
+        [[ $status -eq 3 && ! -s "$evidence/stdout" ]] || return 1
+        ! grep -q '^COMMAND ' "$evidence/calls" || return 1
+        return 0
+    fi
+    if [[ "$scenario" == invalid ]]; then
+        secrets_run_gh api user --hostname github.com > "$evidence/stdout" 2> "$evidence/stderr" || status=$?
+        [[ $status -eq 23 && ! -s "$evidence/stdout" ]] || return 1
+        ! secrets_validate_gh_scopes release || return 1
+        ! grep -q '^TOKEN ' "$evidence/calls" || return 1
+    else
+        [[ "$(secrets_get_gh_token)" == "$expected" ]] || return 1
+        secrets_validate_gh_scopes release || return 1
+        result=$(secrets_check_gh_auth) || return 1
+        jq -e '.status == "ok" and .user == "fixture-release-account"' <<< "$result" >/dev/null || return 1
+        result=$(secrets_doctor_summary) || return 1
+        jq -e --arg source "$expected_source" '.github.available == true and
+            .github.user == "fixture-release-account" and .github.source == $source' <<< "$result" >/dev/null || return 1
+        secrets_run_gh api failure --hostname github.com > "$evidence/stdout" 2> "$evidence/stderr" || status=$?
+        [[ $status -eq 19 ]] || return 1
+    fi
+    after="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
+    [[ "$before" == "$after" ]] || return 1
+    ! grep -q '^TOKEN enterprise\.' "$evidence/calls" || return 1
+    ! grep '^COMMAND ' "$evidence/calls" | grep -Fv "COMMAND github.com $expected "
+)
+
+test_gh_credential_routing() {
+    local scenario
+    log_test 'GitHub command and diagnostic credential routing'
+    for scenario in dsr github gh saved missing invalid scope-api; do
+        if test_gh_credential_fixture "$scenario"; then
+            log_pass "GitHub identity preserved: $scenario"
+        else
+            log_fail "GitHub identity mismatch: $scenario"
+        fi
+    done
+}
+
 # ============================================================================
 # Webhook URL Validation Tests
 # ============================================================================
@@ -316,6 +398,12 @@ test_json_redaction() {
 # ============================================================================
 
 main() {
+    if [[ "${1:-}" == --credential-routing-only ]]; then
+        test_gh_credential_routing
+        printf 'Credential diagnostics: %s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        exit $?
+    fi
     echo "═══════════════════════════════════════════════════════════════"
     echo "  secrets.sh Unit Tests"
     echo "═══════════════════════════════════════════════════════════════"
@@ -331,6 +419,7 @@ main() {
 
     # Source detection tests
     test_gh_source_detection
+    test_gh_credential_routing
 
     # Webhook validation tests
     test_slack_webhook_validation

@@ -140,9 +140,9 @@ secrets_get_gh_token() {
     elif [[ -n "${GH_TOKEN:-}" ]]; then
         token="$GH_TOKEN"
         _sec_log_info "Using GitHub token from GH_TOKEN"
-    # 4. gh auth token fallback
+    # 4. Public-GitHub stored credentials, independent of an ambient GH_HOST.
     elif command -v gh &>/dev/null; then
-        if token=$(gh auth token 2>/dev/null) && [[ -n "$token" ]]; then
+        if token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) && [[ -n "$token" ]]; then
             _sec_log_info "Using GitHub token from gh auth"
         else
             token=""
@@ -159,6 +159,20 @@ secrets_get_gh_token() {
     echo "$token"
     return 0
 }
+
+# Run one gh command with the same public-GitHub identity as DSR's HTTP
+# transports. gh otherwise prefers GH_TOKEN over GITHUB_TOKEN and does not
+# understand DSR_GH_TOKEN. The subshell preserves all caller environment and
+# tracing settings; credentials are supplied through the child's environment.
+# Usage: secrets_run_gh <gh arguments...>
+secrets_run_gh() (
+    set +x
+    local token
+    command -v gh >/dev/null 2>&1 || return 3
+    token=$(secrets_get_gh_token 2>/dev/null) || return 3
+    [[ -n "$token" ]] || return 3
+    GH_HOST=github.com GH_TOKEN="$token" gh "$@"
+)
 
 # Check if GitHub token is available (without outputting it)
 # Usage: secrets_has_gh_token
@@ -186,7 +200,7 @@ secrets_validate_gh_scopes() {
 
     # Get current auth status
     local auth_status
-    if ! auth_status=$(gh auth status 2>&1); then
+    if ! auth_status=$(secrets_run_gh auth status --hostname github.com 2>&1); then
         _sec_log_error "GitHub authentication failed"
         _sec_log_error "Run: gh auth login"
         return 3
@@ -202,7 +216,7 @@ secrets_validate_gh_scopes() {
 
     if [[ -z "$current_scopes" ]]; then
         # If we can't determine scopes, try an API call to verify
-        if ! gh api user &>/dev/null; then
+        if ! secrets_run_gh api user --hostname github.com &>/dev/null; then
             _sec_log_error "Token validation failed - unable to access GitHub API"
             return 3
         fi
@@ -254,7 +268,7 @@ secrets_check_gh_auth() {
         details="Not authenticated"
     else
         # Get authenticated user
-        if user=$(gh api user -q '.login' 2>/dev/null); then
+        if user=$(secrets_run_gh api user --hostname github.com -q '.login' 2>/dev/null); then
             details="Authenticated as $user"
         else
             status="warn"
@@ -423,7 +437,7 @@ secrets_doctor_summary() {
     # GitHub
     if secrets_has_gh_token; then
         gh_available=true
-        gh_user=$(gh api user -q '.login' 2>/dev/null || echo "unknown")
+        gh_user=$(secrets_run_gh api user --hostname github.com -q '.login' 2>/dev/null || echo "unknown")
         gh_source=$(secrets_get_gh_source)
     fi
 
@@ -465,7 +479,7 @@ secrets_get_gh_source() {
         echo "GITHUB_TOKEN"
     elif [[ -n "${GH_TOKEN:-}" ]]; then
         echo "GH_TOKEN"
-    elif command -v gh &>/dev/null && gh auth token &>/dev/null; then
+    elif command -v gh &>/dev/null && GH_HOST=github.com gh auth token --hostname github.com &>/dev/null; then
         echo "gh_auth"
     else
         echo "none"
@@ -474,7 +488,7 @@ secrets_get_gh_source() {
 
 # Export functions
 export -f secrets_init secrets_redact secrets_redact_json secrets_mask
-export -f secrets_get_gh_token secrets_has_gh_token secrets_validate_gh_scopes
+export -f secrets_get_gh_token secrets_run_gh secrets_has_gh_token secrets_validate_gh_scopes
 export -f secrets_check_gh_auth secrets_get_slack_webhook secrets_has_slack_webhook
 export -f secrets_get_discord_webhook secrets_validate_for secrets_doctor_summary
 export -f secrets_get_gh_source

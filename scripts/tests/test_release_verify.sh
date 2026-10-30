@@ -159,6 +159,11 @@ create_mock_gh() {
                 ;;
             release)
                 if [[ "${2:-}" == "upload" ]]; then
+                    if [[ -n "${VERIFY_MOCK_EXPECTED_TOKEN:-}" ]] && \
+                       [[ "${GH_TOKEN:-}" != "$VERIFY_MOCK_EXPECTED_TOKEN" || \
+                          "${GH_HOST:-}" != "github.com" ]]; then
+                        return 9
+                    fi
                     [[ -n "$VERIFY_MOCK_UPLOAD_LOG" ]] && printf '%s\n' "$*" >> "$VERIFY_MOCK_UPLOAD_LOG"
                     [[ "$VERIFY_MOCK_UPLOAD_STATUS" == "0" ]] && printf 'Uploaded asset\n'
                     return "$VERIFY_MOCK_UPLOAD_STATUS"
@@ -2632,6 +2637,47 @@ test_verify_fix_attempts_upload() {
     harness_teardown
 }
 
+test_verify_fix_uses_selected_github_identity() {
+    ((TESTS_RUN++))
+
+    if [[ "$HAS_YQ" != "true" ]]; then
+        skip "yq required for repos.yaml parsing"
+        return 0
+    fi
+
+    harness_setup
+    seed_repos_config
+    seed_manifest "test-tool" "v1.0.0"
+    local upload_log="$TEST_TMPDIR/identity-upload.log"
+    create_mock_gh '{
+        "id": 12345,
+        "html_url": "https://github.com/testuser/test-tool/releases/tag/v1.0.0",
+        "assets": [
+            {"name": "test-tool-linux-amd64", "browser_download_url": "https://example.invalid/a"},
+            {"name": "SHA256SUMS", "browser_download_url": "https://example.invalid/c"}
+        ]
+    }' 0 0 0 "$upload_log"
+
+    DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
+        GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
+        VERIFY_MOCK_EXPECTED_TOKEN=release-fixture-token \
+        PATH="$TEST_TMPDIR/bin:$PATH" exec_run \
+        "$DSR_CMD" --json release verify test-tool v1.0.0 --fix
+
+    if [[ $(exec_status) -eq 0 && -f "$upload_log" ]] && \
+       grep -q 'darwin-arm64' "$upload_log" && \
+       exec_stdout | jq -e '.details.verification.missing == 0 and .details.assets.missing == []' >/dev/null 2>&1; then
+        pass "release verify --fix uploads with the selected token and github.com host"
+    else
+        fail "release repair must use the same GitHub identity as release discovery"
+        printf 'exit status: %s\n' "$(exec_status)"
+        exec_stderr | tail -10
+    fi
+
+    remove_release_verify_mock_gh
+    harness_teardown
+}
+
 test_verify_fix_dry_run_uploads_nothing() {
     ((TESTS_RUN++))
 
@@ -2912,6 +2958,7 @@ test_strict_fix_refuses_release_tag_rebind_before_mutation
 test_strict_fix_final_get_rejects_postcheck_asset_flip
 test_strict_fix_dry_run_leaves_draft_and_sidecars_untouched
 test_verify_fix_attempts_upload
+test_verify_fix_uses_selected_github_identity
 test_verify_fix_dry_run_uploads_nothing
 test_verify_fix_reports_not_found_locally
 

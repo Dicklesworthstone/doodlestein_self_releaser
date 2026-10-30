@@ -15,6 +15,14 @@
 
 set -uo pipefail
 
+# Exported adapter functions and sourceable consumers share one credential
+# policy. Load its exported helpers here so child shells need no source-path
+# reconstruction; secrets.sh has no dependency on this adapter.
+if ! declare -F secrets_get_gh_token >/dev/null || ! declare -F secrets_run_gh >/dev/null; then
+    # shellcheck source=src/secrets.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/secrets.sh" || { return 3 2>/dev/null || exit 3; }
+fi
+
 # Cache configuration
 GH_CACHE_DIR="${DSR_CACHE_DIR:-$HOME/.cache/dsr}/github"
 GH_CACHE_TTL="${GH_CACHE_TTL:-60}"  # seconds
@@ -58,7 +66,7 @@ gh_check() {
         return 1
     fi
 
-    if ! gh auth status &>/dev/null 2>&1; then
+    if ! secrets_run_gh auth status --hostname github.com &>/dev/null 2>&1; then
         _gh_log_warn "gh CLI not authenticated, falling back to curl"
         return 1
     fi
@@ -66,24 +74,13 @@ gh_check() {
     return 0
 }
 
-# Resolve a GitHub token using the canonical cascade:
-#   1. DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN (via secrets_get_gh_token
-#      if that helper is sourced — it centralises the precedence so the
-#      gh_upload_asset and gh_upload_asset_named callers below use the
-#      same order)
-#   2. `gh auth token` if gh CLI is authenticated
-#   3. Bare $GITHUB_TOKEN env var
+# Resolve the canonical DSR_GH_TOKEN / GITHUB_TOKEN / GH_TOKEN / public-GitHub
+# stored credential cascade. Keep precedence in secrets.sh for every transport.
 # Emits the resolved token on stdout. Returns 0 with a non-empty token on
 # success, 3 on failure.
 _gh_resolve_token() {
     local token=""
-    if command -v secrets_get_gh_token &>/dev/null; then
-        token=$(secrets_get_gh_token 2>/dev/null || true)
-    fi
-    if [[ -z "$token" ]] && gh_check 2>/dev/null; then
-        token=$(gh auth token 2>/dev/null || true)
-    fi
-    [[ -z "$token" ]] && token="${GITHUB_TOKEN:-}"
+    token=$(secrets_get_gh_token 2>/dev/null) || return 3
     if [[ -z "$token" ]]; then
         return 3
     fi
@@ -246,6 +243,13 @@ gh_api() (
 
     if [[ -z "$endpoint" ]]; then
         _gh_log_error "Usage: gh_api <endpoint>"
+        return 4
+    fi
+    # gh accepts absolute endpoint URLs, which override --hostname. This
+    # adapter's contract is a relative path under the public GitHub API, just
+    # as in the curl transport; never let a URL change the credential audience.
+    if [[ "$endpoint" == /* || "$endpoint" == *://* || "$endpoint" == *[[:cntrl:]]* ]]; then
+        _gh_log_error "GitHub API endpoint must be a relative public-GitHub path"
         return 4
     fi
     local max_attempts="${GH_MAX_RETRIES:-3}" retry_delay="${GH_RETRY_DELAY:-5}"
@@ -446,7 +450,7 @@ gh_download_release_asset() {
         staged_file="$staging_dir/asset"
 
         if gh_check 2>/dev/null; then
-            gh api "repos/$repo/releases/assets/$asset_id" \
+            secrets_run_gh api "repos/$repo/releases/assets/$asset_id" --hostname github.com \
                 -H "Accept: application/octet-stream" \
                 -H "Cache-Control: no-cache, no-store, max-age=0" \
                 -H "Pragma: no-cache" > "$staged_file" 2>/dev/null || status=$?
@@ -678,7 +682,7 @@ _gh_api_with_gh() {
     local data="$3"
     local no_cache="${4:-false}"
 
-    local gh_args=(api "$endpoint" -X "$method")
+    local gh_args=(api "$endpoint" --hostname github.com -X "$method")
     if $no_cache; then
         gh_args+=(
             -H "Cache-Control: no-cache, no-store, max-age=0"
@@ -688,9 +692,9 @@ _gh_api_with_gh() {
 
     if [[ -n "$data" ]]; then
         gh_args+=(--input -)
-        echo "$data" | gh "${gh_args[@]}" 2>/dev/null
+        echo "$data" | secrets_run_gh "${gh_args[@]}" 2>/dev/null
     else
-        gh "${gh_args[@]}" 2>/dev/null
+        secrets_run_gh "${gh_args[@]}" 2>/dev/null
     fi
 }
 

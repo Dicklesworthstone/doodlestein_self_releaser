@@ -175,6 +175,38 @@ test_doctor_detects_gh() {
     fi
 }
 
+test_doctor_uses_selected_github_identity() {
+    ((TESTS_RUN++))
+
+    local bin_dir="$TEMP_DIR/identity-bin" output
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/gh" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+    printf 'gh version 2.0.0 (fixture)\n'
+    exit 0
+fi
+[[ "${GH_TOKEN:-}" == "release-fixture-token" && "${GH_HOST:-}" == "github.com" ]] || exit 9
+case "$*" in
+    'auth status --hostname github.com') exit 0 ;;
+    'api user --hostname github.com --jq .login') printf 'selected-release-user\n' ;;
+    *) exit 8 ;;
+esac
+SH
+    chmod +x "$bin_dir/gh"
+    output=$(DSR_GH_TOKEN=release-fixture-token GITHUB_TOKEN=ci-fixture-token \
+        GH_TOKEN=ambient-fixture-token GH_HOST=enterprise.fixture.invalid \
+        PATH="$bin_dir:$PATH" "$DSR_CMD" --json doctor --quick 2>/dev/null)
+
+    if jq -e '.details.checks[] | select(.name == "gh") |
+        .status == "ok" and .authenticated == true and .user == "selected-release-user"' \
+        <<< "$output" >/dev/null 2>&1; then
+        pass "doctor validates the selected release account on github.com"
+    else
+        fail "doctor must validate the release identity when ambient gh credentials differ"
+    fi
+}
+
 test_doctor_detects_jq() {
     ((TESTS_RUN++))
 
@@ -452,6 +484,7 @@ echo ""
 echo "Core Dependency Detection:"
 test_doctor_detects_git
 test_doctor_detects_gh
+test_doctor_uses_selected_github_identity
 test_doctor_detects_jq
 
 echo ""
