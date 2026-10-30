@@ -13,7 +13,7 @@ work = P(tempfile.mkdtemp(prefix='dsr-sync-freshness-')).resolve()
 print('Sync regression evidence retained: ' + str(work), flush=True)
 program = work/'program/src'
 program.mkdir(parents=True)
-for name in ('checksum_sync.sh', 'release_checksums.sh'):
+for name in ('checksum_sync.sh', 'release_checksums.sh', 'secrets.sh'):
     source = P(os.environ.get('DSR_TEST_SYNC_MODULE', str(root/'src'/name))) if name=='checksum_sync.sh' else root/'src'/name
     shutil.copy2(source, program/name)
 passed = failed = 0

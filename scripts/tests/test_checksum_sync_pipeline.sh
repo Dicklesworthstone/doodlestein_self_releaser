@@ -8,7 +8,7 @@ for dependency in git jq sha256sum; do
     command -v "$dependency" >/dev/null || { echo "SKIP: $dependency required"; exit 0; }
 done
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-sync-test.XXXXXXXX") || exit 1
-trap 'code=$?; if [[ $code != 0 && ${DSR_TEST_KEEP_TEMP:-0} == 1 ]]; then echo "Fixtures: $TEMP" >&2; else rm -rf -- "$TEMP"; fi' EXIT
+trap 'if [[ ${DSR_TEST_KEEP_TEMP:-0} == 1 ]]; then echo "Fixtures: $TEMP" >&2; else rm -rf -- "$TEMP"; fi' EXIT
 export HOME="$TEMP/home" GIT_CONFIG_GLOBAL="$TEMP/gitconfig" GIT_CONFIG_NOSYSTEM=1
 export TMPDIR="$TEMP/tmp" DSR_STATE_DIR="$TEMP/state" NO_COLOR=1
 mkdir -p "$HOME" "$TMPDIR" "$DSR_STATE_DIR" "$TEMP/remotes" "$TEMP/artifacts" "$TEMP/transports" "$TEMP/http" "$TEMP/results"
@@ -27,6 +27,7 @@ for name in one two reject; do
  done
 printf 'artifact contents\n' > "$TEMP/artifacts/tool-1.2.3-linux-amd64.tar.gz"
 ln "$TEMP/artifacts/tool-1.2.3-linux-amd64.tar.gz" "$TEMP/artifacts/tool-linux-amd64.tar.gz"
+# shellcheck source=src/checksum_sync.sh
 source "$MODULE" || exit 1
 CONTENT=$(checksum_generate "$TEMP/artifacts") || exit 1
 printf '%s\n' "$CONTENT" > "$TEMP/good-manifest"
@@ -44,6 +45,107 @@ run() {
     printf '%s\n' "$result" > "$TEMP/results/$sequence.json"
 }
 json_is() { jq -es "$1" <<< "$result" >/dev/null; }
+
+# Consume real normalized checksum bytes through the complete sourceable sync
+# command. Only the HTTP/CLI boundary is controlled, using dummy credentials.
+credential_case() (
+    local selected="$1" acquisition="$2" expected='fixture-dsr' expected_status=0 prefer=true
+    local calls="$TEMP/credentials-$selected-$acquisition.calls" response rc=0 before after
+    unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+    unset -f secrets_get_gh_token secrets_run_gh
+    export GH_HOST=enterprise.fixture.invalid GH_REPO=enterprise.fixture.invalid/other/repo
+    case "$selected" in
+        dsr) export DSR_GH_TOKEN=fixture-dsr GITHUB_TOKEN=fixture-github GH_TOKEN=fixture-gh ;;
+        github) export GITHUB_TOKEN=fixture-github GH_TOKEN=fixture-gh; expected='fixture-github' ;;
+        gh) export GH_TOKEN=fixture-gh; expected='fixture-gh' ;;
+        saved) expected='fixture-saved' ;;
+        missing) expected=''; [[ "$acquisition" != private ]] || expected_status=7 ;;
+        invalid)
+            export DSR_GH_TOKEN=fixture-invalid GH_TOKEN=fixture-gh; expected='fixture-invalid'
+            [[ "$acquisition" != private ]] || expected_status=7 ;;
+        *) return 4 ;;
+    esac
+    [[ "$acquisition" != curl-first ]] || prefer=false
+    before="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
+    : > "$calls"
+    gh() {
+        local host="${GH_HOST:-github.com}" token="${GH_TOKEN:-${GITHUB_TOKEN:-fixture-saved}}"
+        local repo='' output='' argument previous=''
+        for argument in "$@"; do
+            case "$previous" in --hostname) host="$argument" ;; --repo) repo="$argument" ;; --output) output="$argument" ;; esac
+            previous="$argument"
+        done
+        if [[ "$1 ${2:-}" == 'auth token' ]]; then
+            printf 'TOKEN %s\n' "$host" >> "$calls"
+            [[ "$selected" != missing ]] || return 1
+            if [[ "$host" == github.com ]]; then printf 'fixture-saved\n'; else printf 'fixture-enterprise\n'; fi
+            return 0
+        fi
+        [[ "$1 ${2:-}" == 'release download' ]] || return 4
+        [[ "$repo" != */*/* ]] || host="${repo%%/*}"
+        printf 'GH %s %s\n' "$host" "$token" >> "$calls"
+        [[ "$selected" != missing && "$token" != fixture-invalid ]] || return 1
+        printf '%s\n' "$CONTENT" > "$output"
+    }
+    curl() {
+        local output='' argument previous=''
+        printf 'CURL\n' >> "$calls"
+        for argument in "$@"; do
+            [[ "$previous" != -o ]] || output="$argument"
+            [[ "$argument" != Authorization:* ]] || return 97
+            previous="$argument"
+        done
+        [[ "$acquisition" != private ]] || return 22
+        printf '%s\n' "$CONTENT" > "$output"
+    }
+    local -a args=(demo v1.2.3 --repo example/one --dry-run)
+    $prefer && args+=(--prefer-gh)
+    response=$(checksum_sync_json "${args[@]}") || rc=$?
+    printf '%s\n' "$response" > "$TEMP/credentials-$selected-$acquisition.json"
+    [[ $rc -eq $expected_status ]] || return 1
+    jq -e --argjson rc "$expected_status" '.exit_code == $rc' <<< "$response" >/dev/null || return 1
+    after="${DSR_GH_TOKEN-unset}|${GITHUB_TOKEN-unset}|${GH_TOKEN-unset}|$GH_HOST|$GH_REPO"
+    [[ "$before" == "$after" ]] || return 1
+    if [[ "$acquisition" == curl-first ]]; then
+        [[ "$(cat "$calls")" == CURL ]] || return 1
+    else
+        ! grep -Eq '^TOKEN enterprise\.|^GH enterprise\.' "$calls" || return 1
+        ! grep '^GH ' "$calls" | grep -Fv "GH github.com $expected" || return 1
+        if [[ "$selected" != missing && "$selected" != invalid ]]; then
+            [[ $(grep -Fc "GH github.com $expected" "$calls") -eq 1 ]] || return 1
+            ! grep -q '^CURL$' "$calls" || return 1
+        elif [[ "$acquisition" == public-fallback ]]; then
+            grep -q '^CURL$' "$calls" || return 1
+        fi
+    fi
+    if [[ $expected_status -eq 0 ]]; then
+        jq -e '(.source.kind == "release_manifest") and .source.asset == "checksums.sha256" and
+            .planned == 1 and .synced == 0' <<< "$response" >/dev/null || return 1
+        [[ "$(cat "$(jq -r .workspace <<< "$response")/manifest")" == "$CONTENT" ]] || return 1
+    fi
+)
+
+credential_tests() {
+    local selected acquisition
+    for selected in dsr github gh saved; do
+        check "checksum manifest selects canonical credential: $selected" credential_case "$selected" private
+    done
+    for selected in missing invalid; do
+        for acquisition in private public-fallback curl-first; do
+            check "checksum credential $selected preserves $acquisition behavior" credential_case "$selected" "$acquisition"
+        done
+    done
+    check 'anonymous curl success does not inspect credentials' credential_case dsr curl-first
+}
+
+if [[ "${1:-}" == --credential-routing-only ]]; then
+    credential_tests
+    printf 'Checksum credential routing: %s passed, %s failed\n' "$passed" "$failed"
+    [[ "$failed" == 0 ]]
+    exit $?
+fi
+
+credential_tests
 run checksum_sync demo v1.2.3 --json --repo example/one --artifacts-dir "$TEMP/artifacts" --dry-run \
     --target-repo example/one --target-repo example/two --target-repo EXAMPLE/ONE
 check 'dry-run succeeds with a complete local release set' equal "$status" 0
@@ -164,6 +266,7 @@ check 'failed clone does not proceed to update or success' equal "$status" 1
 check 'clone failure is explicit per target' json_is '.[0].status=="error" and .[0].results[0].action=="clone" and .[0].results[0].exit_code==8'
 # Network boundaries: real parser consumes bytes produced by fixture transport.
 export HTTP_ROOT="$TEMP/http" CALLS="$TEMP/calls" TRANSPORT_MODE=normal GH_MODE=normal
+export DSR_GH_TOKEN=fixture-sync-account GITHUB_TOKEN=fixture-other GH_TOKEN=fixture-third
 : > "$CALLS"
 cat > "$TEMP/transports/curl" <<'CURL'
 #!/usr/bin/env bash
@@ -180,6 +283,7 @@ CURL
 cat > "$TEMP/transports/gh" <<'GH'
 #!/usr/bin/env bash
 printf 'gh host=%s %s\n' "${GH_HOST:-}" "$*" >> "$CALLS"
+printf '%s %s %s\n' "$1 $2" "${GH_HOST:-}" "${GH_TOKEN:-}" >> "$CALLS.credentials"
 [[ "$GH_MODE" != fail ]] || exit 1
 if [[ "$1 $2" == 'issue create' ]]; then
     printf 'https://github.com/example/review/issues/1\n'; exit 0
@@ -202,8 +306,14 @@ TRANSPORT_MODE=curl-fail
 run checksum_sync_json demo v1.2.3 --repo example/one --dry-run
 check 'authenticated transport can recover failed curl acquisition' equal "$status" 0
 check 'gh transport explicitly pins the GitHub host' grep -q '^gh host=github.com release download' "$CALLS"
+check 'authenticated manifest uses the selected DSR credential' grep -Fxq \
+    'release download github.com fixture-sync-account' "$CALLS.credentials"
 GH_HOST=elsewhere.example run checksum_sync_json demo v1.2.3 --repo example/one --prefer-gh --dry-run
 check 'preferred authenticated transport ignores unrelated GH_HOST' equal "$status" 0
+GH_HOST=elsewhere.example run bash "$MODULE" sync demo v1.2.3 --json --repo example/one --prefer-gh --dry-run
+check 'standalone authenticated sync loads the shared credential policy' equal "$status" 0
+check 'standalone authenticated sync retains the validated release manifest' json_is \
+    'length==1 and .[0].planned==1 and .[0].source.asset=="checksums.sha256"'
 TRANSPORT_MODE=normal
 for kind in html empty duplicate nul; do
     case "$kind" in
@@ -230,6 +340,8 @@ check 'all transport failures return missing-release-data status' equal "$status
 check 'JSON wrapper propagates failed acquisition instead of returning jq success' json_is '.[0].exit_code==7 and .[0].status=="error"'
 GH_MODE=normal TRANSPORT_MODE=normal
 run checksum_sync_json demo v1.2.3 --repo example/one --manifest "$TEMP/good-manifest" --external --push
+check 'review issue uses the same selected credential as the download' grep -Fxq \
+    'issue create github.com fixture-sync-account' "$CALLS.credentials"
 check 'external tool path creates review request instead of committing' equal "$status" 0
 check 'review path has no repository checkout and no pushed claim' json_is '.[0].issues_opened==1 and .[0].synced==0 and .[0].results[0].checkout==null and (.[0].results[0]|has("pushed")|not)'
 GH_MODE=fail

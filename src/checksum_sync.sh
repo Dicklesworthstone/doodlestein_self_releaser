@@ -574,6 +574,19 @@ _cs_update_repo_checksums() (
     return 0
 )
 
+# Load shared authentication only for an actual gh operation. Sourceable local
+# checksum operations and anonymous HTTP downloads require no credential setup.
+# Keep dependency loading and the selected child identity inside this call.
+_cs_run_gh() (
+    if ! declare -F secrets_run_gh >/dev/null; then
+        local module_dir
+        module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 3
+        # shellcheck source=src/secrets.sh
+        source "$module_dir/secrets.sh" || return 3
+    fi
+    secrets_run_gh "$@"
+)
+
 # Only transport failures try another source. A downloaded but malformed
 # manifest is fatal, never a reason to select a different set of checksums.
 _cs_fetch_manifest() {
@@ -587,7 +600,7 @@ _cs_fetch_manifest() {
                 curl -sSfL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
                     "https://github.com/$repo/releases/download/${tag//+/%2B}/$candidate" -o "$output" 2>/dev/null || continue
             else
-                GH_HOST=github.com gh release download "$tag" --repo "$repo" --pattern "$candidate" \
+                _cs_run_gh release download "$tag" --repo "github.com/$repo" --pattern "$candidate" \
                     --output "$output" --clobber 2>/dev/null || continue
             fi
             checksum_manifest_normalize "$output" >/dev/null || return 4
@@ -1145,7 +1158,7 @@ EOF
             else
                 if $verify_release; then _cs_sync_release_gate before-issue || rc=$?; fi
                 if ((rc == 0)); then
-                    if issue_url=$(GH_HOST=github.com gh issue create --repo "$target" \
+                    if issue_url=$(_cs_run_gh issue create --repo "github.com/$target" \
                         --title "Security Review: Update checksums for $tool_name $tag" --body "$body" 2> "$workspace/target-$index.log"); then
                         receipt=$(jq -nc --arg url "$issue_url" '{issue_url:$url}') || return 1
                         issues_opened=$((issues_opened + 1))
