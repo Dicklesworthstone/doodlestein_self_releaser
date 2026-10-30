@@ -284,6 +284,28 @@ def inventory(root, destination=None, require_private_links=False, selected_path
                     raise Failure('cache directory changed while reading: ' + relative)
             finally:
                 os.close(fd)
+        elif (stat.S_ISLNK(before.st_mode) and destination is None and require_private_links and
+              relative.startswith('git/checkouts/')):
+            # Cargo may materialize committed relative file links. Inventory
+            # their text, never follow them as cache traversal. Source-object
+            # authentication separately proves that text against the Git blob.
+            parts = relative.split('/')
+            if len(parts) < 5 or '.git' in (part.casefold() for part in parts):
+                raise Failure('unsafe checkout link location: ' + relative)
+            target = os.readlink(name, dir_fd=parent)
+            checkout = os.path.join(root, *parts[:4])
+            resolved = os.path.realpath(os.path.join(root, *parts[:-1], target))
+            if (not target or os.path.isabs(target) or '.git' in (part.casefold() for part in target.split('/')) or
+                    any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in target) or
+                    not inside(resolved, checkout) or
+                    '.git' in (part.casefold() for part in os.path.relpath(resolved, checkout).split('/')) or
+                    not stat.S_ISREG(os.stat(resolved).st_mode)):
+                raise Failure('checkout link escapes private source files: ' + relative)
+            data = target.encode('utf-8')
+            if identity(before) != identity(os.stat(name, dir_fd=parent, follow_symlinks=False)):
+                raise Failure('checkout link changed while reading: ' + relative)
+            files.append({'path': relative, 'sha256': hashlib.sha256(data).hexdigest(),
+                          'size_bytes': len(data), 'executable_bits': 0, 'symlink': True})
         elif stat.S_ISREG(before.st_mode):
             if selection is not None:
                 raise Failure('selected cache ancestor is not a directory: ' + relative)

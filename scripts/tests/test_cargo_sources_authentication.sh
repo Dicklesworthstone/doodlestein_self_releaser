@@ -497,6 +497,41 @@ def submodule_seed(f):
     assert (copied / 'deps/child/deps/grandchild/value.h').read_bytes() == (nested / 'value.h').read_bytes()
 check('lock-scoped cache preserves only required submodule-bearing checkout', submodule_seed)
 
+def pinned_file_link(f, failure=None):
+    (f.repo / 'LICENSE').write_text('reviewed license\n')
+    (f.repo / 'crate').mkdir()
+    link = f.repo / 'crate/LICENSE'
+    link.symlink_to('../LICENSE')
+    git(f.repo, 'add', '.'); git(f.repo, 'commit', '-qm', 'pin internal license link')
+    f.commit = git(f.repo, 'rev-parse', 'HEAD')
+    f.source = 'git+https://example.invalid/repo#' + f.commit
+    f.graph['packages'][2]['source'] = f.source
+    f.write_lock(); f.save()
+    summary = f.good()
+    assert f.good(mode='verify') == summary
+    if failure:
+        link.rename(f.root / 'retained-link')
+        if failure == 'escape':
+            link.symlink_to('../../../project/Cargo.toml')
+        elif failure == 'absolute':
+            link.symlink_to(f.repo / 'LICENSE')
+        elif failure == 'admin':
+            link.symlink_to('../.git/HEAD')
+        elif failure == 'admin-case':
+            link.symlink_to('../.GiT/HEAD')
+        elif failure == 'directory':
+            link.symlink_to('..')
+        elif failure == 'cycle':
+            link.symlink_to('LICENSE')
+        elif failure == 'retarget':
+            link.symlink_to('../shared.h')
+        elif failure == 'regular':
+            link.write_text('../LICENSE')
+        f.refused(receipt=f.root / 'changed-link.json')
+check('Git object chain authenticates an internal relative file symlink', pinned_file_link)
+for failure in ('escape', 'absolute', 'admin', 'admin-case', 'directory', 'cycle', 'retarget', 'regular'):
+    check('pinned file symlink refuses ' + failure, lambda f, failure=failure: pinned_file_link(f, failure))
+
 print('\nLocked dependency sources: %d passed, %d failed' % (PASS, FAIL))
 sys.exit(bool(FAIL))
 PY

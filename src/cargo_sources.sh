@@ -162,6 +162,24 @@ def ancestors(name):
     return {str(p) for p in Path(name).parents if str(p) != "."}
 
 
+def git_link_bytes(root, name, target):
+    require(target and not target.startswith("/") and
+            not any(ord(c) < 32 or ord(c) == 127 or c in "\\:" for c in target) and
+            ".git" not in (part.casefold() for part in target.split("/")), "unsafe Git source link target")
+    try:
+        resolved = (root / name).parent.joinpath(target).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise Rejected("missing or cyclic Git source link target") from error
+    require(resolved.is_relative_to(root) and
+            ".git" not in (part.casefold() for part in resolved.relative_to(root).parts),
+            "Git source link escapes authenticated source tree")
+    # Directory aliases would hide additional traversal. Admit only a link to
+    # a regular file whose own bytes appear in this same complete inventory.
+    with regular(resolved):
+        pass
+    return target.encode("utf-8")
+
+
 def match_tree(tree, files, directories):
     actual = {row["path"]: row for row in tree["files"]}
     # Cargo creates this marker after checkout/extraction. It is not an
@@ -335,10 +353,14 @@ def git_authentication(tree, source, depth=0):
                     files.update((prefix_child + row["path"], {**row, "path": prefix_child + row["path"]})
                                  for row in child_tree["files"])
                 else:
-                    require(mode in (b"100644", b"100755"), "locked Git sources contain a link or submodule")
+                    require(mode in (b"100644", b"100755", b"120000"), "unsupported locked Git source mode")
                     _, digest, size = object_bytes(child_oid, "blob")
                     files[name] = {"path": name, "sha256": digest, "size_bytes": size,
                                    "executable_bits": 0o111 if mode == b"100755" else 0}
+                    if mode == b"120000":
+                        target = os.readlink(root / name)
+                        git_link_bytes(root, name, target)
+                        files[name]["symlink"] = True
         process.stdin.close()
         require(process.wait(timeout=10) == 0, "locked Git object reader failed")
     finally:
@@ -466,7 +488,12 @@ def inventory(root, kind):
                 require(stat.S_ISDIR(info.st_mode), "linked or external Git administrative directory")
                 directories.append(relative)
                 continue
-            if stat.S_ISDIR(info.st_mode):
+            if kind == "git" and stat.S_ISLNK(info.st_mode):
+                target = os.readlink(name, dir_fd=directory)
+                data = git_link_bytes(root, relative, target)
+                files.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest(),
+                              "size_bytes": len(data), "executable_bits": 0, "symlink": True})
+            elif stat.S_ISDIR(info.st_mode):
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
                 try:
                     require(identity(info) == identity(os.fstat(child)), "dependency directory was replaced")

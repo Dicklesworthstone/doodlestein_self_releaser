@@ -68,6 +68,44 @@ class PrivateCacheTests(unittest.TestCase):
     def copied(self, source):
         return self.home / source.relative_to(self.source)
 
+    def checkout_link(self, target):
+        self.snapshot()
+        checkout = self.home / 'git/checkouts/license-fixture/abcdef0'
+        (checkout / 'crate').mkdir(parents=True)
+        (checkout / 'LICENSE').write_text('reviewed license\n')
+        (checkout / 'crate/LICENSE').symlink_to(target)
+        return checkout
+
+    def test_final_inventory_binds_internal_checkout_file_link(self):
+        self.checkout_link('../LICENSE')
+        receipt = self.root / 'final-links.json'
+        self.invoke('inventory', self.home, receipt)
+        entry = next(row for row in json.loads(receipt.read_text())['inventory']['files']
+                     if row['path'].endswith('/crate/LICENSE'))
+        self.assertTrue(entry['symlink'])
+        self.assertEqual(entry['sha256'], hashlib.sha256(b'../LICENSE').hexdigest())
+        self.invoke('verify', self.home, receipt)
+
+    def test_final_inventory_refuses_checkout_link_escape(self):
+        self.checkout_link('../../../../../config.toml')
+        self.invoke('inventory', self.home, self.root / 'final.json', expected=7)
+
+    def test_final_inventory_refuses_checkout_directory_link(self):
+        self.checkout_link('..')
+        self.invoke('inventory', self.home, self.root / 'final.json', expected=7)
+
+    def test_final_inventory_refuses_checkout_absolute_link(self):
+        self.checkout_link(str(self.home / 'git/checkouts/license-fixture/abcdef0/LICENSE'))
+        self.invoke('inventory', self.home, self.root / 'final.json', expected=7)
+
+    def test_final_inventory_refuses_checkout_link_cycle(self):
+        self.checkout_link('LICENSE')
+        self.invoke('inventory', self.home, self.root / 'final.json', expected=7)
+
+    def test_final_inventory_refuses_case_variant_git_admin_link(self):
+        self.checkout_link('../.GiT/HEAD')
+        self.invoke('inventory', self.home, self.root / 'final.json', expected=7)
+
     def test_private_bytes_modes_and_inventory(self):
         receipt = self.snapshot()
         self.assertEqual(receipt['mode'], 'private-copy')
