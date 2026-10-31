@@ -3283,6 +3283,7 @@ EOF
     local collision_count=0
     local -A collected_names=()
     local -a artifact_rename_pairs=()
+    local verified_additional_receipts='{}'
 
     _build_target_suffix_name() {
         local name="$1"
@@ -3324,6 +3325,8 @@ EOF
         local src="$1"
         local target="${2:-}"
         local target_triple="${3:-}" native_result="${4:-false}"
+        local additional_result="${5:-false}" additional_receipt="null"
+        local additional_format="" additional_sha="" additional_size="" additional_identity=""
         local name dest
         local orig_name=""
 
@@ -3334,7 +3337,33 @@ EOF
         fi
 
         name=$(basename "$src")
-        if [[ "$native_result" == true ]] && ! $build_release_contract_enabled; then
+        if [[ -n "${verified_additional_receipts:-}" ]]; then
+            additional_receipt=$(jq -c --arg path "$src" '.[$path] // null' \
+                <<< "$verified_additional_receipts") || { collect_failed=true; return 1; }
+        fi
+        if [[ "$additional_receipt" != null ]]; then
+            if ! jq -e --arg name "$name" --arg target "$target" \
+                '.name == $name and .target == $target' <<< "$additional_receipt" >/dev/null; then
+                log_error "Additional artifact has the wrong declared name or producer: $src"
+                collect_failed=true
+                return 1
+            fi
+            additional_result=true
+            additional_format=$(jq -r '.declared_format' <<< "$additional_receipt") || return 1
+            additional_sha=$(jq -r '.sha256' <<< "$additional_receipt") || return 1
+            additional_size=$(jq -r '.size_bytes' <<< "$additional_receipt") || return 1
+            additional_identity=$(jq -r '.identity' <<< "$additional_receipt") || return 1
+            if ! _act_validate_additional_artifact "$src" "$target" "$additional_format" \
+                "$additional_sha" "$additional_size" "$additional_identity"; then
+                collect_failed=true
+                return 1
+            fi
+        elif [[ "$additional_result" == true ]]; then
+            log_error "Additional artifact has no verified declaration and receipt: $src"
+            collect_failed=true
+            return 1
+        fi
+        if [[ "$native_result" == true && "$additional_result" != true ]] && ! $build_release_contract_enabled; then
             if ! name=$(_act_native_variant_artifact_name "$tool_name" "$target" "$target_triple" "$name"); then
                 log_error "Native artifact disagrees with its build variant: $src"
                 collect_failed=true
@@ -3344,7 +3373,7 @@ EOF
         orig_name="$name"
         # Qualify raw native outputs before flattening, including the first
         # arrival. Completion order must never decide which target owns `sbh`.
-        if [[ "$native_result" == true ]] && ! $build_release_contract_enabled &&
+        if [[ "$native_result" == true && "$additional_result" != true ]] && ! $build_release_contract_enabled &&
            [[ "$(_act_archive_format "$name")" == none &&
               "$name" != *linux* && "$name" != *darwin* && "$name" != *windows* ]] &&
            [[ -z "$target_triple" || "$name" != *"$target_triple"* ]]; then
@@ -3355,7 +3384,25 @@ EOF
 
         if [[ -n "${collected_names[$name]:-}" ]]; then
             local prior="${collected_names[$name]}"
+            if [[ "$prior" != "$src" ]] && \
+               { [[ "$additional_result" == true ]] ||
+                 { [[ -n "${verified_additional_receipts:-}" ]] &&
+                   jq -e --arg path "$prior" 'has($path)' <<< "$verified_additional_receipts" >/dev/null; }; }; then
+                log_error "Declared additional artifact name collides with another producer: $name"
+                collision_count=$((collision_count + 1))
+                collect_failed=true
+                return 1
+            fi
             if cmp -s "$prior" "$src" 2>/dev/null; then
+                if [[ "$additional_result" == true ]]; then
+                    local duplicate_identity
+                    duplicate_identity=$(_act_file_identity "$dest") || { collect_failed=true; return 1; }
+                    if ! _act_validate_additional_artifact "$dest" "$target" "$additional_format" \
+                        "$additional_sha" "$additional_size" "$duplicate_identity"; then
+                        collect_failed=true
+                        return 1
+                    fi
+                fi
                 log_info "Duplicate artifact (same content): $name"
                 return 0
             fi
@@ -3400,6 +3447,40 @@ EOF
                 collect_failed=true
                 return 1
             fi
+        fi
+
+        # Companions keep their literal configured basename. Copy through a
+        # held exclusive destination, then recheck both format and the frozen
+        # receipt bytes; never suffix or overwrite a conflicting installer.
+        if [[ "$additional_result" == true ]]; then
+            local copied_receipt destination_identity additional_mode=600
+            if [[ "$additional_format" == binary && "$target" != windows/* ]]; then
+                additional_mode=700
+            fi
+            if [[ -e "$dest" || -L "$dest" ]]; then
+                if $build_release_contract_enabled && ! $resume; then
+                    log_error "Strict additional artifact destination already exists: $name"
+                    collect_failed=true
+                    return 1
+                fi
+                destination_identity=$(_act_file_identity "$dest") || { collect_failed=true; return 1; }
+            else
+                if ! copied_receipt=$(_act_collect_stream_exclusive "$dest" "$additional_mode" _act_stream_local_file "$src"); then
+                    log_error "Failed to collect declared additional artifact without clobbering: $name"
+                    collect_failed=true
+                    return 1
+                fi
+                destination_identity=$(jq -r '.identity' <<< "$copied_receipt") || { collect_failed=true; return 1; }
+            fi
+            if ! _act_validate_additional_artifact "$dest" "$target" "$additional_format" \
+                "$additional_sha" "$additional_size" "$destination_identity"; then
+                log_error "Collected additional artifact differs from its declared receipt: $name"
+                collect_failed=true
+                return 1
+            fi
+            collected_names["$name"]="$src"
+            collected_count=$((collected_count + 1))
+            return 0
         fi
 
         if $build_release_contract_enabled; then
@@ -4538,6 +4619,10 @@ EOF
     }
 
     if [[ $success -gt 0 ]]; then
+        if ! verified_additional_receipts=$(_act_additional_artifact_receipts_json "$tool_name" "$result"); then
+            log_error "Additional build artifacts failed their configured ownership, format or receipt checks"
+            return 6
+        fi
         log_info "Collecting build artifacts into $output_dir..."
         local target_result target_triple native_result array_count
         while IFS= read -r target_result; do
@@ -4566,15 +4651,19 @@ EOF
                 continue
             fi
             # Arrays preserve exact paths, including commas. Only legacy
-            # scalar receipts are split; additional payloads remain explicit.
+            # scalar receipts are split; companions have separate trusted
+            # declarations and must never use primary binary renaming rules.
             while IFS= read -r -d '' file; do
                 [[ -n "$file" ]] || continue
                 _build_collect_artifact_file "$file" "$target" "$target_triple" "$native_result"
             done < <(jq -j --argjson count "$array_count" '
-                ((if $count > 0 then .artifact_paths[] else
-                    (.artifact_path // "" | split(",")[]) end),
-                 ((.additional_artifacts // [])[]? | .path // "")) | ., "\u0000"
+                (if $count > 0 then .artifact_paths[] else
+                    (.artifact_path // "" | split(",")[]) end) | ., "\u0000"
             ' <<< "$target_result")
+            while IFS= read -r -d '' file; do
+                [[ -n "$file" ]] || continue
+                _build_collect_artifact_file "$file" "$target" "$target_triple" "$native_result" true
+            done < <(jq -j '.additional_artifacts[]? | .path | ., "\u0000"' <<< "$target_result")
 
             [[ -z "$dir" || ! -d "$dir" ]] && continue
             while IFS= read -r -d '' file; do

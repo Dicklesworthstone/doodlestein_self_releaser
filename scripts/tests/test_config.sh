@@ -1434,6 +1434,184 @@ YAML
   ! config_validate
 }
 
+test_additional_artifact_declarations_normalize() {
+  local value
+  value=$(config_normalize_additional_artifacts_json '{
+    "windows/amd64":[{"name":"setup.msi","format":"msi"},{"name":"app.exe","format":"binary"}],
+    "linux/armv7":["NOTICE.txt",{"name":"index.json","format":"json"},{"name":"docs.zip","format":"zip"}],
+    "freebsd/amd64":[{"name":"sources.tar.gz","format":"tar.gz"},{"name":"data.tar.xz","format":"tar.xz"}]
+  }' fixture) || return 1
+  jq -e '
+    .["windows/amd64"][0] == {name:"setup.msi",format:"msi"} and
+    .["linux/armv7"][0] == {name:"NOTICE.txt",format:"file"} and
+    ([.[][]] | length) == 7
+  ' <<< "$value" >/dev/null || return 1
+  [[ "$(config_normalize_additional_artifacts_json null)" == '{}' ]] || return 1
+  [[ "$(config_normalize_additional_artifacts_json '{}')" == '{}' ]]
+}
+
+test_additional_artifact_declarations_reject_invalid_shapes() {
+  local raw
+  for raw in false '[]' '"file"' '{} {}' \
+    '{"linux/amd64":false}' \
+    '{"linux/amd64":[{"name":"a.json"}]}' \
+    '{"linux/amd64":[{"name":"a.json","format":"json","skip":true}]}' \
+    '{"linux/amd64":[{"name":"a.json","format":"unknown"}]}' \
+    '{"linux/amd64":[{"name":"a.json","format":false}]}' \
+    '{"linux/amd64":[{"name":7,"format":"json"}]}' \
+    '{"linux/amd64":["../escape"]}' \
+    '{"linux/amd64":["a/b"]}' \
+    '{"linux/amd64":["a.sha256"]}' \
+    '{"linux/amd64":["a.json\n"]}' \
+    '{"linux/amd64":["a\u0000.json"]}' \
+    '{"plan9/amd64":["a.json"]}' \
+    '{"linux/amd64\n":[]}'; do
+    if config_normalize_additional_artifacts_json "$raw" fixture >/dev/null 2>&1; then
+      echo "  FAIL: accepted invalid additional artifact declarations: $raw"
+      return 1
+    fi
+  done
+}
+
+test_additional_artifact_declarations_require_single_owner() {
+  local raw
+  for raw in '{"linux/amd64":["notes.txt","notes.txt"]}' \
+    '{"linux/amd64":["notes.txt",{"name":"NOTES.TXT","format":"file"}]}' \
+    '{"linux/amd64":["notes.txt"],"freebsd/amd64":["NOTES.txt"]}'; do
+    if config_normalize_additional_artifacts_json "$raw" fixture > "$TEMP_DIR/output" 2> "$TEMP_DIR/error"; then
+      return 1
+    fi
+    [[ ! -s "$TEMP_DIR/output" ]] || return 1
+    grep -q 'one producer' "$TEMP_DIR/error" || return 1
+  done
+}
+
+test_additional_artifact_declarations_preserve_metadata_namespace() {
+  local name raw
+  for name in SHA256SUMS SHA256SUMS.txt SHA256SUMS.custom checksums.txt \
+      app.sha256 app.minisig app.sig app.sha512 release.intoto.jsonl app.sbom.cdx.json \
+      APP.MINISIG CHECKSUMS.TXT APP.SBOM.JSON; do
+    raw=$(jq -nc --arg name "$name" '{"linux/amd64":[{name:$name,format:"file"}]}') || return 1
+    if config_normalize_additional_artifacts_json "$raw" fixture > "$TEMP_DIR/output" 2> "$TEMP_DIR/error"; then
+      return 1
+    fi
+    [[ ! -s "$TEMP_DIR/output" ]] || return 1
+    grep -q 'reserved release metadata name' "$TEMP_DIR/error" || return 1
+  done
+}
+
+test_additional_artifact_registry_and_explicit_repo_precedence() {
+  release_contract_test_deps_available || return 0
+  config_init >/dev/null
+  cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  contract-tool:
+    workspace_additional_artifacts:
+      windows/amd64: [{name: setup.msi, format: msi}]
+YAML
+  local value
+  value=$(config_get_additional_artifacts_json contract-tool) || return 1
+  jq -e '.["windows/amd64"] == [{name:"setup.msi",format:"msi"}]' <<< "$value" >/dev/null || return 1
+  # The native reader uses repos.d as a complete authority. Preflight must not
+  # promise registry companions that collection will never be configured to read.
+  write_contract_tool_config <<'YAML'
+targets: [linux/armv7]
+YAML
+  [[ "$(config_get_additional_artifacts_json contract-tool)" == '{}' ]] || return 1
+  write_contract_tool_config <<'YAML'
+targets: [linux/armv7]
+workspace_additional_artifacts:
+  linux/armv7: [notes.txt]
+YAML
+  value=$(config_get_additional_artifacts_json contract-tool) || return 1
+  jq -e '. == {"linux/armv7":[{name:"notes.txt",format:"file"}]}' <<< "$value" >/dev/null || return 1
+  write_contract_tool_config <<'YAML'
+workspace_additional_artifacts: null
+YAML
+  [[ "$(config_get_additional_artifacts_json contract-tool)" == '{}' ]] || return 1
+  write_contract_tool_config <<'YAML'
+workspace_additional_artifacts: false
+YAML
+  ! config_get_additional_artifacts_json contract-tool >/dev/null 2>&1
+}
+
+test_additional_artifact_configuration_rejects_duplicate_yaml_keys() {
+  release_contract_test_deps_available || return 0
+  config_init >/dev/null
+  write_contract_tool_config <<'YAML'
+workspace_additional_artifacts:
+  windows/amd64:
+    - name: setup.msi
+      format: msi
+      format: file
+YAML
+  ! config_get_additional_artifacts_json contract-tool >/dev/null 2>&1
+}
+
+test_additional_artifact_configuration_requires_native_producer() {
+  release_contract_test_deps_available || return 0
+  config_init >/dev/null
+  config_load >/dev/null
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64, windows/amd64]
+act_job_map:
+  windows/amd64: build-windows
+workspace_additional_artifacts:
+  windows/amd64: [{name: setup.msi, format: msi}]
+YAML
+  local status=0
+  config_validate > "$TEMP_DIR/validation.out" 2> "$TEMP_DIR/validation.err" || status=$?
+  [[ "$status" == 4 ]] || return 1
+  grep -q 'windows/amd64.*build-windows.*native producer' "$TEMP_DIR/validation.err" || return 1
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64, windows/amd64]
+act_job_map:
+  linux/amd64: build-linux
+  windows/amd64: null
+workspace_additional_artifacts:
+  linux/amd64: []
+  windows/amd64: [{name: setup.msi, format: msi}]
+YAML
+  config_validate >/dev/null || return 1
+  # Match the existing native selector's handling of a quoted null value.
+  config_normalize_additional_artifacts_json \
+    '{"windows/amd64":[{"name":"setup.msi","format":"msi"}]}' \
+    fixture '{"windows/amd64":"null"}' >/dev/null || return 1
+  # Registry-only validation must apply the same producer policy.
+  cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  registry-only:
+    targets: [linux/amd64]
+    act_job_map: {linux/amd64: build-linux}
+    workspace_additional_artifacts:
+      linux/amd64: [notes.txt]
+YAML
+  ! config_get_additional_artifacts_json registry-only >/dev/null 2>&1
+}
+
+test_config_validate_checks_all_additional_artifact_declarations() {
+  release_contract_test_deps_available || return 0
+  config_init >/dev/null
+  config_load >/dev/null
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64, windows/amd64]
+workspace_additional_artifacts:
+  linux/amd64: [notes.txt]
+  windows/amd64: [{name: setup.msi, format: unknown}]
+YAML
+  local status=0
+  config_validate > "$TEMP_DIR/validation.out" 2> "$TEMP_DIR/validation.err" || status=$?
+  [[ "$status" == 4 ]] || return 1
+  grep -q 'windows/amd64.*setup.msi' "$TEMP_DIR/validation.err" || return 1
+  write_contract_tool_config <<'YAML'
+targets: [linux/amd64, windows/amd64]
+workspace_additional_artifacts:
+  linux/amd64: [notes.txt]
+  windows/amd64: [{name: setup.msi, format: msi}]
+YAML
+  config_validate >/dev/null
+}
+
 test_platform_contract_exact_pairs() {
   local target matrix
   for target in linux/amd64 linux/arm64 linux/386 linux/armv7 darwin/amd64 \
@@ -1611,6 +1789,14 @@ main() {
   run_test "validate_checks_schema_version" test_validate_checks_schema_version
   run_test "platform_contract_exact_pairs" test_platform_contract_exact_pairs
   run_test "platform_contract_matches_json_schemas" test_platform_contract_matches_json_schemas
+  run_test "additional_artifact_declarations_normalize" test_additional_artifact_declarations_normalize
+  run_test "additional_artifact_declarations_reject_invalid_shapes" test_additional_artifact_declarations_reject_invalid_shapes
+  run_test "additional_artifact_declarations_require_single_owner" test_additional_artifact_declarations_require_single_owner
+  run_test "additional_artifact_declarations_preserve_metadata_namespace" test_additional_artifact_declarations_preserve_metadata_namespace
+  run_test "additional_artifact_registry_and_explicit_repo_precedence" test_additional_artifact_registry_and_explicit_repo_precedence
+  run_test "additional_artifact_configuration_rejects_duplicate_yaml_keys" test_additional_artifact_configuration_rejects_duplicate_yaml_keys
+  run_test "additional_artifact_configuration_requires_native_producer" test_additional_artifact_configuration_requires_native_producer
+  run_test "config_validate_checks_all_additional_artifact_declarations" test_config_validate_checks_all_additional_artifact_declarations
   run_test "seven_target_configuration_without_strict_contract" test_seven_target_configuration_without_strict_contract
   run_test "unsupported_configuration_names_target_without_strict_contract" test_unsupported_configuration_names_target_without_strict_contract
 

@@ -309,6 +309,10 @@ binary_name: focr
 build_cmd: cargo build --release
 targets:
   - linux/amd64
+workspace_additional_artifacts:
+  linux/amd64:
+    - name: supplemental.tar.xz
+      format: tar.xz
 release_contract:
   checksum_sidecar: sha256
   exact_primary_assets:
@@ -3739,7 +3743,7 @@ fi
 # selected additions and ambiguous/unowned additions must fail closed.
 diagnostic_contract=$(config_get_release_contract_json diagnostictest)
 diagnostic_owned_contract=$(jq '.exact_additional_assets = ["darwin-proof", "linux-proof", "SHA256SUMS"]' <<< "$diagnostic_contract")
-printf '\nworkspace_additional_artifacts:\n  darwin/arm64: [darwin-proof]\n  linux/amd64: [linux-proof]\n' >> "$ACT_REPOS_DIR/diagnostictest.yaml"
+printf '\nworkspace_additional_artifacts:\n  darwin/arm64: [{name: darwin-proof, format: file}]\n  linux/amd64: [linux-proof]\n' >> "$ACT_REPOS_DIR/diagnostictest.yaml"
 diagnostic_projection=$(_act_contract_for_build_purpose diagnostictest "$diagnostic_owned_contract" \
     '["darwin/arm64"]' diagnostic-native)
 if jq -e '.exact_additional_assets == ["darwin-proof"] and

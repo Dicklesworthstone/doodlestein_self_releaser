@@ -1120,6 +1120,91 @@ config_validate_targets() {
     dsr_platform_validate_targets_json "$targets_json" "targets for $toolname"
 }
 
+# Additional release files have literal, globally unique names. Their declared
+# format is build policy, not a value an untrusted producer receipt may choose.
+# This pure normalizer is shared by configuration preflight and native readers.
+config_normalize_additional_artifacts_json() {
+    local raw="${1:-null}" context="${2:-workspace_additional_artifacts}" normalized
+    local act_jobs="${3:-null}"
+    if ! normalized=$(jq -csSe --arg context "$context" \
+        --argjson act_jobs "$act_jobs" \
+        --arg platform_pattern "$(dsr_platform_pattern)" '
+        def refuse($message): error($context + ": " + $message);
+        def safe_name:
+            type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and
+            (test("[\u0000-\u001f\u007f]") | not) and
+            (contains("..") | not);
+        def release_metadata_name:
+            ascii_downcase | test("(\\.minisig|\\.sig|\\.sha256|\\.sha512|\\.intoto\\.jsonl)$|^sha256sums|^checksums\\.txt$|\\.sbom\\.");
+        if length != 1 then refuse("expected one platform mapping") else .[0] end |
+        if . == null then {} else . end |
+        if type != "object" then refuse("expected a platform mapping") else . end |
+        to_entries | map(
+            .key as $platform |
+            if ($platform | test("[\u0000-\u001f\u007f]") or (test($platform_pattern) | not))
+            then refuse("unsupported platform " + ($platform | tojson))
+            elif (.value | type) != "array" then refuse($platform + " requires an array")
+            else .value |= map(
+                if type == "string" then {name:., format:"file"}
+                elif type == "object" and keys == ["format", "name"] then .
+                else refuse($platform + " requires names or exact {name,format} declarations") end |
+                .format as $format |
+                if (.name | safe_name | not)
+                then refuse($platform + " has an unsafe artifact name: " + (.name | tojson))
+                elif (.name | release_metadata_name)
+                then refuse($platform + " uses a reserved release metadata name: " + .name)
+                elif ($format | type) != "string" or
+                     (["file","binary","json","zip","tar.gz","tar.xz","msi"] | index($format)) == null
+                then refuse($platform + " has an unsupported format for " + .name + ": " + (.format | tojson))
+                else . end
+            ) end |
+            if (.value | length) == 0 then .
+            elif $act_jobs != null and ($act_jobs | type) != "object"
+            then refuse("act_job_map must be a platform mapping")
+            else ($act_jobs[$platform] // "") as $job |
+                if $job != "" and $job != "null"
+                then refuse($platform + " assigns additional artifacts to act job " + ($job | tojson) +
+                    "; additional artifacts require a native producer (set act_job_map[" + $platform + "]: null)")
+                else . end
+            end
+        ) | from_entries |
+        [.[][] | .name | ascii_downcase] as $names |
+        ($names | group_by(.) | map(select(length > 1) | .[0])) as $duplicates |
+        if ($duplicates | length) > 0
+        then refuse("artifact names must have one producer and be distinct ignoring case: " + ($duplicates | join(", ")))
+        else . end
+    ' <<< "$raw" 2>&1); then
+        _cfg_log_error "Invalid $context: $normalized"
+        return 4
+    fi
+    printf '%s\n' "$normalized"
+}
+
+# repos.d is the native build authority, including an absent declaration. Only
+# registry-only tools are read from repos.yaml, matching native selector policy.
+# False and malformed mappings must never disappear through a defaulting
+# operator before the shared normalizer sees them.
+config_get_additional_artifacts_json() {
+    local toolname="${1:-}" document raw="null" act_jobs="null"
+    local tool_config="${DSR_CONFIG_DIR:-$HOME/.config/dsr}/repos.d/${toolname}.yaml"
+    [[ -n "$toolname" ]] || return 4
+    if [[ -f "$tool_config" ]]; then
+        document=$(_config_read_single_mapping_json "$tool_config") || return 4
+        act_jobs=$(jq -c '.act_job_map' <<< "$document") || return 4
+        raw=$(jq -c '.workspace_additional_artifacts' <<< "$document") || return 4
+    elif [[ -f "$DSR_REPOS_FILE" ]]; then
+        document=$(_config_read_single_mapping_json "$DSR_REPOS_FILE") || return 4
+        raw=$(jq -c --arg tool "$toolname" '
+            if (.tools | type) != "object" then error("tools must be an object")
+            elif (.tools | has($tool)) and (.tools[$tool] | type) != "object"
+            then error("tool entry must be an object")
+            else .tools[$tool].workspace_additional_artifacts end
+        ' <<< "$document") || return 4
+        act_jobs=$(jq -c --arg tool "$toolname" '.tools[$tool].act_job_map' <<< "$document") || return 4
+    fi
+    config_normalize_additional_artifacts_json "$raw" "workspace_additional_artifacts for $toolname" "$act_jobs"
+}
+
 # Exact release identities follow native task identities. A singleton retains
 # its physical platform key; multiple configured triples each own a qualified
 # key. Keep the original platform/triple order for scheduling and ownership.
@@ -1186,6 +1271,7 @@ config_validate_release_contract() {
     local contract_json targets_json identities_json
 
     config_validate_targets "$toolname" || return 4
+    config_get_additional_artifacts_json "$toolname" >/dev/null || return 4
     contract_json=$(config_get_release_contract_json "$toolname") || return $?
     # Target triples decide release asset names with or without a contract;
     # every build, release and `config validate` passes through here.

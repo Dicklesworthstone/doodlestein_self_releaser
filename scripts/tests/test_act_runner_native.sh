@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -1069,6 +1069,18 @@ rsync() {
 yq() {
     local query
 
+    if [[ "${1:-}" == ea && "${2:-}" == -o=json && "${3:-}" == -I=0 && "${4:-}" == '[.]' ]]; then
+        if [[ -n "${MOCK_WORKSPACE_ADDITIONAL_MAP:-}" ]]; then
+            jq -nc --argjson additional "$MOCK_WORKSPACE_ADDITIONAL_MAP" \
+                '[{workspace_additional_artifacts:$additional}]'
+        else
+            jq -nc --arg target "${DSR_TARGET_PLATFORM:-windows/amd64}" \
+                --argjson additional "${MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS:-[]}" \
+                '[{workspace_additional_artifacts:{($target):$additional}}]'
+        fi
+        return $?
+    fi
+
     # The strict workspace selector now validates the entire JSON config.
     # These command-construction fixtures are single-binary repositories.
     if [[ "${1:-}" == -o=json && "${2:-}" == -I=0 ]]; then
@@ -1078,8 +1090,6 @@ yq() {
                 printf 'null\n'; return 0 ;;
             '.workspace_archive_files[strenv(DSR_TARGET_PLATFORM)] // []')
                 printf '%s\n' "${MOCK_WORKSPACE_ARCHIVE_FILES:-[]}"; return 0 ;;
-            '.workspace_additional_artifacts[strenv(DSR_TARGET_PLATFORM)] // []')
-                printf '%s\n' "${MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS:-[]}"; return 0 ;;
         esac
     fi
 
@@ -1183,7 +1193,7 @@ reset_state() {
     unset MOCK_SIBLING_RELATIVE MOCK_SIBLING_LOCAL_PATH
     unset MOCK_ARTIFACT_KIND MOCK_GLIBC_FLOOR MOCK_DERIVE_OPT
     unset MOCK_SOURCE_VERIFY_EXIT_CODE MOCK_STRICT_CARGO_CACHE_ROOT
-    unset MOCK_WORKSPACE_ARCHIVE_FILES MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS
+    unset MOCK_WORKSPACE_ARCHIVE_FILES MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS MOCK_WORKSPACE_ADDITIONAL_MAP
 
     # Defaults
     MOCK_LOCAL_PATH="/local/path/tool"
@@ -3241,6 +3251,58 @@ test_windows_literal_artifact_paths() {
     fi
 }
 
+# Compilation and SSH are controlled protocol boundaries. The production
+# collector, content validators, paths and collection receipts operate on the
+# actual fixture files, including the deliberate .exe decoy.
+_test_windows_companion_collection() (
+    local mode="$1" inputs="$2" case_dir="$3" missing_name="${4:-}" mutation="${5:-}"
+    local override=""
+    exec 2> "$case_dir/stderr"
+    _log_error() { printf '%s\n' "$*" >&2; }
+    _literal_remote_file() {
+        local remote="$1" selected
+        printf '%s\n' "$remote" >> "$case_dir/requests"
+        [[ "$remote" == C:/literal/source/* ]] || return 7
+        selected="${remote#C:/literal/source/}"
+        [[ "$selected" != */* && "$selected" != "$missing_name" ]] || return 7
+        [[ -f "$inputs/$selected" ]] || return 7
+        printf '%s\n' "$inputs/$selected"
+    }
+    scp() {
+        local source="${*: -2:1}" destination="${!#}" selected
+        if [[ "$destination" == wlap:*/build.ps1 ]]; then
+            cp "$source" "$MOCK_DIR/staged-command.ps1"
+            return $?
+        fi
+        [[ "$source" == wlap:* ]] || return 7
+        selected=$(_literal_remote_file "${source#wlap:}") || return 7
+        cp "$selected" "$destination"
+    }
+    ssh() {
+        local program remote selected
+        program=$(_test_decode_remote_command "${!#}") || return 7
+        [[ "$program" == *"[IO.File]::OpenRead('"* ]] || return 7
+        remote="${program#*OpenRead(\'}"
+        remote="${remote%%\'*}"
+        selected=$(_literal_remote_file "$remote") || return 7
+        cat "$selected"
+    }
+    if [[ "$mutation" == after-json-validation ]]; then
+        # Validate real JSON first, then change bytes on the same inode. The
+        # surrounding receipt gate, not the parser, must catch this mutation.
+        # shellcheck source=src/artifact_formats.sh
+        source "$SRC_DIR/artifact_formats.sh" || return 3
+        artifact_format_validate_json() {
+            _artifact_format_validate json "$@" || return $?
+            printf 'changed after content admission\n' >> "$1"
+        }
+    fi
+    [[ "$mode" != strict ]] || override="$MOCK_LOCAL_PATH"
+    ACT_ARTIFACTS_DIR="$case_dir/artifacts" \
+        act_run_native_build tool windows/amd64 v1.6.0 \
+            44444444-4444-4444-8444-444444444444 "$override"
+)
+
 test_windows_literal_companion_collection() {
     log_test "Windows companions: actual ordinary and strict collection retain exact bytes and names"
     reset_state
@@ -3259,52 +3321,14 @@ test_windows_literal_companion_collection() {
     printf 'retained archive payload\n' > "$inputs/bundle.zip"
     printf 'retained extensionless notice\n' > "$inputs/NOTICE"
     printf 'wrong suffix decoy\n' > "$inputs/ui-1.6.0-x86_64.msi.exe"
-    local mode outcome case_dir result status override name path digest size identity
+    local mode outcome case_dir result status missing_name name path digest size identity
     for mode in ordinary strict; do
         for outcome in complete missing; do
             case_dir=$(mktemp -d "$MOCK_DIR/literal-${mode}-${outcome}.XXXXXXXX") || return
             status=0
-            result=$(
-                exec 2> "$case_dir/stderr"
-                # Keep the compilation/SSH protocol fixture used by this
-                # suite. The collector, paths, modes, hashes and held-inode
-                # receipts all run unchanged against real fixture files.
-                _log_error() { printf '%s\n' "$*" >&2; }
-                _literal_remote_file() {
-                    local remote="$1" selected
-                    printf '%s\n' "$remote" >> "$case_dir/requests"
-                    [[ "$remote" == C:/literal/source/* ]] || return 7
-                    selected="${remote#C:/literal/source/}"
-                    [[ "$selected" != */* ]] || return 7
-                    [[ "$outcome" != missing || "$selected" != ui-1.6.0-x86_64.msi ]] || return 7
-                    [[ -f "$inputs/$selected" ]] || return 7
-                    printf '%s\n' "$inputs/$selected"
-                }
-                scp() {
-                    local source="${*: -2:1}" destination="${!#}" selected
-                    if [[ "$destination" == wlap:*/build.ps1 ]]; then
-                        cp "$source" "$MOCK_DIR/staged-command.ps1"
-                        return $?
-                    fi
-                    [[ "$source" == wlap:* ]] || return 7
-                    selected=$(_literal_remote_file "${source#wlap:}") || return 7
-                    cp "$selected" "$destination"
-                }
-                ssh() {
-                    local program remote selected
-                    program=$(_test_decode_remote_command "${!#}") || return 7
-                    [[ "$program" == *"[IO.File]::OpenRead('"* ]] || return 7
-                    remote="${program#*OpenRead(\'}"
-                    remote="${remote%%\'*}"
-                    selected=$(_literal_remote_file "$remote") || return 7
-                    cat "$selected"
-                }
-                override=""
-                [[ "$mode" != strict ]] || override="$MOCK_LOCAL_PATH"
-                ACT_ARTIFACTS_DIR="$case_dir/artifacts" \
-                    act_run_native_build tool windows/amd64 v1.6.0 \
-                        44444444-4444-4444-8444-444444444444 "$override"
-            ) || status=$?
+            missing_name=""
+            [[ "$outcome" != missing ]] || missing_name=ui-1.6.0-x86_64.msi
+            result=$(_test_windows_companion_collection "$mode" "$inputs" "$case_dir" "$missing_name") || status=$?
             printf '%s\n' "$result" > "$case_dir/result.json"
             if [[ "$outcome" == missing ]]; then
                 if jq -e '.status != "success" and
@@ -3355,6 +3379,448 @@ test_windows_literal_companion_collection() {
                 fi
             done
         done
+    done
+}
+
+test_typed_additional_artifact_preflight() {
+    log_test "Typed companion declarations reject before source or compiler side effects"
+    local invalid case_dir result status
+    for invalid in unknown-format unsafe-name nonselected-invalid descriptor-keys duplicate-owner; do
+        reset_state
+        MOCK_LANGUAGE=go
+        MOCK_LOCAL_PATH=C:/literal/source
+        case "$invalid" in
+            unknown-format) MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS='[{"name":"installer.msi","format":"guess"}]' ;;
+            unsafe-name) MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS='[{"name":"../installer.msi","format":"msi"}]' ;;
+            nonselected-invalid)
+                MOCK_WORKSPACE_ADDITIONAL_MAP='{"windows/amd64":[{"name":"installer.msi","format":"msi"}],"linux/armv7":[{"name":"notes.json","format":"guess"}]}' ;;
+            descriptor-keys) MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS='[{"name":"installer.msi","format":"msi","path":"elsewhere"}]' ;;
+            duplicate-owner)
+                MOCK_WORKSPACE_ADDITIONAL_MAP='{"windows/amd64":[{"name":"Installer.msi","format":"msi"}],"linux/amd64":["installer.msi"]}' ;;
+        esac
+        case_dir=$(mktemp -d "$MOCK_DIR/typed-preflight-${invalid}.XXXXXXXX") || return
+        status=0
+        result=$(
+            exec 2> "$case_dir/stderr"
+            _act_ssh_exec() { printf 'unexpected source/compiler command\n' >> "$case_dir/events"; return 99; }
+            ACT_ARTIFACTS_DIR="$case_dir/artifacts" act_run_native_build tool windows/amd64 v1.6.0 \
+                44444444-4444-4444-8444-444444444444
+        ) || status=$?
+        if [[ "$status" -eq 4 && ! -e "$case_dir/events" && ! -e "$case_dir/artifacts" ]] &&
+           jq -e '.status == "error" and .exit_code == 4' <<< "$result" >/dev/null &&
+           grep -q workspace_additional_artifacts "$case_dir/stderr"; then
+            log_pass "$invalid declaration refuses before source, compiler and artifact writes"
+        else
+            log_fail "$invalid declaration crossed preflight: status=$status result=$result"
+        fi
+    done
+
+    log_test "Actual configuration parser rejects companions assigned to act producers before work begins"
+    local route owner
+    for route in load orchestrate native native-control; do
+        case_dir=$(mktemp -d "$MOCK_DIR/typed-producer-${route}.XXXXXXXX") || return
+        mkdir -p "$case_dir/config/repos.d" || return
+        owner=linux/amd64
+        [[ "$route" != native-control ]] || owner=windows/amd64
+        jq -nc --arg owner "$owner" --arg source "$case_dir/source" '
+            {tool_name:"tool",repo:"Test/tool",language:"go",binary_name:"tool",local_path:$source,
+             targets:["linux/amd64","windows/amd64"],
+             act_job_map:{"linux/amd64":"release-linux","windows/amd64":null},
+             workspace_additional_artifacts:{($owner):[{name:"notes.json",format:"json"}]}}
+        ' > "$case_dir/config/repos.d/tool.yaml" || return
+        status=0
+        result=$(
+            exec 2> "$case_dir/stderr"
+            unset -f yq
+            export DSR_CONFIG_DIR="$case_dir/config" ACT_REPOS_DIR="$case_dir/config/repos.d"
+            export DSR_REPOS_FILE="$case_dir/config/repos.yaml" ACT_ARTIFACTS_DIR="$case_dir/artifacts"
+            # shellcheck source=src/config.sh
+            source "$SRC_DIR/config.sh" || exit $?
+            _log_error() { printf '%s\n' "$*" >&2; }
+            act_get_local_path() { printf 'source-selection\n' >> "$case_dir/events"; printf '%s\n' "$case_dir/source"; }
+            act_get_native_host() { printf 'wlap\n'; }
+            _act_get_ssh_destination() { printf '%s\n' "$1"; }
+            _act_ssh_exec() { printf 'unexpected-transport\n' >> "$case_dir/events"; return 99; }
+            case "$route" in
+                load) act_load_repo_config tool ;;
+                orchestrate) act_orchestrate_build tool v1.6.0 -- windows/amd64 ;;
+                native) act_run_native_build tool windows/amd64 v1.6.0 44444444-4444-4444-8444-444444444444 ;;
+                native-control)
+                    act_load_repo_config tool || exit $?
+                    [[ "$(act_get_job_for_target tool linux/amd64)" == release-linux ]] || exit 99
+                    [[ -z "$(act_get_job_for_target tool windows/amd64)" ]] || exit 99
+                    ;;
+            esac
+        ) || status=$?
+        if [[ "$route" == native-control ]]; then
+            if [[ "$status" -eq 0 && "$(cat "$case_dir/events")" == source-selection ]]; then
+                log_pass "Native companions retain existing native/act target selection"
+            else
+                log_fail "Native companion configuration changed target selection: status=$status evidence=$case_dir"
+            fi
+        elif [[ "$status" -eq 4 && ! -e "$case_dir/events" && ! -e "$case_dir/artifacts" ]] &&
+             grep -q 'linux/amd64' "$case_dir/stderr" && grep -q 'release-linux' "$case_dir/stderr"; then
+            log_pass "$route rejects the nonselected act companion producer before source, transport or compiler work"
+        else
+            log_fail "$route act companion producer crossed admission: status=$status result=$result evidence=$case_dir"
+        fi
+    done
+}
+
+test_typed_additional_artifact_collection() {
+    log_test "Typed companions validate actual content and bind collection receipts"
+    reset_state
+    MOCK_LANGUAGE=go
+    MOCK_LOCAL_PATH=C:/literal/source
+    MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS='[
+        {"name":"ui-1.6.0-x86_64.msi","format":"msi"},
+        {"name":"manifest.json","format":"json"},
+        {"name":"bundle.zip","format":"zip"},
+        {"name":"source.tar.gz","format":"tar.gz"},
+        {"name":"source.tar.xz","format":"tar.xz"},
+        {"name":"helper.EXE","format":"binary"},
+        "NOTICE"
+    ]'
+    local inputs
+    inputs=$(mktemp -d "$MOCK_DIR/typed-input.XXXXXXXX") || return
+    if ! bash "$SCRIPT_DIR/test_artifact_formats.sh" --write-fixtures "$inputs/formats"; then
+        log_fail "Cannot prepare independent MSI format fixtures"
+        return
+    fi
+    cp "$inputs/formats/suitable.msi" "$inputs/ui-1.6.0-x86_64.msi"
+    MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$inputs/tool.exe"
+    MOCK_ARTIFACT_KIND=pe-amd64 write_mock_artifact "$inputs/helper.EXE"
+    printf '{"version":"1.6.0","fixture":true}\n' > "$inputs/manifest.json"
+    printf 'opaque notice stays opaque\n' > "$inputs/NOTICE"
+    printf 'wrong executable suffix decoy\n' > "$inputs/ui-1.6.0-x86_64.msi.exe"
+    if ! python3 - "$inputs" <<'PY'
+import io
+from pathlib import Path
+import sys
+import tarfile
+import zipfile
+directory = Path(sys.argv[1])
+content = b'actual archive member bytes\n'
+with zipfile.ZipFile(directory / 'bundle.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr('payload.txt', content)
+for name, mode in [('source.tar.gz', 'w:gz'), ('source.tar.xz', 'w:xz')]:
+    with tarfile.open(directory / name, mode) as archive:
+        member = tarfile.TarInfo('payload.txt')
+        member.size = len(content)
+        member.mode = 0o644
+        archive.addfile(member, io.BytesIO(content))
+PY
+    then
+        log_fail "Cannot prepare real ZIP/tar format fixtures"
+        return
+    fi
+    local mode outcome case_dir case_inputs result status rejected mutation missing_name path name
+    for mode in ordinary strict; do
+        for outcome in valid wrong-msi invalid-json invalid-zip wrong-targz wrong-tarxz wrong-binary wrong-primary missing after-json-validation; do
+            case_dir=$(mktemp -d "$MOCK_DIR/typed-${mode}-${outcome}.XXXXXXXX") || return
+            case_inputs="$case_dir/inputs"
+            mkdir "$case_inputs" || return
+            for name in tool.exe helper.EXE ui-1.6.0-x86_64.msi manifest.json bundle.zip source.tar.gz source.tar.xz NOTICE ui-1.6.0-x86_64.msi.exe; do
+                cp "$inputs/$name" "$case_inputs/$name" || return
+            done
+            rejected="" mutation="" missing_name=""
+            case "$outcome" in
+                wrong-msi)
+                    rejected=ui-1.6.0-x86_64.msi
+                    cp "$inputs/formats/ordinary-ole.msi" "$case_inputs/$rejected" ;;
+                invalid-json)
+                    rejected=manifest.json
+                    printf '{"duplicate":1,"duplicate":2}\n' > "$case_inputs/$rejected" ;;
+                invalid-zip)
+                    rejected=bundle.zip
+                    printf 'PK\003\004truncated archive\n' > "$case_inputs/$rejected" ;;
+                wrong-targz)
+                    rejected=source.tar.gz
+                    cp "$inputs/source.tar.xz" "$case_inputs/$rejected" ;;
+                wrong-tarxz)
+                    rejected=source.tar.xz
+                    cp "$inputs/source.tar.gz" "$case_inputs/$rejected" ;;
+                wrong-binary)
+                    rejected=helper.EXE
+                    MOCK_ARTIFACT_KIND=elf-amd64 write_mock_artifact "$case_inputs/$rejected" ;;
+                wrong-primary)
+                    rejected=tool.exe
+                    MOCK_ARTIFACT_KIND=elf-amd64 write_mock_artifact "$case_inputs/$rejected" ;;
+                missing)
+                    rejected=ui-1.6.0-x86_64.msi
+                    missing_name="$rejected" ;;
+                after-json-validation)
+                    rejected=manifest.json
+                    mutation="$outcome" ;;
+            esac
+            status=0
+            result=$(_test_windows_companion_collection "$mode" "$case_inputs" "$case_dir" "$missing_name" "$mutation") || status=$?
+            printf '%s\n' "$result" > "$case_dir/result.json"
+            if [[ "$mode" == strict && "$outcome" == wrong-primary ]]; then
+                # Strict collection freezes raw primary bytes first; its
+                # independent staging gate owns executable admission.
+                mkdir -p "$case_dir/config/repos.d" || return
+                printf '%s\n' '{"tool_name":"tool","language":"go","binary_name":"tool","targets":["windows/amd64"]}' \
+                    > "$case_dir/config/repos.d/tool.yaml"
+                local staged staging_status=0
+                staged=$(
+                    exec 2> "$case_dir/staging-stderr"
+                    unset -f yq
+                    export DSR_CONFIG_DIR="$case_dir/config" ACT_REPOS_DIR="$case_dir/config/repos.d"
+                    export DSR_REPOS_FILE="$case_dir/config/repos.yaml" ACT_ARTIFACTS_DIR="$case_dir/staging"
+                    # shellcheck source=src/config.sh
+                    source "$SRC_DIR/config.sh" || exit $?
+                    _log_error() { printf '%s\n' "$*" >&2; }
+                    _act_stage_contract_primary tool v1.6.0 44444444-4444-4444-8444-444444444444 \
+                        windows/amd64 "$result" '{"exact_primary_assets":{"windows/amd64":"tool.exe"}}'
+                ) || staging_status=$?
+                if [[ "$status" -eq 0 && "$staging_status" -eq 4 && -z "$staged" ]] &&
+                   grep -q 'PE executable' "$case_dir/staging-stderr"; then
+                    log_pass "Strict primary staging still rejects a different native format after raw collection"
+                else
+                    log_fail "Strict primary executable gate failed: collection=$status staging=$staging_status evidence=$case_dir"
+                fi
+                continue
+            fi
+            if [[ "$outcome" != valid ]]; then
+                if jq -e --arg name "$rejected" '.status != "success" and
+                    all((.artifact_paths[]?, .additional_artifacts[]?.path); (endswith("/" + $name) | not))' \
+                    <<< "$result" >/dev/null &&
+                   { [[ "$mode" == ordinary ]] || [[ "$status" -eq 7 ]]; } &&
+                   { [[ "$outcome" != after-json-validation ]] || grep -q 'changed during format validation' "$case_dir/stderr"; } &&
+                   ! grep -Fq 'ui-1.6.0-x86_64.msi.exe' "$case_dir/requests"; then
+                    log_pass "$mode $outcome refuses the invalid payload receipt and retains exact literal paths"
+                else
+                    log_fail "$mode $outcome admitted invalid companion/primary: status=$status result=$result"
+                fi
+                continue
+            fi
+            if [[ "$status" -eq 0 ]] && jq -e '.status == "success" and
+                (.artifact_paths | length) == 1 and (.additional_artifacts | length) == 7 and
+                ([.additional_artifacts[].path | split("/")[-1]] | sort) ==
+                 ["NOTICE","bundle.zip","helper.EXE","manifest.json","source.tar.gz","source.tar.xz","ui-1.6.0-x86_64.msi"]' \
+                <<< "$result" >/dev/null; then
+                log_pass "$mode collection accepts valid MSI database, JSON, ZIP, gzip/xz tar, native binary and opaque notice"
+            else
+                log_fail "$mode typed collection failed: status=$status result=$result"
+                continue
+            fi
+            for name in ui-1.6.0-x86_64.msi manifest.json bundle.zip source.tar.gz source.tar.xz helper.EXE NOTICE; do
+                path=$(jq -r --arg name "$name" '.additional_artifacts[] | select(.path | endswith("/" + $name)) | .path' <<< "$result")
+                if cmp -s "$case_inputs/$name" "$path" && jq -e --arg path "$path" \
+                    --arg sha "$(_act_sha256 "$path")" --argjson size "$(_act_file_size "$path")" \
+                    --arg identity "$(_act_file_identity "$path")" '.additional_artifacts[] |
+                        select(.path == $path) | .sha256 == $sha and .size_bytes == $size and .identity == $identity' \
+                    <<< "$result" >/dev/null; then
+                    log_pass "$mode typed $name receipt binds the transferred bytes and destination identity"
+                else
+                    log_fail "$mode typed $name receipt is inconsistent"
+                fi
+            done
+            if [[ "$mode" == strict ]]; then
+                TYPED_COMPANION_VALID_RESULT="$result"
+                TYPED_COMPANION_SPECS="$MOCK_WORKSPACE_ADDITIONAL_ARTIFACTS"
+                TYPED_COMPANION_MSI_FIXTURES="$inputs/formats"
+            fi
+        done
+    done
+}
+
+test_typed_additional_artifact_manifests() {
+    log_test "Ordinary and strict manifests independently enforce configured additional content"
+    if [[ -z "${TYPED_COMPANION_VALID_RESULT:-}" ]]; then
+        log_fail "Typed manifest checks require a successful real collection fixture"
+        return
+    fi
+    local source_root source_sha
+    source_root=$(mktemp -d "$MOCK_DIR/typed-manifest-source.XXXXXXXX") || return
+    printf 'Source identity for typed companion manifest admission\n' > "$source_root/README"
+    if ! command git init -q -b main "$source_root" ||
+       ! command git -C "$source_root" -c user.name=DSR-Test -c user.email=dsr-test@example.invalid add README ||
+       ! command git -C "$source_root" -c user.name=DSR-Test -c user.email=dsr-test@example.invalid commit -qm fixture ||
+       ! command git -C "$source_root" tag v1.6.0; then
+        log_fail "Cannot prepare real immutable source/tag fixture"
+        return
+    fi
+    source_sha=$(command git -C "$source_root" rev-parse HEAD) || return
+    local mode outcome case_dir target_result input receipt source_path destination name sha size identity rows row
+    local status manifest declared_specs
+    for mode in ordinary strict; do
+        for outcome in valid wrong-msi invalid-json invalid-zip receipt-tamper missing extra duplicate primary-overlap name-collision after-json-validation forged-format null-receipts false-receipts; do
+            case_dir=$(mktemp -d "$MOCK_DIR/typed-manifest-${mode}-${outcome}.XXXXXXXX") || return
+            mkdir -p "$case_dir/config/repos.d" "$case_dir/payloads" || return
+            rows='[]'
+            while IFS= read -r receipt; do
+                source_path=$(jq -r '.path' <<< "$receipt") || return
+                name=$(basename "$source_path")
+                destination="$case_dir/payloads/$name"
+                cp "$source_path" "$destination" || return
+                case "$outcome:$name" in
+                    wrong-msi:ui-1.6.0-x86_64.msi)
+                        cp "$TYPED_COMPANION_MSI_FIXTURES/ordinary-ole.msi" "$destination" ;;
+                    invalid-json:manifest.json|forged-format:manifest.json)
+                        printf '{"duplicate":1,"duplicate":2}\n' > "$destination" ;;
+                    invalid-zip:bundle.zip)
+                        printf 'PK\003\004truncated archive\n' > "$destination" ;;
+                esac
+                sha=$(_act_sha256 "$destination") || return
+                size=$(_act_file_size "$destination") || return
+                identity=$(_act_file_identity "$destination") || return
+                row=$(jq -nc --arg path "$destination" --arg sha "$sha" --argjson size "$size" \
+                    --arg identity "$identity" '{path:$path, sha256:$sha, size_bytes:$size, identity:$identity}') || return
+                rows=$(jq -c --argjson row "$row" '. + [$row]' <<< "$rows") || return
+            done < <(jq -c '.additional_artifacts[]' <<< "$TYPED_COMPANION_VALID_RESULT")
+            target_result=$(jq -c --argjson rows "$rows" '.additional_artifacts = $rows' \
+                <<< "$TYPED_COMPANION_VALID_RESULT") || return
+            case "$outcome" in
+                receipt-tamper) printf '\n' >> "$case_dir/payloads/manifest.json" ;;
+                missing) target_result=$(jq -c '.additional_artifacts |= .[1:]' <<< "$target_result") ;;
+                extra)
+                    cp "$case_dir/payloads/NOTICE" "$case_dir/payloads/unconfigured.txt"
+                    row=$(jq -nc --arg path "$case_dir/payloads/unconfigured.txt" \
+                        --arg sha "$(_act_sha256 "$case_dir/payloads/unconfigured.txt")" \
+                        --argjson size "$(_act_file_size "$case_dir/payloads/unconfigured.txt")" \
+                        --arg identity "$(_act_file_identity "$case_dir/payloads/unconfigured.txt")" \
+                        '{path:$path, sha256:$sha, size_bytes:$size, identity:$identity}') || return
+                    target_result=$(jq -c --argjson row "$row" '.additional_artifacts += [$row]' <<< "$target_result") ;;
+                duplicate) target_result=$(jq -c '.additional_artifacts += [.additional_artifacts[0]]' <<< "$target_result") ;;
+                forged-format)
+                    target_result=$(jq -c '.additional_artifacts |= map(. + {format:"file",declared_format:"file"})' <<< "$target_result") ;;
+                null-receipts) target_result=$(jq -c '.additional_artifacts = null' <<< "$target_result") ;;
+                false-receipts) target_result=$(jq -c '.additional_artifacts = false' <<< "$target_result") ;;
+            esac
+            declared_specs="$TYPED_COMPANION_SPECS"
+            # Even an empty configured inventory cannot turn an explicitly
+            # malformed provided receipt value into an absent field.
+            case "$outcome" in null-receipts|false-receipts) declared_specs='[]' ;; esac
+            jq -nc --arg source "$source_root" --arg mode "$mode" \
+                --argjson additional "$declared_specs" '
+                {tool_name:"tool", repo:"Test/tool", local_path:$source, language:"go", binary_name:"tool",
+                 build_cmd:"go build", targets:["windows/amd64"], include_extra_files:false,
+                 workspace_additional_artifacts:{"windows/amd64":$additional}} +
+                (if $mode == "strict" then {release_contract:{checksum_sidecar:"sha256",
+                    exact_primary_assets:{"windows/amd64":"tool.exe"},
+                    exact_additional_assets:($additional | map(if type == "string" then . else .name end))}}
+                 else {} end)' > "$case_dir/config/repos.d/tool.yaml" || return
+            status=0
+            manifest=$(
+                exec 2> "$case_dir/stderr"
+                unset -f yq
+                export DSR_CONFIG_DIR="$case_dir/config" ACT_CONFIG_DIR="$case_dir/config"
+                export ACT_REPOS_DIR="$case_dir/config/repos.d" ACT_ARTIFACTS_DIR="$case_dir/staging"
+                export DSR_REPOS_FILE="$case_dir/config/repos.yaml" DSR_CONFIG_FILE="$case_dir/config/config.yaml"
+                export ACT_REPO_LOCAL_PATH="$source_root"
+                # shellcheck source=src/config.sh
+                source "$SRC_DIR/config.sh" || exit $?
+                _log_error() { printf '%s\n' "$*" >&2; }
+                if [[ "$mode" == strict ]]; then
+                    target_result=$(_act_stage_contract_primary tool v1.6.0 \
+                        44444444-4444-4444-8444-444444444444 windows/amd64 "$target_result" \
+                        "$(config_get_release_contract_json tool)") || exit $?
+                fi
+                if [[ "$outcome" == primary-overlap ]]; then
+                    target_result=$(jq -c '.artifact_paths += [.additional_artifacts[0].path]' <<< "$target_result") || exit $?
+                elif [[ "$outcome" == name-collision ]]; then
+                    mkdir "$case_dir/primary" || exit $?
+                    cp "$case_dir/payloads/helper.EXE" "$case_dir/primary/helper.EXE" || exit $?
+                    target_result=$(jq -c --arg path "$case_dir/primary/helper.EXE" \
+                        '.artifact_paths += [$path]' <<< "$target_result") || exit $?
+                fi
+                input=$(jq -nc --arg sha "$source_sha" --argjson target "$target_result" '
+                    {tool:"tool",version:"v1.6.0",run_id:"44444444-4444-4444-8444-444444444444",
+                     git_sha:$sha,git_ref:"v1.6.0",source_dependencies:[],build_purpose:"release",publishable:true,
+                     requested_targets:["windows/amd64"],status:"success",summary:{total:1,success:1,failed:0},
+                     targets:[$target + {build_purpose:"release",publishable:true}]}') || exit $?
+                printf '%s\n' "$input" > "$case_dir/result.json"
+                if [[ "$outcome" == after-json-validation ]]; then
+                    # shellcheck source=src/artifact_formats.sh
+                    source "$SRC_DIR/artifact_formats.sh" || exit $?
+                    artifact_format_validate_json() {
+                        _artifact_format_validate json "$@" || return $?
+                        printf 'same inode, different bytes\n' >> "$1"
+                    }
+                fi
+                act_generate_manifest "$input" "$case_dir/manifest.json" || exit $?
+                cat "$case_dir/manifest.json"
+            ) || status=$?
+            if [[ "$outcome" == valid ]]; then
+                if [[ "$status" -eq 0 ]] && jq -e --arg sha "$source_sha" '
+                    .source.git_sha == $sha and .status == "success" and .publishable == true and
+                    (.artifacts | length) == 8 and
+                    ([.artifacts[].name] | sort) == ["NOTICE","bundle.zip","helper.EXE","manifest.json",
+                        "source.tar.gz","source.tar.xz","tool.exe","ui-1.6.0-x86_64.msi"] and
+                    all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")) and .size_bytes > 0)' \
+                    <<< "$manifest" >/dev/null; then
+                    log_pass "$mode manifest accepts all typed companions with unchanged literal names and source identity"
+                else
+                    log_fail "$mode valid typed manifest failed: status=$status evidence=$case_dir"
+                fi
+            elif [[ "$status" -ne 0 && ! -e "$case_dir/manifest.json" && -z "$manifest" ]] &&
+                 { [[ "$outcome" != after-json-validation ]] || grep -q 'changed during format validation' "$case_dir/stderr"; }; then
+                log_pass "$mode manifest refuses $outcome before writing any manifest"
+            else
+                log_fail "$mode manifest accepted $outcome or left output: status=$status evidence=$case_dir"
+            fi
+        done
+    done
+
+    log_test "Additional assets retain one configured owner across native target triples"
+    for outcome in valid wrong-owner duplicate-owner; do
+        case_dir=$(mktemp -d "$MOCK_DIR/typed-variant-${outcome}.XXXXXXXX") || return
+        mkdir -p "$case_dir/config/repos.d" "$case_dir/gnu" "$case_dir/musl" || return
+        MOCK_ARTIFACT_KIND=elf-amd64 write_mock_artifact "$case_dir/gnu/tool"
+        MOCK_ARTIFACT_KIND=elf-amd64 write_mock_artifact "$case_dir/musl/tool"
+        # A literal metadata name can mention a different platform. Its
+        # configured producer and declared JSON format remain authoritative.
+        printf '{"included_targets":["linux/arm64"]}\n' > "$case_dir/manifest-linux-arm64.json"
+        receipt=$(jq -nc --arg path "$case_dir/manifest-linux-arm64.json" \
+            --arg sha "$(_act_sha256 "$case_dir/manifest-linux-arm64.json")" \
+            --argjson size "$(_act_file_size "$case_dir/manifest-linux-arm64.json")" \
+            --arg identity "$(_act_file_identity "$case_dir/manifest-linux-arm64.json")" \
+            '{path:$path,sha256:$sha,size_bytes:$size,identity:$identity}') || return
+        jq -nc --arg source "$source_root" '
+            {tool_name:"tool",repo:"Test/tool",local_path:$source,language:"rust",binary_name:"tool",
+             targets:["linux/amd64"],target_triples:{"linux/amd64":["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]},
+             workspace_additional_artifacts:{"linux/amd64":[{name:"manifest-linux-arm64.json",format:"json"}]}}
+        ' > "$case_dir/config/repos.d/tool.yaml" || return
+        input=$(jq -nc --arg directory "$case_dir" --arg sha "$source_sha" --arg outcome "$outcome" \
+            --argjson receipt "$receipt" '
+            {tool:"tool",version:"v1.6.0",run_id:"44444444-4444-4444-8444-444444444444",
+             git_sha:$sha,git_ref:"v1.6.0",status:"success",requested_targets:["linux/amd64"],
+             summary:{total:2,success:2,failed:0},targets:[
+                {platform:"linux/amd64",target_triple:"x86_64-unknown-linux-gnu",host:"trj",method:"native",status:"success",
+                 artifact_path:($directory + "/gnu/tool"),artifact_paths:[($directory + "/gnu/tool")],
+                 additional_artifacts:(if $outcome == "wrong-owner" then [] else [$receipt] end)},
+                {platform:"linux/amd64",target_triple:"x86_64-unknown-linux-musl",host:"trj",method:"native",status:"success",
+                 artifact_path:($directory + "/musl/tool"),artifact_paths:[($directory + "/musl/tool")],
+                 additional_artifacts:(if $outcome == "valid" then [] else [$receipt] end)}]}
+        ') || return
+        status=0
+        manifest=$(
+            exec 2> "$case_dir/stderr"
+            unset -f yq
+            export DSR_CONFIG_DIR="$case_dir/config" ACT_REPOS_DIR="$case_dir/config/repos.d"
+            export DSR_REPOS_FILE="$case_dir/config/repos.yaml"
+            # shellcheck source=src/config.sh
+            source "$SRC_DIR/config.sh" || exit $?
+            act_generate_manifest "$input" "$case_dir/manifest.json" || exit $?
+            cat "$case_dir/manifest.json"
+        ) || status=$?
+        if [[ "$outcome" == valid ]]; then
+            if [[ "$status" -eq 0 ]] && jq -e '(.artifacts | length) == 3 and
+                any(.artifacts[]; .name == "manifest-linux-arm64.json" and .target == "linux/amd64" and
+                    .target_triple == "x86_64-unknown-linux-gnu") and
+                ([.artifacts[] | select(.name != "manifest-linux-arm64.json") | .target_triple] | sort) ==
+                    ["x86_64-unknown-linux-gnu","x86_64-unknown-linux-musl"]' <<< "$manifest" >/dev/null; then
+                log_pass "Native variants preserve literal companion name, first producer and both primary identities"
+            else
+                log_fail "Valid variant companion ownership failed: status=$status evidence=$case_dir"
+            fi
+        elif [[ "$status" -eq 4 && ! -e "$case_dir/manifest.json" && -z "$manifest" ]]; then
+            log_pass "Native variant manifest rejects $outcome companions"
+        else
+            log_fail "Native variant manifest admitted $outcome companions: status=$status evidence=$case_dir"
+        fi
     done
 }
 
@@ -4597,6 +5063,22 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --typed-companion-preflight-only ]]; then
+        test_typed_additional_artifact_preflight
+        printf 'Typed companion preflight tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
+    if [[ "${1:-}" == --typed-companions-only ]]; then
+        test_windows_literal_artifact_paths
+        test_windows_literal_companion_collection
+        test_typed_additional_artifact_preflight
+        test_typed_additional_artifact_collection
+        test_typed_additional_artifact_manifests
+        printf 'Typed companion tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --literal-companions-only ]]; then
         test_windows_literal_artifact_paths
         test_windows_literal_companion_collection
@@ -4762,6 +5244,9 @@ main() {
     test_go_artifact_path_honors_gobin
     test_windows_literal_artifact_paths
     test_windows_literal_companion_collection
+    test_typed_additional_artifact_preflight
+    test_typed_additional_artifact_collection
+    test_typed_additional_artifact_manifests
     test_scp_rust_artifact_path
     test_scp_rust_artifact_path_with_absolute_cargo_target_dir
     test_scp_rust_artifact_path_with_relative_cargo_target_dir

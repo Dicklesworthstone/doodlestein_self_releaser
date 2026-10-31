@@ -357,12 +357,151 @@ _act_workspace_archive_files_json() {
 
 _act_workspace_additional_artifacts_json() {
     local config_file="$1"
-    local target="$2"
+    local target="${2:-}" raw normalized module_dir act_jobs
     [[ -f "$config_file" && ! -L "$config_file" ]] || return 4
     command -v yq &>/dev/null || return 3
-    DSR_TARGET_PLATFORM="$target" yq -o=json -I=0 \
-        '.workspace_additional_artifacts[strenv(DSR_TARGET_PLATFORM)] // []' \
-        "$config_file" 2>/dev/null
+    if ! declare -F config_normalize_additional_artifacts_json &>/dev/null; then
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/config.sh
+        source "$module_dir/config.sh" || return 3
+    fi
+    raw=$(DSR_TARGET_PLATFORM="$target" _config_read_single_mapping_json "$config_file") || return 4
+    act_jobs=$(jq -c '.act_job_map' <<< "$raw") || return 4
+    raw=$(jq -c '.workspace_additional_artifacts' <<< "$raw") || return 4
+    normalized=$(config_normalize_additional_artifacts_json "$raw" \
+        "workspace_additional_artifacts in $config_file" "$act_jobs") || return 4
+    if [[ -z "$target" ]]; then
+        printf '%s\n' "$normalized"
+    else
+        jq -c --arg target "$target" '.[$target] // []' <<< "$normalized"
+    fi
+}
+
+# Admit only the bytes named in a collection receipt. Format checks run between
+# digest/size/identity checks so a validator cannot silently admit replacement
+# bytes, including changes that retain the same inode. The declared format comes
+# from the normalized repository configuration, never from a worker receipt.
+_act_validate_additional_artifact() {
+    local file="$1" target="$2" format="$3"
+    local expected_sha="$4" expected_size="$5" expected_identity="$6"
+    local module_dir validation_status=0
+    if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ||
+          ! "$expected_size" =~ ^[1-9][0-9]*$ ||
+          ! "$expected_identity" =~ ^(gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)$ ]] ||
+       [[ ! -f "$file" || -L "$file" ]] ||
+       [[ "$(_act_file_identity "$file")" != "$expected_identity" ||
+          "$(_act_sha256 "$file")" != "$expected_sha" ||
+          "$(_act_file_size "$file")" != "$expected_size" ]]; then
+        _log_error "Additional artifact differs from its collection receipt: $file"
+        return 4
+    fi
+    case "$format" in
+        file) ;;
+        binary)
+            _act_validate_target_binary "$file" "$target" || validation_status=$?
+            ;;
+        zip|tar.gz|tar.xz)
+            if ! declare -F packaging_validate_archive &>/dev/null; then
+                module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+                # shellcheck source=SCRIPTDIR/packaging.sh
+                source "$module_dir/packaging.sh" || return 3
+            fi
+            packaging_validate_archive "$file" "$format" || validation_status=$?
+            ;;
+        json|msi)
+            if ! declare -F artifact_format_validate_json &>/dev/null ||
+               ! declare -F artifact_format_validate_msi &>/dev/null; then
+                module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+                # shellcheck source=SCRIPTDIR/artifact_formats.sh
+                source "$module_dir/artifact_formats.sh" || return 3
+            fi
+            "artifact_format_validate_${format}" "$file" "$expected_sha" "$expected_size" || validation_status=$?
+            ;;
+        *) validation_status=4 ;;
+    esac
+    if [[ "$validation_status" -ne 0 ]]; then
+        _log_error "Additional artifact $(basename "$file") does not satisfy declared format $format for $target"
+        return "$validation_status"
+    fi
+    if [[ ! -f "$file" || -L "$file" ]] ||
+       [[ "$(_act_file_identity "$file")" != "$expected_identity" ||
+          "$(_act_sha256 "$file")" != "$expected_sha" ||
+          "$(_act_file_size "$file")" != "$expected_size" ]]; then
+        _log_error "Additional artifact changed during format validation: $file"
+        return 4
+    fi
+}
+
+# Reconstruct additional-artifact ownership from trusted configuration before
+# manifest admission. This also refuses missing, extra or repeated receipts and
+# prevents later variants from taking ownership of platform-level companions.
+# Return a path-keyed map with trusted names/formats and the verified receipts.
+_act_additional_artifact_receipts_json() {
+    local tool="$1" result_json="$2" configured target_json target triple specs
+    local receipts names expected triples row name path format sha size identity complete primary_paths
+    local verified='{}'
+    jq -e '.targets | type == "array" and all(.[]; type == "object")' \
+        <<< "$result_json" >/dev/null || return 4
+    primary_paths=$(jq -c '[.targets[] |
+        if ((.artifact_paths // []) | length) > 0 then .artifact_paths[]
+        else (.artifact_path // "" | split(",")[]) end | select(length > 0)]' \
+        <<< "$result_json") || return 4
+    configured=$(_act_workspace_additional_artifacts_json "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    while IFS= read -r target_json; do
+        target=$(jq -er '.platform // .target | strings' <<< "$target_json") || return 4
+        specs=$(jq -c --arg target "$target" '.[$target] // []' <<< "$configured") || return 4
+        triple=$(jq -r '.target_triple // ""' <<< "$target_json") || return 4
+        if [[ -n "$triple" ]] && [[ "$(jq 'length' <<< "$specs")" -gt 0 ]]; then
+            triples=$(config_get_target_triples_json "$tool" "$target") || return 4
+            if [[ "$triple" != "$(jq -r '.[0] // ""' <<< "$triples")" ]]; then
+                specs='[]'
+            fi
+        fi
+        receipts=$(jq -ce '(if has("additional_artifacts") then .additional_artifacts else [] end) |
+            if type == "array" and all(.[];
+                type == "object" and (.path | type == "string" and length > 0) and
+                (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                (.size_bytes | type == "number" and . > 0 and floor == .) and
+                (.identity | type == "string" and
+                 test("^(gnu:[0-9]+:[1-9][0-9]*|bsd:[1-9][0-9]*)$")))
+            then . else error("invalid additional artifact receipts") end' <<< "$target_json") || return 4
+        names=$(jq -c '[.[].path | split("/") | last] | sort' <<< "$receipts") || return 4
+        expected=$(jq -c 'map(.name) | sort' <<< "$specs") || return 4
+        complete=$(jq -r --arg overall "$(jq -r '.status // ""' <<< "$result_json")" '
+            $overall == "success" or .status == "success" or .status == "ok" or .status == "passed"
+        ' <<< "$target_json") || return 4
+        if ! jq -en --argjson names "$names" --argjson expected "$expected" \
+            --argjson complete "$complete" '
+            ($names | length) == ($names | unique | length) and
+            (($names - $expected) | length) == 0 and
+            (if $complete then $names == $expected else true end)
+        ' >/dev/null; then
+            _log_error "Additional artifact receipts for $target do not match configured names (expected $expected; collected $names)"
+            return 4
+        fi
+        while IFS= read -r row; do
+            path=$(jq -r '.path' <<< "$row") || return 4
+            name=$(basename "$path")
+            if jq -e --arg path "$path" 'index($path) != null' <<< "$primary_paths" >/dev/null; then
+                _log_error "Additional artifact is also claimed as a primary payload: $path"
+                return 4
+            fi
+            format=$(jq -er --arg name "$name" '.[] | select(.name == $name) | .format' <<< "$specs") || return 4
+            sha=$(jq -r '.sha256' <<< "$row") || return 4
+            size=$(jq -r '.size_bytes' <<< "$row") || return 4
+            identity=$(jq -r '.identity' <<< "$row") || return 4
+            _act_validate_additional_artifact "$path" "$target" "$format" "$sha" "$size" "$identity" || return 4
+            if jq -e --arg path "$path" 'has($path)' <<< "$verified" >/dev/null; then
+                _log_error "Additional artifact path has multiple producers: $path"
+                return 4
+            fi
+            verified=$(jq -c --arg path "$path" --arg name "$name" --arg format "$format" \
+                --arg target "$target" --argjson receipt "$row" \
+                '. + {($path): ($receipt + {name:$name, declared_format:$format, target:$target})}' \
+                <<< "$verified") || return 4
+        done < <(jq -c '.[]' <<< "$receipts")
+    done < <(jq -c '.targets[]' <<< "$result_json")
+    printf '%s\n' "$verified"
 }
 
 # Per-repo flat-archive contract: when a repo's installer enforces an exact
@@ -1714,11 +1853,7 @@ _act_contract_for_build_purpose() {
     done < <(jq -r '.[]' <<< "$requested")
     while IFS= read -r target; do
         additional=$(_act_workspace_additional_artifacts_json "$ACT_REPOS_DIR/$tool.yaml" "$target") || return 4
-        if ! jq -e 'type == "array" and all(.[]; type == "string" and length > 0)' \
-            <<< "$additional" >/dev/null; then
-            _log_error "Diagnostic additional artifact ownership is invalid for $target"
-            return 4
-        fi
+        additional=$(jq -c 'map(.name)' <<< "$additional") || return 4
         ownership=$(jq -nc --argjson owners "$ownership" --arg target "$target" \
             --argjson additional "$additional" '$owners + {($target): $additional}') || return 4
     done < <(jq -r '.[]' <<< "$platforms")
@@ -2562,6 +2697,7 @@ act_load_repo_config() {
     if [[ "$configured_targets" != null ]]; then
         dsr_platform_validate_targets_json "$configured_targets" "targets for $tool_name" || return 4
     fi
+    _act_workspace_additional_artifacts_json "$config_file" >/dev/null || return 4
 
     # Load config into variables
     ACT_REPO_NAME=$(yq -r '.tool_name // ""' "$config_file")
@@ -9364,6 +9500,16 @@ act_run_native_build() {
         return 4
     fi
 
+    # Validate every configured additional-artifact declaration before source
+    # staging or compiler invocation, even when only one platform was selected.
+    local additional_json
+    if ! additional_json=$(_act_workspace_additional_artifacts_json "$config_file" "$platform"); then
+        jq -nc --arg platform "$platform" \
+            '{platform:$platform, status:"error", exit_code:4,
+              error:"Invalid workspace_additional_artifacts configuration; see the rejected declaration above"}'
+        return 4
+    fi
+
     local_path=$(act_get_local_path "$tool_name")
     build_cmd=$(act_get_build_cmd "$tool_name" "$platform") || return 4
     if ! build_env=$(act_get_build_env "$tool_name" "$platform" "$selected_triple"); then
@@ -10510,7 +10656,7 @@ EOF
 
     # Determine result
     local status local_artifact_path="" local_artifact_paths=()
-    local local_additional_artifact_paths=() additional_artifact_receipts=()
+    local additional_artifact_receipts=()
     local collected_sha256="" collected_size_bytes=0 collected_identity=""
     local strict_collection_receipts=()
     if [[ $exit_code -eq 0 ]]; then
@@ -10868,11 +11014,10 @@ EOF
         # are collected by literal name but never folded into the process
         # archive.  The receipt is carried in the target result so strict
         # manifest generation can require its exact name, bytes, and identity.
-        local additional_json="[]" additional_name additional_remote additional_local
-        local additional_receipt
-        additional_json=$(_act_workspace_additional_artifacts_json \
-            "$config_file" "$platform") || download_failed=true
-        if $strict_native_build && [[ -n "$selected_triple" ]]; then
+        local additional_spec additional_name additional_remote additional_local
+        local additional_receipt additional_format additional_mode
+        local additional_sha additional_size additional_identity
+        if [[ -n "$selected_triple" ]]; then
             local additional_owner_triples
             additional_owner_triples=$(act_get_configured_target_triples "$tool_name" "$platform") || return 4
             # Platform-level companions have one producer. Additional assets
@@ -10881,14 +11026,13 @@ EOF
                 additional_json='[]'
             fi
         fi
-        if ! jq -e 'type == "array" and all(.[]; type == "string")' \
-            <<< "$additional_json" >/dev/null 2>&1; then
-            _log_error "Invalid workspace_additional_artifacts configuration for $platform"
-            download_failed=true
-            additional_json='[]'
-        fi
-        while IFS= read -r additional_name; do
-            [[ -n "$additional_name" ]] || continue
+        while IFS= read -r additional_spec; do
+            additional_name=$(jq -r '.name' <<< "$additional_spec") || return 4
+            additional_format=$(jq -r '.format' <<< "$additional_spec") || return 4
+            additional_mode=600
+            if [[ "$additional_format" == binary && "$platform" != windows/* ]]; then
+                additional_mode=700
+            fi
             if ! _act_is_safe_basename "$additional_name" || \
                [[ -e "$artifact_dir/$additional_name" || -L "$artifact_dir/$additional_name" ]]; then
                 _log_error "Unsafe or colliding additional release artifact: $additional_name"
@@ -10907,43 +11051,59 @@ EOF
             if $strict_native_build; then
                 if _act_is_local_host "$host"; then
                     additional_receipt=$(_act_collect_stream_exclusive \
-                        "$additional_local" 600 _act_stream_local_file \
+                        "$additional_local" "$additional_mode" _act_stream_local_file \
                         "$additional_remote") || additional_receipt=""
                 elif _act_is_windows_host "$host"; then
                     additional_receipt=$(_act_collect_stream_exclusive \
-                        "$additional_local" 600 _act_stream_remote_windows_file \
+                        "$additional_local" "$additional_mode" _act_stream_remote_windows_file \
                         "$host" "$additional_remote") || additional_receipt=""
                 else
                     additional_receipt=$(_act_collect_stream_exclusive \
-                        "$additional_local" 600 _act_stream_remote_unix_file \
+                        "$additional_local" "$additional_mode" _act_stream_remote_unix_file \
                         "$ssh_destination" "$additional_remote") || additional_receipt=""
                 fi
-                if [[ -n "$additional_receipt" ]]; then
-                    local_additional_artifact_paths+=("$additional_local")
-                    additional_artifact_receipts+=("$additional_receipt")
-                else
+                if [[ -z "$additional_receipt" ]]; then
                     _log_error "Failed to collect additional release artifact $additional_name from $host:$additional_remote"
                     download_failed=true
+                    continue
                 fi
             else
                 if _act_is_local_host "$host" && \
                    [[ -f "$additional_remote" && ! -L "$additional_remote" ]] && \
                    cp "$additional_remote" "$additional_local" && \
-                   chmod 600 "$additional_local"; then
-                    local_additional_artifact_paths+=("$additional_local")
+                   chmod "$additional_mode" "$additional_local"; then
+                    :
                 elif ! _act_is_local_host "$host" && \
                      scp -o ConnectTimeout="$_ACT_SSH_TIMEOUT" \
                          -o StrictHostKeyChecking=accept-new \
                          "${ssh_destination}:${additional_remote}" \
                          "$additional_local" >/dev/null 2>&1 && \
-                     chmod 600 "$additional_local"; then
-                    local_additional_artifact_paths+=("$additional_local")
+                     chmod "$additional_mode" "$additional_local"; then
+                    :
                 else
                     _log_error "Failed to collect additional release artifact $additional_name from $host:$additional_remote"
                     download_failed=true
+                    continue
                 fi
+                additional_sha=$(_act_sha256 "$additional_local") || return 4
+                additional_size=$(_act_file_size "$additional_local") || return 4
+                additional_identity=$(_act_file_identity "$additional_local") || return 4
+                additional_receipt=$(jq -nc --arg path "$additional_local" \
+                    --arg sha256 "$additional_sha" --argjson size_bytes "$additional_size" \
+                    --arg identity "$additional_identity" \
+                    '{path:$path, sha256:$sha256, size_bytes:$size_bytes, identity:$identity}') || return 4
             fi
-        done < <(jq -r '.[]' <<< "$additional_json")
+            additional_sha=$(jq -r '.sha256' <<< "$additional_receipt") || return 4
+            additional_size=$(jq -r '.size_bytes' <<< "$additional_receipt") || return 4
+            additional_identity=$(jq -r '.identity' <<< "$additional_receipt") || return 4
+            if ! _act_validate_additional_artifact "$additional_local" "$platform" \
+                "$additional_format" "$additional_sha" "$additional_size" "$additional_identity"; then
+                _log_error "Rejected additional release artifact $additional_name from $host:$additional_remote (declared format $additional_format)"
+                download_failed=true
+                continue
+            fi
+            additional_artifact_receipts+=("$additional_receipt")
+        done < <(jq -c '.[]' <<< "$additional_json")
 
         # Set final status and artifact path(s)
         # Every remote output has been copied home; a staged build's private
@@ -11200,21 +11360,6 @@ EOF
     if [[ ${#additional_artifact_receipts[@]} -gt 0 ]]; then
         additional_artifacts_json=$(printf '%s\n' \
             "${additional_artifact_receipts[@]}" | jq -s '.') || return 4
-    elif [[ ${#local_additional_artifact_paths[@]} -gt 0 ]]; then
-        local additional_path additional_sha additional_size additional_identity
-        local additional_records=()
-        for additional_path in "${local_additional_artifact_paths[@]}"; do
-            additional_sha=$(_act_sha256 "$additional_path") || return 4
-            additional_size=$(_act_file_size "$additional_path") || return 4
-            additional_identity=$(_act_file_identity "$additional_path") || return 4
-            additional_records+=("$(jq -nc \
-                --arg path "$additional_path" --arg sha256 "${additional_sha,,}" \
-                --argjson size_bytes "$additional_size" \
-                --arg identity "$additional_identity" \
-                '{path: $path, sha256: $sha256, size_bytes: $size_bytes, identity: $identity}')")
-        done
-        additional_artifacts_json=$(printf '%s\n' \
-            "${additional_records[@]}" | jq -s '.') || return 4
     fi
 
     jq -nc \
@@ -13426,6 +13571,9 @@ _act_generate_contract_manifest() {
     fi
     _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
 
+    local verified_additional
+    verified_additional=$(_act_additional_artifact_receipts_json "$tool" "$result_json") || return 4
+
     if ! jq -e '
         .checksum_sidecar == "sha256" and
         (.exact_primary_assets | type == "object") and
@@ -13622,6 +13770,11 @@ _act_generate_contract_manifest() {
             return 4
         fi
         additional_path=$(jq -r '.path' <<< "$additional_receipt") || return 4
+        if ! jq -e --arg path "$additional_path" --arg name "$additional_name" \
+            '.[$path].name == $name' <<< "$verified_additional" >/dev/null; then
+            _log_error "Additional artifact has no configured and validated producer: $additional_name"
+            return 4
+        fi
         [[ -f "$additional_path" && ! -L "$additional_path" &&
            "$(basename "$additional_path")" == "$additional_name" ]] || return 4
         additional_sha=$(jq -r '.sha256' <<< "$additional_receipt") || return 4
@@ -13638,7 +13791,10 @@ _act_generate_contract_manifest() {
             return 4
         fi
         additional_identity_after=$(_act_file_identity "$additional_path") || return 4
-        [[ "$additional_identity_after" == "$additional_identity_before" ]] || return 4
+        [[ -f "$additional_path" && ! -L "$additional_path" &&
+           "$additional_identity_after" == "$additional_identity_before" &&
+           "$(_act_sha256 "$additional_path")" == "$additional_sha" &&
+           "$(_act_file_size "$additional_path")" == "$additional_size" ]] || return 4
         additional_format=$(_act_archive_format "$additional_name")
         [[ "$additional_format" != "none" ]] || additional_format="binary"
         additional_json=$(jq -nc \
@@ -13827,6 +13983,8 @@ act_generate_manifest() {
     fi
     config_validate_target_triples "$tool" || return 4
     _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
+    local verified_additional
+    verified_additional=$(_act_additional_artifact_receipts_json "$tool" "$result_json") || return 4
     if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
         # shellcheck source=SCRIPTDIR/artifact_naming.sh
         source "$manifest_module_dir/artifact_naming.sh" || return 3
@@ -13948,8 +14106,14 @@ act_generate_manifest() {
         fi
         [[ -z "$target" ]] && return 0
 
-        local name
+        local name additional_receipt literal_additional=false
         name=$(basename "$file")
+        additional_receipt=$(jq -c --arg path "$file" '.[$path] // null' <<< "$verified_additional") || return 4
+        if [[ "$additional_receipt" != null ]]; then
+            literal_additional=true
+            [[ "$name" == "$(jq -r '.name' <<< "$additional_receipt")" &&
+               "$target" == "$(jq -r '.target' <<< "$additional_receipt")" ]] || return 4
+        fi
 
         case "$name" in
             *.minisig|*.sig|*.sha256|*.sha512|SHA256SUMS*|*.sbom.*|*.intoto.jsonl)
@@ -13958,7 +14122,9 @@ act_generate_manifest() {
         esac
         if [[ "$native_result" == true ]]; then
             [[ ! -L "$file" ]] || return 4
-            name=$(_act_native_variant_artifact_name "$tool" "$target" "$declared_triple" "$name") || return 4
+            if ! $literal_additional; then
+                name=$(_act_native_variant_artifact_name "$tool" "$target" "$declared_triple" "$name") || return 4
+            fi
             if [[ -n "${seen_native_paths[$file]:-}" && \
                   "${seen_native_paths[$file]}" != "$target|$declared_triple" ]]; then
                 _log_error "Native artifact path is shared by distinct variants: $file"
@@ -13970,6 +14136,10 @@ act_generate_manifest() {
         collected_name=$(jq -r --arg key "$target||$declared_triple||$name" '.[$key] // empty' <<< "$collection_names") || return 4
         if [[ -n "$collected_name" ]]; then
             _act_is_safe_basename "$collected_name" || return 4
+            if $literal_additional && [[ "$collected_name" != "$name" ]]; then
+                _log_error "Additional artifact collection changed its configured literal name: $name"
+                return 4
+            fi
             name="$collected_name"
         fi
 
@@ -13996,7 +14166,20 @@ act_generate_manifest() {
             _log_warn "Unable to determine size for artifact: $file"
             return 4
         fi
+        if $literal_additional; then
+            if [[ -L "$file" || "$sha" != "$(jq -r '.sha256' <<< "$additional_receipt")" ||
+                  "$size" != "$(jq -r '.size_bytes' <<< "$additional_receipt")" ||
+                  "$(_act_file_identity "$file")" != "$(jq -r '.identity' <<< "$additional_receipt")" ]]; then
+                _log_error "Additional artifact changed after format validation: $file"
+                return 4
+            fi
+        fi
         if [[ -n "${seen_names[$name]:-}" ]]; then
+            if $literal_additional || jq -e --arg name "$name" \
+                'any(.[]; .name == $name)' <<< "$verified_additional" >/dev/null; then
+                _log_error "Additional artifact shares a release name with another payload: $name"
+                return 4
+            fi
             if [[ "${seen_names[$name]}" != "$sha" ]]; then
                 _log_error "Artifacts have the same release name and different bytes: $name"
                 return 4
@@ -14009,7 +14192,10 @@ act_generate_manifest() {
         # matrix workflows produce cross-platform artifacts under a single
         # act job.
         local inferred_target
-        inferred_target=$(_act_infer_target_from_name "$name")
+        inferred_target=""
+        if ! $literal_additional; then
+            inferred_target=$(_act_infer_target_from_name "$name")
+        fi
         if [[ "$native_result" == true && -n "$inferred_target" && "$inferred_target" != "$target" ]]; then
             _log_error "Native artifact platform contradicts its worker result: $name ($target)"
             return 4

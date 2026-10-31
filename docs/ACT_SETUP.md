@@ -157,9 +157,82 @@ For an archive companion, `executable: true` sets its executable permissions;
 it does not change its filename. Missing companions fail collection with the
 host and exact attempted source path in the diagnostic.
 
-The existing collection receipts bind the transferred bytes, SHA-256, size,
-and destination identity. Literal filenames do not add format-specific MSI
-or archive validation.
+`workspace_additional_artifacts` accepts literal strings for opaque files, or
+explicit `name` and `format` declarations when collection must check content:
+
+```yaml
+workspace_additional_artifacts:
+  windows/amd64:
+    - name: ui-1.6.0-x86_64.msi
+      format: msi
+    - name: manifest.json
+      format: json
+    - name: bundle.zip
+      format: zip
+    - name: helper.EXE
+      format: binary
+    - NOTICE
+```
+
+Put these declarations in `repos.d/<tool>.yaml`. When that file exists, it is
+the native build authority; omitted declarations mean no additional files, and
+are not filled from the repository registry during preflight.
+
+These declarations require a native producer. A target with a nonempty
+`act_job_map` entry cannot also declare additional native files; configuration
+validation reports the target and workflow job before source staging or
+compilation. Set that target's `act_job_map` entry to `null` when selecting a
+native build. A workflow target with no additional declarations retains its
+existing artifact collection behavior.
+
+Names remain literal for every format, including `binary`. For example,
+`helper.EXE` is collected under that exact spelling. Each name has one configured
+producer across the complete platform mapping; duplicates, including names
+that differ only by case, are rejected. A platform with several target triples
+collects its additional files from its first configured triple. Primary
+executables and `workspace_binaries` retain their existing target architecture
+and executable checks.
+
+Checksum, signature, SBOM and provenance names belong to the existing release
+metadata generators. Additional declarations cannot use `.sha256`, `.sha512`,
+`.sig` or `.minisig` suffixes, `SHA256SUMS*`, `checksums.txt`, `*.sbom.*`, or
+`*.intoto.jsonl` names, ignoring case. Configuration validation identifies such
+a name as reserved before compilation.
+
+| Format | Required content |
+| --- | --- |
+| `file`, or a plain string | Nonempty regular file; its bytes remain opaque. |
+| `binary` | Native executable format and architecture matching the owning target. |
+| `json` | One complete UTF-8 JSON document, at most 16 MiB, without duplicate keys or non-finite numbers. |
+| `zip`, `tar.gz`, `tar.xz` | Correct container/compression, complete readable members, valid ZIP CRC/compressed trailers, and the existing archive path, entry-type and expansion limits. |
+| `msi` | Structurally valid Windows Installer database compound file, including bounded allocation chains, directory and stream consistency, the Windows Installer database root class, and SummaryInformation metadata. |
+
+The MSI check distinguishes ordinary OLE documents and truncated compound files.
+It does not establish that Windows Installer can install the database, or
+authenticate its publisher. Microsoft documents that merge modules and patch
+creation files share the database class identifier; Windows installation
+semantics and Authenticode require their own tooling. SummaryInformation
+admission supports the `I2`, `I4`, `LPSTR` and `FILETIME` property types used by
+Installer databases and rejects other property types explicitly. See Microsoft's
+[Windows Installer file type identifiers](https://devblogs.microsoft.com/setup/identifying-windows-installer-file-types/)
+and [Compound File Binary Format specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cfb/).
+
+Malformed declarations, unsupported formats and invalid platform owners fail
+configuration validation before source staging or compilation, even on a
+platform omitted from the current build selection. Content checks run after
+collection and again before manifest admission, using the declared type from
+the repository configuration. Each successful check is bound to the same
+SHA-256, size and destination identity as the collection receipt. A failed
+check identifies the file, expected format, host and literal source path;
+its bytes receive no accepted additional-artifact receipt. Checksums,
+signatures, provenance and publication gates continue to apply independently.
+
+Run `bash scripts/tests/test_act_runner_native.sh --typed-companions-only` for
+the focused collection and manifest regressions, and
+`bash scripts/tests/test_artifact_formats.sh` for malformed JSON/compound-file
+coverage. These use real file content and production validators with controlled
+SSH/compiler transport; they do not claim a native Windows build or installer
+execution.
 
 ## Git-aware ordinary source synchronization
 

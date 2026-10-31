@@ -46,7 +46,45 @@ collision_count=0
 declare -A collected_names=()
 declare -a artifact_rename_pairs=()
 output_dir="$WORK/output"
-mkdir -p "$output_dir"
+DSR_CONFIG_DIR="$WORK/config"
+DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
+ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d"
+mkdir -p "$output_dir" "$ACT_REPOS_DIR"
+cat > "$ACT_REPOS_DIR/sbh.yaml" <<'YAML'
+tool_name: sbh
+targets: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64]
+workspace_additional_artifacts:
+  linux/amd64: [{name: release-info.json, format: json}]
+YAML
+if [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]; then
+    (
+        # Use an actual host ELF executable to check final-copy permissions,
+        # independently of the synthetic multi-platform payloads below.
+        output_dir="$WORK/typed-binary-output"
+        mkdir -p "$output_dir" "$WORK/typed-binary-source"
+        cp -L /bin/true "$WORK/typed-binary-source/helper" || exit 1
+        chmod 700 "$WORK/typed-binary-source/helper" || exit 1
+        verified_additional_receipts=$(jq -nc --arg path "$WORK/typed-binary-source/helper" \
+            --arg sha "$(_act_sha256 "$WORK/typed-binary-source/helper")" \
+            --argjson size "$(_act_file_size "$WORK/typed-binary-source/helper")" \
+            --arg identity "$(_act_file_identity "$WORK/typed-binary-source/helper")" \
+            '{($path):{path:$path,name:"helper",declared_format:"binary",target:"linux/amd64",
+                       sha256:$sha,size_bytes:$size,identity:$identity}}') || exit 1
+        _build_collect_artifact_file "$WORK/typed-binary-source/helper" linux/amd64 \
+            x86_64-unknown-linux-gnu true true || exit 1
+        [[ -x "$output_dir/helper" ]] || exit 1
+        cmp "$WORK/typed-binary-source/helper" "$output_dir/helper" || exit 1
+        chmod 600 "$output_dir/helper" || exit 1
+        if _build_collect_artifact_file "$WORK/typed-binary-source/helper" linux/amd64 \
+            x86_64-unknown-linux-gnu true true; then
+            echo 'FAIL: repeated collection accepted a companion whose executable mode changed' >&2
+            exit 1
+        fi
+    ) || exit 1
+    echo 'PASS: a real Linux companion retains executable mode and refuses later mode changes'
+else
+    echo 'SKIP: real Linux AMD64 companion executable requires that host architecture'
+fi
 targets='[]'
 for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
     dir="$WORK/${target/\//_}"
@@ -63,6 +101,14 @@ for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
         platform:$target,method:"native",status:"success",host:"fixture",
         artifact_paths:[$dir+"/sbh",$dir+"/inspector",$dir+"/bundle.tar.xz"]}]' <<< "$targets") || exit 1
 done
+printf '{"version":"1.2.3","schema":1}\n' > "$WORK/linux_amd64/release-info.json"
+additional_receipt=$(jq -nc --arg path "$WORK/linux_amd64/release-info.json" \
+    --arg sha "$(_act_sha256 "$WORK/linux_amd64/release-info.json")" \
+    --argjson size "$(_act_file_size "$WORK/linux_amd64/release-info.json")" \
+    --arg identity "$(_act_file_identity "$WORK/linux_amd64/release-info.json")" \
+    '{path:$path,sha256:$sha,size_bytes:$size,identity:$identity}') || exit 1
+targets=$(jq -c --argjson receipt "$additional_receipt" \
+    '.[0].additional_artifacts=[$receipt]' <<< "$targets") || exit 1
 with_receipts='[]'
 while IFS= read -r row; do
     receipts=$(_act_result_artifact_receipts "$row") || exit 1
@@ -70,11 +116,37 @@ while IFS= read -r row; do
         '. + [$row + {resume_artifacts:$receipts}]' <<< "$with_receipts") || exit 1
 done < <(jq -c '.[]' <<< "$targets")
 targets="$with_receipts"
-renames=$(printf '%s\n' "${artifact_rename_pairs[@]}" | jq -Rn '
-    reduce inputs as $line ({}; ($line|split("\t")) as $p | .[$p[0]]=$p[1])') || exit 1
 result=$(jq -nc --argjson targets "$targets" '{tool:"sbh",version:"1.2.3",
     run_id:"12345678-1234-1234-1234-123456789abc",git_sha:("a"*40),git_ref:"v1.2.3",
     status:"success",summary:{total:4,success:4,failed:0},targets:$targets}') || exit 1
+verified_additional_receipts=$(_act_additional_artifact_receipts_json sbh "$result") || exit 1
+_build_collect_artifact_file "$WORK/linux_amd64/release-info.json" linux/amd64 \
+    x86_64-unknown-linux-gnu true true || exit 1
+[[ -f "$output_dir/release-info.json" && ! -e "$output_dir/release-info_linux_amd64.json" ]] || exit 1
+before_count="$collected_count"
+# The real collector also discovers files by walking the worker directory.
+# Its second observation must retain the declaration instead of renaming it.
+_build_collect_artifact_file "$WORK/linux_amd64/release-info.json" linux/amd64 \
+    x86_64-unknown-linux-gnu true || exit 1
+[[ "$collected_count" == "$before_count" ]] || exit 1
+echo 'PASS: a declared JSON companion keeps its literal name through both collection paths'
+collected_names[release-info.json]="$WORK/another-producer"
+if _build_collect_artifact_file "$WORK/linux_amd64/release-info.json" linux/amd64 '' true true; then
+    echo 'FAIL: literal companion collision was silently renamed or coalesced' >&2
+    exit 1
+fi
+collected_names[release-info.json]="$WORK/linux_amd64/release-info.json"
+[[ ! -e "$output_dir/release-info_linux_amd64.json" ]] || exit 1
+cmp "$WORK/linux_amd64/release-info.json" "$output_dir/release-info.json" || exit 1
+collect_failed=false
+if _build_collect_artifact_file "$WORK/linux_amd64/sbh" linux/amd64 '' true true; then
+    echo 'FAIL: undeclared additional payload bypassed receipt validation' >&2
+    exit 1
+fi
+collect_failed=false
+echo 'PASS: companion collisions and undeclared additional payloads refuse collection'
+renames=$(printf '%s\n' "${artifact_rename_pairs[@]}" | jq -Rn '
+    reduce inputs as $line ({}; ($line|split("\t")) as $p | .[$p[0]]=$p[1])') || exit 1
 manifest="$WORK/manifest.json"
 act_generate_manifest "$result" "$manifest" "$renames" || exit 1
 _act_verify_collected_manifest "$manifest" "$output_dir" || exit 1
@@ -91,9 +163,10 @@ if printf '%s\0' "${!collected_names[@]}" |
     exit 1
 fi
 echo 'PASS: final sealing refuses a collected payload omitted from the manifest'
-jq -e '.artifacts | length == 12 and
-    ([.[]|select(.archive_format=="none")]|length==8) and
-    ([.[].target]|unique|length==4)' "$manifest" >/dev/null || exit 1
+jq -e '.artifacts | length == 13 and
+    ([.[]|select(.archive_format=="none")]|length==9) and
+    ([.[].target]|unique|length==4) and
+    any(.name=="release-info.json" and .target=="linux/amd64")' "$manifest" >/dev/null || exit 1
 for target in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
     for binary in sbh inspector; do
         test -s "$output_dir/${binary}_${target}" || exit 1
