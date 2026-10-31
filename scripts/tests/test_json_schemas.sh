@@ -275,7 +275,9 @@ test_xwin_manifest_schema() {
     # claims of compiler execution. The real source-pinned runner tests retain
     # manifests that can be supplied unchanged through this same validator.
     if python3 - "$SCHEMAS_DIR/manifest.json" "${DSR_XWIN_SCHEMA_MANIFESTS:-}" \
-        "${DSR_XWIN_SCHEMA_PACKAGED_MANIFESTS:-}" "${DSR_NATIVE_SCHEMA_MANIFESTS:-}" <<'PY'
+        "${DSR_XWIN_SCHEMA_PACKAGED_MANIFESTS:-}" "${DSR_NATIVE_SCHEMA_MANIFESTS:-}" \
+        "${DSR_XWIN_SCHEMA_SOURCE_RECEIPTS:-}" <<'PY'
+import base64
 import copy
 import json
 from pathlib import Path
@@ -298,6 +300,7 @@ def check(label, value, valid=True, selected=validator):
 
 digest = "a" * 64
 commit = "b" * 40
+raw_commit = base64.b64encode(("tree " + "c"*40 + "\n\nsource proof\n").encode()).decode()
 roles = ("cargo", "cargo-xwin", "rustc", "clang", "lld-link", "llvm-ar")
 
 def protocol_fixture(platform, triple):
@@ -309,7 +312,8 @@ def protocol_fixture(platform, triple):
         files=[dict(path="include", type="directory", sha256="", size_bytes=0),
                dict(path="include/header.h", type="file", sha256=digest, size_bytes=1)])
     source = dict(schema_version=1, kind="dsr-xwin-source", repository="https://github.com/owner/demo",
-        git_sha=commit, git_ref="refs/tags/v1.2.3", git_tree="c"*40, source_date_epoch=1, snapshot_sha256=digest,
+        git_sha=commit, git_ref="refs/tags/v1.2.3", git_tree="c"*40, git_commit_object=raw_commit,
+        source_date_epoch=1, snapshot_sha256=digest,
         files=[dict(path="src/main.rs", sha256=digest, size_bytes=1, executable=False)])
     binary = dict(package_id="path+file:///build/source#demo@1.2.3", package="demo", version="1.2.3", binary="demo",
                   manifest="Cargo.toml", binary_source="src/main.rs", features=[])
@@ -355,6 +359,67 @@ if not fixtures:
         check("explicit structural producer fixture " + fixture["build_environments"][0]["target"], fixture)
 
 missing = object()
+source_validator = Draft202012Validator({"$schema":schema["$schema"],"$defs":schema["$defs"],
+                                       "$ref":"#/$defs/xwin_source_snapshot"}, format_checker=FormatChecker())
+for path in [Path(p) for p in sys.argv[5].splitlines() if p]:
+    check("actual Git-authenticated source receipt " + str(path), json.loads(path.read_text()), selected=source_validator)
+
+# These values exercise the receipt schema, not Git object authentication.
+# test_xwin_source.sh verifies actual commits, nested gitlinks and staged bytes.
+source_proof = copy.deepcopy(protocol_fixture("windows/amd64", "x86_64-pc-windows-msvc")["build_environments"][0]["source_snapshot"])
+child = dict(path="vendor/child",commit=commit,tree="c"*40,commit_object=raw_commit)
+source_proof.update(git_commit_object=raw_commit,submodules=[copy.deepcopy(child)])
+check("structural source receipt with authenticated submodule fields", source_proof, selected=source_validator)
+nested_proof = copy.deepcopy(source_proof)
+nested_proof["submodules"][0]["submodules"] = [dict(child,path="nested")]
+check("structural recursive submodule evidence", nested_proof, selected=source_validator)
+source_cases = [
+    ("submodules without parent commit object", ("git_commit_object",), missing),
+    ("empty submodule proof list", ("submodules",), []),
+    ("unsafe submodule path", ("submodules",0,"path"), "../outside"),
+    ("administrative submodule path", ("submodules",0,"path"), "vendor/.GiT/objects"),
+    ("option-like submodule path", ("submodules",0,"path"), "vendor/-child"),
+    ("submodule path newline", ("submodules",0,"path"), "vendor/child\n"),
+    ("missing gitlink commit", ("submodules",0,"commit"), missing),
+    ("invalid gitlink commit", ("submodules",0,"commit"), "0"*40),
+    ("missing submodule tree", ("submodules",0,"tree"), missing),
+    ("invalid submodule tree", ("submodules",0,"tree"), "not-a-tree"),
+    ("missing submodule raw commit", ("submodules",0,"commit_object"), missing),
+    ("non-base64 raw commit", ("submodules",0,"commit_object"), "not base64!"),
+    ("raw commit trailing newline", ("submodules",0,"commit_object"), raw_commit+"\n"),
+    ("empty raw commit", ("submodules",0,"commit_object"), ""),
+    ("oversized raw commit", ("submodules",0,"commit_object"), "A"*1398108),
+    ("empty nested submodule list", ("submodules",0,"submodules"), []),
+    ("unrecognized submodule evidence", ("submodules",0,"unreviewed"), True),
+    ("excessive submodule list", ("submodules",), [dict(child,path="child"+str(i)) for i in range(257)]),
+]
+for label, path, replacement in source_cases:
+    changed = copy.deepcopy(source_proof)
+    selected = changed
+    for key in path[:-1]:
+        selected = selected[key]
+    if replacement is missing:
+        selected.pop(path[-1])
+    else:
+        selected[path[-1]] = replacement
+    check("source schema refuses " + label, changed, False, source_validator)
+
+source_set = copy.deepcopy(source_proof)
+source_set.update(primary_path="project",primary_snapshot_sha256=digest)
+sibling = {key:copy.deepcopy(value) for key,value in source_proof.items()
+           if key not in ("schema_version","kind","files")}
+sibling["relative_path"] = "helper"
+source_set["dependencies"] = [sibling]
+check("sibling source identity carries its own submodule evidence", source_set, selected=source_validator)
+unbound_sibling = copy.deepcopy(source_set)
+unbound_sibling["dependencies"][0].pop("git_commit_object")
+check("sibling submodules require their parent commit object", unbound_sibling, False, source_validator)
+ordinary_source = copy.deepcopy(source_proof)
+ordinary_source.pop("submodules")
+check("source without submodules still carries its commit object", ordinary_source, selected=source_validator)
+ordinary_source.pop("git_commit_object")
+check("source cannot discard commit authentication with the submodule list", ordinary_source, False, source_validator)
+
 for fixture in fixtures:
     environment = fixture["build_environments"][0]
     platform, triple = environment["target"], environment["target_triple"]

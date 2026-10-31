@@ -200,6 +200,13 @@ if [[ "$mode" == registry-* ]]; then
     objects+=("$TMPDIR/dependency.obj")
     printf 'compiled lockfile-authenticated private crate C source\n' >&2
 fi
+if [[ "$mode" == submodule-* ]]; then
+    [[ ! -e vendor/native/.git ]] || exit 92
+    compile_flags=(-DDSR_SIBLING=1)
+    clang --target="$target" -ffreestanding -c vendor/native/native.c -o "$TMPDIR/submodule.obj" || exit $?
+    objects+=("$TMPDIR/submodule.obj")
+    printf 'compiled parent-gitlink-authenticated project submodule\n' >&2
+fi
 # Match the observed cc-rs/cargo-xwin order, including the competing MSVC
 # intrinsic -I path. Split only the runner's controlled whitespace-free flags.
 sysroot="$XWIN_CACHE_DIR/windows-msvc-sysroot"
@@ -218,6 +225,7 @@ case "$mode" in
     sibling-plan-drift) printf '\n' >> "$HOME/../sibling-crates.json" ;;
     sibling-receipt-drift) printf '\n' >> "$HOME/../release-source.json" ;;
     registry-drift) printf '// changed after compilation\n' >> "$dependency" ;;
+    submodule-drift) printf '// changed after compilation\n' >> vendor/native/native.c ;;
 esac
 python3 - "$mode" "$out" <<'PY'
 import json, os, sys
@@ -299,8 +307,11 @@ PY
     fi
     git -C "$directory" init -qb main && git -C "$directory" config user.name 'DSR Fixture' &&
         git -C "$directory" config user.email test@example.invalid &&
-        git -C "$directory" remote add origin https://github.com/owner/probe.git &&
-        git -C "$directory" add . && git -C "$directory" -c commit.gpgsign=false commit -qm fixture &&
+        git -C "$directory" remote add origin https://github.com/owner/probe.git || return 1
+    if [[ "$1" == submodule-* ]]; then
+        git -C "$directory" -c protocol.file.allow=always submodule add -q "$WORK/project-submodule-dependency" vendor/native || return 1
+    fi
+    git -C "$directory" add . && git -C "$directory" -c commit.gpgsign=false commit -qm fixture &&
         git -C "$directory" tag v0.1.0 || return 1
     printf 'ignored, uncommitted bytes\n' > "$directory/ignored.txt"
 }
@@ -579,5 +590,58 @@ assert 'transitive committed header changes actual compiled bytes' jq -en --slur
     --slurpfile after "$WORK/sibling-next.json" '$before[0].artifact.sha256!=$after[0].artifact.sha256'
 assert 'old completed snapshot remains independent of advanced original checkout' xwin_source_verify \
     "$WORK/sibling-good/source" "$WORK/sibling-good/release-source.json"
+
+# Project submodule C bytes cross the real source-admission, compiler, PE and
+# manifest-export boundaries. Cargo remains the command-boundary fixture above.
+mkdir "$WORK/project-submodule-dependency" || exit 1
+printf 'int DsrSiblingValue(void) { return 314; }\n' > "$WORK/project-submodule-dependency/native.c"
+git -C "$WORK/project-submodule-dependency" init -qb main &&
+    git -C "$WORK/project-submodule-dependency" config user.name 'DSR Fixture' &&
+    git -C "$WORK/project-submodule-dependency" config user.email test@example.invalid &&
+    git -C "$WORK/project-submodule-dependency" add native.c &&
+    git -C "$WORK/project-submodule-dependency" -c commit.gpgsign=false commit -qm submodule || exit 1
+SUBMODULE_SHA=$(git -C "$WORK/project-submodule-dependency" rev-parse HEAD)
+make_project submodule-ok || exit 1
+SUBMODULE_SOURCE_SHA=$(git -C "$WORK/project-submodule-ok" rev-parse HEAD)
+"${BUILD[@]}" --project "$WORK/project-submodule-ok" --source-sha "$SUBMODULE_SOURCE_SHA" \
+    --run-dir "$WORK/submodule-good" > "$WORK/submodule-result.json" 2> "$WORK/submodule.stderr" || {
+        cat "$WORK/submodule.stderr" >&2; exit 1;
+    }
+assert 'real LLVM compiler consumes the pinned project submodule' grep -Fxq \
+    'compiled parent-gitlink-authenticated project submodule' "$WORK/submodule-good/build.log"
+assert 'submodule build emits a selected-target Windows executable' xwin_validate_pe \
+    "$WORK/submodule-good/artifacts/probe-$TEST_TARGET.exe" "$TEST_TARGET"
+assert 'release export retains the parent and submodule object proof' jq -e --arg sha "$SUBMODULE_SHA" \
+    '.build_environments[0].source_snapshot | (.git_commit_object|length)>0 and
+     .submodules[0].path=="vendor/native" and .submodules[0].commit==$sha and
+     (.submodules[0].commit_object|length)>0 and any(.files[];.path=="vendor/native/native.c")' \
+    "$WORK/submodule-good/release/build-manifest.json"
+assert 'public submodule manifest retains the existing SLSA publication profile' _slsa_manifest_statement \
+    "$WORK/submodule-good/release/build-manifest.json" owner/probe dsr:pinned-cargo-xwin
+make_project submodule-drift || exit 1
+DRIFT_SHA=$(git -C "$WORK/project-submodule-drift" rev-parse HEAD)
+reject 'compiled submodule drift prevents release publication' 7 "${BUILD[@]}" \
+    --project "$WORK/project-submodule-drift" --source-sha "$DRIFT_SHA" --run-dir "$WORK/submodule-drift"
+assert 'submodule drift leaves no release manifest' test ! -e "$WORK/submodule-drift/release"
+
+printf 'int DsrSiblingValue(void) { return 2718; }\n' > "$WORK/project-submodule-dependency/native.c"
+git -C "$WORK/project-submodule-dependency" add native.c &&
+    git -C "$WORK/project-submodule-dependency" -c commit.gpgsign=false commit -qm next-submodule || exit 1
+NEXT_SUBMODULE_SHA=$(git -C "$WORK/project-submodule-dependency" rev-parse HEAD)
+make_project submodule-next || exit 1
+NEXT_SOURCE_SHA=$(git -C "$WORK/project-submodule-next" rev-parse HEAD)
+"${BUILD[@]}" --project "$WORK/project-submodule-next" --source-sha "$NEXT_SOURCE_SHA" \
+    --run-dir "$WORK/submodule-next" > "$WORK/submodule-next.json" 2> "$WORK/submodule-next.stderr" || {
+        cat "$WORK/submodule-next.stderr" >&2; exit 1;
+    }
+assert 'a new parent gitlink changes the actual compiled executable' jq -en \
+    --slurpfile before "$WORK/submodule-result.json" --slurpfile after "$WORK/submodule-next.json" \
+    '$before[0].artifact.sha256!=$after[0].artifact.sha256'
+assert 'new release retains the newly admitted child commit' jq -e --arg sha "$NEXT_SUBMODULE_SHA" \
+    '.submodules[0].commit==$sha' "$WORK/submodule-next/release-source.json"
+mv "$WORK/project-submodule-ok" "$WORK/original-project-submodule-moved" || exit 1
+mv "$WORK/project-submodule-dependency" "$WORK/original-submodule-dependency-moved" || exit 1
+assert 'completed submodule snapshot verifies without its original repositories' xwin_source_verify \
+    "$WORK/submodule-good/source" "$WORK/submodule-good/release-source.json"
 printf '\n%s release path: %s passed, %s failed\n' "$TEST_TARGET" "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

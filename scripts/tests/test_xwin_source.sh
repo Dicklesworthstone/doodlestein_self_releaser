@@ -61,7 +61,7 @@ assert 'untracked ignored input is not copied into the snapshot' test ! -e "$SNA
 assert 'executable mode is preserved' test -x "$SNAP/build-helper"
 assert 'snapshot has no inherited Git configuration' test ! -e "$SNAP/.git"
 assert 'receipt binds repository commit tag tree and inventory' jq -e --arg sha "$SHA" \
-    '.git_sha==$sha and .git_ref=="refs/tags/v1.2.3" and .repository=="https://github.com/owner/demo" and (.git_tree|length)==40 and (.snapshot_sha256|length)==64 and (.files|length)==6' "$RECEIPT"
+    '.git_sha==$sha and .git_ref=="refs/tags/v1.2.3" and .repository=="https://github.com/owner/demo" and (.git_tree|length)==40 and (.git_commit_object|length)>0 and (.snapshot_sha256|length)==64 and (.files|length)==6' "$RECEIPT"
 assert 'unchanged committed source revalidates' xwin_source_verify "$SNAP" "$RECEIPT"
 reject 'existing snapshot is never overwritten' 4 xwin_source_snapshot "$PROJECT" "$SHA" v1.2.3 owner/demo "$SNAP" "$WORK/again.json"
 reject 'repository substitution rejected' 4 xwin_source_snapshot "$PROJECT" "$SHA" v1.2.3 other/demo "$WORK/wrong-repo" "$WORK/wrong-repo.json"
@@ -298,7 +298,470 @@ reject 'escaping committed sibling symlinks are refused before staging' 4 xwin_s
     "$WORK/unsafe-sibling-set" "$WORK/unsafe-sibling-set.json" "$WORK/linked-siblings.json"
 assert 'unsafe sibling prevents creating the entire source set' test ! -e "$WORK/unsafe-sibling-set"
 
-# The input Git tree itself must not contain an unbound symlink/submodule.
+# Exercise real local Git children, including ordinary absorbed administration
+# stores. Every successful fixture pins commit objects before mutating checkouts.
+assert 'recursive project submodule custody regressions' python3 - "$WORK" "$ROOT" <<'PY'
+import base64
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+
+WORK, ROOT = map(Path, sys.argv[1:])
+MODULE = ROOT / "src/xwin_source.sh"
+ENV = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+ENV.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0",
+           GIT_TEMPLATE_DIR="", LC_ALL="C")
+
+class ProjectSubmodules(unittest.TestCase):
+    def setUp(self):
+        self.work = WORK / self._testMethodName
+        self.work.mkdir()
+        self.project = self.work / "project"
+        self.snapshot = self.work / "snapshot"
+        self.receipt = self.work / "source.json"
+        self.tag = "v1.2.3"
+
+    def git(self, path, *args, data=None, raw=False):
+        result = subprocess.run(["git", "-c", "protocol.file.allow=always", "-c", "init.templateDir=",
+                                 "-C", str(path), *args], input=data, env=ENV,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return result.stdout if raw else result.stdout.decode().strip()
+
+    def repository(self, path, primary=False, empty=False):
+        path.mkdir(parents=True, exist_ok=True)
+        self.git(path, "init", "-q", "-b", "main", "--template=")
+        self.git(path, "config", "user.name", "DSR submodule test")
+        self.git(path, "config", "user.email", "test@example.invalid")
+        if primary:
+            self.git(path, "remote", "add", "origin", "https://github.com/owner/demo.git")
+            (path / "Cargo.toml").write_text('[package]\nname="demo"\nversion="1.2.3"\n')
+            (path / "Cargo.lock").write_text("version = 3\n")
+        if not empty:
+            (path / "value").write_text("locked " + path.name + "\n")
+        return path
+
+    def seal(self, path):
+        self.git(path, "add", ".")
+        self.git(path, "commit", "--allow-empty", "-qm", "pinned fixture")
+        return self.git(path, "rev-parse", "HEAD")
+
+    def fixture(self, escape=False, empty=False):
+        leaf = self.repository(self.work / "leaf", empty=empty)
+        if escape:
+            (leaf / "escape").symlink_to("../value")
+        elif not empty:
+            (leaf / "link").symlink_to("value")
+        self.leaf_sha = self.seal(leaf)
+        child = self.repository(self.work / "child")
+        self.git(child, "submodule", "add", "-q", str(leaf), "nested")
+        self.child_sha = self.seal(child)
+        self.repository(self.project, primary=True)
+        self.git(self.project, "submodule", "add", "-q", str(child), "vendor/child")
+        self.git(self.project, "submodule", "update", "--init", "--recursive", "-q")
+        self.sha = self.seal(self.project)
+        self.git(self.project, "tag", self.tag)
+        self.child = self.project / "vendor/child"
+        self.leaf = self.child / "nested"
+        self.admin = Path(self.git(self.child, "rev-parse", "--absolute-git-dir"))
+
+    def call(self, function, *args):
+        result = subprocess.run(["bash", "-c", 'source "$1"; shift; "$@"', "submodule-test",
+                                 str(MODULE), function, *map(str, args)], env=ENV,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(result.stdout, b"")
+        self.assertNotIn(b"Traceback", result.stderr)
+        return result
+
+    def capture(self, expected=0):
+        result = self.call("xwin_source_snapshot", self.project, self.sha, self.tag,
+                           "owner/demo", self.snapshot, self.receipt)
+        self.assertEqual(result.returncode, expected, result.stderr.decode())
+        if expected:
+            self.assertFalse(self.snapshot.exists())
+            self.assertFalse(self.receipt.exists())
+            return None
+        self.verify()
+        return json.loads(self.receipt.read_text())
+
+    def verify(self, expected=0, receipt=None):
+        result = self.call("xwin_source_verify", self.snapshot, receipt or self.receipt)
+        self.assertEqual(result.returncode, expected, result.stderr.decode())
+
+    def rewritten_flat_receipt(self, original):
+        # Build the attacker's substituted tree with real Git, independently
+        # of the production tree reconstruction. The staged child files are
+        # now ordinary files in that tree, with no authenticated gitlinks.
+        store = self.work / "forged-tree.git"
+        store.mkdir()
+        self.git(store, "init", "--bare", "-q", "-b", "main", "--template=")
+        self.git(store, "--git-dir=" + str(store), "--work-tree=" + str(self.snapshot),
+                 "add", "--all", "--force")
+        tree = self.git(store, "--git-dir=" + str(store), "write-tree")
+        files = []
+        for path in sorted(self.snapshot.rglob("*")):
+            if not path.is_file():
+                continue
+            raw = path.read_bytes()
+            files.append({"path": path.relative_to(self.snapshot).as_posix(),
+                          "sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw),
+                          "executable": bool(path.stat().st_mode & 0o111)})
+        files.sort(key=lambda row: row["path"])
+        proof = copy.deepcopy(original)
+        proof.pop("git_commit_object", None)
+        proof.pop("submodules", None)
+        proof["git_tree"] = tree
+        proof["files"] = files
+        canonical = (json.dumps(files, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+        proof["snapshot_sha256"] = hashlib.sha256(canonical).hexdigest()
+        self.assertNotEqual(proof["git_tree"], original["git_tree"])
+        self.assertEqual(proof["git_sha"], original["git_sha"])
+        self.assertEqual(proof["git_ref"], original["git_ref"])
+        return proof
+
+    def test_plain_root_requires_its_exact_raw_commit_authority(self):
+        self.repository(self.project, primary=True)
+        self.sha = self.seal(self.project)
+        self.git(self.project, "tag", self.tag)
+        original = self.capture()
+        self.assertNotIn("submodules", original)
+        self.assertEqual(base64.b64decode(original["git_commit_object"]),
+                         self.git(self.project, "cat-file", "commit", self.sha, raw=True))
+        # A second real commit keeps exactly the same tree. Accepting its
+        # valid object would therefore prove only the tree, not the pin.
+        self.git(self.project, "commit", "--allow-empty", "-qm", "same tree, different commit")
+        other = self.git(self.project, "rev-parse", "HEAD")
+        self.assertNotEqual(other, self.sha)
+        self.assertEqual(self.git(self.project, "rev-parse", other + "^{tree}"), original["git_tree"])
+        substitute = base64.b64encode(self.git(self.project, "cat-file", "commit", other, raw=True)).decode()
+        mutations = {
+            "omitted": lambda p: p.pop("git_commit_object"),
+            "null": lambda p: p.update(git_commit_object=None),
+            "invalid": lambda p: p.update(git_commit_object="Zm9yZ2Vk"),
+            "different-valid-commit": lambda p: p.update(git_commit_object=substitute),
+        }
+        self.project.rename(self.work / "primary-unavailable")
+        self.verify()
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name):
+                proof = copy.deepcopy(original)
+                mutate(proof)
+                receipt = self.work / (name + ".json")
+                receipt.write_text(json.dumps(proof))
+                self.verify(7, receipt)
+        (self.snapshot / "value").write_text("forged ordinary source bytes\n")
+        forged = self.rewritten_flat_receipt(original)
+        receipt = self.work / "forged-root-tree.json"
+        receipt.write_text(json.dumps(forged))
+        self.verify(7, receipt)
+
+    def test_absorbed_nested_children_verify_after_originals_disappear(self):
+        self.fixture()
+        proof = self.capture()
+        child = proof["submodules"][0]
+        self.assertEqual((child["path"], child["commit"]), ("vendor/child", self.child_sha))
+        self.assertEqual(child["tree"], self.git(self.child, "rev-parse", self.child_sha + "^{tree}"))
+        self.assertEqual(child["submodules"][0]["commit"], self.leaf_sha)
+        self.assertEqual((self.snapshot / "vendor/child/nested/link").read_text(), "locked leaf\n")
+        self.assertFalse((self.snapshot / "vendor/child/nested/link").is_symlink())
+        self.assertFalse(any(path.name == ".git" for path in self.snapshot.rglob("*")))
+        row = next(row for row in proof["files"] if row["path"] == "vendor/child/nested/link")
+        self.assertEqual(row["symlink"]["resolved_path"], "value")
+        destination = os.environ.get("DSR_XWIN_SUBMODULE_TEST_RECEIPT")
+        if destination:
+            Path(destination).write_text(json.dumps(proof))
+        for name in ("project", "child", "leaf"):
+            (self.work / name).rename(self.work / (name + "-unavailable"))
+        self.verify()
+
+    def test_self_contained_child_repository_is_supported(self):
+        self.repository(self.project, primary=True)
+        child = self.repository(self.project / "child")
+        pinned = self.seal(child)
+        self.git(self.project, "add", "Cargo.toml", "Cargo.lock", "value")
+        self.git(self.project, "update-index", "--add", "--cacheinfo", "160000," + pinned + ",child")
+        self.git(self.project, "commit", "-qm", "parent gitlink")
+        self.sha = self.git(self.project, "rev-parse", "HEAD")
+        self.git(self.project, "tag", self.tag)
+        evidence = self.capture()
+        self.assertEqual(evidence["submodules"][0]["commit"], pinned)
+
+    def test_mutable_child_head_worktree_and_url_cannot_select_bytes(self):
+        self.fixture()
+        self.git(self.project, "config", "submodule.vendor/child.ignore", "all")
+        self.git(self.child, "config", "user.name", "DSR submodule test")
+        self.git(self.child, "config", "user.email", "test@example.invalid")
+        (self.child / "value").write_text("new HEAD must not be selected\n")
+        advanced = self.seal(self.child)
+        self.assertNotEqual(advanced, self.child_sha)
+        (self.child / "value").write_text("uncommitted bytes must not be copied\n")
+        self.git(self.child, "remote", "set-url", "origin", "https://unreachable.invalid/changed")
+        self.assertEqual(self.git(self.project, "status", "--porcelain=v1"), "")
+        evidence = self.capture()
+        self.assertEqual(evidence["submodules"][0]["commit"], self.child_sha)
+        self.assertEqual((self.snapshot / "vendor/child/value").read_text(), "locked child\n")
+
+    def test_missing_pinned_child_commit_is_refused_before_staging(self):
+        self.fixture()
+        loose = self.admin / "objects" / self.child_sha[:2] / self.child_sha[2:]
+        self.assertTrue(loose.is_file())
+        loose.rename(self.work / "retained-missing-commit")
+        self.capture(4)
+
+    def test_gitlink_to_present_blob_is_refused_as_wrong_object_type(self):
+        self.fixture()
+        blob = self.git(self.child, "rev-parse", self.child_sha + ":value")
+        self.git(self.project, "update-index", "--cacheinfo", "160000," + blob + ",vendor/child")
+        self.git(self.project, "commit", "-qm", "wrong object type")
+        self.sha = self.git(self.project, "rev-parse", "HEAD")
+        self.tag = "v1.2.4"
+        self.git(self.project, "tag", self.tag)
+        self.capture(4)
+
+    def test_external_administration_pointer_is_refused(self):
+        self.fixture()
+        (self.child / ".git").write_text("gitdir: " + str(self.work / "child/.git") + "\n")
+        self.capture(4)
+
+    def test_linked_administration_store_is_refused(self):
+        self.fixture()
+        alias = self.admin.parent / "alias"
+        alias.symlink_to(self.admin, target_is_directory=True)
+        (self.child / ".git").write_text("gitdir: " + str(alias) + "\n")
+        self.capture(4)
+
+    def test_alternates_and_configuration_includes_are_refused(self):
+        for index, name in enumerate(("alternates", "include")):
+            if index:
+                self.work = WORK / (self._testMethodName + "-include")
+                self.work.mkdir()
+                self.project = self.work / "project"
+            self.fixture()
+            if name == "alternates":
+                (self.admin / "objects/info/alternates").write_text(str(self.work / "child/.git/objects") + "\n")
+            else:
+                self.git(self.child, "config", "include.path", str(self.work / "outside-config"))
+            with self.subTest(kind=name):
+                self.capture(4)
+
+    def test_child_symlink_cannot_escape_into_parent(self):
+        self.fixture(escape=True)
+        self.capture(4)
+
+    def test_parent_symlink_cannot_enter_a_child_repository(self):
+        self.fixture()
+        (self.project / "cross-link").symlink_to("vendor/child/value")
+        self.sha = self.seal(self.project)
+        self.tag = "v1.2.4"
+        self.git(self.project, "tag", self.tag)
+        self.capture(4)
+
+    def test_receipt_chain_mutations_and_missing_authority_are_refused(self):
+        self.fixture()
+        original = self.capture()
+        mutations = {
+            "root-proof-omitted": lambda p: p.pop("git_commit_object"),
+            "children-omitted": lambda p: p.pop("submodules"),
+            "entire-proof-omitted": lambda p: (p.pop("git_commit_object"), p.pop("submodules")),
+            "empty-children": lambda p: p.update(submodules=[]),
+            "commit": lambda p: p["submodules"][0].update(commit="1" * 40),
+            "tree": lambda p: p["submodules"][0].update(tree="2" * 40),
+            "path": lambda p: p["submodules"][0].update(path="vendor/other"),
+            "object": lambda p: p["submodules"][0].update(commit_object="Zm9yZ2Vk"),
+            "root-object": lambda p: p.update(git_commit_object="Zm9yZ2Vk"),
+            "unknown-field": lambda p: p["submodules"][0].update(head=self.child_sha),
+            "duplicate-child": lambda p: p["submodules"].append(copy.deepcopy(p["submodules"][0])),
+            "escaping-path": lambda p: p["submodules"][0].update(path="../child"),
+            "cycle": lambda p: p["submodules"][0].update(commit=p["git_sha"], commit_object=p["git_commit_object"]),
+            "nested-empty-set": lambda p: p["submodules"][0]["submodules"][0].update(submodules=[]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name):
+                proof = copy.deepcopy(original)
+                mutate(proof)
+                receipt = self.work / (name + ".json")
+                receipt.write_text(json.dumps(proof))
+                self.verify(7, receipt)
+
+    def test_rewritten_child_bytes_tree_and_receipt_cannot_erase_commit_authority(self):
+        self.fixture()
+        original = self.capture()
+        (self.snapshot / "vendor/child/value").write_text("attacker replacement child source\n")
+        self.verify(7)
+        forged = self.rewritten_flat_receipt(original)
+        receipt = self.work / "forged-without-authority.json"
+        receipt.write_text(json.dumps(forged))
+        self.verify(7, receipt)
+        # Supplying the original commit cannot authorize the substituted
+        # flattened tree either, even with fully refreshed file digests.
+        forged["git_commit_object"] = original["git_commit_object"]
+        receipt = self.work / "forged-with-original-authority.json"
+        receipt.write_text(json.dumps(forged))
+        self.verify(7, receipt)
+        # Replacing the raw commit's tree line changes its object ID, so that
+        # apparently self-consistent commit also cannot retain the old pin.
+        raw = base64.b64decode(original["git_commit_object"])
+        _, suffix = raw.split(b"\n", 1)
+        forged["git_commit_object"] = base64.b64encode(
+            ("tree " + forged["git_tree"] + "\n").encode() + suffix).decode()
+        receipt = self.work / "forged-with-rewritten-authority.json"
+        receipt.write_text(json.dumps(forged))
+        self.verify(7, receipt)
+
+    def test_child_file_and_empty_directory_drift_are_refused(self):
+        self.fixture()
+        self.capture()
+        path = self.snapshot / "vendor/child/value"
+        original = path.read_bytes()
+        path.write_text("compiler drift\n")
+        self.verify(7)
+        path.write_bytes(original)
+        (self.snapshot / "vendor/child/untracked-empty").mkdir()
+        self.verify(7)
+
+    def test_empty_nested_child_remains_a_pinned_directory(self):
+        self.fixture(empty=True)
+        proof = self.capture()
+        nested = self.snapshot / "vendor/child/nested"
+        self.assertTrue(nested.is_dir())
+        self.assertEqual(list(nested.iterdir()), [])
+        self.assertEqual(proof["submodules"][0]["submodules"][0]["commit"], self.leaf_sha)
+        nested.rename(self.work / "retained-empty-child")
+        self.verify(7)
+
+    def test_source_set_retains_sibling_submodule_proofs_and_boundaries(self):
+        self.fixture()
+        sibling = self.project
+        sibling_sha = self.sha
+        self.git(sibling, "remote", "set-url", "origin", "https://github.com/owner/helper.git")
+        primary = self.repository(self.work / "primary", primary=True)
+        primary_sha = self.seal(primary)
+        self.git(primary, "tag", self.tag)
+        plan = self.work / "siblings.json"
+        plan.write_text(json.dumps([{"relative_path": "helper", "local_path": str(sibling),
+                                    "revision": sibling_sha, "repo": "owner/helper"}]))
+        result = self.call("xwin_source_snapshot_set", primary, primary_sha, self.tag, "owner/demo",
+                           self.snapshot, self.receipt, plan)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.verify()
+        evidence = json.loads(self.receipt.read_text())
+        self.assertNotIn("submodules", evidence)
+        dependency = evidence["dependencies"][0]
+        self.assertEqual(dependency["submodules"][0]["commit"], self.child_sha)
+        self.assertIn("git_commit_object", dependency)
+        self.assertEqual((self.snapshot / "helper/vendor/child/nested/link").read_text(), "locked leaf\n")
+        sibling.rename(self.work / "sibling-unavailable")
+        primary.rename(self.work / "primary-unavailable")
+        self.verify()
+        dependency.pop("submodules")
+        dependency.pop("git_commit_object")
+        bad = self.work / "sibling-proof-omitted.json"
+        bad.write_text(json.dumps(evidence))
+        self.verify(7, bad)
+
+    def test_plain_source_set_requires_primary_and_sibling_commit_authority(self):
+        self.repository(self.project, primary=True)
+        self.sha = self.seal(self.project)
+        self.git(self.project, "tag", self.tag)
+        sibling = self.repository(self.work / "helper", primary=True)
+        self.git(sibling, "remote", "set-url", "origin", "https://github.com/owner/helper.git")
+        sibling_sha = self.seal(sibling)
+        plan = self.work / "siblings.json"
+        plan.write_text(json.dumps([{"relative_path": "helper", "local_path": str(sibling),
+                                    "revision": sibling_sha, "repo": "owner/helper"}]))
+        result = self.call("xwin_source_snapshot_set", self.project, self.sha, self.tag, "owner/demo",
+                           self.snapshot, self.receipt, plan)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.verify()
+        original = json.loads(self.receipt.read_text())
+        self.assertNotIn("submodules", original)
+        self.assertNotIn("submodules", original["dependencies"][0])
+        for name, path, selected, pin in (
+                ("primary", self.project, original, self.sha),
+                ("sibling", sibling, original["dependencies"][0], sibling_sha)):
+            self.assertEqual(base64.b64decode(selected["git_commit_object"]),
+                             self.git(path, "cat-file", "commit", pin, raw=True))
+            self.git(path, "commit", "--allow-empty", "-qm", "another real commit with the same tree")
+            other = self.git(path, "rev-parse", "HEAD")
+            self.assertNotEqual(other, pin)
+            self.assertEqual(self.git(path, "rev-parse", other + "^{tree}"), selected["git_tree"])
+            substitute = base64.b64encode(self.git(path, "cat-file", "commit", other, raw=True)).decode()
+            for mutation in ("omitted", "invalid", "different-valid-commit"):
+                with self.subTest(repository=name, mutation=mutation):
+                    proof = copy.deepcopy(original)
+                    identity = proof if name == "primary" else proof["dependencies"][0]
+                    if mutation == "omitted":
+                        identity.pop("git_commit_object")
+                    else:
+                        identity["git_commit_object"] = substitute if mutation == "different-valid-commit" else "Zm9yZ2Vk"
+                    receipt = self.work / (name + "-" + mutation + ".json")
+                    receipt.write_text(json.dumps(proof))
+                    self.verify(7, receipt)
+        self.project.rename(self.work / "primary-unavailable")
+        sibling.rename(self.work / "sibling-unavailable")
+        self.verify()
+
+    def test_recursive_depth_is_bounded_on_real_git_children(self):
+        self.repository(self.project, primary=True)
+        paths = [self.project]
+        for _ in range(17):
+            paths.append(paths[-1] / "child")
+            self.repository(paths[-1])
+        child_commit = None
+        for path in reversed(paths):
+            self.git(path, "add", "value")
+            if path == self.project:
+                self.git(path, "add", "Cargo.toml", "Cargo.lock")
+            if child_commit:
+                self.git(path, "update-index", "--add", "--cacheinfo", "160000," + child_commit + ",child")
+            self.git(path, "commit", "-qm", "real nested Git boundary")
+            child_commit = self.git(path, "rev-parse", "HEAD")
+        self.sha = child_commit
+        self.git(self.project, "tag", self.tag)
+        self.capture(4)
+        # The immediate child has exactly sixteen nested repository edges.
+        # Give it a primary identity without changing any of its child pins.
+        self.project = paths[1]
+        self.git(self.project, "remote", "add", "origin", "https://github.com/owner/demo.git")
+        (self.project / "Cargo.toml").write_text('[package]\nname="demo"\nversion="1.2.3"\n')
+        (self.project / "Cargo.lock").write_text("version = 3\n")
+        self.sha = self.seal(self.project)
+        self.git(self.project, "tag", self.tag)
+        self.capture()
+
+    def test_one_aggregate_budget_is_shared_across_repository_admissions(self):
+        self.repository(self.project, primary=True)
+        self.sha = self.seal(self.project)
+        self.git(self.project, "tag", self.tag)
+        other = self.repository(self.work / "other", primary=True)
+        other_sha = self.seal(other)
+        self.git(other, "tag", self.tag)
+        text = MODULE.read_text()
+        source = text.split("<<'PY'\n", 1)[1].split("\nPY\n}", 1)[0]
+        definitions = source.split('\ntry:\n    mode = sys.argv[1]', 1)[0]
+        scope = {}
+        exec(compile(definitions, str(MODULE), "exec"), scope)
+        budget = {"entries": scope["MAX_ENTRIES"] - 4}
+        scope["inspect_project"](str(self.project), self.sha, self.tag, "owner/demo", budget)
+        with self.assertRaisesRegex(scope["Rejected"], "aggregate entries limit"):
+            scope["inspect_project"](str(other), other_sha, self.tag, "owner/demo", budget)
+        budget = {"repositories": scope["MAX_REPOSITORIES"] - 1}
+        scope["inspect_project"](str(self.project), self.sha, self.tag, "owner/demo", budget)
+        with self.assertRaisesRegex(scope["Rejected"], "aggregate repositories limit"):
+            scope["inspect_project"](str(other), other_sha, self.tag, "owner/demo", budget)
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(ProjectSubmodules)
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+sys.exit(0 if result.wasSuccessful() else 1)
+PY
+cat "$WORK/assert.err" >&2
+
+# The input Git tree itself must not contain an unbound escaping symlink.
 ln -s ../outside.rs "$PROJECT/linked-source"
 git -C "$PROJECT" add linked-source && git -C "$PROJECT" commit -qm linked || exit 1
 LINK_SHA=$(git -C "$PROJECT" rev-parse HEAD)

@@ -175,9 +175,25 @@ committed, including `Cargo.lock`. Ignored/untracked files are not copied.
 The runner materializes raw Git blobs into `run/source`, checking their Git
 object hashes and preserving executable modes. It does not build directly from
 the original checkout or use `git archive`: export-ignore/export-subst attributes
-cannot silently alter the release source. Links, submodules, unsafe paths, and
-local Cargo path dependencies outside the admitted source roots are rejected.
-Sibling repositories require the explicit pins described below. The snapshot
+cannot silently alter the release source. Committed relative links to regular
+files are materialized as verified bytes; each link must resolve within its own
+repository. Project submodules use the exact commit recorded by the parent
+gitlink, including nested modules. The runner authenticates every commit, tree
+and blob before copying, and retains the raw commit evidence needed to verify
+the snapshot independently of the original repositories. Mutable child HEADs,
+URLs and working files cannot select different release inputs.
+
+Initialize required submodules before the build. Their pinned commits must be
+available locally; source admission performs no fetch. A child may keep its own
+regular `.git` directory or use Git's normal absorbed storage beneath its
+admitted parent's `.git/modules` directory. External administrative pointers,
+configuration includes, alternates, linked object stores, missing objects and
+links crossing repository boundaries are refused. The complete primary and
+sibling source set is bounded to 256 repositories, 100000 tree entries and 16
+levels of nested modules; each raw commit object is limited to 1 MiB.
+
+Unsafe paths and local Cargo dependencies outside the admitted source roots are
+rejected. Sibling repositories require the explicit pins described below. The snapshot
 must also live outside ancestor Cargo configurations. The primary commit's time
 sets `SOURCE_DATE_EPOCH` in the controlled build environment.
 
@@ -373,8 +389,9 @@ normal relative layout. Every repository is materialized from raw Git blobs,
 not its mutable working directory. No Cargo manifest or dependency path is
 rewritten. The primary lockfile must already describe the selected dependency
 graph. Unlisted roots, absolute references back to the original checkout, and
-dependencies escaping these sibling roots fail admission. Nested layouts that
-cannot be represented by these sibling basenames are not supported.
+dependencies escaping these sibling roots fail admission. Nested repositories
+inside a primary or sibling root must be authenticated project submodules;
+arbitrary additional checkout layouts are not admitted.
 
 Both metadata observations validate local manifests and target sources against
 the admitted source set. Only the primary repository can supply the selected
@@ -384,6 +401,16 @@ on the final result and in `source.dependencies` on the release manifest.
 Declared but unused siblings remain identified as staged inputs, not asserted
 to have compiled. The full per-repository Git tree, origin, commit, timestamp
 and file-inventory evidence remains in the manifest's `source_snapshot`.
+Every repository identity retains `git_commit_object`, including repositories
+without submodules. Recursive `submodules` records contain each child path,
+commit, tree and raw commit object.
+Verification reconstructs the Git trees from the materialized file bytes and
+gitlinks, so a changed nested source or substituted submodule pin fails even
+after the original checkout is unavailable. Receipts without the raw root
+commit proof require a fresh snapshot; removing submodule evidence cannot
+disable commit authentication. This support applies to the pinned
+cross-build backend; the native snapshot path retains its separate admission
+rules.
 
 These compact dependency pins use the same `{relative_path, git_sha}` records
 consumed by the existing SLSA mapper and release-bundle collector. A bundle can

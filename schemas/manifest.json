@@ -445,16 +445,41 @@
         "dependency_sources": {"$ref": "#/$defs/cargo_dependency_sources"}
       }
     },
+    "xwin_git_commit_object": {
+      "type": "string", "minLength": 4, "maxLength": 1398104,
+      "description": "Base64 of the raw Git commit object, bounded to 1 MiB after decoding. Runtime verification hashes these bytes to the selected commit and authenticates its tree.",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+      "not": {"pattern": "[^A-Za-z0-9+/=]"}
+    },
+    "xwin_project_submodules": {
+      "type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true,
+      "description": "Children authenticated by their parent Git tree. Runtime verification enforces depth 16, 256 repositories and 100000 entries across the complete source set.",
+      "items": {
+        "type": "object", "required": ["path", "commit", "tree", "commit_object"], "additionalProperties": false,
+        "properties": {
+          "path": {
+            "allOf": [{"$ref": "#/$defs/xwin_relative_path"}],
+            "not": {"pattern": "(?:^|/)(?:-|\\.[gG][iI][tT](?:/|$))|[\\u0000-\\u001f\\u007f]"}
+          },
+          "commit": {"$ref": "#/$defs/source/properties/git_sha"},
+          "tree": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"},
+          "commit_object": {"$ref": "#/$defs/xwin_git_commit_object"},
+          "submodules": {"$ref": "#/$defs/xwin_project_submodules"}
+        }
+      }
+    },
     "xwin_source_identity": {
       "type": "object",
-      "required": ["repository", "git_sha", "git_ref", "git_tree", "source_date_epoch", "snapshot_sha256"],
+      "required": ["repository", "git_sha", "git_ref", "git_tree", "git_commit_object", "source_date_epoch", "snapshot_sha256"],
       "properties": {
         "repository": {"$ref": "#/$defs/github_repository"},
         "git_sha": {"$ref": "#/$defs/source/properties/git_sha"},
         "git_ref": {"type": "string", "minLength": 1},
         "git_tree": {"type": "string", "pattern": "^(?!0{40}$)[0-9a-f]{40}$"},
         "source_date_epoch": {"type": "integer", "minimum": 0},
-        "snapshot_sha256": {"$ref": "#/$defs/sha256"}
+        "snapshot_sha256": {"$ref": "#/$defs/sha256"},
+        "git_commit_object": {"$ref": "#/$defs/xwin_git_commit_object"},
+        "submodules": {"$ref": "#/$defs/xwin_project_submodules"}
       }
     },
     "xwin_source_snapshot": {

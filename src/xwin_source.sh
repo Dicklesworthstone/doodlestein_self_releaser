@@ -26,12 +26,14 @@ xwin_source_verify() {
 _xws_source() {
     python3 - "$@" <<'PY'
 from contextlib import contextmanager
+import base64
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import re
+import select
 import stat
 import subprocess
 import sys
@@ -54,7 +56,12 @@ def safe_name(name):
 def inventory(root, git_blobs=None):
     require(root.is_dir() and not root.is_symlink(), "missing or linked source snapshot")
     files = []
+    node_count = 0
     for directory, dirs, names in os.walk(root, followlinks=False):
+        node_count += len(dirs) + len(names)
+        # Source sets add at most 33 layout roots to the shared Git-entry
+        # budget. Refuse oversized physical inventories before reading bytes.
+        require(node_count <= MAX_ENTRIES + 33, "source snapshot exceeds its aggregate entry limit")
         for name in dirs:
             path = Path(directory) / name
             safe_name(path.relative_to(root).as_posix())
@@ -112,6 +119,67 @@ def sibling_name(name):
     require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name)
             and ".." not in name and name.lower() != "project", "invalid or reserved sibling name")
 
+MAX_ENTRIES = 100000
+MAX_REPOSITORIES = 256
+MAX_DEPTH = 16
+MAX_COMMIT_BYTES = 1024 ** 2
+
+def charge(budget, kind, amount=1):
+    budget[kind] = budget.get(kind, 0) + amount
+    require(budget[kind] <= (MAX_ENTRIES if kind == "entries" else MAX_REPOSITORIES),
+            "source graph exceeds its aggregate " + kind + " limit")
+
+def plain_directory(path):
+    path = Path(os.path.abspath(path))
+    for node in (path, *path.parents):
+        require(stat.S_ISDIR(node.lstat().st_mode), "linked or missing source repository directory")
+    return path
+
+def source_admin(project, environment, parent_admin=None):
+    # A normal absorbed submodule has a small .git pointer into its parent's
+    # modules directory. Admit only that static, contained store, or a child's
+    # self-contained .git directory. URLs, HEAD and arbitrary gitdir pointers
+    # never select release objects.
+    plain_directory(project)
+    marker = project / ".git"
+    mode = marker.lstat().st_mode
+    if stat.S_ISDIR(mode):
+        admin = plain_directory(marker)
+    else:
+        require(parent_admin is not None and stat.S_ISREG(mode), "external Git administration is not an admitted source")
+        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read(4097)
+            after = os.fstat(stream.fileno())
+        require(len(raw) <= 4096 and (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), "Git administration pointer changed while reading")
+        match = re.fullmatch(rb"gitdir: ([^\x00-\x1f\x7f]+)\n?", raw)
+        require(match is not None, "invalid submodule administration pointer")
+        target = Path(os.fsdecode(match[1]))
+        admin = Path(os.path.abspath(target if target.is_absolute() else project / target))
+        require(admin.is_relative_to(parent_admin / "modules") and admin != parent_admin / "modules",
+                "submodule administration escapes its admitted parent repository")
+        admin = plain_directory(admin)
+    for name in ("commondir", "objects/info/alternates", "objects/info/http-alternates"):
+        require(not os.path.lexists(admin / name), "external Git object storage is not an admitted source")
+    objects = plain_directory(admin / "objects")
+    for directory, dirs, names in os.walk(objects, followlinks=False):
+        for name in dirs:
+            require(stat.S_ISDIR((Path(directory) / name).lstat().st_mode), "linked Git object storage")
+        for name in names:
+            require(stat.S_ISREG((Path(directory) / name).lstat().st_mode), "linked or special Git object storage")
+    for name in ("config", "config.worktree"):
+        config = admin / name
+        if not os.path.lexists(config):
+            continue
+        require(stat.S_ISREG(config.lstat().st_mode), "linked Git repository configuration")
+        result = subprocess.run(["git", "config", "--no-includes", "--file", str(config), "--null", "--list"],
+                                env=environment, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        keys = [row.split(b"\n", 1)[0].lower() for row in result.stdout.split(b"\0") if row]
+        require(not any(key.startswith((b"include.", b"includeif.")) for key in keys), "external Git configuration is not an admitted source")
+    return admin
+
 @contextmanager
 def blob_reader(selection):
     process = subprocess.Popen(selection["command"] + ["cat-file", "--batch"], env=selection["environment"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -125,6 +193,33 @@ def blob_reader(selection):
             process.wait()
         process.stdin.close()
         process.stdout.close()
+
+def read_object(process, oid, kind, limit):
+    require(isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{40}", oid), "invalid Git object identity")
+    process.stdin.write((oid + "\n").encode("ascii"))
+    process.stdin.flush()
+    def read(count):
+        data = bytearray()
+        while len(data) < count:
+            require(select.select([process.stdout], [], [], 30)[0], "Git source object read timed out")
+            block = os.read(process.stdout.fileno(), count - len(data))
+            require(block, "truncated Git source object")
+            data.extend(block)
+        return bytes(data)
+    header = bytearray()
+    while len(header) <= 128:
+        byte = read(1)
+        if byte == b"\n":
+            break
+        header.extend(byte)
+    fields = header.decode("ascii").split()
+    require(len(fields) == 3 and fields[:2] == [oid, kind] and fields[2].isdigit(), "missing or wrong-type pinned Git object")
+    size = int(fields[2])
+    require(size <= limit, "pinned Git object exceeds its size limit")
+    data = read(size)
+    require(read(1) == b"\n" and hashlib.sha1((kind + " " + str(size) + "\0").encode() + data).hexdigest() == oid,
+            "Git source object hash mismatch")
+    return data
 
 def copy_blob(process, oid, output, limit=1024 ** 3):
     process.stdin.write((oid + "\n").encode("ascii"))
@@ -221,7 +316,77 @@ def verify_links(files, expected, git_blobs):
         by_path[name]["symlink"] = link
     return files
 
-def inspect_project(project, commit, tag, repo):
+def inspect_repository(project, commit, environment, budget, parent_admin=None, depth=0, active=None):
+    require(depth <= MAX_DEPTH, "source submodule nesting exceeds verification limit")
+    active = set() if active is None else active
+    require(commit not in active, "cyclic source submodule ancestry")
+    charge(budget, "repositories")
+    admin = source_admin(project, environment, parent_admin)
+    stores = budget.setdefault("stores", set())
+    require(str(admin) not in stores, "one Git administration store selected more than once")
+    stores.add(str(admin))
+    command = ["git", "-c", "protocol.allow=never", "-c", "core.fsmonitor=false",
+               "-c", "core.hooksPath=" + os.devnull, "--git-dir=" + str(admin)]
+    selection = {"project": str(project), "command": command, "environment": environment,
+                 "entries": [], "children": [], "commit": commit}
+    active.add(commit)
+    try:
+        gitlinks = []
+        with blob_reader(selection) as process:
+            raw_commit = read_object(process, commit, "commit", MAX_COMMIT_BYTES)
+            first = raw_commit.split(b"\n", 1)[0]
+            require(re.fullmatch(rb"tree [0-9a-f]{40}", first), "invalid pinned Git commit tree")
+            selection["tree"] = first[5:].decode("ascii")
+            selection["commit_object"] = base64.b64encode(raw_commit).decode("ascii")
+            pending = [("", selection["tree"])]
+            while pending:
+                prefix, oid = pending.pop()
+                data = read_object(process, oid, "tree", 64 * 1024 ** 2)
+                require(data or not prefix, "empty source subtree cannot be represented")
+                offset, names, previous = 0, set(), None
+                while offset < len(data):
+                    end = data.find(b"\0", offset)
+                    require(end > offset and end + 21 <= len(data), "malformed pinned Git tree")
+                    mode, raw_name = data[offset:end].split(b" ", 1)
+                    leaf = raw_name.decode("utf-8")
+                    safe_name(leaf)
+                    require("/" not in leaf and leaf not in names, "ambiguous pinned Git tree entry")
+                    names.add(leaf)
+                    order = raw_name + (b"/" if mode == b"40000" else b"")
+                    require(previous is None or previous < order, "noncanonical pinned Git tree order")
+                    previous = order
+                    name = prefix + leaf
+                    safe_name(name)
+                    charge(budget, "entries")
+                    child_oid = data[end + 1:end + 21].hex()
+                    offset = end + 21
+                    if mode == b"40000":
+                        pending.append((name + "/", child_oid))
+                    elif mode == b"160000":
+                        gitlinks.append((name, child_oid))
+                    else:
+                        require(mode in (b"100644", b"100755", b"120000"), "unsupported pinned Git source mode")
+                        selection["entries"].append((name, mode.decode("ascii"), child_oid))
+        selection["entries"].sort()
+        selection["links"] = source_links(selection)
+        for name, child_oid in sorted(gitlinks):
+            child = inspect_repository(project / name, child_oid, environment, budget, admin, depth + 1, active)
+            selection["children"].append((name, child))
+        return selection
+    finally:
+        active.remove(commit)
+
+def submodule_evidence(selection):
+    result = []
+    for name, child in selection["children"]:
+        proof = {"path": name, "commit": child["commit"], "tree": child["tree"],
+                 "commit_object": child["commit_object"]}
+        if child["children"]:
+            proof["submodules"] = submodule_evidence(child)
+        result.append(proof)
+    return result
+
+def inspect_project(project, commit, tag, repo, budget):
     require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40, "expected an explicit SHA-1 source commit")
     require(tag is None or re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", tag), "expected a version tag")
     require(isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo) and ".." not in repo, "invalid source repository")
@@ -230,8 +395,9 @@ def inspect_project(project, commit, tag, repo):
     project = project.resolve()
     environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_NO_REPLACE_OBJECTS="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
-    command = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull, "-C", str(project)]
+                       GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    selection = inspect_repository(project, commit, environment, budget)
+    command = ["git", "-c", "protocol.allow=never", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull, "-C", str(project)]
     def git(*args):
         return subprocess.run(command + list(args), env=environment, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
     require(Path(os.fsdecode(git("rev-parse", "--show-toplevel")).strip()).resolve() == project, "project must be the Git worktree root")
@@ -243,33 +409,20 @@ def inspect_project(project, commit, tag, repo):
     require(origin in ("https://github.com/" + repo, "https://github.com/" + repo + ".git",
                        "git@github.com:" + repo, "git@github.com:" + repo + ".git",
                        "ssh://git@github.com/" + repo, "ssh://git@github.com/" + repo + ".git"), "source origin differs from the selected release repository")
-    tree = git("rev-parse", "--verify", commit + "^{tree}").decode().strip()
     epoch = git("show", "-s", "--format=%ct", commit).decode().strip()
     require(epoch.isdigit(), "invalid source timestamp")
-    records = git("ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0")
-    entries = []
-    for record in records:
-        if not record:
-            continue
-        header, raw_name = record.split(b"\t", 1)
-        file_mode, kind, oid = header.decode("ascii").split(" ")
-        name = raw_name.decode("utf-8")
-        safe_name(name)
-        require(kind == "blob" and file_mode in ("100644", "100755", "120000"), "release snapshot refuses unsupported entries and submodules: " + name)
-        require(re.fullmatch(r"[0-9a-f]{40}", oid), "invalid Git object identity")
-        entries.append((name, file_mode, oid))
-    require(entries and len(entries) <= 100000, "empty or oversized source tree")
     required = {"Cargo.toml", "Cargo.lock"} if tag is not None else {"Cargo.toml"}
-    require(required.issubset({item[0] for item in entries}), "required Cargo manifests/lockfile must be committed")
-    selection = {"project": str(project), "command": command, "environment": environment, "entries": entries,
-            "identity": {"repository": "https://github.com/" + repo, "git_sha": commit,
-                         "git_ref": "refs/tags/" + tag if tag is not None else commit,
-                         "git_tree": tree, "source_date_epoch": int(epoch)}}
+    require(required.issubset({item[0] for item in selection["entries"]}), "required Cargo manifests/lockfile must be committed")
+    selection["identity"] = {"repository": "https://github.com/" + repo, "git_sha": commit,
+                             "git_ref": "refs/tags/" + tag if tag is not None else commit,
+                             "git_tree": selection["tree"], "git_commit_object": selection["commit_object"],
+                             "source_date_epoch": int(epoch)}
+    if selection["children"]:
+        selection["identity"]["submodules"] = submodule_evidence(selection)
     # Admit every link before creating any destination, including all siblings.
-    selection["links"] = source_links(selection)
     return selection
 
-def write_snapshot(selection, root):
+def write_repository(selection, root, links, prefix=""):
     root.mkdir(mode=0o700)
     # Read raw Git objects, not a working tree or git archive: attributes such
     # as export-ignore/export-subst must not silently change release inputs.
@@ -283,21 +436,147 @@ def write_snapshot(selection, root):
             with path.open("xb") as stream:
                 copy_blob(process, oid, stream)
             path.chmod(0o755 if file_mode == "100755" else 0o644)
+    links.update((prefix + name, proof) for name, proof in selection["links"].items())
+    for name, child in selection["children"]:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        write_repository(child, root / name, links, prefix + name + "/")
+
+def write_snapshot(selection, root):
+    links = {}
+    write_repository(selection, root, links)
     files = inventory(root)
     for entry in files:
-        if entry["path"] in selection["links"]:
-            entry["symlink"] = selection["links"][entry["path"]]
+        if entry["path"] in links:
+            entry["symlink"] = links[entry["path"]]
     return {"schema_version": 1, "kind": "dsr-xwin-source", **selection["identity"],
             "files": files, "snapshot_sha256": digest_files(files)}
 
+def reconstructed_tree(files, git_blobs, children, budget):
+    tree = {}
+    def insert(path, mode, oid):
+        safe_name(path)
+        require(isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{40}", oid), "invalid source object evidence")
+        node = tree
+        parts = path.split("/")
+        for part in parts[:-1]:
+            if part not in node:
+                node[part] = {}
+            require(isinstance(node[part], dict), "source file overlaps a repository boundary")
+            node = node[part]
+        require(parts[-1] not in node, "ambiguous source repository path")
+        node[parts[-1]] = (mode, oid)
+    for entry in files:
+        if "symlink" in entry:
+            insert(entry["path"], "120000", entry["symlink"]["git_blob"])
+        else:
+            insert(entry["path"], "100755" if entry["executable"] else "100644", git_blobs[entry["path"]])
+    for child in children:
+        insert(child["path"], "160000", child["commit"])
+    def encode(node):
+        charge(budget, "entries", len(node))
+        data = bytearray()
+        for name, item in sorted(node.items(), key=lambda row: row[0].encode("utf-8") + (b"/" if isinstance(row[1], dict) else b"")):
+            mode, oid = ("40000", encode(item)) if isinstance(item, dict) else item
+            data.extend(mode.encode("ascii") + b" " + name.encode("utf-8") + b"\0" + bytes.fromhex(oid))
+        return hashlib.sha1(("tree " + str(len(data)) + "\0").encode() + data).hexdigest()
+    return encode(tree)
+
+def verify_commit(raw, commit, tree):
+    require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40
+            and isinstance(tree, str) and re.fullmatch(r"[0-9a-f]{40}", tree) and tree != "0" * 40,
+            "invalid source commit or tree evidence")
+    require(isinstance(raw, str) and 0 < len(raw) <= 4 * ((MAX_COMMIT_BYTES + 2) // 3), "invalid source commit object evidence")
+    decoded = base64.b64decode(raw, validate=True)
+    require(len(decoded) <= MAX_COMMIT_BYTES and base64.b64encode(decoded).decode("ascii") == raw,
+            "noncanonical source commit object evidence")
+    require(hashlib.sha1(("commit " + str(len(decoded)) + "\0").encode() + decoded).hexdigest() == commit
+            and decoded.split(b"\n", 1)[0] == ("tree " + tree).encode("ascii"), "source commit evidence does not authenticate its tree")
+
+def verify_repository(root, files, expected, git_blobs, identity, budget, depth=0, active=None, child=False):
+    require(depth <= MAX_DEPTH, "source submodule nesting exceeds verification limit")
+    charge(budget, "repositories")
+    active = set() if active is None else active
+    if child:
+        require(isinstance(identity, dict) and set(identity) in (
+            {"path", "commit", "tree", "commit_object"},
+            {"path", "commit", "tree", "commit_object", "submodules"}), "invalid submodule evidence")
+        commit, tree, raw = identity["commit"], identity["tree"], identity["commit_object"]
+    else:
+        commit, tree, raw = identity.get("git_sha"), identity.get("git_tree"), identity.get("git_commit_object")
+    # Every repository must carry its commit authority, even an ordinary
+    # primary or sibling with no children. Optional proof would let a forged
+    # receipt erase gitlinks and replace the root tree with materialized files
+    # while retaining the operator's selected commit and tag.
+    verify_commit(raw, commit, tree)
+    children = identity.get("submodules", [])
+    require(isinstance(children, list) and ("submodules" not in identity or 0 < len(children) <= MAX_REPOSITORIES),
+            "invalid source submodule set")
+    require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40
+            and commit not in active, "cyclic or invalid source submodule ancestry")
+    active.add(commit)
+    try:
+        names = []
+        for proof in children:
+            require(isinstance(proof, dict), "invalid submodule evidence")
+            name = proof.get("path")
+            safe_name(name)
+            require(not any(name == prior or name.startswith(prior + "/") or prior.startswith(name + "/") for prior in names),
+                    "ambiguous source submodule boundaries")
+            names.append(name)
+        require(names == sorted(names), "noncanonical source submodule order")
+        def own(path):
+            return not any(path.startswith(name + "/") for name in names)
+        selected = [entry for entry in expected if own(entry["path"])]
+        direct = [entry for entry in files if own(entry["path"])]
+        hashes = {path: oid for path, oid in git_blobs.items() if own(path)}
+        direct = verify_links(direct, selected, hashes)
+        actual_tree = reconstructed_tree(direct, hashes, children, budget)
+        require(isinstance(tree, str) and re.fullmatch(r"[0-9a-f]{40}", tree) and tree != "0" * 40
+                and actual_tree == tree, "materialized source tree differs from its pinned Git tree")
+        result = list(direct)
+        for proof in children:
+            prefix = proof["path"] + "/"
+            subset = [{**entry, "path": entry["path"][len(prefix):]} for entry in files if entry["path"].startswith(prefix)]
+            admitted = [{**entry, "path": entry["path"][len(prefix):]} for entry in expected if entry["path"].startswith(prefix)]
+            child_hashes = {path[len(prefix):]: oid for path, oid in git_blobs.items() if path.startswith(prefix)}
+            plain_directory(root / proof["path"])
+            verified = verify_repository(root / proof["path"], subset, admitted, child_hashes, proof, budget, depth + 1, active, True)
+            result.extend({**entry, "path": prefix + entry["path"]} for entry in verified)
+        if child or children:
+            expected_dirs = set()
+            for name in [entry["path"] for entry in files] + [proof["path"] + "/" for proof in children]:
+                parts = name.split("/")[:-1]
+                for index in range(1, len(parts) + 1):
+                    expected_dirs.add("/".join(parts[:index]))
+            actual_dirs = {str((Path(directory) / name).relative_to(root).as_posix())
+                           for directory, dirs, _ in os.walk(root, followlinks=False) for name in dirs}
+            # Nested empty submodules have no file row. Their directory is
+            # nevertheless authenticated by the recursive gitlink proof.
+            def nested_directories(proofs, prefix=""):
+                for proof in proofs:
+                    path = prefix + proof["path"]
+                    parts = path.split("/")
+                    expected_dirs.update("/".join(parts[:index]) for index in range(1, len(parts) + 1))
+                    nested_directories(proof.get("submodules", []), path + "/")
+            nested_directories(children)
+            require(actual_dirs == expected_dirs, "source submodule directory inventory changed")
+        result.sort(key=lambda entry: entry["path"])
+        require(result == expected, "source repository inventory differs from its receipt")
+        return result
+    finally:
+        active.remove(commit)
+
 def verify(root, evidence):
     require(isinstance(evidence, dict) and evidence.get("schema_version") == 1 and evidence.get("kind") == "dsr-xwin-source", "invalid source receipt")
-    git_blobs = {}
-    files = inventory(root, git_blobs)
     expected = evidence.get("files")
-    require(isinstance(expected, list) and all(isinstance(entry, dict) for entry in expected), "invalid source file evidence")
+    require(isinstance(expected, list) and 0 < len(expected) <= MAX_ENTRIES
+            and all(isinstance(entry, dict) for entry in expected), "invalid or oversized source file evidence")
     for entry in expected:
         safe_name(entry.get("path"))
+    git_blobs = {}
+    files = inventory(root, git_blobs)
+    require(len(files) <= MAX_ENTRIES, "oversized source file inventory")
+    budget = {}
     if "primary_path" in evidence:
         require(evidence["primary_path"] == "project", "invalid primary source layout")
         dependencies = evidence.get("dependencies")
@@ -311,14 +590,14 @@ def verify(root, evidence):
             subset = [{**entry, "path": entry["path"][len(name) + 1:]} for entry in files if entry["path"].startswith(name + "/")]
             selected = [{**entry, "path": entry["path"][len(name) + 1:]} for entry in expected if entry["path"].startswith(name + "/")]
             hashes = {path[len(name) + 1:]: digest for path, digest in git_blobs.items() if path.startswith(name + "/")}
-            subset = verify_links(subset, selected, hashes)
+            subset = verify_repository(root / name, subset, selected, hashes, dependency, budget)
             require(subset and digest_files(subset) == dependency["snapshot_sha256"], "sibling source inventory differs from its pin")
         require(len({name.lower() for name in names}) == len(names), "ambiguous sibling names")
         require({p.name for p in root.iterdir()} == {"project", *names}, "source-set namespace differs from plan")
         primary = [{**entry, "path": entry["path"][8:]} for entry in files if entry["path"].startswith("project/")]
         selected = [{**entry, "path": entry["path"][8:]} for entry in expected if entry["path"].startswith("project/")]
         hashes = {path[8:]: digest for path, digest in git_blobs.items() if path.startswith("project/")}
-        primary = verify_links(primary, selected, hashes)
+        primary = verify_repository(root / "project", primary, selected, hashes, evidence, budget)
         require(primary and digest_files(primary) == evidence.get("primary_snapshot_sha256"), "primary source inventory differs from its pin")
         # Per-repository verification above prevents a link escaping its own
         # pin even when a different admitted sibling occupies that destination.
@@ -327,7 +606,7 @@ def verify(root, evidence):
         files = expected
     else:
         require(not evidence.get("dependencies"), "sibling evidence requires a source-set layout")
-        files = verify_links(files, expected, git_blobs)
+        files = verify_repository(root, files, expected, git_blobs, evidence, budget)
     require(digest_files(files) == evidence.get("snapshot_sha256"), "source inventory digest mismatch")
 
 try:
@@ -342,7 +621,8 @@ try:
     require(root.is_absolute() and root.parent.is_dir() and not root.exists() and not root.is_symlink(), "snapshot destination must be a new absolute directory")
     require(receipt.parent.is_dir() and not receipt.exists() and not receipt.is_symlink(), "source receipt destination already exists")
     require(not receipt.resolve().is_relative_to(root.resolve()), "receipt must live outside the source snapshot")
-    primary = inspect_project(project, commit, tag, repo)
+    budget = {}
+    primary = inspect_project(project, commit, tag, repo, budget)
     siblings = []
     if mode == "snapshot-set":
         plan = read_json(Path(sys.argv[8]))
@@ -354,7 +634,7 @@ try:
             sibling_name(name)
             require(name.lower() not in names, "duplicate sibling destination")
             require(isinstance(entry["local_path"], str) and Path(entry["local_path"]).is_absolute(), "sibling checkout must be absolute")
-            selected = inspect_project(entry["local_path"], entry["revision"], None, entry["repo"])
+            selected = inspect_project(entry["local_path"], entry["revision"], None, entry["repo"], budget)
             require(selected["project"] not in projects, "source checkout selected more than once")
             names.add(name.lower())
             projects.add(selected["project"])
@@ -378,7 +658,7 @@ try:
         evidence = write_snapshot(primary, root)
     verify(root, evidence)
     publish(receipt, evidence)
-except (Rejected, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+except (Rejected, OSError, ValueError, KeyError, TypeError, RecursionError, subprocess.SubprocessError) as error:
     print("[xwin-source] " + str(error), file=sys.stderr)
     sys.exit(7 if sys.argv[1] == "verify" else 4)
 PY

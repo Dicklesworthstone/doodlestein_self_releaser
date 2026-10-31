@@ -702,6 +702,14 @@ MSVC libraries, LLVM headers and executable machine check. Source-pinned release
 mode authenticates the committed workspace and locked dependencies and emits
 the existing DSR build manifest with explicit target-triple evidence.
 
+Project submodules, including nested modules inside pinned sibling repositories,
+are staged from their parent gitlinks and locally available Git objects. The
+saved source receipt retains the commit/tree evidence needed to reverify the
+complete snapshot after the original checkouts are gone. Initialize submodules
+before building; missing commits, external Git storage and file links crossing
+repository boundaries are refused. See the [source admission contract](docs/XWIN_BUILD.md)
+for supported storage layouts and limits.
+
 Select this backend with the [pinned build command](docs/XWIN_BUILD.md) or an
 `xwin` job in a [release build plan](docs/RELEASE_BUILDS.md). Each job selects one
 Windows architecture; a plan can build both concurrently, retain a successful
