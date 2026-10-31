@@ -2275,6 +2275,10 @@ cmd_build() {
                 ;;
             --targets)
                 # Allow comma-separated list
+                if [[ "${2:-}" == *[[:cntrl:]]* ]]; then
+                    log_error "Unsupported target list: control characters are not allowed; use comma-separated os/arch targets"
+                    return 4
+                fi
                 IFS=',' read -ra targets <<< "$2"
                 shift 2
                 ;;
@@ -2475,6 +2479,15 @@ EOF
         log_error "Tool '$tool_name' not found in repos.d"
         log_info "Available tools: $(act_list_tools 2>/dev/null | tr '\n' ' ')"
         return 4
+    fi
+
+    # Validate explicit selections before source checks or synchronization.
+    # Reject unsupported pairs rather than spending a build on a target that
+    # the manifest/provenance contract can never admit.
+    if [[ ${#targets[@]} -gt 0 ]]; then
+        local selected_targets_json
+        selected_targets_json=$(printf '%s\0' "${targets[@]}" | jq -Rsc 'split("\u0000")[:-1]') || return 4
+        dsr_platform_validate_targets_json "$selected_targets_json" "selected targets for $tool_name" || return 4
     fi
 
     # Get local path
@@ -3495,29 +3508,6 @@ EOF
                 collect_failed=true
             fi
         done
-    }
-
-    # Final manifest validation must prove both directions: every manifest row
-    # has matching bytes, and every payload actually collected from successful
-    # workers is represented by a manifest row. Without this second check a
-    # collector/manifest naming bug can silently drop one target while the
-    # remaining manifest still verifies perfectly.
-    _build_verify_collected_manifest_coverage() {
-        local manifest="$1" name
-        [[ -f "$manifest" && ! -L "$manifest" ]] || return 4
-        for name in "${!collected_names[@]}"; do
-            case "$name" in
-                *.minisig|*.sig|*.sha256|*.sha512|SHA256SUMS*|*.sbom.*|*.intoto.jsonl)
-                    continue
-                    ;;
-            esac
-            if ! jq -e --arg name "$name" 'any(.artifacts[]?; .name == $name)' \
-                    "$manifest" >/dev/null 2>&1; then
-                log_error "Collected artifact is absent from final manifest: $name"
-                return 4
-            fi
-        done
-        return 0
     }
 
     local -a extra_manifest_entries=()
@@ -4718,9 +4708,10 @@ EOF
     # Packaging may deliberately replace archive bytes. Validate the final
     # inventory after those replacements, before granting publication authority.
     if [[ -f "$manifest_file" ]] && ! $manifest_failed; then
-        _act_verify_collected_manifest "$manifest_file" "$output_dir" || manifest_failed=true
-        if ! $manifest_failed; then
-            _build_verify_collected_manifest_coverage "$manifest_file" || manifest_failed=true
+        if [[ ! -f "$manifest_file" || -L "$manifest_file" ]] ||
+           ! printf '%s\0' "${!collected_names[@]}" |
+                _act_verify_collected_manifest "$manifest_file" "$output_dir" --collected; then
+            manifest_failed=true
         fi
     fi
 
@@ -4856,6 +4847,10 @@ EOF
         echo ""
         if [[ $final_exit -eq 0 && -f "$manifest_file" ]]; then
             log_ok "Manifest: $manifest_file"
+        elif $manifest_failed; then
+            log_warn "Manifest generation or verification failed; artifacts remain non-publishable. See the manifest error above."
+        elif $collect_failed; then
+            log_warn "Artifact collection or packaging failed; artifacts remain non-publishable. See the error above."
         elif [[ $success -gt 0 ]]; then
             log_warn "Manifest withheld until every requested target and packaging step succeeds"
         fi
@@ -12771,10 +12766,14 @@ _dsr_render_artifact_name() {
         case "$os/$arch" in
             linux/amd64) target_triple="x86_64-unknown-linux-gnu" ;;
             linux/arm64) target_triple="aarch64-unknown-linux-gnu" ;;
+            linux/386) target_triple="i686-unknown-linux-gnu" ;;
+            linux/armv7) target_triple="armv7-unknown-linux-gnueabihf" ;;
             darwin/amd64) target_triple="x86_64-apple-darwin" ;;
             darwin/arm64) target_triple="aarch64-apple-darwin" ;;
             windows/amd64) target_triple="x86_64-pc-windows-msvc" ;;
             windows/arm64) target_triple="aarch64-pc-windows-msvc" ;;
+            windows/386) target_triple="i686-pc-windows-msvc" ;;
+            freebsd/amd64) target_triple="x86_64-unknown-freebsd" ;;
             *) target_triple="${os}-${arch}" ;;
         esac
     fi

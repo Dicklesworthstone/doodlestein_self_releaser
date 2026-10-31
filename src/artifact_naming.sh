@@ -111,10 +111,14 @@ _an_default_target_triple() {
     case "$os/$arch" in
         linux/amd64) echo "x86_64-unknown-linux-gnu" ;;
         linux/arm64) echo "aarch64-unknown-linux-gnu" ;;
+        linux/386) echo "i686-unknown-linux-gnu" ;;
+        linux/armv7) echo "armv7-unknown-linux-gnueabihf" ;;
         darwin/amd64) echo "x86_64-apple-darwin" ;;
         darwin/arm64) echo "aarch64-apple-darwin" ;;
         windows/amd64) echo "x86_64-pc-windows-msvc" ;;
         windows/arm64) echo "aarch64-pc-windows-msvc" ;;
+        windows/386) echo "i686-pc-windows-msvc" ;;
+        freebsd/amd64) echo "x86_64-unknown-freebsd" ;;
         *) echo "${os}-${arch}" ;;
     esac
 }

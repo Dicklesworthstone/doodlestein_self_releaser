@@ -4,6 +4,8 @@
 _RELEASE_BUILDS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/guardrails.sh
 source "$_RELEASE_BUILDS_DIR/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+# shellcheck source=src/platforms.sh
+source "$_RELEASE_BUILDS_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 _rbuild_execute() {
     set -uo pipefail
@@ -11,6 +13,7 @@ _rbuild_execute() {
     # The shell may hold DRY_RUN without exporting it. The interpreter must
     # receive the same value that justified bypassing the execution refusal.
     exec env DRY_RUN="${DRY_RUN:-false}" RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-}" \
+        DSR_PLATFORM_PATTERN="$(dsr_platform_pattern)" \
         python3 - "$_RELEASE_BUILDS_DIR" "$@" <<'PY'
 import argparse
 import fcntl
@@ -130,8 +133,11 @@ def integer(value, low, high):
     return type(value) is int and low <= value <= high
 
 def targets(value):
-    require(isinstance(value, list) and value and all(matches(t, r"(linux|darwin|windows)/(amd64|arm64|386)") for t in value)
-            and len(set(value)) == len(value), "invalid or duplicate targets", 4)
+    require(isinstance(value, list) and value, "targets must be a nonempty array", 4)
+    for target in value:
+        require(matches(target, os.environ["DSR_PLATFORM_PATTERN"]),
+                "unsupported build target: " + repr(target) + "; select a supported os/arch target", 4)
+    require(len(set(value)) == len(value), "duplicate build targets", 4)
     return sorted(value)
 
 def variants(value, matrix):

@@ -4,10 +4,12 @@
 # in test_release_provenance_finalize.sh; no live compiler/API/crypto claim.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=scripts/tests/test_release_provenance_finalize.sh
 DSR_PROVENANCE_FIXTURES_ONLY=true source "$HERE/test_release_provenance_finalize.sh"
 INSTALL="$WORK/install"
 mkdir -p "$INSTALL/src"
-cp "$ROOT/src/release_finalize.sh" "$ROOT/src/release_finalize_core.sh" "$ROOT/src/slsa.sh" "$INSTALL/src/"
+cp "$ROOT/src/release_finalize.sh" "$ROOT/src/release_finalize_core.sh" "$ROOT/src/slsa.sh" \
+    "$ROOT/src/platforms.sh" "$INSTALL/src/"
 # The production router has no test override. Use a temporary installation with
 # deterministic modules at the build/collection boundaries, not a second router.
 cat > "$INSTALL/src/release_bundle.sh" <<'BUNDLE'

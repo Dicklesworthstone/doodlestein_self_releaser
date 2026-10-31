@@ -1434,6 +1434,83 @@ YAML
   ! config_validate
 }
 
+test_platform_contract_exact_pairs() {
+  local target matrix
+  for target in linux/amd64 linux/arm64 linux/386 linux/armv7 darwin/amd64 \
+      darwin/arm64 windows/amd64 windows/arm64 windows/386 freebsd/amd64; do
+    dsr_platform_is_supported "$target" || return 1
+    matrix=$(jq -nc --arg target "$target" '[$target]') || return 1
+    dsr_platform_validate_targets_json "$matrix" || return 1
+  done
+  for target in linux/arm linux/ppc64le darwin/386 darwin/armv7 windows/armv7 \
+      freebsd/arm64 freebsd/386 plan9/amd64 linux/x86_64 linux/amd64/extra \
+      ' linux/amd64' 'linux/amd64 ' $'linux/amd64\n'; do
+    dsr_platform_is_supported "$target" && return 1
+    matrix=$(jq -nc --arg target "$target" '["linux/amd64",$target]') || return 1
+    dsr_platform_validate_targets_json "$matrix" && return 1
+  done
+  for matrix in '' 'null' '{}' '[]' '[1]' '["linux/amd64","linux/amd64"]' \
+      '["linux/amd64"] ["linux/arm64"]'; do
+    dsr_platform_validate_targets_json "$matrix" && return 1
+  done
+  return 0
+}
+
+test_platform_contract_matches_json_schemas() {
+  local platforms schemas_dir="$SRC_DIR/../schemas"
+  platforms=$(dsr_platform_list | jq -Rsc 'split("\n") | map(select(length > 0)) | sort') || return 1
+  jq -e --argjson platforms "$platforms" \
+    '(."$defs".platform.enum | sort) == $platforms and
+     .properties.requested_targets.items."$ref" == "#/$defs/platform" and
+     ."$defs".native_build_environment.properties.target."$ref" == "#/$defs/platform" and
+     (."$defs".artifact.properties.target.oneOf | any(."$ref" == "#/$defs/platform"))' \
+    "$schemas_dir/manifest.json" >/dev/null || return 1
+  jq -e --argjson platforms "$platforms" \
+    '(."$defs".build_target.properties.platform.enum | sort) == $platforms' \
+    "$schemas_dir/build-details.json" >/dev/null || return 1
+  jq -e --argjson platforms "$platforms" \
+    '(."$defs".artifact.properties.target.enum | sort) == $platforms' \
+    "$schemas_dir/envelope.json" >/dev/null
+}
+
+test_seven_target_configuration_without_strict_contract() {
+  config_init
+  config_load
+  write_contract_tool_config <<'YAML'
+tool_name: contract-tool
+targets: [linux/amd64, linux/arm64, linux/armv7, darwin/amd64, darwin/arm64, windows/amd64, freebsd/amd64]
+target_triples:
+  linux/armv7: armv7-unknown-linux-gnueabihf
+  freebsd/amd64: x86_64-unknown-freebsd
+YAML
+  config_validate_release_contract contract-tool && config_validate
+}
+
+test_unsupported_configuration_names_target_without_strict_contract() {
+  config_init
+  config_load
+  local output status=0
+  # A registry-only tool must be rejected too; no strict-contract opt-in is
+  # needed to prevent a successful compile with an unpublishable inventory.
+  cat > "$DSR_REPOS_FILE" <<'YAML'
+tools:
+  contract-tool:
+    targets: [linux/amd64, freebsd/arm64]
+YAML
+  output=$(config_validate 2>&1) || status=$?
+  [[ "$status" == 4 && "$output" == *freebsd/arm64* &&
+     "$output" == *'Select supported targets'* ]] || return 1
+  printf 'tools: {}\n' > "$DSR_REPOS_FILE"
+  write_contract_tool_config <<'YAML'
+tool_name: contract-tool
+targets: [linux/amd64, windows/armv7]
+YAML
+  status=0
+  output=$(config_validate 2>&1) || status=$?
+  [[ "$status" == 4 && "$output" == *windows/armv7* &&
+     "$output" == *'Select supported targets'* ]]
+}
+
 test_load_handles_empty_config() {
   config_init
   # Create empty config file
@@ -1532,6 +1609,10 @@ main() {
   run_test "validate_passes_with_init" test_validate_passes_with_init
   run_test "validate_fails_missing_dir" test_validate_fails_missing_dir
   run_test "validate_checks_schema_version" test_validate_checks_schema_version
+  run_test "platform_contract_exact_pairs" test_platform_contract_exact_pairs
+  run_test "platform_contract_matches_json_schemas" test_platform_contract_matches_json_schemas
+  run_test "seven_target_configuration_without_strict_contract" test_seven_target_configuration_without_strict_contract
+  run_test "unsupported_configuration_names_target_without_strict_contract" test_unsupported_configuration_names_target_without_strict_contract
 
   echo ""
   echo "Show Tests:"

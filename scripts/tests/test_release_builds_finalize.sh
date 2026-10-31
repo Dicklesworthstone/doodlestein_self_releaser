@@ -39,7 +39,7 @@ def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 try:
     repo = work/'repo'
     (repo/'src').mkdir(parents=True)
-    for name in ('release_builds.sh','release_bundle.sh','release_finalize.sh','slsa.sh','guardrails.sh'):
+    for name in ('release_builds.sh','release_bundle.sh','release_finalize.sh','slsa.sh','platforms.sh','guardrails.sh'):
         shutil.copyfile(root/'src'/name,repo/'src'/name)
     (repo/'dsr').write_text(r'''#!/usr/bin/env bash
 set -uo pipefail

@@ -2,10 +2,12 @@
 # Install an explicitly selected executable set from local or fetched signed bytes.
 # One managed current symlink activates a complete generation; no payload runs.
 _RELEASE_INSTALL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/platforms.sh
+source "$_RELEASE_INSTALL_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 _release_install_execute() {
     command -v python3 >/dev/null || return 3
-    exec python3 - "$_RELEASE_INSTALL_DIR" "$@" <<'PY'
+    exec python3 - "$_RELEASE_INSTALL_DIR" "$(dsr_platform_pattern)" "$@" <<'PY'
 import argparse
 import fcntl
 import hashlib
@@ -20,6 +22,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+
+PLATFORM_PATTERN = sys.argv.pop(2)
 
 
 class Failure(Exception):
@@ -119,7 +123,8 @@ def recipe(value, contract=None):
     fields = {"schema_version", "target", "executables"}
     need(isinstance(value, dict) and fields <= set(value) <= fields | {"target_triple"} and
          type(value["schema_version"]) is int and value["schema_version"] == 1 and
-         isinstance(value["target"], str) and re.fullmatch(r"(linux|darwin)/(amd64|arm64|386)", value["target"]) and
+         isinstance(value["target"], str) and re.fullmatch(PLATFORM_PATTERN, value["target"]) and
+         not value["target"].startswith("windows/") and
          isinstance(value["executables"], list) and 1 <= len(value["executables"]) <= 64, "invalid installation recipe", 4)
     if "target_triple" in value:
         need(name(value["target_triple"]), "invalid installation compiler target", 4)
@@ -300,8 +305,9 @@ try:
         need(contract_file.stat().st_size <= 1048576, "release contract exceeds size limit", 4)
         contract_pin = digest(contract_file)
     need(public.stat().st_size <= 8192, "public key exceeds size limit", 4)
-    operating_system = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
-    architecture = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386"}.get(platform.machine().lower())
+    operating_system = {"Linux": "linux", "Darwin": "darwin", "FreeBSD": "freebsd"}.get(platform.system())
+    architecture = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386",
+                    "armv7": "armv7", "armv7l": "armv7", "armv7hl": "armv7"}.get(platform.machine().lower())
     need(operating_system is not None and architecture is not None, "unsupported installation host", 3)
     need(selected["target"] == operating_system + "/" + architecture, "recipe target is not the installation host", 4)
     for executable in ("bash", "jq", "minisign"):

@@ -64,8 +64,7 @@
       "description": "Requested build platforms, retained to detect omitted native matrix receipts at release",
       "uniqueItems": true,
       "items": {
-        "type": "string",
-        "pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"
+        "$ref": "#/$defs/platform"
       }
     },
     "build_environments": {
@@ -194,6 +193,11 @@
         }
       }
     },
+    "platform": {
+      "type": "string",
+      "description": "Canonical supported release platform; kept in agreement with src/platforms.sh by regression tests",
+      "enum": ["linux/amd64", "linux/arm64", "linux/386", "linux/armv7", "darwin/amd64", "darwin/arm64", "windows/amd64", "windows/arm64", "windows/386", "freebsd/amd64"]
+    },
     "build_environment": {
       "oneOf": [
         {"$ref": "#/$defs/native_build_environment"},
@@ -206,8 +210,7 @@
       "additionalProperties": false,
       "properties": {
         "target": {
-          "type": "string",
-          "pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"
+          "$ref": "#/$defs/platform"
         },
         "target_triple": {
           "type": "string",
@@ -966,7 +969,7 @@
           "type": "string",
           "description": "Physical target platform, or an additional release asset shared across build targets",
           "oneOf": [
-            {"pattern": "^(linux|darwin|windows)/(amd64|arm64|386)$"},
+            {"$ref": "#/$defs/platform"},
             {"const": "additional"}
           ]
         },

@@ -38,7 +38,8 @@ gnu, musl = cpu + "-unknown-linux-gnu", cpu + "-unknown-linux-musl"
 runtime = work / "runtime"
 runtime.mkdir()
 for name, variable in (("release_install.sh", "RELEASE_INSTALL_TEST_MODULE"), ("slsa.sh", "SLSA_TEST_MODULE"),
-                       ("slsa_remote.sh", "SLSA_REMOTE_TEST_MODULE"), ("packaging.sh", "PACKAGING_TEST_MODULE")):
+                       ("slsa_remote.sh", "SLSA_REMOTE_TEST_MODULE"), ("packaging.sh", "PACKAGING_TEST_MODULE"),
+                       ("platforms.sh", "PLATFORMS_TEST_MODULE")):
     shutil.copy2(os.environ.get(variable, root / "src" / name), runtime / name)
 
 

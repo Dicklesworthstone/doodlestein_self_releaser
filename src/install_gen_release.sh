@@ -2,10 +2,12 @@
 # Generate a self-contained installer using the existing authenticated engines.
 # Policy is data; source bytes come from this installation, never a release URL.
 _INSTALL_GEN_RELEASE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/platforms.sh
+source "$_INSTALL_GEN_RELEASE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 install_gen_release() (
     command -v python3 >/dev/null || return 3
-    exec python3 - "$_INSTALL_GEN_RELEASE_DIR" "$@" <<'PY'
+    exec python3 - "$_INSTALL_GEN_RELEASE_DIR" "$(dsr_platform_pattern)" "$@" <<'PY'
 import argparse
 import ast
 import base64
@@ -20,6 +22,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+
+PLATFORM_PATTERN = sys.argv.pop(2)
 
 
 class Failure(Exception):
@@ -78,7 +82,7 @@ def matches(v, pattern):
     return isinstance(v, str) and re.fullmatch(pattern, v) is not None
 
 
-MODULES = ("release_install.sh", "slsa_remote.sh", "slsa.sh", "packaging.sh", "sbom_release.sh", "sbom.sh", "github.sh")
+MODULES = ("release_install.sh", "slsa_remote.sh", "slsa.sh", "platforms.sh", "packaging.sh", "sbom_release.sh", "sbom.sh", "github.sh")
 # No module code or policy value is interpolated into executable Python/shell.
 # The only substitution is an ASCII base64-encoded JSON literal.
 BOOTSTRAP = r'''#!/usr/bin/env bash
@@ -164,7 +168,7 @@ try:
     need(hashlib.sha256(blob).hexdigest() == BUNDLE_SHA256, "embedded installer data is damaged", 7)
     bundle = json.loads(blob)
     policy = bundle["policy"]
-    expected = {"release_install.sh", "slsa_remote.sh", "slsa.sh", "packaging.sh", "sbom_release.sh", "sbom.sh", "github.sh"}
+    expected = {"release_install.sh", "slsa_remote.sh", "slsa.sh", "platforms.sh", "packaging.sh", "sbom_release.sh", "sbom.sh", "github.sh"}
     need(set(bundle["modules"]) == expected, "embedded engine inventory changed", 7)
     modules = {}
     for name, record in bundle["modules"].items():
@@ -183,8 +187,9 @@ try:
         snapshot = plain(args.snapshot)
         need(snapshot.is_dir(), "snapshot must be a directory")
         need(snapshot != prefix and prefix not in snapshot.parents and snapshot not in prefix.parents, "prefix overlaps snapshot")
-    os_name = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
-    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386"}.get(platform.machine().lower())
+    os_name = {"Linux": "linux", "Darwin": "darwin", "FreeBSD": "freebsd"}.get(platform.system())
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "i386": "386", "i686": "386",
+            "armv7": "armv7", "armv7l": "armv7", "armv7hl": "armv7"}.get(platform.machine().lower())
     need(os_name is not None and arch is not None, "unsupported installation host", 3)
     target = os_name + "/" + arch
     selected = [r for r in policy["recipes"] if r["target"] == target]
@@ -292,8 +297,8 @@ try:
          matches(value["tag"], r"v[0-9]+\.[0-9]+\.[0-9]+(?:[+-][A-Za-z0-9.+-]+)?") and
          matches(value["source_sha"], r"[0-9a-f]{40}") and value["source_sha"] != "0" * 40 and text(value["builder"]),
          "invalid pinned release identity")
-    need(isinstance(value["targets"], list) and 1 <= len(value["targets"]) <= 9 and
-         all(matches(t, r"(linux|darwin|windows)/(amd64|arm64|386)") for t in value["targets"]) and
+    need(isinstance(value["targets"], list) and value["targets"] and
+         all(matches(t, PLATFORM_PATTERN) for t in value["targets"]) and
          len(set(value["targets"])) == len(value["targets"]), "invalid complete target matrix")
     value["targets"].sort()
     for key in optional & set(value):

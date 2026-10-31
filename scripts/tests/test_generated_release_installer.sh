@@ -87,10 +87,10 @@ def generate(expected=0, output=script, selected=policy_file, extra=()):
     check("generation returns its actual exit status", value["exit_code"] == expected)
     return value
 
-def run(expected=0, extra=(), selected=script, dest=prefix, piped=False):
+def run(expected=0, extra=(), selected=script, dest=prefix, piped=False, env=None):
     args = ["bash", "-s", "--"] if piped else ["bash", str(selected)]
     p = subprocess.run([*args, "--prefix", str(dest), *extra], input=selected.read_bytes() if piped else None,
-                       capture_output=True, timeout=40)
+                       capture_output=True, timeout=40, env=env)
     (case / "runtime.stdout").write_bytes(p.stdout)
     (case / "runtime.stderr").write_bytes(p.stderr)
     if p.returncode != expected:
@@ -191,12 +191,87 @@ finally:
     (case / "offline-policy.json").rename(policy_file)
     (case / "offline-key.pub").rename(key)
 
+# A generated installer and its embedded engine must agree on host identity.
+# Only platform.system/machine are simulated; the complete signed snapshot,
+# archive extraction, digest checks, recipe binding and activation are real.
+# Payload execution on a foreign architecture is deliberately not attempted.
+for target, system, machine, triple in (
+    ("linux/armv7", "Linux", "armv7l", "armv7-unknown-linux-gnueabihf"),
+    ("freebsd/amd64", "FreeBSD", "amd64", "x86_64-unknown-freebsd"),
+):
+    label = target.replace("/", "-")
+    host_fixture = case / (label + "-host")
+    host_fixture.mkdir()
+    (host_fixture / "sitecustomize.py").write_text(
+        "# Test-only host identity fixture. No production verifier is replaced.\nimport platform\n"
+        "platform.system = lambda: " + repr(system) + "\nplatform.machine = lambda: " + repr(machine) + "\n")
+    host_env = dict(os.environ, PYTHONPATH=str(host_fixture))
+    foreign_snapshot = case / (label + "-snapshot")
+    shutil.copytree(snapshot, foreign_snapshot)
+    manifest = json.loads((case / "build.json").read_text())
+    manifest["requested_targets"] = [target if t == "linux/amd64" else t for t in manifest["requested_targets"]]
+    for asset in manifest["artifacts"]:
+        if asset["target"] == "linux/amd64":
+            asset.update(target=target, target_triple=triple)
+        else:
+            asset["target_triple"] = "aarch64-pc-windows-msvc"
+    manifest["required_variants"] = [dict(target=target, target_triple=triple),
+                                     dict(target="windows/arm64", target_triple="aarch64-pc-windows-msvc")]
+    foreign_manifest = case / (label + "-build.json")
+    save(foreign_manifest, manifest)
+    proof = foreign_snapshot / "release.intoto.jsonl"
+    with proof.open("wb") as out:
+        subprocess.run(["bash", "-c", 'source "$1/slsa.sh"; _slsa_manifest_statement "$2" owner/demo dsr:test',
+            "_", str(install / "src"), str(foreign_manifest)], stdout=out, check=True)
+    (foreign_snapshot / "release.intoto.jsonl.minisig").write_text(key.read_text().splitlines()[1] + ":" + digest(proof) + "\n")
+    foreign_policy = copy.deepcopy(policy)
+    foreign_policy["targets"] = [target if t == "linux/amd64" else t for t in foreign_policy["targets"]]
+    foreign_policy["recipes"][0].update(target=target, target_triple=triple)
+    selected_policy, selected_script = case / (label + "-policy.json"), case / (label + "-install.sh")
+    save(selected_policy, foreign_policy)
+    generate(output=selected_script, selected=selected_policy)
+    foreign_prefix = case / (label + "-prefix")
+    foreign_result = run(selected=selected_script, dest=foreign_prefix, env=host_env,
+                         extra=("--snapshot", str(foreign_snapshot)))
+    check(target + " standalone installer authenticates and activates its exact compiler variant",
+          foreign_result["authenticated"] and foreign_result["activated"] and
+          foreign_result["target_triple"] == triple and
+          json.loads((foreign_prefix / "current/receipt.json").read_text())["target"] == target)
+    check(target + " installation preserves every selected executable",
+          {p.name for p in (foreign_prefix / "current/bin").iterdir()} == {"demo", "helper", "raw"} and
+          (foreign_prefix / "current/bin/demo").read_bytes() == (case / "payload/demo").read_bytes())
+    retained_pointer = os.readlink(foreign_prefix / "current")
+    unselected = foreign_snapshot / "artifacts/demo-windows.exe"
+    unselected.write_bytes(unselected.read_bytes() + b"changed unselected platform")
+    run(1, selected=selected_script, dest=foreign_prefix, env=host_env,
+        extra=("--snapshot", str(foreign_snapshot)))
+    check(target + " still authenticates unselected platforms before changing activation",
+          os.readlink(foreign_prefix / "current") == retained_pointer)
+
+# The complete allowlist is no longer limited by the old nine-element product.
+all_platforms = ["linux/amd64", "linux/arm64", "linux/386", "linux/armv7", "darwin/amd64", "darwin/arm64",
+                 "windows/amd64", "windows/arm64", "windows/386", "freebsd/amd64"]
+complete = copy.deepcopy(policy)
+complete["targets"] = all_platforms
+complete["recipes"] = []
+for target in all_platforms:
+    if not target.startswith("windows/"):
+        selected_recipe = copy.deepcopy(policy["recipes"][0])
+        selected_recipe["target"] = target
+        complete["recipes"].append(selected_recipe)
+save(case / "complete-policy.json", complete)
+complete_result = generate(output=case / "complete-install.sh", selected=case / "complete-policy.json")
+check("all supported platform pairs fit one authenticated installer policy", len(complete_result["targets"]) == 7)
+
 # Invalid independent selections fail before creating an installer file/lock.
 for label, change in (
     ("zero-source", lambda p: p.update(source_sha="0"*40)),
     ("unknown-field", lambda p: p.update(command="touch bad")),
     ("null-recipes", lambda p: p.update(recipes=None)),
     ("duplicate-target", lambda p: p["targets"].append("linux/amd64")),
+    ("unsupported-pair", lambda p: p["targets"].append("freebsd/armv7")),
+    ("unsupported-recipe", lambda p: p["recipes"][0].update(target="windows/armv7")),
+    ("target-with-newline", lambda p: p["targets"].append("linux/armv7\n")),
     ("missing-host-recipe", lambda p: p["targets"].append("darwin/arm64")),
     ("duplicate-recipe", lambda p: p["recipes"].append(copy.deepcopy(p["recipes"][0]))),
     ("unsafe-name", lambda p: p["recipes"][0]["executables"][0].update(name="../bad")),

@@ -7,7 +7,7 @@ DSR_SNAPSHOT_FIXTURES_ONLY=true source "$HERE/test_slsa_snapshot.sh"
 new_case online-install
 INSTALL="$CASE/installation"
 mkdir -p "$INSTALL/src"
-for module in release_install slsa_remote slsa; do
+for module in release_install slsa_remote slsa platforms; do
     cp "$ROOT/src/$module.sh" "$INSTALL/src/" || exit 1
 done
 # Only the transport module is substituted; both authenticators and the

@@ -8,6 +8,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 source "$ROOT/scripts/test_groups.sh"
 source "$ROOT/src/slsa.sh"
 source "$ROOT/src/release_payloads.sh"
+# Keep pure handoff identity helpers real; fixture adapters below replace only
+# dispatch delivery, authentication and retained-state observations.
+source "$ROOT/src/dispatch.sh"
 # Use the real local record routines; these are not a remote service boundary.
 # shellcheck source=src/release_integrity.sh
 source "${RI_TEST_MODULE:-$ROOT/src/release_integrity.sh}"

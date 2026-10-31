@@ -1241,6 +1241,24 @@ Tool configuration lives in two places with distinct roles:
 
 ### Build target derivation and the Linux glibc floor
 
+DSR uses one supported platform contract across configuration, build manifests,
+packaging, installers, release bundles and SLSA provenance:
+
+| Operating system | Canonical architectures |
+|------------------|-------------------------|
+| Linux | `amd64`, `arm64`, `386`, `armv7` |
+| macOS (`darwin`) | `amd64`, `arm64` |
+| Windows | `amd64`, `arm64`, `386` |
+| FreeBSD | `amd64` |
+
+These are exact pairs, not an arbitrary combination of OS and architecture.
+For example, `linux/armv7` and `freebsd/amd64` are supported, while
+`darwin/386`, `windows/armv7`, and `freebsd/arm64` are rejected with exit 4
+during configuration validation, before source synchronization or compilation.
+The error names the rejected target and lists supported replacements. Compiler
+availability and native/cross-build host configuration remain prerequisites;
+support in this contract does not provision a compiler or host automatically.
+
 Native Go builds derive `GOOS` and `GOARCH` from the requested platform, so a
 generic `go build` recipe produces the requested architecture. The `armv7`
 alias resolves to `GOARCH=arm`, `GOARM=7`. Platform env values override global
@@ -1254,7 +1272,8 @@ For Rust tools the runner derives `CARGO_BUILD_TARGET` from
 the platform's `cross_compile` env does not set one, so every build is
 explicit about its target and the artifact collector always looks where cargo
 wrote. Collected binaries are validated against the requested platform's
-executable format (ELF/Mach-O/PE + machine type) before packaging — a
+executable format (ELF/Mach-O/PE + machine type, with Linux/FreeBSD ELF OS ABI)
+before packaging — a
 wrong-architecture artifact fails the build instead of shipping. Build
 commands can branch on `DSR_TARGET_OS` / `DSR_TARGET_ARCH` /
 `DSR_TARGET_PLATFORM` / `DSR_TARGET_TRIPLE` without parsing paths. Opt out of

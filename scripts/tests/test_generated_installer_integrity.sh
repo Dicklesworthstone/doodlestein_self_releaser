@@ -1193,6 +1193,39 @@ UNAME
     set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"
 fi
 
+# Exercise the actual generated entry point with only uname simulated. The
+# owned shell payload is never a claim that foreign machine code ran here.
+mkdir -p "$work/new-platform"
+cat > "$work/new-platform/uname" <<'UNAME'
+#!/usr/bin/env bash
+case "${1:-}" in
+    -m) printf '%s\n' "$DSR_TEST_HOST_ARCH" ;;
+    *) printf '%s\n' "$DSR_TEST_HOST_OS" ;;
+esac
+UNAME
+chmod +x "$work/new-platform/uname"
+for host in 'Linux:armv7l:linux/armv7:armv7-unknown-linux-gnueabihf' \
+    'FreeBSD:amd64:freebsd/amd64:x86_64-unknown-freebsd'; do
+    IFS=: read -r fixture_os fixture_arch fixture_target fixture_triple <<< "$host"
+    platform_asset="demo-1.2.3-${fixture_target%/*}-${fixture_target#*/}.tar.gz"
+    tar -czf "$REMOTE/$platform_asset" -C "$work/payload" demo || exit 1
+    platform_hash=$(sha256sum < "$REMOTE/$platform_asset" | awk '{print $1}')
+    set_manifest "$platform_hash  $platform_asset"
+    DSR_TEST_HOST_OS="$fixture_os" DSR_TEST_HOST_ARCH="$fixture_arch" PATH="$work/new-platform:$PATH" run_install
+    check "$fixture_target installs its verified platform archive" success
+    check "$fixture_target selects its compiler triple" grep -q "Target: $fixture_triple" "$case_dir/err"
+    check "$fixture_target installed bytes retain their checksum" cmp -s "$work/payload/demo" "$case_dir/bin/demo"
+    set_manifest "$(printf '%064d' 0)  $platform_asset"
+    DSR_TEST_HOST_OS="$fixture_os" DSR_TEST_HOST_ARCH="$fixture_arch" PATH="$work/new-platform:$PATH" run_install
+    check "$fixture_target still refuses incorrect checksums" blocked
+done
+set_manifest "$(sha256sum < "$REMOTE/$asset" | awk '{print $1}')  $asset"
+: > "$CALLS"
+DSR_TEST_HOST_OS=FreeBSD DSR_TEST_HOST_ARCH=armv7l PATH="$work/new-platform:$PATH" run_install
+check 'unsupported FreeBSD/ARMv7 is rejected before download' blocked
+check 'unsupported pair performs no transport calls' test ! -s "$CALLS"
+check 'unsupported pair is identified precisely' grep -q 'Unsupported platform: freebsd/armv7' "$case_dir/err"
+
 # Piped (`curl | bash`): --help still prints the usage, and replacing an
 # existing binary without a terminal says to use --yes instead of failing mute.
 help_out=$(bash -s -- --help < "$installer" 2>&1)
@@ -1222,7 +1255,8 @@ if command -v yq >/dev/null && command -v jq >/dev/null; then
     for selection in "scalar:tar.xz:$format_host" "scalar:tgz:$format_host" \
         "scalar:zip:$format_host" "scalar:binary:$format_host" \
         'scalar:binary:windows/amd64' "map:binary:$format_host" \
-        'map:binary:windows/amd64' "partial:zip:$format_host"; do
+        'map:binary:windows/amd64' "partial:zip:$format_host" \
+        'scalar:tar.xz:freebsd/amd64' 'map:tar.xz:freebsd/amd64'; do
         shape="${selection%%:*}"
         rest="${selection#*:}"
         configured="${rest%%:*}"
@@ -1234,8 +1268,8 @@ if command -v yq >/dev/null && command -v jq >/dev/null; then
             'binary_name: demo' 'artifact_naming: ${name}-${version}-${os}-${arch}' > "$format_config"
         case "$shape" in
             scalar) printf 'archive_format: %s\n' "$configured" >> "$format_config" ;;
-            map) printf 'archive_format:\n  linux: %s\n  darwin: %s\n  windows: %s\n' \
-                "$configured" "$configured" "$configured" >> "$format_config" ;;
+            map) printf 'archive_format:\n  linux: %s\n  darwin: %s\n  windows: %s\n  freebsd: %s\n' \
+                "$configured" "$configured" "$configured" "$configured" >> "$format_config" ;;
             partial) printf 'archive_format:\n  windows: %s\n' "$configured" >> "$format_config" ;;
         esac
         status=0
@@ -1299,6 +1333,11 @@ else
 fi
 
 test_strict_contract_installers || exit 1
+# The strict refusal cases deliberately install a failing verifier. Retain its
+# evidence outside PATH before the genuine Minisign/Go qualification below.
+if [[ -f "$work/transports/minisign" ]]; then
+    mv "$work/transports/minisign" "$work/failed-signature-verifier" || exit 1
+fi
 test_static_go_routing || exit 1
 test_static_go_installers || exit 1
 printf 'Generated installer integrity: %s passed, %s failed\n' "$passed" "$failed"

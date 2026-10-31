@@ -17,6 +17,9 @@
 
 set -uo pipefail
 
+# shellcheck source=src/platforms.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/platforms.sh" || { return 3 2>/dev/null || exit 3; }
+
 # XDG directories with defaults (respect existing env vars for testing)
 DSR_CONFIG_DIR="${DSR_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dsr}"
 DSR_CACHE_DIR="${DSR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/dsr}"
@@ -1105,6 +1108,18 @@ _config_get_tool_targets_json() {
     printf '%s\n' "$raw_json" | jq -c . 2>/dev/null
 }
 
+# An absent matrix is permitted for source-only tools; an explicitly supplied
+# matrix must be supported even when no strict release contract is enabled.
+config_validate_targets() {
+    local toolname="${1:-}" targets_json
+    targets_json=$(_config_get_tool_targets_json "$toolname") || {
+        _cfg_log_error "Could not parse configured targets for $toolname"
+        return 4
+    }
+    [[ "$targets_json" == null ]] && return 0
+    dsr_platform_validate_targets_json "$targets_json" "targets for $toolname"
+}
+
 # Exact release identities follow native task identities. A singleton retains
 # its physical platform key; multiple configured triples each own a qualified
 # key. Keep the original platform/triple order for scheduling and ownership.
@@ -1114,8 +1129,10 @@ config_get_release_contract_targets_json() {
     local toolname="${1:-}" targets mapping rows
     targets=$(_config_get_tool_targets_json "$toolname") || return 4
     mapping=$(_config_target_triples_json "$toolname") || return 4
-    if ! rows=$(jq -cen --argjson targets "$targets" --argjson mapping "$mapping" '
-        def platform: type == "string" and test("^[a-z0-9]+/[a-z0-9_]+$");
+    dsr_platform_validate_targets_json "$targets" "release targets for $toolname" || return 4
+    if ! rows=$(jq -cen --argjson targets "$targets" --argjson mapping "$mapping" \
+        --arg platform_pattern "$(dsr_platform_pattern)" '
+        def platform: type == "string" and (test("[\u0000-\u001f\u007f]") | not) and test($platform_pattern);
         def triple: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and
             (contains("..") | not);
         def variants:
@@ -1168,6 +1185,7 @@ config_validate_release_contract() {
     local toolname="${1:-}"
     local contract_json targets_json identities_json
 
+    config_validate_targets "$toolname" || return 4
     contract_json=$(config_get_release_contract_json "$toolname") || return $?
     # Target triples decide release asset names with or without a contract;
     # every build, release and `config validate` passes through here.
@@ -1427,8 +1445,8 @@ config_validate_target_triples() {
         return 4
     fi
     while IFS= read -r platform; do
-        if [[ ! "$platform" =~ ^[a-z0-9]+/[a-z0-9_]+$ ]]; then
-            _cfg_log_error "Invalid target_triples platform for $toolname: $platform (expected os/arch)"
+        if ! dsr_platform_is_supported "$platform"; then
+            _cfg_log_error "Unsupported target_triples platform for $toolname: $platform (select a supported os/arch target)"
             return 4
         fi
         triples=$(config_get_target_triples "$toolname" "$platform") || return 4
@@ -1721,6 +1739,6 @@ export -f _config_target_triples_json config_get_target_triples config_get_targe
 export -f _config_gnu_target_selector_rows_json config_validate_gnu_target_suffixes
 export -f _config_literal_target_words _config_reject_gnu_target_suffix
 export -f config_get_linux_libc_fallback
-export -f config_get_release_contract_json config_validate_release_contract
+export -f config_get_release_contract_json config_validate_release_contract config_validate_targets
 export -f config_get_release_contract_targets_json config_get_release_contract_target_key
 export -f config_get_release_source_dependencies_json

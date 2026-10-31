@@ -256,6 +256,82 @@ if fixture:
 wrong=work/'bad-signature';shutil.copytree(snapshot,wrong)
 (wrong/'release.intoto.jsonl.minisig').write_text('not a signature\n')
 verify(wrong,expected=1,label='signature failure remains terminal')
+
+# Issue #47: the complete NTM matrix must cross both independent contract
+# parsers and the signed-provenance boundary without omitting ARMv7 or FreeBSD.
+# These are named payload fixtures; genuine cross-compilation is qualified by
+# test_native_artifact_build.sh and test_native_release_recovery.sh.
+issue_targets=['linux/amd64','linux/arm64','linux/armv7','darwin/amd64',
+               'darwin/arm64','windows/amd64','freebsd/amd64']
+issue_snapshot=work/'seven-target-snapshot'
+issue_assets=issue_snapshot/'artifacts';issue_assets.mkdir(parents=True)
+issue_artifacts=[]
+for target in issue_targets:
+    payload=issue_assets/('app-'+target.replace('/','-'))
+    payload.write_text('owned release payload for '+target+'\n')
+    issue_artifacts.append(dict(name=payload.name,target=target,archive_format='binary',
+                                sha256=sha(payload),size_bytes=payload.stat().st_size))
+issue_manifest=dict(manifest,requested_targets=issue_targets,artifacts=issue_artifacts,
+                    build_environments=[dict(target=t,method='native',host='cross-host') for t in issue_targets],
+                    summary=dict(total=7,success=7,failed=0))
+issue_manifest_path=save(work/'seven-target-manifest.json',issue_manifest)
+issue_proof=issue_snapshot/'release.intoto.jsonl'
+generated=invoke(['bash',root/'src/slsa.sh','generate-manifest',issue_manifest_path,issue_assets,
+                 '--repository',repo,'--builder',builder,'--output',issue_proof],label='seven-target provenance')
+issue_contract=save(work/'seven-target-contract.json',dict(schema_version=1,required_assets=[
+    {k:a[k] for k in ('name','target','archive_format')} for a in issue_artifacts]))
+described=describe(issue_contract,selected_targets=issue_targets)
+if generated.returncode==0 and described.returncode==0:
+    sign(issue_proof)
+    save(issue_snapshot/'download.json',dict(untrusted=True))
+    issue_policy=['--repo',repo,'--tag',tag,'--sha',pin,'--builder',builder,
+                  '--targets',','.join(issue_targets),'--public-key',public,'--release-contract',issue_contract]
+    checked=invoke(['bash',module,'verify-snapshot',issue_snapshot,*issue_policy],label='signed seven-target snapshot')
+    if checked.returncode==0:
+        evidence=json.loads(checked.stdout)
+        statement=read(issue_proof)
+        check('all seven targets and subjects remain bound to the selected manifest',
+              evidence['authenticated'] is True and len(evidence['artifacts'])==7 and
+              statement['predicate']['buildDefinition']['externalParameters']['targets']==sorted(issue_targets) and
+              {s['name'] for s in statement['subject']}=={a['name'] for a in issue_artifacts} and
+              statement['dsr_evidence']['manifest_sha256']==sha(issue_manifest_path))
+    # A complete signature must not authorize different bytes for either new
+    # platform, and failure must never expose an authenticated result.
+    for target in ('linux/armv7','freebsd/amd64'):
+        payload=issue_assets/('app-'+target.replace('/','-'))
+        original=payload.read_bytes();payload.write_bytes(original+b'tampered\n')
+        refused=invoke(['bash',module,'verify-snapshot',issue_snapshot,*issue_policy],1,
+                       'tampered '+target+' payload')
+        check('tampered '+target+' produces no authenticated success',not refused.stdout)
+        payload.write_bytes(original)
+
+for rejected in ('freebsd/arm64','freebsd/armv7','darwin/386','windows/armv7','linux/riscv64','linux/armv7\n'):
+    # Both platform-only policy and exact contract admission must use the same
+    # supported pairs; adding an OS must not accidentally admit its product
+    # with every known architecture.
+    selected=[*issue_targets[:-1],rejected]
+    describe(issue_contract,expected=4,selected_targets=selected)
+    refused=invoke(['bash',module,'verify-snapshot',issue_snapshot,'--repo',repo,'--tag',tag,'--sha',pin,
+                    '--builder',builder,'--targets',','.join(selected),'--public-key',public],4,
+                   'unsupported snapshot target '+repr(rejected))
+    check('unsupported target emits no snapshot receipt',not refused.stdout)
+    invalid_manifest=copy.deepcopy(issue_manifest)
+    invalid_manifest['requested_targets']=selected
+    invalid_manifest['artifacts'][-1]['target']=rejected
+    invalid_manifest['build_environments'][-1]['target']=rejected
+    candidate=save(work/('unsupported-target-%d.json'%calls),invalid_manifest)
+    refused=invoke(['bash',root/'src/slsa.sh','generate-manifest',candidate,issue_assets,
+                    '--repository',repo,'--builder',builder,'--output',work/('unsupported-proof-%d'%calls)],4,
+                   'unsupported manifest target '+repr(rejected))
+    check('unsupported target emits no provenance receipt',not refused.stdout)
+
+missing=copy.deepcopy(issue_manifest)
+missing['artifacts']=[a for a in missing['artifacts'] if a['target']!='freebsd/amd64']
+missing['build_environments']=[e for e in missing['build_environments'] if e['target']!='freebsd/amd64']
+missing['summary']=dict(total=6,success=6,failed=0)
+invoke(['bash',root/'src/slsa.sh','generate-manifest',save(work/'missing-freebsd.json',missing),issue_assets,
+        '--repository',repo,'--builder',builder,'--output',work/'incomplete-seven-proof'],4,
+       'six successful targets cannot attest the requested seven-target release')
 summary=dict(passed=passed,failed=failed,signer='fixture' if fixture else 'minisign',remote_transport='local callback fixtures',work=str(work))
 save(work/'summary.json',summary)
 # Do not distribute ephemeral private signing keys as validation evidence.

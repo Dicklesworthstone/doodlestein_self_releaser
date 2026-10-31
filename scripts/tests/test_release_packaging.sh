@@ -156,6 +156,9 @@ try:
         ("explicit-null", lambda p: p["artifacts"][0].update(aliases=None)),
         ("shell-command", lambda p: p["artifacts"][0].update(command="echo unsafe")),
         ("empty-members", lambda p: p["artifacts"][0].update(members=[])),
+        ("unsupported-os", lambda p: p["artifacts"][0].update(target="plan9/amd64")),
+        ("unsupported-pair", lambda p: p["artifacts"][0].update(target="freebsd/armv7")),
+        ("target-with-newline", lambda p: p["artifacts"][0].update(target="linux/armv7\n")),
     ):
         bad = copy.deepcopy(selected); mutate(bad); write(work / "bad.json", bad)
         folder = work / title
@@ -178,6 +181,39 @@ try:
     (incoming / "helper").write_bytes(b"corrupt")
     run(work / "corrupt-producer", 1)
     (incoming / "helper").write_bytes(saved)
+    # Newly admitted platforms use the same pinned producer/archive path. The
+    # payload is an owned byte fixture; no claim of native foreign execution.
+    for target, triple in (("linux/armv7", "armv7-unknown-linux-gnueabihf"),
+                           ("freebsd/amd64", "x86_64-unknown-freebsd")):
+        label = target.replace("/", "-")
+        folder = work / label
+        files = work / (label + "-producer")
+        files.mkdir()
+        shutil.copy2(incoming / "app", files / "app")
+        asset = dict(name="app", target=target, target_triple=triple, archive_format="binary",
+                     sha256=sha(files / "app"), size_bytes=(files / "app").stat().st_size)
+        foreign = copy.deepcopy(producer)
+        foreign.update(summary=dict(total=1, success=1, failed=0), requested_targets=[target],
+                       artifacts=[asset], build_environments=[],
+                       required_assets=[{k: asset[k] for k in ("name", "target", "target_triple", "archive_format")}])
+        selected_manifest = work / (label + "-producer.json")
+        write(selected_manifest, foreign)
+        archive = "demo-" + label + ".tar.gz"
+        selected_recipe = work / (label + "-recipe.json")
+        write(selected_recipe, dict(schema_version=1, artifacts=[dict(name=archive, target=target,
+            target_triple=triple, archive_format="tar.gz", members=[dict(source="app", path="demo")])]))
+        result = run(folder, recipe=selected_recipe, src=selected_manifest, pin=sha(selected_manifest), files=files)
+        retained = read(Path(result["manifest"]))
+        check(target + " remains publishable with its exact compiler identity", result["publishable"] and
+              retained["requested_targets"] == [target] and retained["artifacts"][0]["target"] == target and
+              retained["artifacts"][0]["target_triple"] == triple)
+        with tarfile.open(Path(result["artifacts_dir"]) / archive) as packaged:
+            check(target + " archive preserves verified producer bytes", packaged.getnames() == ["demo"] and
+                  packaged.extractfile("demo").read() == (files / "app").read_bytes())
+        (files / "app").write_bytes(b"changed producer")
+        run(work / (label + "-corrupt"), 1, recipe=selected_recipe, src=selected_manifest,
+            pin=sha(selected_manifest), files=files)
+        check(target + " still refuses a changed producer", not (work / (label + "-corrupt/release")).exists())
     # Revalidated output is immutable: reject rather than repair drift.
     for relative in ("artifacts/demo-linux", "source/artifacts/app", "build-manifest.json", "result.json", "recipe.json"):
         file = out / "release" / relative
