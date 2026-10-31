@@ -193,6 +193,16 @@ collects its additional files from its first configured triple. Primary
 executables and `workspace_binaries` retain their existing target architecture
 and executable checks.
 
+Ordinary `dsr release` also preserves these literal names. A declared companion
+must belong to its configured platform and, when target triples are configured,
+the first triple. Words such as `gnu` or `musl` in a companion name are ordinary
+filename text; they do not identify its ABI. Archive companions keep their own
+names instead of claiming the primary executable's archive aliases. The usual
+explicit `target_triple` requirement still applies to platforms with multiple
+configured variants, and primary executable names still undergo variant checks.
+Manifest hashes, complete inventory validation and upload collision checks apply
+to both primary artifacts and companions.
+
 Checksum, signature, SBOM and provenance names belong to the existing release
 metadata generators. Additional declarations cannot use `.sha256`, `.sha512`,
 `.sig` or `.minisig` suffixes, `SHA256SUMS*`, `checksums.txt`, `*.sbom.*`, or
@@ -233,6 +243,11 @@ the focused collection and manifest regressions, and
 coverage. These use real file content and production validators with controlled
 SSH/compiler transport; they do not claim a native Windows build or installer
 execution.
+
+For ordinary release planning, run
+`DSR_RELEASE_RESUME_TEST_FILTER='^test_literal_companion_' bash scripts/tests/test_release_resume.sh`.
+These dry-run command tests use byte-bound manifest fixtures and the production
+configuration, naming and inventory validators, without remote requests.
 
 ## Git-aware ordinary source synchronization
 
