@@ -7070,9 +7070,115 @@ _source_release_scan_created() {
     return 7
 }
 
+# Publish each receipt transition atomically. In particular, a controller that
+# stops after GitHub accepts publication must retain the complete ID-bound
+# pending record, rather than a truncated terminal JSON file.
+_source_release_save_receipt() {
+    local file="$1" directory="$2" tool="$3" tag="$4" fingerprint="$5" record="$6"
+    [[ "${file##*/}" == "$tool-$tag.json."* ]] || return 7
+    if ! printf '%s\n' "$record" | python3 -I -c '
+import hashlib
+import json
+import os
+import secrets
+import stat
+import sys
+
+if not __debug__:
+    raise SystemExit("Source-only receipt updates require enabled predicates")
+
+def identity(value):
+    return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns,
+            value.st_ctime_ns, value.st_mode, value.st_uid, value.st_nlink]
+
+def contents(descriptor, size):
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    data = b""
+    while len(data) < size:
+        chunk = os.read(descriptor, min(65536, size - len(data)))
+        assert chunk
+        data += chunk
+    return data
+
+directory_fd = receipt_fd = temporary_fd = None
+try:
+    path, directory = map(os.path.abspath, sys.argv[1:3])
+    expected = json.loads(sys.argv[3])
+    assert os.path.dirname(path) == directory and os.path.realpath(directory) == directory
+    assert getattr(os, "O_NOFOLLOW", 0) and getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    parent = os.fstat(directory_fd)
+    assert stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.geteuid()
+    assert not parent.st_mode & 0o022
+    directory_identity = [parent.st_dev, parent.st_ino, parent.st_mode, parent.st_uid]
+    name = os.path.basename(path)
+    receipt_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    before = os.fstat(receipt_fd)
+    assert stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
+    assert stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1
+    assert 0 <= before.st_size <= 1048576
+    previous = contents(receipt_fd, before.st_size)
+    if expected is None:
+        assert before.st_size == 0
+    else:
+        assert {"identity": identity(before), "directory_identity": directory_identity,
+                "sha256": hashlib.sha256(previous).hexdigest()} == expected
+    data = sys.stdin.buffer.read(1048577)
+    assert 0 < len(data) <= 1048576 and isinstance(json.loads(data), dict)
+    for unused in range(16):
+        temporary = ".source-only-" + secrets.token_hex(16)
+        try:
+            temporary_fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                   0o600, dir_fd=directory_fd)
+            break
+        except FileExistsError:
+            continue
+    assert temporary_fd is not None
+    with os.fdopen(temporary_fd, "wb", closefd=False) as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    written = os.fstat(temporary_fd)
+    assert stat.S_ISREG(written.st_mode) and written.st_uid == os.geteuid()
+    assert stat.S_IMODE(written.st_mode) == 0o600 and written.st_nlink == 1
+    assert written.st_size == len(data) and contents(temporary_fd, written.st_size) == data
+    assert identity(os.fstat(temporary_fd)) == identity(written)
+    assert identity(os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)) == identity(written)
+    assert identity(os.fstat(receipt_fd)) == identity(before)
+    assert identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) == identity(before)
+    named_parent = os.lstat(directory)
+    assert [named_parent.st_dev, named_parent.st_ino, named_parent.st_mode,
+            named_parent.st_uid] == directory_identity
+    os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    os.fsync(directory_fd)
+    after = os.fstat(temporary_fd)
+    assert (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink, after.st_size) == (
+        written.st_dev, written.st_ino, written.st_mode, written.st_uid, 1, len(data))
+    assert contents(temporary_fd, after.st_size) == data
+    assert identity(os.fstat(temporary_fd)) == identity(after)
+    assert identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)) == identity(after)
+    named_parent = os.lstat(directory)
+    assert [named_parent.st_dev, named_parent.st_ino, named_parent.st_mode,
+            named_parent.st_uid] == directory_identity
+    print(json.dumps({"identity": identity(after), "directory_identity": directory_identity,
+                      "sha256": hashlib.sha256(data).hexdigest()}))
+except (OSError, ValueError, AssertionError):
+    raise SystemExit("Could not atomically retain the private source-only recovery receipt")
+finally:
+    for descriptor in (temporary_fd, receipt_fd, directory_fd):
+        if descriptor is not None:
+            os.close(descriptor)
+' "$file" "$directory" "$fingerprint"; then
+        return 7
+    fi
+    return 0
+}
+
 cmd_release_source_only() {
     local tool="" version="" exact_tag="" notes="" no_dispatch=false draft=false prerelease=false
     local resume_receipt="" saved_receipt="" saved_sha="" saved_fingerprint="" resume_release_id=""
+    local draft_explicit=false publish_draft=false requested_draft=false publication_requested=true
+    local observed_draft=true publication_attempted=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --tag)
@@ -7085,7 +7191,8 @@ cmd_release_source_only() {
                 [[ $# -ge 2 && "$2" == /* ]] || return 4
                 resume_receipt="$2"; shift 2 ;;
             --no-dispatch) no_dispatch=true; shift ;;
-            --draft) draft=true; shift ;;
+            --draft) draft=true; draft_explicit=true; shift ;;
+            --publish-draft) publish_draft=true; shift ;;
             --prerelease) prerelease=true; shift ;;
             --help|-h)
                 cat <<'EOF'
@@ -7096,7 +7203,10 @@ Publishes an installer/source-only GitHub Release with exactly zero assets.
 Requires publication_mode: source-only in repos.d, a clean exact tagged checkout,
 the same peeled tag on GitHub, and explicit reviewed notes. Always verifies an
 owned draft before publication. --draft, --prerelease, and global --dry-run work.
-Use --resume-receipt /absolute/path to recover your private pending draft record.
+Use --resume-receipt /absolute/path to recover a private pending or success record.
+Plain resume preserves saved draft intent and verifies an already-public release
+without publishing again. Add --publish-draft to explicitly promote a retained
+draft; it requires --resume-receipt and cannot be combined with --draft.
 Use --tag instead of a version for a single-component crate or workspace tag.
 Binary artifact, resume, upgrade-verification, and dispatch options are refused.
 EOF
@@ -7120,6 +7230,12 @@ EOF
         log_error "Source-only publication requires exactly one version or --tag"
         return 4
     }
+    if $publish_draft && { [[ -z "$resume_receipt" ]] || $draft_explicit; }; then
+        log_error "--publish-draft requires --resume-receipt and cannot be combined with --draft"
+        return 4
+    fi
+    requested_draft="$draft"
+    $draft && publication_requested=false
     _dsr_require github
     _dsr_require git_ops
     _dsr_require act_runner
@@ -7176,6 +7292,9 @@ EOF
     notes_json=$(jq -n --rawfile body "$notes" '{body:$body}') || return 4
     [[ "$(_gh_asset_sha256 "$notes")" == "$notes_sha" ]] || return 4
     local receipt_dir="${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/source-only"
+    if [[ -d "$receipt_dir" && ! -L "$receipt_dir" ]]; then
+        receipt_dir=$(cd "$receipt_dir" && pwd -P) || return 4
+    fi
     local scan="" nonce="" expected="" title="" body="" release="" release_id=""
     scan=$(_release_contract_scan_release_by_tag "$repo" "$tag") || return 7
     if [[ -n "$resume_receipt" ]]; then
@@ -7185,12 +7304,34 @@ EOF
         saved_receipt=$(jq -c '.record' <<< "$saved_receipt") || return 4
         _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" || return 4
         jq -e --arg repo "$repo" --arg notes "$notes_sha" --arg config "$config_sha" \
-            --arg registry "$registry_sha" --argjson draft "$draft" '
-            .publication_mode == "source-only" and .status == "pending" and
+            --arg registry "$registry_sha" --arg tag "$tag" --arg sha "$sha" '
+            .publication_mode == "source-only" and (.status | IN("pending","success")) and
             .repo == $repo and .notes_sha256 == $notes and .config_sha256 == $config and
             ((.registry_sha256 == $registry) or (.registry_sha256 == null and $registry == "absent")) and
-            (.requested_draft == null or .requested_draft == $draft)
+            (.requested_draft == null or (.requested_draft | type == "boolean")) and
+            (.publication_requested == null or (.publication_requested | type == "boolean")) and
+            (.requested_draft != false or .publication_requested != false) and
+            (if .release_id == null then .status == "pending" else
+                (.release_id | type == "number" and floor == . and . > 0 and . <= 9007199254740991) and
+                .tag == $tag and .git_sha == $sha and .asset_count == 0 end) and
+            (if .status == "success" then
+                (.draft | type == "boolean") and
+                (.publication_requested != true or .draft == false)
+             else true end)
         ' <<< "$saved_receipt" >/dev/null || return 4
+        requested_draft=$(jq -r --argjson fallback "$draft" '
+            if (.requested_draft | type) == "boolean" then .requested_draft
+            elif .status == "success" then .draft else $fallback end' <<< "$saved_receipt") || return 4
+        publication_requested=$(jq -r --argjson requested "$requested_draft" '
+            if (.publication_requested | type) == "boolean" then .publication_requested
+            else ($requested | not) end' <<< "$saved_receipt") || return 4
+        if $draft_explicit && { [[ "$requested_draft" != true ]] || [[ "$publication_requested" == true ]]; }; then
+            log_error "--draft conflicts with the saved source-only publication intent"
+            return 4
+        fi
+        $publish_draft && publication_requested=true
+        draft=true
+        [[ "$publication_requested" == true ]] && draft=false
         nonce=$(jq -er '.metadata.body | capture("\\n\\n<!-- dsr-source-only-create:(?<nonce>[0-9a-f]{64}) -->$").nonce' \
             <<< "$saved_receipt") || return 4
         [[ "$(jq -r '.count' <<< "$scan")" == 1 ]] || return 7
@@ -7211,30 +7352,67 @@ EOF
         jq -e --argjson expected "$expected" '.metadata == $expected' <<< "$saved_receipt" >/dev/null || return 4
         release=$(jq -c '.release' <<< "$scan") || return 7
         release_id=$(jq -r '.id // empty' <<< "$release") || return 7
-        [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 7
-        _source_release_metadata_matches "$release" "$expected" "$release_id" true || return 7
-        _source_release_observe "$repo" "$release_id" "$expected" true >/dev/null || return 7
+        jq -e '.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991' \
+            <<< "$release" >/dev/null || return 7
+        if ! jq -e --argjson id "$release_id" '.release_id == null or .release_id == $id' \
+            <<< "$saved_receipt" >/dev/null; then
+            log_error "Source-only release ID differs from its saved creation custody"
+            return 7
+        fi
+        _source_release_metadata_matches "$release" "$expected" "$release_id" any || return 7
+        observed_draft=$(jq -r '.draft' <<< "$release") || return 7
+        if [[ "$observed_draft" == false ]]; then
+            # Legacy pending records can recover their nonce-owned draft, but
+            # never infer a public release ID from a same-tag lookup.
+            if $draft_explicit || ! jq -e --argjson id "$release_id" '.release_id == $id' \
+                <<< "$saved_receipt" >/dev/null; then
+                log_error "Public source-only recovery requires the saved exact release ID and cannot request --draft"
+                return 7
+            fi
+            draft=false
+        fi
+        _source_release_observe "$repo" "$release_id" "$expected" "$observed_draft" >/dev/null || return 7
+        _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" || return 4
+        _source_release_identity "$repo" "$path" "$tag" "$sha" || return 4
+        _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
+            "$registry" "$registry_sha" || return 4
         resume_release_id="$release_id"
     fi
     body=$(jq -r '.body' <<< "$expected") || return 4
     if $DRY_RUN; then
-        log_info "Would publish exact source $sha as $repo $tag with zero assets"
+        if [[ "$observed_draft" == false ]]; then
+            log_info "Would verify public source-only release $repo $tag ($release_id) with zero assets"
+        elif $draft; then
+            log_info "Would retain exact source $sha as private $repo $tag with zero assets"
+        else
+            log_info "Would publish exact source $sha as $repo $tag with zero assets"
+        fi
         $JSON_MODE && json_envelope "release source-only" "success" 0 "$expected"
         return 0
     fi
     mkdir -p "$receipt_dir" || return 7
-    local receipt=""
+    [[ ! -L "$receipt_dir" ]] || return 7
+    receipt_dir=$(cd "$receipt_dir" && pwd -P) || return 7
+    local receipt="" receipt_record="" receipt_fingerprint=null
     receipt=$(mktemp "$receipt_dir/$tool-$tag.json.XXXXXXXX") || return 7
-    jq -n --argjson expected "$expected" --arg repo "$repo" --arg notes_sha "$notes_sha" \
-        --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" --argjson draft "$draft" \
-        --arg resumed_from "$resume_receipt" --arg resumed_sha "$saved_sha" '
+    receipt_record=$(jq -n --argjson expected "$expected" --arg repo "$repo" --arg notes_sha "$notes_sha" \
+        --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" \
+        --argjson requested_draft "$requested_draft" --argjson publication "$publication_requested" \
+        --arg resumed_from "$resume_receipt" --arg resumed_sha "$saved_sha" \
+        --arg release_id "$resume_release_id" --arg tag "$tag" --arg sha "$sha" '
         {publication_mode:"source-only",repo:$repo,metadata:$expected,notes_sha256:$notes_sha,
-         config_sha256:$config_sha,registry_sha256:$registry_sha,requested_draft:$draft,
-         resumed_from:$resumed_from,resumed_receipt_sha256:$resumed_sha,status:"pending"}' \
-        > "$receipt" || return 7
+         config_sha256:$config_sha,registry_sha256:$registry_sha,requested_draft:$requested_draft,
+         publication_requested:$publication,
+         resumed_from:$resumed_from,resumed_receipt_sha256:$resumed_sha,status:"pending"}
+        + (if $release_id == "" then {} else
+            {release_id:($release_id|tonumber),tag:$tag,git_sha:$sha,asset_count:0} end)') || return 7
+    receipt_fingerprint=$(_source_release_save_receipt "$receipt" "$receipt_dir" "$tool" "$tag" \
+        "$receipt_fingerprint" "$receipt_record") || return 7
+    log_info "Retained source-only recovery receipt: $receipt"
     _source_release_identity "$repo" "$path" "$tag" "$sha" || return 4
     _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
         "$registry" "$registry_sha" || return 4
+    _source_release_resume_receipt_matches "$receipt" "$receipt_dir" "$tool" "$tag" "$receipt_fingerprint" || return 4
     # Create only as draft. A transport failure is reconciled by the unique
     # nonce-bound metadata, never by accepting someone else's same-tag draft.
     if [[ -n "$resume_receipt" ]]; then
@@ -7247,44 +7425,66 @@ EOF
     scan=$(_source_release_scan_created "$repo" "$tag") || return 7
     release=$(jq -c '.release' <<< "$scan") || return 7
     release_id=$(jq -r '.id // empty' <<< "$release") || return 7
-    [[ "$release_id" =~ ^[1-9][0-9]*$ ]] || return 7
+    jq -e '.id | type == "number" and floor == . and . > 0 and . <= 9007199254740991' \
+        <<< "$release" >/dev/null || return 7
     [[ -z "$resume_release_id" || "$release_id" == "$resume_release_id" ]] || return 7
-    _source_release_metadata_matches "$release" "$expected" "$release_id" true || return 7
-    if ! _source_release_observe "$repo" "$release_id" "$expected" true >/dev/null ||
+    _source_release_metadata_matches "$release" "$expected" "$release_id" "$observed_draft" || return 7
+    if ! _source_release_observe "$repo" "$release_id" "$expected" "$observed_draft" >/dev/null ||
        ! _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" ||
        ! _source_release_identity "$repo" "$path" "$tag" "$sha" ||
        ! _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
             "$registry" "$registry_sha"; then
-        _source_release_restore_draft "$repo" "$release_id" "$expected" || true
         return 7
     fi
-    if ! $draft; then
+    # Save the original observed ID before any publication PATCH. Recovery of
+    # a public release must match this exact identity as well as the nonce.
+    if [[ -z "$resume_release_id" ]]; then
+        receipt_record=$(jq --argjson id "$release_id" --arg tag "$tag" --arg sha "$sha" \
+            '. + {release_id:$id,tag:$tag,git_sha:$sha,asset_count:0}' <<< "$receipt_record") || return 7
+        receipt_fingerprint=$(_source_release_save_receipt "$receipt" "$receipt_dir" "$tool" "$tag" \
+            "$receipt_fingerprint" "$receipt_record") || return 7
+    fi
+    if ! _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" ||
+       ! _source_release_resume_receipt_matches "$receipt" "$receipt_dir" "$tool" "$tag" "$receipt_fingerprint" ||
+       ! _source_release_identity "$repo" "$path" "$tag" "$sha" ||
+       ! _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
+            "$registry" "$registry_sha"; then
+        return 7
+    fi
+    if ! $draft && [[ "$observed_draft" == true ]]; then
+        publication_attempted=true
         gh_api "repos/$repo/releases/$release_id" --method PATCH --data '{"draft":false}' \
             --no-cache >/dev/null 2>&1 || true
     fi
     if ! release=$(_source_release_observe "$repo" "$release_id" "$expected" "$draft") ||
        ! _source_release_resume_receipt_matches "$resume_receipt" "$receipt_dir" "$tool" "$tag" "$saved_fingerprint" ||
+       ! _source_release_resume_receipt_matches "$receipt" "$receipt_dir" "$tool" "$tag" "$receipt_fingerprint" ||
        ! _source_release_identity "$repo" "$path" "$tag" "$sha" ||
        ! _source_release_inputs_match "$config_file" "$config_sha" "$notes" "$notes_sha" \
             "$registry" "$registry_sha"; then
-        _source_release_restore_draft "$repo" "$release_id" "$expected" || true
+        if $publication_attempted; then _source_release_restore_draft "$repo" "$release_id" "$expected" || true; fi
         return 7
     fi
-    jq -n --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" \
+    receipt_record=$(jq -n --arg repo "$repo" --arg tag "$tag" --arg sha "$sha" \
         --arg notes_sha "$notes_sha" --arg config_sha "$config_sha" --arg registry_sha "$registry_sha" \
+        --argjson requested_draft "$requested_draft" --argjson publication "$publication_requested" \
         --arg resumed_from "$resume_receipt" --arg resumed_sha "$saved_sha" \
         --argjson expected "$expected" --argjson release "$release" '
         {publication_mode:"source-only",repo:$repo,tag:$tag,git_sha:$sha,
          notes_sha256:$notes_sha,config_sha256:$config_sha,registry_sha256:$registry_sha,
          metadata:$expected,asset_count:0,release_id:$release.id,
+         requested_draft:$requested_draft,publication_requested:$publication,
          resumed_from:$resumed_from,resumed_receipt_sha256:$resumed_sha,
          draft:$release.draft,url:$release.html_url,status:"success"}
-    ' > "$receipt" || {
-        _source_release_restore_draft "$repo" "$release_id" "$expected" || true
+    ') || return 7
+    if ! _source_release_save_receipt "$receipt" "$receipt_dir" "$tool" "$tag" \
+        "$receipt_fingerprint" "$receipt_record" >/dev/null; then
+        if $publication_attempted; then _source_release_restore_draft "$repo" "$release_id" "$expected" || true; fi
         return 7
-    }
+    fi
     log_info "Verified source-only release $repo $tag; receipt: $receipt"
-    $JSON_MODE && json_envelope "release source-only" "success" 0 "$(cat "$receipt")"
+    $JSON_MODE && json_envelope "release source-only" "success" 0 \
+        "$(jq --arg receipt "$receipt" '. + {receipt:$receipt}' <<< "$receipt_record")"
     return 0
 }
 

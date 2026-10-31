@@ -33,7 +33,7 @@ helper_text = helper_text.split(test_marker, 1)[0]
 exec(compile(helper_text, str(stock) + ":helper-definitions", "exec"))
 
 EXACT_TAGS = ("fp-types-v0.4.0", "frankenpandas-v0.4.0")
-EXPECTED_CHECKS = 132
+EXPECTED_CHECKS = 144
 seen_checks = set()
 stock_assert_ok = assert_ok
 
@@ -260,6 +260,30 @@ for tag in EXACT_TAGS:
     exact_check(label+' private zero-asset draft receipt', len(receipt) == 1
                 and private_record(case, receipt[0], tag, prerelease=True)
                 and json.loads(receipt[0].read_text())['asset_count'] == 0)
+    original = receipt[0]
+    before, inode = original.read_bytes(), original.stat().st_ino
+    proc, requests = invoke_exact(case, tag, flags=['--prerelease', '--resume-receipt', str(original)])
+    exact_check(label+' plain resume retains private intent', proc.returncode == 0
+                and remote_record(case)['draft'] is True and not has_patch(requests, False))
+    prior_records = set(records(case))
+    proc, requests = invoke_exact(case, tag, flags=['--prerelease', '--resume-receipt', str(original),
+                                                  '--publish-draft'])
+    exact_check(label+' explicit promotion succeeds', proc.returncode == 0
+                and remote_record(case)['draft'] is False and has_patch(requests, False))
+    exact_check(label+' promotion preserves exact tag and source', post_count(requests) == 1
+                and remote_record(case)['id'] == 9 and exact_metadata(case, remote_record(case), tag, True))
+    exact_check(label+' promotion retains original custody', original.read_bytes() == before
+                and original.stat().st_ino == inode)
+    promoted = list(set(records(case)) - prior_records)
+    exact_check(label+' promotion creates linked exact-tag receipt', len(promoted) == 1
+                and private_record(case, promoted[0], tag, prerelease=True)
+                and json.loads(promoted[0].read_text())['resumed_from'] == str(original)
+                and json.loads(promoted[0].read_text())['publication_requested'] is True)
+    prior_requests = len(requests)
+    proc, requests = invoke_exact(case, tag, flags=['--prerelease', '--resume-receipt', str(promoted[0])])
+    exact_check(label+' public retry verifies without mutation', proc.returncode == 0
+                and not any('--post' in request or '--method' in request
+                            for request in requests[prior_requests:]))
 
 for tag in EXACT_TAGS:
     for fault, control in [('delayed', {'delay_created': 2}), ('lost-post', {'lost_post': True})]:

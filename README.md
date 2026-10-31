@@ -820,11 +820,29 @@ the exact crate or workspace tag; it accepts only a single Git ref component
 starting with a letter or digit, using letters, digits, `.`, `_`, `+`, or `-`.
 Both forms require the same clean checkout and local/remote peeled tag identity.
 
-If GitHub temporarily omits a newly created draft from its release list, DSR
-retains the private pending receipt. Retry with the same inputs and
-`--resume-receipt /absolute/path/to/the/receipt`. Recovery verifies the original
-nonce-bound draft and creates no new release; it retains the original receipt
-and records a separate recovery receipt. Ordinary `--resume` remains a binary
+If publication is interrupted, retry with the same inputs and
+`--resume-receipt /absolute/path/to/the/receipt`. DSR accepts its private pending
+or completed receipt, verifies the original release ID and nonce, and creates
+no new release. An already-public release is verified without another publish
+request. The original receipt remains unchanged; each recovery records a
+separate receipt. DSR saves the release ID before requesting publication, so
+recovery also works when GitHub accepted the request but the controller stopped
+before recording success. A legacy pending receipt without an ID can recover
+its owned draft, but cannot adopt a public release by tag alone.
+
+An explicitly requested draft stays private on ordinary receipt recovery.
+Promote it through DSR with the additional explicit option:
+
+```bash
+dsr release source-only example 1.2.3 --notes-file release-notes.md --no-dispatch \
+  --resume-receipt /absolute/path/to/the/receipt --publish-draft
+```
+
+`--publish-draft` requires `--resume-receipt` and conflicts with `--draft`.
+Recovery still requires the same source commit, tag, reviewed notes,
+configuration and prerelease selection, and exactly zero release assets.
+Receipt paths are printed before remote mutation and returned as
+`details.receipt` on JSON success. Ordinary `--resume` remains a binary
 publication option and is refused in source-only mode.
 
 If strict binary creation succeeded but its controller stopped before

@@ -1165,6 +1165,60 @@ concurrent privileged mutation.
 
 ---
 
+### `dsr release source-only`
+
+Publish or recover a release with exactly zero uploaded assets. The repository
+must explicitly select `publication_mode: source-only` in its `repos.d` entry,
+with `tool_name`, `repo` and `local_path`; binary build configuration and a
+conflicting legacy registry entry are refused.
+
+```bash
+dsr release source-only <tool> <version> --notes-file <file> --no-dispatch
+dsr release source-only <tool> --tag <exact-tag> --notes-file <file> --no-dispatch
+dsr release source-only <tool> <version> --notes-file <file> --no-dispatch \
+  --resume-receipt /absolute/path/to/receipt --publish-draft
+```
+
+Choose exactly one version or explicit tag. `--tag` preserves a single Git ref
+component starting with a letter or digit and containing only letters, digits,
+`.`, `_`, `+` or `-`. The clean checkout, local tag and peeled remote tag must
+all identify the same commit. Explicit notes, the configuration and registry
+identity remain bound throughout publication and recovery. `--prerelease`
+selects prerelease metadata; a retry must supply the same selection.
+
+New releases are created as private, uniquely marked drafts. DSR verifies
+their metadata, source identity and empty inventory before publication and
+again after publication. `--draft` keeps a verified draft private. Global
+`--dry-run` performs admission and recovery checks without a POST, PATCH or
+new receipt. Binary artifact, ordinary `--resume`, upgrade and dispatch
+options remain unsupported; `--no-dispatch` is required.
+
+`--resume-receipt` accepts a private pending or successful receipt from
+`$DSR_STATE_DIR/source-only`. It requires the original creation nonce, inputs,
+exact tag/SHA and, when present, exact release ID. The original receipt is
+preserved byte for byte. A separate recovery receipt records the result and
+its predecessor's digest. New checkpoints retain the verified release ID
+before the publication PATCH; retry checkpoints retain a previously verified
+ID from their first write. Receipt transitions are atomic and verify the
+intended private file bytes and identity through replacement.
+
+Plain recovery preserves a saved draft request. Add `--publish-draft` to
+explicitly promote that draft; the option requires `--resume-receipt` and
+cannot accompany `--draft`. A pending promotion retains that publication
+request for the next retry. An already-public release with saved ID-bound
+custody is verified without another creation or publication request, and
+verification failure does not return that existing public release to draft.
+A legacy pending receipt lacking the release ID can recover its nonce-owned
+draft, but cannot establish custody of an already-public release from a tag
+lookup. Changed IDs, metadata, source pins or nonempty assets refuse recovery.
+
+Human output prints the recovery receipt path before remote mutation.
+Successful JSON reports `details.receipt`, `release_id`, `tag`, `git_sha`,
+`draft`, `asset_count: 0`, `requested_draft`, `publication_requested`, and the
+predecessor receipt information. Retain these private receipts between attempts.
+
+---
+
 ### `dsr installer`
 
 Generate and validate standalone installers from registered tool configuration.
