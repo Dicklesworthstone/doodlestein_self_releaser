@@ -7498,6 +7498,7 @@ cmd_release() {
     local generate_notes=false
     local verify_tag=false
     local resume=false
+    local publish_draft=false
     local verify_upgrade=false
     local dispatch_override=""
     local dispatch_event_override=""
@@ -7548,6 +7549,10 @@ cmd_release() {
                 resume=true
                 shift
                 ;;
+            --publish-draft)
+                publish_draft=true
+                shift
+                ;;
             --verify-upgrade)
                 verify_upgrade=true
                 shift
@@ -7590,6 +7595,7 @@ USAGE:
     dsr release <tool> <version>
     dsr release <tool> <version> --artifacts <dir>
     dsr release <tool> <version> --draft
+    dsr release <tool> <version> --resume --publish-draft
     dsr release verify <tool> <version>   (verify existing release)
     dsr release dispatch --outbox <file> (recover a saved downstream handoff)
 
@@ -7603,6 +7609,8 @@ OPTIONS:
     -V, --version <ver>      Version to release (or second positional arg)
     -a, --artifacts <dir>    Directory containing build artifacts
     --draft                  Keep the verified release as a draft
+    --publish-draft          Explicitly publish an owned ordinary draft; requires
+                             --resume and its original private creation custody
     --prerelease             Mark as prerelease
     --generate-notes         Auto-generate release notes
     --verify-tag             Verify tag exists before release
@@ -7669,6 +7677,10 @@ EOF
         esac
     done
     requested_draft=$draft
+    if $publish_draft && { ! $resume || $requested_draft; }; then
+        log_error "--publish-draft requires --resume and cannot be combined with --draft"
+        return 4
+    fi
 
     # Validate required arguments
     if [[ -z "$tool_name" ]]; then
@@ -7749,6 +7761,10 @@ EOF
 
     if $sbom_enabled && $release_contract_enabled; then
         log_error "Automatic SBOM generation requires an ordinary release; strict contracts must declare their SBOM assets explicitly (use --no-sbom)"
+        return 4
+    fi
+    if $publish_draft && $release_contract_enabled; then
+        log_error "Strict drafts require 'dsr release finalize' with their original creation response; --publish-draft is for ordinary releases"
         return 4
     fi
 
@@ -8377,6 +8393,9 @@ EOF
             log_info "  Draft:       $draft"
         fi
         log_info "  Prerelease:  $prerelease"
+        if $publish_draft; then
+            log_info "  Promotion:   requested; creation custody and remote contents will be verified during the real run"
+        fi
 
         # List exactly what would be uploaded: every name of every artifact,
         # then the manifest, generated checksums and existing sidecars.
@@ -8470,6 +8489,7 @@ EOF
                 --arg repo "$repo" \
                 --arg artifacts_dir "$artifacts_dir" \
                 --argjson draft "$requested_draft" \
+                --argjson promotion_requested "$publish_draft" \
                 --argjson prerelease "$prerelease" \
                 --argjson file_count "$file_count" \
                 --argjson artifacts "$plan_artifacts_json" \
@@ -8480,6 +8500,7 @@ EOF
                 --argjson contract_assets "$(if $release_contract_enabled; then jq -c '[.assets[].name]' <<< "$release_contract_plan"; else echo '[]'; fi)" \
                 '{tool: $tool, version: $version, tag: $version, repo: $repo,
                   artifacts_dir: $artifacts_dir, draft: $draft, prerelease: $prerelease,
+                  promotion_requested: $promotion_requested,
                   file_count: $file_count, mode: "dry_run", dry_run: true,
                   plan: (if $strict then {strict: true, assets: $contract_assets}
                          else {strict: false, artifacts: $artifacts, additional_files: $extra,
@@ -8947,6 +8968,22 @@ EOF
         draft=$(jq -r '.draft' <<< "$release_json")
         prerelease=$(jq -r '.prerelease' <<< "$release_json")
         _release_ordinary_recover_custody || return 7
+        if $publish_draft; then
+            if ! $ordinary_owned; then
+                log_error "--publish-draft requires this release's original private creation custody; an existing draft alone is not sufficient"
+                return 7
+            fi
+            # The explicit flag authorizes this invocation only. Preserve the
+            # original intent/POST response byte for byte, including its draft
+            # request, and retain the protection for releases public on entry.
+            # Exact remote inventory and source verification below must still
+            # succeed before the existing ID-bound publication path can run.
+            ordinary_publish=true
+            if ! $draft; then
+                ordinary_external_publication=true
+            fi
+            log_info "Explicit promotion requested for the owned release $release_id"
+        fi
         if ! $resume && [[ $create_status -eq 0 ]]; then
             if ! $ordinary_owned; then
                 log_error "Ordinary draft creation did not preserve its original private POST response"
@@ -9810,6 +9847,7 @@ EOF
             --argjson staged "$ordinary_owned" \
             --arg artifacts_dir "$(cd "$artifacts_dir" && pwd -P)" \
             --argjson draft "$draft" \
+            --argjson promotion_requested "$publish_draft" \
             --argjson prerelease "$prerelease" \
             --argjson uploaded "$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')" \
             --argjson failed "$(printf '%s\n' "${failed_assets[@]}" | jq -sc '.')" \
@@ -9841,6 +9879,7 @@ EOF
                 staging_receipt: (if $staged then $staging_receipt else null end),
                 artifacts_dir: $artifacts_dir,
                 draft: $draft,
+                promotion_requested: $promotion_requested,
                 prerelease: $prerelease,
                 assets_uploaded: $uploaded,
                 assets_failed: $failed,
@@ -9877,14 +9916,19 @@ EOF
             printf -v finalize_command 'TMPDIR=%q dsr release finalize %q %q --artifacts %q --create-response %q --no-dispatch' \
                 "$create_response_dir" "$tool_name" "$version" "$(cd "$artifacts_dir" && pwd -P)" "$create_response"
             log_info "Finalize: $finalize_command"
-        elif $draft && $ordinary_owned && $ordinary_publish; then
+        elif $draft && $ordinary_owned; then
             local resume_command
             printf -v resume_command 'dsr release %q %q --artifacts %q --resume' \
                 "$tool_name" "$version" "$(cd "$artifacts_dir" && pwd -P)"
             if $sbom_enabled; then
                 printf -v resume_command '%s --sbom-format %q' "$resume_command" "$sbom_format"
             fi
-            log_info "Staged publication is retained privately; resume with: $resume_command"
+            if $publish_draft || ! $ordinary_publish; then
+                printf -v resume_command '%s --publish-draft' "$resume_command"
+                log_info "Draft creation custody is retained; explicitly publish with: $resume_command"
+            else
+                log_info "Staged publication is retained privately; resume with: $resume_command"
+            fi
         fi
 
         if [[ ${#missing_assets[@]} -gt 0 ]]; then

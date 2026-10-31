@@ -725,6 +725,7 @@ Upload artifacts to GitHub Release.
 ```bash
 dsr release --repo ntm --version v1.2.3         # Upload to release
 dsr release --repo ntm --version v1.2.3 --draft # Keep the verified release private
+dsr release ntm v1.2.3 --resume --publish-draft # Explicitly publish an owned ordinary draft
 dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
 dsr release dispatch --outbox /absolute/path/state.json --status # Inspect saved deliveries
 dsr release dispatch --outbox /absolute/path/state.json          # Recover unfinished deliveries
@@ -759,6 +760,21 @@ verifies its contents without changing its visibility. Automated fallback
 reports a retained draft as blocked, so watch
 cannot mistake successful uploads for a completed public release. Ordinary
 creation and recovery require Python 3.
+
+Publish a draft created by DSR after reviewing it:
+
+```bash
+dsr release ntm v1.2.3 --artifacts /path/to/artifacts --resume --publish-draft
+```
+
+DSR reuses verified uploads, finishes any missing uploads, and checks the
+original release ID, metadata, source pin, complete asset list and bytes before
+publication. It preserves the original private receipt files. If a promotion
+fails, repeat `--resume --publish-draft`; a plain `--resume` keeps the original
+draft intent. Repeating a successful promotion verifies the public release
+without publishing again. The flag requires `--resume`, conflicts with
+`--draft`, and refuses drafts without their original creation custody. Strict
+contracts use `dsr release finalize` instead.
 
 Generate SBOMs for every payload selected by the build manifest before release:
 

@@ -725,6 +725,7 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--dispatch-retry-uncertain` | false | Enable dispatch and deliberately resend uncertain saved deliveries; duplicates are possible |
 | `--no-manifest` | false | Upload an artifacts directory that has no build manifest, as-is |
 | `--resume` | false | Reverify retained uploads and complete an owned interrupted publication |
+| `--publish-draft` | false | With `--resume`, explicitly publish an ordinary draft using its original private creation custody |
 | `--sbom` | `sbom.enabled`, default false | Generate and verify complete SBOM coverage before ordinary publication |
 | `--no-sbom` | false | Disable automatic generation without discarding retained public metadata |
 | `--sbom-format` | `sbom.format`, default `spdx` | Select `spdx` or `cyclonedx` and enable generation |
@@ -784,10 +785,33 @@ creation custody. Upload journals alone never authorize publication.
 An explicitly requested draft remains private when a later `--resume` omits
 `--draft`; an unrelated existing draft also remains private. Existing public
 releases without staged creation custody retain ordinary upload behavior.
+To explicitly publish a draft created by DSR, use:
+
+```bash
+dsr release TOOL VERSION --artifacts /absolute/path/to/artifacts --resume --publish-draft
+```
+
+This requires the original private creation response and frozen input plan.
+It reuses matching uploads, completes missing uploads, and verifies the exact
+release ID, metadata, pinned source, complete asset inventory and hashes before
+publishing. The original receipt files retain their bytes and identities;
+promotion authorization applies only to the invocation with `--publish-draft`.
+If publication fails while the release is still private, retry with the same
+flag. A plain `--resume` continues to honor the original draft request. If a
+publish response is lost, an exact public verification can confirm success;
+repeating the command verifies the public release without another publish.
+`--publish-draft` conflicts with `--draft` and requires `--resume`. Strict
+contracts continue to use `dsr release finalize` with their original creation
+response. `details.promotion_requested` records the explicit flag; dry-run
+reports the requested plan without contacting GitHub or asserting that remote
+promotion admission has passed.
+
 If a user subsequently publishes an explicitly requested draft on GitHub,
 `--resume` verifies its original complete artifact plan without changing its
 visibility, including on verification failure. Requesting `--draft` for an
 already-public release still refuses before upload.
+The same visibility protection applies when `--publish-draft` observes that
+the owned release was already public at the start of recovery.
 `--draft` on a retry can keep an owned public-intent draft private for that
 invocation without changing its retained publication intent.
 

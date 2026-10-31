@@ -1295,6 +1295,198 @@ test_staged_explicit_draft_stays_private_on_resume() {
         jq -e '.details.draft==true' "$CASE/stdout" >/dev/null
 }
 
+promotion_setup() {
+    setup "$1"
+    CREATE_FAIL=false
+    [[ "${2:-}" != manifest ]] || staged_manifest payload.bin || return 1
+    run_release --draft
+    [[ $STATUS -eq 0 ]] && jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+    PROMOTION_INTENT=$(jq -r '.details.staging_receipt' "$CASE/stdout") || return 1
+    local -a responses=("${PROMOTION_INTENT%/*}"/dsr-api-response.????????)
+    [[ ${#responses[@]} -eq 1 ]] || return 1
+    PROMOTION_RESPONSE="${responses[0]}"
+    cp "$PROMOTION_INTENT" "$CASE/original-intent.json" &&
+        cp "$PROMOTION_RESPONSE" "$CASE/original-response.json" || return 1
+    PROMOTION_INTENT_INODE=$(stat -c '%d:%i' "$PROMOTION_INTENT") || return 1
+    PROMOTION_RESPONSE_INODE=$(stat -c '%d:%i' "$PROMOTION_RESPONSE") || return 1
+    : > "$CALLS"
+}
+
+promotion_custody_unchanged() {
+    cmp -s "$PROMOTION_INTENT" "$CASE/original-intent.json" &&
+        cmp -s "$PROMOTION_RESPONSE" "$CASE/original-response.json" &&
+        [[ "$(stat -c '%d:%i' "$PROMOTION_INTENT")" == "$PROMOTION_INTENT_INODE" &&
+           "$(stat -c '%d:%i' "$PROMOTION_RESPONSE")" == "$PROMOTION_RESPONSE_INODE" ]] &&
+        jq -e '.publish==false' "$PROMOTION_INTENT" >/dev/null
+}
+
+test_promotion_requires_resume_and_refuses_draft_flag() {
+    setup promotion_invalid_options
+    run_release --publish-draft
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]] && grep -q 'requires --resume' "$CASE/stderr" || return 1
+    run_release --resume --publish-draft --draft
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]] && grep -q 'combined with --draft' "$CASE/stderr"
+}
+
+test_promotion_keeps_strict_finalization_separate() {
+    setup promotion_strict
+    STRICT_CONTRACT='{}'
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 4 && ! -s "$CALLS" ]] && grep -q "dsr release finalize" "$CASE/stderr"
+}
+
+test_promotion_requires_original_creation_custody() {
+    setup promotion_unowned
+    jq '.draft=true' "$CASE/release.json" > "$CASE/release.next" &&
+        mv "$CASE/release.next" "$CASE/release.json" || return 1
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        grep -q 'original private creation custody' "$CASE/stderr" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_promotion_verifies_complete_draft_and_preserves_original_custody() {
+    promotion_setup promotion_complete manifest || return 1
+    jq 'map(.digest=null)' "$CASE/inventory.json" > "$CASE/inventory.next" &&
+        mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
+    run_release --resume --publish-draft --verify-upgrade
+    [[ $STATUS -eq 0 && $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] &&
+        ! grep -q '^CREATE\|^POST \|^RESTORE-DRAFT' "$CALLS" &&
+        grep -q '^DOWNLOAD ' "$CALLS" && grep -Fxq DISPATCH "$CALLS" && grep -Fxq UPGRADE "$CALLS" &&
+        jq -e '.details.draft==false and .details.promotion_requested and .details.success==4 and
+            .details.verification=="ok"' "$CASE/stdout" >/dev/null && promotion_custody_unchanged
+}
+
+test_promotion_finishes_only_missing_assets() {
+    setup promotion_incomplete
+    CREATE_FAIL=false FAIL_NAME=second.bin
+    printf 'second payload\n' > "$CASE/artifacts/second.bin"
+    run_release --draft
+    [[ $STATUS -eq 1 ]] && jq -e '.draft==true' "$CASE/release.json" >/dev/null || return 1
+    FAIL_NAME=""
+    : > "$CALLS"
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 0 && $(grep -c '^POST ' "$CALLS") -eq 1 && $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] &&
+        grep -Fxq 'POST second.bin' "$CALLS" && ! grep -q '^CREATE' "$CALLS" &&
+        jq -e '.details.draft==false and .details.success==2' "$CASE/stdout" >/dev/null
+}
+
+test_promotion_lost_response_reconciles_and_repeats_without_mutation() {
+    promotion_setup promotion_lost_response || return 1
+    LOST_PUBLISH_RESPONSE=true
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 0 && $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] &&
+        ! grep -q '^CREATE\|^POST \|^RESTORE-DRAFT' "$CALLS" && promotion_custody_unchanged || return 1
+    : > "$CALLS"
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.details.draft==false and .details.promotion_requested' "$CASE/stdout" >/dev/null &&
+        promotion_custody_unchanged
+}
+
+test_promotion_failure_needs_explicit_retry_and_keeps_original_intent() {
+    promotion_setup promotion_retry || return 1
+    PUBLISH_FAIL=true
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 1 && $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] &&
+        ! grep -q '^DISPATCH' "$CALLS" && promotion_custody_unchanged || return 1
+    PUBLISH_FAIL=false
+    : > "$CALLS"
+    run_release --resume
+    [[ $STATUS -eq 0 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.details.draft==true and (.details.promotion_requested|not)' "$CASE/stdout" >/dev/null || return 1
+    : > "$CALLS"
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 0 && $(grep -c '^PUBLISH$' "$CALLS") -eq 1 ]] &&
+        ! grep -q '^CREATE\|^POST ' "$CALLS" && promotion_custody_unchanged
+}
+
+test_promotion_rejects_digestless_remote_byte_drift() {
+    promotion_setup promotion_changed_remote || return 1
+    jq 'map(.digest=null)' "$CASE/inventory.json" > "$CASE/inventory.next" &&
+        mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
+    printf 'fake payload\n' > "$CASE/remote/100"
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 1 ]] && grep -q '^DOWNLOAD ' "$CALLS" &&
+        ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null && promotion_custody_unchanged
+}
+
+test_promotion_refuses_unexpected_remote_assets() {
+    promotion_setup promotion_extra_asset || return 1
+    remote_put unexpected.bin "$CASE/artifacts/payload.bin" || return 1
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 1 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null && promotion_custody_unchanged
+}
+
+test_promotion_refuses_changed_id_nonce_and_metadata() {
+    local mutation field
+    for field in id nonce notes; do
+        promotion_setup "promotion_changed_$field" || return 1
+        case "$field" in
+            id) mutation='.id=10 | .upload_url="https://uploads.github.com/repos/owner/repo/releases/10/assets{?name,label}"' ;;
+            nonce) mutation='.body |= sub("dsr-publication-nonce:[0-9a-f]+";"dsr-publication-nonce:"+("f"*64))' ;;
+            notes) mutation='.body="Changed release notes\n\n<!-- dsr-publication-nonce:"+("0"*63)+"1 -->"' ;;
+        esac
+        jq "$mutation" "$CASE/release.json" > "$CASE/release.next" &&
+            mv "$CASE/release.next" "$CASE/release.json" || return 1
+        run_release --resume --publish-draft
+        [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+            promotion_custody_unchanged || return 1
+    done
+}
+
+test_promotion_refuses_changed_local_inputs_or_missing_response() {
+    promotion_setup promotion_changed_local || return 1
+    printf 'different payload\n' > "$CASE/artifacts/payload.bin"
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+        promotion_custody_unchanged || return 1
+    promotion_setup promotion_lost_custody || return 1
+    mv "$PROMOTION_RESPONSE" "$CASE/retained-but-unavailable-response" || return 1
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 7 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_promotion_rechecks_pinned_tag_before_publication() {
+    setup promotion_moved_tag
+    CREATE_FAIL=false
+    git init -q "$CASE/checkout" &&
+        git -C "$CASE/checkout" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m tagged &&
+        git -C "$CASE/checkout" tag v1.2.3 || return 1
+    STAGED_SOURCE_SHA=$(git -C "$CASE/checkout" rev-parse HEAD) || return 1
+    act_get_local_path() { printf '%s\n' "$CASE/checkout"; }
+    git_ops_tag_exists() { git -C "$1" rev-parse -q --verify "refs/tags/$2" >/dev/null; }
+    git_ops_tag_sha() { git -C "$1" rev-parse --verify "$2^{commit}"; }
+    run_release --draft
+    [[ $STATUS -eq 0 ]] || return 1
+    STAGED_REMOTE_MODE=moved
+    : > "$CALLS"
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 1 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null
+}
+
+test_promotion_restores_owned_draft_after_failed_public_verification() {
+    promotion_setup promotion_postpublish_drift || return 1
+    PUBLISH_ASSET_DRIFT=true
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 1 ]] && grep -Fxq PUBLISH "$CALLS" && grep -Fxq RESTORE-DRAFT "$CALLS" &&
+        ! grep -q '^DISPATCH' "$CALLS" && jq -e '.draft==true' "$CASE/release.json" >/dev/null &&
+        promotion_custody_unchanged
+}
+
+test_promotion_dry_run_has_no_network_or_state_changes() {
+    promotion_setup promotion_dry_run manifest || return 1
+    DRY_RUN=true
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 0 && ! -s "$CALLS" ]] &&
+        jq -e '.status=="dry_run" and .details.promotion_requested' "$CASE/stdout" >/dev/null &&
+        jq -e '.draft==true' "$CASE/release.json" >/dev/null && promotion_custody_unchanged
+}
+
 staged_publish_explicit_draft() {
     setup "$1"
     CREATE_FAIL=false
@@ -1320,6 +1512,25 @@ test_staged_manual_publication_drift_is_not_redrafted() {
     jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next" &&
         mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
     run_release --resume
+    [[ $STATUS -eq 1 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==false' "$CASE/release.json" >/dev/null
+}
+
+test_promotion_never_redrafts_release_public_on_entry() {
+    staged_publish_explicit_draft promotion_existing_public || return 1
+    jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next" &&
+        mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
+    run_release --resume --publish-draft
+    [[ $STATUS -eq 1 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
+        jq -e '.draft==false' "$CASE/release.json" >/dev/null || return 1
+    setup promotion_existing_public_intent
+    CREATE_FAIL=false
+    run_release
+    [[ $STATUS -eq 0 ]] || return 1
+    jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.json" > "$CASE/inventory.next" &&
+        mv "$CASE/inventory.next" "$CASE/inventory.json" || return 1
+    : > "$CALLS"
+    run_release --resume --publish-draft
     [[ $STATUS -eq 1 ]] && ! grep -q '^CREATE\|^POST \|^PUBLISH\|^RESTORE-DRAFT\|^DISPATCH' "$CALLS" &&
         jq -e '.draft==false' "$CASE/release.json" >/dev/null
 }
@@ -1914,6 +2125,16 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_staged_creation_publishes_only_after_private_uploads test_staged_dry_run_creates_no_custody \
     test_staged_interrupted_upload_resumes_and_publishes test_staged_generated_checksums_remain_bound_across_retry \
     test_staged_manifest_aliases_are_all_verified test_staged_explicit_draft_stays_private_on_resume \
+    test_promotion_requires_resume_and_refuses_draft_flag test_promotion_keeps_strict_finalization_separate \
+    test_promotion_requires_original_creation_custody \
+    test_promotion_verifies_complete_draft_and_preserves_original_custody test_promotion_finishes_only_missing_assets \
+    test_promotion_lost_response_reconciles_and_repeats_without_mutation \
+    test_promotion_failure_needs_explicit_retry_and_keeps_original_intent \
+    test_promotion_rejects_digestless_remote_byte_drift test_promotion_refuses_unexpected_remote_assets \
+    test_promotion_refuses_changed_id_nonce_and_metadata test_promotion_refuses_changed_local_inputs_or_missing_response \
+    test_promotion_rechecks_pinned_tag_before_publication \
+    test_promotion_restores_owned_draft_after_failed_public_verification \
+    test_promotion_dry_run_has_no_network_or_state_changes test_promotion_never_redrafts_release_public_on_entry \
     test_staged_explicit_draft_published_manually_resumes test_staged_manual_publication_drift_is_not_redrafted \
     test_staged_manual_publication_rejects_draft_request \
     test_staged_lost_publish_response_requires_public_proof test_staged_failed_publish_retries_without_reupload \
