@@ -37,8 +37,8 @@ publishing an aggregate directly cannot discard its selected repository.
 The producer remains responsible for correctness. No repository name is inferred
 from the tool name, current directory, or artifact location.
 
-This profile accepts UTC second-resolution `built_at` timestamps, the schema's
-Linux/macOS/Windows targets, and tar.gz, tar.xz, ZIP, binary or none formats. It
+This profile accepts UTC second-resolution `built_at` timestamps, the shared
+Linux/macOS/Windows/FreeBSD target policy, and tar.gz, tar.xz, ZIP, binary or none formats. It
 rejects partial/failed builds, missing targets, duplicate names, invalid pins,
 and metadata that disagrees with successful target coverage. This is validation
 of the fields consumed by this profile, not a general JSON Schema validator.

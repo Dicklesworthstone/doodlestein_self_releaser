@@ -61,7 +61,7 @@ _rf_provenance_plan() {
         --arg pin "$pin" --arg hash "$hash" '
         if .version==$tag and .source.git_sha==$sha then
             {required:true,builder:$builder,public_key:$token,build_manifest_sha256:$pin,
-             invocation_id:.run_id,targets:([.artifacts[].target]|unique|sort),
+             invocation_id:.run_id,targets:([.artifacts[].target|select(.!="additional")]|unique|sort),
              artifact_count:(.artifacts|length),statement:{name:"release.intoto.jsonl",sha256:$hash}}
         else error("provenance requires the selected source and canonical version tag") end' "$manifest" || return 4
     [[ "$(_rf_hash "$manifest")" == "$pin" ]] || return 2
@@ -510,7 +510,8 @@ _rf_execute() (
     local provenance_result=null provenance_key=null provenance_file='' prepared_provenance=null
     local _RF_PROVENANCE_POLICY='' _RF_PROVENANCE_DOCUMENTS='' _RF_PROVENANCE_OUTPUT=''
     local _RF_PROVENANCE_PUBLIC='' _RF_PROVENANCE_KEY=''
-    local -a preparation_args=() provenance_args=()
+    local sbom_selection_plan=null sbom_selection_path='' sbom_name
+    local -a preparation_args=() provenance_args=() sbom_selection_args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --provenance-builder)
@@ -816,6 +817,29 @@ _rf_execute() (
         [[ "$(_rf_hash "$build_snapshot")" == "$build_pin" &&
            "$(_rf_hash "$build_manifest")" == "$build_pin" ]] || return 2
     fi
+    # A build-selected data/license file is a payload even when ordinary SBOM
+    # discovery filters its basename. Freeze the COMPLETE selected set, never
+    # just those extra files, for every scanner/publication/verification call.
+    # Binary-only selections retain the existing discovery policy and exact-set
+    # gates, so already-completed ordinary inventories remain reusable.
+    if [[ "$require_signatures" == true ]]; then
+        sbom_selection_plan="$integrity_selection"
+    else
+        sbom_selection_plan="$upload_plan"
+    fi
+    if [[ "$sbom_selection_plan" != null ]]; then
+        while IFS= read -r sbom_name; do
+            if _sbom_is_metadata "$sbom_name"; then
+                sbom_selection_path=$(mktemp "$work/sbom-selection.XXXXXXXX") || return 1
+                jq -cS '{schema_version:1,artifacts:(.artifacts|map({name,sha256})|sort_by(.name))}' \
+                    <<< "$sbom_selection_plan" > "$sbom_selection_path" || return 4
+                chmod 400 "$sbom_selection_path" || return 1
+                _sbom_read_selection "$sbom_selection_path" >/dev/null || return $?
+                sbom_selection_args=(--selection "$sbom_selection_path")
+                break
+            fi
+        done < <(jq -r '.artifacts[].name' <<< "$sbom_selection_plan")
+    fi
     if [[ "$require_signatures" == true ]]; then
         # Freeze the selected public token; subsequent mutation of the key file
         # cannot silently change which key this invocation trusts. Never copy the
@@ -963,7 +987,8 @@ _rf_execute() (
     case "$format" in spdx) manifest_name=sbom-manifest.spdx.json ;; *) manifest_name=sbom-manifest.cdx.json ;; esac
     manifest="$output_dir/$manifest_name"
     # This API reuses verified completed inventories without requiring Syft.
-    sbom_generate_artifacts "$root" --format "$format" --output-dir "$output_dir" > "$work/scan.out" || return $?
+    sbom_generate_artifacts "$root" --format "$format" --output-dir "$output_dir" \
+        ${sbom_selection_args[@]+"${sbom_selection_args[@]}"} > "$work/scan.out" || return $?
     _rf_payload_gate "$manifest" "$work" || return $?
     _rf_integrity_local_gate "$manifest" "$work" || return $?
     pin=$(_rf_hash "$manifest") || return $?
@@ -981,7 +1006,8 @@ _rf_execute() (
         integrity_inventory=$(_sbr_inventory "$repo" "$(jq -r '.release.id' <<< "$context")" "$work") || return $?
         _rf_integrity_assets_gate "$integrity_inventory" || return $?
     fi
-    result=$(sbom_publish_artifacts "$root" --repo "$repo" --tag "$tag" --format "$format" --output-dir "$output_dir") || return $?
+    result=$(sbom_publish_artifacts "$root" --repo "$repo" --tag "$tag" --format "$format" \
+        --output-dir "$output_dir" ${sbom_selection_args[@]+"${sbom_selection_args[@]}"}) || return $?
     jq -es 'length==1 and (.[0]|.kind=="dsr-sbom-publication" and .status=="verified" and .dry_run==false)' <<< "$result" >/dev/null || return 7
     verification=$(sbom_verify_release --repo "$repo" --tag "$tag" --format "$format" --manifest-sha256 "$pin") || return $?
     evidence=$(_rf_evidence_key "$verification" "$repo" "$tag" "$sha" "$format" "$pin" "$manifest_name") || return 7
@@ -1017,7 +1043,8 @@ _rf_execute() (
         state=$(jq -cS '.promotion_attempts+=1 | .phase="promoting"' <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
         # Saving intent can fail; no public mutation precedes that durable record.
-        sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" >/dev/null || return $?
+        sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" \
+            ${sbom_selection_args[@]+"${sbom_selection_args[@]}"} >/dev/null || return $?
         _rf_gate "$repo" "$tag" "$sha" "$evidence" true "$manifest" "$work" || return $?
         promotion_attempted=true
         _rf_promote "$repo" "$(jq -r '.release.id' <<< "$verification")" "$work" || promotion_rc=$?
@@ -1048,7 +1075,8 @@ _rf_execute() (
         state=$(jq -cS --argjson receipt "$provenance_result" '.provenance_verification=$receipt' <<< "$state") || return 1
         oldhash=$(_rf_save "$file" "$state" "$oldhash" "$work" "$plan") || return $?
     fi
-    sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" >/dev/null || return $?
+    sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" \
+        ${sbom_selection_args[@]+"${sbom_selection_args[@]}"} >/dev/null || return $?
     _rf_gate "$repo" "$tag" "$sha" "$evidence" "$initial_draft" "$manifest" "$work" || return $?
     if [[ "$initial_draft" == false ]]; then
         status=published

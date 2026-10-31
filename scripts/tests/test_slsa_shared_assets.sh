@@ -405,6 +405,26 @@ sys.exit(0 if valid else 1)
         self.assertEqual(again, value)
         self.verify_snapshot(contract=False)
 
+    def test_signed_snapshot_retains_platform_owned_metadata_and_rejects_tampering(self):
+        self.data['artifacts'][1]['target'] = 'linux/amd64'
+        self.add_payload('runtime.json', 'linux/amd64', b'{"release_data":true}\n')
+        self.add_payload('NOTICE', 'linux/amd64', b'owned release notice\n')
+        self.prepare()
+        value = json.loads(self.verify_snapshot().stdout)
+        self.assertTrue(value['authenticated'])
+        self.assertEqual(value['policy']['targets'], ['linux/amd64'])
+        self.assertEqual({a['name'] for a in value['artifacts']},
+                         {'LICENSE', 'NOTICE', 'runtime.json', 'app-linux-amd64.tar.gz'})
+        for row in value['artifacts']:
+            self.assertEqual(row['target'], 'linux/amd64')
+            self.assertEqual(row['sha256'], digest(self.snapshot / 'artifacts' / row['name']))
+        self.assertEqual(json.loads(self.verify_snapshot().stdout), value)
+        signature = (self.snapshot / 'release.intoto.jsonl.minisig').read_bytes()
+        payload = self.snapshot / 'artifacts/runtime.json'
+        payload.write_bytes(b'x' * payload.stat().st_size)
+        self.verify_snapshot(expected=1)
+        self.assertEqual((self.snapshot / 'release.intoto.jsonl.minisig').read_bytes(), signature)
+
     def test_validly_resigned_missing_shared_subject_fails_independent_contract(self):
         self.prepare()
         proof = self.snapshot / 'release.intoto.jsonl'
@@ -573,6 +593,68 @@ _slr_payloads example/shared-assets "$(cat "$4")" "$5" "$6"
             self.assertEqual(digest(work / 'payloads' / row['name']), row['sha256'])
         calls = [json.loads(line)['asset_id'] for line in self.calls.read_text().splitlines()]
         self.assertEqual(sorted(calls), [str(i) for i in range(1, 6)])
+
+    def test_platform_owned_metadata_names_are_downloaded_and_hashed(self):
+        self.data['artifacts'][1]['target'] = 'linux/amd64'
+        for name, body in (('NOTICE', b'owned notice\n'),
+                           ('runtime.json', b'{"release_data":true}\n'),
+                           ('README.md', b'owned instructions\n')):
+            self.add_payload(name, 'linux/amd64', body)
+        rows = self.inventory()
+        rows.append(dict(id=102, name='operator.json', state='uploaded', size=12, digest=None))
+        work, _ = self.acquire(rows)
+        self.assertEqual({p.name for p in (work / 'payloads').iterdir()},
+                         {a['name'] for a in self.data['artifacts']})
+        for row in self.data['artifacts']:
+            self.assertEqual(digest(work / 'payloads' / row['name']), row['sha256'])
+        calls = [json.loads(line)['asset_id'] for line in self.calls.read_text().splitlines()]
+        self.assertEqual(sorted(calls), [str(i) for i in range(1, 6)])
+
+    def test_missing_platform_metadata_fails_before_any_download(self):
+        self.add_payload('runtime.json', 'linux/amd64', b'{"release_data":true}\n')
+        rows = [r for r in self.inventory() if r['name'] != 'runtime.json']
+        _, result = self.acquire(rows, expected=7)
+        self.assertIn('Remote payload namespace differs', result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_platform_metadata_does_not_hide_an_unlisted_binary(self):
+        self.add_payload('runtime.json', 'linux/amd64', b'{"release_data":true}\n')
+        rows = self.inventory()
+        rows.append(dict(id=100, name='unexpected-executable', state='uploaded', size=1, digest=None))
+        _, result = self.acquire(rows, expected=7)
+        self.assertIn('Remote payload namespace differs', result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_platform_metadata_identity_mismatch_fails_before_download(self):
+        self.add_payload('runtime.json', 'linux/amd64', b'{"release_data":true}\n')
+        base = self.inventory()
+        for change in ('size', 'digest', 'duplicate'):
+            rows = copy.deepcopy(base)
+            selected = next(r for r in rows if r['name'] == 'runtime.json')
+            with self.subTest(change=change):
+                if change == 'size':
+                    selected['size'] += 1
+                elif change == 'digest':
+                    selected['digest'] = 'sha256:' + '0' * 64
+                else:
+                    rows.append(dict(selected, id=101))
+                self.acquire(rows, expected=7)
+                self.assertFalse(self.calls.exists())
+
+    def test_corrupt_platform_metadata_is_hashed_with_or_without_api_digest(self):
+        self.add_payload('runtime.json', 'linux/amd64', b'{"release_data":true}\n')
+        base = self.inventory()
+        selected = next(r for r in base if r['name'] == 'runtime.json')
+        path = self.remote_bytes / str(selected['id'])
+        path.write_bytes(b'x' * path.stat().st_size)
+        for advertised in (True, False):
+            rows = copy.deepcopy(base)
+            if not advertised:
+                next(r for r in rows if r['name'] == 'runtime.json')['digest'] = None
+            with self.subTest(advertised_digest=advertised):
+                work, result = self.acquire(rows, expected=7)
+                self.assertIn('Downloaded release asset bytes do not match inventory', result.stderr)
+                self.assertFalse((work / 'payloads/runtime.json').exists())
 
     def test_missing_shared_name_fails_before_any_download(self):
         rows = [r for r in self.inventory() if r['name'] != 'LICENSE']

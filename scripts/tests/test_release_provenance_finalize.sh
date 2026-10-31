@@ -7,6 +7,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 # shellcheck source=scripts/test_groups.sh
 source "$ROOT/scripts/test_groups.sh"
 source "$ROOT/src/slsa.sh"
+source "$ROOT/src/sbom.sh"
 source "$ROOT/src/release_payloads.sh"
 # Keep pure handoff identity helpers real; fixture adapters below replace only
 # dispatch delivery, authentication and retained-state observations.
@@ -17,7 +18,7 @@ source "${RI_TEST_MODULE:-$ROOT/src/release_integrity.sh}"
 # shellcheck source=src/release_finalize_core.sh
 source "${PROVENANCE_FINALIZE_TEST_MODULE:-$ROOT/src/release_finalize_core.sh}"
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+trap 'if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then printf "Finalization fixtures retained at %s\n" "$WORK" >&2; else rm -rf -- "$WORK"; fi' EXIT
 mkdir "$WORK/bin"
 export PATH="$WORK/bin:$PATH"
 minisign() {
@@ -66,7 +67,6 @@ signing_sign_exact() {
     [[ -f "$3" && "$(_slsa_sha256 "$1")" == "$6" ]] || return 7
     (set -o noclobber; printf '%s:%s\n' "$4" "$6" > "$2") || return 2
 }
-_sbom_select_artifacts() { find "$1" -maxdepth 1 -type f \( -name 'tool-linux*' -o -name 'tool-windows.exe' \) -printf '%f\n' | sort; }
 _rup_require() { :; }
 fixture_payloads() {
     local root=$1 selection=$2 rows row name
@@ -123,7 +123,8 @@ fixture_integrity_receipt() {
     local selected inventory hash
     selected=$(jq -c '{artifacts}' "$CASE/remote/release-integrity.json") || return 1
     fixture_payloads "$CASE/remote" "$selected" || return $?
-    inventory=$(jq -c '[.[]|select(.name=="release-integrity.json" or (.name|startswith("tool-")))]' "$CASE/inventory.json")
+    inventory=$(jq -c --argjson names "$(jq -c '[.artifacts[].name]' <<< "$selected")" \
+        '[.[]|select(.name=="release-integrity.json" or (.name as $n|$names|index($n)!=null))]' "$CASE/inventory.json")
     hash=$(_rf_hash "$CASE/remote/release-integrity.json")
     jq -cn --argjson ctx "$(cat "$CASE/context.json")" --argjson assets "$inventory" --arg token "$TOKEN" --arg hash "$hash" \
         '$ctx+{schema_version:1,kind:"dsr-release-integrity-verification",status:"verified",authenticated:true,
@@ -147,18 +148,36 @@ release_upload_payloads() {
         while IFS= read -r row; do add_asset "$row" "$root/$row" || return $?
         done < <(jq -r '.artifacts[].name' <<< "$selection")
         jq -cn --argjson ctx "$(cat "$CASE/context.json")" --argjson s "$selection" \
-            --argjson a "$(jq -c '[.[]|select(.name|startswith("tool-"))]' "$CASE/inventory.json")" \
+            --argjson a "$(jq -c --argjson names "$(jq -c '[.artifacts[].name]' <<< "$selection")" \
+                '[.[]|select(.name as $n|$names|index($n)!=null)]' "$CASE/inventory.json")" \
             '$ctx+{kind:"dsr-release-payload-publication",status:"verified",dry_run:false,manifest_sha256:$s.manifest_sha256,tool:$s.tool,assets:$a}'
     else
         jq -cn --argjson p "$selection" '{kind:"dsr-release-payload-publication",status:"planned",dry_run:true,plan:$p}'
     fi
 }
 _rup_preflight() { fixture_payloads "$CASE/remote" "$3"; }
+# Keep actual discovery, explicit selection and payload hashing at the scanner
+# boundary. The fixture supplies SBOM documents, never its own selected set.
+fixture_sbom_inputs() {
+    local selection wanted=''
+    selection=$(arg --selection "$@")
+    if [[ -n "$selection" ]]; then
+        wanted=$(_sbom_read_selection "$selection") || return $?
+        trace "sbom-selection $(_rf_hash "$selection")"
+    fi
+    _sbom_snapshot_artifacts "$1" "$CASE/sbom-inputs" "$wanted"
+}
 sbom_generate_artifacts() {
     trace sbom-generate
-    local output; output=$(arg --output-dir "$@")
+    local output inputs policy=top-level-artifacts-v1
+    output=$(arg --output-dir "$@")
+    if [[ "$MODE" == companion-drift ]]; then printf drift >> "$CASE/artifacts/runtime.json"; fi
+    if [[ "$MODE" == unselected-payload ]]; then printf unexpected > "$CASE/artifacts/unselected.bin"; fi
+    inputs=$(fixture_sbom_inputs "$@") || return $?
+    [[ -z "$(arg --selection "$@")" ]] || policy=explicit-artifacts-v1
     if [[ ! -e "$output/sbom-manifest.spdx.json" ]]; then
-        jq -cS '{artifacts:[.artifacts[]|{artifact:{name,sha256}}]}' "$BUILD" > "$output/sbom-manifest.spdx.json"
+        jq -cnS --argjson rows "$inputs" --arg policy "$policy" \
+            '{selection_policy:$policy,artifacts:[$rows[]|{artifact:.}]}' > "$output/sbom-manifest.spdx.json"
     fi
 }
 sbom_verify_artifacts() {
@@ -166,11 +185,17 @@ sbom_verify_artifacts() {
     if [[ "$MODE" == local-late-drift && $(count local-sbom-verify) == 1 ]]; then
         printf drift >> "$CASE/proofs/release.intoto.jsonl"
     fi
-    local manifest; manifest="$(arg --output-dir "$@")/sbom-manifest.spdx.json"
-    [[ -f "$manifest" ]] || return 7
+    local manifest inputs
+    manifest="$(arg --output-dir "$@")/sbom-manifest.spdx.json"
+    inputs=$(fixture_sbom_inputs "$@") || return $?
+    jq -e --argjson rows "$inputs" '[.artifacts[].artifact]|sort_by(.name)==$rows' "$manifest" >/dev/null || return 7
 }
 sbom_publish_artifacts() {
     trace sbom-publish
+    local inputs
+    inputs=$(fixture_sbom_inputs "$@") || return $?
+    jq -e --argjson rows "$inputs" '[.artifacts[].artifact]|sort_by(.name)==$rows' \
+        "$(arg --output-dir "$@")/sbom-manifest.spdx.json" >/dev/null || return 7
     add_asset sbom-manifest.spdx.json "$(arg --output-dir "$@")/sbom-manifest.spdx.json" || return $?
     # The remote copy keeps its 0400 staging mode: unlock it so drift happens.
     if [[ "$MODE" == remote-late-drift ]]; then
@@ -185,8 +210,9 @@ sbom_verify_release() {
     [[ "$hash" == "$(_rf_hash "$CASE/remote/sbom-manifest.spdx.json")" ]] || return 7
     inventory=$(_sbr_inventory_sha256 "$(cat "$CASE/inventory.json")" "$CASE")
     jq -cn --argjson ctx "$(cat "$CASE/context.json")" --argjson a "$asset" --arg hash "$hash" --arg inv "$inventory" \
+        --argjson count "$(jq '.artifacts|length' "$CASE/remote/sbom-manifest.spdx.json")" \
         '$ctx+{schema_version:1,kind:"dsr-sbom-remote-verification",status:"verified",format:"spdx",
-          manifest:{name:$a.name,asset_id:$a.id,sha256:$hash},artifact_count:3,
+          manifest:{name:$a.name,asset_id:$a.id,sha256:$hash},artifact_count:$count,
           asset_inventory_sha256:$inv,verification_policy:"expected-manifest-sha256"}'
 }
 fixture_provenance_receipt() {
@@ -203,9 +229,10 @@ fixture_provenance_receipt() {
     jq -cn --argjson ctx "$(cat "$CASE/context.json")" --arg builder "$builder" --arg hash "$hash" \
         --arg manifest "$manifest" --arg invocation "$invocation" --arg inventory "$inventory" \
         --argjson a "$stmt" --argjson s "$sig" --arg sig "$(_rf_hash "$proof.minisig")" \
+        --argjson count "$(jq '.subject|length' "$proof")" \
         '$ctx+{schema_version:1,kind:"dsr-slsa-remote-verification",status:"verified",authenticated:true,
           builder:$builder,targets:["linux/amd64","windows/arm64"],build_manifest_sha256:$manifest,invocation_id:$invocation,
-          artifact_count:3,asset_inventory_sha256:$inventory,verification_policy:"trusted-minisign-slsa-v1-all-payload-bytes",
+          artifact_count:$count,asset_inventory_sha256:$inventory,verification_policy:"trusted-minisign-slsa-v1-all-payload-bytes",
           statement:{name:$a.name,asset_id:$a.id,sha256:$hash},signature:{name:$s.name,asset_id:$s.id,sha256:$sig}}'
 }
 slsa_publish_release() {
@@ -416,6 +443,58 @@ assert 'prepared flow never calls a signer' test "$(count sign-provenance)" = 0
 assert 'prepared proof identity is retained exactly' jq -e --slurpfile docs "$CASE/prepared-documents.json" \
     '.integrity_policy.mode=="prepared" and .provenance_documents==$docs[0] and .phase=="published"' "$(state_file)"
 }
-dsr_test_groups provenance_completion_cases provenance_failure_cases provenance_receipt_cases provenance_recovery_cases || exit 1
+add_companion() {
+    local name=$1 target=$2 content=$3
+    printf '%s\n' "$content" > "$CASE/artifacts/$name"
+    jq --arg name "$name" --arg target "$target" --arg hash "$(_rf_hash "$CASE/artifacts/$name")" \
+        --argjson size "$(wc -c < "$CASE/artifacts/$name")" \
+        '.artifacts += [{name:$name,target:$target,sha256:$hash,size_bytes:$size,archive_format:"binary"}]' \
+        "$BUILD" > "$CASE/next-build.json"
+    mv "$CASE/next-build.json" "$BUILD"
+}
+provenance_additional_asset_cases() {
+    new_case platform-data
+    add_companion runtime.json windows/arm64 '{"runtime":"required"}'
+    printf 'private operator notes\n' > "$CASE/artifacts/operator.json"
+    run_code 'platform-owned JSON survives signed finalization and promotion' 0 finalize --promote
+    assert 'SBOM and provenance retain every declared payload' jq -e \
+        '.verification.artifact_count==4 and .provenance.artifact_count==4 and .status=="published"' "$CASE/result.json"
+    assert 'selected JSON is published and unselected metadata stays private' jq -e \
+        'any(.[];.name=="runtime.json") and (any(.[];.name=="operator.json")|not)' "$CASE/inventory.json"
+    assert 'SBOM records the explicit selection policy' jq -e \
+        '.selection_policy=="explicit-artifacts-v1" and any(.artifacts[];.artifact.name=="runtime.json")' \
+        "$CASE/meta/sbom-manifest.spdx.json"
+    assert 'every SBOM stage receives the same frozen selection' python3 - "$CASE/calls" <<'PY'
+import sys
+hashes = [line.split()[1] for line in open(sys.argv[1]) if line.startswith('sbom-selection ')]
+assert len(hashes) == 4 and len(set(hashes)) == 1, hashes
+PY
+    run_code 'exact selected-asset retry reuses completed publication' 0 finalize --promote
+    assert 'selected retry does not promote again' test "$(count promote)" = 1
+    new_case shared-data
+    add_companion runtime.json windows/arm64 '{"runtime":"required"}'
+    add_companion NOTICE additional 'required release notice'
+    run_code 'shared companions do not become physical build targets' 0 finalize --dry-run
+    assert 'shared assets count as subjects and preserve platform selection' jq -e \
+        '.provenance_policy.targets==["linux/amd64","windows/arm64"] and .provenance_policy.artifact_count==5' "$CASE/result.json"
+    run_code 'shared and platform-owned data complete the same signed release' 0 finalize --promote
+    assert 'shared notice remains covered by both complete inventories' jq -e \
+        '.verification.artifact_count==5 and .provenance.artifact_count==5 and .provenance.targets==["linux/amd64","windows/arm64"]' "$CASE/result.json"
+    for mode in companion-drift unselected-payload; do
+        new_case "$mode"; MODE=$mode
+        add_companion runtime.json windows/arm64 '{"runtime":"required"}'
+        local expected=2
+        [[ "$mode" != unselected-payload ]] || expected=4
+        run_code 'selected-asset drift or extra binary blocks publication completion' "$expected" finalize --promote
+        assert 'invalid collection remains draft' jq -e '.release.draft' "$CASE/context.json"
+        assert 'invalid collection is never promoted' test "$(count promote)" = 0
+    done
+}
+if [[ "${1:-}" == --additional-assets-only ]]; then
+    provenance_additional_asset_cases
+else
+    dsr_test_groups provenance_completion_cases provenance_failure_cases provenance_receipt_cases \
+        provenance_recovery_cases provenance_additional_asset_cases || exit 1
+fi
 printf '\nProvenance-gated finalization: %s passed, %s failed\n' "$((checks-failures))" "$failures"
 [[ "$failures" == 0 ]]
