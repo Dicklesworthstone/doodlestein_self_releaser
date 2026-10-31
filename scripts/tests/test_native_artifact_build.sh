@@ -3,6 +3,7 @@
 # real offline Go compilation. No SSH, workflow, compiler, receipt, hash or
 # archive substitute. Host-slot reservation is outside this local fixture.
 # --seven-target-release selects the exact issue #47 matrix.
+# --validate-targets-only checks early rejection and structured errors only.
 # --manifest-provenance-only compiles that matrix directly, then exercises the
 # real collector/packager/manifest/provenance APIs without running the scheduler
 # or changing its host-health admission. It is narrower evidence, not a full
@@ -12,6 +13,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P) || exit 1
 EXPECT_INVENTORY_GAP=false
 GO_ENVIRONMENT_ONLY=false
 MANIFEST_PROVENANCE_ONLY=false
+VALIDATE_TARGETS_ONLY=false
 TARGETS_JSON='["linux/amd64","linux/arm64","linux/armv7","darwin/amd64","darwin/arm64","windows/amd64","windows/arm64","windows/386","freebsd/amd64"]'
 case "${1:-}" in
     --expect-inventory-gap) EXPECT_INVENTORY_GAP=true ;;
@@ -19,6 +21,7 @@ case "${1:-}" in
     # retains the existing Windows ARM64 and 386 compiler/archive coverage.
     --seven-target-release) TARGETS_JSON='["linux/amd64","linux/arm64","linux/armv7","darwin/amd64","darwin/arm64","windows/amd64","freebsd/amd64"]' ;;
     --manifest-provenance-only) MANIFEST_PROVENANCE_ONLY=true; TARGETS_JSON='["linux/amd64","linux/arm64","linux/armv7","darwin/amd64","darwin/arm64","windows/amd64","freebsd/amd64"]' ;;
+    --validate-targets-only) VALIDATE_TARGETS_ONLY=true ;;
     --go-targets-only) TARGETS_JSON='["linux/amd64","linux/arm64"]' ;;
     --go-environment-only) GO_ENVIRONMENT_ONLY=true; TARGETS_JSON='["linux/amd64","linux/arm64"]' ;;
     '') ;;
@@ -253,6 +256,38 @@ config_validate > "$WORK/config-valid.out" 2> "$WORK/config-valid.err" || {
 }
 printf 'PASS: complete supported target matrix passes configuration validation\n'
 PREFLIGHT_CHECKS=$((PREFLIGHT_CHECKS + 1))
+
+# The direct API's rejection result is consumed by build coordinators. Keep
+# its JSON error contract, including the established duplicate-target error,
+# and preserve argument boundaries rather than splitting embedded whitespace.
+expect_orchestration_error_json() {
+    local label="$1" expected="$2" status=0
+    shift 2
+    act_orchestrate_build nativeartifacts 1.2.3 --no-source-sync-gate \
+        --output-dir "$WORK/rejected-output" -- linux/amd64 "$@" \
+        > "$WORK/preflight-$PREFLIGHT_CHECKS.out" \
+        2> "$WORK/preflight-$PREFLIGHT_CHECKS.err" || status=$?
+    if [[ "$status" != 4 || -s "$WORK/build-events" || -e "$WORK/rejected-output" ]] ||
+       ! jq -e --arg expected "$expected" '
+           .tool == "nativeartifacts" and .status == "error" and
+           .summary == {total:0,success:0,failed:0} and .targets == [] and
+           (.error | type == "string" and contains($expected))
+       ' "$WORK/preflight-$PREFLIGHT_CHECKS.out" >/dev/null; then
+        cat "$WORK/preflight-$PREFLIGHT_CHECKS.err" >&2
+        printf 'FAIL: %s must preserve structured early rejection (exit %s)\n' "$label" "$status" >&2
+        return 1
+    fi
+    PREFLIGHT_CHECKS=$((PREFLIGHT_CHECKS + 1))
+    printf 'PASS: %s retains structured early rejection without compilation\n' "$label"
+}
+expect_orchestration_error_json duplicate Duplicate linux/amd64 || exit 1
+expect_orchestration_error_json unsupported plan9/amd64 plan9/amd64 || exit 1
+expect_orchestration_error_json 'space inside target' unsupported 'linux/arm64 freebsd/amd64' || exit 1
+expect_orchestration_error_json 'newline inside target' unsupported $'linux/arm64\nfreebsd/amd64' || exit 1
+if $VALIDATE_TARGETS_ONLY; then
+    printf 'Target validation: %s passed, 0 failed\n' "$PREFLIGHT_CHECKS"
+    exit 0
+fi
 OUTPUT="$WORK/output"
 MANIFEST="$OUTPUT/nativeartifacts-v1.2.3-manifest.json"
 if $MANIFEST_PROVENANCE_ONLY; then

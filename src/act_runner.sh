@@ -12157,11 +12157,9 @@ act_orchestrate_build() {
     fi
 
     # Get targets (from args or config)
-    local targets
+    local targets selected_targets_json=""
     if [[ ${#targets_arg[@]} -gt 0 ]]; then
-        local selected_targets_json
         selected_targets_json=$(printf '%s\0' "${targets_arg[@]}" | jq -Rsc 'split("\u0000")[:-1]') || return 4
-        dsr_platform_validate_targets_json "$selected_targets_json" "selected targets for $tool_name" || return 4
         targets="${targets_arg[*]}"
     else
         targets=$(act_get_targets "$tool_name")
@@ -12175,13 +12173,25 @@ act_orchestrate_build() {
     fi
 
     local requested_targets_json
-    requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
-        jq -Rsc 'split("\n") | map(select(length > 0))')
-    dsr_platform_validate_targets_json "$requested_targets_json" "build targets for $tool_name" || return 4
+    if [[ -n "$selected_targets_json" ]]; then
+        requested_targets_json="$selected_targets_json"
+    else
+        requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
+            jq -Rsc 'split("\n") | map(select(length > 0))') || return 4
+    fi
     if ! jq -en --argjson requested "$requested_targets_json" \
         '($requested | length) == ($requested | unique | length)' >/dev/null 2>&1; then
         _log_error "Duplicate build targets are not allowed"
         jq -nc --arg tool "$tool_name" --arg error "Duplicate build targets are not allowed" \
+            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+        return 4
+    fi
+
+    local target_validation_error
+    if ! target_validation_error=$(dsr_platform_validate_targets_json \
+        "$requested_targets_json" "build targets for $tool_name" 2>&1); then
+        _log_error "$target_validation_error"
+        jq -nc --arg tool "$tool_name" --arg error "$target_validation_error" \
             '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
         return 4
     fi

@@ -464,6 +464,7 @@ mkdir "$directory/cli" || exit 1
 cp "$FINALIZER" "$directory/cli/release_finalize.sh" || exit 1
 cp "$BUNDLE" "$directory/cli/release_bundle.sh" || exit 1
 cp "$SLSA" "$directory/cli/slsa.sh" || exit 1
+cp "$ROOT/src/platforms.sh" "$directory/cli/platforms.sh" || exit 1
 export DSR_FINALIZE_FIXTURE_ROOT="$directory"
 cat > "$directory/cli/release_finalize_core.sh" <<'SH'
 #!/usr/bin/env bash
