@@ -12,7 +12,7 @@ GIT_REAL=$(command -v git)
 GO_REAL=$(command -v go)
 export GIT_REAL GO_REAL
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-installer-source.XXXXXXXX") || exit 1
-trap 'rm -rf -- "$TEMP"' EXIT
+trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$TEMP"' EXIT
 export HOME="$TEMP/home" GIT_CONFIG_GLOBAL="$TEMP/gitconfig" GIT_CONFIG_NOSYSTEM=1
 export GOCACHE="${DSR_TEST_GO_CACHE:-/tmp/dsr-installer-source-go-cache}"
 mkdir -p "$HOME" "$TEMP/upstream/project/cmd/app" "$TEMP/bin" "$TEMP/config/repos.d" "$TEMP/releases" "$TEMP/results"
@@ -171,7 +171,16 @@ CURL
 cat > "$TEMP/bin/gh" <<'GH'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$CALLS"
+if [[ "${1:-} ${2:-}" == 'auth token' ]]; then
+    [[ "${GH_HOST:-}" == github.com && "${3:-} ${4:-}" == '--hostname github.com' ]] || exit 1
+    printf 'installer-source-fixture-token\n'
+    exit 0
+fi
 if [[ "$1" == api ]]; then
+    if [[ -n "${GH_EXPECTED_TOKEN:-}" ]]; then
+        printf 'gh-context %s %s\n' "${GH_HOST:-}" "${GH_TOKEN:-}" >> "$CALLS"
+        [[ "${GH_HOST:-}" == github.com && "${GH_TOKEN:-}" == "$GH_EXPECTED_TOKEN" ]] || exit 1
+    fi
     freshness-response "${!#}"
     exit $?
 fi
@@ -381,10 +390,19 @@ for mode in unavailable bad-head multiple-heads bad-tag diverged behind wrong-ba
     check "unknown decision is explicit in JSON: $mode" jq -e '.freshness.status == "unknown" and (has("source") | not)' "$CASE/out.json"
 done
 FRESHNESS_MODE=private
-GH_HOST=unrelated.example run_case freshness-private good --prefer-gh --allow-source-build --source-if-stale 1
+DSR_GH_TOKEN=dsr-source-fixture GITHUB_TOKEN=ci-source-fixture GH_TOKEN=cli-source-fixture \
+    GH_HOST=unrelated.example GH_EXPECTED_TOKEN=dsr-source-fixture \
+    run_case freshness-private good --prefer-gh --allow-source-build --source-if-stale 1
 check 'authenticated gh can provide private-repo freshness metadata' equal "$status" 0
 check 'gh metadata transport is pinned to github.com' grep -q '^gh api --hostname github.com --method GET' "$CALLS"
 check 'private comparison returns a fresh decision' jq -e '.freshness.status == "fresh"' "$CASE/out.json"
+check 'freshness uses the selected DSR account for all three API requests' \
+    test "$(grep -c '^gh-context github.com dsr-source-fixture$' "$CALLS" || true)" -eq 3
+DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN='' GH_HOST=unrelated.example \
+    GH_EXPECTED_TOKEN=installer-source-fixture-token \
+    run_case freshness-stored good --prefer-gh --allow-source-build --source-if-stale 1
+check 'private freshness discovers the stored public-GitHub account' equal "$status" 0
+check 'stored-account freshness remains a validated decision' jq -e '.freshness.status == "fresh"' "$CASE/out.json"
 FRESHNESS_MODE=normal FRESHNESS_COUNT=1001
 run_case freshness-large good --allow-source-build --source-if-stale 10 --source-timeout 60
 check 'large comparison count is not truncated to page length' equal "$status" 0

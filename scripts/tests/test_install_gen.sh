@@ -46,7 +46,7 @@ setup() {
 }
 
 teardown() {
-    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" && "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then
         rm -rf "$TEMP_DIR"
     fi
 }
@@ -209,7 +209,7 @@ test_template_has_gh_download_function() {
     # Every release asset (payload and sidecars) is fetched by one function
     # with a gh release download fallback for private or throttled repos.
     if grep -qF '_fetch_release_asset() {' <<< "$template" && \
-       grep -qF 'gh release download "$_VERSION" --repo "$REPO" --pattern "$asset"' <<< "$template"; then
+       grep -qF '_installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset"' <<< "$template"; then
         pass "template includes gh release download fallback"
     else
         fail "template missing gh release download fallback"
@@ -333,6 +333,38 @@ EOF
     teardown
 }
 
+test_generator_preserves_caller_selection() {
+    setup
+    source "$PROJECT_ROOT/src/install_gen.sh"
+    cat > "$DSR_CONFIG_DIR/repos.d/caller-state.yaml" <<'CONFIG'
+tool_name: caller-state
+repo: example/caller-state
+binary_name: caller-state
+language: go
+CONFIG
+    local scenario status expected_status platform triple arch alias
+    for scenario in success invalid-signing-key; do
+        ((TESTS_RUN++))
+        platform=caller-platform triple=caller-triple arch=caller-arch alias=caller-alias
+        expected_status=0
+        if [[ "$scenario" == invalid-signing-key ]]; then
+            printf 'minisign_pubkey: invalid-key\n' >> "$DSR_CONFIG_DIR/repos.d/caller-state.yaml"
+            expected_status=4
+        fi
+        status=0
+        # Call directly, as a sourced API client does. Command substitution
+        # would conceal writes to the caller's platform and naming state.
+        install_gen_create caller-state > "$TEMP_DIR/generate.out" 2> "$TEMP_DIR/generate.err" || status=$?
+        if [[ "$status" -eq "$expected_status" &&
+              "$platform:$triple:$arch:$alias" == caller-platform:caller-triple:caller-arch:caller-alias ]]; then
+            pass "$scenario generation preserves caller platform and naming state"
+        else
+            fail "$scenario generation changed caller state or returned unexpected status $status"
+        fi
+    done
+    teardown
+}
+
 # ============================================================================
 # Cleanup
 # ============================================================================
@@ -365,6 +397,7 @@ test_template_has_cache_get_function
 test_template_has_skill_archive_support
 test_template_maps_windows_arm64_target_triple
 test_generated_installer_embeds_full_skill_tree
+test_generator_preserves_caller_selection
 
 echo ""
 echo "=========================================="

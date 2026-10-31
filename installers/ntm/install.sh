@@ -1212,13 +1212,35 @@ _isb_checkout() {
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
+# Shared by release acquisition and freshness in generated installers, and
+# usable when this source module is loaded alone. Match DSR's token order;
+# gh otherwise prefers GH_TOKEN and may inherit an unrelated enterprise host.
+# Resolve only one account. An invalid explicit token must not try a stored
+# login. Keep credentials and tracing changes confined to this child process.
+_installer_run_gh() (
+    set +x
+    local token=''
+    command -v gh >/dev/null 2>&1 || return 3
+    if [[ -n "${DSR_GH_TOKEN:-}" ]]; then
+        token="$DSR_GH_TOKEN"
+    elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        token="$GITHUB_TOKEN"
+    elif [[ -n "${GH_TOKEN:-}" ]]; then
+        token="$GH_TOKEN"
+    else
+        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || return 3
+    fi
+    [[ -n "$token" ]] || return 3
+    GH_HOST=github.com GH_TOKEN="$token" gh "$@"
+)
+
 # Freshness is advisory release metadata, NOT artifact or commit-signature
 # verification. Query only GitHub's API and do not inherit a GH_HOST override.
 # Separate API bytes from diagnostic logs so warnings cannot become JSON.
 _isb_freshness_request() {
     local transport="$1" endpoint="$2" destination="$3"
     if [[ "$transport" == gh ]]; then
-        gh api --hostname github.com --method GET \
+        _installer_run_gh api --hostname github.com --method GET \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
             "$endpoint" > "$destination"
     else
@@ -2209,7 +2231,7 @@ _fetch_release_asset() {
     [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
+        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
             return 0
         fi
@@ -2220,7 +2242,7 @@ _fetch_release_asset() {
         return 0
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
+        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
             return 0
         fi
@@ -2241,7 +2263,7 @@ _get_latest_version() {
     local response version="" effective prefix="https://github.com/$REPO/releases/tag/"
     $_OFFLINE_MODE && return 4
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
+        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
            _valid_release_version "$version"; then
             printf '%s\n' "$version"; return 0
         fi
@@ -2271,7 +2293,7 @@ _get_latest_version() {
         fi
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
+        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
            _valid_release_version "$version"; then
             printf '%s\n' "$version"; return 0
         fi

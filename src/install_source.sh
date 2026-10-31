@@ -173,13 +173,35 @@ _isb_checkout() {
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
+# Shared by release acquisition and freshness in generated installers, and
+# usable when this source module is loaded alone. Match DSR's token order;
+# gh otherwise prefers GH_TOKEN and may inherit an unrelated enterprise host.
+# Resolve only one account. An invalid explicit token must not try a stored
+# login. Keep credentials and tracing changes confined to this child process.
+_installer_run_gh() (
+    set +x
+    local token=''
+    command -v gh >/dev/null 2>&1 || return 3
+    if [[ -n "${DSR_GH_TOKEN:-}" ]]; then
+        token="$DSR_GH_TOKEN"
+    elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        token="$GITHUB_TOKEN"
+    elif [[ -n "${GH_TOKEN:-}" ]]; then
+        token="$GH_TOKEN"
+    else
+        token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || return 3
+    fi
+    [[ -n "$token" ]] || return 3
+    GH_HOST=github.com GH_TOKEN="$token" gh "$@"
+)
+
 # Freshness is advisory release metadata, NOT artifact or commit-signature
 # verification. Query only GitHub's API and do not inherit a GH_HOST override.
 # Separate API bytes from diagnostic logs so warnings cannot become JSON.
 _isb_freshness_request() {
     local transport="$1" endpoint="$2" destination="$3"
     if [[ "$transport" == gh ]]; then
-        gh api --hostname github.com --method GET \
+        _installer_run_gh api --hostname github.com --method GET \
             -H 'Accept: application/vnd.github+json' -H 'Cache-Control: no-cache' \
             "$endpoint" > "$destination"
     else

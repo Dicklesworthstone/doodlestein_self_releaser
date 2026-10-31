@@ -10,7 +10,7 @@ done
 REAL_GIT=$(command -v git); REAL_GO=$(command -v go)
 export REAL_GIT REAL_GO
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-installer-freshness.XXXXXXXX") || exit 1
-trap 'rm -rf -- "$TEMP"' EXIT
+trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$TEMP"' EXIT
 export HOME="$TEMP/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TEMP/gitconfig"
 export GOCACHE="${DSR_TEST_GO_CACHE:-$TEMP/gocache}" GOPROXY=off GOSUMDB=off
 mkdir -p "$HOME" "$TEMP/config/repos.d" "$TEMP/bin" "$TEMP/upstream" "$TEMP/release" "$TEMP/results"
@@ -130,6 +130,10 @@ BIN
 cat > "$TEMP/bin/gh" <<'BIN'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$TEST_HTTP_LOG"
+if [[ "${1:-} ${2:-}" == 'auth token' ]]; then
+    printf 'installer-freshness-fixture-token\n'
+    exit 0
+fi
 exit 1
 BIN
 chmod +x "$TEMP/bin/"*

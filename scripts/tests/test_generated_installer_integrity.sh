@@ -3,12 +3,12 @@
 # Real tar archives and SHA256; only remote transports/minisign failure are fixtures.
 set -uo pipefail
 case "$#:${1:-}" in
-    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only) ;;
-    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only]\n' "$0" >&2; exit 4 ;;
+    0:|1:--static-go-only|1:--static-go-routing-only|1:--strict-contracts-only|1:--credential-routing-only) ;;
+    *) printf 'Usage: %s [--static-go-only|--static-go-routing-only|--strict-contracts-only|--credential-routing-only]\n' "$0" >&2; exit 4 ;;
 esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-install-integrity.XXXXXXXX") || exit 1
-trap 'rm -rf -- "$work"' EXIT
+trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$work"' EXIT
 passed=0 failed=0
 check() {
     local label="$1"; shift
@@ -22,6 +22,7 @@ cat > "$DSR_CONFIG_DIR/repos.d/demo.yaml" <<'CONFIG'
 tool_name: demo
 repo: example/demo
 binary_name: demo
+language: go
 artifact_naming: ${name}-${version}-${os}-${arch}
 CONFIG
 # shellcheck source=../../src/install_gen.sh
@@ -71,19 +72,54 @@ TRANSPORT
 cat > "$work/transports/gh" <<'TRANSPORT'
 #!/usr/bin/env bash
 set -uo pipefail
-if [[ "${1:-} ${2:-}" == 'release view' ]]; then
-    printf 'gh view\n' >> "$CALLS"
-    [[ "$GH_FAIL" == 0 && -n "$GH_VIEW_TAG" ]] || exit 1
-    printf '%s\n' "$GH_VIEW_TAG"; exit 0
-fi
-asset='' dest=''
+operation="${1:-} ${2:-}"
+repo='' hostname='' asset='' dest='' endpoint="${!#}"
 while (($#)); do
     case "$1" in
+        --repo) repo="$2"; shift 2 ;;
+        --hostname) hostname="$2"; shift 2 ;;
         --pattern) asset="$2"; shift 2 ;;
         --output) dest="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
+if [[ "$operation" == 'auth token' ]]; then
+    if [[ -n "${CREDENTIAL_CALLS:-}" ]]; then
+        printf 'auth\t%s\t%s\n' "${GH_HOST:-github.com}" "$hostname" >> "$CREDENTIAL_CALLS"
+    fi
+    [[ "$hostname" == github.com && "${GH_AUTH_FAIL:-0}" == 0 ]] || exit 1
+    printf '%s\n' "${GH_STORED_TOKEN-installer-fixture-stored}"
+    exit 0
+fi
+# Model gh's own host and token precedence, independently of the installer.
+host="${GH_HOST:-github.com}"
+[[ "$repo" != */*/* ]] || host="${repo%%/*}"
+[[ -z "$hostname" ]] || host="$hostname"
+token="${GH_TOKEN:-${GITHUB_TOKEN:-${GH_STORED_TOKEN-installer-fixture-stored}}}"
+if [[ -n "${CREDENTIAL_CALLS:-}" ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$operation" "$host" "$repo" "$token" "$asset" >> "$CREDENTIAL_CALLS"
+fi
+if [[ "${GH_VERIFY_CONTEXT:-0}" == 1 ]]; then
+    [[ "$host" == github.com && "$token" == "$GH_EXPECTED_TOKEN" ]] || exit 1
+    [[ "$operation" == api\ * || "$repo" == "$GH_EXPECTED_REPO" || "$repo" == "github.com/$GH_EXPECTED_REPO" ]] || exit 1
+fi
+if [[ "$operation" == api\ * ]]; then
+    base=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    case "$endpoint" in
+        'repos/example/demo/commits?per_page=1') printf '[{"sha":"%s"}]\n' "$head" ;;
+        repos/example/demo/commits/tags%2Fv1.2.3) printf '{"sha":"%s"}\n' "$base" ;;
+        "repos/example/demo/compare/$base...$head?per_page=1")
+            printf '{"base_commit":{"sha":"%s"},"merge_base_commit":{"sha":"%s"},"status":"ahead","ahead_by":1,"behind_by":0,"total_commits":1,"commits":[{"sha":"%s"}]}\n' "$base" "$base" "$head" ;;
+        *) exit 1 ;;
+    esac
+    exit 0
+fi
+if [[ "$operation" == 'release view' ]]; then
+    printf 'gh view\n' >> "$CALLS"
+    [[ "$GH_FAIL" == 0 && -n "$GH_VIEW_TAG" ]] || exit 1
+    printf '%s\n' "$GH_VIEW_TAG"; exit 0
+fi
 printf 'gh %s\n' "$asset" >> "$CALLS"
 [[ "$GH_FAIL" == 0 && -n "$asset" && -n "$dest" && -f "$REMOTE/$asset" ]] || exit 1
 cp "$REMOTE/$asset" "$dest"
@@ -111,6 +147,172 @@ fi
 success() { [[ $status -eq 0 && -x "$case_dir/bin/demo" ]] && jq -es 'length == 1 and .[0].status == "success"' "$case_dir/out" >/dev/null; }
 blocked() { [[ $status -ne 0 && ! -e "$case_dir/bin/demo" && ! -e "$case_dir/cache/demo/v1.2.3/$os-$arch.tar.gz" ]]; }
 set_manifest() { printf '%s\n' "$1" > "$REMOTE/checksums.sha256"; }
+
+# The generated entry point must use one account for discovery, payloads,
+# checksums, signatures and freshness. Only the CLI/HTTP boundary is fake;
+# archives, hashes, cache decisions and installed bytes are real.
+test_installer_credential_routing() {
+    local payload="$work/payload/demo" work="$work/credential-routing"
+    local case_id=0 status=0 case_dir='' selected expected before label
+    local CALLS="$work/calls" CREDENTIAL_CALLS="$work/credentials"
+    local DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN='' GH_HOST=enterprise.example
+    local GH_REPO=enterprise.example/other/project GH_STORED_TOKEN=stored-fixture-token
+    local GH_VERIFY_CONTEXT=1 GH_EXPECTED_TOKEN='' GH_EXPECTED_REPO=example/demo GH_AUTH_FAIL=0
+    local CURL_FAIL=1 GH_FAIL=0 GH_VIEW_TAG=v1.2.3 LATEST_MODE=none
+    local VERSION_ARGS=(--version v1.2.3)
+    export CALLS CREDENTIAL_CALLS DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN GH_HOST GH_REPO
+    export GH_STORED_TOKEN GH_VERIFY_CONTEXT GH_EXPECTED_TOKEN GH_EXPECTED_REPO GH_AUTH_FAIL
+    export CURL_FAIL GH_FAIL GH_VIEW_TAG LATEST_MODE
+    mkdir -p "$work" || return 1
+    printf '%s  %s\n' "$hash" "$asset" > "$REMOTE/$asset.sha256"
+    for selected in dsr github gh stored; do
+        DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+        case "$selected" in
+            dsr) DSR_GH_TOKEN=dsr-fixture-token GITHUB_TOKEN=ci-fixture-token GH_TOKEN=cli-fixture-token; expected=$DSR_GH_TOKEN ;;
+            github) GITHUB_TOKEN=ci-fixture-token GH_TOKEN=cli-fixture-token; expected=$GITHUB_TOKEN ;;
+            gh) GH_TOKEN=cli-fixture-token; expected=$GH_TOKEN ;;
+            stored) expected=$GH_STORED_TOKEN ;;
+        esac
+        GH_EXPECTED_TOKEN="$expected"
+        : > "$CALLS"; : > "$CREDENTIAL_CALLS"
+        run_install --prefer-gh
+        check "$selected credential installs a checksum-verified release on github.com" success
+        check "$selected credential preserves the exact release executable" cmp -s "$payload" "$case_dir/bin/demo"
+        check "$selected credential routes both archive and sidecar to the explicit public repository" \
+            test "$(awk -F '\t' -v token="$expected" -v asset="$asset" '
+                $1=="release download" && $2=="github.com" && $3=="github.com/example/demo" && $4==token &&
+                ($5==asset || $5==asset ".sha256") {count++} END {print count+0}' "$CREDENTIAL_CALLS")" -eq 2
+        if [[ "$selected" == stored ]]; then
+            check 'stored credentials are read only from github.com' \
+                test "$(awk -F '\t' '$1=="auth" && $2=="github.com" && $3=="github.com" {count++} END {print count+0}' "$CREDENTIAL_CALLS")" -eq 2
+        else
+            check "$selected explicit credential never probes another stored account" \
+                test "$(grep -c '^auth' "$CREDENTIAL_CALLS" || true)" -eq 0
+        fi
+    done
+    DSR_GH_TOKEN=dsr-fixture-token GITHUB_TOKEN=ci-fixture-token GH_TOKEN=cli-fixture-token
+    GH_EXPECTED_TOKEN=$DSR_GH_TOKEN
+    : > "$CALLS"; : > "$CREDENTIAL_CALLS"
+    run_install
+    check 'default curl failure falls back to the selected authenticated account' success
+    check 'default mode still attempts anonymous curl first' \
+        test "$(head -n 1 "$CALLS")" = "curl https://github.com/example/demo/releases/download/v1.2.3/$asset"
+
+    VERSION_ARGS=()
+    : > "$CALLS"; : > "$CREDENTIAL_CALLS"
+    run_install --prefer-gh --allow-source-build --source-if-stale 1
+    check 'latest discovery and freshness share the selected release account' success
+    check 'private freshness reaches a validated release decision without compiling' \
+        jq -es 'length == 1 and (.[0] | .freshness.status == "fresh" and .freshness.commits_behind == 1 and (has("source") | not))' "$case_dir/out"
+    check 'latest release lookup is explicitly scoped to public GitHub' \
+        grep -q $'^release view\tgithub.com\tgithub.com/example/demo\tdsr-fixture-token\t' "$CREDENTIAL_CALLS"
+    check 'all three freshness requests use the selected account and public host' \
+        test "$(awk -F '\t' '$1 ~ /^api / && $2=="github.com" && $4=="dsr-fixture-token" {count++} END {print count+0}' "$CREDENTIAL_CALLS")" -eq 3
+    : > "$CREDENTIAL_CALLS"
+    status=0
+    bash -c 'source "$1"; install_source_freshness example/demo v1.2.3 1 "$2" --prefer-gh' \
+        bash "$ROOT/src/install_source.sh" "$work/standalone-freshness" \
+        > "$work/standalone.json" 2> "$work/standalone.err" || status=$?
+    check 'standalone source module resolves freshness with the same credentials' \
+        test "$status" -eq 0
+    check 'standalone source module produces verified freshness metadata' \
+        jq -es 'length == 1 and .[0].status == "fresh" and .[0].commits_behind == 1' "$work/standalone.json"
+
+    VERSION_ARGS=(--version v1.2.3)
+    DSR_GH_TOKEN=invalid-fixture-token GH_EXPECTED_TOKEN=cli-fixture-token GH_HOST=github.com
+    : > "$CREDENTIAL_CALLS"
+    run_install --prefer-gh
+    check 'invalid explicit DSR token cannot silently install through another account' blocked
+    check 'invalid explicit token never looks up a stored account' test "$(grep -c '^auth' "$CREDENTIAL_CALLS" || true)" -eq 0
+    DSR_GH_TOKEN='' GITHUB_TOKEN=invalid-ci-fixture-token
+    run_install --prefer-gh
+    check 'invalid explicit CI token cannot silently use GH_TOKEN' blocked
+    DSR_GH_TOKEN=dsr-fixture-token GITHUB_TOKEN=ci-fixture-token GH_EXPECTED_TOKEN=$DSR_GH_TOKEN GH_HOST=enterprise.example
+    CURL_FAIL=0 GH_FAIL=1
+    : > "$CALLS"
+    run_install --prefer-gh
+    check 'preferred authenticated transport failure retains anonymous public curl fallback' success
+    GH_FAIL=0
+    : > "$CREDENTIAL_CALLS"
+    run_install
+    check 'public default install succeeds without credential lookup' success
+    check 'successful anonymous downloads never inspect or use credentials' test ! -s "$CREDENTIAL_CALLS"
+
+    CURL_FAIL=1
+    printf '%064d  %s\n' 0 "$asset" > "$REMOTE/$asset.sha256"
+    : > "$CALLS"; : > "$CREDENTIAL_CALLS"
+    run_install --prefer-gh
+    check 'authenticated response with a wrong digest never installs or enters cache' blocked
+    check 'failed checksum cannot trigger another transport or account' test "$(wc -l < "$CREDENTIAL_CALLS")" -eq 2
+    printf '%s  %s\n' "$hash" "$asset" > "$REMOTE/$asset.sha256"
+    mkdir -p "$work/verifier" || return 1
+    cat > "$work/verifier/minisign" <<'SIGNER'
+#!/usr/bin/env bash
+printf 'minisign\n' >> "$CALLS"
+exit 1
+SIGNER
+    chmod +x "$work/verifier/minisign" || return 1
+    local PATH="$work/verifier:$PATH"
+    export PATH
+    printf 'invalid signature\n' > "$REMOTE/$asset.minisig"
+    case_id=$((case_id + 1)); case_dir="$work/case-$case_id"
+    mkdir -p "$case_dir" || return 1
+    status=0
+    : > "$CALLS"; : > "$CREDENTIAL_CALLS"
+    bash -c 'source "$1" --help >/dev/null
+        MINISIGN_PUBKEY=RWTRzlfQB0VAo0r4gvzjiptFkA9w/VNamRJSxtMaclvkt88+QlEMjQmw
+        main --version v1.2.3 --dir "$2/bin" --cache-dir "$2/cache" --prefer-gh --require-signatures --non-interactive --json --no-skills' \
+        bash "$installer" "$case_dir" > "$case_dir/out" 2> "$case_dir/err" || status=$?
+    check 'authenticated signature sidecar uses the same account and repository' \
+        grep -qF $'release download\tgithub.com\tgithub.com/example/demo\tdsr-fixture-token\t'"$asset.minisig" "$CREDENTIAL_CALLS"
+    check 'authenticated signature reaches verification after valid checksum' grep -q '^minisign$' "$CALLS"
+    check 'invalid authenticated signature blocks installation and cache publication' blocked
+    check 'failed signature never retries another transport or account' test "$(wc -l < "$CREDENTIAL_CALLS")" -eq 3
+    mv "$REMOTE/$asset.minisig" "$work/invalid-signature" || return 1
+
+    before="$DSR_GH_TOKEN|$GITHUB_TOKEN|$GH_TOKEN|$GH_HOST|$GH_REPO"
+    status=0
+    bash -c 'source "$1" --help >/dev/null; set -x
+        _installer_run_gh release view --repo github.com/example/demo --json tagName --jq .tagName || exit $?
+        traced=$-; set +x
+        [[ "$traced" == *x* ]] || exit 1
+        printf "%s\n" "$DSR_GH_TOKEN|$GITHUB_TOKEN|$GH_TOKEN|$GH_HOST|$GH_REPO"' \
+        bash "$installer" > "$work/parent.out" 2> "$work/parent.trace" || status=$?
+    check 'authenticated helper preserves caller environment and tracing state' \
+        test "$status:$(tail -n 1 "$work/parent.out")" = "0:$before"
+    check 'tracing does not expose the selected token' \
+        bash -c '! grep -Eq "(dsr|ci|cli|stored)-fixture-token" "$1"' bash "$work/parent.trace"
+
+    # Check every published script's actual transport, retaining its configured
+    # repository identity rather than replacing it with the fixture owner.
+    for label in bv cass ntm; do
+        GH_EXPECTED_REPO=$(sed -n "s/^REPO='\([^']*\)'/\1/p" "$ROOT/installers/$label/install.sh")
+        status=0
+        bash -c 'source "$1" --help >/dev/null; _VERSION=v1.2.3; _PREFER_GH=true; _fetch_release_asset "$2" "$3"' \
+            bash "$ROOT/installers/$label/install.sh" "$asset" "$work/$label.tar.gz" \
+            > "$work/$label.out" 2> "$work/$label.err" || status=$?
+        check "$label published installer pins its repository and selected credentials" test "$status" -eq 0
+        check "$label published installer retrieves exact release bytes" cmp -s "$REMOTE/$asset" "$work/$label.tar.gz"
+    done
+    GH_EXPECTED_REPO=example/demo
+    DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN='' GH_STORED_TOKEN='' GH_AUTH_FAIL=1
+    : > "$CREDENTIAL_CALLS"
+    run_install --prefer-gh
+    check 'missing public credentials fail without installing a private release' blocked
+    check 'failed stored lookup never invokes authenticated release operations' \
+        test "$(grep -c '^release ' "$CREDENTIAL_CALLS" || true)" -eq 0
+    CURL_FAIL=0
+    run_install --prefer-gh
+    check 'missing stored credentials still allow anonymous public downloads' success
+    mv "$REMOTE/$asset.sha256" "$work/verified-sidecar" || return 1
+}
+
+if [[ "${1:-}" == --credential-routing-only ]]; then
+    test_installer_credential_routing || exit 1
+    printf 'Installer credentials: %s passed, %s failed\n' "$passed" "$failed"
+    [[ $failed -eq 0 ]]
+    exit $?
+fi
 
 # Bounded routing coverage uses the executable protocol fixture above. The
 # separate compiler fixture below proves the genuine static Go installation;
@@ -576,6 +778,7 @@ if [[ "${1:-}" == --strict-contracts-only ]]; then
     [[ $failed -eq 0 ]]
     exit $?
 fi
+test_installer_credential_routing || exit 1
 set_manifest "$hash  $asset"
 run_install
 check 'default install verifies release name, not temporary archive name' success

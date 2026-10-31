@@ -660,7 +660,7 @@ _fetch_release_asset() {
     [[ "$asset" =~ ^[A-Za-z0-9._+-]+$ && "$asset" != . && "$asset" != .. ]] || return 4
     url="https://github.com/$REPO/releases/download/$_VERSION/${asset//+/%2B}"
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
+        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
             return 0
         fi
@@ -671,7 +671,7 @@ _fetch_release_asset() {
         return 0
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if gh release download "$_VERSION" --repo "$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
+        if _installer_run_gh release download "$_VERSION" --repo "github.com/$REPO" --pattern "$asset" --output "$dest" --clobber 2>/dev/null &&
            [[ -f "$dest" && ! -L "$dest" && -s "$dest" ]]; then
             return 0
         fi
@@ -692,7 +692,7 @@ _get_latest_version() {
     local response version="" effective prefix="https://github.com/$REPO/releases/tag/"
     $_OFFLINE_MODE && return 4
     if $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
+        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
            _valid_release_version "$version"; then
             printf '%s\n' "$version"; return 0
         fi
@@ -722,7 +722,7 @@ _get_latest_version() {
         fi
     fi
     if ! $_PREFER_GH && command -v gh &>/dev/null; then
-        if version=$(gh release view --repo "$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
+        if version=$(_installer_run_gh release view --repo "github.com/$REPO" --json tagName --jq '.tagName' 2>/dev/null) &&
            _valid_release_version "$version"; then
             printf '%s\n' "$version"; return 0
         fi
@@ -2562,6 +2562,7 @@ install_gen_create() {
     # Target triple + arch alias overrides (optional)
     local target_triple_cases=""
     local arch_alias_cases=""
+    local platform triple arch alias
     if command -v yq &>/dev/null; then
         if ! declare -F config_validate_target_triples &>/dev/null; then
             # shellcheck source=SCRIPTDIR/config.sh
