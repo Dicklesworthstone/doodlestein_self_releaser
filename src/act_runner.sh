@@ -13,6 +13,8 @@ set -uo pipefail
 # Reload the authoritative policy even if a caller inherited exported helpers.
 # shellcheck source=src/guardrails.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/guardrails.sh" || { return 3 2>/dev/null || exit 3; }
+# shellcheck source=src/platforms.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 # Configuration (can be overridden)
 ACT_ARTIFACTS_DIR="${ACT_ARTIFACTS_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/artifacts}"
@@ -619,6 +621,7 @@ _act_validate_target_binary_reader() {
     shift 5
     local reader_args=("$@")
     local header machine pe_offset_hex pe_offset optional_magic
+    local elf_class elf_machine elf_minimum elf_osabi pe_machine pe_magic
 
     if [[ ! "$size" =~ ^[1-9][0-9]*$ ]]; then
         _log_error "Target primary has no readable bytes: $label"
@@ -626,18 +629,26 @@ _act_validate_target_binary_reader() {
     fi
 
     case "$target" in
-        linux/amd64|linux/arm64)
-            if ((size < 64)) || \
+        linux/amd64|linux/arm64|linux/386|linux/armv7|freebsd/amd64)
+            elf_class=02 elf_minimum=64
+            case "$target" in
+                linux/amd64|freebsd/amd64) elf_machine=3e00 ;;
+                linux/arm64) elf_machine=b700 ;;
+                linux/386) elf_class=01 elf_minimum=52 elf_machine=0300 ;;
+                linux/armv7) elf_class=01 elf_minimum=52 elf_machine=2800 ;;
+            esac
+            if ((size < elf_minimum)) || \
                ! header=$("$reader" "${reader_args[@]}" 0 20); then
-                _log_error "Target primary is not a complete ELF64 header: $label"
+                _log_error "Target primary is not a complete ELF header for $target: $label"
                 return 4
             fi
             machine="${header:36:4}"
-            if [[ "${header:0:8}" != "7f454c46" || "${header:8:2}" != "02" || \
-                  "${header:10:2}" != "01" ]] || \
-               { [[ "$target" == "linux/amd64" ]] && [[ "$machine" != "3e00" ]]; } || \
-               { [[ "$target" == "linux/arm64" ]] && [[ "$machine" != "b700" ]]; }; then
-                _log_error "Target primary ELF format/architecture does not match $target: $label"
+            elf_osabi="${header:14:2}"
+            if [[ "${header:0:8}" != "7f454c46" || "${header:8:2}" != "$elf_class" || \
+                  "${header:10:2}" != "01" || "$machine" != "$elf_machine" ]] || \
+               { [[ "$target" == freebsd/* ]] && [[ "$elf_osabi" != 09 ]]; } || \
+               { [[ "$target" == linux/* ]] && [[ "$elf_osabi" != 00 && "$elf_osabi" != 03 ]]; }; then
+                _log_error "Target primary ELF format/OS/architecture does not match $target: $label"
                 return 4
             fi
             if [[ "$executable" != "true" ]]; then
@@ -663,11 +674,17 @@ _act_validate_target_binary_reader() {
                 return 4
             fi
             ;;
-        windows/amd64|windows/arm64)
+        windows/amd64|windows/arm64|windows/386)
+            pe_magic=0b02
+            case "$target" in
+                windows/amd64) pe_machine=6486 ;;
+                windows/arm64) pe_machine=64aa ;;
+                windows/386) pe_machine=4c01 pe_magic=0b01 ;;
+            esac
             if ((size < 90)) || \
                [[ "$("$reader" "${reader_args[@]}" 0 2 2>/dev/null || true)" != "4d5a" ]] || \
                ! pe_offset_hex=$("$reader" "${reader_args[@]}" 60 4); then
-                _log_error "Target primary is not a complete PE32+ executable: $label"
+                _log_error "Target primary is not a complete PE executable: $label"
                 return 4
             fi
             pe_offset=$((0x${pe_offset_hex:6:2}${pe_offset_hex:4:2}${pe_offset_hex:2:2}${pe_offset_hex:0:2}))
@@ -675,9 +692,7 @@ _act_validate_target_binary_reader() {
                [[ "$("$reader" "${reader_args[@]}" "$pe_offset" 4 2>/dev/null || true)" != "50450000" ]] || \
                ! machine=$("$reader" "${reader_args[@]}" "$((pe_offset + 4))" 2) || \
                ! optional_magic=$("$reader" "${reader_args[@]}" "$((pe_offset + 24))" 2) || \
-               [[ "$optional_magic" != "0b02" ]] || \
-               { [[ "$target" == "windows/amd64" ]] && [[ "$machine" != "6486" ]]; } || \
-               { [[ "$target" == "windows/arm64" ]] && [[ "$machine" != "64aa" ]]; }; then
+               [[ "$optional_magic" != "$pe_magic" || "$machine" != "$pe_machine" ]]; then
                 _log_error "Target primary PE format/architecture does not match $target: $label"
                 return 4
             fi
@@ -2540,6 +2555,14 @@ act_load_repo_config() {
         return 3
     fi
 
+    # Reject the complete configured matrix before even selecting source or
+    # hosts. A CLI subset must not hide an unsupported target in the config.
+    local configured_targets
+    configured_targets=$(yq -o=json -I=0 '.targets' "$config_file") || return 4
+    if [[ "$configured_targets" != null ]]; then
+        dsr_platform_validate_targets_json "$configured_targets" "targets for $tool_name" || return 4
+    fi
+
     # Load config into variables
     ACT_REPO_NAME=$(yq -r '.tool_name // ""' "$config_file")
     ACT_REPO_GITHUB=$(yq -r '.repo // ""' "$config_file")
@@ -3302,10 +3325,10 @@ _act_accept_collected_binary() {
     local glibc_floor="${4:-}"
 
     case "$language" in rust|go) ;; *) return 0 ;; esac
-    case "$platform" in
-        linux/amd64|linux/arm64|darwin/amd64|darwin/arm64|windows/amd64|windows/arm64) ;;
-        *) return 0 ;;
-    esac
+    dsr_platform_is_supported "$platform" || {
+        _log_error "Unsupported collected binary platform: $platform"
+        return 4
+    }
 
     if ! _act_validate_target_binary "$path" "$platform"; then
         _log_error "Collected artifact is not a $platform executable: $path (the build host produced the wrong architecture; refusing to package it)"
@@ -7376,10 +7399,14 @@ _act_default_rust_target_triple() {
     case "$1" in
         linux/amd64) printf 'x86_64-unknown-linux-gnu\n' ;;
         linux/arm64) printf 'aarch64-unknown-linux-gnu\n' ;;
+        linux/386) printf 'i686-unknown-linux-gnu\n' ;;
+        linux/armv7) printf 'armv7-unknown-linux-gnueabihf\n' ;;
         darwin/amd64) printf 'x86_64-apple-darwin\n' ;;
         darwin/arm64) printf 'aarch64-apple-darwin\n' ;;
         windows/amd64) printf 'x86_64-pc-windows-msvc\n' ;;
         windows/arm64) printf 'aarch64-pc-windows-msvc\n' ;;
+        windows/386) printf 'i686-pc-windows-msvc\n' ;;
+        freebsd/amd64) printf 'x86_64-unknown-freebsd\n' ;;
         *) return 4 ;;
     esac
 }
@@ -7731,6 +7758,9 @@ act_ensure_repos_ready() {
     # Determine targets
     local targets
     if [[ ${#targets_arg[@]} -gt 0 ]]; then
+        local selected_targets_json
+        selected_targets_json=$(printf '%s\0' "${targets_arg[@]}" | jq -Rsc 'split("\u0000")[:-1]') || return 4
+        dsr_platform_validate_targets_json "$selected_targets_json" "selected targets for $tool_name" || return 4
         targets="${targets_arg[*]}"
     else
         targets=$(act_get_targets "$tool_name")
@@ -12127,8 +12157,9 @@ act_orchestrate_build() {
     fi
 
     # Get targets (from args or config)
-    local targets
+    local targets selected_targets_json=""
     if [[ ${#targets_arg[@]} -gt 0 ]]; then
+        selected_targets_json=$(printf '%s\0' "${targets_arg[@]}" | jq -Rsc 'split("\u0000")[:-1]') || return 4
         targets="${targets_arg[*]}"
     else
         targets=$(act_get_targets "$tool_name")
@@ -12142,12 +12173,25 @@ act_orchestrate_build() {
     fi
 
     local requested_targets_json
-    requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
-        jq -Rsc 'split("\n") | map(select(length > 0))')
+    if [[ -n "$selected_targets_json" ]]; then
+        requested_targets_json="$selected_targets_json"
+    else
+        requested_targets_json=$(for target in $targets; do printf '%s\n' "$target"; done | \
+            jq -Rsc 'split("\n") | map(select(length > 0))') || return 4
+    fi
     if ! jq -en --argjson requested "$requested_targets_json" \
         '($requested | length) == ($requested | unique | length)' >/dev/null 2>&1; then
         _log_error "Duplicate build targets are not allowed"
         jq -nc --arg tool "$tool_name" --arg error "Duplicate build targets are not allowed" \
+            '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
+        return 4
+    fi
+
+    local target_validation_error
+    if ! target_validation_error=$(dsr_platform_validate_targets_json \
+        "$requested_targets_json" "build targets for $tool_name" 2>&1); then
+        _log_error "$target_validation_error"
+        jq -nc --arg tool "$tool_name" --arg error "$target_validation_error" \
             '{tool: $tool, status: "error", summary: {total: 0, success: 0, failed: 0}, error: $error, targets: []}'
         return 4
     fi
@@ -13702,6 +13746,7 @@ _act_generate_contract_manifest() {
 # Generate build manifest from orchestration results
 # Usage: act_generate_manifest <orchestration_result_json> <output_file>
 _act_verify_collected_manifest() {
+    [[ $# -eq 2 || ( $# -eq 3 && "$3" == --collected ) ]] || return 4
     local manifest="$1" directory="$2" name sha size path
     jq -e '.artifacts | length > 0 and
         (map(.name) | length == (unique | length)) and
@@ -13715,6 +13760,34 @@ _act_verify_collected_manifest() {
             return 4
         fi
     done < <(jq -r '.artifacts[] | [.name,.sha256,(.size_bytes|tostring)] | @tsv' "$manifest")
+
+    # CLI collection owns this NUL-framed inventory. Paths found in a manifest
+    # cannot declare their own completeness: every actual collected payload
+    # must survive naming and packaging as a manifest row. Share the existing
+    # CLI coverage gate with direct final-admission callers and regression tests.
+    if [[ "${3:-}" == --collected ]]; then
+        local -a collected=()
+        local collected_json
+        name=""
+        while IFS= read -r -d '' name; do
+            [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || return 4
+            case "$name" in
+                *.minisig|*.sig|*.sha256|*.sha512|SHA256SUMS*|*.sbom.*|*.intoto.jsonl) ;;
+                *) collected+=("$name") ;;
+            esac
+        done
+        [[ -z "$name" ]] || return 4
+        if [[ ${#collected[@]} -gt 0 ]]; then
+            collected_json=$(printf '%s\n' "${collected[@]}" | jq -Rsc 'split("\n")[:-1]') || return 4
+            jq -e --argjson collected "$collected_json" '
+                (.artifacts | map(.name)) as $names |
+                all($collected[]; . as $name | $names | index($name) != null)
+            ' "$manifest" >/dev/null || {
+                _log_error "Collected artifact is absent from final manifest"
+                return 4
+            }
+        fi
+    fi
     return 0
 }
 
@@ -13841,13 +13914,16 @@ act_generate_manifest() {
         case "$nm" in
             *darwin*)        os="darwin" ;;
             *linux*)         os="linux" ;;
+            *freebsd*)       os="freebsd" ;;
             *windows*|*.exe) os="windows" ;;
         esac
         case "$nm" in
             *_aarch64*|*-aarch64*|*_arm64*|*-arm64*) arch="arm64" ;;
             *_x86_64*|*-x86_64*|*_amd64*|*-amd64*)   arch="amd64" ;;
+            *_armv7*|*-armv7*) arch="armv7" ;;
+            *_386*|*-386*|*_i686*|*-i686*) arch="386" ;;
         esac
-        [[ -n "$os" && -n "$arch" ]] && printf '%s/%s\n' "$os" "$arch"
+        dsr_platform_is_supported "$os/$arch" && printf '%s/%s\n' "$os" "$arch"
     }
 
     _act_manifest_target_triple() {
@@ -14169,10 +14245,10 @@ act_generate_manifest() {
         _log_error "Failed to serialize build environment receipts"
         return 4
     }
-    requested_targets_json=$(jq -c '
+    requested_targets_json=$(jq -c --arg platform_pattern "$(dsr_platform_pattern)" '
         .requested_targets // null |
         if . == null or (type == "array" and all(.[];
-            type == "string" and test("^(linux|darwin|windows)/(amd64|arm64|386)$")))
+            type == "string" and (test("[\u0000-\u001f\u007f]") | not) and test($platform_pattern)))
         then . else error("invalid requested build platforms") end
     ' <<< "$result_json") || return 4
 

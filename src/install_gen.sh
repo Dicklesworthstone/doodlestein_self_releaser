@@ -17,6 +17,8 @@ set -uo pipefail
 
 # Get script directory for sourcing dependencies
 _IG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/platforms.sh
+source "$_IG_SCRIPT_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 # Source dependencies if not already loaded
 if ! declare -f log_info &>/dev/null; then
@@ -109,6 +111,8 @@ BINARY_NAME='__BINARY_NAME__'
 ARCHIVE_FORMAT_LINUX="__ARCHIVE_FORMAT_LINUX__"
 ARCHIVE_FORMAT_DARWIN="__ARCHIVE_FORMAT_DARWIN__"
 ARCHIVE_FORMAT_WINDOWS="__ARCHIVE_FORMAT_WINDOWS__"
+ARCHIVE_FORMAT_FREEBSD="__ARCHIVE_FORMAT_FREEBSD__"
+SUPPORTED_PLATFORM_PATTERN="__SUPPORTED_PLATFORM_PATTERN__"
 # The template is data, not shell code. Expand its variables only in the renderer.
 ARTIFACT_NAMING='__ARTIFACT_NAMING__'
 LINUX_LIBC_FALLBACK='__LINUX_LIBC_FALLBACK__'
@@ -293,6 +297,7 @@ _detect_platform() {
     case "$os" in
         darwin) os="darwin" ;;
         linux) os="linux" ;;
+        freebsd) os="freebsd" ;;
         mingw*|msys*|cygwin*) os="windows" ;;
         *) _log_error "Unsupported OS: $os"; return 1 ;;
     esac
@@ -306,6 +311,10 @@ _detect_platform() {
         *) _log_error "Unsupported architecture: $arch"; return 1 ;;
     esac
 
+    if [[ ! "$os/$arch" =~ $SUPPORTED_PLATFORM_PATTERN ]]; then
+        _log_error "Unsupported platform: $os/$arch"
+        return 1
+    fi
     echo "$os/$arch"
 }
 
@@ -318,6 +327,7 @@ _get_archive_format() {
         linux) echo "$ARCHIVE_FORMAT_LINUX" ;;
         darwin) echo "$ARCHIVE_FORMAT_DARWIN" ;;
         windows) echo "$ARCHIVE_FORMAT_WINDOWS" ;;
+        freebsd) echo "$ARCHIVE_FORMAT_FREEBSD" ;;
         *) echo "tar.gz" ;;
     esac
 }
@@ -454,6 +464,8 @@ _target_triple_candidates() {
         darwin/arm64) echo "aarch64-apple-darwin" ;;
         windows/amd64) echo "x86_64-pc-windows-msvc" ;;
         windows/arm64) echo "aarch64-pc-windows-msvc" ;;
+        windows/386) echo "i686-pc-windows-msvc" ;;
+        freebsd/amd64) echo "x86_64-unknown-freebsd" ;;
         *) echo "${os}-${arch}" ;;
     esac
 }
@@ -2317,7 +2329,7 @@ _install_gen_archive_formats() {
             log_error "yq and jq are required to validate configured archive formats"
             return 3
         fi
-        printf 'tar.gz\ttar.gz\tzip\n'
+        printf 'tar.gz\ttar.gz\tzip\ttar.gz\n'
         return 0
     fi
     config_json=$(yq -o=json -I=0 '.' "$config_file" 2>/dev/null) || {
@@ -2338,8 +2350,8 @@ _install_gen_archive_formats() {
         else error("expected one repository configuration") end |
         if . == null or format or
            (type == "object" and all(to_entries[];
-                (.key | IN("linux", "darwin", "windows")) and (.value == null or (.value | format))))
-        then [selected("linux"), selected("darwin"), selected("windows")] | @tsv
+                (.key | IN("linux", "darwin", "windows", "freebsd")) and (.value == null or (.value | format))))
+        then [selected("linux"), selected("darwin"), selected("windows"), selected("freebsd")] | @tsv
         else error("archive_format must be a supported format or OS mapping") end
     ' <<< "$config_json"); then
         log_error "Invalid archive_format in $config_file"
@@ -2389,11 +2401,11 @@ _install_gen_contract_model() (
         platform=$(jq -er '.platform' <<< "$row") || return 4
         triple=$(jq -er '.target_triple | strings' <<< "$row") || return 4
         if [[ -z "$triple" ]]; then
-            case "$platform" in
-                linux/amd64|linux/arm64|darwin/amd64|darwin/arm64|windows/amd64|windows/arm64)
-                    triple=$(_an_default_target_triple "${platform%/*}" "${platform#*/}") || return 4 ;;
-                *) log_error "Declare target_triples for strict installer platform $platform"; return 4 ;;
-            esac
+            dsr_platform_is_supported "$platform" || {
+                log_error "Unsupported strict installer platform $platform"
+                return 4
+            }
+            triple=$(_an_default_target_triple "${platform%/*}" "${platform#*/}") || return 4
         fi
         # Native matrix workers already reject fixed conflicting targets. Do
         # the same for installers, including singleton defaults: a configured
@@ -2460,7 +2472,7 @@ install_gen_create() {
 
     # Extract values
     local repo binary_name language workflow_path local_path
-    local archive_linux archive_darwin archive_windows archive_formats
+    local archive_linux archive_darwin archive_windows archive_freebsd archive_formats
     local artifact_naming linux_libc_fallback=none workspace_binary_cases libc_independent_go_cases
     local contract_model strict_release_contract=false contract_asset_cases=''
     local source_subdir source_entry source_package source_engine toolchain_engine field value output_observation
@@ -2502,7 +2514,7 @@ install_gen_create() {
     [[ "$language" == rust || -z "$source_package" ]] || return 4
 
     archive_formats=$(_install_gen_archive_formats "$config_file") || return $?
-    IFS=$'\t' read -r archive_linux archive_darwin archive_windows <<< "$archive_formats"
+    IFS=$'\t' read -r archive_linux archive_darwin archive_windows archive_freebsd <<< "$archive_formats"
 
     artifact_naming=$(_install_gen_yaml_get "$config_file" "artifact_naming" "")
     # Strip surrounding quotes if present
@@ -2726,6 +2738,8 @@ install_gen_create() {
     template="${template//__ARCHIVE_FORMAT_LINUX__/$archive_linux}"
     template="${template//__ARCHIVE_FORMAT_DARWIN__/$archive_darwin}"
     template="${template//__ARCHIVE_FORMAT_WINDOWS__/$archive_windows}"
+    template="${template//__ARCHIVE_FORMAT_FREEBSD__/$archive_freebsd}"
+    template="${template//__SUPPORTED_PLATFORM_PATTERN__/$(dsr_platform_pattern)}"
     template="${template//__ARTIFACT_NAMING__/$artifact_naming}"
     template="${template//__LINUX_LIBC_FALLBACK__/$linux_libc_fallback}"
     template="${template//__STRICT_RELEASE_CONTRACT__/$strict_release_contract}"

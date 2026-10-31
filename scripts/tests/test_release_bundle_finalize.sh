@@ -117,6 +117,7 @@ mkdir -p "$WORK/cli"
 cp "$ROOT/src/release_finalize.sh" "$WORK/cli/release_finalize.sh"
 cp "$ROOT/src/release_bundle.sh" "$WORK/cli/release_bundle.sh"
 cp "$ROOT/src/slsa.sh" "$WORK/cli/slsa.sh"
+cp "$ROOT/src/platforms.sh" "$WORK/cli/platforms.sh"
 cat > "$WORK/cli/release_finalize_core.sh" <<'SH'
 #!/usr/bin/env bash
 release_finalize() { jq -cn --args '{legacy_args:$ARGS.positional}' -- "$@"; }

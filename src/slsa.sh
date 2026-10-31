@@ -5,6 +5,10 @@
 # Sourceable API: slsa_generate, slsa_generate_batch, slsa_verify,
 # slsa_generate_json. Build timestamps are omitted unless backed by evidence.
 
+_SLSA_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/platforms.sh
+source "$_SLSA_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
+
 # shellcheck disable=SC2034 # spec version constant for scripts that source this module
 SLSA_SPEC_VERSION="1.0"
 SLSA_BUILDER_ID="${SLSA_BUILDER_ID:-https://github.com/Dicklesworthstone/doodlestein_self_releaser}"
@@ -329,13 +333,14 @@ _slsa_manifest_statement() {
     repository=$(_slsa_repository "$repository") || return $?
     _slsa_text "$builder" || return 4
     digest=$(_slsa_sha256 "$manifest") || return $?
-    statement=$(jq -ceS -s --arg repo "$repository" --arg builder "$builder" --arg digest "$digest" '
+    statement=$(jq -ceS -s --arg repo "$repository" --arg builder "$builder" --arg digest "$digest" \
+        --arg platform_pattern "$(dsr_platform_pattern)" '
         def text: type == "string" and length > 0 and (test("[\u0000-\u001f\u007f]") | not);
         def name: text and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$") and (contains("..") | not);
         def sha: type == "string" and length == 64 and test("^[0-9a-f]{64}$");
         def commit: type == "string" and length == 40 and test("^[0-9a-f]{40}$") and . != ("0" * 40);
         def count: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
-        def target: text and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
+        def target: text and test($platform_pattern);
         def triple: text and test("^[A-Za-z0-9][A-Za-z0-9._+\\-]*$") and (contains("..") | not);
         def optional_triple: . == null or triple;
         # Native manifests use this exact non-platform identity for shared

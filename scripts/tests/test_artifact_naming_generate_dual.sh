@@ -421,6 +421,28 @@ test_platform_windows_arm64_target_triple() {
     fi
 }
 
+test_additional_platform_target_triples() {
+    local target triple result
+    while IFS=' ' read -r target triple; do
+        log_test "Platform: $target target triple"
+        result=$(artifact_naming_substitute '${name}-${target_triple}.${ext}' \
+            "app" "v2.0.0" "${target%/*}" "${target#*/}" "tar.gz" "missing-tool")
+        ((TEST_COUNT++))
+        if [[ "$result" == "app-$triple.tar.gz" ]]; then
+            ((PASS_COUNT++))
+            log_pass "$target uses compiler triple $triple"
+        else
+            ((FAIL_COUNT++))
+            log_fail "Expected app-$triple.tar.gz, got: $result"
+        fi
+    done <<'TRIPLES'
+linux/armv7 armv7-unknown-linux-gnueabihf
+freebsd/amd64 x86_64-unknown-freebsd
+linux/386 i686-unknown-linux-gnu
+windows/386 i686-pc-windows-msvc
+TRIPLES
+}
+
 # =============================================================================
 # TEST: EDGE CASES
 # =============================================================================
@@ -601,6 +623,7 @@ main() {
     test_platform_darwin_amd64
     test_platform_windows_arm64
     test_platform_windows_arm64_target_triple
+    test_additional_platform_target_triples
     end_phase "pass" $((TEST_COUNT - phase_tests))
 
     # Phase 7: Edge Cases

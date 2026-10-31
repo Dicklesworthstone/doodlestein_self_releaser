@@ -139,7 +139,7 @@ assert 'runtime packaging failure never invokes remote policy' test ! -s "$CASE/
 # coordinating/admission/packaging module is copied byte-for-byte from source.
 INSTALL="$WORK/install"
 mkdir -p "$INSTALL/src"
-for module in release_finalize release_finalize_core release_packaging_pipeline release_packaging release_builds release_bundle slsa packaging guardrails; do
+for module in release_finalize release_finalize_core release_packaging_pipeline release_packaging release_builds release_bundle slsa platforms packaging guardrails; do
     cp "$ROOT/src/$module.sh" "$INSTALL/src/" || exit 1
 done
 cat > "$INSTALL/dsr" <<'DRIVER'

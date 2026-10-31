@@ -3,6 +3,8 @@
 # The operator pins the complete target matrix and every input manifest before
 # collection. Imported shards are immutable checkpoints, not success markers.
 _RELEASE_BUNDLE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/platforms.sh
+source "$_RELEASE_BUNDLE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 _rb_log() { printf '[release-bundle] %s\n' "$*" >&2; }
 _rb_require() {
@@ -19,12 +21,12 @@ _rb_require() {
 # Paths are local operator selections, never read out of a build manifest.
 # Sorting makes argument/target order irrelevant to recovery identity.
 _rb_plan() {
-    jq -csSe '
+    jq -csSe --arg platform_pattern "$(dsr_platform_pattern)" '
         def text: type=="string" and length>0 and (test("[\u0000-\u001f\u007f]")|not);
         def name: text and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..")|not);
         def hash: type=="string" and test("^[0-9a-f]{64}$");
         def path: text and startswith("/") and (contains("\\")|not);
-        def target: type=="string" and test("^(linux|darwin|windows)/(amd64|arm64|386)$");
+        def target: text and test($platform_pattern);
         def targets: type=="array" and length>0 and all(.[];target) and (unique|length)==length;
         def triple: text and length<=128 and test("^[A-Za-z0-9][A-Za-z0-9._+-]*$") and (contains("..")|not);
         def variant: type=="object" and keys==["target","target_triple"] and

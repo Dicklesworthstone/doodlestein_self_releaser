@@ -97,7 +97,27 @@ class Endpoint(BaseHTTPRequestHandler):
         requested_range = self.headers.get('Range')
         if behavior == 'require-range' and not requested_range:
             return self.response(503)
-        if requested_range and behavior != 'ignore-range':
+        if requested_range and behavior in ('truncated-200', 'truncated-206'):
+            offset = int(requested_range.removeprefix('bytes=').removesuffix('-'))
+            self.send_response(200 if behavior == 'truncated-200' else 206)
+            self.send_header('Content-Length', str(len(data) if behavior == 'truncated-200' else len(data) - offset))
+            if behavior == 'truncated-206':
+                self.send_header('Content-Range', 'bytes %d-%d/%d' % (offset, len(data) - 1, len(data)))
+            # Close before the required blank line, without a complete body.
+            # A genuine transport truncation must not trigger a full retry.
+            self.flush_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            return
+        if requested_range and behavior == '200-with-range':
+            offset = int(requested_range.removeprefix('bytes=').removesuffix('-'))
+            return self.response(200, data[offset:],
+                                 {'Content-Range': 'bytes %d-%d/%d' % (offset, len(data) - 1, len(data))})
+        if requested_range and behavior == 'refused-range':
+            return self.response(416)
+        ignored_range = behavior in ('ignore-range', 'ignore-range-chunked', 'ignore-range-corrupt',
+                                     'ignore-range-oversized', 'ignore-range-unavailable')
+        if requested_range and not ignored_range:
             match = re.fullmatch(r'bytes=([0-9]+)-', requested_range)
             if match is None or int(match[1]) >= len(data):
                 return self.response(416)
@@ -138,7 +158,14 @@ class Endpoint(BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
             return
-        if behavior in ('complete-disconnect', 'partial-disconnect', 'hold-complete'):
+        if not requested_range and behavior == 'ignore-range-unavailable':
+            return self.response(503)
+        if not requested_range and behavior == 'ignore-range-corrupt':
+            data = b'x' * len(data)
+        if not requested_range and behavior == 'ignore-range-oversized':
+            data += b'x' * 65536
+        if behavior in ('complete-disconnect', 'partial-disconnect', 'hold-complete',
+                        'ignore-range-chunked', 'ignore-range-oversized'):
             self.send_response(200)
             self.send_header('Transfer-Encoding', 'chunked')
             self.send_header('Connection', 'close')
@@ -151,8 +178,11 @@ class Endpoint(BaseHTTPRequestHandler):
             if behavior == 'hold-complete':
                 state.holding.set()
                 state.release.wait(timeout=15)
-            # Deliberately omit the terminating chunk: genuine curl retains
-            # downloaded bytes but refuses to certify a completed transfer.
+            if ignored_range:
+                self.wfile.write(b'0\r\n\r\n')
+                self.wfile.flush()
+            # Disconnect fixtures deliberately omit the terminating chunk:
+            # curl retains bytes but refuses to certify a completed transfer.
             self.close_connection = True
             return
         return self.response(200, data)
@@ -423,17 +453,59 @@ class Recovery(unittest.TestCase):
     def test_server_ignoring_range_restarts_once_without_overwriting_prefix(self):
         old = self.failed_partial()
         before = snapshot(old)
+        for behavior in ('ignore-range', 'ignore-range-chunked'):
+            with self.subTest(behavior=behavior):
+                self.service.behaviors[100] = behavior
+                self.service.requests.clear()
+                code, result, output = self.invoke(behavior, '--resume-from', old)
+                self.assert_complete(code, result, output)
+                self.assertEqual(result['resume']['continued_count'], 0)
+                self.assertEqual(result['resume']['continued_bytes'], 0)
+                self.assertEqual(result['resume']['restarted_count'], 1)
+                requested = [r['range'] for r in self.service.requests if r['path'] == '/asset/100']
+                self.assertEqual(requested, ['bytes=262144-', None])
+                retained = list((output / 'requests').glob('*.unused-prefix'))
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].read_bytes(), self.service.payloads['a.bin'][:262144])
+                self.assert_fresh_evidence()
+                self.assertEqual(snapshot(old), before)
+
+    def test_ignored_range_restart_still_requires_complete_verified_payload(self):
+        old = self.failed_partial()
+        before = snapshot(old)
+        for behavior in ('ignore-range-corrupt', 'ignore-range-oversized', 'ignore-range-unavailable'):
+            with self.subTest(behavior=behavior):
+                self.service.behaviors[100] = behavior
+                self.service.requests.clear()
+                code, result, output = self.invoke(behavior, '--resume-from', old)
+                self.assertNotEqual(code, 0, result)
+                self.assertEqual(result['verified_count'], 0)
+                self.assertEqual(result['resume']['continued_count'], 0)
+                self.assertEqual(result['resume']['restarted_count'], 0)
+                self.assertFalse((output / 'checksums.normalized').exists())
+                requested = [r['range'] for r in self.service.requests if r['path'] == '/asset/100']
+                self.assertEqual(requested, ['bytes=262144-', None])
+                retained = list((output / 'requests').glob('*.unused-prefix'))
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].read_bytes(), self.service.payloads['a.bin'][:262144])
+                self.assert_fresh_evidence()
+                self.assertEqual(snapshot(old), before)
+                if (output / 'artifacts/a.bin').exists():
+                    self.assertLessEqual((output / 'artifacts/a.bin').stat().st_size, len(self.service.payloads['a.bin']))
+
+    def test_ignored_range_restart_still_rechecks_inventory(self):
+        old = self.failed_partial()
+        before = snapshot(old)
         self.service.behaviors[100] = 'ignore-range'
-        code, result, output = self.invoke('resumed', '--resume-from', old)
-        self.assert_complete(code, result, output)
-        self.assertEqual(result['resume']['continued_count'], 0)
-        self.assertEqual(result['resume']['continued_bytes'], 0)
+        self.service.inventory_reads = 0
+        self.service.change_after_download = True
+        code, result, output = self.invoke('drift', '--resume-from', old)
+        self.assertNotEqual(code, 0, result)
+        self.assertEqual(result['verified_count'], 4)
         self.assertEqual(result['resume']['restarted_count'], 1)
-        requested = [r['range'] for r in self.service.requests if r['path'] == '/asset/100']
-        self.assertEqual(requested, ['bytes=262144-', None])
-        retained = list((output / 'requests').glob('*.unused-prefix'))
-        self.assertEqual(len(retained), 1)
-        self.assertEqual(retained[0].read_bytes(), self.service.payloads['a.bin'][:262144])
+        self.assertIn('changed during verification', result['error'])
+        self.assertFalse(result['inventory_stable'])
+        self.assertFalse((output / 'checksums.normalized').exists())
         self.assertEqual(snapshot(old), before)
 
     def test_repeated_transfer_failure_continues_from_new_longer_prefix(self):
@@ -461,7 +533,8 @@ class Recovery(unittest.TestCase):
         old = self.failed_partial()
         before = snapshot(old)
         for behavior in ('wrong-range', 'wrong-start', 'missing-range', 'duplicate-range',
-                         'encoded-range', 'corrupt-suffix', 'excessive-range'):
+                         'encoded-range', 'corrupt-suffix', 'excessive-range', 'truncated-200',
+                         'truncated-206', '200-with-range', 'refused-range'):
             with self.subTest(behavior=behavior):
                 self.service.behaviors[100] = behavior
                 self.service.requests.clear()
@@ -469,7 +542,9 @@ class Recovery(unittest.TestCase):
                 self.assertNotEqual(code, 0, result)
                 self.assertEqual(result['verified_count'], 0)
                 self.assertEqual(result['resume']['continued_count'], 0)
+                self.assertEqual(result['resume']['restarted_count'], 0)
                 self.assertFalse((output / 'checksums.normalized').exists())
+                self.assertFalse(list((output / 'requests').glob('*.unused-prefix')))
                 requests = [r for r in self.service.requests if r['path'] == '/asset/100']
                 self.assertEqual(len(requests), 1)
                 self.assertEqual(requests[0]['range'], 'bytes=262144-')

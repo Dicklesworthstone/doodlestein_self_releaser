@@ -3,10 +3,12 @@
 # Archive safety, extraction and payload parity use the existing packaging API;
 # both input and output manifests pass the shared successful-release admission.
 _RELEASE_PACKAGING_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/platforms.sh
+source "$_RELEASE_PACKAGING_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 _rpackage_execute() {
     command -v python3 >/dev/null || return 3
-    exec python3 - "$_RELEASE_PACKAGING_DIR" "$@" <<'PY'
+    exec python3 - "$_RELEASE_PACKAGING_DIR" "$(dsr_platform_pattern)" "$@" <<'PY'
 import argparse
 import copy
 import fcntl
@@ -21,6 +23,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+
+PLATFORM_PATTERN = sys.argv.pop(2)
 
 class Failure(Exception):
     def __init__(self, message, code=7):
@@ -106,7 +110,7 @@ def recipe(value):
         base = {"name", "target", "archive_format"}
         need(base <= set(item) <= base | {"source", "members", "aliases", "source_files", "target_triple"} and
              ("source" in item) != ("members" in item), "select source or members, not both", 4)
-        need(name(item["name"]) and match(item["target"], r"(linux|darwin|windows)/(amd64|arm64|386)") and
+        need(name(item["name"]) and match(item["target"], PLATFORM_PATTERN) and
              isinstance(item["archive_format"], str) and item["archive_format"] in ARCHIVES | RAW,
              "invalid packaging name, target or format", 4)
         if "target_triple" in item:

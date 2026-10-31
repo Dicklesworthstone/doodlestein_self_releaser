@@ -80,12 +80,15 @@ environment = os.environ.copy()
 environment.update(CGO_ENABLED='0', GOENV='off', GOTOOLCHAIN='local', GOPROXY='off',
                    GOSUMDB='off', GO111MODULE='off',
                    GOCACHE=os.environ.get('DSR_RECOVERY_TEST_GOCACHE', str(work / 'go-cache')))
-for platform in platforms:
+built_workers = {}
+for platform in [*platforms, 'linux/armv7', 'freebsd/amd64']:
     operating_system, architecture = platform.split('/')
     directory = assets / platform.replace('/', '-')
     directory.mkdir()
     binary = directory / ('demo.exe' if operating_system == 'windows' else 'demo')
-    env = dict(environment, GOOS=operating_system, GOARCH=architecture)
+    env = dict(environment, GOOS=operating_system, GOARCH='arm' if architecture == 'armv7' else architecture)
+    if architecture == 'armv7':
+        env['GOARM'] = '7'
     print('Compiling genuine Go payload: ' + platform, flush=True)
     run(['go', 'build', '-trimpath', '-o', str(binary), str(source / 'main.go')], env=env, timeout=180)
     binary.chmod(0o600 if operating_system == 'windows' else 0o700)
@@ -96,10 +99,15 @@ for platform in platforms:
     result = dict(tool='demo', platform=platform, host='cross-host', task_key=platform, target_triple=None,
         status='success', exit_code=0, method='native', build_purpose='release', publishable=True,
         artifact_path=str(binary), artifact_paths=[str(binary)], additional_artifacts=[], resume_artifacts=[receipt],
-        build_influence_env={'GOOS': operating_system, 'GOARCH': architecture}, cargo_isolation=None)
-    state['context']['build_tasks'].append(task)
-    state['target_statuses'][platform] = dict(status='completed', host='cross-host', result=result,
-        updated_at=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+        build_influence_env={'GOOS': operating_system, 'GOARCH': env['GOARCH']}, cargo_isolation=None)
+    if architecture == 'armv7':
+        result['build_influence_env']['GOARM'] = '7'
+    saved = dict(status='completed', host='cross-host', result=result,
+                 updated_at=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    built_workers[platform] = dict(task=task, saved=saved)
+    if platform in platforms:
+        state['context']['build_tasks'].append(task)
+        state['target_statuses'][platform] = saved
 
 counter = 0
 
@@ -242,6 +250,62 @@ def refuse(label, value=None, code=None, **kwargs):
     status, response, destination, _ = invoke(value, **kwargs)
     check(label, status != 0 and (code is None or status == code) and
           response.get('exit_code') == status and response.get('status') == 'error' and not (destination / 'release').exists())
+
+
+# Issue #47's exact seven-platform set uses genuine ARMv7 and FreeBSD Go
+# executables. Retain the original Windows ARM64/386 tests above and below.
+issue_targets = ['linux/amd64', 'linux/arm64', 'linux/armv7', 'darwin/amd64',
+                 'darwin/arm64', 'windows/amd64', 'freebsd/amd64']
+issue_state = copy.deepcopy(state)
+issue_state['targets'] = issue_targets
+issue_state['context']['build_tasks'] = [copy.deepcopy(built_workers[p]['task']) for p in issue_targets]
+issue_state['context']['target_hosts'] = {p: 'cross-host' for p in issue_targets}
+issue_state['target_statuses'] = {p: copy.deepcopy(built_workers[p]['saved']) for p in issue_targets}
+status, response, issue_output, _ = invoke(issue_state)
+check('issue 47 seven-target native inventory recovers including ARMv7 and FreeBSD',
+      status == 0 and response.get('recovered_targets') == 7 and response.get('recovered_artifacts') == 7)
+if status == 0:
+    recovered = issue_output / 'release'
+    evidence = json.loads((recovered / 'build-manifest.json').read_bytes())
+    check('issue 47 manifest retains all requested platforms and exact payload digests',
+          evidence['requested_targets'] == sorted(issue_targets) and
+          {a['target'] for a in evidence['artifacts']} == set(issue_targets) and
+          all(sha((recovered / 'artifacts' / a['name']).read_bytes()) == a['sha256'] for a in evidence['artifacts']))
+    check('ARMv7 Go compiler selectors are preserved as GOARCH arm and GOARM 7',
+          next(e['build_influence_env'] for e in evidence['build_environments'] if e['target'] == 'linux/armv7') ==
+          {'GOOS': 'linux', 'GOARCH': 'arm', 'GOARM': '7'})
+else:
+    print((work / ('run-%d.stderr' % counter)).read_text(), file=sys.stderr)
+
+for platform, triple in (('linux/armv7', 'armv7-unknown-linux-gnueabihf'),
+                        ('freebsd/amd64', 'x86_64-unknown-freebsd')):
+    candidate = copy.deepcopy(issue_state)
+    task = next(t for t in candidate['context']['build_tasks'] if t['platform'] == platform)
+    task['key'], task['target_triple'] = platform + '@' + triple, triple
+    saved = candidate['target_statuses'].pop(platform)
+    saved['result']['task_key'], saved['result']['target_triple'] = task['key'], triple
+    candidate['target_statuses'][task['key']] = saved
+    status, response, destination, _ = invoke(candidate, arguments=['--dry-run'])
+    check('compiler target normalization retains ' + triple,
+          status == 0 and response.get('recovered_targets') == 7 and not destination.exists())
+
+for target, wrong_target in (('freebsd/amd64', 'linux/amd64'), ('linux/amd64', 'freebsd/amd64'),
+                             ('linux/armv7', 'linux/amd64')):
+    candidate = copy.deepcopy(issue_state)
+    record = candidate['target_statuses'][target]['result']
+    original = Path(issue_state['target_statuses'][wrong_target]['result']['artifact_path'])
+    counterfeit = assets / ('wrong-platform-' + target.replace('/', '-'))
+    counterfeit.write_bytes(original.read_bytes()); counterfeit.chmod(0o700)
+    info = counterfeit.stat()
+    record['artifact_path'], record['artifact_paths'] = str(counterfeit), [str(counterfeit)]
+    record['resume_artifacts'] = [dict(path=str(counterfeit), sha256=sha(counterfeit.read_bytes()),
+                                     size_bytes=info.st_size, identity='gnu:%d:%d' % (info.st_dev, info.st_ino))]
+    refuse('intact ' + wrong_target + ' bytes cannot masquerade as ' + target, candidate, code=7)
+
+for target in ('freebsd/arm64', 'freebsd/armv7', 'darwin/386', 'windows/armv7', 'linux/riscv64'):
+    candidate = copy.deepcopy(issue_state)
+    candidate['targets'][-1] = target
+    refuse('unsupported recovery platform remains rejected: ' + target, candidate, code=4)
 
 
 # This is the actual terminal worker checkpoint emitted by

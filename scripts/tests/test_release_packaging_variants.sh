@@ -253,7 +253,7 @@ cli = work / "cli"
 cli.mkdir()
 for source, filename in ((finalizer, "release_finalize.sh"), (packager, "release_packaging.sh")):
     shutil.copy2(source, cli / filename)
-for filename in ("release_bundle.sh", "slsa.sh", "packaging.sh", "release_packaging_pipeline.sh"):
+for filename in ("release_bundle.sh", "slsa.sh", "platforms.sh", "packaging.sh", "release_packaging_pipeline.sh"):
     shutil.copy2(root / "src" / filename, cli / filename)
 (cli / "release_finalize_core.sh").write_text('''#!/usr/bin/env bash
 _rf_log() { printf '%s\\n' "$*" >&2; }

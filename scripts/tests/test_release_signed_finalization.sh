@@ -87,7 +87,7 @@ SH
     printf 'Native Minisign unavailable; real Ed25519 verification uses a Python format adapter\n'
 fi
 export PATH="$WORK/bin:$PATH"
-for module in signing slsa sbom sbom_release release_payloads release_integrity release_finalize; do
+for module in signing slsa sbom sbom_release release_payloads release_integrity release_finalize dispatch; do
     if [[ "$module" == release_integrity ]]; then
         # shellcheck source=src/release_integrity.sh
         source "${RI_TEST_MODULE:-$ROOT/src/release_integrity.sh}"

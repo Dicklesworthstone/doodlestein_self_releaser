@@ -48,7 +48,7 @@ def digest(p):
 install = work / "install"
 (install / "src").mkdir(parents=True)
 (install / "scripts").mkdir()
-for module in ("release_builds", "release_bundle", "slsa", "guardrails"):
+for module in ("release_builds", "release_bundle", "slsa", "platforms", "guardrails"):
     selected = Path(os.environ["DSR_TEST_RECOVERY_COORDINATOR"]) if module == "release_builds" and "DSR_TEST_RECOVERY_COORDINATOR" in os.environ else source / "src" / (module + ".sh")
     shutil.copyfile(selected, install / "src" / (module + ".sh"))
 # These two production command paths are the only substituted implementation.

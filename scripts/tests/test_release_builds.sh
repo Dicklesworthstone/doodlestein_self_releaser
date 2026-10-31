@@ -44,7 +44,7 @@ try:
     repo = work / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "scripts").mkdir()
-    for file in ("release_builds.sh", "release_bundle.sh", "slsa.sh", "guardrails.sh"):
+    for file in ("release_builds.sh", "release_bundle.sh", "slsa.sh", "platforms.sh", "guardrails.sh"):
         shutil.copyfile(root / "src" / file, repo / "src" / file)
     # The production dispatcher has no test hooks. Execute unmodified code in
     # a temporary installation with test doubles only at its driver paths.

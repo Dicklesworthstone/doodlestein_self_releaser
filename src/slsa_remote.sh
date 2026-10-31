@@ -2,6 +2,8 @@
 # Signed build-manifest provenance at the GitHub release boundary. Reuse the
 # existing uncached/immutable-ID transport, never URLs embedded in a statement.
 _SLSA_REMOTE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/platforms.sh
+source "$_SLSA_REMOTE_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
 
 _slr_require() {
     # Public SLSA functions may be exported by a parent shell without their
@@ -24,7 +26,7 @@ _slr_require() {
 _slr_read_contract() {
     command -v python3 >/dev/null || return 3
     _slr_path "$1" || return 4
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" "$(dsr_platform_pattern)" <<'PY'
 import hashlib
 import json
 import os
@@ -49,7 +51,7 @@ def name(value):
 try:
     targets = sys.argv[2].split(",")
     need(targets and len(set(targets)) == len(targets) and all(
-        re.fullmatch(r"(linux|darwin|windows)/(amd64|arm64|386)", t) for t in targets), "invalid expected targets")
+        re.fullmatch(sys.argv[3], t) for t in targets), "invalid expected targets")
     with os.fdopen(os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
         before = os.fstat(stream.fileno())
         need(stat.S_ISREG(before.st_mode) and before.st_size <= 1048576, "invalid or oversized contract file")
@@ -500,8 +502,8 @@ _slr_execute() (
        ( -z "$manifest_hash" || "$manifest_hash" =~ ^[0-9a-f]{64}$ ) &&
        -f "$public" && ! -L "$public" && "$dry" =~ ^(true|false)$ ]] || return 4
     command -v jq >/dev/null || return 3
-    matrix=$(jq -cne --arg targets "$targets" '$targets|split(",")|
-        if length>0 and all(.[];test("^(linux|darwin|windows)/(amd64|arm64|386)$")) and (unique|length)==length
+    matrix=$(jq -cne --arg targets "$targets" --arg platform_pattern "$(dsr_platform_pattern)" '$targets|split(",")|
+        if length>0 and all(.[];test($platform_pattern) and (test("[\u0000-\u001f\u007f]")|not)) and (unique|length)==length
         then sort else error("invalid expected targets") end') || return 4
     if [[ -n "$contract" ]]; then
         contract_record=$(_slr_read_contract "$contract" "$targets") || return $?

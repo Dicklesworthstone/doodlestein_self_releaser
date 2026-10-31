@@ -137,8 +137,11 @@ def require_curl():
             'curl 8.4.0 or newer is required for bounded downloads', 3)
 
 def range_response(path, reported):
-    # Inspect only the last complete response, never a proxy CONNECT or CDN
-    # redirect block. Keep headers as lists so duplicates cannot hide a range.
+    # Inspect the last response, never a proxy CONNECT or CDN redirect block.
+    # Keep completion separate: curl may refuse an ignored Range before its
+    # header callback records the terminating blank line. Such evidence can
+    # justify a bounded restart, never admission of a continued payload.
+    # Keep headers as lists so duplicates cannot hide a range.
     require(regular(path).st_size <= 262144, 'Excessive resumed-download headers', 8)
     status, fields, complete = None, {}, False
     for line in path.read_bytes().splitlines():
@@ -156,8 +159,9 @@ def range_response(path, reported):
                     not any(c < 32 and c != 9 or c == 127 for c in value),
                     'Malformed resumed-download header', 8)
             fields.setdefault(key.lower(), []).append(value.strip())
-    require(complete and reported == status.encode('ascii'), 'Incomplete resumed-download response', 8)
-    return status, fields
+    require(status is not None and reported == status.encode('ascii'),
+            'Incomplete resumed-download response', 8)
+    return status, fields, complete
 
 def acquire(endpoint, destination, maximum, binary=False, offset=0, prefix_sha256=None):
     global requests
@@ -189,10 +193,13 @@ def acquire(endpoint, destination, maximum, binary=False, offset=0, prefix_sha25
     command += ['https://api.github.com/' + endpoint]
     code, stdout, _ = run(command, incoming=config.encode('ascii'), limit=args.timeout + 10)
     if offset:
-        status, fields = range_response(headers, stdout)
+        status, fields, complete = range_response(headers, stdout)
         if status == '200' and code in (33, 63) and b'content-range' not in fields:
             # A server may legitimately ignore Range. Restart ONCE into a new
-            # file only when curl refused before changing the private prefix.
+            # file only when curl reports a range/size refusal before changing
+            # the private prefix. curl can omit the final header separator on
+            # this refusal; no bytes from that response are trusted or reused.
+            # The fresh download still needs every checksum/inventory gate.
             # Never retry an integrity failure or erase the retained attempt.
             require(regular(destination).st_size == offset and digest(destination) == prefix_sha256,
                     'Non-range response changed the retained prefix')
@@ -201,6 +208,7 @@ def acquire(endpoint, destination, maximum, binary=False, offset=0, prefix_sha25
             destination.rename(preserved)
             acquire(endpoint, destination, maximum, binary)
             return 'restarted'
+        require(complete, 'Incomplete resumed-download response', 8)
         require(status == '206' and fields.get(b'content-range') ==
                 [('bytes %d-%d/%d' % (offset, maximum - 1, maximum)).encode('ascii')] and
                 fields.get(b'content-encoding', [b'identity']) == [b'identity'],

@@ -3,9 +3,13 @@
 # This is an explicit local import, not a strict-build attestation or a release
 # upload. Original state, worker receipts and artifacts are never modified.
 
+_NATIVE_RECOVERY_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=src/platforms.sh
+source "$_NATIVE_RECOVERY_DIR/platforms.sh" || { return 3 2>/dev/null || exit 3; }
+
 _native_recovery_execute() {
     command -v python3 >/dev/null || return 3
-    exec env DRY_RUN="${DRY_RUN:-false}" python3 -I - "$@" <<'PY'
+    exec env DRY_RUN="${DRY_RUN:-false}" python3 -I - "$(dsr_platform_pattern)" "$@" <<'PY'
 import argparse
 import concurrent.futures
 import datetime
@@ -27,6 +31,8 @@ import tempfile
 import uuid
 import zipfile
 import zlib
+
+PLATFORM_PATTERN = sys.argv.pop(1)
 
 
 class Failure(Exception):
@@ -192,7 +198,11 @@ def binary_platform(data):
         order = "<" if data[5] == 1 else ">"
         kind, machine = struct.unpack_from(order + "HH", data, 16)
         need(kind in (2, 3), "ELF payload is not an executable")
-        return {(1, 3): "linux/386", (2, 62): "linux/amd64", (2, 183): "linux/arm64"}.get((data[4], machine))
+        architecture = {(1, 3): "386", (1, 40): "armv7", (2, 62): "amd64", (2, 183): "arm64"}.get((data[4], machine))
+        # FreeBSD and Linux both use ELF. Preserve the OS identity instead of
+        # admitting FreeBSD bytes as a Linux payload (or the reverse).
+        operating_system = {0: "linux", 3: "linux", 9: "freebsd"}.get(data[7])
+        return operating_system + "/" + architecture if operating_system and architecture else None
     if data[:4] in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe") and len(data) >= 32:
         cpu, _, kind = struct.unpack_from("<III", data, 4)
         need(kind == 2, "Mach-O payload is not an executable")
@@ -401,9 +411,9 @@ def git_read(repository, *arguments):
 
 
 def triple_platform(triple):
-    arch = {"x86_64": "amd64", "aarch64": "arm64", "i686": "386", "i586": "386"}.get(triple.split("-", 1)[0])
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "i686": "386", "i586": "386", "armv7": "armv7"}.get(triple.split("-", 1)[0])
     operating_system = ("linux" if "-linux-" in triple else "darwin" if triple.endswith("-apple-darwin")
-                        else "windows" if "-windows-" in triple else None)
+                        else "windows" if "-windows-" in triple else "freebsd" if triple.endswith("-unknown-freebsd") else None)
     return operating_system + "/" + arch if operating_system and arch else None
 
 
@@ -442,7 +452,7 @@ def select_workers(state):
          "diagnostic or unclassified builds cannot become releases", 4)
     tasks = context["build_tasks"]
     need(isinstance(tasks, list) and 1 <= len(tasks) <= 256 and isinstance(statuses, dict) and
-         isinstance(targets, list) and targets and all(match(t, r"(linux|darwin|windows)/(amd64|arm64|386)") for t in targets) and
+         isinstance(targets, list) and targets and all(match(t, PLATFORM_PATTERN) for t in targets) and
          len(set(targets)) == len(targets), "invalid native task matrix", 4)
     need(all(isinstance(t, dict) and set(t) == {"key", "platform", "target_triple", "method"} and
          t["method"] == "native" and isinstance(t["platform"], str) and t["platform"] in targets and

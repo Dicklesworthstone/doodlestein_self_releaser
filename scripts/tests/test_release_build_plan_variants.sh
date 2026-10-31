@@ -47,7 +47,7 @@ def read(p):
 runtime = work / 'runtime'
 (runtime / 'src').mkdir(parents=True)
 (runtime / 'scripts').mkdir()
-for filename in ('release_builds.sh', 'release_bundle.sh', 'slsa.sh'):
+for filename in ('release_builds.sh', 'release_bundle.sh', 'slsa.sh', 'platforms.sh', 'guardrails.sh'):
     shutil.copy2(root / 'src' / filename, runtime / 'src' / filename)
 (runtime / 'dsr').write_text('#!/usr/bin/env bash\nexec python3 "${0%/*}/driver.py" dsr "$@"\n')
 (runtime / 'scripts/xwin-build.sh').write_text('#!/usr/bin/env bash\nexec python3 "${0%/*}/../driver.py" xwin "$@"\n')
