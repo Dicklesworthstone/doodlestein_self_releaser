@@ -165,6 +165,19 @@ function Get-DsrWindowsSourceLinkReferent {
     $parts=New-Object 'System.Collections.Generic.List[string]'
     $slash=$Path.LastIndexOf('/')
     if ($slash -ge 0) { foreach ($part in $Path.Substring(0,$slash).Split('/')) { $parts.Add($part) } }
+    # A flattened source manifest still records every repository boundary as
+    # a 160000 row. A link belongs to its nearest enclosing repository, and
+    # may neither leave it nor enter a nested repository, even transiently.
+    $boundaryDepth=0
+    $ancestor=$parts -join '/'
+    while ($ancestor) {
+        if ($Rows.ContainsKey($ancestor) -and $Rows[$ancestor].Mode -ceq '160000') {
+            $boundaryDepth=$ancestor.Split('/').Count
+            break
+        }
+        $slash=$ancestor.LastIndexOf('/')
+        $ancestor=if ($slash -lt 0) { '' } else { $ancestor.Substring(0,$slash) }
+    }
     foreach ($part in $Target.Split('/')) {
         # Validate traversal before collapsing '..'. A regular file or another
         # link cannot act as the directory in "file/../target".
@@ -174,11 +187,15 @@ function Get-DsrWindowsSourceLinkReferent {
         }
         if (-not $part -or $part -ceq '.') { continue }
         if ($part -ceq '..') {
-            if ($parts.Count -eq 0) { throw ('Tracked source link escapes its snapshot: ' + $Path + ' -> ' + $Target) }
+            if ($parts.Count -le $boundaryDepth) { throw ('Tracked source link escapes its repository: ' + $Path + ' -> ' + $Target) }
             $parts.RemoveAt($parts.Count-1); continue
         }
         Assert-DsrWindowsSourceMember $part
         $parts.Add($part)
+        $cursor=$parts -join '/'
+        if ($Rows.ContainsKey($cursor) -and $Rows[$cursor].Mode -ceq '160000') {
+            throw ('Tracked source link enters a nested repository: ' + $Path + ' -> ' + $Target)
+        }
     }
     $relative=$parts -join '/'
     if (-not $Rows.ContainsKey($relative) -or $Rows[$relative].Mode -cnotin @('100644','100755')) {
@@ -239,11 +256,6 @@ function Get-DsrWindowsSourcePlan {
         if ($rows.Count -eq 0 -or $spelling.Count -ne $ExpectedObjectCount) { throw 'Strict source manifest object count differs from the controller' }
         foreach ($row in $rows.Values) {
             if ($row.Mode -cne '160000' -and $directories.Contains($row.Path)) { throw ('Source file is also a directory: ' + $row.Path) }
-            if ($row.Mode -ceq '160000') {
-                foreach ($node in $spelling.Keys) {
-                    if ($node.StartsWith($row.Path+'/',[StringComparison]::Ordinal)) { throw ('Tracked Git link is not empty: ' + $row.Path) }
-                }
-            }
         }
         $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $tar=[System.Formats.Tar.TarReader]::new($inputArchive,$true)

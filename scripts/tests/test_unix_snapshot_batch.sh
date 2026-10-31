@@ -3,9 +3,14 @@
 # Git/grep observers delegate to the real tools and count process launches.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+case "${1:-}" in
+    ''|--project-submodules-only) ;;
+    *) printf 'Unknown snapshot test selection: %s\n' "$1" >&2; exit 4 ;;
+esac
 for tool in python3 bash sh git tar awk grep; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
 done
+if [[ "${1:-}" != --project-submodules-only ]]; then
 python3 - "$ROOT" <<'PY'
 import hashlib
 import json
@@ -185,4 +190,271 @@ empty.chmod(0o755); invoke('unterminated final record cannot bypass mode checks'
 manifest.write_bytes(original_manifest); script.write_bytes(generate()); expected=digest(archive)+' '+digest(manifest)+'\n'
 invoke('restored snapshot is still accepted')
 print(f'Unix snapshot batch: {checks} assertions passed; real Git/filesystem, no SSH transport.',flush=True)
+PY
+batch_status=$?
+[[ "$batch_status" -eq 0 ]] || exit "$batch_status"
+fi
+
+# Authenticate the actual native export and receiver path with recursive Git
+# repositories. This is separate from the large-file batch above so an
+# incumbent negative control can select it without rerunning that matrix.
+python3 - "$ROOT" <<'PY'
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import subprocess
+import sys
+import tempfile
+import zlib
+
+root = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
+os.umask(0o077)
+work = Path(tempfile.mkdtemp(prefix='dsr-unix-project-submodules-'))
+print('Project-submodule fixtures: ' + str(work), flush=True)
+environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+    GIT_AUTHOR_NAME='DSR fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+    GIT_COMMITTER_NAME='DSR fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
+    GIT_AUTHOR_DATE='2026-01-01T00:00:00Z', GIT_COMMITTER_DATE='2026-01-01T00:00:00Z',
+    ACT_ARTIFACTS_DIR=str(work / 'artifacts'), DSR_STATE_DIR=str(work / 'state'), NO_COLOR='1')
+checks = 0
+
+def check(label, condition):
+    global checks
+    if not condition:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS ' + label, flush=True)
+
+def run(arguments, **kwargs):
+    return subprocess.run(arguments, capture_output=True, env=environment, timeout=30, **kwargs)
+
+def git(repository, *arguments, data=None):
+    return run(['git', '-c', 'protocol.file.allow=always', '-C', str(repository), *arguments],
+               input=data, check=True).stdout
+
+def call(function, *arguments):
+    return run(['bash', '-c', 'source "$1" || exit; shift; "$@"', 'fixture', str(module),
+                function, *map(str, arguments)])
+
+def success(function, *arguments):
+    result = call(function, *arguments)
+    if result.returncode:
+        raise AssertionError(function + ': ' + result.stderr.decode(errors='replace'))
+    return result.stdout
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def make_repository(name, files=None, links=None):
+    repository = work / name
+    repository.mkdir()
+    git(repository, 'init', '-q', '--initial-branch=main', '--object-format=sha1')
+    for name, value in (files or {}).items():
+        mode, data = value if isinstance(value, tuple) else (0o644, value)
+        path = repository / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data); path.chmod(mode)
+    for name, target in (links or {}).items():
+        path = repository / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
+    git(repository, 'add', '.')
+    git(repository, 'commit', '-qm', 'pinned source fixture', '--allow-empty')
+    return repository
+
+leaf = make_repository('leaf-seed', {'leaf.txt': b'pinned nested source\n'}, {'leaf-copy': 'leaf.txt'})
+empty = make_repository('empty-seed')
+child_seed = make_repository('child-seed', {'data.txt': b'pinned child source\n',
+    'run.sh': (0o755, b'#!/bin/sh\nprintf "child\\n"\n')},
+    {'copy.txt': 'data.txt', 'deep/local-link': '../data.txt', 'nested-directory-link': 'nested'})
+for name, repository in [('nested/leaf', leaf), ('empty', empty)]:
+    git(child_seed, 'submodule', 'add', '-q', str(repository), name)
+git(child_seed, 'commit', '-qm', 'pin nested and empty children')
+standalone_seed = make_repository('standalone-seed', {'standalone.txt': b'self-contained child\n'})
+project = make_repository('project', {'root.txt': b'root source\n', 'docs/guide.txt': b'tracked guide\n'},
+                          {'root-copy': 'root.txt', 'directory-link': 'docs', 'vendor-directory-link': 'vendor'})
+git(project, 'submodule', 'add', '-q', str(child_seed), 'vendor/dep')
+git(project, 'submodule', 'update', '--init', '--recursive', '-q')
+standalone = project / 'vendor/standalone'
+git(project, 'clone', '-q', '--no-hardlinks', str(standalone_seed), str(standalone))
+standalone_sha = git(standalone, 'rev-parse', 'HEAD').decode().strip()
+git(project, 'update-index', '--add', '--cacheinfo', '160000,' + standalone_sha + ',vendor/standalone')
+git(project, 'commit', '-qm', 'pin absorbed and self-contained project children')
+revision = git(project, 'rev-parse', 'HEAD').decode().strip()
+child = project / 'vendor/dep'
+child_revision = git(child, 'rev-parse', 'HEAD').decode().strip()
+check('fixture uses an absorbed child and self-contained sibling',
+      (child / '.git').is_file() and (standalone / '.git').is_dir())
+check('fixture uses a recursively absorbed nested child', (child / 'nested/leaf/.git').is_file())
+check('full project checkout is clean before strict source staging', not git(project, 'status', '--porcelain'))
+
+def export(label, selected=revision):
+    archive, manifest = work / (label + '.tar'), work / (label + '.manifest')
+    success('_act_write_git_archive_evidence', project, selected, archive)
+    success('_act_write_tracked_manifest', project, selected, manifest)
+    return archive, manifest
+
+archive, manifest = export('selected')
+rows = {}
+
+def selected_rows(repository, commit, prefix=''):
+    for row in git(repository, 'ls-tree', '-rz', '--full-tree', commit).split(b'\0'):
+        if not row:
+            continue
+        metadata, name = row.decode().split('\t', 1)
+        mode, kind, oid = metadata.split()
+        rows[prefix + name] = (oid, mode)
+        if mode == '160000':
+            selected_rows(repository / name, oid, prefix + name + '/')
+
+selected_rows(project, revision)
+actual_rows = {parts[2]: tuple(parts[:2]) for parts in
+               (line.split('\t') for line in manifest.read_text().splitlines())}
+check('production manifest contains every exact recursive Git blob and gitlink', actual_rows == rows)
+check('production manifest retains nested and empty repository boundaries',
+      all(rows[path][1] == '160000' for path in ('vendor/dep', 'vendor/dep/nested/leaf', 'vendor/dep/empty', 'vendor/standalone')))
+source = work / 'selected-source'; source.mkdir()
+run(['tar', '-xf', str(archive), '-C', str(source)], check=True)
+check('production archive contains pinned child and nested contents',
+      (source / 'vendor/dep/data.txt').read_bytes() == b'pinned child source\n' and
+      (source / 'vendor/dep/nested/leaf/leaf.txt').read_bytes() == b'pinned nested source\n')
+check('production archive preserves child links and executable modes',
+      (source / 'vendor/dep/copy.txt').is_symlink() and (source / 'directory-link').is_symlink() and
+      (source / 'vendor/dep/run.sh').stat().st_mode & 0o111 == 0o111)
+check('own-repository directory links survive when their directory contains only gitlinks',
+      (source / 'vendor-directory-link').is_symlink() and (source / 'vendor-directory-link').is_dir() and
+      (source / 'vendor/dep/nested-directory-link').is_symlink() and (source / 'vendor/dep/nested-directory-link').is_dir())
+check('production archive preserves the empty child directory',
+      (source / 'vendor/dep/empty').is_dir() and not list((source / 'vendor/dep/empty').iterdir()))
+count = int(success('_act_tracked_manifest_object_count', manifest))
+expected = (sha256(archive) + ' ' + sha256(manifest) + '\n').encode()
+
+def verify(label, tree=source, selected_manifest=manifest, accepted=True):
+    local = call('_act_verify_tracked_manifest_local', tree, selected_manifest)
+    selected_count = int(success('_act_tracked_manifest_object_count', selected_manifest))
+    program = success('_act_unix_strict_snapshot_verify_script', tree, archive, selected_manifest,
+                      sha256(selected_manifest), selected_count)
+    script = work / ('verify-' + label + '.sh'); script.write_bytes(program)
+    remote = run(['sh', str(script)])
+    wanted = (sha256(archive) + ' ' + sha256(selected_manifest) + '\n').encode()
+    check(label + ' local verifier', local.returncode == 0 if accepted else local.returncode != 0)
+    check(label + ' actual emitted POSIX verifier',
+          remote.returncode == 0 and remote.stdout == wanted if accepted else remote.returncode != 0 and not remote.stdout)
+
+verify('recursive-project-source')
+again_archive, again_manifest = export('regenerated')
+check('recovery reproduces the exact source archive and manifest bytes',
+      archive.read_bytes() == again_archive.read_bytes() and manifest.read_bytes() == again_manifest.read_bytes())
+check('production recovery archive hash matches admitted export',
+      success('_act_git_archive_sha256', project, revision).decode().strip() == sha256(archive))
+
+# Use actual local staging and final source verification; no transport, source
+# admission, path selection, or manifest function is substituted here.
+stage = work / 'native-run/source'
+success('_act_sync_strict_checkout', 'act', project, revision, stage, 'source.tar', 'submodule-fixture')
+check('actual strict local stage contains the nested pinned source',
+      (stage / 'vendor/dep/nested/leaf/leaf.txt').read_bytes() == b'pinned nested source\n')
+check('actual strict source finalization accepts the unchanged staged graph',
+      call('_act_verify_strict_checkout_snapshot', 'act', project, revision, stage, 'source.tar', 'submodule-fixture').returncode == 0)
+(stage / 'vendor/dep/data.txt').write_bytes(b'changed staged child\n')
+check('actual strict source finalization refuses changed staged child bytes',
+      call('_act_verify_strict_checkout_snapshot', 'act', project, revision, stage, 'source.tar', 'submodule-fixture').returncode != 0)
+
+payload = source / 'vendor/dep/data.txt'; original = payload.read_bytes()
+payload.write_bytes(b'changed child\n'); verify('changed-child-bytes', accepted=False); payload.write_bytes(original)
+executable = source / 'vendor/dep/run.sh'
+executable.chmod(0o644); verify('changed-child-mode', accepted=False); executable.chmod(0o755)
+extra = source / 'vendor/dep/empty/extra'; extra.write_bytes(b'untracked\n')
+verify('extra-file-in-empty-submodule', accepted=False); extra.rename(work / 'held-extra-child')
+nested = source / 'vendor/dep/nested/leaf/leaf.txt'; held_nested = work / 'held-nested-file'
+nested.rename(held_nested); verify('missing-nested-file', accepted=False); held_nested.rename(nested)
+
+# A correctly hashed link blob is insufficient if traversal crosses a Git
+# namespace. These receiver inputs intentionally bypass the producer's own
+# refusal; the independent local and remote gates must enforce it too.
+for label, owner, target in (
+    ('parent-direct-child-directory', '', 'vendor/dep'),
+    ('parent-to-child', '', 'vendor/dep/data.txt'),
+    ('parent-enters-and-leaves', '', 'vendor/dep/../../root.txt'),
+    ('child-to-parent', 'vendor/dep', '../../root.txt'),
+    ('child-leaves-and-reenters', 'vendor/dep', '../dep/data.txt'),
+    ('child-to-sibling', 'vendor/dep', '../standalone/standalone.txt'),
+    ('child-direct-nested-directory', 'vendor/dep', 'nested/leaf'),
+    ('child-to-nested', 'vendor/dep', 'nested/leaf/leaf.txt'),
+    ('child-enters-and-leaves-nested', 'vendor/dep', 'nested/leaf/../../data.txt'),
+    ('nested-to-parent', 'vendor/dep/nested/leaf', '../../data.txt'),
+    ('missing-directory-before-parent', 'vendor/dep', 'missing/../data.txt'),
+    ('regular-file-before-parent', 'vendor/dep', 'data.txt/../data.txt'),
+):
+    tree = work / ('receiver-' + label)
+    shutil.copytree(source, tree, symlinks=True)
+    path = str(PurePosixPath(owner) / 'boundary-link')
+    (tree / path).symlink_to(target)
+    oid = git(project, 'hash-object', '--stdin', data=target.encode()).decode().strip()
+    forged = work / ('receiver-' + label + '.manifest')
+    forged.write_bytes(manifest.read_bytes() + (oid + '\t120000\t' + path + '\n').encode())
+    verify(label, tree, forged, False)
+
+# Construct a new child commit and parent gitlink using real Git objects. The
+# selected parent pin, not the mutable child HEAD or checkout, chooses bytes.
+old_oid = rows['vendor/dep/data.txt'][0]
+new_oid = git(child, 'hash-object', '-w', '--stdin', data=b'new pinned child source\n').decode().strip()
+git(child, 'update-index', '--cacheinfo', '100644,' + new_oid + ',data.txt')
+new_tree = git(child, 'write-tree').decode().strip()
+new_child = git(child, 'commit-tree', new_tree, '-p', child_revision, '-m', 'new child pin').decode().strip()
+git(child, 'update-index', '--cacheinfo', '100644,' + old_oid + ',data.txt')
+git(project, 'update-index', '--cacheinfo', '160000,' + new_child + ',vendor/dep')
+new_root_tree = git(project, 'write-tree').decode().strip()
+new_root = git(project, 'commit-tree', new_root_tree, '-p', revision, '-m', 'select changed child').decode().strip()
+git(project, 'update-index', '--cacheinfo', '160000,' + child_revision + ',vendor/dep')
+changed_archive, changed_manifest = export('changed-pin', new_root)
+changed_source = work / 'changed-pin-source'; changed_source.mkdir()
+run(['tar', '-xf', str(changed_archive), '-C', str(changed_source)], check=True)
+check('changing the parent gitlink changes the actual selected child bytes',
+      sha256(changed_archive) != sha256(archive) and
+      (changed_source / 'vendor/dep/data.txt').read_bytes() == b'new pinned child source\n')
+git(child, 'update-ref', 'HEAD', new_child)
+(child / 'data.txt').write_bytes(b'mutable checkout bytes are never release inputs\n')
+git(child, 'config', 'remote.origin.url', 'https://unreachable.invalid/never-fetch.git')
+unchanged_archive, unchanged_manifest = export('ignore-mutable-child')
+check('child HEAD, working bytes, and remote URL cannot override the parent pin',
+      archive.read_bytes() == unchanged_archive.read_bytes() and manifest.read_bytes() == unchanged_manifest.read_bytes())
+check('strict staging still refuses a dirty checkout even though object export is pinned',
+      call('_act_sync_strict_checkout', 'act', project, revision, work / 'dirty-run/source', 'source.tar', 'dirty-fixture').returncode != 0)
+git(child, 'update-ref', 'HEAD', child_revision)
+(child / 'data.txt').write_bytes(b'pinned child source\n')
+
+admin = Path(git(child, 'rev-parse', '--absolute-git-dir').decode().strip())
+object_file = admin / 'objects' / old_oid[:2] / old_oid[2:]
+check('negative controls use the genuine selected loose Git object', object_file.is_file())
+held_object = work / 'held-child-object'; object_file.rename(held_object)
+check('missing selected child object refuses native archive export',
+      call('_act_write_git_archive_evidence', project, revision, work / 'missing-object.tar').returncode != 0)
+check('missing child object cannot produce a successful recovery hash',
+      call('_act_git_archive_sha256', project, revision).returncode != 0)
+held_object.rename(object_file)
+original_object = object_file.read_bytes()
+object_file.write_bytes(zlib.compress(b'blob 6\x00forged'))
+check('validly encoded object with wrong content hash refuses native export',
+      call('_act_write_git_archive_evidence', project, revision, work / 'wrong-object.tar').returncode != 0)
+object_file.write_bytes(original_object)
+
+marker = child / '.git'; original_marker = marker.read_bytes()
+external = work / 'external-git-administration'
+shutil.copytree(admin, external)
+marker.write_text('gitdir: ' + str(external) + '\n')
+check('external Git administration with the same objects is refused',
+      call('_act_write_git_archive_evidence', project, revision, work / 'external-admin.tar').returncode != 0)
+marker.write_bytes(original_marker)
+alternates = admin / 'objects/info/alternates'; alternates.write_text(str(external / 'objects') + '\n')
+check('external alternate object stores are refused',
+      call('_act_write_git_archive_evidence', project, revision, work / 'alternates.tar').returncode != 0)
+alternates.rename(work / 'held-alternates')
+check('restored genuine source objects reproduce the admitted recovery hash',
+      success('_act_git_archive_sha256', project, revision).decode().strip() == sha256(archive))
+verify('restored-recursive-project-source')
+print(f'Unix project submodules: {checks} assertions passed; genuine Git and local source staging, no SSH transport.', flush=True)
 PY

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Committed-source admission for manifest-backed Windows x64/ARM64 builds.
+# Committed-source admission for manifest-backed Windows x64/ARM64 builds
+# and the native coordinator's authenticated recursive source archives.
 # No checkout mutation, archive export filters, network access, or tag writes.
 
 xwin_source_snapshot() {
@@ -23,6 +24,16 @@ xwin_source_verify() {
     _xws_source verify "$@"
 }
 
+# Native source custody retains the archive and a controller-hashed three-column
+# Git manifest. Share the same raw commit/tree/blob reader as xwin, while keeping
+# native symlinks and the existing independent Unix/Windows receiving gates.
+# stdout: deterministic tar bytes (archive) or oid<TAB>mode<TAB>path (manifest).
+source_archive_export() {
+    [[ $# == 3 && ( "$3" == archive || "$3" == manifest ) ]] || return 4
+    command -v python3 >/dev/null && command -v git >/dev/null || return 3
+    _xws_source native-export "$@"
+}
+
 _xws_source() {
     python3 - "$@" <<'PY'
 from contextlib import contextmanager
@@ -37,6 +48,7 @@ import select
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 class Rejected(Exception):
@@ -194,48 +206,58 @@ def blob_reader(selection):
         process.stdin.close()
         process.stdout.close()
 
-def read_object(process, oid, kind, limit):
-    require(isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{40}", oid), "invalid Git object identity")
-    process.stdin.write((oid + "\n").encode("ascii"))
-    process.stdin.flush()
-    def read(count):
+class GitObjectInput:
+    # One bounded, authenticated stream serves snapshots and tar export. A tar
+    # member never needs a whole blob in memory or an intermediate checkout.
+    def __init__(self, process, oid, kind, limit):
+        require(isinstance(oid, str) and re.fullmatch(r"[0-9a-f]{40}", oid), "invalid Git object identity")
+        self.process, self.oid = process, oid
+        process.stdin.write((oid + "\n").encode("ascii"))
+        process.stdin.flush()
+        header = bytearray()
+        while len(header) <= 128:
+            byte = self.exact(1)
+            if byte == b"\n":
+                break
+            header.extend(byte)
+        require(len(header) <= 128 and byte == b"\n", "oversized Git object response")
+        fields = header.decode("ascii").split()
+        require(len(fields) == 3 and fields[:2] == [oid, kind] and fields[2].isdigit(), "missing or wrong-type pinned Git object")
+        self.size = self.remaining = int(fields[2])
+        require(self.size <= limit, "pinned Git object exceeds its size limit")
+        self.digest = hashlib.sha1((kind + " " + str(self.size) + "\0").encode())
+
+    def exact(self, count):
         data = bytearray()
         while len(data) < count:
-            require(select.select([process.stdout], [], [], 30)[0], "Git source object read timed out")
-            block = os.read(process.stdout.fileno(), count - len(data))
+            require(select.select([self.process.stdout], [], [], 30)[0], "Git source object read timed out")
+            block = os.read(self.process.stdout.fileno(), count - len(data))
             require(block, "truncated Git source object")
             data.extend(block)
         return bytes(data)
-    header = bytearray()
-    while len(header) <= 128:
-        byte = read(1)
-        if byte == b"\n":
-            break
-        header.extend(byte)
-    fields = header.decode("ascii").split()
-    require(len(fields) == 3 and fields[:2] == [oid, kind] and fields[2].isdigit(), "missing or wrong-type pinned Git object")
-    size = int(fields[2])
-    require(size <= limit, "pinned Git object exceeds its size limit")
-    data = read(size)
-    require(read(1) == b"\n" and hashlib.sha1((kind + " " + str(size) + "\0").encode() + data).hexdigest() == oid,
-            "Git source object hash mismatch")
+
+    def read(self, count=-1):
+        count = self.remaining if count < 0 else min(count, self.remaining)
+        data = self.exact(count)
+        self.digest.update(data)
+        self.remaining -= len(data)
+        return data
+
+    def finish(self):
+        require(self.remaining == 0 and self.exact(1) == b"\n" and self.digest.hexdigest() == self.oid,
+                "Git source object hash mismatch")
+
+def read_object(process, oid, kind, limit):
+    source = GitObjectInput(process, oid, kind, limit)
+    data = source.read()
+    source.finish()
     return data
 
 def copy_blob(process, oid, output, limit=1024 ** 3):
-    process.stdin.write((oid + "\n").encode("ascii"))
-    process.stdin.flush()
-    header = process.stdout.readline(256).decode("ascii").split()
-    require(len(header) == 3 and header[:2] == [oid, "blob"] and header[2].isdigit(), "invalid Git blob response")
-    remaining = int(header[2])
-    require(remaining <= limit, "source blob exceeds size limit: " + oid)
-    digest = hashlib.sha1(("blob " + str(remaining) + "\0").encode())
-    while remaining:
-        block = process.stdout.read(min(remaining, 1024 * 1024))
-        require(block, "truncated Git blob")
-        output.write(block)
-        digest.update(block)
-        remaining -= len(block)
-    require(process.stdout.read(1) == b"\n" and digest.hexdigest() == oid, "Git source object hash mismatch")
+    source = GitObjectInput(process, oid, "blob", limit)
+    while source.remaining:
+        output.write(source.read(1024 * 1024))
+    source.finish()
 
 def resolve_links(paths, targets):
     # Resolve against the selected Git namespace, never Path.resolve() on a
@@ -274,7 +296,35 @@ def resolve_links(paths, targets):
         resolved[origin] = current
     return resolved
 
-def source_links(selection):
+def native_links(entries, links, tracked_directories):
+    # Native Unix retains links; Windows independently materializes only file
+    # links. Resolve in this repository's Git namespace, before joining child
+    # repositories, so even a temporary excursion into a gitlink is refused.
+    # A parent-tree directory can contain only a gitlink, with no ordinary
+    # file rows of its own. It is still a valid directory referent; the child
+    # repository boundary itself is deliberately absent from this set.
+    directories = {"", *tracked_directories}
+    for origin, proof in links.items():
+        target = proof["target"]
+        require(re.fullmatch(r"[A-Za-z0-9_./+@~#,=()\[\] -]+", target) is not None
+                and not target.startswith("/"), "unsafe native source symlink: " + origin)
+        parts = origin.split("/")[:-1]
+        for component in target.split("/"):
+            require("/".join(parts) in directories, "native source symlink traverses another repository or non-directory: " + origin)
+            if component in ("", "."):
+                continue
+            if component == "..":
+                require(parts, "native source symlink escapes its repository: " + origin)
+                parts.pop()
+            else:
+                safe_name(component)
+                parts.append(component)
+        resolved = "/".join(parts)
+        require(resolved in directories or (resolved in entries and entries[resolved][0] in ("100644", "100755")),
+                "native source symlink must resolve inside its repository without chains: " + origin)
+    return links
+
+def source_links(selection, native=False):
     entries = {name: (mode, oid) for name, mode, oid in selection["entries"]}
     links = {}
     if any(mode == "120000" for mode, oid in entries.values()):
@@ -284,6 +334,8 @@ def source_links(selection):
                     output = io.BytesIO()
                     copy_blob(process, oid, output, limit=4096)
                     links[name] = {"target": output.getvalue().decode("utf-8"), "git_blob": oid}
+    if native:
+        return native_links(entries, links, selection["directories"])
     resolved = resolve_links(entries, {name: link["target"] for name, link in links.items()})
     for name, target in resolved.items():
         links[name].update(resolved_path=target, resolved_git_blob=entries[target][1])
@@ -316,7 +368,7 @@ def verify_links(files, expected, git_blobs):
         by_path[name]["symlink"] = link
     return files
 
-def inspect_repository(project, commit, environment, budget, parent_admin=None, depth=0, active=None):
+def inspect_repository(project, commit, environment, budget, parent_admin=None, depth=0, active=None, native=False):
     require(depth <= MAX_DEPTH, "source submodule nesting exceeds verification limit")
     active = set() if active is None else active
     require(commit not in active, "cyclic source submodule ancestry")
@@ -328,7 +380,7 @@ def inspect_repository(project, commit, environment, budget, parent_admin=None, 
     command = ["git", "-c", "protocol.allow=never", "-c", "core.fsmonitor=false",
                "-c", "core.hooksPath=" + os.devnull, "--git-dir=" + str(admin)]
     selection = {"project": str(project), "command": command, "environment": environment,
-                 "entries": [], "children": [], "commit": commit}
+                 "entries": [], "directories": [], "children": [], "commit": commit}
     active.add(commit)
     try:
         gitlinks = []
@@ -361,6 +413,7 @@ def inspect_repository(project, commit, environment, budget, parent_admin=None, 
                     child_oid = data[end + 1:end + 21].hex()
                     offset = end + 21
                     if mode == b"40000":
+                        selection["directories"].append(name)
                         pending.append((name + "/", child_oid))
                     elif mode == b"160000":
                         gitlinks.append((name, child_oid))
@@ -368,9 +421,9 @@ def inspect_repository(project, commit, environment, budget, parent_admin=None, 
                         require(mode in (b"100644", b"100755", b"120000"), "unsupported pinned Git source mode")
                         selection["entries"].append((name, mode.decode("ascii"), child_oid))
         selection["entries"].sort()
-        selection["links"] = source_links(selection)
+        selection["links"] = source_links(selection, native)
         for name, child_oid in sorted(gitlinks):
-            child = inspect_repository(project / name, child_oid, environment, budget, admin, depth + 1, active)
+            child = inspect_repository(project / name, child_oid, environment, budget, admin, depth + 1, active, native)
             selection["children"].append((name, child))
         return selection
     finally:
@@ -386,6 +439,12 @@ def submodule_evidence(selection):
         result.append(proof)
     return result
 
+def git_environment():
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    return environment
+
 def inspect_project(project, commit, tag, repo, budget):
     require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) and commit != "0" * 40, "expected an explicit SHA-1 source commit")
     require(tag is None or re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", tag), "expected a version tag")
@@ -393,9 +452,7 @@ def inspect_project(project, commit, tag, repo, budget):
     project = Path(project)
     require(project.is_dir() and not project.is_symlink(), "invalid project directory")
     project = project.resolve()
-    environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                       GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    environment = git_environment()
     selection = inspect_repository(project, commit, environment, budget)
     command = ["git", "-c", "protocol.allow=never", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull, "-C", str(project)]
     def git(*args):
@@ -421,6 +478,66 @@ def inspect_project(project, commit, tag, repo, budget):
         selection["identity"]["submodules"] = submodule_evidence(selection)
     # Admit every link before creating any destination, including all siblings.
     return selection
+
+def native_export(project, commit, output_kind):
+    require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None and commit != "0" * 40,
+            "expected an explicit SHA-1 source commit")
+    require(output_kind in ("archive", "manifest"), "invalid native source export")
+    selection = inspect_repository(plain_directory(project), commit, git_environment(), {}, native=True)
+    rows = []
+    def collect(selected, prefix=""):
+        for name, mode, oid in selected["entries"]:
+            rows.append((prefix + name, mode, oid))
+        for name, child in selected["children"]:
+            rows.append((prefix + name, "160000", child["commit"]))
+            collect(child, prefix + name + "/")
+    collect(selection)
+    require(rows, "empty native source manifest")
+    for name, _, _ in rows:
+        require(re.fullmatch(r"[A-Za-z0-9_./+@~#,=()\[\] -]+", name) is not None and ".." not in name,
+                "native source path cannot be represented safely: " + name)
+    if output_kind == "manifest":
+        for name, mode, oid in sorted(rows):
+            print(oid + "\t" + mode + "\t" + name)
+        return
+    # Staging archives have fixed metadata and contain only selected Git
+    # objects. HEAD, worktree edits, export-ignore/export-subst, and submodule
+    # URLs never supply the contents. Recreating this stream gives recovery
+    # exactly the same controller-held digest without retaining a Git checkout.
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+        directories = set()
+        def directory(name):
+            if not name or name in directories:
+                return
+            parent = name.rsplit("/", 1)[0] if "/" in name else ""
+            directory(parent)
+            entry = tarfile.TarInfo(name + "/")
+            entry.type, entry.mode = tarfile.DIRTYPE, 0o755
+            archive.addfile(entry)
+            directories.add(name)
+        def emit(selected, prefix=""):
+            with blob_reader(selected) as process:
+                for name, mode, oid in selected["entries"]:
+                    path = prefix + name
+                    directory(path.rsplit("/", 1)[0] if "/" in path else "")
+                    entry = tarfile.TarInfo(path)
+                    if mode == "120000":
+                        # The link blob was already hashed during graph
+                        # admission. Emit its original text, never dereference.
+                        entry.type, entry.mode = tarfile.SYMTYPE, 0o777
+                        entry.linkname = selected["links"][name]["target"]
+                        archive.addfile(entry)
+                    else:
+                        source = GitObjectInput(process, oid, "blob", 1024 ** 3)
+                        entry.size = source.size
+                        entry.mode = 0o755 if mode == "100755" else 0o644
+                        archive.addfile(entry, source)
+                        source.finish()
+            for name, child in selected["children"]:
+                path = prefix + name
+                directory(path)
+                emit(child, path + "/")
+        emit(selection)
 
 def write_repository(selection, root, links, prefix=""):
     root.mkdir(mode=0o700)
@@ -611,6 +728,9 @@ def verify(root, evidence):
 
 try:
     mode = sys.argv[1]
+    if mode == "native-export":
+        native_export(*sys.argv[2:])
+        sys.exit(0)
     if mode == "verify":
         root, receipt = map(Path, sys.argv[2:])
         verify(root, read_json(receipt))
@@ -658,7 +778,7 @@ try:
         evidence = write_snapshot(primary, root)
     verify(root, evidence)
     publish(receipt, evidence)
-except (Rejected, OSError, ValueError, KeyError, TypeError, RecursionError, subprocess.SubprocessError) as error:
+except (Rejected, OSError, ValueError, KeyError, TypeError, RecursionError, tarfile.TarError, subprocess.SubprocessError) as error:
     print("[xwin-source] " + str(error), file=sys.stderr)
     sys.exit(7 if sys.argv[1] == "verify" else 4)
 PY

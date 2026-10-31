@@ -961,6 +961,31 @@ Cargo-generated version 3/4 lockfiles. Unused patch records are parsed but never
 contribute resolved-package authority. No Python installation is needed on the
 Windows build host.
 
+Strict native project snapshots expand initialized submodules recursively from
+the gitlink commits in their parent trees. The coordinator's shared Git object
+reader authenticates every commit, tree and blob, then streams a deterministic
+tar archive without copying mutable working-tree bytes or applying Git export
+attributes. The original three-column manifest retains each `160000` repository
+boundary and includes every selected child file. The coordinator-held archive
+and manifest hashes continue to bind staging, independent final verification
+and recovery; recovery reconstructs the same bytes from the pinned objects.
+
+Self-contained child `.git` directories and ordinary absorbed submodules whose
+administration remains inside their parent's `modules` directory are supported.
+External administration pointers, alternates, linked object stores, missing or
+wrong-type objects and configuration includes are refused. No submodule URL is
+fetched, and a child HEAD cannot override its parent's selected commit. Each
+source archive has a shared limit of 100000 Git tree entries, 256 repositories
+and 16 nested submodule levels. Recursive export requires Python 3.9+ on the
+coordinator; it adds no Python requirement to Windows build hosts.
+
+The Unix and Windows receivers admit only the manifest's exact directory and
+file inventory, including empty nested submodules. Links cannot leave their
+nearest repository or enter another submodule, even temporarily before `..`.
+Unix retains contained tracked file or directory links; Windows retains its
+regular-file materialization policy. Unlisted descendants and changed blobs
+refuse staging or artifact collection, as do changed executable modes on Unix.
+
 Strict native Windows project snapshots also support tracked file symlinks
 such as `CLAUDE.md -> AGENTS.md`. A relative link must resolve, with exact
 case, to a regular file present in the same tracked manifest. The extractor

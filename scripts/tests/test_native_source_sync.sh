@@ -30,12 +30,15 @@ test_windows_source_links() (
     python3 - "$work" "$ROOT" "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" <<'PY' || return 1
 import hashlib
 import base64
+import copy
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import shlex
 import subprocess
 import sys
+import tarfile
 
 work = Path(sys.argv[1])
 root = Path(sys.argv[2])
@@ -125,6 +128,117 @@ assert expansion['expanded_bytes'] > 2 * Path(expansion['archive']).stat().st_si
 fixture('regular-only', {'plain.txt': b'unchanged regular source\n', 'nested/empty': b''}, accepted=True)
 fixture('empty-gitlink', {'plain.txt': b'gitlink sibling\n'}, accepted=True, gitlinks=('vendor/dep',))
 
+def submodule_fixture(name, specification, accepted=False):
+    directory = work / name
+    repo = directory / 'repo'
+    rows, members, contents, links, directories = [], [], {}, {}, set()
+
+    def populate(checkout, selected, prefix=''):
+        checkout.mkdir(parents=True)
+        git(checkout, 'init', '-q', '--initial-branch=main', '--object-format=sha1')
+        children = selected.get('children', {})
+        for path, child in children.items():
+            revision = populate(checkout / path, child, prefix + path + '/')
+            git(checkout, 'update-index', '--add', '--cacheinfo', '160000,' + revision + ',' + path)
+        for path, value in selected.get('files', {}).items():
+            mode, data = value if isinstance(value, tuple) else ('100644', value)
+            oid = git(checkout, 'hash-object', '-w', '--stdin', data=data).decode().strip()
+            git(checkout, 'update-index', '--add', '--cacheinfo', mode + ',' + oid + ',' + path)
+            contents[prefix + path] = dict(oid=oid, sha256=hashlib.sha256(data).hexdigest(), length=len(data))
+        for path, target in selected.get('links', {}).items():
+            oid = git(checkout, 'hash-object', '-w', '--stdin', data=target.encode('ascii')).decode().strip()
+            git(checkout, 'update-index', '--add', '--cacheinfo', '120000,' + oid + ',' + path)
+            links[prefix + path] = target
+        tree = git(checkout, 'write-tree').decode().strip()
+        revision = git(checkout, 'commit-tree', tree, '-m', 'pinned project submodule fixture').decode().strip()
+        git(checkout, 'update-ref', 'refs/heads/main', revision)
+        for record in git(checkout, 'ls-tree', '-rz', '--full-tree', revision).split(b'\0'):
+            if not record:
+                continue
+            metadata, path = record.decode('ascii').split('\t', 1)
+            mode, kind, oid = metadata.split(' ')
+            full = prefix + path
+            rows.append((oid, mode, full))
+            if mode == '160000':
+                directories.add(full)
+            parent = PurePosixPath(full).parent
+            while str(parent) != '.':
+                directories.add(str(parent))
+                parent = parent.parent
+        # Negative receiver controls retain genuine parent/child Git output.
+        # They bypass only the controller's admission so the independent
+        # receiver must still reject links that cross a repository boundary.
+        if children or selected.get('files') or selected.get('links'):
+            with tarfile.open(fileobj=io.BytesIO(git(checkout, 'archive', '--format=tar', revision))) as source:
+                for member in source:
+                    entry = copy.copy(member)
+                    entry.name = prefix + entry.name
+                    entry.pax_headers = {}
+                    data = source.extractfile(member).read() if member.isfile() else None
+                    members.append((entry, data))
+        return revision
+
+    revision = populate(repo, specification)
+    archive, manifest = directory / 'source.tar', directory / 'source.manifest'
+    if accepted:
+        # These are the actual coordinator exporters, not a parallel fixture
+        # implementation of their object authentication or archive format.
+        program = 'source "$1" || exit; _act_write_git_archive_evidence "$2" "$3" "$4" && _act_write_tracked_manifest "$2" "$3" "$5"'
+        exported = subprocess.run(['bash', '-c', program, 'fixture', str(runner), str(repo), revision,
+                                   str(archive), str(manifest)], env=environment,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        (directory / 'controller-export.log').write_bytes(exported.stderr)
+        if exported.returncode:
+            raise RuntimeError('Native project-submodule export failed: ' + name + '\n' + exported.stderr.decode())
+        actual_rows = [tuple(line.split('\t')) for line in manifest.read_text().splitlines()]
+        assert sorted(actual_rows) == sorted(rows), (name, actual_rows, rows)
+    else:
+        with tarfile.open(archive, 'w', format=tarfile.PAX_FORMAT) as output:
+            for entry, data in sorted(members, key=lambda item: item[0].name):
+                output.addfile(entry, io.BytesIO(data) if data is not None else None)
+        manifest.write_text(''.join('\t'.join(row) + '\n' for row in sorted(rows, key=lambda row: row[2])), encoding='ascii')
+    materialized = 0
+    if accepted:
+        import posixpath
+        for path, target in links.items():
+            referent = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+            contents[path] = dict(contents[referent], referent=referent)
+            materialized += contents[referent]['length']
+    value = dict(name=name, archive=str(archive), manifest=str(manifest),
+                 archive_sha256=digest(archive), manifest_sha256=digest(manifest),
+                 object_count=len(directories) + sum(row[1] != '160000' for row in rows),
+                 accepted=accepted, files=contents if accepted else {}, directories=sorted(directories),
+                 links=links, expanded_bytes=sum(item['length'] for item in contents.values()),
+                 materialized_bytes=materialized)
+    cases.append(value)
+    return value
+
+submodule_spec = {'files': {'root.txt': b'parent repository\n'}, 'children': {
+    'vendor/dep': {'files': {'data.txt': b'pinned child source\n', 'run.ps1': ('100755', b'Write-Output "child"\n')},
+                   'links': {'copy.txt': 'data.txt', 'nested/local-link': '../data.txt'},
+                   'children': {'inner': {'files': {'leaf.txt': b'pinned nested source\n'},
+                                          'links': {'leaf-copy': 'leaf.txt'}}, 'empty': {}}},
+    'vendor/other': {'files': {'other.txt': b'independent pinned child\n'}}}}
+submodule_fixture('project-submodules', submodule_spec, True)
+for name, owner, path, target in (
+    ('parent-to-child', '', 'link', 'vendor/dep/data.txt'),
+    ('parent-enters-and-leaves-child', '', 'link', 'vendor/dep/../../root.txt'),
+    ('child-to-parent', 'vendor/dep', 'link', '../../root.txt'),
+    ('child-leaves-and-reenters', 'vendor/dep', 'link', '../dep/data.txt'),
+    ('child-to-sibling', 'vendor/dep', 'link', '../other/other.txt'),
+    ('child-to-nested', 'vendor/dep', 'link', 'inner/leaf.txt'),
+    ('child-enters-and-leaves-nested', 'vendor/dep', 'link', 'inner/../data.txt'),
+    ('nested-to-parent', 'vendor/dep/inner', 'link', '../data.txt'),
+):
+    selected = copy.deepcopy(submodule_spec)
+    destination = selected
+    if owner:
+        destination = destination['children']['vendor/dep']
+        if owner.endswith('/inner'):
+            destination = destination['children']['inner']
+    destination.setdefault('links', {})[path] = target
+    submodule_fixture(name, selected)
+
 base = {'source/input.txt': b'authenticated input\n'}
 for name, links in (
     ('absolute-posix', {'link': '/outside.txt'}),
@@ -182,7 +296,7 @@ generator_env = dict(environment, DSR_CONFIG_DIR=str(work / 'config'),
                      DOTNET_CLI_TELEMETRY_OPTOUT='1', POWERSHELL_UPDATECHECK='Off')
 generator = 'source "$1" || exit; shift; "$@"'
 for case in cases:
-    if case['name'] not in ('safe', 'pax-long-path-and-link', 'regular-only', 'empty-gitlink', 'changed-link-target'):
+    if case['name'] not in ('safe', 'pax-long-path-and-link', 'regular-only', 'empty-gitlink', 'changed-link-target', 'project-submodules', 'parent-to-child', 'child-to-parent'):
         continue
     destination = work / ('emitted-' + case['name'])
     destination.mkdir()
@@ -374,6 +488,21 @@ foreach ($mutation in @('link-copy','referent','extra-file')) {
     [IO.File]::WriteAllText((Join-Path $destination $path),'changed after admission')
     Refused ($mutation + ' alteration fails fresh final verification') { Test-DsrWindowsSourceSnapshot -Plan (Plan $safe) -DestinationPath $destination }
 }
+$submodules=@($cases | Where-Object name -eq project-submodules)[0]
+foreach ($mutation in @('child-file','nested-file','child-link-copy','extra-child-file')) {
+    $destination=Empty-Root ('submodule-after-copy-' + $mutation)
+    $null=Expand-DsrWindowsSourceSnapshot -Plan (Plan $submodules) -DestinationPath $destination
+    $path=switch ($mutation) {
+        'child-file' { 'vendor/dep/data.txt' }
+        'nested-file' { 'vendor/dep/inner/leaf.txt' }
+        'child-link-copy' { 'vendor/dep/copy.txt' }
+        'extra-child-file' { 'vendor/dep/empty/untracked.txt' }
+    }
+    [IO.File]::WriteAllText((Join-Path $destination $path),'changed child after admission')
+    Refused ($mutation + ' fails fresh project-submodule verification') {
+        Test-DsrWindowsSourceSnapshot -Plan (Plan $submodules) -DestinationPath $destination
+    }
+}
 $destination=Empty-Root 'nonempty'
 $sentinel=Join-Path $destination 'sentinel.txt'
 [IO.File]::WriteAllText($sentinel,'preserve prior bytes')
@@ -409,13 +538,13 @@ try {
     & (Join-Path $FixtureRoot 'budget-expansion.ps1')
     Check 'actual expansion budget admits sufficient materialized-byte headroom' $true
 } catch { Check 'actual expansion budget admits sufficient materialized-byte headroom' $false; [Console]::Error.WriteLine($_) }
-foreach ($case in @($cases | Where-Object { $_.name -in @('safe','pax-long-path-and-link','regular-only','empty-gitlink','changed-link-target') })) {
+foreach ($case in @($cases | Where-Object { $_.name -in @('safe','pax-long-path-and-link','regular-only','empty-gitlink','changed-link-target','project-submodules','parent-to-child','child-to-parent') })) {
     $extract=Join-Path $FixtureRoot ($case.name + '-extract.ps1')
     $verify=Join-Path $FixtureRoot ($case.name + '-verify.ps1')
     $destination=Join-Path $FixtureRoot ('emitted-' + $case.name)
     if (-not $case.accepted) {
-        Refused 'emitted receiver refuses changed authenticated link target' { & $extract }
-        Check 'emitted receiver refusal creates no payload' (@(Get-ChildItem -LiteralPath $destination -Force).Count -eq 0)
+        Refused ($case.name + ' emitted receiver refuses inadmissible authenticated link') { & $extract }
+        Check ($case.name + ' emitted receiver refusal creates no payload') (@(Get-ChildItem -LiteralPath $destination -Force).Count -eq 0)
         continue
     }
     try {
@@ -427,6 +556,9 @@ foreach ($case in @($cases | Where-Object { $_.name -in @('safe','pax-long-path-
         if ($case.name -eq 'safe') {
             [IO.File]::WriteAllText((Join-Path $destination 'file-link'),'altered copied link')
             Refused 'emitted final verifier refuses changed materialized source' { & $verify }
+        } elseif ($case.name -eq 'project-submodules') {
+            [IO.File]::WriteAllText((Join-Path $destination 'vendor/dep/inner/leaf.txt'),'altered pinned nested source')
+            Refused 'emitted final verifier refuses changed project-submodule source' { & $verify }
         }
     } catch {
         Check ($case.name + ' emitted receiver completes') $false

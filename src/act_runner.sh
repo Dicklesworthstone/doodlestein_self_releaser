@@ -4361,14 +4361,39 @@ _act_strict_source_root_path() {
     printf '%s/%s-%s/source\n' "$strict_root" "$tool_name" "$run_id"
 }
 
+_act_source_has_gitlinks() {
+    local listing
+    listing=$(_act_strict_git -C "$1" ls-tree -r --full-tree "$2" 2>/dev/null) || return 4
+    [[ "$listing" == '160000 commit '* || "$listing" == *$'\n160000 commit '* ]]
+}
+
+_act_source_archive_export() {
+    local repo_path="$1" revision="$2" kind="$3" module_dir commit
+    module_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || return 4
+    # shellcheck source=src/xwin_source.sh
+    source "$module_dir/xwin_source.sh" || return 3
+    commit=$(_act_strict_git -C "$repo_path" rev-parse --verify "${revision}^{commit}" 2>/dev/null) || return 4
+    source_archive_export "$repo_path" "$commit" "$kind"
+}
+
+_act_stream_git_archive() {
+    local status=0
+    _act_source_has_gitlinks "$1" "$2" || status=$?
+    case "$status" in
+        0) _act_source_archive_export "$1" "$2" archive ;;
+        1) _act_strict_git -C "$1" archive --format=tar "$2" 2>/dev/null ;;
+        *) return "$status" ;;
+    esac
+}
+
 _act_git_archive_sha256() {
     local repo_path="$1"
     local revision="$2"
 
     if command -v sha256sum &>/dev/null; then
-        _act_strict_git -C "$repo_path" archive --format=tar "$revision" 2>/dev/null | sha256sum | awk '{print $1}'
+        (set -o pipefail; _act_stream_git_archive "$repo_path" "$revision" | sha256sum | awk '{print $1}')
     elif command -v shasum &>/dev/null; then
-        _act_strict_git -C "$repo_path" archive --format=tar "$revision" 2>/dev/null | shasum -a 256 | awk '{print $1}'
+        (set -o pipefail; _act_stream_git_archive "$repo_path" "$revision" | shasum -a 256 | awk '{print $1}')
     else
         return 3
     fi
@@ -4385,7 +4410,7 @@ _act_write_git_archive_evidence() {
         umask 077
         exec 9> "$output_file" || exit 4
         descriptor_inode=$(_act_file_identity /dev/fd/9) || exit 4
-        _act_strict_git -C "$repo_path" archive --format=tar "$revision" >&9 2>/dev/null || exit 4
+        _act_stream_git_archive "$repo_path" "$revision" >&9 || exit 4
         chmod 600 /dev/fd/9 || exit 4
         path_inode=$(_act_file_identity "$output_file") || exit 4
         [[ -s /dev/fd/9 && -f "$output_file" && ! -L "$output_file" && \
@@ -4402,8 +4427,10 @@ _act_strict_symlink_target_is_contained() {
     local root_path="${1%/}"
     local link_path="$2"
     local target="$3"
-    local component cursor="$root_path"
+    local repository_root="${4:-$root_path}" component cursor="$root_path" gitlink
     local -a parts=()
+    local -a gitlink_roots=()
+    if [[ $# -gt 4 ]]; then gitlink_roots=("${@:5}"); fi
 
     [[ -n "$root_path" && -d "$root_path" && ! -L "$root_path" && \
        "$link_path" != /* && "$link_path" != *..* && \
@@ -4419,15 +4446,19 @@ _act_strict_symlink_target_is_contained() {
     fi
     IFS='/' read -r -a parts <<< "$target"
     for component in "${parts[@]}"; do
+        [[ -d "$cursor" && ! -L "$cursor" ]] || return 1
         case "$component" in
             ""|.) ;;
             ..)
-                [[ "$cursor" != "$root_path" ]] || return 1
+                [[ "$cursor" != "$repository_root" ]] || return 1
                 cursor="${cursor%/*}"
                 ;;
             *)
                 cursor="$cursor/$component"
                 [[ ! -L "$cursor" ]] || return 1
+                for gitlink in "${gitlink_roots[@]}"; do
+                    [[ "$cursor" != "$gitlink" || "$cursor" == "$repository_root" ]] || return 1
+                done
                 ;;
         esac
     done
@@ -4453,11 +4484,23 @@ _act_write_tracked_manifest() {
     local output_file="$3"
     (
         local metadata path mode object_type object_id descriptor_inode path_inode
-        local kind
+        local kind gitlink_status=0
         set -C
         umask 077
         exec 9> "$output_file" || exit 4
         descriptor_inode=$(_act_file_identity /dev/fd/9) || exit 4
+        _act_source_has_gitlinks "$repo_path" "$revision" || gitlink_status=$?
+        if [[ $gitlink_status -eq 0 ]]; then
+            _act_source_archive_export "$repo_path" "$revision" manifest >&9 || exit 4
+            chmod 600 /dev/fd/9 || exit 4
+            path_inode=$(_act_file_identity "$output_file") || exit 4
+            [[ -s /dev/fd/9 && -f "$output_file" && ! -L "$output_file" && \
+               "$descriptor_inode" == "$path_inode" ]] || exit 4
+            exec 9>&-
+            exit 0
+        elif [[ $gitlink_status -ne 1 ]]; then
+            exit "$gitlink_status"
+        fi
         while IFS=$'\t' read -r metadata path; do
             [[ -n "$metadata" && -n "$path" ]] || continue
             read -r mode object_type object_id <<< "$metadata"
@@ -4520,9 +4563,10 @@ _act_tracked_manifest_object_count() {
 _act_verify_tracked_manifest_local() {
     local root_path="$1"
     local manifest_file="$2"
-    local object_id mode relative_path parent expected_count actual_count gitlink_contents
-    local hashes expected_hashes hash_index link_target link_hash
+    local object_id mode relative_path parent expected_count actual_count
+    local hashes expected_hashes hash_index link_target link_hash repository_root gitlink
     local -a hash_paths=() hash_ids=() hash_modes=()
+    local -a gitlink_roots=()
 
     if [[ ! -d "$root_path" || -L "$root_path" ]] || \
        ! expected_count=$(_act_tracked_manifest_object_count "$manifest_file"); then
@@ -4530,15 +4574,18 @@ _act_verify_tracked_manifest_local() {
     fi
 
     while IFS=$'\t' read -r object_id mode relative_path; do
+        [[ "$mode" != "160000" ]] || gitlink_roots+=("$root_path/$relative_path")
+    done < "$manifest_file"
+    while IFS=$'\t' read -r object_id mode relative_path; do
         [[ "$object_id" =~ ^[0-9a-f]{40}$ && \
            ( "$mode" == "100644" || "$mode" == "100755" || "$mode" == "120000" || \
              "$mode" == "160000" ) && \
            "$relative_path" =~ ^[][A-Za-z0-9_./+@~#,=()\ -]+$ && \
            "$relative_path" != *..* && "$relative_path" != /* ]] || return 4
         if [[ "$mode" == "160000" ]]; then
-            if [[ ! -d "$root_path/$relative_path" || -L "$root_path/$relative_path" ]] || \
-               ! gitlink_contents=$(find "$root_path/$relative_path" -mindepth 1 -print -quit 2>/dev/null) || \
-               [[ -n "$gitlink_contents" ]]; then
+            # Descendants are individually authenticated manifest rows. The
+            # final exact node count also rejects any unlisted child contents.
+            if [[ ! -d "$root_path/$relative_path" || -L "$root_path/$relative_path" ]]; then
                 return 4
             fi
         elif [[ "$mode" == "120000" ]]; then
@@ -4546,7 +4593,14 @@ _act_verify_tracked_manifest_local() {
             # hash to the committed blob and stay inside the snapshot.
             [[ -L "$root_path/$relative_path" ]] || return 4
             link_target=$(readlink "$root_path/$relative_path") || return 4
-            _act_strict_symlink_target_is_contained "$root_path" "$relative_path" "$link_target" || return 4
+            repository_root="$root_path"
+            for gitlink in "${gitlink_roots[@]}"; do
+                if [[ "$root_path/$relative_path" == "$gitlink"/* && ${#gitlink} -gt ${#repository_root} ]]; then
+                    repository_root="$gitlink"
+                fi
+            done
+            _act_strict_symlink_target_is_contained "$root_path" "$relative_path" "$link_target" \
+                "$repository_root" "${gitlink_roots[@]}" || return 4
             link_hash=$(printf '%s' "$link_target" | git hash-object --no-filters --stdin 2>/dev/null) || return 4
             [[ "$link_hash" == "$object_id" ]] || return 4
         else
@@ -5986,6 +6040,9 @@ LC_ALL=C awk -F '\\t' '
     END { if (bad || NR == 0) exit 21 }
 ' '$remote_manifest'
 tab=\$(printf '\\t')
+dsr_gitlink_roots=\$(LC_ALL=C awk -F '\\t' '\$2 == "160000" { print \$3 }' '$remote_manifest')
+dsr_line_break='
+'
 while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_path"; do
     node='$remote_path'/\$relative_path
     parent=\$relative_path
@@ -5997,8 +6054,6 @@ while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_pa
     if test "\$mode" = 160000; then
         test -d "\$node"
         test ! -L "\$node"
-        gitlink_contents=\$(find "\$node" -mindepth 1 -print -quit)
-        test -z "\$gitlink_contents"
     elif test "\$mode" = 120000; then
         test -L "\$node"
         target=\$(readlink "\$node")
@@ -6010,6 +6065,17 @@ while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_pa
         test "\$link_dir" = "\$relative_path" && link_dir=
         set -f
         old_ifs=\$IFS
+        repository_root='$remote_path'
+        IFS=\$dsr_line_break
+        for dsr_gitlink in \$dsr_gitlink_roots; do
+            case "\$relative_path" in
+                "\$dsr_gitlink"/*)
+                    dsr_candidate='$remote_path'/\$dsr_gitlink
+                    if test \${#dsr_candidate} -gt \${#repository_root}; then
+                        repository_root=\$dsr_candidate
+                    fi;;
+            esac
+        done
         IFS=/
         for component in \$link_dir; do
             case "\$component" in
@@ -6018,10 +6084,18 @@ while IFS="\$tab" read -r object_id mode relative_path || test -n "\$relative_pa
             esac
         done
         for component in \$target; do
+            test -d "\$cursor"; test ! -L "\$cursor"
             case "\$component" in
                 ''|.) :;;
-                ..) test "\$cursor" != '$remote_path' || exit 21; cursor=\${cursor%/*};;
-                *) cursor="\$cursor/\$component"; test ! -L "\$cursor" || exit 21;;
+                ..) test "\$cursor" != "\$repository_root" || exit 21; cursor=\${cursor%/*};;
+                *)
+                    cursor="\$cursor/\$component"; test ! -L "\$cursor" || exit 21
+                    IFS=\$dsr_line_break
+                    for dsr_gitlink in \$dsr_gitlink_roots; do
+                        test "\$cursor" != '$remote_path'/"\$dsr_gitlink" || \\
+                            test "\$cursor" = "\$repository_root" || exit 21
+                    done
+                    IFS=/;;
             esac
         done
         IFS=\$old_ifs

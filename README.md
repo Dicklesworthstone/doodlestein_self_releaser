@@ -262,6 +262,23 @@ targets as well as target matrices, so a successful command that produces no
 new binary cannot publish an older binary from a shared target directory.
 Dependency-cache reuse is unchanged, and prior attempt outputs are retained.
 
+Strict native source snapshots include initialized project submodules and their
+nested submodules at the commits recorded by their parent Git trees. Initialize
+the checkout with `git submodule update --init --recursive` before building.
+DSR reads and authenticates the selected commit, tree and blob objects directly;
+submodule URLs and mutable child HEADs cannot select release bytes. Missing
+pinned objects, external Git object stores and unsafe administration pointers
+are refused without fetching. Ordinary absorbed submodules and self-contained
+child repositories are supported. The coordinator needs Python 3.9+ for these
+recursive exports.
+
+Each native snapshot retains a deterministic archive and its complete Git
+manifest for independent staging, collection and recovery checks. Unix keeps
+safe tracked links; Windows materializes safe file links as regular copies.
+A link must stay inside its own repository, including during `..` traversal.
+Both receivers reject changed submodule bytes and unlisted files. Each archive
+is bounded to 16 nested levels, 256 repositories and 100,000 Git tree entries.
+
 Strict native Rust builds seed private Cargo homes with downloads selected
 by the committed `Cargo.lock`: checksum-matching crate archives, their index
 records, and Git databases containing locked commits. Ambient extracted registry
