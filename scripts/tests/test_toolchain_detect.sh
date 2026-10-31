@@ -30,6 +30,7 @@ log_init 2>/dev/null || true
 
 setup() {
   TEMP_DIR=$(mktemp -d)
+  TEMP_DIR=$(cd "$TEMP_DIR" && pwd -P) || return 1
   # Suppress colors for consistent test output
   export NO_COLOR=1
   # Reset to non-interactive mode for predictable behavior
@@ -37,7 +38,7 @@ setup() {
 }
 
 teardown() {
-  if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+  if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" && "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then
     rm -rf "$TEMP_DIR"
   fi
 }
@@ -51,28 +52,6 @@ assert_equals() {
     echo "  FAIL: $msg"
     echo "    Expected: $expected"
     echo "    Actual:   $actual"
-    return 1
-  fi
-  return 0
-}
-
-assert_true() {
-  local condition="$1"
-  local msg="${2:-expected true}"
-
-  if ! eval "$condition"; then
-    echo "  FAIL: $msg"
-    return 1
-  fi
-  return 0
-}
-
-assert_false() {
-  local condition="$1"
-  local msg="${2:-expected false}"
-
-  if eval "$condition"; then
-    echo "  FAIL: $msg"
     return 1
   fi
   return 0
@@ -115,15 +94,15 @@ run_test() {
 
   [[ -z "${DSR_TOOLCHAIN_TEST_FILTER:-}" || "$test_name" == *"$DSR_TOOLCHAIN_TEST_FILTER"* ]] || return 0
 
-  ((TESTS_RUN++))
+  ((TESTS_RUN+=1))
   echo -n "  $test_name... "
 
   if $test_func 2>/dev/null; then
     echo "OK"
-    ((TESTS_PASSED++))
+    ((TESTS_PASSED+=1))
   else
     echo "FAILED"
-    ((TESTS_FAILED++))
+    ((TESTS_FAILED+=1))
   fi
 }
 

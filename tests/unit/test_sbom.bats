@@ -373,7 +373,11 @@ EOF
     }
     export -f command
 
-    run sbom_generate_json "/tmp"
+    # /tmp itself is a symlink on macOS and is correctly refused before
+    # dependency discovery. Exercise the missing-scanner path with real input.
+    local project
+    project=$(cd "$TEST_PROJECTS" && pwd -P)
+    run sbom_generate_json "$project"
 
     local status error
     status=$(echo "$output" | jq -r '.status')

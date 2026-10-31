@@ -5,8 +5,12 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${SBOM_TEST_MODULE:-$ROOT/src/sbom.sh}"
 REAL_SYFT=$(command -v syft || true)
+file_identity() {
+    python3 -c 'import os,sys; value=os.stat(sys.argv[1]); print(str(value.st_dev)+":"+str(value.st_ino))' "$1"
+}
 WORK=$(mktemp -d)
-trap 'chmod -R u+w "$WORK"; rm -rf -- "$WORK"' EXIT
+WORK=$(cd "$WORK" && pwd -P) || exit 1
+trap 'if [[ "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then chmod -R u+w "$WORK"; rm -rf -- "$WORK"; fi' EXIT
 trap 'exit 5' HUP INT TERM
 mkdir -p "$WORK/bin" "$WORK/cases"
 export PATH="$WORK/bin:$PATH" SBOM_OUTPUT_DIR=""
@@ -114,16 +118,19 @@ check 'named hardlink aliases both remain in inventory' jq -e '[.artifacts[].art
 check 'metadata is not scanned as a binary' test "$(scan_count)" -eq 6
 check 'each compression variant keeps its own sidecar' test -f "$ART/b.tar.xz.sbom.spdx.json"
 check 'later publication cannot overwrite an earlier receipt' jq -e '.artifact.name == "a.tar.gz"' "$ART/a.tar.gz.sbom.spdx.json.dsr.json"
-check 'receipt files never share a mutable staging inode' test "$(stat -c %i "$ART/a.tar.gz.sbom.spdx.json.dsr.json")" != "$(stat -c %i "$ART/b.tar.xz.sbom.spdx.json.dsr.json")"
+first_receipt_identity=$(file_identity "$ART/a.tar.gz.sbom.spdx.json.dsr.json") || exit 1
+second_receipt_identity=$(file_identity "$ART/b.tar.xz.sbom.spdx.json.dsr.json") || exit 1
+check 'receipt files never share a mutable staging inode' test "$first_receipt_identity" != "$second_receipt_identity"
 cp "$manifest" "$CASE/manifest.before"
 cp "$ART/a.tar.gz.sbom.spdx.json" "$CASE/proof.before"
-inode=$(stat -c %i "$ART/a.tar.gz.sbom.spdx.json")
+inode=$(file_identity "$ART/a.tar.gz.sbom.spdx.json") || exit 1
 capture without_syft sbom_generate_artifacts "$ART"
 check 'complete retry does not require Syft' test "$status" -eq 0
 check 'complete retry performs zero new scans' test "$(scan_count)" -eq 6
 check 'complete retry preserves manifest bytes' cmp -s "$manifest" "$CASE/manifest.before"
 check 'complete retry preserves SBOM bytes' cmp -s "$ART/a.tar.gz.sbom.spdx.json" "$CASE/proof.before"
-check 'complete retry preserves SBOM inode' test "$(stat -c %i "$ART/a.tar.gz.sbom.spdx.json")" = "$inode"
+retry_inode=$(file_identity "$ART/a.tar.gz.sbom.spdx.json") || exit 1
+check 'complete retry preserves SBOM inode' test "$retry_inode" = "$inode"
 capture without_syft sbom_verify_artifacts "$ART"
 check 'independent full-set verification needs no scanner' test "$status" -eq 0
 capture bash -c 'sbom_verify_artifacts "$1"' bash "$ART"

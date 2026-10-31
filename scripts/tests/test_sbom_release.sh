@@ -5,7 +5,8 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${SBOM_TEST_MODULE:-$ROOT/src/sbom.sh}"
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+WORK=$(cd "$WORK" && pwd -P) || exit 1
+trap 'if [[ "${DSR_TEST_KEEP_TEMP:-0}" != 1 ]]; then rm -rf -- "$WORK"; fi' EXIT
 trap 'exit 5' HUP INT TERM
 mkdir -p "$WORK/bin" "$WORK/cases"
 export PATH="$WORK/bin:$PATH" SBOM_FIXTURES="$WORK"
@@ -112,7 +113,7 @@ for mode in fail empty malformed scalar multiple wrong thin; do
     check "$mode scanner result cannot succeed" nonzero "$status"
     check "$mode scanner result leaves no final document" absent "$CASE/tool.tar.gz.sbom.spdx.json"
     check "$mode scanner result emits no success path" test -z "$output"
-    cp "$WORK/spdx.json" "$CASE/retained.json"
+    command cp "$WORK/spdx.json" "$CASE/retained.json"
     capture sbom_generate "$CASE/tool.tar.gz" --output "$CASE/retained.json"
     check "$mode failure preserves retained proof bytes" cmp -s "$WORK/spdx.json" "$CASE/retained.json"
 done
@@ -160,24 +161,24 @@ mkfifo "$CASE/fifo"
 capture sbom_generate "$CASE/fifo"
 check 'special input rejected' nonzero "$status"
 ln -s "$CASE/tool.tar.gz" "$CASE/linked-output"
-cp "$CASE/tool.tar.gz" "$CASE/original"
+command cp "$CASE/tool.tar.gz" "$CASE/original"
 capture sbom_generate "$CASE/tool.tar.gz" --output "$CASE/linked-output"
 check 'linked output rejected' nonzero "$status"
 check 'linked output cannot change artifact' cmp -s "$CASE/tool.tar.gz" "$CASE/original"
 ln "$CASE/tool.tar.gz" "$CASE/hardlink-output"
 capture sbom_generate "$CASE/tool.tar.gz" --output "$CASE/hardlink-output"
 check 'hardlink input/output overlap rejected' nonzero "$status"
-cp "$WORK/spdx.json" "$CASE/signed.json"
+command cp "$WORK/spdx.json" "$CASE/signed.json"
 printf signature > "$CASE/signed.json.minisig"
 capture sbom_generate "$CASE/tool.tar.gz" --output "$CASE/signed.json"
 check 'signed proof is not regenerated' nonzero "$status"
 check 'signed proof bytes preserved' cmp -s "$WORK/spdx.json" "$CASE/signed.json"
 printf '{"existing":true}\n' > "$CASE/invalid.json"
-cp "$CASE/invalid.json" "$CASE/invalid.before"
+command cp "$CASE/invalid.json" "$CASE/invalid.before"
 capture sbom_generate "$CASE/tool.tar.gz" --output "$CASE/invalid.json"
 check 'invalid retained proof is not trusted' nonzero "$status"
 check 'invalid retained proof preserved for diagnosis' cmp -s "$CASE/invalid.before" "$CASE/invalid.json"
-cp "$WORK/spdx.json" "$CASE/changing.json"
+command cp "$WORK/spdx.json" "$CASE/changing.json"
 export SBOM_FIXTURE_MODE=destination-drift SBOM_MUTATE_DEST="$CASE/changing.json"
 capture sbom_generate "$CASE/tool.tar.gz" --output "$CASE/changing.json"
 check 'concurrent destination mutation rejected' nonzero "$status"
@@ -213,17 +214,17 @@ check 'JSON missing target exit is invalid arguments' test "$status" -eq 4
 check 'JSON missing target is structured' jq -e '.output_file == null and .status == "error"' "$CASE/stdout"
 
 new_case io
-cp "$WORK/spdx.json" "$CASE/retained.json"
+command cp "$WORK/spdx.json" "$CASE/retained.json"
 # Different valid scanner result forces the atomic replacement path.
 jq '.name = "replacement"' "$WORK/spdx.json" > "$WORK/changed.json"
-cp "$WORK/spdx.json" "$WORK/unchanged.json"
-cp "$WORK/changed.json" "$WORK/spdx.json"
+command cp "$WORK/spdx.json" "$WORK/unchanged.json"
+command cp "$WORK/changed.json" "$WORK/spdx.json"
 mv() { return 19; }
 capture sbom_generate "$CASE/tool.tar.gz" --output "$CASE/retained.json"
 check 'failed publication remains failure' nonzero "$status"
 check 'failed publication preserves original document' cmp -s "$WORK/unchanged.json" "$CASE/retained.json"
 unset -f mv
-cp "$WORK/unchanged.json" "$WORK/spdx.json"
+command cp "$WORK/unchanged.json" "$WORK/spdx.json"
 cp() { return 19; }
 capture sbom_generate "$CASE/tool.tar.gz"
 check 'snapshot copy failure cannot report success' nonzero "$status"
