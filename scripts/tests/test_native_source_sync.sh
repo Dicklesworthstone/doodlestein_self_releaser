@@ -7,9 +7,439 @@
 # Use --strict-mixed-protocol-only for mixed-platform receipt/selection controls;
 # this mode never claims a Darwin compiler or artifact execution.
 # Use --git-selection-only for genuine Git/rsync selection without a compiler.
+# Use --windows-source-links-only for real Git archives and PowerShell regular
+# copy materialization. On Unix this proves the receiver logic, not NTFS.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+
+test_windows_source_links() (
+    local dependency work backend
+    for dependency in bash git python3 pwsh yq jq; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: Windows source links require %s\n' "$dependency"
+            return 77
+        }
+    done
+    work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-windows-source-links.XXXXXXXX") || return 1
+    printf 'Windows source-link evidence: %s\n' "$work"
+    backend="${DSR_WINDOWS_SOURCE_BACKEND:-$ROOT/src/source_snapshot_windows.ps1}"
+    [[ -f "$backend" ]] || return 3
+    # Git index plumbing creates authentic 120000 blobs without creating an
+    # origin filesystem link or requiring Windows symlink privileges.
+    python3 - "$work" "$ROOT" "${DSR_TEST_ACT_RUNNER:-$ROOT/src/act_runner.sh}" <<'PY' || return 1
+import hashlib
+import base64
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shlex
+import subprocess
+import sys
+
+work = Path(sys.argv[1])
+root = Path(sys.argv[2])
+runner = Path(sys.argv[3])
+environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_AUTHOR_NAME='DSR source fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                   GIT_COMMITTER_NAME='DSR source fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
+                   GIT_AUTHOR_DATE='2026-01-01T00:00:00Z', GIT_COMMITTER_DATE='2026-01-01T00:00:00Z')
+cases = []
+
+def git(repo, *args, data=None):
+    return subprocess.run(['git', '-c', 'core.autocrlf=false', '-c', 'core.protectNTFS=false',
+                           '-C', str(repo), *args], input=data, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=environment, check=True).stdout
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def fixture(name, files, links=None, accepted=False, gitlinks=()):
+    directory = work / name
+    repo = directory / 'repo'
+    repo.mkdir(parents=True)
+    git(repo, 'init', '-q', '--initial-branch=main', '--object-format=sha1')
+    links = links or {}
+    contents = {}
+    for path, value in files.items():
+        mode, data = value if isinstance(value, tuple) else ('100644', value)
+        oid = git(repo, 'hash-object', '-w', '--stdin', data=data).decode().strip()
+        git(repo, 'update-index', '--add', '--cacheinfo', mode + ',' + oid + ',' + path)
+        contents[path] = dict(oid=oid, sha256=hashlib.sha256(data).hexdigest(), length=len(data))
+    for path, target in links.items():
+        oid = git(repo, 'hash-object', '-w', '--stdin', data=target.encode('ascii')).decode().strip()
+        git(repo, 'update-index', '--add', '--cacheinfo', '120000,' + oid + ',' + path)
+    for path in gitlinks:
+        tree = git(repo, 'mktree', data=b'').decode().strip()
+        revision = git(repo, 'commit-tree', tree, '-m', 'gitlink fixture').decode().strip()
+        git(repo, 'update-index', '--add', '--cacheinfo', '160000,' + revision + ',' + path)
+    git(repo, 'commit', '-qm', 'tracked source fixture')
+    archive = directory / 'source.tar'
+    archive.write_bytes(git(repo, 'archive', '--format=tar', 'HEAD'))
+    manifest = directory / 'source.manifest'
+    rows = []
+    directories = set()
+    for record in git(repo, 'ls-tree', '-rz', '--full-tree', 'HEAD').split(b'\0'):
+        if not record:
+            continue
+        metadata, path = record.decode('ascii').split('\t', 1)
+        mode, kind, oid = metadata.split(' ')
+        assert kind == 'blob' or (kind == 'commit' and mode == '160000')
+        rows.append((oid, mode, path))
+        if mode == '160000':
+            directories.add(path)
+        parent = PurePosixPath(path).parent
+        while str(parent) != '.':
+            directories.add(str(parent))
+            parent = parent.parent
+    manifest.write_text(''.join('\t'.join(row) + '\n' for row in rows), encoding='ascii')
+    materialized = 0
+    if accepted:
+        import posixpath
+        for path, target in links.items():
+            referent = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+            contents[path] = dict(contents[referent], referent=referent)
+            materialized += contents[referent]['length']
+    result = dict(name=name, archive=str(archive), manifest=str(manifest),
+                  archive_sha256=digest(archive), manifest_sha256=digest(manifest),
+                  object_count=len(rows) + len(directories) - len(gitlinks), accepted=accepted,
+                  files=contents if accepted else {}, directories=sorted(directories), links=links,
+                  expanded_bytes=sum(value['length'] for value in contents.values()),
+                  materialized_bytes=materialized)
+    cases.append(result)
+    return result
+
+safe = fixture('safe', {'source/input.txt': b'authenticated input\n',
+    'source/run.ps1': ('100755', b'Write-Output "tracked executable"\n'),
+    'source/empty.txt': b'', 'source/space name.txt': b'spaces are literal\n'},
+    {'file-link': 'source/input.txt', 'nested/relative-link': '../source/input.txt',
+     'executable-link': 'source/run.ps1', 'empty-link': 'source/empty.txt',
+     'space-link': 'source/space name.txt', 'dot-link': './source/../source/input.txt'}, True)
+long_name = 'long/' + 'a' * 200 + '.txt'
+fixture('pax-long-path-and-link', {long_name: b'long Git PAX path\n'},
+        {'long-link': long_name}, True)
+expansion = fixture('expansion', {'source/payload.bin': bytes(range(256)) * 256},
+                    {'copy-' + str(index): 'source/payload.bin' for index in range(12)}, True)
+assert expansion['expanded_bytes'] > 2 * Path(expansion['archive']).stat().st_size
+fixture('regular-only', {'plain.txt': b'unchanged regular source\n', 'nested/empty': b''}, accepted=True)
+fixture('empty-gitlink', {'plain.txt': b'gitlink sibling\n'}, accepted=True, gitlinks=('vendor/dep',))
+
+base = {'source/input.txt': b'authenticated input\n'}
+for name, links in (
+    ('absolute-posix', {'link': '/outside.txt'}),
+    ('absolute-windows', {'link': 'C:/outside.txt'}),
+    ('backslash-target', {'link': r'source\input.txt'}),
+    ('unc-target', {'link': '//server/share/input.txt'}),
+    ('escape', {'nested/link': '../../outside.txt'}),
+    ('dangling', {'link': 'source/missing.txt'}),
+    ('directory-link', {'link': 'source'}),
+    ('self-cycle', {'link': 'link'}),
+    ('two-link-cycle', {'left': 'right', 'right': 'left'}),
+    ('link-chain', {'first': 'second', 'second': 'source/input.txt'}),
+    ('wrong-referent-case', {'link': 'SOURCE/input.txt'}),
+    ('file-as-parent', {'link': 'source/input.txt/../input.txt'}),
+):
+    fixture(name, base, links)
+fixture('file-case-collision', {'Case.txt': b'one', 'case.txt': b'two'})
+fixture('directory-case-collision', {'Dir/a.txt': b'one', 'dir/b.txt': b'two'})
+fixture('file-directory-case-collision', {'node': b'one', 'NODE/child.txt': b'two'})
+fixture('reserved-device-name', {'AUX.txt': b'not a Windows plain file'})
+fixture('trailing-dot-name', {'source/file.': b'not a literal Windows name'})
+
+for name, selected in (('link-oid-mismatch', 'file-link'), ('referent-oid-mismatch', 'source/input.txt')):
+    value = fixture(name, base, {'file-link': 'source/input.txt'})
+    manifest = Path(value['manifest'])
+    rewritten = []
+    for line in manifest.read_text().splitlines():
+        oid, mode, path = line.split('\t')
+        rewritten.append('\t'.join(('0' * 40 if path == selected else oid, mode, path)))
+    manifest.write_text('\n'.join(rewritten) + '\n', encoding='ascii')
+    value['manifest_sha256'] = digest(manifest)
+
+# Both archives are genuine Git output. The second link has an equally sized,
+# equally hashed referent, so only authentication of the link blob can reject it.
+original = fixture('original-link-authority', {'a.txt': b'same', 'b.txt': b'same'}, {'link': 'a.txt'}, True)
+changed = fixture('changed-link-target', {'a.txt': b'same', 'b.txt': b'same'}, {'link': 'b.txt'})
+Path(changed['manifest']).write_bytes(Path(original['manifest']).read_bytes())
+changed['manifest_sha256'] = digest(Path(changed['manifest']))
+
+for name, field, replacement in (
+    ('wrong-held-manifest', 'manifest_sha256', '0' * 64),
+    ('wrong-held-archive', 'archive_sha256', '0' * 64),
+    ('wrong-object-count', 'object_count', safe['object_count'] + 1),
+):
+    value = dict(safe, name=name, accepted=False)
+    value[field] = replacement
+    cases.append(value)
+
+(work / 'cases.json').write_text(json.dumps(cases, indent=2) + '\n', encoding='utf-8')
+# Execute the actual emitted receiver programs as well as the helper API.
+# Only the host's optional split-storage configuration is absent here.
+generator_env = dict(environment, DSR_CONFIG_DIR=str(work / 'config'),
+                     DSR_HOSTS_FILE=str(work / 'no-hosts.yaml'), DSR_STATE_DIR=str(work / 'state'),
+                     DSR_CACHE_DIR=str(work / 'cache'), NO_COLOR='1', POWERSHELL_TELEMETRY_OPTOUT='1',
+                     DOTNET_CLI_TELEMETRY_OPTOUT='1', POWERSHELL_UPDATECHECK='Off')
+generator = 'source "$1" || exit; shift; "$@"'
+for case in cases:
+    if case['name'] not in ('safe', 'pax-long-path-and-link', 'regular-only', 'empty-gitlink', 'changed-link-target'):
+        continue
+    destination = work / ('emitted-' + case['name'])
+    destination.mkdir()
+    for kind, arguments in (
+        ('extract', ['_act_windows_strict_snapshot_extract_script', 'source-fixture', str(destination),
+                     case['archive'], case['manifest'], case['archive_sha256'],
+                     case['manifest_sha256'], str(case['object_count'])]),
+        ('verify', ['_act_windows_strict_snapshot_verify_script', str(destination), str(work),
+                    case['archive'], case['manifest'], case['manifest_sha256'],
+                    str(case['object_count']), case['archive_sha256']]),
+    ):
+        result = subprocess.run(['bash', '-c', generator, 'fixture', str(runner), *arguments],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=generator_env)
+        (work / (case['name'] + '-' + kind + '-generation.log')).write_bytes(result.stderr)
+        if result.returncode:
+            raise RuntimeError('Receiver generation failed: ' + case['name'] + ' ' + kind + '\n' + result.stderr.decode())
+        (work / (case['name'] + '-' + kind + '.ps1')).write_bytes(result.stdout)
+
+# The production encoder is exercised unchanged. Only retained-file transport
+# is a controlled boundary; no SSH, Windows launcher or NTFS proof is claimed.
+short_program = "Write-Output 'source-command-short'"
+long_program = (work / 'safe-verify.ps1').read_text().rstrip('\n')
+transport_checks = []
+boundary = '''source "$1" || exit; shift
+program="$1"; mode="$2"; directory="$3"
+_act_windows_stage_build_script() {
+    printf '%s\\n%s\\n' "$1" "$2" > "$directory/arguments"
+    printf '%s' "$3" > "$directory/program"
+    [[ "$mode" != failure ]] || return 73
+    printf 'retained-source-command'
+}
+_act_windows_source_command source-fixture C:/owned/source "$program"
+'''
+for name, program, mode in (('short', short_program, 'success'),
+                            ('long', long_program, 'success'), ('long-failure', long_program, 'failure')):
+    directory = work / ('transport-' + name)
+    directory.mkdir()
+    result = subprocess.run(['bash', '-c', boundary, 'fixture', str(runner), program, mode, str(directory)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=generator_env)
+    (directory / 'out').write_bytes(result.stdout)
+    (directory / 'err').write_bytes(result.stderr)
+    if name == 'short':
+        command = shlex.split(result.stdout.decode())
+        decoded = base64.b64decode(command[-1]).decode('utf-16-le') if command else ''
+        transport_checks.append(dict(label='short source command uses actual PowerShell encoding',
+            passed=result.returncode == 0 and command[:4] == ['pwsh','-NoProfile','-NonInteractive','-EncodedCommand']
+            and decoded == "$ProgressPreference='SilentlyContinue'; " + short_program))
+        transport_checks.append(dict(label='short source command avoids retained staging', passed=not (directory / 'program').exists()))
+        executed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=generator_env) if command else None
+        transport_checks.append(dict(label='short encoded source command executes in genuine PowerShell',
+            passed=executed is not None and executed.returncode == 0 and executed.stdout.strip() == b'source-command-short'))
+    else:
+        transport_checks.append(dict(label=name + ' retains exact host/root/program at the transport boundary',
+            passed=(directory / 'arguments').read_text() == 'source-fixture\nC:/owned/source\n'
+            and (directory / 'program').read_text() == long_program))
+        transport_checks.append(dict(label=name + ' preserves staging result',
+            passed=(result.returncode == 73 and result.stdout == b'') if mode == 'failure'
+            else result.returncode == 0 and result.stdout == b'retained-source-command'))
+direct = subprocess.run(['bash', '-c', generator, 'fixture', str(runner),
+                         '_act_windows_encoded_powershell', long_program, 'pwsh'],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=generator_env)
+transport_checks.append(dict(label='actual complete verifier exceeds the encoder limit and requires staging',
+                             passed=direct.returncode != 0 and direct.stdout == b''))
+(work / 'transport-checks.json').write_text(json.dumps(transport_checks), encoding='utf-8')
+
+# Exercise both actual storage-admission programs against the same real plan
+# and retained inputs. A temporary FileSystem PSDrive maps the drive spelling;
+# only CIM's free-space observation is controlled to straddle the boundary.
+drive_probe = subprocess.run(['pwsh','-NoLogo','-NoProfile','-NonInteractive','-Command',
+    "@('Q','P','O','N','M','L','K') | Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) } | Select-Object -First 1"],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=generator_env, check=True)
+drive = drive_probe.stdout.decode().strip()
+assert drive in 'QPONMLK' and len(drive) == 1
+storage = dict(drive='Z', export='/fixture', server='fixture.invalid', source_budget_bytes=2147483648,
+               source_drive=drive, source_reserve_bytes=8589934592, target_min_free_bytes=21474836480)
+hosts = work / 'storage-hosts.json'
+hosts.write_text(json.dumps({'hosts': {'source-fixture': {'windows_storage': storage}}}), encoding='utf-8')
+budget_env = dict(generator_env, DSR_HOSTS_FILE=str(hosts))
+for phase in ('archive', 'expansion'):
+    result = subprocess.run(['bash','-c',generator,'fixture',str(runner),
+        '_act_windows_source_budget_script','source-fixture',drive + ':/owned',
+        str(Path(expansion['archive']).stat().st_size),str(expansion['object_count']),phase],
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=budget_env,check=True)
+    assert result.stdout
+    (work / ('budget-' + phase + '.ps1')).write_bytes(result.stdout)
+(work / 'budget.json').write_text(json.dumps(dict(drive=drive, reserve=storage['source_reserve_bytes'])), encoding='utf-8')
+print('Genuine Git source cases:', len(cases))
+PY
+    cat > "$work/check.ps1" <<'POWERSHELL'
+param([string]$FixtureRoot, [string]$BackendPath)
+Set-StrictMode -Version Latest
+$ErrorActionPreference='Stop'
+. $BackendPath
+$checks=0; $failures=0
+function Check {
+    param([string]$Label, [bool]$Condition)
+    $script:checks++
+    if ($Condition) { Write-Output ('PASS ' + $Label) }
+    else { $script:failures++; [Console]::Error.WriteLine('FAIL ' + $Label) }
+}
+function Refused {
+    param([string]$Label, [scriptblock]$Action, [string]$Pattern='')
+    $failure=$null
+    try { $null=& $Action } catch { $failure=$_ }
+    Check $Label ($null -ne $failure -and (-not $Pattern -or $failure.Exception.Message -match $Pattern))
+    if ($null -ne $failure) { Write-Output ('  refusal: ' + $failure.Exception.Message) }
+}
+function Plan {
+    param($Case)
+    Get-DsrWindowsSourcePlan -ArchivePath $Case.archive -ManifestPath $Case.manifest `
+        -ExpectedManifestSha256 $Case.manifest_sha256 -ExpectedObjectCount $Case.object_count `
+        -ExpectedArchiveSha256 $Case.archive_sha256
+}
+function Hash {
+    param([string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+function Empty-Root {
+    param([string]$Name)
+    $path=Join-Path $FixtureRoot ('output-' + $Name)
+    $null=[IO.Directory]::CreateDirectory($path)
+    return $path
+}
+Assert-DsrWindowsSourceRuntime
+Write-Output ('Runtime: PowerShell ' + $PSVersionTable.PSVersion + '; platform ' + [Environment]::OSVersion.Platform)
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    Write-Output 'Unix execution: genuine PowerShell/IO/Git archives; native Windows and NTFS are not qualified.'
+}
+$cases=Get-Content -LiteralPath (Join-Path $FixtureRoot 'cases.json') -Raw | ConvertFrom-Json
+foreach ($case in $cases) {
+    if (-not $case.accepted) { Refused $case.name { Plan $case }; continue }
+    try {
+        $plan=Plan $case
+        Check ($case.name + ' controller archive digest') ($plan.ArchiveSha256 -ceq $case.archive_sha256)
+        Check ($case.name + ' controller manifest digest') ($plan.ManifestSha256 -ceq $case.manifest_sha256)
+        Check ($case.name + ' exact physical object count') ($plan.ObjectCount -eq $case.object_count)
+        Check ($case.name + ' expanded byte accounting') ($plan.ExpandedBytes -eq $case.expanded_bytes)
+        Check ($case.name + ' materialized byte accounting') ($plan.MaterializedBytes -eq $case.materialized_bytes)
+        Check ($case.name + ' link count') ($plan.SymlinkCount -eq @($case.links.PSObject.Properties).Count)
+        $destination=Empty-Root $case.name
+        $null=Expand-DsrWindowsSourceSnapshot -Plan $plan -DestinationPath $destination
+        $items=@(Get-ChildItem -LiteralPath $destination -Force -Recurse)
+        Check ($case.name + ' materializes exact inventory') ($items.Count -eq $case.object_count)
+        Check ($case.name + ' creates no reparse nodes') (@($items | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 }).Count -eq 0)
+        foreach ($directory in $case.directories) {
+            Check ($case.name + ' directory ' + $directory) (Test-Path -LiteralPath (Join-Path $destination $directory) -PathType Container)
+        }
+        foreach ($property in $case.files.PSObject.Properties) {
+            $path=Join-Path $destination $property.Name
+            Check ($case.name + ' bytes ' + $property.Name) ((Test-Path -LiteralPath $path -PathType Leaf) -and (Hash $path) -ceq $property.Value.sha256)
+            if ($null -ne $property.Value.PSObject.Properties['referent']) {
+                $row=$plan.Rows[$property.Name]
+                Check ($case.name + ' referent identity ' + $property.Name) `
+                    ($row.ReferentPath -ceq $property.Value.referent -and $row.ReferentOid -ceq $property.Value.oid)
+            }
+        }
+        $null=Test-DsrWindowsSourceSnapshot -Plan (Plan $case) -DestinationPath $destination
+        Check ($case.name + ' fresh final verification') $true
+    } catch {
+        Check ($case.name + ' completes materialization') $false
+        [Console]::Error.WriteLine($_.Exception.ToString())
+    }
+}
+$safe=@($cases | Where-Object name -eq safe)[0]
+foreach ($mutation in @('archive','manifest')) {
+    $copy=$safe.PSObject.Copy()
+    $copy.archive=Join-Path $FixtureRoot ('changed-' + $mutation + '.tar')
+    $copy.manifest=Join-Path $FixtureRoot ('changed-' + $mutation + '.manifest')
+    [IO.File]::Copy($safe.archive,$copy.archive)
+    [IO.File]::Copy($safe.manifest,$copy.manifest)
+    $plan=Plan $copy
+    if ($mutation -eq 'archive') {
+        $bytes=[IO.File]::ReadAllBytes($copy.archive); $bytes[0]=$bytes[0] -bxor 1
+        [IO.File]::WriteAllBytes($copy.archive,$bytes)
+    } else { [IO.File]::AppendAllText($copy.manifest,' ') }
+    $destination=Empty-Root ('after-plan-' + $mutation)
+    Refused ($mutation + ' change after planning is refused') { Expand-DsrWindowsSourceSnapshot -Plan $plan -DestinationPath $destination }
+    Check ($mutation + ' change creates no payload') (@(Get-ChildItem -LiteralPath $destination -Force).Count -eq 0)
+}
+foreach ($mutation in @('link-copy','referent','extra-file')) {
+    $plan=Plan $safe
+    $destination=Empty-Root ('after-copy-' + $mutation)
+    $null=Expand-DsrWindowsSourceSnapshot -Plan $plan -DestinationPath $destination
+    $path=switch ($mutation) {
+        'link-copy' { 'file-link' }
+        'referent' { 'source/input.txt' }
+        'extra-file' { 'unexpected.txt' }
+    }
+    [IO.File]::WriteAllText((Join-Path $destination $path),'changed after admission')
+    Refused ($mutation + ' alteration fails fresh final verification') { Test-DsrWindowsSourceSnapshot -Plan (Plan $safe) -DestinationPath $destination }
+}
+$destination=Empty-Root 'nonempty'
+$sentinel=Join-Path $destination 'sentinel.txt'
+[IO.File]::WriteAllText($sentinel,'preserve prior bytes')
+Refused 'nonempty destination is refused' { Expand-DsrWindowsSourceSnapshot -Plan (Plan $safe) -DestinationPath $destination }
+Check 'nonempty destination remains unchanged' ([IO.File]::ReadAllText($sentinel) -ceq 'preserve prior bytes' -and @(Get-ChildItem -LiteralPath $destination -Force).Count -eq 1)
+$expansion=@($cases | Where-Object name -eq expansion)[0]
+Check 'materialization exceeds the previous two-archive-size assumption' ((Plan $expansion).ExpandedBytes -gt (2 * (Get-Item -LiteralPath $expansion.archive).Length))
+foreach ($control in (Get-Content -LiteralPath (Join-Path $FixtureRoot 'transport-checks.json') -Raw | ConvertFrom-Json)) {
+    Check $control.label $control.passed
+}
+$budget=Get-Content -LiteralPath (Join-Path $FixtureRoot 'budget.json') -Raw | ConvertFrom-Json
+$volume=Join-Path $FixtureRoot 'budget-volume'
+$owned=Join-Path $volume 'owned'
+$null=[IO.Directory]::CreateDirectory($owned)
+[IO.File]::Copy($expansion.archive,(Join-Path $owned 'source.tar'))
+[IO.File]::Copy($expansion.manifest,(Join-Path $owned 'source.manifest'))
+$null=New-PSDrive -Name $budget.drive -PSProvider FileSystem -Root $volume
+$dsrSourcePlan=Plan $expansion
+$overhead=([long]$expansion.object_count * 4096) + 16777216
+$env:DSR_SOURCE_FIXTURE_FREE=[string]([long]$budget.reserve + (2 * (Get-Item -LiteralPath $expansion.archive).Length) + $overhead)
+function Get-CimInstance {
+    param([string]$ClassName,[string]$Filter)
+    if ($ClassName -cne 'Win32_LogicalDisk' -or $Filter -cne ("DeviceID='" + $budget.drive + ":'")) { throw 'Unexpected storage observation' }
+    return [pscustomobject]@{FreeSpace=[long]$env:DSR_SOURCE_FIXTURE_FREE}
+}
+try {
+    & (Join-Path $FixtureRoot 'budget-archive.ps1')
+    Check 'actual archive-budget phase admits the smaller transfer allocation' $true
+} catch { Check 'actual archive-budget phase admits the smaller transfer allocation' $false; [Console]::Error.WriteLine($_) }
+Refused 'actual expansion budget refuses link copies beyond the same free-space allowance' { & (Join-Path $FixtureRoot 'budget-expansion.ps1') } 'Source archives and sibling allocation exceed split-storage admission'
+$env:DSR_SOURCE_FIXTURE_FREE=[string]([long]$budget.reserve + $dsrSourcePlan.ExpandedBytes + $overhead)
+try {
+    & (Join-Path $FixtureRoot 'budget-expansion.ps1')
+    Check 'actual expansion budget admits sufficient materialized-byte headroom' $true
+} catch { Check 'actual expansion budget admits sufficient materialized-byte headroom' $false; [Console]::Error.WriteLine($_) }
+foreach ($case in @($cases | Where-Object { $_.name -in @('safe','pax-long-path-and-link','regular-only','empty-gitlink','changed-link-target') })) {
+    $extract=Join-Path $FixtureRoot ($case.name + '-extract.ps1')
+    $verify=Join-Path $FixtureRoot ($case.name + '-verify.ps1')
+    $destination=Join-Path $FixtureRoot ('emitted-' + $case.name)
+    if (-not $case.accepted) {
+        Refused 'emitted receiver refuses changed authenticated link target' { & $extract }
+        Check 'emitted receiver refusal creates no payload' (@(Get-ChildItem -LiteralPath $destination -Force).Count -eq 0)
+        continue
+    }
+    try {
+        $result=@(& $extract)
+        Check ($case.name + ' emitted extraction digest') ($result.Count -eq 1 -and $result[0] -ceq $case.archive_sha256)
+        $result=@(& $verify)
+        Check ($case.name + ' emitted final verification digests') `
+            ($result.Count -eq 1 -and $result[0] -ceq ($case.archive_sha256 + ' ' + $case.manifest_sha256))
+        if ($case.name -eq 'safe') {
+            [IO.File]::WriteAllText((Join-Path $destination 'file-link'),'altered copied link')
+            Refused 'emitted final verifier refuses changed materialized source' { & $verify }
+        }
+    } catch {
+        Check ($case.name + ' emitted receiver completes') $false
+        [Console]::Error.WriteLine($_.Exception.ToString())
+    }
+}
+Write-Output ('Windows source links: ' + ($checks - $failures) + ' passed, ' + $failures + ' failed')
+if ($failures -ne 0) { exit 1 }
+POWERSHELL
+    POWERSHELL_TELEMETRY_OPTOUT=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 POWERSHELL_UPDATECHECK=Off \
+        pwsh -NoLogo -NoProfile -NonInteractive -File "$work/check.ps1" \
+        -FixtureRoot "$work" -BackendPath "$backend"
+)
 
 test_git_source_selection() (
     local dependency work source_root destination mode output status
@@ -162,11 +592,18 @@ IGNORE
     [[ "$selection_failures" -eq 0 ]]
 )
 
+if [[ "${1:-}" == --windows-source-links-only ]]; then
+    test_windows_source_links
+    exit $?
+fi
 if [[ "${1:-}" == --git-selection-only ]]; then
     test_git_source_selection
     exit $?
 fi
 if [[ $# -eq 0 ]]; then
+    windows_links_status=0
+    test_windows_source_links || windows_links_status=$?
+    [[ "$windows_links_status" == 0 || "$windows_links_status" == 77 ]] || exit "$windows_links_status"
     git_selection_status=0
     test_git_source_selection || git_selection_status=$?
     [[ "$git_selection_status" == 0 || "$git_selection_status" == 77 ]] || exit "$git_selection_status"

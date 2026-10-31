@@ -5252,6 +5252,24 @@ _act_windows_cargo_sources_runtime() {
     cat "$module"
 }
 
+_act_windows_source_runtime_script() {
+    local module
+    module="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/source_snapshot_windows.ps1"
+    [[ -f "$module" && ! -L "$module" ]] || return 3
+    cat "$module"
+}
+
+# Source verification has the same command-line limit as native compilation.
+# Keep larger programs as the existing hash-bound, held Windows script files.
+_act_windows_source_command() {
+    local host="$1" source_root="$2" script="$3" command
+    if command=$(_act_windows_encoded_powershell "$script" pwsh 2>/dev/null); then
+        printf '%s' "$command"
+    else
+        _act_windows_stage_build_script "$host" "$source_root" "$script"
+    fi
+}
+
 # Windows attestation is produced by the selected native process context. Keep
 # it separate from the digest-only context receipt and cache inventories, and
 # require all three executables before any compiler command is admitted.
@@ -5680,20 +5698,26 @@ _act_windows_reparse_guard_script() {
 }
 
 _act_windows_source_budget_script() {
-    local host="$1" parent="$2" archive_bytes="$3" object_count="$4" storage status=0 budget reserve drive
+    local host="$1" parent="$2" archive_bytes="$3" object_count="$4" phase="${5:-archive}"
+    local storage status=0 budget reserve drive incoming
     storage=$(_act_windows_storage_config "$host") || status=$?
     [[ $status -ne 1 ]] || return 0
     [[ $status -eq 0 && "$parent" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$parent" != *..* &&
-       "$archive_bytes" =~ ^[0-9]{1,12}$ && "$object_count" =~ ^[0-9]{1,9}$ ]] || return 4
+       "$archive_bytes" =~ ^[0-9]{1,12}$ && "$object_count" =~ ^[0-9]{1,9}$ &&
+       ( "$phase" == archive || "$phase" == expansion ) ]] || return 4
     budget=$(jq -r '.source_budget_bytes' <<< "$storage")
     reserve=$(jq -r '.source_reserve_bytes' <<< "$storage")
     drive=$(jq -r '.source_drive' <<< "$storage")
     [[ "${parent:0:1}" == "$drive" ]] || return 4
-    # Archives are uncompressed git tar files. Two archive lengths bound the
-    # retained archive plus expanded bytes; per-object allocation overhead is
-    # additionally charged. Each sibling is admitted against this same parent.
+    # Admit archive transfer first. Once both retained inputs are authenticated,
+    # charge the actual planned files, including every materialized link copy.
+    # At that point the archive/manifest are already included in dsrExisting.
+    incoming="([long]$archive_bytes * 2)"
+    if [[ "$phase" == expansion ]]; then
+        incoming='[long]$dsrSourcePlan.ExpandedBytes'
+    fi
     cat <<EOF
-\$dsrIncoming=([long]$archive_bytes * 2)+([long]$object_count * 4096)+16777216;
+\$dsrIncoming=$incoming+([long]$object_count * 4096)+16777216;
 \$dsrExisting=[long]0;
 if (Test-Path -LiteralPath '$parent') {
     foreach (\$entry in Get-ChildItem -LiteralPath '$parent' -Force -Recurse -ErrorAction Stop) {
@@ -5795,28 +5819,31 @@ _act_sync_strict_checkout() {
             return 4
         fi
     elif _act_is_windows_host "$host"; then
-        local win_remote_path win_snapshot_parent win_remote_archive reparse_guard
+        local win_remote_path win_snapshot_parent win_remote_archive win_remote_manifest reparse_guard
         win_remote_path=$(_act_windows_cmd_path "$remote_path")
         win_snapshot_parent=$(_act_windows_cmd_path "$snapshot_parent")
         win_remote_archive=$(_act_windows_cmd_path "$remote_archive")
+        win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
         reparse_guard=$(_act_windows_reparse_guard_script)
-        local win_snapshot_grandparent parent_setup setup_command verify_command
+        local win_snapshot_grandparent parent_setup setup_command verify_command verify_script
         win_snapshot_grandparent=$(_act_windows_cmd_path "$snapshot_grandparent")
         if $creates_snapshot_parent; then
             parent_setup="if (Test-Path -LiteralPath '${win_snapshot_parent}') { exit 16 }; New-Item -ItemType Directory -Force -Path '${win_snapshot_grandparent}' | Out-Null; Assert-PlainDirectory '${win_snapshot_grandparent}'; New-Item -ItemType Directory -Path '${win_snapshot_parent}' | Out-Null; Assert-PlainDirectory '${win_snapshot_parent}'"
         else
             parent_setup="Assert-PlainDirectory '${win_snapshot_parent}'"
         fi
-        setup_command="$(_act_windows_encoded_powershell "${reparse_guard} ${parent_setup}; if ((Test-Path -LiteralPath '${win_remote_path}') -or (Test-Path -LiteralPath '${win_remote_archive}')) { exit 17 }; New-Item -ItemType Directory -Path '${win_remote_path}' | Out-Null; Assert-PlainDirectory '${win_remote_path}'")"
+        setup_command=$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; if (\$PSVersionTable.PSVersion -lt [version]'7.4') { throw 'Strict Windows source snapshots require PowerShell 7.4 or newer' }; Add-Type -AssemblyName System.Formats.Tar; ${reparse_guard} ${parent_setup}; if ((Test-Path -LiteralPath '${win_remote_path}') -or (Test-Path -LiteralPath '${win_remote_archive}') -or (Test-Path -LiteralPath '${win_remote_manifest}')) { exit 17 }; New-Item -ItemType Directory -Path '${win_remote_path}' | Out-Null; Assert-PlainDirectory '${win_remote_path}'" pwsh) || return 4
         local source_budget_script source_archive_bytes setup_script
         source_archive_bytes=$(_act_file_size "$archive_path") || return 4
         source_budget_script=$(_act_windows_source_budget_script "$host" "$snapshot_parent" "$source_archive_bytes" "$expected_object_count") || return 4
         if [[ -n "$source_budget_script" ]]; then
             setup_script=$(_act_windows_command_script "$setup_command") || return 4
-            setup_command=$(_act_windows_encoded_powershell "$source_budget_script"$'\n'"$setup_script") || return 4
+            setup_command=$(_act_windows_encoded_powershell "$source_budget_script"$'\n'"$setup_script" pwsh) || return 4
             setup_command=$(_act_windows_storage_command "$host" "$setup_command") || return 4
         fi
-        verify_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; & (Join-Path \$env:SystemRoot 'System32\\tar.exe') -xf '${win_remote_archive}' -C '${win_remote_path}'; if (\$LASTEXITCODE -ne 0) { exit 18 }; \$items=@(Get-ChildItem -LiteralPath '${win_remote_path}' -Force -Recurse -ErrorAction Stop); if (\$items.Count -ne ${expected_object_count}) { exit 19 }; foreach (\$item in \$items) { Assert-NoReparseChain \$item }; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_archive}').Hash.ToLowerInvariant()")"
+        verify_script=$(_act_windows_strict_snapshot_extract_script "$host" \
+            "$win_remote_path" "$win_remote_archive" "$win_remote_manifest" \
+            "$local_digest" "$local_manifest_digest" "$expected_object_count") || return 4
         # stdin is closed on every transfer command: callers run this inside a
         # `while read` loop over dependency checkouts, and an ssh that inherits
         # the loop's stdin swallows the remaining entries, so only the first
@@ -5828,7 +5855,18 @@ _act_sync_strict_checkout() {
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$archive_path" \
             "${ssh_destination}:${remote_archive}" </dev/null || \
-           ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
+           ! _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
+            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new "$manifest_path" \
+            "${ssh_destination}:${remote_manifest}" </dev/null; then
+            _log_error "Strict fresh Windows source transfer failed for $label"
+            return 4
+        fi
+        # Authenticate both original inputs before creating any source files.
+        # A Git symlink is materialized only after its link text and tracked
+        # regular referent have both matched the controller's source manifest.
+        verify_command=$(_act_windows_source_command "$host" "$remote_path" "$verify_script") || return 4
+        if ! remote_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" "$verify_command"); then
             _log_error "Strict fresh Windows source sync failed for $label"
@@ -5864,20 +5902,12 @@ _act_sync_strict_checkout() {
             return 4
         fi
     elif _act_is_windows_host "$host"; then
-        local win_remote_manifest manifest_preflight_command manifest_verify_command reparse_guard
+        local manifest_verify_command reparse_guard
         win_remote_manifest=$(_act_windows_cmd_path "$remote_manifest")
         reparse_guard=$(_act_windows_reparse_guard_script)
-        manifest_preflight_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; if (Test-Path -LiteralPath '${win_remote_manifest}') { exit 20 }")"
-        manifest_verify_command="$(_act_windows_encoded_powershell "${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant()")"
-        # stdin closed for the same reason as the archive transfer above.
-        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
-            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$ssh_destination" \
-            "$manifest_preflight_command" || return 4
-        _act_run_with_timeout "$_ACT_SYNC_TIMEOUT" scp \
-            -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
-            -o StrictHostKeyChecking=accept-new "$manifest_path" \
-            "${ssh_destination}:${remote_manifest}" </dev/null || return 4
+        # The manifest was transferred and authenticated before extraction;
+        # re-observe its held identity instead of uploading it a second time.
+        manifest_verify_command=$(_act_windows_encoded_powershell "\$ErrorActionPreference='Stop'; ${reparse_guard} Assert-PlainDirectory '${win_snapshot_parent}'; Assert-PlainDirectory '${win_remote_path}'; Assert-PlainFile '${win_remote_archive}'; Assert-PlainFile '${win_remote_manifest}'; (Get-FileHash -Algorithm SHA256 -LiteralPath '${win_remote_manifest}').Hash.ToLowerInvariant()" pwsh) || return 4
         remote_manifest_digest=$(_act_run_with_timeout "$_ACT_SYNC_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new "$ssh_destination" \
@@ -5904,7 +5934,7 @@ _act_sync_strict_checkout() {
         local admitted_digests
         if ! admitted_digests=$(_act_run_strict_snapshot_verifier "$host" "$ssh_destination" \
                 "$remote_path" "$remote_archive" "$remote_manifest" \
-                "$local_manifest_digest" "$expected_object_count" </dev/null) || \
+                "$local_manifest_digest" "$expected_object_count" "$local_digest" </dev/null) || \
            [[ "$admitted_digests" != "$local_digest $local_manifest_digest" ]]; then
             _log_error "Extracted strict source snapshot failed admission on $host for $label; no target was built"
             return 4
@@ -6054,58 +6084,48 @@ printf '%s %s\\n' "\$archive_digest" "\$manifest_digest"
 EOF
 }
 
-_act_windows_strict_snapshot_verify_script() {
-    local remote_path="$1" snapshot_parent="$2" remote_archive="$3" remote_manifest="$4"
-    local expected_manifest_digest="$5" expected_object_count="$6" reparse_guard
+_act_windows_strict_snapshot_extract_script() {
+    local host="$1" remote_path="$2" remote_archive="$3" remote_manifest="$4"
+    local expected_archive_digest="$5" expected_manifest_digest="$6" expected_object_count="$7"
+    local runtime budget_script snapshot_parent reparse_guard
+    remote_path="${remote_path//\\//}"
+    snapshot_parent="${remote_path%/*}"
+    runtime=$(_act_windows_source_runtime_script) || return 4
     reparse_guard=$(_act_windows_reparse_guard_script) || return 4
-    cat << EOF
+    budget_script=$(_act_windows_source_budget_script \
+        "$host" "$snapshot_parent" 0 "$expected_object_count" expansion) || return 4
+    cat <<EOF
 \$ErrorActionPreference='Stop'
+$runtime
 $reparse_guard
 Assert-PlainDirectory '$snapshot_parent'
 Assert-PlainDirectory '$remote_path'
-Assert-PlainFile '$remote_archive'
-Assert-PlainFile '$remote_manifest'
-\$manifestHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '$remote_manifest').Hash.ToLowerInvariant()
-if (\$manifestHash -ne '$expected_manifest_digest') { exit 19 }
-\$paths=[Collections.Generic.List[string]]::new()
-\$expected=[Collections.Generic.List[string]]::new()
-\$gitlinks=[Collections.Generic.List[string]]::new()
-foreach (\$line in Get-Content -LiteralPath '$remote_manifest') {
-    \$parts=\$line.Split([char]9,3)
-    if ((\$parts.Count -ne 3) -or (\$parts[0] -notmatch '^[0-9a-f]{40}$') -or
-        ((\$parts[1] -ne '100644') -and (\$parts[1] -ne '100755') -and (\$parts[1] -ne '160000')) -or
-        (\$parts[2] -notmatch '^[A-Za-z0-9_./+@~#,=()\[\] -]+$') -or
-        \$parts[2].Contains('..') -or \$parts[2].StartsWith('/')) { exit 21 }
-    \$node=Join-Path '$remote_path' \$parts[2]
-    if (\$parts[1] -eq '160000') {
-        Assert-PlainDirectory \$node
-        if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { exit 21 }
-        \$gitlinks.Add(\$node)
-    } else {
-        Assert-PlainFile \$node
-        \$paths.Add(\$parts[2])
-        \$expected.Add(\$parts[0])
-    }
+\$dsrSourcePlan=Get-DsrWindowsSourcePlan -ArchivePath '$remote_archive' -ManifestPath '$remote_manifest' -ExpectedArchiveSha256 '$expected_archive_digest' -ExpectedManifestSha256 '$expected_manifest_digest' -ExpectedObjectCount $expected_object_count
+$budget_script
+\$null=Expand-DsrWindowsSourceSnapshot -Plan \$dsrSourcePlan -DestinationPath '$remote_path'
+Write-Output \$dsrSourcePlan.ArchiveSha256
+EOF
 }
-# Validated paths are ASCII with no quoting or newline characters. One native
-# Git process hashes the ordered inventory without applying ambient filters.
-if (\$paths.Count -gt 0) {
-    \$hashes=@(\$paths | & git -C '$remote_path' hash-object --no-filters --stdin-paths)
-    if ((\$LASTEXITCODE -ne 0) -or (\$hashes.Count -ne \$expected.Count)) { exit 21 }
-    for (\$i=0; \$i -lt \$expected.Count; \$i++) {
-        if (\$hashes[\$i] -cne \$expected[\$i]) { exit 21 }
-        Assert-PlainFile (Join-Path '$remote_path' \$paths[\$i])
-    }
-}
-foreach (\$node in \$gitlinks) {
-    Assert-PlainDirectory \$node
-    if (@(Get-ChildItem -LiteralPath \$node -Force -ErrorAction Stop).Count -ne 0) { exit 21 }
-}
-\$items=@(Get-ChildItem -LiteralPath '$remote_path' -Force -Recurse -ErrorAction Stop)
-if (\$items.Count -ne $expected_object_count) { exit 20 }
-foreach (\$item in \$items) { Assert-NoReparseChain \$item }
-\$archiveHash=(Get-FileHash -Algorithm SHA256 -LiteralPath '$remote_archive').Hash.ToLowerInvariant()
-Write-Output (\$archiveHash + ' ' + \$manifestHash)
+
+_act_windows_strict_snapshot_verify_script() {
+    local remote_path="$1" snapshot_parent="$2" remote_archive="$3" remote_manifest="$4"
+    local expected_manifest_digest="$5" expected_object_count="$6" expected_archive_digest="${7:-}"
+    local runtime reparse_guard archive_argument=""
+    runtime=$(_act_windows_source_runtime_script) || return 4
+    reparse_guard=$(_act_windows_reparse_guard_script) || return 4
+    if [[ -n "$expected_archive_digest" ]]; then
+        [[ "$expected_archive_digest" =~ ^[0-9a-f]{64}$ ]] || return 4
+        archive_argument=" -ExpectedArchiveSha256 '$expected_archive_digest'"
+    fi
+    cat <<EOF
+\$ErrorActionPreference='Stop'
+$runtime
+$reparse_guard
+Assert-PlainDirectory '$snapshot_parent'
+Assert-PlainDirectory '$remote_path'
+\$dsrSourcePlan=Get-DsrWindowsSourcePlan -ArchivePath '$remote_archive' -ManifestPath '$remote_manifest' -ExpectedManifestSha256 '$expected_manifest_digest' -ExpectedObjectCount $expected_object_count$archive_argument
+\$null=Test-DsrWindowsSourceSnapshot -Plan \$dsrSourcePlan -DestinationPath '$remote_path'
+Write-Output (\$dsrSourcePlan.ArchiveSha256 + ' ' + \$dsrSourcePlan.ManifestSha256)
 EOF
 }
 
@@ -6159,7 +6179,7 @@ _act_verify_strict_checkout_snapshot() {
         local verify_output
         verify_output=$(_act_run_strict_snapshot_verifier "$host" "$ssh_destination" \
             "$remote_path" "$remote_archive" "$remote_manifest" \
-            "$expected_manifest_digest" "$expected_object_count") || return 4
+            "$expected_manifest_digest" "$expected_object_count" "$expected_digest") || return 4
         read -r actual_digest actual_manifest_digest <<< "$verify_output"
     fi
 
@@ -6175,7 +6195,7 @@ _act_verify_strict_checkout_snapshot() {
 # verifier's own refusal diagnostics are passed through on stderr.
 _act_run_strict_snapshot_verifier() {
     local host="$1" ssh_destination="$2" remote_path="$3" remote_archive="$4"
-    local remote_manifest="$5" expected_manifest_digest="$6" expected_object_count="$7"
+    local remote_manifest="$5" expected_manifest_digest="$6" expected_object_count="$7" expected_archive_digest="${8:-}"
     local remote_cmd verify_output digests
 
     if _act_is_windows_host "$host"; then
@@ -6185,11 +6205,10 @@ _act_run_strict_snapshot_verifier() {
             "$(_act_windows_cmd_path "${remote_path%/*}")" \
             "$(_act_windows_cmd_path "$remote_archive")" \
             "$(_act_windows_cmd_path "$remote_manifest")" \
-            "$expected_manifest_digest" "$expected_object_count") || return 4
-        # PowerShell 7 is required here: Windows PowerShell 5 cannot inspect
-        # valid tracked paths longer than MAX_PATH, even after native tar has
-        # extracted them successfully. Missing pwsh must fail verification.
-        remote_cmd=$(_act_windows_encoded_powershell "$verify_script" pwsh) || return 4
+            "$expected_manifest_digest" "$expected_object_count" "$expected_archive_digest") || return 4
+        # Reconstruct materialization from original authenticated Git evidence
+        # on every boundary; a saved extraction inventory cannot bless itself.
+        remote_cmd=$(_act_windows_source_command "$host" "$remote_path" "$verify_script") || return 4
     else
         remote_cmd=$(_act_unix_strict_snapshot_verify_script "$remote_path" "$remote_archive" \
             "$remote_manifest" "$expected_manifest_digest" "$expected_object_count") || return 4

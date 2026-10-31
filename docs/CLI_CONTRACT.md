@@ -898,6 +898,25 @@ Cargo-generated version 3/4 lockfiles. Unused patch records are parsed but never
 contribute resolved-package authority. No Python installation is needed on the
 Windows build host.
 
+Strict native Windows project snapshots also support tracked file symlinks
+such as `CLAUDE.md -> AGENTS.md`. A relative link must resolve, with exact
+case, to a regular file present in the same tracked manifest. The extractor
+authenticates both the original Git link blob and its referent, then creates a
+regular file copy. It never creates an NTFS reparse point or requires symbolic
+link privileges. The original archive and three-column Git manifest remain
+the source authority; the derived materialization plan records the link path,
+link blob, target text, referent path/blob and copied byte count.
+
+Absolute links, links escaping the source root, directory links, link chains,
+cycles, missing referents and ambiguous Windows names are refused with the
+offending path. Every extraction and independent source verification uses the
+same PowerShell 7.4+ archive reader and checks all file contents and the exact
+directory inventory. Configured split-storage admission charges the full
+expanded size, including each link copy, before writing source payloads.
+Changing either the original evidence or a materialized copy refuses the
+build or artifact collection. This project-source support does not relax the
+separate Cargo dependency-cache reparse policy.
+
 The coordinator retains metadata and source-evidence SHA-256 hashes under
 `cargo_isolation.dependency_sources`, together with the lockfile hash and counts
 of archive, Git, and workspace-snapshot authenticated packages. Full inventories
