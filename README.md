@@ -912,6 +912,14 @@ including binaries in other workspace packages, and rejects ambiguous Cargo
 output providers. Source installation still requires `--from-source` or
 `--allow-source-build`; Go and Bun source builds support a single executable.
 
+Private GitHub source builds use the same account as release downloads and
+freshness checks: `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then the
+stored GitHub.com login. Authenticated source fetches require Git 2.31 or newer
+and keep tokens out of URLs, command arguments and saved Git configuration.
+They do not switch to another credential helper or `.netrc` account when the
+selected token fails. With no selected GitHub credential, ordinary anonymous
+Git access and custom credential helpers remain available.
+
 Add `--install-toolchain` to either source option when the required Rust, Go,
 or Bun compiler is missing. The installer verifies the upstream distribution
 and prepares a private toolchain for that source build without changing shell

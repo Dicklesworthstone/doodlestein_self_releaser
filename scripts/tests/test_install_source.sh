@@ -1,11 +1,342 @@
 #!/usr/bin/env bash
-# Real Git + Go source-build regressions; no network or DSR config required.
+# Real Git HTTPS credentials plus Git/Go source-build regressions. HTTPS uses
+# a private loopback CONNECT service and fixture CA, never a public endpoint.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-source "$ROOT/src/install_source.sh"
+SOURCE_MODULE="${DSR_TEST_INSTALL_SOURCE_MODULE:-$ROOT/src/install_source.sh}"
+case "$#:${1:-}" in
+    0:|1:--credentials-only) ;;
+    *) printf 'Usage: %s [--credentials-only]\n' "$0" >&2; exit 4 ;;
+esac
+
+test_source_credentials() {
+    local dependency
+    for dependency in python3 openssl git jq; do
+        command -v "$dependency" >/dev/null 2>&1 || { printf 'SKIP: Git HTTPS credentials require %s\n' "$dependency"; return 3; }
+    done
+    python3 -I - "$SOURCE_MODULE" <<'PY'
+import base64
+from http.server import BaseHTTPRequestHandler
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import socketserver
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+from urllib.parse import urlsplit
+
+module = Path(sys.argv[1]).resolve()
+work = Path(tempfile.mkdtemp(prefix='dsr-source-git-credentials-')).resolve()
+print('Git HTTPS source fixtures retained at: ' + str(work), flush=True)
+git = shutil.which('git')
+bash = shutil.which('bash')
+passed = failed = 0
+
+def check(label, condition):
+    global passed, failed
+    if condition:
+        passed += 1
+        print('PASS: ' + label, flush=True)
+    else:
+        failed += 1
+        print('FAIL: ' + label, flush=True)
+
+env = dict(os.environ)
+for name in list(env):
+    if (name.lower().endswith('_proxy') or name.startswith('GIT_') or
+            name in ('DSR_GH_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN', 'GH_HOST',
+                     'DSR_INSTALLER_GIT_TOKEN', 'DSR_INSTALLER_GIT_REPOSITORY')):
+        env.pop(name)
+env.update(HOME=str(work / 'home'), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
+(work / 'home').mkdir()
+upstream = work / 'upstream'
+subprocess.run([git, 'init', '-q', '-b', 'main', str(upstream)], env=env, check=True)
+(upstream / 'src').mkdir()
+(upstream / 'Cargo.toml').write_text('[package]\nname="private_fixture"\nversion="1.0.0"\nedition="2021"\n')
+(upstream / 'Cargo.lock').write_text('version = 4\n\n[[package]]\nname = "private_fixture"\nversion = "1.0.0"\n')
+(upstream / 'src/main.rs').write_text('fn main() { println!("private-source-fixture"); }\n')
+subprocess.run([git, '-C', str(upstream), 'add', '.'], env=env, check=True)
+subprocess.run([git, '-C', str(upstream), '-c', 'user.name=DSR Fixture',
+                '-c', 'user.email=dsr-fixture@example.invalid', 'commit', '-qm', 'private source'], env=env, check=True)
+subprocess.run([git, '-C', str(upstream), '-c', 'user.name=DSR Fixture',
+                '-c', 'user.email=dsr-fixture@example.invalid', 'tag', '-a', 'v1.0.0', '-m', 'source tag'], env=env, check=True)
+pin = subprocess.check_output([git, '-C', str(upstream), 'rev-parse', 'HEAD'], env=env, text=True).strip()
+remotes = work / 'remotes'
+(remotes / 'example').mkdir(parents=True)
+subprocess.run([git, 'clone', '-q', '--bare', str(upstream), str(remotes / 'example/source-fixture.git')], env=env, check=True)
+backend = Path(subprocess.check_output([git, '--exec-path'], env=env, text=True).strip()) / 'git-http-backend'
+if not backend.is_file():
+    raise SystemExit('Real Git HTTP backend is required')
+cert, key = work / 'certificate.pem', work / 'fixture-key.pem'
+with (work / 'openssl.log').open('wb') as log:
+    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+                    '-keyout', str(key), '-out', str(cert), '-subj', '/CN=github.com',
+                    '-addext', 'subjectAltName=DNS:github.com,DNS:other.example.invalid'],
+                   check=True, stdout=log, stderr=log)
+key.chmod(0o600)
+tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+tls.load_cert_chain(cert, key)
+state = {'expected': '', 'mode': 'private', 'requests': [], 'connects': [], 'errors': []}
+
+class Endpoint(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def response(self, status, body=b'', headers=None):
+        self.send_response(status)
+        for name, value in (headers or {}).items():
+            if name.lower() not in ('content-length', 'connection'):
+                self.send_header(name, value)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def route(self):
+        authorization = self.headers.get('Authorization', '')
+        correct = authorization == 'Basic ' + base64.b64encode(('x-access-token:' + state['expected']).encode()).decode()
+        state['requests'].append({'host': self.target_host, 'path': self.path,
+                                  'has_authorization': bool(authorization), 'selected_account': correct})
+        if self.target_host != 'github.com':
+            return self.response(403)
+        if state['mode'] != 'anonymous' and not correct:
+            return self.response(401, headers={'WWW-Authenticate': 'Basic realm="owned Git fixture"'})
+        if state['mode'] == 'redirect':
+            return self.response(302, headers={'Location': 'https://other.example.invalid' + self.path})
+        if state['mode'] == 'redirect-repository':
+            return self.response(302, headers={'Location': 'https://github.com/unrelated/project.git/info/refs?service=git-upload-pack'})
+        url = urlsplit(self.path)
+        if not url.path.startswith('/example/source-fixture.git/'):
+            return self.response(404)
+        incoming = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        backend_env = dict(env, GIT_PROJECT_ROOT=str(remotes), GIT_HTTP_EXPORT_ALL='1',
+                           REQUEST_METHOD=self.command, PATH_INFO=url.path, QUERY_STRING=url.query,
+                           CONTENT_TYPE=self.headers.get('Content-Type', ''), CONTENT_LENGTH=str(len(incoming)),
+                           SERVER_PROTOCOL='HTTP/1.1', REMOTE_USER='fixture',
+                           HTTP_GIT_PROTOCOL=self.headers.get('Git-Protocol', ''))
+        result = subprocess.run([str(backend)], env=backend_env, input=incoming, capture_output=True, timeout=15)
+        if result.returncode:
+            state['errors'].append('git-http-backend failed')
+            return self.response(500)
+        header, body = result.stdout.split(b'\r\n\r\n', 1)
+        fields = dict(line.decode('iso-8859-1').split(': ', 1) for line in header.split(b'\r\n'))
+        status = int(fields.pop('Status', '200 OK').split()[0])
+        return self.response(status, body, fields)
+
+    do_GET = route
+    do_POST = route
+
+class Proxy(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            self.request.settimeout(15)
+            data = b''
+            while not data.endswith(b'\r\n\r\n'):
+                block = self.request.recv(1)
+                if not block or len(data) > 8192:
+                    return
+                data += block
+            fields = data.split(b'\r\n', 1)[0].split()
+            if len(fields) != 3 or fields[0] != b'CONNECT':
+                return
+            host = fields[1].decode()
+            state['connects'].append(host)
+            if host not in ('github.com:443', 'other.example.invalid:443'):
+                self.request.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n')
+                return
+            self.request.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n')
+            with tls.wrap_socket(self.request, server_side=True) as secure:
+                class BoundEndpoint(Endpoint):
+                    target_host = host.rsplit(':', 1)[0]
+                BoundEndpoint(secure, self.client_address, self.server)
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, socket.timeout):
+            pass  # Certificate and redirect refusals can close the client early.
+        except Exception as error:
+            state['errors'].append(type(error).__name__ + ': ' + str(error))
+
+class Server(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+server = Server(('127.0.0.1', 0), Proxy)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+proxy = 'http://127.0.0.1:' + str(server.server_address[1])
+env.update(HTTPS_PROXY=proxy, https_proxy=proxy, HTTP_PROXY=proxy, http_proxy=proxy,
+           ALL_PROXY='', all_proxy='', NO_PROXY='', no_proxy='', GIT_SSL_CAINFO=str(cert))
+bin_dir = work / 'bin'
+git_only = work / 'git-only'
+bin_dir.mkdir(); git_only.mkdir()
+git_wrapper = '''#!/bin/sh
+printf '%s\\n' "$@" >> "$DSR_TEST_GIT_ARGV"
+exec "$DSR_TEST_REAL_GIT" "$@"
+'''
+for directory in (bin_dir, git_only):
+    (directory / 'git').write_text(git_wrapper)
+    (directory / 'git').chmod(0o755)
+    (directory / 'jq').symlink_to(shutil.which('jq'))
+(bin_dir / 'gh').write_text('''#!/bin/sh
+printf '%s %s\\n' "${GH_HOST:-}" "$*" >> "$DSR_TEST_GH_LOG"
+test "$*" = 'auth token --hostname github.com' && test "${GH_HOST:-}" = github.com || exit 1
+test -n "${DSR_TEST_STORED_TOKEN:-}" || exit 1
+printf '%s\\n' "$DSR_TEST_STORED_TOKEN"
+''')
+(bin_dir / 'gh').chmod(0o755)
+ambient_helper = work / 'ambient-credential'
+ambient_helper.write_text('''#!/bin/sh
+test "$1" = get || exit 0
+printf '%s\\n' 'username=x-access-token' 'password=ambient-fixture-secret'
+''')
+ambient_helper.chmod(0o755)
+env.update(PATH=str(bin_dir) + os.pathsep + env['PATH'], DSR_TEST_REAL_GIT=git,
+           GH_HOST='enterprise.example.invalid')
+tokens = ('dsr-fixture-secret', 'ci-fixture-secret', 'cli-fixture-secret', 'stored-fixture-secret', 'ambient-fixture-secret')
+
+def run(label, selected=None, expected='', mode='private', configuration='', no_gh=False, ref='refs/tags/v1.0.0', build=False, tracing=False, netrc=False):
+    case = work / label
+    case.mkdir()
+    state.update(expected=expected, mode=mode, requests=[], connects=[], errors=[])
+    config = case / 'gitconfig'
+    config.write_text(configuration)
+    selected_env = dict(env, GIT_CONFIG_GLOBAL=str(config), DSR_TEST_GIT_ARGV=str(case / 'git-argv'),
+                        DSR_TEST_GH_LOG=str(case / 'gh-lookup'), DSR_GH_TOKEN='', GITHUB_TOKEN='', GH_TOKEN='',
+                        DSR_TEST_STORED_TOKEN='', GIT_TRACE=str(case / 'git-trace'),
+                        GIT_TRACE_CURL=str(case / 'git-curl-trace'), GIT_TRACE_REDACT='0', GIT_CURL_VERBOSE='1',
+                        DSR_INSTALLER_GIT_TOKEN='caller-sentinel', DSR_INSTALLER_GIT_REPOSITORY='caller/repository')
+    selected_env.update(selected or {})
+    if netrc:
+        credential_directory = case / 'credential-home'
+        credential_directory.mkdir()
+        netrc_file = credential_directory / '.netrc'
+        netrc_file.write_text('machine github.com login x-access-token password ambient-fixture-secret\n')
+        netrc_file.chmod(0o600)
+        selected_env['HOME'] = str(credential_directory)
+    if no_gh:
+        selected_env['PATH'] = str(git_only)
+    command = '''source "$1" || exit $?
+if [[ "$4" == build ]]; then
+    install_source_build example/source-fixture "$3" rust private_fixture "$2/build" --allow-build --timeout 60
+else
+    if [[ "$5" == tracing ]]; then set -x; fi
+    _isb_checkout example/source-fixture "$3" "$2/source"
+    checkout_status=$?
+    if [[ "$5" == tracing ]]; then
+        tracing_flags=$-; set +x
+        [[ "$tracing_flags" == *x* && "$DSR_INSTALLER_GIT_TOKEN" == caller-sentinel &&
+           "$DSR_INSTALLER_GIT_REPOSITORY" == caller/repository && "$GIT_CONFIG_GLOBAL" == "$2/gitconfig" &&
+           "$GIT_TRACE_REDACT" == 0 && "$GH_HOST" == enterprise.example.invalid ]] || exit 99
+        printf 'caller-state-preserved\\n'
+    fi
+    exit "$checkout_status"
+fi
+'''
+    result = subprocess.run([bash, '-c', command, '_', str(module), str(case), ref,
+                             'build' if build else 'checkout', 'tracing' if tracing else 'quiet'],
+                            env=selected_env, capture_output=True, timeout=90)
+    (case / 'stdout').write_bytes(result.stdout); (case / 'stderr').write_bytes(result.stderr)
+    (case / 'transport.json').write_text(json.dumps({'requests': state['requests'], 'connects': state['connects'], 'errors': state['errors']}, indent=2))
+    check(label + ': real Git HTTP backend has no fixture error', not state['errors'])
+    return result, case
+
+def pinned(result, case):
+    if result.returncode or not (case / 'source/src/main.rs').is_file():
+        return False
+    current = subprocess.check_output([git, '-C', str(case / 'source'), 'rev-parse', 'HEAD'], env=env, text=True).strip()
+    return current == pin and (case / 'source/src/main.rs').read_bytes() == (upstream / 'src/main.rs').read_bytes()
+
+def no_persisted_token(case):
+    needles = [value.encode() for value in tokens]
+    needles += [base64.b64encode(('x-access-token:' + value).encode()) for value in tokens]
+    paths = [path for name in ('source', 'build') for path in (case / name).rglob('*') if path.is_file()]
+    paths += [case / name for name in ('stdout', 'stderr', 'git-argv', 'git-trace', 'git-curl-trace') if (case / name).is_file()]
+    return not any(needle in path.read_bytes() for path in paths for needle in needles)
+
+try:
+    ambient = '[credential]\n\thelper = ' + json.dumps(str(ambient_helper)) + '\n'
+    poison = '[url "https://other.example.invalid/"]\n\tinsteadOf = https://github.com/\n' + ambient
+    for label, selected, expected in (
+        ('dsr', dict(DSR_GH_TOKEN=tokens[0], GITHUB_TOKEN=tokens[1], GH_TOKEN=tokens[2], DSR_TEST_STORED_TOKEN=tokens[3]), tokens[0]),
+        ('github', dict(GITHUB_TOKEN=tokens[1], GH_TOKEN=tokens[2], DSR_TEST_STORED_TOKEN=tokens[3]), tokens[1]),
+        ('gh', dict(GH_TOKEN=tokens[2], DSR_TEST_STORED_TOKEN=tokens[3]), tokens[2]),
+        ('stored', dict(DSR_TEST_STORED_TOKEN=tokens[3]), tokens[3]),
+    ):
+        result, case = run(label, selected, expected, configuration=poison)
+        check(label + ': selected account fetches and peels the real annotated Git tag', pinned(result, case))
+        check(label + ': credential reaches only the requested GitHub repository', bool(state['requests']) and
+              all(row['host'] == 'github.com' and row['path'].startswith('/example/source-fixture.git/') and
+                  (not row['has_authorization'] or row['selected_account']) for row in state['requests']))
+        check(label + ': no token in checkout, logs, trace or real Git argv', no_persisted_token(case))
+        lookup = (case / 'gh-lookup').read_text() if (case / 'gh-lookup').exists() else ''
+        check(label + ': explicit tokens never probe a stored account',
+              lookup == ('github.com auth token --hostname github.com\n' if label == 'stored' else ''))
+    result, case = run('without-gh', dict(DSR_GH_TOKEN=tokens[0]), tokens[0], no_gh=True, ref=pin)
+    check('explicit token works without gh and preserves the exact commit pin', pinned(result, case))
+    result, case = run('invalid-explicit', dict(DSR_GH_TOKEN='invalid-fixture-token', GH_TOKEN=tokens[4]), tokens[4], configuration=ambient)
+    check('invalid explicit token cannot fall back to ambient helper or GH_TOKEN', result.returncode == 8 and not (case / 'source/src/main.rs').exists())
+    check('invalid explicit token never authenticates through another account', not any(row['selected_account'] for row in state['requests']))
+    result, case = run('netrc-precedence', dict(DSR_GH_TOKEN=tokens[0]), tokens[0], netrc=True)
+    check('selected source credential takes precedence over libcurl netrc credentials', pinned(result, case) and
+          all(not row['has_authorization'] or row['selected_account'] for row in state['requests']))
+    result, case = run('netrc-invalid-explicit', dict(DSR_GH_TOKEN='invalid-fixture-token'), tokens[4], netrc=True)
+    check('invalid explicit token cannot install through a different netrc account', result.returncode == 8 and not (case / 'source/src/main.rs').exists())
+    for label in ('redirect', 'redirect-repository'):
+        result, case = run(label, dict(DSR_GH_TOKEN=tokens[0]), tokens[0], mode=label)
+        check(label + ': authenticated redirect is refused before source checkout', result.returncode == 8 and not (case / 'source/src/main.rs').exists())
+        check(label + ': no other origin or repository receives a request', all(
+            row['host'] == 'github.com' and row['path'].startswith('/example/source-fixture.git/') for row in state['requests']))
+    result, case = run('bad-certificate', dict(DSR_GH_TOKEN=tokens[0], GIT_SSL_CAINFO=str(work / 'missing-ca'), GIT_SSL_NO_VERIFY='1'), tokens[0])
+    check('explicit token never disables HTTPS certificate validation', result.returncode == 8 and not any(row['has_authorization'] for row in state['requests']))
+    result, case = run('malformed-token', dict(DSR_GH_TOKEN='bad\nusername=other'), tokens[0])
+    check('credential protocol injection is refused before any Git network request', result.returncode == 8 and not state['requests'] and not state['connects'])
+    result, case = run('anonymous', mode='anonymous', no_gh=True)
+    check('Git-only anonymous checkout remains available', pinned(result, case))
+    result, case = run('ambient-helper', expected=tokens[4], configuration=ambient, no_gh=True)
+    check('Git-only custom credential helper remains available', pinned(result, case))
+    rewrite = '[url "' + upstream.as_uri() + '"]\n\tinsteadOf = https://github.com/example/source-fixture.git\n'
+    result, case = run('ambient-url-policy', configuration=rewrite, no_gh=True)
+    check('Git-only URL policy still uses the real local Git transport', pinned(result, case) and not state['requests'])
+    result, case = run('caller-state', dict(DSR_GH_TOKEN=tokens[0]), tokens[0], tracing=True)
+    check('authenticated checkout preserves caller environment and tracing state', pinned(result, case) and result.stdout == b'caller-state-preserved\n')
+    check('shell tracing cannot expose the selected source token', no_persisted_token(case))
+    if shutil.which('cargo', path=env['PATH']) and shutil.which('rustc', path=env['PATH']):
+        result, case = run('private-build', dict(DSR_GH_TOKEN=tokens[0]), tokens[0], build=True)
+        check('private pinned source completes a genuine Rust source build', result.returncode == 0)
+        receipt = json.loads(result.stdout) if result.returncode == 0 else {}
+        payload = Path(receipt.get('path', str(case / 'missing')))
+        check('private source receipt binds the fetched commit and locally built executable',
+              receipt.get('source_commit') == pin and receipt.get('method') == 'source' and receipt.get('signed_release') is False and payload.is_file())
+        check('private source executable actually runs', payload.is_file() and
+              subprocess.check_output([str(payload)], env=env).strip() == b'private-source-fixture')
+        check('private build evidence never stores the selected Git token', no_persisted_token(case))
+    else:
+        print('SKIP: genuine private Rust build requires cargo and rustc; Git HTTPS checks ran', flush=True)
+finally:
+    server.shutdown(); server.server_close()
+print('Git HTTPS source credentials: %d passed, %d failed' % (passed, failed), flush=True)
+sys.exit(0 if failed == 0 else 1)
+PY
+}
+
+credential_status=0
+test_source_credentials || credential_status=$?
+[[ "$credential_status" == 0 ]] || exit "$credential_status"
+[[ "${1:-}" != --credentials-only ]] || exit 0
+# shellcheck source=../../src/install_source.sh
+source "$SOURCE_MODULE"
+# These retained local-transport cases deliberately have no GitHub account.
+# The HTTPS fixture above covers every selected-credential route separately.
+export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+gh() { return 1; }
 for tool in git jq go; do command -v "$tool" >/dev/null || { echo "SKIP: $tool required"; exit 0; }; done
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-test.XXXXXXXX") || exit 1
-trap 'rm -rf -- "$TEMP"' EXIT
+trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$TEMP"' EXIT
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TEMP/gitconfig" HOME="$TEMP/home"
 export GOCACHE="${DSR_TEST_GO_CACHE:-/tmp/dsr-test-go-cache}"
 mkdir -p "$HOME" "$TEMP/upstream" "$TEMP/results"
@@ -214,7 +545,7 @@ check 'source drift emits no receipt' test ! -s "$TEMP/mutated.json"
 # TERM must cancel a running command without altering the caller's traps.
 ( _isb_run 30 "$TEMP/term.log" bash -c 'echo "$$"; exec sleep 30' ) > "$TEMP/term.out" 2> "$TEMP/term.err" &
 runner=$!
-for attempt in {1..50}; do [[ ! -f "$TEMP/term.log" ]] || break; sleep 0.02; done
+for _attempt in {1..50}; do [[ ! -f "$TEMP/term.log" ]] || break; sleep 0.02; done
 kill -TERM "$runner"
 status=0
 wait "$runner" || status=$?

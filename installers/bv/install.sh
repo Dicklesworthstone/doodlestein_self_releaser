@@ -1043,6 +1043,9 @@ export -f toolchain_bootstrap
 # Source builds execute repository/dependency build code. They are NOT signed
 # release artifacts. A missing compiler is installed only with separate
 # --install-toolchain consent, inside this source attempt's private directory.
+# GitHub source fetches use the same chosen account as release downloads.
+# Without a selected GitHub credential, ordinary Git authentication and URL
+# policy remain available for anonymous or custom-helper installations.
 #
 # install_source_build owner/repo ref language binary new_directory --allow-build
 #   [--subdir relative/path] [--entry relative/path] [--package cargo_package]
@@ -1196,31 +1199,60 @@ _isb_git() (
     git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false "$@"
 )
 
-_isb_checkout() {
-    local repo="$1" ref="$2" dir="$3"
-    _isb_git init -q "$dir" || return 8
-    _isb_git -C "$dir" remote add origin "https://github.com/$repo.git" || return 8
-    _isb_git -C "$dir" fetch -q --depth=1 --no-tags --recurse-submodules=no origin "$ref" || return 8
+_isb_checkout() (
+    set +x
+    local repo="$1" ref="$2" dir="$3" token='' token_status=0 trace_name authorization
+    local -a git_options=() init_options=()
+    token=$(_installer_github_token) || token_status=$?
+    # With no selected GitHub credential, retain the existing Git-only path:
+    # anonymous HTTPS, user credential helpers and configured URL policy.
+    # A malformed explicit credential must not fall through to that path.
+    ((token_status == 0 || token_status == 3)) || return 8
+    if [[ -n "$token" ]]; then
+        # A header supplied before the first request also prevents libcurl's
+        # ~/.netrc from authenticating as another account before a reactive
+        # Git credential helper runs. jq is already a source-build dependency;
+        # secret input reaches it only on stdin. Git reads the scoped header
+        # from this process's environment, never an argv, URL or stored file.
+        command -v jq >/dev/null 2>&1 || return 3
+        authorization=$(printf 'x-access-token:%s' "$token" | jq -Rrs '@base64') || return 8
+        export DSR_INSTALLER_GIT_AUTHORIZATION="Authorization: Basic $authorization"
+        # A chosen account cannot be redirected by global/system insteadOf
+        # rules, extra Authorization headers or another credential helper.
+        # The fresh repository gets no ambient template/configuration either.
+        export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=https
+        unset GIT_TEMPLATE_DIR GIT_ASKPASS SSH_ASKPASS GIT_CURL_VERBOSE GIT_SSL_NO_VERIFY
+        for trace_name in "${!GIT_TRACE@}"; do unset "$trace_name"; done
+        # --config-env is supported by Git 2.31+. An older Git refuses this
+        # command before network access rather than ignoring the credential
+        # policy as an unknown -c option could.
+        git_options=(-c credential.helper= -c credential.interactive=false -c core.askPass=
+            -c http.extraHeader= "--config-env=http.https://github.com/$repo.git.extraHeader=DSR_INSTALLER_GIT_AUTHORIZATION"
+            -c http.followRedirects=false -c http.sslVerify=true)
+        init_options=(--template=)
+    fi
+    _isb_git ${git_options[@]+"${git_options[@]}"} init -q ${init_options[@]+"${init_options[@]}"} "$dir" || return 8
+    _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" remote add origin "https://github.com/$repo.git" || return 8
+    _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" fetch -q --depth=1 --no-tags --recurse-submodules=no origin "$ref" || return 8
     local commit
-    commit=$(_isb_git -C "$dir" rev-parse --verify 'FETCH_HEAD^{commit}') || return 8
+    commit=$(_isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" rev-parse --verify 'FETCH_HEAD^{commit}') || return 8
     [[ "$commit" =~ ^[0-9a-f]{40}$ || "$commit" =~ ^[0-9a-f]{64}$ ]] || return 8
     if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ || "$ref" =~ ^[0-9a-fA-F]{64}$ ]]; then
         [[ "$commit" == "${ref,,}" ]] || return 8
     fi
-    _isb_git -C "$dir" -c advice.detachedHead=false checkout -q --detach "$commit" || return 8
-}
+    _isb_git ${git_options[@]+"${git_options[@]}"} -C "$dir" -c advice.detachedHead=false checkout -q --detach "$commit" || return 8
+)
 
 _isb_in_dir() ( cd "$1" && shift && "$@" )
 
-# Shared by release acquisition and freshness in generated installers, and
-# usable when this source module is loaded alone. Match DSR's token order;
+# Shared by Git source checkout, release acquisition and freshness in generated
+# installers, and usable when this source module is loaded alone. Match DSR's token order;
 # gh otherwise prefers GH_TOKEN and may inherit an unrelated enterprise host.
 # Resolve only one account. An invalid explicit token must not try a stored
 # login. Keep credentials and tracing changes confined to this child process.
-_installer_run_gh() (
+_installer_github_token() (
     set +x
     local token=''
-    command -v gh >/dev/null 2>&1 || return 3
     if [[ -n "${DSR_GH_TOKEN:-}" ]]; then
         token="$DSR_GH_TOKEN"
     elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -1228,9 +1260,19 @@ _installer_run_gh() (
     elif [[ -n "${GH_TOKEN:-}" ]]; then
         token="$GH_TOKEN"
     else
+        command -v gh >/dev/null 2>&1 || return 3
         token=$(GH_HOST=github.com gh auth token --hostname github.com 2>/dev/null) || return 3
     fi
     [[ -n "$token" ]] || return 3
+    [[ "$token" != *$'\r'* && "$token" != *$'\n'* ]] || return 4
+    printf '%s\n' "$token"
+)
+
+_installer_run_gh() (
+    set +x
+    command -v gh >/dev/null 2>&1 || return 3
+    local token
+    token=$(_installer_github_token) || return $?
     GH_HOST=github.com GH_TOKEN="$token" gh "$@"
 )
 

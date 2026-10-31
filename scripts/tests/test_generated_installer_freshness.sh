@@ -12,6 +12,7 @@ export REAL_GIT REAL_GO
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-installer-freshness.XXXXXXXX") || exit 1
 trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$TEMP"' EXIT
 export HOME="$TEMP/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TEMP/gitconfig"
+export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
 export GOCACHE="${DSR_TEST_GO_CACHE:-$TEMP/gocache}" GOPROXY=off GOSUMDB=off
 mkdir -p "$HOME" "$TEMP/config/repos.d" "$TEMP/bin" "$TEMP/upstream" "$TEMP/release" "$TEMP/results"
 export DSR_CONFIG_DIR="$TEMP/config" DSR_INSTALLER_DIR="$TEMP/installers"
@@ -131,6 +132,7 @@ cat > "$TEMP/bin/gh" <<'BIN'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$TEST_HTTP_LOG"
 if [[ "${1:-} ${2:-}" == 'auth token' ]]; then
+    [[ "${TEST_STORED_GH_ACCOUNT:-0}" == 1 ]] || exit 1
     printf 'installer-freshness-fixture-token\n'
     exit 0
 fi
@@ -200,7 +202,7 @@ for fault in diverged behind wrong-base wrong-merge wrong-total negative fractio
     check "untrustworthy comparison retains release: $fault" equal "$STATUS" 0
     check "untrustworthy comparison never compiles: $fault" test ! -s "$TEST_GO_LOG"
 done
-run_install private-metadata --prefer-gh --prefer-source-if-stale --allow-build --stale-threshold 1
+TEST_STORED_GH_ACCOUNT=1 run_install private-metadata --prefer-gh --prefer-source-if-stale --allow-build --stale-threshold 1
 check 'metadata transport fallback remains usable' equal "$STATUS" 0
 check 'gh metadata transport attempted when preferred' grep -q '^gh api ' "$TEST_HTTP_LOG"
 TEST_DELIVERY=corrupt run_install corrupt-fresh --prefer-source-if-stale --allow-build --stale-threshold 1

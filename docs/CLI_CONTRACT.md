@@ -1220,6 +1220,17 @@ builds require explicit consent through `--from-source` or
 `--allow-source-build`; Go and Bun source fallback accepts only a singleton
 selection. Integrity or installation failures never trigger source fallback.
 
+Source checkout uses the same GitHub identity as release acquisition and
+freshness: `DSR_GH_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, then stored GitHub.com
+credentials. A selected credential is supplied only to the exact repository's
+HTTPS requests through Git's process-local `--config-env` support, requiring
+Git 2.31 or newer. Tokens never enter URLs, command arguments or persisted Git
+configuration. Authenticated checkout disables ambient URL rewrites, competing
+credential helpers, redirects and Git tracing, and an invalid token cannot use
+another `.netrc` account. Without a selected GitHub credential, the existing
+Git-only anonymous and custom-helper path remains available. The selected
+source ref is still resolved to an exact commit before compilation.
+
 `--install-toolchain` separately authorizes provisioning a missing compiler for
 the selected source build. It requires `--from-source` or
 `--allow-source-build`; `--yes` alone does not enable it. Rust, Go and Bun use

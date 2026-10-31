@@ -11,6 +11,10 @@ for dependency in git jq cargo rustc ps; do
 done
 # shellcheck source=../../src/install_source.sh
 source "$ROOT/src/install_source.sh"
+# This fixture uses anonymous Git URL policy; authenticated HTTPS has its own
+# real transport coverage in test_install_source.sh --credentials-only.
+export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+gh() { return 1; }
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/dsr-source-family.XXXXXXXX") || exit 1
 printf 'Fixtures: %s\n' "$WORK"
 # Some hosted environments expose host PIDs to ps but namespace PIDs to Bash.

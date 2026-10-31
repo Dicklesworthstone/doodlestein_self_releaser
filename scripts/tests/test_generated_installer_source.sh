@@ -14,6 +14,7 @@ export GIT_REAL GO_REAL
 TEMP=$(mktemp -d "${TMPDIR:-/tmp}/dsr-installer-source.XXXXXXXX") || exit 1
 trap '[[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]] || rm -rf -- "$TEMP"' EXIT
 export HOME="$TEMP/home" GIT_CONFIG_GLOBAL="$TEMP/gitconfig" GIT_CONFIG_NOSYSTEM=1
+export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
 export GOCACHE="${DSR_TEST_GO_CACHE:-/tmp/dsr-installer-source-go-cache}"
 mkdir -p "$HOME" "$TEMP/upstream/project/cmd/app" "$TEMP/bin" "$TEMP/config/repos.d" "$TEMP/releases" "$TEMP/results"
 export DSR_CONFIG_DIR="$TEMP/config" DSR_INSTALLER_DIR="$TEMP/installers"
@@ -173,6 +174,9 @@ cat > "$TEMP/bin/gh" <<'GH'
 printf 'gh %s\n' "$*" >> "$CALLS"
 if [[ "${1:-} ${2:-}" == 'auth token' ]]; then
     [[ "${GH_HOST:-}" == github.com && "${3:-} ${4:-}" == '--hostname github.com' ]] || exit 1
+    # Ordinary source cases use the real file:// Git route without a stored
+    # GitHub login. The dedicated private freshness control opts into one.
+    [[ -n "${GH_EXPECTED_TOKEN:-}" ]] || exit 1
     printf 'installer-source-fixture-token\n'
     exit 0
 fi

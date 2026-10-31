@@ -6,6 +6,10 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 # Run the identical public integration against a retained baseline checkout.
 ROOT="${DSR_TEST_ROOT:-$ROOT}"
+# Source cases intentionally use Git's local URL rewrite with no GitHub login.
+export DSR_GH_TOKEN='' GITHUB_TOKEN='' GH_TOKEN=''
+gh() { return 1; }
+export -f gh
 for dependency in bash python3 rustc cargo git jq yq tar gzip ps; do
     command -v "$dependency" >/dev/null 2>&1 || {
         printf 'SKIP: generated workspace installer requires %s\n' "$dependency"
