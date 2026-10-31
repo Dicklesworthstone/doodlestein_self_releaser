@@ -5006,7 +5006,8 @@ _dispatch_load_config() {
         local cfg_enabled cfg_event cfg_repos
 
         if [[ -f "$tool_config" ]]; then
-            cfg_enabled=$(yq -r '.dispatch.enabled // ""' "$tool_config" 2>/dev/null || echo "")
+            cfg_enabled=$(yq -r '.dispatch.enabled' "$tool_config" 2>/dev/null || echo "")
+            [[ "$cfg_enabled" != null ]] || cfg_enabled=""
             cfg_event=$(yq -r '.dispatch.event_type // ""' "$tool_config" 2>/dev/null || echo "")
             cfg_repos=$(_dispatch_join_lines "$(yq -r '.dispatch.repos[]?' "$tool_config" 2>/dev/null || true)")
 
@@ -5016,7 +5017,8 @@ _dispatch_load_config() {
         fi
 
         if [[ -f "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" ]]; then
-            cfg_enabled=$(yq -r '.dispatch.enabled // ""' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || echo "")
+            cfg_enabled=$(yq -r '.dispatch.enabled' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || echo "")
+            [[ "$cfg_enabled" != null ]] || cfg_enabled=""
             cfg_event=$(yq -r '.dispatch.event_type // ""' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || echo "")
             cfg_repos=$(_dispatch_join_lines "$(yq -r '.dispatch.repos[]?' "${DSR_CONFIG_FILE:-$config_dir/config.yaml}" 2>/dev/null || true)")
 
@@ -5044,89 +5046,63 @@ _dispatch_send_all() {
     local release_url="$6"
     local event_type="$7"
     local repos_csv="$8"
-    local run_id="$9"
+    local release_id="$9"
+    local retry_uncertain="${10:-false}" expected_assets="${11:-[]}"
+    local payload selected plan normalized_repos target
+    local -a targets=()
 
-    if [[ -z "$repos_csv" ]]; then
-        echo "[]"
-        return 2
-    fi
+    _dsr_require dispatch
+    command -v jq >/dev/null || return 3
+    declare -F _dp_release_outbox >/dev/null || return 3
+    [[ "$git_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || {
+        log_error "Repository dispatch requires the verified release commit"
+        return 4
+    }
+    [[ "$retry_uncertain" == true || "$retry_uncertain" == false ]] || return 4
+    source_repo=$(_dp_repo "$source_repo") || return 4
+    _dp_config || return $?
 
-    if ! command -v jq &>/dev/null; then
-        log_warn "jq not available; skipping repository dispatch"
-        echo "[]"
-        return 2
-    fi
+    # Normalize the entire configured destination set before saving intent or
+    # sending anything. Empty entries and malformed targets remain errors.
+    [[ -n "$repos_csv" && "$repos_csv" != *[[:cntrl:]]* ]] || return 4
+    normalized_repos=""
+    IFS=',' read -r -a targets <<< "$repos_csv"
+    [[ "$repos_csv" != *, ]] || return 4
+    for target in "${targets[@]}"; do
+        target="${target#"${target%%[![:space:]]*}"}"
+        target="${target%"${target##*[![:space:]]}"}"
+        [[ -n "$target" ]] || return 4
+        [[ "$target" == */* ]] || target="Dicklesworthstone/$target"
+        normalized_repos+="${normalized_repos:+,}$target"
+    done
+    selected=$(_dp_repos "$normalized_repos") || return $?
 
-    local payload
+    # The GitHub release ID survives process restarts and version spelling
+    # changes. A changed event, source or destination set must conflict with
+    # this release's saved plan rather than start another fan-out.
+    version="${tag#v}"
     payload=$(jq -nc \
         --arg tool "$tool_name" \
         --arg version "$version" \
         --arg tag "$tag" \
         --arg repo "$source_repo" \
         --arg sha "$git_sha" \
-        --arg run_id "$run_id" \
+        --arg run_id "release-$release_id" \
         --arg release_url "$release_url" \
-        '{tool: $tool, version: $version, tag: $tag, repo: $repo, sha: $sha, run_id: $run_id, release_url: $release_url}')
+        '{tool: $tool, version: $version, tag: $tag, repo: $repo, sha: $sha, run_id: $run_id, release_url: $release_url}') || return 1
+    plan=$(_dp_release_plan "$source_repo" "$selected" "$payload" "$event_type" "$release_id") || return $?
 
-    local results=()
-    local any_failed=0
-    local total=0
-    local target
-    IFS=',' read -ra targets <<< "$repos_csv"
-    for target in "${targets[@]}"; do
-        target="$(echo "$target" | xargs)"
-        [[ -z "$target" ]] && continue
-
-        if [[ "$target" != */* ]]; then
-            target="Dicklesworthstone/$target"
-        fi
-
-        log_info "Dispatching $event_type to $target" "\"tool\":\"$tool_name\",\"version\":\"$version\",\"run_id\":\"$run_id\""
-
-        local dispatch_status="success"
-        local dispatch_error=""
-
-        if command -v build_retry_with_backoff &>/dev/null; then
-            if ! build_retry_with_backoff "${DSR_DISPATCH_RETRIES:-3}" gh_repository_dispatch "$target" "$event_type" "$payload"; then
-                dispatch_status="failed"
-                dispatch_error="dispatch failed"
-            fi
-        else
-            if ! gh_repository_dispatch "$target" "$event_type" "$payload"; then
-                dispatch_status="failed"
-                dispatch_error="dispatch failed"
-            fi
-        fi
-
-        if [[ "$dispatch_status" == "success" ]]; then
-            log_ok "Dispatch sent to $target"
-        else
-            log_warn "Dispatch failed for $target"
-        fi
-
-        [[ "$dispatch_status" == "failed" ]] && any_failed=1
-        total=$((total + 1))
-
-        results+=("$(jq -nc \
-            --arg repo "$target" \
-            --arg status "$dispatch_status" \
-            --arg error "$dispatch_error" \
-            '{repo: $repo, status: $status, error: (if $error == "" then null else $error end)}')")
-    done
-
-    if [[ ${#results[@]} -gt 0 ]]; then
-        printf '%s\n' "${results[@]}" | jq -s '.'
-    else
-        echo "[]"
-    fi
-
-    if [[ $total -eq 0 ]]; then
-        return 2
-    fi
-    if [[ $any_failed -eq 1 ]]; then
-        return 1
-    fi
-    return 0
+    # Prefix the frozen source context: the outbox and transport use Bash
+    # locals named repo/body/state which must not shadow this publication.
+    local _DSR_DISPATCH_SOURCE_REPO="$source_repo" _DSR_DISPATCH_RELEASE_ID="$release_id"
+    local _DSR_DISPATCH_BINDING
+    _DSR_DISPATCH_BINDING=$(_dispatch_release_binding "$source_repo" "$release_id" \
+        "$tag" "$git_sha" "$release_url" "$expected_assets") || return $?
+    plan=$(jq -Sc --argjson binding "$_DSR_DISPATCH_BINDING" \
+        '. + {release_binding:$binding}' <<< "$plan") || return 1
+    _dp_release_outbox "$plan" \
+        "${DISPATCH_STATE_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/dispatch}" \
+        "$retry_uncertain" false _dispatch_public_guard
 }
 
 _release_file_size() {
@@ -7313,6 +7289,7 @@ cmd_release() {
     local dispatch_override=""
     local dispatch_event_override=""
     local dispatch_repos_override=""
+    local dispatch_retry_uncertain=false
     local allow_no_manifest=false
     local release_tag_sha=""
     local sbom_override="" sbom_format_override="" sbom_enabled=false sbom_format=""
@@ -7378,12 +7355,19 @@ cmd_release() {
                 shift
                 ;;
             --dispatch-event)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 dispatch_event_override="$2"
                 shift 2
                 ;;
             --dispatch-repos)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 dispatch_repos_override="$2"
                 shift 2
+                ;;
+            --dispatch-retry-uncertain)
+                dispatch_override="true"
+                dispatch_retry_uncertain=true
+                shift
                 ;;
             --help|-h)
                 cat << 'EOF'
@@ -7394,9 +7378,11 @@ USAGE:
     dsr release <tool> <version> --artifacts <dir>
     dsr release <tool> <version> --draft
     dsr release verify <tool> <version>   (verify existing release)
+    dsr release dispatch --outbox <file> (recover a saved downstream handoff)
 
 SUBCOMMANDS:
     verify    Verify release assets against build manifest
+    dispatch  Inspect or resume the saved downstream delivery outbox
 
 OPTIONS:
     -t, --tool <name>        Tool to release (or first positional arg)
@@ -7419,6 +7405,9 @@ OPTIONS:
     --no-dispatch            Disable repository dispatch for this run
     --dispatch-event <name>  Override dispatch event type
     --dispatch-repos <list>  Comma-separated override of dispatch targets
+    --dispatch-retry-uncertain
+                             Explicitly resend uncertain downstream requests;
+                             may repeat a previously accepted event
     -r, --resume             Resume interrupted upload
 
 DESCRIPTION:
@@ -9527,6 +9516,7 @@ EOF
     local dispatch_enabled dispatch_event dispatch_repos
     local dispatch_results_json="[]"
     local dispatch_status="skipped"
+    local dispatch_exit=0 dispatch_outbox="" dispatch_result=""
     local dispatch_cfg
 
     dispatch_cfg=$(_dispatch_load_config "$tool_name")
@@ -9538,22 +9528,48 @@ EOF
 
     if _dispatch_is_true "$dispatch_enabled" && [[ -n "$dispatch_repos" ]] && \
        [[ $exit_code -eq 0 ]] && ! $draft; then
-        local git_sha=""
-        if [[ -n "$local_path" && -d "$local_path" ]]; then
-            git_sha=$(git_ops_tag_sha "$local_path" "$tag" 2>/dev/null || true)
+        # Keep the commit frozen by publication; never re-read a mutable local
+        # tag and attribute already uploaded artifacts to a different commit.
+        local git_sha="$release_contract_git_sha" dispatch_expected_assets
+        if [[ -z "$git_sha" && "$ordinary_manifest" != null ]]; then
+            git_sha=$(jq -r '.source.git_sha // empty' <<< "$ordinary_manifest")
         fi
+        [[ -n "$git_sha" ]] || git_sha="$release_tag_sha"
         if [[ -z "$git_sha" ]]; then
             git_sha=$(gh_resolve_tag_sha "$repo" "$tag" 2>/dev/null || true)
         fi
-        [[ -z "$git_sha" ]] && git_sha="unknown"
+        if $release_contract_enabled; then
+            dispatch_expected_assets=$(jq -c '.assets' <<< "$release_contract_plan")
+        else
+            dispatch_expected_assets=$(printf '%s\n' "${uploaded_assets[@]}" | jq -sc '.')
+        fi
 
-        local dispatch_exit=0
-        dispatch_results_json=$(_dispatch_send_all "$tool_name" "$version" "$tag" "$repo" "$git_sha" "$release_url" "$dispatch_event" "$dispatch_repos" "${DSR_RUN_ID:-run-unknown}") || dispatch_exit=$?
+        dispatch_result=$(_dispatch_send_all "$tool_name" "$version" "$tag" "$repo" \
+            "$git_sha" "$release_url" "$dispatch_event" "$dispatch_repos" "$release_id" \
+            "$dispatch_retry_uncertain" "$dispatch_expected_assets") || dispatch_exit=$?
+        if jq -es --argjson rc "$dispatch_exit" '
+            length == 1 and (.[0] | type == "object" and .exit_code == $rc and
+                (.results | type == "array") and (.outbox_file | type == "string"))
+        ' <<< "$dispatch_result" >/dev/null 2>&1; then
+            dispatch_results_json=$(jq -c '.results' <<< "$dispatch_result")
+            dispatch_outbox=$(jq -r '.outbox_file' <<< "$dispatch_result")
+        elif [[ $dispatch_exit -eq 0 ]]; then
+            dispatch_exit=1
+            log_error "Dispatch did not return a valid delivery receipt"
+        fi
         case "$dispatch_exit" in
             0) dispatch_status="completed" ;;
-            2) dispatch_status="skipped" ;;
             *) dispatch_status="failed" ;;
         esac
+        if [[ $dispatch_exit -ne 0 ]]; then
+            log_warn "Release publication succeeded; downstream dispatch is incomplete (exit $dispatch_exit)"
+            if [[ -n "$dispatch_outbox" ]]; then
+                local dispatch_recovery
+                printf -v dispatch_recovery 'dsr release dispatch --outbox %q' "$dispatch_outbox"
+                log_info "Recover downstream delivery: $dispatch_recovery"
+                [[ $dispatch_exit -ne 8 ]] || log_warn "Uncertain delivery requires an explicit --retry-uncertain after checking the receiver"
+            fi
+        fi
     elif _dispatch_is_true "$dispatch_enabled" && $draft; then
         log_info "Repository dispatch skipped while release remains a draft"
     elif _dispatch_is_true "$dispatch_enabled" && [[ -z "$dispatch_repos" ]]; then
@@ -9594,6 +9610,8 @@ EOF
             --arg dispatch_status "$dispatch_status" \
             --arg dispatch_event "$dispatch_event" \
             --arg dispatch_repos "$dispatch_repos" \
+            --argjson dispatch_exit "$dispatch_exit" \
+            --arg dispatch_outbox "$dispatch_outbox" \
             --argjson dispatch_results "$dispatch_results_json" \
             --argjson installer_check "$installer_report" \
             --argjson sbom "$ordinary_sbom_report" \
@@ -9624,6 +9642,8 @@ EOF
                 duration_seconds: $duration,
                 dispatch: {
                     status: $dispatch_status,
+                    exit_code: $dispatch_exit,
+                    outbox_file: (if $dispatch_outbox == "" then null else $dispatch_outbox end),
                     event: $dispatch_event,
                     repos: (if $dispatch_repos == "" then [] else ($dispatch_repos | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) end),
                     results: $dispatch_results
@@ -9675,6 +9695,258 @@ EOF
     fi
 
     return $exit_code
+}
+
+# ============================================================================
+# RELEASE DISPATCH RECOVERY
+# ============================================================================
+
+# Read the complete ID-bound collection. Embedded release.assets can be
+# truncated, so it cannot prove either completeness or unchanged custody.
+_dispatch_inventory() {
+    local dispatch_repo="$1" dispatch_id="$2" page page_json count inventory='[]'
+    for ((page=1; page<=100; page++)); do
+        page_json=$(gh_api "repos/$dispatch_repo/releases/$dispatch_id/assets?per_page=100&page=$page" --no-cache) || return 7
+        jq -es '
+            def identifier: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+            length == 1 and (.[0] | type == "array" and length <= 100 and
+                all(.[]; type == "object" and (.id | identifier) and
+                    (.name | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and .state == "uploaded" and
+                    (.size | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                    (.digest == null or (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))))
+        ' <<< "$page_json" >/dev/null || return 7
+        inventory=$(jq -nc --argjson previous "$inventory" --argjson page "$page_json" '$previous + $page') || return 7
+        count=$(jq 'length' <<< "$page_json") || return 7
+        ((count == 100)) || break
+    done
+    ((page <= 100)) || return 7
+    jq -ce '
+        if ([.[].id] | unique | length) == length and
+           ([.[].name] | unique | length) == length
+        then map({id,name,size,state,digest}) | sort_by(.name)
+        else error("Duplicate release assets") end
+    ' <<< "$inventory"
+}
+
+# Freeze the already verified public release, including every asset ID and
+# content hash. Digest-less assets retain a verified hash and are downloaded
+# again at subsequent POST boundaries; matching names and sizes are not proof.
+_dispatch_release_binding() {
+    (
+        set -o pipefail
+        umask 077
+        local dispatch_repo="$1" dispatch_id="$2" dispatch_tag="$3" dispatch_sha="$4"
+        local dispatch_url="$5" binding_expected_assets="$6" metadata inventory after_metadata after_inventory
+        local binding record asset work='' asset_dir='' name size sha remote_sha
+        dispatch_repo=$(_dp_repo "$dispatch_repo") || return 4
+        [[ "$dispatch_id" =~ ^[1-9][0-9]{0,15}$ && -n "$dispatch_tag" &&
+           "$dispatch_tag" != *[[:cntrl:]]* && "$dispatch_sha" =~ ^[0-9a-f]{40}$ ]] || return 4
+        jq -en --arg id "$dispatch_id" --argjson expected "$binding_expected_assets" '
+            def identifier: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+            ($id | tonumber | identifier) and ($expected | type == "array" and length > 0 and
+                ([.[].name] | unique | length) == length and
+                all(.[]; type == "object" and (.name | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+                    (.size_bytes | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                    (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                    (.remote_id == null or (.remote_id | identifier))))
+        ' >/dev/null || return 4
+        metadata=$(gh_api "repos/$dispatch_repo/releases/$dispatch_id" --no-cache) || return 7
+        jq -es --argjson id "$dispatch_id" --arg repo "$dispatch_repo" --arg tag "$dispatch_tag" --arg url "$dispatch_url" '
+            length == 1 and (.[0] | type == "object" and .id == $id and .tag_name == $tag and
+                .draft == false and (.prerelease | type == "boolean") and .html_url == $url and
+                (.html_url | type == "string" and (ascii_downcase | startswith("https://github.com/" + $repo + "/releases/"))))
+        ' <<< "$metadata" >/dev/null || {
+            log_error "Dispatch requires the same verified public release ID, tag and URL"; return 7;
+        }
+        remote_sha=$(gh_resolve_tag_sha "$dispatch_repo" "$dispatch_tag") || return 7
+        [[ "$remote_sha" == "$dispatch_sha" ]] || { log_error "Release tag changed before dispatch"; return 7; }
+        inventory=$(_dispatch_inventory "$dispatch_repo" "$dispatch_id") || return 7
+        if ! jq -en --argjson expected "$binding_expected_assets" --argjson actual "$inventory" '
+            ($expected | sort_by(.name)) as $e | ($actual | sort_by(.name)) as $a |
+            ($e | length) == ($a | length) and all($e | to_entries[];
+                .key as $i | .value as $record |
+                $a[$i].name == $record.name and $a[$i].size == $record.size_bytes and
+                ($record.remote_id == null or $a[$i].id == $record.remote_id) and
+                ($a[$i].digest == null or $a[$i].digest == ("sha256:" + $record.sha256)))
+        ' >/dev/null; then
+            log_error "Release asset inventory changed before dispatch"; return 7
+        fi
+        trap '[[ -z "$work" ]] || rm -rf -- "$work"' EXIT
+        trap 'exit 5' HUP INT TERM
+        while IFS= read -r record; do
+            name=$(jq -r '.name' <<< "$record") || return 7
+            size=$(jq -r '.size_bytes' <<< "$record") || return 7
+            sha=$(jq -r '.sha256' <<< "$record") || return 7
+            asset=$(jq -c --arg name "$name" '.[] | select(.name == $name)' <<< "$inventory") || return 7
+            if jq -e '.digest == null' <<< "$asset" >/dev/null; then
+                [[ -n "$work" ]] || work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-dispatch-assets.XXXXXXXX") || return 1
+                asset_dir="$work/$(jq -r '.id' <<< "$asset")"
+                mkdir "$asset_dir" || return 1
+                _gh_verify_uploaded_asset "$dispatch_repo" "$name" "$size" "$sha" "$asset" "$asset_dir" >/dev/null || return 7
+            fi
+        done < <(jq -c '.[]' <<< "$binding_expected_assets")
+        binding=$(jq -nc --arg tag "$dispatch_tag" --arg sha "$dispatch_sha" --arg url "$dispatch_url" \
+            --argjson metadata "$metadata" --argjson assets "$inventory" --argjson expected "$binding_expected_assets" '
+            {tag:$tag,sha:$sha,release_url:$url,prerelease:$metadata.prerelease,
+             assets:[$assets[] | . as $asset | . + {sha256:($expected[] | select(.name == $asset.name) | .sha256)}]}
+        ') || return 7
+        # Re-observe after any content downloads; otherwise a replacement on
+        # a later page could hide behind an earlier matching asset receipt.
+        after_inventory=$(_dispatch_inventory "$dispatch_repo" "$dispatch_id") || return 7
+        after_metadata=$(gh_api "repos/$dispatch_repo/releases/$dispatch_id" --no-cache) || return 7
+        jq -en --argjson before "$metadata" --argjson after "$after_metadata" \
+            --argjson assets "$inventory" --argjson current "$after_inventory" '
+            def identity: {id,tag_name,draft,prerelease,html_url};
+            ($before | identity) == ($after | identity) and $assets == $current
+        ' >/dev/null || return 7
+        remote_sha=$(gh_resolve_tag_sha "$dispatch_repo" "$dispatch_tag") || return 7
+        [[ "$remote_sha" == "$dispatch_sha" ]] || return 7
+        printf '%s\n' "$binding"
+    )
+}
+
+# The outbox and transport both declare repo/body/state/work locals. Frozen
+# source context therefore uses names that cannot be shadowed by destinations.
+_dispatch_public_guard() {
+    local dispatch_current dispatch_expected
+    [[ -n "${_DSR_DISPATCH_SOURCE_REPO:-}" && -n "${_DSR_DISPATCH_RELEASE_ID:-}" &&
+       -n "${_DSR_DISPATCH_BINDING:-}" ]] || return 4
+    dispatch_expected=$(jq -c '[.assets[] | {name,size_bytes:.size,sha256,remote_id:.id}]' \
+        <<< "$_DSR_DISPATCH_BINDING") || return 4
+    dispatch_current=$(_dispatch_release_binding "$_DSR_DISPATCH_SOURCE_REPO" "$_DSR_DISPATCH_RELEASE_ID" \
+        "$(jq -r '.tag' <<< "$_DSR_DISPATCH_BINDING")" "$(jq -r '.sha' <<< "$_DSR_DISPATCH_BINDING")" \
+        "$(jq -r '.release_url' <<< "$_DSR_DISPATCH_BINDING")" "$dispatch_expected") || return $?
+    jq -en --argjson frozen "$_DSR_DISPATCH_BINDING" --argjson current "$dispatch_current" \
+        '$frozen == $current' >/dev/null || { log_error "Public release changed during dispatch"; return 7; }
+}
+
+# Recovery treats the saved requests as immutable input, not an opportunity to
+# regenerate different payload bytes. Recompute each ID and hash, validate its
+# body against the retained payload, and then validate the delivery history.
+_dispatch_saved_plan() {
+    local file="$1" plan source selected row destination event body material delivery digest
+    plan=$(jq -ce -s 'if length == 1 then .[0].plan else error("Multiple outbox documents") end' "$file") || return 2
+    jq -e '
+        def identifier: type == "number" and floor == . and . > 0 and . <= 9007199254740991;
+        .release_binding as $b |
+        type == "object" and (keys == ["payload","release_binding","release_id","requests","source_repo"]) and
+        (.release_id | identifier) and (.source_repo | type == "string") and
+        (.payload | type == "object") and (.release_binding | type == "object") and
+        (.requests | type == "array" and length > 0) and
+        ($b | keys == ["assets","prerelease","release_url","sha","tag"]) and
+        ($b.tag | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and
+        ($b.sha | type == "string" and test("^[0-9a-f]{40}$")) and
+        ($b.release_url | type == "string") and ($b.prerelease | type == "boolean") and
+        (.payload | keys == ["release_url","repo","run_id","sha","tag","tool","version"]) and
+        .payload.tag == $b.tag and .payload.sha == $b.sha and .payload.release_url == $b.release_url and
+        (.payload.repo | ascii_downcase) == .source_repo and .payload.run_id == ("release-" + (.release_id | tostring)) and
+        (.payload.tool | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+        (.payload.version | type == "string") and .payload.tag == ("v" + .payload.version) and
+        ($b.assets | type == "array" and length > 0 and . == sort_by(.name) and
+            ([.[].id] | unique | length) == length and ([.[].name] | unique | length) == length and
+            all(.[]; type == "object" and (keys == ["digest","id","name","sha256","size","state"]) and
+                (.id | identifier) and (.name | type == "string" and length > 0 and (test("[[:cntrl:]]") | not)) and .state == "uploaded" and
+                (.size | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+                (.digest == null or .digest == ("sha256:" + .sha256)))) and
+        (.requests | all(.[]; type == "object" and
+            (keys == ["body","delivery_id","repo","request_sha256"]) and
+            (.repo | type == "string") and (.body | type == "string") and
+            (.delivery_id | type == "string" and test("^[0-9a-f]{64}$")) and
+            (.request_sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
+    ' <<< "$plan" >/dev/null || return 2
+    source=$(_dp_repo "$(jq -r '.source_repo' <<< "$plan")") || return 2
+    [[ "$source" == "$(jq -r '.source_repo' <<< "$plan")" ]] || return 2
+    selected=$(_dp_repos "$(jq -r '.requests | map(.repo) | join(",")' <<< "$plan")") || return 2
+    jq -en --arg selected "$selected" --arg source "$source" --argjson plan "$plan" '
+        ($selected | split("\n")) == ($plan.requests | map(.repo)) and
+        ($plan.release_binding.release_url | ascii_downcase | startswith("https://github.com/" + $source + "/releases/")) and
+        ([$plan.requests[].body | fromjson | .event_type] | unique | length) == 1
+    ' >/dev/null || return 2
+    while IFS= read -r row; do
+        destination=$(jq -r '.repo' <<< "$row") || return 2
+        body=$(jq -r '.body' <<< "$row") || return 2
+        event=$(jq -r '.body | fromjson | .event_type' <<< "$row") || return 2
+        # Sorted identity material is independent of object insertion order;
+        # the body hash still covers the exact bytes retained for transport.
+        material=$(jq -Scn --arg source "$source" --arg repo "$destination" --arg event "$event" \
+            --argjson payload "$(jq -c '.payload' <<< "$plan")" \
+            '{source_repo:$source,repo:$repo,event_type:$event,payload:$payload}') || return 2
+        delivery=$(_dp_digest_text "$material") || return 2
+        digest=$(_dp_digest_text "$body") || return 2
+        jq -en --argjson row "$row" --argjson plan "$plan" --arg id "$delivery" --arg hash "$digest" '
+            $row.delivery_id == $id and $row.request_sha256 == $hash and
+            ($row.body | fromjson) == {event_type:($row.body | fromjson | .event_type),
+                client_payload:($plan.payload + {source_repo:$plan.source_repo,delivery_id:$id})} and
+            $row.body == ($row.body | fromjson | tojson)
+        ' >/dev/null || return 2
+        [[ "$(_dp_body "$event" "$(jq -c '.client_payload' <<< "$body")")" == "$body" ]] || return 2
+    done < <(jq -c '.requests[]' <<< "$plan")
+    _dp_state_valid "$file" "$plan" || return 2
+    printf '%s\n' "$plan"
+}
+
+cmd_release_dispatch() {
+    local file='' inspect=false retry_uncertain=false dry="${DRY_RUN:-false}"
+    local plan root session canonical key fingerprint mode owner result='' rc=0 envelope_status
+    while (($#)); do
+        case "$1" in
+            --outbox)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* && -z "$file" ]] || return 4
+                file="$2"; shift 2 ;;
+            --status) inspect=true; shift ;;
+            --retry-uncertain) retry_uncertain=true; shift ;;
+            --dry-run|-n) dry=true; shift ;;
+            --help|-h)
+                printf '%s\n' 'Usage: dsr release dispatch --outbox /absolute/path/state.json [--status|--retry-uncertain] [--dry-run]' \
+                    'Resume saved deliveries after re-verifying the same public release, tag and complete asset inventory.' \
+                    'Accepted destinations are never replayed. Uncertain delivery requires --retry-uncertain; duplicates are possible.' \
+                    '--status and --dry-run inspect the saved outbox without authentication, network requests or writes.'
+                return 0 ;;
+            *) log_error "Unknown release dispatch option: $1"; return 4 ;;
+        esac
+    done
+    [[ -n "$file" && "$file" == /* && "${file##*/}" == state.json &&
+       -f "$file" && ! -L "$file" ]] || { log_error "A saved regular outbox state.json is required"; return 4; }
+    [[ "$inspect" != true || "$retry_uncertain" != true ]] || return 4
+    _dsr_require dispatch || return 3
+    session="${file%/*}"; root="${session%/*}"
+    [[ -d "$session" && ! -L "$session" && -d "$root" && ! -L "$root" ]] || return 2
+    canonical=$(cd -- "$session" && pwd -P) || return 2
+    [[ "$file" == "$canonical/state.json" ]] || return 2
+    owner=$(stat -c %u "$file" 2>/dev/null || stat -f %u "$file") || return 2
+    mode=$(stat -c %a "$file" 2>/dev/null || stat -f %Lp "$file") || return 2
+    [[ "$owner" == "$(id -u)" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 2
+    (( (8#$mode & 077) == 0 )) || { log_error "Outbox state must be private to its owner"; return 2; }
+    fingerprint=$(_dp_state_hash "$file") || return 2
+    plan=$(_dispatch_saved_plan "$file") || { log_error "Invalid saved release dispatch plan"; return 2; }
+    key=$(_dp_outbox_identity "$plan") || return 2
+    key=$(_dp_digest_text "$key") || return 2
+    [[ "$session" == "$root/$key" && "$(_dp_state_hash "$file")" == "$fingerprint" ]] || return 2
+    local _DSR_DISPATCH_SOURCE_REPO _DSR_DISPATCH_RELEASE_ID _DSR_DISPATCH_BINDING
+    _DSR_DISPATCH_SOURCE_REPO=$(jq -r '.source_repo' <<< "$plan") || return 2
+    _DSR_DISPATCH_RELEASE_ID=$(jq -r '.release_id' <<< "$plan") || return 2
+    _DSR_DISPATCH_BINDING=$(jq -c '.release_binding' <<< "$plan") || return 2
+    if [[ "$inspect" != true && "$dry" != true ]]; then
+        _dsr_require github || return 3
+        _dp_config || return $?
+    else
+        inspect=true
+    fi
+    result=$(_dp_release_outbox "$plan" "$root" "$retry_uncertain" "$inspect" _dispatch_public_guard true) || rc=$?
+    [[ -n "$result" ]] || result='null'
+    envelope_status=success
+    ((rc == 0)) || envelope_status=error
+    if [[ "$dry" == true && "$result" != null ]]; then
+        result=$(jq -c --argjson retry "$retry_uncertain" '. + {mode:"dry_run",retry_uncertain:$retry}' <<< "$result") || return 2
+        rc=0; envelope_status=dry_run
+    fi
+    if ${JSON_MODE:-false}; then
+        json_envelope "release-dispatch" "$envelope_status" "$rc" "$result"
+    else
+        printf '%s\n' "$result" | jq .
+    fi
+    return "$rc"
 }
 
 # ============================================================================
@@ -15917,6 +16189,10 @@ main() {
         release)
             # Check for subcommand
             case "${1:-}" in
+                dispatch)
+                    shift
+                    cmd_release_dispatch "$@"
+                    ;;
                 finalize)
                     shift
                     cmd_release_finalize "$@"

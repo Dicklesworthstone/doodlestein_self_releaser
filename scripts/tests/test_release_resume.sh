@@ -13,6 +13,10 @@ source "$PROJECT_ROOT/src/artifact_naming.sh"
 source "$PROJECT_ROOT/src/act_runner.sh"
 source "$PROJECT_ROOT/src/signing.sh"
 source "$PROJECT_ROOT/src/sbom.sh"
+# Exercise the production outbox even though lazy module loading below is a
+# fixture. Only its HTTP boundary is replaced, alongside release asset uploads.
+# shellcheck source=/dev/null
+source "${DISPATCH_TEST_MODULE:-$PROJECT_ROOT/src/dispatch.sh}"
 # Load the real command without dispatching the CLI or contacting build hosts.
 # shellcheck source=/dev/null
 source <(awk '/^cmd_release\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
@@ -26,6 +30,10 @@ source <(awk '/^_release_prepare_ordinary_sbom\(\) \(/{copy=1} copy{print} copy 
 source <(awk '/^_release_sbom_policy\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_HELPERS_FILE:-$PROJECT_ROOT/dsr}")
 # shellcheck source=/dev/null
 source <(awk '/^_release_file_size\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+# shellcheck source=/dev/null
+source <(awk '/^_dispatch_[a-z_]+\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
+# shellcheck source=/dev/null
+source <(awk '/^cmd_release_dispatch\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "${DSR_TEST_COMMAND_FILE:-$PROJECT_ROOT/dsr}")
 
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-release-resume-tests.XXXXXXXX") || exit 4
 # Retain the isolated fixtures and request logs for failure diagnosis.
@@ -53,12 +61,6 @@ _gh_is_rate_limited() { return 1; }
 _release_require_publishable_artifacts() { return 0; }
 _release_contract_create_nonce() { printf '%064d\n' 1; }
 _release_contract_preflight() { printf 'STRICT-PREFLIGHT\n' >> "$CALLS"; return 4; }
-_dispatch_load_config() { printf 'true|release-ready|owner/downstream\n'; }
-_dispatch_is_true() { [[ "$1" == true ]]; }
-_dispatch_send_all() {
-    printf 'DISPATCH\nDISPATCH-URL %s\n' "$6" >> "$CALLS"
-    printf '[]\n'
-}
 gh_resolve_tag_sha() {
     if [[ -n "${STAGED_SOURCE_SHA:-}" ]]; then
         case "$STAGED_REMOTE_MODE" in
@@ -93,7 +95,7 @@ artifact_naming_generate_dual_for_tool() {
 
 setup() {
     CASE="$TEST_ROOT/$1"
-    mkdir -p "$CASE/artifacts" "$CASE/remote" "$CASE/state/releases" "$CASE/tmp" "$CASE/config/repos.d"
+    mkdir -p "$CASE/artifacts" "$CASE/remote" "$CASE/state/releases" "$CASE/tmp" "$CASE/config/repos.d" "$CASE/dispatch"
     export DSR_STATE_DIR="$CASE/state" TMPDIR="$CASE/tmp" NO_COLOR=1
     export DSR_CONFIG_DIR="$CASE/config" DSR_REPOS_FILE="$CASE/config/repos.yaml"
     export DSR_CONFIG_FILE="$CASE/config/config.yaml"
@@ -103,12 +105,20 @@ setup() {
     printf 'targets: [linux/amd64]\n' > "$ACT_REPOS_DIR/tool.yaml"
     CALLS="$CASE/calls"
     : > "$CALLS"
+    : > "$CASE/dispatch-calls.jsonl"
     printf '[]\n' > "$CASE/inventory.json"
     jq -nc '{id:9,tag_name:"v1.2.3",draft:false,prerelease:false,
       upload_url:"https://uploads.github.com/repos/owner/repo/releases/9/assets{?name,label}",
       html_url:"https://github.com/owner/repo/releases/tag/v1.2.3",assets:[]}' > "$CASE/release.json"
     printf 'real payload\n' > "$CASE/artifacts/payload.bin"
     export JSON_MODE=true DRY_RUN=false
+    export DSR_GH_TOKEN=fixture-token DSR_RUN_ID=fixture-process
+    export DSR_DISPATCH_ENABLED=true DSR_DISPATCH_EVENT=release-ready DSR_DISPATCH_REPOS=owner/downstream
+    export DISPATCH_MAX_RETRIES=2 DISPATCH_RETRY_DELAY=0 DISPATCH_MAX_WAIT=0 DISPATCH_TIMEOUT=2
+    unset DISPATCH_STATE_DIR
+    DISPATCH_MODE=success DISPATCH_FAILURE_REPO=owner/b RELEASE_TEST_VERSION=1.2.3
+    # Read by config_get and the command functions sourced dynamically above.
+    # shellcheck disable=SC2034
     DSR_CONFIG=()
     STRICT_CONTRACT=null COLLIDE_NAMES=false
     LOOKUP_FAIL=false INVENTORY_FAIL=false UPLOAD_FAIL=false LOST_RESPONSE=false
@@ -205,6 +215,7 @@ gh_api() {
         case "$1" in
             --method) method="$2"; shift 2 ;;
             --data) data="$2"; shift 2 ;;
+            --post) method=POST; data="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -242,6 +253,15 @@ gh_api() {
         return 0
     fi
     case "$endpoint" in
+        repos/*/dispatches)
+            # Keep the old network boundary usable as a negative control: an
+            # adapter which still sends statelessly must expose real repeats.
+            [[ "$method" == POST ]] || return 8
+            local destination="${endpoint#repos/}" code
+            destination="${destination%/dispatches}"
+            code=$(dispatch_fixture_response "$destination" "$data") || return $?
+            [[ "$code" == 204 ]] || return 7
+            ;;
         repos/owner/repo/git/matching-refs/tags/v1.2.3)
             printf 'TAG-ABSENCE\n' >> "$CALLS"
             case "$STAGED_REMOTE_MODE" in
@@ -290,18 +310,51 @@ gh_download_release_asset() {
     [[ ! -e "$3" ]] && cp "$CASE/remote/$2" "$3"
 }
 
+dispatch_fixture_response() {
+    local destination="$1" body="$2" code=204 rc=0
+    printf 'DISPATCH\nDISPATCH-URL %s\n' "$(jq -r '.client_payload.release_url' <<< "$body")" >> "$CALLS"
+    jq -c --arg destination "$destination" '. + {destination:$destination}' <<< "$body" >> "$CASE/dispatch-calls.jsonl" || return 4
+    printf '%s' "$body" > "$CASE/dispatch/${destination//\//_}.json" || return 4
+    if [[ "$destination" == "$DISPATCH_FAILURE_REPO" ]]; then
+        case "$DISPATCH_MODE" in
+            reject) code=422 ;;
+            uncertain) code=000; rc=28 ;;
+        esac
+    fi
+    if [[ "$DISPATCH_MODE" == draft-after-first && "$destination" == owner/a ]]; then
+        jq '.draft=true' "$CASE/release.json" > "$CASE/dispatch-release.next" &&
+            mv "$CASE/dispatch-release.next" "$CASE/release.json" || return 4
+    fi
+    printf '%s' "$code"
+    return "$rc"
+}
+
 curl() {
     local response="" headers="" payload="" url="" arg name
     while (($#)); do
         arg="$1"; shift
         case "$arg" in
-            -o) response="$1"; shift ;;
-            -D) headers="$1"; shift ;;
+            -o|--output) response="$1"; shift ;;
+            -D|--dump-header) headers="$1"; shift ;;
             --data-binary) payload="${1#@}"; shift ;;
             https://uploads.github.com/*) url="$arg" ;;
+            https://api.github.com/repos/*/dispatches) url="$arg" ;;
         esac
     done
     [[ -n "$response" && -n "$headers" && -n "$payload" && -n "$url" ]] || return 4
+    if [[ "$url" == https://api.github.com/repos/*/dispatches ]]; then
+        local destination="${url#https://api.github.com/repos/}" body code rc=0
+        destination="${destination%/dispatches}"
+        # Dispatch passes private curl configuration on stdin. Consume it
+        # without persisting credentials in request logs or assertion output.
+        cat >/dev/null
+        body=$(cat "$payload") || return 4
+        code=$(dispatch_fixture_response "$destination" "$body") || rc=$?
+        printf 'HTTP/2 %s\r\n\r\n' "$code" > "$headers"
+        printf '{}' > "$response"
+        printf '%s' "$code"
+        return "$rc"
+    fi
     name="${url##*?name=}"
     name="${name//%2B/+}"
     printf 'POST %s\n' "$name" >> "$CALLS"
@@ -338,8 +391,13 @@ run_release() {
     # upload of a directory as-is.
     local -a manifest_args=()
     [[ -f "$CASE/artifacts/tool-v1.2.3-manifest.json" ]] || manifest_args=(--no-manifest)
-    cmd_release tool 1.2.3 --artifacts "$CASE/artifacts" ${manifest_args[@]+"${manifest_args[@]}"} "$@" \
+    cmd_release tool "$RELEASE_TEST_VERSION" --artifacts "$CASE/artifacts" ${manifest_args[@]+"${manifest_args[@]}"} "$@" \
         > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
+}
+
+run_dispatch_recovery() {
+    STATUS=0
+    cmd_release_dispatch "$@" > "$CASE/stdout" 2> "$CASE/stderr" || STATUS=$?
 }
 
 run_test() {
@@ -409,8 +467,9 @@ test_draft_resume_does_not_dispatch_or_verify_upgrade() {
     jq '.draft=true | .prerelease=true' "$CASE/release.json" > "$CASE/release.next"
     mv "$CASE/release.next" "$CASE/release.json"
     run_release --resume --verify-upgrade
-    [[ $STATUS -eq 0 ]] && ! grep -q '^DISPATCH\|^UPGRADE' "$CALLS" &&
-        jq -e '.details.draft==true and .details.prerelease==true' "$CASE/stdout" >/dev/null
+    [[ $STATUS -eq 0 && ! -e "$DSR_STATE_DIR/dispatch" ]] && ! grep -q '^DISPATCH\|^UPGRADE' "$CALLS" &&
+        jq -e '.details.draft==true and .details.prerelease==true and
+            .details.dispatch.status=="skipped"' "$CASE/stdout" >/dev/null
 }
 
 test_named_upload_emits_one_json_envelope() {
@@ -676,7 +735,7 @@ test_remote_drift_after_upload_prevents_success() {
     setup final_drift
     FINAL_DRIFT=true
     run_release --resume
-    [[ $STATUS -eq 1 ]] && ! grep -q '^DISPATCH' "$CALLS" &&
+    [[ $STATUS -eq 1 && ! -e "$DSR_STATE_DIR/dispatch" ]] && ! grep -q '^DISPATCH' "$CALLS" &&
         jq -e '.details.verification=="incomplete" and .details.failed>0' "$CASE/stdout" >/dev/null
 }
 
@@ -684,7 +743,7 @@ test_release_visibility_drift_prevents_dispatch() {
     setup visibility_drift
     VISIBILITY_DRIFT=true
     run_release --resume
-    [[ $STATUS -eq 1 ]] && ! grep -q '^DISPATCH' "$CALLS" &&
+    [[ $STATUS -eq 1 && ! -e "$DSR_STATE_DIR/dispatch" ]] && ! grep -q '^DISPATCH' "$CALLS" &&
         jq -e '.details.verification=="incomplete"' "$CASE/stdout" >/dev/null
 }
 
@@ -737,6 +796,332 @@ test_completed_release_resume_does_not_reupload() {
     run_release --resume
     [[ $STATUS -eq 0 ]] && ! grep -q '^POST\|^CREATE\|--method DELETE' "$CALLS" &&
         jq -e '.details.success==1' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_accepted_outbox_survives_new_process_ids() {
+    setup dispatch_stable_identity
+    export DSR_DISPATCH_REPOS=owner/a,owner/b DSR_RUN_ID=first-process
+    run_release --resume
+    [[ $STATUS -eq 0 ]] || return 1
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    if [[ -n "$outbox" && -f "$outbox" ]]; then
+        cp "$outbox" "$CASE/outbox.before" || return 1
+    fi
+    cp "$CASE/dispatch/owner_a.json" "$CASE/a.before" || return 1
+    cp "$CASE/dispatch/owner_b.json" "$CASE/b.before" || return 1
+    export DSR_RUN_ID=another-process
+    run_release --resume
+    [[ $STATUS -eq 0 && -n "$outbox" && -f "$outbox" ]] &&
+        jq -e -s 'length==2 and ([.[].destination]|sort)==["owner/a","owner/b"]' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        cmp -s "$outbox" "$CASE/outbox.before" &&
+        cmp -s "$CASE/a.before" "$CASE/dispatch/owner_a.json" &&
+        cmp -s "$CASE/b.before" "$CASE/dispatch/owner_b.json" &&
+        jq -e 'all(.deliveries[]; (.history|length)==1 and .history[0].outcome=="accepted")' "$outbox" >/dev/null &&
+        jq -e --arg outbox "$outbox" '.details.dispatch.status=="completed" and
+            .details.dispatch.exit_code==0 and .details.dispatch.outbox_file==$outbox and
+            (.details.dispatch.results|length)==2 and
+            all(.details.dispatch.results[]; .outcome=="accepted")' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_retries_only_rejected_destination() {
+    setup dispatch_rejected
+    export DSR_DISPATCH_REPOS=owner/a,owner/b DSR_RUN_ID=first-process
+    DISPATCH_MODE=reject
+    run_release --resume
+    [[ $STATUS -eq 0 ]] || return 1
+    cp "$CASE/stdout" "$CASE/first-result.json" || return 1
+    cp "$CASE/dispatch/owner_b.json" "$CASE/b.before" || return 1
+    DISPATCH_MODE=success
+    export DSR_RUN_ID=retry-process
+    run_release --resume
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] &&
+        jq -e '.status=="success" and .exit_code==0 and
+            .details.dispatch.status=="failed" and .details.dispatch.exit_code==1 and
+            [.details.dispatch.results[].outcome]==["accepted","rejected"]' "$CASE/first-result.json" >/dev/null &&
+        jq -e -s 'length==3 and ([.[]|select(.destination=="owner/a")]|length)==1 and
+            ([.[]|select(.destination=="owner/b")]|length)==2' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        cmp -s "$CASE/b.before" "$CASE/dispatch/owner_b.json" &&
+        jq -e '[.deliveries[].history|length]==[1,2] and
+            .deliveries[1].history[1].resend_uncertain==false' "$outbox" >/dev/null &&
+        jq -e '.details.dispatch.status=="completed" and .details.dispatch.exit_code==0' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_uncertain_requires_explicit_retry() {
+    setup dispatch_uncertain
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=uncertain
+    run_release --resume
+    [[ $STATUS -eq 0 ]] || return 1
+    cp "$CASE/dispatch/owner_b.json" "$CASE/b.before" || return 1
+    DISPATCH_MODE=success
+    export DSR_RUN_ID=retry-process
+    run_release --resume
+    [[ $STATUS -eq 0 ]] &&
+        jq -e -s 'length==2' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        jq -e '.details.dispatch.status=="failed" and .details.dispatch.exit_code==8 and
+            [.details.dispatch.results[].outcome]==["accepted","uncertain"]' "$CASE/stdout" >/dev/null || return 1
+    run_release --resume --dispatch-retry-uncertain
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] &&
+        jq -e -s 'length==3 and ([.[]|select(.destination=="owner/a")]|length)==1' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        cmp -s "$CASE/b.before" "$CASE/dispatch/owner_b.json" &&
+        jq -e '.deliveries[1].history[1].resend_uncertain==true and
+            .deliveries[1].history[1].outcome=="accepted"' "$outbox" >/dev/null &&
+        jq -e '.details.dispatch.status=="completed" and .details.dispatch.exit_code==0' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_custom_event_and_canonical_payload() {
+    setup dispatch_custom_payload
+    RELEASE_TEST_VERSION=v1.2.3
+    run_release --resume --dispatch-event release.custom-ready
+    [[ $STATUS -eq 0 ]] || return 1
+    cp "$CASE/dispatch/owner_downstream.json" "$CASE/request.before" || return 1
+    RELEASE_TEST_VERSION=1.2.3
+    export DSR_RUN_ID=another-process
+    run_release --resume --dispatch-event release.custom-ready
+    local pin outbox
+    printf -v pin '%040d' 1
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] &&
+        jq -e -s 'length==1' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        cmp -s "$CASE/request.before" "$CASE/dispatch/owner_downstream.json" &&
+        jq -e --arg pin "$pin" '.event_type=="release.custom-ready" and
+            (.client_payload|type)=="object" and (.client_payload|length)<=10 and
+            .client_payload.tool=="tool" and .client_payload.version=="1.2.3" and
+            .client_payload.tag=="v1.2.3" and .client_payload.repo=="owner/repo" and
+            .client_payload.source_repo=="owner/repo" and .client_payload.sha==$pin and
+            .client_payload.run_id=="release-9" and
+            .client_payload.release_url=="https://github.com/owner/repo/releases/tag/v1.2.3" and
+            (.client_payload.delivery_id|test("^[0-9a-f]{64}$"))' "$CASE/dispatch/owner_downstream.json" >/dev/null &&
+        jq -e 'all(.deliveries[]; .history[-1].receipt.event_type=="release.custom-ready")' "$outbox" >/dev/null &&
+        jq -e '.details.dispatch.event=="release.custom-ready" and .details.dispatch.status=="completed"' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_plan_drift_preserves_original_work() {
+    setup dispatch_plan_drift
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=reject
+    run_release --resume
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] || return 1
+    cp "$outbox" "$CASE/outbox.before" || return 1
+    DISPATCH_MODE=success
+    local change
+    for change in destination event; do
+        case "$change" in
+            destination) run_release --resume --dispatch-repos owner/a ;;
+            event) run_release --resume --dispatch-event changed-event ;;
+        esac
+        [[ $STATUS -eq 0 ]] &&
+            jq -e '.details.dispatch.status=="failed" and .details.dispatch.exit_code==2' "$CASE/stdout" >/dev/null &&
+            jq -e -s 'length==2' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+            cmp -s "$outbox" "$CASE/outbox.before" || return 1
+    done
+    run_release --resume --dispatch-repos Owner/B,owner/A,owner/b
+    [[ $STATUS -eq 0 ]] &&
+        jq -e '.details.dispatch.status=="completed" and .details.dispatch.exit_code==0' "$CASE/stdout" >/dev/null &&
+        jq -e -s 'length==3 and ([.[]|select(.destination=="owner/a")]|length)==1' "$CASE/dispatch-calls.jsonl" >/dev/null
+}
+
+test_release_dispatch_refuses_unresolved_source_without_sending() {
+    setup dispatch_invalid_source
+    STAGED_SOURCE_SHA=short
+    run_release --resume
+    [[ $STATUS -eq 0 && ! -s "$CASE/dispatch-calls.jsonl" && ! -e "$DSR_STATE_DIR/dispatch" ]] &&
+        jq -e '.details.dispatch.status=="failed" and .details.dispatch.exit_code==4' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_explicit_config_false_prevents_delivery() {
+    local scope config_file
+    for scope in repo global; do
+        setup "dispatch_disabled_$scope"
+        unset DSR_DISPATCH_ENABLED DSR_DISPATCH_REPOS
+        if [[ "$scope" == repo ]]; then config_file="$ACT_REPOS_DIR/tool.yaml"
+        else config_file="$DSR_CONFIG_FILE"; fi
+        printf 'targets: [linux/amd64]\ndispatch:\n  enabled: false\n  repos: [owner/downstream]\n' > "$config_file"
+        run_release --resume
+        [[ $STATUS -eq 0 && ! -s "$CASE/dispatch-calls.jsonl" && ! -e "$DSR_STATE_DIR/dispatch" ]] &&
+            jq -e '.details.dispatch.status=="skipped"' "$CASE/stdout" >/dev/null || return 1
+        # A real configuration reader must also enable the otherwise identical
+        # positive case; missing yq cannot turn this into a false passing skip.
+        printf 'targets: [linux/amd64]\ndispatch:\n  enabled: true\n  repos: [owner/downstream]\n' > "$config_file"
+        run_release --resume
+        [[ $STATUS -eq 0 ]] && jq -e -s 'length==1' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+            jq -e '.details.dispatch.status=="completed"' "$CASE/stdout" >/dev/null || return 1
+    done
+}
+
+test_release_dispatch_rechecks_publication_between_destinations() {
+    setup dispatch_between_destinations
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=draft-after-first
+    run_release --resume
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] &&
+        jq -e -s 'length==1 and .[0].destination=="owner/a"' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        jq -e '.details.dispatch.status=="failed" and .details.dispatch.exit_code==7 and
+            [.details.dispatch.results[].outcome]==["accepted","pending"]' "$CASE/stdout" >/dev/null &&
+        jq -e '[.deliveries[].history|length]==[1,0]' "$outbox" >/dev/null || return 1
+    DISPATCH_MODE=success
+    jq '.draft=false' "$CASE/release.json" > "$CASE/restored-release.json" &&
+        mv "$CASE/restored-release.json" "$CASE/release.json" || return 1
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -eq 0 ]] &&
+        jq -e -s 'length==2 and [.[].destination]==["owner/a","owner/b"]' "$CASE/dispatch-calls.jsonl" >/dev/null
+}
+
+test_release_dispatch_saved_outbox_recovers_without_local_artifacts() {
+    setup dispatch_saved_recovery
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=reject
+    # An older GitHub asset has no server digest. Recovery must prove its
+    # actual remote bytes even after the producer's local artifacts disappear.
+    remote_put payload.bin "$CASE/artifacts/payload.bin" false || return 1
+    run_release --resume
+    local outbox downloads_before remote_id
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] || return 1
+    cp "$CASE/dispatch/owner_b.json" "$CASE/b.before" || return 1
+    cp "$outbox" "$CASE/outbox.before" || return 1
+    mv "$CASE/artifacts" "$CASE/retained-artifacts" || return 1
+    DISPATCH_MODE=success
+    export DSR_RUN_ID=changed-process DSR_DISPATCH_REPOS=owner/unrelated DSR_DISPATCH_EVENT=changed-event
+    remote_id=$(jq -r '.[]|select(.name=="payload.bin")|.id' "$CASE/inventory.json")
+    cp "$CASE/remote/$remote_id" "$CASE/remote.before" || return 1
+    printf 'evil payload\n' > "$CASE/remote/$remote_id"
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -eq 7 ]] &&
+        jq -e -s 'length==2' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        cmp -s "$outbox" "$CASE/outbox.before" || return 1
+    cp "$CASE/remote.before" "$CASE/remote/$remote_id" || return 1
+    downloads_before=$(grep -c '^DOWNLOAD ' "$CALLS")
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -eq 0 && $(grep -c '^DOWNLOAD ' "$CALLS") -gt "$downloads_before" ]] &&
+        jq -e -s 'length==3 and ([.[]|select(.destination=="owner/a")]|length)==1 and
+            ([.[]|select(.destination=="owner/b")]|length)==2' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        cmp -s "$CASE/b.before" "$CASE/dispatch/owner_b.json" &&
+        jq -e --arg outbox "$outbox" '.command=="release-dispatch" and .exit_code==0 and
+            .details.status=="accepted" and .details.outbox_file==$outbox and
+            all(.details.results[]; .outcome=="accepted")' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_saved_status_is_read_only_without_auth() {
+    setup dispatch_saved_status
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=reject
+    run_release --resume
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] || return 1
+    cp "$outbox" "$CASE/outbox.before" || return 1
+    cp "$CALLS" "$CASE/calls.before" || return 1
+    # A failed auth lookup is itself observable, even if it never sends HTTP.
+    _dp_get_token() { printf 'AUTH-ATTEMPT\n' >> "$CALLS"; return 3; }
+    unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+    run_dispatch_recovery --outbox "$outbox" --status
+    [[ $STATUS -eq 1 ]] &&
+        cmp -s "$outbox" "$CASE/outbox.before" && cmp -s "$CALLS" "$CASE/calls.before" &&
+        jq -e '.command=="release-dispatch" and .exit_code==1 and .details.status=="incomplete" and
+            [.details.results[].outcome]==["accepted","rejected"]' "$CASE/stdout" >/dev/null || return 1
+    run_dispatch_recovery --outbox "$outbox" --dry-run
+    [[ $STATUS -eq 0 ]] &&
+        cmp -s "$outbox" "$CASE/outbox.before" && cmp -s "$CALLS" "$CASE/calls.before" &&
+        jq -e '.command=="release-dispatch" and .status=="dry_run" and .exit_code==0 and
+            .details.mode=="dry_run" and [.details.results[].outcome]==["accepted","rejected"]' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_saved_uncertain_requires_explicit_retry() {
+    setup dispatch_saved_uncertain
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=uncertain
+    run_release --resume
+    local outbox
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] || return 1
+    cp "$CASE/dispatch/owner_b.json" "$CASE/b.before" || return 1
+    DISPATCH_MODE=success
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -eq 8 ]] && jq -e -s 'length==2' "$CASE/dispatch-calls.jsonl" >/dev/null || return 1
+    run_dispatch_recovery --outbox "$outbox" --retry-uncertain
+    [[ $STATUS -eq 0 ]] &&
+        jq -e -s 'length==3 and ([.[]|select(.destination=="owner/a")]|length)==1' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+        cmp -s "$CASE/b.before" "$CASE/dispatch/owner_b.json" &&
+        jq -e '.deliveries[1].history[1].resend_uncertain==true and
+            .deliveries[1].history[1].outcome=="accepted"' "$outbox" >/dev/null &&
+        jq -e '.command=="release-dispatch" and .exit_code==0 and .details.status=="accepted"' "$CASE/stdout" >/dev/null
+}
+
+test_release_dispatch_saved_recovery_refuses_remote_drift() {
+    setup dispatch_saved_drift
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=reject
+    run_release --resume
+    local outbox change
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] || return 1
+    cp "$outbox" "$CASE/outbox.before" || return 1
+    cp "$CASE/release.json" "$CASE/release.before" || return 1
+    cp "$CASE/inventory.json" "$CASE/inventory.before" || return 1
+    DISPATCH_MODE=success
+    for change in draft tag assets identity; do
+        cp "$CASE/release.before" "$CASE/release.json" || return 1
+        cp "$CASE/inventory.before" "$CASE/inventory.json" || return 1
+        STAGED_SOURCE_SHA=""
+        case "$change" in
+            draft) jq '.draft=true' "$CASE/release.before" > "$CASE/release.json" || return 1 ;;
+            tag) STAGED_SOURCE_SHA=2222222222222222222222222222222222222222 ;;
+            assets) jq 'map(.digest="sha256:"+("0"*64))' "$CASE/inventory.before" > "$CASE/inventory.json" || return 1 ;;
+            identity) jq '.id=10' "$CASE/release.before" > "$CASE/release.json" || return 1 ;;
+        esac
+        run_dispatch_recovery --outbox "$outbox"
+        [[ $STATUS -ne 0 ]] &&
+            jq -e -s 'length==2' "$CASE/dispatch-calls.jsonl" >/dev/null &&
+            cmp -s "$outbox" "$CASE/outbox.before" || return 1
+    done
+    # Prove the preceding refusals came from changed remote evidence, not an
+    # unrelated failure to admit every saved plan or dispatch destination.
+    cp "$CASE/release.before" "$CASE/release.json" || return 1
+    cp "$CASE/inventory.before" "$CASE/inventory.json" || return 1
+    STAGED_SOURCE_SHA=""
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -eq 0 ]] && jq -e -s 'length==3' "$CASE/dispatch-calls.jsonl" >/dev/null
+}
+
+test_release_dispatch_saved_state_is_validated_before_network() {
+    setup dispatch_saved_invalid
+    export DSR_DISPATCH_REPOS=owner/a,owner/b
+    DISPATCH_MODE=reject
+    run_release --resume
+    local outbox filter
+    outbox=$(jq -r '.details.dispatch.outbox_file // empty' "$CASE/stdout")
+    [[ $STATUS -eq 0 && -f "$outbox" ]] || return 1
+    cp "$outbox" "$CASE/outbox.before" || return 1
+    cp "$CALLS" "$CASE/calls.before" || return 1
+    DISPATCH_MODE=success
+    run_dispatch_recovery --outbox "$outbox" --status
+    [[ $STATUS -eq 1 ]] && cmp -s "$CALLS" "$CASE/calls.before" &&
+        jq -e '.details.status=="incomplete" and
+            [.details.results[].outcome]==["accepted","rejected"]' "$CASE/stdout" >/dev/null || return 1
+    for filter in '.schema_version=99' '.plan.requests[1].request_sha256=("0"*64)' \
+        '.plan.requests[1].body|=(fromjson|.event_type="changed-event"|tojson)' \
+        '.deliveries[1].history[0].request_sha256=("0"*64)'; do
+        jq "$filter" "$CASE/outbox.before" > "$outbox" || return 1
+        cp "$outbox" "$CASE/tampered.before" || return 1
+        run_dispatch_recovery --outbox "$outbox"
+        [[ $STATUS -ne 0 ]] && cmp -s "$outbox" "$CASE/tampered.before" &&
+            cmp -s "$CALLS" "$CASE/calls.before" || return 1
+    done
+    cp "$CASE/outbox.before" "$outbox" || return 1
+    chmod 644 "$outbox" || return 1
+    run_dispatch_recovery --outbox "$outbox"
+    [[ $STATUS -ne 0 ]] && cmp -s "$outbox" "$CASE/outbox.before" &&
+        cmp -s "$CALLS" "$CASE/calls.before"
 }
 
 test_invalid_journal_is_not_upload_authority() {
@@ -1510,6 +1895,19 @@ for test in test_saved_name_missing_remotely_is_uploaded test_identical_remote_i
     test_remote_drift_after_upload_prevents_success test_release_visibility_drift_prevents_dispatch \
     test_checkpoint_symlink_failure_preserves_foreign_file test_checkpoint_receipt_is_bound_and_private \
     test_partial_release_resumes_only_missing_upload test_completed_release_resume_does_not_reupload \
+    test_release_dispatch_accepted_outbox_survives_new_process_ids \
+    test_release_dispatch_retries_only_rejected_destination \
+    test_release_dispatch_uncertain_requires_explicit_retry \
+    test_release_dispatch_custom_event_and_canonical_payload \
+    test_release_dispatch_plan_drift_preserves_original_work \
+    test_release_dispatch_refuses_unresolved_source_without_sending \
+    test_release_dispatch_explicit_config_false_prevents_delivery \
+    test_release_dispatch_rechecks_publication_between_destinations \
+    test_release_dispatch_saved_outbox_recovers_without_local_artifacts \
+    test_release_dispatch_saved_status_is_read_only_without_auth \
+    test_release_dispatch_saved_uncertain_requires_explicit_retry \
+    test_release_dispatch_saved_recovery_refuses_remote_drift \
+    test_release_dispatch_saved_state_is_validated_before_network \
     test_invalid_journal_is_not_upload_authority test_empty_artifacts_are_not_a_release \
     test_unmanifested_directory_is_refused test_artifacts_must_come_from_the_tagged_commit \
     test_draft_request_refuses_published_release test_wrong_repository_upload_url_is_rejected \

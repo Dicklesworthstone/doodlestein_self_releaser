@@ -3,9 +3,70 @@
 `src/dispatch.sh` implements the handoff from a completed release to downstream
 checksum, package-formula, and canary workflows (bead `bd-1jt.3.7`). The release
 API now persists a local outbox rather than forgetting delivery results every
-process invocation.
+process invocation. The public `dsr release --dispatch` command uses the same
+outbox engine after its publication checks succeed.
+
+## Public release command
+
+```bash
+dsr release ntm 1.2.3 --dispatch --dispatch-repos owner/checksums,owner/formulas
+```
+
+The release command retains its `dsr_release` default event; select another with
+`--dispatch-event NAME`. It preserves the `tool`, `version`, `tag`, `repo`, `sha`,
+`run_id`, and `release_url` payload fields, and adds `source_repo` and
+`delivery_id`. `version` omits the leading `v`, `tag` retains it, and `run_id` is
+`release-<GitHub-release-ID>`. A verified source commit is required; an unresolved
+commit never becomes an `unknown` source assertion.
+
+The outbox namespace is the normalized source repository plus its GitHub release
+ID. A different process ID or version spelling cannot start another delivery.
+Changed events, destinations, source commits, tool aliases, or release evidence
+conflict with the saved plan. An intentionally replaced release has a new ID.
+Repository and global `dispatch.enabled: false` settings suppress delivery even
+when destinations are configured; command-line and environment overrides retain
+their precedence.
+
+The saved plan binds the published release ID, tag commit, URL, prerelease mode,
+and complete paginated asset inventory. Before each POST, including a rate-limit
+retry, DSR rechecks that the release is still public and that its tag and assets
+have not changed. Assets without a GitHub digest are downloaded by asset ID and
+hashed again. Dispatch cannot turn a failed publication or an explicitly
+retained draft into a downstream event.
+
+Publication and delivery have separate outcomes: a successful release remains
+successful when downstream delivery is incomplete. JSON reports
+`details.dispatch.status`, `exit_code`, `outbox_file`, and per-destination
+`results`. HTTP acceptance does not establish that a downstream workflow ran.
+
+Recover the saved handoff directly, including after a strict release has already
+been published:
+
+```bash
+dsr release dispatch --outbox /absolute/path/to/dispatch/RELEASE_KEY/state.json --status
+dsr release dispatch --outbox /absolute/path/to/dispatch/RELEASE_KEY/state.json
+dsr release dispatch --outbox /absolute/path/to/dispatch/RELEASE_KEY/state.json --retry-uncertain
+```
+
+Use the exact path returned in release JSON or diagnostics. Recovery needs no
+local build artifacts and does not reread destination configuration, upload
+assets, or publish the release again. It validates the saved request hashes,
+delivery identities, history, private file ownership and canonical location,
+then retries only eligible unfinished deliveries after the public-release gate.
+Missing or corrupt state cannot be replaced with a fresh fan-out. Already
+accepted destinations remain untouched.
+
+`--status` is an offline, read-only inspection and returns the saved delivery
+status, including nonzero for incomplete work. `--dry-run` is also offline and
+read-only, returning a labeled preview with exit zero; it does not qualify the
+current remote release. Ordinary recovery leaves uncertain deliveries alone.
+After checking the receiver, use `--retry-uncertain` to authorize an exact-byte
+resend, which can duplicate a previously accepted event. The original release
+command also accepts `--dispatch-retry-uncertain` when resuming publication.
 
 ## Release fan-out
+
+The standalone module can also receive an explicitly supplied source identity:
 
 ```bash
 bash src/dispatch.sh release ntm v1.2.3 \
@@ -154,15 +215,16 @@ Typical exits are 0 for acknowledged completion or an explicitly labeled plan,
 1 for incomplete fan-out or local I/O failure, 2 for plan/state/lock conflict,
 3 for missing credentials/dependencies, 4 for invalid arguments, 7 for a single
 request's definitive rejection, and 8 for uncertain delivery or an exhausted
-single-request rate limit. These functions do not automatically hook into the
-monolithic `dsr release` command; call the release handoff after the selected
-release verification and publication gates succeed.
+single-request rate limit. These are also the saved-handoff recovery command's
+exits; the publishing command separately reports downstream failure in its
+dispatch details without changing successful publication into an upload error.
 
 ## Regression tests
 
 ```bash
 bash scripts/tests/test_dispatch_delivery.sh
 bash scripts/tests/test_dispatch_outbox.sh
+bash scripts/tests/test_release_resume.sh
 bats tests/unit/test_dispatch.bats
 ```
 

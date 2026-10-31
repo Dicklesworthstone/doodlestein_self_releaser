@@ -722,6 +722,7 @@ dsr release --repo <name> --version <tag> [--draft] [--prerelease] [--dispatch]
 | `--no-dispatch` | false | Disable repository dispatch for this run |
 | `--dispatch-event` | `dsr_release` | Override dispatch event type |
 | `--dispatch-repos` | config/env | Comma-separated override of dispatch targets |
+| `--dispatch-retry-uncertain` | false | Enable dispatch and deliberately resend uncertain saved deliveries; duplicates are possible |
 | `--no-manifest` | false | Upload an artifacts directory that has no build manifest, as-is |
 | `--resume` | false | Reverify retained uploads and complete an owned interrupted publication |
 | `--sbom` | `sbom.enabled`, default false | Generate and verify complete SBOM coverage before ordinary publication |
@@ -742,6 +743,32 @@ closed.
 An upload, inventory, source, or publication failure suppresses dispatch and
 upgrade hooks. A failed publication can be returned to draft only while its
 current nonce and metadata still prove ownership.
+
+Downstream dispatch uses a persistent outbox keyed by the source repository and
+GitHub release ID. Accepted destinations are skipped across process restarts;
+definitively rejected destinations can retry, and uncertain POSTs require an
+explicit resend decision. The complete request plan and verified public release
+are retained. Before each POST, DSR rechecks the release ID, visibility, tag
+commit, and exact paginated asset inventory, downloading and hashing assets when
+GitHub supplies no digest. Changed plans or publication evidence refuse delivery.
+Explicit `dispatch.enabled: false` in repository or global configuration remains
+disabled even when destination repositories are present.
+
+Successful publication retains its successful exit status if a downstream hook
+fails. Inspect `details.dispatch.status`, `exit_code`, `outbox_file`, and `results`
+for the separate delivery outcome. The payload preserves the configured event
+(`dsr_release` by default), uses `version` without a leading `v`, and uses the
+stable `run_id: release-<GitHub-release-ID>` plus a per-destination `delivery_id`.
+
+Use `dsr release dispatch --outbox /absolute/path/state.json` to recover only the
+saved downstream handoff, including for an already-public strict release. It
+uses the saved exact requests and requires the same public release; it does not
+need local build artifacts or upload or publish again. Add `--retry-uncertain`
+only to authorize resending unknown outcomes. `--status` reads the saved outcome
+offline and preserves its exit code; `--dry-run` gives an offline preview with
+exit zero. Both preserve the state bytes and make no network requests. Missing,
+conflicting, corrupt, nonprivate, or relocated state is refused. See
+[dispatch recovery](DISPATCH.md) for the full contract.
 
 Ordinary creation requires Python 3 to preserve its original POST response and
 immutable publication intent in a private directory under

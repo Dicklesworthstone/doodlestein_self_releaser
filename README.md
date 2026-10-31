@@ -718,6 +718,8 @@ Upload artifacts to GitHub Release.
 dsr release --repo ntm --version v1.2.3         # Upload to release
 dsr release --repo ntm --version v1.2.3 --draft # Keep the verified release private
 dsr release --repo ntm --version v1.2.3 --dispatch # Trigger repository dispatch hooks
+dsr release dispatch --outbox /absolute/path/state.json --status # Inspect saved deliveries
+dsr release dispatch --outbox /absolute/path/state.json          # Recover unfinished deliveries
 dsr --dry-run release --repo ntm --version v1.2.3   # Show the exact upload plan, change nothing
 ```
 
@@ -726,6 +728,13 @@ and metadata sidecar matches the complete remote inventory. DSR then publishes
 the original release ID and verifies it again before running post-release
 hooks. Existing source tags must match the pinned commit. A tag proved absent
 on GitHub is created at that commit when publishing and verified afterward.
+
+Downstream dispatch retains each destination's acknowledgement in a persistent
+outbox bound to the GitHub release ID. Retrying skips accepted destinations and
+keeps uncertain requests for an explicit `--retry-uncertain` decision. Recover a
+saved handoff with the `outbox_file` path from release JSON, without uploading or
+publishing again; DSR rechecks the public release, source tag, and complete asset
+inventory before sending. See [dispatch and recovery](docs/DISPATCH.md).
 
 Retry interrupted uploads or publication with the same artifact directory:
 
