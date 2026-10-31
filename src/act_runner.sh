@@ -1905,7 +1905,12 @@ _act_run_with_timeout() (
         }
         trap '_act_timeout_cancel 130' INT
         trap '_act_timeout_cancel 143' TERM
-        "$cmd" "$seconds" "$@" <&0 &
+        # A compiler, transport, or act process may ignore TERM. Bound both
+        # deadline and explicit cancellation cleanup in timeout's own group;
+        # never send a delayed signal to a PID/group that we have reaped.
+        # GNU timeout preserves ordinary command statuses and reports 137
+        # when this final group-wide KILL is necessary.
+        "$cmd" --kill-after=5 "$seconds" "$@" <&0 &
         timeout_pid=$!
         if (( cancel_status != 0 )); then
             _act_timeout_cancel "$cancel_status"
@@ -2311,33 +2316,22 @@ act_run_workflow() {
     # Use PIPESTATUS to capture the actual command exit code, not tee's
     local timeout_cmd
     timeout_cmd=$(_act_timeout_cmd)
-    if [[ -n "$timeout_cmd" ]]; then
-        if [[ -n "$isolated_home" ]]; then
-            HOME="$isolated_home" \
-            XDG_CONFIG_HOME="$isolated_home/.config" \
-            XDG_CACHE_HOME="$isolated_home/.cache" \
-            "$timeout_cmd" "$ACT_TIMEOUT" "${act_cmd[@]}" \
-                --directory "$repo_path" \
-                2>&1 | tee "$log_file"
-        else
-            "$timeout_cmd" "$ACT_TIMEOUT" "${act_cmd[@]}" \
-                --directory "$repo_path" \
-                2>&1 | tee "$log_file"
-        fi
-    else
+    if [[ -z "$timeout_cmd" ]]; then
         _log_warn "timeout command not available; running act without timeout"
-        if [[ -n "$isolated_home" ]]; then
-            HOME="$isolated_home" \
-            XDG_CONFIG_HOME="$isolated_home/.config" \
-            XDG_CACHE_HOME="$isolated_home/.cache" \
-            "${act_cmd[@]}" \
-                --directory "$repo_path" \
-                2>&1 | tee "$log_file"
-        else
-            "${act_cmd[@]}" \
-                --directory "$repo_path" \
-                2>&1 | tee "$log_file"
-        fi
+    fi
+    # timeout creates a separate process group. The shared wrapper forwards
+    # orchestration cancellation into that group and waits for escalation.
+    if [[ -n "$isolated_home" ]]; then
+        HOME="$isolated_home" \
+        XDG_CONFIG_HOME="$isolated_home/.config" \
+        XDG_CACHE_HOME="$isolated_home/.cache" \
+        _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
+            --directory "$repo_path" \
+            2>&1 | tee "$log_file"
+    else
+        _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
+            --directory "$repo_path" \
+            2>&1 | tee "$log_file"
     fi
     local exit_code=${PIPESTATUS[0]}
 

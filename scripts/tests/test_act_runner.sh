@@ -841,7 +841,6 @@ EOF
     original_act_check="$(declare -f act_check)"
 
     act_check() { return 0; }
-    timeout() { shift; "$@"; }
 
     # A runner-image mapping keeps non-interactive act out of its first-run
     # survey (see test_act_run_workflow_requires_runner_image_mapping).
@@ -863,7 +862,6 @@ EOF
     fi
 
     PATH="$original_path"
-    unset -f timeout 2>/dev/null || true
     if [[ -n "$original_act_check" ]]; then
         eval "$original_act_check"
     else
@@ -904,7 +902,6 @@ test_act_run_workflow_requires_runner_image_mapping() {
             unset XDG_CONFIG_HOME CI
             [[ "$scenario" == xdg-actrc ]] && export XDG_CONFIG_HOME="$home/xdg"
             act_check() { return 0; }
-            timeout() { shift; "$@"; }
             if [[ "$scenario" == repo-override ]]; then
                 act_run_workflow "$TEMP_DIR" ".github/workflows/release.yml" "" "push" "" \
                     -P ubuntu-latest=img
@@ -983,7 +980,6 @@ EOF
     HOME="$real_home"
 
     act_check() { return 0; }
-    timeout() { shift; "$@"; }
 
     act_run_workflow "$TEMP_DIR" ".github/workflows/parent-write.yml" "" "push" >/dev/null 2>&1
 
@@ -1006,7 +1002,6 @@ EOF
 
     HOME="$original_home"
     PATH="$original_path"
-    unset -f timeout 2>/dev/null || true
     if [[ -n "$original_act_check" ]]; then
         eval "$original_act_check"
     else
@@ -1084,6 +1079,158 @@ PY
         log_pass "cancellation and deadline drain descendants; stdin and exit status survive"
     else
         log_fail "timeout subprocess lifetime regression"
+    fi
+}
+
+test_workflow_process_cancellation() {
+    log_test "Real workflow cancellation and bounded timeout escalation"
+    if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+module = sys.argv[1]
+root = Path(tempfile.mkdtemp(prefix='dsr-workflow-cancellation-'))
+print('Retained workflow cancellation fixture:', root, flush=True)
+failures = []
+checks = 0
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+def running(pid):
+    status = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                            capture_output=True, text=True).stdout.strip()
+    return bool(status) and not status.startswith('Z')
+
+program = '''#!/usr/bin/env python3
+import json, os, signal, time
+from pathlib import Path
+if os.environ['DSR_FIXTURE_RESIST_TERM'] == '1':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(os.environ['DSR_FIXTURE_MARKER']).write_text(json.dumps({'pid': os.getpid(), 'group': os.getpgrp()}))
+with open(os.environ['DSR_FIXTURE_BEAT'], 'ab', buffering=0) as output:
+    while True:
+        output.write(b'x')
+        time.sleep(0.02)
+'''
+
+sentinel = subprocess.Popen(['sleep', '300'], start_new_session=True)
+try:
+    for case, workflow, resistant, deadline, isolated in (
+            ('helper-resistant-cancel', False, True, False, False),
+            ('helper-resistant-deadline', False, True, True, False),
+            ('workflow-cancel', True, False, False, False),
+            ('workflow-isolated-cancel', True, False, False, True),
+            ('workflow-resistant-cancel', True, True, False, False),
+            ('workflow-resistant-deadline', True, True, True, False)):
+        directory = root / case
+        directory.mkdir()
+        binary = directory / 'act'
+        binary.write_text(program)
+        binary.chmod(0o755)
+        marker, heartbeat = directory / 'pid.json', directory / 'heartbeat'
+        workflow_file = directory / 'workflow.yml'
+        workflow_file.write_text('name: fixture\n# ' + ('../sibling' if isolated else 'ordinary') + '\n')
+        env = os.environ.copy()
+        env.update(PATH=str(directory) + os.pathsep + env['PATH'],
+                   DSR_FIXTURE_MARKER=str(marker), DSR_FIXTURE_BEAT=str(heartbeat),
+                   DSR_FIXTURE_RESIST_TERM='1' if resistant else '0',
+                   DSR_CACHE_DIR=str(directory / 'cache'),
+                   ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
+                   ACT_LOGS_DIR=str(directory / 'logs'),
+                   ACT_TIMEOUT='1' if deadline else '30')
+        if workflow:
+            script = '''source "$1"
+act_check() { return 0; }
+act_platform_uses_act() { return 0; }
+act_get_job_for_target() { printf 'fixture\\n'; }
+act_get_flags() { printf '%s\\n' '-P ubuntu-latest=fixture'; }
+ACT_REPO_WORKFLOW=workflow.yml
+ACT_REPO_LOCAL_PATH=$2
+_act_run_target_worker fixture v1 22222222-2222-4222-8222-222222222222 \\
+    linux/amd64 1 "$2/worker.log" "$2/result.json" false null '{}' '' '' act-local release
+'''
+        else:
+            script = '''source "$1"
+_act_run_with_timeout "$ACT_TIMEOUT" act
+'''
+        output = open(directory / 'output.log', 'wb')
+        process = subprocess.Popen(['bash', '-c', script, '_', module, str(directory)],
+                                   env=env, stdout=output, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        target = None
+        try:
+            for _ in range(150):
+                if marker.exists() and marker.stat().st_size:
+                    target = json.loads(marker.read_text())
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.02)
+            check(case + ': real command started', target is not None)
+            if target is None:
+                continue
+            check(case + ': timeout owns a nested group', target['group'] != process.pid)
+            if not deadline:
+                # This is the real orchestration worker for workflow cases;
+                # helper cases model the enclosing orchestration group signal.
+                if workflow:
+                    process.send_signal(signal.SIGTERM)
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+            retired_by = time.monotonic() + 8
+            while running(target['pid']) and time.monotonic() < retired_by:
+                time.sleep(0.05)
+            stopped = not running(target['pid'])
+            check(case + ': command stops within bounded cleanup', stopped)
+            if stopped:
+                size = heartbeat.stat().st_size
+                time.sleep(0.1)
+                check(case + ': no post-cancellation work', heartbeat.stat().st_size == size)
+            try:
+                status = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                status = None
+            if deadline:
+                # GNU timeout uses 137 when its escalation kills the whole
+                # group; preserve that failure rather than inventing success.
+                expected = (6,) if workflow else (137,)
+            else:
+                expected = (130,) if workflow else (-signal.SIGTERM, 143)
+            check(case + ': caller exits with the intended failure', status in expected)
+            check(case + ': unrelated process remains alive', sentinel.poll() is None)
+        finally:
+            # Only this fixture's newly created groups are eligible for cleanup.
+            for group in (process.pid, None if target is None else target['group']):
+                if group is not None:
+                    try:
+                        os.killpg(group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            process.wait(timeout=5)
+            output.close()
+finally:
+    sentinel.terminate()
+    sentinel.wait(timeout=5)
+
+(root / 'summary.json').write_text(json.dumps({'checks': checks, 'failures': failures}) + '\n')
+print('Workflow lifetime: %d checks, %d failures' % (checks, len(failures)), flush=True)
+sys.exit(bool(failures))
+PY
+    then
+        log_pass "Workflow cancellation reaches nested timeout groups and escalates resistant commands"
+    else
+        log_fail "Workflow or timeout process lifetime regression"
     fi
 }
 
@@ -1263,6 +1410,7 @@ main() {
     fi
     if [[ "${1:-}" == "--timeout-only" ]]; then
         test_timeout_descendant_cancellation
+        test_workflow_process_cancellation
         [[ "$FAIL_COUNT" -eq 0 ]]
         return
     fi
@@ -1292,6 +1440,7 @@ main() {
     test_act_run_workflow_isolates_parent_write_workflows
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
+    test_workflow_process_cancellation
     test_unix_native_build_guard
 
     echo ""
