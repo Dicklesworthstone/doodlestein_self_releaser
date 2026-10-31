@@ -17,6 +17,9 @@ bash src/sbom.sh artifacts /srv/release/artifacts \
   --selection /srv/policy/inputs.json --output-dir /srv/release/sboms
 bash src/sbom.sh verify-artifacts /srv/release/artifacts \
   --selection /srv/policy/inputs.json --output-dir /srv/release/sboms
+bash src/sbom_release.sh publish /srv/release/artifacts \
+  --repo owner/tool --tag v1.2.3 --selection /srv/policy/inputs.json \
+  --output-dir /srv/release/sboms
 ```
 
 Both SPDX and CycloneDX batch modes scan each selected file through the existing
@@ -42,9 +45,20 @@ commands still use `top-level-artifacts-v1`; default discovery cannot silently
 adopt an explicitly selected aggregate. The public SBOMs remain unauthenticated
 scanner observations. Signature and complete-build qualification are separate.
 
+Publication accepts the same `--selection FILE`. It verifies the complete local
+inventory, pins the selection bytes, and rechecks them before and after each
+upload. A lost upload acknowledgment can be reconciled by retrying the same
+selection; existing document and inventory bytes are verified before reuse.
+Independent remote verification still requires the caller-selected SBOM manifest
+SHA-256. An explicit manifest's declared data/license files must actually exist
+in the observed remote inventory and pass the same size, digest and byte checks
+as executable payloads. Missing selected metadata, unexpected binaries and
+changed assets remain errors.
+
 Python 3 is required only for explicit selection parsing (standard library,
 without site initialization). Syft is still required to create new documents;
 verification and complete retries need no scanner. Run
 `bash scripts/tests/test_sbom_selection.sh`. Tests execute the complete CLI,
-real hashing, staging and receipts with an explicit Syft executable fixture;
-they do not qualify native Syft package recognition or remote publication.
+real hashing, staging, receipts, publication and remote verification with explicit
+Syft and GitHub transport fixtures. They do not qualify native Syft package
+recognition or perform live publication.

@@ -10,6 +10,9 @@ python3 -I -S - "${DSR_TEST_SBOM_MODULE:-$ROOT/src/sbom.sh}" "$@" <<'PY'
 import hashlib, json, os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 MODULE = str(Path(sys.argv.pop(1)).resolve())
+REMOTE = str(Path(os.environ.get('DSR_TEST_SBOM_RELEASE_MODULE',
+                                str(Path(MODULE).with_name('sbom_release.sh')))).resolve())
+TRANSPORT_FIXTURE = str(Path(MODULE).parent.parent / 'scripts/tests/test_sbom_remote.sh')
 SCANNER = r'''#!/bin/sh
 exec python3 -I -S - "$@" <<'SCAN_PY'
 import hashlib, json, os, sys
@@ -186,6 +189,180 @@ class SelectionTests(unittest.TestCase):
         self.rows = [{'name':p.name,'sha256':digest(p)} for p in sorted(self.root.iterdir())]
         self.save_selection(self.rows); proof = self.accepted(self.call())
         self.assertEqual(len(json.loads(proof.read_bytes())['artifacts']),5); self.assertEqual(self.scans(),self.rows)
+
+
+class PublicationSelectionTests(unittest.TestCase):
+    """Real inventory generation/publication/verification; fixture HTTP/Syft.
+
+    Reuse the existing GitHub transport fixture, keeping all payload selection,
+    document validation, hashing, receipt, retry, and publication gates real.
+    No network, scanner qualification, signature, or build claim is made.
+    """
+    setUpClass = classmethod(SelectionTests.setUpClass.__func__)
+    scan = SelectionTests.call
+    accepted = SelectionTests.accepted
+    refused = SelectionTests.refused
+    scans = SelectionTests.scans
+    save_selection = SelectionTests.save_selection
+
+    def setUp(self):
+        SelectionTests.setUp(self)
+        (self.root / 'NOTICE').write_bytes(b'owned release notice\n')
+        self.rows = [{'name':p.name,'sha256':digest(p)} for p in sorted(self.root.iterdir())]
+        self.save_selection(self.rows)
+        self.remote = self.work / 'remote'; self.remote.mkdir()
+        self.bodies = self.remote / 'bytes'; self.bodies.mkdir()
+        self.inventory = self.remote / 'inventory.json'
+        assets = []
+        for ident, row in enumerate(self.rows, 101):
+            body = (self.root / row['name']).read_bytes()
+            (self.bodies / str(ident)).write_bytes(body)
+            assets.append(dict(id=ident, name=row['name'], state='uploaded', size=len(body),
+                               digest='sha256:'+row['sha256']))
+        self.inventory.write_text(json.dumps(assets))
+        (self.remote / 'repository.json').write_text(json.dumps(dict(id=17,node_id='REPO17',full_name='acme/tool')))
+        (self.remote / 'releases.json').write_text('[{"id":42,"tag_name":"v1.2.3"}]')
+        (self.remote / 'release.json').write_text(json.dumps(dict(id=42,node_id='REL42',tag_name='v1.2.3',
+            draft=True,prerelease=False,target_commitish='main',url='https://api.github.com/repos/acme/tool/releases/42',
+            upload_url='https://uploads.github.com/repos/acme/tool/releases/42/assets{?name,label}')))
+        (self.remote / 'tag.sha').write_text('1'*40+'\n')
+        self.uploads = self.work / 'uploads.log'
+
+    def publish(self, command='publish', *, explicit=True, options=(), fault='', fmt='spdx'):
+        env = {k:v for k,v in os.environ.items() if not k.startswith('BASH_FUNC_') and k not in ('BASH_ENV','ENV')}
+        env.update(DSR_SELECTION_CASE=str(self.work), DSR_SELECTION_FAULT=fault)
+        args = ['--repo','acme/tool','--tag','v1.2.3','--format',fmt]
+        if command == 'publish':
+            args = [str(self.root),*args,'--output-dir',str(self.output)]
+            if explicit: args += ['--selection',str(self.selection)]
+        else:
+            extension = 'spdx.json' if fmt == 'spdx' else 'cdx.json'
+            args += ['--manifest-sha256',digest(self.output / ('sbom-manifest.'+extension))]
+        program = r'''set -uo pipefail
+source "$1" || exit $?
+source "$2" || exit $?
+source "$3" || exit $?
+action=$4; shift 4
+CASE=$DSR_SELECTION_CASE; ART="$CASE/artifacts"; REMOTE="$CASE/remote"
+MODE=''; DOWNLOAD_MODE=''; LATE_MODE=''; SYFT_DISABLED=true
+# Only GitHub's upload boundary is substituted. The existing fixture supplies
+# real inventory reads, immutable-ID downloads, and recorded transport calls.
+gh_upload_asset_named() {
+    local url=$1 file=$2 name=$3 type=$4
+    [[ "$url" == 'https://uploads.github.com/repos/acme/tool/releases/42/assets{?name,label}' &&
+       "$file" == */proofs/* && "$type" == application/json ]] || return 99
+    printf '%s\n' "$name" >> "$CASE/uploads.log" || return 1
+    remote_add "$name" "$file" || return $?
+    if [[ "$DSR_SELECTION_FAULT" == selection-drift ]]; then
+        printf ' ' >> "$CASE/selection.json" || return 1
+    fi
+    [[ "$DSR_SELECTION_FAULT" != lost-ack ]] || return 8
+    jq -c --arg name "$name" '.[] | select(.name==$name)' "$REMOTE/inventory.json"
+}
+case "$action" in
+    publish) sbom_publish_artifacts "$@" ;;
+    verify) sbom_verify_release "$@" ;;
+    *) exit 99 ;;
+esac
+'''
+        return subprocess.run(['bash','-c',program,'_',TRANSPORT_FIXTURE,MODULE,REMOTE,command,*args,*options],
+                              capture_output=True,text=True,env=env,timeout=45)
+
+    def uploaded_names(self):
+        return self.uploads.read_text().splitlines() if self.uploads.exists() else []
+
+    def complete(self, result):
+        self.assertEqual(result.returncode,0,result.stderr)
+        value=json.loads(result.stdout); self.assertEqual(value['status'],'verified')
+        self.assertNotIn('authenticated',value)
+        return value
+
+    def test_complete_explicit_publication_verification_and_retry_both_formats(self):
+        for fmt, extension in (('spdx','spdx.json'),('cyclonedx','cdx.json')):
+            with self.subTest(format=fmt):
+                self.accepted(self.scan('artifacts','--format',fmt))
+                scans=self.scans(); before=len(self.uploaded_names())
+                value=self.complete(self.publish(fmt=fmt))
+                self.assertEqual(value['verification']['artifact_count'],4)
+                self.assertEqual(value['verification']['verification_policy'],'expected-manifest-sha256')
+                self.assertNotIn('authenticated',value['verification'])
+                expected=[r['name']+'.sbom.'+extension for r in self.rows]+['sbom-manifest.'+extension]
+                self.assertEqual(self.uploaded_names()[before:],expected)
+                for name in expected:
+                    row=next(r for r in json.loads(self.inventory.read_bytes()) if r['name']==name)
+                    self.assertEqual(digest(self.bodies / str(row['id'])),digest(self.output / name))
+                frozen=self.inventory.read_bytes()
+                self.complete(self.publish('verify',fmt=fmt))
+                retry=self.complete(self.publish(fmt=fmt))
+                self.assertEqual(retry['sbom_upload_attempts'],0)
+                self.assertFalse(retry['manifest_upload_attempted'])
+                self.assertEqual(self.inventory.read_bytes(),frozen)
+                self.assertEqual(len(self.uploaded_names()),before+5)
+                self.assertEqual(self.scans(),scans)
+
+    def test_explicit_policy_cannot_be_dropped_or_duplicated(self):
+        self.accepted(self.scan())
+        self.refused(self.publish(explicit=False))
+        self.refused(self.publish(options=('--selection',str(self.selection))))
+        self.assertEqual(self.uploaded_names(),[])
+
+    def test_missing_selected_metadata_fails_before_publication(self):
+        self.accepted(self.scan())
+        rows=[r for r in json.loads(self.inventory.read_bytes()) if r['name']!='runtime.json']
+        self.inventory.write_text(json.dumps(rows))
+        result=self.publish(); self.refused(result)
+        self.assertIn('Remote payload set differs',result.stderr)
+        self.assertEqual(self.uploaded_names(),[])
+
+    def test_unselected_metadata_stays_private_and_unexpected_binary_fails(self):
+        self.accepted(self.scan())
+        rows=json.loads(self.inventory.read_bytes())
+        rows.append(dict(id=999,name='operator.json',state='uploaded',size=1,digest=None))
+        self.inventory.write_text(json.dumps(rows))
+        (self.root / 'operator.json').write_text('private operator data')
+        self.complete(self.publish())
+        self.assertFalse(any(name.startswith('operator.json') for name in self.uploaded_names()))
+        rows=json.loads(self.inventory.read_bytes())
+        rows.append(dict(id=1000,name='unexpected-executable',state='uploaded',size=1,digest=None))
+        self.inventory.write_text(json.dumps(rows)); before=self.uploaded_names()
+        self.refused(self.publish('verify')); self.refused(self.publish())
+        self.assertEqual(self.uploaded_names(),before)
+
+    def test_selected_metadata_digest_and_download_tampering_fail(self):
+        self.accepted(self.scan())
+        rows=json.loads(self.inventory.read_bytes()); selected=next(r for r in rows if r['name']=='runtime.json')
+        selected['digest']='sha256:'+'0'*64
+        self.inventory.write_text(json.dumps(rows)); self.refused(self.publish())
+        self.assertEqual(self.uploaded_names(),[])
+        selected['digest']=None
+        self.inventory.write_text(json.dumps(rows))
+        (self.bodies / str(selected['id'])).write_bytes(b'x'*selected['size'])
+        result=self.publish(); self.refused(result)
+        self.assertIn('Downloaded release asset bytes do not match inventory',result.stderr)
+        self.assertEqual(self.uploaded_names(),[])
+
+    def test_changed_selection_stops_before_following_upload(self):
+        self.accepted(self.scan()); before=self.selection.read_bytes()
+        result=self.publish(fault='selection-drift'); self.refused(result)
+        self.assertIn('Artifact selection changed',result.stderr)
+        self.assertEqual(len(self.uploaded_names()),1)
+        self.assertFalse(any(r['name'].startswith('sbom-manifest.') for r in json.loads(self.inventory.read_bytes())))
+        self.selection.write_bytes(before)
+        self.complete(self.publish())
+        self.assertEqual(self.uploaded_names().count('LICENSE.sbom.spdx.json'),1)
+
+    def test_lost_acknowledgement_retains_and_reuses_selected_metadata_proof(self):
+        self.accepted(self.scan()); self.refused(self.publish(fault='lost-ack'))
+        self.assertEqual(self.uploaded_names(),['LICENSE.sbom.spdx.json'])
+        self.complete(self.publish())
+        self.assertEqual(self.uploaded_names().count('LICENSE.sbom.spdx.json'),1)
+        self.assertEqual(len(self.uploaded_names()),5)
+
+    def test_default_discovery_publication_preserves_existing_policy(self):
+        self.accepted(self.scan(explicit=False))
+        value=self.complete(self.publish(explicit=False))
+        self.assertEqual(value['verification']['artifact_count'],1)
+        self.assertEqual(self.uploaded_names(),['tool-linux.sbom.spdx.json','sbom-manifest.spdx.json'])
 
 if __name__ == '__main__': unittest.main(verbosity=2)
 PY

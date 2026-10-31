@@ -2276,10 +2276,15 @@ _act_workflow_needs_writable_parent() {
 _act_prepare_isolated_home() {
     local real_home="${HOME:-$PWD}"
     local cache_root="${DSR_CACHE_DIR:-${XDG_CACHE_HOME:-$real_home/.cache}/dsr}/act-homes"
-    local run_id
-    run_id="$(date +%Y%m%d-%H%M%S)-$$"
-
-    local isolated_home="$cache_root/$run_id"
+    local isolated_home
+    # Concurrent Bash workers inherit the same $$, and a retry can start in
+    # the same second. Allocate exclusively so their actrc append operations
+    # cannot combine settings in another invocation's HOME.
+    if ! mkdir -p "$cache_root" ||
+       ! isolated_home=$(umask 077; mktemp -d "$cache_root/$(date +%Y%m%d-%H%M%S)-$$.XXXXXXXX"); then
+        _log_error "Failed to allocate an isolated act home in: $cache_root"
+        return 1
+    fi
     local config_dir="$isolated_home/.config/act"
     local actrc="$config_dir/actrc"
 
@@ -2383,14 +2388,19 @@ act_run_workflow() {
         return 4
     fi
 
-    # Create run directories
-    local run_id
-    run_id="$(date +%Y%m%d-%H%M%S)-$$"
-    local artifact_dir="$ACT_ARTIFACTS_DIR/$run_id"
+    # A timestamp and $$ are shared by sibling Bash workers and quick
+    # retries. Reserve a fresh private upload directory atomically, then use
+    # its allocated identity for this invocation's independently owned log.
+    local artifact_dir
+    if ! mkdir -p "$ACT_ARTIFACTS_DIR" "$ACT_LOGS_DIR" ||
+       ! artifact_dir=$(umask 077; mktemp -d "$ACT_ARTIFACTS_DIR/$(date +%Y%m%d-%H%M%S)-$$.XXXXXXXX"); then
+        _log_error "Failed to allocate act run storage: $ACT_ARTIFACTS_DIR, $ACT_LOGS_DIR"
+        return 1
+    fi
+    local run_id="${artifact_dir##*/}"
     local log_file="$ACT_LOGS_DIR/$run_id.log"
-
-    if ! mkdir -p "$artifact_dir" "$ACT_LOGS_DIR"; then
-        _log_error "Failed to create run directories: $artifact_dir, $ACT_LOGS_DIR"
+    if ! (umask 077; set -o noclobber; : > "$log_file"); then
+        _log_error "Failed to reserve act run log without overwriting existing evidence: $log_file"
         return 1
     fi
 
@@ -2477,11 +2487,11 @@ act_run_workflow() {
         XDG_CACHE_HOME="$isolated_home/.cache" \
         _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
             --directory "$repo_path" \
-            2>&1 | tee "$log_file"
+            2>&1 | tee -a "$log_file"
     else
         _act_run_with_timeout "$ACT_TIMEOUT" "${act_cmd[@]}" \
             --directory "$repo_path" \
-            2>&1 | tee "$log_file"
+            2>&1 | tee -a "$log_file"
     fi
     local exit_code=${PIPESTATUS[0]}
 

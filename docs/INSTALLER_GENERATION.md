@@ -88,6 +88,42 @@ install_source_build owner/repo refs/tags/v1.2.3 go app ./new-build \
   --allow-build --install-toolchain --timeout 3600
 ```
 
+## Installation transactions and concurrent installers
+
+Generated ordinary installers serialize changes to each installation directory.
+They acquire a private `.dsr-install.lock` directory before checking overwrite
+permission or backing up installed executables, and hold it through staging,
+replacement, final verification, and any rollback. Release installation and
+explicit source installation use the same transaction. Two tools sharing a
+companion executable use the same directory lock, including when callers reach
+that directory through different symlink paths. Independent installation
+directories can proceed concurrently.
+
+A competing installer fails with an actionable busy/retry message and leaves the
+existing family unchanged. `--yes` authorizes replacement of executables; it does
+not override an active installation lock. The lock uses atomic directory creation
+on Linux, macOS, and FreeBSD, without requiring `flock` or Python on the installing
+machine. Its owner record and directory identities are checked before cleanup,
+which removes only the owning transaction's metadata and empty lock directory.
+
+Normal completion, overwrite refusal, installation failure, and handled
+interruptions release the lock after restoration finishes. If restoration fails,
+the installer retains its recovery files and lock for inspection. A process
+killed with an uncatchable signal or a machine interrupted during installation
+can also leave a lock behind. Inspect the owner record and the installation
+before manually removing an abandoned lock; installers never steal locks based
+on their age or a possibly reused process ID. Unexpected lock replacement fails
+closed and does not remove the replacement's resources.
+
+This coordinates cooperating installers; it is not a transaction against
+arbitrary same-user or privileged filesystem writers or a power-loss guarantee.
+The focused regression uses real generated installers, checksum verification,
+real filesystem renames and a signal to the public installer process:
+
+```bash
+bash scripts/tests/test_generated_installer_transactions.sh
+```
+
 ## Publication, failure and concurrent generation
 
 Generation validates the tool identifier before constructing configuration

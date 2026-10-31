@@ -7,8 +7,10 @@ on:
     paths:
       - .github/workflows/native-artifact-regression.yml
       - scripts/tests/test_native_artifact_build.sh
+      - scripts/tests/test_act_runner.sh
       - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_artifact_formats.sh
+      - scripts/tests/test_generated_installer_transactions.sh
       - dsr
       - src/act_runner.sh
       - src/artifact_naming.sh
@@ -16,6 +18,7 @@ on:
       - src/build_state.sh
       - src/config.sh
       - src/git_ops.sh
+      - src/install_gen.sh
       - src/packaging.sh
       - src/platforms.sh
       - src/slsa.sh
@@ -68,6 +71,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Validate concurrent workflow evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_act_runner.sh
+          bash scripts/tests/test_act_runner.sh --workflow-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workflow-isolation.log"
+          test -z "$(git status --porcelain)"
       - name: Validate typed additional artifact admission
         shell: bash
         run: |
@@ -77,6 +87,14 @@ jobs:
           bash -n scripts/tests/test_act_runner_native.sh
           bash scripts/tests/test_artifact_formats.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/artifact-formats.log"
           bash scripts/tests/test_act_runner_native.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/typed-companions.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate concurrent generated installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/install_gen.sh
+          bash -n scripts/tests/test_generated_installer_transactions.sh
+          bash scripts/tests/test_generated_installer_transactions.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/installer-transactions.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
         shell: bash

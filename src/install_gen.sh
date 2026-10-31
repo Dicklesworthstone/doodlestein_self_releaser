@@ -962,6 +962,25 @@ _extract_archive() {
     fi
 }
 
+# GNU and BSD stat use different format switches. This identity check is also
+# used for the private owner file, so cleanup cannot remove a replacement lock.
+_install_lock_identity() {
+    local value
+    value=$(stat -c '%d:%i' -- "$1" 2>/dev/null) ||
+        value=$(stat -f '%d:%i' "$1" 2>/dev/null) || return 1
+    [[ "$value" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+    printf '%s\n' "$value"
+}
+
+_install_lock_owned() {
+    local directory="$1" directory_identity="$2" owner_identity="$3" owner="$4" observed
+    [[ -d "$directory" && ! -L "$directory" && -f "$directory/owner" && ! -L "$directory/owner" ]] || return 1
+    [[ "$(_install_lock_identity "$directory")" == "$directory_identity" &&
+       "$(_install_lock_identity "$directory/owner")" == "$owner_identity" ]] || return 1
+    observed=$(cat -- "$directory/owner") || return 1
+    [[ "$observed" == "$owner" ]]
+}
+
 # Stage the complete family and backups on the destination filesystem before
 # replacing its first member. On failure, restore every touched destination;
 # unrelated executables are never moved or removed.
@@ -973,6 +992,7 @@ _install_family_transaction() {
     local sources=("$@") hashes=() sizes=() previous=()
     local name path hash size previous_hash backup_hash index=0 stage='' committed=false touched=0
     local receipt='[' separator='' original_dir="$dest_dir"
+    local install_lock='' lock_identity='' owner_identity='' lock_owner='' lock_held=false lock_setup_interrupted=false
     [[ ${#sources[@]} -eq ${#_INSTALL_NAMES[@]} && ${#sources[@]} -gt 0 ]] || exit 1
     for path in "${sources[@]}"; do
         [[ -f "$path" && ! -L "$path" && -s "$path" ]] || exit 1
@@ -991,7 +1011,92 @@ _install_family_transaction() {
             _log_error "Install directory is a dangling or unusable symlink: $original_dir"; exit 1;
         }
     fi
-    # Gather every replacement decision before creating files in the prefix.
+    mkdir -p -- "$dest_dir" || exit 1
+    dest_dir=$(CDPATH='' cd -P -- "$dest_dir" && pwd -P) || exit 1
+    if ! _install_lock_identity "$dest_dir" >/dev/null; then
+        _log_error "stat cannot identify the installation directory; refusing unprotected replacement: $dest_dir"
+        exit 3
+    fi
+    install_lock="$dest_dir/.dsr-install.lock"
+    lock_owner="pid=${BASHPID:-$$} tool=$TOOL_NAME token=$RANDOM-$RANDOM-$RANDOM"
+    _finish_family_transaction() {
+        local status=$? restore_index restore_name failed=false
+        trap - EXIT
+        # Keep ownership through restoration even if the caller repeats TERM.
+        trap '' HUP INT TERM
+        if $lock_held; then
+            if [[ -z "$owner_identity" ]]; then
+                # Setup failed before a complete owner record. Remove only an
+                # empty directory whose identity is still ours; never recurse.
+                if [[ -n "$lock_identity" && ! -L "$install_lock" &&
+                      "$(_install_lock_identity "$install_lock")" == "$lock_identity" ]]; then
+                    rmdir -- "$install_lock" 2>/dev/null ||
+                        _log_error "Incomplete installation lock retained for inspection: $install_lock"
+                fi
+                exit "$status"
+            fi
+            if ! _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner"; then
+                _log_error "Installation lock ownership changed; refusing uncoordinated rollback or cleanup"
+                [[ -z "$stage" ]] || _log_error "Recovery files retained at: $stage"
+                exit 1
+            fi
+        fi
+        if ! $committed; then
+            restore_index=$((touched - 1))
+            while ((restore_index >= 0)); do
+                restore_name="${_INSTALL_NAMES[$restore_index]}"
+                if [[ "${previous[$restore_index]}" == true ]]; then
+                    mv -f -- "$stage/old/$restore_name" "$dest_dir/$restore_name" || failed=true
+                else
+                    rm -f -- "$dest_dir/$restore_name" || failed=true
+                fi
+                restore_index=$((restore_index - 1))
+            done
+        fi
+        if $failed; then
+            _log_error "Could not restore every previous binary; recovery files and installation lock retained: $stage"
+            exit 1
+        fi
+        [[ -z "$stage" ]] || rm -rf -- "$stage"
+        if $lock_held; then
+            if ! _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" ||
+               ! rm -- "$install_lock/owner" || ! rmdir -- "$install_lock"; then
+                _log_error "Could not release the owned installation lock; inspect before retrying: $install_lock"
+                exit 1
+            fi
+        fi
+        exit "$status"
+    }
+    trap _finish_family_transaction EXIT
+    # Record signals during the few setup commands, then handle cancellation
+    # once ownership can be released safely. Do not silently ignore a signal.
+    trap 'lock_setup_interrupted=true' HUP INT TERM
+    # One backend for every installer/PATH. Portable mkdir provides exclusion
+    # on macOS and FreeBSD too; a flock fallback would split the writer set.
+    if ! (umask 077; mkdir -- "$install_lock") 2>/dev/null; then
+        if [[ ! -e "$install_lock" && ! -L "$install_lock" ]]; then
+            _log_error "Cannot create the installation lock; check directory permissions and free space: $dest_dir"
+            exit 1
+        fi
+        _log_error "Installation directory is busy or its lock needs inspection: $install_lock"
+        _log_info 'Wait for the active installer to finish, then retry.'
+        _log_info 'If it stopped unexpectedly, inspect the lock before removing it manually; --yes does not steal locks.'
+        exit 2
+    fi
+    lock_held=true
+    lock_identity=$(_install_lock_identity "$install_lock") || {
+        _log_error "Cannot identify the new installation lock; inspect before retrying: $install_lock"
+        exit 1
+    }
+    (umask 077; printf '%s\n' "$lock_owner" > "$install_lock/owner") || exit 1
+    owner_identity=$(_install_lock_identity "$install_lock/owner") || {
+        _log_error "Cannot identify the installation lock owner; inspect before retrying: $install_lock"
+        exit 1
+    }
+    trap 'exit 5' HUP INT TERM
+    $lock_setup_interrupted && exit 5
+    _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" || exit 1
+    # Gather every replacement decision under the lock before staging binaries.
     for name in "${_INSTALL_NAMES[@]}"; do
         path="$dest_dir/$name"
         [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || {
@@ -1016,35 +1121,7 @@ _install_family_transaction() {
             fi
         fi
     done
-    mkdir -p -- "$dest_dir" || exit 1
     stage=$(mktemp -d "$dest_dir/.${BINARY_NAME}.install.XXXXXXXX") || exit 1
-    _finish_family_transaction() {
-        local status=$? restore_index restore_name failed=false
-        trap - EXIT
-        # Finish restoration even if the caller repeats an interrupt while
-        # backups are being moved back into place.
-        trap '' HUP INT TERM
-        if ! $committed; then
-            restore_index=$((touched - 1))
-            while ((restore_index >= 0)); do
-                restore_name="${_INSTALL_NAMES[$restore_index]}"
-                if [[ "${previous[$restore_index]}" == true ]]; then
-                    mv -f -- "$stage/old/$restore_name" "$dest_dir/$restore_name" || failed=true
-                else
-                    rm -f -- "$dest_dir/$restore_name" || failed=true
-                fi
-                restore_index=$((restore_index - 1))
-            done
-        fi
-        if $failed; then
-            _log_error "Could not restore every previous binary; recovery files retained at: $stage"
-            exit 1
-        fi
-        rm -rf -- "$stage"
-        exit "$status"
-    }
-    trap _finish_family_transaction EXIT
-    trap 'exit 5' HUP INT TERM
     mkdir -- "$stage/new" "$stage/old" || exit 1
     for name in "${_INSTALL_NAMES[@]}"; do
         cp -- "${sources[$index]}" "$stage/new/$name" || exit 1
@@ -1069,6 +1146,7 @@ _install_family_transaction() {
     receipt+=']'
     index=0
     for name in "${_INSTALL_NAMES[@]}"; do
+        _install_lock_owned "$install_lock" "$lock_identity" "$owner_identity" "$lock_owner" || exit 1
         path="$dest_dir/$name"
         [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || exit 1
         touched=$((index + 1))

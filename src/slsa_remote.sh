@@ -179,12 +179,12 @@ _slr_payloads() {
     names=$(jq -c '[.subject[].name]|sort' "$proof") || return 7
     actual=$(_sbr_payload_names "$inventory") || return $?
     # The SBOM scanner deliberately excludes LICENSE/text/JSON metadata.
-    # Authenticated shared subjects are nevertheless mandatory payloads for
-    # this release. Add only their PRESENT inventory names; missing shared
-    # files and unlisted non-metadata payloads must still fail the exact set.
+    # Every authenticated subject is a mandatory payload, including a native
+    # platform's JSON/NOTICE companions. Add only PRESENT subject names;
+    # absent selected files and unlisted binaries still fail the exact set.
     actual=$(printf '%s\n' "$actual" "$inventory" | jq -cse --slurpfile proof "$proof" '
         select(length==2) | .[1] as $inventory |
-        .[0] + [$proof[0].dsr_evidence.artifacts[] | select(.target=="additional") |
+        .[0] + [$proof[0].subject[] |
                 .name as $name | select(any($inventory[]; .name==$name)) | .name] |
         unique | sort') || return 7
     [[ "$names" == "$actual" ]] || { _slsa_log 'Remote payload namespace differs from signed subjects'; return 7; }

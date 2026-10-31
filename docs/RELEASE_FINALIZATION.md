@@ -145,13 +145,39 @@ paths are ignored: files are selected only by validated flat names under the
 explicit artifact directory.
 
 The local top-level payload namespace must match the manifest exactly. Versioned
-and installer-compatible hardlink names remain distinct assets. Selection uses
-the existing SBOM payload policy, excluding text/JSON/checksum/signature metadata.
-This stage uploads only those manifest-selected binaries/archives, **not** the
-private build manifest, local upload state, checksum files, or signature sidecars.
+and installer-compatible hardlink names remain distinct assets. Every explicit
+build-manifest payload is selected, including declared data and license files
+such as `runtime.json`, `NOTICE` and `LICENSE`. Unselected metadata remains
+private; unexpected binaries still fail the exact inventory check. The private
+build manifest, local upload state and generated integrity sidecars are not
+automatically selected as payloads.
 Use the explicit `--require-signatures` policy below to prepare, publish and
 verify the signed checksum/payload bundle in the same finalization invocation.
 The payload-upload option alone is not a substitute for that policy.
+
+### Preserve declared data through complete finalization
+
+When the frozen build or authenticated prepared-signature inventory contains
+files excluded by ordinary SBOM discovery, finalization creates one private
+selection containing the **complete** payload name/SHA-256 set. That same
+selection is passed to SBOM generation, publication, verification before
+promotion, and final local verification. Platform-owned JSON and shared notices
+therefore receive the same complete inventory coverage as executable payloads.
+The original build/signature and remote byte checks continue to bind the set.
+
+These SBOM inventories use `selection_policy: explicit-artifacts-v1`. Binary-only
+releases retain their existing discovery policy and exact-set checks, allowing
+completed ordinary inventories to be reused. A retry preserves the chosen
+payloads and completed proof bytes; it cannot omit a previously selected data
+file or silently regenerate conflicting metadata. Prepared-signature mode derives
+the selection from the authenticated integrity bundle, including when no private
+build manifest is supplied.
+
+With `--require-provenance`, all selected files remain signed subjects. Shared
+`target: additional` assets count toward artifact coverage but never become a
+physical platform in the remote verification policy. SBOM verification records
+byte identity; the separate Minisign/SLSA checks establish signer and builder
+authentication.
 
 Before the first upload, every selected file is hashed and copied into a private
 snapshot. Temporary free space must accommodate the complete selected payload

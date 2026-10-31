@@ -256,6 +256,17 @@ _sbr_verify_payloads() {
     local expected actual entries entry name sha asset digest
     expected=$(jq -c '[.artifacts[].artifact.name] | sort' "$manifest") || return 7
     actual=$(_sbr_payload_names "$inventory") || return $?
+    # The independently pinned inventory can explicitly select JSON, NOTICE,
+    # and other metadata-like payloads. Count only names actually present on
+    # the release; never manufacture missing assets from the expected set or
+    # hide an unexpected binary by changing global discovery rules.
+    if jq -e '.selection_policy == "explicit-artifacts-v1"' "$manifest" >/dev/null; then
+        actual=$(printf '%s\n' "$actual" "$inventory" | jq -cse --slurpfile manifest "$manifest" '
+            select(length == 2) | .[1] as $inventory |
+            .[0] + [$manifest[0].artifacts[].artifact.name as $name |
+                    select(any($inventory[]; .name == $name)) | $name] |
+            unique | sort') || return 7
+    fi
     [[ "$actual" == "$expected" ]] || {
         _sbom_log error 'Remote payload set differs from the complete SBOM inventory'; return 7;
     }
@@ -372,12 +383,17 @@ sbom_verify_release() (
 # Snapshot only the public documents, not private scan plans/cache receipts or
 # multi-gigabyte payloads. The local verifier binds all originals to this manifest.
 _sbr_stage_publication() {
-    local root="$1" output_dir="$2" format="$3" workdir="$4"
+    local root="$1" output_dir="$2" format="$3" workdir="$4" selection="${5:-}" selection_hash="${6:-}"
     local extension manifest sha after entries entry name digest size records
+    local -a selection_args=()
+    [[ -z "$selection" ]] || selection_args=(--selection "$selection")
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     extension=$(_sbom_extension "$format") || return $?
     manifest="$output_dir/sbom-manifest.$extension"
     sha=$(_sbom_hash "$manifest") || return $?
-    sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" >/dev/null || return $?
+    sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" \
+        ${selection_args[@]+"${selection_args[@]}"} >/dev/null || return $?
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     [[ "$(_sbom_hash "$manifest")" == "$sha" ]] || return 7
     mkdir "$workdir/proofs" || return 1
     cp -- "$manifest" "$workdir/proofs/sbom-manifest.$extension" || return 1
@@ -405,6 +421,7 @@ _sbr_stage_publication() {
     done <<< "$entries"
     after=$(_sbom_hash "$manifest") || return $?
     [[ "$after" == "$sha" ]] || return 7
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     size=$(wc -c < "$workdir/proofs/sbom-manifest.$extension") || return 1
     size="${size//[[:space:]]/}"
     ((size <= ${SBOM_REMOTE_MAX_DOCUMENT_BYTES:-67108864})) || return 4
@@ -414,12 +431,17 @@ _sbr_stage_publication() {
 }
 
 _sbr_check_local_publication() {
-    local root="$1" output_dir="$2" format="$3" plan="$4"
+    local root="$1" output_dir="$2" format="$3" plan="$4" selection="${5:-}" selection_hash="${6:-}"
     local name expected
+    local -a selection_args=()
+    [[ -z "$selection" ]] || selection_args=(--selection "$selection")
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     name=$(jq -r '.manifest.name' <<< "$plan") || return 1
     expected=$(jq -r '.manifest.sha256' <<< "$plan") || return 1
     [[ "$(_sbom_hash "$output_dir/$name")" == "$expected" ]] || return 7
-    sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" >/dev/null || return $?
+    sbom_verify_artifacts "$root" --format "$format" --output-dir "$output_dir" \
+        ${selection_args[@]+"${selection_args[@]}"} >/dev/null || return $?
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     [[ "$(_sbom_hash "$output_dir/$name")" == "$expected" ]] || return 7
 }
 
@@ -518,16 +540,18 @@ sbom_publish_artifacts() (
     set -uo pipefail
     local root="${1:-}" repo="" tag="" format="${SBOM_DEFAULT_FORMAT:-spdx}" output_dir="${SBOM_OUTPUT_DIR:-}"
     local dry_run="${DRY_RUN:-false}" allow_published=false
+    local selection="" selection_hash=""
     [[ $# -gt 0 ]] && shift
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --repo|--tag|--format|-f|--output-dir)
+            --repo|--tag|--format|-f|--output-dir|--selection)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --repo) [[ -z "$repo" ]] || return 4; repo="$2" ;;
                     --tag) [[ -z "$tag" ]] || return 4; tag="$2" ;;
                     --format|-f) format="$2" ;;
                     --output-dir) output_dir="$2" ;;
+                    --selection) [[ -z "$selection" ]] || return 4; selection="$2" ;;
                 esac
                 shift 2 ;;
             --dry-run|-n) dry_run=true; shift ;;
@@ -544,6 +568,11 @@ sbom_publish_artifacts() (
         source "$_SBOM_RELEASE_MODULE_DIR/github.sh" || return 3
     fi
     format=$(_sbom_format "$format") || return $?
+    if [[ -n "$selection" ]]; then
+        selection_hash=$(_sbom_hash "$selection") || return $?
+        _sbom_read_selection "$selection" >/dev/null || return $?
+        _sbom_selection_gate "$selection" "$selection_hash" || return $?
+    fi
     root=$(cd "$root" && pwd -P) || return 4
     [[ -n "$output_dir" ]] || output_dir="$root"
     [[ -d "$output_dir" && ! -L "$output_dir" && "$output_dir" != *[[:cntrl:]]* && "$output_dir" != *\\* ]] || return 4
@@ -556,7 +585,8 @@ sbom_publish_artifacts() (
     # shellcheck disable=SC2064
     trap "$cleanup" EXIT
     trap 'exit 5' HUP INT TERM
-    plan=$(_sbr_stage_publication "$root" "$output_dir" "$format" "$workdir") || return $?
+    plan=$(_sbr_stage_publication "$root" "$output_dir" "$format" "$workdir" \
+        "$selection" "$selection_hash") || return $?
     name=$(jq -r '.manifest.name' <<< "$plan") || return 1
     manifest="$workdir/proofs/$name"
     sha=$(jq -r '.manifest.sha256' <<< "$plan") || return 1
@@ -582,12 +612,13 @@ sbom_publish_artifacts() (
         return 4
     fi
     current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$inventory" "$names" "$workdir") || return $?
-    _sbr_check_local_publication "$root" "$output_dir" "$format" "$plan" || return $?
+    _sbr_check_local_publication "$root" "$output_dir" "$format" "$plan" "$selection" "$selection_hash" || return $?
     # A planned name may have been occupied while the first preflight ran.
     # Check the new observation before allowing any upload, not only at the end.
     actions=$(_sbr_preflight_publication "$repo" "$current" "$plan" "$format" "$workdir") || return $?
     manifest_action=$(jq -r --arg name "$(jq -r '.manifest.name' <<< "$plan")" \
         '.[] | select(.name == $name) | .action' <<< "$actions") || return 1
+    _sbom_selection_gate "$selection" "$selection_hash" || return $?
     if [[ "$dry_run" == true ]]; then
         jq -nc --argjson context "$context" --arg format "$format" --argjson actions "$actions" \
             --argjson manifest "$(jq -c '.manifest' <<< "$plan")" '
@@ -602,14 +633,16 @@ sbom_publish_artifacts() (
         if [[ -n "$entries" ]]; then
             while IFS= read -r entry; do
                 name=$(jq -r '.name' <<< "$entry") || return 1
+                _sbom_selection_gate "$selection" "$selection_hash" || return $?
                 _sbr_upload_document "$upload_url" "$workdir/proofs/$name" "$entry" || return $?
                 upload_attempts=$((upload_attempts + 1))
+                _sbom_selection_gate "$selection" "$selection_hash" || return $?
             done <<< "$entries"
         fi
         current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$inventory" "$names" "$workdir") || return $?
         verified_inventory="$current"
         _sbr_verify_documents "$repo" "$current" "$manifest" "$format" "$workdir" || return $?
-        _sbr_check_local_publication "$root" "$output_dir" "$format" "$plan" || return $?
+        _sbr_check_local_publication "$root" "$output_dir" "$format" "$plan" "$selection" "$selection_hash" || return $?
         # Re-observe after document downloads, immediately before the aggregate.
         current=$(_sbr_publication_gate "$repo" "$tag" "$context" "$inventory" "$names" "$workdir") || return $?
         # Once the documents have been read, their IDs and metadata are frozen
@@ -617,7 +650,9 @@ sbom_publish_artifacts() (
         _sbr_inventory_compatible "$verified_inventory" "$current" \
             "$(jq -c '[.manifest.name]' <<< "$plan")" || return $?
         entry=$(jq -c '.manifest' <<< "$plan") || return 1
+        _sbom_selection_gate "$selection" "$selection_hash" || return $?
         _sbr_upload_document "$upload_url" "$manifest" "$entry" || return $?
+        _sbom_selection_gate "$selection" "$selection_hash" || return $?
         manifest_attempted=true
     fi
     # Use the independent verifier, not POST success, as completion evidence.
@@ -628,7 +663,7 @@ sbom_publish_artifacts() (
     [[ "$(_sbr_inventory_sha256 "$current" "$workdir")" == "$(jq -r '.asset_inventory_sha256' <<< "$result")" ]] || {
         _sbom_log error 'Final release inventory differs from the independently verified asset identities'; return 7;
     }
-    _sbr_check_local_publication "$root" "$output_dir" "$format" "$plan" || return $?
+    _sbr_check_local_publication "$root" "$output_dir" "$format" "$plan" "$selection" "$selection_hash" || return $?
     jq -nc --argjson verification "$result" --argjson attempts "$upload_attempts" --argjson manifest "$manifest_attempted" '
         {schema_version:1,kind:"dsr-sbom-publication",status:"verified",dry_run:false,
          sbom_upload_attempts:$attempts,manifest_upload_attempted:$manifest,verification:$verification}'
@@ -651,7 +686,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         help|--help|-h)
             printf '%s\n' \
                 'Usage: bash src/sbom_release.sh publish ARTIFACTS --repo OWNER/REPO --tag vVERSION' \
-                '       [--format spdx|cyclonedx] [--output-dir DIR] [--dry-run] [--allow-published]' \
+                '       [--format spdx|cyclonedx] [--output-dir DIR] [--selection FILE] [--dry-run] [--allow-published]' \
                 'Usage: bash src/sbom_release.sh verify --repo OWNER/REPO --tag vVERSION' \
                 '       --manifest-sha256 SHA256 [--format spdx|cyclonedx]' \
                 'The manifest digest must come from an independently trusted source.' \
