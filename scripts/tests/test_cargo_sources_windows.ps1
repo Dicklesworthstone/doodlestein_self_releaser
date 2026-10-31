@@ -414,6 +414,11 @@ try {
     Write-FixtureText ($upstream + '/src/lib.rs') "pub fn answer() -> u32 { 2 }`n"
     $null = Invoke-Program $git @('init','--initial-branch=main',$upstream)
     $null = Invoke-Program $git @('-C',$upstream,'add','Cargo.toml','src/lib.rs')
+    if ($script:WindowsHost) {
+        Write-FixtureText ($upstream + '/LICENSE') 'src/lib.rs'
+        $linkBlob = (Invoke-Program $git @('-C',$upstream,'hash-object','-w','LICENSE')).Out.Trim()
+        $null = Invoke-Program $git @('-C',$upstream,'update-index','--add','--cacheinfo',('120000,' + $linkBlob + ',LICENSE'))
+    }
     $null = Invoke-Program $git @('-C',$upstream,'-c','user.name=DSR Fixture','-c','user.email=dsr-fixture@example.invalid','commit','-m','source authentication fixture')
     $revision = (Invoke-Program $git @('-C',$upstream,'rev-parse','HEAD')).Out.Trim()
     $upstreamUri = [Uri]::new($upstream).AbsoluteUri
@@ -455,6 +460,19 @@ try {
     $gitPackage = $metadata.packages | Where-Object { $_.name -ceq 'source_git_dep' }
     $registryRoot = ([IO.Path]::GetDirectoryName($registryPackage.manifest_path)).Replace('\','/')
     $gitRoot = ([IO.Path]::GetDirectoryName($gitPackage.manifest_path)).Replace('\','/')
+    if ($script:WindowsHost) {
+        $linkFile = $gitRoot + '/LICENSE'
+        $linkEntry = Get-Item -LiteralPath $linkFile -Force
+        Assert-Check 'real Cargo materializes locked Git symlink as inert target bytes' (
+            -not ($linkEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+            [IO.File]::ReadAllText($linkFile) -ceq 'src/lib.rs')
+        Write-FixtureText $linkFile 'elsewhere.rs'
+        try {
+            Assert-Refused 'modified materialized Git link fails locked blob verification' {
+                Invoke-DsrCargoSources -Operation verify -ExpectedSha256 $summary.sha256 @arguments
+            } 'differ from locked content'
+        } finally { Write-FixtureText $linkFile 'src/lib.rs' }
+    }
     $registryLib = $registryRoot + '/src/lib.rs'; $registryOriginal = [IO.File]::ReadAllText($registryLib)
     $gitLib = $gitRoot + '/src/lib.rs'; $gitOriginal = [IO.File]::ReadAllText($gitLib)
     Write-FixtureText $registryLib "pub fn answer() -> u32 { 41 }`n"

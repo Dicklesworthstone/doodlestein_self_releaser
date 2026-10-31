@@ -40,6 +40,12 @@ public static class DsrCargoSourceObjects {
             ProcessStartInfo info = new ProcessStartInfo(executable);
             info.UseShellExecute = false;
             info.ArgumentList.Add("-c"); info.ArgumentList.Add("protocol.allow=never");
+            // Isolated snapshots can exceed MAX_PATH. Global Git config is
+            // deliberately disabled below, so opt into native long-path reads
+            // explicitly rather than depending on the operator's configuration.
+            if (OperatingSystem.IsWindows()) {
+                info.ArgumentList.Add("-c"); info.ArgumentList.Add("core.longpaths=true");
+            }
             info.ArgumentList.Add("--git-dir=" + admin); info.ArgumentList.Add("cat-file"); info.ArgumentList.Add("--batch");
             List<string> names = new List<string>();
             foreach (string name in info.Environment.Keys) if (name.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)) names.Add(name);
@@ -80,7 +86,7 @@ public static class DsrCargoSourceObjects {
             string[] fields = header.ToString().Split(' '); long length;
             if (fields.Length != 3 || fields[0] != oid || fields[1] != kind || !Int64.TryParse(fields[2], out length) ||
                 length < 0 || length > (kind == "blob" ? 1073741824L : 67108864L))
-                throw new InvalidDataException("Missing, wrong-type or oversized locked Git object");
+                throw new InvalidDataException("Missing, wrong-type or oversized locked Git object: " + oid + " (expected " + kind + ", received " + header.ToString() + ")");
             using (SHA1 identity = SHA1.Create()) using (SHA256 contents = SHA256.Create()) {
                 byte[] prefix = Encoding.ASCII.GetBytes(kind + " " + length.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\0");
                 identity.TransformBlock(prefix, 0, prefix.Length, prefix, 0);
@@ -136,7 +142,12 @@ public static class DsrCargoSourceObjects {
                         gitlinks.Add(name, new Dictionary<string, object> { {"path", name}, {"commit", oid} });
                     }
                     else {
-                        if (mode != "100644" && mode != "100755") throw new InvalidDataException("Locked Git sources contain an unsupported link or mode");
+                        // Git on Windows materializes symlinks as ordinary
+                        // files containing the exact target bytes. The inventory
+                        // refuses reparse points; authenticate these inert bytes
+                        // against the locked blob without ever following them.
+                        if (mode != "100644" && mode != "100755" && !(OperatingSystem.IsWindows() && mode == "120000"))
+                            throw new InvalidDataException("Locked Git sources contain an unsupported link or mode: " + name + " (mode " + mode + ", revision " + revision + ")");
                         ObjectData blob = reader.Get(oid, "blob");
                         files.Add(name, new Dictionary<string, object> { {"path", name}, {"sha256", blob.Hash}, {"size_bytes", blob.Size}, {"executable_bits", 0} });
                     }
