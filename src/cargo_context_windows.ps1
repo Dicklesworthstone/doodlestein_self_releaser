@@ -538,7 +538,7 @@ function Get-DsrCargoToolConfiguration {
             if ($statement -cmatch '^([A-Za-z0-9_-]+)\s*=\s*\[' -and -not $statement.EndsWith(']')) {
                 $pending=$statement; continue
             }
-            if ($statement -cmatch '^\[\s*(build|net|term|registry|env)\s*\]$') {
+            if ($statement -cmatch '^\[\s*(build|net|term|registry|env|unstable)\s*\]$') {
                 $section=$Matches[1]; $target=''; continue
             }
             if ($statement -cmatch '^\[\s*(target|source|registries)\s*\.\s*("(?:[^"\\]|\\.)*"|''[^'']*''|[A-Za-z0-9_-]+)\s*\]$') {
@@ -555,6 +555,16 @@ function Get-DsrCargoToolConfiguration {
             }
             $key=$Matches[1]; $text=$Matches[2].Trim()
             if (-not $keys.Add($section + '.' + $target + '.' + $key)) { throw 'Repeated Cargo configuration key' }
+            # The config receipt hashes these literals with the rest of the file.
+            # Neither setting selects an executable. Admit only content freshness.
+            if ($section -ceq 'build' -and $key -ceq 'fingerprint') {
+                if ($text -cnotin @('"content"', "'content'")) { throw 'Strict Cargo requires content fingerprints' }
+                continue
+            }
+            if ($section -ceq 'unstable') {
+                if ($key -cne 'checksum-freshness' -or $text -cne 'true') { throw 'Unsupported unstable Cargo configuration' }
+                continue
+            }
             $allowed = switch ($section) {
                 build { @('jobs','target','target-dir','incremental','rustc','rustc-wrapper','rustc-workspace-wrapper','rustflags') }
                 target { @('linker','rustflags','runner') }
@@ -764,7 +774,22 @@ function Get-DsrCargoExecutableIdentity {
         if ($first -eq 35 -and $second -eq 33) { throw 'Unresolved executable script wrappers are not attested' }
         if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and ($first -ne 77 -or $second -ne 90)) { throw 'Selected Windows tool is not a native executable' }
     } finally { $magic.Dispose() }
-    $versionResult=Invoke-DsrCargoToolProbe -Context $Context -Program $selected -Arguments $VersionArguments
+    $linkHelp=[IO.Path]::GetFileName($selected) -ieq 'link.exe' -and
+        $VersionArguments.Count -eq 1 -and $VersionArguments[0] -ceq '/?'
+    $versionResult=Invoke-DsrCargoToolProbe -Context $Context -Program $selected -Arguments $VersionArguments -AllowFailure:$linkHelp
+    if ($linkHelp -and $versionResult.ExitCode -ne 0) {
+        # With redirected handles MSVC LINK may print its banner and usage,
+        # then exit 1100. Verify the same binary in noninteractive dump mode.
+        if ($versionResult.ExitCode -ne 1100 -or $versionResult.Stdout -notmatch '(?m)^Microsoft \(R\) Incremental Linker Version ([0-9.]+)\s*$') {
+            throw ('LINK version probe failed: '+$selected+' (exit '+$versionResult.ExitCode+')')
+        }
+        $linkVersion=$Matches[1]
+        $dump=Invoke-DsrCargoToolProbe -Context $Context -Program $selected -Arguments @('/dump','/headers',$physical.Replace('/','\'))
+        if ($dump.Stdout -notmatch '(?m)^Microsoft \(R\) COFF/PE Dumper Version ([0-9.]+)\s*$' -or
+            $Matches[1] -cne $linkVersion -or $dump.Stdout -notmatch 'FILE HEADER VALUES') {
+            throw 'LINK failed to identify its own PE image at the reported version'
+        }
+    }
     $version=($versionResult.Stdout+$versionResult.Stderr).Trim()
     if (-not $version) { throw ('Executable did not report a version: ' + $selected) }
     $record=@{program=$Program; selected_path=$selected; selected_sha256=$sha; selected_kind='executable'; version=$version}
