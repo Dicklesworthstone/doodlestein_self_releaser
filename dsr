@@ -8149,8 +8149,20 @@ EOF
     local -A release_upload_plan=() release_artifact_triples=()
     _release_plan_upload_names() {
         local -A claimants=() rank=() sha_of=() artifact_candidates=()
+        local -A companion_targets=()
         local -a order=()
         local a_name a_sha a_target a_format a_triple variant triple how primary candidate configured
+        local companion_json companion_rows companion_name companion_target
+        companion_json=$(config_get_additional_artifacts_json "$tool_name") || {
+            log_error "Cannot validate additional artifact ownership for $tool_name"
+            return 4
+        }
+        companion_rows=$(jq -r 'to_entries[] | .key as $target |
+            .value[] | [.name, $target] | @tsv' <<< "$companion_json") || return 4
+        while IFS=$'\t' read -r companion_name companion_target; do
+            [[ -n "$companion_name" ]] || continue
+            companion_targets["$companion_name"]="$companion_target"
+        done <<< "$companion_rows"
         while IFS=$'\t' read -r a_name a_sha a_target a_format a_triple; do
             [[ "$a_target" == "-" ]] && a_target=""
             [[ "$a_format" == "-" ]] && a_format=""
@@ -8163,6 +8175,11 @@ EOF
             order+=("$a_name")
             sha_of["$a_name"]="$a_sha"
             triple="" how="" rank["$a_name"]=2
+            companion_target="${companion_targets[$a_name]:-}"
+            if [[ -n "$companion_target" && "$a_target" != "$companion_target" ]]; then
+                log_error "Additional artifact $a_name is configured for $companion_target, but the manifest declares ${a_target:-no platform}"
+                return 4
+            fi
             configured='[]'
             if [[ "$a_target" == */* ]] && declare -F config_get_target_triples_json &>/dev/null; then
                 configured=$(config_get_target_triples_json "$tool_name" "$a_target") || return 4
@@ -8180,7 +8197,17 @@ EOF
                 log_error "Manifest artifact $a_name has a target_triple without a platform"
                 return 4
             fi
-            if [[ "$a_target" == */* ]]; then
+            if [[ -n "$companion_target" ]]; then
+                # Native companions belong to their configured platform's
+                # first variant. Their names are literal data: ABI words in a
+                # JSON/NOTICE/archive name do not select a compiler variant.
+                primary=$(jq -r '.[0] // empty' <<< "$configured") || return 4
+                if [[ -n "$a_triple" && -n "$primary" && "$a_triple" != "$primary" ]]; then
+                    log_error "Additional artifact $a_name must belong to the primary configured target_triple $primary, not $a_triple"
+                    return 4
+                fi
+                triple="${a_triple:-$primary}"
+            elif [[ "$a_target" == */* ]]; then
                 if ! variant=$(artifact_naming_artifact_variant \
                         "$tool_name" "${a_target%/*}" "${a_target#*/}" "$a_name"); then
                     log_error "Cannot reconcile target_triple with artifact name: $a_name"
@@ -8205,8 +8232,14 @@ EOF
             fi
             [[ -z "$a_triple" ]] || triple="$a_triple"
             release_artifact_triples["$a_name"]="$triple"
-            artifact_candidates["$a_name"]=$(_release_artifact_candidate_names \
-                "$a_name" "$a_target" "$a_format" "$triple") || return 4
+            if [[ -n "$companion_target" ]]; then
+                # Companions, including archives, never acquire the primary
+                # binary's versioned, compatibility or architecture aliases.
+                artifact_candidates["$a_name"]="$a_name"
+            else
+                artifact_candidates["$a_name"]=$(_release_artifact_candidate_names \
+                    "$a_name" "$a_target" "$a_format" "$triple") || return 4
+            fi
             while IFS= read -r candidate; do
                 [[ -n "$candidate" ]] || continue
                 claimants["$candidate"]+="$a_name"$'\n'
