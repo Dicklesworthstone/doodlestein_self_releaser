@@ -163,7 +163,11 @@ function Invoke-DsrCargoCfgChecks {
     $cfgPath=Join-Path $cfgSource '.cargo/config.toml'
     Write-Text $cfgPath "[build]`njobs=1`n"
     $command=(ConvertTo-DsrCargoLiteralArgument $cargoPath) + ' build --release --locked --offline --target ' + $triple
-    $baseEnvironment=@("RUSTC=$compilerPath",('CARGO_TARGET_DIR='+(Join-Path $work 'cfg-baseline-target')))
+    # The strict context discards ambient LIB. Carry the developer prompt's SDK
+    # search path explicitly so the native linker can resolve kernel32.lib.
+    $compilerEnvironment=@("RUSTC=$compilerPath")
+    if ($script:WindowsHost -and $env:LIB) { $compilerEnvironment+=("LIB="+$env:LIB) }
+    $baseEnvironment=$compilerEnvironment+@(('CARGO_TARGET_DIR='+(Join-Path $work 'cfg-baseline-target')))
     $baseline=New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment $baseEnvironment -ExpectedTarget $triple
     $lockCommand=(ConvertTo-DsrCargoLiteralArgument $cargoPath) + ' generate-lockfile --offline --manifest-path ' + (ConvertTo-DsrCargoLiteralArgument (Join-Path $cfgSource 'Cargo.toml'))
     $lockResult=Invoke-DsrCargoCommand -Context $baseline -Command $lockCommand -CaptureOutput $true
@@ -215,7 +219,7 @@ function Invoke-DsrCargoCfgChecks {
     foreach ($case in $cases) {
         Write-Text $cfgPath $case.Config
         $target=Join-Path $work ('cfg-target-'+$case.Name)
-        $environment=@("RUSTC=$compilerPath", "CARGO_TARGET_DIR=$target")+$case.Environment
+        $environment=$compilerEnvironment+@("CARGO_TARGET_DIR=$target")+$case.Environment
         if ($case.Name -cne 'cfg-linker') { $environment+="$linkerVariable=$linker" }
         $context=New-DsrCargoContext -BuildCommand $command -SourceRoot $cfgSource -CargoHome $cfgHome -Environment $environment -ExpectedTarget $triple
         $row=$context.ToolchainIdentity.selection.cargo_target
@@ -302,6 +306,19 @@ rustflags=['-L/usr/local/lib']
             ($observed.Receipt.rustflags -ccontains '-Ctarget-cpu=x86-64-v3') -eq ($cross.Arch -ceq 'x86_64') -and
             $observed.Receipt.rustflags -cnotcontains '-Copt-level=2')
     }
+}
+
+$freshSource=Join-Path $work 'content-freshness'
+$freshPath=Join-Path $freshSource '.cargo/config.toml'
+$freshContext=@{SourceRoot=(Get-DsrCacheFullPath $freshSource)}
+$freshConfig="[build]`nfingerprint='content'`n[unstable]`nchecksum-freshness=true`n"
+Write-Text $freshPath $freshConfig
+$freshReceipt=Get-DsrCargoToolConfiguration $freshContext
+Check 'content freshness settings are bound to the tracked config bytes' (
+    $freshReceipt.receipts.Count -eq 1 -and $freshReceipt.receipts[0].sha256 -ceq (Get-DsrCargoToolFileHash $freshPath))
+foreach ($invalid in @($freshConfig.Replace("'content'","'mtime'"),$freshConfig.Replace('true','false'),$freshConfig.Replace('checksum-freshness','other-option'))) {
+    Write-Text $freshPath $invalid
+    Refused 'unsupported freshness mode or unstable selector is rejected' { Get-DsrCargoToolConfiguration $freshContext } 'fingerprints|unstable Cargo'
 }
 
 Invoke-DsrCargoCfgChecks
@@ -401,9 +418,10 @@ try {
                     Write-Output ('Native LINK control '+$spelling+' '+$helpSwitch+': exit='+$nativeHelp.ExitCode+'; '+$nativeHelpDetail)
                 }
             }
-            $nativeHelp=Invoke-DsrCargoToolProbe -Context $nativePrinted.context -Program $nativePrinted.program -Arguments @('/?')
+            $nativeIdentity=Get-DsrCargoExecutableIdentity -Context $nativePrinted.context -Program $nativePrinted.program -VersionArguments @('/?')
             Check 'the native discovered LINK executable reports its version through the production probe' (
-                $nativeHelp.ExitCode -eq 0 -and ($nativeHelp.Stdout+$nativeHelp.Stderr) -match 'Incremental Linker Version [0-9]+\.')
+                $nativeIdentity.selected_sha256 -ceq (Get-DsrCargoToolFileHash $nativePrinted.program) -and
+                $nativeIdentity.version -match 'Incremental Linker Version [0-9]+\.')
         }
     }
     $context = New-DsrCargoContext -BuildCommand $command -SourceRoot $source -CargoHome $privateHome -Environment $baseEnvironment -ExpectedTarget $hostTriple
