@@ -71,6 +71,15 @@ without_auth() (
     "$@"
 )
 
+# Captured from the unchanged default plan at 4008703. Retained outboxes must
+# remain readable without changing request hashes or receiver delivery IDs.
+new_case default-compatibility
+legacy_payload='{"tool":"tool","version":"v1.0.0","sha":"1111111111111111111111111111111111111111","run_id":"tool-v1.0.0"}'
+legacy_plan=$(_dp_release_plan owner/source owner/a "$legacy_payload")
+check 'default request plan retains its previously published bytes' test "$(_dp_digest_text "$legacy_plan")" = 82a19ee88fab614615f32f5b942d493d18d4f19185d18d516aa7ae13b62106e9
+check 'default outbox identity retains its exact previous encoding' test "$(_dp_outbox_identity "$legacy_plan")" = '{"run_id":"tool-v1.0.0","source_repo":"owner/source","tool":"tool","version":"v1.0.0"}'
+check 'default plans do not acquire a release-ID field' jq -e 'has("release_id")|not' <<< "$legacy_plan"
+
 new_case complete
 capture release
 check 'fresh release fan-out succeeds' test "$status" -eq 0
@@ -123,6 +132,101 @@ check 'explicit uncertain retry sends only the uncertain target' test "$(count)"
 check 'explicit retry retains receiver delivery ID and exact payload' cmp -s "$CASE/b.before" "$CASE/owner_b.json"
 check 'explicit uncertain retry is recorded in history' jq -e '.deliveries[1].history[1].resend_uncertain==true' "$STATE"
 
+new_case custom-event
+export DP_MODE=uncertain
+capture release --event dsr_release
+check 'custom release event retains lost-acknowledgement failure' test "$status" -eq 8
+STATE=$(state_path)
+cp "$CASE/owner_b.json" "$CASE/b.before"
+check 'custom event reaches every HTTP request unchanged' jq -e -s 'length==2 and all(.[];.event_type=="dsr_release")' "$CASE/calls.jsonl"
+check 'custom event is bound to every saved receipt' jq -e 'all(.deliveries[].history[];.receipt.event_type=="dsr_release")' "$STATE"
+unset DP_MODE
+capture release --event dsr_release
+check 'custom event restart does not replay uncertain work' test "$status" -eq 8
+check 'custom event restart preserves acknowledged destinations' test "$(count)" -eq 2
+capture release --event dsr_release --retry-uncertain
+check 'custom event intentional retry completes the outbox' test "$status" -eq 0
+check 'custom event intentional retry sends only uncertain work' test "$(count)" -eq 3
+check 'custom event intentional retry uses the exact saved request bytes' cmp -s "$CASE/b.before" "$CASE/owner_b.json"
+cp "$STATE" "$CASE/state.before"
+capture release --event renamed-event
+check 'changing an event conflicts with the original invocation' test "$status" -eq 2
+check 'changing an event cannot cause duplicate delivery' test "$(count)" -eq 3
+check 'changing an event preserves the original outbox bytes' cmp -s "$STATE" "$CASE/state.before"
+
+new_case custom-event-guard
+guard_plan=$(_dp_release_plan owner/source $'owner/a\nowner/b' "$legacy_payload" release-ready)
+custom_guard() {
+    printf '%s\n' "$2" >> "$CASE/guards"
+    [[ "$2" == release-ready ]] && jq -e '.event_type=="release-ready"' <<< "$3" >/dev/null
+}
+export DP_MODE=elapsed
+capture _dp_release_outbox "$guard_plan" "$DSR_STATE_DIR/dispatch" false false custom_guard
+check 'rate-limited custom event remains incomplete' test "$status" -eq 1
+check 'guards receive the saved custom event before sends and each rate-limit retry' test "$(wc -l < "$CASE/guards")" -eq 5
+check 'custom event guard never receives the standalone default' test "$(sort -u "$CASE/guards")" = release-ready
+check 'rate-limited custom event retains its receipt event' jq -e 'all(.results[].receipt;.event_type=="release-ready")' "$CASE/out"
+unset -f custom_guard
+
+new_case release-id-conflicts
+release_plan=$(_dp_release_plan owner/source $'owner/a\nowner/b' "$legacy_payload" dsr_release 73)
+capture _dp_release_outbox "$release_plan" "$DSR_STATE_DIR/dispatch" false false
+check 'GitHub release-bound outbox can deliver its complete plan' test "$status" -eq 0
+STATE=$(state_path); cp "$STATE" "$CASE/state.before"; before=$(count)
+check 'GitHub release ID is retained as a safe numeric value' jq -e '.plan.release_id==73' "$STATE"
+check 'release identity contains only normalized source and immutable release ID' test "$(_dp_outbox_identity "$release_plan")" = '{"release_id":73,"source_repo":"owner/source"}'
+upper_plan=$(jq -c '.source_repo="OWNER/SOURCE"' <<< "$release_plan")
+check 'release identity normalizes source repository case' test "$(_dp_outbox_identity "$upper_plan")" = "$(_dp_outbox_identity "$release_plan")"
+for filter in '.tool="alias"' '.version="1.0.0"' '.run_id="different-invocation"' '.sha=("2"*40)' '.extra="changed"'; do
+    changed_payload=$(jq -c "$filter" <<< "$legacy_payload")
+    changed_plan=$(_dp_release_plan owner/source $'owner/a\nowner/b' "$changed_payload" dsr_release 73)
+    capture _dp_release_outbox "$changed_plan" "$DSR_STATE_DIR/dispatch" false false
+    check "same GitHub release rejects payload drift: $filter" test "$status" -eq 2
+    check 'release payload drift never opens another delivery namespace' test "$(find "$DSR_STATE_DIR" -name state.json -type f | wc -l)" -eq 1
+done
+changed_plan=$(_dp_release_plan owner/source $'owner/a\nowner/b' "$legacy_payload" changed-event 73)
+capture _dp_release_outbox "$changed_plan" "$DSR_STATE_DIR/dispatch" false false
+check 'same GitHub release rejects event drift' test "$status" -eq 2
+changed_plan=$(_dp_release_plan owner/source owner/a "$legacy_payload" dsr_release 73)
+capture _dp_release_outbox "$changed_plan" "$DSR_STATE_DIR/dispatch" false false
+check 'same GitHub release rejects destination drift' test "$status" -eq 2
+check 'all release-bound plan conflicts stop before a POST' test "$(count)" -eq "$before"
+check 'release-bound plan conflicts preserve the retained state' cmp -s "$STATE" "$CASE/state.before"
+
+new_case invalid-release-id
+for release_id in '' 0 -1 01 1.0 1e3 true 9007199254740992 999999999999999999999; do
+    capture _dp_release_plan owner/source owner/a "$legacy_payload" dsr_release "$release_id"
+    check "unsafe release ID is refused before plan creation: $release_id" test "$status" -eq 4
+done
+for release_id in 1 9007199254740991; do
+    capture _dp_release_plan owner/source owner/a "$legacy_payload" dsr_release "$release_id"
+    check "safe release ID boundary is accepted: $release_id" test "$status" -eq 0
+    check 'safe release ID survives exact identity encoding' test "$(_dp_outbox_identity "$(cat "$CASE/out")")" = "{\"release_id\":$release_id,\"source_repo\":\"owner/source\"}"
+done
+for value in null '"73"' false 0 -1 1.5 9007199254740992; do
+    malformed_plan=$(jq -c --argjson value "$value" '.release_id=$value' <<< "$legacy_plan")
+    capture _dp_release_outbox "$malformed_plan" "$DSR_STATE_DIR/dispatch" false false
+    check "malformed retained release ID fails closed: $value" test "$status" -eq 4
+done
+check 'invalid release identities never create outbox state' test ! -e "$DSR_STATE_DIR"
+check 'invalid release identities never reach transport' test "$(count)" -eq 0
+
+new_case recovery-state-loss
+capture _dp_release_outbox "$release_plan" "$DSR_STATE_DIR/dispatch" false false
+check 'recovery fixture starts with an accepted release outbox' test "$status" -eq 0
+STATE=$(state_path); before=$(count)
+capture without_auth _dp_release_outbox "$release_plan" "$DSR_STATE_DIR/dispatch" false false '' true
+check 'existing accepted recovery needs neither credentials nor another POST' test "$status,$(count)" = "0,$before"
+# Preserve the original instead of deleting it; recovery must still observe
+# the absent authoritative pathname after taking its exclusive outbox lock.
+mv "$STATE" "$CASE/retained-state.json"
+capture _dp_release_outbox "$release_plan" "$DSR_STATE_DIR/dispatch" false false '' true
+check 'recovery refuses an outbox lost before locking' test "$status" -eq 2
+check 'recovery never recreates missing state as a new fan-out' test ! -e "$STATE"
+check 'recovery of missing state sends no repeated events' test "$(count)" -eq "$before"
+capture _dp_release_outbox "$release_plan" "$DSR_STATE_DIR/dispatch" false false '' maybe
+check 'invalid recovery mode is rejected' test "$status" -eq 4
+
 for mode in cooldown unknown-cooldown; do
     new_case "$mode"; export DP_MODE="$mode"
     capture release
@@ -162,7 +266,7 @@ export DP_MODE=reject
 capture release
 STATE=$(state_path); cp "$STATE" "$CASE/state.before"; before=$(count)
 unset DP_MODE
-for filter in '.deliveries[1].history[0].receipt.http_status="204"' '.deliveries[0].history[0].request_sha256=("0"*64)' '.deliveries[1].history[0].sequence=9' '.deliveries[0].history[0].receipt.exit_code=7' '.deliveries[0].history[0].receipt.repo="owner/other"' '.deliveries[1].history[0].resend_uncertain=true' '.deliveries += [.deliveries[0]]'; do
+for filter in '.deliveries[1].history[0].receipt.http_status="204"' '.deliveries[0].history[0].request_sha256=("0"*64)' '.deliveries[1].history[0].sequence=9' '.deliveries[0].history[0].receipt.exit_code=7' '.deliveries[0].history[0].receipt.repo="owner/other"' '.deliveries[0].history[0].receipt.event_type="different-event"' '.deliveries[1].history[0].resend_uncertain=true' '.deliveries += [.deliveries[0]]'; do
     jq "$filter" "$CASE/state.before" > "$STATE"
     capture release
     check "invalid state rejected: $filter" test "$status" -eq 2
@@ -246,7 +350,15 @@ capture release
 check 'false-success adapter becomes uncertainty not acceptance' test "$status" -eq 8
 STATE=$(state_path)
 check 'false-success adapter cannot create accepted evidence' jq -e 'all(.deliveries[];.history[-1].outcome=="uncertain")' "$STATE"
+
+new_case mismatched-receipt-event
+_dp_deliver() { _dp_result "$1" dsr-release accepted 0 1 204; }
+capture release --event release-ready
+check 'wrong-event transport receipt cannot acknowledge a custom request' test "$status" -eq 8
+STATE=$(state_path)
+check 'wrong-event receipt retains uncertainty under the saved event' jq -e 'all(.deliveries[];.history[-1].outcome=="uncertain" and .history[-1].receipt.event_type=="release-ready")' "$STATE"
 # Restore the module rather than duplicating the production function in tests.
+# shellcheck source=/dev/null
 source "$MODULE"
 
 new_case filesystem

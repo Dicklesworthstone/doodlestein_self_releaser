@@ -102,6 +102,19 @@ teardown() { harness_teardown; }
     assert_contains "$output" "owner/repo1"
     assert_contains "$output" "owner/repo2"
 }
+@test "dispatch_release previews a custom event without creating an outbox" {
+    run dispatch_release_json test-tool v1.0.0 --event release-ready --dry-run
+    [[ "$status" -eq 0 ]]
+    jq -e '.details.results | length>0 and all(.[];.event_type=="release-ready")' <<< "$output"
+    [[ ! -d "$DSR_STATE_DIR" ]]
+}
+@test "dispatch_release validates custom event before any side effects" {
+    run dispatch_release test-tool v1.0.0 --event
+    [[ "$status" -eq 4 ]]
+    run dispatch_release test-tool v1.0.0 --event $'release\nevent' --dry-run
+    [[ "$status" -eq 4 ]]
+    [[ ! -d "$DSR_STATE_DIR" ]]
+}
 @test "dispatch_release requires a full explicit SHA" {
     run dispatch_release test-tool v1.0.0 --sha abc123def456 --dry-run
     [[ "$status" -eq 4 ]]

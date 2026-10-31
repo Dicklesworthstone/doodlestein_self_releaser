@@ -28,7 +28,10 @@ resolver is used when available, otherwise the default is
 Repository names are normalized case-insensitively and duplicate destinations are
 coalesced. The complete destination list is validated before the first request.
 
-A release event uses `event_type: dsr-release` and includes:
+A release event defaults to `event_type: dsr-release`. Use `--event NAME` to
+select a receiver's event type; that event is retained in the request plan,
+delivery receipts, and every retry. Changing it for an existing outbox is a
+plan conflict. The default payload includes:
 
 ```json
 {

@@ -457,7 +457,8 @@ _rf_promote() {
 }
 
 _rf_dispatch_require() {
-    if ! declare -F _dp_release_plan >/dev/null || ! declare -F _dp_release_outbox >/dev/null; then
+    if ! declare -F _dp_release_plan >/dev/null || ! declare -F _dp_release_outbox >/dev/null ||
+       ! declare -F _dp_outbox_identity >/dev/null; then
         # shellcheck source=src/dispatch.sh
         source "$_RELEASE_FINALIZE_DIR/dispatch.sh" || return 3
     fi
@@ -468,7 +469,7 @@ _rf_dispatch_require() {
 # The outbox repeats this validation under its own lock when delivery begins.
 _rf_dispatch_preflight() {
     local plan="$1" root="$2" identity key file hash
-    identity=$(jq -Sc '{source_repo,tool:.payload.tool,version:.payload.version,run_id:.payload.run_id}' <<< "$plan") || return 1
+    identity=$(_dp_outbox_identity "$plan") || return $?
     key=$(_dp_digest_text "$identity") || return $?
     file="$root/$key/state.json"
     [[ ! -L "$root" && ! -L "$root/$key" ]] || return 2

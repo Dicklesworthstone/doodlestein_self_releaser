@@ -301,21 +301,48 @@ _dp_state_hash() {
 _dp_release_plan() (
     set -o pipefail
     local source="$1" selected="$2" payload="$3" repo id body digest material row rows=''
+    local event="${4-dsr-release}" release_id="${5:-}"
+    if [[ $# -ge 5 ]]; then
+        [[ "$release_id" =~ ^[1-9][0-9]{0,15}$ ]] && (( release_id <= 9007199254740991 )) || {
+            _dp_log_error 'Invalid GitHub release ID'; return 4;
+        }
+    fi
     while IFS= read -r repo; do
         material=$(jq -Scn --arg source "$source" --arg repo "$repo" \
-            --argjson payload "$payload" '{source_repo:$source,repo:$repo,event_type:"dsr-release",payload:$payload}') || return 1
+            --arg event "$event" --argjson payload "$payload" \
+            '{source_repo:$source,repo:$repo,event_type:$event,payload:$payload}') || return 1
         id=$(_dp_digest_text "$material") || return $?
         material=$(jq -c --arg source "$source" --arg id "$id" \
             '.+{source_repo:$source,delivery_id:$id}' <<< "$payload") || return 1
-        body=$(_dp_body dsr-release "$material") || return $?
+        body=$(_dp_body "$event" "$material") || return $?
         digest=$(_dp_digest_text "$body") || return $?
         row=$(jq -nc --arg repo "$repo" --arg id "$id" --arg body "$body" --arg hash "$digest" \
             '{repo:$repo,delivery_id:$id,body:$body,request_sha256:$hash}') || return 1
         rows+="$row"$'\n'
     done <<< "$selected"
-    jq -Scs --arg source "$source" --argjson payload "$payload" \
-        '{source_repo:$source,payload:$payload,requests:sort_by(.repo)}' <<< "$rows"
+    jq -Scs --arg source "$source" --argjson payload "$payload" --arg release_id "$release_id" '
+        {source_repo:$source,payload:$payload,requests:sort_by(.repo)} |
+        if $release_id=="" then . else .release_id=($release_id|tonumber) end' <<< "$rows"
 )
+
+# A published release keeps one namespace even when a retry changes its tool,
+# version spelling, event or payload. Such changes must conflict with the saved
+# plan, not silently create another delivery. Standalone invocation identities
+# retain their exact existing bytes when no GitHub release ID is supplied.
+_dp_outbox_identity() {
+    local plan="$1" source release_id
+    jq -es 'length==1 and (.[0]|type=="object")' <<< "$plan" >/dev/null 2>&1 || return 4
+    if jq -e 'has("release_id")' <<< "$plan" >/dev/null; then
+        release_id=$(jq -er '.release_id | select(type=="number" and floor==. and
+            .>0 and .<=9007199254740991)' <<< "$plan") || return 4
+        source=$(jq -er '.source_repo | strings' <<< "$plan") || return 4
+        source=$(_dp_repo "$source") || return 4
+        jq -Scn --arg source "$source" --argjson release_id "$release_id" \
+            '{source_repo:$source,release_id:$release_id}'
+    else
+        jq -Sc '{source_repo,tool:.payload.tool,version:.payload.version,run_id:.payload.run_id}' <<< "$plan"
+    fi
+}
 
 _dp_state_valid() {
     local file="$1" plan="$2"
@@ -323,7 +350,7 @@ _dp_state_valid() {
     jq -e -s --argjson plan "$plan" '
         def integer: type=="number" and .>=0 and .==floor;
         def receipt($r; $t):
-            type=="object" and .repo==$r.repo and .event_type=="dsr-release" and
+            type=="object" and .repo==$r.repo and .event_type==($r.body|fromjson|.event_type) and
             (.attempts|integer and .<=10) and (.outcome=="blocked" or .attempts>=1) and
             (.http_status==null or (.http_status|type=="string" and test("^[0-9]{3}$"))) and
             (.retry_not_before==null or (.retry_not_before|integer and .<=9999999999)) and
@@ -389,9 +416,11 @@ _dp_release_outbox() (
     set -o pipefail
     umask 077
     local plan="$1" root="$2" retry_uncertain="$3" inspect="$4" guard="${5:-}" identity key session file
-    local work='' state next oldhash current i indices repo body receipt outcome rc=0 retry_at now result
+    local require_existing="${6:-false}"
+    local work='' state next oldhash current i indices repo body event receipt outcome rc=0 retry_at now result
+    [[ "$require_existing" == true || "$require_existing" == false ]] || return 4
     [[ -z "$guard" ]] || declare -F "$guard" >/dev/null || return 3
-    identity=$(jq -Sc '{source_repo,tool:.payload.tool,version:.payload.version,run_id:.payload.run_id}' <<< "$plan") || return 1
+    identity=$(_dp_outbox_identity "$plan") || return $?
     key=$(_dp_digest_text "$identity") || return $?
     [[ -n "$root" && "$root" != *[[:cntrl:]]* && "$root" != *\\* && ! -L "$root" ]] || return 4
     if [[ "$inspect" != true ]]; then
@@ -415,6 +444,10 @@ _dp_release_outbox() (
     trap 'exit 5' HUP INT TERM
     oldhash=$(_dp_state_hash "$file") || return $?
     if [[ "$oldhash" == absent ]]; then
+        if [[ "$require_existing" == true ]]; then
+            _dp_log_error "Saved dispatch outbox disappeared: $file"
+            return 2
+        fi
         [[ "$inspect" != true ]] || return 4
         state=$(jq -Scn --argjson plan "$plan" \
             '{schema_version:1,kind:"dsr-dispatch-outbox",plan:$plan,
@@ -448,8 +481,9 @@ _dp_release_outbox() (
         command -v curl >/dev/null || { rc=3; break; }
         repo=$(jq -r --argjson i "$i" '.plan.requests[$i].repo' <<< "$state") || return 1
         body=$(jq -r --argjson i "$i" '.plan.requests[$i].body' <<< "$state") || return 1
+        event=$(jq -er '.event_type | strings | select(length>0)' <<< "$body") || return 2
         if [[ -n "$guard" ]]; then
-            if "$guard" "$repo" dsr-release "$body"; then :; else rc=$?; break; fi
+            if "$guard" "$repo" "$event" "$body"; then :; else rc=$?; break; fi
         fi
         next=$(jq -Sc --argjson i "$i" '
             (.deliveries[$i].history[-1].outcome // "pending") as $previous |
@@ -461,13 +495,13 @@ _dp_release_outbox() (
         # Persist intent BEFORE crossing the POST boundary. Any interruption
         # after this point leaves a sending/uncertain state, not pending work.
         result=0
-        receipt=$(_dp_deliver "$repo" dsr-release "$body" "$guard") || result=$?
-        if ! jq -e -s --arg repo "$repo" --argjson rc "$result" '
-                length==1 and (.[0]|type=="object" and .repo==$repo and .event_type=="dsr-release" and
+        receipt=$(_dp_deliver "$repo" "$event" "$body" "$guard") || result=$?
+        if ! jq -e -s --arg repo "$repo" --arg event "$event" --argjson rc "$result" '
+                length==1 and (.[0]|type=="object" and .repo==$repo and .event_type==$event and
                 .exit_code==$rc and (.attempts|type=="number" and .>=0) and
                 ((.outcome=="accepted" and $rc==0 and .http_status=="204") or
                  (.outcome!="accepted" and $rc!=0)))' <<< "$receipt" >/dev/null 2>&1; then
-            receipt=$(_dp_result "$repo" dsr-release uncertain 8 1 '') || return 1
+            receipt=$(_dp_result "$repo" "$event" uncertain 8 1 '') || return 1
         fi
         next=$(jq -Sc --argjson i "$i" --argjson receipt "$receipt" \
             '.deliveries[$i].history[-1] += {outcome:$receipt.outcome,receipt:$receipt}' <<< "$state") || return 1
@@ -491,15 +525,16 @@ _dp_release_outbox() (
 dispatch_release() (
     set -o pipefail
     local tool='' version='' repos='' sha='' run_id='' path='' dry="${DRY_RUN:-false}"
+    local event=dsr-release
     local payload tag material source='' state_dir='' retry_uncertain=false inspect=false selected plan
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --tool|-t|--version|-V|--repos|-r|--sha|--run-id|--repo-path|--source-repo|--state-dir)
+            --tool|-t|--version|-V|--repos|-r|--sha|--run-id|--repo-path|--source-repo|--state-dir|--event)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || return 4
                 case "$1" in
                     --tool|-t) tool="$2" ;; --version|-V) version="$2" ;; --repos|-r) repos="$2" ;;
                     --sha) sha="$2" ;; --run-id) run_id="$2" ;; --repo-path) path="$2" ;;
-                    --source-repo) source="$2" ;; --state-dir) state_dir="$2" ;;
+                    --source-repo) source="$2" ;; --state-dir) state_dir="$2" ;; --event) event="$2" ;;
                 esac
                 shift 2 ;;
             --dry-run|-n) dry=true; shift ;;
@@ -508,7 +543,7 @@ dispatch_release() (
             --help|-h)
                 printf '%s\n' 'USAGE: dispatch_release TOOL VERSION --sha COMMIT [--repos OWNER/REPO,...]' \
                     'Use --repo-path DIR to resolve the exact release tag; --run-id ID selects a stable invocation.' \
-                    'Options: --source-repo OWNER/REPO --state-dir DIR --status --retry-uncertain --dry-run' \
+                    'Options: --source-repo OWNER/REPO --event NAME --state-dir DIR --status --retry-uncertain --dry-run' \
                     'Uncertain delivery is not replayed without --retry-uncertain (duplicates are possible).'
                 return 0 ;;
             -*) return 4 ;;
@@ -547,12 +582,12 @@ dispatch_release() (
         '{tool:$tool,version:$version,sha:(if $sha=="" then null else $sha end),run_id:$run_id}') || return 1
     _dp_log_info "Run ID: $run_id; $tool $tag; SHA: ${sha:-unresolved}"
     if [[ "$dry" == true ]]; then
-        dispatch_batch dsr-release --repos "$repos" --payload "$payload" --dry-run
+        dispatch_batch "$event" --repos "$repos" --payload "$payload" --dry-run
         return $?
     fi
     _dp_config || return $?
     selected=$(_dp_repos "$repos") || return $?
-    plan=$(_dp_release_plan "$source" "$selected" "$payload") || return $?
+    plan=$(_dp_release_plan "$source" "$selected" "$payload" "$event") || return $?
     [[ -n "$state_dir" ]] || state_dir="${DISPATCH_STATE_DIR:-${DSR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dsr}/dispatch}"
     _dp_release_outbox "$plan" "$state_dir" "$retry_uncertain" "$inspect"
 )
@@ -583,7 +618,7 @@ dispatch_release_json() (
 
 export -f _dp_log_error _dp_log_info _dp_repo _dp_int _dp_body _dp_get_token
 export -f _dp_config _dp_http _dp_header _dp_result _dp_deliver _dp_repos
-export -f _dp_digest_text _dp_state_hash _dp_release_plan _dp_state_valid _dp_state_write
+export -f _dp_digest_text _dp_state_hash _dp_release_plan _dp_outbox_identity _dp_state_valid _dp_state_write
 export -f _dp_outbox_summary _dp_release_outbox
 export -f dispatch_check_auth dispatch_event dispatch_batch dispatch_release dispatch_release_json
 
