@@ -398,6 +398,18 @@ function Get-DsrCargoSourceKey {
     return $Name + [char]0 + $Version + [char]0 + $Source
 }
 
+function Test-DsrCargoDependencyTargetRequired {
+    param($Target)
+    # Match Cargo's dependency build semantics, including the Unix verifier.
+    # Published manifests can retain examples/tests/bins omitted from archives.
+    # Unknown or missing kinds never establish an exemption.
+    if (-not $Target.PSObject.Properties['kind'] -or $Target.kind -isnot [array] -or $Target.kind.Count -eq 0) { return $true }
+    foreach ($kind in $Target.kind) {
+        if ($kind -isnot [string] -or $kind -cnotin @('bin','test','bench','example')) { return $true }
+    }
+    return $false
+}
+
 function Assert-DsrCargoSourceBoundary {
     param([string]$Path, [string]$Root, [switch]$Exact, [switch]$File)
     $rootGuards = Open-DsrCachePathGuard $Root
@@ -526,7 +538,9 @@ function Invoke-DsrCargoSources {
             if (-not $target.PSObject.Properties['src_path']) { throw 'Missing dependency target source' }
             $path = Get-DsrCacheFullPath $target.src_path
             if (-not (Test-DsrCacheInside $path $root) -or $path -ieq $root) { throw 'Dependency target escapes its source tree' }
-            Assert-DsrCargoSourceBoundary -Path $path -Root $root -File
+            if ((Test-DsrCargoDependencyTargetRequired $target) -or (Test-Path -LiteralPath $path)) {
+                Assert-DsrCargoSourceBoundary -Path $path -Root $root -File
+            }
         }
     }
     $trees = [Collections.Generic.List[object]]::new(); $indexed = @{}
@@ -539,6 +553,7 @@ function Invoke-DsrCargoSources {
         foreach ($file in $tree.files) { $null = $fileNames.Add($file.path) }
         if (-not $fileNames.Contains($package.manifest)) { throw 'Missing dependency manifest' }
         foreach ($target in $byPackage[$package.package_id].targets) {
+            if (-not (Test-DsrCargoDependencyTargetRequired $target)) { continue }
             $path = Get-DsrCacheFullPath $target.src_path
             if (-not $fileNames.Contains($path.Substring($package.root.Length+1))) { throw 'Missing dependency target source' }
         }

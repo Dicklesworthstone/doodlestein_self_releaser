@@ -224,6 +224,7 @@ function Test-DsrLockedGitSubmodules {
         $failedFixture = New-GeneratedSourceFixture 'submodule-poisoned-admission' -FromWorkspace $subWorkspace
         $buildCommand = 'cargo build --locked --offline -j1'
         $failedConfigured = @('CARGO_TARGET_DIR=' + $failedFixture.Parent + '/target')
+        if ($env:LIB) { $failedConfigured += 'LIB=' + $env:LIB }
         if ($env:RUSTUP_HOME) { $failedConfigured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
         Write-FixtureText $childSource "pub const VALUE: u32 = 43;`n"
         $failedAdmission = Invoke-GeneratedSourceProgram -Operation Metadata -SourceRoot $failedFixture.SourceRoot -BuildCommand $buildCommand `
@@ -287,6 +288,7 @@ function Test-DsrLockedGitSubmodules {
         $fixture = New-GeneratedSourceFixture 'submodule-generated-stage' -FromWorkspace $subWorkspace
         $target = $fixture.Parent + '/target'
         $configured = @('CARGO_TARGET_DIR=' + $target)
+        if ($env:LIB) { $configured += 'LIB=' + $env:LIB }
         if ($env:RUSTUP_HOME) { $configured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
         $generated = @{SourceRoot=$fixture.SourceRoot;BuildCommand=$buildCommand;ConfiguredEnvironment=$configured}
         $admission = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Metadata -Suffix nested-clean @generated).Out -Depth 100
@@ -408,7 +410,7 @@ try {
     $archive = $crate + '/target/package/source_registry_dep-1.0.0.crate'
     $archiveBytes = [IO.File]::ReadAllBytes($archive)
     $server = [DsrSourceRegistryFixture]::new($archiveBytes,(Get-DsrCacheBytesHash $archiveBytes))
-    Write-FixtureText ($upstream + '/Cargo.toml') "[package]`nname=`"source_git_dep`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
+    Write-FixtureText ($upstream + '/Cargo.toml') "[package]`nname=`"source_git_dep`"`nversion=`"1.0.0`"`nedition=`"2021`"`n[[example]]`nname=`"omitted`"`npath=`"examples/omitted.rs`"`n"
     Write-FixtureText ($upstream + '/src/lib.rs') "pub fn answer() -> u32 { 2 }`n"
     $null = Invoke-Program $git @('init','--initial-branch=main',$upstream)
     $null = Invoke-Program $git @('-C',$upstream,'add','Cargo.toml','src/lib.rs')
@@ -427,6 +429,13 @@ try {
     $metadataPath = $root + '/metadata.json'; $receiptPath = $root + '/sources.json'
     $metadataText = (Invoke-Program $cargo @('metadata','--locked','--offline','--all-features','--format-version','1','--manifest-path',($workspace + '/Cargo.toml')) $workspace).Out
     Write-FixtureText $metadataPath $metadataText
+    $omittedPackage = (ConvertFrom-Json $metadataText -Depth 100).packages | Where-Object { $_.name -ceq 'source_git_dep' }
+    $omittedTarget = $omittedPackage.targets | Where-Object { $_.name -ceq 'omitted' }
+    Assert-Check 'real Cargo metadata retains an omitted dependency example' ($null -ne $omittedTarget -and -not (Test-Path -LiteralPath $omittedTarget.src_path))
+    foreach ($kind in @('lib','custom-build','proc-macro','unknown')) {
+        Assert-Check ('dependency target remains required: ' + $kind) (Test-DsrCargoDependencyTargetRequired ([pscustomobject]@{kind=@($kind)}))
+    }
+    Assert-Check 'missing target kind stays required' (Test-DsrCargoDependencyTargetRequired ([pscustomobject]@{}))
     $arguments = @{MetadataPath=$metadataPath;ReceiptPath=$receiptPath;Lockfile=($workspace + '/Cargo.lock');CargoHome=$cargoHomePath;SourceRoot=$workspace}
     $summary = Invoke-DsrCargoSources -Operation capture @arguments
     Assert-Check 'real registry and Git packages authenticated against Cargo.lock' ($summary.package_count -eq 2 -and $summary.authentication.locked_archive_packages -eq 1 -and $summary.authentication.locked_git_packages -eq 1)
@@ -606,6 +615,7 @@ try {
     $generatedParent = $generatedFixture.Parent; $generatedSource = $generatedFixture.SourceRoot
     $generatedTarget = $root + '/target-generated'
     $configured = @('CARGO_TARGET_DIR=' + $generatedTarget)
+    if ($env:LIB) { $configured += 'LIB=' + $env:LIB }
     if ($env:RUSTUP_HOME) { $configured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
     $buildCommand = 'cargo build --locked --offline -j1'
     $generatedArguments = @{SourceRoot=$generatedSource;BuildCommand=$buildCommand;ConfiguredEnvironment=$configured}
@@ -724,6 +734,7 @@ try {
             Assert-Check ('refused ' + $damage + ' snapshot publishes no seed receipt') (-not [IO.File]::Exists($refusedHome + '/.dsr-cache-seed.json'))
         } else {
             $caseConfigured = @('CARGO_TARGET_DIR=' + $caseFixture.Parent + '/target')
+            if ($env:LIB) { $caseConfigured += 'LIB=' + $env:LIB }
             if ($env:RUSTUP_HOME) { $caseConfigured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
             [Environment]::SetEnvironmentVariable('CARGO_HOME',$caseAmbient)
             try {
