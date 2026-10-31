@@ -265,8 +265,13 @@ Dependency-cache reuse is unchanged, and prior attempt outputs are retained.
 Strict native Rust builds seed private Cargo homes with downloads selected
 by the committed `Cargo.lock`: checksum-matching crate archives, their index
 records, and Git databases containing locked commits. Ambient extracted registry
-sources and Git checkouts are never copied; Cargo recreates them offline from
-the selected downloads. Unrelated cached links, special files, and large archives
+sources and ordinary Git checkouts are never copied; Cargo recreates them offline
+from the selected downloads. A locked Git commit containing submodules also
+retains its matching checkout and self-contained nested Git stores, so Cargo can
+resolve those submodules offline. The checkout must have the exact locked HEAD;
+each nested commit and its source bytes are then authenticated against the
+gitlink in its parent before the seed is admitted. Unrelated cached links,
+special files, and large archives
 do not enter the seed, and an unused Git cache on another volume is not opened.
 Selection covers the complete lockfile, including other targets and features;
 selected Git databases and legacy registry Git indexes retain their history.
@@ -278,8 +283,9 @@ resolution publishes a retained seed alongside the source snapshot. If that
 first resolution lacks dependencies, no seed is published: refill the ambient
 cache and retry. Once admitted, the seed survives deletion or in-place changes
 to the ambient cache, and every metadata invocation and target attempt receives
-a fresh copy. Retained seeds contain downloads only, even after metadata
-has unpacked sources, and retries must match the seed's original lockfile
+a fresh copy. Retained seeds contain the selected downloads and any required
+submodule checkouts; ordinary sources unpacked during metadata do not enter the
+seed. Retries must match the seed's original lockfile
 selection and inventory. The selected lockfile hash must agree with the lockfile used
 to authenticate dependency sources. Parallel targets therefore do not share
 writable dependency files.
@@ -289,7 +295,11 @@ dependency source files against the committed `Cargo.lock`. Registry archives
 must have their locked SHA-256 checksums, and their extracted files must match
 those archives. Git checkouts must match the locked commit's actual objects.
 This covers the all-features graph from every workspace member on both Unix
-and Windows. Vendored sources have a separate trust basis: they must be inside
+and Windows. Nested Git submodules use the parent's authenticated gitlink as
+their commit authority, independently of a mutable child HEAD or URL. Missing,
+modified or substituted submodule sources and external Git administration
+pointers are refused. Windows dependency sources still refuse symlinks and
+reparse points. Vendored sources have a separate trust basis: they must be inside
 the primary workspace's independently verified source snapshot.
 The coordinator holds hashes of metadata and source evidence, verifies them
 before project compilation, and independently rechecks the source files before artifact

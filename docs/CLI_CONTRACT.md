@@ -856,12 +856,16 @@ unpublished and suppresses dispatch and upgrade hooks.
 Strict native builds trust the configured build host and its installed
 compiler, linker, and Cargo subcommands. DSR isolates Cargo configuration and
 records the explicit build-influence environment. Native Rust builds use
-independent Cargo homes. Strict Unix and Windows builds copy only downloads
+independent Cargo homes. Strict Unix and Windows builds copy dependency inputs
 selected by the committed `Cargo.lock`: checksum-matching archives, corresponding sparse index
 records or matching legacy Git indexes, and Git databases containing pinned
-commits. Cargo recreates extracted registry sources and Git checkouts offline;
-ambient `registry/src` and `git/checkouts` trees are not opened or copied, and
-unmatched crate archives do not enter the seed. Candidate Git databases are
+commits. Cargo recreates extracted registry sources and ordinary Git checkouts
+offline; ambient `registry/src` trees and unrelated Git checkouts are not opened
+or copied, and unmatched crate archives do not enter the seed. A locked Git
+commit with submodules additionally retains only its matching checkout, selected
+by its exact HEAD, including self-contained nested Git stores needed for offline
+resolution. Source authentication subsequently binds every child commit to its
+parent's authenticated gitlink before seed admission. Candidate Git databases are
 examined for locked revisions, and selected index storage is validated; unsafe
 download candidates can still refuse preparation. A lockfile without Git
 dependencies does not inspect the Git cache. Selection conservatively covers
@@ -871,7 +875,9 @@ Ordinary native builds copy the `registry` and `git` caches.
 Metadata and target attempts never compile through ambient cache symlinks or
 Windows junctions. Strict metadata admits a retained seed only after successful
 locked offline resolution and source authentication; retained seeds contain
-only the selected downloads. Retries verify the retained inventory and original
+the selected downloads and any necessary locked submodule checkouts. Ordinary
+sources unpacked by metadata do not enter the seed. Retries verify the retained
+inventory and original
 lockfile selection before making another private copy. Windows holds the physical
 lockfile against replacement or writes through metadata and seed admission.
 The selected lockfile hash must match the authenticated source lockfile hash
@@ -887,6 +893,12 @@ Strict native Unix and Windows builds authenticate resolved dependency sources a
 the workspace's committed `Cargo.lock` before admitting a reusable seed. Registry
 archives must match their locked SHA-256 checksums, and their extracted files must
 match the archive. Git checkout files must match the locked commit's Git objects.
+Git submodules are authenticated recursively against the commit recorded in the
+parent tree, with a maximum depth of 16 and a shared 500000-entry limit on Windows.
+Every nested checkout must have its own regular `.git` directory and internal
+object store. External administrative pointers, alternates, missing commits,
+unlisted nested repositories and modified source bytes are refused. Windows
+dependency symlinks and reparse points remain unsupported.
 The gate follows the all-features metadata graph from every workspace member,
 including members outside the default selection; unrelated cached packages do
 not become source inputs. Vendored sources must remain inside the primary

@@ -3,7 +3,7 @@
 # Fixtures remain inspectable. The explicit Linux adapter proves PowerShell,
 # Cargo, hashes and admission logic; it does not claim Windows/NTFS evidence.
 [CmdletBinding()]
-param([switch]$PortableStorageSemantics, [string]$BashPath,
+param([switch]$PortableStorageSemantics, [string]$BashPath, [switch]$SubmodulesOnly,
     [string]$BackendPath=(Join-Path $PSScriptRoot '../../src/cargo_sources_windows.ps1'))
 
 Set-StrictMode -Version Latest
@@ -55,10 +55,10 @@ function Write-FixtureText {
 }
 
 function New-GeneratedSourceFixture {
-    param([string]$Name)
+    param([string]$Name, [string]$FromWorkspace=$workspace)
     $parent = $root + '/' + $Name; $source = $parent + '/source'
     foreach ($relative in @('Cargo.toml','Cargo.lock','.cargo/config.toml','src/main.rs')) {
-        Write-FixtureText ($source + '/' + $relative) ([IO.File]::ReadAllText($workspace + '/' + $relative))
+        Write-FixtureText ($source + '/' + $relative) ([IO.File]::ReadAllText($FromWorkspace + '/' + $relative))
     }
     $marker = $parent + '/compiler-ran'
     Write-FixtureText ($source + '/build.rs') ('fn main() { std::fs::write(r#"' + $marker + '"#, b"compiled").unwrap(); }')
@@ -139,6 +139,197 @@ esac
     return Invoke-Program ([Environment]::ProcessPath) $childArguments -ExpectFailure:$ExpectFailure
 }
 
+function Test-DsrLockedGitSubmodules {
+    # Cargo/libgit2 constructs these checkouts itself, including the nested
+    # self-contained object stores. No fabricated metadata or source receipt
+    # substitutes for actual locked resolution, compilation or admission.
+    $caseRoot = $root + '/submodules'
+    $producers = $caseRoot + '/upstreams'
+    $leaf = $producers + '/leaf'; $middle = $producers + '/middle'; $top = $producers + '/top'
+    $subWorkspace = $caseRoot + '/workspace'; $subHome = $caseRoot + '/ambient'
+    $savedHome = [Environment]::GetEnvironmentVariable('CARGO_HOME')
+    $null = [IO.Directory]::CreateDirectory($subHome)
+    [Environment]::SetEnvironmentVariable('CARGO_HOME',$subHome)
+    try {
+        foreach ($repo in @($leaf,$middle,$top)) {
+            $null = Invoke-Program $git @('init','--initial-branch=main',$repo)
+        }
+        Write-FixtureText ($leaf + '/value.rs') "pub const VALUE: u32 = 42;`n"
+        $null = Invoke-Program $git @('-C',$leaf,'add','value.rs')
+        $null = Invoke-Program $git @('-C',$leaf,'-c','user.name=DSR Fixture','-c','user.email=dsr-fixture@example.invalid','commit','-m','nested source')
+        $leafRevision = (Invoke-Program $git @('-C',$leaf,'rev-parse','HEAD')).Out.Trim()
+        $leafTree = (Invoke-Program $git @('-C',$leaf,'rev-parse','HEAD^{tree}')).Out.Trim()
+        $leafUri = [Uri]::new($leaf).AbsoluteUri
+        Write-FixtureText ($middle + '/.gitmodules') ("[submodule `"inner`"]`npath = inner`nurl = $leafUri`n")
+        $null = Invoke-Program $git @('-C',$middle,'add','.gitmodules')
+        $null = Invoke-Program $git @('-C',$middle,'update-index','--add','--cacheinfo',('160000,' + $leafRevision + ',inner'))
+        $null = Invoke-Program $git @('-C',$middle,'-c','user.name=DSR Fixture','-c','user.email=dsr-fixture@example.invalid','commit','-m','parent-pinned leaf')
+        $middleRevision = (Invoke-Program $git @('-C',$middle,'rev-parse','HEAD')).Out.Trim()
+        $middleTree = (Invoke-Program $git @('-C',$middle,'rev-parse','HEAD^{tree}')).Out.Trim()
+        $middleUri = [Uri]::new($middle).AbsoluteUri
+        Write-FixtureText ($top + '/Cargo.toml') "[package]`nname=`"source_submodule_dep`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
+        Write-FixtureText ($top + '/src/lib.rs') "include!(`"../vendor/inner/value.rs`");`npub fn answer() -> u32 { VALUE }`n"
+        Write-FixtureText ($top + '/.gitmodules') ("[submodule `"vendor`"]`npath = vendor`nurl = $middleUri`n")
+        $null = Invoke-Program $git @('-C',$top,'add','Cargo.toml','src/lib.rs','.gitmodules')
+        $null = Invoke-Program $git @('-C',$top,'update-index','--add','--cacheinfo',('160000,' + $middleRevision + ',vendor'))
+        $null = Invoke-Program $git @('-C',$top,'-c','user.name=DSR Fixture','-c','user.email=dsr-fixture@example.invalid','commit','-m','dependency with nested submodules')
+        $topRevision = (Invoke-Program $git @('-C',$top,'rev-parse','HEAD')).Out.Trim()
+        $topUri = [Uri]::new($top).AbsoluteUri
+        Write-FixtureText ($subWorkspace + '/Cargo.toml') ("[package]`nname=`"submodule_source_app`"`nversion=`"1.0.0`"`nedition=`"2021`"`n" +
+            "[dependencies]`nsource_submodule_dep = { git = `"$topUri`", rev = `"$topRevision`" }`n")
+        Write-FixtureText ($subWorkspace + '/.cargo/config.toml') ''
+        Write-FixtureText ($subWorkspace + '/src/main.rs') "fn main() { println!(`"{}`", source_submodule_dep::answer()); }`n"
+        $null = Invoke-Program $cargo @('fetch','--manifest-path',($subWorkspace + '/Cargo.toml')) $subWorkspace
+        $metadataPath = $caseRoot + '/metadata.json'
+        Write-FixtureText $metadataPath (Invoke-Program $cargo @('metadata','--locked','--offline','--all-features','--format-version','1') $subWorkspace).Out
+        $graph = ConvertFrom-Json ([IO.File]::ReadAllText($metadataPath)) -Depth 100
+        $package = $graph.packages | Where-Object { $_.name -ceq 'source_submodule_dep' }
+        $checkout = ([IO.Path]::GetDirectoryName($package.manifest_path)).Replace('\','/')
+        $childRoot = $checkout + '/vendor/inner'; $childAdmin = $childRoot + '/.git'; $childSource = $childRoot + '/value.rs'
+        Assert-Check 'real Cargo resolves nested self-contained Git submodule stores' ([IO.Directory]::Exists($checkout + '/vendor/.git') -and [IO.Directory]::Exists($childAdmin))
+        $binary = '/debug/submodule_source_app' + $(if ($script:WindowsHost) { '.exe' } else { '' })
+        $null = Invoke-Program $cargo @('build','--locked','--offline','-j1','--target-dir',($caseRoot + '/target-clean')) $subWorkspace
+        Assert-Check 'genuine offline compilation consumes the parent-pinned nested source' ((Invoke-Program ($caseRoot + '/target-clean' + $binary) @()).Out.Trim() -ceq '42')
+        $arguments = @{MetadataPath=$metadataPath;ReceiptPath=($caseRoot + '/sources.json');Lockfile=($subWorkspace + '/Cargo.lock');CargoHome=$subHome;SourceRoot=$subWorkspace}
+        $summary = Invoke-DsrCargoSources -Operation capture @arguments
+        $evidence = (Read-DsrCargoReceipt $arguments.ReceiptPath).value
+        $proof = @($evidence.authentication.packages)[0]
+        Assert-Check 'submodule proof retains both exact parent-pinned commits and trees' ($summary.authentication.locked_git_packages -eq 1 -and
+            $proof.commit -ceq $topRevision -and @($proof.submodules).Count -eq 1 -and $proof.submodules[0].path -ceq 'vendor' -and
+            $proof.submodules[0].commit -ceq $middleRevision -and $proof.submodules[0].tree -ceq $middleTree -and
+            @($proof.submodules[0].submodules).Count -eq 1 -and $proof.submodules[0].submodules[0].path -ceq 'inner' -and
+            $proof.submodules[0].submodules[0].commit -ceq $leafRevision -and $proof.submodules[0].submodules[0].tree -ceq $leafTree)
+        $null = Invoke-DsrCargoSources -Operation verify -ExpectedSha256 $summary.sha256 @arguments
+        Assert-Check 'independent verification accepts unchanged nested Git source evidence' $true
+        $childHead = $childAdmin + '/HEAD'; $originalHead = [IO.File]::ReadAllText($childHead)
+        Write-FixtureText $childHead (('f' * 40) + "`n")
+        try {
+            $headArguments = $arguments.Clone(); $headArguments.ReceiptPath = $caseRoot + '/changed-head-sources.json'
+            $headSummary = Invoke-DsrCargoSources -Operation capture @headArguments
+            $headProof = @((Read-DsrCargoReceipt $headArguments.ReceiptPath).value.authentication.packages)[0]
+            Assert-Check 'mutable child HEAD cannot replace parent-gitlink authority' ($headSummary.authentication.locked_git_packages -eq 1 -and
+                $headProof.submodules[0].submodules[0].commit -ceq $leafRevision)
+        } finally { Write-FixtureText $childHead $originalHead }
+        $bad = $arguments.Clone(); $bad.ReceiptPath = $caseRoot + '/refused-sources.json'
+        $original = [IO.File]::ReadAllText($childSource)
+        Write-FixtureText $childSource "pub const VALUE: u32 = 43;`n"
+        $null = Invoke-Program $cargo @('build','--locked','--offline','-j1','--target-dir',($caseRoot + '/target-poisoned')) $subWorkspace
+        Assert-Check 'nested source poison changes an actual ungated Cargo executable' ((Invoke-Program ($caseRoot + '/target-poisoned' + $binary) @()).Out.Trim() -ceq '43')
+        Assert-Refused 'nested source poison fails independent verification' { Invoke-DsrCargoSources -Operation verify -ExpectedSha256 $summary.sha256 @arguments } 'differ from locked content'
+        Assert-Refused 'fresh receipt cannot authorize pre-existing nested source poison' { Invoke-DsrCargoSources -Operation capture @bad } 'differ from locked content'
+        Write-FixtureText $childSource $original
+
+        # A fresh generated admission must refuse poisoned selected checkouts
+        # without publishing a canonical seed or entering project compilation.
+        $failedFixture = New-GeneratedSourceFixture 'submodule-poisoned-admission' -FromWorkspace $subWorkspace
+        $buildCommand = 'cargo build --locked --offline -j1'
+        $failedConfigured = @('CARGO_TARGET_DIR=' + $failedFixture.Parent + '/target')
+        if ($env:RUSTUP_HOME) { $failedConfigured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
+        Write-FixtureText $childSource "pub const VALUE: u32 = 43;`n"
+        $failedAdmission = Invoke-GeneratedSourceProgram -Operation Metadata -SourceRoot $failedFixture.SourceRoot -BuildCommand $buildCommand `
+            -ConfiguredEnvironment $failedConfigured -Suffix poisoned-submodule -ExpectFailure
+        Assert-GeneratedSourceRefusal 'generated metadata rejects poisoned selected submodule content' $failedAdmission 'differ from locked content'
+        Assert-Check 'failed submodule admission publishes no seed or compiler marker' (-not [IO.Directory]::Exists($failedFixture.Parent + '/.cargo-home') -and
+            -not [IO.File]::Exists($failedFixture.CompilerMarker) -and
+            -not [IO.File]::Exists($failedFixture.Parent + '/.cargo-home-poisoned-submodule/.dsr-cargo-sources.json'))
+        Write-FixtureText $childSource $original
+
+        $retainedAdmin = $caseRoot + '/retained-child-admin'
+        [IO.Directory]::Move($childAdmin,$retainedAdmin)
+        try {
+            Assert-Refused 'missing nested Git administration cannot inherit parent authority' { Invoke-DsrCargoSources -Operation capture @bad }
+            Write-FixtureText $childAdmin ('gitdir: ' + $retainedAdmin)
+            Assert-Refused 'external nested gitdir pointer is refused' { Invoke-DsrCargoSources -Operation capture @bad } 'linked|special|Git|directory|cache entry'
+            [IO.File]::Move($childAdmin,($caseRoot + '/retained-gitdir-pointer'))
+            $null = Invoke-Program $git @('init','--initial-branch=main',$childRoot)
+            Assert-Refused 'unrelated child object store cannot prove the parent-pinned commit' { Invoke-DsrCargoSources -Operation capture @bad } 'Missing|missing|wrong-type|Git object'
+            [IO.Directory]::Move($childAdmin,($caseRoot + '/retained-unrelated-child-admin'))
+        } finally { [IO.Directory]::Move($retainedAdmin,$childAdmin) }
+        foreach ($pointer in @('commondir','objects/info/alternates','objects/info/http-alternates')) {
+            $path = $childAdmin + '/' + $pointer
+            Write-FixtureText $path ''
+            Assert-Refused ('empty nested external storage pointer is refused: ' + $pointer) { Invoke-DsrCargoSources -Operation capture @bad } 'External Git object storage|external'
+            $refusedSeed = $caseRoot + '/refused-seed-' + $pointer.Replace('/','-')
+            Assert-Refused ('selected submodule cache refuses external storage before admission: ' + $pointer) {
+                Invoke-DsrCargoCache -Operation snapshot -First $subHome -Second $refusedSeed -Lockfile ($subWorkspace + '/Cargo.lock')
+            } 'External|external'
+            Assert-Check ('external storage does not publish a seed receipt: ' + $pointer) (-not [IO.File]::Exists($refusedSeed + '/.dsr-cache-seed.json'))
+            [IO.File]::Move($path,($caseRoot + '/retained-' + $pointer.Replace('/','-')))
+        }
+        $extraAdmin = $checkout + '/src/.git'
+        $null = Invoke-Program $git @('init','--bare',$extraAdmin)
+        Assert-Refused 'unlisted nested Git administration is not exempted from exact inventory' { Invoke-DsrCargoSources -Operation capture @bad } 'directories differ|unlisted|Unexpected'
+        [IO.Directory]::Move($extraAdmin,($caseRoot + '/retained-unlisted-admin'))
+        $extraDirectory = $childRoot + '/unlisted-empty'; $null = [IO.Directory]::CreateDirectory($extraDirectory)
+        Assert-Refused 'unlisted nested empty directories are refused' { Invoke-DsrCargoSources -Operation capture @bad } 'directories differ'
+        [IO.Directory]::Move($extraDirectory,($caseRoot + '/retained-extra-directory'))
+        if (-not $script:WindowsHost) {
+            $caseFile = $childRoot + '/VALUE.rs'; Write-FixtureText $caseFile $original
+            Assert-Refused 'case-colliding nested source names are refused' { Invoke-DsrCargoSources -Operation capture @bad } 'ambiguous|collid|differ from locked content'
+            [IO.File]::Move($caseFile,($caseRoot + '/retained-case-collision.rs'))
+        }
+        $retainedChild = $caseRoot + '/retained-linked-child'; [IO.Directory]::Move($childRoot,$retainedChild)
+        $linkKind = if ($script:WindowsHost) { 'Junction' } else { 'SymbolicLink' }
+        $null = New-Item -ItemType $linkKind -Path $childRoot -Target $retainedChild
+        Assert-Refused 'nested source directory reparse is refused before following it' { Invoke-DsrCargoSources -Operation capture @bad } 'linked|special|reparse'
+        [IO.Directory]::Move($childRoot,($caseRoot + '/retained-child-reparse'))
+        [IO.Directory]::Move($retainedChild,$childRoot)
+        Assert-Check 'every failed nested source capture leaves its receipt unpublished' (-not [IO.File]::Exists($bad.ReceiptPath))
+
+        $unlocked = ([IO.Path]::GetDirectoryName($checkout)).Replace('\','/') + '/unlocked-fixture'
+        $null = Invoke-Program $git @('init','--initial-branch=main',$unlocked)
+        Write-FixtureText ($unlocked + '/unrelated.txt') 'not selected by Cargo.lock'
+        $null = Invoke-Program $git @('-C',$unlocked,'add','unrelated.txt')
+        $null = Invoke-Program $git @('-C',$unlocked,'-c','user.name=DSR Fixture','-c','user.email=dsr-fixture@example.invalid','commit','-m','unlocked ambient checkout')
+        $outside = $caseRoot + '/unselected-outside'; Write-FixtureText ($outside + '/sentinel') 'unchanged'
+        $null = New-Item -ItemType $linkKind -Path ($unlocked + '/unrelated-link') -Target $outside
+        $null = New-Item -ItemType $linkKind -Path ($subHome + '/git/checkouts/unrelated-linked') -Target $outside
+        $fixture = New-GeneratedSourceFixture 'submodule-generated-stage' -FromWorkspace $subWorkspace
+        $target = $fixture.Parent + '/target'
+        $configured = @('CARGO_TARGET_DIR=' + $target)
+        if ($env:RUSTUP_HOME) { $configured += 'RUSTUP_HOME=' + $env:RUSTUP_HOME }
+        $generated = @{SourceRoot=$fixture.SourceRoot;BuildCommand=$buildCommand;ConfiguredEnvironment=$configured}
+        $admission = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Metadata -Suffix nested-clean @generated).Out -Depth 100
+        $seed = $fixture.Parent + '/.cargo-home'; $seedReceipt = $seed + '/.dsr-cache-seed.json'
+        $seedDigest = Get-DsrCargoSourceFileHash $seedReceipt
+        $checkoutRelative = $checkout.Substring($subHome.Length + 1)
+        Assert-Check 'selected seed retains the exact locked checkout and both submodule object stores' (
+            $admission.selection.git_revisions.Count -eq 1 -and $admission.selection.git_revisions[0] -ceq $topRevision -and
+            [IO.Directory]::Exists($seed + '/' + $checkoutRelative + '/vendor/.git/objects') -and
+            [IO.Directory]::Exists($seed + '/' + $checkoutRelative + '/vendor/inner/.git/objects') -and
+            -not [IO.File]::Exists($fixture.CompilerMarker))
+        Assert-Check 'wrong-HEAD ambient checkout and its unrelated reparse stay outside the seed' (
+            -not [IO.Directory]::Exists($seed + '/' + $unlocked.Substring($subHome.Length + 1)) -and
+            -not [IO.Directory]::Exists($seed + '/git/checkouts/unrelated-linked') -and
+            [IO.File]::ReadAllText($outside + '/sentinel') -ceq 'unchanged')
+        $null = Invoke-GeneratedSourceProgram -Operation Build -Admission $admission @generated
+        Assert-Check 'generated strict build compiles the authenticated nested dependency' ((Invoke-Program ($target + $binary) @()).Out.Trim() -ceq '42' -and [IO.File]::Exists($fixture.CompilerMarker))
+        $final = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Finish -Admission $admission @generated).Out -Depth 100
+        Assert-Check 'independent collection accepts original nested dependency authority' ($final.mode -ceq 'inventory' -and $final.cargo_home -ceq $admission.cargo_home)
+        $retainedHome = $caseRoot + '/retained-ambient'; $retainedProducers = $caseRoot + '/retained-upstreams'
+        [IO.Directory]::Move($subHome,$retainedHome); [IO.Directory]::Move($producers,$retainedProducers)
+        try {
+            $retry = ConvertFrom-Json (Invoke-GeneratedSourceProgram -Operation Metadata -Suffix nested-offline @generated).Out -Depth 100
+            Assert-Check 'retained seed resolves nested submodules after ambient and upstream loss' ($retry.cargo_home -cne $admission.cargo_home -and
+                $retry.dependency_sources.authentication.locked_git_packages -eq 1 -and
+                (Get-DsrCargoSourceFileHash $seedReceipt) -ceq $seedDigest)
+            $null = Invoke-GeneratedSourceProgram -Operation Build -Admission $retry @generated
+            Assert-Check 'retained submodule seed supports a genuine offline retry build' ((Invoke-Program ($target + $binary) @()).Out.Trim() -ceq '42')
+            $null = Invoke-GeneratedSourceProgram -Operation Finish -Admission $retry @generated
+            $attemptSource = $retry.cargo_home + '/' + $checkoutRelative + '/vendor/inner/value.rs'
+            Write-FixtureText $attemptSource "pub const VALUE: u32 = 99;`n"
+            $rejectedBuild = Invoke-GeneratedSourceProgram -Operation Build -Admission $retry -ExpectFailure @generated
+            Assert-GeneratedSourceRefusal 'generated build refuses changed private submodule source' $rejectedBuild 'differ from locked content'
+            $rejectedFinish = Invoke-GeneratedSourceProgram -Operation Finish -Admission $retry -ExpectFailure @generated
+            Assert-GeneratedSourceRefusal 'independent collection refuses changed private submodule source' $rejectedFinish 'differ from locked content'
+            Assert-Check 'private-attempt poison does not change the retained submodule seed' ((Get-DsrCargoSourceFileHash $seedReceipt) -ceq $seedDigest -and
+                [IO.File]::ReadAllText($seed + '/' + $checkoutRelative + '/vendor/inner/value.rs') -ceq $original)
+        } finally {
+            [IO.Directory]::Move($retainedProducers,$producers); [IO.Directory]::Move($retainedHome,$subHome)
+        }
+    } finally { [Environment]::SetEnvironmentVariable('CARGO_HOME',$savedHome) }
+}
+
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -204,6 +395,11 @@ $oldWorkspaceWrapper = [Environment]::GetEnvironmentVariable('RUSTC_WORKSPACE_WR
 [Environment]::SetEnvironmentVariable('RUSTC_WORKSPACE_WRAPPER',$null)
 $server = $null
 try {
+    if ($SubmodulesOnly) {
+        Test-DsrLockedGitSubmodules
+        Write-Output ('Source submodule authentication checks: ' + $script:Checks + '; fixtures: ' + $root)
+        return
+    }
     Write-FixtureText ($crate + '/Cargo.toml') "[package]`nname=`"source_registry_dep`"`nversion=`"1.0.0`"`nedition=`"2021`"`n"
     Write-FixtureText ($crate + '/src/lib.rs') "pub fn answer() -> u32 { 40 }`n"
     Write-FixtureText ($crate + '/empty.txt') ''
@@ -554,6 +750,7 @@ try {
     $null = New-Item -ItemType $link -Path $registryRoot -Target $retainedParent
     Assert-Refused 'registry source reparse cannot redirect authenticated reads' { Invoke-DsrCargoSources -Operation capture @badCapture } 'Linked|linked|special|reparse'
     # Keep the refused reparse fixture intact for inspection.
+    Test-DsrLockedGitSubmodules
     Write-Output ('Source authentication checks: ' + $script:Checks + '; fixtures: ' + $root)
 } finally {
     if ($null -ne $server) { $server.Dispose() }

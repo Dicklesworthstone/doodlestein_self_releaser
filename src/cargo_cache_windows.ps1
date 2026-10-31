@@ -443,7 +443,8 @@ function Get-DsrCargoCacheRoutes {
         $pathValue = $CargoHome.TrimEnd('/') + '/' + $Relative
         $names = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
         $folded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        # Inspect only namespace routes, never registry/src or git/checkouts.
+        # Inspect namespace routes only. A Git checkout route is inspected only
+        # when a locked commit needs its nested repositories for offline use.
         # Invalid unrelated names and non-directory routing entries are ignored.
         foreach ($child in [IO.Directory]::GetFileSystemEntries($pathValue)) {
             $name = [IO.Path]::GetFileName($child)
@@ -631,10 +632,42 @@ function Get-DsrCargoLockSelection {
         foreach ($database in (Get-DsrCargoCacheRoutes $CargoHome 'git/db')) {
             $relative = 'git/db/' + $database
             $rows = Invoke-DsrCargoCacheGitProbe ($CargoHome.TrimEnd('/') + '/' + $relative) @('cat-file','--batch-check') $request
+            $matchedRevisions = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
             foreach ($row in $rows.Split("`n")) {
                 if ($row.TrimEnd("`r") -cmatch '^([0-9a-f]{40}) commit [0-9]+$' -and $revisions.Contains($Matches[1])) {
-                    Add-DsrCargoDownload $relative; break
+                    $null = $matchedRevisions.Add($Matches[1])
                 }
+            }
+            if ($matchedRevisions.Count -eq 0) { continue }
+            Add-DsrCargoDownload $relative
+
+            # The parent's bare database does not contain submodule objects.
+            # Cargo's initialized checkout keeps those nested repositories;
+            # without that exact checkout a private offline resolution would
+            # try to fetch them again. Retain only a locked gitlink-bearing
+            # revision, never arbitrary ambient checkout material. The source
+            # authenticator proves every nested commit/tree/blob after copying
+            # and before the cache seed can be published.
+            $checkoutRevisions = [Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($revision in $matchedRevisions) {
+                $tree = Invoke-DsrCargoCacheGitProbe ($CargoHome.TrimEnd('/') + '/' + $relative) @('ls-tree','-rz',$revision)
+                foreach ($node in $tree.Split([char]0)) {
+                    if ($node -cmatch '^160000 commit [0-9a-f]{40}\t') {
+                        $null = $checkoutRevisions.Add($revision)
+                        break
+                    }
+                }
+            }
+            if ($checkoutRevisions.Count -eq 0) { continue }
+            foreach ($checkout in (Get-DsrCargoCacheRoutes $CargoHome ('git/checkouts/' + $database))) {
+                $checkoutRelative = 'git/checkouts/' + $database + '/' + $checkout
+                $adminRelative = $checkoutRelative + '/.git'
+                $checkoutGuards = Open-DsrCargoCacheCandidate $CargoHome $adminRelative -Directory $true
+                if ($null -eq $checkoutGuards) { continue }
+                try {
+                    $head = (Invoke-DsrCargoCacheGitProbe ($CargoHome.TrimEnd('/') + '/' + $adminRelative) @('rev-parse','--verify','HEAD')).Trim()
+                    if ($checkoutRevisions.Contains($head)) { Add-DsrCargoDownload $checkoutRelative }
+                } finally { foreach ($guard in $checkoutGuards) { $guard.Dispose() } }
             }
         }
     }
@@ -713,7 +746,10 @@ function Get-DsrCargoCacheInventory {
                 $parts = $Relative.Split('/')
                 if ($null -ne $SelectedPaths -and
                     ($Relative -imatch '^registry/index/[^/]+/\.git$' -or
-                    $Relative -imatch '^(?:git/db/[^/]+|registry/index/[^/]+/\.git)/(?:commondir|objects/info/(?:http-)?alternates)$')) {
+                    $Relative -imatch '^(?:git/db/[^/]+|registry/index/[^/]+/\.git)/(?:commondir|objects/info/(?:http-)?alternates)$' -or
+                    $Relative -imatch '^git/checkouts/[^/]+/[^/]+/(?:.*/)?\.git/(?:.*/)?(?:commondir|objects/info/(?:http-)?alternates)$')) {
+                    # Even an empty pointer file is not part of an admitted
+                    # selected object store, including nested submodule admin.
                     throw ('External Git storage reference in selected downloads: ' + $Relative)
                 }
                 if ($parts[0] -eq 'git' -and ($parts[-1] -eq '.git' -or

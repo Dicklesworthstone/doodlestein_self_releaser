@@ -104,18 +104,19 @@ public static class DsrCargoSourceObjects {
             input.Dispose(); output.Dispose(); process.Dispose();
         }
     }
-    public static Dictionary<string, object> Git(string executable, string admin, string revision) {
+    public static Dictionary<string, object> Git(string executable, string admin, string revision, int maximumEntries) {
+        if (maximumEntries < 0 || maximumEntries > 500000) throw new InvalidDataException("Invalid locked Git source entry budget");
         SortedDictionary<string, object> files = new SortedDictionary<string, object>(StringComparer.Ordinal);
         SortedSet<string> directories = new SortedSet<string>(StringComparer.Ordinal);
+        SortedDictionary<string, object> gitlinks = new SortedDictionary<string, object>(StringComparer.Ordinal);
         HashSet<string> namespaceNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        string tree;
+        string tree; int count = 0;
         using (Reader reader = new Reader(executable, admin)) {
             ObjectData commit = reader.Get(revision, "commit");
             string first = new UTF8Encoding(false, true).GetString(commit.Data).Split('\n')[0];
             if (!Regex.IsMatch(first, "^tree [0-9a-f]{40}$")) throw new InvalidDataException("Invalid locked Git commit tree");
             tree = first.Substring(5);
             Stack<Tuple<string, string>> pending = new Stack<Tuple<string, string>>(); pending.Push(Tuple.Create("", tree));
-            int count = 0;
             while (pending.Count > 0) {
                 var current = pending.Pop(); byte[] data = reader.Get(current.Item2, "tree").Data; int offset = 0;
                 while (offset < data.Length) {
@@ -127,11 +128,15 @@ public static class DsrCargoSourceObjects {
                     string mode = entry.Substring(0, separator), leaf = entry.Substring(separator + 1);
                     Member(leaf); if (leaf.Contains('/')) throw new InvalidDataException("Invalid locked Git tree leaf");
                     string name = current.Item1 + leaf; Member(name);
-                    if (++count > 500000 || !namespaceNames.Add(name)) throw new InvalidDataException("Ambiguous or oversized locked Git tree");
+                    if (++count > maximumEntries || !namespaceNames.Add(name)) throw new InvalidDataException("Ambiguous or oversized locked Git tree");
                     string oid = Convert.ToHexString(data, end + 1, 20).ToLowerInvariant(); offset = end + 21;
                     if (mode == "40000") { directories.Add(name); pending.Push(Tuple.Create(name + "/", oid)); }
+                    else if (mode == "160000") {
+                        directories.Add(name);
+                        gitlinks.Add(name, new Dictionary<string, object> { {"path", name}, {"commit", oid} });
+                    }
                     else {
-                        if (mode != "100644" && mode != "100755") throw new InvalidDataException("Locked Git sources contain a link or submodule");
+                        if (mode != "100644" && mode != "100755") throw new InvalidDataException("Locked Git sources contain an unsupported link or mode");
                         ObjectData blob = reader.Get(oid, "blob");
                         files.Add(name, new Dictionary<string, object> { {"path", name}, {"sha256", blob.Hash}, {"size_bytes", blob.Size}, {"executable_bits", 0} });
                     }
@@ -139,7 +144,8 @@ public static class DsrCargoSourceObjects {
             }
             reader.Finish();
         }
-        return new Dictionary<string, object> { {"files", new List<object>(files.Values)}, {"directories", new List<string>(directories)}, {"tree", tree} };
+        return new Dictionary<string, object> { {"files", new List<object>(files.Values)}, {"directories", new List<string>(directories)},
+            {"gitlinks", new List<object>(gitlinks.Values)}, {"tree", tree}, {"entry_count", count} };
     }
 }
 '@
@@ -219,9 +225,13 @@ function Get-DsrCargoSourceTree {
             foreach ($child in $children) {
                 if (++$count[0] -gt 500000) { throw 'Dependency tree exceeds 500000 entries' }
                 $leaf = [IO.Path]::GetFileName($child); $relative = $Prefix + $leaf
-                if ($Kind -eq 'git' -and -not $Prefix -and $leaf -ceq '.git') {
+                if ($Kind -eq 'git' -and $leaf -ceq '.git') {
+                    # Cargo/libgit2 gives submodules self-contained object
+                    # stores. Record each administrative directory, but only
+                    # an authenticated parent gitlink can authorize it below.
+                    # A gitdir pointer, junction or other reparse still fails.
                     $admin = Open-DsrCacheEntry $child -Directory $true
-                    try { $null = $directories.Add('.git') } finally { $admin.Dispose() }
+                    try { $null = $directories.Add($relative) } finally { $admin.Dispose() }
                     continue
                 }
                 [DsrCargoSourceObjects]::Member($relative)
@@ -325,17 +335,60 @@ function Get-DsrCargoRegistryProof {
 }
 
 function Get-DsrCargoGitProof {
-    param($Tree, [string]$Source)
+    param($Tree, [string]$Source, [int]$Depth=0, [long[]]$RemainingEntries=$null,
+        [Collections.Generic.HashSet[string]]$ActiveCommits=$null)
+    if ($Depth -lt 0 -or $Depth -gt 16) { throw 'Git submodule nesting exceeds verification limit' }
+    if ($null -eq $RemainingEntries) { $RemainingEntries = [long[]]@(500000) }
+    if ($null -eq $ActiveCommits) { $ActiveCommits = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal) }
     $revision = $Source.Substring($Source.LastIndexOf('#') + 1)
     if ($revision -cnotmatch '^[0-9a-f]{40}$') { throw 'Git source requires a full locked SHA-1 commit' }
-    $admin = $Tree.path + '/.git'; $custody = Open-DsrCargoGitCustody $admin
+    if (-not $ActiveCommits.Add($revision)) { throw 'Cyclic locked Git submodule ancestry' }
+    $admin = $Tree.path + '/.git'; $custody = $null
     try {
+        $custody = Open-DsrCargoGitCustody $admin
         $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
-        $expected = [DsrCargoSourceObjects]::Git($git.Source,$admin,$revision)
+        $expected = [DsrCargoSourceObjects]::Git($git.Source,$admin,$revision,[int]$RemainingEntries[0])
+        $RemainingEntries[0] -= $expected.entry_count
+        $files = [Collections.Generic.List[object]]::new()
+        $directories = [Collections.Generic.List[string]]::new()
+        $submodules = [Collections.Generic.List[object]]::new()
+        foreach ($file in $expected.files) { $files.Add($file) }
+        foreach ($directory in $expected.directories) { $directories.Add($directory) }
+        foreach ($gitlink in $expected.gitlinks) {
+            # The parent's hashed tree pins this exact commit. Neither HEAD,
+            # .gitmodules URLs nor a checkout's own receipt supplies authority.
+            $prefix = $gitlink.path + '/'
+            $childFiles = [Collections.Generic.List[object]]::new()
+            $childDirectories = [Collections.Generic.List[string]]::new()
+            foreach ($file in $Tree.files) {
+                if ($file.path.StartsWith($prefix,[StringComparison]::Ordinal)) {
+                    $childFiles.Add(@{path=$file.path.Substring($prefix.Length);sha256=$file.sha256;
+                        size_bytes=$file.size_bytes;executable_bits=$file.executable_bits})
+                }
+            }
+            foreach ($directory in $Tree.directories) {
+                if ($directory.StartsWith($prefix,[StringComparison]::Ordinal)) { $childDirectories.Add($directory.Substring($prefix.Length)) }
+            }
+            $childTree = @{kind='git';path=($Tree.path + '/' + $gitlink.path);files=@($childFiles);directories=@($childDirectories)}
+            $childProof = Get-DsrCargoGitProof $childTree ('git+submodule#' + $gitlink.commit) ($Depth+1) $RemainingEntries $ActiveCommits
+            $submodules.Add(@{path=$gitlink.path} + $childProof)
+            # Only rows already checked against the child commit can enter
+            # the parent's expected inventory, including that child's .git.
+            foreach ($file in $childTree.files) {
+                $files.Add(@{path=($prefix + $file.path);sha256=$file.sha256;
+                    size_bytes=$file.size_bytes;executable_bits=$file.executable_bits})
+            }
+            foreach ($directory in $childTree.directories) { $directories.Add($prefix + $directory) }
+        }
         Assert-DsrCargoGitCustody $custody
-        Assert-DsrCargoSourceTree $Tree $expected.files $expected.directories
-        return @{basis='lockfile-git-objects';commit=$revision;tree=$expected.tree}
-    } finally { Close-DsrCargoGitCustody $custody }
+        Assert-DsrCargoSourceTree $Tree @($files) @($directories)
+        $proof = @{basis='lockfile-git-objects';commit=$revision;tree=$expected.tree}
+        if ($submodules.Count -gt 0) { $proof.submodules = @($submodules) }
+        return $proof
+    } finally {
+        if ($null -ne $custody) { Close-DsrCargoGitCustody $custody }
+        $null = $ActiveCommits.Remove($revision)
+    }
 }
 
 function Get-DsrCargoSourceKey {
