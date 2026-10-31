@@ -3946,7 +3946,15 @@ EOF
         while IFS= read -r include; do
             [[ -n "$include" ]] && includes+=("$include")
         done <<< "$configured"
-        [[ ${#includes[@]} -gt 0 ]] || return 0
+        if [[ ${#includes[@]} -eq 0 ]]; then
+            # Reuse still requires a complete, safe archive when there are no
+            # configured companions to trigger extraction and its validation.
+            if ! packaging_validate_archive "$archive" "$archive_format"; then
+                log_error "Cannot reuse invalid prebuilt archive for $tool: $archive"
+                return 4
+            fi
+            return 0
+        fi
         if [[ -z "$repo_path" || ! -d "$repo_path" || -L "$repo_path" ]]; then
             log_error "Cannot verify configured include_files for $tool without its source directory"
             return 4
@@ -4207,6 +4215,12 @@ EOF
                 # below (GH#16) rather than assumed.
                 :
             else
+                if [[ "$format" != "binary" ]] && \
+                   ! packaging_validate_archive "$binary_override" "$format"; then
+                    log_error "Invalid prebuilt archive for $tool $target: $binary_override"
+                    collect_failed=true
+                    return 1
+                fi
                 log_info "Archive already produced for $tool $target ($format); skipping packaging"
                 return 0
             fi
@@ -4480,11 +4494,10 @@ EOF
             fi
             if [[ -n "$existing_format" && "$existing_format" == "$format" ]]; then
 
-                if [[ -n "$existing_path" && "$format" != "binary" && \
-                      -n "$(_build_get_include_files "$tool" 2>/dev/null)" ]]; then
-                    # A matching format says nothing about the members: the
-                    # lane may have archived the executable alone (GH#29).
-                    # Verify configured include_files before skipping.
+                if [[ -n "$existing_path" && "$format" != "binary" ]]; then
+                    # A matching name or format does not prove that the lane
+                    # finished writing an archive. Validate its full payload
+                    # and any configured include_files before reusing bytes.
                     _build_package_archive_for_target "$tool" "$version" "$target" \
                         "$output_dir" "$repo_path" "$binary_name" "$existing_path" "$primary_triple" || return 1
                     if [[ -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then

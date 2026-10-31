@@ -850,6 +850,165 @@ test_build_checks_prebuilt_include_contract() {
     done
 }
 
+# A matching extension is not proof that a prebuilt archive is complete. These
+# cases cross the real build/publication boundary with no include_files, so
+# archive admission cannot depend on companion-file extraction happening first.
+test_build_validates_prebuilt_archives_without_includes() {
+    local scenario format requested corrupt
+    for scenario in gzip-valid gzip-primary-crc gzip-secondary-crc \
+            xz-valid xz-primary-trailer zip-valid zip-secondary-crc \
+            xz-conversion xz-corrupt-conversion; do
+        ((TESTS_RUN++))
+        if [[ "$HAS_YQ" != true ]] || ! command -v python3 &>/dev/null; then
+            skip "yq and Python required for prebuilt archive admission ($scenario)"
+            continue
+        fi
+        format=tar.gz; requested=tar.gz; corrupt=""
+        case "$scenario" in
+            gzip-primary-crc) corrupt=gnu ;;
+            gzip-secondary-crc) corrupt=musl ;;
+            xz-valid) format=tar.xz; requested=tar.xz ;;
+            xz-primary-trailer) format=tar.xz; requested=tar.xz; corrupt=gnu ;;
+            zip-valid) format=zip; requested=zip ;;
+            zip-secondary-crc) format=zip; requested=zip; corrupt=musl ;;
+            xz-conversion) format=tar.xz ;;
+            xz-corrupt-conversion) format=tar.xz; corrupt=gnu ;;
+        esac
+        harness_setup
+        local repo_dir="$TEST_TMPDIR/source" output_dir="$TEST_TMPDIR/output"
+        local producer="$TEST_TMPDIR/producer" name libc problems=()
+        seed_variant_lane_fixture "$repo_dir"
+        DSR_TEST_ARCHIVE_FORMAT="$requested" yq -i \
+            '.include_files=[] | .archive_format.linux=strenv(DSR_TEST_ARCHIVE_FORMAT)' \
+            "$DSR_CONFIG_DIR/repos.d/lane-tool.yaml"
+        mkdir -p "$producer"
+        # Stored ZIP and non-default gzip compression make unwanted rewriting
+        # observable. Nested ordinary members remain valid workflow payloads.
+        if ! python3 - "$producer" "$format" "$corrupt" <<'PY'
+import gzip
+import io
+import lzma
+from pathlib import Path
+import stat
+import sys
+import tarfile
+import zipfile
+
+root, fmt, corrupt = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+for variant in ('gnu', 'musl'):
+    executable = ('#!/bin/sh\necho ' + variant + '\n').encode()
+    entries = [('lane-tool', executable, 0o755),
+               ('share/guide.txt', b'workflow companion without include_files\n', 0o644)]
+    stream = io.BytesIO()
+    if fmt == 'zip':
+        with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_STORED) as archive:
+            for name, data, mode in entries:
+                item = zipfile.ZipInfo(name, date_time=(2001, 2, 3, 4, 5, 6))
+                item.create_system = 3
+                item.external_attr = (stat.S_IFREG | mode) << 16
+                archive.writestr(item, data)
+        compressed = stream.getvalue()
+    else:
+        with tarfile.open(fileobj=stream, mode='w') as archive:
+            for name, data, mode in entries:
+                item = tarfile.TarInfo(name)
+                item.size, item.mode, item.mtime = len(data), mode, 1
+                archive.addfile(item, io.BytesIO(data))
+        compressed = (gzip.compress(stream.getvalue(), compresslevel=1, mtime=1)
+                      if fmt == 'tar.gz' else lzma.compress(stream.getvalue()))
+    if variant == corrupt:
+        compressed = bytearray(compressed)
+        offset = (-8 if fmt == 'tar.gz' else -1 if fmt == 'tar.xz'
+                  else compressed.index(executable) + len(executable) - 1)
+        compressed[offset] ^= 1
+    (root / ('lane-tool-1.2.3-x86_64-unknown-linux-' + variant + '.' + fmt)).write_bytes(compressed)
+PY
+        then
+            fail "prebuilt archive fixture could not be created ($scenario)"
+            harness_teardown
+            continue
+        fi
+        mock_command_script act "$(cat <<'EOF'
+if [[ "${1:-}" == "--version" ]]; then echo "act version 0.2.87"; exit 0; fi
+artifact_dir=""; prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "--artifact-server-path" ]]; then artifact_dir="$arg"; break; fi
+  prev="$arg"
+done
+[[ -n "$artifact_dir" ]] || exit 0
+mkdir -p "$artifact_dir" || exit 1
+# act returns an artifact-transport ZIP whose entries are the release assets;
+# a release ZIP must remain an entry, not be mistaken for that outer wrapper.
+python3 - "$LANE_PREBUILT_INPUT" "$artifact_dir/workflow-artifacts.zip" <<'PY'
+from pathlib import Path
+import sys
+import zipfile
+with zipfile.ZipFile(sys.argv[2], 'w', compression=zipfile.ZIP_STORED) as archive:
+    for path in sorted(Path(sys.argv[1]).iterdir()):
+        archive.write(path, path.name)
+PY
+EOF
+)"
+        LANE_PREBUILT_INPUT="$producer" exec_run run_lane_build lane-tool \
+            --version 1.2.3 --output-dir "$output_dir"
+        for libc in gnu musl; do
+            name="lane-tool-1.2.3-x86_64-unknown-linux-$libc.$format"
+            cmp -s "$producer/$name" "$output_dir/$name" || \
+                problems+=("$libc producer bytes changed")
+        done
+        if [[ -z "$corrupt" ]]; then
+            [[ "$(exec_status)" -eq 0 ]] || problems+=("exit $(exec_status), expected success")
+            lane_publication_matches "$output_dir" "$output_dir/lane-tool-v1.2.3-manifest.json" true || \
+                problems+=("valid prebuilt output is not publishable")
+            for libc in gnu musl; do
+                name="lane-tool-1.2.3-x86_64-unknown-linux-$libc.$requested"
+                cmp -s "$output_dir/$name" "$output_dir/lane-tool-x86_64-unknown-linux-$libc.$requested" || \
+                    problems+=("$libc installer alias differs from its primary")
+            done
+            if ! python3 - "$output_dir" "$requested" <<'PY'
+from pathlib import Path
+import sys
+import tarfile
+import zipfile
+
+root, fmt = Path(sys.argv[1]), sys.argv[2]
+for variant in ('gnu', 'musl'):
+    path = root / ('lane-tool-1.2.3-x86_64-unknown-linux-' + variant + '.' + fmt)
+    if fmt == 'zip':
+        with zipfile.ZipFile(path) as archive:
+            actual = {name: archive.read(name) for name in archive.namelist()}
+    else:
+        with tarfile.open(path, 'r:gz' if fmt == 'tar.gz' else 'r:xz') as archive:
+            actual = {item.name: archive.extractfile(item).read()
+                      for item in archive.getmembers() if item.isfile()}
+    assert actual == {'lane-tool': ('#!/bin/sh\necho ' + variant + '\n').encode(),
+                      'share/guide.txt': b'workflow companion without include_files\n'}, actual
+PY
+            then
+                problems+=("archive payload differs from the workflow output")
+            fi
+        else
+            [[ "$(exec_status)" -eq 1 ]] || problems+=("exit $(exec_status), expected partial failure")
+            exec_stdout | jq -e '.status == "partial" and .details.publishable == false and
+                .details.manifest_path == ""' >/dev/null 2>&1 || \
+                problems+=("corrupt prebuilt archive was advertised as publishable")
+            exec_stderr | grep -q 'Archive admission failed' || \
+                problems+=("archive corruption was not diagnosed")
+            [[ ! -e "$output_dir/lane-tool-x86_64-unknown-linux-$corrupt.$requested" ]] || \
+                problems+=("installer alias was emitted for the corrupt variant")
+            lane_publication_matches "$output_dir" "$output_dir/lane-tool-v1.2.3-manifest.json" false || \
+                problems+=("corrupt prebuilt output remains publishable on disk")
+        fi
+        if [[ ${#problems[@]} -eq 0 ]]; then
+            pass "build validates prebuilt archives without includes ($scenario)"
+        else
+            fail "prebuilt archive admission ($scenario): ${problems[*]}"
+            echo "stderr: $(exec_stderr | tail -15)"
+        fi
+        harness_teardown
+    done
+}
+
 # The worker produces a real executable file. Only the compiler/container
 # boundary is simulated; collection, persisted receipts, resume, compression,
 # manifest generation, and release admission all run production code.
@@ -1561,6 +1720,7 @@ echo "Lane Archives and include_files:"
 test_build_completes_lane_archive_with_include_files
 test_build_refuses_attested_thin_lane_archive
 test_build_checks_prebuilt_include_contract
+test_build_validates_prebuilt_archives_without_includes
 test_build_packages_each_target_triple_variant
 test_build_names_unproduced_target_triple_variant
 test_build_refuses_secondary_variant_include_conflict
