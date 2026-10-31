@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh
+# Usage: ./test_act_runner.sh [--workflow-isolation-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -1009,6 +1009,258 @@ EOF
     fi
 }
 
+test_concurrent_workflow_isolation() {
+    log_test "Concurrent act workflows retain separate uploads, logs and receipts"
+    if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+
+module = sys.argv[1]
+root = Path(tempfile.mkdtemp(prefix='dsr-workflow-isolation-'))
+print('Retained workflow isolation fixture:', root, flush=True)
+failures = []
+checks = 0
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+# The only simulated boundary is act's Docker transport. It receives the real
+# production argv and writes a real upload ZIP. Workers, timeouts, run storage,
+# result sidecars, and resume receipt validation remain production code.
+transport = r'''#!/usr/bin/env python3
+import json, os, sys, time, zipfile
+from pathlib import Path
+args = sys.argv[1:]
+job = args[args.index('-j') + 1]
+uploads = Path(args[args.index('--artifact-server-path') + 1])
+root = Path(os.environ['DSR_WORKFLOW_FIXTURE'])
+home = Path(os.environ['HOME'])
+config = home / '.config' / 'act' / 'actrc'
+(root / (job + '.launch.json')).write_text(json.dumps({
+    'job': job, 'argv': args, 'artifact_dir': str(uploads), 'home': str(home),
+    'config': config.read_text() if config.exists() else ''}))
+(root / (job + '.started')).write_text('started\n')
+gate = 'failure.started' if job == 'success' else 'release-failure'
+if job != 'retry':
+    deadline = time.monotonic() + 15
+    while not (root / gate).exists():
+        if time.monotonic() > deadline:
+            raise SystemExit('fixture barrier timed out: ' + gate)
+        time.sleep(0.01)
+# All jobs intentionally upload the same wrapper basename. The failing job
+# writes only after the successful worker has frozen its immutable receipt.
+with zipfile.ZipFile(uploads / 'artifact.zip', 'w') as archive:
+    archive.writestr('tool-v1.2.3.bin', (job + ' upload bytes\n').encode())
+print(job + ' workflow log', flush=True)
+raise SystemExit(9 if job == 'failure' else 0)
+'''
+
+driver = r'''source "$1"
+act_check() { return 0; }
+act_platform_uses_act() { return 0; }
+act_get_job_for_target() {
+    case "$2" in
+        linux/amd64) printf 'success\n' ;;
+        linux/arm64) printf 'failure\n' ;;
+        linux/386) printf 'retry\n' ;;
+    esac
+}
+act_get_flags() { printf '%s\n' '-P ubuntu-latest=fixture'; }
+# Sibling Bash workers inherit $$, even though their BASHPID values differ.
+# Freeze only the naming clock so the old timestamp+$$ collision is certain.
+date() {
+    if [[ "${1:-}" == +%Y%m%d-%H%M%S ]]; then
+        printf '20261031-120000\n'
+    else
+        command date "$@"
+    fi
+}
+ACT_REPO_WORKFLOW=workflow.yml
+ACT_REPO_LOCAL_PATH=$2
+run_fixture_worker() {
+    local label=$1 target=$2
+    printf '%s %s\n' "$$" "$BASHPID" > "$ACT_REPO_LOCAL_PATH/$label.shell-pids"
+    _act_run_target_worker fixture v1.2.3 44444444-4444-4444-8444-444444444444 \
+        "$target" 1 "$ACT_REPO_LOCAL_PATH/$label.worker.log" \
+        "$ACT_REPO_LOCAL_PATH/$label.result.json" false null '{}' '' '' act-local release
+}
+run_fixture_worker success linux/amd64 &
+success_pid=$!
+run_fixture_worker failure linux/arm64 &
+failure_pid=$!
+success_status=0
+failure_status=0
+wait "$success_pid" || success_status=$?
+wait "$failure_pid" || failure_status=$?
+retry_status=0
+run_fixture_worker retry linux/386 || retry_status=$?
+printf '%s %s %s\n' "$success_status" "$failure_status" "$retry_status" > "$2/worker-statuses"
+'''
+
+for case in ('ordinary', 'writable-parent'):
+    directory = root / case
+    directory.mkdir()
+    home = directory / 'operator-home'
+    home.mkdir()
+    (home / '.actrc').write_text('-P ubuntu-latest=fixture\n')
+    binary = directory / 'act'
+    binary.write_text(transport)
+    binary.chmod(0o755)
+    (directory / 'workflow.yml').write_text(
+        'name: fixture\n# ' + ('../sibling' if case == 'writable-parent' else 'ordinary') + '\n')
+    env = os.environ.copy()
+    env.update(PATH=str(directory) + os.pathsep + env['PATH'], HOME=str(home),
+               DSR_WORKFLOW_FIXTURE=str(directory), DSR_CACHE_DIR=str(directory / 'cache'),
+               ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
+               ACT_LOGS_DIR=str(directory / 'logs'), ACT_TIMEOUT='20')
+    output = open(directory / 'driver.log', 'wb')
+    process = subprocess.Popen(['bash', '-c', driver, '_', module, str(directory)],
+                               env=env, stdout=output, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    try:
+        success_file = directory / 'success.result.json'
+        deadline = time.monotonic() + 12
+        success = None
+        while time.monotonic() < deadline:
+            try:
+                success = json.loads(success_file.read_text())
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                if process.poll() is not None:
+                    break
+                time.sleep(0.02)
+        check(case + ': successful worker completes while peer is still running',
+              success is not None and success.get('status') == 'success' and process.poll() is None)
+        if success is None:
+            continue
+        success_archive = Path(success['artifact_dir']) / 'artifact.zip'
+        success_log = Path(success['log_file'])
+        frozen_upload = success_archive.read_bytes()
+        frozen_log = success_log.read_bytes()
+        frozen_result = success_file.read_bytes()
+        (directory / 'release-failure').write_text('release\n')
+        status = process.wait(timeout=12)
+        results = {name: json.loads((directory / (name + '.result.json')).read_text())
+                   for name in ('success', 'failure', 'retry')}
+        check(case + ': success, failure and retry retain their exit statuses',
+              status == 0 and (directory / 'worker-statuses').read_text().split() == ['0', '6', '0'])
+        pids = [(directory / (name + '.shell-pids')).read_text().split()
+                for name in ('success', 'failure')]
+        check(case + ': concurrent workers share $$ but have different process identities',
+              pids[0][0] == pids[1][0] and pids[0][1] != pids[1][1])
+        for field in ('run_id', 'artifact_dir', 'log_file'):
+            check(case + ': each invocation owns a different ' + field,
+                  len({result[field] for result in results.values()}) == 3)
+        check(case + ': later failed upload and retry cannot mutate successful bytes',
+              success_archive.read_bytes() == frozen_upload)
+        check(case + ': later failed output and retry cannot mutate successful log',
+              success_log.read_bytes() == frozen_log and frozen_log == b'success workflow log\n')
+        check(case + ': successful result sidecar remains immutable',
+              success_file.read_bytes() == frozen_result)
+        receipts = success.get('resume_artifacts', [])
+        check(case + ': successful receipt names only its own frozen upload',
+              len(receipts) == 1 and receipts[0]['path'] == str(success_archive) and
+              receipts[0]['sha256'] == hashlib.sha256(frozen_upload).hexdigest() and
+              receipts[0]['size_bytes'] == len(frozen_upload))
+        reusable = subprocess.run(
+            ['bash', '-c', 'source "$1"; _act_target_result_available "$(cat "$2")"',
+             '_', module, str(success_file)], env=env, capture_output=True)
+        check(case + ': completed success is still reusable after failed peer and retry',
+              reusable.returncode == 0)
+        check(case + ': failed worker does not acquire a success receipt',
+              results['failure']['status'] == 'failed' and
+              not results['failure'].get('resume_artifacts'))
+        for name, result in results.items():
+            upload = Path(result['artifact_dir']) / 'artifact.zip'
+            with zipfile.ZipFile(upload) as archive:
+                payload = archive.read('tool-v1.2.3.bin')
+            launch = json.loads((directory / (name + '.launch.json')).read_text())
+            check(case + ': ' + name + ' upload and log belong to that job',
+                  payload == (name + ' upload bytes\n').encode() and
+                  Path(result['log_file']).read_text() == name + ' workflow log\n' and
+                  result['artifact_count'] == 1 and launch['artifact_dir'] == result['artifact_dir'])
+            check(case + ': ' + name + ' keeps requested job, workflow and release tag',
+                  result['job'] == name and result['workflow'] == 'workflow.yml' and
+                  'GITHUB_REF=refs/tags/v1.2.3' in launch['argv'] and
+                  'GITHUB_REF_NAME=v1.2.3' in launch['argv'] and
+                  'GITHUB_REF_TYPE=tag' in launch['argv'])
+            check(case + ': ' + name + ' owns private artifact storage and log',
+                  stat.S_IMODE(Path(result['artifact_dir']).stat().st_mode) == 0o700 and
+                  stat.S_IMODE(Path(result['log_file']).stat().st_mode) == 0o600)
+        if case == 'writable-parent':
+            launches = [json.loads((directory / (name + '.launch.json')).read_text())
+                        for name in results]
+            check(case + ': isolated HOME is exclusive for each workflow',
+                  len({launch['home'] for launch in launches}) == 3 and
+                  all(Path(launch['home']) != home for launch in launches))
+            check(case + ': each isolated config contains exactly its own settings',
+                  all(launch['config'].splitlines() == [
+                      '-P ubuntu-latest=fixture', '--container-options --user 0:0']
+                      for launch in launches))
+    finally:
+        # Release only this fixture's waiting transport and retire its process
+        # group if an assertion/setup failure prevented normal completion.
+        if not (directory / 'release-failure').exists():
+            (directory / 'release-failure').write_text('release\n')
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=8)
+        output.close()
+
+for field in ('ACT_ARTIFACTS_DIR', 'ACT_LOGS_DIR', 'DSR_CACHE_DIR'):
+    directory = root / ('blocked-' + field.lower())
+    directory.mkdir()
+    blocked = directory / 'occupied'
+    blocked.write_bytes(b'preexisting evidence\n')
+    marker = directory / 'transport-started'
+    binary = directory / 'act'
+    binary.write_text('#!/usr/bin/env python3\nimport os\nfrom pathlib import Path\n'
+                      "Path(os.environ['DSR_WORKFLOW_MARKER']).write_text('started\\n')\n")
+    binary.chmod(0o755)
+    (directory / 'workflow.yml').write_text('name: fixture\n# ../sibling\n')
+    env = os.environ.copy()
+    env.update(PATH=str(directory) + os.pathsep + env['PATH'],
+               DSR_WORKFLOW_MARKER=str(marker), DSR_CACHE_DIR=str(directory / 'cache'),
+               ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
+               ACT_LOGS_DIR=str(directory / 'logs'))
+    env[field] = str(blocked)
+    result = subprocess.run(
+        ['bash', '-c', 'source "$1"; act_check() { return 0; }; '
+         'act_run_workflow "$2" workflow.yml success push v1.2.3 -P ubuntu-latest=fixture',
+         '_', module, str(directory)], env=env, capture_output=True, timeout=5)
+    (directory / 'stderr.log').write_bytes(result.stderr)
+    check(field + ': unavailable storage fails before transport and preserves existing bytes',
+          result.returncode == 1 and not marker.exists() and
+          blocked.read_bytes() == b'preexisting evidence\n' and
+          b'Failed to allocate' in result.stderr)
+
+(root / 'summary.json').write_text(json.dumps({'checks': checks, 'failures': failures}) + '\n')
+print('Workflow isolation: %d checks, %d failures' % (checks, len(failures)), flush=True)
+sys.exit(bool(failures))
+PY
+    then
+        log_pass "Concurrent and sequential workflows preserve independent evidence"
+    else
+        log_fail "Workflow artifact, log or isolated HOME namespace collision"
+    fi
+}
+
 test_timeout_descendant_cancellation() {
     log_test "Real timeout descendant cancellation"
     if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
@@ -1403,6 +1655,11 @@ PY
 
 # Main
 main() {
+    if [[ "${1:-}" == "--workflow-isolation-only" ]]; then
+        test_concurrent_workflow_isolation
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     if [[ "${1:-}" == "--native-guard-only" ]]; then
         test_unix_native_build_guard
         [[ "$FAIL_COUNT" -eq 0 ]]
@@ -1438,6 +1695,7 @@ main() {
     test_act_run_workflow_injects_tag_env
     test_act_run_workflow_requires_runner_image_mapping
     test_act_run_workflow_isolates_parent_write_workflows
+    test_concurrent_workflow_isolation
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
     test_workflow_process_cancellation

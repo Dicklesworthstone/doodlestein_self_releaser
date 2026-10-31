@@ -305,6 +305,26 @@ dsr wraps act with additional features:
 3. **Artifact collection**: Consolidates artifacts from all sources
 4. **Logging**: Structured logs with timing and error tracking
 
+Each workflow invocation reserves a new private upload directory and an
+exclusive log file. The returned `run_id`, `artifact_dir`, and `log_file`
+identify that invocation, including failed jobs and retries. Parallel targets
+and retries started in the same second cannot reuse another invocation's
+uploads or overwrite its log. Successful workers freeze the files from their
+own directory into the existing resume receipts; a failed peer's output does
+not invalidate those completed receipts.
+
+Workflows that need to create sibling directories also receive separate
+isolated HOME directories, so concurrent jobs cannot combine their generated
+act configuration. Failure to allocate a run directory or reserve its log
+stops the invocation before act starts.
+
+Run `bash scripts/tests/test_act_runner.sh --workflow-isolation-only` to check
+this boundary without Docker. The test runs real orchestration workers and
+receipt validation with a controlled uploader that writes actual ZIP files;
+it covers concurrent success and failure, a retry within the same clock
+second, retained logs, and isolated HOME ownership. It does not execute a
+GitHub Actions job inside a container.
+
 ### dsr build flow (Linux via act)
 
 ```
