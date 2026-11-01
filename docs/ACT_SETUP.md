@@ -340,6 +340,20 @@ it covers concurrent success and failure, a retry within the same clock
 second, retained logs, and isolated HOME ownership. It does not execute a
 GitHub Actions job inside a container.
 
+The coordinator also owns the task stream used to dispatch targets. Target
+workers start with empty stdin, so a compiler, transport or build command that
+reads stdin cannot consume undispatched tasks. Explicit input streams used by
+individual build helpers retain their existing behavior. Target failures still
+produce attempt receipts, and resume reuses completed work only after checking
+its recorded artifact bytes.
+
+Run `bash scripts/tests/test_act_orchestration.sh --dispatch-stdin-only` for the
+focused scheduler regression. It exercises six physical targets serially and
+seven physical/variant tasks with two workers, including a failed task, changed
+artifact bytes, and selective resume. Native execution is a controlled subprocess
+that deliberately reads stdin; the planner, scheduler, worker supervision and
+state/receipt validation are production code.
+
 ### dsr build flow (Linux via act)
 
 ```

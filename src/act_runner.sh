@@ -13035,11 +13035,15 @@ act_orchestrate_build() {
             fi
         fi
 
+        # This loop owns the task stream on stdin. A background function can
+        # inherit it even without job control; a compiler, transport or other
+        # descendant that reads stdin would drain undispatched task rows.
+        # Workers receive all inputs through arguments and explicit streams.
         DSR_NATIVE_OUTPUT_STAGE="$output_stage" \
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
-            "$selected_triple" "$task_key" "$target_sync_receipt" &
+            "$selected_triple" "$task_key" "$target_sync_receipt" </dev/null &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
         worker_targets+=("$task_key")

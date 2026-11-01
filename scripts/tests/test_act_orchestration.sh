@@ -2,6 +2,8 @@
 # test_act_orchestration.sh - Tests for hybrid build orchestration functions
 #
 # These tests verify the orchestration layer that coordinates act + SSH builds
+# Run --dispatch-stdin-only for the issue #48 scheduler regression without
+# compiler, Docker, SSH, or host-health fixtures.
 
 set -uo pipefail
 
@@ -103,6 +105,236 @@ ACT_REPOS_DIR="$DSR_CONFIG_DIR/repos.d"
 export LOG_LEVEL=0
 log_init >/dev/null 2>&1
 build_state_init
+
+# The task planner, scheduler, worker, state and resume receipts are production
+# code. Only native execution is a controlled subprocess that reads stdin and
+# writes small payloads; these fixtures are not cross-compilation evidence.
+test_dispatch_stdin_isolation() {
+    python3 - "$SCRIPT_DIR" "$TEMP_DIR" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+project, temporary = map(Path, sys.argv[1:])
+root = temporary / 'dispatch-stdin'
+root.mkdir()
+print('Retained dispatch stdin fixtures:', root, flush=True)
+platforms = ['linux/amd64', 'linux/arm64', 'darwin/amd64', 'darwin/arm64',
+             'windows/amd64', 'windows/arm64']
+gnu, musl = 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl'
+checks, failures = 0, []
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(('PASS ' if condition else 'FAIL ') + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+producer = r'''import json, os, sys, time
+from pathlib import Path
+root, platform, triple, phase, jobs = Path(sys.argv[1]), *sys.argv[2:]
+key = platform + ('@' + triple if triple else '')
+slug = key.replace('/', '-')
+captured = sys.stdin.buffer.read()
+(root / (phase + '-' + slug + '.stdin')).write_bytes(captured)
+def event(state):
+    row = json.dumps(dict(phase=phase, key=key, state=state, at=time.monotonic_ns())) + '\n'
+    fd = os.open(root / 'events.jsonl', os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, row.encode())
+    finally:
+        os.close(fd)
+event('start')
+# Make overlap observable without a wall-clock performance assertion. Even
+# the broken dispatcher must finish this fixture if it lost the second task.
+if phase == 'first' and int(jobs) > 1 and platform == 'linux/amd64' and triple.endswith('-gnu'):
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        rows = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+        if sum(row['phase'] == phase and row['state'] == 'start' for row in rows) >= 2:
+            break
+        time.sleep(0.02)
+time.sleep(0.2)
+failed = phase == 'first' and jobs == '2' and platform == 'linux/arm64'
+result = dict(platform=platform, method='native', host='fixture-' + platform.replace('/', '-'),
+              status='failed' if failed else 'success', exit_code=9 if failed else 0,
+              target_triple=triple or None)
+if failed:
+    result['error'] = 'deliberate native transport failure'
+else:
+    payload = root / 'payloads' / (phase + '-' + slug)
+    with payload.open('xb') as output:
+        output.write(('scheduler payload ' + key + '\n').encode())
+    result.update(artifact_path=str(payload), artifact_paths=[str(payload)])
+event('end')
+print(json.dumps(result, separators=(',', ':')), flush=True)
+sys.exit(result['exit_code'])
+'''
+
+driver = r'''source "$1/src/logging.sh"
+source "$1/src/config.sh"
+source "$1/src/build_state.sh"
+source "$1/src/act_runner.sh"
+unset -f selector_acquire_slot selector_release_slot
+act_run_native_build() {
+    # Retain the real timeout wrapper and a real stdin-reading descendant.
+    _act_run_with_timeout 12 python3 "$DSR_DISPATCH_FIXTURE/producer.py" \
+        "$DSR_DISPATCH_FIXTURE" "$2" "${9:-}" "$DSR_DISPATCH_PHASE" "$DSR_DISPATCH_JOBS"
+}
+args=(stdinfixture v1.0.0 --parallel-jobs "$DSR_DISPATCH_JOBS" \
+      --output-dir "$DSR_DISPATCH_FIXTURE/output" --source-sync-json "$(cat "$DSR_DISPATCH_FIXTURE/sync.json")")
+if [[ -n "${DSR_DISPATCH_RESUME:-}" ]]; then
+    args+=(--resume-run-id "$DSR_DISPATCH_RESUME")
+fi
+act_orchestrate_build "${args[@]}"
+status=$?
+exit "$status"
+'''
+
+def run(directory, phase, jobs, resume=''):
+    env = {key: value for key, value in os.environ.items()
+           if key not in ('BASH_ENV', 'ENV') and not key.startswith('BASH_FUNC_')}
+    env.update(DSR_DISPATCH_FIXTURE=str(directory), DSR_DISPATCH_PHASE=phase,
+               DSR_DISPATCH_JOBS=str(jobs), DSR_DISPATCH_RESUME=resume,
+               DSR_CONFIG_DIR=str(directory / 'config'), DSR_REPOS_FILE=str(directory / 'config/repos.yaml'),
+               DSR_HOSTS_FILE=str(directory / 'config/hosts.yaml'), ACT_REPOS_DIR=str(directory / 'config/repos.d'),
+               DSR_STATE_DIR=str(directory / 'state'), DSR_CACHE_DIR=str(directory / 'cache'),
+               ACT_ARTIFACTS_DIR=str(directory / 'artifacts'), ACT_LOGS_DIR=str(directory / 'logs'),
+               DSR_RUN_ID='', DSR_BUILD_LOCK_HELD_BY_CALLER='0', NO_COLOR='1')
+    result = subprocess.run(['bash', '-c', driver, '_', str(project)], env=env,
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    (directory / (phase + '.stdout')).write_bytes(result.stdout)
+    (directory / (phase + '.stderr')).write_bytes(result.stderr)
+    try:
+        body = json.loads(result.stdout)
+    except (ValueError, UnicodeDecodeError):
+        raise AssertionError('Missing structured scheduler result: ' + result.stderr.decode(errors='replace'))
+    state_files = list((directory / 'state/builds').rglob('state.json'))
+    matches = [json.loads(path.read_text()) for path in state_files]
+    matches = [value for value in matches if value.get('run_id') == body['run_id']]
+    if len(matches) != 1:
+        raise AssertionError('Missing unique production build state: ' + str(state_files))
+    state = matches[0]
+    (directory / (phase + '.state.json')).write_text(json.dumps(state) + '\n')
+    return result.returncode, body, state
+
+def events(directory, phase):
+    path = directory / 'events.jsonl'
+    return [row for row in map(json.loads, path.read_text().splitlines()) if row['phase'] == phase]
+
+def verify_phase(label, directory, phase, jobs, result, state, expected, expected_failures=0):
+    rows = result['targets']
+    check(label + ': complete ordered task results', [row.get('task_key') for row in rows] == expected)
+    check(label + ': exact success/failure summary', result['summary'] == dict(
+        total=len(expected), success=len(expected) - expected_failures, failed=expected_failures))
+    check(label + ': every task has an actual attempt and immutable result path',
+          all(row.get('attempt', 0) >= 1 and Path(row.get('result_path', '/nonexistent')).is_file()
+              for row in rows))
+    check(label + ': no pending or synthetic missing-result target',
+          all(entry['status'] != 'pending' and entry.get('attempts', 0) >= 1
+              for entry in state['target_statuses'].values()) and
+          all(row.get('error') != 'No target result' for row in rows))
+    timeline = events(directory, phase)
+    starts = [row['key'] for row in timeline if row['state'] == 'start']
+    check(label + ': each expected worker actually executes exactly once',
+          sorted(starts) == sorted(expected) and len(starts) == len(set(starts)))
+    captures = list(directory.glob(phase + '-*.stdin'))
+    check(label + ': workers receive EOF rather than coordinator task JSON',
+          len(captures) == len(expected) and all(path.read_bytes() == b'' for path in captures))
+    active = peak = 0
+    for row in sorted(timeline, key=lambda value: value['at']):
+        active += 1 if row['state'] == 'start' else -1
+        peak = max(peak, active)
+    check(label + ': worker execution reaches its bound without exceeding it', peak == jobs and active == 0)
+    successful = [row for row in rows if row.get('status') == 'success']
+    check(label + ': successful receipts bind actual payload bytes', all(
+        len(row.get('resume_artifacts', [])) == 1 and
+        row['resume_artifacts'][0]['path'] == row['artifact_path'] and
+        row['resume_artifacts'][0]['sha256'] == hashlib.sha256(Path(row['artifact_path']).read_bytes()).hexdigest()
+        for row in successful))
+
+for jobs in (1, 2):
+    directory = root / ('jobs-' + str(jobs))
+    for relative in ('config/repos.d', 'output', 'payloads', 'sources'):
+        (directory / relative).mkdir(parents=True)
+    config = dict(tool_name='stdinfixture', repo='example/stdinfixture', language='rust',
+                  local_path=str(directory / 'sources'), binary_name='tool', targets=platforms,
+                  build_cmd='cargo build --release --target ${TARGET_TRIPLE}',
+                  act_job_map={platform: None for platform in platforms})
+    expected = platforms[:]
+    if jobs == 2:
+        config['target_triples'] = {'linux/amd64': [gnu, musl]}
+        expected = ['linux/amd64@' + gnu, 'linux/amd64@' + musl] + platforms[1:]
+    (directory / 'config/repos.d/stdinfixture.yaml').write_text(json.dumps(config) + '\n')
+    hosts = {platform: 'fixture-' + platform.replace('/', '-') for platform in platforms}
+    roots = {host: str(directory / 'sources' / host) for host in hosts.values()}
+    for path in roots.values():
+        Path(path).mkdir()
+    sync = dict(status='success', synced=len(roots), failed=0, target_hosts=hosts, source_roots=roots,
+                hosts=[dict(host=host, path=path, status='success') for host, path in roots.items()])
+    (directory / 'sync.json').write_text(json.dumps(sync) + '\n')
+    (directory / 'producer.py').write_text(producer)
+    status, first, state = run(directory, 'first', jobs)
+    label = 'jobs=' + str(jobs)
+    check(label + ': scheduler exit preserves worker outcome', status == (0 if jobs == 1 else 1))
+    verify_phase(label, directory, 'first', jobs, first, state, expected, jobs - 1)
+    if jobs != 2:
+        continue
+    # Continue only after a complete first attempt; a broken dispatcher still
+    # produces its own retained failure evidence rather than fabricated rows.
+    if any(not row.get('result_path') for row in first['targets']):
+        continue
+    first_rows = {row['task_key']: row for row in first['targets']}
+    preserved = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                 for row in first['targets'] for path in (row['result_path'], row['log_path'])}
+    mutated_key = expected[0]
+    Path(first_rows[mutated_key]['artifact_path']).write_bytes(b'tampered after frozen receipt\n')
+    status, resumed, resumed_state = run(directory, 'resume', jobs, first['run_id'])
+    rebuilt = {mutated_key, 'linux/arm64'}
+    check('resume: same run completes all physical and variant tasks', status == 0 and
+          resumed['run_id'] == first['run_id'] and resumed['summary'] == dict(total=7, success=7, failed=0))
+    check('resume: only failed and byte-changed tasks execute again',
+          {row['key'] for row in events(directory, 'resume') if row['state'] == 'start'} == rebuilt)
+    check('resume: completed untouched tasks retain verified reuse', all(
+        (row.get('resume_reused') is True and row['attempt'] == 1 and
+         row['result_path'] == first_rows[row['task_key']]['result_path'])
+        if row['task_key'] not in rebuilt else (not row.get('resume_reused') and row['attempt'] == 2)
+        for row in resumed['targets']))
+    check('resume: both attempted workers receive EOF',
+          len(list(directory.glob('resume-*.stdin'))) == 2 and
+          all(path.read_bytes() == b'' for path in directory.glob('resume-*.stdin')))
+    check('resume: original success and failure evidence is immutable', all(
+        hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest for path, digest in preserved.items()))
+    check('resume: no pending state and exact per-task attempt counts', all(
+        entry['status'] == 'completed' and entry['attempts'] == (2 if key in rebuilt else 1)
+        for key, entry in resumed_state['target_statuses'].items()))
+    before = (directory / 'events.jsonl').read_bytes()
+    status, reused, unused_state = run(directory, 'verified-reuse', jobs, first['run_id'])
+    check('verified reuse: no new build and every task result remains present', status == 0 and
+          len(reused['targets']) == len(expected) and
+          all(row.get('resume_reused') is True for row in reused['targets']) and
+          (directory / 'events.jsonl').read_bytes() == before)
+
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Dispatch stdin: %d checks, %d failures' % (checks, len(failures)), flush=True)
+sys.exit(bool(failures))
+PY
+}
+
+if test_dispatch_stdin_isolation; then
+    pass "dispatch owns its task stream through failure and verified resume"
+else
+    fail "a worker consumed scheduler input or lost task/state/receipt coverage"
+fi
+if [[ "${1:-}" == --dispatch-stdin-only ]]; then
+    [[ $FAIL -eq 0 ]]
+    exit $?
+fi
 
 # Target-specific executable families must use real selection and reject
 # malformed declarations before a native executable can enter an archive.
@@ -1365,6 +1597,8 @@ fi
 act_zero_artifact_check() {
     local count_json="$1" status=0 output
     output=$(
+        # Read by the production _act_build_orchestration_target loaded above.
+        # shellcheck disable=SC2034
         ACT_REPO_WORKFLOW=".github/workflows/release.yml" ACT_REPO_LOCAL_PATH="$TEMP_DIR"
         act_platform_uses_act() { return 0; }
         act_get_job_for_target() { printf 'build-linux\n'; }
