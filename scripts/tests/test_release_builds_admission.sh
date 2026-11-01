@@ -290,6 +290,6 @@ try:
     check("duplicate deadline never creates state", not (case / "builds").exists())
     print("\nBounded build admission: %d passed" % checks, flush=True)
 finally:
-    if sys.exc_info()[0] is None:
+    if sys.exc_info()[0] is None and os.environ.get("DSR_TEST_KEEP_TEMP") != "1":
         shutil.rmtree(work)
 PY

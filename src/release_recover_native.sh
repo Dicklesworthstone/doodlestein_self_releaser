@@ -749,6 +749,12 @@ def interrupted(signum, frame):
     # A Python signal handler must not acquire a synchronization lock: it can
     # interrupt the supervisor while that same lock is already held.
     cancel_requested = True
+    # Keep repeated cancellation ignored through interpreter teardown too.
+    # A Python callback returning early is insufficient: CPython can restore
+    # SIGINT's default disposition while exiting after our JSON receipt, so
+    # a second signal would replace the promised exit 5 with signal death.
+    for cancellation_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(cancellation_signal, signal.SIG_IGN)
     raise Failure("native recovery interrupted", 5)
 
 
