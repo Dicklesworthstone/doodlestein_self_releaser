@@ -77,7 +77,7 @@ def wait_for(process, predicate, label):
     while time.monotonic() < deadline:
         if predicate():
             return
-        if process.poll() is not None:
+        if process is not None and process.poll() is not None:
             break
         time.sleep(0.02)
     raise AssertionError(label)
@@ -122,6 +122,18 @@ selector_acquire_slot() {
 }
 selector_release_slot() {
     printf '%s\n' "$2" >> "$DSR_STDIN_CASE/released-slots"
+    if [[ "$DSR_STDIN_MODE" == sidecar-recovery && "$DSR_STDIN_PHASE" == first ]]; then
+        # The real worker has saved its success receipt, but the coordinator
+        # cannot reap it or save the embedded result until this barrier ends.
+        local ready_path="$DSR_STDIN_CASE/sidecar.$2.ready"
+        printf '%s\n' "$BASHPID" > "$ready_path.tmp" &&
+            mv "$ready_path.tmp" "$ready_path" || return 1
+        local deadline=$((SECONDS + 30))
+        while [[ ! -f "$DSR_STDIN_CASE/release-workers" ]]; do
+            ((SECONDS < deadline)) || return 1
+            sleep 0.02
+        done
+    fi
 }
 act_run_native_build() {
     local deadline=10
@@ -137,7 +149,7 @@ case "$DSR_STDIN_MODE" in
     killed-worker) _act_run_target_worker() { kill -KILL "$BASHPID"; } ;;
 esac
 args=(--run-id "$DSR_STDIN_RUN")
-if [[ "$DSR_STDIN_PHASE" == resume ]]; then args=(--resume-run-id "$DSR_STDIN_RUN"); fi
+if [[ "$DSR_STDIN_PHASE" == resume* ]]; then args=(--resume-run-id "$DSR_STDIN_RUN"); fi
 act_orchestrate_build stdinfixture 1.0.0 --parallel-jobs "$DSR_STDIN_JOBS" \
     --no-source-sync-gate --output-dir "$DSR_STDIN_CASE/output" "${args[@]}"
 ''')
@@ -160,7 +172,7 @@ def fixture(jobs, mode):
     return case, str(uuid.uuid4())
 
 
-def invoke(case, identity, jobs, mode, phase):
+def invocation_env(case, identity, jobs, mode, phase):
     env = dict(os.environ, DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
                DSR_CONFIG_DIR=str(case / 'config'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
                ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
@@ -169,6 +181,11 @@ def invoke(case, identity, jobs, mode, phase):
                DSR_STDIN_JOBS=str(jobs), DSR_STDIN_MODE=mode, DSR_STDIN_PHASE=phase,
                DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='3', NO_COLOR='1')
     env.pop('DSR_BUILD_LOCK_HELD_BY_CALLER', None)
+    return env
+
+
+def invoke(case, identity, jobs, mode, phase):
+    env = invocation_env(case, identity, jobs, mode, phase)
     out = open(case / (phase + '.stdout'), 'wb')
     err = open(case / (phase + '.stderr'), 'wb')
     process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
@@ -258,7 +275,7 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
           state['status'] != 'completed' and not (case / 'output/.dsr-build-purpose.json').exists())
 
 
-for jobs in (() if sys.argv[3] == '--coordinator-receipt-only' else (1, 3)):
+for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-recovery-only') else (1, 3)):
     for mode in ('success', 'failure', 'timeout', 'cancel'):
         case, identity = fixture(jobs, mode)
         first, state = invoke(case, identity, jobs, mode, 'first')
@@ -288,7 +305,7 @@ for jobs in (() if sys.argv[3] == '--coordinator-receipt-only' else (1, 3)):
         check(case.name + ': retries preserve all earlier attempt evidence',
               all(path.read_bytes() == contents for path, contents in immutable.items()))
 
-for jobs in (1, 3):
+for jobs in (() if sys.argv[3] == '--sidecar-recovery-only' else (1, 3)):
     for mode, observed_exit in (('missing-receipt', 0), ('killed-worker', 137)):
         case, identity = fixture(jobs, mode)
         first, state = invoke(case, identity, jobs, mode, 'first')
@@ -316,12 +333,99 @@ for jobs in (1, 3):
               all(not row.get('resume_reused') for row in resumed['targets']) and
               all(path.read_bytes() == contents for path, contents in immutable.items()))
 
+
+def worker_running(pid):
+    probe = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True)
+    return probe.returncode == 0 and bool(probe.stdout.strip()) and not probe.stdout.strip().startswith(b'Z')
+
+
+for jobs in (() if sys.argv[3] == '--coordinator-receipt-only' else (1, 3)):
+    case, identity = fixture(jobs, 'sidecar-recovery')
+    workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
+    env = invocation_env(case, identity, jobs, 'sidecar-recovery', 'first')
+    with open(case / 'first.stdout', 'wb') as out, open(case / 'first.stderr', 'wb') as err:
+        process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=out, stderr=err, start_new_session=True)
+        workers = []
+        try:
+            wait_for(process, lambda: len(list(case.glob('prelude.*.ready'))) == jobs,
+                     case.name + ': initial workers did not reach capacity barrier')
+            (case / 'release').write_text('continue\n')
+            wait_for(process, lambda: len(list(case.glob('sidecar.*.ready'))) == jobs,
+                     case.name + ': successful sidecars did not reach the publication barrier')
+            workers = [int(path.read_text()) for path in case.glob('sidecar.*.ready')]
+            check(case.name + ': real workers are alive after writing their sidecars',
+                  len(set(workers)) == jobs and all(worker_running(pid) for pid in workers))
+            process.kill()
+            check(case.name + ': coordinator really dies before collecting worker results',
+                  process.wait(timeout=5) == -signal.SIGKILL)
+            before = read(workspace / 'state.json')
+            (case / 'first.state.json').write_text(json.dumps(before) + '\n')
+            check(case.name + ': checkpoint retains admitted attempts without embedded completion',
+                  before['status'] == 'running' and
+                  all(before['target_statuses'][target]['status'] == 'running' and
+                      before['target_statuses'][target]['attempts'] == 1 and
+                      before['target_statuses'][target].get('result') is None
+                      for target in targets[:jobs]))
+            check(case.name + ': undispatched targets remain pending with zero attempts',
+                  all(before['target_statuses'][target]['status'] == 'pending' and
+                      before['target_statuses'][target]['attempts'] == 0
+                      for target in targets[jobs:]))
+            check(case.name + ': exactly the admitted targets executed before the crash',
+                  Counter(event['target'] for event in events(case)) == Counter(targets[:jobs]))
+        finally:
+            # Release only this fixture's blocked workers, including on an
+            # assertion failure. At the sidecar barrier their native
+            # descendants have already exited; an earlier failure still lets
+            # the live coordinator cancel those descendants normally.
+            (case / 'release-workers').write_text('continue\n')
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+            wait_for(None, lambda: all(not worker_running(pid) for pid in workers),
+                     case.name + ': released workers did not exit')
+
+    immutable = {path: path.read_bytes() for directory in ('output', 'logs', 'results')
+                 for path in ((case / directory) if directory == 'output' else workspace / directory).rglob('*')
+                 if path.is_file()}
+    resumed, state = invoke(case, identity, jobs, 'success', 'resume')
+    for row in resumed['targets'][:jobs]:
+        target = row['platform']
+        prior = before['target_statuses'][target]
+        check(case.name + ': ' + target + ' sidecar recovery retains its authoritative attempt and receipt paths',
+              row.get('attempt') == prior['attempts'] and
+              row.get('log_path') == prior['log_path'] and
+              row.get('result_path') == prior['result_path'] and
+              row.get('resume_reused') is True and
+              state['target_statuses'][target].get('reconciled_from_sidecar') is True)
+        check(case.name + ': ' + target + ' embeds the complete recovered result in state',
+              state['target_statuses'][target]['result'] == row)
+    verify_attempts(case, resumed, state, {target: 1 for target in targets}, {}, case.name + '/resume')
+    check(case.name + ': resume reuses only successful sidecars and preserves their bytes',
+          all(bool(row.get('resume_reused')) == (row['platform'] in targets[:jobs])
+              for row in resumed['targets']) and
+          all(path.read_bytes() == contents for path, contents in immutable.items()))
+
+    immutable = {path: path.read_bytes() for directory in ('output', 'logs', 'results')
+                 for path in ((case / directory) if directory == 'output' else workspace / directory).rglob('*')
+                 if path.is_file()}
+    again, again_state = invoke(case, identity, jobs, 'success', 'resume-again')
+    verify_attempts(case, again, again_state, {target: 1 for target in targets}, {}, case.name + '/resume-again')
+    check(case.name + ': second resume reuses every embedded result without new attempts or changed receipts',
+          all(row.get('resume_reused') is True for row in again['targets']) and
+          all(path.read_bytes() == contents for path, contents in immutable.items()))
+
 (root / 'summary.json').write_text(json.dumps({'checks': checks, 'failures': 0}) + '\n')
 print('Worker stdin isolation: %d checks, 0 failures' % checks, flush=True)
 PY
 }
 
-if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ]]; then
+if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
+      "${1:-}" == --sidecar-recovery-only ]]; then
     test_worker_stdin_isolation "$1"
     exit $?
 fi

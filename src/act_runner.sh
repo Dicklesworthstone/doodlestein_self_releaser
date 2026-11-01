@@ -12970,7 +12970,16 @@ act_orchestrate_build() {
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                # A worker can finish its immutable sidecar before the
+                # coordinator records completion. Restore the coordinator's
+                # retained attempt metadata when recovering that result,
+                # without rewriting the original worker receipt.
+                final_results["$task_key"]=$(jq -c \
+                    --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
+                    --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
+                    '. + {resume_reused: true, log_path: $log_path,
+                          result_path: $result_path, attempt: $attempt}' \
+                    <<< "$persisted_result") || { interrupted=true; break; }
                 if $state_available; then
                     local reconciled_extra
                     if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
