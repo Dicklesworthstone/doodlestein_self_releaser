@@ -1235,20 +1235,27 @@ configuration uses a bounded literal grammar for build/compiler settings,
 literal target settings, ordinary source/registry settings and Rust flags.
 Includes, dotted keys, general inline tables, unsupported `cfg(...)` predicates, general environment
 injection, unstable selector environments and flags that can select another
-linker/compiler/backend are refused before dependency admission. Positive
-integer strings for `RUST_MIN_STACK` and `RUST_TEST_THREADS` are the supported
-`[env]` exceptions. These accept a literal string or a single-line inline table
-with `value`, optional Boolean `force`, and absent or false `relative`:
+linker/compiler/backend are refused before dependency admission. The supported
+`[env]` exceptions are positive-integer strings for `RUST_MIN_STACK` and
+`RUST_TEST_THREADS`, and exactly the string `"0"` for `CARGO_INCREMENTAL`.
+These accept a literal string or a single-line inline table with `value`,
+optional Boolean `force`, and absent or false `relative`:
 
 ```toml
 [env]
 RUST_MIN_STACK = { value = "16777216", force = true }
 RUST_TEST_THREADS = { value = "4", force = false, relative = false }
+CARGO_INCREMENTAL = "0"
 ```
 
 Existing configured environment values take precedence unless `force=true`.
-The resulting value must also be a positive-integer string. The observer uses
-the same effective settings as Cargo's children and retains the configured
+The resulting value must satisfy the same name-specific restriction. Cargo
+reads its own incremental mode before applying `[env]` to children, so a
+nonzero or malformed incoming `CARGO_INCREMENTAL` refuses admission even when
+the tracked table says `force=true`. A tracked `"0"` alone does not override
+the profile's incremental setting; set `CARGO_INCREMENTAL=0` in the build
+environment to disable incremental compilation in Cargo itself. The observer
+uses the same effective settings as Cargo's children and retains the configured
 value, force flag, effective value and origin in
 `toolchain.selection.cargo_config[].env_exemptions`. Metadata, compilation and
 independent collection bind this evidence. Unknown or duplicate attributes,
@@ -1328,13 +1335,25 @@ Literal tracked Cargo configuration can
 select the compiler, target and linker; those configuration files are hashed
 into the receipt and require Python 3.11+ to parse. A tracked `[env]` table
 that sets any `RUST*`, `CARGO_*`, `XWIN_*`, `PATH` or C toolchain variable is
-refused, with two exceptions, each set to a positive integer string:
+refused, with three bounded exceptions:
 `RUST_MIN_STACK`, which only sizes rustc's and test/run threads' stacks, and
-`RUST_TEST_THREADS`, which only sets libtest's default thread count. They are
-admitted as plain strings or tables containing `value`, optional Boolean `force`,
+`RUST_TEST_THREADS`, which only sets libtest's default thread count, require
+positive-integer strings. `CARGO_INCREMENTAL` accepts exactly the string `"0"`.
+They are admitted as plain strings or tables containing `value`, optional Boolean `force`,
 and absent or false `relative`. The receipt's `env_exemptions` retain the configured
 value/force and effective value, force and origin. Other attributes, invalid
 numeric values and other influencing names still fail closed.
+
+For `CARGO_INCREMENTAL`, an incoming process value other than `0` is refused
+even with `force=true`: Cargo selects its own incremental mode before applying
+the child environment. The tracked setting does not override the selected
+profile. A build environment value of `CARGO_INCREMENTAL=0` explicitly disables
+incremental compilation. Unix and Windows use the same bounded exemption.
+
+Linker overrides in Rust flags remain outside this exemption. Configure a
+literal linker through `[target.<triple>].linker` instead of `-C linker=...`
+so DSR can resolve, hash, and verify the selected executable. A program named
+`cc` is not assumed to be the default linker merely because of its name.
 
 Strict Unix source-closure validation runs locked, offline, all-features Cargo
 metadata with each target's selected toolchain and configured environment.

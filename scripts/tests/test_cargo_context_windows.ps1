@@ -1101,55 +1101,66 @@ fn main() {
     # from a parser that merely produces a plausible receipt.
     Write-Text (Join-Path $configSource 'src/main.rs') @'
 fn main() {
-    println!("{}:{}|{}", env!("RUST_MIN_STACK"), env!("RUST_TEST_THREADS"), env!("DSR_NUMERIC_ENV_PROBE"));
+    println!("{}:{}:{}|{}", env!("RUST_MIN_STACK"), env!("RUST_TEST_THREADS"),
+        env!("CARGO_INCREMENTAL"), env!("DSR_NUMERIC_ENV_PROBE"));
 }
 '@
     Write-Text (Join-Path $configSource 'build.rs') @'
 fn main() {
     println!("cargo:rerun-if-env-changed=RUST_MIN_STACK");
     println!("cargo:rerun-if-env-changed=RUST_TEST_THREADS");
-    println!("cargo:rustc-env=DSR_NUMERIC_ENV_PROBE={}:{}",
-        std::env::var("RUST_MIN_STACK").unwrap(), std::env::var("RUST_TEST_THREADS").unwrap());
+    println!("cargo:rerun-if-env-changed=CARGO_INCREMENTAL");
+    println!("cargo:rustc-env=DSR_NUMERIC_ENV_PROBE={}:{}:{}",
+        std::env::var("RUST_MIN_STACK").unwrap(), std::env::var("RUST_TEST_THREADS").unwrap(),
+        std::env::var("CARGO_INCREMENTAL").unwrap());
 }
 '@
     $numericCases=@(
-        @{Name='literal-default'; Config="RUST_MIN_STACK='16777216'`nRUST_TEST_THREADS=`"4`"";
+        @{Name='literal-default'; Config="RUST_MIN_STACK='16777216'`nRUST_TEST_THREADS=`"4`"`nCARGO_INCREMENTAL=`"0`"";
             Environment=@(); Minimum='16777216'; Threads='4'; Force=$false; Origin='configuration'},
-        @{Name='table-default'; Config="RUST_MIN_STACK={relative=false,value='16777216'}`nRUST_TEST_THREADS={value=`"4`",force=false}";
+        @{Name='table-default'; Config="RUST_MIN_STACK={relative=false,value='16777216'}`nRUST_TEST_THREADS={value=`"4`",force=false}`nCARGO_INCREMENTAL={relative=false,value='0'}";
             Environment=@(); Minimum='16777216'; Threads='4'; Force=$false; Origin='configuration'},
-        @{Name='table-inherited'; Config="RUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={relative=false,value='4'}";
-            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2'); Minimum='8388608'; Threads='2'; Force=$false; Origin='environment'},
-        @{Name='table-forced'; Config="RUST_MIN_STACK={value='16777216',force=true,relative=false}`nRUST_TEST_THREADS={force=true,value='4'}";
-            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2'); Minimum='16777216'; Threads='4'; Force=$true; Origin='configuration'}
+        @{Name='table-inherited'; Config="RUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={relative=false,value='4'}`nCARGO_INCREMENTAL={value='0',force=false}";
+            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2','CARGO_INCREMENTAL=0'); Minimum='8388608'; Threads='2'; Force=$false; Origin='environment'},
+        @{Name='table-forced'; Config="RUST_MIN_STACK={value='16777216',force=true,relative=false}`nRUST_TEST_THREADS={force=true,value='4'}`nCARGO_INCREMENTAL={force=true,value='0',relative=false}";
+            Environment=@('RUST_MIN_STACK=8388608','RUST_TEST_THREADS=2','CARGO_INCREMENTAL=0'); Minimum='16777216'; Threads='4'; Force=$true; Origin='configuration'}
     )
+    $numericCommand='"' + $proxyCargo + '" +dsr-context-selected build --release -vv -j1 --locked --offline --target ' + $hostTriple
     foreach ($case in $numericCases) {
         Write-Text $selectionConfig ("[env]`n" + $case.Config + "`n")
         $numericTarget=Join-Path $work ('numeric-env-' + $case.Name)
         $numericEnvironment=$baseEnvironment + $case.Environment + @("CARGO_TARGET_DIR=$numericTarget")
-        $numericContext=New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $numericEnvironment
+        $numericContext=New-DsrCargoContext -BuildCommand $numericCommand -SourceRoot $configSource -CargoHome $configHome -Environment $numericEnvironment
         $rows=@($numericContext.ToolchainIdentity.selection.cargo_config[0].env_exemptions)
         $minimumRow=@($rows | Where-Object name -ceq 'RUST_MIN_STACK')
         $threadsRow=@($rows | Where-Object name -ceq 'RUST_TEST_THREADS')
+        $incrementalRow=@($rows | Where-Object name -ceq 'CARGO_INCREMENTAL')
         Check ("numeric $($case.Name) retains configured values and effective precedence") (
-            $rows.Count -eq 2 -and $minimumRow.Count -eq 1 -and $threadsRow.Count -eq 1 -and
+            $rows.Count -eq 3 -and $minimumRow.Count -eq 1 -and $threadsRow.Count -eq 1 -and $incrementalRow.Count -eq 1 -and
             $minimumRow[0].value -ceq '16777216' -and $threadsRow[0].value -ceq '4' -and
+            $incrementalRow[0].value -ceq '0' -and $incrementalRow[0].effective_value -ceq '0' -and
             $minimumRow[0].effective_value -ceq $case.Minimum -and $threadsRow[0].effective_value -ceq $case.Threads -and
             $minimumRow[0].force -eq $case.Force -and $threadsRow[0].force -eq $case.Force -and
+            $incrementalRow[0].force -eq $case.Force -and $incrementalRow[0].effective_force -eq $case.Force -and
             $minimumRow[0].effective_force -eq $case.Force -and $threadsRow[0].effective_force -eq $case.Force -and
-            $minimumRow[0].effective_source -ceq $case.Origin -and $threadsRow[0].effective_source -ceq $case.Origin)
+            $minimumRow[0].effective_source -ceq $case.Origin -and $threadsRow[0].effective_source -ceq $case.Origin -and
+            $incrementalRow[0].effective_source -ceq $case.Origin)
         $null=Invoke-ContextChecked $numericContext Metadata
         $numericReceiptPath=Join-Path $work ('numeric-env-' + $case.Name + '-receipt.json')
         $numericReceipt=Write-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath
-        $null=Invoke-ContextChecked $numericContext Build
-        $numericBinary=Join-Path $numericTarget ($hostTriple + '/debug/config-selection-probe' + $extension)
-        $expectedNumeric=$case.Minimum + ':' + $case.Threads
+        $numericBuild=Invoke-ContextChecked $numericContext Build
+        Check ("release Cargo $($case.Name) invokes the compiler without incremental codegen") (
+            $numericBuild.Stderr -match '--crate-name config_selection_probe' -and
+            $numericBuild.Stderr -notmatch '(?:-C\s*|--codegen(?:=|\s+))incremental=')
+        $numericBinary=Join-Path $numericTarget ($hostTriple + '/release/config-selection-probe' + $extension)
+        $expectedNumeric=$case.Minimum + ':' + $case.Threads + ':0'
         Check ("real Cargo $($case.Name) supplies the admitted values to build scripts and rustc") (
             (Invoke-Exe $numericBinary @()).Stdout.Trim() -ceq ($expectedNumeric + '|' + $expectedNumeric))
         Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
             -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
         Check ("numeric $($case.Name) retains metadata authority after genuine compilation") $true
     }
-    Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={value='4',force=false}`n"
+    Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={value='4',force=false}`nCARGO_INCREMENTAL={value='0',force=false}`n"
     Refused 'changing numeric force semantics invalidates the held metadata receipt' {
         Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
             -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
@@ -1158,6 +1169,25 @@ fn main() {
         New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome `
             -Environment ($baseEnvironment + @('RUST_MIN_STACK=invalid','RUST_TEST_THREADS=2'))
     } 'Effective Cargo numeric environment is invalid'
+    foreach ($force in @('false','true')) {
+        Write-Text $selectionConfig ("[env]`nCARGO_INCREMENTAL={value='0',force=" + $force + "}`n")
+        foreach ($incremental in @('1','00','false','',' 0','0 ')) {
+            Refused ("Cargo's incoming incremental setting is refused even with force=${force}: " + $incremental) {
+                New-DsrCargoContext -BuildCommand $numericCommand -SourceRoot $configSource -CargoHome $configHome `
+                    -Environment ($baseEnvironment + ('CARGO_INCREMENTAL=' + $incremental))
+            } 'Effective Cargo numeric environment is invalid: CARGO_INCREMENTAL'
+        }
+    }
+    foreach ($entry in @(
+        '0', 'false', '"1"', '"00"', '"false"', '""', '" 0"', '"0 "', '"0\n"',
+        '{value=0}', '{value=false}', '{value="1"}', '{value="1",force=true}', '{value="0",relative=true}',
+        '{value="0",force="true"}', '{value="0",unknown=false}', '{value="0",value="1"}'
+    )) {
+        Write-Text $selectionConfig ("[env]`nCARGO_INCREMENTAL=" + $entry + "`n")
+        Refused ('incremental compilation admission requires exactly the string zero: ' + $entry) {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
+        }
+    }
     foreach ($entry in @(
         '{}', '{force=true}', '{value=4}', '{value="0"}', '{value="-1"}', '{value=" 4"}',
         '{value="4\n"}', '{value="4\u000a"}', '"4\n"',

@@ -351,10 +351,16 @@ Cargo configuration, or toolchain selection file prevents artifact collection,
 even if compilation succeeds. Results, durable state and manifests retain the
 full identities under `cargo_isolation.toolchain` and the context digests under
 `cargo_isolation.cargo_context`. General environment values remain digest-only;
-the safe numeric Cargo `[env]` settings `RUST_MIN_STACK` and `RUST_TEST_THREADS`
-retain their configured and effective values in toolchain evidence. These
-settings support literal strings and inline tables with Boolean `force` and
-absent or false `relative`, preserving Cargo's configured-environment precedence.
+the bounded Cargo `[env]` settings `RUST_MIN_STACK`, `RUST_TEST_THREADS`, and
+`CARGO_INCREMENTAL` retain their configured and effective values in toolchain
+evidence. The two `RUST_*` settings require positive-integer strings;
+`CARGO_INCREMENTAL` accepts only the string `"0"`. These settings support literal
+strings and inline tables with Boolean `force` and absent or false `relative`.
+Cargo applies `[env]` to its children, so `force=true` cannot override Cargo's
+own incremental mode. An incoming `CARGO_INCREMENTAL` other than `0` therefore
+refuses this exemption even with `force=true`. Set `CARGO_INCREMENTAL=0` in the
+build environment to force Cargo itself to disable incremental compilation;
+a tracked `[env]` value alone does not override the selected profile.
 
 This Windows boundary accepts one literal `cargo build` or `cargo rustc` command,
 an optional first `+toolchain`, and ordinary Cargo build options. Quote whole

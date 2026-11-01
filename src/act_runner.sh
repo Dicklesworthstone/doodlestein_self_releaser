@@ -9324,7 +9324,7 @@ def influences(name):
 
 
 def cargo_env_exemption(name, entry):
-    if name not in ('RUST_MIN_STACK', 'RUST_TEST_THREADS'):
+    if name not in ('RUST_MIN_STACK', 'RUST_TEST_THREADS', 'CARGO_INCREMENTAL'):
         return None
     force = False
     value = entry
@@ -9336,7 +9336,12 @@ def cargo_env_exemption(name, entry):
         relative = entry.get('relative', False)
         if type(force) is not bool or type(relative) is not bool or relative:
             fail('Cargo numeric environment requires boolean force and relative=false: ' + name)
-    if not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value):
+    # Admit only the disabling value for Cargo's children. Cargo itself reads
+    # its process environment before applying [env] (checked below).
+    if name == 'CARGO_INCREMENTAL':
+        if value != '0':
+            fail('Cargo incremental environment requires the string "0": ' + name)
+    elif not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value):
         fail('Cargo environment requires a positive-integer string: ' + name)
     return {'name': name, 'value': value, 'force': force}
 
@@ -9348,9 +9353,15 @@ def cargo_effective_environment(config, receipts, environment):
     effective = {}
     for name, entry in sorted(config.get('env', {}).items()):
         row = cargo_env_exemption(name, entry)
+        # Cargo consumes this variable before applying [env] to its children;
+        # force=true cannot override an enabling value in Cargo's own process.
+        if name == 'CARGO_INCREMENTAL' and name in environment and environment[name] != '0':
+            fail('Cargo process incremental environment requires the string "0": ' + name)
         ambient = name in environment and not row['force']
         value = environment[name] if ambient else row['value']
-        if not re.fullmatch(r'[1-9][0-9]*', value):
+        valid = value == '0' if name == 'CARGO_INCREMENTAL' else (
+            isinstance(value, str) and re.fullmatch(r'[1-9][0-9]*', value))
+        if not valid:
             fail('effective Cargo numeric environment is invalid: ' + name)
         effective[name] = (value, row['force'], 'environment' if ambient else 'configuration')
     for receipt in receipts:
