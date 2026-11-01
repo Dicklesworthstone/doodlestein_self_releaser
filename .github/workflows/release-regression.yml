@@ -35,6 +35,7 @@ on:
       - scripts/tests/test_host_health.sh
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_release_resume.sh
+      - scripts/tests/test_release_verify.sh
       - scripts/tests/test_release_builds.sh
       - scripts/tests/test_release_builds_resume.sh
       - scripts/tests/test_release_builds_recovery.sh
@@ -214,6 +215,30 @@ jobs:
           bash scripts/tests/test_dispatch_outbox.sh
           bats tests/unit/test_dispatch.bats
           bash scripts/tests/test_github.sh
+      - name: Verify ordinary repair against fresh remote receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          yq --version
+          bash -n scripts/tests/test_release_verify.sh
+          bash scripts/tests/test_release_verify.sh \
+            test_verify_fix_attempts_upload \
+            test_verify_fix_uses_selected_github_identity \
+            test_verify_fix_requires_remote_asset_after_upload \
+            test_verify_fix_rejects_changed_remote_bytes \
+            test_verify_fix_rejects_replaced_asset_id \
+            test_verify_fix_rejects_release_retag_after_upload \
+            test_verify_fix_stops_before_upload_after_release_retag \
+            test_verify_fix_final_observation_rejects_asset_flip \
+            test_verify_fix_verifies_complete_inventory_without_uploads \
+            test_verify_fix_rejects_complete_inventory_with_wrong_bytes \
+            test_verify_fix_accepts_repository_case_variation \
+            test_verify_fix_rejects_foreign_upload_repository \
+            test_verify_fix_rejects_empty_manifest \
+            test_verify_fix_reads_paginated_inventory \
+            test_verify_fix_reports_latest_inventory_coherently \
+            test_verify_fix_dry_run_uploads_nothing \
+            test_verify_fix_reports_not_found_locally
   private-cargo-cache:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 35

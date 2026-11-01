@@ -790,6 +790,17 @@ An upload, inventory, source, or publication failure suppresses dispatch and
 upgrade hooks. A failed publication can be returned to draft only while its
 current nonce and metadata still prove ownership.
 
+Ordinary `dsr release verify TOOL VERSION --fix` binds repair to the observed
+GitHub release ID and a validated local manifest. It uploads through the shared
+verified upload helper and never clobbers existing assets. It verifies every
+required name, size, hash, and uploaded asset ID against one complete, fresh
+paginated inventory, including on reruns where no names appear missing.
+Empty or invalid local manifests cannot authorize repair. Release identity and local
+manifest or payload changes prevent success. A nominal upload acknowledgement
+cannot remove an asset from the missing list. Repair failures appear in
+`details.repair.errors` when present; normal verification and dry-run output keep
+their existing shape.
+
 Downstream dispatch uses a persistent outbox keyed by the source repository and
 GitHub release ID. Accepted destinations are skipped across process restarts;
 definitively rejected destinations can retry, and uncertain POSTs require an
