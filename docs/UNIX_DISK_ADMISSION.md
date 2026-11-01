@@ -132,6 +132,19 @@ launcher would later interpret differently. Cargo's brace-based
 they cannot authorize a probe of the unexpanded template. Ordinary Rust clears
 an inherited `CARGO_BUILD_BUILD_DIR` before applying any admitted recipe value.
 
+Native Go recipes also admit explicitly configured `GOCACHE`, `GOMODCACHE`,
+and `GOTMPDIR` destinations as `go_cache`, `go_modcache`, and `go_temp` roles.
+Both cache paths must be absolute. `GOCACHE=off` is refused because Go requires
+a build cache. Relative `GOTMPDIR` resolves against the actual build working
+directory before preparation and compilation; source planning checks its
+absolute form when supplied. Empty values retain Go's target-host defaults.
+Admission does not infer a module cache from `GOPATH`: even `GOENV=off` leaves
+toolchain-level defaults in `GOROOT/go.env` active. Unused `GOPATH` entries
+and `GOBIN` do not add disk requirements for a build. These rules cover the
+configured destinations; discovery of ambient, toolchain-level or persisted
+target-host Go defaults remains separate. The coordinator never substitutes
+its own Go environment for the builder's.
+
 The internal `host_health_check` and `host_health_is_ready` APIs accept
 `--writable-paths` with a bounded JSON array of objects containing exactly `role`
 and `path`. Paths must be absolute Unix paths without control characters or

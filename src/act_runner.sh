@@ -5211,12 +5211,23 @@ _act_native_writable_paths_json() {
             [{role:"cargo_home",name:"CARGO_HOME"},
              {role:"cargo_target",name:"CARGO_TARGET_DIR"},
              {role:"cargo_build",name:"CARGO_BUILD_BUILD_DIR"}]
+           elif $language == "go" then
+            # Even GOENV=off retains GOROOT/go.env defaults on the build host.
+            # Admit explicit recipe locations without guessing those defaults.
+            [{role:"go_cache",name:"GOCACHE",absolute_required:true,empty_default:true},
+             {role:"go_modcache",name:"GOMODCACHE",absolute_required:true,empty_default:true},
+             {role:"go_temp",name:"GOTMPDIR",empty_default:true}]
            else [] end) | map(. as $entry | $env[.name] // empty |
-             if $absolute_only and $entry.name == "CARGO_TARGET_DIR" and (startswith("/") | not) then
+              if $entry.empty_default and . == "" then empty
+              elif $entry.name == "GOCACHE" and . == "off" then
+                  error("GOCACHE=off disables the build cache required by Go")
+              elif $absolute_only and $entry.name == "CARGO_TARGET_DIR" and (startswith("/") | not) then
                  empty
              elif literal | not then error("Unresolved native writable environment path: " + $entry.name)
              elif $entry.name == "CARGO_BUILD_BUILD_DIR" and (test("[{}]")) then
                  error("Cargo build-directory templates require resolved writable paths")
+              elif $entry.absolute_required and (startswith("/") | not) then
+                  error($entry.name + " must be an absolute Go cache path")
              elif startswith("/") then {role:$entry.role,path:.}
              elif $absolute_only then empty
              else {role:$entry.role,path:($working + "/" +

@@ -1075,6 +1075,21 @@ cases = [
     ('source-relative-target-overrides-global', 'source-relative', 'cargo_target', False),
     ('source-sibling-full-trailing-slashes', 'source-sibling', 'source_dependency', True),
     ('source-sibling-healthy-trailing-slashes', 'source-sibling', 'source_dependency', False),
+    ('go-cache-full', 'go-native', 'go_cache', True),
+    ('go-cache-healthy', 'go-native', 'go_cache', False),
+    ('go-module-cache-full', 'go-native', 'go_modcache', True),
+    ('go-module-cache-healthy', 'go-native', 'go_modcache', False),
+    ('go-temp-full', 'go-native', 'go_temp', True),
+    ('go-temp-healthy', 'go-native', 'go_temp', False),
+    ('go-source-cache-full', 'go-sync', 'go_cache', True),
+    ('go-source-cache-healthy', 'go-sync', 'go_cache', False),
+    ('go-source-module-cache-full', 'go-sync', 'go_modcache', True),
+    ('go-source-module-cache-healthy', 'go-sync', 'go_modcache', False),
+    ('go-source-temp-full', 'go-sync', 'go_temp', True),
+    ('go-source-temp-healthy', 'go-sync', 'go_temp', False),
+    ('go-relative-temp-in-private-stage', 'go-relative', 'go_temp', False),
+    ('go-platform-cache-overrides-global', 'go-duplicate', 'go_cache', False),
+    ('go-explicit-module-cache-overrides-gopath', 'go-explicit', 'go_modcache', False),
 ]
 
 def run_case(spec):
@@ -1088,7 +1103,9 @@ def run_case(spec):
     root = full if refused and route != 'drop' else healthy
     selected = root / {'source': 'snapshots', 'temp': 'new temp',
                        'cargo_target': 'target', 'cargo_cache': 'cargo-cache',
-                       'cargo_build': 'intermediates', 'source_dependency': 'dependency'}[role]
+                       'cargo_build': 'intermediates', 'source_dependency': 'dependency',
+                       'go_cache': 'go cache', 'go_modcache': 'go-modules',
+                       'go_temp': 'go temp'}[role]
     recipe = dict(tool_name='tool', repo='fixture/tool', local_path=str(source),
                   binary_name='tool', build_cmd='printf compiler', language='go',
                   targets=[target], hosts={target: 'fixture'}, act_job_map={target: None})
@@ -1112,7 +1129,8 @@ def run_case(spec):
     args = ['act_run_native_build', 'tool', target, '1.0.0', run, '', '', '', 'fixture']
     expected = 'compile'
     setting = {'temp': 'TMPDIR', 'cargo_target': 'CARGO_TARGET_DIR',
-               'cargo_build': 'CARGO_BUILD_BUILD_DIR'}.get(role)
+               'cargo_build': 'CARGO_BUILD_BUILD_DIR', 'go_cache': 'GOCACHE',
+               'go_modcache': 'GOMODCACHE', 'go_temp': 'GOTMPDIR'}.get(role)
     if setting:
         recipe['env'] = {setting: str(selected)}
     if route in ['ordinary-rust', 'strict-rust', 'strict-overridden', 'drop']:
@@ -1133,6 +1151,20 @@ def run_case(spec):
     if route == 'relative':
         recipe['env'] = {'TMPDIR': './scratch space'}
         env['DSR_NATIVE_OUTPUT_STAGE'] = '1'
+    if route == 'go-sync':
+        args = ['act_sync_sources', 'tool', '--stage-ordinary']
+        expected = 'contexts'
+    if route == 'go-relative':
+        recipe['env'] = {'GOTMPDIR': './go scratch space'}
+        env['DSR_NATIVE_OUTPUT_STAGE'] = '1'
+    if route == 'go-duplicate':
+        recipe['env'] = {'GOCACHE': str(full / 'ignored-go-cache')}
+        recipe['cross_compile'] = {target: {'env': {'GOCACHE': str(selected)}}}
+        env['DSR_PATH_FULL'] = str(full)
+    if route == 'go-explicit':
+        recipe['env'] = {'GOPATH': str(full / 'unused-go-path'),
+                         'GOENV': 'off', 'GOMODCACHE': str(selected)}
+        env['DSR_PATH_FULL'] = str(full)
     if route == 'strict-sync':
         recipe['release_contract'] = dict(checksum_sidecar='sha256',
             exact_primary_assets={target: 'tool-aarch64-apple-darwin'})
@@ -1198,13 +1230,20 @@ def run_case(spec):
         checks += [('healthy selected paths reach existing execution boundary', expected in events),
                    ('healthy path evidence is present', bool(requests)),
                    ('fixture is not misrepresented as successful build', result.returncode != 0)]
-    if route in ['strict-overridden', 'duplicate', 'source-relative']:
+    if route in ['strict-overridden', 'duplicate', 'source-relative', 'go-duplicate', 'go-explicit']:
         checks += [('inactive overridden paths are not admitted',
                     all(not row['path'].startswith(str(full)) for row in requests))]
     if route == 'relative':
         checks += [('relative temp resolves inside the actual unique output stage',
                     any(row['role'] == 'temp' and '/dsr-build-tool-darwin-arm64-' in row['path']
                         and row['path'].endswith('/source/scratch space') for row in requests))]
+    if route == 'go-relative':
+        checks += [('relative Go temp resolves inside the actual unique output stage',
+                    any(row['role'] == 'go_temp' and '/dsr-build-tool-darwin-arm64-' in row['path']
+                        and row['path'].endswith('/source/go scratch space') for row in requests))]
+    if role.startswith('go_') and route != 'go-relative':
+        checks += [('selected Go role retains the actual destination',
+                    any(row['role'] == role and row['path'] == str(selected) for row in requests))]
     if route == 'source-sibling':
         checks += [('sibling probe matches dirname/basename transfer semantics',
                     any(row['role'] == 'source_dependency' and row['path'] == str(selected)
@@ -1219,7 +1258,7 @@ def run_case(spec):
                     and receipt.get('artifact_paths') == [] and receipt.get('artifact_path') == ''
                     and 'build command was not started' in receipt.get('error', '')
                     and 'final' not in receipt.get('cargo_isolation', {}).get('dependency_cache', {}))]
-    if route.startswith('sync') or route == 'strict-sync':
+    if route.startswith('sync') or route in ['strict-sync', 'go-sync']:
         checks += [('refused plan leaves no source context or snapshot',
                     not refused or (not (case / 'state/source-contexts').exists()
                                     and not selected.exists()))]
@@ -1235,10 +1274,11 @@ for label, valid in results:
 # Resolver controls exercise actual literal/precedence decisions without a
 # compiler or synthetic health verdict. Paths with spaces/single quotes remain
 # literal; shell expansion and Cargo templates cannot masquerade as evidence.
-def resolve(environment, absolute_only=False):
+resolver_start = len(results)
+def resolve(environment, absolute_only=False, language='rust'):
     command = ['bash', '-c', 'source "$1"; shift; _act_native_writable_paths_json "$@"',
                '_', str(module), '/planned/source', '/planned/stage/source', environment,
-               'rust', '', '[]', str(absolute_only).lower()]
+               language, '', '[]', str(absolute_only).lower()]
     return subprocess.run(command, text=True, capture_output=True, timeout=10)
 
 literal = resolve("TMPDIR=/unused\nTMPDIR=./scratch space\nCARGO_BUILD_BUILD_DIR=objects")
@@ -1263,7 +1303,38 @@ for label, environment in [
     response = resolve(environment)
     results.append((label + ' is refused before path observation',
                     response.returncode == 4 and not response.stdout))
-for label, valid in results[-8:]:
+for label, environment in [
+    ('relative Go build cache', 'GOCACHE=cache'),
+    ('relative Go module cache', 'GOMODCACHE=modules'),
+    ('disabled required Go build cache', 'GOCACHE=off'),
+    ('Go cache variable expansion', 'GOCACHE=/scratch/$HOME'),
+    ('Go module cache command substitution', 'GOMODCACHE=/scratch/$(touch refused)'),
+    ('Go temp shell expansion', 'GOTMPDIR=${HOME}/tmp'),
+]:
+    response = resolve(environment, absolute_only=True, language='go')
+    results.append((label + ' is refused before source observation',
+                    response.returncode == 4 and not response.stdout))
+for label, environment, expected in [
+    ('Go cache last assignment', "GOCACHE=/ignored\nGOCACHE=/scratch/John's cache",
+     [{'role': 'go_cache', 'path': "/scratch/John's cache"}]),
+    ('explicit empty Go paths retain target defaults', 'GOCACHE=\nGOMODCACHE=\nGOTMPDIR=', []),
+    ('GOENV off still leaves GOROOT go.env defaults unclaimed',
+     'GOENV=off\nGOMODCACHE=\nGOPATH=/first/:/unused', []),
+    ('GOPATH does not invent an inherited module cache override', 'GOENV=off\nGOPATH=/first', []),
+    ('GOPATH does not invent a persisted module cache override', 'GOMODCACHE=\nGOPATH=/first', []),
+    ('explicit module cache takes precedence over GOPATH',
+     'GOENV=off\nGOMODCACHE=/selected\nGOPATH=/unused',
+     [{'role': 'go_modcache', 'path': '/selected'}]),
+    ('unused Go install directory does not gate go build', 'GOBIN=/unused', []),
+]:
+    response = resolve(environment, language='go')
+    try:
+        rows = json.loads(response.stdout)
+    except ValueError:
+        rows = []
+    results.append((label, response.returncode == 0 and
+                    [row for row in rows if row['role'].startswith('go_')] == expected))
+for label, valid in results[resolver_start:]:
     print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
 failures = sum(not valid for _, valid in results)
 print(f'Native writable paths: cases={len(cases)} checks={len(results)} failures={failures}', flush=True)
