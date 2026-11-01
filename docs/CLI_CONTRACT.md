@@ -1244,16 +1244,31 @@ named Cargo plugins, and `cargo-zigbuild`/`zig` when DSR routes through them.
 Explicit `RUSTC`/`CARGO_BUILD_RUSTC` executables and compiler wrappers retain
 their own identities; arbitrary scripts are not mislabeled as rustup's
 compiler. Proven rustup proxies and Apple `/usr/bin` compiler launchers also
-record their resolved executable. Literal tracked Cargo configuration can
+record their resolved executable. Unix Rustup recognition requires byte equality
+with the existing manager on the build PATH or at `$HOME/.cargo/bin/rustup`.
+A mismatched PATH manager cannot hide a matching HOME reference. The physical
+manager file and parent are held through dispatch resolution and checked before
+and afterward; its path and hash remain in the toolchain receipt alongside the
+actual delegated Cargo/rustc hashes. Missing or mismatched references cannot
+authorize a receipt containing only proxy bytes. A Rustup dispatch response, or
+an unsuccessful check for unresolved dispatch, refuses admission; neither a
+version response nor `RUSTUP_FORCE_ARG0` grants identity authority. Configured
+`RUSTUP_FORCE_ARG0` is refused. Direct native Cargo/rustc remain supported without
+a manager, and the existing reviewed RCH launchers retain their specific dispatch
+rules. Arbitrary custom native forwarding and complete subprocess graphs remain
+outside this trusted-host entrypoint contract.
+
+Literal tracked Cargo configuration can
 select the compiler, target and linker; those configuration files are hashed
 into the receipt and require Python 3.11+ to parse. A tracked `[env]` table
 that sets any `RUST*`, `CARGO_*`, `XWIN_*`, `PATH` or C toolchain variable is
-refused, with two exceptions, each set to a plain positive integer string:
+refused, with two exceptions, each set to a positive integer string:
 `RUST_MIN_STACK`, which only sizes rustc's and test/run threads' stacks, and
 `RUST_TEST_THREADS`, which only sets libtest's default thread count. They are
-admitted and recorded under that file's `env_exemptions` (name and value) in
-every receipt. Any other value form, or any other influencing name, still fails
-closed.
+admitted as plain strings or tables containing `value`, optional Boolean `force`,
+and absent or false `relative`. The receipt's `env_exemptions` retain the configured
+value/force and effective value, force and origin. Other attributes, invalid
+numeric values and other influencing names still fail closed.
 
 Strict Unix source-closure validation runs locked, offline, all-features Cargo
 metadata with each target's selected toolchain and configured environment.
@@ -1283,7 +1298,7 @@ represent. Configure those selections outside `build_cmd`.
 
 Conflicting toolchains/targets, dynamic selectors, Cargo `--config`/`-C`,
 compiler-selecting shell context changes, opaque Cargo drivers, Cargo aliases,
-configuration includes/`cfg` selectors, and configuration-driven compiler
+configuration includes, unsupported `cfg` predicates, and configuration-driven compiler
 environment changes cannot be represented by one proven selection and are
 refused before compilation. Move those selections into the repository's
 configured build environment or a supported literal Cargo invocation. The

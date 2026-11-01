@@ -4,10 +4,17 @@
 # or modified. The second toolchain has its own real executable copies.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+MODE=all
+if [[ "${1:-}" == --rustup-dispatch-only && $# == 1 ]]; then
+    MODE=rustup-dispatch
+elif (( $# != 0 )); then
+    printf 'Usage: %s [--rustup-dispatch-only]\n' "$0" >&2
+    exit 4
+fi
 for tool in python3 bash cargo rustc rustup cc jq; do
     command -v "$tool" >/dev/null || { printf 'Missing dependency: %s\n' "$tool" >&2; exit 3; }
 done
-python3 -I - "$ROOT" <<'PY'
+python3 -I - "$ROOT" "$MODE" <<'PY'
 import hashlib
 import json
 import os
@@ -19,6 +26,7 @@ import sys
 import tempfile
 
 root = Path(sys.argv[1])
+mode = sys.argv[2]
 module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(root / 'src/act_runner.sh')))
 fixture_base = os.environ.get('RCH_TARGET_BASE') or os.environ.get('TMPDIR')
 work = Path(tempfile.mkdtemp(prefix='dsr-toolchain-identity-', dir=fixture_base)).resolve()
@@ -93,14 +101,20 @@ for name in list(environment):
     if name.startswith(('CARGO_', 'RUST')):
         environment.pop(name)
 environment.update(RUSTUP_HOME=str(work / 'rustup'), CARGO_HOME=str(work / 'cargo'),
-                   RUSTUP_AUTO_INSTALL='0', RCH_DISABLED='1', RCH_CARGO_WRAPPER_BYPASS='1')
+                   RUSTUP_AUTO_INSTALL='0', RCH_DISABLED='1', RCH_CARGO_WRAPPER_BYPASS='1',
+                   CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0')
 require(['rustup', 'toolchain', 'link', 'fixture-default', real_sysroot], env=environment)
 require(['rustup', 'toolchain', 'link', 'fixture-selected', selected], env=environment)
 require(['rustup', 'default', 'fixture-default'], env=environment)
 environment['RUSTUP_TOOLCHAIN'] = 'fixture-default'
 environment['CARGO_BUILD_TARGET'] = host
 
-program = '''source "$1" || exit $?; _act_toolchain_identity_script "$2" "$3" "$4" "" "$5" "$6" | bash'''
+# Match the production transport: parse the whole generated program before
+# executing it, and give descendants closed stdin. A fault-injected Python
+# version probe must not consume later program text from the interpreter pipe.
+program = '''source "$1" || exit $?;
+dsr_identity_program=$(_act_toolchain_identity_script "$2" "$3" "$4" "" "$5" "$6") || exit $?
+printf '{\\n%s\\n} </dev/null\\n' "$dsr_identity_program" | bash'''
 counter = 0
 receipt_pins = {}
 
@@ -202,6 +216,142 @@ def expected_tool(data, name, expected):
     record = data.get('tools', {}).get(name, {})
     return record.get('resolved_path', record.get('selected_path')) == str(expected) and \
         record.get('resolved_sha256', record.get('selected_sha256')) == digest(expected)
+
+
+# Reuse the owned compiler copies and read-only library link above. Proxy
+# entries are hardlinks to one owned copy, as in a normal Rustup installation;
+# no installed executable, standard library or account configuration is changed.
+dispatch_bin = work / 'dispatch-bin'
+dispatch_bin.mkdir()
+proxy_cargo = dispatch_bin / 'cargo'
+shutil.copy2(Path(shutil.which('rustup')).resolve(), proxy_cargo)
+os.link(proxy_cargo, dispatch_bin / 'rustc')
+for name in ('bash', 'python3', 'cat', 'dirname', 'date', 'jq', 'cc', 'c++', 'as', 'ld', 'ar', 'xcrun', 'xcodebuild'):
+    executable = shutil.which(name)
+    if executable:
+        (dispatch_bin / name).symlink_to(executable)
+dispatch_home = work / 'dispatch-home'
+dispatch_home.mkdir()
+dispatch_env = dict(environment, HOME=str(dispatch_home), PATH=str(dispatch_bin),
+                    RUSTUP_TOOLCHAIN='fixture-selected',
+                    CARGO_TARGET_DIR=str(work / 'dispatch-output'))
+dispatch_command = 'cargo build --quiet --locked --offline'
+require(['cargo', 'generate-lockfile', '--offline'], env=dispatch_env, cwd=project)
+compiled = build(dispatch_command, dispatch_env)
+check('unresolved copied proxies are genuine and can compile the owned project offline',
+      compiled.returncode == 0 and
+      require([work / 'dispatch-output' / host / 'debug/identity-probe']) == '42')
+for probe_mode in ('record', 'metadata', 'context'):
+    unresolved, _, unresolved_receipt = probe(dispatch_command, dispatch_env, mode=probe_mode)
+    check('hidden manager refuses ' + probe_mode + ' instead of attesting only proxy bytes',
+          unresolved.returncode != 0 and not unresolved.stdout and not unresolved_receipt.exists() and
+          'unresolved Rustup dispatch' in unresolved.stderr)
+
+# A nonmatching native manager on PATH cannot make the proxy a direct compiler
+# or mask the recognized installation reference at the existing HOME location.
+mismatched_manager = dispatch_bin / 'rustup'
+shutil.copy2(Path(shutil.which('cc')).resolve(), mismatched_manager)
+unresolved, _, unresolved_receipt = probe(dispatch_command, dispatch_env)
+check('mismatched PATH manager cannot authorize a selected-only proxy receipt',
+      unresolved.returncode != 0 and not unresolved_receipt.exists() and
+      'unresolved Rustup dispatch' in unresolved.stderr)
+home_manager = dispatch_home / '.cargo/bin/rustup'
+home_manager.parent.mkdir(parents=True)
+os.link(proxy_cargo, home_manager)
+known, known_identity, known_receipt = probe(dispatch_command, dispatch_env)
+known_verify, _, _ = probe(dispatch_command, dispatch_env, mode='verify', receipt=known_receipt)
+known_metadata, _, _ = probe(dispatch_command, dispatch_env, mode='metadata')
+check('matching HOME manager retains genuine metadata and exact Cargo/rustc identities despite PATH mismatch',
+      known.returncode == 0 and known_verify.returncode == 0 and known_metadata.returncode == 0 and
+      expected_tool(known_identity, 'cargo', selected / 'bin/cargo') and
+      expected_tool(known_identity, 'rustc', selected / 'bin/rustc') and
+      all(known_identity.get('tools', {}).get(name, {}).get('rustup_resolver') == {
+          'path': str(home_manager), 'sha256': digest(home_manager)} for name in ('cargo', 'rustc')))
+explicit_env = dict(dispatch_env, RUSTUP_TOOLCHAIN='fixture-default',
+                    CARGO_TARGET_DIR=str(work / 'dispatch-explicit-output'))
+explicit_command = 'cargo +fixture-selected build --quiet --locked --offline'
+explicit, explicit_identity, explicit_receipt = probe(explicit_command, explicit_env)
+explicit_build = build(explicit_command, explicit_env)
+explicit_verify, _, _ = probe(explicit_command, explicit_env, mode='verify', receipt=explicit_receipt)
+check('recognized explicit toolchain still overrides the ambient choice and genuinely compiles',
+      explicit.returncode == 0 and explicit_build.returncode == 0 and explicit_verify.returncode == 0 and
+      expected_tool(explicit_identity, 'rustc', selected / 'bin/rustc') and
+      require([work / 'dispatch-explicit-output' / host / 'debug/identity-probe']) == '42')
+
+# The manager itself remains a bound dependency even when unchanged proxy
+# versions continue to select the same real compiler.
+home_manager.rename(work / 'retained-dispatch-manager')
+missing_manager, _, _ = probe(dispatch_command, dispatch_env, mode='verify', receipt=known_receipt)
+check('losing the recognized manager refuses the original pinned observation',
+      missing_manager.returncode != 0 and 'unresolved Rustup dispatch' in missing_manager.stderr)
+(work / 'retained-dispatch-manager').rename(home_manager)
+
+# Native direct Cargo/rustc remain supported with no Rustup manager. Selecting
+# these physical executables is an explicit positive control for the detector.
+direct_env = dict(dispatch_env, PATH=str(selected / 'bin') + os.pathsep + str(dispatch_bin),
+                  HOME=str(work / 'direct-home'), CARGO_TARGET_DIR=str(work / 'direct-output'))
+Path(direct_env['HOME']).mkdir()
+direct, direct_identity, direct_receipt = probe(dispatch_command, direct_env)
+direct_build = build(dispatch_command, direct_env)
+direct_verify, _, _ = probe(dispatch_command, direct_env, mode='verify', receipt=direct_receipt)
+check('direct native executables still compile and verify without a recognized manager',
+      direct.returncode == 0 and direct_build.returncode == 0 and direct_verify.returncode == 0 and
+      expected_tool(direct_identity, 'cargo', selected / 'bin/cargo') and
+      expected_tool(direct_identity, 'rustc', selected / 'bin/rustc') and
+      all('rustup_resolver' not in direct_identity.get('tools', {}).get(name, {}) for name in ('cargo', 'rustc')) and
+      require([work / 'direct-output' / host / 'debug/identity-probe']) == '42')
+for override in ('rustup', 'cargo', ''):
+    refused, _, refused_receipt = probe(dispatch_command, dict(direct_env, RUSTUP_FORCE_ARG0=override))
+    check('configured Rustup dispatch override is refused even for direct executables: ' + repr(override),
+          refused.returncode != 0 and not refused_receipt.exists() and
+          'dispatch overrides' in refused.stderr)
+
+# A genuine compiled forwarder demonstrates why a version/FORCE_ARG0 reply is
+# only a refusal signal. No fabricated compiler/version output grants trust.
+forward_bin = work / 'dispatch-forwarder'
+forward_bin.mkdir()
+forward_source = forward_bin / 'forwarder.c'
+forward_source.write_text('''#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    const char *target = getenv("DSR_FORWARD_TOOL");
+    if (!target) return 90;
+    if (getenv("RUSTUP_FORCE_ARG0") && getenv("DSR_FAIL_DISPATCH_PROBE")) return 23;
+    argv[0] = (char *)target;
+    execv(target, argv);
+    return 91;
+}
+''')
+require(['cc', forward_source, '-o', forward_bin / 'cargo'])
+forward_env = dict(dispatch_env, PATH=str(forward_bin) + os.pathsep + str(dispatch_bin),
+                   DSR_FORWARD_TOOL=str(proxy_cargo))
+forwarded = build(dispatch_command, forward_env)
+check('compiled native forwarder executes genuine selected Cargo successfully', forwarded.returncode == 0)
+opaque, _, opaque_receipt = probe(dispatch_command, forward_env)
+check('native forwarding of Rustup versions cannot authorize an unrecognized entrypoint',
+      opaque.returncode != 0 and not opaque_receipt.exists() and 'unresolved Rustup dispatch' in opaque.stderr)
+failed_probe, _, failed_receipt = probe(dispatch_command, dict(forward_env, DSR_FAIL_DISPATCH_PROBE='1'))
+check('failed unknown-dispatch probe cannot authorize a selected-only receipt',
+      failed_probe.returncode != 0 and not failed_receipt.exists() and
+      'cannot rule out unresolved Rustup dispatch' in failed_probe.stderr)
+
+# Reproduce the original custody failure against a pinned successful build:
+# only the delegated compiler changes; proxy, manager and verbose version stay
+# fixed. Restore a fresh owned copy afterward for the remaining genuine builds.
+compiler = selected / 'bin/rustc'
+original_compiler = digest(compiler)
+with compiler.open('ab') as stream:
+    stream.write(b'changed owned delegated compiler bytes\n')
+drifted, _, _ = probe(dispatch_command, dispatch_env, mode='verify', receipt=known_receipt)
+check('delegated compiler byte drift refuses the original proxy/manager observation',
+      known.returncode == 0 and digest(compiler) != original_compiler and drifted.returncode != 0)
+compiler.rename(work / 'retained-dispatch-drift-rustc')
+shutil.copy2(real_toolchain_executable('rustc', alternate_sysroot / 'bin/rustc'), compiler)
+
+if mode == 'rustup-dispatch':
+    print(str(passed) + ' passed; ' + str(failed) + ' failed')
+    sys.exit(1 if failed else 0)
 
 
 command = 'cargo +fixture-selected build --quiet --offline --target ' + shlex.quote(host)
@@ -578,7 +728,7 @@ else:
     fallback_bin = work / 'managed-fallback-bin'
     fallback_bin.mkdir()
     (fallback_bin / 'cargo').symlink_to(managed_shim)
-    for name in ('bash', 'python3', 'dirname', 'date', 'jq', 'cc', 'c++', 'xcrun', 'xcodebuild', 'ld', 'ar'):
+    for name in ('bash', 'python3', 'cat', 'dirname', 'date', 'jq', 'cc', 'c++', 'xcrun', 'xcodebuild', 'ld', 'ar'):
         executable = shutil.which(name)
         if executable:
             (fallback_bin / name).symlink_to(executable)

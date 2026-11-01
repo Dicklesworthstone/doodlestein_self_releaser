@@ -9588,15 +9588,99 @@ def is_script(path):
     with open(path, 'rb') as stream:
         return stream.read(2) == b'#!'
 
-rustup = shutil.which('rustup', path=probe_env.get('PATH'))
-if not rustup:
-    # The managed HOME Cargo fallback may be the stock Rustup proxy even
-    # when neither rustc nor rustup is on PATH. Bind its actual HOME dispatcher
-    # before deciding whether those Cargo bytes are the compiler or a proxy.
-    home_rustup = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/rustup')
-    if home_rustup.is_file() and os.access(home_rustup, os.X_OK) and not is_script(home_rustup):
-        rustup = str(home_rustup)
-rustup_digest = digest(pathlib.Path(rustup).resolve()) if rustup else None
+if 'RUSTUP_FORCE_ARG0' in probe_env:
+    fail('configured Rustup dispatch overrides are outside executable attestation')
+
+# These are the existing trusted host's manager locations, not arbitrary
+# siblings of a selected executable. A mismatched PATH manager must not hide
+# a byte-identical HOME manager. Version output never recognizes a proxy.
+rustup_candidates = []
+path_rustup = shutil.which('rustup', path=probe_env.get('PATH'))
+if path_rustup:
+    rustup_candidates.append(pathlib.Path(path_rustup).absolute())
+home_rustup = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/rustup')
+if home_rustup not in rustup_candidates:
+    rustup_candidates.append(home_rustup)
+
+
+def rustup_reference(expected_digest=None):
+    # Reviewed launchers invoke the configured manager, so their unqualified
+    # lookup must not fall through a broken PATH manager to another install.
+    candidates = rustup_candidates if expected_digest is not None else rustup_candidates[:1]
+    for candidate in candidates:
+        try:
+            physical = candidate.resolve(strict=True)
+            if (physical.name != 'rustup' or not physical.is_file() or
+                    not os.access(physical, os.X_OK) or is_script(physical)):
+                continue
+            observed = digest(physical)
+            if expected_digest is None or observed == expected_digest:
+                return candidate, physical, observed
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+def rustup_resolve(reference, tool):
+    candidate, physical, expected = reference
+    parent = fd = None
+    try:
+        parent = os.open(physical.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent_before = os.fstat(parent)
+        fd = os.open(physical.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            fail('Rustup manager reference is not a regular executable')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = None
+
+            def unchanged():
+                stream.seek(0)
+                observed = hashlib.sha256()
+                for block in iter(lambda: stream.read(1048576), b''):
+                    observed.update(block)
+                named = os.stat(physical, follow_symlinks=False)
+                current_parent = os.stat(physical.parent, follow_symlinks=False)
+                return (candidate.resolve(strict=True) == physical and
+                        receipt_identity(before) == receipt_identity(os.fstat(stream.fileno())) and
+                        receipt_identity(before) == receipt_identity(named) and
+                        (parent_before.st_dev, parent_before.st_ino) ==
+                        (current_parent.st_dev, current_parent.st_ino) and
+                        observed.hexdigest() == expected)
+
+            if not unchanged():
+                fail('Rustup manager reference changed before dispatch resolution')
+            which = run([str(physical), 'which', tool])
+            if not unchanged():
+                fail('Rustup manager reference changed during dispatch resolution')
+        actual = pathlib.Path(which)
+        if not actual.is_absolute() or not actual.is_file():
+            fail('rustup did not resolve the selected ' + tool)
+        return actual.resolve(strict=True), {'path': str(physical), 'sha256': expected}
+    except (OSError, RuntimeError) as error:
+        fail('cannot hold Rustup manager reference: ' + str(error))
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if parent is not None:
+            os.close(parent)
+
+
+def refuse_unresolved_rustup(path):
+    # Rustup documents FORCE_ARG0 as binary-name dispatch. Native forwarders
+    # can relay it, so a response only refuses unresolved delegation; it never
+    # grants authority or supplies a resolved executable path.
+    environment = dict(probe_env, RUSTUP_FORCE_ARG0='rustup')
+    try:
+        result = subprocess.run([str(path), '--version'], capture_output=True,
+                                text=True, timeout=60, env=environment)
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        fail('cannot check unresolved Rustup dispatch: ' + str(error))
+    if re.fullmatch(
+            r'rustup [0-9]+\.[0-9]+\.[0-9]+(?:[-+ ][^\r\n]*)?', result.stdout.strip()):
+        fail('unresolved Rustup dispatch or opaque native wrapper: no byte-identical manager reference')
+    if result.returncode:
+        fail('cannot rule out unresolved Rustup dispatch: version check failed for ' + str(path))
 
 # Same exact reviewed v4 shim/v3 toolchain-wrapper bytes used by the strict
 # cache resolver. v6 was additionally source-reviewed against RCH's shim.rs
@@ -9614,15 +9698,17 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
         return None
     selected = pathlib.Path(selected).absolute()
     resolved_selected = selected.resolve()
+    selected_digest = digest(resolved_selected)
     version = run([str(selected), *version_args]) if version_args else ''
     if version_args and version_args[-1] != '-vV':
         version = version.splitlines()[0] if version else ''
     record = {'program': program, 'selected_path': str(selected),
-              'selected_sha256': digest(resolved_selected),
+              'selected_sha256': selected_digest,
               'selected_kind': 'script' if is_script(resolved_selected) else 'executable',
               'version': version}
     actual = None
-    proxy = rustup_digest is not None and record['selected_sha256'] == rustup_digest
+    manager = rustup_reference(selected_digest) if rustup_tool else None
+    proxy = manager is not None
     managed_cargo = rustup_tool == 'cargo' and record['selected_kind'] == 'script' and \
         record['selected_sha256'] in (rch_shim_hash, rch_toolchain_hash, rch_shim_v6_hash)
     if managed_cargo:
@@ -9665,24 +9751,22 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
             else:
                 actual = pathlib.Path(probe_env.get('HOME', '') + '/.cargo/bin/cargo')
     if rustup_tool and (proxy or managed_cargo and actual is None):
-        if not rustup or is_script(pathlib.Path(rustup).resolve()):
+        reference = manager or rustup_reference()
+        if reference is None:
             fail('selected compiler requires an executable rustup resolver')
-        record['rustup_resolver'] = {'path': str(pathlib.Path(rustup).resolve()),
-                                     'sha256': rustup_digest}
-        which = run([rustup, 'which', rustup_tool])
-        if not which or not pathlib.Path(which).is_file():
-            fail('rustup did not resolve the selected ' + rustup_tool)
-        actual = pathlib.Path(which).resolve()
+        actual, record['rustup_resolver'] = rustup_resolve(reference, rustup_tool)
+    elif rustup_tool and not managed_cargo:
+        refuse_unresolved_rustup(resolved_selected)
+        if rustup_tool == 'cargo' and explicit_toolchain:
+            fail('an explicit +toolchain requires a recognized Rustup Cargo proxy or reviewed launcher')
     if actual is not None and rustup_tool:
         try:
             actual = actual.resolve(strict=True)
             # The v6 fallback can itself be the stock rustup Cargo proxy.
-            if managed_cargo and not is_script(actual) and digest(actual) == rustup_digest:
-                if not rustup or is_script(pathlib.Path(rustup).resolve()):
-                    fail('managed Cargo fallback requires an executable rustup resolver')
-                record['rustup_resolver'] = {'path': str(pathlib.Path(rustup).resolve()),
-                                             'sha256': rustup_digest}
-                actual = pathlib.Path(run([rustup, 'which', rustup_tool])).resolve(strict=True)
+            if managed_cargo and not is_script(actual):
+                fallback_manager = rustup_reference(digest(actual))
+                if fallback_manager is not None:
+                    actual, record['rustup_resolver'] = rustup_resolve(fallback_manager, rustup_tool)
             if is_script(actual):
                 if (rustup_tool != 'cargo' or digest(actual) != rch_toolchain_hash or
                         probe_env.get('RCH_CARGO_WRAPPER_BYPASS') != '1' or
@@ -9690,15 +9774,18 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
                     fail('unresolved compiler launcher: ' + str(actual))
                 record['toolchain_launcher'] = {'path': str(actual), 'sha256': digest(actual)}
                 actual = (actual.parent / 'cargo-rch-real').resolve(strict=True)
-            if (not actual.is_file() or not os.access(actual, os.X_OK) or is_script(actual) or
-                    digest(actual) == rustup_digest):
+            if not actual.is_file() or not os.access(actual, os.X_OK) or is_script(actual):
                 fail('compiler delegation did not resolve a real executable: ' + str(actual))
+            refuse_unresolved_rustup(actual)
+            actual_digest = digest(actual)
             native_args = version_args[1:] if version_args and version_args[0].startswith('+') else version_args
             native_version = run([str(actual), *native_args]) if native_args else ''
             if native_args and native_args[-1] != '-vV':
                 native_version = native_version.splitlines()[0] if native_version else ''
             if native_version != version:
                 fail('selected launcher and resolved executable version disagree: ' + program)
+            if digest(actual) != actual_digest:
+                fail('resolved compiler executable changed during its version probe: ' + program)
         except (OSError, RuntimeError) as error:
             fail('cannot resolve actual compiler executable: ' + str(error))
     if sys.platform == 'darwin' and str(resolved_selected) in (
@@ -9712,6 +9799,8 @@ def identity(name, program, version_args, rustup_tool=None, required=True):
         record['resolved_path'] = str(actual)
         record['resolved_sha256'] = digest(actual)
         record['resolved_kind'] = 'script' if is_script(actual) else 'executable'
+    if selected.resolve() != resolved_selected or digest(resolved_selected) != selected_digest:
+        fail('selected executable changed during its identity probe: ' + program)
     return record
 
 triple = selection['target']
