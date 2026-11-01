@@ -1,8 +1,124 @@
 #!/usr/bin/env bash
 # Real locked offline Rust workspace builds through the installer source engine.
 # Only Git's HTTPS transport is redirected to a local committed repository.
+# The optional Bun contract mode substitutes the compiler boundary only; it is
+# not evidence of native Bun compilation (the generated installer suite is).
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+case "$#:${1:-}" in
+    0:|1:--bun-contracts-only) ;;
+    *) printf 'Usage: %s [--bun-contracts-only]\n' "$0" >&2; exit 4 ;;
+esac
+
+test_bun_family_contracts() (
+    for dependency in jq ps; do
+        command -v "$dependency" >/dev/null 2>&1 || {
+            printf 'SKIP: Bun compiler-boundary contracts require %s\n' "$dependency"; return 0;
+        }
+    done
+    if ! declare -F _isb_compile >/dev/null; then
+        # shellcheck source=../../src/install_source.sh
+        source "$ROOT/src/install_source.sh"
+    fi
+    local fixtures good=0 bad=0 result fault
+    fixtures=$(mktemp -d "${TMPDIR:-/tmp}/dsr-bun-family-contracts.XXXXXXXX") || return 1
+    printf 'Bun compiler-boundary fixtures: %s\n' "$fixtures"
+    contract_check() {
+        local label="$1"; shift
+        if "$@"; then good=$((good + 1)); printf 'PASS: %s\n' "$label"
+        else bad=$((bad + 1)); printf 'FAIL: %s\n' "$label" >&2; fi
+    }
+    contract_equal() { [[ "$1" == "$2" ]]; }
+    contract_case() (
+        local fault="$1" base="$fixtures/$1" output code=0
+        local -a selected=(fixture helper compiler.log)
+        mkdir -p "$base/tree/src" "$base/output" || return 1
+        printf '%s\n' '{"bin":{"fixture":"src/decoy.ts","helper":"src/helper.ts","compiler.log":"src/log.ts"}}' \
+            > "$base/tree/package.json"
+        for entry in primary helper log decoy; do
+            printf 'console.log("%s");\n' "$entry" > "$base/tree/src/$entry.ts"
+        done
+        printf '{}\n' > "$base/tree/bun.lock"
+        case "$fault" in
+            ok) selected=(helper fixture compiler.log) ;;
+            missing) printf '%s\n' '{"bin":{"fixture":"src/decoy.ts","compiler.log":"src/log.ts"}}' > "$base/tree/package.json" ;;
+            scalar) printf '%s\n' '{"bin":"src/primary.ts"}' > "$base/tree/package.json" ;;
+            unsafe) printf '%s\n' '{"bin":{"helper":"../outside.ts","compiler.log":"src/log.ts"}}' > "$base/tree/package.json" ;;
+            input-link) ln -s primary.ts "$base/tree/src/linked.ts" || return 1
+                printf '%s\n' '{"bin":{"helper":"src/linked.ts","compiler.log":"src/log.ts"}}' > "$base/tree/package.json" ;;
+        esac
+        bun() {
+            printf '%s\n' "$*" >> "$base/bun.calls"
+            case "$1" in
+                --version) printf 'bun-contract-version\n' ;;
+                install) [[ "$fault" != dependency ]] ;;
+                build)
+                    local target='' entry=''
+                    shift
+                    while (($#)); do
+                        case "$1" in
+                            --outfile) target="$2"; shift 2 ;;
+                            --compile) shift ;;
+                            *) entry="$1"; shift ;;
+                        esac
+                    done
+                    [[ "$target" == "$base/output/bin/"* ]] || return 1
+                    if [[ "${target##*/}" == helper ]]; then
+                        case "$fault" in
+                            compile) return 9 ;;
+                            absent) return 0 ;;
+                            empty) : > "$target"; return $? ;;
+                            output-link) ln -s "$base/tree/src/helper.ts" "$target"; return $? ;;
+                        esac
+                    fi
+                    printf '%s\n' "$entry" > "$target"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        output=$(_isb_compile bun "$base/tree" "$base/output" fixture src/primary.ts '' 5 "${selected[@]}") || code=$?
+        printf '%s:%s\n' "$code" "$output"
+    )
+    result=$(contract_case ok)
+    contract_check 'Bun family boundary returns every selected member in the requested order' contract_equal "$result" \
+        "$(printf '0:%s/output/bin/helper\n%s/output/bin/fixture\n%s/output/bin/compiler.log' "$fixtures/ok" "$fixtures/ok" "$fixtures/ok")"
+    contract_check 'Bun family uses the explicit primary entry even when primary is not first' \
+        grep -qx './src/primary.ts' "$fixtures/ok/output/bin/fixture"
+    contract_check 'Bun companion retains its own package bin mapping' \
+        grep -qx './src/helper.ts' "$fixtures/ok/output/bin/helper"
+    contract_check 'Bun diagnostic-shaped executable retains its own entry' \
+        grep -qx './src/log.ts' "$fixtures/ok/output/bin/compiler.log"
+    contract_check 'Bun executable cannot overwrite retained compiler identity' \
+        grep -qx bun-contract-version "$fixtures/ok/output/compiler.log"
+    contract_check 'Bun family installs locked dependencies exactly once' contract_equal \
+        "$(grep -c '^install --frozen-lockfile$' "$fixtures/ok/bun.calls")" 1
+    contract_check 'Bun family invokes one standalone compile per member' contract_equal \
+        "$(grep -c '^build --compile ' "$fixtures/ok/bun.calls")" 3
+    for fault in missing scalar unsafe input-link; do
+        result=$(contract_case "$fault" 2> "$fixtures/$fault.log")
+        contract_check "Bun $fault companion rejects the entire family" contract_equal "$result" '4:'
+        contract_check "Bun $fault companion fails before compiler or dependency execution" \
+            test ! -e "$fixtures/$fault/bun.calls"
+    done
+    for fault in dependency compile absent empty output-link; do
+        result=$(contract_case "$fault" 2> "$fixtures/$fault.log")
+        contract_check "Bun $fault failure returns no partial family" contract_equal "$result" '6:'
+    done
+    contract_check 'Bun dependency failure does not run a compiler' contract_equal \
+        "$(grep -c '^build ' "$fixtures/dependency/bun.calls")" 0
+    contract_check 'Bun later compiler failure occurs after a successful first member' \
+        test -s "$fixtures/compile/output/bin/fixture"
+    contract_check 'Bun later compiler failure never attempts the final member' contract_equal \
+        "$(grep -c '^build ' "$fixtures/compile/bun.calls")" 2
+    printf 'Bun family compiler-boundary contracts: %s passed, %s failed\n' "$good" "$bad"
+    [[ $bad -eq 0 ]]
+)
+
+if [[ "${1:-}" == --bun-contracts-only ]]; then
+    test_bun_family_contracts
+    exit $?
+fi
+
 for dependency in git jq cargo rustc ps; do
     command -v "$dependency" >/dev/null 2>&1 || {
         printf 'SKIP: source family integration requires %s\n' "$dependency"
@@ -237,7 +353,7 @@ reject_windows_family case-collision 'case-folded executable collision is reject
 reject_windows_family suffix-collision '.exe alias collision is rejected' --bin family --bin family.exe
 reject_family unsafe 'path traversal executable name is rejected' --bin family --bin ../family-helper
 reject_family option-name 'option-shaped executable name is rejected' --bin family --bin --workspace
-run_build unsupported refs/tags/v1.0.0 go family "$WORK/unsupported" --allow-build --bin family --bin family-helper
+run_build unsupported refs/tags/v1.0.0 ruby family "$WORK/unsupported" --allow-build --bin family --bin family-helper
 check 'unsupported language does not silently install only the primary' equal "$STATUS" 4
 check 'unsupported family is refused before any checkout or compiler' test ! -e "$WORK/unsupported"
 
@@ -327,4 +443,5 @@ check 'source drift cannot emit a successful family receipt' test ! -s "$WORK/re
 check 'source drift leaves no admitted receipt on disk' test ! -e "$WORK/mutation/receipt.json"
 
 printf 'Source family tests: %s passed, %s failed\n' "$PASS" "$FAIL"
-[[ $FAIL -eq 0 ]]
+[[ $FAIL -eq 0 ]] || exit 1
+test_bun_family_contracts

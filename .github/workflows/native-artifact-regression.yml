@@ -12,6 +12,9 @@ on:
       - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_artifact_formats.sh
       - scripts/tests/test_generated_installer_transactions.sh
+      - scripts/tests/test_generated_workspace_installer.sh
+      - scripts/tests/test_install_source.sh
+      - scripts/tests/test_install_source_family.sh
       - dsr
       - src/act_runner.sh
       - src/artifact_naming.sh
@@ -20,6 +23,7 @@ on:
       - src/config.sh
       - src/git_ops.sh
       - src/install_gen.sh
+      - src/install_source.sh
       - src/packaging.sh
       - src/platforms.sh
       - src/slsa.sh
@@ -42,7 +46,7 @@ jobs:
           - os: macos-15
             targets: all-platforms
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -73,6 +77,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Install pinned Bun for genuine source-family compilation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun-v1.4.4-linux-x64-baseline.zip"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --user-agent 'doodlestein_self_releaser-agent (+https://github.com/Dicklesworthstone/doodlestein_self_releaser)' \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64-baseline.zip
+          printf '%s  %s\n' e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76 "$archive" | sha256sum --check --strict
+          unzip -j "$archive" bun-linux-x64-baseline/bun -d "$RUNNER_TEMP/dsr-test-bin"
+          test "$("$RUNNER_TEMP/dsr-test-bin/bun" --version)" = 1.4.4
       - name: Validate concurrent workflow evidence
         shell: bash
         run: |
@@ -106,6 +123,18 @@ jobs:
           bash -n src/install_gen.sh
           bash -n scripts/tests/test_generated_installer_transactions.sh
           bash scripts/tests/test_generated_installer_transactions.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/installer-transactions.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate genuine Go and Bun source executable families
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          bun --version
+          bash -n src/install_source.sh
+          bash scripts/tests/test_install_source.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/source-engine.log"
+          bash scripts/tests/test_install_source_family.sh --bun-contracts-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/bun-family-contracts.log"
+          bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-bun-source-families.log"
           test -z "$(git status --porcelain)"
       - name: Validate native compilation, manifests and signed provenance
         shell: bash

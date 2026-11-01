@@ -16,6 +16,76 @@ sourcing the module to select an output root; the default is `./installers`.
 Success prints only the generated installer path to stdout. Diagnostics and
 retained-history paths go to stderr.
 
+## Executable families from source
+
+The ordinary installer uses the same effective `workspace_binaries` family for
+verified release archives and explicitly authorized source builds. A
+`workspace_binaries_by_target` entry replaces the global list for that platform;
+an empty list selects only `binary_name`. Every nonempty family must include its
+primary executable. Rust, Go, Bun, and TypeScript source builds produce every
+selected member from one pinned checkout before installation begins.
+
+```yaml
+binary_name: app
+language: go
+workspace_binaries: [app, app-helper, app-worker]
+source_subdir: project
+source_entry: entry/main
+```
+
+For this Go configuration, the primary comes from `project/entry/main`, while
+the companions come from `project/cmd/app-helper` and `project/cmd/app-worker`.
+Without `source_entry`, the primary uses `cmd/app` when that path exists and
+otherwise the module root. Each companion requires its own `cmd/<name>`
+directory; it never falls back to the primary's package. DSR resolves all
+selected paths and requires every selected Go package to be `main` before the
+first build. It preserves the existing readonly/vendor dependency policy and
+builds for the installing machine, regardless of inherited `GOOS`, `GOARCH`,
+or `GOFLAGS`.
+
+For Bun and TypeScript, each companion requires its exact name in the selected
+project's `package.json` `bin` object:
+
+```json
+{
+  "bin": {
+    "app": "src/cli.ts",
+    "app-helper": "src/helper.ts",
+    "app-worker": "src/worker.ts"
+  }
+}
+```
+
+An explicit `source_entry` overrides only the primary. A scalar `bin` string
+also selects only the primary and cannot supply companion roles. Every selected
+entry must be a regular file inside the pinned project, with no symlink path
+components. After resolving the complete family, DSR runs one
+`bun install --frozen-lockfile` and then compiles each member separately. A
+committed `bun.lock` or `bun.lockb` remains mandatory. Rust continues to select
+the complete family through Cargo and verify each resolved executable provider.
+
+Go and Bun payloads are kept in a separate `output/bin` directory, so an
+executable named `compiler.log` cannot overwrite retained compiler evidence.
+Every compiler command retains its own diagnostics and timeout. The receipt
+binds all selected executable names, hashes and sizes to the pinned source
+commit, and explicitly marks the result as locally built rather than a signed
+release. Missing entries, invalid providers, a failed member, or source drift
+prevent a success receipt and leave the installed family unchanged. Successful
+families use the same verified installation transaction and directory lock as
+release archives.
+
+The focused integration executes genuine Go and, when installed, Bun compilers
+through the public generator and standalone installer:
+
+```bash
+bash scripts/tests/test_generated_workspace_installer.sh --go-bun-source-only
+```
+
+It checks complete executable receipts, primary overrides, platform subsets,
+dependency locking, missing and unsafe providers, later compiler failure,
+tag-pinned fallback, and refusal to fall back after a failed release checksum.
+The Bun cases explicitly report a skip when the real Bun compiler is absent.
+
 ## Optional source toolchain bootstrap
 
 Generated installers can build a pinned source revision with `--from-source`,

@@ -975,10 +975,15 @@ replacement restores the previous executables and leaves unrelated files
 alone. Successful `--json` output includes each installed executable's name,
 path, SHA-256 and byte size in `binaries`, alongside the primary `path`.
 
-Rust source fallback builds the same selected set from one pinned commit,
-including binaries in other workspace packages, and rejects ambiguous Cargo
-output providers. Source installation still requires `--from-source` or
-`--allow-source-build`; Go and Bun source builds support a single executable.
+Source fallback builds the same selected set from one pinned commit. Rust
+includes binaries in other workspace packages and rejects ambiguous Cargo
+output providers. Go companions use their own `cmd/<name>` packages; Bun and
+TypeScript companions use their exact `package.json` `bin` entries. An explicit
+`source_entry` selects only the primary. Every selected member must build and
+verify before the family is installed. Source installation still requires
+`--from-source` or `--allow-source-build`; see the
+[source family contract](docs/INSTALLER_GENERATION.md#executable-families-from-source)
+for entry selection, dependency locking and failure behavior.
 
 Private GitHub source builds use the same account as release downloads and
 freshness checks: `DSR_GH_TOKEN`, then `GITHUB_TOKEN`, then `GH_TOKEN`, then the
