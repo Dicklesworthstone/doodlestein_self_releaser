@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Cargo config unit tests; --integration also builds with a real nightly toolchain.
+--incremental-integration runs a bounded build/receipt matrix on an installed
+stable-compatible toolchain without running the nightly release fixtures.
 
 Fixtures are byte-exact upstream .cargo/config.toml files, pinned by Git blob:
 pi_agent_rust v0.8.0: dbd046e2b5abdf74d88e12c3deff5cdcea679092
@@ -26,6 +28,9 @@ MODULE = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(ROOT / 'src/act_runner.s
 INTEGRATION = '--integration' in sys.argv
 if INTEGRATION:
     sys.argv.remove('--integration')
+INCREMENTAL_INTEGRATION = '--incremental-integration' in sys.argv
+if INCREMENTAL_INTEGRATION:
+    sys.argv.remove('--incremental-integration')
 
 
 class Refused(Exception):
@@ -110,14 +115,17 @@ class ConfigurationTests(unittest.TestCase):
     def test_incremental_disabled_forms(self):
         for entry, force in [('0', False), ({'value': '0'}, False),
                              ({'value': '0', 'force': False}, False),
+                             ({'value': '0', 'relative': False}, False),
                              ({'value': '0', 'force': True, 'relative': False}, True)]:
             with self.subTest(entry=entry):
                 self.assertEqual(cargo_env_exemption('CARGO_INCREMENTAL', entry),
                                  {'name': 'CARGO_INCREMENTAL', 'value': '0', 'force': force})
 
     def test_incremental_enabled_and_malformed_forms_refused(self):
-        invalid = ['', '1', '2', '00', '01', '-0', '+0', ' 0', '0 ', '0\n', 'auto',
-                   0, False, None, [], {}, {'value': 0}, {'value': '1'},
+        invalid = ['', '1', '2', '-1', '00', '01', '-0', '+0', ' 0', '0 ', '0\n', '0\x00',
+                   '0\u00ad', '0\u200b', '0\u200d', '0\u034f', '0\ufe0f',
+                   'auto', 'false', '\u0660', '\uff10', 0, False, True, None, [], {},
+                   {'value': 0}, {'value': '1'}, {'value': '00'},
                    {'value': '0', 'force': 0}, {'value': '0', 'force': 'false'},
                    {'value': '0', 'relative': 0}, {'value': '0', 'relative': True},
                    {'value': '0', 'extra': False}]
@@ -131,7 +139,8 @@ class ConfigurationTests(unittest.TestCase):
     def test_incremental_effective_environment_and_receipts(self):
         for literal, force in [('"0"', False), ('{value="0", force=false}', False),
                                ('{value="0", force=true, relative=false}', True)]:
-            for ambient in (None, '0', '1', '00', ''):
+            for ambient in (None, '0', '1', '00', '', ' 0', '0\n', '0\x00',
+                            '0\u00ad', '0\u200b', '0\u200d', '0\u034f', '0\ufe0f'):
                 with self.subTest(literal=literal, ambient=ambient):
                     config, receipts = config_read('[env]\nCARGO_INCREMENTAL=' + literal + '\n')
                     env = {} if ambient is None else {'CARGO_INCREMENTAL': ambient}
@@ -149,6 +158,15 @@ class ConfigurationTests(unittest.TestCase):
                     self.assertEqual(row['effective_force'], force)
                     self.assertEqual(row['effective_source'],
                                      'environment' if ambient is not None and not force else 'configuration')
+                    self.assertEqual(receipts[0]['env_exemptions'], [{
+                        'name': 'CARGO_INCREMENTAL', 'value': '0', 'force': force,
+                        'effective_value': '0', 'effective_force': force,
+                        'effective_source': 'environment' if ambient is not None and not force else 'configuration'}])
+        # An allowed inherited value cannot hide an unsafe configured value.
+        with patch.dict(os.environ, {'CARGO_INCREMENTAL': '0'}):
+            for literal in ('"1"', '{value="1", force=false}', '{value="1", force=true}'):
+                with self.subTest(literal=literal), self.assertRaises(Refused):
+                    config_read('[env]\nCARGO_INCREMENTAL=' + literal + '\n')
 
     def test_unix_and_windows_environment_allowlists_agree(self):
         # The native observers use different languages. Guard their public
@@ -262,6 +280,11 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(words=words), self.assertRaises(Refused):
                 cargo_validate_flags(words, True)
         cargo_validate_flags(['-Z', 'threads=4', '-C', 'target-cpu=x86-64-v3'], True)
+
+    def test_linker_override_refusal_names_the_attested_configuration(self):
+        for words in (['-C', 'linker=cc'], ['--codegen=linker=cc']):
+            with self.subTest(words=words), self.assertRaisesRegex(Refused, re.escape('[target.<triple>] linker')):
+                cargo_validate_flags(words, True)
 
     def test_unstable_and_wrapped_cfg_fail_closed(self):
         for text, env in [('[unstable]\nhost-config=true\n', {}),
@@ -466,6 +489,91 @@ class CompilerIntegrationTests(unittest.TestCase):
         result, _ = self.probe(directory, command='cargo build --target definitely-not-a-target')
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((directory / 'identity.json').exists())
+
+
+@unittest.skipUnless(INCREMENTAL_INTEGRATION, 'use --incremental-integration with an installed Cargo/rustc toolchain')
+class IncrementalIntegrationTests(unittest.TestCase):
+    # Reuse the existing real project, compiler observer and receipt verifier
+    # without inheriting or running the nightly release test methods.
+    run_command = staticmethod(CompilerIntegrationTests.run_command)
+    project = CompilerIntegrationTests.project
+    probe = CompilerIntegrationTests.probe
+    build_and_compare = CompilerIntegrationTests.build_and_compare
+
+    @classmethod
+    def setUpClass(cls):
+        for tool in ('cargo', 'rustc', 'rustup', 'bash', 'jq', 'cc'):
+            if not shutil.which(tool):
+                raise RuntimeError('Missing incremental integration dependency: ' + tool)
+        cls.work = Path(tempfile.mkdtemp(prefix='dsr-cargo-incremental-live-')).resolve()
+        print('Retained incremental fixtures:', cls.work, flush=True)
+        discovery = dict(os.environ, RUSTUP_AUTO_INSTALL='0', RCH_DISABLED='1', RCH_CARGO_WRAPPER_BYPASS='1')
+        real_sysroot = cls.run_command(['rustc', '--print', 'sysroot'], env=discovery).stdout.strip()
+        cls.env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('RUST', 'CARGO_', 'RCH_'))}
+        cls.env.update(CARGO_HOME=str(cls.work / 'cargo'), RUSTUP_HOME=str(cls.work / 'rustup'),
+                       RUSTUP_AUTO_INSTALL='0', RCH_DISABLED='1', RCH_CARGO_WRAPPER_BYPASS='1')
+        cls.run_command(['rustup', 'toolchain', 'link', 'dsr-incremental-fixture', real_sysroot], env=cls.env)
+        cls.env['RUSTUP_TOOLCHAIN'] = 'dsr-incremental-fixture'
+        version = cls.run_command(['rustc', '-vV'], env=cls.env).stdout
+        print('Incremental integration compiler:', version.splitlines()[0], flush=True)
+        cls.host = next(line.split(': ', 1)[1] for line in version.splitlines() if line.startswith('host: '))
+        cls.env['CARGO_BUILD_TARGET'] = cls.host
+        cls.count = 0
+
+    def test_real_cargo_records_zero_child_environment_and_preserves_receipt_custody(self):
+        cases = [('"0"', None, False, 'configuration'),
+                 ('{value="0", force=false}', '0', False, 'environment'),
+                 ('{value="0", force=true, relative=false}', '0', True, 'configuration')]
+        for literal, ambient, force, origin in cases:
+            with self.subTest(literal=literal, ambient=ambient):
+                directory = self.project('[env]\nCARGO_INCREMENTAL=' + literal +
+                    '\nRUST_MIN_STACK="16777216"\nRUST_TEST_THREADS="2"\n')
+                environment = dict(self.env)
+                if ambient is not None:
+                    environment['CARGO_INCREMENTAL'] = ambient
+                command = 'cargo build --offline --jobs 1 --verbose'
+                recorded = self.build_and_compare(directory, environment, command=command,
+                                                  incremental_disabled=ambient == '0')
+                rows = recorded['identity']['selection']['cargo_config'][0]['env_exemptions']
+                row = next(row for row in rows if row['name'] == 'CARGO_INCREMENTAL')
+                self.assertEqual(row, {'name': 'CARGO_INCREMENTAL', 'value': '0', 'force': force,
+                    'effective_value': '0', 'effective_force': force, 'effective_source': origin})
+                incremental = directory / 'target' / self.host / 'debug/incremental'
+                cached = any(path.is_file() for path in incremental.rglob('*'))
+                # Cargo selects its own incremental profile from its parent
+                # environment. [env] supplies children; the parent0 cases
+                # also prove Cargo emits no incremental flag or cache.
+                if ambient == '0':
+                    self.assertFalse(cached, 'the explicit Cargo parent value 0 disables its incremental cache')
+                receipt = directory / 'identity.json'
+                original_receipt = receipt.read_bytes()
+                unsafe = dict(environment, CARGO_INCREMENTAL='1')
+                refused, _ = self.probe(directory, unsafe, command=command,
+                                        mode='verify', pin=recorded['pin'])
+                self.assertEqual(refused.returncode, 86, refused.stderr)
+                self.assertEqual(receipt.read_bytes(), original_receipt)
+                with (directory / '.cargo/config.toml').open('a') as stream:
+                    stream.write('\n# tracked configuration drift\n')
+                refused, _ = self.probe(directory, environment, command=command,
+                                        mode='verify', pin=recorded['pin'])
+                self.assertEqual(refused.returncode, 86, refused.stderr)
+                self.assertEqual(receipt.read_bytes(), original_receipt)
+
+    def test_unsafe_incremental_contexts_never_create_an_admission_receipt(self):
+        cases = [('[env]\nCARGO_INCREMENTAL="1"\n', {}),
+                 ('[env]\nCARGO_INCREMENTAL={value="1", force=true}\n', {'CARGO_INCREMENTAL': '0'}),
+                 ('[env]\nCARGO_INCREMENTAL="0"\n', {'CARGO_INCREMENTAL': '1'}),
+                 ('[env]\nCARGO_INCREMENTAL={value="0", force=true}\n', {'CARGO_INCREMENTAL': '1'}),
+                 ('[env]\nCARGO_INCREMENTAL=0\n', {}),
+                 ('[env]\nCARGO_INCREMENTAL="0"\nRUST_MIN_STACK="0"\n', {}),
+                 ('[env]\nCARGO_INCREMENTAL="0"\nRUST_TEST_THREADS="0"\n', {})]
+        for text, overrides in cases:
+            with self.subTest(text=text, overrides=overrides):
+                directory = self.project(text)
+                result, _ = self.probe(directory, dict(self.env, **overrides), command='cargo build --offline --jobs 1')
+                self.assertEqual(result.returncode, 86, result.stderr)
+                self.assertFalse((directory / 'identity.json').exists())
 
 
 if __name__ == '__main__':

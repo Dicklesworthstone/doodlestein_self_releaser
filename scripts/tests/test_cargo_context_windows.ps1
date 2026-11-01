@@ -679,7 +679,7 @@ Write-Text (Join-Path $source 'closure-dependency/Cargo.toml') "[package]`nname=
 Write-Text (Join-Path $source 'closure-dependency/src/lib.rs') 'pub fn value() -> u32 { 42 }'
 $null = Invoke-Exe $cargo @('generate-lockfile','--offline','--manifest-path',$manifest)
 $saved = @{}
-foreach ($name in @('RUSTUP_HOME','RUSTUP_TOOLCHAIN','CARGO_HOME','RUSTFLAGS','RUSTC_WRAPPER','NoDefaultCurrentDirectoryInExePath')) {
+foreach ($name in @('RUSTUP_HOME','RUSTUP_TOOLCHAIN','CARGO_HOME','CARGO_INCREMENTAL','RUSTFLAGS','RUSTC_WRAPPER','NoDefaultCurrentDirectoryInExePath')) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process')
 }
 try {
@@ -1099,6 +1099,9 @@ fn main() {
     # Cargo must apply the admitted numeric settings to both build scripts
     # and rustc. Executing the real result distinguishes actual precedence
     # from a parser that merely produces a plausible receipt.
+    # Ambient incremental compilation is scrubbed; only explicitly configured
+    # environment values participate in Cargo's force/default precedence.
+    $env:CARGO_INCREMENTAL = '1'
     Write-Text (Join-Path $configSource 'src/main.rs') @'
 fn main() {
     println!("{}:{}:{}|{}", env!("RUST_MIN_STACK"), env!("RUST_TEST_THREADS"),
@@ -1160,6 +1163,11 @@ fn main() {
             -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
         Check ("numeric $($case.Name) retains metadata authority after genuine compilation") $true
     }
+    Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=true,relative=false}`nRUST_TEST_THREADS={force=true,value='4'}`nCARGO_INCREMENTAL={value='0',force=false,relative=false}`n"
+    Refused 'changing incremental force cannot reuse the held metadata receipt' {
+        Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
+            -Fingerprint $numericReceipt.fingerprint -ReceiptSha256 $numericReceipt.receipt_sha256
+    } 'context changed'
     Write-Text $selectionConfig "[env]`nRUST_MIN_STACK={value='16777216',force=false}`nRUST_TEST_THREADS={value='4',force=false}`nCARGO_INCREMENTAL={value='0',force=false}`n"
     Refused 'changing numeric force semantics invalidates the held metadata receipt' {
         Assert-DsrCargoContextReceipt -Context $numericContext -Path $numericReceiptPath `
@@ -1171,7 +1179,7 @@ fn main() {
     } 'Effective Cargo numeric environment is invalid'
     foreach ($force in @('false','true')) {
         Write-Text $selectionConfig ("[env]`nCARGO_INCREMENTAL={value='0',force=" + $force + "}`n")
-        foreach ($incremental in @('1','00','false','',' 0','0 ')) {
+        foreach ($incremental in @('1','00','false','',' 0','0 ',('0'+[char]0x00ad),('0'+[char]0x200b))) {
             Refused ("Cargo's incoming incremental setting is refused even with force=${force}: " + $incremental) {
                 New-DsrCargoContext -BuildCommand $numericCommand -SourceRoot $configSource -CargoHome $configHome `
                     -Environment ($baseEnvironment + ('CARGO_INCREMENTAL=' + $incremental))
@@ -1200,6 +1208,38 @@ fn main() {
         Refused ('unsupported numeric environment value cannot receive an attestation: ' + $entry) {
             New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome -Environment $baseEnvironment
         }
+    }
+    foreach ($entry in @(
+        '0', '1', 'true', 'false', '""', '"1"', '"00"', '"+0"', '"-0"', '" 0"', '"0 "', '"0\n"',
+        '"0\u000a"', '"0\u0000"', '"0\u00ad"', '"0\u200b"', '"\u200b0"', '"\uff10"',
+        '{}', '{force=true}', '{value=0}', '{value="1",force=true}',
+        '{value="0",relative=true}', '{value="0",force="true"}', '{value="0",unknown=false}',
+        '{value="0",value="0"}', '{value="0",force=true,force=false}',
+        '{value="0",}', '{value="0"} extra', '{value="0"'
+    )) {
+        Write-Text $selectionConfig ("[env]`nCARGO_INCREMENTAL=" + $entry + "`n")
+        Refused ('unsupported incremental configuration cannot be hidden by an inherited zero: ' + $entry) {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome `
+                -Environment ($baseEnvironment + 'CARGO_INCREMENTAL=0')
+        }
+    }
+    Write-Text $selectionConfig "[env]`nCARGO_INCREMENTAL='0'`n"
+    foreach ($value in @('1','00','+0','-0',' 0','0 ','false','',('0'+[char]0x00ad),('0'+[char]0x200b))) {
+        Refused ('invalid effective incremental value cannot reach a compiler probe: ' + $value) {
+            New-DsrCargoContext -BuildCommand $mutableCommand -SourceRoot $configSource -CargoHome $configHome `
+                -Environment ($baseEnvironment + ("CARGO_INCREMENTAL=" + $value))
+        } 'Effective Cargo numeric environment is invalid: CARGO_INCREMENTAL'
+    }
+    foreach ($flags in @(@('-C','linker=cc'), @('--codegen','linker=cc'), @('-Clinker=cc'), @('--codegen=linker=cc'))) {
+        Refused 'hidden linker selection names the existing attested target-linker migration' {
+            Assert-DsrCargoRustFlags -Words $flags
+        } '\[target\.<triple>\] linker'
+    }
+    foreach ($flags in @(@('-Z','codegen-backend=hidden'), @('-Z','codegen_backend=hidden'), @('--sysroot','hidden'))) {
+        $failure=$null
+        try { Assert-DsrCargoRustFlags -Words $flags } catch { $failure=$_ }
+        Check 'other executable selectors remain refused without suggesting a target linker' (
+            $null -ne $failure -and $failure.Exception.Message -notmatch '\[target\.<triple>\] linker')
     }
     foreach ($configText in @(
         'build.rustc="hidden-rustc"', ('[build]'+"`n"+'rustc={value="hidden-rustc"}'),

@@ -9441,6 +9441,8 @@ def cargo_validate_flags(words, cfg_scoped=False):
                 key = re.split(r'[=\s]', option.strip().lstrip('='), maxsplit=1)[0]
                 # rustc accepts underscores as well as hyphens in -C/-Z keys.
                 if key.replace('_', '-') == forbidden:
+                    if forbidden == 'linker':
+                        fail('rustflags compiler/linker overrides require explicit attested configuration; move the linker option to [target.<triple>] linker')
                     fail('rustflags compiler/linker overrides require explicit attested configuration')
         if cfg_scoped and (word in ('--cfg', '--target') or word.startswith(('--cfg=', '--target='))):
             fail('cfg-scoped Cargo selection cannot be combined with rustflags --cfg or --target')

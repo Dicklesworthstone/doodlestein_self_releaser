@@ -210,7 +210,7 @@ function ConvertFrom-DsrCargoConfigString {
 function Test-DsrCargoNumericEnvironmentValue {
     param([string]$Name, $Value)
     if ($Value -isnot [string]) { return $false }
-    if ($Name -ceq 'CARGO_INCREMENTAL') { return $Value -ceq '0' }
+    if ($Name -ceq 'CARGO_INCREMENTAL') { return [string]::Equals($Value,'0',[StringComparison]::Ordinal) }
     return $Name -cin @('RUST_MIN_STACK','RUST_TEST_THREADS') -and $Value -cmatch '^[1-9][0-9]*\z'
 }
 
@@ -389,6 +389,9 @@ function Assert-DsrCargoRustFlags {
     # Keep the existing Windows executable-selection boundary, then validate
     # actual argument boundaries as well as the final concatenated cfg argv.
     if (($Words -join ' ') -match '(?i)(linker|link-self-contained|codegen-backend|gcc-ld|sysroot|--target|@)') {
+        if (($Words -join ' ') -cmatch '(?:^|\s)(?:-C(?:\s+|=)?|--codegen(?:\s+|=))linker(?:=|\s|$)') {
+            throw 'Rustflags can change executable selection; move the linker option to [target.<triple>] linker'
+        }
         throw 'Rustflags can change executable selection; configure an explicit Cargo target linker and compiler'
     }
     for ($index=0; $index -lt $Words.Count; $index++) {
@@ -409,6 +412,7 @@ function Assert-DsrCargoRustFlags {
             if ($null -ne $option) {
                 $key=([regex]::Split($option.Trim().TrimStart('='),'[=\s]'))[0]
                 if ($key.Replace('_','-') -ceq $selector.Forbidden) {
+                    if ($selector.Forbidden -ceq 'linker') { throw 'Rustflags compiler/linker overrides require explicit attested configuration; move the linker option to [target.<triple>] linker' }
                     throw 'Rustflags compiler/linker overrides require explicit attested configuration'
                 }
             }

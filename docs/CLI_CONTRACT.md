@@ -1253,7 +1253,9 @@ CARGO_INCREMENTAL = "0"
 ```
 
 Existing configured environment values take precedence unless `force=true`.
-The resulting value must satisfy the same name-specific restriction. Cargo
+Both configured and effective values must satisfy the same name-specific
+restriction. For `CARGO_INCREMENTAL`, numeric zero, `"1"`, whitespace,
+invisible suffixes and alternate zero spellings are refused. Cargo
 reads its own incremental mode before applying `[env]` to children, so a
 nonzero or malformed incoming `CARGO_INCREMENTAL` refuses admission even when
 the tracked table says `force=true`. A tracked `"0"` alone does not override
@@ -1265,6 +1267,13 @@ value, force flag, effective value and origin in
 independent collection bind this evidence. Unknown or duplicate attributes,
 relative-path expansion, non-Boolean flags, multiline tables and trailing
 commas are refused; this exception does not admit compiler environment changes.
+
+Cargo's `[build] incremental=false` also disables incremental compilation when
+there is no overriding parent `CARGO_INCREMENTAL`.
+The exemption and its receipt describe the effective child environment; they
+do not certify that Cargo emitted no incremental artifacts. See Cargo's
+[`env` configuration](https://doc.rust-lang.org/cargo/reference/config.html#env)
+and [incremental setting](https://doc.rust-lang.org/cargo/reference/config.html#buildincremental).
 
 Tracked target tables can use bounded `cfg(...)` expressions on Windows as well
 as Unix. Supported predicates are `unix`, `windows`, and literal values for
@@ -1288,6 +1297,20 @@ Cargo's ordinal order. Build flags combine the build table and
 target table, which overrides a matching cfg linker; multiple matching cfg
 linkers without a higher-priority selection are refused. Changing the cfg
 configuration or selected compiler invalidates the held metadata receipt.
+
+On both Unix and Windows, configure the linker through the explicit target key
+so its selected executable is resolved and attested. Move a
+`-C linker=cc` or `--codegen linker=cc` selection out of `rustflags`, for example:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "cc"
+rustflags = ["-Z", "threads=4", "-C", "link-arg=-B/usr/bin"]
+```
+
+The remaining flags still need the selected compiler's normal support. Linker
+selection inside `rustflags` remains refused even when it spells the default
+linker; naming `cc` alone does not establish its executable identity.
 
 Configured compiler
 or linker paths must be absolute, or project-relative paths in tracked Cargo
