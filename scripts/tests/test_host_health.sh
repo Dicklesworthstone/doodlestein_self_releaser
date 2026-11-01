@@ -327,6 +327,22 @@ test_remote_health_preserves_caller_stdin() {
     done
 }
 
+# Explicit data at the external writable-probe boundary. Classification and
+# role/contract admission remain the complete production implementation.
+_test_writable_inventory() {
+    local root_usage="$1" root_kb="$2" build_usage="$3" build_kb="$4" build_path="${5:-/var/tmp}"
+    jq -nc --argjson root_usage "$root_usage" --argjson root_kb "$root_kb" \
+        --argjson build_usage "$build_usage" --argjson build_kb "$build_kb" --arg build_path "$build_path" '
+        {requested_paths:[],roles:(["root","home","cargo_home","temp","build_root"] | map(
+            . as $role | ($role == "build_root") as $build |
+            (if $role == "root" then "/" elif $build then $build_path else "/fixture/" + $role end) as $path |
+            {role:$role,path:$path,probe_path:$path,filesystem_id:(if $build then "20" else "10" end),
+             capacity_group:(if $build then "filesystem:20" else "filesystem:10" end),
+             usage_percent:(if $build then $build_usage else $root_usage end),
+             available_bytes:((if $build then $build_kb else $root_kb end)*1024),
+             total_bytes:4398046511104}))}'
+}
+
 test_local_disk_space() {
     ((TESTS_RUN+=1))
 
@@ -359,23 +375,15 @@ test_disk_space_forces_kilobytes_with_512_byte_default() {
     ((TESTS_RUN+=1))
 
     local result
-    result=$(
-        (
-            _hh_exec_on_host() {
-                if [[ "$4" == *"df -Pk /"* ]]; then
-                    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-                    printf '/dev/test 8388608 4194304 2097152 50%% /\n'
-                else
-                    printf 'Filesystem 512-blocks Used Available Capacity Mounted on\n'
-                    printf '/dev/test 16777216 8388608 4194304 50%% /\n'
-                fi
-            }
-            _hh_check_disk_space "testlocal" "local" ""
-        )
-    )
+    # Only the explicit split route still uses df. Its fixture rejects commands
+    # without -k, and also supplies the now-required complete writable inventory.
+    result=$(_test_unix_split_disk "50 2097152" "50 67108864")
 
-    if echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2' &>/dev/null; then
-        pass "Disk space forces 1K blocks under a 512-byte default"
+    if echo "$result" | jq -e '.admission == "unix-split-storage-v2" and
+        .root.usage_percent == 50 and .root.available_gb == 2 and
+        .root.available_bytes == 2147483648 and .root.admitted_as == "error" and
+        .status == "error" and (.roles|length) == 5' &>/dev/null; then
+        pass "Retained df probes force 1K blocks and preserve the absolute capacity refusal"
     else
         fail "Disk space should report 2 GiB from df -Pk output, got: $result"
     fi
@@ -406,8 +414,9 @@ test_windows_disk_probe_survives_bash_default_shell() {
         )
     ) || status=$?
 
-    if [[ $status -eq 0 ]] && echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2 and .status == "ok"' &>/dev/null; then
-        pass "Windows disk probe preserves PowerShell variables through Bash"
+    if [[ $status -eq 0 ]] && echo "$result" | jq -e '.usage_percent == 50 and .available_gb == 2 and
+        .available_bytes == 2147483648 and .min_free_bytes == 21474836480 and .status == "error"' &>/dev/null; then
+        pass "Windows disk probe preserves PowerShell variables and refuses capacity below its floor"
     else
         fail "Windows disk probe failed through Bash: status=$status result=$result"
     fi
@@ -420,18 +429,54 @@ test_disk_space_rejects_non_numeric_fields() {
     result=$(
         (
             _hh_exec_on_host() {
-                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-                printf '/dev/test 8388608 4194304 invalid 50%% /\n'
+                [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]] || return 91
+                _test_writable_inventory 50 67108864 50 67108864 |
+                    jq '.roles[0].available_bytes="invalid"'
             }
             _hh_check_disk_space "testlocal" "local" ""
         )
     ) || status=$?
 
-    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .available_gb == null' &>/dev/null; then
+    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .available_gb == null and
+        .error == "Invalid writable storage inventory or free-space policy"' &>/dev/null; then
         pass "Disk space rejects non-numeric fields"
     else
         fail "Disk space should reject non-numeric fields, got status=$status result=$result"
     fi
+}
+
+test_windows_disk_capacity_boundaries() {
+    # Controlled transport output exercises the real scalar admission path;
+    # this is not native PowerShell or Windows filesystem qualification.
+    local usage available expected result status
+    while read -r usage available expected; do
+        ((TESTS_RUN+=1))
+        status=0
+        result=$(
+            (
+                _hh_exec_on_host() {
+                    [[ "$4" == 'powershell -NoProfile -NonInteractive -EncodedCommand '* ]] || return 91
+                    printf '%s\r\n%s\r\n' "$usage" "$available"
+                }
+                _hh_check_disk_space "testwindows" "ssh" "example.invalid" "windows/amd64"
+            )
+        ) || status=$?
+        if [[ $status -eq 0 ]] && jq -e --arg expected "$expected" --argjson usage "$usage" --argjson kb "$available" '
+            .status == $expected and .usage_percent == $usage and
+            .available_bytes == ($kb*1024) and .min_free_bytes == 21474836480 and
+            (if $expected == "error" then .available_gb == 20 and
+                (.error|contains("20 GiB floor")) else .error == null end)
+        ' <<< "$result" >/dev/null; then
+            pass "Windows scalar capacity: $usage percent and $available KiB produces $expected"
+        else
+            fail "Windows scalar capacity: $usage percent and $available KiB: $result"
+        fi
+    done <<'CASES'
+96 187695104 warning
+100 20971520 warning
+90 20971520 ok
+96 20971519 error
+CASES
 }
 
 test_disk_space_rejects_numeric_output_from_failed_command() {
@@ -441,15 +486,16 @@ test_disk_space_rejects_numeric_output_from_failed_command() {
     result=$(
         (
             _hh_exec_on_host() {
-                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-                printf '/dev/test 4194304 2097152 1048576 50%% /\n'
+                [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]] || return 91
+                _test_writable_inventory 50 67108864 50 67108864
                 return 23
             }
             _hh_check_disk_space "testlocal" "local" ""
         )
     ) || status=$?
 
-    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and .error == "Failed to get disk info"' &>/dev/null; then
+    if [[ $status -ne 0 ]] && echo "$result" | jq -e '.status == "error" and
+        (.error|startswith("Required writable storage probe failed"))' &>/dev/null; then
         pass "Disk space preserves command failure despite numeric stdout"
     else
         fail "Disk space should fail when command returns nonzero, got status=$status result=$result"
@@ -760,10 +806,10 @@ test_disk_threshold_values() {
     ((TESTS_RUN+=1))
 
     # Verify thresholds are set
-    if [[ $_HH_DISK_WARN_THRESHOLD -eq 90 ]] && [[ $_HH_DISK_ERROR_THRESHOLD -eq 95 ]]; then
+    if [[ $_HH_DISK_WARN_THRESHOLD -eq 90 ]] && [[ $_HH_DISK_MIN_FREE_BYTES -eq 21474836480 ]]; then
         pass "Disk thresholds have expected defaults"
     else
-        fail "Disk thresholds: warn=$_HH_DISK_WARN_THRESHOLD error=$_HH_DISK_ERROR_THRESHOLD"
+        fail "Disk thresholds: warn=$_HH_DISK_WARN_THRESHOLD min_free_bytes=$_HH_DISK_MIN_FREE_BYTES"
     fi
 }
 
@@ -1407,18 +1453,33 @@ EOF
     fi
 }
 
-# $1 root df line fields "usage avail_kb", $2 build df "usage avail_kb" or "FAIL"
+# Root/build df observations plus the required v2 complete-role observation.
+# $1 root "usage avail_kb", $2 build "usage avail_kb" or "FAIL", $3 probe mode.
 _test_unix_split_disk() {
-    local root="$1" build="$2" fixture="$TEMP_DIR/unix-storage-admission.yaml"
+    local root="$1" build="$2" probe_mode="${3:-valid}" fixture="$TEMP_DIR/unix-storage-admission.yaml"
     printf 'hosts:\n  splithost:\n    platform: linux/amd64\n    connection: local\n    build_root: /data\n    unix_storage:\n      root_min_free_bytes: 21474836480\n' > "$fixture"
     (
         export DSR_HOSTS_FILE="$fixture"
         _hh_exec_on_host() {
             local fields
-            if [[ "$4" == *"df -Pk '/data'"* ]]; then
+            if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+                [[ "$4" == *"python3 -I - '/data'"* ]] || return 91
+                local inventory
+                inventory=$(_test_writable_inventory "${root%% *}" "${root#* }" \
+                    "${build%% *}" "${build#* }" /data) || return 92
+                case "$probe_mode" in
+                    valid) printf '%s\n' "$inventory" ;;
+                    low_temp) jq '.roles |= map(if .role == "temp" then
+                        . + {available_bytes:1073741824,usage_percent:99,
+                             filesystem_id:"30",capacity_group:"filesystem:30"} else . end)' <<< "$inventory" ;;
+                    incomplete) jq '.roles |= map(select(.role != "temp"))' <<< "$inventory" ;;
+                    *) return 93 ;;
+                esac
+                return $?
+            elif [[ "$4" == "LC_ALL=C df -Pk '/data'" ]]; then
                 [[ "$build" == FAIL ]] && return 7
                 fields="$build"
-            elif [[ "$4" == *"df -Pk /"* ]]; then
+            elif [[ "$4" == "LC_ALL=C df -Pk /" ]]; then
                 fields="$root"
             else
                 return 9
@@ -1435,9 +1496,11 @@ test_unix_split_storage_admission() {
     # trj on 2026-10-13: / 97% with ~33 GiB free, /data 69%.
     ((TESTS_RUN+=1))
     result=$(_test_unix_split_disk "97 34664140" "69 1700000000")
-    if jq -e '.status == "warning" and .admission == "unix-split-storage-v1" and
-              .root.status == "error" and .root.admitted_as == "warning" and
-              .build_root.status == "ok" and .build_root.path == "/data" and .usage_percent == 97' <<< "$result" >/dev/null; then
+    if jq -e '.status == "warning" and .admission == "unix-split-storage-v2" and
+              .root.status == "warning" and .root.admitted_as == "warning" and
+              .build_root.status == "ok" and .build_root.path == "/data" and .usage_percent == 97 and
+              (.roles|length) == 5 and (.capacity_groups|length) == 2 and
+              all(.roles[]; if .role == "build_root" then .status == "ok" else .status == "warning" end)' <<< "$result" >/dev/null; then
         pass "Full root above its free floor is admitted as a warning beside a healthy build root"
     else
         fail "Split admission (root over floor) got: $result"
@@ -1468,6 +1531,37 @@ test_unix_split_storage_admission() {
     fi
 
     ((TESTS_RUN+=1))
+    result=$(_test_unix_split_disk "96 187695104" "96 187695104")
+    if jq -e '.status == "warning" and .root.admitted_as == "warning" and
+              .build_root.status == "warning" and (.roles|length) == 5 and
+              all(.roles[]; .status == "warning" and .available_bytes == 192199786496)' <<< "$result" >/dev/null; then
+        pass "Large split volumes at 96 percent preserve all roles and admit their sufficient byte capacity"
+    else
+        fail "Split admission (large spacious volumes) got: $result"
+    fi
+
+    ((TESTS_RUN+=1))
+    result=$(_test_unix_split_disk "96 187695104" "96 187695104" low_temp)
+    if jq -e '.status == "error" and .root.admitted_as == "warning" and
+              .build_root.status == "warning" and
+              [.roles[]|select(.status == "error")|.role] == ["temp"] and
+              (.error|contains("temp /fixture/temp"))' <<< "$result" >/dev/null; then
+        pass "Spacious split root and build storage cannot hide a separate exhausted temp role"
+    else
+        fail "Split admission (independent low temp) got: $result"
+    fi
+
+    ((TESTS_RUN+=1))
+    status=0
+    result=$(_test_unix_split_disk "96 187695104" "96 187695104" incomplete) || status=$?
+    if [[ $status -ne 0 ]] && jq -e '.admission == "unix-split-storage-v2" and .status == "error" and
+              .error == "Required complete writable-storage inspection failed"' <<< "$result" >/dev/null; then
+        pass "Split admission refuses an incomplete role inventory despite two spacious df observations"
+    else
+        fail "Split admission (incomplete roles) status=$status got: $result"
+    fi
+
+    ((TESTS_RUN+=1))
     status=0
     result=$(_test_unix_split_disk "50 400000000" FAIL) || status=$?
     if [[ $status -ne 0 ]] && jq -e '.status == "error" and (.error | test("build root /data"))' <<< "$result" >/dev/null; then
@@ -1494,19 +1588,26 @@ test_unix_split_storage_admission() {
 
 test_unix_split_storage_human_report() {
     local warn_result err_result output
-    warn_result='{"hostname":"trj","platform":"linux/amd64","status":"warning","healthy":true,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"warning","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":97,"available_gb":33.02,"status":"error","admitted_as":"warning","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":70,"available_gb":1494.49,"status":"ok"}},"toolchains":{},"docker":{},"clock_drift":{}}}'
-    err_result='{"hostname":"trj","platform":"linux/amd64","status":"error","healthy":false,"checks":{"connectivity":{"reachable":true},"disk_space":{"path":"/","usage_percent":50,"available_gb":400,"status":"error","admission":"unix-split-storage-v1","root":{"path":"/","usage_percent":50,"available_gb":400,"status":"ok","admitted_as":"ok","min_free_bytes":21474836480},"build_root":{"path":"/data/dsr-build-root","usage_percent":96,"available_gb":3.1,"status":"error"}},"toolchains":{}}}'
+    warn_result=$(jq -nc --argjson disk "$(_test_unix_split_disk "97 34664140" "69 1700000000")" '
+        {hostname:"trj",platform:"linux/amd64",status:"warning",healthy:true,
+         checks:{connectivity:{reachable:true},disk_space:$disk,toolchains:{},docker:{},clock_drift:{}}}')
+    err_result=$(jq -nc --argjson disk "$(_test_unix_split_disk "50 400000000" "96 1000000")" '
+        {hostname:"trj",platform:"linux/amd64",status:"error",healthy:false,
+         checks:{connectivity:{reachable:true},disk_space:$disk,toolchains:{},docker:{},clock_drift:{}}}')
     ((TESTS_RUN+=1))
     output=$(_hh_print_result "trj" "$warn_result" 2>&1)
-    if [[ "$output" == *"root / 97% used, 33.02 GB free: warning (above its 20 GiB free floor)"* &&
-          "$output" == *"build root /data/dsr-build-root 70% used"*": ok"* && "$output" != *"Disk usage >"* ]]; then
-        pass "Split-storage warning report names each volume and the floor"
+    if [[ "$output" == *"initial root / 97% used,"*"GiB free: warning"* &&
+          "$output" == *"initial build root /data 69% used"*": ok"* &&
+          "$output" == *"cargo_home /fixture/cargo_home 97% used"* &&
+          "$output" == *"temp /fixture/temp 97% used"* && "$output" != *"Disk usage >"* ]]; then
+        pass "Current split-storage warning report names both initial volumes and every writable role"
     else
         fail "Split-storage warning report: $output"
     fi
     ((TESTS_RUN+=1))
     output=$(_hh_print_result "trj" "$err_result" 2>&1)
-    if [[ "$output" == *"build root /data/dsr-build-root 96% used, 3.1 GB free: error"* && "$output" != *"Disk usage >"* ]]; then
+    if [[ "$output" == *"initial build root /data 96% used"*"GiB free: error"* &&
+          "$output" == *"20 GiB required"* && "$output" != *"Disk usage >"* ]]; then
         pass "Split-storage error report names the full build root, not the healthy root"
     else
         fail "Split-storage error report: $output"
@@ -1554,6 +1655,7 @@ test_disk_space_forces_kilobytes_with_512_byte_default
 test_disk_space_rejects_non_numeric_fields
 test_disk_space_rejects_numeric_output_from_failed_command
 test_windows_disk_probe_survives_bash_default_shell
+test_windows_disk_capacity_boundaries
 test_windows_storage_optional_config
 test_powershell_program_failure
 test_windows_split_storage_admission

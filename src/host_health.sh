@@ -317,8 +317,7 @@ _HH_CACHE_TTL=300  # 5 minutes
 
 # Thresholds
 _HH_DISK_WARN_THRESHOLD=90   # Warn if disk usage > 90%
-_HH_DISK_ERROR_THRESHOLD=95  # Error if disk usage > 95%
-_HH_DISK_MIN_FREE_BYTES=21474836480  # 20 GiB, independently of usage percent
+_HH_DISK_MIN_FREE_BYTES=21474836480  # Refuse below 20 GiB; percentage alone only warns
 _HH_CLOCK_DRIFT_WARN=30      # Warn if clock drift > 30 seconds
 _HH_SSH_TIMEOUT=10           # SSH connect timeout (seconds)
 _HH_CMD_TIMEOUT=30           # Command execution timeout (seconds)
@@ -406,13 +405,12 @@ _hh_admission_fingerprint() {
     contract=$(jq -ncS --argjson host "$host_config" \
         --argjson requested_paths "$requested_paths" \
         --arg disk_warn "$_HH_DISK_WARN_THRESHOLD" \
-        --arg disk_error "$_HH_DISK_ERROR_THRESHOLD" \
         --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v7",host:$host,writable_paths:$requested_paths,policy:{
-            disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
+        '{schema:"dsr-host-admission-v8",host:$host,writable_paths:$requested_paths,policy:{
+            disk_warn:$disk_warn,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
     if command -v sha256sum >/dev/null 2>&1; then
@@ -619,17 +617,18 @@ _hh_windows_storage_command() {
 # integers or be interpreted as shell arithmetic expressions.
 _hh_disk_status() {
     local usage="${1:-}" available_kb="${2:-}" minimum_bytes="${3:-}"
+    local warning="${_HH_DISK_WARN_THRESHOLD:-}"
     [[ "$usage" =~ ^[0-9]{1,3}$ && "$available_kb" =~ ^[0-9]{1,13}$ &&
-       "$minimum_bytes" =~ ^[0-9]{1,16}$ ]] || return 4
+       "$minimum_bytes" =~ ^[0-9]{1,16}$ && "$warning" =~ ^[0-9]{1,3}$ ]] || return 4
     usage=$((10#$usage))
     available_kb=$((10#$available_kb))
     minimum_bytes=$((10#$minimum_bytes))
+    warning=$((10#$warning))
     [[ $usage -le 100 && $available_kb -le 8796093022207 &&
-       $minimum_bytes -gt 0 && $minimum_bytes -le 9007199254740991 ]] || return 4
-    if (( available_kb < (minimum_bytes + 1023) / 1024 ||
-          usage > _HH_DISK_ERROR_THRESHOLD )); then
+       $minimum_bytes -gt 0 && $minimum_bytes -le 9007199254740991 && $warning -le 100 ]] || return 4
+    if (( available_kb < (minimum_bytes + 1023) / 1024 )); then
         printf 'error\n'
-    elif (( usage > _HH_DISK_WARN_THRESHOLD )); then
+    elif (( usage > warning )); then
         printf 'warning\n'
     else
         printf 'ok\n'
@@ -908,9 +907,12 @@ _hh_writable_storage_verdict() {
     requested_paths=$(_hh_writable_paths_json "${2-[]}") || return 4
     jq -ces --argjson split "$split_storage" --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
             --argjson requested "$requested_paths" \
-            --argjson warning "$_HH_DISK_WARN_THRESHOLD" --argjson critical "$_HH_DISK_ERROR_THRESHOLD" '
+            --argjson warning "$_HH_DISK_WARN_THRESHOLD" '
         def whole: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
         def path: type == "string" and startswith("/") and (test("[\\x00-\\x1f\\x7f]")|not);
+        def pressure($floor):
+            if .available_bytes < $floor then "error"
+            elif .usage_percent > $warning then "warning" else "ok" end;
         def apfs:
             (.container_id|type == "string" and test("^disk[0-9]+$")) and
             (.container_uuid|type == "string" and test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")) and
@@ -919,8 +921,7 @@ _hh_writable_storage_verdict() {
             .total_bytes > 0 and .available_bytes <= .total_bytes and
             (.used_bytes|whole) and (.quota_bytes|whole) and (.reserve_bytes|whole);
         if length != 1 or ($minimum|whole|not) or $minimum == 0 or
-           ($warning|whole|not) or ($critical|whole|not) or
-           $warning > $critical or $critical > 100
+           ($warning|whole|not) or $warning > 100
         then error("invalid probe/policy") else .[0] end |
         if (.roles|type != "array") or
            ((.roles|map(select(.requested != true)|.role)|sort) != ["build_root","cargo_home","home","root","temp"] and
@@ -961,13 +962,10 @@ _hh_writable_storage_verdict() {
             (if $root_policy then $split.root_min_free_bytes else $minimum end) as $floor |
             . + {min_free_bytes:$floor,
             available_gb:((.available_bytes/1073741824*100|floor)/100),
-            status:(if .available_bytes < $floor or .usage_percent > $critical then "error"
-                    elif .usage_percent > $warning then "warning" else "ok" end)} |
+            status:pressure($floor)} |
             if $split == null then . else
-                . + {pressure_status:.status,
-                     capacity_policy:(if $root_policy then "split-root" else "build-default" end)} |
-                if $root_policy and .status == "error" and .available_bytes >= $floor
-                then .status = "warning" else . end
+                . + {pressure_status:pressure($minimum),
+                     capacity_policy:(if $root_policy then "split-root" else "build-default" end)}
             end) |
         .roles as $roles | ($roles|map(select(.role == "root" and .requested != true))[0]) as $root |
         {path:$root.path,usage_percent:$root.usage_percent,available_bytes:$root.available_bytes,
@@ -1051,7 +1049,7 @@ _hh_check_disk_space() {
         # -Command before PowerShell sees it. Encode the script so either
         # shell passes the exact program through, including the drive filter.
         local disk_probe
-        if disk_probe=$(printf '%s' '$ErrorActionPreference="Stop"; $d=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='"'"'C:'"'"'"; [math]::Round(100-($d.FreeSpace/$d.Size*100)); [math]::Round($d.FreeSpace/1KB)' \
+        if disk_probe=$(printf '%s' '$ErrorActionPreference="Stop"; $d=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='"'"'C:'"'"'"; [math]::Round(100-($d.FreeSpace/$d.Size*100)); [math]::Floor($d.FreeSpace/1KB)' \
             | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n'); then
             df_output=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" \
                 "powershell -NoProfile -NonInteractive -EncodedCommand $disk_probe") || df_status=$?
@@ -1096,19 +1094,22 @@ _hh_check_disk_space() {
     # Use awk for division (more portable than bc which may not be installed)
     available_gb=$(awk -v kb="$available_kb" 'BEGIN {printf "%.2f", kb / 1048576}')
 
-    if [[ $usage_percent -gt $_HH_DISK_ERROR_THRESHOLD ]]; then
-        status="error"
-    elif [[ $usage_percent -gt $_HH_DISK_WARN_THRESHOLD ]]; then
-        status="warning"
-    else
-        status="ok"
-    fi
+    status=$(_hh_disk_status "$usage_percent" "$available_kb" "$_HH_DISK_MIN_FREE_BYTES") || {
+        echo '{"path":"/","usage_percent":null,"available_gb":null,"status":"error","error":"Invalid disk metrics or free-space floor"}'
+        return 1
+    }
 
     if [[ "$platform" != windows/* ]]; then
         _hh_unix_split_storage_admission "$hostname" "$connection" "$ssh_host" "$unix_storage" \
             "$usage_percent" "$available_kb" "$status" "$requested_paths"
     else
-        echo "{\"path\": \"/\", \"usage_percent\": $usage_percent, \"available_gb\": $available_gb, \"status\": \"$status\"}"
+        jq -nc --argjson usage "$usage_percent" --argjson available_kb "$available_kb" \
+            --argjson available_gb "$available_gb" --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
+            --arg status "$status" '
+            {path:"/",usage_percent:$usage,available_bytes:($available_kb*1024),
+             available_gb:$available_gb,min_free_bytes:$minimum,status:$status} |
+            if .status == "error" then . + {error:("Available disk space is below the required " +
+                ($minimum/1073741824|tostring) + " GiB floor")} else . end'
     fi
 }
 
@@ -1120,7 +1121,7 @@ _hh_split_storage_lines() {
             "initial root \(.root.path) \(.root.usage_percent)% used, \(.root.available_gb) GiB free: \(.root.admitted_as)",
             "initial build root \(.build_root.path) \(.build_root.usage_percent)% used, \(.build_root.available_gb) GiB free: \(.build_root.status)",
             (.roles[] | "\(.role) \(.path) \(.usage_percent)% used, \(.available_gb) GiB free: \(.status)" +
-                (if .pressure_status != .status then " (split-root free-space allowance)" else "" end)),
+                (if .pressure_status != .status then " (split-root capacity policy)" else "" end)),
             (if .probe_error != null then "writable storage: \(.probe_error)" else empty end)
         elif .admission == "unix-writable-roles-v1" or .admission == "unix-writable-roles-v2" then
             .roles[] | "\(.role) \(.path) \(.usage_percent)% used, \(.available_gb) GiB free: \(.status)"
@@ -1135,11 +1136,9 @@ _hh_split_storage_lines() {
         <<< "$1" 2>/dev/null || true
 }
 
-# Unix split storage (#38): the build root requires both the usual
-# percentages and the default absolute floor. Root requires its configured
-# absolute floor regardless of percentage. It keeps its own verdict, except that above
-# the error percentage it is admitted as a warning while its free space meets
-# the contract's floor. Root pressure is reported, never hidden.
+# Unix split storage (#38): the build root requires the default absolute floor.
+# Root requires its configured floor. Percentages remain visible as warnings;
+# neither path can borrow capacity from another filesystem.
 _hh_unix_split_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" storage="$4"
     local root_usage="$5" root_available_kb="$6" root_status="$7"
@@ -1195,9 +1194,6 @@ _hh_unix_split_storage_admission() {
         return 1
     }
     min_free_bytes=$((10#$min_free_bytes))
-    if [[ "$root_admitted" == "error" ]] && (( 10#$root_available_kb * 1024 >= min_free_bytes )); then
-        root_admitted="warning"
-    fi
 
     local overall="ok"
     if [[ "$root_admitted" == "error" || "$build_status" == "error" ]]; then
@@ -1691,7 +1687,7 @@ _hh_print_result() {
                     disk_error=$(echo "$result" | jq -r '.checks.disk_space.error // "Disk check failed"')
                     _hh_log_error "  - $disk_error"
                 else
-                    _hh_log_error "  - Disk usage > ${_HH_DISK_ERROR_THRESHOLD}%"
+                    _hh_log_error "  - Disk capacity admission failed"
                 fi
             fi
             ;;

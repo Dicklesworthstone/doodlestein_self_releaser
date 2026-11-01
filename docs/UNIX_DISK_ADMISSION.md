@@ -1,10 +1,11 @@
 # Unix disk free-space admission
 
-Unix host health now requires **20 GiB (21,474,836,480 bytes) available** in
-addition to the existing usage thresholds. The comparison uses the raw available
-capacity returned by the filesystem, not the rounded `available_gb` display.
-Exactly 20 GiB passes the byte floor; percentages still warn above 90% and fail
-above 95%. The explicit split contract retains its `df -Pk` probes.
+Host health requires **20 GiB (21,474,836,480 bytes) available** for each default
+writable role. The comparison uses the raw available capacity returned by the
+filesystem, not the rounded `available_gb` display. Exactly 20 GiB passes the
+byte floor. Usage above 90% remains a visible warning, including values above
+95%; a percentage alone does not refuse a host that meets its byte floor.
+The explicit Unix split contract retains its `df -Pk` probes.
 
 This closes the immediate false-green case in issue #46: an APFS System-volume
 report of 84% used with 2,427,860 KiB available must not be `ok`. A percentage can
@@ -12,19 +13,28 @@ look acceptable while the shared APFS container has almost no writable capacity.
 The JSON includes `available_bytes` and `min_free_bytes`; the human error names
 the capacity floor instead of incorrectly claiming usage exceeds 95%.
 
+This also fixes issue #51's opposite failure: 179 GiB free at 96% usage on a
+large volume produces a warning and can pass readiness. Every required role
+must still meet its own floor; 2.32 GiB remains an error at any usage percentage.
+
 The opt-in `unix_storage` split-volume contract retains its explicitly configured
-`root_min_free_bytes` and its existing high-percentage warning exception. Its
-root floor is now enforced even when the root's reported percentage is low.
-The separately probed build root must satisfy both the standard percentage
-thresholds and the 20 GiB floor. A healthy external build root cannot compensate
+`root_min_free_bytes`. Its root floor is enforced even when the root's reported
+percentage is low. The separately probed build root must satisfy the 20 GiB
+floor. A healthy external build root cannot compensate
 for an internal root below the contract floor, or vice versa. Both role verdicts
 remain visible in the report.
 
 Malformed, excessive, or non-decimal counts fail before shell arithmetic. An
 empty, invalid, or unsuccessful disk-probe result cannot produce a healthy public
 host verdict. The admission fingerprint changed, so cached results created by
-the old percentage-only policy cannot authorize a build under the new policy.
-Windows storage policy is unchanged.
+an older policy cannot authorize a build under the new policy.
+
+The unconfigured Windows system-drive probe uses the same 20 GiB floor and
+percentage-warning policy. It rounds free bytes down to KiB before transport,
+so a value just below the floor cannot round up into admission. Its JSON now
+retains `available_bytes` and `min_free_bytes` alongside the display value.
+Configured Windows split-storage source/target budgets, mapping identity and
+locking requirements remain unchanged.
 
 Both native source staging and native compilation require host-health admission,
 including ordinary builds, explicit repository host pins, and static mapping
@@ -242,12 +252,12 @@ The plist container/volume vocabulary is also used by the
 
 Configuring `unix_storage` no longer bypasses the Cargo-home, temporary-directory,
 home, Cargo-target or APFS-container/volume-quota checks. The split path retains
-its original root and build-root `df` decisions, then requires the same complete
+its root and build-root `df` observations, then requires the same complete
 receiving-host inspection used by default admission. The overall status is the
 most restrictive of the original decisions and the complete role verdict.
 Failure of the additional probe refuses admission, not a fallback to two paths.
 
-The contract's `root_min_free_bytes` and high-percentage warning allowance apply
+The contract's `root_min_free_bytes` applies
 to root and ambient roles sharing its observed capacity group. This means the
 same filesystem on ordinary Unix storage, or the same independently identified
 APFS container on macOS. Every such role must still satisfy the configured byte
@@ -255,7 +265,7 @@ floor using its own effective availability, including its volume quota. A root
 allowance never rescues an exhausted quota or applies to another capacity pool.
 
 **Build-root and explicit Cargo-target roles always require the normal 20 GiB
-floor and 90/95-percent policy**, even if they share root's storage. Ambient roles
+floor**, even if they share root's storage. Ambient roles
 on another pool use that normal policy too. This preserves usable split layouts
 with a spacious external build drive and an explicitly admitted internal root,
 without letting an unrelated tight temporary or Cargo filesystem disappear.
@@ -264,15 +274,18 @@ The `unix-split-storage-v2` result retains the original `df` observations under
 `root` and `build_root`; `roles` contains the subsequent complete observations
 and APFS-effective metrics. `filesystems` and `capacity_groups` retain their
 individual identities. `unix_storage_contract` records the selected contract.
-Each role records `capacity_policy`, `min_free_bytes`, `pressure_status` before
-the explicit percentage allowance, and final `status`. Human diagnostics show
+Each role records `capacity_policy`, `min_free_bytes`, `pressure_status` under
+the default 20 GiB policy, and final `status` under its applicable floor. A
+configured root floor can be lower or higher than the default; both verdicts
+remain visible. All roles retain percentage warnings above 90%. Human diagnostics show
 both original observations and every role, including probe-failure reasons.
 The new host-admission fingerprint invalidates earlier two-path cached verdicts.
 
 Explicit split probing now needs Python 3 and the same native macOS metadata
 tools as the default path. All probes remain read-only, with the existing helper
 deadlines. They are sequential observations, not an atomic capacity reservation.
-No directory is created, storage cleaned, gate disabled or limit reduced.
+No directory is created or storage cleaned. The default byte floor and the
+configured role budgets are unchanged.
 
 The existing test script includes actual low-capacity `/dev/shm` observations
 for split temp/Cargo/target roles and production policy tests with explicit APFS
@@ -282,3 +295,11 @@ low-capacity ambient role while the candidate refuses it. Healthy split controls
 same-pool allowances, independent build limits and per-volume quotas remain
 covered. Sourceable helper testing does not by itself qualify the complete
 configuration/yq, monolithic CLI, live SSH or native macOS paths.
+
+For the percentage correction, set `DSR_TEST_CAPACITY_BASELINE` to the unchanged
+`host_health.sh` from before the fix when running `test_disk_free_floor.sh`.
+The same invocation compares both actual classifiers: spacious high-usage
+volumes change from refusal to warning; low-space cases retain their refusals,
+and unchanged boundary cases retain their original verdicts. APFS fixtures also
+verify that effective container usage stays visible, quotas and individual role
+floors still refuse, and split contracts cannot relax unrelated write locations.

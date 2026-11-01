@@ -23,6 +23,7 @@ import unittest
 ROOT = Path(sys.argv.pop(1))
 MODULE = Path(os.environ.get('DSR_TEST_HOST_HEALTH', ROOT / 'src/host_health.sh'))
 BASELINE = os.environ.get('DSR_TEST_DISK_BASELINE')
+CAPACITY_BASELINE = os.environ.get('DSR_TEST_CAPACITY_BASELINE')
 BASH = os.environ['DSR_TEST_DISK_BASH']
 WORK = Path(tempfile.mkdtemp(prefix='dsr-disk-floor-'))
 print('Retained evidence:', WORK, flush=True)
@@ -93,8 +94,10 @@ class DiskFloor(unittest.TestCase):
     def test_percentage_warning_still_applies(self):
         self.verdict(91, FLOOR_KB * 2, 'warning')
 
-    def test_percentage_error_still_applies(self):
-        self.verdict(96, FLOOR_KB * 2, 'error')
+    def test_large_spacious_volume_warns_instead_of_refusing(self):
+        self.verdict(96, 179 * GIB // 1024, 'warning')
+        self.verdict(97, 30 * GIB // 1024, 'warning')
+        self.verdict(100, FLOOR_KB, 'warning')
 
     def test_percentage_boundaries_unchanged(self):
         self.verdict(90, FLOOR_KB, 'ok')
@@ -102,6 +105,41 @@ class DiskFloor(unittest.TestCase):
 
     def test_byte_floor_overrides_percentage_warning(self):
         self.verdict(91, FLOOR_KB - 1, 'error')
+        self.verdict(96, FLOOR_KB - 1, 'error')
+        self.verdict(100, FLOOR_KB - 1, 'error')
+
+    def test_malformed_warning_policy_never_reaches_arithmetic(self):
+        for warning in ('', '-1', '101', '1.5', '1+2', '9007199254740992'):
+            with self.subTest(warning=warning):
+                self.env['DSR_TEST_WARNING_POLICY'] = warning
+                result = self.call('_hh_disk_status', 96, 179 * GIB // 1024, MINIMUM,
+                                   setup='_HH_DISK_WARN_THRESHOLD="$DSR_TEST_WARNING_POLICY"')
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertEqual(result.stdout, '')
+
+    @unittest.skipUnless(CAPACITY_BASELINE, 'set DSR_TEST_CAPACITY_BASELINE for same-input policy comparison')
+    def test_capacity_policy_retains_floor_refusals_and_fixes_percentage_false_refusals(self):
+        for usage, kb, old_status, current_status in (
+            (96, 179 * GIB // 1024, 'error', 'warning'),
+            (97, 30 * GIB // 1024, 'error', 'warning'),
+            (100, FLOOR_KB, 'error', 'warning'),
+            (90, FLOOR_KB, 'ok', 'ok'),
+            (95, FLOOR_KB, 'warning', 'warning'),
+            (84, 2427860, 'error', 'error'),
+            (0, FLOOR_KB - 1, 'error', 'error'),
+            (100, FLOOR_KB - 1, 'error', 'error'),
+        ):
+            with self.subTest(usage=usage, kb=kb):
+                before = self.call('_hh_disk_status', usage, kb, MINIMUM,
+                                   module=CAPACITY_BASELINE, setup=':')
+                after = self.call('_hh_disk_status', usage, kb, MINIMUM, setup=':')
+                self.assertEqual((before.returncode, before.stdout), (0, old_status + '\n'))
+                self.assertEqual((after.returncode, after.stdout), (0, current_status + '\n'))
+        config = '{"platform":"darwin/arm64","connection":"ssh","ssh_host":"fixture"}'
+        before = self.call('_hh_admission_fingerprint', config, module=CAPACITY_BASELINE, setup=':')
+        after = self.call('_hh_admission_fingerprint', config, setup=':')
+        self.assertEqual((before.returncode, after.returncode), (0, 0))
+        self.assertNotEqual(before.stdout, after.stdout)
 
     def test_decimal_leading_zeroes(self):
         self.verdict('084', '0000002427860', 'error')
@@ -830,8 +868,34 @@ class ApfsCapacity(unittest.TestCase):
     def test_container_percentage_cannot_be_hidden_by_volume_percentage(self):
         self.document['Containers'][0].update(CapacityCeiling=1000 * GIB, CapacityFree=30 * GIB)
         value = self.accepted(self.bind())
-        self.assertEqual(value['status'], 'error')
+        self.assertEqual(value['status'], 'warning')
+        self.assertTrue(all(r['status'] == 'warning' for r in value['roles']))
         self.assertTrue(all(r['usage_percent'] == 97 for r in value['roles']))
+
+    def test_reported_large_apfs_pool_keeps_all_roles_and_warns(self):
+        total = 36 * 1024 * GIB // 10
+        self.document['Containers'][0].update(CapacityCeiling=total, CapacityFree=179 * GIB)
+        for row in self.rows:
+            row.update(total_bytes=total, available_bytes=179 * GIB, usage_percent=84)
+        rows = self.bind()
+        for storage in (None, self.split_policy()):
+            with self.subTest(split=storage is not None):
+                value = self.accepted(rows, storage)
+                self.assertEqual(value['status'], 'warning')
+                self.assertEqual(len(value['capacity_groups']), 1)
+                self.assertEqual(len(value['roles']), 5)
+                self.assertTrue(all(r['status'] == 'warning' and r['usage_percent'] == 96 and
+                                    r['available_bytes'] == 179 * GIB for r in value['roles']))
+                self.assertTrue(all(r.get('pressure_status', 'warning') == 'warning' for r in value['roles']))
+
+    def test_spacious_pool_cannot_hide_one_byte_below_the_required_floor(self):
+        for selected in ('root', 'home', 'cargo_home', 'temp', 'build_root'):
+            with self.subTest(role=selected):
+                rows = self.bind()
+                next(r for r in rows if r['role'] == selected)['available_bytes'] = MINIMUM - 1
+                value = self.accepted(rows)
+                self.assertEqual(value['status'], 'error')
+                self.assertEqual([r['role'] for r in value['roles'] if r['status'] == 'error'], [selected])
 
     def test_reserve_is_evidence_not_additional_free_space(self):
         self.document['Containers'][0]['Volumes'][1]['CapacityReserve'] = 60 * GIB

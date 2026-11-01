@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Real parser/filesystem/probe regressions for GH #21. No fake yq or SSH.
+# GH #51 public-capacity cases control only the external probe response;
+# configuration, inventory validation, verdicts, caching and readiness are real.
 # DSR_TEST_REQUIRE_YQ=1 makes an unavailable YAML parser a failing prerequisite.
 set -uo pipefail
 
@@ -7,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 command -v jq >/dev/null 2>&1 || { echo 'SKIP: jq is required' >&2; exit 3; }
 TEST_ROOT=$(mktemp -d) || exit 1
-trap 'rm -rf -- "$TEST_ROOT"' EXIT
+trap 'if [[ "${DSR_TEST_KEEP_TEMP:-0}" == 1 ]]; then printf "Retained fixtures: %s\n" "$TEST_ROOT"; else rm -rf -- "$TEST_ROOT"; fi' EXIT
 export DSR_CONFIG_DIR="$TEST_ROOT/config"
 export DSR_CACHE_DIR="$TEST_ROOT/cache"
 export DSR_STATE_DIR="$TEST_ROOT/state"
@@ -139,9 +141,9 @@ live_local() {
 }
 
 live_disk_refusal() {
-    # Use the actual df result with a test-only threshold below any real usage.
+    # Use the actual capacity result with a valid floor above the fixture host.
     # This tests refusal, not a fabricated remote response or a filled disk.
-    _HH_DISK_ERROR_THRESHOLD=-1
+    _HH_DISK_MIN_FREE_BYTES=9007199254740991
     local result status=0
     result=$(host_health_check local --no-cache --json) || status=$?
     [[ $status -eq 1 ]] || return 1
@@ -252,7 +254,7 @@ cache_fingerprint() {
         fingerprint=$(_hh_admission_fingerprint "$changed") || return 1
         [[ "$baseline" != "$fingerprint" ]] || return 1
     done
-    _HH_DISK_ERROR_THRESHOLD=80
+    _HH_DISK_MIN_FREE_BYTES=21474836481
     fingerprint=$(_hh_admission_fingerprint "$config") || return 1
     [[ "$baseline" != "$fingerprint" ]]
 }
@@ -270,7 +272,7 @@ cache_reuse() {
 
 cache_policy_refusal() {
     host_health_check local --json >/dev/null || return 1
-    _HH_DISK_ERROR_THRESHOLD=-1
+    _HH_DISK_MIN_FREE_BYTES=9007199254740991
     local result status=0
     result=$(host_health_check local --json) || status=$?
     [[ $status -eq 1 ]] || return 1
@@ -346,6 +348,117 @@ selection_error() {
     reject 4 host_health_get_healthy_hosts --json
 }
 
+capacity_fixture() {
+    local usage="$1" available="$2"
+    cat > "$DSR_HOSTS_FILE" <<'YAML'
+hosts:
+  capacity:
+    platform: linux/amd64
+    connection: local
+    build_root: /fixture/build_root
+YAML
+    CAPACITY_TRACE="$TEST_ROOT/capacity-probes-$RUN"
+    CAPACITY_PROBE_EXIT=0
+    CAPACITY_DATA=$(jq -nc --argjson usage "$usage" --argjson available "$available" '
+        {requested_paths:[],roles:(["root","home","build_root","cargo_home","temp"] | map(
+            . as $role | (if $role == "root" then "/" else "/fixture/" + $role end) as $path |
+            {role:$role,path:$path,probe_path:$path,filesystem_id:"10",capacity_group:"filesystem:10",
+             available_bytes:$available,total_bytes:3958241859993,usage_percent:$usage}))}') || return 1
+    _hh_exec_on_host() {
+        [[ "$1" == capacity && "$2" == local &&
+           "$4" == *"python3 -I - '/fixture/build_root'"* &&
+           "$4" == *DSR_UNIX_WRITABLE_PY* ]] || return 91
+        printf 'writable-probe\n' >> "$CAPACITY_TRACE" || return 92
+        printf '%s\n' "$CAPACITY_DATA"
+        return "$CAPACITY_PROBE_EXIT"
+    }
+}
+
+capacity_outcome() {
+    local usage="$1" available="$2" expected="$3" result status=0 readiness=0 human
+    capacity_fixture "$usage" "$available" || return 1
+    result=$(host_health_check capacity --no-cache --json) || status=$?
+    jq -e --arg expected "$expected" --argjson usage "$usage" --argjson available "$available" '
+        .hostname == "capacity" and .status == $expected and
+        .healthy == ($expected != "error") and .errors == (if $expected == "error" then 1 else 0 end) and
+        .checks.connectivity.reachable == true and .checks.disk_space.admission == "unix-writable-roles-v2" and
+        (.checks.disk_space.capacity_groups|length) == 1 and (.checks.disk_space.roles|length) == 5 and
+        all(.checks.disk_space.roles[]; .status == $expected and .usage_percent == $usage and
+            .available_bytes == $available and .min_free_bytes == 21474836480)' <<< "$result" >/dev/null || return 1
+    # Native writable-path requests demand a new observation even when their
+    # current explicit list is empty. A cached healthy result cannot stand in.
+    host_health_is_ready capacity --writable-paths '[]' || readiness=$?
+    [[ $(wc -l < "$CAPACITY_TRACE") -eq 2 ]] || return 1
+    if [[ "$expected" == error ]]; then
+        [[ $status -eq 1 && $readiness -eq 1 ]] || return 1
+        jq -e '.warnings == 0 and (.checks.disk_space.error|contains("20 GiB required"))' <<< "$result" >/dev/null
+    else
+        [[ $status -eq 0 && $readiness -eq 0 ]] || return 1
+        jq -e '.warnings == 1' <<< "$result" >/dev/null || return 1
+        human=$(_hh_print_result capacity "$result" 2>&1)
+        [[ "$human" == *"root / $usage% used"* && "$human" == *"cargo_home /fixture/cargo_home"* &&
+           "$human" == *"temp /fixture/temp"* && "$human" == *"GiB free: warning"* ]]
+    fi
+}
+
+capacity_invalid_inventory() {
+    local mode="$1" result status=0 readiness=0
+    capacity_fixture 96 192199786496 || return 1
+    case "$mode" in
+        missing_role) CAPACITY_DATA=$(jq '.roles |= map(select(.role != "temp"))' <<< "$CAPACITY_DATA") || return 1 ;;
+        malformed_count) CAPACITY_DATA=$(jq '.roles[0].available_bytes="plenty"' <<< "$CAPACITY_DATA") || return 1 ;;
+        empty) CAPACITY_DATA='' ;;
+        failed_probe) CAPACITY_PROBE_EXIT=23 ;;
+        *) return 1 ;;
+    esac
+    result=$(host_health_check capacity --no-cache --json) || status=$?
+    [[ $status -eq 1 ]] || return 1
+    jq -e '.healthy == false and .status == "error" and .errors == 1 and
+        .checks.connectivity.reachable == true and .checks.disk_space.status == "error" and
+        (.checks.disk_space.error|type == "string" and length > 0)' <<< "$result" >/dev/null || return 1
+    host_health_is_ready capacity --writable-paths '[]' || readiness=$?
+    [[ $readiness -eq 1 && $(wc -l < "$CAPACITY_TRACE") -eq 2 ]]
+}
+
+capacity_cached_policy_change() {
+    local before after status=0
+    capacity_fixture 96 192199786496 || return 1
+    before=$(host_health_check capacity --json) || return 1
+    jq -e '.status == "warning" and .healthy == true' <<< "$before" >/dev/null || return 1
+    [[ $(wc -l < "$CAPACITY_TRACE") -eq 1 ]] || return 1
+    _HH_DISK_MIN_FREE_BYTES=214748364800
+    after=$(host_health_check capacity --json) || status=$?
+    [[ $status -eq 1 && $(wc -l < "$CAPACITY_TRACE") -eq 2 ]] || return 1
+    jq -e --arg old "$(jq -r '.admission_fingerprint' <<< "$before")" '
+        .healthy == false and .status == "error" and .admission_fingerprint != $old and
+        all(.checks.disk_space.roles[]; .status == "error" and .min_free_bytes == 214748364800)' <<< "$after" >/dev/null || return 1
+    ! host_health_is_ready capacity || return 1
+    [[ $(wc -l < "$CAPACITY_TRACE") -eq 2 ]]
+}
+
+run_capacity_tests() {
+    run_test 'public health and fresh readiness admit 96 percent usage with 179 GiB available as a warning' \
+        capacity_outcome 96 192199786496 warning
+    run_test 'public health and readiness keep exact-floor capacity at 100 percent usage as a warning' \
+        capacity_outcome 100 21474836480 warning
+    run_test 'public health and readiness refuse the reported 2.32 GiB low-space case' \
+        capacity_outcome 84 2486128640 error
+    run_test 'public health and readiness refuse one byte below the floor despite rounded 20 GiB display' \
+        capacity_outcome 96 21474836479 error
+    local mode
+    for mode in missing_role malformed_count empty failed_probe; do
+        run_test "public health and readiness refuse $mode capacity evidence" capacity_invalid_inventory "$mode"
+    done
+    run_test 'a tightened byte floor invalidates cached high-usage healthy admission before readiness' capacity_cached_policy_change
+}
+
+if [[ "${1:-}" == --capacity-only ]]; then
+    run_capacity_tests
+    printf '\nPublic capacity admission: %s passed, %s failed\n' "$PASSED" "$FAILED"
+    [[ $FAILED -eq 0 ]]
+    exit $?
+fi
+
 run_test 'normalization defaults apply only to missing fields' normal_defaults
 run_test 'typed capabilities, SSH route and explicit false survive normalization' normal_values
 for invalid in 'null' '[]' '{}' 'false' \
@@ -378,6 +491,7 @@ run_test 'cache writes replace atomically and never truncate a held prior receip
 run_test 'linked cache destinations are neither followed nor replaced' cache_symlink_refusal
 run_test 'cache paths reject traversal labels' reject 4 _hh_cache_file ../outside
 run_test 'host selection propagates configuration errors instead of returning an empty success' selection_error
+run_capacity_tests
 if command -v go >/dev/null 2>&1; then
     run_test 'real local toolchain is admitted and require-go succeeds' live_local
     run_test 'real disk probe still refuses insufficient headroom' live_disk_refusal
