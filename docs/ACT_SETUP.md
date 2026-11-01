@@ -401,6 +401,24 @@ artifact bytes, and selective resume. Native execution is a controlled subproces
 that deliberately reads stdin; the planner, scheduler, worker supervision and
 state/receipt validation are production code.
 
+Every native invocation also reserves a private log directory before remote
+preparation or compilation. Its `log_file` identifies that exact attempt,
+including failures and retries. Native singleton and variant builds collect
+each attempt into a fresh directory under the requested run and target; primary
+and companion basenames remain literal. Consumers must use the returned
+`artifact_paths`, `additional_artifacts` and `log_file` rather than deriving
+paths from a run ID. A retry or concurrent caller cannot replace the bytes
+referenced by an earlier result. Unavailable log storage stops execution before
+the compiler is invoked.
+
+Run `bash scripts/tests/test_act_runner_native.sh --attempt-isolation-only`
+for this boundary. The test executes the production native function,
+collection, resume checks and manifest admission with tiny inert executable
+fixtures and explicitly controlled remote admission, transport and Cargo cache
+responses. It checks sequential and concurrent calls, failed retries, retained
+prior receipts, strict/variant log ownership and allocation failures. It does
+not run a compiler or qualify a native Windows host.
+
 ### dsr build flow (Linux via act)
 
 ```
