@@ -126,7 +126,7 @@ source "$DSR_STDIN_PROJECT/src/logging.sh"
 source "$DSR_STDIN_PROJECT/src/config.sh"
 source "$DSR_STDIN_PROJECT/src/build_state.sh"
 source "$DSR_STDIN_MODULE"
-if [[ "$DSR_STDIN_MODE" == source-sync-recovery ]]; then
+if [[ "$DSR_STDIN_MODE" == source-sync-recovery || "$DSR_STDIN_MODE" == readiness-recovery ]]; then
     # Keep the real state updater. Pause its caller at two precise durable
     # boundaries so SIGKILL leaves an authentic coordinator-loss checkpoint.
     source <(declare -f build_state_update_target |
@@ -142,15 +142,17 @@ if [[ "$DSR_STDIN_MODE" == source-sync-recovery ]]; then
         done
     }
     build_state_update_target() {
-        local sync_failure=false
-        if [[ "$4" == failed ]] && jq -e '.result.stage == "source_sync"' <<< "$5" >/dev/null; then
-            sync_failure=true
+        local admission_failure=false refusal_stage=source_sync
+        [[ "$DSR_STDIN_MODE" != readiness-recovery ]] || refusal_stage=host_readiness
+        if [[ "$4" == failed ]] && jq -e --arg stage "$refusal_stage" \
+            '.result.stage == $stage' <<< "$5" >/dev/null; then
+            admission_failure=true
         fi
-        if $sync_failure && [[ "$DSR_STDIN_PHASE" == first ]]; then
+        if $admission_failure && [[ "$DSR_STDIN_PHASE" == first ]]; then
             _fixture_pause_state_update || return 1
         fi
         _fixture_build_state_update_target "$@" || return $?
-        if $sync_failure && [[ "$DSR_STDIN_PHASE" == resume-reconcile* ]] &&
+        if $admission_failure && [[ "$DSR_STDIN_PHASE" == resume-reconcile* ]] &&
            jq -e '.reconciled_from_sidecar == true' <<< "$5" >/dev/null; then
             _fixture_pause_state_update || return 1
         fi
@@ -184,6 +186,7 @@ selector_release_slot() {
 }
 act_run_native_build() {
     if [[ ( "$DSR_STDIN_MODE" == readiness && "$2" == darwin/* ) ||
+          ( "$DSR_STDIN_MODE" == readiness-recovery && "$2" == linux/amd64 ) ||
           "$DSR_STDIN_MODE" == cli-readiness ]]; then
         (
             # Re-enter the production native runner in this child only. Its
@@ -380,6 +383,7 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
             check(label + ': ' + target + ' retains the actual host-readiness refusal',
                   row['status'] == 'error' and row['method'] == 'native' and
                   row['stage'] == 'host_readiness' and
+                  saved['host_readiness_failures'] == expected and
                   row['host'] == 'host-' + target.replace('/', '-') and
                   row['error'] == 'Native build host is not ready' and
                   not row.get('resume_artifacts') and
@@ -424,6 +428,23 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-reco
                      for path in ((case / directory) if directory == 'output' else
                                   case / 'state/builds/stdinfixture/1.0.0' / identity / directory).rglob('*')
                      if path.is_file()}
+        if mode == 'readiness':
+            # The native gate refuses before any compiler starts. Repeated
+            # exact-run retries must preserve evidence and allow recovery
+            # even after more refusals than the compiler retry allowance.
+            for refused_attempt in (2, 3, 4):
+                refused, refused_state = invoke(case, identity, jobs, mode,
+                                                 'resume-unready-%d' % refused_attempt)
+                counts = {target: count + (1 if target in codes else 0)
+                          for target, count in counts.items()}
+                verify_attempts(case, refused, refused_state, counts, codes,
+                                case.name + '/unready-%d' % refused_attempt)
+                check(case.name + ': readiness retry %d retains prior immutable evidence' % refused_attempt,
+                      all(path.read_bytes() == contents for path, contents in immutable.items()))
+                immutable.update({path: path.read_bytes() for directory in ('output', 'logs', 'results')
+                                  for path in ((case / directory) if directory == 'output' else
+                                               case / 'state/builds/stdinfixture/1.0.0' / identity / directory).rglob('*')
+                                  if path.is_file()})
         resumed, resumed_state = invoke(case, identity, jobs, 'success', 'resume')
         resumed_counts = {target: counts.get(target, 0) + (0 if target in counts and target not in codes else 1)
                           for target in targets}
@@ -433,6 +454,13 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-reco
                   for row in resumed['targets']))
         check(case.name + ': retries preserve all earlier attempt evidence',
               all(path.read_bytes() == contents for path, contents in immutable.items()))
+        if mode == 'readiness':
+            check(case.name + ': repaired hosts compile once after four retained readiness refusals',
+                  all(resumed_state['target_statuses'][target]['attempts'] == 5 and
+                      resumed_state['target_statuses'][target]['host_readiness_failures'] == 4
+                      for target in codes) and
+                  Counter(event['target'] for event in events(case) if event['mode'] == 'success') ==
+                  Counter({target: 1 for target in targets}))
 
 for jobs in (() if sys.argv[3] in ('--sidecar-recovery-only', '--worker-completion-only',
                                   '--host-readiness-only', '--host-readiness-cli-only') else (1, 3)):
@@ -674,8 +702,13 @@ for jobs, crash_mode in sidecar_cases:
               len(list(workspace.glob('logs/*.log'))) == 6 and
               len(list(workspace.glob('results/*.json'))) == 6)
 
-if sidecar_cases:
-    case, identity = fixture(1, 'source-sync-recovery')
+for refusal_kind in (('source-sync', 'readiness') if sidecar_cases else ()):
+    recovery_mode = refusal_kind + '-recovery'
+    readiness = refusal_kind == 'readiness'
+    refusal_stage = 'host_readiness' if readiness else 'source_sync'
+    refusal_exit = 4 if readiness else 1
+    counter_key = 'host_readiness_failures' if readiness else 'source_sync_failures'
+    case, identity = fixture(1, recovery_mode)
     workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
     host_map = {target: 'host-' + target.replace('/', '-') for target in targets}
     sync_rows = [dict(host=host, path=str(case / 'source'),
@@ -686,10 +719,11 @@ if sidecar_cases:
                         hosts=sync_rows,
                         source_roots={row['host']: row['path'] for row in sync_rows
                                       if row['status'] == 'success'})
-    (case / 'source-sync.json').write_text(json.dumps(sync_receipt) + '\n')
+    if not readiness:
+        (case / 'source-sync.json').write_text(json.dumps(sync_receipt) + '\n')
 
     def crash_at_state_update(phase):
-        env = invocation_env(case, identity, 1, 'source-sync-recovery', phase, retry_max=1)
+        env = invocation_env(case, identity, 1, recovery_mode, phase, retry_max=1)
         marker = case / (phase + '.state-update.ready')
         with open(case / (phase + '.stdout'), 'wb') as out, open(case / (phase + '.stderr'), 'wb') as err:
             process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
@@ -714,49 +748,56 @@ if sidecar_cases:
     (case / 'release').write_text('continue\n')
     before = crash_at_state_update('first')
     prior = before['target_statuses'][targets[0]]
-    check(case.name + ': source-only worker completed before its result reached state',
+    check(case.name + ': admission refusal completed before its result reached state',
           before['status'] == 'running' and prior['status'] == 'running' and
           prior['attempts'] == 1 and prior.get('result') is None and
-          prior.get('source_sync_failures', 0) == 0 and
-          read(Path(prior['result_path']))['stage'] == 'source_sync' and
-          read(Path(prior['result_path']))['exit_code'] == 1 and
-          not events(case) and not list(case.glob('prelude.*.ready')))
+          prior.get(counter_key, 0) == 0 and
+          read(Path(prior['result_path']))['stage'] == refusal_stage and
+          read(Path(prior['result_path']))['exit_code'] == refusal_exit and
+          len(events(case)) == int(readiness) and
+          all(event['mode'] == 'readiness' and event['stdin_is_null'] for event in events(case)) and
+          len(list(case.glob('prelude.*.ready'))) == int(readiness) and
+          not list((case / 'output').iterdir()))
     immutable = {Path(prior[key]): Path(prior[key]).read_bytes() for key in ('log_path', 'result_path')}
     for phase in ('resume-reconcile', 'resume-reconcile-again'):
         reconciled = crash_at_state_update(phase)
         saved = reconciled['target_statuses'][targets[0]]
         result = saved['result']
-        check(case.name + '/' + phase + ': one source-only attempt earns exactly one compiler-budget discount',
+        check(case.name + '/' + phase + ': one admission refusal earns exactly one compiler-budget discount',
               saved['status'] == 'failed' and saved['attempts'] == 1 and
-              saved.get('source_sync_failures') == 1 and saved.get('reconciled_from_sidecar') is True and
-              result['stage'] == 'source_sync' and result['exit_code'] == 1 and
+              saved.get(counter_key) == 1 and saved.get('reconciled_from_sidecar') is True and
+              result['stage'] == refusal_stage and result['exit_code'] == refusal_exit and
               result['attempt'] == 1 and result['log_path'] == prior['log_path'] and
-              result['result_path'] == prior['result_path'] and not events(case) and
+              result['result_path'] == prior['result_path'] and len(events(case)) == int(readiness) and
               all(reconciled['target_statuses'][target]['attempts'] == 0 for target in targets[1:]) and
               all(path.read_bytes() == contents for path, contents in immutable.items()))
 
-    # Repair only the source gate. The first actual compiler attempt fails,
-    # then max1 must stop a further retry despite two prior reconciliations.
+    # Repair the admission gate and exercise the existing controlled compiler
+    # payload boundary. Its first execution fails; max1 must then stop another
+    # execution despite two earlier reconciliations of the same refused receipt.
     for row in sync_rows:
         row['status'] = 'success'
         row.pop('error', None)
     sync_receipt.update(status='success', synced=6, failed=0,
                         source_roots={row['host']: row['path'] for row in sync_rows})
-    (case / 'source-sync.json').write_text(json.dumps(sync_receipt) + '\n')
+    if not readiness:
+        (case / 'source-sync.json').write_text(json.dumps(sync_receipt) + '\n')
     for phase, mode in (('resume-repaired', 'failure'), ('resume-budget-exhausted', 'success')):
         value, state = invoke(case, identity, 1, mode, phase, retry_max=1, expected_code=1)
         dispatches = {target: 2 if target == targets[0] else 1 for target in targets}
-        verify_attempts(case, value, state, {target: 1 for target in targets},
+        observed_counts = {target: 2 if readiness and target == targets[0] else 1 for target in targets}
+        verify_attempts(case, value, state, observed_counts,
                         {targets[0]: 9}, case.name + '/' + phase, dispatch_counts=dispatches)
         check(case.name + '/' + phase + ': repair admits exactly one real compiler attempt without over-discounting',
-              state['target_statuses'][targets[0]].get('source_sync_failures') == 1 and
+              state['target_statuses'][targets[0]].get(counter_key) == 1 and
               value['targets'][0]['attempt'] == 2 and
-              sorted(event['attempt'] for event in events(case) if event['target'] == targets[0]) == [2] and
+              sorted(event['attempt'] for event in events(case)
+                     if event['target'] == targets[0] and event['mode'] != 'readiness') == [2] and
               len(list(workspace.glob('results/*.json'))) == 7 and
               len(list(workspace.glob('logs/*.log'))) == 7 and
               all(path.read_bytes() == contents for path, contents in immutable.items()))
         if phase == 'resume-budget-exhausted':
-            check(case.name + ': source discount does not admit a second compiler failure',
+            check(case.name + ': admission discount does not admit a second compiler failure',
                   value['targets'][0].get('retry_limit_exceeded') is True and
                   value['targets'][0]['exit_code'] == 9)
 
@@ -826,6 +867,305 @@ _act_run_target_worker fixture 1.0.0 55555555-5555-4555-8555-555555555555 \
 print('Worker stdin isolation: %d checks, 0 failures' % checks, flush=True)
 PY
 }
+
+# Faults at the durable reservation/log boundary must not strand a run behind
+# an untracked immutable log. Exercise the actual coordinator, state writer,
+# worker processes, cancellation and exact resume; only payloads and the named
+# failing write are substituted.
+test_dispatch_reservation_recovery() {
+    local project_root required_tool
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for required_tool in python3 jq yq; do
+        command -v "$required_tool" >/dev/null || return 77
+    done
+    python3 - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+from collections import Counter
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import uuid
+
+project, module = map(Path, sys.argv[1:3])
+root = Path(tempfile.mkdtemp(prefix='dsr-dispatch-reservation-'))
+print('Retained dispatch reservation fixture: ' + str(root), flush=True)
+targets = ['linux/amd64', 'linux/arm64', 'darwin/arm64']
+checks = 0
+
+
+def check(label, valid):
+    global checks
+    if not valid:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def events(case):
+    path = case / 'invocations.jsonl'
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+payload = root / 'payload.py'
+payload.write_text(r'''import json, os, sys, time
+from pathlib import Path
+case, target, attempt, hold = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4] == 'true'
+assert sys.stdin.buffer.read() == b''
+fd = os.open(case / 'invocations.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+os.write(fd, (json.dumps(dict(target=target, attempt=attempt, pid=os.getpid())) + '\n').encode())
+os.close(fd)
+if hold:
+    (case / 'peer.ready').write_text(str(os.getpid()))
+    while True:
+        time.sleep(0.02)
+path = case / 'output' / (target.replace('/', '-') + '.attempt-' + str(attempt))
+path.write_bytes(('payload:' + target + ':' + str(attempt)).encode())
+print(json.dumps(dict(platform=target, method='native', status='success', exit_code=0,
+                     artifact_path=str(path), artifact_paths=[str(path)])), flush=True)
+''')
+driver = root / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_RES_PROJECT/src/logging.sh"
+source "$DSR_RES_PROJECT/src/config.sh"
+source "$DSR_RES_PROJECT/src/build_state.sh"
+source "$DSR_RES_MODULE"
+eval "$(declare -f build_state_update_target | sed '1s/build_state_update_target/_real_target_update/')"
+eval "$(declare -f build_state_update_host | sed '1s/build_state_update_host/_real_host_update/')"
+wait_for_active_peer() {
+    [[ "$DSR_RES_JOBS" == 3 ]] || return 0
+    local deadline=$((SECONDS + 15))
+    while [[ ! -f "$DSR_RES_CASE/peer.ready" ]]; do
+        ((SECONDS < deadline)) || return 1
+        sleep 0.02
+    done
+}
+build_state_update_target() {
+    if [[ ( "$DSR_RES_PHASE" == first || "$DSR_RES_PHASE" == cli ) &&
+          "$3" == "$DSR_RES_FAULT_TARGET" && "$4" == running ]]; then
+        if [[ "$DSR_RES_MODE" == target-write ]]; then
+            wait_for_active_peer || return 1
+            return 1
+        fi
+        _real_target_update "$@" || return $?
+        if [[ "$DSR_RES_MODE" == crash || "$DSR_RES_MODE" == signal ]]; then
+            printf 'reserved\n' > "$DSR_RES_CASE/reserved"
+            if [[ "$DSR_RES_MODE" == crash ]]; then kill -KILL "$BASHPID"; else kill -TERM "$BASHPID"; fi
+        fi
+        return 0
+    fi
+    _real_target_update "$@"
+}
+build_state_update_host() {
+    if [[ ( "$DSR_RES_PHASE" == first || "$DSR_RES_PHASE" == cli ) &&
+          "$3" == "host-${DSR_RES_FAULT_TARGET//\//-}" && "$4" == running ]]; then
+        wait_for_active_peer || return 1
+        [[ "$DSR_RES_MODE" != host-write ]] || return 1
+        _real_host_update "$@" || return $?
+        if [[ "$DSR_RES_MODE" == log-write || "$DSR_RES_MODE" == receipt-write ]]; then
+            mkdir "$log_path" || return 1
+            if [[ "$DSR_RES_MODE" == receipt-write ]]; then mkdir "$result_path" || return 1; fi
+        fi
+        return 0
+    fi
+    _real_host_update "$@"
+}
+selector_acquire_slot() { return 0; }
+selector_release_slot() { return 0; }
+act_run_native_build() {
+    local hold=false
+    if [[ "$DSR_RES_PHASE" == first && "$DSR_RES_JOBS" == 3 &&
+          "$DSR_RES_MODE" != crash && "$DSR_RES_MODE" != signal && "$2" == linux/amd64 ]]; then hold=true; fi
+    python3 "$DSR_RES_PAYLOAD" "$DSR_RES_CASE" "$2" "$attempt" "$hold"
+}
+args=(--run-id "$DSR_RES_RUN")
+[[ "$DSR_RES_PHASE" == first ]] || args=(--resume-run-id "$DSR_RES_RUN")
+if [[ "$DSR_RES_PHASE" == cli ]]; then
+    for module in git_ops artifact_naming packaging; do
+        source "$DSR_RES_PROJECT/src/$module.sh" || exit 1
+    done
+    export SCRIPT_DIR="$DSR_RES_PROJECT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+    declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+    source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' \
+        "$DSR_RES_PROJECT/dsr") || exit 1
+    source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' \
+        "$DSR_RES_PROJECT/dsr") || exit 1
+    cmd_build reservationfixture --version 1.0.0 --no-sync --jobs "$DSR_RES_JOBS" \
+        --output-dir "$DSR_RES_CASE/output"
+else
+    act_orchestrate_build reservationfixture 1.0.0 --parallel-jobs "$DSR_RES_JOBS" \
+        --no-source-sync-gate --output-dir "$DSR_RES_CASE/output" "${args[@]}"
+fi
+''')
+
+
+def invoke(case, run, jobs, mode, phase):
+    env = dict(os.environ, DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+               DSR_CONFIG_DIR=str(case / 'config'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
+               ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
+               DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='3', NO_COLOR='1',
+               DSR_RES_PROJECT=str(project), DSR_RES_MODULE=str(module), DSR_RES_PAYLOAD=str(payload),
+               DSR_RES_CASE=str(case), DSR_RES_RUN=run, DSR_RES_JOBS=str(jobs),
+               DSR_RES_MODE=mode, DSR_RES_PHASE=phase,
+               DSR_RES_FAULT_TARGET=targets[0] if mode in ('crash', 'signal') or phase == 'cli' else targets[1])
+    env.pop('DSR_BUILD_LOCK_HELD_BY_CALLER', None)
+    with open(case / (phase + '.stdout'), 'wb') as out, open(case / (phase + '.stderr'), 'wb') as err:
+        process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=out, stderr=err, start_new_session=True)
+        try:
+            code = process.wait(timeout=45)
+        except BaseException:
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            raise
+    value = None if code == -signal.SIGKILL else read(case / (phase + '.stdout'))
+    if phase == 'cli':
+        run = value['details']['run_id']
+    state = read(case / 'state/builds/reservationfixture/1.0.0' / run / 'state.json')
+    return code, value, state
+
+
+for jobs in (1, 3):
+    for mode in ('target-write', 'host-write', 'log-write', 'receipt-write', 'crash', 'signal'):
+        case = root / ('jobs-%d-%s' % (jobs, mode))
+        for directory in ('config/repos.d', 'state', 'cache', 'source', 'output'):
+            (case / directory).mkdir(parents=True, exist_ok=True)
+        hosts = {target: 'host-' + target.replace('/', '-') for target in targets}
+        (case / 'config/hosts.yaml').write_text(json.dumps({
+            'schema_version': '1.0.0', 'platform_mapping': hosts,
+            'hosts': {host: {'platform': target, 'connection': 'local'} for target, host in hosts.items()}}))
+        (case / 'config/repos.d/reservationfixture.yaml').write_text(json.dumps({
+            'tool_name': 'reservationfixture', 'repo': 'fixture/reservationfixture', 'language': 'go',
+            'local_path': str(case / 'source'), 'binary_name': 'fixture', 'targets': targets,
+            'cross_compile': {target: {'host': host} for target, host in hosts.items()}}))
+        run = str(uuid.uuid4())
+        workspace = case / 'state/builds/reservationfixture/1.0.0' / run
+        code, result, state = invoke(case, run, jobs, mode, 'first')
+        label = case.name
+        if mode in ('crash', 'signal'):
+            check(label + ': actual signal stops the coordinator after durable reservation',
+                  code == (-signal.SIGKILL if mode == 'crash' else 130) and (case / 'reserved').is_file())
+            check(label + ': no immutable log or worker exists before the reserved dispatch',
+                  state['target_statuses'][targets[0]]['attempts'] == 1 and not events(case) and
+                  not list((workspace / 'logs').iterdir()) and not list((workspace / 'results').iterdir()))
+            if mode == 'signal':
+                check(label + ': genuine cancellation remains exit 130',
+                      result['exit_code'] == 130 and all(row['exit_code'] == 130 for row in result['targets']))
+            expected_attempts = {targets[0]: 2, targets[1]: 1, targets[2]: 1}
+        else:
+            refused = result['targets'][1]
+            reserved = mode != 'target-write'
+            check(label + ': persistence refusal remains a coordinator error, not cancellation',
+                  code == 4 and result['exit_code'] == 4 and result['status'] == 'failed')
+            check(label + ': unstarted target is explicitly classified without a build log',
+                  refused['stage'] == 'dispatch' and refused['exit_code'] == 4 and
+                  refused['execution_started'] is False and refused['attempt'] == int(reserved) and
+                  refused['status'] == ('failed' if reserved else 'skipped') and 'log_path' not in refused)
+            check(label + ': queued target remains undispatched with its real reason',
+                  result['targets'][2]['status'] == 'skipped' and result['targets'][2]['attempt'] == 0 and
+                  result['targets'][2]['stage'] == 'dispatch' and result['targets'][2]['exit_code'] == 4 and
+                  state['target_statuses'][targets[2]]['attempts'] == 0)
+            check(label + ': no payload ran for the refused or queued target',
+                  Counter(event['target'] for event in events(case)) == Counter({targets[0]: 1}))
+            if not reserved:
+                check(label + ': failed reservation creates no orphan log or result',
+                      state['target_statuses'][targets[1]]['attempts'] == 0 and
+                      not list((workspace / 'logs').glob('*linux-arm64*')) and
+                      not list((workspace / 'results').glob('*linux-arm64*')) and 'result_path' not in refused)
+            elif mode == 'receipt-write':
+                check(label + ': failed receipt publication never invents a result path',
+                      'result_path' not in refused and
+                      state['target_statuses'][targets[1]]['result'].get('result_path') is None and
+                      list((workspace / 'results').glob('*linux-arm64*'))[0].is_dir())
+            else:
+                check(label + ': reserved refusal retains its exact immutable receipt',
+                      Path(refused['result_path']).is_file() and read(Path(refused['result_path'])) == refused and
+                      state['target_statuses'][targets[1]]['result'] == refused)
+            if jobs == 3:
+                check(label + ': started peer is cancelled and reaped with its own actual attempt',
+                      result['targets'][0]['exit_code'] == 130 and result['targets'][0]['attempt'] == 1 and
+                      Path(result['targets'][0]['result_path']).is_file())
+                pid = events(case)[0]['pid']
+                observed = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True, text=True)
+                check(label + ': started descendant is no longer doing work',
+                      observed.returncode != 0 or not observed.stdout.strip() or observed.stdout.strip().startswith('Z'))
+            expected_attempts = {targets[0]: 1 if jobs == 1 else 2,
+                                 targets[1]: 2 if reserved else 1, targets[2]: 1}
+
+        immutable = {path: path.read_bytes() for directory in (case / 'output', workspace / 'logs', workspace / 'results')
+                     for path in directory.rglob('*') if path.is_file()}
+        retained_directories = {path for directory in (workspace / 'logs', workspace / 'results')
+                                for path in directory.iterdir() if path.is_dir()}
+        resumed_code, resumed, resumed_state = invoke(case, run, jobs, mode, 'resume')
+        check(label + ': exact-run resume finishes every target with monotonic attempt numbers',
+              resumed_code == 0 and resumed['summary'] == dict(total=3, success=3, failed=0) and
+              [row['platform'] for row in resumed['targets']] == targets and
+              all(row['attempt'] == expected_attempts[row['platform']] for row in resumed['targets']) and
+              all(resumed_state['target_statuses'][target]['attempts'] == expected_attempts[target] for target in targets))
+        expected_counts = {target: 1 for target in targets}
+        if jobs == 3 and mode not in ('crash', 'signal'):
+            expected_counts[targets[0]] = 2
+        check(label + ': resume performs exactly the missing work and reuses completed bytes',
+              Counter(event['target'] for event in events(case)) == Counter(expected_counts) and
+              all(path.read_bytes() == contents for path, contents in immutable.items()) and
+              all(path.is_dir() for path in retained_directories))
+        check(label + ': every success has real payloads and immutable attempt evidence',
+              all(Path(row['artifact_path']).is_file() and Path(row['log_path']).is_file() and
+                  Path(row['result_path']).is_file() and row['resume_artifacts'] for row in resumed['targets']))
+
+case = root / 'public-cli-refusal'
+for directory in ('config/repos.d', 'state', 'cache', 'source', 'output'):
+    (case / directory).mkdir(parents=True, exist_ok=True)
+hosts = {target: 'host-' + target.replace('/', '-') for target in targets}
+(case / 'config/hosts.yaml').write_text(json.dumps({
+    'schema_version': '1.0.0', 'platform_mapping': hosts,
+    'hosts': {host: {'platform': target, 'connection': 'local'} for target, host in hosts.items()}}))
+(case / 'config/repos.d/reservationfixture.yaml').write_text(json.dumps({
+    'tool_name': 'reservationfixture', 'repo': 'fixture/reservationfixture', 'language': 'go',
+    'local_path': str(case / 'source'), 'binary_name': 'fixture', 'targets': targets,
+    'cross_compile': {target: {'host': host} for target, host in hosts.items()}}))
+for command in (['git', '-C', str(case / 'source'), 'init', '-q'],
+                ['git', '-C', str(case / 'source'), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                 'commit', '--allow-empty', '-qm', 'source identity']):
+    subprocess.run(command, check=True, capture_output=True)
+code, envelope, state = invoke(case, str(uuid.uuid4()), 1, 'host-write', 'cli')
+details = envelope['details']
+refused = details['targets'][0]
+check('public CLI: coordinator refusal remains exit 4 with all configured targets represented',
+      code == 4 and envelope['exit_code'] == 4 and envelope['command'] == 'build' and
+      [row['platform'] for row in details['targets']] == targets and
+      (details['total'], details['success'], details['failed']) == (3, 0, 3))
+check('public CLI: reserved refusal retains actual receipt without fabricating a worker log',
+      refused['status'] == 'failed' and refused['stage'] == 'dispatch' and
+      refused['exit_code'] == 4 and refused['execution_started'] is False and refused['attempt'] == 1 and
+      'log_path' not in refused and Path(refused['result_path']).is_file() and
+      read(Path(refused['result_path']))['execution_started'] is False and
+      state['target_statuses'][targets[0]]['result']['result_path'] == refused['result_path'])
+check('public CLI: queued targets remain unstarted and release publication remains blocked',
+      all(row['status'] == 'skipped' and row['attempt'] == 0 and row['stage'] == 'dispatch' and
+          row['exit_code'] == 4 and row['execution_started'] is False and
+          'log_path' not in row and 'result_path' not in row for row in details['targets'][1:]) and
+      not events(case) and state['status'] == 'failed' and not details['publishable'] and not details['manifest_path'])
+
+print('Dispatch reservation recovery: %d checks, 0 failures' % checks, flush=True)
+PY
+}
+
+if [[ "${1:-}" == --dispatch-reservation-only ]]; then
+    test_dispatch_reservation_recovery
+    exit $?
+fi
 
 if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
       "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ||
@@ -5361,6 +5701,12 @@ if test_worker_stdin_isolation; then
     pass "stdin-consuming target workers preserve dispatch, receipts, cancellation and resume"
 else
     fail "target worker stdin isolation or execution accounting regressed"
+fi
+
+if test_dispatch_reservation_recovery; then
+    pass "dispatch persistence and coordinator loss preserve immutable attempts and exact resume"
+else
+    fail "dispatch reservation recovery or coordinator refusal classification regressed"
 fi
 
 # Cleanup

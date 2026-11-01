@@ -700,6 +700,17 @@ build_state_update_target() {
         then .target_statuses[$target].source_sync_failures =
           (($prior.source_sync_failures // 0) + 1)
         else . end |
+        # Native readiness refusals likewise stop before compilation. Keep
+        # their attempt receipts, but do not spend the compiler retry budget
+        # while an operator repairs an unavailable or full build host.
+        if $status == "failed" and $extra.result.stage == "host_readiness" and
+           $extra.result.exit_code == 4 and
+           ($extra.result.status == "failed" or $extra.result.status == "error") and
+           ($prior.status != "failed" or $prior.result.stage != "host_readiness" or
+            $prior.result.exit_code != 4 or $prior.attempts != $extra.attempts)
+        then .target_statuses[$target].host_readiness_failures =
+          (($prior.host_readiness_failures // 0) + 1)
+        else . end |
         .updated_at = $now' <<< "$extra_json"; then
     return 1
   fi
@@ -1392,7 +1403,8 @@ build_state_resume() {
        (all((.target_statuses // {})[];
          type == "object" and valid_status and valid_counter("attempts") and
          valid_counter("source_sync_failures") and
-         (counter("source_sync_failures") <= counter("attempts"))) | not) or
+         valid_counter("host_readiness_failures") and
+         ((counter("source_sync_failures") + counter("host_readiness_failures")) <= counter("attempts"))) | not) or
        (tasks | type) != "array" or
        ([tasks[].key] | unique | length) != (tasks | length) or
        (all(tasks[]; (.key | type == "string" and length > 0) and
@@ -1431,7 +1443,8 @@ build_state_resume() {
       ($s.target_statuses[$target] // {}) as $entry |
       if ($entry.status == "completed" and ($entry.result | type) == "object" and
           ($entry.result | length) > 0) then .completed += [$target]
-      elif (($entry | counter("attempts") - counter("source_sync_failures")) >= $retry_max)
+      elif (($entry | counter("attempts") - counter("source_sync_failures") -
+                    counter("host_readiness_failures")) >= $retry_max)
       then .exceeded += [$target]
       else .retryable += [$target] end
     )) as $target_plan |

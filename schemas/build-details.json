@@ -107,12 +107,12 @@
         },
         "result_path": {
           "type": "string",
-          "description": "Path to the retained target attempt result; absent when no attempt ran"
+          "description": "Path to the retained target result or coordinator refusal; absent when no receipt could be written"
         },
         "attempt": {
           "type": "integer",
           "minimum": 0,
-          "description": "Retained target attempt number, or zero when the task has never been dispatched"
+          "description": "Durable target attempt reservation number, or zero before any reservation"
         },
         "exit_code": {
           "type": "integer",
@@ -127,7 +127,11 @@
         "stage": {
           "type": "string",
           "minLength": 1,
-          "description": "Failure stage; source_sync means no compiler or capacity slot was started, host_readiness means native host admission refused before compilation"
+          "description": "Failure stage; dispatch means the worker was not started, source_sync means no compiler or capacity slot was started, host_readiness means native host admission refused before compilation"
+        },
+        "execution_started": {
+          "type": "boolean",
+          "description": "False on a coordinator dispatch refusal; a reserved attempt number does not establish that its worker ran"
         },
         "source_sync": {
           "type": "object",

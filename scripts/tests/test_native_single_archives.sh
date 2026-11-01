@@ -132,7 +132,9 @@ if os.environ.get('DSR_TEST_NATIVE_PACKAGE_BLOCK'):
 else:
     source = module.read_text()
     begin = '        # Package workspace binaries into a single tarball\n'
-    end = '\n    elif [[ $exit_code -eq 124 ]]; then'
+    # Stop at the next outer result branch. Readiness and timeout handling
+    # are outside this archive-only fixture; retain the whole success block.
+    end = '\n    elif [['
     if source.count(begin) != 1:
         raise AssertionError('native packaging block is ambiguous or unavailable')
     start = source.index(begin)

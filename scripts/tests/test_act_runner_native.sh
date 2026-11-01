@@ -402,13 +402,23 @@ def run_case(spec):
     requests = [row for value in observations for row in value['roles'] if row.get('requested')]
     checks = []
     if refused:
-        checks += [('refuses with the established terminal status', result.returncode == (6 if route == 'drop' else 4)),
+        checks += [('refuses with the established terminal status', result.returncode == 4),
                    ('stops before source/cache/compiler side effects',
                     events == (['prepare:ordinary'] if route == 'drop' else [])),
                    ('observes the full selected volume with healthy defaults',
                     any(row['role'] == role and row['available_bytes'] == 2 * 1024**3 for row in requests)
                     and all(row['available_bytes'] == 60 * 1024**3
                             for value in observations for row in value['roles'] if not row.get('requested')))]
+        if args[0] == 'act_run_native_build':
+            try:
+                refusal = json.loads(result.stdout)
+            except ValueError:
+                refusal = {}
+            checks += [('native refusal retains its identity and pre-compiler stage',
+                        refusal.get('platform') == target and refusal.get('method') == 'native'
+                        and refusal.get('host') == 'fixture' and refusal.get('stage') == 'host_readiness'
+                        and refusal.get('exit_code') == 4
+                        and refusal.get('status') in ('error', 'failed'))]
     else:
         checks += [('healthy selected paths reach existing execution boundary', expected in events),
                    ('healthy path evidence is present', bool(requests)),
@@ -430,7 +440,7 @@ def run_case(spec):
         except ValueError:
             receipt = {}
         checks += [('late refusal records failed build without artifact or final-cache authority',
-                    receipt.get('status') == 'failed' and receipt.get('exit_code') == 6
+                    receipt.get('status') == 'failed' and receipt.get('exit_code') == 4
                     and receipt.get('artifact_paths') == [] and receipt.get('artifact_path') == ''
                     and 'build command was not started' in receipt.get('error', '')
                     and 'final' not in receipt.get('cargo_isolation', {}).get('dependency_cache', {}))]

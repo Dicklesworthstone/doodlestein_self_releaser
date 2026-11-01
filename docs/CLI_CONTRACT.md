@@ -575,6 +575,15 @@ triple, host, and attempt receipts. They report `stage: "host_readiness"` and
 `exit_code: 4`; public target status is `failed`, even though no compiler ran.
 Receipt-write failures release the attempt's capacity lease before the worker
 returns, preserving unrelated workers' slots and allowing a later retry.
+The coordinator persists an attempt reservation before creating its log or
+starting its worker. A failed reservation leaves no orphan log to block resume.
+A later dispatch failure reports `stage: "dispatch"`, `exit_code: 4`, and
+`execution_started: false`; any already started workers are cancelled and
+drained. A saved reservation keeps its attempt number even if the coordinator
+stops before launch, so resume uses a fresh number and preserves old receipts.
+Receipt paths are reported only when the corresponding refusal receipt was
+written. A recovered successful worker receipt regains its saved attempt and
+log/result paths without changing the original receipt or rebuilding its output.
 The aggregate failed count includes all unsuccessful requested tasks, including
 skipped tasks. An interrupted run remains resumable and cannot publish an
 authoritative manifest.
@@ -633,9 +642,15 @@ coverage, split-storage behavior and the limits of this capacity check.
 Run context and aggregate results retain the complete `source_sync` receipt.
 Resume syncs again, updates the ordinary host/path bindings, and records the
 new receipt in `source_sync_history`. It verifies completed artifact receipts
-before deciding which targets still need work. `attempts` counts retained
-target attempts, while `source_sync_failures` excludes transfers that never
-reached compilation from the compiler retry limit. Direct orchestration resume
+before deciding which targets still need work. `attempts` counts durable attempt
+reservations. `source_sync_failures` and `host_readiness_failures` count recorded
+transfer failures and native admission refusals that never reached compilation;
+both are excluded from the compiler retry limit. Readiness exemptions require
+the explicit `host_readiness` stage and exit code 4. Replaying the same failed
+attempt does not increase either counter, and real build failures still consume
+the configured retry allowance. Checkpoints without readiness counters retain
+their prior conservative accounting; resume does not invent missing history.
+Direct orchestration resume
 without a new receipt retains the saved gate; the explicit CLI `--no-sync`
 opt-out clears it while preserving recorded host/path bindings and history.
 An ordinary sync receipt records transfer admission; strict releases continue

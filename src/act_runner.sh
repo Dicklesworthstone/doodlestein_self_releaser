@@ -10257,8 +10257,10 @@ act_run_native_build() {
                 "$strict_build_env"$'\n'"CARGO_HOME=$prepared_cargo_home" "$language" \
                 "$strict_cache_root") || return 4
             if ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
-                jq -nc --arg host "$host" \
-                    '{status:"error",exit_code:4,host:$host,error:"Native Cargo writable paths are not ready"}'
+                jq -nc --arg platform "$platform" --arg host "$host" --arg triple "$selected_triple" \
+                    '{platform:$platform,method:"native",status:"error",exit_code:4,host:$host,
+                      stage:"host_readiness",error:"Native Cargo writable paths are not ready"} +
+                     (if $triple == "" then {} else {target_triple:$triple} end)'
                 return 4
             fi
         fi
@@ -10612,8 +10614,10 @@ act_run_native_build() {
         native_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$native_working_root" \
             "$build_env" "$language" "$strict_cache_root") || return 4
         if ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
-            jq -nc --arg host "$host" \
-                '{status:"error",exit_code:4,host:$host,error:"Native build writable paths are not ready"}'
+            jq -nc --arg platform "$platform" --arg host "$host" --arg triple "$selected_triple" \
+                '{platform:$platform,method:"native",status:"error",exit_code:4,host:$host,
+                  stage:"host_readiness",error:"Native build writable paths are not ready"} +
+                 (if $triple == "" then {} else {target_triple:$triple} end)'
             return 4
         fi
     fi
@@ -11859,6 +11863,11 @@ EOF
             fi
         fi
 
+    elif [[ -n "$native_storage_error" ]]; then
+        # A late capacity refusal never started the build command. Preserve
+        # the admission outcome for public reporting and resume accounting.
+        status="failed"
+        exit_code=4
     elif [[ $exit_code -eq 124 ]]; then
         _log_error "Build timed out on $host after ${_ACT_BUILD_TIMEOUT}s"
         status="timeout"
@@ -11919,7 +11928,8 @@ EOF
             build_influence_env: $build_influence_env,
             cargo_isolation: $cargo_isolation,
             log_file: $log_file
-        } + (if $storage_error == "" then {} else {error:$storage_error} end)' <<< "$cargo_isolation_json" || return 4
+        } + (if $storage_error == "" then {} else
+               {stage:"host_readiness",error:$storage_error} end)' <<< "$cargo_isolation_json" || return 4
 
     return "$exit_code"
 }
@@ -13351,6 +13361,7 @@ act_orchestrate_build() {
     fi
 
     local results=() success_count=0 fail_count=0 interrupted=false
+    local coordinator_error=""
     local start_time target_index=0
     start_time=$(date +%s)
     local -a worker_pids=() worker_targets=() worker_platforms=() worker_triples=()
@@ -13465,6 +13476,49 @@ act_orchestrate_build() {
         done
     }
 
+    _act_refuse_unstarted_attempt() {
+        local message="$1" reserved="$2" refusal refusal_with_path refusal_extra
+        local refusal_attempt="$prior_attempts" refusal_status=skipped
+        coordinator_error="$message"
+        _log_error "$message"
+        if $reserved; then
+            refusal_attempt="$attempt"
+            refusal_status=failed
+        fi
+        if refusal=$(jq -nc --arg target "$target" --arg task_key "$task_key" \
+                --arg triple "$selected_triple" --arg host "$host" \
+                --arg purpose "$build_purpose" --arg status "$refusal_status" \
+                --arg error "$message" --argjson attempt "$refusal_attempt" \
+                '{platform:$target, task_key:$task_key, host:$host, status:$status,
+                  exit_code:4, stage:"dispatch", execution_started:false, error:$error,
+                  attempt:$attempt, build_purpose:$purpose, publishable:($purpose == "release")} +
+                 (if $triple == "" then {} else {target_triple:$triple} end)'); then
+            # A failed reservation has no durable attempt identity. Do not
+            # create orphan receipts that would obstruct its first retry.
+            if $reserved; then
+                refusal_with_path=$(jq -c --arg path "$result_path" \
+                    '. + {result_path:$path, receipt_source:"coordinator"}' <<< "$refusal")
+                if [[ -n "$refusal_with_path" ]] &&
+                   (umask 077; set -o noclobber; printf '%s\n' "$refusal_with_path" > "$result_path"); then
+                    refusal="$refusal_with_path"
+                fi
+                if $state_available; then
+                    refusal_extra=$(jq -nc --argjson attempts "$attempt" \
+                        'input as $result | {result:$result, attempts:$attempts,
+                         log_path:null, result_path:($result.result_path // null)}' <<< "$refusal") &&
+                        build_state_update_target "$tool_name" "$version" "$task_key" \
+                            failed "$refusal_extra" "$run_id" ||
+                        _log_error "Could not persist dispatch refusal for $task_key"
+                fi
+            fi
+            final_results["$task_key"]="$refusal"
+        fi
+        # A coordinator persistence failure must not leave previously started
+        # targets running after dispatch stops. Their own traps retain actual
+        # interrupted attempts; the coordinator failure remains exit 4.
+        _act_cancel_parallel_workers
+    }
+
     # Bash 4.0 lacks wait -n. Poll only the bounded worker set and reap the
     # first completed process, keeping the scheduler work-conserving without
     # sacrificing the project's Bash 4.0 compatibility.
@@ -13508,11 +13562,15 @@ act_orchestrate_build() {
                 jq -c --arg target "$task_key" '.target_statuses[$target] // {}')
             prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
             if ! prior_build_attempts=$(jq -er '
-                (.attempts // 0) as $all | (.source_sync_failures // 0) as $sync |
+                def counter($key): if has($key) then .[$key] else 0 end;
+                counter("attempts") as $all | counter("source_sync_failures") as $sync |
+                counter("host_readiness_failures") as $readiness |
                 select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                  ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and $sync <= $all) |
-                $all - $sync' <<< "$persisted_entry"); then
-                _log_error "Invalid source synchronization/build attempt counters for $task_key"
+                  ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                  ($readiness | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                  ($sync + $readiness) <= $all) |
+                $all - $sync - $readiness' <<< "$persisted_entry"); then
+                _log_error "Invalid source synchronization/readiness/build attempt counters for $task_key"
                 interrupted=true
                 break
             fi
@@ -13565,7 +13623,8 @@ act_orchestrate_build() {
                         --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
                         --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
                         --arg status "$recovered_status" '
-                        . + {log_path: $log_path, result_path: $result_path, attempt: $attempt} |
+                        . + {result_path: $result_path, attempt: $attempt} |
+                        if $log_path == "" then del(.log_path) else .log_path = $log_path end |
                         if $status == "completed" then . + {resume_reused: true} else . end
                     ' <<< "$recovered_result") || { interrupted=true; break; }
                     if $state_available; then
@@ -13585,9 +13644,9 @@ act_orchestrate_build() {
                         _log_info "Resume: reconciled completed sidecar for $task_key"
                         continue
                     fi
-                    # Reconciliation accounts for a source-sync failure once.
-                    # Reread that authoritative discount before applying the
-                    # compiler budget, including on repeated resume requests.
+                    # Reconciliation accounts for source-sync and readiness
+                    # refusals once. Reread those authoritative discounts
+                    # before applying the compiler budget on every resume.
                     if $state_available; then
                         persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
                             jq -c --arg target "$task_key" '.target_statuses[$target] // {}') || {
@@ -13595,11 +13654,15 @@ act_orchestrate_build() {
                             break
                         }
                         if ! prior_build_attempts=$(jq -er '
-                            (.attempts // 0) as $all | (.source_sync_failures // 0) as $sync |
+                            def counter($key): if has($key) then .[$key] else 0 end;
+                            counter("attempts") as $all | counter("source_sync_failures") as $sync |
+                            counter("host_readiness_failures") as $readiness |
                             select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                              ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and $sync <= $all) |
-                            $all - $sync' <<< "$persisted_entry"); then
-                            _log_error "Invalid source synchronization/build attempt counters for $task_key"
+                              ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                              ($readiness | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                              ($sync + $readiness) <= $all) |
+                            $all - $sync - $readiness' <<< "$persisted_entry"); then
+                            _log_error "Invalid source synchronization/readiness/build attempt counters for $task_key"
                             interrupted=true
                             break
                         fi
@@ -13635,9 +13698,11 @@ act_orchestrate_build() {
                     --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
                     --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
                     --arg purpose "$build_purpose" --arg task_key "$task_key" '
-                    . + {log_path: $log_path, result_path: $result_path, attempt: $attempt,
+                    . + {attempt: $attempt,
                          build_purpose: $purpose, publishable: ($purpose == "release"),
-                         task_key: $task_key, retry_limit_exceeded: true}
+                         task_key: $task_key, retry_limit_exceeded: true} |
+                    if $log_path == "" then del(.log_path) else .log_path = $log_path end |
+                    if $result_path == "" then del(.result_path) else .result_path = $result_path end
                 ' <<< "$exhausted_result") || { interrupted=true; break; }
                 if $state_available; then
                     if ! exhausted_extra=$(jq -nc --argjson attempts "$prior_attempts" \
@@ -13661,8 +13726,9 @@ act_orchestrate_build() {
         log_path="$workspace/logs/${index_prefix}-${target_slug}.attempt-${attempt}.log"
         result_path="$workspace/results/${index_prefix}-${target_slug}.attempt-${attempt}.json"
         if [[ -e "$log_path" || -L "$log_path" || -e "$result_path" || -L "$result_path" ]]; then
-            _log_error "Refusing to overwrite an existing target attempt receipt"
-            interrupted=true
+            coordinator_error="Refusing to overwrite an existing target attempt receipt"
+            _log_error "$coordinator_error"
+            _act_cancel_parallel_workers
             break
         fi
         host="act-local"
@@ -13712,24 +13778,33 @@ act_orchestrate_build() {
         # Cancellation there must leave queued tasks at zero attempts, without
         # an empty immutable log that would prevent the next resume.
         $interrupted && break
-        if ! (umask 077; set -o noclobber; : > "$log_path"); then
-            _log_error "Could not create immutable target log receipt: $log_path"
-            interrupted=true
-            break
-        fi
-
+        local attempt_reserved=false
+        # Commit the attempt identity before creating any immutable receipt.
+        # If persistence fails, exact-run resume must still be able to start
+        # this attempt; after a crash, a saved reservation advances its number.
         if $state_available; then
             if ! build_state_update_target "$tool_name" "$version" "$task_key" "running" \
                 "$(jq -nc --arg host "$host" --arg log_path "$log_path" \
                     --arg result_path "$result_path" --argjson attempts "$attempt" \
                     '{host: $host, log_path: $log_path, result_path: $result_path,
-                      attempts: $attempts, result: null}')" "$run_id" || \
-               ! build_state_update_host "$tool_name" "$version" "$host" "running" \
-                    "$(jq -nc --arg target "$target" '{target: $target}')" "$run_id"; then
-                _log_error "Could not persist running state for target $target"
-                interrupted=true
+                      attempts: $attempts, result: null}')" "$run_id"; then
+                $interrupted && break
+                _act_refuse_unstarted_attempt "Could not persist target attempt reservation; worker was not started: $task_key" false
                 break
             fi
+            attempt_reserved=true
+            if ! build_state_update_host "$tool_name" "$version" "$host" "running" \
+                    "$(jq -nc --arg target "$target" '{target: $target}')" "$run_id"; then
+                $interrupted && break
+                _act_refuse_unstarted_attempt "Could not persist host running state; worker was not started: $task_key" true
+                break
+            fi
+        fi
+        $interrupted && break
+        if ! (umask 077; set -o noclobber; : > "$log_path"); then
+            $interrupted && break
+            _act_refuse_unstarted_attempt "Could not create immutable target log; worker was not started: $task_key" "$attempt_reserved"
+            break
         fi
 
         # Only this loop may read the remaining JSON task records. Isolate the
@@ -13789,7 +13864,10 @@ act_orchestrate_build() {
             # No worker result means this invocation never dispatched this
             # task. Do not invent a failed build or an execution receipt.
             local dispatch_exit=6 dispatch_error="Target was not dispatched"
-            if $interrupted; then
+            if [[ -n "$coordinator_error" ]]; then
+                dispatch_exit=4
+                dispatch_error="Dispatch stopped before this target started: $coordinator_error"
+            elif $interrupted; then
                 dispatch_exit=130
                 dispatch_error="Interrupted before target dispatch"
             else
@@ -13799,7 +13877,8 @@ act_orchestrate_build() {
                 --argjson exit_code "$dispatch_exit" --arg error "$dispatch_error" \
                 --argjson attempt "$undispatched_attempts" \
                 '{platform: $target, status: "skipped", attempt: $attempt,
-                  exit_code: $exit_code, error: $error}')
+                  exit_code: $exit_code, stage:"dispatch", execution_started:false,
+                  error: $error}')
         fi
         if [[ "$(jq -r '.status // empty' <<< "$ordered_result")" == "success" ]] && \
            { ! _act_build_purpose_matches "$ordered_result" "$build_purpose" "$strict_release_contract" || \
@@ -13836,7 +13915,10 @@ act_orchestrate_build() {
 
     # Determine overall status
     local overall_status overall_exit_code
-    if $interrupted; then
+    if [[ -n "$coordinator_error" ]]; then
+        overall_status="failed"
+        overall_exit_code=4
+    elif $interrupted; then
         overall_status="failed"
         overall_exit_code=130
     elif $source_validation_failed; then
