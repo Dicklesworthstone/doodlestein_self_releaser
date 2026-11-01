@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import patch
 
 MODULE = os.environ.get('DSR_TEST_CARGO_CACHE_MODULE', sys.argv.pop(1))
+ACT_RUNNER = os.environ.get('DSR_TEST_ACT_RUNNER', str(Path(MODULE).with_name('act_runner.sh')))
 
 
 class PrivateCacheTests(unittest.TestCase):
@@ -1275,6 +1276,163 @@ class UnscopedRegistrySeedTests(unittest.TestCase):
         final = self.invoke('inventory', home, self.root / 'registry-final.json')
         self.invoke('verify', home, final['receipt_path'])
         self.assertEqual(json.loads(Path(seed['receipt_path']).read_bytes())['kind'], 'private-copy')
+
+
+class PrivateCargoHomeGeneratorTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='dsr-cargo-generator-test.')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+
+    git = LockedCacheTests.git
+
+    def shell(self, function, *args, env=None):
+        # Execute the actual emitted program locally with closed worker stdin.
+        # Transport is the only adapter; cache and source admission remain real.
+        program = r'''
+source "$1" || exit $?
+shift
+_act_ssh_exec() { bash -s <<< $'{\n'"$2"$'\n} </dev/null'; }
+"$@"
+'''
+        return subprocess.run(['bash', '-c', program, '_', ACT_RUNNER, function,
+                               *map(str, args)], env=env, text=True,
+                              capture_output=True, timeout=90)
+
+    def test_both_generators_preserve_underscore_attempt_suffixes(self):
+        suffixes = ('linux-amd64-0123456789abcdef0123456789abcdef',
+                    'linux-musl_amd64-0123456789abcdef0123456789abcdef',
+                    'windows-arm64_ec-0123456789abcdef0123456789abcdef',
+                    'a_', 'Z9')
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            for suffix in suffixes:
+                with self.subTest(backend=backend, suffix=suffix):
+                    result = self.shell('_act_' + backend + '_private_cargo_home_script', root, suffix)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, '')
+                    self.assertIn('.cargo-home-' + suffix, result.stdout)
+                    if '_' in suffix:
+                        self.assertNotIn('.cargo-home-' + suffix.replace('_', '-'), result.stdout)
+
+    def test_windows_generator_keeps_backslash_root_normalization(self):
+        result = self.shell('_act_windows_private_cargo_home_script',
+                            r'C:\fixture\source', 'attempt_native')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Open-DsrCachePathGuard 'C:/fixture/source'", result.stdout)
+        self.assertIn("'.cargo-home-attempt_native'", result.stdout)
+
+    def test_both_generators_refuse_unsafe_suffixes_before_emitting_programs(self):
+        suffixes = ('', 'a', '_leading', '-leading', 'a/b', 'a\\b', '../attempt',
+                    'a..b', 'a b', 'a\tb', 'a\nb', 'a\rb', "a'b", 'a"b', 'a;b',
+                    'a$(id)', 'a`id`', 'a:b', 'a+b', 'a.b', 'a*', 'a?', 'a[0]',
+                    'a|b', 'a&b', 'aé')
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            for suffix in suffixes:
+                with self.subTest(backend=backend, suffix=suffix):
+                    result = self.shell('_act_' + backend + '_private_cargo_home_script', root, suffix)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo attempt suffix', result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_both_generators_refuse_unsafe_roots_before_emitting_programs(self):
+        roots = {
+            'unix': ('relative/source', '/', '/tmp/../source', '/tmp/source name',
+                     "/tmp/source'", '/tmp/source$(id)', '/tmp/a\\b', '/tmp/source\nline'),
+            'windows': ('/tmp/source', 'C:source', 'C:/', 'C:/safe/../source',
+                        'C:/source name', "C:/source'", r'\\server\share\source',
+                        'C:/source\nline'),
+        }
+        for backend, candidates in roots.items():
+            for root in candidates:
+                with self.subTest(backend=backend, root=root):
+                    result = self.shell('_act_' + backend + '_private_cargo_home_script',
+                                        root, 'attempt_native')
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo source root', result.stderr)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    @unittest.skipUnless(all(shutil.which(name) for name in ('cargo', 'rustc', 'git', 'jq')),
+                         'real Cargo/rustc/Git/jq unavailable; native cache use requires genuine tools')
+    def test_unix_underscore_attempts_prepare_reuse_seed_and_build_offline(self):
+        # This uses the exact reported internal suffix. The host compiler proves
+        # private-cache consumption, not musl ABI or native Windows qualification.
+        upstream = self.root / 'upstream'
+        self.git('init', '-q', '-b', 'main', upstream)
+        (upstream / 'src').mkdir()
+        (upstream / 'Cargo.toml').write_text(
+            '[package]\nname="suffix-dependency"\nversion="1.0.0"\nedition="2021"\n')
+        (upstream / 'src/lib.rs').write_text('pub fn answer() -> u32 { 42 }\n')
+        self.git('-C', upstream, 'add', '.')
+        self.git('-C', upstream, '-c', 'user.name=DSR Test',
+                 '-c', 'user.email=dsr@example.invalid', 'commit', '-qm', 'dependency')
+        revision = self.git('-C', upstream, 'rev-parse', 'HEAD')
+        source = self.root / 'snapshot/source'
+        (source / 'src').mkdir(parents=True)
+        (source / 'Cargo.toml').write_text(
+            '[package]\nname="suffix-consumer"\nversion="1.0.0"\nedition="2021"\n'
+            '[dependencies]\nsuffix-dependency={git=' + json.dumps(upstream.as_uri()) +
+            ',rev=' + json.dumps(revision) + '}\n')
+        (source / 'src/main.rs').write_text('fn main() { println!("{}", suffix_dependency::answer()); }\n')
+        ambient = self.root / 'real-cargo-home'
+        ambient.mkdir()
+        target = self.root / 'target'
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'RUST', 'GIT_'))}
+        env.update(CARGO_HOME=str(ambient), CARGO_TARGET_DIR=str(target),
+                   RUSTUP_AUTO_INSTALL='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        for name in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN'):
+            if name in os.environ: env[name] = os.environ[name]
+        fetched = subprocess.run(['cargo', 'fetch'], cwd=source, env=env,
+                                 text=True, capture_output=True, timeout=90)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr)
+        original_source = {path.relative_to(source): path.read_bytes()
+                           for path in source.rglob('*') if path.is_file()}
+        lock_digest = hashlib.sha256((source / 'Cargo.lock').read_bytes()).hexdigest()
+
+        def prepare(suffix):
+            result = self.shell('_act_prepare_unix_private_cargo_home', 'fixture', source, suffix,
+                                'cargo build --locked --offline', 'CARGO_TARGET_DIR=' + str(target),
+                                env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary['cargo_home'], str(source.parent / ('.cargo-home-' + suffix)))
+            self.assertEqual(summary['selection']['lockfile_sha256'], lock_digest)
+            self.assertEqual(summary['dependency_sources']['authentication']['lockfile_sha256'], lock_digest)
+            return summary
+
+        first = prepare('linux-musl_amd64-0123456789abcdef0123456789abcdef')
+        seed = source.parent / '.cargo-home'
+        seed_receipt = (seed / '.dsr-cache-seed.json').read_bytes()
+        ambient.rename(self.root / 'retained-ambient')
+        upstream.rename(self.root / 'retained-upstream')
+        second_suffix = 'linux-musl_amd64-fedcba9876543210fedcba9876543210'
+        second = prepare(second_suffix)
+        self.assertEqual((seed / '.dsr-cache-seed.json').read_bytes(), seed_receipt)
+        homes = (seed, Path(first['cargo_home']), Path(second['cargo_home']))
+        database = next((seed / 'git/db').glob('*/config')).relative_to(seed)
+        self.assertEqual(len({(home / database).stat().st_ino for home in homes}), 3)
+        env['CARGO_HOME'] = second['cargo_home']
+        built = subprocess.run(['cargo', 'run', '--locked', '--offline', '--quiet'],
+                               cwd=source, env=env, text=True, capture_output=True, timeout=90)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertEqual(built.stdout.strip(), '42')
+        finished = self.shell('_act_finish_unix_private_cargo_home', 'fixture', second['cargo_home'],
+                              second['receipt_sha256'], source,
+                              json.dumps(second['dependency_sources']), env=env)
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(json.loads(finished.stdout)['mode'], 'inventory')
+        self.assertEqual({path.relative_to(source): path.read_bytes()
+                          for path in source.rglob('*') if path.is_file()}, original_source)
+
+        retained = {home / name: (home / name).read_bytes() for home in homes[1:]
+                    for name in ('.dsr-cache-seed.json', '.dsr-cargo-metadata.json', '.dsr-cargo-sources.json')}
+        collision = self.shell('_act_prepare_unix_private_cargo_home', 'fixture', source,
+                               second_suffix, env=env)
+        self.assertNotEqual(collision.returncode, 0, collision.stderr)
+        self.assertEqual(collision.stdout, '')
+        for path, content in retained.items(): self.assertEqual(path.read_bytes(), content)
+        self.assertEqual((seed / '.dsr-cache-seed.json').read_bytes(), seed_receipt)
 
 
 unittest.main(verbosity=2)

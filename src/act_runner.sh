@@ -5579,8 +5579,14 @@ EOF
 # or letting normal unpacking race another target's cache inventory.
 _act_unix_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
-    [[ "$source_root" =~ ^/[A-Za-z0-9_./+-]+$ && "$source_root" != *..* &&
-       "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9-]+$ ]] || return 4
+    if [[ ! "$source_root" =~ ^/[A-Za-z0-9_./+-]+$ || "$source_root" == *..* ]]; then
+        _log_error "Invalid strict Unix Cargo source root: expected an absolute source path using letters, digits, _, ., /, + or -, without '..'"
+        return 4
+    fi
+    if [[ ! "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9_-]+$ ]]; then
+        _log_error "Invalid strict Unix Cargo attempt suffix: require a leading letter or digit and at least one further letter, digit, _ or -"
+        return 4
+    fi
     printf 'set -e\numask 077\n'
     _act_unix_cargo_cache_runtime || return $?
     cat <<EOF
@@ -5962,8 +5968,14 @@ _act_windows_cache_command() {
 _act_windows_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
     source_root="${source_root//\\//}"
-    [[ "$source_root" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ && "$source_root" != *..* &&
-       "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9-]+$ ]] || return 4
+    if [[ ! "$source_root" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ || "$source_root" == *..* ]]; then
+        _log_error "Invalid strict Windows Cargo source root: expected a drive-qualified source path using letters, digits, _, ., /, + or -, without '..'"
+        return 4
+    fi
+    if [[ ! "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9_-]+$ ]]; then
+        _log_error "Invalid strict Windows Cargo attempt suffix: require a leading letter or digit and at least one further letter, digit, _ or -"
+        return 4
+    fi
     _act_windows_cargo_cache_runtime || return $?
     cat <<EOF
 \$ErrorActionPreference='Stop'

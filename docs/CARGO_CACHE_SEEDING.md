@@ -111,6 +111,27 @@ verifier still rejects a confined but uncommitted retarget and recursively
 confines each nested submodule's links to that submodule's own root. A link from
 a child to its parent or a sibling cannot acquire authority from a cache receipt.
 
+### Native attempt names
+
+The strict Unix and Windows cache generators preserve the attempt suffix in
+`.cargo-home-SUFFIX`, including underscores in names such as
+`linux-musl_amd64-0123456789abcdef0123456789abcdef` (issue #50). A suffix starts
+with an ASCII letter or digit, contains at least two characters, and permits
+only letters, digits, underscores and hyphens. Keeping the exact suffix preserves
+the cache identity expected by native readiness and subsequent admission.
+Invalid source roots or suffixes produce a specific stderr diagnostic before
+the generator emits any program. The existing source-root constraints, exclusive
+private-home creation and immutable seed verification remain in force. These
+internal naming rules do not change the public platform registry.
+
+Run `bash scripts/tests/test_cargo_cache.sh PrivateCargoHomeGeneratorTests` for
+both generators' accepted names, invalid inputs and diagnostics. With genuine
+Cargo/rustc available, the Unix test also prepares two independent underscore
+attempts, reuses the retained seed after removing the ambient cache and dependency
+origin, compiles offline, verifies final source/cache admission, and refuses a
+duplicate attempt without altering its receipts. It uses the host compiler;
+musl artifact and native Windows qualification remain separate requirements.
+
 ## Relocated ambient cache roots
 
 An operator may store `$CARGO_HOME/registry` or `$CARGO_HOME/git` on another
@@ -202,5 +223,6 @@ source and link targets. The source-authentication suite separately verifies the
 copied Git object chains and refuses retargeted links and nested-root escapes.
 Git/tar reconstruction
 alone is not claimed as native compiler, complete DSR orchestration, or public
-release qualification. Windows has its separate cache backend and is unchanged.
+release qualification. Windows has its separate cache backend; the generator
+checks above do not qualify its native filesystem execution.
 No fleet performance improvement or exact dependency-minimality is claimed.
