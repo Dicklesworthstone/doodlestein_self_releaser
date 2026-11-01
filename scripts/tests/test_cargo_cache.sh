@@ -590,6 +590,42 @@ class UnscopedGitSeedTests(unittest.TestCase):
     git = LockedCacheTests.git
     make_git_database = LockedCacheTests.make_git_database
 
+    def test_checkout_only_seed_does_not_create_private_git_namespace(self):
+        (self.source / 'git/db').rename(self.root / 'retained-database')
+        checkout = self.source / 'git/checkouts/unselected/revision'
+        checkout.mkdir(parents=True)
+        (checkout / 'LICENSE').symlink_to('/missing/unselected-license')
+        receipt = self.snapshot()
+        self.assertFalse((self.home / 'git').exists())
+        self.assertEqual(receipt['caches'], ['registry'])
+        self.assertEqual(receipt['file_count'], 2)
+        self.assertTrue((checkout / 'LICENSE').is_symlink())
+        self.invoke('verify', self.home, receipt['receipt_path'])
+
+    def test_database_appearing_after_checkout_only_copy_is_refused(self):
+        (self.source / 'git/db').rename(self.root / 'retained-database')
+        import ast
+        code = Path(MODULE).read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY\n', 1)[0]
+        definitions = ast.parse(code)
+        definitions.body = [node for node in definitions.body if isinstance(
+            node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef))]
+        namespace = {}
+        exec(compile(definitions, MODULE, 'exec'), namespace)
+        original = namespace['inventory']
+
+        def database_after_copy(root, destination=None, **kwargs):
+            result = original(root, destination, **kwargs)
+            if root == str(self.source) and destination is not None:
+                database = self.source / 'git/db/appeared'
+                database.mkdir(parents=True)
+                (database / 'HEAD').write_text('ref: refs/heads/main\n')
+            return result
+
+        namespace['inventory'] = database_after_copy
+        with self.assertRaisesRegex(namespace['Failure'], 'cache selection changed'):
+            namespace['main'](['snapshot', str(self.source), str(self.home)])
+        self.assertFalse(self.home.exists())
+
     def test_issue_39_unrelated_checkout_license_link_does_not_abort(self):
         checkout = self.source / 'git/checkouts/k9/revision'
         checkout.mkdir(parents=True)

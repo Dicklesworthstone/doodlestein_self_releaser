@@ -564,6 +564,11 @@ def unscoped_selection(source, roots=None):
                         raise Failure('Git database cache is not a real directory: ' + relative)
                     selected[root][name] = None
                     anchors[relative] = stable(info)
+                if categories is not None and not selected[root]:
+                    # Unselected checkouts alone do not create a private Git
+                    # namespace. Keep the root/missing-db anchors: an eligible
+                    # database appearing during the copy must still refuse.
+                    del selected[root]
                 if (stable(os.fstat(parent)) != anchors[root] or
                         (roots is None and stable(os.stat(root, dir_fd=home, follow_symlinks=False)) != anchors[root])):
                     raise Failure('cache root changed during seed selection: ' + root)
