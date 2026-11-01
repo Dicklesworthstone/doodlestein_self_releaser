@@ -779,8 +779,13 @@ current nonce and metadata still prove ownership.
 Downstream dispatch uses a persistent outbox keyed by the source repository and
 GitHub release ID. Accepted destinations are skipped across process restarts;
 definitively rejected destinations can retry, and uncertain POSTs require an
-explicit resend decision. The complete request plan and verified public release
-are retained. Before each POST, DSR rechecks the release ID, visibility, tag
+explicit resend decision. Authentication, dependency, and local preparation
+failures known to occur before transport are recorded as `blocked` and can resume
+normally. Their receipts count zero HTTP attempts, or only earlier definitive
+rate-limit rejections if preparation fails before a later retry. Missing
+receipts, interrupted transports, and unreadable transport outcomes remain
+uncertain. The complete request plan and verified public release are retained.
+Before each POST, DSR rechecks the release ID, visibility, tag
 commit, and exact paginated asset inventory, downloading and hashing assets when
 GitHub supplies no digest. Changed plans or publication evidence refuse delivery.
 Explicit `dispatch.enabled: false` in repository or global configuration remains

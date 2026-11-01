@@ -32,6 +32,7 @@ if [[ "$repo" == owner/b ]]; then
     case "${DP_MODE:-}" in
         reject) code=422 ;;
         uncertain) code=000; rc=28 ;;
+        auth-like-transport) code=000; rc=3 ;;
         cooldown) code=429; extra=$'Retry-After: 86400\r\n' ;;
         unknown-cooldown) code=429; extra=$'Retry-After: Wed, 21 Oct 2030 07:28:00 GMT\r\n' ;;
         elapsed) code=429; extra=$'Retry-After: 0\r\n' ;;
@@ -45,7 +46,16 @@ printf '{}' > "$output"
 printf '%s' "$code"
 exit "$rc"
 CURL
-chmod +x "$WORK/bin/curl"
+cat > "$WORK/bin/gh" <<'GH'
+#!/usr/bin/env bash
+set -uo pipefail
+[[ "$*" == 'auth token --hostname github.com' ]] || exit 9
+printf 'lookup\n' >> "$DP_CASE/auth-lookups"
+lookups=$(wc -l < "$DP_CASE/auth-lookups")
+if (( lookups == ${DP_AUTH_FAIL_AT:-0} )); then exit 1; fi
+printf '%s' fixture-token
+GH
+chmod +x "$WORK/bin/curl" "$WORK/bin/gh"
 # shellcheck source=/dev/null
 source "$MODULE"
 PIN=1111111111111111111111111111111111111111
@@ -58,7 +68,7 @@ check() {
 new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"
     export DP_CASE="$CASE" DSR_STATE_DIR="$CASE/state" DSR_GH_TOKEN=fixture-token
-    unset DP_MODE DRY_RUN
+    unset DP_MODE DP_AUTH_FAIL_AT DP_PREPARE_FAIL DRY_RUN
     : > "$CASE/calls.jsonl"
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -68,6 +78,14 @@ count() { wc -l < "$CASE/calls.jsonl"; }
 without_auth() (
     unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
     gh() { return 1; }; secrets_get_gh_token() { return 1; }
+    "$@"
+)
+
+# Auth lookup is an executable boundary. A counter survives the real nested
+# subshells so failure can occur after intent publication, before any POST.
+with_rotating_auth() (
+    unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+    unset -f gh secrets_get_gh_token
     "$@"
 )
 
@@ -288,6 +306,106 @@ STATE=$(state_path)
 check 'missing credentials do not mark pending work as uncertain' jq -e 'all(.deliveries[];.history==[])' "$STATE"
 capture release
 check 'adding credentials resumes initial plan' test "$status" -eq 0
+
+for lookup in 2 3; do
+    new_case "auth-after-intent-$lookup"
+    export DP_AUTH_FAIL_AT="$lookup"
+    capture with_rotating_auth release --repos owner/a
+    check "auth lookup $lookup keeps the dependency exit" test "$status" -eq 3
+    check "auth lookup $lookup starts no HTTP request" test "$(count)" -eq 0
+    STATE=$(state_path)
+    check "auth lookup $lookup records known unsent work" jq -e \
+        '.deliveries[0].history[0] | .outcome=="blocked" and .receipt.attempts==0 and
+         .receipt.exit_code==3 and .receipt.http_status==null' "$STATE"
+    unset DP_AUTH_FAIL_AT
+    capture with_rotating_auth release --repos owner/a
+    check "auth lookup $lookup resumes without uncertain authorization" test "$status" -eq 0
+    check "auth lookup $lookup recovery sends exactly one request" test "$(count)" -eq 1
+    check "auth lookup $lookup preserves the zero-attempt refusal" jq -e \
+        '.deliveries[0].history | length==2 and .[0].receipt.attempts==0 and
+         .[1].receipt.attempts==1 and .[1].outcome=="accepted" and
+         .[1].resend_uncertain==false' "$STATE"
+done
+
+new_case preflight-after-accepted-peer
+export DP_AUTH_FAIL_AT=5
+capture with_rotating_auth release
+check 'late credential failure preserves the dependency exit' test "$status" -eq 3
+check 'late credential failure never sends the unfinished destination' test "$(count)" -eq 1
+STATE=$(state_path)
+accepted_before=$(jq -Sc '.deliveries[0]' "$STATE")
+check 'accepted and known-unsent destinations remain distinct' jq -e \
+    '[.deliveries[].history[-1].outcome]==["accepted","blocked"] and
+     .deliveries[1].history[-1].receipt.attempts==0' "$STATE"
+unset DP_AUTH_FAIL_AT
+capture with_rotating_auth release
+check 'ordinary retry completes only known-unsent work' test "$status" -eq 0
+check 'ordinary retry never duplicates the accepted peer' test "$(count)" -eq 2
+check 'accepted peer retains its original evidence' test "$(jq -Sc '.deliveries[0]' "$STATE")" = "$accepted_before"
+check 'safe retry does not claim uncertain-resend permission' jq -e \
+    '.deliveries[1].history[1].outcome=="accepted" and
+     .deliveries[1].history[1].resend_uncertain==false' "$STATE"
+
+new_case auth-after-rate-limit
+export DP_MODE=elapsed DP_AUTH_FAIL_AT=4
+capture with_rotating_auth release --repos owner/b
+check 'credential loss after rate limiting stays a dependency failure' test "$status" -eq 3
+check 'credential loss does not invent a second POST' test "$(count)" -eq 1
+STATE=$(state_path)
+check 'blocked retry retains its actual earlier HTTP attempt' jq -e \
+    '.deliveries[0].history[0] | .outcome=="blocked" and .receipt.attempts==1 and
+     .receipt.exit_code==3 and .receipt.http_status==null' "$STATE"
+unset DP_MODE DP_AUTH_FAIL_AT
+capture with_rotating_auth release --repos owner/b
+check 'definitively rejected earlier POST permits ordinary recovery' test "$status" -eq 0
+check 'rate-limit recovery sends only the required next POST' test "$(count)" -eq 2
+check 'rate-limit recovery needs no uncertain resend' jq -e \
+    '.deliveries[0].history[1].resend_uncertain==false' "$STATE"
+
+# Inject only local temporary-file preparation errors. The real outbox and
+# delivery worker must retain blocked receipts before a transport can start.
+for phase in directory body headers code; do
+    new_case "prepare-$phase"
+    export DP_PREPARE_FAIL="$phase"
+    mktemp() {
+        local selected
+        if [[ "$*" == *"/dsr-dispatch.XXXXXXXX"* ]]; then
+            [[ "$DP_PREPARE_FAIL" != directory ]] || return 19
+            selected=$(command mktemp "$@") || return $?
+            mkdir "$selected/$DP_PREPARE_FAIL" || return 1
+            printf '%s\n' "$selected"
+        else
+            command mktemp "$@"
+        fi
+    }
+    capture release --repos owner/a
+    unset -f mktemp
+    check "$phase preparation failure keeps its local error" test "$status" -eq 1
+    check "$phase preparation failure starts no POST" test "$(count)" -eq 0
+    STATE=$(state_path)
+    check "$phase preparation failure retains a zero-attempt receipt" jq -e \
+        '.deliveries[0].history[0] | .outcome=="blocked" and .receipt.attempts==0 and
+         .receipt.exit_code==1 and .receipt.http_status==null' "$STATE"
+    capture release --repos owner/a
+    check "$phase preparation failure resumes without uncertain authorization" test "$status" -eq 0
+    check "$phase recovery records only the actual HTTP attempt" jq -e \
+        '.deliveries[0].history | length==2 and .[0].receipt.attempts==0 and
+         .[1].receipt.attempts==1 and .[1].resend_uncertain==false' "$STATE"
+    check "$phase recovery sends exactly once" test "$(count)" -eq 1
+done
+
+new_case transport-auth-like-exit
+export DP_MODE=auth-like-transport
+capture release
+check 'a transport return code alone cannot prove that no POST ran' test "$status" -eq 8
+check 'transport ambiguity retains its actual HTTP attempt' test "$(count)" -eq 2
+STATE=$(state_path)
+check 'nonempty transport status remains uncertain' jq -e \
+    '.deliveries[1].history[0] | .outcome=="uncertain" and .receipt.attempts==1 and
+     .receipt.exit_code==8' "$STATE"
+unset DP_MODE
+capture release
+check 'ordinary retry never replays an ambiguous transport' test "$status,$(count)" = 8,2
 
 new_case no-state
 capture release --status
