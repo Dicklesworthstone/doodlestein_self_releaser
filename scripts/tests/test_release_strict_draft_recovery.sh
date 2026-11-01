@@ -23,7 +23,9 @@ except ImportError:
 
 root = Path(sys.argv[1])
 os.umask(0o077)
-work = Path(tempfile.mkdtemp(prefix='dsr-strict-finalize-'))
+# Private receipt descriptors require canonical absolute parents. System temp
+# directories may themselves be exposed through a symlink (macOS /var).
+work = Path(tempfile.mkdtemp(prefix='dsr-strict-finalize-')).resolve()
 source = Path(os.environ.get('DSR_TEST_COMMAND_FILE', str(root / 'dsr'))).read_text()
 names = re.findall(r'^(_release_[A-Za-z0-9_]+)\(\) \{', source, re.M)
 names += ['_source_release_read_private_receipt', '_source_release_metadata_matches',
@@ -522,10 +524,13 @@ check('custom handoff publishes only its owned draft',len(patches)==1 and
 check('custom handoff retains original creation response',
       response.read_bytes()==raw and response.stat().st_ino==before.st_ino)
 finalized=list((c/'state/releases').glob('*-finalized.*'))
+# The receipt binds physical paths, including a symlinked system temp root
+# (macOS exposes /private/var through /var). Compare against that exact root.
+canonical_custom=custom.resolve()
 check('custom finalization receipt binds canonical manifest and asset paths',
       len(finalized)==1 and
-      json.loads(finalized[0].read_text())['plan']['manifest_file']==str(custom/'app-v1.2.3-manifest.json') and
-      all(Path(a['path']).parent==custom for a in json.loads(finalized[0].read_text())['plan']['assets']))
+      json.loads(finalized[0].read_text())['plan']['manifest_file']==str(canonical_custom/'app-v1.2.3-manifest.json') and
+      all(Path(a['path']).parent==canonical_custom for a in json.loads(finalized[0].read_text())['plan']['assets']))
 
 for label,filename in [('custom-payload-tamper','payload.tar.gz'),
                        ('custom-signature-tamper','payload.tar.gz.minisig')]:
