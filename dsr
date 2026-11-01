@@ -178,10 +178,10 @@ COMMANDS:
     report      Recent runs, failures and throttling
     version     Detect and tag versions from version files
     canary      Test installers in Docker containers
-    installer   Generate and validate curl|bash installers
+    installer   Generate installers and install authenticated releases
     sbom        Generate Software Bill of Materials
     slsa        Generate SLSA provenance attestation
-    docker      Build multi-arch Docker images
+    docker      Build, release, verify and attest container images
     verify      Verification commands (upgrade checks)
 
 GLOBAL OPTIONS:
@@ -15510,14 +15510,22 @@ cmd_installer() {
 
     case "$subcmd" in
         generate|validate) ;;
+        generate-release|install|describe-recipe)
+            _dsr_require installer_release_cli
+            installer_release_cli "$subcmd" "$@"
+            return $?
+            ;;
         --help|-h|help|"")
             cat << 'EOF'
-dsr installer - Generate and validate curl|bash installers
+dsr installer - Generate installers and install authenticated releases
 
 USAGE:
     dsr installer generate <tool>... [--output-dir DIR] [--dry-run]
     dsr installer generate --all [--output-dir DIR] [--dry-run]
     dsr installer validate <tool>... [--output-dir DIR]
+    dsr installer generate-release --policy FILE --public-key FILE --output FILE [--dry-run]
+    dsr installer install (--snapshot DIR | --fetch) --recipe FILE --prefix DIR [release policy...]
+    dsr installer describe-recipe --recipe FILE [--release-contract FILE --targets LIST]
 
 DESCRIPTION:
     Writes <output-dir>/<tool>/install.sh from repos.d/<tool>.yaml: platform
@@ -15533,10 +15541,22 @@ DESCRIPTION:
 
     validate checks syntax, ShellCheck and the required safety elements.
 
+    generate-release captures an explicit pinned release policy and trust key
+    in a standalone authenticated installer. install authenticates the complete
+    signed snapshot and atomically selects an executable/runtime-data generation.
+    These actions require exact release identity and trust inputs; they do not
+    discover a release or fall back to source. Each action's --help lists its
+    strict engine options. --json wraps its authoritative result in one envelope.
+    Generator dry-run validates without writing output or its lock. Installation
+    dry-run authenticates and extracts without changing the prefix; --fetch still
+    downloads the complete signed snapshot. describe-recipe is always read-only.
+
 EXIT CODES:
     0  - All installers generated/valid
     1  - Some tools failed
     4  - Invalid arguments or tool configuration
+
+    Authenticated actions preserve their engine's documented exit codes.
 EOF
             return 0
             ;;
@@ -16250,17 +16270,8 @@ cmd_docker() {
     shift 2>/dev/null || true
 
     case "$subcmd" in
-        build)
-            _docker_build "$@"
-            ;;
-        release)
-            _docker_release "$@"
-            ;;
-        sign)
-            _docker_sign "$@"
-            ;;
-        setup)
-            _docker_setup "$@"
+        build|release|sign|setup|verify|attest)
+            _docker_command "$subcmd" "$@"
             ;;
         --help|-h|help|"")
             cat << 'EOF'
@@ -16271,22 +16282,30 @@ USAGE:
     dsr docker release <tool> <version> --certificate-identity <id>
                        --certificate-oidc-issuer <https-url> [options]
     dsr docker sign <registry/repository@sha256:<digest>>
-    dsr docker setup
+    dsr docker verify <registry/repository@sha256:<digest>> [options]
+    dsr docker attest <registry/repository@sha256:<digest>> [options]
+    dsr docker setup [--dry-run]
 
 SUBCOMMANDS:
     build     Build multi-arch Docker image
     release   Build, push, sign, and attest image
     sign      Sign a digest-pinned image with cosign (keyless)
-    setup     Setup buildx builder
+    verify    Verify the image signature and every platform's SBOM attestation
+    attest    Repair platform SBOM attestations without rebuilding
+    setup     Prepare the named Buildx builder without changing global selection
 
 OPTIONS:
     --push              Push to GHCR after build (build only)
     --local             Build for local platform only (build only)
-    -p, --platform      Platforms (build only; default: linux/amd64,linux/arm64)
-    --skip-sign         Skip cosign signing (release only)
+    --repo-path DIR     Source checkout for build/release
+    --dockerfile FILE   Dockerfile inside the source checkout
+    --tag TAG           Additional explicit tag (repeatable; build/release)
+    --output OCI_TAR    OCI archive destination (build only)
+    -p, --platform      Exact Linux platform list (build/release/verify/attest)
+    --skip-sign         Skip the image signature only; SBOM checks remain
     --certificate-identity, --certificate-oidc-issuer
                         Keyless identity the release verifies its signature
-                        and SBOM attestation against (release only; or set
+                        and SBOM attestation against (release/verify/attest; or set
                         DOCKER_CERTIFICATE_IDENTITY / _OIDC_ISSUER)
     -n, --dry-run       Show what would be done
 
@@ -16305,239 +16324,76 @@ EXAMPLES:
         --certificate-oidc-issuer https://token.actions.githubusercontent.com
     dsr docker sign ghcr.io/dicklesworthstone/ubs@sha256:<64-hex digest>
                                              # Tags are refused: sign the digest
+    dsr --json --dry-run docker setup         # Plan without contacting Docker
 
 EXIT CODES:
     0  - Success
     1  - Build/operation failed
     3  - Dependency error (docker/buildx/cosign)
     4  - Invalid arguments
-    7  - No Dockerfile found
+    7  - Missing Dockerfile or invalid/mismatched evidence
+    8  - Registry read failed
 EOF
             return 0
             ;;
         *)
-            log_error "Unknown docker subcommand: $subcmd"
-            log_info "Run 'dsr docker --help' for usage"
-            return 4
+            _docker_command "$subcmd" "$@"
             ;;
     esac
 }
 
-_docker_build() {
-    local tool=""
-    local version=""
-    local push=false
-    local local_only=false
-    local platforms=""
-    local dry_run=false
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --push) push=true; shift ;;
-            --local) local_only=true; shift ;;
-            --platform|-p) platforms="$2"; shift 2 ;;
-            --dry-run|-n) dry_run=true; shift ;;
-            --help|-h) docker_build --help; return 0 ;;
-            -*) log_error "Unknown option: $1"; return 4 ;;
-            *)
-                if [[ -z "$tool" ]]; then
-                    tool="$1"
-                elif [[ -z "$version" ]]; then
-                    version="$1"
-                fi
-                shift
-                ;;
+# The module owns argument validation and operation receipts. This adapter only
+# adds DSR's envelope; successful planning is not evidence of completed work.
+_docker_command() {
+    local operation="$1" command_name=docker exit_code=0 output='' receipt=null
+    local dry="${DRY_RUN:-false}" help_requested=false arg start=$SECONDS details
+    shift
+    case "$operation" in
+        build|release|sign|setup|verify|attest) command_name="docker-$operation" ;;
+    esac
+    if ! $JSON_MODE; then
+        docker_command "$operation" "$@"
+        return $?
+    fi
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n) dry=true ;;
+            --help|-h) help_requested=true ;;
         esac
     done
-
-    if [[ -z "$tool" || -z "$version" ]]; then
-        log_error "Tool and version required"
-        log_info "Usage: dsr docker build <tool> <version>"
-        return 4
-    fi
-
-    local start_time
-    start_time=$(date +%s)
-
-    local args=(--tool "$tool" --version "$version")
-    $push && args+=(--push)
-    $local_only && args+=(--local)
-    [[ -n "$platforms" ]] && args+=(--platform "$platforms")
-    $dry_run && args+=(--dry-run)
-
-    # As in _docker_release: the module's stdout JSON belongs in the envelope.
-    local build_output="" exit_code=0
-    if $JSON_MODE; then
-        build_output=$(docker_build "${args[@]}") || exit_code=$?
-    else
-        docker_build "${args[@]}" || exit_code=$?
-    fi
-    local duration=$(($(date +%s) - start_time))
-    if [[ $exit_code -eq 0 ]]; then
-        if $JSON_MODE; then
-            local image="$DOCKER_REGISTRY/$tool:v${version#v}"
-            json_envelope "docker-build" "ok" 0 "$(jq -nc \
-                --arg tool "$tool" \
-                --arg version "$version" \
-                --arg image "$image" \
-                --argjson pushed "$push" \
-                --arg result "$build_output" \
-                --argjson duration "$duration" \
-                '{tool: $tool, version: $version, image: $image, pushed: $pushed, duration_seconds: $duration,
-                  result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
+    output=$(docker_command "$operation" "$@") || exit_code=$?
+    if [[ -n "$output" ]]; then
+        if ! receipt=$(jq -ce -s 'if length == 1 and (.[0] | type == "object") then .[0]
+            else error("expected one operation receipt") end' <<< "$output" 2>/dev/null); then
+            receipt=null
+            if [[ $exit_code -eq 0 ]]; then
+                log_error 'Container operation did not return one JSON receipt'
+                exit_code=1
+            fi
         fi
-        return 0
+    elif [[ $exit_code -eq 0 ]] && ! $help_requested; then
+        log_error 'Container operation returned no receipt'
+        exit_code=1
     fi
-    if $JSON_MODE; then
-        json_envelope "docker-build" "error" "$exit_code" "$(jq -nc \
-            --arg tool "$tool" \
-            --arg version "$version" \
-            --arg result "$build_output" \
-            --argjson duration "$duration" \
-            '{tool: $tool, version: $version, duration_seconds: $duration,
-              result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
-    fi
-    return $exit_code
-}
-
-_docker_release() {
-    local tool=""
-    local version=""
-    local skip_sign=false
-    local dry_run=false
-    local -a policy_args=()
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --skip-sign) skip_sign=true; shift ;;
-            --dry-run|-n) dry_run=true; shift ;;
-            # The module verifies signatures and SBOM attestations against this
-            # keyless policy (also DOCKER_CERTIFICATE_IDENTITY/_OIDC_ISSUER).
-            --certificate-identity|--certificate-oidc-issuer)
-                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
-                    log_error "$1 requires a value"
-                    return 4
-                fi
-                policy_args+=("$1" "$2")
-                shift 2
-                ;;
-            --help|-h) docker_release --help; return 0 ;;
-            -*) log_error "Unknown option: $1"; return 4 ;;
-            *)
-                if [[ -z "$tool" ]]; then
-                    tool="$1"
-                elif [[ -z "$version" ]]; then
-                    version="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-
-    if [[ -z "$tool" || -z "$version" ]]; then
-        log_error "Tool and version required"
-        log_info "Usage: dsr docker release <tool> <version> [--certificate-identity ID --certificate-oidc-issuer URL] [--skip-sign] [--dry-run]"
-        return 4
-    fi
-
-    local start_time
-    start_time=$(date +%s)
-
-    local args=(--tool "$tool" --version "$version")
-    $skip_sign && args+=(--skip-sign)
-    $dry_run && args+=(--dry-run)
-    [[ ${#policy_args[@]} -eq 0 ]] || args+=("${policy_args[@]}")
-
-    # The module prints its plan/result JSON on stdout. In --json mode that
-    # document goes inside the envelope, so stdout stays a single document.
-    local release_output="" exit_code=0
-    if $JSON_MODE; then
-        release_output=$(docker_release "${args[@]}") || exit_code=$?
-    else
-        docker_release "${args[@]}" || exit_code=$?
-    fi
-    local duration=$(($(date +%s) - start_time))
-    if [[ $exit_code -eq 0 ]]; then
-        if $JSON_MODE; then
-            local image="$DOCKER_REGISTRY/$tool:v${version#v}"
-            json_envelope "docker-release" "ok" 0 "$(jq -nc \
-                --arg tool "$tool" \
-                --arg version "$version" \
-                --arg image "$image" \
-                --arg result "$release_output" \
-                --argjson duration "$duration" \
-                '{tool: $tool, version: $version, image: $image, duration_seconds: $duration,
-                  result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
-        fi
-        return 0
-    fi
-    if $JSON_MODE; then
-        json_envelope "docker-release" "error" "$exit_code" "$(jq -nc \
-            --arg tool "$tool" \
-            --arg version "$version" \
-            --arg result "$release_output" \
-            --argjson duration "$duration" \
-            '{tool: $tool, version: $version, duration_seconds: $duration,
-              result: (if $result == "" then null else ($result | try fromjson catch $result) end)}')"
-    fi
-    return $exit_code
-}
-
-_docker_sign() {
-    local image=""
-    local dry_run=false
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dry-run|-n) dry_run=true; shift ;;
-            --help|-h) docker_sign --help; return 0 ;;
-            -*)
-                log_error "Unknown option: $1"
-                return 4
-                ;;
-            *)
-                [[ -z "$image" ]] && image="$1"
-                shift
-                ;;
-        esac
-    done
-
-    if [[ -z "$image" ]]; then
-        log_error "Image reference required"
-        log_info "Usage: dsr docker sign <image>"
-        return 4
-    fi
-
-    local args=("$image")
-    $dry_run && args+=(--dry-run)
-
-    if docker_sign "${args[@]}"; then
-        if $JSON_MODE; then
-            json_envelope "docker-sign" "ok" 0 "$(jq -nc --arg image "$image" '{image: $image, signed: true}')"
-        fi
-        return 0
-    else
-        local exit_code=$?
-        if $JSON_MODE; then
-            json_envelope "docker-sign" "error" "$exit_code" "$(jq -nc --arg image "$image" '{image: $image, signed: false}')"
-        fi
-        return $exit_code
-    fi
-}
-
-_docker_setup() {
-    if docker_setup_buildx; then
-        if $JSON_MODE; then
-            json_envelope "docker-setup" "ok" 0 "$(jq -nc --arg builder "$DOCKER_BUILDER_NAME" '{builder: $builder, ready: true}')"
-        fi
-        return 0
-    else
-        local exit_code=$?
-        if $JSON_MODE; then
-            json_envelope "docker-setup" "error" "$exit_code" '{"ready": false}'
-        fi
-        return $exit_code
-    fi
+    details=$(jq -nc --argjson result "$receipt" --argjson code "$exit_code" \
+        --arg operation "$operation" --argjson dry "$dry" --argjson duration "$((SECONDS-start))" '
+        ($result // {}) as $r | ($r.build // $r) as $build |
+        {status:(if $code != 0 then "error" elif $result == null then "help" else $r.status end),
+         dry_run:($dry or ($r.status == "planned")),duration_seconds:$duration,result:$result} +
+        (if $build.tool then {tool:$build.tool,version:$build.version} else {} end) +
+        (if ($build.tags[0] // $r.reference // $build.reference) then
+            {image:($build.tags[0] // $r.reference // $build.reference)} else {} end) +
+        (if $code != 0 then {}
+         elif $operation == "build" or $operation == "release" then
+            {pushed:($build.status == "built" and $build.exporter == "registry")}
+         elif $operation == "sign" then {signed:($r.signed == true),verified:false}
+         elif $operation == "setup" then
+            {ready:($code == 0 and $r.ready == true)} + (if $r.builder then {builder:$r.builder} else {} end)
+         else {} end)') || return 1
+    local envelope_status=success
+    [[ $exit_code -eq 0 ]] || envelope_status=error
+    json_envelope "$command_name" "$envelope_status" "$exit_code" "$details"
+    return "$exit_code"
 }
 
 # ============================================================================

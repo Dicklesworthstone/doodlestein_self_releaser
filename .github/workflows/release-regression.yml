@@ -14,6 +14,8 @@ on:
       - src/release_packaging_pipeline.sh
       - src/release_install.sh
       - src/install_gen_release.sh
+      - src/installer_release_cli.sh
+      - src/docker.sh
       - src/platforms.sh
       - src/slsa.sh
       - src/slsa_remote.sh
@@ -27,6 +29,7 @@ on:
       - 'scripts/xwin*.sh'
       - 'scripts/tests/test_xwin*.sh'
       - schemas/manifest.json
+      - schemas/envelope.json
       - scripts/tests/test_json_schemas.sh
       - scripts/tests/test_cargo_cache.sh
       - scripts/tests/test_cargo_sources.sh
@@ -47,6 +50,9 @@ on:
       - scripts/tests/test_release_install_fetch.sh
       - scripts/tests/test_release_install_variants.sh
       - scripts/tests/test_generated_release_installer.sh
+      - scripts/tests/test_installer_release_cli.sh
+      - scripts/tests/test_docker_release.sh
+      - tests/unit/test_docker.bats
       - scripts/tests/test_slsa_snapshot.sh
       - scripts/tests/test_release_source_only.sh
       - scripts/tests/test_release_source_only_exact_tag.sh
@@ -61,6 +67,40 @@ concurrency:
   group: release-regression-refs/heads/main
   cancel-in-progress: false
 jobs:
+  container-workflow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install container contract regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats jq python3 python3-jsonschema shellcheck tar
+          mkdir -p "$RUNNER_TEMP/container-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/container-evidence/head.txt"
+      - name: Validate public container commands and immutable evidence gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n dsr
+          bash -n src/docker.sh
+          bash -n scripts/tests/test_docker_release.sh
+          shellcheck -S warning src/docker.sh scripts/tests/test_docker_release.sh
+          bash scripts/tests/test_docker_release.sh 2>&1 | tee "$RUNNER_TEMP/container-evidence/container-workflow.log"
+          bats tests/unit/test_docker.bats 2>&1 | tee "$RUNNER_TEMP/container-evidence/container-unit.log"
+          test -z "$(git status --porcelain)"
+      - name: Retain container workflow evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: container-workflow-evidence
+          path: ${{ runner.temp }}/container-evidence
+          retention-days: 7
+          if-no-files-found: error
   build-recovery:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -151,16 +191,17 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq python3 minisign shellcheck gcc tar zip unzip xz-utils util-linux
+          sudo apt-get install -y --no-install-recommends jq python3 python3-jsonschema minisign shellcheck gcc tar zip unzip xz-utils util-linux
           mkdir -p "$RUNNER_TEMP/installation-evidence"
           git rev-parse HEAD > "$RUNNER_TEMP/installation-evidence/head.txt"
       - name: Validate complete authenticated installation generations
         shell: bash
         run: |
           set -euo pipefail
-          files=(src/release_install.sh src/install_gen_release.sh
+          files=(src/release_install.sh src/install_gen_release.sh src/installer_release_cli.sh
                  scripts/tests/test_release_install.sh scripts/tests/test_release_install_fetch.sh
-                 scripts/tests/test_release_install_variants.sh scripts/tests/test_generated_release_installer.sh)
+                 scripts/tests/test_release_install_variants.sh scripts/tests/test_generated_release_installer.sh
+                 scripts/tests/test_installer_release_cli.sh)
           for source in "${files[@]}"; do
             bash -n "$source"
             shellcheck -S warning "$source"
@@ -169,6 +210,7 @@ jobs:
           bash scripts/tests/test_release_install_variants.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/signed-variants-and-data.log"
           bash scripts/tests/test_release_install_fetch.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/fetch.log"
           bash scripts/tests/test_generated_release_installer.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/generated-installer.log"
+          bash scripts/tests/test_installer_release_cli.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/public-installer.log"
           test -z "$(git status --porcelain)"
       - name: Retain installation validation evidence
         if: always()

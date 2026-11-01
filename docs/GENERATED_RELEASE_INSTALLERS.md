@@ -8,7 +8,7 @@ installer code at runtime. The release payloads are still authenticated by the
 embedded policy before the complete executable and runtime-data generation is activated.
 
 This is an explicit per-release generator, exposed through
-`src/release_install.sh generate-installer`. It does not silently change the
+`dsr installer generate-release`. It does not silently change the
 older `install_gen_create` templates, their version discovery, or source-build
 fallback. Those configurations do not supply the independent source/build and
 complete-matrix policy this installer requires.
@@ -185,13 +185,21 @@ that the claimed compiler was executed. Select a compatible variant deliberately
 ## Generate and inspect
 
 ```bash
-bash src/release_install.sh generate-installer \
+dsr installer generate-release \
   --policy /srv/policies/demo-release.json \
   --public-key /srv/keys/release.pub \
   --output /srv/installers/demo-v1.2.3.sh
 
 bash /srv/installers/demo-v1.2.3.sh --inspect
 ```
+
+The public command uses the existing `install_gen_release.sh` engine. The
+low-level `bash src/release_install.sh generate-installer ...` entry point and
+sourceable `install_gen_release` API remain available with the same arguments.
+`dsr --json installer generate-release ...` wraps the engine's complete result
+in one standard envelope with `details.action: "generate-release"`; the engine
+status and exit code remain authoritative. Without `--json`, it prints the
+engine's JSON generation receipt directly.
 
 The generator reads the existing DSR installation's `release_install.sh`,
 `slsa_remote.sh`, `slsa.sh`, `platforms.sh`, `packaging.sh`, `sbom_release.sh`, `sbom.sh`, and
@@ -214,6 +222,17 @@ an existing executable installer without changing its inode. A different script
 requires explicit generator `--replace`; no source module, key or policy file may
 be selected as its output. Input paths and timestamps are not embedded in the
 identity. Public-key comments are normalized; the key token remains exact.
+
+Add generator `--dry-run`, or use the global `dsr --dry-run`, to review the exact
+prospective installer without publishing it. The plan performs the same
+policy/key/module admission, recipe normalization, Python/Bash syntax checks,
+input-stability checks and existing-output replacement checks. Its
+`status: "planned"` result includes the script hash, policy hash, embedded engine
+hashes and whether an existing installer would be reused. Conflicting existing
+output still requires `--replace`. Planning stages in private temporary storage;
+it does not create or change the selected output or adjacent lock, and does not
+reserve either against another writer. Real publication repeats the validation
+and checks the selected output under its normal cooperating-writer lock.
 
 ## Consumers: one file, one installation command
 
@@ -290,6 +309,13 @@ automatically adopt future engine fixes, key revocation or chronological
 anti-rollback policy: regenerate and redistribute under the intended policy.
 
 ## Tests
+
+`bash scripts/tests/test_installer_release_cli.sh` exercises the public
+`generate-release`, `describe-recipe` and `install` commands with real Minisign
+signatures and inert payload fixtures. It covers planning without output or
+lock changes, exact planned/published script hashes, invalid policy/key refusal,
+replacement consent, public JSON envelopes, complete activation and rollback,
+integrity failures, and cancellation. It uses no network or compiler.
 
 Run `bash scripts/tests/test_generated_release_installer.sh`. The suite generates
 and executes the actual standalone script, removes the original DSR/policy/key

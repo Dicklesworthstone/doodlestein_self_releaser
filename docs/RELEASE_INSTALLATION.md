@@ -1,6 +1,6 @@
 # Install an authenticated application generation
 
-`src/release_install.sh` installs explicitly selected executables and runtime data from a signed
+`dsr installer install` installs explicitly selected executables and runtime data from a signed
 [release snapshot](RELEASE_SNAPSHOTS.md). It authenticates the whole snapshot,
 extracts selected archive members, verifies a complete installation generation,
 and switches one managed `current` pointer. It does not publish, build,
@@ -9,7 +9,7 @@ files. This is an explicit consumer command, not a silent change to the generate
 curl-bash installers or ordinary `dsr release` policy.
 
 For a distributable per-release script with embedded engines, recipes and trust
-policy, use `generate-installer` as described in
+policy, use `dsr installer generate-release` as described in
 [generated release installers](GENERATED_RELEASE_INSTALLERS.md). Consumers can
 then use online or offline installation without a DSR checkout or repeated
 policy/key arguments.
@@ -20,7 +20,7 @@ Use `--fetch` instead of `--snapshot DIR` to fetch the exact selected signed
 release into private staging and install from those authenticated bytes:
 
 ```bash
-bash src/release_install.sh --fetch \
+dsr installer install --fetch \
   --recipe /srv/policies/demo-install.json --prefix /home/alice/.local/demo \
   --repo OWNER/REPO --tag v1.2.3 --sha "$REVIEWED_SOURCE_COMMIT" \
   --builder "$TRUSTED_BUILDER_ID" --public-key /srv/keys/release.pub \
@@ -58,6 +58,22 @@ produces the same generation identity; transport receipts are not part of that
 identity. Every online retry fetches again rather than trusting a cached success.
 Use the separate `fetch-release` command to keep an offline snapshot permanently.
 
+The public command delegates to the same strict `src/release_install.sh` engine.
+Use `dsr installer install --help` for its complete argument list. It accepts no
+release-discovery or source-build fallback options. Global `dsr --dry-run` and
+installation `--dry-run` both authenticate and extract without activating a
+generation; online mode still downloads the complete snapshot.
+
+With `dsr --json installer install ...`, stdout contains one standard DSR
+envelope. `details` retains the engine's complete result, including
+`authenticated`, `status`, `generation`, selected files, and `activated` when
+activation was attempted. The envelope's exit code agrees with the process and
+the engine. `details.action` identifies `install`. A signal to the public DSR
+process is forwarded to the engine, which finishes its cleanup and returns its
+actual activation state. If activation already completed, that committed result
+remains authoritative. Without `--json`, the engine's JSON receipt is printed
+directly. `--help` prints usage, or one help envelope in JSON mode.
+
 Run `bash scripts/tests/test_release_install_fetch.sh` for the full fetch,
 offline authentication and installation handoff. GitHub transport and Minisign
 are explicit fixtures, not live HTTP or native cryptographic acceptance tests.
@@ -93,6 +109,17 @@ armv7; macOS on amd64 or arm64; and FreeBSD on amd64. Windows payloads may be pr
 release snapshot but are not installed on POSIX hosts. This check authenticates
 the producer's platform claim; it is not independent executable-format or loader
 qualification. The installer does not execute a candidate to discover its platform.
+
+Review a recipe without downloading or authenticating a release:
+
+```bash
+dsr --json installer describe-recipe --recipe /srv/policies/demo-install.json
+```
+
+Add both `--release-contract FILE` and `--targets LIST` to validate it against an
+independent complete release contract. This command uses the installation
+engine's normalizer and always reports `authenticated: false`; a valid recipe
+does not establish that the named release assets exist or are signed.
 
 ## Select runtime data
 
@@ -152,7 +179,7 @@ have an existing parent and be new, empty, or already owned by this installer.
 It must not overlap the snapshot, recipe or public key.
 
 ```bash
-bash src/release_install.sh \
+dsr installer install \
   --snapshot /srv/downloads/demo-v1.2.3 \
   --recipe /srv/policies/demo-install.json \
   --prefix /home/alice/.local/demo \
@@ -283,6 +310,17 @@ Snapshot/cryptographic failures preserve their underlying nonzero status.
 Missing Python itself returns dependency exit `3` before the JSON engine starts.
 
 ## Validation
+
+Run `bash scripts/tests/test_installer_release_cli.sh` for the public command
+path. It uses the actual DSR executable, generator, archive handling and
+installation engine with real Minisign signatures over small private fixtures.
+It verifies dry-run output/lock/prefix preservation, standalone inspection,
+complete executable/data activation, retry, replacement, rollback, exact
+ownership and compiler selection, and refusal of signed-subject corruption.
+Cancellation is tested through the public PID before activation and through an
+explicit result-delivery boundary after the real engine has already committed.
+No network, compiler or installed payload is executed by this suite. The
+existing legacy installer commands remain separate regression controls.
 
 Run `bash scripts/tests/test_release_install.sh`. It starts with the actual
 snapshot fetch/verification flow, then executes the real installer CLI and

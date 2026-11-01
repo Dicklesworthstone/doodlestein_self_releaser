@@ -1331,7 +1331,51 @@ predecessor receipt information. Retain these private receipts between attempts.
 
 ### `dsr installer`
 
-Generate and validate standalone installers from registered tool configuration.
+Generate installers, or authenticate and install an exact signed release.
+
+#### Authenticated release commands
+
+```bash
+dsr installer generate-release --policy /absolute/policy.json \
+  --public-key /absolute/release.pub --output /absolute/install.sh
+
+dsr installer describe-recipe --recipe /absolute/recipe.json
+
+dsr installer install --snapshot /absolute/snapshot \
+  --recipe /absolute/recipe.json --prefix /absolute/prefix \
+  --repo OWNER/TOOL --tag v1.2.3 --sha "$SOURCE_SHA" \
+  --builder "$BUILDER" --targets "$TARGETS" --public-key /absolute/release.pub
+```
+
+These commands use the authenticated release engines' strict argument parsing
+and exact identity, target, compiler-variant and trust policy. `install` accepts
+either a complete local `--snapshot` or explicit `--fetch`; it authenticates the
+complete signed inventory before installing the recipe's executable and runtime
+data set. Changing an existing managed generation requires `--replace`.
+Recipe inspection validates policy and reports `authenticated: false`.
+See [authenticated installation](RELEASE_INSTALLATION.md) for the snapshot,
+recipe, independent contract and activation requirements.
+
+Both global `--dry-run` and command-local `--dry-run` are supported for
+`generate-release` and `install`. Generation validates the policy, key, captured
+engines, recipes, resulting script and existing-output conflict before returning
+a plan. It does not create the selected output or its adjacent lock. Installation
+planning authenticates and extracts into private staging without activating a
+generation or changing the managed prefix. With `--fetch`, planning still fetches
+and authenticates the exact release. A plan is an observation, not a reservation;
+execution repeats the validation and concurrency checks.
+
+With global `--json`, the command emits one standard envelope with
+`command: "installer"`. `details.action` identifies `generate-release`, `install`
+or `describe-recipe`; all authoritative engine fields remain in `details`,
+including `status`, `activated`, `authenticated` and any reported error. The
+envelope exit code matches the process result. A successful plan has outer
+`status: "success"` and `details.status: "planned"`; it does not claim activation
+or authenticated generation. Help is returned as help text within the envelope.
+See [standalone release installers](GENERATED_RELEASE_INSTALLERS.md) for pinned
+generator policy and distribution trust.
+
+#### Registered-tool installer generation
 
 ```bash
 dsr installer generate <tool>... [--output-dir DIR] [--dry-run]
@@ -1431,6 +1475,52 @@ builds require a preinstalled compiler. Safe, offline, and required-signature
 source restrictions still apply. The source receipt records the selected
 toolchain and distribution evidence when provisioning occurs. See
 [installer generation](INSTALLER_GENERATION.md) for pinning and verification.
+
+---
+
+### `dsr docker`
+
+Build, publish, sign, verify and repair container evidence through the shared
+container module parser.
+
+```bash
+dsr docker build TOOL VERSION --repo-path /absolute/project \
+  --dockerfile docker/Dockerfile --output /absolute/image.oci.tar
+dsr docker release TOOL VERSION --repo-path /absolute/project \
+  --platform linux/amd64,linux/arm64 \
+  --certificate-identity "$SIGNER" --certificate-oidc-issuer "$ISSUER"
+dsr docker verify "$PINNED_IMAGE" --platform linux/amd64,linux/arm64 \
+  --certificate-identity "$SIGNER" --certificate-oidc-issuer "$ISSUER"
+dsr docker attest "$PINNED_IMAGE" \
+  --certificate-identity "$SIGNER" --certificate-oidc-issuer "$ISSUER"
+dsr docker sign "$PINNED_IMAGE"
+dsr docker setup --dry-run
+```
+
+`PINNED_IMAGE` is an independently selected `REPOSITORY@sha256:DIGEST`.
+`build` forwards explicit context, Dockerfile, platform, repeated tag and output
+options to the module. `release` uses registry export and retains every digest,
+platform, signer, SPDX and final inventory verification gate. `verify` checks
+published evidence without building, scanning, logging in, signing or uploading.
+`attest` regenerates and verifies per-platform SBOM attestations, but reports the
+root signature as `not_checked`; a subsequent `verify` checks that signature.
+`sign` alone reports signing without claiming independent signature verification.
+
+Global and command-local dry runs validate and return plans without Docker,
+registry, scanning, signing, builder setup or output publication. In particular,
+`setup --dry-run` does not inspect, create or bootstrap a builder. Planning does
+not establish registry access or credential validity. Missing option values and
+unexpected positional arguments fail with exit code 4.
+
+Global `--json` returns exactly one standard envelope using the command name
+`docker-build`, `docker-release`, `docker-sign`, `docker-setup`, `docker-verify`
+or `docker-attest`. `details.result` preserves the complete module receipt;
+`details.status` and `details.dry_run` identify its operation state. Successful
+plans use outer `status: "success"` with `details.status: "planned"`; completion
+fields such as `pushed`, `signed` and `ready` remain false. Failures preserve the
+module's nonzero exit status and do not claim completed publication or verification.
+See [container workflows](CONTAINERS.md) for the full exporter, evidence and trust
+contracts and the standalone module entry points.
 
 ---
 

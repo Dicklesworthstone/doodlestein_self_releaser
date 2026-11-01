@@ -1,23 +1,24 @@
 # Container builds and releases
 
-The `src/docker.sh` module implements the container workflow tracked by
-`bd-1jt.3.8`. Docker, Buildx, Syft and Cosign remain external tools. It does not
-install toolchains, enable emulation, or change your globally selected builder.
+The public `dsr docker` commands and the standalone `src/docker.sh` module share
+the container workflow tracked by `bd-1jt.3.8`. Docker, Buildx, Syft and Cosign
+remain external tools. The workflow does not install toolchains, enable emulation,
+or change your globally selected builder.
 
 ## Build outputs
 
 ```bash
 # Plan without contacting Docker, the registry, or signing services.
-bash src/docker.sh build tool 1.2.3 --repo-path /path/to/tool --push --dry-run
+dsr docker build tool 1.2.3 --repo-path /path/to/tool --push --dry-run
 
 # Push a version tag. Add --tag latest explicitly when appropriate.
-bash src/docker.sh build tool 1.2.3 --repo-path /path/to/tool --push
+dsr docker build tool 1.2.3 --repo-path /path/to/tool --push
 
 # Without --push or --local, export an OCI archive instead of a hidden cache-only result.
-bash src/docker.sh build tool 1.2.3 --repo-path /path/to/tool --output /tmp/tool.oci.tar
+dsr docker build tool 1.2.3 --repo-path /path/to/tool --output /tmp/tool.oci.tar
 
 # Load one platform into the local Docker image store.
-bash src/docker.sh build tool 1.2.3 --repo-path /path/to/tool --local --platform linux/arm64
+dsr docker build tool 1.2.3 --repo-path /path/to/tool --local --platform linux/arm64
 ```
 
 Defaults are `DOCKER_REGISTRY=ghcr.io/dicklesworthstone`,
@@ -56,12 +57,12 @@ must be valid Docker tags; unsupported syntax is rejected, not rewritten.
 
 ```bash
 # Use the exact identity and issuer expected in your Fulcio certificate.
-bash src/docker.sh release tool 1.2.3 --repo-path /path/to/tool \
+dsr docker release tool 1.2.3 --repo-path /path/to/tool \
   --certificate-identity builder@example.com \
   --certificate-oidc-issuer https://oauth2.sigstore.dev/auth
 
 # Planning does not require signing credentials or invoke external tools.
-bash src/docker.sh release-json tool 1.2.3 --repo-path /path/to/tool --dry-run
+dsr --json docker release tool 1.2.3 --repo-path /path/to/tool --dry-run
 ```
 
 Choose the identity and issuer from your own signing policy, not from whichever
@@ -117,13 +118,13 @@ skipped.
 
 ```bash
 # The digest must be selected independently, not a mutable tag.
-bash src/docker.sh verify ghcr.io/OWNER/tool@sha256:EXPECTED_DIGEST \
+dsr docker verify ghcr.io/OWNER/tool@sha256:EXPECTED_DIGEST \
   --platform linux/amd64,linux/arm64 \
   --certificate-identity builder@example.com \
   --certificate-oidc-issuer https://oauth2.sigstore.dev/auth
 
 # Complete attestations for an already-pushed image after a partial failure.
-bash src/docker.sh attest ghcr.io/OWNER/tool@sha256:EXPECTED_DIGEST \
+dsr docker attest ghcr.io/OWNER/tool@sha256:EXPECTED_DIGEST \
   --certificate-identity builder@example.com \
   --certificate-oidc-issuer https://oauth2.sigstore.dev/auth
 ```
@@ -144,21 +145,56 @@ check the root signature; its receipt says `signature: "not_checked"`. A later
 `verify` checks that root signature as well. This is evidence recovery, not a
 cached scan resume: scans run again and signature-service prompts may recur.
 
-Standalone `sign` and `attest` accept immutable qualified references only. They
+`sign`, `verify`, and `attest` accept immutable qualified references only. They
 do not resolve mutable tags separately between scanning and signing. Global
-`DRY_RUN=true` is honored by all entry points; plans are reported as `planned`,
-not completed builds or releases.
+`dsr --dry-run`, command-local `--dry-run`, and the sourced module's `DRY_RUN=true`
+are honored before contacting Docker, scanning, signing, or creating outputs.
+The setup command also honors planning before checking or bootstrapping a builder:
+
+```bash
+dsr --json --dry-run docker setup
+dsr docker setup
+```
+
+Setup uses `DOCKER_BUILDER_NAME` without changing the globally selected builder.
+Its receipt distinguishes `planned` from completed `ready` status. Standalone
+signing returns `signed: true` only after Cosign accepts the operation, and always
+reports `verified: false`: signing alone does not perform the independent policy
+check available through `verify` and required by `release`.
+
+## Public command receipts
+
+All six public commands use the module's argument parser. `build` and `release`
+accept the same source paths, nested Dockerfiles, repeated explicit tags, and
+platform selections as the standalone module; OCI `--output` remains build-only.
+Missing flag values, unsupported options, extra positional arguments, and mutable
+verification/signing references fail with argument error 4. Verification retains
+its evidence mismatch code 7 and registry-read code 8.
+
+Without `--json`, stdout is the module's single operation receipt. With `--json`,
+`dsr` returns one standard envelope whose `details.result` preserves that entire
+receipt. Diagnostics stay on stderr. Overall `status: "success"` means the
+requested operation or plan completed; use `details.status` and `details.dry_run`
+to distinguish planning from effects. A successful plan has
+`details.status: "planned"` and `details.dry_run: true`. It never reports
+`pushed: true`, `signed: true`, or `ready: true`.
+
+Completed operations report `built`, `signed`, `ready`, or `verified` in
+`details.status`, according to their evidence. Attestation recovery's
+`details.result.signature` remains `not_checked`; verification and release report
+the independently checked signature result. Failures return a nonzero process
+status and a matching error envelope. Completion flags are omitted on failure,
+because a failed registry/signing operation may already have partial effects.
 
 `build-json` and `release-json` preserve the operation's nonzero exit status while
 emitting a JSON error object. Diagnostics are separate from the structured
 `result`. Sourced APIs are `docker_build`, `docker_release`, `docker_sign`,
 `docker_attest_sbom`, `docker_verify_release`, `docker_build_json`, and
-`docker_release_json`. Existing
-`dsr docker` dispatch uses these same library functions; the standalone commands
-also expose all module options without the monolithic CLI's older argument parser.
-The new `verify` operation is exposed by `bash src/docker.sh verify`, not yet by
-the monolithic CLI. Trust policy environment variables also work for its existing
-release dispatch.
+`docker_release_json`, and `docker_setup`. `docker_command` provides the shared
+dispatch used by both `dsr docker` and `bash src/docker.sh`. The standalone
+`build-json` and `release-json` convenience wrappers retain their existing module
+envelope, including top-level `status: "planned"` for plans. Trust policy
+environment variables work with both entry points.
 
 Existing Docker credential configuration remains usable. For GHCR, explicitly
 set `DSR_GH_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` (in that precedence order) to log
@@ -198,6 +234,8 @@ local observations, not independently signed release certificates.
 
 ```bash
 bash scripts/tests/test_docker_release.sh
+# Only the actual public CLI contract, publication, verification, and recovery cases:
+bash scripts/tests/test_docker_release.sh --cli-only
 bats tests/unit/test_docker.bats
 ```
 
@@ -207,5 +245,9 @@ not perform native container builds, registry uploads, OIDC, or cryptographic
 verification. Registry manifests in the fixture have real computed content
 digests; bad-index, missing-platform, mismatched-config, moved-tag, false-success,
 wrong-subject, wrong-predicate, multiple-attestation and interrupted-evidence
-cases exercise the real orchestration and validation code. Live tool integration
+cases exercise the real orchestration and validation code. Public CLI cases also
+cover both dry-run placements, exact argument forwarding, single truthful JSON
+envelopes, read-only verification, and attestation repair followed by independent
+verification. The suite additionally validates envelopes against the repository's
+JSON Schema when Python's `jsonschema` package is available. Live tool integration
 is a separate validation requirement.
