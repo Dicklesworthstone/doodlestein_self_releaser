@@ -1098,6 +1098,16 @@ Cargo-generated version 3/4 lockfiles. Unused patch records are parsed but never
 contribute resolved-package authority. No Python installation is needed on the
 Windows build host.
 
+Strict native source export checks the ordinary Git tar stream against the
+selected committed tree before choosing the transfer bytes. Complete archives
+retain their existing bytes and hashes, including when export attributes have
+no effect. When Git export attributes omit or substitute committed content,
+the coordinator uses its authenticated raw-object exporter to retain the
+complete source inventory and original blob bytes. Archive generation or
+parsing failures refuse export; they do not authorize a fallback. The comparison
+streams file contents without an additional archive spool. Staging, relocation,
+final verification and exact-run resume derive the same selected archive hash.
+
 Strict native project snapshots expand initialized submodules recursively from
 the gitlink commits in their parent trees. The coordinator's shared Git object
 reader authenticates every commit, tree and blob, then streams a deterministic
@@ -1113,8 +1123,9 @@ External administration pointers, alternates, linked object stores, missing or
 wrong-type objects and configuration includes are refused. No submodule URL is
 fetched, and a child HEAD cannot override its parent's selected commit. Each
 source archive has a shared limit of 100000 Git tree entries, 256 repositories
-and 16 nested submodule levels. Recursive export requires Python 3.9+ on the
-coordinator; it adds no Python requirement to Windows build hosts.
+and 16 nested submodule levels. Archive selection and recursive export require
+Python 3.9+ on the coordinator; they add no Python requirement to Windows build
+hosts.
 
 The Unix and Windows receivers admit only the manifest's exact directory and
 file inventory, including empty nested submodules. Links cannot leave their

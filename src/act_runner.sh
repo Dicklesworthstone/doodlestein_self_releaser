@@ -5252,7 +5252,11 @@ _act_source_archive_export() {
     # shellcheck source=src/xwin_source.sh
     source "$module_dir/xwin_source.sh" || return 3
     commit=$(_act_strict_git -C "$repo_path" rev-parse --verify "${revision}^{commit}" 2>/dev/null) || return 4
-    source_archive_export "$repo_path" "$commit" "$kind"
+    if [[ "$kind" == compare ]]; then
+        source_archive_matches_git "$repo_path" "$commit"
+    else
+        source_archive_export "$repo_path" "$commit" "$kind"
+    fi
 }
 
 _act_stream_git_archive() {
@@ -5260,7 +5264,18 @@ _act_stream_git_archive() {
     _act_source_has_gitlinks "$1" "$2" || status=$?
     case "$status" in
         0) _act_source_archive_export "$1" "$2" archive ;;
-        1) _act_strict_git -C "$1" archive --format=tar "$2" 2>/dev/null ;;
+        1)
+            # Keep every already-admitted legacy archive byte-identical.
+            # Attribute declarations alone do not imply a changed tree: an
+            # export-subst file without a token still has its committed bytes.
+            status=0
+            _act_source_archive_export "$1" "$2" compare || status=$?
+            case "$status" in
+                0) _act_strict_git -C "$1" archive --format=tar "$2" 2>/dev/null ;;
+                10) _act_source_archive_export "$1" "$2" archive ;;
+                *) return "$status" ;;
+            esac
+            ;;
         *) return "$status" ;;
     esac
 }

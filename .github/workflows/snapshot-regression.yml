@@ -4,6 +4,8 @@ on:
     branches: [main]
     paths:
       - src/act_runner.sh
+      - src/xwin_source.sh
+      - src/config.sh
       - scripts/tests/test_unix_snapshot_batch.sh
       - .github/workflows/snapshot-regression.yml
   workflow_dispatch:
@@ -30,18 +32,26 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == Linux ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends python3 git tar mawk grep coreutils dash
+            sudo apt-get install -y --no-install-recommends python3 git tar mawk grep coreutils dash jq golang-go ripgrep
           else
             command -v python3 >/dev/null || brew install python
             command -v git >/dev/null || brew install git
+            for tool in jq go; do
+              command -v "$tool" >/dev/null || brew install "$tool"
+            done
+            command -v rg >/dev/null || brew install ripgrep
             if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
             echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           fi
+          mkdir -p "$RUNNER_TEMP/dsr-test-bin"
+          GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
+          echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
       - name: Verify generated snapshot program against real Git and filesystem mutations
         shell: bash
         run: |
           set -euo pipefail
           git diff --check
           bash -n src/act_runner.sh
+          bash -n src/xwin_source.sh
           bash -n scripts/tests/test_unix_snapshot_batch.sh
           bash scripts/tests/test_unix_snapshot_batch.sh
