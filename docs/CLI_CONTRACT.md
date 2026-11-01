@@ -600,6 +600,19 @@ was launched; it does not assert that a compiler ran. Existing immutable worker
 receipts remain available for exact-run resume, and a failed coordinator receipt
 write does not create a reported `result_path`. A retained nonempty malformed
 receipt still causes resume to refuse; it is not overwritten or accepted.
+The same rule applies when resume cannot checkpoint an already verified
+sidecar or a retry-budget decision. Its original outcome, attempt and existing
+receipt remain observable while the coordinator stops and drains active peers.
+Saved attempt counters and build purposes are checked before resumed dispatch;
+later checkpoint-read failures return an explicit coordinator error without
+inventing an unknown attempt count. A new durable reservation supersedes the
+previous failed observation even if cancellation precedes worker launch.
+Missing or unadmitted sidecars are not reported as result files, and a reserved
+but unstarted attempt does not acquire a nonexistent build log on recovery.
+Actual INT/TERM interruption retains exit code 130. These recovery boundaries
+are exercised by `test_act_orchestration.sh --resume-persistence-only` and the
+existing dispatch-reservation CI gate using real local processes and controlled
+producer/checkpoint faults; they do not qualify native build hosts.
 The aggregate failed count includes all unsuccessful requested tasks, including
 skipped tasks. An interrupted run remains resumable and cannot publish an
 authoritative manifest.

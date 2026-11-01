@@ -612,7 +612,8 @@ for jobs, crash_mode in sidecar_cases:
             prior = before['target_statuses'][targets[0]]
             check(case.name + '/' + phase + ': exhausted target preserves dispatch identity and failed state',
                   failed['status'] == 'failed' and failed['attempt'] == 1 and
-                  failed['log_path'] == prior['log_path'] and failed['result_path'] == prior['result_path'] and
+                  failed['log_path'] == prior['log_path'] and
+                  (failed.get('result_path') == prior['result_path'] if known_failure else 'result_path' not in failed) and
                   failed.get('retry_limit_exceeded') is True and not failed.get('resume_reused') and
                   saved['status'] == 'failed' and saved['result'] == failed and
                   state['status'] == 'partial' and
@@ -636,7 +637,7 @@ for jobs, crash_mode in sidecar_cases:
                       failed['receipt_source'] == 'coordinator' and
                       not any(key in failed for key in ('worker_exit_code', 'artifact_path',
                                                        'artifact_paths', 'resume_artifacts')) and
-                      not Path(failed['result_path']).exists() and
+                      'result_path' not in failed and not prior_path.exists() and
                       unavailable_receipt.read_bytes() == unavailable_bytes and
                       len(list(workspace.glob('results/*.json'))) == 5)
             check(case.name + '/' + phase + ': successful work and every retained receipt remain unchanged',
@@ -944,6 +945,7 @@ source "$DSR_RES_PROJECT/src/build_state.sh"
 source "$DSR_RES_MODULE"
 eval "$(declare -f build_state_update_target | sed '1s/build_state_update_target/_real_target_update/')"
 eval "$(declare -f build_state_update_host | sed '1s/build_state_update_host/_real_host_update/')"
+eval "$(declare -f build_state_get | sed '1s/build_state_get/_real_state_read/')"
 wait_for_active_peer() {
     [[ "$DSR_RES_JOBS" != 1 ]] || return 0
     local deadline=$((SECONDS + 15))
@@ -953,6 +955,40 @@ wait_for_active_peer() {
     done
 }
 build_state_update_target() {
+    if [[ "$DSR_RES_MODE" == resume-* && "$3" == "$DSR_RES_FAULT_TARGET" &&
+          ( "$4" == completed || "$4" == failed ) ]]; then
+        if [[ "$DSR_RES_PHASE" == first ]] ||
+           { [[ "$DSR_RES_PHASE" == resume-refusal ]] &&
+             { [[ "$DSR_RES_MODE" == resume-budget* ]] && jq -e '.result.retry_limit_exceeded == true' <<< "$5" >/dev/null; }; }; then
+            return 1
+        fi
+        if [[ "$DSR_RES_PHASE" == resume-refusal && "$DSR_RES_MODE" != resume-budget* &&
+              "$DSR_RES_MODE" != resume-counter && "$DSR_RES_MODE" != resume-purpose &&
+              "$DSR_RES_MODE" != resume-reservation-signal ]]; then
+            jq -e '.reconciled_from_sidecar == true' <<< "$5" >/dev/null || return 90
+            wait_for_active_peer || return 1
+            return 1
+        fi
+    fi
+    if [[ "$DSR_RES_PHASE" == resume-refusal && "$DSR_RES_MODE" == resume-reservation-signal &&
+          "$3" == "$DSR_RES_FAULT_TARGET" && "$4" == running ]]; then
+        _real_target_update "$@" || return $?
+        wait_for_active_peer || return 1
+        kill -TERM "$BASHPID"
+        return 0
+    fi
+    if [[ "$DSR_RES_PHASE" == resume-refusal && "$3" == linux/amd64 && "$4" == running &&
+          ( "$DSR_RES_MODE" == resume-counter || "$DSR_RES_MODE" == resume-purpose ) ]]; then
+        _real_target_update "$@" || return $?
+        local corrupt='{"attempts":"untrusted"}'
+        if [[ "$DSR_RES_MODE" == resume-purpose ]]; then
+            corrupt='{"result":{"platform":"linux/arm64","task_key":"linux/arm64","status":"failed","build_purpose":"diagnostic-native","publishable":false}}'
+        fi
+        # Corrupt only this owned checkpoint after admission, through the real
+        # state writer. Immutable worker receipts and all other entries stay intact.
+        _real_target_update "$1" "$2" "$DSR_RES_FAULT_TARGET" running "$corrupt" "$6"
+        return $?
+    fi
     if [[ ( "$DSR_RES_PHASE" == first || "$DSR_RES_PHASE" == cli ) &&
           "$3" == "$DSR_RES_FAULT_TARGET" &&
           ( "$4" == completed || "$4" == failed ) &&
@@ -975,7 +1011,25 @@ build_state_update_target() {
     fi
     _real_target_update "$@"
 }
+build_state_get() {
+    if [[ "$DSR_RES_PHASE" == resume-refusal && -n "${worker_pids[0]:-}" &&
+          ( "$DSR_RES_MODE" == resume-counter || "$DSR_RES_MODE" == resume-purpose ) ]]; then
+        wait_for_active_peer || return 1
+    fi
+    if [[ "$DSR_RES_PHASE" == resume-refusal && "$DSR_RES_MODE" == resume-aggregation &&
+          "${interrupted:-false}" == true && "${active_workers:-0}" == 0 ]]; then
+        # Model an unreadable queued counter after the owned workers are
+        # drained. Do not rewrite the saved checkpoint or any sidecar.
+        _real_state_read "$@" | jq '.target_statuses["darwin/arm64"].attempts = "untrusted"'
+        return $?
+    fi
+    _real_state_read "$@"
+}
 build_state_update_host() {
+    if [[ "$DSR_RES_PHASE" == first && "$DSR_RES_MODE" == resume-unstarted &&
+          "$3" == "host-${DSR_RES_FAULT_TARGET//\//-}" && "$4" == running ]]; then
+        return 1
+    fi
     if [[ ( "$DSR_RES_PHASE" == first || "$DSR_RES_PHASE" == cli ) &&
           "$3" == "host-${DSR_RES_FAULT_TARGET//\//-}" &&
           ( "$4" == completed || "$4" == failed ) &&
@@ -1013,7 +1067,8 @@ selector_release_slot() { return 0; }
 act_run_native_build() {
     local hold=false outcome=success
     if [[ "$DSR_RES_PHASE" == first && "$DSR_RES_JOBS" == 3 &&
-          "$DSR_RES_MODE" != crash && "$DSR_RES_MODE" != signal && "$2" == linux/amd64 ]]; then hold=true; fi
+          "$DSR_RES_MODE" != crash && "$DSR_RES_MODE" != signal &&
+          "$DSR_RES_MODE" != resume-* && "$2" == linux/amd64 ]]; then hold=true; fi
     if [[ "$DSR_RES_PHASE" == first && "$DSR_RES_JOBS" == 2 && "$2" == linux/arm64 ]]; then
         hold=true
     fi
@@ -1025,6 +1080,13 @@ act_run_native_build() {
         case "$DSR_RES_MODE" in
             failed-*|completion-receipt) outcome=failure ;;
         esac
+    fi
+    if [[ "$DSR_RES_MODE" == resume-* ]]; then
+        if [[ "$DSR_RES_PHASE" == first && "$2" == linux/amd64 ]]; then outcome=failure; fi
+        if [[ "$DSR_RES_PHASE" == first && "$2" == "$DSR_RES_FAULT_TARGET" &&
+              ( "$DSR_RES_MODE" == resume-failed || "$DSR_RES_MODE" == resume-budget* ||
+                "$DSR_RES_MODE" == resume-reservation-signal ) ]]; then outcome=failure; fi
+        if [[ "$DSR_RES_PHASE" == resume-refusal && "$DSR_RES_JOBS" == 3 && "$2" == linux/amd64 ]]; then hold=true; fi
     fi
     python3 "$DSR_RES_PAYLOAD" "$DSR_RES_CASE" "$2" "$attempt" "$hold" "$outcome"
 }
@@ -1043,17 +1105,20 @@ if [[ "$DSR_RES_PHASE" == cli ]]; then
     cmd_build reservationfixture --version 1.0.0 --no-sync --jobs "$DSR_RES_JOBS" \
         --output-dir "$DSR_RES_CASE/output"
 else
+    orchestration_status=0
     act_orchestrate_build reservationfixture 1.0.0 --parallel-jobs "$DSR_RES_JOBS" \
-        --no-source-sync-gate --output-dir "$DSR_RES_CASE/output" "${args[@]}"
+        --no-source-sync-gate --output-dir "$DSR_RES_CASE/output" "${args[@]}" || orchestration_status=$?
+    trap -p INT TERM > "$DSR_RES_CASE/$DSR_RES_PHASE.caller-traps"
+    exit "$orchestration_status"
 fi
 ''')
 
 
-def invoke(case, run, jobs, mode, phase):
+def invoke(case, run, jobs, mode, phase, retry_max=3):
     env = dict(os.environ, DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
                DSR_CONFIG_DIR=str(case / 'config'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
                ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
-               DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='3', NO_COLOR='1',
+               DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX=str(retry_max), NO_COLOR='1',
                DSR_RES_PROJECT=str(project), DSR_RES_MODULE=str(module), DSR_RES_PAYLOAD=str(payload),
                DSR_RES_CASE=str(case), DSR_RES_RUN=run, DSR_RES_JOBS=str(jobs),
                DSR_RES_MODE=mode, DSR_RES_PHASE=phase,
@@ -1073,11 +1138,202 @@ def invoke(case, run, jobs, mode, phase):
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
             raise
-    value = None if code == -signal.SIGKILL else read(case / (phase + '.stdout'))
+    value = None if code == -signal.SIGKILL or not (case / (phase + '.stdout')).stat().st_size else read(case / (phase + '.stdout'))
     if phase == 'cli':
         run = value['details']['run_id']
     state = read(case / 'state/builds/reservationfixture/1.0.0' / run / 'state.json')
     return code, value, state
+
+
+def resume_fixture(label):
+    case = root / label
+    for directory in ('config/repos.d', 'state', 'cache', 'source', 'output'):
+        (case / directory).mkdir(parents=True, exist_ok=True)
+    hosts = {target: 'host-' + target.replace('/', '-') for target in targets}
+    (case / 'config/hosts.yaml').write_text(json.dumps({
+        'schema_version': '1.0.0', 'platform_mapping': hosts,
+        'hosts': {host: {'platform': target, 'connection': 'local'} for target, host in hosts.items()}}))
+    (case / 'config/repos.d/reservationfixture.yaml').write_text(json.dumps({
+        'tool_name': 'reservationfixture', 'repo': 'fixture/reservationfixture', 'language': 'go',
+        'local_path': str(case / 'source'), 'binary_name': 'fixture', 'targets': targets,
+        'cross_compile': {target: {'host': host} for target, host in hosts.items()}}))
+    return case, str(uuid.uuid4())
+
+
+resume_cases = [] if sys.argv[3] == '--completion-persistence-only' else (
+    [(jobs, mode) for jobs in (1, 3) for mode in ('resume-success', 'resume-failed', 'resume-unstarted')] +
+    [(1, 'resume-budget'), (1, 'resume-budget-missing'), (1, 'resume-budget-empty'),
+     (3, 'resume-counter'), (3, 'resume-purpose'), (3, 'resume-aggregation')])
+for jobs, mode in resume_cases:
+    case, run = resume_fixture('jobs-%d-%s' % (jobs, mode))
+    workspace = case / 'state/builds/reservationfixture/1.0.0' / run
+    # The real serial producer leaves target one failed and target two's
+    # completed sidecar ahead of its checkpoint. Target three never starts.
+    seed_code, seed, seed_state = invoke(case, run, 1, mode, 'first')
+    original_entry = seed_state['target_statuses'][targets[1]]
+    original_path = Path(original_entry['result_path'])
+    original_receipt = read(original_path)
+    original_bytes = original_path.read_bytes()
+    unstarted = mode == 'resume-unstarted'
+    budget = mode.startswith('resume-budget')
+    check(case.name + ': actual seed retains an uncheckpointed immutable target outcome',
+          seed_code == 4 and original_entry['status'] == 'running' and not original_entry.get('result') and
+          original_entry['attempts'] == 1 and seed_state['target_statuses'][targets[2]]['attempts'] == 0 and
+          Counter(event['target'] for event in events(case)) ==
+          Counter({targets[0]: 1, **({} if unstarted else {targets[1]: 1})}))
+    missing_path = None
+    if mode in ('resume-budget-missing', 'resume-budget-empty'):
+        missing_path = case / 'retained-unavailable-sidecar.json'
+        original_path.rename(missing_path)
+        if mode == 'resume-budget-empty':
+            original_path.write_bytes(b'')
+    immutable = {path: path.read_bytes() for directory in (case / 'output', workspace / 'logs', workspace / 'results')
+                 for path in directory.rglob('*') if path.is_file() and
+                 not (mode == 'resume-budget-empty' and path == original_path)}
+    code, result, state = invoke(case, run, jobs, mode, 'resume-refusal', retry_max=1 if budget else 3)
+    row, peer, queued = result['targets'][1], result['targets'][0], result['targets'][2]
+    reason = ('Invalid or unavailable source synchronization/readiness/build attempt counters' if mode == 'resume-counter'
+              else 'Resume target result has missing or different build purpose' if mode == 'resume-purpose'
+              else 'Could not persist retry-budget outcome' if budget
+              else 'Could not persist recovered target outcome')
+    check(case.name + ': resume failure remains a first-cause coordinator error, not operator interruption',
+          code == 4 and result['exit_code'] == 4 and result['status'] == 'failed' and
+          reason in result['error'] and targets[1] in result['error'] and state['status'] == 'failed')
+    check(case.name + ': refused resume does not allocate a new attempt for recovered or queued work',
+          len([event for event in events(case) if event['target'] == targets[1]]) == int(not unstarted) and
+          not any(event['target'] == targets[2] for event in events(case)) and
+          state['target_statuses'][targets[2]]['attempts'] == 0)
+    if mode in ('resume-counter', 'resume-purpose'):
+        check(case.name + ': invalid authority is an explicit refusal without borrowed receipt paths',
+              row['status'] == 'failed' and row['exit_code'] == 4 and row['stage'] == 'resume' and
+              row['execution_started'] is False and row['receipt_source'] == 'coordinator' and
+              not any(key in row for key in ('result_path', 'log_path', 'artifact_path', 'resume_artifacts')) and
+              (('attempt' not in row) if mode == 'resume-counter' else row['attempt'] == 1))
+    elif mode in ('resume-budget-missing', 'resume-budget-empty'):
+        check(case.name + ': missing historical receipt never becomes a reported file or observed worker exit',
+              row['status'] == 'failed' and row['exit_code'] == 6 and row['attempt'] == 1 and
+              row['stage'] == 'resume' and row['retry_limit_exceeded'] is True and
+              'result_path' not in row and 'worker_exit_code' not in row and
+              missing_path.read_bytes() == original_bytes)
+        if mode == 'resume-budget-empty':
+            check(case.name + ': an empty sidecar stays unmodified and never becomes admitted receipt evidence',
+                  original_path.is_file() and original_path.read_bytes() == b'')
+    else:
+        check(case.name + ': failed checkpoint preserves the verified historical outcome and attempt',
+              row['status'] == original_receipt['status'] and row['exit_code'] == original_receipt['exit_code'] and
+              row['attempt'] == 1 and row['result_path'] == str(original_path) and
+              original_path.read_bytes() == original_bytes and
+              bool(row.get('retry_limit_exceeded')) == budget)
+        if original_receipt['status'] == 'success':
+            check(case.name + ': recovered success retains actual execution and complete frozen artifact evidence',
+                  row.get('resume_reused') is True and row['execution_started'] is True and
+                  row['resume_artifacts'] == original_receipt['resume_artifacts'])
+        if unstarted:
+            check(case.name + ': a coordinator dispatch refusal remains explicitly unstarted after recovery',
+                  row['execution_started'] is False and row['stage'] == 'dispatch' and
+                  'log_path' not in original_receipt and 'log_path' not in row and not row.get('resume_artifacts'))
+    if mode == 'resume-aggregation':
+        check(case.name + ': aggregation refuses unreadable history without inventing an attempt or changing the first cause',
+              queued['status'] == 'failed' and queued['exit_code'] == 4 and 'attempt' not in queued and
+              'result_path' not in queued and 'log_path' not in queued and
+              result['error'] == 'Could not persist recovered target outcome for ' + targets[1])
+    else:
+        check(case.name + ': queued target remains unstarted with its original zero-attempt history',
+              queued['status'] == 'skipped' and queued['exit_code'] == 4 and queued['attempt'] == 0 and
+              queued['execution_started'] is False and result['error'] in queued['error'] and
+              'result_path' not in queued and 'log_path' not in queued)
+    check(case.name + ': coordinator failures leave caller INT and TERM dispositions usable',
+          not (case / 'resume-refusal.caller-traps').read_text())
+    if jobs == 3:
+        check(case.name + ': started peer is cancelled with the actual second attempt and receipt',
+              peer['status'] == 'failed' and peer['exit_code'] == 130 and peer['attempt'] == 2 and
+              peer['execution_started'] is True and Path(peer['result_path']).is_file())
+        event = next(event for event in events(case) if event['target'] == targets[0] and event['attempt'] == 2)
+        live = subprocess.run(['ps', '-p', str(event['pid']), '-o', 'stat='], capture_output=True, text=True)
+        check(case.name + ': actual descendant stops before failed resume returns',
+              live.returncode != 0 or not live.stdout.strip() or live.stdout.strip().startswith('Z'))
+    check(case.name + ': refusal preserves every original artifact, log and sidecar byte',
+          all(path.read_bytes() == contents for path, contents in immutable.items()))
+    if missing_path is not None:
+        if mode == 'resume-budget-empty':
+            original_path.rename(case / 'retained-empty-sidecar.json')
+        missing_path.rename(original_path)
+    if mode in ('resume-counter', 'resume-purpose'):
+        # Repair only the corrupted entry; retain the peer's actual interrupted
+        # second attempt and all other checkpoint updates from this invocation.
+        repaired = read(workspace / 'state.json')
+        repaired['target_statuses'][targets[1]] = original_entry
+        (workspace / 'state.json').write_text(json.dumps(repaired) + '\n')
+    repaired_code, repaired, repaired_state = invoke(case, run, jobs, mode, 'resume-repaired')
+    expected = {targets[0]: 3 if jobs == 3 else 2,
+                targets[1]: 1 if original_receipt['status'] == 'success' else 2, targets[2]: 1}
+    check(case.name + ': exact resume after repair reuses successes and retries only necessary attempts',
+          repaired_code == 0 and repaired['summary'] == dict(total=3, success=3, failed=0) and
+          all(row['attempt'] == expected[row['platform']] for row in repaired['targets']) and
+          all(repaired_state['target_statuses'][target]['attempts'] == expected[target] for target in targets) and
+          original_path.read_bytes() == original_bytes)
+    expected_events = dict(expected)
+    if unstarted:
+        expected_events[targets[1]] -= 1
+    check(case.name + ': execution events distinguish reserved-only history from real attempts',
+          Counter(event['target'] for event in events(case)) == Counter(expected_events))
+    before_repeat = events(case)
+    repeated_code, repeated, repeated_state = invoke(case, run, jobs, mode, 'resume-again')
+    check(case.name + ': repeated exact resume does not allocate or execute another attempt',
+          repeated_code == 0 and events(case) == before_repeat and
+          all(row.get('resume_reused') is True and row['attempt'] == expected[row['platform']] for row in repeated['targets']) and
+          all(path.read_bytes() == contents for path, contents in immutable.items()))
+
+if sys.argv[3] != '--completion-persistence-only':
+    for jobs in (1, 3):
+        case, run = resume_fixture('reserved-retry-signal-%d' % jobs)
+        code, _, state = invoke(case, run, 1, 'resume-reservation-signal', 'first')
+        old = state['target_statuses'][targets[1]]
+        sidecar = Path(old['result_path'])
+        contents = sidecar.read_bytes()
+        code, result, state = invoke(case, run, jobs, 'resume-reservation-signal', 'resume-refusal')
+        refused = result['targets'][1]
+        check(case.name + ': real cancellation after retry reservation reports the new unstarted attempt',
+              code == 130 and result['exit_code'] == 130 and 'error' not in result and
+              refused['status'] == 'skipped' and refused['exit_code'] == 130 and refused['attempt'] == 2 and
+              refused['execution_started'] is False and 'result_path' not in refused and 'log_path' not in refused and
+              state['target_statuses'][targets[1]]['attempts'] == 2 and
+              state['target_statuses'][targets[1]]['result'] is None and sidecar.read_bytes() == contents and
+              len([event for event in events(case) if event['target'] == targets[1]]) == 1)
+        repaired_code, repaired, repaired_state = invoke(case, run, jobs, 'resume-reservation-signal', 'resume-repaired')
+        expected = {targets[0]: 2 if jobs == 1 else 3, targets[1]: 3, targets[2]: 1}
+        check(case.name + ': repaired resume preserves both the old failure and the interrupted reservation',
+              repaired_code == 0 and all(row['attempt'] == expected[row['platform']] for row in repaired['targets']) and
+              repaired_state['target_statuses'][targets[1]]['attempts'] == 3 and sidecar.read_bytes() == contents and
+              len([event for event in events(case) if event['target'] == targets[1]]) == 2)
+    for invalid in ('counter', 'purpose'):
+        case, run = resume_fixture('preflight-' + invalid)
+        code, _, state = invoke(case, run, 1, 'resume-success', 'first')
+        workspace = case / 'state/builds/reservationfixture/1.0.0' / run
+        state_path = workspace / 'state.json'
+        original = state_path.read_bytes()
+        corrupted = read(state_path)
+        entry = corrupted['target_statuses'][targets[1]]
+        if invalid == 'counter':
+            entry['attempts'] = 'untrusted'
+        else:
+            entry['result'] = dict(read(Path(entry['result_path'])), build_purpose='diagnostic-native', publishable=False)
+        state_path.write_text(json.dumps(corrupted) + '\n')
+        corrupted_bytes = state_path.read_bytes()
+        before = events(case)
+        refused_code, refused, _ = invoke(case, run, 3, 'resume-success', 'resume-preflight')
+        check(case.name + ': invalid saved authority refuses before any worker or attempt allocation',
+              code == 4 and refused_code == 4 and refused is None and events(case) == before and
+              state_path.read_bytes() == corrupted_bytes and
+              ('attempt counters' if invalid == 'counter' else 'build purpose') in (case / 'resume-preflight.stderr').read_text())
+        state_path.write_bytes(original)
+        repaired_code, repaired, _ = invoke(case, run, 3, 'resume-success', 'resume-repaired')
+        check(case.name + ': preflight refusal releases the run lock for exact repaired resume',
+              repaired_code == 0 and repaired['summary'] == dict(total=3, success=3, failed=0))
+
+if sys.argv[3] == '--resume-persistence-only':
+    print('Resume persistence recovery: %d checks, 0 failures' % checks, flush=True)
+    sys.exit(0)
 
 
 for jobs in (() if sys.argv[3] == '--completion-persistence-only' else (1, 3)):
@@ -1341,7 +1597,8 @@ print('Dispatch reservation recovery: %d checks, 0 failures' % checks, flush=Tru
 PY
 }
 
-if [[ "${1:-}" == --dispatch-reservation-only || "${1:-}" == --completion-persistence-only ]]; then
+if [[ "${1:-}" == --dispatch-reservation-only || "${1:-}" == --completion-persistence-only ||
+      "${1:-}" == --resume-persistence-only ]]; then
     test_dispatch_reservation_recovery "$1"
     exit $?
 fi

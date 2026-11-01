@@ -13120,6 +13120,20 @@ act_orchestrate_build() {
         fi
         resume_retry_limit=$((10#$resume_retry_limit))
     fi
+    _act_prior_build_attempts() {
+        # Use the same admission rule before dispatch and when rereading a
+        # checkpoint. Missing or invalid history must not become attempt zero.
+        jq -er -s '
+            select(length == 1) | .[0] | select(type == "object") |
+            def counter($key): if has($key) then .[$key] else 0 end;
+            counter("attempts") as $all | counter("source_sync_failures") as $sync |
+            counter("host_readiness_failures") as $readiness |
+            select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($readiness | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($sync + $readiness) <= $all) |
+            $all - $sync - $readiness' <<< "$1"
+    }
     if [[ -n "$resume_target_host" || -n "$resume_target_host_approval" ]]; then
         if ! $resume_run || [[ "$build_purpose" != "release" ||
              -z "$resume_target_host" || -z "$resume_target_host_approval" ]]; then
@@ -13440,7 +13454,17 @@ act_orchestrate_build() {
             # Inspect both authorities before admitting any resumed worker.
             # A valid embedded result cannot launder a differently purposed sidecar.
             local resume_entry resume_receipt resume_result_path
+            if ! jq -e '.target_statuses | type == "object"' <<< "$resume_state" >/dev/null; then
+                _log_error "Resume target history is not a target-keyed map"
+                _act_release_orchestration_lock
+                return 4
+            fi
             while IFS= read -r resume_entry; do
+                if ! _act_prior_build_attempts "$resume_entry" >/dev/null; then
+                    _log_error "Invalid source synchronization/readiness/build attempt counters in resume state"
+                    _act_release_orchestration_lock
+                    return 4
+                fi
                 resume_receipt=$(jq -c '.result // empty' <<< "$resume_entry")
                 if [[ -n "$resume_receipt" ]] && \
                    ! _act_build_purpose_matches "$resume_receipt" "$build_purpose" "$strict_release_contract"; then
@@ -13723,10 +13747,43 @@ act_orchestrate_build() {
         done
     }
 
+    _act_fail_coordinator() {
+        [[ -n "$coordinator_error" ]] || coordinator_error="$1"
+        _log_error "$1"
+        interrupted=true
+        # Aggregation can discover unreadable queued history after workers
+        # were drained and the signal traps restored. Do not reinstall
+        # ignored signals in the caller when no owned worker remains.
+        if (( active_workers > 0 )); then
+            _act_cancel_parallel_workers
+        fi
+    }
+
+    _act_refuse_retained_target() {
+        local message="$1" known_attempt="${2:-}" refusal refusal_stage=dispatch
+        $resume_run && refusal_stage=resume
+        # A verified observation is stronger than the failure to persist it.
+        # Otherwise return only this coordinator's refusal, without borrowing
+        # unverified result paths or inventing an unknown attempt history.
+        if [[ -z "${final_results[$task_key]:-}" ]]; then
+            if refusal=$(jq -nc --arg target "$target" --arg task_key "$task_key" \
+                    --arg triple "$selected_triple" --arg purpose "$build_purpose" \
+                    --arg error "$message" --arg attempt "$known_attempt" --arg stage "$refusal_stage" '
+                    {platform:$target, task_key:$task_key, status:"failed", exit_code:4,
+                     stage:$stage, receipt_source:"coordinator", execution_started:false,
+                     error:$error, build_purpose:$purpose, publishable:($purpose == "release")} +
+                    (if $triple == "" then {} else {target_triple:$triple} end) +
+                    (if $attempt == "" then {} else {attempt:($attempt | tonumber)} end)'); then
+                final_results["$task_key"]="$refusal"
+            fi
+        fi
+        _act_fail_coordinator "$message"
+    }
+
     _act_refuse_unstarted_attempt() {
         local message="$1" reserved="$2" refusal refusal_with_path refusal_extra
         local refusal_attempt="$prior_attempts" refusal_status=skipped
-        coordinator_error="$message"
+        [[ -n "$coordinator_error" ]] || coordinator_error="$message"
         _log_error "$message"
         if $reserved; then
             refusal_attempt="$attempt"
@@ -13788,11 +13845,7 @@ act_orchestrate_build() {
                         # Completion persistence is a coordinator failure,
                         # not an operator interruption. Keep the first cause
                         # while cancelling and draining all remaining peers.
-                        if [[ -z "$coordinator_error" ]]; then
-                            coordinator_error="Could not retain completed target outcome for ${worker_targets[$reap_index]}"
-                        fi
-                        _log_error "$coordinator_error"
-                        _act_cancel_parallel_workers
+                        _act_fail_coordinator "Could not retain completed target outcome for ${worker_targets[$reap_index]}"
                     fi
                     return 0
                 fi
@@ -13814,22 +13867,13 @@ act_orchestrate_build() {
         local persisted_entry='{}' persisted_result="" persisted_result_path=""
         local prior_attempts=0 prior_build_attempts=0
         if $state_available; then
-            persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                jq -c --arg target "$task_key" '.target_statuses[$target] // {}')
-            prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
-            if ! prior_build_attempts=$(jq -er '
-                def counter($key): if has($key) then .[$key] else 0 end;
-                counter("attempts") as $all | counter("source_sync_failures") as $sync |
-                counter("host_readiness_failures") as $readiness |
-                select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                  ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                  ($readiness | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                  ($sync + $readiness) <= $all) |
-                $all - $sync - $readiness' <<< "$persisted_entry"); then
-                _log_error "Invalid source synchronization/readiness/build attempt counters for $task_key"
-                interrupted=true
+            if ! persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                    jq -ce --arg target "$task_key" '.target_statuses[$target] // {}') ||
+               ! prior_build_attempts=$(_act_prior_build_attempts "$persisted_entry"); then
+                _act_refuse_retained_target "Invalid or unavailable source synchronization/readiness/build attempt counters for $task_key"
                 break
             fi
+            prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")
             persisted_result=$(jq -c '.result // empty' <<< "$persisted_entry")
             persisted_result_path=$(jq -r '.result_path // empty' <<< "$persisted_entry")
         fi
@@ -13837,8 +13881,7 @@ act_orchestrate_build() {
         if $resume_run; then
             if [[ -n "$persisted_result" ]] && \
                ! _act_build_purpose_matches "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                _log_error "Resume target result has missing or different build purpose: $target"
-                interrupted=true
+                _act_refuse_retained_target "Resume target result has missing or different build purpose: $target" "$prior_attempts"
                 break
             fi
             if [[ -n "$persisted_result" ]] && \
@@ -13853,8 +13896,7 @@ act_orchestrate_build() {
             if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] &&
                recovered_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
                 if ! _act_build_purpose_matches "$recovered_result" "$build_purpose" "$strict_release_contract"; then
-                    _log_error "Resume sidecar has missing or different build purpose: $target"
-                    interrupted=true
+                    _act_refuse_retained_target "Resume sidecar has missing or different build purpose: $target" "$prior_attempts"
                     break
                 fi
                 if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
@@ -13875,14 +13917,26 @@ act_orchestrate_build() {
                     # The immutable sidecar is written before the coordinator
                     # records completion. Its attempt identity comes from the
                     # retained dispatch entry, not fields supplied by a worker.
+                    local recovered_log_path
+                    recovered_log_path=$(jq -r '.log_path // empty' <<< "$persisted_entry")
+                    [[ -f "$recovered_log_path" && ! -L "$recovered_log_path" ]] || recovered_log_path=""
                     recovered_result=$(jq -c \
-                        --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
+                        --arg log_path "$recovered_log_path" \
                         --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
                         --arg status "$recovered_status" '
                         . + {result_path: $result_path, attempt: $attempt} |
                         if $log_path == "" then del(.log_path) else .log_path = $log_path end |
-                        if $status == "completed" then . + {resume_reused: true} else . end
-                    ' <<< "$recovered_result") || { interrupted=true; break; }
+                        if $status == "completed" then
+                            . + {resume_reused: true} |
+                            if has("execution_started") then . else .execution_started = true end
+                        else . end
+                    ' <<< "$recovered_result") || {
+                        _act_refuse_retained_target "Could not retain recovered target observation for $task_key" "$prior_attempts"
+                        break
+                    }
+                    # Keep this verified sidecar even if checkpointing it
+                    # fails. Recovery did not launch another target attempt.
+                    final_results["$task_key"]="$recovered_result"
                     if $state_available; then
                         local reconciled_extra
                         if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
@@ -13890,7 +13944,7 @@ act_orchestrate_build() {
                                  reconciled_from_sidecar: true}' <<< "$recovered_result") ||
                            ! build_state_update_target "$tool_name" "$version" "$task_key" "$recovered_status" \
                                 "$reconciled_extra" "$run_id"; then
-                            interrupted=true
+                            _act_refuse_retained_target "Could not persist recovered target outcome for $task_key" "$prior_attempts"
                             break
                         fi
                     fi
@@ -13904,22 +13958,10 @@ act_orchestrate_build() {
                     # refusals once. Reread those authoritative discounts
                     # before applying the compiler budget on every resume.
                     if $state_available; then
-                        persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                            jq -c --arg target "$task_key" '.target_statuses[$target] // {}') || {
-                            interrupted=true
-                            break
-                        }
-                        if ! prior_build_attempts=$(jq -er '
-                            def counter($key): if has($key) then .[$key] else 0 end;
-                            counter("attempts") as $all | counter("source_sync_failures") as $sync |
-                            counter("host_readiness_failures") as $readiness |
-                            select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                              ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                              ($readiness | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-                              ($sync + $readiness) <= $all) |
-                            $all - $sync - $readiness' <<< "$persisted_entry"); then
-                            _log_error "Invalid source synchronization/readiness/build attempt counters for $task_key"
-                            interrupted=true
+                        if ! persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                                jq -ce --arg target "$task_key" '.target_statuses[$target] // {}') ||
+                           ! prior_build_attempts=$(_act_prior_build_attempts "$persisted_entry"); then
+                            _act_refuse_retained_target "Invalid or unavailable reconciled attempt counters for $task_key" "$prior_attempts"
                             break
                         fi
                     fi
@@ -13948,25 +13990,40 @@ act_orchestrate_build() {
                          stage: "resume", receipt_source: "coordinator",
                          error: "Target retry limit exceeded without a reusable target result"} +
                         (if $triple == "" then {} else {target_triple: $triple} end)
-                    ') || { interrupted=true; break; }
+                    ') || {
+                        _act_refuse_retained_target "Could not retain retry-budget refusal for $task_key" "$prior_attempts"
+                        break
+                    }
                 fi
+                local exhausted_result_path="" exhausted_log_path=""
+                # A path that merely exists is not an admitted receipt. Empty
+                # or wrong-target sidecars cannot acquire authority at exhaustion.
+                if [[ -n "$recovered_status" && -f "$persisted_result_path" && ! -L "$persisted_result_path" ]]; then
+                    exhausted_result_path="$persisted_result_path"
+                fi
+                exhausted_log_path=$(jq -r '.log_path // empty' <<< "$persisted_entry")
+                [[ -f "$exhausted_log_path" && ! -L "$exhausted_log_path" ]] || exhausted_log_path=""
                 exhausted_result=$(jq -c \
-                    --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
-                    --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
+                    --arg log_path "$exhausted_log_path" \
+                    --arg result_path "$exhausted_result_path" --argjson attempt "$prior_attempts" \
                     --arg purpose "$build_purpose" --arg task_key "$task_key" '
                     . + {attempt: $attempt,
                          build_purpose: $purpose, publishable: ($purpose == "release"),
                          task_key: $task_key, retry_limit_exceeded: true} |
                     if $log_path == "" then del(.log_path) else .log_path = $log_path end |
                     if $result_path == "" then del(.result_path) else .result_path = $result_path end
-                ' <<< "$exhausted_result") || { interrupted=true; break; }
+                ' <<< "$exhausted_result") || {
+                    _act_refuse_retained_target "Could not retain retry-budget outcome for $task_key" "$prior_attempts"
+                    break
+                }
+                final_results["$task_key"]="$exhausted_result"
                 if $state_available; then
                     if ! exhausted_extra=$(jq -nc --argjson attempts "$prior_attempts" \
                             'input as $result | {result: $result, attempts: $attempts}' \
                             <<< "$exhausted_result") ||
                        ! build_state_update_target "$tool_name" "$version" "$task_key" failed \
                             "$exhausted_extra" "$run_id"; then
-                        interrupted=true
+                        _act_refuse_retained_target "Could not persist retry-budget outcome for $task_key" "$prior_attempts"
                         break
                     fi
                 fi
@@ -13982,14 +14039,15 @@ act_orchestrate_build() {
         log_path="$workspace/logs/${index_prefix}-${target_slug}.attempt-${attempt}.log"
         result_path="$workspace/results/${index_prefix}-${target_slug}.attempt-${attempt}.json"
         if [[ -e "$log_path" || -L "$log_path" || -e "$result_path" || -L "$result_path" ]]; then
-            coordinator_error="Refusing to overwrite an existing target attempt receipt"
-            _log_error "$coordinator_error"
-            _act_cancel_parallel_workers
+            _act_fail_coordinator "Refusing to overwrite an existing target attempt receipt"
             break
         fi
         host="act-local"
         if $strict_release_contract; then
-            host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || return 4
+            host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || {
+                _act_refuse_retained_target "Strict target host binding became unavailable for $task_key" "$prior_attempts"
+                break
+            }
         elif ! act_platform_uses_act "$tool_name" "$target"; then
             # Build where the source was synced. Asking the capacity selector
             # again could pick a busier-now host that was never synced and
@@ -14000,7 +14058,10 @@ act_orchestrate_build() {
         local target_sync_receipt=null
         if [[ -n "$source_sync_json" ]] && ! act_platform_uses_act "$tool_name" "$target"; then
             target_sync_receipt=$(jq -ce --arg host "$host" '.hosts[] | select(.host == $host)' \
-                <<< "$source_sync_json") || { interrupted=true; break; }
+                <<< "$source_sync_json") || {
+                _act_refuse_retained_target "Source synchronization receipt became unavailable for $task_key" "$prior_attempts"
+                break
+            }
         fi
 
         # Two concurrent targets on one host whose builds write the same file
@@ -14049,6 +14110,10 @@ act_orchestrate_build() {
                 break
             fi
             attempt_reserved=true
+            # A new durable reservation supersedes the earlier failed
+            # observation, even if cancellation arrives before its worker
+            # starts. The immutable prior sidecar remains retained on disk.
+            unset 'final_results[$task_key]'
             if ! build_state_update_host "$tool_name" "$version" "$host" "running" \
                     "$(jq -nc --arg target "$target" '{target: $target}')" "$run_id"; then
                 $interrupted && break
@@ -14110,11 +14175,15 @@ act_orchestrate_build() {
         local ordered_result="${final_results[$task_key]:-}" undispatched_attempts=0
         if [[ -z "$ordered_result" && $state_available == true ]]; then
             local ordered_entry
-            ordered_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                jq -c --arg task_key "$task_key" '.target_statuses[$task_key] // {}') || return 4
-            ordered_result=$(jq -c '.result // empty' <<< "$ordered_entry") || return 4
-            undispatched_attempts=$(jq -er '(.attempts // 0) |
-                select(type == "number" and . >= 0 and floor == .)' <<< "$ordered_entry") || return 4
+            if ! ordered_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                    jq -ce --arg task_key "$task_key" '.target_statuses[$task_key] // {}') ||
+               ! _act_prior_build_attempts "$ordered_entry" >/dev/null; then
+                _act_refuse_retained_target "Invalid or unavailable retained attempt history for $task_key"
+                ordered_result="${final_results[$task_key]:-}"
+            else
+                ordered_result=$(jq -c '.result // empty' <<< "$ordered_entry") || return 4
+                undispatched_attempts=$(jq -r '.attempts // 0' <<< "$ordered_entry") || return 4
+            fi
         fi
         if [[ -z "$ordered_result" ]]; then
             # No worker result means this invocation never dispatched this
