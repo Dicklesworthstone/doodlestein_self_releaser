@@ -553,9 +553,23 @@ their interrupted attempt receipts. Queued tasks that have never run report
 pending in run state, so exact-run resume starts their first attempt while
 reusing verified successful receipts and retrying interrupted attempts.
 Per-target JSON includes the retained `attempt`, `exit_code`, `log_path`, and
-`result_path` when available. A coordinator-recovered receipt records the
-observed `worker_exit_code` and `receipt_source: "coordinator"`; a missing
-receipt cannot turn a zero process exit into a successful build.
+`result_path` when available. When a live coordinator recovers a missing
+receipt, it records the observed `worker_exit_code` and
+`receipt_source: "coordinator"`; a missing receipt cannot turn a zero process
+exit into a successful build.
+
+After coordinator loss, resume reconciles valid terminal worker receipts with
+their retained dispatch attempt and paths. The original sidecars remain
+unchanged. Failed sidecars retain their observed error and exit code, and a
+source-sync refusal is excluded from the compiler retry budget exactly once,
+even across repeated crashes during reconciliation.
+The retry limit applies to every non-reusable target, including one still
+recorded as running or completed with unavailable artifacts. Verified completed
+results remain reusable at the limit. Exhaustion does not launch another worker
+or create an attempt receipt. When no valid failed result is available, run
+state and aggregate output record a failed coordinator result with
+`stage: "resume"` and exit code 6, without inventing an observed worker exit or
+successful artifact evidence.
 Native host-readiness refusals retain the requested platform, optional selected
 triple, host, and attempt receipts. They report `stage: "host_readiness"` and
 `exit_code: 4`; public target status is `failed`, even though no compiler ran.

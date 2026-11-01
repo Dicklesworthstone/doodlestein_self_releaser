@@ -12531,6 +12531,15 @@ act_orchestrate_build() {
         _log_error "--resume-run-id requires a schema-valid UUID"
         return 4
     fi
+    local resume_retry_limit="${BUILD_RETRY_MAX:-3}"
+    if $resume_run; then
+        if [[ ! "$resume_retry_limit" =~ ^[0-9]{1,4}$ ]] ||
+           ((10#$resume_retry_limit < 1 || 10#$resume_retry_limit > 1000)); then
+            _log_error "Resume retry limit must be an integer from 1 through 1000"
+            return 4
+        fi
+        resume_retry_limit=$((10#$resume_retry_limit))
+    fi
     if [[ -n "$resume_target_host" || -n "$resume_target_host_approval" ]]; then
         if ! $resume_run || [[ "$build_purpose" != "release" ||
              -z "$resume_target_host" || -z "$resume_target_host_approval" ]]; then
@@ -13188,48 +13197,121 @@ act_orchestrate_build() {
                 _log_info "Resume: reusing completed target $task_key"
                 continue
             fi
-            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
-               persisted_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
-                if ! _act_build_purpose_matches "$persisted_result" "$build_purpose" "$strict_release_contract"; then
+            local recovered_result="" recovered_status=""
+            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] &&
+               recovered_result=$(jq -ce '.' "$persisted_result_path" 2>/dev/null); then
+                if ! _act_build_purpose_matches "$recovered_result" "$build_purpose" "$strict_release_contract"; then
                     _log_error "Resume sidecar has missing or different build purpose: $target"
                     interrupted=true
                     break
                 fi
+                if _act_matrix_result_matches "$recovered_result" "$target" "$selected_triple" &&
+                   [[ "$(jq -r '.task_key // ""' <<< "$recovered_result")" == "$task_key" ]] &&
+                   _act_target_result_available "$recovered_result" "$build_purpose" "$strict_release_contract"; then
+                    recovered_status=completed
+                elif jq -e --arg task_key "$task_key" --arg platform "$target" \
+                        --arg triple "$selected_triple" '
+                        .task_key == $task_key and .platform == $platform and
+                        ($triple == "" or .target_triple == $triple) and
+                        ((.status // "") | IN("failed", "error", "timeout", "cancelled"))
+                    ' <<< "$recovered_result" >/dev/null; then
+                    # Early failures may precede backend selection, so unlike
+                    # successful reuse their identity does not require method.
+                    recovered_status=failed
+                fi
+                if [[ -n "$recovered_status" ]]; then
+                    # The immutable sidecar is written before the coordinator
+                    # records completion. Its attempt identity comes from the
+                    # retained dispatch entry, not fields supplied by a worker.
+                    recovered_result=$(jq -c \
+                        --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
+                        --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
+                        --arg status "$recovered_status" '
+                        . + {log_path: $log_path, result_path: $result_path, attempt: $attempt} |
+                        if $status == "completed" then . + {resume_reused: true} else . end
+                    ' <<< "$recovered_result") || { interrupted=true; break; }
+                    if $state_available; then
+                        local reconciled_extra
+                        if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
+                                'input as $result | {result: $result, attempts: $attempts,
+                                 reconciled_from_sidecar: true}' <<< "$recovered_result") ||
+                           ! build_state_update_target "$tool_name" "$version" "$task_key" "$recovered_status" \
+                                "$reconciled_extra" "$run_id"; then
+                            interrupted=true
+                            break
+                        fi
+                    fi
+                    persisted_result="$recovered_result"
+                    if [[ "$recovered_status" == completed ]]; then
+                        final_results["$task_key"]="$recovered_result"
+                        _log_info "Resume: reconciled completed sidecar for $task_key"
+                        continue
+                    fi
+                    # Reconciliation accounts for a source-sync failure once.
+                    # Reread that authoritative discount before applying the
+                    # compiler budget, including on repeated resume requests.
+                    if $state_available; then
+                        persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                            jq -c --arg target "$task_key" '.target_statuses[$target] // {}') || {
+                            interrupted=true
+                            break
+                        }
+                        if ! prior_build_attempts=$(jq -er '
+                            (.attempts // 0) as $all | (.source_sync_failures // 0) as $sync |
+                            select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+                              ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and $sync <= $all) |
+                            $all - $sync' <<< "$persisted_entry"); then
+                            _log_error "Invalid source synchronization/build attempt counters for $task_key"
+                            interrupted=true
+                            break
+                        fi
+                    fi
+                fi
             fi
-            if [[ -n "$persisted_result_path" && -s "$persisted_result_path" ]] && \
-               _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
-               [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
-               _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                # A worker can finish its immutable sidecar before the
-                # coordinator records completion. Restore the coordinator's
-                # retained attempt metadata when recovering that result,
-                # without rewriting the original worker receipt.
-                final_results["$task_key"]=$(jq -c \
+            if [[ "$prior_build_attempts" -ge "$resume_retry_limit" ]]; then
+                local exhausted_result exhausted_extra
+                if [[ -n "$persisted_result" ]] &&
+                   jq -e --arg task_key "$task_key" --arg platform "$target" \
+                        --arg triple "$selected_triple" '
+                        .task_key == $task_key and .platform == $platform and
+                        ($triple == "" or .target_triple == $triple) and
+                        ((.status // "") | IN("failed", "error", "timeout", "cancelled"))
+                    ' <<< "$persisted_result" >/dev/null; then
+                    # Keep an observed failure's exit and error. Exhaustion is
+                    # a scheduling decision, not another worker execution.
+                    exhausted_result="$persisted_result"
+                else
+                    # A lost worker or unavailable successful artifacts cannot
+                    # become success merely because the budget is exhausted.
+                    # Do not invent a worker exit or rewrite its old sidecar.
+                    exhausted_result=$(jq -nc --arg platform "$target" \
+                        --arg host "$(jq -r '.host // empty' <<< "$persisted_entry")" \
+                        --arg triple "$selected_triple" '
+                        {platform: $platform, host: $host, status: "failed", exit_code: 6,
+                         stage: "resume", receipt_source: "coordinator",
+                         error: "Target retry limit exceeded without a reusable target result"} +
+                        (if $triple == "" then {} else {target_triple: $triple} end)
+                    ') || { interrupted=true; break; }
+                fi
+                exhausted_result=$(jq -c \
                     --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
                     --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
-                    '. + {resume_reused: true, log_path: $log_path,
-                          result_path: $result_path, attempt: $attempt}' \
-                    <<< "$persisted_result") || { interrupted=true; break; }
+                    --arg purpose "$build_purpose" --arg task_key "$task_key" '
+                    . + {log_path: $log_path, result_path: $result_path, attempt: $attempt,
+                         build_purpose: $purpose, publishable: ($purpose == "release"),
+                         task_key: $task_key, retry_limit_exceeded: true}
+                ' <<< "$exhausted_result") || { interrupted=true; break; }
                 if $state_available; then
-                    local reconciled_extra
-                    if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
-                            'input as $result | {result: $result, attempts: $attempts,
-                             reconciled_from_sidecar: true}' <<< "${final_results[$task_key]}") || \
-                       ! build_state_update_target "$tool_name" "$version" "$task_key" "completed" \
-                        "$reconciled_extra" \
-                        "$run_id"; then
+                    if ! exhausted_extra=$(jq -nc --argjson attempts "$prior_attempts" \
+                            'input as $result | {result: $result, attempts: $attempts}' \
+                            <<< "$exhausted_result") ||
+                       ! build_state_update_target "$tool_name" "$version" "$task_key" failed \
+                            "$exhausted_extra" "$run_id"; then
                         interrupted=true
                         break
                     fi
                 fi
-                _log_info "Resume: reconciled completed sidecar for $task_key"
-                continue
-            fi
-            if [[ "$(jq -r '.status // "pending"' <<< "$persisted_entry")" == "failed" && \
-                  "$prior_build_attempts" -ge "${BUILD_RETRY_MAX:-3}" ]]; then
-                final_results["$task_key"]=$(jq -c \
-                    '.result // {platform: "'"$target"'", status: "failed", exit_code: 6,
-                     error: "Target retry limit exceeded"}' <<< "$persisted_entry")
+                final_results["$task_key"]="$exhausted_result"
                 _log_warn "Resume: retry limit exceeded for $target"
                 continue
             fi

@@ -126,6 +126,36 @@ source "$DSR_STDIN_PROJECT/src/logging.sh"
 source "$DSR_STDIN_PROJECT/src/config.sh"
 source "$DSR_STDIN_PROJECT/src/build_state.sh"
 source "$DSR_STDIN_MODULE"
+if [[ "$DSR_STDIN_MODE" == source-sync-recovery ]]; then
+    # Keep the real state updater. Pause its caller at two precise durable
+    # boundaries so SIGKILL leaves an authentic coordinator-loss checkpoint.
+    source <(declare -f build_state_update_target |
+        sed '1s/build_state_update_target/_fixture_build_state_update_target/')
+    _fixture_pause_state_update() {
+        local ready_path="$DSR_STDIN_CASE/$DSR_STDIN_PHASE.state-update.ready"
+        printf '%s\n' "$BASHPID" > "$ready_path.tmp" &&
+            mv "$ready_path.tmp" "$ready_path" || return 1
+        local deadline=$((SECONDS + 30))
+        while [[ ! -f "$DSR_STDIN_CASE/$DSR_STDIN_PHASE.release-update" ]]; do
+            ((SECONDS < deadline)) || return 1
+            sleep 0.02
+        done
+    }
+    build_state_update_target() {
+        local sync_failure=false
+        if [[ "$4" == failed ]] && jq -e '.result.stage == "source_sync"' <<< "$5" >/dev/null; then
+            sync_failure=true
+        fi
+        if $sync_failure && [[ "$DSR_STDIN_PHASE" == first ]]; then
+            _fixture_pause_state_update || return 1
+        fi
+        _fixture_build_state_update_target "$@" || return $?
+        if $sync_failure && [[ "$DSR_STDIN_PHASE" == resume-reconcile* ]] &&
+           jq -e '.reconciled_from_sidecar == true' <<< "$5" >/dev/null; then
+            _fixture_pause_state_update || return 1
+        fi
+    }
+fi
 selector_acquire_slot() {
     cat > "$DSR_STDIN_CASE/prelude.$2.stdin"
     printf 'ready\n' > "$DSR_STDIN_CASE/prelude.$2.ready"
@@ -139,8 +169,8 @@ selector_release_slot() {
         # must preserve completed success even if its outer worker now dies.
         kill -KILL "$BASHPID"
     fi
-    if [[ "$DSR_STDIN_MODE" == sidecar-recovery && "$DSR_STDIN_PHASE" == first ]]; then
-        # The real worker has saved its success receipt, but the coordinator
+    if [[ "$DSR_STDIN_MODE" == sidecar-* && "$DSR_STDIN_PHASE" == first ]]; then
+        # The real worker has saved its terminal receipt, but the coordinator
         # cannot reap it or save the embedded result until this barrier ends.
         local ready_path="$DSR_STDIN_CASE/sidecar.$2.ready"
         printf '%s\n' "$BASHPID" > "$ready_path.tmp" &&
@@ -170,6 +200,7 @@ act_run_native_build() {
     fi
     local deadline=10 native_mode="$DSR_STDIN_MODE"
     [[ "$native_mode" != readiness ]] || native_mode=success
+    [[ "$native_mode" != sidecar-failure-recovery ]] || native_mode=failure
     [[ "$DSR_STDIN_MODE" != cancel ]] || deadline=60
     if [[ "$DSR_STDIN_MODE" == timeout && "$2" == linux/amd64 ]]; then deadline=1; fi
     _act_run_with_timeout "$deadline" python3 "$DSR_STDIN_WORKER" \
@@ -214,8 +245,12 @@ if [[ "$DSR_STDIN_PHASE" == cli ]]; then
     cmd_build stdinfixture --version 1.0.0 --no-sync --jobs "$DSR_STDIN_JOBS" \
         --output-dir "$DSR_STDIN_CASE/output"
 else
+    source_args=(--no-source-sync-gate)
+    if [[ -f "$DSR_STDIN_CASE/source-sync.json" ]]; then
+        source_args=(--source-sync-json "$(cat "$DSR_STDIN_CASE/source-sync.json")")
+    fi
     act_orchestrate_build stdinfixture 1.0.0 --parallel-jobs "$DSR_STDIN_JOBS" \
-        --no-source-sync-gate --output-dir "$DSR_STDIN_CASE/output" "${args[@]}"
+        "${source_args[@]}" --output-dir "$DSR_STDIN_CASE/output" "${args[@]}"
 fi
 ''')
 
@@ -237,20 +272,20 @@ def fixture(jobs, mode):
     return case, str(uuid.uuid4())
 
 
-def invocation_env(case, identity, jobs, mode, phase):
+def invocation_env(case, identity, jobs, mode, phase, retry_max=3):
     env = dict(os.environ, DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
                DSR_CONFIG_DIR=str(case / 'config'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
                ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
                DSR_STDIN_PROJECT=str(project), DSR_STDIN_MODULE=str(module),
                DSR_STDIN_WORKER=str(worker), DSR_STDIN_CASE=str(case), DSR_STDIN_RUN=identity,
                DSR_STDIN_JOBS=str(jobs), DSR_STDIN_MODE=mode, DSR_STDIN_PHASE=phase,
-               DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='3', NO_COLOR='1')
+               DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX=str(retry_max), NO_COLOR='1')
     env.pop('DSR_BUILD_LOCK_HELD_BY_CALLER', None)
     return env
 
 
-def invoke(case, identity, jobs, mode, phase):
-    env = invocation_env(case, identity, jobs, mode, phase)
+def invoke(case, identity, jobs, mode, phase, retry_max=3, expected_code=None):
+    env = invocation_env(case, identity, jobs, mode, phase, retry_max)
     out = open(case / (phase + '.stdout'), 'wb')
     err = open(case / (phase + '.stderr'), 'wb')
     process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
@@ -290,10 +325,11 @@ def invoke(case, identity, jobs, mode, phase):
     state_path = case / 'state/builds/stdinfixture/1.0.0' / identity / 'state.json'
     state = read(state_path)
     (case / (phase + '.state.json')).write_text(json.dumps(state) + '\n')
-    expected_code = (0 if mode in ('child-success', 'child-durable-success-killed') else 1) \
-        if mode.startswith('child-') else {
-        'success': 0, 'failure': 1, 'timeout': 1, 'readiness': 1, 'cancel': 130,
-        'missing-receipt': 6, 'killed-worker': 6}[mode]
+    if expected_code is None:
+        expected_code = (0 if mode in ('child-success', 'child-durable-success-killed') else 1) \
+            if mode.startswith('child-') else {
+            'success': 0, 'failure': 1, 'timeout': 1, 'readiness': 1, 'cancel': 130,
+            'missing-receipt': 6, 'killed-worker': 6}[mode]
     check(case.name + '/' + phase + ': aggregate preserves the real exit status', code == expected_code)
     check(case.name + '/' + phase + ': exactly six ordered target rows',
           value['run_id'] == identity and value['summary']['total'] == 6 and
@@ -471,11 +507,16 @@ def worker_running(pid):
     return probe.returncode == 0 and bool(probe.stdout.strip()) and not probe.stdout.strip().startswith(b'Z')
 
 
-for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-completion-only',
-                                  '--host-readiness-only', '--host-readiness-cli-only') else (1, 3)):
-    case, identity = fixture(jobs, 'sidecar-recovery')
+sidecar_cases = [] if sys.argv[3] in (
+    '--coordinator-receipt-only', '--worker-completion-only',
+    '--host-readiness-only', '--host-readiness-cli-only') else [
+        (jobs, mode) for jobs in (1, 3) for mode in
+        ('sidecar-failure-recovery', 'sidecar-missing-recovery', 'sidecar-recovery')]
+for jobs, crash_mode in sidecar_cases:
+    case, identity = fixture(jobs, crash_mode)
     workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
-    env = invocation_env(case, identity, jobs, 'sidecar-recovery', 'first')
+    env = invocation_env(case, identity, jobs, crash_mode, 'first',
+                         retry_max=3 if crash_mode == 'sidecar-recovery' else 1)
     with open(case / 'first.stdout', 'wb') as out, open(case / 'first.stderr', 'wb') as err:
         process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
                                    stdout=out, stderr=err, start_new_session=True)
@@ -485,7 +526,7 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-compl
                      case.name + ': initial workers did not reach capacity barrier')
             (case / 'release').write_text('continue\n')
             wait_for(process, lambda: len(list(case.glob('sidecar.*.ready'))) == jobs,
-                     case.name + ': successful sidecars did not reach the publication barrier')
+                     case.name + ': worker sidecars did not reach the publication barrier')
             workers = [int(path.read_text()) for path in case.glob('sidecar.*.ready')]
             check(case.name + ': real workers are alive after writing their sidecars',
                   len(set(workers)) == jobs and all(worker_running(pid) for pid in workers))
@@ -522,9 +563,58 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-compl
             wait_for(None, lambda: all(not worker_running(pid) for pid in workers),
                      case.name + ': released workers did not exit')
 
+    unavailable_receipt = None
+    if crash_mode == 'sidecar-missing-recovery':
+        # Retain the actual bytes outside their expected path to model a lost
+        # receipt after a real coordinator crash; never synthesize worker JSON.
+        prior_path = Path(before['target_statuses'][targets[0]]['result_path'])
+        unavailable_receipt = case / 'unavailable-sidecar.json'
+        prior_path.rename(unavailable_receipt)
+        unavailable_bytes = unavailable_receipt.read_bytes()
     immutable = {path: path.read_bytes() for directory in ('output', 'logs', 'results')
                  for path in ((case / directory) if directory == 'output' else workspace / directory).rglob('*')
                  if path.is_file()}
+    if crash_mode != 'sidecar-recovery':
+        known_failure = crash_mode == 'sidecar-failure-recovery'
+        for phase, limit in (('resume', 1), ('resume-again', '01')):
+            resumed, state = invoke(case, identity, jobs, 'success', phase,
+                                    retry_max=limit, expected_code=1)
+            failed = resumed['targets'][0]
+            saved = state['target_statuses'][targets[0]]
+            prior = before['target_statuses'][targets[0]]
+            check(case.name + '/' + phase + ': exhausted target preserves dispatch identity and failed state',
+                  failed['status'] == 'failed' and failed['attempt'] == 1 and
+                  failed['log_path'] == prior['log_path'] and failed['result_path'] == prior['result_path'] and
+                  failed.get('retry_limit_exceeded') is True and not failed.get('resume_reused') and
+                  saved['status'] == 'failed' and saved['result'] == failed and
+                  state['status'] == 'partial' and
+                  resumed['summary'] == {'total': 6, 'success': 5, 'failed': 1})
+            check(case.name + '/' + phase + ': retry budget admits every pending target but never reruns consumed attempts',
+                  Counter(event['target'] for event in events(case)) ==
+                  Counter({target: 1 for target in targets}) and
+                  all(entry['attempts'] == 1 for entry in state['target_statuses'].values()) and
+                  len(list(workspace.glob('logs/*.log'))) == 6 and
+                  len((case / 'released-slots').read_text().splitlines()) == 6)
+            if known_failure:
+                verify_attempts(case, resumed, state, {target: 1 for target in targets},
+                                {targets[0]: 9}, case.name + '/' + phase)
+                check(case.name + '/' + phase + ': original failed sidecar keeps its actual exit and error',
+                      failed['exit_code'] == 9 and
+                      failed['error'] == 'deliberate stdin-consuming build failure' and
+                      saved.get('reconciled_from_sidecar') is True)
+            else:
+                check(case.name + '/' + phase + ': missing worker evidence remains an explicit coordinator refusal',
+                      failed['exit_code'] == 6 and failed['stage'] == 'resume' and
+                      failed['receipt_source'] == 'coordinator' and
+                      not any(key in failed for key in ('worker_exit_code', 'artifact_path',
+                                                       'artifact_paths', 'resume_artifacts')) and
+                      not Path(failed['result_path']).exists() and
+                      unavailable_receipt.read_bytes() == unavailable_bytes and
+                      len(list(workspace.glob('results/*.json'))) == 5)
+            check(case.name + '/' + phase + ': successful work and every retained receipt remain unchanged',
+                  all(row['status'] == 'success' and row['attempt'] == 1 for row in resumed['targets'][1:]) and
+                  all(path.read_bytes() == contents for path, contents in immutable.items()))
+        continue
     resumed, state = invoke(case, identity, jobs, 'success', 'resume')
     for row in resumed['targets'][:jobs]:
         target = row['platform']
@@ -551,6 +641,125 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-compl
     check(case.name + ': second resume reuses every embedded result without new attempts or changed receipts',
           all(row.get('resume_reused') is True for row in again['targets']) and
           all(path.read_bytes() == contents for path, contents in immutable.items()))
+
+    # A completed result becomes non-reusable when its frozen payload is no
+    # longer available. An exhausted retry budget must not turn it back into
+    # successful publication evidence or silently compile a second attempt.
+    artifact = Path(again['targets'][0]['artifact_path'])
+    retained_artifact = case / 'unavailable-artifact.bin'
+    artifact.rename(retained_artifact)
+    retained_bytes = retained_artifact.read_bytes()
+    immutable = {path: path.read_bytes() for directory in ('logs', 'results')
+                 for path in (workspace / directory).rglob('*') if path.is_file()}
+    for phase in ('resume-artifact-lost', 'resume-artifact-lost-again'):
+        blocked, blocked_state = invoke(case, identity, jobs, 'success', phase,
+                                        retry_max=1, expected_code=1)
+        row = blocked['targets'][0]
+        saved = blocked_state['target_statuses'][targets[0]]
+        check(case.name + '/' + phase + ': unavailable completed artifacts cannot bypass the exhausted budget',
+              row['status'] == 'failed' and row['exit_code'] == 6 and row['attempt'] == 1 and
+              row['stage'] == 'resume' and row['receipt_source'] == 'coordinator' and
+              row.get('retry_limit_exceeded') is True and
+              not any(key in row for key in ('worker_exit_code', 'artifact_path',
+                                             'artifact_paths', 'resume_artifacts')) and
+              saved['status'] == 'failed' and saved['result'] == row and
+              blocked_state['status'] == 'partial' and
+              blocked['summary'] == {'total': 6, 'success': 5, 'failed': 1})
+        check(case.name + '/' + phase + ': no new execution or receipt replaces the missing artifact evidence',
+              Counter(event['target'] for event in events(case)) ==
+              Counter({target: 1 for target in targets}) and
+              all(entry['attempts'] == 1 for entry in blocked_state['target_statuses'].values()) and
+              not artifact.exists() and retained_artifact.read_bytes() == retained_bytes and
+              all(path.read_bytes() == contents for path, contents in immutable.items()) and
+              len(list(workspace.glob('logs/*.log'))) == 6 and
+              len(list(workspace.glob('results/*.json'))) == 6)
+
+if sidecar_cases:
+    case, identity = fixture(1, 'source-sync-recovery')
+    workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
+    host_map = {target: 'host-' + target.replace('/', '-') for target in targets}
+    sync_rows = [dict(host=host, path=str(case / 'source'),
+                      status='failed' if target == targets[0] else 'success')
+                 for target, host in host_map.items()]
+    sync_rows[0]['error'] = 'deliberate source transport refusal'
+    sync_receipt = dict(status='partial', synced=5, failed=1, target_hosts=host_map,
+                        hosts=sync_rows,
+                        source_roots={row['host']: row['path'] for row in sync_rows
+                                      if row['status'] == 'success'})
+    (case / 'source-sync.json').write_text(json.dumps(sync_receipt) + '\n')
+
+    def crash_at_state_update(phase):
+        env = invocation_env(case, identity, 1, 'source-sync-recovery', phase, retry_max=1)
+        marker = case / (phase + '.state-update.ready')
+        with open(case / (phase + '.stdout'), 'wb') as out, open(case / (phase + '.stderr'), 'wb') as err:
+            process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                                       stdout=out, stderr=err, start_new_session=True)
+            try:
+                wait_for(process, marker.is_file,
+                         case.name + '/' + phase + ': coordinator did not reach the real state boundary')
+                check(case.name + '/' + phase + ': state barrier belongs to the actual coordinator',
+                      int(marker.read_text()) == process.pid)
+                process.kill()
+                check(case.name + '/' + phase + ': actual coordinator death preserves the checkpoint',
+                      process.wait(timeout=5) == -signal.SIGKILL)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+        state = read(workspace / 'state.json')
+        (case / (phase + '.state.json')).write_text(json.dumps(state) + '\n')
+        return state
+
+    # The state boundary, not capacity waiting, must hold this checkpoint.
+    (case / 'release').write_text('continue\n')
+    before = crash_at_state_update('first')
+    prior = before['target_statuses'][targets[0]]
+    check(case.name + ': source-only worker completed before its result reached state',
+          before['status'] == 'running' and prior['status'] == 'running' and
+          prior['attempts'] == 1 and prior.get('result') is None and
+          prior.get('source_sync_failures', 0) == 0 and
+          read(Path(prior['result_path']))['stage'] == 'source_sync' and
+          read(Path(prior['result_path']))['exit_code'] == 1 and
+          not events(case) and not list(case.glob('prelude.*.ready')))
+    immutable = {Path(prior[key]): Path(prior[key]).read_bytes() for key in ('log_path', 'result_path')}
+    for phase in ('resume-reconcile', 'resume-reconcile-again'):
+        reconciled = crash_at_state_update(phase)
+        saved = reconciled['target_statuses'][targets[0]]
+        result = saved['result']
+        check(case.name + '/' + phase + ': one source-only attempt earns exactly one compiler-budget discount',
+              saved['status'] == 'failed' and saved['attempts'] == 1 and
+              saved.get('source_sync_failures') == 1 and saved.get('reconciled_from_sidecar') is True and
+              result['stage'] == 'source_sync' and result['exit_code'] == 1 and
+              result['attempt'] == 1 and result['log_path'] == prior['log_path'] and
+              result['result_path'] == prior['result_path'] and not events(case) and
+              all(reconciled['target_statuses'][target]['attempts'] == 0 for target in targets[1:]) and
+              all(path.read_bytes() == contents for path, contents in immutable.items()))
+
+    # Repair only the source gate. The first actual compiler attempt fails,
+    # then max1 must stop a further retry despite two prior reconciliations.
+    for row in sync_rows:
+        row['status'] = 'success'
+        row.pop('error', None)
+    sync_receipt.update(status='success', synced=6, failed=0,
+                        source_roots={row['host']: row['path'] for row in sync_rows})
+    (case / 'source-sync.json').write_text(json.dumps(sync_receipt) + '\n')
+    for phase, mode in (('resume-repaired', 'failure'), ('resume-budget-exhausted', 'success')):
+        value, state = invoke(case, identity, 1, mode, phase, retry_max=1, expected_code=1)
+        dispatches = {target: 2 if target == targets[0] else 1 for target in targets}
+        verify_attempts(case, value, state, {target: 1 for target in targets},
+                        {targets[0]: 9}, case.name + '/' + phase, dispatch_counts=dispatches)
+        check(case.name + '/' + phase + ': repair admits exactly one real compiler attempt without over-discounting',
+              state['target_statuses'][targets[0]].get('source_sync_failures') == 1 and
+              value['targets'][0]['attempt'] == 2 and
+              sorted(event['attempt'] for event in events(case) if event['target'] == targets[0]) == [2] and
+              len(list(workspace.glob('results/*.json'))) == 7 and
+              len(list(workspace.glob('logs/*.log'))) == 7 and
+              all(path.read_bytes() == contents for path, contents in immutable.items()))
+        if phase == 'resume-budget-exhausted':
+            check(case.name + ': source discount does not admit a second compiler failure',
+                  value['targets'][0].get('retry_limit_exceeded') is True and
+                  value['targets'][0]['exit_code'] == 9)
+
 
 if sys.argv[3] not in ('--coordinator-receipt-only', '--sidecar-recovery-only', '--worker-completion-only'):
     case = root / 'early-worker-refusal'
