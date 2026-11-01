@@ -119,6 +119,10 @@ The strict Unix and Windows cache generators preserve the attempt suffix in
 with an ASCII letter or digit, contains at least two characters, and permits
 only letters, digits, underscores and hyphens. Keeping the exact suffix preserves
 the cache identity expected by native readiness and subsequent admission.
+Both generators enforce that ASCII contract in a function-local `C` locale,
+so Unicode collation cannot expand the permitted letter ranges. The caller's
+locale is restored on return; inability to establish the validation locale
+refuses generation with exit code 4.
 Invalid source roots or suffixes produce a specific stderr diagnostic before
 the generator emits any program. The existing source-root constraints, exclusive
 private-home creation and immutable seed verification remain in force. These

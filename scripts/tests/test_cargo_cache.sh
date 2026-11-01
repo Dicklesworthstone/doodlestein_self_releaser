@@ -1322,6 +1322,80 @@ _act_ssh_exec() { bash -s <<< $'{\n'"$2"$'\n} </dev/null'; }
         self.assertIn("Open-DsrCachePathGuard 'C:/fixture/source'", result.stdout)
         self.assertIn("'.cargo-home-attempt_native'", result.stdout)
 
+    def unicode_collation_locale(self):
+        if not shutil.which('locale'):
+            self.skipTest('locale inventory unavailable')
+        result = subprocess.run(['locale', '-a'], env=dict(os.environ, LC_ALL='C'),
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in result.stdout.splitlines():
+            if name.lower().replace('-', '') == 'en_us.utf8':
+                return name
+        self.skipTest('en_US UTF-8 locale unavailable; non-C collation regression requires it')
+
+    def test_both_generators_keep_ascii_path_contract_under_unicode_collation(self):
+        # libc collation can make Bash's [A-Za-z] ranges accept accented and
+        # fullwidth letters. Test the actual generators in that locale, with
+        # the supported underscore suffix as a positive control.
+        env = dict(os.environ, LC_ALL=self.unicode_collation_locale())
+        suffix = 'linux-musl_amd64-0123456789abcdef0123456789abcdef'
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            function = '_act_' + backend + '_private_cargo_home_script'
+            result = self.shell(function, root, suffix, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('.cargo-home-' + suffix, result.stdout)
+            self.assertEqual(result.stderr, '')
+            for invalid in ('attempt_é', 'attempt_K', 'attempt_Ａ'):
+                with self.subTest(backend=backend, suffix=invalid):
+                    result = self.shell(function, root, invalid, env=env)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo attempt suffix', result.stderr)
+            for invalid in (root + '/caché', root + '/K', root + '/Ａ'):
+                with self.subTest(backend=backend, root=invalid):
+                    result = self.shell(function, invalid, suffix, env=env)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo source root', result.stderr)
+
+    def test_both_generators_preserve_caller_locale_on_success_and_refusal(self):
+        language = self.unicode_collation_locale()
+        program = r'''
+source "$1" || exit $?
+shift
+status=0
+"$@" >/dev/null || status=$?
+printf '%s\n%s\n' "$status" "$LC_ALL"
+'''
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            for suffix, status in (('linux-musl_amd64-attempt', 0), ('../escape', 4)):
+                with self.subTest(backend=backend, suffix=suffix):
+                    result = subprocess.run(
+                        ['bash', '-c', program, '_', ACT_RUNNER,
+                         '_act_' + backend + '_private_cargo_home_script', root, suffix],
+                        env=dict(os.environ, LC_ALL=language), text=True,
+                        capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(), [str(status), language])
+
+    def test_both_generators_fail_closed_if_validation_locale_is_readonly(self):
+        program = r'''
+source "$1" || exit $?
+shift
+readonly LC_ALL
+"$@"
+'''
+        env = dict(os.environ, LC_ALL=self.unicode_collation_locale())
+        for backend, root in (('unix', '/tmp/source'), ('windows', 'C:/fixture/source')):
+            with self.subTest(backend=backend):
+                result = subprocess.run(
+                    ['bash', '-c', program, '_', ACT_RUNNER,
+                     '_act_' + backend + '_private_cargo_home_script', root, 'attempt_é'],
+                    env=env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('ASCII validation locale', result.stderr)
+
     def test_both_generators_refuse_unsafe_suffixes_before_emitting_programs(self):
         suffixes = ('', 'a', '_leading', '-leading', 'a/b', 'a\\b', '../attempt',
                     'a..b', 'a b', 'a\tb', 'a\nb', 'a\rb', "a'b", 'a"b', 'a;b',

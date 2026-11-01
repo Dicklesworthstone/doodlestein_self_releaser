@@ -5924,6 +5924,12 @@ EOF
 # or letting normal unpacking race another target's cache inventory.
 _act_unix_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
+    # Shell ranges follow LC_COLLATE: en_US.UTF-8 can otherwise admit non-ASCII
+    # letters in these path components. Keep the wire/path allowlist literal.
+    local LC_ALL=C || {
+        _log_error "Unable to select ASCII validation locale for strict Unix Cargo paths"
+        return 4
+    }
     if [[ ! "$source_root" =~ ^/[A-Za-z0-9_./+-]+$ || "$source_root" == *..* ]]; then
         _log_error "Invalid strict Unix Cargo source root: expected an absolute source path using letters, digits, _, ., /, + or -, without '..'"
         return 4
@@ -6328,6 +6334,11 @@ _act_windows_cache_command() {
 
 _act_windows_private_cargo_home_script() {
     local source_root="$1" suffix="$2"
+    # Match the Unix ASCII path contract independently of coordinator locale.
+    local LC_ALL=C || {
+        _log_error "Unable to select ASCII validation locale for strict Windows Cargo paths"
+        return 4
+    }
     source_root="${source_root//\\//}"
     if [[ ! "$source_root" =~ ^[A-Za-z]:/[A-Za-z0-9_./+-]+$ || "$source_root" == *..* ]]; then
         _log_error "Invalid strict Windows Cargo source root: expected a drive-qualified source path using letters, digits, _, ., /, + or -, without '..'"
