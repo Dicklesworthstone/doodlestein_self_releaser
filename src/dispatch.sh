@@ -249,7 +249,9 @@ dispatch_batch() (
     trap 'for index in "${pids[@]}"; do kill "$index" 2>/dev/null || :; done; wait; exit 5' HUP INT TERM
     [[ "$parallel" != true ]] || limit="${DISPATCH_PARALLELISM:-4}"
     while IFS= read -r repo; do
-        _dp_deliver "$repo" "$event" "$body" > "$work/$i.json" &
+        # A transport/auth descendant must not read the remaining repository
+        # records from this loop's stdin. Isolate the whole delivery worker.
+        _dp_deliver "$repo" "$event" "$body" </dev/null > "$work/$i.json" &
         pids+=("$!"); i=$((i + 1))
         if (( ${#pids[@]} >= limit )); then
             for index in "${pids[@]}"; do wait "$index" || failed=$((failed + 1)); done
@@ -258,10 +260,13 @@ dispatch_batch() (
     done <<< "$selected"
     for index in "${pids[@]}"; do wait "$index" || failed=$((failed + 1)); done
     (( failed == 0 )) || rc=1
-    jq -sc --argjson rc "$rc" --argjson expected "$i" '
-        if length == $expected and all(.[]; type=="object" and has("outcome"))
+    # Reconcile against the requested inventory, not the number of workers the
+    # loop happened to launch; a short dispatch must never report acceptance.
+    jq -sc --argjson rc "$rc" --arg repos "$selected" '
+        ($repos|split("\n")|sort) as $expected |
+        if ([.[].repo]|sort) == $expected and all(.[]; type=="object" and has("outcome"))
         then {status:(if $rc==0 then "accepted" else "incomplete" end),exit_code:$rc,results:sort_by(.repo)}
-        else error("Missing dispatch outcomes") end' "$work/"*.json || return 1
+        else error("Missing or mismatched dispatch outcomes") end' "$work/"*.json || return 1
     return "$rc"
 )
 

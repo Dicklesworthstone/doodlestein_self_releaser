@@ -57,6 +57,9 @@ cat > "$WORK/bin/gh" <<'GH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DP_TEST_CASE/gh-calls"
 [[ "$*" == 'auth token --hostname github.com' ]] || exit 9
+if [[ "${DP_READ_STDIN:-false}" == true ]]; then
+    cat > "$DP_TEST_CASE/stdin-$BASHPID"
+fi
 printf '%s' 'stored-token'
 GH
 chmod +x "$WORK/bin/curl" "$WORK/bin/gh"
@@ -73,13 +76,27 @@ new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"; export DP_TEST_CASE="$CASE"
     export DSR_STATE_DIR="$CASE/state"
     : > "$CASE/calls"; : > "$CASE/argv"; : > "$CASE/gh-calls"
-    unset DP_MODE DRY_RUN
+    unset DP_MODE DP_READ_STDIN DRY_RUN
     export DSR_GH_TOKEN=dsr-explicit GITHUB_TOKEN=github-other GH_TOKEN=gh-other
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
 count() { wc -l < "$CASE/calls"; }
 contains() { grep -F -- "$2" "$1" >/dev/null; }
 absent_text() { ! grep -F -- "$2" "$1" >/dev/null; }
+auth_inputs_empty() {
+    local input seen=0
+    for input in "$CASE"/stdin-*; do
+        [[ -f "$input" && ! -s "$input" ]] || {
+            printf 'Expected an empty auth input: %s\n' "$input"
+            return 1
+        }
+        seen=$((seen+1))
+    done
+    [[ "$seen" -eq "$1" ]] || {
+        printf 'Expected %s auth invocations, observed %s\n' "$1" "$seen"
+        return 1
+    }
+}
 
 new_case success
 capture dispatch_event Owner/Repo release --payload '{"version":"v1.2.3"}'
@@ -188,6 +205,54 @@ export DP_MODE=mixed
 capture dispatch_batch release --repos 'owner/a,owner/b' --parallel
 check 'one failed target makes whole batch incomplete' test "$status" -eq 1
 check 'partial batch includes both outcomes' jq -e '.status=="incomplete" and ([.results[].outcome]|sort)==["accepted","rejected"]' "$CASE/out"
+
+# Exercise the real delivery workers and HTTP receipt path. A deliberately
+# stdin-consuming auth executable is a descendant of every worker, while curl
+# still receives its intentional credential pipe. With the vulnerable launch,
+# the first batch consumes the undispatched repository records.
+for scheduling in serial parallel; do
+    batch_args=()
+    [[ "$scheduling" != parallel ]] || batch_args=(--parallel)
+    for mode in success mixed lost rate; do
+        new_case "batch-stdin-$scheduling-$mode"
+        unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN
+        export DP_READ_STDIN=true DP_MODE="$mode"
+        capture dispatch_batch release --repos 'owner/a,owner/b,owner/c,owner/d,owner/e,owner/f' \
+            --payload '{"version":"v1.2.3"}' ${batch_args[@]+"${batch_args[@]}"} </dev/null
+        expected_status=0 expected_attempts=1 expected_calls=6
+        case "$mode" in mixed|lost) expected_status=1 ;; rate) expected_attempts=3; expected_calls=18 ;; esac
+        check "$scheduling $mode preserves the aggregate exit" test "$status" -eq "$expected_status"
+        check "$scheduling $mode dispatches every configured repository exactly once" jq -e \
+            '[.results[].repo]==["owner/a","owner/b","owner/c","owner/d","owner/e","owner/f"]' "$CASE/out"
+        check "$scheduling $mode receipts retain actual transport attempt counts" jq -e \
+            --argjson attempts "$expected_attempts" 'all(.results[]; .attempts==$attempts)' "$CASE/out"
+        check "$scheduling $mode executes every recorded transport attempt" test "$(count)" -eq "$expected_calls"
+        check "$scheduling $mode still delivers the credential pipe to curl" contains "$CASE/auth" 'Bearer stored-token'
+        check "$scheduling $mode all auth descendants see EOF" auth_inputs_empty "$((1+6+expected_calls))"
+        case "$mode" in
+            success|rate)
+                check "$scheduling $mode reports all acknowledgements" jq -e \
+                    '.status=="accepted" and all(.results[]; .outcome=="accepted" and .exit_code==0)' "$CASE/out" ;;
+            mixed)
+                check "$scheduling failure preserves the rejected repository" jq -e \
+                    '.status=="incomplete" and ([.results[]|select(.outcome=="rejected")|.repo]==["owner/b"])' "$CASE/out" ;;
+            lost)
+                check "$scheduling timeout remains uncertain with no blind retry" jq -e \
+                    '.status=="incomplete" and all(.results[]; .outcome=="uncertain" and .exit_code==8)' "$CASE/out" ;;
+        esac
+    done
+done
+
+# Admission is bound to the reviewed destinations even if a worker returns an
+# otherwise valid receipt for a different destination or duplicates a peer.
+batch_wrong_receipt() (
+    _dp_deliver() { _dp_result owner/a "$2" accepted 0 1 204; }
+    dispatch_batch release --repos owner/a,owner/b
+)
+new_case batch-wrong-receipt
+capture batch_wrong_receipt
+check 'duplicate receipt cannot conceal an omitted destination' test "$status" -ne 0
+check 'rejected inventory emits no accepted aggregate' test ! -s "$CASE/out"
 
 new_case release
 sha=$(printf '%040d' 1)
