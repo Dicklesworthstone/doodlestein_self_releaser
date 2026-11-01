@@ -102,7 +102,7 @@ if mode == 'readiness':
     # The actual native runner converts this health refusal into its own
     # structured result. No compiler or successful artifact is simulated.
     raise SystemExit(1)
-if mode == 'cancel' or (mode == 'timeout' and target == 'linux/amd64'):
+if mode in ('cancel', 'custody-cancel') or (mode == 'timeout' and target == 'linux/amd64'):
     while True:
         time.sleep(0.05)
 if mode == 'failure' and target == 'linux/amd64':
@@ -124,7 +124,7 @@ driver.write_text(r'''#!/usr/bin/env bash
 set -uo pipefail
 source "$DSR_STDIN_PROJECT/src/logging.sh"
 source "$DSR_STDIN_PROJECT/src/config.sh"
-source "$DSR_STDIN_PROJECT/src/build_state.sh"
+source "${DSR_TEST_BUILD_STATE:-$DSR_STDIN_PROJECT/src/build_state.sh}"
 source "$DSR_STDIN_MODULE"
 if [[ "$DSR_STDIN_MODE" == source-sync-recovery || "$DSR_STDIN_MODE" == readiness-recovery ]]; then
     # Keep the real state updater. Pause its caller at two precise durable
@@ -160,7 +160,7 @@ if [[ "$DSR_STDIN_MODE" == source-sync-recovery || "$DSR_STDIN_MODE" == readines
 fi
 selector_acquire_slot() {
     cat > "$DSR_STDIN_CASE/prelude.$2.stdin"
-    printf 'ready\n' > "$DSR_STDIN_CASE/prelude.$2.ready"
+    printf '%s\n' "$BASHPID" > "$DSR_STDIN_CASE/prelude.$2.ready"
     while [[ ! -f "$DSR_STDIN_CASE/release" ]]; do sleep 0.02; done
 }
 selector_release_slot() {
@@ -171,7 +171,8 @@ selector_release_slot() {
         # must preserve completed success even if its outer worker now dies.
         kill -KILL "$BASHPID"
     fi
-    if [[ "$DSR_STDIN_MODE" == sidecar-* && "$DSR_STDIN_PHASE" == first ]]; then
+    if [[ ( "$DSR_STDIN_MODE" == sidecar-* || "$DSR_STDIN_MODE" == custody-cancel ) &&
+          "$DSR_STDIN_PHASE" == first ]]; then
         # The real worker has saved its terminal receipt, but the coordinator
         # cannot reap it or save the embedded result until this barrier ends.
         local ready_path="$DSR_STDIN_CASE/sidecar.$2.ready"
@@ -204,7 +205,7 @@ act_run_native_build() {
     local deadline=10 native_mode="$DSR_STDIN_MODE"
     [[ "$native_mode" != readiness ]] || native_mode=success
     [[ "$native_mode" != sidecar-failure-recovery ]] || native_mode=failure
-    [[ "$DSR_STDIN_MODE" != cancel ]] || deadline=60
+    [[ "$DSR_STDIN_MODE" != cancel && "$DSR_STDIN_MODE" != custody-cancel ]] || deadline=60
     if [[ "$DSR_STDIN_MODE" == timeout && "$2" == linux/amd64 ]]; then deadline=1; fi
     _act_run_with_timeout "$deadline" python3 "$DSR_STDIN_WORKER" \
         "$DSR_STDIN_CASE" "$2" "$attempt" "$native_mode"
@@ -398,6 +399,130 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
     check(label + ': target completion does not claim finalized publication',
           (state['status'] == 'targets-complete') == completed and
           state['status'] != 'completed' and not (case / 'output/.dsr-build-purpose.json').exists())
+
+
+def coordinator_custody_cases():
+    def signal_defaults():
+        # Noninteractive Bash cannot trap a signal inherited as ignored.
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+    def running(pid):
+        probe = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True)
+        return probe.returncode == 0 and bool(probe.stdout.strip()) and not probe.stdout.strip().startswith(b'Z')
+
+    def signal_worker(pid, session):
+        try:
+            if os.getsid(pid) == session:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def lock_info(case):
+        env = dict(os.environ, DSR_STATE_DIR=str(case / 'state'))
+        probe = subprocess.run(['bash', '-c', 'source "${DSR_TEST_BUILD_STATE:-$1/src/build_state.sh}"; '
+                                'build_state_init && build_lock_info stdinfixture 1.0.0',
+                                'fixture', str(project)], env=env, capture_output=True, timeout=5)
+        check(case.name + ': custody inspection succeeds', probe.returncode == 0)
+        return json.loads(probe.stdout)
+
+    for jobs in (1, 3):
+        for crash_signal in (signal.SIGKILL, signal.SIGHUP):
+            case, identity = fixture(jobs, 'custody-' + crash_signal.name)
+            workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
+            env = invocation_env(case, identity, jobs, 'custody-cancel', 'first')
+            with open(case / 'first.stdout', 'wb') as out, open(case / 'first.stderr', 'wb') as err:
+                process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                                           stdout=out, stderr=err, start_new_session=True,
+                                           preexec_fn=signal_defaults)
+                workers = []
+                try:
+                    wait_for(process, lambda: len(list(case.glob('prelude.*.ready'))) == jobs,
+                             case.name + ': initial worker wave did not start')
+                    workers = [int(path.read_text()) for path in case.glob('prelude.*.ready')]
+                    (case / 'release').write_text('continue\n')
+                    wait_for(process, lambda: len(events(case)) == jobs,
+                             case.name + ': native descendants did not start')
+                    original_events = events(case)
+                    checkpoint = (workspace / 'state.json').read_bytes()
+                    check(case.name + ': custody covers the real running coordinator and workers',
+                          lock_info(case).get('locked') is True and
+                          all(running(event['pid']) for event in original_events))
+                    process.send_signal(crash_signal)
+                    if crash_signal == signal.SIGKILL:
+                        check(case.name + ': coordinator loss leaves genuine active backend work',
+                              process.wait(timeout=5) == -signal.SIGKILL and
+                              all(running(event['pid']) for event in original_events))
+
+                    # The original worker's release barrier retains its lease
+                    # even if HUP cleanup finishes before this retry gets CPU.
+                    # Every retry must refuse before state or attempt changes.
+                    for retry in (1, 2):
+                        phase = 'resume-blocked-%d' % retry
+                        blocked_env = invocation_env(case, identity, jobs, 'success', phase)
+                        blocked = subprocess.run(['bash', str(driver)], env=blocked_env,
+                                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+                        (case / (phase + '.stdout')).write_bytes(blocked.stdout)
+                        (case / (phase + '.stderr')).write_bytes(blocked.stderr)
+                        check(case.name + '/' + phase + ': exact resume refuses inherited live custody',
+                              blocked.returncode == 2 and json.loads(blocked.stdout)['status'] == 'error')
+                        check(case.name + '/' + phase + ': refusal does not dispatch or spend an attempt',
+                              events(case) == original_events and
+                              (workspace / 'state.json').read_bytes() == checkpoint)
+                    if crash_signal == signal.SIGKILL:
+                        held = lock_info(case)
+                        check(case.name + ': a dead coordinator PID cannot make inherited custody stale',
+                              held['locked'] is True and held['custody'] == 'held' and
+                              held['process_alive'] is False and held['stale'] is False)
+                        for pid in workers:
+                            signal_worker(pid, process.pid)
+                    wait_for(None, lambda: len(list(case.glob('sidecar.*.ready'))) == jobs,
+                             case.name + ': cancelled workers did not retain terminal receipts')
+                    check(case.name + ': interrupted descendants stop before worker lease release',
+                          all(not running(event['pid']) for event in original_events) and
+                          all(running(pid) for pid in workers) and
+                          all(read(path)['exit_code'] == 130 for path in (workspace / 'results').glob('*.json')))
+                    immutable = {path: path.read_bytes() for directory in ('logs', 'results')
+                                 for path in (workspace / directory).rglob('*') if path.is_file()}
+                finally:
+                    # Only fixture-owned workers are signalled. Retain files
+                    # and unblock all barriers on both pass and failure.
+                    (case / 'release-workers').write_text('continue\n')
+                    for pid in workers:
+                        signal_worker(pid, process.pid)
+                    if process.poll() is None:
+                        process.send_signal(signal.SIGTERM)
+                        try:
+                            process.wait(timeout=12)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait(timeout=5)
+                    wait_for(None, lambda: all(not running(pid) for pid in workers),
+                             case.name + ': owned workers did not drain')
+                if crash_signal == signal.SIGHUP:
+                    check(case.name + ': hangup returns managed cancellation and all configured rows',
+                          process.returncode == 130 and read(case / 'first.stdout')['summary'] ==
+                          {'total': 6, 'success': 0, 'failed': 6})
+            free = lock_info(case)
+            check(case.name + ': kernel custody is free only after the last inherited worker closes it',
+                  free['locked'] is False and free['custody'] == 'free')
+            resumed, state = invoke(case, identity, jobs, 'success', 'resume')
+            counts = {target: 2 if target in targets[:jobs] else 1 for target in targets}
+            verify_attempts(case, resumed, state, counts, {}, case.name + '/resume')
+            check(case.name + ': exact recovery preserves original interruption evidence',
+                  all(path.read_bytes() == data for path, data in immutable.items()))
+            after = events(case)
+            repeated, repeated_state = invoke(case, identity, jobs, 'success', 'resume-again')
+            check(case.name + ': repeated exact resume reuses every success without executing again',
+                  events(case) == after and all(row.get('resume_reused') for row in repeated['targets']) and
+                  all(entry['attempts'] == counts[target]
+                      for target, entry in repeated_state['target_statuses'].items()))
+
+
+if sys.argv[3] in ('all', '--stdin-isolation-only', '--coordinator-custody-only'):
+    coordinator_custody_cases()
+if sys.argv[3] == '--coordinator-custody-only':
+    print('Coordinator custody: %d checks passed' % checks, flush=True)
+    raise SystemExit(0)
 
 
 for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-recovery-only',
@@ -1732,7 +1857,12 @@ fi
 # the target worker. Exercise both caller monitor states on normal completion.
 if [[ "$MODE" == success || "$MODE" == failure ]]; then
     [[ "$MODE" != success ]] || set -m
-    coproc FOREIGN_WORKER { IFS= read -r request; printf 'foreign:%s\n' "$request"; }
+    coproc FOREIGN_WORKER {
+        IFS= read -r request
+        printf 'foreign:%s\n' "$request"
+        # Keep the read descriptor live until its owner observed the reply.
+        IFS= read -r acknowledgement && [[ "$acknowledgement" == received ]]
+    }
     foreign_pid="$FOREIGN_WORKER_PID"
     foreign_read="${FOREIGN_WORKER[0]}"
     foreign_write="${FOREIGN_WORKER[1]}"
@@ -1746,6 +1876,7 @@ if [[ "$MODE" == success || "$MODE" == failure ]]; then
     printf 'still-owned\n' >&"$foreign_write"
     IFS= read -r -u "$foreign_read" foreign_response || exit 91
     [[ "$foreign_response" == foreign:still-owned ]] || exit 92
+    printf 'received\n' >&"$foreign_write"
     wait "$foreign_pid" || exit 93
     if [[ "$before_flags" == *m* ]]; then
         [[ "$after_flags" == *m* ]] || exit 94
@@ -1873,7 +2004,8 @@ fi
 
 if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
       "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ||
-      "${1:-}" == --host-readiness-only || "${1:-}" == --host-readiness-cli-only ]]; then
+      "${1:-}" == --host-readiness-only || "${1:-}" == --host-readiness-cli-only ||
+      "${1:-}" == --coordinator-custody-only ]]; then
     test_worker_stdin_isolation "$1"
     exit $?
 fi

@@ -556,6 +556,10 @@ worker releases capacity or writes an interruption receipt. Completed backends
 drain without that grace delay. Losing the worker closes its control channel and
 retires the group; a killed worker does not fabricate a completion receipt or claim
 to have released its lease. Native remote builds retain their host-side supervisors.
+Timed local commands also remain in an owned process group. A command leader
+exiting does not abandon a descendant that ignored termination; cleanup finishes
+before the timeout wrapper returns its actual command or deadline status.
+The timed command retains its original stdin, including staged script input.
 Queued tasks that have never run report
 `status: "skipped"` and `attempt: 0`, without a log or result path. They remain
 pending in run state, so exact-run resume starts their first attempt while
@@ -566,11 +570,27 @@ receipt, it records the observed `worker_exit_code` and
 `receipt_source: "coordinator"`; a missing receipt cannot turn a zero process
 exit into a successful build.
 
-After coordinator loss, resume reconciles valid terminal worker receipts with
-their retained dispatch attempt and paths. The original sidecars remain
-unchanged. Failed sidecars retain their observed error and exit code, and a
-source-sync refusal is excluded from the compiler retry budget exactly once,
-even across repeated crashes during reconciliation.
+Build exclusion is held by an inherited operating-system file lock for each
+tool and version. If the coordinator dies while a worker remains active, an
+immediate resume returns exit 2 until the last inherited holder closes its
+descriptor. The saved PID and lock age are diagnostic information; neither a
+dead coordinator nor an old timestamp permits overlapping attempts. Public
+build and fallback commands retain this exclusion through collection and
+publication. Build state requires a filesystem that supports local advisory
+locks, with `flock` or Python 3's `fcntl` available on the coordinator.
+
+The `.lock.lease` sidecar is a stable lock inode and must remain in place.
+Legacy PID-only metadata or a missing, replaced or malformed lease identity
+fails closed. For a retained legacy `.lock`, verify that the old coordinator
+and all of its workers have stopped before moving that metadata aside; keep
+any `.lock.lease` sidecar. Current lease-backed runs recover automatically once
+their inherited holders finish.
+
+After coordinator loss and release of that exclusion, resume reconciles valid
+terminal worker receipts with their retained dispatch attempt and paths. The
+original sidecars remain unchanged. Failed sidecars retain their observed error
+and exit code, and a source-sync refusal is excluded from the compiler retry
+budget exactly once, even across repeated crashes during reconciliation.
 The retry limit applies to every non-reusable target, including one still
 recorded as running or completed with unavailable artifacts. Verified completed
 results remain reusable at the limit. Exhaustion does not launch another worker
@@ -990,6 +1010,18 @@ cleanup, while the host deadline remains the configured build timeout. Builds
 receive EOF on stdin. A missing host runtime returns dependency error 3 before
 the compiler runs. Commands that deliberately detach into a new session are
 outside this process-group boundary. Strict Rust still requires Python 3.11+.
+
+Native Windows guards retain the complete compiler program as `payload.ps1`
+beside the staged launcher and start PowerShell with a quoted `-File` path.
+The program's size therefore does not become a child command-line argument.
+The payload is created exclusively, flushed, scanned with the existing Defender
+policy, and checked against its original bytes under a held read handle before
+launch. Directory-chain handles prevent ancestor substitution during execution;
+linked files, reparses, conflicting existing payloads and changed bytes are
+refused. The file preserves Unicode with a UTF-8 BOM and remains as attempt
+evidence. The child still starts suspended, enters its owned kill-on-close Job
+Object, and only then resumes. Normal exit status is preserved; the host-side
+deadline returns 124 after stopping the job.
 
 The manifest also retains `requested_targets` when supplied by the orchestrator.
 For native matrices, both generation and release admission reconcile selected

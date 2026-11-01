@@ -6,7 +6,7 @@
 #   - Build state persistence (JSON with authoritative per-target status)
 #   - Workspace isolation (unique run_id directories)
 #   - Resume from partial builds
-#   - Stale lock detection and cleanup
+#   - Inherited build custody across coordinator loss
 #
 # Usage:
 #   source build_state.sh
@@ -19,13 +19,18 @@
 
 set -uo pipefail
 
-# Lock settings
-# shellcheck disable=SC2034 # Used by external callers
-BUILD_LOCK_TTL_SECONDS="${DSR_LOCK_TTL:-3600}"  # 1 hour default
-BUILD_LOCK_STALE_THRESHOLD="${DSR_LOCK_STALE:-1800}"  # 30 min stale detection
-
 # State directory
-_BUILD_STATE_DIR=""
+_BUILD_STATE_DIR="${_BUILD_STATE_DIR:-}"
+
+# Indexed arrays keep this Bash 4.0 compatible, including when the module is
+# sourced from a loader function (where declare would create local variables).
+# A re-source must not forget an open lease. Children inherit these descriptors,
+# but only the process that acquired one may explicitly release its copy.
+if [[ "${_BUILD_LOCK_REGISTRY_READY:-0}" != 1 ]]; then
+  _BUILD_LOCK_PATHS=("") _BUILD_LOCK_FDS=("") _BUILD_LOCK_IDENTITIES=("")
+  _BUILD_LOCK_OWNERS=("") _BUILD_LOCK_RECORDS=("")
+  _BUILD_LOCK_REGISTRY_READY=1
+fi
 
 # Compute SHA256 for a file (portable: sha256sum or shasum -a 256)
 # Usage: _build_state_sha256 <file>
@@ -263,185 +268,208 @@ _build_get_state_file() {
 # Lock Management
 # ============================================================================
 
-# Acquire lock for a tool/version
-# Returns: 0 on success, 2 if already locked (conflict)
-build_lock_acquire() {
-  local tool="$1"
-  local version="$2"
-  # shellcheck disable=SC2034 # Reserved for future wait-for-lock feature
-  local wait="${3:-false}"  # Whether to wait for lock
-
-  [[ -z "$_BUILD_STATE_DIR" ]] && build_state_init
-
-  local tool_dir
-  tool_dir=$(_build_get_tool_dir "$tool" "$version")
-  if ! mkdir -p "$tool_dir"; then
-    log_error "Failed to create tool directory: $tool_dir"
-    return 1
+# Use a stable inode for the kernel lease and a separate, atomic metadata file.
+# Neither lease age nor coordinator death proves that inherited workers stopped.
+# Never unlink this sidecar, or unlock its shared open description with LOCK_UN.
+_build_lock_open_lease() {
+  local lease="$1" create="${2:-true}" descriptor
+  _BUILD_LOCK_OPEN_FD=""
+  if [[ ! -e "$lease" && ! -L "$lease" ]]; then
+    [[ "$create" == true ]] || return 1
+    (umask 077; set -C; : > "$lease") 2>/dev/null || true
   fi
-
-  local lock_file
-  lock_file=$(_build_get_lock_file "$tool" "$version")
-
-  # Check for existing lock
-  if [[ -f "$lock_file" ]]; then
-    # Read existing lock info
-    local lock_pid lock_ts lock_run_id
-    if read -r lock_pid lock_ts lock_run_id < "$lock_file" 2>/dev/null; then
-      # Validate numeric fields to handle corrupted lock files
-      if [[ ! "$lock_pid" =~ ^[0-9]+$ ]] || [[ ! "$lock_ts" =~ ^[0-9]+$ ]]; then
-        log_warn "Corrupted lock file (invalid pid/ts), removing: $lock_file"
-        rm -f "$lock_file"
-      else
-        local now
-        now=$(date +%s)
-        local age=$((now - lock_ts))
-
-        # Check if process is still alive (clear immediately if not)
-        if ! kill -0 "$lock_pid" 2>/dev/null; then
-          log_warn "Removing stale lock (pid=$lock_pid not running, age=${age}s)"
-          rm -f "$lock_file"
-        elif [[ $age -gt $BUILD_LOCK_STALE_THRESHOLD ]]; then
-          # Process still alive but lock is old - respect it but warn
-          log_warn "Lock held by active process $lock_pid for ${age}s"
-          return 2
-        else
-          # Lock is recent and valid
-          log_warn "Build already locked by pid=$lock_pid (run_id=$lock_run_id)"
-          return 2
-        fi
+  [[ -f "$lease" && ! -L "$lease" ]] || return 1
+  # Preserve caller descriptors and other build leases. Bash 4.0 predates
+  # exec {variable}; eval receives only our bounded numeric descriptor.
+  for ((descriptor = 10; descriptor < 200; descriptor++)); do
+    if ! { : <&"$descriptor"; } 2>/dev/null; then
+      if eval 'exec '"$descriptor"'<> "$lease"'; then
+        _BUILD_LOCK_OPEN_FD="$descriptor"
+        return 0
       fi
+      return 1
     fi
-  fi
-
-  # Create lock file atomically
-  local my_pid=$$
-  local my_ts
-  my_ts=$(date +%s)
-  local my_run_id="${DSR_RUN_ID:-run-$my_ts-$my_pid}"
-
-  # Use temp file + mv for atomic creation
-  local temp_lock="$lock_file.$$"
-  echo "$my_pid $my_ts $my_run_id" > "$temp_lock"
-
-  if ! mv -n "$temp_lock" "$lock_file" 2>/dev/null; then
-    # Another process beat us to it
-    rm -f "$temp_lock"
-    log_warn "Failed to acquire lock (race condition)"
-    return 2
-  fi
-
-  # Verify we own the lock
-  local check_pid
-  read -r check_pid _ _ < "$lock_file" 2>/dev/null || true
-  if [[ "$check_pid" != "$my_pid" ]]; then
-    log_warn "Lock acquired by another process"
-    return 2
-  fi
-
-  log_info "Acquired build lock for $tool $version"
-  return 0
-}
-
-# Release lock for a tool/version
-build_lock_release() {
-  local tool="$1"
-  local version="$2"
-
-  local lock_file
-  lock_file=$(_build_get_lock_file "$tool" "$version")
-
-  if [[ ! -f "$lock_file" ]]; then
-    log_debug "No lock to release for $tool $version"
-    return 0
-  fi
-
-  # Verify we own the lock before releasing
-  local lock_pid
-  read -r lock_pid _ _ < "$lock_file" 2>/dev/null || true
-
-  if [[ "$lock_pid" == "$$" ]]; then
-    rm -f "$lock_file"
-    log_info "Released build lock for $tool $version"
-  else
-    log_warn "Cannot release lock owned by pid=$lock_pid (we are $$)"
-    return 1
-  fi
-}
-
-# Check if a lock exists and is valid
-# Returns: 0 if locked, 1 if not locked
-build_lock_check() {
-  local tool="$1"
-  local version="$2"
-
-  local lock_file
-  lock_file=$(_build_get_lock_file "$tool" "$version")
-
-  if [[ ! -f "$lock_file" ]]; then
-    return 1
-  fi
-
-  local lock_pid lock_ts
-  if read -r lock_pid lock_ts _ < "$lock_file" 2>/dev/null; then
-    local now
-    now=$(date +%s)
-    local age=$((now - lock_ts))
-
-    # Check if lock is stale
-    if [[ $age -gt $BUILD_LOCK_STALE_THRESHOLD ]]; then
-      if ! kill -0 "$lock_pid" 2>/dev/null; then
-        return 1  # Stale lock, process dead
-      fi
-    fi
-    return 0  # Lock is valid
-  fi
-
+  done
+  log_error "No free descriptor for build custody"
   return 1
 }
 
-# Get lock info as JSON
-build_lock_info() {
-  local tool="$1"
-  local version="$2"
+_build_lock_close_fd() {
+  local descriptor="$1"
+  [[ "$descriptor" =~ ^[0-9]{1,3}$ ]] || return 1
+  eval "exec ${descriptor}>&-"
+}
 
-  local lock_file
+_build_lock_record() {
+  local path="$1" expected_identity="${2:-}" record pid timestamp run format token identity extra
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  record=$(cat -- "$path") || return 1
+  [[ "$record" != *$'\n'* ]] || return 1
+  read -r pid timestamp run format token identity extra <<< "$record"
+  [[ "$pid" =~ ^[1-9][0-9]{0,9}$ && "$timestamp" =~ ^(0|[1-9][0-9]{0,9})$ &&
+     "$run" =~ ^[A-Za-z0-9._-]+$ && "$format" == lease-v1 &&
+     "$token" =~ ^[A-Za-z0-9:.-]+$ && "$identity" =~ ^[0-9]+:[0-9]+$ &&
+     -z "$extra" && ( -z "$expected_identity" || "$identity" == "$expected_identity" ) ]] || return 1
+  printf '%s\n' "$record"
+}
+
+# A probe uses a separate open description even when this shell owns the lease.
+# Return 0 when free, 2 when held, and 4 for unverifiable custody. Only a verified
+# free lease permits admission; legacy PID-only metadata is retained and refused.
+_build_lock_probe() (
+  local lock_file="$1" lease="$1.lease" descriptor identity
+  if [[ ! -e "$lease" && ! -L "$lease" ]]; then
+    [[ ! -e "$lock_file" && ! -L "$lock_file" ]] && return 0
+    return 4
+  fi
+  _build_lock_open_lease "$lease" false || return 4
+  descriptor="$_BUILD_LOCK_OPEN_FD"
+  identity=$(_build_state_fd_identity "$descriptor") || return 4
+  [[ ! -L "$lease" && "$(_build_state_file_identity "$lease")" == "$identity" ]] || return 4
+  command -v flock >/dev/null || command -v python3 >/dev/null || return 4
+  _build_state_wait_lock "$descriptor" 0 || return 2
+  [[ ! -L "$lease" && "$(_build_state_file_identity "$lease")" == "$identity" ]] || return 4
+  if [[ -e "$lock_file" || -L "$lock_file" ]]; then
+    _build_lock_record "$lock_file" "$identity" >/dev/null || return 4
+  fi
+  return 0
+)
+
+# Acquire custody for a tool/version. Workers inherit the descriptor, keeping
+# exclusion after coordinator loss until the last owned descendant closes it.
+# Returns 2 for contention and 1 for unavailable/unsafe custody.
+build_lock_acquire() {
+  local tool="$1" version="$2" tool_dir lock_file lease descriptor identity
+  local index timestamp run record metadata
+  [[ -n "$_BUILD_STATE_DIR" ]] || build_state_init || return 1
+  tool_dir=$(_build_get_tool_dir "$tool" "$version")
+  if ! mkdir -p "$tool_dir" || [[ ! -d "$tool_dir" || -L "$tool_dir" ]]; then
+    log_error "Failed to create safe build custody directory: $tool_dir"
+    return 1
+  fi
   lock_file=$(_build_get_lock_file "$tool" "$version")
+  lease="$lock_file.lease"
+  if [[ ( -e "$lock_file" || -L "$lock_file" ) && ! -e "$lease" ]]; then
+    log_error "Build custody has metadata without its original lease; explicit recovery is required"
+    return 1
+  fi
+  for index in "${!_BUILD_LOCK_PATHS[@]}"; do
+    if [[ "${_BUILD_LOCK_PATHS[$index]}" == "$lock_file" ]]; then
+      log_warn "Build custody is already held by this shell or an ancestor"
+      return 2
+    fi
+  done
+  _build_lock_open_lease "$lease" || return 1
+  descriptor="$_BUILD_LOCK_OPEN_FD"
+  if ! identity=$(_build_state_fd_identity "$descriptor") || [[ -L "$lease" ||
+       "$(_build_state_file_identity "$lease")" != "$identity" ]]; then
+    _build_lock_close_fd "$descriptor"
+    return 1
+  fi
+  if ! command -v flock >/dev/null && ! command -v python3 >/dev/null; then
+    _build_lock_close_fd "$descriptor"
+    log_error "Build custody requires flock or Python 3 with fcntl"
+    return 1
+  fi
+  if ! _build_state_wait_lock "$descriptor" 0; then
+    _build_lock_close_fd "$descriptor"
+    log_warn "Build custody is held by a coordinator or its workers"
+    return 2
+  fi
+  if [[ -L "$lease" || "$(_build_state_file_identity "$lease")" != "$identity" ]] ||
+     { [[ -e "$lock_file" || -L "$lock_file" ]] && ! _build_lock_record "$lock_file" "$identity" >/dev/null; }; then
+    _build_lock_close_fd "$descriptor"
+    log_error "Build custody metadata is unsafe or predates inherited leases; retained for explicit recovery"
+    return 1
+  fi
+  timestamp=$(date +%s) || { _build_lock_close_fd "$descriptor"; return 1; }
+  run="${DSR_RUN_ID:-run-$timestamp-$BASHPID}"
+  if [[ ! "$run" =~ ^[A-Za-z0-9._-]+$ ]] ||
+     ! metadata=$(umask 077; mktemp "$lock_file.owner.XXXXXXXX"); then
+    _build_lock_close_fd "$descriptor"
+    return 1
+  fi
+  record="$BASHPID $timestamp $run lease-v1 $BASHPID:$RANDOM:$RANDOM $identity"
+  if ! printf '%s\n' "$record" > "$metadata" ||
+     [[ -L "$lease" || "$(_build_state_file_identity "$lease")" != "$identity" || -L "$lock_file" ]] ||
+     ! mv -f -- "$metadata" "$lock_file"; then
+    _build_lock_close_fd "$descriptor"
+    return 1
+  fi
+  index=${#_BUILD_LOCK_PATHS[@]}
+  # Released entries retain their index so concurrent locks never overwrite
+  # another registry slot after an earlier lock has been released.
+  while [[ -n "${_BUILD_LOCK_PATHS[$index]:-}" ]]; do index=$((index + 1)); done
+  _BUILD_LOCK_PATHS[$index]="$lock_file"
+  _BUILD_LOCK_FDS[$index]="$descriptor"
+  _BUILD_LOCK_IDENTITIES[$index]="$identity"
+  _BUILD_LOCK_OWNERS[$index]="$BASHPID"
+  _BUILD_LOCK_RECORDS[$index]="$record"
+  log_info "Acquired build custody for $tool $version"
+  return 0
+}
 
-  if [[ ! -f "$lock_file" ]]; then
-    echo '{"locked": false}'
+build_lock_release() {
+  local tool="$1" version="$2" lock_file index descriptor
+  [[ -n "$_BUILD_STATE_DIR" ]] || build_state_init || return 1
+  lock_file=$(_build_get_lock_file "$tool" "$version")
+  for index in "${!_BUILD_LOCK_PATHS[@]}"; do
+    [[ "${_BUILD_LOCK_PATHS[$index]}" == "$lock_file" ]] || continue
+    if [[ "${_BUILD_LOCK_OWNERS[$index]}" != "$BASHPID" ]]; then
+      log_warn "Only the acquiring process may release its build custody descriptor"
+      return 1
+    fi
+    descriptor="${_BUILD_LOCK_FDS[$index]}"
+    if [[ -L "$lock_file.lease" ||
+          "$(_build_state_file_identity "$lock_file.lease")" != "${_BUILD_LOCK_IDENTITIES[$index]}" ||
+          "$(_build_state_fd_identity "$descriptor")" != "${_BUILD_LOCK_IDENTITIES[$index]}" ||
+          "$(_build_lock_record "$lock_file" "${_BUILD_LOCK_IDENTITIES[$index]}")" != "${_BUILD_LOCK_RECORDS[$index]}" ]]; then
+      log_error "Build custody identity changed; refusing to release an unrelated descriptor"
+      return 1
+    fi
+    _build_lock_close_fd "$descriptor" || return 1
+    _BUILD_LOCK_PATHS[$index]=""
+    _BUILD_LOCK_FDS[$index]="" _BUILD_LOCK_IDENTITIES[$index]=""
+    _BUILD_LOCK_OWNERS[$index]="" _BUILD_LOCK_RECORDS[$index]=""
+    log_info "Released coordinator custody for $tool $version; inherited workers retain their leases"
+    return 0
+  done
+  # Idempotent release is safe only when no other process holds custody.
+  _build_lock_probe "$lock_file" || return 1
+}
+
+# Unknown custody is treated as locked, never as permission to start or prune.
+build_lock_check() {
+  local lock_file
+  [[ -n "$_BUILD_STATE_DIR" ]] || build_state_init || return 0
+  lock_file=$(_build_get_lock_file "$1" "$2")
+  if _build_lock_probe "$lock_file"; then return 1; fi
+  return 0
+}
+
+build_lock_info() {
+  local lock_file record status=0 pid timestamp run format token identity now age alive=false
+  local locked=false custody=free
+  [[ -n "$_BUILD_STATE_DIR" ]] || build_state_init || return 1
+  lock_file=$(_build_get_lock_file "$1" "$2")
+  _build_lock_probe "$lock_file" || status=$?
+  if [[ "$status" == 2 ]]; then locked=true; custody=held
+  elif [[ "$status" != 0 ]]; then locked=true; custody=unverifiable; fi
+  if ! record=$(_build_lock_record "$lock_file"); then
+    jq -nc --argjson locked "$locked" --arg custody "$custody" \
+      '{locked:$locked,custody:$custody} +
+       (if $locked then {error:"Build custody metadata is unavailable or unverifiable"} else {} end)'
     return
   fi
-
-  local lock_pid lock_ts lock_run_id
-  if read -r lock_pid lock_ts lock_run_id < "$lock_file" 2>/dev/null; then
-    local now
-    now=$(date +%s)
-    local age=$((now - lock_ts))
-    local alive=false
-    kill -0 "$lock_pid" 2>/dev/null && alive=true
-    local stale=false
-    [[ "$age" -gt "$BUILD_LOCK_STALE_THRESHOLD" ]] && stale=true
-
-    jq -nc \
-        --argjson pid "$lock_pid" \
-        --argjson timestamp "$lock_ts" \
-        --argjson age_seconds "$age" \
-        --arg run_id "$lock_run_id" \
-        --argjson process_alive "$alive" \
-        --argjson stale "$stale" \
-        '{
-            locked: true,
-            pid: $pid,
-            timestamp: $timestamp,
-            age_seconds: $age_seconds,
-            run_id: $run_id,
-            process_alive: $process_alive,
-            stale: $stale
-        }'
-  else
-    echo '{"locked": false, "error": "invalid lock file"}'
-  fi
+  read -r pid timestamp run format token identity <<< "$record"
+  now=$(date +%s) || return 1
+  age=$((now - 10#$timestamp))
+  kill -0 "$pid" 2>/dev/null && alive=true
+  jq -nc --argjson locked "$locked" --arg custody "$custody" \
+    --argjson pid "$pid" --argjson timestamp "$timestamp" --argjson age "$age" \
+    --arg run "$run" --argjson alive "$alive" \
+    '{locked:$locked,custody:$custody,pid:$pid,timestamp:$timestamp,
+      age_seconds:$age,run_id:$run,process_alive:$alive,stale:false}'
 }
 
 # ============================================================================

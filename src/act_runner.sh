@@ -2336,43 +2336,153 @@ _act_timeout_cmd() {
     echo "$_ACT_TIMEOUT_CMD"
 }
 
+# GNU timeout normally leaves its process group as soon as the command leader
+# exits, even when a descendant ignored TERM. Its pending --kill-after timer
+# then disappears with it. Keep our own live group anchor and use --foreground
+# so timeout and every ordinary descendant remain in the group we still own.
+_act_timeout_group() {
+    local input_fd="$1" output_fd="$2" timeout_command="$3" seconds="$4"
+    shift 4
+    [[ "$input_fd" =~ ^[0-9]+$ && "$output_fd" =~ ^[0-9]+$ ]] || return 4
+    local group_pid="$BASHPID" child="" finished=false cancelled=false
+    local control="" running="" status=0 read_status=0
+    set +m
+    trap - EXIT
+    trap 'cancelled=true' INT TERM HUP PIPE
+    # Register the exact PID and private channels before starting a command.
+    if ! IFS= read -r control || [[ "$control" != start ]] || $cancelled; then
+        return 130
+    fi
+    (
+        # Only fd0/fd1 are inherited by the command for these streams. In
+        # particular it must not retain the anchor's parent-lifetime reader.
+        eval "exec ${input_fd}<&- ${output_fd}>&-"
+        exec "$timeout_command" --foreground --kill-after=5 "$seconds" "$@"
+    ) <&"$input_fd" >&"$output_fd" &
+    child=$!
+    eval "exec ${input_fd}<&- ${output_fd}>&-"
+    while ! $cancelled; do
+        if ! $finished; then
+            running=$(jobs -pr)
+            case $'\n'"$running"$'\n' in
+                *$'\n'"$child"$'\n'*) ;;
+                *)
+                    wait "$child" || status=$?
+                    finished=true
+                    printf 'exit:%s\n' "$status" || break
+                    ;;
+            esac
+        fi
+        read_status=0
+        IFS= read -r -t 0.1 control || read_status=$?
+        # EOF also retires the group after SIGKILL/OOM of the waiting shell.
+        if (( read_status == 0 || read_status == 1 )); then
+            break
+        fi
+        (( read_status > 128 )) || break
+    done
+    trap '' INT TERM HUP PIPE
+    kill -TERM -- "-$group_pid" 2>/dev/null || true
+    if ! $finished; then
+        # Finish inside the outer target worker's five-second cancellation
+        # grace. The command's own deadline still retains --kill-after=5.
+        sleep 2
+    fi
+    # Never signal a reaped/reusable PGID: the anchor is still its live leader.
+    kill -KILL -- "-$group_pid" 2>/dev/null || true
+    return 4
+}
+
 _act_run_with_timeout() (
     local seconds="$1"
     shift
     local cmd
     cmd=$(_act_timeout_cmd)
-    if [[ -n "$cmd" ]]; then
-        # GNU timeout creates its own process group. Forward cancellation from
-        # the orchestration group into that group before releasing our waiter.
-        # --foreground would lose timeout's descendant deadline enforcement.
-        local timeout_pid="" cancel_status=0
-        _act_timeout_cancel() {
-            # A signal may arrive between the background fork and recording $!.
-            # Defer forwarding until the exact owned PID is available.
-            cancel_status=$1
-            [[ -n "$timeout_pid" ]] || return 0
-            trap '' INT TERM
-            kill -TERM -- "-$timeout_pid" 2>/dev/null ||
-                kill -TERM "$timeout_pid" 2>/dev/null || true
-            wait "$timeout_pid" 2>/dev/null || true
-            exit "$1"
-        }
-        trap '_act_timeout_cancel 130' INT
-        trap '_act_timeout_cancel 143' TERM
-        # A compiler, transport, or act process may ignore TERM. Bound both
-        # deadline and explicit cancellation cleanup in timeout's own group;
-        # never send a delayed signal to a PID/group that we have reaped.
-        # GNU timeout preserves ordinary command statuses and reports 137
-        # when this final group-wide KILL is necessary.
-        "$cmd" --kill-after=5 "$seconds" "$@" <&0 &
-        timeout_pid=$!
-        if (( cancel_status != 0 )); then
-            _act_timeout_cancel "$cancel_status"
-        fi
-        wait "$timeout_pid"
-    else
+    if [[ -z "$cmd" ]]; then
         "$@"
+        return
     fi
+
+    # Coprocess stdin/stdout carry only control/status. Reserve unused numeric
+    # descriptors for the caller's actual streams, including a large program
+    # fed through stdin. Do not overwrite an inherited fd or coprocess channel.
+    # Numeric eval redirections retain Bash 4.0 support ({var} needs Bash 4.1).
+    local input_fd="" output_fd="" candidate_fd
+    for ((candidate_fd = 10; candidate_fd < 63; candidate_fd++)); do
+        if { : <&"$candidate_fd"; } 2>/dev/null; then
+            continue
+        fi
+        if [[ -z "$input_fd" ]]; then
+            eval "exec ${candidate_fd}<&0" || return 4
+            input_fd=$candidate_fd
+        else
+            eval "exec ${candidate_fd}>&1" || return 4
+            output_fd=$candidate_fd
+            break
+        fi
+    done
+    [[ -n "$input_fd" && -n "$output_fd" ]] || return 4
+
+    local timeout_pid="" result_fd="" control_fd="" guard_status=0
+    local cancel_status=0 launch_pending=false monitor=false
+    local message="" result=4 protocol_valid=false
+    local -a _ACT_TIMEOUT_GROUP=()
+    local _ACT_TIMEOUT_GROUP_PID=""
+    _act_timeout_drain() {
+        if [[ "$control_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${control_fd}>&-"
+            control_fd=""
+        fi
+        if [[ "$timeout_pid" =~ ^[1-9][0-9]*$ ]]; then
+            guard_status=0
+            wait "$timeout_pid" 2>/dev/null || guard_status=$?
+            timeout_pid=""
+        fi
+        if [[ "$result_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${result_fd}<&-"
+            result_fd=""
+        fi
+    }
+    _act_timeout_cancel() {
+        (( cancel_status != 0 )) || cancel_status=$1
+        $launch_pending && return 0
+        trap '' INT TERM HUP PIPE
+        _act_timeout_drain
+        exit "$cancel_status"
+    }
+    trap '_act_timeout_cancel 130' INT
+    trap '_act_timeout_cancel 143' TERM
+    trap '_act_timeout_cancel 129' HUP
+    trap '_act_timeout_cancel 141' PIPE
+    [[ $- != *m* ]] || monitor=true
+    set -m
+    launch_pending=true
+    coproc _ACT_TIMEOUT_GROUP {
+        _act_timeout_group "$input_fd" "$output_fd" "$cmd" "$seconds" "$@"
+    }
+    timeout_pid="${_ACT_TIMEOUT_GROUP_PID:-}"
+    result_fd="${_ACT_TIMEOUT_GROUP[0]:-}"
+    control_fd="${_ACT_TIMEOUT_GROUP[1]:-}"
+    launch_pending=false
+    $monitor || set +m
+    eval "exec ${input_fd}<&- ${output_fd}>&-"
+    if (( cancel_status != 0 )); then
+        _act_timeout_cancel "$cancel_status"
+    fi
+    if [[ "$control_fd" =~ ^[0-9]+$ && "$result_fd" =~ ^[0-9]+$ ]] &&
+       printf 'start\n' >&"$control_fd" &&
+       IFS= read -r -u "$result_fd" message &&
+       [[ "$message" =~ ^exit:([0-9]{1,3})$ ]] &&
+       (( 10#${BASH_REMATCH[1]} <= 255 )); then
+        result=$((10#${BASH_REMATCH[1]}))
+        protocol_valid=true
+    fi
+    _act_timeout_drain
+    if ! $protocol_valid; then
+        result=$guard_status
+        [[ "$result" -ne 0 ]] || result=4
+    fi
+    return "$result"
 )
 
 # Return the first act config file in a home directory that has --bind without
@@ -4150,10 +4260,17 @@ _act_windows_build_guard_script() {
 $ErrorActionPreference='Stop'
 Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 public static class DSRNativeBuildGuard {
+    [StructLayout(LayoutKind.Sequential)] struct FileInfo {
+        public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh,
+            WriteLow, WriteHigh, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
     [StructLayout(LayoutKind.Sequential)] struct BasicLimits {
         public long ProcessTime, JobTime;
         public uint Flags;
@@ -4209,6 +4326,73 @@ public static class DSRNativeBuildGuard {
         IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles,
         uint flags, IntPtr environment, string directory,
         ref StartupInfo startup, out ProcessInfo process);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern uint GetFileType(SafeFileHandle handle);
+    static SafeFileHandle HoldPath(string path, bool directory) {
+        string native = path.Replace('/', '\\');
+        if (!native.StartsWith(@"\\?\", StringComparison.Ordinal)) native = @"\\?\" + native;
+        // As in the private Cargo cache, FILE_LIST_DIRECTORY is required for
+        // directory sharing exclusions; FILE_READ_ATTRIBUTES alone is not.
+        SafeFileHandle handle = CreateFileW(native, directory ? 0x81u : 0x80000000u,
+            directory ? 3u : 1u, IntPtr.Zero, 3, 0x00200000u | 0x02000000u, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, "Cannot hold native build launcher path: " + path);
+        }
+        try {
+            FileInfo info;
+            if (!GetFileInformationByHandle(handle, out info))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((info.Attributes & (0x400u | 0x40u)) != 0 ||
+                    ((info.Attributes & 0x10u) != 0) != directory || GetFileType(handle) != 1 ||
+                    (!directory && info.Links != 1))
+                throw new IOException("Linked or unexpected native build launcher path: " + path);
+            return handle;
+        } catch { handle.Dispose(); throw; }
+    }
+    public static SafeFileHandle[] HoldDirectory(string directory) {
+        string path = Path.GetFullPath(directory);
+        string root = Path.GetPathRoot(path);
+        if (root == null || root.Length != 3 || root[1] != ':')
+            throw new IOException("Native build launcher requires a local drive directory");
+        List<SafeFileHandle> handles = new List<SafeFileHandle>();
+        try {
+            string current = root;
+            handles.Add(HoldPath(current, true));
+            foreach (string part in path.Substring(root.Length).Split(
+                    new char[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries)) {
+                current = Path.Combine(current, part);
+                handles.Add(HoldPath(current, true));
+            }
+            return handles.ToArray();
+        } catch {
+            foreach (SafeFileHandle handle in handles) handle.Dispose();
+            throw;
+        }
+    }
+    public static FileStream OpenPayload(string path) {
+        SafeFileHandle handle = HoldPath(path, false);
+        try { return new FileStream(handle, FileAccess.Read); }
+        catch { handle.Dispose(); throw; }
+    }
+    public static string BuildCommand(string application, string script) {
+        char[] forbidden = new char[] { '\0', '"', '\r', '\n' };
+        if (String.IsNullOrEmpty(application) || String.IsNullOrEmpty(script) ||
+                application.IndexOfAny(forbidden) >= 0 || script.IndexOfAny(forbidden) >= 0 ||
+                application.EndsWith("\\", StringComparison.Ordinal) ||
+                script.EndsWith("\\", StringComparison.Ordinal))
+            throw new ArgumentException("Invalid native build executable or script path");
+        string command = "\"" + application + "\" -NoProfile -NonInteractive -File \"" + script + "\"";
+        if (command.Length >= 32767)
+            throw new ArgumentException("Native build file command exceeds the Windows process limit");
+        return command;
+    }
     static IntPtr InheritableStandardHandle(int kind) {
         IntPtr handle = GetStdHandle(kind);
         if (handle == IntPtr.Zero || handle == new IntPtr(-1) ||
@@ -4216,7 +4400,8 @@ public static class DSRNativeBuildGuard {
             throw new Win32Exception(Marshal.GetLastWin32Error());
         return handle;
     }
-    public static int Run(string command, int seconds) {
+    public static int Run(string application, string script, int seconds) {
+        string command = BuildCommand(application, script);
         uint milliseconds = checked((uint)seconds * 1000);
         IntPtr job = CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -4233,7 +4418,7 @@ public static class DSRNativeBuildGuard {
             startup.Input = InheritableStandardHandle(-10);
             startup.Output = InheritableStandardHandle(-11);
             startup.Error = InheritableStandardHandle(-12);
-            if (!CreateProcess(null, new StringBuilder(command), IntPtr.Zero,
+            if (!CreateProcess(application, new StringBuilder(command), IntPtr.Zero,
                     IntPtr.Zero, true, 4, IntPtr.Zero, null, ref startup, out process))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             if (!AssignProcessToJobObject(job, process.Process))
@@ -4268,15 +4453,47 @@ public static class DSRNativeBuildGuard {
 '@
 POWERSHELL
     # Keep the original source visible in the staged Defender-scanned file.
-    # Encoding is only for the child command-line transport after admission.
+    # The child gets a held file, never a payload-sized CreateProcess argument.
     printf '$dsrBuildScript='\''%s'\''\n' "$script_quoted"
     cat <<'POWERSHELL'
-$dsrBuildEncoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($dsrBuildScript))
+$dsrBuildDirectoryHandles=@()
+$dsrBuildHeld=$null
+$dsrBuildHash=$null
 $dsrPowerShell=Join-Path $PSHOME 'powershell.exe'
 if (-not (Test-Path -LiteralPath $dsrPowerShell -PathType Leaf)) { $dsrPowerShell=Join-Path $PSHOME 'pwsh.exe' }
-$dsrBuildCommand='"' + $dsrPowerShell + '" -NoProfile -NonInteractive -EncodedCommand ' + $dsrBuildEncoded
+try {
+    if ([string]::IsNullOrEmpty($PSScriptRoot)) { throw 'Native build guard requires its retained launcher directory' }
+    $dsrBuildDirectoryHandles=[DSRNativeBuildGuard]::HoldDirectory($PSScriptRoot)
+    $dsrBuildPath=Join-Path $PSScriptRoot 'payload.ps1'
+    $dsrBuildEncoding=[Text.UTF8Encoding]::new($true)
+    $dsrBuildBytes=$dsrBuildEncoding.GetPreamble() + $dsrBuildEncoding.GetBytes($dsrBuildScript)
+    $dsrBuildWriter=[IO.File]::Open($dsrBuildPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {
+        $dsrBuildWriter.Write($dsrBuildBytes,0,$dsrBuildBytes.Length)
+        $dsrBuildWriter.Flush($true)
+    } finally { $dsrBuildWriter.Dispose() }
+    # Keep the normal scanner policy. Permit quarantine before opening the
+    # read-only custody handle; changed or missing bytes then fail admission.
+    $dsrBuildScanner=Join-Path $env:ProgramFiles 'Windows Defender/MpCmdRun.exe'
+    if (Test-Path -LiteralPath $dsrBuildScanner) {
+        & $dsrBuildScanner -Scan -ScanType 3 -File $dsrBuildPath
+        if ($LASTEXITCODE -ne 0) { throw 'Native build payload security scan failed' }
+    }
+    $dsrBuildHeld=[DSRNativeBuildGuard]::OpenPayload($dsrBuildPath)
+    $dsrBuildHash=[Security.Cryptography.SHA256]::Create()
+    $dsrBuildExpected=[Convert]::ToBase64String($dsrBuildHash.ComputeHash([byte[]]$dsrBuildBytes))
+    $dsrBuildActual=[Convert]::ToBase64String($dsrBuildHash.ComputeHash($dsrBuildHeld))
+    if ($dsrBuildActual -cne $dsrBuildExpected) { throw 'Native build payload digest mismatch' }
+    [Console]::Error.WriteLine('Native build payload retained: ' + $dsrBuildPath)
 POWERSHELL
-    printf 'exit [DSRNativeBuildGuard]::Run($dsrBuildCommand, %s)\n' "$timeout_sec"
+    printf '    exit [DSRNativeBuildGuard]::Run($dsrPowerShell, $dsrBuildPath, %s)\n' "$timeout_sec"
+    cat <<'POWERSHELL'
+} finally {
+    if ($null -ne $dsrBuildHash) { $dsrBuildHash.Dispose() }
+    if ($null -ne $dsrBuildHeld) { $dsrBuildHeld.Dispose() }
+    foreach ($dsrBuildDirectoryHandle in $dsrBuildDirectoryHandles) { $dsrBuildDirectoryHandle.Dispose() }
+}
+POWERSHELL
 }
 
 # Recover only command forms produced above; never evaluate launcher text.
@@ -4311,26 +4528,36 @@ _act_windows_command_script() {
 _act_windows_stage_build_script() {
     local host="$1" source_root="$2" script="$3"
     local destination uuid local_dir local_script remote_dir remote_script digest setup guard
+    local remote_parent remote_parent_q remote_dir_q remote_script_q
     destination=$(_act_get_ssh_destination "$host") || return 4
     uuid=$(_act_generate_uuid) || return 4
     _act_is_uuid "$uuid" || return 4
     source_root="${source_root//\\//}"
-    [[ "$source_root" =~ ^[A-Za-z]:/ && "$source_root" != *"'"* ]] || return 4
-    remote_dir="${source_root%/*}/launcher-$uuid"
+    if [[ "$source_root" =~ ^/([A-Za-z])/(.*)$ ]]; then
+        source_root="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+    fi
+    [[ "$source_root" =~ ^[A-Za-z]:/ && "$source_root" != *[[:cntrl:]]* ]] || return 4
+    while [[ "$source_root" == */ && ${#source_root} -gt 3 ]]; do source_root="${source_root%/}"; done
+    remote_parent="${source_root%/*}"
+    [[ ! "$remote_parent" =~ ^[A-Za-z]:$ ]] || remote_parent+='/'
+    remote_dir="${remote_parent%/}/launcher-$uuid"
     remote_script="$remote_dir/build.ps1"
+    remote_parent_q="${remote_parent//\'/\'\'}"
+    remote_dir_q="${remote_dir//\'/\'\'}"
+    remote_script_q="${remote_script//\'/\'\'}"
     mkdir -p "$ACT_ARTIFACTS_DIR" || return 4
     local_dir=$(mktemp -d "$ACT_ARTIFACTS_DIR/windows-launcher.XXXXXXXX") || return 4
     local_script="$local_dir/build.ps1"
     (umask 077; printf '%s\n' "$script" > "$local_script") || return 4
     digest=$(_act_sha256 "$local_script") || return 4
-    setup="\$ErrorActionPreference='Stop'; \$parent=Get-Item -LiteralPath '${source_root%/*}' -Force; if (-not \$parent.PSIsContainer -or ((\$parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher parent is not a plain directory' }; if (Test-Path -LiteralPath '$remote_dir') { throw 'Launcher destination already exists' }; New-Item -ItemType Directory -Path '$remote_dir' | Out-Null; \$acl=Get-Acl -LiteralPath '$remote_dir'; \$acl.SetAccessRuleProtection(\$true,\$false); \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; \$rule=[Security.AccessControl.FileSystemAccessRule]::new(\$user,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$rule); Set-Acl -LiteralPath '$remote_dir' -AclObject \$acl"
-    setup+="; \$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18'); \$systemRule=[Security.AccessControl.FileSystemAccessRule]::new(\$system,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$systemRule); Set-Acl -LiteralPath '$remote_dir' -AclObject \$acl"
+    setup="\$ErrorActionPreference='Stop'; \$parent=Get-Item -LiteralPath '$remote_parent_q' -Force; if (-not \$parent.PSIsContainer -or ((\$parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher parent is not a plain directory' }; if (Test-Path -LiteralPath '$remote_dir_q') { throw 'Launcher destination already exists' }; New-Item -ItemType Directory -Path '$remote_dir_q' | Out-Null; \$acl=Get-Acl -LiteralPath '$remote_dir_q'; \$acl.SetAccessRuleProtection(\$true,\$false); \$user=[Security.Principal.WindowsIdentity]::GetCurrent().User; \$rule=[Security.AccessControl.FileSystemAccessRule]::new(\$user,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$rule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
+    setup+="; \$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18'); \$systemRule=[Security.AccessControl.FileSystemAccessRule]::new(\$system,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); \$acl.AddAccessRule(\$systemRule); Set-Acl -LiteralPath '$remote_dir_q' -AclObject \$acl"
     _act_ssh_exec "$host" "$(_act_windows_encoded_powershell "$setup" pwsh)" 60 >&2 || return 4
     scp -q -o ConnectTimeout="$_ACT_SSH_TIMEOUT" -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new "$local_script" "$destination:$remote_script" >&2 || return 4
     # A normal custom scan retains Defender policy; no exclusion, policy
     # bypass, or restoration of quarantined content is permitted here.
-    guard="\$ErrorActionPreference='Stop'; \$item=Get-Item -LiteralPath '$remote_script' -Force; if (\$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher is not a plain file' }; \$scanner=Join-Path \$env:ProgramFiles 'Windows Defender/MpCmdRun.exe'; if (Test-Path -LiteralPath \$scanner) { & \$scanner -Scan -ScanType 3 -File \$item.FullName; if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' } }; \$held=[IO.File]::Open('$remote_script',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { \$actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(\$held)); if (\$actual -ne '$digest') { throw 'Launcher digest mismatch' }; & '$remote_script'; exit \$LASTEXITCODE } finally { \$held.Dispose() }"
+    guard="\$ErrorActionPreference='Stop'; \$item=Get-Item -LiteralPath '$remote_script_q' -Force; if (\$item.PSIsContainer -or ((\$item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) { throw 'Launcher is not a plain file' }; \$scanner=Join-Path \$env:ProgramFiles 'Windows Defender/MpCmdRun.exe'; if (Test-Path -LiteralPath \$scanner) { & \$scanner -Scan -ScanType 3 -File \$item.FullName; if (\$LASTEXITCODE -ne 0) { throw 'Launcher security scan failed' } }; \$held=[IO.File]::Open('$remote_script_q',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { \$actual=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(\$held)); if (\$actual -ne '$digest') { throw 'Launcher digest mismatch' }; & '$remote_script_q'; exit \$LASTEXITCODE } finally { \$held.Dispose() }"
     _log_info "Windows build script retained: $local_script (sha256=$digest), host path $remote_script"
     _act_windows_encoded_powershell "$guard" pwsh
 }
@@ -10948,7 +11175,7 @@ $ps_env_assignments
 exit \$process.ExitCode
 EOF
             ) || return 4
-            remote_cmd=$(_act_windows_encoded_powershell "$ps_nonstrict_build" pwsh) || return 4
+            windows_build_body="$ps_nonstrict_build"
         fi
     else
         # Unix: use bash/zsh compatible syntax
@@ -11115,11 +11342,10 @@ EOF
         fi
         windows_build_guard=$(_act_windows_build_guard_script "$_ACT_BUILD_TIMEOUT" "$windows_build_script") || return 4
         windows_build_script="$windows_build_guard"
-        if $strict_rust_build; then
-            remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
-        else
-            remote_cmd=$(_act_windows_encoded_powershell "$windows_build_script" pwsh) || return 4
-        fi
+        # Every guard needs its private launcher directory, including ordinary
+        # and non-Rust builds. remote_path still names the existing source;
+        # the future ordinary Cargo stage is prepared separately below.
+        remote_cmd=$(_act_windows_stage_build_script "$host" "$remote_path" "$windows_build_script") || return 4
         # Let the remote deadline retire its job before killing the transport.
         # This grace is not additional build time and never enables local work.
         build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 60))
@@ -13737,7 +13963,7 @@ act_orchestrate_build() {
     _act_cancel_parallel_workers() {
         # A second Ctrl-C must not interrupt cleanup after workers have been
         # told to terminate; keep the coordinator alive until they are reaped.
-        trap '' INT TERM
+        trap '' INT TERM HUP
         interrupted=true
         local cancel_index cancel_pid
         for ((cancel_index = 0; cancel_index < ${#worker_pids[@]}; cancel_index++)); do
@@ -13854,7 +14080,7 @@ act_orchestrate_build() {
         done
         return 1
     }
-    trap _act_cancel_parallel_workers INT TERM
+    trap _act_cancel_parallel_workers INT TERM HUP
 
     local task_json task_key selected_triple
     while IFS= read -r task_json; do
@@ -14163,7 +14389,7 @@ act_orchestrate_build() {
     while (( active_workers > 0 )); do
         _act_reap_one_worker || interrupted=true
     done
-    trap - INT TERM
+    trap - INT TERM HUP
 
     # Deterministic aggregation follows configured target order, never worker
     # completion order.

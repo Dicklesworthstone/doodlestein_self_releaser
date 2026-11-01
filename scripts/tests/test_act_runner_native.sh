@@ -65,6 +65,13 @@ source "$DSR_ATTEMPT_PROJECT/src/config.sh" || exit $?
 source "$DSR_ATTEMPT_MODULE" || exit $?
 host_health_is_ready() { [[ "${DSR_ATTEMPT_HEALTH:-healthy}" == healthy ]]; }
 _act_ssh_exec() {
+    local decoded
+    decoded=$(_act_windows_command_script "$2") || return 94
+    if [[ "$decoded" == *'Launcher parent is not a plain directory'* ]]; then
+        printf '%s\n' "$DSR_ATTEMPT_LABEL" >> "$DSR_ATTEMPT_CASE/launcher-events"
+        return 0
+    fi
+    [[ "$decoded" == *'Launcher digest mismatch'* ]] || return 95
     printf 'remote invocation %s\n' "$DSR_ATTEMPT_LABEL" >> "$DSR_ATTEMPT_CASE/transport-events"
     if [[ -n "${DSR_ATTEMPT_BARRIER:-}" ]]; then
         : > "$DSR_ATTEMPT_BARRIER/$DSR_ATTEMPT_LABEL"
@@ -76,7 +83,11 @@ _act_ssh_exec() {
 scp() {
     local destination="${!#}" source="${*: -2:1}"
     # Guarded PowerShell programs may be staged through this same transport.
-    [[ "$destination" != *:* ]] || return 0
+    if [[ "$destination" == *:* ]]; then
+        [[ "$destination" == */launcher-*/build.ps1 ]] || return 96
+        cp "$source" "$DSR_ATTEMPT_CASE/$DSR_ATTEMPT_LABEL.guard.ps1"
+        return $?
+    fi
     cp "$DSR_ATTEMPT_INPUTS/${source##*/}" "$destination"
 }
 ssh() {
@@ -198,6 +209,10 @@ def retained_paths(result):
 def accepted(context, label, outcome):
     code, result = outcome
     check(label + ': native collection succeeds', code == 0 and result.get('status') == 'success')
+    guard = context[0] / (label + '.guard.ps1')
+    check(label + ': Windows compiler uses its retained private file guard',
+          guard.is_file() and '$dsrBuildDirectoryHandles=' in guard.read_text() and
+          label in (context[0] / 'launcher-events').read_text().splitlines())
     check(label + ': primary name and physical target are unchanged',
           result.get('platform') == 'windows/amd64' and result.get('method') == 'native' and
           [Path(p).name for p in result.get('artifact_paths', [])] == ['attempt.exe'])
@@ -1379,15 +1394,22 @@ _test_decode_remote_command() {
     if [[ "$command" == powershell\ -NoProfile\ -NonInteractive\ * ||
           "$command" == pwsh\ -NoProfile\ -NonInteractive\ * ]]; then
         decoded=$(_act_windows_command_script "$command") || return 1
-        if [[ "$decoded" == *"[IO.File]::Open("* && "$decoded" == *"Launcher digest mismatch"* &&
-              -s "$MOCK_DIR/staged-command.ps1" ]]; then
-            decoded=$(cat "$MOCK_DIR/staged-command.ps1") || return 1
+        if [[ "$decoded" == *"[IO.File]::Open("* && "$decoded" == *"Launcher digest mismatch"* ]]; then
+            decoded=$(printf '%s' "$decoded" | python3 -c '
+import hashlib, pathlib, re, sys
+match = re.search(r"\$held=\[IO\.File\]::Open\(\x27((?:[^\x27]|\x27\x27)*)\x27,", sys.stdin.read())
+if match is None:
+    raise SystemExit("missing staged launcher path")
+remote = match[1].replace("\x27\x27", "\x27")
+key = hashlib.sha256(remote.encode()).hexdigest()
+sys.stdout.buffer.write((pathlib.Path(sys.argv[1]) / "staged-launchers" / key).read_bytes())
+' "$MOCK_DIR") || return 1
         fi
         if [[ "$decoded" == *'$dsrBuildScript='* ]]; then
             decoded=$(printf '%s' "$decoded" | python3 -c '
 import re, sys
 source = sys.stdin.read()
-match = re.search(r"(?m)^\$dsrBuildScript=\x27((?:[^\x27]|\x27\x27)*)\x27\n\$dsrBuildEncoded=", source)
+match = re.search(r"(?m)^\$dsrBuildScript=\x27((?:[^\x27]|\x27\x27)*)\x27\n\$dsrBuildDirectoryHandles=", source)
 if match is None:
     raise SystemExit("missing guarded build script")
 sys.stdout.write(match[1].replace("\x27\x27", "\x27"))
@@ -1658,6 +1680,24 @@ write_mock_artifact() {
     chmod 755 "$dest" 2>/dev/null || true
 }
 
+# Retain each upload by its remote path. Cache preparation can stage another
+# script between build-guard upload and invocation; those are distinct files.
+_test_capture_windows_launcher() {
+    local source="$1" destination="$2"
+    python3 - "$source" "$destination" "$MOCK_DIR" <<'PY' || return 1
+import hashlib, pathlib, sys
+source, destination, fixture = sys.argv[1:]
+remote = destination.split(":", 1)[1]
+directory = pathlib.Path(fixture) / "staged-launchers"
+directory.mkdir(exist_ok=True)
+(directory / hashlib.sha256(remote.encode()).hexdigest()).write_bytes(pathlib.Path(source).read_bytes())
+PY
+    cat "$source" > "$MOCK_DIR/staged-command.ps1" || return 1
+    if grep -q '\$dsrBuildScript=' "$source"; then
+        cat "$source" > "$MOCK_DIR/staged-build.ps1" || return 1
+    fi
+}
+
 # Mock scp - captures args to file
 scp() {
     printf '%s\n' "$@" > "$SCP_ARGS_FILE"
@@ -1670,10 +1710,7 @@ scp() {
             # Launcher uploads must not create a bogus host:path tree locally.
             local source="${*: -2:1}"
             if [[ "$target" == */build.ps1 && -f "$source" ]]; then
-                cat "$source" > "$MOCK_DIR/staged-command.ps1"
-                if grep -q '\$dsrBuildScript=' "$source"; then
-                    cat "$source" > "$MOCK_DIR/staged-build.ps1"
-                fi
+                _test_capture_windows_launcher "$source" "$target" || return 1
             fi
             return 0
         fi
@@ -3607,6 +3644,22 @@ test_windows_build_guard_transport_and_timeout_validation() {
     else
         log_fail "Guard changed the original build script"
     fi
+    # The actual private Cargo runtime is already larger than Windows accepts
+    # as a child command line. Preserve that complete source through the same
+    # generator/transport boundary; the PowerShell fixture executes it by file.
+    local large_script large_guard large_encoded large_decoded
+    large_script=$(printf '# retained build runtime\n%.0s' {1..9000})$'\n'"$script"
+    if ! large_guard=$(_act_windows_build_guard_script 30 "$large_script") ||
+       ! large_encoded=$(_act_windows_encoded_powershell "$large_guard") ||
+       ! large_decoded=$(_test_decode_remote_command "$large_encoded"); then
+        log_fail "Large guard transport failed"
+        return
+    fi
+    if [[ "${#large_script}" -gt 131072 && "$large_decoded" == "$large_script" ]]; then
+        log_pass "Guard retains a complete script larger than process argument limits"
+    else
+        log_fail "Large guard source was truncated or changed"
+    fi
     for bad in 0 -1 2147484 invalid '1;exit'; do
         if _act_windows_build_guard_script "$bad" "$script" >/dev/null 2>&1; then
             rejected=false
@@ -3617,6 +3670,38 @@ test_windows_build_guard_transport_and_timeout_validation() {
     else
         log_fail "Guard accepted an invalid remote deadline"
     fi
+    local source_path parent parent_quoted staged_command staged_guard setup_command
+    for source_path in '/c/Users/dsr/work tree/tool' "C:/Users/O'Brien/tool" 'C:/tool'; do
+        case "$source_path" in
+            /c/*) parent='c:/Users/dsr/work tree' ;;
+            "C:/Users/O'Brien/tool") parent="C:/Users/O'Brien" ;;
+            *) parent='C:/' ;;
+        esac
+        parent_quoted="${parent//\'/\'\'}"
+        reset_state
+        if ! staged_command=$(_act_windows_stage_build_script wlap "$source_path" "$script"); then
+            log_fail "Guard staging refused the admitted Windows path: $source_path"
+            continue
+        fi
+        staged_guard=$(_act_windows_command_script "$staged_command") || {
+            log_fail "Guard staging returned an invalid file launcher"
+            continue
+        }
+        setup_command=$(get_ssh_cmd)
+        if [[ "$setup_command" == *"Get-Item -LiteralPath '$parent_quoted' -Force"* &&
+              "$staged_guard" == *"Get-Item -LiteralPath '${parent_quoted%/}/launcher-"* ]]; then
+            log_pass "Guard uses the existing parent with literal Windows path: $source_path"
+        else
+            log_fail "Guard staging changed the Windows parent or quoting: $source_path"
+        fi
+        if [[ "$(cat "$MOCK_DIR/staged-command.ps1")" == "$script" &&
+              ${#staged_command} -le 7000 && "$staged_guard" == *'Launcher digest mismatch'* &&
+              "$staged_guard" == *'[IO.FileShare]::Read'* ]]; then
+            log_pass "Staging retains exact source and sends only its held file launcher"
+        else
+            log_fail "Staging changed source bytes or lost bounded held-file transport"
+        fi
+    done
 }
 
 test_windows_cd_command() {
@@ -3912,7 +3997,7 @@ _test_windows_companion_collection() (
     scp() {
         local source="${*: -2:1}" destination="${!#}" selected
         if [[ "$destination" == wlap:*/build.ps1 ]]; then
-            cp "$source" "$MOCK_DIR/staged-command.ps1"
+            _test_capture_windows_launcher "$source" "$destination"
             return $?
         fi
         [[ "$source" == wlap:* ]] || return 7
@@ -5706,6 +5791,14 @@ test_windows_private_cache_collection() {
 }
 
 main() {
+    if [[ "${1:-}" == --windows-guard-only ]]; then
+        test_windows_build_guard_transport_and_timeout_validation
+        test_windows_rust_isolation_receipt_matches_command
+        test_windows_rust_absolute_target_is_private
+        printf 'Windows guard transport tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return $?
+    fi
     if [[ "${1:-}" == --typed-companion-preflight-only ]]; then
         test_typed_additional_artifact_preflight
         printf 'Typed companion preflight tests: passed=%s failed=%s fixtures=%s\n' "$PASS_COUNT" "$FAIL_COUNT" "$MOCK_DIR"

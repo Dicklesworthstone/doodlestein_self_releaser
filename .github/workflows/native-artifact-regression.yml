@@ -9,6 +9,7 @@ on:
       - scripts/tests/test_native_artifact_build.sh
       - scripts/tests/test_act_runner.sh
       - scripts/tests/test_act_orchestration.sh
+      - scripts/tests/test_build_state.sh
       - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_config.sh
@@ -118,6 +119,16 @@ jobs:
           set -euo pipefail
           bash -n scripts/tests/test_act_build_cmd_tokens.sh
           bash scripts/tests/test_act_build_cmd_tokens.sh --go-cross-build 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-command-tokens.log"
+          test -z "$(git status --porcelain)"
+      - name: Preserve build custody and timed process ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/build_state.sh
+          bash -n scripts/tests/test_build_state.sh
+          bash scripts/tests/test_build_state.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/build-state.log"
+          bash scripts/tests/test_act_orchestration.sh --coordinator-custody-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/coordinator-custody.log"
+          bash scripts/tests/test_act_runner.sh --timeout-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/timeout-ownership.log"
           test -z "$(git status --porcelain)"
       - name: Validate stdin-isolated target dispatch and exact-run resume
         shell: bash

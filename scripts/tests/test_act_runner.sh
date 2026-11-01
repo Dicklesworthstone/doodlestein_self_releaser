@@ -1068,7 +1068,8 @@ print(job + ' workflow log', flush=True)
 raise SystemExit(9 if job == 'failure' else 0)
 '''
 
-driver = r'''source "$1"
+driver = r'''source "${1%/*}/config.sh"
+source "$1"
 act_check() { return 0; }
 act_platform_uses_act() { return 0; }
 act_get_job_for_target() {
@@ -1121,9 +1122,17 @@ for case in ('ordinary', 'writable-parent'):
     binary.chmod(0o755)
     (directory / 'workflow.yml').write_text(
         'name: fixture\n# ' + ('../sibling' if case == 'writable-parent' else 'ordinary') + '\n')
+    # Real worker admission resolves the repository's complete workflow plan.
+    # Keep that gate active and provide each fixture job's actual owner.
+    repos = directory / 'repos.d'
+    repos.mkdir()
+    (repos / 'fixture.yaml').write_text(
+        'targets: [linux/amd64, linux/arm64, linux/386]\n'
+        'act_job_map:\n  linux/amd64: success\n  linux/arm64: failure\n  linux/386: retry\n')
     env = os.environ.copy()
     env.update(PATH=str(directory) + os.pathsep + env['PATH'], HOME=str(home),
                DSR_WORKFLOW_FIXTURE=str(directory), DSR_CACHE_DIR=str(directory / 'cache'),
+               DSR_CONFIG_DIR=str(directory),
                ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
                ACT_LOGS_DIR=str(directory / 'logs'), ACT_TIMEOUT='20')
     output = open(directory / 'driver.log', 'wb')
@@ -1772,6 +1781,267 @@ PY
     fi
 }
 
+test_timeout_owned_groups() {
+    log_test "Real timeout groups retain descendants until cleanup"
+    if python3 - "${DSR_TEST_ACT_RUNNER:-$SRC_DIR/act_runner.sh}" <<'PY'
+import ctypes
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+module = Path(sys.argv[1]).resolve()
+root = Path(tempfile.mkdtemp(prefix='dsr-timeout-owned-groups-'))
+print('Retained timeout ownership fixture: ' + str(root), flush=True)
+checks = failures = 0
+if sys.platform.startswith('linux'):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
+
+
+def check(label, valid):
+    global checks, failures
+    checks += 1
+    failures += not valid
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+
+
+def alive(pid):
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                           capture_output=True, text=True).stdout.strip()
+    return bool(state and not state.startswith('Z'))
+
+
+def until(predicate, seconds=5):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def fixture_signals():
+    # Bash cannot trap a signal that the invoking runtime ignored on entry.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
+probe = root / 'probe.py'
+probe.write_text(r'''import json, os, pathlib, signal, subprocess, sys, time
+case = pathlib.Path(sys.argv[1])
+def alive(pid):
+    state = subprocess.run(['ps','-o','stat=','-p',str(pid)],
+                           capture_output=True,text=True).stdout.strip()
+    return bool(state and not state.startswith('Z'))
+if sys.argv[2] == 'child':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    (case / 'descendant.json').write_text(json.dumps(dict(pid=os.getpid(),pgid=os.getpgrp())))
+    while True:
+        time.sleep(0.05)
+else:
+    child=json.loads((case/'descendant.json').read_text())['pid']
+    leader=int((case/'leader.pid').read_text())
+    (case/'released.json').write_text(json.dumps(dict(alive=[p for p in (child,leader) if alive(p)])))
+''')
+leader = root / 'leader.bash'
+leader.write_text(r'''set -uo pipefail
+case_dir="$1" probe="$2" mode="$3"
+printf '%s\n' "$BASHPID" > "$case_dir/leader.pid"
+if [[ "$mode" == resistant_deadline ]]; then trap '' TERM HUP
+else trap 'exit 17' TERM HUP; fi
+python3 "$probe" "$case_dir" child &
+child=$!
+while [[ ! -s "$case_dir/descendant.json" ]]; do sleep 0.01; done
+if [[ "$mode" == completed || "$mode" == worker_completed ]]; then exit 17; fi
+wait "$child"
+''')
+driver = root / 'driver.bash'
+driver.write_text(r'''set -uo pipefail
+source "$1" || exit 90
+case_dir="$2" mode="$3" probe="$4" leader="$5"
+ACT_LOGS_DIR="$case_dir/logs"
+mkdir "$ACT_LOGS_DIR"
+seconds=30
+[[ "$mode" != *deadline ]] || seconds=1
+if [[ "$mode" == worker_* ]]; then
+    act_platform_uses_act() { return 0; }
+    selector_acquire_slot() { printf '%s\n' "$BASHPID" > "$case_dir/acquired"; }
+    selector_release_slot() { python3 "$probe" "$case_dir" release; }
+    _act_build_orchestration_target() {
+        local status=0
+        _act_run_with_timeout "$seconds" bash "$leader" "$case_dir" "$probe" "$mode" || status=$?
+        jq -nc --argjson status "$status" \
+            '{platform:"linux/amd64",host:"act-local",status:"failed",exit_code:$status,error:"fixture backend"}'
+        return "$status"
+    }
+    _act_run_target_worker tool v1.0.0 run linux/amd64 1 \
+        "$case_dir/attempt.log" "$case_dir/attempt.json" false '{}' '{}' '' '' act-local release
+else
+    # This driver must keep waiting for its managed helper when we signal the
+    # whole invocation group; only the helper owns the cancellation result.
+    trap ':' INT TERM HUP
+    status=0
+    _act_run_with_timeout "$seconds" bash "$leader" "$case_dir" "$probe" "$mode" || status=$?
+    exit "$status"
+fi
+''')
+sentinel = subprocess.Popen(['sleep', '90'], start_new_session=True)
+try:
+    for mode, expected in (('completed', 17), ('deadline', 124),
+                           ('resistant_deadline', 137), ('cancel', 143), ('interrupt', 130),
+                           ('hangup', 129), ('wrapper_lost', 137),
+                           ('worker_cancel', 130), ('worker_deadline', 124),
+                           ('worker_completed', 17)):
+        case = root / mode
+        case.mkdir()
+        process = None
+        child = None
+        group = None
+        with (case / 'transcript.log').open('w') as log:
+            started = time.monotonic()
+            try:
+                process = subprocess.Popen(['bash', str(driver), str(module), str(case),
+                                            mode, str(probe), str(leader)],
+                                           stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                           start_new_session=True, preexec_fn=fixture_signals)
+                if not until(lambda: (case / 'descendant.json').exists() and
+                             (case / 'descendant.json').stat().st_size > 0):
+                    raise RuntimeError('command descendant did not start')
+                owned = json.loads((case / 'descendant.json').read_text())
+                child, group = owned['pid'], owned['pgid']
+                check(mode + ': exercise an owned nested group',
+                      group != process.pid and os.getpgid(process.pid) == process.pid)
+                if mode == 'cancel':
+                    os.killpg(process.pid, signal.SIGTERM)
+                elif mode == 'interrupt':
+                    os.killpg(process.pid, signal.SIGINT)
+                elif mode == 'hangup':
+                    os.killpg(process.pid, signal.SIGHUP)
+                elif mode == 'worker_cancel':
+                    os.kill(process.pid, signal.SIGTERM)
+                elif mode == 'wrapper_lost':
+                    # The group anchor is a direct child of the managed
+                    # timeout wrapper. Kill that exact parent, not a PID found
+                    # by name, to exercise the parent-lifetime channel.
+                    owner = int(subprocess.check_output(
+                        ['ps', '-o', 'ppid=', '-p', str(group)], text=True).strip())
+                    check('lost wrapper belongs to this invocation',
+                          owner != process.pid and os.getpgid(owner) == process.pid)
+                    os.kill(owner, signal.SIGKILL)
+                status = process.wait(timeout=12)
+                check(mode + ': preserve actual exit status ' + str(expected), status == expected)
+                drained = until(lambda: not alive(child), 4) if mode == 'wrapper_lost' else not alive(child)
+                check(mode + ': no running descendant after managed completion', drained)
+                check(mode + ': cleanup is bounded', time.monotonic() - started < 10)
+                if mode.startswith('worker_'):
+                    receipt = json.loads((case / 'attempt.json').read_text())
+                    released = json.loads((case / 'released.json').read_text())
+                    check(mode + ': slot release follows descendant cleanup', released['alive'] == [])
+                    check(mode + ': immutable receipt records actual failed attempt',
+                          receipt.get('status') == 'failed' and receipt.get('exit_code') == expected and
+                          receipt.get('platform') == 'linux/amd64' and not receipt.get('resume_artifacts'))
+                check(mode + ': unrelated process survives', sentinel.poll() is None)
+            except Exception as error:
+                check(mode + ': ' + str(error), False)
+            finally:
+                # The fixture exclusively created these sessions/groups. With
+                # Linux subreaping, exited anchors also stay unreusable until
+                # reaped. Never search for processes by a shared program name.
+                if process is not None and process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+                if child is not None and alive(child):
+                    # A live, still-owned descendant keeps its process group
+                    # from being reused even if its original leader exited.
+                    if group is not None and os.getpgid(child) == group:
+                        os.killpg(group, signal.SIGKILL)
+                    else:
+                        os.kill(child, signal.SIGKILL)
+                while True:
+                    try:
+                        if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                            break
+                    except ChildProcessError:
+                        break
+
+    io_driver = root / 'io.bash'
+    io_driver.write_text(r'''set -uo pipefail
+source "$1" || exit 90
+case_dir="$2" monitor="$3"
+[[ "$monitor" != on ]] || set -m
+exec 10< "$case_dir/fd-input" 11> "$case_dir/fd-output"
+coproc FOREIGN_TIMEOUT_TEST {
+    IFS= read -r request
+    printf 'foreign:%s\n' "$request"
+    IFS= read -r acknowledged
+}
+foreign_pid="$FOREIGN_TIMEOUT_TEST_PID"
+foreign_read="${FOREIGN_TIMEOUT_TEST[0]}" foreign_write="${FOREIGN_TIMEOUT_TEST[1]}"
+before_flags="$-"
+trap ':' HUP
+before_trap=$(trap -p HUP)
+status=0
+_act_run_with_timeout 5 bash -c '
+    printf "arg1=<%s> arg2=<%s> arg3=<%s>\n" "$1" "$2" "$3"
+    cat
+    cat <&10
+    printf "fd-output\n" >&11
+    printf "real-stderr\n" >&2
+    exit 37' _ 'space argument' '' '$literal' || status=$?
+[[ "$status" == 37 && "$before_flags" == "$-" && "$before_trap" == "$(trap -p HUP)" ]] || exit 91
+printf 'intact\n' >&"$foreign_write"
+IFS= read -r -u "$foreign_read" reply || exit 92
+[[ "$reply" == foreign:intact ]] || exit 93
+printf 'acknowledged\n' >&"$foreign_write"
+wait "$foreign_pid" || exit 94
+exit 37
+''')
+    for monitor in ('on', 'off'):
+        case = root / ('streams-' + monitor)
+        case.mkdir()
+        (case / 'fd-input').write_text('fd-input\n')
+        result = subprocess.run(['bash', str(io_driver), str(module), str(case), monitor],
+                                input='real-stdin\n', text=True, capture_output=True, timeout=10,
+                                preexec_fn=fixture_signals)
+        (case / 'stdout').write_text(result.stdout)
+        (case / 'stderr').write_text(result.stderr)
+        check(monitor + ': preserve status, monitor, signal trap and foreign coprocess', result.returncode == 37)
+        check(monitor + ': preserve argument boundaries and stdin/stdout',
+              result.stdout == 'arg1=<space argument> arg2=<> arg3=<$literal>\nreal-stdin\nfd-input\n')
+        check(monitor + ': preserve an occupied output descriptor',
+              (case / 'fd-output').read_text() == 'fd-output\n')
+        check(monitor + ': preserve real stderr', 'real-stderr\n' in result.stderr)
+    fallback = subprocess.run(['bash', '-c', r'''source "$1"
+_act_timeout_cmd() { printf ''; }
+payload() { printf 'fallback:<%s>\n' "$1"; cat; return 23; }
+_act_run_with_timeout 1 payload 'space argument'
+''', '_', str(module)], input='fallback stdin\n', text=True, capture_output=True, timeout=5)
+    check('missing timeout preserves direct function status', fallback.returncode == 23)
+    check('missing timeout preserves direct function arguments and streams',
+          fallback.stdout == 'fallback:<space argument>\nfallback stdin\n')
+finally:
+    if sentinel.poll() is None:
+        sentinel.terminate()
+    sentinel.wait(timeout=5)
+
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Owned timeout groups: %d checks, %d failures' % (checks, failures), flush=True)
+sys.exit(bool(failures))
+PY
+    then
+        log_pass "timeout groups drain resistant descendants before returning or releasing slots"
+    else
+        log_fail "timeout group ownership regression"
+    fi
+}
+
 test_workflow_process_cancellation() {
     log_test "Real workflow cancellation and bounded timeout escalation"
     if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
@@ -1831,16 +2101,25 @@ try:
         marker, heartbeat = directory / 'pid.json', directory / 'heartbeat'
         workflow_file = directory / 'workflow.yml'
         workflow_file.write_text('name: fixture\n# ' + ('../sibling' if isolated else 'ordinary') + '\n')
+        # The production worker validates the complete workflow payload plan
+        # before launching act. Supply a real untyped repository document so
+        # these lifetime probes reach that launch through the actual gate.
+        repos = directory / 'repos.d'
+        repos.mkdir()
+        (repos / 'fixture.yaml').write_text(
+            'targets: [linux/amd64]\nact_job_map:\n  linux/amd64: fixture\n')
         env = os.environ.copy()
         env.update(PATH=str(directory) + os.pathsep + env['PATH'],
                    DSR_FIXTURE_MARKER=str(marker), DSR_FIXTURE_BEAT=str(heartbeat),
                    DSR_FIXTURE_RESIST_TERM='1' if resistant else '0',
                    DSR_CACHE_DIR=str(directory / 'cache'),
+                   DSR_CONFIG_DIR=str(directory),
                    ACT_ARTIFACTS_DIR=str(directory / 'artifacts'),
                    ACT_LOGS_DIR=str(directory / 'logs'),
                    ACT_TIMEOUT='1' if deadline else '30')
         if workflow:
-            script = '''source "$1"
+            script = '''source "${1%/*}/config.sh"
+source "$1"
 act_check() { return 0; }
 act_platform_uses_act() { return 0; }
 act_get_job_for_target() { printf 'fixture\\n'; }
@@ -1888,7 +2167,10 @@ _act_run_with_timeout "$ACT_TIMEOUT" act
                 time.sleep(0.1)
                 check(case + ': no post-cancellation work', heartbeat.stat().st_size == size)
             try:
-                status = process.wait(timeout=1)
+                # The target may exit immediately, while the owning worker
+                # keeps its five-second group grace before publishing a
+                # receipt. Wait within the same overall cleanup deadline.
+                status = process.wait(timeout=max(0.1, retired_by - time.monotonic()))
             except subprocess.TimeoutExpired:
                 status = None
             if deadline:
@@ -1900,13 +2182,19 @@ _act_run_with_timeout "$ACT_TIMEOUT" act
             check(case + ': caller exits with the intended failure', status in expected)
             check(case + ': unrelated process remains alive', sentinel.poll() is None)
         finally:
-            # Only this fixture's newly created groups are eligible for cleanup.
-            for group in (process.pid, None if target is None else target['group']):
-                if group is not None:
-                    try:
-                        os.killpg(group, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+            # Only groups with a still-live owned member are eligible. Do not
+            # signal a reaped invocation's potentially reusable numeric PGID.
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if target is not None and running(target['pid']):
+                try:
+                    if os.getpgid(target['pid']) == target['group']:
+                        os.killpg(target['group'], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             process.wait(timeout=5)
             output.close()
 finally:
@@ -2384,6 +2672,7 @@ main() {
     fi
     if [[ "${1:-}" == "--timeout-only" ]]; then
         test_timeout_descendant_cancellation
+        test_timeout_owned_groups
         test_workflow_process_cancellation
         [[ "$FAIL_COUNT" -eq 0 ]]
         return
@@ -2416,6 +2705,7 @@ main() {
     test_typed_workflow_companions
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
+    test_timeout_owned_groups
     test_workflow_process_cancellation
     test_worker_admission_cancellation
     test_unix_native_build_guard
