@@ -7463,8 +7463,14 @@ act_substitute_build_cmd_tokens() {
 
     cmd="${cmd//\$\{arch\}/$arch}"
     cmd="${cmd//\$\{ARCH\}/$arch}"
-    cmd="${cmd//\$\{goarch\}/$arch}"
-    cmd="${cmd//\$\{GOARCH\}/$arch}"
+    # Keep release-routing names in ${arch}, but use the compiler's spelling
+    # for Go selectors. An inline GOARCH assignment otherwise overrides the
+    # correctly resolved environment with unsupported GOARCH=armv7. The
+    # existing environment resolver still owns the required GOARM=7 value.
+    local go_arch="$arch"
+    [[ "$go_arch" != armv7 ]] || go_arch=arm
+    cmd="${cmd//\$\{goarch\}/$go_arch}"
+    cmd="${cmd//\$\{GOARCH\}/$go_arch}"
 
     if [[ -n "$target_triple" ]]; then
         cmd="${cmd//\$\{target_triple\}/$target_triple}"

@@ -7,7 +7,10 @@
 # not POSIX-expand ${version}, so the literal placeholder was being baked into
 # the bv ldflag and shipped in the v0.17.0 Windows binary.
 #
-# Usage: ./scripts/tests/test_act_build_cmd_tokens.sh
+# --go-cross-build also runs real offline Go compilation through the production
+# environment resolver and command substitution. It does not start a native
+# host worker or bypass its readiness admission.
+# Usage: ./scripts/tests/test_act_build_cmd_tokens.sh [--go-cross-build]
 #
 # Exit codes:
 #   0 - All tests passed
@@ -19,6 +22,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+GO_CROSS_BUILD=false
+case "${1:-}" in
+    '') ;;
+    --go-cross-build) GO_CROSS_BUILD=true ;;
+    *) printf 'Unknown test option: %s\n' "$1" >&2; exit 4 ;;
+esac
 
 # Source the module under test
 # shellcheck source=../../src/act_runner.sh
@@ -98,6 +107,106 @@ test_os_arch_name_tokens() {
     assert_eq 'go build -o mytool-darwin-arm64 .' "$out" 'name/os/arch tokens resolve'
 }
 
+# Compiler selectors and release-routing names are distinct for ARMv7. The
+# explicit command assignment must agree with act_get_build_env; otherwise it
+# overrides GOARCH=arm with an unsupported Go architecture at execution time.
+test_go_architecture_tokens() {
+    local out arch
+    out=$(act_substitute_build_cmd_tokens \
+        'GOOS=${GOOS} GOARCH=${GOARCH} go build -o ${NAME}-${OS}-${ARCH} .' \
+        'tool' 'v1.2.3' 'linux' 'armv7')
+    assert_eq 'GOOS=linux GOARCH=arm go build -o tool-linux-armv7 .' "$out" \
+        'uppercase Go selector is arm while the release-routing token remains armv7'
+    out=$(act_substitute_build_cmd_tokens \
+        'GOOS=${goos} GOARCH=${goarch} go build -o ${name}-${os}-${arch} .' \
+        'tool' 'v1.2.3' 'linux' 'armv7')
+    assert_eq 'GOOS=linux GOARCH=arm go build -o tool-linux-armv7 .' "$out" \
+        'lowercase Go selector is arm while the release-routing token remains armv7'
+    for arch in amd64 arm64 386; do
+        out=$(act_substitute_build_cmd_tokens 'GOARCH=${GOARCH} go build -o tool-${arch} .' \
+            'tool' 'v1.2.3' 'linux' "$arch")
+        assert_eq "GOARCH=$arch go build -o tool-$arch ." "$out" \
+            "$arch Go and routing selectors retain their existing values"
+    done
+    out=$(act_substitute_build_cmd_tokens 'GOARM=$GOARM go build -o tool-${arch} .' \
+        'tool' 'v1.2.3' 'linux' 'armv7')
+    assert_eq 'GOARM=$GOARM go build -o tool-armv7 .' "$out" \
+        'the configured GOARM environment remains under the existing resolver'
+}
+
+test_go_armv7_cross_build() {
+    local dependency
+    for dependency in go yq jq; do
+        if ! command -v "$dependency" >/dev/null; then
+            assert_eq available missing "real Go command regression requires $dependency"
+            return 1
+        fi
+    done
+    local fixture
+    fixture=$(mktemp -d "${TMPDIR:-/tmp}/dsr-go-command-tokens.XXXXXXXX") || return 1
+    log_info "Retained real Go command evidence: $fixture"
+    local ACT_REPOS_DIR="$fixture/config" environment pair mode template command artifact metadata status
+    local -a environment_args=()
+    mkdir -p "$ACT_REPOS_DIR" "$fixture/cache" "$fixture/tmp" "$fixture/uppercase" "$fixture/lowercase" || return 1
+    cat > "$ACT_REPOS_DIR/fixture.yaml" <<'YAML'
+tool_name: fixture
+language: go
+binary_name: fixture
+targets: [linux/armv7]
+env:
+  CGO_ENABLED: "0"
+YAML
+    cat > "$fixture/main.go" <<'GO'
+package main
+import "runtime"
+func main() { println(runtime.GOOS + "/" + runtime.GOARCH) }
+GO
+    environment=$(act_get_build_env fixture linux/armv7) || {
+        assert_eq resolved failed 'production Go environment resolves the ARMv7 request'
+        return 1
+    }
+    assert_eq arm "$(act_get_build_env_value "$environment" GOARCH)" 'real build resolves GOARCH=arm'
+    assert_eq 7 "$(act_get_build_env_value "$environment" GOARM)" 'real build resolves GOARM=7'
+    while IFS= read -r pair; do
+        [[ -n "$pair" ]] && environment_args+=("$pair")
+    done <<< "$environment"
+    for mode in uppercase lowercase; do
+        if [[ "$mode" == uppercase ]]; then
+            template='GOOS=${GOOS} GOARCH=${GOARCH} go build -p 1 -trimpath -o "$DSR_GO_OUTPUT/${NAME}-${OS}-${ARCH}" "$DSR_GO_SOURCE"'
+        else
+            template='GOOS=${goos} GOARCH=${goarch} go build -p 1 -trimpath -o "$DSR_GO_OUTPUT/${name}-${os}-${arch}" "$DSR_GO_SOURCE"'
+        fi
+        command=$(act_substitute_build_cmd_tokens "$template" fixture v1.2.3 linux armv7) || return 1
+        printf '%s\n' "$command" > "$fixture/$mode/command.txt"
+        status=0
+        # A private bounded fixture cache and an absolute single source file
+        # keep this build offline and independent of repository dependencies.
+        # Deliberately conflicting inherited selectors must lose to the real
+        # resolver and the subsequently expanded command assignments.
+        env GOOS=plan9 GOARCH=386 GOARM=5 GOENV=off GO111MODULE=off \
+            GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off GOMAXPROCS=2 \
+            GOCACHE="$fixture/cache" GOTMPDIR="$fixture/tmp" \
+            DSR_GO_OUTPUT="$fixture/$mode" DSR_GO_SOURCE="$fixture/main.go" \
+            "${environment_args[@]}" bash -c "$command" \
+            > "$fixture/$mode/stdout" 2> "$fixture/$mode/stderr" || status=$?
+        assert_eq 0 "$status" "$mode command compiles the requested ARMv7 program with real Go"
+        if [[ "$status" -ne 0 ]]; then
+            cat "$fixture/$mode/stderr" >&2
+            continue
+        fi
+        artifact="$fixture/$mode/fixture-linux-armv7"
+        status=0
+        _act_validate_target_binary "$artifact" linux/armv7 || status=$?
+        assert_eq 0 "$status" "$mode output passes production Linux ARMv7 binary admission"
+        metadata=$(GOENV=off go version -m "$artifact") || return 1
+        printf '%s\n' "$metadata" > "$fixture/$mode/build-info.txt"
+        assert_eq arm "$(awk '$1 == "build" && $2 ~ /^GOARCH=/ {sub(/^GOARCH=/,"",$2); print $2}' <<< "$metadata")" \
+            "$mode embedded compiler metadata records GOARCH=arm"
+        pair=$(awk '$1 == "build" && $2 ~ /^GOARM=/ {sub(/^GOARM=/,"",$2); print $2}' <<< "$metadata")
+        assert_eq 7 "${pair%%,*}" "$mode embedded compiler metadata records the ARMv7 ISA"
+    done
+}
+
 # Version without a leading "v" is passed through as-is.
 test_version_without_v() {
     local out
@@ -172,6 +281,7 @@ test_bv_version_token
 test_no_token_unchanged
 test_shell_vars_untouched
 test_os_arch_name_tokens
+test_go_architecture_tokens
 test_version_without_v
 test_rejects_command_substitution_in_version
 test_rejects_backtick_in_version
@@ -180,6 +290,9 @@ test_rejects_pipe_in_name
 test_rejects_newline_in_arch
 test_rejects_space_in_os
 test_accepts_clean_semver_with_build_metadata
+if $GO_CROSS_BUILD; then
+    test_go_armv7_cross_build || assert_eq complete aborted 'real Go regression completes every requested check'
+fi
 
 log_info "Results: $PASS_COUNT/$TEST_COUNT passed, $FAIL_COUNT failed"
 [[ "$FAIL_COUNT" -eq 0 ]]

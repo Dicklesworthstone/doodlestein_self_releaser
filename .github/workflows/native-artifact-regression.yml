@@ -9,6 +9,7 @@ on:
       - scripts/tests/test_native_artifact_build.sh
       - scripts/tests/test_act_runner.sh
       - scripts/tests/test_act_orchestration.sh
+      - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_disk_free_floor.sh
       - scripts/tests/test_artifact_formats.sh
@@ -98,6 +99,13 @@ jobs:
           set -euo pipefail
           bash -n scripts/tests/test_act_runner.sh
           bash scripts/tests/test_act_runner.sh --workflow-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workflow-isolation.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate Go compiler selectors and ARMv7 command expansion
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_act_build_cmd_tokens.sh
+          bash scripts/tests/test_act_build_cmd_tokens.sh --go-cross-build 2>&1 | tee "$RUNNER_TEMP/collector-evidence/go-command-tokens.log"
           test -z "$(git status --porcelain)"
       - name: Validate stdin-isolated target dispatch and exact-run resume
         shell: bash
