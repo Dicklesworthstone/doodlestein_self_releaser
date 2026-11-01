@@ -305,6 +305,27 @@ lease_mkdir_cleanup() {
 }
 expect 'mkdir backend cleans up without changing caller traps or breaking spaced paths' 0 '' lease_mkdir_cleanup
 
+# The previous owner may release its guard between our failed mkdir and the
+# filesystem inspection. Inject that boundary once, then acquire a real lock.
+lease_mkdir_owner_release_race() {
+    lease_env owner-release-race mkdir || return 1
+    local guard="$_SELECTOR_STATE_DIR/mutexes/gamma.d"
+    local attempted="$_SELECTOR_STATE_DIR/mkdir-attempted"
+    mkdir() {
+        if [[ "${*: -1}" == "$guard" && ! -e "$attempted" ]]; then
+            : > "$attempted"
+            return 1
+        fi
+        command mkdir "$@"
+    }
+    DSR_SELECTOR_LOCK_TIMEOUT=1 selector_acquire_slot gamma raced || return 1
+    [[ -f "$attempted" && -f "$_SELECTOR_LOCKS_DIR/gamma/raced.lock" ]] || return 1
+    [[ ! -e "$guard" ]] || return 1
+    selector_release_slot gamma raced || return 1
+    [[ ! -e "$_SELECTOR_LOCKS_DIR/gamma/raced.lock" && ! -e "$guard" ]]
+}
+expect 'mkdir retries when the previous owner releases between acquisition and inspection' 0 '' lease_mkdir_owner_release_race
+
 lease_failed_lock() {
     lease_env failed-lock flock || return 1
     flock() { return 64; }

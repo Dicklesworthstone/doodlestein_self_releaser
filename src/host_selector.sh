@@ -169,7 +169,10 @@ _sel_with_lock() (
         guard+=".d"
         started=$SECONDS
         while ! (umask 077; mkdir -- "$guard") 2>/dev/null; do
-            [[ -d "$guard" && ! -L "$guard" ]] || return 4
+            # The owner may remove its directory after mkdir observes EEXIST.
+            # An absent guard is retryable under the same deadline; an extant
+            # non-directory or symlink still fails closed.
+            [[ ! -L "$guard" && ( ! -e "$guard" || -d "$guard" ) ]] || return 4
             if ((SECONDS - started >= budget)); then
                 _sel_log_warn "Host mutex busy; inspect abandoned guards rather than stealing them: $guard"
                 return 2
