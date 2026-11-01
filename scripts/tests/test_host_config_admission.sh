@@ -17,7 +17,9 @@ export DSR_CONFIG_FILE="$DSR_CONFIG_DIR/config.yaml"
 export DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
 export DSR_REPOS_FILE="$DSR_CONFIG_DIR/repos.yaml"
 mkdir -p "$DSR_CONFIG_DIR" "$DSR_CACHE_DIR" "$DSR_STATE_DIR" || exit 1
-source "$PROJECT_ROOT/src/host_health.sh"
+# Run the exact same public admission matrix against an unchanged module when
+# collecting a baseline; the default always exercises the checkout under test.
+source "${DSR_TEST_HOST_HEALTH_MODULE:-$PROJECT_ROOT/src/host_health.sh}"
 
 RUN=0 PASSED=0 FAILED=0 SKIPPED=0
 HAVE_YQ=false
@@ -35,6 +37,7 @@ hosts:
   local:
     platform: linux/amd64
     connection: local
+    concurrency: 1
     capabilities:
       - go
     description: "Live local probes"
@@ -189,6 +192,7 @@ alias_fixture() {
 shared: &base
   platform: linux/amd64
   connection: local
+  concurrency: 1
   capabilities: &go_tools
     - go
 hosts:
@@ -286,6 +290,7 @@ hosts:
   local:
     platform: linux/amd64
     connection: local
+    concurrency: 1
 YAML
     local result
     result=$(host_health_check local --json) || return 1
@@ -349,7 +354,7 @@ selection_error() {
 }
 
 capacity_fixture() {
-    local usage="$1" available="$2"
+    local usage="$1" available="$2" slots="${3-1}"
     cat > "$DSR_HOSTS_FILE" <<'YAML'
 hosts:
   capacity:
@@ -357,6 +362,11 @@ hosts:
     connection: local
     build_root: /fixture/build_root
 YAML
+    # Legacy floor cases select one build explicitly. The omitted-count cases
+    # below exercise the scheduler's real default through public admission.
+    if [[ "$slots" != omitted ]]; then
+        printf '    concurrency: %s\n' "$slots" >> "$DSR_HOSTS_FILE"
+    fi
     CAPACITY_TRACE="$TEST_ROOT/capacity-probes-$RUN"
     CAPACITY_PROBE_EXIT=0
     CAPACITY_DATA=$(jq -nc --argjson usage "$usage" --argjson available "$available" '
@@ -376,22 +386,29 @@ YAML
 
 capacity_outcome() {
     local usage="$1" available="$2" expected="$3" result status=0 readiness=0 human
-    capacity_fixture "$usage" "$available" || return 1
+    local slots="${4-1}" minimum="${5-21474836480}" expected_slots="${4-1}" check_slots=false
+    (( $# < 4 )) || check_slots=true
+    [[ "$expected_slots" != omitted ]] || expected_slots=2
+    capacity_fixture "$usage" "$available" "$slots" || return 1
     result=$(host_health_check capacity --no-cache --json) || status=$?
-    jq -e --arg expected "$expected" --argjson usage "$usage" --argjson available "$available" '
+    jq -e --arg expected "$expected" --argjson usage "$usage" --argjson available "$available" \
+        --argjson minimum "$minimum" --argjson slots "$expected_slots" --argjson check_slots "$check_slots" '
         .hostname == "capacity" and .status == $expected and
         .healthy == ($expected != "error") and .errors == (if $expected == "error" then 1 else 0 end) and
         .checks.connectivity.reachable == true and .checks.disk_space.admission == "unix-writable-roles-v2" and
+        (if $check_slots then .checks.disk_space.concurrent_builds == $slots else true end) and
         (.checks.disk_space.capacity_groups|length) == 1 and (.checks.disk_space.roles|length) == 5 and
         all(.checks.disk_space.roles[]; .status == $expected and .usage_percent == $usage and
-            .available_bytes == $available and .min_free_bytes == 21474836480)' <<< "$result" >/dev/null || return 1
+            .available_bytes == $available and .min_free_bytes == $minimum)' <<< "$result" >/dev/null || return 1
     # Native writable-path requests demand a new observation even when their
     # current explicit list is empty. A cached healthy result cannot stand in.
     host_health_is_ready capacity --writable-paths '[]' || readiness=$?
     [[ $(wc -l < "$CAPACITY_TRACE") -eq 2 ]] || return 1
     if [[ "$expected" == error ]]; then
         [[ $status -eq 1 && $readiness -eq 1 ]] || return 1
-        jq -e '.warnings == 0 and (.checks.disk_space.error|contains("20 GiB required"))' <<< "$result" >/dev/null
+        jq -e --argjson minimum "$minimum" '.warnings == 0 and
+            (.checks.disk_space.error|contains(($minimum/1073741824|tostring) + " GiB required"))' \
+            <<< "$result" >/dev/null
     else
         [[ $status -eq 0 && $readiness -eq 0 ]] || return 1
         jq -e '.warnings == 1' <<< "$result" >/dev/null || return 1
@@ -436,6 +453,33 @@ capacity_cached_policy_change() {
     [[ $(wc -l < "$CAPACITY_TRACE") -eq 2 ]]
 }
 
+capacity_cached_concurrency_change() {
+    local before after status=0
+    capacity_fixture 96 192199786496 8 || return 1
+    before=$(host_health_check capacity --json) || return 1
+    jq -e '.status == "warning" and .healthy == true' <<< "$before" >/dev/null || return 1
+    [[ $(wc -l < "$CAPACITY_TRACE") -eq 1 ]] || return 1
+    # Preserve the same real cache and raw capacity while the configured
+    # simultaneous build count crosses the available-space boundary.
+    capacity_fixture 96 192199786496 9 || return 1
+    after=$(host_health_check capacity --json) || status=$?
+    if [[ $status -ne 1 ]]; then
+        printf 'Nine-build admission must refuse 179 GiB; got exit %s: %s\n' "$status" \
+            "$(jq -c '{status,healthy,minimum:.checks.disk_space.min_free_bytes}' <<< "$after")"
+        return 1
+    fi
+    [[ $(wc -l < "$CAPACITY_TRACE") -eq 2 ]] || return 1
+    jq -e --argjson before "$before" '
+        $before.checks.disk_space.concurrent_builds == 8 and
+        all($before.checks.disk_space.roles[]; .min_free_bytes == 171798691840) and
+        .healthy == false and .status == "error" and .admission_fingerprint != $before.admission_fingerprint and
+        .checks.disk_space.concurrent_builds == 9 and
+        all(.checks.disk_space.roles[]; .status == "error" and .min_free_bytes == 193273528320)' \
+        <<< "$after" >/dev/null || return 1
+    ! host_health_is_ready capacity || return 1
+    [[ $(wc -l < "$CAPACITY_TRACE") -eq 2 ]]
+}
+
 run_capacity_tests() {
     run_test 'public health and fresh readiness admit 96 percent usage with 179 GiB available as a warning' \
         capacity_outcome 96 192199786496 warning
@@ -445,11 +489,20 @@ run_capacity_tests() {
         capacity_outcome 84 2486128640 error
     run_test 'public health and readiness refuse one byte below the floor despite rounded 20 GiB display' \
         capacity_outcome 96 21474836479 error
+    run_test 'public admission with an omitted slot count requires the scheduler default of 40 GiB' \
+        capacity_outcome 96 21474836480 error omitted 42949672960
+    run_test 'public admission with an omitted slot count accepts the exact 40 GiB floor with a warning' \
+        capacity_outcome 100 42949672960 warning omitted 42949672960
+    run_test 'public health and fresh readiness admit eight builds with 179 GiB available' \
+        capacity_outcome 96 192199786496 warning 8 171798691840
+    run_test 'public health and fresh readiness refuse nine builds with 179 GiB available' \
+        capacity_outcome 96 192199786496 error 9 193273528320
     local mode
     for mode in missing_role malformed_count empty failed_probe; do
         run_test "public health and readiness refuse $mode capacity evidence" capacity_invalid_inventory "$mode"
     done
     run_test 'a tightened byte floor invalidates cached high-usage healthy admission before readiness' capacity_cached_policy_change
+    run_test 'increasing concurrency from eight to nine invalidates cached admission at 179 GiB' capacity_cached_concurrency_change
 }
 
 if [[ "${1:-}" == --capacity-only ]]; then
