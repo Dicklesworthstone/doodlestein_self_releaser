@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install an explicitly selected executable set from local or fetched signed bytes.
+# Install explicitly selected executables and runtime data from signed bytes.
 # One managed current symlink activates a complete generation; no payload runs.
 _RELEASE_INSTALL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=src/platforms.sh
@@ -119,9 +119,20 @@ def member(value):
     return isinstance(value, str) and len(value) <= 1024 and all(name(p) for p in value.split("/"))
 
 
+def data_directories(files):
+    # This also defines the entire permitted directory namespace. Empty or
+    # undeclared directories are never part of an installed generation.
+    children = {}
+    for item in files:
+        parts = item["path"].split("/")
+        for i in range(1, len(parts)):
+            children.setdefault("/".join(parts[:i]), set()).add(parts[i])
+    return children
+
+
 def recipe(value, contract=None):
     fields = {"schema_version", "target", "executables"}
-    need(isinstance(value, dict) and fields <= set(value) <= fields | {"target_triple"} and
+    need(isinstance(value, dict) and fields <= set(value) <= fields | {"target_triple", "files"} and
          type(value["schema_version"]) is int and value["schema_version"] == 1 and
          isinstance(value["target"], str) and re.fullmatch(PLATFORM_PATTERN, value["target"]) and
          not value["target"].startswith("windows/") and
@@ -133,6 +144,27 @@ def recipe(value, contract=None):
              name(item["name"]) and name(item["artifact"]) and
              ("member" not in item or member(item["member"])), "invalid executable selection", 4)
     need(len({e["name"].lower() for e in value["executables"]}) == len(value["executables"]), "colliding executable names", 4)
+    if "files" in value:
+        need(isinstance(value["files"], list) and len(value["files"]) <= 256, "invalid runtime file selections", 4)
+        destinations = {}
+        for item in value["files"]:
+            need(isinstance(item, dict) and {"path", "artifact"} <= set(item) <= {"path", "artifact", "member"} and
+                 member(item["path"]) and item["path"].startswith("share/") and name(item["artifact"]) and
+                 ("member" not in item or member(item["member"])), "invalid runtime file selection", 4)
+            parts = item["path"].split("/")
+            for i in range(1, len(parts) + 1):
+                path = "/".join(parts[:i])
+                kind = "file" if i == len(parts) else "dir"
+                previous = destinations.get(path.casefold())
+                need(previous is None or (kind == "dir" and previous == (path, kind)),
+                     "colliding runtime file destinations: " + item["path"], 4)
+                destinations[path.casefold()] = (path, kind)
+        if value["files"]:
+            value["files"].sort(key=lambda item: item["path"])
+        else:
+            # An explicitly empty data selection is the existing executable-
+            # only recipe, including its canonical receipt and generation ID.
+            del value["files"]
     if contract is not None:
         # Independent output policy is checked before network acquisition. It
         # cannot authenticate bytes; the complete signed snapshot still must.
@@ -148,6 +180,14 @@ def recipe(value, contract=None):
             need("target_triple" not in value or "target_triple" not in asset or
                  value["target_triple"] == asset["target_triple"],
                  "recipe compiler differs from the independent asset contract", 4)
+        for item in value.get("files", []):
+            asset = assets.get(item["artifact"])
+            need(asset is not None and asset["target"] in (value["target"], "additional") and
+                 ((asset["archive_format"] in ("binary", "none")) == ("member" not in item)),
+                 "recipe runtime file differs from the independent asset contract", 4)
+            need(asset["target"] == "additional" or "target_triple" not in value or "target_triple" not in asset or
+                 value["target_triple"] == asset["target_triple"],
+                 "runtime file compiler differs from the independent asset contract", 4)
     value["executables"].sort(key=lambda e: e["name"])
     return value
 
@@ -215,18 +255,35 @@ def describe_contract(file, targets, work):
 
 def verify_generation(directory, expected):
     plain(directory, "dir")
-    need({p.name for p in directory.iterdir()} == {"bin", "receipt.json", "release.intoto.jsonl", "release.intoto.jsonl.minisig"},
+    files = expected.get("files", [])
+    namespace = {"bin", "receipt.json", "release.intoto.jsonl", "release.intoto.jsonl.minisig"}
+    if files:
+        namespace.add("share")
+    need({p.name for p in directory.iterdir()} == namespace,
          "generation namespace changed")
-    need(load(directory / "receipt.json") == expected, "generation receipt differs from authenticated selection")
+    retained_receipt = plain(directory / "receipt.json", "file")
+    need(retained_receipt.stat().st_nlink == 1 and load(retained_receipt) == expected,
+         "generation receipt differs from authenticated selection")
     for file, pin in (("release.intoto.jsonl", expected["statement_sha256"]),
                       ("release.intoto.jsonl.minisig", expected["signature_sha256"])):
-        need(digest(directory / file) == pin, "retained generation proof changed")
+        proof = plain(directory / file, "file")
+        need(proof.stat().st_nlink == 1 and digest(proof) == pin, "retained generation proof changed")
     binaries = plain(directory / "bin", "dir")
     need({p.name for p in binaries.iterdir()} == {e["name"] for e in expected["executables"]}, "installed executable set changed")
     for item in expected["executables"]:
         file = plain(binaries / item["name"], "file")
-        need(digest(file) == item["sha256"] and file.stat().st_size == item["size_bytes"] and
+        need(file.stat().st_nlink == 1 and digest(file) == item["sha256"] and file.stat().st_size == item["size_bytes"] and
              stat.S_IMODE(file.stat().st_mode) == 0o755, "installed executable changed: " + item["name"])
+    for path, children in data_directories(files).items():
+        folder = plain(directory / path, "dir")
+        need(stat.S_IMODE(folder.stat().st_mode) == 0o755 and
+             {p.name for p in folder.iterdir()} == children, "installed runtime directory changed: " + path)
+    for item in files:
+        file = plain(directory / item["path"], "file")
+        observed = file.stat()
+        need(observed.st_nlink == 1 and stat.S_IMODE(observed.st_mode) == 0o644 and
+             observed.st_size == item["size_bytes"] and digest(file) == item["sha256"],
+             "installed runtime file changed: " + item["path"])
 
 
 def current_selection(prefix):
@@ -387,12 +444,24 @@ try:
                      "executable artifact differs from the selected compiler variant: " + item["artifact"], 4)
             need((records[item["artifact"]]["archive_format"] in ("binary", "none")) == ("member" not in item),
                  "raw artifacts forbid member; archives require member", 4)
+        for item in selected.get("files", []):
+            record = records.get(item["artifact"])
+            need(record is not None and record["target"] in (selected["target"], "additional"),
+                 "runtime file artifact is not a signed payload for this target or the shared release", 4)
+            if record["target"] == "additional":
+                need("target_triple" not in record, "shared runtime file has a compiler identity", 4)
+            elif "target_triple" in selected:
+                need(record.get("target_triple") == selected["target_triple"],
+                     "runtime file artifact differs from the selected compiler variant: " + item["artifact"], 4)
+            need((record["archive_format"] in ("binary", "none")) == ("member" not in item),
+                 "raw runtime artifacts forbid member; archives require member", 4)
         staged = work / "generation"
         (staged / "bin").mkdir(parents=True)
         copy_pinned(snapshot / "release.intoto.jsonl", staged / "release.intoto.jsonl", verified["statement_sha256"])
         copy_pinned(snapshot / "release.intoto.jsonl.minisig", staged / "release.intoto.jsonl.minisig", verified["signature_sha256"])
         extracted = {}
-        for number, artifact in enumerate(sorted({e["artifact"] for e in selected["executables"]})):
+        selections = selected["executables"] + selected.get("files", [])
+        for number, artifact in enumerate(sorted({e["artifact"] for e in selections})):
             record = records[artifact]
             local = work / ("artifact-%d" % number)
             copy_pinned(snapshot / "artifacts" / artifact, local, record["sha256"])
@@ -418,12 +487,34 @@ try:
             installed.append(dict(item, sha256=pin, size_bytes=dest.stat().st_size, mode=0o755))
             if "target_triple" in selected:
                 installed[-1]["target_triple"] = selected["target_triple"]
+        installed_files = []
+        for path in sorted(data_directories(selected.get("files", [])), key=lambda p: (p.count("/"), p)):
+            folder = staged / path
+            folder.mkdir(mode=0o755)
+            folder.chmod(0o755)
+        for item in selected.get("files", []):
+            source = extracted[item["artifact"]]
+            if "member" in item:
+                source /= item["member"]
+            plain(source, "file")
+            # Unlike executables, an explicitly selected empty archive member
+            # is useful data. The containing archive is still authenticated.
+            pin = digest(source)
+            dest = staged / item["path"]
+            copy_pinned(source, dest, pin, 0o644)
+            record = records[item["artifact"]]
+            installed_files.append(dict(item, target=record["target"], sha256=pin,
+                                        size_bytes=dest.stat().st_size, mode=0o644))
+            if record["target"] != "additional" and "target_triple" in selected:
+                installed_files[-1]["target_triple"] = selected["target_triple"]
         receipt = dict(schema_version=1, kind="dsr-authenticated-install-generation", repository=args.repo, tag=args.tag,
                        source_sha=args.sha, builder=args.builder, target=selected["target"], recipe=selected,
                        public_key=(work / "trusted.pub").read_text().splitlines()[1], remote_current=False,
                        snapshot_sha256=verified["snapshot_sha256"], statement_sha256=verified["statement_sha256"],
                        signature_sha256=verified["signature_sha256"], build_manifest_sha256=verified["build_manifest_sha256"],
                        invocation_id=verified["invocation_id"], executables=installed)
+        if installed_files:
+            receipt["files"] = installed_files
         if "target_triple" in selected:
             receipt["target_triple"] = selected["target_triple"]
         if contract is not None:
@@ -439,6 +530,9 @@ try:
                       bin_dir=str(prefix / "current/bin"), generation_bin_dir=str(prefix / "generations" / identity / "bin"),
                       executables=installed, snapshot_sha256=verified["snapshot_sha256"],
                       dry_run=args.dry_run)
+        if installed_files:
+            result.update(files=installed_files, share_dir=str(prefix / "current/share"),
+                          generation_share_dir=str(prefix / "generations" / identity / "share"))
         if "target_triple" in selected:
             result["target_triple"] = selected["target_triple"]
         if contract is not None:

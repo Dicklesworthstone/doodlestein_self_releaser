@@ -12,8 +12,11 @@ on:
       - src/release_bundle.sh
       - src/release_packaging.sh
       - src/release_packaging_pipeline.sh
+      - src/release_install.sh
+      - src/install_gen_release.sh
       - src/platforms.sh
       - src/slsa.sh
+      - src/slsa_remote.sh
       - src/cargo_cache.sh
       - src/cargo_sources.sh
       - src/packaging.sh
@@ -35,6 +38,11 @@ on:
       - scripts/tests/test_release_build_plan_variants.sh
       - scripts/tests/test_release_packaging.sh
       - scripts/tests/test_release_packaging_variants.sh
+      - scripts/tests/test_release_install.sh
+      - scripts/tests/test_release_install_fetch.sh
+      - scripts/tests/test_release_install_variants.sh
+      - scripts/tests/test_generated_release_installer.sh
+      - scripts/tests/test_slsa_snapshot.sh
       - scripts/tests/test_release_source_only.sh
       - scripts/tests/test_release_source_only_exact_tag.sh
       - scripts/tests/test_dispatch_delivery.sh
@@ -84,6 +92,47 @@ jobs:
         with:
           name: build-packaging-contract-evidence
           path: ${{ runner.temp }}/packaging-evidence
+          retention-days: 7
+          if-no-files-found: error
+  authenticated-installation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DSR_TEST_MINISIGN_FIXTURE: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install signed installation regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 minisign shellcheck gcc tar zip unzip xz-utils util-linux
+          mkdir -p "$RUNNER_TEMP/installation-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/installation-evidence/head.txt"
+      - name: Validate complete authenticated installation generations
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(src/release_install.sh src/install_gen_release.sh
+                 scripts/tests/test_release_install.sh scripts/tests/test_release_install_fetch.sh
+                 scripts/tests/test_release_install_variants.sh scripts/tests/test_generated_release_installer.sh)
+          for source in "${files[@]}"; do
+            bash -n "$source"
+            shellcheck -S warning "$source"
+          done
+          bash scripts/tests/test_release_install.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/install.log"
+          bash scripts/tests/test_release_install_variants.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/signed-variants-and-data.log"
+          bash scripts/tests/test_release_install_fetch.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/fetch.log"
+          bash scripts/tests/test_generated_release_installer.sh 2>&1 | tee "$RUNNER_TEMP/installation-evidence/generated-installer.log"
+          test -z "$(git status --porcelain)"
+      - name: Retain installation validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: authenticated-installation-evidence
+          path: ${{ runner.temp }}/installation-evidence
           retention-days: 7
           if-no-files-found: error
   release-regression:
