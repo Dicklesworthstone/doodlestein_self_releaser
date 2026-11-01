@@ -162,6 +162,18 @@ before native source transfer, cache preparation or compilation for that phase.
 The host-health cache and diagnostic output are independent of build staging;
 the probe does not reserve or modify destination storage.
 
+Cached default-host admissions must also retain complete disk evidence. Before
+reusing a successful cache entry, DSR recomputes the Unix role verdicts from
+their raw capacity observations, including APFS container and volume limits,
+and verifies the retained filesystem and capacity-group summaries. Split-storage
+entries must additionally satisfy their original root/build-root observations
+or Windows source/target budgets and mapping/locking evidence. The receipt must
+agree with the current host platform, build root, concurrency and storage contract.
+A matching configuration fingerprint alone cannot authorize missing disk data,
+contradictory statuses or a reduced capacity budget. Invalid success entries cause
+a fresh probe; cached failures remain refusals. Valid percentage-pressure
+warnings with sufficient absolute space remain eligible for caching.
+
 Resume continues to verify completed artifact receipts before deciding what
 needs execution. An unfinished native task must pass admission for its current
 effective paths before it can prepare or compile. Storage admission does not

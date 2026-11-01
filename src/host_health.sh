@@ -413,7 +413,7 @@ _hh_admission_fingerprint() {
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v9",host:$host,writable_paths:$requested_paths,policy:{
+        '{schema:"dsr-host-admission-v10",host:$host,writable_paths:$requested_paths,policy:{
             disk_warn:$disk_warn,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -436,7 +436,7 @@ _hh_admission_fingerprint() {
 _hh_cache_get() {
     local hostname="$1"
     local expected_fingerprint="${2:-}"
-    local cache_file result
+    local host_config="${3:-}" cache_file result
     cache_file=$(_hh_cache_file "$hostname") || return 1
 
     if [[ ! -f "$cache_file" || -L "$cache_file" ]]; then
@@ -472,8 +472,11 @@ _hh_cache_get() {
         (.connection | type == "string") and
         ((.status == "ok" or .status == "warning") and .healthy == true or
          .status == "error" and .healthy == false) and
-        (.errors | type == "number") and
-        (.warnings | type == "number") and
+        (.errors | type == "number" and . >= 0 and . == floor) and
+        (.warnings | type == "number" and . >= 0 and . == floor) and
+        (if .healthy then .errors == 0 and .checks.connectivity.reachable == true and
+            (if .status == "ok" then .warnings == 0 else .warnings > 0 end)
+         else .errors > 0 end) and
         (.checks | type == "object") and
         (.checks.connectivity | type == "object") and
         (.checks.disk_space | type == "object") and
@@ -485,6 +488,22 @@ _hh_cache_get() {
         (.checked_at | type == "string"))
     ' <<< "$result" >/dev/null 2>&1; then
         return 1
+    fi
+
+    # A configuration fingerprint is not evidence that the nested disk result
+    # is complete or agrees with its outer healthy flag. Re-admit successful
+    # cached observations with the same policy used for fresh disk probes.
+    # Failed observations remain useful diagnostics and cannot admit a host.
+    if jq -e '.healthy' <<< "$result" >/dev/null; then
+        if [[ -n "$expected_fingerprint" ]]; then
+            local requested current_fingerprint
+            [[ -n "$host_config" ]] || host_config=$(_hh_get_host_config "$hostname") || return 1
+            requested=$(jq -c '.checks.disk_space.requested_paths // []' <<< "$result") || return 1
+            requested=$(_hh_writable_paths_json "$requested") || return 1
+            current_fingerprint=$(_hh_admission_fingerprint "$host_config" "$requested") || return 1
+            [[ "$current_fingerprint" == "$expected_fingerprint" ]] || return 1
+        fi
+        _hh_cached_disk_evidence_valid "$result" "$host_config" || return 1
     fi
 
     local cache_age file_mtime now
@@ -665,6 +684,144 @@ _hh_disk_status() {
     else
         printf 'ok\n'
     fi
+}
+
+# Classify an original df/Windows scalar observation retained in the cache.
+# These probes transport whole KiB; do not round an inconsistent byte count
+# into admission. The existing classifier owns the actual floor/warning rule.
+_hh_cached_scalar_disk_status() {
+    local observation="$1" minimum="$2" concurrent_builds="${3-1}"
+    local counts usage available_kb
+    counts=$(jq -er '
+        if (.usage_percent | type == "number" and . >= 0 and . <= 100 and . == floor) and
+           (.available_bytes | type == "number" and . >= 0 and . <= 9007199254740991 and
+                . == floor and . % 1024 == 0) and
+           (.available_gb | type == "number" and . >= 0)
+        then "\(.usage_percent) \(.available_bytes / 1024)"
+        else error("invalid cached scalar disk observation") end
+    ' <<< "$observation" 2>/dev/null) || return 1
+    read -r usage available_kb <<< "$counts"
+    _hh_disk_status "$usage" "$available_kb" "$minimum" "$concurrent_builds"
+}
+
+# Cached success must retain the raw observations needed to reproduce its disk
+# verdict. In particular, neither an empty disk object nor a forged role status
+# may inherit the outer healthy flag. Reuse the production Unix role policy so
+# APFS quotas, shared containers, split allowances and concurrency cannot drift.
+_hh_cached_disk_evidence_valid() {
+    local result="$1" host_config="${2:-}" disk platform profile concurrent_builds minimum expected
+    disk=$(jq -ce '.checks.disk_space' <<< "$result") || return 1
+    platform=$(jq -er '.platform' <<< "$result") || return 1
+    profile=$(jq -r '.admission // ""' <<< "$disk") || return 1
+    if ! jq -e '
+        (.checks.disk_space.status == "ok" or .checks.disk_space.status == "warning") and
+        .checks.disk_space.error == null and .checks.disk_space.probe_error == null and
+        (if .checks.disk_space.status == "warning" then .status == "warning" and .warnings > 0 else true end)
+    ' <<< "$result" >/dev/null; then return 1; fi
+    concurrent_builds=$(jq -er '.concurrent_builds |
+        select(type == "number" and . > 0 and . == floor and . <= 9007199254740991)' <<< "$disk") || return 1
+    minimum=$(_hh_disk_minimum_bytes "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || return 1
+    if [[ -n "$host_config" ]]; then
+        local configured_builds configured_storage storage_status=0 hostname
+        configured_builds=$(_hh_disk_concurrency "$host_config") || return 1
+        [[ "$concurrent_builds" == "$configured_builds" ]] || return 1
+        jq -e --arg platform "$platform" '.platform == $platform' <<< "$host_config" >/dev/null || return 1
+        if [[ "$platform" != windows/* ]]; then
+            hostname=$(jq -er '.hostname' <<< "$result") || return 1
+            configured_storage=$(config_unix_storage_json "$hostname") || storage_status=$?
+            case "$storage_status" in
+                0)
+                    [[ "$profile" == unix-split-storage-v2 ]] || return 1
+                    jq -e --argjson contract "$configured_storage" \
+                        '.unix_storage_contract == $contract' <<< "$disk" >/dev/null || return 1
+                    ;;
+                1)
+                    local configured_root
+                    [[ "$profile" == unix-writable-roles-v2 ]] || return 1
+                    configured_root=$(_hh_unix_build_root "$host_config") || return 1
+                    jq -e --arg root "$configured_root" '
+                        [.roles[] | select(.role == "build_root" and .requested != true) | .path] == [$root]
+                    ' <<< "$disk" >/dev/null || return 1
+                    ;;
+                *) return 1 ;;
+            esac
+        fi
+    fi
+
+    case "$profile" in
+        unix-writable-roles-v2|unix-split-storage-v2)
+            [[ "$platform" != windows/* ]] || return 1
+            local split=null requested root build root_status root_admitted build_status root_minimum
+            requested=$(jq -ce '.requested_paths' <<< "$disk") || return 1
+            if [[ "$profile" == unix-split-storage-v2 ]]; then
+                split=$(jq -ce '.unix_storage_contract' <<< "$disk") || return 1
+            fi
+            expected=$(_hh_writable_storage_verdict "$split" "$requested" "$concurrent_builds" <<< "$disk" 2>/dev/null) || return 1
+            if [[ "$profile" == unix-split-storage-v2 ]]; then
+                root=$(jq -ce '.root' <<< "$disk") || return 1
+                build=$(jq -ce '.build_root' <<< "$disk") || return 1
+                root_minimum=$(jq -er '.root_min_free_bytes' <<< "$split") || return 1
+                root_status=$(_hh_cached_scalar_disk_status "$root" "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || return 1
+                root_admitted=$(_hh_cached_scalar_disk_status "$root" "$root_minimum") || return 1
+                build_status=$(_hh_cached_scalar_disk_status "$build" "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || return 1
+                [[ "$root_admitted" != error && "$build_status" != error ]] || return 1
+                jq -e --argjson split "$split" --argjson minimum "$minimum" \
+                    --arg root_status "$root_status" --arg admitted "$root_admitted" --arg build_status "$build_status" '
+                    .root.path == "/" and .root.status == $root_status and .root.admitted_as == $admitted and
+                    .root.min_free_bytes == $split.root_min_free_bytes and
+                    .build_root.path == $split.build_root and .build_root.status == $build_status and
+                    .build_root.min_free_bytes == $minimum
+                ' <<< "$disk" >/dev/null || return 1
+                expected=$(jq -c --argjson disk "$disk" --argjson split "$split" '
+                    . + {admission:"unix-split-storage-v2",unix_storage_contract:$split,
+                         root:$disk.root,build_root:$disk.build_root} |
+                    .status = (if .status == "error" then "error"
+                               elif .status == "warning" or .root.admitted_as == "warning" or .build_root.status == "warning"
+                               then "warning" else "ok" end)
+                ' <<< "$expected") || return 1
+            fi
+            jq -ne --argjson expected "$expected" --argjson disk "$disk" \
+                '$expected == $disk and ($expected.status == "ok" or $expected.status == "warning")' >/dev/null
+            ;;
+        "")
+            [[ "$platform" == windows/* ]] || return 1
+            expected=$(_hh_cached_scalar_disk_status "$disk" "$_HH_DISK_MIN_FREE_BYTES" "$concurrent_builds") || return 1
+            jq -e --arg expected "$expected" --argjson minimum "$minimum" '
+                .path == "/" and .min_free_bytes == $minimum and .status == $expected and
+                (.status == "ok" or .status == "warning")
+            ' <<< "$disk" >/dev/null
+            ;;
+        split-storage-role-budgets-v1)
+            [[ "$platform" == windows/* ]] || return 1
+            # Windows split storage reports byte counts rather than the scalar
+            # probe's KiB. Preserve exact source reserve and target boundaries;
+            # reproduce PowerShell Math.Round (ties to even) only for pressure.
+            jq -e --argjson minimum "$minimum" '
+                def whole: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
+                def volume: (.free_bytes|whole) and (.size_bytes|whole) and
+                    .size_bytes > 0 and .free_bytes <= .size_bytes;
+                def usage:
+                    (100 - (.free_bytes/.size_bytes*100)) |
+                    floor as $lower |
+                    if . - $lower < 0.5 then $lower
+                    elif . - $lower > 0.5 then $lower+1
+                    elif $lower % 2 == 0 then $lower else $lower+1 end;
+                .storage_contract as $contract |
+                ([ $minimum, $contract.target_min_free_bytes ] | max) as $target_minimum |
+                (.source|volume) and (.target|volume) and
+                .source.path == ($contract.source_drive + ":") and .path == .source.path and
+                .target.path == ($contract.drive + ":") and
+                .target.provider == ("\\\\" + $contract.server + ($contract.export | gsub("/"; "\\"))) and
+                .source.free_bytes >= ($contract.source_budget_bytes + $contract.source_reserve_bytes) and
+                .target.free_bytes >= $target_minimum and .target.min_free_bytes == $target_minimum and
+                .lock_probe == "independent-process-exclusion-and-reacquisition" and
+                .lock_range == "cargo-win32-whole-u64-v1" and
+                .usage_percent == (.source|usage) and
+                .status == (if (.source|usage) > 90 or (.target|usage) > 90 then "warning" else "ok" end)
+            ' <<< "$disk" >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 # Probe default writable roles in the actual host process environment. Only
@@ -889,6 +1046,14 @@ if __name__ == '__main__':
 DSR_WRITABLE_PROBE
 }
 
+_hh_unix_build_root() {
+    jq -ers 'if length == 1 and (.[0]|type == "object") then .[0] else error("invalid host") end |
+        if .build_root == null then "/var/tmp"
+        elif (.build_root|type == "string" and test("^/[A-Za-z0-9_./:+-]+$") and
+             (test("(^|/)\\.\\.?(/|$)|//")|not)) then .build_root
+        else error("invalid build root") end' <<< "$1" 2>/dev/null
+}
+
 _hh_default_unix_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" host_config="${4:-}"
     local split_storage="${5-null}"
@@ -912,11 +1077,7 @@ _hh_default_unix_storage_admission() {
         echo '{"path":"writable-storage","status":"error","error":"Invalid disk concurrency or overflowing free-space requirement"}'
         return 1
     fi
-    build_root=$(jq -ers 'if length == 1 and (.[0]|type == "object") then .[0] else error("invalid host") end |
-        if .build_root == null then "/var/tmp"
-        elif (.build_root|type == "string" and test("^/[A-Za-z0-9_./:+-]+$") and
-             (test("(^|/)\\.\\.?(/|$)|//")|not)) then .build_root
-        else error("invalid build root") end' <<< "$host_config" 2>/dev/null) || {
+    build_root=$(_hh_unix_build_root "$host_config") || {
         echo '{"path":"writable-storage","status":"error","error":"Invalid Unix build root"}'
         return 1
     }
@@ -1570,7 +1731,7 @@ host_health_check() {
         use_cache=false
         _hh_log_warn "Health cache unavailable for $hostname; running fresh checks"
     fi
-    if $use_cache && cached=$(_hh_cache_get "$hostname" "$fingerprint"); then
+    if $use_cache && cached=$(_hh_cache_get "$hostname" "$fingerprint" "$host_config"); then
         cached_healthy=$(jq -r '.healthy' <<< "$cached")
         if $json_mode; then
             echo "$cached"

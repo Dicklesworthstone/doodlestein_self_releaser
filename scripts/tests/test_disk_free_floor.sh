@@ -50,7 +50,7 @@ class DiskFloor(unittest.TestCase):
             '    concurrency: 1\n    enabled: true\n    capabilities:\n')
         self.sequence = 0
 
-    def call(self, function, *arguments, module=MODULE, setup=''):
+    def call(self, function, *arguments, module=MODULE, setup='', input_text=None):
         # A complete checkout loads its actual config module, including the
         # YAML parser helpers. The retained partial-workspace mode only supports
         # the existing no-yq reader; no function or executable is replaced.
@@ -61,7 +61,7 @@ class DiskFloor(unittest.TestCase):
                    'source "$2" || exit $?; shift 2; ' + setup + '; "$@"')
         result = subprocess.run([BASH, '-c', program, '_', str(ROOT), str(module),
                                  function, *map(str, arguments)], env=self.env,
-                                text=True, capture_output=True, timeout=20)
+                                text=True, input=input_text, capture_output=True, timeout=20)
         self.sequence += 1
         (self.work / f'{self.sequence}.stdout').write_text(result.stdout)
         (self.work / f'{self.sequence}.stderr').write_text(result.stderr)
@@ -488,13 +488,26 @@ class DiskFloor(unittest.TestCase):
                 fresh = self.call('host_health_check', 'localtest', '--json', '--no-cache',
                                   '--writable-paths', json.dumps(request), setup=':')
                 receipt = json.loads(fresh.stdout)
-                # A historical healthy snapshot is a cache input fixture. All
-                # actual re-probes below use the real host and production code.
+                # Supply a complete, internally consistent historical capacity
+                # fixture. The cache reader now re-admits disk evidence, so
+                # changing status/free bytes alone cannot make a valid hit.
+                # All re-probes below still use the actual local filesystem.
                 receipt.update(status='ok', healthy=True, errors=0, warnings=0)
                 receipt['historical_cache_fixture'] = True
-                receipt['checks']['disk_space']['status'] = 'ok'
-                for row in receipt['checks']['disk_space']['roles']:
-                    row.update(status='ok', available_bytes=100 * GIB, available_gb=100)
+                historical = dict(roles=[], requested_paths=request)
+                for observed in receipt['checks']['disk_space']['roles']:
+                    row = {key: observed[key] for key in
+                           ('role', 'path', 'probe_path', 'filesystem_id')}
+                    row.update(available_bytes=100 * GIB, total_bytes=200 * GIB,
+                               usage_percent=50,
+                               capacity_group='filesystem:' + row['filesystem_id'])
+                    if observed.get('requested'):
+                        row['requested'] = True
+                    historical['roles'].append(row)
+                admitted = self.call('_hh_writable_storage_verdict', 'null', json.dumps(request), '1',
+                                     setup=':', input_text=json.dumps(historical))
+                self.assertEqual(admitted.returncode, 0, admitted.stderr)
+                receipt['checks']['disk_space'] = json.loads(admitted.stdout)
                 stored = self.call('_hh_cache_write', 'localtest', json.dumps(receipt),
                                    setup='_hh_init_cache')
                 self.assertEqual(stored.returncode, 0, stored.stderr)

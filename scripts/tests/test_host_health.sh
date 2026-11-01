@@ -81,7 +81,8 @@ export -f log_info log_warn log_error log_debug
 
 # Source the modules
 source "$PROJECT_ROOT/src/config.sh"
-source "$PROJECT_ROOT/src/host_health.sh"
+# shellcheck source=src/host_health.sh
+source "${DSR_TEST_HOST_HEALTH:-$PROJECT_ROOT/src/host_health.sh}"
 
 # ============================================================================
 # Cache Tests
@@ -91,11 +92,17 @@ _test_health_result_json() {
     local hostname="$1"
     local status="$2"
     local healthy="$3"
+    local usage=50 available_kb=2147483648 disk
+    if [[ "$status" == warning ]]; then usage=96; available_kb=187695104;
+    elif [[ "$status" == error ]]; then usage=100; available_kb=0; fi
+    disk=$(_test_writable_inventory "$usage" "$available_kb" "$usage" "$available_kb" |
+        _hh_writable_storage_verdict null '[]' 2) || return 1
 
     jq -nc \
         --arg hostname "$hostname" \
         --arg status "$status" \
         --argjson healthy "$healthy" \
+        --argjson disk "$disk" \
         '{
             hostname: $hostname,
             platform: "linux/amd64",
@@ -104,10 +111,10 @@ _test_health_result_json() {
             status: $status,
             healthy: $healthy,
             errors: (if $healthy then 0 else 1 end),
-            warnings: 0,
+            warnings: (if $status == "warning" then 1 else 0 end),
             checks: {
                 connectivity: {reachable: $healthy},
-                disk_space: {status: $status, usage_percent: null},
+                disk_space: $disk,
                 toolchains: {},
                 docker: {},
                 clock_drift: {}
@@ -199,6 +206,213 @@ test_cache_rejects_invalid_json() {
     else
         fail "Fresh cache should reject one-byte invalid JSON"
     fi
+}
+
+_test_cached_disk_receipt() {
+    local label="$1" receipt="$2" expected="$3" contract="${4:-}" actual=refused
+    ((TESTS_RUN+=1))
+    _hh_init_cache || { fail "$label: cannot initialize cache"; return; }
+    _hh_cache_write cacheprobe "$receipt" || { fail "$label: cannot write fixture"; return; }
+    if [[ -n "$contract" ]]; then
+        # Only the configured Windows contract is supplied at this boundary;
+        # the cache reader and complete capacity validators are production code.
+        if (config_windows_storage_json() { printf '%s\n' "$contract"; }
+            _hh_cache_get cacheprobe >/dev/null 2>&1); then actual=accepted; fi
+    elif _hh_cache_get cacheprobe >/dev/null 2>&1; then actual=accepted; fi
+    if [[ "$actual" == "$expected" ]]; then pass "$label: $actual";
+    else fail "$label: $actual, expected $expected"; fi
+}
+
+test_cache_requires_disk_evidence() {
+    local receipt warning expression
+    receipt=$(_test_health_result_json cacheprobe ok true) || return 1
+    warning=$(_test_health_result_json cacheprobe warning true) || return 1
+    _test_cached_disk_receipt 'Complete multi-filesystem cache remains reusable' "$receipt" accepted
+    _test_cached_disk_receipt '179 GiB at 96% remains an admissible cached warning' "$warning" accepted
+    while IFS= read -r expression; do
+        _test_cached_disk_receipt "Incomplete or contradictory healthy cache ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done <<'CASES'
+del(.checks.disk_space)
+.checks.disk_space=null
+.checks.disk_space=[]
+.checks.disk_space={}
+.checks.disk_space={status:"ok"}
+.checks.disk_space={status:"error",error:"capacity unavailable"}
+.checks.disk_space.error="capacity unavailable"
+del(.checks.disk_space.concurrent_builds)
+del(.checks.disk_space.min_free_bytes)
+.checks.disk_space.min_free_bytes=1
+.checks.disk_space.roles=[]
+del(.checks.disk_space.roles[0].available_bytes)
+.checks.disk_space.roles[0].available_bytes=0
+.checks.disk_space.roles[0].status="error"
+del(.checks.disk_space.capacity_groups)
+.checks.disk_space.capacity_groups[0].available_bytes=1
+.checks.connectivity.reachable=false
+.errors=1
+.errors=-1
+.warnings=0.5
+CASES
+    _test_cached_disk_receipt 'Disk warning cannot hide behind outer ok' \
+        "$(jq '.status="ok" | .warnings=0' <<< "$warning")" refused
+    _test_cached_disk_receipt 'Cached probe failure remains a readable refusal' \
+        "$(_test_health_result_json cacheprobe error false | jq \
+            '.checks.disk_space={status:"error",error:"required filesystem unavailable"}')" accepted
+}
+
+test_cache_apfs_and_split_evidence() {
+    local inventory disk receipt expression split
+    inventory=$(_test_writable_inventory 96 187695104 96 187695104 | jq '
+        .roles |= map(. + {filesystem_available_bytes:.available_bytes,
+            filesystem_total_bytes:.total_bytes,
+            capacity_group:"apfs:12345678-1234-1234-1234-123456789abc",
+            apfs:{container_id:"disk3",container_uuid:"12345678-1234-1234-1234-123456789abc",
+                  volume_id:(if .role == "build_root" then "disk3s5" else "disk3s1" end),
+                  available_bytes:.available_bytes,total_bytes:.total_bytes,
+                  used_bytes:0,quota_bytes:0,reserve_bytes:0}})') || return 1
+    disk=$(_hh_writable_storage_verdict null '[]' 2 <<< "$inventory") || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.platform="darwin/arm64" | .checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Shared APFS-container warning remains reusable' "$receipt" accepted
+    for expression in \
+        'del(.checks.disk_space.roles[0].apfs.total_bytes)' \
+        '.checks.disk_space.roles[0].apfs.quota_bytes=1073741824' \
+        '.checks.disk_space.roles[0].apfs.available_bytes=0'; do
+        _test_cached_disk_receipt "APFS cached capacity contradiction ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done
+
+    split='{"build_root":"/external","root_min_free_bytes":1073741824}'
+    disk=$(
+        _hh_exec_on_host() {
+            if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+                _test_writable_inventory 99 8388608 50 2147483648 /external
+            else
+                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 4294967296 2147483648 2147483648 50%% /external\n'
+            fi
+        }
+        _hh_unix_split_storage_admission cacheprobe local '' "$split" 99 8388608 error '[]' 2
+    ) || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Explicit split-root allowance remains reusable' "$receipt" accepted
+    for expression in \
+        'del(.checks.disk_space.root)' \
+        '.checks.disk_space.root.available_bytes=0' \
+        '.checks.disk_space.build_root.available_bytes=0' \
+        '.checks.disk_space.build_root.status="error"'; do
+        _test_cached_disk_receipt "Initial split observation remains required ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done
+
+    ((TESTS_RUN+=1))
+    if (
+        local host_config='{"platform":"linux/amd64","connection":"local","concurrency":2,"build_root":"/external"}'
+        local fingerprint
+        fingerprint=$(_hh_admission_fingerprint "$host_config") || exit 1
+        receipt=$(jq --arg fingerprint "$fingerprint" '.admission_fingerprint=$fingerprint' <<< "$receipt") || exit 1
+        _hh_cache_write cacheprobe "$receipt" || exit 1
+        # The current configured reserve is stronger than this historical
+        # receipt, even though its outer fingerprint claims current policy.
+        config_unix_storage_json() { printf '%s\n' '{"build_root":"/external","root_min_free_bytes":17179869184}'; }
+        ! _hh_cache_get cacheprobe "$fingerprint" "$host_config" >/dev/null 2>&1
+    ); then pass 'Cached split allowance is bound to the current configured reserve';
+    else fail 'Cached split allowance relaxed the current configured reserve'; fi
+}
+
+test_cache_windows_disk_evidence() {
+    local disk receipt contract expression
+    disk=$(
+        _hh_exec_on_host() { printf '96\r\n187695104\r\n'; }
+        _hh_check_disk_space fixture local '' windows/amd64 '{"concurrency":2}'
+    ) || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.platform="windows/amd64" | .checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Windows scalar warning remains reusable' "$receipt" accepted
+    for expression in \
+        'del(.checks.disk_space.available_bytes)' \
+        '.checks.disk_space.available_bytes=42949671936' \
+        '.checks.disk_space.available_bytes+=1' \
+        '.checks.disk_space.min_free_bytes=1'; do
+        _test_cached_disk_receipt "Windows cached capacity refusal ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused
+    done
+
+    contract=$(_test_windows_capacity_contract) || return 1
+    disk=$(
+        config_windows_storage_json() { printf '%s\n' "$contract"; }
+        _hh_exec_on_host() {
+            jq -nc --argjson contract "$contract" '
+                {path:"C:",usage_percent:88,available_gb:12,status:"warning",
+                 admission:"split-storage-role-budgets-v1",
+                 source:{path:"C:",free_bytes:12884901888,size_bytes:107374182400},
+                 target:{path:"R:",provider:("\\\\"+$contract.server+($contract.export|gsub("/";"\\"))),
+                         free_bytes:192199786496,size_bytes:4398046511104},
+                 lock_probe:"independent-process-exclusion-and-reacquisition",lock_range:"cargo-win32-whole-u64-v1"}'
+        }
+        _hh_check_disk_space cacheprobe local '' windows/amd64 '{"concurrency":2}'
+    ) || return 1
+    receipt=$(_test_health_result_json cacheprobe warning true | jq --argjson disk "$disk" \
+        '.platform="windows/amd64" | .checks.disk_space=$disk') || return 1
+    _test_cached_disk_receipt 'Windows split source reserve and target warning remain reusable' "$receipt" accepted "$contract"
+    for expression in \
+        'del(.checks.disk_space.source)' \
+        '.checks.disk_space.source.free_bytes=0' \
+        '.checks.disk_space.target.free_bytes=42949672959' \
+        '.checks.disk_space.target.min_free_bytes=1' \
+        '.checks.disk_space.target.provider="wrong"' \
+        '.checks.disk_space.lock_probe=null'; do
+        _test_cached_disk_receipt "Windows split cached evidence refusal ($expression)" \
+            "$(jq "$expression" <<< "$receipt")" refused "$contract"
+    done
+}
+
+test_cached_disk_public_readiness() {
+    local mode
+    for mode in missing concurrency build_root requested_paths; do
+        ((TESTS_RUN+=1))
+        if (
+            local host_config fingerprint receipt disk result status=0
+            local DSR_HOSTS_FILE="$TEMP_DIR/cache-public-$mode.yaml"
+            printf 'hosts:\n  cacheprobe:\n    platform: linux/amd64\n    connection: local\n    concurrency: 2\n' > "$DSR_HOSTS_FILE"
+            host_config=$(_hh_get_host_config cacheprobe) || exit 1
+            fingerprint=$(_hh_admission_fingerprint "$host_config") || exit 1
+            receipt=$(_test_health_result_json cacheprobe warning true | jq --arg fingerprint "$fingerprint" \
+                '.admission_fingerprint=$fingerprint | .historical_cache_fixture=true') || exit 1
+            if [[ "$mode" == missing ]]; then
+                receipt=$(jq '.checks.disk_space={}' <<< "$receipt") || exit 1
+            elif [[ "$mode" == concurrency ]]; then
+                disk=$(_test_writable_inventory 96 187695104 96 187695104 |
+                    _hh_writable_storage_verdict null '[]' 1) || exit 1
+                receipt=$(jq --argjson disk "$disk" '.checks.disk_space=$disk' <<< "$receipt") || exit 1
+            elif [[ "$mode" == build_root ]]; then
+                disk=$(_test_writable_inventory 96 187695104 96 187695104 /unrelated |
+                    _hh_writable_storage_verdict null '[]' 2) || exit 1
+                receipt=$(jq --argjson disk "$disk" '.checks.disk_space=$disk' <<< "$receipt") || exit 1
+            else
+                disk=$(_test_writable_inventory 96 187695104 96 187695104 | jq '
+                    .requested_paths=[{role:"temp",path:"/different/recipe"}] |
+                    .roles += [(.roles[0] + {requested:true,role:"temp",path:"/different/recipe",probe_path:"/different"})]' |
+                    _hh_writable_storage_verdict null '[{"role":"temp","path":"/different/recipe"}]' 2) || exit 1
+                receipt=$(jq --argjson disk "$disk" '.checks.disk_space=$disk' <<< "$receipt") || exit 1
+            fi
+            _hh_cache_write cacheprobe "$receipt" || exit 1
+            # Only the remote filesystem observation is controlled. The public
+            # parser, fingerprint, cache reader, verdict and readiness are real.
+            _hh_exec_on_host() {
+                [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]] || return 1
+                printf 'probe\n' >> "$TEMP_DIR/cache-public-$mode.probes"
+                _test_writable_inventory 100 0 100 0
+            }
+            result=$(host_health_check cacheprobe --json 2>/dev/null) || status=$?
+            [[ $status -eq 1 && -s "$TEMP_DIR/cache-public-$mode.probes" ]] || exit 1
+            jq -e '.healthy == false and .checks.disk_space.status == "error" and
+                .historical_cache_fixture == null' <<< "$result" >/dev/null || exit 1
+            ! host_health_is_ready cacheprobe
+        ); then pass "Public readiness reprobes/refuses $mode evidence despite matching fingerprint";
+        else fail "Public readiness accepted $mode evidence with matching fingerprint"; fi
+    done
 }
 
 test_cache_clear() {
@@ -1404,13 +1618,21 @@ hosts:
       source_reserve_bytes: 8589934592
       target_min_free_bytes: 21474836480
 YAML
-    local DSR_HOSTS_FILE="$storage_fixture" contract
+    local DSR_HOSTS_FILE="$storage_fixture" contract ordinary_result
     contract=$(config_windows_storage_json lockcontract)
     _hh_init_cache
-    result=$(_test_health_result_json "lockcontract" "ok" "true" | jq \
-        --argjson contract "$contract" '.platform="windows/amd64" |
-        .checks.disk_space.storage_contract=$contract |
-        .checks.disk_space.admission="split-storage-role-budgets-v1"')
+    ordinary_result=$(_test_health_result_json "lockcontract" "ok" "true" | jq '
+        .platform="windows/amd64" |
+        .checks.disk_space={path:"/",usage_percent:50,available_bytes:214748364800,
+            available_gb:200,min_free_bytes:42949672960,concurrent_builds:2,status:"ok"}')
+    result=$(jq --argjson contract "$contract" '
+        .checks.disk_space={path:"C:",usage_percent:50,available_gb:50,status:"ok",
+            concurrent_builds:2,storage_contract:$contract,admission:"split-storage-role-budgets-v1",
+            lock_probe:"independent-process-exclusion-and-reacquisition",
+            source:{path:"C:",free_bytes:53687091200,size_bytes:107374182400},
+            target:{path:"R:",provider:("\\\\"+$contract.server+($contract.export|gsub("/";"\\"))),
+                free_bytes:214748364800,size_bytes:429496729600,min_free_bytes:42949672960}}
+    ' <<< "$ordinary_result")
     _hh_cache_write lockcontract "$result"
     ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then fail "Legacy one-byte cached admission must be reprobed";
@@ -1419,9 +1641,8 @@ YAML
     ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then pass "Whole-u64 cached admission retains normal TTL";
     else fail "Whole-u64 cached admission unexpectedly refused"; fi
-    local current_result ordinary_result changed_contract
+    local current_result changed_contract
     current_result=$(_hh_cache_read lockcontract)
-    ordinary_result=$(_test_health_result_json "lockcontract" "ok" "true" | jq '.platform="windows/amd64"')
     _hh_cache_write lockcontract "$ordinary_result"
     ((TESTS_RUN+=1))
     if _hh_cache_valid lockcontract; then fail "Local cached health must not admit new split storage";
@@ -1924,6 +2145,16 @@ test_unix_split_concurrent_capacity() {
     fi
 }
 
+if [[ "${1:-}" == --disk-cache-only ]]; then
+    test_cache_requires_disk_evidence
+    test_cache_apfs_and_split_evidence
+    test_cache_windows_disk_evidence
+    test_cached_disk_public_readiness
+    echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+    [[ $TESTS_FAILED -eq 0 ]]
+    exit $?
+fi
+
 if [[ "${1:-}" == --disk-capacity-only ]]; then
     test_windows_disk_capacity_boundaries
     test_concurrent_disk_capacity
@@ -1966,6 +2197,10 @@ test_cache_validity
 test_cache_rejects_invalid_json
 test_cache_rejects_wrong_shape_or_hostname
 test_cached_unhealthy_result_returns_nonzero
+test_cache_requires_disk_evidence
+test_cache_apfs_and_split_evidence
+test_cache_windows_disk_evidence
+test_cached_disk_public_readiness
 test_cache_clear
 test_cache_clear_all
 

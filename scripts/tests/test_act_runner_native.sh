@@ -1313,14 +1313,27 @@ test_native_host_capability_admission() (
         "capable":{"platform":"linux/amd64","connection":"ssh","ssh_host":"capable.invalid","concurrency":1,"capabilities":["rust","go","bun","node"]}},
         "platform_mapping":{"linux/amd64":"incapable"}}' > "$DSR_HOSTS_FILE" || return 1
     _cap_seed() {
-        local hostname="$1" supported="$2" host fingerprint receipt
+        local hostname="$1" supported="$2" host fingerprint receipt disk concurrent_builds
         host=$(_hh_get_host_config "$hostname") || return 1
         fingerprint=$(_hh_admission_fingerprint "$host") || return 1
-        receipt=$(jq -nc --arg hostname "$hostname" --arg fingerprint "$fingerprint" --argjson supported "$supported" '
+        concurrent_builds=$(_hh_disk_concurrency "$host") || return 1
+        # Supply complete controlled capacity observations, then let the real
+        # policy classify them for each host's configured build count. These
+        # fixtures isolate compiler capability, not disk-evidence validation.
+        disk=$(jq -nc '
+            [{role:"root",path:"/"}, {role:"home",path:"/fixture/home"},
+             {role:"build_root",path:"/var/tmp"},
+             {role:"cargo_home",path:"/fixture/home/.cargo"}, {role:"temp",path:"/tmp"}] |
+            {requested_paths:[],roles:map(. + {probe_path:.path,
+                filesystem_id:"1",capacity_group:"filesystem:1",usage_percent:50,
+                available_bytes:214748364800,total_bytes:429496729600})}
+        ' | _hh_writable_storage_verdict null '[]' "$concurrent_builds") || return 1
+        receipt=$(jq -nc --arg hostname "$hostname" --arg fingerprint "$fingerprint" \
+            --argjson supported "$supported" --argjson disk "$disk" '
             {hostname:$hostname,platform:"linux/amd64",description:"Controlled scheduling fixture",
              connection:"ssh",status:"ok",healthy:true,errors:0,warnings:0,
              admission_fingerprint:$fingerprint,checked_at:"fixture",
-             checks:{connectivity:{reachable:true},disk_space:{status:"ok"},docker:{},clock_drift:{},
+             checks:{connectivity:{reachable:true},disk_space:$disk,docker:{},clock_drift:{},
                 toolchains:(["rust","go","bun","node"] | map(. as $cap |
                     {key:$cap,value:{status:(if $supported | index($cap) then "ok" else "missing" end),version:"fixture"}}) | from_entries)}}
         ') || return 1
