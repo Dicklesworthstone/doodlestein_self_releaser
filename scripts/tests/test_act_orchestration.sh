@@ -82,7 +82,8 @@ def wait_for(process, predicate, label):
         if process is not None and process.poll() is not None:
             break
         time.sleep(0.02)
-    raise AssertionError(label)
+    process_status = '' if process is None else ' (process exit: %r)' % process.poll()
+    raise AssertionError(label + process_status)
 
 
 worker = root / 'native.py'
@@ -104,9 +105,13 @@ if mode == 'failure' and target == 'linux/amd64':
     print(json.dumps(dict(platform=target, method='native', status='failed', exit_code=9,
                          error='deliberate stdin-consuming build failure')), flush=True)
     raise SystemExit(9)
+if mode in ('child-malformed-zero', 'child-malformed-exit'):
+    print('{unfinished-result}', flush=True)
+    raise SystemExit(0)
 artifact = case / 'output' / (slug + '.bin')
 artifact.write_bytes(('artifact for ' + target + '\n').encode())
-print(json.dumps(dict(platform=target, method='native', status='success', exit_code=0,
+status = 'ok' if mode == 'child-ok-exit' else 'passed' if mode == 'child-passed-exit' else 'success'
+print(json.dumps(dict(platform=target, method='native', status=status, exit_code=0,
                      artifact_path=str(artifact), artifact_paths=[str(artifact)])), flush=True)
 ''')
 
@@ -124,6 +129,12 @@ selector_acquire_slot() {
 }
 selector_release_slot() {
     printf '%s\n' "$2" >> "$DSR_STDIN_CASE/released-slots"
+    if [[ "$DSR_STDIN_MODE" == child-durable-success-killed &&
+          "$DSR_STDIN_PHASE" == first && "$2" == *-linux-amd64-attempt-1 ]]; then
+        # A durable receipt already exists at this boundary. The coordinator
+        # must preserve completed success even if its outer worker now dies.
+        kill -KILL "$BASHPID"
+    fi
     if [[ "$DSR_STDIN_MODE" == sidecar-recovery && "$DSR_STDIN_PHASE" == first ]]; then
         # The real worker has saved its success receipt, but the coordinator
         # cannot reap it or save the embedded result until this barrier ends.
@@ -149,6 +160,22 @@ act_run_native_build() {
 case "$DSR_STDIN_MODE" in
     missing-receipt) _act_run_target_worker() { return 0; } ;;
     killed-worker) _act_run_target_worker() { kill -KILL "$BASHPID"; } ;;
+    child-*)
+        # The real outer worker must observe this command's actual status.
+        # A native backend can already have printed successful JSON when its
+        # orchestration child dies before normalization or strict staging.
+        # Do not replace the outer worker, wait, sidecar writer or scheduler.
+        _act_build_orchestration_target() {
+            local mode=success
+            [[ "$4" != linux/amd64 ]] || mode="$DSR_STDIN_MODE"
+            python3 "$DSR_STDIN_WORKER" "$DSR_STDIN_CASE" "$4" "$attempt" "$mode" || return $?
+            case "$mode" in
+                child-success-killed) kill -KILL "$BASHPID" ;;
+                child-*-exit) return 9 ;;
+            esac
+            return 0
+        }
+        ;;
 esac
 args=(--run-id "$DSR_STDIN_RUN")
 if [[ "$DSR_STDIN_PHASE" == resume* ]]; then args=(--resume-run-id "$DSR_STDIN_RUN"); fi
@@ -220,8 +247,10 @@ def invoke(case, identity, jobs, mode, phase):
     state_path = case / 'state/builds/stdinfixture/1.0.0' / identity / 'state.json'
     state = read(state_path)
     (case / (phase + '.state.json')).write_text(json.dumps(state) + '\n')
-    expected_code = {'success': 0, 'failure': 1, 'timeout': 1, 'cancel': 130,
-                     'missing-receipt': 6, 'killed-worker': 6}[mode]
+    expected_code = (0 if mode in ('child-success', 'child-durable-success-killed') else 1) \
+        if mode.startswith('child-') else {
+        'success': 0, 'failure': 1, 'timeout': 1, 'cancel': 130,
+        'missing-receipt': 6, 'killed-worker': 6}[mode]
     check(case.name + '/' + phase + ': aggregate preserves the real exit status', code == expected_code)
     check(case.name + '/' + phase + ': exactly six ordered target rows',
           value['run_id'] == identity and value['summary']['total'] == 6 and
@@ -277,7 +306,8 @@ def verify_attempts(case, value, state, expected_counts, expected_codes, label, 
           state['status'] != 'completed' and not (case / 'output/.dsr-build-purpose.json').exists())
 
 
-for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-recovery-only') else (1, 3)):
+for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-recovery-only',
+                                  '--worker-completion-only') else (1, 3)):
     for mode in ('success', 'failure', 'timeout', 'cancel'):
         case, identity = fixture(jobs, mode)
         first, state = invoke(case, identity, jobs, mode, 'first')
@@ -307,7 +337,7 @@ for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--sidecar-reco
         check(case.name + ': retries preserve all earlier attempt evidence',
               all(path.read_bytes() == contents for path, contents in immutable.items()))
 
-for jobs in (() if sys.argv[3] == '--sidecar-recovery-only' else (1, 3)):
+for jobs in (() if sys.argv[3] in ('--sidecar-recovery-only', '--worker-completion-only') else (1, 3)):
     for mode, observed_exit in (('missing-receipt', 0), ('killed-worker', 137)):
         case, identity = fixture(jobs, mode)
         first, state = invoke(case, identity, jobs, mode, 'first')
@@ -336,12 +366,51 @@ for jobs in (() if sys.argv[3] == '--sidecar-recovery-only' else (1, 3)):
               all(path.read_bytes() == contents for path, contents in immutable.items()))
 
 
+for jobs in ((1, 3) if sys.argv[3] in ('all', '--stdin-isolation-only', '--worker-completion-only') else ()):
+    for mode, observed_exit in (('child-success-killed', 137), ('child-success-exit', 9),
+                                ('child-ok-exit', 9), ('child-passed-exit', 9),
+                                ('child-malformed-zero', 0), ('child-malformed-exit', 9),
+                                ('child-success', 0), ('child-durable-success-killed', 0)):
+        case, identity = fixture(jobs, mode)
+        first, state = invoke(case, identity, jobs, mode, 'first')
+        codes = {} if mode in ('child-success', 'child-durable-success-killed') else {
+            'linux/amd64': observed_exit or 6}
+        verify_attempts(case, first, state, {target: 1 for target in targets}, codes,
+                        case.name + '/first')
+        failed = first['targets'][0]
+        log = Path(failed['log_path']).read_text()
+        if mode not in ('child-malformed-zero', 'child-malformed-exit'):
+            raw = [json.loads(line) for line in log.splitlines() if line.startswith('{')][-1]
+            check(case.name + ': child emitted real artifact success before its observed exit',
+                  raw['status'] in ('success', 'ok', 'passed') and raw['exit_code'] == 0 and
+                  Path(raw['artifact_path']).is_file())
+        if observed_exit:
+            check(case.name + ': unsuccessful child cannot persist a reusable success receipt',
+                  read(Path(failed['result_path']))['status'] == 'failed' and
+                  state['target_statuses']['linux/amd64']['status'] == 'failed' and
+                  not failed.get('resume_artifacts'))
+        workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
+        immutable = {path: path.read_bytes() for directory in ('output', 'logs', 'results')
+                     for path in ((case / directory) if directory == 'output' else
+                                  workspace / directory).rglob('*') if path.is_file()}
+        resumed, resumed_state = invoke(case, identity, jobs, 'success', 'resume')
+        counts = {target: 1 + (1 if target in codes else 0) for target in targets}
+        verify_attempts(case, resumed, resumed_state, counts, {}, case.name + '/resume')
+        check(case.name + ': actual compiler attempts advance exactly once on retry',
+              all(sorted(event['attempt'] for event in events(case) if event['target'] == target) ==
+                  list(range(1, counts[target] + 1)) for target in targets))
+        check(case.name + ': exact resume retries only the unfinished command and preserves all prior evidence',
+              all(bool(row.get('resume_reused')) == (row['platform'] not in codes)
+                  for row in resumed['targets']) and
+              all(path.read_bytes() == contents for path, contents in immutable.items()))
+
+
 def worker_running(pid):
     probe = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='], capture_output=True)
     return probe.returncode == 0 and bool(probe.stdout.strip()) and not probe.stdout.strip().startswith(b'Z')
 
 
-for jobs in (() if sys.argv[3] == '--coordinator-receipt-only' else (1, 3)):
+for jobs in (() if sys.argv[3] in ('--coordinator-receipt-only', '--worker-completion-only') else (1, 3)):
     case, identity = fixture(jobs, 'sidecar-recovery')
     workspace = case / 'state/builds/stdinfixture/1.0.0' / identity
     env = invocation_env(case, identity, jobs, 'sidecar-recovery', 'first')
@@ -427,7 +496,7 @@ PY
 }
 
 if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
-      "${1:-}" == --sidecar-recovery-only ]]; then
+      "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ]]; then
     test_worker_stdin_isolation "$1"
     exit $?
 fi

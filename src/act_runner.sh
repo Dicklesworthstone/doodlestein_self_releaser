@@ -11916,12 +11916,25 @@ _act_run_target_worker() {
 
     result=$(grep '^{.*}$' "$log_path" | tail -1)
     if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
+        [[ "$worker_status" -ne 0 ]] || worker_status=6
         result=$(jq -nc --arg target "$target" --arg host "$host" \
             --argjson exit_code "$worker_status" \
             '{platform: $target, host: $host, status: "failed",
               exit_code: $exit_code, error: "Worker produced no valid result"}')
     fi
     result_status=$(jq -r '.status // "unknown"' <<< "$result")
+    # The log can contain backend success before the orchestration child has
+    # finished normalization and strict staging. Its observed exit must agree
+    # before those artifact paths become an immutable, reusable success.
+    if [[ "$worker_status" -ne 0 ]] &&
+       [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]]; then
+        result_status=failed
+        result=$(jq -c --argjson exit_code "$worker_status" '
+            .status = "failed" | .exit_code = $exit_code |
+            .error = (.error // "Worker exited nonzero despite reporting success") |
+            del(.resume_artifacts)
+        ' <<< "$result") || return 4
+    fi
     if [[ "$result_status" == success || "$result_status" == ok || "$result_status" == passed ]] && \
        ! _act_matrix_result_matches "$result" "$target" "$selected_triple"; then
         worker_status=4
