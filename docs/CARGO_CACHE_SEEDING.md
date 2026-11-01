@@ -52,6 +52,33 @@ as a fallback source or a replacement database; the seed can be incomplete.
 The caller's existing dependency-resolution and build checks remain required.
 The source cache is never repaired or modified by selection.
 
+### Ordinary native stage protection
+
+The Unix native runner creates an exclusive `.sbh-protect` file in each fresh
+ordinary Rust stage before seeding its private Cargo home. SBH recognizes a
+marker in an ancestor as protection for that directory and its descendants,
+including direct deletion-candidate checks, as implemented by its
+[protection registry](https://github.com/Dicklesworthstone/storage_ballast_helper/blob/main/src/scanner/protection.rs).
+This protects the private dependency
+cache and staged source from pressure-driven reclamation while a build uses
+them. The marker is outside both source and cache inventories; it changes no
+authenticated or compiled source bytes and invokes no SBH command.
+
+The stage and marker retain private ownership and modes. An existing marker,
+symlink or directory at the marker path refuses preparation before a cache is
+published. Protection follows the existing stage lifecycle: normal success,
+failure and cancellation remove the owned stage; `DSR_KEEP_BUILD_STAGES=1`
+deliberately retains it for diagnosis. Shared build roots, ambient caches and
+separate Cargo target directories receive no permanent marker from this step.
+
+Run `bash scripts/tests/test_nonstrict_cargo_lock_seed.sh` for marker and refusal
+checks. With Cargo/rustc available, `bash scripts/tests/test_strict_cargo_private_cache.sh`
+also runs the actual ordinary native coordinator, checks protection before
+compilation, builds offline after the original cache and dependency origin are
+removed, and verifies success/failure stage cleanup. The host readiness fixture
+is controlled and has an explicit refusal check; this is not a live SBH emergency
+cleanup or native fleet qualification.
+
 ## Lockfile-scoped seeds
 
 ```bash

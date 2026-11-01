@@ -158,7 +158,13 @@ _act_is_local_host() { return 0; }
 _act_get_host_platform() { printf '%s\n' "$DSR_TEST_PLATFORM"; }
 _act_get_host_build_root() { printf '%s\n' "${DSR_TEST_BUILD_ROOT:-}"; }
 act_get_native_host() { printf 'cache-fixture\n'; }
-_act_ssh_exec() { bash -c "$2"; }
+# Health is controlled for this local transport fixture; native host admission
+# has its own suite. Keep its refusal observable here as well.
+host_health_is_ready() { [[ "$1" == cache-fixture && "${DSR_TEST_HOST_READY:-1}" == 1 ]]; }
+# Generated Cargo programs can exceed Linux's single-argument limit. Preserve
+# this adapter's non-login Bash context, parse the whole program before running
+# it, and keep program text off descendant stdin as the real transport does.
+_act_ssh_exec() { bash -s <<< $'{\n'"$2"$'\n} </dev/null'; }
 "$@"
 '''
 
@@ -605,9 +611,10 @@ if dependency.exists():
 ordinary_env = dict(environment, CARGO_HOME=str(ordinary_ambient))
 require(['cargo', 'metadata', '--format-version', '1'], env=ordinary_env, cwd=source)
 dependency.rename(work / 'retained-ordinary-dependency')
-ordinary_registry = ordinary_ambient / 'registry/cache/fixture/payload.crate'
-ordinary_registry.parent.mkdir(parents=True, exist_ok=True)
-ordinary_registry.write_bytes(b'ordinary registry marker\n')
+ordinary_registry = next(ordinary_ambient.glob('registry/cache/*/registry_dependency-1.0.0.crate'))
+ordinary_unrelated = ordinary_ambient / 'registry/cache/fixture/payload.crate'
+ordinary_unrelated.parent.mkdir(parents=True, exist_ok=True)
+ordinary_unrelated.write_bytes(b'unrelated ordinary registry marker\n')
 (ordinary_ambient / 'config.toml').write_text('[build]\nrustc-wrapper="/untrusted/operator-wrapper"\n')
 (ordinary_ambient / 'credentials.toml').write_text('private credentials must not be copied\n')
 ordinary_build_root = work / 'ordinary-build-root'
@@ -616,9 +623,10 @@ ordinary_env['DSR_TEST_BUILD_ROOT'] = str(ordinary_build_root)
 wiped_ambient = work / 'ordinary-ambient-wiped'
 
 
-def ordinary_build(label, mutation='', successful=True, preparation=''):
+def ordinary_build(label, mutation='', successful=True, preparation='', keep_stage=True, ready=True):
     probe = work / ('ordinary-home-' + str(checks))
-    command = ('printf "%s\\n" "$CARGO_HOME" > "$DSR_CACHE_PROBE"; ' + preparation +
+    command = ('printf "%s\\n" "$CARGO_HOME" > "$DSR_CACHE_PROBE"; '
+               'test -f "$CARGO_HOME/../.sbh-protect" && test ! -L "$CARGO_HOME/../.sbh-protect" || exit 91; ' + preparation +
                'cargo build --quiet --locked --offline --target "$CARGO_BUILD_TARGET"; ' + mutation)
     configuration = {
         'tool_name': 'cache-probe', 'repo': 'fixture/cache-probe', 'local_path': str(source),
@@ -628,7 +636,9 @@ def ordinary_build(label, mutation='', successful=True, preparation=''):
                 'DSR_ORDINARY_AMBIENT': str(ordinary_ambient), 'DSR_WIPED_AMBIENT': str(wiped_ambient)},
     }
     (configs / 'cache-probe.yaml').write_text(json.dumps(configuration))
-    result = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', 'ordinary-run', env=ordinary_env)
+    build_environment = dict(ordinary_env, DSR_KEEP_BUILD_STAGES='1' if keep_stage else '0',
+                             DSR_TEST_HOST_READY='1' if ready else '0')
+    result = shell('act_run_native_build', 'cache-probe', target, 'v1.0.0', 'ordinary-run', env=build_environment)
     rows = [line for line in result.stdout.splitlines() if line.startswith(b'{')]
     report = json.loads(rows[-1]) if rows else {}
     if not (result.returncode == 0 if successful else result.returncode != 0):
@@ -656,12 +666,19 @@ check('ordinary result records a private copy instead of ambient cache reuse',
 check('ordinary build ran with the recorded private Cargo home inside its stage root',
       ordinary_home is not None and ordinary_home.resolve() == Path(cache['seed']['cargo_home']) and
       str(ordinary_home).startswith(str(ordinary_build_root) + '/dsr-build-cache-probe-'))
-ordinary_private_registry = ordinary_home / 'registry/cache/fixture/payload.crate'
+check('ordinary stage protection remains outside copied source and cache inventories',
+      (ordinary_home.parent / '.sbh-protect').is_file() and
+      not (ordinary_home.parent / '.sbh-protect').is_symlink() and
+      not (ordinary_home / '.sbh-protect').exists() and
+      not (Path(isolation['source_root']) / '.sbh-protect').exists())
+ordinary_private_registry = ordinary_home / ordinary_registry.relative_to(ordinary_ambient)
 check('ordinary private registry bytes are copied onto independent inodes',
-      ordinary_private_registry.read_bytes() == b'ordinary registry marker\n' and
+      ordinary_private_registry.read_bytes() == registry_bytes and
       not ordinary_private_registry.is_symlink() and
       ordinary_private_registry.stat().st_ino != ordinary_registry.stat().st_ino and
       not (ordinary_home / 'registry').is_symlink())
+check('ordinary lock-selected seed omits the unrelated ambient archive',
+      not (ordinary_home / ordinary_unrelated.relative_to(ordinary_ambient)).exists())
 check('ordinary private home excludes ambient configuration and credentials',
       not (ordinary_home / 'config.toml').exists() and not (ordinary_home / 'credentials.toml').exists())
 check('ordinary collected executable runs with the committed dependency bytes',
@@ -671,6 +688,23 @@ ordinary_build('a config-bearing ordinary private home refuses artifact admissio
 _, second_ordinary_home = ordinary_build('a second ordinary build compiles with a fresh private home')
 check('ordinary builds never share a Cargo home',
       second_ordinary_home is not None and second_ordinary_home != ordinary_home)
+
+# Protection belongs to the existing ephemeral lifecycle, not a permanent
+# shared root. Successful and failed attempts retire it with their own stage.
+cleaned_report, cleaned_home = ordinary_build('ordinary protected stage permits normal successful cleanup', keep_stage=False)
+check('successful cleanup retires the protected stage after final cache admission',
+      cleaned_home is not None and not cleaned_home.parent.exists() and
+      require([cleaned_report['artifact_path']]).strip() == '42:42')
+_, failed_home = ordinary_build('ordinary build failure still refuses artifact admission',
+                                successful=False, preparation='exit 19; ', keep_stage=False)
+check('failed build cleanup also retires the protected stage',
+      failed_home is not None and not failed_home.parent.exists())
+before = set(ordinary_build_root.iterdir())
+refused_report, refused_home = ordinary_build('unhealthy fixture host still refuses ordinary builds',
+                                             successful=False, ready=False)
+check('readiness refusal creates no protected stage and never starts the compiler',
+      refused_home is None and set(ordinary_build_root.iterdir()) == before and
+      refused_report.get('stage') == 'host_readiness')
 
 print(f'Native Unix Cargo cache: {checks} assertions passed; real offline compilation and local transport.', flush=True)
 PY

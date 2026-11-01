@@ -5427,6 +5427,24 @@ while test -n "\$dsr_ancestor"; do
 done
 test ! -e '$stage_root'; test ! -L '$stage_root'
 mkdir '$stage_root'; test -d '$stage_root'; test ! -L '$stage_root'
+# SBH honors ancestor markers for both scanning and direct deletion checks.
+# Protect the private source/cache before copying any bytes; the existing
+# all-outcome stage cleanup retires this marker with the owned stage. O_EXCL
+# refuses every existing leaf, including a FIFO that shell noclobber can block on.
+python3 -I - '$stage_root' <<'DSR_ORDINARY_STAGE_PROTECTION'
+import os, stat, sys
+parent = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(parent)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o777 != 0o700:
+        raise RuntimeError('ordinary build stage must be private and owned')
+    fd = os.open('.sbh-protect', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=parent)
+    with os.fdopen(fd, 'w') as marker:
+        marker.write('reason = "DSR ordinary native build stage"' + chr(10))
+finally:
+    os.close(parent)
+DSR_ORDINARY_STAGE_PROTECTION
 ambient_home=\${CARGO_HOME:-\$HOME/.cargo}
 if test ! -e "\$ambient_home" && test ! -L "\$ambient_home"; then ambient_home=; fi
 dsr_lockfile=
@@ -13166,16 +13184,7 @@ act_orchestrate_build() {
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                # A worker can finish its immutable sidecar before the
-                # coordinator records completion. Restore the coordinator's
-                # retained attempt metadata when recovering that result,
-                # without rewriting the original worker receipt.
-                final_results["$task_key"]=$(jq -c \
-                    --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
-                    --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
-                    '. + {resume_reused: true, log_path: $log_path,
-                          result_path: $result_path, attempt: $attempt}' \
-                    <<< "$persisted_result") || { interrupted=true; break; }
+                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 _log_info "Resume: reusing completed target $task_key"
                 continue
             fi
@@ -13191,7 +13200,16 @@ act_orchestrate_build() {
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                # A worker can finish its immutable sidecar before the
+                # coordinator records completion. Restore the coordinator's
+                # retained attempt metadata when recovering that result,
+                # without rewriting the original worker receipt.
+                final_results["$task_key"]=$(jq -c \
+                    --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
+                    --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
+                    '. + {resume_reused: true, log_path: $log_path,
+                          result_path: $result_path, attempt: $attempt}' \
+                    <<< "$persisted_result") || { interrupted=true; break; }
                 if $state_available; then
                     local reconciled_extra
                     if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \
