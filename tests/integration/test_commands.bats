@@ -224,7 +224,10 @@ _mock_gh_runs() {
     export GH_RETRY_DELAY=0
     mock_command_script "gh" "$(cat <<'SCRIPT'
 printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
-[[ "$1" == auth ]] && exit 0
+if [[ "$1" == auth ]]; then
+    [[ "${2:-}" != token ]] || printf '%s\n' 'dsr-offline-integration-fixture'
+    exit 0
+fi
 if [[ "$1" == api ]]; then
     [[ -s "$TEST_TMPDIR/runs.json" ]] || { echo 'gh: Bad gateway (HTTP 502)' >&2; exit 1; }
     if [[ "$*" == *repos/Dicklesworthstone/ntm/* ]]; then
@@ -292,7 +295,10 @@ _mock_active_inventory() {
         ' > "$TEST_TMPDIR/active-history.json"
     mock_command_script "gh" "$(cat <<'SCRIPT'
 printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
-[[ "$1" == auth ]] && exit 0
+if [[ "$1" == auth ]]; then
+    [[ "${2:-}" != token ]] || printf '%s\n' 'dsr-offline-integration-fixture'
+    exit 0
+fi
 [[ "$1" == api ]] || exit 99
 endpoint=""
 for arg in "$@"; do
@@ -453,7 +459,10 @@ _mock_job_inventory() {
     ' > "$TEST_TMPDIR/job-workflow.json"
     mock_command_script "gh" "$(cat <<'SCRIPT'
 printf '%s\n' "$*" >> "$TEST_TMPDIR/gh.calls"
-[[ "$1" == auth ]] && exit 0
+if [[ "$1" == auth ]]; then
+    [[ "${2:-}" != token ]] || printf '%s\n' 'dsr-offline-integration-fixture'
+    exit 0
+fi
 [[ "$1" == api ]] || exit 99
 endpoint=""
 for arg in "$@"; do [[ "$arg" == repos/*/actions/* ]] && endpoint="$arg"; done
@@ -1337,13 +1346,25 @@ EOF
 # ============================================================================
 
 _iso_ago() {
-    date -u -d "$1 ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
-        date -u -v-"${1// /}" +%Y-%m-%dT%H:%M:%SZ
+    local amount unit minutes epoch
+    read -r amount unit <<< "$1"
+    case "$unit" in
+        hour|hours) minutes=$((amount * 60)) ;;
+        minute|minutes) minutes=$amount ;;
+        *) printf 'Unsupported fixture time unit: %s\n' "$unit" >&2; return 1 ;;
+    esac
+    epoch=$((${report_fixture_epoch:?report fixture epoch required} - minutes * 60))
+    date -u -d "@$epoch" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null ||
+        date -u -r "$epoch" +"%Y-%m-%dT%H:%M:%SZ"
 }
 
 # Today's run log: a watcher whose fallback (ntm) failed with exit 6 while it
 # ran, a later successful build of bv, and status calls that are not runs.
 _write_report_log() {
+    # Keep exact fixture durations independent of how long writing the log takes.
+    # Bash's dynamic local scope also carries this anchor into _iso_ago subshells.
+    local report_fixture_epoch
+    report_fixture_epoch=$(date +%s)
     local day="$DSR_STATE_DIR/logs/$(date +%Y-%m-%d)"
     mkdir -p "$day"
     cat > "$day/run.log" << EOF
@@ -1567,13 +1588,15 @@ fi
         printf 'tool_name: %s\nrepo: example/%s\nbinary_name: %s\nartifact_naming: ${name}-${version}-${os}-${arch}\n' \
             "$tool" "$tool" "$tool" > "$DSR_CONFIG_DIR/repos.d/$tool.yaml"
     done
-    local out="$TEST_TMPDIR/installers"
+    local out
+    out="$(cd "$TEST_TMPDIR" && pwd -P)/installers"
 
     run bash -c '"$1" installer generate --all --output-dir "$2" --dry-run 2>/dev/null' _ "$PROJECT_ROOT/dsr" "$out"
     assert_equal "0" "$status"
     [[ ! -e "$out" ]]
 
-    run bash -c '"$1" installer generate alpha --output-dir "$2" 2>/dev/null' _ "$PROJECT_ROOT/dsr" "$out"
+    run bash -c '"$1" installer generate alpha --output-dir "$2" 2>"$3"' _ "$PROJECT_ROOT/dsr" "$out" "$TEST_TMPDIR/installer.stderr"
+    if [[ "$status" -ne 0 ]]; then cat "$TEST_TMPDIR/installer.stderr" >&2; fi
     assert_equal "0" "$status"
     assert_equal "$out/alpha/install.sh" "$output"
     bash -n "$out/alpha/install.sh"
