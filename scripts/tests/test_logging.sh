@@ -179,6 +179,36 @@ test_log_timed() {
     fi
 }
 
+# Epoch corrections must not change elapsed time or the command's exit code.
+test_log_timed_backward_epoch() {
+    ((TESTS_RUN++))
+    local evidence status=0
+    evidence=$(mktemp -d "$TEMP_DIR/backward-clock.XXXXXXXX") || return 1
+    (
+        export DSR_LOG_FILE="$evidence/log.jsonl"
+        LOG_FILE="$DSR_LOG_FILE"
+        _get_ms_timestamp() {
+            if [[ -f "$evidence/epoch-called" ]]; then
+                printf '9000\n'
+            else
+                touch "$evidence/epoch-called"
+                printf '10000\n'
+            fi
+        }
+        log_timed bash -c 'sleep 0.1; exit 7' 2>/dev/null || status=$?
+        [[ "$status" == 7 ]] || exit 1
+        jq -es '[.[] | select(.msg == "Failed: bash")][-1] |
+            .exit_code == 7 and (.duration_ms | type == "number") and
+            .duration_ms >= 80' "$DSR_LOG_FILE" >/dev/null
+    )
+    if [[ $? == 0 ]]; then
+        pass "log_timed survives backward epoch and preserves failure exit"
+    else
+        fail "log_timed backward epoch or command exit regression"
+    fi
+}
+
+
 # ============================================================================
 # XDG Layout Tests (bd-1jt.5.10 criteria)
 # ============================================================================
@@ -252,6 +282,10 @@ test_log_file_under_date_dir() {
 
 # Cleanup
 cleanup() {
+    if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
+        printf 'Retained test fixture: %s\n' "$TEMP_DIR" >&2
+        return
+    fi
     rm -rf "$TEMP_DIR"
 }
 trap cleanup EXIT
@@ -272,6 +306,7 @@ test_quiet_mode
 test_json_escape
 test_log_get_run_id
 test_log_timed
+test_log_timed_backward_epoch
 
 echo ""
 echo "XDG Layout Tests:"

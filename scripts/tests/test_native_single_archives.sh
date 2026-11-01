@@ -142,6 +142,7 @@ driver = work / 'package-driver.sh'
 driver.write_text(r'''#!/usr/bin/env bash
 set -uo pipefail
 source "$1" || exit $?
+source "$(dirname "$1")/config.sh" || exit $?
 # Naming is an explicit configuration boundary, not simulated archive evidence.
 # Its exact-primary behavior has a separate production naming regression suite.
 artifact_naming_generate_dual_for_tool() {
@@ -152,6 +153,9 @@ _test_native_packaging() {
     local config_file="$2" local_path="$3" release_git_sha="$4"
     local platform="$5" artifact_dir="$6" compiled="$7"
     local tool_name=app version=v1.2.3 strict_native_build=true selected_triple=''
+    # The extracted branch inherits this context from act_run_native_build.
+    # Exercise release packaging; do not let nounset abort before validation.
+    local build_purpose=release
     local status=success exit_code=0 log_file="$artifact_dir/build.log"
     local collected_sha256='' collected_size_bytes=0 collected_identity=''
     local workspace_binaries binary_name bin receipt
@@ -257,7 +261,8 @@ for target in ('linux/amd64','linux/arm64','darwin/amd64','darwin/arm64','window
         skipped += 1
         print('SKIP actual cross-compiled fixture unavailable: '+target)
 
-base = {'binary_name':'app', 'include_files':list(committed), 'release_contract':{'exact_primary_assets':{}}}
+base = {'binary_name':'app', 'include_files':list(committed),
+        'targets':list(fixtures), 'release_contract':{'exact_primary_assets':{}}}
 for target in fixtures:
     base['release_contract']['exact_primary_assets'][target] = 'app-'+target.replace('/','-')+'.tar.xz'
 
@@ -290,13 +295,19 @@ def package(config,target,expected=0,preexisting=False,tamper=False):
     counter+=1
     folder=work/('case-'+str(counter)); folder.mkdir()
     cf=work/('case-'+str(counter)+'.json'); write(cf,config)
+    config_dir=folder/'config'
+    (config_dir/'repos.d').mkdir(parents=True)
+    # Bind the production config reader to this exact case, never the user's
+    # release registry. JSON is valid YAML and retains identical contract bytes.
+    (config_dir/'repos.d/app.yaml').write_bytes(cf.read_bytes())
     path=folder/config['release_contract']['exact_primary_assets'][target]
     prior=None
     if preexisting:
         path.write_bytes(b'previous immutable archive')
         prior=(sha(path),path.stat().st_ino)
     p=subprocess.run(['bash',str(driver),str(module),str(cf),str(repo),revision,target,str(folder),str(fixtures[target])],
-                     env=dict(os.environ,DSR_TEST_TAMPER_COLLECTED=str(int(tamper))),capture_output=True,timeout=90)
+                     env=dict(os.environ,DSR_CONFIG_DIR=str(config_dir),
+                              DSR_TEST_TAMPER_COLLECTED=str(int(tamper))),capture_output=True,timeout=90)
     if p.returncode!=expected:
         raise AssertionError(f'package expected {expected}, got {p.returncode}: {p.stdout.decode()}\n{p.stderr.decode()}')
     result=json.loads(p.stdout)

@@ -62,23 +62,21 @@ _qg_sha256() {
 }
 
 _qg_now_ms() {
-    if declare -f _get_ms_timestamp &>/dev/null; then
-        _get_ms_timestamp
+    if declare -f _get_monotonic_ms &>/dev/null; then
+        _get_monotonic_ms
         return
     fi
-    # BSD date has no %3N (prints it literally) — validate before use.
-    local ms
-    ms=$(date +%s%3N 2>/dev/null)
-    if [[ "$ms" =~ ^[0-9]+$ ]]; then
-        echo "$ms"
-    elif command -v python3 &>/dev/null; then
-        # Mirrors logging.sh::_get_ms_timestamp. Without this the last resort
-        # below quantizes to whole seconds, so every check that finishes inside
-        # one second is recorded as 0ms — which is what the duration assertions
-        # in test_quality_gates.sh were catching on macOS.
-        python3 -c 'import time; print(int(time.time() * 1000))'
+    # This module is also sourced independently of logging.sh.
+    if command -v python3 &>/dev/null; then
+        python3 -c 'import time; print(time.monotonic_ns() // 1000000)'
+    elif command -v perl &>/dev/null; then
+        perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \
+            'printf "%.0f\n", clock_gettime(CLOCK_MONOTONIC) * 1000'
+    elif [[ -r /proc/uptime ]]; then
+        awk '{printf "%.0f\n", $1 * 1000}' /proc/uptime
     else
-        echo "$(($(date +%s) * 1000))"
+        _qg_log_error 'No monotonic clock provider available'
+        return 4
     fi
 }
 
@@ -229,7 +227,7 @@ _qg_run_single_check() {
     local log_file="$4"
 
     local start_ms end_ms duration_ms exit_code=0
-    start_ms=$(_qg_now_ms)
+    start_ms=$(_qg_now_ms) || return 4
 
     if [[ "$dry_run" == "true" ]]; then
         _qg_log_info "(dry-run) Planned, NOT executed: $cmd"
@@ -258,7 +256,7 @@ _qg_run_single_check() {
         echo "# cwd: $resolved_cwd"
         echo "# env: PATH=$PATH"
         env | LC_ALL=C grep -E '^(DSR_|CARGO_|RUST)' | sed 's/^/# env: /' || true
-        echo "# started_ms: $start_ms"
+        echo "# started_monotonic_ms: $start_ms"
         echo "# ----"
     } > "$log_file"
 
@@ -274,7 +272,7 @@ _qg_run_single_check() {
     fi
     echo "# exit_code: $exit_code" >> "$log_file"
 
-    end_ms=$(_qg_now_ms)
+    end_ms=$(_qg_now_ms) || return 4
     duration_ms=$((end_ms - start_ms))
 
     if [[ $exit_code -eq 0 ]]; then
@@ -470,7 +468,7 @@ EOF
     local results=()
     local total_start_ms total_end_ms
     local passed=0 failed=0 planned=0 idx=0
-    total_start_ms=$(_qg_now_ms)
+    total_start_ms=$(_qg_now_ms) || return 4
 
     # Materialize the complete command inventory before executing anything.
     # Executed checks must never share the pipe that carries this control data.
@@ -494,7 +492,7 @@ EOF
         esac
     done
 
-    total_end_ms=$(_qg_now_ms)
+    total_end_ms=$(_qg_now_ms) || return 4
     local total_duration_ms=$((total_end_ms - total_start_ms))
     echo "" >&2
 

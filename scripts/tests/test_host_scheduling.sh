@@ -3,10 +3,15 @@
 # internal health provider is isolated: these tests must not contact SSH hosts.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=src/host_selector.sh
 source "${DSR_SELECTOR_MODULE:-$ROOT/src/host_selector.sh}"
 command -v jq >/dev/null || { echo 'SKIP: jq is required'; exit 0; }
 work=$(mktemp -d "${TMPDIR:-/tmp}/dsr-scheduling.XXXXXXXX") || exit 1
-trap 'rm -rf -- "$work"' EXIT
+if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
+    trap 'printf "Retained test fixture: %s\n" "$work" >&2' EXIT
+else
+    trap 'rm -rf -- "$work"' EXIT
+fi
 export DSR_CONFIG_DIR="$work/config" DSR_STATE_DIR="$work/state"
 export DSR_HOSTS_FILE="$DSR_CONFIG_DIR/hosts.yaml"
 mkdir -p "$DSR_CONFIG_DIR" || exit 1
@@ -26,11 +31,24 @@ cp "$DSR_HOSTS_FILE" "$work/original.json"
 HEALTH='["gamma","alpha","beta","disabled","paused","removed","unknown-platform"]'
 HEALTH_STATUS=0
 host_health_get_healthy_hosts() {
-    if [[ "${1:-}" == --for-capability ]]; then
-        [[ "${2:-}" == rust && "${3:-}" == --json ]] || return 4
+    local capability="" json=false
+    while (($#)); do
+        case "$1" in
+            --json) json=true; shift ;;
+            --for-capability)
+                [[ $# -ge 2 && "$2" == rust ]] || return 4
+                capability="$2"; shift 2 ;;
+            --for-os)
+                [[ $# -ge 2 ]] || return 4
+                case "$2" in linux|darwin|windows) ;; *) return 4 ;; esac
+                shift 2 ;;
+            *) return 4 ;;
+        esac
+    done
+    "$json" || return 4
+    if [[ "$capability" == rust ]]; then
         printf '%s\n' '["gamma"]'
     else
-        [[ "${1:-}" == --json ]] || return 4
         printf '%s\n' "$HEALTH"
     fi
     return "$HEALTH_STATUS"
