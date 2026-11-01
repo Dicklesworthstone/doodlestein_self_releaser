@@ -191,6 +191,82 @@ class SigningContext(unittest.TestCase):
     def test_explicit_admission_requires_frozen_digest(self):
         self.call('signing_validate_release_inventory "$@"',self.manifest,self.out,'0'*64,expected=4)
 
+    def aggregate_bytes(self):
+        return ''.join(sorted(row['sha256'] + '  ' + row['name'] + '\n'
+                              for row in self.body['artifacts'])).encode()
+
+    def test_all_conventional_aggregates_bind_the_complete_inventory(self):
+        expected = self.aggregate_bytes()
+        for name in ('SHA256SUMS', 'SHA256SUMS.txt', 'checksums.txt'):
+            with self.subTest(name=name):
+                path = self.out / name
+                path.write_bytes(expected)
+                frozen = self.snapshot()
+                self.check(frozen)
+                self.assertEqual(path.read_bytes(), expected)
+
+    def test_legacy_aggregate_does_not_require_canonical_basename(self):
+        for name in ('SHA256SUMS.txt', 'checksums.txt'):
+            with self.subTest(name=name):
+                (self.out / name).write_bytes(self.aggregate_bytes())
+                self.snapshot()
+                self.assertFalse((self.out / 'SHA256SUMS').exists())
+
+    def test_each_aggregate_requires_complete_unique_matching_rows(self):
+        correct = self.aggregate_bytes()
+        lines = correct.splitlines(keepends=True)
+        malformed = {
+            'empty': b'', 'partial': lines[0], 'duplicate': correct + lines[0],
+            'wrong hash': b'0' * 64 + lines[0][64:] + lines[1],
+            'extra payload': correct + b'0' * 64 + b'  undeclared.bin\n',
+            'malformed': b'not a checksum inventory\n',
+        }
+        for name in ('SHA256SUMS', 'SHA256SUMS.txt', 'checksums.txt'):
+            (self.out / name).write_bytes(correct)
+        frozen = self.snapshot()
+        for name in ('SHA256SUMS', 'SHA256SUMS.txt', 'checksums.txt'):
+            path = self.out / name
+            for fault, value in malformed.items():
+                with self.subTest(name=name, fault=fault):
+                    path.write_bytes(value)
+                    try:
+                        self.check(frozen, 4)
+                        self.assertEqual(path.read_bytes(), value)
+                    finally:
+                        path.write_bytes(correct)
+
+    def test_linked_and_nonfile_aggregates_cannot_authorize_payloads(self):
+        for name in ('SHA256SUMS', 'SHA256SUMS.txt', 'checksums.txt'):
+            with self.subTest(name=name):
+                held = self.root / ('held-' + name)
+                held.write_bytes(self.aggregate_bytes())
+                path = self.out / name
+                path.symlink_to(held)
+                self.call('_signing_release_manifest_snapshot "$@"', self.payload, expected=4)
+                path.rename(self.root / ('retained-link-' + name))
+                path.mkdir()
+                self.call('_signing_release_manifest_snapshot "$@"', self.payload, expected=4)
+                path.rename(self.root / ('retained-directory-' + name))
+
+    def test_manifest_owned_legacy_basename_retains_payload_role(self):
+        for name in ('SHA256SUMS.txt', 'checksums.txt'):
+            with self.subTest(name=name):
+                path = self.out / name
+                path.write_bytes(b'explicitly selected runtime data, not a checksum inventory\n')
+                self.body['artifacts'].append(dict(name=name, target='additional',
+                                                   sha256=sha(path), size_bytes=path.stat().st_size))
+                self.save()
+                (self.out / 'SHA256SUMS').write_bytes(self.aggregate_bytes())
+                self.snapshot()
+
+    def test_checksum_prefix_is_not_an_unowned_payload_exemption(self):
+        for name in ('SHA256SUMS.NOTICE', 'SHA256SUMS.txt.extra', 'Checksums.txt', 'checksums.json'):
+            with self.subTest(name=name):
+                path = self.out / name
+                path.write_bytes(self.aggregate_bytes())
+                self.call('_signing_release_manifest_snapshot "$@"', self.payload, expected=4)
+                path.rename(self.root / ('retained-' + name))
+
     def test_public_entrypoints_validate_before_private_key_use(self):
         self.companion.rename(self.root/'retained-arm64')
         for function in ('signing_sign','signing_sign_batch'):

@@ -1129,6 +1129,156 @@ test_release_upload_scenario() (
   return 0
 )
 
+# The production uploader retains the adjacent manifest even when signing is
+# disabled. These are byte-inventory/HTTP lifecycle tests, not cryptographic
+# signature acceptance; the legacy aggregate integration uses real Minisign.
+test_release_aggregate_upload_scenario() (
+  local aggregate="$1" scenario="$2" expected_status=0 expected_posts=1
+  local fixture="$TEMP_DIR/aggregate" directory="$TEMP_DIR/aggregate/release"
+  local manifest="$directory/tool-v1.2.3-manifest.json" file upload_name
+  local calls="$fixture/calls" posts="$fixture/posts" remote="$fixture/remote.json"
+  local expected="$fixture/expected" app_sha helper_sha digest size name
+  mkdir -p "$directory" "$fixture/tmp" || return 1
+  printf 'primary payload bytes\n' > "$directory/app"
+  printf 'workspace helper bytes\n' > "$directory/helper"
+  app_sha=$(_gh_asset_sha256 "$directory/app") || return 1
+  helper_sha=$(_gh_asset_sha256 "$directory/helper") || return 1
+  jq -nc --arg app "$app_sha" --arg helper "$helper_sha" \
+    --argjson app_size "$(wc -c < "$directory/app")" \
+    --argjson helper_size "$(wc -c < "$directory/helper")" \
+    '{tool:"tool",version:"v1.2.3",status:"success",build_purpose:"release",publishable:true,
+      artifacts:[{name:"app",sha256:$app,size_bytes:$app_size},
+                 {name:"helper",sha256:$helper,size_bytes:$helper_size}]}' > "$manifest" || return 1
+  for name in SHA256SUMS SHA256SUMS.txt checksums.txt; do
+    printf '%s  app\n%s  helper\n' "$app_sha" "$helper_sha" > "$directory/$name"
+  done
+  file="$directory/$aggregate" upload_name="$aggregate"
+  case "$scenario" in
+    existing) expected_posts=0 ;;
+    signature)
+      # Membership of all supported detached-proof suffixes is literal. No
+      # fixture signer is allowed to claim that these proof bytes authenticate.
+      for name in minisig sig asc; do
+        printf 'signature membership fixture; no cryptographic claim\n' > "$directory/$aggregate.$name"
+        _gh_manifest_has_upload_name "$manifest" "$aggregate.$name" "$directory/$aggregate.$name" \
+          "$(_gh_asset_sha256 "$directory/$aggregate.$name")" || return 1
+      done
+      file="$directory/$aggregate.minisig" upload_name="$aggregate.minisig" ;;
+    alias-only)
+      for name in SHA256SUMS SHA256SUMS.txt checksums.txt; do
+        [[ "$name" == "$aggregate" ]] || mv "$directory/$name" "$fixture/retained-$name" || return 1
+      done ;;
+    owned-payload)
+      [[ "$aggregate" != SHA256SUMS ]] || return 1
+      printf 'explicitly selected runtime data\n' > "$file"
+      jq --arg name "$aggregate" --arg sha "$(_gh_asset_sha256 "$file")" \
+        --argjson size "$(wc -c < "$file")" \
+        '.artifacts += [{name:$name,sha256:$sha,size_bytes:$size,target:"additional"}]' \
+        "$manifest" > "$fixture/manifest.next" || return 1
+      mv "$fixture/manifest.next" "$manifest" || return 1
+      for name in SHA256SUMS SHA256SUMS.txt checksums.txt; do
+        [[ "$name" == "$aggregate" ]] && continue
+        jq -r '.artifacts[] | .sha256 + "  " + .name' "$manifest" > "$directory/$name" || return 1
+        [[ "$name" == SHA256SUMS ]] || mv "$directory/$name" "$fixture/retained-$name" || return 1
+      done ;;
+    metadata-renamed) upload_name=other-checksums.txt; expected_status=4; expected_posts=0 ;;
+    payload-renamed) file="$directory/app"; expected_status=4; expected_posts=0 ;;
+    unknown-name)
+      file="$directory/$aggregate.extra" upload_name="$aggregate.extra"
+      cp "$directory/$aggregate" "$file" || return 1
+      expected_status=4; expected_posts=0 ;;
+    partial)
+      printf '%s  app\n' "$app_sha" > "$directory/$aggregate"
+      file="$directory/app" upload_name=app; expected_status=4; expected_posts=0 ;;
+    before-post-mutation|existing-mutation)
+      file="$directory/app" upload_name=app; expected_status=4; expected_posts=0 ;;
+    response-mutation|reconcile-mutation)
+      file="$directory/app" upload_name=app; expected_status=4 ;;
+    fresh|lost-response) ;;
+    *) return 1 ;;
+  esac
+  cp "$file" "$expected" || return 1
+  digest=$(_gh_asset_sha256 "$expected") || return 1
+  size=$(wc -c < "$expected"); size="${size//[[:space:]]/}"
+  : > "$calls"; printf '0\n' > "$posts"; printf '[]\n' > "$remote"
+  local TMPDIR="$fixture/tmp" GH_MAX_RETRIES=2 GH_RETRY_DELAY=0 GH_UPLOAD_TIMEOUT=15
+  _gh_resolve_token() { printf 'AUTH\n' >> "$calls"; printf 'fixture-token\n'; }
+  aggregate_asset() {
+    jq -nc --arg name "$upload_name" --arg digest "sha256:$digest" --argjson size "$size" \
+      '{id:42,name:$name,state:"uploaded",size:$size,digest:$digest}'
+  }
+  case "$scenario" in existing|existing-mutation) aggregate_asset | jq -sc . > "$remote" ;; esac
+  gh_api() {
+    [[ "$1" == 'repos/owner/repo/releases/9/assets?per_page=100&page=1' && "$2" == --no-cache ]] || return 91
+    printf 'READ\n' >> "$calls"
+    case "$scenario" in before-post-mutation|existing-mutation)
+      printf '%s  app\n' "$app_sha" > "$directory/$aggregate" ;;
+    esac
+    cat "$remote"
+  }
+  curl() {
+    local output='' payload='' url='' headers='' count asset
+    while (($#)); do
+      case "$1" in
+        -o) output="$2"; shift 2 ;;
+        -D) headers="$2"; shift 2 ;;
+        --data-binary) payload="${2#@}"; shift 2 ;;
+        https://*) url="$1"; shift ;;
+        *) shift ;;
+      esac
+    done
+    [[ "$url" == "https://uploads.github.com/repos/owner/repo/releases/9/assets?name=$upload_name" &&
+       -n "$output" && -n "$headers" && "$payload" != "$file" ]] || return 92
+    cmp -s "$payload" "$expected" || return 93
+    read -r count < "$posts"; printf '%s\n' "$((count + 1))" > "$posts"
+    printf 'POST\n' >> "$calls"
+    asset=$(aggregate_asset) || return 94
+    printf '[%s]\n' "$asset" > "$remote"
+    printf '%s\n' "$asset" > "$output"
+    printf 'HTTP/2 201\r\n\r\n' > "$headers"
+    case "$scenario" in response-mutation|reconcile-mutation)
+      printf '%s  app\n' "$app_sha" > "$directory/$aggregate" ;;
+    esac
+    case "$scenario" in lost-response|reconcile-mutation) printf 000; return 56 ;; esac
+    printf 201
+  }
+  local result status=0 post_count
+  result=$(gh_upload_asset_named 'https://uploads.github.com/repos/owner/repo/releases/9/assets' \
+    "$file" "$upload_name" 2> "$fixture/stderr") || status=$?
+  read -r post_count < "$posts"
+  if [[ "$status" != "$expected_status" || "$post_count" != "$expected_posts" ]]; then
+    printf 'FAIL %s/%s: status=%s posts=%s expected=%s/%s\n' \
+      "$aggregate" "$scenario" "$status" "$post_count" "$expected_status" "$expected_posts"
+    cat "$fixture/stderr"
+    return 1
+  fi
+  if [[ "$status" == 0 ]]; then
+    jq -es --arg name "$upload_name" --arg digest "sha256:$digest" \
+      'length==1 and .[0].name==$name and .[0].digest==$digest and .[0].id==42' <<< "$result" >/dev/null || return 1
+  else
+    [[ -z "$result" ]] || return 1
+  fi
+  case "$scenario" in metadata-renamed|payload-renamed|unknown-name|partial)
+    [[ ! -s "$calls" ]] || return 1 ;;
+  esac
+  [[ "$(_gh_asset_sha256 "$directory/app")" == "$app_sha" &&
+     "$(_gh_asset_sha256 "$directory/helper")" == "$helper_sha" ]] || return 1
+  [[ -z "$(find "$fixture/tmp" -mindepth 1 -print -quit)" ]]
+)
+
+run_aggregate_upload_tests() {
+  local aggregate scenario
+  for aggregate in SHA256SUMS SHA256SUMS.txt checksums.txt; do
+    for scenario in fresh existing lost-response signature alias-only metadata-renamed payload-renamed \
+                    unknown-name partial before-post-mutation existing-mutation response-mutation reconcile-mutation; do
+      run_test "aggregate_${aggregate}_${scenario}" test_release_aggregate_upload_scenario "$aggregate" "$scenario"
+    done
+    if [[ "$aggregate" != SHA256SUMS ]]; then
+      run_test "aggregate_${aggregate}_owned_payload" test_release_aggregate_upload_scenario "$aggregate" owned-payload
+    fi
+  done
+}
+
 test_upload_rejects_unsafe_inputs_before_auth() (
   local asset="$TEMP_DIR/asset" url name status result
   local valid_url='https://uploads.github.com/repos/owner/repo/releases/9/assets'
@@ -1521,6 +1671,12 @@ main() {
     [[ "$TESTS_FAILED" -eq 0 ]]
     exit $?
   fi
+  if [[ "${1:-}" == --aggregate-upload-only ]]; then
+    run_aggregate_upload_tests
+    printf 'Aggregate upload: %s passed, %s failed\n' "$TESTS_PASSED" "$TESTS_FAILED"
+    [[ "$TESTS_FAILED" -eq 0 ]]
+    exit $?
+  fi
 
   echo "Cache Key Generation:"
   run_test "cache_key_simple" test_cache_key_simple
@@ -1703,6 +1859,10 @@ dual-compat-fails 1 2 0
 dual-primary-fails 7 1 0
 dual-same 0 1 0
 UPLOAD_SCENARIOS
+
+  echo ""
+  echo "Manifest-bound Aggregate Uploads:"
+  run_aggregate_upload_tests
 
   echo ""
   echo "Immutable Tag Ruleset Receipts:"

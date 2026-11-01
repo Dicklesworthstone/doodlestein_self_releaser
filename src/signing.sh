@@ -507,7 +507,7 @@ _signing_sha256() {
 # release set. No names, checksums, or existing signatures are rewritten here.
 # Generic signature verification remains usable with a downloaded manifest alone.
 _signing_manifest_preflight() {
-    local manifest="$1" directory name path sha size actual before rows listing line
+    local manifest="$1" directory name path sha size actual before rows listing line aggregate
     # An explicit root is publication admission, not filename discovery.
     [[ $# -eq 1 || $# -eq 2 ]] || return 4
     [[ $# -eq 2 || "${manifest##*/}" == *-manifest.json ]] || return 0
@@ -578,7 +578,7 @@ _signing_manifest_preflight() {
         fi
         case "$name" in
             .dsr-*.json|*-manifest.json|*.minisig|*.sig|*.asc|\
-            *.sha256|*.sha512|SHA256SUMS|SHA512SUMS|\
+            *.sha256|*.sha512|SHA256SUMS|SHA256SUMS.txt|checksums.txt|SHA512SUMS|\
             *.sbom.*|*.intoto.jsonl) ;;
             sbom-manifest.spdx.json|sbom-manifest.cdx.json|sbom-plan.spdx.json|sbom-plan.cdx.json) ;;
             *) _sign_log_error "Release payload is absent from manifest: $name"
@@ -588,25 +588,30 @@ _signing_manifest_preflight() {
     rm -f -- "$listing"
     $invalid && return 4
 
-    # SHA256SUMS is optional before checksum generation. Once present it must
-    # enumerate exactly the same final names/hashes, not a subset or aliases
-    # synthesized after signing. Per-name checksums, when present, agree too.
-    if [[ -e "$directory/SHA256SUMS" || -L "$directory/SHA256SUMS" ]]; then
-        [[ -f "$directory/SHA256SUMS" && ! -L "$directory/SHA256SUMS" ]] || return 4
+    # Every present conventional aggregate must enumerate exactly the same
+    # final names/hashes. A legacy basename explicitly owned by the manifest
+    # remains a payload; it is not reinterpreted as its own checksum inventory.
+    # SHA256SUMS itself is reserved above. Per-name checksums agree too.
+    for aggregate in SHA256SUMS SHA256SUMS.txt checksums.txt; do
+        [[ -z "${expected[$aggregate]:-}" ]] || continue
+        path="$directory/$aggregate"
+        [[ -e "$path" || -L "$path" ]] || continue
+        [[ -f "$path" && ! -L "$path" ]] || return 4
+        checksums=()
         while IFS= read -r line || [[ -n "$line" ]]; do
             if [[ ! "$line" =~ ^([0-9a-f]{64})[\ ][\ *]([A-Za-z0-9][A-Za-z0-9._+-]*)$ ]]; then
-                _sign_log_error "Malformed SHA256SUMS entry"; return 4
+                _sign_log_error "Malformed $aggregate entry"; return 4
             fi
             sha="${BASH_REMATCH[1]}" name="${BASH_REMATCH[2]}"
             if [[ -n "${checksums[$name]:-}" || "${expected[$name]:-}" != "$sha" ]]; then
-                _sign_log_error "SHA256SUMS disagrees with manifest: $name"; return 4
+                _sign_log_error "$aggregate disagrees with manifest: $name"; return 4
             fi
             checksums["$name"]="$sha"
-        done < "$directory/SHA256SUMS"
+        done < "$path"
         [[ ${#checksums[@]} -eq ${#expected[@]} ]] || {
-            _sign_log_error "SHA256SUMS omits manifest artifacts"; return 4;
+            _sign_log_error "$aggregate omits manifest artifacts"; return 4;
         }
-    fi
+    done
     for name in "${!expected[@]}"; do
         path="$directory/$name.sha256"
         if [[ -e "$path" || -L "$path" ]]; then

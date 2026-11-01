@@ -10,6 +10,8 @@ on:
       - src/git_ops.sh
       - src/github.sh
       - scripts/tests/test_legacy_checksum_aggregate.sh
+      - scripts/tests/test_signing_context.py
+      - scripts/tests/test_github.sh
       - .github/workflows/aggregate-regression.yml
   workflow_dispatch:
 permissions:
@@ -46,6 +48,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
+      - name: Verify inventory admission and GitHub upload recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/signing.sh
+          bash -n src/github.sh
+          bash -n scripts/tests/test_github.sh
+          python3 -I scripts/tests/test_signing_context.py
+          bash scripts/tests/test_github.sh
       - name: Verify native manifest, resumable receipts, and signed aggregates
         shell: bash
         run: |
