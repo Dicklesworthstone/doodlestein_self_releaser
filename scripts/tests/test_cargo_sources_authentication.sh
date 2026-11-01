@@ -480,19 +480,24 @@ for failure in ('bytes', 'commit', 'objects', 'pointer', 'extra-admin'):
     check('recursive submodule refusal: ' + failure, lambda f, failure=failure: recursive_submodules(f, failure))
 
 
-def submodule_seed(f):
-    child, nested = submodule_fixture(f)
+def seed_submodule_cache(f):
     home = f.repo.parents[3]
     database = home / 'git/db/repo-123'
     database.parent.mkdir(parents=True)
     subprocess.run(['git', 'clone', '--bare', '--no-hardlinks', str(f.repo), str(database)],
                    check=True, capture_output=True)
     destination = f.root / 'private-home'
-    cache = str(Path(MODULE).with_name('cargo_cache.sh'))
+    cache = os.environ.get('DSR_TEST_CARGO_CACHE_MODULE', str(Path(MODULE).with_name('cargo_cache.sh')))
     result = subprocess.run(['bash', cache, 'snapshot', str(home), str(destination), str(f.lock)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     copied = destination / f.repo.relative_to(home)
+    return copied
+
+
+def submodule_seed(f):
+    child, nested = submodule_fixture(f)
+    copied = seed_submodule_cache(f)
     assert (copied / 'deps/child/deps/grandchild/.git/objects').is_dir()
     assert (copied / 'deps/child/deps/grandchild/value.h').read_bytes() == (nested / 'value.h').read_bytes()
 check('lock-scoped cache preserves only required submodule-bearing checkout', submodule_seed)
@@ -531,6 +536,54 @@ def pinned_file_link(f, failure=None):
 check('Git object chain authenticates an internal relative file symlink', pinned_file_link)
 for failure in ('escape', 'absolute', 'admin', 'admin-case', 'directory', 'cycle', 'retarget', 'regular'):
     check('pinned file symlink refuses ' + failure, lambda f, failure=failure: pinned_file_link(f, failure))
+
+
+def seeded_submodule_links(f, failure=None):
+    child, nested = submodule_fixture(f)
+    for tree in (f.repo, nested):
+        (tree / 'LICENSE').write_text('reviewed license\n')
+        (tree / 'crate').mkdir()
+        # This remains inside the outer checkout, but crosses the nested
+        # submodule boundary. Even committing it must not confer authority.
+        target = '../../../../../LICENSE' if tree == nested and failure == 'nested-escape' else '../LICENSE'
+        (tree / 'crate/LICENSE').symlink_to(target)
+    for tree in (nested, child, f.repo):
+        git(tree, 'add', '.')
+        git(tree, 'commit', '-qm', 'pin nested file-link text')
+    f.commit = git(f.repo, 'rev-parse', 'HEAD')
+    f.source = 'git+https://example.invalid/repo#' + f.commit
+    f.graph['packages'][2]['source'] = f.source
+    f.write_lock(); f.save()
+    if failure != 'nested-escape':
+        summary = f.good()
+        assert f.good(mode='verify') == summary
+    f.repo = seed_submodule_cache(f)
+    package = f.graph['packages'][2]
+    package['manifest_path'] = str(f.repo / 'Cargo.toml')
+    package['targets'][0]['src_path'] = str(f.repo / 'lib.rs')
+    f.save()
+    receipt = f.root / 'private-source-receipt.json'
+    if failure == 'nested-escape':
+        f.refused(receipt=receipt)
+        assert not receipt.exists()
+        return
+    summary = f.good(receipt=receipt)
+    assert f.good(mode='verify', receipt=receipt) == summary
+    assert os.readlink(f.repo / 'crate/LICENSE') == '../LICENSE'
+    if failure == 'retarget':
+        link = f.repo / 'crate/LICENSE'
+        link.rename(f.root / 'retained-private-link')
+        link.symlink_to('../shared.h')
+        # A confined file link can still be unpinned. Fresh authentication and
+        # receipt verification must both refuse its changed Git-blob text.
+        f.refused(receipt=f.root / 'retargeted-private-source.json')
+        f.refused(mode='verify', receipt=receipt)
+
+
+check('seeded submodule file links retain recursive Git object authentication', seeded_submodule_links)
+for failure in ('retarget', 'nested-escape'):
+    check('seeded submodule file links refuse ' + failure,
+          lambda f, failure=failure: seeded_submodule_links(f, failure))
 
 print('\nLocked dependency sources: %d passed, %d failed' % (PASS, FAIL))
 sys.exit(bool(FAIL))

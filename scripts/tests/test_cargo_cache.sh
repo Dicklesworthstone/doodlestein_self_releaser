@@ -516,6 +516,183 @@ class LockedCacheTests(unittest.TestCase):
         self.git('clone', '-q', '--bare', '--no-hardlinks', work, database)
         return database, sha
 
+    def submodule_checkout(self):
+        checkout = self.source / 'git/checkouts/selected-submodule/abcdef0'
+        child = checkout / 'deps/child'
+        for tree in (checkout, child):
+            self.git('init', '-q', '-b', 'main', tree)
+            (tree / 'LICENSE').write_text('reviewed license\n')
+            (tree / 'crate').mkdir()
+            (tree / 'crate/LICENSE').symlink_to('../LICENSE')
+            (tree / 'lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
+        (checkout / 'Cargo.toml').write_text('[package]\nname="helper"\nversion="1.0.0"\n')
+        for tree in (child, checkout):
+            self.git('-C', tree, 'add', '.')
+            self.git('-C', tree, '-c', 'user.name=DSR Test', '-c', 'user.email=dsr@example.invalid',
+                     'commit', '-qm', 'locked submodule with file links')
+        sha = self.git('-C', checkout, 'rev-parse', 'HEAD')
+        database = self.source / 'git/db/selected-submodule'
+        self.git('clone', '-q', '--bare', '--no-hardlinks', checkout, database)
+        self.write_lock([{'name': 'helper', 'version': '1.0.0', 'source': 'git+https://example.invalid/helper#' + sha}])
+        return checkout, child
+
+    def assert_submodule_link_seed(self, relocated=False):
+        checkout, child = self.submodule_checkout()
+        if relocated:
+            (self.source / 'git').rename(self.root / 'relocated git')
+            (self.source / 'git').symlink_to('../relocated git', target_is_directory=True)
+        result = self.scoped()
+        evidence = json.loads(Path(result['receipt_path']).read_bytes())
+        for tree in (checkout, child):
+            copied = self.copied(tree)
+            self.assertEqual(os.readlink(copied / 'crate/LICENSE'), '../LICENSE')
+            self.assertEqual((copied / 'crate/LICENSE').read_text(), 'reviewed license\n')
+            self.assertTrue((copied / '.git/objects').is_dir())
+            self.assertNotEqual((copied / 'LICENSE').stat().st_ino, (tree / 'LICENSE').stat().st_ino)
+            row = next(row for row in evidence['inventory']['files']
+                       if row['path'] == str((tree / 'crate/LICENSE').relative_to(self.source)))
+            self.assertTrue(row['symlink'])
+            self.assertEqual(row['sha256'], hashlib.sha256(b'../LICENSE').hexdigest())
+            self.assertEqual(row['size_bytes'], len(b'../LICENSE'))
+        self.assertFalse((self.home / 'git').is_symlink())
+        # Strict admission copies the prepared seed into another private home.
+        second = self.root / 'second private home'
+        copied_seed = self.scoped(source=self.home, home=second)
+        self.assertEqual(json.loads(Path(copied_seed['receipt_path']).read_bytes())['inventory'], evidence['inventory'])
+        (checkout / 'LICENSE').write_text('changed ambient license\n')
+        self.assertEqual((self.copied(checkout) / 'crate/LICENSE').read_text(), 'reviewed license\n')
+        self.source.rename(self.root / 'retained ambient')
+        self.invoke('verify', self.home, result['receipt_path'])
+        self.invoke('verify', second, copied_seed['receipt_path'])
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_preserves_confined_file_link_text(self):
+        self.assert_submodule_link_seed()
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_file_links_survive_relocated_git_root(self):
+        self.assert_submodule_link_seed(relocated=True)
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_refuses_unsafe_links(self):
+        checkout, _ = self.submodule_checkout()
+        link = checkout / 'crate/LICENSE'
+        cases = {'absolute': str(checkout / 'LICENSE'), 'escape': '../../../../../outside',
+                 'admin': '../.git/HEAD', 'admin-case': '../.GiT/HEAD',
+                 'directory': '..', 'cycle': 'LICENSE', 'dangling': '../missing',
+                 'backslash': '..\\LICENSE', 'control': '../LICENSE\n'}
+        for label, target in cases.items():
+            with self.subTest(label=label):
+                link.rename(self.root / ('retained-link-' + label))
+                link.symlink_to(target)
+                destination = self.root / ('refused-' + label)
+                self.scoped(7, home=destination)
+                self.assertFalse(destination.exists())
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_locked_submodule_seed_refuses_linked_administration_and_special_files(self):
+        checkout, _ = self.submodule_checkout()
+        admin = checkout / '.git/linked-license'
+        admin.symlink_to('../LICENSE')
+        self.scoped(7)
+        self.assertFalse(self.home.exists())
+        admin.rename(self.root / 'retained-admin-link')
+        os.mkfifo(checkout / 'special')
+        self.scoped(7)
+        self.assertFalse(self.home.exists())
+
+    @unittest.skipUnless(shutil.which('git'), 'Git not installed')
+    def test_selected_checkout_link_replacement_during_read_is_refused(self):
+        self.submodule_checkout()
+        import ast
+        code = Path(MODULE).read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY\n', 1)[0]
+        definitions = ast.parse(code)
+        definitions.body = [node for node in definitions.body if isinstance(
+            node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef))]
+        namespace = {}
+        exec(compile(definitions, MODULE, 'exec'), namespace)
+        original = os.readlink
+        changed = []
+
+        def replace_after_read(path, **kwargs):
+            result = original(path, **kwargs)
+            if path == 'LICENSE' and not changed:
+                parent = kwargs['dir_fd']
+                os.rename(path, 'retained-link', src_dir_fd=parent, dst_dir_fd=parent)
+                os.symlink('../lib.rs', path, dir_fd=parent)
+                changed.append(True)
+            return result
+
+        with patch.object(os, 'readlink', replace_after_read):
+            with self.assertRaisesRegex(namespace['Failure'], 'checkout link changed while reading'):
+                namespace['main'](['snapshot', str(self.source), str(self.home), str(self.lock)])
+        self.assertTrue(changed)
+        self.assertFalse(self.home.exists())
+
+    @unittest.skipUnless(shutil.which('cargo') and shutil.which('rustc') and shutil.which('git'),
+                         'real Cargo/rustc/Git unavailable; submodule consumption requires genuine tools')
+    def test_real_cargo_build_uses_seeded_submodule_file_links_offline(self):
+        # Both repositories are local file:// inputs. The compiler must read
+        # nested submodule bytes and both committed license links after every
+        # original repository and the ambient Cargo home have moved away.
+        child = self.root / 'child-upstream'
+        upstream = self.root / 'parent-upstream'
+        for tree in (child, upstream):
+            self.git('init', '-q', '-b', 'main', tree)
+            (tree / 'LICENSE').write_text('reviewed license\n')
+            (tree / 'crate').mkdir()
+            (tree / 'crate/LICENSE').symlink_to('../LICENSE')
+        (child / 'value.rs').write_text(
+            'pub fn value() -> u32 { assert_eq!(include_str!("crate/LICENSE"), "reviewed license\\n"); 42 }\n')
+        self.git('-C', child, 'add', '.')
+        self.git('-C', child, '-c', 'user.name=DSR Test', '-c', 'user.email=dsr@example.invalid',
+                 'commit', '-qm', 'local nested source')
+        (upstream / 'Cargo.toml').write_text(
+            '[package]\nname="seed-dependency"\nversion="1.0.0"\nedition="2021"\n[lib]\npath="lib.rs"\n')
+        (upstream / 'lib.rs').write_text(
+            'include!("deps/child/value.rs");\n'
+            'pub fn answer() -> u32 { assert_eq!(include_str!("crate/LICENSE"), "reviewed license\\n"); value() }\n')
+        self.git('-C', upstream, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q',
+                 child.as_uri(), 'deps/child')
+        self.git('-C', upstream, 'add', '.')
+        self.git('-C', upstream, '-c', 'user.name=DSR Test', '-c', 'user.email=dsr@example.invalid',
+                 'commit', '-qm', 'local parent with linked submodule sources')
+        revision = self.git('-C', upstream, 'rev-parse', 'HEAD')
+        project = self.root / 'submodule-consumer'
+        (project / 'src').mkdir(parents=True)
+        (project / 'Cargo.toml').write_text(
+            '[package]\nname="seed-consumer"\nversion="1.0.0"\nedition="2021"\n[dependencies]\n'
+            'seed-dependency={git=' + json.dumps(upstream.as_uri()) + ',rev=' + json.dumps(revision) + '}\n')
+        (project / 'src/main.rs').write_text('fn main() { println!("{}", seed_dependency::answer()); }\n')
+        ambient = self.root / 'submodule-cargo-home'
+        ambient.mkdir()
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'RUST', 'GIT_'))}
+        env.update(CARGO_HOME=str(ambient), CARGO_TARGET_DIR=str(self.root / 'submodule-target'),
+                   RUSTUP_AUTO_INSTALL='0', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        for name in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN'):
+            if name in os.environ:
+                env[name] = os.environ[name]
+        fetched = subprocess.run(['cargo', 'fetch'], cwd=project, env=env, capture_output=True, timeout=90)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr.decode())
+        self.lock = project / 'Cargo.lock'
+        home = self.root / 'submodule-private-home'
+        seed = self.scoped(source=ambient, home=home)
+        checkout = next((home / 'git/checkouts').glob('*/*/Cargo.toml')).parent
+        self.assertEqual(os.readlink(checkout / 'crate/LICENSE'), '../LICENSE')
+        self.assertEqual(os.readlink(checkout / 'deps/child/crate/LICENSE'), '../LICENSE')
+        self.assertTrue((checkout / 'deps/child/.git/objects').is_dir())
+        self.invoke('verify', home, seed['receipt_path'])
+        ambient.rename(self.root / 'retained-cargo-home')
+        upstream.rename(self.root / 'retained-parent-upstream')
+        child.rename(self.root / 'retained-child-upstream')
+        env['CARGO_HOME'] = str(home)
+        built = subprocess.run(['cargo', 'run', '--locked', '--offline', '--quiet'],
+                               cwd=project, env=env, capture_output=True, timeout=90)
+        self.assertEqual(built.returncode, 0, built.stderr.decode())
+        self.assertEqual(built.stdout.strip(), b'42')
+        final = self.invoke('inventory', home, self.root / 'submodule-final.json')
+        self.invoke('verify', home, final['receipt_path'])
+
     @unittest.skipUnless(shutil.which('git'), 'Git not installed')
     def test_only_locked_git_database_is_copied_and_can_recreate_checkout(self):
         database, sha = self.make_git_database('selected-123')

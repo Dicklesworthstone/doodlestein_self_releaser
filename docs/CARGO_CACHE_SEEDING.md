@@ -60,11 +60,29 @@ bash src/cargo_cache.sh snapshot /home/builder/.cargo /srv/build/cargo-home \
 ```
 
 Lockfile-scoped selection retains matching registry archives and indexes plus
-Git databases containing locked revisions. It excludes extracted registry and
-Git sources and binds the lockfile digest in the selection receipt.
+Git databases containing locked revisions. It excludes extracted registry
+sources and ordinary Git checkouts and binds the lockfile digest in the
+selection receipt. A locked Git commit containing submodules also retains its
+exact matching checkout, including the nested object databases that Cargo
+cannot recreate offline from the parent database alone.
 A missing or incorrect download is not silently replaced with untrusted
 extracted source bytes. The caller's locked/offline metadata gate determines
 whether the resulting seed is complete before release compilation.
+
+Selected submodule checkouts may contain relative links to regular source files,
+such as `crate/LICENSE -> ../LICENSE`. The copier preserves the link text in a
+fresh symlink without reading the ambient target. The completed private inventory
+must resolve each link to a regular file inside that checkout; escaping, absolute,
+dangling, cyclic, directory, special-file and Git-administration links are refused.
+The same narrow copying rule applies when a prepared seed is copied into the
+build's private home, including when the original ambient Git root was relocated.
+
+Preserving the text matters: later source authentication checks the exact Git
+symlink blob, and replacing it with file contents would change the authenticated
+type. Cache copying does not authenticate source. The locked commit/tree/blob
+verifier still rejects a confined but uncommitted retarget and recursively
+confines each nested submodule's links to that submodule's own root. A link from
+a child to its parent or a sibling cannot acquire authority from a cache receipt.
 
 ## Relocated ambient cache roots
 
@@ -101,8 +119,9 @@ ambient-layout exception, including for a previously successful private copy.
 
 ## Integrity and later materialization
 
-Apart from the two ambient root aliases described above, selected cache entries
-still refuse symlinks, special files and external Git storage pointers.
+Apart from the two ambient root aliases and explicitly selected checkout file
+links described above, selected cache entries still refuse symlinks. Special
+files and external Git storage pointers remain refused throughout the cache.
 Ordinary selection holds root/database identities through the copy and rechecks
 them before publishing a seed receipt. It also
 binds every archive that authorizes omission of an extracted registry package,
@@ -148,7 +167,13 @@ repository have been moved away. A second test uses a tiny registry served on
 loopback, stops its server, moves the ambient cache away, and requires genuine
 locked/offline Cargo to reconstruct and compile authentic archived source rather
 than a modified working copy. Neither test installs a toolchain or uses public
-network services; without the dependencies each reports an explicit skip. Git/tar reconstruction
+network services; without the dependencies each reports an explicit skip. A
+third real Cargo test uses a locked Git dependency with a submodule and file
+links in both repositories. It moves the original cache and both upstreams away,
+then compiles and runs with `--locked --offline`, consuming the preserved nested
+source and link targets. The source-authentication suite separately verifies the
+copied Git object chains and refuses retargeted links and nested-root escapes.
+Git/tar reconstruction
 alone is not claimed as native compiler, complete DSR orchestration, or public
 release qualification. Windows has its separate cache backend and is unchanged.
 No fleet performance improvement or exact dependency-minimality is claimed.
