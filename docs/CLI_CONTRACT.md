@@ -545,6 +545,21 @@ toolchain.
 
 Target logs and result receipts are isolated by task and attempt. Aggregation
 is deterministic in requested-platform order, then configured triple order.
+Workers start with stdin connected to the null device; only the coordinator
+reads the queued task records. A worker failure or timeout does not discard
+later tasks. Cancellation stops dispatch, drains started workers, and retains
+their interrupted attempt receipts. Queued tasks that have never run report
+`status: "skipped"` and `attempt: 0`, without a log or result path. They remain
+pending in run state, so exact-run resume starts their first attempt while
+reusing verified successful receipts and retrying interrupted attempts.
+Per-target JSON includes the retained `attempt`, `exit_code`, `log_path`, and
+`result_path` when available. A coordinator-recovered receipt records the
+observed `worker_exit_code` and `receipt_source: "coordinator"`; a missing
+receipt cannot turn a zero process exit into a successful build.
+The aggregate failed count includes all unsuccessful requested tasks, including
+skipped tasks. An interrupted run remains resumable and cannot publish an
+authoritative manifest.
+
 For native Rust builds, a `target_triples` list expands one platform
 into independent GNU/musl tasks. Each task records its selected `target_triple`
 and a `task_key` such as `linux/amd64@x86_64-unknown-linux-musl`; singleton and

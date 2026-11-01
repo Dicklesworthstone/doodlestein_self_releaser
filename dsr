@@ -4880,7 +4880,8 @@ EOF
         target_results_json=$(jq -c '[.targets[]? | select(type == "object" and (.platform | type == "string")) |
             {platform, host: (.host // ""), method: (.method // "native"),
              status: (if (.status // "") | IN("success", "ok", "passed") then "success"
-                      elif .status == "timeout" then "timeout" else "failed" end)}
+                      elif .status == "timeout" then "timeout"
+                      elif .status == "skipped" then "skipped" else "failed" end)}
             + (if (.artifact_path | type) == "string" then {artifact_path} else {} end)
             + (if (.artifact_paths | type) == "array" then {artifact_paths} else {} end)
             + (if (.target_triple | type) == "string" then {target_triple} else {} end)
@@ -4890,6 +4891,9 @@ EOF
             + (if (.build_influence_env | type) == "object" then {build_influence_env} else {} end)
             + (if (.cargo_isolation | type) == "object" then {cargo_isolation} else {} end)
             + (if (.log_path | type) == "string" then {log_path} else {} end)
+            + (if (.result_path | type) == "string" then {result_path} else {} end)
+            + (if (.attempt | type) == "number" then {attempt} else {} end)
+            + (if (.exit_code | type) == "number" then {exit_code} else {} end)
             + (if (.error | type) == "string" then {error} else {} end)
             + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \
             <<< "$result" 2>/dev/null) || target_results_json='[]'

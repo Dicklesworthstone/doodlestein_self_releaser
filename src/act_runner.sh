@@ -11773,7 +11773,7 @@ _act_run_target_worker() {
     local slot_task="${task_key//\//-}"
     slot_task="${slot_task//@/-}"
     local slot_id="${run_id}-${slot_task}-attempt-${attempt}"
-    local slot_acquired=false
+    local slot_requested=false
 
     _act_write_worker_result() {
         local body="$1"
@@ -11828,6 +11828,41 @@ _act_run_target_worker() {
         fi
     fi
 
+    local worker_pid="" worker_launch_pending=false worker_cancelled=false
+    _act_worker_release_slot() {
+        # Release is ownership-checked and safe when no slot was granted. Mark
+        # the request before acquisition so cancellation between grant and
+        # return cannot strand this attempt's capacity lease.
+        if $slot_requested && declare -F selector_release_slot &>/dev/null; then
+            selector_release_slot "$host" "$slot_id" >/dev/null 2>&1 || true
+            slot_requested=false
+        fi
+    }
+
+    _act_worker_cancel() {
+        worker_cancelled=true
+        # A trap can run between the background fork and assigning $!. Defer
+        # cleanup until the exact child process group has been recorded.
+        $worker_launch_pending && return 0
+        trap '' INT TERM
+        if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$worker_pid" 2>/dev/null; then
+            kill -TERM -- "-$worker_pid" 2>/dev/null || kill -TERM "$worker_pid" 2>/dev/null || true
+            wait "$worker_pid" 2>/dev/null || true
+        fi
+        # Preserve a completed receipt if cancellation raced its publication.
+        # Otherwise retain an actual interrupted attempt for exact-run resume.
+        if [[ ! -e "$result_path" && ! -L "$result_path" ]]; then
+            local cancelled_result
+            cancelled_result=$(jq -nc --arg target "$target" --arg host "$host" \
+                '{platform: $target, host: $host, status: "failed", exit_code: 130,
+                  error: "Target interrupted"}') &&
+                _act_write_worker_result "$cancelled_result" || true
+        fi
+        exit 130
+    }
+    trap _act_worker_release_slot EXIT
+    trap _act_worker_cancel INT TERM
+
     if declare -F selector_acquire_slot &>/dev/null; then
         # A target whose host is at its concurrency limit queues for a slot
         # rather than failing: its budget is one build timeout (the longest a
@@ -11838,6 +11873,7 @@ _act_run_target_worker() {
             slot_wait_budget=99999
         fi
         local slot_status=0 slot_wait_started=$SECONDS
+        slot_requested=true
         DSR_SELECTOR_WAIT_TIMEOUT="$slot_wait_budget" \
             selector_acquire_slot "$host" "$slot_id" --wait || slot_status=$?
         if [[ $slot_status -ne 0 ]]; then
@@ -11850,47 +11886,31 @@ _act_run_target_worker() {
             slot_failure=$(jq -nc --arg target "$target" --arg host "$host" --arg error "$slot_error" \
                 '{platform: $target, host: $host, status: "failed", exit_code: 2,
                   error: $error}')
-            _act_write_worker_result "$slot_failure" || return 4
+            if ! _act_write_worker_result "$slot_failure"; then
+                _act_worker_release_slot
+                trap - EXIT INT TERM
+                return 4
+            fi
+            _act_worker_release_slot
+            trap - EXIT INT TERM
             return 2
         fi
-        slot_acquired=true
     fi
-
-    _act_worker_release_slot() {
-        if $slot_acquired && declare -F selector_release_slot &>/dev/null; then
-            selector_release_slot "$host" "$slot_id" >/dev/null 2>&1 || true
-            slot_acquired=false
-        fi
-    }
-
-    local worker_pid=""
-    _act_worker_cancel() {
-        # Ignore repeated signals while the first cancellation drains the
-        # dedicated build process group and releases the host slot.
-        trap '' INT TERM
-        if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$worker_pid" 2>/dev/null; then
-            # Job control gives the target and all of its descendants a
-            # dedicated process group, so cancellation does not orphan ssh,
-            # compilers, or user build commands.
-            kill -TERM -- "-$worker_pid" 2>/dev/null || kill -TERM "$worker_pid" 2>/dev/null || true
-            wait "$worker_pid" 2>/dev/null || true
-        fi
-        exit 130
-    }
-    trap _act_worker_release_slot EXIT
-    trap _act_worker_cancel INT TERM
 
     local worker_status=0 result receipts result_status
     set -m
+    worker_launch_pending=true
     _act_build_orchestration_target \
         "$tool_name" "$version" "$run_id" "$target" \
         "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
         "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" \
         >> "$log_path" 2>&1 &
     worker_pid=$!
+    worker_launch_pending=false
     # The process group remains distinct after monitor mode is disabled; this
     # avoids interactive-style job-completion notices in coordinator logs.
     set +m
+    $worker_cancelled && _act_worker_cancel
     wait "$worker_pid" || worker_status=$?
     worker_pid=""
 
@@ -12796,9 +12816,12 @@ act_orchestrate_build() {
                       error: "Worker result purpose is missing or inconsistent"}')
             fi
         else
+            local receipt_exit="$worker_status"
+            [[ "$receipt_exit" -ne 0 ]] || receipt_exit=6
             finished_result=$(jq -nc --arg target "$finished_platform" --arg host "$host" \
-                --argjson exit_code "$worker_status" \
+                --argjson exit_code "$receipt_exit" --argjson worker_exit_code "$worker_status" \
                 '{platform: $target, host: $host, status: "failed", exit_code: $exit_code,
+                  worker_exit_code: $worker_exit_code,
                   error: "Worker result receipt missing or invalid"}')
         fi
         if [[ "$(jq -r '.status // ""' <<< "$finished_result")" == success ]] && \
@@ -12812,6 +12835,16 @@ act_orchestrate_build() {
             '. + {log_path: $log_path, result_path: $result_path, attempt: $attempt,
                   build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
             <<< "$finished_result")
+        if [[ ! -e "$result_path" && ! -L "$result_path" ]]; then
+            # Even a worker killed before installing its traps has a durable
+            # outcome. Identify coordinator recovery rather than pretending
+            # the child wrote a receipt; never replace existing evidence.
+            finished_result=$(jq -c '. + {receipt_source: "coordinator"}' <<< "$finished_result") || return 4
+            if ! (umask 077; set -o noclobber; printf '%s\n' "$finished_result" > "$result_path"); then
+                _log_error "Could not retain missing worker outcome for $finished_target"
+                return 4
+            fi
+        fi
         final_results["$finished_target"]="$finished_result"
         status=$(jq -r '.status // "unknown"' <<< "$finished_result")
 
@@ -12973,11 +13006,6 @@ act_orchestrate_build() {
             interrupted=true
             break
         fi
-        if ! (umask 077; set -o noclobber; : > "$log_path"); then
-            _log_error "Could not create immutable target log receipt: $log_path"
-            interrupted=true
-            break
-        fi
         host="act-local"
         if $strict_release_contract; then
             host=$(jq -er --arg target "$target" '.[$target]' <<< "$target_hosts_json") || return 4
@@ -13021,6 +13049,16 @@ act_orchestrate_build() {
             fi
         fi
 
+        # Do not reserve an attempt while waiting on another target's output.
+        # Cancellation there must leave queued tasks at zero attempts, without
+        # an empty immutable log that would prevent the next resume.
+        $interrupted && break
+        if ! (umask 077; set -o noclobber; : > "$log_path"); then
+            _log_error "Could not create immutable target log receipt: $log_path"
+            interrupted=true
+            break
+        fi
+
         if $state_available; then
             if ! build_state_update_target "$tool_name" "$version" "$task_key" "running" \
                 "$(jq -nc --arg host "$host" --arg log_path "$log_path" \
@@ -13035,11 +13073,14 @@ act_orchestrate_build() {
             fi
         fi
 
+        # Only this loop may read the remaining JSON task records. Isolate the
+        # whole worker, including capacity selection and all descendants, so
+        # an stdin-reading build or transport cannot silently eat queued tasks.
         DSR_NATIVE_OUTPUT_STAGE="$output_stage" \
         _act_run_target_worker "$tool_name" "$version" "$run_id" "$target" "$attempt" \
             "$log_path" "$result_path" "$strict_release_contract" \
             "$release_contract_json" "$source_roots_json" "$git_sha" "$git_ref" "$host" "$build_purpose" \
-            "$selected_triple" "$task_key" "$target_sync_receipt" &
+            "$selected_triple" "$task_key" "$target_sync_receipt" </dev/null &
         worker_pids+=("$!")
         worker_output_paths+=("$output_paths")
         worker_targets+=("$task_key")
@@ -13050,6 +13091,13 @@ act_orchestrate_build() {
         worker_hosts+=("$host")
         worker_attempts+=("$attempt")
         active_workers=$((active_workers + 1))
+
+        # Cancellation may arrive while the new worker is being registered.
+        # Include that worker in cleanup once its PID and receipts are known.
+        if $interrupted; then
+            _act_cancel_parallel_workers
+            break
+        fi
 
         if (( active_workers >= parallel_jobs )); then
             _act_reap_one_worker || interrupted=true
@@ -13069,16 +13117,30 @@ act_orchestrate_build() {
         task_key=$(jq -r '.key' <<< "$task_json")
         selected_triple=""
         [[ "$task_key" == "$target" ]] || selected_triple=$(jq -r '.target_triple' <<< "$task_json")
-        local ordered_result="${final_results[$task_key]:-}"
+        local ordered_result="${final_results[$task_key]:-}" undispatched_attempts=0
         if [[ -z "$ordered_result" && $state_available == true ]]; then
-            ordered_result=$(build_state_get "$tool_name" "$version" "$run_id" | \
-                jq -c --arg target "$target" --arg task_key "$task_key" \
-                    '.target_statuses[$task_key].result // {platform: $target, status: "failed",
-                     exit_code: 6, error: "No target result"}')
+            local ordered_entry
+            ordered_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
+                jq -c --arg task_key "$task_key" '.target_statuses[$task_key] // {}') || return 4
+            ordered_result=$(jq -c '.result // empty' <<< "$ordered_entry") || return 4
+            undispatched_attempts=$(jq -er '(.attempts // 0) |
+                select(type == "number" and . >= 0 and floor == .)' <<< "$ordered_entry") || return 4
         fi
         if [[ -z "$ordered_result" ]]; then
+            # No worker result means this invocation never dispatched this
+            # task. Do not invent a failed build or an execution receipt.
+            local dispatch_exit=6 dispatch_error="Target was not dispatched"
+            if $interrupted; then
+                dispatch_exit=130
+                dispatch_error="Interrupted before target dispatch"
+            else
+                _log_error "No worker was dispatched for requested task $task_key"
+            fi
             ordered_result=$(jq -nc --arg target "$target" \
-                '{platform: $target, status: "failed", exit_code: 6, error: "No target result"}')
+                --argjson exit_code "$dispatch_exit" --arg error "$dispatch_error" \
+                --argjson attempt "$undispatched_attempts" \
+                '{platform: $target, status: "skipped", attempt: $attempt,
+                  exit_code: $exit_code, error: $error}')
         fi
         if [[ "$(jq -r '.status // empty' <<< "$ordered_result")" == "success" ]] && \
            { ! _act_build_purpose_matches "$ordered_result" "$build_purpose" "$strict_release_contract" || \

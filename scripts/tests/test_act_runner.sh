@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh [--workflow-isolation-only]
+# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -1653,8 +1653,241 @@ PY
     fi
 }
 
+# Cancellation before compilation must retain a real interrupted attempt and
+# release only its own capacity. The final case drives real output-conflict
+# scheduling and exact-run resume; only the compiler itself is a fixture.
+test_worker_admission_cancellation() {
+    log_test "Worker cancellation during capacity and output-conflict waits"
+    local dependency
+    for dependency in python3 jq yq; do
+        if ! command -v "$dependency" >/dev/null; then
+            log_skip "worker admission cancellation requires $dependency"
+            return
+        fi
+    done
+    if python3 - "$PROJECT_ROOT" "${DSR_TEST_ACT_RUNNER:-$SRC_DIR/act_runner.sh}" <<'PY'
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+project, module = map(Path, sys.argv[1:])
+root = Path(tempfile.mkdtemp(prefix='dsr-admission-cancel-'))
+print('Retained admission cancellation fixture: ' + str(root), flush=True)
+checks = 0
+
+
+def check(label, valid):
+    global checks
+    if not valid:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def stop(process):
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+
+def wait_for(process, predicate, label):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    raise AssertionError(label)
+
+
+def launch(case, script, phase, extra=None):
+    env = dict(os.environ, DSR_ADMISSION_PROJECT=str(project), DSR_ADMISSION_MODULE=str(module),
+               DSR_ADMISSION_CASE=str(case), DSR_ADMISSION_PHASE=phase,
+               DSR_CONFIG_DIR=str(case / 'config'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+               DSR_STATE_DIR=str(case / 'state'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
+               ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
+               DSR_DISABLE_HOST_SELECTOR='1', DSR_SELECTOR_LOCK_TIMEOUT='2',
+               DSR_SELECTOR_WAIT_TIMEOUT='30', DSR_SELECTOR_POLL_MAX='1', NO_COLOR='1')
+    env.pop('DSR_BUILD_LOCK_HELD_BY_CALLER', None)
+    env.update(extra or {})
+    with open(case / (phase + '.stdout'), 'wb') as out, open(case / (phase + '.stderr'), 'wb') as err:
+        return subprocess.Popen(['bash', '-c', script], env=env, stdin=subprocess.DEVNULL,
+                                stdout=out, stderr=err, start_new_session=True)
+
+
+def fixture(name, capacity=1):
+    case = root / name
+    for directory in ('config/repos.d', 'state', 'source', 'output'):
+        (case / directory).mkdir(parents=True, exist_ok=True)
+    (case / 'config/hosts.yaml').write_text(json.dumps({'hosts': {
+        'shared': {'platform': 'linux/amd64', 'connection': 'local', 'concurrency': capacity}}}))
+    return case
+
+
+check('stdin isolation tests require the actual null device', stat.S_ISCHR(os.stat(os.devnull).st_mode))
+holder_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+selector_acquire_slot shared unrelated || exit 1
+trap 'selector_release_slot shared unrelated' EXIT
+trap 'exit 0' INT TERM
+: > "$DSR_ADMISSION_CASE/holder.ready"
+while :; do sleep 0.05; done
+'''
+worker_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+source "$DSR_ADMISSION_MODULE"
+act_platform_uses_act() { return 0; }
+_act_build_orchestration_target() {
+    : > "$DSR_ADMISSION_CASE/unexpected-build"
+    cat > "$DSR_ADMISSION_CASE/unexpected.stdin"
+    return 99
+}
+if [[ "$DSR_ADMISSION_PHASE" == waiting ]]; then
+    # Observe the real selector's first capacity backoff, after its locked
+    # attempt found the holder. Do not substitute the lease or its result.
+    sleep() { : > "$DSR_ADMISSION_CASE/worker.ready"; command sleep "$@"; }
+else
+    # The real lease has been atomically granted, but acquire has not returned.
+    _sel_log_ok() {
+        : > "$DSR_ADMISSION_CASE/worker.ready"
+        while :; do command sleep 0.05; done
+    }
+fi
+_act_run_target_worker fixture 1.0.0 55555555-5555-4555-8555-555555555555 \
+    linux/amd64 1 "$DSR_ADMISSION_CASE/worker.log" "$DSR_ADMISSION_CASE/result.json" \
+    false null '{}' '' '' shared release
+'''
+for mode in ('waiting', 'granted'):
+    case = fixture('capacity-' + mode)
+    (case / 'worker.log').touch()
+    holder = worker = None
+    locks = case / 'state/selector/locks/shared'
+    try:
+        if mode == 'waiting':
+            holder = launch(case, holder_script, 'holder')
+            wait_for(holder, lambda: (case / 'holder.ready').exists(), 'capacity holder did not start')
+            retained_holder = (locks / 'unrelated.lock').read_bytes()
+        worker = launch(case, worker_script, mode)
+        wait_for(worker, lambda: (case / 'worker.ready').exists(), 'worker did not reach ' + mode)
+        own_slot = locks / '55555555-5555-4555-8555-555555555555-linux-amd64-attempt-1.lock'
+        check(mode + ': the barrier observes the intended real lease state', own_slot.exists() == (mode == 'granted'))
+        worker.send_signal(signal.SIGTERM)
+        check(mode + ': interrupted admission preserves exit 130', worker.wait(timeout=8) == 130)
+        check(mode + ': cancellation retains an immutable attempt receipt',
+              (case / 'result.json').is_file() and read(case / 'result.json')['exit_code'] == 130 and
+              read(case / 'result.json')['status'] == 'failed' and
+              read(case / 'result.json')['task_key'] == 'linux/amd64')
+        check(mode + ': capacity admission never starts compilation', not (case / 'unexpected-build').exists())
+        check(mode + ': cancellation leaves no owned capacity lease', not own_slot.exists())
+        if holder is not None:
+            check('waiting: cancellation preserves the live unrelated holder and its exact lease',
+                  holder.poll() is None and (locks / 'unrelated.lock').read_bytes() == retained_holder)
+    finally:
+        stop(worker)
+        stop(holder)
+
+case = fixture('output-conflict', capacity=2)
+targets = ['linux/amd64', 'linux/arm64', 'darwin/arm64']
+identity = str(uuid.uuid4())
+(case / 'config/repos.d/conflictfixture.yaml').write_text(json.dumps({
+    'tool_name': 'conflictfixture', 'repo': 'fixture/conflictfixture', 'language': 'go',
+    'local_path': str(case / 'source'), 'binary_name': 'fixture', 'targets': targets,
+    'env': {'GOBIN': str(case / 'shared-output')},
+    'cross_compile': {target: {'host': 'shared'} for target in targets}}))
+coordinator_script = r'''
+source "$DSR_ADMISSION_PROJECT/src/logging.sh"
+source "$DSR_ADMISSION_PROJECT/src/config.sh"
+source "$DSR_ADMISSION_PROJECT/src/build_state.sh"
+source "$DSR_ADMISSION_PROJECT/src/host_selector.sh"
+source "$DSR_ADMISSION_MODULE"
+act_run_native_build() {
+    local slug="${2//\//-}.attempt-$attempt" artifact
+    printf '%s %s\n' "$2" "$attempt" >> "$DSR_ADMISSION_CASE/invocations"
+    cat > "$DSR_ADMISSION_CASE/$slug.stdin"
+    if [[ "$DSR_ADMISSION_PHASE" == first ]]; then while :; do sleep 0.05; done; fi
+    artifact="$DSR_ADMISSION_CASE/output/$slug.bin"
+    printf 'artifact %s\n' "$2" > "$artifact"
+    jq -nc --arg platform "$2" --arg path "$artifact" \
+        '{platform:$platform,method:"native",status:"success",exit_code:0,artifact_path:$path,artifact_paths:[$path]}'
+}
+args=(--run-id "$DSR_ADMISSION_RUN")
+[[ "$DSR_ADMISSION_PHASE" != resume ]] || args=(--resume-run-id "$DSR_ADMISSION_RUN")
+act_orchestrate_build conflictfixture 1.0.0 --parallel-jobs 2 --no-source-sync-gate \
+    --output-dir "$DSR_ADMISSION_CASE/output" "${args[@]}"
+'''
+process = None
+try:
+    process = launch(case, coordinator_script, 'first', {'DSR_ADMISSION_RUN': identity})
+    wait_for(process, lambda: (case / 'invocations').exists() and
+             b'waiting for that build to finish' in (case / 'first.stderr').read_bytes(),
+             'second target did not reach the real shared-output wait')
+    process.send_signal(signal.SIGTERM)
+    check('output conflict: cancellation drains the active worker and returns 130', process.wait(timeout=10) == 130)
+    first = read(case / 'first.stdout')
+    workspace = case / 'state/builds/conflictfixture/1.0.0' / identity
+    state = read(workspace / 'state.json')
+    check('output conflict: only the admitted target ran', (case / 'invocations').read_text().splitlines() == [targets[0] + ' 1'])
+    for target, row in zip(targets[1:], first['targets'][1:]):
+        saved = state['target_statuses'][target]
+        check('output conflict: ' + target + ' stays pending with zero attempts',
+              saved['status'] == 'pending' and saved['attempts'] == 0 and row['status'] == 'skipped')
+    check('output conflict: no queued target reserves an immutable log or result',
+          not any(p.name.startswith(('002-', '003-'))
+                  for directory in ('logs', 'results') for p in (workspace / directory).iterdir()))
+    receipts = {p: hashlib.sha256(p.read_bytes()).hexdigest()
+                for directory in ('logs', 'results') for p in (workspace / directory).iterdir() if p.is_file()}
+    process = launch(case, coordinator_script, 'resume', {'DSR_ADMISSION_RUN': identity})
+    check('output conflict: exact-run resume completes successfully', process.wait(timeout=30) == 0)
+    resumed = read(case / 'resume.stdout')
+    state = read(workspace / 'state.json')
+    check('output conflict: every queued target runs once and the interrupted target retries once',
+          Counter((case / 'invocations').read_text().splitlines()) ==
+          Counter([targets[0] + ' 1', targets[0] + ' 2', targets[1] + ' 1', targets[2] + ' 1']))
+    check('output conflict: resume preserves ordered results and truthful attempt counters',
+          resumed['run_id'] == identity and resumed['summary'] == {'total': 3, 'success': 3, 'failed': 0} and
+          [r['platform'] for r in resumed['targets']] == targets and
+          [state['target_statuses'][target]['attempts'] for target in targets] == [2, 1, 1] and
+          state['status'] == 'targets-complete')
+    check('output conflict: resume preserves prior immutable receipt bytes',
+          all(hashlib.sha256(p.read_bytes()).hexdigest() == digest for p, digest in receipts.items()))
+    check('output conflict: stdin-reading descendants receive EOF on every attempt',
+          len(list(case.glob('*.stdin'))) == 4 and all(p.stat().st_size == 0 for p in case.glob('*.stdin')))
+finally:
+    stop(process)
+print('Worker admission cancellation: %d passed, 0 failed' % checks, flush=True)
+PY
+    then
+        log_pass "capacity and output-conflict cancellation preserve leases, receipts and resume"
+    else
+        log_fail "worker admission cancellation regression"
+    fi
+}
+
 # Main
 main() {
+    if [[ "${1:-}" == "--worker-admission-cancel-only" ]]; then
+        test_worker_admission_cancellation
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     if [[ "${1:-}" == "--workflow-isolation-only" ]]; then
         test_concurrent_workflow_isolation
         [[ "$FAIL_COUNT" -eq 0 ]]
@@ -1699,6 +1932,7 @@ main() {
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
     test_workflow_process_cancellation
+    test_worker_admission_cancellation
     test_unix_native_build_guard
 
     echo ""

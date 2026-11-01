@@ -105,6 +105,21 @@
           "type": "string",
           "description": "Path to build log"
         },
+        "result_path": {
+          "type": "string",
+          "description": "Path to the retained target attempt result; absent when no attempt ran"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Retained target attempt number, or zero when the task has never been dispatched"
+        },
+        "exit_code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Target outcome code; skipped targets use the dispatch or interruption reason, not a compiler exit"
+        },
         "error": {
           "type": "string",
           "description": "Error message if failed"

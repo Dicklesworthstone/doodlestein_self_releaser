@@ -19,6 +19,313 @@ pass() { echo -e "${GREEN}✓${NC} $1"; ((PASS++)); }
 fail() { echo -e "${RED}✗${NC} $1"; ((FAIL++)); }
 skip() { echo -e "${YELLOW}○${NC} $1"; ((SKIP++)); }
 
+# Exercise the real task stream, worker wrapper, timeout, immutable receipts,
+# state transitions and resume admission. Normal cases replace only native
+# compilation and capacity acquisition; both deliberately read stdin. Reading in the slot
+# prelude catches a redirect placed too late, inside the native build alone.
+test_worker_stdin_isolation() {
+    local project_root required_tool
+    [[ -c /dev/null ]] || { echo 'Worker stdin tests require a working /dev/null device' >&2; return 1; }
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for required_tool in python3 jq yq; do
+        command -v "$required_tool" >/dev/null || { echo "Missing test dependency: $required_tool" >&2; return 77; }
+    done
+    if ! command -v timeout >/dev/null && ! command -v gtimeout >/dev/null; then
+        echo 'Missing test dependency: GNU timeout or gtimeout' >&2
+        return 77
+    fi
+    python3 - "$project_root" "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" "${1:-all}" <<'PY'
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+project, module = map(Path, sys.argv[1:3])
+root = Path(tempfile.mkdtemp(prefix='dsr-worker-stdin-'))
+print('Retained worker stdin fixture: ' + str(root), flush=True)
+targets = ['linux/amd64', 'linux/arm64', 'darwin/amd64',
+           'darwin/arm64', 'windows/amd64', 'windows/arm64']
+checks = 0
+
+
+def check(label, valid):
+    global checks
+    if not valid:
+        raise AssertionError(label)
+    checks += 1
+    print('PASS: ' + label, flush=True)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def events(case):
+    path = case / 'invocations.jsonl'
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def wait_for(process, predicate, label):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    raise AssertionError(label)
+
+
+worker = root / 'native.py'
+worker.write_text(r'''import json, os, stat, sys, time
+from pathlib import Path
+case, target, attempt, mode = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+slug = target.replace('/', '-') + '.attempt-' + str(attempt)
+descriptor, null = os.fstat(0), os.stat(os.devnull)
+is_null = stat.S_ISCHR(descriptor.st_mode) and descriptor.st_rdev == null.st_rdev
+(case / (slug + '.child.stdin')).write_bytes(sys.stdin.buffer.read())
+event = dict(target=target, attempt=attempt, mode=mode, pid=os.getpid(), stdin_is_null=is_null)
+fd = os.open(case / 'invocations.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+os.write(fd, (json.dumps(event) + '\n').encode())
+os.close(fd)
+if mode == 'cancel' or (mode == 'timeout' and target == 'linux/amd64'):
+    while True:
+        time.sleep(0.05)
+if mode == 'failure' and target == 'linux/amd64':
+    print(json.dumps(dict(platform=target, method='native', status='failed', exit_code=9,
+                         error='deliberate stdin-consuming build failure')), flush=True)
+    raise SystemExit(9)
+artifact = case / 'output' / (slug + '.bin')
+artifact.write_bytes(('artifact for ' + target + '\n').encode())
+print(json.dumps(dict(platform=target, method='native', status='success', exit_code=0,
+                     artifact_path=str(artifact), artifact_paths=[str(artifact)])), flush=True)
+''')
+
+driver = root / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_STDIN_PROJECT/src/logging.sh"
+source "$DSR_STDIN_PROJECT/src/config.sh"
+source "$DSR_STDIN_PROJECT/src/build_state.sh"
+source "$DSR_STDIN_MODULE"
+selector_acquire_slot() {
+    cat > "$DSR_STDIN_CASE/prelude.$2.stdin"
+    printf 'ready\n' > "$DSR_STDIN_CASE/prelude.$2.ready"
+    while [[ ! -f "$DSR_STDIN_CASE/release" ]]; do sleep 0.02; done
+}
+selector_release_slot() {
+    printf '%s\n' "$2" >> "$DSR_STDIN_CASE/released-slots"
+}
+act_run_native_build() {
+    local deadline=10
+    [[ "$DSR_STDIN_MODE" != cancel ]] || deadline=60
+    if [[ "$DSR_STDIN_MODE" == timeout && "$2" == linux/amd64 ]]; then deadline=1; fi
+    _act_run_with_timeout "$deadline" python3 "$DSR_STDIN_WORKER" \
+        "$DSR_STDIN_CASE" "$2" "$attempt" "$DSR_STDIN_MODE"
+}
+# Explicit fault injection at the worker boundary tests the real parent's
+# recovery of a missing receipt, including an actual uncatchable child death.
+case "$DSR_STDIN_MODE" in
+    missing-receipt) _act_run_target_worker() { return 0; } ;;
+    killed-worker) _act_run_target_worker() { kill -KILL "$BASHPID"; } ;;
+esac
+args=(--run-id "$DSR_STDIN_RUN")
+if [[ "$DSR_STDIN_PHASE" == resume ]]; then args=(--resume-run-id "$DSR_STDIN_RUN"); fi
+act_orchestrate_build stdinfixture 1.0.0 --parallel-jobs "$DSR_STDIN_JOBS" \
+    --no-source-sync-gate --output-dir "$DSR_STDIN_CASE/output" "${args[@]}"
+''')
+
+
+def fixture(jobs, mode):
+    case = root / ('jobs-%d-%s' % (jobs, mode))
+    for directory in ('config/repos.d', 'state', 'cache', 'source', 'output'):
+        (case / directory).mkdir(parents=True, exist_ok=True)
+    hosts = {target: 'host-' + target.replace('/', '-') for target in targets}
+    (case / 'config/hosts.yaml').write_text(json.dumps({
+        'schema_version': '1.0.0', 'platform_mapping': hosts,
+        'hosts': {host: {'platform': target, 'connection': 'local'}
+                  for target, host in hosts.items()}}))
+    (case / 'config/repos.d/stdinfixture.yaml').write_text(json.dumps({
+        'tool_name': 'stdinfixture', 'repo': 'fixture/stdinfixture', 'language': 'go',
+        'local_path': str(case / 'source'), 'binary_name': 'fixture',
+        'targets': targets, 'cross_compile': {target: {'host': host}
+                                             for target, host in hosts.items()}}))
+    return case, str(uuid.uuid4())
+
+
+def invoke(case, identity, jobs, mode, phase):
+    env = dict(os.environ, DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+               DSR_CONFIG_DIR=str(case / 'config'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
+               ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
+               DSR_STDIN_PROJECT=str(project), DSR_STDIN_MODULE=str(module),
+               DSR_STDIN_WORKER=str(worker), DSR_STDIN_CASE=str(case), DSR_STDIN_RUN=identity,
+               DSR_STDIN_JOBS=str(jobs), DSR_STDIN_MODE=mode, DSR_STDIN_PHASE=phase,
+               DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='3', NO_COLOR='1')
+    env.pop('DSR_BUILD_LOCK_HELD_BY_CALLER', None)
+    out = open(case / (phase + '.stdout'), 'wb')
+    err = open(case / (phase + '.stderr'), 'wb')
+    process = subprocess.Popen(['bash', str(driver)], env=env, stdin=subprocess.DEVNULL,
+                               stdout=out, stderr=err, start_new_session=True)
+    try:
+        if phase == 'first' and mode not in ('missing-receipt', 'killed-worker'):
+            # Each admitted worker blocks in its capacity prelude. The next
+            # batch cannot start until we release this exact initial wave.
+            wait_for(process, lambda: len(list(case.glob('prelude.*.ready'))) == jobs,
+                     str(case) + ': initial worker wave did not reach its barrier')
+            (case / 'release').write_text('continue\n')
+            if mode == 'cancel':
+                wait_for(process, lambda: len(events(case)) == jobs,
+                         str(case) + ': cancellable descendants did not start')
+                process.send_signal(signal.SIGTERM)
+        code = process.wait(timeout=45)
+    except BaseException:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+        raise
+    finally:
+        out.close()
+        err.close()
+    value = read(case / (phase + '.stdout'))
+    state_path = case / 'state/builds/stdinfixture/1.0.0' / identity / 'state.json'
+    state = read(state_path)
+    (case / (phase + '.state.json')).write_text(json.dumps(state) + '\n')
+    expected_code = {'success': 0, 'failure': 1, 'timeout': 1, 'cancel': 130,
+                     'missing-receipt': 6, 'killed-worker': 6}[mode]
+    check(case.name + '/' + phase + ': aggregate preserves the real exit status', code == expected_code)
+    check(case.name + '/' + phase + ': exactly six ordered target rows',
+          value['run_id'] == identity and value['summary']['total'] == 6 and
+          [row['platform'] for row in value['targets']] == targets)
+    return value, state
+
+
+def verify_attempts(case, value, state, expected_counts, expected_codes, label, dispatch_counts=None):
+    seen = events(case)
+    successes = sum(target in expected_counts and target not in expected_codes for target in targets)
+    check(label + ': aggregate counts match completed and unsuccessful targets',
+          value['summary'] == {'total': 6, 'success': successes, 'failed': 6 - successes} and
+          value['status'] == ('success' if successes == 6 else 'partial' if successes else 'failed'))
+    check(label + ': actual invocations match each configured target exactly',
+          Counter(event['target'] for event in seen) == Counter(expected_counts))
+    check(label + ': worker prelude and descendant receive isolated stdin',
+          all(event['stdin_is_null'] for event in seen) and
+          len(list(case.glob('prelude.*.stdin'))) == len(seen) and
+          all(path.stat().st_size == 0 for path in case.glob('*.stdin')))
+    check(label + ': every acquired slot is released',
+          len((case / 'released-slots').read_text().splitlines()) == len(seen))
+    for row in value['targets']:
+        target = row['platform']
+        saved = state['target_statuses'][target]
+        expected = (dispatch_counts if dispatch_counts is not None else expected_counts).get(target, 0)
+        check(label + ': ' + target + ' attempt count matches execution',
+              saved['attempts'] == expected and row['attempt'] == expected)
+        if not expected:
+            check(label + ': ' + target + ' remains pending without fabricated receipts',
+                  row['status'] == 'skipped' and row['exit_code'] == 130 and
+                  saved['status'] == 'pending' and not saved.get('result') and
+                  not any(row.get(key) for key in ('log_path', 'result_path', 'resume_artifacts')))
+            continue
+        code = expected_codes.get(target, 0)
+        receipt = Path(row['result_path'])
+        check(label + ': ' + target + ' has real immutable execution receipts',
+              Path(row['log_path']).is_file() and receipt.is_file() and
+              read(receipt)['exit_code'] == code and row['exit_code'] == code and
+              saved['result']['exit_code'] == code and
+              saved['status'] == ('completed' if code == 0 else 'failed'))
+        if code == 0:
+            frozen = row['resume_artifacts']
+            check(label + ': ' + target + ' artifact bytes match the frozen receipt',
+                  row['status'] == 'success' and len(frozen) == 1 and
+                  frozen[0]['sha256'] == hashlib.sha256(Path(frozen[0]['path']).read_bytes()).hexdigest() and
+                  frozen[0]['size_bytes'] == Path(frozen[0]['path']).stat().st_size)
+        else:
+            check(label + ': ' + target + ' failure cannot supply successful artifacts',
+                  row['status'] == 'failed' and not row.get('resume_artifacts'))
+    completed = not expected_codes and all(expected_counts.get(target, 0) for target in targets)
+    check(label + ': target completion does not claim finalized publication',
+          (state['status'] == 'targets-complete') == completed and
+          state['status'] != 'completed' and not (case / 'output/.dsr-build-purpose.json').exists())
+
+
+for jobs in (() if sys.argv[3] == '--coordinator-receipt-only' else (1, 3)):
+    for mode in ('success', 'failure', 'timeout', 'cancel'):
+        case, identity = fixture(jobs, mode)
+        first, state = invoke(case, identity, jobs, mode, 'first')
+        counts = {target: 1 for target in (targets[:jobs] if mode == 'cancel' else targets)}
+        codes = ({target: 130 for target in targets[:jobs]} if mode == 'cancel' else
+                 {'linux/amd64': {'failure': 9, 'timeout': 124}[mode]}
+                 if mode in ('failure', 'timeout') else {})
+        verify_attempts(case, first, state, counts, codes, case.name + '/first')
+        if mode == 'cancel':
+            for event in events(case):
+                probe = subprocess.run(['ps', '-p', str(event['pid']), '-o', 'stat='], capture_output=True)
+                check(case.name + ': cancelled descendant has stopped',
+                      probe.returncode != 0 or probe.stdout.strip().startswith(b'Z'))
+        # Preserve failed and successful evidence alike. A retry may create
+        # new receipts, but cannot alter any prior attempt's logs or bytes.
+        immutable = {path: path.read_bytes() for directory in ('output', 'logs', 'results')
+                     for path in ((case / directory) if directory == 'output' else
+                                  case / 'state/builds/stdinfixture/1.0.0' / identity / directory).rglob('*')
+                     if path.is_file()}
+        resumed, resumed_state = invoke(case, identity, jobs, 'success', 'resume')
+        resumed_counts = {target: counts.get(target, 0) + (0 if target in counts and target not in codes else 1)
+                          for target in targets}
+        verify_attempts(case, resumed, resumed_state, resumed_counts, {}, case.name + '/resume')
+        check(case.name + ': resume reuses only completed targets',
+              all(bool(row.get('resume_reused')) == (row['platform'] in counts and row['platform'] not in codes)
+                  for row in resumed['targets']))
+        check(case.name + ': retries preserve all earlier attempt evidence',
+              all(path.read_bytes() == contents for path, contents in immutable.items()))
+
+for jobs in (1, 3):
+    for mode, observed_exit in (('missing-receipt', 0), ('killed-worker', 137)):
+        case, identity = fixture(jobs, mode)
+        first, state = invoke(case, identity, jobs, mode, 'first')
+        check(case.name + ': lost worker receipts cannot report compilation or publication success',
+              not events(case) and first['status'] == 'failed' and state['status'] == 'failed' and
+              first['summary'] == {'total': 6, 'success': 0, 'failed': 6} and
+              not (case / 'output/.dsr-build-purpose.json').exists())
+        immutable = {}
+        for row in first['targets']:
+            saved = state['target_statuses'][row['platform']]
+            result_path, log_path = Path(row['result_path']), Path(row['log_path'])
+            receipt = read(result_path)
+            check(case.name + ': ' + row['platform'] + ' retains the observed child exit separately',
+                  row['status'] == 'failed' and row['exit_code'] == (observed_exit or 6) and
+                  row['worker_exit_code'] == observed_exit and row['receipt_source'] == 'coordinator' and
+                  row['attempt'] == 1 and saved['attempts'] == 1 and saved['status'] == 'failed' and
+                  receipt == saved['result'] and receipt == row and not receipt.get('resume_artifacts'))
+            immutable[result_path] = result_path.read_bytes()
+            immutable[log_path] = log_path.read_bytes()
+        (case / 'release').write_text('continue\n')
+        resumed, resumed_state = invoke(case, identity, jobs, 'success', 'resume')
+        verify_attempts(case, resumed, resumed_state, {target: 1 for target in targets}, {},
+                        case.name + '/resume', {target: 2 for target in targets})
+        check(case.name + ': exact resume runs each compiler once and preserves failed receipts',
+              all(not row.get('resume_reused') for row in resumed['targets']) and
+              all(path.read_bytes() == contents for path, contents in immutable.items()))
+
+(root / 'summary.json').write_text(json.dumps({'checks': checks, 'failures': 0}) + '\n')
+print('Worker stdin isolation: %d checks, 0 failures' % checks, flush=True)
+PY
+}
+
+if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ]]; then
+    test_worker_stdin_isolation "$1"
+    exit $?
+fi
+
 # Setup test environment BEFORE sourcing (critical for config path resolution)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEMP_DIR=$(mktemp -d)
@@ -4308,6 +4615,12 @@ if test_worker_capacity_wait_budget; then
     pass "capacity-limited targets queue for one build timeout and fail with an actionable error"
 else
     fail "capacity-limited target wait budget or failure message is wrong"
+fi
+
+if test_worker_stdin_isolation; then
+    pass "stdin-consuming target workers preserve dispatch, receipts, cancellation and resume"
+else
+    fail "target worker stdin isolation or execution accounting regressed"
 fi
 
 # Cleanup

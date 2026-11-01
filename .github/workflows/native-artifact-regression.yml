@@ -8,6 +8,7 @@ on:
       - .github/workflows/native-artifact-regression.yml
       - scripts/tests/test_native_artifact_build.sh
       - scripts/tests/test_act_runner.sh
+      - scripts/tests/test_act_orchestration.sh
       - scripts/tests/test_act_runner_native.sh
       - scripts/tests/test_artifact_formats.sh
       - scripts/tests/test_generated_installer_transactions.sh
@@ -65,6 +66,7 @@ jobs:
             for tool in jq xz go minisign; do
               command -v "$tool" >/dev/null || brew install "$tool"
             done
+            if ! command -v timeout >/dev/null && ! command -v gtimeout >/dev/null; then brew install coreutils; fi
             if (( BASH_VERSINFO[0] < 4 )); then brew install bash; fi
             echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           fi
@@ -77,6 +79,14 @@ jobs:
           set -euo pipefail
           bash -n scripts/tests/test_act_runner.sh
           bash scripts/tests/test_act_runner.sh --workflow-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workflow-isolation.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate stdin-isolated target dispatch and exact-run resume
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_act_orchestration.sh
+          bash scripts/tests/test_act_orchestration.sh --stdin-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/stdin-isolation.log"
+          bash scripts/tests/test_act_runner.sh --worker-admission-cancel-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/admission-cancellation.log"
           test -z "$(git status --porcelain)"
       - name: Validate typed additional artifact admission
         shell: bash
