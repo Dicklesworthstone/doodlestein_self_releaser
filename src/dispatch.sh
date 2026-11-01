@@ -494,7 +494,10 @@ _dp_release_outbox() (
     # Whole-state validation above precedes every external side effect.
     indices=$(jq -r '.requests|keys[]' <<< "$plan") || return 1
     [[ -n "$indices" ]] || return 4
-    while IFS= read -r i; do
+    # Only the dispatcher reads task indices. Authentication, release guards
+    # and delivery descendants may read stdin; none may consume queued work.
+    # FD3 is scoped to this loop; inherited release/outbox locks use FD8/FD9.
+    while IFS= read -r -u 3 i; do
         outcome=$(jq -r --argjson i "$i" '.deliveries[$i].history[-1].outcome // "pending"' <<< "$state") || return 1
         [[ "$outcome" != accepted ]] || continue
         [[ "$inspect" != true ]] || continue
@@ -541,7 +544,7 @@ _dp_release_outbox() (
         oldhash=$(_dp_state_write "$file" "$next" "$oldhash" "$work" "$plan") || return $?
         state="$next"
         if [[ "$(jq -r '.outcome' <<< "$receipt")" == blocked ]]; then rc="$result"; break; fi
-    done <<< "$indices"
+    done 3<<< "$indices" </dev/null
     current=$(_dp_state_hash "$file") || return $?
     [[ "$current" == "$oldhash" ]] || return 2
     _dp_state_valid "$file" "$plan" || return 2

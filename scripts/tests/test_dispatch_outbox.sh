@@ -50,6 +50,9 @@ cat > "$WORK/bin/gh" <<'GH'
 #!/usr/bin/env bash
 set -uo pipefail
 [[ "$*" == 'auth token --hostname github.com' ]] || exit 9
+if [[ "${DP_STDIN_CONSUMER:-}" == auth ]]; then
+    cat >> "$DP_CASE/auth-stdin" || exit 9
+fi
 printf 'lookup\n' >> "$DP_CASE/auth-lookups"
 lookups=$(wc -l < "$DP_CASE/auth-lookups")
 if (( lookups == ${DP_AUTH_FAIL_AT:-0} )); then exit 1; fi
@@ -68,7 +71,7 @@ check() {
 new_case() {
     CASE="$WORK/cases/$1"; mkdir "$CASE"
     export DP_CASE="$CASE" DSR_STATE_DIR="$CASE/state" DSR_GH_TOKEN=fixture-token
-    unset DP_MODE DP_AUTH_FAIL_AT DP_PREPARE_FAIL DRY_RUN
+    unset DP_MODE DP_AUTH_FAIL_AT DP_PREPARE_FAIL DP_STDIN_CONSUMER DRY_RUN
     : > "$CASE/calls.jsonl"
 }
 capture() { status=0; "$@" > "$CASE/out" 2> "$CASE/err" || status=$?; }
@@ -88,6 +91,21 @@ with_rotating_auth() (
     unset -f gh secrets_get_gh_token
     "$@"
 )
+
+stdin_consuming_guard() {
+    printf '%s\n' "$1" >> "$DP_CASE/guard-lookups"
+    cat >> "$DP_CASE/guard-stdin"
+}
+
+stdin_six_release() {
+    if [[ "$DP_STDIN_CONSUMER" == auth ]]; then
+        with_rotating_auth release --repos "$stdin_six_repos"
+    else
+        _dp_config || return $?
+        _dp_release_outbox "$stdin_six_plan" "$DSR_STATE_DIR/dispatch" \
+            false false stdin_consuming_guard
+    fi
+}
 
 # Captured from the unchanged default plan at 4008703. Retained outboxes must
 # remain readable without changing request hashes or receiver delivery IDs.
@@ -119,6 +137,73 @@ check 'complete retry preserves state inode' test "$(stat -c %i "$STATE")" = "$i
 capture without_auth release --status
 check 'status is available without credentials' test "$status" -eq 0
 check 'status is read-only' cmp -s "$STATE" "$CASE/state.before"
+
+# Authentication and guard descendants deliberately read the coordinator's
+# stdin. Every planned destination must still get its own real HTTP attempt,
+# including destinations after a definitive failure and on exact-plan resume.
+stdin_six_repos=owner/a,owner/b,owner/c,owner/d,owner/e,owner/f
+stdin_six_destinations='["owner/a","owner/b","owner/c","owner/d","owner/e","owner/f"]'
+stdin_six_plan=$(_dp_release_plan owner/source "$(_dp_repos "$stdin_six_repos")" "$legacy_payload")
+for stdin_consumer in auth guard; do
+    for stdin_scenario in complete reject; do
+        new_case "six-stdin-$stdin_consumer-$stdin_scenario"
+        export DP_STDIN_CONSUMER="$stdin_consumer"
+        stdin_rejected=false stdin_expected_rc=0 stdin_accepted=6 stdin_final_posts=6
+        if [[ "$stdin_scenario" == reject ]]; then
+            export DP_MODE=reject
+            stdin_rejected=true stdin_expected_rc=1 stdin_accepted=5 stdin_final_posts=7
+        fi
+        capture stdin_six_release
+        check "$stdin_consumer/$stdin_scenario preserves the aggregate outcome" \
+            test "$status" -eq "$stdin_expected_rc"
+        check "$stdin_consumer/$stdin_scenario dispatches all six destinations exactly once" \
+            jq -es --argjson expected "$stdin_six_destinations" \
+            'map(.destination) == $expected' "$CASE/calls.jsonl"
+        STATE=$(state_path)
+        check "$stdin_consumer/$stdin_scenario records only actual attempts and acknowledgements" \
+            jq -e --argjson rejected "$stdin_rejected" '
+                (.deliveries | length) == 6 and all(.deliveries[];
+                    (.history | length) == 1 and .history[0].receipt.attempts == 1 and
+                    .history[0].receipt.repo == .repo and
+                    .history[0].outcome == (if $rejected and .repo == "owner/b" then "rejected" else "accepted" end) and
+                    .history[0].receipt.exit_code == (if $rejected and .repo == "owner/b" then 7 else 0 end))
+            ' "$STATE"
+        check "$stdin_consumer/$stdin_scenario summary retains all attempted destinations" \
+            jq -e --argjson accepted "$stdin_accepted" '
+                (.results | length) == 6 and
+                ([.results[] | select(.outcome == "accepted")] | length) == $accepted and
+                all(.results[]; .invocations == 1 and .receipt.attempts == 1)
+            ' "$CASE/out"
+        if [[ "$stdin_consumer" == auth ]]; then
+            check "$stdin_consumer/$stdin_scenario exercises every real token lookup" \
+                test "$(wc -l < "$CASE/auth-lookups")" -eq 18
+        else
+            check "$stdin_consumer/$stdin_scenario exercises both guards for every POST" \
+                test "$(wc -l < "$CASE/guard-lookups")" -eq 12
+        fi
+        stdin_accepted_before=$(jq -Sc '[.deliveries[] | select(.repo != "owner/b")]' "$STATE")
+        unset DP_MODE
+        capture stdin_six_release
+        check "$stdin_consumer/$stdin_scenario exact-plan resume completes" test "$status" -eq 0
+        check "$stdin_consumer/$stdin_scenario resume never duplicates accepted destinations" \
+            test "$(count)" -eq "$stdin_final_posts"
+        check "$stdin_consumer/$stdin_scenario accepted peers retain identical evidence" \
+            test "$(jq -Sc '[.deliveries[] | select(.repo != "owner/b")]' "$STATE")" = "$stdin_accepted_before"
+        check "$stdin_consumer/$stdin_scenario history records only the necessary retry" \
+            jq -e --argjson rejected "$stdin_rejected" '
+                (.deliveries | length) == 6 and all(.deliveries[];
+                    (.history | length) == (if $rejected and .repo == "owner/b" then 2 else 1 end) and
+                    .history[-1].outcome == "accepted" and
+                    .history[-1].receipt.attempts == 1 and
+                    .history[-1].receipt.exit_code == 0 and
+                    .history[-1].resend_uncertain == false)
+            ' "$STATE"
+        check "$stdin_consumer/$stdin_scenario resumed summary reflects six actual acceptances" \
+            jq -e '.status == "accepted" and .exit_code == 0 and
+                (.results | length) == 6 and all(.results[];
+                    .outcome == "accepted" and .receipt.http_status == "204")' "$CASE/out"
+    done
+done
 
 new_case rejected
 export DP_MODE=reject
