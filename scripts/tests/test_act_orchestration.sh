@@ -1167,6 +1167,274 @@ if [[ "${1:-}" == --dispatch-reservation-only ]]; then
     exit $?
 fi
 
+# Exercise the real worker and owned process groups without requiring a native
+# compiler, Docker, SSH, or null-device type checks. Resistant descendants must
+# stop before a live worker releases capacity or publishes interruption.
+test_worker_group_lifecycle() {
+    local project_root required_tool
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for required_tool in python3 jq; do
+        command -v "$required_tool" >/dev/null || return 77
+    done
+    python3 - "${DSR_TEST_ACT_RUNNER:-$project_root/src/act_runner.sh}" <<'PY'
+import ctypes
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+module = Path(sys.argv[1]).resolve()
+root = Path(tempfile.mkdtemp(prefix='dsr-worker-lifecycle-'))
+print('Retained worker lifecycle fixture: ' + str(root), flush=True)
+checks = failures = 0
+if sys.platform.startswith('linux'):
+    # Reap orphaned fixture grandchildren after parent-loss probes.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
+
+
+def check(label, valid):
+    global checks, failures
+    checks += 1
+    failures += not valid
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+
+
+def alive(pid):
+    try:
+        result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                                capture_output=True, text=True, check=False)
+        return result.returncode == 0 and bool(result.stdout.strip()) and not result.stdout.lstrip().startswith('Z')
+    except ProcessLookupError:
+        return False
+
+
+def fixture_signals():
+    # A tool runner or CI shell may ignore HUP. Bash cannot trap a signal
+    # ignored on entry, so restore its normal disposition before exec.
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
+def until(predicate, seconds=10):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+probe = root / 'probe.py'
+probe.write_text(r'''import json, os, pathlib, signal, subprocess, sys, time
+case = pathlib.Path(sys.argv[1])
+def alive(pid):
+    result = subprocess.run(['ps','-o','stat=','-p',str(pid)],
+                            capture_output=True,text=True,check=False)
+    return result.returncode == 0 and bool(result.stdout.strip()) and not result.stdout.lstrip().startswith('Z')
+if sys.argv[2] == 'child':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    (case / 'descendant.json').write_text(json.dumps(dict(pid=os.getpid(), pgid=os.getpgrp(), sid=os.getsid(0))))
+    while True:
+        time.sleep(0.05)
+else:
+    pids = [int((case / 'backend.pid').read_text())] if (case / 'backend.pid').exists() else []
+    if (case / 'descendant.json').exists():
+        pids.append(json.loads((case / 'descendant.json').read_text())['pid'])
+    (case / 'released.json').write_text(json.dumps(dict(pids=pids, alive=[pid for pid in pids if alive(pid)])))
+''')
+
+driver = root / 'driver.bash'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$1" || exit 90
+CASE="$2" MODE="$3" PROBE="$4"
+export CASE MODE PROBE
+ACT_LOGS_DIR="$CASE/logs"
+mkdir "$ACT_LOGS_DIR"
+act_platform_uses_act() { return 0; }
+selector_acquire_slot() { printf '%s\n' "$BASHPID" > "$CASE/acquired"; }
+selector_release_slot() { python3 "$PROBE" "$CASE" release; }
+_act_build_orchestration_target() {
+    set +m
+    printf '%s\n' "$BASHPID" > "$CASE/backend.pid"
+    if [[ "$MODE" == success ]]; then
+        printf 'owned artifact\n' > "$CASE/artifact.bin"
+        jq -nc --arg path "$CASE/artifact.bin" \
+            '{platform:"linux/amd64",method:"act",status:"success",exit_code:0,artifact_path:$path}'
+        return 0
+    fi
+    if [[ "$MODE" == failure ]]; then
+        jq -nc '{platform:"linux/amd64",method:"act",status:"failed",exit_code:17,error:"fixture failure"}'
+        return 17
+    fi
+    if [[ "$MODE" == leader_ignores || "$MODE" == worker_hangup || "$MODE" == parent_lost ]]; then
+        trap '' TERM
+    else
+        trap 'exit 143' TERM
+    fi
+    python3 "$PROBE" "$CASE" child &
+    local descendant="$!"
+    while [[ ! -s "$CASE/descendant.json" ]]; do sleep 0.01; done
+    if [[ "$MODE" == completed_with_orphan || "$MODE" == closed_reader ]]; then
+        jq -nc '{platform:"linux/amd64",method:"act",status:"failed",exit_code:17,error:"fixture failure"}'
+        return 17
+    fi
+    wait "$descendant"
+}
+if [[ "$MODE" == closed_reader ]]; then
+    # Exercise a lost status reader before completion is reported. A fatal
+    # SIGPIPE here must not bypass cleanup of the still-owned group.
+    _act_run_target_group "$CASE/attempt.log" _act_build_orchestration_target
+    exit $?
+fi
+# An existing coprocess has private descriptors and must remain usable after
+# the target worker. Exercise both caller monitor states on normal completion.
+if [[ "$MODE" == success || "$MODE" == failure ]]; then
+    [[ "$MODE" != success ]] || set -m
+    coproc FOREIGN_WORKER { IFS= read -r request; printf 'foreign:%s\n' "$request"; }
+    foreign_pid="$FOREIGN_WORKER_PID"
+    foreign_read="${FOREIGN_WORKER[0]}"
+    foreign_write="${FOREIGN_WORKER[1]}"
+    before_flags="$-"
+fi
+status=0
+_act_run_target_worker tool v1.0.0 run linux/amd64 1 \
+    "$CASE/attempt.log" "$CASE/attempt.json" false '{}' '{}' '' '' act-local release || status=$?
+if [[ "$MODE" == success || "$MODE" == failure ]]; then
+    after_flags="$-"
+    printf 'still-owned\n' >&"$foreign_write"
+    IFS= read -r -u "$foreign_read" foreign_response || exit 91
+    [[ "$foreign_response" == foreign:still-owned ]] || exit 92
+    wait "$foreign_pid" || exit 93
+    if [[ "$before_flags" == *m* ]]; then
+        [[ "$after_flags" == *m* ]] || exit 94
+    else
+        [[ "$after_flags" != *m* ]] || exit 95
+    fi
+    printf 'preserved\n' > "$CASE/caller-state"
+fi
+exit "$status"
+''')
+
+sentinel = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                            start_new_session=True)
+try:
+    for mode in ('success', 'failure', 'completed_with_orphan', 'closed_reader',
+                 'leader_ignores', 'descendant_survives', 'worker_hangup', 'parent_lost'):
+        case = root / mode
+        case.mkdir()
+        env = os.environ.copy()
+        env.update(DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+                   DSR_CONFIG_DIR=str(case / 'config'))
+        owned = {}
+        with (case / 'driver.log').open('wb') as log:
+            process = subprocess.Popen(['bash', str(driver), str(module), str(case), mode, str(probe)],
+                                       env=env, stdin=subprocess.PIPE if mode == 'closed_reader' else None,
+                                       stdout=subprocess.PIPE if mode == 'closed_reader' else log,
+                                       stderr=log, start_new_session=True,
+                                       preexec_fn=fixture_signals)
+            try:
+                if mode == 'closed_reader':
+                    process.stdout.close()
+                    process.stdin.write(b'start\n')
+                    process.stdin.flush()
+                if mode in ('success', 'failure'):
+                    process.wait(timeout=10)
+                    receipt = json.loads((case / 'attempt.json').read_text())
+                    expected = 0 if mode == 'success' else 17
+                    check(mode + ': preserves actual backend exit and receipt',
+                          process.returncode == expected and receipt['exit_code'] == expected)
+                    check(mode + ': preserves caller job control and unrelated coprocess',
+                          (case / 'caller-state').read_text() == 'preserved\n')
+                    if mode == 'success':
+                        check('success: retains frozen artifact evidence',
+                              receipt['status'] == 'success' and len(receipt['resume_artifacts']) == 1)
+                else:
+                    def ready():
+                        try:
+                            owned.update(json.loads((case / 'descendant.json').read_text()))
+                            owned['backend'] = int((case / 'backend.pid').read_text())
+                            return owned['sid'] == process.pid and (
+                                mode in ('completed_with_orphan', 'closed_reader') or alive(owned['pid']))
+                        except (FileNotFoundError, ValueError, KeyError):
+                            return False
+                    if not until(ready):
+                        raise AssertionError('owned backend/descendant did not reach the barrier')
+                    if mode in ('leader_ignores', 'descendant_survives'):
+                        os.kill(process.pid, signal.SIGTERM)
+                    elif mode == 'worker_hangup':
+                        os.kill(process.pid, signal.SIGHUP)
+                    elif mode == 'parent_lost':
+                        os.kill(process.pid, signal.SIGKILL)
+                    process.wait(timeout=10)
+                    check(mode + ': owned descendants retire after bounded cleanup',
+                          until(lambda: not alive(owned['backend']) and not alive(owned['pid']), 8))
+                    if mode == 'closed_reader':
+                        check('closed status reader: drains before the anchor exits',
+                              process.returncode == -signal.SIGKILL)
+                    elif mode == 'parent_lost':
+                        check('parent loss: does not invent cleanup or completion receipts',
+                              process.returncode == -signal.SIGKILL and
+                              not (case / 'attempt.json').exists() and not (case / 'released.json').exists())
+                    else:
+                        receipt = json.loads((case / 'attempt.json').read_text())
+                        expected = 17 if mode == 'completed_with_orphan' else 130
+                        check(mode + ': retains actual failure or interrupted attempt identity',
+                              process.returncode == expected and receipt['exit_code'] == expected and
+                              receipt['status'] == 'failed' and receipt['platform'] == 'linux/amd64' and
+                              receipt['task_key'] == 'linux/amd64')
+                if mode not in ('parent_lost', 'closed_reader'):
+                    released = json.loads((case / 'released.json').read_text())
+                    check(mode + ': releases capacity only after owned work stops', released['alive'] == [])
+                check(mode + ': leaves unrelated process alive', sentinel.poll() is None)
+            except (AssertionError, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as error:
+                check(mode + ': ' + str(error), False)
+            finally:
+                if process.stdin is not None:
+                    process.stdin.close()
+                # Restrict failure cleanup to the exact owned fixture session.
+                if owned:
+                    for pid in (owned.get('backend'), owned.get('pid')):
+                        try:
+                            if pid and os.getsid(pid) == process.pid:
+                                os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        if os.getsid(owned['pgid']) == process.pid:
+                            os.killpg(owned['pgid'], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                if sys.platform.startswith('linux'):
+                    while True:
+                        try:
+                            pid, _ = os.waitpid(-1, os.WNOHANG)
+                            if not pid:
+                                break
+                        except ChildProcessError:
+                            break
+finally:
+    sentinel.terminate()
+    sentinel.wait(timeout=5)
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures)) + '\n')
+print('Worker lifecycle: %d checks, %d failures' % (checks, failures), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --worker-lifecycle-only ]]; then
+    test_worker_group_lifecycle
+    exit $?
+fi
+
 if [[ "${1:-}" == --stdin-isolation-only || "${1:-}" == --coordinator-receipt-only ||
       "${1:-}" == --sidecar-recovery-only || "${1:-}" == --worker-completion-only ||
       "${1:-}" == --host-readiness-only || "${1:-}" == --host-readiness-cli-only ]]; then
@@ -5695,6 +5963,12 @@ if test_worker_capacity_wait_budget; then
     pass "capacity-limited targets queue for one build timeout and fail with an actionable error"
 else
     fail "capacity-limited target wait budget or failure message is wrong"
+fi
+
+if test_worker_group_lifecycle; then
+    pass "owned target groups drain before receipts and capacity release"
+else
+    fail "target worker cancellation or descendant lifecycle regressed"
 fi
 
 if test_worker_stdin_isolation; then

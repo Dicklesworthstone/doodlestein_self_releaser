@@ -548,7 +548,15 @@ is deterministic in requested-platform order, then configured triple order.
 Workers start with stdin connected to the null device; only the coordinator
 reads the queued task records. A worker failure or timeout does not discard
 later tasks. Cancellation stops dispatch, drains started workers, and retains
-their interrupted attempt receipts. Queued tasks that have never run report
+their interrupted attempt receipts. Each worker keeps an owned local process-group
+anchor alive until cleanup completes. Interrupt, termination and hangup signals
+request cancellation, which allows five seconds for active
+backends to terminate, then kills remaining members of that group before the live
+worker releases capacity or writes an interruption receipt. Completed backends
+drain without that grace delay. Losing the worker closes its control channel and
+retires the group; a killed worker does not fabricate a completion receipt or claim
+to have released its lease. Native remote builds retain their host-side supervisors.
+Queued tasks that have never run report
 `status: "skipped"` and `attempt: 0`, without a log or result path. They remain
 pending in run state, so exact-run resume starts their first attempt while
 reusing verified successful receipts and retrying interrupted attempts.

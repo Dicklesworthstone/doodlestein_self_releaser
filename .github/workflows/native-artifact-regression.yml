@@ -122,6 +122,7 @@ jobs:
           set -euo pipefail
           bash -n scripts/tests/test_act_orchestration.sh
           bash scripts/tests/test_act_orchestration.sh --stdin-isolation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/stdin-isolation.log"
+          bash scripts/tests/test_act_orchestration.sh --worker-lifecycle-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/worker-lifecycle.log"
           bash scripts/tests/test_act_orchestration.sh --dispatch-reservation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-reservation.log"
           bash scripts/tests/test_act_runner.sh --worker-admission-cancel-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/admission-cancellation.log"
           bash scripts/tests/test_act_orchestration.sh --dispatch-stdin-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-stdin.log"

@@ -12317,6 +12317,60 @@ _act_native_output_paths() {
     done <<< "$binaries"
 }
 
+# Keep the backend's process-group leader alive until the worker has observed
+# its exit and requested cleanup. This Bash 4 coprocess owns only this target:
+# its stdin is a parent-lifetime channel, never the dispatcher's task stream.
+# A caught TERM keeps the anchor alive during cleanup, preventing a delayed
+# group signal from reaching a reused PID after an early backend exit.
+_act_run_target_group() {
+    local group_log="$1"
+    shift
+    local group_pid="$BASHPID" group_child="" group_finished=false
+    local group_cancelled=false group_command="" group_running="" group_exit=0
+    local group_read_status=0
+    set +m
+    trap - EXIT
+    trap 'group_cancelled=true' INT TERM HUP PIPE
+    # The worker registers its PID/channels before authorizing any backend.
+    if ! IFS= read -r group_command || [[ "$group_command" != start ]] || $group_cancelled; then
+        return 130
+    fi
+    "$@" </dev/null >> "$group_log" 2>&1 &
+    group_child=$!
+    while ! $group_cancelled; do
+        if ! $group_finished; then
+            group_running=$(jobs -pr)
+            case $'\n'"$group_running"$'\n' in
+                *$'\n'"$group_child"$'\n'*) ;;
+                *)
+                    wait "$group_child" || group_exit=$?
+                    group_finished=true
+                    printf 'exit:%s\n' "$group_exit" || break
+                    ;;
+            esac
+        fi
+        group_read_status=0
+        IFS= read -r -t 0.1 group_command || group_read_status=$?
+        # EOF also retires the group if the outer worker is killed. Backend
+        # stdin was replaced above, so it cannot keep this lease pipe open.
+        if (( group_read_status == 0 || group_read_status == 1 )); then
+            break
+        fi
+        (( group_read_status > 128 )) || break
+    done
+    trap '' INT TERM HUP PIPE
+    kill -TERM -- "-$group_pid" 2>/dev/null || true
+    if ! $group_finished; then
+        # Native supervisors have their own two-second descendant drain.
+        # Give them time to finish before forcing remaining local processes.
+        sleep 5
+    fi
+    # The live anchor still owns this group even if its backend exited first.
+    # Completion does not need a grace delay: no backend work remains valid.
+    kill -KILL -- "-$group_pid" 2>/dev/null || true
+    return 4
+}
+
 # Worker wrapper: reserve host capacity and write immutable attempt receipts.
 _act_run_target_worker() {
     local tool_name="$1" version="$2" run_id="$3" target="$4"
@@ -12398,6 +12452,9 @@ _act_run_target_worker() {
     fi
 
     local worker_pid="" worker_launch_pending=false worker_cancelled=false
+    local worker_result_fd="" worker_control_fd="" worker_guard_exit=0
+    local -a _ACT_TARGET_GROUP=()
+    local _ACT_TARGET_GROUP_PID=""
     _act_worker_release_slot() {
         # Release is ownership-checked and safe when no slot was granted. Mark
         # the request before acquisition so cancellation between grant and
@@ -12408,16 +12465,34 @@ _act_run_target_worker() {
         fi
     }
 
+    _act_worker_drain_group() {
+        # Both descriptors came from Bash's own coprocess table. Numeric
+        # validation confines eval to closing those descriptors on Bash 4.0,
+        # which predates the later {variable} redirection syntax.
+        if [[ "$worker_control_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${worker_control_fd}>&-"
+            worker_control_fd=""
+        fi
+        if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]]; then
+            worker_guard_exit=0
+            wait "$worker_pid" 2>/dev/null || worker_guard_exit=$?
+            worker_pid=""
+        fi
+        if [[ "$worker_result_fd" =~ ^[0-9]+$ ]]; then
+            eval "exec ${worker_result_fd}<&-"
+            worker_result_fd=""
+        fi
+    }
+
     _act_worker_cancel() {
         worker_cancelled=true
         # A trap can run between the background fork and assigning $!. Defer
         # cleanup until the exact child process group has been recorded.
         $worker_launch_pending && return 0
-        trap '' INT TERM
-        if [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$worker_pid" 2>/dev/null; then
-            kill -TERM -- "-$worker_pid" 2>/dev/null || kill -TERM "$worker_pid" 2>/dev/null || true
-            wait "$worker_pid" 2>/dev/null || true
-        fi
+        trap '' INT TERM HUP
+        # Closing the parent-lifetime channel asks the still-owned anchor
+        # to drain every descendant before this worker releases its slot.
+        _act_worker_drain_group
         # Preserve a completed receipt if cancellation raced its publication.
         # Otherwise retain an actual interrupted attempt for exact-run resume.
         if [[ ! -e "$result_path" && ! -L "$result_path" ]]; then
@@ -12430,7 +12505,7 @@ _act_run_target_worker() {
         exit 130
     }
     trap _act_worker_release_slot EXIT
-    trap _act_worker_cancel INT TERM
+    trap _act_worker_cancel INT TERM HUP
 
     if declare -F selector_acquire_slot &>/dev/null; then
         # A target whose host is at its concurrency limit queues for a slot
@@ -12457,31 +12532,45 @@ _act_run_target_worker() {
                   error: $error}')
             if ! _act_write_worker_result "$slot_failure"; then
                 _act_worker_release_slot
-                trap - EXIT INT TERM
+                trap - EXIT INT TERM HUP
                 return 4
             fi
             _act_worker_release_slot
-            trap - EXIT INT TERM
+            trap - EXIT INT TERM HUP
             return 2
         fi
     fi
 
     local worker_status=0 result receipts result_status
+    local worker_monitor=false worker_message="" worker_protocol_valid=false
+    [[ $- != *m* ]] || worker_monitor=true
     set -m
     worker_launch_pending=true
-    _act_build_orchestration_target \
-        "$tool_name" "$version" "$run_id" "$target" \
-        "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
-        "$release_git_sha" "$release_git_ref" "$host" "$selected_triple" \
-        >> "$log_path" 2>&1 &
-    worker_pid=$!
+    coproc _ACT_TARGET_GROUP {
+        _act_run_target_group "$log_path" _act_build_orchestration_target \
+            "$tool_name" "$version" "$run_id" "$target" \
+            "$strict_release_contract" "$release_contract_json" "$source_roots_json" \
+            "$release_git_sha" "$release_git_ref" "$host" "$selected_triple"
+    }
+    worker_pid="${_ACT_TARGET_GROUP_PID:-}"
+    worker_result_fd="${_ACT_TARGET_GROUP[0]:-}"
+    worker_control_fd="${_ACT_TARGET_GROUP[1]:-}"
     worker_launch_pending=false
-    # The process group remains distinct after monitor mode is disabled; this
-    # avoids interactive-style job-completion notices in coordinator logs.
-    set +m
+    $worker_monitor || set +m
     $worker_cancelled && _act_worker_cancel
-    wait "$worker_pid" || worker_status=$?
-    worker_pid=""
+    if [[ "$worker_control_fd" =~ ^[0-9]+$ && "$worker_result_fd" =~ ^[0-9]+$ ]] &&
+       printf 'start\n' >&"$worker_control_fd" &&
+       IFS= read -r -u "$worker_result_fd" worker_message &&
+       [[ "$worker_message" =~ ^exit:([0-9]{1,3})$ ]] &&
+       (( 10#${BASH_REMATCH[1]} <= 255 )); then
+        worker_status=$((10#${BASH_REMATCH[1]}))
+        worker_protocol_valid=true
+    fi
+    _act_worker_drain_group
+    if ! $worker_protocol_valid; then
+        worker_status="$worker_guard_exit"
+        [[ "$worker_status" -ne 0 ]] || worker_status=6
+    fi
 
     result=$(grep '^{.*}$' "$log_path" | tail -1)
     if [[ -z "$result" ]] || ! jq -e '.' <<< "$result" &>/dev/null; then
@@ -12504,7 +12593,7 @@ _act_run_target_worker() {
             del(.resume_artifacts)
         ' <<< "$result"); then
             _act_worker_release_slot
-            trap - EXIT INT TERM
+            trap - EXIT INT TERM HUP
             return 4
         fi
     fi
@@ -12515,7 +12604,7 @@ _act_run_target_worker() {
         if ! result=$(jq -c '.status = "failed" | .exit_code = 4 |
             .error = "Native worker result does not match the requested target triple"' <<< "$result"); then
             _act_worker_release_slot
-            trap - EXIT INT TERM
+            trap - EXIT INT TERM HUP
             return 4
         fi
     fi
@@ -12537,11 +12626,11 @@ _act_run_target_worker() {
         # trap runs. Release while the attempt's lease identity is still in
         # scope, including storage/receipt failures after a real build.
         _act_worker_release_slot
-        trap - EXIT INT TERM
+        trap - EXIT INT TERM HUP
         return 4
     fi
     _act_worker_release_slot
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
     return "$worker_status"
 }
 
