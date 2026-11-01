@@ -114,11 +114,11 @@ teardown() {
 }
 
 @test "docker_build normalizes version with v prefix" {
-    # This will fail because Docker isn't running, but we can check the log output
     export DOCKER_REGISTRY="test.registry.io"
-    run docker_build ubs 1.2.3 --dry-run 2>&1
-    # Even on failure, the version should be normalized in the output
-    assert_contains "$output" "v1.2.3" || assert_contains "$output" "docker"
+    run docker_build ubs 1.2.3 --repo-path "$TEST_TMPDIR/projects/ubs" --push --dry-run
+    [[ "$status" -eq 0 ]]
+    jq -e '.status == "planned" and .version == "v1.2.3" and
+        .tags == ["test.registry.io/ubs:v1.2.3"]' <<< "$output"
 }
 
 # ============================================================================
@@ -205,10 +205,14 @@ teardown() {
     mkdir -p "$TEST_TMPDIR/test_tool"
     echo "FROM alpine" > "$TEST_TMPDIR/test_tool/Dockerfile"
 
-    # Mock the docker commands by setting a non-containerized tool
-    # and checking the dry run output
-    run docker_build --help
+    docker() { printf 'unexpected Docker invocation\n' >&2; return 99; }
+    export -f docker
+    run docker_build test_tool 1.0.0 --repo-path "$TEST_TMPDIR/test_tool" \
+        --output "$TEST_TMPDIR/untouched/image.tar" --dry-run
     [[ "$status" -eq 0 ]]
+    jq -e --arg context "$TEST_TMPDIR/test_tool" \
+        '.status == "planned" and .context == $context and .exporter == "oci" and .digest == null' <<< "$output"
+    [[ ! -e "$TEST_TMPDIR/untouched" ]]
 }
 
 # ============================================================================
@@ -223,8 +227,17 @@ teardown() {
 
 @test "dsr docker build --help works" {
     run "$PROJECT_ROOT/dsr" docker build --help
-    # The help should work even if build itself fails
-    [[ "$status" -eq 0 ]] || assert_contains "$output" "Tool and version required"
+    [[ "$status" -eq 0 ]]
+    assert_contains "$output" "docker_build - Build multi-arch Docker image"
+}
+
+@test "dsr docker verify and attest expose evidence help" {
+    run "$PROJECT_ROOT/dsr" docker verify --help
+    [[ "$status" -eq 0 ]]
+    assert_contains "$output" "REPOSITORY@sha256:DIGEST"
+    run "$PROJECT_ROOT/dsr" docker attest --help
+    [[ "$status" -eq 0 ]]
+    assert_contains "$output" "--certificate-identity"
 }
 
 @test "dsr docker unknown-subcommand returns error" {

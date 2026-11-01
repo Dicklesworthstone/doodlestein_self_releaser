@@ -31,7 +31,15 @@
         "prune",
         "config",
         "doctor",
-        "signing"
+        "signing",
+        "installer",
+        "docker",
+        "docker-build",
+        "docker-release",
+        "docker-sign",
+        "docker-setup",
+        "docker-verify",
+        "docker-attest"
       ]
     },
     "schema_version": {

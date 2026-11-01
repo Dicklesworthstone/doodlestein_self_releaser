@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner_native.sh - Unit tests for act_runner.sh native build SSH logic
 #
-# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only]
+# Usage: ./test_act_runner_native.sh [--typed-companions-only | --typed-companion-preflight-only | --attempt-isolation-only]
 #
 # Tests native build SSH command construction with mocks.
 # Covers: command construction, path handling, env vars, SCP, error handling.
@@ -11,6 +11,321 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
+
+# Real native allocation/collection/manifest code with controlled remote
+# admission, transport and Rust cache protocol responses. No compiler, network
+# request or native Windows execution is claimed. Every fixture is retained.
+test_native_attempt_isolation() {
+    local dependency
+    for dependency in python3 yq jq git; do
+        command -v "$dependency" >/dev/null || { printf 'Missing test dependency: %s\n' "$dependency" >&2; return 3; }
+    done
+    python3 - "$PROJECT_ROOT" <<'PY'
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+
+root = Path(sys.argv[1])
+work = Path(tempfile.mkdtemp(prefix='dsr-native-attempts-'))
+print('Retained native attempt evidence: ' + str(work), flush=True)
+checks = failures = 0
+run_id = '11111111-1111-4111-8111-111111111111'
+triple = 'x86_64-pc-windows-msvc'
+module = Path(os.environ.get('DSR_NATIVE_ATTEMPT_MODULE', str(root / 'src/act_runner.sh')))
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, sort_keys=True) + '\n')
+
+
+def snapshot(paths):
+    result = {}
+    for path in map(Path, paths):
+        info = path.stat()
+        result[str(path)] = (info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode),
+                            info.st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+    return result
+
+
+program = r'''
+source "$DSR_ATTEMPT_PROJECT/src/config.sh" || exit $?
+source "$DSR_ATTEMPT_MODULE" || exit $?
+host_health_is_ready() { [[ "${DSR_ATTEMPT_HEALTH:-healthy}" == healthy ]]; }
+_act_ssh_exec() {
+    printf 'remote invocation %s\n' "$DSR_ATTEMPT_LABEL" >> "$DSR_ATTEMPT_CASE/transport-events"
+    if [[ -n "${DSR_ATTEMPT_BARRIER:-}" ]]; then
+        : > "$DSR_ATTEMPT_BARRIER/$DSR_ATTEMPT_LABEL"
+        while [[ $(find "$DSR_ATTEMPT_BARRIER" -type f | wc -l) -lt 2 ]]; do sleep 0.05; done
+    fi
+    printf 'controlled remote output: %s\n' "$DSR_ATTEMPT_LABEL"
+    return "${DSR_ATTEMPT_EXIT:-0}"
+}
+scp() {
+    local destination="${!#}" source="${*: -2:1}"
+    # Guarded PowerShell programs may be staged through this same transport.
+    [[ "$destination" != *:* ]] || return 0
+    cp "$DSR_ATTEMPT_INPUTS/${source##*/}" "$destination"
+}
+ssh() {
+    local command="${!#}" decoded path
+    decoded=$(_act_windows_command_script "$command") || return 91
+    [[ "$decoded" == *"[IO.File]::OpenRead('"* ]] || return 92
+    path="${decoded#*OpenRead(\'}"
+    path="${path%%\'*}"
+    cat "$DSR_ATTEMPT_INPUTS/${path##*/}"
+}
+# These two responses isolate native attempt storage from the independently
+# tested remote Cargo cache implementation. Collection and receipts stay real.
+_act_prepare_windows_nonstrict_cargo_home() {
+    jq -nc --arg home "$4" '{mode:"private-copy",cargo_home:$home,
+        receipt_sha256:("3"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
+}
+_act_finish_windows_private_cargo_home() {
+    jq -nc --arg home "$2" '{mode:"inventory",cargo_home:$home,
+        receipt_sha256:("5"*64),inventory_sha256:("4"*64),file_count:0,size_bytes:0,caches:[]}'
+}
+if [[ "${DSR_ATTEMPT_MKTEMP_FAIL:-}" == logs ]]; then
+    mktemp() {
+        if [[ "$*" == *"$ACT_LOGS_DIR/"* ]]; then
+            printf 'controlled native log allocation failure\n' >&2
+            return 19
+        fi
+        command mktemp "$@"
+    }
+fi
+case "$DSR_ATTEMPT_OPERATION" in
+    build)
+        selected='' source_root=''
+        [[ "$DSR_ATTEMPT_MODE" != variant ]] || selected=x86_64-pc-windows-msvc
+        [[ "$DSR_ATTEMPT_MODE" != strict ]] || source_root=C:/fixture/release/source
+        act_run_native_build attempt windows/amd64 1.0.0 "$DSR_ATTEMPT_RUN" \
+            "$source_root" '' '' fixture "$selected"
+        ;;
+    receipts) _act_result_artifact_receipts "$(cat "$DSR_ATTEMPT_RESULT")" ;;
+    available) _act_target_result_available "$(cat "$DSR_ATTEMPT_RESULT")" ;;
+    manifest) act_generate_manifest "$(cat "$DSR_ATTEMPT_RESULT")" "$DSR_ATTEMPT_MANIFEST" ;;
+    *) exit 93 ;;
+esac
+'''
+
+
+def prepare(name, mode='ordinary'):
+    case = work / name
+    (case / 'config/repos.d').mkdir(parents=True)
+    source = case / 'source'
+    source.mkdir()
+    (source / 'main.go').write_text('package main\nfunc main() {}\n')
+    subprocess.run(['git', '-C', str(source), 'init', '-q', '-b', 'main'], check=True)
+    blob = subprocess.check_output(['git', '-C', str(source), 'hash-object', '-w', 'main.go']).decode().strip()
+    tree = subprocess.check_output(['git', '-C', str(source), 'mktree'],
+                                   input=('100644 blob ' + blob + '\tmain.go\n').encode()).decode().strip()
+    sha = subprocess.check_output(['git', '-C', str(source), '-c', 'user.name=DSR fixture',
+        '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+        'commit-tree', tree, '-m', 'Native attempt custody fixture']).decode().strip()
+    save(case / 'config/repos.yaml', {'tools': {}})
+    save(case / 'config/hosts.yaml', {'hosts': {'fixture': {
+        'platform': 'windows/amd64', 'connection': 'ssh', 'ssh_host': 'fixture.invalid', 'enabled': True}}})
+    config = {'tool_name': 'attempt', 'repo': 'owner/attempt', 'local_path': str(source),
+        'host_paths': {'fixture': 'C:/fixture/attempt'}, 'language': 'go', 'binary_name': 'attempt',
+        'build_cmd': 'go build -o attempt.exe', 'targets': ['windows/amd64'],
+        'act_job_map': {'windows/amd64': None},
+        'workspace_additional_artifacts': {'windows/amd64': [{'name': 'metadata.json', 'format': 'json'}]}}
+    if mode == 'variant':
+        config.update(language='rust', build_cmd='cargo build --release --target ${target_triple}',
+                      target_triples={'windows/amd64': triple})
+    save(case / 'config/repos.d/attempt.yaml', config)
+    env = dict(os.environ, DSR_CONFIG_DIR=str(case / 'config'), DSR_REPOS_FILE=str(case / 'config/repos.yaml'),
+        DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'), DSR_STATE_DIR=str(case / 'state'),
+        ACT_ARTIFACTS_DIR=str(case / 'artifacts'), ACT_LOGS_DIR=str(case / 'logs'),
+        DSR_ATTEMPT_PROJECT=str(root), DSR_ATTEMPT_MODULE=str(module), DSR_ATTEMPT_CASE=str(case),
+        DSR_ATTEMPT_RUN=run_id, DSR_ATTEMPT_MODE=mode, DSR_ATTEMPT_OPERATION='build',
+        RCH_REQUIRE_REMOTE='0', NO_COLOR='1')
+    return case, env, sha
+
+
+def launch(context, label, **overrides):
+    case, env, _ = context
+    inputs = case / ('inputs-' + label)
+    inputs.mkdir()
+    header = b'MZ' + b'\0' * 58 + b'\x40\0\0\0PE\0\0\x64\x86' + b'\0' * 18 + b'\x0b\x02' + b'\0' * 6
+    (inputs / 'attempt.exe').write_bytes(header + ('inert fixture ' + label + '\n').encode())
+    save(inputs / 'metadata.json', {'attempt': label})
+    child_env = dict(env, DSR_ATTEMPT_LABEL=label, DSR_ATTEMPT_INPUTS=str(inputs), **overrides)
+    return subprocess.Popen(['bash', '-c', program], env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def finish(context, label, process):
+    case, env, _ = context
+    stdout, stderr = process.communicate(timeout=45)
+    (case / (label + '.stdout')).write_bytes(stdout)
+    (case / (label + '.stderr')).write_bytes(stderr)
+    rows = [line for line in stdout.splitlines() if line.startswith(b'{')]
+    result = json.loads(rows[-1]) if rows else {}
+    if result.get('status') == 'success':
+        result_path = case / (label + '.result.json')
+        save(result_path, result)
+        observed = subprocess.run(['bash', '-c', program], env=dict(env,
+            DSR_ATTEMPT_OPERATION='receipts', DSR_ATTEMPT_RESULT=str(result_path)),
+            capture_output=True, timeout=20)
+        if observed.returncode:
+            raise AssertionError('Cannot read actual collected receipts: ' + observed.stderr.decode())
+        result['resume_artifacts'] = json.loads(observed.stdout)
+    save(case / (label + '.result.json'), result)
+    return process.returncode, result
+
+
+def build(context, label, **overrides):
+    return finish(context, label, launch(context, label, **overrides))
+
+
+def retained_paths(result):
+    return [result['log_file'], *[row['path'] for row in result['resume_artifacts']]]
+
+
+def accepted(context, label, outcome):
+    code, result = outcome
+    check(label + ': native collection succeeds', code == 0 and result.get('status') == 'success')
+    check(label + ': primary name and physical target are unchanged',
+          result.get('platform') == 'windows/amd64' and result.get('method') == 'native' and
+          [Path(p).name for p in result.get('artifact_paths', [])] == ['attempt.exe'])
+    check(label + ': typed companion has its own complete held receipt',
+          [Path(r['path']).name for r in result.get('additional_artifacts', [])] == ['metadata.json'] and
+          len(result.get('resume_artifacts', [])) == 2)
+    check(label + ': actual primary and companion bytes belong to this attempt',
+          Path(result['artifact_paths'][0]).read_bytes().endswith(('inert fixture ' + label + '\n').encode()) and
+          json.loads(Path(result['additional_artifacts'][0]['path']).read_text()) == {'attempt': label})
+    check(label + ': native log contains its own remote output',
+          ('controlled remote output: ' + label) in Path(result['log_file']).read_text())
+    check(label + ': log directory and file have private permissions',
+          stat.S_IMODE(Path(result['log_file']).parent.stat().st_mode) == 0o700 and
+          stat.S_IMODE(Path(result['log_file']).stat().st_mode) == 0o600)
+    return result
+
+
+def admission(context, label, result):
+    case, env, sha = context
+    receipt = case / (label + '.readback.json')
+    save(receipt, result)
+    available = subprocess.run(['bash', '-c', program], env=dict(env,
+        DSR_ATTEMPT_OPERATION='available', DSR_ATTEMPT_RESULT=str(receipt)), capture_output=True, timeout=20)
+    check(label + ': production resume verifies the original bytes after later attempts', available.returncode == 0)
+    inventory = {'tool': 'attempt', 'version': '1.0.0', 'run_id': run_id,
+        'git_sha': sha, 'git_ref': 'v1.0.0', 'status': 'success',
+        'summary': {'total': 1, 'success': 1, 'failed': 0}, 'duration_seconds': 0, 'targets': [result]}
+    save(receipt, inventory)
+    manifest = case / (label + '.manifest.json')
+    generated = subprocess.run(['bash', '-c', program], env=dict(env,
+        DSR_ATTEMPT_OPERATION='manifest', DSR_ATTEMPT_RESULT=str(receipt), DSR_ATTEMPT_MANIFEST=str(manifest)),
+        capture_output=True, timeout=30)
+    (case / (label + '.manifest.stderr')).write_bytes(generated.stderr)
+    check(label + ': production manifest still admits the complete original inventory', generated.returncode == 0)
+    if generated.returncode == 0:
+        actual = json.loads(manifest.read_text())['artifacts']
+        expected = {Path(r['path']).name: r['sha256'] for r in result['resume_artifacts']}
+        check(label + ': manifest hashes and owners match retained original receipts',
+              {r['name']: r['sha256'] for r in actual} == expected and
+              all(r['target'] == 'windows/amd64' for r in actual))
+
+
+context = prepare('sequential')
+case, env, _ = context
+legacy_payload = case / 'artifacts' / run_id / 'windows-amd64' / 'attempt.exe'
+legacy_payload.parent.mkdir(parents=True)
+legacy_payload.write_bytes(b'preexisting native payload must be retained\n')
+(case / 'logs').mkdir()
+legacy_log = case / 'logs' / ('attempt-windows-amd64-' + run_id + '.log')
+legacy_log.write_text('preexisting native log must be retained\n')
+legacy = snapshot([legacy_payload, legacy_log])
+first = accepted(context, 'first', build(context, 'first'))
+held = snapshot(retained_paths(first))
+second = accepted(context, 'second', build(context, 'second'))
+check('retry: earlier payload, companion and log bytes/inodes remain unchanged', snapshot(held) == held)
+check('retry: primary and companion attempt directories are distinct',
+      Path(first['artifact_paths'][0]).parent != Path(second['artifact_paths'][0]).parent and
+      Path(first['additional_artifacts'][0]['path']).parent != Path(second['additional_artifacts'][0]['path']).parent)
+check('retry: native logs have distinct paths', first['log_file'] != second['log_file'])
+check('retry: preexisting legacy payload and log remain unchanged', snapshot(legacy) == legacy)
+held_second = snapshot(retained_paths(second))
+code, failed = build(context, 'failed-retry', DSR_ATTEMPT_EXIT='23')
+check('failed retry: real nonzero transport becomes a failed build without artifacts',
+      code != 0 and failed.get('status') == 'failed' and failed.get('artifact_paths') == [] and
+      failed.get('additional_artifacts') == [])
+check('failed retry: its native log is retained separately',
+      failed.get('log_file') not in (first['log_file'], second['log_file']) and
+      'failed-retry' in Path(failed['log_file']).read_text())
+check('failed retry: both prior complete receipts and logs stay unchanged',
+      snapshot(held) == held and snapshot(held_second) == held_second)
+admission(context, 'first-after-retry', first)
+admission(context, 'second-after-failure', second)
+
+context = prepare('concurrent')
+barrier = context[0] / 'barrier'
+barrier.mkdir()
+left = launch(context, 'left', DSR_ATTEMPT_BARRIER=str(barrier))
+right = launch(context, 'right', DSR_ATTEMPT_BARRIER=str(barrier))
+a = accepted(context, 'left', finish(context, 'left', left))
+b = accepted(context, 'right', finish(context, 'right', right))
+check('concurrent: both native calls reached the remote barrier', len(list(barrier.iterdir())) == 2)
+check('concurrent: no payload, companion or log path is shared', set(retained_paths(a)).isdisjoint(retained_paths(b)))
+admission(context, 'left-after-peer', a)
+admission(context, 'right-after-peer', b)
+
+for mode in ('strict', 'variant'):
+    context = prepare(mode, mode)
+    a = accepted(context, mode + '-first', build(context, mode + '-first'))
+    before = snapshot(retained_paths(a))
+    b = accepted(context, mode + '-second', build(context, mode + '-second'))
+    check(mode + ': existing payload isolation and new log isolation both remain private',
+          set(retained_paths(a)).isdisjoint(retained_paths(b)) and snapshot(before) == before)
+    check(mode + ': target label remains present in the native log namespace',
+          'windows-amd64' in str(Path(a['log_file']).parent) and
+          (mode != 'variant' or triple in str(Path(a['log_file']).parent)))
+
+for obstruction in ('log-file', 'log-symlink', 'log-mktemp', 'unhealthy'):
+    context = prepare(obstruction)
+    case, env, _ = context
+    extra = {}
+    victim = case / 'retained-victim'
+    victim.mkdir()
+    (victim / 'marker').write_text('unchanged\n')
+    before = snapshot([victim / 'marker'])
+    if obstruction == 'log-file':
+        (case / 'logs').write_text('preexisting regular file\n')
+    elif obstruction == 'log-symlink':
+        (case / 'logs').symlink_to(victim, target_is_directory=True)
+    elif obstruction == 'log-mktemp':
+        extra['DSR_ATTEMPT_MKTEMP_FAIL'] = 'logs'
+    else:
+        extra['DSR_ATTEMPT_HEALTH'] = 'unhealthy'
+    code, result = build(context, obstruction, **extra)
+    check(obstruction + ': unavailable admission/log storage refuses the native build',
+          code == 4 and result.get('status') == 'error')
+    check(obstruction + ': no remote compiler invocation or artifact collection occurred',
+          not (case / 'transport-events').exists() and not (case / 'artifacts').exists())
+    check(obstruction + ': existing outside bytes remain unchanged', snapshot(before) == before)
+
+print('Native attempt isolation: %d checks, %d failures' % (checks, failures), flush=True)
+raise SystemExit(1 if failures else 0)
+PY
+}
+
+if [[ "${1:-}" == --attempt-isolation-only ]]; then
+    test_native_attempt_isolation
+    exit $?
+fi
 
 # Controlled admission boundaries through the complete production modules and
 # real configuration parsers. Healthy cases stop at transport resolution or

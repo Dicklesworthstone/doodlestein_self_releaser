@@ -4,12 +4,18 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 MODULE="${DOCKER_TEST_MODULE:-$ROOT/src/docker.sh}"
+CLI="${DOCKER_TEST_CLI:-$ROOT/dsr}"
 WORK=$(mktemp -d)
-trap 'rm -rf -- "$WORK"' EXIT
+if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
+    trap 'printf "Retained container fixtures: %s\n" "$WORK"' EXIT
+else
+    trap 'rm -rf -- "$WORK"' EXIT
+fi
 trap 'exit 5' HUP INT TERM
 mkdir -p "$WORK/bin" "$WORK/cases"
 export PATH="$WORK/bin:$PATH" DK_WORK="$WORK"
-export DK_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+DK_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+export DK_DIGEST
 unset DSR_GH_TOKEN GITHUB_TOKEN GH_TOKEN DOCKER_OUTPUT_DIR
 export DOCKER_REGISTRY=ghcr.io/acme DOCKER_BUILDER_NAME=dsr-test-builder
 export DOCKER_PLATFORMS=linux/amd64,linux/arm64
@@ -21,7 +27,9 @@ set -uo pipefail
 jq -nc --args '$ARGS.positional' -- "$@" >> "$DK_CALLS"
 case "$*" in
     info|buildx\ version) exit 0 ;;
-    buildx\ inspect*) [[ "${DK_MODE:-}" != bootstrap-fail || "$*" != *--bootstrap* ]]; exit $? ;;
+    buildx\ inspect*)
+        [[ "${DK_MODE:-}" != builder-absent || "$*" == *--bootstrap* ]] || exit 1
+        [[ "${DK_MODE:-}" != bootstrap-fail || "$*" != *--bootstrap* ]]; exit $? ;;
     buildx\ create*) exit 0 ;;
     login*) cat > "$DK_WORK/token.stdin"; [[ "${DK_MODE:-}" != login-fail ]]; exit $? ;;
 esac
@@ -144,6 +152,7 @@ SH
 cat > "$WORK/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
+jq -nc --args '$ARGS.positional' -- gh "$@" >> "$DK_CALLS"
 printf 'gh-config-token'
 SH
 chmod +x "$WORK/bin/docker" "$WORK/bin/syft" "$WORK/bin/cosign" "$WORK/bin/gh"
@@ -151,6 +160,7 @@ printf payload > "$WORK/payload"
 cat > "$WORK/spdx.json" <<'JSON'
 {"spdxVersion":"SPDX-2.3","dataLicense":"CC0-1.0","SPDXID":"SPDXRef-DOCUMENT","name":"fixture","documentNamespace":"https://example.test/sbom","creationInfo":{"created":"2026-09-18T00:00:00Z","creators":["Tool: fixture"]},"packages":[]}
 JSON
+# shellcheck source=/dev/null
 source "$MODULE"
 checks=0 failures=0 status=0 CASE='' REPO='' output=''
 # The registry fixture serves exact serialized bytes addressed by their REAL
@@ -200,6 +210,7 @@ new_case() {
     export DK_CALLS="$CASE/calls.jsonl" DK_MODE=''
     : > "$DK_CALLS"
     export DOCKER_OUTPUT_DIR="$CASE/output"
+    export DSR_CONFIG_DIR="$CASE/config" DSR_STATE_DIR="$CASE/state" DSR_CACHE_DIR="$CASE/cache"
     DRY_RUN=false
     export DK_SYFT_DISABLED=false DK_SCAN_NONCE=''
     export DOCKER_CERTIFICATE_IDENTITY=builder@example.test DOCKER_CERTIFICATE_OIDC_ISSUER=https://issuer.example.test
@@ -224,6 +235,7 @@ no_call_kind() { jq -e -s --arg kind "$1" 'all(.[]; index($kind) == null)' "$DK_
 build() { docker_build tool 1.2.3 --repo-path "$REPO" "$@"; }
 release() { docker_release tool 1.2.3 --repo-path "$REPO" "$@"; }
 
+if [[ "${1:-}" != --cli-only ]]; then
 new_case dry
 capture build --push --dry-run
 check 'dry run succeeds without Docker interaction' test "$status" -eq 0
@@ -231,10 +243,13 @@ check 'dry run invokes no external adapters' no_calls
 check 'dry run is a plan, not built' jq -e '.status == "planned" and .dry_run == true and .digest == null' "$CASE/stdout"
 check 'nested Dockerfile retains repository build context' jq -e --arg root "$REPO" '.context == $root and .dockerfile == ($root + "/docker/Dockerfile")' "$CASE/stdout"
 check 'latest is not silently published' jq -e '.tags == ["ghcr.io/acme/tool:v1.2.3"]' "$CASE/stdout"
-DRY_RUN=true
+export DRY_RUN=true
 capture release
 check 'global dry run propagates through release' test "$status" -eq 0
 check 'global dry run has no setup/push/sign/scan effects' no_calls
+capture docker_setup_buildx
+check 'direct builder setup honors global dry run' test "$status" -eq 0
+check 'direct builder setup plan has no Docker effects' no_calls
 capture docker_build_json tool 1.2.3 --repo-path "$REPO"
 check 'JSON wrapper distinguishes planned status' jq -e '.status == "planned" and .exit_code == 0' "$CASE/stdout"
 check 'dry run creates no OCI output directory' absent "$DOCKER_OUTPUT_DIR"
@@ -505,6 +520,222 @@ capture release
 check 'tag drift after evidence publication prevents completion' test "$status" -eq 7
 check 'late tag drift does not delete already-published attestations' test -s "$DK_REGISTRY/attestations/$DK_ARM64.jsonl"
 check 'late tag drift emits no misleading success receipt' test -z "$output"
+fi
+
+# Exercise the actual public executable, not sourced forwarding functions.
+# External tools remain explicit recording fixtures; no live container build,
+# registry, OIDC service, or cryptographic signature is claimed by these tests.
+cli_receipts=0
+cli_capture() {
+    capture bash "$CLI" --json "$@"
+    cli_receipts=$((cli_receipts+1))
+    cp "$CASE/stdout" "$CASE/cli-$cli_receipts.json"
+    check "public invocation $cli_receipts emits exactly one envelope" jq -e -s \
+        'length == 1 and (.[0] | type == "object" and
+         (.status == "success" or .status == "error") and
+         (.exit_code | type == "number") and (.details | type == "object"))' "$CASE/stdout"
+}
+
+for placement in global local; do
+    for operation in build release sign setup verify attest; do
+        new_case "cli-plan-$placement-$operation"
+        args=()
+        case "$operation" in
+            build|release)
+                args=(tool v1.2.3 --repo-path "$REPO" --dockerfile docker/Dockerfile --tag stable --platform linux/amd64)
+                [[ "$operation" != build ]] || args+=(--push) ;;
+            sign|verify|attest) args=("ghcr.io/acme/tool@$DK_DIGEST") ;;
+        esac
+        if [[ "$placement" == global ]]; then
+            cli_capture --dry-run docker "$operation" "${args[@]}"
+        else
+            cli_capture docker "$operation" "${args[@]}" --dry-run
+        fi
+        check "$operation $placement dry run succeeds" test "$status" -eq 0
+        check "$operation $placement plan never claims completed work" jq -e \
+            '.status == "success" and .details.status == "planned" and .details.dry_run == true and
+             .details.result.status == "planned" and .details.pushed != true and
+             .details.signed != true and .details.ready != true' "$CASE/stdout"
+        check "$operation $placement plan invokes no external adapters" no_calls
+        check "$operation $placement plan creates no output or state" bash -c \
+            '[[ ! -e "$1" && ! -e "$2" && ! -e "$3" ]]' bash "$DOCKER_OUTPUT_DIR" "$DSR_STATE_DIR" "$DSR_CACHE_DIR"
+    done
+done
+
+new_case cli-custom-oci
+cli_capture docker build tool v1.2.3 --repo-path "$REPO" --dockerfile docker/Dockerfile \
+    --output "$CASE/custom output/image.tar" --tag stable --tag stable --platform linux/amd64
+check 'public OCI build succeeds with explicit paths and tags' test "$status" -eq 0
+check 'public OCI receipt binds actual exported bytes' jq -e \
+    --arg sha "$(_dk_hash "$CASE/custom output/image.tar")" --arg root "$REPO" \
+    '.details.status == "built" and .details.dry_run == false and .details.pushed == false and
+     .details.result.context == $root and .details.result.dockerfile == ($root + "/docker/Dockerfile") and
+     .details.result.archive.sha256 == $sha and .details.result.archive.size > 0 and
+     .details.result.platforms == ["linux/amd64"] and
+     .details.result.tags == ["ghcr.io/acme/tool:v1.2.3","ghcr.io/acme/tool:stable"]' "$CASE/stdout"
+check 'public build forwards nested Dockerfile and root context as separate arguments' jq -e -s --arg root "$REPO" \
+    'any(.[]; .[0:2] == ["buildx","build"] and .[-1] == $root and
+     .[index("--file")+1] == ($root + "/docker/Dockerfile"))' "$DK_CALLS"
+capture bash "$CLI" docker build tool 1.2.3 --repo-path "$REPO" --local --platform linux/arm64
+check 'non-JSON public build retains one module receipt' jq -e -s \
+    'length == 1 and .[0].status == "built" and .[0].exporter == "docker" and .[0].platforms == ["linux/arm64"]' "$CASE/stdout"
+check 'public local exporter preserves honest attestation capabilities' jq -e -s \
+    'any(.[]; index("--load") != null and index("--provenance=false") != null and index("--sbom=false") != null)' "$DK_CALLS"
+
+new_case cli-setup
+DK_MODE=builder-absent
+cli_capture docker setup
+check 'public setup creates and bootstraps an absent named builder' test "$status" -eq 0
+check 'public setup reports completed readiness' jq -e \
+    '.details.status == "ready" and .details.ready == true and .details.dry_run == false and
+     .details.result.builder == "dsr-test-builder"' "$CASE/stdout"
+check 'public setup uses explicit builder without changing global selection' jq -e -s \
+    'any(.[]; .[0:2] == ["buildx","create"] and .[index("--name")+1] == "dsr-test-builder") and
+     any(.[]; .[0:2] == ["buildx","inspect"] and index("--bootstrap") != null) and
+     all(.[]; index("--use") == null and index("use") == null)' "$DK_CALLS"
+
+new_case cli-sign
+cli_capture docker sign "ghcr.io/acme/tool@$DK_DIGEST"
+check 'public standalone sign reports acknowledged write without verification' jq -e \
+    '.details.status == "signed" and .details.signed == true and .details.verified == false and
+     .details.result.verified == false and .details.dry_run == false' "$CASE/stdout"
+check 'signer diagnostics stay on stderr' bash -c \
+    '[[ "$(cat "$1")" == *"signer diagnostic on stdout"* ]]' bash "$CASE/stderr"
+
+new_case cli-release-verify
+unset DOCKER_CERTIFICATE_IDENTITY DOCKER_CERTIFICATE_OIDC_ISSUER
+cli_capture docker release tool v1.2.3 --repo-path "$REPO" --dockerfile docker/Dockerfile \
+    --platform linux/amd64,linux/arm64 --tag stable --certificate-identity builder@example.test \
+    --certificate-oidc-issuer https://issuer.example.test
+check 'public release completes all existing verification gates' test "$status" -eq 0
+check 'public release preserves verified physical inventory and immutable reference' jq -e \
+    --arg ref "ghcr.io/acme/tool@$DK_DIGEST" \
+    '.details.status == "verified" and .details.pushed == true and .details.dry_run == false and
+     .details.result.reference == $ref and .details.result.signature == "verified" and
+     .details.result.sbom == "verified" and
+     [.details.result.platforms[].platform] == ["linux/amd64","linux/arm64"]' "$CASE/stdout"
+: > "$DK_CALLS"
+DK_SYFT_DISABLED=true
+cli_capture docker verify "ghcr.io/acme/tool@$DK_DIGEST" --platform linux/amd64,linux/arm64 \
+    --certificate-identity builder@example.test --certificate-oidc-issuer https://issuer.example.test
+check 'public verifier works with scanner disabled and explicit trust policy' test "$status" -eq 0
+check 'public verifier returns independently checked signature and per-platform evidence' jq -e \
+    '.details.status == "verified" and .details.result.signature == "verified" and
+     (.details.result.platforms | length == 2) and
+     all(.details.result.platforms[]; .status == "verified" and (.predicate_sha256 | test("^[0-9a-f]{64}$")))' "$CASE/stdout"
+check 'public verifier has no build, login, scan, sign, attest, or builder effects' jq -e -s \
+    'all(.[]; .[0] != "syft" and .[0] != "gh" and .[0] != "login" and
+     .[0:2] != ["buildx","build"] and .[0:2] != ["buildx","create"] and .[0:2] != ["buildx","inspect"] and
+     .[0:2] != ["cosign","sign"] and .[0:2] != ["cosign","attest"])' "$DK_CALLS"
+export DOCKER_CERTIFICATE_IDENTITY=builder@example.test DOCKER_CERTIFICATE_OIDC_ISSUER=https://issuer.example.test
+for mode in raw-corrupt registry-fail verify-sign-fail empty-attestation wrong-sign-digest; do
+    DK_MODE="$mode"
+    cli_capture docker verify "ghcr.io/acme/tool@$DK_DIGEST"
+    expected_code=7
+    [[ "$mode" != registry-fail ]] || expected_code=8
+    check "public verifier preserves $mode exit code" test "$status" -eq "$expected_code"
+    check "public verifier cannot claim success for $mode" jq -e --argjson code "$expected_code" \
+        '.status == "error" and .exit_code == $code and .details.status == "error" and .details.result == null' "$CASE/stdout"
+done
+DK_MODE=''
+for mismatch in platform identity issuer; do
+    case "$mismatch" in
+        platform) args=(--platform linux/amd64) ;;
+        identity) args=(--certificate-identity stranger@example.test) ;;
+        issuer) args=(--certificate-oidc-issuer https://wrong.example.test) ;;
+    esac
+    cli_capture docker verify "ghcr.io/acme/tool@$DK_DIGEST" "${args[@]}"
+    check "public verifier rejects mismatched $mismatch" test "$status" -eq 7
+done
+
+new_case cli-evidence-recovery
+DK_MODE=second-attest-fail
+cli_capture docker release tool 1.2.3 --repo-path "$REPO"
+check 'public release reports partial attestation failure' test "$status" -eq 1
+check 'failed release does not invent completion or absence of partial writes' jq -e \
+    '.status == "error" and .details.status == "error" and .details.result == null and
+     (.details | has("pushed") | not)' "$CASE/stdout"
+check 'public failed release retains already-published child evidence' test -s "$DK_REGISTRY/attestations/$DK_AMD64.jsonl"
+DK_MODE=''
+: > "$DK_CALLS"
+cli_capture docker attest "ghcr.io/acme/tool@$DK_DIGEST" --platform linux/amd64,linux/arm64
+check 'public attestation recovery succeeds without rebuilding' test "$status" -eq 0
+check 'public recovery reports the root signature as not checked' jq -e \
+    '.details.status == "verified" and .details.result.signature == "not_checked" and
+     [.details.result.platforms[].platform] == ["linux/amd64","linux/arm64"]' "$CASE/stdout"
+check 'public recovery never rebuilds or signs the root' jq -e -s \
+    'all(.[]; .[0:2] != ["buildx","build"] and .[0:2] != ["cosign","sign"])' "$DK_CALLS"
+cli_capture docker verify "ghcr.io/acme/tool@$DK_DIGEST"
+check 'public recovered release independently verifies its full evidence set' test "$status" -eq 0
+check 'public post-recovery verification establishes the root signature' jq -e \
+    '.details.result.signature == "verified" and .details.result.operation == "verify"' "$CASE/stdout"
+
+new_case cli-invalid-arguments
+for option in --tool --version --repo-path --dockerfile --platform --tag --output; do
+    cli_capture --dry-run docker build "$option"
+    check "public build diagnoses missing $option value" test "$status" -eq 4
+    check "public build reports $option as an argument error" jq -e \
+        '.status == "error" and .exit_code == 4 and .details.status == "error"' "$CASE/stdout"
+done
+for operation in release verify attest; do
+    for option in --certificate-identity --certificate-oidc-issuer; do
+        if [[ "$operation" == release ]]; then args=(tool 1.2.3 --repo-path "$REPO")
+        else args=("ghcr.io/acme/tool@$DK_DIGEST"); fi
+        cli_capture --dry-run docker "$operation" "${args[@]}" "$option"
+        check "public $operation diagnoses missing $option value" test "$status" -eq 4
+    done
+done
+for option in --tag --repo-path --platform; do
+    case "$option" in
+        --tag) missing_value=stable ;;
+        --repo-path) missing_value="$REPO" ;;
+        --platform) missing_value=linux/amd64 ;;
+    esac
+    for policy in --skip-sign --certificate-identity; do
+        args=(tool 1.2.3 --repo-path "$REPO" "$option" "$policy")
+        [[ "$policy" != --certificate-identity ]] || args+=(builder@example.test)
+        args+=("$missing_value")
+        cli_capture --dry-run docker release "${args[@]}"
+        check "public release rejects $option interrupted by $policy" test "$status" -eq 4
+        check "missing $option cannot change policy interpretation" bash -c \
+            '[[ "$(cat "$1")" == *"$2"* ]]' bash "$CASE/stderr" "Missing value for $option"
+    done
+done
+for operation in build release sign setup verify attest; do
+    case "$operation" in
+        build|release) args=(tool 1.2.3 --repo-path "$REPO") ;;
+        sign|verify|attest) args=("ghcr.io/acme/tool@$DK_DIGEST") ;;
+        setup) args=() ;;
+    esac
+    cli_capture --dry-run docker "$operation" "${args[@]}" extra
+    check "public $operation refuses excess positional arguments" test "$status" -eq 4
+done
+for operation in sign verify attest; do
+    cli_capture --dry-run docker "$operation" ghcr.io/acme/tool:v1.2.3
+    check "public $operation refuses a mutable tag even in plans" test "$status" -eq 4
+done
+cli_capture --dry-run docker unknown-command
+check 'unknown public container command returns argument error' test "$status" -eq 4
+check 'all malformed public invocations fail before external operations' no_calls
+check 'invalid public dry runs do not create state' absent "$DSR_STATE_DIR"
+
+# JSON Schema is an additional contract check when its test-only dependency is
+# installed. The executable assertions above always run and remain decisive.
+if python3 -c 'import jsonschema' >/dev/null 2>&1; then
+    check 'all public envelopes satisfy the published JSON schema' python3 - "$ROOT/schemas/envelope.json" "$WORK/cases" <<'PY'
+import json
+import pathlib
+import sys
+import jsonschema
+schema = json.loads(pathlib.Path(sys.argv[1]).read_text())
+receipts = list(pathlib.Path(sys.argv[2]).glob('*/cli-*.json'))
+assert receipts
+for receipt in receipts:
+    jsonschema.validate(json.loads(receipt.read_text()), schema)
+PY
+else
+    printf 'NOTE: optional envelope JSON Schema validation unavailable (python3 jsonschema missing).\n'
+fi
 
 printf '\nContainer regression checks: %d; failures: %d\n' "$checks" "$failures"
 [[ "$failures" -eq 0 ]]

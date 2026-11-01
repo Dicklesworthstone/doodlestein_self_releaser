@@ -10622,11 +10622,24 @@ act_run_native_build() {
         fi
     fi
 
-    # Prepare log file
-    local log_dir log_file
+    # Every invocation owns its log, including retries of one target and
+    # concurrent standalone callers that share a release run. Allocate before
+    # preparation or compilation so unavailable evidence storage fails closed.
+    local log_dir log_file native_log_dir native_log_label
     log_dir="$ACT_LOGS_DIR"
-    mkdir -p "$log_dir"
-    log_file="$log_dir/${tool_name}-${native_target_slug}-${run_id:-$$}.log"
+    native_log_label="${tool_name}-${native_target_slug}-${run_id:-$$}"
+    native_log_label="${native_log_label//[^A-Za-z0-9._+-]/_}"
+    if ! mkdir -p "$log_dir" || [[ ! -d "$log_dir" || -L "$log_dir" ]] ||
+       ! native_log_dir=$(umask 077; mktemp -d "$log_dir/${native_log_label}.XXXXXXXX") ||
+       [[ ! -d "$native_log_dir" || -L "$native_log_dir" ]] ||
+       ! (umask 077; set -C; : > "$native_log_dir/build.log"); then
+        _log_error "Unable to allocate a private native build log for $platform on $host"
+        jq -nc --arg platform "$platform" --arg host "$host" \
+            '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
+              error:"Private native build log could not be allocated; compiler was not started"}'
+        return 4
+    fi
+    log_file="$native_log_dir/build.log"
 
     _log_info "Building $tool_name for $platform${selected_triple:+ ($selected_triple)} on $host"
     _log_info "Remote path: $remote_path"
@@ -11202,17 +11215,21 @@ EOF
                 jq -nc '{status: "error", exit_code: 4, error: "Private strict artifact directory unavailable"}'
                 return 4
             fi
-        elif [[ -n "$selected_triple" ]]; then
-            local variant_artifact_parent="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name}/${native_target_slug}"
-            if ! mkdir -p "$variant_artifact_parent" || \
-               [[ ! -d "$variant_artifact_parent" || -L "$variant_artifact_parent" ]] || \
-               ! artifact_dir=$(mktemp -d "$variant_artifact_parent/attempt.XXXXXXXX"); then
-                _log_error "Unable to create a fresh artifact directory for native variant $selected_triple"
+        else
+            # Singleton targets need the same per-attempt custody as variants.
+            # Reusing <run>/<platform>/<name> overwrites earlier result bytes
+            # on retry, even though their worker receipts remain immutable.
+            local native_artifact_parent="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name}/${native_target_slug}"
+            if ! mkdir -p "$native_artifact_parent" || \
+               [[ ! -d "$native_artifact_parent" || -L "$native_artifact_parent" ]] || \
+               ! artifact_dir=$(umask 077; mktemp -d "$native_artifact_parent/attempt.XXXXXXXX") || \
+               [[ ! -d "$artifact_dir" || -L "$artifact_dir" ]]; then
+                _log_error "Unable to create a fresh native artifact directory for $platform${selected_triple:+ ($selected_triple)}"
+                jq -nc --arg platform "$platform" --arg host "$host" \
+                    '{platform:$platform,method:"native",host:$host,status:"error",exit_code:4,
+                      error:"Private native artifact directory could not be allocated"}'
                 return 4
             fi
-        else
-            artifact_dir="$ACT_ARTIFACTS_DIR/${run_id:-build-$tool_name-$(date +%s)}/${platform//\//-}"
-            mkdir -p "$artifact_dir"
         fi
 
         # Small delay to ensure files are fully flushed on remote
