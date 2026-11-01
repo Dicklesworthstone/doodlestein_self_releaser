@@ -11,6 +11,7 @@ on:
       - scripts/tests/test_act_orchestration.sh
       - scripts/tests/test_act_build_cmd_tokens.sh
       - scripts/tests/test_act_runner_native.sh
+      - scripts/tests/test_config.sh
       - scripts/tests/test_disk_free_floor.sh
       - scripts/tests/test_artifact_formats.sh
       - scripts/tests/test_generated_installer_transactions.sh
@@ -116,15 +117,18 @@ jobs:
           bash scripts/tests/test_act_runner.sh --worker-admission-cancel-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/admission-cancellation.log"
           bash scripts/tests/test_act_orchestration.sh --dispatch-stdin-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-stdin.log"
           test -z "$(git status --porcelain)"
-      - name: Validate typed additional artifact admission
+      - name: Validate native and workflow companion artifact admission
         shell: bash
         run: |
           set -euo pipefail
           bash -n src/artifact_formats.sh
           bash -n scripts/tests/test_artifact_formats.sh
           bash -n scripts/tests/test_act_runner_native.sh
+          bash -n scripts/tests/test_config.sh
+          bash scripts/tests/test_config.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/companion-config.log"
           bash scripts/tests/test_artifact_formats.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/artifact-formats.log"
           bash scripts/tests/test_act_runner_native.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/typed-companions.log"
+          bash scripts/tests/test_act_runner.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workflow-companions.log"
           test -z "$(git status --porcelain)"
       - name: Validate actual native writable-path admission
         shell: bash

@@ -1122,7 +1122,7 @@ config_validate_targets() {
 
 # Additional release files have literal, globally unique names. Their declared
 # format is build policy, not a value an untrusted producer receipt may choose.
-# This pure normalizer is shared by configuration preflight and native readers.
+# This pure normalizer is shared by configuration preflight and producer readers.
 config_normalize_additional_artifacts_json() {
     local raw="${1:-null}" context="${2:-workspace_additional_artifacts}" normalized
     local act_jobs="${3:-null}"
@@ -1161,10 +1161,11 @@ config_normalize_additional_artifacts_json() {
             if (.value | length) == 0 then .
             elif $act_jobs != null and ($act_jobs | type) != "object"
             then refuse("act_job_map must be a platform mapping")
-            else ($act_jobs[$platform] // "") as $job |
-                if $job != "" and $job != "null"
-                then refuse($platform + " assigns additional artifacts to act job " + ($job | tojson) +
-                    "; additional artifacts require a native producer (set act_job_map[" + $platform + "]: null)")
+            else $act_jobs[$platform] as $job |
+                if $job != null and ($job | type) != "string"
+                then refuse($platform + " requires a string or null act job selector, received " + ($job | tojson))
+                elif ($job | type) == "string" and ($job | test("[\u0000-\u001f\u007f]"))
+                then refuse($platform + " has control characters in its act job selector")
                 else . end
             end
         ) | from_entries |
