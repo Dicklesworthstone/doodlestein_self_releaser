@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test_act_runner.sh - Unit tests for act_runner.sh module
 #
-# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only]
+# Usage: ./test_act_runner.sh [--workflow-isolation-only | --worker-admission-cancel-only | --typed-companions-only]
 #
 # Tests act integration functions without actually running Docker
 
@@ -1261,6 +1261,444 @@ PY
     fi
 }
 
+test_typed_workflow_companions() {
+    log_test "Actual act workers preserve typed companions and both evidence inventories"
+    if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
+import copy
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+module = Path(sys.argv[1])
+root = Path(tempfile.mkdtemp(prefix="dsr-typed-act-"))
+print("Retained typed act fixture:", root, flush=True)
+checks = 0
+failures = []
+run_id = "44444444-4444-4444-8444-444444444444"
+arches = ("amd64", "arm64")
+triples = {"amd64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unknown-linux-gnu"}
+
+def check(label, condition):
+    global checks
+    checks += 1
+    print(("PASS " if condition else "FAIL ") + label, flush=True)
+    if not condition:
+        failures.append(label)
+
+def require(label, condition):
+    check(label, condition)
+    if not condition:
+        raise AssertionError(label + "; retained evidence: " + str(root))
+
+def save(path, value):
+    path.write_text(json.dumps(value, sort_keys=True) + "\n")
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+for dependency in ("bash", "git", "jq", "yq", "tar", "gzip", "unzip"):
+    require("fixture dependency is available: " + dependency, shutil.which(dependency) is not None)
+
+source = root / "source"
+source.mkdir()
+(source / "workflow.yml").write_text("name: typed transport fixture\non: push\njobs:\n"
+    "  build-amd64:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    "  build-arm64:\n    runs-on: ubuntu-latest\n    steps: []\n")
+(source / "README").write_text("Owned synthetic workflow fixture; no compilation or payload execution.\n")
+for command in (("init", "--initial-branch=main"), ("add", "README", "workflow.yml"),
+                ("-c", "user.name=DSR fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"),
+                ("tag", "v1.0.0")):
+    subprocess.run(["git", "-C", str(source), *command], check=True, capture_output=True)
+source_pin = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+
+def primary(arch):
+    return "typedact-1.0.0-linux-" + arch + ".tar.gz"
+
+def compat(arch):
+    return "typedact-linux-" + arch + ".tar.gz"
+
+def metadata(arch):
+    # A filename's misleading ABI token must not override declared ownership.
+    return "metadata-musl-" + arch + ".json"
+
+def runtime(arch):
+    return "runtime-" + arch + ".zip"
+
+fixtures = root / "payload-fixtures"
+fixtures.mkdir()
+for arch, machine in (("amd64", 62), ("arm64", 183)):
+    header = bytearray(64)
+    header[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<HHI", header, 16, 2, machine, 1)
+    header.extend(("inert " + arch + " header fixture\n").encode())
+    with tarfile.open(fixtures / primary(arch), "w:gz") as archive:
+        member = tarfile.TarInfo("typedact")
+        member.size, member.mode, member.mtime = len(header), 0o755, 0
+        archive.addfile(member, io.BytesIO(header))
+    (fixtures / metadata(arch)).write_text(json.dumps({"target": "linux/" + arch, "fixture": True}) + "\n")
+    with zipfile.ZipFile(fixtures / runtime(arch), "w", zipfile.ZIP_DEFLATED) as archive:
+        member = zipfile.ZipInfo("runtime/info.json")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFREG | 0o644) << 16
+        archive.writestr(member, json.dumps({"runtime": arch}).encode())
+    (fixtures / (primary(arch) + ".sha256")).write_text(digest(fixtures / primary(arch)) + "  " + primary(arch) + "\n")
+(fixtures / "invalid.json").write_bytes(b'{"duplicate":1,"duplicate":2}\n')
+(fixtures / "invalid.zip").write_bytes(b"PK\x03\x04truncated final ZIP companion")
+(fixtures / "extra.txt").write_bytes(b"unexpected workflow upload\n")
+
+base_config = dict(tool_name="typedact", repo="owner/typedact", language="go", binary_name="typedact",
+    local_path=str(source), workflow="workflow.yml", targets=["linux/" + a for a in arches],
+    target_triples={"linux/" + a: [triples[a]] for a in arches},
+    act_job_map={"linux/" + a: "build-" + a for a in arches},
+    act_overrides=dict(platform_image="fixture/no-image-download"), archive_format="tar.gz",
+    artifact_naming="${name}-${version}-${os}-${arch}", install_script_compat="${name}-${os}-${arch}",
+    workspace_additional_artifacts={"linux/" + a: [dict(name=metadata(a), format="json"),
+                                                  dict(name=runtime(a), format="zip")] for a in arches})
+
+# These are the only replaced execution boundaries. The actual act argv,
+# config parser, worker, wrapper admission, architecture/content validators,
+# collection receipts, manifest mapper, and SLSA mapper all remain production.
+transport = r'''#!/usr/bin/env python3
+import json, os, stat, sys, time, zipfile
+from pathlib import Path
+args = sys.argv[1:]
+case = Path(os.environ["DSR_TYPED_ACT_CASE"])
+fd = os.open(case / "requests.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+os.write(fd, (json.dumps(args) + "\n").encode())
+os.close(fd)
+if args == ["--version"]:
+    print("act version 0.2.86")
+    raise SystemExit(0)
+job = args[args.index("-j") + 1]
+assert job.startswith("build-")
+arch = job[len("build-"):]
+uploads = Path(args[args.index("--artifact-server-path") + 1])
+(case / (arch + ".launch.json")).write_text(json.dumps({"argv": args, "uploads": str(uploads)}))
+if os.environ.get("DSR_TYPED_ACT_BARRIER") == "1":
+    (case / (arch + ".ready")).write_text("ready\n")
+    deadline = time.monotonic() + 15
+    while not all((case / (a + ".ready")).exists() for a in ("amd64", "arm64")):
+        if time.monotonic() > deadline:
+            raise SystemExit("concurrent typed transport peer did not start")
+        time.sleep(.02)
+for wrapper in json.loads((case / "uploads.json").read_text())[arch]:
+    destination = uploads / wrapper["name"]
+    output = case / (arch + "-linked-source.zip") if wrapper.get("linked") else destination
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in wrapper["members"]:
+            info = zipfile.ZipInfo(item["name"])
+            info.create_system = 3
+            info.external_attr = ((stat.S_IFLNK | 0o777) if item.get("symlink") else (stat.S_IFREG | 0o644)) << 16
+            archive.writestr(info, Path(item["source"]).read_bytes())
+    if wrapper.get("linked"):
+        destination.symlink_to(output)
+print("typed fixture uploaded " + arch, flush=True)
+'''
+worker = r'''source "$1" || exit $?
+act_load_repo_config typedact || exit $?
+status=0
+_act_run_target_worker typedact v1.0.0 44444444-4444-4444-8444-444444444444 \
+    "linux/$3" 1 "$2/$3.worker.log" "$2/$3.result.json" false null '{}' '' '' act-local release || status=$?
+[[ ! -f "$2/$3.result.json" ]] || cat "$2/$3.result.json"
+exit "$status"
+'''
+
+def make_case(label, mode="valid", change=None):
+    case = root / label
+    (case / "config/repos.d").mkdir(parents=True)
+    (case / "home").mkdir()
+    (case / "bin").mkdir()
+    for name, data in (("act", transport), ("docker", '#!/bin/sh\n[ "$1" = info ] || exit 98\n')):
+        (case / "bin" / name).write_text(data)
+        (case / "bin" / name).chmod(0o755)
+    config = copy.deepcopy(base_config)
+    if change:
+        change(config)
+    save(case / "config/repos.d/typedact.yaml", config)
+    save(case / "config/config.yaml", {})
+    save(case / "config/repos.yaml", {"tools": {}})
+    uploads = {}
+    for arch in arches:
+        def entry(name, source_name=None, **extra):
+            return dict(name=name, source=str(fixtures / (source_name or Path(name).name)), **extra)
+        payload = [entry("dist/" + primary(arch)), entry("dist/" + compat(arch), primary(arch)),
+                   entry("dist/" + primary(arch) + ".sha256")]
+        companions = [entry("reports/" + metadata(arch)), entry("assets/" + runtime(arch))]
+        if mode == "no-compat":
+            payload = [e for e in payload if Path(e["name"]).name != compat(arch)]
+        elif mode == "missing-primary":
+            payload = [e for e in payload if Path(e["name"]).name != primary(arch)]
+        elif mode == "missing-companion":
+            companions = companions[1:]
+        elif mode == "extra":
+            companions.append(entry("extra.txt"))
+        elif mode == "foreign":
+            other = "arm64" if arch == "amd64" else "amd64"
+            companions.append(entry(primary(other)))
+        elif mode == "duplicate":
+            companions.append(entry("another/" + primary(arch)))
+        elif mode == "case-alias":
+            payload.append(entry("other/" + metadata(arch).upper(), metadata(arch)))
+        elif mode == "invalid-json":
+            companions[0]["source"] = str(fixtures / "invalid.json")
+        elif mode == "invalid-zip":
+            companions[1]["source"] = str(fixtures / "invalid.zip")
+        elif mode == "invalid-checksum":
+            payload[2]["source"] = str(fixtures / "extra.txt")
+        elif mode in ("wrong-machine", "wrong-compat-machine"):
+            payload[0 if mode == "wrong-machine" else 1]["source"] = str(fixtures / primary("arm64" if arch == "amd64" else "amd64"))
+        elif mode == "traversal":
+            companions[0]["name"] = "../escaped-" + metadata(arch)
+        elif mode == "member-symlink":
+            companions[0]["symlink"] = True
+        uploads[arch] = [dict(name="primary-upload.zip", members=payload),
+                         dict(name="companion-upload.zip", members=companions)]
+        if mode in ("colliding-wrapper-name", "missing-inner-zip"):
+            uploads[arch] = [dict(name="primary-upload.zip", members=payload),
+                             dict(name="metadata-upload.zip", members=companions[:1]),
+                             dict(name=runtime(arch), members=companions[1:])]
+            if mode == "missing-inner-zip":
+                uploads[arch][2]["members"] = [entry("extra.txt")]
+        if mode == "wrapper-symlink":
+            uploads[arch][1]["linked"] = True
+    save(case / "uploads.json", uploads)
+    return case
+
+def environment(case, concurrent=False):
+    env = os.environ.copy()
+    env.update(PATH=str(case / "bin") + os.pathsep + env["PATH"], HOME=str(case / "home"),
+        XDG_CONFIG_HOME=str(case / "home/.config"), DSR_TYPED_ACT_CASE=str(case),
+        DSR_TYPED_ACT_BARRIER="1" if concurrent else "0", DSR_CONFIG_DIR=str(case / "config"),
+        DSR_CONFIG_FILE=str(case / "config/config.yaml"), DSR_REPOS_FILE=str(case / "config/repos.yaml"),
+        DSR_HOSTS_FILE=str(case / "config/hosts.yaml"), DSR_STATE_DIR=str(case / "state"),
+        DSR_CACHE_DIR=str(case / "cache"), ACT_ARTIFACTS_DIR=str(case / "artifacts"),
+        ACT_LOGS_DIR=str(case / "logs"), ACT_TIMEOUT="25", NO_COLOR="1")
+    return env
+
+def launch(case, arch="amd64", concurrent=False):
+    return subprocess.Popen(["bash", "-c", worker, "_", str(module), str(case), arch],
+        env=environment(case, concurrent), stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+
+def finish(case, arch, process):
+    try:
+        out, err = process.communicate(timeout=40)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        out, err = process.communicate(timeout=10)
+        raise AssertionError("typed act worker timed out: " + str(case))
+    (case / (arch + ".stdout")).write_bytes(out)
+    (case / (arch + ".stderr")).write_bytes(err)
+    result_path = case / (arch + ".result.json")
+    return process.returncode, json.loads(result_path.read_text()) if result_path.is_file() else {}
+
+def reusable(case, result):
+    return subprocess.run(["bash", "-c", 'source "$1"; _act_target_result_available "$2"',
+        "_", str(module), json.dumps(result)], env=environment(case), capture_output=True, timeout=10).returncode == 0
+
+def manifest(case, results, label, expected=0):
+    wanted = sorted(r["platform"] for r in results)
+    inventory = dict(tool="typedact", version="v1.0.0", run_id=run_id, git_sha=source_pin, git_ref="v1.0.0",
+        requested_targets=wanted, status="success", summary=dict(total=len(results), success=len(results), failed=0),
+        build_purpose="release", publishable=True, source_dependencies=[], targets=results)
+    selected, output = case / (label + "-inventory.json"), case / (label + "-manifest.json")
+    save(selected, inventory)
+    command = r'''source "$1" || exit $?
+act_load_repo_config typedact || exit $?
+act_generate_manifest "$(cat "$2")" "$3"
+'''
+    completed = subprocess.run(["bash", "-c", command, "_", str(module), str(selected), str(output)],
+        env=environment(case), capture_output=True, timeout=30)
+    (case / (label + "-manifest.stderr")).write_bytes(completed.stderr)
+    check(label + ": real manifest admission has expected outcome",
+          completed.returncode == expected and (output.is_file() if expected == 0 else not output.exists()))
+    return output if completed.returncode == 0 else None
+
+case = make_case("concurrent-success")
+processes = {a: launch(case, a, True) for a in arches}
+results = {}
+try:
+    for arch, process in processes.items():
+        status, result = finish(case, arch, process)
+        require(arch + ": actual concurrent worker accepts the complete typed output", status == 0 and result.get("status") == "success")
+        results[arch] = result
+finally:
+    for process in processes.values():
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=10)
+
+for arch, result in results.items():
+    wrappers, payload = Path(result["workflow_artifact_dir"]), Path(result["workflow_payload_dir"])
+    expected_payloads = {primary(arch), compat(arch), primary(arch) + ".sha256", metadata(arch), runtime(arch)}
+    check(arch + ": bridge owns an exact flat materialized payload inventory",
+          not result.get("artifact_dir") and {p.name for p in payload.iterdir()} == expected_payloads and
+          all(p.is_file() and not p.is_symlink() for p in payload.iterdir()))
+    check(arch + ": authoritative primaries do not duplicate typed companions",
+          {Path(p).name for p in result["artifact_paths"]} == {primary(arch), compat(arch), primary(arch) + ".sha256"} and
+          len(result["artifact_paths"]) == 3 and len(result["additional_artifacts"]) == 2 and
+          {Path(r["path"]).name for r in result["additional_artifacts"]} == {metadata(arch), runtime(arch)})
+    check(arch + ": final ZIP companion survives as exact bytes instead of being unwrapped",
+          (payload / runtime(arch)).read_bytes() == (fixtures / runtime(arch)).read_bytes() and
+          not (payload / "info.json").exists())
+    check(arch + ": unversioned misleading-ABI JSON is preserved under its exact declared name",
+          (payload / metadata(arch)).read_bytes() == (fixtures / metadata(arch)).read_bytes())
+    actual_paths = {str(p) for directory in (wrappers, payload) for p in directory.rglob("*") if p.is_file()}
+    receipts = result.get("resume_artifacts", [])
+    check(arch + ": completion receipts bind every original wrapper and materialized payload",
+          {r["path"] for r in receipts} == actual_paths and len(receipts) == len(actual_paths) and
+          all(r["sha256"] == digest(Path(r["path"])) and r["size_bytes"] == Path(r["path"]).stat().st_size for r in receipts))
+    check(arch + ": completed worker is reusable with both inventories intact", reusable(case, result))
+    check(arch + ": ordinary JSON object key reordering preserves valid receipt semantics",
+          reusable(case, json.loads(json.dumps(result, sort_keys=True))))
+    launch_record = json.loads((case / (arch + ".launch.json")).read_text())
+    check(arch + ": actual act subprocess retains target job, tag, and private upload directory",
+          launch_record["uploads"] == str(wrappers) and "build-" + arch in launch_record["argv"] and
+          "GITHUB_REF=refs/tags/v1.0.0" in launch_record["argv"])
+check("concurrent targets retain separate wrapper and payload directories",
+      all(len({results[a][field] for a in arches}) == 2 for field in ("workflow_artifact_dir", "workflow_payload_dir", "log_file")))
+output = manifest(case, list(results.values()), "complete")
+require("complete typed workflow manifest exists", output is not None)
+records = json.loads(output.read_text())["artifacts"]
+expected_names = {name for a in arches for name in (primary(a), compat(a), metadata(a), runtime(a))}
+check("manifest includes every primary and typed companion exactly once, without transport ZIPs",
+      {r["name"] for r in records} == expected_names and len(records) == len(expected_names))
+for arch in arches:
+    own = [r for r in records if r["name"] in (primary(arch), compat(arch), metadata(arch), runtime(arch))]
+    check(arch + ": manifest uses configured GNU ownership despite companion musl filename",
+          len(own) == 4 and all(r["target"] == "linux/" + arch and r["target_triple"] == triples[arch] for r in own))
+    check(arch + ": manifest hashes exact materialized final ZIP and JSON bodies",
+          all(r["sha256"] == digest(Path(results[arch]["workflow_payload_dir"]) / r["name"]) for r in own) and
+          next(r for r in own if r["name"] == runtime(arch))["archive_format"] == "zip")
+proof = case / "complete.intoto.jsonl"
+with proof.open("wb") as out:
+    statement_result = subprocess.run(["bash", "-c", 'source "$1/slsa.sh"; _slsa_manifest_statement "$2" owner/typedact dsr:typed-act-fixture',
+        "_", str(module.parent), str(output)], stdout=out, stderr=subprocess.PIPE, env=environment(case), timeout=20)
+(case / "proof.stderr").write_bytes(statement_result.stderr)
+require("production SLSA mapper accepts complete typed workflow manifest", statement_result.returncode == 0)
+statement = json.loads(proof.read_text())
+check("SLSA subjects bind each complete payload digest exactly once",
+      {s["name"]: s["digest"]["sha256"] for s in statement["subject"]} == {r["name"]: r["sha256"] for r in records} and
+      len(statement["subject"]) == len(records))
+check("SLSA preserves platform ownership and binds the manifest containing explicit GNU triples",
+      {r["name"]: r["target"] for r in statement["dsr_evidence"]["artifacts"]} == {r["name"]: r["target"] for r in records} and
+      statement["dsr_evidence"]["manifest_sha256"] == digest(output) and
+      statement["predicate"]["runDetails"]["byproducts"][0]["digest"]["sha256"] == digest(output))
+
+# Recheck real resume and manifest admission after mutations of either complete
+# directory. Restore private evidence through renames; retain every adversarial
+# object, including links, instead of deleting failed fixtures.
+result = results["amd64"]
+for index, mutation in enumerate(("wrapper-bytes", "wrapper-added", "wrapper-missing", "wrapper-link", "wrapper-dir-link",
+                                  "payload-bytes", "payload-added", "payload-missing", "payload-link", "payload-dir-link")):
+    wrappers, payload = Path(result["workflow_artifact_dir"]), Path(result["workflow_payload_dir"])
+    directory = wrappers if mutation.startswith("wrapper") else payload
+    selected = wrappers / "primary-upload.zip" if mutation.startswith("wrapper") else payload / metadata("amd64")
+    held = case / ("held-" + mutation)
+    if mutation.endswith("bytes"):
+        original = selected.read_bytes()
+        selected.write_bytes(original + b"same inode, changed evidence\n")
+        restore = lambda p=selected, data=original: p.write_bytes(data)
+    elif mutation.endswith("added"):
+        selected = directory / ("unlisted.zip" if mutation.startswith("wrapper") else "unlisted.json")
+        selected.write_bytes((fixtures / runtime("amd64")).read_bytes())
+        restore = lambda p=selected, h=held: p.rename(h)
+    elif mutation.endswith("missing"):
+        selected.rename(held)
+        restore = lambda p=selected, h=held: h.rename(p)
+    else:
+        if mutation.endswith("dir-link"):
+            selected = directory
+        selected.rename(held)
+        selected.symlink_to(held, target_is_directory=held.is_dir())
+        def restore(p=selected, h=held):
+            p.rename(Path(str(h) + "-link"))
+            h.rename(p)
+    try:
+        check(mutation + ": frozen worker cannot be resumed", not reusable(case, result))
+        manifest(case, list(results.values()), "drift-" + str(index), 4)
+    finally:
+        restore()
+    check(mutation + ": exact evidence restoration restores availability", reusable(case, result))
+
+optional_case = make_case("optional-compat", "no-compat")
+status, optional = finish(optional_case, "amd64", launch(optional_case))
+check("configured compatibility primary remains optional", status == 0 and optional.get("status") == "success" and
+      compat("amd64") not in {Path(p).name for p in optional.get("artifact_paths", [])})
+
+named_case = make_case("colliding-wrapper-name", "colliding-wrapper-name")
+status, named = finish(named_case, "amd64", launch(named_case))
+require("transport wrapper may share the final ZIP companion's basename", status == 0 and named.get("status") == "success")
+check("colliding wrapper name publishes exact inner ZIP bytes, never the transport container",
+      (Path(named["workflow_payload_dir"]) / runtime("amd64")).read_bytes() == (fixtures / runtime("amd64")).read_bytes() and
+      (Path(named["workflow_payload_dir"]) / runtime("amd64")).read_bytes() !=
+      (Path(named["workflow_artifact_dir"]) / runtime("amd64")).read_bytes())
+named_manifest = manifest(named_case, [named], "colliding-wrapper-name")
+check("manifest retains the inner companion ZIP digest after colliding wrapper-name admission",
+      named_manifest is not None and any(r["name"] == runtime("amd64") and r["sha256"] == digest(fixtures / runtime("amd64"))
+                                        for r in json.loads(named_manifest.read_text())["artifacts"]))
+
+for kind in ("wrapper", "payload"):
+    linked_case = make_case("retained-" + kind + "-hardlink")
+    status, linked = finish(linked_case, "amd64", launch(linked_case))
+    require(kind + " hardlink control starts with an accepted actual worker", status == 0 and linked.get("status") == "success")
+    selected = (Path(linked["workflow_artifact_dir"]) / "primary-upload.zip" if kind == "wrapper" else
+                Path(linked["workflow_payload_dir"]) / metadata("amd64"))
+    frozen = (selected.stat().st_ino, digest(selected), selected.stat().st_size)
+    os.link(selected, linked_case / "external-hardlink")
+    check(kind + " hardlink changes link count while retaining every frozen byte and file identity",
+          selected.stat().st_nlink == 2 and frozen == (selected.stat().st_ino, digest(selected), selected.stat().st_size))
+    check(kind + " hardlink blocks resume even without a byte change", not reusable(linked_case, linked))
+    manifest(linked_case, [linked], "hardlink", 4)
+
+for mode in ("missing-primary", "missing-companion", "extra", "foreign", "duplicate", "case-alias", "invalid-json", "invalid-zip", "invalid-checksum",
+             "wrong-machine", "wrong-compat-machine", "traversal", "member-symlink", "wrapper-symlink", "missing-inner-zip"):
+    rejected = make_case("reject-" + mode, mode)
+    status, refused = finish(rejected, "amd64", launch(rejected))
+    check(mode + ": invalid actual upload fails worker publication",
+          status != 0 and refused.get("status") not in ("success", "ok", "passed") and not refused.get("resume_artifacts"))
+    check(mode + ": test reached the real act subprocess without escaping its upload boundary",
+          (rejected / "amd64.launch.json").is_file() and not list(root.rglob("escaped-*.json")))
+
+def share_job_with_untyped_peer(config):
+    config["act_job_map"]["linux/arm64"] = "build-amd64"
+    config["workspace_additional_artifacts"]["linux/arm64"] = []
+
+for label, change in (
+    ("multiple-act-variants", lambda c: c["target_triples"]["linux/amd64"].append("x86_64-unknown-linux-musl")),
+    ("nonselected-act-variants", lambda c: c["target_triples"]["linux/arm64"].append("aarch64-unknown-linux-musl")),
+    ("ambiguous-primary-owner", lambda c: c.update(artifact_naming="${name}-${version}", install_script_compat="${name}")),
+    ("shared-act-job", lambda c: c["act_job_map"].update({"linux/arm64": "build-amd64"})),
+    ("shared-act-job-untyped-peer", share_job_with_untyped_peer),
+    ("companion-primary-collision", lambda c: c["workspace_additional_artifacts"]["linux/arm64"].append(
+        dict(name=primary("amd64"), format="tar.gz"))),
+):
+    rejected = make_case("preflight-" + label, change=change)
+    status, refused = finish(rejected, "amd64", launch(rejected))
+    check(label + ": invalid entire ownership plan rejects before any act invocation",
+          status == 4 and not (rejected / "requests.jsonl").exists() and not refused.get("resume_artifacts"))
+
+save(root / "summary.json", dict(checks=checks, failures=failures))
+print("Typed act companions: %d checks, %d failures" % (checks, len(failures)), flush=True)
+sys.exit(bool(failures))
+PY
+    then
+        log_pass "Actual typed workflow workers preserve complete release and resume evidence"
+    else
+        log_fail "Typed workflow companion admission, publication or resume failed"
+    fi
+}
+
 test_timeout_descendant_cancellation() {
     log_test "Real timeout descendant cancellation"
     if python3 - "$SRC_DIR/act_runner.sh" <<'PY'
@@ -1924,6 +2362,11 @@ PY
 
 # Main
 main() {
+    if [[ "${1:-}" == "--typed-companions-only" ]]; then
+        test_typed_workflow_companions
+        [[ "$FAIL_COUNT" -eq 0 ]]
+        return
+    fi
     if [[ "${1:-}" == "--worker-admission-cancel-only" ]]; then
         test_worker_admission_cancellation
         [[ "$FAIL_COUNT" -eq 0 ]]
@@ -1970,6 +2413,7 @@ main() {
     test_act_run_workflow_requires_runner_image_mapping
     test_act_run_workflow_isolates_parent_write_workflows
     test_concurrent_workflow_isolation
+    test_typed_workflow_companions
     test_act_analyze_workflow
     test_timeout_descendant_cancellation
     test_workflow_process_cancellation

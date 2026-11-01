@@ -3729,17 +3729,19 @@ test_typed_additional_artifact_preflight() {
         fi
     done
 
-    log_test "Actual configuration parser rejects companions assigned to act producers before work begins"
-    local route owner
-    for route in load orchestrate native native-control; do
+    log_test "Actual configuration parser admits typed act owners and refuses malformed producers before work"
+    local route owner job
+    for route in load orchestrate native act-control native-control; do
         case_dir=$(mktemp -d "$MOCK_DIR/typed-producer-${route}.XXXXXXXX") || return
         mkdir -p "$case_dir/config/repos.d" || return
         owner=linux/amd64
         [[ "$route" != native-control ]] || owner=windows/amd64
-        jq -nc --arg owner "$owner" --arg source "$case_dir/source" '
+        job=false
+        [[ "$route" != *-control ]] || job='"release-linux"'
+        jq -nc --arg owner "$owner" --argjson job "$job" --arg source "$case_dir/source" '
             {tool_name:"tool",repo:"Test/tool",language:"go",binary_name:"tool",local_path:$source,
              targets:["linux/amd64","windows/amd64"],
-             act_job_map:{"linux/amd64":"release-linux","windows/amd64":null},
+             act_job_map:{"linux/amd64":$job,"windows/amd64":null},
              workspace_additional_artifacts:{($owner):[{name:"notes.json",format:"json"}]}}
         ' > "$case_dir/config/repos.d/tool.yaml" || return
         status=0
@@ -3759,24 +3761,24 @@ test_typed_additional_artifact_preflight() {
                 load) act_load_repo_config tool ;;
                 orchestrate) act_orchestrate_build tool v1.6.0 -- windows/amd64 ;;
                 native) act_run_native_build tool windows/amd64 v1.6.0 44444444-4444-4444-8444-444444444444 ;;
-                native-control)
+                act-control|native-control)
                     act_load_repo_config tool || exit $?
                     [[ "$(act_get_job_for_target tool linux/amd64)" == release-linux ]] || exit 99
                     [[ -z "$(act_get_job_for_target tool windows/amd64)" ]] || exit 99
                     ;;
             esac
         ) || status=$?
-        if [[ "$route" == native-control ]]; then
+        if [[ "$route" == *-control ]]; then
             if [[ "$status" -eq 0 && "$(cat "$case_dir/events")" == source-selection ]]; then
-                log_pass "Native companions retain existing native/act target selection"
+                log_pass "$route typed companions retain exact native/act target selection"
             else
-                log_fail "Native companion configuration changed target selection: status=$status evidence=$case_dir"
+                log_fail "$route typed companion configuration changed target selection: status=$status evidence=$case_dir"
             fi
         elif [[ "$status" -eq 4 && ! -e "$case_dir/events" && ! -e "$case_dir/artifacts" ]] &&
-             grep -q 'linux/amd64' "$case_dir/stderr" && grep -q 'release-linux' "$case_dir/stderr"; then
-            log_pass "$route rejects the nonselected act companion producer before source, transport or compiler work"
+             grep -q 'linux/amd64' "$case_dir/stderr" && grep -Eq 'act_job_map|act job selector' "$case_dir/stderr"; then
+            log_pass "$route rejects the nonselected malformed producer before source, transport or compiler work"
         else
-            log_fail "$route act companion producer crossed admission: status=$status result=$result evidence=$case_dir"
+            log_fail "$route malformed producer crossed admission: status=$status result=$result evidence=$case_dir"
         fi
     done
 }

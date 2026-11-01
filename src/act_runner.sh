@@ -432,6 +432,304 @@ _act_validate_additional_artifact() {
     fi
 }
 
+# Opted-in workflow producers must own one physical target and one unambiguous
+# release naming family. Resolve the whole configuration before any job starts;
+# a selected subset cannot hide a second owner of the same job or asset name.
+_act_workflow_payload_plans_json() {
+    local tool="$1" version="$2" config_file="$ACT_REPOS_DIR/$1.yaml"
+    local configured document enabled module_dir target job owners triples triple format names binaries binary repo_path
+    local primary compat outputs plan plans='{}' primary_owners='[]' all_names='{}'
+    configured=$(_act_workspace_additional_artifacts_json "$config_file") || return 4
+    document=$(_config_read_single_mapping_json "$config_file") || return 4
+    enabled=$(jq -c --argjson configured "$configured" '
+        . as $doc | [$configured | to_entries[] | select(.value | length > 0) |
+        .key as $target | $doc.act_job_map[$target] as $job |
+        select(($job | type) == "string" and $job != "" and $job != "null") | $target]
+    ' <<< "$document") || return 4
+    [[ "$enabled" != '[]' ]] || { printf '{}\n'; return 0; }
+    repo_path=$(act_get_local_path "$tool") || return 4
+    if ! jq -e --argjson enabled "$enabled" '
+        (.targets | type == "array") and (($enabled - .targets) | length == 0)
+    ' <<< "$document" >/dev/null; then
+        _log_error "Workflow additional artifacts require their owners in the configured targets: $enabled"
+        return 4
+    fi
+    if ! declare -F artifact_naming_generate_dual_for_tool &>/dev/null; then
+        module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+        # shellcheck source=SCRIPTDIR/artifact_naming.sh
+        source "$module_dir/artifact_naming.sh" || return 3
+    fi
+    while IFS= read -r target; do
+        job=$(jq -r --arg target "$target" '.act_job_map[$target]' <<< "$document") || return 4
+        owners=$(jq -c --arg job "$job" '. as $doc | [.targets[] | select($doc.act_job_map[.] == $job)]' \
+            <<< "$document") || return 4
+        if [[ "$(jq length <<< "$owners")" != 1 ]]; then
+            _log_error "Workflow job '$job' for $target has ambiguous target owners $owners; use a distinct job per typed companion producer"
+            return 4
+        fi
+        triples=$(config_get_target_triples_json "$tool" "$target") || return 4
+        if [[ "$(jq length <<< "$triples")" -gt 1 ]]; then
+            _log_error "Workflow job '$job' for $target declares multiple target triples; typed companion producers require one target variant"
+            return 4
+        fi
+    done < <(jq -r '.[]' <<< "$enabled")
+
+    # Include unselected and native targets when checking release-name owners.
+    while IFS= read -r target; do
+        format=$(jq -r --arg os "${target%/*}" '
+            if (.archive_format | type) == "object" then .archive_format[$os] // ""
+            elif (.archive_format | type) == "string" then .archive_format else "" end
+        ' <<< "$document") || return 4
+        if [[ "$format" == binary && "$target" == windows/* ]]; then
+            format=exe
+        elif [[ "$format" == none || "$format" == binary ]]; then
+            format=none
+        else
+            format=$(_act_workspace_archive_format "$config_file" "$target") || return 4
+        fi
+        triples=$(config_get_target_triples_json "$tool" "$target") || return 4
+        [[ "$triples" != '[]' ]] || triples='[""]'
+        while IFS= read -r triple; do
+            names=$(artifact_naming_generate_dual_for_tool "$tool" "$version" "${target%/*}" "${target#*/}" \
+                "$format" "$repo_path" release "$triple") || return 4
+            primary_owners=$(jq -c --arg target "$target" --argjson names "$names" \
+                '. + ([$names.versioned, $names.compat] | unique | map({target:$target,name:.}))' \
+                <<< "$primary_owners") || return 4
+            all_names=$(jq -c --arg target "$target" --argjson names "$names" \
+                '. + {($target):$names}' <<< "$all_names") || return 4
+        done < <(jq -r '.[]' <<< "$triples")
+    done < <(jq -r '.targets[]' <<< "$document")
+    if ! jq -en --argjson primary "$primary_owners" --argjson additional "$configured" '
+        [$additional[][] | .name | ascii_downcase] as $names |
+        all($primary[]; (.name | ascii_downcase) as $name | ($names | index($name)) == null)
+    ' >/dev/null; then
+        _log_error "Workflow additional artifact name collides with a configured primary or installer alias"
+        return 4
+    fi
+    while IFS= read -r target; do
+        job=$(jq -r --arg target "$target" '.act_job_map[$target]' <<< "$document") || return 4
+        names=$(jq -c --arg target "$target" '.[$target]' <<< "$all_names") || return 4
+        if ! jq -en --arg target "$target" --argjson owners "$primary_owners" --argjson names "$names" '
+            [$names.versioned, $names.compat] | map(ascii_downcase) as $own |
+            all($owners[] | select(.target != $target); (.name | ascii_downcase) as $name |
+                ($own | index($name)) == null)
+        ' >/dev/null; then
+            _log_error "Workflow job '$job' for $target has ambiguous primary names; include the platform in artifact_naming and install_script_compat"
+            return 4
+        fi
+        format=$(_act_workspace_archive_format "$config_file" "$target") || return 4
+        primary=$(jq -r '.versioned' <<< "$names") || return 4
+        compat=$(jq -r '.compat' <<< "$names") || return 4
+        if [[ "$primary" != "$compat" && "${primary,,}" == "${compat,,}" ]]; then
+            _log_error "Workflow job '$job' for $target has primary names that differ only by case"
+            return 4
+        fi
+        binaries=$(_act_workspace_binaries_for_target "$config_file" "$target") || return 4
+        [[ -n "$binaries" ]] || binaries=$(jq -r --arg tool "$tool" '.binary_name // $tool' <<< "$document") || return 4
+        local -a members=()
+        while IFS= read -r binary; do
+            _act_is_safe_basename "$binary" || return 4
+            if [[ "$target" == windows/* ]]; then
+                [[ "${binary,,}" != *.exe ]] || binary="${binary:0:${#binary}-4}"
+                binary="${binary}.exe"
+            fi
+            members+=("$binary")
+        done <<< "$binaries"
+        binaries=$(printf '%s\n' "${members[@]}" | jq -Rsc 'split("\n")[:-1]') || return 4
+        outputs=$(jq -cn --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
+            --argjson companions "$(jq -c --arg target "$target" '.[$target]' <<< "$configured")" '
+            ([$primary,$compat] | unique | map({key:.,value:{role:"primary",format:$format,required:(. == $primary)}}) |
+             from_entries) as $primaries |
+            $primaries + ($primaries | to_entries | map({key:(.key + ".sha256"),value:{role:"checksum",format:"file",required:false}}) | from_entries) +
+            ($companions | map({key:.name,value:{role:"additional",format:.format,required:true}}) | from_entries)
+        ') || return 4
+        plan=$(jq -cn --arg target "$target" --arg job "$job" --arg version "$version" \
+            --arg primary "$primary" --arg compat "$compat" --arg format "$format" \
+            --argjson binaries "$binaries" --argjson outputs "$outputs" \
+            '{target:$target,job:$job,version:$version,primary:$primary,compat:$compat,
+              archive_format:$format,binaries:$binaries,outputs:$outputs}') || return 4
+        plans=$(jq -c --arg target "$target" --argjson plan "$plan" '. + {($target):$plan}' <<< "$plans") || return 4
+    done < <(jq -r '.[]' <<< "$enabled")
+    printf '%s\n' "$plans"
+}
+
+# Workflow primary archives may include notices or other regular data, but
+# every configured executable must exist at its exact root name and have the
+# owning target's binary format and architecture. Full archive admission runs
+# first, including CRC/trailer, path, link and expansion checks.
+_act_validate_workflow_primary() {
+    local file="$1" plan="$2" format target members binary size mode executable
+    format=$(jq -r '.archive_format' <<< "$plan") || return 4
+    target=$(jq -r '.target' <<< "$plan") || return 4
+    packaging_validate_archive "$file" "$format" || return 4
+    members=$(packaging_payload_members "$file" "$format") || return 4
+    while IFS= read -r binary; do
+        if ! printf '%s\n' "$members" | grep -Fx -- "$binary" >/dev/null; then
+            _log_error "Workflow primary $(basename "$file") for $target is missing configured binary $binary"
+            return 4
+        fi
+        size=$(_act_archive_entry_stream "$file" "$format" "$binary" | wc -c | tr -d '[:space:]') || return 4
+        mode=$(_act_archive_member_mode "$file" "$format" "$binary") || return 4
+        executable=false
+        [[ "$mode" != *x* ]] || executable=true
+        _act_validate_target_binary_reader "$file::$binary" "$target" "$size" "$executable" \
+            _act_read_archive_hex_bytes "$file" "$format" "$binary" || return 4
+    done < <(jq -r '.binaries[]' <<< "$plan")
+}
+
+# Independent manifest admission repeats this check using a freshly resolved
+# configuration plan. Neither a worker's method flag nor its filename can
+# choose the owner, declared content type or compiler variant.
+_act_validate_workflow_payload_result() {
+    local result="$1" plan="$2" payload inventory actual paths additional name path row role format sha size identity
+    payload=$(jq -er '.workflow_payload_dir | strings | select(length > 0)' <<< "$result") || return 4
+    if ! jq -e --argjson plan "$plan" '
+        .method == "act" and .platform == $plan.target and .job == $plan.job and
+        .workflow_payload_plan == $plan and (.artifact_dir // "") == "" and (.artifact_path // "") == "" and
+        (.workflow_artifact_dir | type == "string" and length > 0) and
+        .workflow_artifact_dir != .workflow_payload_dir and
+        (.artifact_paths | type == "array" and all(.[]; type == "string")) and
+        (.additional_artifacts | type == "array")
+    ' <<< "$result" >/dev/null; then
+        _log_error "Workflow result does not match its configured payload ownership plan"
+        return 4
+    fi
+    inventory=$(jq -ceS '.workflow_inventory | if type == "array" and length > 0 then sort_by(.path) else error("missing workflow inventory") end' \
+        <<< "$result") || return 4
+    actual=$(_act_result_artifact_receipts "$result") || return 4
+    [[ "$actual" == "$inventory" ]] || { _log_error "Workflow transport or payload bytes differ from their collection inventory"; return 4; }
+    paths='[]' additional='[]'
+    local seen='[]'
+    while IFS= read -r -d '' path; do
+        [[ "$path" == "$payload" ]] && continue
+        [[ -f "$path" && ! -L "$path" && "${path%/*}" == "$payload" ]] || return 4
+        name="${path##*/}"
+        row=$(jq -ce --arg name "$name" '.outputs[$name] // error("undeclared workflow payload: " + $name)' <<< "$plan") || return 4
+        seen=$(jq -c --arg name "$name" '. + [$name]' <<< "$seen") || return 4
+        role=$(jq -r '.role' <<< "$row") || return 4
+        format=$(jq -r '.format' <<< "$row") || return 4
+        row=$(jq -ce --arg path "$path" '.[] | select(.path == $path)' <<< "$inventory") || return 4
+        sha=$(jq -r '.sha256' <<< "$row"); size=$(jq -r '.size_bytes' <<< "$row"); identity=$(jq -r '.identity' <<< "$row")
+        _act_validate_additional_artifact "$path" "$(jq -r '.target' <<< "$plan")" "$format" "$sha" "$size" "$identity" || return 4
+        if [[ "$role" == additional ]]; then
+            additional=$(jq -c --argjson row "$row" '. + [$row]' <<< "$additional") || return 4
+        else
+            paths=$(jq -c --arg path "$path" '. + [$path]' <<< "$paths") || return 4
+            if [[ "$role" == primary ]]; then
+                _act_validate_workflow_primary "$path" "$plan" || return 4
+            else
+                [[ -f "$payload/${name%.sha256}" && ! -L "$payload/${name%.sha256}" ]] || return 4
+                sha=$(_act_sha256 "$payload/${name%.sha256}") || return 4
+                if ! python3 - "$path" "$sha" "${name%.sha256}" <<'PY'
+import sys
+path, digest, name = sys.argv[1:]
+with open(path, 'rb') as stream:
+    data = stream.read(1025)
+forms = [digest, digest + '  ' + name, digest + ' *' + name]
+allowed = {form.encode('ascii') + ending for form in forms for ending in (b'', b'\n', b'\r\n')}
+raise SystemExit(0 if data in allowed else 4)
+PY
+                then
+                    _log_error "Workflow checksum does not describe its owned primary: $name"
+                    return 4
+                fi
+            fi
+        fi
+    done < <(find "$payload" -print0)
+    if ! jq -en --argjson seen "$seen" --argjson plan "$plan" --argjson result "$result" \
+        --argjson paths "$paths" --argjson additional "$additional" '
+        ($seen | map(ascii_downcase) | length == (unique | length)) and
+        (([$plan.outputs | to_entries[] | select(.value.required) | .key] - $seen) | length == 0) and
+        ($paths | sort) == ($result.artifact_paths | sort) and
+        ($additional | sort_by(.path)) == ($result.additional_artifacts | sort_by(.path))
+    ' >/dev/null; then
+        _log_error "Workflow result is missing required primaries or companions, or has contradictory payload receipts"
+        return 4
+    fi
+    actual=$(_act_result_artifact_receipts "$result") || return 4
+    [[ "$actual" == "$inventory" ]] || return 4
+}
+
+# act's upload ZIPs are transport containers. Materialize one exact payload
+# namespace before exposing a successful result, retaining both the original
+# transport inventory and final files for resume verification. A final archive
+# companion is copied intact and never fed through the legacy ZIP heuristic.
+_act_materialize_workflow_payloads() {
+    local result="$1" plan="$2" raw root payload before after row source copy name path receipt selected
+    local index=0 role format paths='[]' additional='[]' inventory module_dir extracted
+    local -A seen=()
+    raw=$(jq -er '.artifact_dir | strings | select(length > 0)' <<< "$result") || return 4
+    before=$(_act_result_artifact_receipts "$(jq -cn --arg dir "$raw" '{workflow_artifact_dir:$dir}')") || return 4
+    module_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 3
+    if ! declare -F packaging_extract_payload &>/dev/null; then
+        # shellcheck source=SCRIPTDIR/packaging.sh
+        source "$module_dir/packaging.sh" || return 3
+    fi
+    root=$(mktemp -d "$ACT_ARTIFACTS_DIR/workflow-payload.XXXXXXXX") || return 4
+    payload="$root/payload"
+    mkdir -m 700 "$payload" || return 4
+    while IFS= read -r row; do
+        source=$(jq -r '.path' <<< "$row") || return 4
+        index=$((index + 1))
+        copy="$root/input-$index"
+        receipt=$(_act_collect_stream_exclusive "$copy" 600 _act_stream_local_file "$source") || return 4
+        if ! jq -en --argjson source "$row" --argjson copy "$receipt" \
+            '$source.sha256 == $copy.sha256 and $source.size_bytes == $copy.size_bytes' >/dev/null; then
+            _log_error "Workflow upload changed during held collection: $source"
+            return 4
+        fi
+        name="${source##*/}"
+        if act_artifact_zip_is_wrapper act "$source"; then
+            extracted="$root/extracted-$index"
+            mkdir -m 700 "$extracted" || return 4
+            packaging_extract_payload "$copy" zip "$extracted" || return 4
+            selected='[]'
+            while IFS= read -r -d '' path; do
+                [[ -f "$path" && ! -L "$path" ]] || return 4
+                selected=$(jq -c --arg name "${path##*/}" --arg path "$path" \
+                    '. + [{name:$name,path:$path}]' <<< "$selected") || return 4
+            done < <(find "$extracted" -type f -print0)
+        elif jq -e --arg name "$name" '.outputs | has($name)' <<< "$plan" >/dev/null; then
+            selected=$(jq -cn --arg name "$name" --arg path "$copy" '[{name:$name,path:$path}]') || return 4
+        else
+            _log_error "Workflow job $(jq -r '.job' <<< "$plan") uploaded an undeclared file: $source"
+            return 4
+        fi
+        while IFS= read -r receipt; do
+            name=$(jq -r '.name' <<< "$receipt"); path=$(jq -r '.path' <<< "$receipt")
+            if [[ -n "${seen[${name,,}]:-}" ]] ||
+               ! jq -e --arg name "$name" '.outputs | has($name)' <<< "$plan" >/dev/null ||
+               { ! _act_is_safe_basename "$name" &&
+                 ! jq -e --arg name "$name" '.outputs[$name].role == "checksum"' <<< "$plan" >/dev/null; }; then
+                _log_error "Workflow job $(jq -r '.job' <<< "$plan") for $(jq -r '.target' <<< "$plan") has a duplicate, foreign or undeclared payload: $name"
+                return 4
+            fi
+            seen["${name,,}"]=1
+            role=$(jq -r --arg name "$name" '.outputs[$name].role' <<< "$plan") || return 4
+            format=$(jq -r --arg name "$name" '.outputs[$name].format' <<< "$plan") || return 4
+            local mode=600
+            [[ "$format" != binary ]] || mode=700
+            receipt=$(_act_collect_stream_exclusive "$payload/$name" "$mode" _act_stream_local_file "$path") || return 4
+            if [[ "$role" == additional ]]; then
+                additional=$(jq -c --argjson receipt "$receipt" '. + [$receipt]' <<< "$additional") || return 4
+            else
+                paths=$(jq -c --arg path "$payload/$name" '. + [$path]' <<< "$paths") || return 4
+            fi
+        done < <(jq -c '.[]' <<< "$selected")
+    done < <(jq -c '.[]' <<< "$before")
+    after=$(_act_result_artifact_receipts "$(jq -cn --arg dir "$raw" '{workflow_artifact_dir:$dir}')") || return 4
+    [[ "$before" == "$after" ]] || { _log_error "Workflow transport inventory changed during collection"; return 4; }
+    result=$(jq -c --arg raw "$raw" --arg payload "$payload" --argjson plan "$plan" \
+        --argjson paths "$paths" --argjson additional "$additional" '
+        . + {artifact_dir:"",artifact_path:"",artifact_paths:$paths,additional_artifacts:$additional,
+             workflow_artifact_dir:$raw,workflow_payload_dir:$payload,workflow_payload_plan:$plan,
+             artifact_count:(($paths|length)+($additional|length))}' <<< "$result") || return 4
+    inventory=$(_act_result_artifact_receipts "$result") || return 4
+    result=$(jq -c --argjson inventory "$inventory" '.workflow_inventory=$inventory' <<< "$result") || return 4
+    _act_validate_workflow_payload_result "$result" "$plan" || return 4
+    printf '%s\n' "$result"
+}
+
 # Reconstruct additional-artifact ownership from trusted configuration before
 # manifest admission. This also refuses missing, extra or repeated receipts and
 # prevents later variants from taking ownership of platform-level companions.
@@ -439,7 +737,7 @@ _act_validate_additional_artifact() {
 _act_additional_artifact_receipts_json() {
     local tool="$1" result_json="$2" configured target_json target triple specs
     local receipts names expected triples row name path format sha size identity complete primary_paths
-    local verified='{}'
+    local verified='{}' workflow_plans workflow_plan
     jq -e '.targets | type == "array" and all(.[]; type == "object")' \
         <<< "$result_json" >/dev/null || return 4
     primary_paths=$(jq -c '[.targets[] |
@@ -447,11 +745,13 @@ _act_additional_artifact_receipts_json() {
         else (.artifact_path // "" | split(",")[]) end | select(length > 0)]' \
         <<< "$result_json") || return 4
     configured=$(_act_workspace_additional_artifacts_json "$ACT_REPOS_DIR/$tool.yaml") || return 4
+    workflow_plans=$(_act_workflow_payload_plans_json "$tool" "$(jq -r '.version // ""' <<< "$result_json")") || return 4
     while IFS= read -r target_json; do
         target=$(jq -er '.platform // .target | strings' <<< "$target_json") || return 4
         specs=$(jq -c --arg target "$target" '.[$target] // []' <<< "$configured") || return 4
         triple=$(jq -r '.target_triple // ""' <<< "$target_json") || return 4
-        if [[ -n "$triple" ]] && [[ "$(jq 'length' <<< "$specs")" -gt 0 ]]; then
+        if [[ "$(jq -r '.method // ""' <<< "$target_json")" != act && -n "$triple" ]] &&
+           [[ "$(jq 'length' <<< "$specs")" -gt 0 ]]; then
             triples=$(config_get_target_triples_json "$tool" "$target") || return 4
             if [[ "$triple" != "$(jq -r '.[0] // ""' <<< "$triples")" ]]; then
                 specs='[]'
@@ -470,6 +770,10 @@ _act_additional_artifact_receipts_json() {
         complete=$(jq -r --arg overall "$(jq -r '.status // ""' <<< "$result_json")" '
             $overall == "success" or .status == "success" or .status == "ok" or .status == "passed"
         ' <<< "$target_json") || return 4
+        workflow_plan=$(jq -c --arg target "$target" '.[$target] // null' <<< "$workflow_plans") || return 4
+        if [[ "$workflow_plan" != null && "$complete" == true ]]; then
+            _act_validate_workflow_payload_result "$target_json" "$workflow_plan" || return 4
+        fi
         if ! jq -en --argjson names "$names" --argjson expected "$expected" \
             --argjson complete "$complete" '
             ($names | length) == ($names | unique | length) and
@@ -11598,7 +11902,7 @@ _act_result_artifact_receipts() {
     local result_json="$1"
     local -A seen_paths=()
     local -a artifact_paths=() receipts=()
-    local path artifact_dir legacy_paths array_count
+    local path artifact_dir directory_field legacy_paths array_count
 
     # The array form is authoritative and preserves commas/newlines in valid
     # Unix paths. The scalar form is a legacy comma-separated compatibility
@@ -11643,19 +11947,25 @@ _act_result_artifact_receipts() {
         return 4
     fi
 
-    artifact_dir=$(jq -r '.artifact_dir // empty' <<< "$result_json" 2>/dev/null)
-    if [[ -n "$artifact_dir" ]]; then
+    for directory_field in artifact_dir workflow_artifact_dir workflow_payload_dir; do
+        artifact_dir=$(jq -r --arg field "$directory_field" '.[$field] // empty' <<< "$result_json" 2>/dev/null)
+        [[ -n "$artifact_dir" ]] || continue
         [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] || return 4
         # Process substitution cannot propagate find's exit status. Preflight
         # traversal explicitly so an unreadable subtree cannot yield a
         # deceptively partial receipt set.
         find "$artifact_dir" -type f ! -type l -print0 >/dev/null 2>&1 || return 4
+        if [[ "$directory_field" != artifact_dir ]] &&
+           [[ -n "$(find "$artifact_dir" \( -type l -o \( -type f -links +1 \) -o \( ! -type f ! -type d \) \) -print -quit)" ]]; then
+            _log_error "Workflow inventory contains a linked directory/file or special entry: $artifact_dir"
+            return 4
+        fi
         while IFS= read -r -d '' path; do
             [[ -z "${seen_paths[$path]:-}" ]] || continue
             seen_paths["$path"]=1
             artifact_paths+=("$path")
         done < <(find "$artifact_dir" -type f ! -type l -print0 2>/dev/null)
-    fi
+    done
 
     [[ ${#artifact_paths[@]} -gt 0 ]] || return 4
     for path in "${artifact_paths[@]}"; do
@@ -11672,7 +11982,7 @@ _act_result_artifact_receipts() {
         receipts+=("$receipt")
     done
 
-    printf '%s\n' "${receipts[@]}" | jq -sc 'sort_by(.path)'
+    printf '%s\n' "${receipts[@]}" | jq -scS 'sort_by(.path)'
 }
 
 # Return success only when a persisted result still points at the exact frozen
@@ -11684,7 +11994,7 @@ _act_target_result_available() {
     jq -e '(.status == "success" or .status == "ok" or .status == "passed")' \
         <<< "$result_json" &>/dev/null || return 1
     local expected actual
-    expected=$(jq -ce '
+    expected=$(jq -ceS '
         .resume_artifacts |
         if type == "array" and length > 0 then sort_by(.path)
         else error("missing artifact receipts") end
@@ -11700,6 +12010,7 @@ _act_build_task_plan() {
     local tool="$1" version="$2" platforms_json="$3" strict="$4"
     local platform method triples triple key environment command command_template language binary_name
     local plan='[]' config_file="$ACT_REPOS_DIR/${tool}.yaml"
+    _act_workflow_payload_plans_json "$tool" "$version" >/dev/null || return 4
     language=$(yq -r '.language // ""' "$config_file") || return 4
     binary_name=$(yq -r '.binary_name // ""' "$config_file") || return 4
     [[ -n "$binary_name" ]] || binary_name="$tool"
@@ -11793,7 +12104,9 @@ _act_build_orchestration_target() {
             jq -nc '{status: "error", exit_code: 4, error: "Strict release targets must use native builds"}'
             return 4
         fi
-        local job workflow local_path extra_flags
+        local job workflow local_path extra_flags workflow_plans workflow_plan materialized
+        workflow_plans=$(_act_workflow_payload_plans_json "$tool_name" "$version") || return 4
+        workflow_plan=$(jq -c --arg target "$target" '.[$target] // null' <<< "$workflow_plans") || return 4
         job=$(act_get_job_for_target "$tool_name" "$target")
         workflow="$ACT_REPO_WORKFLOW"
         local_path="$ACT_REPO_LOCAL_PATH"
@@ -11826,6 +12139,19 @@ _act_build_orchestration_target() {
             exit_code=6
             result=$(jq -c '.status = "failed" | .exit_code = 6 |
                 .error = "act workflow completed without producing any artifacts"' <<< "$result")
+        fi
+        if [[ "$workflow_plan" != null && "$exit_code" -eq 0 ]] &&
+           jq -e '.status == "success" or .status == "ok" or .status == "passed"' <<< "$result" >/dev/null; then
+            if materialized=$(_act_materialize_workflow_payloads "$result" "$workflow_plan"); then
+                result="$materialized"
+            else
+                exit_code=4
+                result=$(jq -c '.workflow_artifact_dir=.artifact_dir | .artifact_dir="" |
+                    .artifact_path="" | .artifact_paths=[] | .additional_artifacts=[] |
+                    .status="failed" | .exit_code=4 |
+                    .error="Workflow payloads do not satisfy the configured primary and companion ownership contract"' \
+                    <<< "$result") || return 4
+            fi
         fi
     else
         _log_info "Method: native (host=$host)"
@@ -14276,8 +14602,13 @@ act_generate_manifest() {
     fi
     config_validate_target_triples "$tool" || return 4
     _act_validate_native_matrix_result_inventory "$tool" "$result_json" || return 4
-    local verified_additional
+    local verified_additional verified_workflow_files workflow_plans
     verified_additional=$(_act_additional_artifact_receipts_json "$tool" "$result_json") || return 4
+    workflow_plans=$(_act_workflow_payload_plans_json "$tool" "$version") || return 4
+    verified_workflow_files=$(jq -c --argjson plans "$workflow_plans" '[.targets[] |
+        select(.method == "act" and $plans[.platform] != null and
+               (.status == "success" or .status == "ok" or .status == "passed")) |
+        .platform as $target | .artifact_paths[] | {key:.,value:$target}] | from_entries' <<< "$result_json") || return 4
     if ! declare -F artifact_naming_artifact_variant &>/dev/null; then
         # shellcheck source=SCRIPTDIR/artifact_naming.sh
         source "$manifest_module_dir/artifact_naming.sh" || return 3
@@ -14399,13 +14730,17 @@ act_generate_manifest() {
         fi
         [[ -z "$target" ]] && return 0
 
-        local name additional_receipt literal_additional=false
+        local name additional_receipt literal_additional=false authoritative_workflow=false
         name=$(basename "$file")
         additional_receipt=$(jq -c --arg path "$file" '.[$path] // null' <<< "$verified_additional") || return 4
         if [[ "$additional_receipt" != null ]]; then
             literal_additional=true
             [[ "$name" == "$(jq -r '.name' <<< "$additional_receipt")" &&
                "$target" == "$(jq -r '.target' <<< "$additional_receipt")" ]] || return 4
+        fi
+        if jq -e --arg path "$file" 'has($path)' <<< "$verified_workflow_files" >/dev/null; then
+            authoritative_workflow=true
+            [[ "$(jq -r --arg path "$file" '.[$path]' <<< "$verified_workflow_files")" == "$target" ]] || return 4
         fi
 
         case "$name" in
@@ -14486,7 +14821,7 @@ act_generate_manifest() {
         # act job.
         local inferred_target
         inferred_target=""
-        if ! $literal_additional; then
+        if ! $literal_additional && ! $authoritative_workflow; then
             inferred_target=$(_act_infer_target_from_name "$name")
         fi
         if [[ "$native_result" == true && -n "$inferred_target" && "$inferred_target" != "$target" ]]; then
@@ -14498,6 +14833,8 @@ act_generate_manifest() {
         local target_triple
         if [[ "$native_result" == true && -n "$declared_triple" ]]; then
             target_triple="$declared_triple"
+        elif $literal_additional || $authoritative_workflow; then
+            target_triple=$(_act_manifest_target_triple "$target" "") || return 4
         else
             target_triple=$(_act_manifest_target_triple "$target" "$name") || return 4
         fi

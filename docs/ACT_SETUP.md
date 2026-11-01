@@ -178,12 +178,14 @@ Put these declarations in `repos.d/<tool>.yaml`. When that file exists, it is
 the native build authority; omitted declarations mean no additional files, and
 are not filled from the repository registry during preflight.
 
-These declarations require a native producer. A target with a nonempty
-`act_job_map` entry cannot also declare additional native files; configuration
-validation reports the target and workflow job before source staging or
-compilation. Set that target's `act_job_map` entry to `null` when selecting a
-native build. A workflow target with no additional declarations retains its
-existing artifact collection behavior.
+These declarations also opt an ordinary `act` target into exact workflow
+payload collection. Native targets read the files from their effective output
+directory; workflow jobs upload them alongside their primary release archive.
+Set a target's `act_job_map` entry to `null`, an empty string or the string
+`"null"` when selecting a native build. Typed declarations reject malformed job
+selectors, including Boolean values, before execution. A workflow target with
+no additional declarations retains its existing artifact collection behavior.
+Strict release contracts still require native producers.
 
 Names remain literal for every format, including `binary`. For example,
 `helper.EXE` is collected under that exact spelling. Each name has one configured
@@ -243,6 +245,51 @@ the focused collection and manifest regressions, and
 coverage. These use real file content and production validators with controlled
 SSH/compiler transport; they do not claim a native Windows build or installer
 execution.
+
+### Typed companions from workflow jobs
+
+An opted-in workflow job must belong to exactly one configured physical target,
+with at most one configured target triple. Distinct targets need distinct job
+names, including targets without additional declarations. DSR checks the whole
+configuration before invoking `act`; a target subset cannot hide shared jobs,
+multiple compiler variants or ambiguous primary names. This bounded contract
+does not split a matrix-wide upload among several producers.
+
+The job must upload the versioned primary name resolved by `artifact_naming`
+and `archive_format`, together with every declared companion. The primary
+format must be `tar.gz`, `tar.xz` or `zip`, and its root must contain
+`binary_name` or every selected `workspace_binaries` executable. DSR checks the
+archive's complete readable content and each configured executable's target
+format and architecture. Ordinary regular-file notices inside the archive are
+permitted. The distinct name resolved by `install_script_compat` is optional;
+when supplied, it undergoes the same primary validation.
+
+Upload ZIP wrappers may contain these files under safe nested paths. DSR
+materializes their literal basenames into a private, flat payload directory,
+rejecting missing, extra, foreign, repeated or case-colliding names. A declared
+ZIP companion remains one complete ZIP file; it is not unpacked again by
+manifest generation or CLI collection. Unversioned companions, including names
+containing words such as `musl`, retain their configured owner and first target
+triple without filename-based platform or ABI inference.
+
+An optional `<owned-primary>.sha256` upload is accepted only when it names that
+primary and contains its exact digest (a plain digest is also accepted).
+Other undeclared files, including aggregate metadata, are refused. Normal DSR
+checksum, signing, provenance and publication stages continue independently.
+
+The original transport tree and materialized payload tree remain separate in
+the worker result. Both complete inventories are frozen for resume checks;
+changed, added, removed or replaced files invalidate reuse. Linked files,
+linked directories and special entries are refused. Manifest admission repeats
+the configuration ownership, required inventory, type, hash, size and file
+identity checks before using the materialized paths.
+
+Run `bash scripts/tests/test_act_runner.sh --typed-companions-only` for the
+focused workflow tests. They launch the real worker and production collection,
+manifest and provenance code, with controlled external `act`/Docker transport
+and inert executable-header fixtures. They cover concurrent producer isolation
+and malicious or contradictory uploads; they do not claim Docker execution or
+a real compiler run.
 
 For ordinary release planning, run
 `DSR_RELEASE_RESUME_TEST_FILTER='^test_literal_companion_' bash scripts/tests/test_release_resume.sh`.
