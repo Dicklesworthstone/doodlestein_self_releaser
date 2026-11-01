@@ -5691,18 +5691,34 @@ print(json.dumps(summary, sort_keys=True, separators=(',', ':')))
 DSR_NATIVE_CARGO_PREPARED
 SH
 )"
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
-    _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
-    jq -ce '
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || {
+        local prepare_status=$?
+        _log_error "Strict Unix Cargo cache preparation failed on $host (exit $prepare_status)"
+        return "$prepare_status"
+    }
+    if ! sources_json=$(jq -ce '.dependency_sources' <<< "$summary") ||
+       ! _act_validate_cargo_sources_summary "$sources_json" >/dev/null; then
+        _log_error "Strict Unix Cargo cache preparation returned invalid dependency-source evidence on $host"
+        return 4
+    fi
+    # Physical parent paths can differ through legitimate source aliases, but
+    # the home must belong to this attempt, never the retained seed or another
+    # target. Do not publish partial/multiple transport receipts on refusal.
+    if ! summary=$(jq -cse --arg name ".cargo-home-$suffix" '
+        select(length == 1) | .[0] |
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
-            (.cargo_home | type == "string" and startswith("/")) and
+            (.cargo_home | type == "string" and test("^/[A-Za-z0-9_./+-]+$") and
+                (contains("..") | not) and endswith("/" + $name)) and
             .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
             (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
             (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
             .selection.kind == "cargo-lock-downloads" and
             .selection.lockfile_sha256 == .dependency_sources.authentication.lockfile_sha256)
-    ' <<< "$summary"
+    ' <<< "$summary"); then
+        _log_error "Strict Unix Cargo cache preparation returned invalid private attempt evidence on $host (expected .cargo-home-$suffix)"
+        return 4
+    fi
+    printf '%s\n' "$summary"
 }
 
 # Ordinary (non-strict) Unix Rust builds stage their source under a fresh,
@@ -6069,15 +6085,32 @@ _act_prepare_windows_private_cargo_home() {
     script+=$'\n'"$(_act_windows_cargo_metadata_body "$build_cmd" "$build_env")" || return $?
     script+=$'\n''$dsrPrivateSummary | ConvertTo-Json -Compress -Depth 100; exit 0'
     command=$(_act_windows_cache_command "$host" "$source_root" "$script") || return $?
-    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || return $?
-    sources_json=$(jq -ce '.dependency_sources' <<< "$summary") || return 4
-    _act_validate_cargo_sources_summary "$sources_json" >/dev/null || return 4
-    _act_validate_cargo_cache_selection "$summary" "$sources_json" >/dev/null || return 4
-    toolchain_json=$(jq -ce '.toolchain' <<< "$summary") || return 4
-    _act_validate_windows_toolchain_summary "$toolchain_json" "$source_root" >/dev/null || return 4
-    jq -ce '
+    summary=$(_act_ssh_exec "$host" "$command" "$_ACT_SYNC_TIMEOUT") || {
+        local prepare_status=$?
+        _log_error "Strict Windows Cargo cache preparation failed on $host (exit $prepare_status)"
+        return "$prepare_status"
+    }
+    if ! sources_json=$(jq -ce '.dependency_sources' <<< "$summary") ||
+       ! _act_validate_cargo_sources_summary "$sources_json" >/dev/null; then
+        _log_error "Strict Windows Cargo cache preparation returned invalid dependency-source evidence on $host"
+        return 4
+    fi
+    if ! _act_validate_cargo_cache_selection "$summary" "$sources_json" >/dev/null; then
+        _log_error "Strict Windows Cargo cache preparation returned invalid lockfile selection evidence on $host"
+        return 4
+    fi
+    if ! toolchain_json=$(jq -ce '.toolchain' <<< "$summary") ||
+       ! _act_validate_windows_toolchain_summary "$toolchain_json" "$source_root" >/dev/null; then
+        _log_error "Strict Windows Cargo cache preparation returned invalid toolchain evidence on $host"
+        return 4
+    fi
+    # Retain the requested attempt identity even when the host resolves a
+    # physical source parent. A valid receipt cannot authorize another home.
+    if ! summary=$(jq -cse --arg name ".cargo-home-$suffix" '
+        select(length == 1) | .[0] |
         select(type == "object" and .schema_version == 1 and .mode == "private-copy" and
-            (.cargo_home | type == "string" and test("^[A-Za-z]:/")) and
+            (.cargo_home | type == "string" and test("^[A-Za-z]:/[A-Za-z0-9_./+-]+$") and
+                (contains("..") | not) and endswith("/" + $name)) and
             .receipt_path == (.cargo_home + "/.dsr-cache-seed.json") and
             (.receipt_sha256 | test("^[0-9a-f]{64}$")) and
             (.inventory_sha256 | test("^[0-9a-f]{64}$")) and
@@ -6085,7 +6118,11 @@ _act_prepare_windows_private_cargo_home() {
                 (keys | sort) == ["fingerprint", "receipt_sha256", "schema_version"] and
                 (.fingerprint | test("^[0-9a-f]{64}$")) and
                 (.receipt_sha256 | test("^[0-9a-f]{64}$"))))
-    ' <<< "$summary"
+    ' <<< "$summary"); then
+        _log_error "Strict Windows Cargo cache preparation returned invalid private attempt evidence on $host (expected .cargo-home-$suffix)"
+        return 4
+    fi
+    printf '%s\n' "$summary"
 }
 
 # The build uses the same context constructor and CMD launcher as admission.

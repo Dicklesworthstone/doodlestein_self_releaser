@@ -15,6 +15,7 @@ import sys
 import tempfile
 import tarfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 MODULE = os.environ.get('DSR_TEST_CARGO_CACHE_MODULE', sys.argv.pop(1))
@@ -1352,6 +1353,191 @@ _act_ssh_exec() { bash -s <<< $'{\n'"$2"$'\n} </dev/null'; }
                     self.assertEqual(result.stdout, '')
                     self.assertIn('Cargo source root', result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def preparation_response(self, backend):
+        source = '/logical/snapshot/source' if backend == 'unix' else 'C:/snapshot/source'
+        parent = '/physical/snapshot' if backend == 'unix' else 'C:/snapshot'
+        home = parent + '/.cargo-home-linux-musl_amd64-0123456789abcdef0123456789abcdef'
+        sources = {'schema_version': 1, 'kind': 'dsr-cargo-dependency-sources', 'sha256': '1' * 64,
+                   'metadata_sha256': '2' * 64, 'package_count': 1, 'root_count': 1,
+                   'file_count': 1, 'size_bytes': 1,
+                   'authentication': {'lockfile_sha256': '3' * 64, 'locked_archive_packages': 0,
+                                      'locked_git_packages': 0, 'workspace_snapshot_packages': 1}}
+        summary = {'schema_version': 1, 'mode': 'private-copy', 'cargo_home': home,
+                   'receipt_path': home + '/.dsr-cache-seed.json', 'receipt_sha256': '4' * 64,
+                   'inventory_sha256': '5' * 64, 'dependency_sources': sources,
+                   'selection': {'kind': 'cargo-lock-downloads', 'lockfile_sha256': '3' * 64,
+                                 'registry_packages': 0, 'git_revisions': []}}
+        if backend == 'windows':
+            summary['cargo_context'] = {'schema_version': 1, 'fingerprint': '6' * 64,
+                                       'receipt_sha256': '7' * 64}
+            summary['toolchain'] = {'schema_version': 1, 'cwd': source,
+                'target_triple': 'x86_64-pc-windows-msvc',
+                'tools': {tool: {'program': tool, 'selected_path': 'C:/tools/' + tool + '.exe',
+                                'selected_sha256': '8' * 64, 'selected_kind': 'executable', 'version': 'fixture'}
+                          for tool in ('cargo', 'rustc', 'linker')},
+                'selection': {'rustup_toolchain': None, 'cargo_commands': ['build'], 'cargo_config': []}}
+        return source, summary
+
+    def controlled_prepare(self, backend, response, suffix=None, transport_status=0):
+        # Only the remote response and metadata/compiler execution are
+        # controlled. Keep the actual argument, generator and evidence gates.
+        # Native Windows execution remains in test_cargo_cache_windows.ps1.
+        program = r'''
+source "$1" || exit $?
+shift
+_act_unix_cargo_metadata_body() { :; }
+_act_windows_cargo_metadata_body() { :; }
+_act_windows_cache_command() { printf 'controlled-host-command'; }
+_act_ssh_exec() {
+    printf 'transport\n' >> "$DSR_ADMISSION_TRANSPORT"
+    [[ "$DSR_ADMISSION_TRANSPORT_EXIT" == 0 ]] || return "$DSR_ADMISSION_TRANSPORT_EXIT"
+    cat "$DSR_ADMISSION_RESPONSE"
+}
+"$@"
+'''
+        response_path = self.root / 'response.json'
+        response_path.write_text(response if isinstance(response, str) else json.dumps(response))
+        source, _ = self.preparation_response(backend)
+        env = dict(os.environ, DSR_ADMISSION_RESPONSE=str(response_path),
+                   DSR_ADMISSION_TRANSPORT=str(self.root / 'transport.log'),
+                   DSR_ADMISSION_TRANSPORT_EXIT=str(transport_status))
+        return subprocess.run(['bash', '-c', program, '_', ACT_RUNNER,
+                               '_act_prepare_' + backend + '_private_cargo_home', 'fixture', source,
+                               suffix if suffix is not None else
+                               'linux-musl_amd64-0123456789abcdef0123456789abcdef'],
+                              capture_output=True, text=True, timeout=30, env=env)
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq unavailable')
+    def test_both_preparers_bind_reported_home_to_requested_attempt(self):
+        for backend in ('unix', 'windows'):
+            _, summary = self.preparation_response(backend)
+            result = self.controlled_prepare(backend, summary)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), summary)
+            # Legitimate Unix aliases can resolve to a different parent. The
+            # unique attempt leaf must still be exactly the requested one.
+            home = summary['cargo_home']
+            parent, name = home.rsplit('/', 1)
+            for wrong_home in (parent + '/.cargo-home', parent + '/.cargo-home-other-attempt',
+                               home + '/child', parent + '/../escape/' + name,
+                               parent + "/bad'path/" + name):
+                with self.subTest(backend=backend, home=wrong_home):
+                    wrong = dict(summary, cargo_home=wrong_home,
+                                 receipt_path=wrong_home + '/.dsr-cache-seed.json')
+                    result = self.controlled_prepare(backend, wrong)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('invalid private attempt evidence', result.stderr)
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq unavailable')
+    def test_both_preparers_diagnose_malformed_or_unauthenticated_evidence(self):
+        for backend in ('unix', 'windows'):
+            _, summary = self.preparation_response(backend)
+            for payload in (json.dumps(summary) + '\n' + json.dumps(summary), '{}', 'not JSON'):
+                with self.subTest(backend=backend, payload=payload):
+                    result = self.controlled_prepare(backend, payload)
+                    self.assertEqual(result.returncode, 4, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('Cargo cache preparation', result.stderr)
+            summary['dependency_sources']['metadata_sha256'] = 'invalid'
+            result = self.controlled_prepare(backend, summary)
+            self.assertEqual(result.returncode, 4, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('invalid dependency-source evidence', result.stderr)
+        _, summary = self.preparation_response('windows')
+        summary['selection']['lockfile_sha256'] = '9' * 64
+        result = self.controlled_prepare('windows', summary)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('invalid lockfile selection evidence', result.stderr)
+        _, summary = self.preparation_response('windows')
+        summary['toolchain']['cwd'] = 'C:/unadmitted/source'
+        result = self.controlled_prepare('windows', summary)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('invalid toolchain evidence', result.stderr)
+
+    @unittest.skipUnless(shutil.which('jq'), 'jq unavailable')
+    def test_both_preparers_preserve_transport_failure_and_refuse_unsafe_inputs_locally(self):
+        for backend in ('unix', 'windows'):
+            _, summary = self.preparation_response(backend)
+            result = self.controlled_prepare(backend, summary, transport_status=19)
+            self.assertEqual(result.returncode, 19, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('Cargo cache preparation failed', result.stderr)
+            self.assertIn('exit 19', result.stderr)
+            before = (self.root / 'transport.log').read_bytes()
+            result = self.controlled_prepare(backend, summary, suffix='../escape')
+            self.assertEqual(result.returncode, 4, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertIn('Cargo attempt suffix', result.stderr)
+            self.assertEqual((self.root / 'transport.log').read_bytes(), before)
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), 'lock-selected downloads require Python 3.11+')
+    def test_unix_underscore_cache_custody_without_compilation(self):
+        # Deterministic selected download bytes, real generated cache copying,
+        # no metadata/compiler invocation. Cold attempts cannot publish a seed.
+        source = self.root / 'snapshot/source'
+        source.mkdir(parents=True)
+        ambient = self.root / 'ambient'
+        archive = ambient / 'registry/cache/fixture/dependency-1.0.0.crate'
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b'locked download fixture\n')
+        lockfile = source / 'Cargo.lock'
+        lockfile.write_text('version = 4\n[[package]]\nname = "dependency"\nversion = "1.0.0"\n'
+                            'source = "registry+https://example.invalid/index"\nchecksum = "' +
+                            hashlib.sha256(archive.read_bytes()).hexdigest() + '"\n')
+        env = dict(os.environ, CARGO_HOME=str(ambient))
+
+        def prepare(suffix):
+            generated = self.shell('_act_unix_private_cargo_home_script', source, suffix)
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            return subprocess.run(['bash', '-s'], input=generated.stdout +
+                                  '\nprintf "%s\\n" "$dsr_private_summary"\n',
+                                  text=True, capture_output=True, timeout=30, env=env)
+
+        suffix = 'linux-musl_amd64-0123456789abcdef0123456789abcdef'
+        cold = prepare(suffix)
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        home = source.parent / ('.cargo-home-' + suffix)
+        copied_archive = home / archive.relative_to(ambient)
+        self.assertEqual(copied_archive.read_bytes(), archive.read_bytes())
+        self.assertNotEqual(copied_archive.stat().st_ino, archive.stat().st_ino)
+        self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((source.parent / '.cargo-home').exists())
+        marker = home / 'operator-evidence'
+        marker.write_bytes(b'preserve refused attempt\n')
+        collision = prepare(suffix)
+        self.assertNotEqual(collision.returncode, 0, collision.stderr)
+        self.assertEqual(collision.stdout, '')
+        self.assertEqual(marker.read_bytes(), b'preserve refused attempt\n')
+        self.assertEqual(copied_archive.read_bytes(), archive.read_bytes())
+        victim = self.root / 'victim'
+        victim.mkdir()
+        (victim / 'evidence').write_bytes(b'preserve symlink destination\n')
+        (source.parent / '.cargo-home-linked_attempt').symlink_to(victim, target_is_directory=True)
+        linked = prepare('linked_attempt')
+        self.assertNotEqual(linked.returncode, 0, linked.stderr)
+        self.assertEqual(linked.stdout, '')
+        self.assertEqual((victim / 'evidence').read_bytes(), b'preserve symlink destination\n')
+        self.assertEqual(len(list(victim.iterdir())), 1)
+        seed = source.parent / '.cargo-home'
+        seeded = subprocess.run(['bash', MODULE, 'snapshot', str(ambient), str(seed), str(lockfile)],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        seed_receipt = (seed / '.dsr-cache-seed.json').read_bytes()
+        seed_archive = seed / archive.relative_to(ambient)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            attempts = list(workers.map(prepare, ('linux-musl_amd64-one', 'linux-musl-amd64-one')))
+        for result in attempts:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        copies = [Path(json.loads(result.stdout)['cargo_home']) / archive.relative_to(ambient) for result in attempts]
+        copies[0].write_bytes(b'one attempt mutates its private bytes\n')
+        self.assertEqual(len({path.stat().st_ino for path in (*copies, seed_archive, archive)}), 4)
+        self.assertEqual(copies[1].read_bytes(), archive.read_bytes())
+        self.assertEqual(seed_archive.read_bytes(), archive.read_bytes())
+        self.assertEqual((seed / '.dsr-cache-seed.json').read_bytes(), seed_receipt)
 
     @unittest.skipUnless(all(shutil.which(name) for name in ('cargo', 'rustc', 'git', 'jq')),
                          'real Cargo/rustc/Git/jq unavailable; native cache use requires genuine tools')
