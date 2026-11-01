@@ -601,6 +601,9 @@ successful artifact evidence.
 Native host-readiness refusals retain the requested platform, optional selected
 triple, host, and attempt receipts. They report `stage: "host_readiness"` and
 `exit_code: 4`; public target status is `failed`, even though no compiler ran.
+Host-slot acquisition failures report `stage: "host_capacity"`, `exit_code: 2`,
+and `backend_started: false`. They retain their own immutable attempt receipts
+and remain eligible for resume after host capacity becomes available.
 Receipt-write failures release the attempt's capacity lease before the worker
 returns, preserving unrelated workers' slots and allowing a later retry.
 The coordinator persists an attempt reservation before creating its log or
@@ -616,8 +619,12 @@ If the coordinator cannot persist a finished worker's outcome, dispatch stops
 and active peers are cancelled and reaped. The run reports exit code 4 and
 `details.error`, preserving the actual target outcome and attempt rather than
 classifying the worker as unstarted. `execution_started: true` means the worker
-was launched; it does not assert that a compiler ran. Existing immutable worker
-receipts remain available for exact-run resume, and a failed coordinator receipt
+was launched; it does not assert that a compiler ran. Worker receipts also
+record the worker-owned `backend_started` flag. It becomes true
+when the worker launches its build backend after capacity acquisition; native
+host readiness can still refuse before compilation. Backend output cannot
+override this flag to claim a capacity refusal after execution.
+Existing immutable worker receipts remain available for exact-run resume, and a failed coordinator receipt
 write does not create a reported `result_path`. A retained nonempty malformed
 receipt still causes resume to refuse; it is not overwritten or accepted.
 The same rule applies when resume cannot checkpoint an already verified
@@ -692,12 +699,15 @@ Run context and aggregate results retain the complete `source_sync` receipt.
 Resume syncs again, updates the ordinary host/path bindings, and records the
 new receipt in `source_sync_history`. It verifies completed artifact receipts
 before deciding which targets still need work. `attempts` counts durable attempt
-reservations. `source_sync_failures` and `host_readiness_failures` count recorded
-transfer failures and native admission refusals that never reached compilation;
-both are excluded from the compiler retry limit. Readiness exemptions require
-the explicit `host_readiness` stage and exit code 4. Replaying the same failed
-attempt does not increase either counter, and real build failures still consume
-the configured retry allowance. Checkpoints without readiness counters retain
+reservations. `source_sync_failures`, `host_readiness_failures`, and
+`host_capacity_failures` count recorded transfer failures, native admission
+refusals, and host-slot acquisition failures that never reached compilation;
+these are excluded from the compiler retry limit. Readiness exemptions require
+the explicit `host_readiness` stage and exit code 4. Capacity exemptions require
+the explicit `host_capacity` stage, exit code 2, and the worker-owned
+`backend_started: false` flag. Replaying the same failed attempt does not increase
+the counters, and real build failures still consume the configured retry
+allowance. Checkpoints without these counters retain
 their prior conservative accounting; resume does not invent missing history.
 Direct orchestration resume
 without a new receipt retains the saved gate; the explicit CLI `--no-sync`

@@ -1120,7 +1120,14 @@ test_resume_rejects_malformed_inventory() {
     '.target_statuses["linux/amd64"].host_readiness_failures = null' \
     '.target_statuses["linux/amd64"].host_readiness_failures = 1.5' \
     '.target_statuses["linux/amd64"].host_readiness_failures = 99' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = -1' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = "0"' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = null' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = false' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = 1.5' \
+    '.target_statuses["linux/amd64"].host_capacity_failures = 99' \
     '.target_statuses["linux/amd64"] |= . + {attempts:3,source_sync_failures:2,host_readiness_failures:2}' \
+    '.target_statuses["linux/amd64"] |= . + {attempts:3,source_sync_failures:1,host_readiness_failures:1,host_capacity_failures:2}' \
     '.context = []' '.context.target_hosts = {"linux/amd64":null}'; do
     jq "$filter" <<< "$original" > "$RESUME_STATE_FILE" || return 1
     status=0
@@ -1477,6 +1484,84 @@ test_host_readiness_compiler_retry_budget() {
     .target_statuses["linux/amd64"].host_readiness_failures == 3' >/dev/null
 }
 
+test_host_capacity_compiler_retry_budget() {
+  local run_id attempt extra plan
+  local BUILD_RETRY_MAX=3
+  build_state_init || return 1
+  run_id=$(build_state_create capacity-budget v1.0.0 linux/amd64) || return 1
+  build_state_set_context capacity-budget v1.0.0 "$run_id" '' '' '{}' /output 1 '{}' || return 1
+  build_state_update_status capacity-budget v1.0.0 failed "$run_id" || return 1
+  # Six reservations fail before compilation, including four busy-host
+  # refusals: the immutable attempt number must outgrow the retry allowance
+  # without preventing a build once capacity becomes available.
+  for attempt in 1 2 3 4 5 6; do
+    extra=$(jq -nc --argjson attempt "$attempt" '{attempts:$attempt,result:null}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 running "$extra" "$run_id" || return 1
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{attempt:$attempt,backend_started:false,
+       status:(if $attempt == 6 then "error" else "failed" end),
+       exit_code:(if $attempt < 3 then 4 else 2 end),
+       stage:(if $attempt == 1 then "source_sync" elif $attempt == 2 then "host_readiness"
+              else "host_capacity" end)}}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    # Aggregation and resumed receipt replay may repeat this exact write.
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume capacity-budget v1.0.0 "$run_id") || return 1
+    jq -e '.targets_to_process == ["linux/amd64"] and .exceeded_target_retry_limit == []' \
+      <<< "$plan" >/dev/null || return 1
+  done
+  build_state_get capacity-budget v1.0.0 "$run_id" | jq -e '
+    .target_statuses["linux/amd64"] |
+    .attempts == 6 and .source_sync_failures == 1 and .host_readiness_failures == 1 and
+    .host_capacity_failures == 4' >/dev/null || return 1
+  # Once a backend runs, even exit 2 is a genuine build attempt. Exactly the
+  # configured three attempts remain available after all six refusals.
+  for attempt in 7 8 9; do
+    extra=$(jq -nc --argjson attempt "$attempt" '{attempts:$attempt,result:null}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 running "$extra" "$run_id" || return 1
+    extra=$(jq -nc --argjson attempt "$attempt" '
+      {attempts:$attempt,result:{status:"failed",stage:"build",exit_code:2,
+       backend_started:true,attempt:$attempt}}') || return 1
+    build_state_update_target capacity-budget v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume capacity-budget v1.0.0 "$run_id") || return 1
+    if ((attempt < 9)); then
+      jq -e '.targets_to_process == ["linux/amd64"] and .exceeded_target_retry_limit == []' \
+        <<< "$plan" >/dev/null || return 1
+    else
+      jq -e '.targets_to_process == [] and .exceeded_target_retry_limit == ["linux/amd64"]' \
+        <<< "$plan" >/dev/null || return 1
+    fi
+  done
+  build_state_get capacity-budget v1.0.0 "$run_id" | jq -e '
+    .target_statuses["linux/amd64"] |
+    .attempts == 9 and .source_sync_failures == 1 and .host_readiness_failures == 1 and
+    .host_capacity_failures == 4' >/dev/null
+}
+
+test_host_capacity_requires_preexecution_evidence() {
+  local BUILD_RETRY_MAX=1
+  local sequence=0 filter tool run_id extra plan
+  build_state_init || return 1
+  for filter in '.stage="build"' '.exit_code=6' '.status="success"' \
+    '.backend_started=true' 'del(.backend_started)' '.backend_started=null' \
+    '.backend_started="false"'; do
+    ((sequence+=1))
+    tool="capacity-evidence-$sequence"
+    run_id=$(build_state_create "$tool" v1.0.0 linux/amd64) || return 1
+    build_state_update_status "$tool" v1.0.0 failed "$run_id" || return 1
+    extra=$(jq -nc '{status:"failed",stage:"host_capacity",exit_code:2,backend_started:false}' |
+      jq -c "$filter" | jq -c '{attempts:1,result:.}') || return 1
+    build_state_update_target "$tool" v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    build_state_update_target "$tool" v1.0.0 linux/amd64 failed "$extra" "$run_id" || return 1
+    plan=$(build_state_resume "$tool" v1.0.0 "$run_id") || return 1
+    jq -e '.targets_to_process == [] and .exceeded_target_retry_limit == ["linux/amd64"]' \
+      <<< "$plan" >/dev/null || return 1
+    build_state_get "$tool" v1.0.0 "$run_id" | jq -e --argjson limit "$BUILD_RETRY_MAX" '
+      .target_statuses["linux/amd64"] |
+      .attempts == $limit and (.host_capacity_failures // 0) == 0' >/dev/null || return 1
+  done
+}
+
 # Cleanup
 cleanup() {
   if [[ "${DSR_TEST_KEEP_TMP:-0}" == 1 ]]; then
@@ -1489,6 +1574,15 @@ trap cleanup EXIT
 
 if [[ "${1:-}" == --lock-custody-only ]]; then
   test_build_lock_custody
+  exit $?
+fi
+
+if [[ "${1:-}" == --capacity-budget-only ]]; then
+  run_state_regression "capacity refusals retain all compiler retries without double counting" test_host_capacity_compiler_retry_budget
+  run_state_regression "capacity exemptions require an explicit pre-execution refusal" test_host_capacity_requires_preexecution_evidence
+  run_state_regression "resume rejects malformed and overlapping refusal counters" test_resume_rejects_malformed_inventory
+  echo "Tests run: $TESTS_RUN  Passed: $TESTS_PASSED  Failed: $TESTS_FAILED"
+  [[ $TESTS_FAILED -eq 0 ]]
   exit $?
 fi
 
@@ -1566,6 +1660,8 @@ run_state_regression "native variant checkpoints resume only failed tasks and re
 run_state_regression "source-sync refresh preserves completed artifacts and records repair/opt-out history" test_source_sync_context_refresh
 run_state_regression "source-sync failures preserve the compiler retry allowance without double counting" test_source_sync_compiler_retry_budget
 run_state_regression "host-readiness refusals preserve compiler retries and real build failures exhaust them" test_host_readiness_compiler_retry_budget
+run_state_regression "capacity refusals retain all compiler retries without double counting" test_host_capacity_compiler_retry_budget
+run_state_regression "capacity exemptions require an explicit pre-execution refusal" test_host_capacity_requires_preexecution_evidence
 run_state_regression "generic retry rejects zero or invalid budgets before execution" test_retry_budget_validation
 run_state_regression "exponential retry backoff never exceeds its cap or overflows" test_retry_backoff_is_bounded
 run_state_regression "missing or invalid saved retry budgets cannot launch commands" test_retry_unreadable_budget_blocks_execution

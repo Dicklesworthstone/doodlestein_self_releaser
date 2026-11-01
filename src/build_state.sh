@@ -739,6 +739,19 @@ build_state_update_target() {
         then .target_statuses[$target].host_readiness_failures =
           (($prior.host_readiness_failures // 0) + 1)
         else . end |
+        # Waiting for a busy host is a real, retained scheduling attempt, but
+        # it cannot spend compiler retries when no backend was launched. The
+        # worker owns backend_started; an executed command cannot opt out by
+        # printing a capacity label. Replaying the same refusal is idempotent.
+        if $status == "failed" and $extra.result.stage == "host_capacity" and
+           $extra.result.exit_code == 2 and $extra.result.backend_started == false and
+           ($extra.result.status == "failed" or $extra.result.status == "error") and
+           ($prior.status != "failed" or $prior.result.stage != "host_capacity" or
+            $prior.result.exit_code != 2 or $prior.result.backend_started != false or
+            $prior.attempts != $extra.attempts)
+        then .target_statuses[$target].host_capacity_failures =
+          (($prior.host_capacity_failures // 0) + 1)
+        else . end |
         .updated_at = $now' <<< "$extra_json"; then
     return 1
   fi
@@ -1432,7 +1445,9 @@ build_state_resume() {
          type == "object" and valid_status and valid_counter("attempts") and
          valid_counter("source_sync_failures") and
          valid_counter("host_readiness_failures") and
-         ((counter("source_sync_failures") + counter("host_readiness_failures")) <= counter("attempts"))) | not) or
+         valid_counter("host_capacity_failures") and
+         ((counter("source_sync_failures") + counter("host_readiness_failures") +
+           counter("host_capacity_failures")) <= counter("attempts"))) | not) or
        (tasks | type) != "array" or
        ([tasks[].key] | unique | length) != (tasks | length) or
        (all(tasks[]; (.key | type == "string" and length > 0) and
@@ -1472,7 +1487,7 @@ build_state_resume() {
       if ($entry.status == "completed" and ($entry.result | type) == "object" and
           ($entry.result | length) > 0) then .completed += [$target]
       elif (($entry | counter("attempts") - counter("source_sync_failures") -
-                    counter("host_readiness_failures")) >= $retry_max)
+                    counter("host_readiness_failures") - counter("host_capacity_failures")) >= $retry_max)
       then .exceeded += [$target]
       else .retryable += [$target] end
     )) as $target_plan |

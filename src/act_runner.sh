@@ -12918,7 +12918,7 @@ _act_run_target_worker() {
     local slot_task="${task_key//\//-}"
     slot_task="${slot_task//@/-}"
     local slot_id="${run_id}-${slot_task}-attempt-${attempt}"
-    local slot_requested=false
+    local slot_requested=false backend_started=false
 
     _act_write_worker_result() {
         local body="$1"
@@ -12929,7 +12929,9 @@ _act_run_target_worker() {
         body=$(jq -c --arg purpose "$build_purpose" --arg task_key "$task_key" \
             --arg platform "$target" --arg host "$host" --arg triple "$selected_triple" \
             --argjson source_sync "$source_sync_receipt" \
-            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key} |
+            --argjson backend_started "$backend_started" \
+            '. + {build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key,
+                  backend_started:$backend_started} |
              if (.status // "") | IN("success", "ok", "passed") then .
              else . + {platform:$platform,host:(.host // $host)} +
                   (if $triple == "" then {} else {target_triple:$triple} end) end |
@@ -13058,7 +13060,7 @@ _act_run_target_worker() {
             fi
             slot_failure=$(jq -nc --arg target "$target" --arg host "$host" --arg error "$slot_error" \
                 '{platform: $target, host: $host, status: "failed", exit_code: 2,
-                  error: $error}')
+                  stage:"host_capacity", error: $error}')
             if ! _act_write_worker_result "$slot_failure"; then
                 _act_worker_release_slot
                 trap - EXIT INT TERM HUP
@@ -13075,6 +13077,10 @@ _act_run_target_worker() {
     [[ $- != *m* ]] || worker_monitor=true
     set -m
     worker_launch_pending=true
+    # Only this wrapper knows whether capacity was granted and the backend
+    # was launched. Backend stdout cannot claim a pre-execution refusal to
+    # recover retry budget after it has actually run.
+    backend_started=true
     coproc _ACT_TARGET_GROUP {
         _act_run_target_group "$log_path" _act_build_orchestration_target \
             "$tool_name" "$version" "$run_id" "$target" \
@@ -13531,11 +13537,13 @@ act_orchestrate_build() {
             def counter($key): if has($key) then .[$key] else 0 end;
             counter("attempts") as $all | counter("source_sync_failures") as $sync |
             counter("host_readiness_failures") as $readiness |
+            counter("host_capacity_failures") as $capacity |
             select(($all | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
               ($sync | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
               ($readiness | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
-              ($sync + $readiness) <= $all) |
-            $all - $sync - $readiness' <<< "$1"
+              ($capacity | type == "number" and floor == . and . >= 0 and . <= 9007199254740991) and
+              ($sync + $readiness + $capacity) <= $all) |
+            $all - $sync - $readiness - $capacity' <<< "$1"
     }
     if [[ -n "$resume_target_host" || -n "$resume_target_host_approval" ]]; then
         if ! $resume_run || [[ "$build_purpose" != "release" ||
@@ -14273,7 +14281,7 @@ act_orchestrate_build() {
             if ! persisted_entry=$(build_state_get "$tool_name" "$version" "$run_id" | \
                     jq -ce --arg target "$task_key" '.target_statuses[$target] // {}') ||
                ! prior_build_attempts=$(_act_prior_build_attempts "$persisted_entry"); then
-                _act_refuse_retained_target "Invalid or unavailable source synchronization/readiness/build attempt counters for $task_key"
+                _act_refuse_retained_target "Invalid or unavailable source synchronization/readiness/capacity/build attempt counters for $task_key"
                 break
             fi
             prior_attempts=$(jq -r '.attempts // 0' <<< "$persisted_entry")

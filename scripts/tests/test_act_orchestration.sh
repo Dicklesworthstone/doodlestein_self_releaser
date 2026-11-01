@@ -1317,7 +1317,7 @@ for jobs, mode in resume_cases:
                  not (mode == 'resume-budget-empty' and path == original_path)}
     code, result, state = invoke(case, run, jobs, mode, 'resume-refusal', retry_max=1 if budget else 3)
     row, peer, queued = result['targets'][1], result['targets'][0], result['targets'][2]
-    reason = ('Invalid or unavailable source synchronization/readiness/build attempt counters' if mode == 'resume-counter'
+    reason = ('Invalid or unavailable source synchronization/readiness/capacity/build attempt counters' if mode == 'resume-counter'
               else 'Resume target result has missing or different build purpose' if mode == 'resume-purpose'
               else 'Could not persist retry-budget outcome' if budget
               else 'Could not persist recovered target outcome')
@@ -1725,6 +1725,342 @@ PY
 if [[ "${1:-}" == --dispatch-reservation-only || "${1:-}" == --completion-persistence-only ||
       "${1:-}" == --resume-persistence-only ]]; then
     test_dispatch_reservation_recovery "$1"
+    exit $?
+fi
+
+# Capacity denial precedes the backend, so it must not spend the compiler's
+# retry allowance. Keep real scheduling, worker receipts, state and artifact
+# reuse; control only the capacity boundary and native payload in the portable
+# cases. The additional live-selector cases acquire genuine competing leases.
+test_capacity_resume_accounting() {
+    local project_root dependency
+    project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || return 1
+    for dependency in python3 jq yq git; do
+        command -v "$dependency" >/dev/null || return 77
+    done
+    python3 - "$project_root" <<'PY'
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+project = Path(sys.argv[1])
+module = Path(os.environ.get('DSR_TEST_ACT_RUNNER', str(project / 'src/act_runner.sh')))
+state_module = Path(os.environ.get('DSR_TEST_BUILD_STATE', str(project / 'src/build_state.sh')))
+root = Path(tempfile.mkdtemp(prefix='dsr-capacity-resume-'))
+print('Retained capacity resume evidence: ' + str(root), flush=True)
+targets = ['linux/amd64', 'linux/arm64', 'darwin/arm64']
+checks = failures = skips = 0
+
+
+def check(label, condition):
+    global checks, failures
+    checks += 1
+    failures += not condition
+    print(('PASS: ' if condition else 'FAIL: ') + label, flush=True)
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def events(case):
+    path = case / 'backend-events.jsonl'
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def freeze(paths):
+    return {str(path): (path.stat().st_ino, hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in map(Path, paths)}
+
+
+payload = root / 'payload.py'
+payload.write_text(r'''import json, os, sys
+from pathlib import Path
+case, target, attempt, outcome = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+assert sys.stdin.buffer.read() == b''
+fd = os.open(case / 'backend-events.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+os.write(fd, (json.dumps(dict(target=target, attempt=attempt, outcome=outcome, pid=os.getpid())) + '\n').encode())
+os.close(fd)
+result = dict(platform=target, method='native', status='failed', exit_code=17,
+              error='actual payload process failed')
+if outcome == 'forged-capacity':
+    result.update(exit_code=2, stage='host_capacity', backend_started=False,
+                  error='backend stdout falsely claims pre-execution capacity refusal')
+elif outcome == 'success':
+    path = case / 'output' / (target.replace('/', '-') + '.attempt-' + str(attempt))
+    with path.open('xb') as output:
+        output.write(('payload:' + target + ':' + str(attempt)).encode())
+    result.update(status='success', exit_code=0, artifact_path=str(path), artifact_paths=[str(path)])
+print(json.dumps(result), flush=True)
+raise SystemExit(result['exit_code'])
+''')
+driver = root / 'driver.sh'
+driver.write_text(r'''set -uo pipefail
+source "$DSR_CAP_PROJECT/src/logging.sh" || exit $?
+source "$DSR_CAP_PROJECT/src/config.sh" || exit $?
+source "$DSR_CAP_STATE" || exit $?
+source "$DSR_CAP_MODULE" || exit $?
+source "$DSR_CAP_PROJECT/src/host_selector.sh" || exit $?
+if [[ "$DSR_CAP_SELECTOR" == controlled ]]; then
+    selector_acquire_slot() {
+        cat > "$DSR_CAP_CASE/slot.$2.stdin"
+        [[ "$DSR_CAP_BLOCKED" != true ]] || return 2
+    }
+    selector_release_slot() { return 0; }
+fi
+act_run_native_build() {
+    python3 "$DSR_CAP_PAYLOAD" "$DSR_CAP_CASE" "$2" "$attempt" "$DSR_CAP_OUTCOME"
+}
+case "$DSR_CAP_ACTION" in
+    plan)
+        build_state_init || exit $?
+        build_state_resume capacity 1.0.0 "$DSR_CAP_RUN"
+        ;;
+    available) _act_target_result_available "$(cat "$DSR_CAP_RECEIPT")" release true ;;
+    cli)
+        # Load the exact public command and envelope, as the native artifact
+        # qualification does. Real workers produce every refusal below; no
+        # target result, receipt, state transition or JSON projection is mocked.
+        for module in git_ops artifact_naming packaging; do
+            source "$DSR_CAP_PROJECT/src/$module.sh" || exit $?
+        done
+        export SCRIPT_DIR="$DSR_CAP_PROJECT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+        declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1)
+        source <(awk '/^(_dsr_require|cmd_build)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' \
+            "$DSR_CAP_CLI") || exit $?
+        source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' \
+            "$DSR_CAP_CLI") || exit $?
+        cmd_build capacity --version 1.0.0 --no-sync --jobs "$DSR_CAP_JOBS" \
+            --output-dir "$DSR_CAP_CASE/output"
+        ;;
+    run)
+        args=(--run-id "$DSR_CAP_RUN")
+        [[ "$DSR_CAP_FIRST" == true ]] || args=(--resume-run-id "$DSR_CAP_RUN")
+        act_orchestrate_build capacity 1.0.0 --no-source-sync-gate \
+            --parallel-jobs "$DSR_CAP_JOBS" --output-dir "$DSR_CAP_CASE/output" "${args[@]}"
+        ;;
+    *) exit 98 ;;
+esac
+''')
+
+
+def fixture(name, jobs, selector='controlled'):
+    case = root / name
+    for directory in ('config/repos.d', 'source', 'output'):
+        (case / directory).mkdir(parents=True)
+    hosts = {target: 'host-' + target.replace('/', '-') for target in targets}
+    (case / 'config/hosts.yaml').write_text(json.dumps(dict(
+        hosts={host: dict(platform=target, connection='local', enabled=True, concurrency=1)
+               for target, host in hosts.items()}, platform_mapping=hosts)))
+    (case / 'config/repos.d/capacity.yaml').write_text(json.dumps(dict(
+        tool_name='capacity', repo='fixture/capacity', language='bash',
+        local_path=str(case / 'source'), binary_name='payload', targets=targets,
+        act_job_map={target: None for target in targets},
+        cross_compile={target: dict(host=host) for target, host in hosts.items()})))
+    identity = str(uuid.uuid4())
+    env = dict(os.environ, DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+        DSR_CONFIG_DIR=str(case / 'config'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+        ACT_REPOS_DIR=str(case / 'config/repos.d'), ACT_LOGS_DIR=str(case / 'logs'),
+        ACT_ARTIFACTS_DIR=str(case / 'artifacts'), DSR_DISABLE_HOST_SELECTOR='1',
+        DSR_RETRY_MAX='2', DSR_SELECTOR_WAIT_TIMEOUT='0', DSR_SELECTOR_LOCK_TIMEOUT='2',
+        DSR_CAP_PROJECT=str(project), DSR_CAP_MODULE=str(module), DSR_CAP_STATE=str(state_module),
+        DSR_CAP_CLI=os.environ.get('DSR_TEST_CLI', str(project / 'dsr')),
+        DSR_CAP_CASE=str(case), DSR_CAP_PAYLOAD=str(payload), DSR_CAP_RUN=identity,
+        DSR_CAP_JOBS=str(jobs), DSR_CAP_SELECTOR=selector, NO_COLOR='1')
+    env.pop('DSR_BUILD_LOCK_HELD_BY_CALLER', None)
+    return case, env, case / 'state/builds/capacity/1.0.0' / identity
+
+
+def invoke(context, label, first=False, blocked=False, outcome='success', action='run', **extra):
+    case, env, workspace = context
+    result = subprocess.run(['bash', str(driver)], stdin=subprocess.DEVNULL,
+        env=dict(env, DSR_CAP_FIRST=str(first).lower(), DSR_CAP_BLOCKED=str(blocked).lower(),
+                 DSR_CAP_OUTCOME=outcome, DSR_CAP_ACTION=action, **extra),
+        text=True, capture_output=True, timeout=45)
+    (case / (label + '.stdout')).write_text(result.stdout)
+    (case / (label + '.stderr')).write_text(result.stderr)
+    (case / (label + '.status')).write_text(str(result.returncode) + '\n')
+    body = json.loads(result.stdout) if result.stdout.strip() else {}
+    if action == 'cli':
+        workspace = case / 'state/builds/capacity/1.0.0' / body['details']['run_id']
+    return result.returncode, body, read(workspace / 'state.json')
+
+
+def capacity_recovery(context, release=None):
+    case, env, workspace = context
+    old = {}
+    for round_number in range(1, 4):
+        code, result, state = invoke(context, 'blocked-%d' % round_number,
+                                    first=round_number == 1, blocked=True)
+        label = case.name + ' refusal %d' % round_number
+        rows = result.get('targets', [])
+        check(label + ': all configured targets receive genuine capacity refusals',
+              code == 6 and [row.get('platform') for row in rows] == targets and
+              all(row.get('status') == 'failed' and row.get('exit_code') == 2 and
+                  row.get('stage') == 'host_capacity' and row.get('backend_started') is False and
+                  row.get('execution_started') is True and row.get('attempt') == round_number
+                  for row in rows))
+        check(label + ': no backend or artifacts run while capacity is unavailable',
+              not events(case) and not any((case / 'output').iterdir()) and
+              all(not row.get('resume_artifacts') for row in rows))
+        check(label + ': immutable refusal receipts are persisted once per attempt',
+              all(state['target_statuses'][target]['attempts'] == round_number and
+                  state['target_statuses'][target].get('host_capacity_failures') == round_number
+                  for target in targets) and
+              all(Path(row['result_path']).is_file() and Path(row['log_path']).is_file() and
+                  read(Path(row['result_path'])).get('backend_started') is False for row in rows))
+        if old:
+            check(label + ': earlier logs and receipts retain their exact bytes and inodes', freeze(old) == old)
+        old.update(freeze([row[key] for row in rows for key in ('result_path', 'log_path')]))
+        _, plan, _ = invoke(context, 'plan-%d' % round_number, action='plan')
+        check(label + ': public resume planner retains every target beyond compiler retry limit',
+              plan.get('can_resume') is True and plan.get('targets_to_process') == targets and
+              plan.get('exceeded_target_retry_limit') == [])
+    if release:
+        release()
+    code, result, state = invoke(context, 'capacity-restored')
+    rows = result.get('targets', [])
+    check(case.name + ': restored capacity admits one actual payload execution per target',
+          code == 0 and result.get('status') == 'success' and
+          Counter(event['target'] for event in events(case)) == Counter(targets) and
+          all(event['attempt'] == 4 for event in events(case)) and
+          all(row.get('backend_started') is True and row.get('attempt') == 4 and
+              row.get('status') == 'success' for row in rows))
+    check(case.name + ': refusal counters and immutable prior evidence survive completion',
+          all(state['target_statuses'][target].get('host_capacity_failures') == 3 and
+              state['target_statuses'][target]['attempts'] == 4 for target in targets) and freeze(old) == old)
+    before = events(case)
+    code, reused, _ = invoke(context, 'reuse-completed')
+    check(case.name + ': subsequent resume reuses exact frozen artifacts without another backend',
+          code == 0 and events(case) == before and all(
+              row.get('resume_reused') is True and row.get('attempt') == 4 for row in reused.get('targets', [])))
+    for row in rows:
+        status, _, _ = invoke(context, 'available-' + row['platform'].replace('/', '-'),
+                              action='available', DSR_CAP_RECEIPT=row['result_path'])
+        check(case.name + ': completed artifact still passes actual receipt admission ' + row['platform'],
+              status == 0)
+
+
+for jobs in (1, 3):
+    capacity_recovery(fixture('controlled-jobs-%d' % jobs, jobs))
+    for outcome in ('failure', 'forged-capacity'):
+        context = fixture(outcome + '-jobs-%d' % jobs, jobs)
+        case, env, workspace = context
+        for round_number in (1, 2):
+            code, result, state = invoke(context, 'build-%d' % round_number,
+                first=round_number == 1, outcome=outcome)
+            check(case.name + ': executed failure %d consumes its actual backend attempt' % round_number,
+                  code == 6 and all(row.get('backend_started') is True and
+                                    row.get('attempt') == round_number for row in result.get('targets', [])) and
+                  all(entry.get('host_capacity_failures', 0) == 0
+                      for entry in state['target_statuses'].values()))
+        before = events(case)
+        code, result, state = invoke(context, 'exhausted', outcome='success')
+        check(case.name + ': real failures still exhaust the budget and cannot launder backend stdout',
+              code == 6 and events(case) == before and
+              Counter(event['target'] for event in before) == Counter({target: 2 for target in targets}) and
+              all(row.get('retry_limit_exceeded') is True and row.get('attempt') == 2
+                  for row in result.get('targets', [])))
+
+context = fixture('public-cli-capacity-refusal', 3)
+case, env, _ = context
+for command in (
+        ['git', '-C', str(case / 'source'), 'init', '-q', '-b', 'main'],
+        ['git', '-C', str(case / 'source'), '-c', 'user.name=DSR fixture',
+         '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+         'commit', '--allow-empty', '-qm', 'Capacity CLI source identity']):
+    subprocess.run(command, check=True, capture_output=True, timeout=10)
+code, envelope, state = invoke(context, 'refused', first=True, blocked=True, action='cli')
+details = envelope.get('details', {})
+rows = details.get('targets', [])
+check('public CLI: every refused worker retains capacity stage and honest backend execution flag',
+      code == 6 and envelope.get('exit_code') == 6 and
+      [row.get('platform') for row in rows] == targets and
+      all(row.get('status') == 'failed' and row.get('stage') == 'host_capacity' and
+          row.get('exit_code') == 2 and row.get('attempt') == 1 and
+          row.get('execution_started') is True and row.get('backend_started') is False
+          for row in rows))
+check('public CLI: capacity refusals cannot authorize payload execution or a publishable manifest',
+      not events(case) and details.get('total') == 3 and details.get('success') == 0 and
+      details.get('failed') == 3 and details.get('publishable') is False and
+      not details.get('manifest_path') and state['status'] == 'failed' and
+      read(case / 'output/.dsr-build-purpose.json')['publishable'] is False)
+check('public CLI: each public receipt path resolves to the actual persisted capacity refusal',
+      len(rows) == 3 and all(Path(row['result_path']).is_file() and Path(row['log_path']).is_file() and
+          read(Path(row['result_path'])).get('stage') == 'host_capacity' and
+          read(Path(row['result_path'])).get('backend_started') is False and
+          state['target_statuses'][row['platform']].get('host_capacity_failures') == 1
+          for row in rows))
+
+# The selector requires a coherent process inventory. A container exposing
+# unrelated /proc PIDs cannot authenticate a holder; record that prerequisite
+# as unavailable rather than replacing process identity or weakening leases.
+probe = subprocess.run(['bash', '-c',
+    'source "$1/src/host_selector.sh"; '
+    'if [[ -d /proc/self ]]; then IFS=" " read -r observed_pid _ < /proc/self/stat; '
+    '[[ "$observed_pid" == "$BASHPID" ]] || exit 77; fi; '
+    '_sel_process_start "$BASHPID"', '_', str(project)],
+    text=True, capture_output=True, timeout=10)
+(root / 'selector-prerequisite.stdout').write_text(probe.stdout)
+(root / 'selector-prerequisite.stderr').write_text(probe.stderr)
+(root / 'selector-prerequisite.status').write_text(str(probe.returncode) + '\n')
+if probe.returncode == 77:
+    skips += 1
+    print('SKIP: live selector holder cannot authenticate mismatched shell and /proc PID namespaces', flush=True)
+elif probe.returncode:
+    check('live selector production process identity succeeds in a coherent PID namespace', False)
+else:
+    holder_program = r'''set -uo pipefail
+source "$DSR_CAP_PROJECT/src/host_selector.sh" || exit $?
+for host in host-linux-amd64 host-linux-arm64 host-darwin-arm64; do
+    selector_acquire_slot "$host" held-for-capacity-regression || exit $?
+done
+printf 'ready\n' > "$DSR_CAP_CASE/holder.ready"
+IFS= read -r -t 90 release || true
+for host in host-linux-amd64 host-linux-arm64 host-darwin-arm64; do
+    selector_release_slot "$host" held-for-capacity-regression || exit $?
+done
+'''
+    for jobs in (1, 3):
+        context = fixture('live-selector-jobs-%d' % jobs, jobs, 'real')
+        case, env, _ = context
+        with (case / 'holder.log').open('wb') as log:
+            holder = subprocess.Popen(['bash', '-c', holder_program], env=env,
+                stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
+            def release_holder():
+                if holder.poll() is None:
+                    holder.stdin.write(b'release\n')
+                    holder.stdin.flush()
+                status = holder.wait(timeout=10)
+                check(case.name + ': genuine holder releases only its owned competing slots', status == 0)
+            try:
+                deadline = time.monotonic() + 10
+                while not (case / 'holder.ready').exists() and holder.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                ready = (case / 'holder.ready').exists() and holder.poll() is None
+                check(case.name + ': genuine selector holds all configured one-slot hosts', ready)
+                if ready:
+                    capacity_recovery(context, release_holder)
+            finally:
+                if holder.poll() is None:
+                    holder.stdin.close()
+                    holder.wait(timeout=10)
+
+(root / 'summary.json').write_text(json.dumps(dict(checks=checks, failures=failures, skips=skips)) + '\n')
+print('Capacity resume: %d checks, %d failures, %d skips' % (checks, failures, skips), flush=True)
+raise SystemExit(bool(failures))
+PY
+}
+
+if [[ "${1:-}" == --capacity-resume-only ]]; then
+    test_capacity_resume_accounting
     exit $?
 fi
 
@@ -6531,6 +6867,12 @@ if test_worker_capacity_wait_budget; then
     pass "capacity-limited targets queue for one build timeout and fail with an actionable error"
 else
     fail "capacity-limited target wait budget or failure message is wrong"
+fi
+
+if test_capacity_resume_accounting; then
+    pass "capacity refusals preserve compiler retry allowance through exact-run resume"
+else
+    fail "capacity refusal accounting exhausted retries or trusted backend classification"
 fi
 
 if test_worker_group_lifecycle; then

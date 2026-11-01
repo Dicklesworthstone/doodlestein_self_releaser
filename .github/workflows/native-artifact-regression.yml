@@ -146,6 +146,7 @@ jobs:
           bash scripts/tests/test_act_orchestration.sh --dispatch-reservation-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-reservation.log"
           bash scripts/tests/test_act_runner.sh --worker-admission-cancel-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/admission-cancellation.log"
           bash scripts/tests/test_act_orchestration.sh --dispatch-stdin-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/dispatch-stdin.log"
+          bash scripts/tests/test_act_orchestration.sh --capacity-resume-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/capacity-resume.log"
           test -z "$(git status --porcelain)"
       - name: Validate native and workflow companion artifact admission
         shell: bash

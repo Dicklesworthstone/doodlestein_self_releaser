@@ -132,11 +132,15 @@
         "stage": {
           "type": "string",
           "minLength": 1,
-          "description": "Failure stage; dispatch means the worker was not started, source_sync means no compiler or capacity slot was started, host_readiness means native host admission refused before compilation"
+          "description": "Failure stage; dispatch means the worker was not started, source_sync means no compiler or capacity slot was started, host_capacity means slot acquisition failed before backend launch, host_readiness means native host admission refused before compilation"
         },
         "execution_started": {
           "type": "boolean",
           "description": "True when the coordinator observed a launched worker; false on a dispatch refusal. This does not establish compiler execution: native host readiness may still refuse the attempt"
+        },
+        "backend_started": {
+          "type": "boolean",
+          "description": "Worker-owned observation that its build backend was launched after capacity acquisition; false for a host_capacity refusal. True does not establish compiler execution because native host readiness can still refuse"
         },
         "worker_exit_code": {
           "type": "integer",
