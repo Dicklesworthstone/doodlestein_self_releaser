@@ -14,6 +14,7 @@ on:
       - scripts/tests/test_config.sh
       - scripts/tests/test_disk_free_floor.sh
       - scripts/tests/test_artifact_formats.sh
+      - scripts/tests/test_ordinary_collection_inventory.sh
       - scripts/tests/test_generated_installer_transactions.sh
       - scripts/tests/test_generated_workspace_installer.sh
       - scripts/tests/test_install_source.sh
@@ -139,6 +140,14 @@ jobs:
           bash scripts/tests/test_artifact_formats.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/artifact-formats.log"
           bash scripts/tests/test_act_runner_native.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/typed-companions.log"
           bash scripts/tests/test_act_runner.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/workflow-companions.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate ordinary primary and companion packaging ownership
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/tests/test_ordinary_collection_inventory.sh
+          bash scripts/tests/test_ordinary_collection_inventory.sh --companion-packaging-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/ordinary-companion-packaging.log"
           test -z "$(git status --porcelain)"
       - name: Validate actual native writable-path admission
         shell: bash

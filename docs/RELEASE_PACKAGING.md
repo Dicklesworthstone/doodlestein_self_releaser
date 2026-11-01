@@ -93,6 +93,31 @@ not reclassify arbitrary metadata or weaken checksum, signature, provenance or
 publication checks. Retained shared files and archives undergo the same
 completed-output verification on retry as physical-platform outputs.
 
+## Companion archives in ordinary builds
+
+The packaging step in `dsr build` also preserves the ownership declared by
+`workspace_additional_artifacts`. A validated companion ZIP or tar archive
+keeps its literal name and exact bytes in the final inventory. Sharing a target
+and archive format with the primary executable does not make that companion
+eligible to supply the primary release archive or its installer alias.
+Companion names are reserved across the flat output directory, ignoring case.
+A primary or installer name that collides with one is refused before packaging,
+including a compiler variant's name or a companion with identical bytes.
+
+Primary selection excludes the configured companions whose collection receipts
+were verified, then matches the requested platform and compiler variant. DSR
+packages a raw primary, converts a primary archive when needed, or reuses an
+already complete primary archive without changing its bytes. A missing or
+invalid primary prevents publication even when every companion is valid.
+
+`bash scripts/tests/test_ordinary_collection_inventory.sh --companion-packaging-only`
+exercises the complete build command with real small host ELF files and archives.
+Its producer and scheduler responses are controlled fixtures; receipt validation,
+collection, packaging, manifest admission and completion writes run unchanged.
+The cases cover gzip and ZIP companions, conversion, preserved prebuilt bytes,
+raw binaries, compiler variant selection, reserved-name collisions and unusable primaries. They do not
+claim native compiler, GNU/musl ABI or remote-host qualification.
+
 ## Describe and execute
 
 ```bash

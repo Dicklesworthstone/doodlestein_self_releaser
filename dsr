@@ -3743,6 +3743,37 @@ EOF
         return 1
     }
 
+    # A typed companion may have the same container format and target as the
+    # primary executable. Its verified ownership must survive manifest-based
+    # selection: documentation.tar.gz cannot become the installer archive.
+    # Stream the receipt map; large release inventories must not enter argv.
+    _build_primary_manifest_artifacts() {
+        local manifest_file="$1" additional_receipts="${verified_additional_receipts:-}"
+        [[ -n "$additional_receipts" ]] || additional_receipts='{}'
+        jq -c --slurpfile manifest "$manifest_file" '
+            [.[] | {name, target}] as $additional |
+            $manifest[0].artifacts | map(select(. as $artifact |
+                all($additional[];
+                    .name != $artifact.name or .target != $artifact.target)))
+        ' <<< "$additional_receipts"
+    }
+
+    # The flattened output has one owner per name, even when two owners have
+    # identical bytes. Reserve companions before primary packaging can replace
+    # a destination or choose an existing file as its installer alias.
+    _build_require_primary_names_available() {
+        local versioned="$1" compat="$2" additional_receipts="${verified_additional_receipts:-}"
+        [[ -n "$additional_receipts" ]] || additional_receipts='{}'
+        if ! jq -e --arg versioned "$versioned" --arg compat "$compat" '
+            ([$versioned, $compat] | map(select(length > 0) | ascii_downcase)) as $primary |
+            all(.[]; (.name | ascii_downcase) as $name |
+                ($primary | index($name)) == null)
+        ' <<< "$additional_receipts" >/dev/null; then
+            log_error "Primary release or installer name collides with a configured additional artifact: $versioned ${compat:-}"
+            return 4
+        fi
+    }
+
     _build_find_manifest_artifact() {
         local manifest_file="$1"
         local output_dir="$2"
@@ -3751,21 +3782,22 @@ EOF
         local target_triple="${5:-}"
 
         if [[ -f "$manifest_file" ]]; then
-            local name
+            local name primary_artifacts
+            primary_artifacts=$(_build_primary_manifest_artifacts "$manifest_file") || return 4
             name=$(jq -r --arg t "$target" --arg f "$format" --arg triple "$target_triple" '
-                .artifacts[]? | select(.target == $t) |
+                .[] | select(.target == $t) |
                 select($triple == "" or .target_triple == $triple) |
                 select(.archive_format == $f) | .name
-            ' "$manifest_file" 2>/dev/null | head -1)
+            ' <<< "$primary_artifacts" 2>/dev/null | head -1)
             if [[ -n "$name" && -f "$output_dir/$name" ]]; then
                 echo "$output_dir/$name"
                 return 0
             fi
 
             name=$(jq -r --arg t "$target" --arg triple "$target_triple" '
-                .artifacts[]? | select(.target == $t) |
+                .[] | select(.target == $t) |
                 select($triple == "" or .target_triple == $triple) | .name
-            ' "$manifest_file" 2>/dev/null | head -1)
+            ' <<< "$primary_artifacts" 2>/dev/null | head -1)
             if [[ -n "$name" && -f "$output_dir/$name" ]]; then
                 echo "$output_dir/$name"
                 return 0
@@ -4128,6 +4160,10 @@ EOF
                 naming_override=$(jq -nc --arg versioned "$versioned" --arg compat "$compat" \
                     '{versioned:$versioned, compat:$compat}') || return 1
             fi
+            if ! _build_require_primary_names_available "$versioned" "$compat"; then
+                collect_failed=true
+                return 1
+            fi
             variant_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$triple" 2>/dev/null || true)
             if [[ -z "$variant_path" || -L "$variant_path" ]]; then
                 log_warn "Variant $triple of $tool $target was not produced by this build ($versioned); installers selecting it will find no asset"
@@ -4275,7 +4311,9 @@ EOF
         fi
 
         local existing_format="${existing_archive_formats[$target]:-}"
-        if [[ -n "$target_triple" && -n "$binary_override" && -f "$binary_override" ]]; then
+        if [[ -n "$binary_override" && -f "$binary_override" ]]; then
+            # Only the selected primary determines prebuilt reuse. A platform
+            # may also carry companion archives or another compiler variant.
             existing_format=$(packaging_format_for_name "${binary_override##*/}")
             [[ "$existing_format" != none ]] || existing_format=""
         fi
@@ -4486,11 +4524,12 @@ EOF
         fi
 
         if [[ -n "$manifest_file" && -f "$manifest_file" ]]; then
-            local target format
+            local target format primary_artifacts
+            primary_artifacts=$(_build_primary_manifest_artifacts "$manifest_file") || return 4
             while IFS=$'\t' read -r target format; do
                 [[ -z "$target" || -z "$format" || "$format" == "none" ]] && continue
                 existing_archive_formats["$target"]="$format"
-            done < <(jq -r '.artifacts[]? | [.target // "", .archive_format // ""] | @tsv' "$manifest_file" 2>/dev/null)
+            done < <(jq -r '.[] | [.target // "", .archive_format // ""] | @tsv' <<< "$primary_artifacts" 2>/dev/null)
         else
             local target artifact_path
             while IFS=$'\t' read -r target artifact_path; do
@@ -4546,6 +4585,10 @@ EOF
             }
             versioned_name=$(echo "$names_json" | jq -r '.versioned // empty' 2>/dev/null)
             compat_name=$(echo "$names_json" | jq -r '.compat // empty' 2>/dev/null)
+            if ! _build_require_primary_names_available "$versioned_name" "$compat_name"; then
+                collect_failed=true
+                return 1
+            fi
 
             if [[ "$format" != "none" ]]; then
                 _build_emit_variant_aliases "$tool" "$version" "$target" "$format" "$naming_ext" \
@@ -4559,6 +4602,11 @@ EOF
             existing_path=$(_build_find_manifest_artifact "$manifest_file" "$output_dir" "$target" "$format" "$primary_triple" 2>/dev/null || true)
             if [[ -z "$existing_path" && ! -f "$manifest_file" && -n "$versioned_name" && -f "$output_dir/$versioned_name" ]]; then
                 existing_path="$output_dir/$versioned_name"
+            fi
+            if [[ -f "$manifest_file" && -z "$existing_path" && "$format" != none ]]; then
+                log_error "Primary artifact not found for $tool $target ${primary_triple:-}; additional artifacts cannot replace it"
+                collect_failed=true
+                return 1
             fi
             if [[ -n "$existing_path" ]]; then
                 existing_format=$(packaging_format_for_name "${existing_path##*/}")
