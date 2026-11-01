@@ -382,19 +382,36 @@ _hh_cache_file() {
     echo "$_HH_CACHE_DIR/${hostname}.json"
 }
 
+# Normalize the actual writable locations selected by a native operation. A
+# role can name several paths; only exact role/path duplicates are collapsed.
+# These paths are data for the receiving host, never remote shell fragments.
+_hh_writable_paths_json() {
+    jq -ces '
+        if length != 1 then error("expected one writable-path request") else .[0] end |
+        if type != "array" or length > 128 or
+           (all(.[]; type == "object" and (keys | sort) == ["path","role"] and
+                (.role | type == "string" and test("^[a-z][a-z0-9_]{0,63}$")) and
+                (.path | type == "string" and length <= 4096 and startswith("/") and
+                    (test("[\\x00-\\x1f\\x7f]|(^|/)\\.\\.?(/|$)|//") | not))) | not)
+        then error("invalid writable-path request")
+        else unique_by([.role,.path]) end
+    ' <<< "${1-[]}" 2>/dev/null
+}
+
 # Bind cached admission to the normalized host and the policy that produced it.
 # Retain only the digest, not arbitrary host fields (which may be private).
 # Bump the schema whenever probe/admission semantics change incompatibly.
 _hh_admission_fingerprint() {
-    local host_config="$1" contract digest
+    local host_config="$1" requested_paths="${2-[]}" contract digest
     contract=$(jq -ncS --argjson host "$host_config" \
+        --argjson requested_paths "$requested_paths" \
         --arg disk_warn "$_HH_DISK_WARN_THRESHOLD" \
         --arg disk_error "$_HH_DISK_ERROR_THRESHOLD" \
         --arg disk_min_free "$_HH_DISK_MIN_FREE_BYTES" \
         --arg clock_warn "$_HH_CLOCK_DRIFT_WARN" \
         --arg ssh_timeout "$_HH_SSH_TIMEOUT" \
         --arg command_timeout "$_HH_CMD_TIMEOUT" \
-        '{schema:"dsr-host-admission-v6",host:$host,policy:{
+        '{schema:"dsr-host-admission-v7",host:$host,writable_paths:$requested_paths,policy:{
             disk_warn:$disk_warn,disk_error:$disk_error,clock_warn:$clock_warn,
             disk_min_free_bytes:$disk_min_free,
             ssh_timeout:$ssh_timeout,command_timeout:$command_timeout}}') || return 4
@@ -625,6 +642,7 @@ _hh_disk_status() {
 # read-only capacity observation, not a reservation or a compiler attestation.
 _hh_unix_writable_probe_script() {
     cat <<'DSR_WRITABLE_PROBE'
+import base64
 import json
 import os
 import plistlib
@@ -774,14 +792,23 @@ def safe_path(value):
 
 def observe(role, selected, allow_missing=False):
     selected = safe_path(selected)
-    actual = os.path.realpath(selected)
-    while allow_missing and not os.path.exists(actual):
-        parent = os.path.dirname(actual)
-        if parent == actual:
+    actual = selected.rstrip('/') or '/'
+    while allow_missing:
+        try:
+            os.stat(actual)
             break
-        actual = parent
+        except FileNotFoundError:
+            # Resolve only after finding an existing directory. Resolving a
+            # dangling symlink first would silently admit its unrelated parent.
+            if os.path.lexists(actual):
+                raise ValueError('writable role contains a dangling symlink: ' + role)
+            parent = os.path.dirname(actual.rstrip('/'))
+            if not parent or parent == actual:
+                raise ValueError('writable role has no existing parent: ' + role)
+            actual = parent
     if not os.path.isdir(actual):
         raise ValueError('required writable role is not an existing directory: ' + role + ': ' + selected)
+    actual = os.path.realpath(actual)
     info = os.statvfs(actual)
     block = info.f_frsize or info.f_bsize
     available, total = info.f_bavail * block, info.f_blocks * block
@@ -806,11 +833,20 @@ def main():
     target = os.environ.get('CARGO_TARGET_DIR')
     if target:
         rows.append(observe('cargo_target', target))
+    requested = json.loads(base64.b64decode(sys.argv[2], validate=True)) if len(sys.argv) > 2 else []
+    if not isinstance(requested, list) or len(requested) > 128:
+        raise ValueError('invalid requested writable roles')
+    for entry in requested:
+        if not isinstance(entry, dict) or set(entry) != {'role', 'path'} or not isinstance(entry['role'], str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,63}', entry['role']):
+            raise ValueError('invalid requested writable role')
+        row = observe(entry['role'], entry['path'], allow_missing=True)
+        row['requested'] = True
+        rows.append(row)
     rows = macos_capacities(rows) if sys.platform == 'darwin' else bind_apfs(rows, {}, ({}, {}))
     for row in rows:
         if str(os.stat(row['probe_path']).st_dev) != row['filesystem_id']:
             raise ValueError('writable filesystem changed during capacity observation')
-    print(json.dumps(dict(roles=rows), sort_keys=True, separators=(',', ':')))
+    print(json.dumps(dict(roles=rows, requested_paths=requested), sort_keys=True, separators=(',', ':')))
 
 if __name__ == '__main__':
     try:
@@ -825,7 +861,14 @@ DSR_WRITABLE_PROBE
 _hh_default_unix_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" host_config="${4:-}"
     local split_storage="${5-null}"
+    local requested_paths="${6-[]}" encoded_paths
     local config_status=0 build_root script result
+    if ! requested_paths=$(_hh_writable_paths_json "$requested_paths") || \
+       ! encoded_paths=$(printf '%s' "$requested_paths" | base64 | tr -d '\r\n') || \
+       [[ ! "$encoded_paths" =~ ^[A-Za-z0-9+/=]+$ ]]; then
+        echo '{"path":"writable-storage","status":"error","error":"Invalid requested writable paths"}'
+        return 1
+    fi
     if [[ -z "$host_config" ]]; then
         host_config=$(_hh_get_host_config "$hostname") || config_status=$?
         if [[ $config_status -ne 0 ]]; then
@@ -841,13 +884,17 @@ _hh_default_unix_storage_admission() {
         echo '{"path":"writable-storage","status":"error","error":"Invalid Unix build root"}'
         return 1
     }
-    script="python3 -I - '$build_root' <<'DSR_UNIX_WRITABLE_PY'"$'\n'
+    script="python3 -I - '$build_root' '$encoded_paths' <<'DSR_UNIX_WRITABLE_PY'"$'\n'
     script+="$(_hh_unix_writable_probe_script)"$'\nDSR_UNIX_WRITABLE_PY'
     if ! result=$(_hh_exec_on_host "$hostname" "$connection" "$ssh_host" "$script"); then
-        echo '{"path":"writable-storage","status":"error","error":"Required writable storage probe failed (Python 3, native diskutil, directory, or filesystem unavailable)"}'
+        jq -nc --argjson requested "$requested_paths" '
+            {path:"writable-storage",status:"error",requested_paths:$requested,
+             error:("Required writable storage probe failed (Python 3, native diskutil, directory, or filesystem unavailable)" +
+                (if $requested == [] then "" else "; requested: " +
+                    ($requested | map(.role + " " + .path) | join("; ")) end))}'
         return 1
     fi
-    if ! _hh_writable_storage_verdict "$split_storage" <<< "$result"; then
+    if ! _hh_writable_storage_verdict "$split_storage" "$requested_paths" <<< "$result"; then
         echo '{"path":"writable-storage","status":"error","error":"Invalid writable storage inventory or free-space policy"}'
         return 1
     fi
@@ -857,7 +904,10 @@ _hh_default_unix_storage_admission() {
 # distinction between filesystem IDs and APFS containers shared by volumes.
 _hh_writable_storage_verdict() {
     local split_storage="${1-null}"
+    local requested_paths
+    requested_paths=$(_hh_writable_paths_json "${2-[]}") || return 4
     jq -ces --argjson split "$split_storage" --argjson minimum "$_HH_DISK_MIN_FREE_BYTES" \
+            --argjson requested "$requested_paths" \
             --argjson warning "$_HH_DISK_WARN_THRESHOLD" --argjson critical "$_HH_DISK_ERROR_THRESHOLD" '
         def whole: type == "number" and . >= 0 and . <= 9007199254740991 and . == floor;
         def path: type == "string" and startswith("/") and (test("[\\x00-\\x1f\\x7f]")|not);
@@ -873,9 +923,12 @@ _hh_writable_storage_verdict() {
            $warning > $critical or $critical > 100
         then error("invalid probe/policy") else .[0] end |
         if (.roles|type != "array") or
-           ((.roles|map(.role)|sort) != ["build_root","cargo_home","home","root","temp"] and
-            (.roles|map(.role)|sort) != ["build_root","cargo_home","cargo_target","home","root","temp"]) or
-           (all(.roles[]; (.path|path) and (.probe_path|path) and
+           ((.roles|map(select(.requested != true)|.role)|sort) != ["build_root","cargo_home","home","root","temp"] and
+            (.roles|map(select(.requested != true)|.role)|sort) != ["build_root","cargo_home","cargo_target","home","root","temp"]) or
+           (.requested_paths // []) != $requested or
+           (.roles|map(select(.requested == true)|{role,path})|sort_by([.role,.path])) != $requested or
+           (all(.roles[]; ((has("requested")|not) or .requested == true) and
+                 (.path|path) and (.probe_path|path) and
                 (.filesystem_id|type == "string" and test("^[0-9]+$")) and
                 (if has("apfs") then (.apfs|apfs) and
                      .capacity_group == ("apfs:" + .apfs.container_uuid) and
@@ -899,11 +952,11 @@ _hh_writable_storage_verdict() {
              ($split | keys | sort) != ["build_root","root_min_free_bytes"] or
              ($split.root_min_free_bytes | whole | not) or $split.root_min_free_bytes < 1073741824 or
              ($split.build_root | path | not) or
-             ([.roles[] | select(.role == "build_root") | .path] != [$split.build_root]))
+             ([.roles[] | select(.role == "build_root" and .requested != true) | .path] != [$split.build_root]))
         then error("invalid or mismatched split-storage contract") else . end |
-        (.roles | map(select(.role == "root"))[0].capacity_group) as $root_group |
+        (.roles | map(select(.role == "root" and .requested != true))[0].capacity_group) as $root_group |
         .roles |= map(
-            ($split != null and .capacity_group == $root_group and
+            ($split != null and .requested != true and .capacity_group == $root_group and
              .role != "build_root" and .role != "cargo_target") as $root_policy |
             (if $root_policy then $split.root_min_free_bytes else $minimum end) as $floor |
             . + {min_free_bytes:$floor,
@@ -916,9 +969,10 @@ _hh_writable_storage_verdict() {
                 if $root_policy and .status == "error" and .available_bytes >= $floor
                 then .status = "warning" else . end
             end) |
-        .roles as $roles | ($roles|map(select(.role == "root"))[0]) as $root |
+        .roles as $roles | ($roles|map(select(.role == "root" and .requested != true))[0]) as $root |
         {path:$root.path,usage_percent:$root.usage_percent,available_bytes:$root.available_bytes,
          available_gb:$root.available_gb,min_free_bytes:$root.min_free_bytes,admission:"unix-writable-roles-v2",roles:$roles,
+         requested_paths:$requested,
          filesystems:($roles|group_by(.filesystem_id)|map({filesystem_id:.[0].filesystem_id,
              roles:map(.role),paths:map(.probe_path)|unique,available_bytes:(map(.available_bytes)|min)})),
          capacity_groups:($roles|group_by(.capacity_group)|map({id:.[0].capacity_group,
@@ -930,7 +984,8 @@ _hh_writable_storage_verdict() {
                  elif any($roles[];.status == "warning") then "warning" else "ok" end)} |
         if .status == "error" then . + {error:("Writable storage pressure: " +
             ($roles|map(select(.status == "error")|(.role + " " + .path + " (" +
-                (.available_gb|tostring) + " GiB free, " + (.usage_percent|tostring) + "% used)"))|join("; ")))} else . end
+                (.available_gb|tostring) + " GiB free, " + (.min_free_bytes/1073741824|tostring) +
+                " GiB required, " + (.usage_percent|tostring) + "% used)"))|join("; ")))} else . end
     '
 }
 
@@ -939,7 +994,17 @@ _hh_check_disk_space() {
     local connection="$2"
     local ssh_host="$3"
     local platform="${4:-}"
+    local requested_paths
+    requested_paths=$(_hh_writable_paths_json "${6-[]}") || {
+        echo '{"path":"writable-storage","status":"error","error":"Invalid requested writable paths"}'
+        return 1
+    }
     local unix_storage="" unix_status=1
+
+    if [[ "$platform" == windows/* && "$requested_paths" != '[]' ]]; then
+        echo '{"path":"writable-storage","status":"error","error":"Requested Unix writable paths cannot authorize Windows storage"}'
+        return 1
+    fi
 
     if [[ "$platform" != windows/* ]]; then
         if declare -F config_unix_storage_json >/dev/null; then
@@ -947,7 +1012,7 @@ _hh_check_disk_space() {
             unix_storage=$(config_unix_storage_json "$hostname") || unix_status=$?
         fi
         if [[ $unix_status -eq 1 ]]; then
-            _hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" "${5:-}"
+            _hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" "${5:-}" null "$requested_paths"
             return $?
         elif [[ $unix_status -ne 0 ]]; then
             echo '{"path":"/","status":"error","error":"Invalid Unix split-storage contract"}'
@@ -1041,7 +1106,7 @@ _hh_check_disk_space() {
 
     if [[ "$platform" != windows/* ]]; then
         _hh_unix_split_storage_admission "$hostname" "$connection" "$ssh_host" "$unix_storage" \
-            "$usage_percent" "$available_kb" "$status"
+            "$usage_percent" "$available_kb" "$status" "$requested_paths"
     else
         echo "{\"path\": \"/\", \"usage_percent\": $usage_percent, \"available_gb\": $available_gb, \"status\": \"$status\"}"
     fi
@@ -1078,6 +1143,7 @@ _hh_split_storage_lines() {
 _hh_unix_split_storage_admission() {
     local hostname="$1" connection="$2" ssh_host="$3" storage="$4"
     local root_usage="$5" root_available_kb="$6" root_status="$7"
+    local requested_paths="${8-[]}"
     local build_root min_free_bytes df_output df_status=0
     # Validate before either remote command. Sourceable callers must not be
     # able to interpolate an unchecked build path into the retained df probe.
@@ -1168,7 +1234,7 @@ _hh_unix_split_storage_admission() {
     # the complete receiving-host observation used by the default path.
     role_config=$(jq -c '{build_root}' <<< "$storage") || return 1
     writable=$(_hh_default_unix_storage_admission "$hostname" "$connection" "$ssh_host" \
-        "$role_config" "$storage") || writable_status=$?
+        "$role_config" "$storage" "$requested_paths") || writable_status=$?
     if [[ $writable_status -ne 0 ]]; then
         jq -nc --argjson summary "$summary" \
             '$summary + {admission:"unix-split-storage-v2",status:"error",roles:[],
@@ -1341,21 +1407,37 @@ _hh_check_clock_drift() {
 }
 
 # Main health check function for a single host
-# Usage: host_health_check <hostname> [--no-cache] [--json]
+# Usage: host_health_check <hostname> [--no-cache] [--json] [--writable-paths <json>]
 # Returns: JSON object with all health checks
 host_health_check() {
     local hostname="$1"
     shift
     local use_cache=true
     local json_mode=false
+    local requested_paths='[]'
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-cache) use_cache=false; shift ;;
             --json) json_mode=true; shift ;;
+            --writable-paths)
+                if [[ $# -lt 2 ]]; then
+                    echo '{"status":"error","healthy":false,"error":"Missing writable-path request"}'
+                    return 4
+                fi
+                requested_paths="$2"
+                # A target's source/recipe choices are not covered by a recent
+                # ambient host check. Observe these exact paths for this call.
+                use_cache=false
+                shift 2
+                ;;
             *) shift ;;
         esac
     done
+    if ! requested_paths=$(_hh_writable_paths_json "$requested_paths"); then
+        echo '{"status":"error","healthy":false,"error":"Invalid requested writable paths"}'
+        return 4
+    fi
 
     # Validate configuration before considering cached health or invoking SSH.
     config_load 2>/dev/null || true
@@ -1410,7 +1492,7 @@ host_health_check() {
     fi
 
     local fingerprint="" cache_available=true cached cached_healthy
-    if ! fingerprint=$(_hh_admission_fingerprint "$host_config") || ! _hh_init_cache; then
+    if ! fingerprint=$(_hh_admission_fingerprint "$host_config" "$requested_paths") || ! _hh_init_cache; then
         # Health probes still work without a writable cache or a hash utility;
         # an unbound or unwritable receipt is never used for admission.
         cache_available=false
@@ -1446,7 +1528,7 @@ host_health_check() {
     if echo "$connectivity" | jq -e '.reachable' &>/dev/null; then
         # 2. Check disk space (pass platform for Windows compatibility)
         local disk_status disk_exit=0
-        disk_space=$(_hh_check_disk_space "$hostname" "$connection" "$ssh_host" "$platform" "$host_config") || disk_exit=$?
+        disk_space=$(_hh_check_disk_space "$hostname" "$connection" "$ssh_host" "$platform" "$host_config" "$requested_paths") || disk_exit=$?
         if ! disk_status=$(jq -ers 'if length == 1 and (.[0] | type == "object" and
                 (.status == "ok" or .status == "warning" or .status == "error"))
             then .[0].status else error("invalid disk result") end' <<< "$disk_space" 2>/dev/null); then
@@ -1769,24 +1851,53 @@ host_health_get_healthy_hosts() {
 }
 
 # Check if a specific host is healthy for a build
-# Usage: host_health_is_ready <hostname> [--require <capability1,capability2>]
+# Usage: host_health_is_ready <hostname> [--require <capability1,capability2>] [--writable-paths <json>]
 # Returns: 0 if ready, 1 if not
 host_health_is_ready() {
     local hostname="$1"
     shift
     local required_capabilities=""
+    local requested_paths='[]' check_args=("$hostname" --json)
+    local requested_mode=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --require) required_capabilities="$2"; shift 2 ;;
+            --require)
+                [[ $# -ge 2 && -n "$2" ]] || return 1
+                required_capabilities="$2"; shift 2
+                ;;
+            --writable-paths)
+                [[ $# -ge 2 ]] || return 1
+                requested_paths="$2"; requested_mode=true; shift 2
+                ;;
             *) shift ;;
         esac
     done
+    if $requested_mode; then
+        requested_paths=$(_hh_writable_paths_json "$requested_paths") || return 1
+        check_args+=(--writable-paths "$requested_paths")
+    fi
 
-    local result
-    result=$(host_health_check "$hostname" --json 2>/dev/null)
+    local result health_status=0
+    result=$(host_health_check "${check_args[@]}" 2>/dev/null) || health_status=$?
 
-    if ! echo "$result" | jq -e '.healthy' &>/dev/null; then
+    if [[ $health_status -ne 0 ]] || \
+       ! jq -se 'length == 1 and (.[0] | type == "object" and .healthy == true)' <<< "$result" &>/dev/null; then
+        if $requested_mode; then
+            local reason
+            reason=$(jq -er '.checks.disk_space.error // .error // "Native host readiness probe failed" |
+                select(type == "string" and length > 0)' <<< "$result" 2>/dev/null) || \
+                reason="Native host readiness probe failed"
+            _hh_log_error "$hostname: $reason"
+        fi
+        return 1
+    fi
+    if $requested_mode && ! jq -e --argjson requested "$requested_paths" '
+        .checks.disk_space.requested_paths == $requested and
+        (.checks.disk_space.roles | map(select(.requested == true) | {role,path}) |
+            sort_by([.role,.path])) == $requested
+    ' <<< "$result" >/dev/null 2>&1; then
+        _hh_log_error "$hostname: Missing or mismatched requested writable-path evidence"
         return 1
     fi
 

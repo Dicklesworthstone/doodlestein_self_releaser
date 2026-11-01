@@ -120,7 +120,8 @@ for label, route, health in cases:
                     ['health:first', 'health:second'] if route == 'late' else
                     ['health:act'] if route == 'local-alias' else ['health:first'])
         if route == 'act': expected = []
-        elif health == 'healthy': expected.append('contexts')
+        elif health == 'healthy':
+            expected += ['health:act' if route == 'local-alias' else 'health:first', 'contexts']
     else:
         arguments = ['act_run_native_build', 'tool', 'darwin/arm64', 'v0.0.0', 'fixture']
         if route in ('strict', 'missing-root', 'missing-host'):
@@ -174,6 +175,319 @@ sys.exit(bool(failures))
 
 if [[ "${1:-}" == --host-health-admission-tests ]]; then
     test_native_host_health_admission
+    exit $?
+fi
+
+# Exercise real configuration, source/native consumers, writable-path inventory,
+# host observation program, disk policy, and fresh admission. Only raw machine
+# capacity and the downstream compiler/cache/transfer boundaries are controlled.
+# No fixture compiler result is represented as a successful release build.
+test_native_writable_path_admission() (
+    command -v python3 >/dev/null && command -v yq >/dev/null && command -v jq >/dev/null || return 3
+    python3 - "$PROJECT_ROOT" "${DSR_TEST_NATIVE_ADMISSION_MODULE:-$SRC_DIR/act_runner.sh}" <<'PY'
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import uuid
+
+project, module = map(Path, sys.argv[1:3])
+work = Path(tempfile.mkdtemp(prefix='dsr-native-paths-',
+                           dir=os.environ.get('DSR_NATIVE_ADMISSION_TEST_ROOT')))
+print('Retained native writable-path evidence:', work, flush=True)
+source = work / 'committed-source'
+source.mkdir()
+(source / 'tracked.txt').write_text('release source fixture\n')
+git = ['git', '-C', str(source)]
+subprocess.run(git + ['init', '-q', '-b', 'main'], check=True)
+subprocess.run(git + ['add', 'tracked.txt'], check=True)
+subprocess.run(git + ['-c', 'user.name=DSR Fixture', '-c', 'user.email=fixture@example.invalid',
+                     '-c', 'commit.gpgsign=false', 'commit', '-qm', 'Writable path fixture'], check=True)
+sha = subprocess.check_output(git + ['rev-parse', 'HEAD'], text=True).strip()
+
+observer = work / 'observe.py'
+observer.write_text(r'''import json, os, shlex, sys, types
+from pathlib import Path
+program = sys.stdin.read()
+lines = program.splitlines()
+argv = shlex.split(lines[0].split(' <<')[0])
+sys.argv = ['probe', *argv[3:]]
+code = '\n'.join(lines[1:-1])
+case = Path(os.environ['DSR_PATH_CASE'])
+selected = os.environ.get('DSR_PATH_FULL', '')
+if (case / 'capacity-dropped').exists():
+    selected = os.environ['DSR_PATH_DROP']
+original_stat = os.stat
+def limited(path):
+    text = str(path)
+    return selected and (text == selected or text.startswith(selected + '/'))
+def stat(path, *args, **kwargs):
+    result = original_stat(path, *args, **kwargs)
+    if limited(path):
+        values = list(result)
+        values[2] = 987654321
+        return os.stat_result(values)
+    return result
+def statvfs(path):
+    available = (2 if limited(path) else 60) * 1024**3
+    return types.SimpleNamespace(f_frsize=4096, f_bsize=4096,
+                                 f_bavail=available // 4096, f_blocks=100 * 1024**3 // 4096)
+os.stat, os.statvfs = stat, statvfs
+# Portable controlled Unix observations; the separate host-health suite owns
+# native APFS plist/container accounting. Real paths, nearest ancestors and
+# directory checks remain production code.
+sys.platform = 'linux'
+namespace = {'__name__': 'fixture'}
+exec(compile(code, 'production-writable-probe', 'exec'), namespace)
+namespace['main']()
+''')
+driver = work / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+source "$DSR_PATH_PROJECT/src/logging.sh" || exit $?
+source "$DSR_PATH_PROJECT/src/config.sh" || exit $?
+source "$DSR_PATH_PROJECT/src/host_health.sh" || exit $?
+source "$DSR_PATH_MODULE" || exit $?
+_hh_exec_on_host() {
+    if [[ "$4" == *DSR_UNIX_WRITABLE_PY* ]]; then
+        local result
+        result=$(printf '%s' "$4" | python3 "$DSR_PATH_OBSERVER") || return $?
+        printf '%s\n' "$result" >> "$DSR_PATH_CASE/observations.jsonl"
+        printf '%s\n' "$result"
+    else
+        "$BASH" -c "$4"
+    fi
+}
+_act_prepare_unix_private_cargo_home() {
+    printf 'prepare:strict\n' >> "$DSR_PATH_CASE/events"
+    return 97
+}
+_act_prepare_unix_nonstrict_cargo_home() {
+    printf 'prepare:ordinary\n' >> "$DSR_PATH_CASE/events"
+    if [[ "$DSR_PATH_MODE" != drop ]]; then return 97; fi
+    printf 'full\n' > "$DSR_PATH_CASE/capacity-dropped"
+    jq -nc --arg home "$4" '{cargo_home:$home,receipt_sha256:("1"*64)}'
+}
+_act_ssh_exec() { printf 'compile\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_remove_build_stage_root() { return 0; }
+_act_sync_strict_checkout() { printf 'sync\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_sync_source() { printf 'sync\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_prepare_ordinary_source_root() { printf 'stage\n' >> "$DSR_PATH_CASE/events"; return 97; }
+_act_export_ordinary_git_contexts() { printf 'contexts\n' >> "$DSR_PATH_CASE/events"; return 97; }
+"$@"
+''')
+
+cases = [
+    ('strict-source-full', 'strict-sync', 'source', True),
+    ('strict-source-healthy', 'strict-sync', 'source', False),
+    ('recipe-temp-full', 'native', 'temp', True),
+    ('recipe-temp-healthy', 'native', 'temp', False),
+    ('ordinary-target-full', 'ordinary-rust', 'cargo_target', True),
+    ('ordinary-target-healthy', 'ordinary-rust', 'cargo_target', False),
+    ('strict-cache-full', 'strict-rust', 'cargo_cache', True),
+    ('strict-cache-healthy', 'strict-rust', 'cargo_cache', False),
+    ('ordinary-build-dir-full', 'ordinary-rust', 'cargo_build', True),
+    ('strict-build-dir-full', 'strict-rust', 'cargo_build', True),
+    ('same-host-second-temp-full', 'sync-two', 'temp', True),
+    ('same-host-second-temp-healthy', 'sync-two', 'temp', False),
+    ('strict-overridden-paths', 'strict-overridden', 'cargo_target', False),
+    ('platform-temp-overrides-global', 'duplicate', 'temp', False),
+    ('cache-preparation-fills-target', 'drop', 'cargo_target', True),
+    ('relative-temp-in-private-stage', 'relative', 'temp', False),
+    ('source-relative-target-overrides-global', 'source-relative', 'cargo_target', False),
+    ('source-sibling-full-trailing-slashes', 'source-sibling', 'source_dependency', True),
+    ('source-sibling-healthy-trailing-slashes', 'source-sibling', 'source_dependency', False),
+]
+
+def run_case(spec):
+    label, route, role, refused = spec
+    case = work / label
+    config, healthy, full = case / 'config', case / 'healthy', case / 'full'
+    for directory in [config / 'repos.d', healthy / 'build', healthy / 'target',
+                      case / 'home', case / 'temp', full, case / 'strict/source']:
+        directory.mkdir(parents=True)
+    target = 'darwin/arm64'
+    root = full if refused and route != 'drop' else healthy
+    selected = root / {'source': 'snapshots', 'temp': 'new temp',
+                       'cargo_target': 'target', 'cargo_cache': 'cargo-cache',
+                       'cargo_build': 'intermediates', 'source_dependency': 'dependency'}[role]
+    recipe = dict(tool_name='tool', repo='fixture/tool', local_path=str(source),
+                  binary_name='tool', build_cmd='printf compiler', language='go',
+                  targets=[target], hosts={target: 'fixture'}, act_job_map={target: None})
+    env = dict(os.environ, DSR_PATH_PROJECT=str(project), DSR_PATH_MODULE=str(module),
+               DSR_PATH_OBSERVER=str(observer), DSR_PATH_CASE=str(case), DSR_PATH_MODE=route,
+               DSR_PATH_FULL=str(full) if refused and route != 'drop' else '',
+               DSR_PATH_DROP=str(healthy / 'target'), HOME=str(case / 'home'), TMPDIR=str(case / 'temp'),
+               DSR_CONFIG_DIR=str(config), ACT_CONFIG_DIR=str(config),
+               ACT_REPOS_DIR=str(config / 'repos.d'), DSR_HOSTS_FILE=str(config / 'hosts.yaml'),
+               DSR_CONFIG_FILE=str(config / 'config.yaml'), DSR_REPOS_FILE=str(config / 'repos.yaml'),
+               DSR_CACHE_DIR=str(case / 'cache'), DSR_STATE_DIR=str(case / 'state'),
+               ACT_LOGS_DIR=str(case / 'logs'), ACT_ARTIFACTS_DIR=str(case / 'artifacts'),
+               DSR_DISABLE_HOST_SELECTOR='1', RCH_REQUIRE_REMOTE='0', NO_COLOR='1')
+    for name in ['CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR', 'DSR_STRICT_BUILD_ROOT',
+                 'DSR_NATIVE_OUTPUT_STAGE', 'DSR_CONFIG_LOADED', 'ACT_REPO_LOCAL_PATH']:
+        env.pop(name, None)
+    (config / 'hosts.yaml').write_text(json.dumps({'hosts': {'fixture': dict(
+        platform='linux/amd64', connection='local', enabled=True, capabilities=[],
+        build_root=str(healthy / 'build'))}}))
+    run = str(uuid.uuid4())
+    args = ['act_run_native_build', 'tool', target, '1.0.0', run, '', '', '', 'fixture']
+    expected = 'compile'
+    setting = {'temp': 'TMPDIR', 'cargo_target': 'CARGO_TARGET_DIR',
+               'cargo_build': 'CARGO_BUILD_BUILD_DIR'}.get(role)
+    if setting:
+        recipe['env'] = {setting: str(selected)}
+    if route in ['ordinary-rust', 'strict-rust', 'strict-overridden', 'drop']:
+        recipe['language'] = 'rust'
+        expected = 'prepare:strict' if route.startswith('strict') else 'prepare:ordinary'
+    if route.startswith('strict') and route != 'strict-sync':
+        args[5] = str(case / 'strict/source')
+    if role == 'cargo_cache':
+        recipe['strict_cargo_cache_root'] = str(selected)
+    if route == 'strict-overridden':
+        env['DSR_PATH_FULL'] = str(full)
+        recipe['env'] = {'CARGO_HOME': str(full / 'ignored-home'),
+                         'CARGO_TARGET_DIR': str(full / 'ignored-target')}
+    if route == 'duplicate':
+        recipe['env'] = {'TMPDIR': str(full / 'ignored-temp')}
+        recipe['cross_compile'] = {target: {'env': {'TMPDIR': str(healthy / 'new temp')}}}
+        env['DSR_PATH_FULL'] = str(full)
+    if route == 'relative':
+        recipe['env'] = {'TMPDIR': './scratch space'}
+        env['DSR_NATIVE_OUTPUT_STAGE'] = '1'
+    if route == 'strict-sync':
+        recipe['release_contract'] = dict(checksum_sidecar='sha256',
+            exact_primary_assets={target: 'tool-aarch64-apple-darwin'})
+        env['DSR_STRICT_BUILD_ROOT'] = str(selected)
+        args = ['act_sync_sources', 'tool', '--strict-release', '--run-id', run, '--git-sha', sha]
+        expected = 'sync'
+    if route == 'sync-two':
+        second = 'darwin/amd64'
+        recipe['targets'].append(second)
+        recipe['hosts'][second] = 'fixture'
+        recipe['act_job_map'][second] = None
+        recipe['env'] = {'TMPDIR': str(healthy / 'first-temp')}
+        recipe['cross_compile'] = {second: {'env': {'TMPDIR': str(selected)}}}
+        args = ['act_sync_sources', 'tool', '--stage-ordinary']
+        expected = 'contexts'
+    if route == 'source-relative':
+        recipe['language'] = 'rust'
+        recipe['env'] = {'CARGO_TARGET_DIR': str(full / 'ignored-target')}
+        recipe['cross_compile'] = {target: {'env': {'CARGO_TARGET_DIR': '${HOME}/ignored-relative'}}}
+        env['DSR_PATH_FULL'] = str(full)
+        args = ['act_sync_sources', 'tool', '--stage-ordinary']
+        expected = 'contexts'
+    if route == 'source-sibling':
+        destination = healthy / 'inplace/source'
+        selected = healthy / 'inplace' / source.name
+        destination.mkdir(parents=True)
+        selected.mkdir()
+        env['DSR_PATH_FULL'] = str(selected) if refused else ''
+        recipe['host_paths'] = {'fixture': str(destination) + '/'}
+        recipe['sibling_crates'] = [{'local_path': str(source) + '/'}]
+        args = ['act_sync_sources', 'tool']
+        expected = 'sync'
+    (config / 'repos.d/tool.yaml').write_text(json.dumps(recipe))
+    result = subprocess.run([os.environ.get('BASH', 'bash'), str(driver), *args], env=env,
+                            text=True, capture_output=True, timeout=45)
+    (case / 'stdout').write_text(result.stdout)
+    (case / 'stderr').write_text(result.stderr)
+    (case / 'exit').write_text(str(result.returncode) + '\n')
+    events = (case / 'events').read_text().splitlines() if (case / 'events').exists() else []
+    observation_file = case / 'observations.jsonl'
+    observations = [json.loads(line) for line in observation_file.read_text().splitlines()] if observation_file.exists() else []
+    requests = [row for value in observations for row in value['roles'] if row.get('requested')]
+    checks = []
+    if refused:
+        checks += [('refuses with the established terminal status', result.returncode == (6 if route == 'drop' else 4)),
+                   ('stops before source/cache/compiler side effects',
+                    events == (['prepare:ordinary'] if route == 'drop' else [])),
+                   ('observes the full selected volume with healthy defaults',
+                    any(row['role'] == role and row['available_bytes'] == 2 * 1024**3 for row in requests)
+                    and all(row['available_bytes'] == 60 * 1024**3
+                            for value in observations for row in value['roles'] if not row.get('requested')))]
+    else:
+        checks += [('healthy selected paths reach existing execution boundary', expected in events),
+                   ('healthy path evidence is present', bool(requests)),
+                   ('fixture is not misrepresented as successful build', result.returncode != 0)]
+    if route in ['strict-overridden', 'duplicate', 'source-relative']:
+        checks += [('inactive overridden paths are not admitted',
+                    all(not row['path'].startswith(str(full)) for row in requests))]
+    if route == 'relative':
+        checks += [('relative temp resolves inside the actual unique output stage',
+                    any(row['role'] == 'temp' and '/dsr-build-tool-darwin-arm64-' in row['path']
+                        and row['path'].endswith('/source/scratch space') for row in requests))]
+    if route == 'source-sibling':
+        checks += [('sibling probe matches dirname/basename transfer semantics',
+                    any(row['role'] == 'source_dependency' and row['path'] == str(selected)
+                        for row in requests))]
+    if route == 'drop':
+        try:
+            receipt = json.loads(result.stdout)
+        except ValueError:
+            receipt = {}
+        checks += [('late refusal records failed build without artifact or final-cache authority',
+                    receipt.get('status') == 'failed' and receipt.get('exit_code') == 6
+                    and receipt.get('artifact_paths') == [] and receipt.get('artifact_path') == ''
+                    and 'build command was not started' in receipt.get('error', '')
+                    and 'final' not in receipt.get('cargo_isolation', {}).get('dependency_cache', {}))]
+    if route.startswith('sync') or route == 'strict-sync':
+        checks += [('refused plan leaves no source context or snapshot',
+                    not refused or (not (case / 'state/source-contexts').exists()
+                                    and not selected.exists()))]
+    return [(label + ': ' + check, valid) for check, valid in checks]
+
+results = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    for case_checks in executor.map(run_case, cases):
+        results += case_checks
+for label, valid in results:
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+
+# Resolver controls exercise actual literal/precedence decisions without a
+# compiler or synthetic health verdict. Paths with spaces/single quotes remain
+# literal; shell expansion and Cargo templates cannot masquerade as evidence.
+def resolve(environment, absolute_only=False):
+    command = ['bash', '-c', 'source "$1"; shift; _act_native_writable_paths_json "$@"',
+               '_', str(module), '/planned/source', '/planned/stage/source', environment,
+               'rust', '', '[]', str(absolute_only).lower()]
+    return subprocess.run(command, text=True, capture_output=True, timeout=10)
+
+literal = resolve("TMPDIR=/unused\nTMPDIR=./scratch space\nCARGO_BUILD_BUILD_DIR=objects")
+try:
+    rows = json.loads(literal.stdout)
+except ValueError:
+    rows = []
+results.append(('resolver last assignment and actual cwd',
+                literal.returncode == 0 and
+                {'role': 'temp', 'path': '/planned/stage/source/scratch space'} in rows and
+                {'role': 'cargo_build', 'path': '/planned/stage/source/objects'} in rows))
+quoted = resolve("TMPDIR=/scratch/John's directory")
+results.append(('literal single quotes and spaces remain supported', quoted.returncode == 0))
+for label, environment in [
+    ('variable expansion', 'TMPDIR=/scratch/$HOME'),
+    ('command substitution', 'TMPDIR=/scratch/$(touch refused)'),
+    ('backtick substitution', 'TMPDIR=/scratch/' + chr(96) + 'false' + chr(96)),
+    ('double quote shell syntax', 'TMPDIR=/scratch/"redirect"'),
+    ('backslash shell syntax', 'TMPDIR=/scratch/escape\\space'),
+    ('Cargo build-directory templates', 'CARGO_BUILD_BUILD_DIR={cargo-cache-home}/build'),
+]:
+    response = resolve(environment)
+    results.append((label + ' is refused before path observation',
+                    response.returncode == 4 and not response.stdout))
+for label, valid in results[-8:]:
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+failures = sum(not valid for _, valid in results)
+print(f'Native writable paths: cases={len(cases)} checks={len(results)} failures={failures}', flush=True)
+sys.exit(bool(failures))
+PY
+)
+
+if [[ "${1:-}" == --host-writable-path-tests ]]; then
+    test_native_writable_path_admission
     exit $?
 fi
 
@@ -5104,6 +5418,11 @@ main() {
             log_pass "Native capability routing admits the required toolchain before transport"
         else
             log_fail "Native capability routing regression cases failed"
+        fi
+        if test_native_writable_path_admission; then
+            log_pass "Native staging and builds admit their actual writable paths"
+        else
+            log_fail "Native writable-path regression cases failed"
         fi
     fi
     if [[ "${1:-}" == --go-targets-only ]]; then

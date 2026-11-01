@@ -4530,6 +4530,67 @@ _act_strict_source_root_path() {
     printf '%s/%s-%s/source\n' "$strict_root" "$tool_name" "$run_id"
 }
 
+# Describe Unix write locations as data, never by evaluating recipe text in a
+# coordinator shell. The final launcher applies the last environment assignment.
+# Relative settings belong to the build's actual working directory, not to the
+# coordinator or the original checkout. Source planning has no final per-target
+# working directory yet, so that phase admits absolute overrides only; native
+# preparation admits the complete, resolved set before creating its private home.
+_act_native_writable_paths_json() {
+    local source_root="$1" working_root="$2" build_env="$3" language="$4"
+    local cache_root="${5:-}" extra_paths="${6:-[]}" absolute_only="${7:-false}"
+    jq -nce --arg source "$source_root" --arg working "$working_root" \
+        --arg environment "$build_env" --arg language "$language" \
+        --arg cache "$cache_root" --argjson extra "$extra_paths" \
+        --argjson absolute_only "$absolute_only" '
+        def literal:
+            . as $path | type == "string" and length > 0 and
+            all(explode[]; . >= 32 and . != 127) and
+            (["$","`","\\","\""] | all(.[]; . as $char | ($path | contains($char) | not)));
+        def absolute:
+            literal and startswith("/");
+        if ($source | absolute | not) or ($working | absolute | not) or
+           ($extra | type != "array") then error("Invalid native writable roots") else . end |
+        (reduce ($environment | split("\n")[] | select(contains("="))) as $pair ({};
+            ($pair | index("=")) as $equals |
+            .[$pair[:$equals]] = $pair[$equals + 1:])) as $env |
+        [{role:"source",path:$source}] + $extra +
+        (if $working != $source then [{role:"stage",path:$working}] else [] end) +
+        (if $cache != "" then [{role:"cargo_cache",path:$cache}] else [] end) +
+        ([{role:"temp",name:"TMPDIR"}] +
+          (if $language == "rust" then
+            [{role:"cargo_home",name:"CARGO_HOME"},
+             {role:"cargo_target",name:"CARGO_TARGET_DIR"},
+             {role:"cargo_build",name:"CARGO_BUILD_BUILD_DIR"}]
+           else [] end) | map(. as $entry | $env[.name] // empty |
+             if $absolute_only and $entry.name == "CARGO_TARGET_DIR" and (startswith("/") | not) then
+                 empty
+             elif literal | not then error("Unresolved native writable environment path: " + $entry.name)
+             elif $entry.name == "CARGO_BUILD_BUILD_DIR" and (test("[{}]")) then
+                 error("Cargo build-directory templates require resolved writable paths")
+             elif startswith("/") then {role:$entry.role,path:.}
+             elif $absolute_only then empty
+             else {role:$entry.role,path:($working + "/" +
+                    (split("/") | map(select(. != "." and . != "")) | join("/")))} end)) |
+        if all(.[]; (.path | absolute)) then unique_by([.role,.path])
+        else error("Invalid native writable path") end
+    ' || return 4
+}
+
+# Keep the general host gate, then require fresh evidence for the selected
+# paths. Windows has a separate split-storage contract and does not consume
+# these Unix path observations.
+_act_native_writable_paths_ready() {
+    local host="$1" capability="$2" paths="$3"
+    local readiness_args=("$host" --writable-paths "$paths")
+    [[ -z "$capability" ]] || readiness_args+=(--require "$capability")
+    if ! declare -F host_health_is_ready &>/dev/null ||
+       ! host_health_is_ready "${readiness_args[@]}"; then
+        _log_error "Native writable paths are not ready on $host"
+        return 4
+    fi
+}
+
 _act_source_has_gitlinks() {
     local listing
     listing=$(_act_strict_git -C "$1" ls-tree -r --full-tree "$2" 2>/dev/null) || return 4
@@ -6885,6 +6946,8 @@ act_sync_sources() {
     local host_paths=()
     local configured_host_paths=()
     local admitted_host_capabilities=()
+    local admitted_writable_paths=()
+    local writable_admission_plans=()
     local target_hosts_json='{}'
     for target in $targets; do
         local host remote_path
@@ -6908,9 +6971,11 @@ act_sync_sources() {
         target_hosts_json=$(jq -c --arg target "$target" --arg host "$host" \
             '.[$target] = $host' <<< "$target_hosts_json") || return 4
         local already_added=false
-        for h in "${hosts_to_sync[@]}"; do
-            if [[ "$h" == "$host" ]]; then
+        local sync_host_index
+        for sync_host_index in "${!hosts_to_sync[@]}"; do
+            if [[ "${hosts_to_sync[$sync_host_index]}" == "$host" ]]; then
                 already_added=true
+                remote_path="${host_paths[$sync_host_index]}"
                 break
             fi
         done
@@ -6934,9 +6999,8 @@ act_sync_sources() {
             fi
             admitted_host_capabilities+=("$admission_key")
         fi
-        $already_added && continue
         local configured_remote_path="$remote_path"
-        if $stage_ordinary; then
+        if ! $already_added && $stage_ordinary; then
             ordinary_stage_id=$(_act_generate_uuid) || return 4
             remote_path=$(_act_ordinary_source_root_path "$host" "$ordinary_stage_id" "$configured_remote_path") || return 4
         fi
@@ -6956,7 +7020,7 @@ act_sync_sources() {
             esac
         fi
 
-        if $strict_release; then
+        if ! $already_added && $strict_release; then
             if ! remote_path=$(_act_strict_source_root_path \
                 "$remote_path" "$tool_name" "$strict_run_id" "$host"); then
                 _log_error "Could not derive a safe fresh source root for $host"
@@ -6965,9 +7029,83 @@ act_sync_sources() {
             fi
         fi
 
+        if ! _act_is_windows_host "$host"; then
+            local sync_build_env sync_language sync_cache_root sync_env_pair sync_filtered_env=""
+            local sync_writable_paths sync_paths_key sync_paths_admitted=false
+            local sync_extra_paths='[]' sync_dependency_count sync_dependency_index
+            local sync_dependency_local sync_dependency_relative sync_source_parent
+            sync_source_parent=$(dirname "$remote_path") || return 4
+            if $strict_release || $stage_ordinary; then
+                sync_extra_paths=$(jq -nc --arg path "$sync_source_parent" \
+                    '[{role:"source_parent",path:$path}]') || return 4
+            fi
+            if $strict_release; then
+                sync_extra_paths=$(jq -nc --argjson extra "$sync_extra_paths" \
+                    --argjson dependencies "$strict_dependency_checkouts" --arg parent "$sync_source_parent" \
+                    '$extra + [$dependencies[] | {role:"source_dependency",path:($parent + "/" + .relative_path)}]') || return 4
+            elif [[ "$remote_path" != "$local_path" ]]; then
+                sync_dependency_count=$(yq -r '.sibling_crates // [] | length' "$config_file") || return 4
+                [[ "$sync_dependency_count" =~ ^[0-9]+$ ]] || return 4
+                for ((sync_dependency_index = 0; sync_dependency_index < sync_dependency_count; sync_dependency_index++)); do
+                    sync_dependency_local=$(yq -r ".sibling_crates[$sync_dependency_index].local_path" "$config_file") || return 4
+                    sync_dependency_local=$(_act_materialized_source_path "$tool_name" "$sync_dependency_local") || return 4
+                    sync_dependency_relative=$(yq -r ".sibling_crates[$sync_dependency_index].relative_path // \"\"" "$config_file") || return 4
+                    [[ -n "$sync_dependency_relative" ]] || sync_dependency_relative=$(basename "$sync_dependency_local") || return 4
+                    sync_extra_paths=$(jq -nc --argjson extra "$sync_extra_paths" \
+                        --arg path "$sync_source_parent/$sync_dependency_relative" \
+                        '$extra + [{role:"source_dependency",path:$path}]') || return 4
+                done
+            fi
+            sync_build_env=$(act_get_build_env "$tool_name" "$target") || return 4
+            sync_language=$(yq -r '.language // ""' "$config_file") || return 4
+            sync_cache_root=$(yq -r '.strict_cargo_cache_root // ""' "$config_file") || return 4
+            if [[ -n "$sync_cache_root" ]] &&
+               { ! $strict_release || [[ "$sync_language" != rust ||
+                    ! "$sync_cache_root" =~ ^/[A-Za-z0-9_./+-]+$ || "$sync_cache_root" == *..* ]]; }; then
+                _log_error "strict_cargo_cache_root requires strict Unix Rust and a canonical absolute private directory"
+                return 4
+            fi
+            while IFS= read -r sync_env_pair; do
+                [[ -n "$sync_env_pair" ]] || continue
+                if [[ "$sync_language" == rust ]]; then
+                    [[ "$sync_env_pair" != CARGO_HOME=* ]] || continue
+                    if $strict_release; then
+                        [[ "$sync_env_pair" != CARGO_TARGET_DIR=* ]] || continue
+                        [[ -z "$sync_cache_root" || "$sync_env_pair" != CARGO_BUILD_BUILD_DIR=* ]] || continue
+                    fi
+                fi
+                sync_filtered_env+="${sync_filtered_env:+$'\n'}$sync_env_pair"
+            done <<< "$sync_build_env"
+            sync_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$remote_path" \
+                "$sync_filtered_env" "$sync_language" "$sync_cache_root" "$sync_extra_paths" true) || return 4
+            sync_paths_key="$host:$capability:$sync_writable_paths"
+            for admitted in "${admitted_writable_paths[@]}"; do
+                [[ "$admitted" != "$sync_paths_key" ]] || sync_paths_admitted=true
+            done
+            if ! $sync_paths_admitted; then
+                writable_admission_plans+=("$(jq -nc --arg host "$host" --arg capability "$capability" \
+                    --argjson paths "$sync_writable_paths" '{host:$host,capability:$capability,paths:$paths}')")
+                admitted_writable_paths+=("$sync_paths_key")
+            fi
+        fi
+        $already_added && continue
         hosts_to_sync+=("$host")
         host_paths+=("$remote_path")
         configured_host_paths+=("$configured_remote_path")
+    done
+
+    # General host/capability admission for the entire plan completes first.
+    # Path-bound observations still precede the first context export or write.
+    local writable_plan writable_host writable_capability writable_paths
+    for writable_plan in "${writable_admission_plans[@]}"; do
+        writable_host=$(jq -r .host <<< "$writable_plan") || return 4
+        writable_capability=$(jq -r .capability <<< "$writable_plan") || return 4
+        writable_paths=$(jq -c .paths <<< "$writable_plan") || return 4
+        if ! _act_native_writable_paths_ready "$writable_host" "$writable_capability" "$writable_paths"; then
+            jq -nc --arg host "$writable_host" \
+                '{status:"error",exit_code:4,host:$host,error:"Native source writable paths are not ready"}'
+            return 4
+        fi
     done
 
     if [[ ${#hosts_to_sync[@]} -eq 0 ]]; then
@@ -9678,6 +9816,7 @@ act_run_native_build() {
     local strict_sources_verification=""
     local build_influence_env_json='{}'
     local cargo_isolation_json='null'
+    local native_writable_paths='[]' native_storage_error=""
     local nonstrict_stage_root="" nonstrict_source_root="" nonstrict_cargo_home=""
     local nonstrict_sibling_roots_json='[]'
     local nonstrict_sibling_relatives=()
@@ -9772,6 +9911,17 @@ act_run_native_build() {
         local cargo_attempt cargo_prepare=_act_prepare_unix_private_cargo_home
         cargo_attempt=$(_act_generate_uuid) || return 3
         _act_is_windows_host "$host" && cargo_prepare=_act_prepare_windows_private_cargo_home
+        if ! _act_is_windows_host "$host"; then
+            local prepared_cargo_home="${remote_path%/*}/.cargo-home-${platform//\//-}-${cargo_attempt//-/}"
+            native_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$remote_path" \
+                "$strict_build_env"$'\n'"CARGO_HOME=$prepared_cargo_home" "$language" \
+                "$strict_cache_root") || return 4
+            if ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
+                jq -nc --arg host "$host" \
+                    '{status:"error",exit_code:4,host:$host,error:"Native Cargo writable paths are not ready"}'
+                return 4
+            fi
+        fi
         if ! strict_cargo_seed_json=$("$cargo_prepare" \
                 "$host" "$remote_path" "${platform//\//-}-${cargo_attempt//-/}" \
                 "$build_cmd" "$strict_build_env") || \
@@ -10117,6 +10267,17 @@ act_run_native_build() {
     # Where in-tree outputs of this build land (collection reads from here).
     local artifact_source_root="${output_stage_source:-$remote_path}"
 
+    if ! _act_is_windows_host "$host"; then
+        local native_working_root="${nonstrict_source_root:-${output_stage_source:-$remote_path}}"
+        native_writable_paths=$(_act_native_writable_paths_json "$remote_path" "$native_working_root" \
+            "$build_env" "$language" "$strict_cache_root") || return 4
+        if ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
+            jq -nc --arg host "$host" \
+                '{status:"error",exit_code:4,host:$host,error:"Native build writable paths are not ready"}'
+            return 4
+        fi
+    fi
+
     # Prepare log file
     local log_dir log_file
     log_dir="$ACT_LOGS_DIR"
@@ -10136,7 +10297,7 @@ act_run_native_build() {
     local cargo_env_to_unset=()
     if [[ "$language" == "rust" ]]; then
         cargo_env_to_unset=(
-            CARGO_HOME CARGO_TARGET_DIR CARGO_BUILD_TARGET CARGO_BUILD_JOBS
+            CARGO_HOME CARGO_TARGET_DIR CARGO_BUILD_BUILD_DIR CARGO_BUILD_TARGET CARGO_BUILD_JOBS
             CARGO_INCREMENTAL CARGO_ENCODED_RUSTFLAGS
             RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
             RUSTDOC RUSTDOCFLAGS RUSTUP_HOME RUSTUP_TOOLCHAIN
@@ -10579,6 +10740,15 @@ EOF
         else
             build_transport_timeout=$((_ACT_BUILD_TIMEOUT + 10))
         fi
+    fi
+
+    # Cache/source preparation can consume the last available bytes. Observe
+    # the same selected volumes again immediately before starting the compiler.
+    if [[ $exit_code -eq 0 ]] && ! _act_is_windows_host "$host" &&
+       ! _act_native_writable_paths_ready "$host" "$capability" "$native_writable_paths"; then
+        exit_code=4
+        native_storage_error="Native writable paths are not ready after preparation; build command was not started"
+        _log_error "$native_storage_error"
     fi
 
     # Execute on remote host
@@ -11389,6 +11559,7 @@ EOF
         --argjson collected_size_bytes "$collected_size_bytes" \
         --arg collected_identity "$collected_identity" \
         --argjson build_influence_env "$build_influence_env_json" \
+        --arg storage_error "$native_storage_error" \
         --arg log_file "$log_file" \
         'input as $cargo_isolation | {
             tool: $tool,
@@ -11408,7 +11579,7 @@ EOF
             build_influence_env: $build_influence_env,
             cargo_isolation: $cargo_isolation,
             log_file: $log_file
-        }' <<< "$cargo_isolation_json" || return 4
+        } + (if $storage_error == "" then {} else {error:$storage_error} end)' <<< "$cargo_isolation_json" || return 4
 
     return "$exit_code"
 }
@@ -12989,7 +13160,16 @@ act_orchestrate_build() {
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
+                # A worker can finish its immutable sidecar before the
+                # coordinator records completion. Restore the coordinator's
+                # retained attempt metadata when recovering that result,
+                # without rewriting the original worker receipt.
+                final_results["$task_key"]=$(jq -c \
+                    --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
+                    --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
+                    '. + {resume_reused: true, log_path: $log_path,
+                          result_path: $result_path, attempt: $attempt}' \
+                    <<< "$persisted_result") || { interrupted=true; break; }
                 _log_info "Resume: reusing completed target $task_key"
                 continue
             fi
@@ -13005,16 +13185,7 @@ act_orchestrate_build() {
                _act_matrix_result_matches "$persisted_result" "$target" "$selected_triple" && \
                [[ "$(jq -r '.task_key // ""' <<< "$persisted_result")" == "$task_key" ]] && \
                _act_target_result_available "$persisted_result" "$build_purpose" "$strict_release_contract"; then
-                # A worker can finish its immutable sidecar before the
-                # coordinator records completion. Restore the coordinator's
-                # retained attempt metadata when recovering that result,
-                # without rewriting the original worker receipt.
-                final_results["$task_key"]=$(jq -c \
-                    --arg log_path "$(jq -r '.log_path // empty' <<< "$persisted_entry")" \
-                    --arg result_path "$persisted_result_path" --argjson attempt "$prior_attempts" \
-                    '. + {resume_reused: true, log_path: $log_path,
-                          result_path: $result_path, attempt: $attempt}' \
-                    <<< "$persisted_result") || { interrupted=true; break; }
+                final_results["$task_key"]=$(jq -c '. + {resume_reused: true}' <<< "$persisted_result")
                 if $state_available; then
                     local reconciled_extra
                     if ! reconciled_extra=$(jq -nc --argjson attempts "$prior_attempts" \

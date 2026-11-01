@@ -40,8 +40,8 @@ Without a `unix_storage` opt-in, the host now checks all of these roles in its
 own process environment: root, home, configured build root (or `/var/tmp`), Cargo
 home (`CARGO_HOME` or `$HOME/.cargo`), and temporary storage (`TMPDIR` or `/tmp`).
 An explicit `CARGO_TARGET_DIR` adds a required target role. The build root is the
-base used by the native runner for its private source, target and Cargo stages;
-this host-health observation does not inspect a particular uncreated build run.
+host's configured default for native staging. This general health observation
+is supplemented by the actual paths selected for each native operation below.
 
 Each role has its own path, resolved probe path, filesystem identifier, available
 and total byte counts, effective usage, free-byte floor, and verdict. Every role
@@ -59,20 +59,99 @@ than the misleading System-volume used-block percentage. On macOS with an
 existing `/System/Volumes/Data`, the root role probes that writable Data volume.
 The actual user home and temporary paths are also independently observed.
 
-Configured build roots and explicit environment locations must exist as
-directories. The default, unconfigured `$HOME/.cargo` may not exist yet: only
-that implicit role probes its nearest existing parent and reports both paths.
+For these default host roles, configured build roots and explicit environment
+locations must exist as directories. The default, unconfigured `$HOME/.cargo`
+may not exist yet: that implicit role probes its nearest existing parent and
+reports both paths.
 No directory is created by a probe. Relative paths, control characters, missing
 required directories, missing remote Python, malformed inventories, or failed
 filesystem reads produce an error, never an assumed healthy verdict. The simple
 no-yq host reader retains `build_root`; a full checkout uses its production YAML
 reader when available. Prior root-only cached admissions are invalidated.
 
+## Paths selected for a native operation
+
+A healthy default location does not admit a different source, output, cache or
+temporary directory selected by a release recipe. Native operations therefore
+pass an explicit writable-path inventory to host health in addition to the
+default roles. The inventory contains role/path pairs for the receiving host;
+the coordinator's filesystem does not stand in for the destination host.
+
+Source planning derives the actual destination before requesting admission.
+This includes the `DSR_STRICT_BUILD_ROOT` override, a configured host build root,
+fresh ordinary source staging, and the configured destination used by an
+in-place sync. Fresh snapshot parents and declared source-dependency destinations
+are included as well; an in-place sibling can reside on a different filesystem
+from the primary source. Sibling destinations use the same path and fallback
+basename rules as the transfer, including configured trailing slashes.
+The source plan also checks explicit absolute writable locations from each
+target's effective recipe. All required host, capability and path
+combinations must pass before source contexts are exported or any host receives
+source files. Two targets on one host can require different writable locations.
+
+Native execution resolves its final working directory and effective environment
+before preparing private Cargo state or build stages. This inventory includes
+the selected source and stage paths, private Cargo home and output destinations,
+`strict_cargo_cache_root`, and applicable recipe `TMPDIR` and
+`CARGO_BUILD_BUILD_DIR` locations. Ordinary Rust builds retain an absolute
+configured `CARGO_TARGET_DIR` as a base for an exclusive per-attempt directory.
+Strict Rust builds instead use their generated snapshot-relative Cargo paths;
+the overwritten configuration values do not describe those writes. Relative
+recipe locations are resolved against the final build working directory before
+native admission. Harmless `.` components in relative locations are normalized;
+parent traversal through `..` is refused. Duplicate environment assignments use
+the launcher's effective last assignment, including when a relative ordinary
+Cargo target setting is replaced by DSR's generated destination. Unresolved
+shell expansions are refused rather than probed as literal paths that the
+launcher would later interpret differently. Cargo's brace-based
+`CARGO_BUILD_BUILD_DIR` templates likewise require a resolved literal path;
+they cannot authorize a probe of the unexpanded template. Ordinary Rust clears
+an inherited `CARGO_BUILD_BUILD_DIR` before applying any admitted recipe value.
+
+The internal `host_health_check` and `host_health_is_ready` APIs accept
+`--writable-paths` with a bounded JSON array of objects containing exactly `role`
+and `path`. Paths must be absolute Unix paths without control characters or
+dot components. Exact duplicate role/path pairs are collapsed; distinct roles
+and destinations are preserved. The request is encoded as data for the remote
+Python probe. It is never evaluated as shell syntax.
+
+An explicit future output directory may not exist yet. Its probe walks to the
+nearest existing directory and retains both the selected `path` and observed
+`probe_path`. Existing directory symlinks retain their normal filesystem
+resolution. A dangling or looping link, a file where a directory is needed, an
+inaccessible ancestor, or an unreadable filesystem refuses admission. The probe
+does not create a directory to make its own check succeed. Existing source and
+output custody checks still decide whether a path is acceptable for staging.
+
+Requested rows carry `requested: true`; `requested_paths` records the exact
+normalized request. Admission requires matching coverage in the returned
+inventory. Each requested location must satisfy the normal **20 GiB** floor
+and usage thresholds, including when it shares the root's capacity group under
+an explicit split-storage contract. Shared filesystems and APFS containers are
+still grouped without adding their free space together.
+
+Explicit path requests always perform a fresh probe. Their normalized inventory
+also contributes to the admission fingerprint, so a cached default-host result
+or a result for another path cannot authorize the operation. A refusal occurs
+before native source transfer, cache preparation or compilation for that phase.
+The host-health cache and diagnostic output are independent of build staging;
+the probe does not reserve or modify destination storage.
+
+Resume continues to verify completed artifact receipts before deciding what
+needs execution. An unfinished native task must pass admission for its current
+effective paths before it can prepare or compile. Storage admission does not
+fabricate an execution receipt, repeat a completed target, or override the
+separate source, toolchain, retry and publication checks. Windows retains its
+existing storage contracts, and workflow execution through `act` is unchanged.
+
 ## Scope and remaining work
 
-Default locations are host-level observations, not per-project command-environment
-resolution. An explicit `unix_storage` contract retains its existing root and
-build-root checks and also requires the complete writable-role inspection
+Default health reports remain host-level observations; native operations add
+the effective paths described above. The inventory covers DSR's staging and
+supported recipe storage settings. It cannot predict arbitrary filesystem writes
+inside a custom build command or reserve space against other processes.
+An explicit `unix_storage` contract retains its existing root and build-root
+checks and also requires the complete writable-role inspection
 described below. Default and split-storage macOS probes now bind selected
 APFS volumes to their container identities and capacity/volume-quota observations
 as described below. A fresh native macOS acceptance run remains required under
@@ -100,6 +179,16 @@ Set `DSR_TEST_DISK_BASELINE` to the unchanged prior `host_health.sh` to compare 
 same supplied root counts and real build-root `df` in one invocation. The prior
 split checker admits the 2.32 GiB root; the new checker refuses it. No network,
 compiler, signing, or release upload is required. Tests retain their evidence.
+
+The writable-path cases exercise future-directory ancestor resolution, literal
+path transport, ordinary directory symlinks, rejected dangling links and file
+ancestors, requested-role floors, exact receipt coverage and stale-cache refusal.
+The APFS policy cases also cover requested locations sharing a container with
+ambient roles and the split-root allowance. Run
+`bash scripts/tests/test_act_runner_native.sh --host-writable-path-tests` for the
+native admission boundaries and effective recipe-path selection. Those tests
+identify their host/compiler boundaries explicitly; they do not establish native
+APFS or production release qualification.
 
 ## APFS shared containers and volume limits
 

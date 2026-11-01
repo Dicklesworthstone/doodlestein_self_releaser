@@ -605,6 +605,17 @@ authoritative manifest while any target remains unsuccessful.
 Both local and SSH rsync transfers use checksums to detect edited files whose
 sizes and timestamps match the older destination files.
 
+Native Unix admission checks the actual selected source, build, Cargo and recipe
+temporary paths in addition to the host's default storage roles. Source planning
+checks every required host/path combination before any source export or transfer;
+native execution checks its effective paths before cache preparation, staging or
+compilation. Planned directories are observed through their nearest existing
+parent without creating them. Explicit path requests require fresh observations
+and the normal 20 GiB floor, including on the root's split-storage capacity group.
+An old healthy host-cache result cannot admit a new release destination.
+See [Unix disk admission](UNIX_DISK_ADMISSION.md) for path resolution, receipt
+coverage, split-storage behavior and the limits of this capacity check.
+
 Run context and aggregate results retain the complete `source_sync` receipt.
 Resume syncs again, updates the ordinary host/path bindings, and records the
 new receipt in `source_sync_history`. It verifies completed artifact receipts

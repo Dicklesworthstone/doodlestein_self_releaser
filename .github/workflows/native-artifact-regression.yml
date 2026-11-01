@@ -10,6 +10,7 @@ on:
       - scripts/tests/test_act_runner.sh
       - scripts/tests/test_act_orchestration.sh
       - scripts/tests/test_act_runner_native.sh
+      - scripts/tests/test_disk_free_floor.sh
       - scripts/tests/test_artifact_formats.sh
       - scripts/tests/test_generated_installer_transactions.sh
       - scripts/tests/test_generated_workspace_installer.sh
@@ -22,6 +23,7 @@ on:
       - src/build_state.sh
       - src/config.sh
       - src/git_ops.sh
+      - src/host_health.sh
       - src/install_gen.sh
       - src/install_source.sh
       - src/packaging.sh
@@ -115,6 +117,15 @@ jobs:
           bash -n scripts/tests/test_act_runner_native.sh
           bash scripts/tests/test_artifact_formats.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/artifact-formats.log"
           bash scripts/tests/test_act_runner_native.sh --typed-companions-only 2>&1 | tee "$RUNNER_TEMP/collector-evidence/typed-companions.log"
+          test -z "$(git status --porcelain)"
+      - name: Validate actual native writable-path admission
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n src/host_health.sh
+          bash -n scripts/tests/test_disk_free_floor.sh
+          bash scripts/tests/test_disk_free_floor.sh 2>&1 | tee "$RUNNER_TEMP/collector-evidence/writable-storage.log"
+          bash scripts/tests/test_act_runner_native.sh --host-writable-path-tests 2>&1 | tee "$RUNNER_TEMP/collector-evidence/writable-path-boundaries.log"
           test -z "$(git status --porcelain)"
       - name: Validate concurrent generated installers
         shell: bash
