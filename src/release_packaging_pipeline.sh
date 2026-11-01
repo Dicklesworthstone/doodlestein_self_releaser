@@ -72,10 +72,16 @@ _rf_packaging_contract() {
             if $target=="windows/amd64" then "x86_64-pc-windows-msvc"
             elif $target=="windows/arm64" then "aarch64-pc-windows-msvc"
             else error("unsupported xwin packaging target") end;
-        ([$r.required_assets[].target]|unique|sort)==($p.required_targets|sort) and
+        ([$r.required_assets[]|select(.target!="additional")|.target]|unique|sort)==($p.required_targets|sort) and
+        all(($r.required_assets+$r.inputs)[]|select(.target=="additional"); has("target_triple")|not) and
+        # Xwin output is exactly its selected executables, even when the plan
+        # omits required_assets. Build-set rows have no driver and are admitted
+        # separately from their pinned manifests, so do not infer their origin.
+        (if all($p.builds[]; .driver?=="xwin") and any($r.inputs[]; .target=="additional")
+         then error("shared packaging inputs need a DSR or imported producer") else true end) and
         (if $p|has("required_variants") then
-            all($r.required_assets[]; has("target_triple")) and
-            ([$r.required_assets[]|{target,target_triple}]|unique|sort_by(.target,.target_triple))==
+            all($r.required_assets[]|select(.target!="additional"); has("target_triple")) and
+            ([$r.required_assets[]|select(.target!="additional")|{target,target_triple}]|unique|sort_by(.target,.target_triple))==
                 ($p.required_variants|sort_by(.target,.target_triple))
          else true end) and
         (if $p|has("required_assets") then

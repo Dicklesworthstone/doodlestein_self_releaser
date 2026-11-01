@@ -55,6 +55,44 @@ JSON keys, explicit null lists, missing input assets and unconsumed producer
 assets are errors. A source may participate in several independent outputs.
 The recipe is an exact inventory, not an instruction to glob a directory.
 
+## Shared release payloads
+
+Recipes can consume explicitly declared shared producer assets with
+`target: "additional"`. For example, preserve a release notice unchanged:
+
+```json
+{
+  "name": "NOTICE",
+  "source": "NOTICE",
+  "target": "additional",
+  "archive_format": "none"
+}
+```
+
+Raw shared files retain their selected names and exact bytes. A shared archive
+may instead select `members`, or use `source` to preserve or convert an admitted
+shared archive through the normal extraction and parity checks. All its producer
+inputs must also belong to `additional`; packaging cannot relabel a physical
+executable as shared data or assign a shared file to a physical platform.
+Aliases are created only when explicitly listed in the recipe.
+
+Shared assets must omit `target_triple`, including explicit null. They never
+stand in for a physical target or compiler variant. All physical outputs must
+still cover the original platform and variant matrix, while the derived manifest
+preserves the actual build environments and successful-task count. Every producer
+asset, including each selected shared file, must be consumed. The public
+build-plan finalizer checks that complete input selection before starting work
+and checks the actual bytes and resulting manifest before downstream finalization.
+An execution plan containing only xwin jobs cannot supply shared recipe inputs,
+even when the plan omits the optional `required_assets` selection. Such a recipe
+is rejected before compilation. Mixed DSR/import plans and completed build sets
+remain subject to their actual pinned producer manifests and exact ownership.
+
+These files remain payloads in the exact release inventory. This feature does
+not reclassify arbitrary metadata or weaken checksum, signature, provenance or
+publication checks. Retained shared files and archives undergo the same
+completed-output verification on retry as physical-platform outputs.
+
 ## Describe and execute
 
 ```bash
@@ -129,6 +167,16 @@ a tiny C fixture when `cc` is available (otherwise it uses a shell executable).
 It tests all output formats, prebuilt preservation, independent repacking,
 producer disappearance, drift, malicious archive entries and compressor failure.
 No live GitHub, signing or Rust/Windows build acceptance is claimed.
+
+`bash scripts/tests/test_release_packaging_variants.sh` also exercises exact
+plans with shared raw files and archives alongside GNU, musl and Windows compiler
+identities. It uses the real coordinator, pinned imports, collection, archive
+construction, manifest/SLSA admission and public finalizer CLI. The imported
+producer evidence and the final network/signing engine are fixtures; this test
+does not claim actual compilation or authenticated build provenance. Its shared
+payload group can run alone with `DSR_PACKAGING_SHARED_ONLY=1`. Controls cover
+invalid physical/triple selections, missing and unselected payloads, duplicate
+owners, unchanged offline retries, and refusal of changed completed outputs.
 
 ## Reproducible new archives
 

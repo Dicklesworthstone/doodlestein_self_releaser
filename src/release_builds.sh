@@ -157,13 +157,17 @@ def asset_contract(value, matrix):
     require(isinstance(value, list) and 1 <= len(value) <= 256, "expected 1..256 required assets", 4)
     for asset in value:
         require(isinstance(asset, dict) and set(asset) - {"target_triple"} == {"name", "target", "archive_format"} and
-                name(asset["name"]) and len(asset["name"]) <= 128 and asset["target"] in matrix and
+                name(asset["name"]) and len(asset["name"]) <= 128 and
+                (asset["target"] in matrix or asset["target"] == "additional") and
                 asset["archive_format"] in ("tar.gz", "tar.xz", "zip", "binary", "none"), "invalid required asset", 4)
-        if "target_triple" in asset:
+        if asset["target"] == "additional":
+            require("target_triple" not in asset, "shared required assets cannot select a compiler target", 4)
+        elif "target_triple" in asset:
             require(name(asset["target_triple"]) and len(asset["target_triple"]) <= 128,
                     "invalid required asset compiler target", 4)
     require(len({a["name"].casefold() for a in value}) == len(value) and
-            sorted({a["target"] for a in value}) == matrix, "required assets must uniquely cover every target", 4)
+            sorted({a["target"] for a in value if a["target"] != "additional"}) == matrix,
+            "required assets must uniquely cover every target", 4)
     return sorted(value, key=lambda a: a["name"])
 
 XWIN_TARGETS = {"windows/amd64": "x86_64-pc-windows-msvc", "windows/arm64": "aarch64-pc-windows-msvc"}
@@ -283,6 +287,11 @@ def validate(value):
                 "jobs must partition the entire required compiler matrix", 4)
     else:
         require(sorted(matrix) == value["required_targets"], "jobs must partition the entire required target matrix", 4)
+    # Xwin's exact executable inventory cannot supply a shared data payload.
+    # Refuse an impossible selection before starting any compiler work.
+    if any(a["target"] == "additional" for a in value.get("required_assets", [])):
+        require(any(j["driver"] in ("dsr", "import") for j in value["builds"]),
+                "shared required assets need a DSR or imported producer", 4)
     value["builds"].sort(key=lambda j: j["id"])
     return value
 

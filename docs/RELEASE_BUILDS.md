@@ -163,6 +163,38 @@ An import job has exactly `id`, `driver: "import"`, `targets`, `manifest`,
 `manifest_sha256`, and `artifacts_dir`. It can be combined with either build
 driver. It never runs a compiler, and its output hash must be selected in advance.
 
+## Shared release payloads
+
+An exact `required_assets` selection may also include shared files already
+declared by a producer manifest:
+
+```json
+{"name":"NOTICE","target":"additional","archive_format":"none"}
+```
+
+`additional` is an asset owner, not a physical platform. It is valid only on
+asset records, never in `required_targets`, a job's `targets`, or
+`required_variants`. A shared asset must omit `target_triple`; even an explicit
+null is rejected. Shared files do not satisfy physical platform coverage, add
+compiler variants, schedule workers, or increase the successful-build count.
+
+The selected producer manifest pins each shared file's owner, hash and size.
+Exactly one admitted producer must supply every selected shared name. The
+collector refuses missing or unselected assets and duplicate owners, including
+two producers supplying identical bytes. A shared name cannot silently disappear
+from the publishable aggregate. Existing byte, source, namespace and completed
+retry checks apply to these files too.
+
+Xwin jobs advertise an exact executable inventory and cannot supply arbitrary
+shared payloads. A plan with only xwin jobs and a shared-asset requirement is
+rejected before compilation; combine xwin with a DSR or pinned import producer
+that actually owns those files. Merely selecting an eligible producer does not
+prove ownership: collection still requires its successful manifest and bytes.
+
+Completed imports retain their shared files for offline retries. To preserve
+raw names or explicitly package shared files into archives, use the
+[shared-payload recipe contract](RELEASE_PACKAGING.md#shared-release-payloads).
+
 ## Recovery and publication
 
 Each invocation reads the same canonical plan. Job and target ordering does not

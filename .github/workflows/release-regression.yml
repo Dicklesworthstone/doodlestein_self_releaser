@@ -7,6 +7,13 @@ on:
       - src/github.sh
       - src/dispatch.sh
       - src/release_finalize_core.sh
+      - src/release_finalize.sh
+      - src/release_builds.sh
+      - src/release_bundle.sh
+      - src/release_packaging.sh
+      - src/release_packaging_pipeline.sh
+      - src/platforms.sh
+      - src/slsa.sh
       - src/cargo_cache.sh
       - src/cargo_sources.sh
       - src/packaging.sh
@@ -25,6 +32,9 @@ on:
       - scripts/tests/test_host_health.sh
       - scripts/tests/test_host_config_admission.sh
       - scripts/tests/test_release_resume.sh
+      - scripts/tests/test_release_build_plan_variants.sh
+      - scripts/tests/test_release_packaging.sh
+      - scripts/tests/test_release_packaging_variants.sh
       - scripts/tests/test_release_source_only.sh
       - scripts/tests/test_release_source_only_exact_tag.sh
       - scripts/tests/test_dispatch_delivery.sh
@@ -38,6 +48,44 @@ concurrency:
   group: release-regression-refs/heads/main
   cancel-in-progress: false
 jobs:
+  build-packaging-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install local packaging regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3 shellcheck gcc tar zip unzip xz-utils util-linux
+          mkdir -p "$RUNNER_TEMP/packaging-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/packaging-evidence/head.txt"
+      - name: Validate exact build plans and shared-asset packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(src/release_builds.sh src/release_packaging.sh src/release_packaging_pipeline.sh
+                 scripts/tests/test_release_build_plan_variants.sh scripts/tests/test_release_packaging.sh
+                 scripts/tests/test_release_packaging_variants.sh)
+          for source in "${files[@]}"; do
+            bash -n "$source"
+            shellcheck -S warning "$source"
+          done
+          bash scripts/tests/test_release_build_plan_variants.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/build-plan-variants.log"
+          bash scripts/tests/test_release_packaging.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging.log"
+          bash scripts/tests/test_release_packaging_variants.sh 2>&1 | tee "$RUNNER_TEMP/packaging-evidence/packaging-variants.log"
+          test -z "$(git status --porcelain)"
+      - name: Retain packaging validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: build-packaging-contract-evidence
+          path: ${{ runner.temp }}/packaging-evidence
+          retention-days: 7
+          if-no-files-found: error
   release-regression:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15

@@ -110,10 +110,13 @@ def recipe(value):
         base = {"name", "target", "archive_format"}
         need(base <= set(item) <= base | {"source", "members", "aliases", "source_files", "target_triple"} and
              ("source" in item) != ("members" in item), "select source or members, not both", 4)
-        need(name(item["name"]) and match(item["target"], PLATFORM_PATTERN) and
+        need(name(item["name"]) and
+             (item["target"] == "additional" or match(item["target"], PLATFORM_PATTERN)) and
              isinstance(item["archive_format"], str) and item["archive_format"] in ARCHIVES | RAW,
              "invalid packaging name, target or format", 4)
-        if "target_triple" in item:
+        if item["target"] == "additional":
+            need("target_triple" not in item, "shared packaging assets cannot select a compiler target", 4)
+        elif "target_triple" in item:
             need(name(item["target_triple"]), "invalid packaging compiler target", 4)
         item.setdefault("aliases", [])
         need(isinstance(item["aliases"], list) and all(name(n) for n in item["aliases"]), "invalid aliases", 4)
@@ -228,7 +231,8 @@ def source_contract(value):
         # A recipe is a selection, never evidence of compilation. Check its
         # declared compiler against every original input before copying or
         # compressing anything. Do not erase a multi-variant source matrix.
-        required = "required_variants" in value or len(variant_platforms[item["target"]]) > 1
+        required = item["target"] != "additional" and (
+            "required_variants" in value or len(variant_platforms[item["target"]]) > 1)
         need(not required or "target_triple" in item,
              "variant packaging requires an explicit target_triple for every output", 4)
         if "target_triple" in item:
