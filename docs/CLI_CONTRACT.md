@@ -592,6 +592,14 @@ stops before launch, so resume uses a fresh number and preserves old receipts.
 Receipt paths are reported only when the corresponding refusal receipt was
 written. A recovered successful worker receipt regains its saved attempt and
 log/result paths without changing the original receipt or rebuilding its output.
+If the coordinator cannot persist a finished worker's outcome, dispatch stops
+and active peers are cancelled and reaped. The run reports exit code 4 and
+`details.error`, preserving the actual target outcome and attempt rather than
+classifying the worker as unstarted. `execution_started: true` means the worker
+was launched; it does not assert that a compiler ran. Existing immutable worker
+receipts remain available for exact-run resume, and a failed coordinator receipt
+write does not create a reported `result_path`. A retained nonempty malformed
+receipt still causes resume to refuse; it is not overwritten or accepted.
 The aggregate failed count includes all unsuccessful requested tasks, including
 skipped tasks. An interrupted run remains resumable and cannot publish an
 authoritative manifest.

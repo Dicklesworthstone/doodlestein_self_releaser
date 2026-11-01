@@ -13523,21 +13523,36 @@ act_orchestrate_build() {
             finished_result=$(jq -c '.status = "failed" | .exit_code = 4 |
                 .error = "Completed native result has inconsistent variant identity"' <<< "$finished_result") || return 4
         fi
-        finished_result=$(jq -c --arg log_path "$log_path" --arg result_path "$result_path" \
+        finished_result=$(jq -c --arg log_path "$log_path" \
             --argjson attempt "$attempt" \
             --arg purpose "$build_purpose" --arg task_key "$finished_target" \
-            '. + {log_path: $log_path, result_path: $result_path, attempt: $attempt,
-                  build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key}' \
-            <<< "$finished_result")
-        if [[ ! -e "$result_path" && ! -L "$result_path" ]]; then
+            '. + {log_path: $log_path, attempt: $attempt, execution_started:true,
+                  build_purpose: $purpose, publishable: ($purpose == "release"), task_key:$task_key} |
+             del(.result_path)' <<< "$finished_result") || return 4
+        # The coordinator waited for this registered worker. Retain that fact
+        # before any receipt or state write can fail; storage failure must not
+        # turn a genuine attempt into an undispatched target at aggregation.
+        final_results["$finished_target"]="$finished_result"
+        if [[ -f "$result_path" && ! -L "$result_path" ]]; then
+            finished_result=$(jq -c --arg result_path "$result_path" \
+                '. + {result_path:$result_path}' <<< "$finished_result") || return 4
+        elif [[ ! -e "$result_path" && ! -L "$result_path" ]]; then
             # Even a worker killed before installing its traps has a durable
             # outcome. Identify coordinator recovery rather than pretending
             # the child wrote a receipt; never replace existing evidence.
             finished_result=$(jq -c '. + {receipt_source: "coordinator"}' <<< "$finished_result") || return 4
-            if ! (umask 077; set -o noclobber; printf '%s\n' "$finished_result" > "$result_path"); then
+            final_results["$finished_target"]="$finished_result"
+            local retained_result
+            retained_result=$(jq -c --arg result_path "$result_path" \
+                '. + {result_path:$result_path}' <<< "$finished_result") || return 4
+            if ! (umask 077; set -o noclobber; printf '%s\n' "$retained_result" > "$result_path"); then
                 _log_error "Could not retain missing worker outcome for $finished_target"
                 return 4
             fi
+            finished_result="$retained_result"
+        else
+            _log_error "Worker result receipt path is not a regular file: $result_path"
+            return 4
         fi
         final_results["$finished_target"]="$finished_result"
         status=$(jq -r '.status // "unknown"' <<< "$finished_result")
@@ -13643,7 +13658,16 @@ act_orchestrate_build() {
                     wait "$reap_pid" || worker_status=$?
                     worker_reaped["$reap_index"]=1
                     active_workers=$((active_workers - 1))
-                    _act_record_worker_result "$reap_index" "$worker_status" || interrupted=true
+                    if ! _act_record_worker_result "$reap_index" "$worker_status"; then
+                        # Completion persistence is a coordinator failure,
+                        # not an operator interruption. Keep the first cause
+                        # while cancelling and draining all remaining peers.
+                        if [[ -z "$coordinator_error" ]]; then
+                            coordinator_error="Could not retain completed target outcome for ${worker_targets[$reap_index]}"
+                        fi
+                        _log_error "$coordinator_error"
+                        _act_cancel_parallel_workers
+                    fi
                     return 0
                 fi
             done
@@ -14073,6 +14097,7 @@ act_orchestrate_build() {
         --arg git_ref "$git_ref" \
         --argjson source_dependencies "$source_dependencies_json" \
         --arg status "$overall_status" \
+        --arg error "$coordinator_error" \
         --argjson exit_code "$overall_exit_code" \
         --argjson duration "$total_duration" \
         --argjson total "$((success_count + fail_count))" \
@@ -14100,7 +14125,7 @@ act_orchestrate_build() {
                 success: $success,
                 failed: $failed
             }
-        }') || return 4
+        } + (if $error == "" then {} else {error:$error} end)') || return 4
     _act_bind_orchestration_targets "$summary_json" "$results_json" || return 4
 
     return "$overall_exit_code"

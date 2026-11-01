@@ -44,6 +44,11 @@
     "source_sync": {
       "type": ["object", "null"],
       "description": "Complete ordinary source synchronization receipt, including host/path bindings and failed transfers; null when synchronization was bypassed or the build used strict snapshots"
+    },
+    "error": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Coordinator failure that prevents completion, even when an individual worker succeeded"
     }
   },
   "$defs": {
@@ -131,7 +136,18 @@
         },
         "execution_started": {
           "type": "boolean",
-          "description": "False on a coordinator dispatch refusal; a reserved attempt number does not establish that its worker ran"
+          "description": "True when the coordinator observed a launched worker; false on a dispatch refusal. This does not establish compiler execution: native host readiness may still refuse the attempt"
+        },
+        "worker_exit_code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Actual worker process exit observed by the coordinator when recovering a missing or invalid worker receipt"
+        },
+        "receipt_source": {
+          "type": "string",
+          "enum": ["coordinator"],
+          "description": "Identifies a result synthesized by the coordinator without claiming the worker wrote a receipt"
         },
         "source_sync": {
           "type": "object",

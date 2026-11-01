@@ -4895,6 +4895,8 @@ EOF
             + (if (.result_path | type) == "string" then {result_path} else {} end)
             + (if (.attempt | type) == "number" then {attempt} else {} end)
             + (if (.exit_code | type) == "number" then {exit_code} else {} end)
+            + (if (.worker_exit_code | type) == "number" then {worker_exit_code} else {} end)
+            + (if (.receipt_source | type) == "string" then {receipt_source} else {} end)
             + (if (.error | type) == "string" then {error} else {} end)
             + (if (.duration_ms | type) == "number" then {duration_ms: (.duration_ms | floor)} else {} end)]' \
             <<< "$result" 2>/dev/null) || target_results_json='[]'
@@ -4903,6 +4905,7 @@ EOF
             --arg build_purpose "$build_purpose" --arg targets "$target_list" \
             --argjson results "$target_results_json" --arg run_id "$result_run_id" \
             --argjson source_sync "$(jq -c '.source_sync // null' <<< "$result")" \
+            --argjson coordinator_error "$(jq -c '.error // null' <<< "$result")" \
             --argjson total "$total" --argjson success "$success" --argjson failed "$failed" \
             --argjson duration "$duration" --arg output_dir "$output_dir" \
             --arg manifest "$authoritative_manifest" '
@@ -4915,7 +4918,9 @@ EOF
                  else {platform: $platform, host: "", method: "native", status: "skipped"} end],
              total: $total, success: $success, failed: $failed,
              duration_seconds: $duration, total_build_time_ms: ($duration * 1000),
-             output_dir: $output_dir, manifest_path: $manifest}') || return 4
+             output_dir: $output_dir, manifest_path: $manifest}
+            + (if ($coordinator_error | type) == "string" and $coordinator_error != ""
+               then {error: $coordinator_error} else {} end)') || return 4
         json_envelope "build" "$final_status" "$final_exit" "$build_details"
     else
         echo ""
