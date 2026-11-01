@@ -295,6 +295,38 @@ test_remote_connectivity_handles_bsd_date_literal_nanoseconds() {
     fi
 }
 
+test_remote_health_preserves_caller_stdin() {
+    local mode
+    for mode in command connectivity; do
+        ((TESTS_RUN+=1))
+        if printf 'caller-input-must-survive\n' | (
+            # Model SSH consuming its input unless explicitly detached. Neither
+            # health command requires input from its caller's command stream.
+            ssh() {
+                local detached=false argument
+                for argument in "$@"; do
+                    [[ "$argument" != -n ]] || detached=true
+                done
+                if ! "$detached"; then cat >/dev/null; fi
+                printf 'ok\n'
+            }
+            _hh_run_with_timeout() { shift; "$@"; }
+            if [[ "$mode" == command ]]; then
+                _hh_exec_on_host test ssh fixture 'echo ok' >/dev/null || exit 1
+            else
+                _hh_check_connectivity test ssh fixture >/dev/null || exit 1
+            fi
+            value=''
+            IFS= read -r value || exit 1
+            [[ "$value" == caller-input-must-survive ]]
+        ); then
+            pass "Remote health $mode preserves caller stdin"
+        else
+            fail "Remote health $mode consumed caller stdin"
+        fi
+    done
+}
+
 test_local_disk_space() {
     ((TESTS_RUN+=1))
 
@@ -1535,6 +1567,7 @@ test_local_toolchains_check
 test_local_clock_drift
 
 # Full health check tests
+test_remote_health_preserves_caller_stdin
 test_health_check_local_host
 test_health_check_returns_healthy_for_local
 test_health_check_has_all_checks

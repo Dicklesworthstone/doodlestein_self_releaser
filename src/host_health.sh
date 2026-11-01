@@ -554,7 +554,7 @@ _hh_exec_on_host() {
     if [[ "$connection" == "local" ]]; then
         _hh_run_with_timeout "$_HH_CMD_TIMEOUT" bash -c "$cmd" 2>/dev/null
     else
-        _hh_run_with_timeout "$_HH_CMD_TIMEOUT" ssh \
+        _hh_run_with_timeout "$_HH_CMD_TIMEOUT" ssh -n \
             -o ConnectTimeout="$_HH_SSH_TIMEOUT" \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new \
@@ -578,7 +578,7 @@ _hh_check_connectivity() {
     local start_ms end_ms latency_ms
     start_ms=$(_get_ms_timestamp)
 
-    if _hh_run_with_timeout "$_HH_SSH_TIMEOUT" ssh \
+    if _hh_run_with_timeout "$_HH_SSH_TIMEOUT" ssh -n \
         -o ConnectTimeout="$_HH_SSH_TIMEOUT" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \

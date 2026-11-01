@@ -250,22 +250,41 @@ _get_ms_timestamp() {
     date_sec) echo "$(($(date +%s) * 1000))" ;;
   esac
 }
+# Elapsed time must not use the epoch clock: NTP/manual corrections can move it
+# backwards. Keep _get_ms_timestamp for callers that need epoch timestamps.
+_get_monotonic_ms() {
+  if command -v python3 &>/dev/null; then
+    python3 -c 'import time; print(time.monotonic_ns() // 1000000)'
+  elif command -v perl &>/dev/null; then
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \
+      'printf "%.0f\n", clock_gettime(CLOCK_MONOTONIC) * 1000'
+  elif [[ -r /proc/uptime ]]; then
+    awk '{printf "%.0f\n", $1 * 1000}' /proc/uptime
+  else
+    printf '%s\n' 'No monotonic clock provider available' >&2
+    return 1
+  fi
+}
+
 
 # Log with duration tracking
 # Executes command and logs completion with duration and exit code
 # Usage: log_timed command arg1 arg2 ...
 log_timed() {
   local start_ms
-  start_ms=$(_get_ms_timestamp)
+  start_ms=$(_get_monotonic_ms) || start_ms=""
 
   # Run the command
   local exit_code=0
   "$@" || exit_code=$?
 
   local end_ms
-  end_ms=$(_get_ms_timestamp)
+  end_ms=$(_get_monotonic_ms) || end_ms=""
 
-  local duration_ms=$((end_ms - start_ms))
+  local duration_ms=null
+  if [[ "$start_ms" =~ ^[0-9]+$ && "$end_ms" =~ ^[0-9]+$ ]] && ((end_ms >= start_ms)); then
+    duration_ms=$((end_ms - start_ms))
+  fi
 
   if [[ $exit_code -eq 0 ]]; then
     log_info "Completed: $1" "\"duration_ms\":$duration_ms,\"exit_code\":$exit_code"
@@ -324,6 +343,6 @@ log_get_run_id() {
 export -f log_init log_error log_warn log_info log_debug log_ok log_timed
 export -f log_set_level_from_flags log_set_command log_set_tool log_set_host
 export -f log_clear_context log_get_file log_get_run_id log_session_finished
-export -f _log _should_log _json_escape _json_escape_var _get_ms_timestamp
+export -f _log _should_log _json_escape _json_escape_var _get_ms_timestamp _get_monotonic_ms
 export DSR_RUN_ID LOG_LEVEL LOG_FILE _DSR_MS_TIMESTAMP_METHOD
 export DSR_CURRENT_CMD DSR_CURRENT_TOOL DSR_CURRENT_HOST

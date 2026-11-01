@@ -333,6 +333,31 @@ test_run_single_check_duration() {
     teardown_test_env
 }
 
+test_run_single_check_backward_epoch() {
+    ((TESTS_RUN++))
+    setup_test_env
+    if (
+        _get_ms_timestamp() {
+            if [[ -f "$TEST_TMPDIR/epoch-called" ]]; then
+                printf '9000\n'
+            else
+                touch "$TEST_TMPDIR/epoch-called"
+                printf '10000\n'
+            fi
+        }
+        result=$(run_single_check "sleep 0.1; exit 7" "" "false" 2>/dev/null)
+        jq -e '.passed == false and .exit_code == 7 and
+            (.duration_ms | type == "number") and .duration_ms >= 80' \
+            <<< "$result" >/dev/null
+    ); then
+        pass "quality check survives backward epoch and preserves failure"
+    else
+        fail "quality check backward epoch or command exit regression"
+    fi
+    teardown_test_env
+}
+
+
 test_run_single_check_dry_run() {
     ((TESTS_RUN++))
     setup_test_env
@@ -1258,6 +1283,7 @@ main() {
     test_run_single_check_failure
     test_run_single_check_output_captured
     test_run_single_check_duration
+    test_run_single_check_backward_epoch
     test_run_single_check_dry_run
     test_run_single_check_work_dir
     test_run_single_check_json_structure
