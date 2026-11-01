@@ -665,6 +665,44 @@ _watch_run_json() {
             head_branch:"v1.2.3",head_sha:$sha}]}}'
 }
 
+# Use a real commit and the production checkpoint writer. Only the watcher
+# child CLI boundary is controlled: these tests qualify checkpoint selection,
+# not compilation or release publication.
+_watch_checkpoint_source_sha() {
+    git init -q -b main "$TEST_TMPDIR/checkpoint-source" || return 1
+    printf 'watch checkpoint source\n' > "$TEST_TMPDIR/checkpoint-source/source.txt"
+    git -C "$TEST_TMPDIR/checkpoint-source" add source.txt || return 1
+    git -C "$TEST_TMPDIR/checkpoint-source" -c user.name='DSR test' \
+        -c user.email='dsr-test@example.invalid' commit -qm fixture || return 1
+    git -C "$TEST_TMPDIR/checkpoint-source" rev-parse HEAD
+}
+
+_watch_seed_mixed_checkpoint() (
+    local run_id="$1" output_dir="$2" sha="$3" run_status="${4:-partial}"
+    local extra receipt artifact
+    source "${DSR_ROUTING_TEST_ROOT:-$DSR_PROJECT_ROOT}/src/build_state.sh"
+    log_info() { :; }
+    log_debug() { :; }
+    build_state_init || return 1
+    DSR_RUN_ID="$run_id" build_state_create ntm v1.2.3 linux/amd64,darwin/arm64 >/dev/null || return 1
+    build_state_set_context ntm v1.2.3 "$run_id" "$sha" v1.2.3 '{}' "$output_dir" 1 \
+        '{"linux/amd64":"trj","darwin/arm64":"mmini"}' || return 1
+    mkdir -p "$output_dir" || return 1
+    artifact="$output_dir/ntm-linux-amd64"
+    [[ -f "$artifact" ]] || printf 'completed target payload\n' > "$artifact"
+    receipt=$(jq -nc --arg path "$artifact" --arg sha "$(_build_state_sha256 "$artifact")" \
+        --argjson size "$(wc -c < "$artifact")" \
+        '[{path:$path,sha256:$sha,size_bytes:$size}]') || return 1
+    extra=$(jq -nc --arg path "$artifact" --argjson receipts "$receipt" \
+        '{attempts:1,result:{platform:"linux/amd64",host:"trj",status:"success",exit_code:0,
+          artifact_path:$path,resume_artifacts:$receipts}}') || return 1
+    build_state_update_target ntm v1.2.3 linux/amd64 completed "$extra" "$run_id" || return 1
+    build_state_update_target ntm v1.2.3 darwin/arm64 failed \
+        '{"attempts":1,"result":{"platform":"darwin/arm64","host":"mmini","status":"failed","exit_code":6}}' \
+        "$run_id" || return 1
+    build_state_update_status ntm v1.2.3 "$run_status" "$run_id"
+)
+
 @test "nullable routing: check reaches an unregistered owner/repo without inventing a tool" {
     harness_create_config
     _mock_gh_runs '{"workflow_runs": []}'
@@ -876,6 +914,78 @@ EOF
     _watch_completed
     jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") | index($resume) != null' "$TEST_TMPDIR/fallback.args"
     jq -e --arg run "$checkpoint" '.attempts["12345"] | .attempt == 2 and .resume_run_id == $run' "$DSR_STATE_DIR/triggered.json"
+}
+
+@test "watch partial recovery resumes a mixed-success checkpoint instead of unrelated latest" {
+    harness_create_config
+    local sha check_json checkpoint=12345678-1234-1234-1234-123456789abc
+    local unrelated=12345678-1234-1234-1234-123456789abd checkpoint_file before payload
+    sha=$(_watch_checkpoint_source_sha)
+    check_json=$(_watch_run_json "$sha")
+    DSR_WATCH_FIXTURE_STATUS=1 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    _watch_seed_mixed_checkpoint "$checkpoint" "$DSR_STATE_DIR/watch-artifacts/12345" "$sha"
+    _watch_seed_mixed_checkpoint "$unrelated" "$TEST_TMPDIR/unrelated-output" "$sha"
+    assert_equal "$unrelated" "$(readlink "$DSR_STATE_DIR/builds/ntm/v1.2.3/latest")"
+    checkpoint_file="$DSR_STATE_DIR/builds/ntm/v1.2.3/$checkpoint/state.json"
+    before=$(cat "$checkpoint_file")
+    payload=$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm-linux-amd64")
+    jq -e '.status == "partial" and
+        .target_statuses["linux/amd64"].status == "completed" and
+        .target_statuses["darwin/arm64"].status == "failed"' "$checkpoint_file"
+    sleep 1
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    jq -Rse --arg resume "--resume=$checkpoint" 'split("\u0000") | index($resume) != null' "$TEST_TMPDIR/fallback.args"
+    jq -e --arg run "$checkpoint" '.attempts["12345"] |
+        .attempt == 2 and .resume_run_id == $run and .status != "blocked"' "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 2 ]]
+    assert_equal "$before" "$(cat "$checkpoint_file")"
+    assert_equal "$payload" "$(cat "$DSR_STATE_DIR/watch-artifacts/12345/ntm-linux-amd64")"
+    assert_equal "$sha" "$(git -C "$TEST_TMPDIR/checkpoint-source" rev-parse HEAD)"
+}
+
+_watch_partial_refusal_case() {
+    local mode="$1" sha="$2" checkpoint=12345678-1234-1234-1234-123456789abc
+    local duplicate=12345678-1234-1234-1234-123456789abd check_json output_dir saved_sha run_status=partial
+    local -x TEST_TMPDIR="$TEST_TMPDIR/$mode"
+    local -x DSR_STATE_DIR="$TEST_TMPDIR/state"
+    mkdir -p "$DSR_STATE_DIR"
+    check_json=$(_watch_run_json "$sha")
+    DSR_WATCH_FIXTURE_STATUS=1 run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    _watch_completed
+    output_dir="$DSR_STATE_DIR/watch-artifacts/12345"
+    saved_sha="$sha"
+    case "$mode" in
+        cancelled) run_status=cancelled ;;
+        wrong-source) saved_sha=2222222222222222222222222222222222222222 ;;
+        unrelated-output)
+            mkdir -p "$output_dir"
+            output_dir="$TEST_TMPDIR/unrelated-output"
+            ;;
+    esac
+    _watch_seed_mixed_checkpoint "$checkpoint" "$output_dir" "$saved_sha" "$run_status"
+    if [[ "$mode" == ambiguous ]]; then
+        _watch_seed_mixed_checkpoint "$duplicate" "$output_dir" "$sha"
+    fi
+    sleep 1
+    run _routing_watch "$check_json" --auto-fallback --retry-delay 1
+    assert_equal "0" "$status"
+    jq -e '.attempts["12345"] | .status == "blocked" and .attempt == 1 and .next_retry_at == null' \
+        "$DSR_STATE_DIR/triggered.json"
+    [[ "$(wc -l < "$TEST_TMPDIR/fallback.starts")" -eq 1 ]]
+}
+
+@test "watch partial recovery rejects cancelled mismatched and ambiguous checkpoints" {
+    harness_create_config
+    local sha mode
+    sha=$(_watch_checkpoint_source_sha)
+    for mode in cancelled wrong-source unrelated-output ambiguous; do
+        _watch_partial_refusal_case "$mode" "$sha"
+    done
 }
 
 @test "watch recovery blocks an artifact directory with no matching source checkpoint" {

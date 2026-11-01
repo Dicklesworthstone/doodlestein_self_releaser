@@ -4,6 +4,13 @@
 # controllable boundaries; this suite does not execute external releases.
 set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# Completed-checkpoint admission uses the task planner and its configuration
+# dependencies. Load the same modules as the CLI; extracting the planner alone
+# would omit workflow-payload admission and turn valid resumes into fixture errors.
+# shellcheck source=src/config.sh
+source "$ROOT/src/config.sh"
+# shellcheck source=src/act_runner.sh
+source "$ROOT/src/act_runner.sh"
 # Keep inventory admission real even though cryptographic signing is a
 # controlled boundary below. Sourcing the module does not generate any key.
 # shellcheck source=src/signing.sh
@@ -18,8 +25,6 @@ HELPERS_FILE="${DSR_TEST_HELPERS_FILE:-$COMMAND_FILE}"
 source <(awk '/^(_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$HELPERS_FILE")
 # shellcheck source=/dev/null
 source <(awk '/^cmd_fallback\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$COMMAND_FILE")
-# shellcheck source=/dev/null
-source <(awk '/^_act_build_task_plan\(\) \{/{copy=1} copy{print} copy && /^\}/{exit}' "$ROOT/src/act_runner.sh")
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/dsr-fallback-tests.XXXXXXXX") || exit 1
 printf 'Fixtures: %s\n' "$TEST_ROOT"
 PASS=0 FAIL=0
@@ -389,6 +394,280 @@ test_resume_reaches_build() {
     setup resume; checkpoint failed; run_fallback --resume
     [[ "$RC" == 0 ]] && grep -q "^BUILD .*--resume=$RUN" "$CALLS" &&
         [[ $(grep -c '^STATE ' "$CALLS") == 1 ]]
+}
+
+# The public build command must produce the partial checkpoint consumed by the
+# public fallback command. Keep source staging, Git bundles, worker dispatch,
+# state/locks, artifact hashing, collection and final manifests real. Native
+# payloads, host health/slots and notifications are controlled boundaries; this
+# is resume integration coverage, not compiler or host-readiness qualification.
+# Run alone with DSR_TEST_FILTER=test_partial_resume_real_workers.
+test_partial_resume_real_workers() {
+    local dependency
+    for dependency in python3 git jq yq rsync tar gzip; do
+        command -v "$dependency" >/dev/null || {
+            printf 'Missing partial-resume test dependency: %s\n' "$dependency" >&2
+            return 1
+        }
+    done
+    python3 - "$ROOT" "$COMMAND_FILE" "$TEST_ROOT" <<'PY'
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+project, command, parent = map(Path, sys.argv[1:])
+root = parent / 'partial-real-workers'
+root.mkdir()
+print('Retained public partial-resume fixture: ' + str(root), flush=True)
+checks = failures = 0
+targets = ['linux/amd64', 'linux/arm64']
+
+
+def check(label, valid):
+    global checks, failures
+    checks += 1
+    failures += not valid
+    print(('PASS: ' if valid else 'FAIL: ') + label, flush=True)
+    return valid
+
+
+def read(path):
+    return json.loads(path.read_text())
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def events(case):
+    path = case / 'events.jsonl'
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+payload = root / 'payload.py'
+payload.write_text(r'''import json, os, sys
+from pathlib import Path
+case, platform, attempt = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+assert sys.stdin.buffer.read() == b''
+fd = os.open(case / 'events.jsonl', os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+os.write(fd, (json.dumps(dict(platform=platform,attempt=attempt,pid=os.getpid()))+'\n').encode())
+os.close(fd)
+if platform == 'linux/arm64' and not (case / 'repaired').exists():
+    print(json.dumps(dict(platform=platform,method='native',host='fixturehost',
+                         status='failed',exit_code=17,error='deliberate payload failure')),flush=True)
+    raise SystemExit(17)
+path = case / 'payloads' / ('tool-' + platform.replace('/', '-') + '.attempt-' + str(attempt) + '.bin')
+with path.open('xb') as out:
+    out.write(('release payload for '+platform+'\n').encode())
+print(json.dumps(dict(platform=platform,method='native',host='fixturehost',status='success',
+                     exit_code=0,artifact_path=str(path),artifact_paths=[str(path)])),flush=True)
+''')
+
+driver = root / 'driver.sh'
+driver.write_text(r'''#!/usr/bin/env bash
+set -uo pipefail
+for module in logging config build_state act_runner artifact_naming git_ops packaging sbom signing slsa; do
+    source "$PARTIAL_PROJECT/src/$module.sh" || exit 1
+done
+export SCRIPT_DIR="$PARTIAL_PROJECT" JSON_MODE=true DRY_RUN=false VERBOSE=false DSR_VERSION=fixture
+declare -A _DSR_LOADED_MODULES=([packaging]=1 [artifact_naming]=1 [sbom]=1 [signing]=1)
+# Load exact public definitions, as the native artifact integration suite does.
+# No replacement cmd_build, fallback, state updater, collector or resume planner.
+source <(awk '/^(_dsr_require|cmd_build|cmd_fallback|_release_file_size|_release_sha256|_release_require_publishable_artifacts|_release_sbom_policy)\(\) \{/{copy=1} copy{print} copy && /^\}/{copy=0}' "$PARTIAL_COMMAND") || exit 1
+source <(awk '/^json_envelope\(\) \{/{copy=1} copy{print} copy && /^# ====/{exit}' "$PARTIAL_COMMAND") || exit 1
+selector_acquire_slot() { printf 'SLOT %s\n' "$*" >> "$PARTIAL_CASE/boundaries"; }
+selector_release_slot() { :; }
+host_health_is_ready() { printf 'READINESS %s\n' "$*" >> "$PARTIAL_CASE/boundaries"; }
+act_run_native_build() { python3 "$PARTIAL_PAYLOAD" "$PARTIAL_CASE" "$2" "$attempt"; }
+notify_event() { printf 'NOTIFY %s\n' "$*" >> "$PARTIAL_CASE/boundaries"; }
+qg_run_checks() {
+    printf 'CHECK %s\n' "$*" >> "$PARTIAL_CASE/boundaries"
+    [[ "$(git -C "$PARTIAL_CASE/source" rev-parse HEAD)" == "$PARTIAL_SHA" ]]
+}
+signing_is_enabled() { return 1; }
+signing_wanted() { return 1; }
+cmd_release() { printf 'UNEXPECTED_PUBLICATION %s\n' "$*" >> "$PARTIAL_CASE/boundaries"; return 7; }
+_check_repo() { printf 'UNEXPECTED_NETWORK %s\n' "$*" >> "$PARTIAL_CASE/boundaries"; return 8; }
+case "$PARTIAL_MODE" in
+    first)
+        cmd_build tool --version 1.2.3 --no-sync --jobs "$PARTIAL_JOBS" --output-dir "$PARTIAL_CASE/output" ;;
+    plan)
+        build_state_init && build_state_resume tool 1.2.3 "$PARTIAL_RUN" ;;
+    status)
+        build_state_init && build_state_update_status tool 1.2.3 "$PARTIAL_STATUS" "$PARTIAL_RUN" ;;
+    resume)
+        cmd_fallback tool --version 1.2.3 --expected-sha "$PARTIAL_SHA" --build-only \
+            --resume="$PARTIAL_RUN" --output-dir "$PARTIAL_CASE/output" ;;
+esac
+''')
+
+
+def fixture(name, jobs):
+    case = root / name
+    for directory in ('config/repos.d', 'source', 'state', 'cache', 'payloads'):
+        (case / directory).mkdir(parents=True)
+    (case / 'source/source.txt').write_text('fixture release source\n')
+    for args in (['init', '-q', '-b', 'main'], ['add', '.'],
+                 ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                  '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture'], ['tag', 'v1.2.3']):
+        subprocess.run(['git', '-C', str(case / 'source')] + args, check=True)
+    sha = subprocess.check_output(['git', '-C', str(case / 'source'), 'rev-parse', 'HEAD'], text=True).strip()
+    (case / 'config/config.yaml').write_text('schema_version: "1.0.0"\n')
+    (case / 'config/repos.yaml').write_text('tools: {}\n')
+    (case / 'config/hosts.yaml').write_text(json.dumps({
+        'schema_version': '1.0.0', 'hosts': {'fixturehost': {'platform': 'linux/amd64',
+        'connection': 'local', 'concurrency': 2, 'build_root': str(case / 'stages')}},
+        'platform_mapping': {target: 'fixturehost' for target in targets}}))
+    (case / 'config/repos.d/tool.yaml').write_text(json.dumps({
+        'tool_name': 'tool', 'repo': 'fixture/tool', 'local_path': str(case / 'source'),
+        'language': 'go', 'binary_name': 'tool', 'build_cmd': 'fixture payload process',
+        'targets': targets, 'act_job_map': {target: None for target in targets},
+        'cross_compile': {target: {'host': 'fixturehost'} for target in targets}}))
+    env = dict(os.environ, PARTIAL_PROJECT=str(project), PARTIAL_COMMAND=str(command), PARTIAL_CASE=str(case),
+        PARTIAL_PAYLOAD=str(payload), PARTIAL_JOBS=str(jobs), PARTIAL_SHA=sha,
+        DSR_CONFIG_DIR=str(case / 'config'), DSR_CONFIG_FILE=str(case / 'config/config.yaml'),
+        DSR_REPOS_FILE=str(case / 'config/repos.yaml'), DSR_HOSTS_FILE=str(case / 'config/hosts.yaml'),
+        DSR_STATE_DIR=str(case / 'state'), DSR_CACHE_DIR=str(case / 'cache'),
+        ACT_CONFIG_DIR=str(case / 'config'), ACT_REPOS_DIR=str(case / 'config/repos.d'),
+        ACT_ARTIFACTS_DIR=str(case / 'artifacts'), ACT_LOGS_DIR=str(case / 'logs'),
+        DSR_DISABLE_HOST_SELECTOR='1', DSR_RETRY_MAX='3', RCH_DISABLED='1',
+        RCH_CARGO_WRAPPER_BYPASS='1', NO_COLOR='1')
+    for key in ('DSR_BUILD_LOCK_HELD_BY_CALLER', 'DSR_RUN_ID', 'RCH_REQUIRE_REMOTE'):
+        env.pop(key, None)
+    return case, env
+
+
+def invoke(case, env, mode, label=None, **extra):
+    label = label or mode
+    with (case / (label + '.stdout')).open('wb') as out, (case / (label + '.stderr')).open('wb') as err:
+        result = subprocess.run(['bash', str(driver)], env=dict(env, PARTIAL_MODE=mode, **extra),
+            stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=90)
+    if mode == 'status':
+        check(case.name + '/' + label + ': real state transition succeeds', result.returncode == 0)
+        return result.returncode, {}
+    try:
+        value = read(case / (label + '.stdout'))
+    except (ValueError, OSError):
+        value = {}
+    check(case.name + '/' + label + ': exactly one structured result', isinstance(value, dict) and bool(value))
+    return result.returncode, value
+
+
+def seed(name, jobs):
+    case, env = fixture(name, jobs)
+    code, result = invoke(case, env, 'first')
+    check(name + ': public build reports one real success and one real failure',
+          code == 1 and result.get('status') == 'partial' and result.get('exit_code') == 1 and
+          result.get('details', {}).get('success') == 1 and result.get('details', {}).get('failed') == 1 and
+          result.get('details', {}).get('publishable') is False)
+    identity = result.get('details', {}).get('run_id', '')
+    state_path = case / 'state/builds/tool/1.2.3' / identity / 'state.json'
+    state = read(state_path)
+    (case / 'first.state.json').write_text(state_path.read_text())
+    check(name + ': actual persisted checkpoint is partial with exact target outcomes',
+          state['status'] == 'partial' and state['context']['parallel_jobs'] == jobs and
+          state['target_statuses']['linux/amd64']['status'] == 'completed' and
+          state['target_statuses']['linux/arm64']['status'] == 'failed' and
+          state['target_statuses']['linux/arm64']['result']['exit_code'] == 17)
+    check(name + ': both payloads genuinely executed once',
+          Counter((event['platform'], event['attempt']) for event in events(case)) ==
+          Counter({('linux/amd64', 1): 1, ('linux/arm64', 1): 1}))
+    env['PARTIAL_RUN'] = identity
+    code, plan = invoke(case, env, 'plan')
+    check(name + ': public state planner admits only unfinished target',
+          code == 0 and plan.get('can_resume') is True and plan.get('current_status') == 'partial' and
+          plan.get('completed_targets') == ['linux/amd64'] and plan.get('targets_to_process') == ['linux/arm64'])
+    return case, env, state_path, state
+
+
+for jobs in (1, 2):
+    case, env, state_path, initial = seed('jobs-' + str(jobs), jobs)
+    before = {Path(row['result_path']): digest(Path(row['result_path']))
+              for row in initial['target_statuses'].values()}
+    successful_payload = Path(initial['target_statuses']['linux/amd64']['result']['artifact_path'])
+    before[successful_payload] = digest(successful_payload)
+    (case / 'repaired').write_text('repair complete\n')
+    code, resumed = invoke(case, env, 'resume')
+    state = read(state_path)
+    (case / 'resume.state.json').write_text(state_path.read_text())
+    check(case.name + ': public fallback resumes the exact partial UUID successfully',
+          code == 0 and resumed.get('status') == 'success' and resumed.get('exit_code') == 0 and
+          resumed.get('details', {}).get('resume_run_id') == initial['run_id'] and
+          resumed.get('details', {}).get('phases', {}).get('verification') == 'passed')
+    check(case.name + ': completed target reused while failed target receives a second real attempt',
+          Counter((event['platform'], event['attempt']) for event in events(case)) ==
+          Counter({('linux/amd64', 1): 1, ('linux/arm64', 1): 1, ('linux/arm64', 2): 1}) and
+          state['target_statuses']['linux/amd64']['attempts'] == 1 and
+          state['target_statuses']['linux/arm64']['attempts'] == 2)
+    check(case.name + ': prior worker receipts and successful payload stay immutable',
+          all(path.is_file() and digest(path) == prior for path, prior in before.items()))
+    manifest_path = case / 'output/tool-v1.2.3-manifest.json'
+    manifest = read(manifest_path) if manifest_path.exists() else {}
+    check(case.name + ': verified full manifest and completed state retain source and run identity',
+          state['status'] == 'completed' and state['run_id'] == initial['run_id'] and
+          manifest.get('run_id') == initial['run_id'] and manifest.get('publishable') is True and
+          manifest.get('source', {}).get('git_sha') == env['PARTIAL_SHA'] and
+          manifest.get('summary') == {'total': 2, 'success': 2, 'failed': 0} and
+          bool(manifest.get('artifacts')) and all(
+              digest(case / 'output' / row['name']) == row['sha256'] and
+              (case / 'output' / row['name']).stat().st_size == row['size_bytes']
+              for row in manifest.get('artifacts', [])))
+    boundaries = (case / 'boundaries').read_text()
+    check(case.name + ': source admission ran and build-only made no publication/network call',
+          'READINESS ' in boundaries and 'UNEXPECTED_' not in boundaries and
+          resumed.get('details', {}).get('phases', {}).get('release') == 'skipped')
+
+case, env, state_path, initial = seed('refusal-guards', 2)
+before_events = events(case)
+for status in ('cancelled', 'unknown-state'):
+    invoke(case, env, 'status', 'set-' + status, PARTIAL_STATUS=status)
+    before_state = digest(state_path)
+    code, result = invoke(case, env, 'resume', 'refuse-' + status)
+    check(status + ': rejected before checks, retries or publication',
+          code == 4 and result.get('exit_code') == 4 and result.get('details', {}).get('phase') == 'resume' and
+          digest(state_path) == before_state and events(case) == before_events and
+          'CHECK ' not in (case / 'boundaries').read_text() and
+          'UNEXPECTED_' not in (case / 'boundaries').read_text())
+
+invoke(case, env, 'status', 'restore-partial', PARTIAL_STATUS='partial')
+successful_payload = Path(initial['target_statuses']['linux/amd64']['result']['artifact_path'])
+good_digest = digest(successful_payload)
+original_receipt = Path(initial['target_statuses']['linux/amd64']['result_path'])
+receipt_digest = digest(original_receipt)
+with successful_payload.open('ab') as changed:
+    changed.write(b'changed bytes must not be reused\n')
+changed_digest = digest(successful_payload)
+(case / 'repaired').write_text('repair complete\n')
+code, result = invoke(case, env, 'resume', 'refuse-artifact-drift')
+state = read(state_path)
+replacement = Path(state['target_statuses']['linux/amd64']['result']['artifact_path'])
+check('changed completed artifact requires a genuine replacement attempt',
+      Counter((event['platform'], event['attempt']) for event in events(case)) ==
+      Counter({('linux/amd64', 1): 1, ('linux/arm64', 1): 1,
+               ('linux/amd64', 2): 1, ('linux/arm64', 2): 1}) and
+      replacement != successful_payload and digest(replacement) == good_digest and
+      digest(successful_payload) == changed_digest and digest(original_receipt) == receipt_digest)
+# Replacement payload names deliberately include their attempt. The old
+# collected output therefore remains outside the new manifest, and fallback
+# must refuse that stale inventory even after both rebuilds have succeeded.
+manifest_path = case / 'output/tool-v1.2.3-manifest.json'
+manifest = read(manifest_path) if manifest_path.exists() else {}
+check('rebuilt manifest cannot claim the corrupted or superseded payload',
+      state['status'] == 'completed' and bool(manifest.get('artifacts')) and
+      all(row['sha256'] != changed_digest and row['name'] != successful_payload.name
+          for row in manifest.get('artifacts', [])))
+check('unmanifested prior output still blocks fallback publication',
+      code == 6 and result.get('exit_code') == 6 and
+      result.get('details', {}).get('phase') == 'verification' and
+      'Release payload is absent from manifest' in (case / 'refuse-artifact-drift.stderr').read_text() and
+      'UNEXPECTED_' not in (case / 'boundaries').read_text())
+print('Public partial-resume checks: %d, failures: %d' % (checks, failures), flush=True)
+raise SystemExit(bool(failures))
+PY
 }
 test_preserves_caller_state() {
     setup caller
@@ -804,7 +1083,7 @@ test_isolated_source_sibling_resume() {
     ' "$CASE/checkpoint.json" > "$CASE/source-state.json"
     mv "$CASE/source-state.json" "$CASE/checkpoint.json"
     case "$1" in
-        partial) jq '.status="failed"' "$CASE/checkpoint.json" > "$CASE/revised-state.json" ;;
+        partial) jq '.status="partial"' "$CASE/checkpoint.json" > "$CASE/revised-state.json" ;;
         pending)
             jq --arg path "$CASE/not-yet-written-result.json" '
                 .status="failed" | .target_statuses["darwin/arm64"]={status:"running",result_path:$path}
@@ -962,6 +1241,7 @@ for rc in 1 7 8 130; do run_test test_release_failure "$rc"; done
 for mode in draft missing-visibility wrong-tag wrong-repo malformed; do run_test test_release_requires_public_confirmation "$mode"; done
 run_test test_release_public_confirmation_completes
 run_test test_resume_reaches_build
+run_test test_partial_resume_real_workers
 run_test test_preserves_caller_state
 run_test test_signal_releases_lock checks
 run_test test_signal_releases_lock build

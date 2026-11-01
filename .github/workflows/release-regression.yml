@@ -60,6 +60,7 @@ on:
       - scripts/tests/test_dispatch_outbox.sh
       - tests/unit/test_dispatch.bats
       - scripts/tests/test_fallback_pipeline.sh
+      - tests/integration/test_commands.bats
       - .github/workflows/release-regression.yml
 permissions:
   contents: read
@@ -232,7 +233,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bats jq shellcheck curl util-linux golang-go
+          sudo apt-get install -y --no-install-recommends bats jq python3 rsync shellcheck curl util-linux golang-go
           mkdir -p "$RUNNER_TEMP/dsr-test-bin"
           GOBIN="$RUNNER_TEMP/dsr-test-bin" go install github.com/mikefarah/yq/v4@v4.47.1
           echo "$RUNNER_TEMP/dsr-test-bin" >> "$GITHUB_PATH"
@@ -250,6 +251,7 @@ jobs:
           bash ./dsr --version
           bash ./dsr fallback --help
           bash scripts/tests/test_fallback_pipeline.sh
+          bats --filter 'watch.*recovery' tests/integration/test_commands.bats
           bash scripts/tests/test_release_resume.sh
           bash scripts/tests/test_release_source_only.sh
           bash scripts/tests/test_release_source_only_exact_tag.sh

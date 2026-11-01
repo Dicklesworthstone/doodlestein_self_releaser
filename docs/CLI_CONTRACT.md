@@ -496,9 +496,13 @@ Each attempt retains its output and terminal exit status under
 watcher restarts. Failed attempts can retry while the same source run remains
 throttled, with an exponential cooldown capped at one hour. A retry resumes
 only a unique build UUID matching the exact tool, tag, source SHA, and private
-output directory. Successful runs are never replayed. Legacy timestamp-only
-history and workers lost without a completion receipt require manual recovery;
-their publication outcome cannot safely be inferred.
+output directory. A `partial` build with both successful and failed targets is
+eligible for this recovery; fallback validates and reuses successful target
+artifacts while retrying the remaining targets. Cancelled, mismatched, or
+ambiguous checkpoints block automatic recovery. Successful runs are never
+replayed. Legacy timestamp-only history and workers lost without a completion
+receipt require manual recovery; their publication outcome cannot safely be
+inferred.
 Terminal fallback notifications are sent only after the worker has saved its
 completion receipt; detailed phase output remains in the attempt's `result.json`
 and the run's `fallback-<run-id>.log`.
@@ -1674,6 +1678,14 @@ asked for, since `dsr check` itself exits 1 exactly when throttled. Its step
 carries `throttled` and the check's own exit code. The build step covers the
 quality gate, build, artifact verification and signing; `--build-only` runs
 the build step alone. `details.steps[]` lists the steps that ran.
+
+`--resume=RUN_UUID` accepts a saved `partial` build as well as failed or
+interrupted builds. It retains the original run UUID and output directory,
+validates the saved source and successful target artifacts, and retries only
+targets that remain eligible under the existing attempt budget. A partial
+checkpoint does not bypass the build step or authorize publication; release
+still requires a complete, validated successful build. Cancelled or unknown
+checkpoint states are refused before execution.
 
 The release step succeeds only when `dsr release` confirms the requested
 repository and tag as public. An upload that correctly leaves an unrelated

@@ -1727,7 +1727,7 @@ _watch_resume_checkpoint() {
         state=$(build_state_get "$tool" "$version" "$run") || return 4
         jq -e --arg sha "$sha" --arg output "$output" '
             .git_sha == $sha and .context.output_dir == $output and
-            (.status | IN("created","running","failed","targets-complete","completed"))
+            (.status | IN("created","running","failed","partial","targets-complete","completed"))
         ' <<< "$state" >/dev/null || return 4
         found="$run"; count=$((count + 1))
     done
@@ -11762,7 +11762,7 @@ EOF
                 length == 1 and (.[0] | .tool == $tool and .version == $version and
                 (.run_id | type == "string" and
                     test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")) and
-                (.status == "created" or .status == "running" or .status == "failed" or
+                (.status == "created" or .status == "running" or .status == "failed" or .status == "partial" or
                  .status == "targets-complete" or .status == "completed") and
                 (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
                 (.context.output_dir | type == "string" and length > 0) and
